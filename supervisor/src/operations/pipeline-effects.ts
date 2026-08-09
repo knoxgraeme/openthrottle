@@ -420,11 +420,10 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       const visit = (currentId: string): boolean => {
         if (currentId === successorStageId) return true;
         if (visiting.has(currentId)) {
-          throw new Error(`pipeline manifest has a transition cycle while resolving structured successor ${stageId}`);
+          return false;
         }
         if (visited.has(currentId)) return false;
         visiting.add(currentId);
-        visited.add(currentId);
         const current = stages.get(currentId);
         if (!current) throw new Error(`pipeline manifest transition references unknown stage ${currentId}`);
         for (const transition of Object.values(current.transitions ?? {})) {
@@ -433,6 +432,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           }
         }
         visiting.delete(currentId);
+        visited.add(currentId);
         return false;
       };
       return visit(stageId);

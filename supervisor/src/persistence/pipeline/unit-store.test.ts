@@ -2009,6 +2009,143 @@ describe("execution unit store", () => {
     expect(events).toHaveLength(2);
   });
 
+  it("atomically migrates terminal legacy aggregate and parent stage artifacts", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    const treeSubject = "2".repeat(40);
+    const legacyGraphHash = "legacy-graph-hash";
+    const legacyStageHash = "legacy-stage-hash";
+    const canonicalGraphPayload = canonicalJson({
+      schema: "openthrottle.artifact/execution_graph_result@1",
+      kind: "execution_graph_result",
+      repository: { subject: treeSubject },
+    });
+    const canonicalGraphHash = digestNormalized(canonicalGraphPayload);
+    const canonicalStagePayload = canonicalJson({
+      schema: "openthrottle.artifact/stage_result@1",
+      kind: "stage_result",
+      repository: { subject: treeSubject },
+      evidence: [canonicalGraphHash],
+      details: { execution_graph_result_hash: canonicalGraphHash },
+    });
+    const canonicalStageHash = digestNormalized(canonicalStagePayload);
+    const canonicalArtifact = {
+      kind: "execution_graph_result",
+      schemaVersion: 1,
+      assurance: "executor_verified",
+      subject: treeSubject,
+      payload: canonicalGraphPayload,
+      hash: canonicalGraphHash,
+    } as const;
+    const canonicalStageArtifact = {
+      kind: "stage_result",
+      schemaVersion: 1,
+      assurance: "executor_verified",
+      subject: treeSubject,
+      payload: canonicalStagePayload,
+      hash: canonicalStageHash,
+    } as const;
+    emitSingleUnitAggregate(store, subject, legacyGraphHash);
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET status = 'completed', result_hash = ?
+      WHERE id = ?
+    `).run(legacyStageHash, "attempt-parent");
+
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: legacyGraphHash,
+      toArtifactHash: canonicalGraphHash,
+      fromStageResultHash: legacyStageHash,
+      toStageResultHash: canonicalStageHash,
+      canonicalArtifact,
+      canonicalStageArtifact,
+    })).toBe("migrated");
+
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      aggregate_artifact_hash: canonicalGraphHash,
+    });
+    expect(db!.prepare("SELECT result_hash FROM pipeline_stage_attempts WHERE id = ?").get("attempt-parent"))
+      .toEqual({ result_hash: canonicalStageHash });
+    expect(db!.prepare(`
+      SELECT kind, subject, artifact_hash FROM pipeline_artifacts
+      WHERE attempt_id = ? AND artifact_hash IN (?, ?)
+      ORDER BY kind
+    `).all("attempt-parent", canonicalGraphHash, canonicalStageHash)).toEqual([
+      { kind: "execution_graph_result", subject: treeSubject, artifact_hash: canonicalGraphHash },
+      { kind: "stage_result", subject: treeSubject, artifact_hash: canonicalStageHash },
+    ]);
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: legacyGraphHash,
+      toArtifactHash: canonicalGraphHash,
+      fromStageResultHash: legacyStageHash,
+      toStageResultHash: canonicalStageHash,
+      canonicalArtifact,
+      canonicalStageArtifact,
+    })).toBe("already_canonical");
+  });
+
+  it("rolls back coupled terminal aggregate migration when downstream rewrite fails", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    const treeSubject = "2".repeat(40);
+    const legacyGraphHash = "legacy-graph-hash";
+    const legacyStageHash = "legacy-stage-hash";
+    const canonicalGraphPayload = canonicalJson({ schema: "graph", kind: "execution_graph_result" });
+    const canonicalGraphHash = digestNormalized(canonicalGraphPayload);
+    const canonicalStagePayload = canonicalJson({ schema: "stage", kind: "stage_result" });
+    const canonicalStageHash = digestNormalized(canonicalStagePayload);
+    emitSingleUnitAggregate(store, subject, legacyGraphHash);
+    insertPublishAttempt({
+      id: "attempt-publish-rollback",
+      expectedSubject: subject,
+      contextPolicy: "fresh",
+      nativeSessionId: null,
+    });
+    db!.prepare("UPDATE pipeline_stage_attempts SET status = 'completed', result_hash = ? WHERE id = ?")
+      .run(legacyStageHash, "attempt-parent");
+    db!.prepare("UPDATE pipeline_stage_attempts SET request_payload = NULL WHERE id = ?")
+      .run("attempt-publish-rollback");
+
+    expect(() => store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: legacyGraphHash,
+      toArtifactHash: canonicalGraphHash,
+      fromStageResultHash: legacyStageHash,
+      toStageResultHash: canonicalStageHash,
+      canonicalArtifact: {
+        kind: "execution_graph_result",
+        schemaVersion: 1,
+        assurance: "executor_verified",
+        subject: treeSubject,
+        payload: canonicalGraphPayload,
+        hash: canonicalGraphHash,
+      },
+      canonicalStageArtifact: {
+        kind: "stage_result",
+        schemaVersion: 1,
+        assurance: "executor_verified",
+        subject: treeSubject,
+        payload: canonicalStagePayload,
+        hash: canonicalStageHash,
+      },
+      fromSubject: subject,
+      toSubject: treeSubject,
+      publishStageId: "publish",
+    })).toThrow(/has no sealed request/);
+
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      aggregate_artifact_hash: legacyGraphHash,
+    });
+    expect(db!.prepare("SELECT result_hash FROM pipeline_stage_attempts WHERE id = ?").get("attempt-parent"))
+      .toEqual({ result_hash: legacyStageHash });
+    expect(db!.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_artifacts
+      WHERE attempt_id = ? AND artifact_hash IN (?, ?)
+    `).get("attempt-parent", canonicalGraphHash, canonicalStageHash)).toEqual({ count: 0 });
+  });
+
   it("rewrites migrated publish requests with the sealed native context policy", () => {
     const subject = "1".repeat(40);
     const treeSubject = "2".repeat(40);

@@ -50,7 +50,7 @@ describe("pipeline effect processor", () => {
         kind?: string;
         command?: string;
         depends_on?: string[];
-        transitions: Record<string, { to?: string; terminal?: string }>;
+        transitions: Record<string, { to?: string; terminal?: string; max_reentries?: number; on_exhausted?: string }>;
       }>;
     };
     graph.id = `repository/structured-${publishStageId}`;
@@ -68,9 +68,9 @@ describe("pipeline effect processor", () => {
         command: "test",
         depends_on: [],
         transitions: {
+          retryable_failure: { to: intermediateStageId, max_reentries: 2, on_exhausted: "failed" },
           success: { to: publishStageId },
           repair_required: { to: publishStageId },
-          retryable_failure: { terminal: "failed" },
           failure: { to: publishStageId },
         },
       });
@@ -1403,34 +1403,44 @@ describe("pipeline effect processor", () => {
     });
     const legacyGraphResult = legacyCommitSubjectAggregate.artifacts
       ?.find((artifact) => artifact.kind === "execution_graph_result");
+    const legacyStageResult = legacyCommitSubjectAggregate.artifacts
+      ?.find((artifact) => artifact.kind === "stage_result");
     expect(legacyGraphResult).toBeDefined();
-    const persistLegacyGraphResult = () => {
+    expect(legacyStageResult).toBeDefined();
+    const persistLegacyAggregateArtifacts = () => {
+      for (const legacyArtifact of [legacyStageResult!, legacyGraphResult!]) {
+        db!.prepare(`
+          INSERT INTO pipeline_artifacts (
+            id, pipeline_instance_id, attempt_id, kind, schema_version,
+            assurance, subject, payload, artifact_hash, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            pipeline_instance_id = excluded.pipeline_instance_id,
+            attempt_id = excluded.attempt_id,
+            kind = excluded.kind,
+            schema_version = excluded.schema_version,
+            assurance = excluded.assurance,
+            subject = excluded.subject,
+            payload = excluded.payload,
+            artifact_hash = excluded.artifact_hash
+        `).run(
+          `legacy-artifact-${attempt.id}-${legacyArtifact.kind}`,
+          instance.id,
+          attempt.id,
+          legacyArtifact.kind,
+          legacyArtifact.schemaVersion,
+          legacyArtifact.assurance,
+          legacyArtifact.subject ?? null,
+          legacyArtifact.payload,
+          legacyArtifact.hash,
+          "2099-07-22T12:00:00.000Z"
+        );
+      }
       db!.prepare(`
-        INSERT INTO pipeline_artifacts (
-          id, pipeline_instance_id, attempt_id, kind, schema_version,
-          assurance, subject, payload, artifact_hash, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          pipeline_instance_id = excluded.pipeline_instance_id,
-          attempt_id = excluded.attempt_id,
-          kind = excluded.kind,
-          schema_version = excluded.schema_version,
-          assurance = excluded.assurance,
-          subject = excluded.subject,
-          payload = excluded.payload,
-          artifact_hash = excluded.artifact_hash
-      `).run(
-        `legacy-artifact-${attempt.id}`,
-        instance.id,
-        attempt.id,
-        legacyGraphResult!.kind,
-        legacyGraphResult!.schemaVersion,
-        legacyGraphResult!.assurance,
-        legacyGraphResult!.subject ?? null,
-        legacyGraphResult!.payload,
-        legacyGraphResult!.hash,
-        "2099-07-22T12:00:00.000Z"
-      );
+        UPDATE pipeline_stage_attempts
+        SET result_hash = ?, updated_at = ?
+        WHERE id = ?
+      `).run(legacyStageResult!.hash, "2099-07-22T12:00:00.000Z", attempt.id);
     };
     db!.prepare("UPDATE pipeline_instances SET status = ? WHERE id = ?").run(beforeAggregateStatus, instance.id);
     db!.prepare(`
@@ -1504,6 +1514,9 @@ describe("pipeline effect processor", () => {
     db!.prepare("UPDATE pipeline_instances SET status = ? WHERE id = ?").run(beforeAggregateStatus, instance.id);
 
     await processor.drain();
+    const expectedCanonicalStageResultHash = (db!.prepare(`
+      SELECT result_hash FROM pipeline_stage_attempts WHERE id = ?
+    `).get(attempt.id) as { result_hash: string | null }).result_hash!;
     const aggregate = pipelines.getGraphForAttempt(attempt.id);
     expect(aggregate).toMatchObject({
       aggregate_emitted_at: expect.any(String),
@@ -1533,7 +1546,7 @@ describe("pipeline effect processor", () => {
       effect.status === "pending" &&
       effect.idempotency_key === queuedIntermediateRequest.idempotencyKey
     )!;
-    persistLegacyGraphResult();
+    persistLegacyAggregateArtifacts();
     rewriteAggregatePublicationToLegacyHash();
     db!.prepare(`
       UPDATE execution_graphs
@@ -1570,6 +1583,11 @@ describe("pipeline effect processor", () => {
     );
     await processor.drain();
     const intermediateAttempt = pipelines.getActiveAttempt(instance.id)!;
+    expect(pipelines.getAttempt(attempt.id)).toMatchObject({ result_hash: expectedCanonicalStageResultHash });
+    expect(db!.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_artifacts
+      WHERE attempt_id = ? AND kind = 'stage_result' AND artifact_hash = ?
+    `).get(attempt.id, expectedCanonicalStageResultHash)).toEqual({ count: 1 });
     expect(intermediateAttempt).toMatchObject({
       stage_id: intermediateStageId,
       status: "running",
@@ -1583,6 +1601,7 @@ describe("pipeline effect processor", () => {
       })
     );
     rewriteAggregatePublicationToLegacyHash();
+    persistLegacyAggregateArtifacts();
     db!.prepare(`
       UPDATE execution_graphs
       SET aggregate_artifact_hash = ?, updated_at = ?
@@ -1735,6 +1754,7 @@ describe("pipeline effect processor", () => {
     const legacyRequest = canonicalJson({ ...legacyWithoutFence, ...legacyFence });
     const dispatchEffect = effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending")!;
     rewriteAggregatePublicationToLegacyHash();
+    persistLegacyAggregateArtifacts();
     db!.prepare(`
       UPDATE execution_graphs
       SET aggregate_artifact_hash = ?, updated_at = ?
@@ -1768,10 +1788,18 @@ describe("pipeline effect processor", () => {
       DELETE FROM pipeline_artifacts
       WHERE attempt_id = ? AND kind = 'execution_graph_result' AND artifact_hash = ?
     `).run(attempt.id, canonicalGraphResultHash);
+    db!.prepare(`
+      DELETE FROM pipeline_artifacts
+      WHERE attempt_id = ? AND kind = 'stage_result' AND artifact_hash = ?
+    `).run(attempt.id, expectedCanonicalStageResultHash);
     expect(db!.prepare(`
       SELECT COUNT(*) AS count FROM pipeline_artifacts
       WHERE attempt_id = ? AND kind = 'execution_graph_result' AND artifact_hash = ?
     `).get(attempt.id, canonicalGraphResultHash)).toEqual({ count: 0 });
+    expect(db!.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_artifacts
+      WHERE attempt_id = ? AND kind = 'stage_result' AND artifact_hash = ?
+    `).get(attempt.id, expectedCanonicalStageResultHash)).toEqual({ count: 0 });
 
     const dispatchCallsBeforePublish = runtime.dispatchStage.mock.calls.length;
     await processor.drain();
@@ -1779,6 +1807,10 @@ describe("pipeline effect processor", () => {
       SELECT COUNT(*) AS count FROM pipeline_artifacts
       WHERE attempt_id = ? AND kind = 'execution_graph_result' AND artifact_hash = ?
     `).get(attempt.id, canonicalGraphResultHash)).toEqual({ count: 1 });
+    expect(db!.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_artifacts
+      WHERE attempt_id = ? AND kind = 'stage_result' AND artifact_hash = ?
+    `).get(attempt.id, expectedCanonicalStageResultHash)).toEqual({ count: 1 });
     expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforePublish + 1);
     expect(runtime.dispatchStage).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
@@ -1801,6 +1833,7 @@ describe("pipeline effect processor", () => {
     expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(publishRequest.runId);
 
     rewriteAggregatePublicationToLegacyHash();
+    persistLegacyAggregateArtifacts();
     db!.prepare(`
       UPDATE execution_graphs
       SET aggregate_artifact_hash = ?, updated_at = ?
@@ -1902,6 +1935,7 @@ describe("pipeline effect processor", () => {
     )!;
 
     rewriteAggregatePublicationToLegacyHash();
+    persistLegacyAggregateArtifacts();
     db!.prepare(`
       UPDATE execution_graphs
       SET aggregate_artifact_hash = ?, updated_at = ?

@@ -162,6 +162,15 @@ export interface PipelineArtifactRecord {
   created_at: string;
 }
 
+type MigratedAggregateArtifact = {
+  kind: string;
+  schemaVersion: number;
+  assurance: string;
+  subject?: string | null;
+  payload: string;
+  hash: string;
+};
+
 export interface ExecutionDownstreamContext {
   id: string;
   execution_graph_id: string;
@@ -247,14 +256,10 @@ export interface ExecutionUnitStore {
     parentAttemptId: string;
     fromArtifactHash: string;
     toArtifactHash: string;
-    canonicalArtifact?: {
-      kind: string;
-      schemaVersion: number;
-      assurance: string;
-      subject?: string | null;
-      payload: string;
-      hash: string;
-    };
+    fromStageResultHash?: string;
+    toStageResultHash?: string;
+    canonicalStageArtifact?: MigratedAggregateArtifact;
+    canonicalArtifact?: MigratedAggregateArtifact;
     fromSubject?: string;
     toSubject?: string;
     successorStageId?: string;
@@ -1243,18 +1248,17 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     return "emitted";
   });
 
-  function persistCanonicalAggregateArtifact(input: {
+  function persistCanonicalMigratedArtifact(input: {
     graph: ExecutionUnitGraph;
     parentAttemptId: string;
     toArtifactHash: string;
-    artifact: NonNullable<Parameters<ExecutionUnitStore["migrateAggregateArtifactHash"]>[0]["canonicalArtifact"]>;
+    artifact: MigratedAggregateArtifact;
   }): void {
     if (
-      input.artifact.kind !== "execution_graph_result" ||
       input.artifact.hash !== input.toArtifactHash ||
       digestNormalized(input.artifact.payload) !== input.artifact.hash
     ) {
-      throw new Error(`execution graph ${input.graph.id} canonical aggregate artifact does not match migration target`);
+      throw new Error(`execution graph ${input.graph.id} canonical ${input.artifact.kind} artifact does not match migration target`);
     }
     const artifactId = deterministicId("artifact", [
       input.graph.pipeline_instance_id,
@@ -1289,7 +1293,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         existingArtifact.payload !== input.artifact.payload ||
         existingArtifact.artifact_hash !== input.artifact.hash
       ) {
-        throw new Error(`execution graph ${input.graph.id} canonical aggregate artifact conflicts with durable evidence`);
+        throw new Error(`execution graph ${input.graph.id} canonical ${input.artifact.kind} artifact conflicts with durable evidence`);
       }
       return;
     }
@@ -1320,13 +1324,49 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     if (!graph.aggregate_emitted_at) {
       throw new Error(`execution graph ${graph.id} has no aggregate marker to migrate`);
     }
+    if (input.canonicalArtifact?.kind !== undefined && input.canonicalArtifact.kind !== "execution_graph_result") {
+      throw new Error(`execution graph ${graph.id} canonical aggregate artifact has wrong kind`);
+    }
+    if (input.canonicalStageArtifact?.kind !== undefined && input.canonicalStageArtifact.kind !== "stage_result") {
+      throw new Error(`execution graph ${graph.id} canonical stage artifact has wrong kind`);
+    }
     if (input.canonicalArtifact) {
-      persistCanonicalAggregateArtifact({
+      persistCanonicalMigratedArtifact({
         graph,
         parentAttemptId: input.parentAttemptId,
         toArtifactHash: input.toArtifactHash,
         artifact: input.canonicalArtifact,
       });
+    }
+    if (input.canonicalStageArtifact) {
+      if (!input.fromStageResultHash || !input.toStageResultHash) {
+        throw new Error(`execution graph ${graph.id} canonical stage artifact migration is missing stage hashes`);
+      }
+      persistCanonicalMigratedArtifact({
+        graph,
+        parentAttemptId: input.parentAttemptId,
+        toArtifactHash: input.toStageResultHash,
+        artifact: input.canonicalStageArtifact,
+      });
+      const attempt = db.prepare(`
+        SELECT result_hash FROM pipeline_stage_attempts
+        WHERE id = ? AND pipeline_instance_id = ?
+      `).get(input.parentAttemptId, graph.pipeline_instance_id) as { result_hash: string | null } | undefined;
+      if (!attempt) throw new Error(`parent attempt ${input.parentAttemptId} is missing for aggregate migration`);
+      if (attempt.result_hash === input.toStageResultHash) {
+        // Already migrated by a prior replay; keep the rest of the transaction idempotent.
+      } else if (attempt.result_hash !== input.fromStageResultHash) {
+        throw new Error(`parent attempt ${input.parentAttemptId} result hash does not match migration source`);
+      } else {
+        const attemptUpdate = db.prepare(`
+          UPDATE pipeline_stage_attempts
+          SET result_hash = ?, updated_at = ?
+          WHERE id = ? AND pipeline_instance_id = ? AND result_hash = ?
+        `).run(input.toStageResultHash, now(), input.parentAttemptId, graph.pipeline_instance_id, input.fromStageResultHash);
+        if (attemptUpdate.changes !== 1) {
+          throw new Error(`parent attempt ${input.parentAttemptId} result hash compare-and-set failed`);
+        }
+      }
     }
     const migrateActivity = (timestamp: string) => migrateAggregatePublicationActivity({
       db,
