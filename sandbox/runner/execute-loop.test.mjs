@@ -3818,6 +3818,108 @@ describe("executeLoopAction", () => {
     });
   });
 
+  it("extracts a standard receipt from the exact Codex agent-message JSONL envelope", () => {
+    const valid = request({ agent: "codex" });
+    const receipt = standardReceipt(valid, { result: "needs_human" });
+
+    expect(parseLoopReceipt([
+      JSON.stringify({
+        type: "item.completed",
+        item: { id: "item_6", type: "agent_message", text: JSON.stringify(receipt) },
+      }),
+      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } }),
+    ].join("\n"), {})).toMatchObject({
+      type: "unit_completion",
+      result: "needs_human",
+    });
+  });
+
+  it("keeps accepting the Codex agent-message envelope when the item id is omitted", () => {
+    const valid = request({ agent: "codex" });
+    const receipt = standardReceipt(valid);
+
+    expect(parseLoopReceipt(JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: JSON.stringify(receipt) },
+    }), {})).toMatchObject({ type: "unit_completion", result: "success" });
+  });
+
+  it("keeps strict receipt validation inside the Codex agent-message envelope", () => {
+    const valid = request({ agent: "codex" });
+    const receipt = { ...standardReceipt(valid), extra: "not allowed" };
+
+    expect(() => parseLoopReceipt([
+      JSON.stringify({
+        type: "item.completed",
+        item: { type: "agent_message", text: JSON.stringify(receipt) },
+      }),
+      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } }),
+    ].join("\n"), {})).toThrow(/standard receipt has unknown field extra/);
+  });
+
+  it.each([
+    {
+      name: "a non-agent item",
+      event: (text) => ({ type: "item.completed", item: { type: "reasoning", text } }),
+    },
+    {
+      name: "an item envelope with an extra field",
+      event: (text) => ({ type: "item.completed", item: { type: "agent_message", text }, message: text }),
+    },
+    {
+      name: "an agent-message item with an extra field",
+      event: (text) => ({
+        type: "item.completed",
+        item: { type: "agent_message", text, status: "completed" },
+      }),
+    },
+    {
+      name: "an agent-message item with an invalid id",
+      event: (text) => ({
+        type: "item.completed",
+        item: { id: "x".repeat(201), type: "agent_message", text },
+      }),
+    },
+  ])("does not extract receipt text from $name", ({ event }) => {
+    const valid = request({ agent: "codex" });
+    const receipt = standardReceipt(valid);
+    expect(() => parseLoopReceipt([
+      JSON.stringify(event(JSON.stringify(receipt))),
+      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } }),
+    ].join("\n"), {})).toThrow(/invalid standard receipt/);
+  });
+
+  it("refuses to choose between receipts from multiple Codex agent messages", () => {
+    const valid = request({ agent: "codex" });
+    const first = standardReceipt(valid);
+    const second = standardReceipt(valid, { result: "needs_human" });
+    const event = (receipt) => JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: JSON.stringify(receipt) },
+    });
+
+    expect(() => parseLoopReceipt([
+      event(first),
+      event(second),
+      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } }),
+    ].join("\n"), {})).toThrow(/2 receipt-like Codex agent messages found; refusing to guess/);
+  });
+
+  it("ignores non-receipt Codex agent messages before the final receipt", () => {
+    const valid = request({ agent: "codex" });
+    const receipt = standardReceipt(valid);
+    const event = (id, text) => JSON.stringify({
+      type: "item.completed",
+      item: { id, type: "agent_message", text },
+    });
+
+    expect(parseLoopReceipt([
+      event("item_1", "Still working through the tests."),
+      event("item_2", JSON.stringify(receipt)),
+      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } }),
+    ].join("\n"), {})).toMatchObject({ type: "unit_completion", result: "success" });
+  });
+
   it("keeps integration checkout validation fail-closed on the concrete default path", () => {
     process.env.OT_INTEGRATION_REPO_DIR = join(tmpdir(), "ot-missing-integration-repo");
 
