@@ -175,7 +175,7 @@ function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: Pip
   if (stage.evaluator.kind === "publish_subject") {
     return input.event.providerRevision !== undefined && input.event.subject === input.event.providerRevision;
   }
-  return false;
+  return input.instance.published_commit !== null && input.event.subject === input.instance.published_commit;
 }
 
 function verifyInput(input: PipelineReductionInput): PipelineStage {
