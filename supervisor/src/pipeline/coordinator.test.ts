@@ -462,7 +462,7 @@ describe("pipeline coordinator", () => {
       active_stage_id: "provider",
       immutable_subject: subject,
       published_commit: publishedCommit,
-      published_subject: null,
+      published_subject: subject,
     };
     const providerStages = providerWaitStages(stages, 0);
     const providerEvent = providerFeedbackEvent(providerInstance, providerAttempt, "success", "provider-success", {
@@ -489,7 +489,23 @@ describe("pipeline coordinator", () => {
       attempt: providerAttempt,
       stages: providerStages,
       event: providerEvent,
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
+
+    expect(() => reducePipelineEvent({
+      manifest,
+      instance: { ...providerInstance, published_subject: null },
+      attempt: providerAttempt,
+      stages: providerStages,
+      event: providerEvent,
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
+
+    expect(() => reducePipelineEvent({
+      manifest,
+      instance: { ...providerInstance, published_subject: "c".repeat(40) },
+      attempt: providerAttempt,
+      stages: providerStages,
+      event: providerEvent,
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
 
     expect(() => reducePipelineEvent({
       manifest,
@@ -497,7 +513,7 @@ describe("pipeline coordinator", () => {
       attempt: providerAttempt,
       stages: providerStages,
       event: { ...providerEvent, providerRevision: "e".repeat(40) },
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
   });
 
   it("allows a direct publish terminal to ship with exact publish-stage evidence", () => {
@@ -569,7 +585,7 @@ describe("pipeline coordinator", () => {
         artifacts: publishEvent.artifacts?.map((artifact) => ({ ...artifact, subject: "e".repeat(40) })),
         providerRevision: undefined,
       },
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
   });
 
   it.each([
@@ -673,13 +689,41 @@ describe("pipeline coordinator", () => {
       publishedCommit: null,
     });
 
+    const noChangePayload = JSON.stringify({ outcome: "no_change" });
+    const noChangeHash = digestNormalized(noChangePayload);
+    const noChangeEvent: PipelineCoordinatorEvent = {
+      ...exactEvent,
+      id: `${stageId}-post-publication-no-change-terminal`,
+      outcome: "no_change",
+      resultHash: noChangeHash,
+      artifacts: postStage.artifacts.map((kind) => ({
+        kind,
+        schemaVersion: 1,
+        assurance: postStage.assurance,
+        subject,
+        payload: noChangePayload,
+        hash: noChangeHash,
+      })),
+    };
+
+    expect(reducePipelineEvent({
+      manifest: postPublicationManifest,
+      instance: postInstance,
+      attempt: postAttempt,
+      stages,
+      event: noChangeEvent,
+    })).toMatchObject({
+      terminalOutcome: "no_change",
+      publishedCommit: null,
+    });
+
     expect(() => reducePipelineEvent({
       manifest: postPublicationManifest,
       instance: { ...postInstance, published_commit: null },
       attempt: postAttempt,
       stages,
       event: exactEvent,
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
 
     expect(() => reducePipelineEvent({
       manifest: postPublicationManifest,
@@ -687,7 +731,7 @@ describe("pipeline coordinator", () => {
       attempt: postAttempt,
       stages,
       event: exactEvent,
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
 
     expect(() => reducePipelineEvent({
       manifest: postPublicationManifest,
@@ -695,7 +739,15 @@ describe("pipeline coordinator", () => {
       attempt: postAttempt,
       stages,
       event: exactEvent,
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
+
+    expect(() => reducePipelineEvent({
+      manifest: postPublicationManifest,
+      instance: { ...postInstance, published_subject: null },
+      attempt: postAttempt,
+      stages,
+      event: noChangeEvent,
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
 
     expect(() => reducePipelineEvent({
       manifest: postPublicationManifest,
@@ -708,7 +760,7 @@ describe("pipeline coordinator", () => {
         subject: "d".repeat(40),
         artifacts: exactEvent.artifacts?.map((artifact) => ({ ...artifact, subject: "d".repeat(40) })),
       },
-    })).toThrow(/cannot settle shipped without exact published provider evidence/);
+    })).toThrow(/cannot settle terminal without exact published provider evidence/);
   });
 
   it("projects notable repair stages into run notes without changing transitions", () => {

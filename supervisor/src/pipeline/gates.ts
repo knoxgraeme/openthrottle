@@ -71,7 +71,7 @@ export const GATE_RECEIPT_REASONS = Object.freeze([
 export type GateReceiptReason = (typeof GATE_RECEIPT_REASONS)[number];
 
 function providerRevisionFromPayload(payload: Record<string, unknown>): string | undefined {
-  const revision = payload.observed_head_sha ?? payload.head_sha;
+  const revision = payload.expected_published_commit ?? payload.head_sha;
   return typeof revision === "string" && GIT_COMMIT.test(revision) ? revision : undefined;
 }
 

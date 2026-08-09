@@ -217,12 +217,18 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
         last_error: boundedStatusError(lastError),
         last_state_change_at: instance.updated_at,
         subject: instance.immutable_subject,
-        published_commit: instance.published_commit,
+        published_commit: instance.published_commit !== null &&
+          instance.published_subject !== null &&
+          instance.immutable_subject === instance.published_subject
+          ? instance.published_commit
+          : null,
         // Production transitions persist only linear_ledger/github_summary
         // receipts, so normal runs have no pull_request receipt; the ticket
         // projection (populated by the pull-request webhook) is the durable
         // fallback that keeps this field honest for the /status contract.
-        published_pr_url: instance.published_commit === null
+        published_pr_url: instance.published_commit === null ||
+          instance.published_subject === null ||
+          instance.immutable_subject !== instance.published_subject
           ? null
           : publishedPr?.external_url ?? publishedPr?.target_url ?? instance.ticket_pr_url ?? null,
         gate_result: gate?.result ?? null,

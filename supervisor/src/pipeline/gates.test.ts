@@ -32,6 +32,7 @@ const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yam
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const runtime = buildInstalledRuntimeDescriptor("gate-test/v1");
 const SUBJECT = "c".repeat(40);
+const PUBLISHED_COMMIT = "9".repeat(40);
 
 interface Fixture {
   db: Database.Database;
@@ -160,12 +161,16 @@ describe("deterministic supervisor stage gates", () => {
     };
   }
 
-  function moveFixtureToProviderWait(fixture: Fixture, headSha = SUBJECT): void {
+  function moveFixtureToProviderWait(
+    fixture: Fixture,
+    subject = SUBJECT,
+    publishedCommit = PUBLISHED_COMMIT
+  ): void {
     fixture.db.prepare(`
       UPDATE pipeline_stage_attempts
       SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
       WHERE id = ?
-    `).run(headSha, fixture.attempt.id);
+    `).run(subject, fixture.attempt.id);
     fixture.db.prepare(`
       UPDATE pipeline_instance_stages SET status = 'waiting'
       WHERE pipeline_instance_id = ? AND stage_id = 'provider'
@@ -173,10 +178,10 @@ describe("deterministic supervisor stage gates", () => {
     fixture.db.prepare(`
       UPDATE pipeline_instances
       SET status = 'waiting_provider', active_stage_id = 'provider',
-          immutable_subject = ?, published_commit = ?
+          immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
-    `).run(headSha, headSha, fixture.instance.id);
-    fixture.tickets.setSetting("github-head:issue-1", headSha);
+    `).run(subject, publishedCommit, subject, fixture.instance.id);
+    fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
   }
 
   function recordAcknowledgedPublication(
@@ -1110,6 +1115,7 @@ describe("deterministic supervisor stage gates", () => {
 
   it("turns supervisor-owned provider evidence into a fenced terminal receipt", () => {
     const fixture = setup("core/implement@4");
+    const publishedCommit = "d".repeat(40);
     fixture.db.prepare(`
       UPDATE pipeline_stage_attempts
       SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?, native_session_id = 'native-1'
@@ -1118,9 +1124,9 @@ describe("deterministic supervisor stage gates", () => {
     fixture.db.prepare(`
       UPDATE pipeline_instances
       SET status = 'completion_pending_publication', active_stage_id = 'provider',
-          immutable_subject = ?, published_commit = ?
+          immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
-    `).run(SUBJECT, SUBJECT, fixture.instance.id);
+    `).run(SUBJECT, publishedCommit, SUBJECT, fixture.instance.id);
 
     const providerInput = {
       id: "provider-success-1",
@@ -1128,10 +1134,10 @@ describe("deterministic supervisor stage gates", () => {
       outcome: "success" as const,
       summary: "GitHub reports the pull request merged.",
       evidence: ["https://github.com/owner/repo/pull/1"],
-      providerPayload: { merged: true, head_sha: "d".repeat(40) },
+      providerPayload: { merged: true, head_sha: publishedCommit },
     };
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
-    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
     expect(routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
@@ -1156,7 +1162,7 @@ describe("deterministic supervisor stage gates", () => {
       summary: providerInput.summary,
       evidence: providerInput.evidence,
       payload: providerInput.providerPayload,
-      headSha: SUBJECT,
+      headSha: publishedCommit,
       pullRequestUrl: "https://github.com/owner/repo/pull/1",
     })).toBe(true);
     const deferred = fixture.pipelines.getInstance(fixture.instance.id)!;
@@ -1183,7 +1189,7 @@ describe("deterministic supervisor stage gates", () => {
       summary: providerInput.summary,
       evidence: providerInput.evidence,
       payload: providerInput.providerPayload,
-      headSha: SUBJECT,
+      headSha: publishedCommit,
       pullRequestUrl: "https://github.com/owner/repo/pull/1",
     })).toBe(true);
     expect(fixture.pipelines.getInstance(fixture.instance.id))
@@ -1198,6 +1204,7 @@ describe("deterministic supervisor stage gates", () => {
     { merged: false, terminalOutcome: "no_change" },
   ])("preserves deferred close evidence when merged=$merged during publication", async ({ merged, terminalOutcome }) => {
     const fixture = setup("core/implement@4");
+    const publishedCommit = "d".repeat(40);
     fixture.db.prepare(`
       UPDATE pipeline_stage_attempts
       SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
@@ -1206,11 +1213,11 @@ describe("deterministic supervisor stage gates", () => {
     fixture.db.prepare(`
       UPDATE pipeline_instances
       SET status = 'completion_pending_publication', active_stage_id = 'provider',
-          immutable_subject = ?, published_commit = ?
+          immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
-    `).run(SUBJECT, SUBJECT, fixture.instance.id);
+    `).run(SUBJECT, publishedCommit, SUBJECT, fixture.instance.id);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
-    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
 
     await handleGithubEvent(
       {} as never,
@@ -1224,14 +1231,14 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           merged,
-          head: { ref: "ot/issue-1", sha: SUBJECT },
+          head: { ref: "ot/issue-1", sha: publishedCommit },
           base: { ref: "main" },
         },
       },
       fixture.pipelines
     );
 
-    const providerEventId = `github-pull-closed:owner/repo:1:${SUBJECT}`;
+    const providerEventId = `github-pull-closed:owner/repo:1:${publishedCommit}`;
     expect(fixture.pipelines.getInboxEvent(providerEventId)?.status).toBe("pending");
     expect(fixture.pipelines.getAttempt(fixture.attempt.id)?.status).toBe("pending");
     expect(fixture.pipelines.getInstance(fixture.instance.id)?.terminal_outcome).toBeNull();
@@ -1288,7 +1295,7 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           merged: true,
-          head: { ref: "ot/issue-1", sha: SUBJECT },
+          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
         },
       },
@@ -1296,10 +1303,10 @@ describe("deterministic supervisor stage gates", () => {
     );
 
     expect(recordJournalEntry).toHaveBeenCalledWith(expect.objectContaining({
-      id: `journal-github-merged-owner/repo-1-${SUBJECT}`,
+      id: `journal-github-merged-owner/repo-1-${PUBLISHED_COMMIT}`,
     }));
     expect(pipelines.getInboxEvent).toHaveBeenCalledWith(
-      `github-pull-closed:owner/repo:1:${SUBJECT}`
+      `github-pull-closed:owner/repo:1:${PUBLISHED_COMMIT}`
     );
   });
 
@@ -1320,7 +1327,7 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          head: { ref: "ot/issue-1", sha: SUBJECT },
+          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
         },
         review: {
@@ -1411,7 +1418,7 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          head: { ref: "ot/issue-1", sha: SUBJECT },
+          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
         },
         review: {
@@ -1641,7 +1648,7 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          head: { ref: "ot/issue-1", sha: SUBJECT },
+          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
         },
         review: {
@@ -1707,7 +1714,7 @@ describe("deterministic supervisor stage gates", () => {
           status: "completed",
           conclusion: "failure",
           head_branch: "ot/issue-1",
-          head_sha: SUBJECT,
+          head_sha: PUBLISHED_COMMIT,
           html_url: "https://github.com/owner/repo/actions/runs/20",
         },
       },
@@ -1735,7 +1742,7 @@ describe("deterministic supervisor stage gates", () => {
     moveFixtureToProviderWait(fixture);
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
-      if (url.endsWith(`/commits/${SUBJECT}/check-runs?per_page=100`)) {
+      if (url.endsWith(`/commits/${PUBLISHED_COMMIT}/check-runs?per_page=100`)) {
         return Response.json({
           check_runs: [{
             id: 501,
@@ -1776,7 +1783,7 @@ describe("deterministic supervisor stage gates", () => {
           status: "completed",
           conclusion: "failure",
           head_branch: "ot/issue-1",
-          head_sha: SUBJECT,
+          head_sha: PUBLISHED_COMMIT,
           url: "https://api.github.com/repos/owner/repo/check-suites/30",
         },
       },
@@ -1982,17 +1989,17 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
       status: "completion_pending_publication",
       terminal_outcome: "needs_human",
-      published_commit: SUBJECT,
+      published_commit: PUBLISHED_COMMIT,
     });
   });
 
   it("coalesces feedback arriving during repair and replays a claimed snapshot at provider wait", () => {
     const fixture = setup("core/implement@4");
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
-    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    fixture.tickets.setSetting("github-head:issue-1", PUBLISHED_COMMIT);
     fixture.db.prepare(`
       UPDATE pipeline_instances SET status = 'running', published_commit = ? WHERE id = ?
-    `).run(SUBJECT, fixture.instance.id);
+    `).run(PUBLISHED_COMMIT, fixture.instance.id);
     const route = (id: string) => routePipelineProviderEvent({
       pipelines: fixture.pipelines,
       store: fixture.tickets,
@@ -2002,7 +2009,7 @@ describe("deterministic supervisor stage gates", () => {
       summary: `Feedback ${id}`,
       evidence: [`https://github.com/owner/repo/pull/1#${id}`],
       payload: { kind: "review", id },
-      headSha: SUBJECT,
+      headSha: PUBLISHED_COMMIT,
       pullRequestUrl: "https://github.com/owner/repo/pull/1",
     });
 
@@ -2035,9 +2042,10 @@ describe("deterministic supervisor stage gates", () => {
     `).run(fixture.instance.id);
     fixture.db.prepare(`
       UPDATE pipeline_instances
-      SET status = 'waiting_provider', active_stage_id = 'provider', immutable_subject = ?
+      SET status = 'waiting_provider', active_stage_id = 'provider',
+          immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
-    `).run(SUBJECT, fixture.instance.id);
+    `).run(SUBJECT, PUBLISHED_COMMIT, SUBJECT, fixture.instance.id);
 
     expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
@@ -2056,10 +2064,10 @@ describe("deterministic supervisor stage gates", () => {
   it("routes a mixed same-head snapshot to repair re-entry, not the successful outcome", () => {
     const fixture = setup("core/implement@4");
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
-    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    fixture.tickets.setSetting("github-head:issue-1", PUBLISHED_COMMIT);
     fixture.db.prepare(`
       UPDATE pipeline_instances SET status = 'running', published_commit = ? WHERE id = ?
-    `).run(SUBJECT, fixture.instance.id);
+    `).run(PUBLISHED_COMMIT, fixture.instance.id);
 
     // GitHub reports success for the published head before the provider-wait
     // stage can receive, so the event is collected into the pending snapshot.
@@ -2067,12 +2075,12 @@ describe("deterministic supervisor stage gates", () => {
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
-      eventId: `github-pull-closed:owner/repo:1:${SUBJECT}`,
+      eventId: `github-pull-closed:owner/repo:1:${PUBLISHED_COMMIT}`,
       outcome: "success",
       summary: "GitHub reports the pull request merged.",
       evidence: ["https://github.com/owner/repo/pull/1"],
       payload: { kind: "pull_request", action: "closed", merged: true },
-      headSha: SUBJECT,
+      headSha: PUBLISHED_COMMIT,
       pullRequestUrl: "https://github.com/owner/repo/pull/1",
     })).toBe(true);
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots").pluck().get()).toBe("collecting");
@@ -2092,9 +2100,10 @@ describe("deterministic supervisor stage gates", () => {
     `).run(fixture.instance.id);
     fixture.db.prepare(`
       UPDATE pipeline_instances
-      SET status = 'waiting_provider', active_stage_id = 'provider', immutable_subject = ?
+      SET status = 'waiting_provider', active_stage_id = 'provider',
+          immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
-    `).run(SUBJECT, fixture.instance.id);
+    `).run(SUBJECT, PUBLISHED_COMMIT, SUBJECT, fixture.instance.id);
 
     // A Linear reply for the same head joins that snapshot as a repair request.
     const instance = fixture.pipelines.getInstance(fixture.instance.id)!;
@@ -2108,7 +2117,7 @@ describe("deterministic supervisor stage gates", () => {
       summary: "Linear reply requires another implementation pass.",
       evidence: ["Please rename the flag before shipping."],
       payload: { kind: "linear_reply", activity_id: "activity-1" },
-      headSha: SUBJECT,
+      headSha: PUBLISHED_COMMIT,
     });
     expect(processPipelineFeedbackSnapshot({
       pipelines: fixture.pipelines,
@@ -2153,7 +2162,7 @@ describe("deterministic supervisor stage gates", () => {
       payload: {
         kind: "pull_request_review",
       },
-      headSha: SUBJECT,
+      headSha: PUBLISHED_COMMIT,
       pullRequestUrl: "https://github.com/owner/repo/pull/1",
     })).toBe(true);
 
@@ -2171,7 +2180,7 @@ describe("deterministic supervisor stage gates", () => {
   it("preserves an unstructured repair request mixed with non-blocking diagnostics", () => {
     const fixture = setup("core/implement@4");
     moveFixtureToProviderWait(fixture, SUBJECT);
-    const workItemId = `pipeline-feedback:${fixture.instance.id}:${SUBJECT}`;
+    const workItemId = `pipeline-feedback:${fixture.instance.id}:${PUBLISHED_COMMIT}`;
     const eventPayload = (
       summary: string,
       findings?: Array<{ severity: "P2"; code: string; summary: string }>
@@ -2190,7 +2199,7 @@ describe("deterministic supervisor stage gates", () => {
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
-      headSha: SUBJECT,
+      headSha: PUBLISHED_COMMIT,
       kind: "pipeline_provider_event",
       payload: eventPayload("p2 mixed", [{
         severity: "P2",
@@ -2208,7 +2217,7 @@ describe("deterministic supervisor stage gates", () => {
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
-      headSha: SUBJECT,
+      headSha: PUBLISHED_COMMIT,
       kind: "pipeline_provider_event",
       payload: eventPayload("unstructured human feedback"),
       workItemId,
@@ -2233,7 +2242,7 @@ describe("deterministic supervisor stage gates", () => {
     const fixture = setup("core/implement@4");
     moveFixtureToProviderWait(fixture, SUBJECT);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
-    const workItemId = `pipeline-feedback:${fixture.instance.id}:${SUBJECT}`;
+    const workItemId = `pipeline-feedback:${fixture.instance.id}:${PUBLISHED_COMMIT}`;
     const payload = (
       providerEventId: string,
       findings: Array<{ severity: "P1" | "P2"; code: string; summary: string }>
@@ -2254,7 +2263,7 @@ describe("deterministic supervisor stage gates", () => {
         generation: fixture.instance.generation,
         repository: fixture.instance.repository,
         pullNumber: 1,
-        headSha: SUBJECT,
+        headSha: PUBLISHED_COMMIT,
         kind: "pipeline_provider_event",
         payload: payload(`p2 batch ${batch}`, Array.from({ length: 20 }, (_, index) => ({
           severity: "P2",
@@ -2273,7 +2282,7 @@ describe("deterministic supervisor stage gates", () => {
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
-      headSha: SUBJECT,
+      headSha: PUBLISHED_COMMIT,
       kind: "pipeline_provider_event",
       payload: payload("p1 after cap", [{
         severity: "P1",
@@ -2331,7 +2340,7 @@ describe("deterministic supervisor stage gates", () => {
       payload: {
         kind: "pull_request_review",
       },
-      headSha: SUBJECT,
+      headSha: PUBLISHED_COMMIT,
       pullRequestUrl: "https://github.com/owner/repo/pull/1",
     })).toBe(true);
 
@@ -2363,7 +2372,7 @@ describe("deterministic supervisor stage gates", () => {
         summary: "The status copy could be clearer.",
       }],
       providerPayload: {
-        expected_published_commit: SUBJECT,
+        expected_published_commit: PUBLISHED_COMMIT,
         observed_head_sha: driftHead,
       },
     });
@@ -2383,9 +2392,10 @@ describe("deterministic supervisor stage gates", () => {
   ])("carries same-run feedback from a superseded %s into the current provider wait", (_label, publicationOptions) => {
     const fixture = setup("core/implement@4");
     const oldHead = Object.values(publicationOptions)[0];
+    const currentPublishedCommit = "f".repeat(40);
     const localSubject = "b".repeat(40);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
-    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    fixture.tickets.setSetting("github-head:issue-1", PUBLISHED_COMMIT);
     fixture.db.prepare(`
       UPDATE pipeline_instances SET status = 'running', published_commit = ? WHERE id = ?
     `).run(oldHead, fixture.instance.id);
@@ -2407,11 +2417,11 @@ describe("deterministic supervisor stage gates", () => {
       .get("github-review:superseded-same-run")).toEqual({ head_sha: oldHead });
 
     const snapshot = fixture.db.prepare("SELECT * FROM feedback_snapshots").get() as { id: string };
-    moveFixtureToProviderWait(fixture, SUBJECT);
+    moveFixtureToProviderWait(fixture, SUBJECT, currentPublishedCommit);
 
     expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
     expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
-      .toEqual({ status: "consumed", head_sha: SUBJECT });
+      .toEqual({ status: "consumed", head_sha: currentPublishedCommit });
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
       stage_id: "repair_implementation",
       reentry_ordinal: 1,
@@ -2426,7 +2436,7 @@ describe("deterministic supervisor stage gates", () => {
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
     recordAcknowledgedPublication(fixture, "b".repeat(40), { publishedCommit: staleHead });
-    recordAcknowledgedPublication(fixture, SUBJECT, {}, "publication-current");
+    recordAcknowledgedPublication(fixture, SUBJECT, { publishedCommit: PUBLISHED_COMMIT }, "publication-current");
     moveFixtureToProviderWait(fixture, SUBJECT);
     fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
       .run(fixture.instance.id);
@@ -2459,12 +2469,12 @@ describe("deterministic supervisor stage gates", () => {
       pipelines: fixture.pipelines,
       store: fixture.tickets,
       ticket: fixture.tickets.getByIssueId("issue-1")!,
-      eventId: `github-pull-closed:owner/repo:1:${SUBJECT}`,
+      eventId: `github-pull-closed:owner/repo:1:${PUBLISHED_COMMIT}`,
       outcome: "success",
       summary: "GitHub reports the pull request merged.",
       evidence: ["https://github.com/owner/repo/pull/1"],
       payload: { kind: "pull_request", action: "closed", merged: true },
-      headSha: SUBJECT,
+      headSha: PUBLISHED_COMMIT,
       pullRequestUrl: "https://github.com/owner/repo/pull/1",
     })).toBe(true);
     expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
@@ -2477,9 +2487,9 @@ describe("deterministic supervisor stage gates", () => {
     const fixture = setup("core/implement@4");
     const previousHead = "d".repeat(40);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
-    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
+    fixture.tickets.setSetting("github-head:issue-1", PUBLISHED_COMMIT);
     recordAcknowledgedPublication(fixture, "b".repeat(40), { publishedCommit: previousHead }, "publication-previous");
-    recordAcknowledgedPublication(fixture, SUBJECT, {}, "publication-current");
+    recordAcknowledgedPublication(fixture, SUBJECT, { publishedCommit: PUBLISHED_COMMIT }, "publication-current");
     moveFixtureToProviderWait(fixture, SUBJECT);
     fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
       .run(fixture.instance.id);
@@ -2512,7 +2522,7 @@ describe("deterministic supervisor stage gates", () => {
     })).toBe(true);
 
     expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
-      .toEqual({ status: "consumed", head_sha: SUBJECT });
+      .toEqual({ status: "consumed", head_sha: PUBLISHED_COMMIT });
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
       stage_id: "repair_implementation",
       reentry_ordinal: 1,
@@ -2567,7 +2577,7 @@ describe("deterministic supervisor stage gates", () => {
       "2026-01-01T00:00:00.000Z"
     );
 
-    recordAcknowledgedPublication(fixture, SUBJECT, {}, "publication-current");
+    recordAcknowledgedPublication(fixture, SUBJECT, { publishedCommit: PUBLISHED_COMMIT }, "publication-current");
     moveFixtureToProviderWait(fixture, SUBJECT);
     fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
       .run(fixture.instance.id);
@@ -2624,7 +2634,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.tickets.claimFeedbackSnapshot(snapshot.id, Number.MAX_SAFE_INTEGER))
       .toMatchObject({ status: "claimed", snapshot: { repair_round: 1 } });
 
-    recordAcknowledgedPublication(fixture, SUBJECT, {}, "publication-current");
+    recordAcknowledgedPublication(fixture, SUBJECT, { publishedCommit: PUBLISHED_COMMIT }, "publication-current");
     moveFixtureToProviderWait(fixture, SUBJECT);
     fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
       .run(fixture.instance.id);
@@ -2645,8 +2655,8 @@ describe("deterministic supervisor stage gates", () => {
   it("still acts on new provider findings anchored to the repaired head", () => {
     const fixture = setup("core/implement@4");
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
-    fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
-    recordAcknowledgedPublication(fixture, SUBJECT, {}, "publication-current");
+    fixture.tickets.setSetting("github-head:issue-1", PUBLISHED_COMMIT);
+    recordAcknowledgedPublication(fixture, SUBJECT, { publishedCommit: PUBLISHED_COMMIT }, "publication-current");
     moveFixtureToProviderWait(fixture, SUBJECT);
     fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
       .run(fixture.instance.id);
@@ -2660,12 +2670,12 @@ describe("deterministic supervisor stage gates", () => {
       summary: "New review feedback against the repaired head.",
       evidence: ["https://github.com/owner/repo/pull/1#discussion_r4"],
       payload: { kind: "pull_request_review", id: "new-current-head-finding" },
-      headSha: SUBJECT,
+      headSha: PUBLISHED_COMMIT,
       pullRequestUrl: "https://github.com/owner/repo/pull/1",
     })).toBe(true);
 
     expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots").get())
-      .toEqual({ status: "consumed", head_sha: SUBJECT });
+      .toEqual({ status: "consumed", head_sha: PUBLISHED_COMMIT });
     expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
       status: "dispatchable",
       terminal_outcome: null,
@@ -2740,6 +2750,7 @@ describe("deterministic supervisor stage gates", () => {
   it("seals carried feedback under the head it was observed against, not the drainable head", () => {
     const fixture = setup("core/implement@4");
     const observedHead = "d".repeat(40);
+    const currentPublishedCommit = "f".repeat(40);
     const localSubject = "b".repeat(40);
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     fixture.tickets.setSetting("github-head:issue-1", SUBJECT);
@@ -2765,7 +2776,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(snapshot.head_sha).toBe(observedHead);
     expect(snapshot.observed_head_sha).toBe(observedHead);
 
-    moveFixtureToProviderWait(fixture, SUBJECT);
+    moveFixtureToProviderWait(fixture, SUBJECT, currentPublishedCommit);
     expect(drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
 
     // OPE-27 drainability is preserved: the snapshot is retargeted to the
@@ -2775,7 +2786,7 @@ describe("deterministic supervisor stage gates", () => {
       "SELECT status, head_sha, observed_head_sha FROM feedback_snapshots WHERE id = ?"
     ).get(snapshot.id)).toEqual({
       status: "consumed",
-      head_sha: SUBJECT,
+      head_sha: currentPublishedCommit,
       observed_head_sha: observedHead,
     });
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
@@ -2798,7 +2809,7 @@ describe("deterministic supervisor stage gates", () => {
       .find((artifact) => artifact.details?.snapshot_id === snapshot.id);
     expect(sealed?.repository?.subject).toBe(SUBJECT);
     expect(sealed?.details?.observed_head_sha).toBe(observedHead);
-    expect(sealed?.details?.expected_published_commit).toBe(SUBJECT);
+    expect(sealed?.details?.expected_published_commit).toBe(currentPublishedCommit);
   });
 
   it("continues draining when the oldest same-session feedback snapshot is stale", () => {

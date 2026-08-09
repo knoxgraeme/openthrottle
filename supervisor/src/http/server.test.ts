@@ -602,9 +602,10 @@ describe("coordinator-only server", () => {
     db.prepare(`
       UPDATE pipeline_instances
       SET status = 'waiting_provider', active_stage_id = 'provider',
-          published_commit = ?, updated_at = '2026-07-26T00:20:00.000Z'
+          immutable_subject = ?, published_commit = ?, published_subject = NULL,
+          updated_at = '2026-07-26T00:20:00.000Z'
       WHERE id = ?
-    `).run("c".repeat(40), instance.id);
+    `).run("d".repeat(40), "c".repeat(40), instance.id);
     // Production transitions never persist a pull_request receipt, so the
     // ticket projection (populated by the pull-request webhook) must back
     // published_pr_url on its own.
@@ -617,6 +618,21 @@ describe("coordinator-only server", () => {
       tickets: Array<{ pipeline: Record<string, unknown> | null }>;
     };
     expect(ticketFallbackBody.tickets[0]?.pipeline).toMatchObject({
+      published_pr_url: null,
+    });
+
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET published_subject = ?, updated_at = '2026-07-26T00:20:30.000Z'
+      WHERE id = ?
+    `).run("d".repeat(40), instance.id);
+    const boundTicketFallbackResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    const boundTicketFallbackBody = await boundTicketFallbackResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(boundTicketFallbackBody.tickets[0]?.pipeline).toMatchObject({
       published_pr_url: "https://github.com/owner/repo/pull/11",
     });
 
@@ -637,10 +653,10 @@ describe("coordinator-only server", () => {
     });
     db.prepare(`
       UPDATE pipeline_instances
-      SET published_commit = ?, published_subject = ?,
+      SET immutable_subject = ?, published_commit = ?, published_subject = ?,
           updated_at = '2026-07-26T00:22:00.000Z'
       WHERE id = ?
-    `).run("c".repeat(40), "d".repeat(40), instance.id);
+    `).run("d".repeat(40), "c".repeat(40), "d".repeat(40), instance.id);
 
     db.prepare(`
       INSERT INTO pipeline_publication_receipts (

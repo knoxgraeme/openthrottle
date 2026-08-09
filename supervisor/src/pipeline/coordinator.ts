@@ -170,7 +170,10 @@ function successPathIncludesPublication(manifest: PipelineManifest): boolean {
 
 function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: PipelineStage): boolean {
   if (stage.executor.kind === "provider_wait") {
-    return input.instance.published_commit !== null && input.event.providerRevision === input.instance.published_commit;
+    return input.instance.published_commit !== null &&
+      input.instance.published_subject !== null &&
+      input.event.providerRevision === input.instance.published_commit &&
+      input.event.subject === input.instance.published_subject;
   }
   if (stage.evaluator.kind === "publish_subject") {
     return input.event.providerRevision !== undefined && input.event.subject != null;
@@ -655,12 +658,17 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
   }
 
   const terminal = transition.terminal!;
+  const clearsPublishedBinding = shouldClearPublishedBinding(input);
+  const requiresExactPublicationEvidence = terminal === "shipped"
+    ? successPathIncludesPublication(input.manifest)
+    : terminal === "no_change" &&
+      !clearsPublishedBinding &&
+      (input.instance.published_commit !== null || input.instance.published_subject !== null);
   if (
-    terminal === "shipped" &&
-    successPathIncludesPublication(input.manifest) &&
+    requiresExactPublicationEvidence &&
     !eventHasExactPublishedSubject(input, stage)
   ) {
-    throw new Error("publishing pipeline cannot settle shipped without exact published provider evidence");
+    throw new Error("publishing pipeline cannot settle terminal without exact published provider evidence");
   }
   return terminalWrite({
     ...input,
@@ -670,7 +678,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     immutableSubject: input.event.subject ?? null,
     publishedCommit: publishedCommitForEvent(input, stage),
     publishedSubject: publishedSubjectForEvent(input, stage),
-    clearPublishedCommit: shouldClearPublishedBinding(input),
+    clearPublishedCommit: clearsPublishedBinding,
     effects: terminal === "failed" ? [failedTerminalStopEffect({
       instanceId: input.instance.id,
       idempotencyKey: `stop:${input.instance.id}:${terminal}`,
