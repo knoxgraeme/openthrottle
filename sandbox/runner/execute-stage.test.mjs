@@ -1350,6 +1350,11 @@ exit 1
       "OT_LOOP_CREDENTIALS_FILE",
       "OT_LOOP_REQUEST_FILE",
       "OT_LOOP_RESULT_FILE",
+      "OT_STAGE_CONFIG_FILE",
+      "OT_STAGE_MANIFEST_FILE",
+      "OT_STAGE_PROPOSAL_FILE",
+      "OT_STAGE_REQUEST_FILE",
+      "OT_STAGE_RESULT_FILE",
       "GITHUB_REPO",
     ].map((name) => [name, process.env[name]]));
     try {
@@ -1362,6 +1367,11 @@ exit 1
       process.env.OT_LOOP_CREDENTIALS_FILE = "/private/loop-credentials.json";
       process.env.OT_LOOP_REQUEST_FILE = "/private/loop-request.json";
       process.env.OT_LOOP_RESULT_FILE = "/private/loop-result.json";
+      process.env.OT_STAGE_CONFIG_FILE = "/private/stage-config.json";
+      process.env.OT_STAGE_MANIFEST_FILE = "/private/stage-manifest.json";
+      process.env.OT_STAGE_PROPOSAL_FILE = "/private/stage-proposal.json";
+      process.env.OT_STAGE_REQUEST_FILE = "/private/stage-request.json";
+      process.env.OT_STAGE_RESULT_FILE = "/private/stage-result.json";
       process.env.GITHUB_REPO = "owner/repo";
       const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
       directories.push(binDir);
@@ -1377,6 +1387,11 @@ exit 1
         "loopCredentials: process.env.OT_LOOP_CREDENTIALS_FILE ?? null",
         "loopRequest: process.env.OT_LOOP_REQUEST_FILE ?? null",
         "loopResult: process.env.OT_LOOP_RESULT_FILE ?? null",
+        "stageConfig: process.env.OT_STAGE_CONFIG_FILE ?? null",
+        "stageManifest: process.env.OT_STAGE_MANIFEST_FILE ?? null",
+        "stageProposal: process.env.OT_STAGE_PROPOSAL_FILE ?? null",
+        "stageRequest: process.env.OT_STAGE_REQUEST_FILE ?? null",
+        "stageResult: process.env.OT_STAGE_RESULT_FILE ?? null",
         "repo: process.env.GITHUB_REPO ?? null",
         "home: process.env.HOME ?? null",
         "user: process.env.USER ?? null",
@@ -1397,6 +1412,11 @@ exit 1
         loopCredentials: null,
         loopRequest: null,
         loopResult: null,
+        stageConfig: null,
+        stageManifest: null,
+        stageProposal: null,
+        stageRequest: null,
+        stageResult: null,
         repo: "owner/repo",
         home: "/home/agent",
         user: "agent",
@@ -1417,6 +1437,11 @@ exit 1
       expect(commandEnv.OT_LOOP_CREDENTIALS_FILE).toBeUndefined();
       expect(commandEnv.OT_LOOP_REQUEST_FILE).toBeUndefined();
       expect(commandEnv.OT_LOOP_RESULT_FILE).toBeUndefined();
+      expect(commandEnv.OT_STAGE_CONFIG_FILE).toBeUndefined();
+      expect(commandEnv.OT_STAGE_MANIFEST_FILE).toBeUndefined();
+      expect(commandEnv.OT_STAGE_PROPOSAL_FILE).toBeUndefined();
+      expect(commandEnv.OT_STAGE_REQUEST_FILE).toBeUndefined();
+      expect(commandEnv.OT_STAGE_RESULT_FILE).toBeUndefined();
     } finally {
       for (const [name, value] of Object.entries(previous)) {
         if (value === undefined) delete process.env[name];

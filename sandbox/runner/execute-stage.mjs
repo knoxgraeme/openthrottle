@@ -314,6 +314,11 @@ const PRIVATE_REPOSITORY_COMMAND_ENV = new Set([
   "OT_LOOP_CREDENTIALS_FILE",
   "OT_LOOP_REQUEST_FILE",
   "OT_LOOP_RESULT_FILE",
+  "OT_STAGE_CONFIG_FILE",
+  "OT_STAGE_MANIFEST_FILE",
+  "OT_STAGE_PROPOSAL_FILE",
+  "OT_STAGE_REQUEST_FILE",
+  "OT_STAGE_RESULT_FILE",
 ]);
 
 export function repositoryCommandEnvironment(env = process.env) {
