@@ -399,6 +399,23 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     return base;
   };
 
+  const receiptBaseFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string => {
+    if (action.action_kind !== "final_review") return worktreeBaseFor(instance, action);
+    if (action.request_payload) {
+      try {
+        const request = JSON.parse(action.request_payload) as { protocol?: unknown; baseSubject?: unknown };
+        if (request.protocol === "loop-action@2" &&
+            typeof request.baseSubject === "string" &&
+            GIT_SUBJECT.test(request.baseSubject)) {
+          return request.baseSubject;
+        }
+      } catch {
+        // The request-hash fence still rejects incompatible legacy receipts.
+      }
+    }
+    return instance.base_commit;
+  };
+
   const latestPriorOutputSubject = (
     action: ExecutionWorkAttempt,
     kinds: readonly UnitActionKind[]
@@ -539,7 +556,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       generation: instance.generation,
       nativeSessionId: receiptNativeSessionId,
       requestHash: action.request_hash ?? "",
-      baseSubject: action.action_kind === "final_review" ? instance.base_commit : worktreeBaseFor(instance, action),
+      baseSubject: receiptBaseFor(instance, action),
       preSubject: actionInputSubjectFor(instance, action),
       subject,
       producers: expectedProducersFor(instance, action),
