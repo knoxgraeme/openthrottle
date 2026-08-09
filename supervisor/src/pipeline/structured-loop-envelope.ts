@@ -36,8 +36,13 @@ function referencedTextDigest(ids: Set<string>, values: Record<string, string>):
   return digestCanonicalJson(Object.fromEntries([...ids].map((id) => [id, values[id] ?? null])));
 }
 
-function truncatedTextCount(ids: Set<string>, values: Record<string, string>, limit: number): number {
+function truncatedTextCount(ids: Set<string>, values: Record<string, string>, limit: number | null): number {
+  if (limit === null) return 0;
   return [...ids].filter((id) => (values[id]?.length ?? 0) > limit).length;
+}
+
+function maybeBoundedText(value: string | undefined, limit: number | null): string {
+  return limit === null ? value ?? "" : boundedText(value, limit);
 }
 
 function finalReviewFullDetailDigest(input: {
@@ -190,8 +195,12 @@ function finalReviewPlanContext(plan: ExecutionPlanContract, actionKind: UnitAct
   if (Buffer.byteLength(canonicalJson(context), "utf8") <= FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES) return context;
 
   const titleLimit = 120;
-  const detailLimit = 320;
-  const compact = {
+  const maxDetailLength = Math.max(
+    0,
+    ...[...instructionIds].map((id) => plan.instructions[id]?.length ?? 0),
+    ...[...acceptanceIds].map((id) => plan.acceptance[id]?.length ?? 0)
+  );
+  const compactForDetailLimit = (detailLimit: number | null) => ({
     ...context,
     context_complete: false,
     truncated: true,
@@ -220,10 +229,28 @@ function finalReviewPlanContext(plan: ExecutionPlanContract, actionKind: UnitAct
       ...unit,
       title: boundedText(unit.title, titleLimit),
     })),
-    instructions: Object.fromEntries([...instructionIds].map((id) => [id, boundedText(plan.instructions[id], detailLimit)])),
-    acceptance: Object.fromEntries([...acceptanceIds].map((id) => [id, boundedText(plan.acceptance[id], detailLimit)])),
-  };
-  if (Buffer.byteLength(canonicalJson(compact), "utf8") <= FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES) return compact;
+    instructions: Object.fromEntries([...instructionIds].map((id) => [id, maybeBoundedText(plan.instructions[id], detailLimit)])),
+    acceptance: Object.fromEntries([...acceptanceIds].map((id) => [id, maybeBoundedText(plan.acceptance[id], detailLimit)])),
+  });
+  const titleOnlyCompact = compactForDetailLimit(null);
+  if (Buffer.byteLength(canonicalJson(titleOnlyCompact), "utf8") <= FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES) {
+    return titleOnlyCompact;
+  }
+
+  let low = 0;
+  let high = maxDetailLength;
+  let compact: Record<string, unknown> | null = null;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = compactForDetailLimit(mid);
+    if (Buffer.byteLength(canonicalJson(candidate), "utf8") <= FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES) {
+      compact = candidate;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  if (compact) return compact;
 
   return finalReviewFallbackContext({ plan, actionKind, instructionIds, acceptanceIds });
 }
