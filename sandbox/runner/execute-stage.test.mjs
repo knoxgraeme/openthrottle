@@ -20,6 +20,7 @@ import {
   computeWorkspaceTreeOid,
   classifyAgentExecutionFailure,
   createStageRequestHash,
+  defaultExecuteCommand,
   defaultRunAgent,
   executeStage,
   extractNativeSessionId,
@@ -27,6 +28,7 @@ import {
   lockRepositorySkillStageHome,
   lockRepositorySkillStagePersistentProfiles,
   materializeRepositorySkill,
+  repositoryCommandEnvironment,
   repositorySkillStageEnvironment,
   resolveContextInvocation,
   runCapturedProcess,
@@ -1327,6 +1329,80 @@ exit 1
     }));
     expect(result.outcome).toBe("success");
     expect(JSON.parse(result.artifacts[0].payload).details.command_name).toBe("docs-check");
+  });
+
+  it("scrubs private executor liveness variables from repository commands while preserving command environment", () => {
+    const input = fixture({
+      capability: "command/run@1",
+      contextPolicy: "none",
+      requiredArtifacts: ["stage_result", "command_result"],
+      credentialScopes: ["repo.read"],
+      liveSteering: false,
+      commandName: "test",
+    });
+    const previous = Object.fromEntries([
+      "RUN_ID",
+      "OT_CHILD_ACTION_ID",
+      "OT_HEARTBEAT_FILE",
+      "OT_EXECUTOR_HEARTBEAT_INTERVAL_MS",
+      "OT_CHILD_EXECUTOR_REQUEST_FILE",
+      "GITHUB_REPO",
+    ].map((name) => [name, process.env[name]]));
+    try {
+      process.env.RUN_ID = "run-private";
+      process.env.OT_CHILD_ACTION_ID = "child-private";
+      process.env.OT_HEARTBEAT_FILE = "/private/heartbeat.json";
+      process.env.OT_EXECUTOR_HEARTBEAT_INTERVAL_MS = "1000";
+      process.env.OT_CHILD_EXECUTOR_REQUEST_FILE = "/private/request.json";
+      process.env.GITHUB_REPO = "owner/repo";
+      const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+      directories.push(binDir);
+      installFakeGosu(binDir);
+
+      const probe = [
+        "run: process.env.RUN_ID ?? null",
+        "child: process.env.OT_CHILD_ACTION_ID ?? null",
+        "heartbeat: process.env.OT_HEARTBEAT_FILE ?? null",
+        "interval: process.env.OT_EXECUTOR_HEARTBEAT_INTERVAL_MS ?? null",
+        "childRequest: process.env.OT_CHILD_EXECUTOR_REQUEST_FILE ?? null",
+        "repo: process.env.GITHUB_REPO ?? null",
+        "home: process.env.HOME ?? null",
+        "user: process.env.USER ?? null",
+      ].join(", ");
+      const execution = withPrependedPath(binDir, () => defaultExecuteCommand({
+        command: `node -e 'console.log(JSON.stringify({${probe}}))'`,
+        repoDir: input.repoDir,
+        timeoutMs: 10_000,
+      }));
+      expect(execution).toMatchObject({ exitCode: 0, signal: null, timedOut: false });
+      expect(JSON.parse(execution.stdout)).toEqual({
+        run: null,
+        child: null,
+        heartbeat: null,
+        interval: null,
+        childRequest: null,
+        repo: "owner/repo",
+        home: "/home/agent",
+        user: "agent",
+      });
+
+      const commandEnv = repositoryCommandEnvironment();
+      expect(commandEnv).toMatchObject({
+        HOME: "/home/agent",
+        USER: "agent",
+        GITHUB_REPO: "owner/repo",
+      });
+      expect(commandEnv.RUN_ID).toBeUndefined();
+      expect(commandEnv.OT_CHILD_ACTION_ID).toBeUndefined();
+      expect(commandEnv.OT_HEARTBEAT_FILE).toBeUndefined();
+      expect(commandEnv.OT_EXECUTOR_HEARTBEAT_INTERVAL_MS).toBeUndefined();
+      expect(commandEnv.OT_CHILD_EXECUTOR_REQUEST_FILE).toBeUndefined();
+    } finally {
+      for (const [name, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 
   it("normalizes an unconfigured command to a valid no-change event outcome", () => {

@@ -304,12 +304,37 @@ export function resolveContextInvocation(request) {
 }
 
 export const REPOSITORY_COMMAND_TIMEOUT_MS = 7_200_000;
+const PRIVATE_REPOSITORY_COMMAND_ENV = new Set([
+  "RUN_ID",
+  "OT_CHILD_ACTION_ID",
+  "OT_CHILD_EXECUTOR_REQUEST_FILE",
+  "OT_CHILD_EXECUTOR_RESULT_FILE",
+  "OT_EXECUTOR_HEARTBEAT_INTERVAL_MS",
+  "OT_HEARTBEAT_FILE",
+  "OT_LOOP_CREDENTIALS_FILE",
+  "OT_LOOP_REQUEST_FILE",
+  "OT_LOOP_RESULT_FILE",
+]);
+
+export function repositoryCommandEnvironment(env = process.env) {
+  const commandEnv = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (PRIVATE_REPOSITORY_COMMAND_ENV.has(name)) continue;
+    commandEnv[name] = value;
+  }
+  return {
+    ...commandEnv,
+    HOME: "/home/agent",
+    USER: "agent",
+  };
+}
 
 export function defaultExecuteCommand({ command, repoDir, timeoutMs }) {
   if (!command) return { notConfigured: true, exitCode: null, signal: null, timedOut: false, stdout: "", stderr: "" };
   const result = runWithAgentProcessFence(
-    () => runCapturedProcess("gosu", ["agent", "env", "HOME=/home/agent", "USER=agent", "bash", "-lc", command], {
+    () => runCapturedProcess("gosu", ["agent", "bash", "-lc", command], {
       cwd: repoDir,
+      env: repositoryCommandEnvironment(),
       timeout: timeoutMs,
       captureBytes: 8 * 1024 * 1024,
     }),
