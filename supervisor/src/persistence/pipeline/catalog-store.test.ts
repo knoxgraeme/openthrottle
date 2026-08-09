@@ -1,7 +1,8 @@
 import type Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   canonicalJson,
@@ -9,6 +10,7 @@ import {
   loadPipelineCatalog,
   validatePipelineManifest,
 } from "../../pipeline/manifest.js";
+import { parseAndCompileExecutionGraph } from "../../pipeline/execution-graph.js";
 import { buildInstalledRuntimeDescriptor, loadRuntimeCapabilityDescriptor } from "../../__fixtures__/runtime.js";
 import { openDb } from "../database.js";
 import { createPipelineStore } from "./create-store.js";
@@ -25,6 +27,9 @@ import {
 describe("pipeline catalog store", () => {
   let db: Database.Database | undefined;
   const temporaryDirectories: string[] = [];
+  const structuredV1GraphPath = fileURLToPath(new URL("../../../graphs/structured-v1.json", import.meta.url));
+  const structuredV2GraphPath = fileURLToPath(new URL("../../../graphs/structured-v2.json", import.meta.url));
+  const legacyStructuredV1Digest = "13f4b9ed94324317a78a2228a53f781d5f382b406063316bfeb85e53c37b0830";
 
   afterEach(() => {
     db?.close();
@@ -98,6 +103,156 @@ describe("pipeline catalog store", () => {
     }
     expect(pipelines.getInstanceForSession("session-v1")?.pipeline_version).toBe(1);
     expect(pipelines.getInstanceForSession("session-v2")?.pipeline_version).toBe(3);
+  });
+
+  it("keeps the exact legacy structured v1 catalog entry immutable while admitting repaired structured v2", () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("structured-catalog-test/v1");
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    const legacyV1 = parseAndCompileExecutionGraph(readFileSync(structuredV1GraphPath, "utf8"), {
+      source: "builtin:core/structured@1",
+      id: "builtin/structured",
+      version: 1,
+      description: "Compiled execution graph structured from builtin core/structured@1.",
+      maxAttempts: 200,
+      runtime: runtimeDescriptor.descriptor,
+    }).manifest;
+    const repairedV2 = parseAndCompileExecutionGraph(readFileSync(structuredV2GraphPath, "utf8"), {
+      source: "builtin:core/structured@2",
+      id: "builtin/structured",
+      version: 2,
+      description: "Compiled execution graph structured from builtin core/structured@2.",
+      maxAttempts: 200,
+      runtime: runtimeDescriptor.descriptor,
+      aggregatePublishContext: "prefer_resume",
+    }).manifest;
+    expect(legacyV1.digest).toBe(legacyStructuredV1Digest);
+    db.prepare(`
+      INSERT INTO pipeline_catalog_entries (
+        pipeline_id, version, digest, normalized_manifest, accepted_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run("builtin/structured", 1, legacyStructuredV1Digest, legacyV1.normalized, new Date(0).toISOString());
+
+    expect(() => pipelines.acceptManifest(legacyV1)).not.toThrow();
+    const changedLegacyManifest = JSON.parse(legacyV1.normalized) as Record<string, unknown>;
+    const changedLegacyV1 = validatePipelineManifest({
+      ...changedLegacyManifest,
+      description: "Changed legacy structured v1 bytes.",
+    }, { source: "builtin:core/structured@1", runtime: runtimeDescriptor.descriptor });
+    expect(changedLegacyV1.digest).not.toBe(legacyStructuredV1Digest);
+    expect(() => pipelines.acceptManifest(changedLegacyV1)).toThrow(/different digest/);
+    pipelines.acceptManifest(repairedV2);
+    expect(() => pipelines.acceptManifest(repairedV2)).not.toThrow();
+
+    expect(db.prepare(`
+      SELECT pipeline_id, version, digest FROM pipeline_catalog_entries
+      WHERE pipeline_id = 'builtin/structured'
+      ORDER BY version
+    `).all()).toEqual([
+      { pipeline_id: "builtin/structured", version: 1, digest: legacyV1.digest },
+      { pipeline_id: "builtin/structured", version: 2, digest: repairedV2.digest },
+    ]);
+    expect(legacyV1.digest).not.toBe(repairedV2.digest);
+  });
+
+  it("re-admits an unchanged repository graph with a direct aggregate publish edge", () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("repository-graph-catalog-test/v1", {
+      capabilities: [
+        ...buildInstalledRuntimeDescriptor("repository-graph-base/v1").descriptor.capabilities,
+        "accept-unit@1",
+        "graph/for-each-unit@1",
+      ],
+    });
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    const repositoryGraph = {
+      schema: "openthrottle.graph/v1",
+      id: "repository/direct-aggregate-publish",
+      version: 3,
+      entry_node: "units",
+      workers: [{
+        id: "worker",
+        engine: "agent",
+        skills: ["builtin://ce/implement@1"],
+        allowed_mcp_servers: [],
+        session_scope: "attempt",
+        credentials: ["model.invoke", "provider.read", "repo.read"],
+      }, {
+        id: "lead-worker",
+        engine: "agent",
+        skills: ["builtin://accept-unit@1"],
+        allowed_mcp_servers: [],
+        session_scope: "fresh",
+        credentials: ["model.invoke", "repo.read"],
+      }],
+      loops: [{
+        id: "loop",
+        worker: "worker",
+        skill: "builtin://ce/implement@1",
+        input_scope: "unit",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      }, {
+        id: "lead-loop",
+        worker: "lead-worker",
+        skill: "builtin://accept-unit@1",
+        input_scope: "unit",
+        receipt: "unit_decision",
+        max_parallel: 1,
+        max_rounds: 1,
+        timeout_seconds: 60,
+      }],
+      nodes: [{
+        id: "units",
+        kind: "for_each_unit",
+        phases: [
+          { id: "implement", kind: "agent", loop: "loop" },
+          { id: "candidate", kind: "evidence" },
+          { id: "lead", kind: "gate", loop: "lead-loop" },
+          { id: "integrate", kind: "integrate" },
+        ],
+        depends_on: [],
+        transitions: {
+          success: { to: "publish" },
+          repair_required: { terminal: "needs_human" },
+          retryable_failure: { terminal: "failed" },
+          failure: { terminal: "failed" },
+        },
+      }, {
+        id: "publish",
+        kind: "publish",
+        depends_on: [],
+        transitions: {
+          success: { terminal: "completed" },
+          repair_required: { terminal: "needs_human" },
+          retryable_failure: { terminal: "failed" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    };
+    const manifest = parseAndCompileExecutionGraph(JSON.stringify(repositoryGraph), {
+      source: "owner/repo@005a0a89783b92a72518ce0ab04e287c9a4ad31e:.openthrottle/graphs/structured.json",
+      id: "repository/direct-aggregate-publish",
+      version: 3,
+      description: "Compiled repository graph direct aggregate publish fixture.",
+      maxAttempts: 200,
+      runtime: runtimeDescriptor.descriptor,
+    }).manifest;
+
+    expect(manifest.digest).toBe("fd1d1345f05a8bf8d77a2d867be7f47d462447862147e0e3a5af074b6ba34984");
+    expect(manifest.manifest.stages.find((stage) => stage.id === "publish")?.context).toBe("resume_required");
+    db.prepare(`
+      INSERT INTO pipeline_catalog_entries (
+        pipeline_id, version, digest, normalized_manifest, accepted_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(manifest.manifest.id, manifest.manifest.version, manifest.digest, manifest.normalized, new Date(0).toISOString());
+
+    expect(() => pipelines.acceptManifest(manifest)).not.toThrow();
+    expect(pipelines.getAcceptedManifestDigest(manifest.manifest.id, manifest.manifest.version)).toBe(manifest.digest);
   });
 
   it("revalidates pinned hashes and restricts deletion of audit-bearing parents", () => {

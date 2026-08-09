@@ -162,7 +162,12 @@ function completionReceipt(subject: string, attempt: ExecutionWorkAttempt): stri
   });
 }
 
-function semanticReviewReceipt(subject: string, attempt: ExecutionWorkAttempt, message: string): string {
+function semanticReviewReceipt(
+  subject: string,
+  attempt: ExecutionWorkAttempt,
+  message: string,
+  base = "a".repeat(40)
+): string {
   return canonicalJson({
     schema: "openthrottle.receipt/v1",
     type: "semantic_review",
@@ -175,7 +180,7 @@ function semanticReviewReceipt(subject: string, attempt: ExecutionWorkAttempt, m
       skill_package_digest: null,
     },
     subject: {
-      base: "a".repeat(40),
+      base,
       pre: subject,
       post: subject,
     },
@@ -1975,6 +1980,101 @@ describe("structured child runtime repair fences", () => {
         receipts: [],
       },
     });
+  });
+
+  it("accepts an in-flight final review receipt sealed with its persisted request base", async () => {
+    const integratedSubject = "b".repeat(40);
+    const requestHash = "e".repeat(64);
+    const finalReview = action({
+      id: "legacy-final-review",
+      action_kind: "final_review",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 5,
+      unit_id: null,
+      execution_unit_id: null,
+      request_hash: requestHash,
+      request_payload: canonicalJson({
+        protocol: "loop-action@2",
+        baseSubject: integratedSubject,
+      }),
+      request_launch_state: "launched",
+    });
+    const receipt = semanticReviewReceipt(
+      integratedSubject,
+      finalReview,
+      "legacy final-review base",
+      integratedSubject
+    );
+    const completeGatedAction = vi.fn();
+    const failUnitAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        collectLoopActionResult: async () => ({
+          actionId: finalReview.id,
+          attemptId: "parent-attempt",
+          requestHash,
+          outcome: "success",
+          nativeSessionId: null,
+          subject: integratedSubject,
+          receipt,
+          completedAt: "2099-07-22T12:00:00.000Z",
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => finalReview,
+        completeGatedAction,
+        failUnitAction,
+        listWorkAttempts: () => [finalReview],
+        getGraphForAttempt: () => ({
+          integration_subject: integratedSubject,
+          command_names: "[]",
+        }),
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 7,
+      base_commit: "a".repeat(40),
+      immutable_subject: integratedSubject,
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhaseBindings: [
+            {
+              id: "implement",
+              kind: "agent",
+              loop: { skill: "builtin://ce/implement@1", timeout_seconds: 60 },
+              worker: { id: "worker-1", agent: "inherit", allowed_mcp_servers: [] },
+              credentials: ["model.invoke", "provider.read", "repo.read"],
+              context: "resume_required",
+            },
+            {
+              id: "lead",
+              kind: "gate",
+              loop: { skill: "builtin://accept-unit@1", timeout_seconds: 60 },
+              worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
+              credentials: ["model.invoke", "repo.read"],
+              context: "fresh",
+            },
+          ],
+        }],
+      }),
+    } as any, "parent-attempt");
+
+    expect(failUnitAction).not.toHaveBeenCalled();
+    expect(completeGatedAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: finalReview.id,
+      outputSubject: integratedSubject,
+      receipt,
+    }));
   });
 
   it("dispatches lead review against the current cycle candidate evidence", async () => {

@@ -12,11 +12,15 @@ import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 const catalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const simpleGraphPath = fileURLToPath(new URL("../../graphs/simple-v1.json", import.meta.url));
 const investigateGraphPath = fileURLToPath(new URL("../../graphs/investigate-v1.json", import.meta.url));
-const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
+const structuredV1GraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
+const structuredV2GraphPath = fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url));
 const SIMPLE_GRAPH_DIGEST = "2f25ae9b891405d0e73e5f3c0f103354183c8cb27ca923cbd06baa6c470b76d1";
 const SIMPLE_MANIFEST_DIGEST = "9b705c003313187cb2f7e219c99e1cbf795d966be0e1d257015462219833ac6a";
 const INVESTIGATE_GRAPH_DIGEST = "a76d3e1360d92f41bc7aa9ed2372e294555478d5854808bf0c2a5ed7febaf317";
 const INVESTIGATE_MANIFEST_DIGEST = "d159ef720f5dbc7216b8dd502e3961ac30ffb2c4d4ea44a5afdc71a78f84da4e";
+const STRUCTURED_V2_COMPILE_OPTIONS = {
+  aggregatePublishContext: "prefer_resume",
+} as const;
 
 function shippedManifest(reference: string): PipelineManifest {
   const catalog = loadPipelineCatalog(catalogPath, buildInstalledRuntimeDescriptor("test-runtime/v1").descriptor);
@@ -225,7 +229,7 @@ describe("execution graph compiler", () => {
     });
   });
 
-  it("compiles for_each_unit to the structured graph runtime capability with test descriptors", () => {
+  it("keeps built-in structured v1 on the legacy aggregate terminal behavior", () => {
     const runtime = buildInstalledRuntimeDescriptor("structured-test/v1", {
       capabilities: [
         ...buildInstalledRuntimeDescriptor("base-test/v1").descriptor.capabilities,
@@ -234,8 +238,8 @@ describe("execution graph compiler", () => {
         "graph/for-each-unit@1",
       ],
     });
-    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
-      source: structuredGraphPath,
+    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredV1GraphPath, "utf8"), {
+      source: structuredV1GraphPath,
       runtime: runtime.descriptor,
     });
 
@@ -243,18 +247,59 @@ describe("execution graph compiler", () => {
       id: "builtin/structured",
       version: 1,
       entry_stage: "units",
-      requires: { capabilities: ["ce/implement@1", "ce/simplify@1", "graph/for-each-unit@1", "accept-unit@1"] },
-      stages: [{
-        id: "units",
-        executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
-        evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
-        context: "none",
-        live_steering: false,
-        credentials: ["provider.read", "repo.read"],
-        produces: ["stage_result", "execution_graph_result"],
-        unitPhases: ["implement", "simplify", "command", "candidate", "lead", "integrate"],
-        unitCommandNames: ["test", "lint", "build"],
-      }],
+      requires: {
+        capabilities: [
+          "ce/implement@1",
+          "ce/simplify@1",
+          "graph/for-each-unit@1",
+          "accept-unit@1",
+        ],
+      },
+    });
+    expect(compiled.manifest.manifest.stages.map((stage) => stage.id)).toEqual(["units"]);
+    expect(compiled.manifest.manifest.stages[0]?.transitions.success).toEqual({ terminal: "shipped" });
+  });
+
+  it("compiles structured v2 to the repaired aggregate publish provider tail", () => {
+    const runtime = buildInstalledRuntimeDescriptor("structured-test/v1", {
+      capabilities: [
+        ...buildInstalledRuntimeDescriptor("base-test/v1").descriptor.capabilities,
+        "accept-unit@1",
+        "ce/simplify@1",
+        "graph/for-each-unit@1",
+      ],
+    });
+    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredV2GraphPath, "utf8"), {
+      source: structuredV2GraphPath,
+      runtime: runtime.descriptor,
+      ...STRUCTURED_V2_COMPILE_OPTIONS,
+    });
+
+    expect(compiled.manifest.manifest).toMatchObject({
+      id: "builtin/structured",
+      version: 2,
+      entry_stage: "units",
+      requires: {
+        capabilities: [
+          "ce/implement@1",
+          "ce/simplify@1",
+          "ce/publish@1",
+          "graph/for-each-unit@1",
+          "provider/wait@1",
+          "accept-unit@1",
+        ],
+      },
+    });
+    expect(compiled.manifest.manifest.stages[0]).toMatchObject({
+      id: "units",
+      executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
+      evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
+      context: "none",
+      live_steering: false,
+      credentials: ["provider.read", "repo.read"],
+      produces: ["stage_result", "execution_graph_result"],
+      unitPhases: ["implement", "simplify", "command", "candidate", "lead", "integrate"],
+      unitCommandNames: ["test", "lint", "build"],
     });
     const phaseAction = (phase: NonNullable<PipelineStage["unitPhaseBindings"]>[number]): string => {
       if (phase.kind === "command") return "command";
@@ -274,17 +319,102 @@ describe("execution graph compiler", () => {
       { id: "lead", kind: "gate", action: "accept-unit@1", receipt: "unit_decision" },
       { id: "integrate", kind: "integrate", action: "integrate", receipt: undefined },
     ]);
+    expect(compiled.manifest.manifest.stages.map((stage) => stage.id)).toEqual(["units", "publish", "provider"]);
+    expect(compiled.manifest.manifest.stages[0]?.transitions.success).toEqual({ to: "publish" });
+    expect(compiled.manifest.manifest.stages[1]).toMatchObject({
+      id: "publish",
+      executor: { kind: "agent", capability: "ce/publish@1" },
+      context: "prefer_resume",
+      transitions: {
+        success: { to: "provider" },
+        semantic_repair_required: { terminal: "needs_human" },
+      },
+    });
+    expect(compiled.manifest.manifest.stages[2]).toMatchObject({
+      id: "provider",
+      executor: { kind: "provider_wait", capability: "provider/wait@1" },
+      transitions: {
+        success: { terminal: "shipped" },
+        semantic_repair_required: { terminal: "needs_human" },
+      },
+    });
     expect(compiled.unitPhases).toEqual(["implement", "simplify", "command", "candidate", "lead", "integrate"]);
     expect(compiled.unitCommandNames).toEqual(["test", "lint", "build"]);
     expect(compiled.manifest.manifest.stages[0]?.transitions.no_change).toEqual({ terminal: "no_change" });
   });
 
   it("compiles the structured graph against the shipped production runtime descriptor", () => {
-    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
-      source: structuredGraphPath,
+    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredV2GraphPath, "utf8"), {
+      source: structuredV2GraphPath,
       runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
+      ...STRUCTURED_V2_COMPILE_OPTIONS,
     });
     expect(compiled.manifest.manifest.requires.capabilities).toContain("graph/for-each-unit@1");
+  });
+
+  it("preserves repository graph output for direct aggregate publish unless explicitly opted in", () => {
+    const graph = minimalUnitGraph({
+      worker: { session_scope: "attempt" },
+    });
+    const units = (graph.nodes as Record<string, unknown>[])[0]!;
+    units.transitions = {
+      success: { to: "publish" },
+      repair_required: { terminal: "needs_human" },
+      retryable_failure: { terminal: "failed" },
+      failure: { terminal: "failed" },
+    };
+    (graph.nodes as Record<string, unknown>[]).push({
+      id: "publish",
+      kind: "publish",
+      depends_on: [],
+      transitions: {
+        success: { terminal: "completed" },
+        repair_required: { terminal: "needs_human" },
+        retryable_failure: { terminal: "failed" },
+        failure: { terminal: "failed" },
+      },
+    });
+
+    const compiled = validateAndCompileExecutionGraph(graph, {
+      id: "repository/a",
+      version: 7,
+    });
+    const publish = compiled.manifest.manifest.stages.find((stage) => stage.id === "publish")!;
+
+    expect(publish.context).toBe("resume_required");
+    expect(compiled.manifest.digest).toBe("eeb2f6bed1d6e6b20a478f4f77284c935714ad5b2e11d47623363d2fa8edb769");
+  });
+
+  it("opts aggregate publish into prefer_resume only through the explicit compiler option", () => {
+    const graph = minimalUnitGraph();
+    const units = (graph.nodes as Record<string, unknown>[])[0]!;
+    units.transitions = {
+      success: { to: "publish" },
+      repair_required: { terminal: "needs_human" },
+      retryable_failure: { terminal: "failed" },
+      failure: { terminal: "failed" },
+    };
+    (graph.nodes as Record<string, unknown>[]).push({
+      id: "publish",
+      kind: "publish",
+      depends_on: [],
+      transitions: {
+        success: { terminal: "completed" },
+        repair_required: { terminal: "needs_human" },
+        retryable_failure: { terminal: "failed" },
+        failure: { terminal: "failed" },
+      },
+    });
+
+    const compiled = validateAndCompileExecutionGraph(graph, {
+      aggregatePublishContext: "prefer_resume",
+    });
+    const publish = compiled.manifest.manifest.stages.find((stage) => stage.id === "publish")!;
+
+    expect(publish.context).toBe("prefer_resume");
+    expect(() => validateAndCompileExecutionGraph(graph, {
+      aggregatePublishContext: "fresh" as unknown as "prefer_resume",
+    })).toThrow(/compile\.aggregatePublishContext: must be prefer_resume when provided/);
   });
 
   it("changes the pinned manifest digest when only a unit phase worker binding changes", () => {

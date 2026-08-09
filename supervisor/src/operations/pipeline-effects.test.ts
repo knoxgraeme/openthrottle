@@ -24,7 +24,7 @@ import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 import type { RuntimeResourceReconciler } from "./runtime-resource-reclaim.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
-const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
+const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url));
 
 describe("pipeline effect processor", () => {
   let db: Database.Database | undefined;
@@ -500,7 +500,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -514,6 +514,7 @@ describe("pipeline effect processor", () => {
       id: "builtin/structured",
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
+      aggregatePublishContext: "prefer_resume",
     }).manifest;
     pipelines.acceptManifest(manifest);
     const executionPlan = {
@@ -660,7 +661,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -819,7 +820,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -833,6 +834,7 @@ describe("pipeline effect processor", () => {
       id: "builtin/structured",
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
+      aggregatePublishContext: "prefer_resume",
     }).manifest;
     pipelines.acceptManifest(manifest);
     const executionPlan = {
@@ -1132,6 +1134,8 @@ describe("pipeline effect processor", () => {
         role: "reviewer",
         skill: "final-review",
         expectedProducerSkill: "builtin://final-review@1",
+        baseSubject: instance.base_commit,
+        inputSubject: integratedSubjectB,
         worktree: null,
       })
     );
@@ -1219,6 +1223,16 @@ describe("pipeline effect processor", () => {
 
     await processor.drain();
     const freshReview = latestAction("final_review");
+    expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        protocol: "loop-action@2",
+        role: "reviewer",
+        skill: "final-review",
+        baseSubject: instance.base_commit,
+        inputSubject: finalIntegratedSubject,
+      })
+    );
     pipelines.completeGatedAction({
       actionId: freshReview.id,
       resultHash: "result-review-fresh",
@@ -1267,9 +1281,50 @@ describe("pipeline effect processor", () => {
       aggregate_emitted_at: expect.any(String),
       integration_subject: finalIntegratedSubject,
     });
-    const activationsAfterAggregate = runtime.setActive.mock.calls.length;
+    expect(pipelines.getInstance(instance.id)).toMatchObject({
+      active_stage_id: "publish",
+      status: "dispatchable",
+      immutable_subject: finalIntegratedSubject,
+    });
+    const effects = pipelines.listEffects(instance.id);
+    expect(effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending"))
+      .toMatchObject({
+        kind: "dispatch_stage",
+        idempotency_key: expect.stringContaining("publish"),
+      });
+    const publishRequest = JSON.parse(
+      effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending")!.payload
+    ) as {
+      stageId: string;
+      capability: string;
+      expectedSubject: string;
+      runId: string;
+      contextPolicy: string;
+      nativeSessionId: string | null;
+    };
+    expect(publishRequest).toMatchObject({
+      stageId: "publish",
+      capability: "ce/publish@1",
+      expectedSubject: finalIntegratedSubject,
+      contextPolicy: "prefer_resume",
+      nativeSessionId: null,
+    });
+    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBeNull();
+
+    const dispatchCallsBeforePublish = runtime.dispatchStage.mock.calls.length;
     await processor.drain();
-    expect(runtime.setActive).toHaveBeenCalledTimes(activationsAfterAggregate);
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforePublish + 1);
+    expect(runtime.dispatchStage).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        stageId: "publish",
+        capability: "ce/publish@1",
+        expectedSubject: finalIntegratedSubject,
+        contextPolicy: "prefer_resume",
+        nativeSessionId: null,
+      })
+    );
+    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(publishRequest.runId);
   });
 
   it("leaves retryable child loop errors active for effect retry instead of parsing them as receipts", async () => {
@@ -1289,7 +1344,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -1303,6 +1358,7 @@ describe("pipeline effect processor", () => {
       id: "builtin/structured",
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
+      aggregatePublishContext: "prefer_resume",
     }).manifest;
     pipelines.acceptManifest(manifest);
     const executionPlan = {
@@ -1425,7 +1481,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -1439,6 +1495,7 @@ describe("pipeline effect processor", () => {
       id: "builtin/structured",
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
+      aggregatePublishContext: "prefer_resume",
     }).manifest;
     pipelines.acceptManifest(manifest);
     const executionPlan = {
@@ -1536,7 +1593,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -1550,6 +1607,7 @@ describe("pipeline effect processor", () => {
       id: "builtin/structured",
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
+      aggregatePublishContext: "prefer_resume",
     }).manifest;
     pipelines.acceptManifest(manifest);
     const executionPlan = {

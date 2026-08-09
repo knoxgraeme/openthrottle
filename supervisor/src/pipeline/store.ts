@@ -49,6 +49,7 @@ export interface PipelineInstance {
   agent: "claude" | "codex" | "opencode";
   task_type: "implement" | "investigate";
   published_commit: string | null;
+  published_subject: string | null;
   repository_config_snapshot_id: string;
   repository_config_digest: string;
   runtime_release: string;
@@ -377,6 +378,8 @@ export interface CoordinatorTransitionWrite {
   waitReason?: string | null;
   immutableSubject?: string | null;
   publishedCommit?: string | null;
+  publishedSubject?: string | null;
+  clearPublishedCommit?: boolean;
   reentryIncrement?: number;
   artifacts?: CoordinatorArtifactWrite[];
   gateReceipt?: CoordinatorGateReceiptWrite;
@@ -402,6 +405,7 @@ export interface CoordinatorTransitionWrite {
 export interface PipelineStore extends ChildActionLivenessPort {
   acceptCatalog(catalog: ValidatedPipelineCatalog): void;
   acceptManifest(manifest: ValidatedPipelineManifest): void;
+  getAcceptedManifestDigest(pipelineId: string, version: number): string | undefined;
   acceptRuntimeDescriptor(runtime: ValidatedRuntimeCapabilityDescriptor): void;
   saveRepositoryConfigSnapshot(input: {
     id?: string;
@@ -445,6 +449,7 @@ export interface PipelineStore extends ChildActionLivenessPort {
    */
   listReclaimableRuntimeResources(cutoffIso: string, limit?: number): PipelineInstance[];
   getActiveAttempt(instanceId: string): PipelineStageAttempt | undefined;
+  listAttempts(instanceId: string): PipelineStageAttempt[];
   listProviderReadyInstances(limit?: number): PipelineInstance[];
   listStages(instanceId: string): PipelineInstanceStage[];
   getEffect(id: string): PipelineEffectIntent | undefined;

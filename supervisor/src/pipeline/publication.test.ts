@@ -2465,13 +2465,15 @@ describe("pipeline publication", () => {
 
   it("does not claim no pull request was created on a no_change terminal that follows an earlier publish", () => {
     const { instance, attempt } = setup();
+    const publishedCommit = "d".repeat(40);
     const publication = buildLifecyclePublication({
       instance: {
         ...instance,
         status: "no_change",
         terminal_outcome: "no_change",
         immutable_subject: SUBJECT,
-        published_commit: SUBJECT,
+        published_commit: publishedCommit,
+        published_subject: SUBJECT,
       },
       attempt,
       outcome: "no_change",
@@ -2480,6 +2482,26 @@ describe("pipeline publication", () => {
     expect(publication.body).not.toContain("no pull request was created");
     expect(publication.body).toContain("already-published tree remains current");
     expect(publication.body).toContain(`tree/${SUBJECT}`);
+  });
+
+  it("does not render an unbound no_change published_commit as current", () => {
+    const { instance, attempt } = setup();
+    const publishedCommit = "d".repeat(40);
+    const publication = buildLifecyclePublication({
+      instance: {
+        ...instance,
+        status: "no_change",
+        terminal_outcome: "no_change",
+        immutable_subject: SUBJECT,
+        published_commit: publishedCommit,
+        published_subject: null,
+      },
+      attempt,
+      outcome: "no_change",
+      reason: "A later repair round found nothing further to change.",
+    });
+    expect(publication.body).toContain("no pull request was created");
+    expect(publication.body).not.toContain("already-published tree remains current");
   });
 
   it("still reports no pull request was created for an ordinary no_change with a sealed subject but no publish", () => {
@@ -2514,10 +2536,12 @@ describe("pipeline publication", () => {
   // proven against the function production actually calls, not a stand-in.
   it("renders the no_change published-commit distinction through the real production path", () => {
     const { pipelines, instance, attempt } = setup("fixture/agent@1");
+    const publishedCommit = "d".repeat(40);
     // Simulate an earlier publish_subject stage succeeding in this same
     // generation (production sets this via gates.ts) before a later
     // ordinary stage reaches no_change.
-    db!.prepare("UPDATE pipeline_instances SET published_commit = ? WHERE id = ?").run(SUBJECT, instance.id);
+    db!.prepare("UPDATE pipeline_instances SET published_commit = ?, published_subject = ? WHERE id = ?")
+      .run(publishedCommit, SUBJECT, instance.id);
 
     const noChange = semanticEvent({
       instance,
@@ -2532,6 +2556,40 @@ describe("pipeline publication", () => {
     const publication = parsePipelinePublication(receipt.payload);
     expect(publication.body).not.toContain("no pull request was created");
     expect(publication.body).toContain("already-published tree remains current");
+  });
+
+  it("renders stale publication as unavailable when a terminal transition clears the binding", () => {
+    const { pipelines, instance, attempt } = setup("fixture/agent@1");
+    const publishedSubject = "c".repeat(40);
+    const unpublishedSubject = "e".repeat(40);
+    const publishedCommit = "d".repeat(40);
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET immutable_subject = ?, published_commit = ?, published_subject = ?
+      WHERE id = ?
+    `).run(publishedSubject, publishedCommit, publishedSubject, instance.id);
+
+    const noChange = semanticEvent({
+      instance: {
+        ...instance,
+        immutable_subject: publishedSubject,
+        published_commit: publishedCommit,
+        published_subject: publishedSubject,
+      },
+      attempt,
+      outcome: "no_change",
+      summary: "Terminal stage changed the workspace subject.",
+      subject: unpublishedSubject,
+    });
+    const transitioned = coordinatePipelineEvent(pipelines, noChange.event, undefined, noChange.receipt);
+
+    const receipt = pipelines.listPublications(instance.id)
+      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+    const publication = parsePipelinePublication(receipt.payload);
+    expect(transitioned.published_commit).toBeNull();
+    expect(transitioned.published_subject).toBeNull();
+    expect(publication.body).toContain("no pull request was created");
+    expect(publication.body).not.toContain("already-published tree remains current");
   });
 
   it("still reports no pull request was created through the real production path when no publish occurred", () => {

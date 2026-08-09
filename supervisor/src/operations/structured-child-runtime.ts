@@ -15,7 +15,7 @@ import {
 } from "@openthrottle/contracts";
 import { canonicalJson, digestNormalized, stageById, type StageOutcome } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
-import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
+import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "../pipeline/coordinator.js";
 import {
   buildAggregateStageEvent,
   type ExecutionUnitState,
@@ -74,6 +74,7 @@ type StructuredChildRuntimeDeps = {
   runtime: SandboxRuntime;
   taskTimeoutSeconds: number;
   now: () => Date;
+  completeParentStage?: (event: PipelineCoordinatorEvent) => PipelineInstance;
   // Persists a Codex OAuth blob rotated inside one action's own scoped
   // CODEX_HOME (see readCodexAuthSnapshot in execute-loop.mjs). Keyed to the
   // action that actually ran as a Codex worker -- never to the parent
@@ -388,11 +389,31 @@ function finalRepairWorktreeHandleFor(
 }
 
 export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): StructuredChildRuntime {
+  const completeParentStage = deps.completeParentStage ?? ((event: PipelineCoordinatorEvent) =>
+    coordinatePipelineEvent(deps.store, event));
+
   const worktreeBaseFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string => {
     const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
     const base = graph?.integration_subject ?? instance.immutable_subject ?? instance.base_commit;
     if (!GIT_SUBJECT.test(base)) throw new Error(`child action ${action.id} has no exact worktree base`);
     return base;
+  };
+
+  const receiptBaseFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string => {
+    if (action.action_kind !== "final_review") return worktreeBaseFor(instance, action);
+    if (action.request_payload) {
+      try {
+        const request = JSON.parse(action.request_payload) as { protocol?: unknown; baseSubject?: unknown };
+        if (request.protocol === "loop-action@2" &&
+            typeof request.baseSubject === "string" &&
+            GIT_SUBJECT.test(request.baseSubject)) {
+          return request.baseSubject;
+        }
+      } catch {
+        // The request-hash fence still rejects incompatible legacy receipts.
+      }
+    }
+    return instance.base_commit;
   };
 
   const latestPriorOutputSubject = (
@@ -535,7 +556,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       generation: instance.generation,
       nativeSessionId: receiptNativeSessionId,
       requestHash: action.request_hash ?? "",
-      baseSubject: worktreeBaseFor(instance, action),
+      baseSubject: receiptBaseFor(instance, action),
       preSubject: actionInputSubjectFor(instance, action),
       subject,
       producers: expectedProducersFor(instance, action),
@@ -924,7 +945,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       ...(workerBinding.worker.model === undefined ? {} : { model: workerBinding.worker.model }),
       skill: workerBinding.repositorySkill?.invocation ?? adapterSkillFor(action.action_kind),
       worktree,
-      baseSubject: worktreeBaseFor(instance, action),
+      baseSubject: action.action_kind === "final_review" ? instance.base_commit : worktreeBaseFor(instance, action),
       inputSubject,
       nativeSessionId: action.native_session_id,
       contextPolicy,
@@ -1289,7 +1310,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         if (graph.aggregate_artifact_hash !== graphResult.hash) {
           throw new Error(`structured aggregate ${parentAttemptId} replay hash does not match durable graph marker`);
         }
-        coordinatePipelineEvent(deps.store, event);
+        completeParentStage(event);
         return;
       }
       deps.store.emitAggregateOnce({
@@ -1298,7 +1319,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         integrationSubject: graph.integration_subject,
         requireFinalReview: outcome === "success",
       });
-      coordinatePipelineEvent(deps.store, event);
+      completeParentStage(event);
     },
 
     compositeGraphNeedsDrain(parentAttemptId) {

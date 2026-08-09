@@ -27,6 +27,8 @@ import {
 } from "./publication.js";
 import type { LaunchFaultReason } from "./fault-attribution.js";
 
+const PUBLISH_CAPABILITY = ["ce", "publish@1"].join("/");
+
 export interface PipelineEventArtifact {
   id?: string;
   kind: string;
@@ -71,6 +73,7 @@ export interface PipelineReductionInput {
   manifest: PipelineManifest;
   instance: PipelineInstance;
   attempt: PipelineStageAttempt;
+  attempts?: readonly PipelineStageAttempt[];
   stages: readonly PipelineInstanceStage[];
   event: PipelineCoordinatorEvent;
 }
@@ -150,6 +153,84 @@ function activeStage(input: PipelineReductionInput): PipelineStage {
   if (!stage) throw new Error(`active stage ${input.instance.active_stage_id ?? "<none>"} is absent from the pinned manifest`);
   if (stage.id !== input.attempt.stage_id) throw new Error("active attempt does not match the pinned stage");
   return stage;
+}
+
+function isPublicationStage(stage: PipelineStage): boolean {
+  return (stage.executor.kind === "agent" && stage.executor.capability === PUBLISH_CAPABILITY) ||
+    stage.executor.kind === "provider_wait";
+}
+
+function executionIncludesPublication(
+  input: PipelineReductionInput,
+  active: PipelineStage
+): boolean {
+  if (isPublicationStage(active)) return true;
+  const stagesById = new Map(input.manifest.stages.map((stage) => [stage.id, stage]));
+  return (input.attempts ?? [input.attempt]).some((attempt) => {
+    if (attempt.status !== "completed" || attempt.outcome !== "success") return false;
+    const stage = stagesById.get(attempt.stage_id);
+    return stage ? isPublicationStage(stage) : false;
+  });
+}
+
+function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: PipelineStage): boolean {
+  if (stage.executor.kind === "provider_wait") {
+    return input.instance.published_commit !== null &&
+      input.instance.published_subject !== null &&
+      input.event.providerRevision === input.instance.published_commit &&
+      input.event.subject === input.instance.published_subject;
+  }
+  if (stage.evaluator.kind === "publish_subject") {
+    return input.event.providerRevision !== undefined && input.event.subject != null;
+  }
+  return input.instance.published_commit !== null &&
+    input.instance.published_subject !== null &&
+    input.event.subject === input.instance.published_subject;
+}
+
+function terminalRequiresExactPublicationEvidence(
+  input: PipelineReductionInput,
+  stage: PipelineStage,
+  terminal: PipelineOutcome,
+  clearsPublishedBinding: boolean
+): boolean {
+  return terminal === "shipped"
+    ? executionIncludesPublication(input, stage)
+    : terminal === "no_change" &&
+      !clearsPublishedBinding &&
+      (input.instance.published_commit !== null || input.instance.published_subject !== null);
+}
+
+function assertTerminalPublishedBinding(
+  input: PipelineReductionInput,
+  stage: PipelineStage,
+  terminal: PipelineOutcome,
+  clearsPublishedBinding: boolean
+): void {
+  if (
+    terminalRequiresExactPublicationEvidence(input, stage, terminal, clearsPublishedBinding) &&
+    !eventHasExactPublishedSubject(input, stage)
+  ) {
+    throw new Error("publishing pipeline cannot settle terminal without exact published provider evidence");
+  }
+}
+
+function shouldClearPublishedBinding(input: PipelineReductionInput): boolean {
+  return input.instance.published_commit !== null &&
+    input.event.providerRevision === undefined &&
+    input.event.subject != null &&
+    input.instance.immutable_subject != null &&
+    input.event.subject !== input.instance.immutable_subject;
+}
+
+function publishedCommitForEvent(input: PipelineReductionInput, stage: PipelineStage): string | null {
+  return stage.evaluator.kind === "publish_subject" ? input.event.providerRevision ?? null : null;
+}
+
+function publishedSubjectForEvent(input: PipelineReductionInput, stage: PipelineStage): string | null {
+  return stage.evaluator.kind === "publish_subject" && input.event.providerRevision !== undefined
+    ? input.event.subject ?? null
+    : null;
 }
 
 function verifyInput(input: PipelineReductionInput): PipelineStage {
@@ -242,21 +323,25 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     throw new Error("pipeline event result hash does not match stage_result artifact");
   }
   if (event.providerRevision !== undefined) {
-    if (event.kind !== "stage_result" || stage.evaluator.kind !== "publish_subject" ||
-        !/^[a-f0-9]{40}$/.test(event.providerRevision)) {
+    if (!/^[a-f0-9]{40}$/.test(event.providerRevision)) {
       throw new Error("pipeline event has an invalid provider revision");
     }
-    const publish = artifacts.find((artifact) => artifact.kind === "publish_subject");
-    let publishedCommit: unknown;
-    try {
-      publishedCommit = publish
-        ? (JSON.parse(publish.payload) as { details?: { published_commit?: unknown } }).details?.published_commit
-        : undefined;
-    } catch {
-      publishedCommit = undefined;
-    }
-    if (publishedCommit !== event.providerRevision) {
-      throw new Error("pipeline provider revision does not match publish evidence");
+    if (event.kind === "stage_result" && stage.evaluator.kind === "publish_subject") {
+      const publish = artifacts.find((artifact) => artifact.kind === "publish_subject");
+      let publishedCommit: unknown;
+      try {
+        publishedCommit = publish
+          ? (JSON.parse(publish.payload) as { details?: { published_commit?: unknown } }).details?.published_commit
+          : undefined;
+      } catch {
+        publishedCommit = undefined;
+      }
+      if (publishedCommit !== event.providerRevision) {
+        throw new Error("pipeline provider revision does not match publish evidence");
+      }
+    } else if (event.kind !== "provider_snapshot" || stage.executor.kind !== "provider_wait" ||
+        stage.evaluator.kind !== "provider") {
+      throw new Error("pipeline event has an invalid provider revision");
     }
   }
   return stage;
@@ -397,6 +482,8 @@ function terminalWrite(input: PipelineReductionInput & {
   waitReason?: string | null;
   immutableSubject?: string | null;
   publishedCommit?: string | null;
+  publishedSubject?: string | null;
+  clearPublishedCommit?: boolean;
   cleanup?: boolean;
   effects?: CoordinatorEffectWrite[];
 }): CoordinatorTransitionWrite {
@@ -416,6 +503,8 @@ function terminalWrite(input: PipelineReductionInput & {
     waitReason: input.waitReason ?? (input.terminal === "needs_human" ? "pipeline requires a human decision" : null),
     immutableSubject: input.immutableSubject,
     publishedCommit: input.publishedCommit,
+    publishedSubject: input.publishedSubject,
+    clearPublishedCommit: input.clearPublishedCommit,
     artifacts: artifactsFor(input.event),
     effects: [
       publishLinearEffect(input.publishIdempotencyKey),
@@ -491,12 +580,17 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     if (!targetState) throw new Error(`stage state ${target.id} is absent for pipeline instance ${input.instance.id}`);
     if (isReentry && input.manifest.max_repair_rounds !== undefined &&
       input.instance.reentry_count >= input.manifest.max_repair_rounds) {
+      const clearsPublishedBinding = shouldClearPublishedBinding(input);
       return terminalWrite({
         ...input,
         eventPayloadHash,
         terminal: "failed",
         publishIdempotencyKey: `linear-repair-rounds-exhausted:${input.instance.id}:${input.manifest.max_repair_rounds}`,
         waitReason: `pipeline repair round limit ${input.manifest.max_repair_rounds} exhausted`,
+        immutableSubject: input.event.subject ?? null,
+        publishedCommit: publishedCommitForEvent(input, stage),
+        publishedSubject: publishedSubjectForEvent(input, stage),
+        clearPublishedCommit: clearsPublishedBinding,
         effects: [failedTerminalStopEffect({
           instanceId: input.instance.id,
           idempotencyKey: `stop:${input.instance.id}:repair-rounds-exhausted`,
@@ -506,12 +600,18 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     }
     if (isReentry && transition.max_reentries !== undefined && targetState.reentry_count >= transition.max_reentries) {
       const exhausted = transition.on_exhausted!;
+      const clearsPublishedBinding = shouldClearPublishedBinding(input);
+      assertTerminalPublishedBinding(input, stage, exhausted, clearsPublishedBinding);
       return terminalWrite({
         ...input,
         eventPayloadHash,
         terminal: exhausted,
         publishIdempotencyKey: `linear-exhausted:${input.instance.id}:${stage.id}:${targetState.reentry_count}`,
         waitReason: `re-entry exhausted at ${stage.id}`,
+        immutableSubject: input.event.subject ?? null,
+        publishedCommit: publishedCommitForEvent(input, stage),
+        publishedSubject: publishedSubjectForEvent(input, stage),
+        clearPublishedCommit: clearsPublishedBinding,
         effects: exhausted === "failed" ? [failedTerminalStopEffect({
           instanceId: input.instance.id,
           idempotencyKey: `stop:${input.instance.id}:reentry-exhausted`,
@@ -525,12 +625,17 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     // coordinator must not strand a successfully repaired tree before
     // publish/provider.
     if (isReentry && input.instance.attempt_count >= input.manifest.max_attempts) {
+      const clearsPublishedBinding = shouldClearPublishedBinding(input);
       return terminalWrite({
         ...input,
         eventPayloadHash,
         terminal: "failed",
         publishIdempotencyKey: `linear-attempts-exhausted:${input.instance.id}:${input.manifest.max_attempts}`,
         waitReason: `pipeline attempt limit ${input.manifest.max_attempts} exhausted`,
+        immutableSubject: input.event.subject ?? null,
+        publishedCommit: publishedCommitForEvent(input, stage),
+        publishedSubject: publishedSubjectForEvent(input, stage),
+        clearPublishedCommit: clearsPublishedBinding,
         effects: [failedTerminalStopEffect({
           instanceId: input.instance.id,
           idempotencyKey: `stop:${input.instance.id}:attempts-exhausted`,
@@ -590,7 +695,9 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
           ? `provider evidence required at ${target.id}`
           : null,
       immutableSubject: input.event.subject ?? null,
-      publishedCommit: input.event.providerRevision ?? null,
+      publishedCommit: publishedCommitForEvent(input, stage),
+      publishedSubject: publishedSubjectForEvent(input, stage),
+      clearPublishedCommit: shouldClearPublishedBinding(input),
       reentryIncrement: isReentry ? 1 : 0,
       artifacts: artifactsFor(input.event),
       nextAttempt,
@@ -599,13 +706,17 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
   }
 
   const terminal = transition.terminal!;
+  const clearsPublishedBinding = shouldClearPublishedBinding(input);
+  assertTerminalPublishedBinding(input, stage, terminal, clearsPublishedBinding);
   return terminalWrite({
     ...input,
     eventPayloadHash,
     terminal,
     publishIdempotencyKey: `linear-terminal:${input.instance.id}:${terminal}`,
     immutableSubject: input.event.subject ?? null,
-    publishedCommit: input.event.providerRevision ?? null,
+    publishedCommit: publishedCommitForEvent(input, stage),
+    publishedSubject: publishedSubjectForEvent(input, stage),
+    clearPublishedCommit: clearsPublishedBinding,
     effects: terminal === "failed" ? [failedTerminalStopEffect({
       instanceId: input.instance.id,
       idempotencyKey: `stop:${input.instance.id}:${terminal}`,
@@ -636,7 +747,8 @@ export function coordinatePipelineEvent(
   if (!attempt) throw new Error(`unknown pipeline attempt ${event.attemptId}`);
   const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
   const stages = store.listStages(instance.id);
-  const write = reducePipelineEvent({ manifest, instance, attempt, stages, event });
+  const attempts = store.listAttempts(instance.id);
+  const write = reducePipelineEvent({ manifest, instance, attempt, attempts, stages, event });
   write.exhaustedEffectId = event.exhaustedEffectId;
   write.exhaustedEffectError = event.exhaustedEffectError;
   write.gateReceipt = gateReceipt;

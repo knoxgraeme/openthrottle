@@ -37,7 +37,20 @@ import type { PipelineCoordinatorContext, SessionServicePorts } from "./session-
 const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
 const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
 const BUILTIN_SIMPLE_GRAPH = fileURLToPath(new URL("../../graphs/simple-v1.json", import.meta.url));
-const BUILTIN_STRUCTURED_GRAPH = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
+const BUILTIN_GRAPHS = {
+  "core/structured@1": {
+    path: fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url)),
+    id: "builtin/structured",
+    version: 1,
+    description: "Compiled execution graph structured from builtin core/structured@1.",
+  },
+  "core/structured@2": {
+    path: fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url)),
+    id: "builtin/structured",
+    version: 2,
+    description: "Compiled execution graph structured from builtin core/structured@2.",
+  },
+} as const;
 const SIMPLE_IMPLEMENT_DESCRIPTION = "Staged CE implementation from a pre-approved plan with round-based repair budgeting, scoped repair re-entry, sealed repository gates, exact-tree publication, and bounded provider repair. The initial forward pass may simplify; repair passes re-run semantic review and command gates without re-running simplification.";
 const REPOSITORY_SKILL_PACKAGE_SCHEMA = "openthrottle.repository-skill-package/v1";
 const ORDINARY_STAGE_TASK_CONTEXT_LIMIT = 64_000;
@@ -50,6 +63,7 @@ const LINEAR_CONTEXT_SECTION_KINDS = [
 ] as const;
 
 type ContextSectionKind = typeof LINEAR_CONTEXT_SECTION_KINDS[number];
+type BuiltinGraphReference = keyof typeof BUILTIN_GRAPHS;
 interface ContextSection {
   kind: ContextSectionKind;
   text: string;
@@ -155,6 +169,12 @@ function hasLinearContextStructuralDelimiter(context: string): boolean {
     `</?(?:${LINEAR_CONTEXT_SECTION_KINDS.join("|")})\\b[^>]*>`,
     "i"
   ).test(context);
+}
+
+function builtinGraphFor(ref: string): typeof BUILTIN_GRAPHS[BuiltinGraphReference] | undefined {
+  return Object.hasOwn(BUILTIN_GRAPHS, ref)
+    ? BUILTIN_GRAPHS[ref as BuiltinGraphReference]
+    : undefined;
 }
 
 function parentIssueSummary(section: ContextSection): string {
@@ -502,7 +522,8 @@ async function resolvePipelineSelection(
   readPinnedDirectory: (path: string) => Promise<RepositoryDirectorySnapshot>,
   runtime: PipelineCoordinatorContext["runtime"],
   catalog: ValidatedPipelineCatalog,
-  selectedAgent: Agent
+  selectedAgent: Agent,
+  acceptedManifestDigest?: (pipelineId: string, version: number) => string | undefined
 ): Promise<ValidatedPipelineManifest> {
   const intent = repositoryConfig.config.intents?.implement;
   const requested = extractRequestedGraph(context);
@@ -513,6 +534,7 @@ async function resolvePipelineSelection(
   }
   const source = repositoryConfig.config.graphs.find((entry) => entry.id === graphId);
   if (!source) throw new Error(`graph ${graphId} is not declared in repository config`);
+  const builtinGraph = source.kind === "builtin" ? builtinGraphFor(source.ref) : undefined;
   let rawGraph: string;
   let compileSource: string;
   let blobDescription: string;
@@ -531,10 +553,10 @@ async function resolvePipelineSelection(
     rawGraph = readFileSync(BUILTIN_SIMPLE_GRAPH, "utf8");
     compileSource = "builtin:core/simple@1";
     blobDescription = "builtin core/simple@1";
-  } else if (source.ref === "core/structured@1") {
-    rawGraph = readFileSync(BUILTIN_STRUCTURED_GRAPH, "utf8");
-    compileSource = "builtin:core/structured@1";
-    blobDescription = "builtin core/structured@1";
+  } else if (builtinGraph) {
+    rawGraph = readFileSync(builtinGraph.path, "utf8");
+    compileSource = `builtin:${source.ref}`;
+    blobDescription = `builtin ${source.ref}`;
   } else {
     throw new Error(`unknown built-in graph reference ${source.ref}`);
   }
@@ -556,13 +578,39 @@ async function resolvePipelineSelection(
       description: SIMPLE_IMPLEMENT_DESCRIPTION,
       maxAttempts: 200,
       maxRepairRounds: 5,
+    } : source.ref === "core/structured@1" ? {
+      id: `builtin/${graphId}`,
+      version: 1,
+      description: `Compiled execution graph ${graphId} from ${blobDescription}.`,
+      maxAttempts: 200,
+    } : builtinGraph ? {
+      id: builtinGraph.id,
+      version: builtinGraph.version,
+      description: builtinGraph.description,
+      maxAttempts: 200,
+      ...(source.ref === "core/structured@2" ? { aggregatePublishContext: "prefer_resume" as const } : {}),
     } : {
-      id: source.kind === "builtin" ? `builtin/${graphId}` : manifestId,
+      id: manifestId,
       description: `Compiled execution graph ${graphId} from ${blobDescription}.`,
       maxAttempts: 200,
     }),
   };
-  const compiled = parseAndCompileExecutionGraph(rawGraph, compileOptions);
+  let compiled = parseAndCompileExecutionGraph(rawGraph, compileOptions);
+  if (source.kind === "repository") {
+    const aggregatePublishCompiled = parseAndCompileExecutionGraph(rawGraph, {
+      ...compileOptions,
+      aggregatePublishContext: "prefer_resume" as const,
+    });
+    const existingDigest = acceptedManifestDigest?.(
+      compiled.manifest.manifest.id,
+      compiled.manifest.manifest.version
+    );
+    if (existingDigest === aggregatePublishCompiled.manifest.digest) {
+      compiled = aggregatePublishCompiled;
+    } else if (!existingDigest) {
+      compiled = aggregatePublishCompiled;
+    }
+  }
   if (compiled.manifest.manifest.requires.capabilities.includes(FOR_EACH_UNIT_CAPABILITY) && !requested.hasExecutionPlan) {
     throw new Error(`graph ${graphId} requires a canonical ${EXECUTION_PLAN_FENCE} block`);
   }
@@ -793,7 +841,8 @@ export async function handleCreated(
         ),
         coordinator.runtime,
         coordinator.catalog,
-        selectedAgent
+        selectedAgent,
+        (pipelineId, version) => coordinator.store.getAcceptedManifestDigest(pipelineId, version)
       )
       : resolvePipelineReference(
         coordinator.catalog,

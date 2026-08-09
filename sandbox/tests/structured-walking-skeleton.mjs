@@ -34,7 +34,7 @@ import { digestCanonicalJson } from "../../contracts/dist/index.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..", "..");
 const IMAGE = process.argv[2] ?? "openthrottle:test";
-const STRUCTURED_GRAPH_PATH = join(REPO_ROOT, "supervisor", "graphs", "structured-v1.json");
+const STRUCTURED_GRAPH_PATH = join(REPO_ROOT, "supervisor", "graphs", "structured-v2.json");
 const CATALOG_PATH = join(REPO_ROOT, "supervisor", "pipelines", "catalog.yaml");
 const STUB_AGENT_PATH = join(__dirname, "fixtures", "walking-skeleton-agent-stub.mjs");
 // The configured `test` command, shared by the fixture's own .openthrottle.yml
@@ -614,7 +614,7 @@ function setupInstance({ db, pipelines, tickets, runtimeDescriptor, fixture, iss
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@1",
+      "    ref: core/structured@2",
       "post_bootstrap:",
       `  - "${POST_BOOTSTRAP_COMMAND}"`,
       "commands:",
@@ -634,6 +634,7 @@ function setupInstance({ db, pipelines, tickets, runtimeDescriptor, fixture, iss
     id: "builtin/structured",
     runtime: runtimeDescriptor.descriptor,
     config: repositoryConfig.config,
+    aggregatePublishContext: "prefer_resume",
   }).manifest;
   pipelines.acceptManifest(manifest);
   tickets.upsert({

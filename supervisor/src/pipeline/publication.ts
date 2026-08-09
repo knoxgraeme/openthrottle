@@ -213,6 +213,7 @@ interface RenderContext {
   transition: PipelineManifest["stages"][number]["transitions"][StageOutcome] | undefined;
   repairSourceStageId?: string;
   publishedCommit: string | null;
+  publishedSubject: string | null;
 }
 
 interface RenderExtras {
@@ -220,6 +221,7 @@ interface RenderExtras {
   repairBannerFinding?: PublicationFinding;
   repairSourceStageId?: string;
   publishedCommit?: string | null;
+  publishedSubject?: string | null;
 }
 
 const STAGE_LABELS: Readonly<Record<string, { display: string; action?: string }>> = {
@@ -237,6 +239,7 @@ const STAGE_LABELS: Readonly<Record<string, { display: string; action?: string }
   semantic_review: { display: "code review", action: "reviewing changes" },
   simplification: { display: "simplifying", action: "simplifying changes" },
   test: { display: "testing" },
+  units: { display: "structured execution" },
 };
 
 function stageDisplayName(stageId: string): string {
@@ -357,6 +360,7 @@ function renderContext(
     transition: stage?.transitions[envelope.decision.outcome as StageOutcome],
     repairSourceStageId: extras?.repairSourceStageId,
     publishedCommit: extras?.publishedCommit ?? null,
+    publishedSubject: extras?.publishedSubject ?? null,
   };
 }
 
@@ -438,6 +442,9 @@ function eventSentence(
     case "selection":
       return "OpenThrottle selected the pinned pipeline and recorded the starting receipt.";
     case "gate":
+      if (envelope.stage?.id === "units" && envelope.decision.outcome === "success") {
+        return "The structured execution aggregate is ready for publication.";
+      }
       return envelope.decision.gate_result === "passed"
         ? "The supervisor accepted the stage result and verified the required fences."
         : `The supervisor recorded the stage result: ${sentenceForOutcome(envelope.decision.outcome)}`;
@@ -470,7 +477,7 @@ function terminalSentence(envelope: PipelinePublicationBodyInput, context: Rende
       // sealed on every stage result regardless of publication and would
       // misreport an ordinary first-stage no_change (which never published
       // anything) as an already-published run.
-      return context.publishedCommit
+      return context.publishedCommit && context.publishedSubject === envelope.decision.subject
         ? `The job finished with no further code change needed; the already-published tree remains current.${providerLink}`
         : "The job finished because no code change was needed; no pull request was created.";
     case "needs_human":
@@ -1002,6 +1009,7 @@ export function buildLifecyclePublication(input: {
     ...partial,
     body: renderBody(partial, input.instance.normalized_manifest, {
       publishedCommit: input.instance.published_commit,
+      publishedSubject: input.instance.published_subject,
     }),
   };
 }
@@ -1097,12 +1105,19 @@ export function buildStagePublication(input: {
     ...(input.structuredExecution ? { structured_execution: input.structuredExecution } : {}),
     resume_status: resumeStatus,
   };
+  const publishedCommit = input.write.clearPublishedCommit
+    ? null
+    : input.write.publishedCommit ?? input.instance.published_commit;
+  const publishedSubject = input.write.clearPublishedCommit
+    ? null
+    : input.write.publishedSubject ?? input.instance.published_subject;
   const body = renderBody(partial, input.instance.normalized_manifest, {
     scheduledReentryOrdinal: input.write.nextAttempt?.reentryOrdinal,
     repairBannerFinding: currentFindingsWithDisposition
       .find((finding) => finding.disposition === "carried to repair"),
     repairSourceStageId,
-    publishedCommit: input.instance.published_commit,
+    publishedCommit,
+    publishedSubject,
   });
   return artifactBytes <= INLINE_ARTIFACT_LIMIT_BYTES
     ? {

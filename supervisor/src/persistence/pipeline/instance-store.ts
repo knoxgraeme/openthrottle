@@ -56,6 +56,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   | "listReclaimableRuntimeResources"
   | "getInstanceByRuntimeResourceId"
   | "getActiveAttempt"
+  | "listAttempts"
   | "listProviderReadyInstances"
   | "listStages"
   | "listEffects"
@@ -618,6 +619,13 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
           AND psa.status IN ('pending', 'leased', 'dispatched', 'acknowledged', 'running')
         ORDER BY psa.reentry_ordinal DESC, psa.attempt_ordinal DESC LIMIT 1
       `).get(instanceId) as PipelineStageAttempt | undefined;
+    },
+    listAttempts(instanceId) {
+      return db.prepare(`
+        SELECT * FROM pipeline_stage_attempts
+        WHERE pipeline_instance_id = ?
+        ORDER BY attempt_ordinal, reentry_ordinal, created_at, id
+      `).all(instanceId) as PipelineStageAttempt[];
     },
     listProviderReadyInstances(limit = 50) {
       const instances = db.prepare(`
