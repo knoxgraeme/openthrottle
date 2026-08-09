@@ -820,9 +820,17 @@ the reducer emits one `execution_graph_result` artifact and one aggregate
 `execution_graphs` so the parent can settle once through the ordinary
 stage-result path. Structured success requires every authored unit to have a
 `completed` terminal level plus accepted integration evidence for that unit's
-exact integration subject. The aggregate subject is the final integrated graph
-head after all unit and whole-change integration phases complete. A stopped,
-exited, failed, or partially integrated graph never claims structured success.
+exact integration subject. The graph's integration subject and whole-change
+final review remain bound to the exact final integrated commit after all unit
+and whole-change integration phases complete. At the successful aggregate
+boundary, the parent `stage_result`, `execution_graph_result` aggregate
+artifact, persisted immutable subject, and downstream publish request are
+instead bound to the canonical workspace tree from the accepted
+executor-verified integration receipt for that exact commit. The supervisor
+keeps the independent observed-workspace equality fence fail-closed; commit
+subjects are not accepted as aliases for tree subjects at publication time. A
+stopped, exited, failed, or partially integrated graph never claims structured
+success.
 
 `pipeline_artifacts.kind` includes `execution_graph_result` for the child
 aggregate artifact in addition to the existing stage, review, command,

@@ -1381,6 +1381,44 @@ describe("pipeline effect processor", () => {
       .toEqual(expect.arrayContaining([
         expect.stringContaining(`aggregate=${canonicalGraphResultHash}`),
       ]));
+    const aggregatePublication = db!.prepare(`
+      SELECT e.id, e.body, e.linear_outbox_id, o.payload
+      FROM execution_publication_events e
+      JOIN linear_outbox o ON o.id = e.linear_outbox_id
+      WHERE e.parent_attempt_id = ? AND e.kind = 'aggregate'
+      ORDER BY e.sequence ASC
+      LIMIT 1
+    `).get(attempt.id) as { id: string; body: string; linear_outbox_id: string; payload: string };
+    const legacyAggregateBody = aggregatePublication.body.replaceAll(canonicalGraphResultHash, legacyGraphResult!.hash);
+    const aggregateOutboxPayload = JSON.parse(aggregatePublication.payload) as {
+      activity: Record<string, unknown>;
+    } & Record<string, unknown>;
+    const legacyAggregateOutboxPayload = canonicalJson({
+      ...aggregateOutboxPayload,
+      activity: {
+        ...aggregateOutboxPayload.activity,
+        body: legacyAggregateBody,
+      },
+    });
+    db!.prepare("UPDATE execution_publication_events SET body = ? WHERE id = ?")
+      .run(legacyAggregateBody, aggregatePublication.id);
+    db!.prepare("UPDATE linear_outbox SET payload = ?, payload_hash = ? WHERE id = ?")
+      .run(
+        legacyAggregateOutboxPayload,
+        digestNormalized(legacyAggregateOutboxPayload),
+        aggregatePublication.linear_outbox_id
+      );
+    await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
+    const reconciledPublication = pipelines.getStructuredExecutionPublicationForInstance(instance.id)!;
+    expect(reconciledPublication.graph.aggregate_artifact_hash).toBe(canonicalGraphResultHash);
+    expect(executionLedgerLines(reconciledPublication))
+      .toEqual(expect.arrayContaining([
+        expect.stringContaining(`aggregate=${canonicalGraphResultHash}`),
+      ]));
+    expect(executionLedgerLines(reconciledPublication))
+      .not.toEqual(expect.arrayContaining([
+        expect.stringContaining(`aggregate=${legacyGraphResult!.hash}`),
+      ]));
 
     db!.prepare("UPDATE pipeline_instances SET status = ? WHERE id = ?").run(beforeAggregateStatus, instance.id);
 

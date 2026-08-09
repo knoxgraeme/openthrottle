@@ -1884,29 +1884,7 @@ describe("execution unit store", () => {
   it("appends one durable aggregate correction when the legacy activity was already delivered", () => {
     const store = setup();
     const subject = "1".repeat(40);
-    store.createGraph({
-      pipelineInstanceId: "instance-1",
-      parentAttemptId: "attempt-parent",
-      parentStageId: "units",
-      parentRunId: "run-parent",
-      graphDigest: "graph-digest",
-      planDigest: "plan-digest",
-      units: [{ id: "a" }],
-      unitPhaseBindings: builtinUnitPhaseBindings([]),
-    });
-    completeUnitToTerminal(store, subject);
-    const finalReview = lease(store);
-    store.completeGatedAction({
-      actionId: finalReview.id,
-      resultHash: "fr-hash",
-      outputSubject: subject,
-      decision: gateDecision({ gateKind: "final_review", outcome: "success", subject }),
-    });
-    expect(store.emitAggregateOnce({
-      parentAttemptId: "attempt-parent",
-      artifactHash: "legacy-hash",
-      integrationSubject: subject,
-    })).toBe("emitted");
+    emitSingleUnitAggregate(store, subject, "legacy-hash");
     const delivered = publicationEvents("attempt-parent").find((event) => event.kind === "aggregate")!;
     db!.prepare("UPDATE linear_outbox SET status = 'processed', processed_at = ? WHERE payload LIKE ?")
       .run(timestamp, `%${delivered.body}%`);
@@ -1949,57 +1927,13 @@ describe("execution unit store", () => {
   it("treats a stale aggregate marker replay as already canonical without duplicating activity", () => {
     const store = setup();
     const subject = "1".repeat(40);
-    store.createGraph({
-      pipelineInstanceId: "instance-1",
-      parentAttemptId: "attempt-parent",
-      parentStageId: "units",
-      parentRunId: "run-parent",
-      graphDigest: "graph-digest",
-      planDigest: "plan-digest",
-      units: [{ id: "a" }],
-      unitPhaseBindings: builtinUnitPhaseBindings([]),
-    });
-    completeUnitToTerminal(store, subject);
-    const finalReview = lease(store);
-    store.completeGatedAction({
-      actionId: finalReview.id,
-      resultHash: "fr-hash",
-      outputSubject: subject,
-      decision: gateDecision({ gateKind: "final_review", outcome: "success", subject }),
-    });
-    expect(store.emitAggregateOnce({
-      parentAttemptId: "attempt-parent",
-      artifactHash: "legacy-hash",
-      integrationSubject: subject,
-    })).toBe("emitted");
+    emitSingleUnitAggregate(store, subject, "legacy-hash");
     expect(store.migrateAggregateArtifactHash({
       parentAttemptId: "attempt-parent",
       fromArtifactHash: "legacy-hash",
       toArtifactHash: "canonical-hash",
     })).toBe("migrated");
-    const canonicalEvent = db!.prepare(`
-      SELECT e.id, e.body, e.linear_outbox_id, o.payload
-      FROM execution_publication_events e
-      JOIN linear_outbox o ON o.id = e.linear_outbox_id
-      WHERE e.parent_attempt_id = ? AND e.kind = 'aggregate'
-      ORDER BY e.sequence ASC
-      LIMIT 1
-    `).get("attempt-parent") as { id: string; body: string; linear_outbox_id: string; payload: string };
-    const legacyBody = canonicalEvent.body.replaceAll("canonical-hash", "legacy-hash");
-    const canonicalOutboxPayload = JSON.parse(canonicalEvent.payload) as {
-      activity: Record<string, unknown>;
-    } & Record<string, unknown>;
-    const legacyOutboxPayload = canonicalJson({
-      ...canonicalOutboxPayload,
-      activity: {
-        ...canonicalOutboxPayload.activity,
-        body: legacyBody,
-      },
-    });
-    db!.prepare("UPDATE execution_publication_events SET body = ? WHERE id = ?")
-      .run(legacyBody, canonicalEvent.id);
-    db!.prepare("UPDATE linear_outbox SET payload = ?, payload_hash = ? WHERE id = ?")
-      .run(legacyOutboxPayload, digestNormalized(legacyOutboxPayload), canonicalEvent.linear_outbox_id);
+    rewriteAggregateActivityHash("attempt-parent", "canonical-hash", "legacy-hash");
 
     expect(store.migrateAggregateArtifactHash({
       parentAttemptId: "attempt-parent",
@@ -2013,6 +1947,69 @@ describe("execution unit store", () => {
         body: expect.stringContaining("canonical-hash"),
         outboxBody: expect.stringContaining("canonical-hash"),
       });
+  });
+
+  it("records one correction when a canonical aggregate marker has an already delivered legacy activity", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    emitSingleUnitAggregate(store, subject, "legacy-hash");
+    const delivered = publicationEvents("attempt-parent").find((event) => event.kind === "aggregate")!;
+    db!.prepare("UPDATE linear_outbox SET status = 'processed', processed_at = ? WHERE payload LIKE ?")
+      .run(timestamp, `%${delivered.body}%`);
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET aggregate_artifact_hash = ?
+      WHERE parent_attempt_id = ?
+    `).run("canonical-hash", "attempt-parent");
+
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+    })).toBe("already_canonical");
+    expect(store.getStructuredExecutionPublication("attempt-parent")?.graph).toMatchObject({
+      aggregate_artifact_hash: "canonical-hash",
+    });
+    let events = publicationEvents("attempt-parent").filter((event) => event.kind === "aggregate");
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      body: expect.stringContaining("canonical-hash"),
+      outboxBody: expect.stringContaining("legacy-hash"),
+      outboxStatus: "processed",
+    });
+    expect(events[1]).toMatchObject({
+      body: expect.stringContaining("canonical-hash"),
+      outboxBody: expect.stringContaining("canonical-hash"),
+      outboxStatus: "pending",
+    });
+
+    expect(store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+    })).toBe("already_canonical");
+    events = publicationEvents("attempt-parent").filter((event) => event.kind === "aggregate");
+    expect(events).toHaveLength(2);
+  });
+
+  it("rejects a canonical aggregate marker whose durable activity is unrelated to the migration source", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    emitSingleUnitAggregate(store, subject, "legacy-hash");
+    rewriteAggregateActivityHash("attempt-parent", "legacy-hash", "unrelated-hash");
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET aggregate_artifact_hash = ?
+      WHERE parent_attempt_id = ?
+    `).run("canonical-hash", "attempt-parent");
+
+    expect(() => store.migrateAggregateArtifactHash({
+      parentAttemptId: "attempt-parent",
+      fromArtifactHash: "legacy-hash",
+      toArtifactHash: "canonical-hash",
+    })).toThrow(/aggregate publication event does not match migration source/);
+    expect(publicationEvents("attempt-parent").filter((event) => event.kind === "aggregate"))
+      .toHaveLength(1);
   });
 
   it("advances the graph integration head after each serial integration", () => {
@@ -3255,6 +3252,58 @@ describe("execution unit store", () => {
     expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ stopped_at: timestamp, stop_reason: "lead_needs_human" });
     expect(lease(store)).toBeUndefined();
   });
+
+  function emitSingleUnitAggregate(store: ExecutionUnitStore, subject: string, artifactHash: string): void {
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    completeUnitToTerminal(store, subject);
+    const finalReview = lease(store);
+    store.completeGatedAction({
+      actionId: finalReview.id,
+      resultHash: "fr-hash",
+      outputSubject: subject,
+      decision: gateDecision({ gateKind: "final_review", outcome: "success", subject }),
+    });
+    expect(store.emitAggregateOnce({
+      parentAttemptId: "attempt-parent",
+      artifactHash,
+      integrationSubject: subject,
+    })).toBe("emitted");
+  }
+
+  function rewriteAggregateActivityHash(parentAttemptId: string, fromArtifactHash: string, toArtifactHash: string): void {
+    const aggregateEvent = db!.prepare(`
+      SELECT e.id, e.body, e.linear_outbox_id, o.payload
+      FROM execution_publication_events e
+      JOIN linear_outbox o ON o.id = e.linear_outbox_id
+      WHERE e.parent_attempt_id = ? AND e.kind = 'aggregate'
+      ORDER BY e.sequence ASC
+      LIMIT 1
+    `).get(parentAttemptId) as { id: string; body: string; linear_outbox_id: string; payload: string };
+    const rewrittenBody = aggregateEvent.body.replaceAll(fromArtifactHash, toArtifactHash);
+    const outboxPayload = JSON.parse(aggregateEvent.payload) as {
+      activity: Record<string, unknown>;
+    } & Record<string, unknown>;
+    const rewrittenOutboxPayload = canonicalJson({
+      ...outboxPayload,
+      activity: {
+        ...outboxPayload.activity,
+        body: rewrittenBody,
+      },
+    });
+    db!.prepare("UPDATE execution_publication_events SET body = ? WHERE id = ?")
+      .run(rewrittenBody, aggregateEvent.id);
+    db!.prepare("UPDATE linear_outbox SET payload = ?, payload_hash = ? WHERE id = ?")
+      .run(rewrittenOutboxPayload, digestNormalized(rewrittenOutboxPayload), aggregateEvent.linear_outbox_id);
+  }
 
   function publicationEvents(parentAttemptId: string): Array<{
     sequence: number;
