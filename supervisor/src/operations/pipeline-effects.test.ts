@@ -1794,9 +1794,70 @@ describe("pipeline effect processor", () => {
       intermediateEffect.id
     );
 
+    const fillerTimestamp = "2099-07-22T11:59:00.000Z";
+    const fillerRunIds: string[] = [];
+    for (let index = 0; index < 55; index += 1) {
+      const suffix = index.toString().padStart(2, "0");
+      const fillerIssueId = `issue-active-filler-${suffix}`;
+      const fillerSessionId = `session-active-filler-${suffix}`;
+      tickets.upsert({
+        linear_issue_id: fillerIssueId,
+        linear_issue_identifier: fillerIssueId.toUpperCase(),
+        linear_session_id: fillerSessionId,
+        sandbox_id: null,
+        branch: `ot/${fillerIssueId}`,
+        agent: "codex",
+        repo: "owner/repo",
+        pr_url: null,
+        state: "active",
+        pipeline: {
+          repository: "owner/repo",
+          baseCommit: "a".repeat(40),
+          manifest,
+          repositoryConfig: config,
+          runtime: runtimeDescriptor,
+          authorizedCapabilities: manifest.manifest.requires.capabilities,
+          taskType: "implement",
+          taskContext,
+        },
+      });
+      const filler = pipelines.getInstanceForSession(fillerSessionId)!;
+      const fillerAttempt = pipelines.getActiveAttempt(filler.id)!;
+      const fillerRunId = fillerAttempt.planned_run_id!;
+      fillerRunIds.push(fillerRunId);
+      expect(tickets.beginRun({
+        issueId: fillerIssueId,
+        runId: fillerRunId,
+        taskType: "implement",
+        tokenHash: `token-${suffix}`,
+        expiresAt: "2100-01-01T00:00:00.000Z",
+      })).toBe(true);
+      pipelines.bindRuntimeResource(filler.id, "daytona", `sandbox-active-filler-${suffix}`);
+      db!.prepare(`
+        UPDATE pipeline_instances
+        SET status = 'running', updated_at = ?, runtime_resource_updated_at = ?
+        WHERE id = ?
+      `).run(fillerTimestamp, fillerTimestamp, filler.id);
+      db!.prepare(`
+        UPDATE pipeline_stage_attempts
+        SET status = 'running', run_id = ?, updated_at = ?
+        WHERE id = ?
+      `).run(fillerRunId, fillerTimestamp, fillerAttempt.id);
+      db!.prepare(`
+        UPDATE pipeline_effect_intents
+        SET status = 'acknowledged'
+        WHERE pipeline_instance_id = ?
+      `).run(filler.id);
+    }
+    expect(pipelines.listActiveRuntimeInstances()).toHaveLength(50);
+    expect(pipelines.listActiveRuntimeInstances().some((active) => active.id === instance.id)).toBe(false);
+
     const stopCallsBeforeIntermediateRecovery = runtime.stop.mock.calls.length;
     await processor.drain();
     expect(runtime.stop).toHaveBeenCalledTimes(stopCallsBeforeIntermediateRecovery + 1);
+    for (const fillerRunId of fillerRunIds) {
+      expect(tickets.getRun(fillerRunId)).toMatchObject({ status: "running" });
+    }
     expect(tickets.getRun(legacyIntermediateWithoutFence.runId)).toMatchObject({ status: "stopped" });
     const restartedIntermediateAttempt = pipelines.getActiveAttempt(instance.id)!;
     const restartedIntermediateRequest = JSON.parse(restartedIntermediateAttempt.request_payload!) as StageRequestEnvelope;

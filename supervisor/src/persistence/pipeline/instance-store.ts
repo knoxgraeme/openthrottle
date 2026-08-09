@@ -55,6 +55,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   | "setRuntimeResourceStatus"
   | "listReclaimableRuntimeResources"
   | "listActiveRuntimeInstances"
+  | "listActiveRuntimeInstancesAfter"
   | "getInstanceByRuntimeResourceId"
   | "getActiveAttempt"
   | "listAttempts"
@@ -93,6 +94,28 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
         AND terminal_outcome IS NULL
         AND status NOT IN ('shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed')
     `).all(issueId, currentSessionId) as PipelineInstance[];
+
+  const listActiveRuntimeInstancesAfter = (
+    cursor: { updatedAt: string; id: string } | null,
+    limit = 50
+  ): PipelineInstance[] => {
+    const instances = (cursor
+      ? db.prepare(`
+        SELECT * FROM pipeline_instances
+        WHERE runtime_resource_status = 'active'
+          AND status IN ('running', 'dispatchable')
+          AND (updated_at > ? OR (updated_at = ? AND id > ?))
+        ORDER BY updated_at, id LIMIT ?
+      `).all(cursor.updatedAt, cursor.updatedAt, cursor.id, limit)
+      : db.prepare(`
+        SELECT * FROM pipeline_instances
+        WHERE runtime_resource_status = 'active'
+          AND status IN ('running', 'dispatchable')
+        ORDER BY updated_at, id LIMIT ?
+      `).all(limit)) as PipelineInstance[];
+    for (const instance of instances) validatePinnedInstance(db, instance);
+    return instances;
+  };
 
   const getSupersedableAttempt = (instanceId: string): PipelineStageAttempt | undefined =>
     db.prepare(`
@@ -609,15 +632,9 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
       `).all(cutoffIso, limit) as PipelineInstance[];
     },
     listActiveRuntimeInstances(limit = 50) {
-      const instances = db.prepare(`
-        SELECT * FROM pipeline_instances
-        WHERE runtime_resource_status = 'active'
-          AND status IN ('running', 'dispatchable')
-        ORDER BY updated_at, id LIMIT ?
-      `).all(limit) as PipelineInstance[];
-      for (const instance of instances) validatePinnedInstance(db, instance);
-      return instances;
+      return listActiveRuntimeInstancesAfter(null, limit);
     },
+    listActiveRuntimeInstancesAfter,
     getInstanceByRuntimeResourceId(providerResourceId) {
       return getInstanceByRuntimeResourceIdStmt.get(providerResourceId) as PipelineInstance | undefined;
     },

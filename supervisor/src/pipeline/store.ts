@@ -449,6 +449,10 @@ export interface PipelineStore extends ChildActionLivenessPort {
    */
   listReclaimableRuntimeResources(cutoffIso: string, limit?: number): PipelineInstance[];
   listActiveRuntimeInstances(limit?: number): PipelineInstance[];
+  listActiveRuntimeInstancesAfter(
+    cursor: { updatedAt: string; id: string } | null,
+    limit?: number
+  ): PipelineInstance[];
   getActiveAttempt(instanceId: string): PipelineStageAttempt | undefined;
   listAttempts(instanceId: string): PipelineStageAttempt[];
   listProviderReadyInstances(limit?: number): PipelineInstance[];

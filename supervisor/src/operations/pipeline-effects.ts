@@ -28,6 +28,7 @@ const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
 const MAX_EFFECT_ATTEMPTS = 8;
 const CAPACITY_RETRY_MS = 5 * 60_000;
+const ACTIVE_RUNTIME_RECONCILIATION_PAGE_SIZE = 50;
 
 // Deterministic provider failures must not burn the whole retry budget on hot
 // exponential backoff. Auth failures never self-heal, so they exhaust on the
@@ -775,25 +776,23 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       drained.add(key);
       await drainCompletedCompositeParentsForSuccessor(resource, instance, successorStageId);
     };
-    const tickets = deps.tickets.listRunning();
-    for (const ticket of tickets) {
-      const instance = deps.store.getInstanceForSession(ticket.linear_session_id);
-      if (!instance || ticket.run_id === null || !instance.active_stage_id) continue;
-      const attempt = deps.store.getActiveAttempt(instance.id);
-      if (!attempt || attempt.run_id !== ticket.run_id || attempt.status !== "running") continue;
-      const binding = runtimeBindingFor(instance);
-      if (!binding.resource || binding.status !== "active") continue;
-      await drainInstance(instance, binding.resource, attempt.stage_id);
-    }
-    for (const instance of deps.store.listActiveRuntimeInstances()) {
-      if (!instance.active_stage_id) continue;
-      const attempt = deps.store.getActiveAttempt(instance.id);
-      if (!attempt || attempt.status !== "running" || !attempt.run_id) continue;
-      const run = deps.tickets.getRun(attempt.run_id);
-      if (run?.status === "running") continue;
-      const binding = runtimeBindingFor(instance);
-      if (!binding.resource || binding.status !== "active") continue;
-      await drainInstance(instance, binding.resource, attempt.stage_id);
+    let cursor: { updatedAt: string; id: string } | null = null;
+    while (true) {
+      const activeInstances = deps.store.listActiveRuntimeInstancesAfter(
+        cursor,
+        ACTIVE_RUNTIME_RECONCILIATION_PAGE_SIZE
+      );
+      if (activeInstances.length === 0) break;
+      for (const instance of activeInstances) {
+        cursor = { updatedAt: instance.updated_at, id: instance.id };
+        if (!instance.active_stage_id) continue;
+        const attempt = deps.store.getActiveAttempt(instance.id);
+        if (!attempt || attempt.status !== "running" || !attempt.run_id) continue;
+        const binding = runtimeBindingFor(instance);
+        if (!binding.resource || binding.status !== "active") continue;
+        await drainInstance(instance, binding.resource, attempt.stage_id);
+      }
+      if (activeInstances.length < ACTIVE_RUNTIME_RECONCILIATION_PAGE_SIZE) break;
     }
   };
 
@@ -925,8 +924,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           new Date(current.getTime() + EFFECT_LEASE_MS).toISOString()
         );
         await Promise.all(effects.map(processClaimed));
-        await drainActiveCompositeGraphs();
         await drainActiveSuccessorReconciliations();
+        await drainActiveCompositeGraphs();
       } finally {
         draining = false;
       }
