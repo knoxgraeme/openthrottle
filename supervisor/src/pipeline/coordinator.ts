@@ -173,18 +173,23 @@ function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: Pip
     return input.instance.published_commit !== null && input.event.subject === input.instance.published_commit;
   }
   if (stage.evaluator.kind === "publish_subject") {
-    return input.event.providerRevision !== undefined && input.event.subject === input.event.providerRevision;
+    return input.event.providerRevision !== undefined && input.event.subject != null;
   }
   return input.instance.published_commit !== null &&
-    input.event.subject === input.instance.published_commit;
+    input.instance.published_subject !== null &&
+    input.event.subject === input.instance.published_subject;
 }
 
-function shouldClearPublishedCommit(input: PipelineReductionInput): boolean {
+function shouldClearPublishedBinding(input: PipelineReductionInput): boolean {
   return input.instance.published_commit !== null &&
     input.event.providerRevision === undefined &&
     input.event.subject != null &&
     input.instance.immutable_subject != null &&
     input.event.subject !== input.instance.immutable_subject;
+}
+
+function publishedSubjectForEvent(input: PipelineReductionInput): string | null {
+  return input.event.providerRevision === undefined ? null : input.event.subject ?? null;
 }
 
 function verifyInput(input: PipelineReductionInput): PipelineStage {
@@ -432,6 +437,7 @@ function terminalWrite(input: PipelineReductionInput & {
   waitReason?: string | null;
   immutableSubject?: string | null;
   publishedCommit?: string | null;
+  publishedSubject?: string | null;
   clearPublishedCommit?: boolean;
   cleanup?: boolean;
   effects?: CoordinatorEffectWrite[];
@@ -452,6 +458,7 @@ function terminalWrite(input: PipelineReductionInput & {
     waitReason: input.waitReason ?? (input.terminal === "needs_human" ? "pipeline requires a human decision" : null),
     immutableSubject: input.immutableSubject,
     publishedCommit: input.publishedCommit,
+    publishedSubject: input.publishedSubject,
     clearPublishedCommit: input.clearPublishedCommit,
     artifacts: artifactsFor(input.event),
     effects: [
@@ -628,7 +635,8 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
           : null,
       immutableSubject: input.event.subject ?? null,
       publishedCommit: input.event.providerRevision ?? null,
-      clearPublishedCommit: shouldClearPublishedCommit(input),
+      publishedSubject: publishedSubjectForEvent(input),
+      clearPublishedCommit: shouldClearPublishedBinding(input),
       reentryIncrement: isReentry ? 1 : 0,
       artifacts: artifactsFor(input.event),
       nextAttempt,
@@ -651,7 +659,8 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     publishIdempotencyKey: `linear-terminal:${input.instance.id}:${terminal}`,
     immutableSubject: input.event.subject ?? null,
     publishedCommit: input.event.providerRevision ?? null,
-    clearPublishedCommit: shouldClearPublishedCommit(input),
+    publishedSubject: publishedSubjectForEvent(input),
+    clearPublishedCommit: shouldClearPublishedBinding(input),
     effects: terminal === "failed" ? [failedTerminalStopEffect({
       instanceId: input.instance.id,
       idempotencyKey: `stop:${input.instance.id}:${terminal}`,

@@ -1101,12 +1101,15 @@ export function buildStagePublication(input: {
     ...(input.structuredExecution ? { structured_execution: input.structuredExecution } : {}),
     resume_status: resumeStatus,
   };
+  const publishedCommit = input.write.clearPublishedCommit
+    ? null
+    : input.write.publishedCommit ?? input.instance.published_commit;
   const body = renderBody(partial, input.instance.normalized_manifest, {
     scheduledReentryOrdinal: input.write.nextAttempt?.reentryOrdinal,
     repairBannerFinding: currentFindingsWithDisposition
       .find((finding) => finding.disposition === "carried to repair"),
     repairSourceStageId,
-    publishedCommit: input.instance.published_commit,
+    publishedCommit,
   });
   return artifactBytes <= INLINE_ARTIFACT_LIMIT_BYTES
     ? {

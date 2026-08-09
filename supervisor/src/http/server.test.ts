@@ -621,6 +621,28 @@ describe("coordinator-only server", () => {
     });
 
     db.prepare(`
+      UPDATE pipeline_instances
+      SET published_commit = NULL, published_subject = NULL,
+          updated_at = '2026-07-26T00:21:00.000Z'
+      WHERE id = ?
+    `).run(instance.id);
+    const stalePublicationResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    const stalePublicationBody = await stalePublicationResponse.json() as {
+      tickets: Array<{ pipeline: Record<string, unknown> | null }>;
+    };
+    expect(stalePublicationBody.tickets[0]?.pipeline).toMatchObject({
+      published_pr_url: null,
+    });
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET published_commit = ?, published_subject = ?,
+          updated_at = '2026-07-26T00:22:00.000Z'
+      WHERE id = ?
+    `).run("c".repeat(40), "d".repeat(40), instance.id);
+
+    db.prepare(`
       INSERT INTO pipeline_publication_receipts (
         id, pipeline_instance_id, kind, idempotency_key, payload, payload_hash,
         status, external_url, attempts, next_attempt_at, created_at, updated_at

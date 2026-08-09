@@ -222,8 +222,9 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
         // receipts, so normal runs have no pull_request receipt; the ticket
         // projection (populated by the pull-request webhook) is the durable
         // fallback that keeps this field honest for the /status contract.
-        published_pr_url:
-          publishedPr?.external_url ?? publishedPr?.target_url ?? instance.ticket_pr_url ?? null,
+        published_pr_url: instance.published_commit === null
+          ? null
+          : publishedPr?.external_url ?? publishedPr?.target_url ?? instance.ticket_pr_url ?? null,
         gate_result: gate?.result ?? null,
         assurance: gate?.assurance ?? null,
         policy_digest: gate?.policy_digest ?? null,

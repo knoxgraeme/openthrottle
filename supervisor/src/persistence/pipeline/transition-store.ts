@@ -300,6 +300,7 @@ export function createTransitionStore(db: Database.Database, now: () => string):
         attempt_count = attempt_count + ?, reentry_count = reentry_count + ?,
         immutable_subject = CASE WHEN ? IS NULL THEN immutable_subject ELSE ? END,
         published_commit = CASE WHEN ? THEN NULL WHEN ? IS NULL THEN published_commit ELSE ? END,
+        published_subject = CASE WHEN ? THEN NULL WHEN ? IS NULL THEN published_subject ELSE ? END,
         terminal_outcome = ?,
         updated_at = ?
       WHERE id = ? AND state_version = ? AND status = ?
@@ -308,6 +309,7 @@ export function createTransitionStore(db: Database.Database, now: () => string):
       write.nextAttempt ? 1 : 0, write.reentryIncrement ?? 0,
       write.immutableSubject ?? null, write.immutableSubject ?? null,
       write.clearPublishedCommit ? 1 : 0, write.publishedCommit ?? null, write.publishedCommit ?? null,
+      write.clearPublishedCommit ? 1 : 0, write.publishedSubject ?? null, write.publishedSubject ?? null,
       write.terminalOutcome ?? null,
       timestamp, instance.id, write.expectedVersion, write.expectedStatus
     );
