@@ -599,6 +599,60 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     throw new Error(`missing ${type} receipt for ${unitId ?? "final"}`);
   };
 
+  const verifiedAggregateTreeSubject = (input: {
+    parentAttemptId: string;
+    integrationSubject: string;
+    attempts: readonly ExecutionWorkAttempt[];
+    gates: readonly ExecutionGateReceipt[];
+  }): string => {
+    const accepted = input.gates.filter((gate) =>
+      gate.gate_kind === "integration" &&
+      gate.outcome === "success" &&
+      gate.result === "passed" &&
+      gate.subject === input.integrationSubject
+    );
+    if (accepted.length === 0) {
+      throw new Error(`structured aggregate ${input.parentAttemptId} requires an accepted integration gate for the integrated commit`);
+    }
+    const trees = new Set<string>();
+    for (const gate of accepted) {
+      if (digestNormalized(gate.payload) !== gate.receipt_hash) {
+        throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration gate hash mismatch`);
+      }
+      const attempt = input.attempts.find((entry) => entry.id === gate.execution_work_attempt_id);
+      if (!attempt || attempt.action_kind !== "integrate" || attempt.status !== "completed" || !attempt.receipt) {
+        throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration receipt is missing`);
+      }
+      if (!attempt.receipt_hash || digestNormalized(attempt.receipt) !== attempt.receipt_hash) {
+        throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration receipt hash mismatch`);
+      }
+      const gateArtifactHashes = JSON.parse(gate.artifact_hashes) as unknown;
+      if (!Array.isArray(gateArtifactHashes) || !gateArtifactHashes.includes(attempt.receipt_hash)) {
+        throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration gate does not seal the receipt`);
+      }
+      if (attempt.output_subject !== input.integrationSubject) {
+        throw new Error(`structured aggregate ${input.parentAttemptId} integration action subject disagrees with graph subject`);
+      }
+      const receipt = parseStandardReceipt(attempt.receipt, { source: `child_action.${attempt.id}.receipt` }).value;
+      if (receipt.type !== "integration_evidence" || receipt.assurance !== "executor_verified") {
+        throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration receipt is not executor verified`);
+      }
+      if (
+        receipt.result !== "success" ||
+        receipt.subject.post !== input.integrationSubject ||
+        receipt.payload.clean !== true ||
+        !GIT_SUBJECT.test(receipt.payload.tree)
+      ) {
+        throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration receipt does not seal a clean tree`);
+      }
+      trees.add(receipt.payload.tree);
+    }
+    if (trees.size !== 1) {
+      throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration receipts disagree on the tree subject`);
+    }
+    return [...trees][0]!;
+  };
+
   const unitCompletionAttemptReceipt = (
     receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
     unitId: string | null,
@@ -1269,10 +1323,6 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (!graph) return;
       const parentAttempt = deps.store.getAttempt(parentAttemptId);
       if (!parentAttempt) throw new Error(`structured parent attempt ${parentAttemptId} is missing`);
-      if (
-        graph.aggregate_emitted_at &&
-        ["completed", "canceled", "superseded", "failed"].includes(parentAttempt.status)
-      ) return;
       const units = deps.store.listUnits(parentAttemptId);
       const attempts = deps.store.listWorkAttempts(parentAttemptId);
       const gates = deps.store.listGateReceipts(parentAttemptId);
@@ -1281,27 +1331,39 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         : aggregateOutcomeFor(units, gates);
       if (!outcome) return;
       if (outcome === "success" && graph.final_phase !== "done") return;
-      const aggregateSubject = graph.integration_subject ?? parentAttempt.expected_subject ?? instance.immutable_subject ?? instance.base_commit;
-      if (!aggregateSubject || !GIT_SUBJECT.test(aggregateSubject)) {
+      const integrationSubject = outcome === "success"
+        ? graph.integration_subject
+        : graph.integration_subject ?? parentAttempt.expected_subject ?? instance.immutable_subject ?? instance.base_commit;
+      if (!integrationSubject || !GIT_SUBJECT.test(integrationSubject)) {
         throw new Error(`structured aggregate ${parentAttemptId} has no exact subject`);
       }
+      let aggregateSubject = integrationSubject;
       if (outcome === "success") {
+        aggregateSubject = verifiedAggregateTreeSubject({
+          parentAttemptId,
+          integrationSubject,
+          attempts,
+          gates,
+        });
         const finalReviewSubject = latestAttemptReceipt<SemanticReviewReceipt>(
           completedAttemptReceiptsFrom(attempts),
           "semantic_review",
           null
         ).receipt.subject.post;
-        if (finalReviewSubject !== aggregateSubject) {
+        if (finalReviewSubject !== integrationSubject) {
           throw new Error("structured aggregate success requires the fresh final review subject to match the integrated subject");
         }
       }
+      const aggregateCompletedAt = graph.aggregate_emitted_at ?? deps.now().toISOString();
+      const manifest = JSON.parse(instance.normalized_manifest);
       const event = buildAggregateStageEvent({
         id: `execution-aggregate:${parentAttemptId}:${aggregateSubject}:${outcome}`,
-        manifest: JSON.parse(instance.normalized_manifest),
+        manifest,
         instance,
         parentAttempt,
         outcome,
         subject: aggregateSubject,
+        completedAt: aggregateCompletedAt,
         units,
       });
       const graphResult = event.artifacts?.find((artifact) => artifact.kind === "execution_graph_result");
@@ -1310,6 +1372,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         if (graph.aggregate_artifact_hash !== graphResult.hash) {
           throw new Error(`structured aggregate ${parentAttemptId} replay hash does not match durable graph marker`);
         }
+        if (["completed", "canceled", "superseded", "failed"].includes(parentAttempt.status)) return;
         completeParentStage(event);
         return;
       }
@@ -1317,6 +1380,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         parentAttemptId,
         artifactHash: graphResult.hash,
         integrationSubject: graph.integration_subject,
+        emittedAt: aggregateCompletedAt,
         requireFinalReview: outcome === "success",
       });
       completeParentStage(event);

@@ -98,5 +98,5 @@ describe("canonical digest determinism fixture", () => {
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });

@@ -14,6 +14,7 @@ import {
   parseRepositoryConfig,
 } from "../pipeline/manifest.js";
 import { parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
+import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor, type SandboxAutostopRuntime, type SandboxRuntime } from "../__fixtures__/runtime.js";
 import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
@@ -35,6 +36,90 @@ describe("pipeline effect processor", () => {
 
   const listLinearOutbox = (): LinearOutboxRecord[] =>
     db!.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
+
+  function repositoryStructuredGraphWithPublishStage(
+    publishStageId: string,
+    intermediateStageId?: string,
+    cycleStageId?: string,
+    alternatePublishStageId?: string
+  ): string {
+    const graph = JSON.parse(readFileSync(structuredGraphPath, "utf8")) as {
+      id: string;
+      nodes: Array<{
+        id: string;
+        kind?: string;
+        command?: string;
+        depends_on?: string[];
+        transitions: Record<string, { to?: string; terminal?: string; max_reentries?: number; on_exhausted?: string }>;
+      }>;
+    };
+    graph.id = `repository/structured-${publishStageId}`;
+    for (const node of graph.nodes) {
+      if (node.id === "units") node.transitions.success = { to: intermediateStageId ?? publishStageId };
+      if (node.id === "publish") {
+        node.id = publishStageId;
+        node.transitions.retryable_failure = { ...node.transitions.retryable_failure, to: publishStageId };
+      }
+    }
+    if (intermediateStageId) {
+      graph.nodes.splice(1, 0, {
+        id: intermediateStageId,
+        kind: "command",
+        command: "test",
+        depends_on: [],
+        transitions: {
+          retryable_failure: { to: intermediateStageId, max_reentries: 2, on_exhausted: "failed" },
+          success: { to: cycleStageId ?? publishStageId },
+          repair_required: { to: publishStageId },
+          failure: { to: alternatePublishStageId ?? publishStageId },
+        },
+      });
+      if (cycleStageId) {
+        graph.nodes.splice(2, 0, {
+          id: cycleStageId,
+          kind: "command",
+          command: "test",
+          depends_on: [],
+          transitions: {
+            retryable_failure: { to: cycleStageId, max_reentries: 2, on_exhausted: "failed" },
+            success: { to: intermediateStageId, max_reentries: 2, on_exhausted: "failed" },
+            repair_required: { to: publishStageId },
+            failure: { to: alternatePublishStageId ?? publishStageId },
+          },
+        });
+      }
+    }
+    if (alternatePublishStageId) {
+      const publishNode = graph.nodes.find((node) => node.id === publishStageId);
+      if (!publishNode) throw new Error(`publish node ${publishStageId} not found`);
+      const providerNode = graph.nodes.find((node) => node.id === "provider");
+      if (!providerNode) throw new Error("provider node not found");
+      const alternateProviderStageId = `${alternatePublishStageId}_provider`;
+      graph.nodes.push({
+        ...structuredClone(publishNode),
+        id: alternatePublishStageId,
+        transitions: Object.fromEntries(Object.entries(publishNode.transitions).map(([outcome, transition]) => [
+          outcome,
+          transition.to === "provider"
+            ? { ...transition, to: alternateProviderStageId }
+            : transition.to === publishStageId
+              ? { ...transition, to: alternatePublishStageId, max_reentries: transition.max_reentries ?? 2 }
+              : transition,
+        ])),
+      });
+      graph.nodes.push({
+        ...structuredClone(providerNode),
+        id: alternateProviderStageId,
+        transitions: Object.fromEntries(Object.entries(providerNode.transitions).map(([outcome, transition]) => [
+          outcome,
+          transition.to === "provider"
+            ? { ...transition, to: alternateProviderStageId, max_reentries: transition.max_reentries ?? 2 }
+            : transition,
+        ])),
+      });
+    }
+    return JSON.stringify(graph);
+  }
 
   function sandboxRuntimeMock(ids: { issueId?: string; providerDispatchId?: string } = {}) {
     const issueId = ids.issueId ?? "1";
@@ -170,6 +255,7 @@ describe("pipeline effect processor", () => {
     outcome?: ExecutionGateDecision["outcome"];
     result?: ExecutionGateDecision["result"];
     reason?: GateReceiptReason;
+    artifactHashes?: string[];
   }): ExecutionGateDecision {
     const base = {
       gateKind: input.gateKind,
@@ -177,7 +263,7 @@ describe("pipeline effect processor", () => {
       result: input.result ?? "passed",
       reason: input.reason ?? "typed_semantic_result",
       subject: input.subject,
-      artifactHashes: ["a".repeat(64)],
+      artifactHashes: input.artifactHashes ?? ["a".repeat(64)],
     };
     const payload = canonicalJson({ schema: "test.gate-decision/v1", ...base });
     return { ...base, payload, hash: digestNormalized(payload) };
@@ -194,6 +280,8 @@ describe("pipeline effect processor", () => {
     commandName?: string | null;
     nativeSessionId?: string | null;
     evidence?: string[];
+    treeSubject?: string;
+    clean?: boolean;
   }): string {
     const executorVerified = input.type === "command_result" || input.type.endsWith("_evidence");
     const producer = (() => {
@@ -260,7 +348,12 @@ describe("pipeline effect processor", () => {
           ? { summary: "no findings", findings: [] }
         : input.type === "unit_decision"
           ? { rationale: "candidate matches the unit scope", context_updates: [], accepted_subject: input.subject }
-          : { tree: input.subject, diff_digest: "d".repeat(64), changed_paths: [], clean: true };
+        : {
+            tree: input.treeSubject ?? input.subject,
+            diff_digest: "d".repeat(64),
+            changed_paths: [],
+            clean: input.clean ?? true,
+          };
     return canonicalJson({
       schema: "openthrottle.receipt/v1",
       type: input.type,
@@ -510,8 +603,9 @@ describe("pipeline effect processor", () => {
       blobSha: "b".repeat(40),
       config: repositoryConfig,
     });
-    const manifest = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
-      id: "builtin/structured",
+    const publishStageId = "release";
+    const manifest = parseAndCompileExecutionGraph(repositoryStructuredGraphWithPublishStage(publishStageId), {
+      id: `repository/structured-${publishStageId}`,
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
       aggregatePublishContext: "prefer_resume",
@@ -830,8 +924,17 @@ describe("pipeline effect processor", () => {
       blobSha: "b".repeat(40),
       config: repositoryConfig,
     });
-    const manifest = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
-      id: "builtin/structured",
+    const publishStageId = "release";
+    const alternatePublishStageId = "repair_release";
+    const intermediateStageId = "verify_release";
+    const cycleStageId = "bounded_cycle_before_release";
+    const manifest = parseAndCompileExecutionGraph(repositoryStructuredGraphWithPublishStage(
+      publishStageId,
+      intermediateStageId,
+      cycleStageId,
+      alternatePublishStageId
+    ), {
+      id: `repository/structured-${publishStageId}`,
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
       aggregatePublishContext: "prefer_resume",
@@ -1166,6 +1269,7 @@ describe("pipeline effect processor", () => {
     const repairedSubject = "c".repeat(40);
     const finalCandidateSubject = "d".repeat(40);
     const finalIntegratedSubject = "e".repeat(40);
+    const finalIntegratedTreeSubject = "9".repeat(40);
     completeUnitAction("final_repair", repairedSubject, "unit_completion");
 
     await processor.drain();
@@ -1210,12 +1314,23 @@ describe("pipeline effect processor", () => {
       })
     );
     const finalIntegrate = latestAction("integrate");
+    const finalIntegrationReceipt = receiptJson({
+      instance,
+      action: finalIntegrate,
+      type: "integration_evidence",
+      subject: finalIntegratedSubject,
+      treeSubject: finalIntegratedTreeSubject,
+    });
     pipelines.completeGatedAction({
       actionId: finalIntegrate.id,
       resultHash: "result-final-integrate",
       outputSubject: finalIntegratedSubject,
-      receipt: receiptJson({ instance, action: finalIntegrate, type: "integration_evidence", subject: finalIntegratedSubject }),
-      decision: gateDecision({ gateKind: "integration", subject: finalIntegratedSubject }),
+      receipt: finalIntegrationReceipt,
+      decision: gateDecision({
+        gateKind: "integration",
+        subject: finalIntegratedSubject,
+        artifactHashes: [digestNormalized(finalIntegrationReceipt)],
+      }),
     });
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({ integration_subject: finalIntegratedSubject });
 
@@ -1265,6 +1380,53 @@ describe("pipeline effect processor", () => {
       freshReview.id
     );
 
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET integration_subject = NULL, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run("2099-07-22T12:00:00.000Z", attempt.id);
+    await expect(processor.drain()).rejects.toThrow(/has no exact subject/);
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET integration_subject = ?, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run(finalIntegratedSubject, "2099-07-22T12:00:00.000Z", attempt.id);
+
+    const rewriteFinalIntegrationReceipt = (receipt: string) => {
+      const receiptHash = digestNormalized(receipt);
+      const gate = gateDecision({
+        gateKind: "integration",
+        subject: finalIntegratedSubject,
+        artifactHashes: [receiptHash],
+      });
+      db!.prepare(`
+        UPDATE execution_work_attempts
+        SET receipt = ?, receipt_hash = ?, updated_at = ?
+        WHERE id = ?
+      `).run(receipt, receiptHash, "2099-07-22T12:00:00.000Z", finalIntegrate.id);
+      db!.prepare(`
+        UPDATE execution_gate_receipts
+        SET artifact_hashes = ?, payload = ?, receipt_hash = ?
+        WHERE execution_work_attempt_id = ? AND gate_kind = 'integration'
+      `).run(canonicalJson(gate.artifactHashes), gate.payload, gate.hash, finalIntegrate.id);
+    };
+    rewriteFinalIntegrationReceipt(receiptJson({
+      instance,
+      action: finalIntegrate,
+      type: "integration_evidence",
+      subject: finalIntegratedSubject,
+      treeSubject: finalIntegratedTreeSubject,
+      clean: false,
+    }));
+    await expect(processor.drain()).rejects.toThrow(/accepted integration receipt does not seal a clean tree/);
+    rewriteFinalIntegrationReceipt(receiptJson({
+      instance,
+      action: finalIntegrate,
+      type: "integration_evidence",
+      subject: finalIntegratedSubject,
+      treeSubject: finalIntegratedTreeSubject,
+    }));
+
     const beforeAggregateStatus = pipelines.getInstance(instance.id)!.status;
     db!.prepare("UPDATE pipeline_instances SET status = 'publication_blocked' WHERE id = ?").run(instance.id);
     await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
@@ -1272,59 +1434,95 @@ describe("pipeline effect processor", () => {
       aggregate_emitted_at: expect.any(String),
       aggregate_artifact_hash: expect.any(String),
     });
+    let canonicalGraphResultHash = pipelines.getGraphForAttempt(attempt.id)!.aggregate_artifact_hash!;
+    const expectedCanonicalGraphResultHash = canonicalGraphResultHash;
     expect(pipelines.getAttempt(attempt.id)).toMatchObject({ status: "running" });
+
     db!.prepare("UPDATE pipeline_instances SET status = ? WHERE id = ?").run(beforeAggregateStatus, instance.id);
 
     await processor.drain();
-    const aggregate = pipelines.getGraphForAttempt(attempt.id);
-    expect(aggregate).toMatchObject({
+    canonicalGraphResultHash = pipelines.getGraphForAttempt(attempt.id)!.aggregate_artifact_hash!;
+    expect(canonicalGraphResultHash).toBe(expectedCanonicalGraphResultHash);
+    expect(canonicalGraphResultHash).not.toBe(finalIntegratedSubject);
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
       aggregate_emitted_at: expect.any(String),
+      aggregate_artifact_hash: canonicalGraphResultHash,
       integration_subject: finalIntegratedSubject,
     });
     expect(pipelines.getInstance(instance.id)).toMatchObject({
-      active_stage_id: "publish",
+      active_stage_id: intermediateStageId,
       status: "dispatchable",
-      immutable_subject: finalIntegratedSubject,
+      immutable_subject: finalIntegratedTreeSubject,
     });
-    const effects = pipelines.listEffects(instance.id);
-    expect(effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending"))
-      .toMatchObject({
-        kind: "dispatch_stage",
-        idempotency_key: expect.stringContaining("publish"),
-      });
-    const publishRequest = JSON.parse(
-      effects.find((effect) => effect.kind === "dispatch_stage" && effect.status === "pending")!.payload
-    ) as {
-      stageId: string;
-      capability: string;
-      expectedSubject: string;
-      runId: string;
-      contextPolicy: string;
-      nativeSessionId: string | null;
-    };
-    expect(publishRequest).toMatchObject({
-      stageId: "publish",
-      capability: "ce/publish@1",
-      expectedSubject: finalIntegratedSubject,
-      contextPolicy: "prefer_resume",
-      nativeSessionId: null,
-    });
-    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBeNull();
 
-    const dispatchCallsBeforePublish = runtime.dispatchStage.mock.calls.length;
+    const dispatchCallsBeforeFreshReplay = runtime.dispatchStage.mock.calls.length;
     await processor.drain();
-    expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforePublish + 1);
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforeFreshReplay + 1);
     expect(runtime.dispatchStage).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
       expect.objectContaining({
-        stageId: "publish",
-        capability: "ce/publish@1",
-        expectedSubject: finalIntegratedSubject,
-        contextPolicy: "prefer_resume",
-        nativeSessionId: null,
+        stageId: intermediateStageId,
+        expectedSubject: finalIntegratedTreeSubject,
       })
     );
-    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(publishRequest.runId);
+    const intermediateAttempt = pipelines.getActiveAttempt(instance.id)!;
+    const intermediateRequest = JSON.parse(intermediateAttempt.request_payload!) as StageRequestEnvelope;
+    expect(intermediateAttempt).toMatchObject({
+      stage_id: intermediateStageId,
+      status: "running",
+      expected_subject: finalIntegratedTreeSubject,
+    });
+    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(intermediateRequest.runId);
+
+    const intermediateStagePayload = JSON.stringify({ id: "intermediate-release-check", outcome: "semantic_repair_required" });
+    const intermediateCommandPayload = JSON.stringify({ command: "test", exit_code: 1, summary: "command requested repair" });
+    tickets.finishRunAndThen({
+      runId: intermediateRequest.runId,
+      status: "completed",
+      ticketState: "active",
+      faultAttribution: null,
+    }, () => coordinatePipelineEvent(pipelines, {
+      id: "intermediate-release-check",
+      kind: "stage_result",
+      instanceId: instance.id,
+      generation: instance.generation,
+      attemptId: intermediateAttempt.id,
+      requestHash: intermediateRequest.requestHash,
+      outcome: "semantic_repair_required",
+      resultHash: digestNormalized(intermediateStagePayload),
+      subject: finalIntegratedTreeSubject,
+      nativeSessionId: null,
+      artifacts: [{
+        kind: "stage_result",
+        schemaVersion: 1,
+        assurance: "executor_verified",
+        subject: finalIntegratedTreeSubject,
+        payload: intermediateStagePayload,
+        hash: digestNormalized(intermediateStagePayload),
+      }, {
+        kind: "command_result",
+        schemaVersion: 1,
+        assurance: "executor_verified",
+        subject: finalIntegratedTreeSubject,
+        payload: intermediateCommandPayload,
+        hash: digestNormalized(intermediateCommandPayload),
+      }],
+    }));
+    expect(pipelines.getInstance(instance.id)).toMatchObject({
+      active_stage_id: publishStageId,
+      status: "dispatchable",
+      immutable_subject: finalIntegratedTreeSubject,
+    });
+    const publishEffect = pipelines.listEffects(instance.id).find((effect) =>
+      effect.kind === "dispatch_stage" && effect.status === "pending"
+    )!;
+    const publishRequest = JSON.parse(publishEffect.payload) as StageRequestEnvelope;
+    expect(publishRequest).toMatchObject({
+      stageId: publishStageId,
+      capability: "ce/publish@1",
+      expectedSubject: finalIntegratedTreeSubject,
+      contextPolicy: "resume_required",
+    });
   });
 
   it("leaves retryable child loop errors active for effect retry instead of parsing them as receipts", async () => {

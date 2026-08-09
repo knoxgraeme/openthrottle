@@ -142,7 +142,12 @@ export async function handlePrompted(
         },
         headSha: pipelineInstance.published_commit,
       });
-      processPipelineFeedbackSnapshot({ pipelines: coordinator.store, store, instance: pipelineInstance, snapshot });
+      processPipelineFeedbackSnapshot({
+        pipelines: coordinator.store,
+        store,
+        instance: pipelineInstance,
+        snapshot,
+      });
       await coordinator.drainEffects?.();
       await providers.activityPublisher.publishActivity({
         sessionId,

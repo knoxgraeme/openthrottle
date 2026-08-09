@@ -220,6 +220,7 @@ export interface ExecutionUnitStore {
     parentAttemptId: string;
     artifactHash: string;
     integrationSubject: string | null;
+    emittedAt?: string;
     requireFinalReview?: boolean;
   }): "emitted" | "already_emitted";
   recordGateReceipt(input: {
@@ -1176,7 +1177,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     if ((input.requireFinalReview ?? true) && hasCompletedUnit && graph.final_phase !== "done") {
       throw new Error(`execution graph ${graph.id} whole-change final review has not passed`);
     }
-    const timestamp = now();
+    const timestamp = input.emittedAt ?? now();
     const update = db.prepare(`
       UPDATE execution_graphs
       SET aggregate_artifact_hash = ?, aggregate_emitted_at = ?,

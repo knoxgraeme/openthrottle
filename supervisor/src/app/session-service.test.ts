@@ -2777,7 +2777,7 @@ intents:
     db!.prepare("UPDATE pipeline_instances SET status = 'running', published_commit = ? WHERE id = ?")
       .run(head, instance.id);
 
-    expect(routePipelineProviderEvent({
+    expect(await routePipelineProviderEvent({
       pipelines,
       store: tickets,
       ticket: tickets.getByIssueId("issue-1")!,

@@ -1835,6 +1835,11 @@ describe("execution unit store", () => {
       artifactHash: "hash-1",
       integrationSubject: subject,
     })).toBe("emitted");
+    expect(publicationEvents("attempt-parent").find((event) => event.kind === "aggregate"))
+      .toMatchObject({
+        body: expect.stringContaining("hash-1"),
+        outboxBody: expect.stringContaining("hash-1"),
+      });
     expect(store.emitAggregateOnce({
       parentAttemptId: "attempt-parent",
       artifactHash: "hash-1",
