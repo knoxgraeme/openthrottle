@@ -41,7 +41,8 @@ describe("pipeline effect processor", () => {
 
   function repositoryStructuredGraphWithPublishStage(
     publishStageId: string,
-    intermediateStageId?: string
+    intermediateStageId?: string,
+    cycleStageId?: string
   ): string {
     const graph = JSON.parse(readFileSync(structuredGraphPath, "utf8")) as {
       id: string;
@@ -69,11 +70,25 @@ describe("pipeline effect processor", () => {
         depends_on: [],
         transitions: {
           retryable_failure: { to: intermediateStageId, max_reentries: 2, on_exhausted: "failed" },
-          success: { to: publishStageId },
+          success: { to: cycleStageId ?? publishStageId },
           repair_required: { to: publishStageId },
           failure: { to: publishStageId },
         },
       });
+      if (cycleStageId) {
+        graph.nodes.splice(2, 0, {
+          id: cycleStageId,
+          kind: "command",
+          command: "test",
+          depends_on: [],
+          transitions: {
+            retryable_failure: { to: cycleStageId, max_reentries: 2, on_exhausted: "failed" },
+            success: { to: intermediateStageId, max_reentries: 2, on_exhausted: "failed" },
+            repair_required: { to: publishStageId },
+            failure: { to: publishStageId },
+          },
+        });
+      }
     }
     return JSON.stringify(graph);
   }
@@ -883,9 +898,11 @@ describe("pipeline effect processor", () => {
     });
     const publishStageId = "release";
     const intermediateStageId = "verify_release";
+    const cycleStageId = "bounded_cycle_before_release";
     const manifest = parseAndCompileExecutionGraph(repositoryStructuredGraphWithPublishStage(
       publishStageId,
-      intermediateStageId
+      intermediateStageId,
+      cycleStageId
     ), {
       id: `repository/structured-${publishStageId}`,
       runtime: runtimeDescriptor.descriptor,
@@ -1530,6 +1547,68 @@ describe("pipeline effect processor", () => {
     });
     const queuedIntermediateAttempt = pipelines.getActiveAttempt(instance.id)!;
     const queuedIntermediateRequest = JSON.parse(queuedIntermediateAttempt.request_payload!) as StageRequestEnvelope;
+    const insertCompletedCompositePredecessor = (input: {
+      id: string;
+      attemptOrdinal: number;
+      plannedRunId: string;
+      integrationSubject: string;
+      aggregateArtifactHash: string;
+    }) => {
+      db!.prepare(`
+        INSERT INTO pipeline_stage_attempts (
+          id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
+          run_id, request_hash, idempotency_key, context_revision, native_context_policy,
+          status, outcome, result_hash, started_at, completed_at, created_at, updated_at,
+          planned_run_id, expected_subject, native_session_id, request_payload
+        )
+        SELECT
+          ?, pipeline_instance_id, stage_id, ?, 0,
+          NULL, ?, ?, context_revision, native_context_policy,
+          'completed', 'success', result_hash, started_at, completed_at, ?, ?,
+          ?, expected_subject, native_session_id, request_payload
+        FROM pipeline_stage_attempts
+        WHERE id = ?
+      `).run(
+        input.id,
+        input.attemptOrdinal,
+        `request-${input.id}`,
+        `idem-${input.id}`,
+        "2099-07-22T12:00:00.000Z",
+        "2099-07-22T12:00:00.000Z",
+        input.plannedRunId,
+        attempt.id
+      );
+      db!.prepare(`
+        INSERT INTO execution_graphs (
+          id, pipeline_instance_id, parent_attempt_id, parent_stage_id, parent_run_id,
+          graph_digest, plan_digest, command_names, max_repair_rounds,
+          final_phase, final_command_index, final_cycle, final_repair_rounds,
+          final_review_passed_at, integration_subject, aggregate_artifact_hash,
+          aggregate_emitted_at, stopped_at, stop_reason, created_at, updated_at
+        )
+        SELECT
+          ?, pipeline_instance_id, ?, parent_stage_id, ?,
+          graph_digest, plan_digest, command_names, max_repair_rounds,
+          final_phase, final_command_index, final_cycle, final_repair_rounds,
+          final_review_passed_at, ?, ?,
+          aggregate_emitted_at, stopped_at, stop_reason, ?, ?
+        FROM execution_graphs
+        WHERE parent_attempt_id = ?
+      `).run(
+        `graph-${input.id}`,
+        input.id,
+        input.plannedRunId,
+        input.integrationSubject,
+        input.aggregateArtifactHash,
+        "2099-07-22T12:00:00.000Z",
+        "2099-07-22T12:00:00.000Z",
+        attempt.id
+      );
+    };
+    const deleteCompletedCompositePredecessor = (id: string) => {
+      db!.prepare("DELETE FROM execution_graphs WHERE parent_attempt_id = ?").run(id);
+      db!.prepare("DELETE FROM pipeline_stage_attempts WHERE id = ?").run(id);
+    };
     const queuedIntermediateWithoutFence = (({ requestHash, idempotencyKey, ...rest }: StageRequestEnvelope) => {
       void requestHash;
       void idempotencyKey;
@@ -1581,6 +1660,49 @@ describe("pipeline effect processor", () => {
       digestNormalized(legacyIntermediateRequest),
       intermediateEffect.id
     );
+    insertCompletedCompositePredecessor({
+      id: "attempt-ambiguous-supplying-parent",
+      attemptOrdinal: 2,
+      plannedRunId: "run-ambiguous-supplying-parent",
+      integrationSubject: finalIntegratedSubject,
+      aggregateArtifactHash: legacyGraphResult!.hash,
+    });
+    expect(db!.prepare(`
+      SELECT COUNT(*) AS count
+      FROM pipeline_stage_attempts a
+      JOIN execution_graphs g ON g.parent_attempt_id = a.id
+      WHERE a.pipeline_instance_id = ?
+        AND a.stage_id = ?
+        AND a.status = 'completed'
+        AND g.aggregate_emitted_at IS NOT NULL
+        AND g.aggregate_artifact_hash IS NOT NULL
+        AND g.integration_subject = ?
+    `).get(instance.id, attempt.stage_id, finalIntegratedSubject)).toEqual({ count: 2 });
+    expect(pipelines.getInstance(instance.id)).toMatchObject({ immutable_subject: finalIntegratedSubject });
+    expect(pipelines.getActiveAttempt(instance.id)).toMatchObject({
+      stage_id: intermediateStageId,
+      expected_subject: finalIntegratedSubject,
+    });
+    const dispatchCallsBeforeAmbiguity = runtime.dispatchStage.mock.calls.length;
+    await processor.drain();
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforeAmbiguity);
+    expect(pipelines.getEffect(intermediateEffect.id)).toMatchObject({
+      status: "failed",
+      last_error: expect.stringContaining("ambiguous structured aggregate predecessors"),
+    });
+    db!.prepare(`
+      UPDATE pipeline_effect_intents
+      SET status = 'pending', attempts = 0, last_error = NULL, next_attempt_at = ?
+      WHERE id = ?
+    `).run("2099-07-22T12:00:00.000Z", intermediateEffect.id);
+    deleteCompletedCompositePredecessor("attempt-ambiguous-supplying-parent");
+    insertCompletedCompositePredecessor({
+      id: "attempt-earlier-non-supplying-parent",
+      attemptOrdinal: 2,
+      plannedRunId: "run-earlier-non-supplying-parent",
+      integrationSubject: "7".repeat(40),
+      aggregateArtifactHash: "7".repeat(64),
+    });
     await processor.drain();
     const intermediateAttempt = pipelines.getActiveAttempt(instance.id)!;
     expect(pipelines.getAttempt(attempt.id)).toMatchObject({ result_hash: expectedCanonicalStageResultHash });

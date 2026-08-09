@@ -393,20 +393,32 @@ function successReachablePublishStageId(manifest: {
   }>;
 }, fromStageId: string | null | undefined): string | null {
   const stages = new Map(manifest.stages.map((stage) => [stage.id, stage]));
+  const publishStageIds = new Set<string>();
   const visited = new Set<string>();
-  let currentId = fromStageId;
-  while (currentId) {
-    if (visited.has(currentId)) {
-      throw new Error(`pipeline manifest has a success-transition cycle while resolving structured publish successor ${fromStageId}`);
-    }
-    visited.add(currentId);
+  const visit = (currentId: string, activePath: Set<string>): void => {
+    if (activePath.has(currentId)) return;
+    if (visited.has(currentId)) return;
     const stage = stages.get(currentId);
     if (!stage) throw new Error(`pipeline manifest success transition references unknown stage ${currentId}`);
-    if (stage.executor.capability === PUBLISH_CAPABILITY && stage.evaluator.kind === "publish_subject") return stage.id;
-    const transition = stage.transitions.success;
-    currentId = typeof transition === "object" && transition !== null ? transition.to : null;
+    if (stage.executor.capability === PUBLISH_CAPABILITY && stage.evaluator.kind === "publish_subject") {
+      publishStageIds.add(stage.id);
+      visited.add(currentId);
+      return;
+    }
+    activePath.add(currentId);
+    for (const transition of Object.values(stage.transitions ?? {})) {
+      if (typeof transition === "object" && transition !== null && transition.to) {
+        visit(transition.to, activePath);
+      }
+    }
+    activePath.delete(currentId);
+    visited.add(currentId);
+  };
+  if (fromStageId) visit(fromStageId, new Set());
+  if (publishStageIds.size > 1) {
+    throw new Error(`pipeline manifest has ambiguous structured publish successors from ${fromStageId}`);
   }
-  return null;
+  return [...publishStageIds][0] ?? null;
 }
 
 function finalRepairWorktreeHandleFor(

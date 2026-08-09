@@ -352,25 +352,16 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     instance: PipelineInstance,
     resource: RuntimeResource,
     successorStageId: string,
-    completedCompositeAttempts: PipelineStageAttempt[]
+    supplyingParentAttemptId: string | null
   ): Promise<void> => {
     const current = deps.store.getInstance(instance.id);
     const attempt = deps.store.getActiveAttempt(instance.id);
     if (!current || current.active_stage_id !== successorStageId || !attempt ||
         attempt.stage_id !== successorStageId || attempt.status !== "running" ||
-        !attempt.run_id || !attempt.expected_subject) {
+        !attempt.run_id || !attempt.expected_subject || !supplyingParentAttemptId) {
       return;
     }
-    const legacyGraphs = completedCompositeAttempts
-      .map((candidate) => deps.store.getGraphForAttempt(candidate.id))
-      .filter((graph) =>
-        graph?.aggregate_emitted_at &&
-        graph.integration_subject === attempt.expected_subject
-      );
-    if (legacyGraphs.length > 1) {
-      throw new Error(`successor attempt ${attempt.id} has ambiguous structured aggregate predecessors`);
-    }
-    const legacyGraph = legacyGraphs[0];
+    const legacyGraph = deps.store.getGraphForAttempt(supplyingParentAttemptId);
     if (!legacyGraph) return;
     const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
     const run = deps.tickets.getRun(attempt.run_id);
@@ -400,6 +391,32 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         throw new Error(`successor attempt ${attempt.id} legacy actor could not be terminated for aggregate migration`);
       }
     }
+  };
+
+  const downstreamSupplyingCompositeParent = (
+    instance: PipelineInstance,
+    successorStageId: string,
+    completedCompositeAttempts: PipelineStageAttempt[]
+  ): string | null => {
+    const attempt = deps.store.getActiveAttempt(instance.id);
+    if (!attempt || attempt.stage_id !== successorStageId || !attempt.expected_subject) return null;
+    const request = attempt.request_payload ? JSON.parse(attempt.request_payload) as { expectedSubject?: unknown } : null;
+    if (request?.expectedSubject !== attempt.expected_subject) {
+      throw new Error(`successor attempt ${attempt.id} sealed expected subject does not match durable state`);
+    }
+    const matchingParents = completedCompositeAttempts.filter((candidate) => {
+      const graph = deps.store.getGraphForAttempt(candidate.id);
+      return Boolean(
+        graph?.aggregate_emitted_at &&
+        graph.aggregate_artifact_hash &&
+        graph.integration_subject === attempt.expected_subject &&
+        instance.immutable_subject === attempt.expected_subject
+      );
+    });
+    if (matchingParents.length > 1) {
+      throw new Error(`successor attempt ${attempt.id} has ambiguous structured aggregate predecessors`);
+    }
+    return matchingParents[0]?.id ?? null;
   };
 
   const completedCompositeAttemptsForSuccessor = (
@@ -450,10 +467,11 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     successorStageId: string
   ): Promise<void> => {
     const completedCompositeAttempts = completedCompositeAttemptsForSuccessor(instance, successorStageId);
-    await stopLegacySuccessorActorIfNeeded(instance, resource, successorStageId, completedCompositeAttempts);
+    const supplyingParentAttemptId = downstreamSupplyingCompositeParent(instance, successorStageId, completedCompositeAttempts);
+    await stopLegacySuccessorActorIfNeeded(instance, resource, successorStageId, supplyingParentAttemptId);
     for (const attempt of completedCompositeAttempts) {
       await structuredChildren.drainCompositeChildren(resource, instance, attempt.id, {
-        successorStageId,
+        ...(attempt.id === supplyingParentAttemptId ? { successorStageId } : {}),
       });
     }
   };
