@@ -1501,6 +1501,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (!graphResult) throw new Error(`structured aggregate ${event.id} did not include execution_graph_result`);
       if (graph.aggregate_emitted_at) {
         let legacyGraphResult: PipelineEventArtifact | null = null;
+        const parentAlreadyTerminal = ["completed", "canceled", "superseded", "failed"].includes(parentAttempt.status);
         if (graph.aggregate_artifact_hash !== graphResult.hash) {
           if (outcome !== "success" || aggregateSubject === integrationSubject || !graph.aggregate_artifact_hash) {
             throw new Error(`structured aggregate ${parentAttemptId} replay hash does not match durable graph marker`);
@@ -1533,19 +1534,51 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
             graphResult = event.artifacts?.find((artifact) => artifact.kind === "execution_graph_result");
             if (!graphResult) throw new Error(`structured aggregate ${event.id} did not include execution_graph_result`);
           }
-          legacyGraphResult = validateDurableLegacyAggregateArtifact({
-            parentAttemptId,
-            artifact: durableLegacyArtifact,
-            artifactHash: graph.aggregate_artifact_hash,
-            integrationSubject,
-            aggregateSubject,
-            graphResult,
-            instance,
-            parentAttempt,
-          }).graphResult;
+          if (durableLegacyArtifact || parentAlreadyTerminal) {
+            legacyGraphResult = validateDurableLegacyAggregateArtifact({
+              parentAttemptId,
+              artifact: durableLegacyArtifact,
+              artifactHash: graph.aggregate_artifact_hash,
+              integrationSubject,
+              aggregateSubject,
+              graphResult,
+              instance,
+              parentAttempt,
+            }).graphResult;
+          } else {
+            const legacyEvent = buildAggregateStageEvent({
+              id: `execution-aggregate:${parentAttemptId}:${integrationSubject}:${outcome}`,
+              manifest,
+              instance,
+              parentAttempt,
+              outcome,
+              subject: integrationSubject,
+              completedAt: aggregateCompletedAt,
+              units,
+            });
+            const markerOnlyGraphResult = legacyEvent.artifacts
+              ?.find((artifact) => artifact.kind === "execution_graph_result");
+            if (!markerOnlyGraphResult || markerOnlyGraphResult.hash !== graph.aggregate_artifact_hash) {
+              throw new Error(`structured aggregate ${parentAttemptId} marker-only legacy replay hash does not match durable graph marker`);
+            }
+            const markerOnlyPayload = JSON.parse(markerOnlyGraphResult.payload) as Record<string, unknown>;
+            const transformedPayload = canonicalJson(canonicalAggregatePayloadFromLegacy(
+              markerOnlyPayload,
+              integrationSubject,
+              aggregateSubject
+            ));
+            if (transformedPayload !== graphResult.payload) {
+              throw new Error(`structured aggregate ${parentAttemptId} canonical aggregate artifact does not derive from marker-only legacy evidence`);
+            }
+            legacyGraphResult = {
+              ...graphResult,
+              subject: aggregateSubject,
+              payload: transformedPayload,
+              hash: digestNormalized(transformedPayload),
+            };
+          }
         }
         if (legacyGraphResult) {
-          const parentAlreadyTerminal = ["completed", "canceled", "superseded", "failed"].includes(parentAttempt.status);
           deps.store.migrateAggregateArtifactHash({
             parentAttemptId,
             fromArtifactHash: graph.aggregate_artifact_hash,

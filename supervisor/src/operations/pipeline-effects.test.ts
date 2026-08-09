@@ -69,9 +69,9 @@ describe("pipeline effect processor", () => {
         depends_on: [],
         transitions: {
           success: { to: publishStageId },
-          repair_required: { terminal: "needs_human" },
+          repair_required: { to: publishStageId },
           retryable_failure: { terminal: "failed" },
-          failure: { terminal: "failed" },
+          failure: { to: publishStageId },
         },
       });
     }
@@ -1432,15 +1432,13 @@ describe("pipeline effect processor", () => {
         "2099-07-22T12:00:00.000Z"
       );
     };
-    persistLegacyGraphResult();
-
     db!.prepare("UPDATE pipeline_instances SET status = ? WHERE id = ?").run(beforeAggregateStatus, instance.id);
     db!.prepare(`
       UPDATE execution_graphs
       SET aggregate_artifact_hash = ?, updated_at = ?
       WHERE parent_attempt_id = ?
     `).run("0".repeat(64), "2099-07-22T12:00:00.000Z", attempt.id);
-    await expect(processor.drain()).rejects.toThrow(/durable legacy aggregate artifact is missing/);
+    await expect(processor.drain()).rejects.toThrow(/marker-only legacy replay hash does not match/);
 
     const aggregatePublication = db!.prepare(`
       SELECT e.id, e.body, e.linear_outbox_id, o.payload
@@ -1503,7 +1501,6 @@ describe("pipeline effect processor", () => {
       .not.toEqual(expect.arrayContaining([
         expect.stringContaining(`aggregate=${legacyGraphResult!.hash}`),
       ]));
-
     db!.prepare("UPDATE pipeline_instances SET status = ? WHERE id = ?").run(beforeAggregateStatus, instance.id);
 
     await processor.drain();
@@ -1536,6 +1533,7 @@ describe("pipeline effect processor", () => {
       effect.status === "pending" &&
       effect.idempotency_key === queuedIntermediateRequest.idempotencyKey
     )!;
+    persistLegacyGraphResult();
     rewriteAggregatePublicationToLegacyHash();
     db!.prepare(`
       UPDATE execution_graphs
@@ -1584,10 +1582,83 @@ describe("pipeline effect processor", () => {
         expectedSubject: finalIntegratedTreeSubject,
       })
     );
-    const intermediateStagePayload = JSON.stringify({ id: "intermediate-release-check", outcome: "success" });
-    const intermediateCommandPayload = JSON.stringify({ command: "test", exit_code: 0, summary: "command passed" });
+    rewriteAggregatePublicationToLegacyHash();
+    db!.prepare(`
+      UPDATE execution_graphs
+      SET aggregate_artifact_hash = ?, updated_at = ?
+      WHERE parent_attempt_id = ?
+    `).run(legacyGraphResult!.hash, "2099-07-22T12:00:00.000Z", attempt.id);
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET immutable_subject = ?, status = 'running', updated_at = ?
+      WHERE id = ?
+    `).run(finalIntegratedSubject, "2099-07-22T12:00:00.000Z", instance.id);
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET expected_subject = ?, request_hash = ?, idempotency_key = ?,
+          planned_run_id = ?, run_id = ?, request_payload = ?, status = 'running',
+          updated_at = ?
+      WHERE id = ?
+    `).run(
+      finalIntegratedSubject,
+      legacyIntermediateFence.requestHash,
+      legacyIntermediateFence.idempotencyKey,
+      legacyIntermediateWithoutFence.runId,
+      legacyIntermediateWithoutFence.runId,
+      legacyIntermediateRequest,
+      "2099-07-22T12:00:00.000Z",
+      intermediateAttempt.id
+    );
+    db!.prepare(`
+      UPDATE pipeline_effect_intents
+      SET idempotency_key = ?, payload = ?, payload_hash = ?, status = 'acknowledged'
+      WHERE id = ?
+    `).run(
+      legacyIntermediateFence.idempotencyKey,
+      legacyIntermediateRequest,
+      digestNormalized(legacyIntermediateRequest),
+      intermediateEffect.id
+    );
+
+    const stopCallsBeforeIntermediateRecovery = runtime.stop.mock.calls.length;
+    await processor.drain();
+    expect(runtime.stop).toHaveBeenCalledTimes(stopCallsBeforeIntermediateRecovery + 1);
+    expect(tickets.getRun(legacyIntermediateWithoutFence.runId)).toMatchObject({ status: "stopped" });
+    const restartedIntermediateAttempt = pipelines.getActiveAttempt(instance.id)!;
+    const restartedIntermediateRequest = JSON.parse(restartedIntermediateAttempt.request_payload!) as StageRequestEnvelope;
+    expect(restartedIntermediateAttempt).toMatchObject({
+      stage_id: intermediateStageId,
+      status: "pending",
+      run_id: null,
+      expected_subject: finalIntegratedTreeSubject,
+    });
+    expect(restartedIntermediateRequest).toMatchObject({
+      stageId: intermediateStageId,
+      expectedSubject: finalIntegratedTreeSubject,
+    });
+    expect(restartedIntermediateRequest.runId).not.toBe(legacyIntermediateWithoutFence.runId);
+    expect(pipelines.listEffects(instance.id).filter((effect) =>
+      effect.kind === "dispatch_stage" &&
+      effect.status === "pending" &&
+      effect.idempotency_key === restartedIntermediateRequest.idempotencyKey
+    )).toHaveLength(1);
+
+    const dispatchCallsBeforeIntermediateRestart = runtime.dispatchStage.mock.calls.length;
+    await processor.drain();
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforeIntermediateRestart + 1);
+    expect(runtime.dispatchStage).toHaveBeenLastCalledWith(
+      { providerResourceId: "sandbox-child-drain" },
+      expect.objectContaining({
+        stageId: intermediateStageId,
+        expectedSubject: finalIntegratedTreeSubject,
+        runId: restartedIntermediateRequest.runId,
+      })
+    );
+    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(restartedIntermediateRequest.runId);
+    const intermediateStagePayload = JSON.stringify({ id: "intermediate-release-check", outcome: "semantic_repair_required" });
+    const intermediateCommandPayload = JSON.stringify({ command: "test", exit_code: 1, summary: "command requested repair" });
     tickets.finishRunAndThen({
-      runId: intermediateAttempt.run_id!,
+      runId: restartedIntermediateRequest.runId,
       status: "completed",
       ticketState: "active",
       faultAttribution: null,
@@ -1596,9 +1667,9 @@ describe("pipeline effect processor", () => {
       kind: "stage_result",
       instanceId: instance.id,
       generation: instance.generation,
-      attemptId: intermediateAttempt.id,
-      requestHash: intermediateAttempt.request_hash,
-      outcome: "success",
+      attemptId: restartedIntermediateAttempt.id,
+      requestHash: restartedIntermediateRequest.requestHash,
+      outcome: "semantic_repair_required",
       resultHash: digestNormalized(intermediateStagePayload),
       subject: finalIntegratedTreeSubject,
       nativeSessionId: "publish-native-session",

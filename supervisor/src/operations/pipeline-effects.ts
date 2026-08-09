@@ -28,7 +28,6 @@ const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
 const MAX_EFFECT_ATTEMPTS = 8;
 const CAPACITY_RETRY_MS = 5 * 60_000;
-const PUBLISH_CAPABILITY = "ce/publish@1";
 
 // Deterministic provider failures must not burn the whole retry budget on hot
 // exponential backoff. Auth failures never self-heal, so they exhaust on the
@@ -63,11 +62,6 @@ function classifyEffectError(message: string): EffectErrorClass {
   if (CAPACITY_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "capacity";
   if (AUTH_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "auth";
   return "transient";
-}
-
-function isPublishStage(normalizedManifest: string, stageId: string | null | undefined): boolean {
-  const stage = stageById(normalizedManifest, stageId);
-  return stage?.executor.capability === PUBLISH_CAPABILITY && stage.evaluator.kind === "publish_subject";
 }
 
 export interface PipelineEffectProcessor {
@@ -354,16 +348,16 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     };
   };
 
-  const stopLegacyPublishActorIfNeeded = async (
+  const stopLegacySuccessorActorIfNeeded = async (
     instance: PipelineInstance,
     resource: RuntimeResource,
-    publishStageId: string,
+    successorStageId: string,
     completedCompositeAttempts: PipelineStageAttempt[]
   ): Promise<void> => {
     const current = deps.store.getInstance(instance.id);
     const attempt = deps.store.getActiveAttempt(instance.id);
-    if (!current || current.active_stage_id !== publishStageId || !attempt ||
-        attempt.stage_id !== publishStageId || attempt.status !== "running" ||
+    if (!current || current.active_stage_id !== successorStageId || !attempt ||
+        attempt.stage_id !== successorStageId || attempt.status !== "running" ||
         !attempt.run_id || !attempt.expected_subject) {
       return;
     }
@@ -374,7 +368,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         graph.integration_subject === attempt.expected_subject
       );
     if (legacyGraphs.length > 1) {
-      throw new Error(`publish attempt ${attempt.id} has ambiguous structured aggregate predecessors`);
+      throw new Error(`successor attempt ${attempt.id} has ambiguous structured aggregate predecessors`);
     }
     const legacyGraph = legacyGraphs[0];
     if (!legacyGraph) return;
@@ -394,8 +388,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         store: deps.tickets,
         runId: attempt.run_id,
         sandboxId: resource.providerResourceId,
-        owner: `aggregate-publish-restart:${attempt.id}`,
-        reason: "legacy commit-fenced publish actor replaced by canonical tree-fenced dispatch",
+        owner: `aggregate-successor-restart:${attempt.id}`,
+        reason: "legacy commit-fenced successor actor replaced by canonical tree-fenced dispatch",
         faultAttribution: null,
         status: "stopped",
         ticketState: "active",
@@ -403,7 +397,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         quarantineOnStopFailure: true,
       });
       if (settlement.kind !== "settled") {
-        throw new Error(`publish attempt ${attempt.id} legacy actor could not be terminated for aggregate migration`);
+        throw new Error(`successor attempt ${attempt.id} legacy actor could not be terminated for aggregate migration`);
       }
     }
   };
@@ -421,20 +415,27 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     };
     const stages = new Map((manifest.stages ?? []).map((stage) => [stage.id, stage]));
     const reachesSuccessor = (stageId: string): boolean => {
+      const visiting = new Set<string>();
       const visited = new Set<string>();
-      let currentId: string | null | undefined = stageId;
-      while (currentId) {
+      const visit = (currentId: string): boolean => {
         if (currentId === successorStageId) return true;
-        if (visited.has(currentId)) {
-          throw new Error(`pipeline manifest has a success-transition cycle while resolving structured successor ${stageId}`);
+        if (visiting.has(currentId)) {
+          throw new Error(`pipeline manifest has a transition cycle while resolving structured successor ${stageId}`);
         }
+        if (visited.has(currentId)) return false;
+        visiting.add(currentId);
         visited.add(currentId);
         const current = stages.get(currentId);
-        if (!current) throw new Error(`pipeline manifest success transition references unknown stage ${currentId}`);
-        const transition = current.transitions?.success;
-        currentId = typeof transition === "object" && transition !== null ? transition.to : null;
-      }
-      return false;
+        if (!current) throw new Error(`pipeline manifest transition references unknown stage ${currentId}`);
+        for (const transition of Object.values(current.transitions ?? {})) {
+          if (typeof transition === "object" && transition !== null && transition.to) {
+            if (visit(transition.to)) return true;
+          }
+        }
+        visiting.delete(currentId);
+        return false;
+      };
+      return visit(stageId);
     };
     const compositeStageIds = new Set((manifest.stages ?? []).filter((stage) =>
       stage.executor?.capability === FOR_EACH_UNIT_CAPABILITY && reachesSuccessor(stage.id)
@@ -449,9 +450,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     successorStageId: string
   ): Promise<void> => {
     const completedCompositeAttempts = completedCompositeAttemptsForSuccessor(instance, successorStageId);
-    if (isPublishStage(instance.normalized_manifest, successorStageId)) {
-      await stopLegacyPublishActorIfNeeded(instance, resource, successorStageId, completedCompositeAttempts);
-    }
+    await stopLegacySuccessorActorIfNeeded(instance, resource, successorStageId, completedCompositeAttempts);
     for (const attempt of completedCompositeAttempts) {
       await structuredChildren.drainCompositeChildren(resource, instance, attempt.id, {
         successorStageId,
@@ -750,17 +749,18 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }
   };
 
-  const drainActivePublishReconciliations = async (): Promise<void> => {
+  const drainActiveSuccessorReconciliations = async (): Promise<void> => {
     const drained = new Set<string>();
-    const drainInstance = async (instance: PipelineInstance, resource: RuntimeResource, publishStageId: string): Promise<void> => {
-      if (drained.has(instance.id)) return;
-      drained.add(instance.id);
-      await drainCompletedCompositeParentsForSuccessor(resource, instance, publishStageId);
+    const drainInstance = async (instance: PipelineInstance, resource: RuntimeResource, successorStageId: string): Promise<void> => {
+      const key = `${instance.id}:${successorStageId}`;
+      if (drained.has(key)) return;
+      drained.add(key);
+      await drainCompletedCompositeParentsForSuccessor(resource, instance, successorStageId);
     };
     const tickets = deps.tickets.listRunning();
     for (const ticket of tickets) {
       const instance = deps.store.getInstanceForSession(ticket.linear_session_id);
-      if (!instance || ticket.run_id === null || !isPublishStage(instance.normalized_manifest, instance.active_stage_id)) continue;
+      if (!instance || ticket.run_id === null || !instance.active_stage_id) continue;
       const attempt = deps.store.getActiveAttempt(instance.id);
       if (!attempt || attempt.run_id !== ticket.run_id || attempt.status !== "running") continue;
       const binding = runtimeBindingFor(instance);
@@ -768,7 +768,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       await drainInstance(instance, binding.resource, attempt.stage_id);
     }
     for (const instance of deps.store.listActiveRuntimeInstances()) {
-      if (!isPublishStage(instance.normalized_manifest, instance.active_stage_id)) continue;
+      if (!instance.active_stage_id) continue;
       const attempt = deps.store.getActiveAttempt(instance.id);
       if (!attempt || attempt.status !== "running" || !attempt.run_id) continue;
       const run = deps.tickets.getRun(attempt.run_id);
@@ -908,7 +908,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         );
         await Promise.all(effects.map(processClaimed));
         await drainActiveCompositeGraphs();
-        await drainActivePublishReconciliations();
+        await drainActiveSuccessorReconciliations();
       } finally {
         draining = false;
       }
