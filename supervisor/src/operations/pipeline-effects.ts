@@ -367,12 +367,16 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         !attempt.run_id || !attempt.expected_subject) {
       return;
     }
-    const legacyGraph = completedCompositeAttempts
+    const legacyGraphs = completedCompositeAttempts
       .map((candidate) => deps.store.getGraphForAttempt(candidate.id))
-      .find((graph) =>
+      .filter((graph) =>
         graph?.aggregate_emitted_at &&
         graph.integration_subject === attempt.expected_subject
       );
+    if (legacyGraphs.length > 1) {
+      throw new Error(`publish attempt ${attempt.id} has ambiguous structured aggregate predecessors`);
+    }
+    const legacyGraph = legacyGraphs[0];
     if (!legacyGraph) return;
     const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
     if (ticket?.run_id !== attempt.run_id) return;
@@ -412,14 +416,26 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         transitions?: Record<string, { to?: string | null }>;
       }>;
     };
+    const stages = new Map((manifest.stages ?? []).map((stage) => [stage.id, stage]));
+    const reachesPublish = (stageId: string): boolean => {
+      const visited = new Set<string>();
+      let currentId: string | null | undefined = stageId;
+      while (currentId) {
+        if (currentId === publishStageId) return true;
+        if (visited.has(currentId)) {
+          throw new Error(`pipeline manifest has a success-transition cycle while resolving publish predecessor ${stageId}`);
+        }
+        visited.add(currentId);
+        const current = stages.get(currentId);
+        if (!current) throw new Error(`pipeline manifest success transition references unknown stage ${currentId}`);
+        const transition = current.transitions?.success;
+        currentId = typeof transition === "object" && transition !== null ? transition.to : null;
+      }
+      return false;
+    };
     const compositeStageIds = new Set((manifest.stages ?? []).filter((stage) =>
-      stage.executor?.capability === FOR_EACH_UNIT_CAPABILITY &&
-      Object.values(stage.transitions ?? {}).some((transition) =>
-        typeof transition === "object" && transition !== null &&
-        "to" in transition && transition.to === publishStageId
-      )
-    )
-      .map((stage) => stage.id));
+      stage.executor?.capability === FOR_EACH_UNIT_CAPABILITY && reachesPublish(stage.id)
+    ).map((stage) => stage.id));
     return deps.store.listAttempts(instance.id)
       .filter((attempt) => compositeStageIds.has(attempt.stage_id) && attempt.status === "completed");
   };

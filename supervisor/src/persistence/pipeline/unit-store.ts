@@ -226,12 +226,21 @@ export interface ExecutionUnitStore {
     parentAttemptId: string;
     artifactHash: string;
     integrationSubject: string | null;
+    emittedAt?: string;
     requireFinalReview?: boolean;
   }): "emitted" | "already_emitted";
   migrateAggregateArtifactHash(input: {
     parentAttemptId: string;
     fromArtifactHash: string;
     toArtifactHash: string;
+    canonicalArtifact?: {
+      kind: string;
+      schemaVersion: number;
+      assurance: string;
+      subject?: string | null;
+      payload: string;
+      hash: string;
+    };
     fromSubject?: string;
     toSubject?: string;
     publishStageId?: string;
@@ -1190,7 +1199,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     if ((input.requireFinalReview ?? true) && hasCompletedUnit && graph.final_phase !== "done") {
       throw new Error(`execution graph ${graph.id} whole-change final review has not passed`);
     }
-    const timestamp = now();
+    const timestamp = input.emittedAt ?? now();
     const update = db.prepare(`
       UPDATE execution_graphs
       SET aggregate_artifact_hash = ?, aggregate_emitted_at = ?,
@@ -1213,6 +1222,75 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     return "emitted";
   });
 
+  function persistCanonicalAggregateArtifact(input: {
+    graph: ExecutionUnitGraph;
+    parentAttemptId: string;
+    toArtifactHash: string;
+    artifact: NonNullable<Parameters<ExecutionUnitStore["migrateAggregateArtifactHash"]>[0]["canonicalArtifact"]>;
+  }): void {
+    if (
+      input.artifact.kind !== "execution_graph_result" ||
+      input.artifact.hash !== input.toArtifactHash ||
+      digestNormalized(input.artifact.payload) !== input.artifact.hash
+    ) {
+      throw new Error(`execution graph ${input.graph.id} canonical aggregate artifact does not match migration target`);
+    }
+    const artifactId = deterministicId("artifact", [
+      input.graph.pipeline_instance_id,
+      input.parentAttemptId,
+      input.artifact.kind,
+      input.artifact.hash,
+    ]);
+    const existingArtifact = db.prepare(`
+      SELECT pipeline_instance_id, attempt_id, kind, schema_version, assurance,
+             subject, payload, artifact_hash
+      FROM pipeline_artifacts WHERE id = ?
+    `).get(artifactId) as
+      | {
+        pipeline_instance_id: string;
+        attempt_id: string;
+        kind: string;
+        schema_version: number;
+        assurance: string;
+        subject: string | null;
+        payload: string;
+        artifact_hash: string;
+      }
+      | undefined;
+    if (existingArtifact) {
+      if (
+        existingArtifact.pipeline_instance_id !== input.graph.pipeline_instance_id ||
+        existingArtifact.attempt_id !== input.parentAttemptId ||
+        existingArtifact.kind !== input.artifact.kind ||
+        existingArtifact.schema_version !== input.artifact.schemaVersion ||
+        existingArtifact.assurance !== input.artifact.assurance ||
+        existingArtifact.subject !== (input.artifact.subject ?? null) ||
+        existingArtifact.payload !== input.artifact.payload ||
+        existingArtifact.artifact_hash !== input.artifact.hash
+      ) {
+        throw new Error(`execution graph ${input.graph.id} canonical aggregate artifact conflicts with durable evidence`);
+      }
+      return;
+    }
+    db.prepare(`
+      INSERT INTO pipeline_artifacts (
+        id, pipeline_instance_id, attempt_id, kind, schema_version,
+        assurance, subject, payload, artifact_hash, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      artifactId,
+      input.graph.pipeline_instance_id,
+      input.parentAttemptId,
+      input.artifact.kind,
+      input.artifact.schemaVersion,
+      input.artifact.assurance,
+      input.artifact.subject ?? null,
+      input.artifact.payload,
+      input.artifact.hash,
+      now()
+    );
+  }
+
   const migrateAggregateArtifactHash = db.transaction((
     input: Parameters<ExecutionUnitStore["migrateAggregateArtifactHash"]>[0]
   ): "migrated" | "already_canonical" => {
@@ -1220,6 +1298,14 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     if (!graph) throw new Error(`execution graph for parent attempt ${input.parentAttemptId} is missing`);
     if (!graph.aggregate_emitted_at) {
       throw new Error(`execution graph ${graph.id} has no aggregate marker to migrate`);
+    }
+    if (input.canonicalArtifact) {
+      persistCanonicalAggregateArtifact({
+        graph,
+        parentAttemptId: input.parentAttemptId,
+        toArtifactHash: input.toArtifactHash,
+        artifact: input.canonicalArtifact,
+      });
     }
     const migrateActivity = (timestamp: string) => migrateAggregatePublicationActivity({
       db,
@@ -1274,7 +1360,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     toSubject: string;
     publishStageId?: string;
   }): void {
-    const publishStageId = input.publishStageId ?? "publish";
+    if (!input.publishStageId) return;
+    const publishStageId = input.publishStageId;
     const publishAttempts = input.db.prepare(`
       SELECT id, request_hash, idempotency_key, request_payload, planned_run_id,
              expected_subject, native_session_id, status, run_id

@@ -50,6 +50,7 @@ import { createUnitEffectProcessor } from "./unit-effects.js";
 
 const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
 const GIT_SHA1_SUBJECT = /^[a-f0-9]{40}$/;
+const PUBLISH_CAPABILITY = "ce/publish@1";
 // Head slice for a non-success diagnostic stored as lastError -- fits inside
 // the 2,000-char budget the store applies (unit-store.ts) with room to spare.
 const DIAGNOSTIC_TEXT_HEAD_CHARS = 1_500;
@@ -371,6 +372,31 @@ function sha1SubjectForGitOperation(subject: string, label: string): string {
     throw new Error(`${label} must be a 40-character Git object ID for child Git operations`);
   }
   return subject;
+}
+
+function successReachablePublishStageId(manifest: {
+  stages: Array<{
+    id: string;
+    executor: { capability: string };
+    evaluator: { kind: string };
+    transitions: Record<string, { to?: string | null }>;
+  }>;
+}, fromStageId: string | null | undefined): string | null {
+  const stages = new Map(manifest.stages.map((stage) => [stage.id, stage]));
+  const visited = new Set<string>();
+  let currentId = fromStageId;
+  while (currentId) {
+    if (visited.has(currentId)) {
+      throw new Error(`pipeline manifest has a success-transition cycle while resolving structured publish successor ${fromStageId}`);
+    }
+    visited.add(currentId);
+    const stage = stages.get(currentId);
+    if (!stage) throw new Error(`pipeline manifest success transition references unknown stage ${currentId}`);
+    if (stage.executor.capability === PUBLISH_CAPABILITY && stage.evaluator.kind === "publish_subject") return stage.id;
+    const transition = stage.transitions.success;
+    currentId = typeof transition === "object" && transition !== null ? transition.to : null;
+  }
+  return null;
 }
 
 function finalRepairWorktreeHandleFor(
@@ -1354,9 +1380,10 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           throw new Error("structured aggregate success requires the fresh final review subject to match the integrated subject");
         }
       }
+      const aggregateCompletedAt = graph.aggregate_emitted_at ?? deps.now().toISOString();
       const manifest = JSON.parse(instance.normalized_manifest);
       const parentStage = stageById(instance.normalized_manifest, parentAttempt.stage_id);
-      const publishStageId = parentStage?.transitions[outcome]?.to;
+      const publishStageId = successReachablePublishStageId(manifest, parentStage?.transitions[outcome]?.to);
       const event = buildAggregateStageEvent({
         id: `execution-aggregate:${parentAttemptId}:${aggregateSubject}:${outcome}`,
         manifest,
@@ -1364,6 +1391,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         parentAttempt,
         outcome,
         subject: aggregateSubject,
+        completedAt: aggregateCompletedAt,
         units,
       });
       const graphResult = event.artifacts?.find((artifact) => artifact.kind === "execution_graph_result");
@@ -1403,10 +1431,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           }
         }
         if (legacyGraphResult) {
+          const parentAlreadyTerminal = ["completed", "canceled", "superseded", "failed"].includes(parentAttempt.status);
           deps.store.migrateAggregateArtifactHash({
             parentAttemptId,
             fromArtifactHash: legacyGraphResult.hash,
             toArtifactHash: graphResult.hash,
+            ...(parentAlreadyTerminal ? { canonicalArtifact: graphResult } : {}),
             fromSubject: integrationSubject,
             toSubject: aggregateSubject,
             ...(publishStageId ? { publishStageId } : {}),
@@ -1420,6 +1450,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         parentAttemptId,
         artifactHash: graphResult.hash,
         integrationSubject: graph.integration_subject,
+        emittedAt: aggregateCompletedAt,
         requireFinalReview: outcome === "success",
       });
       completeParentStage(event);

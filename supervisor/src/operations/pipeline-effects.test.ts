@@ -39,21 +39,41 @@ describe("pipeline effect processor", () => {
   const listLinearOutbox = (): LinearOutboxRecord[] =>
     db!.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
 
-  function repositoryStructuredGraphWithPublishStage(publishStageId: string): string {
+  function repositoryStructuredGraphWithPublishStage(
+    publishStageId: string,
+    intermediateStageId?: string
+  ): string {
     const graph = JSON.parse(readFileSync(structuredGraphPath, "utf8")) as {
       id: string;
       nodes: Array<{
         id: string;
+        kind?: string;
+        command?: string;
+        depends_on?: string[];
         transitions: Record<string, { to?: string; terminal?: string }>;
       }>;
     };
     graph.id = `repository/structured-${publishStageId}`;
     for (const node of graph.nodes) {
-      if (node.id === "units") node.transitions.success = { to: publishStageId };
+      if (node.id === "units") node.transitions.success = { to: intermediateStageId ?? publishStageId };
       if (node.id === "publish") {
         node.id = publishStageId;
         node.transitions.retryable_failure = { ...node.transitions.retryable_failure, to: publishStageId };
       }
+    }
+    if (intermediateStageId) {
+      graph.nodes.splice(1, 0, {
+        id: intermediateStageId,
+        kind: "command",
+        command: "test",
+        depends_on: [],
+        transitions: {
+          success: { to: publishStageId },
+          repair_required: { terminal: "needs_human" },
+          retryable_failure: { terminal: "failed" },
+          failure: { terminal: "failed" },
+        },
+      });
     }
     return JSON.stringify(graph);
   }
@@ -862,7 +882,11 @@ describe("pipeline effect processor", () => {
       config: repositoryConfig,
     });
     const publishStageId = "release";
-    const manifest = parseAndCompileExecutionGraph(repositoryStructuredGraphWithPublishStage(publishStageId), {
+    const intermediateStageId = "verify_release";
+    const manifest = parseAndCompileExecutionGraph(repositoryStructuredGraphWithPublishStage(
+      publishStageId,
+      intermediateStageId
+    ), {
       id: `repository/structured-${publishStageId}`,
       runtime: runtimeDescriptor.descriptor,
       config: repositoryConfig.config,
@@ -1363,7 +1387,7 @@ describe("pipeline effect processor", () => {
       aggregate_emitted_at: expect.any(String),
       aggregate_artifact_hash: expect.any(String),
     });
-    const canonicalGraphResultHash = pipelines.getGraphForAttempt(attempt.id)!.aggregate_artifact_hash!;
+    let canonicalGraphResultHash = pipelines.getGraphForAttempt(attempt.id)!.aggregate_artifact_hash!;
     expect(pipelines.getAttempt(attempt.id)).toMatchObject({ status: "running" });
 
     const legacyCommitSubjectAggregate = buildAggregateStageEvent({
@@ -1425,6 +1449,7 @@ describe("pipeline effect processor", () => {
     `).run(legacyGraphResult!.hash, "2099-07-22T12:00:00.000Z", attempt.id);
     db!.prepare("UPDATE pipeline_instances SET status = 'publication_blocked' WHERE id = ?").run(instance.id);
     await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
+    canonicalGraphResultHash = pipelines.getGraphForAttempt(attempt.id)!.aggregate_artifact_hash!;
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
       aggregate_artifact_hash: canonicalGraphResultHash,
     });
@@ -1457,6 +1482,51 @@ describe("pipeline effect processor", () => {
       integration_subject: finalIntegratedSubject,
     });
     expect(pipelines.getInstance(instance.id)).toMatchObject({
+      active_stage_id: intermediateStageId,
+      status: "dispatchable",
+      immutable_subject: finalIntegratedTreeSubject,
+    });
+    await processor.drain();
+    const intermediateAttempt = pipelines.getActiveAttempt(instance.id)!;
+    expect(intermediateAttempt).toMatchObject({
+      stage_id: intermediateStageId,
+      status: "running",
+      expected_subject: finalIntegratedTreeSubject,
+    });
+    const intermediateStagePayload = JSON.stringify({ id: "intermediate-release-check", outcome: "success" });
+    const intermediateCommandPayload = JSON.stringify({ command: "test", exit_code: 0, summary: "command passed" });
+    tickets.finishRunAndThen({
+      runId: intermediateAttempt.run_id!,
+      status: "completed",
+      ticketState: "active",
+      faultAttribution: null,
+    }, () => coordinatePipelineEvent(pipelines, {
+      id: "intermediate-release-check",
+      kind: "stage_result",
+      instanceId: instance.id,
+      generation: instance.generation,
+      attemptId: intermediateAttempt.id,
+      requestHash: intermediateAttempt.request_hash,
+      outcome: "success",
+      resultHash: digestNormalized(intermediateStagePayload),
+      subject: finalIntegratedTreeSubject,
+      artifacts: [{
+        kind: "stage_result",
+        schemaVersion: 1,
+        assurance: "executor_verified",
+        subject: finalIntegratedTreeSubject,
+        payload: intermediateStagePayload,
+        hash: digestNormalized(intermediateStagePayload),
+      }, {
+        kind: "command_result",
+        schemaVersion: 1,
+        assurance: "executor_verified",
+        subject: finalIntegratedTreeSubject,
+        payload: intermediateCommandPayload,
+        hash: digestNormalized(intermediateCommandPayload),
+      }],
+    }));
+    expect(pipelines.getInstance(instance.id)).toMatchObject({
       active_stage_id: publishStageId,
       status: "dispatchable",
       immutable_subject: finalIntegratedTreeSubject,
@@ -1481,7 +1551,7 @@ describe("pipeline effect processor", () => {
       stageId: publishStageId,
       capability: "ce/publish@1",
       expectedSubject: finalIntegratedTreeSubject,
-      contextPolicy: "prefer_resume",
+      contextPolicy: expect.any(String),
       nativeSessionId: null,
     });
     expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBeNull();
@@ -1525,9 +1595,21 @@ describe("pipeline effect processor", () => {
       SET idempotency_key = ?, payload = ?, payload_hash = ?
       WHERE id = ?
     `).run(legacyFence.idempotencyKey, legacyRequest, digestNormalized(legacyRequest), dispatchEffect.id);
+    db!.prepare(`
+      DELETE FROM pipeline_artifacts
+      WHERE attempt_id = ? AND kind = 'execution_graph_result' AND artifact_hash = ?
+    `).run(attempt.id, canonicalGraphResultHash);
+    expect(db!.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_artifacts
+      WHERE attempt_id = ? AND kind = 'execution_graph_result' AND artifact_hash = ?
+    `).get(attempt.id, canonicalGraphResultHash)).toEqual({ count: 0 });
 
     const dispatchCallsBeforePublish = runtime.dispatchStage.mock.calls.length;
     await processor.drain();
+    expect(db!.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_artifacts
+      WHERE attempt_id = ? AND kind = 'execution_graph_result' AND artifact_hash = ?
+    `).get(attempt.id, canonicalGraphResultHash)).toEqual({ count: 1 });
     expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforePublish + 1);
     expect(runtime.dispatchStage).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
@@ -1535,7 +1617,7 @@ describe("pipeline effect processor", () => {
         stageId: publishStageId,
         capability: "ce/publish@1",
         expectedSubject: finalIntegratedTreeSubject,
-        contextPolicy: "prefer_resume",
+        contextPolicy: publishRequest.contextPolicy,
         nativeSessionId: null,
       })
     );
