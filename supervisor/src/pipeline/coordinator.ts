@@ -180,6 +180,14 @@ function eventHasExactPublishedSubject(input: PipelineReductionInput, stage: Pip
     input.event.subject === input.instance.immutable_subject;
 }
 
+function shouldClearPublishedCommit(input: PipelineReductionInput): boolean {
+  return input.instance.published_commit !== null &&
+    input.event.providerRevision === undefined &&
+    input.event.subject != null &&
+    input.instance.immutable_subject != null &&
+    input.event.subject !== input.instance.immutable_subject;
+}
+
 function verifyInput(input: PipelineReductionInput): PipelineStage {
   const { manifest, instance, attempt, event } = input;
   const normalized = canonicalJson(manifest);
@@ -425,6 +433,7 @@ function terminalWrite(input: PipelineReductionInput & {
   waitReason?: string | null;
   immutableSubject?: string | null;
   publishedCommit?: string | null;
+  clearPublishedCommit?: boolean;
   cleanup?: boolean;
   effects?: CoordinatorEffectWrite[];
 }): CoordinatorTransitionWrite {
@@ -444,6 +453,7 @@ function terminalWrite(input: PipelineReductionInput & {
     waitReason: input.waitReason ?? (input.terminal === "needs_human" ? "pipeline requires a human decision" : null),
     immutableSubject: input.immutableSubject,
     publishedCommit: input.publishedCommit,
+    clearPublishedCommit: input.clearPublishedCommit,
     artifacts: artifactsFor(input.event),
     effects: [
       publishLinearEffect(input.publishIdempotencyKey),
@@ -619,6 +629,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
           : null,
       immutableSubject: input.event.subject ?? null,
       publishedCommit: input.event.providerRevision ?? null,
+      clearPublishedCommit: shouldClearPublishedCommit(input),
       reentryIncrement: isReentry ? 1 : 0,
       artifacts: artifactsFor(input.event),
       nextAttempt,
@@ -641,6 +652,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     publishIdempotencyKey: `linear-terminal:${input.instance.id}:${terminal}`,
     immutableSubject: input.event.subject ?? null,
     publishedCommit: input.event.providerRevision ?? null,
+    clearPublishedCommit: shouldClearPublishedCommit(input),
     effects: terminal === "failed" ? [failedTerminalStopEffect({
       instanceId: input.instance.id,
       idempotencyKey: `stop:${input.instance.id}:${terminal}`,

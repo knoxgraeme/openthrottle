@@ -367,6 +367,34 @@ describe("pipeline coordinator", () => {
     expect(pipelines.listEffects(instance.id)).toHaveLength(4);
   });
 
+  it("clears persisted publication evidence when a stage advances the subject after publishing", () => {
+    const { pipelines, instance, attempt } = setup();
+    const publishedSubject = "b".repeat(40);
+    const unpublishedSubject = "c".repeat(40);
+    const publishedCommit = "d".repeat(40);
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET immutable_subject = ?, published_commit = ?
+      WHERE id = ?
+    `).run(publishedSubject, publishedCommit, instance.id);
+    const input = event(
+      { ...instance, immutable_subject: publishedSubject, published_commit: publishedCommit },
+      attempt,
+      "retryable_infrastructure_failure",
+      "post-publication-subject-advance"
+    );
+    const subjectAdvancingEvent: PipelineCoordinatorEvent = {
+      ...input,
+      subject: unpublishedSubject,
+      artifacts: input.artifacts?.map((artifact) => ({ ...artifact, subject: unpublishedSubject })),
+    };
+
+    const next = coordinatePipelineEvent(pipelines, subjectAdvancingEvent);
+
+    expect(next.immutable_subject).toBe(unpublishedSubject);
+    expect(next.published_commit).toBeNull();
+  });
+
   it("writes one run_outcomes settlement row when the pipeline reaches a terminal outcome", () => {
     const { pipelines, instance, attempt } = setup();
     const completed = coordinatePipelineEvent(pipelines, event(instance, attempt));

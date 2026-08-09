@@ -377,6 +377,7 @@ export interface CoordinatorTransitionWrite {
   waitReason?: string | null;
   immutableSubject?: string | null;
   publishedCommit?: string | null;
+  clearPublishedCommit?: boolean;
   reentryIncrement?: number;
   artifacts?: CoordinatorArtifactWrite[];
   gateReceipt?: CoordinatorGateReceiptWrite;
