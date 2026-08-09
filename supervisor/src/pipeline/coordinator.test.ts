@@ -648,6 +648,10 @@ describe("pipeline coordinator", () => {
       native_context_policy: "none" as const,
       expected_subject: subject,
     };
+    const attempts = [
+      completedPublishAttempt(attempt, `${stageId}-completed-publish`, subject),
+      postAttempt,
+    ];
     const exactEvent: PipelineCoordinatorEvent = {
       id: `${stageId}-post-publication-terminal`,
       kind: "stage_result",
@@ -687,6 +691,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: postInstance,
       attempt: postAttempt,
+      attempts,
       stages: postPublicationStages,
       event: exactEvent,
     })).toMatchObject({
@@ -715,6 +720,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: postInstance,
       attempt: postAttempt,
+      attempts,
       stages: postPublicationStages,
       event: noChangeEvent,
     })).toMatchObject({
@@ -726,6 +732,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: { ...postInstance, published_commit: null },
       attempt: postAttempt,
+      attempts,
       stages: postPublicationStages,
       event: exactEvent,
     })).toThrow(/cannot settle terminal without exact published provider evidence/);
@@ -734,6 +741,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: { ...postInstance, published_commit: stalePublishedCommit, published_subject: null },
       attempt: postAttempt,
+      attempts,
       stages: postPublicationStages,
       event: exactEvent,
     })).toThrow(/cannot settle terminal without exact published provider evidence/);
@@ -742,6 +750,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: { ...postInstance, published_subject: stalePublishedSubject },
       attempt: postAttempt,
+      attempts,
       stages: postPublicationStages,
       event: exactEvent,
     })).toThrow(/cannot settle terminal without exact published provider evidence/);
@@ -750,6 +759,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: { ...postInstance, published_subject: null },
       attempt: postAttempt,
+      attempts,
       stages: postPublicationStages,
       event: noChangeEvent,
     })).toThrow(/cannot settle terminal without exact published provider evidence/);
@@ -758,6 +768,7 @@ describe("pipeline coordinator", () => {
       manifest: postPublicationManifest,
       instance: postInstance,
       attempt: postAttempt,
+      attempts,
       stages: postPublicationStages,
       event: {
         ...exactEvent,
@@ -856,6 +867,27 @@ describe("pipeline coordinator", () => {
     };
   }
 
+  function completedPublishAttempt(
+    template: PipelineStageAttempt,
+    id: string,
+    subject: string
+  ): PipelineStageAttempt {
+    return {
+      ...template,
+      id,
+      stage_id: "publish",
+      request_hash: digestNormalized(`${id}-request`),
+      idempotency_key: `${id}-idempotency`,
+      native_context_policy: "resume_required",
+      expected_subject: subject,
+      status: "completed",
+      outcome: "success",
+      result_hash: digestNormalized(`${id}-result`),
+      completed_at: "2026-08-09T00:00:00.000Z",
+      updated_at: "2026-08-09T00:00:00.000Z",
+    };
+  }
+
   it("fences shipped terminals by the actually executed publication branch, not the entry success path", () => {
     const { manifest, instance, attempt, stages } = setup();
     const branching = branchingPublicationManifest(manifest);
@@ -870,6 +902,10 @@ describe("pipeline coordinator", () => {
       native_context_policy: "none" as const,
       expected_subject: subject,
     };
+    const attempts = [
+      completedPublishAttempt(attempt, "branching-completed-publish", subject),
+      commandAttempt,
+    ];
     const commandInstance = {
       ...instance,
       active_stage_id: "command",
@@ -892,6 +928,7 @@ describe("pipeline coordinator", () => {
       manifest: branching,
       instance: commandInstance,
       attempt: commandAttempt,
+      attempts,
       stages: passedPublicationStages,
       event: terminal,
     })).toMatchObject({
@@ -903,6 +940,7 @@ describe("pipeline coordinator", () => {
       manifest: branching,
       instance: { ...commandInstance, published_commit: null },
       attempt: commandAttempt,
+      attempts,
       stages: passedPublicationStages,
       event: terminal,
     })).toThrow(/cannot settle terminal without exact published provider evidence/);
@@ -912,6 +950,7 @@ describe("pipeline coordinator", () => {
       manifest: branching,
       instance: commandInstance,
       attempt: commandAttempt,
+      attempts,
       stages: passedPublicationStages,
       event: commandTerminalEvent({
         instance: commandInstance,
@@ -993,7 +1032,7 @@ describe("pipeline coordinator", () => {
     `).run(now, instance.id);
     for (const [stageId, ordinal, status, attemptCount] of [
       ["entry", 1, "passed", 1],
-      ["publish", 2, "passed", 1],
+      ["publish", 2, "failed", 2],
     ] as const) {
       db!.prepare(`
         INSERT INTO pipeline_instance_stages (
@@ -1001,6 +1040,25 @@ describe("pipeline coordinator", () => {
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(instance.id, stageId, ordinal, status, attemptCount, now, now);
     }
+    db!.prepare(`
+      INSERT INTO pipeline_stage_attempts (
+        id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
+        request_hash, idempotency_key, context_revision, native_context_policy,
+        status, outcome, result_hash, expected_subject, started_at, completed_at, created_at, updated_at
+      ) VALUES (?, ?, 'publish', 1, 0, ?, ?, 0, 'resume_required',
+        'completed', 'success', ?, ?, ?, ?, ?, ?)
+    `).run(
+      "persisted-publish-success-attempt",
+      instance.id,
+      digestNormalized("persisted-publish-request"),
+      "persisted-publish-idempotency",
+      digestNormalized("persisted-publish-result"),
+      subject,
+      now,
+      now,
+      now,
+      now
+    );
     db!.prepare(`
       UPDATE pipeline_stage_attempts
       SET stage_id = 'command', request_hash = ?, native_context_policy = 'none',

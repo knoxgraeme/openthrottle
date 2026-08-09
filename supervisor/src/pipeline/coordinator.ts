@@ -73,6 +73,7 @@ export interface PipelineReductionInput {
   manifest: PipelineManifest;
   instance: PipelineInstance;
   attempt: PipelineStageAttempt;
+  attempts?: readonly PipelineStageAttempt[];
   stages: readonly PipelineInstanceStage[];
   event: PipelineCoordinatorEvent;
 }
@@ -165,9 +166,9 @@ function executionIncludesPublication(
 ): boolean {
   if (isPublicationStage(active)) return true;
   const stagesById = new Map(input.manifest.stages.map((stage) => [stage.id, stage]));
-  return input.stages.some((state) => {
-    if (state.status !== "passed") return false;
-    const stage = stagesById.get(state.stage_id);
+  return (input.attempts ?? [input.attempt]).some((attempt) => {
+    if (attempt.status !== "completed" || attempt.outcome !== "success") return false;
+    const stage = stagesById.get(attempt.stage_id);
     return stage ? isPublicationStage(stage) : false;
   });
 }
@@ -746,7 +747,8 @@ export function coordinatePipelineEvent(
   if (!attempt) throw new Error(`unknown pipeline attempt ${event.attemptId}`);
   const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
   const stages = store.listStages(instance.id);
-  const write = reducePipelineEvent({ manifest, instance, attempt, stages, event });
+  const attempts = store.listAttempts(instance.id);
+  const write = reducePipelineEvent({ manifest, instance, attempt, attempts, stages, event });
   write.exhaustedEffectId = event.exhaustedEffectId;
   write.exhaustedEffectError = event.exhaustedEffectError;
   write.gateReceipt = gateReceipt;
