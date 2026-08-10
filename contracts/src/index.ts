@@ -46,6 +46,23 @@ export {
   type LogicalCredential,
 } from "./graph.js";
 export {
+  ANALYSIS_QUERY_ATTRIBUTIONS,
+  ANALYSIS_QUERY_OUTCOMES,
+  ANALYSIS_QUERY_REASONS,
+  CITATION_CONTRACT_SCHEMA,
+  CLAIM_DISPOSITIONS,
+  GRADE_VALUES,
+  parseCitationContractProposal,
+  validateCitationContractProposal,
+  type AnalysisRunQuery,
+  type AnalysisRunResult,
+  type CitationContractCitation,
+  type CitationContractClaim,
+  type CitationContractDisposition,
+  type CitationContractGrade,
+  type CitationContractProposal,
+} from "./citation-contract.js";
+export {
   EXECUTION_PLAN_SCHEMA,
   parseExecutionPlanContract,
   validateExecutionPlanContract,
@@ -91,19 +108,24 @@ export {
   REVIEW_OUTCOMES,
   REVIEW_POLICY_SCHEMA,
   REVIEW_REPAIR_DISPOSITION_SCHEMA,
+  REVIEW_RESOLUTION_STATES,
   REVIEW_ROSTER_SCHEMA,
   REVIEW_SELECTION_SCHEMA,
   REVIEW_SEVERITIES,
   REVIEW_SYNTHESIS_SCHEMA,
   REVIEW_VALIDATION_SCHEMA,
+  REVIEW_VALIDATOR_RESULTS,
   deriveReviewFindingId,
   parseReviewJournalContract,
   validateReviewJournalContract,
   type ReviewFindingContract,
   type ReviewFindingIdentity,
+  type ReviewFindingResolution,
   type ReviewJournalContract,
   type ReviewJournalEntry,
+  type ReviewMeasurements,
   type ReviewPersonaPolicy,
+  type ReviewPersonaReceiptEvidence,
   type ReviewPersonaSelection,
   type ReviewPersonaSnapshot,
   type ReviewPolicyContract,
@@ -113,5 +135,10 @@ export {
   type ReviewValidationContract,
   type SealedReviewRosterContract,
 } from "./review.js";
-export { COMMAND_NAME_PATTERN, PRODUCER_SKILL_REFERENCE, SKILL_REFERENCE } from "./validation.js";
+export {
+  COMMAND_NAME_PATTERN,
+  PRODUCER_SKILL_REFERENCE,
+  SKILL_REFERENCE,
+  normalizeIso8601Timestamp,
+} from "./validation.js";
 export type { ValidatedContract } from "./validation.js";

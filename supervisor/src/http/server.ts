@@ -48,7 +48,11 @@ import { stageById } from "../pipeline/manifest.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { AnalysisStore } from "../persistence/pipeline/analysis-store.js";
+import type { CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
 import type { RuntimeInventory, RuntimeLogs, RuntimeSnapshotReadiness } from "../runtime/contracts.js";
+import { executeRawCitationGate } from "./citation-executor.js";
+
+const MAX_CITATION_CONTRACT_BYTES = 256 * 1024;
 
 export interface ServerDeps {
   cfg: Config;
@@ -59,6 +63,7 @@ export interface ServerDeps {
   // pipelineCoordinator.store (PipelineStore), which gate/transition/
   // scheduler/effect-drain code consumes. See analysis-store.ts.
   analysisStore: AnalysisStore;
+  citationGateStore: CitationGateStore;
   runBackground?: (task: Promise<void>) => void;
   getLinearClient?: () => Promise<LinearClient | undefined>;
   deliveryProcessor?: WebhookDeliveryProcessor;
@@ -86,6 +91,43 @@ function tokenHash(token: string): string {
 function hashesMatch(left: string, right: string): boolean {
   if (!/^[a-f\d]{64}$/i.test(left) || !/^[a-f\d]{64}$/i.test(right)) return false;
   return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
+}
+
+async function readBoundedUtf8Body(request: Request, maxBytes: number): Promise<string> {
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null) {
+    const declaredBytes = Number(contentLength);
+    if (Number.isSafeInteger(declaredBytes) && declaredBytes > maxBytes) {
+      throw new Error("citation_contract: JSON exceeds 256 KiB");
+    }
+  }
+
+  if (request.body === null) return "";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error("citation_contract: JSON exceeds 256 KiB");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: true }).decode(body);
 }
 
 function findTicket(store: SupervisorStore, identifier: string): Ticket | undefined {
@@ -370,6 +412,32 @@ export function createServer(deps: ServerDeps): Hono {
           limit: limit ? Number(limit) : undefined,
         }),
       });
+    } catch (error) {
+      return context.json({ error: sanitizeText(String(error)) }, 400);
+    }
+  });
+
+  app.post("/analysis/citations/grade", async (context) => {
+    if (!requireStatusAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    try {
+      const execution = executeRawCitationGate({
+        raw: await readBoundedUtf8Body(context.req.raw, MAX_CITATION_CONTRACT_BYTES),
+        analysisStore: deps.analysisStore,
+        citationGateStore: deps.citationGateStore,
+      });
+      return context.json({
+        ...execution.grade,
+        gate: {
+          result: execution.decision.result,
+          outcome: execution.decision.outcome,
+          reason: execution.decision.reason,
+          proposal_hash: execution.decision.proposal_hash,
+          grade_hash: execution.decision.grade_hash,
+          receipt_hash: execution.receipt.receipt_hash,
+        },
+      }, execution.grade.result === "pass" ? 200 : 422);
     } catch (error) {
       return context.json({ error: sanitizeText(String(error)) }, 400);
     }
