@@ -156,6 +156,43 @@ describe("Stage C contract fixtures", () => {
       .toThrow(/dispositions\[0\]\.citation_ids: must contain between 1 and 32 entries/);
   });
 
+  it("rejects unsupported timestamps and normalizes equivalent ISO offsets", () => {
+    const raw = readFixture("valid", "citation-contract.json");
+    const proposal = JSON.parse(raw) as {
+      citations: Array<{
+        query: { from?: string };
+        expected_result: Array<{ created_at: string }>;
+      }>;
+    };
+
+    for (const unsupported of ["2026", "2026-08-08", "08/08/2026", "0"]) {
+      proposal.citations[0]!.query.from = unsupported;
+      expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+        .toThrow(/query\.from: must be an ISO-8601 timestamp/);
+    }
+
+    proposal.citations[0]!.query.from = "2026-08-08T02:00:00+0200";
+    proposal.citations[0]!.expected_result[0]!.created_at = "2026-08-08T02:00:00+02:00";
+    const parsed = parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" });
+    expect(parsed.value.citations[0]!.query.from).toBe("2026-08-08T00:00:00.000Z");
+    expect(parsed.value.citations[0]!.expected_result[0]!.created_at).toBe("2026-08-08T00:00:00.000Z");
+  });
+
+  it("rejects declared citations that no claim or disposition references", () => {
+    const proposal = JSON.parse(readFixture("valid", "citation-contract.json")) as {
+      citations: Array<Record<string, unknown>>;
+    };
+    proposal.citations.push({
+      id: "orphan_citation",
+      query: { outcome: "failed" },
+      expected_result: [],
+      source_digests: ["b".repeat(64)],
+    });
+
+    expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+      .toThrow(/citations\.orphan_citation: must be referenced by a claim or disposition/);
+  });
+
   it("keeps map ordering irrelevant while preserving authored array order", () => {
     const raw = readFixture("valid", "execution-plan.json");
     const first = parseExecutionPlanContract(raw, { source: "plan" });

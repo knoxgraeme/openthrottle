@@ -5,6 +5,7 @@ import {
   enumAt,
   fail,
   integerAt,
+  normalizeIso8601Timestamp,
   normalizedContract,
   objectAt,
   optional,
@@ -99,8 +100,9 @@ export interface CitationContractProposal {
 
 function timestamp(value: unknown, path: string): string {
   const result = stringAt(value, path, { max: 64 });
-  if (Number.isNaN(Date.parse(result))) fail(path, "must be an ISO timestamp");
-  return result;
+  const normalized = normalizeIso8601Timestamp(result);
+  if (!normalized) fail(path, "must be an ISO-8601 timestamp");
+  return normalized;
 }
 
 function parseAnalysisRunQuery(value: unknown, path: string): AnalysisRunQuery {
@@ -194,9 +196,11 @@ function validateReferences(proposal: CitationContractProposal, source: string):
   if (claimIds.size !== proposal.claims.length) fail(`${source}.claims`, "must not contain duplicate IDs");
 
   const dispositionClaimIds = new Set<string>();
+  const referencedCitationIds = new Set<string>();
   for (const claim of proposal.claims) {
     for (const citationId of claim.citation_ids) {
       if (!citationIds.has(citationId)) fail(`${source}.claims.${claim.id}.citation_ids`, "references an unknown citation");
+      referencedCitationIds.add(citationId);
     }
   }
   for (const disposition of proposal.dispositions) {
@@ -205,6 +209,12 @@ function validateReferences(proposal: CitationContractProposal, source: string):
     dispositionClaimIds.add(disposition.claim_id);
     for (const citationId of disposition.citation_ids) {
       if (!citationIds.has(citationId)) fail(`${source}.dispositions.${disposition.claim_id}.citation_ids`, "references an unknown citation");
+      referencedCitationIds.add(citationId);
+    }
+  }
+  for (const citation of proposal.citations) {
+    if (!referencedCitationIds.has(citation.id)) {
+      fail(`${source}.citations.${citation.id}`, "must be referenced by a claim or disposition");
     }
   }
   for (const claimId of claimIds) {

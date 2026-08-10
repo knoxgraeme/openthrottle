@@ -107,6 +107,17 @@ export const SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]
 export const PRODUCER_SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+|repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?:(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+\/)*(?!\.{1,2}$)[A-Za-z0-9._-]+)$/;
 export const SHA256 = /^[a-f0-9]{64}$/;
 export const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
+// Keep evidence-query timestamps byte-compatible with the persistence read
+// surfaces. Date.parse alone accepts ambiguous values such as `0`, `2026`,
+// and locale-shaped dates, while equivalent offset timestamps must normalize
+// to the same bytes before citation results are compared.
+const ISO_8601_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:?\d{2})$/;
+
+export function normalizeIso8601Timestamp(value: string): string | null {
+  if (!ISO_8601_TIMESTAMP.test(value)) return null;
+  const timestamp = Date.parse(value);
+  return Number.isNaN(timestamp) ? null : new Date(timestamp).toISOString();
+}
 // Matches sandbox/runner/artifacts.mjs's NATIVE_SESSION_ID and
 // native-session-package.mjs's PACKAGE_PATH_ID, since a native session id
 // is later used to build a filesystem path.

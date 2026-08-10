@@ -389,6 +389,7 @@ describe("coordinator-only server", () => {
           attribution: "agent",
           graph: "structured",
           skill_digest: "builtin://ce/implement@1",
+          from: "2026-08-08T02:00:00+0200",
           limit: 1,
         },
         expected_result: [{
@@ -398,7 +399,7 @@ describe("coordinator-only server", () => {
           outcome: "failed",
           closed_reason: "failure",
           fault_attribution: "agent",
-          created_at: "2026-08-08T00:00:00.000Z",
+          created_at: "2026-08-08T02:00:00+02:00",
         }],
         source_digests: ["a".repeat(64)],
       }],
@@ -433,6 +434,49 @@ describe("coordinator-only server", () => {
       claims: [{ id: "claim_one", result: "survived" }],
       gate: { result: "passed", outcome: "success", reason: "all_citations_reproduced" },
     });
+  });
+
+  it("rejects unsupported citation timestamps and unreferenced citations before grading", async () => {
+    const proposal = {
+      schema: "openthrottle.citation-contract/v1",
+      id: "proposal_invalid",
+      summary: "Invalid evidence graph.",
+      claims: [{ id: "claim_one", text: "A claim.", citation_ids: ["citation_one"] }],
+      citations: [{
+        id: "citation_one",
+        query: { outcome: "failed", from: "2026-08-08" },
+        expected_result: [],
+        source_digests: ["a".repeat(64)],
+      }],
+      dispositions: [{
+        claim_id: "claim_one",
+        disposition: "supported",
+        rationale: "Purported support.",
+        citation_ids: ["citation_one"],
+      }],
+      grades: [{
+        id: "overall",
+        value: "pass",
+        disposition_claim_ids: ["claim_one"],
+        rationale: "Purported pass.",
+      }],
+    };
+
+    const grade = (body: unknown) => app().request("/analysis/citations/grade", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token", "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    expect((await grade(proposal)).status).toBe(400);
+    proposal.citations[0]!.query.from = "2026-08-08T00:00:00.000Z";
+    proposal.citations.push({
+      id: "orphan_citation",
+      query: { outcome: "failed", from: "2026-08-08T00:00:00.000Z" },
+      expected_result: [],
+      source_digests: ["b".repeat(64)],
+    });
+    expect((await grade(proposal)).status).toBe(400);
   });
 
   it("grades ordinary citation mismatches without throwing and fails closed when no claims survive", async () => {
