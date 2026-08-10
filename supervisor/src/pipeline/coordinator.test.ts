@@ -1429,6 +1429,59 @@ describe("pipeline coordinator", () => {
       .toEqual(["publish_linear", "stop", "cleanup"]);
   });
 
+  it("enforces authored ordinary loop rounds independently of transition re-entry caps", () => {
+    const { manifest, instance, attempt, stages } = setup("core/implement@4");
+    const loopBoundManifest: PipelineManifest = {
+      ...manifest,
+      stages: manifest.stages.map((stage) => stage.id === "implementation"
+        ? {
+            ...stage,
+            loop: {
+              id: "implementation-loop",
+              skill: "builtin://ce/implement@1",
+              input_scope: "graph",
+              receipt: "unit_completion",
+              max_parallel: 1,
+              max_rounds: 1,
+              timeout_seconds: 7_200,
+            },
+          }
+        : stage),
+    };
+    const normalizedManifest = canonicalJson(loopBoundManifest);
+    const loopBoundInstance = {
+      ...instance,
+      manifest_digest: digestNormalized(normalizedManifest),
+      normalized_manifest: normalizedManifest,
+    };
+    const repair = event(loopBoundInstance, attempt, "semantic_repair_required", "loop-round-limit");
+    const allowed = reducePipelineEvent({
+      manifest: loopBoundManifest,
+      instance: loopBoundInstance,
+      attempt,
+      stages,
+      event: repair,
+    });
+    expect(allowed.nextStageId).toBe("implementation");
+
+    const exhausted = reducePipelineEvent({
+      manifest: loopBoundManifest,
+      instance: { ...loopBoundInstance, reentry_count: 1 },
+      attempt,
+      stages: stages.map((stage) => stage.stage_id === "implementation"
+        ? { ...stage, attempt_count: 2, reentry_count: 1 }
+        : stage),
+      event: repair,
+    });
+    expect(exhausted).toMatchObject({
+      nextStatus: "completion_pending_publication",
+      terminalOutcome: "needs_human",
+      nextStageId: null,
+      waitReason: "stage implementation loop round limit 1 exhausted",
+    });
+    expect(exhausted.nextAttempt).toBeUndefined();
+  });
+
   it("fences no_change terminals produced by re-entry exhaustion", () => {
     const { manifest, instance, attempt, stages } = setup("core/implement@4");
     const noChangeExhaustionManifest: PipelineManifest = {

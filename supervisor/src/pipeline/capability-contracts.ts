@@ -2,6 +2,20 @@ import type { ArtifactKind, ContextPolicy } from "./manifest.js";
 
 export const FOR_EACH_UNIT_CAPABILITY = "graph/for-each-unit@1";
 export const REPOSITORY_SKILL_CAPABILITY = "agent/repository-skill@1";
+export const ORDINARY_STAGE_BUILTIN_CAPABILITIES = [
+  "agent/semantic@1",
+  "ce/implement@1",
+  "ce/plan@1",
+  "ce/publish@1",
+  "ce/investigate@1",
+  "ce/review@1",
+  "ce/simplify@1",
+] as const;
+export const STRUCTURED_PHASE_BUILTIN_CAPABILITIES = {
+  implement: "ce/implement@1",
+  simplify: "ce/simplify@1",
+  lead: "accept-unit@1",
+} as const;
 
 export interface CapabilityCredentialContract {
   minimum: readonly string[];

@@ -1734,6 +1734,74 @@ commands:
     expect(second.pipeline_id).not.toBe(first.pipeline_id);
   });
 
+  it("rejects repository ordinary loop timeouts that are not the effective hard deadline", async () => {
+    const graphPath = ".openthrottle/graphs/ordinary-timeout.json";
+    const graph = JSON.stringify({
+      schema: "openthrottle.graph/v1",
+      id: "ordinary-timeout",
+      version: 1,
+      entry_node: "implementation",
+      workers: [{
+        id: "implementer",
+        engine: "agent",
+        session_scope: "attempt",
+        credentials: ["model.invoke", "repo.read", "repo.write"],
+        skills: ["builtin://ce/implement@1"],
+      }],
+      loops: [{
+        id: "implement_loop",
+        worker: "implementer",
+        input_scope: "graph",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        skill: "builtin://ce/implement@1",
+        timeout_seconds: 60,
+      }],
+      nodes: [{
+        id: "implementation",
+        kind: "run",
+        loop: "implement_loop",
+        depends_on: [],
+        transitions: {
+          success: { terminal: "completed" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+    const { pipelines, tickets } = await run(
+      `schema: openthrottle.config/v1
+default_graph: ordinary_timeout
+graphs:
+  - id: ordinary_timeout
+    kind: repository
+    ref: ${graphPath}
+limits:
+  task_timeout: 7200
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: ordinary_timeout
+    allowed_graphs: [ordinary_timeout]
+`,
+      {},
+      shippedCatalogPath,
+      payload(),
+      { [graphPath]: graph }
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(pipelines.getInstanceForSession("session-1")).toBeUndefined();
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) =>
+      entry.includes("timeout_seconds: must equal the enforced ordinary stage timeout 300")
+    )).toBe(true);
+  });
+
   it("pins repository skill packages and carries skill identity in the compiled request", async () => {
     const graphPath = ".openthrottle/graphs/repo-skill.json";
     const skillPath = ".agents/skills/implement-unit/SKILL.md";
@@ -1757,7 +1825,7 @@ commands:
         max_parallel: 1,
         max_rounds: 1,
         skill: "repo://implement_unit",
-        timeout_seconds: 60,
+        timeout_seconds: 300,
       }],
       nodes: [{
         id: "implementation",
@@ -1780,6 +1848,8 @@ graphs:
 skills:
   - id: implement_unit
     path: .agents/skills/implement-unit
+limits:
+  task_timeout: 7200
 pipelines: { implement: implement }
 intents:
   implement:
@@ -1882,6 +1952,8 @@ graphs:
 skills:
   - id: implement_unit
     path: .agents/skills/implement-unit
+limits:
+  task_timeout: 60
 pipelines: { implement: implement }
 intents:
   implement:

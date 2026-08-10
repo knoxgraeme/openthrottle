@@ -135,7 +135,7 @@ function minimalUnitGraph(overrides: {
     }, {
       id: "lead-worker",
       engine: "agent",
-      skills: ["builtin://ce/review@1"],
+      skills: ["builtin://accept-unit@1"],
       allowed_mcp_servers: [],
       session_scope: "fresh",
       credentials: ["model.invoke", "repo.read"],
@@ -154,7 +154,7 @@ function minimalUnitGraph(overrides: {
     }, {
       id: "lead-loop",
       worker: "lead-worker",
-      skill: "builtin://ce/review@1",
+      skill: "builtin://accept-unit@1",
       input_scope: "unit",
       receipt: "unit_decision",
       max_parallel: 1,
@@ -382,7 +382,7 @@ describe("execution graph compiler", () => {
     const publish = compiled.manifest.manifest.stages.find((stage) => stage.id === "publish")!;
 
     expect(publish.context).toBe("resume_required");
-    expect(compiled.manifest.digest).toBe("eeb2f6bed1d6e6b20a478f4f77284c935714ad5b2e11d47623363d2fa8edb769");
+    expect(compiled.manifest.digest).toBe("db5b8eaccee24a465f7a123438798a944793f08f25bf85c61603734a3b7c101b");
   });
 
   it("opts aggregate publish into prefer_resume only through the explicit compiler option", () => {
@@ -451,9 +451,9 @@ describe("execution graph compiler", () => {
     });
 
     expect(compiled.manifest.manifest.requires.capabilities).toEqual([
-      "ce/review@1",
       "graph/for-each-unit@1",
       REPOSITORY_SKILL_CAPABILITY,
+      "accept-unit@1",
     ]);
     expect(compiled.manifest.manifest.stages[0]?.unitPhaseBindings?.[0]).toMatchObject({
       id: "implement",
@@ -470,7 +470,7 @@ describe("execution graph compiler", () => {
   it("preserves authored ordinary run loop execution settings on compiled stages", () => {
     const compiled = validateAndCompileExecutionGraph(minimalGraph({
       loop: { input_scope: "diff", receipt: "semantic_review", max_rounds: 7, timeout_seconds: 123 },
-    }));
+    }), { ordinaryStageTimeoutSeconds: 123 });
 
     expect(compiled.manifest.manifest.stages[0]?.loop).toEqual({
       id: "loop",
@@ -481,6 +481,14 @@ describe("execution graph compiler", () => {
       max_rounds: 7,
       timeout_seconds: 123,
     });
+  });
+
+  it.each([123, 600])("rejects ordinary run loop timeout %s when the enforced stage timeout is 300", (timeoutSeconds) => {
+    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+      loop: { timeout_seconds: timeoutSeconds },
+    }), {
+      ordinaryStageTimeoutSeconds: 300,
+    })).toThrow(/graph\.loops\.loop\.timeout_seconds: must equal the enforced ordinary stage timeout 300/);
   });
 
   it("preserves authored structured loop execution settings in unit phase bindings", () => {
@@ -530,7 +538,7 @@ describe("execution graph compiler", () => {
         credentials: ["model.invoke", "provider.read", "repo.read"],
       },
       leadLoop: { skill: "builtin://ce/implement@1" },
-    }))).toThrow(/graph\.nodes\.units\.phases\.2\.skill: ce\/implement@1 requires repo\.write and cannot be used for gate phases/);
+    }))).toThrow(/graph\.nodes\.units\.phases\.2\.skill: ce\/implement@1 is not runnable for the lead phase; expected accept-unit@1/);
   });
 
   it("allows implement unit workers to request declared MCP access", () => {
@@ -654,6 +662,44 @@ describe("execution graph compiler", () => {
       },
       leadLoop: { skill: "builtin://accept-imaginary@1" },
     }))).toThrow(/graph\.loops\.lead-loop\.skill: unsupported builtin capability accept-imaginary@1/);
+  });
+
+  it("rejects known builtin capabilities that have no ordinary stage dispatch adapter", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+      worker: {
+        skills: ["builtin://accept-unit@1"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      loop: { skill: "builtin://accept-unit@1" },
+    }))).toThrow(/graph\.loops\.loop\.skill: accept-unit@1 has no ordinary stage dispatch adapter/);
+  });
+
+  it("rejects builtin capabilities that do not match the structured phase adapter", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      worker: {
+        skills: ["builtin://ce/review@1"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      loop: { skill: "builtin://ce/review@1" },
+    }))).toThrow(/graph\.nodes\.units\.phases\.0\.skill: ce\/review@1 is not runnable for the implement phase/);
+
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      phases: [
+        { id: "implement", kind: "agent", loop: "loop" },
+        { id: "simplify", kind: "agent", loop: "loop" },
+        { id: "candidate", kind: "evidence" },
+        { id: "lead", kind: "gate", loop: "lead-loop" },
+        { id: "integrate", kind: "integrate" },
+      ],
+    }))).toThrow(/graph\.nodes\.units\.phases\.1\.skill: ce\/implement@1 is not runnable for the simplify phase/);
+
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: {
+        skills: ["builtin://ce/review@1"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      leadLoop: { skill: "builtin://ce/review@1" },
+    }))).toThrow(/graph\.nodes\.units\.phases\.2\.skill: ce\/review@1 is not runnable for the lead phase/);
   });
 
   it.each([

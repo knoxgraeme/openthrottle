@@ -33,7 +33,9 @@ import {
 } from "./manifest.js";
 import {
   FOR_EACH_UNIT_CAPABILITY,
+  ORDINARY_STAGE_BUILTIN_CAPABILITIES,
   REPOSITORY_SKILL_CAPABILITY,
+  STRUCTURED_PHASE_BUILTIN_CAPABILITIES,
   capabilityCredentialContract,
   capabilityCredentialContractViolations,
   capabilityRequiresCredential,
@@ -48,6 +50,7 @@ export interface CompileExecutionGraphOptions {
   maxAttempts?: number;
   maxRepairRounds?: number;
   aggregatePublishContext?: "prefer_resume";
+  ordinaryStageTimeoutSeconds?: number;
   runtime?: RuntimeCapabilityInventory;
   config?: RepositoryConfigContract;
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>;
@@ -88,6 +91,12 @@ const GRAPH_TO_STAGE_OUTCOME: Record<PublicGraphOutcome, StageOutcome> = {
   retryable_failure: "retryable_infrastructure_failure",
   failure: "failure",
 };
+
+// These are the builtin capabilities that sandbox/runner/execute-stage.mjs
+// maps to installed whole-stage task adapters. A broader credential contract
+// is not sufficient: accepting a capability with no dispatch mapping would run
+// the generic fallback instead of the graph's declared skill.
+const ORDINARY_RUN_BUILTIN_CAPABILITIES = new Set<string>(ORDINARY_STAGE_BUILTIN_CAPABILITIES);
 
 const DEFAULT_TERMINALS: Pick<Record<StageOutcome, PipelineTransition>, "needs_human" | "canceled" | "superseded"> = {
   needs_human: { terminal: "needs_human" },
@@ -236,6 +245,7 @@ function compileTransitions(node: GraphNode): Record<StageOutcome, PipelineTrans
 function loopTemplate(
   graph: GraphContract,
   node: GraphNode,
+  ordinaryStageTimeoutSeconds?: number,
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
 ): StageTemplate {
   const loop = graph.loops.find((candidate) => candidate.id === node.loop);
@@ -249,11 +259,20 @@ function loopTemplate(
   if (loop.input_scope !== "graph" && loop.input_scope !== "diff" && loop.input_scope !== "review") {
     fail(`graph.loops.${loop.id}.input_scope`, "cannot compile this loop input scope for run nodes yet");
   }
+  if (ordinaryStageTimeoutSeconds !== undefined && loop.timeout_seconds !== ordinaryStageTimeoutSeconds) {
+    fail(
+      `graph.loops.${loop.id}.timeout_seconds`,
+      `must equal the enforced ordinary stage timeout ${ordinaryStageTimeoutSeconds}`
+    );
+  }
   const { capability, repositorySkill } = capabilityFromSkill(
     loop.skill,
     `graph.loops.${loop.id}.skill`,
     repositorySkills
   );
+  if (repositorySkill === undefined && !ORDINARY_RUN_BUILTIN_CAPABILITIES.has(capability)) {
+    fail(`graph.loops.${loop.id}.skill`, `${capability} has no ordinary stage dispatch adapter`);
+  }
   const isReview = loop.receipt === "semantic_review";
   const liveSteering = capability === "ce/implement@1" || capability === "ce/investigate@1";
   const template: StageTemplate = {
@@ -307,6 +326,15 @@ function unitPhaseLoop(
   if (!worker) fail(`graph.loops.${loop.id}.worker`, "references an unknown worker");
   if (worker.engine !== "agent") fail(`graph.workers.${worker.id}.engine`, "for_each_unit phases require an agent worker");
   const { capability, repositorySkill } = capabilityFromSkill(loop.skill, `graph.loops.${loop.id}.skill`, repositorySkills);
+  const expectedBuiltinCapability = STRUCTURED_PHASE_BUILTIN_CAPABILITIES[
+    phase.id as keyof typeof STRUCTURED_PHASE_BUILTIN_CAPABILITIES
+  ];
+  if (repositorySkill === undefined && capability !== expectedBuiltinCapability) {
+    fail(
+      `graph.nodes.${node.id}.phases.${index}.skill`,
+      `${capability} is not runnable for the ${phase.id} phase; expected ${expectedBuiltinCapability}`
+    );
+  }
   const context = contextFromSessionScope(worker);
   const kind = phase.kind as "agent" | "gate";
   assertGateReadOnly(phase, worker, capability, `graph.nodes.${node.id}.phases.${index}`);
@@ -423,12 +451,14 @@ function publishContextFor(
 function nodeTemplate(
   graph: GraphContract,
   node: GraphNode,
-  options: Pick<CompileExecutionGraphOptions, "aggregatePublishContext"> = {},
+  options: Pick<CompileExecutionGraphOptions, "aggregatePublishContext" | "ordinaryStageTimeoutSeconds"> = {},
   config?: RepositoryConfigContract,
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
 ): StageTemplate {
   assertNoDependencies(node);
-  if (node.kind === "run") return loopTemplate(graph, node, repositorySkills);
+  if (node.kind === "run") {
+    return loopTemplate(graph, node, options.ordinaryStageTimeoutSeconds, repositorySkills);
+  }
   if (node.kind === "for_each_unit") return forEachUnitTemplate(graph, node, config, repositorySkills);
   if (node.kind === "command") {
     return {

@@ -473,6 +473,8 @@ export function stagePrompt(
       entry += `\n\n${skillBody(readFileSync(join(skillDir, "SKILL.md"), "utf8"))}`;
       entry += skillReferencesText(skillDir);
     }
+  } else if (request.capability !== "agent/semantic@1") {
+    throw new Error(`stage capability ${request.capability} has no ordinary stage dispatch adapter`);
   }
   return `${entry}\n\nThis is one fenced OpenThrottle stage (${request.stageId}/${request.attemptId}) ` +
     `for capability ${request.capability}. ` +

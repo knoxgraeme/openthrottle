@@ -129,6 +129,23 @@ skill reference, invocation name, pinned package files, and package digest in
 the manifest and sealed request. Production advertises `agent/repository-skill@1`
 in its installed runtime capability descriptor, so a `run` node backed by a
 repository skill is reachable through the existing whole-attempt dispatch path.
+Compiler-produced repository manifest identity includes an explicit compiler
+identity version in addition to the pinned graph id, path, and blob. Any
+compiler change that alters normalized manifest bytes bumps that identity
+version instead of reusing an already-accepted immutable catalog key.
+Builtin `run` skills must name an installed whole-stage dispatch adapter (or
+the intentional generic `agent/semantic@1` executor). Structured builtin phase
+skills are exact: `implement` uses `ce/implement@1`, `simplify` uses
+`ce/simplify@1`, and `lead` uses `accept-unit@1`; pinned repository skills are
+the only configurable alternative. A repository graph's ordinary `run` loop
+is accepted only when its `timeout_seconds` equals the effective existing hard
+deadline—the lesser
+of supervisor `TASK_TIMEOUT` and repository `limits.task_timeout` (default
+7,200 seconds)—because per-loop ordinary-stage deadlines are not yet carried
+through the sealed stage protocol. Admission rejects any mismatch. For ordinary
+stages, `max_rounds` bounds repeat entries into the stage independently of the
+graph transition and manifest-wide retry/repair safety limits; the first
+forward entry is not a repeat round, and the first exhausted bound wins.
 The composite `graph/for-each-unit@1` capability (structured multi-unit
 execution) is installed only with the composition root that constructs and
 drains the child unit runtime. A composite host stage dispatches no

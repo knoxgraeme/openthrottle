@@ -14,7 +14,9 @@ import {
 import { parseDocument } from "yaml";
 import {
   FOR_EACH_UNIT_CAPABILITY,
+  ORDINARY_STAGE_BUILTIN_CAPABILITIES,
   REPOSITORY_SKILL_CAPABILITY,
+  STRUCTURED_PHASE_BUILTIN_CAPABILITIES,
   capabilityCredentialContractViolations,
   capabilityRequiresCredential,
 } from "./capability-contracts.js";
@@ -382,6 +384,17 @@ function validateUnitPhaseBindings(
     if (binding.executor.capability !== expectedCapability) {
       fail(`${path}[${index}].executor.capability`, "must match loop.skill");
     }
+    if (expectedCapability !== REPOSITORY_SKILL_CAPABILITY) {
+      const phaseCapability = STRUCTURED_PHASE_BUILTIN_CAPABILITIES[
+        binding.id as keyof typeof STRUCTURED_PHASE_BUILTIN_CAPABILITIES
+      ];
+      if (expectedCapability !== phaseCapability) {
+        fail(
+          `${path}[${index}].executor.capability`,
+          `${expectedCapability} is not runnable for the ${binding.id} phase; expected ${phaseCapability}`
+        );
+      }
+    }
     const canonicalContext = contextForWorkerSessionScope(binding.worker.session_scope);
     if (binding.context !== canonicalContext) {
       fail(`${path}[${index}].context`, "must match worker.session_scope");
@@ -654,6 +667,18 @@ function parseStage(
     if (stage.executor.kind !== "agent" || stage.executor.capability !== REPOSITORY_SKILL_CAPABILITY) {
       fail(`${path}.repositorySkill`, "is allowed only for agent/repository-skill@1 stages");
     }
+  }
+  if (stage.executor.kind === "agent" &&
+      stage.executor.capability === REPOSITORY_SKILL_CAPABILITY &&
+      !stage.repositorySkill) {
+    fail(`${path}.repositorySkill`, "is required for agent/repository-skill@1 stages");
+  }
+  if (stage.executor.kind === "agent" &&
+      stage.executor.capability !== REPOSITORY_SKILL_CAPABILITY &&
+      !ORDINARY_STAGE_BUILTIN_CAPABILITIES.includes(
+        stage.executor.capability as (typeof ORDINARY_STAGE_BUILTIN_CAPABILITIES)[number]
+      )) {
+    fail(`${path}.executor.capability`, `${stage.executor.capability} has no ordinary stage dispatch adapter`);
   }
   const isForEachUnitStage = stage.executor.kind === "loop_action" && stage.executor.capability === FOR_EACH_UNIT_CAPABILITY;
   if (stage.unitPhases || stage.unitCommandNames || stage.unitPhaseBindings) {

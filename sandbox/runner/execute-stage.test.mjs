@@ -345,6 +345,8 @@ describe("one-stage executor", () => {
     // genuinely unmapped capability.
     expect(prompt("ce/plan@1")).toMatch(/^\$implement-plan/);
     expect(() => prompt("ce/unmapped@1")).toThrow(/has no mapped skill/);
+    expect(prompt("agent/semantic@1")).toContain("Review the requested repository state");
+    expect(() => prompt("accept-unit@1")).toThrow(/has no ordinary stage dispatch adapter/);
     // A mapped capability whose package is missing fails closed. It must never
     // silently resolve to implement-plan: that would run an implement-and-
     // commit skill for a read-only review or simplify stage.
