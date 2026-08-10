@@ -34,6 +34,9 @@ openthrottle logs <ticket>
   changing files or registering the repository.
 - `ship` creates a Linear issue from the first `# Heading` and delegates it
   with `IssueUpdateInput.delegateId` when `OT_AGENT_APP_ID` is configured.
+  Linear emits that first delegation as an issue-only assignment-created
+  session, so graph selection and execution-plan fences must live in the child
+  issue body, not in later comment or parent context.
 - `status`, `stop`, and `logs` call authenticated supervisor endpoints using
   `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN`.
 
