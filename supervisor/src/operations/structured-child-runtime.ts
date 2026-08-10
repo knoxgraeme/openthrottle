@@ -19,12 +19,14 @@ import {
   stageById,
   type PipelineUnitPhaseBinding,
   type StageOutcome,
+  unitPhaseBindingIds,
 } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "../pipeline/coordinator.js";
 import {
   buildAggregateStageEvent,
   FINAL_REPAIR_MAX_ROUNDS,
+  repairCyclePhaseSequence,
   type ExecutionUnitState,
   type UnitActionKind,
 } from "../pipeline/unit-coordinator.js";
@@ -225,12 +227,14 @@ function uniqueInOrder(values: readonly string[]): string[] {
 }
 
 function authoredUnitRepairMaxRounds(bindings: readonly PipelineUnitPhaseBinding[] | undefined): number | undefined {
-  const mutationRounds = (bindings ?? []).flatMap((binding) =>
-    binding.kind === "agent" && (binding.id === "implement" || binding.id === "simplify")
+  if (!bindings) return undefined;
+  const repeatedPhases = new Set(repairCyclePhaseSequence(unitPhaseBindingIds(bindings)));
+  const repeatedLoopRounds = bindings.flatMap((binding) =>
+    repeatedPhases.has(binding.id) && (binding.kind === "agent" || binding.kind === "gate")
       ? [binding.loop.max_rounds]
       : []
   );
-  return mutationRounds.length > 0 ? Math.min(...mutationRounds) : undefined;
+  return repeatedLoopRounds.length > 0 ? Math.min(...repeatedLoopRounds) : undefined;
 }
 
 function commandPlanForUnits(input: {
