@@ -632,6 +632,7 @@ intents:
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
     const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes(expectedMessage))).toBe(true);
   }
@@ -765,6 +766,31 @@ intents:
       pipeline_version: 4,
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(1);
+  });
+
+  it("rejects an assignment-created context whose issue identifier does not match the session issue", async () => {
+    const context = [
+      `<issue identifier="OT-2">`,
+      `<title>Wrong assignment</title>`,
+      `<description>Use another issue's context.</description>`,
+      `</issue>`,
+    ].join("\n");
+
+    await expectSelectionFailure(context, "issue identifier does not match the authenticated session issue");
+  });
+
+  it("rejects a comment-prompted context whose issue identifier does not match the session issue", async () => {
+    const context = [
+      `<issue identifier="OT-2">`,
+      `<title>Wrong prompted issue</title>`,
+      `<description>Use another issue's context.</description>`,
+      `</issue>`,
+      `<primary-directive-thread comment-id="directive">`,
+      `<comment author="Operator" created-at="2026-08-08T00:00:00.000Z">@OpenThrottle implement this ticket.</comment>`,
+      `</primary-directive-thread>`,
+    ].join("\n");
+
+    await expectSelectionFailure(context, "issue identifier does not match the authenticated session issue");
   });
 
   it("rejects provided prompt context with no Linear sections before selection", async () => {
@@ -2453,14 +2479,14 @@ intents:
   it("keeps legacy structured config on v1 until an explicit config upgrade selects v2", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
-    const context = issueOnlyPromptContext([
+    const contextFor = (identifier: string) => issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v1",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
       JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
       "```",
-    ].join("\n"));
+    ].join("\n"), "Structured work", identifier);
     const config = `schema: openthrottle.config/v1
 default_graph: simple
 graphs:
@@ -2478,7 +2504,7 @@ intents:
 `;
 
     const { pipelines, invoke, setRepositoryConfig } =
-      await run(config, {}, shippedCatalogPath, payload("session-1", "issue-1", "OT-1", context));
+      await run(config, {}, shippedCatalogPath, payload("session-1", "issue-1", "OT-1", contextFor("OT-1")));
     const legacyInstance = pipelines.getInstanceForSession("session-1")!;
     const legacyManifest = JSON.parse(legacyInstance.normalized_manifest) as {
       stages: Array<{ id: string; transitions: { success: unknown } }>;
@@ -2494,7 +2520,7 @@ intents:
 
     const upgradedConfig = config.replace("ref: core/structured@1", "ref: core/structured@2");
     setRepositoryConfig(upgradedConfig);
-    await invoke({}, payload("session-2", "issue-2", "OT-2", context));
+    await invoke({}, payload("session-2", "issue-2", "OT-2", contextFor("OT-2")));
     const upgradedInstance = pipelines.getInstanceForSession("session-2")!;
     const upgradedManifest = JSON.parse(upgradedInstance.normalized_manifest) as {
       stages: Array<{ id: string; transitions: { success: unknown } }>;
@@ -2517,14 +2543,14 @@ intents:
   it("preserves legacy structured v1 identity for custom graph ids", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "release";
-    const context = issueOnlyPromptContext([
+    const contextFor = (identifier: string) => issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v1",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
       JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "release" }, null, 2),
       "```",
-    ].join("\n"));
+    ].join("\n"), "Structured work", identifier);
     const config = `schema: openthrottle.config/v1
 default_graph: simple
 graphs:
@@ -2542,7 +2568,7 @@ intents:
 `;
 
     const { pipelines, invoke, setRepositoryConfig } =
-      await run(config, {}, shippedCatalogPath, payload("session-1", "issue-1", "OT-1", context));
+      await run(config, {}, shippedCatalogPath, payload("session-1", "issue-1", "OT-1", contextFor("OT-1")));
     const legacyInstance = pipelines.getInstanceForSession("session-1")!;
     const legacyManifest = JSON.parse(legacyInstance.normalized_manifest) as {
       description: string;
@@ -2558,7 +2584,7 @@ intents:
     expect(legacyManifest.stages[0]?.transitions.success).toEqual({ terminal: "shipped" });
 
     setRepositoryConfig(config.replace("ref: core/structured@1", "ref: core/structured@2"));
-    await invoke({}, payload("session-2", "issue-2", "OT-2", context));
+    await invoke({}, payload("session-2", "issue-2", "OT-2", contextFor("OT-2")));
     const upgradedInstance = pipelines.getInstanceForSession("session-2")!;
     expect(upgradedInstance).toMatchObject({
       pipeline_id: "builtin/structured",
@@ -2622,21 +2648,21 @@ intents:
     default_graph: simple
     allowed_graphs: [simple, structured]
 `;
-    const contextFor = (executionPlan: ExecutionPlanContract) => issueOnlyPromptContext([
+    const contextFor = (executionPlan: ExecutionPlanContract, identifier: string) => issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v1",
       JSON.stringify(executionPlan),
       "```",
       "```json openthrottle.ship-selection/v1",
       JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
       "```",
-    ].join("\n"));
+    ].join("\n"), "Structured work", identifier);
 
     {
       const { tickets } = await run(
         config,
         { claudeCodeOauthToken: "claude-oauth" },
         shippedCatalogPath,
-        payload("session-bound-ok", "issue-bound-ok", "OT-BOUND-OK", contextFor(boundary.accepted)),
+        payload("session-bound-ok", "issue-bound-ok", "OT-BOUND-OK", contextFor(boundary.accepted, "OT-BOUND-OK")),
         {},
         {},
         [{ name: "agent:claude" }]
@@ -2659,7 +2685,7 @@ intents:
       config,
       { claudeCodeOauthToken: "claude-oauth" },
       shippedCatalogPath,
-      payload("session-bound-reject", "issue-bound-reject", "OT-BOUND-REJECT", contextFor(boundary.rejected)),
+      payload("session-bound-reject", "issue-bound-reject", "OT-BOUND-REJECT", contextFor(boundary.rejected, "OT-BOUND-REJECT")),
       {},
       {},
       [{ name: "agent:claude" }]
@@ -2702,7 +2728,7 @@ intents:
       "```json openthrottle.ship-selection/v1",
       JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
       "```",
-    ].join("\n"));
+    ].join("\n"), "Structured work", "OT-RESUME-BOUND");
 
     const { tickets } = await run(
       config,
@@ -2738,7 +2764,7 @@ intents:
       "```json openthrottle.ship-selection/v1",
       JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
       "```",
-    ].join("\n"));
+    ].join("\n"), "Structured work", "OT-REPO-BOUND");
     const graph = JSON.stringify({
       schema: "openthrottle.graph/v1",
       id: "repository/structured",

@@ -120,6 +120,11 @@ function invalidLinearContextShapeMessage(): string {
     "then an optional parent issue and comment threads. No sandbox was provisioned.";
 }
 
+function issueIdentifierMismatchMessage(): string {
+  return "Linear prompt context issue identifier does not match the authenticated session issue. " +
+    "No sandbox was provisioned.";
+}
+
 function linearContextSections(context: string): ParsedLinearContextSections {
   const tokenPattern = new RegExp(
     `</?(${LINEAR_CONTEXT_SECTION_KINDS.join("|")})\\b[^>]*>`,
@@ -183,6 +188,13 @@ function hasCanonicalLinearContextShape(sections: ContextSection[]): boolean {
     return false;
   }
   return true;
+}
+
+function issueSectionIdentifier(section: ContextSection): string | undefined {
+  const match = section.text.match(
+    /^<issue\b[^>]*\bidentifier\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))/i
+  );
+  return match?.[1] ?? match?.[2] ?? match?.[3];
 }
 
 function stripNestedLinearContextSections(section: ContextSection): ContextSection {
@@ -256,7 +268,7 @@ function parentIssueSummary(section: ContextSection): string {
 
 function composeBoundedOrdinaryTaskContext(
   rawContext: string,
-  options: { requireLinearSections?: boolean } = {}
+  options: { requireLinearSections?: boolean; expectedIssueIdentifier?: string } = {}
 ): BoundedTaskContext {
   const sanitized = sanitizeText(rawContext);
   const originalBytes = utf8Bytes(sanitized);
@@ -270,6 +282,15 @@ function composeBoundedOrdinaryTaskContext(
     };
   }
   const rawIssueSections = contextSectionsOf(sections, "issue");
+  if (rawIssueSections.length > 0 &&
+      options.expectedIssueIdentifier !== undefined &&
+      issueSectionIdentifier(rawIssueSections[0]!) !== options.expectedIssueIdentifier) {
+    return {
+      context: sanitized,
+      selectionContext: "",
+      selectionError: issueIdentifierMismatchMessage(),
+    };
+  }
   const issueSections = rawIssueSections.map(stripNestedLinearContextSections);
   const rawDirectiveSections = contextSectionsOf(sections, "primary-directive-thread");
   const directiveSections = rawDirectiveSections.map(stripNestedLinearContextSections);
@@ -886,6 +907,7 @@ export async function handleCreated(
   };
   const boundedTaskContext = composeBoundedOrdinaryTaskContext(initialContext, {
     requireLinearSections: hasSuppliedPromptContext,
+    expectedIssueIdentifier: issue.identifier,
   });
   try {
     if (boundedTaskContext.selectionError) {
