@@ -100,7 +100,7 @@ type LoopDispatchBinding = {
     receipt: string;
     max_parallel: number;
     max_rounds: number;
-    timeout_seconds: number;
+    timeout_seconds?: number;
   };
   worker: {
     id: string;
@@ -181,7 +181,6 @@ function builtinLoopBinding(input: {
       receipt: input.kind === "gate" ? "unit_decision" : "unit_completion",
       max_parallel: 1,
       max_rounds: input.maxRounds ?? 1,
-      timeout_seconds: 86_400,
     },
     credentials: input.credentials,
     context: input.context ?? "fresh",

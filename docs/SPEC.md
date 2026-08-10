@@ -161,6 +161,9 @@ repository graph compilation and its timeout-equality check.
 Structured unit implementation repairs use the authored implement-loop
 `max_rounds`. Whole-change final-review repair is a distinct internal loop with
 its own one-round bound; it never borrows the unit implementation budget.
+Internal whole-change final review and repair bindings do not declare an
+independent timeout, so their sealed action timeout inherits the supervisor
+`TASK_TIMEOUT` hard resource bound.
 The composite `graph/for-each-unit@1` capability (structured multi-unit
 execution) is installed only with the composition root that constructs and
 drains the child unit runtime. A composite host stage dispatches no

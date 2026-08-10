@@ -1180,6 +1180,7 @@ describe("structured child runtime repair fences", () => {
       loop: "repair",
       contextPolicy: "resume_required",
       nativeSessionId: "native-session-final-repair-1",
+      timeoutMs: 300_000,
       priorEvidence: {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "final_repair",
@@ -2025,6 +2026,7 @@ describe("structured child runtime repair fences", () => {
       actionId: "final-review-no-commands",
       role: "reviewer",
       loop: "review",
+      timeoutMs: 300_000,
       priorEvidence: {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "final_review",
