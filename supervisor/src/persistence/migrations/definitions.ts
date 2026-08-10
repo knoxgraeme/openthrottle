@@ -1850,6 +1850,30 @@ CREATE INDEX execution_work_attempts_pipeline_instance_idx
 const runOutcomesMigrationSource = `${runOutcomesSchema}${runOutcomesReceiptIndexSchema}
 run-outcomes-contract:run_outcomes is written exactly once per pipeline instance terminal transition, supervisor-derived facts only, closed_reason/outcome/fault_attribution reuse the existing StageOutcome/PipelineOutcome/FaultAttribution vocabularies/v1`;
 
+const citationGateReceiptSchema = `
+CREATE TABLE citation_gate_receipts (
+  id TEXT PRIMARY KEY,
+  proposal_id TEXT NOT NULL,
+  proposal_hash TEXT NOT NULL UNIQUE,
+  gate_result TEXT NOT NULL CHECK(gate_result IN ('passed', 'failed')),
+  outcome TEXT NOT NULL CHECK(outcome IN ('success', 'failure')),
+  reason TEXT NOT NULL CHECK(reason IN (
+    'all_citations_reproduced', 'partial_claim_survival', 'no_claims_survived',
+    'proposal_tampered', 'stale_evidence'
+  )),
+  grade_hash TEXT NOT NULL,
+  payload TEXT NOT NULL CHECK(json_valid(payload)),
+  receipt_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX citation_gate_receipts_created_idx
+  ON citation_gate_receipts(created_at, proposal_id);
+`;
+
+const citationGateReceiptMigrationSource = `${citationGateReceiptSchema}
+citation-gate-contract:proposal citation gates persist canonical provider-neutral decisions and reject conflicting replay/v1
+analysis-boundary-contract:resolved analysis rows are gate inputs supplied by the caller, never imported by scheduler transition or effect code/v1`;
+
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
     db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
@@ -2444,6 +2468,16 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (hasTable(db, "pipeline_instances") && !hasColumns(db, "pipeline_instances", ["published_subject"])) {
         db.exec(pipelinePublishedSubjectSchema);
+      }
+    },
+  },
+  {
+    version: 31,
+    name: "citation-gate-receipts",
+    source: citationGateReceiptMigrationSource,
+    up(db) {
+      if (!hasTable(db, "citation_gate_receipts")) {
+        db.exec(citationGateReceiptSchema);
       }
     },
   },

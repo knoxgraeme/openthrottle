@@ -5,7 +5,7 @@ import { digestCanonicalJson } from "./canonical.js";
 import { parseRepositoryConfigContract } from "./config.js";
 import { parseExecutionPlanContract } from "./execution-plan.js";
 import { parseGraphContract } from "./graph.js";
-import { parseStandardReceipt, validateStandardReceipt } from "./receipts.js";
+import { parseCitationContractProposal, parseStandardReceipt, validateStandardReceipt } from "./index.js";
 
 const fixtureRoot = new URL("../fixtures", import.meta.url);
 
@@ -19,6 +19,7 @@ function invalidFixtures(): string[] {
 
 function parseByName(name: string, raw: string): unknown {
   if (name.startsWith("config-")) return parseRepositoryConfigContract(raw, { source: name });
+  if (name.startsWith("citation-contract")) return parseCitationContractProposal(raw, { source: name });
   if (name.startsWith("graph-")) return parseGraphContract(raw, { source: name });
   if (name === "execution-plan.json" || name.startsWith("execution-plan-")) {
     return parseExecutionPlanContract(raw, { source: name });
@@ -28,6 +29,10 @@ function parseByName(name: string, raw: string): unknown {
 }
 
 const invalidCases = [
+  ["citation-contract-unknown-citation.json", /claims\.claim_one\.citation_ids: references an unknown citation/],
+  ["citation-contract-unknown-field.json", /claims\[0\]\.confidence: unknown field/],
+  ["citation-contract-unbounded-query.json", /query\.limit: must be an integer between 1 and 200/],
+  ["citation-contract-unsupported-query.json", /query\.outcome: must be one of/],
   ["config-path-traversal.json", /ref: has an invalid format/],
   ["config-provider-secret-env.json", /must not name a provider-secret identifier/],
   ["config-unknown-field.json", /unexpected: unknown field/],
@@ -122,6 +127,7 @@ describe("Stage C contract fixtures", () => {
   it("accepts and normalizes the frozen valid corpora", () => {
     const fixtures = [
       "config-repository.json",
+      "citation-contract.json",
       "graph-structured.json",
       "execution-plan.json",
       "receipt-unit-completion.json",

@@ -48,7 +48,9 @@ import { stageById } from "../pipeline/manifest.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { AnalysisStore } from "../persistence/pipeline/analysis-store.js";
+import type { CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
 import type { RuntimeInventory, RuntimeLogs, RuntimeSnapshotReadiness } from "../runtime/contracts.js";
+import { executeRawCitationGate } from "./citation-executor.js";
 
 export interface ServerDeps {
   cfg: Config;
@@ -59,6 +61,7 @@ export interface ServerDeps {
   // pipelineCoordinator.store (PipelineStore), which gate/transition/
   // scheduler/effect-drain code consumes. See analysis-store.ts.
   analysisStore: AnalysisStore;
+  citationGateStore: CitationGateStore;
   runBackground?: (task: Promise<void>) => void;
   getLinearClient?: () => Promise<LinearClient | undefined>;
   deliveryProcessor?: WebhookDeliveryProcessor;
@@ -370,6 +373,32 @@ export function createServer(deps: ServerDeps): Hono {
           limit: limit ? Number(limit) : undefined,
         }),
       });
+    } catch (error) {
+      return context.json({ error: sanitizeText(String(error)) }, 400);
+    }
+  });
+
+  app.post("/analysis/citations/grade", async (context) => {
+    if (!requireStatusAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    try {
+      const execution = executeRawCitationGate({
+        raw: await context.req.json(),
+        analysisStore: deps.analysisStore,
+        citationGateStore: deps.citationGateStore,
+      });
+      return context.json({
+        ...execution.grade,
+        gate: {
+          result: execution.decision.result,
+          outcome: execution.decision.outcome,
+          reason: execution.decision.reason,
+          proposal_hash: execution.decision.proposal_hash,
+          grade_hash: execution.decision.grade_hash,
+          receipt_hash: execution.receipt.receipt_hash,
+        },
+      }, execution.grade.result === "pass" ? 200 : 422);
     } catch (error) {
       return context.json({ error: sanitizeText(String(error)) }, 400);
     }

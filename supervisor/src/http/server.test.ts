@@ -7,6 +7,7 @@ import { createSupervisorStore, type SupervisorStore } from "../persistence/stor
 import { openDb } from "../persistence/database.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { createAnalysisStore, type AnalysisStore } from "../persistence/pipeline/analysis-store.js";
+import { createCitationGateStore, type CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
 import { STRUCTURED_STATUS_UNITS_SQL } from "../persistence/pipeline/status-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
@@ -14,6 +15,7 @@ import { loadPipelineCatalog, parseRepositoryConfig, stageById, type PipelineUni
 import { parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
 import { buildInstalledRuntimeDescriptor, type RuntimeInventory, type RuntimeLogs, type RuntimeSnapshotReadiness } from "../__fixtures__/runtime.js";
 import { createServer, createServerWebhookDeliveryProcessor } from "./server.js";
+import { CITATION_GRADE_SCHEMA } from "./citation-executor.js";
 
 const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url));
 
@@ -103,12 +105,14 @@ describe("coordinator-only server", () => {
   let store: SupervisorStore;
   let pipelines: PipelineStore;
   let analysisStore: AnalysisStore;
+  let citationGateStore: CitationGateStore;
 
   beforeEach(() => {
     db = openDb(":memory:");
     pipelines = createPipelineStore(db);
     store = createSupervisorStore(db, pipelines);
     analysisStore = createAnalysisStore(db);
+    citationGateStore = createCitationGateStore(db, () => "2026-08-08T00:00:00.000Z");
   });
 
   afterEach(() => db.close());
@@ -119,6 +123,7 @@ describe("coordinator-only server", () => {
       store,
       runtime: {} as ServerRuntime,
       analysisStore,
+      citationGateStore,
       getLinearClient: async () => undefined,
       pipelineCoordinator: {
         catalog: {} as never,
@@ -352,6 +357,137 @@ describe("coordinator-only server", () => {
       });
       expect(response.status, `limit=${limit}`).toBe(400);
     }
+  });
+
+  it("grades citation proposals by re-executing expected analysis queries server-side", async () => {
+    seedPipelineTicket();
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    db.prepare(`
+      INSERT INTO run_outcomes (
+        pipeline_instance_id, linear_issue_id, generation, execution_graph_id, plan_digest,
+        base_commit, engine, outcome, closed_reason, fault_attribution, generations_consumed,
+        repair_rounds_by_unit, phase_durations_ms, token_cost_usd, skill_digests, created_at
+      ) VALUES (?, ?, 1, 'structured', NULL, ?, 'codex', 'failed', 'failure', 'agent', 1, '{}', '{}', NULL, ?, ?)
+    `).run(
+      instance.id,
+      instance.linear_issue_id,
+      instance.base_commit,
+      JSON.stringify([{ skill: "builtin://ce/implement@1", skill_package_digest: null }]),
+      "2026-08-08T00:00:00.000Z"
+    );
+
+    const proposal = {
+      schema: "openthrottle.citation-contract/v1",
+      id: "proposal_one",
+      summary: "Claim grounded in analysis.",
+      claims: [{ id: "claim_one", text: "The agent failed.", citation_ids: ["citation_one"] }],
+      citations: [{
+        id: "citation_one",
+        query: {
+          outcome: "failed",
+          reason: "failure",
+          attribution: "agent",
+          graph: "structured",
+          skill_digest: "builtin://ce/implement@1",
+          limit: 1,
+        },
+        expected_result: [{
+          pipeline_instance_id: instance.id,
+          generation: 1,
+          execution_graph_id: "structured",
+          outcome: "failed",
+          closed_reason: "failure",
+          fault_attribution: "agent",
+          created_at: "2026-08-08T00:00:00.000Z",
+        }],
+        source_digests: ["a".repeat(64)],
+      }],
+      dispositions: [{
+        claim_id: "claim_one",
+        disposition: "supported",
+        rationale: "The analysis read reproduced.",
+        citation_ids: ["citation_one"],
+      }],
+      grades: [{
+        id: "overall",
+        value: "pass",
+        disposition_claim_ids: ["claim_one"],
+        rationale: "All cited claims reproduced.",
+      }],
+    };
+
+    const response = await app().request("/analysis/citations/grade", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token", "Content-Type": "application/json" },
+      body: JSON.stringify(proposal),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      schema: CITATION_GRADE_SCHEMA,
+      proposal_id: "proposal_one",
+      result: "pass",
+      surviving_claim_ids: ["claim_one"],
+      dropped_claim_ids: [],
+      citations: [{ id: "citation_one", result: "reproduced" }],
+      claims: [{ id: "claim_one", result: "survived" }],
+      gate: { result: "passed", outcome: "success", reason: "all_citations_reproduced" },
+    });
+  });
+
+  it("grades ordinary citation mismatches without throwing and fails closed when no claims survive", async () => {
+    seedPipelineTicket();
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const proposal = {
+      schema: "openthrottle.citation-contract/v1",
+      id: "proposal_mismatch",
+      summary: "Claim with stale evidence.",
+      claims: [{ id: "claim_one", text: "The run shipped.", citation_ids: ["citation_one"] }],
+      citations: [{
+        id: "citation_one",
+        query: { outcome: "shipped", limit: 1 },
+        expected_result: [{
+          pipeline_instance_id: instance.id,
+          generation: 1,
+          execution_graph_id: null,
+          outcome: "shipped",
+          closed_reason: "success",
+          fault_attribution: null,
+          created_at: "2026-08-08T00:00:00.000Z",
+        }],
+        source_digests: ["b".repeat(64)],
+      }],
+      dispositions: [{
+        claim_id: "claim_one",
+        disposition: "supported",
+        rationale: "The stale expected row should not survive.",
+        citation_ids: ["citation_one"],
+      }],
+      grades: [{
+        id: "overall",
+        value: "pass",
+        disposition_claim_ids: ["claim_one"],
+        rationale: "Input grade is rechecked server-side.",
+      }],
+    };
+
+    const response = await app().request("/analysis/citations/grade", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token", "Content-Type": "application/json" },
+      body: JSON.stringify(proposal),
+    });
+
+    expect(response.status).toBe(422);
+    expect(await response.json()).toMatchObject({
+      schema: CITATION_GRADE_SCHEMA,
+      proposal_id: "proposal_mismatch",
+      result: "fail",
+      surviving_claim_ids: [],
+      dropped_claim_ids: ["claim_one"],
+      citations: [{ id: "citation_one", result: "mismatch", actual_result: [] }],
+      claims: [{ id: "claim_one", result: "dropped" }],
+      gate: { result: "failed", outcome: "failure", reason: "stale_evidence" },
+    });
   });
 
   it("includes repeated sandbox ingestion failures in pipeline status", async () => {

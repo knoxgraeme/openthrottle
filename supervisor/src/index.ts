@@ -17,6 +17,7 @@ import { activityPayload, createLinearActivityPublisher, createLinearOutboxProce
 import { loadPipelineCatalog } from "./pipeline/manifest.js";
 import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { createAnalysisStore } from "./persistence/pipeline/analysis-store.js";
+import { createCitationGateStore } from "./persistence/pipeline/citation-gate-store.js";
 import { loadRuntimeCapabilityDescriptor } from "./runtime/contracts.js";
 import { drainDeferredProviderEvidence } from "./pipeline/gates.js";
 import { completeStageAttemptActor } from "./pipeline/settlement.js";
@@ -47,6 +48,7 @@ async function main() {
   const pipelineStore = createPipelineStore(db);
   const store = createSupervisorStore(db, pipelineStore);
   const analysisStore = createAnalysisStore(db);
+  const citationGateStore = createCitationGateStore(db, () => new Date().toISOString());
   const runtimeCapabilities = loadRuntimeCapabilityDescriptor(
     cfg.sandboxRuntimeDescriptorPath,
     cfg.sandboxRuntimeRelease
@@ -126,6 +128,7 @@ async function main() {
     store,
     runtime,
     analysisStore,
+    citationGateStore,
     getLinearClient,
     deliveryProcessor,
     linearOutboxProcessor,
