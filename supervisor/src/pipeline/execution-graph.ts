@@ -280,6 +280,9 @@ function unitPhaseLoop(
   if (loop.input_scope !== "unit") {
     fail(`graph.loops.${loop.id}.input_scope`, "for_each_unit phases require unit input scope");
   }
+  if (loop.max_parallel !== 1) {
+    fail(`graph.loops.${loop.id}.max_parallel`, "for_each_unit phases do not support parallel loop actions yet");
+  }
   if (phase.kind === "agent" && loop.receipt !== "unit_completion") {
     fail(`graph.loops.${loop.id}.receipt`, "for_each_unit agent phases require unit_completion receipts");
   }

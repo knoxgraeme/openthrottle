@@ -13,7 +13,13 @@ import {
   type UnitCompletionReceipt,
   type UnitDecisionReceipt,
 } from "@openthrottle/contracts";
-import { canonicalJson, digestNormalized, stageById, type StageOutcome } from "../pipeline/manifest.js";
+import {
+  canonicalJson,
+  digestNormalized,
+  stageById,
+  type PipelineUnitPhaseBinding,
+  type StageOutcome,
+} from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "../pipeline/coordinator.js";
 import {
@@ -86,7 +92,15 @@ type StructuredChildRuntimeDeps = {
 
 type LoopDispatchBinding = {
   kind: "agent" | "gate";
-  loop: { skill: string; timeout_seconds?: number };
+  loop: {
+    id: string;
+    skill: string;
+    input_scope: "unit";
+    receipt: string;
+    max_parallel: number;
+    max_rounds: number;
+    timeout_seconds: number;
+  };
   worker: {
     id: string;
     agent?: "inherit" | "claude" | "codex" | "opencode";
@@ -159,8 +173,13 @@ function builtinLoopBinding(input: {
       allowed_mcp_servers: [],
     },
     loop: {
+      id: input.skill,
       skill: input.skill,
-      timeout_seconds: undefined,
+      input_scope: "unit" as const,
+      receipt: input.kind === "gate" ? "unit_decision" : "unit_completion",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 86_400,
     },
     credentials: input.credentials,
     context: input.context ?? "fresh",
@@ -201,6 +220,11 @@ function configuredCommandNamesFor(instance: PipelineInstance, store: PipelineSt
 
 function uniqueInOrder(values: readonly string[]): string[] {
   return [...new Set(values)];
+}
+
+function authoredImplementMaxRounds(bindings: readonly PipelineUnitPhaseBinding[] | undefined): number | undefined {
+  const binding = bindings?.find((candidate) => candidate.id === "implement" && candidate.kind === "agent");
+  return binding?.kind === "agent" ? binding.loop.max_rounds : undefined;
 }
 
 function commandPlanForUnits(input: {
@@ -1305,6 +1329,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         commandNames: commandPlan.graphCommandNames,
         unitPhases: stage.unitPhases,
         unitPhaseBindings: stage.unitPhaseBindings,
+        maxRepairRounds: authoredImplementMaxRounds(stage.unitPhaseBindings),
       });
     },
 

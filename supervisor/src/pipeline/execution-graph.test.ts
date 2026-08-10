@@ -467,6 +467,32 @@ describe("execution graph compiler", () => {
     });
   });
 
+  it("preserves authored structured loop execution settings in unit phase bindings", () => {
+    const compiled = validateAndCompileExecutionGraph(minimalUnitGraph({
+      loop: { max_rounds: 7, timeout_seconds: 123 },
+      leadLoop: { max_rounds: 2, timeout_seconds: 45 },
+    }));
+
+    expect(compiled.manifest.manifest.stages[0]?.unitPhaseBindings?.[0]).toMatchObject({
+      id: "implement",
+      loop: {
+        input_scope: "unit",
+        max_parallel: 1,
+        max_rounds: 7,
+        timeout_seconds: 123,
+      },
+    });
+    expect(compiled.manifest.manifest.stages[0]?.unitPhaseBindings?.[2]).toMatchObject({
+      id: "lead",
+      loop: {
+        input_scope: "unit",
+        max_parallel: 1,
+        max_rounds: 2,
+        timeout_seconds: 45,
+      },
+    });
+  });
+
   it("rejects gate phases whose worker requests write credentials", () => {
     expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
       leadWorker: { credentials: ["model.invoke", "repo.read", "repo.write"] },
@@ -633,6 +659,11 @@ describe("execution graph compiler", () => {
         },
       }),
       /graph\.loops\.loop\.input_scope: for_each_unit phases require unit input scope/,
+    ],
+    [
+      "parallel for_each_unit loops",
+      minimalUnitGraph({ loop: { max_parallel: 2 } }),
+      /graph\.loops\[0\]\.max_parallel: must be an integer between 1 and 1/,
     ],
     [
       "human nodes",
