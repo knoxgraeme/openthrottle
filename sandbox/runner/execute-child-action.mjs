@@ -64,6 +64,14 @@ function validateRequest(value) {
   if (value.actionKind === "integrate" && !value.candidateSubject) {
     throw new Error("child executor integration action requires a candidate subject");
   }
+  if (value.actionKind === "integrate") {
+    if (!value.integrationRatchet || typeof value.integrationRatchet !== "object" || Array.isArray(value.integrationRatchet)) {
+      throw new Error("child executor integration action requires ratchet evidence");
+    }
+    if (value.integrationRatchet.schema !== "openthrottle.integration-ratchet-input/v1") {
+      throw new Error("child executor integration ratchet evidence schema is invalid");
+    }
+  }
   return value;
 }
 
@@ -156,6 +164,7 @@ function candidateEvidence(request, candidate) {
 function integrationEvidence(request, evidence) {
   return [
     `executor:integration:${request.actionId}:${evidence.integrated_head}:${evidence.tree}:${digest(canonicalJson(evidence.changed_paths ?? []))}`,
+    canonicalJson(request.integrationRatchet),
   ];
 }
 

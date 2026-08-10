@@ -8,6 +8,8 @@ import {
   type CommandResultReceipt,
   type ExecutionPlanContract,
   type IntegrationEvidenceReceipt,
+  type RatchetDecision,
+  type RatchetDifferentialInput,
   type SemanticReviewReceipt,
   type StandardReceipt,
   type UnitCompletionReceipt,
@@ -46,6 +48,7 @@ import {
   evaluateIntegrationGate,
   evaluateUnitAcceptanceGate,
   type ExpectedReceiptProducer,
+  type IntegrationRatchetEvidence,
   type ReceiptProducerRole,
   type StandardReceiptFence,
 } from "../pipeline/execution-gates.js";
@@ -62,6 +65,7 @@ const GIT_SHA1_SUBJECT = /^[a-f0-9]{40}$/;
 // Head slice for a non-success diagnostic stored as lastError -- fits inside
 // the 2,000-char budget the store applies (unit-store.ts) with room to spare.
 const DIAGNOSTIC_TEXT_HEAD_CHARS = 1_500;
+const INTEGRATION_RATCHET_INPUT_SCHEMA = "openthrottle.integration-ratchet-input/v1";
 const ACTION_OUTPUT_ORDER: Record<UnitActionKind, number> = {
   implement: 10,
   repair: 10,
@@ -77,6 +81,53 @@ const ACTION_OUTPUT_ORDER: Record<UnitActionKind, number> = {
   stop: 40,
   cleanup: 40,
 };
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function parseIntegrationRatchetEvidence(receipt: IntegrationEvidenceReceipt): IntegrationRatchetEvidence | null {
+  for (const entry of receipt.evidence) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(entry) as unknown;
+    } catch {
+      continue;
+    }
+    const input = recordValue(parsed);
+    if (!input || input.schema !== INTEGRATION_RATCHET_INPUT_SCHEMA) continue;
+    const citationGate = recordValue(input.citation_gate);
+    const differentialRatchet = recordValue(input.differential_ratchet);
+    if (!citationGate || !differentialRatchet) return null;
+    return {
+      citationGate: {
+        hash: citationGate.hash as string,
+        proposalHash: citationGate.proposal_hash as string,
+        gradeHash: citationGate.grade_hash as string,
+        result: citationGate.result as IntegrationRatchetEvidence["citationGate"]["result"],
+        outcome: citationGate.outcome as IntegrationRatchetEvidence["citationGate"]["outcome"],
+        reason: citationGate.reason as string,
+        sourceDigests: citationGate.source_digests as string[],
+      },
+      differentialRatchet: {
+        input: differentialRatchet.input as RatchetDifferentialInput,
+        decision: differentialRatchet.decision as RatchetDecision,
+      },
+    };
+  }
+  return null;
+}
+
+function integrationRatchetPayload(action: ExecutionWorkAttempt): ChildExecutorActionRequest["integrationRatchet"] | undefined {
+  if (action.action_kind !== "integrate") return undefined;
+  const payload = recordValue(JSON.parse(action.payload) as unknown);
+  const ratchet = payload?.integration_ratchet ?? payload?.integrationRatchet;
+  const input = recordValue(ratchet);
+  if (!input || input.schema !== INTEGRATION_RATCHET_INPUT_SCHEMA) return undefined;
+  return input as ChildExecutorActionRequest["integrationRatchet"];
+}
 
 type StructuredChildRuntimeDeps = {
   store: PipelineStore & ExecutionUnitStore;
@@ -936,6 +987,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         baseSubject,
         inputSubject: actionInputSubjectFor(instance, action),
         ...(integrationCandidateSubject ? { candidateSubject: integrationCandidateSubject } : {}),
+        ...(integrationRatchetPayload(action) ? { integrationRatchet: integrationRatchetPayload(action) } : {}),
       });
       deps.store.prepareActionDispatch?.({
         actionId: action.id,
@@ -1247,6 +1299,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         const decision = evaluateIntegrationGate({
           expected: standardFenceFor(instance, action, integrationSubject),
           integration: receipt as IntegrationEvidenceReceipt,
+          ratchet: parseIntegrationRatchetEvidence(receipt as IntegrationEvidenceReceipt),
         });
         return collected(integrationSubject, receipt, decision);
       }

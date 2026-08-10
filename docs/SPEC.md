@@ -792,6 +792,15 @@ transition, reducer, and effect-drain code must not import the analysis store
 to recreate this evidence, and must not treat citation receipts as authority to
 advance pipeline execution.
 
+Differential ratchets compose the citation decision with pinned-baseline policy
+inputs before integration is accepted. Executor integration requests must carry
+schema-bound ratchet evidence before mutating the integration checkout; the
+supervisor recomputes the differential ratchet from the sealed input and
+rejects mismatched input or decision hashes instead of trusting executor-authored
+`accept` claims. Human-only locks are authority records only: they can approve a
+bounded proposal hash, but cannot widen sandbox credentials, repository command
+or MCP scope, immutable skill policy, or bypass the composed ratchet.
+
 Stage C child-unit work must add any needed live binding state to the owning
 unit/work records rather than reviving empty historical binding tables.
 For the serial `for_each_unit` composite stage, `execution_graphs` binds one

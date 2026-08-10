@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  decideDifferentialRatchet,
+  type RatchetDifferentialInput,
+} from "@openthrottle/contracts";
+import {
   evaluateFinalReviewGate,
   evaluateIntegrationGate,
   evaluateUnitAcceptanceGate,
+  type IntegrationRatchetEvidence,
   type StandardReceiptFence,
 } from "./execution-gates.js";
 import { canonicalJson, digestNormalized } from "./manifest.js";
@@ -65,6 +70,52 @@ const expected: StandardReceiptFence = {
     },
   },
 };
+
+function ratchetInput(): RatchetDifferentialInput {
+  return {
+    schema: "openthrottle.ratchet-contract/v1",
+    id: "ope_114_differential_ratchet",
+    pinned: [{
+      id: "unit_receipt",
+      kind: "standard_receipt",
+      artifact_digest: "a".repeat(64),
+      provenance_digest: "b".repeat(64),
+    }],
+    proposed: [{
+      id: "unit_receipt",
+      kind: "standard_receipt",
+      artifact_digest: "a".repeat(64),
+      provenance_digest: "b".repeat(64),
+    }],
+    human_authority: {
+      actor_id: "linear-user-1",
+      approval_digest: "c".repeat(64),
+    },
+    tuner_authority: {
+      tuner_id: "structured_tuner",
+      proposal_digest: "d".repeat(64),
+      model_digest: "e".repeat(64),
+    },
+  };
+}
+
+function acceptedRatchet(input: RatchetDifferentialInput = ratchetInput()): IntegrationRatchetEvidence {
+  return {
+    citationGate: {
+      hash: "2".repeat(64),
+      proposalHash: "3".repeat(64),
+      gradeHash: "4".repeat(64),
+      result: "passed",
+      outcome: "success",
+      reason: "all_citations_reproduced",
+      sourceDigests: ["5".repeat(64)],
+    },
+    differentialRatchet: {
+      input,
+      decision: decideDifferentialRatchet(input),
+    },
+  };
+}
 
 function receipt(type: string, result: string, overrides: Record<string, unknown> = {}) {
   return {
@@ -274,6 +325,7 @@ describe("structured execution gates", () => {
     expect(evaluateIntegrationGate({
       expected,
       integration: receipt("integration_evidence", "success") as never,
+      ratchet: acceptedRatchet(),
     })).toMatchObject({ outcome: "success", reason: "executor_integrated_candidate" });
 
     expect(() => evaluateFinalReviewGate({
@@ -489,6 +541,7 @@ describe("structured execution gates", () => {
     expect(() => evaluateIntegrationGate({
       expected,
       integration: receipt("integration_evidence", "success", { producer: impersonator }) as never,
+      ratchet: acceptedRatchet(),
     })).toThrow(/integration receipt producer mismatch/);
 
     const reviewCommand = command("success", 0);
@@ -599,8 +652,8 @@ describe("structured execution gates", () => {
   });
 
   it("evaluates identically for an exact receipt replay and rejects a conflicting replay", () => {
-    const first = evaluateIntegrationGate({ expected, integration: receipt("integration_evidence", "success") as never });
-    const second = evaluateIntegrationGate({ expected, integration: receipt("integration_evidence", "success") as never });
+    const first = evaluateIntegrationGate({ expected, integration: receipt("integration_evidence", "success") as never, ratchet: acceptedRatchet() });
+    const second = evaluateIntegrationGate({ expected, integration: receipt("integration_evidence", "success") as never, ratchet: acceptedRatchet() });
     expect(second).toEqual(first);
 
     expect(() => evaluateIntegrationGate({
@@ -608,6 +661,58 @@ describe("structured execution gates", () => {
       integration: receipt("integration_evidence", "success", {
         subject: { base: "0".repeat(40), pre: "0".repeat(40), post: "9".repeat(40) },
       }) as never,
+      ratchet: acceptedRatchet(),
     })).toThrow(/integration receipt subject mismatch/);
+  });
+
+  it("rejects integration when the composed ratchet is missing, rejected, or forged", () => {
+    expect(evaluateIntegrationGate({
+      expected,
+      integration: receipt("integration_evidence", "success") as never,
+      ratchet: null,
+    })).toMatchObject({
+      outcome: "failure",
+      result: "failed",
+      reason: "integration_evidence_failed",
+    });
+
+    const rejectedInput = ratchetInput();
+    rejectedInput.proposed[0]!.artifact_digest = "f".repeat(64);
+    const rejectedDecision = evaluateIntegrationGate({
+      expected,
+      integration: receipt("integration_evidence", "success") as never,
+      ratchet: acceptedRatchet(rejectedInput),
+    });
+    expect(rejectedDecision).toMatchObject({
+      outcome: "failure",
+      result: "failed",
+      reason: "integration_evidence_failed",
+    });
+    expect(JSON.parse(rejectedDecision.payload)).toMatchObject({
+      ratchet_journal: {
+        result: "failed",
+        reasons: ["ratchet:artifact_digest_changed"],
+      },
+    });
+
+    const forged = acceptedRatchet();
+    const mismatchedInput = ratchetInput();
+    mismatchedInput.proposed[0]!.artifact_digest = "f".repeat(64);
+    forged.differentialRatchet.input = mismatchedInput;
+    const forgedDecision = evaluateIntegrationGate({
+      expected,
+      integration: receipt("integration_evidence", "success") as never,
+      ratchet: forged,
+    });
+    expect(JSON.parse(forgedDecision.payload)).toMatchObject({
+      ratchet_journal: {
+        result: "failed",
+        reasons: [
+          "differential_ratchet_input_mismatch",
+          "differential_ratchet_decision_mismatch",
+          "ratchet:artifact_digest_changed",
+        ],
+      },
+    });
   });
 });

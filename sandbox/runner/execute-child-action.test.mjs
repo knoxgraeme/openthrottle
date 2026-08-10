@@ -50,6 +50,57 @@ function childExecutorRequest(overrides = {}) {
   };
 }
 
+function integrationRatchet(overrides = {}) {
+  const input = {
+    schema: "openthrottle.ratchet-contract/v1",
+    id: "ope_114_differential_ratchet",
+    pinned: [{
+      id: "unit_receipt",
+      kind: "standard_receipt",
+      artifact_digest: "a".repeat(64),
+      provenance_digest: "b".repeat(64),
+    }],
+    proposed: [{
+      id: "unit_receipt",
+      kind: "standard_receipt",
+      artifact_digest: "a".repeat(64),
+      provenance_digest: "b".repeat(64),
+    }],
+    human_authority: {
+      actor_id: "linear-user-1",
+      approval_digest: "c".repeat(64),
+    },
+    tuner_authority: {
+      tuner_id: "structured_tuner",
+      proposal_digest: "d".repeat(64),
+      model_digest: "e".repeat(64),
+    },
+  };
+  return {
+    schema: "openthrottle.integration-ratchet-input/v1",
+    citation_gate: {
+      hash: "1".repeat(64),
+      proposal_hash: "2".repeat(64),
+      grade_hash: "3".repeat(64),
+      result: "passed",
+      outcome: "success",
+      reason: "all_citations_reproduced",
+      source_digests: ["4".repeat(64)],
+    },
+    differential_ratchet: {
+      input,
+      decision: {
+        schema: "openthrottle.ratchet-decision/v1",
+        input_digest: "5".repeat(64),
+        outcome: "accept",
+        reject_reasons: [],
+        differences: [],
+      },
+    },
+    ...overrides,
+  };
+}
+
 function useRepositoryConfig(commands, extra = {}) {
   const configDir = mkdtempSync(join(tmpdir(), "ot-child-action-config-"));
   directories.push(configDir);
@@ -119,8 +170,18 @@ describe("child executor action", () => {
       actionKind: "integrate",
       commandName: undefined,
       worktree: null,
+      integrationRatchet: integrationRatchet(),
     });
     expect(() => executeChildAction({ request: missingIntegrationCandidate })).toThrow(/integration action requires a candidate subject/);
+
+    const missingIntegrationRatchet = childExecutorRequest({
+      actionId: "action-integrate-missing-ratchet",
+      actionKind: "integrate",
+      commandName: undefined,
+      worktree: null,
+      candidateSubject: "3".repeat(40),
+    });
+    expect(() => executeChildAction({ request: missingIntegrationRatchet })).toThrow(/integration action requires ratchet evidence/);
   });
 
   it("fails closed instead of truncating unsupported child git operation subjects", () => {
@@ -144,6 +205,7 @@ describe("child executor action", () => {
       baseSubject: "1".repeat(64),
       inputSubject: "2".repeat(64),
       candidateSubject: "3".repeat(64),
+      integrationRatchet: integrationRatchet(),
     });
     expect(() => executeChildAction({ request: integrate })).toThrow(/inputSubject must be a 40-character Git object ID/);
 
@@ -153,6 +215,7 @@ describe("child executor action", () => {
       commandName: undefined,
       worktree: null,
       candidateSubject: "3".repeat(64),
+      integrationRatchet: integrationRatchet(),
     });
     expect(() => executeChildAction({ request: invalidCandidate })).toThrow(/candidateSubject must be a 40-character Git object ID/);
   });

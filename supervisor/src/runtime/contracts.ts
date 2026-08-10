@@ -16,7 +16,12 @@ import {
   type StageRequestEnvelope,
 } from "../pipeline/stage-request.js";
 import type { RepositorySkillPackage } from "../pipeline/manifest.js";
-import { LOGICAL_CREDENTIALS, type LogicalCredential } from "@openthrottle/contracts";
+import {
+  LOGICAL_CREDENTIALS,
+  type LogicalCredential,
+  type RatchetDecision,
+  type RatchetDifferentialInput,
+} from "@openthrottle/contracts";
 
 // The closed logical-scope set a loop action may declare (contracts/src/graph.ts
 // LOGICAL_CREDENTIALS). Enforced again here at the runtime boundary so a loop
@@ -151,6 +156,22 @@ export interface ChildExecutorActionRequest {
   baseSubject: string;
   inputSubject: string;
   candidateSubject?: string;
+  integrationRatchet?: {
+    schema: "openthrottle.integration-ratchet-input/v1";
+    citation_gate: {
+      hash: string;
+      proposal_hash: string;
+      grade_hash: string;
+      result: "passed" | "failed";
+      outcome: StageOutcome;
+      reason: string;
+      source_digests: readonly string[];
+    };
+    differential_ratchet: {
+      input: RatchetDifferentialInput;
+      decision: RatchetDecision;
+    };
+  };
   requestHash: string;
   idempotencyKey: string;
 }
