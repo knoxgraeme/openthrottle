@@ -5,6 +5,7 @@ import {
   IDENTIFIER,
   SHA256,
   arrayAt,
+  booleanAt,
   enumAt,
   fail,
   normalizedContract,
@@ -42,6 +43,10 @@ export const RATCHET_REJECTION_REASONS = [
   "mcp_scope_expanded",
   "gate_weakened",
   "resource_limit_increased",
+  "skill_locked",
+  "skill_immutable_changed",
+  "skill_bounds_exceeded",
+  "skill_forbidden_token",
   "unknown_policy_change",
   "incomparable_policy_change",
 ] as const;
@@ -64,6 +69,17 @@ export interface RatchetTunerAuthority {
   model_digest: string;
 }
 
+export interface RatchetRepositorySkillPackageFile {
+  path: string;
+  content: string;
+}
+
+export interface RatchetRepositorySkillPackage {
+  id: string;
+  tunable: boolean;
+  files: RatchetRepositorySkillPackageFile[];
+}
+
 export interface RatchetDifferentialInput {
   schema: typeof RATCHET_CONTRACT_SCHEMA;
   id: string;
@@ -73,6 +89,8 @@ export interface RatchetDifferentialInput {
   proposed_config?: RepositoryConfigContract;
   pinned_graph?: GraphContract;
   proposed_graph?: GraphContract;
+  pinned_repository_skills?: RatchetRepositorySkillPackage[];
+  proposed_repository_skills?: RatchetRepositorySkillPackage[];
   human_authority: RatchetHumanAuthority | null;
   tuner_authority: RatchetTunerAuthority | null;
 }
@@ -115,6 +133,16 @@ function pushDifference(
 
 function sameCanonical(left: unknown, right: unknown): boolean {
   return canonicalJson(left) === canonicalJson(right);
+}
+
+function uniqueDifference(
+  differences: RatchetDifference[],
+  reason: RatchetRejectionReason,
+  path: string
+): void {
+  if (!differences.some((difference) => difference.reason === reason && difference.path === path)) {
+    pushDifference(differences, reason, path);
+  }
 }
 
 function activeMcpServers(config: RepositoryConfigContract): Map<string, unknown> {
@@ -188,6 +216,141 @@ function compareRepositoryConfigPolicy(
     }
     if (!sameCanonical(server, pinnedServer)) {
       pushDifference(differences, "incomparable_policy_change", `config.mcp_servers.${name}`);
+    }
+  }
+}
+
+const SKILL_FILE_MAX_BYTES = 64 * 1024;
+const SKILL_PACKAGE_MAX_BYTES = 256 * 1024;
+const SKILL_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
+const FRONTMATTER_DELIMITER = "---";
+const CANONICAL_CONTRACT_SCHEMA = /"schema"\s*:\s*"openthrottle\.[^"]+"/;
+const COMMAND_OR_TOOL_ALLOWLIST = /\b(?:command|commands|tool|tools|mcp|allowlist|allowed_mcp_servers)\b/i;
+const CRAFT_SECTION = /^##\s+(?:craft|reference|references|heuristic|heuristics|method|methods)\b/i;
+const FORBIDDEN_SKILL_TOKENS = [
+  /\bce-[a-z][a-z-]*[a-z]\b/,
+  /\brequest_user_input\b/,
+  /\bask\s+(?:the\s+)?user\s+for\s+confirmation\b/i,
+  /\bwait\s+for\s+confirmation\b/i,
+  /\bblocking\s+(?:question|approval)\b/i,
+  /\bread\s+-p\b/,
+  /\bselect\s+[A-Za-z_][A-Za-z0-9_]*\s+in\b/,
+  /\binquirer\b/i,
+  /\bprompt\s*\(/i,
+];
+
+function skillFrontmatter(raw: string): string {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  if (lines[0] !== FRONTMATTER_DELIMITER) fail("repository_skills.SKILL.md", "is missing frontmatter");
+  const end = lines.indexOf(FRONTMATTER_DELIMITER, 1);
+  if (end === -1) fail("repository_skills.SKILL.md", "frontmatter is unterminated");
+  return lines.slice(0, end + 1).join("\n");
+}
+
+function canonicalContractBlocks(raw: string): string[] {
+  const blocks: string[] = [];
+  const fence = /```(?:json)?\n([\s\S]*?)```/g;
+  for (const match of raw.matchAll(fence)) {
+    const body = match[1]!.trim();
+    if (CANONICAL_CONTRACT_SCHEMA.test(body)) blocks.push(body);
+  }
+  return blocks;
+}
+
+function immutableSkillLines(raw: string): string[] {
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  const immutable: string[] = [];
+  let currentCraftSection = false;
+  for (const line of lines) {
+    if (line.startsWith("## ")) currentCraftSection = CRAFT_SECTION.test(line);
+    if (!currentCraftSection || COMMAND_OR_TOOL_ALLOWLIST.test(line)) immutable.push(line);
+  }
+  return immutable;
+}
+
+function compareSkillMdImmutableContent(
+  pinned: string,
+  proposed: string,
+  path: string,
+  differences: RatchetDifference[]
+): void {
+  if (skillFrontmatter(pinned) !== skillFrontmatter(proposed)) {
+    pushDifference(differences, "skill_immutable_changed", `${path}.frontmatter`);
+  }
+  if (!sameCanonical(canonicalContractBlocks(pinned), canonicalContractBlocks(proposed))) {
+    pushDifference(differences, "skill_immutable_changed", `${path}.canonical_contract_blocks`);
+  }
+  if (!sameCanonical(immutableSkillLines(pinned), immutableSkillLines(proposed))) {
+    pushDifference(differences, "skill_immutable_changed", `${path}.immutable_sections`);
+  }
+}
+
+function isSkillMd(path: string): boolean {
+  return path.endsWith("/SKILL.md") || path === "SKILL.md";
+}
+
+function isReferenceFile(path: string): boolean {
+  return path.includes("/references/") || path.startsWith("references/");
+}
+
+function compareRepositorySkillPackages(
+  pinned: RatchetRepositorySkillPackage[],
+  proposed: RatchetRepositorySkillPackage[],
+  differences: RatchetDifference[]
+): void {
+  const pinnedById = new Map(pinned.map((skill) => [skill.id, skill]));
+  const proposedById = new Map(proposed.map((skill) => [skill.id, skill]));
+  for (const pinnedSkill of pinned) {
+    const proposedSkill = proposedById.get(pinnedSkill.id);
+    if (!proposedSkill) {
+      pushDifference(differences, "skill_immutable_changed", `repository_skills.${pinnedSkill.id}`);
+      continue;
+    }
+    const basePath = `repository_skills.${pinnedSkill.id}`;
+    if (pinnedSkill.tunable !== proposedSkill.tunable) {
+      pushDifference(differences, "skill_immutable_changed", `${basePath}.tunable`);
+    }
+    if (!pinnedSkill.tunable && !sameCanonical(pinnedSkill, proposedSkill)) {
+      pushDifference(differences, "skill_locked", basePath);
+      continue;
+    }
+    const proposedFiles = new Map(proposedSkill.files.map((file) => [file.path, file.content]));
+    for (const pinnedFile of pinnedSkill.files) {
+      const proposedContent = proposedFiles.get(pinnedFile.path);
+      if (proposedContent === undefined) {
+        pushDifference(differences, "skill_immutable_changed", `${basePath}.files.${pinnedFile.path}`);
+        continue;
+      }
+      if (isSkillMd(pinnedFile.path)) {
+        compareSkillMdImmutableContent(pinnedFile.content, proposedContent, `${basePath}.SKILL.md`, differences);
+      } else if (!isReferenceFile(pinnedFile.path) && pinnedFile.content !== proposedContent) {
+        pushDifference(differences, "skill_immutable_changed", `${basePath}.files.${pinnedFile.path}`);
+      }
+    }
+  }
+  for (const proposedSkill of proposed) {
+    const pinnedSkill = pinnedById.get(proposedSkill.id);
+    if (!pinnedSkill) {
+      pushDifference(differences, "skill_immutable_changed", `repository_skills.${proposedSkill.id}`);
+    }
+    const pinnedPaths = new Set(pinnedSkill?.files.map((file) => file.path) ?? []);
+    for (const file of proposedSkill.files) {
+      const path = `repository_skills.${proposedSkill.id}.files.${file.path}`;
+      if (!pinnedPaths.has(file.path) && !isReferenceFile(file.path)) {
+        pushDifference(differences, "skill_immutable_changed", path);
+      }
+      if (Buffer.byteLength(file.content, "utf8") > SKILL_FILE_MAX_BYTES) {
+        pushDifference(differences, "skill_bounds_exceeded", path);
+      }
+      for (const token of FORBIDDEN_SKILL_TOKENS) {
+        if (token.test(file.content)) uniqueDifference(differences, "skill_forbidden_token", path);
+      }
+    }
+    const packageBytes = proposedSkill.files.reduce((sum, file) => sum + Buffer.byteLength(file.content, "utf8"), 0);
+    if (packageBytes > SKILL_PACKAGE_MAX_BYTES) {
+      pushDifference(differences, "skill_bounds_exceeded", `repository_skills.${proposedSkill.id}`);
     }
   }
 }
@@ -319,6 +482,36 @@ function parseArtifactList(value: unknown, path: string): RatchetArtifactDigest[
   return artifacts;
 }
 
+function parseRepositorySkillPackageFile(value: unknown, path: string): RatchetRepositorySkillPackageFile {
+  const input = objectAt(value, path, ["path", "content"]);
+  return {
+    path: stringAt(input.path, `${path}.path`, { max: 320, pattern: SKILL_PATH }),
+    content: stringAt(input.content, `${path}.content`, { max: SKILL_PACKAGE_MAX_BYTES }),
+  };
+}
+
+function parseRepositorySkillPackage(value: unknown, path: string): RatchetRepositorySkillPackage {
+  const input = objectAt(value, path, ["id", "tunable", "files"]);
+  const skill: RatchetRepositorySkillPackage = {
+    id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
+    tunable: booleanAt(input.tunable, `${path}.tunable`),
+    files: arrayAt(input.files, `${path}.files`, parseRepositorySkillPackageFile, { min: 1, max: 64 }),
+  };
+  unique(skill.files.map((file) => file.path), `${path}.files.path`);
+  if (!skill.files.some((file) => isSkillMd(file.path))) {
+    fail(`${path}.files`, "must include SKILL.md");
+  }
+  const packageBytes = skill.files.reduce((sum, file) => sum + Buffer.byteLength(file.content, "utf8"), 0);
+  if (packageBytes > SKILL_PACKAGE_MAX_BYTES) fail(path, `must contain at most ${SKILL_PACKAGE_MAX_BYTES} UTF-8 bytes`);
+  return skill;
+}
+
+function parseRepositorySkillPackageList(value: unknown, path: string): RatchetRepositorySkillPackage[] {
+  const skills = arrayAt(value, path, parseRepositorySkillPackage, { max: 32 });
+  unique(skills.map((skill) => skill.id), path);
+  return skills;
+}
+
 export function validateRatchetDifferentialInput(
   value: unknown,
   options: { source?: string } = {}
@@ -326,7 +519,7 @@ export function validateRatchetDifferentialInput(
   const source = options.source ?? "ratchet_contract";
   const input = objectAt(value, source, [
     "schema", "id", "pinned", "proposed", "pinned_config", "proposed_config", "pinned_graph", "proposed_graph",
-    "human_authority", "tuner_authority",
+    "pinned_repository_skills", "proposed_repository_skills", "human_authority", "tuner_authority",
   ]);
   if (input.schema !== RATCHET_CONTRACT_SCHEMA) fail(`${source}.schema`, `must be ${RATCHET_CONTRACT_SCHEMA}`);
   const pinnedConfig = parseOptionalConfig(input.pinned_config, `${source}.pinned_config`);
@@ -349,6 +542,18 @@ export function validateRatchetDifferentialInput(
         source: `${source}.proposed_graph`,
         config: proposedConfig,
       }).value,
+    }),
+    ...(input.pinned_repository_skills === undefined ? {} : {
+      pinned_repository_skills: parseRepositorySkillPackageList(
+        input.pinned_repository_skills,
+        `${source}.pinned_repository_skills`
+      ),
+    }),
+    ...(input.proposed_repository_skills === undefined ? {} : {
+      proposed_repository_skills: parseRepositorySkillPackageList(
+        input.proposed_repository_skills,
+        `${source}.proposed_repository_skills`
+      ),
     }),
     human_authority: input.human_authority === null
       ? null
@@ -410,6 +615,15 @@ export function decideDifferentialRatchet(input: RatchetDifferentialInput): Ratc
     pushDifference(differences, "unknown_policy_change", "graph");
   } else if (contract.pinned_graph && contract.proposed_graph) {
     compareGraphPolicy(contract.pinned_graph, contract.proposed_graph, differences);
+  }
+  if (Boolean(contract.pinned_repository_skills) !== Boolean(contract.proposed_repository_skills)) {
+    pushDifference(differences, "skill_immutable_changed", "repository_skills");
+  } else if (contract.pinned_repository_skills && contract.proposed_repository_skills) {
+    compareRepositorySkillPackages(
+      contract.pinned_repository_skills,
+      contract.proposed_repository_skills,
+      differences
+    );
   }
 
   const reject_reasons = [...new Set(differences.map((difference) => difference.reason))];

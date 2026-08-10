@@ -469,9 +469,9 @@ describe("Stage C contract fixtures", () => {
 
   it("validates repository skill references against config allowlisted directories", () => {
     const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
-      skills?: Array<{ id: string; path: string }>;
+      skills?: Array<{ id: string; path: string; tunable?: boolean }>;
     };
-    config.skills = [{ id: "implement_unit", path: ".openthrottle/skills/implement_unit" }];
+    config.skills = [{ id: "implement_unit", path: ".openthrottle/skills/implement_unit", tunable: false }];
     const parsedConfig = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
     expect(parsedConfig.value.skills).toEqual(config.skills);
 
@@ -505,6 +505,153 @@ describe("Stage C contract fixtures", () => {
     config.skills = [{ id: "bad", path: ".openthrottle/skills/not-bad" }];
     expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
       .toThrow(/config\.skills\[0\]\.path: must be exactly \.openthrottle\/skills\/bad/);
+  });
+
+  it("lets the ratchet accept only craft and reference edits in tunable repository skills", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: [
+          "---",
+          "name: implement_unit",
+          "description: Implements one unit",
+          "---",
+          "# Implement Unit",
+          "## Authority Fence",
+          "Do not commit.",
+          "```json",
+          "{\"schema\":\"openthrottle.receipt/v1\",\"type\":\"unit_completion\"}",
+          "```",
+          "## Craft",
+          "Prefer the smallest correct increment.",
+          "## Command Allowlist",
+          "Allowed commands: test, build.",
+        ].join("\n"),
+      }, {
+        path: ".openthrottle/skills/implement_unit/agents/openai.yaml",
+        content: "tools: [shell]\n",
+      }, {
+        path: ".openthrottle/skills/implement_unit/references/method.md",
+        content: "Original reference guidance.",
+      }],
+    };
+    const proposedSkill = structuredClone(skill);
+    proposedSkill.files[0]!.content = proposedSkill.files[0]!.content.replace(
+      "Prefer the smallest correct increment.",
+      "Prefer focused edits with evidence."
+    );
+    proposedSkill.files[2]!.content = "Updated reference guidance.";
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposedSkill],
+    })).toMatchObject({
+      outcome: "accept",
+      reject_reasons: [],
+      differences: [],
+    });
+  });
+
+  it("rejects locked repository skills and immutable skill policy edits", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: false,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: [
+          "---",
+          "name: implement_unit",
+          "description: Implements one unit",
+          "---",
+          "# Implement Unit",
+          "## Authority Fence",
+          "Do not commit.",
+          "## Craft",
+          "Prefer the smallest correct increment.",
+          "## Command Allowlist",
+          "Allowed commands: test, build.",
+        ].join("\n"),
+      }, {
+        path: ".openthrottle/skills/implement_unit/agents/openai.yaml",
+        content: "tools: [shell]\n",
+      }],
+    };
+    const lockedEdit = structuredClone(skill);
+    lockedEdit.files[0]!.content = lockedEdit.files[0]!.content.replace("increment", "step");
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [lockedEdit],
+    })).toMatchObject({
+      outcome: "reject",
+      reject_reasons: ["skill_locked"],
+      differences: [{ reason: "skill_locked", path: "repository_skills.implement_unit" }],
+    });
+
+    const tunable = { ...skill, tunable: true };
+    const proposed = structuredClone(tunable);
+    proposed.tunable = false;
+    proposed.files[0]!.content = proposed.files[0]!.content
+      .replace("Do not commit.", "Commit when finished.")
+      .replace("Allowed commands: test, build.", "Allowed commands: test.");
+    proposed.files[1]!.content = "tools: [shell, network]\n";
+
+    const decision = decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_repository_skills: [tunable],
+      proposed_repository_skills: [proposed],
+    });
+    expect(decision.outcome).toBe("reject");
+    expect(decision.reject_reasons).toEqual(["skill_immutable_changed"]);
+    expect(decision.differences).toEqual(expect.arrayContaining([
+      { reason: "skill_immutable_changed", path: "repository_skills.implement_unit.tunable" },
+      { reason: "skill_immutable_changed", path: "repository_skills.implement_unit.SKILL.md.immutable_sections" },
+      {
+        reason: "skill_immutable_changed",
+        path: "repository_skills.implement_unit.files..openthrottle/skills/implement_unit/agents/openai.yaml",
+      },
+    ]));
+  });
+
+  it("rejects repository skill edits with forbidden tokens or oversized files", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: "---\nname: implement_unit\n---\n# Implement Unit\n## Craft\nWrite code.\n",
+      }],
+    };
+    const proposed = structuredClone(skill);
+    proposed.files[0]!.content = proposed.files[0]!.content.replace("Write code.", "Call ce-work first.");
+    proposed.files.push({
+      path: ".openthrottle/skills/implement_unit/references/oversized.md",
+      content: "a".repeat(64 * 1024 + 1),
+    });
+
+    const decision = decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposed],
+    });
+    expect(decision.outcome).toBe("reject");
+    expect(decision.reject_reasons).toEqual(expect.arrayContaining([
+      "skill_bounds_exceeded",
+      "skill_forbidden_token",
+    ]));
   });
 
   it("rejects provider-secret identifiers in config values and headers", () => {

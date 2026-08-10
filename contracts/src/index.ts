@@ -84,6 +84,8 @@ export {
   type RatchetDifference,
   type RatchetDifferentialInput,
   type RatchetHumanAuthority,
+  type RatchetRepositorySkillPackage,
+  type RatchetRepositorySkillPackageFile,
   type RatchetTunerAuthority,
 } from "./ratchet-contract.js";
 export {
