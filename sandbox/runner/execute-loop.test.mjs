@@ -349,6 +349,28 @@ describe("loop action request validation", () => {
     expect(validateLoopRequest(legacy)).not.toHaveProperty("parentRunId");
   });
 
+  it("accepts deterministic path-safe selector, persona, and validator review action ids", () => {
+    const parentActionId = `execution-work-${"a".repeat(32)}`;
+    for (const [subactionId, skill] of [
+      ["selector", "select-review-personas"],
+      ["correctness-dataflow", "correctness-dataflow"],
+      ["validator", "validate-review-findings"],
+    ]) {
+      const actionId = `${parentActionId}.review.${subactionId}`;
+      expect(validateLoopRequest(request({
+        actionId,
+        role: "reviewer",
+        loop: "review",
+        skill,
+        worktree: null,
+        inputSubject: "b".repeat(40),
+        contextPolicy: "fresh",
+        allowedMcpServers: [],
+        credentialScopes: ["model.invoke", "repo.read"],
+      }))).toMatchObject({ actionId, role: "reviewer", loop: "review", skill });
+    }
+  });
+
   it("accepts graph-declared producer skill fences separately from adapter invocation", () => {
     const valid = request({ expectedProducerSkill: "builtin://ce/implement@1" });
     const producer = {

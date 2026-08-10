@@ -1783,10 +1783,10 @@ describe("execution unit store", () => {
     store.markActionDispatched(finalReview.id, "parent-request-hash", null);
 
     const subactions = [
-      `${finalReview.id}:review:selector`,
-      `${finalReview.id}:review:correctness-dataflow`,
-      `${finalReview.id}:review:tests-contracts`,
-      `${finalReview.id}:review:validator`,
+      `${finalReview.id}.review.selector`,
+      `${finalReview.id}.review.correctness-dataflow`,
+      `${finalReview.id}.review.tests-contracts`,
+      `${finalReview.id}.review.validator`,
     ];
     for (const [index, actionId] of subactions.entries()) {
       store.prepareReviewSubactionDispatch({
@@ -1806,7 +1806,7 @@ describe("execution unit store", () => {
     })).toBe(false);
     expect(store.renewChildActionLiveness({
       parentRunId: "run-parent",
-      actionId: `${finalReview.id}:review:unknown`,
+      actionId: `${finalReview.id}.review.unknown`,
       heartbeatAtIso: "2026-07-29T00:01:05.000Z",
       leaseUntilIso: "2026-07-29T00:02:05.000Z",
     })).toBe(false);
@@ -1858,8 +1858,8 @@ describe("execution unit store", () => {
     completeUnitToTerminal(store, subject);
     const finalReview = lease(store);
     store.markActionDispatched(finalReview.id, "parent-request-hash", null);
-    const acknowledgedId = `${finalReview.id}:review:correctness-dataflow`;
-    const fallbackId = `${finalReview.id}:review:tests-contracts`;
+    const acknowledgedId = `${finalReview.id}.review.correctness-dataflow`;
+    const fallbackId = `${finalReview.id}.review.tests-contracts`;
 
     store.prepareReviewSubactionDispatch({
       parentActionId: finalReview.id,

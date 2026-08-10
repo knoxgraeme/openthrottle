@@ -848,7 +848,7 @@ describe("structured child runtime review fanout", () => {
               completedAt: "2099-07-22T12:00:00.000Z",
             };
           }
-          const personaId = request.actionId.split(":review:")[1]!;
+          const personaId = request.actionId.split(".review.")[1]!;
           return {
             actionId: request.actionId,
             attemptId: request.attemptId,
@@ -2446,7 +2446,7 @@ describe("structured child runtime repair fences", () => {
     } as any, "parent-attempt");
 
     expect(dispatched).toMatchObject({
-      actionId: "final-review-no-commands:review:selector",
+      actionId: "final-review-no-commands.review.selector",
       role: "reviewer",
       loop: "review",
       timeoutMs: 300_000,
@@ -2751,7 +2751,7 @@ describe("structured child runtime repair fences", () => {
     } as any, "parent-attempt");
 
     expect(dispatched).toMatchObject({
-      actionId: "final-review-cycle-2:review:selector",
+      actionId: "final-review-cycle-2.review.selector",
       role: "reviewer",
       loop: "review",
       priorEvidence: {

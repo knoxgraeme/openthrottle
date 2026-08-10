@@ -34,6 +34,8 @@ export const FINDING_ID_PREFIX = "finding_" as const;
 const FINDING_ID_PATTERN = /^finding_[a-f0-9]{32}$/;
 export const SEMANTIC_GROUP_ID_PREFIX = "semantic_group_" as const;
 const SEMANTIC_GROUP_ID_PATTERN = /^semantic_group_[a-f0-9]{32}$/;
+export const REVIEW_SUBACTION_SEPARATOR = ".review." as const;
+const LOOP_ACTION_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const GENERIC_SEMANTIC_ANCHOR = /^(?:the\s+)?(?:file|module|change|code|logic|implementation|behavior|review|function|method|class|contract|test|tests)$/i;
 const STABLE_CLAIM_DISCRIMINATOR = /^[a-z0-9]+(?:-[a-z0-9]+)+$/;
 const REVIEW_JOURNAL_ENTRY_KINDS = [
@@ -53,6 +55,14 @@ type RepairDisposition = (typeof REPAIR_DISPOSITIONS)[number];
 type ReviewValidatorResult = (typeof REVIEW_VALIDATOR_RESULTS)[number];
 type ReviewResolutionState = (typeof REVIEW_RESOLUTION_STATES)[number];
 type ReviewJournalEntryKind = (typeof REVIEW_JOURNAL_ENTRY_KINDS)[number];
+
+export function deriveReviewSubactionActionId(parentActionId: string, subactionId: string): string {
+  const actionId = `${parentActionId}${REVIEW_SUBACTION_SEPARATOR}${subactionId}`;
+  if (!LOOP_ACTION_PATH_ID.test(actionId)) {
+    throw new Error(`review subaction action id is not path-safe: ${actionId}`);
+  }
+  return actionId;
+}
 
 export interface ReviewPersonaPolicy {
   persona_id: string;
@@ -590,7 +600,7 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
     ...journal.timing_evidence.personas.map((entry) => entry.action_id),
     ...(journal.timing_evidence.validator ? [journal.timing_evidence.validator.action_id] : []),
   ], `${source}.timing_evidence.action_id`);
-  const selectorSuffix = ":review:selector";
+  const selectorSuffix = `${REVIEW_SUBACTION_SEPARATOR}selector`;
   if (!journal.timing_evidence.selector.action_id.endsWith(selectorSuffix)) {
     fail(`${source}.timing_evidence.selector.action_id`, `must end with ${selectorSuffix}`);
   }
@@ -599,16 +609,16 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
     fail(`${source}.timing_evidence.selector.action_id`, "must include the parent review action prefix");
   }
   for (const timing of journal.timing_evidence.personas) {
-    const expectedActionId = `${reviewActionPrefix}:review:${timing.persona_id}`;
+    const expectedActionId = deriveReviewSubactionActionId(reviewActionPrefix, timing.persona_id);
     if (timing.action_id !== expectedActionId) {
       fail(`${source}.timing_evidence.personas.${timing.persona_id}.action_id`, `must be ${expectedActionId}`);
     }
   }
   if (journal.timing_evidence.validator &&
-      journal.timing_evidence.validator.action_id !== `${reviewActionPrefix}:review:validator`) {
+      journal.timing_evidence.validator.action_id !== deriveReviewSubactionActionId(reviewActionPrefix, "validator")) {
     fail(
       `${source}.timing_evidence.validator.action_id`,
-      `must be ${reviewActionPrefix}:review:validator`
+      `must be ${deriveReviewSubactionActionId(reviewActionPrefix, "validator")}`
     );
   }
   if (personaTimings.size !== journal.persona_receipts.length) {

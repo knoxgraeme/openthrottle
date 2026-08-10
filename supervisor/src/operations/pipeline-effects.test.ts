@@ -1196,7 +1196,7 @@ describe("pipeline effect processor", () => {
         const dispatched = runtime.dispatchLoopAction.mock.calls
           .map(([, request]) => request)
           .find((request) => request.actionId === collection.actionId);
-        if (!dispatched?.actionId.startsWith(`${lead.id}:review:`) || !dispatched.expectedProducer) return null;
+        if (!dispatched?.actionId.startsWith(`${lead.id}.review.`) || !dispatched.expectedProducer) return null;
         return {
           actionId: dispatched.actionId,
           attemptId: dispatched.attemptId,

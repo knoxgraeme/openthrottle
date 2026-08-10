@@ -1,5 +1,6 @@
 import {
   EXECUTION_PLAN_SCHEMA,
+  deriveReviewSubactionActionId,
   digestCanonicalJson,
   parseExecutionPlanContract,
   parseStandardReceipt,
@@ -323,15 +324,15 @@ function buildLoopActionRequest(
 }
 
 function fanoutActionId(action: ExecutionWorkAttempt, personaId: string): string {
-  return `${action.id}:review:${personaId}`;
+  return deriveReviewSubactionActionId(action.id, personaId);
 }
 
 function selectorActionId(action: ExecutionWorkAttempt): string {
-  return `${action.id}:review:selector`;
+  return deriveReviewSubactionActionId(action.id, "selector");
 }
 
 function validatorActionId(action: ExecutionWorkAttempt): string {
-  return `${action.id}:review:validator`;
+  return deriveReviewSubactionActionId(action.id, "validator");
 }
 
 function buildChildExecutorActionRequest(
@@ -933,7 +934,6 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     requests: readonly LoopActionRequest[];
   }): Promise<Map<string, LoopActionResult>> => {
     const precollected = new Map<string, LoopActionResult>();
-    const serializeRotatingCodexAuth = input.requests.some((request) => request.agent === "codex");
     for (const request of input.requests) {
       const prepared = await prepareReviewSubaction({
         resource: input.resource,
@@ -942,7 +942,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         label: "review fanout action",
       });
       let result = prepared.result;
-      if (serializeRotatingCodexAuth && !result && !prepared.newlyDispatched) {
+      if (!result && !prepared.newlyDispatched) {
         result = await reviewRuntimeCall(
           `review fanout action ${request.actionId} serialized result collection failed`,
           () => deps.runtime.collectLoopActionResult(input.resource, {
@@ -954,9 +954,9 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       }
       if (result) {
         precollected.set(request.actionId, result);
-        if (serializeRotatingCodexAuth) captureLatestReviewCodexAuth([{ request, result }]);
+        captureLatestReviewCodexAuth([{ request, result }]);
       }
-      if (serializeRotatingCodexAuth && (prepared.newlyDispatched || !result || result.outcome !== "success")) {
+      if (prepared.newlyDispatched || !result || result.outcome !== "success") {
         break;
       }
     }
@@ -1914,10 +1914,11 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         timeoutMs: selectorRequest.timeoutMs,
       });
       for (const request of fanoutRequests) assertLoopRequestEnvelopeBound(request);
-      // Codex subscription auth uses a rotating one-time refresh token. Its
-      // persona actions therefore run one at a time: capture action N's auth
-      // snapshot before materializing credentials for action N+1. Claude and
-      // OpenCode retain the independent parallel fanout path.
+      // Review subactions share one sandbox. The sandbox seals every action by
+      // locking sibling action directories, so overlapping persona processes
+      // would lock one another's active engine homes. Run the deterministic
+      // roster one action at a time; for Codex this also preserves the rotating
+      // auth handoff before action N+1 materializes its credentials.
       const precollectedFanout = await prepareReviewFanout({
         resource,
         action,

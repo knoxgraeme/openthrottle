@@ -11,6 +11,7 @@ import {
   REVIEW_VALIDATION_SCHEMA,
   deriveReviewFindingId,
   deriveReviewSemanticGroupId,
+  deriveReviewSubactionActionId,
   validateReviewJournalContract,
   type ReviewFindingContract,
   type ReviewJournalContract,
@@ -111,7 +112,7 @@ function validJournal(): ReviewJournalContract {
   }];
   const timingEvidence = {
     selector: {
-      action_id: "review-parent:review:selector",
+      action_id: "review-parent.review.selector",
       dispatched_at: "2026-08-10T00:00:01.000Z",
       completed_at: "2026-08-10T00:00:01.020Z",
       dispatch_time_source: "acknowledged" as const,
@@ -119,14 +120,14 @@ function validJournal(): ReviewJournalContract {
     },
     personas: [{
       persona_id: "contract_reviewer",
-      action_id: "review-parent:review:contract_reviewer",
+      action_id: "review-parent.review.contract_reviewer",
       dispatched_at: "2026-08-10T00:00:01.020Z",
       completed_at: "2026-08-10T00:00:01.140Z",
       dispatch_time_source: "acknowledged" as const,
       latency_ms: 120,
     }],
     validator: {
-      action_id: "review-parent:review:validator",
+      action_id: "review-parent.review.validator",
       dispatched_at: "2026-08-10T00:00:01.140Z",
       completed_at: "2026-08-10T00:00:01.180Z",
       dispatch_time_source: "acknowledged" as const,
@@ -198,6 +199,17 @@ function validJournal(): ReviewJournalContract {
 }
 
 describe("review journal contracts", () => {
+  it("derives path-safe review subaction ids and rejects invalid or overlong values", () => {
+    expect(deriveReviewSubactionActionId("execution-work-1", "selector"))
+      .toBe("execution-work-1.review.selector");
+    expect(() => deriveReviewSubactionActionId("execution/work-1", "selector"))
+      .toThrow(/not path-safe/);
+    expect(() => deriveReviewSubactionActionId("execution-work-1", "selector:other"))
+      .toThrow(/not path-safe/);
+    expect(() => deriveReviewSubactionActionId("a".repeat(120), "correctness-dataflow"))
+      .toThrow(/not path-safe/);
+  });
+
   it("accepts a bounded canonical review journal with a sealed roster and semantic finding identity", () => {
     const validated = validateReviewJournalContract(validJournal(), { source: "review" });
 
@@ -452,7 +464,7 @@ describe("review journal contracts", () => {
 
     const wrongPersonaTimingAction = validJournal();
     wrongPersonaTimingAction.timing_evidence.personas[0]!.action_id =
-      "review-parent:review:other-persona";
+      "review-parent.review.other-persona";
     expect(() => validateReviewJournalContract(wrongPersonaTimingAction, { source: "review" }))
       .toThrow(/timing_evidence\.personas\.contract_reviewer\.action_id/);
 
