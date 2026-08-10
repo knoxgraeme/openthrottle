@@ -15,9 +15,9 @@ const investigateGraphPath = fileURLToPath(new URL("../../graphs/investigate-v1.
 const structuredV1GraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
 const structuredV2GraphPath = fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url));
 const SIMPLE_GRAPH_DIGEST = "2f25ae9b891405d0e73e5f3c0f103354183c8cb27ca923cbd06baa6c470b76d1";
-const SIMPLE_MANIFEST_DIGEST = "9b705c003313187cb2f7e219c99e1cbf795d966be0e1d257015462219833ac6a";
+const SIMPLE_MANIFEST_DIGEST = "01bd7ef7b3705f2569698ec5e7fd59f694c8c0406e529916692b012d17e91e1b";
 const INVESTIGATE_GRAPH_DIGEST = "a76d3e1360d92f41bc7aa9ed2372e294555478d5854808bf0c2a5ed7febaf317";
-const INVESTIGATE_MANIFEST_DIGEST = "d159ef720f5dbc7216b8dd502e3961ac30ffb2c4d4ea44a5afdc71a78f84da4e";
+const INVESTIGATE_MANIFEST_DIGEST = "80bb12f5b10d771d65d7235e308c2489b33ff6878a452069cf8c23621dec9329";
 const STRUCTURED_V2_COMPILE_OPTIONS = {
   aggregatePublishContext: "prefer_resume",
 } as const;
@@ -464,6 +464,22 @@ describe("execution graph compiler", () => {
     expect(compiled.unitPhaseBindings[0]).toMatchObject({
       id: "implement",
       repositorySkill: pkg,
+    });
+  });
+
+  it("preserves authored ordinary run loop execution settings on compiled stages", () => {
+    const compiled = validateAndCompileExecutionGraph(minimalGraph({
+      loop: { input_scope: "diff", receipt: "semantic_review", max_rounds: 7, timeout_seconds: 123 },
+    }));
+
+    expect(compiled.manifest.manifest.stages[0]?.loop).toEqual({
+      id: "loop",
+      skill: "builtin://ce/implement@1",
+      input_scope: "diff",
+      receipt: "semantic_review",
+      max_parallel: 1,
+      max_rounds: 7,
+      timeout_seconds: 123,
     });
   });
 

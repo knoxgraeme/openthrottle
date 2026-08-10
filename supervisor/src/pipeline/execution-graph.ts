@@ -21,6 +21,7 @@ import {
   type ExecutorKind,
   type PipelineManifest,
   type PipelineStage,
+  type PipelineStageLoopBinding,
   type PipelineTransition,
   type PipelineUnitPhaseBinding,
   type RepositorySkillPackage,
@@ -63,6 +64,7 @@ export interface CompiledExecutionGraph {
 
 type StageTemplate = {
   executor: { kind: ExecutorKind; capability: string };
+  loop?: PipelineStageLoopBinding;
   repositorySkill?: RepositorySkillPackage;
   evaluator: { kind: EvaluatorKind; assurance: AssuranceClass; required_artifacts: ArtifactKind[] };
   context: ContextPolicy;
@@ -244,6 +246,9 @@ function loopTemplate(
   if (loop.receipt !== "unit_completion" && loop.receipt !== "semantic_review") {
     fail(`graph.loops.${loop.id}.receipt`, "cannot compile this loop receipt yet");
   }
+  if (loop.input_scope !== "graph" && loop.input_scope !== "diff" && loop.input_scope !== "review") {
+    fail(`graph.loops.${loop.id}.input_scope`, "cannot compile this loop input scope for run nodes yet");
+  }
   const { capability, repositorySkill } = capabilityFromSkill(
     loop.skill,
     `graph.loops.${loop.id}.skill`,
@@ -253,6 +258,15 @@ function loopTemplate(
   const liveSteering = capability === "ce/implement@1" || capability === "ce/investigate@1";
   const template: StageTemplate = {
     executor: { kind: "agent", capability },
+    loop: {
+      id: loop.id,
+      skill: loop.skill,
+      input_scope: loop.input_scope,
+      receipt: loop.receipt,
+      max_parallel: loop.max_parallel,
+      max_rounds: loop.max_rounds,
+      timeout_seconds: loop.timeout_seconds,
+    },
     ...(repositorySkill === undefined ? {} : { repositorySkill }),
     evaluator: {
       kind: "semantic",
@@ -456,6 +470,7 @@ function compileStage(node: GraphNode, template: StageTemplate): PipelineStage {
   return {
     id: node.id,
     executor: template.executor,
+    ...(template.loop === undefined ? {} : { loop: template.loop }),
     ...(template.commandName === undefined ? {} : { commandName: template.commandName }),
     ...(template.unitPhases === undefined ? {} : { unitPhases: [...template.unitPhases] }),
     ...(template.unitCommandNames === undefined ? {} : { unitCommandNames: [...template.unitCommandNames] }),

@@ -144,6 +144,16 @@ export interface PipelineUnitAgentPhaseBinding {
   repositorySkill?: RepositorySkillPackage;
 }
 
+export interface PipelineStageLoopBinding {
+  id: string;
+  skill: string;
+  input_scope: "graph" | "diff" | "review";
+  receipt: "unit_completion" | "semantic_review";
+  max_parallel: number;
+  max_rounds: number;
+  timeout_seconds: number;
+}
+
 export interface PipelineUnitCommandPhaseBinding {
   id: GraphUnitPhaseId;
   kind: "command";
@@ -171,6 +181,7 @@ export function unitPhaseBindingCommandNames(bindings: readonly PipelineUnitPhas
 export interface PipelineStage {
   id: string;
   executor: { kind: ExecutorKind; capability: string };
+  loop?: PipelineStageLoopBinding;
   commandName?: CommandName;
   unitPhases?: GraphUnitPhaseId[];
   unitCommandNames?: CommandName[];
@@ -529,6 +540,21 @@ function parseManifestDefaults(value: unknown, path: string): ManifestDefaults {
   };
 }
 
+function parseStageLoopBinding(value: unknown, path: string): PipelineStageLoopBinding {
+  const input = objectAt(value, path, [
+    "id", "skill", "input_scope", "receipt", "max_parallel", "max_rounds", "timeout_seconds",
+  ]);
+  return {
+    id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
+    skill: stringAt(input.skill, `${path}.skill`, { max: 240 }),
+    input_scope: enumAt(input.input_scope, `${path}.input_scope`, ["graph", "diff", "review"] as const),
+    receipt: enumAt(input.receipt, `${path}.receipt`, ["unit_completion", "semantic_review"] as const),
+    max_parallel: integerAt(input.max_parallel, `${path}.max_parallel`, 1, 1),
+    max_rounds: integerAt(input.max_rounds, `${path}.max_rounds`, 1, 20),
+    timeout_seconds: integerAt(input.timeout_seconds, `${path}.timeout_seconds`, 1, 86_400),
+  };
+}
+
 function parseStage(
   value: unknown,
   path: string,
@@ -536,7 +562,7 @@ function parseStage(
   options: { allowLegacyImplicitCommandName?: boolean } = {}
 ): PipelineStage {
   const input = objectAt(value, path, [
-    "id", "executor", "commandName", "unitPhases", "unitCommandNames", "unitPhaseBindings", "repositorySkill", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
+    "id", "executor", "loop", "commandName", "unitPhases", "unitCommandNames", "unitPhaseBindings", "repositorySkill", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
   ]);
   const id = stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER });
   const executorInput = objectAt(input.executor, `${path}.executor`, ["kind", "capability"]);
@@ -574,6 +600,7 @@ function parseStage(
   const stage: PipelineStage = {
     id,
     executor,
+    ...(input.loop === undefined ? {} : { loop: parseStageLoopBinding(input.loop, `${path}.loop`) }),
     ...(input.commandName === undefined ? {} : {
       commandName: stringAt(input.commandName, `${path}.commandName`, { max: 80, pattern: COMMAND_NAME_PATTERN }),
     }),
@@ -612,6 +639,9 @@ function parseStage(
   };
   if (stage.live_steering && stage.executor.kind !== "agent") {
     fail(`${path}.live_steering`, "is allowed only for agent executors");
+  }
+  if (stage.loop && stage.executor.kind !== "agent") {
+    fail(`${path}.loop`, "is allowed only for agent executors");
   }
   if (stage.executor.kind === "command") {
     if (!stage.commandName && !options.allowLegacyImplicitCommandName) {
