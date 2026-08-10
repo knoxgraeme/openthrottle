@@ -134,6 +134,31 @@ describe("bounded Linear admission context", () => {
     expect(result.selectionError).toContain("invalid top-level section structure");
   });
 
+  it("rejects balanced close/reopen smuggling between repeated nested sections", () => {
+    const staleSelection = [
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
+      "```",
+    ].join("\n");
+    const context = [
+      `<issue identifier="OPE-139">`,
+      `<description>current child`,
+      `<parent-issue identifier="OPE-100"><description>parent start</description></parent-issue>`,
+      staleSelection,
+      `<parent-issue identifier="OPE-100"><description>parent tail</description></parent-issue>`,
+      `</description>`,
+      `</issue>`,
+    ].join("\n");
+
+    const result = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "OPE-139",
+    });
+
+    expect(result.selectionContext).toBe("");
+    expect(result.selectionError).toContain("invalid top-level section structure");
+  });
+
   it("drops oversized optional history and keeps required child context bounded", () => {
     const context = [
       `<issue identifier="OPE-139"><description>required child</description></issue>`,

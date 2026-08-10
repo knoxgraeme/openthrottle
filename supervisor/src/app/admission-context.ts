@@ -13,6 +13,7 @@ const LINEAR_CONTEXT_SECTION_KINDS = [
 type ContextSectionKind = typeof LINEAR_CONTEXT_SECTION_KINDS[number];
 
 interface NestedSpan {
+  kind: ContextSectionKind;
   start: number;
   end: number;
 }
@@ -94,7 +95,11 @@ function linearContextSections(context: string): ParsedLinearContextSections {
     const end = match.index! + raw.length;
     if (stack.length === 1) {
       const root = stack[0]!;
+      if (root.nestedSpans.some((span) => span.kind === open.kind)) {
+        return { sections, error: invalidLinearContextShapeMessage() };
+      }
       root.nestedSpans.push({
+        kind: open.kind,
         start: open.start - root.start,
         end: end - root.start,
       });
