@@ -380,7 +380,11 @@ function validateUnitPhaseBindings(
   }
   for (const [index, binding] of bindings.entries()) {
     if (binding.kind !== "agent" && binding.kind !== "gate") continue;
-    const expectedCapability = capabilityForUnitPhaseBindingSkill(binding, `${path}[${index}]`);
+    const expectedCapability = capabilityForLoopSkill(
+      binding.loop,
+      binding.repositorySkill,
+      `${path}[${index}]`
+    );
     if (binding.executor.capability !== expectedCapability) {
       fail(`${path}[${index}].executor.capability`, "must match loop.skill");
     }
@@ -437,22 +441,23 @@ function validateUnitPhaseBindingCapabilityContract(
   }
 }
 
-function capabilityForUnitPhaseBindingSkill(
-  binding: PipelineUnitAgentPhaseBinding,
+function capabilityForLoopSkill(
+  loop: { skill: string },
+  repositorySkill: RepositorySkillPackage | undefined,
   path: string
 ): string {
-  if (binding.loop.skill.startsWith("builtin://")) {
-    if (binding.repositorySkill) {
+  if (loop.skill.startsWith("builtin://")) {
+    if (repositorySkill) {
       fail(`${path}.repositorySkill`, "is allowed only for repo:// loop skills");
     }
-    return binding.loop.skill.slice("builtin://".length);
+    return loop.skill.slice("builtin://".length);
   }
-  if (binding.loop.skill.startsWith("repo://")) {
-    const invocation = binding.loop.skill.slice("repo://".length);
-    if (!binding.repositorySkill) {
+  if (loop.skill.startsWith("repo://")) {
+    const invocation = loop.skill.slice("repo://".length);
+    if (!repositorySkill) {
       fail(`${path}.repositorySkill`, "is required for repo:// loop skills");
     }
-    if (binding.repositorySkill.invocation !== invocation) {
+    if (repositorySkill.invocation !== invocation) {
       fail(`${path}.repositorySkill.invocation`, "must match loop.skill");
     }
     return REPOSITORY_SKILL_CAPABILITY;
@@ -655,6 +660,12 @@ function parseStage(
   }
   if (stage.loop && stage.executor.kind !== "agent") {
     fail(`${path}.loop`, "is allowed only for agent executors");
+  }
+  if (stage.loop && stage.executor.kind === "agent") {
+    const expectedCapability = capabilityForLoopSkill(stage.loop, stage.repositorySkill, path);
+    if (stage.executor.capability !== expectedCapability) {
+      fail(`${path}.executor.capability`, "must match loop.skill");
+    }
   }
   if (stage.executor.kind === "command") {
     if (!stage.commandName && !options.allowLegacyImplicitCommandName) {

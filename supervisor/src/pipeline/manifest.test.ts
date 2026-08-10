@@ -464,6 +464,41 @@ describe("pipeline manifest validation", () => {
       .toThrow(/pipeline\.stages\[0\]\.repositorySkill: is required for agent\/repository-skill@1 stages/);
   });
 
+  it("binds ordinary stage loop skills to their dispatched executor and repository package", () => {
+    const builtinMismatch = manifest();
+    firstStage(builtinMismatch).loop = {
+      id: "review-loop",
+      skill: "builtin://ce/review@1",
+      input_scope: "review",
+      receipt: "semantic_review",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+    };
+    expect(() => validatePipelineManifest(builtinMismatch))
+      .toThrow(/pipeline\.stages\[0\]\.executor\.capability: must match loop\.skill/);
+
+    const repositoryMismatch = manifest();
+    repositoryMismatch.requires = {
+      protocol: "stage-executor@1",
+      capabilities: ["agent/repository-skill@1"],
+    };
+    const stage = firstStage(repositoryMismatch);
+    stage.executor = { kind: "agent", capability: "agent/repository-skill@1" };
+    stage.loop = {
+      id: "repository-loop",
+      skill: "repo://implement_unit",
+      input_scope: "graph",
+      receipt: "unit_completion",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+    };
+    stage.repositorySkill = repositorySkillPackage();
+    expect(() => validatePipelineManifest(repositoryMismatch))
+      .toThrow(/pipeline\.stages\[0\]\.repositorySkill\.invocation: must match loop\.skill/);
+  });
+
   it("requires command executors to declare a valid repository command name", () => {
     const command = manifest();
     command.requires = { protocol: "stage-executor@1", capabilities: ["command/run@1"] };
