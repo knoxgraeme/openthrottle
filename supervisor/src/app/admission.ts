@@ -271,7 +271,8 @@ function composeBoundedOrdinaryTaskContext(
   }
   const rawIssueSections = contextSectionsOf(sections, "issue");
   const issueSections = rawIssueSections.map(stripNestedLinearContextSections);
-  const directiveSections = contextSectionsOf(sections, "primary-directive-thread");
+  const rawDirectiveSections = contextSectionsOf(sections, "primary-directive-thread");
+  const directiveSections = rawDirectiveSections.map(stripNestedLinearContextSections);
   if (issueSections.length === 0) {
     if (options.requireLinearSections) {
       return {
@@ -296,7 +297,7 @@ function composeBoundedOrdinaryTaskContext(
   const parentSectionCount = parentSections.length;
   const knownSections = [
     ...rawIssueSections,
-    ...directiveSections,
+    ...rawDirectiveSections,
     ...parentSections,
     ...otherThreadSections,
   ];

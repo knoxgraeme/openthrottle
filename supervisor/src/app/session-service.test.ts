@@ -916,6 +916,54 @@ intents:
     expect(request.taskContext).not.toContain("openthrottle.ship-selection/v1");
   });
 
+  it("does not select from nested history inside the primary directive", async () => {
+    const staleSelection = [
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const context = [
+      `<issue identifier="OT-1">`,
+      `<title>Child issue</title>`,
+      `<description>Use the default graph for the prompted child issue.</description>`,
+      `</issue>`,
+      `<primary-directive-thread comment-id="directive">`,
+      `<comment author="Operator" created-at="2026-08-08T00:00:00.000Z">@OpenThrottle implement this ticket.</comment>`,
+      `<other-thread comment-id="stale-history">`,
+      `<comment author="Openthrottle" created-at="2026-08-07T00:00:00.000Z">${staleSelection}</comment>`,
+      `</other-thread>`,
+      `</primary-directive-thread>`,
+    ].join("\n");
+
+    const { pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@2
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const request = pipelines.getStageRequest(pipelines.getActiveAttempt(instance.id)!.id);
+    expect(instance.pipeline_id).toBe("core/implement");
+    expect(request.taskContext).toContain("@OpenThrottle implement this ticket.");
+    expect(request.taskContext).not.toContain("stale-history");
+    expect(request.taskContext).not.toContain("openthrottle.ship-selection/v1");
+  });
+
   it("rejects closing-delimiter injection that forges a required issue section", async () => {
     const staleSelection = [
       "```json openthrottle.ship-selection/v1",
