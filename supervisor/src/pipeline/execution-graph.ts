@@ -21,6 +21,7 @@ import {
   type ExecutorKind,
   type PipelineManifest,
   type PipelineStage,
+  type PipelineStageLoopBinding,
   type PipelineTransition,
   type PipelineUnitPhaseBinding,
   type RepositorySkillPackage,
@@ -32,7 +33,10 @@ import {
 } from "./manifest.js";
 import {
   FOR_EACH_UNIT_CAPABILITY,
+  ORDINARY_STAGE_BUILTIN_CAPABILITIES,
+  ORDINARY_STAGE_INPUT_SCOPE,
   REPOSITORY_SKILL_CAPABILITY,
+  STRUCTURED_PHASE_BUILTIN_CAPABILITIES,
   capabilityCredentialContract,
   capabilityCredentialContractViolations,
   capabilityRequiresCredential,
@@ -47,6 +51,8 @@ export interface CompileExecutionGraphOptions {
   maxAttempts?: number;
   maxRepairRounds?: number;
   aggregatePublishContext?: "prefer_resume";
+  includeOrdinaryLoopBinding?: boolean;
+  ordinaryStageTimeoutSeconds?: number;
   runtime?: RuntimeCapabilityInventory;
   config?: RepositoryConfigContract;
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>;
@@ -63,6 +69,7 @@ export interface CompiledExecutionGraph {
 
 type StageTemplate = {
   executor: { kind: ExecutorKind; capability: string };
+  loop?: PipelineStageLoopBinding;
   repositorySkill?: RepositorySkillPackage;
   evaluator: { kind: EvaluatorKind; assurance: AssuranceClass; required_artifacts: ArtifactKind[] };
   context: ContextPolicy;
@@ -87,6 +94,12 @@ const GRAPH_TO_STAGE_OUTCOME: Record<PublicGraphOutcome, StageOutcome> = {
   failure: "failure",
 };
 
+// These are the builtin capabilities that sandbox/runner/execute-stage.mjs
+// maps to installed whole-stage task adapters. A broader credential contract
+// is not sufficient: accepting a capability with no dispatch mapping would run
+// the generic fallback instead of the graph's declared skill.
+const ORDINARY_RUN_BUILTIN_CAPABILITIES = new Set<string>(ORDINARY_STAGE_BUILTIN_CAPABILITIES);
+
 const DEFAULT_TERMINALS: Pick<Record<StageOutcome, PipelineTransition>, "needs_human" | "canceled" | "superseded"> = {
   needs_human: { terminal: "needs_human" },
   canceled: { terminal: "canceled" },
@@ -101,13 +114,21 @@ function repoSkillId(skill: string): string | undefined {
   return skill.startsWith("repo://") ? skill.slice("repo://".length) : undefined;
 }
 
+function assertSupportedBuiltinCapability(capability: string, path: string): void {
+  if (!capabilityCredentialContract(capability)) {
+    fail(path, `unsupported builtin capability ${capability}`);
+  }
+}
+
 function capabilityFromSkill(
   skill: string,
   path: string,
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
 ): { capability: string; repositorySkill?: RepositorySkillPackage } {
   if (skill.startsWith("builtin://")) {
-    return { capability: skill.slice("builtin://".length) };
+    const capability = skill.slice("builtin://".length);
+    assertSupportedBuiltinCapability(capability, path);
+    return { capability };
   }
   const id = repoSkillId(skill);
   if (!id) fail(path, "must be a builtin or repository skill reference");
@@ -226,6 +247,8 @@ function compileTransitions(node: GraphNode): Record<StageOutcome, PipelineTrans
 function loopTemplate(
   graph: GraphContract,
   node: GraphNode,
+  includeOrdinaryLoopBinding = true,
+  ordinaryStageTimeoutSeconds?: number,
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
 ): StageTemplate {
   const loop = graph.loops.find((candidate) => candidate.id === node.loop);
@@ -236,15 +259,45 @@ function loopTemplate(
   if (loop.receipt !== "unit_completion" && loop.receipt !== "semantic_review") {
     fail(`graph.loops.${loop.id}.receipt`, "cannot compile this loop receipt yet");
   }
+  if (loop.input_scope !== "graph" && loop.input_scope !== "diff" && loop.input_scope !== "review") {
+    fail(`graph.loops.${loop.id}.input_scope`, "cannot compile this loop input scope for run nodes yet");
+  }
+  if (ordinaryStageTimeoutSeconds !== undefined && loop.timeout_seconds !== ordinaryStageTimeoutSeconds) {
+    fail(
+      `graph.loops.${loop.id}.timeout_seconds`,
+      `must equal the enforced ordinary stage timeout ${ordinaryStageTimeoutSeconds}`
+    );
+  }
   const { capability, repositorySkill } = capabilityFromSkill(
     loop.skill,
     `graph.loops.${loop.id}.skill`,
     repositorySkills
   );
+  if (repositorySkill === undefined && !ORDINARY_RUN_BUILTIN_CAPABILITIES.has(capability)) {
+    fail(`graph.loops.${loop.id}.skill`, `${capability} has no ordinary stage dispatch adapter`);
+  }
+  const enforcedInputScope = ORDINARY_STAGE_INPUT_SCOPE[capability];
+  if (includeOrdinaryLoopBinding && enforcedInputScope !== undefined && loop.input_scope !== enforcedInputScope) {
+    fail(
+      `graph.loops.${loop.id}.input_scope`,
+      `must be ${enforcedInputScope} for ${capability}`
+    );
+  }
   const isReview = loop.receipt === "semantic_review";
   const liveSteering = capability === "ce/implement@1" || capability === "ce/investigate@1";
   const template: StageTemplate = {
     executor: { kind: "agent", capability },
+    ...(includeOrdinaryLoopBinding ? {
+      loop: {
+        id: loop.id,
+        skill: loop.skill,
+        input_scope: loop.input_scope,
+        receipt: loop.receipt,
+        max_parallel: loop.max_parallel,
+        max_rounds: loop.max_rounds,
+        timeout_seconds: loop.timeout_seconds,
+      },
+    } : {}),
     ...(repositorySkill === undefined ? {} : { repositorySkill }),
     evaluator: {
       kind: "semantic",
@@ -272,6 +325,9 @@ function unitPhaseLoop(
   if (loop.input_scope !== "unit") {
     fail(`graph.loops.${loop.id}.input_scope`, "for_each_unit phases require unit input scope");
   }
+  if (loop.max_parallel !== 1) {
+    fail(`graph.loops.${loop.id}.max_parallel`, "for_each_unit phases do not support parallel loop actions yet");
+  }
   if (phase.kind === "agent" && loop.receipt !== "unit_completion") {
     fail(`graph.loops.${loop.id}.receipt`, "for_each_unit agent phases require unit_completion receipts");
   }
@@ -282,6 +338,15 @@ function unitPhaseLoop(
   if (!worker) fail(`graph.loops.${loop.id}.worker`, "references an unknown worker");
   if (worker.engine !== "agent") fail(`graph.workers.${worker.id}.engine`, "for_each_unit phases require an agent worker");
   const { capability, repositorySkill } = capabilityFromSkill(loop.skill, `graph.loops.${loop.id}.skill`, repositorySkills);
+  const expectedBuiltinCapability = STRUCTURED_PHASE_BUILTIN_CAPABILITIES[
+    phase.id as keyof typeof STRUCTURED_PHASE_BUILTIN_CAPABILITIES
+  ];
+  if (repositorySkill === undefined && capability !== expectedBuiltinCapability) {
+    fail(
+      `graph.nodes.${node.id}.phases.${index}.skill`,
+      `${capability} is not runnable for the ${phase.id} phase; expected ${expectedBuiltinCapability}`
+    );
+  }
   const context = contextFromSessionScope(worker);
   const kind = phase.kind as "agent" | "gate";
   assertGateReadOnly(phase, worker, capability, `graph.nodes.${node.id}.phases.${index}`);
@@ -398,12 +463,23 @@ function publishContextFor(
 function nodeTemplate(
   graph: GraphContract,
   node: GraphNode,
-  options: Pick<CompileExecutionGraphOptions, "aggregatePublishContext"> = {},
+  options: Pick<
+    CompileExecutionGraphOptions,
+    "aggregatePublishContext" | "includeOrdinaryLoopBinding" | "ordinaryStageTimeoutSeconds"
+  > = {},
   config?: RepositoryConfigContract,
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
 ): StageTemplate {
   assertNoDependencies(node);
-  if (node.kind === "run") return loopTemplate(graph, node, repositorySkills);
+  if (node.kind === "run") {
+    return loopTemplate(
+      graph,
+      node,
+      options.includeOrdinaryLoopBinding,
+      options.ordinaryStageTimeoutSeconds,
+      repositorySkills
+    );
+  }
   if (node.kind === "for_each_unit") return forEachUnitTemplate(graph, node, config, repositorySkills);
   if (node.kind === "command") {
     return {
@@ -445,6 +521,7 @@ function compileStage(node: GraphNode, template: StageTemplate): PipelineStage {
   return {
     id: node.id,
     executor: template.executor,
+    ...(template.loop === undefined ? {} : { loop: template.loop }),
     ...(template.commandName === undefined ? {} : { commandName: template.commandName }),
     ...(template.unitPhases === undefined ? {} : { unitPhases: [...template.unitPhases] }),
     ...(template.unitCommandNames === undefined ? {} : { unitCommandNames: [...template.unitCommandNames] }),

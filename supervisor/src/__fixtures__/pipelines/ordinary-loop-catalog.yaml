@@ -1,0 +1,7 @@
+schema: openthrottle.catalog/v1
+manifests:
+  - ordinary-loop-fixture-v1.yaml
+aliases:
+  ordinary-loop:
+    id: fixture/ordinary-loop
+    version: 1

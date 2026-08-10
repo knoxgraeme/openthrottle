@@ -462,6 +462,92 @@ describe("structured child runtime command seeding", () => {
     }));
   });
 
+  it("seeds the strictest repeated loop-backed phase rounds as the durable unit repair budget", () => {
+    const createGraph = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {} as any,
+      store: {
+        getRepositoryConfigSnapshot: () => ({
+          digest: "config-digest",
+          normalized_config: canonicalJson({ commands: { "docs-check": "npm run docs:check", test: "npm test" } }),
+        }),
+        createGraph,
+      } as any,
+    });
+    const manifestInstance = {
+      ...instance,
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          executor: { capability: "graph/for-each-unit@1" },
+          unitCommandNames: ["test"],
+          unitPhases: ["implement", "simplify", "candidate", "lead", "integrate"],
+          unitPhaseBindings: [
+            {
+              id: "implement",
+              kind: "agent",
+              loop: {
+                id: "unit-loop",
+                skill: "builtin://implement-unit@1",
+                input_scope: "unit",
+                receipt: "unit_completion",
+                max_parallel: 1,
+                max_rounds: 6,
+                timeout_seconds: 77,
+              },
+              worker: { id: "worker-1", agent: "inherit", allowed_mcp_servers: [] },
+              executor: { kind: "agent", capability: "implement-unit@1" },
+              credentials: ["model.invoke", "repo.read"],
+              context: "fresh",
+            },
+            {
+              id: "simplify",
+              kind: "agent",
+              loop: {
+                id: "simplify-loop",
+                skill: "builtin://simplify-unit@1",
+                input_scope: "unit",
+                receipt: "unit_completion",
+                max_parallel: 1,
+                max_rounds: 2,
+                timeout_seconds: 77,
+              },
+              worker: { id: "worker-2", agent: "inherit", allowed_mcp_servers: [] },
+              executor: { kind: "agent", capability: "simplify-unit@1" },
+              credentials: ["model.invoke", "repo.read"],
+              context: "fresh",
+            },
+            {
+              id: "lead",
+              kind: "gate",
+              loop: {
+                id: "lead-loop",
+                skill: "builtin://accept-unit@1",
+                input_scope: "unit",
+                receipt: "unit_decision",
+                max_parallel: 1,
+                max_rounds: 1,
+                timeout_seconds: 77,
+              },
+              worker: { id: "worker-3", agent: "inherit", allowed_mcp_servers: [] },
+              executor: { kind: "agent", capability: "accept-unit@1" },
+              credentials: ["model.invoke", "repo.read"],
+              context: "fresh",
+            },
+          ],
+        }],
+      }),
+    };
+
+    childRuntime.seedCompositeGraph(manifestInstance as any, request(executionPlan) as any);
+
+    expect(createGraph).toHaveBeenCalledWith(expect.objectContaining({
+      maxRepairRounds: 1,
+    }));
+  });
+
   it("fails closed when a required execution-plan command is not configured", () => {
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -885,7 +971,7 @@ describe("structured child runtime repair fences", () => {
             kind: "agent",
             loop: {
               skill: "builtin://implement-unit@1",
-              timeout_seconds: 60,
+              timeout_seconds: 17,
             },
             worker: {
               id: "worker-1",
@@ -912,6 +998,7 @@ describe("structured child runtime repair fences", () => {
       generation: 7,
       baseSubject: "a".repeat(40),
       inputSubject: "a".repeat(40),
+      timeoutMs: 17_000,
       expectedProducer: {
         workerId: "worker-1",
         skill: "builtin://implement-unit@1",
@@ -1129,6 +1216,7 @@ describe("structured child runtime repair fences", () => {
       loop: "repair",
       contextPolicy: "resume_required",
       nativeSessionId: "native-session-final-repair-1",
+      timeoutMs: 300_000,
       priorEvidence: {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "final_repair",
@@ -1974,6 +2062,7 @@ describe("structured child runtime repair fences", () => {
       actionId: "final-review-no-commands",
       role: "reviewer",
       loop: "review",
+      timeoutMs: 300_000,
       priorEvidence: {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "final_review",

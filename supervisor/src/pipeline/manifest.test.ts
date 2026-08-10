@@ -11,7 +11,7 @@ import {
 } from "./manifest.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
-const UNIT_PHASE_RUNTIME_CAPABILITIES = ["ce/implement@1", "ce/review@1", "graph/for-each-unit@1"];
+const UNIT_PHASE_RUNTIME_CAPABILITIES = ["ce/implement@1", "accept-unit@1", "graph/for-each-unit@1"];
 
 function transitions(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const output: Record<string, unknown> = {
@@ -100,7 +100,7 @@ function unitPhaseBindings(): unknown[] {
     timeout_seconds: 60,
   };
   const leadWorker = { ...worker, credentials: ["model.invoke", "repo.read"] };
-  const leadLoop = { ...loop, id: "lead_loop", skill: "builtin://ce/review@1", receipt: "unit_decision" };
+  const leadLoop = { ...loop, id: "lead_loop", skill: "builtin://accept-unit@1", receipt: "unit_decision" };
   return [
     {
       id: "implement",
@@ -117,7 +117,7 @@ function unitPhaseBindings(): unknown[] {
       kind: "gate",
       loop: leadLoop,
       worker: leadWorker,
-      executor: { kind: "agent", capability: "ce/review@1" },
+      executor: { kind: "agent", capability: "accept-unit@1" },
       context: "fresh",
       credentials: ["model.invoke", "repo.read"],
     },
@@ -183,6 +183,17 @@ describe("pipeline manifest validation", () => {
       "investigate",
       "publish",
     ]);
+  });
+
+  it("rejects ordinary loop bindings in directly loaded catalog manifests", () => {
+    const path = fileURLToPath(new URL(
+      "../__fixtures__/pipelines/ordinary-loop-catalog.yaml",
+      import.meta.url
+    ));
+    const runtime = buildInstalledRuntimeDescriptor("test-runtime/v1");
+
+    expect(() => loadPipelineCatalog(path, runtime.descriptor))
+      .toThrow(/ordinary-loop-fixture-v1\.yaml\.stages\.stage\.loop: ordinary loop bindings are supported only in repository-compiled manifests/);
   });
 
   it("normalizes defaults and retry shorthand to the same JSON and digest as explicit transitions", () => {
@@ -443,6 +454,96 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(undeclared)).toThrow(/not declared in requires.capabilities/);
   });
 
+  it("rejects ordinary agent capabilities without a stage dispatch adapter", () => {
+    const value = manifest();
+    value.requires = { protocol: "stage-executor@1", capabilities: ["accept-unit@1"] };
+    const stage = firstStage(value);
+    stage.executor = { kind: "agent", capability: "accept-unit@1" };
+    stage.credentials = ["model.invoke", "repo.read"];
+
+    expect(() => validatePipelineManifest(value))
+      .toThrow(/pipeline\.stages\[0\]\.executor\.capability: accept-unit@1 has no ordinary stage dispatch adapter/);
+  });
+
+  it("requires a pinned package for ordinary repository-skill stages", () => {
+    const value = manifest();
+    value.requires = { protocol: "stage-executor@1", capabilities: ["agent/repository-skill@1"] };
+    const stage = firstStage(value);
+    stage.executor = { kind: "agent", capability: "agent/repository-skill@1" };
+
+    expect(() => validatePipelineManifest(value))
+      .toThrow(/pipeline\.stages\[0\]\.repositorySkill: is required for agent\/repository-skill@1 stages/);
+  });
+
+  it("binds ordinary stage loop skills to their dispatched executor and repository package", () => {
+    const builtinMismatch = manifest();
+    firstStage(builtinMismatch).loop = {
+      id: "review-loop",
+      skill: "builtin://ce/review@1",
+      input_scope: "review",
+      receipt: "semantic_review",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+    };
+    expect(() => validatePipelineManifest(builtinMismatch))
+      .toThrow(/pipeline\.stages\[0\]\.executor\.capability: must match loop\.skill/);
+
+    const repositoryMismatch = manifest();
+    repositoryMismatch.requires = {
+      protocol: "stage-executor@1",
+      capabilities: ["agent/repository-skill@1"],
+    };
+    const stage = firstStage(repositoryMismatch);
+    stage.executor = { kind: "agent", capability: "agent/repository-skill@1" };
+    stage.loop = {
+      id: "repository-loop",
+      skill: "repo://implement_unit",
+      input_scope: "graph",
+      receipt: "unit_completion",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+    };
+    stage.repositorySkill = repositorySkillPackage();
+    expect(() => validatePipelineManifest(repositoryMismatch))
+      .toThrow(/pipeline\.stages\[0\]\.repositorySkill\.invocation: must match loop\.skill/);
+  });
+
+  it("binds ordinary loop input scope to the dispatched adapter", () => {
+    const semantic = manifest();
+    firstStage(semantic).loop = {
+      id: "semantic-loop",
+      skill: "builtin://agent/semantic@1",
+      input_scope: "diff",
+      receipt: "semantic_review",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+    };
+    expect(() => validatePipelineManifest(semantic))
+      .toThrow(/pipeline\.stages\[0\]\.loop\.input_scope: must be graph for agent\/semantic@1/);
+
+    const review = manifest();
+    review.requires = { protocol: "stage-executor@1", capabilities: ["ce/review@1"] };
+    const reviewStage = firstStage(review);
+    reviewStage.executor = { kind: "agent", capability: "ce/review@1" };
+    reviewStage.loop = {
+      id: "review-loop",
+      skill: "builtin://ce/review@1",
+      input_scope: "diff",
+      receipt: "semantic_review",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+    };
+    expect(validatePipelineManifest(review).manifest.stages[0]?.loop?.input_scope).toBe("diff");
+
+    (reviewStage.loop as Record<string, unknown>).input_scope = "review";
+    expect(() => validatePipelineManifest(review))
+      .toThrow(/pipeline\.stages\[0\]\.loop\.input_scope: must be diff for ce\/review@1/);
+  });
+
   it("requires command executors to declare a valid repository command name", () => {
     const command = manifest();
     command.requires = { protocol: "stage-executor@1", capabilities: ["command/run@1"] };
@@ -583,7 +684,7 @@ describe("pipeline manifest validation", () => {
       "ce/plan@1",
       ["model.invoke", "provider.read", "repo.read"],
     )))
-      .toThrow(/unitPhaseBindings\[0\]\.credentials: ce\/plan@1 is not authorized for credential scope provider\.read/);
+      .toThrow(/unitPhaseBindings\[0\]\.executor\.capability: ce\/plan@1 is not runnable for the implement phase; expected ce\/implement@1/);
 
     expect(() => validatePipelineManifest(manifestWithUnitBindingCapability(
       value,
@@ -594,7 +695,7 @@ describe("pipeline manifest validation", () => {
       .toThrow(/unitPhaseBindings\[0\]\.credentials: ce\/implement@1 requires credential scope model\.invoke/);
 
     expect(() => validatePipelineManifest(manifestWithUnitBindingCapability(value, 0, "ce/publish@1")))
-      .toThrow(/unitPhaseBindings\[0\]\.context: ce\/publish@1 does not support context policy fresh/);
+      .toThrow(/unitPhaseBindings\[0\]\.executor\.capability: ce\/publish@1 is not runnable for the implement phase; expected ce\/implement@1/);
 
     expect(() => validatePipelineManifest(manifestWithUnitBindingCapability(
       value,
@@ -646,7 +747,7 @@ describe("pipeline manifest validation", () => {
     (writeMinimumCapabilityBinding.loop as Record<string, unknown>).skill = "builtin://ce/implement@1";
     writeMinimumCapabilityBinding.executor = { kind: "agent", capability: "ce/implement@1" };
     expect(() => validatePipelineManifest(writeMinimumCapability))
-      .toThrow(/unitPhaseBindings\[2\]\.executor\.capability: ce\/implement@1 requires repo\.write and cannot be used for gate phase bindings/);
+      .toThrow(/unitPhaseBindings\[2\]\.executor\.capability: ce\/implement@1 is not runnable for the lead phase; expected accept-unit@1/);
 
     const missingFromOriginalSupervisorContract = structuredClone(value) as Record<string, unknown>;
     (missingFromOriginalSupervisorContract.requires as { capabilities: string[] }).capabilities = [
@@ -658,7 +759,7 @@ describe("pipeline manifest validation", () => {
     (publishBinding.loop as Record<string, unknown>).skill = "builtin://ce/publish@1";
     publishBinding.executor = { kind: "agent", capability: "ce/publish@1" };
     expect(() => validatePipelineManifest(missingFromOriginalSupervisorContract))
-      .toThrow(/unitPhaseBindings\[2\]\.executor\.capability: ce\/publish@1 requires repo\.write and cannot be used for gate phase bindings/);
+      .toThrow(/unitPhaseBindings\[2\]\.executor\.capability: ce\/publish@1 is not runnable for the lead phase; expected accept-unit@1/);
 
     const mismatchedSkillCapability = structuredClone(value) as Record<string, unknown>;
     const mismatchedSkillCapabilityBinding =
@@ -667,13 +768,9 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(mismatchedSkillCapability))
       .toThrow(/unitPhaseBindings\[2\]\.executor\.capability: must match loop\.skill/);
 
-    const readOnlyBuiltinCapability = structuredClone(value) as Record<string, unknown>;
-    expect(validatePipelineManifest(readOnlyBuiltinCapability).manifest.stages[0]?.unitPhaseBindings?.[2])
-      .toMatchObject({
-        kind: "gate",
-        executor: { kind: "agent", capability: "ce/review@1" },
-        credentials: ["model.invoke", "repo.read"],
-      });
+    const wrongPhaseBuiltin = manifestWithUnitBindingCapability(value, 2, "ce/review@1");
+    expect(() => validatePipelineManifest(wrongPhaseBuiltin))
+      .toThrow(/unitPhaseBindings\[2\]\.executor\.capability: ce\/review@1 is not runnable for the lead phase; expected accept-unit@1/);
 
     const repositorySkillCapability = structuredClone(value) as Record<string, unknown>;
     (repositorySkillCapability.requires as { capabilities: string[] }).capabilities = [

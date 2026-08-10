@@ -14,7 +14,10 @@ import {
 import { parseDocument } from "yaml";
 import {
   FOR_EACH_UNIT_CAPABILITY,
+  ORDINARY_STAGE_BUILTIN_CAPABILITIES,
+  ORDINARY_STAGE_INPUT_SCOPE,
   REPOSITORY_SKILL_CAPABILITY,
+  STRUCTURED_PHASE_BUILTIN_CAPABILITIES,
   capabilityCredentialContractViolations,
   capabilityRequiresCredential,
 } from "./capability-contracts.js";
@@ -144,6 +147,16 @@ export interface PipelineUnitAgentPhaseBinding {
   repositorySkill?: RepositorySkillPackage;
 }
 
+export interface PipelineStageLoopBinding {
+  id: string;
+  skill: string;
+  input_scope: "graph" | "diff" | "review";
+  receipt: "unit_completion" | "semantic_review";
+  max_parallel: number;
+  max_rounds: number;
+  timeout_seconds: number;
+}
+
 export interface PipelineUnitCommandPhaseBinding {
   id: GraphUnitPhaseId;
   kind: "command";
@@ -171,6 +184,7 @@ export function unitPhaseBindingCommandNames(bindings: readonly PipelineUnitPhas
 export interface PipelineStage {
   id: string;
   executor: { kind: ExecutorKind; capability: string };
+  loop?: PipelineStageLoopBinding;
   commandName?: CommandName;
   unitPhases?: GraphUnitPhaseId[];
   unitCommandNames?: CommandName[];
@@ -367,9 +381,24 @@ function validateUnitPhaseBindings(
   }
   for (const [index, binding] of bindings.entries()) {
     if (binding.kind !== "agent" && binding.kind !== "gate") continue;
-    const expectedCapability = capabilityForUnitPhaseBindingSkill(binding, `${path}[${index}]`);
+    const expectedCapability = capabilityForLoopSkill(
+      binding.loop,
+      binding.repositorySkill,
+      `${path}[${index}]`
+    );
     if (binding.executor.capability !== expectedCapability) {
       fail(`${path}[${index}].executor.capability`, "must match loop.skill");
+    }
+    if (expectedCapability !== REPOSITORY_SKILL_CAPABILITY) {
+      const phaseCapability = STRUCTURED_PHASE_BUILTIN_CAPABILITIES[
+        binding.id as keyof typeof STRUCTURED_PHASE_BUILTIN_CAPABILITIES
+      ];
+      if (expectedCapability !== phaseCapability) {
+        fail(
+          `${path}[${index}].executor.capability`,
+          `${expectedCapability} is not runnable for the ${binding.id} phase; expected ${phaseCapability}`
+        );
+      }
     }
     const canonicalContext = contextForWorkerSessionScope(binding.worker.session_scope);
     if (binding.context !== canonicalContext) {
@@ -413,22 +442,23 @@ function validateUnitPhaseBindingCapabilityContract(
   }
 }
 
-function capabilityForUnitPhaseBindingSkill(
-  binding: PipelineUnitAgentPhaseBinding,
+function capabilityForLoopSkill(
+  loop: { skill: string },
+  repositorySkill: RepositorySkillPackage | undefined,
   path: string
 ): string {
-  if (binding.loop.skill.startsWith("builtin://")) {
-    if (binding.repositorySkill) {
+  if (loop.skill.startsWith("builtin://")) {
+    if (repositorySkill) {
       fail(`${path}.repositorySkill`, "is allowed only for repo:// loop skills");
     }
-    return binding.loop.skill.slice("builtin://".length);
+    return loop.skill.slice("builtin://".length);
   }
-  if (binding.loop.skill.startsWith("repo://")) {
-    const invocation = binding.loop.skill.slice("repo://".length);
-    if (!binding.repositorySkill) {
+  if (loop.skill.startsWith("repo://")) {
+    const invocation = loop.skill.slice("repo://".length);
+    if (!repositorySkill) {
       fail(`${path}.repositorySkill`, "is required for repo:// loop skills");
     }
-    if (binding.repositorySkill.invocation !== invocation) {
+    if (repositorySkill.invocation !== invocation) {
       fail(`${path}.repositorySkill.invocation`, "must match loop.skill");
     }
     return REPOSITORY_SKILL_CAPABILITY;
@@ -529,6 +559,21 @@ function parseManifestDefaults(value: unknown, path: string): ManifestDefaults {
   };
 }
 
+function parseStageLoopBinding(value: unknown, path: string): PipelineStageLoopBinding {
+  const input = objectAt(value, path, [
+    "id", "skill", "input_scope", "receipt", "max_parallel", "max_rounds", "timeout_seconds",
+  ]);
+  return {
+    id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
+    skill: stringAt(input.skill, `${path}.skill`, { max: 240 }),
+    input_scope: enumAt(input.input_scope, `${path}.input_scope`, ["graph", "diff", "review"] as const),
+    receipt: enumAt(input.receipt, `${path}.receipt`, ["unit_completion", "semantic_review"] as const),
+    max_parallel: integerAt(input.max_parallel, `${path}.max_parallel`, 1, 1),
+    max_rounds: integerAt(input.max_rounds, `${path}.max_rounds`, 1, 20),
+    timeout_seconds: integerAt(input.timeout_seconds, `${path}.timeout_seconds`, 1, 86_400),
+  };
+}
+
 function parseStage(
   value: unknown,
   path: string,
@@ -536,7 +581,7 @@ function parseStage(
   options: { allowLegacyImplicitCommandName?: boolean } = {}
 ): PipelineStage {
   const input = objectAt(value, path, [
-    "id", "executor", "commandName", "unitPhases", "unitCommandNames", "unitPhaseBindings", "repositorySkill", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
+    "id", "executor", "loop", "commandName", "unitPhases", "unitCommandNames", "unitPhaseBindings", "repositorySkill", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
   ]);
   const id = stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER });
   const executorInput = objectAt(input.executor, `${path}.executor`, ["kind", "capability"]);
@@ -574,6 +619,7 @@ function parseStage(
   const stage: PipelineStage = {
     id,
     executor,
+    ...(input.loop === undefined ? {} : { loop: parseStageLoopBinding(input.loop, `${path}.loop`) }),
     ...(input.commandName === undefined ? {} : {
       commandName: stringAt(input.commandName, `${path}.commandName`, { max: 80, pattern: COMMAND_NAME_PATTERN }),
     }),
@@ -613,6 +659,22 @@ function parseStage(
   if (stage.live_steering && stage.executor.kind !== "agent") {
     fail(`${path}.live_steering`, "is allowed only for agent executors");
   }
+  if (stage.loop && stage.executor.kind !== "agent") {
+    fail(`${path}.loop`, "is allowed only for agent executors");
+  }
+  if (stage.loop && stage.executor.kind === "agent") {
+    const expectedCapability = capabilityForLoopSkill(stage.loop, stage.repositorySkill, path);
+    if (stage.executor.capability !== expectedCapability) {
+      fail(`${path}.executor.capability`, "must match loop.skill");
+    }
+    const enforcedInputScope = ORDINARY_STAGE_INPUT_SCOPE[expectedCapability];
+    if (enforcedInputScope !== undefined && stage.loop.input_scope !== enforcedInputScope) {
+      fail(
+        `${path}.loop.input_scope`,
+        `must be ${enforcedInputScope} for ${expectedCapability}`
+      );
+    }
+  }
   if (stage.executor.kind === "command") {
     if (!stage.commandName && !options.allowLegacyImplicitCommandName) {
       fail(`${path}.commandName`, "is required for command executors");
@@ -624,6 +686,18 @@ function parseStage(
     if (stage.executor.kind !== "agent" || stage.executor.capability !== REPOSITORY_SKILL_CAPABILITY) {
       fail(`${path}.repositorySkill`, "is allowed only for agent/repository-skill@1 stages");
     }
+  }
+  if (stage.executor.kind === "agent" &&
+      stage.executor.capability === REPOSITORY_SKILL_CAPABILITY &&
+      !stage.repositorySkill) {
+    fail(`${path}.repositorySkill`, "is required for agent/repository-skill@1 stages");
+  }
+  if (stage.executor.kind === "agent" &&
+      stage.executor.capability !== REPOSITORY_SKILL_CAPABILITY &&
+      !ORDINARY_STAGE_BUILTIN_CAPABILITIES.includes(
+        stage.executor.capability as (typeof ORDINARY_STAGE_BUILTIN_CAPABILITIES)[number]
+      )) {
+    fail(`${path}.executor.capability`, `${stage.executor.capability} has no ordinary stage dispatch adapter`);
   }
   const isForEachUnitStage = stage.executor.kind === "loop_action" && stage.executor.capability === FOR_EACH_UNIT_CAPABILITY;
   if (stage.unitPhases || stage.unitCommandNames || stage.unitPhaseBindings) {
@@ -957,6 +1031,14 @@ export function loadPipelineCatalog(
   for (const file of files) {
     const path = resolve(dirname(catalogPath), file);
     const validated = parsePipelineManifest(readFileSync(path, "utf8"), { source: path, runtime });
+    for (const stage of validated.manifest.stages) {
+      if (stage.loop) {
+        fail(
+          `${path}.stages.${stage.id}.loop`,
+          "ordinary loop bindings are supported only in repository-compiled manifests"
+        );
+      }
+    }
     const key = manifestKey(validated.manifest.id, validated.manifest.version);
     if (manifests.has(key)) fail(catalogPath, `duplicate pipeline identity ${key}`);
     manifests.set(key, validated);

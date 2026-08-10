@@ -53,6 +53,11 @@ const BUILTIN_GRAPHS = {
 } as const;
 const SIMPLE_IMPLEMENT_DESCRIPTION = "Staged CE implementation from a pre-approved plan with round-based repair budgeting, scoped repair re-entry, sealed repository gates, exact-tree publication, and bounded provider repair. The initial forward pass may simplify; repair passes re-run semantic review and command gates without re-running simplification.";
 const REPOSITORY_SKILL_PACKAGE_SCHEMA = "openthrottle.repository-skill-package/v1";
+// Repository graph blobs are immutable inputs, but compiler changes can alter
+// their normalized manifest bytes. Bump this identity version whenever that
+// happens so an already-accepted manifest identity is never silently reused.
+const REPOSITORY_GRAPH_COMPILER_IDENTITY_VERSION = 2;
+const DEFAULT_REPOSITORY_TASK_TIMEOUT_SECONDS = 7_200;
 const ORDINARY_STAGE_TASK_CONTEXT_LIMIT = 64_000;
 const PARENT_ISSUE_CONTEXT_LIMIT = 6_000;
 const LINEAR_CONTEXT_SECTION_KINDS = [
@@ -523,6 +528,7 @@ async function resolvePipelineSelection(
   runtime: PipelineCoordinatorContext["runtime"],
   catalog: ValidatedPipelineCatalog,
   selectedAgent: Agent,
+  taskTimeoutSeconds: number,
   acceptedManifestDigest?: (pipelineId: string, version: number) => string | undefined
 ): Promise<ValidatedPipelineManifest> {
   const intent = repositoryConfig.config.intents?.implement;
@@ -548,6 +554,7 @@ async function resolvePipelineSelection(
       graphId,
       blobSha: snapshot.blobSha,
       path: snapshot.path,
+      compilerVersion: REPOSITORY_GRAPH_COMPILER_IDENTITY_VERSION,
     }))}`;
   } else if (source.ref === "core/simple@1") {
     rawGraph = readFileSync(BUILTIN_SIMPLE_GRAPH, "utf8");
@@ -568,9 +575,16 @@ async function resolvePipelineSelection(
       readPinnedDirectory,
     })
     : undefined;
+  const repositoryTaskTimeoutSeconds = repositoryConfig.config.limits?.task_timeout ??
+    DEFAULT_REPOSITORY_TASK_TIMEOUT_SECONDS;
+  const ordinaryStageTimeoutSeconds = Math.min(taskTimeoutSeconds, repositoryTaskTimeoutSeconds);
   const compileOptions = {
     source: compileSource,
-    ...(source.kind === "repository" ? { config: repositoryConfig.config } : {}),
+    includeOrdinaryLoopBinding: source.kind === "repository",
+    ...(source.kind === "repository" ? {
+      config: repositoryConfig.config,
+      ordinaryStageTimeoutSeconds,
+    } : {}),
     ...(repositorySkills === undefined ? {} : { repositorySkills }),
     ...(source.ref === "core/simple@1" ? {
       id: "core/implement",
@@ -842,6 +856,7 @@ export async function handleCreated(
         coordinator.runtime,
         coordinator.catalog,
         selectedAgent,
+        cfg.taskTimeout,
         (pipelineId, version) => coordinator.store.getAcceptedManifestDigest(pipelineId, version)
       )
       : resolvePipelineReference(

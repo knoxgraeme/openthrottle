@@ -15,9 +15,9 @@ const investigateGraphPath = fileURLToPath(new URL("../../graphs/investigate-v1.
 const structuredV1GraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
 const structuredV2GraphPath = fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url));
 const SIMPLE_GRAPH_DIGEST = "2f25ae9b891405d0e73e5f3c0f103354183c8cb27ca923cbd06baa6c470b76d1";
-const SIMPLE_MANIFEST_DIGEST = "9b705c003313187cb2f7e219c99e1cbf795d966be0e1d257015462219833ac6a";
+const SIMPLE_MANIFEST_DIGEST = "f49011080d9f377bf4b9507eb1b47243e7a87f0918acfcc10e80b5940b505c0d";
 const INVESTIGATE_GRAPH_DIGEST = "a76d3e1360d92f41bc7aa9ed2372e294555478d5854808bf0c2a5ed7febaf317";
-const INVESTIGATE_MANIFEST_DIGEST = "d159ef720f5dbc7216b8dd502e3961ac30ffb2c4d4ea44a5afdc71a78f84da4e";
+const INVESTIGATE_MANIFEST_DIGEST = "80bb12f5b10d771d65d7235e308c2489b33ff6878a452069cf8c23621dec9329";
 const STRUCTURED_V2_COMPILE_OPTIONS = {
   aggregatePublishContext: "prefer_resume",
 } as const;
@@ -135,7 +135,7 @@ function minimalUnitGraph(overrides: {
     }, {
       id: "lead-worker",
       engine: "agent",
-      skills: ["builtin://ce/review@1"],
+      skills: ["builtin://accept-unit@1"],
       allowed_mcp_servers: [],
       session_scope: "fresh",
       credentials: ["model.invoke", "repo.read"],
@@ -154,7 +154,7 @@ function minimalUnitGraph(overrides: {
     }, {
       id: "lead-loop",
       worker: "lead-worker",
-      skill: "builtin://ce/review@1",
+      skill: "builtin://accept-unit@1",
       input_scope: "unit",
       receipt: "unit_decision",
       max_parallel: 1,
@@ -178,25 +178,26 @@ function minimalUnitGraph(overrides: {
 }
 
 describe("execution graph compiler", () => {
-  it("compiles the built-in simple graph behaviorally equivalent to core/implement@4 with a new digest", () => {
-    const compiled = parseAndCompileExecutionGraph(readFileSync(simpleGraphPath, "utf8"), {
-      source: simpleGraphPath,
-      id: "builtin/simple",
-      version: 1,
-      description: "Built-in simple implementation graph compiled to the staged CE manifest.",
-      maxAttempts: 200,
-      maxRepairRounds: 5,
-    });
+  it("keeps the built-in simple parity compile byte-identical to core/implement@4", () => {
     const deployed = resolvePipelineReference(
       loadPipelineCatalog(catalogPath, buildInstalledRuntimeDescriptor("test-runtime/v1").descriptor),
       "core/implement@4"
     );
+    const compiled = parseAndCompileExecutionGraph(readFileSync(simpleGraphPath, "utf8"), {
+      source: simpleGraphPath,
+      id: deployed.manifest.id,
+      version: deployed.manifest.version,
+      description: deployed.manifest.description,
+      maxAttempts: 200,
+      maxRepairRounds: 5,
+      includeOrdinaryLoopBinding: false,
+    });
 
     expect(behavior(compiled.manifest.manifest)).toEqual(behavior(deployed.manifest));
-    expect(compiled.manifest.manifest.id).toBe("builtin/simple");
+    expect(compiled.manifest.manifest.id).toBe("core/implement");
     expect(compiled.graphDigest).toBe(SIMPLE_GRAPH_DIGEST);
     expect(compiled.manifest.digest).toBe(SIMPLE_MANIFEST_DIGEST);
-    expect(compiled.manifest.digest).not.toBe(deployed.digest);
+    expect(compiled.manifest.digest).toBe(deployed.digest);
   });
 
   it("compiles the built-in investigate graph behaviorally equivalent to core/investigate@1", () => {
@@ -382,7 +383,7 @@ describe("execution graph compiler", () => {
     const publish = compiled.manifest.manifest.stages.find((stage) => stage.id === "publish")!;
 
     expect(publish.context).toBe("resume_required");
-    expect(compiled.manifest.digest).toBe("eeb2f6bed1d6e6b20a478f4f77284c935714ad5b2e11d47623363d2fa8edb769");
+    expect(compiled.manifest.digest).toBe("db5b8eaccee24a465f7a123438798a944793f08f25bf85c61603734a3b7c101b");
   });
 
   it("opts aggregate publish into prefer_resume only through the explicit compiler option", () => {
@@ -451,9 +452,9 @@ describe("execution graph compiler", () => {
     });
 
     expect(compiled.manifest.manifest.requires.capabilities).toEqual([
-      "ce/review@1",
       "graph/for-each-unit@1",
       REPOSITORY_SKILL_CAPABILITY,
+      "accept-unit@1",
     ]);
     expect(compiled.manifest.manifest.stages[0]?.unitPhaseBindings?.[0]).toMatchObject({
       id: "implement",
@@ -464,6 +465,85 @@ describe("execution graph compiler", () => {
     expect(compiled.unitPhaseBindings[0]).toMatchObject({
       id: "implement",
       repositorySkill: pkg,
+    });
+  });
+
+  it("preserves authored ordinary run loop execution settings on compiled stages", () => {
+    const compiled = validateAndCompileExecutionGraph(minimalGraph({
+      worker: {
+        skills: ["builtin://ce/review@1"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      loop: {
+        skill: "builtin://ce/review@1",
+        input_scope: "diff",
+        receipt: "semantic_review",
+        max_rounds: 7,
+        timeout_seconds: 123,
+      },
+    }), { ordinaryStageTimeoutSeconds: 123 });
+
+    expect(compiled.manifest.manifest.stages[0]?.loop).toEqual({
+      id: "loop",
+      skill: "builtin://ce/review@1",
+      input_scope: "diff",
+      receipt: "semantic_review",
+      max_parallel: 1,
+      max_rounds: 7,
+      timeout_seconds: 123,
+    });
+  });
+
+  it.each([
+    { capability: "ce/implement@1", scope: "diff", expected: "graph" },
+    { capability: "ce/implement@1", scope: "review", expected: "graph" },
+    { capability: "ce/review@1", scope: "graph", expected: "diff" },
+    { capability: "ce/review@1", scope: "review", expected: "diff" },
+    { capability: "ce/simplify@1", scope: "graph", expected: "diff" },
+    { capability: "ce/simplify@1", scope: "review", expected: "diff" },
+  ] as const)("rejects $capability ordinary input scope $scope", ({ capability, scope, expected }) => {
+    const credentials = capability === "ce/implement@1"
+      ? ["model.invoke", "provider.read", "repo.read", "repo.write"]
+      : ["model.invoke", "repo.read"];
+    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+      worker: { skills: [`builtin://${capability}`], credentials },
+      loop: { skill: `builtin://${capability}`, input_scope: scope },
+    }))).toThrow(new RegExp(
+      `graph\\.loops\\.loop\\.input_scope: must be ${expected} for ${capability.replace("/", "\\/")}`
+    ));
+  });
+
+  it.each([123, 600])("rejects ordinary run loop timeout %s when the enforced stage timeout is 300", (timeoutSeconds) => {
+    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+      loop: { timeout_seconds: timeoutSeconds },
+    }), {
+      ordinaryStageTimeoutSeconds: 300,
+    })).toThrow(/graph\.loops\.loop\.timeout_seconds: must equal the enforced ordinary stage timeout 300/);
+  });
+
+  it("preserves authored structured loop execution settings in unit phase bindings", () => {
+    const compiled = validateAndCompileExecutionGraph(minimalUnitGraph({
+      loop: { max_rounds: 7, timeout_seconds: 123 },
+      leadLoop: { max_rounds: 2, timeout_seconds: 45 },
+    }));
+
+    expect(compiled.manifest.manifest.stages[0]?.unitPhaseBindings?.[0]).toMatchObject({
+      id: "implement",
+      loop: {
+        input_scope: "unit",
+        max_parallel: 1,
+        max_rounds: 7,
+        timeout_seconds: 123,
+      },
+    });
+    expect(compiled.manifest.manifest.stages[0]?.unitPhaseBindings?.[2]).toMatchObject({
+      id: "lead",
+      loop: {
+        input_scope: "unit",
+        max_parallel: 1,
+        max_rounds: 2,
+        timeout_seconds: 45,
+      },
     });
   });
 
@@ -488,7 +568,7 @@ describe("execution graph compiler", () => {
         credentials: ["model.invoke", "provider.read", "repo.read"],
       },
       leadLoop: { skill: "builtin://ce/implement@1" },
-    }))).toThrow(/graph\.nodes\.units\.phases\.2\.skill: ce\/implement@1 requires repo\.write and cannot be used for gate phases/);
+    }))).toThrow(/graph\.nodes\.units\.phases\.2\.skill: ce\/implement@1 is not runnable for the lead phase; expected accept-unit@1/);
   });
 
   it("allows implement unit workers to request declared MCP access", () => {
@@ -551,6 +631,20 @@ describe("execution graph compiler", () => {
       repositorySkill: pkg,
       credentials: ["model.invoke", "repo.read", "repo.write"],
     });
+
+    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+      worker: {
+        skills: ["repo://implement_unit"],
+        credentials: ["model.invoke", "repo.read", "repo.write"],
+      },
+      loop: {
+        skill: "repo://implement_unit",
+        input_scope: "diff",
+      },
+    }), {
+      runtime: runtime.descriptor,
+      repositorySkills: new Map([["implement_unit", pkg]]),
+    })).toThrow(/graph\.loops\.loop\.input_scope: must be graph for agent\/repository-skill@1/);
   });
 
   it("compiles repository-defined command names from the pinned command inventory", () => {
@@ -594,6 +688,64 @@ describe("execution graph compiler", () => {
     })).toThrow(/runtime capability mismatch: capability:agent\/repository-skill@1/);
   });
 
+  it("rejects syntactically valid but unsupported builtin loop skills during compilation", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+      worker: {
+        skills: ["builtin://ce/imaginary@1"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      loop: { skill: "builtin://ce/imaginary@1" },
+    }))).toThrow(/graph\.loops\.loop\.skill: unsupported builtin capability ce\/imaginary@1/);
+  });
+
+  it("rejects syntactically valid but unsupported builtin unit phase skills during compilation", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: {
+        skills: ["builtin://accept-imaginary@1"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      leadLoop: { skill: "builtin://accept-imaginary@1" },
+    }))).toThrow(/graph\.loops\.lead-loop\.skill: unsupported builtin capability accept-imaginary@1/);
+  });
+
+  it("rejects known builtin capabilities that have no ordinary stage dispatch adapter", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+      worker: {
+        skills: ["builtin://accept-unit@1"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      loop: { skill: "builtin://accept-unit@1" },
+    }))).toThrow(/graph\.loops\.loop\.skill: accept-unit@1 has no ordinary stage dispatch adapter/);
+  });
+
+  it("rejects builtin capabilities that do not match the structured phase adapter", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      worker: {
+        skills: ["builtin://ce/review@1"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      loop: { skill: "builtin://ce/review@1" },
+    }))).toThrow(/graph\.nodes\.units\.phases\.0\.skill: ce\/review@1 is not runnable for the implement phase/);
+
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      phases: [
+        { id: "implement", kind: "agent", loop: "loop" },
+        { id: "simplify", kind: "agent", loop: "loop" },
+        { id: "candidate", kind: "evidence" },
+        { id: "lead", kind: "gate", loop: "lead-loop" },
+        { id: "integrate", kind: "integrate" },
+      ],
+    }))).toThrow(/graph\.nodes\.units\.phases\.1\.skill: ce\/implement@1 is not runnable for the simplify phase/);
+
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: {
+        skills: ["builtin://ce/review@1"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      leadLoop: { skill: "builtin://ce/review@1" },
+    }))).toThrow(/graph\.nodes\.units\.phases\.2\.skill: ce\/review@1 is not runnable for the lead phase/);
+  });
+
   it.each([
     [
       "for_each_unit nodes",
@@ -613,6 +765,11 @@ describe("execution graph compiler", () => {
         },
       }),
       /graph\.loops\.loop\.input_scope: for_each_unit phases require unit input scope/,
+    ],
+    [
+      "parallel for_each_unit loops",
+      minimalUnitGraph({ loop: { max_parallel: 2 } }),
+      /graph\.loops\[0\]\.max_parallel: must be an integer between 1 and 1/,
     ],
     [
       "human nodes",
@@ -661,6 +818,7 @@ describe("execution graph compiler", () => {
         },
         loop: {
           skill: "builtin://ce/review@1",
+          input_scope: "diff",
           receipt: "semantic_review",
         },
       }),

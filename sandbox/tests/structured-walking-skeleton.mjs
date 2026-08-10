@@ -35,6 +35,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..", "..");
 const IMAGE = process.argv[2] ?? "openthrottle:test";
 const STRUCTURED_GRAPH_PATH = join(REPO_ROOT, "supervisor", "graphs", "structured-v2.json");
+const WALKING_SKELETON_REPAIR_ROUNDS = 2;
 const CATALOG_PATH = join(REPO_ROOT, "supervisor", "pipelines", "catalog.yaml");
 const STUB_AGENT_PATH = join(__dirname, "fixtures", "walking-skeleton-agent-stub.mjs");
 // The configured `test` command, shared by the fixture's own .openthrottle.yml
@@ -667,7 +668,17 @@ function setupInstance({ db, pipelines, tickets, runtimeDescriptor, fixture, iss
 
 let graphFileCache;
 function readGraphFile() {
-  if (!graphFileCache) graphFileCache = readFileSync(STRUCTURED_GRAPH_PATH, "utf8");
+  if (!graphFileCache) {
+    const graph = JSON.parse(readFileSync(STRUCTURED_GRAPH_PATH, "utf8"));
+    const leadLoop = graph.loops?.find((loop) => loop.id === "lead-loop");
+    assert(leadLoop, "structured walking-skeleton fixture is missing lead-loop");
+    // The shipped graph deliberately permits one repeated lead decision. This
+    // fixture needs two repair cycles for the OPE-101 second-session-relocation
+    // regression, so widen only the ephemeral test graph rather than mutating
+    // the immutable builtin contract exercised by admission tests.
+    leadLoop.max_rounds = WALKING_SKELETON_REPAIR_ROUNDS;
+    graphFileCache = JSON.stringify(graph);
+  }
   return graphFileCache;
 }
 

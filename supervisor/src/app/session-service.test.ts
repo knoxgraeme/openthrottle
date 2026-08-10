@@ -1212,6 +1212,7 @@ intents:
       graphId: "repo_structured",
       blobSha: "c".repeat(40),
       path: graphPath,
+      compilerVersion: 2,
     }))}`);
     expect(manifest.stages.find((stage) => stage.id === "publish")?.context).toBe("prefer_resume");
   });
@@ -1638,10 +1639,18 @@ commands:
         graphId: "docs",
         blobSha: "c".repeat(40),
         path: graphPath,
+        compilerVersion: 2,
       }))}`,
       pipeline_version: 1,
       active_stage_id: "verify",
     });
+    expect(pipelines.getInstanceForSession("session-1")?.pipeline_id).not.toBe(
+      `repository/${digestNormalized(canonicalJson({
+        graphId: "docs",
+        blobSha: "c".repeat(40),
+        path: graphPath,
+      }))}`
+    );
     const request = pipelines.getStageRequest(pipelines.getActiveAttempt(pipelines.getInstanceForSession("session-1")!.id)!.id);
     expect(request.commandName).toBe("docs-check");
   });
@@ -1714,13 +1723,83 @@ commands:
       graphId: "docs_a",
       blobSha: "c".repeat(40),
       path: graphA,
+      compilerVersion: 2,
     }))}`);
     expect(second.pipeline_id).toBe(`repository/${digestNormalized(canonicalJson({
       graphId: "docs_b",
       blobSha: "c".repeat(40),
       path: graphB,
+      compilerVersion: 2,
     }))}`);
     expect(second.pipeline_id).not.toBe(first.pipeline_id);
+  });
+
+  it("rejects repository ordinary loop timeouts that are not the effective hard deadline", async () => {
+    const graphPath = ".openthrottle/graphs/ordinary-timeout.json";
+    const graph = JSON.stringify({
+      schema: "openthrottle.graph/v1",
+      id: "ordinary-timeout",
+      version: 1,
+      entry_node: "implementation",
+      workers: [{
+        id: "implementer",
+        engine: "agent",
+        session_scope: "attempt",
+        credentials: ["model.invoke", "repo.read", "repo.write"],
+        skills: ["builtin://ce/implement@1"],
+      }],
+      loops: [{
+        id: "implement_loop",
+        worker: "implementer",
+        input_scope: "graph",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 1,
+        skill: "builtin://ce/implement@1",
+        timeout_seconds: 60,
+      }],
+      nodes: [{
+        id: "implementation",
+        kind: "run",
+        loop: "implement_loop",
+        depends_on: [],
+        transitions: {
+          success: { terminal: "completed" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+    const { pipelines, tickets } = await run(
+      `schema: openthrottle.config/v1
+default_graph: ordinary_timeout
+graphs:
+  - id: ordinary_timeout
+    kind: repository
+    ref: ${graphPath}
+limits:
+  task_timeout: 7200
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: ordinary_timeout
+    allowed_graphs: [ordinary_timeout]
+`,
+      {},
+      shippedCatalogPath,
+      payload(),
+      { [graphPath]: graph }
+    );
+
+    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(pipelines.getInstanceForSession("session-1")).toBeUndefined();
+    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) =>
+      entry.includes("timeout_seconds: must equal the enforced ordinary stage timeout 300")
+    )).toBe(true);
   });
 
   it("pins repository skill packages and carries skill identity in the compiled request", async () => {
@@ -1746,7 +1825,7 @@ commands:
         max_parallel: 1,
         max_rounds: 1,
         skill: "repo://implement_unit",
-        timeout_seconds: 60,
+        timeout_seconds: 300,
       }],
       nodes: [{
         id: "implementation",
@@ -1769,6 +1848,8 @@ graphs:
 skills:
   - id: implement_unit
     path: .agents/skills/implement-unit
+limits:
+  task_timeout: 7200
 pipelines: { implement: implement }
 intents:
   implement:
@@ -1796,6 +1877,7 @@ intents:
         graphId: "repo_skill",
         blobSha: "c".repeat(40),
         path: graphPath,
+        compilerVersion: 2,
       }))}`,
       active_stage_id: "implementation",
     });
@@ -1870,6 +1952,8 @@ graphs:
 skills:
   - id: implement_unit
     path: .agents/skills/implement-unit
+limits:
+  task_timeout: 60
 pipelines: { implement: implement }
 intents:
   implement:

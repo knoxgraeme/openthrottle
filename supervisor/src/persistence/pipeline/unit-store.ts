@@ -13,6 +13,7 @@ import type { GateReceiptReason } from "../../pipeline/gates.js";
 import {
   decideDownstreamContext,
   deriveUnitTerminalState,
+  FINAL_REPAIR_MAX_ROUNDS,
   assertValidUnitPhaseSequence,
   nextUnitPhase,
   routeFinalReviewDecision,
@@ -1010,7 +1011,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         outcome: input.decision.outcome,
         reason: input.decision.reason,
         repairRounds: graph.final_repair_rounds,
-        maxRepairRounds: graph.max_repair_rounds,
+        maxRepairRounds: FINAL_REPAIR_MAX_ROUNDS,
       });
       if (routing.action === "done") {
         db.prepare(`
@@ -1035,7 +1036,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
           graph,
           unitId: null,
           kind: "final_review",
-          body: `Whole-change final review needs another repair pass (round ${routing.repairRounds}/${graph.max_repair_rounds}): ${input.decision.reason}.`,
+          body: `Whole-change final review needs another repair pass (round ${routing.repairRounds}/${FINAL_REPAIR_MAX_ROUNDS}): ${input.decision.reason}.`,
           timestamp,
         });
       } else {

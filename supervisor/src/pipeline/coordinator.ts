@@ -598,6 +598,29 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
         })],
       });
     }
+    const completedTargetReentries = Math.max(0, targetState.attempt_count - 1);
+    if (target.loop && targetState.attempt_count > 0 &&
+      completedTargetReentries >= target.loop.max_rounds) {
+      const exhausted = transition.on_exhausted ?? "needs_human";
+      const clearsPublishedBinding = shouldClearPublishedBinding(input);
+      assertTerminalPublishedBinding(input, stage, exhausted, clearsPublishedBinding);
+      return terminalWrite({
+        ...input,
+        eventPayloadHash,
+        terminal: exhausted,
+        publishIdempotencyKey: `linear-loop-rounds-exhausted:${input.instance.id}:${target.id}:${target.loop.max_rounds}`,
+        waitReason: `stage ${target.id} loop round limit ${target.loop.max_rounds} exhausted`,
+        immutableSubject: input.event.subject ?? null,
+        publishedCommit: publishedCommitForEvent(input, stage),
+        publishedSubject: publishedSubjectForEvent(input, stage),
+        clearPublishedCommit: clearsPublishedBinding,
+        effects: exhausted === "failed" ? [failedTerminalStopEffect({
+          instanceId: input.instance.id,
+          idempotencyKey: `stop:${input.instance.id}:loop-rounds-exhausted`,
+          runId: stopRunId(input.attempt),
+        })] : [],
+      });
+    }
     if (isReentry && transition.max_reentries !== undefined && targetState.reentry_count >= transition.max_reentries) {
       const exhausted = transition.on_exhausted!;
       const clearsPublishedBinding = shouldClearPublishedBinding(input);
