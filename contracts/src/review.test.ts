@@ -87,6 +87,36 @@ function validJournal(): ReviewJournalContract {
       rationale: "The semantic identity rule is now enforced.",
     }],
   };
+  const personaReceipts = [{
+    persona_id: "contract_reviewer",
+    receipt_digest: "d".repeat(64),
+    subject: "b".repeat(40),
+    finding_ids: [finding.finding_id],
+    finding_count: 1,
+    latency_ms: 120,
+    cost_microusd: 450,
+  }];
+  const findingResolutions = [{
+    finding_id: finding.finding_id,
+    exact_dedup_personas: ["contract_reviewer"],
+    semantic_dedup_finding_ids: [finding.finding_id],
+    validator_result: "accepted" as const,
+    corroboration_count: 1,
+    repair_disposition: "fixed" as const,
+    convergence_cycle: 1,
+    state: "resolved" as const,
+  }];
+  const measurements = {
+    persona_count: 1,
+    finding_count: 1,
+    accepted_finding_count: 1,
+    rejected_finding_count: 0,
+    resolved_finding_count: 1,
+    unresolved_finding_count: 0,
+    total_latency_ms: 120,
+    critical_path_latency_ms: 120,
+    total_cost_microusd: 450,
+  };
   return {
     schema: REVIEW_JOURNAL_SCHEMA,
     subject: {
@@ -97,25 +127,40 @@ function validJournal(): ReviewJournalContract {
     policy,
     roster,
     selection,
+    persona_receipts: personaReceipts,
     synthesis,
     validation,
     repair_disposition: repairDisposition,
+    finding_resolutions: findingResolutions,
+    measurements,
     entries: [{
       at: "2026-08-10T00:00:01.000Z",
       kind: "selection",
       digest: digestCanonicalJson(selection),
     }, {
       at: "2026-08-10T00:00:02.000Z",
+      kind: "persona_receipts",
+      digest: digestCanonicalJson(personaReceipts),
+    }, {
+      at: "2026-08-10T00:00:03.000Z",
       kind: "synthesis",
       digest: digestCanonicalJson(synthesis),
     }, {
-      at: "2026-08-10T00:00:03.000Z",
+      at: "2026-08-10T00:00:04.000Z",
       kind: "validation",
       digest: digestCanonicalJson(validation),
     }, {
-      at: "2026-08-10T00:00:04.000Z",
+      at: "2026-08-10T00:00:05.000Z",
       kind: "repair_disposition",
       digest: digestCanonicalJson(repairDisposition),
+    }, {
+      at: "2026-08-10T00:00:06.000Z",
+      kind: "finding_resolutions",
+      digest: digestCanonicalJson(findingResolutions),
+    }, {
+      at: "2026-08-10T00:00:07.000Z",
+      kind: "measurements",
+      digest: digestCanonicalJson(measurements),
     }],
   };
 }
@@ -205,5 +250,44 @@ describe("review journal contracts", () => {
 
     expect(() => validateReviewJournalContract(journal, { source: "review" }))
       .toThrow(/review\.synthesis\.findings\[0\]\.path: must not encode line numbers/);
+  });
+
+  it("rejects persona receipt attribution, subject, latency, cost, and finding-count drift", () => {
+    const wrongCount = validJournal();
+    wrongCount.persona_receipts[0]!.finding_count = 0;
+    expect(() => validateReviewJournalContract(wrongCount, { source: "review" }))
+      .toThrow(/review\.persona_receipts\.contract_reviewer\.finding_count: does not match finding_ids length/);
+
+    const wrongSubject = validJournal();
+    wrongSubject.persona_receipts[0]!.subject = "e".repeat(40);
+    expect(() => validateReviewJournalContract(wrongSubject, { source: "review" }))
+      .toThrow(/review\.persona_receipts\.contract_reviewer\.subject: does not match the reviewed subject/);
+
+    const invalidLatency = validJournal();
+    invalidLatency.persona_receipts[0]!.latency_ms = -1;
+    expect(() => validateReviewJournalContract(invalidLatency, { source: "review" }))
+      .toThrow(/review\.persona_receipts\[0\]\.latency_ms: must be an integer between 0/);
+
+    const invalidCost = validJournal();
+    invalidCost.persona_receipts[0]!.cost_microusd = -1;
+    expect(() => validateReviewJournalContract(invalidCost, { source: "review" }))
+      .toThrow(/review\.persona_receipts\[0\]\.cost_microusd: must be an integer between 0/);
+  });
+
+  it("rejects untraceable resolution membership and aggregate measurement drift", () => {
+    const unknownMembership = validJournal();
+    unknownMembership.finding_resolutions[0]!.semantic_dedup_finding_ids = ["finding_" + "1".repeat(32)];
+    expect(() => validateReviewJournalContract(unknownMembership, { source: "review" }))
+      .toThrow(/semantic_dedup_finding_ids: must include its canonical finding_id/);
+
+    const badCorroboration = validJournal();
+    badCorroboration.finding_resolutions[0]!.corroboration_count = 2;
+    expect(() => validateReviewJournalContract(badCorroboration, { source: "review" }))
+      .toThrow(/corroboration_count: does not match exact_dedup_personas length/);
+
+    const wrongMeasurements = validJournal();
+    wrongMeasurements.measurements.total_latency_ms = 119;
+    expect(() => validateReviewJournalContract(wrongMeasurements, { source: "review" }))
+      .toThrow(/review\.measurements: does not match persona and finding evidence/);
   });
 });

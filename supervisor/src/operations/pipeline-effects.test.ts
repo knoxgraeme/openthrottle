@@ -131,7 +131,7 @@ describe("pipeline effect processor", () => {
       dispatchStage: vi.fn(async () => ({ providerDispatchId: ids.providerDispatchId ?? `dispatch-${issueId}` })),
       collectStageResult: vi.fn(async () => null),
       createWorktree: vi.fn(async () => ({ id: `worktree-${issueId}` })),
-      dispatchLoopAction: vi.fn(async () => ({ providerDispatchId: `loop-${issueId}` })),
+      dispatchLoopAction: vi.fn<SandboxRuntime["dispatchLoopAction"]>(async () => ({ providerDispatchId: `loop-${issueId}` })),
       collectLoopActionResult: vi.fn<SandboxRuntime["collectLoopActionResult"]>(async () => null),
       dispatchChildExecutorAction: vi.fn(async () => ({ providerDispatchId: `child-executor-${issueId}` })),
       collectChildExecutorActionResult: vi.fn<SandboxRuntime["collectChildExecutorActionResult"]>(async () => null),
@@ -1166,7 +1166,7 @@ describe("pipeline effect processor", () => {
           (attempt.action_kind === "implement" || attempt.action_kind === "candidate" || attempt.action_kind === "command") &&
           attempt.receipt)
         .map((attempt) => digestNormalized(attempt.receipt!));
-      runtime.collectLoopActionResult.mockResolvedValueOnce({
+      const leadResult = {
         actionId: lead.id,
         attemptId: lead.parent_attempt_id,
         requestHash: lead.request_hash!,
@@ -1183,6 +1183,49 @@ describe("pipeline effect processor", () => {
           evidence: leadEvidence,
         }),
         completedAt: "2099-07-22T12:00:00.000Z",
+      } as const;
+      runtime.collectLoopActionResult.mockImplementation(async (_resource, collection) => {
+        if (collection.actionId === lead.id) return leadResult;
+        const dispatched = runtime.dispatchLoopAction.mock.calls
+          .map(([, request]) => request)
+          .find((request) => request.actionId === collection.actionId);
+        if (!dispatched?.actionId.startsWith(`${lead.id}:review:`) || !dispatched.expectedProducer) return null;
+        return {
+          actionId: dispatched.actionId,
+          attemptId: dispatched.attemptId,
+          requestHash: dispatched.requestHash,
+          outcome: "success",
+          nativeSessionId: null,
+          subject: input.candidate,
+          receipt: canonicalJson({
+            schema: "openthrottle.receipt/v1",
+            type: "semantic_review",
+            assurance: dispatched.expectedProducer.assurance,
+            result: "success",
+            producer: {
+              worker_id: dispatched.expectedProducer.workerId,
+              skill: dispatched.expectedProducer.skill,
+              capability_digest: dispatched.expectedProducer.capabilityDigest,
+              skill_package_digest: dispatched.expectedProducer.skillPackageDigest,
+            },
+            subject: { base: input.baseSubject, pre: input.candidate, post: input.candidate },
+            fence: {
+              pipeline_instance_id: dispatched.pipelineInstanceId,
+              graph_digest: dispatched.graphDigest,
+              unit_id: dispatched.unitId ?? "__final__",
+              attempt_id: dispatched.attemptId,
+              parent_run_id: dispatched.parentRunId,
+              action_attempt_id: dispatched.actionId,
+              generation: dispatched.generation,
+              native_session_id: null,
+              request_hash: dispatched.requestHash,
+            },
+            evidence: [`${dispatched.skill} reviewed the exact candidate`],
+            payload: { summary: "no findings", findings: [] },
+            issued_at: "2099-07-22T12:00:00.000Z",
+          }),
+          completedAt: "2099-07-22T12:00:00.000Z",
+        };
       });
       await processor.drain();
       expect(pipelines.listWorkAttempts(attempt.id).find((attempt) => attempt.id === lead.id))

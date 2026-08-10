@@ -81,6 +81,26 @@ A repository-scoped skill may replace any of these when it emits the same
 coordinator evaluates the receipt and executor-derived Git/command evidence,
 not implementation details internal to the skill.
 
+The structured supervisor selects a bounded roster from plan and command risk
+signals, seals it to one exact subject, and dispatches every selected persona
+as its own fresh, read-only loop action. Personas never spawn other personas.
+The ordinary lead or `final-review` action is dispatched separately; after all
+results arrive, the supervisor rejects missing, duplicate, unexpected, or
+wrong-subject receipts and deterministically synthesizes the independent
+findings. A blocker from that synthesis is overlaid onto the lead/final-review
+gate even when the ordinary review returned success. After repair, the roster
+digest must match the prior cycle before any rereview result can settle.
+
+Review journal contracts keep this assurance measurable without granting it
+transition authority. They digest the sealed selection, per-persona receipt
+evidence, synthesis, validation, repair disposition, finding resolution, and
+aggregate measurements. Cross-references bind persona receipts to the reviewed
+subject and selected roster; finding ids to exact/semantic dedup membership,
+validator outcome, corroboration, repair disposition, convergence cycle, and
+resolution state; and aggregate finding, latency, and measured-cost totals back
+to those typed records. Later self-learning stages may analyze that corpus, but
+cannot mutate a live roster or gate from journal data.
+
 ## Delivery per agent
 
 The canonical `SKILL.md` is maintained once:

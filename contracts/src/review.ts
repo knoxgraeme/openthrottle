@@ -8,6 +8,7 @@ import {
   enumAt,
   fail,
   integerAt,
+  nullable,
   normalizedContract,
   objectAt,
   stringAt,
@@ -27,13 +28,25 @@ export const REVIEW_JOURNAL_SCHEMA = "openthrottle.review-journal/v1" as const;
 export const REVIEW_SEVERITIES = ["P0", "P1", "P2", "P3"] as const;
 export const REVIEW_OUTCOMES = ["success", "semantic_repair_required", "failure", "needs_human"] as const;
 export const REPAIR_DISPOSITIONS = ["accepted", "fixed", "deferred", "rejected", "superseded"] as const;
+export const REVIEW_VALIDATOR_RESULTS = ["accepted", "rejected"] as const;
+export const REVIEW_RESOLUTION_STATES = ["resolved", "unresolved"] as const;
 export const FINDING_ID_PREFIX = "finding_" as const;
 const FINDING_ID_PATTERN = /^finding_[a-f0-9]{32}$/;
-const REVIEW_JOURNAL_ENTRY_KINDS = ["selection", "synthesis", "validation", "repair_disposition"] as const;
+const REVIEW_JOURNAL_ENTRY_KINDS = [
+  "selection",
+  "persona_receipts",
+  "synthesis",
+  "validation",
+  "repair_disposition",
+  "finding_resolutions",
+  "measurements",
+] as const;
 
 type ReviewSeverity = (typeof REVIEW_SEVERITIES)[number];
 type ReviewOutcome = (typeof REVIEW_OUTCOMES)[number];
 type RepairDisposition = (typeof REPAIR_DISPOSITIONS)[number];
+type ReviewValidatorResult = (typeof REVIEW_VALIDATOR_RESULTS)[number];
+type ReviewResolutionState = (typeof REVIEW_RESOLUTION_STATES)[number];
 type ReviewJournalEntryKind = (typeof REVIEW_JOURNAL_ENTRY_KINDS)[number];
 
 export interface ReviewPersonaPolicy {
@@ -127,6 +140,39 @@ export interface ReviewJournalEntry {
   digest: string;
 }
 
+export interface ReviewPersonaReceiptEvidence {
+  persona_id: string;
+  receipt_digest: string;
+  subject: string;
+  finding_ids: string[];
+  finding_count: number;
+  latency_ms: number;
+  cost_microusd: number | null;
+}
+
+export interface ReviewFindingResolution {
+  finding_id: string;
+  exact_dedup_personas: string[];
+  semantic_dedup_finding_ids: string[];
+  validator_result: ReviewValidatorResult;
+  corroboration_count: number;
+  repair_disposition: RepairDisposition;
+  convergence_cycle: number;
+  state: ReviewResolutionState;
+}
+
+export interface ReviewMeasurements {
+  persona_count: number;
+  finding_count: number;
+  accepted_finding_count: number;
+  rejected_finding_count: number;
+  resolved_finding_count: number;
+  unresolved_finding_count: number;
+  total_latency_ms: number;
+  critical_path_latency_ms: number;
+  total_cost_microusd: number | null;
+}
+
 export interface ReviewJournalContract {
   schema: typeof REVIEW_JOURNAL_SCHEMA;
   subject: {
@@ -137,9 +183,12 @@ export interface ReviewJournalContract {
   policy: ReviewPolicyContract;
   roster: SealedReviewRosterContract;
   selection: ReviewSelectionContract;
+  persona_receipts: ReviewPersonaReceiptEvidence[];
   synthesis: ReviewSynthesisContract;
   validation: ReviewValidationContract;
   repair_disposition: ReviewRepairDispositionContract;
+  finding_resolutions: ReviewFindingResolution[];
+  measurements: ReviewMeasurements;
   entries: ReviewJournalEntry[];
 }
 
@@ -301,6 +350,87 @@ function parseRepairDisposition(value: unknown, path: string): ReviewRepairDispo
   return repair;
 }
 
+function parsePersonaReceipt(value: unknown, path: string): ReviewPersonaReceiptEvidence {
+  const input = objectAt(value, path, [
+    "persona_id", "receipt_digest", "subject", "finding_ids", "finding_count", "latency_ms", "cost_microusd",
+  ]);
+  const findingIds = unique(arrayAt(
+    input.finding_ids,
+    `${path}.finding_ids`,
+    (entry, entryPath) => stringAt(entry, entryPath, { max: 40, pattern: FINDING_ID_PATTERN }),
+    { max: 64 }
+  ), `${path}.finding_ids`);
+  return {
+    persona_id: stringAt(input.persona_id, `${path}.persona_id`, { pattern: IDENTIFIER }),
+    receipt_digest: stringAt(input.receipt_digest, `${path}.receipt_digest`, { pattern: SHA256 }),
+    subject: stringAt(input.subject, `${path}.subject`, { pattern: GIT_SUBJECT }),
+    finding_ids: findingIds,
+    finding_count: integerAt(input.finding_count, `${path}.finding_count`, 0, 64),
+    latency_ms: integerAt(input.latency_ms, `${path}.latency_ms`, 0, 604_800_000),
+    cost_microusd: nullable(input.cost_microusd, (entry) =>
+      integerAt(entry, `${path}.cost_microusd`, 0, 1_000_000_000_000)),
+  };
+}
+
+function parseFindingResolution(value: unknown, path: string): ReviewFindingResolution {
+  const input = objectAt(value, path, [
+    "finding_id",
+    "exact_dedup_personas",
+    "semantic_dedup_finding_ids",
+    "validator_result",
+    "corroboration_count",
+    "repair_disposition",
+    "convergence_cycle",
+    "state",
+  ]);
+  return {
+    finding_id: stringAt(input.finding_id, `${path}.finding_id`, { max: 40, pattern: FINDING_ID_PATTERN }),
+    exact_dedup_personas: unique(arrayAt(
+      input.exact_dedup_personas,
+      `${path}.exact_dedup_personas`,
+      (entry, entryPath) => stringAt(entry, entryPath, { pattern: IDENTIFIER }),
+      { min: 1, max: 32 }
+    ), `${path}.exact_dedup_personas`),
+    semantic_dedup_finding_ids: unique(arrayAt(
+      input.semantic_dedup_finding_ids,
+      `${path}.semantic_dedup_finding_ids`,
+      (entry, entryPath) => stringAt(entry, entryPath, { max: 40, pattern: FINDING_ID_PATTERN }),
+      { min: 1, max: 64 }
+    ), `${path}.semantic_dedup_finding_ids`),
+    validator_result: enumAt(input.validator_result, `${path}.validator_result`, REVIEW_VALIDATOR_RESULTS),
+    corroboration_count: integerAt(input.corroboration_count, `${path}.corroboration_count`, 1, 32),
+    repair_disposition: enumAt(input.repair_disposition, `${path}.repair_disposition`, REPAIR_DISPOSITIONS),
+    convergence_cycle: integerAt(input.convergence_cycle, `${path}.convergence_cycle`, 1, 64),
+    state: enumAt(input.state, `${path}.state`, REVIEW_RESOLUTION_STATES),
+  };
+}
+
+function parseMeasurements(value: unknown, path: string): ReviewMeasurements {
+  const input = objectAt(value, path, [
+    "persona_count",
+    "finding_count",
+    "accepted_finding_count",
+    "rejected_finding_count",
+    "resolved_finding_count",
+    "unresolved_finding_count",
+    "total_latency_ms",
+    "critical_path_latency_ms",
+    "total_cost_microusd",
+  ]);
+  return {
+    persona_count: integerAt(input.persona_count, `${path}.persona_count`, 1, 32),
+    finding_count: integerAt(input.finding_count, `${path}.finding_count`, 0, 64),
+    accepted_finding_count: integerAt(input.accepted_finding_count, `${path}.accepted_finding_count`, 0, 64),
+    rejected_finding_count: integerAt(input.rejected_finding_count, `${path}.rejected_finding_count`, 0, 64),
+    resolved_finding_count: integerAt(input.resolved_finding_count, `${path}.resolved_finding_count`, 0, 64),
+    unresolved_finding_count: integerAt(input.unresolved_finding_count, `${path}.unresolved_finding_count`, 0, 64),
+    total_latency_ms: integerAt(input.total_latency_ms, `${path}.total_latency_ms`, 0, Number.MAX_SAFE_INTEGER),
+    critical_path_latency_ms: integerAt(input.critical_path_latency_ms, `${path}.critical_path_latency_ms`, 0, 604_800_000),
+    total_cost_microusd: nullable(input.total_cost_microusd, (entry) =>
+      integerAt(entry, `${path}.total_cost_microusd`, 0, Number.MAX_SAFE_INTEGER)),
+  };
+}
+
 function parseJournalEntry(value: unknown, path: string): ReviewJournalEntry {
   const input = objectAt(value, path, ["at", "kind", "digest"]);
   return {
@@ -331,6 +461,25 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
   const selectedPersonaIds = new Set(journal.selection.personas.map((persona) => persona.persona_id));
   for (const persona of journal.selection.personas) {
     if (!rosterPersonas.has(persona.persona_id)) fail(`${source}.selection.personas.${persona.persona_id}`, "references an unknown roster persona");
+  }
+  unique(journal.persona_receipts.map((receipt) => receipt.persona_id), `${source}.persona_receipts.persona_id`);
+  unique(journal.persona_receipts.map((receipt) => receipt.receipt_digest), `${source}.persona_receipts.receipt_digest`);
+  const receiptPersonaIds = new Set(journal.persona_receipts.map((receipt) => receipt.persona_id));
+  for (const personaId of selectedPersonaIds) {
+    if (!receiptPersonaIds.has(personaId)) {
+      fail(`${source}.persona_receipts`, `missing selected persona ${personaId}`);
+    }
+  }
+  for (const receipt of journal.persona_receipts) {
+    if (!selectedPersonaIds.has(receipt.persona_id)) {
+      fail(`${source}.persona_receipts.${receipt.persona_id}`, "references an unselected persona");
+    }
+    if (receipt.subject !== journal.subject.pre) {
+      fail(`${source}.persona_receipts.${receipt.persona_id}.subject`, "does not match the reviewed subject");
+    }
+    if (receipt.finding_count !== receipt.finding_ids.length) {
+      fail(`${source}.persona_receipts.${receipt.persona_id}.finding_count`, "does not match finding_ids length");
+    }
   }
   if (journal.synthesis.selection_id !== journal.selection.selection_id) {
     fail(`${source}.synthesis.selection_id`, "does not match selection_id");
@@ -372,11 +521,96 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
       fail(`${source}.repair_disposition.dispositions.${disposition.finding_id}`, "references an unknown finding");
     }
   }
+  unique(journal.finding_resolutions.map((resolution) => resolution.finding_id), `${source}.finding_resolutions.finding_id`);
+  const dispositions = new Map(journal.repair_disposition.dispositions.map((entry) => [entry.finding_id, entry]));
+  const resolutions = new Map(journal.finding_resolutions.map((resolution) => [resolution.finding_id, resolution]));
+  const semanticMembership = new Map<string, string>();
+  for (const findingId of findings.keys()) {
+    if (!resolutions.has(findingId)) fail(`${source}.finding_resolutions`, `missing synthesized finding ${findingId}`);
+  }
+  for (const resolution of journal.finding_resolutions) {
+    if (!findings.has(resolution.finding_id)) {
+      fail(`${source}.finding_resolutions.${resolution.finding_id}`, "references an unknown synthesized finding");
+    }
+    if (!resolution.semantic_dedup_finding_ids.includes(resolution.finding_id)) {
+      fail(`${source}.finding_resolutions.${resolution.finding_id}.semantic_dedup_finding_ids`, "must include its canonical finding_id");
+    }
+    for (const personaId of resolution.exact_dedup_personas) {
+      const receipt = journal.persona_receipts.find((entry) => entry.persona_id === personaId);
+      if (!receipt) {
+        fail(`${source}.finding_resolutions.${resolution.finding_id}.exact_dedup_personas`, `references unknown persona ${personaId}`);
+      }
+      if (!receipt.finding_ids.includes(resolution.finding_id)) {
+        fail(`${source}.finding_resolutions.${resolution.finding_id}.exact_dedup_personas`, `${personaId} did not report the canonical finding`);
+      }
+    }
+    const expectedExactPersonas = journal.persona_receipts
+      .filter((receipt) => receipt.finding_ids.includes(resolution.finding_id))
+      .map((receipt) => receipt.persona_id)
+      .sort();
+    const actualExactPersonas = [...resolution.exact_dedup_personas].sort();
+    if (digestCanonicalJson(actualExactPersonas) !== digestCanonicalJson(expectedExactPersonas)) {
+      fail(`${source}.finding_resolutions.${resolution.finding_id}.exact_dedup_personas`, "does not match exact persona membership");
+    }
+    if (resolution.corroboration_count !== resolution.exact_dedup_personas.length) {
+      fail(`${source}.finding_resolutions.${resolution.finding_id}.corroboration_count`, "does not match exact_dedup_personas length");
+    }
+    const disposition = dispositions.get(resolution.finding_id);
+    if (!disposition) {
+      fail(`${source}.repair_disposition.dispositions`, `missing synthesized finding ${resolution.finding_id}`);
+    }
+    if (resolution.repair_disposition !== disposition.disposition) {
+      fail(`${source}.finding_resolutions.${resolution.finding_id}.repair_disposition`, "does not match repair disposition");
+    }
+    for (const memberId of resolution.semantic_dedup_finding_ids) {
+      const prior = semanticMembership.get(memberId);
+      if (prior) {
+        fail(`${source}.finding_resolutions.${resolution.finding_id}.semantic_dedup_finding_ids`, `finding ${memberId} is already assigned to ${prior}`);
+      }
+      semanticMembership.set(memberId, resolution.finding_id);
+    }
+  }
+  for (const receipt of journal.persona_receipts) {
+    for (const findingId of receipt.finding_ids) {
+      if (!semanticMembership.has(findingId)) {
+        fail(`${source}.persona_receipts.${receipt.persona_id}.finding_ids`, `finding ${findingId} has no semantic dedup membership`);
+      }
+    }
+  }
+  const acceptedFindingCount = journal.finding_resolutions
+    .filter((resolution) => resolution.validator_result === "accepted").length;
+  const rejectedFindingCount = journal.finding_resolutions.length - acceptedFindingCount;
+  const resolvedFindingCount = journal.finding_resolutions
+    .filter((resolution) => resolution.state === "resolved").length;
+  const unresolvedFindingCount = journal.finding_resolutions.length - resolvedFindingCount;
+  const totalLatencyMs = journal.persona_receipts.reduce((total, receipt) => total + receipt.latency_ms, 0);
+  const criticalPathLatencyMs = Math.max(0, ...journal.persona_receipts.map((receipt) => receipt.latency_ms));
+  const measuredCosts = journal.persona_receipts.map((receipt) => receipt.cost_microusd);
+  const totalCostMicrousd = measuredCosts.some((cost) => cost === null)
+    ? null
+    : measuredCosts.reduce<number>((total, cost) => total + (cost ?? 0), 0);
+  const expectedMeasurements: ReviewMeasurements = {
+    persona_count: journal.persona_receipts.length,
+    finding_count: journal.synthesis.findings.length,
+    accepted_finding_count: acceptedFindingCount,
+    rejected_finding_count: rejectedFindingCount,
+    resolved_finding_count: resolvedFindingCount,
+    unresolved_finding_count: unresolvedFindingCount,
+    total_latency_ms: totalLatencyMs,
+    critical_path_latency_ms: criticalPathLatencyMs,
+    total_cost_microusd: totalCostMicrousd,
+  };
+  if (digestCanonicalJson(journal.measurements) !== digestCanonicalJson(expectedMeasurements)) {
+    fail(`${source}.measurements`, "does not match persona and finding evidence");
+  }
   const expectedEntries = [
     { kind: "selection", digest: digestCanonicalJson(journal.selection) },
+    { kind: "persona_receipts", digest: digestCanonicalJson(journal.persona_receipts) },
     { kind: "synthesis", digest: synthesisDigest },
     { kind: "validation", digest: digestCanonicalJson(journal.validation) },
     { kind: "repair_disposition", digest: digestCanonicalJson(journal.repair_disposition) },
+    { kind: "finding_resolutions", digest: digestCanonicalJson(journal.finding_resolutions) },
+    { kind: "measurements", digest: digestCanonicalJson(journal.measurements) },
   ] as const;
   if (journal.entries.length !== expectedEntries.length) fail(`${source}.entries`, "must contain one digest for each journal artifact");
   for (const [index, expected] of expectedEntries.entries()) {
@@ -392,7 +626,18 @@ export function validateReviewJournalContract(
 ): ValidatedContract<ReviewJournalContract> {
   const source = options.source ?? "review_journal";
   const input = objectAt(value, source, [
-    "schema", "subject", "policy", "roster", "selection", "synthesis", "validation", "repair_disposition", "entries",
+    "schema",
+    "subject",
+    "policy",
+    "roster",
+    "selection",
+    "persona_receipts",
+    "synthesis",
+    "validation",
+    "repair_disposition",
+    "finding_resolutions",
+    "measurements",
+    "entries",
   ]);
   if (input.schema !== REVIEW_JOURNAL_SCHEMA) fail(`${source}.schema`, `must be ${REVIEW_JOURNAL_SCHEMA}`);
   const subject = objectAt(input.subject, `${source}.subject`, ["base", "pre", "post"]);
@@ -406,9 +651,12 @@ export function validateReviewJournalContract(
     policy: parsePolicy(input.policy, `${source}.policy`),
     roster: parseRoster(input.roster, `${source}.roster`),
     selection: parseSelection(input.selection, `${source}.selection`),
+    persona_receipts: arrayAt(input.persona_receipts, `${source}.persona_receipts`, parsePersonaReceipt, { min: 1, max: 32 }),
     synthesis: parseSynthesis(input.synthesis, `${source}.synthesis`),
     validation: parseValidation(input.validation, `${source}.validation`),
     repair_disposition: parseRepairDisposition(input.repair_disposition, `${source}.repair_disposition`),
+    finding_resolutions: arrayAt(input.finding_resolutions, `${source}.finding_resolutions`, parseFindingResolution, { max: 64 }),
+    measurements: parseMeasurements(input.measurements, `${source}.measurements`),
     entries: arrayAt(input.entries, `${source}.entries`, parseJournalEntry, { max: 16 }),
   };
   validateCrossReferences(journal, source);

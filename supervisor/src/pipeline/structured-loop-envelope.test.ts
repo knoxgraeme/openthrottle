@@ -252,7 +252,7 @@ describe("downstream-context admission bound", () => {
     expect(Buffer.byteLength(canonicalJson(context), "utf8")).toBeLessThanOrEqual(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
   });
 
-  it("seals deterministic review fanout context into unit lead requests", () => {
+  it("seals deterministic review fanout context into unit lead and final-review requests", () => {
     const plan: ExecutionPlanContract = {
       schema: "openthrottle.execution-plan/v1",
       graph_id: "structured",
@@ -289,6 +289,21 @@ describe("downstream-context admission bound", () => {
       "performance",
     ]);
     expect(context.review_fanout.max_parallel).toBe(context.review_fanout.personas.length);
+
+    const finalReviewContext = loopActionPlanContext({
+      plan,
+      actionKind: "final_review",
+      unitId: null,
+      reviewSubject: "2".repeat(40),
+    }) as { review_fanout: { subject: string; roster_digest: string; personas: Array<{ id: string }> } };
+    expect(finalReviewContext.review_fanout).toMatchObject({
+      subject: "2".repeat(40),
+      roster_digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      personas: expect.arrayContaining([
+        expect.objectContaining({ id: "correctness-dataflow" }),
+        expect.objectContaining({ id: "tests-contracts" }),
+      ]),
+    });
   });
 
   it("preserves valid 1,001-2,000 character final-review criteria when the full context fits", () => {

@@ -290,6 +290,41 @@ describe("loop action request validation", () => {
     expect(() => validateLoopRequest({ ...valid, skill: "ce-code-review" })).toThrow(/stale/);
   });
 
+  it("allows every installed review persona only as an independently fenced read-only review action", () => {
+    const personas = [
+      "select-review-personas",
+      "correctness-dataflow",
+      "tests-contracts",
+      "reliability-adversarial",
+      "agent-native-contracts",
+      "security",
+      "data-migration",
+      "performance",
+      "project-standards",
+    ];
+    for (const skill of personas) {
+      const valid = validateLoopRequest(request({
+        role: "reviewer",
+        loop: "review",
+        skill,
+        worktree: null,
+        contextPolicy: "fresh",
+        allowedMcpServers: [],
+        credentialScopes: ["model.invoke", "repo.read"],
+      }));
+      expect(valid).toMatchObject({ role: "reviewer", loop: "review", skill, worktree: null });
+    }
+
+    const writable = request({
+      role: "reviewer",
+      loop: "review",
+      skill: "security",
+      worktree: null,
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+    });
+    expect(() => validateLoopRequest(writable)).toThrow(/structured loop actions cannot request repo.write/);
+  });
+
   it("keeps loop-action@2 backward-compatible when parentRunId is absent", () => {
     const { parentRunId: _parentRunId, requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...legacyWithoutFence } = request();
     const legacy = { ...legacyWithoutFence, ...createLoopRequestHash(legacyWithoutFence) };
