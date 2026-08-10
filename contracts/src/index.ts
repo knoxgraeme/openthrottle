@@ -11,6 +11,7 @@ export {
 } from "./determinism-fixture.js";
 export {
   CONFIG_SCHEMA,
+  DEFAULT_CONFIG_LIMITS,
   GRAPH_SOURCE_KINDS,
   parseRepositoryConfigContract,
   validateRepositoryConfigContract,

@@ -1,5 +1,9 @@
 import { canonicalJson } from "./canonical.js";
-import { validateRepositoryConfigContract, type RepositoryConfigContract } from "./config.js";
+import {
+  DEFAULT_CONFIG_LIMITS,
+  validateRepositoryConfigContract,
+  type RepositoryConfigContract,
+} from "./config.js";
 import { validateGraphContract, type GraphContract } from "./graph.js";
 import {
   IDENTIFIER,
@@ -35,6 +39,7 @@ export const RATCHET_REJECTION_REASONS = [
   "missing_pinned_artifact",
   "missing_proposed_artifact",
   "artifact_digest_changed",
+  "artifact_kind_changed",
   "provenance_digest_changed",
   "human_authority_missing",
   "tuner_authority_missing",
@@ -162,10 +167,13 @@ function compareResourceLimit(
   pinned: number | undefined,
   proposed: number | undefined,
   path: string,
-  differences: RatchetDifference[]
+  differences: RatchetDifference[],
+  defaultLimit?: number
 ): void {
-  if (pinned === undefined) return;
-  if (proposed === undefined || proposed > pinned) {
+  const effectivePinned = pinned ?? defaultLimit;
+  const effectiveProposed = proposed ?? defaultLimit;
+  if (effectivePinned === undefined) return;
+  if (effectiveProposed === undefined || effectiveProposed > effectivePinned) {
     pushDifference(differences, "resource_limit_increased", path);
   }
 }
@@ -185,13 +193,15 @@ function compareRepositoryConfigPolicy(
     pinned.limits?.max_turns,
     proposed.limits?.max_turns,
     "config.limits.max_turns",
-    differences
+    differences,
+    DEFAULT_CONFIG_LIMITS.max_turns
   );
   compareResourceLimit(
     pinned.limits?.task_timeout,
     proposed.limits?.task_timeout,
     "config.limits.task_timeout",
-    differences
+    differences,
+    DEFAULT_CONFIG_LIMITS.task_timeout
   );
 
   const pinnedCommands = pinned.commands ?? {};
@@ -226,10 +236,13 @@ const SKILL_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$
 const FRONTMATTER_DELIMITER = "---";
 const CANONICAL_CONTRACT_SCHEMA = /"schema"\s*:\s*"openthrottle\.[^"]+"/;
 const COMMAND_OR_TOOL_ALLOWLIST = /\b(?:command|commands|tool|tools|mcp|allowlist|allowed_mcp_servers)\b/i;
+const COMMAND_OR_TOOL_INVOCATION = /(?:\b(?:run|execute|invoke|call|use)\s+`[^`]+`|\b(?:npm|npx|pnpm|yarn|bun|node|deno|python|pytest|cargo|go|make|docker|flyctl|curl|wget)\s+[A-Za-z0-9]|\bmcp__[A-Za-z0-9_]+\b)/i;
 const CRAFT_SECTION = /^##\s+(?:craft|reference|references|heuristic|heuristics|method|methods)\b/i;
 const FORBIDDEN_SKILL_TOKENS = [
   /\bce-[a-z][a-z-]*[a-z]\b/,
   /\brequest_user_input\b/,
+  /\bAskUserQuestion\b/i,
+  /\bask_user\b/i,
   /\bask\s+(?:the\s+)?user\s+for\s+confirmation\b/i,
   /\bwait\s+for\s+confirmation\b/i,
   /\bblocking\s+(?:question|approval)\b/i,
@@ -239,18 +252,18 @@ const FORBIDDEN_SKILL_TOKENS = [
   /\bprompt\s*\(/i,
 ];
 
-function skillFrontmatter(raw: string): string {
+function skillFrontmatter(raw: string): string | null {
   const normalized = raw.replace(/\r\n/g, "\n");
   const lines = normalized.split("\n");
-  if (lines[0] !== FRONTMATTER_DELIMITER) fail("repository_skills.SKILL.md", "is missing frontmatter");
+  if (lines[0] !== FRONTMATTER_DELIMITER) return null;
   const end = lines.indexOf(FRONTMATTER_DELIMITER, 1);
-  if (end === -1) fail("repository_skills.SKILL.md", "frontmatter is unterminated");
+  if (end === -1) return null;
   return lines.slice(0, end + 1).join("\n");
 }
 
 function canonicalContractBlocks(raw: string): string[] {
   const blocks: string[] = [];
-  const fence = /```(?:json)?\n([\s\S]*?)```/g;
+  const fence = /^```[^\n]*\n([\s\S]*?)^```[\t ]*$/gm;
   for (const match of raw.matchAll(fence)) {
     const body = match[1]!.trim();
     if (CANONICAL_CONTRACT_SCHEMA.test(body)) blocks.push(body);
@@ -263,9 +276,27 @@ function immutableSkillLines(raw: string): string[] {
   const lines = normalized.split("\n");
   const immutable: string[] = [];
   let currentCraftSection = false;
+  let protectedSubsectionLevel: number | null = null;
   for (const line of lines) {
-    if (line.startsWith("## ")) currentCraftSection = CRAFT_SECTION.test(line);
-    if (!currentCraftSection || COMMAND_OR_TOOL_ALLOWLIST.test(line)) immutable.push(line);
+    const heading = /^(#{2,6})\s+/.exec(line);
+    if (heading) {
+      const level = heading[1]!.length;
+      if (level === 2) {
+        currentCraftSection = CRAFT_SECTION.test(line);
+        protectedSubsectionLevel = null;
+      } else if (currentCraftSection) {
+        if (protectedSubsectionLevel !== null && level <= protectedSubsectionLevel) {
+          protectedSubsectionLevel = null;
+        }
+        if (COMMAND_OR_TOOL_ALLOWLIST.test(line)) protectedSubsectionLevel = level;
+      }
+    }
+    if (
+      !currentCraftSection ||
+      protectedSubsectionLevel !== null ||
+      COMMAND_OR_TOOL_ALLOWLIST.test(line) ||
+      COMMAND_OR_TOOL_INVOCATION.test(line)
+    ) immutable.push(line);
   }
   return immutable;
 }
@@ -276,7 +307,13 @@ function compareSkillMdImmutableContent(
   path: string,
   differences: RatchetDifference[]
 ): void {
-  if (skillFrontmatter(pinned) !== skillFrontmatter(proposed)) {
+  const pinnedFrontmatter = skillFrontmatter(pinned);
+  const proposedFrontmatter = skillFrontmatter(proposed);
+  if (
+    pinnedFrontmatter === null ||
+    proposedFrontmatter === null ||
+    pinnedFrontmatter !== proposedFrontmatter
+  ) {
     pushDifference(differences, "skill_immutable_changed", `${path}.frontmatter`);
   }
   if (!sameCanonical(canonicalContractBlocks(pinned), canonicalContractBlocks(proposed))) {
@@ -298,8 +335,30 @@ function isReferenceFile(path: string): boolean {
 function compareRepositorySkillPackages(
   pinned: RatchetRepositorySkillPackage[],
   proposed: RatchetRepositorySkillPackage[],
-  differences: RatchetDifference[]
+  differences: RatchetDifference[],
+  pinnedConfig?: RepositoryConfigContract,
+  proposedConfig?: RepositoryConfigContract
 ): void {
+  const assertTunabilityBindings = (
+    config: RepositoryConfigContract | undefined,
+    packages: RatchetRepositorySkillPackage[]
+  ): void => {
+    if (!config) return;
+    const configuredById = new Map((config.skills ?? []).map((skill) => [skill.id, skill]));
+    for (const skillPackage of packages) {
+      const configured = configuredById.get(skillPackage.id);
+      if (!configured || (configured.tunable ?? true) !== skillPackage.tunable) {
+        uniqueDifference(
+          differences,
+          "skill_immutable_changed",
+          `repository_skills.${skillPackage.id}.tunable_binding`
+        );
+      }
+    }
+  };
+  assertTunabilityBindings(pinnedConfig, pinned);
+  assertTunabilityBindings(proposedConfig, proposed);
+
   const pinnedById = new Map(pinned.map((skill) => [skill.id, skill]));
   const proposedById = new Map(proposed.map((skill) => [skill.id, skill]));
   for (const pinnedSkill of pinned) {
@@ -589,6 +648,9 @@ export function decideDifferentialRatchet(input: RatchetDifferentialInput): Ratc
     if (proposed.artifact_digest !== pinned.artifact_digest) {
       differences.push({ reason: "artifact_digest_changed", artifact_id: pinned.id });
     }
+    if (proposed.kind !== pinned.kind) {
+      differences.push({ reason: "artifact_kind_changed", artifact_id: pinned.id });
+    }
     if (proposed.provenance_digest !== pinned.provenance_digest) {
       differences.push({ reason: "provenance_digest_changed", artifact_id: pinned.id });
     }
@@ -603,7 +665,7 @@ export function decideDifferentialRatchet(input: RatchetDifferentialInput): Ratc
   if (!contract.human_authority) differences.push({ reason: "human_authority_missing" });
   if (!contract.tuner_authority) differences.push({ reason: "tuner_authority_missing" });
   if (contract.human_authority && contract.tuner_authority &&
-      contract.human_authority.approval_digest === contract.tuner_authority.proposal_digest) {
+      contract.human_authority.actor_id === contract.tuner_authority.tuner_id) {
     differences.push({ reason: "authority_conflict" });
   }
   if (Boolean(contract.pinned_config) !== Boolean(contract.proposed_config)) {
@@ -622,17 +684,34 @@ export function decideDifferentialRatchet(input: RatchetDifferentialInput): Ratc
     compareRepositorySkillPackages(
       contract.pinned_repository_skills,
       contract.proposed_repository_skills,
-      differences
+      differences,
+      contract.pinned_config,
+      contract.proposed_config
     );
   }
 
   const reject_reasons = [...new Set(differences.map((difference) => difference.reason))];
+  const boundedDifferences = (() => {
+    if (differences.length <= 128) return differences;
+    const requiredIndexes = new Set<number>();
+    const seenReasons = new Set<RatchetRejectionReason>();
+    for (const [index, difference] of differences.entries()) {
+      if (!seenReasons.has(difference.reason)) {
+        seenReasons.add(difference.reason);
+        requiredIndexes.add(index);
+      }
+    }
+    for (let index = 0; index < differences.length && requiredIndexes.size < 128; index += 1) {
+      requiredIndexes.add(index);
+    }
+    return [...requiredIndexes].sort((left, right) => left - right).map((index) => differences[index]!);
+  })();
   return {
     schema: RATCHET_DECISION_SCHEMA,
     input_digest: validated.digest,
     outcome: differences.length === 0 ? "accept" : "reject",
     reject_reasons,
-    differences,
+    differences: boundedDifferences,
   };
 }
 
@@ -649,7 +728,7 @@ export function validateRatchetDecision(
     outcome: enumAt(input.outcome, `${source}.outcome`, ["accept", "reject"]),
     reject_reasons: unique(arrayAt(input.reject_reasons, `${source}.reject_reasons`, (entry, entryPath) => {
       return enumAt(entry, entryPath, RATCHET_REJECTION_REASONS);
-    }, { max: 16 }), `${source}.reject_reasons`),
+    }, { max: RATCHET_REJECTION_REASONS.length }), `${source}.reject_reasons`),
     differences: arrayAt(input.differences, `${source}.differences`, (entry, entryPath) => {
       const difference = objectAt(entry, entryPath, ["reason", "artifact_id", "path"]);
       return {

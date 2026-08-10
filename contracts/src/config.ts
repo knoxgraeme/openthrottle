@@ -16,6 +16,10 @@ import {
 
 export const CONFIG_SCHEMA = "openthrottle.config/v1" as const;
 export const GRAPH_SOURCE_KINDS = ["builtin", "repository"] as const;
+export const DEFAULT_CONFIG_LIMITS = Object.freeze({
+  max_turns: 200,
+  task_timeout: 7_200,
+} as const);
 
 export interface ConfigGraphSource {
   id: string;

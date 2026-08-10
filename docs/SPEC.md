@@ -803,14 +803,27 @@ transition, reducer, and effect-drain code must not import the analysis store
 to recreate this evidence, and must not treat citation receipts as authority to
 advance pipeline execution.
 
-Differential ratchets compose the citation decision with pinned-baseline policy
-inputs before integration is accepted. Executor integration requests must carry
-schema-bound ratchet evidence before mutating the integration checkout; the
-supervisor recomputes the differential ratchet from the sealed input and
-rejects mismatched input or decision hashes instead of trusting executor-authored
-`accept` claims. Human-only locks are authority records only: they can approve a
-bounded proposal hash, but cannot widen sandbox credentials, repository command
-or MCP scope, immutable skill policy, or bypass the composed ratchet.
+The provider-neutral improvement-proposal gate composes an exact successful
+citation decision with one validated pinned-versus-proposed differential input.
+It binds the citation `proposal_hash` to `tuner_authority.proposal_digest`,
+recomputes the ratchet itself, and journals the exact validated inputs,
+repairable reasons, and deterministic policy digest. `core/tune@1` is the first
+mutation-path caller: it must pass this gate before creating or mutating its
+proposal worktree. Ordinary structured candidate integration is unchanged and
+does not carry self-improvement evidence; any later proposal producer inherits
+the same pre-mutation call requirement.
+
+For config comparison, absent repository limits resolve to the runtime defaults
+(`max_turns=200`, `task_timeout=7200`) before monotonic comparison. Repository
+skill package tunability is bound to the matching exact config entry, where an
+absent `tunable` value means `true`; a config lock cannot be overridden by a
+caller-authored package wrapper. Frontmatter, canonical contract fences, and
+whole command/tool-allowlist subsections are immutable, including annotated
+JSON fences and nested allowlist entries. Human authority and tuner authority
+must have distinct actor identities. `human_authority.approval_digest` names a
+human authority/lock record, not the tuner proposal subject; OPE-115 binds that
+record to its human-merge workflow, while the composed gate binds the tuner
+proposal to citation evidence.
 
 Stage C child-unit work must add any needed live binding state to the owning
 unit/work records rather than reviving empty historical binding tables.

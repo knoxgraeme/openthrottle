@@ -2,17 +2,9 @@ import type {
   CandidateEvidenceReceipt,
   CommandResultReceipt,
   IntegrationEvidenceReceipt,
-  RatchetDecision,
-  RatchetDifferentialInput,
-  ValidatedContract,
   SemanticReviewReceipt,
   UnitCompletionReceipt,
   UnitDecisionReceipt,
-} from "@openthrottle/contracts";
-import {
-  decideDifferentialRatchet,
-  validateRatchetDecision,
-  validateRatchetDifferentialInput,
 } from "@openthrottle/contracts";
 import {
   canonicalJson,
@@ -67,22 +59,6 @@ export interface ExecutionGateDecision {
   artifactHashes: string[];
   payload: string;
   hash: string;
-}
-
-export interface IntegrationRatchetEvidence {
-  citationGate: {
-    hash: string;
-    proposalHash: string;
-    gradeHash: string;
-    result: "passed" | "failed";
-    outcome: StageOutcome;
-    reason: string;
-    sourceDigests: readonly string[];
-  };
-  differentialRatchet: {
-    input: RatchetDifferentialInput;
-    decision: RatchetDecision;
-  };
 }
 
 export interface UnitAcceptanceReceiptFences {
@@ -184,7 +160,6 @@ function seal(kind: ExecutionGateDecision["gateKind"], input: {
   result: GateResult;
   reason: GateReceiptReason;
   artifactHashes: string[];
-  ratchetJournal?: Record<string, unknown>;
 }): ExecutionGateDecision {
   const artifactHashes = [...input.artifactHashes].sort();
   const payload = canonicalJson({
@@ -204,7 +179,6 @@ function seal(kind: ExecutionGateDecision["gateKind"], input: {
     result: input.result,
     reason: input.reason,
     artifact_hashes: artifactHashes,
-    ...(input.ratchetJournal ? { ratchet_journal: input.ratchetJournal } : {}),
   });
   return {
     gateKind: kind,
@@ -220,101 +194,6 @@ function seal(kind: ExecutionGateDecision["gateKind"], input: {
 
 function receiptHash(receipt: object): string {
   return digestNormalized(canonicalJson(receipt));
-}
-
-function validatedDigest<T>(validated: ValidatedContract<T>): string {
-  return validated.digest;
-}
-
-function invalidRatchetJournal(reasons: string[]): { accepted: false; journal: Record<string, unknown> } {
-  const policy = canonicalJson({
-    schema: "openthrottle.integration-ratchet-policy/v1",
-    citation_gate: null,
-    differential_ratchet: null,
-    reasons,
-  });
-  return {
-    accepted: false,
-    journal: {
-      schema: "openthrottle.integration-ratchet-journal/v1",
-      policy_digest: digestNormalized(policy),
-      result: "failed",
-      reasons,
-      citation_gate: null,
-      differential_ratchet: null,
-    },
-  };
-}
-
-function integrationRatchetJournal(input: IntegrationRatchetEvidence | null): {
-  accepted: boolean;
-  journal: Record<string, unknown>;
-} {
-  if (!input) return invalidRatchetJournal(["citation_gate_missing", "differential_ratchet_missing"]);
-
-  let inputDigest: string;
-  let claimedDecisionDigest: string;
-  let recomputedDecision: RatchetDecision;
-  let recomputedDecisionDigest: string;
-  try {
-    const validatedInput = validateRatchetDifferentialInput(input.differentialRatchet.input, {
-      source: "integration_ratchet.input",
-    });
-    inputDigest = validatedDigest(validatedInput);
-    const claimedDecision = validateRatchetDecision(input.differentialRatchet.decision, {
-      source: "integration_ratchet.decision",
-    });
-    claimedDecisionDigest = validatedDigest(claimedDecision);
-    recomputedDecision = decideDifferentialRatchet(validatedInput.value);
-    recomputedDecisionDigest = validatedDigest(validateRatchetDecision(recomputedDecision, {
-      source: "integration_ratchet.recomputed_decision",
-    }));
-  } catch {
-    return invalidRatchetJournal(["differential_ratchet_invalid"]);
-  }
-
-  const citationGate = {
-    hash: input.citationGate.hash,
-    proposal_hash: input.citationGate.proposalHash,
-    grade_hash: input.citationGate.gradeHash,
-    result: input.citationGate.result,
-    outcome: input.citationGate.outcome,
-    reason: input.citationGate.reason,
-    source_digests: [...input.citationGate.sourceDigests].sort(),
-  };
-  const differentialRatchet = {
-    input_digest: inputDigest,
-    claimed_input_digest: input.differentialRatchet.decision.input_digest,
-    claimed_decision_digest: claimedDecisionDigest,
-    recomputed_decision_digest: recomputedDecisionDigest,
-    outcome: recomputedDecision.outcome,
-    reject_reasons: recomputedDecision.reject_reasons,
-    differences: recomputedDecision.differences,
-  };
-  const reasons = [
-    ...(citationGate.result === "passed" && citationGate.outcome === "success" ? [] : [`citation_gate:${citationGate.reason}`]),
-    ...(input.differentialRatchet.decision.input_digest === inputDigest ? [] : ["differential_ratchet_input_mismatch"]),
-    ...(claimedDecisionDigest === recomputedDecisionDigest ? [] : ["differential_ratchet_decision_mismatch"]),
-    ...(recomputedDecision.outcome === "accept"
-      ? []
-      : recomputedDecision.reject_reasons.map((reason) => `ratchet:${reason}`)),
-  ];
-  const policy = canonicalJson({
-    schema: "openthrottle.integration-ratchet-policy/v1",
-    citation_gate: citationGate,
-    differential_ratchet: differentialRatchet,
-  });
-  return {
-    accepted: reasons.length === 0,
-    journal: {
-      schema: "openthrottle.integration-ratchet-journal/v1",
-      policy_digest: digestNormalized(policy),
-      result: reasons.length === 0 ? "passed" : "failed",
-      reasons,
-      citation_gate: citationGate,
-      differential_ratchet: differentialRatchet,
-    },
-  };
 }
 
 function issuedAt(receipt: { issued_at: string }, label: string): number {
@@ -410,27 +289,14 @@ export function evaluateUnitAcceptanceGate(input: {
 export function evaluateIntegrationGate(input: {
   expected: StandardReceiptFence;
   integration: IntegrationEvidenceReceipt;
-  ratchet: IntegrationRatchetEvidence | null;
 }): ExecutionGateDecision {
   assertReceiptFence(input.integration, input.expected, "integration");
-  const ratchet = integrationRatchetJournal(input.ratchet);
-  if (!ratchet.accepted) {
-    return seal("integration", {
-      expected: input.expected,
-      outcome: "failure",
-      result: "failed",
-      reason: "integration_evidence_failed",
-      artifactHashes: [receiptHash(input.integration)],
-      ratchetJournal: ratchet.journal,
-    });
-  }
   return seal("integration", {
     expected: input.expected,
     outcome: input.integration.result === "success" ? "success" : "failure",
     result: input.integration.result === "success" ? "passed" : "failed",
     reason: input.integration.result === "success" ? "executor_integrated_candidate" : "integration_evidence_failed",
     artifactHashes: [receiptHash(input.integration)],
-    ratchetJournal: ratchet.journal,
   });
 }
 
