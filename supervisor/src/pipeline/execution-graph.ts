@@ -34,6 +34,7 @@ import {
 import {
   FOR_EACH_UNIT_CAPABILITY,
   ORDINARY_STAGE_BUILTIN_CAPABILITIES,
+  ORDINARY_STAGE_INPUT_SCOPE,
   REPOSITORY_SKILL_CAPABILITY,
   STRUCTURED_PHASE_BUILTIN_CAPABILITIES,
   capabilityCredentialContract,
@@ -274,6 +275,13 @@ function loopTemplate(
   );
   if (repositorySkill === undefined && !ORDINARY_RUN_BUILTIN_CAPABILITIES.has(capability)) {
     fail(`graph.loops.${loop.id}.skill`, `${capability} has no ordinary stage dispatch adapter`);
+  }
+  const enforcedInputScope = ORDINARY_STAGE_INPUT_SCOPE[capability];
+  if (includeOrdinaryLoopBinding && enforcedInputScope !== undefined && loop.input_scope !== enforcedInputScope) {
+    fail(
+      `graph.loops.${loop.id}.input_scope`,
+      `must be ${enforcedInputScope} for ${capability}`
+    );
   }
   const isReview = loop.receipt === "semantic_review";
   const liveSteering = capability === "ce/implement@1" || capability === "ce/investigate@1";

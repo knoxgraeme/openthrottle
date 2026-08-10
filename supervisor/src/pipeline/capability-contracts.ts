@@ -11,6 +11,16 @@ export const ORDINARY_STAGE_BUILTIN_CAPABILITIES = [
   "ce/review@1",
   "ce/simplify@1",
 ] as const;
+export const ORDINARY_STAGE_INPUT_SCOPE: Readonly<Partial<Record<string, "graph" | "diff">>> = {
+  "agent/semantic@1": "graph",
+  "ce/implement@1": "graph",
+  "ce/plan@1": "graph",
+  "ce/publish@1": "graph",
+  "ce/investigate@1": "graph",
+  "ce/review@1": "diff",
+  "ce/simplify@1": "diff",
+  [REPOSITORY_SKILL_CAPABILITY]: "graph",
+};
 export const STRUCTURED_PHASE_BUILTIN_CAPABILITIES = {
   implement: "ce/implement@1",
   simplify: "ce/simplify@1",

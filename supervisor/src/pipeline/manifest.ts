@@ -15,6 +15,7 @@ import { parseDocument } from "yaml";
 import {
   FOR_EACH_UNIT_CAPABILITY,
   ORDINARY_STAGE_BUILTIN_CAPABILITIES,
+  ORDINARY_STAGE_INPUT_SCOPE,
   REPOSITORY_SKILL_CAPABILITY,
   STRUCTURED_PHASE_BUILTIN_CAPABILITIES,
   capabilityCredentialContractViolations,
@@ -665,6 +666,13 @@ function parseStage(
     const expectedCapability = capabilityForLoopSkill(stage.loop, stage.repositorySkill, path);
     if (stage.executor.capability !== expectedCapability) {
       fail(`${path}.executor.capability`, "must match loop.skill");
+    }
+    const enforcedInputScope = ORDINARY_STAGE_INPUT_SCOPE[expectedCapability];
+    if (enforcedInputScope !== undefined && stage.loop.input_scope !== enforcedInputScope) {
+      fail(
+        `${path}.loop.input_scope`,
+        `must be ${enforcedInputScope} for ${expectedCapability}`
+      );
     }
   }
   if (stage.executor.kind === "command") {

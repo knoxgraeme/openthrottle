@@ -159,6 +159,8 @@ export type FinalReviewRouting =
   | { action: "repair"; repairRounds: number }
   | { action: "escalate"; reason: string };
 
+export const FINAL_REPAIR_MAX_ROUNDS = 1;
+
 export function routeFinalReviewDecision(input: {
   outcome: StageOutcome;
   reason: string;

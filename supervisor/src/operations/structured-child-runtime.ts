@@ -24,6 +24,7 @@ import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "../pipeline/coordinator.js";
 import {
   buildAggregateStageEvent,
+  FINAL_REPAIR_MAX_ROUNDS,
   type ExecutionUnitState,
   type UnitActionKind,
 } from "../pipeline/unit-coordinator.js";
@@ -164,6 +165,7 @@ function builtinLoopBinding(input: {
   skill: string;
   credentials: LoopActionRequest["credentialScopes"];
   context?: LoopDispatchBinding["context"];
+  maxRounds?: number;
 }): LoopDispatchBinding {
   return Object.freeze({
     kind: input.kind,
@@ -178,7 +180,7 @@ function builtinLoopBinding(input: {
       input_scope: "unit" as const,
       receipt: input.kind === "gate" ? "unit_decision" : "unit_completion",
       max_parallel: 1,
-      max_rounds: 1,
+      max_rounds: input.maxRounds ?? 1,
       timeout_seconds: 86_400,
     },
     credentials: input.credentials,
@@ -199,6 +201,7 @@ const FINAL_REPAIR_BINDING = builtinLoopBinding({
   skill: "final-repair",
   credentials: ["model.invoke", "repo.read"],
   context: "resume_required",
+  maxRounds: FINAL_REPAIR_MAX_ROUNDS,
 });
 
 function extractExecutionPlan(context: string): ExecutionPlanContract {

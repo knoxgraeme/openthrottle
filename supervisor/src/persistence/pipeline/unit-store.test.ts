@@ -2755,7 +2755,7 @@ describe("execution unit store", () => {
     expect(lease(store)).toBeUndefined();
   });
 
-  it("reruns full commands and forces a fresh final review after a final repair", () => {
+  it("reruns full commands, forces a fresh final review, and enforces the final-repair budget", () => {
     const store = setup();
     const subject = "1".repeat(40);
     store.createGraph({
@@ -2838,45 +2838,15 @@ describe("execution unit store", () => {
         reason: "blocking_findings",
       }),
     });
-    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ final_phase: "repair", final_repair_rounds: 2 });
-
-    const finalRepair2 = lease(store);
-    expect(finalRepair2.action_kind).toBe("final_repair");
-    expect(JSON.parse(finalRepair2.payload)).toMatchObject({ resume_native_session_id: "native-session-final-repair-1" });
-    store.completeUnitAction({ actionId: finalRepair2.id, resultHash: "frp2", outputSubject: repairedIntegratedSubject });
-
-    const finalCandidate2 = lease(store);
-    expect(finalCandidate2).toMatchObject({ action_kind: "candidate", unit_id: null, cycle: 2 });
-    store.completeUnitAction({
-      actionId: finalCandidate2.id, resultHash: "fcandidate2", outputSubject: repairedIntegratedSubject,
-      receipt: receiptJson("candidate_evidence"),
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      stopped_at: timestamp,
+      stop_reason: "final_review_repair_rounds_exhausted",
+      final_repair_rounds: 1,
     });
-
-    const finalIntegrate2 = lease(store);
-    expect(finalIntegrate2).toMatchObject({ action_kind: "integrate", unit_id: null, cycle: 2 });
-    store.completeGatedAction({
-      actionId: finalIntegrate2.id,
-      resultHash: "fintegrate2",
-      outputSubject: repairedIntegratedSubject,
-      receipt: receiptJson("integration_evidence"),
-      decision: gateDecision({ gateKind: "integration", subject: repairedIntegratedSubject }),
-    });
-
-    const finalCommand3 = lease(store);
-    expect(finalCommand3).toMatchObject({ action_kind: "final_command", command_name: "test", cycle: 3 });
-    store.completeUnitAction({
-      actionId: finalCommand3.id, resultHash: "fc3", outputSubject: subject,
-      receipt: receiptJson("command_result", { payload: { command: "test" } }),
-    });
-    const finalReview3 = lease(store);
-    expect(finalReview3).toMatchObject({ action_kind: "final_review", cycle: 3 });
-    store.completeGatedAction({
-      actionId: finalReview3.id,
-      resultHash: "fr3",
-      outputSubject: subject,
-      decision: gateDecision({ gateKind: "final_review", outcome: "success", subject }),
-    });
-    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ final_phase: "done" });
+    expect(store.listWorkAttempts("attempt-parent").filter((attempt) =>
+      attempt.action_kind === "final_repair"
+    )).toHaveLength(1);
+    expect(lease(store)).toBeUndefined();
   });
 
   it("rejects completing a gated phase through the non-gated method and vice versa", () => {

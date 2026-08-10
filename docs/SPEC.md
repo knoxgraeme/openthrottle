@@ -144,14 +144,23 @@ is accepted only when its `timeout_seconds` equals the effective existing hard
 deadline—the lesser
 of supervisor `TASK_TIMEOUT` and repository `limits.task_timeout` (default
 7,200 seconds)—because per-loop ordinary-stage deadlines are not yet carried
-through the sealed stage protocol. Admission rejects any mismatch. For ordinary
-stages, `max_rounds` bounds repeat entries into the stage independently of the
-graph transition and manifest-wide retry/repair safety limits; the first
-forward entry is not a repeat round, and the first exhausted bound wins.
+through the sealed stage protocol. Admission rejects any mismatch. Repository
+ordinary `run` loop scope is fixed by its dispatch adapter: semantic,
+implementation, planning, publication, investigation, and pinned repository
+skills use `graph`, while review and simplification use `diff`. The `review`
+scope and every adapter/scope mismatch are rejected until a sealed request
+projection can enforce them.
+For ordinary stages, `max_rounds` bounds repeat entries into the stage
+independently of the graph transition and manifest-wide retry/repair safety
+limits; the first forward entry is not a repeat round, and the first exhausted
+bound wins.
 Directly loaded `PIPELINE_CATALOG_PATH` manifests reject ordinary stage loop
 bindings because their repository-specific effective timeout cannot be proven
 at catalog load time; ordinary loop bindings are admitted only through
 repository graph compilation and its timeout-equality check.
+Structured unit implementation repairs use the authored implement-loop
+`max_rounds`. Whole-change final-review repair is a distinct internal loop with
+its own one-round bound; it never borrows the unit implementation budget.
 The composite `graph/for-each-unit@1` capability (structured multi-unit
 execution) is installed only with the composition root that constructs and
 drains the child unit runtime. A composite host stage dispatches no

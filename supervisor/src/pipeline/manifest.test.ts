@@ -510,6 +510,40 @@ describe("pipeline manifest validation", () => {
       .toThrow(/pipeline\.stages\[0\]\.repositorySkill\.invocation: must match loop\.skill/);
   });
 
+  it("binds ordinary loop input scope to the dispatched adapter", () => {
+    const semantic = manifest();
+    firstStage(semantic).loop = {
+      id: "semantic-loop",
+      skill: "builtin://agent/semantic@1",
+      input_scope: "diff",
+      receipt: "semantic_review",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+    };
+    expect(() => validatePipelineManifest(semantic))
+      .toThrow(/pipeline\.stages\[0\]\.loop\.input_scope: must be graph for agent\/semantic@1/);
+
+    const review = manifest();
+    review.requires = { protocol: "stage-executor@1", capabilities: ["ce/review@1"] };
+    const reviewStage = firstStage(review);
+    reviewStage.executor = { kind: "agent", capability: "ce/review@1" };
+    reviewStage.loop = {
+      id: "review-loop",
+      skill: "builtin://ce/review@1",
+      input_scope: "diff",
+      receipt: "semantic_review",
+      max_parallel: 1,
+      max_rounds: 1,
+      timeout_seconds: 60,
+    };
+    expect(validatePipelineManifest(review).manifest.stages[0]?.loop?.input_scope).toBe("diff");
+
+    (reviewStage.loop as Record<string, unknown>).input_scope = "review";
+    expect(() => validatePipelineManifest(review))
+      .toThrow(/pipeline\.stages\[0\]\.loop\.input_scope: must be diff for ce\/review@1/);
+  });
+
   it("requires command executors to declare a valid repository command name", () => {
     const command = manifest();
     command.requires = { protocol: "stage-executor@1", capabilities: ["command/run@1"] };

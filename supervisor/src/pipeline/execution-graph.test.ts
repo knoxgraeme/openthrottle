@@ -470,18 +470,47 @@ describe("execution graph compiler", () => {
 
   it("preserves authored ordinary run loop execution settings on compiled stages", () => {
     const compiled = validateAndCompileExecutionGraph(minimalGraph({
-      loop: { input_scope: "diff", receipt: "semantic_review", max_rounds: 7, timeout_seconds: 123 },
+      worker: {
+        skills: ["builtin://ce/review@1"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      loop: {
+        skill: "builtin://ce/review@1",
+        input_scope: "diff",
+        receipt: "semantic_review",
+        max_rounds: 7,
+        timeout_seconds: 123,
+      },
     }), { ordinaryStageTimeoutSeconds: 123 });
 
     expect(compiled.manifest.manifest.stages[0]?.loop).toEqual({
       id: "loop",
-      skill: "builtin://ce/implement@1",
+      skill: "builtin://ce/review@1",
       input_scope: "diff",
       receipt: "semantic_review",
       max_parallel: 1,
       max_rounds: 7,
       timeout_seconds: 123,
     });
+  });
+
+  it.each([
+    { capability: "ce/implement@1", scope: "diff", expected: "graph" },
+    { capability: "ce/implement@1", scope: "review", expected: "graph" },
+    { capability: "ce/review@1", scope: "graph", expected: "diff" },
+    { capability: "ce/review@1", scope: "review", expected: "diff" },
+    { capability: "ce/simplify@1", scope: "graph", expected: "diff" },
+    { capability: "ce/simplify@1", scope: "review", expected: "diff" },
+  ] as const)("rejects $capability ordinary input scope $scope", ({ capability, scope, expected }) => {
+    const credentials = capability === "ce/implement@1"
+      ? ["model.invoke", "provider.read", "repo.read", "repo.write"]
+      : ["model.invoke", "repo.read"];
+    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+      worker: { skills: [`builtin://${capability}`], credentials },
+      loop: { skill: `builtin://${capability}`, input_scope: scope },
+    }))).toThrow(new RegExp(
+      `graph\\.loops\\.loop\\.input_scope: must be ${expected} for ${capability.replace("/", "\\/")}`
+    ));
   });
 
   it.each([123, 600])("rejects ordinary run loop timeout %s when the enforced stage timeout is 300", (timeoutSeconds) => {
@@ -602,6 +631,20 @@ describe("execution graph compiler", () => {
       repositorySkill: pkg,
       credentials: ["model.invoke", "repo.read", "repo.write"],
     });
+
+    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+      worker: {
+        skills: ["repo://implement_unit"],
+        credentials: ["model.invoke", "repo.read", "repo.write"],
+      },
+      loop: {
+        skill: "repo://implement_unit",
+        input_scope: "diff",
+      },
+    }), {
+      runtime: runtime.descriptor,
+      repositorySkills: new Map([["implement_unit", pkg]]),
+    })).toThrow(/graph\.loops\.loop\.input_scope: must be graph for agent\/repository-skill@1/);
   });
 
   it("compiles repository-defined command names from the pinned command inventory", () => {
@@ -775,6 +818,7 @@ describe("execution graph compiler", () => {
         },
         loop: {
           skill: "builtin://ce/review@1",
+          input_scope: "diff",
           receipt: "semantic_review",
         },
       }),
