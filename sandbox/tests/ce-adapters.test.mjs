@@ -32,6 +32,7 @@ const optionalReviewPersonaTasks = [
 ];
 const reviewPersonaTasks = [
   "select-review-personas",
+  "validate-review-findings",
   "correctness-dataflow",
   "tests-contracts",
   ...optionalReviewPersonaTasks,
@@ -405,6 +406,7 @@ describe("OpenThrottle canonical task skills", () => {
       "accept-unit": ["unit_decision", "accept"],
       "final-review": ["semantic_review", "semantic_repair_required"],
       "select-review-personas": ["semantic_review", "success"],
+      "validate-review-findings": ["semantic_review", "semantic_repair_required"],
       "correctness-dataflow": ["semantic_review", "semantic_repair_required"],
       "tests-contracts": ["semantic_review", "success"],
       "reliability-adversarial": ["semantic_review", "semantic_repair_required"],

@@ -1,0 +1,236 @@
+import {
+  REVIEW_FINDING_SCHEMA,
+  REVIEW_JOURNAL_SCHEMA,
+  REVIEW_REPAIR_DISPOSITION_SCHEMA,
+  REVIEW_ROSTER_SCHEMA,
+  REVIEW_SELECTION_SCHEMA,
+  REVIEW_SYNTHESIS_SCHEMA,
+  REVIEW_VALIDATION_SCHEMA,
+  deriveReviewFindingId,
+  digestCanonicalJson,
+  validateReviewJournalContract,
+  type ReviewFinding,
+  type ReviewFindingContract,
+  type ReviewJournalContract,
+  type ReviewPersonaReceiptEvidence,
+  type ReviewSelectionContract,
+  type ReviewSynthesisContract,
+  type ReviewValidationContract,
+  type SemanticReviewReceipt,
+  type SealedReviewRosterContract,
+} from "@openthrottle/contracts";
+import { canonicalJson, digestNormalized } from "./manifest.js";
+import {
+  reviewFindingKey,
+  reviewPolicyContract,
+  type ReviewFanoutPlan,
+  type ReviewPersonaId,
+  type ValidatedReviewFanout,
+} from "./review-fanout.js";
+
+function contractFinding(input: {
+  finding: ReviewFinding;
+  personaId: ReviewPersonaId;
+  evidence: readonly string[];
+  invariant: string;
+}): ReviewFindingContract {
+  const match = /^\[([^#\]]+)#([^:\]]+): ([^\]]+)\]/.exec(input.finding.message);
+  if (!match) throw new Error(`review finding from ${input.personaId} lacks a stable [path#anchor: invariant] identity`);
+  const [, identityPath, semanticAnchor, violatedInvariant] = match;
+  const path = input.finding.path ?? identityPath!;
+  if (path !== identityPath) throw new Error(`review finding from ${input.personaId} has conflicting identity paths`);
+  if (violatedInvariant !== input.invariant) {
+    throw new Error(`review finding from ${input.personaId} must use its sealed invariant`);
+  }
+  const identity = {
+    path,
+    semantic_anchor: semanticAnchor!,
+    violated_invariant: violatedInvariant!,
+  };
+  return {
+    schema: REVIEW_FINDING_SCHEMA,
+    finding_id: deriveReviewFindingId(identity),
+    persona_id: input.personaId,
+    severity: input.finding.severity,
+    ...identity,
+    message: input.finding.message,
+    evidence: [...input.evidence],
+  };
+}
+
+function journalOutcome(outcome: ValidatedReviewFanout["synthesis"]["outcome"]): ReviewSynthesisContract["outcome"] {
+  if (outcome === "success" || outcome === "semantic_repair_required" || outcome === "failure" || outcome === "needs_human") {
+    return outcome;
+  }
+  return "failure";
+}
+
+export function buildReviewJournal(input: {
+  plan: ReviewFanoutPlan;
+  baseSubject: string;
+  receipts: ReadonlyArray<{ receipt: SemanticReviewReceipt; completedAt: string }>;
+  validation: ValidatedReviewFanout;
+  cycle: number;
+  actionCreatedAt: string;
+  recordedAt: string;
+  previousJournal?: ReviewJournalContract;
+}): ReviewJournalContract {
+  const policy = reviewPolicyContract();
+  if (digestCanonicalJson(policy) !== input.plan.policy_digest) {
+    throw new Error("review journal policy does not match the sealed fanout plan");
+  }
+  const selectedPolicy = new Map(policy.personas.map((persona) => [persona.persona_id, persona]));
+  const roster: SealedReviewRosterContract = {
+    schema: REVIEW_ROSTER_SCHEMA,
+    roster_id: input.plan.roster_id,
+    policy_digest: input.plan.policy_digest,
+    personas: input.plan.personas.map((persona) => ({ ...selectedPolicy.get(persona.id)! })),
+    sealed_at: input.actionCreatedAt,
+  };
+  const selection: ReviewSelectionContract = {
+    schema: REVIEW_SELECTION_SCHEMA,
+    selection_id: input.plan.selection_id,
+    roster_digest: digestCanonicalJson(roster),
+    personas: input.plan.personas.map((persona) => ({
+      persona_id: persona.id,
+      rationale: `${persona.reason}: ${persona.rationale}`,
+    })),
+  };
+  const planPersonas = new Map(input.plan.personas.map((persona) => [persona.id, persona]));
+  const startedAt = Date.parse(input.actionCreatedAt);
+  const findingsByPersona = new Map<string, ReviewFindingContract[]>();
+  const personaReceipts: ReviewPersonaReceiptEvidence[] = input.receipts.map(({ receipt, completedAt }) => {
+    const personaId = receipt.producer.worker_id as ReviewPersonaId;
+    const persona = planPersonas.get(personaId);
+    if (!persona) throw new Error(`review journal received unknown persona ${personaId}`);
+    const findings = receipt.payload.findings.map((finding) => contractFinding({
+      finding,
+      personaId,
+      evidence: receipt.evidence,
+      invariant: persona.invariant,
+    }));
+    findingsByPersona.set(personaId, findings);
+    const completed = Date.parse(completedAt);
+    return {
+      persona_id: personaId,
+      receipt_digest: digestNormalized(canonicalJson(receipt)),
+      subject: input.plan.subject,
+      finding_ids: findings.map((finding) => finding.finding_id),
+      finding_count: findings.length,
+      latency_ms: Number.isFinite(startedAt) && Number.isFinite(completed) ? Math.max(0, completed - startedAt) : 0,
+      cost_microusd: null,
+    };
+  });
+  const contractFindings = new Map<string, ReviewFindingContract>();
+  for (const persona of input.plan.personas) {
+    for (const finding of findingsByPersona.get(persona.id) ?? []) {
+      if (!contractFindings.has(finding.finding_id)) contractFindings.set(finding.finding_id, finding);
+    }
+  }
+  const carriedResolvedFindingIds = new Set<string>();
+  if (input.previousJournal) {
+    const previousFindings = new Map(
+      input.previousJournal.synthesis.findings.map((finding) => [finding.finding_id, finding])
+    );
+    for (const resolution of input.previousJournal.finding_resolutions) {
+      if (resolution.state !== "unresolved" || contractFindings.has(resolution.finding_id)) continue;
+      const finding = previousFindings.get(resolution.finding_id);
+      if (!finding) throw new Error(`previous review journal lost unresolved finding ${resolution.finding_id}`);
+      contractFindings.set(finding.finding_id, finding);
+      carriedResolvedFindingIds.add(finding.finding_id);
+    }
+  }
+  const synthesis: ReviewSynthesisContract = {
+    schema: REVIEW_SYNTHESIS_SCHEMA,
+    selection_id: selection.selection_id,
+    roster_digest: selection.roster_digest,
+    outcome: journalOutcome(input.validation.synthesis.outcome),
+    summary: carriedResolvedFindingIds.size > 0
+      ? `${input.validation.synthesis.summary} ${carriedResolvedFindingIds.size} prior finding(s) are absent on exact-roster rereview.`
+      : input.validation.synthesis.summary,
+    findings: [...contractFindings.values()],
+  };
+  const validation: ReviewValidationContract = {
+    schema: REVIEW_VALIDATION_SCHEMA,
+    synthesis_digest: digestCanonicalJson(synthesis),
+    valid: true,
+    errors: [],
+  };
+  const acceptedBlocking = new Set(input.validation.accepted_blocking_finding_keys);
+  const rejectedBlocking = new Set(input.validation.rejected_blocking_finding_keys);
+  const repairDisposition = {
+    schema: REVIEW_REPAIR_DISPOSITION_SCHEMA,
+    synthesis_digest: digestCanonicalJson(synthesis),
+    dispositions: synthesis.findings.map((finding) => {
+      const key = reviewFindingKey(finding);
+      const blocking = finding.severity === "P0" || finding.severity === "P1";
+      const disposition = carriedResolvedFindingIds.has(finding.finding_id) ? "fixed" as const
+        : rejectedBlocking.has(key) ? "rejected" as const
+        : blocking && acceptedBlocking.has(key) ? "accepted" as const
+          : "deferred" as const;
+      return {
+        finding_id: finding.finding_id,
+        disposition,
+        rationale: disposition === "fixed"
+          ? "The finding is absent on an exact-roster rereview of the repaired subject."
+          : disposition === "rejected"
+          ? "Independent blocker validation rejected this finding."
+          : disposition === "accepted"
+            ? "Independent blocker validation accepted this finding for consolidated repair."
+            : "Advisory findings are journaled without entering the blocking repair set.",
+      };
+    }),
+  };
+  const findingResolutions = synthesis.findings.map((finding) => {
+    const reporters = personaReceipts
+      .filter((receipt) => receipt.finding_ids.includes(finding.finding_id))
+      .map((receipt) => receipt.persona_id);
+    const rejected = rejectedBlocking.has(reviewFindingKey(finding));
+    const fixed = carriedResolvedFindingIds.has(finding.finding_id);
+    const disposition = repairDisposition.dispositions.find((entry) => entry.finding_id === finding.finding_id)!;
+    return {
+      finding_id: finding.finding_id,
+      exact_dedup_personas: reporters,
+      semantic_dedup_finding_ids: [finding.finding_id],
+      validator_result: rejected ? "rejected" as const : "accepted" as const,
+      corroboration_count: reporters.length,
+      repair_disposition: disposition.disposition,
+      convergence_cycle: input.cycle,
+      state: rejected || fixed ? "resolved" as const : "unresolved" as const,
+    };
+  });
+  const measurements = {
+    persona_count: personaReceipts.length,
+    finding_count: synthesis.findings.length,
+    accepted_finding_count: findingResolutions.filter((entry) => entry.validator_result === "accepted").length,
+    rejected_finding_count: findingResolutions.filter((entry) => entry.validator_result === "rejected").length,
+    resolved_finding_count: findingResolutions.filter((entry) => entry.state === "resolved").length,
+    unresolved_finding_count: findingResolutions.filter((entry) => entry.state === "unresolved").length,
+    total_latency_ms: personaReceipts.reduce((total, receipt) => total + receipt.latency_ms, 0),
+    critical_path_latency_ms: Math.max(0, ...personaReceipts.map((receipt) => receipt.latency_ms)),
+    total_cost_microusd: null,
+  };
+  const journal: ReviewJournalContract = {
+    schema: REVIEW_JOURNAL_SCHEMA,
+    subject: { base: input.baseSubject, pre: input.plan.subject, post: input.plan.subject },
+    policy,
+    roster,
+    selection,
+    persona_receipts: personaReceipts,
+    synthesis,
+    validation,
+    repair_disposition: repairDisposition,
+    finding_resolutions: findingResolutions,
+    measurements,
+    entries: [
+      { at: input.recordedAt, kind: "selection", digest: digestCanonicalJson(selection) },
+      { at: input.recordedAt, kind: "persona_receipts", digest: digestCanonicalJson(personaReceipts) },
+      { at: input.recordedAt, kind: "synthesis", digest: digestCanonicalJson(synthesis) },
+      { at: input.recordedAt, kind: "validation", digest: digestCanonicalJson(validation) },
+      { at: input.recordedAt, kind: "repair_disposition", digest: digestCanonicalJson(repairDisposition) },
+      { at: input.recordedAt, kind: "finding_resolutions", digest: digestCanonicalJson(findingResolutions) },
+      { at: input.recordedAt, kind: "measurements", digest: digestCanonicalJson(measurements) },
+    ],
+  };
+  return validateReviewJournalContract(journal, { source: "review_journal" }).value;
+}

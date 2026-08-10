@@ -79,6 +79,7 @@ const SKILLS = new Set([
   "final-repair",
   "publish",
   "select-review-personas",
+  "validate-review-findings",
   "correctness-dataflow",
   "tests-contracts",
   "reliability-adversarial",

@@ -719,6 +719,16 @@ evidence references. The journal is queryable for operator or future
 orchestrator inspection, but no coordinator transition, gate, or effect
 scheduling logic may consume it as authority.
 
+Each settled structured final-review cycle appends one complete
+`openthrottle.review-journal/v1` object as `structured` journal data before its
+gate decision is persisted. The object cross-binds the exact base/pre/post
+subject, policy and sealed roster, selector recommendation, per-persona receipt
+digests and finding ids, deterministic synthesis, independent blocker
+validation, repair dispositions, convergence cycle and resolution state, plus
+latency/count measurements (`cost_microusd = null` when unavailable). The live
+gate consumes the in-memory exact-fenced receipts and validated synthesis, not
+this history row; the row is durable audit and future self-learning input.
+
 `run_outcomes` holds one deterministic row per pipeline instance, written
 exactly once at its terminal transition -- either applyTransition's normal
 settlement or supersedeOtherInstances' fencing of a superseded generation.
@@ -831,7 +841,21 @@ and at least one unit reached `completed`, the same fenced-action mechanics
 rerun the full configured commands and one fresh, report-only final review
 against the final integrated subject; a `semantic_repair_required` final
 review routes through a dedicated final-repair action and a fresh command/review
-cycle, invalidating the prior review's authority. The reducer may lease at most
+cycle, invalidating the prior review's authority. Final review is a sealed
+supervisor orchestration, not one reviewer's opinion: the supervisor first
+dispatches `select-review-personas` against the exact subject and a bounded
+policy allowlist; validates its subject, policy digest, ordered recommendation,
+and evidence rationale; adds mandatory baseline and deterministic plan/command
+risk lenses; and dispatches each selected persona as an independent fresh,
+read-only loop action. Missing, duplicate, unexpected, stale-subject, or
+wrong-producer receipts fail closed. P0/P1 findings cannot enter the final gate
+until a separate `validate-review-findings` action returns each accepted blocker
+byte-for-byte; rejected blockers and P2/P3 advisories remain journal evidence
+without repair authority. The supervisor alone synthesizes the final review
+receipt and gate input. On a repair cycle, selector authority requires the
+prior ordered persona ids and the prior roster digest must match, so rereview
+cannot silently add, drop, or reorder a lens. Unit leads never dispatch review
+personas and cannot promote persona findings. The reducer may lease at most
 one active action -- unit-scoped or whole-change -- per parent attempt at a
 time. It expires only pre-dispatch claims by lease time. Dispatched or running
 child actions remain the active action while their parent-run-fenced child

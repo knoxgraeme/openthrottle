@@ -38,6 +38,9 @@ shapes remain compatible.
 
 ## Required Postconditions
 
+- In every finding identity, copy the sealed persona invariant exactly:
+  `changed behavior has executable contract proof`.
+
 - The receipt is report-only and contains no file edits, command-gate claims,
   PR actions, ticket actions, or provider mutations.
 - Each blocking finding names the changed contract or proof obligation, the

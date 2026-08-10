@@ -45,6 +45,8 @@ defensible findings over broad commentary.
   subject that makes the defect reachable.
 - Each finding states the data-flow chain: input or trigger, changed path,
   violated invariant, and observable consequence.
+- In every finding identity, copy the sealed persona invariant exactly:
+  `changed control and data flow preserves declared behavior`.
 - Evidence is local to this action: changed paths read, symbols traced, prior
   command or review hashes if the sealed prompt requires them, and checks you
   actually inspected.
@@ -102,7 +104,7 @@ present, `needs_human` for a required product or architecture decision, and
     "findings": [
       {
         "severity": "P1",
-        "message": "[src/example/queue.ts#enqueueAndPublish: failed publish leaves queued row visible] The row is inserted before publish, but the catch returns failure without deleting or marking it retry-safe.",
+        "message": "[src/example/queue.ts#enqueueAndPublish: changed control and data flow preserves declared behavior] The row is inserted before publish, but the catch returns failure without deleting or marking it retry-safe.",
         "path": "src/example/queue.ts"
       }
     ]

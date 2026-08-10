@@ -23,6 +23,8 @@ import type { ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js
 import type { PipelineInstance, PipelineStageAttempt } from "../pipeline/store.js";
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 import type { RuntimeResourceReconciler } from "./runtime-resource-reclaim.js";
+import { validateReviewJournalContract } from "@openthrottle/contracts";
+import { buildReviewSelectorAuthority } from "../pipeline/review-fanout.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url));
@@ -1278,29 +1280,117 @@ describe("pipeline effect processor", () => {
       expect.objectContaining({
         protocol: "loop-action@2",
         role: "reviewer",
-        skill: "final-review",
-        expectedProducerSkill: "builtin://final-review@1",
+        skill: "select-review-personas",
+        expectedProducerSkill: "builtin://select-review-personas@1",
         baseSubject: instance.base_commit,
         inputSubject: integratedSubjectB,
         worktree: null,
       })
     );
     const review = latestAction("final_review");
-    pipelines.completeGatedAction({
-      actionId: review.id,
-      resultHash: "result-review",
-      outputSubject: integratedSubjectB,
-      receipt: receiptJson({ instance, action: review, type: "semantic_review", subject: integratedSubjectB }),
-      decision: gateDecision({
-        gateKind: "final_review",
-        subject: integratedSubjectB,
-        outcome: "semantic_repair_required",
-        result: "failed",
-        reason: "blocking_findings",
-      }),
+    const selectorRequest = runtime.dispatchLoopAction.mock.calls.at(-1)![1];
+    const acceptedFinding = {
+      severity: "P1" as const,
+      message: "[supervisor/src/example/effects.ts#drainEffect: changed control and data flow preserves declared behavior] Failed settlement can silently pass.",
+      path: "supervisor/src/example/effects.ts",
+    };
+    const semanticReceiptFor = (request: typeof selectorRequest, input: {
+      result: "success" | "semantic_repair_required";
+      summary: string;
+      findings: typeof acceptedFinding[];
+    }) => canonicalJson({
+      schema: "openthrottle.receipt/v1",
+      type: "semantic_review",
+      assurance: request.expectedProducer!.assurance,
+      result: input.result,
+      producer: {
+        worker_id: request.expectedProducer!.workerId,
+        skill: request.expectedProducer!.skill,
+        capability_digest: request.expectedProducer!.capabilityDigest,
+        skill_package_digest: request.expectedProducer!.skillPackageDigest,
+      },
+      subject: { base: instance.base_commit, pre: request.inputSubject!, post: request.inputSubject! },
+      fence: {
+        pipeline_instance_id: request.pipelineInstanceId,
+        graph_digest: request.graphDigest,
+        unit_id: request.unitId ?? "__final__",
+        attempt_id: request.attemptId,
+        parent_run_id: request.parentRunId,
+        action_attempt_id: request.actionId,
+        generation: request.generation,
+        native_session_id: null,
+        request_hash: request.requestHash,
+      },
+      evidence: [`${request.skill} inspected the exact final subject`],
+      payload: { summary: input.summary, findings: input.findings },
+      issued_at: "2099-07-22T12:00:00.000Z",
     });
+    runtime.collectLoopActionResult.mockImplementation(async (_resource, collection) => {
+      const dispatched = runtime.dispatchLoopAction.mock.calls
+        .map(([, request]) => request)
+        .find((request) => request.actionId === collection.actionId);
+      if (!dispatched?.expectedProducer) return null;
+      const isSelector = dispatched.skill === "select-review-personas";
+      const isValidator = dispatched.skill === "validate-review-findings";
+      const firstReviewCycle = dispatched.inputSubject === integratedSubjectB;
+      const findings = firstReviewCycle && (dispatched.skill === "correctness-dataflow" || isValidator)
+        ? [acceptedFinding]
+        : [];
+      const summary = isSelector
+        ? canonicalJson({
+            schema: "openthrottle.review-selector-recommendation/v1",
+            subject: dispatched.inputSubject!,
+            policy_digest: buildReviewSelectorAuthority({ subject: dispatched.inputSubject! }).policy_digest,
+            personas: [
+              { persona_id: "correctness-dataflow", rationale: "Changed state transitions need data-flow review." },
+              { persona_id: "tests-contracts", rationale: "The integrated change needs contract proof." },
+            ],
+          })
+        : isValidator
+          ? "One blocking finding was independently reproduced."
+          : "Persona review complete.";
+      return {
+        actionId: dispatched.actionId,
+        attemptId: dispatched.attemptId,
+        requestHash: dispatched.requestHash,
+        outcome: "success",
+        nativeSessionId: null,
+        subject: integratedSubjectB,
+        receipt: semanticReceiptFor(dispatched, {
+          result: findings.length > 0 ? "semantic_repair_required" : "success",
+          summary,
+          findings,
+        }),
+        completedAt: "2099-07-22T12:00:00.000Z",
+      };
+    });
+    const restartedProcessor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+    await restartedProcessor.drain();
+    expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
+      status: "completed",
+    });
+    const reviewJournalEntry = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+      .find((entry) => entry.trigger === "structured_review_fanout");
+    expect(reviewJournalEntry).toBeDefined();
+    const reviewJournal = validateReviewJournalContract(JSON.parse(reviewJournalEntry!.structured!), {
+      source: "persisted_review_journal",
+    }).value;
+    expect(reviewJournal.selection.personas.map((persona) => persona.persona_id)).toEqual([
+      "correctness-dataflow",
+      "tests-contracts",
+    ]);
+    expect(reviewJournal.finding_resolutions).toEqual([
+      expect.objectContaining({ validator_result: "accepted", state: "unresolved", convergence_cycle: 1 }),
+    ]);
 
-    await processor.drain();
+    await restartedProcessor.drain();
     expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
       expect.objectContaining({
@@ -1386,18 +1476,33 @@ describe("pipeline effect processor", () => {
       expect.objectContaining({
         protocol: "loop-action@2",
         role: "reviewer",
-        skill: "final-review",
+        skill: "select-review-personas",
         baseSubject: instance.base_commit,
         inputSubject: finalIntegratedSubject,
       })
     );
-    pipelines.completeGatedAction({
-      actionId: freshReview.id,
-      resultHash: "result-review-fresh",
-      outputSubject: finalIntegratedSubject,
-      receipt: receiptJson({ instance, action: freshReview, type: "semantic_review", subject: finalIntegratedSubject }),
-      decision: gateDecision({ gateKind: "final_review", subject: finalIntegratedSubject }),
+    await restartedProcessor.drain();
+    const settledFreshReview = pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === freshReview.id);
+    expect(settledFreshReview?.last_error).toBeNull();
+    expect(settledFreshReview).toMatchObject({
+      status: "completed",
+      output_subject: finalIntegratedSubject,
     });
+    const rereviewJournalEntry = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+      .filter((entry) => entry.trigger === "structured_review_fanout")
+      .at(-1);
+    expect(rereviewJournalEntry).toBeDefined();
+    const rereviewJournal = validateReviewJournalContract(JSON.parse(rereviewJournalEntry!.structured!), {
+      source: "persisted_rereview_journal",
+    }).value;
+    expect(rereviewJournal.finding_resolutions).toEqual([
+      expect.objectContaining({
+        finding_id: reviewJournal.finding_resolutions[0]!.finding_id,
+        repair_disposition: "fixed",
+        state: "resolved",
+        convergence_cycle: 2,
+      }),
+    ]);
 
     const mismatchedReviewSubject = "f".repeat(40);
     db!.prepare(`

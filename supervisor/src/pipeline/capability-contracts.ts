@@ -28,6 +28,7 @@ export const STRUCTURED_PHASE_BUILTIN_CAPABILITIES = {
 } as const;
 export const REVIEW_PERSONA_CAPABILITIES = [
   "select-review-personas@1",
+  "validate-review-findings@1",
   "correctness-dataflow@1",
   "tests-contracts@1",
   "reliability-adversarial@1",

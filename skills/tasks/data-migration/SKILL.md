@@ -47,6 +47,9 @@ data shapes beyond the versioned contracts or migrations in the repository.
 
 ## Required Postconditions
 
+- In every finding identity, copy the sealed persona invariant exactly:
+  `persisted and versioned data transitions remain safe`.
+
 - The receipt is report-only and contains no file edits, command-gate claims,
   PR actions, ticket actions, or provider mutations.
 - Each blocking finding quotes the exact migration statement, schema field,
@@ -111,7 +114,7 @@ present, `needs_human` for a required product or architecture decision, and
     "findings": [
       {
         "severity": "P1",
-        "message": "[supervisor/src/persistence/migrations/definitions.ts#addDeliveryStatus: legacy rows default to processed] The migration adds status with DEFAULT 'processed', so pending legacy deliveries are acknowledged before replay.",
+        "message": "[supervisor/src/persistence/migrations/definitions.ts#addDeliveryStatus: persisted and versioned data transitions remain safe] The migration adds status with DEFAULT 'processed', so pending legacy deliveries are acknowledged before replay.",
         "path": "supervisor/src/persistence/migrations/definitions.ts"
       }
     ]

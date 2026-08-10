@@ -27,52 +27,58 @@ personas must run and why.
 
 1. Read the sealed review policy or roster first. The selected personas must be
    named there; never invent a persona or modify its invariants.
-2. Include the mandatory baseline personas when present:
+2. When `required_persona_ids` is non-null, this is a rereview. Return exactly
+   those persona ids in exactly that order, with current evidence rationales.
+   Do not add, drop, or reorder a persona even if the repaired diff appears to
+   change its risk profile.
+3. Include the mandatory baseline personas when present:
    `correctness-dataflow` and `tests-contracts`.
-3. Optional personas are allowlisted to `reliability-adversarial`,
+4. Optional personas are allowlisted to `reliability-adversarial`,
    `agent-native-contracts`, `security`, `data-migration`, `performance`, and
    `project-standards`. Add one only when it appears in the sealed roster and a
    mechanical trigger below matches the changed subject.
-4. Select `reliability-adversarial` when changed paths or contracts include
+5. Select `reliability-adversarial` when changed paths or contracts include
    retry loops, durable queues, effect draining, webhook delivery, lease
    renewal, run liveness, ordering-sensitive reducers, idempotency keys, or
    success/failure settlement that can silently pass.
-5. Select `agent-native-contracts` when changed paths or contracts include
+6. Select `agent-native-contracts` when changed paths or contracts include
    native session identifiers, prompt rendering, context policy, receipt
    validation, tool or MCP allowlists, repository skill materialization, or
    agent home/config setup.
-6. Select `security` when changed paths or contracts include authentication,
+7. Select `security` when changed paths or contracts include authentication,
    authorization, bearer or HMAC verification, tenant/repository/run binding,
    untrusted input crossing shell/path/SQL/JSON/markdown/prompt/provider
    boundaries, credential handling, logging, or secret persistence.
-7. Select `data-migration` when changed paths or contracts include SQLite
+8. Select `data-migration` when changed paths or contracts include SQLite
    migrations, schema definitions, indexes, persisted repository adapters,
    backfills, versioned JSON contracts, fixtures, receipt shapes, or config
    shapes that must read existing records.
-8. Select `performance` when changed paths or contracts include hot-path
+9. Select `performance` when changed paths or contracts include hot-path
    queries, reducers, polling loops, drains, leases, resource defaults,
    pagination, bounded lists, artifact retention, sandbox packaging, or
    synchronous work whose cost scales with stored history or repository size.
-9. Select `project-standards` when changed paths or contracts include task
+10. Select `project-standards` when changed paths or contracts include task
    skill packaging, pipeline manifests, runtime capabilities, architecture
    boundaries, AGENTS.md/README/SPEC normative text, command names, or
    cross-surface documentation that must match executable defaults.
-10. Bound optional selection depth: inspect only the sealed diff, the named
+11. Bound optional selection depth: inspect only the sealed diff, the named
    contract or manifest, and at most two directly called local modules needed
    to confirm a trigger. If the trigger needs broader investigation, do not
    select the optional persona unless the sealed roster explicitly marks it
    mandatory.
-11. Keep the order deterministic: mandatory baseline personas first in the order
+12. Keep the order deterministic: mandatory baseline personas first in the order
    above, then optional personas in roster order.
-12. Stay within `max_personas_per_selection`. If the baseline alone exceeds the
+13. Stay within `max_personas_per_selection`. If the baseline alone exceeds the
    bound, return `needs_human`.
 
 ## Required Postconditions
 
 - The receipt is report-only: it has no actions that mutate files, state, PRs,
   tickets, gates, or provider records.
-- The summary names every selected persona and the concrete subject property
-  that selected it.
+- The summary is exactly one compact JSON string with schema
+  `openthrottle.review-selector-recommendation/v1`, the sealed subject and
+  policy digest, and ordered `{persona_id,rationale}` selections. Do not wrap
+  it in Markdown or add prose outside the JSON string.
 - Evidence names the policy or roster digest if supplied, the diff or paths read,
   and any baseline persona that was absent from the sealed roster.
 - Findings are empty unless the selector cannot satisfy the sealed policy.
@@ -132,7 +138,7 @@ the provided policy data itself violates a review contract.
     "changed paths read: contracts/src/review.ts, contracts/src/review.test.ts"
   ],
   "payload": {
-    "summary": "Selected correctness-dataflow for changed data movement and tests-contracts for changed review contract tests.",
+    "summary": "{\"schema\":\"openthrottle.review-selector-recommendation/v1\",\"subject\":\"2222222222222222222222222222222222222222\",\"policy_digest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"personas\":[{\"persona_id\":\"correctness-dataflow\",\"rationale\":\"Changed queue state transitions require data-flow review.\"},{\"persona_id\":\"tests-contracts\",\"rationale\":\"Changed review contracts require negative-path proof.\"}]}",
     "findings": []
   },
   "issued_at": "2026-01-01T00:00:00Z"

@@ -389,7 +389,7 @@ function parseFindingResolution(value: unknown, path: string): ReviewFindingReso
       input.exact_dedup_personas,
       `${path}.exact_dedup_personas`,
       (entry, entryPath) => stringAt(entry, entryPath, { pattern: IDENTIFIER }),
-      { min: 1, max: 32 }
+      { max: 32 }
     ), `${path}.exact_dedup_personas`),
     semantic_dedup_finding_ids: unique(arrayAt(
       input.semantic_dedup_finding_ids,
@@ -398,7 +398,7 @@ function parseFindingResolution(value: unknown, path: string): ReviewFindingReso
       { min: 1, max: 64 }
     ), `${path}.semantic_dedup_finding_ids`),
     validator_result: enumAt(input.validator_result, `${path}.validator_result`, REVIEW_VALIDATOR_RESULTS),
-    corroboration_count: integerAt(input.corroboration_count, `${path}.corroboration_count`, 1, 32),
+    corroboration_count: integerAt(input.corroboration_count, `${path}.corroboration_count`, 0, 32),
     repair_disposition: enumAt(input.repair_disposition, `${path}.repair_disposition`, REPAIR_DISPOSITIONS),
     convergence_cycle: integerAt(input.convergence_cycle, `${path}.convergence_cycle`, 1, 64),
     state: enumAt(input.state, `${path}.state`, REVIEW_RESOLUTION_STATES),
@@ -561,6 +561,10 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
     }
     if (resolution.repair_disposition !== disposition.disposition) {
       fail(`${source}.finding_resolutions.${resolution.finding_id}.repair_disposition`, "does not match repair disposition");
+    }
+    if (resolution.exact_dedup_personas.length === 0 &&
+        !(resolution.state === "resolved" && (resolution.repair_disposition === "fixed" || resolution.repair_disposition === "superseded"))) {
+      fail(`${source}.finding_resolutions.${resolution.finding_id}.exact_dedup_personas`, "may be empty only for a fixed or superseded resolved finding");
     }
     for (const memberId of resolution.semantic_dedup_finding_ids) {
       const prior = semanticMembership.get(memberId);

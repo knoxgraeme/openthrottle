@@ -43,6 +43,7 @@ SKILL_NAMES=(
   final-review
   final-repair
   select-review-personas
+  validate-review-findings
   correctness-dataflow
   tests-contracts
   reliability-adversarial

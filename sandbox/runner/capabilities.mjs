@@ -8,6 +8,7 @@ export const STAGE_EXECUTOR_PROTOCOL = "stage-executor@1";
 
 export const REVIEW_PERSONA_CAPABILITIES = Object.freeze([
   "select-review-personas@1",
+  "validate-review-findings@1",
   "correctness-dataflow@1",
   "tests-contracts@1",
   "reliability-adversarial@1",
@@ -121,7 +122,7 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
 
 export const RUNTIME_DESCRIPTOR = Object.freeze({
   schema: "openthrottle.runtime-capabilities/v1",
-  release: "openthrottle-snapshot/v10",
+  release: "openthrottle-snapshot/v11",
   generatedBy: "sandbox-runtime-build",
   protocol: STAGE_EXECUTOR_PROTOCOL,
   capabilities: Object.keys(CAPABILITY_CONTRACTS).sort(),

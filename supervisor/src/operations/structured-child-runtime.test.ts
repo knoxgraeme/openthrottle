@@ -567,7 +567,7 @@ describe("structured child runtime command seeding", () => {
 });
 
 describe("structured child runtime review fanout", () => {
-  it("dispatches the bounded persona roster as independent read-only review actions before the unit lead", async () => {
+  it("keeps the unit lead independent from whole-change persona fanout", async () => {
     const subject = "4".repeat(40);
     const lead = action({
       id: "lead-fanout",
@@ -686,17 +686,8 @@ describe("structured child runtime review fanout", () => {
       }),
     } as any, "parent-attempt");
 
-    expect(dispatchLoopAction).toHaveBeenCalledTimes(6);
-    expect(dispatchLoopAction.mock.calls.slice(0, 5).map(([, request]) => request)).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ actionId: `${lead.id}:review:correctness-dataflow`, role: "reviewer", worktree: null }),
-        expect.objectContaining({ actionId: `${lead.id}:review:tests-contracts`, role: "reviewer", worktree: null }),
-        expect.objectContaining({ actionId: `${lead.id}:review:reliability-adversarial`, role: "reviewer", worktree: null }),
-        expect.objectContaining({ actionId: `${lead.id}:review:agent-native-contracts`, role: "reviewer", worktree: null }),
-        expect.objectContaining({ actionId: `${lead.id}:review:performance`, role: "reviewer", worktree: null }),
-      ])
-    );
-    expect(dispatchLoopAction.mock.calls[5]![1]).toMatchObject({
+    expect(dispatchLoopAction).toHaveBeenCalledTimes(1);
+    expect(dispatchLoopAction.mock.calls[0]![1]).toMatchObject({
       actionId: lead.id,
       role: "lead",
       skill: "accept-unit",
@@ -704,7 +695,7 @@ describe("structured child runtime review fanout", () => {
     });
   });
 
-  it("synthesizes persona blockers into the production unit acceptance gate", async () => {
+  it("does not promote unvalidated persona blockers through the unit acceptance gate", async () => {
     const subject = "a".repeat(40);
     const lead = action({
       id: "lead-fanout-collect",
@@ -942,14 +933,14 @@ describe("structured child runtime review fanout", () => {
       outputSubject: subject,
       decision: expect.objectContaining({
         gateKind: "unit_acceptance",
-        outcome: "semantic_repair_required",
-        reason: "lead_requested_revision",
+        outcome: "success",
+        reason: "lead_scope_match_accept",
       }),
     }));
     const receipt = JSON.parse(completeGatedAction.mock.calls[0]![0].receipt) as { payload: { revision_request?: string } };
-    expect(receipt.payload.revision_request).toContain("Missing production synthesis.");
+    expect(receipt.payload.revision_request).toBeUndefined();
     const decisionPayload = JSON.parse(completeGatedAction.mock.calls[0]![0].decision.payload) as { review_fanout_synthesis?: unknown };
-    expect(decisionPayload.review_fanout_synthesis).toBeTruthy();
+    expect(decisionPayload.review_fanout_synthesis).toBeUndefined();
   });
 });
 
@@ -2446,7 +2437,7 @@ describe("structured child runtime repair fences", () => {
     } as any, "parent-attempt");
 
     expect(dispatched).toMatchObject({
-      actionId: "final-review-no-commands",
+      actionId: "final-review-no-commands:review:selector",
       role: "reviewer",
       loop: "review",
       timeoutMs: 300_000,
@@ -2458,7 +2449,7 @@ describe("structured child runtime repair fences", () => {
     });
   });
 
-  it("accepts an in-flight final review receipt sealed with its persisted request base", async () => {
+  it("rejects a legacy in-flight final review that bypasses the selector boundary", async () => {
     const integratedSubject = "b".repeat(40);
     const requestHash = "e".repeat(64);
     const finalReview = action({
@@ -2545,11 +2536,10 @@ describe("structured child runtime repair fences", () => {
       }),
     } as any, "parent-attempt");
 
-    expect(failUnitAction).not.toHaveBeenCalled();
-    expect(completeGatedAction).toHaveBeenCalledWith(expect.objectContaining({
+    expect(completeGatedAction).not.toHaveBeenCalled();
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
       actionId: finalReview.id,
-      outputSubject: integratedSubject,
-      receipt,
+      lastError: expect.stringMatching(/final review request is not the sealed selector action/),
     }));
   });
 
@@ -2728,6 +2718,7 @@ describe("structured child runtime repair fences", () => {
         leaseNextUnitAction: () => finalReviewRoundTwo,
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
+        listGateReceipts: () => [],
         listWorkAttempts: () => [priorFinalReview, priorFinalRepair, finalReviewRoundTwo],
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),
@@ -2750,7 +2741,7 @@ describe("structured child runtime repair fences", () => {
     } as any, "parent-attempt");
 
     expect(dispatched).toMatchObject({
-      actionId: "final-review-cycle-2",
+      actionId: "final-review-cycle-2:review:selector",
       role: "reviewer",
       loop: "review",
       priorEvidence: {
@@ -2800,6 +2791,7 @@ describe("structured child runtime repair fences", () => {
         leaseNextUnitAction: () => finalReviewRoundTwo,
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
+        listGateReceipts: () => [],
         listWorkAttempts: () => [priorFinalReview, finalReviewRoundTwo],
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),

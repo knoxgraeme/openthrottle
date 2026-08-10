@@ -290,4 +290,21 @@ describe("review journal contracts", () => {
     expect(() => validateReviewJournalContract(wrongMeasurements, { source: "review" }))
       .toThrow(/review\.measurements: does not match persona and finding evidence/);
   });
+
+  it("represents a prior finding fixed by exact-roster absence without false current corroboration", () => {
+    const journal = validJournal();
+    journal.persona_receipts[0]!.finding_ids = [];
+    journal.persona_receipts[0]!.finding_count = 0;
+    journal.finding_resolutions[0]!.exact_dedup_personas = [];
+    journal.finding_resolutions[0]!.corroboration_count = 0;
+    journal.entries[1]!.digest = digestCanonicalJson(journal.persona_receipts);
+    journal.entries[5]!.digest = digestCanonicalJson(journal.finding_resolutions);
+
+    expect(() => validateReviewJournalContract(journal, { source: "review" })).not.toThrow();
+
+    journal.finding_resolutions[0]!.state = "unresolved";
+    journal.entries[5]!.digest = digestCanonicalJson(journal.finding_resolutions);
+    expect(() => validateReviewJournalContract(journal, { source: "review" }))
+      .toThrow(/exact_dedup_personas: may be empty only for a fixed or superseded resolved finding/);
+  });
 });

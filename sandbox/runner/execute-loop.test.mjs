@@ -293,6 +293,7 @@ describe("loop action request validation", () => {
   it("allows every installed review persona only as an independently fenced read-only review action", () => {
     const personas = [
       "select-review-personas",
+      "validate-review-findings",
       "correctness-dataflow",
       "tests-contracts",
       "reliability-adversarial",

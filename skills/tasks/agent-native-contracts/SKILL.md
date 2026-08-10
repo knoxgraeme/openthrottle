@@ -52,6 +52,9 @@ operator workflow.
 
 ## Required Postconditions
 
+- In every finding identity, copy the sealed persona invariant exactly:
+  `agent requests receipts and sessions remain exactly fenced`.
+
 - The receipt is report-only and contains no file edits, command-gate claims,
   PR actions, ticket actions, or provider mutations.
 - Each blocking finding names the session, prompt, receipt, or tool-contract

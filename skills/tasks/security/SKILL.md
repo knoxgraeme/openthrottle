@@ -49,6 +49,9 @@ finding for it.
 
 ## Required Postconditions
 
+- In every finding identity, copy the sealed persona invariant exactly:
+  `untrusted input and credentials cannot exceed sealed authority`.
+
 - The receipt is report-only and contains no file edits, command-gate claims,
   PR actions, ticket actions, or provider mutations.
 - Each blocking finding quotes the exact authority check, validation branch,
@@ -112,7 +115,7 @@ present, `needs_human` for a required product or architecture decision, and
     "findings": [
       {
         "severity": "P1",
-        "message": "[supervisor/src/example/webhook.ts#handleWebhook: unsigned payload reaches dispatch] The changed handler parses the event before verifying the HMAC and the failure branch still calls dispatch.",
+        "message": "[supervisor/src/example/webhook.ts#handleWebhook: untrusted input and credentials cannot exceed sealed authority] The changed handler parses the event before verifying the HMAC and the failure branch still calls dispatch.",
         "path": "supervisor/src/example/webhook.ts"
       }
     ]

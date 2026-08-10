@@ -51,6 +51,9 @@ record no finding for it.
 
 ## Required Postconditions
 
+- In every finding identity, copy the sealed persona invariant exactly:
+  `retries ordering and settlement fail closed`.
+
 - The receipt is report-only and contains no file edits, command-gate claims,
   PR actions, ticket actions, or provider mutations.
 - Each blocking finding names the retry, ordering, or silent-pass trigger; the
@@ -113,7 +116,7 @@ present, `needs_human` for a required product or architecture decision, and
     "findings": [
       {
         "severity": "P1",
-        "message": "[supervisor/src/example/effects.ts#drainEffect: retry lacks idempotency key] The effect is marked retryable before the provider call, but the retry path creates a fresh provider request without a stable idempotency key.",
+        "message": "[supervisor/src/example/effects.ts#drainEffect: retries ordering and settlement fail closed] The effect is marked retryable before the provider call, but the retry path creates a fresh provider request without a stable idempotency key.",
         "path": "supervisor/src/example/effects.ts"
       }
     ]

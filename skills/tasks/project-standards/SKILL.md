@@ -50,6 +50,9 @@ style review.
 
 ## Required Postconditions
 
+- In every finding identity, copy the sealed persona invariant exactly:
+  `changed code follows the repository's normative contracts`.
+
 - The receipt is report-only and contains no file edits, command-gate claims,
   PR actions, ticket actions, or provider mutations.
 - Each blocking finding quotes the exact committed standard or nearest example
@@ -113,7 +116,7 @@ present, `needs_human` for a required product or architecture decision, and
     "findings": [
       {
         "severity": "P1",
-        "message": "[skills/tasks/example/agents/openai.yaml: missing policy.allow_implicit_invocation] The changed package adds SKILL.md but omits the agent metadata that disables implicit Codex invocation.",
+        "message": "[skills/tasks/example/agents/openai.yaml#policy.allow_implicit_invocation: changed code follows the repository's normative contracts] The changed package adds SKILL.md but omits the agent metadata that disables implicit Codex invocation.",
         "path": "skills/tasks/example/agents/openai.yaml"
       }
     ]

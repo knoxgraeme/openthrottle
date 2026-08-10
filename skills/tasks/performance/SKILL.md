@@ -48,6 +48,9 @@ changed bound.
 
 ## Required Postconditions
 
+- In every finding identity, copy the sealed persona invariant exactly:
+  `changed hot paths remain bounded at production scale`.
+
 - The receipt is report-only and contains no file edits, command-gate claims,
   PR actions, ticket actions, or provider mutations.
 - Each blocking finding quotes the exact loop, query, limit, allocation, or
@@ -112,7 +115,7 @@ present, `needs_human` for a required product or architecture decision, and
     "findings": [
       {
         "severity": "P1",
-        "message": "[supervisor/src/example/events.ts#latestForRun: unbounded event scan] The changed query removes the run_id filter and LIMIT, so every poll synchronously scans all events as history grows.",
+        "message": "[supervisor/src/example/events.ts#latestForRun: changed hot paths remain bounded at production scale] The changed query removes the run_id filter and LIMIT, so every poll synchronously scans all events as history grows.",
         "path": "supervisor/src/example/events.ts"
       }
     ]

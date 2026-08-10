@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { SemanticReviewReceipt } from "@openthrottle/contracts";
-import { buildReviewFanoutPlan, synthesizeReviewFanout, validateReviewFanoutRepair } from "./review-fanout.js";
+import {
+  REVIEW_SELECTOR_RECOMMENDATION_SCHEMA,
+  buildReviewFanoutPlan,
+  buildReviewSelectorAuthority,
+  parseReviewSelectorRecommendation,
+  synthesizeReviewFanout,
+  validateReviewFanoutBlockers,
+  validateReviewFanoutRepair,
+} from "./review-fanout.js";
 
 function reviewReceipt(input: {
   persona: string;
@@ -122,5 +130,147 @@ describe("review fanout runtime contract", () => {
     })).toThrow(/must rerun the exact prior roster/);
     expect(() => validateReviewFanoutRepair({ previous: synthesis, nextPlan: { ...plan, subject: "5".repeat(40) } }))
       .not.toThrow();
+  });
+
+  it("validates an evidence-backed selector recommendation before deterministic policy additions", () => {
+    const subject = "6".repeat(40);
+    const authority = buildReviewSelectorAuthority({ subject });
+    const recommendation = parseReviewSelectorRecommendation(JSON.stringify({
+      schema: REVIEW_SELECTOR_RECOMMENDATION_SCHEMA,
+      subject,
+      policy_digest: authority.policy_digest,
+      personas: [{ persona_id: "security", rationale: "The changed webhook crosses an HMAC trust boundary." }],
+    }), authority);
+    const plan = buildReviewFanoutPlan({
+      subject,
+      instructions: { risk: "Retry webhook dispatch after authorization." },
+      recommendation,
+      selectorReceiptHash: "d".repeat(64),
+    });
+
+    expect(plan.personas.map((persona) => [persona.id, persona.reason])).toEqual([
+      ["correctness-dataflow", "mandatory_baseline"],
+      ["tests-contracts", "mandatory_baseline"],
+      ["reliability-adversarial", "risk_triggered"],
+      ["security", "agent_selected"],
+    ]);
+    expect(plan.selector_receipt_hash).toBe("d".repeat(64));
+    expect(() => parseReviewSelectorRecommendation(JSON.stringify({
+      schema: REVIEW_SELECTOR_RECOMMENDATION_SCHEMA,
+      subject,
+      policy_digest: authority.policy_digest,
+      personas: [{ persona_id: "unknown-persona", rationale: "Not allowlisted." }],
+    }), authority)).toThrow(/unknown persona/);
+  });
+
+  it("requires independent validation and cannot invent or rewrite a blocker", () => {
+    const subject = "7".repeat(40);
+    const plan = buildReviewFanoutPlan({ subject });
+    const blocker = {
+      severity: "P1" as const,
+      message: "[src/unit.ts#settle: changed control and data flow preserves declared behavior] Settlement can silently pass.",
+      path: "src/unit.ts",
+    };
+    const synthesis = synthesizeReviewFanout({
+      plan,
+      receipts: plan.personas.map((persona) => reviewReceipt({
+        persona: persona.id,
+        subject,
+        result: persona.id === "correctness-dataflow" ? "semantic_repair_required" : "success",
+        findings: persona.id === "correctness-dataflow" ? [blocker] : [],
+      })),
+    });
+
+    expect(() => validateReviewFanoutBlockers({ synthesis, validator: null }))
+      .toThrow(/require independent validation/);
+    expect(() => validateReviewFanoutBlockers({
+      synthesis,
+      validator: reviewReceipt({
+        persona: "review-validator",
+        subject,
+        result: "semantic_repair_required",
+        findings: [{ ...blocker, message: `${blocker.message} rewritten` }],
+      }),
+    })).toThrow(/invented or changed/);
+    expect(validateReviewFanoutBlockers({
+      synthesis,
+      validator: reviewReceipt({
+        persona: "review-validator",
+        subject,
+        result: "semantic_repair_required",
+        findings: [blocker],
+      }),
+    })).toMatchObject({
+      synthesis: { outcome: "semantic_repair_required", findings: [blocker] },
+      accepted_blocking_finding_keys: [expect.any(String)],
+      rejected_blocking_finding_keys: [],
+    });
+  });
+
+  it("keeps advisory findings journal-visible without promoting them to blockers", () => {
+    const subject = "8".repeat(40);
+    const plan = buildReviewFanoutPlan({ subject });
+    const advisory = {
+      severity: "P2" as const,
+      message: "[src/unit.ts#settle: changed control and data flow preserves declared behavior] Add a regression assertion.",
+      path: "src/unit.ts",
+    };
+    const synthesis = synthesizeReviewFanout({
+      plan,
+      receipts: plan.personas.map((persona) => reviewReceipt({
+        persona: persona.id,
+        subject,
+        result: persona.id === "correctness-dataflow" ? "semantic_repair_required" : "success",
+        findings: persona.id === "correctness-dataflow" ? [advisory] : [],
+      })),
+    });
+
+    expect(validateReviewFanoutBlockers({ synthesis, validator: null })).toMatchObject({
+      synthesis: { outcome: "success", findings: [advisory] },
+      accepted_blocking_finding_keys: [],
+    });
+  });
+
+  it("requires the exact prior ordered roster on a repair-cycle selection", () => {
+    const subject = "9".repeat(40);
+    const authority = buildReviewSelectorAuthority({
+      subject,
+      requiredPersonaIds: ["correctness-dataflow", "tests-contracts", "security"],
+    });
+    const recommendation = {
+      schema: REVIEW_SELECTOR_RECOMMENDATION_SCHEMA,
+      subject,
+      policy_digest: authority.policy_digest,
+      personas: [
+        { persona_id: "correctness-dataflow", rationale: "Recheck changed control flow." },
+        { persona_id: "tests-contracts", rationale: "Recheck executable proof." },
+        { persona_id: "security", rationale: "Recheck the same trust boundary." },
+      ],
+    };
+
+    expect(parseReviewSelectorRecommendation(JSON.stringify(recommendation), authority).personas)
+      .toHaveLength(3);
+    expect(() => parseReviewSelectorRecommendation(JSON.stringify({
+      ...recommendation,
+      personas: recommendation.personas.slice(0, 2),
+    }), authority)).toThrow(/exact prior-cycle roster/);
+
+    const initialSubject = "a".repeat(40);
+    const initialAuthority = buildReviewSelectorAuthority({ subject: initialSubject });
+    const initial = buildReviewFanoutPlan({
+      subject: initialSubject,
+      recommendation: parseReviewSelectorRecommendation(JSON.stringify({
+        ...recommendation,
+        subject: initialSubject,
+        policy_digest: initialAuthority.policy_digest,
+      }), initialAuthority),
+    });
+    const rereview = buildReviewFanoutPlan({
+      subject,
+      recommendation: parseReviewSelectorRecommendation(JSON.stringify(recommendation), authority),
+      requiredPersonaIds: authority.required_persona_ids!,
+    });
+    expect(rereview.personas.map((persona) => persona.id)).toEqual(authority.required_persona_ids);
+    expect(rereview.roster_digest).toBe(initial.roster_digest);
   });
 });

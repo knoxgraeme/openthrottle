@@ -39,17 +39,18 @@ capability→skill map, not task type):
 - `investigate` (`ce/investigate@1`) diagnoses a reported defect and applies a
   convergent fix only.
 
-Structured graphs use six loop-path task adapters, one per unit action:
+Structured graphs use five direct loop-path task adapters plus the orchestrated
+whole-change review packages:
 
 - `implement-unit`, `simplify-unit`, and `repair-unit` implement, simplify, or
   repair one execution-plan unit in its own worktree and return
   `unit_completion` receipts.
 - `accept-unit` is the minimal lead scope-match decision and returns
   `unit_decision`; it is explicitly not a code review.
-- `final-review` is the only whole-change review adapter in the structured
-  path and returns `semantic_review` for the integrated whole. It is
-  report-only; it never edits.
-- `final-repair` repairs exactly the findings `final-review` raised, in an
+- `final-review` defines the canonical report-only producer contract used by
+  the supervisor's synthesized whole-change review receipt; the structured
+  path does not dispatch it as a second independent reviewer.
+- `final-repair` repairs exactly the validated findings the synthesized review raised, in an
   executor-owned exact-base worktree, and returns `unit_completion`.
 
 Review fanout uses baseline and optional report-only persona packages. They
@@ -58,6 +59,8 @@ independent `semantic_review` receipts:
 
 - `select-review-personas` chooses the deterministic roster from the sealed
   review policy, always including the mandatory baseline personas when present.
+- `validate-review-findings` independently re-inspects proposed P0/P1 blockers
+  and returns only byte-exact findings that survive validation.
 - `correctness-dataflow` reviews changed value flow, state transitions,
   ordering, and failure paths.
 - `tests-contracts` reviews executable proof and cross-boundary contracts.
@@ -81,18 +84,24 @@ A repository-scoped skill may replace any of these when it emits the same
 coordinator evaluates the receipt and executor-derived Git/command evidence,
 not implementation details internal to the skill.
 
-The structured supervisor selects a bounded roster from plan and command risk
-signals, seals it to one exact subject, and dispatches every selected persona
-as its own fresh, read-only loop action. Personas never spawn other personas.
-The ordinary lead or `final-review` action is dispatched separately; after all
-results arrive, the supervisor rejects missing, duplicate, unexpected, or
-wrong-subject receipts and deterministically synthesizes the independent
-findings. A blocker from that synthesis is overlaid onto the lead/final-review
-gate even when the ordinary review returned success. After repair, the roster
-digest must match the prior cycle before any rereview result can settle.
+The unit lead remains a minimal scope-match gate and never runs review personas.
+After all units integrate and final commands pass, the structured supervisor
+first dispatches `select-review-personas` with the exact subject and a sealed
+allowlist. It validates the selector's subject, policy digest, budget, ordered
+persona ids, and evidence rationales, then adds mandatory and deterministic
+risk-triggered lenses. Every selected persona runs as its own fresh, read-only
+loop action; personas never spawn other personas. Missing, duplicate,
+unexpected, or wrong-subject receipts fail closed. P0/P1 findings cannot reach
+the final gate until the separate `validate-review-findings` action reproduces
+and returns them byte-for-byte. P2/P3 findings remain advisory journal entries.
+The supervisor synthesizes the final receipt only after those fences settle.
+After repair, selector authority requires the exact prior ordered roster and
+the roster digest must match before a rereview can settle.
 
-Review journal contracts keep this assurance measurable without granting it
-transition authority. They digest the sealed selection, per-persona receipt
+Review journal contracts keep this assurance measurable without granting the
+persisted history transition authority. Before the live gate settles, the
+supervisor validates and appends one complete `openthrottle.review-journal/v1`
+record through `orchestration_journal`. It digests the sealed selection, per-persona receipt
 evidence, synthesis, validation, repair disposition, finding resolution, and
 aggregate measurements. Cross-references bind persona receipts to the reviewed
 subject and selected roster; finding ids to exact/semantic dedup membership,
@@ -219,13 +228,16 @@ review, respectively — `PRIOR_EVIDENCE_ROLES` covers `lead`, `repair`,
 `final_review`, `final_repair`), but the link back to what triggered the
 repair is bound deterministically by the executor through
 `fence.request_hash`, not by the agent copying a hash, so echoing it would be
-redundant at best. This is the opposite of `accept-unit` and `final-review`,
-which are read-only gates that must echo prior-evidence hashes verbatim as
-their own evidence — the one family where copying is exactly right.
+redundant at best. `accept-unit` remains the read-only gate that must echo its
+prior-evidence hashes verbatim. Structured final review instead binds command,
+selector, persona, and validator evidence in the supervisor-synthesized
+receipt, so no review persona can claim that gate authority.
 
-**Determinism over inferred rosters.** Review lenses (`final-review`,
-`review-change`) and simplification lenses (`simplify-unit`,
-`simplify-change`) are a fixed, ordered list applied every round, rather than
-a per-run set inferred from perceived risk. A fixed roster is what lets a
-repair-then-re-review cycle converge: the same change produces the same
-review shape whether it is round one or round four.
+**Bounded selection, deterministic rereview.** The initial structured review
+combines a mandatory baseline, a selector recommendation constrained to the
+sealed allowlist, and deterministic plan/command risk triggers. The supervisor
+owns ordering and the bound. Once a repair cycle begins, the prior ordered
+persona ids become required selector authority; changed rationales cannot add,
+drop, or reorder lenses. This preserves relevant depth on the first pass and a
+stable comparison surface on every rereview. Stage-path `review-change` and
+both simplification adapters retain their own fixed ordered lenses.

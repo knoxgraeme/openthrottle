@@ -66,7 +66,7 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   ! rg -q "\bce-[a-z][a-z-]*[a-z]\b" /opt/openthrottle/skills &&
   for name in implement-plan investigate review-change simplify-change publish \
               implement-unit repair-unit simplify-unit accept-unit final-review \
-              final-repair select-review-personas correctness-dataflow \
+              final-repair select-review-personas validate-review-findings correctness-dataflow \
               tests-contracts reliability-adversarial agent-native-contracts \
               security data-migration performance project-standards; do
     test -f "/opt/openthrottle/skills/tasks/$name/SKILL.md" || exit 1
@@ -87,7 +87,7 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   test -f /etc/codex/skills/ce-work/SKILL.md &&
   for name in implement-plan investigate review-change simplify-change publish \
               implement-unit simplify-unit repair-unit accept-unit final-review \
-              final-repair select-review-personas correctness-dataflow \
+              final-repair select-review-personas validate-review-findings correctness-dataflow \
               tests-contracts reliability-adversarial agent-native-contracts \
               security data-migration performance project-standards; do
     test -f "/etc/codex/skills/$name/SKILL.md" || exit 1
