@@ -9,8 +9,9 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const skillsRoot = resolve(repoRoot, "skills");
 
 // Five stage-path skills (single-shot agent stages, `openthrottle.stage-proposal/v1`
-// result) and six loop-path skills (structured per-unit/whole-change actions,
-// `openthrottle.receipt/v1` result). See skills/README.md and REVIEW.md §3.
+// result), six loop-path skills (structured per-unit/whole-change actions,
+// `openthrottle.receipt/v1` result), and three mandatory review persona packages.
+// See skills/README.md and REVIEW.md §3.
 const stageTasks = ["implement-plan", "investigate", "review-change", "simplify-change", "publish"];
 const loopTasks = [
   "implement-unit",
@@ -20,7 +21,8 @@ const loopTasks = [
   "final-review",
   "final-repair",
 ];
-const tasks = [...stageTasks, ...loopTasks];
+const reviewPersonaTasks = ["select-review-personas", "correctness-dataflow", "tests-contracts"];
+const tasks = [...stageTasks, ...loopTasks, ...reviewPersonaTasks];
 
 // The four loop skills that own an executor-owned worktree and author
 // `subject.post` via `ot-subject-post`.
@@ -94,7 +96,7 @@ describe("OpenThrottle canonical task skills", () => {
     );
   });
 
-  it("all eleven canonical skill files exist with YAML frontmatter", () => {
+  it("all canonical skill files exist with YAML frontmatter", () => {
     for (const task of tasks) {
       const body = skillBody(task);
       expect(body.startsWith("---\n")).toBe(true);
@@ -120,6 +122,26 @@ describe("OpenThrottle canonical task skills", () => {
     expect(body).toContain("report-only");
     expect(body).toContain("final-repair");
     expect(body).not.toContain("apply:local");
+  });
+
+  it("ships the mandatory baseline review persona packages as report-only independent receipts", () => {
+    const selector = skillBody("select-review-personas");
+    expect(selector).toContain("`correctness-dataflow` and `tests-contracts`");
+    expect(selector).toContain("max_personas_per_selection");
+    expect(selector).toContain("Do not select personas for style taste");
+
+    for (const task of reviewPersonaTasks) {
+      const body = skillBody(task);
+      expect(body).toContain("report-only");
+      expect(body).toContain("openthrottle.receipt/v1");
+      expect(body).toContain('Use `type: "semantic_review"`');
+      expect(body).toContain("Provenance is copied only from the Receipt Authority Contract");
+      expect(body).toContain("Noise Exclusions");
+      expect(body).toContain("Required Postconditions");
+      expect(body).toContain("Never edit, stage, commit, push");
+    }
+    expect(skillBody("correctness-dataflow")).toContain("data-flow chain");
+    expect(skillBody("tests-contracts")).toContain("changed contract or proof obligation");
   });
 
   it("ships non-CE fixture skills for the same standard receipt contracts", () => {
@@ -330,7 +352,7 @@ describe("OpenThrottle canonical task skills", () => {
     expect(skillBody("final-review")).toContain(resultLead.semantic_review.slice(0, -1));
   });
 
-  it("every loop skill ships exactly one worked receipt example that the real validator accepts (OPE-101)", () => {
+  it("every loop and review-persona skill ships exactly one worked receipt example that the real validator accepts (OPE-101)", () => {
     // The three OPE-101 defects were all "described in prose, never shown".
     // A worked example only removes that class of failure if the example is
     // itself valid, so run each one through the executor's own validator.
@@ -346,8 +368,11 @@ describe("OpenThrottle canonical task skills", () => {
       "final-repair": ["unit_completion", "success"],
       "accept-unit": ["unit_decision", "accept"],
       "final-review": ["semantic_review", "semantic_repair_required"],
+      "select-review-personas": ["semantic_review", "success"],
+      "correctness-dataflow": ["semantic_review", "semantic_repair_required"],
+      "tests-contracts": ["semantic_review", "success"],
     };
-    for (const task of loopTasks) {
+    for (const task of [...loopTasks, ...reviewPersonaTasks]) {
       const raw = exampleFor(task).replace(/^```json\n/, "").replace(/\n```$/, "");
       const receipt = validateStandardReceipt(JSON.parse(raw), {});
       const [type, result] = expected[task];
@@ -438,7 +463,7 @@ describe("OpenThrottle canonical task skills", () => {
     expect(simplificationHeuristics("simplify-unit")).toBe(simplificationHeuristics("simplify-change"));
   });
 
-  it("each of the eleven skills declares supported Codex metadata with implicit invocation disabled", () => {
+  it("each canonical skill declares supported Codex metadata with implicit invocation disabled", () => {
     for (const task of tasks) {
       assertSupportedOpenAiMetadata(task);
     }

@@ -66,7 +66,8 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   ! rg -q "\bce-[a-z][a-z-]*[a-z]\b" /opt/openthrottle/skills &&
   for name in implement-plan investigate review-change simplify-change publish \
               implement-unit repair-unit simplify-unit accept-unit final-review \
-              final-repair; do
+              final-repair select-review-personas correctness-dataflow \
+              tests-contracts; do
     test -f "/opt/openthrottle/skills/tasks/$name/SKILL.md" || exit 1
   done &&
   test ! -e /opt/openthrottle/skills/claude &&
@@ -83,7 +84,10 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex codex plugin list --json | jq -e '\''.installed[] | select(.pluginId == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
   test -f /home/agent/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md &&
   test -f /etc/codex/skills/ce-work/SKILL.md &&
-  for name in implement-plan investigate review-change simplify-change publish implement-unit simplify-unit repair-unit accept-unit final-review final-repair; do
+  for name in implement-plan investigate review-change simplify-change publish \
+              implement-unit simplify-unit repair-unit accept-unit final-review \
+              final-repair select-review-personas correctness-dataflow \
+              tests-contracts; do
     test -f "/etc/codex/skills/$name/SKILL.md" || exit 1
     yaml="/etc/codex/skills/$name/agents/openai.yaml"
     test -f "$yaml" || exit 1
