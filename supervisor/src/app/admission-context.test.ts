@@ -95,6 +95,45 @@ describe("bounded Linear admission context", () => {
     expect(fallback.selectionContext).toContain("No prompt context supplied.");
   });
 
+  it.each([
+    [
+      "duplicate top-level issue",
+      [
+        `<issue identifier="OPE-139"><description>current child</description></issue>`,
+        `<issue identifier="OPE-139"><description>duplicate child</description></issue>`,
+      ].join("\n"),
+    ],
+    [
+      "duplicate primary directive",
+      [
+        `<issue identifier="OPE-139"><description>current child</description></issue>`,
+        `<primary-directive-thread><comment>current directive</comment></primary-directive-thread>`,
+        `<primary-directive-thread><comment>duplicate directive</comment></primary-directive-thread>`,
+      ].join("\n"),
+    ],
+    [
+      "parent issue after an other thread",
+      [
+        `<issue identifier="OPE-139"><description>current child</description></issue>`,
+        `<primary-directive-thread><comment>current directive</comment></primary-directive-thread>`,
+        `<other-thread><comment>history</comment></other-thread>`,
+        `<parent-issue identifier="OPE-100"><description>parent</description></parent-issue>`,
+      ].join("\n"),
+    ],
+    [
+      "unclosed required issue",
+      `<issue identifier="OPE-139"><description>unclosed child</description>`,
+    ],
+  ])("rejects %s context", (_name, context) => {
+    const result = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "OPE-139",
+    });
+
+    expect(result.selectionContext).toBe("");
+    expect(result.selectionError).toContain("invalid top-level section structure");
+  });
+
   it("drops oversized optional history and keeps required child context bounded", () => {
     const context = [
       `<issue identifier="OPE-139"><description>required child</description></issue>`,
