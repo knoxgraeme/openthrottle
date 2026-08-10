@@ -673,6 +673,12 @@ describe("Stage C contract fixtures", () => {
     "```sh\ngit push origin main\n```\n",
     "Launch shellcheck across the repository.\n",
     "Issue `git push origin main`.\n",
+    "    rm worktree\n",
+    "     rm worktree\n",
+    "        rm worktree\n",
+    "\t  rm worktree\n",
+    "> ```sh\n> rm worktree\n> ```\n",
+    "-     rm worktree\n",
   ])("defense-in-depth rejects an obvious executable reference surface: %s", (guidance) => {
     const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
       source: "ratchet",
@@ -705,6 +711,35 @@ describe("Stage C contract fixtures", () => {
       }],
     });
   });
+
+  it.each([" ", "  ", "   "])(
+    "keeps a %s-space prose indent tunable because it is not an indented code block",
+    (indent) => {
+      const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+        source: "ratchet",
+      });
+      const skill = {
+        id: "implement_unit",
+        tunable: true,
+        files: [{
+          path: ".openthrottle/skills/implement_unit/SKILL.md",
+          content: "---\nname: implement_unit\n---\n# Implement Unit\n## Craft\nPrefer focused evidence.\n",
+        }, {
+          path: ".openthrottle/skills/implement_unit/references/method.md",
+          content: "Original reference guidance.\n",
+        }],
+      };
+      const proposed = structuredClone(skill);
+      proposed.files[1]!.content = `${indent}Additional reference guidance.\n`;
+
+      expect(decideDifferentialRatchet({
+        ...parsed.value,
+        ...repositorySkillPolicy(true),
+        pinned_repository_skills: [skill],
+        proposed_repository_skills: [proposed],
+      })).toMatchObject({ outcome: "accept", reject_reasons: [] });
+    }
+  );
 
   it("rejects locked repository skills and immutable skill policy edits", () => {
     const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {

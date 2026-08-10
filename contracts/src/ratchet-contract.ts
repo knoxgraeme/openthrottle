@@ -318,13 +318,33 @@ function isObviousGuidanceInvocation(line: string): boolean {
     words.some((word) => GUIDANCE_COMMAND_WORDS.has(word));
 }
 
+function withoutMarkdownContainerPrefixes(line: string): string {
+  let rest = line;
+  while (true) {
+    const blockquote = /^ {0,3}>[ \t]?/.exec(rest);
+    if (blockquote) {
+      rest = rest.slice(blockquote[0].length);
+      continue;
+    }
+    const listItem = /^ {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]/.exec(rest);
+    if (listItem) {
+      // Consume exactly the marker delimiter. Any remaining indentation is
+      // meaningful to CommonMark and may start an indented code block.
+      rest = rest.slice(listItem[0].length);
+      continue;
+    }
+    return rest;
+  }
+}
+
 function referenceGuidanceLintSurfaces(raw: string): string[] {
   const lines = raw.replace(/\r\n/g, "\n").split("\n");
   const surfaces: string[] = [];
   let fenceMarker: string | null = null;
   let fenced: string[] = [];
   for (const line of lines) {
-    const fence = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+    const structuralLine = withoutMarkdownContainerPrefixes(line);
+    const fence = /^ {0,3}(`{3,}|~{3,})/.exec(structuralLine);
     if (fenceMarker !== null) {
       fenced.push(line);
       if (fence && fence[1]![0] === fenceMarker[0] && fence[1]!.length >= fenceMarker.length) {
@@ -339,7 +359,10 @@ function referenceGuidanceLintSurfaces(raw: string): string[] {
       fenced = [line];
       continue;
     }
-    if (/^(?:\t| {4})\S/.test(line) || /^\s{0,3}[$%]\s+\S/.test(line)) {
+    if (
+      /^(?: {4,}|[ \t]*\t[ \t]*)\S/.test(structuralLine) ||
+      /^ {0,3}[$%]\s+\S/.test(structuralLine)
+    ) {
       surfaces.push(`command-block:${line}`);
     }
     for (const inline of line.matchAll(/(`+)([^`\n]+)\1/g)) {
