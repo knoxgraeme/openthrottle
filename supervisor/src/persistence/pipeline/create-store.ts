@@ -11,8 +11,10 @@ import { createStatusStore } from "./status-store.js";
 import { createTransitionStore } from "./transition-store.js";
 import { createExecutionUnitStore } from "./unit-store.js";
 
-export function createPipelineStore(db: Database.Database): PipelineStore & ExecutionUnitStore {
-  const now = () => new Date().toISOString();
+export function createPipelineStore(
+  db: Database.Database,
+  now: () => string = () => new Date().toISOString()
+): PipelineStore & ExecutionUnitStore {
 
   return {
     ...createCatalogStore(db, now),

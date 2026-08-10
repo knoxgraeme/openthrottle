@@ -29,6 +29,16 @@ import { claudeProjectSlug } from "/opt/openthrottle/runner/native-session-packa
 // failure a live loop action whose `ot-subject-post` call `command not
 // found`s. Exercising the binary makes those install lines load-bearing.
 const OT_SUBJECT_POST = "/usr/local/bin/ot-subject-post";
+const REVIEW_PERSONA_SKILLS = new Set([
+  "correctness-dataflow",
+  "tests-contracts",
+  "reliability-adversarial",
+  "agent-native-contracts",
+  "security",
+  "data-migration",
+  "performance",
+  "project-standards",
+]);
 
 function readStdin() {
   try {
@@ -258,6 +268,55 @@ function main() {
       evidence: priorReceiptHashes(priorEvidence),
       payload: {
         summary: "walking-skeleton stub final review: no findings",
+        findings: [],
+      },
+    });
+  } else if (skill === "select-review-personas") {
+    const planContext = extractJsonBlock(prompt, "## Execution Plan Context\n");
+    const authority = planContext?.review_selector_authority;
+    if (!authority || authority.subject !== contract.subject.pre) {
+      throw new Error("stub review selector found no exact-subject authority");
+    }
+    const selectedIds = authority.required_persona_ids ?? authority.personas
+      .filter((persona) => persona.mandatory)
+      .map((persona) => persona.id);
+    receipt = buildReceipt({
+      contract,
+      type: "semantic_review",
+      result: "success",
+      subjectPost: contract.subject.pre,
+      payload: {
+        summary: JSON.stringify({
+          schema: "openthrottle.review-selector-recommendation/v1",
+          subject: authority.subject,
+          policy_digest: authority.policy_digest,
+          personas: selectedIds.map((personaId) => ({
+            persona_id: personaId,
+            rationale: "walking-skeleton stub selected the sealed deterministic review roster",
+          })),
+        }),
+        findings: [],
+      },
+    });
+  } else if (REVIEW_PERSONA_SKILLS.has(skill)) {
+    receipt = buildReceipt({
+      contract,
+      type: "semantic_review",
+      result: "success",
+      subjectPost: contract.subject.pre,
+      payload: {
+        summary: `walking-skeleton stub ${skill} review: no findings`,
+        findings: [],
+      },
+    });
+  } else if (skill === "validate-review-findings") {
+    receipt = buildReceipt({
+      contract,
+      type: "semantic_review",
+      result: "success",
+      subjectPost: contract.subject.pre,
+      payload: {
+        summary: "walking-skeleton stub validator rejected every supplied blocker",
         findings: [],
       },
     });

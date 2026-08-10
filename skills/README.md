@@ -39,23 +39,84 @@ capability→skill map, not task type):
 - `investigate` (`ce/investigate@1`) diagnoses a reported defect and applies a
   convergent fix only.
 
-Structured graphs use six loop-path task adapters, one per unit action:
+Structured graphs use five direct loop-path task adapters plus the orchestrated
+whole-change review packages:
 
 - `implement-unit`, `simplify-unit`, and `repair-unit` implement, simplify, or
   repair one execution-plan unit in its own worktree and return
   `unit_completion` receipts.
 - `accept-unit` is the minimal lead scope-match decision and returns
   `unit_decision`; it is explicitly not a code review.
-- `final-review` is the only whole-change review adapter in the structured
-  path and returns `semantic_review` for the integrated whole. It is
-  report-only; it never edits.
-- `final-repair` repairs exactly the findings `final-review` raised, in an
+- `final-review` defines the canonical report-only producer contract used by
+  the supervisor's synthesized whole-change review receipt; the structured
+  path does not dispatch it as a second independent reviewer.
+- `final-repair` repairs exactly the validated findings the synthesized review raised, in an
   executor-owned exact-base worktree, and returns `unit_completion`.
+
+Review fanout uses baseline and optional report-only persona packages. They
+install with the same task-skill baseline for every supported engine and emit
+independent `semantic_review` receipts:
+
+- `select-review-personas` chooses the deterministic roster from the sealed
+  review policy, always including the mandatory baseline personas when present.
+- `validate-review-findings` independently re-inspects proposed P0/P1 blockers
+  and returns only byte-exact findings that survive validation.
+- `correctness-dataflow` reviews changed value flow, state transitions,
+  ordering, and failure paths.
+- `tests-contracts` reviews executable proof and cross-boundary contracts.
+- `reliability-adversarial` optionally reviews retry, ordering, idempotency,
+  and silent-pass risks where changed code crosses durable or asynchronous
+  execution.
+- `agent-native-contracts` optionally reviews native session continuation,
+  prompt-boundary handling, receipt provenance, and tool-contract authority
+  where changed code crosses agent execution boundaries.
+- `security` optionally reviews authority, untrusted-input, injection, and
+  secret-handling risks where changed code crosses trust boundaries.
+- `data-migration` optionally reviews schema, backfill, persisted-record, and
+  serialized-contract compatibility risks.
+- `performance` optionally reviews hot-path queries, bounded work, resource
+  defaults, artifact retention, and scaling risks.
+- `project-standards` optionally reviews committed OpenThrottle standards such
+  as task packaging, manifests, architecture boundaries, and normative docs.
 
 A repository-scoped skill may replace any of these when it emits the same
 `openthrottle.receipt/v1` or `openthrottle.stage-proposal/v1` contract. The
 coordinator evaluates the receipt and executor-derived Git/command evidence,
 not implementation details internal to the skill.
+
+The unit lead remains a minimal scope-match gate and never runs review personas.
+After all units integrate and final commands pass, the structured supervisor
+first dispatches `select-review-personas` with the exact subject and a sealed
+allowlist. It validates the selector's subject, policy digest, budget, ordered
+persona ids, and evidence rationales, then adds mandatory and deterministic
+risk-triggered lenses. Every selected persona runs as its own fresh, read-only
+loop action; personas never spawn other personas. Missing, duplicate,
+unexpected, or wrong-subject receipts fail closed. P0/P1 findings cannot reach
+the final gate until the separate `validate-review-findings` action reproduces
+and returns them byte-for-byte. Each persona is bounded by the sealed
+`max_findings` value (eight in the current policy); overflow must be disclosed
+as `needs_human`, never silently truncated. P2/P3 findings remain advisory
+journal entries and are excluded from the final-repair-authoritative receipt.
+The supervisor synthesizes the final receipt only after those fences settle,
+binding selector, persona, validator, and command hashes into its evidence.
+After repair, selector authority requires the exact prior ordered roster and
+the roster digest must match before a rereview can settle.
+
+Review journal contracts keep this assurance measurable without granting the
+persisted history transition authority. Before the live gate settles, the
+supervisor validates and appends one complete `openthrottle.review-journal/v1`
+record through `orchestration_journal`. It digests the sealed selection, per-persona receipt
+evidence, synthesis, validation, repair disposition, finding resolution, and
+aggregate measurements. Cross-references bind persona receipts to the reviewed
+subject and selected roster; finding ids to exact/semantic dedup membership,
+validator outcome, corroboration, repair disposition, convergence cycle, and
+resolution state; and aggregate finding, latency, and measured-cost totals back
+to those typed records. Semantic groups preserve the existing canonical finding
+and record every cross-lens member id and reporting persona without inventing a
+new finding. Rereview reads the newest bounded history window; missing or corrupt
+history is recorded as an audit gap and cannot fail or authorize the live gate.
+Later self-learning stages may analyze that corpus, but cannot mutate a live
+roster or gate from journal data.
 
 ## Delivery per agent
 
@@ -143,11 +204,22 @@ byte-identical.
 
 **Stable finding identity, not line numbers.** `final-review` and
 `review-change` key a finding by `(path, enclosing symbol or nearest stable
-anchor, invariant)`, never by line number. A repair that shifts surrounding
-lines must not re-issue an already-raised defect as a new finding — that
+anchor, claim discriminator, invariant)`, never by line number. A repair that
+shifts surrounding lines must not re-issue an already-raised defect as a new finding — that
 non-convergence was the single largest cost in early dogfooding rounds. The
 identity is carried as a prefix of the finding's `message` field because the
-receipt contract has no dedicated id field.
+receipt contract has no dedicated id field. Structured persona fanout groups
+raw findings before blocker validation by `(path, semantic anchor, claim
+discriminator)`; prose and persona invariant remain member evidence, not group
+identity. Anchors must
+name a concrete symbol, contract field, or state transition rather than a
+generic file/module/change label. The supervisor chooses one existing group
+representative by explicit severity and stable byte ordering; only that exact
+representative can enter consolidated final repair.
+Persona sessions are independent, but every engine runs the deterministic
+roster one action at a time because the personas share one sandbox whose
+action-directory locks must not overlap. Codex also captures each rotated
+subscription-auth snapshot before the next action receives credentials.
 
 **Why the split is a fork, not a thicken.** `publish` and the review/simplify
 stages could have wrapped a shared external toolkit instead of restating its
@@ -175,13 +247,16 @@ review, respectively — `PRIOR_EVIDENCE_ROLES` covers `lead`, `repair`,
 `final_review`, `final_repair`), but the link back to what triggered the
 repair is bound deterministically by the executor through
 `fence.request_hash`, not by the agent copying a hash, so echoing it would be
-redundant at best. This is the opposite of `accept-unit` and `final-review`,
-which are read-only gates that must echo prior-evidence hashes verbatim as
-their own evidence — the one family where copying is exactly right.
+redundant at best. `accept-unit` remains the read-only gate that must echo its
+prior-evidence hashes verbatim. Structured final review instead binds command,
+selector, persona, and validator evidence in the supervisor-synthesized
+receipt, so no review persona can claim that gate authority.
 
-**Determinism over inferred rosters.** Review lenses (`final-review`,
-`review-change`) and simplification lenses (`simplify-unit`,
-`simplify-change`) are a fixed, ordered list applied every round, rather than
-a per-run set inferred from perceived risk. A fixed roster is what lets a
-repair-then-re-review cycle converge: the same change produces the same
-review shape whether it is round one or round four.
+**Bounded selection, deterministic rereview.** The initial structured review
+combines a mandatory baseline, a selector recommendation constrained to the
+sealed allowlist, and deterministic plan/command risk triggers. The supervisor
+owns ordering and the bound. Once a repair cycle begins, the prior ordered
+persona ids become required selector authority; changed rationales cannot add,
+drop, or reorder lenses. This preserves relevant depth on the first pass and a
+stable comparison surface on every rereview. Stage-path `review-change` and
+both simplification adapters retain their own fixed ordered lenses.

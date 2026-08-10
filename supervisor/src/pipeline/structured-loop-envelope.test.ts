@@ -252,6 +252,60 @@ describe("downstream-context admission bound", () => {
     expect(Buffer.byteLength(canonicalJson(context), "utf8")).toBeLessThanOrEqual(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
   });
 
+  it("seals deterministic review fanout context into unit lead and final-review requests", () => {
+    const plan: ExecutionPlanContract = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "unit-lead-review-fanout",
+      instructions: {
+        runtime: "Implement bounded fanout dispatch, receipt fences, exact roster rereview, and repair settlement.",
+      },
+      acceptance: {
+        safe: "Validation controls the gate and the roster reruns exactly after repair.",
+      },
+      units: [{
+        id: "fanout_runtime",
+        title: "Implement deterministic persona fanout and validated repair",
+        depends_on: [],
+        instructions: ["runtime"],
+        acceptance: ["safe"],
+      }],
+      commands: [{ name: "test" }, { name: "build" }],
+    };
+
+    const context = loopActionPlanContext({
+      plan,
+      actionKind: "lead",
+      unitId: "fanout_runtime",
+      reviewSubject: "1".repeat(40),
+    }) as { review_fanout: { subject: string; personas: Array<{ id: string }>; max_parallel: number } };
+
+    expect(context.review_fanout.subject).toBe("1".repeat(40));
+    expect(context.review_fanout.personas.map((persona) => persona.id)).toEqual([
+      "correctness-dataflow",
+      "tests-contracts",
+      "reliability-adversarial",
+      "agent-native-contracts",
+      "performance",
+    ]);
+    expect(context.review_fanout.max_parallel).toBe(1);
+
+    const finalReviewContext = loopActionPlanContext({
+      plan,
+      actionKind: "final_review",
+      unitId: null,
+      reviewSubject: "2".repeat(40),
+    }) as { review_fanout: { subject: string; roster_digest: string; personas: Array<{ id: string }> } };
+    expect(finalReviewContext.review_fanout).toMatchObject({
+      subject: "2".repeat(40),
+      roster_digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      personas: expect.arrayContaining([
+        expect.objectContaining({ id: "correctness-dataflow" }),
+        expect.objectContaining({ id: "tests-contracts" }),
+      ]),
+    });
+  });
+
   it("preserves valid 1,001-2,000 character final-review criteria when the full context fits", () => {
     const instructionTail = "INSTRUCTION_TAIL_SENTINEL";
     const acceptanceTail = "ACCEPTANCE_TAIL_SENTINEL";

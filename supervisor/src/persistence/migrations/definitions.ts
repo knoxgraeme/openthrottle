@@ -1874,6 +1874,31 @@ const citationGateReceiptMigrationSource = `${citationGateReceiptSchema}
 citation-gate-contract:proposal citation gates persist canonical provider-neutral decisions and reject conflicting replay/v1
 analysis-boundary-contract:resolved analysis rows are gate inputs supplied by the caller, never imported by scheduler transition or effect code/v1`;
 
+const reviewSubactionDispatchSchema = `
+CREATE TABLE execution_review_subaction_dispatches (
+  parent_action_id TEXT NOT NULL,
+  action_id TEXT NOT NULL,
+  request_hash TEXT NOT NULL CHECK(
+    length(request_hash) = 64 AND request_hash NOT GLOB '*[^a-f0-9]*'
+  ),
+  idempotency_key TEXT NOT NULL,
+  prepared_at TEXT NOT NULL,
+  dispatched_at TEXT,
+  dispatch_time_source TEXT CHECK(dispatch_time_source IN ('acknowledged', 'prepared_fallback')),
+  CHECK(
+    (dispatched_at IS NULL AND dispatch_time_source IS NULL) OR
+    (dispatched_at IS NOT NULL AND dispatch_time_source IS NOT NULL)
+  ),
+  PRIMARY KEY(parent_action_id, action_id),
+  UNIQUE(action_id),
+  UNIQUE(parent_action_id, idempotency_key),
+  FOREIGN KEY(parent_action_id) REFERENCES execution_work_attempts(id) ON DELETE CASCADE
+);
+`;
+
+const reviewSubactionDispatchMigrationSource = `${reviewSubactionDispatchSchema}
+structured-review-dispatch-contract:selector fanout and validator subactions persist exact request dispatch intent plus acknowledged or conservative-fallback launch timing under their parent final-review action so crash replay remains heartbeat-mapped without rematerializing credentials or repeating launched provider work/v4`;
+
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
     db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
@@ -2478,6 +2503,16 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (!hasTable(db, "citation_gate_receipts")) {
         db.exec(citationGateReceiptSchema);
+      }
+    },
+  },
+  {
+    version: 32,
+    name: "execution-review-subaction-dispatches",
+    source: reviewSubactionDispatchMigrationSource,
+    up(db) {
+      if (hasTable(db, "execution_work_attempts") && !hasTable(db, "execution_review_subaction_dispatches")) {
+        db.exec(reviewSubactionDispatchSchema);
       }
     },
   },

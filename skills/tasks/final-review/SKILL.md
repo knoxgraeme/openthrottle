@@ -33,6 +33,28 @@ is reviewed again from scratch rather than accepted against this receipt.
   this exact subject. Read them; do not re-run project commands.
 - Review the whole once; do not review units individually.
 
+## Sealed review fanout
+
+`## Execution Plan Context` carries `review_fanout`, the supervisor-selected
+persona roster for this exact subject. Treat it as sealed audit context, not an
+instruction to create more agents.
+
+- Require `review_fanout.schema` to be `openthrottle.review-fanout-plan/v1`,
+  its `subject` to equal `subject.pre`, and its ordered roster to include both
+  `correctness-dataflow` and `tests-contracts`. If any of those checks fails,
+  return `failure`; never infer or repair missing roster data.
+- Never spawn, delegate to, impersonate, or summarize a persona. The supervisor
+  dispatches each roster member as an independent read-only action, validates
+  every exact-subject receipt, and performs deterministic synthesis outside
+  this session.
+- Perform this whole-change review as the final complementary lens. Do not
+  claim that persona actions ran, do not invent findings on their behalf, and
+  do not drop a finding because another persona might report it.
+- The supervisor combines your fenced receipt with the independently collected
+  fanout synthesis. A missing persona receipt, unexpected persona, subject
+  mismatch, mutable roster, or synthesis failure closes the gate; this receipt
+  has no authority to turn one into success.
+
 ## Evidence binding — copy the command hashes verbatim
 
 Your receipt's top-level `evidence` array **must contain the exact
@@ -96,15 +118,15 @@ Open every `message` with a content-derived identity, so the same defect stays
 recognizable after a repair moves it:
 
 ```
-[<repo-relative path>#<symbol, export, or nearest stable anchor>: <invariant violated>]
+[<repo-relative path>#<symbol, export, or nearest stable anchor>|<claim-discriminator>: <invariant violated>]
 ```
 
 - **Never put a line number in the identity** or use one as a discriminator:
   line numbers move whenever code above them moves, turning one unfixed defect
   into a new finding every round. Set `path` to the file path, no line suffix.
-- The same defect carries the identical identity in every round, even after
-  reformatting or a symbol move; distinct defects in one symbol differ in the
-  invariant clause.
+- The claim discriminator is lowercase kebab-case and names one concrete defect.
+  The same defect carries the identical identity in every round and across review
+  lenses; distinct defects in one symbol use different claim discriminators.
 - **Do not re-report a resolved finding.** When the prompt carries an earlier
   round's dispositions, raise a resolved one again only if the defect is still
   present here, and say why the previous repair did not close it. Add no new

@@ -715,7 +715,7 @@ SQLite is the authority. Core tables include:
 - evidence/effects: `pipeline_artifacts`, `pipeline_gate_receipts`,
   `pipeline_publication_receipts`, `pipeline_effect_intents`;
 - structured child execution: `execution_graphs`, `execution_units`,
-  `execution_work_attempts`, `execution_gate_receipts`,
+  `execution_work_attempts`, `execution_review_subaction_dispatches`, `execution_gate_receipts`,
   `execution_downstream_context`, `execution_publication_events`;
 - cross-run orchestration history: `orchestration_journal`;
 - settlement rollup measurement corpus: `run_outcomes`;
@@ -729,6 +729,54 @@ use `actor = 'stage_agent'` with sanitized, bounded notes and structured
 evidence references. The journal is queryable for operator or future
 orchestrator inspection, but no coordinator transition, gate, or effect
 scheduling logic may consume it as authority.
+
+Each settled structured final-review cycle appends one complete
+`openthrottle.review-journal/v1` object as `structured` journal data before its
+gate decision is persisted. The object cross-binds the exact base/pre/post
+subject, policy and sealed roster, selector recommendation, per-persona receipt
+digests and finding ids, deterministic synthesis, independent blocker
+validation, repair dispositions, convergence cycle and resolution state, plus
+bounded selector/persona/validator dispatch-to-completion timing evidence and
+latency/count measurements (`cost_microusd = null` when unavailable). Total
+latency is the sum of those model-service intervals; critical-path latency is
+the wall interval from selector dispatch through the final persona or validator
+completion, so serialized Codex offsets are not counted more than once.
+Acknowledged launches use supervisor acknowledgement time; a result recovered
+from the launch-ack crash window uses the separately labeled conservative
+`prepared_fallback`. Timing action ids must be the exact deterministic selector,
+persona, and validator ids under one parent review prefix, and persona ids are
+also checked against their fenced receipt action ids. The live
+gate consumes the in-memory exact-fenced receipts and validated synthesis, not
+this history row; the row is durable audit and future self-learning input.
+Raw persona findings are grouped before independent blocker validation by
+repository-relative path plus a sufficiently specific stable semantic anchor and
+lowercase kebab-case claim discriminator; diagnostic prose and persona invariant
+are not group identity. Each group keeps
+one existing representative, selected deterministically by explicit severity
+order (`P0`, `P1`, `P2`, `P3`), stable finding id, then canonical finding bytes.
+Only that exact representative may be validator-accepted and enter final repair,
+once. Journal evidence retains every member finding id and reporting persona,
+but advisory and non-representative members cannot alter the representative's
+validator disposition or resolution state. Only `accepted` and `rejected`
+repair dispositions carry those validator results; `deferred`, `fixed`, and
+`superseded` dispositions carry explicit `not_validated` and are excluded from
+validator acceptance and rejection counts. Rereview correlates unresolved work
+by stable semantic group and finding/member ids before treating absence as
+fixed, so diagnostic rewording cannot duplicate or prematurely resolve a
+finding. Rereview searches the newest bounded history window. A
+missing or malformed prior journal is appended as a separate audit-gap note and
+cannot block, pass, or otherwise authorize the live receipt/gate decision.
+Persona actions remain independent sessions, but all engines execute the
+deterministic roster one action at a time within the shared sealed sandbox.
+Concurrent siblings would race the sandbox's action-directory locks. Codex has
+an additional serialization requirement because its shared subscription
+credential has a rotating one-time refresh token: the supervisor captures the
+completed persona's action-scoped auth snapshot before it materializes the next
+persona's credentials. Selector, persona, and validator dispatch intent is
+persisted before provider launch and marked launched after acknowledgement.
+Repeated drains collect a durably launched subaction before considering
+dispatch; a prepared-only crash window reuses the same provider idempotency
+fence.
 
 `run_outcomes` holds one deterministic row per pipeline instance, written
 exactly once at its terminal transition -- either applyTransition's normal
@@ -878,12 +926,35 @@ and at least one unit reached `completed`, the same fenced-action mechanics
 rerun the full configured commands and one fresh, report-only final review
 against the final integrated subject; a `semantic_repair_required` final
 review routes through a dedicated final-repair action and a fresh command/review
-cycle, invalidating the prior review's authority. The reducer may lease at most
+cycle, invalidating the prior review's authority. Final review is a sealed
+supervisor orchestration, not one reviewer's opinion: the supervisor first
+dispatches `select-review-personas` against the exact subject and a bounded
+policy allowlist; validates its subject, policy digest, ordered recommendation,
+and evidence rationale; adds mandatory baseline and deterministic plan/command
+risk lenses; and dispatches each selected persona as an independent fresh,
+read-only loop action. Missing, duplicate, unexpected, stale-subject, or
+wrong-producer receipts fail closed. P0/P1 findings cannot enter the final gate
+until a separate `validate-review-findings` action returns each accepted blocker
+byte-for-byte. Every persona receipt is bounded by the sealed `max_findings`
+value (eight in the current policy) before validator or journal synthesis.
+Rejected blockers and P2/P3 advisories remain gate/journal telemetry but are
+excluded from the final-repair-authoritative receipt. The supervisor alone
+synthesizes the final review receipt and gate input, with exact selector,
+persona, validator, and command receipt hashes as provenance. Transient persona
+or validator dispatch/collection exceptions leave the parent review active and
+replay the same deterministic subaction ids on the next drain. On a repair
+cycle, selector authority requires the
+prior ordered persona ids and the prior roster digest must match, so rereview
+cannot silently add, drop, or reorder a lens. Unit leads never dispatch review
+personas and cannot promote persona findings. The reducer may lease at most
 one active action -- unit-scoped or whole-change -- per parent attempt at a
 time. It expires only pre-dispatch claims by lease time. Dispatched or running
 child actions remain the active action while their parent-run-fenced child
 liveness is fresh, and are recovered/collected by idempotency rather than
-duplicated. When a dispatched or running child action misses its heartbeat
+duplicated. Structured review selector/persona/validator heartbeat ids renew
+the persisted parent final-review lease only through their exact durable
+subaction mapping; unknown ids, wrong runs, and inactive parents are rejected.
+When a dispatched or running child action misses its heartbeat
 fence, the supervisor first identifies that exact expired current action and
 invokes idempotent runtime result collection outside the SQLite transaction. A
 recovered result completes only through a compare-and-set against the unit's

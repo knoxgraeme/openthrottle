@@ -125,13 +125,13 @@ BAD  [src/config.ts:142: null return]
      — moves when anything above line 142 moves.
 BAD  [src/config.ts: error handling]
      — two different defects in the file collide on one identity.
-GOOD [src/config.ts#loadConfig: read failure is indistinguishable from empty]
-GOOD [src/config.ts#loadConfig: partial write is not rolled back on throw]
-     — same file, same symbol, two invariants, two stable identities.
+GOOD [src/config.ts#loadConfig|read-failure-collapses-to-empty: config reads remain distinguishable]
+GOOD [src/config.ts#loadConfig|partial-write-not-rolled-back: config writes are atomic]
+     — same file and symbol, but two claim discriminators and two stable identities.
 ```
 
 Across a repair round the tag does not change even when the code does. If round
-1 raises `[src/queue.ts#drain: retries have no ceiling]` and round 2 finds it
+1 raises `[src/queue.ts#drain|retry-ceiling-missing: retries remain bounded]` and round 2 finds it
 resolved, the tag is byte-identical even though the repair moved and reformatted
 the function — which is what makes the round legible as progress rather than
 churn. If the symbol itself disappears, anchor to the nearest surviving stable

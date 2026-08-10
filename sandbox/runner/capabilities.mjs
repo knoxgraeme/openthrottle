@@ -6,6 +6,19 @@ import { pathToFileURL } from "node:url";
 
 export const STAGE_EXECUTOR_PROTOCOL = "stage-executor@1";
 
+export const REVIEW_PERSONA_CAPABILITIES = Object.freeze([
+  "select-review-personas@1",
+  "validate-review-findings@1",
+  "correctness-dataflow@1",
+  "tests-contracts@1",
+  "reliability-adversarial@1",
+  "agent-native-contracts@1",
+  "security@1",
+  "data-migration@1",
+  "performance@1",
+  "project-standards@1",
+]);
+
 export const CAPABILITY_CONTRACTS = Object.freeze({
   "agent/repository-skill@1": {
     kind: "agent",
@@ -28,6 +41,13 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
     contexts: ["fresh", "resume_required", "prefer_resume"],
     artifacts: ["stage_result"],
   },
+  ...Object.fromEntries(REVIEW_PERSONA_CAPABILITIES.map((capability) => [capability, {
+    kind: "agent",
+    minimumCredentials: ["model.invoke", "repo.read"],
+    allowedCredentials: ["model.invoke", "repo.read"],
+    contexts: ["fresh", "resume_required", "prefer_resume"],
+    artifacts: ["stage_result"],
+  }])),
   "ce/implement@1": {
     kind: "agent",
     minimumCredentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
@@ -102,7 +122,7 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
 
 export const RUNTIME_DESCRIPTOR = Object.freeze({
   schema: "openthrottle.runtime-capabilities/v1",
-  release: "openthrottle-snapshot/v9",
+  release: "openthrottle-snapshot/v11",
   generatedBy: "sandbox-runtime-build",
   protocol: STAGE_EXECUTOR_PROTOCOL,
   capabilities: Object.keys(CAPABILITY_CONTRACTS).sort(),

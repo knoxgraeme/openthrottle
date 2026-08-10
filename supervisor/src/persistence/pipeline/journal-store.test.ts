@@ -127,4 +127,34 @@ describe("orchestration journal store", () => {
     expect(() => journal.listJournalEntries({ issueId: "issue-1", limit: 1.5 }))
       .toThrow(/limit must be a safe integer/);
   });
+
+  it("can retrieve the newest bounded journal window deterministically", () => {
+    db = openDb(":memory:");
+    seedTicket();
+    registerRepository("OT", "2026-07-27T00:00:00.000Z");
+    let recordedAt = "2026-07-27T00:00:00.000Z";
+    const journal = createJournalStore(db, () => recordedAt);
+    for (const [id, at] of [
+      ["00000000-0000-4000-8000-000000000001", "2026-07-27T00:00:01.000Z"],
+      ["00000000-0000-4000-8000-000000000002", "2026-07-27T00:00:02.000Z"],
+      ["00000000-0000-4000-8000-000000000003", "2026-07-27T00:00:03.000Z"],
+    ] as const) {
+      recordedAt = at;
+      journal.recordJournalEntry({
+        id,
+        issueId: "issue-1",
+        actor: "supervisor",
+        kind: "run_note",
+        trigger: "ordering",
+        action: id,
+        refs: {},
+      });
+    }
+
+    expect(journal.listJournalEntries({ issueId: "issue-1", order: "newest", limit: 2 }).map((entry) => entry.id))
+      .toEqual([
+        "00000000-0000-4000-8000-000000000003",
+        "00000000-0000-4000-8000-000000000002",
+      ]);
+  });
 });

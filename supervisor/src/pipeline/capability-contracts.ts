@@ -26,6 +26,18 @@ export const STRUCTURED_PHASE_BUILTIN_CAPABILITIES = {
   simplify: "ce/simplify@1",
   lead: "accept-unit@1",
 } as const;
+export const REVIEW_PERSONA_CAPABILITIES = [
+  "select-review-personas@1",
+  "validate-review-findings@1",
+  "correctness-dataflow@1",
+  "tests-contracts@1",
+  "reliability-adversarial@1",
+  "agent-native-contracts@1",
+  "security@1",
+  "data-migration@1",
+  "performance@1",
+  "project-standards@1",
+] as const;
 
 export interface CapabilityCredentialContract {
   minimum: readonly string[];
@@ -95,6 +107,12 @@ const CAPABILITY_CREDENTIALS: Readonly<Record<string, CapabilityCredentialContra
     contexts: ["fresh", "resume_required", "prefer_resume"],
     artifacts: ["stage_result"],
   },
+  ...Object.fromEntries(REVIEW_PERSONA_CAPABILITIES.map((capability) => [capability, {
+    minimum: ["model.invoke", "repo.read"],
+    allowed: ["model.invoke", "repo.read"],
+    contexts: ["fresh", "resume_required", "prefer_resume"],
+    artifacts: ["stage_result"],
+  }])),
   [FOR_EACH_UNIT_CAPABILITY]: {
     minimum: ["repo.read"],
     allowed: ["repo.read", "provider.read"],

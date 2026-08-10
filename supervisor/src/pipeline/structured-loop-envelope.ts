@@ -14,6 +14,7 @@ import {
   MAX_PRIOR_EVIDENCE_BYTES,
 } from "./structured-loop-limits.js";
 import type { UnitActionKind } from "./unit-coordinator.js";
+import { buildReviewFanoutPlan } from "./review-fanout.js";
 
 export { MAX_LOOP_REQUEST_ENVELOPE_BYTES } from "./structured-loop-limits.js";
 
@@ -23,7 +24,9 @@ type LoopActionPlanContextInput = {
   plan: ExecutionPlanContract | null;
   actionKind: UnitActionKind;
   unitId: string | null;
+  reviewSubject?: string;
 };
+type ExecutionPlanUnitContext = ExecutionPlanContract["units"][number];
 
 const FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES = 48 * 1024;
 
@@ -255,16 +258,44 @@ function finalReviewPlanContext(plan: ExecutionPlanContract, actionKind: UnitAct
   return finalReviewFallbackContext({ plan, actionKind, instructionIds, acceptanceIds });
 }
 
+function addReviewFanoutContext(
+  context: Record<string, unknown>,
+  input: {
+    subject: string;
+    plan: ExecutionPlanContract;
+    unit?: ExecutionPlanUnitContext;
+    commandNames: readonly string[];
+  }
+): Record<string, unknown> {
+  return {
+    ...context,
+    review_fanout: buildReviewFanoutPlan({
+      subject: input.subject,
+      unit: input.unit,
+      instructions: input.plan.instructions,
+      acceptance: input.plan.acceptance,
+      commandNames: input.commandNames,
+    }),
+  };
+}
+
 export function loopActionPlanContext(input: LoopActionPlanContextInput): Record<string, unknown> | null {
   const plan = input.plan;
   if (!plan) return null;
   if (input.unitId === null && input.actionKind === "final_review") {
-    return finalReviewPlanContext(plan, input.actionKind);
+    const context = finalReviewPlanContext(plan, input.actionKind);
+    return input.reviewSubject
+      ? addReviewFanoutContext(context, {
+          subject: input.reviewSubject,
+          plan,
+          commandNames: plan.commands.map((command) => command.name),
+        })
+      : context;
   }
   const unit = input.unitId
     ? plan.units.find((unit) => unit.id === input.unitId)
     : undefined;
-  return {
+  const context = {
     schema: "openthrottle.loop-action-plan-context/v1",
     graph_id: plan.graph_id,
     plan_id: plan.plan_id,
@@ -276,6 +307,13 @@ export function loopActionPlanContext(input: LoopActionPlanContextInput): Record
       ? plan.commands.filter((command) => command.unit === undefined || command.unit === input.unitId)
       : plan.commands,
   };
+  if ((input.actionKind !== "lead" && input.actionKind !== "repair") || !input.reviewSubject) return context;
+  return addReviewFanoutContext(context, {
+    subject: input.reviewSubject,
+    plan,
+    unit,
+    commandNames: context.commands.map((command) => command.name),
+  });
 }
 
 export function loopActionTransitionContext(input: {

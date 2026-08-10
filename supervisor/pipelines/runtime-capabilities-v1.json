@@ -1,10 +1,11 @@
 {
   "schema": "openthrottle.runtime-capabilities/v1",
-  "release": "openthrottle-snapshot/v9",
+  "release": "openthrottle-snapshot/v11",
   "generatedBy": "sandbox-runtime-build",
   "protocol": "stage-executor@1",
   "capabilities": [
     "accept-unit@1",
+    "agent-native-contracts@1",
     "agent/repository-skill@1",
     "agent/semantic@1",
     "ce/implement@1",
@@ -14,9 +15,18 @@
     "ce/review@1",
     "ce/simplify@1",
     "command/run@1",
+    "correctness-dataflow@1",
+    "data-migration@1",
     "graph/for-each-unit@1",
     "loop-action@2",
-    "provider/wait@1"
+    "performance@1",
+    "project-standards@1",
+    "provider/wait@1",
+    "reliability-adversarial@1",
+    "security@1",
+    "select-review-personas@1",
+    "tests-contracts@1",
+    "validate-review-findings@1"
   ],
   "executors": ["agent", "command", "loop_action", "provider_wait"],
   "evaluators": ["command", "human", "provider", "publish_subject", "semantic"],

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { canonicalJson, digestNormalized } from "../pipeline/manifest.js";
 import type { ExecutionGateReceipt, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { ExecutionUnitState } from "../pipeline/unit-coordinator.js";
-import type { LoopActionRequest } from "../runtime/contracts.js";
+import type { LoopActionRequest, SandboxRuntime } from "../runtime/contracts.js";
 import { MAX_VALID_DOWNSTREAM_CONTEXT } from "../pipeline/structured-loop-envelope.js";
 import { MAX_LOOP_REQUEST_ENVELOPE_BYTES } from "../pipeline/structured-loop-limits.js";
 import { aggregateOutcomeFor, createStructuredChildRuntime } from "./structured-child-runtime.js";
@@ -78,6 +78,14 @@ function action(overrides: Partial<ExecutionWorkAttempt> & {
     completed_at: null,
     last_error: null,
     ...overrides,
+  };
+}
+
+function reviewSubactionDispatchStore() {
+  return {
+    getReviewSubactionDispatch: vi.fn(() => undefined),
+    prepareReviewSubactionDispatch: vi.fn(() => "recorded" as const),
+    markReviewSubactionDispatched: vi.fn(),
   };
 }
 
@@ -563,6 +571,384 @@ describe("structured child runtime command seeding", () => {
 
     expect(() => childRuntime.seedCompositeGraph(instance as any, request(executionPlan) as any))
       .toThrow(/execution plan command docs-check is not configured/);
+  });
+});
+
+describe("structured child runtime review fanout", () => {
+  it("keeps the unit lead independent from whole-change persona fanout", async () => {
+    const subject = "4".repeat(40);
+    const lead = action({
+      id: "lead-fanout",
+      action_kind: "lead",
+      cycle: 1,
+      status: "leased",
+      attempt_ordinal: 1,
+      request_hash: null,
+    });
+    const implement = action({
+      id: "implement-fanout",
+      action_kind: "implement",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 1,
+      request_hash: "1".repeat(64),
+      receipt: completionReceipt(subject, { ...lead, id: "implement-fanout", request_hash: "1".repeat(64) }),
+      output_subject: subject,
+    });
+    const candidate = action({
+      id: "candidate-fanout",
+      action_kind: "candidate",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 1,
+      request_hash: "2".repeat(64),
+      receipt: candidateReceipt(subject, { ...lead, id: "candidate-fanout", request_hash: "2".repeat(64) }),
+      output_subject: subject,
+    });
+    const command = action({
+      id: "command-fanout",
+      action_kind: "command",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 1,
+      command_name: "test",
+      request_hash: "3".repeat(64),
+      receipt: commandReceipt(subject, { ...lead, id: "command-fanout", action_kind: "command", command_name: "test", request_hash: "3".repeat(64) }),
+      output_subject: subject,
+    });
+    const plan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "fanout-runtime",
+      instructions: {
+        runtime: "Implement bounded fanout dispatch, receipt fences, exact roster rereview, and repair settlement.",
+      },
+      acceptance: { done: "Validation controls the gate." },
+      units: [{ id: "unit_a", title: "Fanout runtime", depends_on: [], instructions: ["runtime"], acceptance: ["done"] }],
+      commands: [{ name: "test" }],
+    };
+    const dispatchLoopAction = vi.fn<SandboxRuntime["dispatchLoopAction"]>(async () => ({ providerDispatchId: "dispatch" }));
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: { dispatchLoopAction } as any,
+      store: {
+        leaseNextUnitAction: () => lead,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        prepareActionDispatch: vi.fn((input) => {
+          lead.request_hash = input.requestHash;
+          lead.request_payload = input.requestPayload;
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload(plan) }),
+        listWorkAttempts: () => [implement, candidate, command],
+        listUnits: () => [unit({
+          unitId: "unit_a",
+          ordinal: 0,
+          status: "running",
+          activeActionId: lead.id,
+          phase: "lead",
+          currentCycle: 1,
+          commandNames: ["test"],
+          acceptedCandidateSubject: subject,
+          integrationSubject: null,
+          terminalLevel: null,
+        })],
+        listDownstreamContext: () => [],
+        getGraphForAttempt: () => ({ command_names: JSON.stringify(["test"]), integration_subject: null }),
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhases: ["implement", "command", "candidate", "lead", "integrate"],
+          unitPhaseBindings: [{
+            id: "lead",
+            kind: "gate",
+            loop: {
+              id: "lead-loop",
+              skill: "builtin://accept-unit@1",
+              input_scope: "unit",
+              receipt: "unit_decision",
+              max_parallel: 1,
+              max_rounds: 1,
+              timeout_seconds: 77,
+            },
+            worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
+            executor: { kind: "agent", capability: "accept-unit@1" },
+            credentials: ["model.invoke", "repo.read"],
+            context: "fresh",
+          }],
+          executor: { capability: "graph/for-each-unit@1" },
+        }],
+      }),
+    } as any, "parent-attempt");
+
+    expect(dispatchLoopAction).toHaveBeenCalledTimes(1);
+    expect(dispatchLoopAction.mock.calls[0]![1]).toMatchObject({
+      actionId: lead.id,
+      role: "lead",
+      skill: "accept-unit",
+      candidateSubject: subject,
+    });
+  });
+
+  it("does not promote unvalidated persona blockers through the unit acceptance gate", async () => {
+    const subject = "a".repeat(40);
+    const lead = action({
+      id: "lead-fanout-collect",
+      action_kind: "lead",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 1,
+      request_hash: "9".repeat(64),
+      request_launch_state: "launched",
+      request_payload: canonicalJson({
+        protocol: "loop-action@2",
+        actionId: "lead-fanout-collect",
+        attemptId: "parent-attempt",
+        graphId: "graph-1",
+        unitId: "unit_a",
+        role: "lead",
+        loop: "lead",
+        agent: "codex",
+        skill: "accept-unit",
+        worktree: null,
+        baseSubject: subject,
+        inputSubject: subject,
+        candidateSubject: subject,
+        nativeSessionId: null,
+        contextPolicy: "fresh",
+        timeoutMs: 300_000,
+        transitionContext: "",
+        allowedMcpServers: [],
+        credentialScopes: ["model.invoke", "repo.read"],
+        receiptSchema: "openthrottle.receipt/v1",
+        requestHash: "9".repeat(64),
+        idempotencyKey: "lead",
+      } satisfies LoopActionRequest),
+    });
+    const implement = action({
+      id: "implement-fanout-collect",
+      action_kind: "implement",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 1,
+      request_hash: "1".repeat(64),
+      receipt: completionReceipt(subject, { ...lead, id: "implement-fanout-collect", action_kind: "implement", request_hash: "1".repeat(64) }),
+      output_subject: subject,
+    });
+    const candidate = action({
+      id: "candidate-fanout-collect",
+      action_kind: "candidate",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 1,
+      request_hash: "b".repeat(64),
+      receipt: candidateReceipt(subject, { ...lead, id: "candidate-fanout-collect", action_kind: "candidate", request_hash: "b".repeat(64) }),
+      output_subject: subject,
+    });
+    const priorEvidenceHashes = [implement, candidate].map((attempt) => digestNormalized(attempt.receipt!));
+    const plan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "fanout-runtime",
+      instructions: {
+        runtime: "Implement bounded fanout dispatch, receipt fences, exact roster rereview, and repair settlement.",
+      },
+      acceptance: { done: "Validation controls the gate." },
+      units: [{ id: "unit_a", title: "Fanout runtime", depends_on: [], instructions: ["runtime"], acceptance: ["done"] }],
+      commands: [],
+    };
+    const leadReceipt = canonicalJson({
+      schema: "openthrottle.receipt/v1",
+      type: "unit_decision",
+      assurance: "semantic_attested",
+      result: "accept",
+      producer: {
+        worker_id: "lead-worker",
+        skill: "builtin://accept-unit@1",
+        capability_digest: "d".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: { base: subject, pre: subject, post: subject },
+      fence: {
+        pipeline_instance_id: "instance-1",
+        graph_digest: "c".repeat(64),
+        unit_id: "unit_a",
+        attempt_id: "parent-attempt",
+        parent_run_id: "run-1",
+        action_attempt_id: lead.id,
+        generation: 1,
+        native_session_id: null,
+        request_hash: lead.request_hash,
+      },
+      evidence: priorEvidenceHashes,
+      payload: { rationale: "Scope matches.", context_updates: [], accepted_subject: subject },
+      issued_at: "2099-07-22T12:00:00.000Z",
+    });
+    const semanticReviewReceipt = (input: { personaId: string; actionId: string; requestHash: string }) => canonicalJson({
+      schema: "openthrottle.receipt/v1",
+      type: "semantic_review",
+      assurance: "semantic_attested",
+      result: input.personaId === "tests-contracts" ? "semantic_repair_required" : "success",
+      producer: {
+        worker_id: input.personaId,
+        skill: `builtin://${input.personaId}@1`,
+        capability_digest: "d".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: { base: subject, pre: subject, post: subject },
+      fence: {
+        pipeline_instance_id: "instance-1",
+        graph_digest: "c".repeat(64),
+        unit_id: "unit_a",
+        attempt_id: "parent-attempt",
+        parent_run_id: "run-1",
+        action_attempt_id: input.actionId,
+        generation: 1,
+        native_session_id: null,
+        request_hash: input.requestHash,
+      },
+      evidence: ["reviewed exact subject"],
+      payload: {
+        summary: "Persona reviewed.",
+        findings: input.personaId === "tests-contracts"
+          ? [{ severity: "P1", message: "Missing production synthesis.", path: "supervisor/src/operations/structured-child-runtime.ts" }]
+          : [],
+      },
+      issued_at: "2099-07-22T12:00:00.000Z",
+    });
+    const completeGatedAction = vi.fn();
+    const failUnitAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        collectLoopActionResult: vi.fn(async (_resource, request) => {
+          if (request.actionId === lead.id) {
+            return {
+              actionId: lead.id,
+              attemptId: lead.parent_attempt_id,
+              requestHash: lead.request_hash!,
+              outcome: "success",
+              nativeSessionId: null,
+              subject,
+              receipt: leadReceipt,
+              completedAt: "2099-07-22T12:00:00.000Z",
+            };
+          }
+          const personaId = request.actionId.split(".review.")[1]!;
+          return {
+            actionId: request.actionId,
+            attemptId: request.attemptId,
+            requestHash: request.requestHash,
+            outcome: "success",
+            nativeSessionId: null,
+            subject,
+            receipt: semanticReviewReceipt({ personaId, actionId: request.actionId, requestHash: request.requestHash }),
+            completedAt: "2099-07-22T12:00:00.000Z",
+          };
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => lead,
+        completeGatedAction,
+        failUnitAction,
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload(plan) }),
+        listGateReceipts: () => [],
+        listWorkAttempts: () => [implement, candidate, lead],
+        listUnits: () => [unit({
+          unitId: "unit_a",
+          ordinal: 0,
+          status: "running",
+          activeActionId: lead.id,
+          phase: "lead",
+          currentCycle: 1,
+          commandNames: [],
+          acceptedCandidateSubject: subject,
+          integrationSubject: null,
+          terminalLevel: null,
+        })],
+        getGraphForAttempt: () => ({ command_names: JSON.stringify([]), integration_subject: null }),
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: subject,
+      immutable_subject: subject,
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          unitPhases: ["implement", "candidate", "lead", "integrate"],
+          unitPhaseBindings: [{
+            id: "implement",
+            kind: "agent",
+            loop: {
+              id: "implement-loop",
+              skill: "builtin://implement-unit@1",
+              input_scope: "unit",
+              receipt: "unit_completion",
+              max_parallel: 1,
+              max_rounds: 1,
+              timeout_seconds: 77,
+            },
+            worker: { id: "worker-1", agent: "inherit", allowed_mcp_servers: [] },
+            executor: { kind: "agent", capability: "implement-unit@1" },
+            credentials: ["model.invoke", "repo.read"],
+            context: "fresh",
+          }, {
+            id: "lead",
+            kind: "gate",
+            loop: {
+              id: "lead-loop",
+              skill: "builtin://accept-unit@1",
+              input_scope: "unit",
+              receipt: "unit_decision",
+              max_parallel: 1,
+              max_rounds: 1,
+              timeout_seconds: 77,
+            },
+            worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
+            executor: { kind: "agent", capability: "accept-unit@1" },
+            credentials: ["model.invoke", "repo.read"],
+            context: "fresh",
+          }],
+          executor: { capability: "graph/for-each-unit@1" },
+        }],
+      }),
+    } as any, "parent-attempt");
+
+    expect(failUnitAction).not.toHaveBeenCalled();
+    expect(completeGatedAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: lead.id,
+      outputSubject: subject,
+      decision: expect.objectContaining({
+        gateKind: "unit_acceptance",
+        outcome: "success",
+        reason: "lead_scope_match_accept",
+      }),
+    }));
+    const receipt = JSON.parse(completeGatedAction.mock.calls[0]![0].receipt) as { payload: { revision_request?: string } };
+    expect(receipt.payload.revision_request).toBeUndefined();
+    const decisionPayload = JSON.parse(completeGatedAction.mock.calls[0]![0].decision.payload) as { review_fanout_synthesis?: unknown };
+    expect(decisionPayload.review_fanout_synthesis).toBeUndefined();
   });
 });
 
@@ -2034,6 +2420,7 @@ describe("structured child runtime repair fences", () => {
         },
       } as any,
       store: {
+        ...reviewSubactionDispatchStore(),
         leaseNextUnitAction: () => finalReview,
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
@@ -2059,7 +2446,7 @@ describe("structured child runtime repair fences", () => {
     } as any, "parent-attempt");
 
     expect(dispatched).toMatchObject({
-      actionId: "final-review-no-commands",
+      actionId: "final-review-no-commands.review.selector",
       role: "reviewer",
       loop: "review",
       timeoutMs: 300_000,
@@ -2071,7 +2458,7 @@ describe("structured child runtime repair fences", () => {
     });
   });
 
-  it("accepts an in-flight final review receipt sealed with its persisted request base", async () => {
+  it("rejects a legacy in-flight final review that bypasses the selector boundary", async () => {
     const integratedSubject = "b".repeat(40);
     const requestHash = "e".repeat(64);
     const finalReview = action({
@@ -2158,11 +2545,10 @@ describe("structured child runtime repair fences", () => {
       }),
     } as any, "parent-attempt");
 
-    expect(failUnitAction).not.toHaveBeenCalled();
-    expect(completeGatedAction).toHaveBeenCalledWith(expect.objectContaining({
+    expect(completeGatedAction).not.toHaveBeenCalled();
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
       actionId: finalReview.id,
-      outputSubject: integratedSubject,
-      receipt,
+      lastError: expect.stringMatching(/final review request is not the sealed selector action/),
     }));
   });
 
@@ -2338,9 +2724,11 @@ describe("structured child runtime repair fences", () => {
         },
       } as any,
       store: {
+        ...reviewSubactionDispatchStore(),
         leaseNextUnitAction: () => finalReviewRoundTwo,
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
+        listGateReceipts: () => [],
         listWorkAttempts: () => [priorFinalReview, priorFinalRepair, finalReviewRoundTwo],
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),
@@ -2363,7 +2751,7 @@ describe("structured child runtime repair fences", () => {
     } as any, "parent-attempt");
 
     expect(dispatched).toMatchObject({
-      actionId: "final-review-cycle-2",
+      actionId: "final-review-cycle-2.review.selector",
       role: "reviewer",
       loop: "review",
       priorEvidence: {
@@ -2410,9 +2798,11 @@ describe("structured child runtime repair fences", () => {
         },
       } as any,
       store: {
+        ...reviewSubactionDispatchStore(),
         leaseNextUnitAction: () => finalReviewRoundTwo,
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
+        listGateReceipts: () => [],
         listWorkAttempts: () => [priorFinalReview, finalReviewRoundTwo],
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),

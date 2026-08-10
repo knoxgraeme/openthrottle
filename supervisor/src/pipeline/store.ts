@@ -231,6 +231,7 @@ export interface OrchestrationJournalQuery {
   from?: string;
   to?: string;
   limit?: number;
+  order?: "oldest" | "newest";
 }
 
 // Supervisor-derived settlement facts only -- never agent-authored content.

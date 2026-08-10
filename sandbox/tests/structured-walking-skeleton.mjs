@@ -64,6 +64,7 @@ const TEST_COMMAND = `./${BOOTSTRAP_TOOL} || exit 127; count=$(cat ${TEST_COMMAN
 
 const OPENTHROTTLE_ROOT = "/var/lib/openthrottle";
 const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
+const LOOP_DISPATCH_DIR = "/var/lib/openthrottle/loop-dispatch";
 const CHILD_EXECUTOR_DIR = "/var/lib/openthrottle/child-executor-actions";
 const STAGE_INPUT_DIR = "/var/lib/openthrottle/stage-input";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
@@ -133,6 +134,10 @@ function assertValidResultEnvelope({ event, kind, request }) {
   assert(RESULT_OUTCOMES.has(event.outcome), `${kind} result has invalid outcome ${event.outcome}`);
   assert(typeof event.receipt === "string", `${kind} result is missing a receipt string`);
   assert(typeof event.created_at === "string" && !Number.isNaN(Date.parse(event.created_at)), `${kind} result has an invalid created_at`);
+}
+
+function shellSingleQuoted(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
 function docker(args, options = {}) {
@@ -311,16 +316,18 @@ function readRuntimeDescriptor(container) {
 //
 // Every method that a real Daytona adapter would use to talk to a live
 // sandbox instead runs the exact same runner CLI inside the built container
-// via `docker exec`, synchronously. Since local docker exec has no
-// meaningful async latency, dispatch performs the real work immediately and
-// caches the parsed result; collect returns the cached result. This is a
-// valid provider shape for SandboxRuntime (a "fast" provider) and never
-// substitutes for or bypasses production reduction/gate logic -- those stay
-// in structured-child-runtime.ts / unit-coordinator.ts / execution-gates.ts.
+// via `docker exec`. Loop dispatch is detached so the provider acknowledgement
+// precedes completion evidence exactly as the SandboxRuntime contract requires;
+// collect polls the executor-owned result file. Production reduction/gate
+// logic stays in structured-child-runtime.ts / unit-coordinator.ts /
+// execution-gates.ts.
 // ---------------------------------------------------------------------------
 
 function createDockerSandboxRuntime(container) {
   const cachedLoopResults = new Map();
+  const dispatchedLoopRequests = new Map();
+  const completedReviewPersonaActions = new Set();
+  const lastReviewPersonaByParent = new Map();
   const cachedChildResults = new Map();
   const worktreeHandles = new Map();
   const dispatchedWorktreeIds = new Set();
@@ -330,7 +337,13 @@ function createDockerSandboxRuntime(container) {
   // so a resume dispatched into a DIFFERENT worktree than the one that
   // sealed the session is what proves the restore relocates it (OPE-101).
   const resumedSessionWorktrees = new Map();
-  const counters = { createWorktree: 0, dispatchLoopAction: 0, dispatchChildExecutorAction: 0, cleanupWorktree: 0 };
+  const counters = {
+    createWorktree: 0,
+    dispatchLoopAction: 0,
+    dispatchChildExecutorAction: 0,
+    cleanupWorktree: 0,
+    serialReviewPersonaTransitions: 0,
+  };
   // The container is genuinely shared across scenarios, but production
   // enforces one pipeline instance per runtime_provider_resource_id -- give
   // each runtime adapter (one per scenario, or per restart within a
@@ -355,9 +368,16 @@ function createDockerSandboxRuntime(container) {
 
   return {
     counters,
+    dispatchedLoopRequests,
     worktreeHandles,
     dispatchedWorktreeIds,
     resumedSessionWorktrees,
+
+    loopExecutorStartCount(request) {
+      const auditPath = `/tmp/ot-walking-skeleton-loop-starts/${request.attemptId}.${request.actionId}.log`;
+      const count = dockerExecStatus(container, ["sh", "-c", `test -f ${shellSingleQuoted(auditPath)} && wc -l < ${shellSingleQuoted(auditPath)}`]);
+      return count.status === 0 ? Number.parseInt(count.stdout.trim(), 10) : 0;
+    },
 
     async provision() {
       return { providerResourceId };
@@ -431,6 +451,25 @@ function createDockerSandboxRuntime(container) {
 
     async dispatchLoopAction(_resource, request) {
       counters.dispatchLoopAction += 1;
+      const reviewSeparatorIndex = request.actionId.lastIndexOf(".review.");
+      const isReviewPersona = reviewSeparatorIndex >= 0 &&
+        request.skill !== "select-review-personas" &&
+        request.skill !== "validate-review-findings";
+      if (isReviewPersona) {
+        const parentActionId = request.actionId.slice(0, reviewSeparatorIndex);
+        const previousPersonaActionId = lastReviewPersonaByParent.get(parentActionId);
+        if (previousPersonaActionId && previousPersonaActionId !== request.actionId) {
+          // Non-Codex regression: Claude personas share one sealed sandbox.
+          // Persona N+1 may launch only after collect observed persona N's
+          // durable result; dispatch acknowledgement alone is insufficient.
+          assert(
+            completedReviewPersonaActions.has(previousPersonaActionId),
+            `review persona ${request.actionId} launched before ${previousPersonaActionId} completed`
+          );
+          counters.serialReviewPersonaTransitions += 1;
+        }
+        lastReviewPersonaByParent.set(parentActionId, request.actionId);
+      }
       if (request.worktree?.id) dispatchedWorktreeIds.add(request.worktree.id);
       if (request.nativeSessionId && request.worktree?.id) {
         const seen = resumedSessionWorktrees.get(request.nativeSessionId) ?? new Set();
@@ -440,7 +479,14 @@ function createDockerSandboxRuntime(container) {
       const requestPath = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}/request.json`;
       const outputPath = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}/result.json`;
       const credentialsPath = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}/credentials.json`;
-      dockerWriteRootFile(container, requestPath, JSON.stringify(request));
+      const dispatchNonce = randomBytes(16).toString("hex");
+      const stagedRequestPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.${dispatchNonce}.request.json`;
+      const stagedCredentialsPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.${dispatchNonce}.credentials.json`;
+      const lockPath = `${LOOP_DISPATCH_DIR}/${request.attemptId}.${request.actionId}.lock`;
+      const auditDirectory = "/tmp/ot-walking-skeleton-loop-starts";
+      const auditPath = `${auditDirectory}/${request.attemptId}.${request.actionId}.log`;
+      const activeReplayProbe = request.transitionContext.includes("walking-skeleton-loop-adapter-replay");
+      dockerWriteRootFile(container, stagedRequestPath, JSON.stringify(request));
       // Real provider adapters always stage a credentials.json for every loop
       // action (materializeCredentialEnv runs unconditionally in
       // supervisor/src/providers/daytona/adapter.ts, even when it resolves to
@@ -451,8 +497,8 @@ function createDockerSandboxRuntime(container) {
       const credentialEnv = request.credentialScopes.includes("model.invoke")
         ? { [ENGINE_CREDENTIAL_ENV_BY_AGENT[request.agent]]: "walking-skeleton-stub-token" }
         : {};
-      dockerWriteRootFile(container, credentialsPath, JSON.stringify({ env: credentialEnv }));
-      const result = dockerExecStatus(container, [
+      dockerWriteRootFile(container, stagedCredentialsPath, JSON.stringify({ env: credentialEnv }));
+      const cleanEnv = [
         "env",
         "-i",
         "HOME=/home/agent",
@@ -462,23 +508,52 @@ function createDockerSandboxRuntime(container) {
         `PATH=${AGENT_EXEC_PATH}`,
         `RUN_ID=${request.parentRunId ?? "walking-skeleton"}`,
         `OT_CHILD_ACTION_ID=${request.actionId}`,
-        "node",
-        "/opt/openthrottle/runner/execute-loop.mjs",
-        "--request",
-        requestPath,
-        "--credentials",
-        credentialsPath,
-        "--output",
-        outputPath,
+      ].map(shellSingleQuoted).join(" ");
+      const dispatchBody = [
+        `if test -f ${shellSingleQuoted(outputPath)}; then rm -f ${shellSingleQuoted(stagedCredentialsPath)} ${shellSingleQuoted(stagedRequestPath)}; exit 0; fi`,
+        `install -d -o root -g root -m 0711 ${shellSingleQuoted(LOOP_ACTION_DIR)} ${shellSingleQuoted(`${LOOP_ACTION_DIR}/${request.attemptId}`)} ${shellSingleQuoted(`${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}`)}`,
+        `cp ${shellSingleQuoted(stagedRequestPath)} ${shellSingleQuoted(requestPath)}`,
+        `cp ${shellSingleQuoted(stagedCredentialsPath)} ${shellSingleQuoted(credentialsPath)}`,
+        `chown root:root ${shellSingleQuoted(requestPath)} ${shellSingleQuoted(credentialsPath)}`,
+        `chmod 400 ${shellSingleQuoted(requestPath)} ${shellSingleQuoted(credentialsPath)}`,
+        `rm -f ${shellSingleQuoted(stagedCredentialsPath)} ${shellSingleQuoted(stagedRequestPath)}`,
+        `install -d -o root -g root -m 0700 ${shellSingleQuoted(auditDirectory)}`,
+        `printf 'start\\n' >> ${shellSingleQuoted(auditPath)}`,
+        activeReplayProbe ? "sleep 2" : "true",
+        `${cleanEnv} ${shellSingleQuoted("node")} ${shellSingleQuoted("/opt/openthrottle/runner/execute-loop.mjs")} --request ${shellSingleQuoted(requestPath)} --credentials ${shellSingleQuoted(credentialsPath)} --output ${shellSingleQuoted(outputPath)}`,
+      ].join(" && ");
+      const guardedDispatch = `flock --nonblock ${shellSingleQuoted(lockPath)} sh -c ${shellSingleQuoted(dispatchBody)}` +
+        ` || rm -f ${shellSingleQuoted(stagedCredentialsPath)} ${shellSingleQuoted(stagedRequestPath)}`;
+      docker([
+        "exec",
+        "-d",
+        container,
+        "sh",
+        "-c",
+        guardedDispatch,
       ]);
-      if (result.status !== 0) {
-        throw new Error(`loop action ${request.actionId} (${request.loop}/${request.unitId ?? "final"}) failed: ${result.stderr}`);
+      dispatchedLoopRequests.set(`${request.attemptId}:${request.actionId}`, request);
+      return { providerDispatchId: `loop-${request.actionId}` };
+    },
+
+    async collectLoopActionResult(_resource, input) {
+      const key = `${input.attemptId}:${input.actionId}`;
+      const cached = cachedLoopResults.get(key);
+      if (cached) {
+        assert(cached.requestHash === input.requestHash, `cached loop result request_hash mismatch for ${input.actionId}`);
+        return cached;
       }
-      const raw = dockerReadFile(container, outputPath);
-      const event = JSON.parse(raw);
+      const requestPath = `${LOOP_ACTION_DIR}/${input.attemptId}/${input.actionId}/request.json`;
+      const outputPath = `${LOOP_ACTION_DIR}/${input.attemptId}/${input.actionId}/result.json`;
+      if (dockerExecStatus(container, ["test", "-f", outputPath]).status !== 0) return null;
+      const request = JSON.parse(dockerReadFile(container, requestPath));
+      assert(request.actionId === input.actionId, `sealed loop request action_id mismatch for ${input.actionId}`);
+      assert(request.attemptId === input.attemptId, `sealed loop request attempt_id mismatch for ${input.actionId}`);
+      assert(request.requestHash === input.requestHash, `sealed loop request request_hash mismatch for ${input.actionId}`);
+      const event = JSON.parse(dockerReadFile(container, outputPath));
       assertValidResultEnvelope({ event, kind: "loop_action_result", request });
-      cachedLoopResults.set(`${request.attemptId}:${request.actionId}`, {
-        actionId: request.actionId,
+      const result = {
+        actionId: input.actionId,
         attemptId: event.attempt_id,
         requestHash: event.request_hash,
         outcome: event.outcome,
@@ -487,15 +562,14 @@ function createDockerSandboxRuntime(container) {
         receipt: event.receipt,
         completedAt: event.created_at,
         ...(typeof event.codex_auth_json === "string" ? { codexAuthJson: event.codex_auth_json } : {}),
-      });
-      return { providerDispatchId: `loop-${request.actionId}` };
-    },
-
-    async collectLoopActionResult(_resource, input) {
-      const cached = cachedLoopResults.get(`${input.attemptId}:${input.actionId}`);
-      if (!cached) return null;
-      assert(cached.requestHash === input.requestHash, `cached loop result request_hash mismatch for ${input.actionId}`);
-      return cached;
+      };
+      if (input.actionId.includes(".review.") &&
+          request.skill !== "select-review-personas" &&
+          request.skill !== "validate-review-findings") {
+        completedReviewPersonaActions.add(input.actionId);
+      }
+      cachedLoopResults.set(key, result);
+      return result;
     },
 
     async dispatchChildExecutorAction(_resource, request) {
@@ -777,6 +851,76 @@ function dumpSettleDiagnostics({ pipelines, instance, attemptId, label }) {
 }
 
 // ---------------------------------------------------------------------------
+// Provider replay fidelity: lose the first dispatch acknowledgement while the
+// executor still owns its action lock, redispatch from a fresh adapter, then
+// collect the durable result from a third adapter with no process-local state.
+// This mirrors Daytona's result short-circuit + action-scoped flock boundary.
+// ---------------------------------------------------------------------------
+
+async function runLoopAdapterReplayScenario({ db, container, fixture }) {
+  log("scenario: active loop lost-ack/restart stays single-execution and durably collectable");
+  const pipelines = createPipelineStore(db);
+  const tickets = createSupervisorStore(db, pipelines);
+  const runtimeDescriptor = readRuntimeDescriptor(container);
+  const runtimeA = createDockerSandboxRuntime(container);
+  const plan = buildTwoUnitPlan({ planId: "walking-skeleton-loop-adapter-replay" });
+  const { instance, attempt } = setupInstance({
+    db,
+    pipelines,
+    tickets,
+    runtimeDescriptor,
+    fixture,
+    issueId: "walking-skeleton-loop-adapter-replay",
+    plan,
+  });
+  const processorA = createPipelineEffectProcessor({
+    store: pipelines,
+    tickets,
+    runtime: runtimeA,
+    taskTimeoutSeconds: 300,
+    now: () => new Date(),
+  });
+
+  const request = await drainWithBackoff(
+    processorA,
+    pipelines,
+    instance.id,
+    () => runtimeA.dispatchedLoopRequests.values().next().value ?? null,
+    "loop adapter replay setup: first dispatch"
+  );
+  const resultPath = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}/result.json`;
+  const activeDeadline = Date.now() + 10_000;
+  while (runtimeA.loopExecutorStartCount(request) !== 1 && Date.now() < activeDeadline) {
+    await sleep(25);
+  }
+  assert(runtimeA.loopExecutorStartCount(request) === 1, "the first loop executor never acquired its action lock");
+  assert(
+    dockerExecStatus(container, ["test", "-f", resultPath]).status !== 0,
+    "the active-loop replay probe completed before the lost-ack redispatch"
+  );
+
+  const runtimeB = createDockerSandboxRuntime(container);
+  await runtimeB.dispatchLoopAction({ providerResourceId: "walking-skeleton-restarted-runtime" }, request);
+
+  const resultDeadline = Date.now() + 15_000;
+  while (dockerExecStatus(container, ["test", "-f", resultPath]).status !== 0 && Date.now() < resultDeadline) {
+    await sleep(25);
+  }
+  assert(dockerExecStatus(container, ["test", "-f", resultPath]).status === 0, "the replayed loop action wrote no durable result");
+
+  const runtimeC = createDockerSandboxRuntime(container);
+  const collected = await runtimeC.collectLoopActionResult(
+    { providerResourceId: "walking-skeleton-second-restart" },
+    { attemptId: request.attemptId, actionId: request.actionId, requestHash: request.requestHash }
+  );
+  assert(runtimeC.dispatchedLoopRequests.size === 0, "fresh collector unexpectedly carried process-local dispatch state");
+  assert(collected?.outcome === "success", `fresh adapter failed to collect the durable result: ${collected?.outcome ?? "missing"}`);
+  assert(runtimeC.loopExecutorStartCount(request) === 1, "lost-ack redispatch launched a duplicate loop executor");
+
+  log(`active-loop replay kept ${request.actionId} to one executor and a stateless restart collected its result`);
+}
+
+// ---------------------------------------------------------------------------
 // Scenario: happy path -- two ordered stub units through the full sequence,
 // including two consecutive deliberate command failures/repairs on unit A.
 // Proves RAE8.
@@ -855,6 +999,11 @@ async function runHappyPath({ db, container, fixture }) {
   assert(
     [...runtime.resumedSessionWorktrees.values()].some((handles) => handles.size > 2),
     "no native session was resumed across three different worktrees; the second restore relocation is untested"
+  );
+
+  assert(
+    runtime.counters.serialReviewPersonaTransitions > 0,
+    "the Claude walking skeleton did not prove persona N+1 waited for persona N's collected result"
   );
 
   // Every sealed request that carried a worktree handle must be bound to a
@@ -1128,6 +1277,7 @@ async function main() {
     runDirectMutationScenario({ container });
     await runReplayScenario({ db, container, fixture });
     await runNeedsHumanScenario({ db, container, fixture });
+    await runLoopAdapterReplayScenario({ db, container, fixture });
 
     log("structured walking skeleton PASSED");
   } finally {

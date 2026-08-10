@@ -482,13 +482,14 @@ chown root:root "$LEAD_REQUEST"
 chmod 0400 "$LEAD_REQUEST"
 
 install -d -o root -g root -m 0700 "$ACTION_ROOT/attempt-current/action-reviewer"
-PATH="$BIN:$PATH" node --input-type=module - "$REVIEWER_REQUEST" <<'NODE'
+PATH="$BIN:$PATH" node --input-type=module - "$REVIEWER_REQUEST" "$BASE" <<'NODE'
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { canonicalJson } from "/opt/openthrottle/runner/capabilities.mjs";
 import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs";
 
 const requestPath = process.argv[2];
+const inputSubject = process.argv[3];
 const base = {
   protocol: "loop-action@2",
   actionId: "action-reviewer",
@@ -501,6 +502,7 @@ const base = {
   agent: "codex",
   skill: "final-review",
   worktree: null,
+  inputSubject,
   nativeSessionId: null,
   contextPolicy: "fresh",
   timeoutMs: 120000,

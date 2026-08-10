@@ -13,7 +13,7 @@ set -euo pipefail
 # failure OPE-101/OPE-104 produced and this probe exists to catch.
 #
 # OPE-107: every adopted task skill must register, not just one representative
-# name -- the eleven self-contained skills replaced the CE-delegating
+# name -- the self-contained skills replaced the CE-delegating
 # adapters, and a rename/typo in any single directory would exit 0 under a
 # probe that only ever checked `/implement-unit`.
 #
@@ -42,6 +42,16 @@ SKILL_NAMES=(
   accept-unit
   final-review
   final-repair
+  select-review-personas
+  validate-review-findings
+  correctness-dataflow
+  tests-contracts
+  reliability-adversarial
+  agent-native-contracts
+  security
+  data-migration
+  performance
+  project-standards
 )
 
 docker run --rm --entrypoint bash "$IMAGE" -lc '
@@ -142,5 +152,5 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
     exit 1
   fi
 
-  echo "slash-command registration oracle passed for all eleven adopted skills, and every references/ pointer read back as agent"
+  echo "slash-command registration oracle passed for all adopted skills, and every references/ pointer read back as agent"
 ' bash "${SKILL_NAMES[@]}"

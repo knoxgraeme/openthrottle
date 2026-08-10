@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import {
   RUNTIME_DESCRIPTOR,
+  REVIEW_PERSONA_CAPABILITIES,
   authorizeCapability,
   canonicalJson,
   capabilityContract,
@@ -15,6 +16,7 @@ describe("installed stage capabilities", () => {
     expect(RUNTIME_DESCRIPTOR.capabilities).not.toContain("repository/publish@1");
     expect(RUNTIME_DESCRIPTOR.executors).not.toContain("publish");
     expect(RUNTIME_DESCRIPTOR.capabilities).toContain("loop-action@2");
+    expect(RUNTIME_DESCRIPTOR.capabilities).toEqual(expect.arrayContaining(REVIEW_PERSONA_CAPABILITIES));
     expect(RUNTIME_DESCRIPTOR.executors).toContain("loop_action");
     expect(capabilityContract("command/run@1").kind).toBe("command");
     const supervisorDescriptor = JSON.parse(readFileSync(
@@ -61,6 +63,20 @@ describe("installed stage capabilities", () => {
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
       requiredArtifacts: ["stage_result"],
     }).kind).toBe("loop_action");
+    for (const capability of REVIEW_PERSONA_CAPABILITIES) {
+      expect(authorizeCapability({
+        capability,
+        contextPolicy: "fresh",
+        credentialScopes: ["model.invoke", "repo.read"],
+        requiredArtifacts: ["stage_result"],
+      }).kind).toBe("agent");
+      expect(() => authorizeCapability({
+        capability,
+        contextPolicy: "fresh",
+        credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+        requiredArtifacts: ["stage_result"],
+      })).toThrow(/not authorized.*repo.write/);
+    }
   });
 
   it("rejects unknown capabilities, contexts, and artifacts", () => {

@@ -157,6 +157,16 @@ export interface ExecutionDownstreamContext {
   created_at: string;
 }
 
+export interface ExecutionReviewSubactionDispatch {
+  parent_action_id: string;
+  action_id: string;
+  request_hash: string;
+  idempotency_key: string;
+  prepared_at: string;
+  dispatched_at: string | null;
+  dispatch_time_source: "acknowledged" | "prepared_fallback" | null;
+}
+
 export interface ExecutionUnitStore {
   createGraph(input: {
     pipelineInstanceId: string;
@@ -237,6 +247,21 @@ export interface ExecutionUnitStore {
     hash: string;
   }): "recorded" | "already_recorded";
   listGateReceipts(parentAttemptId: string): ExecutionGateReceipt[];
+  getReviewSubactionDispatch(
+    parentActionId: string,
+    actionId: string
+  ): ExecutionReviewSubactionDispatch | undefined;
+  prepareReviewSubactionDispatch(input: {
+    parentActionId: string;
+    actionId: string;
+    requestHash: string;
+    idempotencyKey: string;
+  }): "recorded" | "already_recorded";
+  markReviewSubactionDispatched(
+    parentActionId: string,
+    actionId: string,
+    source: "acknowledged" | "prepared_fallback"
+  ): void;
   appendDownstreamContext(input: {
     parentAttemptId: string;
     fromUnitId: string;
@@ -1550,6 +1575,54 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         ORDER BY created_at, id
       `).all(parentAttemptId) as ExecutionGateReceipt[];
     },
+    getReviewSubactionDispatch(parentActionId, actionId) {
+      return db.prepare(`
+        SELECT * FROM execution_review_subaction_dispatches
+        WHERE parent_action_id = ? AND action_id = ?
+      `).get(parentActionId, actionId) as ExecutionReviewSubactionDispatch | undefined;
+    },
+    prepareReviewSubactionDispatch(input) {
+      const existing = db.prepare(`
+        SELECT * FROM execution_review_subaction_dispatches
+        WHERE parent_action_id = ? AND action_id = ?
+      `).get(input.parentActionId, input.actionId) as ExecutionReviewSubactionDispatch | undefined;
+      if (existing) {
+        if (existing.request_hash !== input.requestHash || existing.idempotency_key !== input.idempotencyKey) {
+          throw new Error(`review subaction ${input.actionId} already has a different dispatch fence`);
+        }
+        return "already_recorded";
+      }
+      const parent = db.prepare(`
+        SELECT action_kind, status FROM execution_work_attempts WHERE id = ?
+      `).get(input.parentActionId) as Pick<ExecutionWorkAttempt, "action_kind" | "status"> | undefined;
+      if (!parent) throw new Error(`unknown parent review action ${input.parentActionId}`);
+      if (parent.action_kind !== "final_review") {
+        throw new Error(`review subaction ${input.actionId} parent is not a final review action`);
+      }
+      if (parent.status !== "leased" && parent.status !== "dispatched" && parent.status !== "running") {
+        throw new Error(`review subaction ${input.actionId} parent is not active`);
+      }
+      db.prepare(`
+        INSERT INTO execution_review_subaction_dispatches (
+          parent_action_id, action_id, request_hash, idempotency_key,
+          prepared_at, dispatched_at, dispatch_time_source
+        ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
+      `).run(input.parentActionId, input.actionId, input.requestHash, input.idempotencyKey, now());
+      return "recorded";
+    },
+    markReviewSubactionDispatched(parentActionId, actionId, source) {
+      const acknowledgedAt = now();
+      const update = db.prepare(`
+        UPDATE execution_review_subaction_dispatches
+        SET dispatched_at = COALESCE(
+              dispatched_at,
+              CASE WHEN ? = 'acknowledged' THEN ? ELSE prepared_at END
+            ),
+            dispatch_time_source = COALESCE(dispatch_time_source, ?)
+        WHERE parent_action_id = ? AND action_id = ?
+      `).run(source, acknowledgedAt, source, parentActionId, actionId);
+      if (update.changes !== 1) throw new Error(`unknown prepared review subaction ${actionId}`);
+    },
     getStructuredExecutionPublication(parentAttemptId) {
       return getStructuredExecutionPublicationForAttempt(db, parentAttemptId);
     },
@@ -1584,14 +1657,22 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
               ELSE lease_until
             END,
             updated_at = ?
-        WHERE id = ? AND parent_run_id = ?
+        WHERE parent_run_id = ?
           AND status IN ('leased', 'dispatched', 'running')
+          AND (
+            id = ? OR id = (
+              SELECT parent_action_id
+              FROM execution_review_subaction_dispatches
+              WHERE action_id = ?
+            )
+          )
       `).run(
         input.leaseUntilIso,
         input.leaseUntilIso,
         timestamp,
+        input.parentRunId,
         input.actionId,
-        input.parentRunId
+        input.actionId
       ).changes === 1;
     },
   };

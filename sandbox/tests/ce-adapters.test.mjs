@@ -4,13 +4,16 @@ import { dirname, join, resolve, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { validateStandardReceipt } from "../runner/artifacts.mjs";
+import { createLoopRequestHash, executeLoopAction } from "../runner/execute-loop.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const skillsRoot = resolve(repoRoot, "skills");
 
 // Five stage-path skills (single-shot agent stages, `openthrottle.stage-proposal/v1`
-// result) and six loop-path skills (structured per-unit/whole-change actions,
-// `openthrottle.receipt/v1` result). See skills/README.md and REVIEW.md §3.
+// result), six loop-path skills (structured per-unit/whole-change actions,
+// `openthrottle.receipt/v1` result), and baseline plus optional review persona
+// packages.
+// See skills/README.md and REVIEW.md §3.
 const stageTasks = ["implement-plan", "investigate", "review-change", "simplify-change", "publish"];
 const loopTasks = [
   "implement-unit",
@@ -20,7 +23,28 @@ const loopTasks = [
   "final-review",
   "final-repair",
 ];
-const tasks = [...stageTasks, ...loopTasks];
+const optionalReviewPersonaTasks = [
+  "reliability-adversarial",
+  "agent-native-contracts",
+  "security",
+  "data-migration",
+  "performance",
+  "project-standards",
+];
+const reviewPersonaTasks = [
+  "select-review-personas",
+  "validate-review-findings",
+  "correctness-dataflow",
+  "tests-contracts",
+  ...optionalReviewPersonaTasks,
+];
+const findingReviewPersonaTasks = [
+  "correctness-dataflow",
+  "tests-contracts",
+  ...optionalReviewPersonaTasks,
+];
+const selectorAndPersonaTasks = ["select-review-personas", ...findingReviewPersonaTasks];
+const tasks = [...stageTasks, ...loopTasks, ...reviewPersonaTasks];
 
 // The four loop skills that own an executor-owned worktree and author
 // `subject.post` via `ot-subject-post`.
@@ -94,7 +118,7 @@ describe("OpenThrottle canonical task skills", () => {
     );
   });
 
-  it("all eleven canonical skill files exist with YAML frontmatter", () => {
+  it("all canonical skill files exist with YAML frontmatter", () => {
     for (const task of tasks) {
       const body = skillBody(task);
       expect(body.startsWith("---\n")).toBe(true);
@@ -120,6 +144,54 @@ describe("OpenThrottle canonical task skills", () => {
     expect(body).toContain("report-only");
     expect(body).toContain("final-repair");
     expect(body).not.toContain("apply:local");
+  });
+
+  it("ships bounded review persona packages as report-only independent receipts", () => {
+    const selector = skillBody("select-review-personas");
+    expect(selector).toContain("`correctness-dataflow` and `tests-contracts`");
+    expect(selector).toContain("Optional personas are allowlisted");
+    for (const task of optionalReviewPersonaTasks) expect(selector).toContain(`\`${task}\``);
+    expect(selector).toContain("max_personas_per_selection");
+    expect(selector).toContain("Do not select personas for style taste");
+    expect(selector).toContain("Bound optional selection depth");
+    expect(selector).toContain("executor or gate faults");
+
+    for (const task of reviewPersonaTasks) {
+      const body = skillBody(task);
+      expect(body).toContain("report-only");
+      expect(body).toContain("openthrottle.receipt/v1");
+      expect(body).toContain('Use `type: "semantic_review"`');
+      expect(body).toContain("Provenance is copied only from the Receipt Authority Contract");
+      expect(body).toContain("Noise Exclusions");
+      expect(body).toContain("Required Postconditions");
+      expect(body).toContain("Never edit, stage, commit, push");
+    }
+    for (const task of findingReviewPersonaTasks) {
+      const body = skillBody(task);
+      expect(body).toContain("Never emit more than the sealed `max_findings` (8 under the current policy)");
+      expect(body).toContain("never truncate silently");
+      expect(body).toContain('with `result: "needs_human"`');
+    }
+    expect(skillBody("correctness-dataflow")).toContain("data-flow chain");
+    expect(skillBody("tests-contracts")).toContain("changed contract or proof obligation");
+    expect(skillBody("reliability-adversarial")).toContain("retry duplication");
+    expect(skillBody("reliability-adversarial")).toContain("silent-pass trigger");
+    expect(skillBody("reliability-adversarial")).toContain("Bounded Depth");
+    expect(skillBody("agent-native-contracts")).toContain("Native session identifiers");
+    expect(skillBody("agent-native-contracts")).toContain("Receipt validation preserves");
+    expect(skillBody("agent-native-contracts")).toContain("Bounded Depth");
+    expect(skillBody("security")).toContain("untrusted-input execution");
+    expect(skillBody("security")).toContain("quoted code or contract text");
+    expect(skillBody("security")).toContain("Bounded Depth");
+    expect(skillBody("data-migration")).toContain("Backfills handle missing");
+    expect(skillBody("data-migration")).toContain("old persisted shape");
+    expect(skillBody("data-migration")).toContain("Bounded Depth");
+    expect(skillBody("performance")).toContain("bounded work");
+    expect(skillBody("performance")).toContain("quotes the exact loop");
+    expect(skillBody("performance")).toContain("Bounded Depth");
+    expect(skillBody("project-standards")).toContain("Task skills remain self-contained");
+    expect(skillBody("project-standards")).toContain("quoted standard text");
+    expect(skillBody("project-standards")).toContain("Bounded Depth");
   });
 
   it("ships non-CE fixture skills for the same standard receipt contracts", () => {
@@ -330,7 +402,7 @@ describe("OpenThrottle canonical task skills", () => {
     expect(skillBody("final-review")).toContain(resultLead.semantic_review.slice(0, -1));
   });
 
-  it("every loop skill ships exactly one worked receipt example that the real validator accepts (OPE-101)", () => {
+  it("every loop and review-persona skill ships exactly one worked receipt example that the real validator accepts (OPE-101)", () => {
     // The three OPE-101 defects were all "described in prose, never shown".
     // A worked example only removes that class of failure if the example is
     // itself valid, so run each one through the executor's own validator.
@@ -346,8 +418,18 @@ describe("OpenThrottle canonical task skills", () => {
       "final-repair": ["unit_completion", "success"],
       "accept-unit": ["unit_decision", "accept"],
       "final-review": ["semantic_review", "semantic_repair_required"],
+      "select-review-personas": ["semantic_review", "success"],
+      "validate-review-findings": ["semantic_review", "semantic_repair_required"],
+      "correctness-dataflow": ["semantic_review", "semantic_repair_required"],
+      "tests-contracts": ["semantic_review", "success"],
+      "reliability-adversarial": ["semantic_review", "semantic_repair_required"],
+      "agent-native-contracts": ["semantic_review", "success"],
+      "security": ["semantic_review", "semantic_repair_required"],
+      "data-migration": ["semantic_review", "semantic_repair_required"],
+      "performance": ["semantic_review", "semantic_repair_required"],
+      "project-standards": ["semantic_review", "semantic_repair_required"],
     };
-    for (const task of loopTasks) {
+    for (const task of [...loopTasks, ...reviewPersonaTasks]) {
       const raw = exampleFor(task).replace(/^```json\n/, "").replace(/\n```$/, "");
       const receipt = validateStandardReceipt(JSON.parse(raw), {});
       const [type, result] = expected[task];
@@ -364,6 +446,75 @@ describe("OpenThrottle canonical task skills", () => {
     // The four unit_completion skills share one byte-identical example.
     const reference = exampleFor(workerLoopTasks[0]);
     for (const task of workerLoopTasks) expect(exampleFor(task)).toBe(reference);
+  });
+
+  it("every selector and persona example satisfies the real sealed loop receipt fences", () => {
+    for (const task of selectorAndPersonaTasks) {
+      const matches = [...skillBody(task).matchAll(/```json\n([\s\S]*?)\n```/g)];
+      expect(matches.length, `${task} must carry exactly one json example`).toBe(1);
+      const receipt = JSON.parse(matches[0][1]);
+      const workerId = task === "select-review-personas" ? "review-selector" : task;
+      const requestWithoutFence = {
+        protocol: "loop-action@2",
+        actionId: "action-example",
+        attemptId: "attempt-example",
+        graphId: "graph-example",
+        pipelineInstanceId: "instance-example",
+        graphDigest: "0".repeat(64),
+        parentRunId: "run-example",
+        unitId: null,
+        generation: 1,
+        role: "reviewer",
+        loop: "review",
+        agent: "codex",
+        skill: task,
+        worktree: null,
+        baseSubject: "1".repeat(40),
+        inputSubject: "2".repeat(40),
+        nativeSessionId: null,
+        contextPolicy: "fresh",
+        timeoutMs: 30_000,
+        transitionContext: "Review the exact sealed subject.",
+        allowedMcpServers: [],
+        credentialScopes: ["model.invoke", "repo.read"],
+        receiptSchema: "openthrottle.receipt/v1",
+        expectedProducer: {
+          workerId,
+          skill: `builtin://${task}@1`,
+          capabilityDigest: "0".repeat(64),
+          skillPackageDigest: null,
+          assurance: "semantic_attested",
+        },
+      };
+      const request = {
+        ...requestWithoutFence,
+        ...createLoopRequestHash(requestWithoutFence),
+      };
+      // request_hash is necessarily request-specific. All other provenance is
+      // intentionally left as authored in the worked example so the runtime's
+      // real producer, subject, unit, graph, generation, and action fences
+      // reject examples that contradict the Receipt Authority Contract.
+      receipt.fence.request_hash = request.requestHash;
+      const result = executeLoopAction({
+        request,
+        integrationRepoDir: "/tmp/openthrottle-unused-example-repo",
+        runLoopAgent: () => ({
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: JSON.stringify(receipt),
+          stderr: "",
+          nativeSessionId: null,
+          integrationRepoDir: "/tmp/openthrottle-unused-example-repo",
+        }),
+        lockWorkerWorktree: () => {},
+        lockActionDirectory: () => {},
+        restoreIntegration: () => {},
+        now: () => "2026-01-01T00:00:00Z",
+      });
+
+      expect(result.outcome, `${task}: ${result.receipt}`).toBe("success");
+    }
   });
 
   it("exactly the four worker loop skills carry the authority fence, ot-subject-post bullet, and git prohibition (§B/§E)", () => {
@@ -438,7 +589,7 @@ describe("OpenThrottle canonical task skills", () => {
     expect(simplificationHeuristics("simplify-unit")).toBe(simplificationHeuristics("simplify-change"));
   });
 
-  it("each of the eleven skills declares supported Codex metadata with implicit invocation disabled", () => {
+  it("each canonical skill declares supported Codex metadata with implicit invocation disabled", () => {
     for (const task of tasks) {
       assertSupportedOpenAiMetadata(task);
     }
