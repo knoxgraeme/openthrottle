@@ -736,7 +736,11 @@ gate decision is persisted. The object cross-binds the exact base/pre/post
 subject, policy and sealed roster, selector recommendation, per-persona receipt
 digests and finding ids, deterministic synthesis, independent blocker
 validation, repair dispositions, convergence cycle and resolution state, plus
-latency/count measurements (`cost_microusd = null` when unavailable). The live
+bounded selector/persona/validator dispatch-to-completion timing evidence and
+latency/count measurements (`cost_microusd = null` when unavailable). Total
+latency is the sum of those model-service intervals; critical-path latency is
+the wall interval from selector dispatch through the final persona or validator
+completion, so serialized Codex offsets are not counted more than once. The live
 gate consumes the in-memory exact-fenced receipts and validated synthesis, not
 this history row; the row is durable audit and future self-learning input.
 Raw persona findings are grouped before independent blocker validation by
@@ -748,7 +752,10 @@ order (`P0`, `P1`, `P2`, `P3`), stable finding id, then canonical finding bytes.
 Only that exact representative may be validator-accepted and enter final repair,
 once. Journal evidence retains every member finding id and reporting persona,
 but advisory and non-representative members cannot alter the representative's
-validator disposition or resolution state. Rereview correlates unresolved work
+validator disposition or resolution state. Only `accepted` and `rejected`
+repair dispositions carry those validator results; `deferred`, `fixed`, and
+`superseded` dispositions carry explicit `not_validated` and are excluded from
+validator acceptance and rejection counts. Rereview correlates unresolved work
 by stable semantic group and finding/member ids before treating absence as
 fixed, so diagnostic rewording cannot duplicate or prematurely resolve a
 finding. Rereview searches the newest bounded history window. A
@@ -759,9 +766,11 @@ run concurrently within the sealed fanout bound. Codex personas are dispatched
 in deterministic roster order, one at a time, because their shared subscription
 credential has a rotating one-time refresh token: the supervisor captures the
 completed persona's action-scoped auth snapshot before it materializes the next
-persona's credentials. Repeated drains collect a durably recorded subaction
-before considering dispatch, so waits and validator retries do not relaunch
-already-dispatched persona work.
+persona's credentials. Selector, persona, and validator dispatch intent is
+persisted before provider launch and marked launched after acknowledgement.
+Repeated drains collect a durably launched subaction before considering
+dispatch; a prepared-only crash window reuses the same provider idempotency
+fence.
 
 `run_outcomes` holds one deterministic row per pipeline instance, written
 exactly once at its terminal transition -- either applyTransition's normal
@@ -936,7 +945,10 @@ one active action -- unit-scoped or whole-change -- per parent attempt at a
 time. It expires only pre-dispatch claims by lease time. Dispatched or running
 child actions remain the active action while their parent-run-fenced child
 liveness is fresh, and are recovered/collected by idempotency rather than
-duplicated. When a dispatched or running child action misses its heartbeat
+duplicated. Structured review selector/persona/validator heartbeat ids renew
+the persisted parent final-review lease only through their exact durable
+subaction mapping; unknown ids, wrong runs, and inactive parents are rejected.
+When a dispatched or running child action misses its heartbeat
 fence, the supervisor first identifies that exact expired current action and
 invokes idempotent runtime result collection outside the SQLite transaction. A
 recovered result completes only through a compare-and-set against the unit's

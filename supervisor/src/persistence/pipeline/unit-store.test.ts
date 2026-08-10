@@ -1764,6 +1764,84 @@ describe("execution unit store", () => {
     });
   });
 
+  it("renews a slow final review from exact selector, serialized persona, and validator dispatch fences", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    completeUnitToTerminal(store, subject);
+    const finalReview = lease(store, "review-worker", "2026-07-29T00:01:00.000Z");
+    expect(finalReview).toMatchObject({ action_kind: "final_review", unit_id: null });
+    store.markActionDispatched(finalReview.id, "parent-request-hash", null);
+
+    const subactions = [
+      `${finalReview.id}:review:selector`,
+      `${finalReview.id}:review:correctness-dataflow`,
+      `${finalReview.id}:review:tests-contracts`,
+      `${finalReview.id}:review:validator`,
+    ];
+    for (const [index, actionId] of subactions.entries()) {
+      store.prepareReviewSubactionDispatch({
+        parentActionId: finalReview.id,
+        actionId,
+        requestHash: String(index + 1).repeat(64),
+        idempotencyKey: `review-fence-${index}`,
+      });
+      if (index > 0) store.markReviewSubactionDispatched(finalReview.id, actionId);
+    }
+
+    expect(store.renewChildActionLiveness({
+      parentRunId: "wrong-run",
+      actionId: subactions[0]!,
+      heartbeatAtIso: "2026-07-29T00:01:05.000Z",
+      leaseUntilIso: "2026-07-29T00:02:05.000Z",
+    })).toBe(false);
+    expect(store.renewChildActionLiveness({
+      parentRunId: "run-parent",
+      actionId: `${finalReview.id}:review:unknown`,
+      heartbeatAtIso: "2026-07-29T00:01:05.000Z",
+      leaseUntilIso: "2026-07-29T00:02:05.000Z",
+    })).toBe(false);
+
+    for (const [index, actionId] of subactions.entries()) {
+      db!.prepare("UPDATE execution_work_attempts SET lease_until = ? WHERE id = ?")
+        .run("2026-07-29T00:01:00.000Z", finalReview.id);
+      expect(store.renewChildActionLiveness({
+        parentRunId: "run-parent",
+        actionId,
+        heartbeatAtIso: `2026-07-29T00:01:${String(5 + index).padStart(2, "0")}.000Z`,
+        leaseUntilIso: `2026-07-29T00:02:${String(5 + index).padStart(2, "0")}.000Z`,
+      })).toBe(true);
+      expect(store.healExpiredCurrentChildAction({
+        parentAttemptId: "attempt-parent",
+        actionId: finalReview.id,
+        nowIso: `2026-07-29T00:01:${String(6 + index).padStart(2, "0")}.000Z`,
+        reason: "child action missed heartbeat fence",
+      })).toBe("not_current");
+    }
+
+    store.completeGatedAction({
+      actionId: finalReview.id,
+      resultHash: "review-result",
+      outputSubject: subject,
+      decision: gateDecision({ gateKind: "final_review", outcome: "success", subject }),
+    });
+    expect(store.renewChildActionLiveness({
+      parentRunId: "run-parent",
+      actionId: subactions[3]!,
+      heartbeatAtIso: "2026-07-29T00:03:00.000Z",
+      leaseUntilIso: "2026-07-29T00:04:00.000Z",
+    })).toBe(false);
+  });
+
   it("levels failed unit terminals with the operator alarm set", () => {
     const store = setup();
     store.createGraph({

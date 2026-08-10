@@ -64,13 +64,28 @@ function journal(input: {
   cycle: number;
   previousJournal?: ReviewJournalContract;
 }): ReviewJournalContract {
+  const completedAt = "2099-07-22T12:00:01.000Z";
+  const independentlyValidated = input.validation.accepted_blocking_finding_keys.length > 0 ||
+    input.validation.rejected_blocking_finding_keys.length > 0;
   return buildReviewJournal({
     plan: input.plan,
     baseSubject: "0".repeat(40),
     receipts: input.receipts.map((personaReceipt) => ({
       receipt: personaReceipt,
-      completedAt: "2099-07-22T12:00:01.000Z",
+      actionId: personaReceipt.fence.action_attempt_id,
+      dispatchedAt: "2099-07-22T12:00:00.250Z",
+      completedAt,
     })),
+    selectorTiming: {
+      actionId: "review-selector",
+      dispatchedAt: "2099-07-22T12:00:00.000Z",
+      completedAt: "2099-07-22T12:00:00.250Z",
+    },
+    validatorTiming: independentlyValidated ? {
+      actionId: "review-validator-action",
+      dispatchedAt: completedAt,
+      completedAt: "2099-07-22T12:00:01.500Z",
+    } : null,
     validation: input.validation,
     cycle: input.cycle,
     actionCreatedAt: "2099-07-22T12:00:00.000Z",
@@ -226,6 +241,177 @@ describe("review journal construction", () => {
     expect(new Set(reviewJournal.finding_resolutions.map((resolution) => resolution.semantic_group_id)).size).toBe(2);
     expect(reviewJournal.finding_resolutions).toHaveLength(2);
     expect(reviewJournal.finding_resolutions.every((resolution) => resolution.state === "unresolved")).toBe(true);
+  });
+
+  it("records advisory-only review groups as not validated without validator noise", () => {
+    const subject = "6".repeat(40);
+    const plan = buildReviewFanoutPlan({ subject });
+    const receipts = personaReceipts({
+      plan,
+      subject,
+      findingsByPersona: {
+        "correctness-dataflow": [{
+          severity: "P2",
+          path: "supervisor/src/effects.ts",
+          message: "[supervisor/src/effects.ts#settleEffect|operator-diagnostic-visibility: changed control and data flow preserves declared behavior] Add diagnostic context for operators.",
+        }],
+      },
+    });
+    const synthesis = synthesizeReviewFanout({ plan, receipts });
+    const validation = validateReviewFanoutBlockers({ synthesis, validator: null });
+
+    const reviewJournal = journal({ plan, receipts, validation, cycle: 1 });
+
+    expect(reviewJournal.finding_resolutions).toEqual([
+      expect.objectContaining({
+        validator_result: "not_validated",
+        repair_disposition: "deferred",
+        state: "unresolved",
+      }),
+    ]);
+    expect(reviewJournal.measurements).toMatchObject({
+      finding_count: 1,
+      accepted_finding_count: 0,
+      rejected_finding_count: 0,
+      resolved_finding_count: 0,
+      unresolved_finding_count: 1,
+    });
+  });
+
+  it("records a cycle-two blocker fixed by exact-roster absence as not validated", () => {
+    const firstSubject = "7".repeat(40);
+    const firstPlan = buildReviewFanoutPlan({ subject: firstSubject });
+    const firstReceipts = personaReceipts({
+      plan: firstPlan,
+      subject: firstSubject,
+      findingsByPersona: {
+        "correctness-dataflow": [{
+          severity: "P1",
+          path: "supervisor/src/effects.ts",
+          message: "[supervisor/src/effects.ts#settleEffect|failed-effect-retry-ordering: changed control and data flow preserves declared behavior] Completion is recorded before retry scheduling.",
+        }],
+      },
+    });
+    const firstSynthesis = synthesizeReviewFanout({ plan: firstPlan, receipts: firstReceipts });
+    const firstValidation = validateReviewFanoutBlockers({
+      synthesis: firstSynthesis,
+      validator: receipt({
+        personaId: "review-validator",
+        subject: firstSubject,
+        findings: firstSynthesis.findings,
+      }),
+    });
+    const firstJournal = journal({
+      plan: firstPlan,
+      receipts: firstReceipts,
+      validation: firstValidation,
+      cycle: 1,
+    });
+    const secondSubject = "8".repeat(40);
+    const secondPlan = buildReviewFanoutPlan({
+      subject: secondSubject,
+      requiredPersonaIds: firstPlan.personas.map((persona) => persona.id),
+    });
+    const secondReceipts = personaReceipts({
+      plan: secondPlan,
+      subject: secondSubject,
+      findingsByPersona: {},
+    });
+    const secondSynthesis = synthesizeReviewFanout({ plan: secondPlan, receipts: secondReceipts });
+    const secondValidation = validateReviewFanoutBlockers({ synthesis: secondSynthesis, validator: null });
+
+    const secondJournal = journal({
+      plan: secondPlan,
+      receipts: secondReceipts,
+      validation: secondValidation,
+      cycle: 2,
+      previousJournal: firstJournal,
+    });
+
+    expect(secondJournal.finding_resolutions).toEqual([
+      expect.objectContaining({
+        finding_id: firstJournal.finding_resolutions[0]!.finding_id,
+        exact_dedup_personas: [],
+        validator_result: "not_validated",
+        repair_disposition: "fixed",
+        state: "resolved",
+        convergence_cycle: 2,
+      }),
+    ]);
+    expect(secondJournal.measurements).toMatchObject({
+      finding_count: 1,
+      accepted_finding_count: 0,
+      rejected_finding_count: 0,
+      resolved_finding_count: 1,
+      unresolved_finding_count: 0,
+    });
+  });
+
+  it("accounts serialized persona service time without cumulative double counting", () => {
+    const subject = "9".repeat(40);
+    const plan = buildReviewFanoutPlan({ subject });
+    const receipts = personaReceipts({
+      plan,
+      subject,
+      findingsByPersona: {
+        [plan.personas[0]!.id]: [{
+          severity: "P1",
+          path: "supervisor/src/effects.ts",
+          message: "[supervisor/src/effects.ts#settleEffect|failed-effect-retry-ordering: changed control and data flow preserves declared behavior] Completion is recorded before retry scheduling.",
+        }],
+      },
+    });
+    const synthesis = synthesizeReviewFanout({ plan, receipts });
+    const validation = validateReviewFanoutBlockers({
+      synthesis,
+      validator: receipt({
+        personaId: "review-validator",
+        subject,
+        findings: synthesis.findings,
+      }),
+    });
+    const epoch = Date.parse("2099-07-22T12:00:00.000Z");
+    const iso = (offsetMs: number) => new Date(epoch + offsetMs).toISOString();
+    const selectorLatency = 100;
+    const personaLatency = 200;
+    const validatorLatency = 100;
+    const timedReceipts = receipts.map((personaReceipt, index) => ({
+      receipt: personaReceipt,
+      actionId: personaReceipt.fence.action_attempt_id,
+      dispatchedAt: iso(selectorLatency + index * personaLatency),
+      completedAt: iso(selectorLatency + (index + 1) * personaLatency),
+    }));
+    const validatorStart = selectorLatency + receipts.length * personaLatency;
+
+    const reviewJournal = buildReviewJournal({
+      plan,
+      baseSubject: "0".repeat(40),
+      receipts: timedReceipts,
+      selectorTiming: {
+        actionId: "review-selector",
+        dispatchedAt: iso(0),
+        completedAt: iso(selectorLatency),
+      },
+      validatorTiming: {
+        actionId: "review-validator-action",
+        dispatchedAt: iso(validatorStart),
+        completedAt: iso(validatorStart + validatorLatency),
+      },
+      validation,
+      cycle: 1,
+      actionCreatedAt: iso(0),
+      recordedAt: iso(validatorStart + validatorLatency),
+    });
+
+    expect(reviewJournal.timing_evidence.selector.latency_ms).toBe(selectorLatency);
+    expect(reviewJournal.timing_evidence.personas.map((timing) => timing.latency_ms))
+      .toEqual(receipts.map(() => personaLatency));
+    expect(reviewJournal.timing_evidence.validator?.latency_ms).toBe(validatorLatency);
+    const endToEnd = selectorLatency + receipts.length * personaLatency + validatorLatency;
+    expect(reviewJournal.measurements).toMatchObject({
+      total_latency_ms: endToEnd,
+      critical_path_latency_ms: endToEnd,
+    });
   });
 
   it("carries a cycle-two finding by stable id when only its diagnostic prose changes", () => {

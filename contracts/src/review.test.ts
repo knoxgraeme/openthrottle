@@ -85,8 +85,8 @@ function validJournal(): ReviewJournalContract {
     synthesis_digest: digestCanonicalJson(synthesis),
     dispositions: [{
       finding_id: finding.finding_id,
-      disposition: "fixed",
-      rationale: "The semantic identity rule is now enforced.",
+      disposition: "accepted",
+      rationale: "The independently validated finding enters repair.",
     }],
   };
   const personaReceipts = [{
@@ -105,19 +105,40 @@ function validJournal(): ReviewJournalContract {
     semantic_dedup_finding_ids: [finding.finding_id],
     validator_result: "accepted" as const,
     corroboration_count: 1,
-    repair_disposition: "fixed" as const,
+    repair_disposition: "accepted" as const,
     convergence_cycle: 1,
-    state: "resolved" as const,
+    state: "unresolved" as const,
   }];
+  const timingEvidence = {
+    selector: {
+      action_id: "review-selector",
+      dispatched_at: "2026-08-10T00:00:01.000Z",
+      completed_at: "2026-08-10T00:00:01.020Z",
+      latency_ms: 20,
+    },
+    personas: [{
+      persona_id: "contract_reviewer",
+      action_id: "review-contract-reviewer",
+      dispatched_at: "2026-08-10T00:00:01.020Z",
+      completed_at: "2026-08-10T00:00:01.140Z",
+      latency_ms: 120,
+    }],
+    validator: {
+      action_id: "review-validator",
+      dispatched_at: "2026-08-10T00:00:01.140Z",
+      completed_at: "2026-08-10T00:00:01.180Z",
+      latency_ms: 40,
+    },
+  };
   const measurements = {
     persona_count: 1,
     finding_count: 1,
     accepted_finding_count: 1,
     rejected_finding_count: 0,
-    resolved_finding_count: 1,
-    unresolved_finding_count: 0,
-    total_latency_ms: 120,
-    critical_path_latency_ms: 120,
+    resolved_finding_count: 0,
+    unresolved_finding_count: 1,
+    total_latency_ms: 180,
+    critical_path_latency_ms: 180,
     total_cost_microusd: 450,
   };
   return {
@@ -135,6 +156,7 @@ function validJournal(): ReviewJournalContract {
     validation,
     repair_disposition: repairDisposition,
     finding_resolutions: findingResolutions,
+    timing_evidence: timingEvidence,
     measurements,
     entries: [{
       at: "2026-08-10T00:00:01.000Z",
@@ -160,6 +182,10 @@ function validJournal(): ReviewJournalContract {
       at: "2026-08-10T00:00:06.000Z",
       kind: "finding_resolutions",
       digest: digestCanonicalJson(findingResolutions),
+    }, {
+      at: "2026-08-10T00:00:06.500Z",
+      kind: "timing_evidence",
+      digest: digestCanonicalJson(timingEvidence),
     }, {
       at: "2026-08-10T00:00:07.000Z",
       kind: "measurements",
@@ -202,6 +228,59 @@ describe("review journal contracts", () => {
     };
 
     expect(deriveReviewSemanticGroupId(distinctClaim)).not.toBe(deriveReviewSemanticGroupId(finding));
+  });
+
+  it("keeps advisory findings out of independent validator decision metrics", () => {
+    const journal = validJournal();
+    journal.synthesis.findings[0]!.severity = "P2";
+    const synthesisDigest = digestCanonicalJson(journal.synthesis);
+    journal.validation.synthesis_digest = synthesisDigest;
+    journal.repair_disposition.synthesis_digest = synthesisDigest;
+    journal.repair_disposition.dispositions[0] = {
+      finding_id: journal.synthesis.findings[0]!.finding_id,
+      disposition: "deferred",
+      rationale: "Advisory findings do not enter independent blocker validation.",
+    };
+    journal.finding_resolutions[0] = {
+      ...journal.finding_resolutions[0]!,
+      repair_disposition: "deferred",
+      state: "unresolved",
+    };
+    journal.measurements = {
+      ...journal.measurements,
+      accepted_finding_count: 0,
+      rejected_finding_count: 0,
+      resolved_finding_count: 0,
+      unresolved_finding_count: 1,
+    };
+    journal.entries = journal.entries.map((entry) => ({
+      ...entry,
+      digest: digestCanonicalJson(
+        entry.kind === "selection" ? journal.selection
+          : entry.kind === "persona_receipts" ? journal.persona_receipts
+            : entry.kind === "synthesis" ? journal.synthesis
+              : entry.kind === "validation" ? journal.validation
+                : entry.kind === "repair_disposition" ? journal.repair_disposition
+                  : entry.kind === "finding_resolutions" ? journal.finding_resolutions
+                    : entry.kind === "timing_evidence" ? journal.timing_evidence
+                    : journal.measurements
+      ),
+    }));
+
+    expect(() => validateReviewJournalContract(journal, { source: "review" }))
+      .toThrow(/validator_result: must be not_validated for repair disposition deferred/);
+
+    journal.finding_resolutions[0]!.validator_result = "not_validated";
+    journal.timing_evidence.validator = null;
+    journal.measurements.total_latency_ms = 140;
+    journal.measurements.critical_path_latency_ms = 140;
+    journal.entries.find((entry) => entry.kind === "finding_resolutions")!.digest =
+      digestCanonicalJson(journal.finding_resolutions);
+    journal.entries.find((entry) => entry.kind === "timing_evidence")!.digest =
+      digestCanonicalJson(journal.timing_evidence);
+    journal.entries.find((entry) => entry.kind === "measurements")!.digest =
+      digestCanonicalJson(journal.measurements);
+    expect(() => validateReviewJournalContract(journal, { source: "review" })).not.toThrow();
   });
 
   it("rejects unknown fields that could escalate authority", () => {
@@ -353,6 +432,18 @@ describe("review journal contracts", () => {
     expect(() => validateReviewJournalContract(badCorroboration, { source: "review" }))
       .toThrow(/corroboration_count: does not match exact_dedup_personas length/);
 
+    const duplicateTimingAction = validJournal();
+    duplicateTimingAction.timing_evidence.personas[0]!.action_id =
+      duplicateTimingAction.timing_evidence.selector.action_id;
+    expect(() => validateReviewJournalContract(duplicateTimingAction, { source: "review" }))
+      .toThrow(/timing_evidence\.action_id: must not contain duplicates/);
+
+    const earlyValidator = validJournal();
+    earlyValidator.timing_evidence.validator!.dispatched_at = "2026-08-10T00:00:01.100Z";
+    earlyValidator.timing_evidence.validator!.completed_at = "2026-08-10T00:00:01.140Z";
+    expect(() => validateReviewJournalContract(earlyValidator, { source: "review" }))
+      .toThrow(/timing_evidence\.validator\.dispatched_at: must not precede persona completion/);
+
     const wrongMeasurements = validJournal();
     wrongMeasurements.measurements.total_latency_ms = 119;
     expect(() => validateReviewJournalContract(wrongMeasurements, { source: "review" }))
@@ -363,10 +454,23 @@ describe("review journal contracts", () => {
     const journal = validJournal();
     journal.persona_receipts[0]!.finding_ids = [];
     journal.persona_receipts[0]!.finding_count = 0;
+    journal.repair_disposition.dispositions[0]!.disposition = "fixed";
+    journal.finding_resolutions[0]!.validator_result = "not_validated";
+    journal.finding_resolutions[0]!.repair_disposition = "fixed";
+    journal.finding_resolutions[0]!.state = "resolved";
     journal.finding_resolutions[0]!.exact_dedup_personas = [];
     journal.finding_resolutions[0]!.corroboration_count = 0;
+    journal.measurements.accepted_finding_count = 0;
+    journal.measurements.total_latency_ms = 140;
+    journal.measurements.critical_path_latency_ms = 140;
+    journal.measurements.resolved_finding_count = 1;
+    journal.measurements.unresolved_finding_count = 0;
+    journal.timing_evidence.validator = null;
     journal.entries[1]!.digest = digestCanonicalJson(journal.persona_receipts);
+    journal.entries[4]!.digest = digestCanonicalJson(journal.repair_disposition);
     journal.entries[5]!.digest = digestCanonicalJson(journal.finding_resolutions);
+    journal.entries[6]!.digest = digestCanonicalJson(journal.timing_evidence);
+    journal.entries[7]!.digest = digestCanonicalJson(journal.measurements);
 
     expect(() => validateReviewJournalContract(journal, { source: "review" })).not.toThrow();
 

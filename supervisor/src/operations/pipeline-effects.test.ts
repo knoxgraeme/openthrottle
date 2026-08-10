@@ -901,7 +901,7 @@ describe("pipeline effect processor", () => {
 
   it("drains graph-declared child executor actions and lead candidate receipts through the composite host", async () => {
     db = openDb(":memory:");
-    const pipelines = createPipelineStore(db);
+    const pipelines = createPipelineStore(db, () => "2099-07-22T12:00:00.000Z");
     const tickets = createSupervisorStore(db, pipelines);
     const runtimeDescriptor = buildInstalledRuntimeDescriptor("structured-child-drain-test/v1");
     const catalog = loadPipelineCatalog(catalogPath, runtimeDescriptor.descriptor);
@@ -1274,6 +1274,20 @@ describe("pipeline effect processor", () => {
 
     await drainCommandActions("final_command", integratedSubjectB);
 
+    runtime.dispatchLoopAction.mockImplementationOnce(async () => {
+      throw new Error("selector provider launch acknowledgement lost");
+    });
+    await expect(processor.drain()).rejects.toThrow(/selector provider launch acknowledgement lost/);
+    const preparedReview = latestAction("final_review");
+    const preparedSelectorDispatch = db!.prepare(`
+      SELECT prepared_at, dispatched_at
+      FROM execution_review_subaction_dispatches
+      WHERE parent_action_id = ?
+    `).get(preparedReview.id) as { prepared_at: string; dispatched_at: string | null };
+    expect(preparedSelectorDispatch).toEqual({
+      prepared_at: "2099-07-22T12:00:00.000Z",
+      dispatched_at: null,
+    });
     await processor.drain();
     expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
@@ -1289,6 +1303,16 @@ describe("pipeline effect processor", () => {
     );
     const review = latestAction("final_review");
     const selectorRequest = runtime.dispatchLoopAction.mock.calls.at(-1)![1];
+    expect(db!.prepare(`
+      SELECT dispatched_at
+      FROM execution_review_subaction_dispatches
+      WHERE parent_action_id = ? AND action_id = ?
+    `).get(review.id, selectorRequest.actionId)).toEqual({
+      dispatched_at: "2099-07-22T12:00:00.000Z",
+    });
+    expect(runtime.dispatchLoopAction.mock.calls.filter(([, request]) =>
+      request.skill === "select-review-personas"
+    )).toHaveLength(2);
     const acceptedFinding = {
       severity: "P1" as const,
       message: "[supervisor/src/example/effects.ts#drainEffect|failed-settlement-ordering: changed control and data flow preserves declared behavior] Failed settlement can silently pass.",
@@ -1457,14 +1481,14 @@ describe("pipeline effect processor", () => {
       WHERE parent_action_id = ?
       ORDER BY action_id
     `).all(review.id) as Array<{ action_id: string; request_hash: string; idempotency_key: string }>;
-    expect(persistedReviewDispatches).toHaveLength(3);
-    expect(pipelines.recordReviewSubactionDispatch({
+    expect(persistedReviewDispatches).toHaveLength(4);
+    expect(pipelines.prepareReviewSubactionDispatch({
       parentActionId: review.id,
       actionId: persistedReviewDispatches[0]!.action_id,
       requestHash: persistedReviewDispatches[0]!.request_hash,
       idempotencyKey: persistedReviewDispatches[0]!.idempotency_key,
     })).toBe("already_recorded");
-    expect(() => pipelines.recordReviewSubactionDispatch({
+    expect(() => pipelines.prepareReviewSubactionDispatch({
       parentActionId: review.id,
       actionId: persistedReviewDispatches[0]!.action_id,
       requestHash: "0".repeat(64),
@@ -1496,7 +1520,19 @@ describe("pipeline effect processor", () => {
         state: "unresolved",
         convergence_cycle: 1,
       }),
+      expect.objectContaining({
+        exact_dedup_personas: ["correctness-dataflow"],
+        validator_result: "not_validated",
+        repair_disposition: "deferred",
+        state: "unresolved",
+        convergence_cycle: 1,
+      }),
     ]));
+    expect(reviewJournal.measurements).toMatchObject({
+      finding_count: 2,
+      accepted_finding_count: 1,
+      rejected_finding_count: 0,
+    });
     expect(reviewJournal.finding_resolutions.find((resolution) =>
       resolution.exact_dedup_personas.includes("tests-contracts")
     )?.semantic_dedup_finding_ids).toHaveLength(2);
@@ -1674,6 +1710,7 @@ describe("pipeline effect processor", () => {
     expect(rereviewJournal.finding_resolutions).toEqual(expect.arrayContaining([
       expect.objectContaining({
         finding_id: reviewJournal.finding_resolutions[0]!.finding_id,
+        validator_result: "not_validated",
         repair_disposition: "fixed",
         state: "resolved",
         convergence_cycle: 2,

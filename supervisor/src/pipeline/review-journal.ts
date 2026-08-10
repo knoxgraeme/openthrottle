@@ -12,6 +12,7 @@ import {
   type ReviewJournalContract,
   type ReviewPersonaReceiptEvidence,
   type ReviewSelectionContract,
+  type ReviewSubactionTimingEvidence,
   type ReviewSynthesisContract,
   type ReviewValidationContract,
   type SemanticReviewReceipt,
@@ -38,13 +39,37 @@ function journalOutcome(outcome: ValidatedReviewFanout["synthesis"]["outcome"]):
 export function buildReviewJournal(input: {
   plan: ReviewFanoutPlan;
   baseSubject: string;
-  receipts: ReadonlyArray<{ receipt: SemanticReviewReceipt; completedAt: string }>;
+  receipts: ReadonlyArray<{
+    receipt: SemanticReviewReceipt;
+    actionId: string;
+    dispatchedAt: string;
+    completedAt: string;
+  }>;
+  selectorTiming: { actionId: string; dispatchedAt: string; completedAt: string };
+  validatorTiming: { actionId: string; dispatchedAt: string; completedAt: string } | null;
   validation: ValidatedReviewFanout;
   cycle: number;
   actionCreatedAt: string;
   recordedAt: string;
   previousJournal?: ReviewJournalContract;
 }): ReviewJournalContract {
+  const timingSample = (input: {
+    actionId: string;
+    dispatchedAt: string;
+    completedAt: string;
+  }): ReviewSubactionTimingEvidence => {
+    const dispatchedAt = Date.parse(input.dispatchedAt);
+    const completedAt = Date.parse(input.completedAt);
+    if (!Number.isFinite(dispatchedAt) || !Number.isFinite(completedAt) || completedAt < dispatchedAt) {
+      throw new Error(`review timing for ${input.actionId} is invalid`);
+    }
+    return {
+      action_id: input.actionId,
+      dispatched_at: input.dispatchedAt,
+      completed_at: input.completedAt,
+      latency_ms: completedAt - dispatchedAt,
+    };
+  };
   const policy = reviewPolicyContract();
   if (digestCanonicalJson(policy) !== input.plan.policy_digest) {
     throw new Error("review journal policy does not match the sealed fanout plan");
@@ -67,9 +92,9 @@ export function buildReviewJournal(input: {
     })),
   };
   const planPersonas = new Map(input.plan.personas.map((persona) => [persona.id, persona]));
-  const startedAt = Date.parse(input.actionCreatedAt);
   const findingsByPersona = new Map<string, ReviewFindingContract[]>();
-  const personaReceipts: ReviewPersonaReceiptEvidence[] = input.receipts.map(({ receipt, completedAt }) => {
+  const personaTimings = new Map<string, ReviewSubactionTimingEvidence & { persona_id: ReviewPersonaId }>();
+  const personaReceipts: ReviewPersonaReceiptEvidence[] = input.receipts.map(({ receipt, actionId, dispatchedAt, completedAt }) => {
     const personaId = receipt.producer.worker_id as ReviewPersonaId;
     const persona = planPersonas.get(personaId);
     if (!persona) throw new Error(`review journal received unknown persona ${personaId}`);
@@ -80,14 +105,15 @@ export function buildReviewJournal(input: {
       invariant: persona.invariant,
     }));
     findingsByPersona.set(personaId, findings);
-    const completed = Date.parse(completedAt);
+    const timing = timingSample({ actionId, dispatchedAt, completedAt });
+    personaTimings.set(personaId, { persona_id: personaId, ...timing });
     return {
       persona_id: personaId,
       receipt_digest: digestNormalized(canonicalJson(receipt)),
       subject: input.plan.subject,
       finding_ids: findings.map((finding) => finding.finding_id),
       finding_count: findings.length,
-      latency_ms: Number.isFinite(startedAt) && Number.isFinite(completed) ? Math.max(0, completed - startedAt) : 0,
+      latency_ms: timing.latency_ms,
       cost_microusd: null,
     };
   });
@@ -210,18 +236,37 @@ export function buildReviewJournal(input: {
       const disposition = repairDisposition.dispositions.find((entry) => entry.finding_id === group.canonical.finding_id)!;
       const rejected = disposition.disposition === "rejected";
       const fixed = disposition.disposition === "fixed";
+      const validatorResult = disposition.disposition === "accepted"
+        ? "accepted" as const
+        : disposition.disposition === "rejected"
+          ? "rejected" as const
+          : "not_validated" as const;
       return {
         finding_id: group.canonical.finding_id,
         semantic_group_id: semanticGroupId,
         exact_dedup_personas: reporters,
         semantic_dedup_finding_ids: semanticMemberIds,
-        validator_result: rejected ? "rejected" as const : "accepted" as const,
+        validator_result: validatorResult,
         corroboration_count: reporters.length,
         repair_disposition: disposition.disposition,
         convergence_cycle: input.cycle,
         state: rejected || fixed ? "resolved" as const : "unresolved" as const,
       };
     });
+  const timingEvidence = {
+    selector: timingSample(input.selectorTiming),
+    personas: input.plan.personas.map((persona) => {
+      const timing = personaTimings.get(persona.id);
+      if (!timing) throw new Error(`review timing is missing persona ${persona.id}`);
+      return timing;
+    }),
+    validator: input.validatorTiming ? timingSample(input.validatorTiming) : null,
+  };
+  const timingSamples = [
+    timingEvidence.selector,
+    ...timingEvidence.personas,
+    ...(timingEvidence.validator ? [timingEvidence.validator] : []),
+  ];
   const measurements = {
     persona_count: personaReceipts.length,
     finding_count: synthesis.findings.length,
@@ -229,8 +274,12 @@ export function buildReviewJournal(input: {
     rejected_finding_count: findingResolutions.filter((entry) => entry.validator_result === "rejected").length,
     resolved_finding_count: findingResolutions.filter((entry) => entry.state === "resolved").length,
     unresolved_finding_count: findingResolutions.filter((entry) => entry.state === "unresolved").length,
-    total_latency_ms: personaReceipts.reduce((total, receipt) => total + receipt.latency_ms, 0),
-    critical_path_latency_ms: Math.max(0, ...personaReceipts.map((receipt) => receipt.latency_ms)),
+    total_latency_ms: timingSamples.reduce((total, timing) => total + timing.latency_ms, 0),
+    critical_path_latency_ms: Math.max(
+      0,
+      Math.max(...timingSamples.map((timing) => Date.parse(timing.completed_at))) -
+        Date.parse(timingEvidence.selector.dispatched_at)
+    ),
     total_cost_microusd: null,
   };
   const journal: ReviewJournalContract = {
@@ -244,6 +293,7 @@ export function buildReviewJournal(input: {
     validation,
     repair_disposition: repairDisposition,
     finding_resolutions: findingResolutions,
+    timing_evidence: timingEvidence,
     measurements,
     entries: [
       { at: input.recordedAt, kind: "selection", digest: digestCanonicalJson(selection) },
@@ -252,6 +302,7 @@ export function buildReviewJournal(input: {
       { at: input.recordedAt, kind: "validation", digest: digestCanonicalJson(validation) },
       { at: input.recordedAt, kind: "repair_disposition", digest: digestCanonicalJson(repairDisposition) },
       { at: input.recordedAt, kind: "finding_resolutions", digest: digestCanonicalJson(findingResolutions) },
+      { at: input.recordedAt, kind: "timing_evidence", digest: digestCanonicalJson(timingEvidence) },
       { at: input.recordedAt, kind: "measurements", digest: digestCanonicalJson(measurements) },
     ],
   };

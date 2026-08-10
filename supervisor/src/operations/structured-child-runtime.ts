@@ -861,6 +861,28 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     if (latest) deps.captureCodexAuth?.(latest.result.codexAuthJson);
   };
 
+  const ensureReviewSubactionLaunched = async (input: {
+    resource: RuntimeResource;
+    action: ExecutionWorkAttempt;
+    request: LoopActionRequest;
+    label: string;
+  }): Promise<boolean> => {
+    const persisted = deps.store.getReviewSubactionDispatch(input.action.id, input.request.actionId);
+    deps.store.prepareReviewSubactionDispatch({
+      parentActionId: input.action.id,
+      actionId: input.request.actionId,
+      requestHash: input.request.requestHash,
+      idempotencyKey: input.request.idempotencyKey,
+    });
+    if (persisted?.dispatched_at != null) return false;
+    await reviewRuntimeCall(
+      `${input.label} ${input.request.actionId} dispatch failed`,
+      () => deps.runtime.dispatchLoopAction(input.resource, input.request)
+    );
+    deps.store.markReviewSubactionDispatched(input.action.id, input.request.actionId);
+    return true;
+  };
+
   const prepareReviewSubaction = async (input: {
     resource: RuntimeResource;
     action: ExecutionWorkAttempt;
@@ -878,7 +900,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       ) {
         throw new Error(`persisted review subaction ${input.request.actionId} has a different request fence`);
       }
-      return { result: null, newlyDispatched: false };
+      if (persisted.dispatched_at !== null) return { result: null, newlyDispatched: false };
     }
     const recovered = await reviewRuntimeCall(
       `${input.label} ${input.request.actionId} pre-dispatch collection failed`,
@@ -888,19 +910,20 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         requestHash: input.request.requestHash,
       })
     );
+    if (!persisted) {
+      deps.store.prepareReviewSubactionDispatch({
+        parentActionId: input.action.id,
+        actionId: input.request.actionId,
+        requestHash: input.request.requestHash,
+        idempotencyKey: input.request.idempotencyKey,
+      });
+    }
     const newlyDispatched = !recovered;
     if (newlyDispatched) {
-      await reviewRuntimeCall(
-        `${input.label} ${input.request.actionId} dispatch failed`,
-        () => deps.runtime.dispatchLoopAction(input.resource, input.request)
-      );
+      await ensureReviewSubactionLaunched(input);
+    } else {
+      deps.store.markReviewSubactionDispatched(input.action.id, input.request.actionId);
     }
-    deps.store.recordReviewSubactionDispatch({
-      parentActionId: input.action.id,
-      actionId: input.request.actionId,
-      requestHash: input.request.requestHash,
-      idempotencyKey: input.request.idempotencyKey,
-    });
     return { result: recovered, newlyDispatched };
   };
 
@@ -951,7 +974,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   }): Promise<{
     synthesis: ReviewFanoutSynthesis;
     receipts: SemanticReviewReceipt[];
-    receiptResults: Array<{ receipt: SemanticReviewReceipt; completedAt: string }>;
+    receiptResults: Array<{
+      receipt: SemanticReviewReceipt;
+      actionId: string;
+      dispatchedAt: string;
+      completedAt: string;
+    }>;
   } | {
     pending: true;
   } | {
@@ -961,7 +989,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     lastError: string;
   }> => {
     const receipts: SemanticReviewReceipt[] = [];
-    const receiptResults: Array<{ receipt: SemanticReviewReceipt; completedAt: string }> = [];
+    const receiptResults: Array<{
+      receipt: SemanticReviewReceipt;
+      actionId: string;
+      dispatchedAt: string;
+      completedAt: string;
+    }> = [];
     const collected: Array<{ request: LoopActionRequest; result: LoopActionResult | null }> = [];
     for (const request of input.requests) {
       const result = input.precollected?.get(request.actionId) ?? await reviewRuntimeCall(
@@ -1032,8 +1065,22 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           }`,
         };
       }
+      const dispatch = deps.store.getReviewSubactionDispatch(input.action.id, request.actionId);
+      if (!dispatch?.dispatched_at) {
+        return {
+          terminal: true,
+          resultHash: digestCanonicalJson(result),
+          outcome: "failure",
+          lastError: `review fanout action ${request.actionId} has no persisted dispatch timing`,
+        };
+      }
       receipts.push(receipt as SemanticReviewReceipt);
-      receiptResults.push({ receipt: receipt as SemanticReviewReceipt, completedAt: result.completedAt });
+      receiptResults.push({
+        receipt: receipt as SemanticReviewReceipt,
+        actionId: request.actionId,
+        dispatchedAt: dispatch.dispatched_at,
+        completedAt: result.completedAt,
+      });
     }
     try {
       return { synthesis: synthesizeReviewFanout({ plan: input.plan, receipts }), receipts, receiptResults };
@@ -1604,7 +1651,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     if (action.request_payload && action.request_hash) {
       const replayRequest = JSON.parse(action.request_payload) as LoopActionRequest;
       if (action.action_kind === "final_review" && replayRequest.skill === "select-review-personas") {
-        await deps.runtime.dispatchLoopAction(resource, replayRequest);
+        await ensureReviewSubactionLaunched({
+          resource,
+          action,
+          request: replayRequest,
+          label: "review selector action",
+        });
         return { requestHash: replayRequest.requestHash, nativeSessionId: null };
       }
       const needsWorktree = replayRequest.worktree !== null &&
@@ -1705,7 +1757,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         requestPayload: canonicalJson(selectorRequest),
         nativeSessionId: null,
       });
-      await deps.runtime.dispatchLoopAction(resource, selectorRequest);
+      await ensureReviewSubactionLaunched({
+        resource,
+        action,
+        request: selectorRequest,
+        label: "review selector action",
+      });
       return { requestHash: selectorRequest.requestHash, nativeSessionId: null };
     }
     const loopRequest = buildLoopActionRequest({
@@ -1827,6 +1884,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (selector.receipt.result !== "success" || selector.receipt.payload.findings.length > 0) {
         throw new Error("review selector must return success with no review findings");
       }
+      const selectorDispatch = deps.store.getReviewSubactionDispatch(action.id, selectorRequest.actionId);
+      if (!selectorDispatch?.dispatched_at) throw new Error("review selector has no persisted dispatch timing");
       const recommendation = parseReviewSelectorRecommendation(selector.receipt.payload.summary, authority);
       const fanoutPlan = buildReviewFanoutPlan({
         subject: reviewSubject,
@@ -1873,6 +1932,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       const blocking = fanout.synthesis.findings.some((finding) => finding.severity === "P0" || finding.severity === "P1");
       let validatorReceipt: SemanticReviewReceipt | null = null;
       let validatorCompletedAt: string | null = null;
+      let validatorTiming: { actionId: string; dispatchedAt: string; completedAt: string } | null = null;
       if (blocking) {
         const validatorRequest = buildReviewValidatorRequest({
           instance,
@@ -1908,6 +1968,13 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         if ("terminal" in validator) return { ...validator, nativeSessionId: null };
         validatorReceipt = validator.receipt;
         validatorCompletedAt = validator.completedAt;
+        const validatorDispatch = deps.store.getReviewSubactionDispatch(action.id, validatorRequest.actionId);
+        if (!validatorDispatch?.dispatched_at) throw new Error("review validator has no persisted dispatch timing");
+        validatorTiming = {
+          actionId: validatorRequest.actionId,
+          dispatchedAt: validatorDispatch.dispatched_at,
+          completedAt: validator.completedAt,
+        };
       }
       const validated = validateReviewFanoutBlockers({ synthesis: fanout.synthesis, validator: validatorReceipt });
       const receipts = completedAttemptReceiptsFor(action.parent_attempt_id);
@@ -1958,6 +2025,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         plan: fanoutPlan,
         baseSubject: instance.base_commit,
         receipts: fanout.receiptResults,
+        selectorTiming: {
+          actionId: selectorRequest.actionId,
+          dispatchedAt: selectorDispatch.dispatched_at,
+          completedAt: selector.completedAt,
+        },
+        validatorTiming,
         validation: validated,
         cycle: action.cycle,
         actionCreatedAt: action.created_at,

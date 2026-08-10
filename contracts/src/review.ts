@@ -28,7 +28,7 @@ export const REVIEW_JOURNAL_SCHEMA = "openthrottle.review-journal/v1" as const;
 export const REVIEW_SEVERITIES = ["P0", "P1", "P2", "P3"] as const;
 export const REVIEW_OUTCOMES = ["success", "semantic_repair_required", "failure", "needs_human"] as const;
 export const REPAIR_DISPOSITIONS = ["accepted", "fixed", "deferred", "rejected", "superseded"] as const;
-export const REVIEW_VALIDATOR_RESULTS = ["accepted", "rejected"] as const;
+export const REVIEW_VALIDATOR_RESULTS = ["accepted", "rejected", "not_validated"] as const;
 export const REVIEW_RESOLUTION_STATES = ["resolved", "unresolved"] as const;
 export const FINDING_ID_PREFIX = "finding_" as const;
 const FINDING_ID_PATTERN = /^finding_[a-f0-9]{32}$/;
@@ -43,6 +43,7 @@ const REVIEW_JOURNAL_ENTRY_KINDS = [
   "validation",
   "repair_disposition",
   "finding_resolutions",
+  "timing_evidence",
   "measurements",
 ] as const;
 
@@ -167,6 +168,19 @@ export interface ReviewFindingResolution {
   state: ReviewResolutionState;
 }
 
+export interface ReviewSubactionTimingEvidence {
+  action_id: string;
+  dispatched_at: string;
+  completed_at: string;
+  latency_ms: number;
+}
+
+export interface ReviewTimingEvidence {
+  selector: ReviewSubactionTimingEvidence;
+  personas: Array<ReviewSubactionTimingEvidence & { persona_id: string }>;
+  validator: ReviewSubactionTimingEvidence | null;
+}
+
 export interface ReviewMeasurements {
   persona_count: number;
   finding_count: number;
@@ -194,6 +208,7 @@ export interface ReviewJournalContract {
   validation: ReviewValidationContract;
   repair_disposition: ReviewRepairDispositionContract;
   finding_resolutions: ReviewFindingResolution[];
+  timing_evidence: ReviewTimingEvidence;
   measurements: ReviewMeasurements;
   entries: ReviewJournalEntry[];
 }
@@ -442,6 +457,46 @@ function parseFindingResolution(value: unknown, path: string): ReviewFindingReso
   };
 }
 
+function parseSubactionTiming(value: unknown, path: string): ReviewSubactionTimingEvidence {
+  const input = objectAt(value, path, ["action_id", "dispatched_at", "completed_at", "latency_ms"]);
+  const dispatchedAt = timestamp(input.dispatched_at, `${path}.dispatched_at`);
+  const completedAt = timestamp(input.completed_at, `${path}.completed_at`);
+  const latencyMs = integerAt(input.latency_ms, `${path}.latency_ms`, 0, 604_800_000);
+  const expectedLatencyMs = Date.parse(completedAt) - Date.parse(dispatchedAt);
+  if (expectedLatencyMs < 0) fail(`${path}.completed_at`, "must not precede dispatched_at");
+  if (latencyMs !== expectedLatencyMs) fail(`${path}.latency_ms`, "does not match dispatch-to-completion evidence");
+  return {
+    action_id: stringAt(input.action_id, `${path}.action_id`, { max: 512 }),
+    dispatched_at: dispatchedAt,
+    completed_at: completedAt,
+    latency_ms: latencyMs,
+  };
+}
+
+function parseTimingEvidence(value: unknown, path: string): ReviewTimingEvidence {
+  const input = objectAt(value, path, ["selector", "personas", "validator"]);
+  const personas = arrayAt(input.personas, `${path}.personas`, (entry, entryPath) => {
+    const persona = objectAt(entry, entryPath, ["persona_id", "action_id", "dispatched_at", "completed_at", "latency_ms"]);
+    const timing = parseSubactionTiming({
+      action_id: persona.action_id,
+      dispatched_at: persona.dispatched_at,
+      completed_at: persona.completed_at,
+      latency_ms: persona.latency_ms,
+    }, entryPath);
+    return {
+      persona_id: stringAt(persona.persona_id, `${entryPath}.persona_id`, { pattern: IDENTIFIER }),
+      ...timing,
+    };
+  }, { min: 1, max: 32 });
+  unique(personas.map((entry) => entry.persona_id), `${path}.personas.persona_id`);
+  unique(personas.map((entry) => entry.action_id), `${path}.personas.action_id`);
+  return {
+    selector: parseSubactionTiming(input.selector, `${path}.selector`),
+    personas,
+    validator: nullable(input.validator, (entry) => parseSubactionTiming(entry, `${path}.validator`)),
+  };
+}
+
 function parseMeasurements(value: unknown, path: string): ReviewMeasurements {
   const input = objectAt(value, path, [
     "persona_count",
@@ -516,6 +571,40 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
     }
     if (receipt.finding_count !== receipt.finding_ids.length) {
       fail(`${source}.persona_receipts.${receipt.persona_id}.finding_count`, "does not match finding_ids length");
+    }
+  }
+  const personaTimings = new Map(journal.timing_evidence.personas.map((entry) => [entry.persona_id, entry]));
+  unique([
+    journal.timing_evidence.selector.action_id,
+    ...journal.timing_evidence.personas.map((entry) => entry.action_id),
+    ...(journal.timing_evidence.validator ? [journal.timing_evidence.validator.action_id] : []),
+  ], `${source}.timing_evidence.action_id`);
+  if (personaTimings.size !== journal.persona_receipts.length) {
+    fail(`${source}.timing_evidence.personas`, "must match the exact persona receipt roster");
+  }
+  const selectorCompletedAt = Date.parse(journal.timing_evidence.selector.completed_at);
+  for (const receipt of journal.persona_receipts) {
+    const timing = personaTimings.get(receipt.persona_id);
+    if (!timing) fail(`${source}.timing_evidence.personas`, `missing persona ${receipt.persona_id}`);
+    if (Date.parse(timing.dispatched_at) < selectorCompletedAt) {
+      fail(`${source}.timing_evidence.personas.${receipt.persona_id}.dispatched_at`, "must not precede selector completion");
+    }
+    if (receipt.latency_ms !== timing.latency_ms) {
+      fail(`${source}.persona_receipts.${receipt.persona_id}.latency_ms`, "does not match timing evidence");
+    }
+  }
+  const independentlyValidated = journal.finding_resolutions.some((resolution) =>
+    resolution.validator_result === "accepted" || resolution.validator_result === "rejected"
+  );
+  if (independentlyValidated !== (journal.timing_evidence.validator !== null)) {
+    fail(`${source}.timing_evidence.validator`, "must be present exactly when blocking findings were independently validated");
+  }
+  if (journal.timing_evidence.validator) {
+    const finalPersonaCompletion = Math.max(
+      ...journal.timing_evidence.personas.map((timing) => Date.parse(timing.completed_at))
+    );
+    if (Date.parse(journal.timing_evidence.validator.dispatched_at) < finalPersonaCompletion) {
+      fail(`${source}.timing_evidence.validator.dispatched_at`, "must not precede persona completion");
     }
   }
   if (journal.synthesis.selection_id !== journal.selection.selection_id) {
@@ -605,6 +694,21 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
     if (resolution.repair_disposition !== disposition.disposition) {
       fail(`${source}.finding_resolutions.${resolution.finding_id}.repair_disposition`, "does not match repair disposition");
     }
+    const expectedValidatorResult = disposition.disposition === "accepted"
+      ? "accepted"
+      : disposition.disposition === "rejected"
+        ? "rejected"
+        : "not_validated";
+    if (resolution.validator_result !== expectedValidatorResult) {
+      fail(
+        `${source}.finding_resolutions.${resolution.finding_id}.validator_result`,
+        `must be ${expectedValidatorResult} for repair disposition ${disposition.disposition}`
+      );
+    }
+    const canonicalIsBlocking = canonicalFinding.severity === "P0" || canonicalFinding.severity === "P1";
+    if (!canonicalIsBlocking && resolution.validator_result !== "not_validated") {
+      fail(`${source}.finding_resolutions.${resolution.finding_id}.validator_result`, "advisory findings are not independently validated");
+    }
     if (resolution.exact_dedup_personas.length === 0 &&
         !(resolution.state === "resolved" && (resolution.repair_disposition === "fixed" || resolution.repair_disposition === "superseded"))) {
       fail(`${source}.finding_resolutions.${resolution.finding_id}.exact_dedup_personas`, "may be empty only for a fixed or superseded resolved finding");
@@ -626,12 +730,19 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
   }
   const acceptedFindingCount = journal.finding_resolutions
     .filter((resolution) => resolution.validator_result === "accepted").length;
-  const rejectedFindingCount = journal.finding_resolutions.length - acceptedFindingCount;
+  const rejectedFindingCount = journal.finding_resolutions
+    .filter((resolution) => resolution.validator_result === "rejected").length;
   const resolvedFindingCount = journal.finding_resolutions
     .filter((resolution) => resolution.state === "resolved").length;
   const unresolvedFindingCount = journal.finding_resolutions.length - resolvedFindingCount;
-  const totalLatencyMs = journal.persona_receipts.reduce((total, receipt) => total + receipt.latency_ms, 0);
-  const criticalPathLatencyMs = Math.max(0, ...journal.persona_receipts.map((receipt) => receipt.latency_ms));
+  const timingSamples = [
+    journal.timing_evidence.selector,
+    ...journal.timing_evidence.personas,
+    ...(journal.timing_evidence.validator ? [journal.timing_evidence.validator] : []),
+  ];
+  const totalLatencyMs = timingSamples.reduce((total, timing) => total + timing.latency_ms, 0);
+  const finalCompletionMs = Math.max(...timingSamples.map((timing) => Date.parse(timing.completed_at)));
+  const criticalPathLatencyMs = Math.max(0, finalCompletionMs - Date.parse(journal.timing_evidence.selector.dispatched_at));
   const measuredCosts = journal.persona_receipts.map((receipt) => receipt.cost_microusd);
   const totalCostMicrousd = measuredCosts.some((cost) => cost === null)
     ? null
@@ -657,6 +768,7 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
     { kind: "validation", digest: digestCanonicalJson(journal.validation) },
     { kind: "repair_disposition", digest: digestCanonicalJson(journal.repair_disposition) },
     { kind: "finding_resolutions", digest: digestCanonicalJson(journal.finding_resolutions) },
+    { kind: "timing_evidence", digest: digestCanonicalJson(journal.timing_evidence) },
     { kind: "measurements", digest: digestCanonicalJson(journal.measurements) },
   ] as const;
   if (journal.entries.length !== expectedEntries.length) fail(`${source}.entries`, "must contain one digest for each journal artifact");
@@ -683,6 +795,7 @@ export function validateReviewJournalContract(
     "validation",
     "repair_disposition",
     "finding_resolutions",
+    "timing_evidence",
     "measurements",
     "entries",
   ]);
@@ -703,6 +816,7 @@ export function validateReviewJournalContract(
     validation: parseValidation(input.validation, `${source}.validation`),
     repair_disposition: parseRepairDisposition(input.repair_disposition, `${source}.repair_disposition`),
     finding_resolutions: arrayAt(input.finding_resolutions, `${source}.finding_resolutions`, parseFindingResolution, { max: 64 }),
+    timing_evidence: parseTimingEvidence(input.timing_evidence, `${source}.timing_evidence`),
     measurements: parseMeasurements(input.measurements, `${source}.measurements`),
     entries: arrayAt(input.entries, `${source}.entries`, parseJournalEntry, { max: 16 }),
   };

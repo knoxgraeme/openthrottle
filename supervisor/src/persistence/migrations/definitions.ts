@@ -1882,15 +1882,17 @@ CREATE TABLE execution_review_subaction_dispatches (
     length(request_hash) = 64 AND request_hash NOT GLOB '*[^a-f0-9]*'
   ),
   idempotency_key TEXT NOT NULL,
-  dispatched_at TEXT NOT NULL,
+  prepared_at TEXT NOT NULL,
+  dispatched_at TEXT,
   PRIMARY KEY(parent_action_id, action_id),
+  UNIQUE(action_id),
   UNIQUE(parent_action_id, idempotency_key),
   FOREIGN KEY(parent_action_id) REFERENCES execution_work_attempts(id) ON DELETE CASCADE
 );
 `;
 
 const reviewSubactionDispatchMigrationSource = `${reviewSubactionDispatchSchema}
-structured-review-dispatch-contract:fanout and validator subactions persist exact request dispatch evidence under their parent final-review action so repeated drains collect before dispatch and do not rematerialize credentials or repeat provider work/v1`;
+structured-review-dispatch-contract:selector fanout and validator subactions persist exact request dispatch intent and launch evidence under their parent final-review action so crash replay remains heartbeat-mapped without rematerializing credentials or repeating launched provider work/v3`;
 
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {

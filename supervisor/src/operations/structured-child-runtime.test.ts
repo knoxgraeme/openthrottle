@@ -81,6 +81,14 @@ function action(overrides: Partial<ExecutionWorkAttempt> & {
   };
 }
 
+function reviewSubactionDispatchStore() {
+  return {
+    getReviewSubactionDispatch: vi.fn(() => undefined),
+    prepareReviewSubactionDispatch: vi.fn(() => "recorded" as const),
+    markReviewSubactionDispatched: vi.fn(),
+  };
+}
+
 function candidateReceipt(subject: string, attempt: ExecutionWorkAttempt): string {
   return canonicalJson({
     schema: "openthrottle.receipt/v1",
@@ -2412,6 +2420,7 @@ describe("structured child runtime repair fences", () => {
         },
       } as any,
       store: {
+        ...reviewSubactionDispatchStore(),
         leaseNextUnitAction: () => finalReview,
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
@@ -2715,6 +2724,7 @@ describe("structured child runtime repair fences", () => {
         },
       } as any,
       store: {
+        ...reviewSubactionDispatchStore(),
         leaseNextUnitAction: () => finalReviewRoundTwo,
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
@@ -2788,6 +2798,7 @@ describe("structured child runtime repair fences", () => {
         },
       } as any,
       store: {
+        ...reviewSubactionDispatchStore(),
         leaseNextUnitAction: () => finalReviewRoundTwo,
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
