@@ -5,7 +5,14 @@ import { digestCanonicalJson } from "./canonical.js";
 import { parseRepositoryConfigContract } from "./config.js";
 import { parseExecutionPlanContract } from "./execution-plan.js";
 import { parseGraphContract } from "./graph.js";
-import { parseCitationContractProposal, parseStandardReceipt, validateStandardReceipt } from "./index.js";
+import {
+  decideDifferentialRatchet,
+  parseCitationContractProposal,
+  parseRatchetDifferentialInput,
+  parseStandardReceipt,
+  validateRatchetDecision,
+  validateStandardReceipt,
+} from "./index.js";
 
 const fixtureRoot = new URL("../fixtures", import.meta.url);
 
@@ -24,6 +31,7 @@ function parseByName(name: string, raw: string): unknown {
   if (name === "execution-plan.json" || name.startsWith("execution-plan-")) {
     return parseExecutionPlanContract(raw, { source: name });
   }
+  if (name.startsWith("ratchet-contract")) return parseRatchetDifferentialInput(raw, { source: name });
   if (name.startsWith("receipt-")) return parseStandardReceipt(raw, { source: name });
   throw new Error(`unrouted fixture ${name}`);
 }
@@ -60,6 +68,9 @@ const invalidCases = [
   ["execution-plan-cycle.json", /depends_on: creates a cycle/],
   ["execution-plan-bad-ref.json", /depends_on: references an unknown unit/],
   ["execution-plan-invalid-command.json", /commands\[0\]\.name: has an invalid format/],
+  ["ratchet-contract-duplicate-artifact.json", /pinned: must not contain duplicates/],
+  ["ratchet-contract-invalid-authority.json", /tuner_authority\.proposal_digest: has an invalid format/],
+  ["ratchet-contract-unknown-field.json", /pinned\[0\]\.digest: unknown field/],
   ["receipt-bad-skill-ref.json", /producer\.skill: has an invalid format/],
   ["receipt-skill-traversal.json", /producer\.skill: has an invalid format/],
   ["receipt-semantic-assurance-upgrade.json", /assurance: semantic receipts cannot claim/],
@@ -131,6 +142,7 @@ describe("Stage C contract fixtures", () => {
       "citation-contract.json",
       "graph-structured.json",
       "execution-plan.json",
+      "ratchet-contract.json",
       "receipt-unit-completion.json",
       "receipt-unit-decision.json",
       "receipt-repository-skill.json",
@@ -154,6 +166,44 @@ describe("Stage C contract fixtures", () => {
     proposal.dispositions[0]!.citation_ids = [];
     expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
       .toThrow(/dispositions\[0\]\.citation_ids: must contain between 1 and 32 entries/);
+  });
+
+  it("returns stable ratchet rejection reasons for proposed-versus-pinned differences", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const accepted = decideDifferentialRatchet(parsed.value);
+    expect(accepted.outcome).toBe("accept");
+    expect(accepted.reject_reasons).toEqual([]);
+    expect(accepted.differences).toEqual([]);
+    expect(validateRatchetDecision(accepted).digest).toBeTruthy();
+
+    const changed = structuredClone(parsed.value);
+    changed.proposed[0]!.artifact_digest = "f".repeat(64);
+    changed.proposed[0]!.provenance_digest = "e".repeat(64);
+    changed.proposed.push({
+      id: "extra_review",
+      kind: "review",
+      artifact_digest: "d".repeat(64),
+      provenance_digest: "c".repeat(64),
+    });
+    changed.human_authority = null;
+
+    expect(decideDifferentialRatchet(changed)).toMatchObject({
+      outcome: "reject",
+      reject_reasons: [
+        "artifact_digest_changed",
+        "provenance_digest_changed",
+        "missing_pinned_artifact",
+        "human_authority_missing",
+      ],
+      differences: [
+        { reason: "artifact_digest_changed", artifact_id: "unit_receipt" },
+        { reason: "provenance_digest_changed", artifact_id: "unit_receipt" },
+        { reason: "missing_pinned_artifact", artifact_id: "extra_review" },
+        { reason: "human_authority_missing" },
+      ],
+    });
   });
 
   it("rejects unsupported timestamps and normalizes equivalent ISO offsets", () => {
