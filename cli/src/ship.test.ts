@@ -261,6 +261,61 @@ describe("ship", () => {
     }
   });
 
+  it("creates then delegates a first-assignment issue with delegateId", async () => {
+    const directory = temporaryProject();
+    const planPath = join(directory, "plan.md");
+    writeFileSync(planPath, "# Ship it\n\nPlan body");
+    const originalFetch = globalThis.fetch;
+    const previousLinearKey = process.env.LINEAR_API_KEY;
+    const previousTeamId = process.env.LINEAR_TEAM_ID;
+    const previousAgentAppId = process.env.OT_AGENT_APP_ID;
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { query: string };
+      if (body.query.includes("IssueCreate")) {
+        return Response.json({
+          data: {
+            issueCreate: {
+              success: true,
+              issue: { id: "issue-1", identifier: "OPE-1", url: "https://linear.test/OPE-1" },
+            },
+          },
+        });
+      }
+      if (body.query.includes("IssueUpdate")) {
+        return Response.json({ data: { issueUpdate: { success: true } } });
+      }
+      throw new Error("unexpected Linear query");
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    process.env.LINEAR_API_KEY = "linear-key";
+    process.env.LINEAR_TEAM_ID = "team-1";
+    process.env.OT_AGENT_APP_ID = "app-actor-1";
+    try {
+      await ship([planPath]);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(String(fetchMock.mock.calls[0]![1]!.body))).toMatchObject({
+        variables: {
+          input: {
+            teamId: "team-1",
+            title: "Ship it",
+            description: "Plan body",
+          },
+        },
+      });
+      expect(JSON.parse(String(fetchMock.mock.calls[1]![1]!.body))).toMatchObject({
+        variables: { id: "issue-1", input: { delegateId: "app-actor-1" } },
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousLinearKey === undefined) delete process.env.LINEAR_API_KEY;
+      else process.env.LINEAR_API_KEY = previousLinearKey;
+      if (previousTeamId === undefined) delete process.env.LINEAR_TEAM_ID;
+      else process.env.LINEAR_TEAM_ID = previousTeamId;
+      if (previousAgentAppId === undefined) delete process.env.OT_AGENT_APP_ID;
+      else process.env.OT_AGENT_APP_ID = previousAgentAppId;
+    }
+  });
+
   it("rejects valid structured input before any Linear call", async () => {
     const directory = temporaryProject();
     writeStructuredConfig(directory);
