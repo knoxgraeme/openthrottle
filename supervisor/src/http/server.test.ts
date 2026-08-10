@@ -436,7 +436,7 @@ describe("coordinator-only server", () => {
     });
   });
 
-  it("rejects invalid citation timestamps, reversed windows, and unreferenced citations before grading", async () => {
+  it("rejects invalid, oversized, reversed-window, and unreferenced citation contracts before grading", async () => {
     const proposal = {
       schema: "openthrottle.citation-contract/v1",
       id: "proposal_invalid",
@@ -478,6 +478,16 @@ describe("coordinator-only server", () => {
     });
     expect(oversized.status).toBe(400);
     expect(await oversized.json()).toMatchObject({ error: expect.stringContaining("JSON exceeds 256 KiB") });
+
+    const compact = JSON.stringify(proposal);
+    const maxSizedJson = `${compact}${" ".repeat((256 * 1024) - Buffer.byteLength(compact))}`;
+    const bomPrefixed = await app().request("/analysis/citations/grade", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token", "Content-Type": "application/json" },
+      body: new Blob([new Uint8Array([0xef, 0xbb, 0xbf]), maxSizedJson]),
+    });
+    expect(bomPrefixed.status).toBe(400);
+    expect(await bomPrefixed.json()).toMatchObject({ error: expect.stringContaining("JSON exceeds 256 KiB") });
 
     invalidQuery.to = "2026-08-07T23:59:59.999Z";
     expect((await grade(proposal)).status).toBe(400);
