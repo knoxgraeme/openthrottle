@@ -10,7 +10,8 @@ const skillsRoot = resolve(repoRoot, "skills");
 
 // Five stage-path skills (single-shot agent stages, `openthrottle.stage-proposal/v1`
 // result), six loop-path skills (structured per-unit/whole-change actions,
-// `openthrottle.receipt/v1` result), and three mandatory review persona packages.
+// `openthrottle.receipt/v1` result), and baseline plus optional review persona
+// packages.
 // See skills/README.md and REVIEW.md §3.
 const stageTasks = ["implement-plan", "investigate", "review-change", "simplify-change", "publish"];
 const loopTasks = [
@@ -21,7 +22,13 @@ const loopTasks = [
   "final-review",
   "final-repair",
 ];
-const reviewPersonaTasks = ["select-review-personas", "correctness-dataflow", "tests-contracts"];
+const optionalReviewPersonaTasks = ["reliability-adversarial", "agent-native-contracts"];
+const reviewPersonaTasks = [
+  "select-review-personas",
+  "correctness-dataflow",
+  "tests-contracts",
+  ...optionalReviewPersonaTasks,
+];
 const tasks = [...stageTasks, ...loopTasks, ...reviewPersonaTasks];
 
 // The four loop skills that own an executor-owned worktree and author
@@ -124,11 +131,15 @@ describe("OpenThrottle canonical task skills", () => {
     expect(body).not.toContain("apply:local");
   });
 
-  it("ships the mandatory baseline review persona packages as report-only independent receipts", () => {
+  it("ships bounded review persona packages as report-only independent receipts", () => {
     const selector = skillBody("select-review-personas");
     expect(selector).toContain("`correctness-dataflow` and `tests-contracts`");
+    expect(selector).toContain("Optional personas are allowlisted");
+    for (const task of optionalReviewPersonaTasks) expect(selector).toContain(`\`${task}\``);
     expect(selector).toContain("max_personas_per_selection");
     expect(selector).toContain("Do not select personas for style taste");
+    expect(selector).toContain("Bound optional selection depth");
+    expect(selector).toContain("executor or gate faults");
 
     for (const task of reviewPersonaTasks) {
       const body = skillBody(task);
@@ -142,6 +153,12 @@ describe("OpenThrottle canonical task skills", () => {
     }
     expect(skillBody("correctness-dataflow")).toContain("data-flow chain");
     expect(skillBody("tests-contracts")).toContain("changed contract or proof obligation");
+    expect(skillBody("reliability-adversarial")).toContain("retry duplication");
+    expect(skillBody("reliability-adversarial")).toContain("silent-pass trigger");
+    expect(skillBody("reliability-adversarial")).toContain("Bounded Depth");
+    expect(skillBody("agent-native-contracts")).toContain("Native session identifiers");
+    expect(skillBody("agent-native-contracts")).toContain("Receipt validation preserves");
+    expect(skillBody("agent-native-contracts")).toContain("Bounded Depth");
   });
 
   it("ships non-CE fixture skills for the same standard receipt contracts", () => {
@@ -371,6 +388,8 @@ describe("OpenThrottle canonical task skills", () => {
       "select-review-personas": ["semantic_review", "success"],
       "correctness-dataflow": ["semantic_review", "semantic_repair_required"],
       "tests-contracts": ["semantic_review", "success"],
+      "reliability-adversarial": ["semantic_review", "semantic_repair_required"],
+      "agent-native-contracts": ["semantic_review", "success"],
     };
     for (const task of [...loopTasks, ...reviewPersonaTasks]) {
       const raw = exampleFor(task).replace(/^```json\n/, "").replace(/\n```$/, "");

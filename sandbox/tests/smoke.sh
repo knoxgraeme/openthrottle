@@ -67,7 +67,7 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   for name in implement-plan investigate review-change simplify-change publish \
               implement-unit repair-unit simplify-unit accept-unit final-review \
               final-repair select-review-personas correctness-dataflow \
-              tests-contracts; do
+              tests-contracts reliability-adversarial agent-native-contracts; do
     test -f "/opt/openthrottle/skills/tasks/$name/SKILL.md" || exit 1
   done &&
   test ! -e /opt/openthrottle/skills/claude &&
@@ -87,7 +87,7 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   for name in implement-plan investigate review-change simplify-change publish \
               implement-unit simplify-unit repair-unit accept-unit final-review \
               final-repair select-review-personas correctness-dataflow \
-              tests-contracts; do
+              tests-contracts reliability-adversarial agent-native-contracts; do
     test -f "/etc/codex/skills/$name/SKILL.md" || exit 1
     yaml="/etc/codex/skills/$name/agents/openai.yaml"
     test -f "$yaml" || exit 1

@@ -29,11 +29,25 @@ personas must run and why.
    named there; never invent a persona or modify its invariants.
 2. Include the mandatory baseline personas when present:
    `correctness-dataflow` and `tests-contracts`.
-3. Add any optional roster persona only when the subject's changed paths and
-   contracts make its focus materially relevant.
-4. Keep the order deterministic: mandatory baseline personas first in the order
+3. Optional personas are allowlisted to `reliability-adversarial` and
+   `agent-native-contracts`. Add one only when it appears in the sealed roster
+   and a mechanical trigger below matches the changed subject.
+4. Select `reliability-adversarial` when changed paths or contracts include
+   retry loops, durable queues, effect draining, webhook delivery, lease
+   renewal, run liveness, ordering-sensitive reducers, idempotency keys, or
+   success/failure settlement that can silently pass.
+5. Select `agent-native-contracts` when changed paths or contracts include
+   native session identifiers, prompt rendering, context policy, receipt
+   validation, tool or MCP allowlists, repository skill materialization, or
+   agent home/config setup.
+6. Bound optional selection depth: inspect only the sealed diff, the named
+   contract or manifest, and at most two directly called local modules needed
+   to confirm a trigger. If the trigger needs broader investigation, do not
+   select the optional persona unless the sealed roster explicitly marks it
+   mandatory.
+7. Keep the order deterministic: mandatory baseline personas first in the order
    above, then optional personas in roster order.
-5. Stay within `max_personas_per_selection`. If the baseline alone exceeds the
+8. Stay within `max_personas_per_selection`. If the baseline alone exceeds the
    bound, return `needs_human`.
 
 ## Required Postconditions
@@ -52,7 +66,10 @@ personas must run and why.
 
 Do not select personas for style taste, formatting, broad hardening, code-size
 preferences, speculative performance concerns, unchanged files, or toolchain
-checks that the configured command gates already own.
+checks that the configured command gates already own. Do not select optional
+personas for executor crashes, missing binaries, network outages, sandbox
+startup failure, command timeouts with no semantic contract change, or provider
+incidents; those are executor or gate faults, not semantic review findings.
 
 ## The Receipt
 

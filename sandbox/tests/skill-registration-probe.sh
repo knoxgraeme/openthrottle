@@ -45,6 +45,8 @@ SKILL_NAMES=(
   select-review-personas
   correctness-dataflow
   tests-contracts
+  reliability-adversarial
+  agent-native-contracts
 )
 
 docker run --rm --entrypoint bash "$IMAGE" -lc '

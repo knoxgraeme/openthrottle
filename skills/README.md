@@ -52,15 +52,21 @@ Structured graphs use six loop-path task adapters, one per unit action:
 - `final-repair` repairs exactly the findings `final-review` raised, in an
   executor-owned exact-base worktree, and returns `unit_completion`.
 
-Review fanout uses three report-only persona packages. They install with the
-same task-skill baseline for every supported engine and emit independent
-`semantic_review` receipts:
+Review fanout uses baseline and optional report-only persona packages. They
+install with the same task-skill baseline for every supported engine and emit
+independent `semantic_review` receipts:
 
 - `select-review-personas` chooses the deterministic roster from the sealed
   review policy, always including the mandatory baseline personas when present.
 - `correctness-dataflow` reviews changed value flow, state transitions,
   ordering, and failure paths.
 - `tests-contracts` reviews executable proof and cross-boundary contracts.
+- `reliability-adversarial` optionally reviews retry, ordering, idempotency,
+  and silent-pass risks where changed code crosses durable or asynchronous
+  execution.
+- `agent-native-contracts` optionally reviews native session continuation,
+  prompt-boundary handling, receipt provenance, and tool-contract authority
+  where changed code crosses agent execution boundaries.
 
 A repository-scoped skill may replace any of these when it emits the same
 `openthrottle.receipt/v1` or `openthrottle.stage-proposal/v1` contract. The
