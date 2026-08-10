@@ -101,13 +101,21 @@ function repoSkillId(skill: string): string | undefined {
   return skill.startsWith("repo://") ? skill.slice("repo://".length) : undefined;
 }
 
+function assertSupportedBuiltinCapability(capability: string, path: string): void {
+  if (!capabilityCredentialContract(capability)) {
+    fail(path, `unsupported builtin capability ${capability}`);
+  }
+}
+
 function capabilityFromSkill(
   skill: string,
   path: string,
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
 ): { capability: string; repositorySkill?: RepositorySkillPackage } {
   if (skill.startsWith("builtin://")) {
-    return { capability: skill.slice("builtin://".length) };
+    const capability = skill.slice("builtin://".length);
+    assertSupportedBuiltinCapability(capability, path);
+    return { capability };
   }
   const id = repoSkillId(skill);
   if (!id) fail(path, "must be a builtin or repository skill reference");

@@ -594,6 +594,26 @@ describe("execution graph compiler", () => {
     })).toThrow(/runtime capability mismatch: capability:agent\/repository-skill@1/);
   });
 
+  it("rejects syntactically valid but unsupported builtin loop skills during compilation", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+      worker: {
+        skills: ["builtin://ce/imaginary@1"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      loop: { skill: "builtin://ce/imaginary@1" },
+    }))).toThrow(/graph\.loops\.loop\.skill: unsupported builtin capability ce\/imaginary@1/);
+  });
+
+  it("rejects syntactically valid but unsupported builtin unit phase skills during compilation", () => {
+    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+      leadWorker: {
+        skills: ["builtin://accept-imaginary@1"],
+        credentials: ["model.invoke", "repo.read"],
+      },
+      leadLoop: { skill: "builtin://accept-imaginary@1" },
+    }))).toThrow(/graph\.loops\.lead-loop\.skill: unsupported builtin capability accept-imaginary@1/);
+  });
+
   it.each([
     [
       "for_each_unit nodes",
