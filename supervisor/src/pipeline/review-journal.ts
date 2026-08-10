@@ -43,10 +43,21 @@ export function buildReviewJournal(input: {
     receipt: SemanticReviewReceipt;
     actionId: string;
     dispatchedAt: string;
+    dispatchTimeSource: "acknowledged" | "prepared_fallback";
     completedAt: string;
   }>;
-  selectorTiming: { actionId: string; dispatchedAt: string; completedAt: string };
-  validatorTiming: { actionId: string; dispatchedAt: string; completedAt: string } | null;
+  selectorTiming: {
+    actionId: string;
+    dispatchedAt: string;
+    dispatchTimeSource: "acknowledged" | "prepared_fallback";
+    completedAt: string;
+  };
+  validatorTiming: {
+    actionId: string;
+    dispatchedAt: string;
+    dispatchTimeSource: "acknowledged" | "prepared_fallback";
+    completedAt: string;
+  } | null;
   validation: ValidatedReviewFanout;
   cycle: number;
   actionCreatedAt: string;
@@ -56,6 +67,7 @@ export function buildReviewJournal(input: {
   const timingSample = (input: {
     actionId: string;
     dispatchedAt: string;
+    dispatchTimeSource: "acknowledged" | "prepared_fallback";
     completedAt: string;
   }): ReviewSubactionTimingEvidence => {
     const dispatchedAt = Date.parse(input.dispatchedAt);
@@ -67,6 +79,7 @@ export function buildReviewJournal(input: {
       action_id: input.actionId,
       dispatched_at: input.dispatchedAt,
       completed_at: input.completedAt,
+      dispatch_time_source: input.dispatchTimeSource,
       latency_ms: completedAt - dispatchedAt,
     };
   };
@@ -94,10 +107,15 @@ export function buildReviewJournal(input: {
   const planPersonas = new Map(input.plan.personas.map((persona) => [persona.id, persona]));
   const findingsByPersona = new Map<string, ReviewFindingContract[]>();
   const personaTimings = new Map<string, ReviewSubactionTimingEvidence & { persona_id: ReviewPersonaId }>();
-  const personaReceipts: ReviewPersonaReceiptEvidence[] = input.receipts.map(({ receipt, actionId, dispatchedAt, completedAt }) => {
+  const personaReceipts: ReviewPersonaReceiptEvidence[] = input.receipts.map(({
+    receipt, actionId, dispatchedAt, dispatchTimeSource, completedAt,
+  }) => {
     const personaId = receipt.producer.worker_id as ReviewPersonaId;
     const persona = planPersonas.get(personaId);
     if (!persona) throw new Error(`review journal received unknown persona ${personaId}`);
+    if (actionId !== receipt.fence.action_attempt_id) {
+      throw new Error(`review timing action ${actionId} does not match ${personaId} receipt fence`);
+    }
     const findings = receipt.payload.findings.map((finding) => contractReviewFinding({
       finding,
       personaId,
@@ -105,7 +123,7 @@ export function buildReviewJournal(input: {
       invariant: persona.invariant,
     }));
     findingsByPersona.set(personaId, findings);
-    const timing = timingSample({ actionId, dispatchedAt, completedAt });
+    const timing = timingSample({ actionId, dispatchedAt, dispatchTimeSource, completedAt });
     personaTimings.set(personaId, { persona_id: personaId, ...timing });
     return {
       persona_id: personaId,

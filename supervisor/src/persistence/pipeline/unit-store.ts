@@ -164,6 +164,7 @@ export interface ExecutionReviewSubactionDispatch {
   idempotency_key: string;
   prepared_at: string;
   dispatched_at: string | null;
+  dispatch_time_source: "acknowledged" | "prepared_fallback" | null;
 }
 
 export interface ExecutionUnitStore {
@@ -256,7 +257,11 @@ export interface ExecutionUnitStore {
     requestHash: string;
     idempotencyKey: string;
   }): "recorded" | "already_recorded";
-  markReviewSubactionDispatched(parentActionId: string, actionId: string): void;
+  markReviewSubactionDispatched(
+    parentActionId: string,
+    actionId: string,
+    source: "acknowledged" | "prepared_fallback"
+  ): void;
   appendDownstreamContext(input: {
     parentAttemptId: string;
     fromUnitId: string;
@@ -1599,17 +1604,23 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       }
       db.prepare(`
         INSERT INTO execution_review_subaction_dispatches (
-          parent_action_id, action_id, request_hash, idempotency_key, prepared_at, dispatched_at
-        ) VALUES (?, ?, ?, ?, ?, NULL)
+          parent_action_id, action_id, request_hash, idempotency_key,
+          prepared_at, dispatched_at, dispatch_time_source
+        ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
       `).run(input.parentActionId, input.actionId, input.requestHash, input.idempotencyKey, now());
       return "recorded";
     },
-    markReviewSubactionDispatched(parentActionId, actionId) {
+    markReviewSubactionDispatched(parentActionId, actionId, source) {
+      const acknowledgedAt = now();
       const update = db.prepare(`
         UPDATE execution_review_subaction_dispatches
-        SET dispatched_at = COALESCE(dispatched_at, prepared_at)
+        SET dispatched_at = COALESCE(
+              dispatched_at,
+              CASE WHEN ? = 'acknowledged' THEN ? ELSE prepared_at END
+            ),
+            dispatch_time_source = COALESCE(dispatch_time_source, ?)
         WHERE parent_action_id = ? AND action_id = ?
-      `).run(parentActionId, actionId);
+      `).run(source, acknowledgedAt, source, parentActionId, actionId);
       if (update.changes !== 1) throw new Error(`unknown prepared review subaction ${actionId}`);
     },
     getStructuredExecutionPublication(parentAttemptId) {

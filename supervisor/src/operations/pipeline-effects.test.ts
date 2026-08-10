@@ -23,7 +23,12 @@ import type { ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js
 import type { PipelineInstance, PipelineStageAttempt } from "../pipeline/store.js";
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 import type { RuntimeResourceReconciler } from "./runtime-resource-reclaim.js";
-import { validateReviewJournalContract, type ReviewFinding, type SemanticReviewReceipt } from "@openthrottle/contracts";
+import {
+  digestCanonicalJson,
+  validateReviewJournalContract,
+  type ReviewFinding,
+  type SemanticReviewReceipt,
+} from "@openthrottle/contracts";
 import { buildReviewSelectorAuthority } from "../pipeline/review-fanout.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
@@ -1407,9 +1412,7 @@ describe("pipeline effect processor", () => {
         nativeSessionId: null,
         subject: integratedSubjectB,
         receipt,
-        completedAt: dispatched.skill === "tests-contracts"
-          ? "2099-07-22T12:00:02.000Z"
-          : "2099-07-22T12:00:01.000Z",
+        completedAt: "2099-07-22T12:00:00.000Z",
         codexAuthJson: `auth-${dispatched.skill}`,
       };
     });
@@ -1512,6 +1515,15 @@ describe("pipeline effect processor", () => {
       "correctness-dataflow",
       "tests-contracts",
     ]);
+    const swappedTimingJournal = structuredClone(reviewJournal);
+    const firstTimingActionId = swappedTimingJournal.timing_evidence.personas[0]!.action_id;
+    swappedTimingJournal.timing_evidence.personas[0]!.action_id =
+      swappedTimingJournal.timing_evidence.personas[1]!.action_id;
+    swappedTimingJournal.timing_evidence.personas[1]!.action_id = firstTimingActionId;
+    swappedTimingJournal.entries.find((entry) => entry.kind === "timing_evidence")!.digest =
+      digestCanonicalJson(swappedTimingJournal.timing_evidence);
+    expect(() => validateReviewJournalContract(swappedTimingJournal, { source: "swapped_timing_journal" }))
+      .toThrow(/timing_evidence\.personas\.correctness-dataflow\.action_id/);
     expect(reviewJournal.finding_resolutions).toHaveLength(2);
     expect(reviewJournal.finding_resolutions).toEqual(expect.arrayContaining([
       expect.objectContaining({

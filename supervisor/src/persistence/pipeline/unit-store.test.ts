@@ -1795,7 +1795,7 @@ describe("execution unit store", () => {
         requestHash: String(index + 1).repeat(64),
         idempotencyKey: `review-fence-${index}`,
       });
-      if (index > 0) store.markReviewSubactionDispatched(finalReview.id, actionId);
+      if (index > 0) store.markReviewSubactionDispatched(finalReview.id, actionId, "acknowledged");
     }
 
     expect(store.renewChildActionLiveness({
@@ -1840,6 +1840,53 @@ describe("execution unit store", () => {
       heartbeatAtIso: "2026-07-29T00:03:00.000Z",
       leaseUntilIso: "2026-07-29T00:04:00.000Z",
     })).toBe(false);
+  });
+
+  it("separates acknowledged dispatch time from conservative lost-ack fallback time", () => {
+    const store = setup();
+    const subject = "2".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    completeUnitToTerminal(store, subject);
+    const finalReview = lease(store);
+    store.markActionDispatched(finalReview.id, "parent-request-hash", null);
+    const acknowledgedId = `${finalReview.id}:review:correctness-dataflow`;
+    const fallbackId = `${finalReview.id}:review:tests-contracts`;
+
+    store.prepareReviewSubactionDispatch({
+      parentActionId: finalReview.id,
+      actionId: acknowledgedId,
+      requestHash: "1".repeat(64),
+      idempotencyKey: "acknowledged-timing",
+    });
+    store.prepareReviewSubactionDispatch({
+      parentActionId: finalReview.id,
+      actionId: fallbackId,
+      requestHash: "2".repeat(64),
+      idempotencyKey: "fallback-timing",
+    });
+    timestamp = "2026-07-29T00:00:20.000Z";
+    store.markReviewSubactionDispatched(finalReview.id, acknowledgedId, "acknowledged");
+    store.markReviewSubactionDispatched(finalReview.id, fallbackId, "prepared_fallback");
+
+    expect(store.getReviewSubactionDispatch(finalReview.id, acknowledgedId)).toMatchObject({
+      prepared_at: "2026-07-29T00:00:00.000Z",
+      dispatched_at: "2026-07-29T00:00:20.000Z",
+      dispatch_time_source: "acknowledged",
+    });
+    expect(store.getReviewSubactionDispatch(finalReview.id, fallbackId)).toMatchObject({
+      prepared_at: "2026-07-29T00:00:00.000Z",
+      dispatched_at: "2026-07-29T00:00:00.000Z",
+      dispatch_time_source: "prepared_fallback",
+    });
   });
 
   it("levels failed unit terminals with the operator alarm set", () => {

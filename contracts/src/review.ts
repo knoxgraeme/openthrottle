@@ -172,6 +172,7 @@ export interface ReviewSubactionTimingEvidence {
   action_id: string;
   dispatched_at: string;
   completed_at: string;
+  dispatch_time_source: "acknowledged" | "prepared_fallback";
   latency_ms: number;
 }
 
@@ -458,7 +459,9 @@ function parseFindingResolution(value: unknown, path: string): ReviewFindingReso
 }
 
 function parseSubactionTiming(value: unknown, path: string): ReviewSubactionTimingEvidence {
-  const input = objectAt(value, path, ["action_id", "dispatched_at", "completed_at", "latency_ms"]);
+  const input = objectAt(value, path, [
+    "action_id", "dispatched_at", "completed_at", "dispatch_time_source", "latency_ms",
+  ]);
   const dispatchedAt = timestamp(input.dispatched_at, `${path}.dispatched_at`);
   const completedAt = timestamp(input.completed_at, `${path}.completed_at`);
   const latencyMs = integerAt(input.latency_ms, `${path}.latency_ms`, 0, 604_800_000);
@@ -469,6 +472,11 @@ function parseSubactionTiming(value: unknown, path: string): ReviewSubactionTimi
     action_id: stringAt(input.action_id, `${path}.action_id`, { max: 512 }),
     dispatched_at: dispatchedAt,
     completed_at: completedAt,
+    dispatch_time_source: enumAt(
+      input.dispatch_time_source,
+      `${path}.dispatch_time_source`,
+      ["acknowledged", "prepared_fallback"] as const
+    ),
     latency_ms: latencyMs,
   };
 }
@@ -476,11 +484,14 @@ function parseSubactionTiming(value: unknown, path: string): ReviewSubactionTimi
 function parseTimingEvidence(value: unknown, path: string): ReviewTimingEvidence {
   const input = objectAt(value, path, ["selector", "personas", "validator"]);
   const personas = arrayAt(input.personas, `${path}.personas`, (entry, entryPath) => {
-    const persona = objectAt(entry, entryPath, ["persona_id", "action_id", "dispatched_at", "completed_at", "latency_ms"]);
+    const persona = objectAt(entry, entryPath, [
+      "persona_id", "action_id", "dispatched_at", "completed_at", "dispatch_time_source", "latency_ms",
+    ]);
     const timing = parseSubactionTiming({
       action_id: persona.action_id,
       dispatched_at: persona.dispatched_at,
       completed_at: persona.completed_at,
+      dispatch_time_source: persona.dispatch_time_source,
       latency_ms: persona.latency_ms,
     }, entryPath);
     return {
@@ -579,6 +590,27 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
     ...journal.timing_evidence.personas.map((entry) => entry.action_id),
     ...(journal.timing_evidence.validator ? [journal.timing_evidence.validator.action_id] : []),
   ], `${source}.timing_evidence.action_id`);
+  const selectorSuffix = ":review:selector";
+  if (!journal.timing_evidence.selector.action_id.endsWith(selectorSuffix)) {
+    fail(`${source}.timing_evidence.selector.action_id`, `must end with ${selectorSuffix}`);
+  }
+  const reviewActionPrefix = journal.timing_evidence.selector.action_id.slice(0, -selectorSuffix.length);
+  if (reviewActionPrefix.length === 0) {
+    fail(`${source}.timing_evidence.selector.action_id`, "must include the parent review action prefix");
+  }
+  for (const timing of journal.timing_evidence.personas) {
+    const expectedActionId = `${reviewActionPrefix}:review:${timing.persona_id}`;
+    if (timing.action_id !== expectedActionId) {
+      fail(`${source}.timing_evidence.personas.${timing.persona_id}.action_id`, `must be ${expectedActionId}`);
+    }
+  }
+  if (journal.timing_evidence.validator &&
+      journal.timing_evidence.validator.action_id !== `${reviewActionPrefix}:review:validator`) {
+    fail(
+      `${source}.timing_evidence.validator.action_id`,
+      `must be ${reviewActionPrefix}:review:validator`
+    );
+  }
   if (personaTimings.size !== journal.persona_receipts.length) {
     fail(`${source}.timing_evidence.personas`, "must match the exact persona receipt roster");
   }

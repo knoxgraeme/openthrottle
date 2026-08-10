@@ -1884,6 +1884,11 @@ CREATE TABLE execution_review_subaction_dispatches (
   idempotency_key TEXT NOT NULL,
   prepared_at TEXT NOT NULL,
   dispatched_at TEXT,
+  dispatch_time_source TEXT CHECK(dispatch_time_source IN ('acknowledged', 'prepared_fallback')),
+  CHECK(
+    (dispatched_at IS NULL AND dispatch_time_source IS NULL) OR
+    (dispatched_at IS NOT NULL AND dispatch_time_source IS NOT NULL)
+  ),
   PRIMARY KEY(parent_action_id, action_id),
   UNIQUE(action_id),
   UNIQUE(parent_action_id, idempotency_key),
@@ -1892,7 +1897,7 @@ CREATE TABLE execution_review_subaction_dispatches (
 `;
 
 const reviewSubactionDispatchMigrationSource = `${reviewSubactionDispatchSchema}
-structured-review-dispatch-contract:selector fanout and validator subactions persist exact request dispatch intent and launch evidence under their parent final-review action so crash replay remains heartbeat-mapped without rematerializing credentials or repeating launched provider work/v3`;
+structured-review-dispatch-contract:selector fanout and validator subactions persist exact request dispatch intent plus acknowledged or conservative-fallback launch timing under their parent final-review action so crash replay remains heartbeat-mapped without rematerializing credentials or repeating launched provider work/v4`;
 
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {

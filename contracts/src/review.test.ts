@@ -111,22 +111,25 @@ function validJournal(): ReviewJournalContract {
   }];
   const timingEvidence = {
     selector: {
-      action_id: "review-selector",
+      action_id: "review-parent:review:selector",
       dispatched_at: "2026-08-10T00:00:01.000Z",
       completed_at: "2026-08-10T00:00:01.020Z",
+      dispatch_time_source: "acknowledged" as const,
       latency_ms: 20,
     },
     personas: [{
       persona_id: "contract_reviewer",
-      action_id: "review-contract-reviewer",
+      action_id: "review-parent:review:contract_reviewer",
       dispatched_at: "2026-08-10T00:00:01.020Z",
       completed_at: "2026-08-10T00:00:01.140Z",
+      dispatch_time_source: "acknowledged" as const,
       latency_ms: 120,
     }],
     validator: {
-      action_id: "review-validator",
+      action_id: "review-parent:review:validator",
       dispatched_at: "2026-08-10T00:00:01.140Z",
       completed_at: "2026-08-10T00:00:01.180Z",
+      dispatch_time_source: "acknowledged" as const,
       latency_ms: 40,
     },
   };
@@ -291,6 +294,15 @@ describe("review journal contracts", () => {
       .toThrow(/review\.roster\.credentials: unknown field/);
   });
 
+  it("accepts explicitly labeled conservative timing after a lost launch acknowledgement", () => {
+    const journal = validJournal();
+    journal.timing_evidence.selector.dispatch_time_source = "prepared_fallback";
+    journal.entries.find((entry) => entry.kind === "timing_evidence")!.digest =
+      digestCanonicalJson(journal.timing_evidence);
+
+    expect(() => validateReviewJournalContract(journal, { source: "review" })).not.toThrow();
+  });
+
   it("rejects mutable roster and synthesis digest drift", () => {
     const personaDrift = validJournal();
     personaDrift.roster.personas[0] = { ...personaDrift.roster.personas[0]!, max_findings: 5 };
@@ -437,6 +449,12 @@ describe("review journal contracts", () => {
       duplicateTimingAction.timing_evidence.selector.action_id;
     expect(() => validateReviewJournalContract(duplicateTimingAction, { source: "review" }))
       .toThrow(/timing_evidence\.action_id: must not contain duplicates/);
+
+    const wrongPersonaTimingAction = validJournal();
+    wrongPersonaTimingAction.timing_evidence.personas[0]!.action_id =
+      "review-parent:review:other-persona";
+    expect(() => validateReviewJournalContract(wrongPersonaTimingAction, { source: "review" }))
+      .toThrow(/timing_evidence\.personas\.contract_reviewer\.action_id/);
 
     const earlyValidator = validJournal();
     earlyValidator.timing_evidence.validator!.dispatched_at = "2026-08-10T00:00:01.100Z";

@@ -879,7 +879,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       `${input.label} ${input.request.actionId} dispatch failed`,
       () => deps.runtime.dispatchLoopAction(input.resource, input.request)
     );
-    deps.store.markReviewSubactionDispatched(input.action.id, input.request.actionId);
+    deps.store.markReviewSubactionDispatched(input.action.id, input.request.actionId, "acknowledged");
     return true;
   };
 
@@ -922,7 +922,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     if (newlyDispatched) {
       await ensureReviewSubactionLaunched(input);
     } else {
-      deps.store.markReviewSubactionDispatched(input.action.id, input.request.actionId);
+      deps.store.markReviewSubactionDispatched(input.action.id, input.request.actionId, "prepared_fallback");
     }
     return { result: recovered, newlyDispatched };
   };
@@ -978,6 +978,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       receipt: SemanticReviewReceipt;
       actionId: string;
       dispatchedAt: string;
+      dispatchTimeSource: "acknowledged" | "prepared_fallback";
       completedAt: string;
     }>;
   } | {
@@ -993,6 +994,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       receipt: SemanticReviewReceipt;
       actionId: string;
       dispatchedAt: string;
+      dispatchTimeSource: "acknowledged" | "prepared_fallback";
       completedAt: string;
     }> = [];
     const collected: Array<{ request: LoopActionRequest; result: LoopActionResult | null }> = [];
@@ -1066,7 +1068,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         };
       }
       const dispatch = deps.store.getReviewSubactionDispatch(input.action.id, request.actionId);
-      if (!dispatch?.dispatched_at) {
+      if (!dispatch?.dispatched_at || !dispatch.dispatch_time_source) {
         return {
           terminal: true,
           resultHash: digestCanonicalJson(result),
@@ -1079,6 +1081,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         receipt: receipt as SemanticReviewReceipt,
         actionId: request.actionId,
         dispatchedAt: dispatch.dispatched_at,
+        dispatchTimeSource: dispatch.dispatch_time_source,
         completedAt: result.completedAt,
       });
     }
@@ -1885,7 +1888,9 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         throw new Error("review selector must return success with no review findings");
       }
       const selectorDispatch = deps.store.getReviewSubactionDispatch(action.id, selectorRequest.actionId);
-      if (!selectorDispatch?.dispatched_at) throw new Error("review selector has no persisted dispatch timing");
+      if (!selectorDispatch?.dispatched_at || !selectorDispatch.dispatch_time_source) {
+        throw new Error("review selector has no persisted dispatch timing");
+      }
       const recommendation = parseReviewSelectorRecommendation(selector.receipt.payload.summary, authority);
       const fanoutPlan = buildReviewFanoutPlan({
         subject: reviewSubject,
@@ -1932,7 +1937,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       const blocking = fanout.synthesis.findings.some((finding) => finding.severity === "P0" || finding.severity === "P1");
       let validatorReceipt: SemanticReviewReceipt | null = null;
       let validatorCompletedAt: string | null = null;
-      let validatorTiming: { actionId: string; dispatchedAt: string; completedAt: string } | null = null;
+      let validatorTiming: {
+        actionId: string;
+        dispatchedAt: string;
+        dispatchTimeSource: "acknowledged" | "prepared_fallback";
+        completedAt: string;
+      } | null = null;
       if (blocking) {
         const validatorRequest = buildReviewValidatorRequest({
           instance,
@@ -1969,10 +1979,13 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         validatorReceipt = validator.receipt;
         validatorCompletedAt = validator.completedAt;
         const validatorDispatch = deps.store.getReviewSubactionDispatch(action.id, validatorRequest.actionId);
-        if (!validatorDispatch?.dispatched_at) throw new Error("review validator has no persisted dispatch timing");
+        if (!validatorDispatch?.dispatched_at || !validatorDispatch.dispatch_time_source) {
+          throw new Error("review validator has no persisted dispatch timing");
+        }
         validatorTiming = {
           actionId: validatorRequest.actionId,
           dispatchedAt: validatorDispatch.dispatched_at,
+          dispatchTimeSource: validatorDispatch.dispatch_time_source,
           completedAt: validator.completedAt,
         };
       }
@@ -2028,6 +2041,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         selectorTiming: {
           actionId: selectorRequest.actionId,
           dispatchedAt: selectorDispatch.dispatched_at,
+          dispatchTimeSource: selectorDispatch.dispatch_time_source,
           completedAt: selector.completedAt,
         },
         validatorTiming,

@@ -34,7 +34,7 @@ function receipt(input: {
       unit_id: "__final__",
       attempt_id: "attempt-1",
       parent_run_id: "run-1",
-      action_attempt_id: `review-${input.personaId}`,
+      action_attempt_id: `final-review:review:${input.personaId}`,
       generation: 1,
       native_session_id: null,
       request_hash: "c".repeat(64),
@@ -74,16 +74,19 @@ function journal(input: {
       receipt: personaReceipt,
       actionId: personaReceipt.fence.action_attempt_id,
       dispatchedAt: "2099-07-22T12:00:00.250Z",
+      dispatchTimeSource: "acknowledged",
       completedAt,
     })),
     selectorTiming: {
-      actionId: "review-selector",
+      actionId: "final-review:review:selector",
       dispatchedAt: "2099-07-22T12:00:00.000Z",
+      dispatchTimeSource: "acknowledged",
       completedAt: "2099-07-22T12:00:00.250Z",
     },
     validatorTiming: independentlyValidated ? {
-      actionId: "review-validator-action",
+      actionId: "final-review:review:validator",
       dispatchedAt: completedAt,
+      dispatchTimeSource: "acknowledged",
       completedAt: "2099-07-22T12:00:01.500Z",
     } : null,
     validation: input.validation,
@@ -372,13 +375,14 @@ describe("review journal construction", () => {
     });
     const epoch = Date.parse("2099-07-22T12:00:00.000Z");
     const iso = (offsetMs: number) => new Date(epoch + offsetMs).toISOString();
-    const selectorLatency = 100;
-    const personaLatency = 200;
-    const validatorLatency = 100;
+    const selectorLatency = 20_000;
+    const personaLatency = 10_000;
+    const validatorLatency = 10_000;
     const timedReceipts = receipts.map((personaReceipt, index) => ({
       receipt: personaReceipt,
       actionId: personaReceipt.fence.action_attempt_id,
       dispatchedAt: iso(selectorLatency + index * personaLatency),
+      dispatchTimeSource: "acknowledged" as const,
       completedAt: iso(selectorLatency + (index + 1) * personaLatency),
     }));
     const validatorStart = selectorLatency + receipts.length * personaLatency;
@@ -388,13 +392,15 @@ describe("review journal construction", () => {
       baseSubject: "0".repeat(40),
       receipts: timedReceipts,
       selectorTiming: {
-        actionId: "review-selector",
+        actionId: "final-review:review:selector",
         dispatchedAt: iso(0),
+        dispatchTimeSource: "acknowledged",
         completedAt: iso(selectorLatency),
       },
       validatorTiming: {
-        actionId: "review-validator-action",
+        actionId: "final-review:review:validator",
         dispatchedAt: iso(validatorStart),
+        dispatchTimeSource: "acknowledged",
         completedAt: iso(validatorStart + validatorLatency),
       },
       validation,
@@ -404,8 +410,15 @@ describe("review journal construction", () => {
     });
 
     expect(reviewJournal.timing_evidence.selector.latency_ms).toBe(selectorLatency);
+    expect(reviewJournal.timing_evidence.selector.dispatch_time_source).toBe("acknowledged");
     expect(reviewJournal.timing_evidence.personas.map((timing) => timing.latency_ms))
       .toEqual(receipts.map(() => personaLatency));
+    expect(reviewJournal.timing_evidence.personas[0]).toMatchObject({
+      dispatched_at: iso(20_000),
+      completed_at: iso(30_000),
+      dispatch_time_source: "acknowledged",
+      latency_ms: 10_000,
+    });
     expect(reviewJournal.timing_evidence.validator?.latency_ms).toBe(validatorLatency);
     const endToEnd = selectorLatency + receipts.length * personaLatency + validatorLatency;
     expect(reviewJournal.measurements).toMatchObject({
