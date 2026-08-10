@@ -15,7 +15,7 @@ const investigateGraphPath = fileURLToPath(new URL("../../graphs/investigate-v1.
 const structuredV1GraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
 const structuredV2GraphPath = fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url));
 const SIMPLE_GRAPH_DIGEST = "2f25ae9b891405d0e73e5f3c0f103354183c8cb27ca923cbd06baa6c470b76d1";
-const SIMPLE_MANIFEST_DIGEST = "01bd7ef7b3705f2569698ec5e7fd59f694c8c0406e529916692b012d17e91e1b";
+const SIMPLE_MANIFEST_DIGEST = "f49011080d9f377bf4b9507eb1b47243e7a87f0918acfcc10e80b5940b505c0d";
 const INVESTIGATE_GRAPH_DIGEST = "a76d3e1360d92f41bc7aa9ed2372e294555478d5854808bf0c2a5ed7febaf317";
 const INVESTIGATE_MANIFEST_DIGEST = "80bb12f5b10d771d65d7235e308c2489b33ff6878a452069cf8c23621dec9329";
 const STRUCTURED_V2_COMPILE_OPTIONS = {
@@ -178,25 +178,26 @@ function minimalUnitGraph(overrides: {
 }
 
 describe("execution graph compiler", () => {
-  it("compiles the built-in simple graph behaviorally equivalent to core/implement@4 with a new digest", () => {
-    const compiled = parseAndCompileExecutionGraph(readFileSync(simpleGraphPath, "utf8"), {
-      source: simpleGraphPath,
-      id: "builtin/simple",
-      version: 1,
-      description: "Built-in simple implementation graph compiled to the staged CE manifest.",
-      maxAttempts: 200,
-      maxRepairRounds: 5,
-    });
+  it("keeps the built-in simple parity compile byte-identical to core/implement@4", () => {
     const deployed = resolvePipelineReference(
       loadPipelineCatalog(catalogPath, buildInstalledRuntimeDescriptor("test-runtime/v1").descriptor),
       "core/implement@4"
     );
+    const compiled = parseAndCompileExecutionGraph(readFileSync(simpleGraphPath, "utf8"), {
+      source: simpleGraphPath,
+      id: deployed.manifest.id,
+      version: deployed.manifest.version,
+      description: deployed.manifest.description,
+      maxAttempts: 200,
+      maxRepairRounds: 5,
+      includeOrdinaryLoopBinding: false,
+    });
 
     expect(behavior(compiled.manifest.manifest)).toEqual(behavior(deployed.manifest));
-    expect(compiled.manifest.manifest.id).toBe("builtin/simple");
+    expect(compiled.manifest.manifest.id).toBe("core/implement");
     expect(compiled.graphDigest).toBe(SIMPLE_GRAPH_DIGEST);
     expect(compiled.manifest.digest).toBe(SIMPLE_MANIFEST_DIGEST);
-    expect(compiled.manifest.digest).not.toBe(deployed.digest);
+    expect(compiled.manifest.digest).toBe(deployed.digest);
   });
 
   it("compiles the built-in investigate graph behaviorally equivalent to core/investigate@1", () => {

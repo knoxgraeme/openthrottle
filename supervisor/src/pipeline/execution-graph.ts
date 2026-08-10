@@ -50,6 +50,7 @@ export interface CompileExecutionGraphOptions {
   maxAttempts?: number;
   maxRepairRounds?: number;
   aggregatePublishContext?: "prefer_resume";
+  includeOrdinaryLoopBinding?: boolean;
   ordinaryStageTimeoutSeconds?: number;
   runtime?: RuntimeCapabilityInventory;
   config?: RepositoryConfigContract;
@@ -245,6 +246,7 @@ function compileTransitions(node: GraphNode): Record<StageOutcome, PipelineTrans
 function loopTemplate(
   graph: GraphContract,
   node: GraphNode,
+  includeOrdinaryLoopBinding = true,
   ordinaryStageTimeoutSeconds?: number,
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
 ): StageTemplate {
@@ -277,15 +279,17 @@ function loopTemplate(
   const liveSteering = capability === "ce/implement@1" || capability === "ce/investigate@1";
   const template: StageTemplate = {
     executor: { kind: "agent", capability },
-    loop: {
-      id: loop.id,
-      skill: loop.skill,
-      input_scope: loop.input_scope,
-      receipt: loop.receipt,
-      max_parallel: loop.max_parallel,
-      max_rounds: loop.max_rounds,
-      timeout_seconds: loop.timeout_seconds,
-    },
+    ...(includeOrdinaryLoopBinding ? {
+      loop: {
+        id: loop.id,
+        skill: loop.skill,
+        input_scope: loop.input_scope,
+        receipt: loop.receipt,
+        max_parallel: loop.max_parallel,
+        max_rounds: loop.max_rounds,
+        timeout_seconds: loop.timeout_seconds,
+      },
+    } : {}),
     ...(repositorySkill === undefined ? {} : { repositorySkill }),
     evaluator: {
       kind: "semantic",
@@ -451,13 +455,22 @@ function publishContextFor(
 function nodeTemplate(
   graph: GraphContract,
   node: GraphNode,
-  options: Pick<CompileExecutionGraphOptions, "aggregatePublishContext" | "ordinaryStageTimeoutSeconds"> = {},
+  options: Pick<
+    CompileExecutionGraphOptions,
+    "aggregatePublishContext" | "includeOrdinaryLoopBinding" | "ordinaryStageTimeoutSeconds"
+  > = {},
   config?: RepositoryConfigContract,
   repositorySkills?: ReadonlyMap<string, RepositorySkillPackage>
 ): StageTemplate {
   assertNoDependencies(node);
   if (node.kind === "run") {
-    return loopTemplate(graph, node, options.ordinaryStageTimeoutSeconds, repositorySkills);
+    return loopTemplate(
+      graph,
+      node,
+      options.includeOrdinaryLoopBinding,
+      options.ordinaryStageTimeoutSeconds,
+      repositorySkills
+    );
   }
   if (node.kind === "for_each_unit") return forEachUnitTemplate(graph, node, config, repositorySkills);
   if (node.kind === "command") {

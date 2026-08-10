@@ -580,6 +580,7 @@ async function resolvePipelineSelection(
   const ordinaryStageTimeoutSeconds = Math.min(taskTimeoutSeconds, repositoryTaskTimeoutSeconds);
   const compileOptions = {
     source: compileSource,
+    includeOrdinaryLoopBinding: source.kind === "repository",
     ...(source.kind === "repository" ? {
       config: repositoryConfig.config,
       ordinaryStageTimeoutSeconds,

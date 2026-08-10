@@ -132,7 +132,9 @@ repository skill is reachable through the existing whole-attempt dispatch path.
 Compiler-produced repository manifest identity includes an explicit compiler
 identity version in addition to the pinned graph id, path, and blob. Any
 compiler change that alters normalized manifest bytes bumps that identity
-version instead of reusing an already-accepted immutable catalog key.
+version instead of reusing an already-accepted immutable catalog key. Builtin
+graph compilation is a parity check against the canonical catalog manifest and
+does not publish repository-only ordinary loop bindings.
 Builtin `run` skills must name an installed whole-stage dispatch adapter (or
 the intentional generic `agent/semantic@1` executor). Structured builtin phase
 skills are exact: `implement` uses `ce/implement@1`, `simplify` uses
