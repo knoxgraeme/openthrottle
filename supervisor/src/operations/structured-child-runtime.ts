@@ -224,9 +224,13 @@ function uniqueInOrder(values: readonly string[]): string[] {
   return [...new Set(values)];
 }
 
-function authoredImplementMaxRounds(bindings: readonly PipelineUnitPhaseBinding[] | undefined): number | undefined {
-  const binding = bindings?.find((candidate) => candidate.id === "implement" && candidate.kind === "agent");
-  return binding?.kind === "agent" ? binding.loop.max_rounds : undefined;
+function authoredUnitRepairMaxRounds(bindings: readonly PipelineUnitPhaseBinding[] | undefined): number | undefined {
+  const mutationRounds = (bindings ?? []).flatMap((binding) =>
+    binding.kind === "agent" && (binding.id === "implement" || binding.id === "simplify")
+      ? [binding.loop.max_rounds]
+      : []
+  );
+  return mutationRounds.length > 0 ? Math.min(...mutationRounds) : undefined;
 }
 
 function commandPlanForUnits(input: {
@@ -1331,7 +1335,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         commandNames: commandPlan.graphCommandNames,
         unitPhases: stage.unitPhases,
         unitPhaseBindings: stage.unitPhaseBindings,
-        maxRepairRounds: authoredImplementMaxRounds(stage.unitPhaseBindings),
+        maxRepairRounds: authoredUnitRepairMaxRounds(stage.unitPhaseBindings),
       });
     },
 

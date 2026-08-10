@@ -158,9 +158,11 @@ Directly loaded `PIPELINE_CATALOG_PATH` manifests reject ordinary stage loop
 bindings because their repository-specific effective timeout cannot be proven
 at catalog load time; ordinary loop bindings are admitted only through
 repository graph compilation and its timeout-equality check.
-Structured unit implementation repairs use the authored implement-loop
-`max_rounds`. Whole-change final-review repair is a distinct internal loop with
-its own one-round bound; it never borrows the unit implementation budget.
+Structured unit repair cycles rerun every declared mutation phase (`implement`
+and, when present, `simplify`), so their durable repair budget is the minimum of
+those phases' authored `max_rounds`; the first mutation-phase bound exhausted
+wins. Whole-change final-review repair is a distinct internal loop with its own
+one-round bound; it never borrows the unit repair budget.
 Internal whole-change final review and repair bindings do not declare an
 independent timeout, so their sealed action timeout inherits the supervisor
 `TASK_TIMEOUT` hard resource bound.

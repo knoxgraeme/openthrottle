@@ -462,7 +462,7 @@ describe("structured child runtime command seeding", () => {
     }));
   });
 
-  it("seeds the authored implement loop max rounds as the durable repair budget", () => {
+  it("seeds the strictest authored mutation-loop rounds as the durable unit repair budget", () => {
     const createGraph = vi.fn();
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -483,24 +483,43 @@ describe("structured child runtime command seeding", () => {
           id: "structured",
           executor: { capability: "graph/for-each-unit@1" },
           unitCommandNames: ["test"],
-          unitPhases: ["implement", "candidate", "lead", "integrate"],
-          unitPhaseBindings: [{
-            id: "implement",
-            kind: "agent",
-            loop: {
-              id: "unit-loop",
-              skill: "builtin://implement-unit@1",
-              input_scope: "unit",
-              receipt: "unit_completion",
-              max_parallel: 1,
-              max_rounds: 6,
-              timeout_seconds: 77,
+          unitPhases: ["implement", "simplify", "candidate", "lead", "integrate"],
+          unitPhaseBindings: [
+            {
+              id: "implement",
+              kind: "agent",
+              loop: {
+                id: "unit-loop",
+                skill: "builtin://implement-unit@1",
+                input_scope: "unit",
+                receipt: "unit_completion",
+                max_parallel: 1,
+                max_rounds: 6,
+                timeout_seconds: 77,
+              },
+              worker: { id: "worker-1", agent: "inherit", allowed_mcp_servers: [] },
+              executor: { kind: "agent", capability: "implement-unit@1" },
+              credentials: ["model.invoke", "repo.read"],
+              context: "fresh",
             },
-            worker: { id: "worker-1", agent: "inherit", allowed_mcp_servers: [] },
-            executor: { kind: "agent", capability: "implement-unit@1" },
-            credentials: ["model.invoke", "repo.read"],
-            context: "fresh",
-          }],
+            {
+              id: "simplify",
+              kind: "agent",
+              loop: {
+                id: "simplify-loop",
+                skill: "builtin://simplify-unit@1",
+                input_scope: "unit",
+                receipt: "unit_completion",
+                max_parallel: 1,
+                max_rounds: 2,
+                timeout_seconds: 77,
+              },
+              worker: { id: "worker-2", agent: "inherit", allowed_mcp_servers: [] },
+              executor: { kind: "agent", capability: "simplify-unit@1" },
+              credentials: ["model.invoke", "repo.read"],
+              context: "fresh",
+            },
+          ],
         }],
       }),
     };
@@ -508,7 +527,7 @@ describe("structured child runtime command seeding", () => {
     childRuntime.seedCompositeGraph(manifestInstance as any, request(executionPlan) as any);
 
     expect(createGraph).toHaveBeenCalledWith(expect.objectContaining({
-      maxRepairRounds: 6,
+      maxRepairRounds: 2,
     }));
   });
 
