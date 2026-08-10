@@ -165,7 +165,16 @@ describe("Stage C contract fixtures", () => {
       }>;
     };
 
-    for (const unsupported of ["2026", "2026-08-08", "08/08/2026", "0"]) {
+    for (const unsupported of [
+      "2026",
+      "2026-08-08",
+      "08/08/2026",
+      "0",
+      "2026-02-30T00:00:00Z",
+      "2026-13-01T00:00:00Z",
+      "2026-08-08T24:00:00Z",
+      "2026-08-08T00:00:00+24:00",
+    ]) {
       proposal.citations[0]!.query.from = unsupported;
       expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
         .toThrow(/query\.from: must be an ISO-8601 timestamp/);
@@ -191,6 +200,40 @@ describe("Stage C contract fixtures", () => {
 
     expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
       .toThrow(/citations\.orphan_citation: must be referenced by a claim or disposition/);
+  });
+
+  it("requires unique grades to cover every claim disposition", () => {
+    const proposal = JSON.parse(readFixture("valid", "citation-contract.json")) as {
+      claims: Array<Record<string, unknown>>;
+      citations: Array<Record<string, unknown>>;
+      dispositions: Array<Record<string, unknown>>;
+      grades: Array<{ id: string; disposition_claim_ids: string[] }>;
+    };
+    proposal.grades[0]!.disposition_claim_ids = [];
+    expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+      .toThrow(/grades\[0\]\.disposition_claim_ids: must contain between 1 and 64 entries/);
+
+    proposal.claims.push({ id: "claim_two", text: "Second claim.", citation_ids: ["citation_two"] });
+    proposal.citations.push({
+      id: "citation_two",
+      query: { outcome: "shipped" },
+      expected_result: [],
+      source_digests: ["b".repeat(64)],
+    });
+    proposal.dispositions.push({
+      claim_id: "claim_two",
+      disposition: "supported",
+      rationale: "Second disposition.",
+      citation_ids: ["citation_two"],
+    });
+    proposal.grades[0]!.disposition_claim_ids = ["claim_failed_agent_runs"];
+    expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+      .toThrow(/grades: must include every claim disposition/);
+
+    proposal.grades[0]!.disposition_claim_ids.push("claim_two");
+    proposal.grades.push({ ...proposal.grades[0]!, disposition_claim_ids: ["claim_two"] });
+    expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+      .toThrow(/grades: must not contain duplicate IDs/);
   });
 
   it("keeps map ordering irrelevant while preserving authored array order", () => {

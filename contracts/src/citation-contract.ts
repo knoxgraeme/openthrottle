@@ -177,7 +177,7 @@ function parseGrade(value: unknown, path: string): CitationContractGrade {
   return {
     id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
     value: enumAt(input.value, `${path}.value`, GRADE_VALUES),
-    disposition_claim_ids: parseIdentifierList(input.disposition_claim_ids, `${path}.disposition_claim_ids`, 64),
+    disposition_claim_ids: parseIdentifierList(input.disposition_claim_ids, `${path}.disposition_claim_ids`, 64, 1),
     rationale: stringAt(input.rationale, `${path}.rationale`, { max: 2_000 }),
   };
 }
@@ -220,12 +220,20 @@ function validateReferences(proposal: CitationContractProposal, source: string):
   for (const claimId of claimIds) {
     if (!dispositionClaimIds.has(claimId)) fail(`${source}.dispositions`, "must include every claim");
   }
+  const gradeIds = new Set(proposal.grades.map((grade) => grade.id));
+  if (gradeIds.size !== proposal.grades.length) fail(`${source}.grades`, "must not contain duplicate IDs");
+
+  const gradedDispositionClaimIds = new Set<string>();
   for (const grade of proposal.grades) {
     for (const claimId of grade.disposition_claim_ids) {
       if (!dispositionClaimIds.has(claimId)) {
         fail(`${source}.grades.${grade.id}.disposition_claim_ids`, "references an unknown claim disposition");
       }
+      gradedDispositionClaimIds.add(claimId);
     }
+  }
+  for (const claimId of dispositionClaimIds) {
+    if (!gradedDispositionClaimIds.has(claimId)) fail(`${source}.grades`, "must include every claim disposition");
   }
 }
 

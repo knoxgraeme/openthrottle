@@ -444,7 +444,7 @@ describe("coordinator-only server", () => {
       claims: [{ id: "claim_one", text: "A claim.", citation_ids: ["citation_one"] }],
       citations: [{
         id: "citation_one",
-        query: { outcome: "failed", from: "2026-08-08" },
+        query: { outcome: "failed", from: "2026-02-30T00:00:00Z" },
         expected_result: [],
         source_digests: ["a".repeat(64)],
       }],
