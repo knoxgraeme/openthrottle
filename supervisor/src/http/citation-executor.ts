@@ -61,11 +61,11 @@ function resolveCitations(
 }
 
 export function executeRawCitationGate(input: {
-  raw: unknown;
+  raw: string;
   analysisStore: AnalysisStore;
   citationGateStore: CitationGateStore;
 }): CitationGateExecution {
-  const proposalContract = parseCitationContractProposal(JSON.stringify(input.raw), { source: "citation_contract" });
+  const proposalContract = parseCitationContractProposal(input.raw, { source: "citation_contract" });
   const proposal = proposalContract.value;
   const resolvedCitations = resolveCitations(proposal, input.analysisStore);
   const grade = gradeCitationContractProposal(proposal, resolvedCitations);

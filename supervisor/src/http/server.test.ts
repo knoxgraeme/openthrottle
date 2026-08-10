@@ -471,6 +471,14 @@ describe("coordinator-only server", () => {
     expect((await grade(proposal)).status).toBe(400);
     const invalidQuery = proposal.citations[0]!.query as { outcome: string; from: string; to?: string };
     invalidQuery.from = "2026-08-08T00:00:00.000Z";
+    const oversized = await app().request("/analysis/citations/grade", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token", "Content-Type": "application/json" },
+      body: `${JSON.stringify(proposal)}${" ".repeat(256 * 1024)}`,
+    });
+    expect(oversized.status).toBe(400);
+    expect(await oversized.json()).toMatchObject({ error: expect.stringContaining("JSON exceeds 256 KiB") });
+
     invalidQuery.to = "2026-08-07T23:59:59.999Z";
     expect((await grade(proposal)).status).toBe(400);
     delete invalidQuery.to;

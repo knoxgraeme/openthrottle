@@ -384,7 +384,7 @@ export function createServer(deps: ServerDeps): Hono {
     }
     try {
       const execution = executeRawCitationGate({
-        raw: await context.req.json(),
+        raw: await context.req.text(),
         analysisStore: deps.analysisStore,
         citationGateStore: deps.citationGateStore,
       });
