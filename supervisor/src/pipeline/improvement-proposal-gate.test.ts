@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { CitationContractProposal, RatchetDifferentialInput } from "@openthrottle/contracts";
+import {
+  canonicalJson,
+  digestNormalized,
+  type CitationContractProposal,
+  type RatchetDifferentialInput,
+} from "@openthrottle/contracts";
 import { evaluateCitationGate } from "./citation-gate.js";
 import { evaluateImprovementProposalGate } from "./improvement-proposal-gate.js";
 
@@ -44,6 +49,43 @@ function citationGate(actualResult = [run]) {
   });
 }
 
+function citationReceipt(decision = citationGate()) {
+  return {
+    id: `citation-gate-${digestNormalized(canonicalJson([
+      decision.proposal_hash,
+      decision.hash,
+    ])).slice(0, 32)}`,
+    proposal_id: decision.proposal_id,
+    proposal_hash: decision.proposal_hash,
+    gate_result: decision.result,
+    outcome: decision.outcome,
+    reason: decision.reason,
+    grade_hash: decision.grade_hash,
+    payload: decision.payload,
+    receipt_hash: decision.hash,
+    created_at: "2026-08-08T00:00:00.000Z",
+  };
+}
+
+function proposalGateInput(actualResult = [run]) {
+  const decision = citationGate(actualResult);
+  return {
+    input: {
+      citationGate: decision,
+      ratchetInput: ratchetInput(),
+    },
+    ports: receiptPorts(citationReceipt(decision)),
+  };
+}
+
+function receiptPorts(receipt: ReturnType<typeof citationReceipt> | undefined) {
+  return {
+    citationReceipts: {
+      getCitationGateReceipt: () => receipt,
+    },
+  };
+}
+
 function ratchetInput(): RatchetDifferentialInput {
   return {
     schema: "openthrottle.ratchet-contract/v1",
@@ -74,9 +116,9 @@ function ratchetInput(): RatchetDifferentialInput {
 
 describe("improvement proposal gate", () => {
   it("deterministically accepts exact citation and differential inputs", () => {
-    const input = { citationGate: citationGate(), ratchetInput: ratchetInput() };
-    const first = evaluateImprovementProposalGate(input);
-    const second = evaluateImprovementProposalGate(input);
+    const { input, ports } = proposalGateInput();
+    const first = evaluateImprovementProposalGate(input, ports);
+    const second = evaluateImprovementProposalGate(input, ports);
 
     expect(first).toEqual(second);
     expect(first).toMatchObject({
@@ -85,15 +127,23 @@ describe("improvement proposal gate", () => {
       journal: { result: "passed", reasons: [] },
     });
     expect(first.journal.policy_digest).toMatch(/^[a-f0-9]{64}$/);
+    expect(first.journal.proposal_binding_digest).toMatch(/^[a-f0-9]{64}$/);
     expect(first.journal.hash).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it("returns complete bounded reasons for missing or malformed inputs", () => {
-    expect(evaluateImprovementProposalGate({ citationGate: null, ratchetInput: null })).toMatchObject({
+    expect(evaluateImprovementProposalGate({
+      citationGate: null,
+      ratchetInput: null,
+    }, receiptPorts(undefined))).toMatchObject({
       accepted: false,
       journal: {
         result: "failed",
-        reasons: ["citation_gate_missing", "differential_ratchet_missing"],
+        reasons: [
+          "citation_gate_missing",
+          "citation_receipt_missing",
+          "differential_ratchet_missing",
+        ],
       },
     });
 
@@ -101,29 +151,80 @@ describe("improvement proposal gate", () => {
     expect(evaluateImprovementProposalGate({
       citationGate: forgedCitation,
       ratchetInput: { ...ratchetInput(), unexpected: true },
-    })).toMatchObject({
+    }, receiptPorts(citationReceipt()))).toMatchObject({
       accepted: false,
       journal: {
-        reasons: ["citation_gate_invalid", "differential_ratchet_invalid"],
+        reasons: [
+          "citation_gate_invalid",
+          "citation_receipt_missing",
+          "differential_ratchet_invalid",
+        ],
       },
     });
   });
 
-  it("rejects failed citation evidence and stale proposal binding", () => {
+  it("requires a producer receipt and rejects self-sealed empty citation evidence", () => {
+    const decision = citationGate();
     expect(evaluateImprovementProposalGate({
-      citationGate: citationGate([]),
+      citationGate: decision,
       ratchetInput: ratchetInput(),
-    })).toMatchObject({
+    }, receiptPorts(undefined))).toMatchObject({
+      accepted: false,
+      journal: { reasons: ["citation_receipt_missing"] },
+    });
+    expect(evaluateImprovementProposalGate({
+      citationGate: decision,
+      ratchetInput: ratchetInput(),
+    }, receiptPorts({ ...citationReceipt(decision), receipt_hash: "f".repeat(64) }))).toMatchObject({
+      accepted: false,
+      journal: { reasons: ["citation_receipt_invalid"] },
+    });
+
+    const fabricatedWithoutHash = {
+      ...decision,
+      result: "passed",
+      outcome: "success",
+      reason: "all_citations_reproduced",
+      surviving_claim_ids: [],
+      dropped_claim_ids: [],
+      source_digests: [],
+    };
+    const { payload: _payload, hash: _hash, ...fabricatedPayloadValue } = fabricatedWithoutHash;
+    const payload = canonicalJson(fabricatedPayloadValue);
+    const fabricated = { ...fabricatedPayloadValue, payload, hash: digestNormalized(payload) };
+    expect(evaluateImprovementProposalGate({
+      citationGate: fabricated,
+      ratchetInput: ratchetInput(),
+    }, receiptPorts(citationReceipt()))).toMatchObject({
+      accepted: false,
+      journal: { reasons: ["citation_gate_invalid", "citation_receipt_missing"] },
+    });
+  });
+
+  it("rejects failed citation evidence and stale proposal binding", () => {
+    const failed = proposalGateInput([]);
+    expect(evaluateImprovementProposalGate(failed.input, failed.ports)).toMatchObject({
       accepted: false,
       journal: { reasons: ["citation_gate_failed"] },
     });
 
     const staleRatchet = ratchetInput();
     staleRatchet.tuner_authority!.proposal_digest = "f".repeat(64);
+    const exactCitation = citationGate();
     expect(evaluateImprovementProposalGate({
-      citationGate: citationGate(),
+      citationGate: exactCitation,
       ratchetInput: staleRatchet,
-    })).toMatchObject({
+    }, receiptPorts(citationReceipt(exactCitation)))).toMatchObject({
+      accepted: false,
+      journal: { reasons: ["citation_proposal_mismatch"] },
+    });
+
+    const unrelated = ratchetInput();
+    unrelated.id = "unrelated_proposal";
+    expect(evaluateImprovementProposalGate({
+      citationGate: exactCitation,
+      ratchetInput: unrelated,
+    }, receiptPorts(citationReceipt(exactCitation)))).toMatchObject({
       accepted: false,
       journal: { reasons: ["citation_proposal_mismatch"] },
     });
@@ -133,10 +234,11 @@ describe("improvement proposal gate", () => {
     const rejected = ratchetInput();
     rejected.proposed[0]!.artifact_digest = "f".repeat(64);
 
+    const exactCitation = citationGate();
     expect(evaluateImprovementProposalGate({
-      citationGate: citationGate(),
+      citationGate: exactCitation,
       ratchetInput: rejected,
-    })).toMatchObject({
+    }, receiptPorts(citationReceipt(exactCitation)))).toMatchObject({
       accepted: false,
       decision: {
         outcome: "reject",

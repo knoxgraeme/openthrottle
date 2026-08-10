@@ -665,6 +665,40 @@ describe("Stage C contract fixtures", () => {
     });
   });
 
+  it("rejects new command or tool invocations in tunable reference files", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: "---\nname: implement_unit\n---\n# Implement Unit\n## Craft\nWrite focused code.\n",
+      }, {
+        path: ".openthrottle/skills/implement_unit/references/method.md",
+        content: "Prefer focused evidence.\n",
+      }],
+    };
+    const proposed = structuredClone(skill);
+    proposed.files[1]!.content =
+      "Run shellcheck across the repository, then invoke the shell directly.\n";
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      ...repositorySkillPolicy(true),
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposed],
+    })).toMatchObject({
+      outcome: "reject",
+      reject_reasons: ["skill_immutable_changed"],
+      differences: [{
+        reason: "skill_immutable_changed",
+        path: "repository_skills.implement_unit.files..openthrottle/skills/implement_unit/references/method.md.command_or_tool_invocations",
+      }],
+    });
+  });
+
   it("rejects locked repository skills and immutable skill policy edits", () => {
     const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
       source: "ratchet",

@@ -14,11 +14,14 @@ import {
 
 export const IMPROVEMENT_PROPOSAL_POLICY_SCHEMA = "openthrottle.improvement-proposal-policy/v1" as const;
 export const IMPROVEMENT_PROPOSAL_JOURNAL_SCHEMA = "openthrottle.improvement-proposal-journal/v1" as const;
+export const IMPROVEMENT_PROPOSAL_BINDING_SCHEMA = "openthrottle.improvement-proposal-binding/v1" as const;
 
 export const IMPROVEMENT_PROPOSAL_GATE_REASONS = Object.freeze([
   "citation_gate_missing",
   "citation_gate_invalid",
   "citation_gate_failed",
+  "citation_receipt_missing",
+  "citation_receipt_invalid",
   "citation_proposal_mismatch",
   "differential_ratchet_missing",
   "differential_ratchet_invalid",
@@ -34,13 +37,28 @@ export interface ImprovementProposalRatchetJournal {
   decision: RatchetDecision;
 }
 
+export interface ImprovementProposalCitationReceipt {
+  id: string;
+  proposal_id: string;
+  proposal_hash: string;
+  gate_result: "passed" | "failed";
+  outcome: CitationGateDecision["outcome"];
+  reason: CitationGateDecision["reason"];
+  grade_hash: string;
+  payload: string;
+  receipt_hash: string;
+  created_at: string;
+}
+
 export interface ImprovementProposalJournal {
   schema: typeof IMPROVEMENT_PROPOSAL_JOURNAL_SCHEMA;
   result: "passed" | "failed";
   reasons: ImprovementProposalGateReason[];
   policy_digest: string;
   citation_gate: CitationGateDecision | null;
+  citation_receipt: ImprovementProposalCitationReceipt | null;
   differential_ratchet: ImprovementProposalRatchetJournal | null;
+  proposal_binding_digest: string | null;
   hash: string;
 }
 
@@ -50,8 +68,18 @@ export interface ImprovementProposalGateEvaluation {
   journal: ImprovementProposalJournal;
 }
 
+/**
+ * Trusted, immutable OPE-113 receipt source. The mutation producer supplies
+ * proposal data, never this capability; the OPE-115 application path wires it
+ * to CitationGateStore.
+ */
+export interface CitationGateReceiptLookup {
+  getCitationGateReceipt(proposalHash: string): unknown;
+}
+
 const SHA256 = /^[a-f0-9]{64}$/;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const MAX_RATCHET_INPUT_BYTES = 256 * 1024;
 
 function recordValue(value: unknown): Record<string, unknown> | null {
@@ -110,7 +138,13 @@ function validatedCitationGate(value: unknown): CitationGateDecision | null {
     !survivingClaimIds ||
     !droppedClaimIds ||
     !sourceDigests ||
+    sourceDigests.length === 0 ||
     (result === "passed") !== (outcome === "success") ||
+    (result === "passed" && survivingClaimIds.length === 0) ||
+    (result === "failed" && (survivingClaimIds.length !== 0 || droppedClaimIds.length === 0)) ||
+    (reason === "all_citations_reproduced" && (result !== "passed" || droppedClaimIds.length !== 0)) ||
+    (reason === "partial_claim_survival" && (result !== "passed" || droppedClaimIds.length === 0)) ||
+    ((reason === "no_claims_survived" || reason === "stale_evidence") && result !== "failed") ||
     new Set([...survivingClaimIds, ...droppedClaimIds]).size !== survivingClaimIds.length + droppedClaimIds.length ||
     canonicalJson(sourceDigests) !== canonicalJson([...new Set(sourceDigests)].sort())
   ) return null;
@@ -142,6 +176,43 @@ function validatedCitationGate(value: unknown): CitationGateDecision | null {
   };
 }
 
+function validatedCitationReceipt(
+  value: unknown,
+  decision: CitationGateDecision | null
+): ImprovementProposalCitationReceipt | null {
+  const input = recordValue(value);
+  if (!input || !decision || Object.keys(input).length !== 10) return null;
+  const expectedId = `citation-gate-${digestNormalized(
+    canonicalJson([decision.proposal_hash, decision.hash])
+  ).slice(0, 32)}`;
+  if (
+    input.id !== expectedId ||
+    input.proposal_id !== decision.proposal_id ||
+    input.proposal_hash !== decision.proposal_hash ||
+    input.gate_result !== decision.result ||
+    input.outcome !== decision.outcome ||
+    input.reason !== decision.reason ||
+    input.grade_hash !== decision.grade_hash ||
+    input.payload !== decision.payload ||
+    input.receipt_hash !== decision.hash ||
+    typeof input.created_at !== "string" ||
+    !RFC3339.test(input.created_at) ||
+    Number.isNaN(Date.parse(input.created_at))
+  ) return null;
+  return {
+    id: input.id,
+    proposal_id: decision.proposal_id,
+    proposal_hash: decision.proposal_hash,
+    gate_result: decision.result,
+    outcome: decision.outcome,
+    reason: decision.reason,
+    grade_hash: decision.grade_hash,
+    payload: decision.payload,
+    receipt_hash: decision.hash,
+    created_at: input.created_at,
+  };
+}
+
 function validatedRatchetInput(value: unknown): RatchetDifferentialInput | null {
   try {
     if (Buffer.byteLength(canonicalJson(value), "utf8") > MAX_RATCHET_INPUT_BYTES) return null;
@@ -160,6 +231,8 @@ function validatedRatchetInput(value: unknown): RatchetDifferentialInput | null 
 export function evaluateImprovementProposalGate(input: {
   citationGate: unknown;
   ratchetInput: unknown;
+}, ports: {
+  citationReceipts: CitationGateReceiptLookup;
 }): ImprovementProposalGateEvaluation {
   const reasons: ImprovementProposalGateReason[] = [];
   const citationGate = input.citationGate === null || input.citationGate === undefined
@@ -171,6 +244,22 @@ export function evaluateImprovementProposalGate(input: {
     reasons.push("citation_gate_invalid");
   } else if (citationGate.result !== "passed" || citationGate.outcome !== "success") {
     reasons.push("citation_gate_failed");
+  }
+  let rawCitationReceipt: unknown;
+  if (citationGate) {
+    try {
+      rawCitationReceipt = ports.citationReceipts.getCitationGateReceipt(citationGate.proposal_hash);
+    } catch {
+      rawCitationReceipt = undefined;
+    }
+  }
+  const citationReceipt = rawCitationReceipt === null || rawCitationReceipt === undefined
+    ? null
+    : validatedCitationReceipt(rawCitationReceipt, citationGate);
+  if (rawCitationReceipt === null || rawCitationReceipt === undefined) {
+    reasons.push("citation_receipt_missing");
+  } else if (!citationReceipt) {
+    reasons.push("citation_receipt_invalid");
   }
 
   const ratchetInput = input.ratchetInput === null || input.ratchetInput === undefined
@@ -188,17 +277,32 @@ export function evaluateImprovementProposalGate(input: {
 
   if (
     citationGate &&
-    ratchetInput?.tuner_authority &&
-    citationGate.proposal_hash !== ratchetInput.tuner_authority.proposal_digest
+    ratchetInput &&
+    (
+      citationGate.proposal_id !== ratchetInput.id ||
+      !ratchetInput.tuner_authority ||
+      citationGate.proposal_hash !== ratchetInput.tuner_authority.proposal_digest
+    )
   ) reasons.push("citation_proposal_mismatch");
 
   const differentialRatchet = ratchetInput && decision
     ? { input: ratchetInput, decision }
     : null;
+  const proposalBindingDigest = citationGate && citationReceipt && decision
+    ? digestNormalized(canonicalJson({
+      schema: IMPROVEMENT_PROPOSAL_BINDING_SCHEMA,
+      citation_decision_hash: citationGate.hash,
+      citation_receipt_id: citationReceipt.id,
+      citation_receipt_hash: citationReceipt.receipt_hash,
+      ratchet_input_digest: decision.input_digest,
+    }))
+    : null;
   const policy = {
     schema: IMPROVEMENT_PROPOSAL_POLICY_SCHEMA,
     citation_gate: citationGate,
+    citation_receipt: citationReceipt,
     differential_ratchet: differentialRatchet,
+    proposal_binding_digest: proposalBindingDigest,
   };
   const policyDigest = digestNormalized(canonicalJson(policy));
   const journalWithoutHash = {
@@ -207,7 +311,9 @@ export function evaluateImprovementProposalGate(input: {
     reasons,
     policy_digest: policyDigest,
     citation_gate: citationGate,
+    citation_receipt: citationReceipt,
     differential_ratchet: differentialRatchet,
+    proposal_binding_digest: proposalBindingDigest,
   };
   const journal: ImprovementProposalJournal = {
     ...journalWithoutHash,

@@ -804,10 +804,14 @@ to recreate this evidence, and must not treat citation receipts as authority to
 advance pipeline execution.
 
 The provider-neutral improvement-proposal gate composes an exact successful
-citation decision with one validated pinned-versus-proposed differential input.
-It binds the citation `proposal_hash` to `tuner_authority.proposal_digest`,
-recomputes the ratchet itself, and journals the exact validated inputs,
-repairable reasons, and deterministic policy digest. `core/tune@1` is the first
+citation decision and its matching persisted OPE-113 receipt with one validated
+pinned-versus-proposed differential input. It rejects self-sealed decision
+objects that lack the store-derived receipt, binds both citation `proposal_id`
+and `proposal_hash` to the ratchet identity and `tuner_authority.proposal_digest`,
+recomputes the ratchet itself, and seals a combined binding digest over the
+citation decision, receipt, and exact ratchet input digest. Its journal retains
+the exact validated inputs, repairable reasons, binding digest, and deterministic
+policy digest. `core/tune@1` is the first
 mutation-path caller: it must pass this gate before creating or mutating its
 proposal worktree. Ordinary structured candidate integration is unchanged and
 does not carry self-improvement evidence; any later proposal producer inherits
@@ -819,7 +823,9 @@ skill package tunability is bound to the matching exact config entry, where an
 absent `tunable` value means `true`; a config lock cannot be overridden by a
 caller-authored package wrapper. Frontmatter, canonical contract fences, and
 whole command/tool-allowlist subsections are immutable, including annotated
-JSON fences and nested allowlist entries. Human authority and tuner authority
+JSON fences and nested allowlist entries. Mutable reference files may change
+craft guidance but may not introduce new command, tool, MCP, or allowlist lines.
+Human authority and tuner authority
 must have distinct actor identities. `human_authority.approval_digest` names a
 human authority/lock record, not the tuner proposal subject; OPE-115 binds that
 record to its human-merge workflow, while the composed gate binds the tuner

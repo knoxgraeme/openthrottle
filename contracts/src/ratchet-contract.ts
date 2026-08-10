@@ -236,7 +236,7 @@ const SKILL_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$
 const FRONTMATTER_DELIMITER = "---";
 const CANONICAL_CONTRACT_SCHEMA = /"schema"\s*:\s*"openthrottle\.[^"]+"/;
 const COMMAND_OR_TOOL_ALLOWLIST = /\b(?:command|commands|tool|tools|mcp|allowlist|allowed_mcp_servers)\b/i;
-const COMMAND_OR_TOOL_INVOCATION = /(?:\b(?:run|execute|invoke|call|use)\s+`[^`]+`|\b(?:npm|npx|pnpm|yarn|bun|node|deno|python|pytest|cargo|go|make|docker|flyctl|curl|wget)\s+[A-Za-z0-9]|\bmcp__[A-Za-z0-9_]+\b)/i;
+const COMMAND_OR_TOOL_INVOCATION = /(?:\b(?:run|execute|invoke|call)\s+(?:the\s+)?(?:`[^`]+`|[A-Za-z0-9_.:/-]+)|\buse\s+(?:the\s+)?(?:`[^`]+`|command|tool|shell|terminal|cli|mcp)\b|\b(?:npm|npx|pnpm|yarn|bun|node|deno|python|pytest|cargo|go|make|docker|flyctl|curl|wget)\s+[A-Za-z0-9]|\bmcp__[A-Za-z0-9_]+\b)/i;
 const CRAFT_SECTION = /^##\s+(?:craft|reference|references|heuristic|heuristics|method|methods)\b/i;
 const FORBIDDEN_SKILL_TOKENS = [
   /\bce-[a-z][a-z-]*[a-z]\b/,
@@ -299,6 +299,13 @@ function immutableSkillLines(raw: string): string[] {
     ) immutable.push(line);
   }
   return immutable;
+}
+
+function commandOrToolInvocationLines(raw: string): string[] {
+  return raw
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .filter((line) => COMMAND_OR_TOOL_ALLOWLIST.test(line) || COMMAND_OR_TOOL_INVOCATION.test(line));
 }
 
 function compareSkillMdImmutableContent(
@@ -395,10 +402,20 @@ function compareRepositorySkillPackages(
       pushDifference(differences, "skill_immutable_changed", `repository_skills.${proposedSkill.id}`);
     }
     const pinnedPaths = new Set(pinnedSkill?.files.map((file) => file.path) ?? []);
+    const pinnedFiles = new Map(pinnedSkill?.files.map((file) => [file.path, file.content]) ?? []);
     for (const file of proposedSkill.files) {
       const path = `repository_skills.${proposedSkill.id}.files.${file.path}`;
       if (!pinnedPaths.has(file.path) && !isReferenceFile(file.path)) {
         pushDifference(differences, "skill_immutable_changed", path);
+      }
+      if (
+        isReferenceFile(file.path) &&
+        !isSubset(
+          commandOrToolInvocationLines(file.content),
+          commandOrToolInvocationLines(pinnedFiles.get(file.path) ?? "")
+        )
+      ) {
+        uniqueDifference(differences, "skill_immutable_changed", `${path}.command_or_tool_invocations`);
       }
       if (Buffer.byteLength(file.content, "utf8") > SKILL_FILE_MAX_BYTES) {
         pushDifference(differences, "skill_bounds_exceeded", path);
