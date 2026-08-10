@@ -1,15 +1,20 @@
 import Database from "better-sqlite3";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
 import type { PipelineUnitPhaseBinding } from "../../pipeline/manifest.js";
 import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
 import type { GateReceiptReason } from "../../pipeline/gates.js";
 import { openDb } from "../database.js";
+import { createPipelineStore } from "./create-store.js";
 import { createExecutionUnitStore, type ExecutionUnitStore } from "./unit-store.js";
 import { executionLedgerLines } from "../../pipeline/execution-publication.js";
 
 let db: Database.Database | undefined;
 let timestamp = "2026-07-29T00:00:00.000Z";
+const temporaryDirectories: string[] = [];
 
 function gateDecision(overrides: {
   gateKind: ExecutionGateDecision["gateKind"];
@@ -210,8 +215,8 @@ function completeUnitToTerminal(store: ExecutionUnitStore, subject: string, comm
   });
 }
 
-function setup(): ReturnType<typeof createExecutionUnitStore> {
-  db = openDb(":memory:");
+function setup(path = ":memory:"): ReturnType<typeof createExecutionUnitStore> {
+  db = openDb(path);
   db.exec(`
     INSERT INTO tickets (
       linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
@@ -266,6 +271,9 @@ function setup(): ReturnType<typeof createExecutionUnitStore> {
 afterEach(() => {
   db?.close();
   db = undefined;
+  for (const directory of temporaryDirectories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
   timestamp = "2026-07-29T00:00:00.000Z";
 });
 
@@ -3295,7 +3303,10 @@ describe("execution unit store", () => {
   });
 
   it("does not duplicate a child-publication event when an already-recorded gate decision replays from persisted state", () => {
-    const store = setup();
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-unit-replay-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "supervisor.db");
+    const store = setup(databasePath);
     const subject = "1".repeat(40);
     store.createGraph({
       pipelineInstanceId: "instance-1",
@@ -3324,13 +3335,23 @@ describe("execution unit store", () => {
     expect(afterCommit.outbox.map((row) => row.sequence)).toEqual([1]);
     expect(publicationEvents("attempt-parent")).toHaveLength(1);
 
-    const restartedStore = createExecutionUnitStore(db!, () => timestamp);
-    // A crash-and-restart drain replays the same completed gate transition from
-    // durable state. The real completion API must recognize the existing gate
-    // receipt and skip routing/event emission entirely.
+    db!.close();
+    db = undefined;
+
+    db = openDb(databasePath);
+    const restartedStore = createPipelineStore(db);
+    // A crash-and-restart replay re-applies the same completed gate transition from
+    // a freshly opened SQLite connection through the production schema and
+    // composed pipeline-store paths. The real completion API must recognize the
+    // existing gate receipt and skip routing/event emission entirely.
     restartedStore.completeGatedAction(completion);
 
-    expect(replayProjectionSnapshot(restartedStore, "attempt-parent")).toEqual(afterCommit);
+    const afterReplay = replayProjectionSnapshot(restartedStore, "attempt-parent");
+    expect(afterReplay).toEqual(afterCommit);
+    expect(afterReplay.events).toHaveLength(1);
+    expect(afterReplay.outbox).toHaveLength(1);
+    expect(afterReplay.actionOrdinals).toEqual(afterCommit.actionOrdinals);
+    expect(afterReplay.ledger).toEqual(afterCommit.ledger);
   });
 
   it("rejects a gate decision reason outside the closed vocabulary before any receipt or publication event is durably recorded, then succeeds on retry", () => {
