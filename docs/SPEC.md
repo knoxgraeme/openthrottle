@@ -803,6 +803,42 @@ transition, reducer, and effect-drain code must not import the analysis store
 to recreate this evidence, and must not treat citation receipts as authority to
 advance pipeline execution.
 
+The provider-neutral improvement-proposal gate composes an exact successful
+citation decision and its matching persisted OPE-113 receipt with one validated
+pinned-versus-proposed differential input. It rejects self-sealed decision
+objects that lack the store-derived receipt, binds both citation `proposal_id`
+and `proposal_hash` to the ratchet identity and `tuner_authority.proposal_digest`,
+recomputes the ratchet itself, and seals a combined binding digest over the
+citation decision, receipt, and exact ratchet input digest. Its journal retains
+the exact validated inputs, repairable reasons, binding digest, and deterministic
+policy digest. `core/tune@1` is the first
+mutation-path caller: it must pass this gate before creating or mutating its
+proposal worktree. Ordinary structured candidate integration is unchanged and
+does not carry self-improvement evidence; any later proposal producer inherits
+the same pre-mutation call requirement.
+
+For config comparison, absent repository limits resolve to the runtime defaults
+(`max_turns=200`, `task_timeout=7200`) before monotonic comparison. Repository
+skill package tunability is bound to the matching exact config entry, where an
+absent `tunable` value means `true`; a config lock cannot be overridden by a
+caller-authored package wrapper. Frontmatter, canonical contract fences, and
+whole command/tool-allowlist subsections are immutable, including annotated
+JSON fences and nested allowlist entries. Agent policy files and all non-craft
+package files outside `references/` are byte-immutable. These sealed config,
+graph, policy, and allowlist fields are the capability-authority boundary;
+craft and reference prose is behavioral guidance and remains subject to the
+required human merge authority. Markdown executable surfaces in references
+(fenced or indented command blocks and inline code) are preserved exactly, and
+a conservative deterministic lint rejects obvious new command/tool invocation
+text. That lint is defense in depth, not a claim that arbitrary natural-language
+guidance can prove the absence of an invocation; only the sealed runtime
+capability boundary provides that guarantee.
+Human authority and tuner authority
+must have distinct actor identities. `human_authority.approval_digest` names a
+human authority/lock record, not the tuner proposal subject; OPE-115 binds that
+record to its human-merge workflow, while the composed gate binds the tuner
+proposal to citation evidence.
+
 Stage C child-unit work must add any needed live binding state to the owning
 unit/work records rather than reviving empty historical binding tables.
 For the serial `for_each_unit` composite stage, `execution_graphs` binds one

@@ -5,7 +5,14 @@ import { digestCanonicalJson } from "./canonical.js";
 import { parseRepositoryConfigContract } from "./config.js";
 import { parseExecutionPlanContract } from "./execution-plan.js";
 import { parseGraphContract } from "./graph.js";
-import { parseCitationContractProposal, parseStandardReceipt, validateStandardReceipt } from "./index.js";
+import {
+  decideDifferentialRatchet,
+  parseCitationContractProposal,
+  parseRatchetDifferentialInput,
+  parseStandardReceipt,
+  validateRatchetDecision,
+  validateStandardReceipt,
+} from "./index.js";
 
 const fixtureRoot = new URL("../fixtures", import.meta.url);
 
@@ -17,6 +24,22 @@ function invalidFixtures(): string[] {
   return readdirSync(join(fixtureRoot.pathname, "invalid")).filter((name) => name.endsWith(".json")).sort();
 }
 
+function repositorySkillPolicy(tunable: boolean): {
+  pinned_config: ReturnType<typeof parseRepositoryConfigContract>["value"];
+  proposed_config: ReturnType<typeof parseRepositoryConfigContract>["value"];
+} {
+  const pinnedConfig = parseRepositoryConfigContract(readFixture("valid", "config-repository.json")).value;
+  pinnedConfig.skills = [{
+    id: "implement_unit",
+    path: ".openthrottle/skills/implement_unit",
+    tunable,
+  }];
+  return {
+    pinned_config: pinnedConfig,
+    proposed_config: structuredClone(pinnedConfig),
+  };
+}
+
 function parseByName(name: string, raw: string): unknown {
   if (name.startsWith("config-")) return parseRepositoryConfigContract(raw, { source: name });
   if (name.startsWith("citation-contract")) return parseCitationContractProposal(raw, { source: name });
@@ -24,6 +47,7 @@ function parseByName(name: string, raw: string): unknown {
   if (name === "execution-plan.json" || name.startsWith("execution-plan-")) {
     return parseExecutionPlanContract(raw, { source: name });
   }
+  if (name.startsWith("ratchet-contract")) return parseRatchetDifferentialInput(raw, { source: name });
   if (name.startsWith("receipt-")) return parseStandardReceipt(raw, { source: name });
   throw new Error(`unrouted fixture ${name}`);
 }
@@ -60,6 +84,9 @@ const invalidCases = [
   ["execution-plan-cycle.json", /depends_on: creates a cycle/],
   ["execution-plan-bad-ref.json", /depends_on: references an unknown unit/],
   ["execution-plan-invalid-command.json", /commands\[0\]\.name: has an invalid format/],
+  ["ratchet-contract-duplicate-artifact.json", /pinned: must not contain duplicates/],
+  ["ratchet-contract-invalid-authority.json", /tuner_authority\.proposal_digest: has an invalid format/],
+  ["ratchet-contract-unknown-field.json", /pinned\[0\]\.digest: unknown field/],
   ["receipt-bad-skill-ref.json", /producer\.skill: has an invalid format/],
   ["receipt-skill-traversal.json", /producer\.skill: has an invalid format/],
   ["receipt-semantic-assurance-upgrade.json", /assurance: semantic receipts cannot claim/],
@@ -131,6 +158,7 @@ describe("Stage C contract fixtures", () => {
       "citation-contract.json",
       "graph-structured.json",
       "execution-plan.json",
+      "ratchet-contract.json",
       "receipt-unit-completion.json",
       "receipt-unit-decision.json",
       "receipt-repository-skill.json",
@@ -154,6 +182,215 @@ describe("Stage C contract fixtures", () => {
     proposal.dispositions[0]!.citation_ids = [];
     expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
       .toThrow(/dispositions\[0\]\.citation_ids: must contain between 1 and 32 entries/);
+  });
+
+  it("returns stable ratchet rejection reasons for proposed-versus-pinned differences", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const accepted = decideDifferentialRatchet(parsed.value);
+    expect(accepted.outcome).toBe("accept");
+    expect(accepted.reject_reasons).toEqual([]);
+    expect(accepted.differences).toEqual([]);
+    expect(validateRatchetDecision(accepted).digest).toBeTruthy();
+
+    const changed = structuredClone(parsed.value);
+    changed.proposed[0]!.artifact_digest = "f".repeat(64);
+    changed.proposed[0]!.kind = "review";
+    changed.proposed[0]!.provenance_digest = "e".repeat(64);
+    changed.proposed.push({
+      id: "extra_review",
+      kind: "review",
+      artifact_digest: "d".repeat(64),
+      provenance_digest: "c".repeat(64),
+    });
+    changed.human_authority = null;
+
+    expect(decideDifferentialRatchet(changed)).toMatchObject({
+      outcome: "reject",
+      reject_reasons: [
+        "artifact_digest_changed",
+        "artifact_kind_changed",
+        "provenance_digest_changed",
+        "missing_pinned_artifact",
+        "human_authority_missing",
+      ],
+      differences: [
+        { reason: "artifact_digest_changed", artifact_id: "unit_receipt" },
+        { reason: "artifact_kind_changed", artifact_id: "unit_receipt" },
+        { reason: "provenance_digest_changed", artifact_id: "unit_receipt" },
+        { reason: "missing_pinned_artifact", artifact_id: "extra_review" },
+        { reason: "human_authority_missing" },
+      ],
+    });
+  });
+
+  it("bounds complete ratchet differences while retaining every rejection reason", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const bounded = structuredClone(parsed.value);
+    bounded.pinned = Array.from({ length: 64 }, (_, index) => ({
+      id: `pinned_${index}`,
+      kind: "standard_receipt" as const,
+      artifact_digest: "a".repeat(64),
+      provenance_digest: "b".repeat(64),
+    }));
+    bounded.proposed = Array.from({ length: 64 }, (_, index) => ({
+      id: `proposed_${index}`,
+      kind: "review" as const,
+      artifact_digest: "c".repeat(64),
+      provenance_digest: "d".repeat(64),
+    }));
+    bounded.human_authority = null;
+    bounded.tuner_authority = null;
+
+    const decision = decideDifferentialRatchet(bounded);
+    expect(decision.outcome).toBe("reject");
+    expect(decision.differences).toHaveLength(128);
+    expect(decision.reject_reasons).toEqual([
+      "missing_proposed_artifact",
+      "missing_pinned_artifact",
+      "human_authority_missing",
+      "tuner_authority_missing",
+    ]);
+    expect(decision.differences).toEqual(expect.arrayContaining([
+      { reason: "human_authority_missing" },
+      { reason: "tuner_authority_missing" },
+    ]));
+    expect(validateRatchetDecision(decision).value).toEqual(decision);
+  });
+
+  it("distinguishes human and tuner authority by actor identity, not unrelated digest roles", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const sameDigest = structuredClone(parsed.value);
+    sameDigest.human_authority!.approval_digest = sameDigest.tuner_authority!.proposal_digest;
+    expect(decideDifferentialRatchet(sameDigest)).toMatchObject({
+      outcome: "accept",
+      reject_reasons: [],
+    });
+
+    const sameActor = structuredClone(parsed.value);
+    sameActor.human_authority!.actor_id = sameActor.tuner_authority!.tuner_id;
+    expect(decideDifferentialRatchet(sameActor)).toMatchObject({
+      outcome: "reject",
+      reject_reasons: ["authority_conflict"],
+      differences: [{ reason: "authority_conflict" }],
+    });
+  });
+
+  it("accepts monotonic repository config and graph policy shrinkage", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const pinnedConfig = parseRepositoryConfigContract(readFixture("valid", "config-repository.json")).value;
+    const proposedConfig = structuredClone(pinnedConfig);
+    pinnedConfig.limits = { max_turns: 200, task_timeout: 7200 };
+    proposedConfig.limits = { max_turns: 100, task_timeout: 3600 };
+    pinnedConfig.mcp_servers = { github: { command: "mcp-github" } };
+    proposedConfig.mcp_servers = {};
+    proposedConfig.commands = {
+      ...proposedConfig.commands,
+      audit: "npm audit --audit-level high",
+    };
+
+    const pinnedGraph = parseGraphContract(readFixture("valid", "graph-structured.json"), {
+      config: pinnedConfig,
+    }).value;
+    const proposedGraph = structuredClone(pinnedGraph);
+    proposedGraph.workers[0]!.credentials = ["repo.read"];
+    proposedGraph.loops[0]!.timeout_seconds = 1800;
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_config: pinnedConfig,
+      proposed_config: proposedConfig,
+      pinned_graph: pinnedGraph,
+      proposed_graph: proposedGraph,
+    })).toMatchObject({
+      outcome: "accept",
+      reject_reasons: [],
+      differences: [],
+    });
+  });
+
+  it("rejects non-monotonic config policy with stable reasons", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const pinnedConfig = parseRepositoryConfigContract(readFixture("valid", "config-repository.json")).value;
+    const proposedConfig = structuredClone(pinnedConfig);
+    proposedConfig.limits = { max_turns: 201, task_timeout: 7201 };
+    delete proposedConfig.commands!.test;
+    delete proposedConfig.test;
+    proposedConfig.mcp_servers = { github: { command: "mcp-github" } };
+
+    const pinnedGraph = parseGraphContract(readFixture("valid", "graph-structured.json"), {
+      config: pinnedConfig,
+    }).value;
+    const proposedGraph = structuredClone(pinnedGraph);
+    proposedGraph.workers[0]!.credentials = ["repo.read", "model.invoke", "provider.read", "mcp"];
+    proposedGraph.workers[0]!.allowed_mcp_servers = ["github"];
+    proposedGraph.nodes[0]!.phases = proposedGraph.nodes[0]!.phases!.filter((phase) => phase.id !== "command");
+
+    const decision = decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_config: pinnedConfig,
+      proposed_config: proposedConfig,
+      pinned_graph: pinnedGraph,
+      proposed_graph: proposedGraph,
+    });
+
+    expect(decision.outcome).toBe("reject");
+    expect(decision.reject_reasons).toEqual(expect.arrayContaining([
+      "credential_scope_expanded",
+      "mcp_scope_expanded",
+      "gate_weakened",
+      "resource_limit_increased",
+    ]));
+    expect(decision.differences).toEqual(expect.arrayContaining([
+      { reason: "resource_limit_increased", path: "config.limits.max_turns" },
+      { reason: "resource_limit_increased", path: "config.limits.task_timeout" },
+      { reason: "gate_weakened", path: "config.commands.test" },
+      { reason: "mcp_scope_expanded", path: "config.mcp_servers.github" },
+      { reason: "credential_scope_expanded", path: "graph.workers.implementer.credentials" },
+      { reason: "mcp_scope_expanded", path: "graph.workers.implementer.allowed_mcp_servers" },
+      { reason: "gate_weakened", path: "graph.nodes.implement.phases[1]" },
+    ]));
+    expect(validateRatchetDecision(decision).digest).toBeTruthy();
+  });
+
+  it("compares absent repository limits against their canonical runtime defaults", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const pinnedConfig = parseRepositoryConfigContract(readFixture("valid", "config-repository.json")).value;
+    delete pinnedConfig.limits;
+
+    const monotonicConfig = structuredClone(pinnedConfig);
+    monotonicConfig.limits = { max_turns: 100, task_timeout: 3_600 };
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_config: pinnedConfig,
+      proposed_config: monotonicConfig,
+    })).toMatchObject({ outcome: "accept", reject_reasons: [] });
+
+    const increasedConfig = structuredClone(pinnedConfig);
+    increasedConfig.limits = { max_turns: 201, task_timeout: 7_201 };
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_config: pinnedConfig,
+      proposed_config: increasedConfig,
+    })).toMatchObject({
+      outcome: "reject",
+      reject_reasons: ["resource_limit_increased"],
+      differences: [
+        { reason: "resource_limit_increased", path: "config.limits.max_turns" },
+        { reason: "resource_limit_increased", path: "config.limits.task_timeout" },
+      ],
+    });
   });
 
   it("rejects unsupported timestamps and normalizes equivalent ISO offsets", () => {
@@ -338,9 +575,9 @@ describe("Stage C contract fixtures", () => {
 
   it("validates repository skill references against config allowlisted directories", () => {
     const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
-      skills?: Array<{ id: string; path: string }>;
+      skills?: Array<{ id: string; path: string; tunable?: boolean }>;
     };
-    config.skills = [{ id: "implement_unit", path: ".openthrottle/skills/implement_unit" }];
+    config.skills = [{ id: "implement_unit", path: ".openthrottle/skills/implement_unit", tunable: false }];
     const parsedConfig = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
     expect(parsedConfig.value.skills).toEqual(config.skills);
 
@@ -374,6 +611,458 @@ describe("Stage C contract fixtures", () => {
     config.skills = [{ id: "bad", path: ".openthrottle/skills/not-bad" }];
     expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
       .toThrow(/config\.skills\[0\]\.path: must be exactly \.openthrottle\/skills\/bad/);
+  });
+
+  it("lets the ratchet accept only craft and reference edits in tunable repository skills", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: [
+          "---",
+          "name: implement_unit",
+          "description: Implements one unit",
+          "---",
+          "# Implement Unit",
+          "## Authority Fence",
+          "Do not commit.",
+          "```json",
+          "{\"schema\":\"openthrottle.receipt/v1\",\"type\":\"unit_completion\"}",
+          "```",
+          "## Craft",
+          "Prefer the smallest correct increment.",
+          "## Command Allowlist",
+          "Allowed commands: test, build.",
+        ].join("\n"),
+      }, {
+        path: ".openthrottle/skills/implement_unit/agents/openai.yaml",
+        content: "tools: [shell]\n",
+      }, {
+        path: ".openthrottle/skills/implement_unit/references/method.md",
+        content: "Original reference guidance.",
+      }],
+    };
+    const proposedSkill = structuredClone(skill);
+    proposedSkill.files[0]!.content = proposedSkill.files[0]!.content.replace(
+      "Prefer the smallest correct increment.",
+      "Prefer focused edits with evidence."
+    );
+    proposedSkill.files[2]!.content = "Updated reference guidance.";
+    proposedSkill.files.push({
+      path: ".openthrottle/skills/implement_unit/references/observations.md",
+      content: "Additional reference guidance.",
+    });
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      ...repositorySkillPolicy(true),
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposedSkill],
+    })).toMatchObject({
+      outcome: "accept",
+      reject_reasons: [],
+      differences: [],
+    });
+  });
+
+  it.each([
+    "```sh\ngit push origin main\n```\n",
+    "Launch shellcheck across the repository.\n",
+    "Issue `git push origin main`.\n",
+    "    rm worktree\n",
+    "     rm worktree\n",
+    "        rm worktree\n",
+    "\t  rm worktree\n",
+    "> ```sh\n> rm worktree\n> ```\n",
+    "-     rm worktree\n",
+  ])("defense-in-depth rejects an obvious executable reference surface: %s", (guidance) => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: "---\nname: implement_unit\n---\n# Implement Unit\n## Craft\nWrite focused code.\n",
+      }, {
+        path: ".openthrottle/skills/implement_unit/references/method.md",
+        content: "Prefer focused evidence.\n",
+      }],
+    };
+    const proposed = structuredClone(skill);
+    proposed.files[1]!.content = guidance;
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      ...repositorySkillPolicy(true),
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposed],
+    })).toMatchObject({
+      outcome: "reject",
+      reject_reasons: ["skill_immutable_changed"],
+      differences: [{
+        reason: "skill_immutable_changed",
+        path: "repository_skills.implement_unit.files..openthrottle/skills/implement_unit/references/method.md.executable_guidance_lint",
+      }],
+    });
+  });
+
+  it.each([" ", "  ", "   "])(
+    "keeps a %s-space prose indent tunable because it is not an indented code block",
+    (indent) => {
+      const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+        source: "ratchet",
+      });
+      const skill = {
+        id: "implement_unit",
+        tunable: true,
+        files: [{
+          path: ".openthrottle/skills/implement_unit/SKILL.md",
+          content: "---\nname: implement_unit\n---\n# Implement Unit\n## Craft\nPrefer focused evidence.\n",
+        }, {
+          path: ".openthrottle/skills/implement_unit/references/method.md",
+          content: "Original reference guidance.\n",
+        }],
+      };
+      const proposed = structuredClone(skill);
+      proposed.files[1]!.content = `${indent}Additional reference guidance.\n`;
+
+      expect(decideDifferentialRatchet({
+        ...parsed.value,
+        ...repositorySkillPolicy(true),
+        pinned_repository_skills: [skill],
+        proposed_repository_skills: [proposed],
+      })).toMatchObject({ outcome: "accept", reject_reasons: [] });
+    }
+  );
+
+  it("rejects locked repository skills and immutable skill policy edits", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: false,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: [
+          "---",
+          "name: implement_unit",
+          "description: Implements one unit",
+          "---",
+          "# Implement Unit",
+          "## Authority Fence",
+          "Do not commit.",
+          "## Craft",
+          "Prefer the smallest correct increment.",
+          "## Command Allowlist",
+          "Allowed commands: test, build.",
+        ].join("\n"),
+      }, {
+        path: ".openthrottle/skills/implement_unit/agents/openai.yaml",
+        content: "tools: [shell]\n",
+      }],
+    };
+    const lockedEdit = structuredClone(skill);
+    lockedEdit.files[0]!.content = lockedEdit.files[0]!.content.replace("increment", "step");
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      ...repositorySkillPolicy(false),
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [lockedEdit],
+    })).toMatchObject({
+      outcome: "reject",
+      reject_reasons: ["skill_locked"],
+      differences: [{ reason: "skill_locked", path: "repository_skills.implement_unit" }],
+    });
+
+    const tunable = { ...skill, tunable: true };
+    const proposed = structuredClone(tunable);
+    proposed.tunable = false;
+    proposed.files[0]!.content = proposed.files[0]!.content
+      .replace("Do not commit.", "Commit when finished.")
+      .replace("Allowed commands: test, build.", "Allowed commands: test.");
+    proposed.files[1]!.content = "tools: [shell, network]\n";
+
+    const decision = decideDifferentialRatchet({
+      ...parsed.value,
+      ...repositorySkillPolicy(true),
+      pinned_repository_skills: [tunable],
+      proposed_repository_skills: [proposed],
+    });
+    expect(decision.outcome).toBe("reject");
+    expect(decision.reject_reasons).toEqual(["skill_immutable_changed"]);
+    expect(decision.differences).toEqual(expect.arrayContaining([
+      { reason: "skill_immutable_changed", path: "repository_skills.implement_unit.tunable" },
+      { reason: "skill_immutable_changed", path: "repository_skills.implement_unit.SKILL.md.immutable_sections" },
+      {
+        reason: "skill_immutable_changed",
+        path: "repository_skills.implement_unit.files..openthrottle/skills/implement_unit/agents/openai.yaml",
+      },
+    ]));
+  });
+
+  it("rejects repository skill edits with forbidden tokens or oversized files", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: "---\nname: implement_unit\n---\n# Implement Unit\n## Craft\nWrite code.\n",
+      }],
+    };
+    const proposed = structuredClone(skill);
+    proposed.files[0]!.content = proposed.files[0]!.content.replace("Write code.", "Call ce-work first.");
+    proposed.files.push({
+      path: ".openthrottle/skills/implement_unit/references/oversized.md",
+      content: "a".repeat(64 * 1024 + 1),
+    });
+
+    const decision = decideDifferentialRatchet({
+      ...parsed.value,
+      ...repositorySkillPolicy(true),
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposed],
+    });
+    expect(decision.outcome).toBe("reject");
+    expect(decision.reject_reasons).toEqual(expect.arrayContaining([
+      "skill_bounds_exceeded",
+      "skill_forbidden_token",
+    ]));
+  });
+
+  it.each([
+    "Call AskUserQuestion before editing.",
+    "Invoke `mcp__github__create_issue` before editing.",
+    "Run npm audit before editing.",
+  ])("rejects a new interactive or command invocation in craft: %s", (instruction) => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: "---\nname: implement_unit\n---\n# Implement Unit\n## Craft\nWrite focused code.\n",
+      }],
+    };
+    const proposed = structuredClone(skill);
+    proposed.files[0]!.content = proposed.files[0]!.content.replace("Write focused code.", instruction);
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      ...repositorySkillPolicy(true),
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposed],
+    })).toMatchObject({ outcome: "reject" });
+  });
+
+  it("keeps nested command and tool allowlist subsections immutable", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: [
+          "---",
+          "name: implement_unit",
+          "---",
+          "# Implement Unit",
+          "## Craft",
+          "Prefer focused edits.",
+          "### Tool allowlist",
+          "- shell",
+          "- filesystem",
+          "### Heuristics",
+          "Keep patches small.",
+        ].join("\n"),
+      }],
+    };
+    const proposed = structuredClone(skill);
+    proposed.files[0]!.content = proposed.files[0]!.content
+      .replace("- filesystem", "- network")
+      .replace("Keep patches small.", "Prefer cohesive patches.");
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      ...repositorySkillPolicy(true),
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposed],
+    })).toMatchObject({
+      outcome: "reject",
+      reject_reasons: ["skill_immutable_changed"],
+      differences: [{
+        reason: "skill_immutable_changed",
+        path: "repository_skills.implement_unit.SKILL.md.immutable_sections",
+      }],
+    });
+  });
+
+  it("keeps annotated canonical contract fences immutable inside craft sections", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: [
+          "---",
+          "name: implement_unit",
+          "---",
+          "# Implement Unit",
+          "## Method",
+          "```json openthrottle.receipt/v1",
+          "{\"schema\":\"openthrottle.receipt/v1\",\"type\":\"unit_completion\"}",
+          "```",
+          "Tune this explanation.",
+        ].join("\n"),
+      }],
+    };
+    const proposed = structuredClone(skill);
+    proposed.files[0]!.content = proposed.files[0]!.content
+      .replace("unit_completion", "semantic_review")
+      .replace("Tune this explanation.", "Prefer concise explanations.");
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      ...repositorySkillPolicy(true),
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposed],
+    })).toMatchObject({
+      outcome: "reject",
+      reject_reasons: ["skill_immutable_changed"],
+      differences: expect.arrayContaining([{
+        reason: "skill_immutable_changed",
+        path: "repository_skills.implement_unit.SKILL.md.canonical_contract_blocks",
+      }]),
+    });
+  });
+
+  it("binds package tunability to the exact repository config", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const pinnedConfig = parseRepositoryConfigContract(readFixture("valid", "config-repository.json")).value;
+    pinnedConfig.skills = [{
+      id: "implement_unit",
+      path: ".openthrottle/skills/implement_unit",
+      tunable: false,
+    }];
+    const proposedConfig = structuredClone(pinnedConfig);
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: "---\nname: implement_unit\n---\n# Implement Unit\n## Craft\nWrite code.\n",
+      }],
+    };
+    const proposed = structuredClone(skill);
+    proposed.files[0]!.content = proposed.files[0]!.content.replace("Write code.", "Write focused code.");
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_config: pinnedConfig,
+      proposed_config: proposedConfig,
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposed],
+    })).toMatchObject({
+      outcome: "reject",
+      reject_reasons: ["skill_immutable_changed"],
+      differences: [{
+        reason: "skill_immutable_changed",
+        path: "repository_skills.implement_unit.tunable_binding",
+      }],
+    });
+  });
+
+  it("rejects skill policy without sealed config authority and package paths outside their skill", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: "---\nname: implement_unit\n---\n# Implement Unit\n## Craft\nWrite code.\n",
+      }],
+    };
+    const proposed = structuredClone(skill);
+    proposed.files[0]!.content = proposed.files[0]!.content.replace("Write code.", "Write focused code.");
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposed],
+    })).toMatchObject({
+      outcome: "reject",
+      reject_reasons: ["skill_immutable_changed"],
+      differences: [{
+        reason: "skill_immutable_changed",
+        path: "repository_skills.tunable_binding",
+      }],
+    });
+
+    const escaped = structuredClone(proposed);
+    escaped.files.push({
+      path: ".openthrottle/skills/another_skill/references/injected.md",
+      content: "Injected reference.",
+    });
+    expect(() => decideDifferentialRatchet({
+      ...parsed.value,
+      ...repositorySkillPolicy(true),
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [escaped],
+    })).toThrow(/must stay within \.openthrottle\/skills\/implement_unit/);
+  });
+
+  it.each([
+    ["missing", "name: implement_unit\n## Craft\nWrite code.\n"],
+    ["unterminated", "---\nname: implement_unit\n## Craft\nWrite code.\n"],
+  ])("rejects %s proposed skill frontmatter without throwing", (_label, proposedContent) => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: "---\nname: implement_unit\n---\n# Implement Unit\n## Craft\nWrite code.\n",
+      }],
+    };
+    const proposed = structuredClone(skill);
+    proposed.files[0]!.content = proposedContent;
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      ...repositorySkillPolicy(true),
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposed],
+    })).toMatchObject({
+      outcome: "reject",
+      reject_reasons: ["skill_immutable_changed"],
+      differences: expect.arrayContaining([{
+        reason: "skill_immutable_changed",
+        path: "repository_skills.implement_unit.SKILL.md.frontmatter",
+      }]),
+    });
   });
 
   it("rejects provider-secret identifiers in config values and headers", () => {
