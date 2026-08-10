@@ -3127,6 +3127,58 @@ describe("execution unit store", () => {
     }));
   }
 
+  type ReplayPublicationEventRow = {
+    id: string;
+    sequence: number;
+    kind: string;
+    unit_id: string | null;
+    body: string;
+    linear_outbox_id: string;
+  };
+  type ReplayOutboxRow = {
+    id: string;
+    sequence: number;
+    kind: string;
+    payload_hash: string;
+    status: string;
+  };
+  type ReplayActionOrdinalRow = {
+    id: string;
+    attempt_ordinal: number;
+    action_kind: string;
+    status: string;
+  };
+
+  function replayProjectionSnapshot(store: ExecutionUnitStore, parentAttemptId: string): {
+    events: ReplayPublicationEventRow[];
+    outbox: ReplayOutboxRow[];
+    actionOrdinals: ReplayActionOrdinalRow[];
+    ledger: string[];
+  } {
+    const snapshot = store.getStructuredExecutionPublication(parentAttemptId);
+    expect(snapshot).toBeDefined();
+    return {
+      events: db!.prepare(`
+        SELECT id, sequence, kind, unit_id, body, linear_outbox_id
+        FROM execution_publication_events
+        WHERE parent_attempt_id = ?
+        ORDER BY sequence ASC
+      `).all(parentAttemptId) as ReplayPublicationEventRow[],
+      outbox: db!.prepare(`
+        SELECT id, sequence, kind, payload_hash, status
+        FROM linear_outbox
+        ORDER BY sequence ASC, id ASC
+      `).all() as ReplayOutboxRow[],
+      actionOrdinals: db!.prepare(`
+        SELECT id, attempt_ordinal, action_kind, status
+        FROM execution_work_attempts
+        WHERE parent_attempt_id = ?
+        ORDER BY attempt_ordinal ASC, id ASC
+      `).all(parentAttemptId) as ReplayActionOrdinalRow[],
+      ledger: executionLedgerLines(snapshot!),
+    };
+  }
+
   it("durably records ordered child-publication events across repair, settlement, final review, and aggregate", () => {
     const store = setup();
     const subject = "1".repeat(40);
@@ -3242,7 +3294,7 @@ describe("execution unit store", () => {
     ]);
   });
 
-  it("does not duplicate a child-publication event when an already-recorded gate decision replays", () => {
+  it("does not duplicate a child-publication event when an already-recorded gate decision replays from persisted state", () => {
     const store = setup();
     const subject = "1".repeat(40);
     store.createGraph({
@@ -3263,13 +3315,22 @@ describe("execution unit store", () => {
     store.completeUnitAction({ actionId: candidate.id, resultHash: "rc", outputSubject: subject, receipt: receiptJson("candidate_evidence") });
     const lead = lease(store);
     const decision = gateDecision({ gateKind: "unit_acceptance", outcome: "semantic_repair_required", subject, reason: "command_exit_nonzero" });
-    store.completeGatedAction({ actionId: lead.id, resultHash: "rl", outputSubject: subject, decision });
-    // Replaying the identical gate decision on the already-completed action must
-    // short-circuit before routing/event-emission runs again (see the
-    // "already_recorded" guard in completeGatedAction).
-    store.completeGatedAction({ actionId: lead.id, resultHash: "rl", outputSubject: subject, decision });
+    const completion = { actionId: lead.id, resultHash: "rl", outputSubject: subject, decision };
+    store.completeGatedAction(completion);
 
+    const afterCommit = replayProjectionSnapshot(store, "attempt-parent");
+
+    expect(afterCommit.events.map((event) => event.sequence)).toEqual([1]);
+    expect(afterCommit.outbox.map((row) => row.sequence)).toEqual([1]);
     expect(publicationEvents("attempt-parent")).toHaveLength(1);
+
+    const restartedStore = createExecutionUnitStore(db!, () => timestamp);
+    // A crash-and-restart drain replays the same completed gate transition from
+    // durable state. The real completion API must recognize the existing gate
+    // receipt and skip routing/event emission entirely.
+    restartedStore.completeGatedAction(completion);
+
+    expect(replayProjectionSnapshot(restartedStore, "attempt-parent")).toEqual(afterCommit);
   });
 
   it("rejects a gate decision reason outside the closed vocabulary before any receipt or publication event is durably recorded, then succeeds on retry", () => {
