@@ -156,7 +156,7 @@ function parseClaim(value: unknown, path: string): CitationContractClaim {
   return {
     id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
     text: stringAt(input.text, `${path}.text`, { max: 2_000 }),
-    citation_ids: parseIdentifierList(input.citation_ids, `${path}.citation_ids`, 32),
+    citation_ids: parseIdentifierList(input.citation_ids, `${path}.citation_ids`, 32, 1),
   };
 }
 
@@ -166,7 +166,7 @@ function parseDisposition(value: unknown, path: string): CitationContractDisposi
     claim_id: stringAt(input.claim_id, `${path}.claim_id`, { pattern: IDENTIFIER }),
     disposition: enumAt(input.disposition, `${path}.disposition`, CLAIM_DISPOSITIONS),
     rationale: stringAt(input.rationale, `${path}.rationale`, { max: 2_000 }),
-    citation_ids: parseIdentifierList(input.citation_ids, `${path}.citation_ids`, 32),
+    citation_ids: parseIdentifierList(input.citation_ids, `${path}.citation_ids`, 32, 1),
   };
 }
 
@@ -180,10 +180,10 @@ function parseGrade(value: unknown, path: string): CitationContractGrade {
   };
 }
 
-function parseIdentifierList(value: unknown, path: string, max: number): string[] {
+function parseIdentifierList(value: unknown, path: string, max: number, min = 0): string[] {
   return unique(arrayAt(value, path, (entry, entryPath) => {
     return stringAt(entry, entryPath, { pattern: IDENTIFIER });
-  }, { max }), path);
+  }, { min, max }), path);
 }
 
 function validateReferences(proposal: CitationContractProposal, source: string): void {

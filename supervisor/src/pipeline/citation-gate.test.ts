@@ -103,6 +103,57 @@ describe("citation gate", () => {
     });
   });
 
+  it.each(["contradicted", "insufficient", "not_applicable"] as const)(
+    "drops a claim whose disposition is %s even when every citation reproduces",
+    (disposition) => {
+      const input = proposal();
+      input.claims = [{ id: "claim_one", text: "First claim.", citation_ids: ["citation_one"] }];
+      input.dispositions = [
+        { claim_id: "claim_one", disposition, rationale: "The claim is not supported.", citation_ids: ["citation_one"] },
+      ];
+      input.grades = [{ id: "overall", value: "fail", disposition_claim_ids: ["claim_one"], rationale: "Dropped." }];
+
+      expect(evaluateCitationGate({
+        proposal: input,
+        proposalHash: "c".repeat(64),
+        resolvedCitations: [
+          { id: "citation_one", actual_result: [run] },
+          { id: "citation_two", actual_result: [] },
+        ],
+      })).toMatchObject({
+        result: "failed",
+        outcome: "failure",
+        reason: "no_claims_survived",
+        surviving_claim_ids: [],
+        dropped_claim_ids: ["claim_one"],
+      });
+    }
+  );
+
+  it("drops a supported claim when evidence cited by its disposition does not reproduce", () => {
+    const input = proposal();
+    input.claims = [{ id: "claim_one", text: "First claim.", citation_ids: ["citation_one"] }];
+    input.dispositions = [
+      {
+        claim_id: "claim_one",
+        disposition: "supported",
+        rationale: "Both citations are required.",
+        citation_ids: ["citation_one", "citation_two"],
+      },
+    ];
+    input.grades = [{ id: "overall", value: "pass", disposition_claim_ids: ["claim_one"], rationale: "Supported." }];
+
+    expect(gradeCitationContractProposal(input, [
+      { id: "citation_one", actual_result: [run] },
+      { id: "citation_two", actual_result: [{ ...run, outcome: "shipped", closed_reason: "success" }] },
+    ])).toMatchObject({
+      result: "fail",
+      surviving_claim_ids: [],
+      dropped_claim_ids: ["claim_one"],
+      claims: [{ id: "claim_one", result: "dropped", citation_ids: ["citation_one", "citation_two"] }],
+    });
+  });
+
   it("rejects incomplete resolved citation input instead of querying analysis itself", () => {
     expect(() => gradeCitationContractProposal(proposal(), [
       { id: "citation_one", actual_result: [run] },

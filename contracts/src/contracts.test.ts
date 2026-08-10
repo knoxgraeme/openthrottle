@@ -29,6 +29,7 @@ function parseByName(name: string, raw: string): unknown {
 }
 
 const invalidCases = [
+  ["citation-contract-empty-claim-citations.json", /claims\[0\]\.citation_ids: must contain between 1 and 32 entries/],
   ["citation-contract-unknown-citation.json", /claims\.claim_one\.citation_ids: references an unknown citation/],
   ["citation-contract-unknown-field.json", /claims\[0\]\.confidence: unknown field/],
   ["citation-contract-unbounded-query.json", /query\.limit: must be an integer between 1 and 200/],
@@ -141,6 +142,18 @@ describe("Stage C contract fixtures", () => {
       expect(JSON.parse(validated.normalized)).toEqual(validated.value);
       expect(validated.digest).toBe(digestCanonicalJson(validated.value));
     }
+  });
+
+  it("requires claims and their dispositions to cite evidence", () => {
+    const raw = readFixture("valid", "citation-contract.json");
+    const proposal = JSON.parse(raw) as {
+      claims: Array<{ citation_ids: string[] }>;
+      dispositions: Array<{ citation_ids: string[] }>;
+    };
+
+    proposal.dispositions[0]!.citation_ids = [];
+    expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+      .toThrow(/dispositions\[0\]\.citation_ids: must contain between 1 and 32 entries/);
   });
 
   it("keeps map ordering irrelevant while preserving authored array order", () => {

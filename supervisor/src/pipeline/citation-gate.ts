@@ -85,11 +85,20 @@ export function gradeCitationContractProposal(
   const reproducedCitationIds = new Set(
     citations.filter((citation) => citation.result === "reproduced").map((citation) => citation.id)
   );
-  const claims = proposal.claims.map((claim): CitationGradeClaim => ({
-    id: claim.id,
-    result: claim.citation_ids.every((citationId) => reproducedCitationIds.has(citationId)) ? "survived" : "dropped",
-    citation_ids: claim.citation_ids,
-  }));
+  const dispositionByClaimId = new Map(
+    proposal.dispositions.map((disposition) => [disposition.claim_id, disposition])
+  );
+  const claims = proposal.claims.map((claim): CitationGradeClaim => {
+    const disposition = dispositionByClaimId.get(claim.id);
+    if (!disposition) throw new Error(`disposition for claim ${claim.id} is missing`);
+    const citationIds = [...new Set([...claim.citation_ids, ...disposition.citation_ids])];
+    const citationsReproduced = citationIds.every((citationId) => reproducedCitationIds.has(citationId));
+    return {
+      id: claim.id,
+      result: disposition.disposition === "supported" && citationsReproduced ? "survived" : "dropped",
+      citation_ids: citationIds,
+    };
+  });
   const survivingClaimIds = claims.filter((claim) => claim.result === "survived").map((claim) => claim.id);
   const droppedClaimIds = claims.filter((claim) => claim.result === "dropped").map((claim) => claim.id);
 
