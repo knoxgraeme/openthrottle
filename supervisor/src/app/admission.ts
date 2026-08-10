@@ -74,6 +74,11 @@ interface ContextSection {
   text: string;
 }
 
+interface ParsedLinearContextSections {
+  sections: ContextSection[];
+  error?: string;
+}
+
 interface BoundedTaskContext {
   context: string;
   selectionContext: string;
@@ -109,25 +114,40 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return output;
 }
 
-function linearContextSections(context: string): ContextSection[] {
-  const pattern = new RegExp(
-    `(^|\\n)<(${LINEAR_CONTEXT_SECTION_KINDS.join("|")})\\b[^>]*>`,
+function invalidLinearContextShapeMessage(): string {
+  return "Linear prompt context has an invalid top-level section structure. Expected either exactly one issue " +
+    "for an assignment-created delegation, or exactly one issue followed by exactly one primary directive, " +
+    "then an optional parent issue and comment threads. No sandbox was provisioned.";
+}
+
+function linearContextSections(context: string): ParsedLinearContextSections {
+  const tokenPattern = new RegExp(
+    `</?(${LINEAR_CONTEXT_SECTION_KINDS.join("|")})\\b[^>]*>`,
     "gi"
   );
   const sections: ContextSection[] = [];
-  let consumedUntil = 0;
-  for (const match of context.matchAll(pattern)) {
-    const start = match.index! + (match[1] ? 1 : 0);
-    if (start < consumedUntil) continue;
-    const kind = match[2]!.toLowerCase() as ContextSectionKind;
-    const close = `</${kind}>`;
-    const closeStart = context.indexOf(close, start + match[0]!.length);
-    if (closeStart === -1) continue;
-    const end = closeStart + close.length;
-    sections.push({ kind, text: context.slice(start, end) });
-    consumedUntil = end;
+  const stack: Array<{ kind: ContextSectionKind; start: number }> = [];
+  for (const match of context.matchAll(tokenPattern)) {
+    const raw = match[0]!;
+    const kind = match[1]!.toLowerCase() as ContextSectionKind;
+    const closing = raw.startsWith("</");
+    if (!closing) {
+      stack.push({ kind, start: match.index! });
+      continue;
+    }
+    const open = stack.at(-1);
+    if (!open || open.kind !== kind) {
+      return { sections, error: invalidLinearContextShapeMessage() };
+    }
+    stack.pop();
+    if (stack.length === 0) {
+      sections.push({ kind, text: context.slice(open.start, match.index! + raw.length) });
+    }
   }
-  return sections;
+  if (stack.length > 0) {
+    return { sections, error: invalidLinearContextShapeMessage() };
+  }
+  return { sections };
 }
 
 function contextSectionsOf(sections: ContextSection[], kind: ContextSectionKind): ContextSection[] {
@@ -135,7 +155,11 @@ function contextSectionsOf(sections: ContextSection[], kind: ContextSectionKind)
 }
 
 function hasCanonicalLinearContextShape(sections: ContextSection[]): boolean {
-  if (sections.length < 2 || sections[0]?.kind !== "issue" ||
+  if (sections.length === 1) {
+    return sections[0]?.kind === "issue";
+  }
+  if (sections.length < 2 ||
+      sections[0]?.kind !== "issue" ||
       sections[1]?.kind !== "primary-directive-thread") {
     return false;
   }
@@ -159,6 +183,38 @@ function hasCanonicalLinearContextShape(sections: ContextSection[]): boolean {
     return false;
   }
   return true;
+}
+
+function stripNestedLinearContextSections(section: ContextSection): ContextSection {
+  const tokenPattern = new RegExp(
+    `</?(${LINEAR_CONTEXT_SECTION_KINDS.join("|")})\\b[^>]*>`,
+    "gi"
+  );
+  const tokens = [...section.text.matchAll(tokenPattern)];
+  if (tokens.length <= 2) return section;
+  const spans: Array<{ start: number; end: number }> = [];
+  const stack: Array<{ kind: ContextSectionKind; start: number }> = [];
+  for (const match of tokens) {
+    const raw = match[0]!;
+    const kind = match[1]!.toLowerCase() as ContextSectionKind;
+    const closing = raw.startsWith("</");
+    if (!closing) {
+      stack.push({ kind, start: match.index! });
+      continue;
+    }
+    const open = stack.at(-1);
+    if (!open || open.kind !== kind) return section;
+    stack.pop();
+    if (stack.length === 1 && open.start > 0) {
+      spans.push({ start: open.start, end: match.index! + raw.length });
+    }
+  }
+  if (spans.length === 0) return section;
+  let text = section.text;
+  for (const span of spans.reverse()) {
+    text = `${text.slice(0, span.start)}${text.slice(span.end)}`;
+  }
+  return { ...section, text: text.trim() };
 }
 
 function withoutSections(context: string, sections: ContextSection[]): string {
@@ -198,28 +254,38 @@ function parentIssueSummary(section: ContextSection): string {
     : truncateUtf8(body, PARENT_ISSUE_CONTEXT_LIMIT + 500);
 }
 
-function composeBoundedOrdinaryTaskContext(rawContext: string): BoundedTaskContext {
+function composeBoundedOrdinaryTaskContext(
+  rawContext: string,
+  options: { requireLinearSections?: boolean } = {}
+): BoundedTaskContext {
   const sanitized = sanitizeText(rawContext);
   const originalBytes = utf8Bytes(sanitized);
-  const sections = linearContextSections(sanitized);
-  if (sections.length > 0 && !hasCanonicalLinearContextShape(sections)) {
+  const parsed = linearContextSections(sanitized);
+  const sections = parsed.sections;
+  if (parsed.error || (sections.length > 0 && !hasCanonicalLinearContextShape(sections))) {
     return {
       context: sanitized,
       selectionContext: "",
-      selectionError:
-        "Linear prompt context has an invalid top-level section structure. Expected exactly one issue followed by " +
-        "exactly one primary directive, then an optional parent issue and comment threads. No sandbox was provisioned.",
+      selectionError: parsed.error ?? invalidLinearContextShapeMessage(),
     };
   }
-  const issueSections = contextSectionsOf(sections, "issue");
+  const rawIssueSections = contextSectionsOf(sections, "issue");
+  const issueSections = rawIssueSections.map(stripNestedLinearContextSections);
   const directiveSections = contextSectionsOf(sections, "primary-directive-thread");
-  if (issueSections.length === 0 || directiveSections.length === 0) {
+  if (issueSections.length === 0) {
+    if (options.requireLinearSections) {
+      return {
+        context: sanitized,
+        selectionContext: "",
+        selectionError: invalidLinearContextShapeMessage(),
+      };
+    }
     return {
       context: sanitized,
       selectionContext: sanitized,
       ordinaryLimitError: originalBytes > ORDINARY_STAGE_TASK_CONTEXT_LIMIT
         ? `Task context exceeds ${ORDINARY_STAGE_TASK_CONTEXT_LIMIT} bytes for an ordinary stage pipeline, ` +
-          "and OpenThrottle could not identify both the issue description and primary directive to preserve. " +
+          "and OpenThrottle could not identify the child issue to preserve. " +
           "No sandbox was provisioned."
         : undefined,
     };
@@ -229,19 +295,17 @@ function composeBoundedOrdinaryTaskContext(rawContext: string): BoundedTaskConte
   const otherThreadSections = contextSectionsOf(sections, "other-thread");
   const parentSectionCount = parentSections.length;
   const knownSections = [
-    ...issueSections,
+    ...rawIssueSections,
     ...directiveSections,
     ...parentSections,
     ...otherThreadSections,
   ];
   const remaining = withoutSections(sanitized, knownSections);
-  if (hasLinearContextStructuralDelimiter(remaining)) {
+  if (remaining || hasLinearContextStructuralDelimiter(remaining)) {
     return {
       context: sanitized,
       selectionContext: "",
-      selectionError:
-        "Linear prompt context has an invalid top-level section structure. Expected exactly one issue followed by " +
-        "exactly one primary directive, then an optional parent issue and comment threads. No sandbox was provisioned.",
+      selectionError: invalidLinearContextShapeMessage(),
     };
   }
   const parentSummaries = parentSections.map(parentIssueSummary);
@@ -257,13 +321,9 @@ function composeBoundedOrdinaryTaskContext(rawContext: string): BoundedTaskConte
       context: sanitized,
       selectionContext,
       ordinaryLimitError:
-        `Task context required content exceeds ${ORDINARY_STAGE_TASK_CONTEXT_LIMIT} bytes for an ordinary stage pipeline. ` +
+        `Task context required content exceeds ${ORDINARY_STAGE_TASK_CONTEXT_LIMIT} bytes. ` +
         "Reduce the issue description or primary directive. No sandbox was provisioned.",
     };
-  }
-
-  if (originalBytes <= ORDINARY_STAGE_TASK_CONTEXT_LIMIT) {
-    return { context: sanitized, selectionContext };
   }
 
   const keptParentSummaries: string[] = [];
@@ -290,17 +350,23 @@ function composeBoundedOrdinaryTaskContext(rawContext: string): BoundedTaskConte
     ...keptParentSummaries,
     ...keptOptional.map((section) => section.text),
   ].join("\n\n").trim();
+  const boundedBytes = utf8Bytes(context);
+  const pruning = originalBytes !== boundedBytes ||
+    otherThreadSections.length !== keptOptional.length ||
+    parentSectionCount > 0
+    ? {
+      originalBytes,
+      boundedBytes,
+      droppedOtherThreads: otherThreadSections.length - keptOptional.length,
+      droppedParentSections: parentSectionCount,
+      summarizedParentSections: keptParentSummaries.length,
+    }
+    : undefined;
 
   return {
     context,
     selectionContext,
-    pruning: {
-      originalBytes,
-      boundedBytes: utf8Bytes(context),
-      droppedOtherThreads: otherThreadSections.length - keptOptional.length,
-      droppedParentSections: parentSectionCount,
-      summarizedParentSections: keptParentSummaries.length,
-    },
+    pruning,
   };
 }
 
@@ -407,10 +473,6 @@ function effectiveStructuredWorkerAgents(manifest: ValidatedPipelineManifest, se
     }
   }
   return agents;
-}
-
-function manifestUsesCompositeRuntime(manifest: ValidatedPipelineManifest): boolean {
-  return manifest.manifest.stages.some((stage) => stage.executor.kind === "loop_action");
 }
 
 function extractShipSelectionGraphId(context: string): string | undefined {
@@ -697,6 +759,7 @@ export async function handleCreated(
     payload,
     `# ${issue.identifier}\n\nNo Linear prompt context was supplied for this delegation.`
   );
+  const hasSuppliedPromptContext = Boolean(payload.promptContext?.trim());
   await providers.activityPublisher.publishActivity({
     sessionId,
     type: "thought",
@@ -820,7 +883,9 @@ export async function handleCreated(
     manifest: ValidatedPipelineManifest;
     snapshot: ReturnType<PipelineStore["saveRepositoryConfigSnapshot"]>;
   };
-  const boundedTaskContext = composeBoundedOrdinaryTaskContext(initialContext);
+  const boundedTaskContext = composeBoundedOrdinaryTaskContext(initialContext, {
+    requireLinearSections: hasSuppliedPromptContext,
+  });
   try {
     if (boundedTaskContext.selectionError) {
       throw new Error(boundedTaskContext.selectionError);
@@ -879,7 +944,7 @@ export async function handleCreated(
     if (pipelineUsesOpenCodeLoopActions(manifest, selectedAgent)) {
       throw new Error("OpenCode structured loop actions are not supported yet. No sandbox was provisioned.");
     }
-    if (!manifestUsesCompositeRuntime(manifest) && boundedTaskContext.ordinaryLimitError) {
+    if (boundedTaskContext.ordinaryLimitError) {
       throw new Error(boundedTaskContext.ordinaryLimitError);
     }
     const snapshot = coordinator.store.saveRepositoryConfigSnapshot({
@@ -931,16 +996,14 @@ export async function handleCreated(
         runtime: coordinator.runtime,
         authorizedCapabilities: pinned.manifest.manifest.requires.capabilities,
         taskType,
-        taskContext: manifestUsesCompositeRuntime(pinned.manifest)
-          ? sanitizeText(initialContext)
-          : boundedTaskContext.context,
+        taskContext: boundedTaskContext.context,
       },
     });
   } catch (error) {
     await failSelection(error);
     return;
   }
-  if (!manifestUsesCompositeRuntime(pinned.manifest) && boundedTaskContext.pruning) {
+  if (boundedTaskContext.pruning) {
     coordinator.store.recordJournalEntry({
       issueId: issue.id,
       actor: "supervisor",
