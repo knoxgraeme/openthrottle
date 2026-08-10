@@ -1,11 +1,17 @@
 import type {
   ReviewFinding,
+  ReviewFindingContract,
   ReviewPolicyContract,
   SemanticReviewReceipt,
 } from "@openthrottle/contracts";
 import {
+  REVIEW_FINDING_SCHEMA,
   REVIEW_POLICY_SCHEMA,
+  deriveReviewFindingId,
+  deriveReviewSemanticGroupId,
   digestCanonicalJson,
+  isStableReviewClaimDiscriminator,
+  isSpecificReviewSemanticAnchor,
 } from "@openthrottle/contracts";
 import { canonicalJson, digestNormalized, type StageOutcome } from "./manifest.js";
 
@@ -381,11 +387,78 @@ function receiptHash(receipt: SemanticReviewReceipt): string {
   return digestNormalized(canonicalJson(receipt));
 }
 
+const REVIEW_FINDING_IDENTITY = /^\[([^#\]]+)#([^|:\]]+)\|([^:\]]+): ([^\]]+)\]/;
+const REVIEW_SEVERITY_RANK = { P0: 0, P1: 1, P2: 2, P3: 3 } as const;
+
+function compareStableText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+export function contractReviewFinding(input: {
+  finding: ReviewFinding;
+  personaId: ReviewPersonaId;
+  evidence: readonly string[];
+  invariant: string;
+}): ReviewFindingContract {
+  const match = REVIEW_FINDING_IDENTITY.exec(input.finding.message);
+  if (!match) {
+    throw new Error(
+      `review finding from ${input.personaId} lacks a stable [path#anchor|claim-discriminator: invariant] identity`
+    );
+  }
+  const [, identityPath, rawSemanticAnchor, claimDiscriminator, violatedInvariant] = match;
+  const path = input.finding.path ?? identityPath!;
+  if (path !== identityPath) throw new Error(`review finding from ${input.personaId} has conflicting identity paths`);
+  const semanticAnchor = rawSemanticAnchor!.trim();
+  if (
+    semanticAnchor !== rawSemanticAnchor ||
+    !isSpecificReviewSemanticAnchor(semanticAnchor)
+  ) {
+    throw new Error(`review finding from ${input.personaId} needs a sufficiently specific stable semantic anchor`);
+  }
+  if (!isStableReviewClaimDiscriminator(claimDiscriminator!)) {
+    throw new Error(`review finding from ${input.personaId} needs a stable lowercase kebab-case claim discriminator`);
+  }
+  if (violatedInvariant !== input.invariant) {
+    throw new Error(`review finding from ${input.personaId} must use its sealed invariant`);
+  }
+  const identity = {
+    path,
+    semantic_anchor: semanticAnchor,
+    claim_discriminator: claimDiscriminator!,
+    violated_invariant: violatedInvariant!,
+  };
+  return {
+    schema: REVIEW_FINDING_SCHEMA,
+    finding_id: deriveReviewFindingId(identity),
+    persona_id: input.personaId,
+    severity: input.finding.severity,
+    ...identity,
+    message: input.finding.message,
+    evidence: [...input.evidence],
+  };
+}
+
+export function compareReviewFindingRepresentatives(
+  left: ReviewFindingContract,
+  right: ReviewFindingContract
+): number {
+  const severity = REVIEW_SEVERITY_RANK[left.severity] - REVIEW_SEVERITY_RANK[right.severity];
+  if (severity !== 0) return severity;
+  const findingId = compareStableText(left.finding_id, right.finding_id);
+  if (findingId !== 0) return findingId;
+  return compareStableText(
+    canonicalJson({ severity: left.severity, message: left.message, path: left.path }),
+    canonicalJson({ severity: right.severity, message: right.message, path: right.path })
+  );
+}
+
 function findingKey(finding: ReviewFinding): string {
+  const identityPath = REVIEW_FINDING_IDENTITY.exec(finding.message)?.[1];
   return digestCanonicalJson({
     severity: finding.severity,
     message: finding.message,
-    path: finding.path ?? null,
+    path: finding.path ?? identityPath ?? null,
   });
 }
 
@@ -426,7 +499,7 @@ export function synthesizeReviewFanout(input: {
   const missing = expectedIds.filter((personaId) => !receiptsByPersona.has(personaId));
   if (missing.length > 0) throw new Error(`review fanout missing personas: ${missing.join(", ")}`);
 
-  const findings = new Map<string, ReviewFinding>();
+  const findingGroups = new Map<string, { representative: ReviewFinding; contract: ReviewFindingContract }>();
   let outcome: StageOutcome = "success";
   for (const personaId of expectedIds) {
     const receipt = receiptsByPersona.get(personaId)!;
@@ -437,11 +510,20 @@ export function synthesizeReviewFanout(input: {
       throw new Error(`review fanout receipt ${personaId} exceeds max_findings ${persona.max_findings}`);
     }
     for (const finding of receipt.payload.findings) {
-      const key = findingKey(finding);
-      if (!findings.has(key)) findings.set(key, finding);
+      const contract = contractReviewFinding({
+        finding,
+        personaId,
+        evidence: receipt.evidence,
+        invariant: persona.invariant,
+      });
+      const semanticGroupId = deriveReviewSemanticGroupId(contract);
+      const group = findingGroups.get(semanticGroupId);
+      if (!group || compareReviewFindingRepresentatives(contract, group.contract) < 0) {
+        findingGroups.set(semanticGroupId, { representative: finding, contract });
+      }
     }
   }
-  if (outcome === "success" && findings.size > 0) outcome = "semantic_repair_required";
+  if (outcome === "success" && findingGroups.size > 0) outcome = "semantic_repair_required";
   return {
     schema: REVIEW_FANOUT_SYNTHESIS_SCHEMA,
     roster_digest: input.plan.roster_digest,
@@ -451,7 +533,7 @@ export function synthesizeReviewFanout(input: {
     summary: outcome === "success"
       ? "All review personas completed without findings."
       : "Review personas completed and synthesis requires follow-up.",
-    findings: [...findings.values()],
+    findings: [...findingGroups.values()].map((group) => group.representative),
     receipt_hashes: [
       ...(input.plan.selector_receipt_hash ? [input.plan.selector_receipt_hash] : []),
       ...expectedIds.map((personaId) => receiptHash(receiptsByPersona.get(personaId)!)),

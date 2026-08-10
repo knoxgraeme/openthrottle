@@ -1,16 +1,13 @@
 import {
-  REVIEW_FINDING_SCHEMA,
   REVIEW_JOURNAL_SCHEMA,
   REVIEW_REPAIR_DISPOSITION_SCHEMA,
   REVIEW_ROSTER_SCHEMA,
   REVIEW_SELECTION_SCHEMA,
   REVIEW_SYNTHESIS_SCHEMA,
   REVIEW_VALIDATION_SCHEMA,
-  deriveReviewFindingId,
   deriveReviewSemanticGroupId,
   digestCanonicalJson,
   validateReviewJournalContract,
-  type ReviewFinding,
   type ReviewFindingContract,
   type ReviewJournalContract,
   type ReviewPersonaReceiptEvidence,
@@ -22,42 +19,14 @@ import {
 } from "@openthrottle/contracts";
 import { canonicalJson, digestNormalized } from "./manifest.js";
 import {
+  compareReviewFindingRepresentatives,
+  contractReviewFinding,
   reviewFindingKey,
   reviewPolicyContract,
   type ReviewFanoutPlan,
   type ReviewPersonaId,
   type ValidatedReviewFanout,
 } from "./review-fanout.js";
-
-function contractFinding(input: {
-  finding: ReviewFinding;
-  personaId: ReviewPersonaId;
-  evidence: readonly string[];
-  invariant: string;
-}): ReviewFindingContract {
-  const match = /^\[([^#\]]+)#([^:\]]+): ([^\]]+)\]/.exec(input.finding.message);
-  if (!match) throw new Error(`review finding from ${input.personaId} lacks a stable [path#anchor: invariant] identity`);
-  const [, identityPath, semanticAnchor, violatedInvariant] = match;
-  const path = input.finding.path ?? identityPath!;
-  if (path !== identityPath) throw new Error(`review finding from ${input.personaId} has conflicting identity paths`);
-  if (violatedInvariant !== input.invariant) {
-    throw new Error(`review finding from ${input.personaId} must use its sealed invariant`);
-  }
-  const identity = {
-    path,
-    semantic_anchor: semanticAnchor!,
-    violated_invariant: violatedInvariant!,
-  };
-  return {
-    schema: REVIEW_FINDING_SCHEMA,
-    finding_id: deriveReviewFindingId(identity),
-    persona_id: input.personaId,
-    severity: input.finding.severity,
-    ...identity,
-    message: input.finding.message,
-    evidence: [...input.evidence],
-  };
-}
 
 function journalOutcome(outcome: ValidatedReviewFanout["synthesis"]["outcome"]): ReviewSynthesisContract["outcome"] {
   if (outcome === "success" || outcome === "semantic_repair_required" || outcome === "failure" || outcome === "needs_human") {
@@ -104,7 +73,7 @@ export function buildReviewJournal(input: {
     const personaId = receipt.producer.worker_id as ReviewPersonaId;
     const persona = planPersonas.get(personaId);
     if (!persona) throw new Error(`review journal received unknown persona ${personaId}`);
-    const findings = receipt.payload.findings.map((finding) => contractFinding({
+    const findings = receipt.payload.findings.map((finding) => contractReviewFinding({
       finding,
       personaId,
       evidence: receipt.evidence,
@@ -122,31 +91,31 @@ export function buildReviewJournal(input: {
       cost_microusd: null,
     };
   });
-  const currentFindings = new Map<string, ReviewFindingContract>();
   const semanticGroups = new Map<string, {
     canonical: ReviewFindingContract;
     memberIds: Set<string>;
-    currentMemberIds: Set<string>;
     fixedByAbsence: boolean;
   }>();
-  const severityRank = { P0: 0, P1: 1, P2: 2, P3: 3 } as const;
+  const currentGroupByFindingId = new Map<string, string>();
   for (const persona of input.plan.personas) {
     for (const finding of findingsByPersona.get(persona.id) ?? []) {
-      if (!currentFindings.has(finding.finding_id)) currentFindings.set(finding.finding_id, finding);
       const semanticGroupId = deriveReviewSemanticGroupId(finding);
+      const existingGroupId = currentGroupByFindingId.get(finding.finding_id);
+      if (existingGroupId && existingGroupId !== semanticGroupId) {
+        throw new Error(`current review finding ${finding.finding_id} split across semantic groups`);
+      }
+      currentGroupByFindingId.set(finding.finding_id, semanticGroupId);
       const group = semanticGroups.get(semanticGroupId);
       if (!group) {
         semanticGroups.set(semanticGroupId, {
           canonical: finding,
           memberIds: new Set([finding.finding_id]),
-          currentMemberIds: new Set([finding.finding_id]),
           fixedByAbsence: false,
         });
         continue;
       }
       group.memberIds.add(finding.finding_id);
-      group.currentMemberIds.add(finding.finding_id);
-      if (severityRank[finding.severity] < severityRank[group.canonical.severity]) group.canonical = finding;
+      if (compareReviewFindingRepresentatives(finding, group.canonical) < 0) group.canonical = finding;
     }
   }
   if (input.previousJournal) {
@@ -157,7 +126,17 @@ export function buildReviewJournal(input: {
       if (resolution.state !== "unresolved") continue;
       const finding = previousFindings.get(resolution.finding_id);
       if (!finding) throw new Error(`previous review journal lost unresolved finding ${resolution.finding_id}`);
-      const currentGroup = semanticGroups.get(resolution.semantic_group_id);
+      const matchedGroupIds = new Set<string>();
+      if (semanticGroups.has(resolution.semantic_group_id)) matchedGroupIds.add(resolution.semantic_group_id);
+      for (const findingId of [resolution.finding_id, ...resolution.semantic_dedup_finding_ids]) {
+        const semanticGroupId = currentGroupByFindingId.get(findingId);
+        if (semanticGroupId) matchedGroupIds.add(semanticGroupId);
+      }
+      if (matchedGroupIds.size > 1) {
+        throw new Error(`previous semantic finding group ${resolution.semantic_group_id} split across current groups`);
+      }
+      const currentGroupId = [...matchedGroupIds][0];
+      const currentGroup = currentGroupId ? semanticGroups.get(currentGroupId) : undefined;
       if (currentGroup) {
         for (const findingId of resolution.semantic_dedup_finding_ids) currentGroup.memberIds.add(findingId);
         continue;
@@ -165,7 +144,6 @@ export function buildReviewJournal(input: {
       semanticGroups.set(resolution.semantic_group_id, {
         canonical: finding,
         memberIds: new Set(resolution.semantic_dedup_finding_ids),
-        currentMemberIds: new Set(),
         fixedByAbsence: true,
       });
     }
@@ -179,7 +157,9 @@ export function buildReviewJournal(input: {
     summary: carriedResolvedGroupCount > 0
       ? `${input.validation.synthesis.summary} ${carriedResolvedGroupCount} prior semantic finding group(s) are absent on exact-roster rereview.`
       : input.validation.synthesis.summary,
-    findings: [...semanticGroups.values()].map((group) => group.canonical),
+    findings: [...semanticGroups.entries()]
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([, group]) => group.canonical),
   };
   const validation: ReviewValidationContract = {
     schema: REVIEW_VALIDATION_SCHEMA,
@@ -192,50 +172,56 @@ export function buildReviewJournal(input: {
   const repairDisposition = {
     schema: REVIEW_REPAIR_DISPOSITION_SCHEMA,
     synthesis_digest: digestCanonicalJson(synthesis),
-    dispositions: [...semanticGroups.entries()].map(([, group]) => {
-      const members = [...group.currentMemberIds].map((findingId) => currentFindings.get(findingId)!);
-      const blocking = members.filter((finding) => finding.severity === "P0" || finding.severity === "P1");
-      const hasAcceptedBlocker = blocking.some((finding) => acceptedBlocking.has(reviewFindingKey(finding)));
-      const allBlockersRejected = blocking.length > 0 && blocking.every((finding) => rejectedBlocking.has(reviewFindingKey(finding)));
-      const hasAdvisory = members.some((finding) => finding.severity === "P2" || finding.severity === "P3");
-      const disposition = group.fixedByAbsence ? "fixed" as const
-        : hasAcceptedBlocker ? "accepted" as const
-          : allBlockersRejected && !hasAdvisory ? "rejected" as const
-            : "deferred" as const;
+    dispositions: [...semanticGroups.entries()]
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([, group]) => {
+        const representativeKey = reviewFindingKey(group.canonical);
+        const representativeIsBlocking = group.canonical.severity === "P0" || group.canonical.severity === "P1";
+        const representativeAccepted = acceptedBlocking.has(representativeKey);
+        const representativeRejected = rejectedBlocking.has(representativeKey);
+        if (!group.fixedByAbsence && representativeIsBlocking && representativeAccepted === representativeRejected) {
+          throw new Error(`blocking review representative ${group.canonical.finding_id} needs exactly one validator disposition`);
+        }
+        const disposition = group.fixedByAbsence ? "fixed" as const
+          : representativeAccepted ? "accepted" as const
+            : representativeRejected ? "rejected" as const
+              : "deferred" as const;
+        return {
+          finding_id: group.canonical.finding_id,
+          disposition,
+          rationale: disposition === "fixed"
+            ? "The finding is absent on an exact-roster rereview of the repaired subject."
+            : disposition === "rejected"
+            ? "Independent blocker validation rejected this finding."
+            : disposition === "accepted"
+              ? "Independent blocker validation accepted this finding for consolidated repair."
+              : "Advisory findings are journaled without entering the blocking repair set.",
+        };
+      }),
+  };
+  const findingResolutions = [...semanticGroups.entries()]
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([semanticGroupId, group]) => {
+      const semanticMemberIds = [...group.memberIds].sort();
+      const semanticMembers = new Set(semanticMemberIds);
+      const reporters = personaReceipts
+        .filter((receipt) => receipt.finding_ids.some((findingId) => semanticMembers.has(findingId)))
+        .map((receipt) => receipt.persona_id);
+      const disposition = repairDisposition.dispositions.find((entry) => entry.finding_id === group.canonical.finding_id)!;
+      const rejected = disposition.disposition === "rejected";
+      const fixed = disposition.disposition === "fixed";
       return {
         finding_id: group.canonical.finding_id,
-        disposition,
-        rationale: disposition === "fixed"
-          ? "The finding is absent on an exact-roster rereview of the repaired subject."
-          : disposition === "rejected"
-          ? "Independent blocker validation rejected this finding."
-          : disposition === "accepted"
-            ? "Independent blocker validation accepted this finding for consolidated repair."
-            : "Advisory findings are journaled without entering the blocking repair set.",
+        semantic_group_id: semanticGroupId,
+        exact_dedup_personas: reporters,
+        semantic_dedup_finding_ids: semanticMemberIds,
+        validator_result: rejected ? "rejected" as const : "accepted" as const,
+        corroboration_count: reporters.length,
+        repair_disposition: disposition.disposition,
+        convergence_cycle: input.cycle,
+        state: rejected || fixed ? "resolved" as const : "unresolved" as const,
       };
-    }),
-  };
-  const findingResolutions = [...semanticGroups.entries()].map(([semanticGroupId, group]) => {
-    const semanticMemberIds = [...group.memberIds];
-    const semanticMembers = new Set(semanticMemberIds);
-    const reporters = personaReceipts
-      .filter((receipt) => receipt.finding_ids.some((findingId) => semanticMembers.has(findingId)))
-      .map((receipt) => receipt.persona_id);
-    const disposition = repairDisposition.dispositions.find((entry) => entry.finding_id === group.canonical.finding_id)!;
-    const rejected = disposition.disposition === "rejected";
-    const fixed = disposition.disposition === "fixed";
-    return {
-      finding_id: group.canonical.finding_id,
-      semantic_group_id: semanticGroupId,
-      exact_dedup_personas: reporters,
-      semantic_dedup_finding_ids: semanticMemberIds,
-      validator_result: rejected ? "rejected" as const : "accepted" as const,
-      corroboration_count: reporters.length,
-      repair_disposition: disposition.disposition,
-      convergence_cycle: input.cycle,
-      state: rejected || fixed ? "resolved" as const : "unresolved" as const,
-    };
-  });
+    });
   const measurements = {
     persona_count: personaReceipts.length,
     finding_count: synthesis.findings.length,

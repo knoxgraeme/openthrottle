@@ -55,6 +55,13 @@ style review.
   exact and semantic deduplication, return the highest-priority bounded set
   with `result: "needs_human"` and say in the summary that the sealed bound
   omitted additional findings; never truncate silently.
+- Use a sufficiently specific stable semantic anchor: name an enclosing symbol,
+  contract field, or state transition. Generic file/module/change anchors are
+  invalid; diagnostic wording belongs after the identity prefix.
+- Open every finding message with `[path#anchor|claim-discriminator: sealed invariant]`.
+  Use a lowercase kebab-case claim discriminator naming one concrete
+  defect. Same-symbol distinct defects need different claims; the same defect across
+  review lenses must use the exact same claim.
 - In every finding identity, copy the sealed persona invariant exactly:
   `changed code follows the repository's normative contracts`.
 
@@ -121,7 +128,7 @@ present, `needs_human` for a required product or architecture decision, and
     "findings": [
       {
         "severity": "P1",
-        "message": "[skills/tasks/example/agents/openai.yaml#policy.allow_implicit_invocation: changed code follows the repository's normative contracts] The changed package adds SKILL.md but omits the agent metadata that disables implicit Codex invocation.",
+        "message": "[skills/tasks/example/agents/openai.yaml#policy.allow_implicit_invocation|implicit-invocation-policy-omitted: changed code follows the repository's normative contracts] The changed package adds SKILL.md but omits the agent metadata that disables implicit Codex invocation.",
         "path": "skills/tasks/example/agents/openai.yaml"
       }
     ]

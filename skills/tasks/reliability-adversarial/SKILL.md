@@ -56,6 +56,13 @@ record no finding for it.
   exact and semantic deduplication, return the highest-priority bounded set
   with `result: "needs_human"` and say in the summary that the sealed bound
   omitted additional findings; never truncate silently.
+- Use a sufficiently specific stable semantic anchor: name an enclosing symbol,
+  contract field, or state transition. Generic file/module/change anchors are
+  invalid; diagnostic wording belongs after the identity prefix.
+- Open every finding message with `[path#anchor|claim-discriminator: sealed invariant]`.
+  Use a lowercase kebab-case claim discriminator naming one concrete
+  defect. Same-symbol distinct defects need different claims; the same defect across
+  review lenses must use the exact same claim.
 - In every finding identity, copy the sealed persona invariant exactly:
   `retries ordering and settlement fail closed`.
 
@@ -121,7 +128,7 @@ present, `needs_human` for a required product or architecture decision, and
     "findings": [
       {
         "severity": "P1",
-        "message": "[supervisor/src/example/effects.ts#drainEffect: retries ordering and settlement fail closed] The effect is marked retryable before the provider call, but the retry path creates a fresh provider request without a stable idempotency key.",
+        "message": "[supervisor/src/example/effects.ts#drainEffect|retry-idempotency-key-rotation: retries ordering and settlement fail closed] The effect is marked retryable before the provider call, but the retry path creates a fresh provider request without a stable idempotency key.",
         "path": "supervisor/src/example/effects.ts"
       }
     ]

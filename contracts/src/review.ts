@@ -34,6 +34,8 @@ export const FINDING_ID_PREFIX = "finding_" as const;
 const FINDING_ID_PATTERN = /^finding_[a-f0-9]{32}$/;
 export const SEMANTIC_GROUP_ID_PREFIX = "semantic_group_" as const;
 const SEMANTIC_GROUP_ID_PATTERN = /^semantic_group_[a-f0-9]{32}$/;
+const GENERIC_SEMANTIC_ANCHOR = /^(?:the\s+)?(?:file|module|change|code|logic|implementation|behavior|review|function|method|class|contract|test|tests)$/i;
+const STABLE_CLAIM_DISCRIMINATOR = /^[a-z0-9]+(?:-[a-z0-9]+)+$/;
 const REVIEW_JOURNAL_ENTRY_KINDS = [
   "selection",
   "persona_receipts",
@@ -98,6 +100,7 @@ export interface ReviewSelectionContract {
 export interface ReviewFindingIdentity {
   path: string;
   semantic_anchor: string;
+  claim_discriminator: string;
   violated_invariant: string;
 }
 
@@ -216,20 +219,26 @@ export function deriveReviewFindingId(identity: ReviewFindingIdentity): string {
   return `${FINDING_ID_PREFIX}${digestCanonicalJson({
     path: identity.path,
     semantic_anchor: identity.semantic_anchor,
+    claim_discriminator: identity.claim_discriminator,
     violated_invariant: identity.violated_invariant,
   }).slice(0, 32)}`;
 }
 
-export function deriveReviewSemanticGroupId(input: Pick<ReviewFindingContract, "path" | "semantic_anchor" | "message">): string {
-  const diagnostic = input.message
-    .replace(/^\[[^\]]+\]\s*/, "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
+export function isSpecificReviewSemanticAnchor(value: string): boolean {
+  return value === value.trim() && value.length >= 3 && value.length <= 400 && !GENERIC_SEMANTIC_ANCHOR.test(value);
+}
+
+export function isStableReviewClaimDiscriminator(value: string): boolean {
+  return value.length <= 160 && STABLE_CLAIM_DISCRIMINATOR.test(value);
+}
+
+export function deriveReviewSemanticGroupId(
+  input: Pick<ReviewFindingContract, "path" | "semantic_anchor" | "claim_discriminator">
+): string {
   return `${SEMANTIC_GROUP_ID_PREFIX}${digestCanonicalJson({
     path: input.path,
     semantic_anchor: input.semantic_anchor,
-    diagnostic,
+    claim_discriminator: input.claim_discriminator,
   }).slice(0, 32)}`;
 }
 
@@ -298,23 +307,33 @@ function parseSelection(value: unknown, path: string): ReviewSelectionContract {
 
 function parseFinding(value: unknown, path: string): ReviewFindingContract {
   const input = objectAt(value, path, [
-    "schema", "finding_id", "persona_id", "severity", "path", "semantic_anchor", "violated_invariant", "message", "evidence",
+    "schema", "finding_id", "persona_id", "severity", "path", "semantic_anchor", "claim_discriminator",
+    "violated_invariant", "message", "evidence",
   ]);
   if (input.schema !== REVIEW_FINDING_SCHEMA) fail(`${path}.schema`, `must be ${REVIEW_FINDING_SCHEMA}`);
+  const semanticAnchor = stringAt(input.semantic_anchor, `${path}.semantic_anchor`, { max: 400 });
+  if (!isSpecificReviewSemanticAnchor(semanticAnchor)) {
+    fail(`${path}.semantic_anchor`, "must name a sufficiently specific stable symbol, contract, or state transition");
+  }
+  const claimDiscriminator = stringAt(input.claim_discriminator, `${path}.claim_discriminator`, { max: 160 });
+  if (!isStableReviewClaimDiscriminator(claimDiscriminator)) {
+    fail(`${path}.claim_discriminator`, "must be a stable lowercase kebab-case defect claim with at least two tokens");
+  }
   const finding: ReviewFindingContract = {
     schema: REVIEW_FINDING_SCHEMA,
     finding_id: stringAt(input.finding_id, `${path}.finding_id`, { max: 40, pattern: FINDING_ID_PATTERN }),
     persona_id: stringAt(input.persona_id, `${path}.persona_id`, { pattern: IDENTIFIER }),
     severity: enumAt(input.severity, `${path}.severity`, REVIEW_SEVERITIES),
     path: stablePath(input.path, `${path}.path`),
-    semantic_anchor: stringAt(input.semantic_anchor, `${path}.semantic_anchor`, { max: 400 }),
+    semantic_anchor: semanticAnchor,
+    claim_discriminator: claimDiscriminator,
     violated_invariant: stringAt(input.violated_invariant, `${path}.violated_invariant`, { max: 400 }),
     message: stringAt(input.message, `${path}.message`, { max: 2_000 }),
     evidence: boundedTextList(input.evidence, `${path}.evidence`, 16),
   };
   const expected = deriveReviewFindingId(finding);
   if (finding.finding_id !== expected) {
-    fail(`${path}.finding_id`, "must be derived from path, semantic_anchor, and violated_invariant");
+    fail(`${path}.finding_id`, "must be derived from path, semantic_anchor, claim_discriminator, and violated_invariant");
   }
   return finding;
 }

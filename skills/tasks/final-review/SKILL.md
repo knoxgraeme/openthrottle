@@ -118,15 +118,15 @@ Open every `message` with a content-derived identity, so the same defect stays
 recognizable after a repair moves it:
 
 ```
-[<repo-relative path>#<symbol, export, or nearest stable anchor>: <invariant violated>]
+[<repo-relative path>#<symbol, export, or nearest stable anchor>|<claim-discriminator>: <invariant violated>]
 ```
 
 - **Never put a line number in the identity** or use one as a discriminator:
   line numbers move whenever code above them moves, turning one unfixed defect
   into a new finding every round. Set `path` to the file path, no line suffix.
-- The same defect carries the identical identity in every round, even after
-  reformatting or a symbol move; distinct defects in one symbol differ in the
-  invariant clause.
+- The claim discriminator is lowercase kebab-case and names one concrete defect.
+  The same defect carries the identical identity in every round and across review
+  lenses; distinct defects in one symbol use different claim discriminators.
 - **Do not re-report a resolved finding.** When the prompt carries an earlier
   round's dispositions, raise a resolved one again only if the defect is still
   present here, and say why the previous repair did not close it. Add no new

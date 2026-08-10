@@ -715,7 +715,7 @@ SQLite is the authority. Core tables include:
 - evidence/effects: `pipeline_artifacts`, `pipeline_gate_receipts`,
   `pipeline_publication_receipts`, `pipeline_effect_intents`;
 - structured child execution: `execution_graphs`, `execution_units`,
-  `execution_work_attempts`, `execution_gate_receipts`,
+  `execution_work_attempts`, `execution_review_subaction_dispatches`, `execution_gate_receipts`,
   `execution_downstream_context`, `execution_publication_events`;
 - cross-run orchestration history: `orchestration_journal`;
 - settlement rollup measurement corpus: `run_outcomes`;
@@ -739,11 +739,29 @@ validation, repair dispositions, convergence cycle and resolution state, plus
 latency/count measurements (`cost_microusd = null` when unavailable). The live
 gate consumes the in-memory exact-fenced receipts and validated synthesis, not
 this history row; the row is durable audit and future self-learning input.
-Cross-lens semantic groups retain one existing canonical finding plus every
-member finding id and reporting persona, so corroboration is measurable without
-inventing a finding. Rereview searches the newest bounded history window. A
+Raw persona findings are grouped before independent blocker validation by
+repository-relative path plus a sufficiently specific stable semantic anchor and
+lowercase kebab-case claim discriminator; diagnostic prose and persona invariant
+are not group identity. Each group keeps
+one existing representative, selected deterministically by explicit severity
+order (`P0`, `P1`, `P2`, `P3`), stable finding id, then canonical finding bytes.
+Only that exact representative may be validator-accepted and enter final repair,
+once. Journal evidence retains every member finding id and reporting persona,
+but advisory and non-representative members cannot alter the representative's
+validator disposition or resolution state. Rereview correlates unresolved work
+by stable semantic group and finding/member ids before treating absence as
+fixed, so diagnostic rewording cannot duplicate or prematurely resolve a
+finding. Rereview searches the newest bounded history window. A
 missing or malformed prior journal is appended as a separate audit-gap note and
 cannot block, pass, or otherwise authorize the live receipt/gate decision.
+Persona actions remain independent sessions. Claude and OpenCode personas may
+run concurrently within the sealed fanout bound. Codex personas are dispatched
+in deterministic roster order, one at a time, because their shared subscription
+credential has a rotating one-time refresh token: the supervisor captures the
+completed persona's action-scoped auth snapshot before it materializes the next
+persona's credentials. Repeated drains collect a durably recorded subaction
+before considering dispatch, so waits and validator retries do not relaunch
+already-dispatched persona work.
 
 `run_outcomes` holds one deterministic row per pipeline instance, written
 exactly once at its terminal transition -- either applyTransition's normal

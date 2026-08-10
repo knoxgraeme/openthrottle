@@ -204,11 +204,22 @@ byte-identical.
 
 **Stable finding identity, not line numbers.** `final-review` and
 `review-change` key a finding by `(path, enclosing symbol or nearest stable
-anchor, invariant)`, never by line number. A repair that shifts surrounding
-lines must not re-issue an already-raised defect as a new finding — that
+anchor, claim discriminator, invariant)`, never by line number. A repair that
+shifts surrounding lines must not re-issue an already-raised defect as a new finding — that
 non-convergence was the single largest cost in early dogfooding rounds. The
 identity is carried as a prefix of the finding's `message` field because the
-receipt contract has no dedicated id field.
+receipt contract has no dedicated id field. Structured persona fanout groups
+raw findings before blocker validation by `(path, semantic anchor, claim
+discriminator)`; prose and persona invariant remain member evidence, not group
+identity. Anchors must
+name a concrete symbol, contract field, or state transition rather than a
+generic file/module/change label. The supervisor chooses one existing group
+representative by explicit severity and stable byte ordering; only that exact
+representative can enter consolidated final repair.
+Persona sessions are independent; Claude and OpenCode can use the sealed
+parallel fanout, while Codex personas run in deterministic roster order so each
+rotated subscription-auth snapshot is captured before the next action receives
+credentials.
 
 **Why the split is a fork, not a thicken.** `publish` and the review/simplify
 stages could have wrapped a shared external toolkit instead of restating its

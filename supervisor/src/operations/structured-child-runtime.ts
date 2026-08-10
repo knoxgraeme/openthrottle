@@ -66,7 +66,13 @@ import {
 import type { PipelineInstance, PipelineStore } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
 import type { ExecutionGateReceipt, ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
-import type { ChildExecutorActionRequest, LoopActionRequest, RuntimeResource, SandboxRuntime } from "../runtime/contracts.js";
+import type {
+  ChildExecutorActionRequest,
+  LoopActionRequest,
+  LoopActionResult,
+  RuntimeResource,
+  SandboxRuntime,
+} from "../runtime/contracts.js";
 import { extractJsonBlocks } from "../pipeline/markdown.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { createUnitEffectProcessor } from "./unit-effects.js";
@@ -842,6 +848,98 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     }
   };
 
+  const captureLatestReviewCodexAuth = (
+    results: ReadonlyArray<{ request: LoopActionRequest; result: LoopActionResult | null }>
+  ): void => {
+    const latest = results
+      .filter((entry): entry is { request: LoopActionRequest; result: LoopActionResult & { codexAuthJson: string } } =>
+        typeof entry.result?.codexAuthJson === "string" && entry.result.codexAuthJson.length > 0)
+      .sort((left, right) =>
+        left.result.completedAt.localeCompare(right.result.completedAt) ||
+        left.request.actionId.localeCompare(right.request.actionId))
+      .at(-1);
+    if (latest) deps.captureCodexAuth?.(latest.result.codexAuthJson);
+  };
+
+  const prepareReviewSubaction = async (input: {
+    resource: RuntimeResource;
+    action: ExecutionWorkAttempt;
+    request: LoopActionRequest;
+    label: string;
+  }): Promise<{
+    result: LoopActionResult | null;
+    newlyDispatched: boolean;
+  }> => {
+    const persisted = deps.store.getReviewSubactionDispatch(input.action.id, input.request.actionId);
+    if (persisted) {
+      if (
+        persisted.request_hash !== input.request.requestHash ||
+        persisted.idempotency_key !== input.request.idempotencyKey
+      ) {
+        throw new Error(`persisted review subaction ${input.request.actionId} has a different request fence`);
+      }
+      return { result: null, newlyDispatched: false };
+    }
+    const recovered = await reviewRuntimeCall(
+      `${input.label} ${input.request.actionId} pre-dispatch collection failed`,
+      () => deps.runtime.collectLoopActionResult(input.resource, {
+        attemptId: input.request.attemptId,
+        actionId: input.request.actionId,
+        requestHash: input.request.requestHash,
+      })
+    );
+    const newlyDispatched = !recovered;
+    if (newlyDispatched) {
+      await reviewRuntimeCall(
+        `${input.label} ${input.request.actionId} dispatch failed`,
+        () => deps.runtime.dispatchLoopAction(input.resource, input.request)
+      );
+    }
+    deps.store.recordReviewSubactionDispatch({
+      parentActionId: input.action.id,
+      actionId: input.request.actionId,
+      requestHash: input.request.requestHash,
+      idempotencyKey: input.request.idempotencyKey,
+    });
+    return { result: recovered, newlyDispatched };
+  };
+
+  const prepareReviewFanout = async (input: {
+    resource: RuntimeResource;
+    action: ExecutionWorkAttempt;
+    requests: readonly LoopActionRequest[];
+  }): Promise<Map<string, LoopActionResult>> => {
+    const precollected = new Map<string, LoopActionResult>();
+    const serializeRotatingCodexAuth = input.requests.some((request) => request.agent === "codex");
+    for (const request of input.requests) {
+      const prepared = await prepareReviewSubaction({
+        resource: input.resource,
+        action: input.action,
+        request,
+        label: "review fanout action",
+      });
+      let result = prepared.result;
+      if (serializeRotatingCodexAuth && !result && !prepared.newlyDispatched) {
+        result = await reviewRuntimeCall(
+          `review fanout action ${request.actionId} serialized result collection failed`,
+          () => deps.runtime.collectLoopActionResult(input.resource, {
+            attemptId: request.attemptId,
+            actionId: request.actionId,
+            requestHash: request.requestHash,
+          })
+        );
+      }
+      if (result) {
+        precollected.set(request.actionId, result);
+        if (serializeRotatingCodexAuth) captureLatestReviewCodexAuth([{ request, result }]);
+      }
+      if (serializeRotatingCodexAuth && (prepared.newlyDispatched || !result || result.outcome !== "success")) {
+        break;
+      }
+    }
+    return precollected;
+  };
+
   const collectReviewFanout = async (input: {
     resource: RuntimeResource;
     instance: PipelineInstance;
@@ -849,6 +947,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     plan: ReviewFanoutPlan;
     requests: readonly LoopActionRequest[];
     baseSubject: string;
+    precollected?: ReadonlyMap<string, LoopActionResult>;
   }): Promise<{
     synthesis: ReviewFanoutSynthesis;
     receipts: SemanticReviewReceipt[];
@@ -863,8 +962,9 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   }> => {
     const receipts: SemanticReviewReceipt[] = [];
     const receiptResults: Array<{ receipt: SemanticReviewReceipt; completedAt: string }> = [];
+    const collected: Array<{ request: LoopActionRequest; result: LoopActionResult | null }> = [];
     for (const request of input.requests) {
-      const result = await reviewRuntimeCall(
+      const result = input.precollected?.get(request.actionId) ?? await reviewRuntimeCall(
         `review fanout action ${request.actionId} result collection failed`,
         () => deps.runtime.collectLoopActionResult(input.resource, {
           attemptId: request.attemptId,
@@ -872,6 +972,10 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           requestHash: request.requestHash,
         })
       );
+      collected.push({ request, result });
+    }
+    captureLatestReviewCodexAuth(collected);
+    for (const { request, result } of collected) {
       if (!result) return { pending: true };
       if (result.outcome !== "success") {
         return {
@@ -954,6 +1058,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     skill: string;
     subject: string;
     baseSubject: string;
+    precollected?: LoopActionResult;
   }): Promise<{
     receipt: SemanticReviewReceipt;
     completedAt: string;
@@ -963,7 +1068,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
     lastError: string;
   }> => {
-    const result = await reviewRuntimeCall(
+    const result = input.precollected ?? await reviewRuntimeCall(
       `review subaction ${input.request.actionId} result collection failed`,
       () => deps.runtime.collectLoopActionResult(input.resource, {
         attemptId: input.request.attemptId,
@@ -1744,13 +1849,16 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         ...(selectorRequest.model === undefined ? {} : { model: selectorRequest.model }),
         timeoutMs: selectorRequest.timeoutMs,
       });
-      for (const request of fanoutRequests) {
-        assertLoopRequestEnvelopeBound(request);
-        await reviewRuntimeCall(
-          `review fanout action ${request.actionId} dispatch failed`,
-          () => deps.runtime.dispatchLoopAction(resource, request)
-        );
-      }
+      for (const request of fanoutRequests) assertLoopRequestEnvelopeBound(request);
+      // Codex subscription auth uses a rotating one-time refresh token. Its
+      // persona actions therefore run one at a time: capture action N's auth
+      // snapshot before materializing credentials for action N+1. Claude and
+      // OpenCode retain the independent parallel fanout path.
+      const precollectedFanout = await prepareReviewFanout({
+        resource,
+        action,
+        requests: fanoutRequests,
+      });
       const fanout = await collectReviewFanout({
         resource,
         instance,
@@ -1758,6 +1866,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         plan: fanoutPlan,
         requests: fanoutRequests,
         baseSubject: instance.base_commit,
+        precollected: precollectedFanout,
       });
       if ("pending" in fanout) return null;
       if ("terminal" in fanout) return { ...fanout, nativeSessionId: null };
@@ -1778,10 +1887,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           timeoutMs: selectorRequest.timeoutMs,
         });
         assertLoopRequestEnvelopeBound(validatorRequest);
-        await reviewRuntimeCall(
-          `review validator action ${validatorRequest.actionId} dispatch failed`,
-          () => deps.runtime.dispatchLoopAction(resource, validatorRequest)
-        );
+        const precollectedValidator = await prepareReviewSubaction({
+          resource,
+          action,
+          request: validatorRequest,
+          label: "review validator action",
+        });
         const validator = await collectReviewSubaction({
           resource,
           instance,
@@ -1791,6 +1902,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           skill: "builtin://validate-review-findings@1",
           subject: reviewSubject,
           baseSubject: instance.base_commit,
+          ...(precollectedValidator.result ? { precollected: precollectedValidator.result } : {}),
         });
         if ("pending" in validator) return null;
         if ("terminal" in validator) return { ...validator, nativeSessionId: null };

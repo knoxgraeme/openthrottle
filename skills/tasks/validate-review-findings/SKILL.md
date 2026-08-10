@@ -25,10 +25,12 @@ is independently reproducible at the sealed subject.
 1. Require `review_synthesis.schema` to be
    `openthrottle.review-fanout-synthesis/v1` and its subject to match
    `subject.pre`. Return `failure` when the sealed input is missing or stale.
-2. Inspect each supplied `P0`/`P1` independently. Trace the concrete trigger,
-   changed path, violated invariant, and observable impact.
-3. Copy an accepted finding exactly—same severity, message, and path. Never
-   rewrite, escalate, merge, or invent one. Omit a rejected finding.
+2. Treat each supplied `P0`/`P1` as the deterministic representative of one
+   already-grouped semantic defect. Inspect each independently and trace the
+   concrete trigger, changed path, violated invariant, and observable impact.
+3. Copy an accepted representative exactly once—same severity, message, and
+   path. Never rewrite, escalate, merge, duplicate, or invent one. Omit a
+   rejected representative.
 4. Ignore `P2`/`P3`; they remain journaled but never enter blocker validation.
 5. Return `semantic_repair_required` when at least one blocker is accepted;
    return `success` when every blocker is rejected.
@@ -91,7 +93,7 @@ the exact blocking findings that survived validation.
     "findings": [
       {
         "severity": "P1",
-        "message": "[src/example/queue.ts#enqueueAndPublish: retries ordering and settlement fail closed] Failed publication leaves a visible row without retry-safe state.",
+        "message": "[src/example/queue.ts#enqueueAndPublish|failed-publish-retry-state: retries ordering and settlement fail closed] Failed publication leaves a visible row without retry-safe state.",
         "path": "src/example/queue.ts"
       }
     ]

@@ -106,18 +106,22 @@ describe("review fanout runtime contract", () => {
       instructions: { one: "Implement retry receipt validation." },
       acceptance: { done: "The leaf is done." },
     });
-    const finding = { severity: "P1" as const, message: "Candidate omits the acceptance check.", path: "src/unit.ts" };
     const synthesis = synthesizeReviewFanout({
       plan,
       receipts: plan.personas.map((persona) => reviewReceipt({
         persona: persona.id,
         subject,
         result: "semantic_repair_required",
-        findings: [finding],
+        findings: [{
+          severity: "P1",
+          message: `[src/unit.ts#acceptCandidate|acceptance-check-omitted: ${persona.invariant}] Candidate omits the acceptance check.`,
+          path: "src/unit.ts",
+        }],
       })),
     });
 
-    expect(synthesis.findings).toEqual([finding]);
+    expect(synthesis.findings).toHaveLength(1);
+    expect(synthesis.findings[0]).toMatchObject({ severity: "P1", path: "src/unit.ts" });
     expect(synthesis.outcome).toBe("semantic_repair_required");
     expect(() => validateReviewFanoutRepair({
       previous: synthesis,
@@ -192,7 +196,7 @@ describe("review fanout runtime contract", () => {
     const plan = buildReviewFanoutPlan({ subject });
     const blocker = {
       severity: "P1" as const,
-      message: "[src/unit.ts#settle: changed control and data flow preserves declared behavior] Settlement can silently pass.",
+      message: "[src/unit.ts#settle|settlement-silently-passes: changed control and data flow preserves declared behavior] Settlement can silently pass.",
       path: "src/unit.ts",
     };
     const synthesis = synthesizeReviewFanout({
@@ -236,7 +240,7 @@ describe("review fanout runtime contract", () => {
     const plan = buildReviewFanoutPlan({ subject });
     const advisory = {
       severity: "P2" as const,
-      message: "[src/unit.ts#settle: changed control and data flow preserves declared behavior] Add a regression assertion.",
+      message: "[src/unit.ts#settle|settlement-silently-passes: changed control and data flow preserves declared behavior] Add a regression assertion.",
       path: "src/unit.ts",
     };
     const synthesis = synthesizeReviewFanout({

@@ -54,6 +54,13 @@ finding for it.
   exact and semantic deduplication, return the highest-priority bounded set
   with `result: "needs_human"` and say in the summary that the sealed bound
   omitted additional findings; never truncate silently.
+- Use a sufficiently specific stable semantic anchor: name an enclosing symbol,
+  contract field, or state transition. Generic file/module/change anchors are
+  invalid; diagnostic wording belongs after the identity prefix.
+- Open every finding message with `[path#anchor|claim-discriminator: sealed invariant]`.
+  Use a lowercase kebab-case claim discriminator naming one concrete
+  defect. Same-symbol distinct defects need different claims; the same defect across
+  review lenses must use the exact same claim.
 - In every finding identity, copy the sealed persona invariant exactly:
   `untrusted input and credentials cannot exceed sealed authority`.
 
@@ -120,7 +127,7 @@ present, `needs_human` for a required product or architecture decision, and
     "findings": [
       {
         "severity": "P1",
-        "message": "[supervisor/src/example/webhook.ts#handleWebhook: untrusted input and credentials cannot exceed sealed authority] The changed handler parses the event before verifying the HMAC and the failure branch still calls dispatch.",
+        "message": "[supervisor/src/example/webhook.ts#handleWebhook|dispatch-before-hmac-verification: untrusted input and credentials cannot exceed sealed authority] The changed handler parses the event before verifying the HMAC and the failure branch still calls dispatch.",
         "path": "supervisor/src/example/webhook.ts"
       }
     ]

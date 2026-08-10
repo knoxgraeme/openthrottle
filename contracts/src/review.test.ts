@@ -54,6 +54,7 @@ function validJournal(): ReviewJournalContract {
   const identity = {
     path: "contracts/src/review.ts",
     semantic_anchor: "parseFinding validates finding_id",
+    claim_discriminator: "finding-id-derivation",
     violated_invariant: "finding identity is semantic and stable",
   };
   const finding: ReviewFindingContract = {
@@ -176,9 +177,31 @@ describe("review journal contracts", () => {
       deriveReviewFindingId({
         path: "contracts/src/review.ts",
         semantic_anchor: "parseFinding validates finding_id",
+        claim_discriminator: "finding-id-derivation",
         violated_invariant: "finding identity is semantic and stable",
       })
     );
+  });
+
+  it("keeps semantic group identity stable across diagnostic prose and persona invariants", () => {
+    const finding = validJournal().synthesis.findings[0]!;
+    const changedDiagnostic = {
+      ...finding,
+      violated_invariant: "review authority is roster-bound",
+      message: "The same anchored defect is described with different diagnostic prose.",
+    };
+
+    expect(deriveReviewSemanticGroupId(changedDiagnostic)).toBe(deriveReviewSemanticGroupId(finding));
+  });
+
+  it("separates distinct claims against the same stable semantic anchor", () => {
+    const finding = validJournal().synthesis.findings[0]!;
+    const distinctClaim = {
+      ...finding,
+      claim_discriminator: "persona-invariant-membership",
+    };
+
+    expect(deriveReviewSemanticGroupId(distinctClaim)).not.toBe(deriveReviewSemanticGroupId(finding));
   });
 
   it("rejects unknown fields that could escalate authority", () => {
@@ -217,9 +240,10 @@ describe("review journal contracts", () => {
       ...unknownInvariant.synthesis.findings[0]!,
       violated_invariant: "line number is stable",
       finding_id: deriveReviewFindingId({
-        path: "contracts/src/review.ts",
-        semantic_anchor: "parseFinding validates finding_id",
-        violated_invariant: "line number is stable",
+      path: "contracts/src/review.ts",
+      semantic_anchor: "parseFinding validates finding_id",
+      claim_discriminator: "finding-id-derivation",
+      violated_invariant: "line number is stable",
       }),
     };
     expect(() => validateReviewJournalContract(unknownInvariant, { source: "review" }))
@@ -242,6 +266,7 @@ describe("review journal contracts", () => {
     const identity = {
       path: "contracts/src/review.ts:120",
       semantic_anchor: "parseFinding validates finding_id",
+      claim_discriminator: "finding-id-derivation",
       violated_invariant: "finding identity is semantic and stable",
     };
     journal.synthesis.findings[0] = {
@@ -252,6 +277,42 @@ describe("review journal contracts", () => {
 
     expect(() => validateReviewJournalContract(journal, { source: "review" }))
       .toThrow(/review\.synthesis\.findings\[0\]\.path: must not encode line numbers/);
+  });
+
+  it("rejects generic semantic anchors that would over-group unrelated defects", () => {
+    const journal = validJournal();
+    const identity = {
+      path: "contracts/src/review.ts",
+      semantic_anchor: "module",
+      claim_discriminator: "finding-id-derivation",
+      violated_invariant: "finding identity is semantic and stable",
+    };
+    journal.synthesis.findings[0] = {
+      ...journal.synthesis.findings[0]!,
+      ...identity,
+      finding_id: deriveReviewFindingId(identity),
+    };
+
+    expect(() => validateReviewJournalContract(journal, { source: "review" }))
+      .toThrow(/semantic_anchor: must name a sufficiently specific stable symbol/);
+  });
+
+  it("rejects generic claim discriminators that cannot distinguish same-symbol defects", () => {
+    const journal = validJournal();
+    const identity = {
+      path: "contracts/src/review.ts",
+      semantic_anchor: "parseFinding validates finding_id",
+      claim_discriminator: "validation",
+      violated_invariant: "finding identity is semantic and stable",
+    };
+    journal.synthesis.findings[0] = {
+      ...journal.synthesis.findings[0]!,
+      ...identity,
+      finding_id: deriveReviewFindingId(identity),
+    };
+
+    expect(() => validateReviewJournalContract(journal, { source: "review" }))
+      .toThrow(/claim_discriminator: must be a stable lowercase kebab-case defect claim/);
   });
 
   it("rejects persona receipt attribution, subject, latency, cost, and finding-count drift", () => {

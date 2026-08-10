@@ -1291,12 +1291,17 @@ describe("pipeline effect processor", () => {
     const selectorRequest = runtime.dispatchLoopAction.mock.calls.at(-1)![1];
     const acceptedFinding = {
       severity: "P1" as const,
-      message: "[supervisor/src/example/effects.ts#drainEffect: changed control and data flow preserves declared behavior] Failed settlement can silently pass.",
+      message: "[supervisor/src/example/effects.ts#drainEffect|failed-settlement-ordering: changed control and data flow preserves declared behavior] Failed settlement can silently pass.",
+      path: "supervisor/src/example/effects.ts",
+    };
+    const contractProofFinding = {
+      severity: "P1" as const,
+      message: "[supervisor/src/example/effects.ts#drainEffect|failed-settlement-ordering: changed behavior has executable contract proof] No executable assertion proves failed settlement remains retryable.",
       path: "supervisor/src/example/effects.ts",
     };
     const advisoryFinding = {
       severity: "P2" as const,
-      message: "[supervisor/src/example/effects.ts#drainEffectDiagnostics: changed control and data flow preserves declared behavior] Add a diagnostic assertion for operator visibility.",
+      message: "[supervisor/src/example/effects.ts#drainEffectDiagnostics|operator-diagnostic-visibility: changed control and data flow preserves declared behavior] Add a diagnostic assertion for operator visibility.",
       path: "supervisor/src/example/effects.ts",
     };
     const semanticReceiptFor = (request: typeof selectorRequest, input: {
@@ -1331,19 +1336,26 @@ describe("pipeline effect processor", () => {
       issued_at: "2099-07-22T12:00:00.000Z",
     });
     let selectorReceipt: string | null = null;
+    let validatorRepresentative: ReviewFinding | null = null;
+    const successfullyDispatchedReviewActions = new Set([selectorRequest.actionId]);
     runtime.collectLoopActionResult.mockImplementation(async (_resource, collection) => {
       const dispatched = runtime.dispatchLoopAction.mock.calls
         .map(([, request]) => request)
         .find((request) => request.actionId === collection.actionId);
-      if (!dispatched?.expectedProducer) return null;
+      if (!dispatched?.expectedProducer || !successfullyDispatchedReviewActions.has(dispatched.actionId)) return null;
       const isSelector = dispatched.skill === "select-review-personas";
       const isValidator = dispatched.skill === "validate-review-findings";
       const firstReviewCycle = dispatched.inputSubject === integratedSubjectB;
       const findings: ReviewFinding[] = firstReviewCycle && dispatched.skill === "correctness-dataflow"
         ? [acceptedFinding, advisoryFinding]
+        : firstReviewCycle && dispatched.skill === "tests-contracts"
+          ? [contractProofFinding]
         : firstReviewCycle && isValidator
-          ? [acceptedFinding]
+          ? ((JSON.parse(dispatched.transitionContext.split("## Execution Plan Context\n")[1]!) as {
+              review_synthesis: { findings: ReviewFinding[] };
+            }).review_synthesis.findings.filter((finding) => finding.severity === "P0" || finding.severity === "P1"))
           : [];
+      if (isValidator && findings.length > 0) validatorRepresentative = findings[0]!;
       const summary = isSelector
         ? canonicalJson({
             schema: "openthrottle.review-selector-recommendation/v1",
@@ -1371,11 +1383,15 @@ describe("pipeline effect processor", () => {
         nativeSessionId: null,
         subject: integratedSubjectB,
         receipt,
-        completedAt: "2099-07-22T12:00:00.000Z",
+        completedAt: dispatched.skill === "tests-contracts"
+          ? "2099-07-22T12:00:02.000Z"
+          : "2099-07-22T12:00:01.000Z",
+        codexAuthJson: `auth-${dispatched.skill}`,
       };
     });
     let fanoutDispatchFailed = false;
     let validatorDispatchFailed = false;
+    const reviewAuthEvents: string[] = [];
     runtime.dispatchLoopAction.mockImplementation(async (_resource, request) => {
       if (request.skill === "correctness-dataflow" && !fanoutDispatchFailed) {
         fanoutDispatchFailed = true;
@@ -1385,8 +1401,11 @@ describe("pipeline effect processor", () => {
         validatorDispatchFailed = true;
         throw new Error("transient validator dispatch timeout");
       }
+      reviewAuthEvents.push(`dispatch:${request.skill}`);
+      successfullyDispatchedReviewActions.add(request.actionId);
       return { providerDispatchId: "loop-child-drain" };
     });
+    const captureCodexAuth = vi.fn((blob: string) => reviewAuthEvents.push(`capture:${blob}`));
     const restartedProcessor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
@@ -1394,6 +1413,12 @@ describe("pipeline effect processor", () => {
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
+      captureCodexAuth,
+    });
+    await restartedProcessor.drain();
+    expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
+      status: "dispatched",
+      last_error: null,
     });
     await restartedProcessor.drain();
     expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
@@ -1408,13 +1433,48 @@ describe("pipeline effect processor", () => {
     await restartedProcessor.drain();
     expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
       status: "completed",
+      last_error: null,
     });
     expect(fanoutDispatchFailed).toBe(true);
     expect(validatorDispatchFailed).toBe(true);
+    const reviewDispatchCounts = runtime.dispatchLoopAction.mock.calls
+      .map(([, request]) => request.skill)
+      .reduce<Record<string, number>>((counts, skill) => ({
+        ...counts,
+        [skill]: (counts[skill] ?? 0) + 1,
+      }), {});
+    expect(reviewDispatchCounts["correctness-dataflow"]).toBe(2);
+    expect(reviewDispatchCounts["tests-contracts"]).toBe(1);
+    expect(reviewDispatchCounts["validate-review-findings"]).toBe(2);
+    expect(captureCodexAuth).toHaveBeenCalledWith("auth-correctness-dataflow");
+    expect(captureCodexAuth).toHaveBeenCalledWith("auth-tests-contracts");
+    expect(reviewAuthEvents.indexOf("capture:auth-correctness-dataflow")).toBeLessThan(
+      reviewAuthEvents.indexOf("dispatch:tests-contracts")
+    );
+    const persistedReviewDispatches = db!.prepare(`
+      SELECT action_id, request_hash, idempotency_key
+      FROM execution_review_subaction_dispatches
+      WHERE parent_action_id = ?
+      ORDER BY action_id
+    `).all(review.id) as Array<{ action_id: string; request_hash: string; idempotency_key: string }>;
+    expect(persistedReviewDispatches).toHaveLength(3);
+    expect(pipelines.recordReviewSubactionDispatch({
+      parentActionId: review.id,
+      actionId: persistedReviewDispatches[0]!.action_id,
+      requestHash: persistedReviewDispatches[0]!.request_hash,
+      idempotencyKey: persistedReviewDispatches[0]!.idempotency_key,
+    })).toBe("already_recorded");
+    expect(() => pipelines.recordReviewSubactionDispatch({
+      parentActionId: review.id,
+      actionId: persistedReviewDispatches[0]!.action_id,
+      requestHash: "0".repeat(64),
+      idempotencyKey: persistedReviewDispatches[0]!.idempotency_key,
+    })).toThrow(/different dispatch fence/);
     const persistedReviewReceipt = JSON.parse(
       pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)!.receipt!
     ) as SemanticReviewReceipt;
-    expect(persistedReviewReceipt.payload.findings).toEqual([acceptedFinding]);
+    expect(validatorRepresentative).not.toBeNull();
+    expect(persistedReviewReceipt.payload.findings).toEqual([validatorRepresentative]);
     expect(persistedReviewReceipt.payload.findings).not.toContainEqual(advisoryFinding);
     expect(selectorReceipt).not.toBeNull();
     expect(persistedReviewReceipt.evidence).toContain(digestNormalized(selectorReceipt!));
@@ -1430,8 +1490,16 @@ describe("pipeline effect processor", () => {
     ]);
     expect(reviewJournal.finding_resolutions).toHaveLength(2);
     expect(reviewJournal.finding_resolutions).toEqual(expect.arrayContaining([
-      expect.objectContaining({ validator_result: "accepted", state: "unresolved", convergence_cycle: 1 }),
+      expect.objectContaining({
+        exact_dedup_personas: ["correctness-dataflow", "tests-contracts"],
+        validator_result: "accepted",
+        state: "unresolved",
+        convergence_cycle: 1,
+      }),
     ]));
+    expect(reviewJournal.finding_resolutions.find((resolution) =>
+      resolution.exact_dedup_personas.includes("tests-contracts")
+    )?.semantic_dedup_finding_ids).toHaveLength(2);
     const reviewGatePayload = JSON.parse(
       pipelines.listGateReceipts(attempt.id).find((gate) => gate.execution_work_attempt_id === review.id)!.payload
     ) as { review_fanout_synthesis: { findings: ReviewFinding[]; receipt_hashes: string[] } };
@@ -1447,6 +1515,11 @@ describe("pipeline effect processor", () => {
         skill: "final-repair",
       })
     );
+    const finalRepairRequest = runtime.dispatchLoopAction.mock.calls.at(-1)![1];
+    const triggeringReview = JSON.parse(
+      finalRepairRequest.priorEvidence!.receipts.find((receipt) => receipt.role === "final_review")!.receipt
+    ) as SemanticReviewReceipt;
+    expect(triggeringReview.payload.findings).toEqual([validatorRepresentative]);
     const repairedSubject = "c".repeat(40);
     const finalCandidateSubject = "d".repeat(40);
     const finalIntegratedSubject = "e".repeat(40);
@@ -1560,6 +1633,11 @@ describe("pipeline effect processor", () => {
     });
     db!.prepare("UPDATE orchestration_journal SET recorded_at = ? WHERE id = ?")
       .run("2100-01-01T00:00:00.000Z", "00000000-0000-4000-8000-000000001138");
+    await restartedProcessor.drain();
+    expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === freshReview.id)).toMatchObject({
+      status: "dispatched",
+      last_error: null,
+    });
     await restartedProcessor.drain();
     const settledFreshReview = pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === freshReview.id);
     expect(settledFreshReview?.last_error).toBeNull();

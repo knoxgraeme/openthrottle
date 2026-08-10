@@ -157,6 +157,14 @@ export interface ExecutionDownstreamContext {
   created_at: string;
 }
 
+export interface ExecutionReviewSubactionDispatch {
+  parent_action_id: string;
+  action_id: string;
+  request_hash: string;
+  idempotency_key: string;
+  dispatched_at: string;
+}
+
 export interface ExecutionUnitStore {
   createGraph(input: {
     pipelineInstanceId: string;
@@ -237,6 +245,16 @@ export interface ExecutionUnitStore {
     hash: string;
   }): "recorded" | "already_recorded";
   listGateReceipts(parentAttemptId: string): ExecutionGateReceipt[];
+  getReviewSubactionDispatch(
+    parentActionId: string,
+    actionId: string
+  ): ExecutionReviewSubactionDispatch | undefined;
+  recordReviewSubactionDispatch(input: {
+    parentActionId: string;
+    actionId: string;
+    requestHash: string;
+    idempotencyKey: string;
+  }): "recorded" | "already_recorded";
   appendDownstreamContext(input: {
     parentAttemptId: string;
     fromUnitId: string;
@@ -1549,6 +1567,30 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         WHERE parent_attempt_id = ?
         ORDER BY created_at, id
       `).all(parentAttemptId) as ExecutionGateReceipt[];
+    },
+    getReviewSubactionDispatch(parentActionId, actionId) {
+      return db.prepare(`
+        SELECT * FROM execution_review_subaction_dispatches
+        WHERE parent_action_id = ? AND action_id = ?
+      `).get(parentActionId, actionId) as ExecutionReviewSubactionDispatch | undefined;
+    },
+    recordReviewSubactionDispatch(input) {
+      const existing = db.prepare(`
+        SELECT * FROM execution_review_subaction_dispatches
+        WHERE parent_action_id = ? AND action_id = ?
+      `).get(input.parentActionId, input.actionId) as ExecutionReviewSubactionDispatch | undefined;
+      if (existing) {
+        if (existing.request_hash !== input.requestHash || existing.idempotency_key !== input.idempotencyKey) {
+          throw new Error(`review subaction ${input.actionId} already has a different dispatch fence`);
+        }
+        return "already_recorded";
+      }
+      db.prepare(`
+        INSERT INTO execution_review_subaction_dispatches (
+          parent_action_id, action_id, request_hash, idempotency_key, dispatched_at
+        ) VALUES (?, ?, ?, ?, ?)
+      `).run(input.parentActionId, input.actionId, input.requestHash, input.idempotencyKey, now());
+      return "recorded";
     },
     getStructuredExecutionPublication(parentAttemptId) {
       return getStructuredExecutionPublicationForAttempt(db, parentAttemptId);

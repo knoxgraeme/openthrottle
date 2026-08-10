@@ -118,6 +118,8 @@ export {
   REVIEW_VALIDATOR_RESULTS,
   deriveReviewFindingId,
   deriveReviewSemanticGroupId,
+  isStableReviewClaimDiscriminator,
+  isSpecificReviewSemanticAnchor,
   parseReviewJournalContract,
   validateReviewJournalContract,
   type ReviewFindingContract,

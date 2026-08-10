@@ -34,8 +34,8 @@ defensible findings over broad commentary.
   do not leave partial state that a retry duplicates.
 - Cross-module calls agree on return values, thrown errors, persisted shapes,
   and ordering assumptions.
-- Finding identity uses repository-relative path, semantic anchor, and violated
-  invariant, never a line number.
+- Finding identity uses repository-relative path, semantic anchor, claim
+  discriminator, and violated invariant, never a line number.
 
 ## Required Postconditions
 
@@ -50,6 +50,13 @@ defensible findings over broad commentary.
   subject that makes the defect reachable.
 - Each finding states the data-flow chain: input or trigger, changed path,
   violated invariant, and observable consequence.
+- Use a sufficiently specific stable semantic anchor: name an enclosing symbol,
+  contract field, or state transition. Generic file/module/change anchors are
+  invalid; diagnostic wording belongs after the identity prefix.
+- Open every finding message with `[path#anchor|claim-discriminator: sealed invariant]`.
+  Use a lowercase kebab-case claim discriminator naming one concrete
+  defect. Same-symbol distinct defects need different claims; the same defect across
+  review lenses must use the exact same claim.
 - In every finding identity, copy the sealed persona invariant exactly:
   `changed control and data flow preserves declared behavior`.
 - Evidence is local to this action: changed paths read, symbols traced, prior
@@ -109,7 +116,7 @@ present, `needs_human` for a required product or architecture decision, and
     "findings": [
       {
         "severity": "P1",
-        "message": "[src/example/queue.ts#enqueueAndPublish: changed control and data flow preserves declared behavior] The row is inserted before publish, but the catch returns failure without deleting or marking it retry-safe.",
+        "message": "[src/example/queue.ts#enqueueAndPublish|failed-publish-retry-state: changed control and data flow preserves declared behavior] The row is inserted before publish, but the catch returns failure without deleting or marking it retry-safe.",
         "path": "src/example/queue.ts"
       }
     ]

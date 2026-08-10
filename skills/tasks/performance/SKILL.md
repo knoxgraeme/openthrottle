@@ -53,6 +53,13 @@ changed bound.
   exact and semantic deduplication, return the highest-priority bounded set
   with `result: "needs_human"` and say in the summary that the sealed bound
   omitted additional findings; never truncate silently.
+- Use a sufficiently specific stable semantic anchor: name an enclosing symbol,
+  contract field, or state transition. Generic file/module/change anchors are
+  invalid; diagnostic wording belongs after the identity prefix.
+- Open every finding message with `[path#anchor|claim-discriminator: sealed invariant]`.
+  Use a lowercase kebab-case claim discriminator naming one concrete
+  defect. Same-symbol distinct defects need different claims; the same defect across
+  review lenses must use the exact same claim.
 - In every finding identity, copy the sealed persona invariant exactly:
   `changed hot paths remain bounded at production scale`.
 
@@ -120,7 +127,7 @@ present, `needs_human` for a required product or architecture decision, and
     "findings": [
       {
         "severity": "P1",
-        "message": "[supervisor/src/example/events.ts#latestForRun: changed hot paths remain bounded at production scale] The changed query removes the run_id filter and LIMIT, so every poll synchronously scans all events as history grows.",
+        "message": "[supervisor/src/example/events.ts#latestForRun|unbounded-history-scan: changed hot paths remain bounded at production scale] The changed query removes the run_id filter and LIMIT, so every poll synchronously scans all events as history grows.",
         "path": "supervisor/src/example/events.ts"
       }
     ]
