@@ -1,3 +1,5 @@
+import { normalizeIso8601Timestamp } from "@openthrottle/contracts";
+
 // Shared query validation for the persistence read surfaces
 // (analysis-store.ts, journal-store.ts). These helpers were hand-copied into
 // both stores and promptly diverged: journal-store's regex learned the
@@ -8,24 +10,11 @@
 
 const QUERY_LIMIT = 200;
 
-// Deliberately narrow: requires the 'T' separator and a trailing 'Z' or
-// numeric UTC offset so a loosely-formatted or ambiguous value (`0`,
-// `08/08/2026`) is rejected by shape before Date.parse ever sees it --
-// Date.parse's non-standard fallback parsing accepts both and would
-// otherwise silently query an unintended time range instead of failing
-// closed (PR #156 follow-up review). The offset's colon is optional so both
-// extended (`+00:00`) and basic (`+0000`) ISO-8601 numeric offsets are
-// accepted -- Date.parse itself already accepts both, and requiring the
-// colon would silently reject a well-formed, unambiguous timestamp a caller
-// previously relied on being accepted (PR #158 review).
-const ISO_8601_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:?\d{2})$/;
-
 export function queryTimestamp(value: string | undefined, label: string): string | undefined {
   if (value === undefined) return undefined;
-  if (!ISO_8601_TIMESTAMP.test(value)) throw new Error(`${label} must be an ISO-8601 timestamp`);
-  const timestamp = Date.parse(value);
-  if (Number.isNaN(timestamp)) throw new Error(`${label} must be an ISO-8601 timestamp`);
-  return new Date(timestamp).toISOString();
+  const normalized = normalizeIso8601Timestamp(value);
+  if (!normalized) throw new Error(`${label} must be an ISO-8601 timestamp`);
+  return normalized;
 }
 
 // Every other filter on these endpoints fails closed on a malformed value; a

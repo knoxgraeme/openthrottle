@@ -636,6 +636,7 @@ sentence, or links rendered after it.
 | `GET` | `/status` | `OT_STATUS_TOKEN` bearer | tickets and pipeline/effect/publication state |
 | `GET` | `/capabilities` | `OT_STATUS_TOKEN` bearer | active runtime release, capability digest/IDs, and effective limits |
 | `GET` | `/analysis/runs` | `OT_STATUS_TOKEN` bearer | read-only, filterable `run_outcomes` evidence for improvement proposals |
+| `POST` | `/analysis/citations/grade` | `OT_STATUS_TOKEN` bearer | reproduce proposal citations and deterministically grade their evidence graph |
 | `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered routes |
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | coordinator stop |
@@ -776,6 +777,20 @@ tables such as `run_liveness`, `session_executions`,
 `pipeline_runtime_resources`, `run_stage_bindings`, and
 `pipeline_work_bindings` remain in immutable migrations only; live state is
 stored on the owning actor, session, instance, attempt, or work row.
+
+Citation-backed proposal flows use a separate provider-neutral citation gate.
+`/analysis/citations/grade` is still the only production path that resolves
+analysis queries against `run_outcomes`; after resolution it calls the
+pipeline-level citation gate with plain proposal bytes plus resolved result
+rows. The gate emits canonical `openthrottle.citation-gate/v1` decisions with
+bounded reason codes (`all_citations_reproduced`,
+`partial_claim_survival`, `no_claims_survived`, `stale_evidence`) and persists
+them in `citation_gate_receipts` by proposal
+hash. Exact replay returns the original receipt; the same proposal hash paired
+with different resolved evidence is rejected as conflicting replay. Scheduler,
+transition, reducer, and effect-drain code must not import the analysis store
+to recreate this evidence, and must not treat citation receipts as authority to
+advance pipeline execution.
 
 Stage C child-unit work must add any needed live binding state to the owning
 unit/work records rather than reviving empty historical binding tables.

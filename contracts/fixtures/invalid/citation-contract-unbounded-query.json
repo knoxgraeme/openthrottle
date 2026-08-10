@@ -1,0 +1,46 @@
+{
+  "schema": "openthrottle.citation-contract/v1",
+  "id": "bad_citation_contract",
+  "summary": "Unbounded query limits must fail closed.",
+  "claims": [
+    {
+      "id": "claim_one",
+      "text": "A claim.",
+      "citation_ids": [
+        "citation_one"
+      ]
+    }
+  ],
+  "citations": [
+    {
+      "id": "citation_one",
+      "query": {
+        "limit": 1000
+      },
+      "expected_result": [],
+      "source_digests": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ]
+    }
+  ],
+  "dispositions": [
+    {
+      "claim_id": "claim_one",
+      "disposition": "supported",
+      "rationale": "Bound.",
+      "citation_ids": [
+        "citation_one"
+      ]
+    }
+  ],
+  "grades": [
+    {
+      "id": "overall",
+      "value": "pass",
+      "disposition_claim_ids": [
+        "claim_one"
+      ],
+      "rationale": "Bound."
+    }
+  ]
+}

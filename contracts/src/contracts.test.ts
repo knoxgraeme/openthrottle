@@ -5,7 +5,7 @@ import { digestCanonicalJson } from "./canonical.js";
 import { parseRepositoryConfigContract } from "./config.js";
 import { parseExecutionPlanContract } from "./execution-plan.js";
 import { parseGraphContract } from "./graph.js";
-import { parseStandardReceipt, validateStandardReceipt } from "./receipts.js";
+import { parseCitationContractProposal, parseStandardReceipt, validateStandardReceipt } from "./index.js";
 
 const fixtureRoot = new URL("../fixtures", import.meta.url);
 
@@ -19,6 +19,7 @@ function invalidFixtures(): string[] {
 
 function parseByName(name: string, raw: string): unknown {
   if (name.startsWith("config-")) return parseRepositoryConfigContract(raw, { source: name });
+  if (name.startsWith("citation-contract")) return parseCitationContractProposal(raw, { source: name });
   if (name.startsWith("graph-")) return parseGraphContract(raw, { source: name });
   if (name === "execution-plan.json" || name.startsWith("execution-plan-")) {
     return parseExecutionPlanContract(raw, { source: name });
@@ -28,6 +29,11 @@ function parseByName(name: string, raw: string): unknown {
 }
 
 const invalidCases = [
+  ["citation-contract-empty-claim-citations.json", /claims\[0\]\.citation_ids: must contain between 1 and 32 entries/],
+  ["citation-contract-unknown-citation.json", /claims\.claim_one\.citation_ids: references an unknown citation/],
+  ["citation-contract-unknown-field.json", /claims\[0\]\.confidence: unknown field/],
+  ["citation-contract-unbounded-query.json", /query\.limit: must be an integer between 1 and 200/],
+  ["citation-contract-unsupported-query.json", /query\.outcome: must be one of/],
   ["config-path-traversal.json", /ref: has an invalid format/],
   ["config-provider-secret-env.json", /must not name a provider-secret identifier/],
   ["config-unknown-field.json", /unexpected: unknown field/],
@@ -122,6 +128,7 @@ describe("Stage C contract fixtures", () => {
   it("accepts and normalizes the frozen valid corpora", () => {
     const fixtures = [
       "config-repository.json",
+      "citation-contract.json",
       "graph-structured.json",
       "execution-plan.json",
       "receipt-unit-completion.json",
@@ -135,6 +142,115 @@ describe("Stage C contract fixtures", () => {
       expect(JSON.parse(validated.normalized)).toEqual(validated.value);
       expect(validated.digest).toBe(digestCanonicalJson(validated.value));
     }
+  });
+
+  it("requires claims and their dispositions to cite evidence", () => {
+    const raw = readFixture("valid", "citation-contract.json");
+    const proposal = JSON.parse(raw) as {
+      claims: Array<{ citation_ids: string[] }>;
+      dispositions: Array<{ citation_ids: string[] }>;
+    };
+
+    proposal.dispositions[0]!.citation_ids = [];
+    expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+      .toThrow(/dispositions\[0\]\.citation_ids: must contain between 1 and 32 entries/);
+  });
+
+  it("rejects unsupported timestamps and normalizes equivalent ISO offsets", () => {
+    const raw = readFixture("valid", "citation-contract.json");
+    const proposal = JSON.parse(raw) as {
+      citations: Array<{
+        query: { from?: string };
+        expected_result: Array<{ created_at: string }>;
+      }>;
+    };
+
+    for (const unsupported of [
+      "2026",
+      "2026-08-08",
+      "08/08/2026",
+      "0",
+      "2026-02-30T00:00:00Z",
+      "2026-13-01T00:00:00Z",
+      "2026-08-08T24:00:00Z",
+      "2026-08-08T00:00:00+24:00",
+    ]) {
+      proposal.citations[0]!.query.from = unsupported;
+      expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+        .toThrow(/query\.from: must be an ISO-8601 timestamp/);
+    }
+
+    proposal.citations[0]!.query.from = "2026-08-08T02:00:00+0200";
+    proposal.citations[0]!.expected_result[0]!.created_at = "2026-08-08T02:00:00+02:00";
+    const parsed = parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" });
+    expect(parsed.value.citations[0]!.query.from).toBe("2026-08-08T00:00:00.000Z");
+    expect(parsed.value.citations[0]!.expected_result[0]!.created_at).toBe("2026-08-08T00:00:00.000Z");
+  });
+
+  it("rejects reversed citation windows after normalization while allowing equality", () => {
+    const proposal = JSON.parse(readFixture("valid", "citation-contract.json")) as {
+      citations: Array<{ query: { from?: string; to?: string } }>;
+    };
+    proposal.citations[0]!.query.from = "2026-08-08T03:00:00+02:00";
+    proposal.citations[0]!.query.to = "2026-08-08T00:00:00Z";
+    expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+      .toThrow(/query: from must not be later than to/);
+
+    proposal.citations[0]!.query.from = "2026-08-08T02:00:00+02:00";
+    const parsed = parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" });
+    expect(parsed.value.citations[0]!.query).toMatchObject({
+      from: "2026-08-08T00:00:00.000Z",
+      to: "2026-08-08T00:00:00.000Z",
+    });
+  });
+
+  it("rejects declared citations that no claim or disposition references", () => {
+    const proposal = JSON.parse(readFixture("valid", "citation-contract.json")) as {
+      citations: Array<Record<string, unknown>>;
+    };
+    proposal.citations.push({
+      id: "orphan_citation",
+      query: { outcome: "failed" },
+      expected_result: [],
+      source_digests: ["b".repeat(64)],
+    });
+
+    expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+      .toThrow(/citations\.orphan_citation: must be referenced by a claim or disposition/);
+  });
+
+  it("requires unique grades to cover every claim disposition", () => {
+    const proposal = JSON.parse(readFixture("valid", "citation-contract.json")) as {
+      claims: Array<Record<string, unknown>>;
+      citations: Array<Record<string, unknown>>;
+      dispositions: Array<Record<string, unknown>>;
+      grades: Array<{ id: string; disposition_claim_ids: string[] }>;
+    };
+    proposal.grades[0]!.disposition_claim_ids = [];
+    expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+      .toThrow(/grades\[0\]\.disposition_claim_ids: must contain between 1 and 64 entries/);
+
+    proposal.claims.push({ id: "claim_two", text: "Second claim.", citation_ids: ["citation_two"] });
+    proposal.citations.push({
+      id: "citation_two",
+      query: { outcome: "shipped" },
+      expected_result: [],
+      source_digests: ["b".repeat(64)],
+    });
+    proposal.dispositions.push({
+      claim_id: "claim_two",
+      disposition: "supported",
+      rationale: "Second disposition.",
+      citation_ids: ["citation_two"],
+    });
+    proposal.grades[0]!.disposition_claim_ids = ["claim_failed_agent_runs"];
+    expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+      .toThrow(/grades: must include every claim disposition/);
+
+    proposal.grades[0]!.disposition_claim_ids.push("claim_two");
+    proposal.grades.push({ ...proposal.grades[0]!, disposition_claim_ids: ["claim_two"] });
+    expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+      .toThrow(/grades: must not contain duplicate IDs/);
   });
 
   it("keeps map ordering irrelevant while preserving authored array order", () => {

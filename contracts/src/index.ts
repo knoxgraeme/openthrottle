@@ -46,6 +46,23 @@ export {
   type LogicalCredential,
 } from "./graph.js";
 export {
+  ANALYSIS_QUERY_ATTRIBUTIONS,
+  ANALYSIS_QUERY_OUTCOMES,
+  ANALYSIS_QUERY_REASONS,
+  CITATION_CONTRACT_SCHEMA,
+  CLAIM_DISPOSITIONS,
+  GRADE_VALUES,
+  parseCitationContractProposal,
+  validateCitationContractProposal,
+  type AnalysisRunQuery,
+  type AnalysisRunResult,
+  type CitationContractCitation,
+  type CitationContractClaim,
+  type CitationContractDisposition,
+  type CitationContractGrade,
+  type CitationContractProposal,
+} from "./citation-contract.js";
+export {
   EXECUTION_PLAN_SCHEMA,
   parseExecutionPlanContract,
   validateExecutionPlanContract,
@@ -83,5 +100,10 @@ export {
   type UnitDecisionPayload,
   type UnitDecisionReceipt,
 } from "./receipts.js";
-export { COMMAND_NAME_PATTERN, PRODUCER_SKILL_REFERENCE, SKILL_REFERENCE } from "./validation.js";
+export {
+  COMMAND_NAME_PATTERN,
+  PRODUCER_SKILL_REFERENCE,
+  SKILL_REFERENCE,
+  normalizeIso8601Timestamp,
+} from "./validation.js";
 export type { ValidatedContract } from "./validation.js";

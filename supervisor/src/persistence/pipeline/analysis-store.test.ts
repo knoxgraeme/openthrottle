@@ -182,6 +182,8 @@ describe("analysis store", () => {
     expect(() => store.listRunOutcomes({ from: "0" })).toThrow(/from must be an ISO-8601 timestamp/);
     expect(() => store.listRunOutcomes({ from: "08/08/2026" })).toThrow(/from must be an ISO-8601 timestamp/);
     expect(() => store.listRunOutcomes({ to: "2026-08-08" })).toThrow(/to must be an ISO-8601 timestamp/);
+    expect(() => store.listRunOutcomes({ to: "2026-02-30T00:00:00Z" }))
+      .toThrow(/to must be an ISO-8601 timestamp/);
     expect(store.listRunOutcomes({ from: "2026-08-08T00:00:00.000Z" })).toEqual([]);
     expect(store.listRunOutcomes({ from: "2026-08-08T00:00:00+00:00" })).toEqual([]);
     expect(store.listRunOutcomes({ from: "2026-08-08T00:00:00+0000" })).toEqual([]);
