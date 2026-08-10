@@ -72,6 +72,7 @@ describe("review fanout runtime contract", () => {
       "agent-native-contracts",
       "performance",
     ]);
+    expect(plan.max_parallel).toBe(1);
     expect(new Set(plan.personas.map((persona) => persona.id)).size).toBe(plan.personas.length);
   });
 

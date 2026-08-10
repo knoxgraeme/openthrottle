@@ -766,9 +766,10 @@ fixed, so diagnostic rewording cannot duplicate or prematurely resolve a
 finding. Rereview searches the newest bounded history window. A
 missing or malformed prior journal is appended as a separate audit-gap note and
 cannot block, pass, or otherwise authorize the live receipt/gate decision.
-Persona actions remain independent sessions. Claude and OpenCode personas may
-run concurrently within the sealed fanout bound. Codex personas are dispatched
-in deterministic roster order, one at a time, because their shared subscription
+Persona actions remain independent sessions, but all engines execute the
+deterministic roster one action at a time within the shared sealed sandbox.
+Concurrent siblings would race the sandbox's action-directory locks. Codex has
+an additional serialization requirement because its shared subscription
 credential has a rotating one-time refresh token: the supervisor captures the
 completed persona's action-scoped auth snapshot before it materializes the next
 persona's credentials. Selector, persona, and validator dispatch intent is

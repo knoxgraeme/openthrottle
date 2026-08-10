@@ -216,10 +216,10 @@ name a concrete symbol, contract field, or state transition rather than a
 generic file/module/change label. The supervisor chooses one existing group
 representative by explicit severity and stable byte ordering; only that exact
 representative can enter consolidated final repair.
-Persona sessions are independent; Claude and OpenCode can use the sealed
-parallel fanout, while Codex personas run in deterministic roster order so each
-rotated subscription-auth snapshot is captured before the next action receives
-credentials.
+Persona sessions are independent, but every engine runs the deterministic
+roster one action at a time because the personas share one sandbox whose
+action-directory locks must not overlap. Codex also captures each rotated
+subscription-auth snapshot before the next action receives credentials.
 
 **Why the split is a fork, not a thicken.** `publish` and the review/simplify
 stages could have wrapped a shared external toolkit instead of restating its

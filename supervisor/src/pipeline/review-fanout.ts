@@ -378,7 +378,7 @@ export function buildReviewFanoutPlan(input: {
     policy_digest: authority.policy_digest,
     selection_id: selectionId,
     selector_receipt_hash: input.selectorReceiptHash ?? null,
-    max_parallel: selected.length,
+    max_parallel: 1,
     personas: selected,
   };
 }

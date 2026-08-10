@@ -288,7 +288,7 @@ describe("downstream-context admission bound", () => {
       "agent-native-contracts",
       "performance",
     ]);
-    expect(context.review_fanout.max_parallel).toBe(context.review_fanout.personas.length);
+    expect(context.review_fanout.max_parallel).toBe(1);
 
     const finalReviewContext = loopActionPlanContext({
       plan,
