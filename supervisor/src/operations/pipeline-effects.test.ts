@@ -23,7 +23,7 @@ import type { ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js
 import type { PipelineInstance, PipelineStageAttempt } from "../pipeline/store.js";
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 import type { RuntimeResourceReconciler } from "./runtime-resource-reclaim.js";
-import { validateReviewJournalContract } from "@openthrottle/contracts";
+import { validateReviewJournalContract, type ReviewFinding, type SemanticReviewReceipt } from "@openthrottle/contracts";
 import { buildReviewSelectorAuthority } from "../pipeline/review-fanout.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
@@ -1294,10 +1294,15 @@ describe("pipeline effect processor", () => {
       message: "[supervisor/src/example/effects.ts#drainEffect: changed control and data flow preserves declared behavior] Failed settlement can silently pass.",
       path: "supervisor/src/example/effects.ts",
     };
+    const advisoryFinding = {
+      severity: "P2" as const,
+      message: "[supervisor/src/example/effects.ts#drainEffectDiagnostics: changed control and data flow preserves declared behavior] Add a diagnostic assertion for operator visibility.",
+      path: "supervisor/src/example/effects.ts",
+    };
     const semanticReceiptFor = (request: typeof selectorRequest, input: {
       result: "success" | "semantic_repair_required";
       summary: string;
-      findings: typeof acceptedFinding[];
+      findings: ReviewFinding[];
     }) => canonicalJson({
       schema: "openthrottle.receipt/v1",
       type: "semantic_review",
@@ -1325,6 +1330,7 @@ describe("pipeline effect processor", () => {
       payload: { summary: input.summary, findings: input.findings },
       issued_at: "2099-07-22T12:00:00.000Z",
     });
+    let selectorReceipt: string | null = null;
     runtime.collectLoopActionResult.mockImplementation(async (_resource, collection) => {
       const dispatched = runtime.dispatchLoopAction.mock.calls
         .map(([, request]) => request)
@@ -1333,9 +1339,11 @@ describe("pipeline effect processor", () => {
       const isSelector = dispatched.skill === "select-review-personas";
       const isValidator = dispatched.skill === "validate-review-findings";
       const firstReviewCycle = dispatched.inputSubject === integratedSubjectB;
-      const findings = firstReviewCycle && (dispatched.skill === "correctness-dataflow" || isValidator)
-        ? [acceptedFinding]
-        : [];
+      const findings: ReviewFinding[] = firstReviewCycle && dispatched.skill === "correctness-dataflow"
+        ? [acceptedFinding, advisoryFinding]
+        : firstReviewCycle && isValidator
+          ? [acceptedFinding]
+          : [];
       const summary = isSelector
         ? canonicalJson({
             schema: "openthrottle.review-selector-recommendation/v1",
@@ -1349,6 +1357,12 @@ describe("pipeline effect processor", () => {
         : isValidator
           ? "One blocking finding was independently reproduced."
           : "Persona review complete.";
+      const receipt = semanticReceiptFor(dispatched, {
+        result: findings.length > 0 ? "semantic_repair_required" : "success",
+        summary,
+        findings,
+      });
+      if (isSelector) selectorReceipt = receipt;
       return {
         actionId: dispatched.actionId,
         attemptId: dispatched.attemptId,
@@ -1356,13 +1370,22 @@ describe("pipeline effect processor", () => {
         outcome: "success",
         nativeSessionId: null,
         subject: integratedSubjectB,
-        receipt: semanticReceiptFor(dispatched, {
-          result: findings.length > 0 ? "semantic_repair_required" : "success",
-          summary,
-          findings,
-        }),
+        receipt,
         completedAt: "2099-07-22T12:00:00.000Z",
       };
+    });
+    let fanoutDispatchFailed = false;
+    let validatorDispatchFailed = false;
+    runtime.dispatchLoopAction.mockImplementation(async (_resource, request) => {
+      if (request.skill === "correctness-dataflow" && !fanoutDispatchFailed) {
+        fanoutDispatchFailed = true;
+        throw new Error("transient persona dispatch timeout");
+      }
+      if (request.skill === "validate-review-findings" && !validatorDispatchFailed) {
+        validatorDispatchFailed = true;
+        throw new Error("transient validator dispatch timeout");
+      }
+      return { providerDispatchId: "loop-child-drain" };
     });
     const restartedProcessor = createPipelineEffectProcessor({
       store: pipelines,
@@ -1374,8 +1397,27 @@ describe("pipeline effect processor", () => {
     });
     await restartedProcessor.drain();
     expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
+      status: "dispatched",
+      last_error: null,
+    });
+    await restartedProcessor.drain();
+    expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
+      status: "dispatched",
+      last_error: null,
+    });
+    await restartedProcessor.drain();
+    expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
       status: "completed",
     });
+    expect(fanoutDispatchFailed).toBe(true);
+    expect(validatorDispatchFailed).toBe(true);
+    const persistedReviewReceipt = JSON.parse(
+      pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)!.receipt!
+    ) as SemanticReviewReceipt;
+    expect(persistedReviewReceipt.payload.findings).toEqual([acceptedFinding]);
+    expect(persistedReviewReceipt.payload.findings).not.toContainEqual(advisoryFinding);
+    expect(selectorReceipt).not.toBeNull();
+    expect(persistedReviewReceipt.evidence).toContain(digestNormalized(selectorReceipt!));
     const reviewJournalEntry = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
       .find((entry) => entry.trigger === "structured_review_fanout");
     expect(reviewJournalEntry).toBeDefined();
@@ -1386,9 +1428,15 @@ describe("pipeline effect processor", () => {
       "correctness-dataflow",
       "tests-contracts",
     ]);
-    expect(reviewJournal.finding_resolutions).toEqual([
+    expect(reviewJournal.finding_resolutions).toHaveLength(2);
+    expect(reviewJournal.finding_resolutions).toEqual(expect.arrayContaining([
       expect.objectContaining({ validator_result: "accepted", state: "unresolved", convergence_cycle: 1 }),
-    ]);
+    ]));
+    const reviewGatePayload = JSON.parse(
+      pipelines.listGateReceipts(attempt.id).find((gate) => gate.execution_work_attempt_id === review.id)!.payload
+    ) as { review_fanout_synthesis: { findings: ReviewFinding[]; receipt_hashes: string[] } };
+    expect(reviewGatePayload.review_fanout_synthesis.findings).toContainEqual(advisoryFinding);
+    expect(reviewGatePayload.review_fanout_synthesis.receipt_hashes).toContain(digestNormalized(selectorReceipt!));
 
     await restartedProcessor.drain();
     expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
@@ -1471,6 +1519,8 @@ describe("pipeline effect processor", () => {
 
     await processor.drain();
     const freshReview = latestAction("final_review");
+    expect(freshReview.cycle).toBe(2);
+    expect(freshReview.parent_run_id).toBe(review.parent_run_id);
     expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
       expect.objectContaining({
@@ -1481,6 +1531,35 @@ describe("pipeline effect processor", () => {
         inputSubject: finalIntegratedSubject,
       })
     );
+    for (let index = 0; index < 1_001; index += 1) {
+      pipelines.recordJournalEntry({
+        issueId: instance.linear_issue_id,
+        instanceId: instance.id,
+        runId: review.parent_run_id,
+        actor: "supervisor",
+        kind: "run_note",
+        trigger: "review_history_noise",
+        action: `Older unrelated journal row ${index}.`,
+        refs: { index },
+      });
+    }
+    db!.prepare("UPDATE orchestration_journal SET recorded_at = ? WHERE trigger = ?")
+      .run("2000-01-01T00:00:00.000Z", "review_history_noise");
+    pipelines.recordJournalEntry({
+      id: "00000000-0000-4000-8000-000000001138",
+      issueId: instance.linear_issue_id,
+      instanceId: instance.id,
+      runId: freshReview.parent_run_id,
+      actor: "supervisor",
+      kind: "run_note",
+      trigger: "structured_review_fanout",
+      action: "Malformed review journal evidence must not control the live gate.",
+      outcome: "failure",
+      refs: { cycle: 1 },
+      structured: { malformed: true },
+    });
+    db!.prepare("UPDATE orchestration_journal SET recorded_at = ? WHERE id = ?")
+      .run("2100-01-01T00:00:00.000Z", "00000000-0000-4000-8000-000000001138");
     await restartedProcessor.drain();
     const settledFreshReview = pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === freshReview.id);
     expect(settledFreshReview?.last_error).toBeNull();
@@ -1488,21 +1567,40 @@ describe("pipeline effect processor", () => {
       status: "completed",
       output_subject: finalIntegratedSubject,
     });
-    const rereviewJournalEntry = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
-      .filter((entry) => entry.trigger === "structured_review_fanout")
+    const newestJournalWindow = pipelines.listJournalEntries({ issueId: instance.linear_issue_id, order: "newest", limit: 1_000 });
+    expect(newestJournalWindow.some((entry) => entry.id === reviewJournalEntry!.id)).toBe(true);
+    expect(newestJournalWindow.some((entry) => entry.id === "00000000-0000-4000-8000-000000001138")).toBe(true);
+    expect(newestJournalWindow[0]?.id).toBe("00000000-0000-4000-8000-000000001138");
+    expect(newestJournalWindow[0]).toMatchObject({
+      instance_id: instance.id,
+      run_id: freshReview.parent_run_id,
+      trigger: "structured_review_fanout",
+      structured: canonicalJson({ malformed: true }),
+    });
+    const rereviewJournalGaps = newestJournalWindow
+      .filter((entry) => entry.trigger === "structured_review_journal_gap");
+    expect(rereviewJournalGaps).toEqual([
+      expect.objectContaining({
+        outcome: "failure",
+        action: expect.stringContaining("ignored 1 invalid prior review journal candidate row"),
+      }),
+    ]);
+    const rereviewJournalEntry = newestJournalWindow
+      .filter((entry) => entry.trigger === "structured_review_fanout" && entry.action.includes("cycle 2 resolution state"))
       .at(-1);
     expect(rereviewJournalEntry).toBeDefined();
     const rereviewJournal = validateReviewJournalContract(JSON.parse(rereviewJournalEntry!.structured!), {
       source: "persisted_rereview_journal",
     }).value;
-    expect(rereviewJournal.finding_resolutions).toEqual([
+    expect(rereviewJournal.finding_resolutions).toHaveLength(2);
+    expect(rereviewJournal.finding_resolutions).toEqual(expect.arrayContaining([
       expect.objectContaining({
         finding_id: reviewJournal.finding_resolutions[0]!.finding_id,
         repair_disposition: "fixed",
         state: "resolved",
         convergence_cycle: 2,
       }),
-    ]);
+    ]));
 
     const mismatchedReviewSubject = "f".repeat(40);
     db!.prepare(`

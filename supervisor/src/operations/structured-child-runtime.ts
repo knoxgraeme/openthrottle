@@ -76,6 +76,13 @@ const GIT_SHA1_SUBJECT = /^[a-f0-9]{40}$/;
 // Head slice for a non-success diagnostic stored as lastError -- fits inside
 // the 2,000-char budget the store applies (unit-store.ts) with room to spare.
 const DIAGNOSTIC_TEXT_HEAD_CHARS = 1_500;
+
+class RetryableReviewRuntimeError extends Error {
+  constructor(operation: string, cause: unknown) {
+    super(`${operation}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "RetryableReviewRuntimeError";
+  }
+}
 const ACTION_OUTPUT_ORDER: Record<UnitActionKind, number> = {
   implement: 10,
   repair: 10,
@@ -827,6 +834,14 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     },
   });
 
+  const reviewRuntimeCall = async <T>(operation: string, execute: () => Promise<T>): Promise<T> => {
+    try {
+      return await execute();
+    } catch (error) {
+      throw new RetryableReviewRuntimeError(operation, error);
+    }
+  };
+
   const collectReviewFanout = async (input: {
     resource: RuntimeResource;
     instance: PipelineInstance;
@@ -849,11 +864,14 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     const receipts: SemanticReviewReceipt[] = [];
     const receiptResults: Array<{ receipt: SemanticReviewReceipt; completedAt: string }> = [];
     for (const request of input.requests) {
-      const result = await deps.runtime.collectLoopActionResult(input.resource, {
-        attemptId: request.attemptId,
-        actionId: request.actionId,
-        requestHash: request.requestHash,
-      });
+      const result = await reviewRuntimeCall(
+        `review fanout action ${request.actionId} result collection failed`,
+        () => deps.runtime.collectLoopActionResult(input.resource, {
+          attemptId: request.attemptId,
+          actionId: request.actionId,
+          requestHash: request.requestHash,
+        })
+      );
       if (!result) return { pending: true };
       if (result.outcome !== "success") {
         return {
@@ -945,11 +963,14 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
     lastError: string;
   }> => {
-    const result = await deps.runtime.collectLoopActionResult(input.resource, {
-      attemptId: input.request.attemptId,
-      actionId: input.request.actionId,
-      requestHash: input.request.requestHash,
-    });
+    const result = await reviewRuntimeCall(
+      `review subaction ${input.request.actionId} result collection failed`,
+      () => deps.runtime.collectLoopActionResult(input.resource, {
+        attemptId: input.request.attemptId,
+        actionId: input.request.actionId,
+        requestHash: input.request.requestHash,
+      })
+    );
     if (!result) return { pending: true };
     if (typeof result.codexAuthJson === "string" && result.codexAuthJson) deps.captureCodexAuth?.(result.codexAuthJson);
     if (result.outcome !== "success") {
@@ -1022,28 +1043,35 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   const previousReviewJournal = (
     instance: PipelineInstance,
     action: ExecutionWorkAttempt
-  ): ReviewJournalContract | undefined => {
-    if (action.cycle < 2) return undefined;
-    const entries = deps.store.listJournalEntries({ issueId: instance.linear_issue_id, limit: 1_000 })
+  ): { journal?: ReviewJournalContract; auditError?: string } => {
+    if (action.cycle < 2) return {};
+    const entries = deps.store.listJournalEntries({ issueId: instance.linear_issue_id, limit: 1_000, order: "newest" })
       .filter((entry) =>
         entry.instance_id === instance.id &&
         entry.run_id === action.parent_run_id &&
         entry.trigger === "structured_review_fanout" &&
-        entry.structured !== null)
-      .reverse();
+        entry.structured !== null);
+    let invalidEntries = 0;
     for (const entry of entries) {
       try {
         const journal = validateReviewJournalContract(JSON.parse(entry.structured!), {
           source: `orchestration_journal.${entry.id}.structured`,
         }).value;
         if (journal.finding_resolutions.some((resolution) => resolution.convergence_cycle === action.cycle - 1)) {
-          return journal;
+          return {
+            journal,
+            ...(invalidEntries > 0
+              ? { auditError: `ignored ${invalidEntries} invalid prior review journal candidate row(s)` }
+              : {}),
+          };
         }
       } catch {
-        continue;
+        invalidEntries += 1;
       }
     }
-    throw new Error(`final review cycle ${action.cycle} has no valid prior review journal`);
+    return {
+      auditError: `final review cycle ${action.cycle} has no valid prior review journal (${invalidEntries} invalid candidate row(s))`,
+    };
   };
 
   const synthesizeFinalReviewReceipt = (input: {
@@ -1718,7 +1746,10 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       });
       for (const request of fanoutRequests) {
         assertLoopRequestEnvelopeBound(request);
-        await deps.runtime.dispatchLoopAction(resource, request);
+        await reviewRuntimeCall(
+          `review fanout action ${request.actionId} dispatch failed`,
+          () => deps.runtime.dispatchLoopAction(resource, request)
+        );
       }
       const fanout = await collectReviewFanout({
         resource,
@@ -1747,7 +1778,10 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           timeoutMs: selectorRequest.timeoutMs,
         });
         assertLoopRequestEnvelopeBound(validatorRequest);
-        await deps.runtime.dispatchLoopAction(resource, validatorRequest);
+        await reviewRuntimeCall(
+          `review validator action ${validatorRequest.actionId} dispatch failed`,
+          () => deps.runtime.dispatchLoopAction(resource, validatorRequest)
+        );
         const validator = await collectReviewSubaction({
           resource,
           instance,
@@ -1779,13 +1813,35 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         .filter((value): value is string => value !== null)
         .sort();
       const issuedAt = completedTimes.at(-1) ?? deps.now().toISOString();
+      const repairAuthoritativeSynthesis: ReviewFanoutSynthesis = {
+        ...validated.synthesis,
+        findings: validated.synthesis.findings.filter((finding) => finding.severity === "P0" || finding.severity === "P1"),
+      };
       const reviewReceipt = synthesizeFinalReviewReceipt({
         expected,
-        synthesis: validated.synthesis,
+        synthesis: repairAuthoritativeSynthesis,
         commandHashes: commands.map((command) => digestNormalized(canonicalJson(command.receipt))),
         issuedAt,
       });
       const priorJournal = previousReviewJournal(instance, action);
+      if (priorJournal.auditError) {
+        deps.store.recordJournalEntry({
+          issueId: instance.linear_issue_id,
+          instanceId: instance.id,
+          runId: action.parent_run_id,
+          actor: "supervisor",
+          kind: "run_note",
+          trigger: "structured_review_journal_gap",
+          action: priorJournal.auditError,
+          outcome: "failure",
+          refs: {
+            pipeline_instance_id: instance.id,
+            action_attempt_id: action.id,
+            cycle: action.cycle,
+            subject: reviewSubject,
+          },
+        });
+      }
       const journal = buildReviewJournal({
         plan: fanoutPlan,
         baseSubject: instance.base_commit,
@@ -1794,7 +1850,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         cycle: action.cycle,
         actionCreatedAt: action.created_at,
         recordedAt: issuedAt,
-        ...(priorJournal ? { previousJournal: priorJournal } : {}),
+        ...(priorJournal.journal ? { previousJournal: priorJournal.journal } : {}),
       });
       deps.store.recordJournalEntry({
         issueId: instance.linear_issue_id,
@@ -1840,6 +1896,10 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         decision,
       };
     } catch (error) {
+      // Provider dispatch/collection failures are not semantic review
+      // decisions. Leave the fenced parent action active so the next drain
+      // can replay the same deterministic subaction ids idempotently.
+      if (error instanceof RetryableReviewRuntimeError) return null;
       return terminalFailure(error);
     }
   };

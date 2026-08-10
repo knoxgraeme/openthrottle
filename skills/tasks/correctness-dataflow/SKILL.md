@@ -39,6 +39,11 @@ defensible findings over broad commentary.
 
 ## Required Postconditions
 
+- Never emit more than the sealed `max_findings` (8 under the current policy).
+  Rank actionable defects before writing the receipt. If more remain after
+  exact and semantic deduplication, return the highest-priority bounded set
+  with `result: "needs_human"` and say in the summary that the sealed bound
+  omitted additional findings; never truncate silently.
 - The receipt is report-only and contains no file edits, command-gate claims,
   PR actions, ticket actions, or provider mutations.
 - Each blocking finding quotes or paraphrases the concrete construct in this
@@ -75,7 +80,7 @@ present, `needs_human` for a required product or architecture decision, and
   "assurance": "semantic_attested",
   "result": "semantic_repair_required",
   "producer": {
-    "worker_id": "correctness-dataflow-reviewer",
+    "worker_id": "correctness-dataflow",
     "skill": "builtin://correctness-dataflow@1",
     "capability_digest": "0000000000000000000000000000000000000000000000000000000000000000",
     "skill_package_digest": null

@@ -13,6 +13,7 @@ export const REVIEW_FANOUT_PLAN_SCHEMA = "openthrottle.review-fanout-plan/v1" as
 export const REVIEW_FANOUT_SYNTHESIS_SCHEMA = "openthrottle.review-fanout-synthesis/v1" as const;
 export const REVIEW_SELECTOR_AUTHORITY_SCHEMA = "openthrottle.review-selector-authority/v1" as const;
 export const REVIEW_SELECTOR_RECOMMENDATION_SCHEMA = "openthrottle.review-selector-recommendation/v1" as const;
+export const REVIEW_MAX_FINDINGS_PER_PERSONA = 8;
 
 export const REVIEW_PERSONA_CATALOG = [
   {
@@ -114,6 +115,7 @@ export interface ReviewFanoutPlan {
     mandatory: boolean;
     focus: string;
     invariant: string;
+    max_findings: number;
     reason: ReviewFanoutReason;
     rationale: string;
   }>;
@@ -131,6 +133,7 @@ export interface ReviewSelectorAuthority {
     mandatory: boolean;
     focus: string;
     invariant: string;
+    max_findings: number;
   }>;
 }
 
@@ -190,7 +193,7 @@ export function reviewPolicyContract(): ReviewPolicyContract {
       title: persona.title,
       focus: persona.focus,
       invariants: [persona.invariant],
-      max_findings: 8,
+      max_findings: REVIEW_MAX_FINDINGS_PER_PERSONA,
     })),
     max_personas_per_selection: REVIEW_PERSONA_CATALOG.length,
     max_findings_per_journal: 64,
@@ -227,6 +230,7 @@ export function buildReviewSelectorAuthority(input: {
       mandatory: persona.mandatory,
       focus: persona.focus,
       invariant: persona.invariant,
+      max_findings: REVIEW_MAX_FINDINGS_PER_PERSONA,
     })),
   };
 }
@@ -334,6 +338,7 @@ export function buildReviewFanoutPlan(input: {
       mandatory: persona.mandatory,
       focus: persona.focus,
       invariant: persona.invariant,
+      max_findings: REVIEW_MAX_FINDINGS_PER_PERSONA,
       reason,
       rationale: reason === "mandatory_baseline"
         ? recommended.has(persona.id)
@@ -427,6 +432,10 @@ export function synthesizeReviewFanout(input: {
     const receipt = receiptsByPersona.get(personaId)!;
     const nextOutcome = receiptOutcome(receipt);
     if (outcomeRank(nextOutcome) > outcomeRank(outcome)) outcome = nextOutcome;
+    const persona = input.plan.personas.find((entry) => entry.id === personaId)!;
+    if (receipt.payload.findings.length > persona.max_findings) {
+      throw new Error(`review fanout receipt ${personaId} exceeds max_findings ${persona.max_findings}`);
+    }
     for (const finding of receipt.payload.findings) {
       const key = findingKey(finding);
       if (!findings.has(key)) findings.set(key, finding);
@@ -443,7 +452,10 @@ export function synthesizeReviewFanout(input: {
       ? "All review personas completed without findings."
       : "Review personas completed and synthesis requires follow-up.",
     findings: [...findings.values()],
-    receipt_hashes: expectedIds.map((personaId) => receiptHash(receiptsByPersona.get(personaId)!)),
+    receipt_hashes: [
+      ...(input.plan.selector_receipt_hash ? [input.plan.selector_receipt_hash] : []),
+      ...expectedIds.map((personaId) => receiptHash(receiptsByPersona.get(personaId)!)),
+    ],
   };
 }
 

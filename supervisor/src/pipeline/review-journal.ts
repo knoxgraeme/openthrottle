@@ -7,6 +7,7 @@ import {
   REVIEW_SYNTHESIS_SCHEMA,
   REVIEW_VALIDATION_SCHEMA,
   deriveReviewFindingId,
+  deriveReviewSemanticGroupId,
   digestCanonicalJson,
   validateReviewJournalContract,
   type ReviewFinding,
@@ -121,34 +122,64 @@ export function buildReviewJournal(input: {
       cost_microusd: null,
     };
   });
-  const contractFindings = new Map<string, ReviewFindingContract>();
+  const currentFindings = new Map<string, ReviewFindingContract>();
+  const semanticGroups = new Map<string, {
+    canonical: ReviewFindingContract;
+    memberIds: Set<string>;
+    currentMemberIds: Set<string>;
+    fixedByAbsence: boolean;
+  }>();
+  const severityRank = { P0: 0, P1: 1, P2: 2, P3: 3 } as const;
   for (const persona of input.plan.personas) {
     for (const finding of findingsByPersona.get(persona.id) ?? []) {
-      if (!contractFindings.has(finding.finding_id)) contractFindings.set(finding.finding_id, finding);
+      if (!currentFindings.has(finding.finding_id)) currentFindings.set(finding.finding_id, finding);
+      const semanticGroupId = deriveReviewSemanticGroupId(finding);
+      const group = semanticGroups.get(semanticGroupId);
+      if (!group) {
+        semanticGroups.set(semanticGroupId, {
+          canonical: finding,
+          memberIds: new Set([finding.finding_id]),
+          currentMemberIds: new Set([finding.finding_id]),
+          fixedByAbsence: false,
+        });
+        continue;
+      }
+      group.memberIds.add(finding.finding_id);
+      group.currentMemberIds.add(finding.finding_id);
+      if (severityRank[finding.severity] < severityRank[group.canonical.severity]) group.canonical = finding;
     }
   }
-  const carriedResolvedFindingIds = new Set<string>();
   if (input.previousJournal) {
     const previousFindings = new Map(
       input.previousJournal.synthesis.findings.map((finding) => [finding.finding_id, finding])
     );
     for (const resolution of input.previousJournal.finding_resolutions) {
-      if (resolution.state !== "unresolved" || contractFindings.has(resolution.finding_id)) continue;
+      if (resolution.state !== "unresolved") continue;
       const finding = previousFindings.get(resolution.finding_id);
       if (!finding) throw new Error(`previous review journal lost unresolved finding ${resolution.finding_id}`);
-      contractFindings.set(finding.finding_id, finding);
-      carriedResolvedFindingIds.add(finding.finding_id);
+      const currentGroup = semanticGroups.get(resolution.semantic_group_id);
+      if (currentGroup) {
+        for (const findingId of resolution.semantic_dedup_finding_ids) currentGroup.memberIds.add(findingId);
+        continue;
+      }
+      semanticGroups.set(resolution.semantic_group_id, {
+        canonical: finding,
+        memberIds: new Set(resolution.semantic_dedup_finding_ids),
+        currentMemberIds: new Set(),
+        fixedByAbsence: true,
+      });
     }
   }
+  const carriedResolvedGroupCount = [...semanticGroups.values()].filter((group) => group.fixedByAbsence).length;
   const synthesis: ReviewSynthesisContract = {
     schema: REVIEW_SYNTHESIS_SCHEMA,
     selection_id: selection.selection_id,
     roster_digest: selection.roster_digest,
     outcome: journalOutcome(input.validation.synthesis.outcome),
-    summary: carriedResolvedFindingIds.size > 0
-      ? `${input.validation.synthesis.summary} ${carriedResolvedFindingIds.size} prior finding(s) are absent on exact-roster rereview.`
+    summary: carriedResolvedGroupCount > 0
+      ? `${input.validation.synthesis.summary} ${carriedResolvedGroupCount} prior semantic finding group(s) are absent on exact-roster rereview.`
       : input.validation.synthesis.summary,
-    findings: [...contractFindings.values()],
+    findings: [...semanticGroups.values()].map((group) => group.canonical),
   };
   const validation: ReviewValidationContract = {
     schema: REVIEW_VALIDATION_SCHEMA,
@@ -161,15 +192,18 @@ export function buildReviewJournal(input: {
   const repairDisposition = {
     schema: REVIEW_REPAIR_DISPOSITION_SCHEMA,
     synthesis_digest: digestCanonicalJson(synthesis),
-    dispositions: synthesis.findings.map((finding) => {
-      const key = reviewFindingKey(finding);
-      const blocking = finding.severity === "P0" || finding.severity === "P1";
-      const disposition = carriedResolvedFindingIds.has(finding.finding_id) ? "fixed" as const
-        : rejectedBlocking.has(key) ? "rejected" as const
-        : blocking && acceptedBlocking.has(key) ? "accepted" as const
-          : "deferred" as const;
+    dispositions: [...semanticGroups.entries()].map(([, group]) => {
+      const members = [...group.currentMemberIds].map((findingId) => currentFindings.get(findingId)!);
+      const blocking = members.filter((finding) => finding.severity === "P0" || finding.severity === "P1");
+      const hasAcceptedBlocker = blocking.some((finding) => acceptedBlocking.has(reviewFindingKey(finding)));
+      const allBlockersRejected = blocking.length > 0 && blocking.every((finding) => rejectedBlocking.has(reviewFindingKey(finding)));
+      const hasAdvisory = members.some((finding) => finding.severity === "P2" || finding.severity === "P3");
+      const disposition = group.fixedByAbsence ? "fixed" as const
+        : hasAcceptedBlocker ? "accepted" as const
+          : allBlockersRejected && !hasAdvisory ? "rejected" as const
+            : "deferred" as const;
       return {
-        finding_id: finding.finding_id,
+        finding_id: group.canonical.finding_id,
         disposition,
         rationale: disposition === "fixed"
           ? "The finding is absent on an exact-roster rereview of the repaired subject."
@@ -181,17 +215,20 @@ export function buildReviewJournal(input: {
       };
     }),
   };
-  const findingResolutions = synthesis.findings.map((finding) => {
+  const findingResolutions = [...semanticGroups.entries()].map(([semanticGroupId, group]) => {
+    const semanticMemberIds = [...group.memberIds];
+    const semanticMembers = new Set(semanticMemberIds);
     const reporters = personaReceipts
-      .filter((receipt) => receipt.finding_ids.includes(finding.finding_id))
+      .filter((receipt) => receipt.finding_ids.some((findingId) => semanticMembers.has(findingId)))
       .map((receipt) => receipt.persona_id);
-    const rejected = rejectedBlocking.has(reviewFindingKey(finding));
-    const fixed = carriedResolvedFindingIds.has(finding.finding_id);
-    const disposition = repairDisposition.dispositions.find((entry) => entry.finding_id === finding.finding_id)!;
+    const disposition = repairDisposition.dispositions.find((entry) => entry.finding_id === group.canonical.finding_id)!;
+    const rejected = disposition.disposition === "rejected";
+    const fixed = disposition.disposition === "fixed";
     return {
-      finding_id: finding.finding_id,
+      finding_id: group.canonical.finding_id,
+      semantic_group_id: semanticGroupId,
       exact_dedup_personas: reporters,
-      semantic_dedup_finding_ids: [finding.finding_id],
+      semantic_dedup_finding_ids: semanticMemberIds,
       validator_result: rejected ? "rejected" as const : "accepted" as const,
       corroboration_count: reporters.length,
       repair_disposition: disposition.disposition,

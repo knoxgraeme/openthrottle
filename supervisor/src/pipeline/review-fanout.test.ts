@@ -155,12 +155,36 @@ describe("review fanout runtime contract", () => {
       ["security", "agent_selected"],
     ]);
     expect(plan.selector_receipt_hash).toBe("d".repeat(64));
+    const synthesis = synthesizeReviewFanout({
+      plan,
+      receipts: plan.personas.map((persona) => reviewReceipt({ persona: persona.id, subject })),
+    });
+    expect(synthesis.receipt_hashes[0]).toBe("d".repeat(64));
     expect(() => parseReviewSelectorRecommendation(JSON.stringify({
       schema: REVIEW_SELECTOR_RECOMMENDATION_SCHEMA,
       subject,
       policy_digest: authority.policy_digest,
       personas: [{ persona_id: "unknown-persona", rationale: "Not allowlisted." }],
     }), authority)).toThrow(/unknown persona/);
+  });
+
+  it("rejects an over-bound persona receipt before journal or validator synthesis", () => {
+    const subject = "f".repeat(40);
+    const plan = buildReviewFanoutPlan({ subject });
+    const findings = Array.from({ length: 9 }, (_, index) => ({
+      severity: "P2" as const,
+      message: `Advisory ${index + 1}.`,
+      path: `src/advisory-${index + 1}.ts`,
+    }));
+
+    expect(() => synthesizeReviewFanout({
+      plan,
+      receipts: plan.personas.map((persona) => reviewReceipt({
+        persona: persona.id,
+        subject,
+        findings: persona.id === "correctness-dataflow" ? findings : [],
+      })),
+    })).toThrow(/correctness-dataflow exceeds max_findings 8/);
   });
 
   it("requires independent validation and cannot invent or rewrite a blocker", () => {

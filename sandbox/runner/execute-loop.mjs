@@ -534,6 +534,9 @@ export function validateLoopRequest(value) {
   if (request.role !== "worker" && request.worktree) throw new Error("non-worker loop cannot receive a writable worktree");
   if (request.role === "lead" && !candidateSubject) throw new Error("lead loop requires a candidate subject");
   if (request.role !== "lead" && candidateSubject) throw new Error("candidate subject is only valid for lead loops");
+  if (request.role === "reviewer" && request.inputSubject === undefined) {
+    throw new Error("reviewer loop requires an exact input subject");
+  }
   if (request.priorEvidence?.role === "lead" && request.role !== "lead") throw new Error("lead prior evidence is only valid for lead loops");
   if (
     request.priorEvidence?.role === "repair" &&
@@ -755,7 +758,11 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   const destination = pathInside(currentActionDirectory, "repo-view");
   rmSync(destination, { recursive: true, force: true });
   lockNonCurrentActionDirectories(request, actionRoot);
-  const sourceSubject = request.role === "lead" ? request.candidateSubject : "HEAD";
+  const sourceSubject = request.role === "lead"
+    ? request.candidateSubject
+    : request.role === "reviewer"
+      ? request.inputSubject
+      : "HEAD";
   const subject = runRootGit(sourceRepoDir, ["rev-parse", sourceSubject]);
   const objectType = runRootGit(sourceRepoDir, ["cat-file", "-t", subject]);
   if (objectType !== "commit" && objectType !== "tree") {

@@ -739,6 +739,11 @@ validation, repair dispositions, convergence cycle and resolution state, plus
 latency/count measurements (`cost_microusd = null` when unavailable). The live
 gate consumes the in-memory exact-fenced receipts and validated synthesis, not
 this history row; the row is durable audit and future self-learning input.
+Cross-lens semantic groups retain one existing canonical finding plus every
+member finding id and reporting persona, so corroboration is measurable without
+inventing a finding. Rereview searches the newest bounded history window. A
+missing or malformed prior journal is appended as a separate audit-gap note and
+cannot block, pass, or otherwise authorize the live receipt/gate decision.
 
 `run_outcomes` holds one deterministic row per pipeline instance, written
 exactly once at its terminal transition -- either applyTransition's normal
@@ -861,9 +866,15 @@ risk lenses; and dispatches each selected persona as an independent fresh,
 read-only loop action. Missing, duplicate, unexpected, stale-subject, or
 wrong-producer receipts fail closed. P0/P1 findings cannot enter the final gate
 until a separate `validate-review-findings` action returns each accepted blocker
-byte-for-byte; rejected blockers and P2/P3 advisories remain journal evidence
-without repair authority. The supervisor alone synthesizes the final review
-receipt and gate input. On a repair cycle, selector authority requires the
+byte-for-byte. Every persona receipt is bounded by the sealed `max_findings`
+value (eight in the current policy) before validator or journal synthesis.
+Rejected blockers and P2/P3 advisories remain gate/journal telemetry but are
+excluded from the final-repair-authoritative receipt. The supervisor alone
+synthesizes the final review receipt and gate input, with exact selector,
+persona, validator, and command receipt hashes as provenance. Transient persona
+or validator dispatch/collection exceptions leave the parent review active and
+replay the same deterministic subaction ids on the next drain. On a repair
+cycle, selector authority requires the
 prior ordered persona ids and the prior roster digest must match, so rereview
 cannot silently add, drop, or reorder a lens. Unit leads never dispatch review
 personas and cannot promote persona findings. The reducer may lease at most

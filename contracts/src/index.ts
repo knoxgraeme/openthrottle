@@ -102,6 +102,7 @@ export {
 } from "./receipts.js";
 export {
   FINDING_ID_PREFIX,
+  SEMANTIC_GROUP_ID_PREFIX,
   REPAIR_DISPOSITIONS,
   REVIEW_FINDING_SCHEMA,
   REVIEW_JOURNAL_SCHEMA,
@@ -116,6 +117,7 @@ export {
   REVIEW_VALIDATION_SCHEMA,
   REVIEW_VALIDATOR_RESULTS,
   deriveReviewFindingId,
+  deriveReviewSemanticGroupId,
   parseReviewJournalContract,
   validateReviewJournalContract,
   type ReviewFindingContract,

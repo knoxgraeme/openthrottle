@@ -10,6 +10,7 @@ import {
   REVIEW_SYNTHESIS_SCHEMA,
   REVIEW_VALIDATION_SCHEMA,
   deriveReviewFindingId,
+  deriveReviewSemanticGroupId,
   validateReviewJournalContract,
   type ReviewFindingContract,
   type ReviewJournalContract,
@@ -98,6 +99,7 @@ function validJournal(): ReviewJournalContract {
   }];
   const findingResolutions = [{
     finding_id: finding.finding_id,
+    semantic_group_id: deriveReviewSemanticGroupId(finding),
     exact_dedup_personas: ["contract_reviewer"],
     semantic_dedup_finding_ids: [finding.finding_id],
     validator_result: "accepted" as const,
@@ -275,6 +277,11 @@ describe("review journal contracts", () => {
   });
 
   it("rejects untraceable resolution membership and aggregate measurement drift", () => {
+    const wrongSemanticGroup = validJournal();
+    wrongSemanticGroup.finding_resolutions[0]!.semantic_group_id = "semantic_group_" + "0".repeat(32);
+    expect(() => validateReviewJournalContract(wrongSemanticGroup, { source: "review" }))
+      .toThrow(/semantic_group_id: must be derived from the canonical finding semantics/);
+
     const unknownMembership = validJournal();
     unknownMembership.finding_resolutions[0]!.semantic_dedup_finding_ids = ["finding_" + "1".repeat(32)];
     expect(() => validateReviewJournalContract(unknownMembership, { source: "review" }))

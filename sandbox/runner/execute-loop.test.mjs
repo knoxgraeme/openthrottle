@@ -309,6 +309,7 @@ describe("loop action request validation", () => {
         loop: "review",
         skill,
         worktree: null,
+        inputSubject: "b".repeat(40),
         contextPolicy: "fresh",
         allowedMcpServers: [],
         credentialScopes: ["model.invoke", "repo.read"],
@@ -321,9 +322,20 @@ describe("loop action request validation", () => {
       loop: "review",
       skill: "security",
       worktree: null,
+      inputSubject: "b".repeat(40),
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
     });
     expect(() => validateLoopRequest(writable)).toThrow(/structured loop actions cannot request repo.write/);
+
+    const unfencedSubject = request({
+      role: "reviewer",
+      loop: "review",
+      skill: "security",
+      worktree: null,
+      inputSubject: undefined,
+      credentialScopes: ["model.invoke", "repo.read"],
+    });
+    expect(() => validateLoopRequest(unfencedSubject)).toThrow(/requires an exact input subject/);
   });
 
   it("keeps loop-action@2 backward-compatible when parentRunId is absent", () => {
@@ -771,6 +783,7 @@ describe("loop action request validation", () => {
       loop: "review",
       skill: "final-review",
       worktree: null,
+      inputSubject: "2".repeat(40),
       credentialScopes: ["repo.read"],
     });
     const fixedSubject = { base: "1".repeat(40), pre: "1".repeat(40), post: "2".repeat(40) };
@@ -1946,40 +1959,61 @@ describe("loop action request validation", () => {
     expect(result.status).toBe(0);
   });
 
-  it("runs reviewer loops from the source repository HEAD in a detached read-only view", () => {
+  it("runs reviewer, selector, and validator loops from the sealed input subject when source HEAD drifts", () => {
     const integrationRepoDir = repository();
     writeFileSync(join(integrationRepoDir, "review-subject.txt"), "review subject\n");
     execFileSync("git", ["add", "review-subject.txt"], { cwd: integrationRepoDir });
     execFileSync("git", ["commit", "-qm", "review subject"], { cwd: integrationRepoDir });
-    const valid = validateLoopRequest(request({
-      role: "reviewer",
-      loop: "review",
-      skill: "final-review",
-      worktree: null,
-      credentialScopes: ["repo.read"],
-    }));
+    const reviewSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: integrationRepoDir,
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(integrationRepoDir, "review-subject.txt"), "drifted HEAD\n");
+    writeFileSync(join(integrationRepoDir, "head-only.txt"), "must not be reviewed\n");
+    execFileSync("git", ["add", "review-subject.txt", "head-only.txt"], { cwd: integrationRepoDir });
+    execFileSync("git", ["commit", "-qm", "drift after sealed subject"], { cwd: integrationRepoDir });
+    const driftedHead = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: integrationRepoDir,
+      encoding: "utf8",
+    }).trim();
+    expect(driftedHead).not.toBe(reviewSubject);
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
     directories.push(actionRoot);
     process.env.OT_LOOP_ACTION_ROOT = actionRoot;
-    const expectedView = join(actionRoot, valid.attemptId, valid.actionId, "repo-view");
+    for (const [skill, actionId] of [
+      ["final-review", "reviewer-exact-subject"],
+      ["select-review-personas", "selector-exact-subject"],
+      ["validate-review-findings", "validator-exact-subject"],
+    ]) {
+      const valid = validateLoopRequest(request({
+        actionId,
+        role: "reviewer",
+        loop: "review",
+        skill,
+        worktree: null,
+        inputSubject: reviewSubject,
+        credentialScopes: ["model.invoke", "repo.read"],
+      }));
+      const expectedView = join(actionRoot, valid.attemptId, valid.actionId, "repo-view");
+      const result = runLoopAgentInPreparedRepository({
+        request: valid,
+        invocation: resolveLoopInvocation(valid),
+        integrationRepoDir,
+        lockIntegration: () => true,
+        processFence: (execute) => execute(),
+        runProcess: (_command, _args, options) => {
+          expect(options.cwd).toBe(expectedView);
+          expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "rev-parse", "HEAD"], { encoding: "utf8" }).trim())
+            .toBe(reviewSubject);
+          expect(readFileSync(join(expectedView, "review-subject.txt"), "utf8")).toBe("review subject\n");
+          expect(existsSync(join(expectedView, "head-only.txt"))).toBe(false);
+          expect(statSync(expectedView).mode & 0o777).toBe(0o555);
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        },
+      });
 
-    const result = runLoopAgentInPreparedRepository({
-      request: valid,
-      invocation: resolveLoopInvocation(valid),
-      integrationRepoDir,
-      lockIntegration: () => true,
-      processFence: (execute) => execute(),
-      runProcess: (_command, _args, options) => {
-        expect(options.cwd).toBe(expectedView);
-        expect(execFileSync("git", ["-c", `safe.directory=${expectedView}`, "-C", expectedView, "rev-parse", "HEAD"], { encoding: "utf8" }).trim())
-          .toMatch(/^[a-f0-9]{40}$/);
-        expect(readFileSync(join(expectedView, "review-subject.txt"), "utf8")).toBe("review subject\n");
-        expect(statSync(expectedView).mode & 0o777).toBe(0o555);
-        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
-      },
-    });
-
-    expect(result.status).toBe(0);
+      expect(result.status).toBe(0);
+    }
   });
 
   it("rejects unsafe configured action roots before locking directories", () => {

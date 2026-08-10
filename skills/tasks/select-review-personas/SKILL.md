@@ -125,7 +125,7 @@ the provided policy data itself violates a review contract.
   "fence": {
     "pipeline_instance_id": "instance-example",
     "graph_digest": "0000000000000000000000000000000000000000000000000000000000000000",
-    "unit_id": "__review_selector__",
+    "unit_id": "__final__",
     "attempt_id": "attempt-example",
     "parent_run_id": "run-example",
     "action_attempt_id": "action-example",

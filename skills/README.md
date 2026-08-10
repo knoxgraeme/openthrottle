@@ -93,8 +93,12 @@ risk-triggered lenses. Every selected persona runs as its own fresh, read-only
 loop action; personas never spawn other personas. Missing, duplicate,
 unexpected, or wrong-subject receipts fail closed. P0/P1 findings cannot reach
 the final gate until the separate `validate-review-findings` action reproduces
-and returns them byte-for-byte. P2/P3 findings remain advisory journal entries.
-The supervisor synthesizes the final receipt only after those fences settle.
+and returns them byte-for-byte. Each persona is bounded by the sealed
+`max_findings` value (eight in the current policy); overflow must be disclosed
+as `needs_human`, never silently truncated. P2/P3 findings remain advisory
+journal entries and are excluded from the final-repair-authoritative receipt.
+The supervisor synthesizes the final receipt only after those fences settle,
+binding selector, persona, validator, and command hashes into its evidence.
 After repair, selector authority requires the exact prior ordered roster and
 the roster digest must match before a rereview can settle.
 
@@ -107,8 +111,12 @@ aggregate measurements. Cross-references bind persona receipts to the reviewed
 subject and selected roster; finding ids to exact/semantic dedup membership,
 validator outcome, corroboration, repair disposition, convergence cycle, and
 resolution state; and aggregate finding, latency, and measured-cost totals back
-to those typed records. Later self-learning stages may analyze that corpus, but
-cannot mutate a live roster or gate from journal data.
+to those typed records. Semantic groups preserve the existing canonical finding
+and record every cross-lens member id and reporting persona without inventing a
+new finding. Rereview reads the newest bounded history window; missing or corrupt
+history is recorded as an audit gap and cannot fail or authorize the live gate.
+Later self-learning stages may analyze that corpus, but cannot mutate a live
+roster or gate from journal data.
 
 ## Delivery per agent
 

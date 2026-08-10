@@ -135,6 +135,8 @@ export function createJournalStore(db: Database.Database, now: () => string): Pi
       const from = queryTimestamp(query.from, "from");
       const to = queryTimestamp(query.to, "to");
       const limit = queryLimit(query.limit);
+      const order = query.order ?? "oldest";
+      if (order !== "oldest" && order !== "newest") throw new Error("order must be oldest or newest");
       const filters: string[] = [];
       const args: unknown[] = [];
       if (query.issueId) {
@@ -161,7 +163,7 @@ export function createJournalStore(db: Database.Database, now: () => string): Pi
       return db.prepare(`
         SELECT * FROM orchestration_journal
         ${where}
-        ORDER BY recorded_at, id
+        ORDER BY recorded_at ${order === "newest" ? "DESC" : "ASC"}, id ${order === "newest" ? "DESC" : "ASC"}
         LIMIT ?
       `).all(...args, limit) as OrchestrationJournalEntry[];
     },

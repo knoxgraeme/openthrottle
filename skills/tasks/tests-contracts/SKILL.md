@@ -38,6 +38,11 @@ shapes remain compatible.
 
 ## Required Postconditions
 
+- Never emit more than the sealed `max_findings` (8 under the current policy).
+  Rank actionable defects before writing the receipt. If more remain after
+  exact and semantic deduplication, return the highest-priority bounded set
+  with `result: "needs_human"` and say in the summary that the sealed bound
+  omitted additional findings; never truncate silently.
 - In every finding identity, copy the sealed persona invariant exactly:
   `changed behavior has executable contract proof`.
 
@@ -73,7 +78,7 @@ present, `needs_human` for a required product or architecture decision, and
   "assurance": "semantic_attested",
   "result": "success",
   "producer": {
-    "worker_id": "tests-contracts-reviewer",
+    "worker_id": "tests-contracts",
     "skill": "builtin://tests-contracts@1",
     "capability_digest": "0000000000000000000000000000000000000000000000000000000000000000",
     "skill_package_digest": null

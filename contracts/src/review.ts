@@ -32,6 +32,8 @@ export const REVIEW_VALIDATOR_RESULTS = ["accepted", "rejected"] as const;
 export const REVIEW_RESOLUTION_STATES = ["resolved", "unresolved"] as const;
 export const FINDING_ID_PREFIX = "finding_" as const;
 const FINDING_ID_PATTERN = /^finding_[a-f0-9]{32}$/;
+export const SEMANTIC_GROUP_ID_PREFIX = "semantic_group_" as const;
+const SEMANTIC_GROUP_ID_PATTERN = /^semantic_group_[a-f0-9]{32}$/;
 const REVIEW_JOURNAL_ENTRY_KINDS = [
   "selection",
   "persona_receipts",
@@ -152,6 +154,7 @@ export interface ReviewPersonaReceiptEvidence {
 
 export interface ReviewFindingResolution {
   finding_id: string;
+  semantic_group_id: string;
   exact_dedup_personas: string[];
   semantic_dedup_finding_ids: string[];
   validator_result: ReviewValidatorResult;
@@ -214,6 +217,19 @@ export function deriveReviewFindingId(identity: ReviewFindingIdentity): string {
     path: identity.path,
     semantic_anchor: identity.semantic_anchor,
     violated_invariant: identity.violated_invariant,
+  }).slice(0, 32)}`;
+}
+
+export function deriveReviewSemanticGroupId(input: Pick<ReviewFindingContract, "path" | "semantic_anchor" | "message">): string {
+  const diagnostic = input.message
+    .replace(/^\[[^\]]+\]\s*/, "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+  return `${SEMANTIC_GROUP_ID_PREFIX}${digestCanonicalJson({
+    path: input.path,
+    semantic_anchor: input.semantic_anchor,
+    diagnostic,
   }).slice(0, 32)}`;
 }
 
@@ -375,6 +391,7 @@ function parsePersonaReceipt(value: unknown, path: string): ReviewPersonaReceipt
 function parseFindingResolution(value: unknown, path: string): ReviewFindingResolution {
   const input = objectAt(value, path, [
     "finding_id",
+    "semantic_group_id",
     "exact_dedup_personas",
     "semantic_dedup_finding_ids",
     "validator_result",
@@ -385,6 +402,7 @@ function parseFindingResolution(value: unknown, path: string): ReviewFindingReso
   ]);
   return {
     finding_id: stringAt(input.finding_id, `${path}.finding_id`, { max: 40, pattern: FINDING_ID_PATTERN }),
+    semantic_group_id: stringAt(input.semantic_group_id, `${path}.semantic_group_id`, { max: 47, pattern: SEMANTIC_GROUP_ID_PATTERN }),
     exact_dedup_personas: unique(arrayAt(
       input.exact_dedup_personas,
       `${path}.exact_dedup_personas`,
@@ -522,6 +540,7 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
     }
   }
   unique(journal.finding_resolutions.map((resolution) => resolution.finding_id), `${source}.finding_resolutions.finding_id`);
+  unique(journal.finding_resolutions.map((resolution) => resolution.semantic_group_id), `${source}.finding_resolutions.semantic_group_id`);
   const dispositions = new Map(journal.repair_disposition.dispositions.map((entry) => [entry.finding_id, entry]));
   const resolutions = new Map(journal.finding_resolutions.map((resolution) => [resolution.finding_id, resolution]));
   const semanticMembership = new Map<string, string>();
@@ -532,6 +551,10 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
     if (!findings.has(resolution.finding_id)) {
       fail(`${source}.finding_resolutions.${resolution.finding_id}`, "references an unknown synthesized finding");
     }
+    const canonicalFinding = findings.get(resolution.finding_id)!;
+    if (resolution.semantic_group_id !== deriveReviewSemanticGroupId(canonicalFinding)) {
+      fail(`${source}.finding_resolutions.${resolution.finding_id}.semantic_group_id`, "must be derived from the canonical finding semantics");
+    }
     if (!resolution.semantic_dedup_finding_ids.includes(resolution.finding_id)) {
       fail(`${source}.finding_resolutions.${resolution.finding_id}.semantic_dedup_finding_ids`, "must include its canonical finding_id");
     }
@@ -540,12 +563,13 @@ function validateCrossReferences(journal: ReviewJournalContract, source: string)
       if (!receipt) {
         fail(`${source}.finding_resolutions.${resolution.finding_id}.exact_dedup_personas`, `references unknown persona ${personaId}`);
       }
-      if (!receipt.finding_ids.includes(resolution.finding_id)) {
-        fail(`${source}.finding_resolutions.${resolution.finding_id}.exact_dedup_personas`, `${personaId} did not report the canonical finding`);
+      if (!receipt.finding_ids.some((findingId) => resolution.semantic_dedup_finding_ids.includes(findingId))) {
+        fail(`${source}.finding_resolutions.${resolution.finding_id}.exact_dedup_personas`, `${personaId} did not report a member of the semantic finding group`);
       }
     }
+    const semanticMembers = new Set(resolution.semantic_dedup_finding_ids);
     const expectedExactPersonas = journal.persona_receipts
-      .filter((receipt) => receipt.finding_ids.includes(resolution.finding_id))
+      .filter((receipt) => receipt.finding_ids.some((findingId) => semanticMembers.has(findingId)))
       .map((receipt) => receipt.persona_id)
       .sort();
     const actualExactPersonas = [...resolution.exact_dedup_personas].sort();
