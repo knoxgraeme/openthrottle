@@ -1212,6 +1212,7 @@ intents:
       graphId: "repo_structured",
       blobSha: "c".repeat(40),
       path: graphPath,
+      compilerVersion: 2,
     }))}`);
     expect(manifest.stages.find((stage) => stage.id === "publish")?.context).toBe("prefer_resume");
   });
@@ -1638,10 +1639,18 @@ commands:
         graphId: "docs",
         blobSha: "c".repeat(40),
         path: graphPath,
+        compilerVersion: 2,
       }))}`,
       pipeline_version: 1,
       active_stage_id: "verify",
     });
+    expect(pipelines.getInstanceForSession("session-1")?.pipeline_id).not.toBe(
+      `repository/${digestNormalized(canonicalJson({
+        graphId: "docs",
+        blobSha: "c".repeat(40),
+        path: graphPath,
+      }))}`
+    );
     const request = pipelines.getStageRequest(pipelines.getActiveAttempt(pipelines.getInstanceForSession("session-1")!.id)!.id);
     expect(request.commandName).toBe("docs-check");
   });
@@ -1714,11 +1723,13 @@ commands:
       graphId: "docs_a",
       blobSha: "c".repeat(40),
       path: graphA,
+      compilerVersion: 2,
     }))}`);
     expect(second.pipeline_id).toBe(`repository/${digestNormalized(canonicalJson({
       graphId: "docs_b",
       blobSha: "c".repeat(40),
       path: graphB,
+      compilerVersion: 2,
     }))}`);
     expect(second.pipeline_id).not.toBe(first.pipeline_id);
   });
@@ -1796,6 +1807,7 @@ intents:
         graphId: "repo_skill",
         blobSha: "c".repeat(40),
         path: graphPath,
+        compilerVersion: 2,
       }))}`,
       active_stage_id: "implementation",
     });

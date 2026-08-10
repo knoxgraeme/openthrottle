@@ -53,6 +53,10 @@ const BUILTIN_GRAPHS = {
 } as const;
 const SIMPLE_IMPLEMENT_DESCRIPTION = "Staged CE implementation from a pre-approved plan with round-based repair budgeting, scoped repair re-entry, sealed repository gates, exact-tree publication, and bounded provider repair. The initial forward pass may simplify; repair passes re-run semantic review and command gates without re-running simplification.";
 const REPOSITORY_SKILL_PACKAGE_SCHEMA = "openthrottle.repository-skill-package/v1";
+// Repository graph blobs are immutable inputs, but compiler changes can alter
+// their normalized manifest bytes. Bump this identity version whenever that
+// happens so an already-accepted manifest identity is never silently reused.
+const REPOSITORY_GRAPH_COMPILER_IDENTITY_VERSION = 2;
 const ORDINARY_STAGE_TASK_CONTEXT_LIMIT = 64_000;
 const PARENT_ISSUE_CONTEXT_LIMIT = 6_000;
 const LINEAR_CONTEXT_SECTION_KINDS = [
@@ -548,6 +552,7 @@ async function resolvePipelineSelection(
       graphId,
       blobSha: snapshot.blobSha,
       path: snapshot.path,
+      compilerVersion: REPOSITORY_GRAPH_COMPILER_IDENTITY_VERSION,
     }))}`;
   } else if (source.ref === "core/simple@1") {
     rawGraph = readFileSync(BUILTIN_SIMPLE_GRAPH, "utf8");
