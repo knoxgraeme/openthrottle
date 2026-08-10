@@ -5,7 +5,7 @@
   "result": "success",
   "producer": {
     "worker_id": "implementer",
-    "skill": "repo://acme/openthrottle-graphs@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#.agents/skills/implement-unit",
+    "skill": "repo://acme/openthrottle-graphs@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#.openthrottle/skills/implement_unit",
     "capability_digest": "1111111111111111111111111111111111111111111111111111111111111111",
     "skill_package_digest": "4444444444444444444444444444444444444444444444444444444444444444"
   },

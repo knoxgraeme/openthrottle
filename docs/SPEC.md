@@ -118,8 +118,10 @@ skill pack, but the `ce/` namespace is reserved for capability IDs such as
 
 Repository-authored graphs may reference committed repository skills only
 through `repo://<skill-id>`. The repository config owns the allowlist that maps
-each skill id to a committed directory containing `SKILL.md`; ticket text cannot
-choose a skill path. Admission resolves that directory at the exact pinned base
+each skill id exactly to `.openthrottle/skills/<skill-id>`, a committed
+directory containing `SKILL.md`; ticket text cannot choose a skill path and a
+second `.agents/skills` copy is never generated. Admission resolves that
+directory at the exact pinned base
 commit, fetches the bounded package closure as regular files, rejects traversal,
 path escape, symlinks, oversized or undeclared entries, and pins every accepted
 blob plus the package digest. Repository skill identity is separate from runtime
@@ -632,7 +634,7 @@ sentence, or links rendered after it.
 | `GET` | `/oauth/install` | `OT_INSTALL_SECRET` bearer | begin Linear OAuth |
 | `GET` | `/oauth/callback` | one-time OAuth state | exchange and store installation |
 | `GET` | `/status` | `OT_STATUS_TOKEN` bearer | tickets and pipeline/effect/publication state |
-| `GET` | `/capabilities` | `OT_STATUS_TOKEN` bearer | active runtime release, capability digest, and capability IDs |
+| `GET` | `/capabilities` | `OT_STATUS_TOKEN` bearer | active runtime release, capability digest/IDs, and effective limits |
 | `GET` | `/analysis/runs` | `OT_STATUS_TOKEN` bearer | read-only, filterable `run_outcomes` evidence for improvement proposals |
 | `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered routes |
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert route/webhook |
@@ -667,7 +669,9 @@ instance, the nested `pipeline` object includes:
 `GET /capabilities` returns the installed runtime capability descriptor's
 `release`, `capabilityDigest`, and `capabilities` array, read directly off the
 same `ValidatedRuntimeCapabilityDescriptor` admission validates every pipeline
-against. The CLI's structured `ship` command queries this endpoint as a
+against. Its `limits.taskTimeoutSeconds` field reports the same configured hard
+deadline repository-graph admission enforces. The CLI's structured `ship`
+command queries this endpoint as a
 pre-mutation activation check (see "CLI contract" below): explicit structured
 selection never proceeds to any Linear call, let alone mutation, when the
 endpoint is unreachable, unauthenticated, or its response is missing,
@@ -933,7 +937,24 @@ fresh checkout runnable, and unit worktrees are fresh checkouts.
 `openthrottle setup` verifies snapshot availability and prints the supervisor
 secret checklist. `openthrottle init` detects the GitHub origin/default branch,
 writes `.openthrottle.yml`, and idempotently registers the Linear-team route and
-GitHub webhook. `openthrottle ship <plan.md>` creates and delegates a Linear
+GitHub webhook. Its explicit `--editable-skills` option transactionally writes
+an editable `simple_editable` repository graph, the exact referenced
+`implement-plan` package closure under `.openthrottle/skills/`, and
+`.openthrottle/skills.lock.json`. The lock pins the OpenThrottle release plus
+the upstream and scaffold graph, package, and file digests and binds those
+fields with a self-integrity digest. The package closure has the same 64-file
+and 256-KiB limits as supervisor admission and rejects symlinks and non-regular
+entries. Generated loop timeouts use the authenticated supervisor's advertised
+effective task-timeout limit. Preflight validates the complete candidate config
+and graph, compares local/upstream/provenance digests, and permits only
+`unchanged` and `upstream-only`; `local-only` and `conflict` refuse all writes.
+The CLI prints every classification and requires a separate confirmation before
+applying; `--dry-run` exits after the read-only plan without files or
+registration changes. This scaffold rewires only the simple graph's
+initial and repair implementation loops. Review, simplification, publication,
+and structured-unit bindings stay platform-owned and are not advertised as
+editable because current repository-skill dispatch cannot faithfully replace
+their scopes. `openthrottle ship <plan.md>` creates and delegates a Linear
 issue. `status`, `stop`, `logs`, and `analysis` call authenticated supervisor
 endpoints; `analysis` filters `GET /analysis/runs` by `--outcome`, `--reason`,
 `--attribution`, `--graph`, `--skill-digest`, `--from`, `--to`, and `--limit`.

@@ -283,6 +283,7 @@ export function createServer(deps: ServerDeps): Hono {
       release: runtime.descriptor.release,
       capabilityDigest: runtime.digest,
       capabilities: runtime.descriptor.capabilities,
+      limits: { taskTimeoutSeconds: cfg.taskTimeout },
     });
   });
 

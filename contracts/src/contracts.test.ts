@@ -224,7 +224,7 @@ describe("Stage C contract fixtures", () => {
     const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
       skills?: Array<{ id: string; path: string }>;
     };
-    config.skills = [{ id: "implement_unit", path: ".agents/skills/implement-unit" }];
+    config.skills = [{ id: "implement_unit", path: ".openthrottle/skills/implement_unit" }];
     const parsedConfig = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
     expect(parsedConfig.value.skills).toEqual(config.skills);
 
@@ -246,7 +246,7 @@ describe("Stage C contract fixtures", () => {
     graph.loops[0]!.skill = "builtin://implement-unit@1";
     graph.workers[1]!.skills = ["repo://accept_unit"];
     graph.loops[1]!.skill = "repo://accept_unit";
-    config.skills = [{ id: "accept_unit", path: ".agents/skills/accept-unit" }];
+    config.skills = [{ id: "accept_unit", path: ".openthrottle/skills/accept_unit" }];
     const parsedGateConfig = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
     expect(() => parseGraphContract(JSON.stringify(graph), { source: "graph", config: parsedGateConfig.value }))
       .not.toThrow();
@@ -254,6 +254,10 @@ describe("Stage C contract fixtures", () => {
     config.skills = [{ id: "bad", path: "../skills/bad" }];
     expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
       .toThrow(/config\.skills\[0\]\.path: has an invalid format/);
+
+    config.skills = [{ id: "bad", path: ".openthrottle/skills/not-bad" }];
+    expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
+      .toThrow(/config\.skills\[0\]\.path: must be exactly \.openthrottle\/skills\/bad/);
   });
 
   it("rejects provider-secret identifiers in config values and headers", () => {
