@@ -1023,6 +1023,14 @@ export function loadPipelineCatalog(
   for (const file of files) {
     const path = resolve(dirname(catalogPath), file);
     const validated = parsePipelineManifest(readFileSync(path, "utf8"), { source: path, runtime });
+    for (const stage of validated.manifest.stages) {
+      if (stage.loop) {
+        fail(
+          `${path}.stages.${stage.id}.loop`,
+          "ordinary loop bindings are supported only in repository-compiled manifests"
+        );
+      }
+    }
     const key = manifestKey(validated.manifest.id, validated.manifest.version);
     if (manifests.has(key)) fail(catalogPath, `duplicate pipeline identity ${key}`);
     manifests.set(key, validated);

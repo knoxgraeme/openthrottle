@@ -1,0 +1,34 @@
+schema: openthrottle.pipeline/v1
+id: fixture/ordinary-loop
+version: 1
+description: Direct-catalog ordinary loop fixture.
+entry_stage: stage
+max_attempts: 2
+requires:
+  protocol: stage-executor@1
+  capabilities: [agent/semantic@1]
+stages:
+  - id: stage
+    executor: { kind: agent, capability: agent/semantic@1 }
+    loop:
+      id: semantic-loop
+      skill: builtin://agent/semantic@1
+      input_scope: graph
+      receipt: semantic_review
+      max_parallel: 1
+      max_rounds: 1
+      timeout_seconds: 60
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result] }
+    context: fresh
+    live_steering: true
+    credentials: [model.invoke, repo.read]
+    produces: [stage_result]
+    transitions:
+      success: { terminal: shipped }
+      no_change: { terminal: no_change }
+      semantic_repair_required: { terminal: needs_human }
+      retryable_infrastructure_failure: { terminal: failed }
+      needs_human: { terminal: needs_human }
+      canceled: { terminal: canceled }
+      superseded: { terminal: superseded }
+      failure: { terminal: failed }

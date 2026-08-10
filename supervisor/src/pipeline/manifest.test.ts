@@ -185,6 +185,17 @@ describe("pipeline manifest validation", () => {
     ]);
   });
 
+  it("rejects ordinary loop bindings in directly loaded catalog manifests", () => {
+    const path = fileURLToPath(new URL(
+      "../__fixtures__/pipelines/ordinary-loop-catalog.yaml",
+      import.meta.url
+    ));
+    const runtime = buildInstalledRuntimeDescriptor("test-runtime/v1");
+
+    expect(() => loadPipelineCatalog(path, runtime.descriptor))
+      .toThrow(/ordinary-loop-fixture-v1\.yaml\.stages\.stage\.loop: ordinary loop bindings are supported only in repository-compiled manifests/);
+  });
+
   it("normalizes defaults and retry shorthand to the same JSON and digest as explicit transitions", () => {
     const explicit = manifest();
     firstStage(explicit).transitions = transitions({
