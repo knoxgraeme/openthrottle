@@ -11,6 +11,7 @@ export {
 } from "./determinism-fixture.js";
 export {
   CONFIG_SCHEMA,
+  DEFAULT_CONFIG_LIMITS,
   GRAPH_SOURCE_KINDS,
   parseRepositoryConfigContract,
   validateRepositoryConfigContract,
@@ -70,6 +71,24 @@ export {
   type ExecutionPlanContract,
   type ExecutionPlanUnit,
 } from "./execution-plan.js";
+export {
+  RATCHET_ARTIFACT_KINDS,
+  RATCHET_CONTRACT_SCHEMA,
+  RATCHET_DECISION_SCHEMA,
+  RATCHET_REJECTION_REASONS,
+  decideDifferentialRatchet,
+  parseRatchetDifferentialInput,
+  validateRatchetDecision,
+  validateRatchetDifferentialInput,
+  type RatchetArtifactDigest,
+  type RatchetDecision,
+  type RatchetDifference,
+  type RatchetDifferentialInput,
+  type RatchetHumanAuthority,
+  type RatchetRepositorySkillPackage,
+  type RatchetRepositorySkillPackageFile,
+  type RatchetTunerAuthority,
+} from "./ratchet-contract.js";
 export {
   ASSURANCE_CLASSES,
   COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES,

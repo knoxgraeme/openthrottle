@@ -16,6 +16,10 @@ import {
 
 export const CONFIG_SCHEMA = "openthrottle.config/v1" as const;
 export const GRAPH_SOURCE_KINDS = ["builtin", "repository"] as const;
+export const DEFAULT_CONFIG_LIMITS = Object.freeze({
+  max_turns: 200,
+  task_timeout: 7_200,
+} as const);
 
 export interface ConfigGraphSource {
   id: string;
@@ -40,6 +44,7 @@ export interface ConfigMcpServer {
 export interface ConfigRepositorySkill {
   id: string;
   path: string;
+  tunable?: boolean;
 }
 
 export interface RepositoryConfigContract {
@@ -130,7 +135,7 @@ function parseSource(value: unknown, path: string): ConfigGraphSource {
 }
 
 function parseRepositorySkill(value: unknown, path: string): ConfigRepositorySkill {
-  const input = objectAt(value, path, ["id", "path"]);
+  const input = objectAt(value, path, ["id", "path", "tunable"]);
   const id = stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER });
   const skillPath = stringAt(input.path, `${path}.path`, { max: 240, pattern: REPOSITORY_DIR });
   const expectedPath = `.openthrottle/skills/${id}`;
@@ -140,6 +145,7 @@ function parseRepositorySkill(value: unknown, path: string): ConfigRepositorySki
   return {
     id,
     path: skillPath,
+    ...(input.tunable === undefined ? {} : { tunable: booleanAt(input.tunable, `${path}.tunable`) }),
   };
 }
 
