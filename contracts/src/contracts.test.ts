@@ -206,6 +206,87 @@ describe("Stage C contract fixtures", () => {
     });
   });
 
+  it("accepts monotonic repository config and graph policy shrinkage", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const pinnedConfig = parseRepositoryConfigContract(readFixture("valid", "config-repository.json")).value;
+    const proposedConfig = structuredClone(pinnedConfig);
+    pinnedConfig.limits = { max_turns: 200, task_timeout: 7200 };
+    proposedConfig.limits = { max_turns: 100, task_timeout: 3600 };
+    pinnedConfig.mcp_servers = { github: { command: "mcp-github" } };
+    proposedConfig.mcp_servers = {};
+    proposedConfig.commands = {
+      ...proposedConfig.commands,
+      audit: "npm audit --audit-level high",
+    };
+
+    const pinnedGraph = parseGraphContract(readFixture("valid", "graph-structured.json"), {
+      config: pinnedConfig,
+    }).value;
+    const proposedGraph = structuredClone(pinnedGraph);
+    proposedGraph.workers[0]!.credentials = ["repo.read"];
+    proposedGraph.loops[0]!.timeout_seconds = 1800;
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_config: pinnedConfig,
+      proposed_config: proposedConfig,
+      pinned_graph: pinnedGraph,
+      proposed_graph: proposedGraph,
+    })).toMatchObject({
+      outcome: "accept",
+      reject_reasons: [],
+      differences: [],
+    });
+  });
+
+  it("rejects non-monotonic config policy with stable reasons", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const pinnedConfig = parseRepositoryConfigContract(readFixture("valid", "config-repository.json")).value;
+    const proposedConfig = structuredClone(pinnedConfig);
+    proposedConfig.limits = { max_turns: 201, task_timeout: 7201 };
+    delete proposedConfig.commands!.test;
+    delete proposedConfig.test;
+    proposedConfig.mcp_servers = { github: { command: "mcp-github" } };
+
+    const pinnedGraph = parseGraphContract(readFixture("valid", "graph-structured.json"), {
+      config: pinnedConfig,
+    }).value;
+    const proposedGraph = structuredClone(pinnedGraph);
+    proposedGraph.workers[0]!.credentials = ["repo.read", "model.invoke", "provider.read", "mcp"];
+    proposedGraph.workers[0]!.allowed_mcp_servers = ["github"];
+    proposedGraph.nodes[0]!.phases = proposedGraph.nodes[0]!.phases!.filter((phase) => phase.id !== "command");
+
+    const decision = decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_config: pinnedConfig,
+      proposed_config: proposedConfig,
+      pinned_graph: pinnedGraph,
+      proposed_graph: proposedGraph,
+    });
+
+    expect(decision.outcome).toBe("reject");
+    expect(decision.reject_reasons).toEqual(expect.arrayContaining([
+      "credential_scope_expanded",
+      "mcp_scope_expanded",
+      "gate_weakened",
+      "resource_limit_increased",
+    ]));
+    expect(decision.differences).toEqual(expect.arrayContaining([
+      { reason: "resource_limit_increased", path: "config.limits.max_turns" },
+      { reason: "resource_limit_increased", path: "config.limits.task_timeout" },
+      { reason: "gate_weakened", path: "config.commands.test" },
+      { reason: "mcp_scope_expanded", path: "config.mcp_servers.github" },
+      { reason: "credential_scope_expanded", path: "graph.workers.implementer.credentials" },
+      { reason: "mcp_scope_expanded", path: "graph.workers.implementer.allowed_mcp_servers" },
+      { reason: "gate_weakened", path: "graph.nodes.implement.phases[1]" },
+    ]));
+    expect(validateRatchetDecision(decision).digest).toBeTruthy();
+  });
+
   it("rejects unsupported timestamps and normalizes equivalent ISO offsets", () => {
     const raw = readFixture("valid", "citation-contract.json");
     const proposal = JSON.parse(raw) as {

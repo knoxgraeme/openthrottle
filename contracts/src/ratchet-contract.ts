@@ -1,3 +1,6 @@
+import { canonicalJson } from "./canonical.js";
+import { validateRepositoryConfigContract, type RepositoryConfigContract } from "./config.js";
+import { validateGraphContract, type GraphContract } from "./graph.js";
 import {
   IDENTIFIER,
   SHA256,
@@ -35,6 +38,12 @@ export const RATCHET_REJECTION_REASONS = [
   "human_authority_missing",
   "tuner_authority_missing",
   "authority_conflict",
+  "credential_scope_expanded",
+  "mcp_scope_expanded",
+  "gate_weakened",
+  "resource_limit_increased",
+  "unknown_policy_change",
+  "incomparable_policy_change",
 ] as const;
 
 export interface RatchetArtifactDigest {
@@ -60,6 +69,10 @@ export interface RatchetDifferentialInput {
   id: string;
   pinned: RatchetArtifactDigest[];
   proposed: RatchetArtifactDigest[];
+  pinned_config?: RepositoryConfigContract;
+  proposed_config?: RepositoryConfigContract;
+  pinned_graph?: GraphContract;
+  proposed_graph?: GraphContract;
   human_authority: RatchetHumanAuthority | null;
   tuner_authority: RatchetTunerAuthority | null;
 }
@@ -67,6 +80,7 @@ export interface RatchetDifferentialInput {
 export interface RatchetDifference {
   reason: (typeof RATCHET_REJECTION_REASONS)[number];
   artifact_id?: string;
+  path?: string;
 }
 
 export interface RatchetDecision {
@@ -75,6 +89,201 @@ export interface RatchetDecision {
   outcome: "accept" | "reject";
   reject_reasons: Array<(typeof RATCHET_REJECTION_REASONS)[number]>;
   differences: RatchetDifference[];
+}
+
+type RatchetRejectionReason = (typeof RATCHET_REJECTION_REASONS)[number];
+
+const CONFIG_POLICY_TOP_LEVEL_FIELDS = [
+  "schema",
+  "default_graph",
+  "graphs",
+  "skills",
+  "agent",
+  "model",
+  "post_bootstrap",
+  "pipelines",
+  "intents",
+] as const;
+
+function pushDifference(
+  differences: RatchetDifference[],
+  reason: RatchetRejectionReason,
+  path: string
+): void {
+  differences.push({ reason, path });
+}
+
+function sameCanonical(left: unknown, right: unknown): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function activeMcpServers(config: RepositoryConfigContract): Map<string, unknown> {
+  const active = new Map<string, unknown>();
+  for (const [name, server] of Object.entries(config.mcp_servers ?? {})) {
+    if (server.enabled !== false) active.set(name, server);
+  }
+  return active;
+}
+
+function isSubset<T extends string>(proposed: readonly T[], pinned: readonly T[]): boolean {
+  const pinnedSet = new Set(pinned);
+  return proposed.every((entry) => pinnedSet.has(entry));
+}
+
+function compareResourceLimit(
+  pinned: number | undefined,
+  proposed: number | undefined,
+  path: string,
+  differences: RatchetDifference[]
+): void {
+  if (pinned === undefined) return;
+  if (proposed === undefined || proposed > pinned) {
+    pushDifference(differences, "resource_limit_increased", path);
+  }
+}
+
+function compareRepositoryConfigPolicy(
+  pinned: RepositoryConfigContract,
+  proposed: RepositoryConfigContract,
+  differences: RatchetDifference[]
+): void {
+  for (const field of CONFIG_POLICY_TOP_LEVEL_FIELDS) {
+    if (!sameCanonical(pinned[field], proposed[field])) {
+      pushDifference(differences, "unknown_policy_change", `config.${field}`);
+    }
+  }
+
+  compareResourceLimit(
+    pinned.limits?.max_turns,
+    proposed.limits?.max_turns,
+    "config.limits.max_turns",
+    differences
+  );
+  compareResourceLimit(
+    pinned.limits?.task_timeout,
+    proposed.limits?.task_timeout,
+    "config.limits.task_timeout",
+    differences
+  );
+
+  const pinnedCommands = pinned.commands ?? {};
+  const proposedCommands = proposed.commands ?? {};
+  for (const [name, command] of Object.entries(pinnedCommands)) {
+    if (!(name in proposedCommands)) {
+      pushDifference(differences, "gate_weakened", `config.commands.${name}`);
+      continue;
+    }
+    if (proposedCommands[name] !== command) {
+      pushDifference(differences, "incomparable_policy_change", `config.commands.${name}`);
+    }
+  }
+
+  const pinnedServers = activeMcpServers(pinned);
+  const proposedServers = activeMcpServers(proposed);
+  for (const [name, server] of proposedServers) {
+    const pinnedServer = pinnedServers.get(name);
+    if (!pinnedServer) {
+      pushDifference(differences, "mcp_scope_expanded", `config.mcp_servers.${name}`);
+      continue;
+    }
+    if (!sameCanonical(server, pinnedServer)) {
+      pushDifference(differences, "incomparable_policy_change", `config.mcp_servers.${name}`);
+    }
+  }
+}
+
+function commandPhases(graph: GraphContract): Map<string, readonly string[]> {
+  const phases = new Map<string, readonly string[]>();
+  for (const node of graph.nodes) {
+    for (const [index, phase] of (node.phases ?? []).entries()) {
+      if (phase.kind === "command") phases.set(`${node.id}.phases[${index}]`, phase.commands ?? []);
+    }
+    if (node.kind === "command" && node.command) phases.set(`${node.id}.command`, [node.command]);
+  }
+  return phases;
+}
+
+function graphWithoutComparablePolicyFields(graph: GraphContract): unknown {
+  return {
+    ...graph,
+    workers: graph.workers.map((worker) => ({ ...worker, credentials: [], allowed_mcp_servers: [] })),
+    loops: graph.loops.map((loop) => ({ ...loop, max_rounds: 1, timeout_seconds: 1 })),
+    nodes: graph.nodes.map((node) => ({
+      ...node,
+      command: node.kind === "command" ? "" : node.command,
+      phases: node.phases?.map((phase) => ({
+        ...phase,
+        commands: phase.kind === "command" ? [] : phase.commands,
+      })),
+    })),
+  };
+}
+
+function compareGraphPolicy(
+  pinned: GraphContract,
+  proposed: GraphContract,
+  differences: RatchetDifference[]
+): void {
+  const proposedWorkers = new Map(proposed.workers.map((worker) => [worker.id, worker]));
+  for (const worker of pinned.workers) {
+    const proposedWorker = proposedWorkers.get(worker.id);
+    if (!proposedWorker) {
+      pushDifference(differences, "unknown_policy_change", `graph.workers.${worker.id}`);
+      continue;
+    }
+    if (!isSubset(proposedWorker.credentials, worker.credentials)) {
+      pushDifference(differences, "credential_scope_expanded", `graph.workers.${worker.id}.credentials`);
+    }
+    if (!isSubset(proposedWorker.allowed_mcp_servers, worker.allowed_mcp_servers)) {
+      pushDifference(differences, "mcp_scope_expanded", `graph.workers.${worker.id}.allowed_mcp_servers`);
+    }
+    const pinnedComparable = { ...worker, credentials: [], allowed_mcp_servers: [] };
+    const proposedComparable = { ...proposedWorker, credentials: [], allowed_mcp_servers: [] };
+    if (!sameCanonical(pinnedComparable, proposedComparable)) {
+      pushDifference(differences, "unknown_policy_change", `graph.workers.${worker.id}`);
+    }
+  }
+  for (const worker of proposed.workers) {
+    if (!pinned.workers.some((pinnedWorker) => pinnedWorker.id === worker.id)) {
+      if (worker.credentials.length > 0) pushDifference(differences, "credential_scope_expanded", `graph.workers.${worker.id}.credentials`);
+      if (worker.allowed_mcp_servers.length > 0) pushDifference(differences, "mcp_scope_expanded", `graph.workers.${worker.id}.allowed_mcp_servers`);
+    }
+  }
+
+  const proposedLoops = new Map(proposed.loops.map((loop) => [loop.id, loop]));
+  for (const loop of pinned.loops) {
+    const proposedLoop = proposedLoops.get(loop.id);
+    if (!proposedLoop) {
+      pushDifference(differences, "gate_weakened", `graph.loops.${loop.id}`);
+      continue;
+    }
+    compareResourceLimit(loop.max_rounds, proposedLoop.max_rounds, `graph.loops.${loop.id}.max_rounds`, differences);
+    compareResourceLimit(loop.timeout_seconds, proposedLoop.timeout_seconds, `graph.loops.${loop.id}.timeout_seconds`, differences);
+    const pinnedComparable = { ...loop, max_rounds: 1, timeout_seconds: 1 };
+    const proposedComparable = { ...proposedLoop, max_rounds: 1, timeout_seconds: 1 };
+    if (!sameCanonical(pinnedComparable, proposedComparable)) {
+      pushDifference(differences, "unknown_policy_change", `graph.loops.${loop.id}`);
+    }
+  }
+
+  const proposedCommandPhases = commandPhases(proposed);
+  for (const [path, commands] of commandPhases(pinned)) {
+    const proposedCommands = proposedCommandPhases.get(path);
+    if (!proposedCommands || !isSubset(commands, proposedCommands)) {
+      pushDifference(differences, "gate_weakened", `graph.nodes.${path}`);
+    }
+  }
+
+  if (!sameCanonical(graphWithoutComparablePolicyFields(pinned), graphWithoutComparablePolicyFields(proposed))) {
+    pushDifference(differences, "incomparable_policy_change", "graph");
+  }
+}
+
+function parseOptionalConfig(
+  value: unknown,
+  source: string
+): RepositoryConfigContract | undefined {
+  return value === undefined ? undefined : validateRepositoryConfigContract(value, { source }).value;
 }
 
 function parseArtifactDigest(value: unknown, path: string): RatchetArtifactDigest {
@@ -116,14 +325,31 @@ export function validateRatchetDifferentialInput(
 ): ValidatedContract<RatchetDifferentialInput> {
   const source = options.source ?? "ratchet_contract";
   const input = objectAt(value, source, [
-    "schema", "id", "pinned", "proposed", "human_authority", "tuner_authority",
+    "schema", "id", "pinned", "proposed", "pinned_config", "proposed_config", "pinned_graph", "proposed_graph",
+    "human_authority", "tuner_authority",
   ]);
   if (input.schema !== RATCHET_CONTRACT_SCHEMA) fail(`${source}.schema`, `must be ${RATCHET_CONTRACT_SCHEMA}`);
+  const pinnedConfig = parseOptionalConfig(input.pinned_config, `${source}.pinned_config`);
+  const proposedConfig = parseOptionalConfig(input.proposed_config, `${source}.proposed_config`);
   const contract: RatchetDifferentialInput = {
     schema: RATCHET_CONTRACT_SCHEMA,
     id: stringAt(input.id, `${source}.id`, { pattern: IDENTIFIER }),
     pinned: parseArtifactList(input.pinned, `${source}.pinned`),
     proposed: parseArtifactList(input.proposed, `${source}.proposed`),
+    ...(pinnedConfig === undefined ? {} : { pinned_config: pinnedConfig }),
+    ...(proposedConfig === undefined ? {} : { proposed_config: proposedConfig }),
+    ...(input.pinned_graph === undefined ? {} : {
+      pinned_graph: validateGraphContract(input.pinned_graph, {
+        source: `${source}.pinned_graph`,
+        config: pinnedConfig,
+      }).value,
+    }),
+    ...(input.proposed_graph === undefined ? {} : {
+      proposed_graph: validateGraphContract(input.proposed_graph, {
+        source: `${source}.proposed_graph`,
+        config: proposedConfig,
+      }).value,
+    }),
     human_authority: input.human_authority === null
       ? null
       : parseHumanAuthority(input.human_authority, `${source}.human_authority`),
@@ -175,8 +401,18 @@ export function decideDifferentialRatchet(input: RatchetDifferentialInput): Ratc
       contract.human_authority.approval_digest === contract.tuner_authority.proposal_digest) {
     differences.push({ reason: "authority_conflict" });
   }
+  if (Boolean(contract.pinned_config) !== Boolean(contract.proposed_config)) {
+    pushDifference(differences, "unknown_policy_change", "config");
+  } else if (contract.pinned_config && contract.proposed_config) {
+    compareRepositoryConfigPolicy(contract.pinned_config, contract.proposed_config, differences);
+  }
+  if (Boolean(contract.pinned_graph) !== Boolean(contract.proposed_graph)) {
+    pushDifference(differences, "unknown_policy_change", "graph");
+  } else if (contract.pinned_graph && contract.proposed_graph) {
+    compareGraphPolicy(contract.pinned_graph, contract.proposed_graph, differences);
+  }
 
-  const reject_reasons = unique(differences.map((difference) => difference.reason), "ratchet_decision.reject_reasons");
+  const reject_reasons = [...new Set(differences.map((difference) => difference.reason))];
   return {
     schema: RATCHET_DECISION_SCHEMA,
     input_digest: validated.digest,
@@ -201,11 +437,14 @@ export function validateRatchetDecision(
       return enumAt(entry, entryPath, RATCHET_REJECTION_REASONS);
     }, { max: 16 }), `${source}.reject_reasons`),
     differences: arrayAt(input.differences, `${source}.differences`, (entry, entryPath) => {
-      const difference = objectAt(entry, entryPath, ["reason", "artifact_id"]);
+      const difference = objectAt(entry, entryPath, ["reason", "artifact_id", "path"]);
       return {
         reason: enumAt(difference.reason, `${entryPath}.reason`, RATCHET_REJECTION_REASONS),
         ...(difference.artifact_id === undefined ? {} : {
           artifact_id: stringAt(difference.artifact_id, `${entryPath}.artifact_id`, { pattern: IDENTIFIER }),
+        }),
+        ...(difference.path === undefined ? {} : {
+          path: stringAt(difference.path, `${entryPath}.path`, { max: 300 }),
         }),
       };
     }, { max: 128 }),
