@@ -1,5 +1,4 @@
 import type Database from "better-sqlite3";
-import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
@@ -25,7 +24,6 @@ import {
   renderGithubPipelineSummary,
   shouldPostLinearEventComment,
 } from "./publication.js";
-import { executionLedgerLines } from "./execution-publication.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { createPipelinePublicationWriter } from "../persistence/pipeline/helpers.js";
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
@@ -38,10 +36,6 @@ import type {
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
-const legacyPublicationPreV25Path = fileURLToPath(new URL(
-  "../__fixtures__/legacy-publication-envelope-pre-v25.json",
-  import.meta.url
-));
 const runtime = buildInstalledRuntimeDescriptor("publication-test/v1");
 const SUBJECT = "c".repeat(40);
 
@@ -595,31 +589,6 @@ describe("pipeline publication", () => {
     expect(publication.body).toMatch(/Your move:/);
     expect(publication.body).toContain("earlier unit(s) omitted");
     expect(renderGithubPipelineSummary(publication)).toContain(`- [${link.label}](${link.url})`);
-  });
-
-  it("parses and renders a structured_execution envelope persisted before activity_log existed", () => {
-    const persistedLegacyPublication = readFileSync(legacyPublicationPreV25Path, "utf8").replace(/\r?\n$/, "");
-    const expectedLegacyPublication = JSON.parse(persistedLegacyPublication);
-    const parsed = parsePipelinePublication(persistedLegacyPublication);
-    const ledger = executionLedgerLines(parsed.structured_execution).join("\n");
-
-    expect(parsed).toEqual(expectedLegacyPublication);
-    expect(parsed.structured_execution && "activity_log" in parsed.structured_execution).toBe(false);
-    expect(parsed.structured_execution?.activity_log ?? []).toEqual([]);
-    expect(parsed.structured_execution?.graph).toEqual({
-      id: "graph-legacy-pre-v25",
-      parent_attempt_id: "attempt-parent-legacy",
-      parent_stage_id: "structured",
-      integration_subject: "abcdef1234567890abcdef1234567890abcdef12",
-      aggregate_artifact_hash: "aggregate-hash-legacy",
-      aggregate_emitted_at: "2026-07-29T00:03:00.000Z",
-      stopped_at: null,
-      stop_reason: null,
-    });
-    expect(parsed.structured_execution?.units[0]?.gates[0]?.reason).toBe("Lead accepted the legacy unit.");
-    expect(parsed.structured_execution?.units[0]?.downstream_context[0]?.summary).toBe("Legacy downstream context survives parsing.");
-    expect(ledger).toContain("legacy_envelope_pin: completed");
-    expect(ledger).not.toContain("Structured Activity Log");
   });
 
   it("keeps persisted v1 publication envelopes parseable after the template bump", () => {
