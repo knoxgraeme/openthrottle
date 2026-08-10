@@ -1859,7 +1859,7 @@ CREATE TABLE citation_gate_receipts (
   outcome TEXT NOT NULL CHECK(outcome IN ('success', 'failure')),
   reason TEXT NOT NULL CHECK(reason IN (
     'all_citations_reproduced', 'partial_claim_survival', 'no_claims_survived',
-    'proposal_tampered', 'stale_evidence'
+    'stale_evidence'
   )),
   grade_hash TEXT NOT NULL,
   payload TEXT NOT NULL CHECK(json_valid(payload)),

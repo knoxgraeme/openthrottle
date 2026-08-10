@@ -14,7 +14,6 @@ export const CITATION_GATE_REASONS = Object.freeze([
   "all_citations_reproduced",
   "partial_claim_survival",
   "no_claims_survived",
-  "proposal_tampered",
   "stale_evidence",
 ] as const);
 export type CitationGateReason = (typeof CITATION_GATE_REASONS)[number];

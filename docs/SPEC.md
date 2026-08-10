@@ -783,8 +783,8 @@ analysis queries against `run_outcomes`; after resolution it calls the
 pipeline-level citation gate with plain proposal bytes plus resolved result
 rows. The gate emits canonical `openthrottle.citation-gate/v1` decisions with
 bounded reason codes (`all_citations_reproduced`,
-`partial_claim_survival`, `no_claims_survived`, `proposal_tampered`,
-`stale_evidence`) and persists them in `citation_gate_receipts` by proposal
+`partial_claim_survival`, `no_claims_survived`, `stale_evidence`) and persists
+them in `citation_gate_receipts` by proposal
 hash. Exact replay returns the original receipt; the same proposal hash paired
 with different resolved evidence is rejected as conflicting replay. Scheduler,
 transition, reducer, and effect-drain code must not import the analysis store

@@ -51,7 +51,7 @@ describe("citation gate store", () => {
     store.recordCitationGateDecision(decision());
 
     expect(() => store.recordCitationGateDecision(decision({
-      reason: "proposal_tampered",
+      reason: "stale_evidence",
       result: "failed",
       outcome: "failure",
       grade_hash: "e".repeat(64),
