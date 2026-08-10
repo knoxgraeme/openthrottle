@@ -61,8 +61,8 @@ gosu agent git -C "$INTEGRATION" config user.email probe@openthrottle.dev
 gosu agent git -C "$INTEGRATION" config user.name "OpenThrottle Probe"
 gosu agent git -C "$INTEGRATION" config gc.auto 0
 gosu agent sh -c "printf 'integration-owned\n' > '$INTEGRATION/file.txt'"
-gosu agent mkdir -p "$INTEGRATION/.agents/skills/current"
-gosu agent sh -c "cat > '$INTEGRATION/.agents/skills/current/SKILL.md' <<'SKILL'
+gosu agent mkdir -p "$INTEGRATION/.openthrottle/skills/current"
+gosu agent sh -c "cat > '$INTEGRATION/.openthrottle/skills/current/SKILL.md' <<'SKILL'
 ---
 name: repo_action
 description: Probe repository skill
@@ -71,7 +71,7 @@ description: Probe repository skill
 Probe repository skill from the pinned package.
 SKILL"
 gosu agent git -C "$INTEGRATION" add file.txt
-gosu agent git -C "$INTEGRATION" add .agents/skills/current/SKILL.md
+gosu agent git -C "$INTEGRATION" add .openthrottle/skills/current/SKILL.md
 gosu agent git -C "$INTEGRATION" commit -q -m "seed integration"
 BASE="$(gosu agent git -C "$INTEGRATION" rev-parse HEAD)"
 SIBLING_ONLY_BLOB="$(gosu agent sh -c "printf 'sibling object secret\n' | git -C '$INTEGRATION' hash-object -w --stdin")"
@@ -399,7 +399,7 @@ import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs
 
 const requestPath = process.argv[2];
 const repoDir = process.argv[3];
-const skillPath = ".agents/skills/current/SKILL.md";
+const skillPath = ".openthrottle/skills/current/SKILL.md";
 function git(args) {
   return execFileSync("git", ["-c", `safe.directory=${repoDir}`, "-C", repoDir, ...args], { encoding: "utf8" }).trim();
 }
@@ -407,9 +407,9 @@ const head = git(["rev-parse", "HEAD"]);
 const blobSha = git(["rev-parse", `${head}:${skillPath}`]);
 const unsignedPackage = {
   schema: "openthrottle.repository-skill-package/v1",
-  reference: `repo://owner/repo@${head}#.agents/skills/current`,
+  reference: `repo://owner/repo@${head}#.openthrottle/skills/current`,
   invocation: "repo_action",
-  directory: ".agents/skills/current",
+  directory: ".openthrottle/skills/current",
   commit: head,
   files: [{
     path: skillPath,
@@ -563,7 +563,7 @@ LEAD_REQUEST_HASH="$(request_hash "$LEAD_REQUEST")"
 REVIEWER_REQUEST_HASH="$(request_hash "$REVIEWER_REQUEST")"
 BUILTIN_REQUEST_HASH="$(request_hash "$BUILTIN_REQUEST")"
 
-printf 'mutable worktree skill bytes\n' > "$WORKTREES/current/.agents/skills/current/SKILL.md"
+printf 'mutable worktree skill bytes\n' > "$WORKTREES/current/.openthrottle/skills/current/SKILL.md"
 printf '#!/bin/sh\necho executable probe\n' > "$WORKTREES/current/executable-probe.sh"
 chmod 0755 "$WORKTREES/current/executable-probe.sh"
 
@@ -596,7 +596,7 @@ write_probe_env \
   PROBE_RECEIPT_ACTION_ATTEMPT_ID "action-current" \
   PROBE_RECEIPT_GENERATION "1" \
   PROBE_RECEIPT_NATIVE_SESSION_ID "native-current" \
-  PROBE_RECEIPT_SKILL "repo://owner/repo@$BASE#.agents/skills/current"
+  PROBE_RECEIPT_SKILL "repo://owner/repo@$BASE#.openthrottle/skills/current"
 PATH="$BIN:$PATH" \
 OT_LOOP_ACTION_ROOT="$ACTION_ROOT" \
 OT_WORKTREE_ROOT="$WORKTREES" \

@@ -398,10 +398,10 @@ describe("GitHub contracts", () => {
         return Response.json({
           truncated: false,
           tree: [
-            { path: ".agents/skills/implement-unit", mode: "040000", type: "tree", sha: "1".repeat(40) },
-            { path: ".agents/skills/implement-unit/SKILL.md", mode: "100644", type: "blob", sha: "d".repeat(40), size: Buffer.byteLength(skill) },
-            { path: ".agents/skills/implement-unit/references/helper.md", mode: "100644", type: "blob", sha: "f".repeat(40), size: Buffer.byteLength(helper) },
-            { path: ".agents/skills/other/SKILL.md", mode: "100644", type: "blob", sha: "f".repeat(40), size: 1 },
+            { path: ".openthrottle/skills/implement_unit", mode: "040000", type: "tree", sha: "1".repeat(40) },
+            { path: ".openthrottle/skills/implement_unit/SKILL.md", mode: "100644", type: "blob", sha: "d".repeat(40), size: Buffer.byteLength(skill) },
+            { path: ".openthrottle/skills/implement_unit/references/helper.md", mode: "100644", type: "blob", sha: "f".repeat(40), size: Buffer.byteLength(helper) },
+            { path: ".openthrottle/skills/other/SKILL.md", mode: "100644", type: "blob", sha: "f".repeat(40), size: 1 },
           ],
         });
       }
@@ -428,14 +428,14 @@ describe("GitHub contracts", () => {
       { token: "github", fetch: fetchMock },
       "owner/repo",
       "a".repeat(40),
-      ".agents/skills/implement-unit"
+      ".openthrottle/skills/implement_unit"
     )).resolves.toMatchObject({
       repository: "owner/repo",
       commit: "a".repeat(40),
-      directory: ".agents/skills/implement-unit",
+      directory: ".openthrottle/skills/implement_unit",
       files: [
-        { path: ".agents/skills/implement-unit/references/helper.md", blobSha: "f".repeat(40), content: helper },
-        { path: ".agents/skills/implement-unit/SKILL.md", blobSha: "d".repeat(40), content: skill },
+        { path: ".openthrottle/skills/implement_unit/references/helper.md", blobSha: "f".repeat(40), content: helper },
+        { path: ".openthrottle/skills/implement_unit/SKILL.md", blobSha: "d".repeat(40), content: skill },
       ],
     });
   });
@@ -458,7 +458,7 @@ describe("GitHub contracts", () => {
         return Response.json({
           truncated: false,
           tree: [
-            { path: ".agents/skills/implement-unit/SKILL.md", mode: "120000", type: "blob", sha: "d".repeat(40), size: 10 },
+            { path: ".openthrottle/skills/implement_unit/SKILL.md", mode: "120000", type: "blob", sha: "d".repeat(40), size: 10 },
           ],
         });
       }
@@ -468,7 +468,7 @@ describe("GitHub contracts", () => {
       { token: "github", fetch: fetchMock },
       "owner/repo",
       "a".repeat(40),
-      ".agents/skills/implement-unit"
+      ".openthrottle/skills/implement_unit"
     )).rejects.toThrow(/not a regular file/);
   });
 

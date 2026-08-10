@@ -113,7 +113,7 @@ function repository() {
 }
 
 function sealedRepositorySkillPackage(repoDir, {
-  skillDir = ".agents/skills/implement-unit",
+  skillDir = ".openthrottle/skills/implement_unit",
   invocation = "implement_unit",
   skillName = "implement_unit",
   body = "# Skill\n",
@@ -654,13 +654,13 @@ describe("one-stage executor", () => {
   it("accepts repository skill identity when it matches the sealed manifest", () => {
     const repositorySkill = {
       schema: "openthrottle.repository-skill-package/v1",
-      reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+      reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/implement_unit`,
       invocation: "implement_unit",
-      directory: ".agents/skills/implement-unit",
+      directory: ".openthrottle/skills/implement_unit",
       commit: "a".repeat(40),
       packageDigest: "d".repeat(64),
       files: [{
-        path: ".agents/skills/implement-unit/SKILL.md",
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
         blobSha: "b".repeat(40),
         digest: "c".repeat(64),
       }],
@@ -682,13 +682,13 @@ describe("one-stage executor", () => {
 
   it("materializes only the sealed repository skill package into engine discovery", () => {
     const repoDir = repository();
-    const skillDir = ".agents/skills/implement-unit";
-    mkdirSync(join(repoDir, ".agents", "skills", "implement-unit"), { recursive: true });
-    mkdirSync(join(repoDir, ".agents", "skills", "other-skill"), { recursive: true });
+    const skillDir = ".openthrottle/skills/implement_unit";
+    mkdirSync(join(repoDir, skillDir), { recursive: true });
+    mkdirSync(join(repoDir, ".openthrottle", "skills", "other-skill"), { recursive: true });
     writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Skill\n");
     writeFileSync(join(repoDir, skillDir, "helper.txt"), "helper\n");
     writeFileSync(join(repoDir, skillDir, "run.sh"), "#!/usr/bin/env sh\nexit 0\n");
-    writeFileSync(join(repoDir, ".agents", "skills", "other-skill", "SKILL.md"), "---\nname: other\n---\n");
+    writeFileSync(join(repoDir, ".openthrottle", "skills", "other-skill", "SKILL.md"), "---\nname: other\n---\n");
     execFileSync("git", ["add", "."], { cwd: repoDir });
     execFileSync("git", ["update-index", "--chmod=+x", `${skillDir}/run.sh`], { cwd: repoDir });
     execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
@@ -773,7 +773,7 @@ describe("one-stage executor", () => {
     const rematerialized = materializeRepositorySkill({ request, repoDir });
     expect(readFileSync(join(rematerialized, "helper.txt"), "utf8")).toBe("helper\n");
     expectMaterializeToThrow({ ...repositorySkill, packageDigest: "0".repeat(64) }, /package digest mismatch/);
-    const outsidePath = ".agents/skills/other-skill/SKILL.md";
+    const outsidePath = ".openthrottle/skills/other-skill/SKILL.md";
     const outsideBytes = readFileSync(join(repoDir, outsidePath));
     const outsideFile = {
       path: outsidePath,
@@ -820,13 +820,13 @@ describe("one-stage executor", () => {
   it("locks persistent agent profiles for repository-skill stages only", () => {
     const repositorySkill = {
       schema: "openthrottle.repository-skill-package/v1",
-      reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+      reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/implement_unit`,
       invocation: "implement_unit",
-      directory: ".agents/skills/implement-unit",
+      directory: ".openthrottle/skills/implement_unit",
       commit: "a".repeat(40),
       packageDigest: "d".repeat(64),
       files: [{
-        path: ".agents/skills/implement-unit/SKILL.md",
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
         blobSha: "b".repeat(40),
         digest: "c".repeat(64),
       }],

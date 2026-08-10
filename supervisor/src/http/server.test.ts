@@ -240,11 +240,17 @@ describe("coordinator-only server", () => {
     const response = await app({ pipelineCoordinator: { catalog: {} as never, runtime, store: pipelines } })
       .request("/capabilities", { headers: { Authorization: "Bearer status-token" } });
     expect(response.status).toBe(200);
-    const body = await response.json() as { release: string; capabilityDigest: string; capabilities: string[] };
+    const body = await response.json() as {
+      release: string;
+      capabilityDigest: string;
+      capabilities: string[];
+      limits: { taskTimeoutSeconds: number };
+    };
     expect(body).toEqual({
       release: runtime.descriptor.release,
       capabilityDigest: runtime.digest,
       capabilities: runtime.descriptor.capabilities,
+      limits: { taskTimeoutSeconds: 7200 },
     });
   });
 

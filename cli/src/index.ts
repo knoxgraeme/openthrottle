@@ -10,9 +10,13 @@ const USAGE = `openthrottle — plan-first autonomous coding pipeline CLI
 Usage:
   openthrottle setup               Check one-time platform prerequisites and
                                     print the Fly supervisor secrets checklist.
-  openthrottle init                Register the current GitHub repository and
+  openthrottle init [--editable-skills] [--dry-run]
+                                    Register the current GitHub repository and
                                     Linear team, verify readiness, and write
-                                    .openthrottle.yml.
+                                    .openthrottle.yml. The optional flag also
+                                    scaffolds the editable simple pipeline;
+                                    --dry-run prints its refresh classifications
+                                    without writing or registering anything.
   openthrottle plan validate <file.md>
                                     Validate the plan's execution-plan block.
   openthrottle plan prepare <file.md> [--graph <id>]
@@ -44,7 +48,7 @@ async function main(): Promise<void> {
     }
     case 'init': {
       const { default: init } = await import('./init.js');
-      await init();
+      await init(rest);
       break;
     }
     case 'ship': {

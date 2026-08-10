@@ -1804,7 +1804,7 @@ intents:
 
   it("pins repository skill packages and carries skill identity in the compiled request", async () => {
     const graphPath = ".openthrottle/graphs/repo-skill.json";
-    const skillPath = ".agents/skills/implement-unit/SKILL.md";
+    const skillPath = ".openthrottle/skills/implement_unit/SKILL.md";
     const graph = JSON.stringify({
       schema: "openthrottle.graph/v1",
       id: "repo-skill-graph",
@@ -1847,7 +1847,7 @@ graphs:
     ref: ${graphPath}
 skills:
   - id: implement_unit
-    path: .agents/skills/implement-unit
+    path: .openthrottle/skills/implement_unit
 limits:
   task_timeout: 7200
 pipelines: { implement: implement }
@@ -1885,9 +1885,9 @@ intents:
     expect(request).toMatchObject({
       capability: "agent/repository-skill@1",
       repositorySkill: {
-        reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+        reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/implement_unit`,
         invocation: "implement_unit",
-        directory: ".agents/skills/implement-unit",
+        directory: ".openthrottle/skills/implement_unit",
         commit: "a".repeat(40),
         files: [{
           path: skillPath,
@@ -1908,7 +1908,7 @@ intents:
 
   it("admits repository skill graphs now that production advertises agent/repository-skill@1", async () => {
     const graphPath = ".openthrottle/graphs/repo-skill.json";
-    const skillPath = ".agents/skills/implement-unit/SKILL.md";
+    const skillPath = ".openthrottle/skills/implement_unit/SKILL.md";
     const graph = JSON.stringify({
       schema: "openthrottle.graph/v1",
       id: "repo-skill-graph",
@@ -1951,7 +1951,7 @@ graphs:
     ref: ${graphPath}
 skills:
   - id: implement_unit
-    path: .agents/skills/implement-unit
+    path: .openthrottle/skills/implement_unit
 limits:
   task_timeout: 60
 pipelines: { implement: implement }
@@ -1984,7 +1984,7 @@ intents:
 
   it("rejects repository skill packages whose SKILL.md name does not match the configured invocation", async () => {
     const graphPath = ".openthrottle/graphs/repo-skill.json";
-    const skillPath = ".agents/skills/implement-unit/SKILL.md";
+    const skillPath = ".openthrottle/skills/implement_unit/SKILL.md";
     const graph = JSON.stringify({
       schema: "openthrottle.graph/v1",
       id: "repo-skill-graph",
@@ -2028,7 +2028,7 @@ graphs:
     ref: ${graphPath}
 skills:
   - id: implement_unit
-    path: .agents/skills/implement-unit
+    path: .openthrottle/skills/implement_unit
 pipelines: { implement: implement }
 intents:
   implement:
@@ -2528,7 +2528,7 @@ intents:
 
   it("includes repository skill package metadata in the structured envelope bound", async () => {
     const graphPath = ".openthrottle/graphs/structured-repo-skill.json";
-    const skillPath = ".agents/skills/implement-unit/SKILL.md";
+    const skillPath = ".openthrottle/skills/implement_unit/SKILL.md";
     const boundary = structuredPlanContextBoundary();
     const context = [
       "# Structured work",
@@ -2634,7 +2634,7 @@ graphs:
     ref: ${graphPath}
 skills:
   - id: implement_unit
-    path: .agents/skills/implement-unit
+    path: .openthrottle/skills/implement_unit
 commands:
   test: "npm test"
   lint: "npm run lint"

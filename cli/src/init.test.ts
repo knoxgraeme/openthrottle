@@ -1,17 +1,30 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { parseGraphContract, validateRepositoryConfigContract } from "@openthrottle/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import {
   detectPackageManager,
   detectProject,
   detectRepository,
+  editableSkillsRefreshSummary,
+  getSupervisorTaskTimeoutSeconds,
   parseGithubRemote,
+  planEditableSkillsRefresh,
   registerTargetRepository,
   registrationSummary,
   writeProjectConfig,
+  type ProjectConfig,
 } from "./init.js";
 
 const directories: string[] = [];
@@ -23,6 +36,33 @@ function temporaryProject(): string {
   const directory = mkdtempSync(join(tmpdir(), "openthrottle-cli-test-"));
   directories.push(directory);
   return directory;
+}
+
+function completeProjectConfig(): ProjectConfig {
+  return {
+    agent: "codex",
+    commands: {
+      test: "npm test",
+      lint: "npm run lint",
+      build: "npm run build",
+    },
+    test: "npm test",
+    lint: "npm run lint",
+    build: "npm run build",
+    post_bootstrap: ["npm install"],
+    limits: { max_turns: 200, task_timeout: 7200 },
+    mcp_servers: {},
+  };
+}
+
+function mutableEditableResources(): { root: string; graphPath: string; skillDirectory: string } {
+  const root = temporaryProject();
+  const graphPath = join(root, "simple-v1.json");
+  const skillDirectory = join(root, "implement-plan");
+  mkdirSync(skillDirectory, { recursive: true });
+  cpSync(resolve(process.cwd(), "../supervisor/graphs/simple-v1.json"), graphPath);
+  cpSync(resolve(process.cwd(), "../skills/tasks/implement-plan"), skillDirectory, { recursive: true });
+  return { root, graphPath, skillDirectory };
 }
 
 describe("init project detection", () => {
@@ -258,5 +298,431 @@ describe("init project detection", () => {
         request
       )
     ).resolves.toMatchObject({ registration: { github_repo: "acme/widget" } });
+  });
+
+  it("scaffolds the exact editable simple-pipeline package under .openthrottle", () => {
+    const directory = temporaryProject();
+    writeProjectConfig(completeProjectConfig(), directory, { editableSkills: true });
+
+    const configRaw = readFileSync(join(directory, ".openthrottle.yml"), "utf8");
+    const config = validateRepositoryConfigContract(parse(configRaw), { source: ".openthrottle.yml" });
+    expect(config.value).toMatchObject({
+      default_graph: "simple_editable",
+      graphs: expect.arrayContaining([
+        { id: "simple_editable", kind: "repository", ref: ".openthrottle/graphs/simple.json" },
+      ]),
+      skills: [{ id: "implement-plan", path: ".openthrottle/skills/implement-plan" }],
+      intents: {
+        implement: {
+          default_graph: "simple_editable",
+          allowed_graphs: ["simple_editable", "simple", "structured"],
+        },
+      },
+    });
+
+    const graphRaw = readFileSync(join(directory, ".openthrottle/graphs/simple.json"), "utf8");
+    const graph = parseGraphContract(graphRaw, {
+      source: ".openthrottle/graphs/simple.json",
+      config: config.value,
+    }).value;
+    expect(graph.loops.find((loop) => loop.id === "implementation-loop")?.skill).toBe("repo://implement-plan");
+    expect(graph.loops.find((loop) => loop.id === "repair-implementation-loop")?.skill).toBe("repo://implement-plan");
+    expect(graph.loops.find((loop) => loop.id === "review-loop")?.skill).toBe("builtin://ce/review@1");
+
+    const generatedSkill = readFileSync(
+      join(directory, ".openthrottle/skills/implement-plan/SKILL.md"),
+      "utf8"
+    );
+    expect(generatedSkill).toBe(readFileSync(resolve(process.cwd(), "../skills/tasks/implement-plan/SKILL.md"), "utf8"));
+    expect(readFileSync(
+      join(directory, ".openthrottle/skills/implement-plan/agents/openai.yaml"),
+      "utf8"
+    )).toBe(readFileSync(resolve(process.cwd(), "../skills/tasks/implement-plan/agents/openai.yaml"), "utf8"));
+    expect(() => readFileSync(join(directory, ".agents/skills/implement-plan/SKILL.md"), "utf8")).toThrow();
+
+    const lock = JSON.parse(readFileSync(join(directory, ".openthrottle/skills.lock.json"), "utf8"));
+    expect(lock).toMatchObject({
+      schema: "openthrottle.skills.lock/v1",
+      upstream_graph: { ref: "core/simple@1" },
+      upstream_files: [{ path: "SKILL.md" }, { path: "agents/openai.yaml" }],
+    });
+    expect(lock).toHaveProperty("upstream_package_digest");
+    expect(lock).toHaveProperty("scaffold_package_digest");
+    expect(lock.integrity_digest).toMatch(/^[a-f0-9]{64}$/);
+    expect(planEditableSkillsRefresh(completeProjectConfig(), directory)).toMatchObject({
+      writable: true,
+      entries: expect.arrayContaining([
+        expect.objectContaining({ path: ".openthrottle/skills.lock.json", status: "unchanged" }),
+      ]),
+    });
+  });
+
+  it("copies and pins the complete bounded source package closure", () => {
+    const directory = temporaryProject();
+    const resources = mutableEditableResources();
+    mkdirSync(join(resources.skillDirectory, "references"), { recursive: true });
+    writeFileSync(join(resources.skillDirectory, "references/helper.md"), "# Helper\n");
+
+    writeProjectConfig(completeProjectConfig(), directory, {
+      editableSkills: true,
+      resources: { ...resources, release: "closure-test" },
+    });
+
+    expect(readFileSync(
+      join(directory, ".openthrottle/skills/implement-plan/references/helper.md"),
+      "utf8"
+    )).toBe("# Helper\n");
+    const lock = JSON.parse(readFileSync(join(directory, ".openthrottle/skills.lock.json"), "utf8"));
+    expect(lock.upstream_files).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "references/helper.md" }),
+    ]));
+  });
+
+  it("rejects source package symlinks and production admission bound overflows", () => {
+    const config = completeProjectConfig();
+
+    const symlinkDirectory = temporaryProject();
+    const symlinkResources = mutableEditableResources();
+    symlinkSync(
+      join(symlinkResources.skillDirectory, "SKILL.md"),
+      join(symlinkResources.skillDirectory, "linked.md")
+    );
+    expect(() => writeProjectConfig(config, symlinkDirectory, {
+      editableSkills: true,
+      resources: { ...symlinkResources, release: "symlink-test" },
+    })).toThrow(/source must not contain symlinks/);
+
+    const countDirectory = temporaryProject();
+    const countResources = mutableEditableResources();
+    mkdirSync(join(countResources.skillDirectory, "references"));
+    for (let index = 0; index < 63; index += 1) {
+      writeFileSync(join(countResources.skillDirectory, `references/${index}.md`), "x");
+    }
+    expect(() => writeProjectConfig(config, countDirectory, {
+      editableSkills: true,
+      resources: { ...countResources, release: "count-test" },
+    })).toThrow(/64 file limit/);
+
+    const bytesDirectory = temporaryProject();
+    const bytesResources = mutableEditableResources();
+    writeFileSync(
+      join(bytesResources.skillDirectory, "SKILL.md"),
+      `---\nname: implement-plan\n---\n${"x".repeat(256 * 1024)}`
+    );
+    expect(() => writeProjectConfig(config, bytesDirectory, {
+      editableSkills: true,
+      resources: { ...bytesResources, release: "bytes-test" },
+    })).toThrow(/256 KiB snapshot limit/);
+  });
+
+  it("uses the authenticated supervisor task-timeout capability in generated loops", () => {
+    const directory = temporaryProject();
+    writeProjectConfig(completeProjectConfig(), directory, {
+      editableSkills: true,
+      supervisorTaskTimeoutSeconds: 3600,
+    });
+    const graph = JSON.parse(readFileSync(join(directory, ".openthrottle/graphs/simple.json"), "utf8"));
+    expect(graph.loops.every((loop: { timeout_seconds: number }) => loop.timeout_seconds === 3600)).toBe(true);
+
+    const longDirectory = temporaryProject();
+    const longConfig = completeProjectConfig();
+    longConfig.limits.task_timeout = 10_000;
+    writeProjectConfig(longConfig, longDirectory, {
+      editableSkills: true,
+      supervisorTaskTimeoutSeconds: 12_000,
+    });
+    const longGraph = JSON.parse(readFileSync(
+      join(longDirectory, ".openthrottle/graphs/simple.json"),
+      "utf8"
+    ));
+    expect(longGraph.loops.every((loop: { timeout_seconds: number }) => (
+      loop.timeout_seconds === 10_000
+    ))).toBe(true);
+  });
+
+  it("refuses local-only generated-file edits before writing any candidate", () => {
+    const directory = temporaryProject();
+    const config = completeProjectConfig();
+    writeProjectConfig(config, directory, { editableSkills: true });
+    const graphBefore = readFileSync(join(directory, ".openthrottle/graphs/simple.json"), "utf8");
+    const lockBefore = readFileSync(join(directory, ".openthrottle/skills.lock.json"), "utf8");
+    const skillPath = join(directory, ".openthrottle/skills/implement-plan/SKILL.md");
+    writeFileSync(skillPath, `${readFileSync(skillPath, "utf8")}\nUser-owned edit.\n`);
+
+    expect(planEditableSkillsRefresh(config, directory)).toMatchObject({
+      writable: false,
+      entries: expect.arrayContaining([expect.objectContaining({
+        path: ".openthrottle/skills/implement-plan/SKILL.md",
+        status: "local-only",
+      })]),
+    });
+    expect(() => writeProjectConfig(config, directory, { editableSkills: true })).toThrow(/local-only/);
+    expect(readFileSync(join(directory, ".openthrottle/graphs/simple.json"), "utf8")).toBe(graphBefore);
+    expect(readFileSync(join(directory, ".openthrottle/skills.lock.json"), "utf8")).toBe(lockBefore);
+    expect(readFileSync(skillPath, "utf8")).toContain("User-owned edit");
+  });
+
+  it("refuses undeclared files in the repository package closure", () => {
+    const directory = temporaryProject();
+    const config = completeProjectConfig();
+    writeProjectConfig(config, directory, { editableSkills: true });
+    const extraPath = join(directory, ".openthrottle/skills/implement-plan/undeclared.md");
+    writeFileSync(extraPath, "not in the generated package closure\n");
+
+    expect(planEditableSkillsRefresh(config, directory)).toMatchObject({
+      writable: false,
+      entries: expect.arrayContaining([expect.objectContaining({
+        path: ".openthrottle/skills/implement-plan/undeclared.md",
+        status: "local-only",
+        upstream_digest: null,
+      })]),
+    });
+    expect(() => writeProjectConfig(config, directory, { editableSkills: true }))
+      .toThrow(/undeclared\.md \(local-only\)/);
+    expect(readFileSync(extraPath, "utf8")).toContain("not in the generated package closure");
+  });
+
+  it("fails closed when a scaffold path is a symlink", () => {
+    const directory = temporaryProject();
+    const outside = temporaryProject();
+    symlinkSync(outside, join(directory, ".openthrottle"));
+
+    expect(() => writeProjectConfig(completeProjectConfig(), directory, { editableSkills: true }))
+      .toThrow(/must not contain symlinks/);
+    expect(() => readFileSync(join(outside, "skills.lock.json"), "utf8")).toThrow();
+  });
+
+  it("recognizes a genuine old-to-new upstream graph and package as upstream-only", () => {
+    const directory = temporaryProject();
+    const config = completeProjectConfig();
+    const resources = mutableEditableResources();
+    const resourceOptions = {
+      graphPath: resources.graphPath,
+      skillDirectory: resources.skillDirectory,
+      release: "test-release",
+    };
+    writeProjectConfig(config, directory, { editableSkills: true, resources: resourceOptions });
+    const oldLock = JSON.parse(readFileSync(join(directory, ".openthrottle/skills.lock.json"), "utf8"));
+
+    const upstreamSkillPath = join(resources.skillDirectory, "SKILL.md");
+    writeFileSync(upstreamSkillPath, `${readFileSync(upstreamSkillPath, "utf8")}\nUpstream release improvement.\n`);
+    const upstreamGraph = JSON.parse(readFileSync(resources.graphPath, "utf8"));
+    upstreamGraph.loops.find((loop: { id: string }) => loop.id === "implementation-loop").max_rounds += 1;
+    writeFileSync(resources.graphPath, `${JSON.stringify(upstreamGraph, null, 2)}\n`);
+
+    const plan = planEditableSkillsRefresh(config, directory, { resources: resourceOptions });
+    expect(plan).toMatchObject({
+      writable: true,
+      entries: expect.arrayContaining([
+        expect.objectContaining({ path: ".openthrottle/graphs/simple.json", status: "upstream-only" }),
+        expect.objectContaining({
+          path: ".openthrottle/skills/implement-plan/SKILL.md",
+          status: "upstream-only",
+        }),
+        expect.objectContaining({ path: ".openthrottle/skills.lock.json", status: "upstream-only" }),
+      ]),
+    });
+
+    writeProjectConfig(config, directory, { editableSkills: true, resources: resourceOptions });
+    const newLock = JSON.parse(readFileSync(join(directory, ".openthrottle/skills.lock.json"), "utf8"));
+    expect(newLock.upstream_package_digest).not.toBe(oldLock.upstream_package_digest);
+    expect(newLock.scaffold_package_digest).not.toBe(oldLock.scaffold_package_digest);
+    expect(newLock.upstream_graph.digest).not.toBe(oldLock.upstream_graph.digest);
+    expect(newLock.upstream_graph.scaffold_digest).not.toBe(oldLock.upstream_graph.scaffold_digest);
+    expect(newLock.upstream_files.find((entry: { path: string }) => entry.path === "SKILL.md").digest)
+      .not.toBe(oldLock.upstream_files.find((entry: { path: string }) => entry.path === "SKILL.md").digest);
+    expect(newLock.files.find((entry: { path: string }) => entry.path.endsWith("/SKILL.md")).digest)
+      .not.toBe(oldLock.files.find((entry: { path: string }) => entry.path.endsWith("/SKILL.md")).digest);
+  });
+
+  it("removes an unchanged provenance-owned file when the upstream package removes it", () => {
+    const directory = temporaryProject();
+    const config = completeProjectConfig();
+    const resources = mutableEditableResources();
+    mkdirSync(join(resources.skillDirectory, "references"));
+    writeFileSync(join(resources.skillDirectory, "references/retired.md"), "retire me\n");
+    const resourceOptions = { ...resources, release: "removal-test" };
+    writeProjectConfig(config, directory, { editableSkills: true, resources: resourceOptions });
+    rmSync(join(resources.skillDirectory, "references/retired.md"));
+
+    expect(planEditableSkillsRefresh(config, directory, { resources: resourceOptions })).toMatchObject({
+      writable: true,
+      entries: expect.arrayContaining([expect.objectContaining({
+        path: ".openthrottle/skills/implement-plan/references/retired.md",
+        status: "upstream-only",
+        upstream_digest: null,
+      })]),
+    });
+    writeProjectConfig(config, directory, { editableSkills: true, resources: resourceOptions });
+    expect(() => readFileSync(
+      join(directory, ".openthrottle/skills/implement-plan/references/retired.md"),
+      "utf8"
+    )).toThrow();
+  });
+
+  it("refreshes release-only provenance when packaged assets are byte-identical", () => {
+    const directory = temporaryProject();
+    const config = completeProjectConfig();
+    const resources = mutableEditableResources();
+    const baseResources = {
+      graphPath: resources.graphPath,
+      skillDirectory: resources.skillDirectory,
+    };
+    writeProjectConfig(config, directory, {
+      editableSkills: true,
+      resources: { ...baseResources, release: "2.0.0-alpha.2" },
+    });
+
+    const plan = planEditableSkillsRefresh(config, directory, {
+      resources: { ...baseResources, release: "2.0.0-alpha.3" },
+    });
+    expect(plan).toMatchObject({
+      writable: true,
+      entries: expect.arrayContaining([
+        expect.objectContaining({ path: ".openthrottle/skills.lock.json", status: "upstream-only" }),
+      ]),
+    });
+    writeProjectConfig(config, directory, {
+      editableSkills: true,
+      resources: { ...baseResources, release: "2.0.0-alpha.3" },
+    });
+    expect(JSON.parse(readFileSync(join(directory, ".openthrottle/skills.lock.json"), "utf8")))
+      .toMatchObject({ openthrottle_release: "2.0.0-alpha.3" });
+  });
+
+  it("refreshes source-graph provenance when formatting leaves scaffold bytes unchanged", () => {
+    const directory = temporaryProject();
+    const config = completeProjectConfig();
+    const resources = mutableEditableResources();
+    const resourceOptions = { ...resources, release: "format-only-test" };
+    writeProjectConfig(config, directory, { editableSkills: true, resources: resourceOptions });
+    const lockPath = join(directory, ".openthrottle/skills.lock.json");
+    const oldLock = JSON.parse(readFileSync(lockPath, "utf8"));
+    writeFileSync(resources.graphPath, `${readFileSync(resources.graphPath, "utf8")}\n`);
+
+    expect(planEditableSkillsRefresh(config, directory, { resources: resourceOptions })).toMatchObject({
+      writable: true,
+      entries: expect.arrayContaining([
+        expect.objectContaining({ path: ".openthrottle/graphs/simple.json", status: "unchanged" }),
+        expect.objectContaining({ path: ".openthrottle/skills.lock.json", status: "upstream-only" }),
+      ]),
+    });
+    writeProjectConfig(config, directory, { editableSkills: true, resources: resourceOptions });
+    const newLock = JSON.parse(readFileSync(lockPath, "utf8"));
+    expect(newLock.upstream_graph.digest).not.toBe(oldLock.upstream_graph.digest);
+    expect(newLock.upstream_graph.scaffold_digest).toBe(oldLock.upstream_graph.scaffold_digest);
+  });
+
+  it("fails closed on stale lock digests and unbound local release edits", () => {
+    for (const mutate of [
+      (lock: Record<string, any>) => { lock.upstream_package_digest = "not-a-digest"; },
+      (lock: Record<string, any>) => { lock.files[0].digest = "0".repeat(64); },
+      (lock: Record<string, any>) => { lock.upstream_graph.scaffold_digest = "1".repeat(64); },
+      (lock: Record<string, any>) => { lock.openthrottle_release = "local-release-edit"; },
+    ]) {
+      const directory = temporaryProject();
+      const config = completeProjectConfig();
+      const resources = mutableEditableResources();
+      const resourceOptions = { ...resources, release: "integrity-test" };
+      writeProjectConfig(config, directory, { editableSkills: true, resources: resourceOptions });
+      const lockPath = join(directory, ".openthrottle/skills.lock.json");
+      const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+      mutate(lock);
+      writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+
+      expect(planEditableSkillsRefresh(config, directory, { resources: resourceOptions })).toMatchObject({
+        writable: false,
+        entries: expect.arrayContaining([
+          expect.objectContaining({ path: ".openthrottle/skills.lock.json", status: "local-only" }),
+        ]),
+      });
+    }
+  });
+
+  it("rejects semantic provenance edits even while an upstream package changes", () => {
+    const directory = temporaryProject();
+    const config = completeProjectConfig();
+    const resources = mutableEditableResources();
+    const resourceOptions = {
+      graphPath: resources.graphPath,
+      skillDirectory: resources.skillDirectory,
+      release: "test-release",
+    };
+    writeProjectConfig(config, directory, { editableSkills: true, resources: resourceOptions });
+    const lockPath = join(directory, ".openthrottle/skills.lock.json");
+    const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+    lock.upstream_graph.ref = "core/structured@2";
+    writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+    const upstreamSkillPath = join(resources.skillDirectory, "SKILL.md");
+    writeFileSync(upstreamSkillPath, `${readFileSync(upstreamSkillPath, "utf8")}\nNew upstream bytes.\n`);
+
+    expect(planEditableSkillsRefresh(config, directory, { resources: resourceOptions })).toMatchObject({
+      writable: false,
+      entries: expect.arrayContaining([
+        expect.objectContaining({ path: ".openthrottle/skills.lock.json", status: "conflict" }),
+      ]),
+    });
+    expect(() => writeProjectConfig(config, directory, {
+      editableSkills: true,
+      resources: resourceOptions,
+    })).toThrow(/skills\.lock\.json \(conflict\)/);
+  });
+
+  it("classifies simultaneous local and upstream package edits as a conflict", () => {
+    const directory = temporaryProject();
+    const config = completeProjectConfig();
+    const resources = mutableEditableResources();
+    const resourceOptions = {
+      graphPath: resources.graphPath,
+      skillDirectory: resources.skillDirectory,
+      release: "test-release",
+    };
+    writeProjectConfig(config, directory, { editableSkills: true, resources: resourceOptions });
+    const localSkillPath = join(directory, ".openthrottle/skills/implement-plan/SKILL.md");
+    writeFileSync(localSkillPath, `${readFileSync(localSkillPath, "utf8")}\nLocal edit.\n`);
+    const upstreamSkillPath = join(resources.skillDirectory, "SKILL.md");
+    writeFileSync(upstreamSkillPath, `${readFileSync(upstreamSkillPath, "utf8")}\nUpstream edit.\n`);
+
+    expect(planEditableSkillsRefresh(config, directory, { resources: resourceOptions })).toMatchObject({
+      writable: false,
+      entries: expect.arrayContaining([expect.objectContaining({
+        path: ".openthrottle/skills/implement-plan/SKILL.md",
+        status: "conflict",
+      })]),
+    });
+  });
+
+  it("requires every command executed by the editable simple graph", () => {
+    const directory = temporaryProject();
+    const config = completeProjectConfig();
+    config.commands = { test: "npm test", build: "npm run build" };
+    config.lint = "";
+    expect(() => writeProjectConfig(config, directory, { editableSkills: true }))
+      .toThrow(/requires a lint command/);
+    expect(() => readFileSync(join(directory, ".openthrottle.yml"), "utf8")).toThrow();
+  });
+
+  it("reads the supervisor timeout capability and formats a read-only refresh plan", async () => {
+    await expect(getSupervisorTaskTimeoutSeconds(async (path) => {
+      expect(path).toBe("/capabilities");
+      return Response.json({ limits: { taskTimeoutSeconds: 3600 } });
+    })).resolves.toBe(3600);
+    await expect(getSupervisorTaskTimeoutSeconds(async () => (
+      Response.json({ limits: { taskTimeoutSeconds: 100_000 } })
+    ))).resolves.toBe(100_000);
+    await expect(getSupervisorTaskTimeoutSeconds(async () => (
+      Response.json({ limits: { taskTimeoutSeconds: "3600" } })
+    ))).rejects.toThrow(/invalid task timeout capability/);
+
+    expect(editableSkillsRefreshSummary({
+      writable: false,
+      entries: [{
+        path: ".openthrottle/skills.lock.json",
+        status: "conflict",
+        provenance_digest: null,
+        local_digest: "a".repeat(64),
+        upstream_digest: "b".repeat(64),
+      }],
+    })).toEqual(["conflict      .openthrottle/skills.lock.json"]);
   });
 });

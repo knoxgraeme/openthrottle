@@ -99,13 +99,13 @@ function minimalGraph(overrides: {
 function repositorySkillPackage() {
   return {
     schema: "openthrottle.repository-skill-package/v1" as const,
-    reference: `repo://owner/repo@${"a".repeat(40)}#.agents/skills/implement-unit`,
+    reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/implement_unit`,
     invocation: "implement_unit",
-    directory: ".agents/skills/implement-unit",
+    directory: ".openthrottle/skills/implement_unit",
     commit: "a".repeat(40),
     packageDigest: "d".repeat(64),
     files: [{
-      path: ".agents/skills/implement-unit/SKILL.md",
+      path: ".openthrottle/skills/implement_unit/SKILL.md",
       blobSha: "b".repeat(40),
       digest: "c".repeat(64),
     }],

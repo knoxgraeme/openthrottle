@@ -290,7 +290,7 @@ describe("normalized stage artifacts", () => {
       result: "success",
       producer: {
         worker_id: "worker-1",
-        skill: "repo://acme/graphs@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#.agents/skills/implement-unit",
+        skill: "repo://acme/graphs@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#.openthrottle/skills/implement_unit",
         capability_digest: "e".repeat(64),
         skill_package_digest: "d".repeat(64),
       },

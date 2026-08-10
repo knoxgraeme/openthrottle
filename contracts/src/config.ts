@@ -131,12 +131,14 @@ function parseSource(value: unknown, path: string): ConfigGraphSource {
 
 function parseRepositorySkill(value: unknown, path: string): ConfigRepositorySkill {
   const input = objectAt(value, path, ["id", "path"]);
+  const id = stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER });
   const skillPath = stringAt(input.path, `${path}.path`, { max: 240, pattern: REPOSITORY_DIR });
-  if (skillPath.endsWith(".json") || skillPath.endsWith("/")) {
-    fail(`${path}.path`, "must be a repository skill directory");
+  const expectedPath = `.openthrottle/skills/${id}`;
+  if (skillPath !== expectedPath) {
+    fail(`${path}.path`, `must be exactly ${expectedPath}`);
   }
   return {
-    id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
+    id,
     path: skillPath,
   };
 }
