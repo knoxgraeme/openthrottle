@@ -1,15 +1,20 @@
 import Database from "better-sqlite3";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
 import type { PipelineUnitPhaseBinding } from "../../pipeline/manifest.js";
 import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
 import type { GateReceiptReason } from "../../pipeline/gates.js";
 import { openDb } from "../database.js";
+import { createPipelineStore } from "./create-store.js";
 import { createExecutionUnitStore, type ExecutionUnitStore } from "./unit-store.js";
 import { executionLedgerLines } from "../../pipeline/execution-publication.js";
 
 let db: Database.Database | undefined;
 let timestamp = "2026-07-29T00:00:00.000Z";
+const temporaryDirectories: string[] = [];
 
 function gateDecision(overrides: {
   gateKind: ExecutionGateDecision["gateKind"];
@@ -210,8 +215,8 @@ function completeUnitToTerminal(store: ExecutionUnitStore, subject: string, comm
   });
 }
 
-function setup(): ReturnType<typeof createExecutionUnitStore> {
-  db = openDb(":memory:");
+function setup(path = ":memory:"): ReturnType<typeof createExecutionUnitStore> {
+  db = openDb(path);
   db.exec(`
     INSERT INTO tickets (
       linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
@@ -266,6 +271,9 @@ function setup(): ReturnType<typeof createExecutionUnitStore> {
 afterEach(() => {
   db?.close();
   db = undefined;
+  for (const directory of temporaryDirectories.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
   timestamp = "2026-07-29T00:00:00.000Z";
 });
 
@@ -3127,6 +3135,58 @@ describe("execution unit store", () => {
     }));
   }
 
+  type ReplayPublicationEventRow = {
+    id: string;
+    sequence: number;
+    kind: string;
+    unit_id: string | null;
+    body: string;
+    linear_outbox_id: string;
+  };
+  type ReplayOutboxRow = {
+    id: string;
+    sequence: number;
+    kind: string;
+    payload_hash: string;
+    status: string;
+  };
+  type ReplayActionOrdinalRow = {
+    id: string;
+    attempt_ordinal: number;
+    action_kind: string;
+    status: string;
+  };
+
+  function replayProjectionSnapshot(store: ExecutionUnitStore, parentAttemptId: string): {
+    events: ReplayPublicationEventRow[];
+    outbox: ReplayOutboxRow[];
+    actionOrdinals: ReplayActionOrdinalRow[];
+    ledger: string[];
+  } {
+    const snapshot = store.getStructuredExecutionPublication(parentAttemptId);
+    expect(snapshot).toBeDefined();
+    return {
+      events: db!.prepare(`
+        SELECT id, sequence, kind, unit_id, body, linear_outbox_id
+        FROM execution_publication_events
+        WHERE parent_attempt_id = ?
+        ORDER BY sequence ASC
+      `).all(parentAttemptId) as ReplayPublicationEventRow[],
+      outbox: db!.prepare(`
+        SELECT id, sequence, kind, payload_hash, status
+        FROM linear_outbox
+        ORDER BY sequence ASC, id ASC
+      `).all() as ReplayOutboxRow[],
+      actionOrdinals: db!.prepare(`
+        SELECT id, attempt_ordinal, action_kind, status
+        FROM execution_work_attempts
+        WHERE parent_attempt_id = ?
+        ORDER BY attempt_ordinal ASC, id ASC
+      `).all(parentAttemptId) as ReplayActionOrdinalRow[],
+      ledger: executionLedgerLines(snapshot!),
+    };
+  }
+
   it("durably records ordered child-publication events across repair, settlement, final review, and aggregate", () => {
     const store = setup();
     const subject = "1".repeat(40);
@@ -3242,8 +3302,11 @@ describe("execution unit store", () => {
     ]);
   });
 
-  it("does not duplicate a child-publication event when an already-recorded gate decision replays", () => {
-    const store = setup();
+  it("does not duplicate a child-publication event when an already-recorded gate decision replays from persisted state", () => {
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-unit-replay-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "supervisor.db");
+    const store = setup(databasePath);
     const subject = "1".repeat(40);
     store.createGraph({
       pipelineInstanceId: "instance-1",
@@ -3263,13 +3326,32 @@ describe("execution unit store", () => {
     store.completeUnitAction({ actionId: candidate.id, resultHash: "rc", outputSubject: subject, receipt: receiptJson("candidate_evidence") });
     const lead = lease(store);
     const decision = gateDecision({ gateKind: "unit_acceptance", outcome: "semantic_repair_required", subject, reason: "command_exit_nonzero" });
-    store.completeGatedAction({ actionId: lead.id, resultHash: "rl", outputSubject: subject, decision });
-    // Replaying the identical gate decision on the already-completed action must
-    // short-circuit before routing/event-emission runs again (see the
-    // "already_recorded" guard in completeGatedAction).
-    store.completeGatedAction({ actionId: lead.id, resultHash: "rl", outputSubject: subject, decision });
+    const completion = { actionId: lead.id, resultHash: "rl", outputSubject: subject, decision };
+    store.completeGatedAction(completion);
 
+    const afterCommit = replayProjectionSnapshot(store, "attempt-parent");
+
+    expect(afterCommit.events.map((event) => event.sequence)).toEqual([1]);
+    expect(afterCommit.outbox.map((row) => row.sequence)).toEqual([1]);
     expect(publicationEvents("attempt-parent")).toHaveLength(1);
+
+    db!.close();
+    db = undefined;
+
+    db = openDb(databasePath);
+    const restartedStore = createPipelineStore(db);
+    // A crash-and-restart replay re-applies the same completed gate transition from
+    // a freshly opened SQLite connection through the production schema and
+    // composed pipeline-store paths. The real completion API must recognize the
+    // existing gate receipt and skip routing/event emission entirely.
+    restartedStore.completeGatedAction(completion);
+
+    const afterReplay = replayProjectionSnapshot(restartedStore, "attempt-parent");
+    expect(afterReplay).toEqual(afterCommit);
+    expect(afterReplay.events).toHaveLength(1);
+    expect(afterReplay.outbox).toHaveLength(1);
+    expect(afterReplay.actionOrdinals).toEqual(afterCommit.actionOrdinals);
+    expect(afterReplay.ledger).toEqual(afterCommit.ledger);
   });
 
   it("rejects a gate decision reason outside the closed vocabulary before any receipt or publication event is durably recorded, then succeeds on retry", () => {

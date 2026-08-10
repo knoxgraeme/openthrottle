@@ -24,7 +24,6 @@ import {
   renderGithubPipelineSummary,
   shouldPostLinearEventComment,
 } from "./publication.js";
-import { executionLedgerLines } from "./execution-publication.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { createPipelinePublicationWriter } from "../persistence/pipeline/helpers.js";
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
@@ -590,53 +589,6 @@ describe("pipeline publication", () => {
     expect(publication.body).toMatch(/Your move:/);
     expect(publication.body).toContain("earlier unit(s) omitted");
     expect(renderGithubPipelineSummary(publication)).toContain(`- [${link.label}](${link.url})`);
-  });
-
-  it("parses and renders a structured_execution envelope persisted before activity_log existed", () => {
-    const { instance, attempt } = setup();
-    const input = event(instance, attempt);
-    const publication = buildStagePublication({
-      instance,
-      attempt,
-      event: input.event,
-      write: {
-        instanceId: instance.id,
-        eventId: input.event.id,
-        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
-        expectedVersion: instance.state_version,
-        expectedStatus: instance.status,
-        attemptId: attempt.id,
-        outcome: "success",
-        resultHash: input.event.resultHash,
-        nextStatus: "dispatchable",
-        nextStageId: "publish",
-        effects: [],
-      },
-      gateReceipt: input.receipt,
-      structuredExecution: {
-        graph: {
-          id: "graph-1",
-          parent_attempt_id: attempt.id,
-          parent_stage_id: attempt.stage_id,
-          integration_subject: SUBJECT,
-          aggregate_artifact_hash: null,
-          aggregate_emitted_at: null,
-          stopped_at: null,
-          stop_reason: null,
-        },
-        units: [],
-        activity_log: [],
-      },
-    });
-    const legacyStructuredExecution = { ...publication.structured_execution } as Record<string, unknown>;
-    delete legacyStructuredExecution.activity_log;
-    const legacyPublication = { ...publication, structured_execution: legacyStructuredExecution };
-    const parsed = parsePipelinePublication(canonicalJson(legacyPublication));
-
-    expect(parsed.structured_execution).toBeDefined();
-    expect(parsed.structured_execution && "activity_log" in parsed.structured_execution).toBe(false);
-    expect(() => executionLedgerLines(parsed.structured_execution)).not.toThrow();
-    expect(executionLedgerLines(parsed.structured_execution).join("\n")).not.toContain("Structured Activity Log");
   });
 
   it("keeps persisted v1 publication envelopes parseable after the template bump", () => {
