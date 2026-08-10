@@ -823,8 +823,16 @@ skill package tunability is bound to the matching exact config entry, where an
 absent `tunable` value means `true`; a config lock cannot be overridden by a
 caller-authored package wrapper. Frontmatter, canonical contract fences, and
 whole command/tool-allowlist subsections are immutable, including annotated
-JSON fences and nested allowlist entries. Mutable reference files may change
-craft guidance but may not introduce new command, tool, MCP, or allowlist lines.
+JSON fences and nested allowlist entries. Agent policy files and all non-craft
+package files outside `references/` are byte-immutable. These sealed config,
+graph, policy, and allowlist fields are the capability-authority boundary;
+craft and reference prose is behavioral guidance and remains subject to the
+required human merge authority. Markdown executable surfaces in references
+(fenced or indented command blocks and inline code) are preserved exactly, and
+a conservative deterministic lint rejects obvious new command/tool invocation
+text. That lint is defense in depth, not a claim that arbitrary natural-language
+guidance can prove the absence of an invocation; only the sealed runtime
+capability boundary provides that guarantee.
 Human authority and tuner authority
 must have distinct actor identities. `human_authority.approval_digest` names a
 human authority/lock record, not the tuner proposal subject; OPE-115 binds that

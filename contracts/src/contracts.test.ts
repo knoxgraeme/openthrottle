@@ -652,6 +652,10 @@ describe("Stage C contract fixtures", () => {
       "Prefer focused edits with evidence."
     );
     proposedSkill.files[2]!.content = "Updated reference guidance.";
+    proposedSkill.files.push({
+      path: ".openthrottle/skills/implement_unit/references/observations.md",
+      content: "Additional reference guidance.",
+    });
 
     expect(decideDifferentialRatchet({
       ...parsed.value,
@@ -665,7 +669,11 @@ describe("Stage C contract fixtures", () => {
     });
   });
 
-  it("rejects new command or tool invocations in tunable reference files", () => {
+  it.each([
+    "```sh\ngit push origin main\n```\n",
+    "Launch shellcheck across the repository.\n",
+    "Issue `git push origin main`.\n",
+  ])("defense-in-depth rejects an obvious executable reference surface: %s", (guidance) => {
     const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
       source: "ratchet",
     });
@@ -681,8 +689,7 @@ describe("Stage C contract fixtures", () => {
       }],
     };
     const proposed = structuredClone(skill);
-    proposed.files[1]!.content =
-      "Run shellcheck across the repository, then invoke the shell directly.\n";
+    proposed.files[1]!.content = guidance;
 
     expect(decideDifferentialRatchet({
       ...parsed.value,
@@ -694,7 +701,7 @@ describe("Stage C contract fixtures", () => {
       reject_reasons: ["skill_immutable_changed"],
       differences: [{
         reason: "skill_immutable_changed",
-        path: "repository_skills.implement_unit.files..openthrottle/skills/implement_unit/references/method.md.command_or_tool_invocations",
+        path: "repository_skills.implement_unit.files..openthrottle/skills/implement_unit/references/method.md.executable_guidance_lint",
       }],
     });
   });

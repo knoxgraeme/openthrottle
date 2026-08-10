@@ -236,7 +236,13 @@ const SKILL_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$
 const FRONTMATTER_DELIMITER = "---";
 const CANONICAL_CONTRACT_SCHEMA = /"schema"\s*:\s*"openthrottle\.[^"]+"/;
 const COMMAND_OR_TOOL_ALLOWLIST = /\b(?:command|commands|tool|tools|mcp|allowlist|allowed_mcp_servers)\b/i;
-const COMMAND_OR_TOOL_INVOCATION = /(?:\b(?:run|execute|invoke|call)\s+(?:the\s+)?(?:`[^`]+`|[A-Za-z0-9_.:/-]+)|\buse\s+(?:the\s+)?(?:`[^`]+`|command|tool|shell|terminal|cli|mcp)\b|\b(?:npm|npx|pnpm|yarn|bun|node|deno|python|pytest|cargo|go|make|docker|flyctl|curl|wget)\s+[A-Za-z0-9]|\bmcp__[A-Za-z0-9_]+\b)/i;
+const GUIDANCE_INVOCATION_VERBS = new Set([
+  "call", "deploy", "execute", "install", "invoke", "issue", "launch", "publish", "run", "start", "use",
+]);
+const GUIDANCE_COMMAND_WORDS = new Set([
+  "bun", "cargo", "curl", "deno", "docker", "flyctl", "git", "go", "make", "node", "npm", "npx",
+  "pnpm", "python", "pytest", "shellcheck", "wget", "yarn",
+]);
 const CRAFT_SECTION = /^##\s+(?:craft|reference|references|heuristic|heuristics|method|methods)\b/i;
 const FORBIDDEN_SKILL_TOKENS = [
   /\bce-[a-z][a-z-]*[a-z]\b/,
@@ -295,17 +301,56 @@ function immutableSkillLines(raw: string): string[] {
       !currentCraftSection ||
       protectedSubsectionLevel !== null ||
       COMMAND_OR_TOOL_ALLOWLIST.test(line) ||
-      COMMAND_OR_TOOL_INVOCATION.test(line)
+      isObviousGuidanceInvocation(line) ||
+      /`[^`]+`/.test(line)
     ) immutable.push(line);
   }
   return immutable;
 }
 
-function commandOrToolInvocationLines(raw: string): string[] {
-  return raw
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .filter((line) => COMMAND_OR_TOOL_ALLOWLIST.test(line) || COMMAND_OR_TOOL_INVOCATION.test(line));
+function guidanceWords(line: string): string[] {
+  return line.toLowerCase().match(/[a-z][a-z0-9_-]*/g) ?? [];
+}
+
+function isObviousGuidanceInvocation(line: string): boolean {
+  const words = guidanceWords(line);
+  return words.some((word) => GUIDANCE_INVOCATION_VERBS.has(word)) ||
+    words.some((word) => GUIDANCE_COMMAND_WORDS.has(word));
+}
+
+function referenceGuidanceLintSurfaces(raw: string): string[] {
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  const surfaces: string[] = [];
+  let fenceMarker: string | null = null;
+  let fenced: string[] = [];
+  for (const line of lines) {
+    const fence = /^\s{0,3}(`{3,}|~{3,})/.exec(line);
+    if (fenceMarker !== null) {
+      fenced.push(line);
+      if (fence && fence[1]![0] === fenceMarker[0] && fence[1]!.length >= fenceMarker.length) {
+        surfaces.push(`fence:${fenced.join("\n")}`);
+        fenceMarker = null;
+        fenced = [];
+      }
+      continue;
+    }
+    if (fence) {
+      fenceMarker = fence[1]!;
+      fenced = [line];
+      continue;
+    }
+    if (/^(?:\t| {4})\S/.test(line) || /^\s{0,3}[$%]\s+\S/.test(line)) {
+      surfaces.push(`command-block:${line}`);
+    }
+    for (const inline of line.matchAll(/(`+)([^`\n]+)\1/g)) {
+      surfaces.push(`inline-code:${inline[0]}`);
+    }
+    if (COMMAND_OR_TOOL_ALLOWLIST.test(line) || isObviousGuidanceInvocation(line)) {
+      surfaces.push(`guidance-lint:${line}`);
+    }
+  }
+  if (fenceMarker !== null) surfaces.push(`fence:${fenced.join("\n")}`);
+  return surfaces;
 }
 
 function compareSkillMdImmutableContent(
@@ -410,12 +455,12 @@ function compareRepositorySkillPackages(
       }
       if (
         isReferenceFile(file.path) &&
-        !isSubset(
-          commandOrToolInvocationLines(file.content),
-          commandOrToolInvocationLines(pinnedFiles.get(file.path) ?? "")
+        !sameCanonical(
+          referenceGuidanceLintSurfaces(file.content),
+          referenceGuidanceLintSurfaces(pinnedFiles.get(file.path) ?? "")
         )
       ) {
-        uniqueDifference(differences, "skill_immutable_changed", `${path}.command_or_tool_invocations`);
+        uniqueDifference(differences, "skill_immutable_changed", `${path}.executable_guidance_lint`);
       }
       if (Buffer.byteLength(file.content, "utf8") > SKILL_FILE_MAX_BYTES) {
         pushDifference(differences, "skill_bounds_exceeded", path);
