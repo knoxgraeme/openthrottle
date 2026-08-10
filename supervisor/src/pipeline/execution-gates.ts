@@ -17,6 +17,7 @@ import {
   type GateReceiptReason,
   type GateResult,
 } from "./gates.js";
+import type { ReviewFanoutSynthesis } from "./review-fanout.js";
 
 const SEMANTIC_REVIEW_SKILL = /(?:^|\/)ce-code-review(?:@|$)/;
 
@@ -160,6 +161,7 @@ function seal(kind: ExecutionGateDecision["gateKind"], input: {
   result: GateResult;
   reason: GateReceiptReason;
   artifactHashes: string[];
+  reviewFanout?: ReviewFanoutSynthesis;
 }): ExecutionGateDecision {
   const artifactHashes = [...input.artifactHashes].sort();
   const payload = canonicalJson({
@@ -179,6 +181,7 @@ function seal(kind: ExecutionGateDecision["gateKind"], input: {
     result: input.result,
     reason: input.reason,
     artifact_hashes: artifactHashes,
+    ...(input.reviewFanout ? { review_fanout_synthesis: input.reviewFanout } : {}),
   });
   return {
     gateKind: kind,
@@ -210,6 +213,7 @@ export function evaluateUnitAcceptanceGate(input: {
   commands: readonly CommandResultReceipt[];
   expectedCommandNames: readonly string[];
   lead: UnitDecisionReceipt;
+  reviewFanout?: ReviewFanoutSynthesis;
 }): ExecutionGateDecision {
   if (SEMANTIC_REVIEW_SKILL.test(input.lead.producer.skill)) {
     throw new Error("unit acceptance must not be produced by ce-code-review");
@@ -241,6 +245,7 @@ export function evaluateUnitAcceptanceGate(input: {
       result: "failed",
       reason: "candidate_evidence_failed",
       artifactHashes,
+      reviewFanout: input.reviewFanout,
     });
   }
   if (input.completion.result !== "success") {
@@ -250,11 +255,12 @@ export function evaluateUnitAcceptanceGate(input: {
       result: input.completion.result === "needs_human" ? "indeterminate" : "failed",
       reason: "worker_completion_not_success",
       artifactHashes,
+      reviewFanout: input.reviewFanout,
     });
   }
   const commands = commandOutcome(input.commands, input.expectedCommandNames);
   if (commands.outcome !== "success" && commands.outcome !== "no_change") {
-    return seal("unit_acceptance", { expected: input.expected, ...commands, artifactHashes });
+    return seal("unit_acceptance", { expected: input.expected, ...commands, artifactHashes, reviewFanout: input.reviewFanout });
   }
   if (input.lead.result === "accept") {
     if (input.lead.payload.accepted_subject !== input.expected.subject) {
@@ -266,6 +272,7 @@ export function evaluateUnitAcceptanceGate(input: {
       result: "passed",
       reason: "lead_scope_match_accept",
       artifactHashes,
+      reviewFanout: input.reviewFanout,
     });
   }
   if (input.lead.result === "revise") {
@@ -275,6 +282,7 @@ export function evaluateUnitAcceptanceGate(input: {
       result: "failed",
       reason: "lead_requested_revision",
       artifactHashes,
+      reviewFanout: input.reviewFanout,
     });
   }
   return seal("unit_acceptance", {
@@ -283,6 +291,7 @@ export function evaluateUnitAcceptanceGate(input: {
     result: input.lead.result === "needs_human" ? "indeterminate" : "passed",
     reason: input.lead.result === "needs_human" ? "lead_needs_human" : "lead_context_update",
     artifactHashes,
+    reviewFanout: input.reviewFanout,
   });
 }
 
@@ -313,6 +322,7 @@ export function evaluateFinalReviewGate(input: {
   commands: readonly CommandResultReceipt[];
   expectedCommandNames: readonly string[];
   review: SemanticReviewReceipt;
+  reviewFanout?: ReviewFanoutSynthesis;
 }): ExecutionGateDecision {
   const fences = input.expectedReceipts ?? {
     commands: input.commands.map(() => input.expected),
@@ -331,7 +341,7 @@ export function evaluateFinalReviewGate(input: {
   const commands = commandOutcome(input.commands, input.expectedCommandNames);
   const artifactHashes = [...input.commands, input.review].map(receiptHash);
   if (commands.outcome !== "success" && commands.outcome !== "no_change") {
-    return seal("final_review", { expected: input.expected, ...commands, artifactHashes });
+    return seal("final_review", { expected: input.expected, ...commands, artifactHashes, reviewFanout: input.reviewFanout });
   }
   const review = semanticDecisionForEvidence({
     result: input.review.result,
@@ -341,5 +351,5 @@ export function evaluateFinalReviewGate(input: {
       post_subject: input.review.subject.post,
     },
   });
-  return seal("final_review", { expected: input.expected, ...review, artifactHashes });
+  return seal("final_review", { expected: input.expected, ...review, artifactHashes, reviewFanout: input.reviewFanout });
 }

@@ -40,6 +40,13 @@ import {
   MAX_PRIOR_EVIDENCE_RECEIPTS,
 } from "../pipeline/structured-loop-limits.js";
 import {
+  buildReviewFanoutPlan,
+  synthesizeReviewFanout,
+  validateReviewFanoutRepair,
+  type ReviewFanoutPlan,
+  type ReviewFanoutSynthesis,
+} from "../pipeline/review-fanout.js";
+import {
   assertStandardReceiptFence,
   assertCandidateEvidenceFence,
   evaluateFinalReviewGate,
@@ -295,6 +302,10 @@ function buildLoopActionRequest(
   };
 }
 
+function fanoutActionId(action: ExecutionWorkAttempt, personaId: string): string {
+  return `${action.id}:review:${personaId}`;
+}
+
 function buildChildExecutorActionRequest(
   request: Omit<ChildExecutorActionRequest, "requestHash" | "idempotencyKey">
 ): ChildExecutorActionRequest {
@@ -388,6 +399,7 @@ function compareAttemptOrder(left: ExecutionWorkAttempt, right: ExecutionWorkAtt
 }
 
 function parentTaskContextFor(store: PipelineStore, parentAttemptId: string): string {
+  if (typeof (store as { getAttempt?: unknown }).getAttempt !== "function") return "";
   const attempt = store.getAttempt(parentAttemptId);
   if (!attempt?.request_payload) return "";
   const payload = JSON.parse(attempt.request_payload) as { taskContext?: unknown };
@@ -570,6 +582,360 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     if (role === "command") return builtinProducer("command_result", instance.capability_digest);
     if (role === "integration") return builtinProducer("integration_evidence", instance.capability_digest);
     return agentProducerFor(instance, action, role);
+  };
+
+  const reviewFanoutPlanForAction = (
+    action: ExecutionWorkAttempt,
+    plan: ExecutionPlanContract | null,
+    subject: string
+  ): ReviewFanoutPlan | undefined => {
+    if (!plan || (action.action_kind !== "lead" && action.action_kind !== "final_review")) return undefined;
+    const unit = action.unit_id
+      ? plan.units.find((unit) => unit.id === action.unit_id)
+      : undefined;
+    const commandNames = action.unit_id
+      ? plan.commands
+        .filter((command) => command.unit === undefined || command.unit === action.unit_id)
+        .map((command) => command.name)
+      : plan.commands.map((command) => command.name);
+    return buildReviewFanoutPlan({
+      subject,
+      unit,
+      instructions: plan.instructions,
+      acceptance: plan.acceptance,
+      commandNames,
+    });
+  };
+
+  const fanoutProducerFor = (
+    instance: PipelineInstance,
+    personaId: string
+  ): ExpectedReceiptProducer => ({
+    workerId: personaId,
+    skill: `builtin://${personaId}@1`,
+    capabilityDigest: instance.capability_digest,
+    skillPackageDigest: null,
+    assurance: "semantic_attested",
+  });
+
+  const buildReviewFanoutRequests = (input: {
+    instance: PipelineInstance;
+    action: ExecutionWorkAttempt;
+    plan: ExecutionPlanContract;
+    fanout: ReviewFanoutPlan;
+    inputSubject: string;
+    baseSubject: string;
+    agent: LoopActionRequest["agent"];
+    model?: string;
+    timeoutMs: number;
+  }): LoopActionRequest[] =>
+    input.fanout.personas.map((persona) => buildLoopActionRequest({
+      protocol: "loop-action@2",
+      actionId: fanoutActionId(input.action, persona.id),
+      attemptId: input.action.parent_attempt_id,
+      graphId: input.action.execution_graph_id,
+      pipelineInstanceId: input.instance.id,
+      graphDigest: input.instance.manifest_digest,
+      parentRunId: input.action.parent_run_id,
+      unitId: input.action.unit_id,
+      generation: input.instance.generation,
+      role: "reviewer",
+      loop: "review",
+      agent: input.agent,
+      ...(input.model === undefined ? {} : { model: input.model }),
+      skill: persona.id,
+      worktree: null,
+      baseSubject: input.baseSubject,
+      inputSubject: input.inputSubject,
+      nativeSessionId: null,
+      contextPolicy: "fresh",
+      timeoutMs: input.timeoutMs,
+      transitionContext: loopActionTransitionContext({
+        actionPayload: canonicalJson({
+          parent_attempt_id: input.action.parent_attempt_id,
+          parent_run_id: input.action.parent_run_id,
+          unit_id: input.action.unit_id,
+          action_kind: input.action.action_kind,
+          cycle: input.action.cycle,
+          review_persona_id: persona.id,
+        }),
+        planContext: {
+          schema: "openthrottle.loop-action-plan-context/v1",
+          action_kind: input.action.action_kind,
+          graph_id: input.plan.graph_id,
+          plan_id: input.plan.plan_id,
+          unit: input.action.unit_id ? input.plan.units.find((unit) => unit.id === input.action.unit_id) ?? null : null,
+          review_fanout: input.fanout,
+          review_persona: persona,
+        },
+        actionKind: input.action.action_kind,
+        unitId: input.action.unit_id,
+      }),
+      allowedMcpServers: [],
+      credentialScopes: ["model.invoke", "repo.read"],
+      receiptSchema: RECEIPT_SCHEMA,
+      expectedProducerSkill: `builtin://${persona.id}@1`,
+      expectedProducer: fanoutProducerFor(input.instance, persona.id),
+    }));
+
+  const persistedLoopRequestOptions = (
+    action: ExecutionWorkAttempt,
+    fallbackAgent: LoopActionRequest["agent"]
+  ): Pick<LoopActionRequest, "agent" | "timeoutMs"> => {
+    const request = action.request_payload
+      ? JSON.parse(action.request_payload) as LoopActionRequest
+      : undefined;
+    return {
+      agent: request?.agent ?? fallbackAgent,
+      timeoutMs: request?.timeoutMs ?? deps.taskTimeoutSeconds * 1_000,
+    };
+  };
+
+  const fanoutFenceFor = (input: {
+    instance: PipelineInstance;
+    action: ExecutionWorkAttempt;
+    request: LoopActionRequest;
+    personaId: string;
+    subject: string;
+    baseSubject: string;
+  }): StandardReceiptFence => ({
+    pipelineInstanceId: input.instance.id,
+    graphDigest: input.instance.manifest_digest,
+    unitId: input.action.unit_id ?? "__final__",
+    attemptId: input.action.parent_attempt_id,
+    parentRunId: input.action.parent_run_id,
+    actionAttemptId: input.request.actionId,
+    generation: input.instance.generation,
+    nativeSessionId: null,
+    requestHash: input.request.requestHash,
+    baseSubject: input.baseSubject,
+    preSubject: input.subject,
+    subject: input.subject,
+    producers: {
+      ...expectedProducersFor(input.instance, input.action),
+      review: fanoutProducerFor(input.instance, input.personaId),
+    },
+  });
+
+  const collectReviewFanout = async (input: {
+    resource: RuntimeResource;
+    instance: PipelineInstance;
+    action: ExecutionWorkAttempt;
+    plan: ReviewFanoutPlan;
+    requests: readonly LoopActionRequest[];
+    baseSubject: string;
+  }): Promise<{
+    synthesis: ReviewFanoutSynthesis;
+    receipts: SemanticReviewReceipt[];
+  } | {
+    pending: true;
+  } | {
+    terminal: true;
+    resultHash: string;
+    outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
+    lastError: string;
+  }> => {
+    const receipts: SemanticReviewReceipt[] = [];
+    for (const request of input.requests) {
+      const result = await deps.runtime.collectLoopActionResult(input.resource, {
+        attemptId: request.attemptId,
+        actionId: request.actionId,
+        requestHash: request.requestHash,
+      });
+      if (!result) return { pending: true };
+      if (result.outcome !== "success") {
+        return {
+          terminal: true,
+          resultHash: digestCanonicalJson(result),
+          outcome: result.outcome === "retryable_infrastructure_failure"
+            ? "retryable_infrastructure_failure"
+            : result.outcome === "needs_human"
+              ? "needs_human"
+              : "failure",
+          lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
+        };
+      }
+      let receipt: StandardReceipt;
+      try {
+        receipt = parseStandardReceipt(result.receipt, { source: `review_fanout.${request.actionId}.receipt` }).value;
+      } catch {
+        return {
+          terminal: true,
+          resultHash: digestCanonicalJson(result),
+          outcome: "failure",
+          lastError: `review fanout action ${request.actionId} returned malformed success receipt`,
+        };
+      }
+      if (receipt.type !== "semantic_review") {
+        return {
+          terminal: true,
+          resultHash: digestCanonicalJson(result),
+          outcome: "failure",
+          lastError: `review fanout action ${request.actionId} returned ${receipt.type}, expected semantic_review`,
+        };
+      }
+      const personaId = receipt.producer.worker_id;
+      try {
+        assertStandardReceiptFence({
+          expected: fanoutFenceFor({
+            instance: input.instance,
+            action: input.action,
+            request,
+            personaId,
+            subject: input.plan.subject,
+            baseSubject: input.baseSubject,
+          }),
+          receipt,
+          role: "review",
+        });
+      } catch (error) {
+        return {
+          terminal: true,
+          resultHash: digestCanonicalJson(result),
+          outcome: "failure",
+          lastError: `review fanout action ${request.actionId} returned invalid receipt: ${
+            sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
+          }`,
+        };
+      }
+      receipts.push(receipt as SemanticReviewReceipt);
+    }
+    try {
+      return { synthesis: synthesizeReviewFanout({ plan: input.plan, receipts }), receipts };
+    } catch (error) {
+      return {
+        terminal: true,
+        resultHash: digestCanonicalJson({ plan: input.plan, receipts }),
+        outcome: "failure",
+        lastError: `review fanout synthesis failed: ${
+          sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
+        }`,
+      };
+    }
+  };
+
+  const previousReviewFanoutSynthesis = (
+    action: ExecutionWorkAttempt
+  ): ReviewFanoutSynthesis | undefined => {
+    const previousCycle = action.cycle - 1;
+    if (previousCycle < 1) return undefined;
+    const gateKind = action.action_kind === "lead" ? "unit_acceptance" : "final_review";
+    const gates = deps.store.listGateReceipts(action.parent_attempt_id)
+      .filter((gate) =>
+        gate.gate_kind === gateKind &&
+        gate.unit_id === action.unit_id &&
+        gate.execution_work_attempt_id !== action.id)
+      .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.id.localeCompare(left.id));
+    for (const gate of gates) {
+      try {
+        const payload = JSON.parse(gate.payload) as { review_fanout_synthesis?: ReviewFanoutSynthesis };
+        if (payload.review_fanout_synthesis) return payload.review_fanout_synthesis;
+      } catch {
+        continue;
+      }
+    }
+    return undefined;
+  };
+
+  const synthesizeLeadReceipt = (input: {
+    expected: StandardReceiptFence;
+    synthesis: ReviewFanoutSynthesis;
+    evidenceHashes: readonly string[];
+    issuedAt: string;
+  }): UnitDecisionReceipt => {
+    const producer = input.expected.producers.lead;
+    const revision = input.synthesis.findings
+      .map((finding) => `${finding.severity}: ${finding.path ? `${finding.path}: ` : ""}${finding.message}`)
+      .join("\n");
+    const result = input.synthesis.outcome === "needs_human" || input.synthesis.outcome === "failure"
+      ? "needs_human"
+      : input.synthesis.outcome === "success"
+        ? "accept"
+        : "revise";
+    return {
+      schema: RECEIPT_SCHEMA,
+      type: "unit_decision",
+      assurance: producer.assurance,
+      result,
+      producer: {
+        worker_id: producer.workerId,
+        skill: producer.skill,
+        capability_digest: producer.capabilityDigest,
+        skill_package_digest: producer.skillPackageDigest,
+      },
+      subject: {
+        base: input.expected.baseSubject,
+        pre: input.expected.preSubject,
+        post: input.expected.subject,
+      },
+      fence: {
+        pipeline_instance_id: input.expected.pipelineInstanceId,
+        graph_digest: input.expected.graphDigest,
+        unit_id: input.expected.unitId,
+        attempt_id: input.expected.attemptId,
+        parent_run_id: input.expected.parentRunId,
+        action_attempt_id: input.expected.actionAttemptId,
+        generation: input.expected.generation,
+        native_session_id: input.expected.nativeSessionId,
+        request_hash: input.expected.requestHash,
+      },
+      evidence: [...input.evidenceHashes, ...input.synthesis.receipt_hashes, digestCanonicalJson(input.synthesis)],
+      payload: {
+        rationale: input.synthesis.summary,
+        ...(result === "accept" ? { accepted_subject: input.expected.subject } : {}),
+        ...(result === "revise" ? { revision_request: revision || input.synthesis.summary } : {}),
+        context_updates: [],
+      },
+      issued_at: input.issuedAt,
+    };
+  };
+
+  const synthesizeFinalReviewReceipt = (input: {
+    expected: StandardReceiptFence;
+    synthesis: ReviewFanoutSynthesis;
+    commandHashes: readonly string[];
+    issuedAt: string;
+  }): SemanticReviewReceipt => {
+    const producer = input.expected.producers.review;
+    const result = input.synthesis.outcome === "needs_human" || input.synthesis.outcome === "failure"
+      ? input.synthesis.outcome
+      : input.synthesis.outcome === "success"
+        ? "success"
+        : "semantic_repair_required";
+    return {
+      schema: RECEIPT_SCHEMA,
+      type: "semantic_review",
+      assurance: producer.assurance,
+      result,
+      producer: {
+        worker_id: producer.workerId,
+        skill: producer.skill,
+        capability_digest: producer.capabilityDigest,
+        skill_package_digest: producer.skillPackageDigest,
+      },
+      subject: {
+        base: input.expected.baseSubject,
+        pre: input.expected.preSubject,
+        post: input.expected.subject,
+      },
+      fence: {
+        pipeline_instance_id: input.expected.pipelineInstanceId,
+        graph_digest: input.expected.graphDigest,
+        unit_id: input.expected.unitId,
+        attempt_id: input.expected.attemptId,
+        parent_run_id: input.expected.parentRunId,
+        action_attempt_id: input.expected.actionAttemptId,
+        generation: input.expected.generation,
+        native_session_id: input.expected.nativeSessionId,
+        request_hash: input.expected.requestHash,
+      },
+      evidence: [...input.commandHashes, ...input.synthesis.receipt_hashes, digestCanonicalJson(input.synthesis)],
+      payload: {
+        summary: input.synthesis.summary,
+        findings: input.synthesis.findings,
+      },
+      issued_at: input.issuedAt,
+    };
   };
 
   const standardFenceFor = (
@@ -959,6 +1325,32 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         });
         deps.store.markActionWorktreeReady?.(action.id);
       }
+      if (action.action_kind === "lead" || action.action_kind === "final_review") {
+        const parentTaskContext = parentTaskContextFor(deps.store, action.parent_attempt_id);
+        const executionPlan = parentTaskContext
+          ? extractExecutionPlan(parentTaskContext)
+          : null;
+        const subject = action.action_kind === "lead"
+          ? replayRequest.candidateSubject
+          : replayRequest.inputSubject;
+        if (executionPlan && subject && replayRequest.baseSubject && replayRequest.inputSubject) {
+          const fanout = reviewFanoutPlanForAction(action, executionPlan, subject);
+          if (fanout) {
+            const fanoutRequests = buildReviewFanoutRequests({
+              instance,
+              action,
+              plan: executionPlan,
+              fanout,
+              inputSubject: subject,
+              baseSubject: replayRequest.baseSubject,
+              agent: replayRequest.agent,
+              ...(replayRequest.model === undefined ? {} : { model: replayRequest.model }),
+              timeoutMs: replayRequest.timeoutMs,
+            });
+            for (const request of fanoutRequests) await deps.runtime.dispatchLoopAction(resource, request);
+          }
+        }
+      }
       await deps.runtime.dispatchLoopAction(resource, replayRequest);
       return { requestHash: replayRequest.requestHash, nativeSessionId: replayRequest.nativeSessionId ?? null };
     }
@@ -1015,6 +1407,9 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       : workerBinding.context === "resume_required" && !action.native_session_id
         ? "prefer_resume"
         : workerBinding.context;
+    const reviewSubject = action.action_kind === "lead" ? leadCandidateSubject
+      : action.action_kind === "final_review" ? inputSubject
+        : undefined;
     const loopRequest = buildLoopActionRequest({
       protocol: "loop-action@2",
       actionId: action.id,
@@ -1044,6 +1439,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           plan: executionPlan,
           actionKind: action.action_kind,
           unitId: action.unit_id,
+          reviewSubject,
         }),
         actionKind: action.action_kind,
         unitId: action.unit_id,
@@ -1076,6 +1472,26 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         baseCommit,
       });
       deps.store.markActionWorktreeReady?.(action.id);
+    }
+    if (executionPlan && reviewSubject && (action.action_kind === "lead" || action.action_kind === "final_review")) {
+      const fanout = reviewFanoutPlanForAction(action, executionPlan, reviewSubject);
+      if (fanout) {
+        const fanoutRequests = buildReviewFanoutRequests({
+          instance,
+          action,
+          plan: executionPlan,
+          fanout,
+          inputSubject: reviewSubject,
+          baseSubject: loopRequest.baseSubject ?? worktreeBaseFor(instance, action),
+          agent: loopRequest.agent,
+          ...(loopRequest.model === undefined ? {} : { model: loopRequest.model }),
+          timeoutMs: loopRequest.timeoutMs,
+        });
+        for (const request of fanoutRequests) {
+          assertLoopRequestEnvelopeBound(request);
+          await deps.runtime.dispatchLoopAction(resource, request);
+        }
+      }
     }
     await deps.runtime.dispatchLoopAction(resource, loopRequest);
     return { requestHash: loopRequest.requestHash, nativeSessionId: action.native_session_id ?? null };
@@ -1218,6 +1634,49 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         );
         const commands = commandAttemptReceipts(receiptEntries, action.unit_id, action.cycle);
         const acceptedSubject = candidate.receipt.subject.post;
+        let reviewFanout: ReviewFanoutSynthesis | undefined;
+        const parentTaskContext = parentTaskContextFor(deps.store, action.parent_attempt_id);
+        const executionPlan = parentTaskContext ? extractExecutionPlan(parentTaskContext) : null;
+        const fanoutPlan = reviewFanoutPlanForAction(action, executionPlan, acceptedSubject);
+        if (executionPlan && fanoutPlan) {
+          const expected = standardFenceFor(instance, action, acceptedSubject);
+          const fanoutOptions = persistedLoopRequestOptions(action, instance.agent);
+          const fanoutRequests = buildReviewFanoutRequests({
+            instance,
+            action,
+            plan: executionPlan,
+            fanout: fanoutPlan,
+            inputSubject: acceptedSubject,
+            baseSubject: expected.baseSubject,
+            ...fanoutOptions,
+          });
+          const fanout = await collectReviewFanout({
+            resource,
+            instance,
+            action,
+            plan: fanoutPlan,
+            requests: fanoutRequests,
+            baseSubject: expected.baseSubject,
+          });
+          if ("pending" in fanout) return null;
+          if ("terminal" in fanout) return fanout;
+          reviewFanout = fanout.synthesis;
+          const previousFanout = previousReviewFanoutSynthesis(action);
+          if (previousFanout) validateReviewFanoutRepair({ previous: previousFanout, nextPlan: fanoutPlan });
+          if (reviewFanout.outcome !== "success") {
+            const evidenceHashes = [
+              digestNormalized(canonicalJson(completion.receipt)),
+              digestNormalized(canonicalJson(candidate.receipt)),
+              ...commands.map((command) => digestNormalized(canonicalJson(command.receipt))),
+            ];
+            receipt = synthesizeLeadReceipt({
+              expected,
+              synthesis: reviewFanout,
+              evidenceHashes,
+              issuedAt: result.completedAt,
+            });
+          }
+        }
         const decision = evaluateUnitAcceptanceGate({
           expected: standardFenceFor(instance, action, acceptedSubject),
           expectedReceipts: {
@@ -1236,8 +1695,15 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
             return unit?.commandNames ? [...unit.commandNames] : graph ? JSON.parse(graph.command_names) as string[] : [];
           })(),
           lead: receipt as UnitDecisionReceipt,
+          reviewFanout,
         });
-        return collected(acceptedSubject, receipt, decision);
+        return {
+          resultHash: digestCanonicalJson({ result, review_fanout_synthesis: reviewFanout ?? null }),
+          outputSubject: acceptedSubject,
+          receipt: canonicalJson(receipt),
+          nativeSessionId,
+          decision,
+        };
       }
       if (action.action_kind === "integrate") {
         if (receipt.type !== "integration_evidence") {
@@ -1258,6 +1724,45 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
         const commands = commandAttemptReceipts(receipts, null, action.cycle);
         const reviewSubject = actionInputSubjectFor(instance, action);
+        let reviewFanout: ReviewFanoutSynthesis | undefined;
+        const parentTaskContext = parentTaskContextFor(deps.store, action.parent_attempt_id);
+        const executionPlan = parentTaskContext ? extractExecutionPlan(parentTaskContext) : null;
+        const fanoutPlan = reviewFanoutPlanForAction(action, executionPlan, reviewSubject);
+        if (executionPlan && fanoutPlan) {
+          const expected = standardFenceFor(instance, action, reviewSubject);
+          const fanoutOptions = persistedLoopRequestOptions(action, instance.agent);
+          const fanoutRequests = buildReviewFanoutRequests({
+            instance,
+            action,
+            plan: executionPlan,
+            fanout: fanoutPlan,
+            inputSubject: reviewSubject,
+            baseSubject: expected.baseSubject,
+            ...fanoutOptions,
+          });
+          const fanout = await collectReviewFanout({
+            resource,
+            instance,
+            action,
+            plan: fanoutPlan,
+            requests: fanoutRequests,
+            baseSubject: expected.baseSubject,
+          });
+          if ("pending" in fanout) return null;
+          if ("terminal" in fanout) return fanout;
+          reviewFanout = fanout.synthesis;
+          const previousFanout = previousReviewFanoutSynthesis(action);
+          if (previousFanout) validateReviewFanoutRepair({ previous: previousFanout, nextPlan: fanoutPlan });
+          if (reviewFanout.outcome !== "success") {
+            const commandHashes = commands.map((command) => digestNormalized(canonicalJson(command.receipt)));
+            receipt = synthesizeFinalReviewReceipt({
+              expected,
+              synthesis: reviewFanout,
+              commandHashes,
+              issuedAt: result.completedAt,
+            });
+          }
+        }
         const decision = evaluateFinalReviewGate({
           expected: standardFenceFor(instance, action, reviewSubject),
           expectedReceipts: {
@@ -1267,8 +1772,15 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           commands: commands.map((command) => command.receipt),
           expectedCommandNames: graph ? JSON.parse(graph.command_names) as string[] : [],
           review: receipt as SemanticReviewReceipt,
+          reviewFanout,
         });
-        return collected(reviewSubject, receipt, decision);
+        return {
+          resultHash: digestCanonicalJson({ result, review_fanout_synthesis: reviewFanout ?? null }),
+          outputSubject: reviewSubject,
+          receipt: canonicalJson(receipt),
+          nativeSessionId,
+          decision,
+        };
       }
       // The triggering final-review receipt is bound deterministically via the
       // completion receipt's request_hash fence (asserted below), which was
