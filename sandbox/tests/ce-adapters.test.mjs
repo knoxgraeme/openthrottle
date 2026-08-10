@@ -22,7 +22,14 @@ const loopTasks = [
   "final-review",
   "final-repair",
 ];
-const optionalReviewPersonaTasks = ["reliability-adversarial", "agent-native-contracts"];
+const optionalReviewPersonaTasks = [
+  "reliability-adversarial",
+  "agent-native-contracts",
+  "security",
+  "data-migration",
+  "performance",
+  "project-standards",
+];
 const reviewPersonaTasks = [
   "select-review-personas",
   "correctness-dataflow",
@@ -159,6 +166,18 @@ describe("OpenThrottle canonical task skills", () => {
     expect(skillBody("agent-native-contracts")).toContain("Native session identifiers");
     expect(skillBody("agent-native-contracts")).toContain("Receipt validation preserves");
     expect(skillBody("agent-native-contracts")).toContain("Bounded Depth");
+    expect(skillBody("security")).toContain("untrusted-input execution");
+    expect(skillBody("security")).toContain("quoted code or contract text");
+    expect(skillBody("security")).toContain("Bounded Depth");
+    expect(skillBody("data-migration")).toContain("Backfills handle missing");
+    expect(skillBody("data-migration")).toContain("old persisted shape");
+    expect(skillBody("data-migration")).toContain("Bounded Depth");
+    expect(skillBody("performance")).toContain("bounded work");
+    expect(skillBody("performance")).toContain("quotes the exact loop");
+    expect(skillBody("performance")).toContain("Bounded Depth");
+    expect(skillBody("project-standards")).toContain("Task skills remain self-contained");
+    expect(skillBody("project-standards")).toContain("quoted standard text");
+    expect(skillBody("project-standards")).toContain("Bounded Depth");
   });
 
   it("ships non-CE fixture skills for the same standard receipt contracts", () => {
@@ -390,6 +409,10 @@ describe("OpenThrottle canonical task skills", () => {
       "tests-contracts": ["semantic_review", "success"],
       "reliability-adversarial": ["semantic_review", "semantic_repair_required"],
       "agent-native-contracts": ["semantic_review", "success"],
+      "security": ["semantic_review", "semantic_repair_required"],
+      "data-migration": ["semantic_review", "semantic_repair_required"],
+      "performance": ["semantic_review", "semantic_repair_required"],
+      "project-standards": ["semantic_review", "semantic_repair_required"],
     };
     for (const task of [...loopTasks, ...reviewPersonaTasks]) {
       const raw = exampleFor(task).replace(/^```json\n/, "").replace(/\n```$/, "");

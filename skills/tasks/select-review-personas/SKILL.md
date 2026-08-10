@@ -29,9 +29,10 @@ personas must run and why.
    named there; never invent a persona or modify its invariants.
 2. Include the mandatory baseline personas when present:
    `correctness-dataflow` and `tests-contracts`.
-3. Optional personas are allowlisted to `reliability-adversarial` and
-   `agent-native-contracts`. Add one only when it appears in the sealed roster
-   and a mechanical trigger below matches the changed subject.
+3. Optional personas are allowlisted to `reliability-adversarial`,
+   `agent-native-contracts`, `security`, `data-migration`, `performance`, and
+   `project-standards`. Add one only when it appears in the sealed roster and a
+   mechanical trigger below matches the changed subject.
 4. Select `reliability-adversarial` when changed paths or contracts include
    retry loops, durable queues, effect draining, webhook delivery, lease
    renewal, run liveness, ordering-sensitive reducers, idempotency keys, or
@@ -40,14 +41,30 @@ personas must run and why.
    native session identifiers, prompt rendering, context policy, receipt
    validation, tool or MCP allowlists, repository skill materialization, or
    agent home/config setup.
-6. Bound optional selection depth: inspect only the sealed diff, the named
+6. Select `security` when changed paths or contracts include authentication,
+   authorization, bearer or HMAC verification, tenant/repository/run binding,
+   untrusted input crossing shell/path/SQL/JSON/markdown/prompt/provider
+   boundaries, credential handling, logging, or secret persistence.
+7. Select `data-migration` when changed paths or contracts include SQLite
+   migrations, schema definitions, indexes, persisted repository adapters,
+   backfills, versioned JSON contracts, fixtures, receipt shapes, or config
+   shapes that must read existing records.
+8. Select `performance` when changed paths or contracts include hot-path
+   queries, reducers, polling loops, drains, leases, resource defaults,
+   pagination, bounded lists, artifact retention, sandbox packaging, or
+   synchronous work whose cost scales with stored history or repository size.
+9. Select `project-standards` when changed paths or contracts include task
+   skill packaging, pipeline manifests, runtime capabilities, architecture
+   boundaries, AGENTS.md/README/SPEC normative text, command names, or
+   cross-surface documentation that must match executable defaults.
+10. Bound optional selection depth: inspect only the sealed diff, the named
    contract or manifest, and at most two directly called local modules needed
    to confirm a trigger. If the trigger needs broader investigation, do not
    select the optional persona unless the sealed roster explicitly marks it
    mandatory.
-7. Keep the order deterministic: mandatory baseline personas first in the order
+11. Keep the order deterministic: mandatory baseline personas first in the order
    above, then optional personas in roster order.
-8. Stay within `max_personas_per_selection`. If the baseline alone exceeds the
+12. Stay within `max_personas_per_selection`. If the baseline alone exceeds the
    bound, return `needs_human`.
 
 ## Required Postconditions
@@ -65,11 +82,13 @@ personas must run and why.
 ## Noise Exclusions
 
 Do not select personas for style taste, formatting, broad hardening, code-size
-preferences, speculative performance concerns, unchanged files, or toolchain
-checks that the configured command gates already own. Do not select optional
-personas for executor crashes, missing binaries, network outages, sandbox
-startup failure, command timeouts with no semantic contract change, or provider
-incidents; those are executor or gate faults, not semantic review findings.
+preferences, speculative security or performance concerns, unchanged files,
+dependency advisories unrelated to the changed subject, local credential
+absence, provider outages, or toolchain checks that the configured command gates
+already own. Do not select optional personas for executor crashes, missing
+binaries, network outages, sandbox startup failure, command timeouts with no
+semantic contract change, or provider incidents; those are executor or gate faults,
+not semantic review findings.
 
 ## The Receipt
 

@@ -67,6 +67,14 @@ independent `semantic_review` receipts:
 - `agent-native-contracts` optionally reviews native session continuation,
   prompt-boundary handling, receipt provenance, and tool-contract authority
   where changed code crosses agent execution boundaries.
+- `security` optionally reviews authority, untrusted-input, injection, and
+  secret-handling risks where changed code crosses trust boundaries.
+- `data-migration` optionally reviews schema, backfill, persisted-record, and
+  serialized-contract compatibility risks.
+- `performance` optionally reviews hot-path queries, bounded work, resource
+  defaults, artifact retention, and scaling risks.
+- `project-standards` optionally reviews committed OpenThrottle standards such
+  as task packaging, manifests, architecture boundaries, and normative docs.
 
 A repository-scoped skill may replace any of these when it emits the same
 `openthrottle.receipt/v1` or `openthrottle.stage-proposal/v1` contract. The

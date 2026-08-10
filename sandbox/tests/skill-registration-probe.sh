@@ -47,6 +47,10 @@ SKILL_NAMES=(
   tests-contracts
   reliability-adversarial
   agent-native-contracts
+  security
+  data-migration
+  performance
+  project-standards
 )
 
 docker run --rm --entrypoint bash "$IMAGE" -lc '
