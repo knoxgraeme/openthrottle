@@ -557,8 +557,15 @@ function parseRepositorySkillPackage(value: unknown, path: string): RatchetRepos
     files: arrayAt(input.files, `${path}.files`, parseRepositorySkillPackageFile, { min: 1, max: 64 }),
   };
   unique(skill.files.map((file) => file.path), `${path}.files.path`);
-  if (!skill.files.some((file) => isSkillMd(file.path))) {
-    fail(`${path}.files`, "must include SKILL.md");
+  const packageRoot = `.openthrottle/skills/${skill.id}`;
+  const skillPath = `${packageRoot}/SKILL.md`;
+  if (!skill.files.some((file) => file.path === skillPath)) {
+    fail(`${path}.files`, `must include ${skillPath}`);
+  }
+  for (const file of skill.files) {
+    if (!file.path.startsWith(`${packageRoot}/`)) {
+      fail(`${path}.files.${file.path}`, `must stay within ${packageRoot}`);
+    }
   }
   const packageBytes = skill.files.reduce((sum, file) => sum + Buffer.byteLength(file.content, "utf8"), 0);
   if (packageBytes > SKILL_PACKAGE_MAX_BYTES) fail(path, `must contain at most ${SKILL_PACKAGE_MAX_BYTES} UTF-8 bytes`);
@@ -681,6 +688,9 @@ export function decideDifferentialRatchet(input: RatchetDifferentialInput): Ratc
   if (Boolean(contract.pinned_repository_skills) !== Boolean(contract.proposed_repository_skills)) {
     pushDifference(differences, "skill_immutable_changed", "repository_skills");
   } else if (contract.pinned_repository_skills && contract.proposed_repository_skills) {
+    if (!contract.pinned_config || !contract.proposed_config) {
+      pushDifference(differences, "skill_immutable_changed", "repository_skills.tunable_binding");
+    }
     compareRepositorySkillPackages(
       contract.pinned_repository_skills,
       contract.proposed_repository_skills,

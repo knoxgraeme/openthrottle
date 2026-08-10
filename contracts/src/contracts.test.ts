@@ -24,6 +24,22 @@ function invalidFixtures(): string[] {
   return readdirSync(join(fixtureRoot.pathname, "invalid")).filter((name) => name.endsWith(".json")).sort();
 }
 
+function repositorySkillPolicy(tunable: boolean): {
+  pinned_config: ReturnType<typeof parseRepositoryConfigContract>["value"];
+  proposed_config: ReturnType<typeof parseRepositoryConfigContract>["value"];
+} {
+  const pinnedConfig = parseRepositoryConfigContract(readFixture("valid", "config-repository.json")).value;
+  pinnedConfig.skills = [{
+    id: "implement_unit",
+    path: ".openthrottle/skills/implement_unit",
+    tunable,
+  }];
+  return {
+    pinned_config: pinnedConfig,
+    proposed_config: structuredClone(pinnedConfig),
+  };
+}
+
 function parseByName(name: string, raw: string): unknown {
   if (name.startsWith("config-")) return parseRepositoryConfigContract(raw, { source: name });
   if (name.startsWith("citation-contract")) return parseCitationContractProposal(raw, { source: name });
@@ -639,6 +655,7 @@ describe("Stage C contract fixtures", () => {
 
     expect(decideDifferentialRatchet({
       ...parsed.value,
+      ...repositorySkillPolicy(true),
       pinned_repository_skills: [skill],
       proposed_repository_skills: [proposedSkill],
     })).toMatchObject({
@@ -680,6 +697,7 @@ describe("Stage C contract fixtures", () => {
 
     expect(decideDifferentialRatchet({
       ...parsed.value,
+      ...repositorySkillPolicy(false),
       pinned_repository_skills: [skill],
       proposed_repository_skills: [lockedEdit],
     })).toMatchObject({
@@ -698,6 +716,7 @@ describe("Stage C contract fixtures", () => {
 
     const decision = decideDifferentialRatchet({
       ...parsed.value,
+      ...repositorySkillPolicy(true),
       pinned_repository_skills: [tunable],
       proposed_repository_skills: [proposed],
     });
@@ -734,6 +753,7 @@ describe("Stage C contract fixtures", () => {
 
     const decision = decideDifferentialRatchet({
       ...parsed.value,
+      ...repositorySkillPolicy(true),
       pinned_repository_skills: [skill],
       proposed_repository_skills: [proposed],
     });
@@ -765,6 +785,7 @@ describe("Stage C contract fixtures", () => {
 
     expect(decideDifferentialRatchet({
       ...parsed.value,
+      ...repositorySkillPolicy(true),
       pinned_repository_skills: [skill],
       proposed_repository_skills: [proposed],
     })).toMatchObject({ outcome: "reject" });
@@ -801,6 +822,7 @@ describe("Stage C contract fixtures", () => {
 
     expect(decideDifferentialRatchet({
       ...parsed.value,
+      ...repositorySkillPolicy(true),
       pinned_repository_skills: [skill],
       proposed_repository_skills: [proposed],
     })).toMatchObject({
@@ -842,6 +864,7 @@ describe("Stage C contract fixtures", () => {
 
     expect(decideDifferentialRatchet({
       ...parsed.value,
+      ...repositorySkillPolicy(true),
       pinned_repository_skills: [skill],
       proposed_repository_skills: [proposed],
     })).toMatchObject({
@@ -892,6 +915,47 @@ describe("Stage C contract fixtures", () => {
     });
   });
 
+  it("rejects skill policy without sealed config authority and package paths outside their skill", () => {
+    const parsed = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json"), {
+      source: "ratchet",
+    });
+    const skill = {
+      id: "implement_unit",
+      tunable: true,
+      files: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        content: "---\nname: implement_unit\n---\n# Implement Unit\n## Craft\nWrite code.\n",
+      }],
+    };
+    const proposed = structuredClone(skill);
+    proposed.files[0]!.content = proposed.files[0]!.content.replace("Write code.", "Write focused code.");
+
+    expect(decideDifferentialRatchet({
+      ...parsed.value,
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [proposed],
+    })).toMatchObject({
+      outcome: "reject",
+      reject_reasons: ["skill_immutable_changed"],
+      differences: [{
+        reason: "skill_immutable_changed",
+        path: "repository_skills.tunable_binding",
+      }],
+    });
+
+    const escaped = structuredClone(proposed);
+    escaped.files.push({
+      path: ".openthrottle/skills/another_skill/references/injected.md",
+      content: "Injected reference.",
+    });
+    expect(() => decideDifferentialRatchet({
+      ...parsed.value,
+      ...repositorySkillPolicy(true),
+      pinned_repository_skills: [skill],
+      proposed_repository_skills: [escaped],
+    })).toThrow(/must stay within \.openthrottle\/skills\/implement_unit/);
+  });
+
   it.each([
     ["missing", "name: implement_unit\n## Craft\nWrite code.\n"],
     ["unterminated", "---\nname: implement_unit\n## Craft\nWrite code.\n"],
@@ -912,6 +976,7 @@ describe("Stage C contract fixtures", () => {
 
     expect(decideDifferentialRatchet({
       ...parsed.value,
+      ...repositorySkillPolicy(true),
       pinned_repository_skills: [skill],
       proposed_repository_skills: [proposed],
     })).toMatchObject({
