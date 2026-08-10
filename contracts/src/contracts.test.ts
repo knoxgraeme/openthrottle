@@ -187,6 +187,23 @@ describe("Stage C contract fixtures", () => {
     expect(parsed.value.citations[0]!.expected_result[0]!.created_at).toBe("2026-08-08T00:00:00.000Z");
   });
 
+  it("rejects reversed citation windows after normalization while allowing equality", () => {
+    const proposal = JSON.parse(readFixture("valid", "citation-contract.json")) as {
+      citations: Array<{ query: { from?: string; to?: string } }>;
+    };
+    proposal.citations[0]!.query.from = "2026-08-08T03:00:00+02:00";
+    proposal.citations[0]!.query.to = "2026-08-08T00:00:00Z";
+    expect(() => parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" }))
+      .toThrow(/query: from must not be later than to/);
+
+    proposal.citations[0]!.query.from = "2026-08-08T02:00:00+02:00";
+    const parsed = parseCitationContractProposal(JSON.stringify(proposal), { source: "proposal" });
+    expect(parsed.value.citations[0]!.query).toMatchObject({
+      from: "2026-08-08T00:00:00.000Z",
+      to: "2026-08-08T00:00:00.000Z",
+    });
+  });
+
   it("rejects declared citations that no claim or disposition references", () => {
     const proposal = JSON.parse(readFixture("valid", "citation-contract.json")) as {
       citations: Array<Record<string, unknown>>;

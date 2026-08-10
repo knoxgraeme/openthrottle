@@ -108,7 +108,7 @@ function timestamp(value: unknown, path: string): string {
 function parseAnalysisRunQuery(value: unknown, path: string): AnalysisRunQuery {
   const input = objectAt(value, path, ANALYSIS_RUN_QUERY_FIELDS);
   if (Object.keys(input).length === 0) fail(path, "must include at least one allowlisted filter");
-  return {
+  const query: AnalysisRunQuery = {
     ...optional(input.outcome, (entry) => ({ outcome: enumAt(entry, `${path}.outcome`, ANALYSIS_QUERY_OUTCOMES) })),
     ...optional(input.reason, (entry) => ({ reason: enumAt(entry, `${path}.reason`, ANALYSIS_QUERY_REASONS) })),
     ...optional(input.attribution, (entry) => ({
@@ -122,6 +122,10 @@ function parseAnalysisRunQuery(value: unknown, path: string): AnalysisRunQuery {
     ...optional(input.to, (entry) => ({ to: timestamp(entry, `${path}.to`) })),
     ...optional(input.limit, (entry) => ({ limit: integerAt(entry, `${path}.limit`, 1, 200) })),
   };
+  if (query.from !== undefined && query.to !== undefined && query.from > query.to) {
+    fail(path, "from must not be later than to");
+  }
+  return query;
 }
 
 function parseAnalysisRunResult(value: unknown, path: string): AnalysisRunResult {

@@ -436,7 +436,7 @@ describe("coordinator-only server", () => {
     });
   });
 
-  it("rejects unsupported citation timestamps and unreferenced citations before grading", async () => {
+  it("rejects invalid citation timestamps, reversed windows, and unreferenced citations before grading", async () => {
     const proposal = {
       schema: "openthrottle.citation-contract/v1",
       id: "proposal_invalid",
@@ -469,7 +469,11 @@ describe("coordinator-only server", () => {
     });
 
     expect((await grade(proposal)).status).toBe(400);
-    proposal.citations[0]!.query.from = "2026-08-08T00:00:00.000Z";
+    const invalidQuery = proposal.citations[0]!.query as { outcome: string; from: string; to?: string };
+    invalidQuery.from = "2026-08-08T00:00:00.000Z";
+    invalidQuery.to = "2026-08-07T23:59:59.999Z";
+    expect((await grade(proposal)).status).toBe(400);
+    delete invalidQuery.to;
     proposal.citations.push({
       id: "orphan_citation",
       query: { outcome: "failed", from: "2026-08-08T00:00:00.000Z" },

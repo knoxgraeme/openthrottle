@@ -636,6 +636,7 @@ sentence, or links rendered after it.
 | `GET` | `/status` | `OT_STATUS_TOKEN` bearer | tickets and pipeline/effect/publication state |
 | `GET` | `/capabilities` | `OT_STATUS_TOKEN` bearer | active runtime release, capability digest/IDs, and effective limits |
 | `GET` | `/analysis/runs` | `OT_STATUS_TOKEN` bearer | read-only, filterable `run_outcomes` evidence for improvement proposals |
+| `POST` | `/analysis/citations/grade` | `OT_STATUS_TOKEN` bearer | reproduce proposal citations and deterministically grade their evidence graph |
 | `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered routes |
 | `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert route/webhook |
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | coordinator stop |
