@@ -1,7 +1,15 @@
 import { getErrorMessage, supervisorRequest } from './util.js';
 
 interface TicketRow {
-  linear_issue_identifier: string;
+  id: string;
+  reference: string;
+  current_session_id: string;
+  control_provider: string;
+  external_thread: {
+    provider: string;
+    id: string;
+    reference: string;
+  };
   branch: string;
   agent: string;
   state: string;
@@ -63,7 +71,12 @@ function shortSha(input: string | null | undefined): string {
 }
 
 function renderTicket(ticket: TicketRow): void {
-  console.log(`${ticket.linear_issue_identifier}`);
+  const externalThread = ticket.external_thread;
+  console.log(ticket.reference);
+  console.log(`  id: ${ticket.id}`);
+  console.log(`  session: ${ticket.current_session_id}`);
+  console.log(`  control: ${ticket.control_provider}`);
+  console.log(`  external thread: ${externalThread.reference} (${externalThread.provider}:${externalThread.id})`);
   console.log(`  whose move: ${ticket.pipeline?.whose_move ?? (ticket.state === 'closed' ? 'finished' : 'working')}`);
   console.log(`  branch: ${ticket.branch}`);
   console.log(`  agent: ${ticket.agent}`);
@@ -126,7 +139,7 @@ export default async function status(ticketFilter?: string): Promise<void> {
   }
 
   const tickets = ticketFilter
-    ? (data.tickets ?? []).filter((ticket) => ticket.linear_issue_identifier === ticketFilter)
+    ? (data.tickets ?? []).filter((ticket) => ticket.id === ticketFilter)
     : data.tickets ?? [];
   if (tickets.length === 0) {
     console.log(ticketFilter ? `(no ticket ${ticketFilter})` : '(no tickets)');
