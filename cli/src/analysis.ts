@@ -2,7 +2,7 @@ import { getErrorMessage, printTable, supervisorRequest } from './util.js';
 
 interface RunOutcomeRow {
   pipeline_instance_id: string;
-  linear_issue_id: string;
+  ticket_id: string;
   generation: number;
   execution_graph_id: string | null;
   plan_digest: string | null;
@@ -86,7 +86,7 @@ export default async function analysis(args: string[]): Promise<void> {
   printTable(
     runs.map((run) => ({
       instance: run.pipeline_instance_id,
-      issue: run.linear_issue_id,
+      ticket: run.ticket_id,
       outcome: run.outcome,
       reason: run.closed_reason,
       attribution: run.fault_attribution,
@@ -95,6 +95,6 @@ export default async function analysis(args: string[]): Promise<void> {
       cost_usd: run.token_cost_usd,
       created_at: run.created_at,
     })),
-    ['instance', 'issue', 'outcome', 'reason', 'attribution', 'graph', 'engine', 'cost_usd', 'created_at']
+    ['instance', 'ticket', 'outcome', 'reason', 'attribution', 'graph', 'engine', 'cost_usd', 'created_at']
   );
 }
