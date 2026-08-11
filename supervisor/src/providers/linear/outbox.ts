@@ -263,6 +263,15 @@ export function createLinearOutboxProcessor(params: {
   const leaseMs = params.leaseMs ?? 30_000;
 
   async function processRow(row: LinearOutboxRecord): Promise<void> {
+    const session = !row.ticket_id && row.session_id
+      ? params.store.getSession(row.session_id)
+      : undefined;
+    const ticket = params.store.getByIssueId(row.ticket_id ?? session?.ticket_id ?? "");
+    if (ticket && ticket.control_provider !== "linear") {
+      throw new Error(
+        `invalid control provider ${ticket.control_provider} for Linear outbox ${row.id}`
+      );
+    }
     const linear = await params.getLinearClient();
     if (!linear) throw new Error("No valid Linear OAuth token is stored");
     const receipt = await deliver(linear, row, params.store);
