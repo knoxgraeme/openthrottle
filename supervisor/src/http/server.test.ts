@@ -1382,6 +1382,48 @@ describe("coordinator-only server", () => {
     expect(process).not.toHaveBeenCalled();
   });
 
+  it("drops unauthorized GitHub Issue comments before durable delivery", async () => {
+    const process = vi.fn(async () => undefined);
+    const server = app({
+      deliveryProcessor: { process, drain: vi.fn(async () => undefined) },
+      runBackground: (task) => void task,
+    });
+    vi.stubGlobal("fetch", vi.fn(async () =>
+      Response.json({ permission: "read", role_name: "pull" })
+    ));
+    const payload = JSON.stringify({
+      action: "created",
+      repository: { full_name: "owner/repo" },
+      issue: { number: 12 },
+      comment: {
+        id: 101,
+        body: "unauthorized steering body",
+        html_url: "https://github.com/owner/repo/issues/12#issuecomment-101",
+        user: { login: "reader" },
+      },
+    });
+    const signature = createHmac("sha256", cfg.githubWebhookSecret).update(payload).digest("hex");
+
+    try {
+      const response = await server.request("/webhooks/github", {
+        method: "POST",
+        headers: {
+          "X-GitHub-Event": "issue_comment",
+          "X-Hub-Signature-256": `sha256=${signature}`,
+          "X-GitHub-Delivery": "github-unauthorized-comment",
+        },
+        body: payload,
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("ok");
+      expect(db.prepare("SELECT COUNT(*) FROM webhook_deliveries").pluck().get()).toBe(0);
+      expect(process).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("serves a sanitized bounded durable run tail after cleanup", async () => {
     seedTicket();
     expect(store.beginRun({

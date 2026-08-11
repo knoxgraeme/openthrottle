@@ -49,18 +49,19 @@ export async function handlePrompted(
   }
 
   const command = parseCommand(promptBody);
-  const pipelineInstance = coordinator.store.getInstanceForSession(sessionId);
+  const currentSessionId = ticket.session_id;
+  const pipelineInstance = coordinator.store.getInstanceForSession(currentSessionId);
   const isStop = payload.activity?.signal?.toLowerCase() === "stop" || command.kind === "stop";
   if (isStop) {
     if (!pipelineInstance) {
-      await publishMissingPipeline(providers, sessionId, ticket.ticket_id);
+      await publishMissingPipeline(providers, currentSessionId, ticket.ticket_id);
       return;
     }
     requestPipelineStop({
       store: coordinator.store,
-      sessionId,
+      sessionId: currentSessionId,
       eventId: `${payload.provider}-stop:${pipelineInstance.id}:${payload.activity?.id ?? "signal"}`,
-      reason: "Stopped from the Linear thread.",
+      reason: `Stopped from the ${payload.provider} thread.`,
     });
     await coordinator.drainEffects?.();
     return;
@@ -86,7 +87,7 @@ export async function handlePrompted(
     store.enqueueInbox({
       id: workId,
       issueId: ticket.ticket_id,
-      sessionId,
+      sessionId: currentSessionId,
       runId: ticket.run_id,
       source: "human",
       body: sanitizeText(promptBody),
@@ -107,7 +108,7 @@ export async function handlePrompted(
     store.enqueueInbox({
       id: workId,
       issueId: ticket.ticket_id,
-      sessionId,
+      sessionId: currentSessionId,
       runId: null,
       source: "human",
       body: sanitizeText(promptBody),

@@ -33,6 +33,7 @@ interface GithubPullRequest {
 
 interface GithubEventBase {
   repository: { full_name: string };
+  sender?: { login?: string };
 }
 
 interface GithubPullRequestEvent extends GithubEventBase {
@@ -80,19 +81,22 @@ interface GithubCheckSuiteEvent extends GithubEventBase {
   };
 }
 
-interface GithubIssueThread {
+export interface GithubIssueThread {
   number: number;
   title: string;
   html_url: string;
+  created_at?: string;
+  updated_at?: string;
   body?: string | null;
   user?: { login: string };
   labels?: Array<{ id?: string; name: string }> | { nodes?: Array<{ name: string }> };
 }
 
-interface GithubIssuesEvent extends GithubEventBase {
+export interface GithubIssuesEvent extends GithubEventBase {
   kind: "issues";
   action: string;
   issue: GithubIssueThread;
+  label?: { name?: string };
 }
 
 export interface GithubIssueCommentEvent extends GithubEventBase {
@@ -179,6 +183,8 @@ export { OPENTHROTTLE_WEBHOOK_EVENTS };
 
 export type GithubIssueCommentClassification = "pull_request_comment" | "plain_issue_comment";
 export type GithubIssueControlWebhookEvent = GithubIssuesEvent | GithubIssueCommentEvent;
+export const GITHUB_CONTROL_LABEL = "openthrottle";
+export const GITHUB_ISSUE_CONTEXT_LIMIT = 64_000;
 
 export function classifyGithubIssueComment(
   event: GithubIssueCommentEvent
@@ -186,7 +192,10 @@ export function classifyGithubIssueComment(
   return event.issue.pull_request ? "pull_request_comment" : "plain_issue_comment";
 }
 
-export function githubIssueControlEvent(event: GithubIssueControlWebhookEvent): ControlThreadEvent {
+export function githubIssueControlEvent(
+  event: GithubIssueControlWebhookEvent,
+  options: { promptContext?: string; sessionId?: string } = {}
+): ControlThreadEvent {
   const isIssue = event.kind === "issues";
   const repository = event.repository.full_name;
   const issueNumber = event.issue.number;
@@ -202,9 +211,9 @@ export function githubIssueControlEvent(event: GithubIssueControlWebhookEvent): 
   return {
     provider: "github",
     action: isIssue ? "created" : "prompted",
-    promptContext: isIssue ? body : undefined,
+    promptContext: isIssue ? options.promptContext ?? body : undefined,
     agentSession: {
-      id: `github:${threadId}`,
+      id: options.sessionId ?? `github:${threadId}`,
       threadId,
       thread: {
         id: threadId,
@@ -249,6 +258,9 @@ export function parseGithubWebhook(eventName: string | undefined, raw: string): 
     if (issue.pull_request !== undefined) {
       throw new Error("GitHub issues webhook unexpectedly references a pull request");
     }
+    if (payload.label !== undefined) {
+      stringField(recordField(payload, "label"), "name");
+    }
   } else if (eventName === "pull_request_review") {
     const review = recordField(payload, "review");
     numberField(review, "id");
@@ -278,6 +290,126 @@ export function parseGithubWebhook(eventName: string | undefined, raw: string): 
     }
   }
   return { ...payload, kind: eventName } as unknown as GithubWebhookEvent;
+}
+
+export function githubIssueHasExactControlLabel(
+  labels: GithubIssueThread["labels"] | undefined
+): boolean {
+  const nodes = Array.isArray(labels) ? labels : labels?.nodes ?? [];
+  return nodes.some((label) => label.name === GITHUB_CONTROL_LABEL);
+}
+
+export function githubIssuesEventCarriesExactControlLabel(event: GithubIssuesEvent): boolean {
+  if (event.action === "labeled") return event.label?.name === GITHUB_CONTROL_LABEL;
+  if (event.action === "opened" || event.action === "reopened") {
+    return githubIssueHasExactControlLabel(event.issue.labels);
+  }
+  return false;
+}
+
+export type GithubRepositoryPermission =
+  | "none"
+  | "read"
+  | "triage"
+  | "write"
+  | "maintain"
+  | "admin";
+
+export function isAuthorizedGithubControlPermission(permission: GithubRepositoryPermission): boolean {
+  return ["triage", "write", "maintain", "admin"].includes(permission);
+}
+
+export async function getRepositoryCollaboratorPermission(
+  client: GithubClient,
+  repo: string,
+  username: string
+): Promise<GithubRepositoryPermission> {
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(username)) {
+    throw new Error("GitHub collaborator permission lookup requires a safe username");
+  }
+  const permission = await githubRequest<{
+    permission?: string;
+    role_name?: string;
+  }>(
+    client,
+    `/repos/${repo}/collaborators/${encodeURIComponent(username)}/permission`
+  );
+  const role = String(permission.role_name ?? permission.permission ?? "none").toLowerCase();
+  if (role === "admin") return "admin";
+  if (role === "maintain") return "maintain";
+  if (role === "write" || role === "push") return "write";
+  if (role === "triage") return "triage";
+  if (role === "read" || role === "pull") return "read";
+  return "none";
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;");
+}
+
+function boundedGithubIssueContext(input: {
+  identifier: string;
+  title: string;
+  body: string;
+  comments: Array<{ id: number; body: string }>;
+}): string {
+  const title = input.title.slice(0, 1_000);
+  const body = input.body.slice(0, 20_000);
+  const issue = [
+    `<issue identifier="${escapeXml(input.identifier)}">`,
+    `<title>${escapeXml(title)}</title>`,
+    `<description>${escapeXml(body)}</description>`,
+    `</issue>`,
+  ].join("");
+  const primary = [
+    `<primary-directive-thread comment-id="github-issue-body">`,
+    `<comment>${escapeXml(body || title)}</comment>`,
+    `</primary-directive-thread>`,
+  ].join("");
+  const optional = input.comments.map((comment) => [
+    `<other-thread comment-id="github-comment-${comment.id}">`,
+    `<comment>${escapeXml(comment.body.slice(0, 4_000))}</comment>`,
+    `</other-thread>`,
+  ].join(""));
+  const parts = [issue, primary, ...optional];
+  while (parts.join("\n").length > GITHUB_ISSUE_CONTEXT_LIMIT && parts.length > 2) {
+    parts.pop();
+  }
+  return parts.join("\n");
+}
+
+export async function fetchGithubIssueLabels(
+  client: GithubClient,
+  repo: string,
+  issueNumber: number
+): Promise<Array<{ name: string }>> {
+  const issue = await githubRequest<GithubIssueThread>(client, `/repos/${repo}/issues/${issueNumber}`);
+  const labels = Array.isArray(issue.labels) ? issue.labels : issue.labels?.nodes ?? [];
+  return labels.map((label) => ({ name: label.name }));
+}
+
+export async function fetchGithubIssueContext(
+  client: GithubClient,
+  repo: string,
+  issueNumber: number
+): Promise<string> {
+  const issue = await githubRequest<GithubIssueThread>(client, `/repos/${repo}/issues/${issueNumber}`);
+  const comments = await githubRequest<Array<{ id: number; body?: string | null }>>(
+    client,
+    `/repos/${repo}/issues/${issueNumber}/comments?per_page=100`
+  );
+  return boundedGithubIssueContext({
+    identifier: `GH-${issue.number}`,
+    title: issue.title,
+    body: issue.body ?? "",
+    comments: comments
+      .map((comment) => ({ id: comment.id, body: comment.body ?? "" }))
+      .filter((comment) => comment.body.length > 0),
+  });
 }
 
 export function isOpenthrottleBranch(ref: string | null | undefined): ref is string {

@@ -6,7 +6,12 @@ import type { SupervisorStore } from "../../persistence/store.js";
 import {
   getFailingGithubCheckDetails,
   OPENTHROTTLE_COMMENT_MARKER_PREFIX,
+  fetchGithubIssueContext,
+  getRepositoryCollaboratorPermission,
+  githubIssueControlEvent,
+  githubIssuesEventCarriesExactControlLabel,
   classifyGithubIssueComment,
+  isAuthorizedGithubControlPermission,
   isOpenthrottleBranch,
   type GithubWebhookEvent,
 } from "./client.js";
@@ -22,6 +27,8 @@ import {
   type PipelineProviderOutcome,
 } from "../../app/provider-feedback.js";
 import { sanitizeText } from "../../shared/sanitize.js";
+import { handleControlEvent, type PipelineCoordinatorContext, type SessionServicePorts } from "../../app/session-service.js";
+import type { AdmissionPreflight } from "../../app/admission-preflight.js";
 
 type ProviderFinding = {
   severity: "P0" | "P1" | "P2" | "P3";
@@ -129,6 +136,24 @@ function githubPullEventId(
   headSha: string
 ): string {
   return `github-pull-${action}:${repository}:${pullNumber}:${headSha}`;
+}
+
+async function authorizedGithubControlActor(
+  cfg: Config,
+  repository: string,
+  author: string | undefined
+): Promise<boolean> {
+  if (!author) return false;
+  try {
+    const permission = await getRepositoryCollaboratorPermission(
+      { token: cfg.githubReadToken },
+      repository,
+      author
+    );
+    return isAuthorizedGithubControlPermission(permission);
+  } catch {
+    return false;
+  }
 }
 
 export function considerCiGithubHead(
@@ -266,7 +291,13 @@ export async function handleGithubEvent(
   store: SupervisorStore,
   activityPublisher: ActivityPublicationPort,
   event: GithubWebhookEvent,
-  pipelines: PipelineStore
+  pipelines: PipelineStore,
+  control?: {
+    ports: SessionServicePorts;
+    coordinator: PipelineCoordinatorContext;
+    preflight?: AdmissionPreflight;
+    deliveryId?: string;
+  }
 ): Promise<void> {
   if (event.kind === "pull_request") {
     const branch = event.pull_request.head.ref;
@@ -413,7 +444,21 @@ export async function handleGithubEvent(
   }
 
   if (event.kind === "issue_comment") {
-    if (classifyGithubIssueComment(event) === "plain_issue_comment") return;
+    if (classifyGithubIssueComment(event) === "plain_issue_comment") {
+      if (!control || event.action !== "created") return;
+      const author = event.comment.user?.login;
+      if (!await authorizedGithubControlActor(_cfg, event.repository.full_name, author)) return;
+      await handleControlEvent(
+        _cfg,
+        store,
+        control.ports,
+        githubIssueControlEvent(event),
+        control.coordinator,
+        control.preflight
+      );
+      await control.coordinator.drainEffects?.();
+      return;
+    }
     if (event.action !== "created") return;
     const ticket = store.getByPrUrl(
       event.repository.full_name,
@@ -452,6 +497,51 @@ export async function handleGithubEvent(
   }
 
   if (event.kind === "issues") {
+    if (event.action === "closed") {
+      const ticket = store.getByExternalThread(
+        "github",
+        `${event.repository.full_name}#${event.issue.number}`
+      );
+      if (!ticket) return;
+      const pipelineInstance = pipelines.getInstanceForSession(ticket.session_id);
+      if (pipelineInstance && !pipelineIsTerminal(pipelineInstance)) {
+        requestPipelineStop({
+          store: pipelines,
+          sessionId: ticket.session_id,
+          eventId: `github-issue-closed:${pipelineInstance.id}:${event.repository.full_name}:${event.issue.number}`,
+          reason: "GitHub Issue closed while a pipeline stage was active.",
+          ticketState: "closed",
+        });
+      }
+      store.setState(ticket.ticket_id, "closed");
+      store.markSessionState(ticket.session_id, "stopped");
+      store.cancelPendingInbox(ticket.ticket_id);
+      await control?.coordinator.drainEffects?.();
+      return;
+    }
+    if (!control || !githubIssuesEventCarriesExactControlLabel(event)) return;
+    const author = event.sender?.login ?? event.issue.user?.login;
+    if (!await authorizedGithubControlActor(_cfg, event.repository.full_name, author)) return;
+    const promptContext = await fetchGithubIssueContext(
+      { token: _cfg.githubReadToken },
+      event.repository.full_name,
+      event.issue.number
+    );
+    const sessionSuffix = event.action === "labeled"
+      ? `label:${event.issue.updated_at ?? control.deliveryId ?? "current"}`
+      : `opened:${event.issue.created_at ?? control.deliveryId ?? "current"}`;
+    await handleControlEvent(
+      _cfg,
+      store,
+      control.ports,
+      githubIssueControlEvent(event, {
+        promptContext,
+        sessionId: `github:${event.repository.full_name}#${event.issue.number}:${sessionSuffix}`,
+      }),
+      control.coordinator,
+      control.preflight
+    );
+    await control.coordinator.drainEffects?.();
     return;
   }
 

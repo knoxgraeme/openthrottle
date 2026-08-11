@@ -17,6 +17,8 @@ import {
 } from "../providers/linear/events.js";
 import {
   branchExists,
+  fetchGithubIssueLabels,
+  getRepositoryCollaboratorPermission,
   getMergeReadiness,
   getRepositoryConfigAtCommit,
   getRepositoryDirectoryAtCommit,
@@ -26,6 +28,9 @@ import {
   parsePullRequestUrl,
   prepareRepository,
   verifyGithubSignature,
+  classifyGithubIssueComment,
+  githubIssuesEventCarriesExactControlLabel,
+  isAuthorizedGithubControlPermission,
   type GithubWebhookEvent,
 } from "../providers/github/client.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "../shared/logs.js";
@@ -243,6 +248,37 @@ export function createServerWebhookDeliveryProcessor(deps: {
         mergePullRequest({ token: deps.cfg.githubToken }, repo, pullNumber, expectedHeadSha),
     },
   });
+  const githubSessionServicePorts: SessionServicePorts = {
+    activityPublisher,
+    labelResolver: {
+      fetchThreadLabels: async (threadId: string) => {
+        const match = threadId.match(/^(.+)#(\d+)$/);
+        if (!match) throw new Error("GitHub thread id is not repository#issueNumber");
+        return fetchGithubIssueLabels(
+          { token: deps.cfg.githubReadToken },
+          match[1]!,
+          Number(match[2])
+        );
+      },
+    },
+    repositoryReader: {
+      branchExists: (repository: string, branch: string) =>
+        branchExists({ token: deps.cfg.githubToken }, repository, branch),
+      getRepositoryConfigAtCommit: (repository: string, branch: string) =>
+        getRepositoryConfigAtCommit({ token: deps.cfg.githubToken }, repository, branch),
+      getRepositoryFileAtCommit: (repository: string, commit: string, path: string) =>
+        getRepositoryFileAtCommit({ token: deps.cfg.githubToken }, repository, commit, path),
+      getRepositoryDirectoryAtCommit: (repository: string, commit: string, path: string) =>
+        getRepositoryDirectoryAtCommit({ token: deps.cfg.githubToken }, repository, commit, path),
+    },
+    merger: {
+      parsePullRequestUrl,
+      getMergeReadiness: (repo: string, pullNumber: number) =>
+        getMergeReadiness({ token: deps.cfg.githubToken }, repo, pullNumber),
+      mergePullRequest: (repo: string, pullNumber: number, expectedHeadSha: string) =>
+        mergePullRequest({ token: deps.cfg.githubToken }, repo, pullNumber, expectedHeadSha),
+    },
+  };
   return createWebhookDeliveryProcessor({
     store: deps.store,
     maxAttempts: 8,
@@ -277,7 +313,13 @@ export function createServerWebhookDeliveryProcessor(deps: {
         deps.store,
         activityPublisher,
         parseGithubWebhook(delivery.event_name ?? undefined, delivery.payload),
-        deps.pipelineCoordinator.store
+        deps.pipelineCoordinator.store,
+        {
+          ports: githubSessionServicePorts,
+          coordinator: deps.pipelineCoordinator,
+          preflight: admissionPreflight,
+          deliveryId: delivery.id,
+        }
       );
       await deps.pipelineCoordinator.drainEffects?.();
     },
@@ -619,6 +661,34 @@ export function createServer(deps: ServerDeps): Hono {
     } catch (error) {
       if (String(error).includes("Unsupported GitHub event")) return context.text("ignored", 200);
       return context.text("invalid payload", 400);
+    }
+    const authorizeGithubWebhookActor = async (repo: string, author: string | undefined) => {
+      if (!author) return false;
+      try {
+        const permission = await getRepositoryCollaboratorPermission(
+          { token: cfg.githubReadToken },
+          repo,
+          author
+        );
+        return isAuthorizedGithubControlPermission(permission);
+      } catch {
+        return false;
+      }
+    };
+    if (
+      event.kind === "issues" &&
+      (event.action === "closed" || githubIssuesEventCarriesExactControlLabel(event))
+    ) {
+      const author = event.sender?.login ?? event.issue.user?.login;
+      if (!await authorizeGithubWebhookActor(event.repository.full_name, author)) return context.text("ok", 200);
+    }
+    if (
+      event.kind === "issue_comment" &&
+      classifyGithubIssueComment(event) === "plain_issue_comment" &&
+      event.action === "created"
+    ) {
+      const author = event.comment.user?.login;
+      if (!await authorizeGithubWebhookActor(event.repository.full_name, author)) return context.text("ok", 200);
     }
     const deliveryId =
       context.req.header("X-GitHub-Delivery") ?? createHash("sha256").update(rawBody).digest("hex");

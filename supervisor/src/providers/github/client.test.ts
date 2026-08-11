@@ -7,14 +7,18 @@ import {
   OPENTHROTTLE_WEBHOOK_EVENTS,
   branchExists,
   classifyGithubIssueComment,
+  fetchGithubIssueContext,
   getRepositoryConfigAtCommit,
   getRepositoryDirectoryAtCommit,
   getRepositoryFileAtCommit,
   getFailingGithubCheckDetails,
   getMergeReadiness,
+  getRepositoryCollaboratorPermission,
   githubIssueControlEvent,
+  githubIssuesEventCarriesExactControlLabel,
   isGithubPullRequestUrl,
   isOpenthrottleBranch,
+  isAuthorizedGithubControlPermission,
   parseGithubWebhook,
   parsePullRequestUrl,
   prepareRepository,
@@ -203,6 +207,104 @@ describe("GitHub contracts", () => {
     }));
     if (pullComment.kind !== "issue_comment") throw new Error("expected issue_comment webhook");
     expect(classifyGithubIssueComment(pullComment)).toBe("pull_request_comment");
+  });
+
+  it("dispatches GitHub Issue admission only on the exact OpenThrottle label", () => {
+    const labeled = parseGithubWebhook("issues", JSON.stringify({
+      action: "labeled",
+      repository: { full_name: "owner/repo" },
+      label: { name: "openthrottle" },
+      issue: {
+        number: 12,
+        title: "Add issue control",
+        body: "Implement it.",
+        html_url: "https://github.com/owner/repo/issues/12",
+      },
+    }));
+    if (labeled.kind !== "issues") throw new Error("expected issues webhook");
+    expect(githubIssuesEventCarriesExactControlLabel(labeled)).toBe(true);
+
+    const fuzzy = parseGithubWebhook("issues", JSON.stringify({
+      action: "labeled",
+      repository: { full_name: "owner/repo" },
+      label: { name: "OpenThrottle" },
+      issue: {
+        number: 12,
+        title: "Add issue control",
+        body: "Implement it.",
+        html_url: "https://github.com/owner/repo/issues/12",
+      },
+    }));
+    if (fuzzy.kind !== "issues") throw new Error("expected issues webhook");
+    expect(githubIssuesEventCarriesExactControlLabel(fuzzy)).toBe(false);
+
+    const opened = parseGithubWebhook("issues", JSON.stringify({
+      action: "opened",
+      repository: { full_name: "owner/repo" },
+      issue: {
+        number: 13,
+        title: "Add issue control",
+        body: "Implement it.",
+        html_url: "https://github.com/owner/repo/issues/13",
+        labels: [{ name: "openthrottle" }],
+      },
+    }));
+    if (opened.kind !== "issues") throw new Error("expected issues webhook");
+    expect(githubIssuesEventCarriesExactControlLabel(opened)).toBe(true);
+  });
+
+  it("maps current GitHub collaborator permissions and authorizes triage or stronger", async () => {
+    const requests: string[] = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      requests.push(String(input));
+      return Response.json({ permission: "read", role_name: requests.length === 1 ? "triage" : "pull" });
+    });
+    await expect(getRepositoryCollaboratorPermission(
+      { token: "read-token", fetch: fetchMock },
+      "owner/repo",
+      "octocat"
+    )).resolves.toBe("triage");
+    await expect(getRepositoryCollaboratorPermission(
+      { token: "read-token", fetch: fetchMock },
+      "owner/repo",
+      "octocat"
+    )).resolves.toBe("read");
+    expect(isAuthorizedGithubControlPermission("triage")).toBe(true);
+    expect(isAuthorizedGithubControlPermission("read")).toBe(false);
+    expect(requests[0]).toBe("https://api.github.com/repos/owner/repo/collaborators/octocat/permission");
+  });
+
+  it("fetches deterministic bounded GitHub Issue context with pre-admission comments", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/repo/issues/12")) {
+        return Response.json({
+          number: 12,
+          title: "Use <GitHub> control",
+          body: "Implement & verify.",
+          html_url: "https://github.com/owner/repo/issues/12",
+        });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/comments?per_page=100")) {
+        return Response.json([
+          { id: 7, body: "First pre-admission comment." },
+          { id: 8, body: "Second pre-admission comment." },
+        ]);
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+
+    const context = await fetchGithubIssueContext(
+      { token: "read-token", fetch: fetchMock },
+      "owner/repo",
+      12
+    );
+
+    expect(context.length).toBeLessThanOrEqual(64_000);
+    expect(context).toContain(`<issue identifier="GH-12">`);
+    expect(context).toContain("Use &lt;GitHub&gt; control");
+    expect(context).toContain(`<other-thread comment-id="github-comment-7">`);
+    expect(context).toContain("Second pre-admission comment.");
   });
 
   it("recognizes managed branches and strict PR URLs", () => {
