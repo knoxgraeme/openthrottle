@@ -159,6 +159,7 @@ describe("GitHub contracts", () => {
         number: 12,
         title: "Add issue control",
         body: "Implement the provider contract.",
+        updated_at: "2026-08-11T00:00:00Z",
         html_url: "https://github.com/owner/repo/issues/12",
         labels: [{ name: "implement" }],
       },
@@ -167,6 +168,7 @@ describe("GitHub contracts", () => {
     expect(githubIssueControlEvent(issueEvent)).toMatchObject({
       provider: "github",
       action: "created",
+      providerActivatedAt: "2026-08-11T00:00:00Z",
       promptContext: "Implement the provider contract.",
       agentSession: {
         id: "github:owner/repo#12",

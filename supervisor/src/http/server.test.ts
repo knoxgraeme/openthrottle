@@ -153,7 +153,7 @@ describe("coordinator-only server", () => {
     });
   }
 
-  function seedPipelineTicket(): void {
+  function seedPipelineTicket(sessionId = "session-1"): void {
     const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
     const catalog = loadPipelineCatalog(
       fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url)),
@@ -171,7 +171,7 @@ describe("coordinator-only server", () => {
     store.upsert({
       ticket_id: "issue-1",
       ticket_reference: "OT-1",
-      session_id: "session-1",
+      session_id: sessionId,
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -1538,7 +1538,7 @@ describe("coordinator-only server", () => {
     expect(process).not.toHaveBeenCalled();
   });
 
-  it("drops stale generation-one Issue close and comment webhooks before durable persistence", async () => {
+  it("fences delayed GitHub deliveries against provider activation instead of local admission time", async () => {
     store.upsertUnpinned({
       ticket_id: "github:owner/repo#12",
       ticket_reference: "GH-12",
@@ -1546,6 +1546,7 @@ describe("coordinator-only server", () => {
       control_provider: "github",
       external_thread_id: "owner/repo#12",
       external_thread_reference: "GH-12",
+      provider_activated_at: "2026-08-11T00:00:00Z",
       sandbox_id: null,
       branch: "ot/gh-12",
       agent: "codex",
@@ -1555,7 +1556,7 @@ describe("coordinator-only server", () => {
       state: "active",
     });
     db.prepare("UPDATE agent_sessions SET created_at = ? WHERE id = ?").run(
-      "2026-08-11T00:00:00.000Z",
+      "2026-08-11T00:05:00.987Z",
       "github:owner/repo#12:reopened:2026-08-11T00:00:00.000Z"
     );
     const process = vi.fn(async () => undefined);
@@ -1618,6 +1619,97 @@ describe("coordinator-only server", () => {
     expect(db.prepare("SELECT COUNT(*) FROM webhook_deliveries").pluck().get()).toBe(0);
     expect(process).not.toHaveBeenCalled();
     expect(store.getByIssueId("github:owner/repo#12")?.state).toBe("active");
+
+    const delayedPayload = JSON.stringify({
+      action: "created",
+      repository: { full_name: "owner/repo" },
+      issue: { number: 12 },
+      comment: {
+        id: 105,
+        body: "feedback sent after activation while admission was delayed",
+        created_at: "2026-08-11T00:00:01Z",
+        html_url: "https://github.com/owner/repo/issues/12#issuecomment-105",
+        user: { login: "operator" },
+      },
+    });
+    const delayedSignature = createHmac("sha256", cfg.githubWebhookSecret)
+      .update(delayedPayload)
+      .digest("hex");
+    const delayed = await server.request("/webhooks/github", {
+      method: "POST",
+      headers: {
+        "X-GitHub-Event": "issue_comment",
+        "X-Hub-Signature-256": `sha256=${delayedSignature}`,
+        "X-GitHub-Delivery": "github-delayed-valid-comment",
+      },
+      body: delayedPayload,
+    });
+
+    expect(delayed.status).toBe(200);
+    expect(db.prepare(
+      "SELECT status FROM webhook_deliveries WHERE delivery_id = ?"
+    ).get("github-delayed-valid-comment")).toEqual({ status: "pending" });
+    expect(process).toHaveBeenCalledWith("github-delayed-valid-comment");
+  });
+
+  it("keeps same-second GitHub comments when activation and provider timestamps have second precision", async () => {
+    store.upsertUnpinned({
+      ticket_id: "github:owner/repo#12",
+      ticket_reference: "GH-12",
+      session_id: "github:owner/repo#12:initial",
+      control_provider: "github",
+      external_thread_id: "owner/repo#12",
+      external_thread_reference: "GH-12",
+      provider_activated_at: "2026-08-11T00:00:00Z",
+      sandbox_id: null,
+      branch: "ot/gh-12",
+      agent: "codex",
+      repo: "owner/repo",
+      base_branch: "main",
+      pr_url: null,
+      state: "active",
+    });
+    db.prepare("UPDATE agent_sessions SET created_at = ? WHERE id = ?").run(
+      "2026-08-11T00:00:00.987Z",
+      "github:owner/repo#12:initial"
+    );
+    const process = vi.fn(async () => undefined);
+    const server = app({
+      deliveryProcessor: { process, drain: vi.fn(async () => undefined) },
+      runBackground: (task) => void task,
+    });
+    vi.stubGlobal("fetch", vi.fn(async () =>
+      Response.json({ permission: "triage", role_name: "triage" })
+    ));
+    const payload = JSON.stringify({
+      action: "created",
+      repository: { full_name: "owner/repo" },
+      issue: { number: 12 },
+      comment: {
+        id: 106,
+        body: "same-second feedback",
+        created_at: "2026-08-11T00:00:00Z",
+        html_url: "https://github.com/owner/repo/issues/12#issuecomment-106",
+        user: { login: "operator" },
+      },
+    });
+    const signature = createHmac("sha256", cfg.githubWebhookSecret).update(payload).digest("hex");
+
+    const response = await server.request("/webhooks/github", {
+      method: "POST",
+      headers: {
+        "X-GitHub-Event": "issue_comment",
+        "X-Hub-Signature-256": `sha256=${signature}`,
+        "X-GitHub-Delivery": "github-same-second-comment",
+      },
+      body: payload,
+    });
+
+    expect(response.status).toBe(200);
+    expect(db.prepare(
+      "SELECT status FROM webhook_deliveries WHERE delivery_id = ?"
+    ).get("github-same-second-comment")).toEqual({ status: "pending" });
+    expect(process).toHaveBeenCalledWith("github-same-second-comment");
   });
 
   it("retries a durable GitHub control delivery when its permission recheck fails transiently", async () => {
@@ -1664,6 +1756,472 @@ describe("coordinator-only server", () => {
     expect(db.prepare(
       "SELECT status, attempts FROM webhook_deliveries WHERE delivery_id = ?"
     ).get("github-durable-transient-permission")).toEqual({ status: "failed", attempts: 1 });
+  });
+
+  it("retries an authorized same-thread comment until its Issue admission is durable", async () => {
+    const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
+    const catalog = loadPipelineCatalog(
+      fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url)),
+      runtime.descriptor
+    );
+    pipelines.acceptRuntimeDescriptor(runtime);
+    pipelines.acceptCatalog(catalog);
+    const postedBodies: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/collaborators/operator/permission")) {
+        return Response.json({ permission: "triage", role_name: "triage" });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/comments?per_page=100")) {
+        return Response.json([]);
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/comments") && method === "POST") {
+        const body = (JSON.parse(String(init?.body)) as { body: string }).body;
+        postedBodies.push(body);
+        return Response.json({
+          id: 801,
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-801",
+        });
+      }
+      throw new Error(`unexpected GitHub request ${method} ${url}`);
+    }));
+    const processor = createServerWebhookDeliveryProcessor({
+      cfg,
+      store,
+      runtime: {
+        listLabeledResources: async () => [],
+        deleteResource: async () => undefined,
+      },
+      getLinearClient: async () => undefined,
+      pipelineCoordinator: { catalog, runtime, store: pipelines },
+    });
+    store.claimDelivery({
+      deliveryId: "github-issue-admission-in-flight",
+      source: "github",
+      action: "issues:labeled",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "labeled",
+        repository: { full_name: "owner/repo" },
+        label: { name: "openthrottle" },
+        issue: { number: 12 },
+      }),
+    });
+    store.claimDelivery({
+      deliveryId: "github-comment-during-admission",
+      source: "github",
+      action: "issue_comment:created",
+      eventName: "issue_comment",
+      payload: JSON.stringify({
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 12 },
+        comment: {
+          id: 107,
+          body: "retain this comment across admission",
+          created_at: "2026-08-11T00:00:01Z",
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-107",
+          user: { login: "operator" },
+        },
+      }),
+    });
+
+    await expect(processor.process("github-comment-during-admission"))
+      .rejects.toThrow("Issue admission is still in flight");
+    expect(postedBodies).toEqual([]);
+    expect(db.prepare(
+      "SELECT status, attempts FROM webhook_deliveries WHERE delivery_id = ?"
+    ).get("github-comment-during-admission")).toEqual({ status: "failed", attempts: 1 });
+
+    seedPipelineTicket();
+    db.prepare(`
+      UPDATE tickets
+      SET control_provider = 'github', external_thread_id = 'owner/repo#12',
+          external_thread_reference = 'GH-12'
+      WHERE ticket_id = 'issue-1'
+    `).run();
+    db.prepare(`
+      UPDATE agent_sessions SET provider_activated_at = ? WHERE id = 'session-1'
+    `).run("2026-08-11T00:00:00Z");
+    store.markDeliveryProcessed("github-issue-admission-in-flight");
+    db.prepare(`
+      UPDATE webhook_deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z'
+      WHERE delivery_id = 'github-comment-during-admission'
+    `).run();
+
+    await expect(processor.process("github-comment-during-admission")).resolves.toBeUndefined();
+    expect(store.getInbox("github-comment:107")).toMatchObject({
+      ticket_id: "issue-1",
+      session_id: "session-1",
+      run_id: null,
+      body: "retain this comment across admission",
+      status: "pending",
+    });
+    expect(postedBodies).toHaveLength(1);
+    expect(postedBodies[0]).toContain("Captured your message");
+    expect(postedBodies[0]).not.toContain("couldn't find an existing workspace");
+  });
+
+  it("queues a comment for a durable current session despite a failed matching admission delivery", async () => {
+    const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
+    const catalog = loadPipelineCatalog(
+      fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url)),
+      runtime.descriptor
+    );
+    pipelines.acceptRuntimeDescriptor(runtime);
+    pipelines.acceptCatalog(catalog);
+    const postedBodies: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/collaborators/operator/permission")) {
+        return Response.json({ permission: "triage", role_name: "triage" });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/comments?per_page=100")) {
+        return Response.json([]);
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/comments") && method === "POST") {
+        const body = (JSON.parse(String(init?.body)) as { body: string }).body;
+        postedBodies.push(body);
+        return Response.json({
+          id: 803,
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-803",
+        });
+      }
+      throw new Error(`unexpected GitHub request ${method} ${url}`);
+    }));
+    const processor = createServerWebhookDeliveryProcessor({
+      cfg,
+      store,
+      runtime: {
+        listLabeledResources: async () => [],
+        deleteResource: async () => undefined,
+      },
+      getLinearClient: async () => undefined,
+      pipelineCoordinator: { catalog, runtime, store: pipelines },
+    });
+    seedPipelineTicket();
+    db.prepare(`
+      UPDATE tickets
+      SET control_provider = 'github', external_thread_id = 'owner/repo#12',
+          external_thread_reference = 'GH-12'
+      WHERE ticket_id = 'issue-1'
+    `).run();
+    db.prepare(`
+      UPDATE agent_sessions SET provider_activated_at = ? WHERE id = 'session-1'
+    `).run("2026-08-11T00:00:00Z");
+    store.claimDelivery({
+      deliveryId: "github-failed-issue-admission",
+      source: "github",
+      action: "issues:labeled",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "labeled",
+        repository: { full_name: "owner/repo" },
+        label: { name: "openthrottle" },
+        issue: { number: 12 },
+      }),
+    });
+    store.markDeliveryFailed(
+      "github-failed-issue-admission",
+      "effect failed after admission committed",
+      "2099-01-01T00:00:00.000Z"
+    );
+    store.claimDelivery({
+      deliveryId: "github-comment-after-durable-admission",
+      source: "github",
+      action: "issue_comment:created",
+      eventName: "issue_comment",
+      payload: JSON.stringify({
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 12 },
+        comment: {
+          id: 109,
+          body: "queue this despite the stale failed admission",
+          created_at: "2026-08-11T00:00:01Z",
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-109",
+          user: { login: "operator" },
+        },
+      }),
+    });
+
+    await expect(processor.process("github-comment-after-durable-admission"))
+      .resolves.toBeUndefined();
+    expect(store.getInbox("github-comment:109")).toMatchObject({
+      ticket_id: "issue-1",
+      session_id: "session-1",
+      run_id: null,
+      body: "queue this despite the stale failed admission",
+      status: "pending",
+    });
+    expect(postedBodies).toHaveLength(1);
+    expect(postedBodies[0]).toContain("Captured your message");
+    expect(db.prepare(
+      "SELECT status FROM webhook_deliveries WHERE delivery_id = ?"
+    ).get("github-comment-after-durable-admission")).toEqual({ status: "processed" });
+  });
+
+  it("defers a terminal generation comment only while a successor admission is durable", async () => {
+    const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
+    const catalog = loadPipelineCatalog(
+      fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url)),
+      runtime.descriptor
+    );
+    pipelines.acceptRuntimeDescriptor(runtime);
+    pipelines.acceptCatalog(catalog);
+    const postedBodies: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/collaborators/operator/permission")) {
+        return Response.json({ permission: "triage", role_name: "triage" });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/comments?per_page=100")) {
+        return Response.json([]);
+      }
+      if ((url.endsWith("/repos/owner/repo/issues/12/comments") && method === "POST") ||
+          (url.includes("/repos/owner/repo/issues/comments/") && method === "PATCH")) {
+        const body = (JSON.parse(String(init?.body)) as { body: string }).body;
+        postedBodies.push(body);
+        return Response.json({
+          id: 804,
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-804",
+        });
+      }
+      throw new Error(`unexpected GitHub request ${method} ${url}`);
+    }));
+    const processor = createServerWebhookDeliveryProcessor({
+      cfg,
+      store,
+      runtime: {
+        listLabeledResources: async () => [],
+        deleteResource: async () => undefined,
+      },
+      getLinearClient: async () => undefined,
+      pipelineCoordinator: { catalog, runtime, store: pipelines },
+    });
+    seedPipelineTicket();
+    db.prepare(`
+      UPDATE tickets
+      SET control_provider = 'github', external_thread_id = 'owner/repo#12',
+          external_thread_reference = 'GH-12'
+      WHERE ticket_id = 'issue-1'
+    `).run();
+    db.prepare(`
+      UPDATE agent_sessions SET provider_activated_at = ? WHERE id = 'session-1'
+    `).run("2026-08-11T00:00:00Z");
+    const prior = pipelines.getInstanceForSession("session-1")!;
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'shipped', terminal_outcome = 'shipped'
+      WHERE id = ?
+    `).run(prior.id);
+
+    store.claimDelivery({
+      deliveryId: "github-ordinary-post-terminal-comment",
+      source: "github",
+      action: "issue_comment:created",
+      eventName: "issue_comment",
+      payload: JSON.stringify({
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 12 },
+        comment: {
+          id: 110,
+          body: "ordinary post-terminal comment",
+          created_at: "2026-08-11T00:00:30Z",
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-110",
+          user: { login: "operator" },
+        },
+      }),
+    });
+    await expect(processor.process("github-ordinary-post-terminal-comment"))
+      .resolves.toBeUndefined();
+    expect(store.getInbox("github-comment:110")).toBeUndefined();
+    expect(postedBodies.at(-1)).toContain("does not accept live steering");
+
+    store.claimDelivery({
+      deliveryId: "github-pending-successor-admission",
+      source: "github",
+      action: "issues:reopened",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "reopened",
+        repository: { full_name: "owner/repo" },
+        issue: {
+          number: 12,
+          updated_at: "2026-08-11T00:01:00Z",
+          labels: [{ name: "openthrottle" }],
+        },
+      }),
+    });
+    store.claimDelivery({
+      deliveryId: "github-comment-before-successor-admission",
+      source: "github",
+      action: "issue_comment:created",
+      eventName: "issue_comment",
+      payload: JSON.stringify({
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 12 },
+        comment: {
+          id: 111,
+          body: "carry this into the successor generation",
+          created_at: "2026-08-11T00:01:01Z",
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-111",
+          user: { login: "operator" },
+        },
+      }),
+    });
+
+    await expect(processor.process("github-comment-before-successor-admission"))
+      .rejects.toThrow("Issue admission is still in flight");
+    expect(store.getInbox("github-comment:111")).toBeUndefined();
+    expect(postedBodies).toHaveLength(1);
+
+    seedPipelineTicket("session-2");
+    db.prepare(`
+      UPDATE agent_sessions SET provider_activated_at = ? WHERE id = 'session-2'
+    `).run("2026-08-11T00:01:00Z");
+    store.markDeliveryProcessed("github-pending-successor-admission");
+    db.prepare(`
+      UPDATE webhook_deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z'
+      WHERE delivery_id = 'github-comment-before-successor-admission'
+    `).run();
+
+    await expect(processor.process("github-comment-before-successor-admission"))
+      .resolves.toBeUndefined();
+    expect(store.getByExternalThread("github", "owner/repo#12")?.session_id).toBe("session-2");
+    expect(store.getInbox("github-comment:111")).toMatchObject({
+      ticket_id: "issue-1",
+      session_id: "session-2",
+      run_id: null,
+      body: "carry this into the successor generation",
+      status: "pending",
+    });
+    expect(postedBodies.at(-1)).toContain("Captured your message");
+  });
+
+  it("retries a ticketless comment when the live Issue is labeled before its admission delivery is stored", async () => {
+    const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
+    const catalog = loadPipelineCatalog(
+      fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url)),
+      runtime.descriptor
+    );
+    pipelines.acceptRuntimeDescriptor(runtime);
+    pipelines.acceptCatalog(catalog);
+    const postedBodies: string[] = [];
+    let liveIssueReads = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/collaborators/operator/permission")) {
+        return Response.json({ permission: "triage", role_name: "triage" });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12") && method === "GET") {
+        liveIssueReads += 1;
+        return Response.json({
+          number: 12,
+          title: "Ship it",
+          html_url: "https://github.com/owner/repo/issues/12",
+          state: "open",
+          created_at: "2026-08-11T00:00:00Z",
+          updated_at: "2026-08-11T00:00:00Z",
+          labels: [{ name: "openthrottle" }],
+        });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/comments?per_page=100") && method === "GET") {
+        return Response.json([]);
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/comments") && method === "POST") {
+        const body = (JSON.parse(String(init?.body)) as { body: string }).body;
+        postedBodies.push(body);
+        return Response.json({
+          id: 802,
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-802",
+        });
+      }
+      throw new Error(`unexpected GitHub request ${method} ${url}`);
+    }));
+    const processor = createServerWebhookDeliveryProcessor({
+      cfg,
+      store,
+      runtime: {
+        listLabeledResources: async () => [],
+        deleteResource: async () => undefined,
+      },
+      getLinearClient: async () => undefined,
+      pipelineCoordinator: { catalog, runtime, store: pipelines },
+    });
+    store.claimDelivery({
+      deliveryId: "github-comment-before-admission-delivery",
+      source: "github",
+      action: "issue_comment:created",
+      eventName: "issue_comment",
+      payload: JSON.stringify({
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 12 },
+        comment: {
+          id: 108,
+          body: "retain this reversed delivery too",
+          created_at: "2026-08-11T00:00:01Z",
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-108",
+          user: { login: "operator" },
+        },
+      }),
+    });
+
+    await expect(processor.process("github-comment-before-admission-delivery"))
+      .rejects.toThrow("Issue activation is not durable yet");
+    expect(liveIssueReads).toBe(1);
+    expect(postedBodies).toEqual([]);
+    expect(db.prepare(
+      "SELECT status, attempts FROM webhook_deliveries WHERE delivery_id = ?"
+    ).get("github-comment-before-admission-delivery")).toEqual({ status: "failed", attempts: 1 });
+
+    store.claimDelivery({
+      deliveryId: "github-late-issue-admission",
+      source: "github",
+      action: "issues:labeled",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "labeled",
+        repository: { full_name: "owner/repo" },
+        label: { name: "openthrottle" },
+        issue: { number: 12 },
+      }),
+    });
+    seedPipelineTicket();
+    db.prepare(`
+      UPDATE tickets
+      SET control_provider = 'github', external_thread_id = 'owner/repo#12',
+          external_thread_reference = 'GH-12'
+      WHERE ticket_id = 'issue-1'
+    `).run();
+    db.prepare(`
+      UPDATE agent_sessions SET provider_activated_at = ? WHERE id = 'session-1'
+    `).run("2026-08-11T00:00:00Z");
+    store.markDeliveryProcessed("github-late-issue-admission");
+    db.prepare(`
+      UPDATE webhook_deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z'
+      WHERE delivery_id = 'github-comment-before-admission-delivery'
+    `).run();
+
+    await expect(processor.process("github-comment-before-admission-delivery"))
+      .resolves.toBeUndefined();
+    expect(store.getInbox("github-comment:108")).toMatchObject({
+      ticket_id: "issue-1",
+      session_id: "session-1",
+      run_id: null,
+      body: "retain this reversed delivery too",
+      status: "pending",
+    });
+    expect(postedBodies).toHaveLength(1);
+    expect(postedBodies[0]).toContain("Captured your message");
+    expect(postedBodies[0]).not.toContain("couldn't find an existing workspace");
   });
 
   it("publishes GitHub admission errors on the Issue without entering the Linear outbox", async () => {

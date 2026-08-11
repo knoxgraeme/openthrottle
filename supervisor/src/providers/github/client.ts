@@ -200,7 +200,7 @@ export function classifyGithubIssueComment(
 
 export function githubIssueControlEvent(
   event: GithubIssueControlWebhookEvent,
-  options: { promptContext?: string; sessionId?: string } = {}
+  options: { promptContext?: string; sessionId?: string; providerActivatedAt?: string } = {}
 ): ControlThreadEvent {
   const isIssue = event.kind === "issues";
   const repository = event.repository.full_name;
@@ -214,9 +214,13 @@ export function githubIssueControlEvent(
     isIssue
       ? event.issue.body ?? undefined
       : event.comment.body;
+  const providerActivatedAt = isIssue
+    ? options.providerActivatedAt ?? event.issue.updated_at ?? event.issue.created_at
+    : undefined;
   return {
     provider: "github",
     action: isIssue ? "created" : "prompted",
+    ...(providerActivatedAt ? { providerActivatedAt } : {}),
     promptContext: isIssue ? options.promptContext ?? body : undefined,
     agentSession: {
       id: options.sessionId ?? `github:${threadId}`,
@@ -439,7 +443,11 @@ export async function fetchGithubIssueLifecycle(
   client: GithubClient,
   repo: string,
   issueNumber: number
-): Promise<{ state: "open" | "closed"; updatedAt: string }> {
+): Promise<{
+  state: "open" | "closed";
+  updatedAt: string;
+  labels: Array<{ name: string }>;
+}> {
   const issue = await githubRequest<GithubIssueThread>(client, `/repos/${repo}/issues/${issueNumber}`);
   if (issue.state !== "open" && issue.state !== "closed") {
     throw new Error("GitHub Issue lifecycle lookup returned an invalid state");
@@ -448,7 +456,8 @@ export async function fetchGithubIssueLifecycle(
   if (!updatedAt || Number.isNaN(Date.parse(updatedAt))) {
     throw new Error("GitHub Issue lifecycle lookup returned an invalid timestamp");
   }
-  return { state: issue.state, updatedAt };
+  const labels = Array.isArray(issue.labels) ? issue.labels : issue.labels?.nodes ?? [];
+  return { state: issue.state, updatedAt, labels: labels.map((label) => ({ name: label.name })) };
 }
 
 export async function fetchGithubIssueContext(

@@ -36,6 +36,51 @@ describe("admission store", () => {
     });
   });
 
+  it("persists the provider activation timestamp as the session generation fence", () => {
+    store.upsertUnpinned({
+      ticket_id: "github:owner/repo#1",
+      ticket_reference: "GH-1",
+      session_id: "github:owner/repo#1:initial",
+      control_provider: "github",
+      external_thread_id: "owner/repo#1",
+      external_thread_reference: "GH-1",
+      provider_activated_at: "2026-08-11T00:00:00Z",
+      sandbox_id: null,
+      branch: "ot/gh-1",
+      agent: "codex",
+      repo: "owner/repo",
+      base_branch: "main",
+      pr_url: null,
+      state: "active",
+    });
+
+    expect(store.getCurrentSession("github:owner/repo#1")).toMatchObject({
+      id: "github:owner/repo#1:initial",
+      provider_activated_at: "2026-08-11T00:00:00Z",
+    });
+
+    // A duplicate delivery for the same deterministic session must not move
+    // the generation fence forward and make already-authorized comments stale.
+    store.upsertUnpinned({
+      ticket_id: "github:owner/repo#1",
+      ticket_reference: "GH-1",
+      session_id: "github:owner/repo#1:initial",
+      control_provider: "github",
+      external_thread_id: "owner/repo#1",
+      external_thread_reference: "GH-1",
+      provider_activated_at: "2026-08-11T00:00:05Z",
+      sandbox_id: null,
+      branch: "ot/gh-1",
+      agent: "codex",
+      repo: "owner/repo",
+      base_branch: "main",
+      pr_url: null,
+      state: "active",
+    });
+    expect(store.getCurrentSession("github:owner/repo#1")?.provider_activated_at)
+      .toBe("2026-08-11T00:00:00Z");
+  });
+
   it("routes only through durable repository registrations", () => {
     store.registerRepository({
       linearTeamKey: "ENG",

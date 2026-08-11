@@ -338,7 +338,9 @@ function githubControlEventPredatesCurrentSession(
   const ticket = store.getByExternalThread("github", target.externalThreadId);
   if (!ticket) return false;
   const session = store.getCurrentSession(ticket.ticket_id) ?? store.getSession(ticket.session_id);
-  return session !== undefined && Date.parse(target.timestamp) < Date.parse(session.created_at);
+  const providerActivatedAt = session?.provider_activated_at ?? session?.created_at;
+  return providerActivatedAt !== undefined &&
+    Date.parse(target.timestamp) < Date.parse(providerActivatedAt);
 }
 
 export function createServerWebhookDeliveryProcessor(deps: {

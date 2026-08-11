@@ -766,6 +766,12 @@ SQLite is the authority. Core tables include:
 - operations: `repository_registrations`, `supervisor_leases`, `settings`,
   `schema_migrations`, `migration_reconciliation`.
 
+Each `agent_sessions` generation stores `provider_activated_at`, copied from
+the provider event that activated that generation. Provider event timestamps
+are fenced against this value, preserving the provider's native precision;
+the supervisor's later local `created_at` is not an activation watermark.
+Legacy sessions backfill this field from `created_at` conservatively.
+
 `orchestration_journal` is append-only data capture, keyed by team,
 repository, issue, and recorded time. Supervisor-owned orchestration decisions
 use `actor = 'supervisor'` with null notes; notable agent proposal projections

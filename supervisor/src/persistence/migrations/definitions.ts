@@ -2083,6 +2083,13 @@ const githubWebhookRedeliveryMigrationSource = `${githubWebhookRedeliverySchema}
 github-webhook-redelivery-contract:repository-hook failures are discovered from bounded provider history and each exact delivery receives one leased durable redelivery request/v1
 local-handler-recovery-contract:only dead deliveries from a successfully reconciled repository receive one repository-scoped local replay/v1`;
 
+const providerActivationFenceMigrationSource = `
+ALTER TABLE agent_sessions ADD COLUMN provider_activated_at TEXT;
+UPDATE agent_sessions
+SET provider_activated_at = created_at
+WHERE provider_activated_at IS NULL;
+provider-activation-fence-contract:session generations retain the provider timestamp that activated them; legacy rows conservatively fall back to their local creation timestamp/v1`;
+
 type GithubHeadSource =
   | { kind: "authoritative" }
   | { kind: "sequenced"; source: string; sequence: number };
@@ -3079,6 +3086,22 @@ const definitions: DatabaseMigrationDefinition[] = [
           ""
         ));
       }
+    },
+  },
+  {
+    version: 37,
+    name: "session-provider-activation-fence",
+    source: providerActivationFenceMigrationSource,
+    up(db) {
+      if (!hasTable(db, "agent_sessions")) return;
+      if (!hasColumns(db, "agent_sessions", ["provider_activated_at"])) {
+        db.exec("ALTER TABLE agent_sessions ADD COLUMN provider_activated_at TEXT");
+      }
+      db.exec(`
+        UPDATE agent_sessions
+        SET provider_activated_at = created_at
+        WHERE provider_activated_at IS NULL
+      `);
     },
   },
 ];

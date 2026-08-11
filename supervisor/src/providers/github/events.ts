@@ -8,6 +8,7 @@ import {
   fetchGithubIssueContext,
   fetchGithubIssueLifecycle,
   getRepositoryCollaboratorPermission,
+  githubIssueHasExactControlLabel,
   githubIssueControlEvent,
   githubIssuesEventCarriesExactControlLabel,
   classifyGithubIssueComment,
@@ -243,7 +244,9 @@ function eventPredatesCurrentSession(
 ): boolean {
   if (!providerTimestamp || Number.isNaN(Date.parse(providerTimestamp))) return false;
   const session = store.getCurrentSession(ticket.ticket_id) ?? store.getSession(ticket.session_id);
-  return session !== undefined && Date.parse(providerTimestamp) < Date.parse(session.created_at);
+  const providerActivatedAt = session?.provider_activated_at ?? session?.created_at;
+  return providerActivatedAt !== undefined &&
+    Date.parse(providerTimestamp) < Date.parse(providerActivatedAt);
 }
 
 function lifecycleFromIssueEvent(
@@ -563,17 +566,48 @@ export async function handleGithubEvent(
     }
     if (classifyGithubIssueComment(event) === "plain_issue_comment") {
       if (!control || event.action !== "created") return;
+      const author = event.comment.user?.login;
+      if (!await authorizedGithubControlActor(_cfg, event.repository.full_name, author)) return;
+      const externalThreadId = `${event.repository.full_name}#${event.issue.number}`;
       const existingTicket = store.getByExternalThread(
         "github",
-        `${event.repository.full_name}#${event.issue.number}`
+        externalThreadId
       );
+      const currentPipeline = existingTicket
+        ? pipelines.getInstanceForSession(existingTicket.session_id)
+        : undefined;
+      if (
+        (!existingTicket || !currentPipeline || pipelineIsTerminal(currentPipeline)) &&
+        store.githubIssueAdmissionInFlight(
+          event.repository.full_name,
+          event.issue.number
+        )
+      ) {
+        // Admission fetches and validates provider/repository state before its
+        // ticket transaction. A retained terminal ticket may still be awaiting
+        // a reopened/relabel successor, while a durable nonterminal generation
+        // is already safe to receive the comment immediately.
+        throw new Error("GitHub Issue admission is still in flight");
+      }
+      if (!existingTicket) {
+        const live = await fetchGithubIssueLifecycle(
+          { token: _cfg.githubReadToken },
+          event.repository.full_name,
+          event.issue.number
+        );
+        if (live.state === "open" && githubIssueHasExactControlLabel(live.labels)) {
+          // GitHub does not guarantee webhook delivery order. The activation
+          // webhook may not have been claimed yet even though the provider's
+          // Issue already reflects it. Leave this durable comment retryable so
+          // it cannot acknowledge a missing workspace ahead of admission.
+          throw new Error("GitHub Issue activation is not durable yet");
+        }
+      }
       if (existingTicket && eventPredatesCurrentSession(
         store,
         existingTicket,
         event.comment.created_at
       )) return;
-      const author = event.comment.user?.login;
-      if (!await authorizedGithubControlActor(_cfg, event.repository.full_name, author)) return;
       await handleControlEvent(
         _cfg,
         store,
@@ -669,6 +703,7 @@ export async function handleGithubEvent(
       deliveryId: control.deliveryId,
     });
     if (!sessionId) return;
+    const providerActivatedAt = githubIssueEventTimestamp(event);
     const promptContext = await fetchGithubIssueContext(
       { token: _cfg.githubReadToken },
       event.repository.full_name,
@@ -704,6 +739,7 @@ export async function handleGithubEvent(
       githubIssueControlEvent(event, {
         promptContext,
         sessionId,
+        ...(providerActivatedAt ? { providerActivatedAt } : {}),
       }),
       control.coordinator,
       finalIssuePreflight

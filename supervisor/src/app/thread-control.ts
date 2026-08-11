@@ -104,7 +104,18 @@ export async function handlePrompted(
     await publishMissingPipeline(providers, currentSessionId, ticket.ticket_id);
     return;
   }
-  if (command.kind === "reply" && workId && pipelineInstance.status === "running" && ticket.run_id) {
+  if (
+    command.kind === "reply" &&
+    workId &&
+    ((pipelineInstance.status === "running" && Boolean(ticket.run_id)) ||
+      (payload.provider === "github" &&
+        !ticket.run_id &&
+        ["pending", "dispatchable", "running"].includes(pipelineInstance.status)))
+  ) {
+    // A GitHub comment delivery can be retried immediately after admission,
+    // before the first runtime effect has bound a run. Queue it generation-
+    // scoped with a null run so the steering store binds it to the first live
+    // run instead of dropping it between prompt-context fetch and dispatch.
     store.enqueueInbox({
       id: workId,
       issueId: ticket.ticket_id,

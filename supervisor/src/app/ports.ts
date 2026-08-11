@@ -52,6 +52,7 @@ export interface ControlThread {
 export interface ControlThreadEvent {
   provider: ControlProvider;
   action: "created" | "prompted";
+  providerActivatedAt?: string;
   promptContext?: string;
   agentSession: {
     id: string;

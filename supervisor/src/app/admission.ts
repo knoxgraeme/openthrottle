@@ -579,6 +579,7 @@ export async function handleCreated(
     control_provider: issue.provider,
     external_thread_id: issue.id,
     external_thread_reference: issue.identifier,
+    provider_activated_at: payload.providerActivatedAt,
     sandbox_id: null,
     branch: branchFor(issue.identifier),
     agent: selectedAgent,

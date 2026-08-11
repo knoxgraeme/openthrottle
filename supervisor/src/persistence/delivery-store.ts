@@ -95,6 +95,7 @@ export interface DeliveryStore {
   }): WebhookDelivery | undefined;
   markDeliveryProcessed(deliveryId: string): void;
   markDeliveryFailed(deliveryId: string, error: string, retryAt: string | null): void;
+  githubIssueAdmissionInFlight(repository: string, issueNumber: number): boolean;
   requeueDeadDeliveriesForRedelivery(
     source: WebhookDelivery["source"],
     repository: string,
@@ -175,6 +176,29 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       OR (status = 'processing' AND next_attempt_at <= ?))
     ORDER BY received_at
     LIMIT ?
+  `);
+  const githubIssueAdmissionInFlightStmt = db.prepare(`
+    SELECT 1
+    FROM webhook_deliveries
+    WHERE source = 'github'
+      AND event_name = 'issues'
+      AND status IN ('pending', 'processing', 'failed')
+      AND next_attempt_at IS NOT NULL
+      AND json_valid(payload)
+      AND lower(json_extract(payload, '$.repository.full_name')) = lower(?)
+      AND json_extract(payload, '$.issue.number') = ?
+      AND (
+        (action = 'issues:labeled'
+          AND json_extract(payload, '$.label.name') = 'openthrottle')
+        OR
+        (action IN ('issues:opened', 'issues:reopened')
+          AND EXISTS (
+            SELECT 1
+            FROM json_each(json_extract(payload, '$.issue.labels')) AS label
+            WHERE json_extract(label.value, '$.name') = 'openthrottle'
+          ))
+      )
+    LIMIT 1
   `);
   const listRedeliverableDeliveriesStmt = db.prepare(`
     SELECT delivery_id
@@ -525,6 +549,9 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
         WHERE delivery_id = ?
       `).run(status, nextAttemptAt, errorValue, deliveryId).changes,
       });
+    },
+    githubIssueAdmissionInFlight(repository, issueNumber) {
+      return Boolean(githubIssueAdmissionInFlightStmt.get(repository, issueNumber));
     },
     requeueDeadDeliveriesForRedelivery(source, repository, nowIso, limit) {
       return requeueDeadDeliveriesForRedeliveryTransaction(source, repository, nowIso, limit);

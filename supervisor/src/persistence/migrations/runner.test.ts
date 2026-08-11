@@ -151,6 +151,7 @@ describe("database migrations", () => {
       "8ede2103ae2f761958e4a21fc672b1c7a2a6c8fe39f75109ca3843b2fe492597",
       "0d0aa73d6cbb944697d6815f5bd1c8dd766a919b8692945b905298759dd766a7",
       "be4b0a09caf911013a376efe34aed76843fc89901c59dfe195eda0be4b4a852a",
+      "0550761a59df3d2178bcdfd5113c0d270c35fe090da08fb0f732eccf7d2d2fd3",
     ]);
   });
 
@@ -215,10 +216,53 @@ describe("database migrations", () => {
     `).get()).toEqual({ name: "github_webhook_redelivery_process_idx" });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 36, name: "github-webhook-redelivery-requests" });
+    `).get()).toEqual({ version: 37, name: "session-provider-activation-fence" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
     });
+  });
+
+  it("backfills the provider activation fence when upgrading existing sessions", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      CREATE TABLE agent_sessions (
+        id TEXT PRIMARY KEY,
+        ticket_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        provider_conversation_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        superseded_at TEXT
+      );
+      INSERT INTO agent_sessions (
+        id, ticket_id, generation, state, created_at, updated_at
+      ) VALUES (
+        'session-legacy', 'github:owner/repo#1', 1, 'current',
+        '2026-08-11T00:05:00.987Z', '2026-08-11T00:05:00.987Z'
+      );
+    `);
+    for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 36)) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-08-11T00:05:00.987Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare(`
+      SELECT provider_activated_at FROM agent_sessions WHERE id = 'session-legacy'
+    `).get()).toEqual({ provider_activated_at: "2026-08-11T00:05:00.987Z" });
+    expect(db.prepare(`
+      SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
+    `).get()).toEqual({ version: 37, name: "session-provider-activation-fence" });
   });
 
   it("commits a complete ledger that reopens idempotently from a real SQLite file", () => {
