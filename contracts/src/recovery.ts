@@ -18,6 +18,7 @@ export const EXECUTION_WORK_PRIVATE_ARTIFACT_SCHEMA = "openthrottle.execution-wo
 export const MAX_INLINE_RECOVERY_DIFF_BYTES = 48 * 1024;
 export const MAX_PRIVATE_RECOVERY_DIFF_BYTES = 8 * 1024 * 1024;
 export const MAX_RECOVERY_CHANGED_PATHS = 256;
+export const MAX_RECOVERY_CHANGED_PATHS_CANONICAL_BYTES = 16 * 1024;
 
 interface LoopReceiptRecoveryBase {
   schema: typeof LOOP_RECEIPT_RECOVERY_SCHEMA;
@@ -138,10 +139,13 @@ export function parseLoopReceiptRecoveryContract(
   const changedPaths = unique(arrayAt(
     input.changed_paths,
     `${path}.changed_paths`,
-    (entry, entryPath) => stringAt(entry, entryPath, { max: 4_096 }),
+    // Git's reversible C-style form may expand a legal non-UTF-8 path beyond
+    // 4,096 characters. The aggregate canonical-byte fence is the payload
+    // bound; this per-entry ceiling cannot reject anything that fits it.
+    (entry, entryPath) => stringAt(entry, entryPath, { max: MAX_RECOVERY_CHANGED_PATHS_CANONICAL_BYTES }),
     { max: MAX_RECOVERY_CHANGED_PATHS }
   ), `${path}.changed_paths`);
-  if (Buffer.byteLength(canonicalJson(changedPaths), "utf8") > 16 * 1024) {
+  if (Buffer.byteLength(canonicalJson(changedPaths), "utf8") > MAX_RECOVERY_CHANGED_PATHS_CANONICAL_BYTES) {
     throw new Error(`${path}.changed_paths: exceeds 16 KiB`);
   }
   const changedPathsCount = integerAt(input.changed_paths_count, `${path}.changed_paths_count`, changedPaths.length, 1_000_000);

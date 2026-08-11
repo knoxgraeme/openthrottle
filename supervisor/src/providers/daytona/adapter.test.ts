@@ -653,7 +653,7 @@ describe("Daytona stage execution", () => {
     })).rejects.toThrow(/invalid envelope/);
   });
 
-  it("parses a fenced private recovery artifact from terminal loop results", async () => {
+  it("parses a fenced private recovery artifact with a long reversible path", async () => {
     const remoteFiles = new Map<string, Buffer>();
     const sandbox = {
       id: "provider-opaque-recovery",
@@ -670,6 +670,9 @@ describe("Daytona stage execution", () => {
       snapshot: "snapshot-v1",
       materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
     });
+    const quotedPath = `"${Array.from({ length: 5 }, () => "\\377".repeat(240)).join("/")}"`;
+    const changedPaths = [quotedPath];
+    expect(quotedPath.length).toBeGreaterThan(4_096);
     const recoveryArtifact = canonicalJson({
       schema: "openthrottle.loop-receipt-recovery/v1",
       action_id: "loop-1",
@@ -679,9 +682,9 @@ describe("Daytona stage execution", () => {
       base_commit: "c".repeat(40),
       candidate_commit: null,
       candidate_tree: "e".repeat(40),
-      changed_paths: [],
-      changed_paths_count: 0,
-      changed_paths_sha256: digestNormalized(canonicalJson([])),
+      changed_paths: changedPaths,
+      changed_paths_count: changedPaths.length,
+      changed_paths_sha256: digestNormalized(canonicalJson(changedPaths)),
       changed_paths_truncated: false,
       diff_encoding: "git-diff",
       diff_base64: "",

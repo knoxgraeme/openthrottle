@@ -1774,6 +1774,7 @@ export function executeLoopAction({
   let sanitizeEnv = { ...process.env, ...credentialEnv };
   let result;
   let execution;
+  let requiresWorkspacePreservation = false;
   const persistedCorrectionState = readReceiptCorrectionState(request);
   try {
     const invocation = resolveLoopInvocation(request);
@@ -1996,6 +1997,7 @@ export function executeLoopAction({
           (receiptError ? [receiptError, recoveryReference, diagnosticTail].filter(Boolean).join(" ") : "") ||
           execution.stdout || execution.stderr ||
           (failed ? "loop action failed" : "loop action completed");
+    requiresWorkspacePreservation = recoveryArtifact?.requires_workspace_preservation === true;
     result = {
       version: 1,
       kind: "loop_action_result",
@@ -2003,7 +2005,7 @@ export function executeLoopAction({
       action_id: request.actionId,
       attempt_id: request.attemptId,
       request_hash: request.requestHash,
-      outcome: recoveryArtifact?.requires_workspace_preservation
+      outcome: requiresWorkspacePreservation
         ? "needs_human"
         : retryableInfrastructureFailure || launchFailure?.retryable
         ? "retryable_infrastructure_failure"
@@ -2045,10 +2047,25 @@ export function executeLoopAction({
     }
   }
   if (cleanupErrors.length > 0) {
+    const sanitizedCleanupDiagnostic = sanitizeArtifactText(
+      `loop action cleanup failed: ${cleanupErrors.join("; ")}`,
+      sanitizeEnv,
+    );
+    if (requiresWorkspacePreservation) {
+      const cleanupDiagnostic = sanitizedCleanupDiagnostic.slice(0, 4_000);
+      const receipt = sanitizeArtifactText(result.receipt ?? "", sanitizeEnv);
+      const separator = receipt ? "\n" : "";
+      const availableReceiptChars = Math.max(0, 128_000 - separator.length - cleanupDiagnostic.length);
+      return {
+        ...result,
+        outcome: "needs_human",
+        receipt: `${receipt.slice(0, availableReceiptChars)}${separator}${cleanupDiagnostic}`,
+      };
+    }
     return {
       ...result,
       outcome: "retryable_infrastructure_failure",
-      receipt: sanitizeArtifactText(`loop action cleanup failed: ${cleanupErrors.join("; ")}`, sanitizeEnv).slice(0, 128_000),
+      receipt: sanitizedCleanupDiagnostic.slice(0, 128_000),
     };
   }
   return result;

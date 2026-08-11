@@ -3,6 +3,7 @@ import { canonicalJson, digestNormalized } from "./canonical.js";
 import {
   EXECUTION_WORK_PRIVATE_ARTIFACT_SCHEMA,
   LOOP_RECEIPT_RECOVERY_SCHEMA,
+  MAX_RECOVERY_CHANGED_PATHS_CANONICAL_BYTES,
   parseLoopReceiptRecoveryContract,
 } from "./recovery.js";
 
@@ -36,6 +37,43 @@ describe("loop receipt recovery contract", () => {
     expect(parseLoopReceiptRecoveryContract(value).value).toEqual(value);
     expect(() => parseLoopReceiptRecoveryContract({ ...value, diff_bytes: diff.byteLength + 1 }))
       .toThrow(/byte or digest fence/);
+  });
+
+  it("accepts a reversible Git-quoted path longer than 4,096 characters", () => {
+    const component = "\\377".repeat(240);
+    const quotedPath = `"${Array.from({ length: 5 }, () => component).join("/")}"`;
+    const paths = [quotedPath];
+    const diff = Buffer.from("small patch");
+    const value = {
+      ...base,
+      base_commit: "c".repeat(40),
+      candidate_commit: "d".repeat(40),
+      candidate_tree: "e".repeat(40),
+      changed_paths: paths,
+      changed_paths_count: 1,
+      changed_paths_sha256: digestNormalized(canonicalJson(paths)),
+      changed_paths_truncated: false,
+      diff_encoding: "git-diff",
+      diff_base64: diff.toString("base64"),
+      diff_bytes: diff.byteLength,
+      diff_sha256: digestNormalized(diff),
+      diff_truncated: false,
+    };
+
+    expect(quotedPath.length).toBeGreaterThan(4_096);
+    expect(Buffer.byteLength(canonicalJson(paths), "utf8"))
+      .toBeLessThanOrEqual(MAX_RECOVERY_CHANGED_PATHS_CANONICAL_BYTES);
+    expect(parseLoopReceiptRecoveryContract(value).value).toEqual(value);
+
+    const oversizedPath = `"${Array.from({ length: 14 }, () => component).join("/")}"`;
+    const oversizedPaths = [oversizedPath];
+    expect(Buffer.byteLength(canonicalJson(oversizedPaths), "utf8"))
+      .toBeGreaterThan(MAX_RECOVERY_CHANGED_PATHS_CANONICAL_BYTES);
+    expect(() => parseLoopReceiptRecoveryContract({
+      ...value,
+      changed_paths: oversizedPaths,
+      changed_paths_sha256: digestNormalized(canonicalJson(oversizedPaths)),
+    })).toThrow(/exceeds 16 KiB/);
   });
 
   it("accepts one external payload phase and rejects mixed storage pointers", () => {

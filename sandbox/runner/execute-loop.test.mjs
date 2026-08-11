@@ -3965,6 +3965,57 @@ describe("executeLoopAction", () => {
     });
   });
 
+  it.each([
+    ["worker worktree lock", "lockWorkerWorktree"],
+    ["action directory lock", "lockActionDirectory"],
+    ["integration restore", "restoreIntegration"],
+  ])("keeps preservation-required recovery needs_human when %s cleanup fails", (_label, failingCleanup) => {
+    const valid = withFreshLoopFence(request(), { recoveryBaseSubject: undefined });
+    const worktreeDir = loopWorktreeDirectory(valid);
+    writeFileSync(join(worktreeDir, "only-in-sandbox.txt"), "preserve me\n");
+    const receipt = standardReceipt(valid);
+    const cleanupSecret = "cleanup-secret-value";
+    const cleanups = {
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+    };
+    cleanups[failingCleanup].mockImplementation(() => {
+      throw new Error(`${failingCleanup} failed with ${cleanupSecret} ${"x".repeat(8_000)}`);
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      credentialEnv: { GITHUB_TOKEN: cleanupSecret },
+      runLoopAgent: vi.fn(() => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify({
+          ...receipt,
+          payload: { ...receipt.payload, summary: ["not-authoritative"] },
+        }),
+        stderr: "",
+        nativeSessionId: "native-preservation-cleanup",
+        integrationRepoDir: "/tmp/integration-current",
+      })),
+      ...cleanups,
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(cleanups[failingCleanup]).toHaveBeenCalledOnce();
+    expect(result.outcome).toBe("needs_human");
+    expect(result.receipt).toContain("private_recovery_artifact=");
+    expect(result.receipt).toContain("loop action cleanup failed:");
+    expect(result.receipt).toContain("[REDACTED]");
+    expect(result.receipt).not.toContain(cleanupSecret);
+    expect(result.receipt.length).toBeLessThanOrEqual(128_000);
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+      error: "private recovery has no sealed durable base subject",
+    });
+  });
+
   it("preserves work when a semantic receipt defect cannot be repaired from sealed authority", () => {
     const valid = request();
     const goodReceipt = standardReceipt(valid);
