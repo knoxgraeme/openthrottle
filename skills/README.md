@@ -13,6 +13,8 @@ a separate, upstream-of-delegation surface this split does not change.
 skills/
   planning/<name>/SKILL.md          # planning-time authoring skills
   planning/<name>/agents/openai.yaml
+  operator/openthrottle/SKILL.md    # explicit local operator skill
+  operator/openthrottle/agents/openai.yaml
   tasks/<name>/SKILL.md             # canonical adapter, single source of truth
   tasks/<name>/agents/openai.yaml   # Codex admin-scope policy
   codex/AGENTS-fragment.md          # standing Codex runtime instructions
@@ -132,6 +134,12 @@ Planning skills use the same one-body-per-skill layout, but they are packaged
 for local authoring tools instead of sealed stage execution. A planning skill
 may call local CLI validators; it must not mutate Linear, publish branches, or
 claim runtime gate authority.
+
+The operator skill under `skills/operator/openthrottle/` is also local-only,
+but it is for an interactive human operator rather than plan authoring. It is
+installed by the CLI through pinned Skillfish into detected user-global agent
+skill directories. It must never be copied into `.openthrottle/skills` or
+treated as a sealed Daytona task adapter.
 
 The runtime chooses fresh, read-only fresh, required-resume, or preferred-resume
 context from the pinned manifest. When continuation is allowed, the sealed
