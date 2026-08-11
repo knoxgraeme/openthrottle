@@ -6,6 +6,7 @@ import type { SupervisorStore } from "../../persistence/store.js";
 import {
   getFailingGithubCheckDetails,
   OPENTHROTTLE_COMMENT_MARKER_PREFIX,
+  classifyGithubIssueComment,
   isOpenthrottleBranch,
   type GithubWebhookEvent,
 } from "./client.js";
@@ -412,7 +413,8 @@ export async function handleGithubEvent(
   }
 
   if (event.kind === "issue_comment") {
-    if (event.action !== "created" || !event.issue.pull_request) return;
+    if (classifyGithubIssueComment(event) === "plain_issue_comment") return;
+    if (event.action !== "created") return;
     const ticket = store.getByPrUrl(
       event.repository.full_name,
       `https://github.com/${event.repository.full_name}/pull/${event.issue.number}`
@@ -446,6 +448,10 @@ export async function handleGithubEvent(
       payload: { kind: "issue_comment", head_sha: headSha },
       headSha,
     });
+    return;
+  }
+
+  if (event.kind === "issues") {
     return;
   }
 

@@ -58,7 +58,7 @@ describe("GitHub webhook reconciliation", () => {
 
     expect(store.getRepositoryRegistration("team-1")?.webhook_id).toBe(8);
     expect(logger.warn).toHaveBeenCalledWith(
-      "[github-webhook] reconciled acme/widget hook 8; missing events: pull_request_review, issue_comment, workflow_run, check_suite"
+      "[github-webhook] reconciled acme/widget hook 8; missing events: issues, pull_request_review, issue_comment, workflow_run, check_suite"
     );
     expect(logger.error).not.toHaveBeenCalled();
   });

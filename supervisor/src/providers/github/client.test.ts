@@ -6,11 +6,13 @@ import { considerCiGithubHead } from "./events.js";
 import {
   OPENTHROTTLE_WEBHOOK_EVENTS,
   branchExists,
+  classifyGithubIssueComment,
   getRepositoryConfigAtCommit,
   getRepositoryDirectoryAtCommit,
   getRepositoryFileAtCommit,
   getFailingGithubCheckDetails,
   getMergeReadiness,
+  githubIssueControlEvent,
   isGithubPullRequestUrl,
   isOpenthrottleBranch,
   parseGithubWebhook,
@@ -95,17 +97,112 @@ describe("GitHub contracts", () => {
       },
     });
     expect(parseGithubWebhook("issue_comment", comment).kind).toBe("issue_comment");
+    const plainIssue = JSON.stringify({
+      action: "opened",
+      repository: { full_name: "o/r" },
+      issue: {
+        number: 3,
+        title: "Ship GitHub control",
+        body: "Use the issue as the control thread.",
+        html_url: "https://github.com/o/r/issues/3",
+        user: { login: "operator" },
+        labels: [{ name: "agent:codex" }],
+      },
+    });
+    expect(parseGithubWebhook("issues", plainIssue)).toMatchObject({
+      kind: "issues",
+      issue: { number: 3, title: "Ship GitHub control" },
+    });
+    expect(OPENTHROTTLE_WEBHOOK_EVENTS).toContain("issues");
     expect(() =>
       parseGithubWebhook(
         "issue_comment",
         JSON.stringify({ action: "created", repository: { full_name: "o/r" }, issue: { number: 1 } })
       )
     ).toThrow(/comment/);
-    expect(() => parseGithubWebhook("issues", raw)).toThrow(/Unsupported/);
+    expect(() =>
+      parseGithubWebhook(
+        "issues",
+        JSON.stringify({
+          action: "opened",
+          repository: { full_name: "o/r" },
+          issue: {
+            number: 1,
+            title: "PR-shaped issue",
+            html_url: "https://github.com/o/r/pull/1",
+            pull_request: { url: "https://api.github.com/repos/o/r/pulls/1" },
+          },
+        })
+      )
+    ).toThrow(/pull request/);
     expect(() => parseGithubWebhook("pull_request", "[]")).toThrow(/object/);
     expect(() =>
       parseGithubWebhook("pull_request", JSON.stringify({ action: "closed", repository: { full_name: "o/r" } }))
     ).toThrow(/pull_request/);
+  });
+
+  it("classifies plain Issues separately from PR comments and derives provider-qualified control identity", () => {
+    const issueEvent = parseGithubWebhook("issues", JSON.stringify({
+      action: "opened",
+      repository: { full_name: "owner/repo" },
+      issue: {
+        number: 12,
+        title: "Add issue control",
+        body: "Implement the provider contract.",
+        html_url: "https://github.com/owner/repo/issues/12",
+        labels: [{ name: "implement" }],
+      },
+    }));
+    if (issueEvent.kind !== "issues") throw new Error("expected issues webhook");
+    expect(githubIssueControlEvent(issueEvent)).toMatchObject({
+      provider: "github",
+      action: "created",
+      promptContext: "Implement the provider contract.",
+      agentSession: {
+        id: "github:owner/repo#12",
+        threadId: "owner/repo#12",
+        thread: {
+          id: "owner/repo#12",
+          identifier: "GH-12",
+          provider: "github",
+          route: { key: "owner/repo" },
+        },
+      },
+    });
+
+    const plainComment = parseGithubWebhook("issue_comment", JSON.stringify({
+      action: "created",
+      repository: { full_name: "owner/repo" },
+      issue: { number: 12 },
+      comment: {
+        id: 99,
+        body: "Please continue.",
+        html_url: "https://github.com/owner/repo/issues/12#issuecomment-99",
+      },
+    }));
+    if (plainComment.kind !== "issue_comment") throw new Error("expected issue_comment webhook");
+    expect(classifyGithubIssueComment(plainComment)).toBe("plain_issue_comment");
+    expect(githubIssueControlEvent(plainComment)).toMatchObject({
+      provider: "github",
+      action: "prompted",
+      activity: {
+        id: "github-comment:99",
+        body: "Please continue.",
+      },
+    });
+
+    const pullComment = parseGithubWebhook("issue_comment", JSON.stringify({
+      action: "created",
+      repository: { full_name: "owner/repo" },
+      issue: { number: 7, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/7" } },
+      comment: {
+        id: 100,
+        body: "Repair the PR.",
+        html_url: "https://github.com/owner/repo/pull/7#issuecomment-100",
+      },
+    }));
+    if (pullComment.kind !== "issue_comment") throw new Error("expected issue_comment webhook");
+    expect(classifyGithubIssueComment(pullComment)).toBe("pull_request_comment");
   });
 
   it("recognizes managed branches and strict PR URLs", () => {
@@ -484,13 +581,7 @@ describe("GitHub contracts", () => {
         expect(JSON.parse(String(init.body))).toEqual({
           name: "web",
           active: true,
-          events: [
-            "pull_request",
-            "pull_request_review",
-            "issue_comment",
-            "workflow_run",
-            "check_suite",
-          ],
+          events: OPENTHROTTLE_WEBHOOK_EVENTS,
           config: {
             url: "https://ot.test/webhooks/github",
             content_type: "json",
@@ -583,7 +674,7 @@ describe("GitHub contracts", () => {
       repo: "acme/widget",
       webhookId: 7,
       webhookAction: "updated",
-      missingEvents: ["issue_comment"],
+      missingEvents: ["issues", "issue_comment"],
     });
   });
 
@@ -623,7 +714,7 @@ describe("GitHub contracts", () => {
       repo: "acme/widget",
       webhookId: 8,
       webhookAction: "updated",
-      missingEvents: ["pull_request_review", "issue_comment", "workflow_run", "check_suite"],
+      missingEvents: ["issues", "pull_request_review", "issue_comment", "workflow_run", "check_suite"],
     });
   });
 

@@ -283,6 +283,12 @@ export function createAdmissionStore(
       return registerRepositoryTransaction(input);
     },
     getRepositoryRegistration(teamId, teamKey, controlProvider = "linear") {
+      if (controlProvider === "github") {
+        const repo = teamKey ?? teamId;
+        if (!repo) return undefined;
+        const byRepo = getRepositoryByRepoStmt.get(repo) as RepositoryRegistration | undefined;
+        return byRepo?.control_provider === "github" ? byRepo : undefined;
+      }
       if (teamId) {
         const byId = getRepositoryByTeamIdStmt.get(teamId) as RepositoryRegistration | undefined;
         if (byId?.control_provider === controlProvider) return byId;

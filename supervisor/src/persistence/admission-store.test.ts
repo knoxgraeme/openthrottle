@@ -97,6 +97,23 @@ describe("admission store", () => {
     expect(store.getRepositoryRegistration("team-1", undefined, "github")).toBeUndefined();
   });
 
+  it("resolves GitHub-control repository registrations by provider route repository", () => {
+    store.registerRepository({
+      controlProvider: "github",
+      githubRepo: "acme/widget",
+      baseBranch: "main",
+      webhookId: 43,
+      snapshot: "openthrottle",
+    });
+
+    expect(store.getRepositoryRegistration(undefined, "ACME/WIDGET", "github")).toMatchObject({
+      control_provider: "github",
+      github_repo: "acme/widget",
+      base_branch: "main",
+    });
+    expect(store.getRepositoryRegistration(undefined, "ACME/WIDGET", "linear")).toBeUndefined();
+  });
+
   it("rejects moving a Linear route to another repository", () => {
     store.registerRepository({
       linearTeamKey: "ENG",

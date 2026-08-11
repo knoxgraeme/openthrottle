@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import type { ControlThreadEvent } from "../../app/ports.js";
 
 const HTTP_TIMEOUT_MS = 15_000;
 const GITHUB_PULL_REQUEST_URL_PATTERN =
@@ -79,6 +80,21 @@ interface GithubCheckSuiteEvent extends GithubEventBase {
   };
 }
 
+interface GithubIssueThread {
+  number: number;
+  title: string;
+  html_url: string;
+  body?: string | null;
+  user?: { login: string };
+  labels?: Array<{ id?: string; name: string }> | { nodes?: Array<{ name: string }> };
+}
+
+interface GithubIssuesEvent extends GithubEventBase {
+  kind: "issues";
+  action: string;
+  issue: GithubIssueThread;
+}
+
 export interface GithubIssueCommentEvent extends GithubEventBase {
   kind: "issue_comment";
   action: string;
@@ -97,6 +113,7 @@ export interface GithubIssueCommentEvent extends GithubEventBase {
 export type GithubWebhookEvent =
   | GithubPullRequestEvent
   | GithubReviewEvent
+  | GithubIssuesEvent
   | GithubIssueCommentEvent
   | GithubWorkflowRunEvent
   | GithubCheckSuiteEvent;
@@ -150,6 +167,7 @@ function validatePullRequestEvent(payload: Record<string, unknown>): void {
 }
 
 const OPENTHROTTLE_WEBHOOK_EVENTS = [
+  "issues",
   "pull_request",
   "pull_request_review",
   "issue_comment",
@@ -158,6 +176,57 @@ const OPENTHROTTLE_WEBHOOK_EVENTS = [
 ] as const;
 
 export { OPENTHROTTLE_WEBHOOK_EVENTS };
+
+export type GithubIssueCommentClassification = "pull_request_comment" | "plain_issue_comment";
+export type GithubIssueControlWebhookEvent = GithubIssuesEvent | GithubIssueCommentEvent;
+
+export function classifyGithubIssueComment(
+  event: GithubIssueCommentEvent
+): GithubIssueCommentClassification {
+  return event.issue.pull_request ? "pull_request_comment" : "plain_issue_comment";
+}
+
+export function githubIssueControlEvent(event: GithubIssueControlWebhookEvent): ControlThreadEvent {
+  const isIssue = event.kind === "issues";
+  const repository = event.repository.full_name;
+  const issueNumber = event.issue.number;
+  const threadId = `${repository}#${issueNumber}`;
+  const htmlUrl =
+    "html_url" in event.issue && typeof event.issue.html_url === "string"
+      ? event.issue.html_url
+      : `https://github.com/${repository}/issues/${issueNumber}`;
+  const body =
+    isIssue
+      ? event.issue.body ?? undefined
+      : event.comment.body;
+  return {
+    provider: "github",
+    action: isIssue ? "created" : "prompted",
+    promptContext: isIssue ? body : undefined,
+    agentSession: {
+      id: `github:${threadId}`,
+      threadId,
+      thread: {
+        id: threadId,
+        identifier: `GH-${issueNumber}`,
+        provider: "github",
+        route: { key: repository },
+        labels: isIssue ? event.issue.labels : undefined,
+      },
+    },
+    activity: event.kind === "issue_comment"
+      ? {
+          id: `github-comment:${event.comment.id}`,
+          content: { type: "text", body: body ?? "" },
+          body: body ?? "",
+        }
+      : {
+          id: `github-issue:${threadId}`,
+          content: { type: "text", body: body ?? "" },
+          body: htmlUrl,
+        },
+  };
+}
 
 export function parseGithubWebhook(eventName: string | undefined, raw: string): GithubWebhookEvent {
   const payload = parseObject(raw);
@@ -172,7 +241,15 @@ export function parseGithubWebhook(eventName: string | undefined, raw: string): 
   } else if (eventName === "pull_request_review") {
     validatePullRequestShape(payload);
   }
-  if (eventName === "pull_request_review") {
+  if (eventName === "issues") {
+    const issue = recordField(payload, "issue");
+    numberField(issue, "number");
+    stringField(issue, "title");
+    stringField(issue, "html_url");
+    if (issue.pull_request !== undefined) {
+      throw new Error("GitHub issues webhook unexpectedly references a pull request");
+    }
+  } else if (eventName === "pull_request_review") {
     const review = recordField(payload, "review");
     numberField(review, "id");
     stringField(review, "state");
