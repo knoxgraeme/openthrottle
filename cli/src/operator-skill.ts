@@ -616,6 +616,10 @@ export function runOperatorSkillAction(
   const listed = runSkillfishJson(["list", "--global"], options);
   if (!ensureSuccessfulSkillfish(listed.json, listed.raw, result, SUPPORTED_AGENTS)) return result;
   const { detected, installs } = classifyCurrentInstalls(listed.json, result, sourceDigest, realHome);
+  if (action === "install" && detected.length === 0) {
+    result.success = false;
+    return result;
+  }
 
   if (action === "status") {
     for (const agent of detected) {
