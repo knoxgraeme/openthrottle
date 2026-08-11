@@ -69,6 +69,43 @@ describe("serializeRuntimeObservationError", () => {
     expect(result.text).not.toContain("secret-token");
   });
 
+  it("retains bounded message head and tail diagnostics", () => {
+    const result = serializeRuntimeObservationError("FileSystem.listFiles", new Error(
+      `provider request failed ${"x".repeat(2_000)} Total memory limit exceeded`
+    ));
+
+    expect(result.message.length).toBeLessThanOrEqual(500);
+    expect(result.message).toContain("provider request failed");
+    expect(result.message).toContain("...[truncated]...");
+    expect(result.message).toContain("Total memory limit exceeded");
+    expect(result.text.length).toBeLessThanOrEqual(1_500);
+  });
+
+  it("classifies a retryable marker in the truncated diagnostic midpoint", () => {
+    const result = serializeRuntimeObservationError("FileSystem.listFiles", new Error(
+      `${"x".repeat(300)} timeout ${"y".repeat(2_000)}`
+    ));
+
+    expect(result.retryable).toBe(true);
+    expect(result.message).toContain("...[truncated]...");
+    expect(result.message).not.toContain("timeout");
+    expect(result.message.length).toBeLessThanOrEqual(500);
+  });
+
+  it("classifies and retains a retryable marker at the tail of a nested safe cause", () => {
+    const result = serializeRuntimeObservationError("FileSystem.listFiles", {
+      message: "provider request failed",
+      cause: { message: `${"x".repeat(2_000)} socket hang up` },
+      body: "unsafe provider body",
+    });
+
+    expect(result.retryable).toBe(true);
+    expect(result.cause).toContain("...[truncated]...");
+    expect(result.cause).toContain("socket hang up");
+    expect(result.cause!.length).toBeLessThanOrEqual(500);
+    expect(result.text).not.toContain("unsafe provider body");
+  });
+
   it("classifies nested network causes as retryable without a status code", () => {
     const result = serializeRuntimeObservationError("FileSystem.listFiles", {
       message: "request failed",

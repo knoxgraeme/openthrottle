@@ -2,6 +2,7 @@ import { sanitizeText } from "../shared/sanitize.js";
 
 const MAX_FIELD_CHARS = 500;
 const MAX_SERIALIZED_CHARS = 1_500;
+const TRUNCATION_MARKER = "...[truncated]...";
 const RETRYABLE_ERROR_CODES = new Set([
   "ECONNRESET",
   "ECONNREFUSED",
@@ -28,15 +29,22 @@ export interface SerializedRuntimeObservationError {
   text: string;
 }
 
-function boundedText(value: unknown): string {
+function boundedHeadAndTail(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const retained = limit - TRUNCATION_MARKER.length;
+  const headLength = Math.ceil(retained / 2);
+  const tailLength = retained - headLength;
+  return `${text.slice(0, headLength)}${TRUNCATION_MARKER}${text.slice(-tailLength)}`;
+}
+
+function safeText(value: unknown): string {
   let text: string;
   if (typeof value === "string") text = value;
   else if (value instanceof Error) text = value.message;
   else if (Array.isArray(value)) text = "array error";
   else if (value && typeof value === "object") text = "object error";
   else text = String(value);
-  const sanitized = sanitizeText(text || "unknown error");
-  return sanitized.slice(0, MAX_FIELD_CHARS);
+  return sanitizeText(text || "unknown error");
 }
 
 function candidateStatus(value: unknown, seen = new Set<unknown>()): number | null {
@@ -60,14 +68,14 @@ function candidateStatus(value: unknown, seen = new Set<unknown>()): number | nu
 }
 
 function candidateMessage(value: unknown): string {
-  if (value instanceof Error) return boundedText(value.message || value.name);
+  if (value instanceof Error) return safeText(value.message || value.name);
   if (value && typeof value === "object") {
     const record = value as Record<string, unknown>;
     for (const key of ["message", "text", "name"]) {
-      if (typeof record[key] === "string" && record[key].trim()) return boundedText(record[key]);
+      if (typeof record[key] === "string" && record[key].trim()) return safeText(record[key]);
     }
   }
-  return boundedText(value);
+  return safeText(value);
 }
 
 function candidateCause(value: unknown): string | null {
@@ -85,20 +93,49 @@ function hasRetryableCode(value: unknown, seen = new Set<unknown>()): boolean {
   return hasRetryableCode(record.cause, seen) || hasRetryableCode(record.error, seen);
 }
 
+function safeObservationFields(error: unknown): { message: string; cause: string | null } {
+  return {
+    message: candidateMessage(error),
+    cause: candidateCause(error),
+  };
+}
+
+function patternMatches(pattern: RegExp, text: string): boolean {
+  pattern.lastIndex = 0;
+  const matches = pattern.test(text);
+  pattern.lastIndex = 0;
+  return matches;
+}
+
+/**
+ * Matches only the complete sanitized provider message/cause fields that are
+ * safe to diagnose. Raw bodies and arbitrary object fields are never read.
+ */
+export function runtimeObservationErrorMatches(
+  error: unknown,
+  patterns: readonly RegExp[]
+): boolean {
+  const { message, cause } = safeObservationFields(error);
+  return patterns.some((pattern) =>
+    patternMatches(pattern, message) || patternMatches(pattern, cause ?? "")
+  );
+}
+
 export function serializeRuntimeObservationError(
   operation: string,
   error: unknown
 ): SerializedRuntimeObservationError {
   const statusCode = candidateStatus(error);
-  const message = candidateMessage(error);
-  const cause = candidateCause(error);
+  const safe = safeObservationFields(error);
   const retryable = statusCode !== null
     ? statusCode >= 500 || RETRYABLE_HTTP_STATUS_CODES.has(statusCode)
     : (error instanceof Error && /\bretryable=true\b/.test(error.message)) ||
       hasRetryableCode(error) ||
       RETRYABLE_MESSAGE_PATTERNS.some((pattern) =>
-        pattern.test(message) || pattern.test(cause ?? "")
-    );
+        patternMatches(pattern, safe.message) || patternMatches(pattern, safe.cause ?? "")
+      );
+  const message = boundedHeadAndTail(safe.message, MAX_FIELD_CHARS);
+  const cause = safe.cause === null ? null : boundedHeadAndTail(safe.cause, MAX_FIELD_CHARS);
   const parts = [
     `operation=${sanitizeText(operation).slice(0, 120)}`,
     `retryable=${retryable ? "true" : "false"}`,
@@ -112,6 +149,6 @@ export function serializeRuntimeObservationError(
     statusCode,
     message,
     cause,
-    text: parts.join(" ").slice(0, MAX_SERIALIZED_CHARS),
+    text: boundedHeadAndTail(parts.join(" "), MAX_SERIALIZED_CHARS),
   };
 }

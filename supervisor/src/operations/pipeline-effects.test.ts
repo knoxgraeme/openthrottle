@@ -2904,6 +2904,41 @@ describe("pipeline effect processor", () => {
       .toContain("Write access to repository not granted");
   });
 
+  it("classifies an auth marker retained at the tail of a long provider error", async () => {
+    const { pipelines, runtime, processor, instance } = harness("issue-auth-tail", "session-auth-tail");
+    runtime.provision.mockRejectedValue(new Error(
+      `provider request failed ${"x".repeat(2_000)} GitHub API 403: Write access to repository not granted`
+    ));
+    const provision = pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision")!;
+
+    await processor.drain();
+
+    expect(runtime.provision).toHaveBeenCalledTimes(1);
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === provision.id)).toMatchObject({
+      status: "dead",
+      attempts: 1,
+      last_error: expect.stringContaining("Write access to repository not granted"),
+    });
+  });
+
+  it("classifies an auth marker in the truncated diagnostic midpoint", async () => {
+    const { pipelines, runtime, processor, instance } = harness("issue-auth-midpoint", "session-auth-midpoint");
+    runtime.provision.mockRejectedValue(new Error(
+      `${"x".repeat(300)} GitHub API 403: Write access to repository not granted ${"y".repeat(2_000)}`
+    ));
+    const provision = pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision")!;
+
+    await processor.drain();
+
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === provision.id)).toMatchObject({
+      status: "dead",
+      attempts: 1,
+      last_error: expect.stringContaining("...[truncated]..."),
+    });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === provision.id)?.last_error)
+      .not.toContain("Write access to repository not granted");
+  });
+
   it("retries a capacity-exhausted provision on a patient fixed interval", async () => {
     const { pipelines, runtime, processor, instance } = harness("issue-capacity", "session-capacity");
     runtime.provision.mockRejectedValue(new Error("Total memory limit exceeded"));
@@ -2940,6 +2975,24 @@ describe("pipeline effect processor", () => {
     expect(payload.activity.body).toContain("waiting on sandbox capacity");
     expect(payload.activity.body).toContain("Total memory limit exceeded");
     expect(payload.activity.body).toContain("retry automatically");
+  });
+
+  it("classifies a capacity marker retained at the tail of a long provider error", async () => {
+    const { pipelines, runtime, processor, instance } = harness("issue-capacity-tail", "session-capacity-tail");
+    runtime.provision.mockRejectedValue(new Error(
+      `HTTP 403 provider request failed ${"x".repeat(2_000)} Total memory limit exceeded`
+    ));
+    const provision = pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision")!;
+
+    await processor.drain();
+
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === provision.id)).toMatchObject({
+      status: "failed",
+      attempts: 1,
+      next_attempt_at: "2099-07-22T12:05:00.000Z",
+      last_error: expect.stringContaining("Total memory limit exceeded"),
+    });
+    expect(pipelines.getInstance(instance.id)).toMatchObject({ terminal_outcome: null });
   });
 
   it("classifies an HTTP-403-wrapped quota error as capacity, not auth", async () => {
