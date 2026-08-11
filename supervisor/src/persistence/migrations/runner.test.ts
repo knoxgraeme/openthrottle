@@ -15,6 +15,8 @@ import { createExecutionUnitStore } from "../pipeline/unit-store.js";
 import { GATE_RECEIPT_REASONS } from "../../pipeline/gates.js";
 import { FAULT_ATTRIBUTIONS } from "../../pipeline/fault-attribution.js";
 import { ENGINES } from "../pipeline/run-outcome-store.js";
+import { createSettingsStore } from "../settings-store.js";
+import { considerCiGithubHead } from "../../providers/github/events.js";
 import { applyDatabaseMigrations, databaseMigrations } from "./runner.js";
 
 let db: Database.Database | undefined;
@@ -145,7 +147,7 @@ describe("database migrations", () => {
       "e1f1cc26fcd21df5ca8cb56548d2d38f90311d40d93bcd0e54d4ab62f9eb6ad4",
       "36f3c74ad261f3e4e9e5014221e5ff8510dc7123b03ab92f2875b02ab0cf4fb2",
       "8ede2103ae2f761958e4a21fc672b1c7a2a6c8fe39f75109ca3843b2fe492597",
-      "f1bdb3c566c1c190d679eede3ce2300855b654fe90dc303d5d18a7f91a762114",
+      "fef0599d2fdfbfcd88d369e4e91bee846225d6db934e862020859a3b4e75f521",
     ]);
   });
 
@@ -276,6 +278,106 @@ describe("database migrations", () => {
     expect(db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'linear_outbox'"
     ).get()).toBeUndefined();
+  });
+
+  it("rekeys the complete GitHub head fence without losing canonical or newer state", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE tickets (
+        linear_issue_id TEXT PRIMARY KEY,
+        linear_issue_identifier TEXT NOT NULL,
+        linear_session_id TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id,
+        branch, agent, repo, created_at, updated_at
+      ) VALUES
+        ('issue-authoritative', 'OT-1', 'session-1', 'ot/ot-1', 'codex', 'owner/repo', '2026-01-01', '2026-01-01'),
+        ('issue-sequenced', 'OT-2', 'session-2', 'ot/ot-2', 'codex', 'owner/repo', '2026-01-01', '2026-01-01'),
+        ('issue-simple', 'OT-3', 'session-3', 'ot/ot-3', 'codex', 'owner/repo', '2026-01-01', '2026-01-01');
+    `);
+    const insertSetting = db.prepare("INSERT INTO settings(key, value) VALUES (?, ?)");
+    for (const [key, value] of [
+      ["github-head:issue-authoritative", "authoritative-head"],
+      ["github-head-source:issue-authoritative", "authoritative"],
+      ["github-head-watermark:issue-authoritative:workflow_run", "41"],
+      ["github-head:linear:issue-authoritative", "ci-head"],
+      ["github-head-source:linear:issue-authoritative", JSON.stringify({ source: "workflow_run", sequence: 50 })],
+      ["github-head-watermark:linear:issue-authoritative:workflow_run", "50"],
+      ["github-head:issue-sequenced", "newer-head"],
+      ["github-head-source:issue-sequenced", JSON.stringify({ source: "check_suite", sequence: 20 })],
+      ["github-head-watermark:issue-sequenced:check_suite", "20"],
+      ["github-head-watermark:issue-sequenced:deployment_status", "8"],
+      ["github-head:linear:issue-sequenced", "older-head"],
+      ["github-head-source:linear:issue-sequenced", JSON.stringify({ source: "check_suite", sequence: 10 })],
+      ["github-head-watermark:linear:issue-sequenced:check_suite", "10"],
+      ["github-head-watermark:linear:issue-sequenced:deployment_status", "12"],
+      ["github-head:issue-simple", "simple-head"],
+      ["github-head-source:issue-simple", JSON.stringify({ source: "workflow_run", sequence: 7 })],
+      ["github-head-watermark:issue-simple:workflow_run", "7"],
+    ] as const) {
+      insertSetting.run(key, value);
+    }
+
+    const migration = databaseMigrations.find((candidate) => candidate.version === 35)!;
+    migration.up(db);
+
+    const settings = createSettingsStore(db);
+    expect(settings.getSetting("github-head:linear:issue-authoritative")).toBe("authoritative-head");
+    expect(settings.getSetting("github-head-source:linear:issue-authoritative")).toBe("authoritative");
+    expect(settings.getSetting("github-head-watermark:linear:issue-authoritative:workflow_run")).toBe("50");
+    expect(settings.getSetting("github-head:linear:issue-sequenced")).toBe("newer-head");
+    expect(settings.getSetting("github-head-source:linear:issue-sequenced")).toBe(
+      JSON.stringify({ source: "check_suite", sequence: 20 })
+    );
+    expect(settings.getSetting("github-head-watermark:linear:issue-sequenced:check_suite")).toBe("20");
+    expect(settings.getSetting("github-head-watermark:linear:issue-sequenced:deployment_status")).toBe("12");
+    expect(settings.getSetting("github-head:linear:issue-simple")).toBe("simple-head");
+    expect(settings.getSetting("github-head-source:linear:issue-simple")).toBe(
+      JSON.stringify({ source: "workflow_run", sequence: 7 })
+    );
+    expect(settings.getSetting("github-head-watermark:linear:issue-simple:workflow_run")).toBe("7");
+    expect(db.prepare(`
+      SELECT key FROM settings
+      WHERE key LIKE 'github-head:%' AND key NOT LIKE 'github-head:linear:%'
+         OR key LIKE 'github-head-source:%' AND key NOT LIKE 'github-head-source:linear:%'
+         OR key LIKE 'github-head-watermark:%' AND key NOT LIKE 'github-head-watermark:linear:%'
+    `).all()).toEqual([]);
+
+    considerCiGithubHead(
+      settings as Parameters<typeof considerCiGithubHead>[0],
+      "linear:issue-authoritative",
+      "delayed-ci-head",
+      "workflow_run",
+      999
+    );
+    expect(settings.getSetting("github-head:linear:issue-authoritative")).toBe("authoritative-head");
+    considerCiGithubHead(
+      settings as Parameters<typeof considerCiGithubHead>[0],
+      "linear:issue-sequenced",
+      "stale-head",
+      "check_suite",
+      19
+    );
+    expect(settings.getSetting("github-head:linear:issue-sequenced")).toBe("newer-head");
+    considerCiGithubHead(
+      settings as Parameters<typeof considerCiGithubHead>[0],
+      "linear:issue-sequenced",
+      "fresh-head",
+      "check_suite",
+      21
+    );
+    expect(settings.getSetting("github-head:linear:issue-sequenced")).toBe("fresh-head");
+
+    const once = db.prepare("SELECT key, value FROM settings ORDER BY key").all();
+    migration.up(db);
+    expect(db.prepare("SELECT key, value FROM settings ORDER BY key").all()).toEqual(once);
   });
 
   it("migrates repository registrations to provider-qualified repo authority", () => {
