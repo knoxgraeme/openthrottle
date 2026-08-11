@@ -2054,7 +2054,7 @@ backfill-contract:legacy publish_linear effects and linear_ledger receipts are r
 
 const neutralControlIdentifierMigrationSource = `
 rename live control-plane ticket/session/context identifiers from Linear-shaped storage names to provider-neutral storage names
-tables: tickets,runs,agent_sessions,control_outbox,session_inbox,pipeline_instances,work_items,work_deliveries,provider_events,feedback_snapshots,session_executions,run_outcomes,execution_publication_events
+tables: tickets,runs,agent_sessions,control_outbox,session_inbox,session_work,pipeline_instances,work_items,work_deliveries,provider_events,feedback_snapshots,session_executions,run_outcomes,execution_publication_events
 backfill-contract:existing rows are retained in place, provider identity remains linear, external thread ids retain the old Linear issue id, internal ticket ids become linear-prefixed, and foreign keys must remain valid/v4
 github-head-fence-contract:head, source, and every per-source watermark move together; authoritative state wins, same-source higher sequence wins, and watermark collisions retain the highest sequence/v1
 journal-identity-contract:legacy display references are rekeyed through their exact instance and run ticket fences, with a unique ticket-reference fallback and fail-closed ambiguity handling/v1`;
@@ -2291,6 +2291,9 @@ function migrateNeutralControlIdentifiers(db: Database.Database): void {
   renameColumnIfPresent(db, "session_inbox", "linear_issue_id", "ticket_id");
   renameColumnIfPresent(db, "session_inbox", "linear_session_id", "session_id");
 
+  renameColumnIfPresent(db, "session_work", "linear_issue_id", "ticket_id");
+  renameColumnIfPresent(db, "session_work", "linear_session_id", "session_id");
+
   renameColumnIfPresent(db, "pipeline_instances", "linear_issue_id", "ticket_id");
   renameColumnIfPresent(db, "pipeline_instances", "linear_session_id", "session_id");
 
@@ -2337,6 +2340,7 @@ function migrateNeutralControlIdentifiers(db: Database.Database): void {
       "agent_sessions",
       "control_outbox",
       "session_inbox",
+      "session_work",
       "pipeline_instances",
       "work_items",
       "work_deliveries",
