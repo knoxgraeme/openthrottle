@@ -25,6 +25,10 @@ describe("bounded Linear admission context", () => {
       `<title>Accept dotted review heartbeat ids</title>`,
       `<description>Ship this prerequisite through the simple pipeline.\n${simpleSelection}</description>`,
       `</sub-issue>`,
+      `<sub-issue identifier="OPE-148">`,
+      `<title>Keep sibling metadata non-authoritative</title>`,
+      `<description>Another completed prerequisite.</description>`,
+      `</sub-issue>`,
       `</sub-issues>`,
       `</issue>`,
       `<primary-directive-thread comment-id="retry">`,
@@ -43,9 +47,11 @@ describe("bounded Linear admission context", () => {
     expect(result.selectionContext).toContain('"graph_id": "structured"');
     expect(result.selectionContext).toContain("Retry OPE-115 from current main with Codex.");
     expect(result.selectionContext).not.toContain("OPE-147");
+    expect(result.selectionContext).not.toContain("OPE-148");
     expect(result.selectionContext).not.toContain('"graph_id": "simple"');
     expect(result.context).toContain('"graph_id": "structured"');
     expect(result.context).not.toContain("OPE-147");
+    expect(result.context).not.toContain("OPE-148");
     expect(result.context).not.toContain('"graph_id": "simple"');
     expect(result.selectionContext.match(/```json openthrottle\.ship-selection\/v1/g)).toHaveLength(1);
   });
@@ -88,6 +94,31 @@ describe("bounded Linear admission context", () => {
       droppedParentSections: 0,
       summarizedParentSections: 0,
     });
+  });
+
+  it("accepts repeated direct sub-issue metadata in the bounded parent summary", () => {
+    const context = [
+      `<issue identifier="OPE-139"><description>current child</description></issue>`,
+      `<primary-directive-thread><comment>current directive</comment></primary-directive-thread>`,
+      `<parent-issue identifier="OPE-100">`,
+      `<title>Parent tracker</title>`,
+      `<description>bounded parent context</description>`,
+      `<sub-issue identifier="OPE-101">first sibling</sub-issue>`,
+      `<sub-issue identifier="OPE-102">second sibling</sub-issue>`,
+      `</parent-issue>`,
+    ].join("\n");
+
+    const result = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "OPE-139",
+    });
+
+    expect(result.selectionError).toBeUndefined();
+    expect(result.selectionContext).not.toContain("OPE-101");
+    expect(result.selectionContext).not.toContain("OPE-102");
+    expect(result.context).toContain("bounded parent context");
+    expect(result.context).not.toContain("OPE-101");
+    expect(result.context).not.toContain("OPE-102");
   });
 
   it.each(["issue", "parent-issue", "other-thread"] as const)(
@@ -168,6 +199,56 @@ describe("bounded Linear admission context", () => {
     [
       "unclosed required issue",
       `<issue identifier="OPE-139"><description>unclosed child</description>`,
+    ],
+    [
+      "top-level sub-issues wrapper",
+      [
+        `<sub-issues></sub-issues>`,
+        `<issue identifier="OPE-139"><description>current child</description></issue>`,
+      ].join("\n"),
+    ],
+    [
+      "top-level sub-issue item",
+      [
+        `<sub-issue identifier="OPE-OLD"></sub-issue>`,
+        `<issue identifier="OPE-139"><description>current child</description></issue>`,
+      ].join("\n"),
+    ],
+    [
+      "direct unwrapped sub-issue item",
+      [
+        `<issue identifier="OPE-139">`,
+        `<description>current child</description>`,
+        `<sub-issue identifier="OPE-OLD"><description>stale child</description></sub-issue>`,
+        `</issue>`,
+      ].join("\n"),
+    ],
+    [
+      "recursive sub-issues wrapper",
+      [
+        `<issue identifier="OPE-139">`,
+        `<description>current child</description>`,
+        `<sub-issues><sub-issues><sub-issue identifier="OPE-OLD">stale child</sub-issue></sub-issues></sub-issues>`,
+        `</issue>`,
+      ].join("\n"),
+    ],
+    [
+      "unclosed nested sub-issues wrapper",
+      [
+        `<issue identifier="OPE-139">`,
+        `<description>current child</description>`,
+        `<sub-issues><sub-issue identifier="OPE-OLD">stale child</sub-issue>`,
+        `</issue>`,
+      ].join("\n"),
+    ],
+    [
+      "mismatched nested sub-issue delimiter",
+      [
+        `<issue identifier="OPE-139">`,
+        `<description>current child</description>`,
+        `<sub-issues><sub-issue identifier="OPE-OLD">stale child</sub-issues></sub-issue>`,
+        `</issue>`,
+      ].join("\n"),
     ],
   ])("rejects %s context", (_name, context) => {
     const result = composeBoundedTaskContext(context, {

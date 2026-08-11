@@ -83,6 +83,20 @@ function isContextSectionKind(kind: LinearContextElementKind): kind is ContextSe
   return LINEAR_CONTEXT_SECTION_KIND_SET.has(kind);
 }
 
+function hasValidElementParent(
+  stack: ReadonlyArray<{ kind: LinearContextElementKind }>,
+  kind: LinearContextElementKind
+): boolean {
+  const parent = stack.at(-1)?.kind;
+  if (kind === "sub-issues") {
+    return parent !== undefined && isContextSectionKind(parent);
+  }
+  if (kind === "sub-issue") {
+    return parent === "sub-issues" || parent === "parent-issue";
+  }
+  return parent !== "sub-issues" && parent !== "sub-issue";
+}
+
 function linearContextSections(context: string): ParsedLinearContextSections {
   const tokenPattern = new RegExp(
     `</?(${LINEAR_CONTEXT_ELEMENT_KINDS.join("|")})\\b[^>]*>`,
@@ -99,6 +113,9 @@ function linearContextSections(context: string): ParsedLinearContextSections {
     const kind = match[1]!.toLowerCase() as LinearContextElementKind;
     const closing = raw.startsWith("</");
     if (!closing) {
+      if (!hasValidElementParent(stack, kind)) {
+        return { sections, error: invalidLinearContextShapeMessage() };
+      }
       stack.push({ kind, start: match.index!, nestedSpans: [] });
       continue;
     }
@@ -110,7 +127,7 @@ function linearContextSections(context: string): ParsedLinearContextSections {
     const end = match.index! + raw.length;
     if (stack.length === 1) {
       const root = stack[0]!;
-      if (root.nestedSpans.some((span) => span.kind === open.kind)) {
+      if (open.kind !== "sub-issue" && root.nestedSpans.some((span) => span.kind === open.kind)) {
         return { sections, error: invalidLinearContextShapeMessage() };
       }
       root.nestedSpans.push({
