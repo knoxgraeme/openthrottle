@@ -311,7 +311,7 @@ describe("coordinator-only server", () => {
     const row = body.journal.find((entry) => entry.kind === "terminal_observed");
     expect(row?.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(row).toMatchObject({
-      issue: "OT-1",
+      issue: "issue-1",
       repository: "owner/repo",
       kind: "terminal_observed",
     });
