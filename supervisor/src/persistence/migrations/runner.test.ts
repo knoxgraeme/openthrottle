@@ -12,6 +12,7 @@ import {
   type PipelineUnitPhaseBinding,
 } from "../../pipeline/manifest.js";
 import { createExecutionUnitStore } from "../pipeline/unit-store.js";
+import { createJournalStore } from "../pipeline/journal-store.js";
 import { GATE_RECEIPT_REASONS } from "../../pipeline/gates.js";
 import { FAULT_ATTRIBUTIONS } from "../../pipeline/fault-attribution.js";
 import { ENGINES } from "../pipeline/run-outcome-store.js";
@@ -147,7 +148,7 @@ describe("database migrations", () => {
       "e1f1cc26fcd21df5ca8cb56548d2d38f90311d40d93bcd0e54d4ab62f9eb6ad4",
       "36f3c74ad261f3e4e9e5014221e5ff8510dc7123b03ab92f2875b02ab0cf4fb2",
       "8ede2103ae2f761958e4a21fc672b1c7a2a6c8fe39f75109ca3843b2fe492597",
-      "fef0599d2fdfbfcd88d369e4e91bee846225d6db934e862020859a3b4e75f521",
+      "7d3a9df445ca32dde099ec99c6f2128a9e87b5f86732f94f61690fe13d53ebcb",
     ]);
   });
 
@@ -378,6 +379,176 @@ describe("database migrations", () => {
     const once = db.prepare("SELECT key, value FROM settings ORDER BY key").all();
     migration.up(db);
     expect(db.prepare("SELECT key, value FROM settings ORDER BY key").all()).toEqual(once);
+  });
+
+  it("rekeys legacy journal display references without breaking structured review lineage", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE tickets (
+        linear_issue_id TEXT PRIMARY KEY,
+        linear_issue_identifier TEXT NOT NULL,
+        linear_session_id TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE pipeline_instances (
+        id TEXT PRIMARY KEY,
+        linear_issue_id TEXT NOT NULL
+      );
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        linear_issue_id TEXT NOT NULL
+      );
+      CREATE TABLE orchestration_journal (
+        id TEXT PRIMARY KEY,
+        recorded_at TEXT NOT NULL,
+        team TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        issue TEXT NOT NULL,
+        instance_id TEXT,
+        run_id TEXT,
+        actor TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        action TEXT NOT NULL,
+        outcome TEXT,
+        refs TEXT NOT NULL,
+        note TEXT,
+        structured TEXT
+      );
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id,
+        branch, agent, repo, created_at, updated_at
+      ) VALUES
+        ('issue-a', 'OT-188', 'session-a', 'ot/a', 'codex', 'owner/repo', '2026-01-01', '2026-01-01'),
+        ('issue-b', 'OT-188', 'session-b', 'ot/b', 'codex', 'owner/repo', '2026-01-01', '2026-01-01'),
+        ('issue-unique', 'OT-200', 'session-unique', 'ot/unique', 'codex', 'owner/repo', '2026-01-01', '2026-01-01');
+      INSERT INTO pipeline_instances (id, linear_issue_id) VALUES
+        ('instance-a', 'issue-a'),
+        ('instance-b', 'issue-b');
+      INSERT INTO runs (id, linear_issue_id) VALUES
+        ('run-a', 'issue-a'),
+        ('run-b', 'issue-b');
+      INSERT INTO orchestration_journal (
+        id, recorded_at, team, repository, issue, instance_id, run_id,
+        actor, kind, trigger, action, outcome, refs, note, structured
+      ) VALUES
+        (
+          'review-cycle-1', '2026-01-01T00:00:01.000Z', 'OT', 'owner/repo', 'OT-188',
+          'instance-a', 'run-a', 'supervisor', 'run_note', 'structured_review_fanout',
+          'Recorded review cycle one.', 'success', '{}', NULL,
+          '{"finding_resolutions":[{"convergence_cycle":1}],"marker":"cycle-1"}'
+        ),
+        (
+          'review-cycle-2', '2026-01-01T00:00:02.000Z', 'OT', 'owner/repo', 'OT-188',
+          'instance-a', 'run-a', 'supervisor', 'run_note', 'structured_review_fanout',
+          'Resumed review with prior lineage.', 'success', '{}', NULL,
+          '{"finding_resolutions":[{"convergence_cycle":2}],"marker":"cycle-2"}'
+        ),
+        (
+          'other-ticket-review', '2026-01-01T00:00:03.000Z', 'OT', 'owner/repo', 'OT-188',
+          'instance-b', 'run-b', 'supervisor', 'run_note', 'structured_review_fanout',
+          'Recorded the colliding display reference.', 'success', '{}', NULL,
+          '{"finding_resolutions":[{"convergence_cycle":1}],"marker":"other"}'
+        ),
+        (
+          'run-only', '2026-01-01T00:00:04.000Z', 'OT', 'owner/repo', 'OT-188',
+          NULL, 'run-a', 'supervisor', 'run_note', 'run-bound',
+          'Mapped through the run fence.', 'success', '{}', NULL, NULL
+        ),
+        (
+          'unique-ticket', '2026-01-01T00:00:05.000Z', 'OT', 'owner/repo', 'OT-200',
+          NULL, NULL, 'supervisor', 'run_note', 'ticket-bound',
+          'Mapped through the unique ticket reference.', 'success', '{}', NULL, NULL
+        );
+    `);
+
+    const migration = databaseMigrations.find((candidate) => candidate.version === 35)!;
+    migration.up(db);
+
+    const journal = createJournalStore(db, () => "2026-01-02T00:00:00.000Z");
+    const issueAEntries = journal.listJournalEntries({ issueId: "linear:issue-a", limit: 100 });
+    expect(issueAEntries.map((entry) => entry.id)).toEqual([
+      "review-cycle-1",
+      "review-cycle-2",
+      "run-only",
+    ]);
+    expect(issueAEntries.filter((entry) =>
+      entry.instance_id === "instance-a" &&
+      entry.run_id === "run-a" &&
+      entry.trigger === "structured_review_fanout"
+    ).map((entry) => entry.structured)).toEqual([
+      '{"finding_resolutions":[{"convergence_cycle":1}],"marker":"cycle-1"}',
+      '{"finding_resolutions":[{"convergence_cycle":2}],"marker":"cycle-2"}',
+    ]);
+    expect(journal.listJournalEntries({ issueId: "linear:issue-b" }).map((entry) => entry.id))
+      .toEqual(["other-ticket-review"]);
+    expect(journal.listJournalEntries({ issueId: "linear:issue-unique" }).map((entry) => entry.id))
+      .toEqual(["unique-ticket"]);
+    expect(journal.listJournalEntries({ issue: "OT-188" })).toEqual([]);
+
+    const once = db.prepare(`
+      SELECT id, issue, structured FROM orchestration_journal ORDER BY id
+    `).all();
+    migration.up(db);
+    expect(db.prepare(`
+      SELECT id, issue, structured FROM orchestration_journal ORDER BY id
+    `).all()).toEqual(once);
+  });
+
+  it("fails v35 before guessing an ambiguous unbound journal identity", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE tickets (
+        linear_issue_id TEXT PRIMARY KEY,
+        linear_issue_identifier TEXT NOT NULL,
+        linear_session_id TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE orchestration_journal (
+        id TEXT PRIMARY KEY,
+        recorded_at TEXT NOT NULL,
+        team TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        issue TEXT NOT NULL,
+        instance_id TEXT,
+        run_id TEXT,
+        actor TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        action TEXT NOT NULL,
+        outcome TEXT,
+        refs TEXT NOT NULL,
+        note TEXT,
+        structured TEXT
+      );
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id,
+        branch, agent, repo, created_at, updated_at
+      ) VALUES
+        ('issue-a', 'OT-188', 'session-a', 'ot/a', 'codex', 'owner/repo', '2026-01-01', '2026-01-01'),
+        ('issue-b', 'OT-188', 'session-b', 'ot/b', 'codex', 'owner/repo', '2026-01-01', '2026-01-01');
+      INSERT INTO orchestration_journal (
+        id, recorded_at, team, repository, issue, instance_id, run_id,
+        actor, kind, trigger, action, outcome, refs, note, structured
+      ) VALUES (
+        'ambiguous', '2026-01-01T00:00:01.000Z', 'OT', 'owner/repo', 'OT-188',
+        NULL, NULL, 'supervisor', 'run_note', 'test', 'Ambiguous legacy row.',
+        'success', '{}', NULL, NULL
+      );
+    `);
+
+    const migration = databaseMigrations.find((candidate) => candidate.version === 35)!;
+    expect(() => migration.up(db!)).toThrow(/ambiguous legacy orchestration journal issue ambiguous/);
+    expect(db.prepare("SELECT issue FROM orchestration_journal WHERE id = 'ambiguous'").get())
+      .toEqual({ issue: "OT-188" });
   });
 
   it("migrates repository registrations to provider-qualified repo authority", () => {
