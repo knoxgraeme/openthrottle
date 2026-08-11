@@ -300,7 +300,7 @@ describe("coordinator-only server", () => {
       refs: { stage: "command" },
     });
 
-    const response = await app().request("/tickets/OT-1/journal", {
+    const response = await app().request("/tickets/issue-1/journal", {
       headers: { Authorization: "Bearer status-token" },
     });
 
@@ -953,14 +953,21 @@ describe("coordinator-only server", () => {
 
   it("does not fall back to direct stop or steering for an unpinned ticket", async () => {
     seedTicket();
-    const stop = await app().request("/tickets/OT-1/stop", {
+    const referenceStop = await app().request("/tickets/OT-1/stop", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(referenceStop.status).toBe(404);
+    expect(await referenceStop.json()).toEqual({ error: "ticket not found" });
+
+    const stop = await app().request("/tickets/issue-1/stop", {
       method: "POST",
       headers: { Authorization: "Bearer status-token" },
     });
     expect(stop.status).toBe(409);
     expect(await stop.json()).toEqual({ error: "pipeline not found" });
 
-    const steer = await app().request("/tickets/OT-1/steer", {
+    const steer = await app().request("/tickets/issue-1/steer", {
       method: "POST",
       headers: {
         Authorization: "Bearer status-token",
@@ -987,7 +994,7 @@ describe("coordinator-only server", () => {
     pipelines.bindStageRun(attempt.id, request.runId);
     pipelines.markStageDispatched(attempt.id);
 
-    const response = await app().request("/tickets/OT-1/steer", {
+    const response = await app().request("/tickets/issue-1/steer", {
       method: "POST",
       headers: {
         Authorization: "Bearer status-token",
@@ -1037,7 +1044,7 @@ describe("coordinator-only server", () => {
       unitPhaseBindings: stageById(instance.normalized_manifest, "units")?.unitPhaseBindings,
     });
 
-    const response = await app().request("/tickets/OT-1/steer", {
+    const response = await app().request("/tickets/issue-1/steer", {
       method: "POST",
       headers: {
         Authorization: "Bearer status-token",
@@ -1066,7 +1073,7 @@ describe("coordinator-only server", () => {
 
     // A second capture during the same composite run records a second,
     // distinct event rather than silently deduping or overwriting the first.
-    const second = await app().request("/tickets/OT-1/steer", {
+    const second = await app().request("/tickets/issue-1/steer", {
       method: "POST",
       headers: {
         Authorization: "Bearer status-token",
@@ -1125,7 +1132,7 @@ describe("coordinator-only server", () => {
         store: failingStore,
         drainEffects: async () => undefined,
       },
-    }).request("/tickets/OT-1/steer", {
+    }).request("/tickets/issue-1/steer", {
       method: "POST",
       headers: {
         Authorization: "Bearer status-token",
@@ -1151,7 +1158,7 @@ describe("coordinator-only server", () => {
 
   it("distinguishes an accepted stop request from confirmed durable settlement", async () => {
     seedPipelineTicket();
-    const pending = await app().request("/tickets/OT-1/stop", {
+    const pending = await app().request("/tickets/issue-1/stop", {
       method: "POST",
       headers: { Authorization: "Bearer status-token" },
     });
@@ -1175,7 +1182,7 @@ describe("coordinator-only server", () => {
           });
         },
       },
-    }).request("/tickets/OT-1/stop", {
+    }).request("/tickets/issue-1/stop", {
       method: "POST",
       headers: { Authorization: "Bearer status-token" },
     });
@@ -1192,11 +1199,11 @@ describe("coordinator-only server", () => {
       ["/analysis/runs", "GET"],
       ["/repositories", "GET"],
       ["/repositories/register", "POST"],
-      ["/tickets/OT-1/stop", "POST"],
-      ["/tickets/OT-1/steer", "POST"],
-      ["/tickets/OT-1/logs", "GET"],
-      ["/tickets/OT-1/journal", "GET"],
-      ["/tickets/OT-1/publications/missing/retry", "POST"],
+      ["/tickets/issue-1/stop", "POST"],
+      ["/tickets/issue-1/steer", "POST"],
+      ["/tickets/issue-1/logs", "GET"],
+      ["/tickets/issue-1/journal", "GET"],
+      ["/tickets/issue-1/publications/missing/retry", "POST"],
     ] as const) {
       const response = await app().request(path, { method });
       expect(response.status, `${method} ${path}`).toBe(401);
@@ -1390,7 +1397,7 @@ describe("coordinator-only server", () => {
       logTail: "finished with github_pat_abcdefghijklmnopqrstuvwxyz1234567890",
     });
 
-    const response = await app().request("/tickets/OT-1/logs", {
+    const response = await app().request("/tickets/issue-1/logs", {
       headers: { Authorization: "Bearer status-token" },
     });
     expect(response.status).toBe(200);
