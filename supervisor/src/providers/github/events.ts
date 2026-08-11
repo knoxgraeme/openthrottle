@@ -45,6 +45,7 @@ type ProviderFinding = {
 const GITHUB_COMMENT_ORDERING_GUIDANCE =
   "OpenThrottle could not prove whether this same-second GitHub Issue comment followed the activation. " +
   "Please resend the comment after the activation is visible so it can be routed safely.";
+const GITHUB_HISTORICAL_ACTOR_PERMISSION_LOOKUP_LIMIT = 32;
 
 export function routePipelineProviderEvent(params: {
   pipelines: PipelineStore;
@@ -907,10 +908,30 @@ export async function handleGithubEvent(
   if (event.kind === "issues") {
     const carriesControl = githubIssuesEventCarriesExactControlLabel(event);
     const needsProviderOrdering = event.action === "closed" || carriesControl;
+    const sender = event.sender?.login;
+    const authorizedActors = new Map<string, Promise<boolean>>();
     if (needsProviderOrdering) {
-      const author = event.sender?.login;
-      if (!await authorizedGithubControlActor(_cfg, event.repository.full_name, author)) return;
+      if (!sender ||
+          !await authorizedGithubControlActor(_cfg, event.repository.full_name, sender)) return;
+      authorizedActors.set(sender.toLowerCase(), Promise.resolve(true));
     }
+    let historicalActorPermissionLookups = 0;
+    const authorizeHistoricalActor = (actorLogin: string): Promise<boolean> => {
+      const key = actorLogin.toLowerCase();
+      const cached = authorizedActors.get(key);
+      if (cached) return cached;
+      if (historicalActorPermissionLookups >= GITHUB_HISTORICAL_ACTOR_PERMISSION_LOOKUP_LIMIT) {
+        throw new Error("GitHub Issue close authorization exceeded the bounded actor lookup limit");
+      }
+      historicalActorPermissionLookups += 1;
+      const lookup = authorizedGithubControlActor(
+        _cfg,
+        event.repository.full_name,
+        actorLogin
+      );
+      authorizedActors.set(key, lookup);
+      return lookup;
+    };
     const eventLifecycle = lifecycleFromIssueEvent(event);
     const priorLifecycle = readGithubIssueLifecycle(
       store,
@@ -931,6 +952,41 @@ export async function handleGithubEvent(
           event.issue.number
         )
       : [];
+    if (event.action === "closed") {
+      const eventTimestamp = githubIssueEventTimestamp(event);
+      const providerClose = eventTimestamp && sender
+        ? [...controlEvents].reverse().find((candidate) =>
+            candidate.kind === "closed" &&
+            candidate.actorLogin.toLowerCase() === sender.toLowerCase() &&
+            Date.parse(candidate.createdAt) === Date.parse(eventTimestamp)
+          )
+        : undefined;
+      if (!providerClose) {
+        throw new Error("GitHub Issue close is not yet durable in provider event history");
+      }
+    }
+    const externalThreadId = `${event.repository.full_name}#${event.issue.number}`;
+    let ticket = store.getByExternalThread("github", externalThreadId);
+    const currentSession = ticket
+      ? store.getCurrentSession(ticket.ticket_id) ?? store.getSession(ticket.session_id)
+      : undefined;
+    let latestAuthorizedClose: GithubIssueControlEventRecord | undefined;
+    if (currentSession) {
+      for (let index = controlEvents.length - 1; index >= 0; index -= 1) {
+        const candidate = controlEvents[index]!;
+        if (candidate.kind !== "closed" ||
+            !githubIssueControlEventIsAfterSession(
+              controlEvents,
+              candidate,
+              currentSession,
+              true
+            )) continue;
+        if (await authorizeHistoricalActor(candidate.actorLogin)) {
+          latestAuthorizedClose = candidate;
+          break;
+        }
+      }
+    }
     const latestLifecycleEvent = latestGithubIssueControlEvent(
       controlEvents,
       new Set(["closed", "reopened"])
@@ -951,23 +1007,14 @@ export async function handleGithubEvent(
             eventLifecycle
           )
         : priorLifecycle;
-    const externalThreadId = `${event.repository.full_name}#${event.issue.number}`;
-    let ticket = store.getByExternalThread("github", externalThreadId);
-    const currentSession = ticket
-      ? store.getCurrentSession(ticket.ticket_id) ?? store.getSession(ticket.session_id)
-      : undefined;
-    const latestClose = latestGithubIssueControlEvent(controlEvents, new Set(["closed"]));
-    const closeCrossesCurrentSession = Boolean(
-      currentSession && latestClose &&
-      githubIssueControlEventIsAfterSession(controlEvents, latestClose, currentSession, true)
-    );
-    if (ticket && closeCrossesCurrentSession && latestClose) {
+    const closeCrossesCurrentSession = latestAuthorizedClose !== undefined;
+    if (ticket && latestAuthorizedClose) {
       const pipelineInstance = pipelines.getInstanceForSession(ticket.session_id);
       if (pipelineInstance && !pipelineIsTerminal(pipelineInstance)) {
         requestPipelineStop({
           store: pipelines,
           sessionId: ticket.session_id,
-          eventId: `github-issue-closed:${pipelineInstance.id}:${latestClose.id}`,
+          eventId: `github-issue-closed:${pipelineInstance.id}:${latestAuthorizedClose.id}`,
           reason: "GitHub Issue closed while a pipeline stage was active.",
           ticketState: "closed",
         });
@@ -995,7 +1042,6 @@ export async function handleGithubEvent(
     )) return;
     const providerActivatedAt = githubIssueEventTimestamp(event);
     const activationKind = event.action === "reopened" ? "reopened" : "labeled";
-    const sender = event.sender?.login;
     const providerActivation = providerActivatedAt && sender
       ? [...controlEvents].reverse().find((candidate) =>
           candidate.kind === activationKind &&

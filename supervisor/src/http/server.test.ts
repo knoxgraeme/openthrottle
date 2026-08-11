@@ -1979,6 +1979,8 @@ describe("coordinator-only server", () => {
     let liveUpdatedAt = "2026-08-11T00:01:00Z";
     let advanceEpochDuringNextSelection = false;
     let timelineResponseMode: "normal" | "oversized" | "full-pages" = "normal";
+    let failOutsiderPermission = false;
+    const permissionLookups: string[] = [];
     const repositoryConfigContent = "schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\n";
     const timelineEvents: Array<Record<string, unknown>> = [{
       id: 900,
@@ -1992,7 +1994,18 @@ describe("coordinator-only server", () => {
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.endsWith("/collaborators/operator/permission")) {
+        permissionLookups.push("operator");
         return Response.json({ permission: "triage", role_name: "triage" });
+      }
+      if (url.endsWith("/collaborators/outsider/permission")) {
+        permissionLookups.push("outsider");
+        if (failOutsiderPermission) throw new Error("historical permission failure");
+        return Response.json({ permission: "read", role_name: "read" });
+      }
+      const attackerPermission = url.match(/\/collaborators\/(attacker-\d+)\/permission$/);
+      if (attackerPermission) {
+        permissionLookups.push(attackerPermission[1]!);
+        return Response.json({ permission: "read", role_name: "read" });
       }
       if (url.endsWith("/repos/owner/repo/issues/12") && method === "GET") {
         return Response.json({
@@ -2131,6 +2144,81 @@ describe("coordinator-only server", () => {
       provider_activation_id: "901",
     });
 
+    store.claimDelivery({
+      deliveryId: "github-close-before-provider-history",
+      source: "github",
+      action: "issues:closed",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "closed",
+        repository: { full_name: "owner/repo" },
+        sender: { login: "operator" },
+        issue: {
+          number: 12,
+          title: "Ship it",
+          html_url: "https://github.com/owner/repo/issues/12",
+          state: "closed",
+          updated_at: "2026-08-11T00:01:15Z",
+          closed_at: "2026-08-11T00:01:15Z",
+          labels: [{ name: "openthrottle" }],
+        },
+      }),
+    });
+    await expect(processor.process("github-close-before-provider-history"))
+      .rejects.toThrow("close is not yet durable in provider event history");
+    expect(store.getCurrentSession("github:owner/repo#12")?.id).toBe(activeSessionId);
+    expect(pipelines.getInstanceForSession(activeSessionId)).toMatchObject({
+      status: "dispatchable",
+    });
+
+    const excessiveHistoryStart = timelineEvents.length;
+    timelineEvents.push(
+      ...Array.from({ length: 33 }, (_, index) => ({
+        id: `excessive-close-${index}`,
+        event: "closed",
+        created_at: "2026-08-11T00:01:20Z",
+        actor: { login: `attacker-${index}` },
+      })),
+      {
+        id: "excessive-history-reopen",
+        event: "reopened",
+        created_at: "2026-08-11T00:01:20Z",
+        actor: { login: "operator" },
+      }
+    );
+    liveUpdatedAt = "2026-08-11T00:01:20Z";
+    const permissionLookupCountBeforeExcessiveHistory = permissionLookups.length;
+    store.claimDelivery({
+      deliveryId: "github-excessive-historical-close-actors",
+      source: "github",
+      action: "issues:reopened",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "reopened",
+        repository: { full_name: "owner/repo" },
+        sender: { login: "operator" },
+        issue: {
+          number: 12,
+          title: "Ship it",
+          html_url: "https://github.com/owner/repo/issues/12",
+          state: "open",
+          updated_at: liveUpdatedAt,
+          labels: [{ name: "openthrottle" }],
+        },
+      }),
+    });
+    await expect(processor.process("github-excessive-historical-close-actors"))
+      .rejects.toThrow("exceeded the bounded actor lookup limit");
+    expect(permissionLookups.slice(permissionLookupCountBeforeExcessiveHistory))
+      .toHaveLength(33);
+    expect(store.getCurrentSession("github:owner/repo#12")).toMatchObject({
+      id: activeSessionId,
+      provider_activation_id: "901",
+    });
+    store.markDeliveryProcessed("github-excessive-historical-close-actors");
+    timelineEvents.splice(excessiveHistoryStart);
+    liveUpdatedAt = "2026-08-11T00:01:00Z";
+
     timelineEvents.push({
       id: 902,
       event: "labeled",
@@ -2164,21 +2252,21 @@ describe("coordinator-only server", () => {
 
     timelineEvents.push(
       {
-        id: 903,
+        id: 9021,
         event: "closed",
-        created_at: "2026-08-11T00:02:00Z",
-        actor: { login: "operator" },
+        created_at: "2026-08-11T00:01:30Z",
+        actor: { login: "outsider" },
       },
       {
-        id: 904,
+        id: 9022,
         event: "reopened",
-        created_at: "2026-08-11T00:02:00Z",
+        created_at: "2026-08-11T00:01:30Z",
         actor: { login: "operator" },
       }
     );
-    liveUpdatedAt = "2026-08-11T00:02:00Z";
+    liveUpdatedAt = "2026-08-11T00:01:30Z";
     store.claimDelivery({
-      deliveryId: "github-reopen-before-close-delivery",
+      deliveryId: "github-authorized-reopen-after-unauthorized-close",
       source: "github",
       action: "issues:reopened",
       eventName: "issues",
@@ -2196,18 +2284,97 @@ describe("coordinator-only server", () => {
         },
       }),
     });
-    await expect(processor.process("github-reopen-before-close-delivery"))
+    failOutsiderPermission = true;
+    await expect(processor.process("github-authorized-reopen-after-unauthorized-close"))
+      .rejects.toThrow("historical permission failure");
+    expect(store.getCurrentSession("github:owner/repo#12")).toMatchObject({
+      id: activeSessionId,
+      provider_activation_id: "901",
+    });
+    expect(pipelines.getInstanceForSession(activeSessionId)).toMatchObject({
+      status: "dispatchable",
+    });
+    failOutsiderPermission = false;
+    db.prepare(`
+      UPDATE webhook_deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z'
+      WHERE delivery_id = 'github-authorized-reopen-after-unauthorized-close'
+    `).run();
+    await expect(processor.process("github-authorized-reopen-after-unauthorized-close"))
       .resolves.toBeUndefined();
-    const reopenedSessionId = "github:owner/repo#12:reopened:904";
+    expect(store.getCurrentSession("github:owner/repo#12")).toMatchObject({
+      id: activeSessionId,
+      state: "current",
+      generation: 1,
+      provider_activation_id: "9022",
+    });
+    expect(pipelines.getInstanceForSession(activeSessionId)).toMatchObject({
+      status: "dispatchable",
+    });
+    expect(store.getSession("github:owner/repo#12:reopened:9022")).toBeUndefined();
+
+    timelineEvents.push(
+      {
+        id: 903,
+        event: "closed",
+        created_at: "2026-08-11T00:02:00Z",
+        actor: { login: "operator" },
+      },
+      {
+        id: 904,
+        event: "reopened",
+        created_at: "2026-08-11T00:02:00Z",
+        actor: { login: "operator" },
+      },
+      {
+        id: 9041,
+        event: "closed",
+        created_at: "2026-08-11T00:02:30Z",
+        actor: { login: "outsider" },
+      },
+      {
+        id: 9042,
+        event: "reopened",
+        created_at: "2026-08-11T00:02:30Z",
+        actor: { login: "operator" },
+      }
+    );
+    liveUpdatedAt = "2026-08-11T00:02:30Z";
+    const permissionLookupCountBeforeCoalescedHistory = permissionLookups.length;
+    store.claimDelivery({
+      deliveryId: "github-coalesced-authorized-and-unauthorized-close-history",
+      source: "github",
+      action: "issues:reopened",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "reopened",
+        repository: { full_name: "owner/repo" },
+        sender: { login: "operator" },
+        issue: {
+          number: 12,
+          title: "Ship it",
+          html_url: "https://github.com/owner/repo/issues/12",
+          state: "open",
+          updated_at: liveUpdatedAt,
+          labels: [{ name: "openthrottle" }],
+        },
+      }),
+    });
+    await expect(processor.process("github-coalesced-authorized-and-unauthorized-close-history"))
+      .resolves.toBeUndefined();
+    const reopenedSessionId = "github:owner/repo#12:reopened:9042";
     expect(store.getSession(activeSessionId)?.state).toBe("stopped");
     expect(store.getCurrentSession("github:owner/repo#12")).toMatchObject({
       id: reopenedSessionId,
       generation: 2,
-      provider_activation_id: "904",
+      provider_activation_id: "9042",
     });
     expect(pipelines.getInstanceForSession(reopenedSessionId)).toMatchObject({
       status: "dispatchable",
     });
+    // The sender authorization is reused while scanning historical closes;
+    // the final admission preflight deliberately rechecks the activation actor.
+    expect(permissionLookups.slice(permissionLookupCountBeforeCoalescedHistory))
+      .toEqual(["operator", "outsider", "operator"]);
 
     store.claimDelivery({
       deliveryId: "github-delayed-close-after-reopen",
@@ -2223,8 +2390,8 @@ describe("coordinator-only server", () => {
           title: "Ship it",
           html_url: "https://github.com/owner/repo/issues/12",
           state: "closed",
-          updated_at: liveUpdatedAt,
-          closed_at: liveUpdatedAt,
+          updated_at: "2026-08-11T00:02:00Z",
+          closed_at: "2026-08-11T00:02:00Z",
           labels: [{ name: "openthrottle" }],
         },
       }),
@@ -2253,7 +2420,7 @@ describe("coordinator-only server", () => {
         comment: {
           id: 110,
           body: "ordinary post-terminal comment",
-          created_at: "2026-08-11T00:02:01Z",
+          created_at: "2026-08-11T00:02:31Z",
           html_url: "https://github.com/owner/repo/issues/12#issuecomment-110",
           user: { login: "operator" },
         },

@@ -552,10 +552,14 @@ events from starting or stopping the wrong generation. The final admission
 preflight also re-reads the bounded Issue Events stream and requires the exact
 authorized activation cursor selected by the delivery to remain current; a
 newer close/reopen/relabel epoch supersedes the slow admission before any
-ticket or pipeline instance is created. Permission lookup
-outages fail with a retryable response before the delivery or untrusted body is
-persisted, while a confirmed insufficient permission is acknowledged without
-admission.
+ticket or pipeline instance is created. When reverse delivery reconciliation
+applies historical closes while handling a later reopen, it scans the bounded
+history after the current activation cursor from newest to oldest and stops at
+the first independently authorized close. Actor permission lookups are cached
+per reconciliation and capped at 32 distinct historical actors; an exhausted
+cap or lookup outage fails retryably before session mutation. A signed close
+also retries until its exact actor and timestamp appear in Issue Events.
+Confirmed insufficient permission is acknowledged without admission.
 
 Issue Events remain the body-free source of activation ordering. When an Issue
 comment and the current activation have equal second-precision timestamps, the
