@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { collectSecretValues, sanitizeText } from "./sanitize.js";
+import { collectSecretValues, containsSecretShapedValue, sanitizeText } from "./sanitize.js";
 
 describe("sanitizeText", () => {
   it("redacts named secrets, nested auth values, and known token shapes", () => {
@@ -17,7 +17,7 @@ describe("sanitizeText", () => {
       "sk-project-secret",
       "lin_api_secretvalue",
       "lin_oauth_secretvalue",
-      "Bearer opaque-value",
+      "Bearer opaque-value-1234567890",
     ].join(" ");
 
     const result = sanitizeText(input, env);
@@ -33,5 +33,63 @@ describe("sanitizeText", () => {
       "abcd-long",
       "abcd",
     ]);
+  });
+
+  it("distinguishes bearer-token shapes from ordinary bearer prose", () => {
+    const prose = "CODEX_AUTH_JSON bearer credentials. Supports bearer token-based authentication and Bearer token.";
+    expect(sanitizeText(prose, {})).toBe(prose);
+    expect(containsSecretShapedValue(prose)).toBe(false);
+
+    for (const secret of [
+      "Bearer eyJhbGciOiJIUzI1NiJ9.cGF5bG9hZA.c2lnbmF0dXJl",
+      "Bearer k7dP3nQ9xR2mV8z",
+      "Bearer opaque._~+/-value-1234567890=",
+      "Authorization: Bearer abc123",
+      "Authorization: Bearer\nabc123",
+      "{\"authorization\":\"Bearer\\nabc123\"}",
+      '{"authorization":"Bearer abc123"}',
+      'summary: "{\\"authorization\\":\\"Bearer abc123\\"}"',
+    ]) {
+      expect(sanitizeText(secret, {})).not.toContain(secret.split("Bearer ")[1]);
+      expect(sanitizeText(secret, {})).toContain("[REDACTED]");
+      expect(containsSecretShapedValue(secret)).toBe(true);
+    }
+
+    const proseRoots = [
+      "authentication",
+      "authorization",
+      "credential",
+      "credentials",
+      "token",
+      "tokens",
+    ];
+    const wrappedAuthorizationPrefixes = [
+      "Authorization:\nBearer ",
+      "Authorization:\r\n\tBearer ",
+      "Authorization:\\nBearer ",
+      "Authorization:\\r\\n\\tBearer ",
+      "{\"authorization\":\"\\nBearer ",
+      'summary: "{\\"authorization\\":\\"\\nBearer ',
+    ];
+    for (const root of proseRoots) {
+      for (const candidate of [root, `${root}-based...`]) {
+        for (const prefix of wrappedAuthorizationPrefixes) {
+          const secret = `${prefix}${candidate}`;
+          expect(sanitizeText(secret, {})).toContain("[REDACTED]");
+          expect(containsSecretShapedValue(secret)).toBe(true);
+        }
+      }
+    }
+
+    let nestedAuthorization = JSON.stringify({ authorization: "Bearer\nabc123" });
+    for (let depth = 1; depth <= 4; depth += 1) {
+      expect(sanitizeText(nestedAuthorization, {}), "nested JSON depth " + depth).toContain("[REDACTED]");
+      expect(containsSecretShapedValue(nestedAuthorization), "nested JSON depth " + depth).toBe(true);
+      nestedAuthorization = JSON.stringify({ summary: nestedAuthorization });
+    }
+
+    const longAuthorization = "Authorization:" + " ".repeat(60) + "Bearer token";
+    expect(sanitizeText(longAuthorization, {})).toContain("[REDACTED]");
+    expect(containsSecretShapedValue(longAuthorization)).toBe(true);
   });
 });

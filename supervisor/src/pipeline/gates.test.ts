@@ -705,8 +705,37 @@ describe("deterministic supervisor stage gates", () => {
     wrongAssurance.resultHash = wrongAssurance.artifacts![0]!.hash;
     expect(() => evaluateStageGate(fixture.pipelines, wrongAssurance)).toThrow(/assurance mismatch/);
 
-    const leaked = event(fixture, "success", { summary: "Bearer secret-token-value" });
+    const leaked = event(fixture, "success", { summary: "Bearer opaque-secret-token-value-1234567890" });
     expect(() => evaluateStageGate(fixture.pipelines, leaked)).toThrow(/secret-shaped/);
+
+    const shortAuthorizationToken = event(fixture, "success", { summary: "Authorization: Bearer abc123" });
+    expect(() => evaluateStageGate(fixture.pipelines, shortAuthorizationToken)).toThrow(/secret-shaped/);
+
+    const wrappedAuthorizationToken = event(fixture, "success", { summary: "Authorization: Bearer\nabc123" });
+    expect(() => evaluateStageGate(fixture.pipelines, wrappedAuthorizationToken)).toThrow(/secret-shaped/);
+
+    const wrappedAuthorizationPrefix = event(fixture, "success", { summary: "Authorization:\nBearer token" });
+    expect(() => evaluateStageGate(fixture.pipelines, wrappedAuthorizationPrefix)).toThrow(/secret-shaped/);
+
+    const escapedAuthorizationPrefix = event(fixture, "success", {
+      summary: "Authorization:\\nBearer credential-based...",
+    });
+    expect(() => evaluateStageGate(fixture.pipelines, escapedAuthorizationPrefix)).toThrow(/secret-shaped/);
+
+    const nestedAuthorization = event(fixture, "success", {
+      summary: JSON.stringify({ authorization: "Bearer\nabc123" }),
+    });
+    expect(() => evaluateStageGate(fixture.pipelines, nestedAuthorization)).toThrow(/secret-shaped/);
+
+    const longAuthorization = event(fixture, "success", {
+      summary: "Authorization:" + " ".repeat(60) + "Bearer token",
+    });
+    expect(() => evaluateStageGate(fixture.pipelines, longAuthorization)).toThrow(/secret-shaped/);
+
+    const safeBearerProse = event(fixture, "success", {
+      summary: "CODEX_AUTH_JSON bearer credentials. Supports bearer token-based authentication.",
+    });
+    expect(() => evaluateStageGate(fixture.pipelines, safeBearerProse)).not.toThrow();
 
     const oversized = event(fixture, "success", { details: { output: "x".repeat(13 * 1024) } });
     expect(() => evaluateStageGate(fixture.pipelines, oversized)).toThrow(/size limit/);
