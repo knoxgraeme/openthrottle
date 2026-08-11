@@ -80,10 +80,8 @@ Ensure `.openthrottle.yml` permits the structured graph and sets `agent: codex`.
 The generated config includes both `simple` and `structured`; do not hand-edit
 around config validation. Before applying the activation label, apply the exact
 GitHub Issue label `agent:codex`. This pins the admission engine on the Issue
-itself; do not rely on a remembered repository default. If an exercise omits
-that label, first verify the supervisor's registered default agent is Codex in
-the live repository registration, then record that verification with the
-exercise evidence.
+itself; it is mandatory for this Codex exercise. Do not rely on a remembered or
+unobservable supervisor default agent.
 
 Prepare or validate the markdown plan before opening the GitHub Issue:
 
@@ -176,10 +174,10 @@ npx openthrottle stop "<ticket-id-from-status>"
 
 `Stop requested for ...` means the supervisor accepted the stop and returned
 `202 stop_requested`; the durable stop effect has not acknowledged yet. After
-that response, do not treat a terminal ticket status by itself as proof that
-the runtime stopped. Require both durable stop-effect acknowledgement and live
-run absence, confirmed by a `200 stopped` response, before considering the
-stop complete. Re-run focused status until both conditions are true.
+that response, repeat the same stop command until it returns `200 stopped` and
+prints `Stopped ...`. Do not treat focused status or a terminal ticket status
+by itself as proof that the runtime stopped: only the repeated stop response
+confirms both durable stop-effect acknowledgement and live-run absence.
 
 If termination cannot be confirmed, retain the supervisor's durable evidence
 and follow the rollout runbook's quarantine guidance. Do not manually delete a
