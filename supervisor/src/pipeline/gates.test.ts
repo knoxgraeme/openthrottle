@@ -22,6 +22,7 @@ import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 import { processPipelineInfrastructureFailure } from "./control.js";
 import { createStageRequestHash, type StageRequestEnvelope } from "./stage-request.js";
 import {
+  acknowledgedPublicationHeadAt,
   drainPipelineFeedbackSnapshots,
   processPipelineFeedbackSnapshot,
   recordPipelineProviderEvent,
@@ -705,8 +706,37 @@ describe("deterministic supervisor stage gates", () => {
     wrongAssurance.resultHash = wrongAssurance.artifacts![0]!.hash;
     expect(() => evaluateStageGate(fixture.pipelines, wrongAssurance)).toThrow(/assurance mismatch/);
 
-    const leaked = event(fixture, "success", { summary: "Bearer secret-token-value" });
+    const leaked = event(fixture, "success", { summary: "Bearer opaque-secret-token-value-1234567890" });
     expect(() => evaluateStageGate(fixture.pipelines, leaked)).toThrow(/secret-shaped/);
+
+    const shortAuthorizationToken = event(fixture, "success", { summary: "Authorization: Bearer abc123" });
+    expect(() => evaluateStageGate(fixture.pipelines, shortAuthorizationToken)).toThrow(/secret-shaped/);
+
+    const wrappedAuthorizationToken = event(fixture, "success", { summary: "Authorization: Bearer\nabc123" });
+    expect(() => evaluateStageGate(fixture.pipelines, wrappedAuthorizationToken)).toThrow(/secret-shaped/);
+
+    const wrappedAuthorizationPrefix = event(fixture, "success", { summary: "Authorization:\nBearer token" });
+    expect(() => evaluateStageGate(fixture.pipelines, wrappedAuthorizationPrefix)).toThrow(/secret-shaped/);
+
+    const escapedAuthorizationPrefix = event(fixture, "success", {
+      summary: "Authorization:\\nBearer credential-based...",
+    });
+    expect(() => evaluateStageGate(fixture.pipelines, escapedAuthorizationPrefix)).toThrow(/secret-shaped/);
+
+    const nestedAuthorization = event(fixture, "success", {
+      summary: JSON.stringify({ authorization: "Bearer\nabc123" }),
+    });
+    expect(() => evaluateStageGate(fixture.pipelines, nestedAuthorization)).toThrow(/secret-shaped/);
+
+    const longAuthorization = event(fixture, "success", {
+      summary: "Authorization:" + " ".repeat(60) + "Bearer token",
+    });
+    expect(() => evaluateStageGate(fixture.pipelines, longAuthorization)).toThrow(/secret-shaped/);
+
+    const safeBearerProse = event(fixture, "success", {
+      summary: "CODEX_AUTH_JSON bearer credentials. Supports bearer token-based authentication.",
+    });
+    expect(() => evaluateStageGate(fixture.pipelines, safeBearerProse)).not.toThrow();
 
     const oversized = event(fixture, "success", { details: { output: "x".repeat(13 * 1024) } });
     expect(() => evaluateStageGate(fixture.pipelines, oversized)).toThrow(/size limit/);
@@ -1608,7 +1638,7 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          head: { ref: "ot/issue-1", sha: SUBJECT },
           base: { ref: "main" },
         },
         review: {
@@ -3332,6 +3362,7 @@ describe("deterministic supervisor stage gates", () => {
     recordAcknowledgedPublication(fixture, "b".repeat(40), { publishedCommit: reviewedHead }, "publication-reviewed");
     recordAcknowledgedPublication(fixture, SUBJECT, { publishedCommit: repairedHead }, "publication-repaired");
     moveFixtureToProviderWait(fixture, SUBJECT, repairedHead);
+    fixture.tickets.setSetting("github-head:issue-1", reviewedHead);
     fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
       .run(fixture.instance.id);
 
@@ -3456,6 +3487,243 @@ describe("deterministic supervisor stage gates", () => {
     expect(JSON.parse(staleNotice.payload).activity.body).toContain("github:github-comment:4907098001");
     expect(JSON.parse(staleNotice.payload).activity.body).toContain(`reviewed_head=${commentedHead}`);
     expect(JSON.parse(staleNotice.payload).activity.body).toContain(`current_published_head=${repairedHead}`);
+  });
+
+  it("ignores a moved GitHub summary when binding a delayed predecessor-head comment", async () => {
+    const fixture = setup("core/implement@4");
+    const previousHead = "d".repeat(40);
+    const currentHead = PUBLISHED_COMMIT;
+    const summaryCreatedAt = "2026-01-01T00:00:02.000Z";
+    const commentCreatedAt = "2026-01-01T00:00:03.000Z";
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    const originalSummary = fixture.pipelines.listPublications(fixture.instance.id)
+      .find((publication) => publication.kind === "github_summary")!;
+    fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts SET created_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(summaryCreatedAt, summaryCreatedAt, originalSummary.id);
+    fixture.tickets.finishRun({
+      runId: fixture.attempt.planned_run_id!,
+      status: "failed",
+    });
+
+    const catalog = loadPipelineCatalog(shippedCatalogPath, runtime.descriptor);
+    const manifest = catalog.manifests.get("core/implement@4")!;
+    const snapshot = fixture.pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: core/implement@4 }\ntest: npm test\n"),
+    });
+    fixture.tickets.upsert({
+      ticket_id: fixture.instance.ticket_id,
+      ticket_reference: "ISSUE-1",
+      session_id: "session-2",
+      sandbox_id: null,
+      branch: "ot/issue-1",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: "https://github.com/owner/repo/pull/1",
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: snapshot,
+        runtime,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+      },
+    });
+    const replacement = fixture.pipelines.getInstanceForSession("session-2")!;
+    expect(fixture.pipelines.listPublications(fixture.instance.id)
+      .some((publication) => publication.kind === "github_summary")).toBe(false);
+    expect(fixture.pipelines.listPublications(replacement.id)
+      .find((publication) => publication.kind === "github_summary")).toMatchObject({
+      id: originalSummary.id,
+      created_at: summaryCreatedAt,
+    });
+
+    let replacementFixture: Fixture = {
+      ...fixture,
+      instance: replacement,
+      attempt: fixture.pipelines.getActiveAttempt(replacement.id)!,
+      stage: fixture.manifest.stages.find((stage) => stage.id === replacement.active_stage_id)!,
+    };
+    recordAcknowledgedPublication(
+      replacementFixture,
+      "b".repeat(40),
+      { publishedCommit: previousHead },
+      "successor-previous-publication"
+    );
+    fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts SET status = 'pending', acknowledged_at = NULL
+      WHERE id = 'successor-previous-publication'
+    `).run();
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'publish', native_context_policy = 'resume_required'
+      WHERE id = ?
+    `).run(replacementFixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'running', active_stage_id = 'publish' WHERE id = ?
+    `).run(replacement.id);
+    replacementFixture = {
+      ...replacementFixture,
+      instance: fixture.pipelines.getInstance(replacement.id)!,
+      attempt: fixture.pipelines.getAttempt(replacementFixture.attempt.id)!,
+      stage: fixture.manifest.stages.find((stage) => stage.id === "publish")!,
+    };
+    expect(settleCurrentStage(replacementFixture, "success", {
+      id: "successor-current-publication",
+      subject: SUBJECT,
+      preSubject: SUBJECT,
+      details: {
+        proposal_schema: "openthrottle.stage-proposal/v1",
+        published_commit: currentHead,
+        provider_revision: currentHead,
+      },
+    })).toMatchObject({
+      status: "waiting_provider",
+      published_commit: currentHead,
+    });
+    const movedSummary = fixture.pipelines.listPublications(replacement.id)
+      .find((publication) => publication.kind === "github_summary")!;
+    expect(movedSummary).toMatchObject({
+      id: originalSummary.id,
+      created_at: summaryCreatedAt,
+      pipeline_instance_id: replacement.id,
+    });
+    expect(movedSummary.payload).toContain(currentHead);
+    fixture.tickets.setSetting("github-head:issue-1", currentHead);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 4907098010,
+          body: "Delayed feedback against the predecessor head.",
+          created_at: commentCreatedAt,
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-4907098010",
+          user: { login: "reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.db.prepare(`
+      SELECT head_sha FROM provider_events WHERE provider_event_id = ?
+    `).get("github-comment:4907098010")).toEqual({ head_sha: previousHead });
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots").get())
+      .toEqual({ status: "stale", head_sha: previousHead });
+    expect(fixture.pipelines.getActiveAttempt(replacement.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
+  });
+
+  it("binds a post-push comment to a provider-observed head before its receipt exists", async () => {
+    const fixture = setup("core/implement@4");
+    const previousHead = "d".repeat(40);
+    const currentHead = PUBLISHED_COMMIT;
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    recordAcknowledgedPublication(fixture, "b".repeat(40), { publishedCommit: previousHead }, "publication-before-push");
+    recordAcknowledgedPublication(fixture, SUBJECT, { publishedCommit: currentHead }, "publication-after-push");
+    moveFixtureToProviderWait(fixture, SUBJECT, currentHead);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request",
+        action: "synchronize",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          merged: false,
+          head: { ref: "ot/issue-1", sha: currentHead },
+          base: { ref: "main" },
+        },
+      },
+      fixture.pipelines
+    );
+    const observedAt = fixture.tickets.getSetting("github-head-observed-at:issue-1");
+    expect(observedAt).toBeDefined();
+    const priorReceiptAt = new Date(Date.parse(observedAt!) - 1_000).toISOString();
+    const commentCreatedAt = new Date(Date.parse(observedAt!) + 1_000).toISOString();
+    const currentReceiptAt = new Date(Date.parse(observedAt!) + 2_000).toISOString();
+    fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts SET created_at = ?, acknowledged_at = ? WHERE id = ?
+    `).run(priorReceiptAt, priorReceiptAt, "publication-before-push");
+    fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts SET created_at = ?, acknowledged_at = ? WHERE id = ?
+    `).run(currentReceiptAt, currentReceiptAt, "publication-after-push");
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 4907098011,
+          body: "Feedback after the provider-visible push.",
+          created_at: commentCreatedAt,
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-4907098011",
+          user: { login: "reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.db.prepare(`
+      SELECT head_sha FROM provider_events WHERE provider_event_id = ?
+    `).get("github-comment:4907098011")).toEqual({ head_sha: currentHead });
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots").get())
+      .toEqual({ status: "consumed", head_sha: currentHead });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
+  it("prefers a newer immutable publication over an older provider head observation", () => {
+    const fixture = setup("core/implement@4");
+    const previousHead = "d".repeat(40);
+    const currentHead = PUBLISHED_COMMIT;
+    recordAcknowledgedPublication(fixture, "b".repeat(40), { publishedCommit: previousHead }, "publication-before-observation");
+    recordAcknowledgedPublication(fixture, SUBJECT, { publishedCommit: currentHead }, "publication-after-observation");
+    fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts SET created_at = ? WHERE id = ?
+    `).run("2026-01-01T00:00:00.000Z", "publication-before-observation");
+    fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts SET created_at = ? WHERE id = ?
+    `).run("2026-01-01T00:00:02.000Z", "publication-after-observation");
+
+    expect(acknowledgedPublicationHeadAt(
+      fixture.pipelines,
+      fixture.instance,
+      "2026-01-01T00:00:03.000Z",
+      { headSha: previousHead, observedAt: "2026-01-01T00:00:01.000Z" }
+    )).toBe(currentHead);
   });
 
   it.each([

@@ -284,22 +284,44 @@ function publicationProviderHeads(payload: string): string[] {
 export function acknowledgedPublicationHeadAt(
   pipelines: PipelineStore,
   instance: PipelineInstance,
-  observedAt: string | undefined
+  observedAt: string | undefined,
+  providerObservation?: { headSha: string; observedAt: string }
 ): string | undefined {
   const observedAtMs = observedAt ? Date.parse(observedAt) : Number.NaN;
   if (Number.isNaN(observedAtMs)) return undefined;
-  return pipelines.listPublications(instance.id)
-    .filter((publication) => publication.status !== "dead")
+  const candidates = pipelines.listPublications(instance.id)
+    .filter((publication) =>
+      publication.kind !== "github_summary" && publication.status !== "dead"
+    )
     .map((publication) => ({
       atMs: Date.parse(publication.created_at),
       publication,
     }))
     .filter(({ atMs }) => !Number.isNaN(atMs) && atMs < observedAtMs)
-    .sort((left, right) =>
-      right.atMs - left.atMs || right.publication.id.localeCompare(left.publication.id)
-    )
-    .flatMap(({ publication }) => publicationProviderHeads(publication.payload))
-    .at(0);
+    .flatMap(({ atMs, publication }) =>
+      publicationProviderHeads(publication.payload).map((headSha) => ({
+        atMs,
+        headSha,
+        id: publication.id,
+        providerObserved: false,
+      }))
+    );
+  const providerObservedAtMs = providerObservation
+    ? Date.parse(providerObservation.observedAt)
+    : Number.NaN;
+  if (providerObservation && !Number.isNaN(providerObservedAtMs) &&
+      providerObservedAtMs < observedAtMs) {
+    candidates.push({
+      atMs: providerObservedAtMs,
+      headSha: providerObservation.headSha,
+      id: `provider-observation:${providerObservation.headSha}`,
+      providerObserved: true,
+    });
+  }
+  return candidates.sort((left, right) =>
+    right.atMs - left.atMs || Number(right.providerObserved) - Number(left.providerObserved) ||
+    right.id.localeCompare(left.id)
+  ).at(0)?.headSha;
 }
 
 function snapshotBelongsToInstance(

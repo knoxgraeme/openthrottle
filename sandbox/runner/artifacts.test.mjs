@@ -8,6 +8,7 @@ import {
   isStageProposalShaped,
   isStandardReceiptShaped,
   parseAgentJson,
+  sanitizeArtifactText,
   validateStandardReceipt,
   validateSemanticProposal,
 } from "./artifacts.mjs";
@@ -98,6 +99,60 @@ describe("normalized stage artifacts", () => {
     expect(artifact.payload).not.toContain("private-value");
     expect(JSON.parse(artifact.payload).summary.length).toBeLessThanOrEqual(2_000);
     expect(Buffer.byteLength(artifact.payload, "utf8")).toBeLessThanOrEqual(12 * 1024);
+  });
+
+  it("keeps bearer prose but redacts bearer-token shapes", () => {
+    const prose = "CODEX_AUTH_JSON bearer credentials. Supports bearer token-based authentication and Bearer token.";
+    expect(sanitizeArtifactText(prose, {})).toBe(prose);
+    for (const secret of [
+      "Bearer eyJhbGciOiJIUzI1NiJ9.cGF5bG9hZA.c2lnbmF0dXJl",
+      "Bearer k7dP3nQ9xR2mV8z",
+      "Bearer opaque._~+/-value-1234567890=",
+      "Authorization: Bearer abc123",
+      "Authorization: Bearer\nabc123",
+      "{\"authorization\":\"Bearer\\nabc123\"}",
+      '{"authorization":"Bearer abc123"}',
+      'summary: "{\\"authorization\\":\\"Bearer abc123\\"}"',
+    ]) {
+      expect(sanitizeArtifactText(secret, {})).not.toContain(secret.split("Bearer ")[1]);
+      expect(sanitizeArtifactText(secret, {})).toContain("[REDACTED]");
+    }
+
+    const proseRoots = [
+      "authentication",
+      "authorization",
+      "credential",
+      "credentials",
+      "token",
+      "tokens",
+    ];
+    const wrappedAuthorizationPrefixes = [
+      "Authorization:\nBearer ",
+      "Authorization:\r\n\tBearer ",
+      "Authorization:\\nBearer ",
+      "Authorization:\\r\\n\\tBearer ",
+      "{\"authorization\":\"\\nBearer ",
+      'summary: "{\\"authorization\\":\\"\\nBearer ',
+    ];
+    for (const root of proseRoots) {
+      for (const candidate of [root, `${root}-based...`]) {
+        for (const prefix of wrappedAuthorizationPrefixes) {
+          expect(sanitizeArtifactText(`${prefix}${candidate}`, {})).toContain("[REDACTED]");
+        }
+      }
+    }
+
+    let nestedAuthorization = JSON.stringify({ authorization: "Bearer\nabc123" });
+    for (let depth = 1; depth <= 4; depth += 1) {
+      expect(sanitizeArtifactText(nestedAuthorization, {}), "nested JSON depth " + depth).toContain("[REDACTED]");
+      nestedAuthorization = JSON.stringify({ summary: nestedAuthorization });
+    }
+
+    const longAuthorization = "Authorization:" + " ".repeat(60) + "Bearer token";
+    expect(sanitizeArtifactText(longAuthorization, {})).toContain("[REDACTED]");
+
+    const repetitiveProse = "Bearer token ".repeat(20_000);
+    expect(sanitizeArtifactText(repetitiveProse, {})).toBe(repetitiveProse);
   });
 
   it("records mechanical command context and never treats termination as success", () => {

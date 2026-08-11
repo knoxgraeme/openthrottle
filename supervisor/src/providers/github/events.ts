@@ -165,8 +165,29 @@ export function routePipelineProviderEvent(params: {
 }
 
 function setAuthoritativeGithubHead(store: SupervisorStore, issueId: string, headSha: string): void {
-  store.setSetting(`github-head:${issueId}`, headSha);
-  store.setSetting(`github-head-source:${issueId}`, "authoritative");
+  const headKey = `github-head:${issueId}`;
+  const sourceKey = `github-head-source:${issueId}`;
+  const observedAtKey = `github-head-observed-at:${issueId}`;
+  const priorObservedAt = store.getSetting(observedAtKey);
+  if (store.getSetting(headKey) !== headSha || store.getSetting(sourceKey) !== "authoritative" ||
+      !priorObservedAt || Number.isNaN(Date.parse(priorObservedAt))) {
+    store.setSetting(observedAtKey, new Date().toISOString());
+  }
+  store.setSetting(headKey, headSha);
+  store.setSetting(sourceKey, "authoritative");
+}
+
+function providerObservedGithubHead(
+  store: SupervisorStore,
+  issueId: string
+): { headSha: string; observedAt: string } | undefined {
+  if (store.getSetting(`github-head-source:${issueId}`) !== "authoritative") return undefined;
+  const head = githubCommitSha(store.getSetting(`github-head:${issueId}`));
+  const headObservedAt = store.getSetting(`github-head-observed-at:${issueId}`);
+  const headObservedAtMs = headObservedAt ? Date.parse(headObservedAt) : Number.NaN;
+  return head && headObservedAt && !Number.isNaN(headObservedAtMs)
+    ? { headSha: head, observedAt: headObservedAt }
+    : undefined;
 }
 
 function githubPullEventId(
@@ -742,6 +763,10 @@ export async function handleGithubEvent(
   if (event.kind === "pull_request_review") {
     const ticket = store.getByBranch(event.repository.full_name, event.pull_request.head.ref);
     if (!ticket || event.action !== "submitted") return;
+    const prHeadSha = githubCommitSha(event.pull_request.head.sha);
+    if (prHeadSha) {
+      setAuthoritativeGithubHead(store, ticket.ticket_id, prHeadSha);
+    }
     await activityPublisher.publishActivity({
       sessionId: ticket.session_id,
       type: "action",
@@ -756,13 +781,12 @@ export async function handleGithubEvent(
     // supervisor never authors pull-request reviews, so no machine-output
     // filtering applies here — every attested review is human.
     if (!author) return;
-    const prHeadSha = event.pull_request.head.sha;
     const reviewedHeadSha = githubCommitSha(event.review.commit_id);
     const headSha = reviewedHeadSha ??
       prHeadSha ??
       store.getSetting(`github-head:${ticket.ticket_id}`) ??
       `unknown:${event.pull_request.head.ref}`;
-    if (!store.getSetting(`github-head:${ticket.ticket_id}`)) {
+    if (!prHeadSha && !store.getSetting(`github-head:${ticket.ticket_id}`)) {
       store.setSetting(`github-head:${ticket.ticket_id}`, headSha);
     }
     const reviewBody = event.review.body?.trim() ?? "";
@@ -992,7 +1016,12 @@ export async function handleGithubEvent(
     if (isGithubBotLinkback(author, event.comment.body)) return;
     const instance = pipelines.getInstanceForSession(ticket.session_id);
     const headSha = (instance && !pipelineIsTerminal(instance)
-      ? acknowledgedPublicationHeadAt(pipelines, instance, event.comment.created_at)
+      ? acknowledgedPublicationHeadAt(
+        pipelines,
+        instance,
+        event.comment.created_at,
+        providerObservedGithubHead(store, ticket.ticket_id)
+      )
       : undefined) ??
       store.getSetting(`github-head:${ticket.ticket_id}`) ??
       `unknown:${ticket.branch}`;

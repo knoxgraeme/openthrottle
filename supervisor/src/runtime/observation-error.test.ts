@@ -57,7 +57,7 @@ describe("serializeRuntimeObservationError", () => {
   it("handles circular values, redacts secrets, and bounds text", () => {
     const circular: Record<string, unknown> = {
       status: 503,
-      message: `failed with Bearer secret-token ${"x".repeat(5_000)}`,
+      message: `failed with Bearer secret-token-value-123 ${"x".repeat(5_000)}`,
     };
     circular.self = circular;
 
@@ -66,7 +66,7 @@ describe("serializeRuntimeObservationError", () => {
     expect(result.retryable).toBe(true);
     expect(result.text.length).toBeLessThanOrEqual(1_500);
     expect(result.text).toContain("[REDACTED]");
-    expect(result.text).not.toContain("secret-token");
+    expect(result.text).not.toContain("secret-token-value-123");
   });
 
   it("retains bounded message head and tail diagnostics", () => {
