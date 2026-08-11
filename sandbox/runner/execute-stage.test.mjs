@@ -300,6 +300,24 @@ describe("one-stage executor", () => {
     const slashAttemptRequest = { ...unsealedRequest, attemptId: "parent/child" };
     expect(() => validateStageRequest({ ...slashAttemptRequest, ...createStageRequestHash(slashAttemptRequest) }))
       .toThrow(/attemptId/);
+    const githubIssueRequest = {
+      ...unsealedRequest,
+      issueId: "github:knoxgraeme/openthrottle-v2#194",
+    };
+    expect(validateStageRequest({
+      ...githubIssueRequest,
+      ...createStageRequestHash(githubIssueRequest),
+    })).toMatchObject({ issueId: "github:knoxgraeme/openthrottle-v2#194" });
+    const invalidIssueCharacterRequest = { ...unsealedRequest, issueId: "github:owner/repo#194?" };
+    expect(() => validateStageRequest({
+      ...invalidIssueCharacterRequest,
+      ...createStageRequestHash(invalidIssueCharacterRequest),
+    })).toThrow(/issueId/);
+    const overlongIssueIdRequest = { ...unsealedRequest, issueId: `a${"#".repeat(200)}` };
+    expect(() => validateStageRequest({
+      ...overlongIssueIdRequest,
+      ...createStageRequestHash(overlongIssueIdRequest),
+    })).toThrow(/issueId/);
     const slashNativeSessionRequest = { ...unsealedRequest, nativeSessionId: "native/../sibling" };
     expect(() => validateStageRequest({ ...slashNativeSessionRequest, ...createStageRequestHash(slashNativeSessionRequest) }))
       .toThrow(/nativeSessionId/);
