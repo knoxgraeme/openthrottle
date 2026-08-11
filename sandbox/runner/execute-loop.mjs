@@ -12,10 +12,10 @@ import {
   sanitizeArtifactText,
   validateStandardReceipt,
 } from "./artifacts.mjs";
-import { computeWorkspaceTreeOid } from "./repository-control.mjs";
+import { computeWorkspaceTreeOid, computeWorkspaceTreeOidAsExecutor } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
-import { grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
+import { deriveCandidateCommit, grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
 import {
   chmodOwnerPrivateTree,
   chmodReadOnlyPreservingExecuteTree,
@@ -108,6 +108,7 @@ const MAX_DOWNSTREAM_CONTEXT_BYTES = 32_768;
 const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
 const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
+const RECEIPT_CORRECTION_ATTEMPTS = 1;
 const ROOT_UID = 0;
 const ROOT_GID = 0;
 const ABSOLUTE_PATH = /^\/[^\u0000]{0,500}$/;
@@ -352,6 +353,10 @@ export function loopCredentialsPath({ attemptId, actionId, rootDir = DEFAULT_ACT
   return actionFilePath({ attemptId: stagePathId(attemptId, "attemptId"), actionId: stagePathId(actionId, "actionId"), rootDir }, "credentials.json");
 }
 
+function loopReceiptCorrectionStatePath({ attemptId, actionId, rootDir = DEFAULT_ACTION_ROOT }) {
+  return actionFilePath({ attemptId: stagePathId(attemptId, "attemptId"), actionId: stagePathId(actionId, "actionId"), rootDir }, "receipt-correction.json");
+}
+
 function ensureCurrentActionTraversal(request, rootDir = configuredActionRoot()) {
   const attemptDirectory = pathInside(rootDir, request.attemptId);
   const currentActionDirectory = actionDirectory(request, rootDir);
@@ -580,9 +585,7 @@ export function resolveLoopInvocation(request) {
     : { mode: "fresh", nativeSessionId: null };
 }
 
-export function loopPrompt(request) {
-  const prefix = request.agent === "claude" ? "/" : "$";
-  const entry = `${prefix}${request.skill}`;
+function receiptAuthorityContract(request) {
   const producer = request.expectedProducer
     ? {
         worker_id: request.expectedProducer.workerId,
@@ -593,7 +596,7 @@ export function loopPrompt(request) {
     : {
         skill: request.expectedProducerSkill ?? request.repositorySkill?.reference ?? `builtin://${request.skill}@1`,
       };
-  const contractPayload = {
+  return {
     schema: "openthrottle.loop-receipt-contract/v1",
     pipeline_instance_id: request.pipelineInstanceId ?? null,
     graph_id: request.graphId,
@@ -620,6 +623,13 @@ export function loopPrompt(request) {
     prior_evidence: request.priorEvidence ?? { schema: PRIOR_EVIDENCE_SCHEMA, role: null, receipts: [] },
     downstream_context_hash: digest(canonicalJson(request.downstreamContext ?? [])),
   };
+}
+
+export function loopPrompt(request) {
+  if (request.receiptCorrectionPrompt) return request.receiptCorrectionPrompt;
+  const prefix = request.agent === "claude" ? "/" : "$";
+  const entry = `${prefix}${request.skill}`;
+  const contractPayload = receiptAuthorityContract(request);
   const contract = canonicalJson(contractPayload);
   const priorEvidence = canonicalJson(request.priorEvidence ?? { schema: PRIOR_EVIDENCE_SCHEMA, role: null, receipts: [] });
   const downstreamContext = canonicalJson(request.downstreamContext ?? []);
@@ -682,9 +692,14 @@ function assertProfileRootFence(profileRoot, nonce, sealedSkillTrees = []) {
   }
 }
 
-function packReachableBaseObjects(repoDir, destinationPackBase, subject = "HEAD") {
+function packReachableBaseObjects(repoDir, destinationPackBase, subject = "HEAD", env = {}) {
   const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir), "pack-objects", "--revs", destinationPackBase], {
     cwd: repoDir,
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: "0",
+      ...env,
+    },
     input: `${subject}\n`,
     timeout: 120_000,
     captureBytes: 1024 * 1024,
@@ -758,13 +773,15 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   const destination = pathInside(currentActionDirectory, "repo-view");
   rmSync(destination, { recursive: true, force: true });
   lockNonCurrentActionDirectories(request, actionRoot);
-  const sourceSubject = request.role === "lead"
+  const viewSourceRepoDir = request.receiptCorrectionSourceRepoDir ?? sourceRepoDir;
+  const viewSourceEnv = request.receiptCorrectionGitObjectEnv ?? {};
+  const sourceSubject = request.receiptCorrectionSubject ?? (request.role === "lead"
     ? request.candidateSubject
     : request.role === "reviewer"
       ? request.inputSubject
-      : "HEAD";
-  const subject = runRootGit(sourceRepoDir, ["rev-parse", sourceSubject]);
-  const objectType = runRootGit(sourceRepoDir, ["cat-file", "-t", subject]);
+      : "HEAD");
+  const subject = runRootGit(viewSourceRepoDir, ["rev-parse", sourceSubject], viewSourceEnv);
+  const objectType = runRootGit(viewSourceRepoDir, ["cat-file", "-t", subject], viewSourceEnv);
   if (objectType !== "commit" && objectType !== "tree") {
     throw new Error("read-only repository subject must be a commit or tree");
   }
@@ -772,7 +789,7 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   runRootGit(destination, ["init", "--quiet"]);
   const packDir = pathInside(pathInside(destination, ".git"), "objects/pack");
   mkdirSync(packDir, { recursive: true, mode: 0o755 });
-  packReachableBaseObjects(sourceRepoDir, join(packDir, "authorized"), subject);
+  packReachableBaseObjects(viewSourceRepoDir, join(packDir, "authorized"), subject, viewSourceEnv);
   if (objectType === "commit") {
     runRootGit(destination, ["switch", "--quiet", "--detach", subject]);
   } else {
@@ -954,6 +971,7 @@ function readCodexAuthSnapshot(codexHome, runProcess) {
 // materialized there too -- a built-in Codex skill lives at the separate
 // admin-scope /etc/codex/skills instead, so this must not fire for that case.
 function assertSealedSkillPreflight({ request, profileRoot, runProcess }) {
+  if (request.receiptCorrectionPrompt) return;
   if (request.agent !== "claude" && !request.repositorySkill) return;
   const skillMarkdownPath = pathInside(pathInside(pathInside(profileRoot, "skills"), request.skill), "SKILL.md");
   let result;
@@ -969,6 +987,89 @@ function assertSealedSkillPreflight({ request, profileRoot, runProcess }) {
       `sealed skill ${request.skill} is not readable by the agent uid before launch (${skillMarkdownPath})`,
     );
   }
+}
+
+function receiptCorrectionCredentialEnv(request, credentialEnv) {
+  if (!request.credentialScopes.includes("model.invoke")) return {};
+  const prefixes = request.agent === "claude"
+    ? ["CLAUDE_", "ANTHROPIC_"]
+    : request.agent === "codex"
+      ? ["CODEX_", "OPENAI_"]
+      : [];
+  return Object.fromEntries(
+    Object.entries(credentialEnv).filter(([key]) => prefixes.some((prefix) => key.startsWith(prefix)))
+  );
+}
+
+function receiptCorrectionRepositorySource(request, subject, gitObjectEnv) {
+  if (!subject) return {};
+  if (!request.worktree) return { receiptCorrectionSubject: subject };
+  const worktreeDir = loopWorktreeDirectory(request);
+  try {
+    const baseCommit = request.inputSubject ?? request.baseSubject ?? runRootGit(worktreeDir, ["rev-parse", "HEAD"]);
+    const candidate = deriveCandidateCommit({
+      worktreeDir,
+      baseCommit,
+      message: `OpenThrottle private receipt correction ${request.actionId}`,
+    });
+    return {
+      receiptCorrectionSubject: candidate.candidateCommit ?? candidate.tree,
+      receiptCorrectionSourceRepoDir: worktreeDir,
+    };
+  } catch {
+    return {
+      receiptCorrectionSubject: subject,
+      receiptCorrectionSourceRepoDir: worktreeDir,
+      ...(gitObjectEnv ? { receiptCorrectionGitObjectEnv: gitObjectEnv } : {}),
+    };
+  }
+}
+
+function receiptCorrectionRuntimeRequest(request, prompt, { subject = null, gitObjectEnv = null } = {}) {
+  return {
+    ...request,
+    role: "reviewer",
+    loop: "review",
+    worktree: null,
+    candidateSubject: null,
+    priorEvidence: undefined,
+    downstreamContext: undefined,
+    allowedMcpServers: [],
+    credentialScopes: request.credentialScopes.includes("model.invoke") ? ["model.invoke"] : [],
+    repositorySkill: undefined,
+    ...receiptCorrectionRepositorySource(request, subject, gitObjectEnv),
+    receiptCorrectionPrompt: prompt,
+  };
+}
+
+function readReceiptCorrectionState(request) {
+  const path = loopReceiptCorrectionStatePath({
+    attemptId: request.attemptId,
+    actionId: request.actionId,
+    rootDir: configuredActionRoot(),
+  });
+  if (!existsSync(path)) return null;
+  const state = JSON.parse(readFileSync(path, "utf8"));
+  if (state?.schema !== "openthrottle.loop-receipt-correction/v1" ||
+      state.request_hash !== request.requestHash ||
+      state.action_id !== request.actionId ||
+      state.attempt_id !== request.attemptId ||
+      !Array.isArray(state.diagnostics) ||
+      typeof state.invalid_receipt_text !== "string") {
+    throw new Error("loop receipt correction state is invalid");
+  }
+  return state;
+}
+
+function writeReceiptCorrectionState(request, state) {
+  const currentActionDirectory = ensureCurrentActionTraversal(request);
+  writeJsonAtomic(pathInside(currentActionDirectory, "receipt-correction.json"), {
+    schema: "openthrottle.loop-receipt-correction/v1",
+    action_id: request.actionId,
+    attempt_id: request.attemptId,
+    request_hash: request.requestHash,
+    ...state,
+  });
 }
 
 export function runLoopAgentInPreparedRepository({
@@ -1177,7 +1278,9 @@ export function parseLoopReceipt(raw, env = process.env) {
   // scan happened to reach first.
   let ambiguityError = null;
   let nestedError = null;
+  let nestedCandidate = null;
   let topError = null;
+  let topCandidate = null;
   const asReceipt = { qualifies: isStandardReceiptShaped, label: "receipt" };
   const codexAmbiguity = ambiguousCodexReceiptError(sanitized, asReceipt);
   if (codexAmbiguity) {
@@ -1194,13 +1297,21 @@ export function parseLoopReceipt(raw, env = process.env) {
         return validateStandardReceipt(parsed, env);
       } catch (error) {
         topError ??= error;
+        topCandidate ??= parsed;
         for (const nested of receiptCandidatesFromJson(parsed)) {
           try {
             const normalized = typeof nested === "string" ? parseAgentJson(nested, asReceipt) : nested;
             return validateStandardReceipt(normalized, env);
           } catch (error) {
             if (error?.ambiguousAgentJson) ambiguityError ??= error;
-            else nestedError ??= error;
+            else {
+              nestedError ??= error;
+              try {
+                nestedCandidate ??= typeof nested === "string" ? parseAgentJson(nested, asReceipt) : nested;
+              } catch {
+                // Keep the validator message as the primary diagnostic.
+              }
+            }
           }
         }
       }
@@ -1211,7 +1322,149 @@ export function parseLoopReceipt(raw, env = process.env) {
   }
   const cause = ambiguityError ?? nestedError ?? topError;
   const detail = cause instanceof Error ? cause.message : cause ? String(cause) : "";
-  throw new Error(`loop action emitted invalid standard receipt${detail ? `: ${detail}` : ""}`);
+  const error = new Error(`loop action emitted invalid standard receipt${detail ? `: ${detail}` : ""}`);
+  error.invalidReceiptCandidate = nestedCandidate ?? topCandidate;
+  throw error;
+}
+
+function jsonPointerFromLabel(label) {
+  const normalized = label
+    .replace(/^loop action emitted invalid standard receipt:\s*/, "")
+    .replace(/^standard receipt(?:\s+|$)/, "")
+    .replace(/^payload\b/, "payload")
+    .replace(/^producer\b/, "producer")
+    .replace(/^subject\b/, "subject")
+    .replace(/^fence\b/, "fence")
+    .replace(/\s+has unknown field\s+([A-Za-z0-9_]+).*$/, " $1")
+    .replace(/\s+is missing field\s+([A-Za-z0-9_]+).*$/, " $1")
+    .replace(/\s+(?:must|is|has|exceeds|cannot|does|may)\b.*$/, "")
+    .trim();
+  if (!normalized) return "/";
+  const parts = [];
+  for (const segment of normalized.split(/\s+/)) {
+    const matches = segment.matchAll(/([^[\]]+)|\[(\d+)\]/g);
+    for (const match of matches) parts.push(match[1] ?? match[2]);
+  }
+  return `/${parts.map((segment) => segment.replace(/~/g, "~0").replace(/\//g, "~1")).join("/")}`;
+}
+
+function valueAtPointer(value, pointer) {
+  if (pointer === "/") return value;
+  let current = value;
+  for (const rawPart of pointer.slice(1).split("/")) {
+    const part = rawPart.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (current == null || typeof current !== "object") return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function observedSummary(value) {
+  if (value === undefined) return "missing";
+  if (value === null) return "null";
+  if (Array.isArray(value)) return `array(${value.length})`;
+  if (typeof value === "object") return "object";
+  if (typeof value === "string") return `string(${value.length})`;
+  return typeof value;
+}
+
+function expectedSummary(message) {
+  if (/unknown field/.test(message)) return "field absent";
+  if (/missing field/.test(message)) return "required field present";
+  if (/must be a string|must be a non-empty string/.test(message)) return "string";
+  if (/must contain at most \d+ items|must be an array/.test(message)) return "array";
+  if (/must be an object/.test(message)) return "object";
+  if (/generation/.test(message)) return "integer";
+  if (/fence mismatch/.test(message)) return "authoritative sealed fence value";
+  return "standard receipt contract";
+}
+
+function receiptCorrectionDiagnostics({ errorMessage, invalidReceipt, request, subject }) {
+  const diagnostics = [];
+  const add = (pointer, expected, observed, message) => {
+    diagnostics.push({
+      pointer,
+      expected,
+      observed,
+      message: sanitizeArtifactText(String(message ?? errorMessage)).slice(0, 500),
+    });
+  };
+  if (/loop receipt request fence mismatch/.test(errorMessage) && invalidReceipt?.fence) {
+    const expected = {
+      "/fence/attempt_id": request.attemptId,
+      "/fence/request_hash": request.requestHash,
+      "/fence/action_attempt_id": request.actionId,
+    };
+    for (const [pointer, expectedValue] of Object.entries(expected)) {
+      const observed = valueAtPointer(invalidReceipt, pointer);
+      if (observed !== expectedValue) add(pointer, JSON.stringify(expectedValue), JSON.stringify(observed), errorMessage);
+    }
+  } else if (/loop receipt .*fence mismatch|loop receipt .*subject mismatch|loop receipt producer/.test(errorMessage) && invalidReceipt) {
+    const contract = receiptAuthorityContract(request);
+    const candidates = {
+      "/fence/pipeline_instance_id": contract.pipeline_instance_id,
+      "/fence/graph_digest": contract.graph_digest,
+      "/fence/parent_run_id": contract.parent_run_id,
+      "/fence/generation": contract.generation,
+      "/fence/native_session_id": contract.native_session_id,
+      "/fence/unit_id": contract.unit_id,
+      "/subject/base": contract.subject.base,
+      "/subject/pre": contract.subject.pre,
+      "/subject/post": subject,
+      "/producer/skill": contract.producer.skill,
+    };
+    for (const [pointer, expectedValue] of Object.entries(candidates)) {
+      if (expectedValue === undefined) continue;
+      const observed = valueAtPointer(invalidReceipt, pointer);
+      if (observed !== expectedValue) add(pointer, JSON.stringify(expectedValue), JSON.stringify(observed), errorMessage);
+    }
+  }
+  if (diagnostics.length === 0) {
+    const pointer = jsonPointerFromLabel(errorMessage);
+    add(pointer, expectedSummary(errorMessage), observedSummary(valueAtPointer(invalidReceipt, pointer)), errorMessage);
+  }
+  return diagnostics.slice(0, 8);
+}
+
+function receiptCorrectionPrompt({ request, invalidReceipt, diagnostics, invalidReceiptText }) {
+  const contract = canonicalJson(receiptAuthorityContract(request));
+  const diagnosticJson = canonicalJson({
+    schema: "openthrottle.receipt-correction-diagnostics/v1",
+    attempts_allowed: RECEIPT_CORRECTION_ATTEMPTS,
+    diagnostics,
+  });
+  const invalid = invalidReceipt
+    ? canonicalJson(invalidReceipt)
+    : sanitizeArtifactText(invalidReceiptText ?? "").slice(0, 16_384);
+  return `This is a receipt-correction continuation for fenced OpenThrottle loop action ${request.actionId}. ` +
+    `The implementation action already exited successfully. Do not run commands, do not inspect unrelated files, ` +
+    `do not edit the repository or worktree, and do not change the completed work. Return only one corrected ` +
+    `${request.receiptSchema} JSON receipt envelope.\n\n` +
+    `The corrected receipt must echo this authoritative Receipt Authority Contract exactly for every fence, ` +
+    `subject, producer, schema, type, assurance, and result field it governs. Do not coerce, invent, copy from a ` +
+    `parent run, rerun commands, mutate files, or depend on runtime field-stripping; author a valid closed-schema ` +
+    `replacement envelope.\n\n` +
+    `## Receipt Authority Contract\n${contract}\n\n` +
+    `## Receipt Diagnostics\n${diagnosticJson}\n\n` +
+    `## Invalid Receipt Candidate\n${invalid}`;
+}
+
+function privateRecoveryReference(request, worktreeDir, subject, env) {
+  if (!worktreeDir) return subject ? `private_recovery_subject=${subject}` : "private_recovery_subject=unavailable";
+  try {
+    const baseCommit = request.inputSubject ?? request.baseSubject ?? runRootGit(worktreeDir, ["rev-parse", "HEAD"]);
+    const candidate = deriveCandidateCommit({
+      worktreeDir,
+      baseCommit,
+      message: `OpenThrottle private receipt recovery ${request.actionId}`,
+    });
+    return `private_recovery_commit=${candidate.candidateCommit ?? "<clean>"} tree=${candidate.tree}`;
+  } catch (error) {
+    return sanitizeArtifactText(
+      `private_recovery_subject=${subject ?? "unavailable"} recovery_commit_error=${error instanceof Error ? error.message : String(error)}`,
+      env
+    ).slice(0, 1_000);
+  }
 }
 
 function assertLoopReceiptFence(receipt, request, subject) {
@@ -1288,6 +1541,7 @@ export function executeLoopAction({
   let sanitizeEnv = { ...process.env, ...credentialEnv };
   let result;
   let execution;
+  const persistedCorrectionState = readReceiptCorrectionState(request);
   try {
     const invocation = resolveLoopInvocation(request);
     // Fail closed before ever spawning the engine: a retry that finds no
@@ -1299,7 +1553,19 @@ export function executeLoopAction({
     // with `reason=credential_missing` without ever running `runLoopAgent`.
     const requiresEngineCredential = request.credentialScopes.includes("model.invoke");
     try {
-      execution = requiresEngineCredential && credentialEnvelopeMissing
+      execution = persistedCorrectionState
+        ? {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: persistedCorrectionState.invalid_receipt_text,
+          stderr: "",
+          nativeSessionId: persistedCorrectionState.native_session_id ?? request.nativeSessionId,
+          integrationRepoDir,
+          codexAuthJson: persistedCorrectionState.codex_auth_json ?? null,
+          gitObjectEnv: persistedCorrectionState.git_object_env ?? undefined,
+        }
+        : requiresEngineCredential && credentialEnvelopeMissing
         ? {
           status: null,
           signal: null,
@@ -1356,9 +1622,9 @@ export function executeLoopAction({
       sanitizeEnv = { ...sanitizeEnv, OT_ROTATED_CODEX_AUTH_JSON: execution.codexAuthJson };
     }
     const worktreeDir = loopWorktreeDirectory(request);
-    let subject = null;
+    let subject = persistedCorrectionState?.subject ?? null;
     let subjectError = null;
-    if (worktreeDir) {
+    if (worktreeDir && !persistedCorrectionState) {
       try {
         subject = computeWorkspaceTreeOid(worktreeDir, execution.gitObjectEnv ?? undefined);
       } catch (error) {
@@ -1367,12 +1633,160 @@ export function executeLoopAction({
     }
     let parsedReceipt = null;
     let receiptError = null;
-    if (!subjectError && !execution.timedOut && !execution.signal && execution.status === 0) {
+    let receiptErrorObject = null;
+    let correctionExecution = null;
+    let correctionDiagnostics = [];
+    let recoveryReference = null;
+    if (persistedCorrectionState) {
+      receiptError = persistedCorrectionState.original_error;
+      correctionDiagnostics = persistedCorrectionState.diagnostics;
+      receiptErrorObject = {
+        invalidReceiptCandidate: persistedCorrectionState.invalid_receipt ?? null,
+      };
+      const invalidReceipt = receiptErrorObject.invalidReceiptCandidate;
+      const correctionPrompt = receiptCorrectionPrompt({
+        request,
+        invalidReceipt,
+        diagnostics: correctionDiagnostics,
+        invalidReceiptText: persistedCorrectionState.invalid_receipt_text,
+      });
+      const correctionRequest = receiptCorrectionRuntimeRequest(request, correctionPrompt, {
+        subject,
+        gitObjectEnv: execution.gitObjectEnv ?? null,
+      });
+      const correctionInvocation = execution.nativeSessionId
+        ? { mode: "resume", nativeSessionId: execution.nativeSessionId }
+        : resolveLoopInvocation(request);
+      try {
+        correctionExecution = runLoopAgent({
+          request: correctionRequest,
+          invocation: correctionInvocation,
+          integrationRepoDir,
+          credentialEnv: receiptCorrectionCredentialEnv(request, credentialEnv),
+        });
+        if (correctionExecution.codexAuthJson) {
+          sanitizeEnv = { ...sanitizeEnv, OT_ROTATED_CODEX_AUTH_JSON: correctionExecution.codexAuthJson };
+        }
+        let correctionSubject = subject;
+        const worktreeDirAfterCorrection = loopWorktreeDirectory(request);
+        if (worktreeDirAfterCorrection) {
+          correctionSubject = computeWorkspaceTreeOidAsExecutor(
+            worktreeDirAfterCorrection,
+            correctionExecution.gitObjectEnv ?? execution.gitObjectEnv ?? undefined
+          );
+        }
+        if (correctionSubject !== subject) {
+          throw new Error("receipt correction mutated the candidate tree");
+        }
+        if (!correctionExecution.timedOut && !correctionExecution.signal && correctionExecution.status === 0) {
+          const correctedReceipt = parseLoopReceipt(correctionExecution.stdout, sanitizeEnv);
+          assertLoopReceiptFence(correctedReceipt, request, subject);
+          parsedReceipt = correctedReceipt;
+          receiptError = null;
+          receiptErrorObject = null;
+        } else {
+          const correctionFailure = launchDiagnosticTail({
+            stdout: correctionExecution.stdout ?? "",
+            stderr: correctionExecution.stderr ?? "",
+            env: sanitizeEnv,
+          });
+          throw new Error(correctionFailure || "receipt correction did not exit successfully");
+        }
+      } catch (error) {
+        receiptError = [
+          `agent_output_contract_failure: receipt correction exhausted after ${RECEIPT_CORRECTION_ATTEMPTS} attempt`,
+          `original=${receiptError}`,
+          `correction=${error instanceof Error ? error.message : String(error)}`,
+          `diagnostics=${canonicalJson(correctionDiagnostics)}`,
+        ].join(" ");
+        const worktreeDir = loopWorktreeDirectory(request);
+        recoveryReference = privateRecoveryReference(request, worktreeDir, subject, sanitizeEnv);
+      }
+    } else if (!subjectError && !execution.timedOut && !execution.signal && execution.status === 0) {
       try {
         parsedReceipt = parseLoopReceipt(execution.stdout, sanitizeEnv);
         assertLoopReceiptFence(parsedReceipt, request, subject);
       } catch (error) {
         receiptError = error instanceof Error ? error.message : String(error);
+        receiptErrorObject = error;
+      }
+      if (receiptError) {
+        const invalidReceipt = parsedReceipt ?? receiptErrorObject?.invalidReceiptCandidate ?? null;
+        correctionDiagnostics = receiptCorrectionDiagnostics({
+          errorMessage: receiptError,
+          invalidReceipt,
+          request,
+          subject,
+        });
+        writeReceiptCorrectionState(request, {
+          original_error: receiptError,
+          invalid_receipt: invalidReceipt,
+          invalid_receipt_text: execution.stdout,
+          diagnostics: correctionDiagnostics,
+          subject,
+          native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
+          codex_auth_json: execution.codexAuthJson ?? null,
+          git_object_env: execution.gitObjectEnv ?? null,
+          created_at: now(),
+        });
+        const correctionPrompt = receiptCorrectionPrompt({
+          request,
+          invalidReceipt,
+          diagnostics: correctionDiagnostics,
+          invalidReceiptText: execution.stdout,
+        });
+        const correctionRequest = receiptCorrectionRuntimeRequest(request, correctionPrompt, {
+          subject,
+          gitObjectEnv: execution.gitObjectEnv ?? null,
+        });
+        const correctionInvocation = execution.nativeSessionId
+          ? { mode: "resume", nativeSessionId: execution.nativeSessionId }
+          : resolveLoopInvocation(request);
+        try {
+          correctionExecution = runLoopAgent({
+            request: correctionRequest,
+            invocation: correctionInvocation,
+            integrationRepoDir,
+            credentialEnv: receiptCorrectionCredentialEnv(request, credentialEnv),
+          });
+          if (correctionExecution.codexAuthJson) {
+            sanitizeEnv = { ...sanitizeEnv, OT_ROTATED_CODEX_AUTH_JSON: correctionExecution.codexAuthJson };
+          }
+          let correctionSubject = subject;
+          const worktreeDirAfterCorrection = loopWorktreeDirectory(request);
+          if (worktreeDirAfterCorrection) {
+            correctionSubject = computeWorkspaceTreeOidAsExecutor(
+              worktreeDirAfterCorrection,
+              correctionExecution.gitObjectEnv ?? execution.gitObjectEnv ?? undefined
+            );
+          }
+          if (correctionSubject !== subject) {
+            throw new Error("receipt correction mutated the candidate tree");
+          }
+          if (!correctionExecution.timedOut && !correctionExecution.signal && correctionExecution.status === 0) {
+            const correctedReceipt = parseLoopReceipt(correctionExecution.stdout, sanitizeEnv);
+            assertLoopReceiptFence(correctedReceipt, request, subject);
+            parsedReceipt = correctedReceipt;
+            receiptError = null;
+            receiptErrorObject = null;
+          } else {
+            const correctionFailure = launchDiagnosticTail({
+              stdout: correctionExecution.stdout ?? "",
+              stderr: correctionExecution.stderr ?? "",
+              env: sanitizeEnv,
+            });
+            throw new Error(correctionFailure || "receipt correction did not exit successfully");
+          }
+        } catch (error) {
+          receiptError = [
+            `agent_output_contract_failure: receipt correction exhausted after ${RECEIPT_CORRECTION_ATTEMPTS} attempt`,
+            `original=${receiptError}`,
+            `correction=${error instanceof Error ? error.message : String(error)}`,
+            `diagnostics=${canonicalJson(correctionDiagnostics)}`,
+          ].join(" ");
+          const worktreeDir = loopWorktreeDirectory(request);
+          recoveryReference = privateRecoveryReference(request, worktreeDir, subject, sanitizeEnv);
+        }
       }
     }
     const retryableInfrastructureFailure = Boolean(execution.retryableInfrastructureFailure);
@@ -1417,12 +1831,13 @@ export function executeLoopAction({
         launchFailure.remediation,
         subjectError,
         receiptError,
+        recoveryReference,
         diagnosticTail,
       ].filter(Boolean).join(" ")
       : execution.executorFailure
         ? (execution.stderr || subjectError || receiptError || "loop action failed")
         : subjectError ||
-          (receiptError ? [receiptError, diagnosticTail].filter(Boolean).join(" ") : "") ||
+          (receiptError ? [receiptError, recoveryReference, diagnosticTail].filter(Boolean).join(" ") : "") ||
           execution.stdout || execution.stderr ||
           (failed ? "loop action failed" : "loop action completed");
     result = {
@@ -1435,7 +1850,7 @@ export function executeLoopAction({
       outcome: retryableInfrastructureFailure || launchFailure?.retryable
         ? "retryable_infrastructure_failure"
         : failed ? "failure" : "success",
-      native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
+      native_session_id: correctionExecution?.nativeSessionId ?? execution.nativeSessionId ?? request.nativeSessionId ?? null,
       subject: subject ?? parsedReceipt?.subject?.post ?? null,
       receipt: parsedReceipt && !receiptError
         ? canonicalJson(parsedReceipt)
@@ -1447,7 +1862,9 @@ export function executeLoopAction({
       // and truncated above): this travels as its own typed field so a
       // rotated Codex refresh token is captured regardless of the action's
       // semantic outcome, without ever passing through free-text logging.
-      ...(execution.codexAuthJson ? { codex_auth_json: execution.codexAuthJson } : {}),
+      ...(correctionExecution?.codexAuthJson || execution.codexAuthJson
+        ? { codex_auth_json: correctionExecution?.codexAuthJson ?? execution.codexAuthJson }
+        : {}),
     };
   } finally {
     const cleanups = [
