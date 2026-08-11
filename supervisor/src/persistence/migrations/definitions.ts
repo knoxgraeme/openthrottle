@@ -2055,7 +2055,122 @@ backfill-contract:legacy publish_linear effects and linear_ledger receipts are r
 const neutralControlIdentifierMigrationSource = `
 rename live control-plane ticket/session/context identifiers from Linear-shaped storage names to provider-neutral storage names
 tables: tickets,runs,agent_sessions,control_outbox,session_inbox,pipeline_instances,work_items,work_deliveries,provider_events,feedback_snapshots,session_executions,run_outcomes,execution_publication_events
-backfill-contract:existing rows are retained in place, provider identity remains linear, external thread ids retain the old Linear issue id, internal ticket ids become linear-prefixed, and foreign keys must remain valid/v2`;
+backfill-contract:existing rows are retained in place, provider identity remains linear, external thread ids retain the old Linear issue id, internal ticket ids become linear-prefixed, and foreign keys must remain valid/v3
+github-head-fence-contract:head, source, and every per-source watermark move together; authoritative state wins, same-source higher sequence wins, and watermark collisions retain the highest sequence/v1`;
+
+type GithubHeadSource =
+  | { kind: "authoritative" }
+  | { kind: "sequenced"; source: string; sequence: number };
+
+function parseGithubHeadSource(value: string | undefined): GithubHeadSource | undefined {
+  if (value === "authoritative") return { kind: "authoritative" };
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as { source?: unknown; sequence?: unknown };
+    if (typeof parsed.source !== "string" || !parsed.source ||
+        !Number.isSafeInteger(parsed.sequence)) return undefined;
+    return { kind: "sequenced", source: parsed.source, sequence: parsed.sequence as number };
+  } catch {
+    return undefined;
+  }
+}
+
+function legacyGithubHeadWins(input: {
+  legacyHead: string | undefined;
+  legacySource: string | undefined;
+  currentHead: string | undefined;
+  currentSource: string | undefined;
+}): boolean {
+  if (!input.legacyHead) return false;
+  if (!input.currentHead) return true;
+  const legacy = parseGithubHeadSource(input.legacySource);
+  const current = parseGithubHeadSource(input.currentSource);
+  if (current?.kind === "authoritative") return false;
+  if (legacy?.kind === "authoritative") return true;
+  if (!current && legacy) return true;
+  if (!legacy || !current || legacy.kind !== "sequenced" || current.kind !== "sequenced") {
+    return false;
+  }
+  return legacy.source === current.source && legacy.sequence > current.sequence;
+}
+
+function newestGithubHeadWatermark(
+  legacy: string | undefined,
+  current: string | undefined
+): string | undefined {
+  if (legacy === undefined) return current;
+  if (current === undefined) return legacy;
+  const legacySequence = Number(legacy);
+  const currentSequence = Number(current);
+  const legacyValid = Number.isSafeInteger(legacySequence);
+  const currentValid = Number.isSafeInteger(currentSequence);
+  if (legacyValid && currentValid) {
+    return legacySequence > currentSequence ? String(legacySequence) : current;
+  }
+  if (legacyValid) return String(legacySequence);
+  return current;
+}
+
+function rekeyGithubHeadSettings(db: Database.Database, rawTicketIds: string[]): void {
+  if (rawTicketIds.length === 0 || !hasTable(db, "settings")) return;
+  const rows = db.prepare("SELECT key, value FROM settings").all() as Array<{
+    key: string;
+    value: string;
+  }>;
+  const settings = new Map(rows.map((row) => [row.key, row.value]));
+  const upsert = db.prepare(`
+    INSERT INTO settings(key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `);
+  const remove = db.prepare("DELETE FROM settings WHERE key = ?");
+  const set = (key: string, value: string): void => {
+    upsert.run(key, value);
+    settings.set(key, value);
+  };
+  const drop = (key: string): void => {
+    remove.run(key);
+    settings.delete(key);
+  };
+
+  // Longest first prevents a ticket id that is a prefix of another ticket id
+  // from claiming the longer id's watermark suffix.
+  for (const rawTicketId of [...rawTicketIds].sort((left, right) => right.length - left.length)) {
+    const ticketId = `linear:${rawTicketId}`;
+    const legacyHeadKey = `github-head:${rawTicketId}`;
+    const legacySourceKey = `github-head-source:${rawTicketId}`;
+    const currentHeadKey = `github-head:${ticketId}`;
+    const currentSourceKey = `github-head-source:${ticketId}`;
+    const legacyHead = settings.get(legacyHeadKey);
+    const legacySource = settings.get(legacySourceKey);
+    const currentHead = settings.get(currentHeadKey);
+    const currentSource = settings.get(currentSourceKey);
+    if (legacyHead !== undefined || legacySource !== undefined) {
+      const useLegacy = legacyGithubHeadWins({
+        legacyHead,
+        legacySource,
+        currentHead,
+        currentSource,
+      });
+      const head = useLegacy ? legacyHead : currentHead ?? legacyHead;
+      const source = useLegacy ? legacySource : currentSource ?? legacySource;
+      if (head !== undefined) set(currentHeadKey, head);
+      if (source !== undefined) set(currentSourceKey, source);
+      drop(legacyHeadKey);
+      drop(legacySourceKey);
+    }
+
+    const legacyWatermarkPrefix = `github-head-watermark:${rawTicketId}:`;
+    for (const [legacyKey, legacyValue] of [...settings]) {
+      if (!legacyKey.startsWith(legacyWatermarkPrefix)) continue;
+      const source = legacyKey.slice(legacyWatermarkPrefix.length);
+      if (!source) continue;
+      const currentKey = `github-head-watermark:${ticketId}:${source}`;
+      const watermark = newestGithubHeadWatermark(legacyValue, settings.get(currentKey));
+      if (watermark !== undefined) set(currentKey, watermark);
+      drop(legacyKey);
+    }
+  }
+}
 
 function migrateNeutralControlIdentifiers(db: Database.Database): void {
   db.exec("PRAGMA foreign_keys = OFF");
@@ -2108,6 +2223,10 @@ function migrateNeutralControlIdentifiers(db: Database.Database): void {
     ] as const) {
       if (!hasColumns(db, "tickets", [column])) db.exec(sql);
     }
+    const rawLinearTicketIds = db.prepare(`
+      SELECT ticket_id FROM tickets
+      WHERE control_provider = 'linear' AND ticket_id NOT LIKE 'linear:%'
+    `).all().map((row) => (row as { ticket_id: string }).ticket_id);
     db.exec(`
       UPDATE tickets
       SET control_provider = COALESCE(control_provider, 'linear'),
@@ -2137,14 +2256,7 @@ function migrateNeutralControlIdentifiers(db: Database.Database): void {
         )
       `);
     }
-    if (hasTable(db, "settings")) {
-      db.exec(`
-        UPDATE settings
-        SET key = 'github-head:linear:' || substr(key, length('github-head:') + 1)
-        WHERE key LIKE 'github-head:%'
-          AND substr(key, length('github-head:') + 1) NOT LIKE 'linear:%'
-      `);
-    }
+    rekeyGithubHeadSettings(db, rawLinearTicketIds);
     db.exec(`
       UPDATE tickets
       SET ticket_id = 'linear:' || ticket_id
