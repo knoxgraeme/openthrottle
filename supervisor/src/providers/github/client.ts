@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { ControlThreadEvent } from "../../app/ports.js";
+import { sanitizeText } from "../../shared/sanitize.js";
 
 const HTTP_TIMEOUT_MS = 15_000;
 const GITHUB_PULL_REQUEST_URL_PATTERN =
@@ -372,12 +373,15 @@ export async function getRepositoryCollaboratorPermission(
   return "none";
 }
 
-function escapeXml(value: string): string {
+function escapeXmlText(value: string): string {
   return value
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll("\"", "&quot;");
+    .replaceAll(">", "&gt;");
+}
+
+function escapeXml(value: string): string {
+  return escapeXmlText(value).replaceAll("\"", "&quot;");
 }
 
 function boundedGithubIssueContext(input: {
@@ -393,35 +397,41 @@ function boundedGithubIssueContext(input: {
   }>;
   paginationTruncated: boolean;
 }): string {
-  const title = input.title.slice(0, 1_000);
-  const body = input.body.slice(0, 20_000);
+  const identifier = sanitizeText(input.identifier);
+  const title = sanitizeText(input.title).slice(0, 1_000);
+  const body = sanitizeText(input.body).slice(0, 20_000);
   const issue = [
-    `<issue identifier="${escapeXml(input.identifier)}">`,
-    `<title>${escapeXml(title)}</title>`,
-    `<description>${escapeXml(body)}</description>`,
+    `<issue identifier="${escapeXml(identifier)}">`,
+    `<title>${escapeXmlText(title)}</title>`,
     `</issue>`,
   ].join("");
-  const primary = [
-    `<primary-directive-thread comment-id="github-issue-body">`,
-    `<comment>${escapeXml(body || title)}</comment>`,
-    `</primary-directive-thread>`,
-  ].join("");
-  const optional = [...input.comments]
-    .sort((left, right) =>
-      left.createdAt.localeCompare(right.createdAt) || left.id - right.id
-    )
-    .map((comment) => [
-    `<other-thread comment-id="github-comment-${comment.id}" author="${escapeXml(comment.author)}" url="${escapeXml(comment.url)}" created-at="${escapeXml(comment.createdAt)}">`,
-    `<comment>${escapeXml(comment.body.slice(0, 4_000))}</comment>`,
-    `</other-thread>`,
-  ].join(""));
-  const selected: string[] = [];
-  let omitted = 0;
   const omissionSection = (count: number) => [
     `<other-thread comment-id="github-comments-omitted" author="openthrottle" omitted-count="${count}" pagination-truncated="${input.paginationTruncated}">`,
     `<comment>Older GitHub Issue comments were omitted by the deterministic context bound.</comment>`,
     `</other-thread>`,
   ].join("");
+  const primaryPrefix = `<primary-directive-thread comment-id="github-issue-body"><comment>`;
+  const primarySuffix = `</comment></primary-directive-thread>`;
+  const directive = body.trim().length > 0 ? body : title;
+  const primary = `${primaryPrefix}${escapeXmlText(directive)}${primarySuffix}`;
+  const optional = input.comments
+    .map((comment) => ({
+      ...comment,
+      body: sanitizeText(comment.body).slice(0, 4_000),
+      author: sanitizeText(comment.author),
+      url: sanitizeText(comment.url),
+      createdAt: sanitizeText(comment.createdAt),
+    }))
+    .sort((left, right) =>
+      left.createdAt.localeCompare(right.createdAt) || left.id - right.id
+    )
+    .map((comment) => [
+    `<other-thread comment-id="github-comment-${comment.id}" author="${escapeXml(comment.author)}" url="${escapeXml(comment.url)}" created-at="${escapeXml(comment.createdAt)}">`,
+    `<comment>${escapeXmlText(comment.body)}</comment>`,
+    `</other-thread>`,
+  ].join(""));
+  const selected: string[] = [];
+  let omitted = 0;
   for (let index = optional.length - 1; index >= 0; index -= 1) {
     const candidate = optional[index]!;
     const marker = omissionSection(omitted + index);

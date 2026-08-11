@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { parseExecutionPlanContract } from "@openthrottle/contracts";
 import { describe, expect, it, vi } from "vitest";
 import { createSupervisorStore } from "../../persistence/store.js";
 import { openDb } from "../../persistence/database.js";
@@ -11,6 +12,7 @@ import {
   handleGithubEvent,
 } from "./events.js";
 import { composeBoundedTaskContext } from "../../app/admission-context.js";
+import { extractJsonBlocks } from "../../pipeline/markdown.js";
 import {
   OPENTHROTTLE_WEBHOOK_EVENTS,
   branchExists,
@@ -823,12 +825,278 @@ describe("GitHub contracts", () => {
     expect(context.length).toBeLessThanOrEqual(64_000);
     expect(context).toContain(`<issue identifier="GH-12">`);
     expect(context).toContain("Use &lt;GitHub&gt; control");
+    expect(context).toContain(`<primary-directive-thread comment-id="github-issue-body">`);
+    expect(context).toContain(`<comment>Implement &amp; verify.</comment>`);
+    expect(context).not.toContain("<description>");
     expect(context).toContain(`<other-thread comment-id="github-comment-101"`);
     expect(context).toContain(`author="new-author-101"`);
     expect(context).toContain(`url="https://github.com/owner/repo/issues/12#issuecomment-101"`);
     expect(context).toContain("Newest pre-admission comment 105.");
     expect(context.indexOf("comment 101.")).toBeLessThan(context.indexOf("comment 105."));
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps an Issue body selection authoritative exactly once through admission context", async () => {
+    const instruction = "A & B < C > D";
+    const executionPlan = {
+      schema: "openthrottle.execution-plan/v1",
+      graph_id: "structured",
+      plan_id: "github-context-round-trip",
+      instructions: { compare: instruction },
+      acceptance: { exact: "The instruction round-trips exactly." },
+      units: [{
+        id: "context",
+        title: "Preserve context",
+        depends_on: [],
+        instructions: ["compare"],
+        acceptance: ["exact"],
+      }],
+      commands: [],
+    };
+    const selection = {
+      schema: "openthrottle.ship-selection/v1",
+      graph_id: "structured",
+    };
+    const body = [
+      "Implement the <approved> & reviewed plan.",
+      "```json openthrottle.execution-plan/v1",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify(selection, null, 2),
+      "```",
+    ].join("\n");
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/repo/issues/194")) {
+        return Response.json({
+          number: 194,
+          title: "Ship the structured plan",
+          body,
+          html_url: "https://github.com/owner/repo/issues/194",
+        });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/194/comments?per_page=100")) {
+        return Response.json([]);
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+
+    const context = await fetchGithubIssueContext(
+      { token: "read-token", fetch: fetchMock },
+      "owner/repo",
+      194
+    );
+    const admission = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "GH-194",
+    });
+    const selections = extractJsonBlocks(
+      admission.selectionContext,
+      "openthrottle.ship-selection/v1"
+    );
+    const plans = extractJsonBlocks(
+      admission.selectionContext,
+      "openthrottle.execution-plan/v1"
+    );
+
+    expect(admission.selectionError).toBeUndefined();
+    expect(admission.ordinaryLimitError).toBeUndefined();
+    expect(context.match(/```json openthrottle\.ship-selection\/v1/g)).toHaveLength(1);
+    expect(selections).toHaveLength(1);
+    expect(plans).toHaveLength(1);
+    expect(JSON.parse(selections[0]!)).toEqual(selection);
+    expect(parseExecutionPlanContract(plans[0]!, { source: "github.issue" }).value)
+      .toMatchObject({ instructions: { compare: instruction } });
+    expect(admission.context).toContain("A &amp; B &lt; C &gt; D");
+    expect(admission.selectionContext).toContain("Ship the structured plan");
+    expect(admission.selectionContext).toContain("Implement the <approved> & reviewed plan.");
+  });
+
+  it.each([null, "", " \n\t"])(
+    "uses the Issue title as the primary directive when the body is empty or whitespace-only",
+    async (body) => {
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/repos/owner/repo/issues/195")) {
+          return Response.json({
+            number: 195,
+            title: "Ship <empty> body & preserve direction",
+            body,
+            html_url: "https://github.com/owner/repo/issues/195",
+          });
+        }
+        if (url.endsWith("/repos/owner/repo/issues/195/comments?per_page=100")) {
+          return Response.json([]);
+        }
+        throw new Error(`unexpected request ${url}`);
+      });
+
+      const context = await fetchGithubIssueContext(
+        { token: "read-token", fetch: fetchMock },
+        "owner/repo",
+        195
+      );
+      const admission = composeBoundedTaskContext(context, {
+        requireLinearSections: true,
+        expectedIssueIdentifier: "GH-195",
+      });
+
+      expect(admission.selectionError).toBeUndefined();
+      expect(admission.ordinaryLimitError).toBeUndefined();
+      expect(context).toContain(`<title>Ship &lt;empty&gt; body &amp; preserve direction</title>`);
+      expect(context).toContain(`<comment>Ship &lt;empty&gt; body &amp; preserve direction</comment>`);
+      expect(context).not.toContain("<description>");
+      expect(admission.selectionContext).toContain("Ship <empty> body & preserve direction");
+    }
+  );
+
+  it("redacts raw Issue fields before XML encoding", async () => {
+    const secret = "A&B<C";
+    const previousSecret = process.env.GITHUB_CONTEXT_TEST_SECRET;
+    process.env.GITHUB_CONTEXT_TEST_SECRET = secret;
+    try {
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/repos/owner/repo/issues/196")) {
+          return Response.json({
+            number: 196,
+            title: `Keep ${secret} out of context`,
+            body: `Implement without ${secret}.`,
+            html_url: "https://github.com/owner/repo/issues/196",
+          });
+        }
+        if (url.endsWith("/repos/owner/repo/issues/196/comments?per_page=100")) {
+          return Response.json([{
+            id: 1,
+            body: `Comment includes ${secret}.`,
+            html_url: `https://github.com/owner/repo/issues/196#${secret}`,
+            created_at: "2026-08-11T00:00:00.000Z",
+            user: { login: `author-${secret}` },
+          }]);
+        }
+        throw new Error(`unexpected request ${url}`);
+      });
+
+      const context = await fetchGithubIssueContext(
+        { token: "read-token", fetch: fetchMock },
+        "owner/repo",
+        196
+      );
+      const admission = composeBoundedTaskContext(context, {
+        requireLinearSections: true,
+        expectedIssueIdentifier: "GH-196",
+      });
+
+      expect(context).toContain("[REDACTED]");
+      expect(context).not.toContain(secret);
+      expect(context).not.toContain("A&amp;B&lt;C");
+      expect(admission.context).not.toContain(secret);
+      expect(admission.context).not.toContain("A&amp;B&lt;C");
+    } finally {
+      if (previousSecret === undefined) delete process.env.GITHUB_CONTEXT_TEST_SECRET;
+      else process.env.GITHUB_CONTEXT_TEST_SECRET = previousSecret;
+    }
+  });
+
+  it("rejects entity-expanded required Issue context without truncating its tail selection", async () => {
+    const selection = {
+      schema: "openthrottle.ship-selection/v1",
+      graph_id: "structured",
+    };
+    const body = [
+      "&".repeat(13_000),
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify(selection),
+      "```",
+    ].join("\n");
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/repo/issues/197")) {
+        return Response.json({
+          number: 197,
+          title: "Bound entity expansion",
+          body,
+          html_url: "https://github.com/owner/repo/issues/197",
+        });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/197/comments?per_page=100")) {
+        return Response.json([{
+          id: 1,
+          body: "Optional history",
+          html_url: "https://github.com/owner/repo/issues/197#issuecomment-1",
+          created_at: "2026-08-11T00:00:00.000Z",
+          user: { login: "operator" },
+        }]);
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+
+    const context = await fetchGithubIssueContext(
+      { token: "read-token", fetch: fetchMock },
+      "owner/repo",
+      197
+    );
+    const admission = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "GH-197",
+    });
+    const selections = extractJsonBlocks(
+      admission.selectionContext,
+      "openthrottle.ship-selection/v1"
+    );
+
+    expect(Buffer.byteLength(context, "utf8")).toBeGreaterThan(64_000);
+    expect(admission.selectionError).toBeUndefined();
+    expect(admission.ordinaryLimitError).toContain("required content exceeds 64000 bytes");
+    expect(context.match(/```json openthrottle\.ship-selection\/v1/g)).toHaveLength(1);
+    expect(selections).toHaveLength(1);
+    expect(JSON.parse(selections[0]!)).toEqual(selection);
+    expect(admission.context).toContain('comment-id="github-comments-omitted"');
+    expect(admission.context).not.toContain("Optional history");
+  });
+
+  it("fails closed when composition cannot retain the GitHub comment-omission marker", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/repo/issues/198")) {
+        return Response.json({
+          number: 198,
+          title: "Preserve omission metadata",
+          body: "&".repeat(12_725),
+          html_url: "https://github.com/owner/repo/issues/198",
+        });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/198/comments?per_page=100")) {
+        return Response.json([{
+          id: 1,
+          body: "Optional history",
+          html_url: "https://github.com/owner/repo/issues/198#issuecomment-1",
+          created_at: "2026-08-11T00:00:00.000Z",
+          user: { login: "operator" },
+        }]);
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+
+    const context = await fetchGithubIssueContext(
+      { token: "read-token", fetch: fetchMock },
+      "owner/repo",
+      198
+    );
+    const admission = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "GH-198",
+    });
+
+    expect(Buffer.byteLength(context, "utf8")).toBeGreaterThan(64_000);
+    expect(context).toContain('comment-id="github-comments-omitted"');
+    expect(context).not.toContain("Optional history");
+    expect(admission.selectionError).toBeUndefined();
+    expect(admission.ordinaryLimitError).toContain("required content exceeds 64000 bytes");
+    expect(admission.context).toBe(context);
+    expect(admission.selectionContext).not.toContain("github-comments-omitted");
+    expect(admission.context).not.toContain("Optional history");
   });
 
   it("retains the newest Issue comments that fit and emits a deterministic omission marker", async () => {

@@ -194,6 +194,26 @@ function issueSectionIdentifier(section: ContextSection): string | undefined {
   return match?.[1] ?? match?.[2] ?? match?.[3];
 }
 
+function isGithubIssueBodyDirective(section: ContextSection): boolean {
+  return section.text.startsWith(
+    `<primary-directive-thread comment-id="github-issue-body">`
+  );
+}
+
+function isGithubCommentsOmittedMarker(section: ContextSection): boolean {
+  return /^<other-thread comment-id="github-comments-omitted" author="openthrottle" omitted-count="\d+" pagination-truncated="(?:true|false)"><comment>Older GitHub Issue comments were omitted by the deterministic context bound\.<\/comment><\/other-thread>$/.test(
+    section.text
+  );
+}
+
+function decodeXmlText(value: string): string {
+  return value.replace(/&(amp|lt|gt);/g, (_match, entity: string) => {
+    if (entity === "amp") return "&";
+    if (entity === "lt") return "<";
+    return ">";
+  });
+}
+
 function stripNestedLinearContextSections(section: ContextSection): ContextSection {
   if (section.nestedSpans.length === 0) return section;
   let text = section.text;
@@ -303,8 +323,22 @@ export function composeBoundedTaskContext(
     ...issueSections,
     ...directiveSections,
   ].map((section) => section.text);
-  const selectionContext = requiredSections.join("\n\n").trim();
-  const requiredContext = requiredSections.join("\n\n").trim();
+  const decodeGithubAuthority = rawDirectiveSections.length === 1 &&
+    isGithubIssueBodyDirective(rawDirectiveSections[0]!);
+  const requiredOmissionSections = decodeGithubAuthority
+    ? otherThreadSections.filter(isGithubCommentsOmittedMarker)
+    : [];
+  const optionalThreadSections = otherThreadSections.filter(
+    (section) => !requiredOmissionSections.includes(section)
+  );
+  const selectionContext = requiredSections
+    .map((section) => decodeGithubAuthority ? decodeXmlText(section) : section)
+    .join("\n\n")
+    .trim();
+  const requiredContext = [
+    ...requiredSections,
+    ...requiredOmissionSections.map((section) => section.text),
+  ].join("\n\n").trim();
   if (utf8Bytes(requiredContext) > ORDINARY_STAGE_TASK_CONTEXT_LIMIT) {
     return {
       context: sanitized,
@@ -326,7 +360,7 @@ export function composeBoundedTaskContext(
   }
 
   const keptOptional: ContextSection[] = [];
-  for (const section of [...otherThreadSections].reverse()) {
+  for (const section of [...optionalThreadSections].reverse()) {
     const candidate = [current, section.text].filter(Boolean).join("\n\n");
     if (utf8Bytes(candidate) <= ORDINARY_STAGE_TASK_CONTEXT_LIMIT) {
       keptOptional.push(section);
@@ -337,16 +371,17 @@ export function composeBoundedTaskContext(
   const context = [
     ...requiredSections,
     ...keptParentSummaries,
+    ...requiredOmissionSections.map((section) => section.text),
     ...keptOptional.map((section) => section.text),
   ].join("\n\n").trim();
   const boundedBytes = utf8Bytes(context);
   const pruning = originalBytes !== boundedBytes ||
-    otherThreadSections.length !== keptOptional.length ||
+    optionalThreadSections.length !== keptOptional.length ||
     parentSectionCount > 0
     ? {
       originalBytes,
       boundedBytes,
-      droppedOtherThreads: otherThreadSections.length - keptOptional.length,
+      droppedOtherThreads: optionalThreadSections.length - keptOptional.length,
       droppedParentSections: parentSectionCount,
       summarizedParentSections: keptParentSummaries.length,
     }
