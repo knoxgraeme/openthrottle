@@ -150,6 +150,9 @@ describe("normalized stage artifacts", () => {
 
     const longAuthorization = "Authorization:" + " ".repeat(60) + "Bearer token";
     expect(sanitizeArtifactText(longAuthorization, {})).toContain("[REDACTED]");
+
+    const repetitiveProse = "Bearer token ".repeat(20_000);
+    expect(sanitizeArtifactText(repetitiveProse, {})).toBe(repetitiveProse);
   });
 
   it("records mechanical command context and never treats termination as success", () => {
