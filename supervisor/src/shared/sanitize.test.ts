@@ -80,5 +80,16 @@ describe("sanitizeText", () => {
         }
       }
     }
+
+    let nestedAuthorization = JSON.stringify({ authorization: "Bearer\nabc123" });
+    for (let depth = 1; depth <= 4; depth += 1) {
+      expect(sanitizeText(nestedAuthorization, {}), "nested JSON depth " + depth).toContain("[REDACTED]");
+      expect(containsSecretShapedValue(nestedAuthorization), "nested JSON depth " + depth).toBe(true);
+      nestedAuthorization = JSON.stringify({ summary: nestedAuthorization });
+    }
+
+    const longAuthorization = "Authorization:" + " ".repeat(60) + "Bearer token";
+    expect(sanitizeText(longAuthorization, {})).toContain("[REDACTED]");
+    expect(containsSecretShapedValue(longAuthorization)).toBe(true);
   });
 });

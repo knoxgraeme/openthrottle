@@ -722,6 +722,16 @@ describe("deterministic supervisor stage gates", () => {
     });
     expect(() => evaluateStageGate(fixture.pipelines, escapedAuthorizationPrefix)).toThrow(/secret-shaped/);
 
+    const nestedAuthorization = event(fixture, "success", {
+      summary: JSON.stringify({ authorization: "Bearer\nabc123" }),
+    });
+    expect(() => evaluateStageGate(fixture.pipelines, nestedAuthorization)).toThrow(/secret-shaped/);
+
+    const longAuthorization = event(fixture, "success", {
+      summary: "Authorization:" + " ".repeat(60) + "Bearer token",
+    });
+    expect(() => evaluateStageGate(fixture.pipelines, longAuthorization)).toThrow(/secret-shaped/);
+
     const safeBearerProse = event(fixture, "success", {
       summary: "CODEX_AUTH_JSON bearer credentials. Supports bearer token-based authentication.",
     });

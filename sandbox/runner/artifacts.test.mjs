@@ -141,6 +141,15 @@ describe("normalized stage artifacts", () => {
         }
       }
     }
+
+    let nestedAuthorization = JSON.stringify({ authorization: "Bearer\nabc123" });
+    for (let depth = 1; depth <= 4; depth += 1) {
+      expect(sanitizeArtifactText(nestedAuthorization, {}), "nested JSON depth " + depth).toContain("[REDACTED]");
+      nestedAuthorization = JSON.stringify({ summary: nestedAuthorization });
+    }
+
+    const longAuthorization = "Authorization:" + " ".repeat(60) + "Bearer token";
+    expect(sanitizeArtifactText(longAuthorization, {})).toContain("[REDACTED]");
   });
 
   it("records mechanical command context and never treats termination as success", () => {
