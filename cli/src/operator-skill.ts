@@ -276,6 +276,10 @@ function operatorSkillTargetPath(home: string, agent: SupportedAgent): string {
   return resolve(home, AGENT_SKILL_DIRS[agent], SKILL_NAME);
 }
 
+function stagedOperatorSkillPath(home: string, agent: SupportedAgent): string {
+  return resolve(home, AGENT_ROOTS[agent], "skills", SKILL_NAME);
+}
+
 function installStagedSkillAtomically(sourcePath: string, targetPath: string): void {
   if (!existsSync(join(sourcePath, "SKILL.md"))) {
     throw new Error(`staged OpenThrottle skill is missing SKILL.md: ${sourcePath}`);
@@ -342,6 +346,41 @@ function parseSkillfishJson(result: SpawnSyncReturns<Buffer>): SkillfishJson {
       errors: [sanitizeError(stdout || result.stderr?.toString("utf8") || "skillfish returned non-JSON output")],
     };
   }
+}
+
+function validatedStagedInstallEntries(
+  json: SkillfishJson,
+  expectedAgents: SupportedAgent[],
+  tempHome: string,
+  expectedDigest: string
+): Map<SupportedAgent, string> {
+  const expected = new Set(expectedAgents);
+  const staged = new Map<SupportedAgent, string>();
+  for (const entry of installedEntries(json)) {
+    if (entry.skill !== SKILL_NAME) continue;
+    if (typeof entry.agent !== "string" || !isSupportedAgent(entry.agent) || !expected.has(entry.agent)) {
+      throw new Error(`Skillfish returned an unexpected OpenThrottle install agent: ${String(entry.agent)}`);
+    }
+    if (staged.has(entry.agent)) {
+      throw new Error(`Skillfish returned duplicate OpenThrottle install entries for ${entry.agent}`);
+    }
+    if (typeof entry.path !== "string") {
+      throw new Error(`Skillfish returned an invalid OpenThrottle install path for ${entry.agent}`);
+    }
+    const stagedPath = resolve(entry.path);
+    const expectedPath = stagedOperatorSkillPath(tempHome, entry.agent);
+    if (stagedPath !== expectedPath) {
+      throw new Error(`Skillfish staged ${entry.agent} at an unexpected path: ${entry.path}`);
+    }
+    if (digestDirectory(stagedPath) !== expectedDigest) {
+      throw new Error(`Skillfish staged ${entry.agent} with bytes that differ from the packaged OpenThrottle skill`);
+    }
+    staged.set(entry.agent, stagedPath);
+  }
+  for (const agent of expected) {
+    if (!staged.has(agent)) throw new Error(`Skillfish did not stage OpenThrottle for ${agent}`);
+  }
+  return staged;
 }
 
 function runSkillfishJson(
@@ -577,22 +616,31 @@ export function runOperatorSkillAction(
     });
     const json = parseSkillfishJson(install);
     if (!ensureSuccessfulSkillfish(json, install, result)) return result;
-    for (const entry of installedEntries(json)) {
-      if (entry.skill === SKILL_NAME && typeof entry.agent === "string" && isSupportedAgent(entry.agent) && typeof entry.path === "string") {
-        const targetPath = operatorSkillTargetPath(realHome, entry.agent);
-        try {
-          if (needsReplace.has(entry.agent)) replaceStagedSkillAtomically(entry.path, targetPath);
-          else installStagedSkillAtomically(entry.path, targetPath);
-          result.installed.push({ agent: entry.agent, status: "installed", path: targetPath });
-        } catch (error) {
-          result.success = false;
-          result.conflicted.push({
-            agent: entry.agent,
-            status: "conflicted",
-            path: targetPath,
-            reason: getErrorMessage(error),
-          });
-        }
+    let staged: Map<SupportedAgent, string>;
+    try {
+      staged = validatedStagedInstallEntries(json, needsInstall, tempHome, sourceDigest);
+    } catch (error) {
+      result.success = false;
+      const reason = getErrorMessage(error);
+      for (const agent of needsInstall) {
+        result.conflicted.push({ agent, status: "conflicted", path: operatorSkillTargetPath(realHome, agent), reason });
+      }
+      return result;
+    }
+    for (const [agent, stagedPath] of staged) {
+      const targetPath = operatorSkillTargetPath(realHome, agent);
+      try {
+        if (needsReplace.has(agent)) replaceStagedSkillAtomically(stagedPath, targetPath);
+        else installStagedSkillAtomically(stagedPath, targetPath);
+        result.installed.push({ agent, status: "installed", path: targetPath });
+      } catch (error) {
+        result.success = false;
+        result.conflicted.push({
+          agent,
+          status: "conflicted",
+          path: targetPath,
+          reason: getErrorMessage(error),
+        });
       }
     }
   } finally {

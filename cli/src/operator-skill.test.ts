@@ -70,6 +70,9 @@ describe("operator skill package", () => {
     for (const name of ["ship", "trigger", "tune", "monitor"]) {
       expect(readFileSync(resolve(process.cwd(), `../skills/operator/openthrottle/references/${name}.md`), "utf8")).toContain(`# ${name[0]!.toUpperCase()}${name.slice(1)}`);
     }
+    const ship = readFileSync(resolve(process.cwd(), "../skills/operator/openthrottle/references/ship.md"), "utf8");
+    expect(ship).toContain("openthrottle plan prepare <file.md> --graph structured --json");
+    expect(ship).toContain("openthrottle ship <file.md> --graph structured");
   });
 });
 
@@ -199,6 +202,102 @@ describe("operator skill Skillfish wrapper", () => {
       ["list", "--global", "--json"],
       ["install", "--global", "--yes", "--json"],
     ]);
+  });
+
+  it("refuses incomplete staged Skillfish installs before copying real targets", () => {
+    const home = temporaryDirectory();
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    const runner = (args: string[], options: { env: NodeJS.ProcessEnv }) => {
+      if (args[0] === "list") {
+        return spawnResult({
+          success: true,
+          installed: [],
+          agents_detected: ["Codex", "Claude Code"],
+        });
+      }
+      const stagedCodexPath = stagedSkill(options.env.HOME ?? "", ".codex");
+      return spawnResult({
+        success: true,
+        installed: [{ skill: "openthrottle", agent: "Codex", path: stagedCodexPath, location: "global" }],
+        skipped: [],
+      });
+    };
+
+    const result = runOperatorSkillAction("install", { home, runner, sourceRef });
+
+    expect(result.success).toBe(false);
+    expect(result.conflicted.map((entry) => entry.agent).sort()).toEqual(["Claude Code", "Codex"]);
+    expect(result.conflicted[0]!.reason).toContain("did not stage OpenThrottle for Claude Code");
+    expect(existsSync(join(home, ".codex", "skills", "openthrottle"))).toBe(false);
+    expect(existsSync(join(home, ".claude", "skills", "openthrottle"))).toBe(false);
+  });
+
+  it("refuses staged Skillfish installs from unexpected paths", () => {
+    const home = temporaryDirectory();
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    const runner = (args: string[], options: { env: NodeJS.ProcessEnv }) => {
+      if (args[0] === "list") {
+        return spawnResult({
+          success: true,
+          installed: [],
+          agents_detected: ["Codex"],
+        });
+      }
+      const unexpectedPath = stagedSkill(options.env.HOME ?? "", ".claude");
+      return spawnResult({
+        success: true,
+        installed: [{ skill: "openthrottle", agent: "Codex", path: unexpectedPath, location: "global" }],
+        skipped: [],
+      });
+    };
+
+    const result = runOperatorSkillAction("install", { home, runner, sourceRef });
+
+    expect(result.success).toBe(false);
+    expect(result.conflicted).toEqual([
+      {
+        agent: "Codex",
+        status: "conflicted",
+        path: join(home, ".codex", "skills", "openthrottle"),
+        reason: expect.stringContaining("unexpected path"),
+      },
+    ]);
+    expect(existsSync(join(home, ".codex", "skills", "openthrottle"))).toBe(false);
+  });
+
+  it("refuses staged Skillfish installs whose bytes differ from the packaged source", () => {
+    const home = temporaryDirectory();
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    const runner = (args: string[], options: { env: NodeJS.ProcessEnv }) => {
+      if (args[0] === "list") {
+        return spawnResult({
+          success: true,
+          installed: [],
+          agents_detected: ["Codex"],
+        });
+      }
+      const stagedCodexPath = stagedSkill(options.env.HOME ?? "", ".codex");
+      writeFileSync(join(stagedCodexPath, "SKILL.md"), "---\nname: openthrottle\n---\nchanged bytes\n");
+      return spawnResult({
+        success: true,
+        installed: [{ skill: "openthrottle", agent: "Codex", path: stagedCodexPath, location: "global" }],
+        skipped: [],
+      });
+    };
+
+    const result = runOperatorSkillAction("install", { home, runner, sourceRef });
+
+    expect(result.success).toBe(false);
+    expect(result.conflicted).toEqual([
+      {
+        agent: "Codex",
+        status: "conflicted",
+        path: join(home, ".codex", "skills", "openthrottle"),
+        reason: expect.stringContaining("differ from the packaged OpenThrottle skill"),
+      },
+    ]);
+    expect(existsSync(join(home, ".codex", "skills", "openthrottle"))).toBe(false);
   });
 
   it("keeps install from overwriting stale owned installs without refresh", () => {
