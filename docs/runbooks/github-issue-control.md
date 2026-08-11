@@ -81,7 +81,16 @@ The generated config includes both `simple` and `structured`; do not hand-edit
 around config validation. Before applying the activation label, apply the exact
 GitHub Issue label `agent:codex`. This pins the admission engine on the Issue
 itself; it is mandatory for this Codex exercise. Do not rely on a remembered or
-unobservable supervisor default agent.
+unobservable supervisor default agent. Registration guarantees only the exact
+`openthrottle` label; if `agent:codex` is absent, an authorized operator must
+create that exact Issue label first, then apply it before `openthrottle`.
+
+GitHub Issue admission reads `.openthrottle.yml` from the registered base
+branch commit, not from an operator's local checkout. Commit and push every
+structured-graph or agent configuration change to that registered base branch
+before applying `openthrottle`. Local `plan prepare` and `plan validate` only
+verify local input; they do not make an unpushed configuration available to
+admission.
 
 Prepare or validate the markdown plan before opening the GitHub Issue:
 
