@@ -131,6 +131,15 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow("TASK_TIMEOUT must be between 1");
   });
 
+  it("caps the supervisor hard task timeout at the authored graph maximum", () => {
+    setRequiredEnv();
+    process.env.TASK_TIMEOUT = "86400";
+    expect(loadConfig().taskTimeout).toBe(86_400);
+
+    process.env.TASK_TIMEOUT = "86401";
+    expect(() => loadConfig()).toThrow("TASK_TIMEOUT must be between 1 and 86400");
+  });
+
   it("rejects an invalid default agent", () => {
     setRequiredEnv();
     process.env.DEFAULT_AGENT = "other";

@@ -18,7 +18,7 @@ const SUPERVISOR_ENV_VARS: Array<{ name: string; hint: string }> = [
   { name: "CLAUDE_CODE_OAUTH_TOKEN", hint: "Claude subscription setup token" },
   { name: "CODEX_AUTH_JSON", hint: "raw ~/.codex/auth.json for Codex subscription login" },
   { name: "KIMI_CODE_API_KEY", hint: "Kimi Code Console subscription API key for OpenCode, not Kimi Open Platform billing" },
-  { name: "TASK_TIMEOUT", hint: "seconds; default: 7200" },
+  { name: "TASK_TIMEOUT", hint: "ordinary-stage seconds; default: 7200; max: 86400" },
   { name: "SANDBOX_EVENT_POLL_INTERVAL_MS", hint: "default: 5000" },
   { name: "ORPHAN_GRACE_MINUTES", hint: "default: 5" },
   { name: "WEBHOOK_MAX_AGE_SECONDS", hint: "default: 60" },

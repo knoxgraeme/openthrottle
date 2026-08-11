@@ -156,7 +156,7 @@ export function loadConfig(): Config {
     );
   }
   requireRange("PORT", cfg.port, 1, 65_535);
-  requireRange("TASK_TIMEOUT", cfg.taskTimeout, 1);
+  requireRange("TASK_TIMEOUT", cfg.taskTimeout, 1, 86_400);
   requireRange("ORPHAN_GRACE_MINUTES", cfg.orphanGraceMinutes, 0);
   requireRange("RUNTIME_RESOURCE_RETENTION_MINUTES", cfg.runtimeResourceRetentionMinutes, 0);
   requireRange("RUN_OUTCOME_RETENTION_DAYS", cfg.runOutcomeRetentionDays, 1);

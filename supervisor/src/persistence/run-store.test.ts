@@ -141,8 +141,11 @@ describe("run store", () => {
       actor_state: "running",
       last_heartbeat_at: "2026-07-22T10:00:00.000Z",
     });
-    expect(db.prepare("SELECT actor_state FROM runs WHERE id = ?").get(runId))
-      .toEqual({ actor_state: "running" });
+    expect(db.prepare("SELECT actor_state, expires_at FROM runs WHERE id = ?").get(runId))
+      .toEqual({
+        actor_state: "running",
+        expires_at: "2026-07-23T00:00:00.000Z",
+      });
   });
 
   it("lists a stalled run through its pipeline attempt actor", () => {
@@ -198,10 +201,11 @@ describe("run store", () => {
     expect(store.renewRunLiveness("run-direct", "2026-07-22T10:00:00.000Z")).toBe(true);
 
     expect(db.prepare(`
-      SELECT actor_state, last_heartbeat_at FROM runs WHERE id = 'run-direct'
+      SELECT actor_state, last_heartbeat_at, expires_at FROM runs WHERE id = 'run-direct'
     `).get()).toEqual({
       actor_state: "running",
       last_heartbeat_at: "2026-07-22T10:00:00.000Z",
+      expires_at: "2026-07-23T00:00:00.000Z",
     });
   });
 });

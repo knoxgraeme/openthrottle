@@ -471,6 +471,7 @@ describe("pipeline effect processor", () => {
     });
     expect(tickets.getRun(attempt.planned_run_id!)).toMatchObject({
       task_type: "investigate",
+      expires_at: "2099-07-22T12:05:00.000Z",
     });
     expect(pipelines.getRuntimeResource(instance.id)).toMatchObject({
       provider_resource_id: "sandbox-1",
@@ -707,6 +708,9 @@ describe("pipeline effect processor", () => {
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
       parent_attempt_id: attempt.id,
       parent_run_id: attempt.planned_run_id,
+    });
+    expect(tickets.getRun(attempt.planned_run_id!)).toMatchObject({
+      expires_at: "2099-07-23T12:00:00.000Z",
     });
     expect(pipelines.listUnits(attempt.id)).toEqual([
       expect.objectContaining({ unitId: "unit_a", status: "running" }),
