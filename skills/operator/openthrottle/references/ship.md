@@ -16,10 +16,12 @@ through OpenThrottle.
      openthrottle plan validate <file.md> --graph structured --json
      ```
 
-   - When the plan lacks a valid execution block, run:
+   - When the plan lacks a valid execution block, run preparation and then
+     independently validate the resulting plan:
 
      ```bash
      openthrottle plan prepare <file.md> --graph structured --json
+     openthrottle plan validate <file.md> --graph structured --json
      ```
 
    Surface the validated digest from the JSON output. If validation or
@@ -39,8 +41,9 @@ through OpenThrottle.
    openthrottle ship <file.md> --graph structured
    ```
 
-5. Report the CLI-evidenced created or reused ticket URL, graph/selection, and
-   trigger state from the command output. Then run `openthrottle status
-   <ticket>` when a ticket identifier is available.
-6. If the CLI reports that a ticket exists but delegation/trigger failed, show
-   its recovery command and reuse that ticket on the next explicit attempt.
+5. Report only the ticket URL and graph/selection that the current command
+   output actually provides. Then run `openthrottle status <ticket>` when a
+   ticket identifier is available.
+6. Ticket reuse, trigger-state JSON, and recovery commands are capability-gated
+   future paths until OPE-145 adds those CLI contracts. Do not claim or infer
+   them from current `ship` output.
