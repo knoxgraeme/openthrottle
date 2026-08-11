@@ -469,6 +469,12 @@ export interface PipelineStore extends ChildActionLivenessPort {
     externalId: string,
     externalUrl: string
   ): boolean;
+  requeueGithubPublicationAfterStaleWrite(
+    id: string,
+    stalePayloadHash: string,
+    externalId: string,
+    externalUrl: string
+  ): boolean;
   markGithubPublicationSkipped(id: string, expectedPayloadHash: string): boolean;
   /** True when the GitHub comment ID was written by the supervisor's own summary upsert. */
   isSupervisorGithubComment(externalId: string): boolean;

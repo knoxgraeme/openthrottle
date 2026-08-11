@@ -2059,6 +2059,30 @@ backfill-contract:existing rows are retained in place, provider identity remains
 github-head-fence-contract:head, source, and every per-source watermark move together; authoritative state wins, same-source higher sequence wins, and watermark collisions retain the highest sequence/v1
 journal-identity-contract:legacy display references are rekeyed through their exact instance and run ticket fences, with a unique ticket-reference fallback and fail-closed ambiguity handling/v1`;
 
+const githubWebhookRedeliverySchema = `
+ALTER TABLE webhook_deliveries ADD COLUMN redelivered_at TEXT;
+CREATE TABLE github_webhook_redelivery_requests (
+  repository TEXT NOT NULL COLLATE NOCASE,
+  webhook_id INTEGER NOT NULL,
+  delivery_id INTEGER NOT NULL,
+  delivery_guid TEXT NOT NULL,
+  delivered_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('claimed', 'accepted', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+  next_attempt_at TEXT NOT NULL,
+  accepted_at TEXT,
+  last_error TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(repository, webhook_id, delivery_id)
+);
+CREATE INDEX github_webhook_redelivery_process_idx
+  ON github_webhook_redelivery_requests(status, next_attempt_at);
+`;
+
+const githubWebhookRedeliveryMigrationSource = `${githubWebhookRedeliverySchema}
+github-webhook-redelivery-contract:repository-hook failures are discovered from bounded provider history and each exact delivery receives one leased durable redelivery request/v1
+local-handler-recovery-contract:only dead deliveries from a successfully reconciled repository receive one repository-scoped local replay/v1`;
+
 type GithubHeadSource =
   | { kind: "authoritative" }
   | { kind: "sequenced"; source: string; sequence: number };
@@ -3039,6 +3063,22 @@ const definitions: DatabaseMigrationDefinition[] = [
       // the identifier/vocabulary migration so direct upgrades still receive
       // every missing selection publication exactly once.
       backfillSelectionPublications(db);
+    },
+  },
+  {
+    version: 36,
+    name: "github-webhook-redelivery-requests",
+    source: githubWebhookRedeliveryMigrationSource,
+    up(db) {
+      if (hasTable(db, "webhook_deliveries") && !hasColumns(db, "webhook_deliveries", ["redelivered_at"])) {
+        db.exec("ALTER TABLE webhook_deliveries ADD COLUMN redelivered_at TEXT");
+      }
+      if (!hasTable(db, "github_webhook_redelivery_requests")) {
+        db.exec(githubWebhookRedeliverySchema.replace(
+          "ALTER TABLE webhook_deliveries ADD COLUMN redelivered_at TEXT;",
+          ""
+        ));
+      }
     },
   },
 ];

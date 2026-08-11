@@ -2,11 +2,13 @@ import { createHmac } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { createSupervisorStore } from "../../persistence/store.js";
 import { openDb } from "../../persistence/database.js";
-import { considerCiGithubHead } from "./events.js";
+import { considerCiGithubHead, githubIssueControlSessionId } from "./events.js";
+import { composeBoundedTaskContext } from "../../app/admission-context.js";
 import {
   OPENTHROTTLE_WEBHOOK_EVENTS,
   branchExists,
   classifyGithubIssueComment,
+  ensureRepositoryControlLabel,
   fetchGithubIssueContext,
   getRepositoryConfigAtCommit,
   getRepositoryDirectoryAtCommit,
@@ -19,8 +21,11 @@ import {
   isGithubPullRequestUrl,
   isOpenthrottleBranch,
   isAuthorizedGithubControlPermission,
+  listFailedRepositoryWebhookDeliveries,
   parseGithubWebhook,
   parsePullRequestUrl,
+  pinIssueComment,
+  redeliverRepositoryWebhookDelivery,
   upsertIssueStatusComment,
   prepareRepository,
   reconcileRepositoryWebhook,
@@ -254,6 +259,46 @@ describe("GitHub contracts", () => {
     expect(githubIssuesEventCarriesExactControlLabel(opened)).toBe(true);
   });
 
+  it("coalesces initial and active Issue label events while reopening terminal work into one deterministic new session", () => {
+    const event = (action: "opened" | "labeled" | "reopened") => ({
+      kind: "issues" as const,
+      action,
+      repository: { full_name: "owner/repo" },
+      issue: {
+        number: 12,
+        title: "Ship it",
+        html_url: "https://github.com/owner/repo/issues/12",
+        created_at: "2026-08-10T00:00:00.000Z",
+        updated_at: "2026-08-11T00:00:00.000Z",
+      },
+      ...(action === "labeled" ? { label: { name: "openthrottle" } } : {}),
+    });
+    const store = {
+      getByExternalThread: vi.fn(() => undefined),
+    } as never;
+    const pipelines = { getInstanceForSession: vi.fn() } as never;
+
+    expect(githubIssueControlSessionId({ store, pipelines, event: event("opened") }))
+      .toBe("github:owner/repo#12:initial");
+    expect(githubIssueControlSessionId({ store, pipelines, event: event("labeled") }))
+      .toBe("github:owner/repo#12:initial");
+
+    const ticket = { session_id: "github:owner/repo#12:initial" };
+    (store as { getByExternalThread: ReturnType<typeof vi.fn> }).getByExternalThread
+      .mockReturnValue(ticket);
+    (pipelines as { getInstanceForSession: ReturnType<typeof vi.fn> }).getInstanceForSession
+      .mockReturnValue({ status: "running", terminal_outcome: null });
+    expect(githubIssueControlSessionId({ store, pipelines, event: event("labeled") }))
+      .toBe(ticket.session_id);
+
+    (pipelines as { getInstanceForSession: ReturnType<typeof vi.fn> }).getInstanceForSession
+      .mockReturnValue({ status: "canceled", terminal_outcome: "canceled" });
+    expect(githubIssueControlSessionId({ store, pipelines, event: event("labeled") }))
+      .toBe("github:owner/repo#12:label:2026-08-11T00:00:00.000Z");
+    expect(githubIssueControlSessionId({ store, pipelines, event: event("reopened") }))
+      .toBe("github:owner/repo#12:reopened:2026-08-11T00:00:00.000Z");
+  });
+
   it("maps current GitHub collaborator permissions and authorizes triage or stronger", async () => {
     const requests: string[] = [];
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
@@ -287,10 +332,22 @@ describe("GitHub contracts", () => {
         });
       }
       if (url.endsWith("/repos/owner/repo/issues/12/comments?per_page=100")) {
-        return Response.json([
-          { id: 7, body: "First pre-admission comment." },
-          { id: 8, body: "Second pre-admission comment." },
-        ]);
+        return Response.json(Array.from({ length: 100 }, (_, index) => ({
+          id: index + 1,
+          body: `Pre-admission comment ${index + 1}.`,
+          html_url: `https://github.com/owner/repo/issues/12#issuecomment-${index + 1}`,
+          created_at: `2026-08-10T00:${String(index % 60).padStart(2, "0")}:00.000Z`,
+          user: { login: `author-${index + 1}` },
+        })));
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/comments?per_page=100&page=2")) {
+        return Response.json(Array.from({ length: 5 }, (_, index) => ({
+          id: index + 101,
+          body: `Newest pre-admission comment ${index + 101}.`,
+          html_url: `https://github.com/owner/repo/issues/12#issuecomment-${index + 101}`,
+          created_at: `2026-08-11T00:0${index}:00.000Z`,
+          user: { login: `new-author-${index + 101}` },
+        })));
       }
       throw new Error(`unexpected request ${url}`);
     });
@@ -304,8 +361,60 @@ describe("GitHub contracts", () => {
     expect(context.length).toBeLessThanOrEqual(64_000);
     expect(context).toContain(`<issue identifier="GH-12">`);
     expect(context).toContain("Use &lt;GitHub&gt; control");
-    expect(context).toContain(`<other-thread comment-id="github-comment-7">`);
-    expect(context).toContain("Second pre-admission comment.");
+    expect(context).toContain(`<other-thread comment-id="github-comment-101"`);
+    expect(context).toContain(`author="new-author-101"`);
+    expect(context).toContain(`url="https://github.com/owner/repo/issues/12#issuecomment-101"`);
+    expect(context).toContain("Newest pre-admission comment 105.");
+    expect(context.indexOf("comment 101.")).toBeLessThan(context.indexOf("comment 105."));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("retains the newest Issue comments that fit and emits a deterministic omission marker", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/repo/issues/44")) {
+        return Response.json({
+          number: 44,
+          title: "Bound context",
+          body: "Keep recent operator direction.",
+          html_url: "https://github.com/owner/repo/issues/44",
+        });
+      }
+      if (url.includes("/repos/owner/repo/issues/44/comments?")) {
+        return Response.json(Array.from({ length: 100 }, (_, index) => {
+          const page = Number(new URL(url).searchParams.get("page") ?? "1");
+          const id = ((page - 1) * 100) + index + 1;
+          return {
+            id,
+            body: `${id === 1 ? "oldest" : id === 1_000 ? "newest" : `comment-${id}`} ${"x".repeat(3_950)}`,
+            html_url: `https://github.com/owner/repo/issues/44#issuecomment-${id}`,
+            created_at: new Date(Date.UTC(2026, 0, 1, 0, 0, id)).toISOString(),
+            user: { login: "operator" },
+          };
+        }));
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+
+    const context = await fetchGithubIssueContext(
+      { token: "read-token", fetch: fetchMock },
+      "owner/repo",
+      44
+    );
+
+    expect(Buffer.byteLength(context, "utf8")).toBeLessThanOrEqual(64_000);
+    expect(context).toContain("newest");
+    expect(context).not.toContain("oldest");
+    expect(context).toContain("github-comments-omitted");
+    expect(fetchMock).toHaveBeenCalledTimes(11);
+
+    const admission = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "GH-44",
+    });
+    expect(admission.selectionError).toBeUndefined();
+    expect(admission.ordinaryLimitError).toBeUndefined();
+    expect(admission.context).toContain('comment-id="github-comments-omitted"');
   });
 
   it("recognizes managed branches and strict PR URLs", () => {
@@ -743,6 +852,35 @@ describe("GitHub contracts", () => {
     expect(result).toMatchObject({ webhookId: 7, webhookAction: "updated" });
   });
 
+  it("ensures the repository has the exact lowercase OpenThrottle control label", async () => {
+    const requests: Array<{ url: string; method: string; body?: unknown }> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({
+        url,
+        method,
+        ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}),
+      });
+      if (url.endsWith("/repos/acme/widget/labels?per_page=100")) {
+        return Response.json([{ name: "OpenThrottle", color: "ffffff" }]);
+      }
+      if (url.endsWith("/repos/acme/widget/labels/OpenThrottle") && method === "PATCH") {
+        return Response.json({ name: "openthrottle" });
+      }
+      throw new Error(`Unexpected GitHub request: ${method} ${url}`);
+    });
+
+    await expect(ensureRepositoryControlLabel(
+      { token: "github", fetch: fetchMock },
+      "acme/widget"
+    )).resolves.toBe("renamed");
+    expect(requests.at(-1)).toMatchObject({
+      method: "PATCH",
+      body: { new_name: "openthrottle" },
+    });
+  });
+
   it("reconciles a persisted webhook whose subscribed event list drifted", async () => {
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
@@ -927,5 +1065,96 @@ describe("GitHub contracts", () => {
     expect(second.id).toBe(101);
     expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
     expect(requests.filter((request) => request.method === "PATCH")).toHaveLength(1);
+  });
+
+  it("matches stable comments only at the exact prefix and never adopts another user's marker", async () => {
+    const marker = "<!-- openthrottle:pipeline-status:github:owner/repo#12 -->";
+    const requests: Array<{ url: string; method: string }> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ url, method });
+      if (url.endsWith("/issues/12/comments?per_page=100")) {
+        return Response.json([
+          {
+            id: 1,
+            body: `User quoted ${marker}\nnot supervisor output`,
+            html_url: "https://github.com/owner/repo/issues/12#issuecomment-1",
+            user: { login: "operator" },
+          },
+          {
+            id: 2,
+            body: `${marker}\nuser-authored collision`,
+            html_url: "https://github.com/owner/repo/issues/12#issuecomment-2",
+            user: { login: "operator" },
+          },
+          {
+            id: 3,
+            body: `${marker}\nsupervisor output`,
+            html_url: "https://github.com/owner/repo/issues/12#issuecomment-3",
+            user: { login: "openthrottle-bot" },
+          },
+        ]);
+      }
+      if (url.endsWith("/user")) return Response.json({ login: "openthrottle-bot" });
+      if (url.endsWith("/issues/comments/3") && method === "PATCH") {
+        return Response.json({ id: 3, html_url: "https://github.com/owner/repo/issues/12#issuecomment-3" });
+      }
+      throw new Error(`Unexpected GitHub request: ${method} ${url}`);
+    });
+
+    await expect(upsertIssueStatusComment(
+      { token: "github", fetch: fetchMock },
+      "owner/repo",
+      12,
+      marker,
+      `${marker}\nupdated`
+    )).resolves.toMatchObject({ id: 3 });
+    expect(requests.some((request) => request.url.endsWith("/issues/comments/2"))).toBe(false);
+  });
+
+  it("pins Issue comments and lists and redelivers failed repository webhook deliveries", async () => {
+    const requests: Array<{ url: string; method: string; apiVersion?: string }> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const headers = new Headers(init?.headers);
+      requests.push({
+        url,
+        method,
+        ...(headers.get("X-GitHub-Api-Version")
+          ? { apiVersion: headers.get("X-GitHub-Api-Version")! }
+          : {}),
+      });
+      if (url.endsWith("/repos/owner/repo/hooks/9/deliveries?per_page=25")) {
+        return Response.json([
+          { id: 10, guid: "guid-ok", status_code: 204, redelivery: false, delivered_at: "2026-08-10T00:00:00Z" },
+          { id: 11, guid: "guid-failed", status_code: 503, redelivery: true, delivered_at: "2026-08-10T00:01:00Z" },
+        ]);
+      }
+      if (url.endsWith("/repos/owner/repo/issues/comments/77/pin") && method === "PUT") {
+        return new Response(null, { status: 204 });
+      }
+      if (url.endsWith("/repos/owner/repo/hooks/9/deliveries/11/attempts") && method === "POST") {
+        return new Response(null, { status: 202 });
+      }
+      throw new Error(`Unexpected GitHub request: ${method} ${url}`);
+    });
+    const client = { token: "github", fetch: fetchMock };
+
+    await expect(pinIssueComment(client, "owner/repo", 77)).resolves.toBeUndefined();
+    await expect(listFailedRepositoryWebhookDeliveries(client, "owner/repo", 9, 25))
+      .resolves.toEqual([{
+        id: 11,
+        guid: "guid-failed",
+        status_code: 503,
+        redelivery: true,
+        delivered_at: "2026-08-10T00:01:00Z",
+      }]);
+    await expect(redeliverRepositoryWebhookDelivery(client, "owner/repo", 9, 11))
+      .resolves.toBeUndefined();
+    expect(requests.map((request) => request.method)).toEqual(["PUT", "GET", "POST"]);
+    expect(requests[0]).toMatchObject({ apiVersion: "2026-03-10" });
+    expect(requests[1]).toMatchObject({ apiVersion: "2022-11-28" });
   });
 });

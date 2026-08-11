@@ -149,6 +149,23 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS webhook_deliveries_received_idx
   ON webhook_deliveries(received_at);
 
+CREATE TABLE IF NOT EXISTS github_webhook_redelivery_requests (
+  repository TEXT NOT NULL COLLATE NOCASE,
+  webhook_id INTEGER NOT NULL,
+  delivery_id INTEGER NOT NULL,
+  delivery_guid TEXT NOT NULL,
+  delivered_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('claimed', 'accepted', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+  next_attempt_at TEXT NOT NULL,
+  accepted_at TEXT,
+  last_error TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(repository, webhook_id, delivery_id)
+);
+CREATE INDEX IF NOT EXISTS github_webhook_redelivery_process_idx
+  ON github_webhook_redelivery_requests(status, next_attempt_at);
+
 CREATE TABLE IF NOT EXISTS repository_registrations (
   github_repo TEXT PRIMARY KEY COLLATE NOCASE,
   control_provider TEXT NOT NULL DEFAULT 'linear' CHECK(control_provider IN ('linear', 'github')),
@@ -208,7 +225,6 @@ const deliveryMigrations: Array<[string, string]> = [
   ["next_attempt_at", "ALTER TABLE webhook_deliveries ADD COLUMN next_attempt_at TEXT"],
   ["processed_at", "ALTER TABLE webhook_deliveries ADD COLUMN processed_at TEXT"],
   ["last_error", "ALTER TABLE webhook_deliveries ADD COLUMN last_error TEXT"],
-  ["redelivered_at", "ALTER TABLE webhook_deliveries ADD COLUMN redelivered_at TEXT"],
 ];
 
 function applyColumnMigrations(

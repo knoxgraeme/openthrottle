@@ -95,9 +95,42 @@ export interface DeliveryStore {
   }): WebhookDelivery | undefined;
   markDeliveryProcessed(deliveryId: string): void;
   markDeliveryFailed(deliveryId: string, error: string, retryAt: string | null): void;
-  requeueFailedDeliveriesForRedelivery(source: WebhookDelivery["source"], nowIso: string, limit: number): number;
+  requeueDeadDeliveriesForRedelivery(
+    source: WebhookDelivery["source"],
+    repository: string,
+    nowIso: string,
+    limit: number
+  ): number;
+  requeueDeliveryAfterProviderRedelivery(
+    source: WebhookDelivery["source"],
+    deliveryId: string,
+    nowIso: string
+  ): boolean;
+  claimGithubWebhookRedelivery(input: {
+    repository: string;
+    webhookId: number;
+    deliveryId: number;
+    deliveryGuid: string;
+    deliveredAt: string;
+    nowIso: string;
+    leaseUntilIso: string;
+  }): boolean;
+  markGithubWebhookRedeliveryAccepted(input: {
+    repository: string;
+    webhookId: number;
+    deliveryId: number;
+    nowIso: string;
+  }): boolean;
+  markGithubWebhookRedeliveryFailed(input: {
+    repository: string;
+    webhookId: number;
+    deliveryId: number;
+    error: string;
+    retryAt: string;
+  }): boolean;
   listProcessableDeliveries(nowIso: string, limit: number): WebhookDelivery[];
   pruneDeliveries(beforeIso: string): number;
+  pruneAcceptedGithubWebhookRedeliveryRequests(beforeIso: string, limit: number): number;
   insertSandboxEvent(params: {
     eventId: string;
     runId: string;
@@ -147,12 +180,24 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
     SELECT delivery_id
     FROM webhook_deliveries
     WHERE source = ?
-      AND status IN ('failed', 'dead')
+      AND status = 'dead'
       AND redelivered_at IS NULL
+      AND lower(json_extract(payload, '$.repository.full_name')) = lower(?)
     ORDER BY received_at
     LIMIT ?
   `);
   const requeueDeliveryForRedeliveryStmt = db.prepare(`
+    UPDATE webhook_deliveries
+    SET status = 'pending',
+        next_attempt_at = ?,
+        last_error = NULL,
+        redelivered_at = ?
+    WHERE delivery_id = ?
+      AND source = ?
+      AND status = 'dead'
+      AND redelivered_at IS NULL
+  `);
+  const requeueExactDeliveryAfterProviderRedeliveryStmt = db.prepare(`
     UPDATE webhook_deliveries
     SET status = 'pending',
         next_attempt_at = ?,
@@ -166,6 +211,16 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
   const pruneDeliveriesStmt = db.prepare(
     "DELETE FROM webhook_deliveries WHERE received_at < ?"
   );
+  const pruneAcceptedGithubWebhookRedeliveryRequestsStmt = db.prepare(`
+    DELETE FROM github_webhook_redelivery_requests
+    WHERE rowid IN (
+      SELECT rowid
+      FROM github_webhook_redelivery_requests
+      WHERE status = 'accepted' AND accepted_at < ?
+      ORDER BY accepted_at, repository, webhook_id, delivery_id
+      LIMIT ?
+    )
+  `);
   const insertSandboxEventStmt = db.prepare(`
     INSERT OR IGNORE INTO sandbox_events (
       event_id, run_id, sandbox_id, kind, payload, status,
@@ -282,12 +337,13 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       return getSandboxEventStmt.get(eventId) as SandboxEventRecord;
     }
   );
-  const requeueFailedDeliveriesForRedeliveryTransaction = db.transaction((
+  const requeueDeadDeliveriesForRedeliveryTransaction = db.transaction((
     source: WebhookDelivery["source"],
+    repository: string,
     nowIso: string,
     limit: number
   ): number => {
-    const rows = listRedeliverableDeliveriesStmt.all(source, limit) as Array<{ delivery_id: string }>;
+    const rows = listRedeliverableDeliveriesStmt.all(source, repository, limit) as Array<{ delivery_id: string }>;
     return rows.reduce((count, row) => count + requeueDeliveryForRedeliveryStmt.run(
       nowIso,
       nowIso,
@@ -295,6 +351,39 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       source
     ).changes, 0);
   });
+  const claimGithubWebhookRedeliveryTransaction = db.transaction((input: {
+    repository: string;
+    webhookId: number;
+    deliveryId: number;
+    deliveryGuid: string;
+    deliveredAt: string;
+    nowIso: string;
+    leaseUntilIso: string;
+  }): boolean => db.prepare(`
+    INSERT INTO github_webhook_redelivery_requests (
+      repository, webhook_id, delivery_id, delivery_guid, delivered_at,
+      status, attempts, next_attempt_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'claimed', 1, ?, ?)
+    ON CONFLICT(repository, webhook_id, delivery_id) DO UPDATE SET
+      status = 'claimed',
+      attempts = github_webhook_redelivery_requests.attempts + 1,
+      next_attempt_at = excluded.next_attempt_at,
+      last_error = NULL,
+      updated_at = excluded.updated_at
+    WHERE github_webhook_redelivery_requests.delivery_guid = excluded.delivery_guid
+      AND github_webhook_redelivery_requests.delivered_at = excluded.delivered_at
+      AND github_webhook_redelivery_requests.status IN ('claimed', 'failed')
+      AND github_webhook_redelivery_requests.next_attempt_at <= ?
+  `).run(
+    input.repository,
+    input.webhookId,
+    input.deliveryId,
+    input.deliveryGuid,
+    input.deliveredAt,
+    input.leaseUntilIso,
+    input.nowIso,
+    input.nowIso
+  ).changes === 1);
   const listClaimableLinearOutboxRows = (nowIso: string, limit: number): LinearOutboxRecord[] =>
     listClaimableLinearOutboxRowsStmt.all(nowIso, nowIso, limit) as LinearOutboxRecord[];
   const claimLinearOutboxRows = (
@@ -437,14 +526,59 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       `).run(status, nextAttemptAt, errorValue, deliveryId).changes,
       });
     },
-    requeueFailedDeliveriesForRedelivery(source, nowIso, limit) {
-      return requeueFailedDeliveriesForRedeliveryTransaction(source, nowIso, limit);
+    requeueDeadDeliveriesForRedelivery(source, repository, nowIso, limit) {
+      return requeueDeadDeliveriesForRedeliveryTransaction(source, repository, nowIso, limit);
+    },
+    requeueDeliveryAfterProviderRedelivery(source, deliveryId, nowIso) {
+      return requeueExactDeliveryAfterProviderRedeliveryStmt.run(
+        nowIso,
+        nowIso,
+        deliveryId,
+        source
+      ).changes === 1;
+    },
+    claimGithubWebhookRedelivery(input) {
+      return claimGithubWebhookRedeliveryTransaction.immediate(input);
+    },
+    markGithubWebhookRedeliveryAccepted(input) {
+      return db.prepare(`
+        UPDATE github_webhook_redelivery_requests
+        SET status = 'accepted', accepted_at = ?, next_attempt_at = ?,
+            last_error = NULL, updated_at = ?
+        WHERE repository = ? AND webhook_id = ? AND delivery_id = ?
+          AND status = 'claimed'
+      `).run(
+        input.nowIso,
+        input.nowIso,
+        input.nowIso,
+        input.repository,
+        input.webhookId,
+        input.deliveryId
+      ).changes === 1;
+    },
+    markGithubWebhookRedeliveryFailed(input) {
+      return db.prepare(`
+        UPDATE github_webhook_redelivery_requests
+        SET status = 'failed', next_attempt_at = ?, last_error = ?, updated_at = ?
+        WHERE repository = ? AND webhook_id = ? AND delivery_id = ?
+          AND status = 'claimed'
+      `).run(
+        input.retryAt,
+        input.error,
+        now(),
+        input.repository,
+        input.webhookId,
+        input.deliveryId
+      ).changes === 1;
     },
     listProcessableDeliveries(nowIso, limit) {
       return listProcessableDeliveriesStmt.all(nowIso, nowIso, limit) as WebhookDelivery[];
     },
     pruneDeliveries(beforeIso) {
       return pruneDeliveriesStmt.run(beforeIso).changes;
+    },
+    pruneAcceptedGithubWebhookRedeliveryRequests(beforeIso, limit) {
+      return pruneAcceptedGithubWebhookRedeliveryRequestsStmt.run(beforeIso, limit).changes;
     },
     insertSandboxEvent(params) {
       const createdAt = now();

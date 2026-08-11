@@ -87,7 +87,22 @@ export function createRunOutcomeStore(db: Database.Database): RunOutcomeStore {
       // primary-key replay this guards, so a CHECK/NOT-NULL violation from
       // vocabulary drift would otherwise vanish the same way -- the exact
       // silent row-drop this corpus exists to prevent. Recorded exactly once.
-      if (getStmt.get(instance.id)) return;
+      const existing = getStmt.get(instance.id) as RunOutcome | undefined;
+      if (existing) {
+        // An Issue close can race the exact pull-request merge webhook. The
+        // coordinator permits only that cryptographically fenced
+        // canceled->shipped correction; keep the learning corpus aligned
+        // with the final provider fact instead of permanently recording the
+        // transient cancellation.
+        if (existing.outcome === "canceled" && write.terminalOutcome === "shipped") {
+          db.prepare(`
+            UPDATE run_outcomes
+            SET outcome = 'shipped', closed_reason = ?, created_at = ?
+            WHERE pipeline_instance_id = ? AND outcome = 'canceled'
+          `).run(write.outcome, timestamp, instance.id);
+        }
+        return;
+      }
       const fault = attempt?.run_id
         ? (runFaultStmt.get(attempt.run_id) as { fault_attribution: RunOutcome["fault_attribution"] } | undefined)
         : undefined;

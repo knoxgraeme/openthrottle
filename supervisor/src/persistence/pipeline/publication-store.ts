@@ -14,6 +14,7 @@ export function createPublicationStore(db: Database.Database, now: () => string)
   | "claimGithubPublications"
   | "bindGithubPublicationTarget"
   | "markGithubPublicationProcessed"
+  | "requeueGithubPublicationAfterStaleWrite"
   | "markGithubPublicationSkipped"
   | "markGithubPublicationFailed"
   | "retryPublication"
@@ -101,6 +102,23 @@ export function createPublicationStore(db: Database.Database, now: () => string)
       WHERE id = ? AND kind = 'github_summary' AND status = 'processing'
         AND payload_hash = ?
     `).run(externalId, externalUrl, timestamp, timestamp, id, expectedPayloadHash);
+    return update.changes === 1;
+  });
+
+  const requeueGithubPublicationAfterStaleWrite = db.transaction((
+    id: string,
+    stalePayloadHash: string,
+    externalId: string,
+    externalUrl: string
+  ): boolean => {
+    const timestamp = now();
+    const update = db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET status = 'pending', next_attempt_at = ?, last_error = NULL,
+          external_id = ?, external_url = ?, updated_at = ?
+      WHERE id = ? AND kind = 'github_summary' AND status = 'processing'
+        AND payload_hash <> ?
+    `).run(timestamp, externalId, externalUrl, timestamp, id, stalePayloadHash);
     return update.changes === 1;
   });
 
@@ -215,6 +233,7 @@ export function createPublicationStore(db: Database.Database, now: () => string)
     claimGithubPublications,
     bindGithubPublicationTarget,
     markGithubPublicationProcessed,
+    requeueGithubPublicationAfterStaleWrite,
     markGithubPublicationSkipped,
     markGithubPublicationFailed,
     retryPublication,

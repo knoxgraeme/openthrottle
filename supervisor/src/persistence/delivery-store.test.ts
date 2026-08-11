@@ -157,13 +157,20 @@ describe("delivery store", () => {
     });
   });
 
-  it("requeues failed webhook deliveries for exactly one reconciled redelivery", () => {
+  it("requeues dead webhook deliveries once within the reconciled repository", () => {
     expect(store.claimDelivery({
       deliveryId: "github-dead",
       source: "github",
       action: "closed",
       eventName: "pull_request",
-      payload: "{}",
+      payload: JSON.stringify({ repository: { full_name: "acme/widget" } }),
+    })).toBe(true);
+    expect(store.claimDelivery({
+      deliveryId: "github-other-dead",
+      source: "github",
+      action: "closed",
+      eventName: "pull_request",
+      payload: JSON.stringify({ repository: { full_name: "acme/other" } }),
     })).toBe(true);
     expect(store.claimDelivery({
       deliveryId: "github-processed",
@@ -179,11 +186,13 @@ describe("delivery store", () => {
       payload: "{}",
     })).toBe(true);
     store.markDeliveryFailed("github-dead", "permanent GitHub failure", null);
+    store.markDeliveryFailed("github-other-dead", "other repository failure", null);
     store.markDeliveryProcessed("github-processed");
     store.markDeliveryFailed("linear-dead", "permanent Linear failure", null);
 
-    expect(store.requeueFailedDeliveriesForRedelivery(
+    expect(store.requeueDeadDeliveriesForRedelivery(
       "github",
+      "ACME/WIDGET",
       "2099-01-01T00:00:00.000Z",
       50
     )).toBe(1);
@@ -197,14 +206,62 @@ describe("delivery store", () => {
       last_error: null,
       redelivered_at: "2099-01-01T00:00:00.000Z",
     });
-    expect(store.requeueFailedDeliveriesForRedelivery(
+    expect(store.requeueDeadDeliveriesForRedelivery(
       "github",
+      "acme/widget",
       "2099-01-01T00:01:00.000Z",
       50
     )).toBe(0);
     expect(db.prepare("SELECT status FROM webhook_deliveries WHERE delivery_id = ?").get("github-processed"))
       .toEqual({ status: "processed" });
+    expect(db.prepare("SELECT status FROM webhook_deliveries WHERE delivery_id = ?").get("github-other-dead"))
+      .toEqual({ status: "dead" });
     expect(db.prepare("SELECT status FROM webhook_deliveries WHERE delivery_id = ?").get("linear-dead"))
       .toEqual({ status: "dead" });
+  });
+
+  it("prunes accepted GitHub redelivery requests in bounded batches", () => {
+    const insert = db.prepare(`
+      INSERT INTO github_webhook_redelivery_requests (
+        repository, webhook_id, delivery_id, delivery_guid, delivered_at,
+        status, attempts, next_attempt_at, accepted_at, last_error, updated_at
+      ) VALUES (?, 42, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+    `);
+    const old = "2020-01-01T00:00:00.000Z";
+    const future = "2100-01-01T00:00:00.000Z";
+    insert.run("acme/widget", 1, "guid-1", old, "accepted", old, old, null, old);
+    insert.run("acme/widget", 2, "guid-2", old, "accepted", old, old, null, old);
+    insert.run("acme/widget", 3, "guid-3", old, "claimed", future, null, null, old);
+    insert.run("acme/widget", 4, "guid-4", old, "failed", future, null, "retry", old);
+    insert.run("acme/widget", 5, "guid-5", future, "accepted", future, future, null, future);
+
+    expect(store.pruneAcceptedGithubWebhookRedeliveryRequests(
+      "2021-01-01T00:00:00.000Z",
+      1
+    )).toBe(1);
+    expect(db.prepare(`
+      SELECT delivery_id, status
+      FROM github_webhook_redelivery_requests
+      ORDER BY delivery_id
+    `).all()).toEqual([
+      { delivery_id: 2, status: "accepted" },
+      { delivery_id: 3, status: "claimed" },
+      { delivery_id: 4, status: "failed" },
+      { delivery_id: 5, status: "accepted" },
+    ]);
+
+    expect(store.pruneAcceptedGithubWebhookRedeliveryRequests(
+      "2021-01-01T00:00:00.000Z",
+      10
+    )).toBe(1);
+    expect(db.prepare(`
+      SELECT delivery_id, status
+      FROM github_webhook_redelivery_requests
+      ORDER BY delivery_id
+    `).all()).toEqual([
+      { delivery_id: 3, status: "claimed" },
+      { delivery_id: 4, status: "failed" },
+      { delivery_id: 5, status: "accepted" },
+    ]);
   });
 });

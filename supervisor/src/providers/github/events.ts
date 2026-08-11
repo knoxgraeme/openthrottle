@@ -5,8 +5,8 @@ import type { Config } from "../../app/config.js";
 import type { SupervisorStore } from "../../persistence/store.js";
 import {
   getFailingGithubCheckDetails,
-  OPENTHROTTLE_COMMENT_MARKER_PREFIX,
   fetchGithubIssueContext,
+  fetchGithubIssueLifecycle,
   getRepositoryCollaboratorPermission,
   githubIssueControlEvent,
   githubIssuesEventCarriesExactControlLabel,
@@ -29,6 +29,7 @@ import {
 import { sanitizeText } from "../../shared/sanitize.js";
 import { handleControlEvent, type PipelineCoordinatorContext, type SessionServicePorts } from "../../app/session-service.js";
 import type { AdmissionPreflight } from "../../app/admission-preflight.js";
+import { githubSupervisorCommentWriteIsPending } from "./comment-provenance.js";
 
 type ProviderFinding = {
   severity: "P0" | "P1" | "P2" | "P3";
@@ -54,8 +55,34 @@ export function routePipelineProviderEvent(params: {
   if (params.pullRequestUrl && params.ticket.pr_url && params.pullRequestUrl !== params.ticket.pr_url) {
     return true;
   }
-  if (pipelineIsTerminal(instance)) return true;
   const authoritativeHead = params.store.getSetting(`github-head:${params.ticket.ticket_id}`);
+  if (pipelineIsTerminal(instance)) {
+    const canceledMergeRecovery =
+      instance.status === "canceled" &&
+      instance.terminal_outcome === "canceled" &&
+      params.outcome === "success" &&
+      params.payload.kind === "pull_request" &&
+      params.payload.action === "closed" &&
+      params.payload.merged === true &&
+      params.headSha !== undefined &&
+      params.headSha === authoritativeHead &&
+      params.headSha === instance.published_commit;
+    if (!canceledMergeRecovery) return true;
+    processProviderEvidence(params.pipelines, {
+      id: params.eventId,
+      instanceId: instance.id,
+      outcome: params.outcome,
+      summary: params.summary,
+      evidence: params.evidence,
+      findings: params.findings,
+      providerPayload: {
+        ...params.payload,
+        expected_published_commit: instance.published_commit,
+        observed_head_sha: params.headSha,
+      },
+    });
+    return true;
+  }
   if (params.headSha === undefined) return true;
   const canReceive = providerStageCanReceive(params.pipelines, instance);
   const revisionMatches = instance.published_commit !== null && params.headSha === instance.published_commit;
@@ -144,16 +171,110 @@ async function authorizedGithubControlActor(
   author: string | undefined
 ): Promise<boolean> {
   if (!author) return false;
+  const permission = await getRepositoryCollaboratorPermission(
+    { token: cfg.githubReadToken },
+    repository,
+    author
+  );
+  return isAuthorizedGithubControlPermission(permission);
+}
+
+type GithubIssueLifecycle = {
+  state: "open" | "closed";
+  observedAt: string;
+};
+
+function githubIssueLifecycleKey(repository: string, issueNumber: number): string {
+  return `github-issue-lifecycle:${repository.toLowerCase()}#${issueNumber}`;
+}
+
+function readGithubIssueLifecycle(
+  store: SupervisorStore,
+  repository: string,
+  issueNumber: number
+): GithubIssueLifecycle | undefined {
+  const raw = store.getSetting(githubIssueLifecycleKey(repository, issueNumber));
+  if (!raw) return undefined;
   try {
-    const permission = await getRepositoryCollaboratorPermission(
-      { token: cfg.githubReadToken },
-      repository,
-      author
-    );
-    return isAuthorizedGithubControlPermission(permission);
+    const value = JSON.parse(raw) as Partial<GithubIssueLifecycle>;
+    if ((value.state !== "open" && value.state !== "closed") ||
+        typeof value.observedAt !== "string" || Number.isNaN(Date.parse(value.observedAt))) {
+      return undefined;
+    }
+    return value as GithubIssueLifecycle;
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+function recordGithubIssueLifecycle(
+  store: SupervisorStore,
+  repository: string,
+  issueNumber: number,
+  lifecycle: GithubIssueLifecycle
+): GithubIssueLifecycle {
+  const prior = readGithubIssueLifecycle(store, repository, issueNumber);
+  const nextTime = Date.parse(lifecycle.observedAt);
+  if (Number.isNaN(nextTime)) return prior ?? lifecycle;
+  if (prior) {
+    const priorTime = Date.parse(prior.observedAt);
+    if (nextTime < priorTime ||
+        (nextTime === priorTime && prior.state === "closed" && lifecycle.state === "open")) {
+      return prior;
+    }
+  }
+  store.setSetting(
+    githubIssueLifecycleKey(repository, issueNumber),
+    JSON.stringify(lifecycle)
+  );
+  return lifecycle;
+}
+
+function githubIssueEventTimestamp(event: Extract<GithubWebhookEvent, { kind: "issues" }>): string | undefined {
+  if (event.action === "closed") return event.issue.closed_at ?? event.issue.updated_at;
+  if (event.action === "opened") return event.issue.created_at ?? event.issue.updated_at;
+  return event.issue.updated_at ?? event.issue.created_at;
+}
+
+function eventPredatesCurrentSession(
+  store: SupervisorStore,
+  ticket: NonNullable<ReturnType<SupervisorStore["getByIssueId"]>>,
+  providerTimestamp: string | undefined
+): boolean {
+  if (!providerTimestamp || Number.isNaN(Date.parse(providerTimestamp))) return false;
+  const session = store.getCurrentSession(ticket.ticket_id) ?? store.getSession(ticket.session_id);
+  return session !== undefined && Date.parse(providerTimestamp) < Date.parse(session.created_at);
+}
+
+function lifecycleFromIssueEvent(
+  event: Extract<GithubWebhookEvent, { kind: "issues" }>
+): GithubIssueLifecycle | undefined {
+  const observedAt = githubIssueEventTimestamp(event);
+  if (!observedAt) return undefined;
+  const state = event.action === "closed" || event.issue.state === "closed" ? "closed" : "open";
+  return { state, observedAt };
+}
+
+export function githubIssueControlSessionId(input: {
+  store: SupervisorStore;
+  pipelines: PipelineStore;
+  event: Extract<GithubWebhookEvent, { kind: "issues" }>;
+  deliveryId?: string;
+}): string | undefined {
+  const externalThreadId = `${input.event.repository.full_name}#${input.event.issue.number}`;
+  const ticket = input.store.getByExternalThread("github", externalThreadId);
+  const current = ticket
+    ? input.pipelines.getInstanceForSession(ticket.session_id)
+    : undefined;
+  if (current && !pipelineIsTerminal(current)) return ticket!.session_id;
+  if (input.event.action === "reopened") {
+    return `github:${externalThreadId}:reopened:${input.event.issue.updated_at ?? input.deliveryId ?? "current"}`;
+  }
+  if (ticket && input.event.action === "labeled") {
+    return `github:${externalThreadId}:label:${input.event.issue.updated_at ?? input.deliveryId ?? "current"}`;
+  }
+  if (ticket) return undefined;
+  return `github:${externalThreadId}:initial`;
 }
 
 export function considerCiGithubHead(
@@ -180,26 +301,6 @@ export function considerCiGithubHead(
   store.setSetting(watermarkKey, String(sequence));
   store.setSetting(headKey, headSha);
   store.setSetting(sourceKey, JSON.stringify({ source, sequence }));
-}
-
-// Solo-operator feedback mode: the operator and the pipeline share one GitHub
-// account, so authorship cannot distinguish human feedback from the pipeline's
-// own output. Provenance comes from the supervisor's own records — the comment
-// IDs its summary upsert persisted as github_summary external IDs. The marker
-// prefix below is only a fallback for the narrow window where the comment
-// webhook races the receipt acknowledgement, and it matches the full enforced
-// summary marker so a human merely mentioning openthrottle markup is not
-// silently dropped. An agent-authored unmarked comment could echo one repair
-// cycle, bounded by the manifest's provider re-entry limit — a distinct
-// machine identity (machine user or GitHub App) restores account-level
-// filtering if this ever runs multi-user.
-const SUPERVISOR_COMMENT_MARKER_PREFIXES = [
-  `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-summary:`,
-  `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-status:`,
-] as const;
-
-function looksLikeSupervisorComment(body: string | undefined): boolean {
-  return SUPERVISOR_COMMENT_MARKER_PREFIXES.some((prefix) => body?.startsWith(prefix) === true);
 }
 
 // Known Linear↔GitHub bridge identities whose PR comments are linkage
@@ -448,9 +549,29 @@ export async function handleGithubEvent(
 
   if (event.kind === "issue_comment") {
     if (pipelines.isSupervisorGithubComment(String(event.comment.id))) return;
-    if (looksLikeSupervisorComment(event.comment.body)) return;
+    if (store.getSetting(`github-supervisor-comment:${event.comment.id}`)) return;
+    if (githubSupervisorCommentWriteIsPending(
+      store,
+      event.repository.full_name,
+      event.issue.number,
+      event.comment.body
+    )) {
+      // Do not decide provenance from caller-controlled marker text. A durable
+      // write intent only defers this delivery until the GitHub mutation has
+      // returned and the exact supervisor-authored comment id is persisted.
+      throw new Error("GitHub supervisor comment publication is still in flight");
+    }
     if (classifyGithubIssueComment(event) === "plain_issue_comment") {
       if (!control || event.action !== "created") return;
+      const existingTicket = store.getByExternalThread(
+        "github",
+        `${event.repository.full_name}#${event.issue.number}`
+      );
+      if (existingTicket && eventPredatesCurrentSession(
+        store,
+        existingTicket,
+        event.comment.created_at
+      )) return;
       const author = event.comment.user?.login;
       if (!await authorizedGithubControlActor(_cfg, event.repository.full_name, author)) return;
       await handleControlEvent(
@@ -472,9 +593,9 @@ export async function handleGithubEvent(
     if (!ticket) return;
     const author = event.comment.user?.login;
     if (!author) return;
-    // Provenance first: comment IDs the supervisor's summary upsert persisted
-    // are the machine's own output. The marker check only covers the window
-    // where this webhook races the receipt acknowledgement.
+    // Provenance first: comment IDs persisted by supervisor publication are
+    // the machine's own output. Body markup never establishes that provenance;
+    // this separate check recognizes only explicit Linear bridge artifacts.
     if (isGithubBotLinkback(author, event.comment.body)) return;
     await activityPublisher.publishActivity({
       sessionId: ticket.session_id,
@@ -500,18 +621,28 @@ export async function handleGithubEvent(
   }
 
   if (event.kind === "issues") {
+    const eventLifecycle = lifecycleFromIssueEvent(event);
+    const lifecycle = eventLifecycle
+      ? recordGithubIssueLifecycle(
+          store,
+          event.repository.full_name,
+          event.issue.number,
+          eventLifecycle
+        )
+      : readGithubIssueLifecycle(store, event.repository.full_name, event.issue.number);
+    if (event.action === "closed" || githubIssuesEventCarriesExactControlLabel(event)) {
+      const author = event.sender?.login;
+      if (!await authorizedGithubControlActor(_cfg, event.repository.full_name, author)) return;
+    }
     if (event.action === "closed") {
       const ticket = store.getByExternalThread(
         "github",
         `${event.repository.full_name}#${event.issue.number}`
       );
       if (!ticket) return;
+      if (eventPredatesCurrentSession(store, ticket, githubIssueEventTimestamp(event))) return;
       const pipelineInstance = pipelines.getInstanceForSession(ticket.session_id);
-      if (
-        pipelineInstance &&
-        !pipelineIsTerminal(pipelineInstance) &&
-        !providerStageCanReceive(pipelines, pipelineInstance)
-      ) {
+      if (pipelineInstance && !pipelineIsTerminal(pipelineInstance)) {
         requestPipelineStop({
           store: pipelines,
           sessionId: ticket.session_id,
@@ -527,26 +658,55 @@ export async function handleGithubEvent(
       return;
     }
     if (!control || !githubIssuesEventCarriesExactControlLabel(event)) return;
-    const author = event.sender?.login ?? event.issue.user?.login;
-    if (!await authorizedGithubControlActor(_cfg, event.repository.full_name, author)) return;
+    const externalThreadId = `${event.repository.full_name}#${event.issue.number}`;
+    const ticket = store.getByExternalThread("github", externalThreadId);
+    if (ticket && eventPredatesCurrentSession(store, ticket, githubIssueEventTimestamp(event))) return;
+    if (lifecycle?.state === "closed") return;
+    const sessionId = githubIssueControlSessionId({
+      store,
+      pipelines,
+      event,
+      deliveryId: control.deliveryId,
+    });
+    if (!sessionId) return;
     const promptContext = await fetchGithubIssueContext(
       { token: _cfg.githubReadToken },
       event.repository.full_name,
       event.issue.number
     );
-    const sessionSuffix = event.action === "labeled"
-      ? `label:${event.issue.updated_at ?? control.deliveryId ?? "current"}`
-      : `opened:${event.issue.created_at ?? control.deliveryId ?? "current"}`;
+    const finalIssuePreflight: AdmissionPreflight = async (target) => {
+      if (control.preflight) {
+        const verdict = await control.preflight(target);
+        if (!verdict.ok) return verdict;
+      }
+      const live = await fetchGithubIssueLifecycle(
+        { token: _cfg.githubReadToken },
+        event.repository.full_name,
+        event.issue.number
+      );
+      const current = recordGithubIssueLifecycle(
+        store,
+        event.repository.full_name,
+        event.issue.number,
+        { state: live.state, observedAt: live.updatedAt }
+      );
+      return current.state === "closed"
+        ? {
+            ok: false,
+            reason: `GitHub Issue ${event.repository.full_name}#${event.issue.number} is closed, so no pipeline was admitted. Reopen it to start a new generation.`,
+          }
+        : { ok: true };
+    };
     await handleControlEvent(
       _cfg,
       store,
       control.ports,
       githubIssueControlEvent(event, {
         promptContext,
-        sessionId: `github:${event.repository.full_name}#${event.issue.number}:${sessionSuffix}`,
+        sessionId,
       }),
       control.coordinator,
-      control.preflight
+      finalIssuePreflight
     );
     await control.coordinator.drainEffects?.();
     return;

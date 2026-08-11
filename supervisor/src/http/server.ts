@@ -29,10 +29,13 @@ import {
   prepareRepository,
   verifyGithubSignature,
   classifyGithubIssueComment,
+  ensureRepositoryControlLabel,
   githubIssuesEventCarriesExactControlLabel,
   isAuthorizedGithubControlPermission,
+  upsertIssueStatusComment,
   type GithubWebhookEvent,
 } from "../providers/github/client.js";
+import type { ActivityPublicationInput, ActivityPublicationPort } from "../app/ports.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "../shared/logs.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import {
@@ -48,6 +51,10 @@ import { createLinearActivityPublisher, createLinearOutboxProcessor, tryPostErro
 import { handleControlEvent, type PipelineCoordinatorContext, type SessionServicePorts } from "../app/session-service.js";
 import { createAdmissionPreflight } from "../app/admission-preflight.js";
 import { handleGithubEvent } from "../providers/github/events.js";
+import {
+  beginGithubSupervisorCommentWrite,
+  settleGithubSupervisorCommentWrite,
+} from "../providers/github/comment-provenance.js";
 import { renderPipelineLogHeader } from "../pipeline/publication.js";
 import { canSteerPipelineRun, requestPipelineStop } from "../pipeline/control.js";
 import { stageById } from "../pipeline/manifest.js";
@@ -169,7 +176,8 @@ function isSafeBranchName(value: string): boolean {
 
 function repositoryRegistrationInput(value: unknown): {
   repo: string;
-  linearTeamKey: string;
+  controlProvider: "linear" | "github";
+  linearTeamKey?: string;
   linearTeamId?: string;
   baseBranch?: string;
 } {
@@ -180,11 +188,19 @@ function repositoryRegistrationInput(value: unknown): {
   if (typeof input.repo !== "string" || !isGithubRepository(input.repo)) {
     throw new Error("repo must be owner/name");
   }
-  if (
-    typeof input.linearTeamKey !== "string" ||
-    !LINEAR_TEAM_KEY_PATTERN.test(input.linearTeamKey)
-  ) {
-    throw new Error("linearTeamKey is required");
+  const controlProvider = input.controlProvider ?? "linear";
+  if (controlProvider !== "linear" && controlProvider !== "github") {
+    throw new Error("controlProvider must be linear or github");
+  }
+  if (controlProvider === "linear") {
+    if (
+      typeof input.linearTeamKey !== "string" ||
+      !LINEAR_TEAM_KEY_PATTERN.test(input.linearTeamKey)
+    ) {
+      throw new Error("linearTeamKey is required for Linear control");
+    }
+  } else if (input.linearTeamKey !== undefined || input.linearTeamId !== undefined) {
+    throw new Error("Linear team fields are not accepted for GitHub control");
   }
   if (
     input.linearTeamId !== undefined &&
@@ -200,10 +216,129 @@ function repositoryRegistrationInput(value: unknown): {
   }
   return {
     repo: input.repo,
-    linearTeamKey: input.linearTeamKey.toUpperCase(),
+    controlProvider,
+    linearTeamKey: typeof input.linearTeamKey === "string"
+      ? input.linearTeamKey.toUpperCase()
+      : undefined,
     linearTeamId: typeof input.linearTeamId === "string" ? input.linearTeamId.trim() : undefined,
     baseBranch: input.baseBranch || undefined,
   };
+}
+
+function githubIssueTarget(
+  store: SupervisorStore,
+  sessionId: string | undefined,
+  issueId: string | undefined
+): { repo: string; issueNumber: number; identity: string } | undefined {
+  const ticket = issueId ? store.getByIssueId(issueId) : undefined;
+  const sessionThread = sessionId?.match(/^github:(.+#\d+)(?::.*)?$/)?.[1];
+  const external = ticket?.control_provider === "github"
+    ? ticket.external_thread_id
+    : issueId?.startsWith("github:")
+      ? issueId.slice("github:".length)
+      : sessionThread;
+  const match = external?.match(/^(.+)#(\d+)$/);
+  if (!match) return undefined;
+  const issueNumber = Number(match[2]);
+  if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0 || !isGithubRepository(match[1]!)) {
+    return undefined;
+  }
+  return {
+    repo: match[1]!,
+    issueNumber,
+    identity: sessionId ?? issueId ?? `github:${external}`,
+  };
+}
+
+function githubActivityBody(marker: string, activity: ActivityPublicationInput): string {
+  const content = activity.type === "action"
+    ? [`**${activity.action}:** ${activity.parameter}`, activity.result].filter(Boolean).join("\n\n")
+    : activity.body;
+  return `${marker}\n\n## OpenThrottle control\n\n${sanitizeText(content).slice(0, 8_000)}`;
+}
+
+function createGithubIssueActivityPublisher(
+  cfg: Config,
+  store: SupervisorStore
+): ActivityPublicationPort {
+  const publish = async (
+    activity: ActivityPublicationInput,
+    issueId?: string
+  ): Promise<void> => {
+    const target = githubIssueTarget(store, activity.sessionId, issueId);
+    if (!target) throw new Error("GitHub control activity has no Issue target");
+    const identity = createHash("sha256").update(target.identity).digest("hex").slice(0, 32);
+    const marker = `<!-- openthrottle:control-session:${identity} -->`;
+    const writeIntent = beginGithubSupervisorCommentWrite(
+      store,
+      target.repo,
+      target.issueNumber,
+      marker
+    );
+    const result = await upsertIssueStatusComment(
+      { token: cfg.githubToken },
+      target.repo,
+      target.issueNumber,
+      marker,
+      githubActivityBody(marker, activity)
+    );
+    store.setSetting(`github-supervisor-comment:${result.id}`, "control-session");
+    settleGithubSupervisorCommentWrite(
+      store,
+      writeIntent,
+      result.id
+    );
+  };
+  return {
+    publishActivity: publish,
+    publishError: (sessionId, issueId, message) => publish({
+      sessionId: sessionId ?? issueId ?? "github:unknown",
+      type: "error",
+      body: message,
+    }, issueId),
+  };
+}
+
+export function createProviderAwareActivityPublisher(
+  cfg: Config,
+  store: SupervisorStore,
+  linearActivityPublisher: ActivityPublicationPort
+): ActivityPublicationPort {
+  const githubActivityPublisher = createGithubIssueActivityPublisher(cfg, store);
+  return {
+    publishActivity: (activity, issueId, runId) =>
+      githubIssueTarget(store, activity.sessionId, issueId)
+        ? githubActivityPublisher.publishActivity(activity, issueId, runId)
+        : linearActivityPublisher.publishActivity(activity, issueId, runId),
+    publishError: (sessionId, issueId, message) =>
+      githubIssueTarget(store, sessionId, issueId)
+        ? githubActivityPublisher.publishError(sessionId, issueId, message)
+        : linearActivityPublisher.publishError(sessionId, issueId, message),
+  };
+}
+
+function githubControlEventPredatesCurrentSession(
+  store: SupervisorStore,
+  event: GithubWebhookEvent
+): boolean {
+  const target = event.kind === "issues"
+    ? {
+        externalThreadId: `${event.repository.full_name}#${event.issue.number}`,
+        timestamp: event.action === "closed"
+          ? event.issue.closed_at ?? event.issue.updated_at
+          : event.issue.updated_at ?? event.issue.created_at,
+      }
+    : event.kind === "issue_comment" && classifyGithubIssueComment(event) === "plain_issue_comment"
+      ? {
+          externalThreadId: `${event.repository.full_name}#${event.issue.number}`,
+          timestamp: event.comment.created_at,
+        }
+      : undefined;
+  if (!target?.timestamp || Number.isNaN(Date.parse(target.timestamp))) return false;
+  const ticket = store.getByExternalThread("github", target.externalThreadId);
+  if (!ticket) return false;
+  const session = store.getCurrentSession(ticket.ticket_id) ?? store.getSession(ticket.session_id);
+  return session !== undefined && Date.parse(target.timestamp) < Date.parse(session.created_at);
 }
 
 export function createServerWebhookDeliveryProcessor(deps: {
@@ -224,9 +359,15 @@ export function createServerWebhookDeliveryProcessor(deps: {
     deps.linearOutbox ??
     createLinearOutboxProcessor({ store: deps.store, getLinearClient: deps.getLinearClient });
   const admissionPreflight = createAdmissionPreflight(deps.cfg, deps.runtime, deps.reconcileRuntimeCapacity);
-  const activityPublisher = createLinearActivityPublisher(deps.store, linearOutbox);
+  const linearActivityPublisher = createLinearActivityPublisher(deps.store, linearOutbox);
+  const githubActivityPublisher = createGithubIssueActivityPublisher(deps.cfg, deps.store);
+  const activityPublisher = createProviderAwareActivityPublisher(
+    deps.cfg,
+    deps.store,
+    linearActivityPublisher
+  );
   const createSessionServicePorts = (linear: LinearClient): SessionServicePorts => ({
-    activityPublisher,
+    activityPublisher: linearActivityPublisher,
     labelResolver: {
       fetchThreadLabels: (issueId: string) => fetchIssueLabels(linear, issueId),
     },
@@ -249,7 +390,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
     },
   });
   const githubSessionServicePorts: SessionServicePorts = {
-    activityPublisher,
+    activityPublisher: githubActivityPublisher,
     labelResolver: {
       fetchThreadLabels: async (threadId: string) => {
         const match = threadId.match(/^(.+)#(\d+)$/);
@@ -524,7 +665,10 @@ export function createServer(deps: ServerDeps): Hono {
     } catch (error) {
       return context.json({ error: sanitizeText(String(error)) }, 400);
     }
-    if (!cfg.linearWebhookSecret || !cfg.linearClientId || !cfg.linearClientSecret) {
+    if (
+      input.controlProvider === "linear" &&
+      (!cfg.linearWebhookSecret || !cfg.linearClientId || !cfg.linearClientSecret)
+    ) {
       return context.json({
         error: "Linear control provider is unavailable: LINEAR_WEBHOOK_SECRET/LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET are not configured.",
       }, 503);
@@ -545,7 +689,11 @@ export function createServer(deps: ServerDeps): Hono {
           webhookSecret: cfg.githubWebhookSecret,
         }
       );
+      const controlLabel = input.controlProvider === "github"
+        ? await ensureRepositoryControlLabel({ token: cfg.githubToken }, github.repo)
+        : undefined;
       const registration = store.registerRepository({
+        controlProvider: input.controlProvider,
         linearTeamKey: input.linearTeamKey,
         linearTeamId: input.linearTeamId,
         githubRepo: github.repo,
@@ -558,6 +706,7 @@ export function createServer(deps: ServerDeps): Hono {
         readiness: {
           github: "ready",
           webhook: github.webhookAction,
+          ...(controlLabel ? { controlLabel } : {}),
           snapshot: { name: snapshot.name, state: snapshot.state },
         },
       });
@@ -664,23 +813,29 @@ export function createServer(deps: ServerDeps): Hono {
     }
     const authorizeGithubWebhookActor = async (repo: string, author: string | undefined) => {
       if (!author) return false;
-      try {
-        const permission = await getRepositoryCollaboratorPermission(
-          { token: cfg.githubReadToken },
-          repo,
-          author
-        );
-        return isAuthorizedGithubControlPermission(permission);
-      } catch {
-        return false;
-      }
+      const permission = await getRepositoryCollaboratorPermission(
+        { token: cfg.githubReadToken },
+        repo,
+        author
+      );
+      return isAuthorizedGithubControlPermission(permission);
     };
     if (
       event.kind === "issues" &&
       (event.action === "closed" || githubIssuesEventCarriesExactControlLabel(event))
     ) {
-      const author = event.sender?.login ?? event.issue.user?.login;
-      if (!await authorizeGithubWebhookActor(event.repository.full_name, author)) return context.text("ok", 200);
+      // `sender` is the actor for the webhook action. The Issue author may be
+      // a different person and must never lend their permission to a label or
+      // close event whose sender is absent.
+      const author = event.sender?.login;
+      try {
+        if (!await authorizeGithubWebhookActor(event.repository.full_name, author)) {
+          return context.text("ok", 200);
+        }
+      } catch (error) {
+        console.warn("[webhooks/github] collaborator permission lookup failed:", error);
+        return context.text("permission lookup unavailable", 503);
+      }
     }
     if (
       event.kind === "issue_comment" &&
@@ -688,7 +843,17 @@ export function createServer(deps: ServerDeps): Hono {
       event.action === "created"
     ) {
       const author = event.comment.user?.login;
-      if (!await authorizeGithubWebhookActor(event.repository.full_name, author)) return context.text("ok", 200);
+      try {
+        if (!await authorizeGithubWebhookActor(event.repository.full_name, author)) {
+          return context.text("ok", 200);
+        }
+      } catch (error) {
+        console.warn("[webhooks/github] collaborator permission lookup failed:", error);
+        return context.text("permission lookup unavailable", 503);
+      }
+    }
+    if (githubControlEventPredatesCurrentSession(store, event)) {
+      return context.text("ok", 200);
     }
     const deliveryId =
       context.req.header("X-GitHub-Delivery") ?? createHash("sha256").update(rawBody).digest("hex");

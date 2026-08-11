@@ -115,7 +115,10 @@ describe("coordinator-only server", () => {
     citationGateStore = createCitationGateStore(db, () => "2026-08-08T00:00:00.000Z");
   });
 
-  afterEach(() => db.close());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    db.close();
+  });
 
   function app(overrides: Partial<Parameters<typeof createServer>[0]> = {}) {
     return createServer({
@@ -1210,6 +1213,80 @@ describe("coordinator-only server", () => {
     }
   });
 
+  it("registers GitHub-controlled repositories without Linear fields or configuration and creates the exact control label", async () => {
+    const requests: Array<{ url: string; method: string; body?: unknown }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({
+        url,
+        method,
+        ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}),
+      });
+      if (url.endsWith("/repos/owner/repo")) {
+        return Response.json({ full_name: "owner/repo", default_branch: "main" });
+      }
+      if (url.endsWith("/repos/owner/repo/branches/main")) return Response.json({ name: "main" });
+      if (url.endsWith("/repos/owner/repo/hooks?per_page=100")) return Response.json([]);
+      if (url.endsWith("/repos/owner/repo/hooks") && method === "POST") return Response.json({ id: 8 });
+      if (url.endsWith("/repos/owner/repo/labels?per_page=100")) return Response.json([]);
+      if (url.endsWith("/repos/owner/repo/labels") && method === "POST") {
+        return Response.json({ name: "openthrottle" });
+      }
+      throw new Error(`unexpected request ${method} ${url}`);
+    }));
+    const server = app({
+      cfg: {
+        ...cfg,
+        linearWebhookSecret: undefined,
+        linearClientId: undefined,
+        linearClientSecret: undefined,
+      },
+      runtime: {
+        getSnapshot: async () => ({ name: "snapshot", state: "active" }),
+      } as unknown as ServerRuntime,
+    });
+
+    const response = await server.request("/repositories/register", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ repo: "owner/repo", controlProvider: "github" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      registration: {
+        control_provider: "github",
+        linear_team_key: null,
+        linear_team_id: null,
+      },
+      readiness: { github: "ready", controlLabel: "created" },
+    });
+    expect(requests.at(-1)).toMatchObject({
+      method: "POST",
+      body: { name: "openthrottle" },
+    });
+  });
+
+  it("requires Linear routing fields and credentials only for Linear-controlled registration", async () => {
+    const missingFields = await app().request("/repositories/register", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ repo: "owner/repo", controlProvider: "linear" }),
+    });
+    expect(missingFields.status).toBe(400);
+    expect(await missingFields.json()).toMatchObject({ error: expect.stringContaining("linearTeamKey") });
+
+    const unavailable = await app({
+      cfg: { ...cfg, linearWebhookSecret: undefined },
+    }).request("/repositories/register", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ repo: "owner/repo", controlProvider: "linear", linearTeamKey: "OT" }),
+    });
+    expect(unavailable.status).toBe(503);
+  });
+
   it("authenticates, freshness-checks, durably deduplicates, and schedules Linear webhooks", async () => {
     const process = vi.fn(async () => undefined);
     const runBackground = vi.fn((task: Promise<void>) => void task);
@@ -1422,6 +1499,248 @@ describe("coordinator-only server", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("returns retryable 503 and retains no body when GitHub permission lookup is transiently unavailable", async () => {
+    const process = vi.fn(async () => undefined);
+    const server = app({
+      deliveryProcessor: { process, drain: vi.fn(async () => undefined) },
+      runBackground: (task) => void task,
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new Error("GitHub permission API unavailable");
+    }));
+    const payload = JSON.stringify({
+      action: "created",
+      repository: { full_name: "owner/repo" },
+      issue: { number: 12 },
+      comment: {
+        id: 102,
+        body: "retry this authorized command later",
+        html_url: "https://github.com/owner/repo/issues/12#issuecomment-102",
+        user: { login: "operator" },
+      },
+    });
+    const signature = createHmac("sha256", cfg.githubWebhookSecret).update(payload).digest("hex");
+
+    const response = await server.request("/webhooks/github", {
+      method: "POST",
+      headers: {
+        "X-GitHub-Event": "issue_comment",
+        "X-Hub-Signature-256": `sha256=${signature}`,
+        "X-GitHub-Delivery": "github-transient-permission",
+      },
+      body: payload,
+    });
+
+    expect(response.status).toBe(503);
+    expect(db.prepare("SELECT COUNT(*) FROM webhook_deliveries").pluck().get()).toBe(0);
+    expect(process).not.toHaveBeenCalled();
+  });
+
+  it("drops stale generation-one Issue close and comment webhooks before durable persistence", async () => {
+    store.upsertUnpinned({
+      ticket_id: "github:owner/repo#12",
+      ticket_reference: "GH-12",
+      session_id: "github:owner/repo#12:reopened:2026-08-11T00:00:00.000Z",
+      control_provider: "github",
+      external_thread_id: "owner/repo#12",
+      external_thread_reference: "GH-12",
+      sandbox_id: null,
+      branch: "ot/gh-12",
+      agent: "codex",
+      repo: "owner/repo",
+      base_branch: "main",
+      pr_url: null,
+      state: "active",
+    });
+    db.prepare("UPDATE agent_sessions SET created_at = ? WHERE id = ?").run(
+      "2026-08-11T00:00:00.000Z",
+      "github:owner/repo#12:reopened:2026-08-11T00:00:00.000Z"
+    );
+    const process = vi.fn(async () => undefined);
+    const server = app({
+      deliveryProcessor: { process, drain: vi.fn(async () => undefined) },
+      runBackground: (task) => void task,
+    });
+    vi.stubGlobal("fetch", vi.fn(async () =>
+      Response.json({ permission: "triage", role_name: "triage" })
+    ));
+    const requests = [
+      {
+        eventName: "issues",
+        delivery: "github-stale-close",
+        payload: {
+          action: "closed",
+          repository: { full_name: "owner/repo" },
+          sender: { login: "operator" },
+          issue: {
+            number: 12,
+            title: "Ship it",
+            html_url: "https://github.com/owner/repo/issues/12",
+            updated_at: "2026-08-10T00:00:00.000Z",
+          },
+        },
+      },
+      {
+        eventName: "issue_comment",
+        delivery: "github-stale-comment",
+        payload: {
+          action: "created",
+          repository: { full_name: "owner/repo" },
+          issue: { number: 12 },
+          comment: {
+            id: 104,
+            body: "old generation feedback",
+            created_at: "2026-08-10T00:00:00.000Z",
+            html_url: "https://github.com/owner/repo/issues/12#issuecomment-104",
+            user: { login: "operator" },
+          },
+        },
+      },
+    ];
+
+    for (const request of requests) {
+      const raw = JSON.stringify(request.payload);
+      const signature = createHmac("sha256", cfg.githubWebhookSecret).update(raw).digest("hex");
+      const response = await server.request("/webhooks/github", {
+        method: "POST",
+        headers: {
+          "X-GitHub-Event": request.eventName,
+          "X-Hub-Signature-256": `sha256=${signature}`,
+          "X-GitHub-Delivery": request.delivery,
+        },
+        body: raw,
+      });
+      expect(response.status).toBe(200);
+    }
+
+    expect(db.prepare("SELECT COUNT(*) FROM webhook_deliveries").pluck().get()).toBe(0);
+    expect(process).not.toHaveBeenCalled();
+    expect(store.getByIssueId("github:owner/repo#12")?.state).toBe("active");
+  });
+
+  it("retries a durable GitHub control delivery when its permission recheck fails transiently", async () => {
+    const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
+    const catalog = loadPipelineCatalog(
+      fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url)),
+      runtime.descriptor
+    );
+    pipelines.acceptRuntimeDescriptor(runtime);
+    pipelines.acceptCatalog(catalog);
+    const processor = createServerWebhookDeliveryProcessor({
+      cfg,
+      store,
+      runtime: {
+        listLabeledResources: async () => [],
+        deleteResource: async () => undefined,
+      },
+      getLinearClient: async () => undefined,
+      pipelineCoordinator: { catalog, runtime, store: pipelines },
+    });
+    store.claimDelivery({
+      deliveryId: "github-durable-transient-permission",
+      source: "github",
+      action: "issue_comment:created",
+      eventName: "issue_comment",
+      payload: JSON.stringify({
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 12 },
+        comment: {
+          id: 103,
+          body: "authorized command",
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-103",
+          user: { login: "operator" },
+        },
+      }),
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new Error("temporary permission failure");
+    }));
+
+    await expect(processor.process("github-durable-transient-permission"))
+      .rejects.toThrow("temporary permission failure");
+    expect(db.prepare(
+      "SELECT status, attempts FROM webhook_deliveries WHERE delivery_id = ?"
+    ).get("github-durable-transient-permission")).toEqual({ status: "failed", attempts: 1 });
+  });
+
+  it("publishes GitHub admission errors on the Issue without entering the Linear outbox", async () => {
+    const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
+    const catalog = loadPipelineCatalog(
+      fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url)),
+      runtime.descriptor
+    );
+    pipelines.acceptRuntimeDescriptor(runtime);
+    pipelines.acceptCatalog(catalog);
+    const postedBodies: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/collaborators/operator/permission")) {
+        return Response.json({ permission: "triage", role_name: "triage" });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12")) {
+        return Response.json({
+          number: 12,
+          title: "Ship it",
+          body: "Run the plan.",
+          state: "open",
+          created_at: "2026-08-11T00:00:00.000Z",
+          updated_at: "2026-08-11T00:00:00.000Z",
+          html_url: "https://github.com/owner/repo/issues/12",
+        });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/comments?per_page=100")) {
+        return Response.json([]);
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/comments") && method === "POST") {
+        postedBodies.push((JSON.parse(String(init?.body)) as { body: string }).body);
+        return Response.json({
+          id: 700 + postedBodies.length,
+          html_url: `https://github.com/owner/repo/issues/12#issuecomment-${700 + postedBodies.length}`,
+        });
+      }
+      throw new Error(`unexpected GitHub request ${method} ${url}`);
+    }));
+    const processor = createServerWebhookDeliveryProcessor({
+      cfg,
+      store,
+      runtime: {
+        listLabeledResources: async () => [],
+        deleteResource: async () => undefined,
+      },
+      getLinearClient: async () => undefined,
+      pipelineCoordinator: { catalog, runtime, store: pipelines },
+    });
+    store.claimDelivery({
+      deliveryId: "github-admission-error",
+      source: "github",
+      action: "issues:opened",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "opened",
+        repository: { full_name: "owner/repo" },
+        sender: { login: "operator" },
+        issue: {
+          number: 12,
+          title: "Ship it",
+          body: "Run the plan.",
+          state: "open",
+          created_at: "2026-08-11T00:00:00.000Z",
+          updated_at: "2026-08-11T00:00:00.000Z",
+          html_url: "https://github.com/owner/repo/issues/12",
+          labels: [{ name: "openthrottle" }],
+          user: { login: "operator" },
+        },
+      }),
+    });
+
+    await expect(processor.process("github-admission-error")).resolves.toBeUndefined();
+    expect(db.prepare("SELECT COUNT(*) FROM control_outbox").pluck().get()).toBe(0);
+    expect(postedBodies.some((body) => body.includes("No repository is registered"))).toBe(true);
+    expect(postedBodies.every((body) => body.startsWith("<!-- openthrottle:control-session:"))).toBe(true);
   });
 
   it("serves a sanitized bounded durable run tail after cleanup", async () => {

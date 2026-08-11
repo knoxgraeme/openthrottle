@@ -1,5 +1,15 @@
 import type { GithubClient } from "./client.js";
-import { parsePullRequestUrl, upsertIssueStatusComment, upsertPullRequestComment } from "./client.js";
+import {
+  parsePullRequestUrl,
+  pinIssueComment,
+  pipelineSummaryCommentMarker,
+  upsertIssueStatusComment,
+  upsertPullRequestComment,
+} from "./client.js";
+import {
+  beginGithubSupervisorCommentWrite,
+  settleGithubSupervisorCommentWrite,
+} from "./comment-provenance.js";
 import {
   pipelineStatusCommentMarker,
   parsePipelinePublication,
@@ -23,6 +33,14 @@ interface GithubPublicationTicket {
 
 interface GithubPublicationTicketStore {
   getByIssueId(issueId: string): GithubPublicationTicket | undefined;
+  acquireSupervisorLease(
+    name: string,
+    owner: string,
+    nowIso: string,
+    leaseUntilIso: string
+  ): boolean;
+  releaseSupervisorLease(name: string, owner: string): boolean;
+  setSetting(key: string, value: string): void;
 }
 
 interface GithubIssueTarget {
@@ -106,24 +124,55 @@ export function createGithubPublicationProcessor(params: {
     const envelope = parsePipelinePublication(publication.payload);
     let result: { id: number; html_url: string };
     if (issueTarget && bound.target_url === issueTarget.url) {
+      const marker = pipelineStatusCommentMarker(instance.ticket_id);
+      const writeIntent = beginGithubSupervisorCommentWrite(
+        params.tickets,
+        instance.repository,
+        issueTarget.number,
+        marker
+      );
       result = await upsertIssueStatusComment(
         params.client,
         instance.repository,
         issueTarget.number,
-        pipelineStatusCommentMarker(instance.ticket_id),
-        renderGithubIssueStatusComment(envelope, bound.target_url)
+        marker,
+        renderGithubIssueStatusComment(envelope, ticket?.pr_url)
       );
+      // Persist exact output provenance before pinning or acknowledging the
+      // publication. Webhook delivery can race either later operation; an
+      // author/type or marker heuristic would let unrelated bots suppress
+      // genuine feedback by copying machine-looking text.
+      params.tickets.setSetting(`github-supervisor-comment:${result.id}`, "pipeline-status");
+      settleGithubSupervisorCommentWrite(
+        params.tickets,
+        writeIntent,
+        result.id
+      );
+      await pinIssueComment(params.client, instance.repository, result.id);
     } else {
       const pull = parsePullRequestUrl(bound.target_url!);
       if (pull.host !== "github.com" || pull.repo.toLowerCase() !== instance.repository.toLowerCase()) {
         throw new Error("invalid pipeline pull request binding for the pinned instance");
       }
+      const marker = pipelineSummaryCommentMarker(instance.ticket_id);
+      const writeIntent = beginGithubSupervisorCommentWrite(
+        params.tickets,
+        instance.repository,
+        pull.number,
+        marker
+      );
       result = await upsertPullRequestComment(
         params.client,
         instance.repository,
         pull.number,
         instance.ticket_id,
         renderGithubPipelineSummary(envelope, bound.target_url)
+      );
+      params.tickets.setSetting(`github-supervisor-comment:${result.id}`, "pipeline-summary");
+      settleGithubSupervisorCommentWrite(
+        params.tickets,
+        writeIntent,
+        result.id
       );
     }
     const processed = params.store.markGithubPublicationProcessed(
@@ -134,7 +183,12 @@ export function createGithubPublicationProcessor(params: {
     );
     if (!processed) {
       const latest = params.store.getPublication(publication.id);
-      if (latest?.status === "acknowledged" && latest.external_id === String(result.id)) {
+      if (latest?.payload_hash !== publication.payload_hash && params.store.requeueGithubPublicationAfterStaleWrite(
+        publication.id,
+        publication.payload_hash,
+        String(result.id),
+        result.html_url
+      )) {
         return;
       }
       if (latest?.status === "processing" && latest.payload_hash === publication.payload_hash) {

@@ -79,7 +79,7 @@ export async function handlePrompted(
     workId &&
     canSteerPipelineRun({
       store: coordinator.store,
-      sessionId,
+      sessionId: currentSessionId,
       runId: ticket.run_id,
       agent: ticket.agent,
     })
@@ -93,7 +93,7 @@ export async function handlePrompted(
       body: sanitizeText(promptBody),
     });
     await providers.activityPublisher.publishActivity({
-      sessionId,
+      sessionId: currentSessionId,
       type: "thought",
       body: "Steering the current pipeline stage with your message…",
       ephemeral: true,
@@ -101,7 +101,7 @@ export async function handlePrompted(
     return;
   }
   if (!pipelineInstance) {
-    await publishMissingPipeline(providers, sessionId, ticket.ticket_id);
+    await publishMissingPipeline(providers, currentSessionId, ticket.ticket_id);
     return;
   }
   if (command.kind === "reply" && workId && pipelineInstance.status === "running" && ticket.run_id) {
@@ -114,7 +114,7 @@ export async function handlePrompted(
       body: sanitizeText(promptBody),
     });
     await providers.activityPublisher.publishActivity({
-      sessionId,
+      sessionId: currentSessionId,
       type: "thought",
       body: "Captured your message — it is retained for the next implementation or repair stage.",
       ephemeral: true,
@@ -132,13 +132,13 @@ export async function handlePrompted(
         store,
         instance: pipelineInstance,
         ticket,
-        provider: "linear",
-        eventId: `linear-reply:${workId}`,
+        provider: payload.provider,
+        eventId: `${payload.provider}-reply:${workId}`,
         outcome: "semantic_repair_required",
-        summary: "Linear reply requires another implementation pass.",
+        summary: `${payload.provider === "github" ? "GitHub" : "Linear"} reply requires another implementation pass.`,
         evidence: [sanitizedReply],
         payload: {
-          kind: "linear_reply",
+          kind: `${payload.provider}_reply`,
           activity_id: workId,
           body: sanitizedReply,
         },
@@ -152,7 +152,7 @@ export async function handlePrompted(
       });
       await coordinator.drainEffects?.();
       await providers.activityPublisher.publishActivity({
-        sessionId,
+        sessionId: currentSessionId,
         type: "thought",
         body: "Waking the run to address your message in the honest ledger.",
       }, ticket.ticket_id);
@@ -160,7 +160,7 @@ export async function handlePrompted(
     }
   }
   await providers.activityPublisher.publishError(
-    sessionId,
+    currentSessionId,
     ticket.ticket_id,
     "The current pipeline stage does not accept live steering. Add feedback to the pull request, or @-mention the agent in a new comment to start a new generation."
   );

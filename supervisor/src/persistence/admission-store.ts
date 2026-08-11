@@ -103,13 +103,13 @@ export function createAdmissionStore(
       webhook_id, snapshot, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(github_repo) DO UPDATE SET
+      control_provider = excluded.control_provider,
       linear_team_key = excluded.linear_team_key,
       linear_team_id = excluded.linear_team_id,
       base_branch = excluded.base_branch,
       webhook_id = excluded.webhook_id,
       snapshot = excluded.snapshot,
       updated_at = excluded.updated_at
-    WHERE repository_registrations.control_provider = excluded.control_provider
   `);
   const getCurrentSessionStmt = db.prepare(
     "SELECT * FROM agent_sessions WHERE ticket_id = ? AND state = 'current'"
@@ -158,11 +158,6 @@ export function createAdmissionStore(
       const existing = getRepositoryByRepoStmt.get(input.githubRepo) as
         | RepositoryRegistration
         | undefined;
-      if (existing && existing.control_provider !== controlProvider) {
-        throw new Error(
-          `Repository ${input.githubRepo} is already registered for ${existing.control_provider} control`
-        );
-      }
       if (controlProvider === "linear") {
         const byKey = input.linearTeamKey
           ? (getRepositoryByTeamKeyStmt.get(input.linearTeamKey) as RepositoryRegistration | undefined)
@@ -181,8 +176,8 @@ export function createAdmissionStore(
       upsertRepositoryRegistrationStmt.run(
         input.githubRepo,
         controlProvider,
-        input.linearTeamKey ?? null,
-        input.linearTeamId ?? null,
+        controlProvider === "linear" ? input.linearTeamKey ?? null : null,
+        controlProvider === "linear" ? input.linearTeamId ?? null : null,
         input.baseBranch,
         input.webhookId,
         input.snapshot,

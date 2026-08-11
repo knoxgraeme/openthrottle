@@ -150,7 +150,75 @@ describe("database migrations", () => {
       "36f3c74ad261f3e4e9e5014221e5ff8510dc7123b03ab92f2875b02ab0cf4fb2",
       "8ede2103ae2f761958e4a21fc672b1c7a2a6c8fe39f75109ca3843b2fe492597",
       "0d0aa73d6cbb944697d6815f5bd1c8dd766a919b8692945b905298759dd766a7",
+      "be4b0a09caf911013a376efe34aed76843fc89901c59dfe195eda0be4b4a852a",
     ]);
+  });
+
+  it("adds durable GitHub redelivery state to a v35 database without losing deliveries or ledger rows", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      CREATE TABLE webhook_deliveries (
+        delivery_id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        payload TEXT,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL,
+        next_attempt_at TEXT,
+        last_error TEXT,
+        received_at TEXT NOT NULL
+      );
+      INSERT INTO webhook_deliveries (
+        delivery_id, source, payload, status, attempts, next_attempt_at,
+        last_error, received_at
+      ) VALUES (
+        'legacy-dead', 'github', '{"repository":{"full_name":"acme/widget"}}',
+        'dead', 4, NULL, 'preserve me', '2026-01-01T00:00:00.000Z'
+      );
+    `);
+    for (const migration of databaseMigrations.filter((migration) => migration.version <= 35)) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare(`
+      SELECT delivery_id, source, payload, status, attempts, next_attempt_at,
+             last_error, redelivered_at, received_at
+      FROM webhook_deliveries
+    `).get()).toEqual({
+      delivery_id: "legacy-dead",
+      source: "github",
+      payload: '{"repository":{"full_name":"acme/widget"}}',
+      status: "dead",
+      attempts: 4,
+      next_attempt_at: null,
+      last_error: "preserve me",
+      redelivered_at: null,
+      received_at: "2026-01-01T00:00:00.000Z",
+    });
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name = 'github_webhook_redelivery_requests'
+    `).get()).toEqual({ name: "github_webhook_redelivery_requests" });
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'github_webhook_redelivery_process_idx'
+    `).get()).toEqual({ name: "github_webhook_redelivery_process_idx" });
+    expect(db.prepare(`
+      SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
+    `).get()).toEqual({ version: 36, name: "github-webhook-redelivery-requests" });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
+      count: databaseMigrations.length,
+    });
   });
 
   it("commits a complete ledger that reopens idempotently from a real SQLite file", () => {

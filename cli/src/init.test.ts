@@ -19,8 +19,10 @@ import {
   detectRepository,
   editableSkillsRefreshSummary,
   getSupervisorTaskTimeoutSeconds,
+  initOutro,
   parseGithubRemote,
   planEditableSkillsRefresh,
+  promptConfig,
   registerTargetRepository,
   registrationSummary,
   writeProjectConfig,
@@ -53,6 +55,51 @@ function completeProjectConfig(): ProjectConfig {
     limits: { max_turns: 200, task_timeout: 7200 },
     mcp_servers: {},
   };
+}
+
+function initPromptHarness(controlProvider: "linear" | "github") {
+  type PromptApi = NonNullable<Parameters<typeof promptConfig>[2]>;
+  const calls: Array<{
+    message: string;
+    initialValue?: unknown;
+    values?: unknown[];
+  }> = [];
+  const textValues: Record<string, string> = {
+    "Linear team key routed to this repository": "eng",
+    "Linear team ID (optional, but recommended)": "team-1",
+  };
+  const prompts = {
+    async group(
+      promptGroup: Record<string, (input: { results: Record<string, unknown> }) => unknown>
+    ) {
+      const results: Record<string, unknown> = {};
+      for (const [key, prompt] of Object.entries(promptGroup)) {
+        results[key] = await prompt({ results });
+      }
+      return results;
+    },
+    async select(options: {
+      message: string;
+      initialValue?: unknown;
+      options: Array<{ value: unknown }>;
+    }) {
+      calls.push({
+        message: options.message,
+        initialValue: options.initialValue,
+        values: options.options.map(({ value }) => value),
+      });
+      if (options.message === "Control provider") {
+        return controlProvider === "linear" ? options.initialValue : "github";
+      }
+      if (options.message === "Default agent") return "codex";
+      throw new Error(`Unexpected select prompt: ${options.message}`);
+    },
+    async text(options: { message: string; initialValue?: string }) {
+      calls.push({ message: options.message, initialValue: options.initialValue });
+      return textValues[options.message] ?? options.initialValue ?? "";
+    },
+  } as unknown as PromptApi;
+  return { calls, prompts };
 }
 
 function mutableEditableResources(): { root: string; graphPath: string; skillDirectory: string } {
@@ -259,14 +306,88 @@ describe("init project detection", () => {
 
   it("summarizes the auto-detected registration for the confirmation prompt", () => {
     expect(
-      registrationSummary({ repo: "acme/widget", baseBranch: "develop", linearTeamKey: "ENG" })
+      registrationSummary({
+        repo: "acme/widget",
+        baseBranch: "develop",
+        controlProvider: "linear",
+        linearTeamKey: "ENG",
+      })
     ).toBe("Linear team ENG → acme/widget (base branch develop)");
-    expect(registrationSummary({ repo: "acme/widget", linearTeamKey: "ENG" })).toBe(
+    expect(registrationSummary({
+      repo: "acme/widget",
+      controlProvider: "linear",
+      linearTeamKey: "ENG",
+    })).toBe(
       "Linear team ENG → acme/widget (GitHub default branch)"
     );
     expect(
-      registrationSummary({ repo: "acme/widget", linearTeamKey: "ENG" }, "https://ot.test")
+      registrationSummary({
+        repo: "acme/widget",
+        controlProvider: "linear",
+        linearTeamKey: "ENG",
+      }, "https://ot.test")
     ).toBe("Linear team ENG → acme/widget (GitHub default branch) on https://ot.test");
+    expect(registrationSummary({
+      repo: "acme/widget",
+      baseBranch: "develop",
+      controlProvider: "github",
+    })).toBe("GitHub Issues → acme/widget (base branch develop)");
+
+    expect(initOutro({
+      repo: "acme/widget",
+      controlProvider: "linear",
+      linearTeamKey: "ENG",
+    }, false)).toBe(
+      "Commit .openthrottle.yml, then delegate an issue from the configured Linear team."
+    );
+    expect(initOutro({
+      repo: "acme/widget",
+      controlProvider: "github",
+    }, true)).toBe(
+      "Commit .openthrottle.yml and .openthrottle/, then open or label a GitHub issue with `openthrottle`."
+    );
+  });
+
+  it("defaults to Linear control and only prompts Linear registrations for a team", async () => {
+    const linear = initPromptHarness("linear");
+    await expect(promptConfig(
+      { pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" },
+      { repo: "acme/widget", baseBranch: "develop" },
+      linear.prompts
+    )).resolves.toMatchObject({
+      registration: {
+        repo: "acme/widget",
+        baseBranch: "develop",
+        controlProvider: "linear",
+        linearTeamKey: "ENG",
+        linearTeamId: "team-1",
+      },
+    });
+    expect(linear.calls.find(({ message }) => message === "Control provider")).toEqual({
+      message: "Control provider",
+      initialValue: "linear",
+      values: ["linear", "github"],
+    });
+    expect(linear.calls.map(({ message }) => message)).toEqual(expect.arrayContaining([
+      "Linear team key routed to this repository",
+      "Linear team ID (optional, but recommended)",
+    ]));
+
+    const github = initPromptHarness("github");
+    await expect(promptConfig(
+      { pm: null, test: "", build: "", lint: "" },
+      { repo: "acme/widget" },
+      github.prompts
+    )).resolves.toMatchObject({
+      registration: {
+        repo: "acme/widget",
+        controlProvider: "github",
+      },
+    });
+    expect(github.calls.map(({ message }) => message)).not.toEqual(expect.arrayContaining([
+      "Linear team key routed to this repository",
+      "Linear team ID (optional, but recommended)",
+    ]));
   });
 
   it("registers a repository through the authenticated supervisor request helper", async () => {
@@ -276,6 +397,7 @@ describe("init project detection", () => {
       expect(JSON.parse(String(init?.body))).toEqual({
         repo: "acme/widget",
         baseBranch: "develop",
+        controlProvider: "linear",
         linearTeamKey: "ENG",
         linearTeamId: "team-1",
       });
@@ -292,12 +414,33 @@ describe("init project detection", () => {
         {
           repo: "acme/widget",
           baseBranch: "develop",
+          controlProvider: "linear",
           linearTeamKey: "ENG",
           linearTeamId: "team-1",
         },
         request
       )
     ).resolves.toMatchObject({ registration: { github_repo: "acme/widget" } });
+  });
+
+  it("registers GitHub control without Linear team fields", async () => {
+    const request = async (_path: string, init?: RequestInit) => {
+      expect(JSON.parse(String(init?.body))).toEqual({
+        repo: "acme/widget",
+        controlProvider: "github",
+      });
+      return Response.json({
+        registration: { github_repo: "acme/widget", base_branch: "main" },
+        readiness: {
+          webhook: "created",
+          snapshot: { name: "openthrottle", state: "active" },
+        },
+      });
+    };
+    await expect(registerTargetRepository({
+      repo: "acme/widget",
+      controlProvider: "github",
+    }, request)).resolves.toMatchObject({ registration: { github_repo: "acme/widget" } });
   });
 
   it("scaffolds the exact editable simple-pipeline package under .openthrottle", () => {

@@ -75,26 +75,87 @@ describe("admission store", () => {
     expect(store.getByIssueId("github:issue-1")?.control_provider).toBe("github");
   });
 
-  it("keys repository registrations by repo and rejects different-provider authority transfer", () => {
+  it("switches future repository routing without changing active ticket and session pins", () => {
     store.registerRepository({
       linearTeamKey: "ENG",
       linearTeamId: "team-1",
-      githubRepo: "acme/widget",
+      githubRepo: "owner/repo",
       baseBranch: "develop",
       webhookId: 42,
       snapshot: "openthrottle",
     });
 
-    expect(() =>
-      store.registerRepository({
-        controlProvider: "github",
-        githubRepo: "ACME/WIDGET",
-        baseBranch: "main",
-        webhookId: 43,
-        snapshot: "openthrottle",
-      })
-    ).toThrow(/already registered for linear control/);
+    expect(store.registerRepository({
+      controlProvider: "github",
+      githubRepo: "OWNER/REPO",
+      baseBranch: "main",
+      webhookId: 43,
+      snapshot: "openthrottle-github",
+    })).toMatchObject({
+      github_repo: "owner/repo",
+      control_provider: "github",
+      linear_team_key: null,
+      linear_team_id: null,
+      base_branch: "main",
+      webhook_id: 43,
+      snapshot: "openthrottle-github",
+    });
+
+    expect(store.getByIssueId("issue-1")).toMatchObject({
+      control_provider: "linear",
+      session_id: "session-1",
+    });
+    expect(store.getCurrentSession("issue-1")).toMatchObject({
+      id: "session-1",
+      generation: 1,
+      state: "current",
+    });
     expect(store.getRepositoryRegistration("team-1", undefined, "github")).toBeUndefined();
+
+    store.upsertUnpinned({
+      ticket_id: "github:owner/repo:2",
+      ticket_reference: "owner/repo#2",
+      session_id: "github-session-2",
+      control_provider: "github",
+      external_thread_id: "2",
+      external_thread_reference: "owner/repo#2",
+      sandbox_id: null,
+      branch: "ot/github-2",
+      agent: "codex",
+      repo: "owner/repo",
+      base_branch: "main",
+      pr_url: null,
+      state: "active",
+    });
+    expect(store.registerRepository({
+      controlProvider: "linear",
+      linearTeamKey: "ENG",
+      linearTeamId: "team-1",
+      githubRepo: "owner/repo",
+      baseBranch: "release",
+      webhookId: 44,
+      snapshot: "openthrottle-linear",
+    })).toMatchObject({
+      github_repo: "owner/repo",
+      control_provider: "linear",
+      linear_team_key: "ENG",
+      linear_team_id: "team-1",
+      base_branch: "release",
+    });
+    expect(store.getByIssueId("issue-1")).toMatchObject({
+      control_provider: "linear",
+      session_id: "session-1",
+    });
+    expect(store.getCurrentSession("issue-1")?.generation).toBe(1);
+    expect(store.getByIssueId("github:owner/repo:2")).toMatchObject({
+      control_provider: "github",
+      session_id: "github-session-2",
+    });
+    expect(store.getCurrentSession("github:owner/repo:2")).toMatchObject({
+      id: "github-session-2",
+      generation: 1,
+      state: "current",
+    });
   });
 
   it("resolves GitHub-control repository registrations by provider route repository", () => {
@@ -134,6 +195,42 @@ describe("admission store", () => {
         snapshot: "openthrottle",
       })
     ).toThrow(/refusing to transfer authority/);
+  });
+
+  it("leaves an existing GitHub route intact when a Linear authority switch is rejected", () => {
+    store.registerRepository({
+      linearTeamKey: "ENG",
+      linearTeamId: "team-1",
+      githubRepo: "acme/linear",
+      baseBranch: "main",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
+    store.registerRepository({
+      controlProvider: "github",
+      githubRepo: "acme/widget",
+      baseBranch: "main",
+      webhookId: 43,
+      snapshot: "openthrottle-github",
+    });
+
+    expect(() =>
+      store.registerRepository({
+        controlProvider: "linear",
+        linearTeamKey: "ENG",
+        linearTeamId: "team-1",
+        githubRepo: "acme/widget",
+        baseBranch: "develop",
+        webhookId: 44,
+        snapshot: "openthrottle-linear",
+      })
+    ).toThrow(/refusing to transfer authority/);
+    expect(store.getRepositoryRegistration(undefined, "acme/widget", "github")).toMatchObject({
+      control_provider: "github",
+      base_branch: "main",
+      webhook_id: 43,
+      snapshot: "openthrottle-github",
+    });
   });
 
   it("supersedes session generations without carrying actor state forward", () => {

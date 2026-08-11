@@ -1269,6 +1269,7 @@ export function renderGithubIssueStatusComment(
 ): string {
   const lines = [
     pipelineStatusCommentMarker(envelope.pipeline.ticket_id),
+    `<!-- openthrottle:status-revision:generation-${envelope.pipeline.generation}:payload-${publicationPayloadHash(envelope)} -->`,
     "## OpenThrottle status",
     "",
     ...linearStatusCommentLines(envelope, issueUrl),

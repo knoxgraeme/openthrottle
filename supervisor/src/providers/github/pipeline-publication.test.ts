@@ -14,6 +14,7 @@ import {
 } from "../../pipeline/manifest.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "../../pipeline/coordinator.js";
 import { createGithubPublicationProcessor } from "./pipeline-publication.js";
+import { githubSupervisorCommentWriteIsPending } from "./comment-provenance.js";
 import { createPipelineStore } from "../../persistence/pipeline/create-store.js";
 import type {
   CoordinatorGateReceiptWrite,
@@ -286,6 +287,62 @@ describe("github publication delivery", () => {
     }
   });
 
+  it("persists an in-flight intent before GitHub can deliver the created-comment webhook", async () => {
+    const { tickets, pipelines } = setup("fixture/command@1", {
+      ticket_id: "github:owner/repo#12",
+      ticket_reference: "GH-12",
+      session_id: "github:owner/repo#12",
+      control_provider: "github",
+      external_thread_id: "owner/repo#12",
+      external_thread_reference: "GH-12",
+    });
+    let releasePost!: (response: Response) => void;
+    const postResponse = new Promise<Response>((resolve) => {
+      releasePost = resolve;
+    });
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/issues/12/comments?per_page=100")) return Response.json([]);
+      if (method === "POST") return postResponse;
+      if (method === "PUT") return new Response(null, { status: 204 });
+      throw new Error(`unexpected request ${method} ${url}`);
+    }) as unknown as typeof fetch;
+    const processor = createGithubPublicationProcessor({
+      store: pipelines,
+      tickets,
+      client: { token: "github", fetch: fetchMock },
+    });
+
+    const drain = processor.drain();
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining("/issues/12/comments"),
+        expect.objectContaining({ method: "POST" })
+      );
+    });
+    const marker = "<!-- openthrottle:pipeline-status:github:owner/repo#12 -->";
+    expect(githubSupervisorCommentWriteIsPending(
+      tickets,
+      "owner/repo",
+      12,
+      `${marker}\nstatus`
+    )).toBe(true);
+
+    releasePost(Response.json({
+      id: 809,
+      html_url: "https://github.com/owner/repo/issues/12#issuecomment-809",
+    }));
+    await drain;
+    expect(tickets.getSetting("github-supervisor-comment:809")).toBe("pipeline-status");
+    expect(githubSupervisorCommentWriteIsPending(
+      tickets,
+      "owner/repo",
+      12,
+      `${marker}\nstatus`
+    )).toBe(false);
+  });
+
   it("does not let a stale GitHub Issue status delivery acknowledge a newer revision", async () => {
     const { pipelines, instance, attempt } = setup("fixture/command@1", {
       ticket_id: "github:owner/repo#12",
@@ -314,9 +371,20 @@ describe("github publication delivery", () => {
     )).toBe(false);
 
     expect(pipelines.getPublication(claimed.id)).toMatchObject({
-      status: "pending",
+      status: "processing",
       payload_hash: newer.payload_hash,
       external_id: null,
+    });
+    expect(pipelines.requeueGithubPublicationAfterStaleWrite(
+      claimed.id,
+      claimed.payload_hash,
+      "1",
+      "https://github.com/owner/repo/issues/12#issuecomment-1"
+    )).toBe(true);
+    expect(pipelines.getPublication(claimed.id)).toMatchObject({
+      status: "pending",
+      payload_hash: newer.payload_hash,
+      external_id: "1",
     });
   });
 

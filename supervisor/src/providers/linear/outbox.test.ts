@@ -122,7 +122,7 @@ describe("Linear outbox retry bounding", () => {
     expect(getLinearOutbox(terminalReceipt.id)?.status).toBe("processed");
   });
 
-  it("fails closed before acquiring Linear credentials for a GitHub-controlled ticket", async () => {
+  it("locally acknowledges a GitHub control receipt and releases its publication gate without Linear", async () => {
     setup();
     store.upsertUnpinned({
       ticket_id: "github:42",
@@ -139,16 +139,64 @@ describe("Linear outbox retry bounding", () => {
       pr_url: null,
       state: "active",
     });
+    const payload = JSON.stringify({
+      type: "pipeline_receipt",
+      publication: { body: "The provider wait is ready." },
+    });
     const row = store.enqueueLinearOutbox({
       id: "github-control-row",
       sessionId: "github-session-42",
       issueId: "github:42",
-      kind: "activity",
-      payload: JSON.stringify({
-        type: "activity",
-        activity: { sessionId: "github-session-42", type: "thought", body: "hello" },
-      }),
+      kind: "pipeline_receipt",
+      payload,
     });
+    const timestamp = "2026-08-11T00:00:00.000Z";
+    db.prepare(`
+      INSERT INTO repository_config_snapshots (
+        id, repository, base_commit, blob_sha, digest, normalized_config, created_at
+      ) VALUES ('github-config', 'owner/repo', ?, ?, ?, '{}', ?)
+    `).run("a".repeat(40), "b".repeat(40), "c".repeat(64), timestamp);
+    db.prepare(`
+      INSERT INTO runtime_capability_descriptors (
+        runtime_release, digest, protocol, normalized_descriptor, accepted_at
+      ) VALUES ('github-runtime', ?, 'stage-executor@1', '{}', ?)
+    `).run("d".repeat(64), timestamp);
+    db.prepare(`
+      INSERT INTO pipeline_catalog_entries (
+        pipeline_id, version, digest, normalized_manifest, accepted_at
+      ) VALUES ('github-test', 1, ?, '{}', ?)
+    `).run("e".repeat(64), timestamp);
+    db.prepare(`
+      INSERT INTO pipeline_instances (
+        id, ticket_id, session_id, generation, pipeline_id, pipeline_version,
+        manifest_digest, normalized_manifest, repository, base_commit, branch, agent,
+        repository_config_snapshot_id, repository_config_digest, runtime_release,
+        capability_digest, executor_protocol, authorized_capabilities, status,
+        active_stage_id, state_version, attempt_count, created_at, updated_at
+      ) VALUES (
+        'github-instance', 'github:42', 'github-session-42', 1, 'github-test', 1,
+        ?, '{}', 'owner/repo', ?, 'ot/gh-42', 'codex', 'github-config', ?,
+        'github-runtime', ?, 'stage-executor@1', '[]',
+        'completion_pending_publication', NULL, 1, 1, ?, ?
+      )
+    `).run(
+      "e".repeat(64),
+      "a".repeat(40),
+      "c".repeat(64),
+      "d".repeat(64),
+      timestamp,
+      timestamp
+    );
+    db.prepare(`
+      INSERT INTO pipeline_publication_receipts (
+        id, pipeline_instance_id, attempt_id, kind, idempotency_key, payload,
+        payload_hash, status, attempts, next_attempt_at, resume_status,
+        created_at, updated_at
+      ) VALUES (
+        ?, 'github-instance', NULL, 'control_ledger', 'github-control-gate', ?,
+        ?, 'pending', 0, ?, 'waiting_provider', ?, ?
+      )
+    `).run(row.id, payload, row.payload_hash, timestamp, timestamp, timestamp);
     const getLinearClient = vi.fn(async () => undefined);
     const processor = createLinearOutboxProcessor({ store, getLinearClient });
 
@@ -156,9 +204,15 @@ describe("Linear outbox retry bounding", () => {
 
     expect(getLinearClient).not.toHaveBeenCalled();
     expect(getLinearOutbox(row.id)).toMatchObject({
-      status: "dead",
+      status: "processed",
       attempts: 1,
-      last_error: expect.stringContaining("invalid control provider github"),
+      last_error: null,
     });
+    expect(db.prepare(`
+      SELECT status FROM pipeline_publication_receipts WHERE id = ?
+    `).get(row.id)).toEqual({ status: "acknowledged" });
+    expect(db.prepare(`
+      SELECT status, terminal_outcome FROM pipeline_instances WHERE id = 'github-instance'
+    `).get()).toEqual({ status: "waiting_provider", terminal_outcome: null });
   });
 });

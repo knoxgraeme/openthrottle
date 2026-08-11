@@ -52,15 +52,27 @@ export interface RepositoryTarget {
   baseBranch?: string;
 }
 
-export interface RepositoryRegistrationInput extends RepositoryTarget {
-  linearTeamKey: string;
-  linearTeamId?: string;
-}
+export type ControlProvider = "linear" | "github";
+
+export type RepositoryRegistrationInput = RepositoryTarget & (
+  | {
+      controlProvider: "linear";
+      linearTeamKey: string;
+      linearTeamId?: string;
+    }
+  | {
+      controlProvider: "github";
+      linearTeamKey?: never;
+      linearTeamId?: never;
+    }
+);
 
 interface InitSelection {
   project: ProjectConfig;
   registration: RepositoryRegistrationInput;
 }
+
+type InitPromptApi = Pick<typeof p, "group" | "select" | "text">;
 
 export type EditableRefreshStatus = "unchanged" | "local-only" | "upstream-only" | "conflict";
 
@@ -211,30 +223,57 @@ export function registrationSummary(
     ? `base branch ${registration.baseBranch}`
     : "GitHub default branch";
   const target = supervisorUrl ? ` on ${supervisorUrl}` : "";
-  return `Linear team ${registration.linearTeamKey} → ${registration.repo} (${branch})${target}`;
+  const control = registration.controlProvider === "linear"
+    ? `Linear team ${registration.linearTeamKey}`
+    : "GitHub Issues";
+  return `${control} → ${registration.repo} (${branch})${target}`;
 }
 
-async function promptConfig(detected: Detected, target: RepositoryTarget): Promise<InitSelection> {
-  const result = await p.group(
+export function initOutro(
+  registration: RepositoryRegistrationInput,
+  editableSkills: boolean
+): string {
+  const files = editableSkills ? ".openthrottle.yml and .openthrottle/" : ".openthrottle.yml";
+  const delegation = registration.controlProvider === "linear"
+    ? "delegate an issue from the configured Linear team"
+    : "open or label a GitHub issue with `openthrottle`";
+  return `Commit ${files}, then ${delegation}.`;
+}
+
+export async function promptConfig(
+  detected: Detected,
+  target: RepositoryTarget,
+  prompts: InitPromptApi = p
+): Promise<InitSelection> {
+  const result = await prompts.group(
     {
-      linearTeamKey: () =>
-        p.text({
+      controlProvider: () =>
+        prompts.select<ControlProvider>({
+          message: "Control provider",
+          options: [
+            { value: "linear", label: "Linear" },
+            { value: "github", label: "GitHub Issues" },
+          ],
+          initialValue: "linear",
+        }),
+      linearTeamKey: ({ results }) =>
+        results.controlProvider === "linear" ? prompts.text({
           message: "Linear team key routed to this repository",
           initialValue: readEnv("LINEAR_TEAM_KEY") ?? "",
           validate: (value) => (/^[A-Za-z0-9_-]+$/.test(value) ? undefined : "Enter a team key"),
-        }),
-      linearTeamId: () =>
-        p.text({
+        }) : undefined,
+      linearTeamId: ({ results }) =>
+        results.controlProvider === "linear" ? prompts.text({
           message: "Linear team ID (optional, but recommended)",
           initialValue: readEnv("LINEAR_TEAM_ID") ?? "",
-        }),
+        }) : undefined,
       baseBranch: () =>
-        p.text({
+        prompts.text({
           message: "Base branch (blank uses GitHub default)",
           initialValue: target.baseBranch ?? "",
         }),
       agent: () =>
-        p.select({
+        prompts.select<ProjectConfig["agent"]>({
           message: "Default agent",
           options: [
             { value: "codex", label: "Codex CLI" },
@@ -245,7 +284,7 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
         }),
       model: ({ results }) => {
         const agent = results.agent as ProjectConfig["agent"] | undefined;
-        return p.text({
+        return prompts.text({
           message: "Model (blank uses the agent default; required for OpenCode)",
           initialValue: agent === "opencode" ? "kimi-code/kimi-for-coding" : "",
           validate: (value) => {
@@ -258,16 +297,16 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
           },
         });
       },
-      test: () => p.text({ message: "Test command (blank to skip)", initialValue: detected.test }),
-      build: () => p.text({ message: "Build command (blank to skip)", initialValue: detected.build }),
-      lint: () => p.text({ message: "Lint command (blank to skip)", initialValue: detected.lint }),
+      test: () => prompts.text({ message: "Test command (blank to skip)", initialValue: detected.test }),
+      build: () => prompts.text({ message: "Build command (blank to skip)", initialValue: detected.build }),
+      lint: () => prompts.text({ message: "Lint command (blank to skip)", initialValue: detected.lint }),
       post_bootstrap: () =>
-        p.text({
+        prompts.text({
           message: "Post-bootstrap command (blank to skip)",
           initialValue: detected.pm ? `${detected.pm} install` : "",
         }),
-      max_turns: () => p.text({ message: "Max turns per agent run", initialValue: "200" }),
-      task_timeout: () => p.text({ message: "Task timeout (seconds)", initialValue: "7200" }),
+      max_turns: () => prompts.text({ message: "Max turns per agent run", initialValue: "200" }),
+      task_timeout: () => prompts.text({ message: "Task timeout (seconds)", initialValue: "7200" }),
     },
     {
       onCancel: () => {
@@ -276,6 +315,30 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
       },
     }
   );
+  if (result.controlProvider !== "linear" && result.controlProvider !== "github") {
+    throw new Error("Control provider selection is required");
+  }
+  let registration: RepositoryRegistrationInput;
+  if (result.controlProvider === "linear") {
+    if (typeof result.linearTeamKey !== "string") {
+      throw new Error("Linear team key is required");
+    }
+    registration = {
+      repo: target.repo,
+      baseBranch: result.baseBranch || undefined,
+      controlProvider: "linear",
+      linearTeamKey: result.linearTeamKey.toUpperCase(),
+      linearTeamId: typeof result.linearTeamId === "string" && result.linearTeamId
+        ? result.linearTeamId
+        : undefined,
+    };
+  } else {
+    registration = {
+      repo: target.repo,
+      baseBranch: result.baseBranch || undefined,
+      controlProvider: "github",
+    };
+  }
   return {
     project: {
       agent: result.agent as "claude" | "codex" | "opencode",
@@ -295,12 +358,7 @@ async function promptConfig(detected: Detected, target: RepositoryTarget): Promi
       },
       mcp_servers: {},
     },
-    registration: {
-      repo: target.repo,
-      baseBranch: result.baseBranch || undefined,
-      linearTeamKey: result.linearTeamKey.toUpperCase(),
-      linearTeamId: result.linearTeamId || undefined,
-    },
+    registration,
   };
 }
 
@@ -1007,7 +1065,5 @@ export default async function init(args: string[] = []): Promise<void> {
     p.log.warn("The local .openthrottle.yml is ready; rerun init after fixing supervisor access.");
     process.exit(1);
   }
-  p.outro(editableSkills
-    ? "Commit .openthrottle.yml and .openthrottle/, then delegate an issue from the configured Linear team."
-    : "Commit .openthrottle.yml, then delegate an issue from the configured Linear team.");
+  p.outro(initOutro(selection.registration, editableSkills));
 }

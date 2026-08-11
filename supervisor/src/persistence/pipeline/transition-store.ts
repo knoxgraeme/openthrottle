@@ -165,10 +165,23 @@ export function createTransitionStore(db: Database.Database, now: () => string):
       throw new Error(`pipeline instance ${write.instanceId} transition compare-and-set failed`);
     }
     const attempt = getAttemptStmt.get(write.attemptId) as PipelineStageAttempt | undefined;
-    if (!attempt || attempt.pipeline_instance_id !== instance.id || attempt.stage_id !== instance.active_stage_id) {
+    if (!attempt || attempt.pipeline_instance_id !== instance.id) {
       throw new Error(`attempt ${write.attemptId} is not active for pipeline instance ${instance.id}`);
     }
-    if (["completed", "canceled", "superseded", "failed"].includes(attempt.status)) {
+    const canceledMergeCorrection =
+      instance.status === "canceled" &&
+      instance.terminal_outcome === "canceled" &&
+      attempt.status === "canceled" &&
+      write.expectedStatus === "canceled" &&
+      write.terminalOutcome === "shipped" &&
+      write.outcome === "success";
+    if (attempt.stage_id !== instance.active_stage_id && !canceledMergeCorrection) {
+      throw new Error(`attempt ${write.attemptId} is not active for pipeline instance ${instance.id}`);
+    }
+    if (
+      ["completed", "canceled", "superseded", "failed"].includes(attempt.status) &&
+      !canceledMergeCorrection
+    ) {
       throw new Error(`attempt ${write.attemptId} is already terminal`);
     }
     const event = db.prepare(`
