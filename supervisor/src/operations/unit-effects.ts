@@ -1,6 +1,7 @@
 import { digestCanonicalJson } from "@openthrottle/contracts";
 import type { ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
+import { serializeRuntimeObservationError } from "../runtime/observation-error.js";
 import { sanitizeText } from "../shared/sanitize.js";
 
 const OBSERVATION_FAILURE_MAX_ATTEMPTS = 3;
@@ -39,6 +40,46 @@ export function createUnitEffectProcessor(input: {
   leaseMs?: number;
 }): UnitEffectProcessor {
   const leaseMs = input.leaseMs ?? 60_000;
+  const recordObservationFailure = (
+    action: ExecutionWorkAttempt,
+    error: unknown
+  ): void => {
+    // Backoff begins when the provider failure is observed, not when the
+    // action lease was acquired before potentially slow I/O.
+    const observedAt = input.now();
+    const attempt = action.observation_failure_count + 1;
+    const message = sanitizeText(error instanceof Error ? error.message : String(error)).slice(-1_500);
+    const lastError = `observation_attempt=${attempt}/${OBSERVATION_FAILURE_MAX_ATTEMPTS} ${message}`;
+    if (attempt >= OBSERVATION_FAILURE_MAX_ATTEMPTS) {
+      input.store.stopRetryableUnitAction({
+        actionId: action.id,
+        resultHash: digestCanonicalJson({
+          schema: "openthrottle.child-action-observation-exhausted/v1",
+          action_id: action.id,
+          attempt,
+          error: lastError,
+        }),
+        lastError,
+        nativeSessionId: action.native_session_id,
+        observationExhaustion: {
+          expectedFailureCount: action.observation_failure_count,
+          expectedEpoch: action.observation_epoch,
+          exhaustedFailureCount: OBSERVATION_FAILURE_MAX_ATTEMPTS,
+        },
+      });
+      return;
+    }
+    const retryAtIso = new Date(
+      observedAt.getTime() + OBSERVATION_FAILURE_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1)
+    ).toISOString();
+    input.store.recordActionObservationFailure({
+      actionId: action.id,
+      expectedFailureCount: action.observation_failure_count,
+      expectedEpoch: action.observation_epoch,
+      lastError,
+      retryAtIso,
+    });
+  };
   return {
     async drain(parentAttemptId) {
       const leasedAt = input.now();
@@ -50,6 +91,7 @@ export function createUnitEffectProcessor(input: {
         leaseUntilIso: new Date(leasedAt.getTime() + leaseMs).toISOString(),
       });
       if (!action) return undefined;
+      let observationFence = action;
       const preparedNotLaunched = action.request_hash != null &&
         action.request_payload != null &&
         action.request_launch_state !== "launched";
@@ -59,38 +101,7 @@ export function createUnitEffectProcessor(input: {
         try {
           recovered = await input.runtime.collectUnitAction(action);
         } catch (error) {
-          const attempt = action.observation_failure_count + 1;
-          const message = sanitizeText(error instanceof Error ? error.message : String(error)).slice(-1_500);
-          const lastError = `observation_attempt=${attempt}/${OBSERVATION_FAILURE_MAX_ATTEMPTS} ${message}`;
-          if (attempt >= OBSERVATION_FAILURE_MAX_ATTEMPTS) {
-            input.store.stopRetryableUnitAction({
-              actionId: action.id,
-              resultHash: digestCanonicalJson({
-                schema: "openthrottle.child-action-observation-exhausted/v1",
-                action_id: action.id,
-                attempt,
-                error: lastError,
-              }),
-              lastError,
-              nativeSessionId: action.native_session_id,
-              observationExhaustion: {
-                expectedFailureCount: action.observation_failure_count,
-                expectedEpoch: action.observation_epoch,
-                exhaustedFailureCount: OBSERVATION_FAILURE_MAX_ATTEMPTS,
-              },
-            });
-            return action;
-          }
-          const retryAtIso = new Date(
-            leasedAt.getTime() + OBSERVATION_FAILURE_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1)
-          ).toISOString();
-          input.store.recordActionObservationFailure({
-            actionId: action.id,
-            expectedFailureCount: action.observation_failure_count,
-            expectedEpoch: action.observation_epoch,
-            lastError,
-            retryAtIso,
-          });
+          recordObservationFailure(observationFence, error);
           return action;
         }
         const observationClear = input.store.clearActionObservationFailure({
@@ -99,6 +110,13 @@ export function createUnitEffectProcessor(input: {
           expectedEpoch: action.observation_epoch,
         });
         if (observationClear === "stale") return action;
+        observationFence = {
+          ...action,
+          observation_failure_count: 0,
+          observation_retry_at: null,
+          observation_epoch: action.observation_epoch + 1,
+          last_error: null,
+        };
         if (recovered) {
           if (recovered.terminal) {
             if (recovered.outcome === "retryable_infrastructure_failure") {
@@ -156,7 +174,30 @@ export function createUnitEffectProcessor(input: {
       const shouldDispatch = action.status === "leased" || requestlessDispatch || preparedNotLaunched;
       if (!shouldDispatch) return action;
       if (action.status === "leased" && !action.request_hash) input.store.markActionDispatching(action.id);
-      const dispatched = await input.runtime.dispatchUnitAction(action);
+      let dispatched: Awaited<ReturnType<UnitEffectRuntime["dispatchUnitAction"]>>;
+      try {
+        dispatched = await input.runtime.dispatchUnitAction(action);
+      } catch (error) {
+        const observed = serializeRuntimeObservationError(`dispatch child action ${action.id}`, error);
+        if (action.action_kind !== "final_review") throw error;
+        if (observed.retryable) {
+          recordObservationFailure(observationFence, observed.text);
+          return action;
+        }
+        const lastError = `final-review dispatch failed: ${observed.text}`.slice(0, 2_000);
+        input.store.failUnitAction({
+          actionId: action.id,
+          resultHash: digestCanonicalJson({
+            schema: "openthrottle.final-review-dispatch-failure/v1",
+            action_id: action.id,
+            error: observed.text,
+          }),
+          outcome: "failure",
+          lastError,
+          nativeSessionId: action.native_session_id,
+        });
+        return action;
+      }
       input.store.markActionDispatched(action.id, dispatched.requestHash, dispatched.nativeSessionId ?? null);
       return action;
     },

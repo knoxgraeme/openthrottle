@@ -1284,10 +1284,18 @@ describe("pipeline effect processor", () => {
     await drainCommandActions("final_command", integratedSubjectB);
 
     runtime.dispatchLoopAction.mockImplementationOnce(async () => {
-      throw new Error("selector provider launch acknowledgement lost");
+      throw Object.assign(new Error("selector provider launch throttled"), { statusCode: 429 });
     });
-    await expect(processor.drain()).rejects.toThrow(/selector provider launch acknowledgement lost/);
+    await expect(processor.drain()).resolves.toBeUndefined();
     const preparedReview = latestAction("final_review");
+    expect(preparedReview).toMatchObject({
+      status: "dispatched",
+      observation_failure_count: 1,
+      observation_retry_at: "2099-07-22T12:00:05.000Z",
+      observation_epoch: 1,
+      last_error: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=429/),
+    });
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({ stopped_at: null, stop_reason: null });
     const preparedSelectorDispatch = db!.prepare(`
       SELECT prepared_at, dispatched_at
       FROM execution_review_subaction_dispatches
@@ -1297,6 +1305,8 @@ describe("pipeline effect processor", () => {
       prepared_at: "2099-07-22T12:00:00.000Z",
       dispatched_at: null,
     });
+    db!.prepare("UPDATE execution_work_attempts SET observation_retry_at = NULL WHERE id = ?")
+      .run(preparedReview.id);
     await processor.drain();
     expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
@@ -1322,22 +1332,14 @@ describe("pipeline effect processor", () => {
     expect(runtime.dispatchLoopAction.mock.calls.filter(([, request]) =>
       request.skill === "select-review-personas"
     )).toHaveLength(2);
-    db!.prepare("UPDATE execution_work_attempts SET lease_until = ? WHERE id = ?")
-      .run("2099-07-22T11:59:59.000Z", review.id);
-    runtime.collectLoopActionResult.mockRejectedValueOnce(
-      Object.assign(new Error("Daytona collection failed"), { statusCode: 502 })
-    );
+    // A successful provider observation with no result starts a fresh retry
+    // epoch before later review subactions are dispatched.
     await processor.drain();
     expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
       status: "dispatched",
-      last_error: expect.stringContaining("retryable=true status=502"),
+      observation_failure_count: 0,
+      last_error: null,
     });
-    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
-      stopped_at: null,
-      stop_reason: null,
-    });
-    db!.prepare("UPDATE execution_work_attempts SET lease_until = ?, observation_retry_at = NULL, last_error = NULL WHERE id = ?")
-      .run("2099-07-22T12:01:00.000Z", review.id);
     const acceptedFinding = {
       severity: "P1" as const,
       message: "[supervisor/src/example/effects.ts#drainEffect|failed-settlement-ordering: changed control and data flow preserves declared behavior] Failed settlement can silently pass.",
@@ -1442,11 +1444,11 @@ describe("pipeline effect processor", () => {
     runtime.dispatchLoopAction.mockImplementation(async (_resource, request) => {
       if (request.skill === "correctness-dataflow" && !fanoutDispatchFailed) {
         fanoutDispatchFailed = true;
-        throw new Error("transient persona dispatch timeout");
+        throw Object.assign(new Error("persona provider request timed out"), { statusCode: 408 });
       }
       if (request.skill === "validate-review-findings" && !validatorDispatchFailed) {
         validatorDispatchFailed = true;
-        throw new Error("transient validator dispatch timeout");
+        throw Object.assign(new Error("validator provider unavailable"), { statusCode: 502 });
       }
       reviewAuthEvents.push(`dispatch:${request.skill}`);
       successfullyDispatchedReviewActions.add(request.actionId);
@@ -1462,21 +1464,34 @@ describe("pipeline effect processor", () => {
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       captureCodexAuth,
     });
+    db!.prepare("UPDATE execution_work_attempts SET lease_until = ? WHERE id = ?")
+      .run("2099-07-22T11:59:59.000Z", review.id);
     await restartedProcessor.drain();
     expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
       status: "dispatched",
+      observation_failure_count: 1,
+      last_error: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=408/),
+    });
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      stopped_at: null,
+      stop_reason: null,
+    });
+    db!.prepare("UPDATE execution_work_attempts SET lease_until = ?, observation_retry_at = NULL WHERE id = ?")
+      .run("2099-07-22T12:01:00.000Z", review.id);
+    await restartedProcessor.drain();
+    expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
+      status: "dispatched",
+      observation_failure_count: 0,
       last_error: null,
     });
     await restartedProcessor.drain();
     expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
       status: "dispatched",
-      last_error: null,
+      observation_failure_count: 1,
+      last_error: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=502/),
     });
-    await restartedProcessor.drain();
-    expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
-      status: "dispatched",
-      last_error: null,
-    });
+    db!.prepare("UPDATE execution_work_attempts SET observation_retry_at = NULL WHERE id = ?")
+      .run(review.id);
     await restartedProcessor.drain();
     expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
       status: "completed",

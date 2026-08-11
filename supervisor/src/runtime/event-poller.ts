@@ -261,17 +261,27 @@ async function pollTicketEvents(
       continue;
     }
 
+    let raw: string;
+    try {
+      raw = (file.prefetched ?? await sandbox.fs.downloadFile!(remotePath))!.toString("utf8");
+    } catch (error) {
+      const observed = serializeRuntimeObservationError(`download sandbox event ${remotePath}`, error);
+      // A provider exception says nothing about the bytes on disk, even when
+      // its classification is unknown or non-retryable. Preserve the file and
+      // the sorted processing fence so a later poll can observe it again.
+      console.error(`[sandbox-events] could not read ${file.name}: ${observed.text}`);
+      break;
+    }
+
     let event: SandboxEvent;
     try {
-      const raw = (file.prefetched ?? await sandbox.fs.downloadFile!(remotePath))!.toString("utf8");
       event = parseSandboxEvent(raw);
     } catch (error) {
-      const observed = serializeRuntimeObservationError(`read sandbox event ${remotePath}`, error);
-      if (observed.retryable) {
-        console.error(`[sandbox-events] could not read ${file.name}: ${observed.text}`);
-        break;
-      }
-      console.error(`[sandbox-events] deleting invalid event ${file.name}: ${observed.text}`);
+      // Once bytes have been downloaded, malformed event content is
+      // deterministic. Do not classify parser text (which may itself contain
+      // words such as "timeout") as a transient provider failure.
+      const message = sanitizeText(error instanceof Error ? error.message : String(error)).slice(-2_000);
+      console.error(`[sandbox-events] deleting invalid event ${file.name}: ${message}`);
       await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
       continue;
     }

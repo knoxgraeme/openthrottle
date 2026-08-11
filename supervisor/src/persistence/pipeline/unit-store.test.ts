@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalJson, digestNormalized, type StageOutcome } from "../../pipeline/manifest.js";
 import type { PipelineUnitPhaseBinding } from "../../pipeline/manifest.js";
 import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
@@ -11,6 +11,7 @@ import { openDb } from "../database.js";
 import { createPipelineStore } from "./create-store.js";
 import { createExecutionUnitStore, type ExecutionUnitStore } from "./unit-store.js";
 import { executionLedgerLines } from "../../pipeline/execution-publication.js";
+import { createUnitEffectProcessor } from "../../operations/unit-effects.js";
 
 let db: Database.Database | undefined;
 let timestamp = "2026-07-29T00:00:00.000Z";
@@ -1719,6 +1720,127 @@ describe("execution unit store", () => {
       reason: "child action missed heartbeat fence",
     })).toBe("healed");
   });
+
+  it("counts the first retryable final-review selector dispatch against the exact observation cap", async () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    completeUnitToTerminal(store, "1".repeat(40));
+    const dispatchUnitAction = vi.fn(async () => {
+      throw Object.assign(new Error("selector provider launch throttled"), { statusCode: 429 });
+    });
+    const processor = createUnitEffectProcessor({
+      store,
+      runtime: {
+        collectUnitAction: vi.fn(async () => null),
+        dispatchUnitAction,
+      },
+      leaseOwner: "pipeline-effects:instance-1",
+      now: () => new Date(timestamp),
+    });
+
+    await processor.drain("attempt-parent");
+    const finalReview = store.listWorkAttempts("attempt-parent")
+      .find((attempt) => attempt.action_kind === "final_review")!;
+    expect(finalReview).toMatchObject({
+      status: "dispatched",
+      observation_failure_count: 1,
+      observation_retry_at: "2026-07-29T00:00:05.000Z",
+      observation_epoch: 1,
+      last_error: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=429/),
+    });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ stopped_at: null, stop_reason: null });
+
+    timestamp = "2026-07-29T00:00:04.000Z";
+    expect(await processor.drain("attempt-parent")).toBeUndefined();
+    expect(dispatchUnitAction).toHaveBeenCalledTimes(1);
+
+    timestamp = "2026-07-29T00:00:05.000Z";
+    await processor.drain("attempt-parent");
+    expect(store.listWorkAttempts("attempt-parent").find((attempt) => attempt.id === finalReview.id)).toMatchObject({
+      status: "dispatched",
+      observation_failure_count: 2,
+      observation_retry_at: "2026-07-29T00:00:15.000Z",
+      observation_epoch: 1,
+      last_error: expect.stringMatching(/observation_attempt=2\/3 .*retryable=true status=429/),
+    });
+
+    timestamp = "2026-07-29T00:00:15.000Z";
+    await processor.drain("attempt-parent");
+    expect(store.listWorkAttempts("attempt-parent").find((attempt) => attempt.id === finalReview.id)).toMatchObject({
+      status: "dead",
+      terminal_result_outcome: "retryable_infrastructure_failure",
+      observation_failure_count: 3,
+      observation_retry_at: null,
+      observation_epoch: 1,
+      last_error: expect.stringMatching(/observation_attempt=3\/3 .*retryable=true status=429/),
+    });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      stopped_at: "2026-07-29T00:00:15.000Z",
+      stop_reason: expect.stringContaining("observation_attempt=3/3"),
+    });
+
+    timestamp = "2026-07-29T00:00:30.000Z";
+    expect(await processor.drain("attempt-parent")).toBeUndefined();
+    expect(dispatchUnitAction).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([400, 401, 403])(
+    "terminalizes a persistent HTTP %i final-review selector dispatch once",
+    async (statusCode) => {
+      const store = setup();
+      store.createGraph({
+        pipelineInstanceId: "instance-1",
+        parentAttemptId: "attempt-parent",
+        parentStageId: "units",
+        parentRunId: "run-parent",
+        graphDigest: "graph-digest",
+        planDigest: "plan-digest",
+        units: [{ id: "a" }],
+        unitPhaseBindings: builtinUnitPhaseBindings([]),
+      });
+      completeUnitToTerminal(store, "1".repeat(40));
+      const dispatchUnitAction = vi.fn(async () => {
+        throw Object.assign(new Error("selector request rejected"), { statusCode });
+      });
+      const processor = createUnitEffectProcessor({
+        store,
+        runtime: {
+          collectUnitAction: vi.fn(async () => null),
+          dispatchUnitAction,
+        },
+        leaseOwner: "pipeline-effects:instance-1",
+        now: () => new Date(timestamp),
+      });
+
+      await processor.drain("attempt-parent");
+      const finalReview = store.listWorkAttempts("attempt-parent")
+        .find((attempt) => attempt.action_kind === "final_review")!;
+      expect(finalReview).toMatchObject({
+        status: "failed",
+        terminal_result_outcome: "failure",
+        result_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        last_error: expect.stringMatching(new RegExp(
+          `final-review dispatch failed: .*retryable=false status=${statusCode}`
+        )),
+      });
+      expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+        stopped_at: timestamp,
+        stop_reason: expect.stringContaining(`retryable=false status=${statusCode}`),
+      });
+
+      expect(await processor.drain("attempt-parent")).toBeUndefined();
+      expect(dispatchUnitAction).toHaveBeenCalledTimes(1);
+    }
+  );
 
   it("compare-and-sets observation writes and clears a recovered outage epoch", () => {
     const store = setup();
