@@ -91,6 +91,13 @@ class RetryableReviewRuntimeError extends Error {
     this.name = "RetryableReviewRuntimeError";
   }
 }
+
+class RetryableReviewCollectionError extends RetryableReviewRuntimeError {
+  constructor(operation: string, cause: unknown) {
+    super(operation, cause);
+    this.name = "RetryableReviewCollectionError";
+  }
+}
 const ACTION_OUTPUT_ORDER: Record<UnitActionKind, number> = {
   implement: 10,
   repair: 10,
@@ -848,6 +855,9 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     } catch (error) {
       const observed = serializeRuntimeObservationError(operation, error);
       if (!observed.retryable) throw new Error(observed.text);
+      if (operation.includes("collection failed")) {
+        throw new RetryableReviewCollectionError(operation, error);
+      }
       throw new RetryableReviewRuntimeError(operation, error);
     }
   };
@@ -2102,6 +2112,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       // Provider dispatch/collection failures are not semantic review
       // decisions. Leave the fenced parent action active so the next drain
       // can replay the same deterministic subaction ids idempotently.
+      if (error instanceof RetryableReviewCollectionError) throw error;
       if (error instanceof RetryableReviewRuntimeError) return null;
       return terminalFailure(error);
     }

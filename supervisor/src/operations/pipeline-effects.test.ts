@@ -1322,6 +1322,22 @@ describe("pipeline effect processor", () => {
     expect(runtime.dispatchLoopAction.mock.calls.filter(([, request]) =>
       request.skill === "select-review-personas"
     )).toHaveLength(2);
+    db!.prepare("UPDATE execution_work_attempts SET lease_until = ? WHERE id = ?")
+      .run("2099-07-22T11:59:59.000Z", review.id);
+    runtime.collectLoopActionResult.mockRejectedValueOnce(
+      Object.assign(new Error("Daytona collection failed"), { statusCode: 502 })
+    );
+    await processor.drain();
+    expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
+      status: "dispatched",
+      last_error: expect.stringContaining("retryable=true status=502"),
+    });
+    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
+      stopped_at: null,
+      stop_reason: null,
+    });
+    db!.prepare("UPDATE execution_work_attempts SET lease_until = ?, last_error = NULL WHERE id = ?")
+      .run("2099-07-22T12:01:00.000Z", review.id);
     const acceptedFinding = {
       severity: "P1" as const,
       message: "[supervisor/src/example/effects.ts#drainEffect|failed-settlement-ordering: changed control and data flow preserves declared behavior] Failed settlement can silently pass.",
