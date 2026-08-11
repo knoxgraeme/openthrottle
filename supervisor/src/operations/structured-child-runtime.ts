@@ -2138,13 +2138,13 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   } | null> => {
     if (!action.request_hash) return null;
     if (action.action_kind === "final_review") {
+      let request: LoopActionRequest;
       try {
         if (!action.request_payload) throw new Error("missing persisted selector request");
-        const request = JSON.parse(action.request_payload) as LoopActionRequest;
+        request = JSON.parse(action.request_payload) as LoopActionRequest;
         if (request.protocol !== "loop-action@2" || request.skill !== "select-review-personas") {
           throw new Error("final review request is not the sealed selector action");
         }
-        return collectOrchestratedFinalReview(resource, instance, action, request);
       } catch (error) {
         return {
           terminal: true,
@@ -2154,6 +2154,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           nativeSessionId: null,
         };
       }
+      return collectOrchestratedFinalReview(resource, instance, action, request);
     }
     let result: Awaited<ReturnType<SandboxRuntime["collectChildExecutorActionResult"]>> |
       Awaited<ReturnType<SandboxRuntime["collectLoopActionResult"]>>;
