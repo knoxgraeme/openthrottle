@@ -2055,8 +2055,9 @@ backfill-contract:legacy publish_linear effects and linear_ledger receipts are r
 const neutralControlIdentifierMigrationSource = `
 rename live control-plane ticket/session/context identifiers from Linear-shaped storage names to provider-neutral storage names
 tables: tickets,runs,agent_sessions,control_outbox,session_inbox,pipeline_instances,work_items,work_deliveries,provider_events,feedback_snapshots,session_executions,run_outcomes,execution_publication_events
-backfill-contract:existing rows are retained in place, provider identity remains linear, external thread ids retain the old Linear issue id, internal ticket ids become linear-prefixed, and foreign keys must remain valid/v3
-github-head-fence-contract:head, source, and every per-source watermark move together; authoritative state wins, same-source higher sequence wins, and watermark collisions retain the highest sequence/v1`;
+backfill-contract:existing rows are retained in place, provider identity remains linear, external thread ids retain the old Linear issue id, internal ticket ids become linear-prefixed, and foreign keys must remain valid/v4
+github-head-fence-contract:head, source, and every per-source watermark move together; authoritative state wins, same-source higher sequence wins, and watermark collisions retain the highest sequence/v1
+journal-identity-contract:legacy display references are rekeyed through their exact instance and run ticket fences, with a unique ticket-reference fallback and fail-closed ambiguity handling/v1`;
 
 type GithubHeadSource =
   | { kind: "authoritative" }
@@ -2172,6 +2173,103 @@ function rekeyGithubHeadSettings(db: Database.Database, rawTicketIds: string[]):
   }
 }
 
+function rekeyOrchestrationJournalIssues(db: Database.Database, rawTicketIds: string[]): void {
+  if (
+    rawTicketIds.length === 0 ||
+    !hasTable(db, "orchestration_journal") ||
+    !hasColumns(db, "orchestration_journal", ["id", "issue", "repository", "instance_id", "run_id"])
+  ) return;
+
+  type LegacyTicket = { ticketId: string; reference: string; repository: string };
+  const rawIds = new Set(rawTicketIds);
+  const tickets = (db.prepare(`
+    SELECT ticket_id, ticket_reference, repo FROM tickets
+    WHERE control_provider = 'linear' AND ticket_id NOT LIKE 'linear:%'
+    ORDER BY ticket_id
+  `).all() as Array<{ ticket_id: string; ticket_reference: string; repo: string }>).map((row): LegacyTicket => ({
+    ticketId: row.ticket_id,
+    reference: row.ticket_reference,
+    repository: row.repo,
+  })).filter((ticket) => rawIds.has(ticket.ticketId));
+  const ticketById = new Map(tickets.map((ticket) => [ticket.ticketId, ticket]));
+  const qualifiedIds = new Set(tickets.map((ticket) => `linear:${ticket.ticketId}`));
+
+  const ticketBindings = (table: string): Map<string, string> => {
+    if (!hasColumns(db, table, ["id", "ticket_id"])) return new Map();
+    const rows = db.prepare(`SELECT id, ticket_id FROM ${table} ORDER BY id`).all() as Array<{
+      id: string;
+      ticket_id: string;
+    }>;
+    return new Map(rows.flatMap((row): Array<[string, string]> => {
+      const rawTicketId = ticketById.has(row.ticket_id)
+        ? row.ticket_id
+        : row.ticket_id.startsWith("linear:") && ticketById.has(row.ticket_id.slice("linear:".length))
+          ? row.ticket_id.slice("linear:".length)
+          : undefined;
+      return rawTicketId ? [[row.id, rawTicketId]] : [];
+    }));
+  };
+  const instanceTickets = ticketBindings("pipeline_instances");
+  const runTickets = ticketBindings("runs");
+  const rows = db.prepare(`
+    SELECT id, issue, repository, instance_id, run_id
+    FROM orchestration_journal ORDER BY id
+  `).all() as Array<{
+    id: string;
+    issue: string;
+    repository: string;
+    instance_id: string | null;
+    run_id: string | null;
+  }>;
+  const updates: Array<{ id: string; legacyIssue: string; ticketId: string }> = [];
+
+  for (const row of rows) {
+    if (qualifiedIds.has(row.issue)) continue;
+    const boundTicketIds = new Set<string>();
+    const instanceTicketId = row.instance_id ? instanceTickets.get(row.instance_id) : undefined;
+    const runTicketId = row.run_id ? runTickets.get(row.run_id) : undefined;
+    if (instanceTicketId) boundTicketIds.add(instanceTicketId);
+    if (runTicketId) boundTicketIds.add(runTicketId);
+    if (boundTicketIds.size > 1) {
+      throw new Error(
+        `conflicting legacy orchestration journal issue ${row.id}: ${[...boundTicketIds].sort().join(", ")}`
+      );
+    }
+
+    const directTicket = ticketById.get(row.issue);
+    const referenceTickets = directTicket ? [directTicket] : tickets.filter((ticket) => ticket.reference === row.issue);
+    const repositoryTickets = referenceTickets.filter(
+      (ticket) => ticket.repository.toLowerCase() === row.repository.toLowerCase()
+    );
+    const displayTickets = repositoryTickets.length > 0 ? repositoryTickets : referenceTickets;
+    const boundTicketId = [...boundTicketIds][0];
+    if (boundTicketId) {
+      if (displayTickets.length > 0 && !displayTickets.some((ticket) => ticket.ticketId === boundTicketId)) {
+        throw new Error(
+          `conflicting legacy orchestration journal issue ${row.id}: display ${row.issue} does not match ${boundTicketId}`
+        );
+      }
+      updates.push({ id: row.id, legacyIssue: row.issue, ticketId: boundTicketId });
+      continue;
+    }
+    const candidateIds = [...new Set(displayTickets.map((ticket) => ticket.ticketId))].sort();
+    if (candidateIds.length > 1) {
+      throw new Error(`ambiguous legacy orchestration journal issue ${row.id}: ${candidateIds.join(", ")}`);
+    }
+    if (candidateIds[0]) {
+      updates.push({ id: row.id, legacyIssue: row.issue, ticketId: candidateIds[0] });
+    }
+  }
+
+  const update = db.prepare("UPDATE orchestration_journal SET issue = ? WHERE id = ? AND issue = ?");
+  for (const row of updates) {
+    const result = update.run(`linear:${row.ticketId}`, row.id, row.legacyIssue);
+    if (result.changes !== 1) {
+      throw new Error(`legacy orchestration journal issue ${row.id} changed during migration`);
+    }
+  }
+}
+
 function migrateNeutralControlIdentifiers(db: Database.Database): void {
   db.exec("PRAGMA foreign_keys = OFF");
   db.exec("PRAGMA defer_foreign_keys = ON");
@@ -2233,6 +2331,7 @@ function migrateNeutralControlIdentifiers(db: Database.Database): void {
           external_thread_id = COALESCE(NULLIF(external_thread_id, ''), ticket_id),
           external_thread_reference = COALESCE(NULLIF(external_thread_reference, ''), ticket_reference)
     `);
+    rekeyOrchestrationJournalIssues(db, rawLinearTicketIds);
     for (const table of [
       "runs",
       "agent_sessions",
