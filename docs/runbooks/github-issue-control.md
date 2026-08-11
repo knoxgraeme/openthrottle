@@ -131,10 +131,11 @@ admits the Issue only if the repository is registered for GitHub control, the
 actor is authorized, the webhook signature is valid, and the live Issue state
 still matches the activation event.
 
-Plain comments from authorized collaborators are steering for the current
-generation. Closing the Issue requests stop for every nonterminal stage,
-including provider wait. Reopening it or reapplying the label after a terminal
-generation starts a new session.
+Authorized collaborator comments are accepted and recorded. During the
+structured `for_each_unit` composite, they do not change in-flight child work
+and are eventually recorded as undelivered; do not wait for a comment to take
+effect. Close the Issue or use `openthrottle stop` for a stop request. Reopening
+it or reapplying the label after a terminal generation starts a new session.
 
 ## Observe progress
 
