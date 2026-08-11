@@ -611,6 +611,25 @@ describe("deterministic supervisor stage gates", () => {
     expect(() => evaluateStageGate(fixture.pipelines, input)).toThrow(/native session fence/);
   });
 
+  it("accepts only the sealed legacy Linear ticket identity after v35 qualifies the durable instance", () => {
+    const fixture = setup();
+    const input = event(fixture);
+    fixture.db.pragma("foreign_keys = OFF");
+    fixture.db.prepare("UPDATE pipeline_instances SET ticket_id = 'linear:issue-1' WHERE id = ?")
+      .run(fixture.instance.id);
+    fixture.db.pragma("foreign_keys = ON");
+
+    expect(() => evaluateStageGate(fixture.pipelines, input)).not.toThrow();
+
+    const forged = event(fixture);
+    const forgedPayload = JSON.parse(forged.artifacts![0]!.payload);
+    forgedPayload.run.ticket_id = "other-issue";
+    forged.artifacts![0]!.payload = canonicalJson(forgedPayload);
+    forged.artifacts![0]!.hash = digestNormalized(forged.artifacts![0]!.payload);
+    forged.resultHash = forged.artifacts![0]!.hash;
+    expect(() => evaluateStageGate(fixture.pipelines, forged)).toThrow(/provenance fence/);
+  });
+
   it("commits the receipt, artifacts, transition, and effects atomically", async () => {
     const fixture = setup();
     const input = event(fixture);
