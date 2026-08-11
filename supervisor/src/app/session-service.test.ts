@@ -7,9 +7,9 @@ import type { Config } from "./config.js";
 import type { ActivityPublicationInput } from "./ports.js";
 import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
-import { handleLinearEvent } from "./session-service.js";
+import { handleControlEvent } from "./session-service.js";
 import type { LinearClient } from "../providers/linear/client.js";
-import { fetchIssueLabels, parseLinearWebhook } from "../providers/linear/events.js";
+import { fetchIssueLabels, linearControlEvent, parseLinearWebhook } from "../providers/linear/events.js";
 import { routePipelineProviderEvent } from "../providers/github/events.js";
 import {
   branchExists,
@@ -224,14 +224,29 @@ describe("pipeline admission", () => {
     db?.close();
   });
 
-  function promptedReply(body: string, activityId = "activity-reply", sessionId = "session-1") {
+  function promptedReply(
+    body: string,
+    activityId = "activity-reply",
+    sessionId = "session-1",
+    issueId = sessionId === "session-2" ? "issue-2" : "issue-1",
+    identifier = issueId === "issue-2" ? "OT-2" : "OT-1"
+  ) {
     return parseLinearWebhook(JSON.stringify({
       action: "prompted",
       type: "AgentSessionEvent",
       webhookId: `pipeline-reply-${activityId}`,
       webhookTimestamp: Date.now(),
       organizationId: "org",
-      agentSession: { id: sessionId },
+      agentSession: {
+        id: sessionId,
+        issueId,
+        issue: {
+          id: issueId,
+          identifier,
+          team: { id: "team-1", key: "OT" },
+          labels: [],
+        },
+      },
       agentActivity: { id: activityId, content: { type: "prompt", body } },
     }));
   }
@@ -318,7 +333,7 @@ describe("pipeline admission", () => {
     event = payload(),
     repositoryFiles: Record<string, string> = {},
     runtimeOverrides: Parameters<typeof buildInstalledRuntimeDescriptor>[1] = {},
-    linearIssueLabels:
+    controlThreadLabels:
       | Array<{ name: string; parentName?: string }>
       | (() => Array<{ name: string; parentName?: string }>) = [],
     linearLabelsFetchError?: string
@@ -403,7 +418,7 @@ describe("pipeline admission", () => {
         if (linearLabelsFetchError !== undefined) {
           throw new Error(linearLabelsFetchError);
         }
-        const labels = typeof linearIssueLabels === "function" ? linearIssueLabels() : linearIssueLabels;
+        const labels = typeof controlThreadLabels === "function" ? controlThreadLabels() : controlThreadLabels;
         return Response.json({
           data: {
             issue: {
@@ -430,7 +445,7 @@ describe("pipeline admission", () => {
           tryPostError(tickets, outbox, sessionId, issueId, message),
       },
       labelResolver: {
-        fetchIssueLabels: (issueId: string) => fetchIssueLabels(linear, issueId),
+        fetchThreadLabels: (issueId: string) => fetchIssueLabels(linear, issueId),
       },
       repositoryReader: {
         branchExists: (repository: string, branch: string) =>
@@ -453,11 +468,11 @@ describe("pipeline admission", () => {
     const invoke = async (
       overrides: Partial<Config> = {},
       event = payload()
-    ) => handleLinearEvent(
+    ) => handleControlEvent(
       { ...config(), ...overrides },
       tickets,
       providers,
-      event,
+      linearControlEvent(event),
       { catalog, runtime, store: pipelines }
     );
     await invoke(overrides, event);
@@ -485,7 +500,7 @@ pipelines: { implement: implement }
 limits: { max_turns: 20, task_timeout: 300 }
 mcp_servers: {}
 `);
-    const ticket = tickets.getByIssueId("issue-1")!;
+    const ticket = tickets.getByIssueId("linear:issue-1")!;
     const instance = pipelines.getInstanceForSession("session-1")!;
     expect(ticket.sandbox_id).toBeNull();
     expect(ticket.run_id).toBeNull();
@@ -501,7 +516,7 @@ mcp_servers: {}
 
   it("ignores legacy implement pipeline overrides when the simple graph is selected", async () => {
     const { tickets, pipelines } = await run(repositoryConfigYaml("{ implement: unknown/pipeline@9 }"));
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "active",
       sandbox_id: null,
       run_id: null,
@@ -547,7 +562,7 @@ intents:
       payload("session-1", "issue-1", "OT-1", context)
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "active",
       sandbox_id: null,
       run_id: null,
@@ -588,14 +603,14 @@ intents:
       payload("session-1", "issue-1", "OT-1", context)
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     const refusal = payloads.find((entry) => entry.includes("its credential is not configured on the supervisor"));
     expect(refusal).toBeDefined();
     expect(refusal).toContain("Codex");
@@ -625,7 +640,7 @@ intents:
       payload("session-1", "issue-1", "OT-1", context)
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
@@ -633,7 +648,7 @@ intents:
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes(expectedMessage))).toBe(true);
   }
 
@@ -671,7 +686,7 @@ intents:
     expect(request.taskContext).not.toContain("oldest optional thread");
     expect(request.taskContext).toContain("newest optional thread");
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(1);
-    const journal = pipelines.listJournalEntries({ issueId: "issue-1" });
+    const journal = pipelines.listJournalEntries({ issueId: "linear:issue-1" });
     const pruning = journal.find((entry) => entry.outcome === "context_bounded");
     expect(pruning).toMatchObject({
       actor: "supervisor",
@@ -728,7 +743,7 @@ intents:
       }
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "active",
       sandbox_id: null,
       run_id: null,
@@ -756,7 +771,7 @@ intents:
       payload("session-1", "issue-1", "OT-1", context)
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "active",
       sandbox_id: null,
       run_id: null,
@@ -1133,7 +1148,7 @@ intents:
     expect(request.taskContext).toContain(`<parent-issue-context source="linear" status="summarized">`);
     expect(request.taskContext).toContain("<description-summary>");
     expect(request.taskContext).not.toContain("<sub-issue");
-    expect(pipelines.listJournalEntries({ issueId: "issue-1" }).some((entry) =>
+    expect(pipelines.listJournalEntries({ issueId: "linear:issue-1" }).some((entry) =>
       entry.outcome === "context_bounded" && entry.refs.includes('"summarized_parent_sections":1')
     )).toBe(true);
   });
@@ -1156,14 +1171,14 @@ intents:
       payload("session-1", "issue-1", "OT-1", context)
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) =>
       entry.includes("Task context required content exceeds 64000 bytes")
     )).toBe(true);
@@ -1217,13 +1232,13 @@ intents:
       }
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) =>
       entry.includes("Task context required content exceeds 64000 bytes")
     )).toBe(true);
@@ -1279,7 +1294,7 @@ intents:
     expect(instance.pipeline_id).toBe("builtin/structured");
     expect(Buffer.byteLength(request.taskContext, "utf8")).toBeLessThanOrEqual(64_000);
     expect(request.taskContext).not.toContain("retained structured optional context");
-    expect(pipelines.listJournalEntries({ issueId: "issue-1" }).some((entry) =>
+    expect(pipelines.listJournalEntries({ issueId: "linear:issue-1" }).some((entry) =>
       entry.outcome === "context_bounded"
     )).toBe(true);
   });
@@ -1343,7 +1358,7 @@ intents:
       }
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "active",
       sandbox_id: null,
       run_id: null,
@@ -1474,7 +1489,7 @@ intents:
       }
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "active",
       sandbox_id: null,
       run_id: null,
@@ -1511,7 +1526,7 @@ intents:
         [{ name: `agent:${agent}` }]
       );
 
-      expect(tickets.getByIssueId("issue-1")).toMatchObject({
+      expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
         state: "error",
         sandbox_id: null,
         run_id: null,
@@ -1519,7 +1534,7 @@ intents:
       expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
       expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
       expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
-      const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+      const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
       const refusal = payloads.find((entry) => entry.includes("its credential is not configured on the supervisor"));
       expect(refusal).toBeDefined();
       expect(refusal).toContain(displayName);
@@ -1549,7 +1564,7 @@ intents:
         {},
         [{ name: flatLabel }]
       );
-      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent });
+      expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "active", agent });
     });
 
     it.each([
@@ -1566,7 +1581,7 @@ intents:
         {},
         [{ name: childName, parentName: "agent" }]
       );
-      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent });
+      expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "active", agent });
     });
 
     it("falls back to DEFAULT_AGENT when the issue carries no agent label", async () => {
@@ -1579,7 +1594,7 @@ intents:
         {},
         []
       );
-      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "codex" });
+      expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "active", agent: "codex" });
     });
 
     it("resolves multiple conflicting agent labels with deterministic precedence: opencode > codex > claude", async () => {
@@ -1592,7 +1607,7 @@ intents:
         {},
         [{ name: "agent:claude" }, { name: "agent:codex" }, { name: "agent:opencode" }]
       );
-      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "opencode" });
+      expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "active", agent: "opencode" });
     });
 
     it("resolves codex over claude when opencode is absent", async () => {
@@ -1605,7 +1620,7 @@ intents:
         {},
         [{ name: "agent:claude" }, { name: "agent:codex" }]
       );
-      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "codex" });
+      expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "active", agent: "codex" });
     });
 
     it("ignores a stale agent label on the delegation event payload and selects from the fresh label read instead", async () => {
@@ -1618,7 +1633,7 @@ intents:
         {},
         [{ name: "agent:claude" }]
       );
-      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "claude" });
+      expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "active", agent: "claude" });
     });
 
     it("fails closed and provisions no sandbox when the fresh label read fails", async () => {
@@ -1632,9 +1647,9 @@ intents:
         [],
         "Linear API unreachable"
       );
-      expect(tickets.getByIssueId("issue-1")).toBeUndefined();
+      expect(tickets.getByIssueId("linear:issue-1")).toBeUndefined();
       expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
-      const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+      const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
       const refusal = payloads.find((entry) => entry.includes("could not read"));
       expect(refusal).toBeDefined();
       expect(refusal).toContain("Linear API unreachable");
@@ -1655,11 +1670,11 @@ intents:
           return fetchCount === 1 ? [{ name: "agent:claude" }] : [];
         }
       );
-      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "claude" });
+      expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "active", agent: "claude" });
 
       await invoke({}, payload("session-2"));
 
-      expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active", agent: "codex" });
+      expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "active", agent: "codex" });
     });
   });
 
@@ -1709,14 +1724,14 @@ intents:
       [{ name: "agent:claude" }]
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("set CLAUDE_CODE_OAUTH_TOKEN"))).toBe(true);
   });
 
@@ -1803,14 +1818,14 @@ intents:
       [{ name: "agent:opencode" }]
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("OpenCode structured loop actions are not supported yet"))).toBe(true);
   });
 
@@ -1827,13 +1842,13 @@ intents:
       payload("session-1", "issue-1", "OT-1", context, ["investigate"])
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("graph selection is not supported for investigate tickets"))).toBe(true);
   });
   it("admits a pinned custom command-only graph without an execution plan", async () => {
@@ -2056,13 +2071,13 @@ intents:
       { [graphPath]: graph }
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
     });
     expect(pipelines.getInstanceForSession("session-1")).toBeUndefined();
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) =>
       entry.includes("timeout_seconds: must equal the enforced ordinary stage timeout 300")
     )).toBe(true);
@@ -2241,7 +2256,7 @@ intents:
       }
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "active",
       sandbox_id: null,
       run_id: null,
@@ -2316,7 +2331,7 @@ intents:
       }
     );
 
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes(
       "repository skill implement_unit SKILL.md name does not match the configured invocation"
     ))).toBe(true);
@@ -2376,8 +2391,8 @@ intents:
       { [graphPath]: graph }
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "error" });
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "error" });
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("workers.implementer.skills: references an undeclared repository skill"))).toBe(true);
   });
   it("fails closed before provisioning when a structured selection omits its execution plan", async () => {
@@ -2477,7 +2492,7 @@ intents:
       payload("session-1", "issue-1", "OT-1", context)
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "active",
       sandbox_id: null,
       run_id: null,
@@ -2645,8 +2660,8 @@ intents:
       payload("session-1", "issue-1", "OT-1", context)
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "error" });
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "error" });
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("unknown built-in graph reference core/structured@3"))).toBe(true);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
   });
@@ -2687,13 +2702,13 @@ intents:
         {},
         [{ name: "agent:claude" }]
       );
-      expect(tickets.getByIssueId("issue-bound-ok")).toMatchObject({
+      expect(tickets.getByIssueId("linear:issue-bound-ok")).toMatchObject({
         state: "error",
         sandbox_id: null,
         run_id: null,
       });
       expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
-      const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+      const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
       expect(payloads.some((entry) =>
         entry.includes("Task context required content exceeds 64000 bytes")
       )).toBe(true);
@@ -2710,14 +2725,14 @@ intents:
       {},
       [{ name: "agent:claude" }]
     );
-    expect(tickets.getByIssueId("issue-bound-reject")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-bound-reject")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) =>
       entry.includes("structured execution plan would seal a") &&
       entry.includes("No sandbox was provisioned")
@@ -2759,14 +2774,14 @@ intents:
       {},
       [{ name: "agent:claude" }]
     );
-    expect(tickets.getByIssueId("issue-resume-bound")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-resume-bound")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) =>
       entry.includes("structured execution plan would seal a") &&
       entry.includes("No sandbox was provisioned")
@@ -2909,14 +2924,14 @@ intents:
       [{ name: "agent:claude" }]
     );
 
-    expect(tickets.getByIssueId("issue-repo-bound")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-repo-bound")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) =>
       entry.includes("structured execution plan would seal a") &&
       entry.includes("No sandbox was provisioned")
@@ -2930,7 +2945,7 @@ intents:
       fixtureCatalogPath
     );
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
@@ -2959,7 +2974,16 @@ intents:
       webhookId: "pipeline-stop",
       webhookTimestamp: Date.now(),
       organizationId: "org",
-      agentSession: { id: "session-1" },
+      agentSession: {
+        id: "session-1",
+        issueId: "issue-1",
+        issue: {
+          id: "issue-1",
+          identifier: "OT-1",
+          team: { id: "team-1", key: "OT" },
+          labels: [],
+        },
+      },
       agentActivity: { id: "activity-stop", content: { type: "prompt", body: "/stop" } },
     }));
 
@@ -2975,7 +2999,7 @@ intents:
     ]));
     expect(db!.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_work'").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM session_inbox").pluck().get()).toBe(0);
-    expect(tickets.getByIssueId("issue-1")?.run_id).toBeNull();
+    expect(tickets.getByIssueId("linear:issue-1")?.run_id).toBeNull();
   });
 
   it("rejects an idle pipeline reply instead of starting another task", async () => {
@@ -2989,7 +3013,7 @@ intents:
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_work'").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM session_inbox").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(true);
   });
 
@@ -3020,7 +3044,7 @@ intents:
       active_stage_id: "repair_implementation",
     });
     expect(db!.prepare("SELECT COUNT(*) FROM feedback_snapshots WHERE status = 'consumed'").pluck().get()).toBe(1);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("Waking the run to address your message in the honest ledger."))).toBe(true);
     expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(false);
   });
@@ -3051,8 +3075,8 @@ intents:
     const oldSnapshot = tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:older",
-      issueId: oldInstance.linear_issue_id,
-      sessionId: oldInstance.linear_session_id,
+      issueId: oldInstance.ticket_id,
+      sessionId: oldInstance.session_id,
       generation: oldInstance.generation,
       repository: oldInstance.repository,
       pullNumber: 1,
@@ -3109,7 +3133,7 @@ intents:
     expect(await routePipelineProviderEvent({
       pipelines,
       store: tickets,
-      ticket: tickets.getByIssueId("issue-1")!,
+      ticket: tickets.getByIssueId("linear:issue-1")!,
       eventId: "github-review:77",
       outcome: "semantic_repair_required",
       summary: "GitHub review requires another implementation pass.",
@@ -3142,7 +3166,7 @@ intents:
     const attempt = pipelines.getActiveAttempt(instance.id)!;
     const request = pipelines.getStageRequest(attempt.id);
     expect(tickets.beginRun({
-      issueId: "issue-1",
+      issueId: "linear:issue-1",
       runId: request.runId,
       taskType: "implement",
       tokenHash: "token-hash",
@@ -3168,7 +3192,7 @@ intents:
     expect(attempt.stage_id).toBe("semantic_review");
     const request = pipelines.getStageRequest(attempt.id);
     expect(tickets.beginRun({
-      issueId: "issue-1",
+      issueId: "linear:issue-1",
       runId: request.runId,
       taskType: "implement",
       tokenHash: "token-hash",
@@ -3185,7 +3209,7 @@ intents:
       run_id: null,
       body: "please carry this into the repair",
     });
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("Captured your message"))).toBe(true);
     expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(false);
   });
@@ -3202,14 +3226,14 @@ intents:
     await invoke({}, promptedReply("can you still fix this?", "activity-terminal"));
 
     expect(providerEvents()).toHaveLength(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(true);
   });
 
   it("rejects a superseded-session reply without feedback", async () => {
     const { tickets, pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     const previous = moveToProviderWait(pipelines);
-    tickets.setSandboxId("issue-1", "sandbox-old");
+    tickets.setSandboxId("linear:issue-1", "sandbox-old");
     await invoke({}, payload("session-2"));
 
     await invoke({}, promptedReply("old generation reply", "activity-superseded", "session-1"));
@@ -3219,14 +3243,14 @@ intents:
       terminal_outcome: "superseded",
     });
     expect(providerEvents()).toHaveLength(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
-    expect(payloads.some((entry) => entry.includes("couldn't find an existing workspace"))).toBe(true);
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(true);
   });
 
   it("supersedes an earlier pipeline generation on re-delegation", async () => {
     const { tickets, pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     const previous = pipelines.getInstanceForSession("session-1")!;
-    tickets.setSandboxId("issue-1", "sandbox-old");
+    tickets.setSandboxId("linear:issue-1", "sandbox-old");
 
     await invoke({}, payload("session-2"));
 
@@ -3236,8 +3260,8 @@ intents:
       status: "superseded",
       terminal_outcome: "superseded",
     });
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
-      linear_session_id: "session-2",
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
+      session_id: "session-2",
       sandbox_id: null,
       run_id: null,
     });
@@ -3251,7 +3275,7 @@ intents:
     const { tickets, pipelines, invoke, setRepositoryConfig } =
       await run(repositoryConfigYaml("{ implement: implement }"));
     const previous = pipelines.getInstanceForSession("session-1")!;
-    tickets.setSandboxId("issue-1", "sandbox-old");
+    tickets.setSandboxId("linear:issue-1", "sandbox-old");
     setRepositoryConfig(`schema: openthrottle.config/v1
 default_graph: missing
 graphs:
@@ -3268,8 +3292,8 @@ pipelines: { implement: implement }
       terminal_outcome: null,
     });
     expect(pipelines.getInstanceForSession("session-2")).toBeUndefined();
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
-      linear_session_id: "session-1",
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
+      session_id: "session-1",
       sandbox_id: "sandbox-old",
       run_id: null,
     });

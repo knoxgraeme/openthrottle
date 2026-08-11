@@ -41,15 +41,15 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
     params.ticketFailureTail === undefined
       ? params.failureTail ?? null
       : params.ticketFailureTail;
-  const getByIssueIdStmt = db.prepare("SELECT * FROM tickets WHERE linear_issue_id = ?");
+  const getByIssueIdStmt = db.prepare("SELECT * FROM tickets WHERE ticket_id = ?");
   const getCurrentSessionStmt = db.prepare(
-    "SELECT * FROM agent_sessions WHERE linear_issue_id = ? AND state = 'current'"
+    "SELECT * FROM agent_sessions WHERE ticket_id = ? AND state = 'current'"
   );
   const getRunStmt = db.prepare("SELECT * FROM runs WHERE id = ?");
   const getAttemptActorStmt = db.prepare("SELECT * FROM pipeline_stage_attempts WHERE run_id = ? OR planned_run_id = ? ORDER BY CASE WHEN run_id = ? THEN 0 ELSE 1 END LIMIT 1");
   const getLatestRunWithLogStmt = db.prepare(
     `SELECT * FROM runs
-     WHERE linear_issue_id = ? AND log_tail IS NOT NULL
+     WHERE ticket_id = ? AND log_tail IS NOT NULL
      ORDER BY started_at DESC, rowid DESC LIMIT 1`
   );
   const listRunningStmt = db.prepare(`
@@ -136,20 +136,20 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       const update = db.prepare(`
         UPDATE tickets
         SET running_since = ?, run_id = ?, state = 'active', last_error = NULL, updated_at = ?
-        WHERE linear_issue_id = ? AND running_since IS NULL
+        WHERE ticket_id = ? AND running_since IS NULL
           AND state NOT IN ('stopped', 'closed', 'expired')
       `).run(startedAt, params.runId, startedAt, params.issueId);
       if (update.changes !== 1) return false;
       db.prepare(`
         INSERT INTO runs (
-          id, linear_issue_id, linear_session_id, session_generation,
+          id, ticket_id, session_id, session_generation,
           task_type, token_hash, status, started_at, expires_at,
           actor_state, actor_created_at, actor_updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, 'running', ?, ?)
       `).run(
         params.runId,
         params.issueId,
-        currentSession?.id ?? ticket?.linear_session_id ?? null,
+        currentSession?.id ?? ticket?.session_id ?? null,
         currentSession?.generation ?? null,
         params.taskType,
         params.tokenHash,
@@ -183,8 +183,8 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
     if (params.logTail !== undefined) {
       db.prepare(`
         UPDATE runs SET log_tail = NULL
-        WHERE linear_issue_id = ? AND id <> ? AND log_tail IS NOT NULL
-      `).run(existing.linear_issue_id, params.runId);
+        WHERE ticket_id = ? AND id <> ? AND log_tail IS NOT NULL
+      `).run(existing.ticket_id, params.runId);
     }
     db.prepare(`
       UPDATE tickets SET
@@ -195,14 +195,14 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
         total_cost_usd = total_cost_usd + COALESCE(?, 0),
         last_error = ?,
         updated_at = ?
-      WHERE linear_issue_id = ? AND run_id = ?
+      WHERE ticket_id = ? AND run_id = ?
     `).run(
       params.ticketState ?? null,
       params.prUrl ?? null,
       params.costUsd ?? null,
       ticketFailureTail(params),
       completedAt,
-      existing.linear_issue_id,
+      existing.ticket_id,
       params.runId
     );
     settleRunningAttemptActorStmt.run(params.status, completedAt, params.runId, params.runId);
@@ -265,12 +265,12 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
         params.owner
       );
       if (update.changes !== 1) return undefined;
-      const ticket = getByIssueIdStmt.get(existing.linear_issue_id) as Ticket | undefined;
-      if (existing.linear_session_id && ticket?.linear_session_id !== existing.linear_session_id) {
+      const ticket = getByIssueIdStmt.get(existing.ticket_id) as Ticket | undefined;
+      if (existing.session_id && ticket?.session_id !== existing.session_id) {
         db.prepare(`
           UPDATE tickets SET running_since = NULL, run_id = NULL, updated_at = ?
-          WHERE linear_issue_id = ? AND run_id = ?
-        `).run(completedAt, existing.linear_issue_id, params.runId);
+          WHERE ticket_id = ? AND run_id = ?
+        `).run(completedAt, existing.ticket_id, params.runId);
       } else {
         db.prepare(`
           UPDATE tickets SET
@@ -278,14 +278,14 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
             state = COALESCE(?, state), pr_url = COALESCE(?, pr_url),
             total_cost_usd = total_cost_usd + COALESCE(?, 0),
             last_error = ?, updated_at = ?
-          WHERE linear_issue_id = ? AND run_id = ?
+          WHERE ticket_id = ? AND run_id = ?
         `).run(
           params.ticketState ?? null,
           params.prUrl ?? null,
           params.costUsd ?? null,
           ticketFailureTail(params),
           completedAt,
-          existing.linear_issue_id,
+          existing.ticket_id,
           params.runId
         );
       }
@@ -325,12 +325,12 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
         WHERE id = ? AND settlement_owner = ?
       `).run(reason, timestamp, runId, owner);
       const run = getRunStmt.get(runId) as Run;
-      const ticket = getByIssueIdStmt.get(run.linear_issue_id) as Ticket | undefined;
-      if (!run.linear_session_id || ticket?.linear_session_id === run.linear_session_id) {
+      const ticket = getByIssueIdStmt.get(run.ticket_id) as Ticket | undefined;
+      if (!run.session_id || ticket?.session_id === run.session_id) {
         db.prepare(`
           UPDATE tickets SET state = 'error', last_error = ?, updated_at = ?
-          WHERE linear_issue_id = ? AND run_id = ?
-        `).run(reason, timestamp, run.linear_issue_id, runId);
+          WHERE ticket_id = ? AND run_id = ?
+        `).run(reason, timestamp, run.ticket_id, runId);
       }
       return run;
     }
@@ -343,24 +343,24 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       UPDATE runs SET status = ?, completed_at = ?, failure_tail = ?, pr_url = COALESCE(?, pr_url)
       WHERE id = ? AND status = 'quarantined'
     `).run(params.status, completedAt, params.failureTail ?? null, params.prUrl ?? null, params.runId);
-    const ticket = getByIssueIdStmt.get(existing.linear_issue_id) as Ticket | undefined;
-    if (existing.linear_session_id && ticket?.linear_session_id !== existing.linear_session_id) {
+    const ticket = getByIssueIdStmt.get(existing.ticket_id) as Ticket | undefined;
+    if (existing.session_id && ticket?.session_id !== existing.session_id) {
       db.prepare(`
         UPDATE tickets SET running_since = NULL, run_id = NULL, updated_at = ?
-        WHERE linear_issue_id = ? AND run_id = ?
-      `).run(completedAt, existing.linear_issue_id, params.runId);
+        WHERE ticket_id = ? AND run_id = ?
+      `).run(completedAt, existing.ticket_id, params.runId);
     } else {
       db.prepare(`
         UPDATE tickets SET running_since = NULL, run_id = NULL,
           state = COALESCE(?, state), pr_url = COALESCE(?, pr_url),
           last_error = ?, updated_at = ?
-        WHERE linear_issue_id = ? AND run_id = ?
+        WHERE ticket_id = ? AND run_id = ?
       `).run(
         params.ticketState ?? null,
         params.prUrl ?? null,
         ticketFailureTail(params),
         completedAt,
-        existing.linear_issue_id,
+        existing.ticket_id,
         params.runId
       );
     }

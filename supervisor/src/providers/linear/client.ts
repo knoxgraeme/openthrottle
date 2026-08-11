@@ -23,7 +23,7 @@ interface LinearWorkflowState {
   type: LinearWorkflowStateType | string;
 }
 
-export type LinearIssueStateSignal = "started" | "review" | "completed";
+export type ControlThreadStateSignal = "started" | "review" | "completed";
 
 const TEAM_WORKFLOW_STATE_CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -385,7 +385,7 @@ async function issueWorkflowSnapshot(
 }
 
 function targetStateFor(
-  signal: LinearIssueStateSignal,
+  signal: ControlThreadStateSignal,
   states: LinearWorkflowState[]
 ): LinearWorkflowState | undefined {
   if (signal === "started") return states.find((state) => state.type === "started");
@@ -398,7 +398,7 @@ function targetStateFor(
 }
 
 function shouldMoveIssueState(
-  signal: LinearIssueStateSignal,
+  signal: ControlThreadStateSignal,
   current: LinearWorkflowState,
   target: LinearWorkflowState,
   states: LinearWorkflowState[]
@@ -467,7 +467,7 @@ async function updateIssueState(
 }
 
 function issueStatePlan(
-  signal: LinearIssueStateSignal,
+  signal: ControlThreadStateSignal,
   snapshot: Awaited<ReturnType<typeof issueWorkflowSnapshot>>
 ): { target: LinearWorkflowState } | { skipped: ReturnType<typeof skippedIssueState> } {
   const current = snapshot.issue.state;
@@ -480,7 +480,7 @@ function issueStatePlan(
 
 export async function issueStateUpdate(
   client: LinearClient,
-  params: { issueId: string; signal: LinearIssueStateSignal }
+  params: { issueId: string; signal: ControlThreadStateSignal }
 ): Promise<{ success: boolean; skipped?: boolean; state?: { id: string; name: string } }> {
   const snapshot = await issueWorkflowSnapshot(client, params.issueId);
   let plan = issueStatePlan(params.signal, snapshot);

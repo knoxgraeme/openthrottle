@@ -130,7 +130,7 @@ describe("pipeline instance store", () => {
     // RunOutcomeStore instead.
     expect(createRunOutcomeStore(db!).getRunOutcome(oldInstance.id)).toMatchObject({
       pipeline_instance_id: oldInstance.id,
-      linear_issue_id: oldInstance.linear_issue_id,
+      ticket_id: oldInstance.ticket_id,
       outcome: "superseded",
       closed_reason: "superseded",
       fault_attribution: null,
@@ -172,7 +172,7 @@ describe("pipeline instance store", () => {
     tickets.upsert({ ...ticket("session-new", "shared-issue"), pipeline });
 
     const publication = pipelines.listPublications(oldInstance.id)
-      .find((item) => item.kind === "linear_ledger" && item.idempotency_key.includes(":superseded:"))!;
+      .find((item) => item.kind === "control_ledger" && item.idempotency_key.includes(":superseded:"))!;
     const envelope = parsePipelinePublication(publication.payload);
     expect(envelope.structured_execution?.units[0]?.unit_id).toBe("U1");
     expect(envelope.body).toContain("**Structured Unit Ledger**");
@@ -201,7 +201,7 @@ describe("pipeline instance store", () => {
       pipeline: { ...pipeline, baseCommit: "c".repeat(40) },
     })).toThrow(/snapshot binding mismatch/);
 
-    expect(tickets.getByIssueId("rollback-issue")?.linear_session_id).toBe("rollback-old");
+    expect(tickets.getByIssueId("rollback-issue")?.session_id).toBe("rollback-old");
     expect(pipelines.getInstance(oldInstance.id)?.status).toBe("dispatchable");
     expect(pipelines.listEffects(oldInstance.id).map((effect) => [effect.kind, effect.status]))
       .toEqual([["provision", "pending"]]);

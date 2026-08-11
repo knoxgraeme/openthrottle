@@ -48,13 +48,13 @@ function seedRunOutcome(
 ): void {
   database.prepare(`
     INSERT INTO run_outcomes (
-      pipeline_instance_id, linear_issue_id, generation, execution_graph_id, plan_digest,
+      pipeline_instance_id, ticket_id, generation, execution_graph_id, plan_digest,
       base_commit, engine, outcome, closed_reason, fault_attribution, generations_consumed,
       repair_rounds_by_unit, phase_durations_ms, token_cost_usd, skill_digests, created_at
     ) VALUES (?, ?, 1, ?, NULL, '${"a".repeat(40)}', 'claude', ?, ?, ?, 1, '{}', '{}', NULL, ?, ?)
   `).run(
     instance.id,
-    instance.linear_issue_id,
+    instance.ticket_id,
     overrides.executionGraphId ?? null,
     overrides.outcome ?? "shipped",
     overrides.closedReason ?? "success",

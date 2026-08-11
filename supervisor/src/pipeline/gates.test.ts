@@ -119,9 +119,9 @@ describe("deterministic supervisor stage gates", () => {
     });
     const manifest = catalog.manifests.get(manifestKey)!;
     tickets.upsert({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "ISSUE-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "ISSUE-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/issue-1",
       agent: "codex",
@@ -217,7 +217,7 @@ describe("deterministic supervisor stage gates", () => {
         id, pipeline_instance_id, attempt_id, kind, idempotency_key,
         payload, payload_hash, status, attempts, next_attempt_at,
         created_at, updated_at, acknowledged_at
-      ) VALUES (?, ?, ?, 'linear_ledger', ?, ?, ?, 'acknowledged', 0, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, 'control_ledger', ?, ?, ?, 'acknowledged', 0, ?, ?, ?, ?)
     `).run(
       id,
       fixture.instance.id,
@@ -276,8 +276,8 @@ describe("deterministic supervisor stage gates", () => {
       },
       run: {
         id: fixture.attempt.planned_run_id!,
-        ticket_id: fixture.instance.linear_issue_id,
-        session_id: fixture.instance.linear_session_id,
+        ticket_id: fixture.instance.ticket_id,
+        session_id: fixture.instance.session_id,
         generation: fixture.instance.generation,
         native_session_id: null,
       },
@@ -387,10 +387,10 @@ describe("deterministic supervisor stage gates", () => {
   function startAttempt(fixture: Fixture): Fixture {
     const current = currentStageFixture(fixture);
     const request = current.pipelines.getStageRequest(current.attempt.id);
-    const ticket = current.tickets.getByIssueId(current.instance.linear_issue_id)!;
+    const ticket = current.tickets.getByIssueId(current.instance.ticket_id)!;
     if (ticket.run_id !== request.runId) {
       expect(current.tickets.beginRun({
-        issueId: current.instance.linear_issue_id,
+        issueId: current.instance.ticket_id,
         runId: request.runId,
         taskType: current.instance.task_type,
         tokenHash: `token-${request.runId}`,
@@ -609,6 +609,25 @@ describe("deterministic supervisor stage gates", () => {
     fixture.db.prepare("UPDATE pipeline_stage_attempts SET native_session_id = ? WHERE id = ?")
       .run("native-original", fixture.attempt.id);
     expect(() => evaluateStageGate(fixture.pipelines, input)).toThrow(/native session fence/);
+  });
+
+  it("accepts only the sealed legacy Linear ticket identity after v35 qualifies the durable instance", () => {
+    const fixture = setup();
+    const input = event(fixture);
+    fixture.db.pragma("foreign_keys = OFF");
+    fixture.db.prepare("UPDATE pipeline_instances SET ticket_id = 'linear:issue-1' WHERE id = ?")
+      .run(fixture.instance.id);
+    fixture.db.pragma("foreign_keys = ON");
+
+    expect(() => evaluateStageGate(fixture.pipelines, input)).not.toThrow();
+
+    const forged = event(fixture);
+    const forgedPayload = JSON.parse(forged.artifacts![0]!.payload);
+    forgedPayload.run.ticket_id = "other-issue";
+    forged.artifacts![0]!.payload = canonicalJson(forgedPayload);
+    forged.artifacts![0]!.hash = digestNormalized(forged.artifacts![0]!.payload);
+    forged.resultHash = forged.artifacts![0]!.hash;
+    expect(() => evaluateStageGate(fixture.pipelines, forged)).toThrow(/provenance fence/);
   });
 
   it("commits the receipt, artifacts, transition, and effects atomically", async () => {
@@ -879,7 +898,7 @@ describe("deterministic supervisor stage gates", () => {
     });
     expect(fixture.db.prepare(`
       SELECT COUNT(*) AS count FROM pipeline_publication_receipts
-      WHERE pipeline_instance_id = ? AND kind = 'linear_ledger'
+      WHERE pipeline_instance_id = ? AND kind = 'control_ledger'
         AND idempotency_key LIKE 'linear-wait:%:provider:%'
     `).get(fixture.instance.id)).toEqual({ count: 2 });
   });
@@ -1266,9 +1285,9 @@ describe("deterministic supervisor stage gates", () => {
   it("scopes merged pull request journal idempotency keys by repository", async () => {
     const recordJournalEntry = vi.fn();
     const ticket = {
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "ISSUE-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "ISSUE-1",
+      session_id: "session-1",
       branch: "ot/issue-1",
       repo: "owner/repo",
       pr_url: null,
@@ -2205,8 +2224,8 @@ describe("deterministic supervisor stage gates", () => {
     fixture.tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:p2-mixed",
-      issueId: fixture.instance.linear_issue_id,
-      sessionId: fixture.instance.linear_session_id,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
@@ -2223,8 +2242,8 @@ describe("deterministic supervisor stage gates", () => {
     const snapshot = fixture.tickets.recordProviderFeedback({
       provider: "linear",
       providerEventId: "linear-reply:mixed-unstructured",
-      issueId: fixture.instance.linear_issue_id,
-      sessionId: fixture.instance.linear_session_id,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
@@ -2269,8 +2288,8 @@ describe("deterministic supervisor stage gates", () => {
       snapshot = fixture.tickets.recordProviderFeedback({
         provider: "github",
         providerEventId: `github-review:p2-batch-${batch}`,
-        issueId: fixture.instance.linear_issue_id,
-        sessionId: fixture.instance.linear_session_id,
+        issueId: fixture.instance.ticket_id,
+        sessionId: fixture.instance.session_id,
         generation: fixture.instance.generation,
         repository: fixture.instance.repository,
         pullNumber: 1,
@@ -2288,8 +2307,8 @@ describe("deterministic supervisor stage gates", () => {
     snapshot = fixture.tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:z-p1-after-cap",
-      issueId: fixture.instance.linear_issue_id,
-      sessionId: fixture.instance.linear_session_id,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
@@ -2437,7 +2456,7 @@ describe("deterministic supervisor stage gates", () => {
       stage_id: "repair_implementation",
       reentry_ordinal: 1,
     });
-    expect(fixture.db.prepare("SELECT COUNT(*) FROM linear_outbox WHERE id LIKE 'feedback-snapshot-stale:%'")
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM control_outbox WHERE id LIKE 'feedback-snapshot-stale:%'")
       .pluck().get()).toBe(0);
   });
 
@@ -2513,8 +2532,8 @@ describe("deterministic supervisor stage gates", () => {
     const snapshot = fixture.tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:prepublish-later-round",
-      issueId: fixture.instance.linear_issue_id,
-      sessionId: fixture.instance.linear_session_id,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
@@ -2559,8 +2578,8 @@ describe("deterministic supervisor stage gates", () => {
     const snapshot = fixture.tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:repair-driving-snapshot",
-      issueId: fixture.instance.linear_issue_id,
-      sessionId: fixture.instance.linear_session_id,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
@@ -2631,8 +2650,8 @@ describe("deterministic supervisor stage gates", () => {
     const snapshot = fixture.tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:claimed-without-provider-proof",
-      issueId: fixture.instance.linear_issue_id,
-      sessionId: fixture.instance.linear_session_id,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
@@ -2659,7 +2678,7 @@ describe("deterministic supervisor stage gates", () => {
 
     expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
       .toEqual({ status: "stale", head_sha: previousHead });
-    expect(fixture.db.prepare("SELECT payload FROM linear_outbox WHERE id = ?")
+    expect(fixture.db.prepare("SELECT payload FROM control_outbox WHERE id = ?")
       .get(`feedback-snapshot-stale:${snapshot.id}`)).toBeDefined();
   });
 
@@ -2716,8 +2735,8 @@ describe("deterministic supervisor stage gates", () => {
     const first = fixture.tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:prepublish-in-mixed-snapshot",
-      issueId: fixture.instance.linear_issue_id,
-      sessionId: fixture.instance.linear_session_id,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
@@ -2730,8 +2749,8 @@ describe("deterministic supervisor stage gates", () => {
     const second = fixture.tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:postpublish-in-mixed-snapshot",
-      issueId: fixture.instance.linear_issue_id,
-      sessionId: fixture.instance.linear_session_id,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
@@ -2837,8 +2856,8 @@ describe("deterministic supervisor stage gates", () => {
     const stale = fixture.tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:stale",
-      issueId: fixture.instance.linear_issue_id,
-      sessionId: fixture.instance.linear_session_id,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
@@ -2851,8 +2870,8 @@ describe("deterministic supervisor stage gates", () => {
     const fresh = fixture.tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:fresh",
-      issueId: fixture.instance.linear_issue_id,
-      sessionId: fixture.instance.linear_session_id,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
@@ -2888,7 +2907,7 @@ describe("deterministic supervisor stage gates", () => {
       .toEqual({ status: "stale" });
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(fresh.id))
       .toEqual({ status: "consumed" });
-    const staleNotice = fixture.db.prepare("SELECT payload FROM linear_outbox WHERE id = ?")
+    const staleNotice = fixture.db.prepare("SELECT payload FROM control_outbox WHERE id = ?")
       .get(`feedback-snapshot-stale:${stale.id}`) as { payload: string };
     expect(JSON.parse(staleNotice.payload)).toMatchObject({
       type: "activity",
@@ -2924,8 +2943,8 @@ describe("deterministic supervisor stage gates", () => {
       const snapshot = fixture.tickets.recordProviderFeedback({
         provider: "github",
         providerEventId: `github-review:${item.id}`,
-        issueId: fixture.instance.linear_issue_id,
-        sessionId: fixture.instance.linear_session_id,
+        issueId: fixture.instance.ticket_id,
+        sessionId: fixture.instance.session_id,
         generation: item.generation,
         repository: fixture.instance.repository,
         pullNumber: 1,
@@ -2943,7 +2962,7 @@ describe("deterministic supervisor stage gates", () => {
       })).toBe(false);
       expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
         .toEqual({ status: "stale", head_sha: SUBJECT });
-      expect(fixture.db.prepare("SELECT payload FROM linear_outbox WHERE id = ?")
+      expect(fixture.db.prepare("SELECT payload FROM control_outbox WHERE id = ?")
         .get(`feedback-snapshot-stale:${snapshot.id}`)).toBeDefined();
     }
   });
@@ -2962,8 +2981,8 @@ describe("deterministic supervisor stage gates", () => {
     const snapshot = fixture.tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:unrelated-head",
-      issueId: fixture.instance.linear_issue_id,
-      sessionId: fixture.instance.linear_session_id,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
@@ -2981,7 +3000,7 @@ describe("deterministic supervisor stage gates", () => {
     })).toBe(false);
     expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
       .toEqual({ status: "stale", head_sha: unrelatedHead });
-    expect(fixture.db.prepare("SELECT payload FROM linear_outbox WHERE id = ?")
+    expect(fixture.db.prepare("SELECT payload FROM control_outbox WHERE id = ?")
       .get(`feedback-snapshot-stale:${snapshot.id}`)).toBeDefined();
   });
 
@@ -3021,7 +3040,7 @@ describe("deterministic supervisor stage gates", () => {
     })).toBe(false);
     expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots WHERE id = ?").get(stored.id))
       .toEqual({ status: "stale", head_sha: oldHead });
-    expect(fixture.db.prepare("SELECT payload FROM linear_outbox WHERE id = ?")
+    expect(fixture.db.prepare("SELECT payload FROM control_outbox WHERE id = ?")
       .get(`feedback-snapshot-stale:${stored.id}`)).toBeDefined();
   });
 
@@ -3039,8 +3058,8 @@ describe("deterministic supervisor stage gates", () => {
     const snapshot = fixture.tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:notice-failure",
-      issueId: fixture.instance.linear_issue_id,
-      sessionId: fixture.instance.linear_session_id,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
       generation: fixture.instance.generation,
       repository: fixture.instance.repository,
       pullNumber: 1,
@@ -3051,7 +3070,7 @@ describe("deterministic supervisor stage gates", () => {
     }).snapshot;
     fixture.tickets.enqueueLinearOutbox({
       id: `feedback-snapshot-stale:${snapshot.id}`,
-      linearSessionId: "session-1",
+      sessionId: "session-1",
       issueId: "issue-1",
       kind: "activity",
       payload: canonicalJson({ incompatible: true }),

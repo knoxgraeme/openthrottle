@@ -34,7 +34,7 @@ interface ValidatedInstanceSeed {
   authorized: string[];
   baseBranch: string;
   instanceId: string;
-  session: { linear_issue_id: string; generation: number; provider_conversation_id: string | null };
+  session: { ticket_id: string; generation: number; provider_conversation_id: string | null };
   snapshot: RepositoryConfigSnapshot;
 }
 
@@ -88,7 +88,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   const listSupersedeCandidates = (issueId: string, currentSessionId: string): PipelineInstance[] =>
     db.prepare(`
       SELECT * FROM pipeline_instances
-      WHERE linear_issue_id = ? AND linear_session_id <> ?
+      WHERE ticket_id = ? AND session_id <> ?
         AND terminal_outcome IS NULL
         AND status NOT IN ('shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed')
     `).all(issueId, currentSessionId) as PipelineInstance[];
@@ -150,8 +150,8 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
     persistPublication({
       instance,
       attemptId: activeAttempt?.id ?? null,
-      kind: "linear_ledger",
-      idempotencyKey: `linear-terminal:${instance.id}:superseded:${nextVersion}`,
+      kind: "control_ledger",
+      idempotencyKey: `control-terminal:${instance.id}:superseded:${nextVersion}`,
       payload: terminalPublication,
       timestamp,
     });
@@ -238,18 +238,18 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
       seed.manifest.manifest.version, seed.manifest.digest,
     ]);
     const session = db.prepare(`
-      SELECT linear_issue_id, generation, provider_conversation_id, execution_mode, pipeline_instance_id
+      SELECT ticket_id, generation, provider_conversation_id, execution_mode, pipeline_instance_id
       FROM agent_sessions WHERE id = ?
     `).get(seed.sessionId) as
       | {
-        linear_issue_id: string;
+        ticket_id: string;
         generation: number;
         provider_conversation_id: string | null;
         execution_mode: string | null;
         pipeline_instance_id: string | null;
       }
       | undefined;
-    if (!session || session.linear_issue_id !== seed.issueId || session.generation !== seed.generation) {
+    if (!session || session.ticket_id !== seed.issueId || session.generation !== seed.generation) {
       throw new Error(`session ${seed.sessionId} generation binding mismatch`);
     }
     if (session.execution_mode) {
@@ -257,7 +257,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
         const existing = getInstanceStmt.get(instanceId) as PipelineInstance;
         validatePinnedInstance(db, existing);
         if (
-          existing.linear_issue_id !== seed.issueId || existing.linear_session_id !== seed.sessionId ||
+          existing.ticket_id !== seed.issueId || existing.session_id !== seed.sessionId ||
           existing.generation !== seed.generation || existing.repository !== seed.repository ||
           existing.base_commit !== seed.baseCommit || existing.base_branch !== baseBranch ||
           existing.branch !== seed.branch || existing.agent !== seed.agent ||
@@ -307,7 +307,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   ): void => {
     db.prepare(`
       INSERT INTO pipeline_instances (
-        id, linear_issue_id, linear_session_id, generation, pipeline_id,
+        id, ticket_id, session_id, generation, pipeline_id,
         pipeline_version, manifest_digest, normalized_manifest, repository,
         base_commit, base_branch, branch, agent, task_type, repository_config_snapshot_id, repository_config_digest,
         runtime_release, capability_digest, executor_protocol,
@@ -436,7 +436,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
     persistSelectionPublications({ db, instance: result, timestamp });
     journal.recordJournalEntry({
       id: deterministicId("journal", [result.id, "delegated"]),
-      issueId: result.linear_issue_id,
+      issueId: result.ticket_id,
       instanceId: result.id,
       actor: "supervisor",
       kind: "delegated",
@@ -546,7 +546,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
           const instance = getInstanceStmt.get(attempt.pipeline_instance_id) as PipelineInstance;
           journal.recordJournalEntry({
             id: deterministicId("journal", [attempt.id, "dispatched_fix"]),
-            issueId: instance.linear_issue_id,
+            issueId: instance.ticket_id,
             instanceId: instance.id,
             runId: attempt.run_id,
             actor: "supervisor",

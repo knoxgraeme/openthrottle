@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import type { ControlThreadEvent } from "../../app/ports.js";
 import { linearGraphQL, type LinearClient } from "./client.js";
 
 export function verifyLinearSignature(
@@ -23,14 +24,14 @@ export function isRecentLinearWebhook(
   );
 }
 
-interface LinearIssueWebhookPayload {
+interface ControlThreadWebhookPayload {
   id: string;
   identifier: string;
   team?: { id?: string; key?: string; name?: string };
   labels?: Array<{ id?: string; name: string }> | { nodes?: Array<{ name: string }> };
 }
 
-export interface LinearAgentSessionEventPayload {
+export interface ControlAgentSessionEventPayload {
   action: "created" | "prompted";
   type: "AgentSessionEvent";
   webhookId: string;
@@ -42,7 +43,7 @@ export interface LinearAgentSessionEventPayload {
   agentSession: {
     id: string;
     issueId?: string;
-    issue?: LinearIssueWebhookPayload;
+    issue?: ControlThreadWebhookPayload;
   };
   agentActivity?: {
     id: string;
@@ -74,7 +75,7 @@ function normalizeSignal(raw: unknown): string | undefined {
   return undefined;
 }
 
-export function parseLinearWebhook(raw: string): LinearAgentSessionEventPayload {
+export function parseLinearWebhook(raw: string): ControlAgentSessionEventPayload {
   const payload: unknown = JSON.parse(raw);
   if (!isRecord(payload)) throw new Error("Linear webhook body must be an object");
   if (payload.type !== "AgentSessionEvent") {
@@ -127,7 +128,30 @@ export function parseLinearWebhook(raw: string): LinearAgentSessionEventPayload 
       throw new Error("Prompted webhook is missing agentActivity.body");
     }
   }
-  return payload as unknown as LinearAgentSessionEventPayload;
+  return payload as unknown as ControlAgentSessionEventPayload;
+}
+
+export function linearControlEvent(payload: ControlAgentSessionEventPayload): ControlThreadEvent {
+  const issue = payload.agentSession.issue;
+  return {
+    provider: "linear",
+    action: payload.action,
+    promptContext: payload.promptContext,
+    agentSession: {
+      id: payload.agentSession.id,
+      threadId: payload.agentSession.issueId,
+      thread: issue
+        ? {
+            id: issue.id,
+            identifier: issue.identifier,
+            provider: "linear",
+            route: issue.team,
+            labels: issue.labels,
+          }
+        : undefined,
+    },
+    activity: payload.agentActivity,
+  };
 }
 
 export interface ResolvedLabel {

@@ -11,6 +11,7 @@ import {
 import {
   fetchIssueLabels,
   isRecentLinearWebhook,
+  linearControlEvent,
   parseLinearWebhook,
   verifyLinearSignature,
 } from "../providers/linear/events.js";
@@ -39,7 +40,7 @@ import {
   type WebhookDeliveryProcessor,
 } from "./webhook-delivery.js";
 import { createLinearActivityPublisher, createLinearOutboxProcessor, tryPostError, type LinearOutboxProcessor } from "../providers/linear/outbox.js";
-import { handleLinearEvent, type PipelineCoordinatorContext, type SessionServicePorts } from "../app/session-service.js";
+import { handleControlEvent, type PipelineCoordinatorContext, type SessionServicePorts } from "../app/session-service.js";
 import { createAdmissionPreflight } from "../app/admission-preflight.js";
 import { handleGithubEvent } from "../providers/github/events.js";
 import { renderPipelineLogHeader } from "../pipeline/publication.js";
@@ -131,7 +132,7 @@ async function readBoundedUtf8Body(request: Request, maxBytes: number): Promise<
 }
 
 function findTicket(store: SupervisorStore, identifier: string): Ticket | undefined {
-  return store.getByIssueId(identifier) ?? store.getByIdentifier(identifier);
+  return store.getByIssueId(identifier);
 }
 
 const LINEAR_TEAM_KEY_PATTERN = /^[A-Za-z0-9_-]+$/;
@@ -222,7 +223,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
   const createSessionServicePorts = (linear: LinearClient): SessionServicePorts => ({
     activityPublisher,
     labelResolver: {
-      fetchIssueLabels: (issueId: string) => fetchIssueLabels(linear, issueId),
+      fetchThreadLabels: (issueId: string) => fetchIssueLabels(linear, issueId),
     },
     repositoryReader: {
       branchExists: (repository: string, branch: string) =>
@@ -261,11 +262,11 @@ export function createServerWebhookDeliveryProcessor(deps: {
       if (delivery.source === "linear") {
         const linear = await deps.getLinearClient();
         if (!linear) throw new Error("No valid Linear OAuth token is stored");
-        await handleLinearEvent(
+        await handleControlEvent(
           deps.cfg,
           deps.store,
           createSessionServicePorts(linear),
-          parseLinearWebhook(delivery.payload),
+          linearControlEvent(parseLinearWebhook(delivery.payload)),
           deps.pipelineCoordinator,
           admissionPreflight
         );
@@ -335,9 +336,17 @@ export function createServer(deps: ServerDeps): Hono {
     }
     return context.json({
       tickets: store.listAll().map((ticket) => {
-        const pipeline = deps.pipelineCoordinator.store.getStatusForIssue(ticket.linear_issue_id);
+        const pipeline = deps.pipelineCoordinator.store.getStatusForIssue(ticket.ticket_id);
         return {
-          linear_issue_identifier: ticket.linear_issue_identifier,
+          id: ticket.ticket_id,
+          reference: ticket.ticket_reference,
+          current_session_id: ticket.session_id,
+          control_provider: ticket.control_provider,
+          external_thread: {
+            provider: ticket.control_provider,
+            id: ticket.external_thread_id,
+            reference: ticket.external_thread_reference,
+          },
           branch: ticket.branch,
           repo: ticket.repo,
           base_branch: ticket.base_branch,
@@ -452,7 +461,7 @@ export function createServer(deps: ServerDeps): Hono {
     try {
       return context.json({
         journal: deps.pipelineCoordinator.store.listJournalEntries({
-          issueId: ticket.linear_issue_id,
+          issueId: ticket.ticket_id,
           from: context.req.query("from"),
           to: context.req.query("to"),
           limit: context.req.query("limit") ? Number(context.req.query("limit")) : undefined,
@@ -472,6 +481,11 @@ export function createServer(deps: ServerDeps): Hono {
       input = repositoryRegistrationInput(await context.req.json());
     } catch (error) {
       return context.json({ error: sanitizeText(String(error)) }, 400);
+    }
+    if (!cfg.linearWebhookSecret || !cfg.linearClientId || !cfg.linearClientSecret) {
+      return context.json({
+        error: "Linear control provider is unavailable: LINEAR_WEBHOOK_SECRET/LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET are not configured.",
+      }, 503);
     }
     try {
       const snapshot = await runtime.getSnapshot(cfg.daytonaSnapshot);
@@ -517,6 +531,9 @@ export function createServer(deps: ServerDeps): Hono {
     if (!hasBearer(context.req.header("Authorization"), cfg.installSecret)) {
       return context.text("unauthorized", 401);
     }
+    if (!cfg.linearClientId) {
+      return context.text("Linear control provider is unavailable: LINEAR_CLIENT_ID is not configured.", 503);
+    }
     const state = oauthStates.issue();
     return context.redirect(
       buildLinearInstallUrl({
@@ -532,6 +549,9 @@ export function createServer(deps: ServerDeps): Hono {
     const code = context.req.query("code");
     const state = context.req.query("state");
     if (!code) return context.text("Missing code", 400);
+    if (!cfg.linearClientId || !cfg.linearClientSecret) {
+      return context.text("Linear control provider is unavailable: LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET are not configured.", 503);
+    }
     if (!oauthStates.consume(state)) {
       return context.text("Missing or expired state", 400);
     }
@@ -552,6 +572,9 @@ export function createServer(deps: ServerDeps): Hono {
 
   app.post("/webhooks/linear", async (context) => {
     const rawBody = await context.req.text();
+    if (!cfg.linearWebhookSecret) {
+      return context.text("Linear control provider is unavailable: LINEAR_WEBHOOK_SECRET is not configured.", 503);
+    }
     if (!verifyLinearSignature(rawBody, context.req.header("Linear-Signature"), cfg.linearWebhookSecret)) {
       return context.text("invalid signature", 401);
     }
@@ -622,11 +645,11 @@ export function createServer(deps: ServerDeps): Hono {
     const ticket = findTicket(store, context.req.param("identifier"));
     if (!ticket) return context.json({ error: "ticket not found" }, 404);
     try {
-      const pipeline = deps.pipelineCoordinator.store.getInstanceForSession(ticket.linear_session_id);
+      const pipeline = deps.pipelineCoordinator.store.getInstanceForSession(ticket.session_id);
       if (!pipeline) return context.json({ error: "pipeline not found" }, 409);
       requestPipelineStop({
         store: deps.pipelineCoordinator.store,
-        sessionId: ticket.linear_session_id,
+        sessionId: ticket.session_id,
         eventId: `operator-stop:${pipeline.id}`,
         reason: "Stopped by operator.",
       });
@@ -646,8 +669,8 @@ export function createServer(deps: ServerDeps): Hono {
       await tryPostError(
         store,
         linearOutboxProcessor,
-        ticket.linear_session_id,
-        ticket.linear_issue_id,
+        ticket.session_id,
+        ticket.ticket_id,
         message
       );
       return context.json({ error: message }, 502);
@@ -674,12 +697,12 @@ export function createServer(deps: ServerDeps): Hono {
     ) {
       return context.json({ error: "message is required" }, 400);
     }
-    const pipeline = deps.pipelineCoordinator.store.getInstanceForSession(ticket.linear_session_id);
+    const pipeline = deps.pipelineCoordinator.store.getInstanceForSession(ticket.session_id);
     if (!pipeline) return context.json({ error: "pipeline not found" }, 409);
     const activeAttempt = deps.pipelineCoordinator.store.getActiveAttempt(pipeline.id);
     const canSteerNow = canSteerPipelineRun({
       store: deps.pipelineCoordinator.store,
-      sessionId: ticket.linear_session_id,
+      sessionId: ticket.session_id,
       runId: ticket.run_id,
       agent: ticket.agent,
       attempt: activeAttempt,
@@ -691,8 +714,8 @@ export function createServer(deps: ServerDeps): Hono {
     // stage accepts steering, fence it to that exact run; otherwise leave it
     // unbound until a later steerable stage can lease it.
     const record = store.enqueueInbox({
-      issueId: ticket.linear_issue_id,
-      sessionId: ticket.linear_session_id,
+      issueId: ticket.ticket_id,
+      sessionId: ticket.session_id,
       runId: canSteerNow ? ticket.run_id : null,
       source: "operator",
       body: message,
@@ -737,7 +760,7 @@ export function createServer(deps: ServerDeps): Hono {
     }
     const ticket = findTicket(store, context.req.param("identifier"));
     if (!ticket) return context.json({ error: "ticket not found" }, 404);
-    const pipeline = deps.pipelineCoordinator.store.getStatusForIssue(ticket.linear_issue_id);
+    const pipeline = deps.pipelineCoordinator.store.getStatusForIssue(ticket.ticket_id);
     const prefix = pipeline ? `${renderPipelineLogHeader(pipeline)}\n` : "";
     const withPipelinePrefix = (logs: string) =>
       prefix + sanitizeText(logs).slice(-Math.max(0, MAX_PRIVATE_LOG_TAIL_CHARS - prefix.length));
@@ -746,10 +769,10 @@ export function createServer(deps: ServerDeps): Hono {
         const logs = await runtime.getLogs(ticket.sandbox_id);
         return context.text(withPipelinePrefix(logs));
       } catch (error) {
-        console.warn(`[logs] live workspace unavailable for ${ticket.linear_issue_identifier}:`, error);
+        console.warn(`[logs] live workspace unavailable for ${ticket.ticket_reference}:`, error);
       }
     }
-    const durableLogTail = store.getLatestRunWithLog(ticket.linear_issue_id)?.log_tail;
+    const durableLogTail = store.getLatestRunWithLog(ticket.ticket_id)?.log_tail;
     if (durableLogTail) {
       return context.text(withPipelinePrefix(durableLogTail));
     }
@@ -766,12 +789,12 @@ export function createServer(deps: ServerDeps): Hono {
     const pipelineStore = deps.pipelineCoordinator.store;
     const publication = pipelineStore.getPublication(context.req.param("publicationId"));
     const instance = publication ? pipelineStore.getInstance(publication.pipeline_instance_id) : undefined;
-    if (!publication || instance?.linear_issue_id !== ticket.linear_issue_id) {
+    if (!publication || instance?.ticket_id !== ticket.ticket_id) {
       return context.json({ error: "publication not found" }, 404);
     }
     try {
       const retried = pipelineStore.retryPublication(publication.id);
-      if (retried.kind === "linear_ledger") {
+      if (retried.kind === "control_ledger") {
         schedule(linearOutboxProcessor.process(retried.id));
       }
       return context.json({

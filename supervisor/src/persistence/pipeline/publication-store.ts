@@ -70,9 +70,9 @@ export function createPublicationStore(db: Database.Database, now: () => string)
         AND EXISTS (
           SELECT 1
           FROM pipeline_instances pi
-          JOIN tickets t ON t.linear_issue_id = pi.linear_issue_id
+          JOIN tickets t ON t.ticket_id = pi.ticket_id
           WHERE pi.id = pipeline_publication_receipts.pipeline_instance_id
-            AND t.linear_session_id = pi.linear_session_id
+            AND t.session_id = pi.session_id
             AND t.pr_url = ?
         )
     `).run(targetUrl, now(), id, expectedPayloadHash, targetUrl);
@@ -169,14 +169,14 @@ export function createPublicationStore(db: Database.Database, now: () => string)
       SET status = 'pending', next_attempt_at = ?, last_error = NULL, updated_at = ?
       WHERE id = ?
     `).run(timestamp, timestamp, id);
-    if (publication.kind === "linear_ledger") {
+    if (publication.kind === "control_ledger") {
       // Reset attempts along with status: MAX_LINEAR_OUTBOX_ATTEMPTS caps a
       // row's own automatic retries, but an operator-triggered retry through
       // this endpoint is a distinct, deliberate recovery action and must get
       // a fresh attempt budget -- otherwise a row already at the cap dies
       // again on its very next failure regardless of this reset.
       const update = db.prepare(`
-        UPDATE linear_outbox
+        UPDATE control_outbox
         SET status = 'pending', next_attempt_at = ?, last_error = NULL, processed_at = NULL, attempts = 0
         WHERE id = ? AND status IN ('dead', 'failed')
       `).run(timestamp, id);

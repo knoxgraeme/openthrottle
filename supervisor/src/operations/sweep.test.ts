@@ -29,9 +29,9 @@ describe("runSweep", () => {
     const pipelines = createPipelineStore(db);
     const store = createSupervisorStore(db, pipelines);
     store.upsertUnpinned({
-      linear_issue_id: "active",
-      linear_issue_identifier: "ACTIVE",
-      linear_session_id: "session-active",
+      ticket_id: "active",
+      ticket_reference: "ACTIVE",
+      session_id: "session-active",
       sandbox_id: "known-active",
       branch: "ot/active",
       agent: "codex",
@@ -127,9 +127,9 @@ describe("runSweep", () => {
     const pipelines = createPipelineStore(db);
     const store = createSupervisorStore(db, pipelines);
     store.upsertUnpinned({
-      linear_issue_id: "issue-old",
-      linear_issue_identifier: "OLD",
-      linear_session_id: "session-old",
+      ticket_id: "issue-old",
+      ticket_reference: "OLD",
+      session_id: "session-old",
       sandbox_id: "sandbox-old",
       branch: "ot/old",
       agent: "codex",
@@ -154,7 +154,7 @@ describe("runSweep", () => {
     });
     store.enqueueLinearOutbox({
       id: "old-ephemeral-outbox",
-      linearSessionId: "session-old",
+      sessionId: "session-old",
       issueId: "issue-old",
       kind: "activity",
       payload: JSON.stringify({ activity: { ephemeral: true } }),
@@ -163,7 +163,7 @@ describe("runSweep", () => {
       .run("2020-01-01T00:00:00.000Z");
     db.prepare("UPDATE sandbox_events SET status = 'processed', processed_at = ?")
       .run("2020-01-01T00:00:00.000Z");
-    db.prepare("UPDATE linear_outbox SET status = 'processed', processed_at = ?")
+    db.prepare("UPDATE control_outbox SET status = 'processed', processed_at = ?")
       .run("2020-01-01T00:00:00.000Z");
     const runtime = {
       deleteResource: vi.fn(async () => undefined),
@@ -186,7 +186,7 @@ describe("runSweep", () => {
     expect(runtime.deleteResource).not.toHaveBeenCalled();
     expect(db.prepare("SELECT COUNT(*) FROM webhook_deliveries").pluck().get()).toBe(0);
     expect(db.prepare("SELECT COUNT(*) FROM sandbox_events").pluck().get()).toBe(0);
-    expect(db.prepare("SELECT COUNT(*) FROM linear_outbox").pluck().get()).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) FROM control_outbox").pluck().get()).toBe(0);
     expect(error).toHaveBeenCalledWith(
       "[sweep] failed to list Daytona sandboxes:",
       expect.any(Error)
@@ -260,7 +260,7 @@ describe("runSweep", () => {
     const instance = pipelines.getInstanceForSession("session-needs-human-old")!;
     pipelines.bindRuntimeResource(instance.id, "daytona", "sandbox-needs-human-old");
     pipelines.setRuntimeResourceStatus(instance.id, "stopped");
-    tickets.setSandboxId(instance.linear_issue_id, "sandbox-needs-human-old");
+    tickets.setSandboxId(instance.ticket_id, "sandbox-needs-human-old");
     db.prepare(`
       UPDATE pipeline_effect_intents SET status = 'acknowledged'
       WHERE pipeline_instance_id = ? AND status = 'pending'
@@ -290,7 +290,7 @@ describe("runSweep", () => {
 
     expect(cleanup).toHaveBeenCalledWith({ providerResourceId: "sandbox-needs-human-old" });
     expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("cleaned");
-    expect(tickets.getByIssueId(instance.linear_issue_id)?.sandbox_id).toBeNull();
+    expect(tickets.getByIssueId(instance.ticket_id)?.sandbox_id).toBeNull();
   });
 
   it("protects a still pipeline-bound sandbox from the orphan path once a newer generation reassigns tickets.sandbox_id", async () => {
@@ -334,7 +334,7 @@ describe("runSweep", () => {
     // The re-delegation that moved the ticket on to a new generation's
     // sandbox -- the old resource's id no longer appears anywhere on the
     // ticket, only on the (still terminal, still 'stopped') pipeline instance.
-    tickets.setSandboxId(instance.linear_issue_id, "sandbox-new-generation");
+    tickets.setSandboxId(instance.ticket_id, "sandbox-new-generation");
 
     const deleteResource = vi.fn(async () => undefined);
     const cleanup = vi.fn(async () => undefined);
@@ -345,7 +345,7 @@ describe("runSweep", () => {
       listLabeledResources: async () => [{
         id: "sandbox-old-generation",
         createdAt: "2020-01-01T00:00:00.000Z",
-        labels: { ticket: instance.linear_issue_id },
+        labels: { ticket: instance.ticket_id },
       }],
     };
 

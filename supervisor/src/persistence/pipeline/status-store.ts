@@ -93,8 +93,8 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
       const instance = db.prepare(`
         SELECT pi.*, t.pr_url AS ticket_pr_url FROM agent_sessions s
         JOIN pipeline_instances pi ON pi.id = s.pipeline_instance_id
-        JOIN tickets t ON t.linear_session_id = s.id
-        WHERE t.linear_issue_id = ? AND s.execution_mode = 'pipeline'
+        JOIN tickets t ON t.session_id = s.id
+        WHERE t.ticket_id = ? AND s.execution_mode = 'pipeline'
       `).get(issueId) as (PipelineInstance & { ticket_pr_url: string | null }) | undefined;
       if (!instance) return undefined;
       const attempt = db.prepare(`
@@ -222,7 +222,7 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
           instance.immutable_subject === instance.published_subject
           ? instance.published_commit
           : null,
-        // Production transitions persist only linear_ledger/github_summary
+        // Production transitions persist only control_ledger/github_summary
         // receipts, so normal runs have no pull_request receipt; the ticket
         // projection (populated by the pull-request webhook) is the durable
         // fallback that keeps this field honest for the /status contract.

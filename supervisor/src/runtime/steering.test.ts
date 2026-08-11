@@ -20,9 +20,9 @@ function seedRunningTicket(agent: "claude" | "codex" | "opencode" = "claude") {
   workStore = createWorkStore(db);
   const store = createSupervisorStore(db);
   store.upsert({
-    linear_issue_id: "issue-1",
-    linear_issue_identifier: "OT-1",
-    linear_session_id: "session-1",
+    ticket_id: "issue-1",
+    ticket_reference: "OT-1",
+    session_id: "session-1",
     sandbox_id: "sandbox-1",
     branch: "ot/ot-1",
     agent,
@@ -132,8 +132,8 @@ describe("deliverPendingInbox", () => {
       version: 1,
       delivery_id: dispatched.delivery_id,
       request_hash: dispatched.request_hash,
-      issue_id: dispatched.linear_issue_id,
-      session_id: dispatched.linear_session_id,
+      issue_id: dispatched.ticket_id,
+      session_id: dispatched.session_id,
       run_id: dispatched.run_id,
       native_session_id: dispatched.native_session_id,
       generation: dispatched.generation,

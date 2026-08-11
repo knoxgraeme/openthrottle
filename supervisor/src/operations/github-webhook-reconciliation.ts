@@ -60,7 +60,8 @@ export function createGithubWebhookReconciler<TClient>(
         });
         if (result.webhookId !== registration.webhook_id) {
           options.store.registerRepository({
-            linearTeamKey: registration.linear_team_key,
+            controlProvider: registration.control_provider,
+            linearTeamKey: registration.linear_team_key ?? undefined,
             linearTeamId: registration.linear_team_id ?? undefined,
             githubRepo: registration.github_repo,
             baseBranch: registration.base_branch,

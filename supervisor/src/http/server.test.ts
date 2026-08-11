@@ -137,9 +137,9 @@ describe("coordinator-only server", () => {
 
   function seedTicket(): void {
     store.upsertUnpinned({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -166,9 +166,9 @@ describe("coordinator-only server", () => {
     });
     const manifest = catalog.manifests.get("fixture/command@1")!;
     store.upsert({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -210,9 +210,9 @@ describe("coordinator-only server", () => {
       config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }, { id: structured, kind: builtin, ref: core/structured@2 }]\npipelines: { implement: structured }\n"),
     });
     store.upsert({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -270,8 +270,17 @@ describe("coordinator-only server", () => {
     };
     expect(body).not.toHaveProperty("execution_summary");
     expect(body.tickets[0]).not.toHaveProperty("execution_mode");
+    expect(body.tickets[0]).not.toHaveProperty("ticket_reference");
     expect(body.tickets[0]).toMatchObject({
-      linear_issue_identifier: "OT-1",
+      id: "issue-1",
+      reference: "OT-1",
+      current_session_id: "session-1",
+      control_provider: "linear",
+      external_thread: {
+        provider: "linear",
+        id: "issue-1",
+        reference: "OT-1",
+      },
       pipeline: null,
     });
   });
@@ -291,7 +300,7 @@ describe("coordinator-only server", () => {
       refs: { stage: "command" },
     });
 
-    const response = await app().request("/tickets/OT-1/journal", {
+    const response = await app().request("/tickets/issue-1/journal", {
       headers: { Authorization: "Bearer status-token" },
     });
 
@@ -302,7 +311,7 @@ describe("coordinator-only server", () => {
     const row = body.journal.find((entry) => entry.kind === "terminal_observed");
     expect(row?.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(row).toMatchObject({
-      issue: "OT-1",
+      issue: "issue-1",
       repository: "owner/repo",
       kind: "terminal_observed",
     });
@@ -313,13 +322,13 @@ describe("coordinator-only server", () => {
     const instance = pipelines.getInstanceForSession("session-1")!;
     db.prepare(`
       INSERT INTO run_outcomes (
-        pipeline_instance_id, linear_issue_id, generation, execution_graph_id, plan_digest,
+        pipeline_instance_id, ticket_id, generation, execution_graph_id, plan_digest,
         base_commit, engine, outcome, closed_reason, fault_attribution, generations_consumed,
         repair_rounds_by_unit, phase_durations_ms, token_cost_usd, skill_digests, created_at
       ) VALUES (?, ?, 1, NULL, NULL, ?, 'codex', 'shipped', 'success', NULL, 1, '{}', '{}', NULL, ?, ?)
     `).run(
       instance.id,
-      instance.linear_issue_id,
+      instance.ticket_id,
       instance.base_commit,
       JSON.stringify([{ skill: "builtin://ce/implement@1", skill_package_digest: null }]),
       "2026-08-08T00:00:00.000Z"
@@ -364,13 +373,13 @@ describe("coordinator-only server", () => {
     const instance = pipelines.getInstanceForSession("session-1")!;
     db.prepare(`
       INSERT INTO run_outcomes (
-        pipeline_instance_id, linear_issue_id, generation, execution_graph_id, plan_digest,
+        pipeline_instance_id, ticket_id, generation, execution_graph_id, plan_digest,
         base_commit, engine, outcome, closed_reason, fault_attribution, generations_consumed,
         repair_rounds_by_unit, phase_durations_ms, token_cost_usd, skill_digests, created_at
       ) VALUES (?, ?, 1, 'structured', NULL, ?, 'codex', 'failed', 'failure', 'agent', 1, '{}', '{}', NULL, ?, ?)
     `).run(
       instance.id,
-      instance.linear_issue_id,
+      instance.ticket_id,
       instance.base_commit,
       JSON.stringify([{ skill: "builtin://ce/implement@1", skill_package_digest: null }]),
       "2026-08-08T00:00:00.000Z"
@@ -592,7 +601,7 @@ describe("coordinator-only server", () => {
       expiresAt: "2099-01-01T00:00:00.000Z",
     })).toBe(false);
     db.prepare(`
-      INSERT INTO runs (id, linear_issue_id, task_type, token_hash, status, started_at, expires_at)
+      INSERT INTO runs (id, ticket_id, task_type, token_hash, status, started_at, expires_at)
       VALUES ('run-old-generation', 'issue-1', 'implement', 'token-hash', 'timed_out', '2026-07-25T00:00:00.000Z', '2026-07-25T02:00:00.000Z')
     `).run();
     store.insertSandboxEvent({
@@ -689,13 +698,13 @@ describe("coordinator-only server", () => {
     `).run(instance.id);
     db.prepare(`
       INSERT INTO runs (
-        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        id, ticket_id, session_id, session_generation, task_type,
         token_hash, status, started_at, expires_at
       ) VALUES (
         'run-latest', ?, 'session-1', 1, 'implement', 'request-hash',
         'completed', '2026-07-26T00:12:00.000Z', '2026-07-26T01:12:00.000Z'
       )
-    `).run(instance.linear_issue_id);
+    `).run(instance.ticket_id);
     db.prepare(`
       INSERT INTO pipeline_stage_attempts (
         id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
@@ -883,7 +892,7 @@ describe("coordinator-only server", () => {
     db.prepare(`
       UPDATE tickets
       SET pr_url = NULL
-      WHERE linear_issue_id = 'issue-1'
+      WHERE ticket_id = 'issue-1'
     `).run();
     db.prepare(`
       INSERT INTO pipeline_publication_receipts (
@@ -944,14 +953,21 @@ describe("coordinator-only server", () => {
 
   it("does not fall back to direct stop or steering for an unpinned ticket", async () => {
     seedTicket();
-    const stop = await app().request("/tickets/OT-1/stop", {
+    const referenceStop = await app().request("/tickets/OT-1/stop", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(referenceStop.status).toBe(404);
+    expect(await referenceStop.json()).toEqual({ error: "ticket not found" });
+
+    const stop = await app().request("/tickets/issue-1/stop", {
       method: "POST",
       headers: { Authorization: "Bearer status-token" },
     });
     expect(stop.status).toBe(409);
     expect(await stop.json()).toEqual({ error: "pipeline not found" });
 
-    const steer = await app().request("/tickets/OT-1/steer", {
+    const steer = await app().request("/tickets/issue-1/steer", {
       method: "POST",
       headers: {
         Authorization: "Bearer status-token",
@@ -978,7 +994,7 @@ describe("coordinator-only server", () => {
     pipelines.bindStageRun(attempt.id, request.runId);
     pipelines.markStageDispatched(attempt.id);
 
-    const response = await app().request("/tickets/OT-1/steer", {
+    const response = await app().request("/tickets/issue-1/steer", {
       method: "POST",
       headers: {
         Authorization: "Bearer status-token",
@@ -1028,7 +1044,7 @@ describe("coordinator-only server", () => {
       unitPhaseBindings: stageById(instance.normalized_manifest, "units")?.unitPhaseBindings,
     });
 
-    const response = await app().request("/tickets/OT-1/steer", {
+    const response = await app().request("/tickets/issue-1/steer", {
       method: "POST",
       headers: {
         Authorization: "Bearer status-token",
@@ -1057,7 +1073,7 @@ describe("coordinator-only server", () => {
 
     // A second capture during the same composite run records a second,
     // distinct event rather than silently deduping or overwriting the first.
-    const second = await app().request("/tickets/OT-1/steer", {
+    const second = await app().request("/tickets/issue-1/steer", {
       method: "POST",
       headers: {
         Authorization: "Bearer status-token",
@@ -1116,7 +1132,7 @@ describe("coordinator-only server", () => {
         store: failingStore,
         drainEffects: async () => undefined,
       },
-    }).request("/tickets/OT-1/steer", {
+    }).request("/tickets/issue-1/steer", {
       method: "POST",
       headers: {
         Authorization: "Bearer status-token",
@@ -1142,7 +1158,7 @@ describe("coordinator-only server", () => {
 
   it("distinguishes an accepted stop request from confirmed durable settlement", async () => {
     seedPipelineTicket();
-    const pending = await app().request("/tickets/OT-1/stop", {
+    const pending = await app().request("/tickets/issue-1/stop", {
       method: "POST",
       headers: { Authorization: "Bearer status-token" },
     });
@@ -1166,7 +1182,7 @@ describe("coordinator-only server", () => {
           });
         },
       },
-    }).request("/tickets/OT-1/stop", {
+    }).request("/tickets/issue-1/stop", {
       method: "POST",
       headers: { Authorization: "Bearer status-token" },
     });
@@ -1183,11 +1199,11 @@ describe("coordinator-only server", () => {
       ["/analysis/runs", "GET"],
       ["/repositories", "GET"],
       ["/repositories/register", "POST"],
-      ["/tickets/OT-1/stop", "POST"],
-      ["/tickets/OT-1/steer", "POST"],
-      ["/tickets/OT-1/logs", "GET"],
-      ["/tickets/OT-1/journal", "GET"],
-      ["/tickets/OT-1/publications/missing/retry", "POST"],
+      ["/tickets/issue-1/stop", "POST"],
+      ["/tickets/issue-1/steer", "POST"],
+      ["/tickets/issue-1/logs", "GET"],
+      ["/tickets/issue-1/journal", "GET"],
+      ["/tickets/issue-1/publications/missing/retry", "POST"],
     ] as const) {
       const response = await app().request(path, { method });
       expect(response.status, `${method} ${path}`).toBe(401);
@@ -1217,7 +1233,7 @@ describe("coordinator-only server", () => {
         },
       },
     });
-    const signature = createHmac("sha256", cfg.linearWebhookSecret).update(payload).digest("hex");
+    const signature = createHmac("sha256", cfg.linearWebhookSecret!).update(payload).digest("hex");
     const request = () => server.request("/webhooks/linear", {
       method: "POST",
       headers: {
@@ -1246,7 +1262,7 @@ describe("coordinator-only server", () => {
       webhookId: "linear-webhook-stale",
       webhookTimestamp: 0,
     });
-    const staleSignature = createHmac("sha256", cfg.linearWebhookSecret)
+    const staleSignature = createHmac("sha256", cfg.linearWebhookSecret!)
       .update(stalePayload).digest("hex");
     const stale = await server.request("/webhooks/linear", {
       method: "POST",
@@ -1255,6 +1271,26 @@ describe("coordinator-only server", () => {
     });
     expect(stale.status).toBe(401);
     expect(db.prepare("SELECT COUNT(*) FROM webhook_deliveries").pluck().get()).toBe(1);
+  });
+
+  it("fails Linear webhooks precisely when the Linear adapter is unavailable", async () => {
+    const server = app({
+      cfg: {
+        ...cfg,
+        linearWebhookSecret: undefined,
+        linearClientId: undefined,
+        linearClientSecret: undefined,
+      },
+    });
+
+    const response = await server.request("/webhooks/linear", {
+      method: "POST",
+      headers: { "Linear-Signature": "0".repeat(64) },
+      body: "{}",
+    });
+
+    expect(response.status).toBe(503);
+    expect(await response.text()).toContain("LINEAR_WEBHOOK_SECRET");
   });
 
   it("fails Linear deliveries before admission when OAuth is unavailable", async () => {
@@ -1361,7 +1397,7 @@ describe("coordinator-only server", () => {
       logTail: "finished with github_pat_abcdefghijklmnopqrstuvwxyz1234567890",
     });
 
-    const response = await app().request("/tickets/OT-1/logs", {
+    const response = await app().request("/tickets/issue-1/logs", {
       headers: { Authorization: "Bearer status-token" },
     });
     expect(response.status).toBe(200);

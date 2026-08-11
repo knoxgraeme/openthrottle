@@ -12,9 +12,12 @@ import {
   type PipelineUnitPhaseBinding,
 } from "../../pipeline/manifest.js";
 import { createExecutionUnitStore } from "../pipeline/unit-store.js";
+import { createJournalStore } from "../pipeline/journal-store.js";
 import { GATE_RECEIPT_REASONS } from "../../pipeline/gates.js";
 import { FAULT_ATTRIBUTIONS } from "../../pipeline/fault-attribution.js";
 import { ENGINES } from "../pipeline/run-outcome-store.js";
+import { createSettingsStore } from "../settings-store.js";
+import { considerCiGithubHead } from "../../providers/github/events.js";
 import { applyDatabaseMigrations, databaseMigrations } from "./runner.js";
 
 let db: Database.Database | undefined;
@@ -143,6 +146,9 @@ describe("database migrations", () => {
       "62d23bf76b20a18c4ff15352d3ef1558fe6bb364860d58915a26a84c8a6ed2b3",
       "1b9a06d171fdefd11b55aa4b785fc639310792b8de144d4c49c50206c4a6a3b2",
       "e1f1cc26fcd21df5ca8cb56548d2d38f90311d40d93bcd0e54d4ab62f9eb6ad4",
+      "36f3c74ad261f3e4e9e5014221e5ff8510dc7123b03ab92f2875b02ab0cf4fb2",
+      "8ede2103ae2f761958e4a21fc672b1c7a2a6c8fe39f75109ca3843b2fe492597",
+      "7d3a9df445ca32dde099ec99c6f2128a9e87b5f86732f94f61690fe13d53ebcb",
     ]);
   });
 
@@ -219,6 +225,425 @@ describe("database migrations", () => {
       SELECT COUNT(*) AS count FROM pragma_foreign_key_list('execution_units')
       WHERE "table" = 'execution_work_attempts'
     `).get()).toEqual({ count: 6 });
+  });
+
+  it("converges a freshly opened database on neutral live control identifiers", () => {
+    db = openDb(":memory:");
+
+    expect(db.prepare(`
+      SELECT name FROM pragma_table_info('tickets') WHERE name = 'ticket_id'
+    `).get()).toEqual({ name: "ticket_id" });
+    expect(db.prepare(`
+      SELECT name FROM pragma_table_info('tickets') WHERE name = 'linear_issue_id'
+    `).get()).toBeUndefined();
+    expect(db.prepare(`
+      SELECT name FROM pragma_table_info('pipeline_instances') WHERE name = 'session_id'
+    `).get()).toEqual({ name: "session_id" });
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'control_outbox'"
+    ).get()).toEqual({ name: "control_outbox" });
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'linear_outbox'"
+    ).get()).toBeUndefined();
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'pipeline_publications_process_idx'
+    `).get()).toEqual({ name: "pipeline_publications_process_idx" });
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'pipeline_effects_pending_idx'
+    `).get()).toEqual({ name: "pipeline_effects_pending_idx" });
+    expect(() => db!.prepare(`
+      INSERT INTO repository_registrations (
+        github_repo, control_provider, linear_team_key, base_branch,
+        webhook_id, snapshot, created_at, updated_at
+      ) VALUES (
+        'acme/missing-linear-team', 'linear', NULL, 'main', 1, '{}',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      )
+    `).run()).toThrow();
+  });
+
+  it("does not recreate the retired Linear outbox after reopening a migrated database", () => {
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-neutral-reopen-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "supervisor.db");
+
+    db = openDb(path);
+    db.close();
+    db = openDb(path);
+
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'control_outbox'"
+    ).get()).toEqual({ name: "control_outbox" });
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'linear_outbox'"
+    ).get()).toBeUndefined();
+  });
+
+  it("rekeys the complete GitHub head fence without losing canonical or newer state", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE tickets (
+        linear_issue_id TEXT PRIMARY KEY,
+        linear_issue_identifier TEXT NOT NULL,
+        linear_session_id TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id,
+        branch, agent, repo, created_at, updated_at
+      ) VALUES
+        ('issue-authoritative', 'OT-1', 'session-1', 'ot/ot-1', 'codex', 'owner/repo', '2026-01-01', '2026-01-01'),
+        ('issue-sequenced', 'OT-2', 'session-2', 'ot/ot-2', 'codex', 'owner/repo', '2026-01-01', '2026-01-01'),
+        ('issue-simple', 'OT-3', 'session-3', 'ot/ot-3', 'codex', 'owner/repo', '2026-01-01', '2026-01-01');
+    `);
+    const insertSetting = db.prepare("INSERT INTO settings(key, value) VALUES (?, ?)");
+    for (const [key, value] of [
+      ["github-head:issue-authoritative", "authoritative-head"],
+      ["github-head-source:issue-authoritative", "authoritative"],
+      ["github-head-watermark:issue-authoritative:workflow_run", "41"],
+      ["github-head:linear:issue-authoritative", "ci-head"],
+      ["github-head-source:linear:issue-authoritative", JSON.stringify({ source: "workflow_run", sequence: 50 })],
+      ["github-head-watermark:linear:issue-authoritative:workflow_run", "50"],
+      ["github-head:issue-sequenced", "newer-head"],
+      ["github-head-source:issue-sequenced", JSON.stringify({ source: "check_suite", sequence: 20 })],
+      ["github-head-watermark:issue-sequenced:check_suite", "20"],
+      ["github-head-watermark:issue-sequenced:deployment_status", "8"],
+      ["github-head:linear:issue-sequenced", "older-head"],
+      ["github-head-source:linear:issue-sequenced", JSON.stringify({ source: "check_suite", sequence: 10 })],
+      ["github-head-watermark:linear:issue-sequenced:check_suite", "10"],
+      ["github-head-watermark:linear:issue-sequenced:deployment_status", "12"],
+      ["github-head:issue-simple", "simple-head"],
+      ["github-head-source:issue-simple", JSON.stringify({ source: "workflow_run", sequence: 7 })],
+      ["github-head-watermark:issue-simple:workflow_run", "7"],
+    ] as const) {
+      insertSetting.run(key, value);
+    }
+
+    const migration = databaseMigrations.find((candidate) => candidate.version === 35)!;
+    migration.up(db);
+
+    const settings = createSettingsStore(db);
+    expect(settings.getSetting("github-head:linear:issue-authoritative")).toBe("authoritative-head");
+    expect(settings.getSetting("github-head-source:linear:issue-authoritative")).toBe("authoritative");
+    expect(settings.getSetting("github-head-watermark:linear:issue-authoritative:workflow_run")).toBe("50");
+    expect(settings.getSetting("github-head:linear:issue-sequenced")).toBe("newer-head");
+    expect(settings.getSetting("github-head-source:linear:issue-sequenced")).toBe(
+      JSON.stringify({ source: "check_suite", sequence: 20 })
+    );
+    expect(settings.getSetting("github-head-watermark:linear:issue-sequenced:check_suite")).toBe("20");
+    expect(settings.getSetting("github-head-watermark:linear:issue-sequenced:deployment_status")).toBe("12");
+    expect(settings.getSetting("github-head:linear:issue-simple")).toBe("simple-head");
+    expect(settings.getSetting("github-head-source:linear:issue-simple")).toBe(
+      JSON.stringify({ source: "workflow_run", sequence: 7 })
+    );
+    expect(settings.getSetting("github-head-watermark:linear:issue-simple:workflow_run")).toBe("7");
+    expect(db.prepare(`
+      SELECT key FROM settings
+      WHERE key LIKE 'github-head:%' AND key NOT LIKE 'github-head:linear:%'
+         OR key LIKE 'github-head-source:%' AND key NOT LIKE 'github-head-source:linear:%'
+         OR key LIKE 'github-head-watermark:%' AND key NOT LIKE 'github-head-watermark:linear:%'
+    `).all()).toEqual([]);
+
+    considerCiGithubHead(
+      settings as Parameters<typeof considerCiGithubHead>[0],
+      "linear:issue-authoritative",
+      "delayed-ci-head",
+      "workflow_run",
+      999
+    );
+    expect(settings.getSetting("github-head:linear:issue-authoritative")).toBe("authoritative-head");
+    considerCiGithubHead(
+      settings as Parameters<typeof considerCiGithubHead>[0],
+      "linear:issue-sequenced",
+      "stale-head",
+      "check_suite",
+      19
+    );
+    expect(settings.getSetting("github-head:linear:issue-sequenced")).toBe("newer-head");
+    considerCiGithubHead(
+      settings as Parameters<typeof considerCiGithubHead>[0],
+      "linear:issue-sequenced",
+      "fresh-head",
+      "check_suite",
+      21
+    );
+    expect(settings.getSetting("github-head:linear:issue-sequenced")).toBe("fresh-head");
+
+    const once = db.prepare("SELECT key, value FROM settings ORDER BY key").all();
+    migration.up(db);
+    expect(db.prepare("SELECT key, value FROM settings ORDER BY key").all()).toEqual(once);
+  });
+
+  it("rekeys legacy journal display references without breaking structured review lineage", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE tickets (
+        linear_issue_id TEXT PRIMARY KEY,
+        linear_issue_identifier TEXT NOT NULL,
+        linear_session_id TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE pipeline_instances (
+        id TEXT PRIMARY KEY,
+        linear_issue_id TEXT NOT NULL
+      );
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        linear_issue_id TEXT NOT NULL
+      );
+      CREATE TABLE orchestration_journal (
+        id TEXT PRIMARY KEY,
+        recorded_at TEXT NOT NULL,
+        team TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        issue TEXT NOT NULL,
+        instance_id TEXT,
+        run_id TEXT,
+        actor TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        action TEXT NOT NULL,
+        outcome TEXT,
+        refs TEXT NOT NULL,
+        note TEXT,
+        structured TEXT
+      );
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id,
+        branch, agent, repo, created_at, updated_at
+      ) VALUES
+        ('issue-a', 'OT-188', 'session-a', 'ot/a', 'codex', 'owner/repo', '2026-01-01', '2026-01-01'),
+        ('issue-b', 'OT-188', 'session-b', 'ot/b', 'codex', 'owner/repo', '2026-01-01', '2026-01-01'),
+        ('issue-unique', 'OT-200', 'session-unique', 'ot/unique', 'codex', 'owner/repo', '2026-01-01', '2026-01-01');
+      INSERT INTO pipeline_instances (id, linear_issue_id) VALUES
+        ('instance-a', 'issue-a'),
+        ('instance-b', 'issue-b');
+      INSERT INTO runs (id, linear_issue_id) VALUES
+        ('run-a', 'issue-a'),
+        ('run-b', 'issue-b');
+      INSERT INTO orchestration_journal (
+        id, recorded_at, team, repository, issue, instance_id, run_id,
+        actor, kind, trigger, action, outcome, refs, note, structured
+      ) VALUES
+        (
+          'review-cycle-1', '2026-01-01T00:00:01.000Z', 'OT', 'owner/repo', 'OT-188',
+          'instance-a', 'run-a', 'supervisor', 'run_note', 'structured_review_fanout',
+          'Recorded review cycle one.', 'success', '{}', NULL,
+          '{"finding_resolutions":[{"convergence_cycle":1}],"marker":"cycle-1"}'
+        ),
+        (
+          'review-cycle-2', '2026-01-01T00:00:02.000Z', 'OT', 'owner/repo', 'OT-188',
+          'instance-a', 'run-a', 'supervisor', 'run_note', 'structured_review_fanout',
+          'Resumed review with prior lineage.', 'success', '{}', NULL,
+          '{"finding_resolutions":[{"convergence_cycle":2}],"marker":"cycle-2"}'
+        ),
+        (
+          'other-ticket-review', '2026-01-01T00:00:03.000Z', 'OT', 'owner/repo', 'OT-188',
+          'instance-b', 'run-b', 'supervisor', 'run_note', 'structured_review_fanout',
+          'Recorded the colliding display reference.', 'success', '{}', NULL,
+          '{"finding_resolutions":[{"convergence_cycle":1}],"marker":"other"}'
+        ),
+        (
+          'run-only', '2026-01-01T00:00:04.000Z', 'OT', 'owner/repo', 'OT-188',
+          NULL, 'run-a', 'supervisor', 'run_note', 'run-bound',
+          'Mapped through the run fence.', 'success', '{}', NULL, NULL
+        ),
+        (
+          'unique-ticket', '2026-01-01T00:00:05.000Z', 'OT', 'owner/repo', 'OT-200',
+          NULL, NULL, 'supervisor', 'run_note', 'ticket-bound',
+          'Mapped through the unique ticket reference.', 'success', '{}', NULL, NULL
+        );
+    `);
+
+    const migration = databaseMigrations.find((candidate) => candidate.version === 35)!;
+    migration.up(db);
+
+    const journal = createJournalStore(db, () => "2026-01-02T00:00:00.000Z");
+    const issueAEntries = journal.listJournalEntries({ issueId: "linear:issue-a", limit: 100 });
+    expect(issueAEntries.map((entry) => entry.id)).toEqual([
+      "review-cycle-1",
+      "review-cycle-2",
+      "run-only",
+    ]);
+    expect(issueAEntries.filter((entry) =>
+      entry.instance_id === "instance-a" &&
+      entry.run_id === "run-a" &&
+      entry.trigger === "structured_review_fanout"
+    ).map((entry) => entry.structured)).toEqual([
+      '{"finding_resolutions":[{"convergence_cycle":1}],"marker":"cycle-1"}',
+      '{"finding_resolutions":[{"convergence_cycle":2}],"marker":"cycle-2"}',
+    ]);
+    expect(journal.listJournalEntries({ issueId: "linear:issue-b" }).map((entry) => entry.id))
+      .toEqual(["other-ticket-review"]);
+    expect(journal.listJournalEntries({ issueId: "linear:issue-unique" }).map((entry) => entry.id))
+      .toEqual(["unique-ticket"]);
+    expect(journal.listJournalEntries({ issue: "OT-188" })).toEqual([]);
+
+    const once = db.prepare(`
+      SELECT id, issue, structured FROM orchestration_journal ORDER BY id
+    `).all();
+    migration.up(db);
+    expect(db.prepare(`
+      SELECT id, issue, structured FROM orchestration_journal ORDER BY id
+    `).all()).toEqual(once);
+  });
+
+  it("fails v35 before guessing an ambiguous unbound journal identity", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE tickets (
+        linear_issue_id TEXT PRIMARY KEY,
+        linear_issue_identifier TEXT NOT NULL,
+        linear_session_id TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE orchestration_journal (
+        id TEXT PRIMARY KEY,
+        recorded_at TEXT NOT NULL,
+        team TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        issue TEXT NOT NULL,
+        instance_id TEXT,
+        run_id TEXT,
+        actor TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        action TEXT NOT NULL,
+        outcome TEXT,
+        refs TEXT NOT NULL,
+        note TEXT,
+        structured TEXT
+      );
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id,
+        branch, agent, repo, created_at, updated_at
+      ) VALUES
+        ('issue-a', 'OT-188', 'session-a', 'ot/a', 'codex', 'owner/repo', '2026-01-01', '2026-01-01'),
+        ('issue-b', 'OT-188', 'session-b', 'ot/b', 'codex', 'owner/repo', '2026-01-01', '2026-01-01');
+      INSERT INTO orchestration_journal (
+        id, recorded_at, team, repository, issue, instance_id, run_id,
+        actor, kind, trigger, action, outcome, refs, note, structured
+      ) VALUES (
+        'ambiguous', '2026-01-01T00:00:01.000Z', 'OT', 'owner/repo', 'OT-188',
+        NULL, NULL, 'supervisor', 'run_note', 'test', 'Ambiguous legacy row.',
+        'success', '{}', NULL, NULL
+      );
+    `);
+
+    const migration = databaseMigrations.find((candidate) => candidate.version === 35)!;
+    expect(() => migration.up(db!)).toThrow(/ambiguous legacy orchestration journal issue ambiguous/);
+    expect(db.prepare("SELECT issue FROM orchestration_journal WHERE id = 'ambiguous'").get())
+      .toEqual({ issue: "OT-188" });
+  });
+
+  it("migrates repository registrations to provider-qualified repo authority", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE repository_registrations (
+        linear_team_key TEXT PRIMARY KEY COLLATE NOCASE,
+        linear_team_id TEXT UNIQUE,
+        github_repo TEXT NOT NULL COLLATE NOCASE,
+        base_branch TEXT NOT NULL,
+        webhook_id INTEGER NOT NULL,
+        snapshot TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO repository_registrations (
+        linear_team_key, linear_team_id, github_repo, base_branch,
+        webhook_id, snapshot, created_at, updated_at
+      ) VALUES
+      (
+        'ENG', 'team-1', 'acme/widget', 'main', 42,
+        'openthrottle', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      ),
+      (
+        'OPS', 'team-2', 'ACME/WIDGET', 'release', 43,
+        'newer-route', '2026-01-02T00:00:00.000Z', '2026-01-02T00:00:00.000Z'
+      );
+    `);
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare(`
+      SELECT github_repo, control_provider, linear_team_key, linear_team_id
+      FROM repository_registrations
+    `).get()).toEqual({
+      github_repo: "ACME/WIDGET",
+      control_provider: "linear",
+      linear_team_key: "OPS",
+      linear_team_id: "team-2",
+    });
+    expect(db.prepare(`
+      SELECT name FROM pragma_table_info('repository_registrations') WHERE pk = 1
+    `).get()).toEqual({ name: "github_repo" });
+    expect(db.prepare(`
+      SELECT name FROM pragma_index_list('repository_registrations')
+      WHERE name = 'repository_registrations_linear_team_key_idx'
+    `).get()).toEqual({ name: "repository_registrations_linear_team_key_idx" });
+    expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+  });
+
+  it("opens a legacy registration database before creating provider-qualified indexes", () => {
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-registration-upgrade-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "supervisor.db");
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE repository_registrations (
+        linear_team_key TEXT PRIMARY KEY COLLATE NOCASE,
+        linear_team_id TEXT UNIQUE,
+        github_repo TEXT NOT NULL COLLATE NOCASE,
+        base_branch TEXT NOT NULL,
+        webhook_id INTEGER NOT NULL,
+        snapshot TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO repository_registrations (
+        linear_team_key, linear_team_id, github_repo, base_branch,
+        webhook_id, snapshot, created_at, updated_at
+      ) VALUES (
+        'ENG', 'team-1', 'acme/widget', 'main', 42,
+        'openthrottle', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+    `);
+    legacy.close();
+
+    db = openDb(path);
+
+    expect(db.prepare(`
+      SELECT github_repo, control_provider, linear_team_key, linear_team_id
+      FROM repository_registrations
+    `).get()).toEqual({
+      github_repo: "acme/widget",
+      control_provider: "linear",
+      linear_team_key: "ENG",
+      linear_team_id: "team-1",
+    });
+    expect(db.prepare(`
+      SELECT name FROM pragma_index_list('repository_registrations')
+      WHERE name = 'repository_registrations_linear_team_key_idx'
+    `).get()).toEqual({ name: "repository_registrations_linear_team_key_idx" });
+    expect(db.prepare(`
+      SELECT name FROM pragma_index_list('repository_registrations')
+      WHERE name = 'repository_registrations_linear_team_id_idx'
+    `).get()).toEqual({ name: "repository_registrations_linear_team_id_idx" });
   });
 
   it("does not stamp v18 when composite identity prerequisites are missing", () => {
@@ -479,14 +904,14 @@ describe("database migrations", () => {
     const now = "2026-07-29T00:00:00.000Z";
     db.exec(`
       INSERT INTO tickets (
-        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        ticket_id, ticket_reference, session_id, branch, agent,
         repo, base_branch, created_at, updated_at
       ) VALUES ('issue-1', 'OPE-1', 'session-1', 'ot/ope-1', 'codex', 'owner/repo', 'main', '${now}', '${now}');
       INSERT INTO agent_sessions (
-        id, linear_issue_id, generation, state, created_at, updated_at
+        id, ticket_id, generation, state, created_at, updated_at
       ) VALUES ('session-1', 'issue-1', 1, 'current', '${now}', '${now}');
       INSERT INTO runs (
-        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        id, ticket_id, session_id, session_generation, task_type,
         token_hash, status, started_at, expires_at
       ) VALUES (
         'run-parent', 'issue-1', 'session-1', 1, 'implement', 'request-hash',
@@ -502,7 +927,7 @@ describe("database migrations", () => {
         pipeline_id, version, digest, normalized_manifest, accepted_at
       ) VALUES ('structured', 1, '${"e".repeat(64)}', '{}', '${now}');
       INSERT INTO pipeline_instances (
-        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        id, ticket_id, session_id, generation, pipeline_id, pipeline_version,
         manifest_digest, normalized_manifest, repository, base_commit, branch,
         repository_config_snapshot_id, repository_config_digest, runtime_release, capability_digest,
         executor_protocol, authorized_capabilities, status, active_stage_id, state_version,
@@ -582,7 +1007,7 @@ describe("database migrations", () => {
         transition_version INTEGER NOT NULL CHECK(transition_version >= 1),
         kind TEXT NOT NULL CHECK(kind IN (
           'provision', 'bootstrap', 'dispatch_stage', 'stop', 'quarantine', 'cleanup',
-          'publish_linear', 'publish_github', 'publish_pr'
+          'publish_control', 'publish_github', 'publish_pr'
         )),
         idempotency_key TEXT NOT NULL UNIQUE,
         payload TEXT NOT NULL,
@@ -862,7 +1287,7 @@ describe("database migrations", () => {
     ));
     db.prepare(`
       INSERT INTO tickets (
-        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        ticket_id, ticket_reference, session_id, branch, agent,
         repo, state, base_branch, created_at, updated_at
       ) VALUES (
         'issue-selection', 'OPE-SELECT', 'session-selection', 'ot/issue-selection',
@@ -871,7 +1296,7 @@ describe("database migrations", () => {
     `).run(now, now);
     db.prepare(`
       INSERT INTO agent_sessions (
-        id, linear_issue_id, generation, state, provider_conversation_id,
+        id, ticket_id, generation, state, provider_conversation_id,
         created_at, updated_at
       ) VALUES (
         'session-selection', 'issue-selection', 1, 'current', NULL, ?, ?
@@ -894,7 +1319,7 @@ describe("database migrations", () => {
     `).run("a".repeat(40), now);
     db.prepare(`
       INSERT INTO pipeline_instances (
-        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        id, ticket_id, session_id, generation, pipeline_id, pipeline_version,
         manifest_digest, normalized_manifest, repository, base_commit,
         repository_config_snapshot_id, repository_config_digest, runtime_release,
         capability_digest, executor_protocol, authorized_capabilities, status,
@@ -925,8 +1350,8 @@ describe("database migrations", () => {
       WHERE pipeline_instance_id = 'instance-selection'
       ORDER BY kind
     `).all()).toEqual([
+      { kind: "control_ledger" },
       { kind: "github_summary" },
-      { kind: "linear_ledger" },
     ]);
   });
 
@@ -936,7 +1361,7 @@ describe("database migrations", () => {
     const now = "2026-01-01T00:00:00.000Z";
     db.prepare(`
       INSERT INTO tickets (
-        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        ticket_id, ticket_reference, session_id, branch, agent,
         repo, state, base_branch, created_at, updated_at
       ) VALUES (
         'issue-contract', 'OPE-CONTRACT', 'session-contract', 'ot/issue-contract',
@@ -945,7 +1370,7 @@ describe("database migrations", () => {
     `).run(now, now);
     db.prepare(`
       INSERT INTO agent_sessions (
-        id, linear_issue_id, generation, state, provider_conversation_id,
+        id, ticket_id, generation, state, provider_conversation_id,
         created_at, updated_at, execution_mode, pipeline_instance_id
       ) VALUES (
         'session-contract', 'issue-contract', 1, 'current', NULL, ?, ?,
@@ -969,7 +1394,7 @@ describe("database migrations", () => {
     `).run("a".repeat(40), now);
     db.prepare(`
       INSERT INTO pipeline_instances (
-        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        id, ticket_id, session_id, generation, pipeline_id, pipeline_version,
         manifest_digest, normalized_manifest, repository, base_commit,
         repository_config_snapshot_id, repository_config_digest, runtime_release,
         capability_digest, executor_protocol, authorized_capabilities, status,
@@ -987,7 +1412,7 @@ describe("database migrations", () => {
     `).run("a".repeat(64), "a".repeat(40), now, now);
     db.prepare(`
       INSERT INTO session_executions (
-        linear_session_id, linear_issue_id, generation, execution_mode,
+        session_id, ticket_id, generation, execution_mode,
         pipeline_instance_id, pinned_at
       ) VALUES (
         'session-contract', 'issue-contract', 1, 'pipeline', 'instance-contract', ?

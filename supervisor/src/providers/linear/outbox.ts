@@ -1,4 +1,4 @@
-import type { AgentActivityInput, AgentPlanItem, LinearClient, LinearComment, LinearIssueStateSignal } from "./client.js";
+import type { AgentActivityInput, AgentPlanItem, LinearClient, LinearComment, ControlThreadStateSignal } from "./client.js";
 import {
   agentActivityCreate,
   agentSessionUpdate,
@@ -31,7 +31,7 @@ export async function tryPostError(
   if (!sessionId) return;
   try {
     const row = store.enqueueLinearOutbox({
-      linearSessionId: sessionId,
+      sessionId: sessionId,
       issueId,
       kind: "activity",
       payload: activityPayload({
@@ -54,7 +54,7 @@ export async function enqueueActivity(
   runId?: string
 ): Promise<void> {
   const row = store.enqueueLinearOutbox({
-    linearSessionId: activity.sessionId,
+    sessionId: activity.sessionId,
     issueId,
     runId,
     kind: "activity",
@@ -89,7 +89,7 @@ export async function enqueueSessionUpdate(
 ): Promise<void> {
   const row = store.enqueueLinearOutbox({
     id: params.id,
-    linearSessionId: params.sessionId,
+    sessionId: params.sessionId,
     issueId: params.issueId,
     kind: "session_update",
     payload: sessionUpdatePayload({
@@ -133,7 +133,7 @@ type LinearOutboxPayload =
   | {
       type: "issue_state";
       issueId: string;
-      signal: LinearIssueStateSignal;
+      signal: ControlThreadStateSignal;
     };
 
 function classifyRetry(error: unknown): { retry: boolean; message: string } {
@@ -192,16 +192,18 @@ async function deliver(
     return {};
   }
   if (payload.type === "issue_state") {
+    const ticket = store.getByIssueId(payload.issueId);
     const result = await issueStateUpdate(linear, {
-      issueId: payload.issueId,
+      issueId: ticket?.external_thread_id ?? payload.issueId,
       signal: payload.signal,
     });
     return { externalId: result.state?.id };
   }
   if (payload.type === "pipeline_status") {
-    if (!row.linear_issue_id) throw new Error(`pipeline status ${row.id} has no Linear issue`);
-    const ticket = store.getByIssueId(row.linear_issue_id);
-    if (ticket && row.linear_session_id && ticket.linear_session_id !== row.linear_session_id) {
+    if (!row.ticket_id) throw new Error(`pipeline status ${row.id} has no Linear issue`);
+    const ticket = store.getByIssueId(row.ticket_id);
+    const linearIssueId = ticket?.external_thread_id ?? row.ticket_id;
+    if (ticket && row.session_id && ticket.session_id !== row.session_id) {
       return {};
     }
     const body = sanitizeText([
@@ -213,8 +215,8 @@ async function deliver(
       existing = await findOwnedCommentById(linear, row.external_id);
     } else {
       existing = await findOwnedCommentById(linear, row.id);
-      const marker = pipelineStatusCommentMarker(row.linear_issue_id);
-      existing ??= await findIssueCommentByMarker(linear, row.linear_issue_id, marker);
+      const marker = pipelineStatusCommentMarker(row.ticket_id);
+      existing ??= await findIssueCommentByMarker(linear, linearIssueId, marker);
     }
     if (existing?.id) {
       if ("body" in existing && existing.body === body) {
@@ -227,10 +229,10 @@ async function deliver(
         if (!isNotFoundError(error)) throw error;
       }
     }
-    const result = await commentCreate(linear, { id: row.id, issueId: row.linear_issue_id, body });
+    const result = await commentCreate(linear, { id: row.id, issueId: linearIssueId, body });
     return { externalId: result.comment?.id, externalUrl: result.comment?.url ?? undefined };
   }
-  if (!row.linear_session_id) throw new Error(`pipeline receipt ${row.id} has no Linear session`);
+  if (!row.session_id) throw new Error(`pipeline receipt ${row.id} has no Linear session`);
   let attachmentUrl = row.attachment_url ?? undefined;
   if (payload.publication.attachment && !attachmentUrl) {
     const upload = await linearFileUpload(linear, payload.publication.attachment);
@@ -246,7 +248,7 @@ async function deliver(
   ].join("\n")).slice(0, 20_000);
   const result = await agentActivityCreate(linear, {
     id: row.id,
-    sessionId: row.linear_session_id,
+    sessionId: row.session_id,
     type: "response",
     body,
   });
@@ -261,6 +263,15 @@ export function createLinearOutboxProcessor(params: {
   const leaseMs = params.leaseMs ?? 30_000;
 
   async function processRow(row: LinearOutboxRecord): Promise<void> {
+    const session = !row.ticket_id && row.session_id
+      ? params.store.getSession(row.session_id)
+      : undefined;
+    const ticket = params.store.getByIssueId(row.ticket_id ?? session?.ticket_id ?? "");
+    if (ticket && ticket.control_provider !== "linear") {
+      throw new Error(
+        `invalid control provider ${ticket.control_provider} for Linear outbox ${row.id}`
+      );
+    }
     const linear = await params.getLinearClient();
     if (!linear) throw new Error("No valid Linear OAuth token is stored");
     const receipt = await deliver(linear, row, params.store);

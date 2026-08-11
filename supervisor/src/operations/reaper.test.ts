@@ -14,7 +14,7 @@ let db: Database.Database | undefined;
 afterEach(() => db?.close());
 
 const listLinearOutbox = (): LinearOutboxRecord[] =>
-  db!.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
+  db!.prepare("SELECT * FROM control_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
 
 const cfg = { stallTimeoutSeconds: 900 } as Config;
 
@@ -36,9 +36,9 @@ const makeActivityPublisher = (store: SupervisorStore, outbox: ReturnType<typeof
 
 const addTicket = (store: SupervisorStore, id: string, sandboxId: string | null) =>
   store.upsert({
-    linear_issue_id: id,
-    linear_issue_identifier: id.toUpperCase(),
-    linear_session_id: `session-${id}`,
+    ticket_id: id,
+    ticket_reference: id.toUpperCase(),
+    session_id: `session-${id}`,
     sandbox_id: sandboxId,
     branch: `ot/${id}`,
     agent: "claude",

@@ -143,8 +143,8 @@ export function recordPipelineProviderEvent(params: {
   return params.store.recordProviderFeedback({
     provider: params.provider,
     providerEventId: params.eventId,
-    issueId: params.instance.linear_issue_id,
-    sessionId: params.instance.linear_session_id,
+    issueId: params.instance.ticket_id,
+    sessionId: params.instance.session_id,
     generation: params.instance.generation,
     repository: params.instance.repository,
     pullNumber: pullNumber(params.ticket, params.pullRequestUrl),
@@ -288,8 +288,8 @@ function snapshotBelongsToInstance(
   snapshot: FeedbackSnapshot,
   instance: PipelineInstance
 ): boolean {
-  return snapshot.linear_issue_id === instance.linear_issue_id &&
-    snapshot.linear_session_id === instance.linear_session_id &&
+  return snapshot.ticket_id === instance.ticket_id &&
+    snapshot.session_id === instance.session_id &&
     snapshot.generation === instance.generation &&
     pipelineFeedbackWorkItemBelongsToInstance(snapshot.work_item_id, instance.id);
 }
@@ -392,7 +392,7 @@ function markStaleFeedbackWithNotice(params: {
     snapshotId: params.snapshot.id,
     noticeId: `feedback-snapshot-stale:${params.snapshot.id}`,
     payload: staleFeedbackNotice({
-      sessionId: params.instance.linear_session_id,
+      sessionId: params.instance.session_id,
       eventCount: params.eventCount,
     }),
   });
@@ -527,7 +527,7 @@ export function drainPipelineFeedbackSnapshots(
   let processed = 0;
   for (const instance of pipelines.listProviderReadyInstances(limit)) {
     if (!providerStageCanReceive(pipelines, instance)) continue;
-    const snapshots = store.listPendingFeedbackSnapshots(instance.linear_session_id, limit);
+    const snapshots = store.listPendingFeedbackSnapshots(instance.session_id, limit);
     if (snapshots.length === 0) continue;
     const publicationSubjects = acknowledgedPublicationSubjects(pipelines, instance.id);
     for (const snapshot of snapshots) {

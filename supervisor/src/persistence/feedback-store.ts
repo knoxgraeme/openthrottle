@@ -3,8 +3,8 @@ import type Database from "better-sqlite3";
 
 export interface FeedbackSnapshot {
   id: string;
-  linear_issue_id: string;
-  linear_session_id: string;
+  ticket_id: string;
+  session_id: string;
   generation: number;
   head_sha: string;
   observed_head_sha: string;
@@ -105,7 +105,7 @@ export function createFeedbackStore(
       : params.headSha;
     let snapshot = db.prepare(`
       SELECT * FROM feedback_snapshots
-      WHERE linear_issue_id = ? AND linear_session_id = ? AND generation = ?
+      WHERE ticket_id = ? AND session_id = ? AND generation = ?
         AND head_sha = ? AND status = 'collecting'
         AND (
           (? = 'issue_comment' AND NOT EXISTS (
@@ -142,7 +142,7 @@ export function createFeedbackStore(
       // creation so the audit seal keeps the original subject as provenance.
       db.prepare(`
         INSERT INTO feedback_snapshots (
-          id, linear_issue_id, linear_session_id, generation, head_sha,
+          id, ticket_id, session_id, generation, head_sha,
           observed_head_sha, provider_watermark, status, work_item_id, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'collecting', ?, ?)
       `).run(
@@ -162,7 +162,7 @@ export function createFeedbackStore(
 
     db.prepare(`
       INSERT INTO provider_events (
-        provider, provider_event_id, linear_issue_id, linear_session_id,
+        provider, provider_event_id, ticket_id, session_id,
         generation, repository, pull_number, head_sha, kind, payload,
         payload_hash, received_at, snapshot_id
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -206,11 +206,11 @@ export function createFeedbackStore(
     }
     const completedRounds = (db.prepare(`
       SELECT COUNT(*) AS count FROM feedback_snapshots
-      WHERE linear_issue_id = ? AND linear_session_id = ?
+      WHERE ticket_id = ? AND session_id = ?
         AND generation = ? AND repair_round IS NOT NULL
     `).get(
-      snapshot.linear_issue_id,
-      snapshot.linear_session_id,
+      snapshot.ticket_id,
+      snapshot.session_id,
       snapshot.generation
     ) as {
       count: number;
@@ -249,12 +249,12 @@ export function createFeedbackStore(
     if (snapshot.head_sha === headSha) return snapshot;
     const target = db.prepare(`
       SELECT * FROM feedback_snapshots
-      WHERE linear_issue_id = ? AND linear_session_id = ? AND generation = ?
+      WHERE ticket_id = ? AND session_id = ? AND generation = ?
         AND head_sha = ? AND status = 'collecting'
       ORDER BY created_at, id LIMIT 1
     `).get(
-      snapshot.linear_issue_id,
-      snapshot.linear_session_id,
+      snapshot.ticket_id,
+      snapshot.session_id,
       snapshot.generation,
       headSha
     ) as FeedbackSnapshot | undefined;
@@ -310,7 +310,7 @@ export function createFeedbackStore(
       }
       const isConversationSnapshot = events.length > 0 &&
         events.every((event) => event.kind === "issue_comment");
-      const currentHead = getCurrentHead(snapshot.linear_issue_id);
+      const currentHead = getCurrentHead(snapshot.ticket_id);
       if (!isConversationSnapshot && currentHead && currentHead !== snapshot.head_sha) {
         return { status: "stale" as const, snapshot, eventCount: events.length };
       }

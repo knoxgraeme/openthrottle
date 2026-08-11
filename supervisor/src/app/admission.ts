@@ -11,11 +11,11 @@ import {
   type ExecutionPlanContract,
 } from "@openthrottle/contracts";
 import type {
-  LinearAgentSessionEvent,
+  ControlThreadEvent,
   RepositoryDirectorySnapshot,
   RepositoryFileSnapshot,
   RepositoryConfigSnapshot,
-  ResolvedLinearLabel,
+  ResolvedControlLabel,
 } from "./ports.js";
 import {
   parseRepositoryConfig,
@@ -65,7 +65,7 @@ const DEFAULT_REPOSITORY_TASK_TIMEOUT_SECONDS = 7_200;
 type BuiltinGraphReference = keyof typeof BUILTIN_GRAPHS;
 
 function linearContext(
-  payload: LinearAgentSessionEvent,
+  payload: ControlThreadEvent,
   fallback: string
 ): string {
   return payload.promptContext?.trim() || fallback;
@@ -77,13 +77,13 @@ function builtinGraphFor(ref: string): typeof BUILTIN_GRAPHS[BuiltinGraphReferen
     : undefined;
 }
 
-function extractLabelNames(payload: LinearAgentSessionEvent): string[] {
-  const labels = payload.agentSession.issue?.labels;
+function extractLabelNames(payload: ControlThreadEvent): string[] {
+  const labels = payload.agentSession.thread?.labels;
   if (Array.isArray(labels)) return labels.map((label) => label.name);
   return labels?.nodes?.map((label) => label.name) ?? [];
 }
 
-function labelMatchNames(labels: ResolvedLinearLabel[]): string[] {
+function labelMatchNames(labels: ResolvedControlLabel[]): string[] {
   const names: string[] = [];
   for (const label of labels) {
     names.push(label.name);
@@ -94,6 +94,10 @@ function labelMatchNames(labels: ResolvedLinearLabel[]): string[] {
 
 function branchFor(issueIdentifier: string): string {
   return `ot/${issueIdentifier.toLowerCase()}`;
+}
+
+function controlTicketId(provider: ControlThreadEvent["provider"], externalThreadId: string): string {
+  return `${provider}:${externalThreadId}`;
 }
 
 // An `agent › <engine>` label (also `agent >`, `agent:`, `agent/`) selects the
@@ -440,9 +444,13 @@ function isSafeBranchName(value: string): boolean {
 
 function repositoryFor(
   store: SupervisorStore,
-  issue: { team?: { id?: string; key?: string } }
+  thread: { provider: ControlThreadEvent["provider"]; route?: { id?: string; key?: string } }
 ): { repo: string; baseBranch: string } | undefined {
-  const registered = store.getRepositoryRegistration(issue.team?.id, issue.team?.key);
+  const registered = store.getRepositoryRegistration(
+    thread.route?.id,
+    thread.route?.key,
+    thread.provider
+  );
   return registered
     ? { repo: registered.github_repo, baseBranch: registered.base_branch }
     : undefined;
@@ -452,11 +460,11 @@ export async function handleCreated(
   cfg: Config,
   store: SupervisorStore,
   providers: SessionServicePorts,
-  payload: LinearAgentSessionEvent,
+  payload: ControlThreadEvent,
   coordinator: PipelineCoordinatorContext,
   preflight?: AdmissionPreflight
 ): Promise<void> {
-  const issue = payload.agentSession.issue;
+  const issue = payload.agentSession.thread;
   const sessionId = payload.agentSession.id;
   if (!issue) {
     await providers.activityPublisher.publishError(sessionId, undefined, "OpenThrottle could not find an issue on this agent session.");
@@ -475,10 +483,11 @@ export async function handleCreated(
   });
 
   const labels = extractLabelNames(payload);
-  const existing = store.getByIssueId(issue.id);
+  const ticketId = controlTicketId(issue.provider, issue.id);
+  const existing = store.getByExternalThread(issue.provider, issue.id) ?? store.getByIssueId(ticketId);
   const existingSessionInstance = coordinator.store.getInstanceForSession(sessionId);
   if (existingSessionInstance) {
-    if (existingSessionInstance.linear_issue_id !== issue.id) {
+    if (existingSessionInstance.ticket_id !== ticketId) {
       throw new Error(`pipeline session ${sessionId} has an invalid issue binding`);
     }
     return;
@@ -488,13 +497,13 @@ export async function handleCreated(
   // applied after (or even shortly before) the event fires can otherwise be
   // silently ignored (OPE-82/OPE-119). Fail closed -- never fall back to the
   // default engine while a label might exist unseen.
-  let resolvedLabels: ResolvedLinearLabel[];
+  let resolvedLabels: ResolvedControlLabel[];
   try {
-    resolvedLabels = await providers.labelResolver.fetchIssueLabels(issue.id);
+    resolvedLabels = await providers.labelResolver.fetchThreadLabels(issue.id);
   } catch (error) {
     await providers.activityPublisher.publishError(
       sessionId,
-      issue.id,
+      ticketId,
       `OpenThrottle could not read ${issue.identifier}'s current Linear labels: ${String(error)}. ` +
       "Engine selection requires a fresh label read, so no sandbox was provisioned. Try again."
     );
@@ -524,8 +533,8 @@ export async function handleCreated(
   if (!selectedRepository) {
     await providers.activityPublisher.publishError(
       sessionId,
-      issue.id,
-      `No repository is registered for Linear team ${issue.team?.key ?? issue.team?.id ?? "unknown"}. Run \`openthrottle init\` in the target repository first.`
+      ticketId,
+      `No repository is registered for ${issue.provider} route ${issue.route?.key ?? issue.route?.id ?? "unknown"}. Run \`openthrottle init\` in the target repository first.`
     );
     return;
   }
@@ -533,7 +542,7 @@ export async function handleCreated(
     if (!isSafeBranchName(requestedBase)) {
       await providers.activityPublisher.publishError(
         sessionId,
-        issue.id,
+        ticketId,
         `The \`branch\` label value \`${requestedBase}\` is not a valid Git branch name.`
       );
       return;
@@ -547,7 +556,7 @@ export async function handleCreated(
     } catch (error) {
       await providers.activityPublisher.publishError(
         sessionId,
-        issue.id,
+        ticketId,
         `OpenThrottle could not verify base branch \`${requestedBase}\` on ${selectedRepository.repo}: ${String(error)}`
       );
       return;
@@ -555,7 +564,7 @@ export async function handleCreated(
     if (!baseExists) {
       await providers.activityPublisher.publishError(
         sessionId,
-        issue.id,
+        ticketId,
         `Base branch \`${requestedBase}\` does not exist on ${selectedRepository.repo}.`
       );
       return;
@@ -564,9 +573,12 @@ export async function handleCreated(
   }
   const taskType: TaskType = routingLabels.includes("investigate") ? "investigate" : "implement";
   const ticketCore = {
-    linear_issue_id: issue.id,
-    linear_issue_identifier: issue.identifier,
-    linear_session_id: sessionId,
+    ticket_id: ticketId,
+    ticket_reference: issue.identifier,
+    session_id: sessionId,
+    control_provider: issue.provider,
+    external_thread_id: issue.id,
+    external_thread_reference: issue.identifier,
     sandbox_id: null,
     branch: branchFor(issue.identifier),
     agent: selectedAgent,
@@ -579,9 +591,9 @@ export async function handleCreated(
     const message = sanitizeText(rawMessage);
     if (!existing) {
       store.upsertUnpinned({ ...ticketCore, state: "error" });
-      store.setState(issue.id, "error", message);
+      store.setState(ticketCore.ticket_id, "error", message);
     }
-    await providers.activityPublisher.publishError(sessionId, issue.id, message);
+    await providers.activityPublisher.publishError(sessionId, ticketCore.ticket_id, message);
   };
   const failSelection = (error: unknown) =>
     failAdmission(`Pipeline selection failed before sandbox provisioning: ${String(error)}`);
@@ -676,7 +688,7 @@ export async function handleCreated(
       await failAdmission(verdict.reason);
       if (verdict.reason.startsWith("Daytona capacity:")) {
         coordinator.store.recordJournalEntry({
-          issueId: issue.id,
+          issueId: ticketCore.ticket_id,
           actor: "supervisor",
           kind: "capacity_refused",
           trigger: "Admission preflight",
@@ -713,7 +725,7 @@ export async function handleCreated(
   }
   if (boundedTaskContext.pruning) {
     coordinator.store.recordJournalEntry({
-      issueId: issue.id,
+      issueId: ticketCore.ticket_id,
       actor: "supervisor",
       kind: "run_note",
       trigger: "Linear delegation admitted",
@@ -733,6 +745,6 @@ export async function handleCreated(
     sessionId,
     type: "thought",
     body: `Pinned pipeline ${pinned.manifest.manifest.id}@${pinned.manifest.manifest.version} (${pinned.manifest.digest.slice(0, 12)}) at base ${pinned.remote.baseCommit.slice(0, 12)}. The durable coordinator will dispatch its first stage.`,
-  }, issue.id);
+  }, ticketCore.ticket_id);
   await coordinator.drainEffects?.();
 }

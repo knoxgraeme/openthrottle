@@ -13,7 +13,7 @@ export interface GithubPublicationProcessor {
 }
 
 interface GithubPublicationTicketStore {
-  getByIssueId(issueId: string): { linear_session_id: string; pr_url: string | null } | undefined;
+  getByIssueId(issueId: string): { session_id: string; pr_url: string | null } | undefined;
 }
 
 function githubRetry(error: unknown): { retry: boolean; message: string } {
@@ -36,7 +36,7 @@ export function createGithubPublicationProcessor(params: {
     if (!instance) throw new Error(`unknown pipeline instance ${publication.pipeline_instance_id}`);
     let bound = publication;
     if (!bound.target_url) {
-      const ticket = params.tickets.getByIssueId(instance.linear_issue_id);
+      const ticket = params.tickets.getByIssueId(instance.ticket_id);
       if (!ticket?.pr_url) {
         const terminal = instance.terminal_outcome != null || [
           "shipped", "no_change", "needs_human", "canceled", "superseded", "failed",
@@ -49,7 +49,7 @@ export function createGithubPublicationProcessor(params: {
         }
         throw new Error("pipeline pull request is not available yet");
       }
-      if (ticket.linear_session_id !== instance.linear_session_id) {
+      if (ticket.session_id !== instance.session_id) {
         throw new Error("pipeline publication no longer has its original session binding");
       }
       const persisted = params.store.bindGithubPublicationTarget(
@@ -75,7 +75,7 @@ export function createGithubPublicationProcessor(params: {
       params.client,
       instance.repository,
       pull.number,
-      instance.linear_issue_id,
+      instance.ticket_id,
       renderGithubPipelineSummary(envelope, bound.target_url)
     );
     const processed = params.store.markGithubPublicationProcessed(

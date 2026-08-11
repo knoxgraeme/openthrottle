@@ -35,9 +35,9 @@ describe("canSteerPipelineRun", () => {
     });
     const manifest = catalog.manifests.get("core/implement@4")!;
     tickets.upsert({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "ISSUE-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "ISSUE-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/issue-1",
       agent: "codex",
@@ -71,7 +71,7 @@ describe("canSteerPipelineRun", () => {
     runId: string
   ): void {
     tickets.beginRun({
-      issueId: instance.linear_issue_id,
+      issueId: instance.ticket_id,
       runId,
       taskType: "implement",
       tokenHash: "token-hash",
@@ -114,7 +114,7 @@ describe("canSteerPipelineRun", () => {
 
     expect(canSteerPipelineRun({
       store: pipelines,
-      sessionId: instance.linear_session_id,
+      sessionId: instance.session_id,
       runId,
       agent: "codex",
     })).toBe(true);
@@ -128,7 +128,7 @@ describe("canSteerPipelineRun", () => {
 
     expect(canSteerPipelineRun({
       store: pipelines,
-      sessionId: instance.linear_session_id,
+      sessionId: instance.session_id,
       runId,
       agent: "codex",
       attempt: liveAttempt,
@@ -140,7 +140,7 @@ describe("canSteerPipelineRun", () => {
     // favor of an internal re-query.
     expect(canSteerPipelineRun({
       store: pipelines,
-      sessionId: instance.linear_session_id,
+      sessionId: instance.session_id,
       runId,
       agent: "codex",
       attempt: { ...liveAttempt, run_id: "stale-run-id-from-a-prior-child" },
@@ -154,7 +154,7 @@ describe("canSteerPipelineRun", () => {
 
     expect(canSteerPipelineRun({
       store: pipelines,
-      sessionId: instance.linear_session_id,
+      sessionId: instance.session_id,
       runId: "stale-run-id-from-a-prior-child",
       agent: "codex",
     })).toBe(false);
@@ -166,7 +166,7 @@ describe("canSteerPipelineRun", () => {
     dispatch(pipelines, tickets, instance, attempt, staleRunId);
     expect(canSteerPipelineRun({
       store: pipelines,
-      sessionId: instance.linear_session_id,
+      sessionId: instance.session_id,
       runId: staleRunId,
       agent: "codex",
     })).toBe(true);
@@ -180,7 +180,7 @@ describe("canSteerPipelineRun", () => {
     // fences live steering, even though the session and issue are unchanged.
     expect(canSteerPipelineRun({
       store: pipelines,
-      sessionId: instance.linear_session_id,
+      sessionId: instance.session_id,
       runId: staleRunId,
       agent: "codex",
     })).toBe(false);
@@ -193,7 +193,7 @@ describe("canSteerPipelineRun", () => {
 
     expect(canSteerPipelineRun({
       store: pipelines,
-      sessionId: instance.linear_session_id,
+      sessionId: instance.session_id,
       runId,
       agent: "opencode",
     })).toBe(false);

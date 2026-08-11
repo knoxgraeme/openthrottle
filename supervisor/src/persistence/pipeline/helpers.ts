@@ -272,32 +272,32 @@ export function validatePinnedInstance(
   return manifest;
 }
 
-function nextLinearOutboxSequence(db: Database.Database, linearSessionId: string): number {
+function nextControlOutboxSequence(db: Database.Database, sessionId: string): number {
   return (db.prepare(`
     SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
-    FROM linear_outbox WHERE linear_session_id IS ?
-  `).get(linearSessionId) as { sequence: number }).sequence;
+    FROM control_outbox WHERE session_id IS ?
+  `).get(sessionId) as { sequence: number }).sequence;
 }
 
-function insertPendingLinearOutbox(input: {
+function insertPendingControlOutbox(input: {
   db: Database.Database;
   id: string;
-  linearSessionId: string;
-  linearIssueId: string;
+  sessionId: string;
+  ticketId: string;
   kind: "pipeline_receipt" | "issue_state" | "activity";
   payload: string;
   timestamp: string;
 }): void {
   input.db.prepare(`
-    INSERT INTO linear_outbox (
-      id, linear_session_id, linear_issue_id, run_id, sequence, kind,
+    INSERT INTO control_outbox (
+      id, session_id, ticket_id, run_id, sequence, kind,
       payload, payload_hash, status, attempts, next_attempt_at, created_at
     ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, 'pending', 0, ?, ?)
   `).run(
     input.id,
-    input.linearSessionId,
-    input.linearIssueId,
-    nextLinearOutboxSequence(input.db, input.linearSessionId),
+    input.sessionId,
+    input.ticketId,
+    nextControlOutboxSequence(input.db, input.sessionId),
     input.kind,
     input.payload,
     digestNormalized(input.payload),
@@ -320,7 +320,7 @@ export type ExecutionPublicationEventKind =
   | "steering_undelivered";
 
 // Inserts one durable, ordered child-publication event (RR18) plus its
-// correlated linear_outbox activity row in the caller's already-open SQL
+// correlated control_outbox activity row in the caller's already-open SQL
 // transaction, so a reportable child transition and its external projection
 // become durable atomically. Sanitization runs before either insert, so a
 // replayed/retried transaction can never re-derive or bypass it -- retrying
@@ -340,15 +340,15 @@ export function insertExecutionPublicationEvent(input: {
   ).get(input.id);
   if (already) return;
   const binding = input.db.prepare(
-    "SELECT linear_session_id, linear_issue_id FROM pipeline_instances WHERE id = ?"
-  ).get(input.graph.pipeline_instance_id) as { linear_session_id: string; linear_issue_id: string } | undefined;
+    "SELECT session_id, ticket_id FROM pipeline_instances WHERE id = ?"
+  ).get(input.graph.pipeline_instance_id) as { session_id: string; ticket_id: string } | undefined;
   if (!binding) throw new Error(`pipeline instance ${input.graph.pipeline_instance_id} is missing`);
   const sanitizedBody = bounded(input.body) ?? "(no detail)";
   const outboxId = deterministicPublicationId(`${input.id}-outbox`);
   const activityPayload = canonicalJson({
     type: "activity",
     activity: {
-      sessionId: binding.linear_session_id,
+      sessionId: binding.session_id,
       type: "thought" as const,
       body: sanitizedBody,
       ephemeral: false,
@@ -358,11 +358,11 @@ export function insertExecutionPublicationEvent(input: {
   // insert (same already-open caller transaction), so a genuine retry never
   // reaches here twice -- reuse the canonical insert idiom rather than a
   // fourth divergent ON CONFLICT variant.
-  insertPendingLinearOutbox({
+  insertPendingControlOutbox({
     db: input.db,
     id: outboxId,
-    linearSessionId: binding.linear_session_id,
-    linearIssueId: binding.linear_issue_id,
+    sessionId: binding.session_id,
+    ticketId: binding.ticket_id,
     kind: "activity",
     payload: activityPayload,
     timestamp: input.timestamp,
@@ -374,7 +374,7 @@ export function insertExecutionPublicationEvent(input: {
   input.db.prepare(`
     INSERT INTO execution_publication_events (
       id, execution_graph_id, pipeline_instance_id, parent_attempt_id, unit_id,
-      sequence, kind, body, linear_outbox_id, created_at
+      sequence, kind, body, control_outbox_id, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO NOTHING
   `).run(
@@ -400,7 +400,7 @@ export interface ExecutionPublicationEventRecord {
   sequence: number;
   kind: ExecutionPublicationEventKind;
   body: string;
-  linear_outbox_id: string;
+  control_outbox_id: string;
   created_at: string;
 }
 
@@ -413,11 +413,11 @@ export const MAX_ACTIVITY_LOG_EVENTS = 32;
 // Restart-safe convergence source for the final structured ledger (RR18/RAE7):
 // each event row is inserted in the same transaction as the child transition
 // it reports, so reading it directly (rather than gating on its correlated
-// linear_outbox activity's own delivery status) is what makes the ledger
+// control_outbox activity's own delivery status) is what makes the ledger
 // converge immediately from durable state -- including on the very same pass
 // that emits the event, and after a crash-and-restart replay, with no
 // dependency on the separate per-event Linear activity having been delivered
-// yet. The correlated linear_outbox row still tracks that activity's own
+// yet. The correlated control_outbox row still tracks that activity's own
 // delivery independently; it is not a precondition for this projection.
 export function listExecutionPublicationEvents(
   db: Database.Database,
@@ -446,24 +446,24 @@ function persistIssueStateProjection(input: {
   const id = deterministicPublicationId(`linear-issue-state:${input.instance.id}:${signal}`);
   const payload = JSON.stringify({
     type: "issue_state",
-    issueId: input.instance.linear_issue_id,
+    issueId: input.instance.ticket_id,
     signal,
   });
   const payloadHash = digestNormalized(payload);
-  const existing = input.db.prepare("SELECT payload_hash FROM linear_outbox WHERE id = ?").get(id) as
+  const existing = input.db.prepare("SELECT payload_hash FROM control_outbox WHERE id = ?").get(id) as
     | { payload_hash: string }
     | undefined;
   if (existing) {
     if (existing.payload_hash !== payloadHash) {
-      throw new Error(`linear issue-state outbox ${id} already exists with different intent`);
+      throw new Error(`control issue-state outbox ${id} already exists with different intent`);
     }
     return;
   }
-  insertPendingLinearOutbox({
+  insertPendingControlOutbox({
     db: input.db,
     id,
-    linearSessionId: input.instance.linear_session_id,
-    linearIssueId: input.instance.linear_issue_id,
+    sessionId: input.instance.session_id,
+    ticketId: input.instance.ticket_id,
     kind: "issue_state",
     payload,
     timestamp: input.timestamp,
@@ -474,20 +474,20 @@ export function createPipelinePublicationWriter(db: Database.Database) {
   return (input: {
     instance: PipelineInstance;
     attemptId: string | null;
-    kind: "linear_ledger" | "github_summary";
+    kind: "control_ledger" | "github_summary";
     idempotencyKey: string;
     payload: string;
     timestamp: string;
   }): PipelinePublicationReceipt => {
     const envelope = parsePipelinePublication(input.payload);
     if (envelope.pipeline.instance_id !== input.instance.id ||
-        envelope.pipeline.linear_issue_id !== input.instance.linear_issue_id ||
+        envelope.pipeline.ticket_id !== input.instance.ticket_id ||
         envelope.pipeline.generation !== input.instance.generation ||
         envelope.pipeline.manifest_digest !== input.instance.manifest_digest) {
       throw new Error("pipeline publication instance fence mismatch");
     }
     const payloadHash = publicationPayloadHash(envelope);
-    if (input.kind === "linear_ledger") {
+    if (input.kind === "control_ledger") {
       const id = deterministicPublicationId(input.idempotencyKey);
       const existing = db.prepare(`
         SELECT * FROM pipeline_publication_receipts WHERE idempotency_key = ?
@@ -505,7 +505,7 @@ export function createPipelinePublicationWriter(db: Database.Database) {
           id, pipeline_instance_id, attempt_id, kind, idempotency_key,
           payload, payload_hash, status, attempts, next_attempt_at,
           resume_status, created_at, updated_at
-        ) VALUES (?, ?, ?, 'linear_ledger', ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, 'control_ledger', ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
       `).run(
         id,
         input.instance.id,
@@ -518,11 +518,14 @@ export function createPipelinePublicationWriter(db: Database.Database) {
         input.timestamp,
         input.timestamp
       );
+      // This prefix is part of the durable projection identity, not provider
+      // routing vocabulary. Keep it stable so a v35 upgrade updates the
+      // existing status comment instead of creating a duplicate projection.
       const statusId = deterministicPublicationId(`linear-status:${input.instance.id}`);
       const statusPayload = pipelineStatusOutboxPayload(envelope);
       db.prepare(`
-        INSERT INTO linear_outbox (
-          id, linear_session_id, linear_issue_id, run_id, sequence, kind,
+        INSERT INTO control_outbox (
+          id, session_id, ticket_id, run_id, sequence, kind,
           payload, payload_hash, status, attempts, next_attempt_at, created_at
         ) VALUES (?, ?, ?, NULL, ?, 'pipeline_status', ?, ?, 'pending', 0, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
@@ -535,9 +538,9 @@ export function createPipelinePublicationWriter(db: Database.Database) {
           processed_at = NULL
       `).run(
         statusId,
-        input.instance.linear_session_id,
-        input.instance.linear_issue_id,
-        nextLinearOutboxSequence(db, input.instance.linear_session_id),
+        input.instance.session_id,
+        input.instance.ticket_id,
+        nextControlOutboxSequence(db, input.instance.session_id),
         statusPayload,
         digestNormalized(statusPayload),
         input.timestamp,
@@ -545,11 +548,11 @@ export function createPipelinePublicationWriter(db: Database.Database) {
       );
       if (shouldPostLinearEventComment(envelope)) {
         const outboxPayload = pipelinePublicationOutboxPayload(envelope);
-        insertPendingLinearOutbox({
+        insertPendingControlOutbox({
           db,
           id,
-          linearSessionId: input.instance.linear_session_id,
-          linearIssueId: input.instance.linear_issue_id,
+          sessionId: input.instance.session_id,
+          ticketId: input.instance.ticket_id,
           kind: "pipeline_receipt",
           payload: outboxPayload,
           timestamp: input.timestamp,
@@ -568,8 +571,17 @@ export function createPipelinePublicationWriter(db: Database.Database) {
         timestamp: input.timestamp,
       });
     } else {
-      const stableKey = `github-summary:${input.instance.linear_issue_id}`;
-      const stableId = deterministicPublicationId(stableKey);
+      const existingProjection = db.prepare(`
+        SELECT ppr.id, ppr.idempotency_key
+        FROM pipeline_publication_receipts ppr
+        JOIN pipeline_instances prior ON prior.id = ppr.pipeline_instance_id
+        WHERE ppr.kind = 'github_summary' AND prior.ticket_id = ?
+        ORDER BY ppr.created_at, ppr.id
+        LIMIT 1
+      `).get(input.instance.ticket_id) as { id: string; idempotency_key: string } | undefined;
+      const stableKey = existingProjection?.idempotency_key ??
+        `github-summary:${input.instance.ticket_id}`;
+      const stableId = existingProjection?.id ?? deterministicPublicationId(stableKey);
       db.prepare(`
         INSERT INTO pipeline_publication_receipts (
           id, pipeline_instance_id, attempt_id, kind, idempotency_key,
@@ -619,8 +631,8 @@ export function persistSelectionPublications(input: {
   persistPublication({
     instance: input.instance,
     attemptId: null,
-    kind: "linear_ledger",
-    idempotencyKey: `linear-selection:${input.instance.id}`,
+    kind: "control_ledger",
+    idempotencyKey: `control-selection:${input.instance.id}`,
     payload: selection,
     timestamp: input.timestamp,
   });

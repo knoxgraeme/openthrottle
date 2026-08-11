@@ -713,9 +713,9 @@ function setupInstance({ db, pipelines, tickets, runtimeDescriptor, fixture, iss
   }).manifest;
   pipelines.acceptManifest(manifest);
   tickets.upsert({
-    linear_issue_id: issueId,
-    linear_issue_identifier: issueId,
-    linear_session_id: `session-${issueId}`,
+    ticket_id: issueId,
+    ticket_reference: issueId,
+    session_id: `session-${issueId}`,
     sandbox_id: null,
     branch: `ot/${issueId}`,
     agent: "claude",

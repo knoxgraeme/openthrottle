@@ -37,13 +37,16 @@ Compound Engineering. There is no second execution architecture.
   dispatch, publication, stop, or cleanup.
 - **Publication receipt:** a durable Linear or GitHub-facing publication with
   retry state.
+- **Ticket identity:** the stable internal `ticket_id` is provider-qualified
+  (`<control-provider>:<external-thread-id>`). Human-facing ticket references
+  are display labels and never command, routing, or persistence identity.
 - **Native session:** a Claude session, Codex thread, or OpenCode session used
   only when the manifest’s context policy permits continuation.
 
 ## Components
 
 - `supervisor/`: Hono control plane, SQLite state, webhook inbox, coordinator,
-  Daytona effects, GitHub provider handling, Linear outbox, sweep/recovery.
+  Daytona effects, GitHub provider handling, `control_outbox`, sweep/recovery.
 - `sandbox/`: sealed single-stage executor and agent runtime boundary.
 - `skills/`: thin OpenThrottle adapters over the pinned native CE plugin.
 - `cli/`: target-repository onboarding and operator commands.
@@ -576,9 +579,9 @@ merge webhook projects to the team's `completed` state. Failed and
 needs-human terminal outcomes do not advance the issue to completed. Projection
 delivery is idempotent and forward-only: issues already at or beyond the target,
 or manually moved to `completed` or `canceled`, are skipped. Projection delivery
-failures are logged and retried by the Linear outbox but never block the run,
-publication, provider evidence handling, or terminal acknowledgement. A Linear
-outbox row's retry is bounded (`MAX_LINEAR_OUTBOX_ATTEMPTS`): once a row keeps
+failures are logged and retried by `control_outbox` but never block the run,
+publication, provider evidence handling, or terminal acknowledgement. A
+`control_outbox` row's retry is bounded (`MAX_LINEAR_OUTBOX_ATTEMPTS`): once a row keeps
 failing without its error matching a recognized dead-token pattern, it goes
 `dead` after the attempt cap rather than retrying forever, so it stops
 head-of-line-blocking later same-session rows -- including a session's own
@@ -592,14 +595,14 @@ untrusted webhook bodies are never automatically attached to Linear or a PR.
 Each reportable child transition -- a unit repair round, a unit settling to
 `completed`/`exited`/`failed`, the whole-change final review passing or
 requesting a repair, the graph stopping, and aggregate emission -- inserts one
-row into `execution_publication_events` and its correlated `linear_outbox`
+row into `execution_publication_events` and its correlated `control_outbox`
 activity row in the same SQL transaction as the durable reducer transition
 that produced it (`supervisor/src/persistence/pipeline/unit-store.ts`). Both
 rows are addressed by a deterministic id derived from the parent attempt, unit,
 and transition, so a retried transaction is a pure no-op rather than a
 duplicate or re-sanitized insert. `execution_publication_events` carries its
 own strictly increasing `sequence` per parent attempt, independent of the
-`linear_outbox` session-wide sequence, giving a restart-safe, gap-free replay
+`control_outbox` session-wide sequence, giving a restart-safe, gap-free replay
 order for the structured graph specifically.
 
 The event body is sanitized and bounded (`bounded()` in
@@ -610,14 +613,14 @@ either no-ops against the existing row or re-derives the identical sanitized
 body from the same inputs. Only the bounded transition summary is durably
 recorded; raw prompts, logs, and command output are never captured here.
 
-The correlated `linear_outbox` row projects and is acknowledged through the
+The correlated `control_outbox` row projects and is acknowledged through the
 existing outbox processor and delivery ordering, but that delivery is an
 independent, separate concern from reading the ledger back: the structured
 ledger's restart-safe "Structured Activity Log" section (appended after the
 live per-unit status breakdown in both the Linear and GitHub publication
 bodies) renders directly from the `execution_publication_events` rows
 themselves (`listExecutionPublicationEvents`), ordered by that per-attempt
-sequence, without waiting on the correlated `linear_outbox` activity to reach
+sequence, without waiting on the correlated `control_outbox` activity to reach
 `processed`. Because each event row is inserted in the same transaction as the
 reportable transition it reports, this converges immediately from durable
 state -- including on the very same pass that emits an event (e.g. the
@@ -659,14 +662,18 @@ Bearer tokens are compared by hashed value with timing-safe equality. Webhook
 deliveries are acknowledged after durable claim and processed asynchronously
 through leases so restart does not lose accepted work.
 
-`GET /status` returns one block per ticket. For tickets with a pipeline
-instance, the nested `pipeline` object includes:
+`GET /status` returns one provider-neutral block per ticket. Its identity fields
+are `id` (the provider-qualified command and persistence identity), `reference`
+(the human-facing display label), `current_session_id`, `control_provider`, and
+`external_thread` (`provider`, provider-native `id`, and display `reference`).
+Operator commands and status filtering accept `id`, never `reference`. For
+tickets with a pipeline instance, the nested `pipeline` object includes:
 
 | Field | Meaning |
 |---|---|
 | `pipeline_id` | pinned pipeline manifest id |
 | `pipeline_version` | pinned pipeline manifest version |
-| `generation` | Linear session generation bound to the instance |
+| `generation` | control-session generation bound to the instance |
 | `status` | current pipeline instance status |
 | `terminal_outcome` | terminal pipeline outcome, or `null` while active |
 | `stage_id` | active stage id, falling back to the latest attempt stage |
@@ -704,7 +711,7 @@ its enforcement.
 SQLite is the authority. Core tables include:
 
 - ticket/run/session projections: `tickets`, `runs`, `agent_sessions`;
-- durable transport: `webhook_deliveries`, `linear_outbox`, `session_inbox`,
+- durable transport: `webhook_deliveries`, `control_outbox`, `session_inbox`,
   `sandbox_events`, `work_items`, `work_item_sources`, `work_deliveries`;
 - provider evidence: `provider_events`, `feedback_snapshots`,
   `feedback_snapshot_events`;
@@ -1017,7 +1024,7 @@ reportable transition, fenced to its exact execution graph/pipeline
 instance/parent attempt, carrying a per-attempt sequence, an event `kind`
 (`unit_repair`, `unit_settled`, `graph_stopped`, `final_review`, `aggregate`,
 `steering_undelivered`),
-its sanitized body, and the id of the `linear_outbox` row it produced in the
+its sanitized body, and the id of the `control_outbox` row it produced in the
 same transaction.
 
 ## Supervisor environment
@@ -1025,14 +1032,16 @@ same transaction.
 Required:
 
 - HTTP/storage: `SUPERVISOR_URL`, `OT_STATUS_TOKEN`, `OT_INSTALL_SECRET`;
-- Linear: `LINEAR_WEBHOOK_SECRET`, `LINEAR_CLIENT_ID`,
-  `LINEAR_CLIENT_SECRET`;
 - GitHub: `GITHUB_WEBHOOK_SECRET`, write-capable `GITHUB_TOKEN`, and
   read-only `GITHUB_READ_TOKEN`;
 - Daytona: `DAYTONA_API_KEY`.
 
 Optional/defaulted:
 
+- Linear control-provider readiness: `LINEAR_WEBHOOK_SECRET`,
+  `LINEAR_CLIENT_ID`, and `LINEAR_CLIENT_SECRET`. The supervisor may boot
+  without them; Linear registration, installation, and webhook endpoints then
+  report the provider as unavailable;
 - `PORT=8080`, `DATABASE_PATH=/data/openthrottle.db`,
   `DAYTONA_SNAPSHOT=openthrottle`;
 - `DEFAULT_AGENT=codex`, plus the selected agent credential:
@@ -1091,8 +1100,10 @@ their scopes. `openthrottle ship <plan.md>` creates a Linear issue and, when
 `OT_AGENT_APP_ID` is set, delegates it with `IssueUpdateInput.delegateId`;
 Linear emits that first delegation as an issue-only assignment-created agent
 session, so any graph selection or execution plan must be present in the child
-issue description. `status`, `stop`, `logs`, and `analysis` call authenticated supervisor
-endpoints; `analysis` filters `GET /analysis/runs` by `--outcome`, `--reason`,
+issue description. `status`, `stop`, `logs`, and `analysis` call authenticated
+supervisor endpoints. Ticket-targeting commands and `status` filtering use the
+provider-qualified ticket `id`; status output leads with the human-facing
+`reference`. `analysis` filters `GET /analysis/runs` by `--outcome`, `--reason`,
 `--attribution`, `--graph`, `--skill-digest`, `--from`, `--to`, and `--limit`.
 
 An explicit structured (unit-consuming) graph selection adds one pre-mutation

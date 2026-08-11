@@ -11,9 +11,9 @@ describe("run store", () => {
     db = openDb(":memory:");
     store = createSupervisorStore(db);
     store.upsertUnpinned({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",

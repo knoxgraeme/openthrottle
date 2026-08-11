@@ -155,7 +155,7 @@ async function main() {
         postActivity: async (activity, event) => {
           const row = store.enqueueLinearOutbox({
             id: event.event_id,
-            linearSessionId: activity.sessionId,
+            sessionId: activity.sessionId,
             issueId: event.issueId,
             runId: event.run_id,
             kind: "activity",
@@ -203,7 +203,7 @@ async function main() {
         store,
         canReceiveSteering: (ticket) => canSteerPipelineRun({
           store: pipelineStore,
-          sessionId: ticket.linear_session_id,
+          sessionId: ticket.session_id,
           runId: ticket.run_id,
           agent: ticket.agent,
         }),

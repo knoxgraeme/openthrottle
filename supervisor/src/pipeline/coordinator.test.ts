@@ -104,9 +104,9 @@ describe("pipeline coordinator", () => {
     });
     const manifest = catalog.manifests.get(manifestKey)!;
     tickets.upsert({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "ISSUE-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "ISSUE-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/issue-1",
       agent: "codex",
@@ -323,10 +323,10 @@ describe("pipeline coordinator", () => {
   it("releases the runtime with a cleanup effect on every terminal outcome", () => {
     const { manifest, instance, attempt, stages } = setup();
     const terminals = [
-      { outcome: "needs_human", terminal: "needs_human", kinds: ["publish_linear", "cleanup"] },
-      { outcome: "canceled", terminal: "canceled", kinds: ["publish_linear", "cleanup"] },
-      { outcome: "superseded", terminal: "superseded", kinds: ["publish_linear", "cleanup"] },
-      { outcome: "failure", terminal: "failed", kinds: ["publish_linear", "stop", "cleanup"] },
+      { outcome: "needs_human", terminal: "needs_human", kinds: ["publish_control", "cleanup"] },
+      { outcome: "canceled", terminal: "canceled", kinds: ["publish_control", "cleanup"] },
+      { outcome: "superseded", terminal: "superseded", kinds: ["publish_control", "cleanup"] },
+      { outcome: "failure", terminal: "failed", kinds: ["publish_control", "stop", "cleanup"] },
     ] as const;
     for (const { outcome, terminal, kinds } of terminals) {
       const write = reducePipelineEvent({
@@ -359,7 +359,7 @@ describe("pipeline coordinator", () => {
     expect(completed.terminal_outcome).toBe("shipped");
     expect(pipelines.listEffects(instance.id).map((effect) => effect.kind)).toEqual([
       "provision",
-      "publish_linear",
+      "publish_control",
       "publish_github",
       "cleanup",
     ]);
@@ -415,7 +415,7 @@ describe("pipeline coordinator", () => {
     const outcome = createRunOutcomeStore(db!).getRunOutcome(instance.id);
     expect(outcome).toMatchObject({
       pipeline_instance_id: instance.id,
-      linear_issue_id: instance.linear_issue_id,
+      ticket_id: instance.ticket_id,
       generation: instance.generation,
       generations_consumed: instance.generation,
       execution_graph_id: null,
@@ -1087,7 +1087,7 @@ describe("pipeline coordinator", () => {
     const effectsAfterFirst = pipelines.listEffects(instance.id);
     expect(effectsAfterFirst.map((effect) => effect.kind)).toEqual([
       "provision",
-      "publish_linear",
+      "publish_control",
       "publish_github",
       "cleanup",
     ]);
@@ -1098,8 +1098,8 @@ describe("pipeline coordinator", () => {
       "SELECT COUNT(*) AS count FROM pipeline_publication_receipts WHERE pipeline_instance_id = ?"
     ).get(instance.id) as { count: number };
     const outboxAfterFirst = db!.prepare(
-      "SELECT COUNT(*) AS count FROM linear_outbox WHERE linear_session_id = ?"
-    ).get(instance.linear_session_id) as { count: number };
+      "SELECT COUNT(*) AS count FROM control_outbox WHERE session_id = ?"
+    ).get(instance.session_id) as { count: number };
 
     const restartedStore = createPipelineStore(db!);
     const replay = coordinatePipelineEvent(restartedStore, terminal);
@@ -1113,8 +1113,8 @@ describe("pipeline coordinator", () => {
       "SELECT COUNT(*) AS count FROM pipeline_publication_receipts WHERE pipeline_instance_id = ?"
     ).get(instance.id)).toEqual(receiptsAfterFirst);
     expect(db!.prepare(
-      "SELECT COUNT(*) AS count FROM linear_outbox WHERE linear_session_id = ?"
-    ).get(instance.linear_session_id)).toEqual(outboxAfterFirst);
+      "SELECT COUNT(*) AS count FROM control_outbox WHERE session_id = ?"
+    ).get(instance.session_id)).toEqual(outboxAfterFirst);
   });
 
   it("projects notable repair stages into run notes without changing transitions", () => {
@@ -1145,12 +1145,12 @@ describe("pipeline coordinator", () => {
     }));
 
     expect(result.active_stage_id).not.toBe("repair_implementation");
-    const notes = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+    const notes = pipelines.listJournalEntries({ issueId: instance.ticket_id })
       .filter((entry) => entry.kind === "run_note");
     expect(notes).toHaveLength(1);
     expect(notes[0]).toMatchObject({
       actor: "stage_agent",
-      issue: "ISSUE-1",
+        issue: "issue-1",
       repository: "owner/repo",
       instance_id: instance.id,
       outcome: "success",
@@ -1176,7 +1176,7 @@ describe("pipeline coordinator", () => {
     }));
 
     expect(result.active_stage_id).toBe("semantic_review");
-    expect(pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+    expect(pipelines.listJournalEntries({ issueId: instance.ticket_id })
       .filter((entry) => entry.kind === "run_note")).toEqual([]);
   });
 
@@ -1204,7 +1204,7 @@ describe("pipeline coordinator", () => {
       summary: "Implemented the planned change.",
     }));
 
-    const notes = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+    const notes = pipelines.listJournalEntries({ issueId: instance.ticket_id })
       .filter((entry) => entry.trigger === `${attempt.stage_id} structured publication`);
     expect(notes).toHaveLength(1);
     expect(notes[0]).toMatchObject({
@@ -1229,7 +1229,7 @@ describe("pipeline coordinator", () => {
     }));
 
     expect(result.active_stage_id).toBe("implementation");
-    const notes = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+    const notes = pipelines.listJournalEntries({ issueId: instance.ticket_id })
       .filter((entry) => entry.kind === "run_note");
     expect(notes).toHaveLength(1);
     expect(notes[0]).toMatchObject({
@@ -1411,7 +1411,7 @@ describe("pipeline coordinator", () => {
     expect(exhausted.nextStatus).toBe("completion_pending_publication");
     expect(exhausted.terminalOutcome).toBe("failed");
     expect(exhausted.nextAttempt).toBeUndefined();
-    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "stop", "cleanup"]);
+    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_control", "stop", "cleanup"]);
     expect(exhausted.effects[2]).toMatchObject({
       idempotencyKey: `cleanup:${instance.id}:failed`,
     });
@@ -1426,7 +1426,7 @@ describe("pipeline coordinator", () => {
     expect(attemptsExhausted.waitReason).toMatch(/attempt limit/);
     expect(attemptsExhausted.nextAttempt).toBeUndefined();
     expect(attemptsExhausted.effects.map((effect) => effect.kind))
-      .toEqual(["publish_linear", "stop", "cleanup"]);
+      .toEqual(["publish_control", "stop", "cleanup"]);
   });
 
   it("enforces authored ordinary loop rounds independently of transition re-entry caps", () => {
@@ -1716,7 +1716,7 @@ describe("pipeline coordinator", () => {
     expect(exhausted.terminalOutcome).toBe("failed");
     expect(exhausted.waitReason).toBe("pipeline repair round limit 5 exhausted");
     expect(exhausted.nextAttempt).toBeUndefined();
-    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "stop", "cleanup"]);
+    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_control", "stop", "cleanup"]);
   });
 
   it("persists a complete immutable request for a repair attempt", () => {
@@ -1870,7 +1870,7 @@ describe("pipeline coordinator", () => {
       contextPolicy: "none",
       nativeSessionId: null,
     });
-    expect(write.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "idle"]);
+    expect(write.effects.map((effect) => effect.kind)).toEqual(["publish_control", "idle"]);
     expect(write.effects.find((effect) => effect.kind === "idle")).toMatchObject({
       idempotencyKey: `idle:${instance.id}:provider:${write.nextAttempt!.id}`,
     });
@@ -2072,15 +2072,15 @@ describe("pipeline coordinator", () => {
         resumeStatus: terminal,
         nextStatus: "completion_pending_publication",
       });
-      expect(write.effects.map((effect) => effect.kind)).toEqual(["publish_linear", "stop"]);
+      expect(write.effects.map((effect) => effect.kind)).toEqual(["publish_control", "stop"]);
       expect(write.effects.find((effect) => effect.kind === "cleanup")).toBeUndefined();
-      expect(write.effects.find((effect) => effect.kind === "publish_linear")?.payload)
+      expect(write.effects.find((effect) => effect.kind === "publish_control")?.payload)
         .toBe(JSON.stringify({ publication: "deferred_to_coordinator" }));
 
       coordinatePipelineEvent(pipelines, input);
 
       const effects = pipelines.listEffects(instance.id);
-      expect(effects.filter((effect) => effect.kind === "publish_linear")).toHaveLength(1);
+      expect(effects.filter((effect) => effect.kind === "publish_control")).toHaveLength(1);
       expect(effects.filter((effect) => effect.kind === "publish_github")).toHaveLength(1);
       expect(effects.filter((effect) => effect.kind === "stop")).toHaveLength(1);
       expect(effects.find((effect) => effect.id === `idle-before-${kind}`)).toMatchObject({
@@ -2088,7 +2088,7 @@ describe("pipeline coordinator", () => {
         last_error: "canceled by a terminal pipeline control event",
       });
       expect(effects.find((effect) => effect.kind === "cleanup")).toBeUndefined();
-      expect(effects.find((effect) => effect.kind === "publish_linear")?.payload)
+      expect(effects.find((effect) => effect.kind === "publish_control")?.payload)
         .toContain("\"schema\":\"openthrottle.pipeline-publication/v1\"");
     }
   });
@@ -2271,9 +2271,9 @@ describe("pipeline coordinator", () => {
       });
       const manifest = catalog.manifests.get("core/implement@4")!;
       tickets.upsert({
-        linear_issue_id: "issue-1",
-        linear_issue_identifier: "ISSUE-1",
-        linear_session_id: "session-1",
+        ticket_id: "issue-1",
+        ticket_reference: "ISSUE-1",
+        session_id: "session-1",
         sandbox_id: null,
         branch: "ot/issue-1",
         agent: "codex",
@@ -2323,9 +2323,9 @@ describe("pipeline coordinator", () => {
       expect(activityLogKinds(githubSummaryEnvelope(db, instance.id).payload)).toEqual(expectedKinds);
       const terminalLedgerId = db.prepare(`
         SELECT id FROM pipeline_publication_receipts
-        WHERE pipeline_instance_id = ? AND kind = 'linear_ledger'
+        WHERE pipeline_instance_id = ? AND kind = 'control_ledger'
           AND idempotency_key = ?
-      `).get(instance.id, `linear-terminal:${instance.id}:no_change`) as { id: string } | undefined;
+      `).get(instance.id, `control-terminal:${instance.id}:no_change`) as { id: string } | undefined;
       expect(terminalLedgerId).toBeDefined();
       const terminalLedgerPayload = (db.prepare(
         "SELECT payload FROM pipeline_publication_receipts WHERE id = ?"
@@ -2333,7 +2333,7 @@ describe("pipeline coordinator", () => {
       expect(activityLogKinds(terminalLedgerPayload)).toEqual(expectedKinds);
 
       const pendingBeforeDelivery = db.prepare(
-        "SELECT COUNT(*) AS count FROM linear_outbox WHERE status = 'processed'"
+        "SELECT COUNT(*) AS count FROM control_outbox WHERE status = 'processed'"
       ).get() as { count: number };
       expect(pendingBeforeDelivery.count).toBe(0);
 
@@ -2398,7 +2398,7 @@ describe("pipeline coordinator", () => {
       }
 
       const stillPending = db.prepare(
-        "SELECT COUNT(*) AS count FROM linear_outbox WHERE status != 'processed'"
+        "SELECT COUNT(*) AS count FROM control_outbox WHERE status != 'processed'"
       ).get() as { count: number };
       expect(stillPending.count).toBe(0);
       const deliveredTerminalReceipt = deliveredActivityBodies.find((body) =>

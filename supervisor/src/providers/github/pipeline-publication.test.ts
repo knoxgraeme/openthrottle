@@ -53,9 +53,9 @@ describe("github publication delivery", () => {
     });
     const manifest = catalog.manifests.get(manifestKey)!;
     tickets.upsert({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "ISSUE-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "ISSUE-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/issue-1",
       agent: "codex",
@@ -140,7 +140,7 @@ describe("github publication delivery", () => {
 
   it("reconciles every update into one durable neutral GitHub summary", async () => {
     const { tickets, pipelines, instance, attempt } = setup();
-    tickets.setPrUrl(instance.linear_issue_id, "https://github.com/owner/repo/pull/9");
+    tickets.setPrUrl(instance.ticket_id, "https://github.com/owner/repo/pull/9");
     let commentExists = false;
     const methods: string[] = [];
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -150,7 +150,7 @@ describe("github publication delivery", () => {
       if (url.endsWith("/issues/9/comments?per_page=100")) {
         return Response.json(commentExists ? [{
           id: 77,
-          body: `<!-- openthrottle:pipeline-summary:${instance.linear_issue_id} -->\nold`,
+          body: `<!-- openthrottle:pipeline-summary:${instance.ticket_id} -->\nold`,
           html_url: "https://github.com/owner/repo/pull/9#issuecomment-77",
         }] : []);
       }
@@ -183,7 +183,7 @@ describe("github publication delivery", () => {
 
   it("surfaces a permanent GitHub summary failure as publication-blocked", async () => {
     const { tickets, pipelines, instance } = setup();
-    tickets.setPrUrl(instance.linear_issue_id, "https://github.com/owner/repo/pull/9");
+    tickets.setPrUrl(instance.ticket_id, "https://github.com/owner/repo/pull/9");
     const processor = createGithubPublicationProcessor({
       store: pipelines,
       tickets,
@@ -197,7 +197,7 @@ describe("github publication delivery", () => {
       .find((row) => row.kind === "github_summary")!;
     expect(publication.status).toBe("dead");
     expect(pipelines.getInstance(instance.id)?.status).toBe("publication_blocked");
-    expect(pipelines.getStatusForIssue(instance.linear_issue_id)).toMatchObject({
+    expect(pipelines.getStatusForIssue(instance.ticket_id)).toMatchObject({
       publication_state: "blocked",
       publication_id: publication.id,
     });
@@ -206,7 +206,7 @@ describe("github publication delivery", () => {
       SET updated_at = '2999-01-01T00:00:00.000Z'
       WHERE pipeline_instance_id = ? AND id <> ?
     `).run(instance.id, publication.id);
-    expect(pipelines.getStatusForIssue(instance.linear_issue_id)).toMatchObject({
+    expect(pipelines.getStatusForIssue(instance.ticket_id)).toMatchObject({
       publication_state: "blocked",
       publication_id: publication.id,
       recovery_action: expect.stringContaining(publication.id),
@@ -217,7 +217,7 @@ describe("github publication delivery", () => {
 
   it("does not leave a GitHub summary receipt reclaimable when the processed CAS returns false", async () => {
     const { tickets, pipelines, instance } = setup();
-    tickets.setPrUrl(instance.linear_issue_id, "https://github.com/owner/repo/pull/9");
+    tickets.setPrUrl(instance.ticket_id, "https://github.com/owner/repo/pull/9");
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
@@ -251,11 +251,11 @@ describe("github publication delivery", () => {
 
   it("never sends an unbound summary to a replacement session's pull request", async () => {
     const { tickets, pipelines, instance } = setup();
-    tickets.setPrUrl(instance.linear_issue_id, "https://github.com/owner/repo/pull/9");
+    tickets.setPrUrl(instance.ticket_id, "https://github.com/owner/repo/pull/9");
     tickets.upsert({
-      linear_issue_id: instance.linear_issue_id,
-      linear_issue_identifier: "ISSUE-1",
-      linear_session_id: "session-2",
+      ticket_id: instance.ticket_id,
+      ticket_reference: "ISSUE-1",
+      session_id: "session-2",
       sandbox_id: null,
       branch: "ot/issue-1-next",
       agent: "codex",

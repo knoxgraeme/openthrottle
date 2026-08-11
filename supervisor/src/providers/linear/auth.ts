@@ -42,6 +42,10 @@ export function createLinearClientProvider(
         console.error("[linear] OAuth access token expired and no refresh token is stored");
         return undefined;
       }
+      if (!cfg.linearClientId || !cfg.linearClientSecret) {
+        console.error("[linear] OAuth refresh unavailable because LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET are not configured");
+        return undefined;
+      }
       const token = await refreshLinearOAuthToken({
         clientId: cfg.linearClientId,
         clientSecret: cfg.linearClientSecret,

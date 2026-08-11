@@ -57,9 +57,9 @@ export interface Config {
   statusToken: string;
   installSecret: string;
 
-  linearWebhookSecret: string;
-  linearClientId: string;
-  linearClientSecret: string;
+  linearWebhookSecret: string | undefined;
+  linearClientId: string | undefined;
+  linearClientSecret: string | undefined;
 
   githubWebhookSecret: string;
   githubToken: string;
@@ -98,9 +98,9 @@ export function loadConfig(): Config {
     statusToken: required("OT_STATUS_TOKEN"),
     installSecret: required("OT_INSTALL_SECRET"),
 
-    linearWebhookSecret: required("LINEAR_WEBHOOK_SECRET"),
-    linearClientId: required("LINEAR_CLIENT_ID"),
-    linearClientSecret: required("LINEAR_CLIENT_SECRET"),
+    linearWebhookSecret: process.env.LINEAR_WEBHOOK_SECRET,
+    linearClientId: process.env.LINEAR_CLIENT_ID,
+    linearClientSecret: process.env.LINEAR_CLIENT_SECRET,
 
     githubWebhookSecret: required("GITHUB_WEBHOOK_SECRET"),
     githubToken: required("GITHUB_TOKEN"),
@@ -148,6 +148,11 @@ export function loadConfig(): Config {
   if (!cfg.kimiCodeApiKey) {
     console.warn(
       "[config] KIMI_CODE_API_KEY is not set — opencode agent will not be usable"
+    );
+  }
+  if (!cfg.linearWebhookSecret || !cfg.linearClientId || !cfg.linearClientSecret) {
+    console.warn(
+      "[config] LINEAR_* is incomplete — Linear control webhooks and installation will be unavailable"
     );
   }
   requireRange("PORT", cfg.port, 1, 65_535);

@@ -27,7 +27,15 @@ describe('operator commands', () => {
       async (_input: string | URL | Request, _init?: RequestInit) => Response.json({
         tickets: [
           {
-            linear_issue_identifier: 'OT-1',
+            id: 'linear:issue-1',
+            reference: 'OT-1',
+            current_session_id: 'session-1',
+            control_provider: 'linear',
+            external_thread: {
+              provider: 'linear',
+              id: 'issue-1',
+              reference: 'OT-1',
+            },
             branch: 'ot/ot-1',
             agent: 'codex',
             state: 'active',
@@ -35,7 +43,15 @@ describe('operator commands', () => {
             updated_at: '2026-07-18T00:00:00.000Z',
           },
           {
-            linear_issue_identifier: 'OT-PIPE',
+            id: 'github:discussion-2',
+            reference: 'GH-2',
+            current_session_id: 'session-2',
+            control_provider: 'github',
+            external_thread: {
+              provider: 'github',
+              id: 'discussion-2',
+              reference: 'owner/repo#2',
+            },
             branch: 'ot/pipe',
             agent: 'codex',
             state: 'active',
@@ -99,6 +115,12 @@ describe('operator commands', () => {
     expect(headers.get('Authorization')).toBe('Bearer operator-token');
     const printed = output.mock.calls.flat().join('\n');
     expect(printed).toContain('OT-1');
+    expect(printed).toContain('id: linear:issue-1');
+    expect(printed).toContain('session: session-1');
+    expect(printed).toContain('control: linear');
+    expect(printed).toContain('external thread: OT-1 (linear:issue-1)');
+    expect(printed).toContain('GH-2');
+    expect(printed).toContain('external thread: owner/repo#2 (github:discussion-2)');
     expect(printed).toContain('ce/implement@1');
     expect(printed).toContain('publication_blocked');
     expect(printed).toContain('whose move: waiting on you');
@@ -115,7 +137,11 @@ describe('operator commands', () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({
       tickets: [
         {
-          linear_issue_identifier: 'OT-1',
+          id: 'linear:issue-1',
+          reference: 'OT-1',
+          current_session_id: 'session-1',
+          control_provider: 'linear',
+          external_thread: { provider: 'linear', id: 'issue-1', reference: 'OT-1' },
           branch: 'ot/ot-1',
           agent: 'codex',
           state: 'active',
@@ -124,7 +150,11 @@ describe('operator commands', () => {
           pipeline: null,
         },
         {
-          linear_issue_identifier: 'OT-2',
+          id: 'linear:issue-2',
+          reference: 'OT-2',
+          current_session_id: 'session-2',
+          control_provider: 'linear',
+          external_thread: { provider: 'linear', id: 'issue-2', reference: 'OT-2' },
           branch: 'ot/ot-2',
           agent: 'codex',
           state: 'active',
@@ -136,11 +166,34 @@ describe('operator commands', () => {
     })));
     const output = vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
-    await status('OT-2');
+    await status('linear:issue-2');
 
     const printed = output.mock.calls.flat().join('\n');
     expect(printed).toContain('OT-2');
     expect(printed).not.toContain('OT-1');
+  });
+
+  it('does not treat a display reference as a status command identity', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      tickets: [{
+        id: 'linear:issue-2',
+        reference: 'OT-2',
+        current_session_id: 'session-2',
+        control_provider: 'linear',
+        external_thread: { provider: 'linear', id: 'issue-2', reference: 'OT-2' },
+        branch: 'ot/ot-2',
+        agent: 'codex',
+        state: 'active',
+        pr_url: null,
+        updated_at: '2026-07-18T00:01:00.000Z',
+        pipeline: null,
+      }],
+    })));
+    const output = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    await status('OT-2');
+
+    expect(output).toHaveBeenCalledWith('(no ticket OT-2)');
   });
 
   it('prints an empty filtered status result clearly', async () => {
@@ -203,7 +256,7 @@ describe('operator commands', () => {
         runs: [
           {
             pipeline_instance_id: 'instance-1',
-            linear_issue_id: 'issue-1',
+            ticket_id: 'github:discussion-1',
             generation: 1,
             execution_graph_id: 'graph-1',
             plan_digest: 'plan-digest',
@@ -229,7 +282,9 @@ describe('operator commands', () => {
       expect.objectContaining({ headers: expect.any(Headers), signal: expect.any(AbortSignal) })
     );
     const printed = output.mock.calls.flat().join('\n');
+    expect(printed).toMatch(/^instance\s+ticket\s+outcome/m);
     expect(printed).toContain('instance-1');
+    expect(printed).toContain('github:discussion-1');
     expect(printed).toContain('shipped');
     expect(printed).toContain('graph-1');
   });

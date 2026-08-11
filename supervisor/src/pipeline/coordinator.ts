@@ -84,7 +84,7 @@ function terminalStatus(_outcome: PipelineOutcome): PipelineInstanceStatus {
 
 function publishLinearEffect(idempotencyKey: string): CoordinatorEffectWrite {
   return {
-    kind: "publish_linear",
+    kind: "publish_control",
     idempotencyKey,
     payload: canonicalJson({ publication: "deferred_to_coordinator" }),
   };
@@ -376,8 +376,8 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     stage,
     attemptId: id,
     runId: plannedRunId,
-    issueId: input.instance.linear_issue_id,
-    sessionId: input.instance.linear_session_id,
+    issueId: input.instance.ticket_id,
+    sessionId: input.instance.session_id,
     generation: input.instance.generation,
     taskType: input.instance.task_type,
     taskContext,
@@ -524,12 +524,12 @@ function attachPublicationEffects(input: {
   attemptId: string;
   receiptHash: string;
 }): void {
-  const linear = input.write.effects.find((effect) => effect.kind === "publish_linear");
+  const linear = input.write.effects.find((effect) => effect.kind === "publish_control");
   if (linear) {
     linear.payload = input.publication;
   } else {
     input.write.effects.push({
-      kind: "publish_linear",
+      kind: "publish_control",
       idempotencyKey: `linear-gate:${input.instanceId}:${input.attemptId}:${input.receiptHash}`,
       payload: input.publication,
     });
@@ -553,7 +553,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       ...input,
       eventPayloadHash,
       terminal,
-      publishIdempotencyKey: `linear-terminal:${input.instance.id}:${terminal}`,
+      publishIdempotencyKey: `control-terminal:${input.instance.id}:${terminal}`,
       cleanup: false,
       effects: [{
         kind: "stop",
@@ -683,7 +683,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
           payload: nextAttempt.requestPayload,
         }
       : {
-          kind: "publish_linear" as const,
+          kind: "publish_control" as const,
           idempotencyKey: `linear-wait:${input.instance.id}:${target.id}:${nextAttempt.id}`,
           payload: canonicalJson({
             pipelineInstanceId: input.instance.id,
@@ -735,7 +735,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
     ...input,
     eventPayloadHash,
     terminal,
-    publishIdempotencyKey: `linear-terminal:${input.instance.id}:${terminal}`,
+    publishIdempotencyKey: `control-terminal:${input.instance.id}:${terminal}`,
     immutableSubject: input.event.subject ?? null,
     publishedCommit: publishedCommitForEvent(input, stage),
     publishedSubject: publishedSubjectForEvent(input, stage),
