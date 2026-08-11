@@ -68,7 +68,7 @@ export function createAdmissionStore(
     "SELECT * FROM tickets WHERE control_provider = ? AND external_thread_id = ?"
   );
   const getByIdentifierStmt = db.prepare(
-    "SELECT * FROM tickets WHERE lower(ticket_reference) = lower(?)"
+    "SELECT * FROM tickets WHERE lower(ticket_reference) = lower(?) ORDER BY created_at, ticket_id"
   );
   const getByBranchStmt = db.prepare("SELECT * FROM tickets WHERE repo = ? AND branch = ?");
   const getByPrUrlStmt = db.prepare(
@@ -246,7 +246,8 @@ export function createAdmissionStore(
       return getByExternalThreadStmt.get(provider, externalThreadId) as Ticket | undefined;
     },
     getByIdentifier(identifier) {
-      return getByIdentifierStmt.get(identifier) as Ticket | undefined;
+      const matches = getByIdentifierStmt.all(identifier) as Ticket[];
+      return matches.length === 1 ? matches[0] : undefined;
     },
     getByBranch(repo, branch) {
       return getByBranchStmt.get(repo, branch) as Ticket | undefined;
