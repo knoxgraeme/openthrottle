@@ -2,7 +2,7 @@
 // =============================================================================
 // openthrottle CLI entrypoint — a plain argv router, no CLI framework.
 //
-// Usage: openthrottle <setup|init|plan|validate|ship|status|stop|logs> [args]
+// Usage: openthrottle <setup|init|plan|validate|ship|status|stop|logs|operator-skill> [args]
 // =============================================================================
 
 const USAGE = `openthrottle — plan-first autonomous coding pipeline CLI
@@ -32,6 +32,9 @@ Usage:
                                     improvement proposals: --outcome, --reason,
                                     --attribution, --graph, --skill-digest,
                                     --from, --to, --limit.
+  openthrottle operator-skill <install|status|refresh|remove> [--json]
+                                    Manage the explicit local OpenThrottle
+                                    operator skill through pinned Skillfish.
 
   openthrottle --help              Show this message.
   openthrottle --version           Print the CLI version.
@@ -84,6 +87,11 @@ async function main(): Promise<void> {
     case 'analysis': {
       const { default: analysis } = await import('./analysis.js');
       await analysis(rest);
+      break;
+    }
+    case 'operator-skill': {
+      const { default: operatorSkill } = await import('./operator-skill.js');
+      await operatorSkill(rest);
       break;
     }
     case '--version':
