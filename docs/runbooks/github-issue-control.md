@@ -78,7 +78,12 @@ upserts the route. Linear team fields are rejected for GitHub control.
 
 Ensure `.openthrottle.yml` permits the structured graph and sets `agent: codex`.
 The generated config includes both `simple` and `structured`; do not hand-edit
-around config validation.
+around config validation. Before applying the activation label, apply the exact
+GitHub Issue label `agent:codex`. This pins the admission engine on the Issue
+itself; do not rely on a remembered repository default. If an exercise omits
+that label, first verify the supervisor's registered default agent is Codex in
+the live repository registration, then record that verification with the
+exercise evidence.
 
 Prepare or validate the markdown plan before opening the GitHub Issue:
 
@@ -105,15 +110,19 @@ Continue only when the response includes `graph/for-each-unit@1` and a nonempty
 
 ## Activate from a GitHub Issue
 
-Create an open GitHub Issue in `OWNER/REPO`. The Issue body must contain the
-prepared plan text and its `openthrottle.execution-plan/v1` block. Do not put
-credentials or operator-only values in the Issue.
+Create an open GitHub Issue in `OWNER/REPO`. Its complete body, including the
+prepared plan text and the `openthrottle.execution-plan/v1` block, must fit the
+20,000-character admission limit. Count the final body before creating or
+editing the Issue; shortening only the prose while omitting the execution-plan
+block is not valid structured input. Do not put credentials or operator-only
+values in the Issue.
 
-Apply the exact lowercase `openthrottle` label to start the generation. Opening
-or reopening an already-labeled Issue is equivalent. The supervisor admits the
-Issue only if the repository is registered for GitHub control, the actor is
-authorized, the webhook signature is valid, and the live Issue state still
-matches the activation event.
+After `agent:codex` is present and the complete body is within the admission
+bound, apply the exact lowercase `openthrottle` label to start the generation.
+Opening or reopening an already-labeled Issue is equivalent. The supervisor
+admits the Issue only if the repository is registered for GitHub control, the
+actor is authorized, the webhook signature is valid, and the live Issue state
+still matches the activation event.
 
 Plain comments from authorized collaborators are steering for the current
 generation. Closing the Issue requests stop for every nonterminal stage,
@@ -166,10 +175,11 @@ npx openthrottle stop "<ticket-id-from-status>"
 ```
 
 `Stop requested for ...` means the supervisor accepted the stop and returned
-`202 stop_requested`; the durable stop effect has not acknowledged yet.
-`Stopped ...` means the supervisor returned `200 stopped`; the live run is gone
-and the stop effect is acknowledged. Re-run focused status until the ticket is
-terminal or the effect is no longer pending.
+`202 stop_requested`; the durable stop effect has not acknowledged yet. After
+that response, do not treat a terminal ticket status by itself as proof that
+the runtime stopped. Require both durable stop-effect acknowledgement and live
+run absence, confirmed by a `200 stopped` response, before considering the
+stop complete. Re-run focused status until both conditions are true.
 
 If termination cannot be confirmed, retain the supervisor's durable evidence
 and follow the rollout runbook's quarantine guidance. Do not manually delete a
