@@ -2091,9 +2091,13 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it.each(["Keep it up!", "Delightful!"])(
-    "routes exact trusted Codex clean review completion with %s as successful current-head evidence",
-    async (encouragement) => {
+  it.each([
+    { encouragement: "Keep it up!", userType: "Bot" },
+    { encouragement: "Delightful!", userType: "Bot" },
+    { encouragement: "Keep it up!", userType: undefined },
+  ])(
+    "routes exact trusted Codex clean review completion with $encouragement and user type $userType as successful current-head evidence",
+    async ({ encouragement, userType }) => {
       const fixture = setup("core/implement@4");
       const activityPublisher = {
         publishActivity: vi.fn(async () => undefined),
@@ -2122,7 +2126,10 @@ describe("deterministic supervisor stage gates", () => {
             id,
             body,
             html_url: `https://github.com/owner/repo/pull/1#issuecomment-${id}`,
-            user: { login: CODEX_CONNECTOR_LOGIN, type: "Bot" },
+            user: {
+              login: CODEX_CONNECTOR_LOGIN,
+              ...(userType === undefined ? {} : { type: userType }),
+            },
           },
         },
         fixture.pipelines
@@ -2241,7 +2248,7 @@ describe("deterministic supervisor stage gates", () => {
     };
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     moveFixtureToProviderWait(fixture);
-    const setupNotice = (id: number) => handleGithubEvent(
+    const setupNotice = (id: number, authorType?: string) => handleGithubEvent(
       {} as never,
       fixture.tickets,
       activityPublisher,
@@ -2254,14 +2261,18 @@ describe("deterministic supervisor stage gates", () => {
           id,
           body: CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE,
           html_url: `https://github.com/owner/repo/pull/1#issuecomment-${id}`,
-          user: { login: CODEX_CONNECTOR_LOGIN, type: "Bot" },
+          user: {
+            login: CODEX_CONNECTOR_LOGIN,
+            ...(authorType === undefined ? {} : { type: authorType }),
+          },
         },
       },
       fixture.pipelines
     );
 
-    await setupNotice(703);
-    await setupNotice(703);
+    await setupNotice(703, "Bot");
+    await setupNotice(703, "Bot");
+    await setupNotice(707);
 
     expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
     expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
@@ -2288,6 +2299,11 @@ describe("deterministic supervisor stage gates", () => {
       label: "lookalike connector bot copying setup notice",
       body: CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE,
       user: { login: "untrusted-codex-connector[bot]", type: "Bot" },
+    },
+    {
+      label: "exact connector login with a non-Bot type copying setup notice",
+      body: CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE,
+      user: { login: CODEX_CONNECTOR_LOGIN, type: "User" },
     },
   ])("admits $label as substantive PR comment feedback", async ({ body, user }) => {
     const fixture = setup("core/implement@4");
@@ -2351,6 +2367,11 @@ describe("deterministic supervisor stage gates", () => {
       label: "lookalike connector bot copying clean review text",
       body: codexCleanReviewBody(PUBLISHED_COMMIT.slice(0, 10)),
       user: { login: "untrusted-codex-connector[bot]", type: "Bot" },
+    },
+    {
+      label: "exact connector login with a non-Bot type copying clean review text",
+      body: codexCleanReviewBody(PUBLISHED_COMMIT.slice(0, 10)),
+      user: { login: CODEX_CONNECTOR_LOGIN, type: "User" },
     },
   ])("admits $label as substantive PR comment feedback", async ({ body, user }) => {
     const fixture = setup("core/implement@4");

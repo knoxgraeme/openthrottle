@@ -521,12 +521,20 @@ function reviewedCommitFromCodexCleanReview(body: string | undefined): string | 
   return commit && REVIEWED_COMMIT.test(commit) ? commit : undefined;
 }
 
+function isTrustedCodexConnectorAuthor(input: {
+  author: string;
+  authorType?: string;
+}): boolean {
+  return input.author.toLowerCase() === CODEX_CONNECTOR_AUTHOR &&
+    (input.authorType === undefined || input.authorType === "Bot");
+}
+
 function reviewedCommitFromTrustedCodexCleanReview(input: {
   author: string;
   authorType?: string;
   body: string | undefined;
 }): string | undefined {
-  if (input.author.toLowerCase() !== CODEX_CONNECTOR_AUTHOR || input.authorType !== "Bot") return undefined;
+  if (!isTrustedCodexConnectorAuthor(input)) return undefined;
   return reviewedCommitFromCodexCleanReview(input.body);
 }
 
@@ -535,8 +543,7 @@ function isCodexConnectorSetupRequiredNotice(input: {
   authorType?: string;
   body: string | undefined;
 }): boolean {
-  return input.authorType === "Bot" &&
-    input.author.toLowerCase() === CODEX_CONNECTOR_AUTHOR &&
+  return isTrustedCodexConnectorAuthor(input) &&
     input.body?.trim() === CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE;
 }
 
