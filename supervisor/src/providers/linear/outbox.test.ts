@@ -121,4 +121,44 @@ describe("Linear outbox retry bounding", () => {
     expect(deliveredActivityIds).toEqual([terminalReceipt.id]);
     expect(getLinearOutbox(terminalReceipt.id)?.status).toBe("processed");
   });
+
+  it("fails closed before acquiring Linear credentials for a GitHub-controlled ticket", async () => {
+    setup();
+    store.upsertUnpinned({
+      ticket_id: "github:42",
+      ticket_reference: "GH-42",
+      session_id: "github-session-42",
+      control_provider: "github",
+      external_thread_id: "42",
+      external_thread_reference: "GH-42",
+      sandbox_id: null,
+      branch: "ot/gh-42",
+      agent: "codex",
+      repo: "owner/repo",
+      base_branch: "main",
+      pr_url: null,
+      state: "active",
+    });
+    const row = store.enqueueLinearOutbox({
+      id: "github-control-row",
+      sessionId: "github-session-42",
+      issueId: "github:42",
+      kind: "activity",
+      payload: JSON.stringify({
+        type: "activity",
+        activity: { sessionId: "github-session-42", type: "thought", body: "hello" },
+      }),
+    });
+    const getLinearClient = vi.fn(async () => undefined);
+    const processor = createLinearOutboxProcessor({ store, getLinearClient });
+
+    await processor.process(row.id);
+
+    expect(getLinearClient).not.toHaveBeenCalled();
+    expect(getLinearOutbox(row.id)).toMatchObject({
+      status: "dead",
+      attempts: 1,
+      last_error: expect.stringContaining("invalid control provider github"),
+    });
+  });
 });
