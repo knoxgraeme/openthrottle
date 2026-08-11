@@ -160,12 +160,6 @@ CREATE TABLE IF NOT EXISTS repository_registrations (
   updated_at TEXT NOT NULL,
   CHECK(control_provider <> 'linear' OR linear_team_key IS NOT NULL)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS repository_registrations_linear_team_key_idx
-  ON repository_registrations(linear_team_key)
-  WHERE control_provider = 'linear' AND linear_team_key IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS repository_registrations_linear_team_id_idx
-  ON repository_registrations(linear_team_id)
-  WHERE control_provider = 'linear' AND linear_team_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 `;
@@ -320,5 +314,23 @@ export function applyCompatibilityIndexes(db: Database.Database): void {
     db.exec("CREATE INDEX IF NOT EXISTS runs_session_idx ON runs(session_id, session_generation);");
   } else {
     db.exec("CREATE INDEX IF NOT EXISTS runs_session_idx ON runs(linear_session_id, session_generation);");
+  }
+  const registrationColumns = new Set(
+    (db.prepare("PRAGMA table_info(repository_registrations)").all() as Array<{ name: string }>).map(
+      (column) => column.name
+    )
+  );
+  // These partial indexes reference the provider discriminator introduced by
+  // migration 33. Creating them in the bootstrap schema would make an upgrade
+  // fail before that migration can rebuild the legacy registration table.
+  if (registrationColumns.has("control_provider")) {
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS repository_registrations_linear_team_key_idx
+        ON repository_registrations(linear_team_key)
+        WHERE control_provider = 'linear' AND linear_team_key IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS repository_registrations_linear_team_id_idx
+        ON repository_registrations(linear_team_id)
+        WHERE control_provider = 'linear' AND linear_team_id IS NOT NULL;
+    `);
   }
 }

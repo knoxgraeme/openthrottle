@@ -599,6 +599,53 @@ describe("database migrations", () => {
     expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
   });
 
+  it("opens a legacy registration database before creating provider-qualified indexes", () => {
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-registration-upgrade-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "supervisor.db");
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE repository_registrations (
+        linear_team_key TEXT PRIMARY KEY COLLATE NOCASE,
+        linear_team_id TEXT UNIQUE,
+        github_repo TEXT NOT NULL COLLATE NOCASE,
+        base_branch TEXT NOT NULL,
+        webhook_id INTEGER NOT NULL,
+        snapshot TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO repository_registrations (
+        linear_team_key, linear_team_id, github_repo, base_branch,
+        webhook_id, snapshot, created_at, updated_at
+      ) VALUES (
+        'ENG', 'team-1', 'acme/widget', 'main', 42,
+        'openthrottle', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+    `);
+    legacy.close();
+
+    db = openDb(path);
+
+    expect(db.prepare(`
+      SELECT github_repo, control_provider, linear_team_key, linear_team_id
+      FROM repository_registrations
+    `).get()).toEqual({
+      github_repo: "acme/widget",
+      control_provider: "linear",
+      linear_team_key: "ENG",
+      linear_team_id: "team-1",
+    });
+    expect(db.prepare(`
+      SELECT name FROM pragma_index_list('repository_registrations')
+      WHERE name = 'repository_registrations_linear_team_key_idx'
+    `).get()).toEqual({ name: "repository_registrations_linear_team_key_idx" });
+    expect(db.prepare(`
+      SELECT name FROM pragma_index_list('repository_registrations')
+      WHERE name = 'repository_registrations_linear_team_id_idx'
+    `).get()).toEqual({ name: "repository_registrations_linear_team_id_idx" });
+  });
+
   it("does not stamp v18 when composite identity prerequisites are missing", () => {
     const scenarios = [
       {
