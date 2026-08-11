@@ -412,28 +412,27 @@ describe("loop action request validation", () => {
     expect(JSON.parse(result.receipt).producer.skill).toBe("builtin://ce/implement@1");
   });
 
-  it("rejects receipts that do not match the sealed expected producer skill", () => {
+  it("deterministically corrects receipts that do not match the sealed expected producer skill", () => {
     const valid = request({ expectedProducerSkill: "builtin://ce/implement@1" });
     const receipt = standardReceipt(valid);
+    const runLoopAgent = vi.fn(() => ({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(receipt),
+      stderr: "",
+      nativeSessionId: "thread-1",
+    }));
 
     const result = executeLoopActionWithIntegration({
       request: valid,
-      runLoopAgent: () => ({
-        status: 0,
-        signal: null,
-        timedOut: false,
-        stdout: JSON.stringify(receipt),
-        stderr: "",
-        nativeSessionId: "thread-1",
-      }),
+      runLoopAgent,
       now: () => "2026-07-29T00:00:00.000Z",
     });
 
-    expect(result).toMatchObject({
-      outcome: "failure",
-      subject: expect.any(String),
-    });
-    expect(result.receipt).toContain("loop receipt producer skill mismatch");
+    expect(result.outcome).toBe("success");
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.receipt).producer.skill).toBe("builtin://ce/implement@1");
   });
 
   it("rejects absolute worktree paths and writes action-attempt scoped result paths", () => {
