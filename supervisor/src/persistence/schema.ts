@@ -157,7 +157,8 @@ CREATE TABLE IF NOT EXISTS repository_registrations (
   webhook_id INTEGER NOT NULL,
   snapshot TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  CHECK(control_provider <> 'linear' OR linear_team_key IS NOT NULL)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS repository_registrations_linear_team_key_idx
   ON repository_registrations(linear_team_key)
@@ -266,7 +267,20 @@ function backfillAgentSessions(db: Database.Database): void {
 }
 
 export function applyBaseSchema(db: Database.Database): void {
-  db.exec(schema);
+  const neutralOutboxAlreadyExists = Boolean(
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'control_outbox'").get()
+  );
+  if (neutralOutboxAlreadyExists) {
+    const outboxStart = schema.indexOf("CREATE TABLE IF NOT EXISTS linear_outbox (");
+    const outboxEndMarker = "  ON linear_outbox(linear_session_id, sequence);";
+    const outboxEnd = schema.indexOf(outboxEndMarker, outboxStart);
+    if (outboxStart < 0 || outboxEnd < 0) {
+      throw new Error("legacy outbox bootstrap boundary is invalid");
+    }
+    db.exec(schema.slice(0, outboxStart) + schema.slice(outboxEnd + outboxEndMarker.length));
+  } else {
+    db.exec(schema);
+  }
   const ticketColumns = new Set(
     (db.prepare("PRAGMA table_info(tickets)").all() as Array<{ name: string }>).map(
       (column) => column.name
