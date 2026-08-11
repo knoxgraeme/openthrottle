@@ -1,6 +1,7 @@
 import type { Config } from "../app/config.js";
 import type { ActivityPublicationPort } from "../app/ports.js";
 import type { SupervisorStore } from "../persistence/store.js";
+import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import type { RuntimeInventory, RuntimeInventoryResource, RuntimeStopper, SandboxRuntime } from "../runtime/contracts.js";
 import { reapExpiredRuns } from "./reaper.js";
@@ -13,6 +14,8 @@ import {
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
 const WEBHOOK_REDELIVERY_PRUNE_LIMIT = 1_000;
+const EXECUTION_PRIVATE_ARTIFACT_RETENTION_DAYS = 30;
+const EXECUTION_PRIVATE_ARTIFACT_PRUNE_LIMIT = 100;
 
 function daysAgoIso(days: number): string {
   return new Date(Date.now() - days * DAY_MS).toISOString();
@@ -33,7 +36,7 @@ export async function runSweep(
   runtime: RuntimeInventory & RuntimeStopper & Pick<SandboxRuntime, "cleanup">,
   store: SupervisorStore,
   cfg: Config,
-  pipelines: PipelineStore,
+  pipelines: PipelineStore & Pick<ExecutionUnitStore, "pruneExecutionWorkPrivateArtifacts">,
   activityPublisher: Pick<ActivityPublicationPort, "publishError">,
   reconcileWebhooks?: () => Promise<void>,
   reconcileRuntimeResources?: RuntimeResourceReconciler
@@ -72,6 +75,10 @@ export async function runSweep(
   store.pruneSandboxEvents(retentionCutoff);
   store.pruneEphemeralLinearOutbox(retentionCutoff);
   pipelines.pruneRunOutcomes(daysAgoIso(cfg.runOutcomeRetentionDays));
+  pipelines.pruneExecutionWorkPrivateArtifacts(
+    daysAgoIso(EXECUTION_PRIVATE_ARTIFACT_RETENTION_DAYS),
+    EXECUTION_PRIVATE_ARTIFACT_PRUNE_LIMIT
+  );
 }
 
 async function deleteOrphanSandboxes(

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -117,6 +117,132 @@ describe("computeWorkspaceTreeOid", () => {
       }
     }
   }
+
+  it("attests executable-bit changes even when repository config ignores file modes", () => {
+    const repoDir = repository();
+    const before = computeWorkspaceTreeOid(repoDir);
+    execFileSync("git", ["config", "core.fileMode", "false"], { cwd: repoDir });
+    chmodSync(join(repoDir, "file.txt"), 0o755);
+
+    const after = computeWorkspaceTreeOid(repoDir);
+
+    expect(after).not.toBe(before);
+    expect(execFileSync("git", ["ls-tree", after, "file.txt"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    })).toContain("100755");
+  });
+
+  it.runIf(process.platform !== "darwin")("attests case-only renames even when repository config ignores case", () => {
+    const repoDir = repository();
+    const before = computeWorkspaceTreeOid(repoDir);
+    execFileSync("git", ["config", "core.ignoreCase", "true"], { cwd: repoDir });
+    renameSync(join(repoDir, "file.txt"), join(repoDir, "FILE.txt"));
+
+    const after = computeWorkspaceTreeOid(repoDir);
+    const paths = execFileSync("git", ["ls-tree", "--name-only", after], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).trim().split("\n");
+
+    expect(after).not.toBe(before);
+    expect(paths).toContain("FILE.txt");
+    expect(paths).not.toContain("file.txt");
+  });
+
+  it("attests symlink-to-file changes even when repository config disables symlinks", () => {
+    const repoDir = repository();
+    symlinkSync("target", join(repoDir, "item"));
+    execFileSync("git", ["add", "item"], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "symlink base"], { cwd: repoDir });
+    execFileSync("git", ["config", "core.symlinks", "false"], { cwd: repoDir });
+    const before = computeWorkspaceTreeOid(repoDir);
+    rmSync(join(repoDir, "item"));
+    writeFileSync(join(repoDir, "item"), "target");
+
+    const after = computeWorkspaceTreeOid(repoDir);
+
+    expect(after).not.toBe(before);
+    expect(execFileSync("git", ["ls-tree", after, "item"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    })).toContain("100644");
+  });
+
+  it("attests the selected checkout when repository config redirects core.worktree", () => {
+    const repoDir = repository();
+    const alternate = mkdtempSync(join(tmpdir(), "ot-control-alternate-worktree-"));
+    directories.push(alternate);
+    writeFileSync(join(alternate, "file.txt"), "initial\n");
+    writeFileSync(join(alternate, "other.txt"), "other\n");
+    execFileSync("git", ["config", "core.worktree", alternate], { cwd: repoDir });
+    writeFileSync(join(repoDir, "file.txt"), "selected checkout\n");
+
+    const subject = computeWorkspaceTreeOid(repoDir);
+
+    expect(execFileSync("git", ["show", `${subject}:file.txt`], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).trim()).toBe("selected checkout");
+  });
+
+  it("fails closed when repository config enables sparse checkout", () => {
+    const repoDir = repository();
+    execFileSync("git", ["config", "core.sparseCheckout", "true"], { cwd: repoDir });
+
+    expect(() => computeWorkspaceTreeOid(repoDir)).toThrow(/requires a full non-sparse checkout/);
+  });
+
+  it("attests new worker files hidden by global and Git metadata excludes", () => {
+    const repoDir = repository();
+    const excludesRoot = mkdtempSync(join(tmpdir(), "ot-control-global-excludes-"));
+    directories.push(excludesRoot);
+    const excludesFile = join(excludesRoot, "ignore");
+    writeFileSync(excludesFile, "*.worker-output\n");
+    execFileSync("git", ["config", "core.excludesFile", excludesFile], { cwd: repoDir });
+    const infoExclude = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(infoExclude, "*.info-output\n*.hidden-executable\n");
+    execFileSync("git", ["config", "core.fileMode", "false"], { cwd: repoDir });
+    writeFileSync(join(repoDir, ".gitignore"), "*.intentionally-ignored\nignored-nested/\n");
+    writeFileSync(join(repoDir, "completed.worker-output"), "completed work\n");
+    writeFileSync(join(repoDir, "completed.info-output"), "completed info-excluded work\n");
+    writeFileSync(join(repoDir, "tool.hidden-executable"), "#!/bin/sh\n");
+    chmodSync(join(repoDir, "tool.hidden-executable"), 0o755);
+    writeFileSync(join(repoDir, "cache.intentionally-ignored"), "ignored cache\n");
+    const ignoredNested = join(repoDir, "ignored-nested");
+    execFileSync("git", ["init", "-q", "-b", "main", ignoredNested]);
+    execFileSync("git", ["config", "user.name", "Nested Test"], { cwd: ignoredNested });
+    execFileSync("git", ["config", "user.email", "nested@example.com"], { cwd: ignoredNested });
+    writeFileSync(join(ignoredNested, "nested.txt"), "ignored nested work\n");
+    execFileSync("git", ["add", "nested.txt"], { cwd: ignoredNested });
+    execFileSync("git", ["commit", "--quiet", "-m", "ignored nested"], { cwd: ignoredNested });
+
+    const subject = computeWorkspaceTreeOid(repoDir);
+
+    expect(execFileSync("git", ["show", `${subject}:completed.worker-output`], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).trim()).toBe("completed work");
+    expect(execFileSync("git", ["show", `${subject}:completed.info-output`], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).trim()).toBe("completed info-excluded work");
+    expect(execFileSync("git", ["ls-tree", subject, "tool.hidden-executable"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    })).toContain("100755");
+    expect(() => execFileSync("git", ["cat-file", "-e", `${subject}:cache.intentionally-ignored`], {
+      cwd: repoDir,
+      stdio: ["ignore", "ignore", "pipe"],
+    })).toThrow();
+    expect(() => execFileSync("git", ["cat-file", "-e", `${subject}:ignored-nested`], {
+      cwd: repoDir,
+      stdio: ["ignore", "ignore", "pipe"],
+    })).toThrow();
+  });
 
   it("uses a supplied Git directory when linked worktree metadata is locked", () => {
     const repoDir = repository();

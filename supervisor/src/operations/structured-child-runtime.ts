@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   EXECUTION_PLAN_SCHEMA,
   deriveReviewSubactionActionId,
@@ -66,9 +67,15 @@ import {
 } from "../pipeline/execution-gates.js";
 import type { PipelineInstance, PipelineStore } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
-import type { ExecutionGateReceipt, ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
+import type {
+  ExecutionGateReceipt,
+  ExecutionUnitStore,
+  ExecutionWorkAttempt,
+  ExecutionWorkPrivateArtifact,
+} from "../persistence/pipeline/unit-store.js";
 import type {
   ChildExecutorActionRequest,
+  ChildExecutorActionResult,
   LoopActionRequest,
   LoopActionResult,
   RuntimeResource,
@@ -84,6 +91,39 @@ const GIT_SHA1_SUBJECT = /^[a-f0-9]{40}$/;
 // Head slice for a non-success diagnostic stored as lastError -- fits inside
 // the 2,000-char budget the store applies (unit-store.ts) with room to spare.
 const DIAGNOSTIC_TEXT_HEAD_CHARS = 1_500;
+
+function terminalPayloadForLoopResult(result: LoopActionResult): string | undefined {
+  if (!result.recoveryArtifact) return undefined;
+  return canonicalJson({
+    schema: "openthrottle.execution-work-terminal-payload/v1",
+    receipt_recovery_artifact: JSON.parse(result.recoveryArtifact) as unknown,
+  });
+}
+
+function privateArtifactForLoopResult(result: LoopActionResult): ExecutionWorkPrivateArtifact | undefined {
+  if (!result.recoveryArtifact || !result.recoveryPayload) return undefined;
+  const payload = Buffer.from(result.recoveryPayload);
+  return {
+    schema: "openthrottle.execution-work-private-artifact/v1",
+    manifest: result.recoveryArtifact,
+    payload,
+    payloadSha256: createHash("sha256").update(payload).digest("hex"),
+    payloadBytes: payload.byteLength,
+  };
+}
+
+function actionResultHash(result: ChildExecutorActionResult | LoopActionResult): string {
+  if (!("recoveryPayload" in result) || !result.recoveryPayload) return digestCanonicalJson(result);
+  const { recoveryPayload, ...boundedResult } = result;
+  const payload = Buffer.from(recoveryPayload);
+  return digestCanonicalJson({
+    ...boundedResult,
+    recoveryPayload: {
+      bytes: payload.byteLength,
+      sha256: createHash("sha256").update(payload).digest("hex"),
+    },
+  });
+}
 
 class RetryableReviewRuntimeError extends Error {
   constructor(operation: string, cause: unknown) {
@@ -156,9 +196,31 @@ export interface StructuredChildRuntime {
   compositeGraphNeedsDrain(parentAttemptId: string): boolean;
 }
 
+function terminalAttemptOutcomeFor(
+  attempts: readonly ExecutionWorkAttempt[]
+): "failure" | "needs_human" | "retryable_infrastructure_failure" | undefined {
+  // failUnitAction persists both semantic failure and needs_human rows with
+  // status='failed'. The exact terminal result is therefore authoritative;
+  // preservation must win over every non-preserving cleanup outcome whenever
+  // any action has recoverable work that requires a human.
+  if (attempts.some((attempt) => attempt.terminal_result_outcome === "needs_human")) {
+    return "needs_human";
+  }
+  // In the absence of preservation-required work, retain retryable provider /
+  // runtime semantics ahead of ordinary semantic failure.
+  if (attempts.some((attempt) => attempt.terminal_result_outcome === "retryable_infrastructure_failure")) {
+    return "retryable_infrastructure_failure";
+  }
+  if (attempts.some((attempt) => attempt.terminal_result_outcome === "failure")) {
+    return "failure";
+  }
+  return undefined;
+}
+
 export function aggregateOutcomeFor(
   units: readonly ExecutionUnitState[],
-  gates: readonly ExecutionGateReceipt[] = []
+  gates: readonly ExecutionGateReceipt[] = [],
+  attempts: readonly ExecutionWorkAttempt[] = []
 ): StageOutcome | undefined {
   if (units.length === 0 || units.some((unit) => unit.terminalLevel === null)) return undefined;
   const acceptedIntegrationSubjects = new Map<string, Set<string>>();
@@ -174,6 +236,8 @@ export function aggregateOutcomeFor(
     subjects.add(gate.subject);
     acceptedIntegrationSubjects.set(gate.unit_id, subjects);
   }
+  const terminalAttemptOutcome = terminalAttemptOutcomeFor(attempts);
+  if (terminalAttemptOutcome) return terminalAttemptOutcome;
   const allAcceptedIntegrated = units.every((unit) =>
     unit.terminalLevel === "completed" &&
     unit.integrationSubject !== null &&
@@ -186,10 +250,13 @@ export function aggregateOutcomeFor(
 }
 
 function stoppedAggregateOutcome(stopReason: string | null, attempts: readonly ExecutionWorkAttempt[]): StageOutcome {
-  if (/\bretryable_infrastructure_failure\b/i.test(stopReason ?? "")) {
+  const terminalAttemptOutcome = terminalAttemptOutcomeFor(attempts);
+  if (terminalAttemptOutcome === "needs_human") return "needs_human";
+  if (terminalAttemptOutcome === "retryable_infrastructure_failure" ||
+      /\bretryable_infrastructure_failure\b/i.test(stopReason ?? "")) {
     return "retryable_infrastructure_failure";
   }
-  if (attempts.some((attempt) => attempt.status === "failed") ||
+  if (terminalAttemptOutcome === "failure" || attempts.some((attempt) => attempt.status === "failed") ||
       /\b(fail(?:ed|ure)?|error|timed out|missed heartbeat)\b/i.test(stopReason ?? "")) {
     return "failure";
   }
@@ -1000,6 +1067,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     resultHash: string;
     outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
     lastError: string;
+    terminalPayload?: string;
+    privateArtifact?: ExecutionWorkPrivateArtifact;
   }> => {
     const receipts: SemanticReviewReceipt[] = [];
     const receiptResults: Array<{
@@ -1027,13 +1096,15 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (result.outcome !== "success") {
         return {
           terminal: true,
-          resultHash: digestCanonicalJson(result),
+          resultHash: actionResultHash(result),
           outcome: result.outcome === "retryable_infrastructure_failure"
             ? "retryable_infrastructure_failure"
             : result.outcome === "needs_human"
               ? "needs_human"
               : "failure",
           lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
+          terminalPayload: terminalPayloadForLoopResult(result),
+          privateArtifact: privateArtifactForLoopResult(result),
         };
       }
       let receipt: StandardReceipt;
@@ -1042,7 +1113,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       } catch {
         return {
           terminal: true,
-          resultHash: digestCanonicalJson(result),
+          resultHash: actionResultHash(result),
           outcome: "failure",
           lastError: `review fanout action ${request.actionId} returned malformed success receipt`,
         };
@@ -1050,7 +1121,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (receipt.type !== "semantic_review") {
         return {
           terminal: true,
-          resultHash: digestCanonicalJson(result),
+          resultHash: actionResultHash(result),
           outcome: "failure",
           lastError: `review fanout action ${request.actionId} returned ${receipt.type}, expected semantic_review`,
         };
@@ -1072,7 +1143,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       } catch (error) {
         return {
           terminal: true,
-          resultHash: digestCanonicalJson(result),
+          resultHash: actionResultHash(result),
           outcome: "failure",
           lastError: `review fanout action ${request.actionId} returned invalid receipt: ${
             sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
@@ -1083,7 +1154,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (!dispatch?.dispatched_at || !dispatch.dispatch_time_source) {
         return {
           terminal: true,
-          resultHash: digestCanonicalJson(result),
+          resultHash: actionResultHash(result),
           outcome: "failure",
           lastError: `review fanout action ${request.actionId} has no persisted dispatch timing`,
         };
@@ -1129,6 +1200,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     resultHash: string;
     outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
     lastError: string;
+    terminalPayload?: string;
+    privateArtifact?: ExecutionWorkPrivateArtifact;
   }> => {
     const result = input.precollected ?? await reviewRuntimeCall(
       `review subaction ${input.request.actionId} result collection failed`,
@@ -1143,11 +1216,13 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     if (result.outcome !== "success") {
       return {
         terminal: true,
-        resultHash: digestCanonicalJson(result),
+        resultHash: actionResultHash(result),
         outcome: result.outcome === "retryable_infrastructure_failure"
           ? "retryable_infrastructure_failure"
           : result.outcome === "needs_human" ? "needs_human" : "failure",
         lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
+        terminalPayload: terminalPayloadForLoopResult(result),
+        privateArtifact: privateArtifactForLoopResult(result),
       };
     }
     let receipt: StandardReceipt;
@@ -1176,7 +1251,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     } catch (error) {
       return {
         terminal: true,
-        resultHash: digestCanonicalJson(result),
+        resultHash: actionResultHash(result),
         outcome: "failure",
         lastError: `review subaction ${input.request.actionId} returned invalid receipt: ${
           sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
@@ -1799,6 +1874,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       skill: workerBinding.repositorySkill?.invocation ?? adapterSkillFor(action.action_kind),
       worktree,
       baseSubject: worktreeBaseFor(instance, action),
+      recoveryBaseSubject: instance.base_commit,
       inputSubject,
       nativeSessionId: action.native_session_id,
       contextPolicy,
@@ -2133,6 +2209,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
     lastError: string;
     nativeSessionId?: string | null;
+    terminalPayload?: string;
+    privateArtifact?: ExecutionWorkPrivateArtifact;
   } | null> => {
     if (!action.request_hash) return null;
     if (action.action_kind === "final_review") {
@@ -2203,7 +2281,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       receipt: StandardReceipt,
       decision?: ReturnType<typeof evaluateUnitAcceptanceGate>
     ) => ({
-      resultHash: digestCanonicalJson(result),
+      resultHash: actionResultHash(result),
       outputSubject,
       receipt: canonicalJson(receipt),
       nativeSessionId,
@@ -2226,7 +2304,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     // head (not tail): the tail is byte-identical padding across different
     // failure reasons, while the head is the one place the classification
     // signal actually lives.
-    const receiptIsDiagnosticText = isChildExecutorActionKind(action.action_kind)
+    const actionIsChildExecutor = isChildExecutorActionKind(action.action_kind);
+    const receiptIsDiagnosticText = actionIsChildExecutor
       ? result.outcome === "retryable_infrastructure_failure"
       : result.outcome !== "success";
     if (receiptIsDiagnosticText) {
@@ -2237,10 +2316,16 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           : "failure";
       return {
         terminal: true,
-        resultHash: digestCanonicalJson(result),
+        resultHash: actionResultHash(result),
         outcome,
         lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
         nativeSessionId,
+        terminalPayload: actionIsChildExecutor
+          ? undefined
+          : terminalPayloadForLoopResult(result as LoopActionResult),
+        privateArtifact: actionIsChildExecutor
+          ? undefined
+          : privateArtifactForLoopResult(result as LoopActionResult),
       };
     }
     let receipt: StandardReceipt;
@@ -2249,7 +2334,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     } catch (error) {
       return {
         terminal: true,
-        resultHash: digestCanonicalJson(result),
+        resultHash: actionResultHash(result),
         outcome: "failure",
         lastError: `child action ${action.id} returned malformed ${result.outcome} receipt: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
         nativeSessionId,
@@ -2297,7 +2382,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           lead: receipt as UnitDecisionReceipt,
         });
         return {
-          resultHash: digestCanonicalJson(result),
+          resultHash: actionResultHash(result),
           outputSubject: acceptedSubject,
           receipt: canonicalJson(receipt),
           nativeSessionId,
@@ -2351,7 +2436,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     } catch (error) {
       return {
         terminal: true,
-        resultHash: digestCanonicalJson(result),
+        resultHash: actionResultHash(result),
         outcome: "failure",
         lastError: `child action ${action.id} returned invalid ${result.outcome} receipt: ${
           sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
@@ -2408,7 +2493,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       const gates = deps.store.listGateReceipts(parentAttemptId);
       const outcome = graph.stopped_at
         ? stoppedAggregateOutcome(graph.stop_reason, attempts)
-        : aggregateOutcomeFor(units, gates);
+        : aggregateOutcomeFor(units, gates, attempts);
       if (!outcome) return;
       if (outcome === "success" && graph.final_phase !== "done") return;
       const integrationSubject = outcome === "success"

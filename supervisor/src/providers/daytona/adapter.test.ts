@@ -1,4 +1,6 @@
 import type { Sandbox } from "@daytona/sdk";
+import { createHash } from "node:crypto";
+import { gzipSync } from "node:zlib";
 import { describe, expect, it, vi } from "vitest";
 import { createDaytonaSandboxRuntime } from "./adapter.js";
 import { canonicalJson, digestNormalized } from "../../pipeline/manifest.js";
@@ -491,6 +493,60 @@ describe("Daytona stage execution", () => {
     })).rejects.toThrow(/invalid envelope/);
   });
 
+  it("redispatches persisted deterministic correction state under the original action lock", async () => {
+    const requestHash = "a".repeat(64);
+    const correctionPath = "/var/lib/openthrottle/loop-actions/attempt-child/loop-1/receipt-correction.json";
+    const correctionState = JSON.stringify({
+      schema: "openthrottle.loop-receipt-correction/v1",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      request_hash: requestHash,
+      diagnostics: [{ pointer: "/payload/status" }],
+      invalid_receipt: { extra: "x".repeat(300_000) },
+      invalid_receipt_text: "{}",
+    });
+    expect(Buffer.byteLength(correctionState, "utf8")).toBeGreaterThan(256 * 1024);
+    const executeSessionCommand = vi.fn(async (_sessionId: string, _options: { command: string }) => ({
+      cmdId: "correction-resume",
+    }));
+    const sandbox = {
+      id: "provider-opaque-correction-resume",
+      state: "started",
+      autoStopInterval: 60,
+      setAutostopInterval: vi.fn(async () => undefined),
+      fs: {
+        downloadFile: vi.fn(async (path: string) => {
+          if (path.endsWith("/result.json")) throw new Error("not found");
+          if (path === correctionPath) return Buffer.from(correctionState);
+          throw new Error("not found");
+        }),
+      },
+      process: {
+        executeSessionCommand,
+        createSession: vi.fn(async () => undefined),
+      },
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+
+    await expect(runtime.collectLoopActionResult({ providerResourceId: sandbox.id }, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash,
+    })).resolves.toBeNull();
+
+    expect(executeSessionCommand).toHaveBeenCalledOnce();
+    const command = executeSessionCommand.mock.calls[0][1].command;
+    expect(command).toContain("flock --nonblock /var/lib/openthrottle/loop-dispatch/attempt-child.loop-1.lock");
+    expect(command).toContain("/opt/openthrottle/runner/execute-loop.mjs");
+    expect(command).toContain("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/request.json");
+    expect(command).toContain("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/credentials.json");
+    expect(command).not.toContain("codex");
+    expect(command).not.toContain("claude");
+  });
+
   it("rejects unsafe loop action IDs before dispatching Daytona paths", async () => {
     const sandbox = {
       id: "provider-opaque-loop-unsafe",
@@ -595,6 +651,193 @@ describe("Daytona stage execution", () => {
       actionId: "loop-1",
       requestHash: "d".repeat(64),
     })).rejects.toThrow(/invalid envelope/);
+  });
+
+  it("parses a fenced private recovery artifact with a long reversible path", async () => {
+    const remoteFiles = new Map<string, Buffer>();
+    const sandbox = {
+      id: "provider-opaque-recovery",
+      state: "started",
+      fs: {
+        downloadFile: vi.fn(async (path: string) => {
+          const file = remoteFiles.get(path);
+          if (!file) throw new Error("not found");
+          return file;
+        }),
+      },
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const quotedPath = `"${Array.from({ length: 5 }, () => "\\377".repeat(240)).join("/")}"`;
+    const changedPaths = [quotedPath];
+    expect(quotedPath.length).toBeGreaterThan(4_096);
+    const recoveryArtifact = canonicalJson({
+      schema: "openthrottle.loop-receipt-recovery/v1",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      request_hash: "a".repeat(64),
+      subject: "d".repeat(40),
+      base_commit: "c".repeat(40),
+      candidate_commit: null,
+      candidate_tree: "e".repeat(40),
+      changed_paths: changedPaths,
+      changed_paths_count: changedPaths.length,
+      changed_paths_sha256: digestNormalized(canonicalJson(changedPaths)),
+      changed_paths_truncated: false,
+      diff_encoding: "git-diff",
+      diff_base64: "",
+      diff_bytes: 0,
+      diff_sha256: digestNormalized(""),
+      diff_truncated: false,
+    });
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "loop_action_result",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      request_hash: "a".repeat(64),
+      outcome: "failure",
+      native_session_id: "thread-1",
+      subject: "d".repeat(40),
+      receipt: "agent_output_contract_failure",
+      recovery_artifact: recoveryArtifact,
+      created_at: "2026-07-22T00:00:00.000Z",
+    })));
+    await expect(runtime.collectLoopActionResult({ providerResourceId: "provider-opaque-recovery" }, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "a".repeat(64),
+    })).resolves.toMatchObject({
+      actionId: "loop-1",
+      recoveryArtifact,
+    });
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "loop_action_result",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      request_hash: "b".repeat(64),
+      outcome: "failure",
+      native_session_id: "thread-1",
+      subject: "d".repeat(40),
+      receipt: "agent_output_contract_failure",
+      recovery_artifact: recoveryArtifact,
+      created_at: "2026-07-22T00:00:00.000Z",
+    })));
+    await expect(runtime.collectLoopActionResult({ providerResourceId: "provider-opaque-recovery" }, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "b".repeat(64),
+    })).resolves.toMatchObject({
+      outcome: "needs_human",
+      recoveryArtifact: expect.stringContaining("requires_workspace_preservation"),
+    });
+  });
+
+  it("downloads and verifies an oversized private recovery payload before cleanup", async () => {
+    const remoteFiles = new Map<string, Buffer>();
+    const sandbox = {
+      id: "provider-opaque-large-recovery",
+      state: "started",
+      fs: {
+        downloadFile: vi.fn(async (path: string) => {
+          const file = remoteFiles.get(path);
+          if (!file) throw new Error("not found");
+          return file;
+        }),
+      },
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const rawDiff = Buffer.from("private recovery line\n".repeat(3_500));
+    const payload = gzipSync(rawDiff, { level: 9 });
+    const payloadHash = createHash("sha256").update(payload).digest("hex");
+    const recoveryArtifact = canonicalJson({
+      schema: "openthrottle.loop-receipt-recovery/v1",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      request_hash: "a".repeat(64),
+      subject: "d".repeat(40),
+      base_commit: "c".repeat(40),
+      candidate_commit: null,
+      candidate_tree: "e".repeat(40),
+      changed_paths: [],
+      changed_paths_count: 0,
+      changed_paths_sha256: digestNormalized(canonicalJson([])),
+      changed_paths_truncated: false,
+      diff_encoding: "gzip+git-diff",
+      diff_base64: null,
+      diff_bytes: rawDiff.byteLength,
+      diff_sha256: createHash("sha256").update(rawDiff).digest("hex"),
+      diff_truncated: false,
+      diff_payload: {
+        file: "recovery.patch.gz",
+        bytes: payload.byteLength,
+        sha256: payloadHash,
+      },
+    });
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "loop_action_result",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      request_hash: "a".repeat(64),
+      outcome: "failure",
+      native_session_id: "thread-1",
+      subject: "d".repeat(40),
+      receipt: "agent_output_contract_failure",
+      recovery_artifact: recoveryArtifact,
+      created_at: "2026-07-22T00:00:00.000Z",
+    })));
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/recovery.patch.gz", payload);
+
+    const result = await runtime.collectLoopActionResult({ providerResourceId: sandbox.id }, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "a".repeat(64),
+    });
+    const persisted = JSON.parse(result?.recoveryArtifact ?? "{}");
+    expect(persisted).toMatchObject({
+      diff_encoding: "gzip+git-diff",
+      diff_base64: null,
+      private_payload: {
+        schema: "openthrottle.execution-work-private-artifact/v1",
+        encoding: "gzip+git-diff",
+        bytes: payload.byteLength,
+        sha256: payloadHash,
+      },
+      source_manifest_sha256: digestNormalized(recoveryArtifact),
+      diff_truncated: false,
+    });
+    expect(persisted).not.toHaveProperty("diff_payload");
+    expect(Buffer.from(result?.recoveryPayload ?? [])).toEqual(payload);
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/recovery.patch.gz", Buffer.from("tampered"));
+    await expect(runtime.collectLoopActionResult({ providerResourceId: sandbox.id }, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "a".repeat(64),
+    })).resolves.toMatchObject({
+      outcome: "needs_human",
+      recoveryPayload: null,
+      recoveryArtifact: expect.stringContaining("requires_workspace_preservation"),
+    });
+
+    remoteFiles.delete("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/recovery.patch.gz");
+    await expect(runtime.collectLoopActionResult({ providerResourceId: sandbox.id }, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "a".repeat(64),
+    })).resolves.toMatchObject({
+      outcome: "needs_human",
+      recoveryPayload: null,
+      recoveryArtifact: expect.stringContaining("requires_workspace_preservation"),
+    });
   });
 
   it("refuses credentials outside the sandbox allowlist", async () => {

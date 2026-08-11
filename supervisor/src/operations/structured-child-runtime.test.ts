@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { canonicalJson, digestNormalized } from "../pipeline/manifest.js";
 import type { ExecutionGateReceipt, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
@@ -410,6 +411,209 @@ describe("structured child runtime aggregate outcome", () => {
         integrationSubject: null,
       }),
     ], [integrationGate("unit_a", subject)])).toBe("failure");
+  });
+
+  it("preserves an exact needs_human action outcome when another unit failed", () => {
+    const needsHumanAttempt = action({
+      id: "needs-human-unit-a",
+      action_kind: "implement",
+      cycle: 1,
+      status: "failed",
+      terminal_result_outcome: "needs_human",
+    });
+    const failedAttempt = action({
+      id: "failed-unit-b",
+      action_kind: "implement",
+      cycle: 1,
+      status: "failed",
+      unit_id: "unit_b",
+      execution_unit_id: "unit-row-b",
+      terminal_result_outcome: "failure",
+    });
+
+    expect(aggregateOutcomeFor([
+      unit({
+        unitId: "unit_a",
+        ordinal: 0,
+        status: "exited",
+        terminalLevel: "exited",
+        integrationSubject: null,
+      }),
+      unit({
+        unitId: "unit_b",
+        ordinal: 1,
+        status: "failed",
+        terminalLevel: "failed",
+        alarm: true,
+        integrationSubject: null,
+      }),
+    ], [], [needsHumanAttempt, failedAttempt])).toBe("needs_human");
+  });
+
+  it("keeps needs_human preservation above a concurrent retryable attempt", () => {
+    const needsHumanAttempt = action({
+      id: "needs-human-final-repair",
+      action_kind: "final_repair",
+      cycle: 1,
+      status: "failed",
+      unit_id: null,
+      execution_unit_id: null,
+      terminal_result_outcome: "needs_human",
+    });
+    const retryableAttempt = action({
+      id: "retryable-provider-stop",
+      action_kind: "final_review",
+      cycle: 1,
+      status: "dead",
+      unit_id: null,
+      execution_unit_id: null,
+      terminal_result_outcome: "retryable_infrastructure_failure",
+    });
+
+    expect(aggregateOutcomeFor([
+      unit({
+        unitId: "unit_a",
+        ordinal: 0,
+        status: "failed",
+        terminalLevel: "failed",
+        alarm: true,
+        integrationSubject: null,
+      }),
+    ], [], [needsHumanAttempt, retryableAttempt])).toBe("needs_human");
+  });
+
+  it("keeps the prior needs_human fallback for a structurally exited dependent", () => {
+    const subject = "1".repeat(40);
+
+    expect(aggregateOutcomeFor([
+      unit({ unitId: "unit_a", ordinal: 0, integrationSubject: subject }),
+      unit({
+        unitId: "unit_b",
+        ordinal: 1,
+        dependencies: ["unit_a"],
+        status: "exited",
+        terminalLevel: "exited",
+        integrationSubject: null,
+      }),
+    ], [integrationGate("unit_a", subject)])).toBe("needs_human");
+  });
+
+  it("drains a stopped final-repair needs_human result as a preserving parent outcome", async () => {
+    const subject = "1".repeat(40);
+    const finalRepair = action({
+      id: "final-repair-needs-human",
+      action_kind: "final_repair",
+      cycle: 1,
+      status: "failed",
+      unit_id: null,
+      execution_unit_id: null,
+      terminal_result_outcome: "needs_human",
+      result_hash: "2".repeat(64),
+      completed_at: "2099-07-22T12:00:00.000Z",
+      last_error: "needs_human: operator decision required",
+    });
+    const retryableAttempt = action({
+      id: "concurrent-retryable-stop",
+      action_kind: "final_review",
+      cycle: 1,
+      status: "dead",
+      unit_id: null,
+      execution_unit_id: null,
+      terminal_result_outcome: "retryable_infrastructure_failure",
+      result_hash: "4".repeat(64),
+      completed_at: "2099-07-22T12:00:00.000Z",
+      last_error: "retryable_infrastructure_failure: provider unavailable",
+    });
+    const parentAttempt = {
+      id: "parent-attempt",
+      pipeline_instance_id: "instance-1",
+      stage_id: "structured",
+      attempt_ordinal: 1,
+      reentry_ordinal: 0,
+      run_id: "run-1",
+      planned_run_id: null,
+      expected_subject: subject,
+      native_session_id: null,
+      request_payload: parentAttemptRequestPayload(),
+      request_hash: "3".repeat(64),
+      idempotency_key: "parent-idempotency-key",
+      context_revision: 1,
+      native_context_policy: "fresh",
+      status: "running",
+      outcome: null,
+      result_hash: null,
+      started_at: "2099-07-22T11:59:00.000Z",
+      completed_at: null,
+      actor_state: "running",
+      last_heartbeat_at: null,
+      settlement_owner: null,
+      settlement_reason: null,
+      termination_confirmed_at: null,
+      quarantine_reason: null,
+      actor_created_at: "2099-07-22T11:59:00.000Z",
+      actor_updated_at: "2099-07-22T11:59:00.000Z",
+      created_at: "2099-07-22T11:59:00.000Z",
+      updated_at: "2099-07-22T11:59:00.000Z",
+    };
+    const instance = {
+      id: "instance-1",
+      ticket_id: "ticket-1",
+      session_id: "session-1",
+      generation: 7,
+      repository: "knoxgraeme/openthrottle-v2",
+      base_commit: "a".repeat(40),
+      immutable_subject: subject,
+      runtime_release: "test-runtime",
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          executor: { capability: "graph/for-each-unit@1" },
+          evaluator: { assurance: "semantic_attested" },
+        }],
+      }),
+    };
+    const completeParentStage = vi.fn(() => instance as any);
+    const emitAggregateOnce = vi.fn(() => "emitted" as const);
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {} as SandboxRuntime,
+      completeParentStage,
+      store: {
+        leaseNextUnitAction: () => undefined,
+        getGraphForAttempt: () => ({
+          stopped_at: "2099-07-22T12:00:00.000Z",
+          stop_reason: "retryable_infrastructure_failure: provider unavailable",
+          integration_subject: subject,
+          final_phase: "repair",
+          aggregate_emitted_at: null,
+          aggregate_artifact_hash: null,
+        }),
+        getAttempt: () => parentAttempt,
+        listUnits: () => [unit({ unitId: "unit_a", ordinal: 0, integrationSubject: subject })],
+        listWorkAttempts: () => [finalRepair, retryableAttempt],
+        listGateReceipts: () => [],
+        emitAggregateOnce,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren(
+      { providerResourceId: "sandbox-1" },
+      instance as any,
+      "parent-attempt"
+    );
+
+    expect(emitAggregateOnce).toHaveBeenCalledWith(expect.objectContaining({
+      parentAttemptId: "parent-attempt",
+      requireFinalReview: false,
+    }));
+    expect(completeParentStage).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "stage_result",
+      outcome: "needs_human",
+      subject,
+    }));
   });
 });
 
@@ -1323,6 +1527,81 @@ describe("structured child runtime repair fences", () => {
     }));
   });
 
+  it("persists a loop receipt recovery artifact on terminal action failure", async () => {
+    const recoveryPayload = Buffer.from("compressed recovery bytes");
+    const recoveryArtifact = canonicalJson({
+      schema: "openthrottle.loop-receipt-recovery/v1",
+      action_id: "implement-recovery",
+      attempt_id: "parent-attempt",
+      request_hash: "b".repeat(64),
+      subject: "a".repeat(40),
+      candidate_tree: "c".repeat(40),
+      diff_base64: "",
+      diff_truncated: false,
+    });
+    const implement = action({
+      id: "implement-recovery",
+      action_kind: "implement",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 1,
+      request_hash: "b".repeat(64),
+      request_launch_state: "launched",
+    });
+    const failUnitAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        collectLoopActionResult: async () => ({
+          actionId: implement.id,
+          attemptId: "parent-attempt",
+          requestHash: "b".repeat(64),
+          outcome: "failure",
+          nativeSessionId: "native-1",
+          subject: "a".repeat(40),
+          receipt: "agent_output_contract_failure: receipt correction exhausted",
+          recoveryArtifact,
+          recoveryPayload,
+          completedAt: "2099-07-22T12:00:00.000Z",
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => implement,
+        failUnitAction,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+    } as any, "parent-attempt");
+
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: implement.id,
+      outcome: "failure",
+      nativeSessionId: "native-1",
+      terminalPayload: canonicalJson({
+        schema: "openthrottle.execution-work-terminal-payload/v1",
+        receipt_recovery_artifact: JSON.parse(recoveryArtifact),
+      }),
+      privateArtifact: {
+        schema: "openthrottle.execution-work-private-artifact/v1",
+        manifest: recoveryArtifact,
+        payload: recoveryPayload,
+        payloadSha256: createHash("sha256").update(recoveryPayload).digest("hex"),
+        payloadBytes: recoveryPayload.byteLength,
+      },
+    }));
+  });
+
   it("reseals deterministic worker worktrees and carries full plan context on requestless dispatch replay", async () => {
     const implement = action({
       id: "implement-replay",
@@ -1400,6 +1679,7 @@ describe("structured child runtime repair fences", () => {
       model: "gpt-5.1-code",
       generation: 7,
       baseSubject: "a".repeat(40),
+      recoveryBaseSubject: "a".repeat(40),
       inputSubject: "a".repeat(40),
       timeoutMs: 17_000,
       expectedProducer: {

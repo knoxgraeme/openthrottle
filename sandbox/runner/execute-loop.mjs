@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { gzipSync } from "node:zlib";
 import { canonicalJson } from "./capabilities.mjs";
 import {
   digest,
@@ -15,7 +16,7 @@ import {
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
-import { grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
+import { deriveCandidateCommit, grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
 import {
   chmodOwnerPrivateTree,
   chmodReadOnlyPreservingExecuteTree,
@@ -108,6 +109,19 @@ const MAX_DOWNSTREAM_CONTEXT_BYTES = 32_768;
 const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
 const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
+const RECEIPT_CORRECTION_ATTEMPTS = 1;
+const MAX_RECEIPT_CORRECTION_DIAGNOSTICS = 8;
+const MAX_INLINE_PRIVATE_RECOVERY_DIFF_BYTES = 48 * 1024;
+// Recovery is exceptional and private, but still bounded. Larger payloads
+// travel in a separate root-owned file that the supervisor downloads before
+// Daytona cleanup; they never inflate the sealed result envelope itself.
+const MAX_PRIVATE_RECOVERY_DIFF_BYTES = 8 * 1024 * 1024;
+const MAX_PRIVATE_RECOVERY_ATTRIBUTE_BYTES = 16 * 1024 * 1024;
+const PRIVATE_RECOVERY_DIFF_FILE = "recovery.patch.gz";
+const MAX_PRIVATE_RECOVERY_CHANGED_PATHS = 256;
+const MAX_PRIVATE_RECOVERY_CHANGED_PATH_BYTES = 16 * 1024;
+const MAX_RECEIPT_CORRECTION_STATE_BYTES = 3 * 1024 * 1024;
+const MAX_RECEIPT_CORRECTION_OUTPUT_CHARS = 64 * 1024;
 const ROOT_UID = 0;
 const ROOT_GID = 0;
 const ABSOLUTE_PATH = /^\/[^\u0000]{0,500}$/;
@@ -352,6 +366,17 @@ export function loopCredentialsPath({ attemptId, actionId, rootDir = DEFAULT_ACT
   return actionFilePath({ attemptId: stagePathId(attemptId, "attemptId"), actionId: stagePathId(actionId, "actionId"), rootDir }, "credentials.json");
 }
 
+function loopReceiptCorrectionStatePath({ attemptId, actionId, rootDir = DEFAULT_ACTION_ROOT }) {
+  return actionFilePath({ attemptId: stagePathId(attemptId, "attemptId"), actionId: stagePathId(actionId, "actionId"), rootDir }, "receipt-correction.json");
+}
+
+export function loopPrivateRecoveryDiffPath({ attemptId, actionId, rootDir = DEFAULT_ACTION_ROOT }) {
+  return actionFilePath(
+    { attemptId: stagePathId(attemptId, "attemptId"), actionId: stagePathId(actionId, "actionId"), rootDir },
+    PRIVATE_RECOVERY_DIFF_FILE,
+  );
+}
+
 function ensureCurrentActionTraversal(request, rootDir = configuredActionRoot()) {
   const attemptDirectory = pathInside(rootDir, request.attemptId);
   const currentActionDirectory = actionDirectory(request, rootDir);
@@ -440,6 +465,23 @@ function runRootGit(repoDir, args, env = {}, { safeDirectories = [] } = {}) {
   return result.stdout.trim();
 }
 
+function runRootGitRaw(repoDir, args, env = {}, { safeDirectories = [] } = {}) {
+  const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir, safeDirectories), ...args], {
+    cwd: repoDir,
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: "0",
+      ...env,
+    },
+    timeout: 120_000,
+    captureBytes: 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-800)}`);
+  }
+  return result.stdout;
+}
+
 export function createLoopRequestHash(requestWithoutFence) {
   const requestHash = digest(canonicalJson(requestWithoutFence));
   return {
@@ -452,7 +494,7 @@ export function validateLoopRequest(value) {
   const input = record(value, "loop request");
   const allowed = new Set([
     "protocol", "actionId", "attemptId", "graphId", "pipelineInstanceId", "graphDigest", "parentRunId",
-    "unitId", "generation", "role", "loop", "agent", "model", "skill", "worktree", "baseSubject", "inputSubject",
+    "unitId", "generation", "role", "loop", "agent", "model", "skill", "worktree", "baseSubject", "recoveryBaseSubject", "inputSubject",
     "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
     "transitionContext", "priorEvidence", "downstreamContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
     "expectedProducerSkill", "expectedProducer", "repositorySkill", "requestHash", "idempotencyKey",
@@ -487,6 +529,9 @@ export function validateLoopRequest(value) {
       id: string(worktree.id, "worktree.id", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
     },
     ...(input.baseSubject === undefined ? {} : { baseSubject: string(input.baseSubject, "baseSubject", GIT_OBJECT_ID) }),
+    ...(input.recoveryBaseSubject === undefined
+      ? {}
+      : { recoveryBaseSubject: string(input.recoveryBaseSubject, "recoveryBaseSubject", GIT_OBJECT_ID) }),
     ...(input.inputSubject === undefined ? {} : { inputSubject: string(input.inputSubject, "inputSubject", GIT_OBJECT_ID) }),
     nativeSessionId: nullableString(input.nativeSessionId, "nativeSessionId", NATIVE_SESSION_ID),
     contextPolicy: string(input.contextPolicy, "contextPolicy"),
@@ -580,9 +625,7 @@ export function resolveLoopInvocation(request) {
     : { mode: "fresh", nativeSessionId: null };
 }
 
-export function loopPrompt(request) {
-  const prefix = request.agent === "claude" ? "/" : "$";
-  const entry = `${prefix}${request.skill}`;
+function receiptAuthorityContract(request) {
   const producer = request.expectedProducer
     ? {
         worker_id: request.expectedProducer.workerId,
@@ -593,7 +636,7 @@ export function loopPrompt(request) {
     : {
         skill: request.expectedProducerSkill ?? request.repositorySkill?.reference ?? `builtin://${request.skill}@1`,
       };
-  const contractPayload = {
+  return {
     schema: "openthrottle.loop-receipt-contract/v1",
     pipeline_instance_id: request.pipelineInstanceId ?? null,
     graph_id: request.graphId,
@@ -620,6 +663,12 @@ export function loopPrompt(request) {
     prior_evidence: request.priorEvidence ?? { schema: PRIOR_EVIDENCE_SCHEMA, role: null, receipts: [] },
     downstream_context_hash: digest(canonicalJson(request.downstreamContext ?? [])),
   };
+}
+
+export function loopPrompt(request) {
+  const prefix = request.agent === "claude" ? "/" : "$";
+  const entry = `${prefix}${request.skill}`;
+  const contractPayload = receiptAuthorityContract(request);
   const contract = canonicalJson(contractPayload);
   const priorEvidence = canonicalJson(request.priorEvidence ?? { schema: PRIOR_EVIDENCE_SCHEMA, role: null, receipts: [] });
   const downstreamContext = canonicalJson(request.downstreamContext ?? []);
@@ -682,9 +731,14 @@ function assertProfileRootFence(profileRoot, nonce, sealedSkillTrees = []) {
   }
 }
 
-function packReachableBaseObjects(repoDir, destinationPackBase, subject = "HEAD") {
+function packReachableBaseObjects(repoDir, destinationPackBase, subject = "HEAD", env = {}) {
   const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir), "pack-objects", "--revs", destinationPackBase], {
     cwd: repoDir,
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: "0",
+      ...env,
+    },
     input: `${subject}\n`,
     timeout: 120_000,
     captureBytes: 1024 * 1024,
@@ -758,13 +812,15 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   const destination = pathInside(currentActionDirectory, "repo-view");
   rmSync(destination, { recursive: true, force: true });
   lockNonCurrentActionDirectories(request, actionRoot);
-  const sourceSubject = request.role === "lead"
+  const viewSourceRepoDir = request.receiptCorrectionSourceRepoDir ?? sourceRepoDir;
+  const viewSourceEnv = request.receiptCorrectionGitObjectEnv ?? {};
+  const sourceSubject = request.receiptCorrectionSubject ?? (request.role === "lead"
     ? request.candidateSubject
     : request.role === "reviewer"
       ? request.inputSubject
-      : "HEAD";
-  const subject = runRootGit(sourceRepoDir, ["rev-parse", sourceSubject]);
-  const objectType = runRootGit(sourceRepoDir, ["cat-file", "-t", subject]);
+      : "HEAD");
+  const subject = runRootGit(viewSourceRepoDir, ["rev-parse", sourceSubject], viewSourceEnv);
+  const objectType = runRootGit(viewSourceRepoDir, ["cat-file", "-t", subject], viewSourceEnv);
   if (objectType !== "commit" && objectType !== "tree") {
     throw new Error("read-only repository subject must be a commit or tree");
   }
@@ -772,7 +828,7 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   runRootGit(destination, ["init", "--quiet"]);
   const packDir = pathInside(pathInside(destination, ".git"), "objects/pack");
   mkdirSync(packDir, { recursive: true, mode: 0o755 });
-  packReachableBaseObjects(sourceRepoDir, join(packDir, "authorized"), subject);
+  packReachableBaseObjects(viewSourceRepoDir, join(packDir, "authorized"), subject, viewSourceEnv);
   if (objectType === "commit") {
     runRootGit(destination, ["switch", "--quiet", "--detach", subject]);
   } else {
@@ -969,6 +1025,59 @@ function assertSealedSkillPreflight({ request, profileRoot, runProcess }) {
       `sealed skill ${request.skill} is not readable by the agent uid before launch (${skillMarkdownPath})`,
     );
   }
+}
+
+function codexAccountId(authJson) {
+  if (typeof authJson !== "string" || authJson.length === 0) return null;
+  try {
+    const accountId = JSON.parse(authJson)?.tokens?.account_id;
+    return typeof accountId === "string" && accountId.length > 0 ? accountId : null;
+  } catch {
+    return null;
+  }
+}
+
+function accountBoundCodexAuthJson(seedAuthJson, observedAuthJson) {
+  if (typeof observedAuthJson !== "string" || observedAuthJson.length === 0) return null;
+  const seedAccountId = codexAccountId(seedAuthJson);
+  const observedAccountId = codexAccountId(observedAuthJson);
+  if (!seedAccountId || !observedAccountId) return null;
+  return observedAccountId === seedAccountId ? observedAuthJson : null;
+}
+
+function readReceiptCorrectionState(request) {
+  const path = loopReceiptCorrectionStatePath({
+    attemptId: request.attemptId,
+    actionId: request.actionId,
+    rootDir: configuredActionRoot(),
+  });
+  if (!existsSync(path)) return null;
+  const state = JSON.parse(readFileSync(path, "utf8"));
+  if (state?.schema !== "openthrottle.loop-receipt-correction/v1" ||
+      state.request_hash !== request.requestHash ||
+      state.action_id !== request.actionId ||
+      state.attempt_id !== request.attemptId ||
+      !Array.isArray(state.diagnostics) ||
+      typeof state.invalid_receipt_text !== "string") {
+    throw new Error("loop receipt correction state is invalid");
+  }
+  return state;
+}
+
+function writeReceiptCorrectionState(request, state) {
+  const currentActionDirectory = ensureCurrentActionTraversal(request);
+  const boundedState = {
+    schema: "openthrottle.loop-receipt-correction/v1",
+    action_id: request.actionId,
+    attempt_id: request.attemptId,
+    request_hash: request.requestHash,
+    ...state,
+    invalid_receipt_text: String(state.invalid_receipt_text ?? "").slice(-MAX_RECEIPT_CORRECTION_OUTPUT_CHARS),
+  };
+  if (Buffer.byteLength(canonicalJson(boundedState), "utf8") > MAX_RECEIPT_CORRECTION_STATE_BYTES) {
+    throw new Error("loop receipt correction state exceeds the sealed 3 MiB bound");
+  }
+  writeJsonAtomic(pathInside(currentActionDirectory, "receipt-correction.json"), boundedState);
 }
 
 export function runLoopAgentInPreparedRepository({
@@ -1177,7 +1286,9 @@ export function parseLoopReceipt(raw, env = process.env) {
   // scan happened to reach first.
   let ambiguityError = null;
   let nestedError = null;
+  let nestedCandidate = null;
   let topError = null;
+  let topCandidate = null;
   const asReceipt = { qualifies: isStandardReceiptShaped, label: "receipt" };
   const codexAmbiguity = ambiguousCodexReceiptError(sanitized, asReceipt);
   if (codexAmbiguity) {
@@ -1194,13 +1305,21 @@ export function parseLoopReceipt(raw, env = process.env) {
         return validateStandardReceipt(parsed, env);
       } catch (error) {
         topError ??= error;
+        topCandidate ??= parsed;
         for (const nested of receiptCandidatesFromJson(parsed)) {
           try {
             const normalized = typeof nested === "string" ? parseAgentJson(nested, asReceipt) : nested;
             return validateStandardReceipt(normalized, env);
           } catch (error) {
             if (error?.ambiguousAgentJson) ambiguityError ??= error;
-            else nestedError ??= error;
+            else {
+              nestedError ??= error;
+              try {
+                nestedCandidate ??= typeof nested === "string" ? parseAgentJson(nested, asReceipt) : nested;
+              } catch {
+                // Keep the validator message as the primary diagnostic.
+              }
+            }
           }
         }
       }
@@ -1211,7 +1330,526 @@ export function parseLoopReceipt(raw, env = process.env) {
   }
   const cause = ambiguityError ?? nestedError ?? topError;
   const detail = cause instanceof Error ? cause.message : cause ? String(cause) : "";
-  throw new Error(`loop action emitted invalid standard receipt${detail ? `: ${detail}` : ""}`);
+  const error = new Error(`loop action emitted invalid standard receipt${detail ? `: ${detail}` : ""}`);
+  error.invalidReceiptCandidate = nestedCandidate ?? topCandidate;
+  throw error;
+}
+
+function jsonPointerFromLabel(label) {
+  const receiptLabel = label.replace(/^loop action emitted invalid standard receipt:\s*/, "");
+  const unknownMarker = " has unknown field ";
+  const unknownAt = receiptLabel.indexOf(unknownMarker);
+  if (unknownAt >= 0) {
+    const unknownKey = receiptLabel.slice(unknownAt + unknownMarker.length);
+    if (unknownKey.length > 0) {
+      const parentPointer = jsonPointerFromLabel(receiptLabel.slice(0, unknownAt));
+      const escapedKey = unknownKey.replace(/~/g, "~0").replace(/\//g, "~1");
+      return `${parentPointer === "/" ? "" : parentPointer}/${escapedKey}`;
+    }
+  }
+  const normalized = receiptLabel
+    .replace(/^standard receipt(?:\s+|$)/, "")
+    .replace(/^payload\b/, "payload")
+    .replace(/^producer\b/, "producer")
+    .replace(/^subject\b/, "subject")
+    .replace(/^fence\b/, "fence")
+    .replace(/(?:^|\s+)has unknown field\s+([A-Za-z0-9_]+).*$/, " $1")
+    .replace(/(?:^|\s+)is missing field\s+([A-Za-z0-9_]+).*$/, " $1")
+    .replace(/\s+(?:must|is|has|exceeds|cannot|does|may)\b.*$/, "")
+    .trim();
+  if (!normalized) return "/";
+  const parts = [];
+  for (const segment of normalized.split(/\s+/)) {
+    const matches = segment.matchAll(/([^[\]]+)|\[(\d+)\]/g);
+    for (const match of matches) parts.push(match[1] ?? match[2]);
+  }
+  return `/${parts.map((segment) => segment.replace(/~/g, "~0").replace(/\//g, "~1")).join("/")}`;
+}
+
+function valueAtPointer(value, pointer) {
+  if (pointer === "/") return value;
+  let current = value;
+  for (const rawPart of pointer.slice(1).split("/")) {
+    const part = rawPart.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (current == null || typeof current !== "object") return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function observedSummary(value) {
+  if (value === undefined) return "missing";
+  if (value === null) return "null";
+  if (Array.isArray(value)) return `array(${value.length})`;
+  if (typeof value === "object") return "object";
+  if (typeof value === "string") return `string(${value.length})`;
+  return typeof value;
+}
+
+function expectedSummary(message) {
+  if (/unknown field/.test(message)) return "field absent";
+  if (/missing field/.test(message)) return "required field present";
+  if (/must be a string|must be a non-empty string/.test(message)) return "string";
+  if (/must contain at most \d+ items|must be an array/.test(message)) return "array";
+  if (/must be an object/.test(message)) return "object";
+  if (/generation/.test(message)) return "integer";
+  if (/fence mismatch/.test(message)) return "authoritative sealed fence value";
+  return "standard receipt contract";
+}
+
+function deleteJsonPointer(value, pointer) {
+  if (!value || typeof value !== "object" || pointer === "/") return;
+  const parts = pointer.slice(1).split("/").map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"));
+  let parent = value;
+  for (const part of parts.slice(0, -1)) {
+    if (!parent || typeof parent !== "object" || !(part in parent)) return;
+    parent = parent[part];
+  }
+  if (parent && typeof parent === "object") delete parent[parts.at(-1)];
+}
+
+function setJsonPointer(value, pointer, replacement) {
+  if (!value || typeof value !== "object" || pointer === "/") {
+    throw new Error(`receipt correction cannot replace ${pointer}`);
+  }
+  const parts = pointer.slice(1).split("/").map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"));
+  let parent = value;
+  for (const part of parts.slice(0, -1)) {
+    if (!parent || typeof parent !== "object" || Array.isArray(parent) || !(part in parent)) {
+      throw new Error(`receipt correction cannot construct missing envelope parent ${pointer}`);
+    }
+    parent = parent[part];
+  }
+  if (!parent || typeof parent !== "object" || Array.isArray(parent)) {
+    throw new Error(`receipt correction cannot replace ${pointer}`);
+  }
+  parent[parts.at(-1)] = replacement;
+}
+
+function correctionDiagnosticIsEnvelopeOnly(diagnostic) {
+  if (/unknown field/.test(String(diagnostic.message))) return true;
+  return diagnostic.pointer === "/schema" ||
+    /^\/(fence|subject|producer)\/[A-Za-z0-9_]+$/.test(diagnostic.pointer);
+}
+
+function assertCorrectableReceiptCandidate(invalidReceipt, diagnostics) {
+  if (!invalidReceipt || typeof invalidReceipt !== "object" || Array.isArray(invalidReceipt)) {
+    throw new Error("receipt correction requires one parsed invalid receipt candidate");
+  }
+  if (diagnostics.length === 0 || diagnostics.some((diagnostic) => !correctionDiagnosticIsEnvelopeOnly(diagnostic))) {
+    throw new Error("receipt correction cannot invent or replace semantic receipt content");
+  }
+}
+
+function assertReceiptCorrectionPreservesCandidate(invalidReceipt, correctedReceipt, diagnostics) {
+  assertCorrectableReceiptCandidate(invalidReceipt, diagnostics);
+  const before = JSON.parse(canonicalJson(invalidReceipt));
+  const after = JSON.parse(canonicalJson(correctedReceipt));
+  for (const diagnostic of diagnostics) {
+    deleteJsonPointer(before, diagnostic.pointer);
+    deleteJsonPointer(after, diagnostic.pointer);
+  }
+  if (canonicalJson(before) !== canonicalJson(after)) {
+    throw new Error("receipt correction changed semantic content outside diagnosed envelope fields");
+  }
+}
+
+function authoritativeCorrectionValues(request, subject) {
+  const contract = receiptAuthorityContract(request);
+  return new Map([
+    ["/schema", STANDARD_RECEIPT_SCHEMA],
+    ["/fence/pipeline_instance_id", request.pipelineInstanceId],
+    ["/fence/graph_digest", request.graphDigest],
+    ["/fence/parent_run_id", request.parentRunId],
+    ["/fence/generation", request.generation],
+    ["/fence/native_session_id", contract.native_session_id],
+    ["/fence/unit_id", contract.unit_id],
+    ["/fence/attempt_id", contract.attempt_id],
+    ["/fence/action_attempt_id", contract.action_attempt_id],
+    ["/fence/request_hash", contract.request_hash],
+    ["/subject/base", request.baseSubject],
+    ["/subject/pre", request.inputSubject],
+    ["/subject/post", subject ?? undefined],
+    ["/producer/worker_id", request.expectedProducer?.workerId],
+    ["/producer/skill", contract.producer.skill],
+    ["/producer/capability_digest", request.expectedProducer?.capabilityDigest],
+    ["/producer/skill_package_digest", request.expectedProducer?.skillPackageDigest],
+  ]);
+}
+
+function deterministicallyCorrectReceipt({ invalidReceipt, diagnostics, request, subject, env }) {
+  assertCorrectableReceiptCandidate(invalidReceipt, diagnostics);
+  const corrected = JSON.parse(canonicalJson(invalidReceipt));
+  const authoritative = authoritativeCorrectionValues(request, subject);
+  for (const diagnostic of diagnostics) {
+    if (diagnostic.expected === "field absent" && /unknown field/.test(String(diagnostic.message))) {
+      deleteJsonPointer(corrected, diagnostic.pointer);
+      continue;
+    }
+    if (!authoritative.has(diagnostic.pointer) || authoritative.get(diagnostic.pointer) === undefined) {
+      throw new Error(`receipt correction has no sealed authority for ${diagnostic.pointer}`);
+    }
+    setJsonPointer(corrected, diagnostic.pointer, authoritative.get(diagnostic.pointer));
+  }
+  const validated = validateStandardReceipt(corrected, env);
+  assertLoopReceiptFence(validated, request, subject);
+  assertReceiptCorrectionPreservesCandidate(invalidReceipt, validated, diagnostics);
+  return validated;
+}
+
+function receiptCorrectionDiagnostics({ errorMessage, invalidReceipt, request, subject }) {
+  const diagnostics = [];
+  const add = (pointer, expected, observed, message) => {
+    diagnostics.push({
+      pointer,
+      expected,
+      observed,
+      message: sanitizeArtifactText(String(message ?? errorMessage)).slice(0, 500),
+    });
+  };
+  const receiptValidationError = errorMessage.replace(/^loop action emitted invalid standard receipt:\s*/, "");
+  const schemaMismatch = /^standard receipt (?:has an invalid schema|is missing field schema)$/.test(receiptValidationError);
+  const envelopeMismatch = /^loop receipt (?:.*fence mismatch|.*subject mismatch|producer(?: skill)? mismatch)$/.test(errorMessage);
+  if (schemaMismatch) {
+    add("/schema", JSON.stringify(STANDARD_RECEIPT_SCHEMA), JSON.stringify(invalidReceipt?.schema), errorMessage);
+  } else if (!envelopeMismatch) {
+    // Preserve the primary schema/semantic failure alongside any masked sealed
+    // mismatches. Unknown fields are themselves correctable; other semantic
+    // failures deliberately keep the candidate on the fail-closed path.
+    const pointer = jsonPointerFromLabel(errorMessage);
+    add(pointer, expectedSummary(errorMessage), observedSummary(valueAtPointer(invalidReceipt, pointer)), errorMessage);
+  }
+  if (invalidReceipt && typeof invalidReceipt === "object" && !Array.isArray(invalidReceipt)) {
+    // assertLoopReceiptFence reports the first mismatch it sees, but the one
+    // deterministic correction pass must repair the whole sealed envelope.
+    // Schema validation, including an unknown-field error, can mask those
+    // mismatches too, so every otherwise parsed object receives all
+    // authoritative envelope diagnostics in the same pass.
+    for (const [pointer, expectedValue] of authoritativeCorrectionValues(request, subject)) {
+      if (pointer === "/schema" || expectedValue === undefined) continue;
+      const observed = valueAtPointer(invalidReceipt, pointer);
+      if (observed !== expectedValue) add(pointer, JSON.stringify(expectedValue), JSON.stringify(observed), errorMessage);
+    }
+  }
+  if (diagnostics.length === 0) {
+    const pointer = jsonPointerFromLabel(errorMessage);
+    add(pointer, expectedSummary(errorMessage), observedSummary(valueAtPointer(invalidReceipt, pointer)), errorMessage);
+  }
+  if (diagnostics.length > MAX_RECEIPT_CORRECTION_DIAGNOSTICS) {
+    // Never truncate to a partially correctable subset. Partial mutation
+    // would consume the only pass and leave a misleading correction record;
+    // one non-envelope diagnostic deliberately routes the receipt to the
+    // preservation path without changing any candidate-authored value.
+    return [{
+      pointer: "/",
+      expected: `at most ${MAX_RECEIPT_CORRECTION_DIAGNOSTICS} sealed envelope mismatches`,
+      observed: `${diagnostics.length} sealed envelope mismatches`,
+      message: "receipt correction mismatch count exceeds the deterministic correction bound",
+    }];
+  }
+  return diagnostics;
+}
+
+function boundedRecoveryChangedPaths(paths) {
+  const all = Array.isArray(paths) ? paths.filter((path) => typeof path === "string") : [];
+  const bounded = [];
+  for (const path of all) {
+    if (bounded.length >= MAX_PRIVATE_RECOVERY_CHANGED_PATHS ||
+        Buffer.byteLength(canonicalJson([...bounded, path]), "utf8") > MAX_PRIVATE_RECOVERY_CHANGED_PATH_BYTES) break;
+    bounded.push(path);
+  }
+  return {
+    changed_paths: bounded,
+    changed_paths_count: all.length,
+    changed_paths_sha256: digest(canonicalJson(all)),
+    changed_paths_truncated: bounded.length !== all.length,
+  };
+}
+
+export function recoveryChangedPathsFromGitQuotedOutput(raw) {
+  const bytes = Buffer.from(raw);
+  const ascii = bytes.toString("ascii");
+  if (!Buffer.from(ascii, "ascii").equals(bytes)) {
+    throw new Error("private recovery path evidence is not reversible Git-quoted ASCII");
+  }
+  return ascii.split("\n").filter(Boolean);
+}
+
+function assertRecoveryTreeHasNoChangedGitlinks(rawTreeChanges) {
+  for (const line of String(rawTreeChanges).split("\n").filter(Boolean)) {
+    const match = line.match(/^:([0-7]{6}) ([0-7]{6}) [a-f0-9]+ [a-f0-9]+ [A-Z][0-9]*\t/);
+    if (!match) {
+      throw new Error("private recovery could not prove changed tree modes are portable");
+    }
+    if (match[2] === "160000") {
+      // A Git binary patch records only the referenced commit id for a
+      // gitlink; it does not carry that nested commit. A fresh clone can
+      // therefore reconstruct ordinary blobs but not an added or updated
+      // submodule reference. Unchanged gitlinks do not appear in this diff.
+      throw new Error("private recovery adds or changes a gitlink whose nested commit is not carried by the recovery patch");
+    }
+  }
+}
+
+function assertRecoveryPathsHavePortableEncodings({
+  worktreeDir,
+  recoveryDirectory,
+  rawPathsPath,
+  baseTree,
+  candidateTree,
+  env,
+}) {
+  const indexPath = pathInside(recoveryDirectory, "recovery.attributes.index.tmp");
+  const outputPath = pathInside(recoveryDirectory, "recovery.attributes.tmp");
+  for (const [label, tree] of [["base", baseTree], ["candidate", candidateTree]]) {
+    rmSync(indexPath, { force: true });
+    rmSync(outputPath, { force: true });
+    try {
+      const attributeEnv = {
+        ...env,
+        GIT_INDEX_FILE: indexPath,
+        GIT_WORK_TREE: worktreeDir,
+      };
+      runRootGit(worktreeDir, ["read-tree", tree], attributeEnv);
+      // Git check-attr has no input-file option. This fixed shell fragment
+      // only redirects executor-owned files; dynamic values remain quoted
+      // positional arguments and are never interpolated shell source.
+      const result = runCapturedProcess("/bin/sh", [
+        "-c",
+        "exec git -c \"safe.directory=$3\" check-attr --cached -z --stdin working-tree-encoding < \"$1\" > \"$2\"",
+        "ot-check-recovery-attributes",
+        rawPathsPath,
+        outputPath,
+        worktreeDir,
+      ], {
+        cwd: worktreeDir,
+        env: { ...process.env, ...attributeEnv, GIT_TERMINAL_PROMPT: "0" },
+        timeout: 120_000,
+        captureBytes: 1024 * 1024,
+      });
+      if (result.error || result.status !== 0) {
+        throw new Error(`private recovery could not inspect ${label} path encodings: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-800)}`);
+      }
+      const outputBytes = statSync(outputPath).size;
+      if (outputBytes > MAX_PRIVATE_RECOVERY_ATTRIBUTE_BYTES) {
+        throw new Error(`private recovery ${label} path encoding evidence exceeds ${MAX_PRIVATE_RECOVERY_ATTRIBUTE_BYTES} byte platform bound`);
+      }
+      const fields = readFileSync(outputPath).toString("utf8").split("\0");
+      if (fields.at(-1) !== "" || (fields.length - 1) % 3 !== 0) {
+        throw new Error(`private recovery ${label} path encoding evidence is malformed`);
+      }
+      for (let index = 0; index < fields.length - 1; index += 3) {
+        const attribute = fields[index + 1];
+        const value = fields[index + 2];
+        if (attribute !== "working-tree-encoding") {
+          throw new Error(`private recovery ${label} path encoding evidence is malformed`);
+        }
+        if (value !== "unspecified" && value !== "unset") {
+          throw new Error("private recovery includes a working-tree-encoded path whose raw workspace bytes are not carried by a Git text patch");
+        }
+      }
+    } finally {
+      rmSync(indexPath, { force: true });
+      rmSync(outputPath, { force: true });
+    }
+  }
+}
+
+function privateRecoveryArtifact(request, worktreeDir, subject, env) {
+  const base = {
+    schema: "openthrottle.loop-receipt-recovery/v1",
+    action_id: request.actionId,
+    attempt_id: request.attemptId,
+    request_hash: request.requestHash,
+    subject: subject ?? null,
+  };
+  if (!worktreeDir) {
+    return {
+      ...base,
+      recovery_subject: subject ?? null,
+      requires_workspace_preservation: true,
+      error: "worktree unavailable",
+    };
+  }
+  try {
+    // inputSubject is the prior action's output tree for reusable worktrees
+    // (for example, implement -> simplify), not the commit checked out at
+    // HEAD. Candidate creation must stay anchored to the sealed worktree base.
+    const worktreeBaseCommit = request.baseSubject ?? runRootGit(worktreeDir, ["rev-parse", "HEAD"]);
+    if (!request.recoveryBaseSubject) {
+      throw new Error("private recovery has no sealed durable base subject");
+    }
+    const candidate = deriveCandidateCommit({
+      worktreeDir,
+      baseCommit: worktreeBaseCommit,
+      message: `OpenThrottle private receipt recovery ${request.actionId}`,
+    });
+    const baseCommit = request.recoveryBaseSubject;
+    const recoveryGitEnv = { GIT_NO_REPLACE_OBJECTS: "1" };
+    const recoveryDirectory = actionDirectory(request);
+    const rawDiffPath = pathInside(recoveryDirectory, "recovery.patch.tmp");
+    const rawModesPath = pathInside(recoveryDirectory, "recovery.modes.tmp");
+    const rawPathsPath = pathInside(recoveryDirectory, "recovery.paths.tmp");
+    const rawAttributePathsPath = pathInside(recoveryDirectory, "recovery.attribute-paths.tmp");
+    const recoveryDiffPath = loopPrivateRecoveryDiffPath({
+      attemptId: request.attemptId,
+      actionId: request.actionId,
+      rootDir: configuredActionRoot(),
+    });
+    rmSync(rawDiffPath, { force: true });
+    rmSync(rawModesPath, { force: true });
+    rmSync(rawPathsPath, { force: true });
+    rmSync(rawAttributePathsPath, { force: true });
+    rmSync(recoveryDiffPath, { force: true });
+    runRootGit(worktreeDir, [
+      "-c",
+      "core.quotePath=true",
+      "diff",
+      "--raw",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--ignore-submodules=none",
+      "--no-renames",
+      "--full-index",
+      `--output=${rawModesPath}`,
+      `${baseCommit}^{tree}`,
+      candidate.tree,
+      "--",
+    ], recoveryGitEnv);
+    const rawModesBytes = statSync(rawModesPath).size;
+    if (rawModesBytes > MAX_PRIVATE_RECOVERY_DIFF_BYTES) {
+      rmSync(rawModesPath, { force: true });
+      throw new Error(`private recovery tree mode evidence exceeds ${MAX_PRIVATE_RECOVERY_DIFF_BYTES} byte platform bound`);
+    }
+    const rawTreeChanges = readFileSync(rawModesPath, "utf8");
+    rmSync(rawModesPath, { force: true });
+    assertRecoveryTreeHasNoChangedGitlinks(rawTreeChanges);
+    runRootGit(worktreeDir, [
+      "diff",
+      "--name-only",
+      "-z",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--ignore-submodules=none",
+      "--no-renames",
+      `--output=${rawAttributePathsPath}`,
+      `${baseCommit}^{tree}`,
+      candidate.tree,
+    ], recoveryGitEnv);
+    const rawAttributePathsBytes = statSync(rawAttributePathsPath).size;
+    if (rawAttributePathsBytes > MAX_PRIVATE_RECOVERY_DIFF_BYTES) {
+      rmSync(rawAttributePathsPath, { force: true });
+      throw new Error(`private recovery attribute path evidence exceeds ${MAX_PRIVATE_RECOVERY_DIFF_BYTES} byte platform bound`);
+    }
+    try {
+      assertRecoveryPathsHavePortableEncodings({
+        worktreeDir,
+        recoveryDirectory,
+        rawPathsPath: rawAttributePathsPath,
+        baseTree: `${baseCommit}^{tree}`,
+        candidateTree: candidate.tree,
+        env: recoveryGitEnv,
+      });
+    } finally {
+      rmSync(rawAttributePathsPath, { force: true });
+    }
+    runRootGit(worktreeDir, [
+      "diff",
+      "--binary",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--ignore-submodules=none",
+      "--no-renames",
+      "--full-index",
+      "--unified=3",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      `--output=${rawDiffPath}`,
+      `${baseCommit}^{tree}`,
+      candidate.tree,
+    ], recoveryGitEnv);
+    const diffBytes = statSync(rawDiffPath).size;
+    if (diffBytes > MAX_PRIVATE_RECOVERY_DIFF_BYTES) {
+      rmSync(rawDiffPath, { force: true });
+      throw new Error(`private recovery diff exceeds ${MAX_PRIVATE_RECOVERY_DIFF_BYTES} byte platform bound`);
+    }
+    const diff = readFileSync(rawDiffPath);
+    rmSync(rawDiffPath, { force: true });
+    runRootGit(worktreeDir, [
+      "-c",
+      "core.quotePath=true",
+      "diff",
+      "--name-only",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--ignore-submodules=none",
+      "--no-renames",
+      `--output=${rawPathsPath}`,
+      `${baseCommit}^{tree}`,
+      candidate.tree,
+    ], recoveryGitEnv);
+    const rawPaths = readFileSync(rawPathsPath);
+    rmSync(rawPathsPath, { force: true });
+    if (rawPaths.byteLength > MAX_PRIVATE_RECOVERY_DIFF_BYTES) {
+      throw new Error(`private recovery path evidence exceeds ${MAX_PRIVATE_RECOVERY_DIFF_BYTES} byte platform bound`);
+    }
+    // Git's C-style quoted path form is reversible and ASCII-safe for every
+    // legal pathname byte sequence, including embedded newlines and bytes
+    // that are not valid UTF-8. Never decode raw `-z` output as UTF-8 here.
+    const completeChangedPaths = recoveryChangedPathsFromGitQuotedOutput(rawPaths);
+    const inline = diffBytes <= MAX_INLINE_PRIVATE_RECOVERY_DIFF_BYTES;
+    let externalDiff = null;
+    if (!inline) {
+      const compressed = gzipSync(diff, { level: 9 });
+      if (compressed.byteLength > MAX_PRIVATE_RECOVERY_DIFF_BYTES) {
+        throw new Error(`compressed private recovery diff exceeds ${MAX_PRIVATE_RECOVERY_DIFF_BYTES} byte platform bound`);
+      }
+      const temporaryPath = pathInside(recoveryDirectory, `${PRIVATE_RECOVERY_DIFF_FILE}.tmp`);
+      writeFileSync(temporaryPath, compressed, { mode: 0o600 });
+      renameSync(temporaryPath, recoveryDiffPath);
+      chmodSync(recoveryDiffPath, 0o600);
+      externalDiff = {
+        file: PRIVATE_RECOVERY_DIFF_FILE,
+        bytes: compressed.byteLength,
+        sha256: digest(compressed),
+      };
+    }
+    const changedPaths = boundedRecoveryChangedPaths(completeChangedPaths);
+    return {
+      ...base,
+      base_commit: baseCommit,
+      candidate_commit: candidate.candidateCommit ?? null,
+      candidate_tree: candidate.tree,
+      ...changedPaths,
+      diff_encoding: inline ? "git-diff" : "gzip+git-diff",
+      diff_base64: inline ? diff.toString("base64") : null,
+      diff_bytes: diffBytes,
+      diff_sha256: digest(diff),
+      diff_truncated: false,
+      ...(externalDiff ? { diff_payload: externalDiff } : {}),
+    };
+  } catch (error) {
+    return {
+      ...base,
+      recovery_subject: subject ?? null,
+      requires_workspace_preservation: true,
+      error: sanitizeArtifactText(error instanceof Error ? error.message : String(error), env).slice(0, 1_000),
+    };
+  }
+}
+
+function privateRecoveryReference(artifact) {
+  const artifactHash = digest(canonicalJson(artifact));
+  return [
+    `private_recovery_artifact=${artifactHash}`,
+    artifact.candidate_commit ? `commit=${artifact.candidate_commit}` : null,
+    artifact.candidate_tree ? `tree=${artifact.candidate_tree}` : null,
+    artifact.subject ? `subject=${artifact.subject}` : null,
+  ].filter(Boolean).join(" ");
 }
 
 function assertLoopReceiptFence(receipt, request, subject) {
@@ -1288,6 +1926,8 @@ export function executeLoopAction({
   let sanitizeEnv = { ...process.env, ...credentialEnv };
   let result;
   let execution;
+  let requiresWorkspacePreservation = false;
+  const persistedCorrectionState = readReceiptCorrectionState(request);
   try {
     const invocation = resolveLoopInvocation(request);
     // Fail closed before ever spawning the engine: a retry that finds no
@@ -1299,7 +1939,19 @@ export function executeLoopAction({
     // with `reason=credential_missing` without ever running `runLoopAgent`.
     const requiresEngineCredential = request.credentialScopes.includes("model.invoke");
     try {
-      execution = requiresEngineCredential && credentialEnvelopeMissing
+      execution = persistedCorrectionState
+        ? {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: persistedCorrectionState.invalid_receipt_text,
+          stderr: "",
+          nativeSessionId: persistedCorrectionState.native_session_id ?? request.nativeSessionId,
+          integrationRepoDir,
+          codexAuthJson: persistedCorrectionState.codex_auth_json ?? null,
+          gitObjectEnv: persistedCorrectionState.git_object_env ?? undefined,
+        }
+        : requiresEngineCredential && credentialEnvelopeMissing
         ? {
           status: null,
           signal: null,
@@ -1353,12 +2005,15 @@ export function executeLoopAction({
     // secret-name pattern, so any accidental echo of it in agent stdout/stderr
     // is redacted the same way the seeded CODEX_AUTH_JSON credential is.
     if (execution.codexAuthJson) {
+      execution.codexAuthJson = accountBoundCodexAuthJson(credentialEnv.CODEX_AUTH_JSON, execution.codexAuthJson);
+    }
+    if (execution.codexAuthJson) {
       sanitizeEnv = { ...sanitizeEnv, OT_ROTATED_CODEX_AUTH_JSON: execution.codexAuthJson };
     }
     const worktreeDir = loopWorktreeDirectory(request);
-    let subject = null;
+    let subject = persistedCorrectionState?.subject ?? null;
     let subjectError = null;
-    if (worktreeDir) {
+    if (worktreeDir && !persistedCorrectionState) {
       try {
         subject = computeWorkspaceTreeOid(worktreeDir, execution.gitObjectEnv ?? undefined);
       } catch (error) {
@@ -1367,12 +2022,90 @@ export function executeLoopAction({
     }
     let parsedReceipt = null;
     let receiptError = null;
-    if (!subjectError && !execution.timedOut && !execution.signal && execution.status === 0) {
+    let receiptErrorObject = null;
+    let correctionDiagnostics = [];
+    let recoveryReference = null;
+    let recoveryArtifact = null;
+    if (subjectError && !execution.timedOut && !execution.signal && execution.status === 0 &&
+        !isUnregisteredCommandResult(execution.stdout)) {
+      // A clean engine exit can still leave completed work that the canonical
+      // staging boundary cannot attest (for example, its bounded untracked
+      // path inventory overflowed). Attempt portable recovery; if the same
+      // staging fault prevents that too, privateRecoveryArtifact explicitly
+      // requires workspace preservation instead of permitting cleanup.
+      recoveryArtifact = privateRecoveryArtifact(request, loopWorktreeDirectory(request), subject, sanitizeEnv);
+      recoveryReference = privateRecoveryReference(recoveryArtifact);
+    }
+    if (persistedCorrectionState) {
+      receiptError = persistedCorrectionState.original_error;
+      correctionDiagnostics = persistedCorrectionState.diagnostics;
+      const invalidReceipt = persistedCorrectionState.invalid_receipt ?? null;
+      try {
+        parsedReceipt = deterministicallyCorrectReceipt({
+          invalidReceipt,
+          diagnostics: correctionDiagnostics,
+          request,
+          subject,
+          env: sanitizeEnv,
+        });
+        receiptError = null;
+      } catch (error) {
+        receiptError = [
+          `agent_output_contract_failure: receipt correction exhausted after ${RECEIPT_CORRECTION_ATTEMPTS} attempt`,
+          `original=${receiptError}`,
+          `correction=${error instanceof Error ? error.message : String(error)}`,
+          `diagnostics=${canonicalJson(correctionDiagnostics)}`,
+        ].join(" ");
+        recoveryArtifact = privateRecoveryArtifact(request, loopWorktreeDirectory(request), subject, sanitizeEnv);
+        recoveryReference = privateRecoveryReference(recoveryArtifact);
+      }
+    } else if (!subjectError && !execution.timedOut && !execution.signal && execution.status === 0) {
       try {
         parsedReceipt = parseLoopReceipt(execution.stdout, sanitizeEnv);
         assertLoopReceiptFence(parsedReceipt, request, subject);
       } catch (error) {
         receiptError = error instanceof Error ? error.message : String(error);
+        receiptErrorObject = error;
+      }
+      if (receiptError) {
+        const invalidReceipt = parsedReceipt ?? receiptErrorObject?.invalidReceiptCandidate ?? null;
+        correctionDiagnostics = receiptCorrectionDiagnostics({
+          errorMessage: receiptError,
+          invalidReceipt,
+          request,
+          subject,
+        });
+        writeReceiptCorrectionState(request, {
+          original_error: receiptError,
+          invalid_receipt: invalidReceipt,
+          invalid_receipt_text: execution.stdout,
+          diagnostics: correctionDiagnostics,
+          subject,
+          native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
+          codex_auth_json: execution.codexAuthJson ?? null,
+          git_object_env: execution.gitObjectEnv ?? null,
+          created_at: now(),
+        });
+        try {
+          parsedReceipt = deterministicallyCorrectReceipt({
+            invalidReceipt,
+            diagnostics: correctionDiagnostics,
+            request,
+            subject,
+            env: sanitizeEnv,
+          });
+          receiptError = null;
+          receiptErrorObject = null;
+        } catch (error) {
+          receiptError = [
+            `agent_output_contract_failure: receipt correction exhausted after ${RECEIPT_CORRECTION_ATTEMPTS} attempt`,
+            `original=${receiptError}`,
+            `correction=${error instanceof Error ? error.message : String(error)}`,
+            `diagnostics=${canonicalJson(correctionDiagnostics)}`,
+          ].join(" ");
+          recoveryArtifact = privateRecoveryArtifact(request, loopWorktreeDirectory(request), subject, sanitizeEnv);
+          recoveryReference = privateRecoveryReference(recoveryArtifact);
+        }
       }
     }
     const retryableInfrastructureFailure = Boolean(execution.retryableInfrastructureFailure);
@@ -1417,14 +2150,16 @@ export function executeLoopAction({
         launchFailure.remediation,
         subjectError,
         receiptError,
+        recoveryReference,
         diagnosticTail,
       ].filter(Boolean).join(" ")
       : execution.executorFailure
         ? (execution.stderr || subjectError || receiptError || "loop action failed")
         : subjectError ||
-          (receiptError ? [receiptError, diagnosticTail].filter(Boolean).join(" ") : "") ||
+          (receiptError ? [receiptError, recoveryReference, diagnosticTail].filter(Boolean).join(" ") : "") ||
           execution.stdout || execution.stderr ||
           (failed ? "loop action failed" : "loop action completed");
+    requiresWorkspacePreservation = recoveryArtifact?.requires_workspace_preservation === true;
     result = {
       version: 1,
       kind: "loop_action_result",
@@ -1432,7 +2167,9 @@ export function executeLoopAction({
       action_id: request.actionId,
       attempt_id: request.attemptId,
       request_hash: request.requestHash,
-      outcome: retryableInfrastructureFailure || launchFailure?.retryable
+      outcome: requiresWorkspacePreservation
+        ? "needs_human"
+        : retryableInfrastructureFailure || launchFailure?.retryable
         ? "retryable_infrastructure_failure"
         : failed ? "failure" : "success",
       native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
@@ -1440,8 +2177,12 @@ export function executeLoopAction({
       receipt: parsedReceipt && !receiptError
         ? canonicalJson(parsedReceipt)
         : sanitizeArtifactText(retryableInfrastructureFailure
-          ? execution.stderr || "loop action infrastructure failure"
+          ? [
+            execution.stderr || "loop action infrastructure failure",
+            recoveryReference,
+          ].filter(Boolean).join(" ")
           : failureNarrative, sanitizeEnv).slice(0, 128_000),
+      ...(recoveryArtifact ? { recovery_artifact: canonicalJson(recoveryArtifact) } : {}),
       created_at: now(),
       // Never derived from agent-authored stdout/stderr (which is sanitized
       // and truncated above): this travels as its own typed field so a
@@ -1468,10 +2209,25 @@ export function executeLoopAction({
     }
   }
   if (cleanupErrors.length > 0) {
+    const sanitizedCleanupDiagnostic = sanitizeArtifactText(
+      `loop action cleanup failed: ${cleanupErrors.join("; ")}`,
+      sanitizeEnv,
+    );
+    if (requiresWorkspacePreservation) {
+      const cleanupDiagnostic = sanitizedCleanupDiagnostic.slice(0, 4_000);
+      const receipt = sanitizeArtifactText(result.receipt ?? "", sanitizeEnv);
+      const separator = receipt ? "\n" : "";
+      const availableReceiptChars = Math.max(0, 128_000 - separator.length - cleanupDiagnostic.length);
+      return {
+        ...result,
+        outcome: "needs_human",
+        receipt: `${receipt.slice(0, availableReceiptChars)}${separator}${cleanupDiagnostic}`,
+      };
+    }
     return {
       ...result,
       outcome: "retryable_infrastructure_failure",
-      receipt: sanitizeArtifactText(`loop action cleanup failed: ${cleanupErrors.join("; ")}`, sanitizeEnv).slice(0, 128_000),
+      receipt: sanitizedCleanupDiagnostic.slice(0, 128_000),
     };
   }
   return result;

@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, chmodSync, chownSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gunzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createLoopRequestHash,
@@ -10,10 +11,12 @@ import {
   lockPersistentAgentPrivateRoots,
   loopAgentCommand,
   loopCredentialsPath,
+  loopPrivateRecoveryDiffPath,
   loopRequestPath,
   loopResultPath,
   loopWorktreeDirectory,
   parseLoopReceipt,
+  recoveryChangedPathsFromGitQuotedOutput,
   restorePersistentAgentPrivateRoots,
   loopPrompt,
   runLoopAgentInPreparedRepository,
@@ -63,6 +66,7 @@ afterEach(() => {
   delete process.env.OT_INTEGRATION_REPO_DIR;
   delete process.env.OT_NATIVE_SESSION_SOURCE_ROOT;
   delete process.env.OT_STAGE_CONFIG_FILE;
+  delete process.env.OT_HOSTILE_DIFF_MARKER;
 });
 
 function repository() {
@@ -93,7 +97,16 @@ function request(overrides = {}) {
   directories.push(rootDir);
   const handle = "unit-1";
   renameSync(repoDir, join(rootDir, handle));
+  const recoveryBaseSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: join(rootDir, handle),
+    encoding: "utf8",
+  }).trim();
   process.env.OT_WORKTREE_ROOT = rootDir;
+  if (!process.env.OT_LOOP_ACTION_ROOT) {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+  }
   const withoutFence = {
     protocol: "loop-action@2",
     actionId: "action-1",
@@ -106,6 +119,7 @@ function request(overrides = {}) {
     agent: "codex",
     skill: "implement-unit",
     worktree: { id: handle },
+    recoveryBaseSubject,
     nativeSessionId: null,
     contextPolicy: "prefer_resume",
     timeoutMs: 30_000,
@@ -115,7 +129,9 @@ function request(overrides = {}) {
     receiptSchema: "openthrottle.receipt/v1",
     ...overrides,
   };
-  return { ...withoutFence, ...createLoopRequestHash(withoutFence) };
+  const fenced = { ...withoutFence, ...createLoopRequestHash(withoutFence) };
+  mkdirSync(join(process.env.OT_LOOP_ACTION_ROOT, fenced.attemptId, fenced.actionId), { recursive: true });
+  return fenced;
 }
 
 function leadRequest(overrides = {}) {
@@ -288,6 +304,7 @@ describe("loop action request validation", () => {
       worktree: { id: "unit-1" },
     });
     expect(() => validateLoopRequest({ ...valid, skill: "ce-code-review" })).toThrow(/stale/);
+    expect(() => validateLoopRequest({ ...valid, recoveryBaseSubject: "c".repeat(40) })).toThrow(/stale/);
   });
 
   it("allows every installed review persona only as an independently fenced read-only review action", () => {
@@ -396,28 +413,27 @@ describe("loop action request validation", () => {
     expect(JSON.parse(result.receipt).producer.skill).toBe("builtin://ce/implement@1");
   });
 
-  it("rejects receipts that do not match the sealed expected producer skill", () => {
+  it("deterministically corrects receipts that do not match the sealed expected producer skill", () => {
     const valid = request({ expectedProducerSkill: "builtin://ce/implement@1" });
     const receipt = standardReceipt(valid);
+    const runLoopAgent = vi.fn(() => ({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(receipt),
+      stderr: "",
+      nativeSessionId: "thread-1",
+    }));
 
     const result = executeLoopActionWithIntegration({
       request: valid,
-      runLoopAgent: () => ({
-        status: 0,
-        signal: null,
-        timedOut: false,
-        stdout: JSON.stringify(receipt),
-        stderr: "",
-        nativeSessionId: "thread-1",
-      }),
+      runLoopAgent,
       now: () => "2026-07-29T00:00:00.000Z",
     });
 
-    expect(result).toMatchObject({
-      outcome: "failure",
-      subject: expect.any(String),
-    });
-    expect(result.receipt).toContain("loop receipt producer skill mismatch");
+    expect(result.outcome).toBe("success");
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.receipt).producer.skill).toBe("builtin://ce/implement@1");
   });
 
   it("rejects absolute worktree paths and writes action-attempt scoped result paths", () => {
@@ -3551,7 +3567,1294 @@ describe("executeLoopAction", () => {
     expect(lockActionDirectory).toHaveBeenCalledOnce();
   });
 
-  it("names the nested validator defect and keeps the model's final message when a receipt misses a field", () => {
+  it.each([
+    ["unknown top-level field", (receipt) => ({
+      ...receipt,
+      ["extra-field/with~punctuation"]: "x".repeat(300_000),
+    }), "/extra-field~1with~0punctuation"],
+    ["unknown commands_run field", (receipt) => ({
+      ...receipt,
+      payload: { ...receipt.payload, commands_run: ["npm test --prefix supervisor -- x.test.ts"] },
+    }), "/payload/commands_run"],
+    ["unknown status field", (receipt) => ({
+      ...receipt,
+      payload: { ...receipt.payload, status: "done" },
+    }), "/payload/status"],
+    ["wrong sealed attempt fence", (receipt) => ({
+      ...receipt,
+      fence: { ...receipt.fence, attempt_id: "attempt-from-parent-run" },
+    }), "/fence/attempt_id"],
+  ])("deterministically repairs %s without changing the candidate tree", (name, mutate, expectedPointer) => {
+    const valid = request();
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = mutate(goodReceipt);
+    const originalSubject = computeWorkspaceTreeOid(loopWorktreeDirectory(valid));
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-correction",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.native_session_id).toBe("native-correction");
+    expect(result.subject).toBe(originalSubject);
+    expect(computeWorkspaceTreeOid(loopWorktreeDirectory(valid))).toBe(originalSubject);
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.receipt)).toMatchObject({ payload: { summary: "Implemented the unit." } });
+    const correctionStateText = readFileSync(join(
+      process.env.OT_LOOP_ACTION_ROOT,
+      valid.attemptId,
+      valid.actionId,
+      "receipt-correction.json",
+    ), "utf8");
+    const correctionState = JSON.parse(correctionStateText);
+    expect(correctionState.diagnostics).toContainEqual(expect.objectContaining({ pointer: expectedPointer }));
+    expect(correctionState.invalid_receipt_text.length).toBeLessThanOrEqual(64 * 1024);
+    if (name === "unknown top-level field") {
+      expect(Buffer.byteLength(correctionStateText, "utf8")).toBeGreaterThan(256 * 1024);
+    }
+  });
+
+  it.each([
+    ["request, subject, and producer", null, null, [
+      "/fence/attempt_id",
+      "/subject/base",
+      "/producer/worker_id",
+    ]],
+    ["schema, request, subject, and producer", "openthrottle.receipt/v0", null, [
+      "/schema",
+      "/fence/attempt_id",
+      "/subject/base",
+      "/producer/worker_id",
+    ]],
+    ["unknown field, request, subject, and producer", null, "unexpected", [
+      "/unexpected",
+      "/fence/attempt_id",
+      "/subject/base",
+      "/producer/worker_id",
+    ]],
+    ["classifier-spoofing unknown field plus request, subject, and producer", null, "loop receipt producer", [
+      "/loop receipt producer",
+      "/fence/attempt_id",
+      "/subject/base",
+      "/producer/worker_id",
+    ]],
+    ["schema-spoofing unknown field plus request, subject, and producer", null, "standard receipt has an invalid schema", [
+      "/standard receipt has an invalid schema",
+      "/fence/attempt_id",
+      "/subject/base",
+      "/producer/worker_id",
+    ]],
+  ])("repairs %s envelope mismatches in one deterministic pass", (_name, wrongSchema, unknownField, expectedPointers) => {
+    const valid = request({
+      pipelineInstanceId: "instance-1",
+      graphDigest: "a".repeat(64),
+      generation: 1,
+      baseSubject: "1".repeat(40),
+      inputSubject: "1".repeat(40),
+      expectedProducer: {
+        workerId: "worker-1",
+        skill: "builtin://implement-unit@1",
+        capabilityDigest: "c".repeat(64),
+        skillPackageDigest: null,
+        assurance: "semantic_attested",
+      },
+    });
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = {
+      ...goodReceipt,
+      ...(wrongSchema ? { schema: wrongSchema } : {}),
+      ...(unknownField ? { [unknownField]: "delete me" } : {}),
+      fence: { ...goodReceipt.fence, attempt_id: "wrong-attempt" },
+      subject: { ...goodReceipt.subject, base: "2".repeat(40) },
+      producer: { ...goodReceipt.producer, worker_id: "wrong-worker" },
+    };
+    const originalSubject = computeWorkspaceTreeOid(loopWorktreeDirectory(valid));
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-multi-envelope-correction",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.subject).toBe(originalSubject);
+    expect(computeWorkspaceTreeOid(loopWorktreeDirectory(valid))).toBe(originalSubject);
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.receipt)).toEqual(goodReceipt);
+    const correctionState = JSON.parse(readFileSync(join(
+      process.env.OT_LOOP_ACTION_ROOT,
+      valid.attemptId,
+      valid.actionId,
+      "receipt-correction.json",
+    ), "utf8"));
+    expect(correctionState.diagnostics.map(({ pointer }) => pointer)).toEqual(expectedPointers);
+  });
+
+  it("fails closed without partial correction when sealed envelope mismatches exceed the diagnostic bound", () => {
+    const valid = request({
+      pipelineInstanceId: "instance-1",
+      graphDigest: "a".repeat(64),
+      generation: 1,
+      baseSubject: "1".repeat(40),
+      inputSubject: "1".repeat(40),
+      expectedProducer: {
+        workerId: "worker-1",
+        skill: "builtin://implement-unit@1",
+        capabilityDigest: "c".repeat(64),
+        skillPackageDigest: null,
+        assurance: "semantic_attested",
+      },
+    });
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = {
+      ...goodReceipt,
+      schema: "openthrottle.receipt/v0",
+      assurance: "semantic_corroborated",
+      fence: {
+        ...goodReceipt.fence,
+        pipeline_instance_id: "wrong-instance",
+        graph_digest: "b".repeat(64),
+        parent_run_id: "wrong-run",
+        generation: 2,
+        native_session_id: "wrong-native-session",
+        unit_id: "wrong-unit",
+        attempt_id: "wrong-attempt",
+        action_attempt_id: "wrong-action",
+        request_hash: "b".repeat(64),
+      },
+      subject: {
+        base: "2".repeat(40),
+        pre: "2".repeat(40),
+        post: "2".repeat(40),
+      },
+      producer: {
+        worker_id: "wrong-worker",
+        skill: "builtin://wrong-skill@1",
+        capability_digest: "d".repeat(64),
+        skill_package_digest: "e".repeat(64),
+      },
+    };
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-over-bound-correction",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(result.receipt).toContain("cannot invent or replace semantic receipt content");
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+    });
+    const correctionState = JSON.parse(readFileSync(join(
+      process.env.OT_LOOP_ACTION_ROOT,
+      valid.attemptId,
+      valid.actionId,
+      "receipt-correction.json",
+    ), "utf8"));
+    expect(correctionState.diagnostics).toEqual([expect.objectContaining({
+      pointer: "/",
+      observed: expect.stringMatching(/^\d+ sealed envelope mismatches$/),
+    })]);
+    expect(correctionState.invalid_receipt).toEqual(badReceipt);
+  });
+
+  it.each([
+    ["worker id", "worker_id", "worker-from-another-action", "/producer/worker_id"],
+    ["skill", "skill", "builtin://another-skill@1", "/producer/skill"],
+    ["capability digest", "capability_digest", "d".repeat(64), "/producer/capability_digest"],
+    ["skill package digest", "skill_package_digest", "e".repeat(64), "/producer/skill_package_digest"],
+  ])("deterministically repairs a wrong sealed producer %s without changing the candidate tree", (_name, field, wrongValue, expectedPointer) => {
+    const valid = request({
+      pipelineInstanceId: "instance-1",
+      graphDigest: "a".repeat(64),
+      generation: 1,
+      baseSubject: "1".repeat(40),
+      inputSubject: "1".repeat(40),
+      expectedProducer: {
+        workerId: "worker-1",
+        skill: "builtin://implement-unit@1",
+        capabilityDigest: "c".repeat(64),
+        skillPackageDigest: null,
+        assurance: "semantic_attested",
+      },
+    });
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = { ...goodReceipt, producer: { ...goodReceipt.producer, [field]: wrongValue } };
+    const originalSubject = computeWorkspaceTreeOid(loopWorktreeDirectory(valid));
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-producer-correction",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.subject).toBe(originalSubject);
+    expect(computeWorkspaceTreeOid(loopWorktreeDirectory(valid))).toBe(originalSubject);
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.receipt)).toEqual(goodReceipt);
+    const correctionState = JSON.parse(readFileSync(join(
+      process.env.OT_LOOP_ACTION_ROOT,
+      valid.attemptId,
+      valid.actionId,
+      "receipt-correction.json",
+    ), "utf8"));
+    expect(correctionState.diagnostics).toContainEqual(expect.objectContaining({
+      pointer: expectedPointer,
+    }));
+  });
+
+  it("does not rewrite a producer's receipt assurance", () => {
+    const valid = request({
+      expectedProducer: {
+        workerId: "worker-1",
+        skill: "builtin://implement-unit@1",
+        capabilityDigest: "c".repeat(64),
+        skillPackageDigest: null,
+        assurance: "semantic_attested",
+      },
+    });
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = { ...goodReceipt, assurance: "semantic_corroborated" };
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-assurance-mismatch",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(result.receipt).toContain("cannot invent or replace semantic receipt content");
+    expect(JSON.parse(result.recovery_artifact)).not.toHaveProperty("requires_workspace_preservation");
+  });
+
+  it("does not invent semantic payload values when a receipt field has the wrong type", () => {
+    const valid = request();
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = {
+      ...goodReceipt,
+      payload: { ...goodReceipt.payload, summary: ["Implemented the unit."] },
+    };
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-correction",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(result.outcome).toBe("failure");
+    expect(result.receipt).toContain("cannot invent or replace semantic receipt content");
+    expect(result.receipt).toContain("private_recovery_artifact=");
+  });
+
+  it("repairs the receipt without launching a second process or regranting the writable worktree", () => {
+    const valid = request();
+    let goodReceipt = null;
+    const runLoopAgent = vi.fn((args) => runLoopAgentInPreparedRepository({
+      ...args,
+      processFence: (execute) => execute(),
+      lockIntegration: vi.fn(),
+      lockPersistentProfiles: () => [],
+      restorePersistentProfiles: vi.fn(),
+      runProcess: (command, processArgs, options) => {
+        expect(command).toBe("gosu");
+        if (processArgs[1] === "cat") {
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        }
+        expect(options.cwd).toBe(loopWorktreeDirectory(valid));
+        writeFileSync(join(loopWorktreeDirectory(valid), "completed-work.txt"), "completed work\n");
+        goodReceipt = standardReceipt(valid);
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: JSON.stringify({
+            ...goodReceipt,
+            payload: { ...goodReceipt.payload, status: "done" },
+          }),
+          stderr: "",
+        };
+      },
+    }));
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.subject).toBe(goodReceipt.subject.post);
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not rewrite invalid semantic review findings through receipt correction", () => {
+    const integrationRepoDir = repository();
+    const subject = execFileSync("git", ["rev-parse", "HEAD"], { cwd: integrationRepoDir, encoding: "utf8" }).trim();
+    const valid = validateLoopRequest(request({
+      role: "reviewer",
+      loop: "review",
+      skill: "final-review",
+      worktree: null,
+      unitId: null,
+      inputSubject: subject,
+      credentialScopes: ["model.invoke", "repo.read"],
+    }));
+    const goodReceipt = {
+      schema: "openthrottle.receipt/v1",
+      type: "semantic_review",
+      assurance: "semantic_attested",
+      result: "success",
+      producer: {
+        worker_id: "worker-1",
+        skill: "builtin://final-review@1",
+        capability_digest: "c".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: { base: subject, pre: subject, post: subject },
+      fence: {
+        pipeline_instance_id: "instance-1",
+        graph_digest: "a".repeat(64),
+        unit_id: "__final__",
+        attempt_id: valid.attemptId,
+        parent_run_id: valid.parentRunId ?? "run-1",
+        action_attempt_id: valid.actionId,
+        generation: 1,
+        native_session_id: valid.nativeSessionId,
+        request_hash: valid.requestHash,
+      },
+      evidence: ["reviewed"],
+      payload: { summary: "reviewed", findings: [] },
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+    const badReceipt = {
+      ...goodReceipt,
+      payload: { summary: "reviewed", findings: ["blocking issue"] },
+    };
+    const runLoopAgent = vi.fn()
+      .mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(badReceipt),
+        stderr: "",
+        nativeSessionId: "native-review",
+        integrationRepoDir,
+      })
+      .mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(goodReceipt),
+        stderr: "",
+        nativeSessionId: "native-review-helper",
+        integrationRepoDir,
+      });
+
+    const result = executeLoopAction({
+      request: valid,
+      integrationRepoDir,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(result.native_session_id).toBe("native-review");
+    expect(result.subject).toBeNull();
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(result.receipt).toContain("cannot invent or replace semantic receipt content");
+    expect(result.receipt).toContain("private_recovery_artifact=");
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+      error: "worktree unavailable",
+    });
+  });
+
+  it("exports portable recovery when simplify uses a sandbox-local worktree base", () => {
+    const initial = request();
+    const worktreeDir = loopWorktreeDirectory(initial);
+    const unchangedGitlink = join(worktreeDir, "unchanged-gitlink");
+    execFileSync("git", ["init", "-q", "-b", "main", unchangedGitlink]);
+    execFileSync("git", ["config", "user.name", "Nested Test"], { cwd: unchangedGitlink });
+    execFileSync("git", ["config", "user.email", "nested@example.com"], { cwd: unchangedGitlink });
+    writeFileSync(join(unchangedGitlink, "nested.txt"), "durable nested state\n");
+    execFileSync("git", ["add", "nested.txt"], { cwd: unchangedGitlink });
+    execFileSync("git", ["commit", "--quiet", "-m", "nested baseline"], { cwd: unchangedGitlink });
+    const unchangedGitlinkSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: unchangedGitlink,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["add", "--", "unchanged-gitlink"], { cwd: worktreeDir });
+    execFileSync("git", ["commit", "--quiet", "-m", "durable gitlink baseline"], { cwd: worktreeDir });
+    const durableBase = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreeDir, encoding: "utf8" }).trim();
+    const remoteRoot = mkdtempSync(join(tmpdir(), "ot-recovery-origin-"));
+    directories.push(remoteRoot);
+    const remoteRepo = join(remoteRoot, "origin.git");
+    execFileSync("git", ["clone", "--bare", "--quiet", worktreeDir, remoteRepo]);
+    writeFileSync(join(worktreeDir, "replacement-only.txt"), "sandbox replacement ref\n");
+    execFileSync("git", ["add", "replacement-only.txt"], { cwd: worktreeDir });
+    execFileSync("git", ["commit", "--quiet", "-m", "sandbox replacement base"], { cwd: worktreeDir });
+    const replacementBase = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: worktreeDir,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["reset", "--hard", "--quiet", durableBase], { cwd: worktreeDir });
+    execFileSync("git", ["replace", durableBase, replacementBase], { cwd: worktreeDir });
+    writeFileSync(join(worktreeDir, "integrated-locally.txt"), "integrated\n");
+    execFileSync("git", ["add", "integrated-locally.txt"], { cwd: worktreeDir });
+    execFileSync("git", ["commit", "--quiet", "-m", "sandbox-only integration"], { cwd: worktreeDir });
+    const localBase = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreeDir, encoding: "utf8" }).trim();
+    writeFileSync(join(worktreeDir, "implemented-before-simplify.txt"), "implemented\n");
+    const inputSubject = computeWorkspaceTreeOid(worktreeDir);
+    const valid = withFreshLoopFence(initial, {
+      loop: "simplify",
+      skill: "ce-simplify-code",
+      baseSubject: localBase,
+      recoveryBaseSubject: durableBase,
+      inputSubject,
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn(() => {
+        writeFileSync(join(worktreeDir, "changed-by-simplify.txt"), "simplified\n");
+        const receipt = standardReceipt(valid, {
+          subject: {
+            base: localBase,
+            pre: inputSubject,
+            post: computeWorkspaceTreeOid(worktreeDir),
+          },
+        });
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: JSON.stringify({
+            ...receipt,
+            payload: { ...receipt.payload, summary: ["not-authoritative"] },
+          }),
+          stderr: "",
+          nativeSessionId: "native-simplify",
+          integrationRepoDir: "/tmp/integration-current",
+        };
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    const artifact = JSON.parse(result.recovery_artifact);
+    expect(artifact).toMatchObject({
+      base_commit: durableBase,
+      candidate_commit: expect.stringMatching(/^[a-f0-9]{40}$/),
+      candidate_tree: expect.stringMatching(/^[a-f0-9]{40}$/),
+      changed_paths: expect.arrayContaining([
+        "integrated-locally.txt",
+        "implemented-before-simplify.txt",
+        "changed-by-simplify.txt",
+      ]),
+      diff_encoding: "git-diff",
+    });
+    expect(artifact.changed_paths).not.toContain("replacement-only.txt");
+    expect(artifact).not.toHaveProperty("requires_workspace_preservation");
+
+    const recoveryRoot = mkdtempSync(join(tmpdir(), "ot-portable-recovery-"));
+    directories.push(recoveryRoot);
+    const recoveryRepo = join(recoveryRoot, "repo");
+    execFileSync("git", ["clone", "--quiet", remoteRepo, recoveryRepo]);
+    expect(() => execFileSync("git", ["cat-file", "-e", `${localBase}^{commit}`], {
+      cwd: recoveryRepo,
+      stdio: ["ignore", "ignore", "pipe"],
+    }))
+      .toThrow();
+    expect(() => execFileSync("git", ["cat-file", "-e", `${unchangedGitlinkSubject}^{commit}`], {
+      cwd: recoveryRepo,
+      stdio: ["ignore", "ignore", "pipe"],
+    }))
+      .toThrow();
+    execFileSync("git", ["checkout", "--quiet", durableBase], { cwd: recoveryRepo });
+    const recoveryPatch = join(recoveryRoot, "recovery.patch");
+    writeFileSync(recoveryPatch, Buffer.from(artifact.diff_base64, "base64"));
+    execFileSync("git", ["apply", recoveryPatch], { cwd: recoveryRepo });
+    expect(computeWorkspaceTreeOid(recoveryRepo)).toBe(artifact.candidate_tree);
+  });
+
+  it("exports raw portable recovery without invoking repository diff drivers or textconv", () => {
+    const initial = request();
+    const worktreeDir = loopWorktreeDirectory(initial);
+    const hostileRoot = mkdtempSync(join(tmpdir(), "ot-hostile-diff-"));
+    directories.push(hostileRoot);
+    const marker = join(hostileRoot, "driver-invoked");
+    const externalDriver = join(hostileRoot, "external-driver.sh");
+    const textconvDriver = join(hostileRoot, "textconv-driver.sh");
+    process.env.OT_HOSTILE_DIFF_MARKER = marker;
+    writeFileSync(externalDriver, [
+      "#!/bin/sh",
+      "printf 'external\\n' >> \"$OT_HOSTILE_DIFF_MARKER\"",
+      "exit 0",
+      "",
+    ].join("\n"));
+    writeFileSync(textconvDriver, [
+      "#!/bin/sh",
+      "printf 'textconv\\n' >> \"$OT_HOSTILE_DIFF_MARKER\"",
+      "printf 'hidden-by-textconv\\n'",
+      "",
+    ].join("\n"));
+    chmodSync(externalDriver, 0o755);
+    chmodSync(textconvDriver, 0o755);
+    writeFileSync(join(worktreeDir, ".gitattributes"), [
+      "external-driver.txt diff=hostile-external",
+      "textconv-driver.dat diff=hostile-textconv",
+      "",
+    ].join("\n"));
+    writeFileSync(join(worktreeDir, "external-driver.txt"), "durable external state\n");
+    writeFileSync(join(worktreeDir, "textconv-driver.dat"), "durable textconv state\n");
+    writeFileSync(join(worktreeDir, "ordinary.txt"), "durable ordinary state\n");
+    execFileSync("git", ["add", ".gitattributes", "external-driver.txt", "textconv-driver.dat", "ordinary.txt"], { cwd: worktreeDir });
+    execFileSync("git", ["commit", "--quiet", "-m", "hostile diff baseline"], { cwd: worktreeDir });
+    const durableBase = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreeDir, encoding: "utf8" }).trim();
+    const remoteRepo = join(hostileRoot, "origin.git");
+    execFileSync("git", ["clone", "--bare", "--quiet", worktreeDir, remoteRepo]);
+    execFileSync("git", ["config", "diff.hostile-external.command", externalDriver], { cwd: worktreeDir });
+    execFileSync("git", ["config", "diff.hostile-textconv.textconv", textconvDriver], { cwd: worktreeDir });
+    execFileSync("git", ["config", "diff.noprefix", "true"], { cwd: worktreeDir });
+    execFileSync("git", ["config", "color.ui", "always"], { cwd: worktreeDir });
+    execFileSync("git", ["config", "color.diff", "always"], { cwd: worktreeDir });
+    execFileSync("git", ["config", "diff.context", "0"], { cwd: worktreeDir });
+    writeFileSync(join(worktreeDir, "external-driver.txt"), "candidate external state\n");
+    writeFileSync(join(worktreeDir, "textconv-driver.dat"), "candidate textconv state\n");
+    writeFileSync(join(worktreeDir, "ordinary.txt"), "candidate ordinary state\n");
+    const candidateTree = computeWorkspaceTreeOid(worktreeDir);
+
+    // Prove the local configuration is hostile: the same tree diff without
+    // recovery's raw-content fences invokes both helpers, and both helpers
+    // suppress their file's real content delta.
+    const hiddenControlDiff = join(hostileRoot, "hidden-control.patch");
+    execFileSync("git", [
+      "diff",
+      "--binary",
+      "--full-index",
+      `--output=${hiddenControlDiff}`,
+      `${durableBase}^{tree}`,
+      candidateTree,
+    ], { cwd: worktreeDir });
+    expect(readFileSync(marker, "utf8")).toContain("external\n");
+    expect(readFileSync(marker, "utf8")).toContain("textconv\n");
+    expect(readFileSync(hiddenControlDiff, "utf8")).toContain("diff --git ordinary.txt ordinary.txt");
+    expect(readFileSync(hiddenControlDiff, "utf8")).not.toContain("diff --git a/ordinary.txt b/ordinary.txt");
+    expect(readFileSync(hiddenControlDiff)).toContain(0x1b);
+    const controlRepo = join(hostileRoot, "unportable-control");
+    execFileSync("git", ["clone", "--quiet", remoteRepo, controlRepo]);
+    execFileSync("git", ["checkout", "--quiet", durableBase], { cwd: controlRepo });
+    expect(() => execFileSync("git", ["apply", hiddenControlDiff], {
+      cwd: controlRepo,
+      stdio: ["ignore", "ignore", "pipe"],
+    })).toThrow();
+    rmSync(marker, { force: true });
+
+    const valid = withFreshLoopFence(initial, {
+      baseSubject: durableBase,
+      recoveryBaseSubject: durableBase,
+    });
+    const preTree = computeWorkspaceTreeOid(worktreeDir);
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn(() => {
+        const receipt = standardReceipt(valid, {
+          subject: { base: durableBase, pre: preTree, post: preTree },
+        });
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: JSON.stringify({
+            ...receipt,
+            payload: { ...receipt.payload, summary: ["not-authoritative"] },
+          }),
+          stderr: "",
+          nativeSessionId: "native-hostile-diff",
+        };
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(existsSync(marker)).toBe(false);
+    const artifact = JSON.parse(result.recovery_artifact);
+    expect(artifact).toMatchObject({
+      base_commit: durableBase,
+      candidate_tree: candidateTree,
+      changed_paths: expect.arrayContaining(["external-driver.txt", "textconv-driver.dat", "ordinary.txt"]),
+      diff_encoding: "git-diff",
+      diff_truncated: false,
+    });
+    expect(Buffer.from(artifact.diff_base64, "base64").byteLength).toBeGreaterThan(0);
+
+    const recoveryRepo = join(hostileRoot, "recovery");
+    execFileSync("git", ["clone", "--quiet", remoteRepo, recoveryRepo]);
+    execFileSync("git", ["checkout", "--quiet", durableBase], { cwd: recoveryRepo });
+    const recoveryPatch = join(hostileRoot, "recovery.patch");
+    writeFileSync(recoveryPatch, Buffer.from(artifact.diff_base64, "base64"));
+    expect(readFileSync(recoveryPatch)).not.toContain(0x1b);
+    execFileSync("git", ["apply", recoveryPatch], { cwd: recoveryRepo });
+    expect(computeWorkspaceTreeOid(recoveryRepo)).toBe(artifact.candidate_tree);
+  });
+
+  it("preserves the workspace when recovery adds a gitlink whose nested commit is sandbox-local", () => {
+    const valid = request();
+    const worktreeDir = loopWorktreeDirectory(valid);
+    const remoteRoot = mkdtempSync(join(tmpdir(), "ot-gitlink-recovery-origin-"));
+    directories.push(remoteRoot);
+    const remoteRepo = join(remoteRoot, "origin.git");
+    execFileSync("git", ["clone", "--bare", "--quiet", worktreeDir, remoteRepo]);
+
+    const sandboxGitlink = join(worktreeDir, "sandbox-only-gitlink");
+    execFileSync("git", ["init", "-q", "-b", "main", sandboxGitlink]);
+    execFileSync("git", ["config", "user.name", "Nested Test"], { cwd: sandboxGitlink });
+    execFileSync("git", ["config", "user.email", "nested@example.com"], { cwd: sandboxGitlink });
+    writeFileSync(join(sandboxGitlink, "nested.txt"), "sandbox-only nested state\n");
+    execFileSync("git", ["add", "nested.txt"], { cwd: sandboxGitlink });
+    execFileSync("git", ["commit", "--quiet", "-m", "sandbox-only nested commit"], { cwd: sandboxGitlink });
+    const nestedSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: sandboxGitlink,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["config", "diff.ignoreSubmodules", "all"], { cwd: worktreeDir });
+    execFileSync("git", ["config", "submodule.sandbox-only-gitlink.ignore", "all"], { cwd: worktreeDir });
+    const candidateTree = computeWorkspaceTreeOid(worktreeDir);
+    expect(execFileSync("git", [
+      "diff",
+      "--raw",
+      `${valid.recoveryBaseSubject}^{tree}`,
+      candidateTree,
+    ], { cwd: worktreeDir, encoding: "utf8" })).toBe("");
+    const badReceipt = standardReceipt(valid, {
+      subject: {
+        base: "1".repeat(40),
+        pre: "1".repeat(40),
+        post: candidateTree,
+      },
+      payload: {
+        ...standardReceipt(valid).payload,
+        summary: ["not-authoritative"],
+      },
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn().mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(badReceipt),
+        stderr: "",
+        nativeSessionId: "native-gitlink-recovery",
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+      error: expect.stringContaining("adds or changes a gitlink"),
+    });
+
+    const freshRoot = mkdtempSync(join(tmpdir(), "ot-gitlink-fresh-clone-"));
+    directories.push(freshRoot);
+    const freshRepo = join(freshRoot, "repo");
+    execFileSync("git", ["clone", "--quiet", remoteRepo, freshRepo]);
+    expect(() => execFileSync("git", ["cat-file", "-e", `${nestedSubject}^{commit}`], {
+      cwd: freshRepo,
+      stdio: ["ignore", "ignore", "pipe"],
+    }))
+      .toThrow();
+  });
+
+  it("preserves the workspace when recovery changes a working-tree-encoded file", () => {
+    const initial = request();
+    const worktreeDir = loopWorktreeDirectory(initial);
+    writeFileSync(join(worktreeDir, ".gitattributes"), "encoded.txt working-tree-encoding=UTF-16LE\n");
+    writeFileSync(join(worktreeDir, "encoded.txt"), Buffer.from("durable encoded text\n", "utf16le"));
+    execFileSync("git", ["add", ".gitattributes", "encoded.txt"], { cwd: worktreeDir });
+    execFileSync("git", ["commit", "--quiet", "-m", "encoded baseline"], { cwd: worktreeDir });
+    const durableBase = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: worktreeDir,
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(worktreeDir, "encoded.txt"), Buffer.from("candidate encoded text\n", "utf16le"));
+    const candidateTree = computeWorkspaceTreeOid(worktreeDir);
+    const valid = withFreshLoopFence(initial, {
+      baseSubject: durableBase,
+      recoveryBaseSubject: durableBase,
+    });
+    const badReceipt = standardReceipt(valid, {
+      subject: {
+        base: "1".repeat(40),
+        pre: "1".repeat(40),
+        post: candidateTree,
+      },
+      payload: {
+        ...standardReceipt(valid).payload,
+        summary: ["not-authoritative"],
+      },
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn().mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(badReceipt),
+        stderr: "",
+        nativeSessionId: "native-encoded-recovery",
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+      error: expect.stringContaining("working-tree-encoded path"),
+    });
+    expect(readFileSync(join(worktreeDir, "encoded.txt"))).toEqual(
+      Buffer.from("candidate encoded text\n", "utf16le"),
+    );
+  });
+
+  it("preserves the workspace when no sealed durable recovery base exists", () => {
+    const valid = withFreshLoopFence(request(), { recoveryBaseSubject: undefined });
+    const worktreeDir = loopWorktreeDirectory(valid);
+    writeFileSync(join(worktreeDir, "unrecoverable.txt"), "sandbox only\n");
+    const receipt = standardReceipt(valid);
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn().mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify({
+          ...receipt,
+          payload: { ...receipt.payload, summary: ["not-authoritative"] },
+        }),
+        stderr: "",
+        nativeSessionId: "native-unrecoverable",
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+      error: "private recovery has no sealed durable base subject",
+    });
+  });
+
+  it("preserves completed work when canonical subject staging cannot produce evidence", () => {
+    const valid = request();
+    const worktreeDir = loopWorktreeDirectory(valid);
+    const receipt = standardReceipt(valid);
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn().mockImplementationOnce(() => {
+        writeFileSync(join(worktreeDir, "completed-but-unattested.txt"), "preserve me\n");
+        // Exercise the same post-execution path as the bounded untracked-path
+        // inventory failure: canonical subject staging and recovery staging
+        // both fail before they can prove a portable candidate.
+        execFileSync("git", ["config", "core.sparseCheckout", "true"], { cwd: worktreeDir });
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: JSON.stringify(receipt),
+          stderr: "",
+          nativeSessionId: "native-unattested",
+          integrationRepoDir: "/tmp/integration-current",
+        };
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(result.receipt).toMatch(/workspace subject attestation failed/);
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+      error: expect.stringContaining("full non-sparse checkout"),
+    });
+    expect(readFileSync(join(worktreeDir, "completed-but-unattested.txt"), "utf8")).toBe("preserve me\n");
+  });
+
+  it("keeps an unregistered-command launch retryable when subject staging also fails", () => {
+    const valid = request({ agent: "claude" });
+    const worktreeDir = loopWorktreeDirectory(valid);
+    const unregisteredCommand = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Unknown command: /implement-unit",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn().mockImplementationOnce(() => {
+        execFileSync("git", ["config", "core.sparseCheckout", "true"], { cwd: worktreeDir });
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: `${JSON.stringify({ type: "system", subtype: "init" })}\n${unregisteredCommand}`,
+          stderr: "",
+          nativeSessionId: null,
+          integrationRepoDir: "/tmp/integration-current",
+        };
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(result.receipt).toContain("reason=unregistered_command");
+    expect(result).not.toHaveProperty("recovery_artifact");
+  });
+
+  it.each([
+    ["worker worktree lock", "lockWorkerWorktree"],
+    ["action directory lock", "lockActionDirectory"],
+    ["integration restore", "restoreIntegration"],
+  ])("keeps preservation-required recovery needs_human when %s cleanup fails", (_label, failingCleanup) => {
+    const valid = withFreshLoopFence(request(), { recoveryBaseSubject: undefined });
+    const worktreeDir = loopWorktreeDirectory(valid);
+    writeFileSync(join(worktreeDir, "only-in-sandbox.txt"), "preserve me\n");
+    const receipt = standardReceipt(valid);
+    const cleanupSecret = "cleanup-secret-value";
+    const cleanups = {
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+    };
+    cleanups[failingCleanup].mockImplementation(() => {
+      throw new Error(`${failingCleanup} failed with ${cleanupSecret} ${"x".repeat(8_000)}`);
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      credentialEnv: { GITHUB_TOKEN: cleanupSecret },
+      runLoopAgent: vi.fn(() => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify({
+          ...receipt,
+          payload: { ...receipt.payload, summary: ["not-authoritative"] },
+        }),
+        stderr: "",
+        nativeSessionId: "native-preservation-cleanup",
+        integrationRepoDir: "/tmp/integration-current",
+      })),
+      ...cleanups,
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(cleanups[failingCleanup]).toHaveBeenCalledOnce();
+    expect(result.outcome).toBe("needs_human");
+    expect(result.receipt).toContain("private_recovery_artifact=");
+    expect(result.receipt).toContain("loop action cleanup failed:");
+    expect(result.receipt).toContain("[REDACTED]");
+    expect(result.receipt).not.toContain(cleanupSecret);
+    expect(result.receipt.length).toBeLessThanOrEqual(128_000);
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+      error: "private recovery has no sealed durable base subject",
+    });
+  });
+
+  it("preserves work when a semantic receipt defect cannot be repaired from sealed authority", () => {
+    const valid = request();
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = {
+      ...goodReceipt,
+      payload: { ...goodReceipt.payload, summary: ["not-authoritative"] },
+    };
+    writeFileSync(join(loopWorktreeDirectory(valid), "changed-after-work.txt"), "useful work\n");
+    const originalSubject = computeWorkspaceTreeOid(loopWorktreeDirectory(valid));
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-correction",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(result.outcome).toBe("failure");
+    expect(result.subject).toBe(originalSubject);
+    expect(result.receipt).toContain("agent_output_contract_failure");
+    expect(result.receipt).toContain("receipt correction exhausted after 1 attempt");
+    expect(result.receipt).toContain("/payload/summary");
+    expect(result.receipt).toContain("private_recovery_artifact=");
+    const recoveryArtifact = JSON.parse(result.recovery_artifact);
+    expect(recoveryArtifact).toMatchObject({
+      schema: "openthrottle.loop-receipt-recovery/v1",
+      action_id: valid.actionId,
+      attempt_id: valid.attemptId,
+      request_hash: valid.requestHash,
+      subject: originalSubject,
+    });
+    expect(recoveryArtifact.candidate_tree).toMatch(/^[a-f0-9]{40}$/);
+    expect(recoveryArtifact.changed_paths).toContain("changed-after-work.txt");
+    expect(recoveryArtifact.diff_truncated).toBe(false);
+    expect(recoveryArtifact.diff_base64).toEqual(expect.any(String));
+    expect(Buffer.from(recoveryArtifact.diff_base64, "base64").toString("utf8")).toContain("changed-after-work.txt");
+  });
+
+  it("keeps recovery diffs above the sealed-envelope limit in a separately collectable private payload", () => {
+    const valid = request();
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = { ...goodReceipt, payload: { ...goodReceipt.payload, summary: ["not-authoritative"] } };
+    writeFileSync(join(loopWorktreeDirectory(valid), "large-recovery.txt"), "recovery-line\n".repeat(6_000));
+    for (let index = 0; index < 300; index += 1) {
+      writeFileSync(join(
+        loopWorktreeDirectory(valid),
+        `recovery-path-${String(index).padStart(3, "0")}-${"escaped-\\\"".repeat(7)}.txt`,
+      ), `${index}\n`);
+    }
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-correction",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    const artifact = JSON.parse(result.recovery_artifact);
+    expect(artifact).toMatchObject({
+      diff_encoding: "gzip+git-diff",
+      diff_base64: null,
+      diff_truncated: false,
+      diff_payload: {
+        file: "recovery.patch.gz",
+        bytes: expect.any(Number),
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+      changed_paths_count: 301,
+      changed_paths_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      changed_paths_truncated: true,
+    });
+    expect(artifact.changed_paths.length).toBeLessThan(256);
+    expect(Buffer.byteLength(canonicalJson(artifact.changed_paths), "utf8")).toBeLessThanOrEqual(16 * 1024);
+    expect(artifact.diff_bytes).toBeGreaterThan(48 * 1024);
+    const payload = readFileSync(loopPrivateRecoveryDiffPath({
+      attemptId: valid.attemptId,
+      actionId: valid.actionId,
+      rootDir: process.env.OT_LOOP_ACTION_ROOT,
+    }));
+    expect(payload.byteLength).toBe(artifact.diff_payload.bytes);
+    expect(digest(payload)).toBe(artifact.diff_payload.sha256);
+    expect(gunzipSync(payload).toString("utf8")).toContain("large-recovery.txt");
+  });
+
+  it("keeps Git-quoted non-UTF-8 recovery path evidence reversible", () => {
+    const output = Buffer.from('normal.txt\n"nonutf8-\\377.txt"\n"line\\nbreak.txt"\n', "ascii");
+    expect(recoveryChangedPathsFromGitQuotedOutput(output)).toEqual([
+      "normal.txt",
+      '"nonutf8-\\377.txt"',
+      '"line\\nbreak.txt"',
+    ]);
+    expect(() => recoveryChangedPathsFromGitQuotedOutput(Buffer.from([0xff, 0x00])))
+      .toThrow(/not reversible Git-quoted ASCII/);
+  });
+
+  it("preserves the workspace when recovery exceeds the private payload bound", () => {
+    const valid = request();
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = { ...goodReceipt, payload: { ...goodReceipt.payload, summary: ["not-authoritative"] } };
+    writeFileSync(join(loopWorktreeDirectory(valid), "oversized-recovery.txt"), "x\n".repeat(4_200_000));
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn().mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(badReceipt),
+        stderr: "",
+        nativeSessionId: "native-correction",
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      schema: "openthrottle.loop-receipt-recovery/v1",
+      requires_workspace_preservation: true,
+      error: expect.stringContaining("exceeds"),
+    });
+  });
+
+  it("resumes a persisted receipt correction without relaunching the implementation", () => {
+    const valid = request();
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = { ...goodReceipt, payload: { ...goodReceipt.payload, status: "done" } };
+    const staleCodexAuth = JSON.stringify({ tokens: { access_token: "stale", refresh_token: "spent", account_id: "account-1" } });
+    const rotatedCodexAuth = JSON.stringify({ tokens: { access_token: "current", refresh_token: "rotated", account_id: "account-1" } });
+    const firstRunLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-correction",
+      integrationRepoDir: "/tmp/integration-current",
+      codexAuthJson: rotatedCodexAuth,
+    });
+
+    const first = executeLoopActionWithIntegration({
+      request: valid,
+      credentialEnv: { CODEX_AUTH_JSON: staleCodexAuth },
+      runLoopAgent: firstRunLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(first.outcome).toBe("success");
+    expect(firstRunLoopAgent).toHaveBeenCalledTimes(1);
+    const resumedRunLoopAgent = vi.fn(() => {
+      throw new Error("persisted deterministic correction must not relaunch the agent");
+    });
+
+    const resumed = executeLoopActionWithIntegration({
+      request: valid,
+      credentialEnv: { CODEX_AUTH_JSON: staleCodexAuth },
+      runLoopAgent: resumedRunLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:01.000Z",
+    });
+
+    expect(resumed.outcome).toBe("success");
+    expect(resumed.native_session_id).toBe("native-correction");
+    expect(resumed.codex_auth_json).toBe(rotatedCodexAuth);
+    expect(resumedRunLoopAgent).not.toHaveBeenCalled();
+    expect(JSON.parse(resumed.receipt)).toEqual(goodReceipt);
+  });
+
+  it("never seeds or persists a rotated Codex credential from a different account", () => {
+    const valid = request();
+    const receipt = standardReceipt(valid);
+    const seed = JSON.stringify({ tokens: { refresh_token: "seed", account_id: "account-1" } });
+    const switched = JSON.stringify({ tokens: { refresh_token: "attacker", account_id: "account-2" } });
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      credentialEnv: { CODEX_AUTH_JSON: seed },
+      runLoopAgent: vi.fn().mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(receipt),
+        stderr: "",
+        nativeSessionId: "native-correction",
+        integrationRepoDir: "/tmp/integration-current",
+        codexAuthJson: switched,
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.codex_auth_json).toBeUndefined();
+  });
+
+  it("rejects rotated Codex auth when the seeded credential has no account binding", () => {
+    const valid = request();
+    const receipt = standardReceipt(valid);
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      credentialEnv: { CODEX_AUTH_JSON: JSON.stringify({ tokens: { refresh_token: "unbound-seed" } }) },
+      runLoopAgent: vi.fn().mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(receipt),
+        stderr: "",
+        nativeSessionId: "native-correction",
+        integrationRepoDir: "/tmp/integration-current",
+        codexAuthJson: JSON.stringify({ tokens: { refresh_token: "rotated", account_id: "account-1" } }),
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.codex_auth_json).toBeUndefined();
+  });
+
+  it("refuses receipt correction when no parsed candidate can constrain semantic content", () => {
+    const valid = request();
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "not a receipt candidate",
+      stderr: "",
+      nativeSessionId: "native-correction",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(result.outcome).toBe("failure");
+    expect(result.receipt).toContain("receipt correction requires one parsed invalid receipt candidate");
+    expect(result.receipt).toContain("private_recovery_artifact=");
+  });
+
+  it("deterministically restores a missing top-level schema from the sealed receipt contract", () => {
     // OPE-101: both failed generations emitted a receipt missing `schema`, and
     // the ledger only ever said "loop action emitted invalid standard receipt".
     // The precise message existed and was thrown away, and the engine's own
@@ -3577,14 +4880,8 @@ describe("executeLoopAction", () => {
       now: () => "2026-07-29T00:00:00.000Z",
     });
 
-    expect(result.outcome).toBe("failure");
-    // The nested-layer error names the field. The top-layer candidate is the
-    // stream-json envelope, whose "unknown field subtype" must never win.
-    expect(result.receipt).toContain("loop action emitted invalid standard receipt: standard receipt is missing field schema");
-    expect(result.receipt).not.toContain("unknown field subtype");
-    // A bounded, sanitized head of what the model actually said travels with it.
-    expect(result.receipt).toContain("subtype=success");
-    expect(result.receipt).toContain("unit_completion");
+    expect(result.outcome).toBe("success");
+    expect(JSON.parse(result.receipt)).toEqual({ schema: "openthrottle.receipt/v1", ...withoutSchema });
   });
 
   it("accepts a receipt wrapped in one markdown code fence and returns the identical result", () => {
@@ -3750,7 +5047,7 @@ describe("executeLoopAction", () => {
       .toThrow(/invalid standard receipt/);
   });
 
-  it("names the nested validator defect for an invalid receipt inside a code fence", () => {
+  it("deterministically restores a missing schema inside a code fence", () => {
     // Fence tolerance must not cost the OPE-101 diagnostics: a fenced receipt
     // that is genuinely wrong still reports the field the validator named,
     // never the stream-json envelope's useless "unknown field subtype".
@@ -3779,9 +5076,8 @@ describe("executeLoopAction", () => {
       now: () => "2026-07-29T00:00:00.000Z",
     });
 
-    expect(result.outcome).toBe("failure");
-    expect(result.receipt).toContain("loop action emitted invalid standard receipt: standard receipt is missing field schema");
-    expect(result.receipt).not.toContain("unknown field subtype");
+    expect(result.outcome).toBe("success");
+    expect(JSON.parse(result.receipt)).toEqual({ schema: "openthrottle.receipt/v1", ...withoutSchema });
   });
 
   it("relocks the worker worktree when the loop agent throws before evidence", () => {

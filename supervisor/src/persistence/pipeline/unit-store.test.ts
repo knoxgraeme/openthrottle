@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1311,7 +1312,46 @@ describe("execution unit store", () => {
       nowIso: "2026-07-29T00:00:00.000Z",
       leaseUntilIso: "2026-07-29T00:01:00.000Z",
     })!;
-    store.markActionDispatched(failed.id, "request-hash", "native-session");
+    const requestHash = "a".repeat(64);
+    store.markActionDispatched(failed.id, requestHash, "native-session");
+    const terminalPayload = JSON.stringify({
+      schema: "openthrottle.execution-work-terminal-payload/v1",
+      receipt_recovery_artifact: { schema: "openthrottle.loop-receipt-recovery/v1" },
+    });
+    const recoveryPayload = Buffer.from("gzip recovery bytes");
+    const payloadSha256 = createHash("sha256").update(recoveryPayload).digest("hex");
+    const privateArtifact = {
+      schema: "openthrottle.execution-work-private-artifact/v1" as const,
+      manifest: canonicalJson({
+        schema: "openthrottle.loop-receipt-recovery/v1",
+        action_id: failed.id,
+        attempt_id: "attempt-parent",
+        request_hash: requestHash,
+        subject: "b".repeat(40),
+        base_commit: "c".repeat(40),
+        candidate_commit: null,
+        candidate_tree: "d".repeat(40),
+        changed_paths: [],
+        changed_paths_count: 0,
+        changed_paths_sha256: digestNormalized(canonicalJson([])),
+        changed_paths_truncated: false,
+        diff_encoding: "gzip+git-diff",
+        diff_base64: null,
+        diff_bytes: 50_000,
+        diff_sha256: "e".repeat(64),
+        diff_truncated: false,
+        private_payload: {
+          schema: "openthrottle.execution-work-private-artifact/v1",
+          encoding: "gzip+git-diff",
+          bytes: recoveryPayload.byteLength,
+          sha256: payloadSha256,
+        },
+        source_manifest_sha256: "f".repeat(64),
+      }),
+      payload: recoveryPayload,
+      payloadSha256,
+      payloadBytes: recoveryPayload.byteLength,
+    };
 
     expect(store.failUnitAction({
       actionId: failed.id,
@@ -1319,6 +1359,8 @@ describe("execution unit store", () => {
       outcome: "failure",
       lastError: "child action returned failure",
       nativeSessionId: "native-session-2",
+      terminalPayload,
+      privateArtifact,
     })).toMatchObject({
       id: failed.id,
       status: "failed",
@@ -1326,6 +1368,7 @@ describe("execution unit store", () => {
       result_hash: "result-hash",
       native_session_id: "native-session-2",
       last_error: "child action returned failure",
+      payload: terminalPayload,
     });
     expect(store.listUnits("attempt-parent")).toEqual([
       expect.objectContaining({
@@ -1343,13 +1386,33 @@ describe("execution unit store", () => {
         alarm: false,
       }),
     ]);
+    expect(db!.prepare(`
+      SELECT schema, manifest, payload, payload_sha256, payload_bytes
+      FROM execution_work_private_artifacts WHERE action_id = ?
+    `).get(failed.id)).toMatchObject({
+      schema: privateArtifact.schema,
+      manifest: privateArtifact.manifest,
+      payload: recoveryPayload,
+      payload_sha256: privateArtifact.payloadSha256,
+      payload_bytes: privateArtifact.payloadBytes,
+    });
     expect(store.failUnitAction({
       actionId: failed.id,
       resultHash: "result-hash",
       outcome: "failure",
       lastError: "child action returned failure",
       nativeSessionId: "native-session-2",
+      terminalPayload,
+      privateArtifact,
     })).toMatchObject({ id: failed.id, status: "failed" });
+    expect(() => store.failUnitAction({
+      actionId: failed.id,
+      resultHash: "result-hash",
+      outcome: "failure",
+      lastError: "child action returned failure",
+      nativeSessionId: "native-session-2",
+      terminalPayload: JSON.stringify({ schema: "different" }),
+    })).toThrow(/already terminated with a different result/);
     expect(() => store.failUnitAction({
       actionId: failed.id,
       resultHash: "different-result",
@@ -1370,6 +1433,66 @@ describe("execution unit store", () => {
       lastError: "child action returned failure",
       nativeSessionId: "native-session-2",
     })).toThrow(/already terminated with a different result/);
+  });
+
+  it("prunes bounded expired private artifacts only after their pipeline is terminal", () => {
+    const store = setup();
+    const graph = store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    const insertArtifact = (actionId: string, createdAt: string) => {
+      db!.prepare(`
+        INSERT INTO execution_work_attempts (
+          id, execution_graph_id, execution_unit_id, pipeline_instance_id,
+          parent_attempt_id, parent_run_id, unit_id, attempt_ordinal,
+          action_kind, cycle, idempotency_key, status, payload,
+          terminal_result_outcome, created_at, updated_at, completed_at
+        ) VALUES (?, ?, NULL, 'instance-1', 'attempt-parent', 'run-parent', NULL, 1,
+          'final_repair', 1, ?, 'failed', '{}', 'failure', ?, ?, ?)
+      `).run(actionId, graph.id, `artifact-${actionId}`, createdAt, createdAt, createdAt);
+      db!.prepare(`
+        INSERT INTO execution_work_private_artifacts (
+          action_id, schema, manifest, payload, payload_sha256, payload_bytes, created_at
+        ) VALUES (?, 'openthrottle.execution-work-private-artifact/v1', '{}', X'01', ?, 1, ?)
+      `).run(actionId, "a".repeat(64), createdAt);
+    };
+    insertArtifact("old-a", "2026-05-01T00:00:00.000Z");
+    insertArtifact("old-b", "2026-05-01T00:00:00.000Z");
+    insertArtifact("old-c", "2026-05-01T00:00:00.000Z");
+    insertArtifact("recent", "2026-07-15T00:00:00.000Z");
+
+    expect(store.pruneExecutionWorkPrivateArtifacts("2026-06-29T00:00:00.000Z", 2)).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM execution_work_private_artifacts").pluck().get()).toBe(4);
+
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'needs_human', terminal_outcome = 'needs_human'
+      WHERE id = 'instance-1'
+    `).run();
+    expect(store.pruneExecutionWorkPrivateArtifacts("2026-06-29T00:00:00.000Z", 2)).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM execution_work_private_artifacts").pluck().get()).toBe(4);
+
+    db!.prepare(`
+      UPDATE pipeline_instances SET updated_at = '2026-05-01T00:00:00.000Z'
+      WHERE id = 'instance-1'
+    `).run();
+    expect(store.pruneExecutionWorkPrivateArtifacts("2026-06-29T00:00:00.000Z", 2)).toBe(2);
+    expect(db!.prepare(`
+      SELECT action_id FROM execution_work_private_artifacts ORDER BY action_id
+    `).pluck().all()).toEqual(["old-c", "recent"]);
+    expect(store.pruneExecutionWorkPrivateArtifacts("2026-06-29T00:00:00.000Z", 2)).toBe(1);
+    expect(db!.prepare(`
+      SELECT action_id FROM execution_work_private_artifacts ORDER BY action_id
+    `).pluck().all()).toEqual(["recent"]);
+    expect(() => store.pruneExecutionWorkPrivateArtifacts("not-a-date", 2)).toThrow(/cutoff is invalid/);
+    expect(() => store.pruneExecutionWorkPrivateArtifacts("2026-06-29T00:00:00.000Z", 0)).toThrow(/limit/);
   });
 
   it("stops the graph from retryable child infrastructure evidence without marking a unit defect", () => {

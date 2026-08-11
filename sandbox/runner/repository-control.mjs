@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   accessSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +22,7 @@ import { identityForUser } from "./filesystem-isolation.mjs";
 const COMMIT = /^[a-f0-9]{40}$/;
 const LOCAL_GIT_TIMEOUT_MS = 120_000;
 const REPOSITORY_CONTROL_TIMEOUT_MS = 30_000;
+const MAX_CANONICAL_UNTRACKED_PATH_BYTES = 8 * 1024 * 1024;
 const REPOSITORY_CONTROL_HELPER = fileURLToPath(new URL("./repository-control-helper.mjs", import.meta.url));
 const GIT_OPERATION_STATE = [
   "MERGE_HEAD",
@@ -91,6 +93,71 @@ export function runGitAsExecutor(repoDir, args, env = {}, { timeoutMs = LOCAL_GI
 
 function ownerGit(asExecutor) {
   return asExecutor ? runGitAsExecutor : runGitAsRepositoryOwner;
+}
+
+function runRepositoryOwnerShell(repoDir, script, positionalArgs, env, asExecutor) {
+  let command = "/bin/sh";
+  let args = ["-c", script, "ot-canonical-stage", ...positionalArgs];
+  const childEnv = { ...process.env, ...env, GIT_TERMINAL_PROMPT: "0" };
+  if (!asExecutor && typeof process.getuid === "function" && process.getuid() === 0) {
+    if (!existsSync("/usr/local/bin/gosu")) {
+      throw new Error("repository control requires the installed gosu privilege boundary");
+    }
+    command = "/usr/local/bin/gosu";
+    args = ["agent", "/bin/sh", ...args];
+    childEnv.HOME = "/home/agent";
+    childEnv.USER = "agent";
+  }
+  const result = runCapturedProcess(command, args, {
+    cwd: repoDir,
+    env: childEnv,
+    timeout: LOCAL_GIT_TIMEOUT_MS,
+    captureBytes: 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`canonical workspace staging failed: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-1_000)}`);
+  }
+}
+
+export function stageCanonicalWorkspaceIndex(repoDir, env, { asExecutor = false, scratchDir }) {
+  const untrackedPaths = join(scratchDir, "repository-untracked-paths.tmp");
+  const runOwnerGit = ownerGit(asExecutor);
+  rmSync(untrackedPaths, { force: true });
+  try {
+    // Enumerate untracked paths while applying only per-directory .gitignore
+    // rules. Deliberately omit --exclude-standard: non-repository global and
+    // $GIT_DIR/info excludes must not make completed worker output disappear.
+    // Ignored dependency/build trees are never enumerated or objectified.
+    runRepositoryOwnerShell(repoDir,
+      "exec git -c \"safe.directory=$2\" -c core.ignoreCase=false -c core.symlinks=true -c core.excludesFile=/dev/null ls-files --others --exclude-per-directory=.gitignore -z -- > \"$1\"",
+      [untrackedPaths, repoDir], env, asExecutor);
+    const untrackedPathBytes = statSync(untrackedPaths).size;
+    if (untrackedPathBytes > MAX_CANONICAL_UNTRACKED_PATH_BYTES) {
+      throw new Error(`repository untracked path evidence exceeds ${MAX_CANONICAL_UNTRACKED_PATH_BYTES} byte platform bound`);
+    }
+    runOwnerGit(repoDir, [
+      "-c", "core.fileMode=true",
+      "-c", "core.ignoreCase=false",
+      "-c", "core.symlinks=true",
+      "-c", "core.excludesFile=/dev/null",
+      "add", "-A", "--", ".",
+    ], env);
+    if (untrackedPathBytes > 0) {
+      // Force-add only the bounded untracked set that repository .gitignore
+      // permits. Literal NUL pathspecs preserve arbitrary path bytes.
+      runOwnerGit(repoDir, [
+        "--literal-pathspecs",
+        "-c", "core.fileMode=true",
+        "-c", "core.ignoreCase=false",
+        "-c", "core.symlinks=true",
+        "add", "-f",
+        `--pathspec-from-file=${untrackedPaths}`,
+        "--pathspec-file-nul",
+      ], env);
+    }
+  } finally {
+    rmSync(untrackedPaths, { force: true });
+  }
 }
 
 function optionalOwnerGit(repoDir, args, asExecutor = false) {
@@ -176,15 +243,26 @@ export function computeWorkspaceTreeOidFromTree(repoDir, baseTree, extraGitEnv =
     const alternates = extraAlternates.length > 0 ? extraAlternates : (commonObjects ? [commonObjects] : []);
     const env = {
       ...gitRepositoryEnvironment(effectiveGitEnv),
+      // A repository-level core.worktree must not redirect canonical subject
+      // evidence away from the checkout selected by the executor.
+      GIT_WORK_TREE: repoDir,
       GIT_INDEX_FILE: indexPath,
+      // Local replace refs must not change the meaning of a sealed object id.
+      GIT_NO_REPLACE_OBJECTS: "1",
       ...(isolateObjects ? {
         GIT_OBJECT_DIRECTORY: objectPath,
         GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates.join(delimiter),
       } : {}),
     };
     const runOwnerGit = ownerGit(asExecutor);
+    const sparseCheckout = runOwnerGit(repoDir, [
+      "config", "--bool", "--default=false", "--get", "core.sparseCheckout",
+    ], env);
+    if (sparseCheckout === "true") {
+      throw new Error("workspace subject requires a full non-sparse checkout");
+    }
     runOwnerGit(repoDir, ["read-tree", baseTree], env);
-    runOwnerGit(repoDir, ["add", "-A", "--", "."], env);
+    stageCanonicalWorkspaceIndex(repoDir, env, { asExecutor, scratchDir: temporary });
     return commit(runOwnerGit(repoDir, ["write-tree"], env), "workspace tree");
   } finally {
     rmSync(temporary, { recursive: true, force: true });

@@ -1,5 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 import { Daytona, type Sandbox } from "@daytona/sdk";
+import {
+  MAX_PRIVATE_RECOVERY_DIFF_BYTES,
+  parseLoopReceiptRecoveryContract,
+} from "@openthrottle/contracts";
 import {
   type RuntimeResource,
   type RuntimeControl,
@@ -29,6 +34,8 @@ const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
 const LOOP_DISPATCH_DIR = "/var/lib/openthrottle/loop-dispatch";
 const CHILD_EXECUTOR_DIR = "/var/lib/openthrottle/child-executor-actions";
 const CHILD_EXECUTOR_DISPATCH_DIR = "/var/lib/openthrottle/child-executor-dispatch";
+const PRIVATE_RECOVERY_DIFF_FILE = "recovery.patch.gz";
+const MAX_RECEIPT_CORRECTION_STATE_BYTES = 3 * 1024 * 1024;
 const STAGE_CREDENTIAL_ENV = new Set([
   "GITHUB_TOKEN",
   "CLAUDE_CODE_OAUTH_TOKEN",
@@ -160,6 +167,22 @@ function loopActionPath(attemptId: string, actionId: string, name: string): stri
   return `${LOOP_ACTION_DIR}/${attemptId}/${actionId}/${name}`;
 }
 
+function assertReceiptCorrectionState(
+  raw: string,
+  input: { attemptId: string; actionId: string; requestHash: string }
+): void {
+  if (Buffer.byteLength(raw, "utf8") > MAX_RECEIPT_CORRECTION_STATE_BYTES) {
+    throw new Error(`loop receipt correction state ${input.attemptId}/${input.actionId} exceeds 3 MiB`);
+  }
+  const state = JSON.parse(raw) as Record<string, unknown>;
+  if (state.schema !== "openthrottle.loop-receipt-correction/v1" ||
+      state.action_id !== input.actionId || state.attempt_id !== input.attemptId ||
+      state.request_hash !== input.requestHash || !Array.isArray(state.diagnostics) ||
+      typeof state.invalid_receipt_text !== "string") {
+    throw new Error(`loop receipt correction state ${input.attemptId}/${input.actionId} is invalid`);
+  }
+}
+
 function childExecutorActionPath(attemptId: string, actionId: string, name: string): string {
   safeStagePathId(attemptId, "child executor attempt ID");
   safeStagePathId(actionId, "child executor action ID");
@@ -241,6 +264,12 @@ function parseCollectedStageResult(raw: string, attemptId: string): StageExecuti
   };
 }
 
+class PrivateRecoveryIntegrityError extends Error {
+  constructor(readonly result: LoopActionResult) {
+    super("private recovery artifact failed integrity validation");
+  }
+}
+
 function parseCollectedLoopResult(raw: string, input: { attemptId: string; actionId: string; requestHash: string }): LoopActionResult {
   if (Buffer.byteLength(raw, "utf8") > 256 * 1024) throw new Error("sealed loop result exceeds 256 KiB");
   const event = JSON.parse(raw) as Record<string, unknown>;
@@ -255,7 +284,7 @@ function parseCollectedLoopResult(raw: string, input: { attemptId: string; actio
         (typeof event.codex_auth_json !== "string" || Buffer.byteLength(event.codex_auth_json, "utf8") > 65_536))) {
     throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} has an invalid envelope`);
   }
-  return {
+  const baseResult: LoopActionResult = {
     actionId: input.actionId,
     attemptId: event.attempt_id as string,
     requestHash: event.request_hash as string,
@@ -265,6 +294,110 @@ function parseCollectedLoopResult(raw: string, input: { attemptId: string; actio
     receipt: event.receipt as string,
     completedAt: event.created_at as string,
     ...(typeof event.codex_auth_json === "string" ? { codexAuthJson: event.codex_auth_json } : {}),
+  };
+  let recoveryArtifact: string | null = null;
+  if (event.recovery_artifact !== undefined) {
+    try {
+      if (typeof event.recovery_artifact !== "string" ||
+          Buffer.byteLength(event.recovery_artifact, "utf8") > 128 * 1024) {
+        throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} has an invalid recovery artifact`);
+      }
+      const artifact = parseLoopReceiptRecoveryContract(JSON.parse(event.recovery_artifact), {
+        source: `sealed_loop_result.${input.attemptId}.${input.actionId}.recovery_artifact`,
+      }).value as unknown as Record<string, unknown>;
+      if (artifact.action_id !== input.actionId || artifact.attempt_id !== input.attemptId ||
+          artifact.request_hash !== input.requestHash) {
+        throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} has an invalid recovery artifact fence`);
+      }
+      recoveryArtifact = event.recovery_artifact;
+    } catch {
+      throw new PrivateRecoveryIntegrityError(baseResult);
+    }
+  }
+  return {
+    ...baseResult,
+    ...(recoveryArtifact ? { recoveryArtifact } : {}),
+  };
+}
+
+async function materializePrivateRecoveryPayload(
+  sandbox: Sandbox,
+  result: LoopActionResult,
+  input: { attemptId: string; actionId: string; requestHash: string },
+): Promise<LoopActionResult> {
+  if (!result.recoveryArtifact) return result;
+  const artifact = JSON.parse(result.recoveryArtifact) as Record<string, unknown>;
+  if (artifact.diff_payload === undefined) return result;
+  if (!artifact.diff_payload || typeof artifact.diff_payload !== "object" || Array.isArray(artifact.diff_payload)) {
+    throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} has an invalid recovery diff payload`);
+  }
+  const descriptor = artifact.diff_payload as Record<string, unknown>;
+  const descriptorKeys = Object.keys(descriptor).sort();
+  if (descriptorKeys.join(",") !== "bytes,file,sha256" ||
+      descriptor.file !== PRIVATE_RECOVERY_DIFF_FILE ||
+      !Number.isSafeInteger(descriptor.bytes) || Number(descriptor.bytes) < 1 ||
+      Number(descriptor.bytes) > MAX_PRIVATE_RECOVERY_DIFF_BYTES ||
+      typeof descriptor.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(descriptor.sha256) ||
+      artifact.diff_encoding !== "gzip+git-diff" || artifact.diff_base64 !== null ||
+      artifact.diff_truncated !== false || !Number.isSafeInteger(artifact.diff_bytes) ||
+      Number(artifact.diff_bytes) <= 48 * 1024 || Number(artifact.diff_bytes) > MAX_PRIVATE_RECOVERY_DIFF_BYTES) {
+    throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} has an invalid recovery diff payload`);
+  }
+  const payload = await sandbox.fs.downloadFile(
+    loopActionPath(input.attemptId, input.actionId, PRIVATE_RECOVERY_DIFF_FILE)
+  );
+  if (!payload || payload.byteLength !== descriptor.bytes ||
+      createHash("sha256").update(payload).digest("hex") !== descriptor.sha256) {
+    throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} recovery diff payload does not match its fence`);
+  }
+  let uncompressed: Buffer;
+  try {
+    uncompressed = gunzipSync(payload, { maxOutputLength: MAX_PRIVATE_RECOVERY_DIFF_BYTES });
+  } catch {
+    throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} recovery diff payload is not bounded gzip`);
+  }
+  if (uncompressed.byteLength !== artifact.diff_bytes) {
+    throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} recovery diff payload length does not match its fence`);
+  }
+  if (createHash("sha256").update(uncompressed).digest("hex") !== artifact.diff_sha256) {
+    throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} recovery diff payload content does not match its fence`);
+  }
+  const { diff_payload: _externalPayload, ...portableArtifact } = artifact;
+  const recoveryArtifact = parseLoopReceiptRecoveryContract({
+    ...portableArtifact,
+    diff_base64: null,
+    private_payload: {
+      schema: "openthrottle.execution-work-private-artifact/v1",
+      encoding: "gzip+git-diff",
+      bytes: descriptor.bytes,
+      sha256: descriptor.sha256,
+    },
+    source_manifest_sha256: createHash("sha256").update(result.recoveryArtifact).digest("hex"),
+  }, { source: `materialized_recovery.${input.attemptId}.${input.actionId}` }).normalized;
+  return { ...result, recoveryArtifact, recoveryPayload: payload };
+}
+
+function preserveWorkspaceForRecoveryFailure(
+  result: LoopActionResult,
+  input: { attemptId: string; actionId: string; requestHash: string }
+): LoopActionResult {
+  const recoveryArtifact = parseLoopReceiptRecoveryContract({
+    schema: "openthrottle.loop-receipt-recovery/v1",
+    action_id: input.actionId,
+    attempt_id: input.attemptId,
+    request_hash: input.requestHash,
+    subject: result.subject,
+    recovery_subject: result.subject,
+    requires_workspace_preservation: true,
+    error: "private recovery payload could not be verified; inspect the preserved workspace",
+  }, { source: `recovery_preservation.${input.attemptId}.${input.actionId}` }).normalized;
+  return {
+    ...result,
+    outcome: "needs_human",
+    receipt: `${result.receipt} private recovery payload could not be verified; workspace preservation required`
+      .slice(0, 128_000),
+    recoveryArtifact,
+    recoveryPayload: null,
   };
 }
 
@@ -617,12 +750,70 @@ export function createDaytonaSandboxRuntime(
       safeStagePathId(input.actionId, "loop action ID");
       if (!/^[a-f0-9]{64}$/.test(input.requestHash)) throw new Error("loop request hash is invalid");
       const sandbox = await getSandbox(resource);
+      let raw: string;
       try {
-        const raw = (await sandbox.fs.downloadFile(loopActionPath(input.attemptId, input.actionId, "result.json"))).toString("utf8");
-        return parseCollectedLoopResult(raw, input);
+        raw = (await sandbox.fs.downloadFile(loopActionPath(input.attemptId, input.actionId, "result.json"))).toString("utf8");
       } catch (error) {
-        if (String(error).toLowerCase().includes("not found")) return null;
+        if (String(error).toLowerCase().includes("not found")) {
+          let correctionState: string;
+          try {
+            correctionState = (await sandbox.fs.downloadFile(
+              loopActionPath(input.attemptId, input.actionId, "receipt-correction.json")
+            )).toString("utf8");
+          } catch (correctionError) {
+            if (String(correctionError).toLowerCase().includes("not found")) return null;
+            throw correctionError;
+          }
+          assertReceiptCorrectionState(correctionState, input);
+          const activeSandbox = await ensureStarted(resource);
+          if (!activeSandbox.process?.executeSessionCommand) {
+            throw new Error("Daytona runtime does not expose session command execution");
+          }
+          const sessionId = `loop-correction-${input.actionId}`;
+          await activeSandbox.process.createSession?.(sessionId).catch(() => undefined);
+          const requestPath = loopActionPath(input.attemptId, input.actionId, "request.json");
+          const credentialsPath = loopActionPath(input.attemptId, input.actionId, "credentials.json");
+          const resultPath = loopActionPath(input.attemptId, input.actionId, "result.json");
+          const lockPath = `${LOOP_DISPATCH_DIR}/${input.attemptId}.${input.actionId}.lock`;
+          const cleanEnv = [
+            "env -i",
+            "HOME=/home/agent",
+            "USER=agent",
+            "LOGNAME=agent",
+            "SHELL=/bin/bash",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            `OT_CHILD_ACTION_ID=${shellSingleQuoted(input.actionId)}`,
+          ].join(" ");
+          await activeSandbox.process.executeSessionCommand(sessionId, {
+            command: `flock --nonblock ${lockPath} sh -c ` + shellSingleQuoted(
+              `if test ! -f ${shellSingleQuoted(resultPath)}; then ` +
+              `${cleanEnv} /opt/openthrottle/runner/execute-loop.mjs ` +
+              `--request ${shellSingleQuoted(requestPath)} --credentials ${shellSingleQuoted(credentialsPath)} ` +
+              `--output ${shellSingleQuoted(resultPath)}; fi`
+            ),
+            runAsync: true,
+            suppressInputEcho: true,
+          }, loopActionDispatchTimeoutSeconds(30_000));
+          return null;
+        }
         throw error;
+      }
+      // Once the sealed result exists, a referenced recovery payload is part
+      // of that result. A missing/malformed payload is an integrity failure,
+      // never evidence that the action result itself is merely pending.
+      let parsed: LoopActionResult;
+      try {
+        parsed = parseCollectedLoopResult(raw, input);
+      } catch (error) {
+        if (error instanceof PrivateRecoveryIntegrityError) {
+          return preserveWorkspaceForRecoveryFailure(error.result, input);
+        }
+        throw error;
+      }
+      try {
+        return await materializePrivateRecoveryPayload(sandbox, parsed, input);
+      } catch {
+        return preserveWorkspaceForRecoveryFailure(parsed, input);
       }
     },
 

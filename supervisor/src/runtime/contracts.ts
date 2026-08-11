@@ -80,6 +80,7 @@ export interface LoopActionRequest {
   skill: string;
   worktree: RuntimeWorktreeHandle | null;
   baseSubject?: string;
+  recoveryBaseSubject?: string;
   inputSubject?: string;
   candidateSubject?: string | null;
   nativeSessionId: string | null;
@@ -132,6 +133,13 @@ export interface LoopActionResult {
   // action-scoped CODEX_HOME rotated its OAuth refresh token. Never derived
   // from agent-authored text.
   codexAuthJson?: string | null;
+  // Present only for terminal receipt-correction exhaustion/mutation failure.
+  // Contains a private, bounded recovery artifact persisted by the supervisor
+  // before the sandbox may be cleaned up.
+  recoveryArtifact?: string | null;
+  // Compressed recovery bytes are deliberately separate from the JSON result
+  // so they can be stored in a cold BLOB row without inflating hot work rows.
+  recoveryPayload?: Uint8Array | null;
 }
 
 export interface ChildExecutorActionRequest {
