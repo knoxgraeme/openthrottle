@@ -775,6 +775,8 @@ function backfillSelectionPublications(db: Database.Database): void {
       'shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed',
       'publication_blocked'
     )
+      AND json_valid(pi.normalized_manifest)
+      AND json_type(pi.normalized_manifest, '$.stages') = 'array'
       AND NOT EXISTS (
         SELECT 1 FROM pipeline_publication_receipts ppr
         WHERE ppr.pipeline_instance_id = pi.id AND ppr.kind = 'control_ledger'
@@ -1923,7 +1925,7 @@ structured-review-dispatch-contract:selector fanout and validator subactions per
 const controlProviderRegistrationSchema = `
 CREATE TABLE repository_registrations_control_v33 (
   github_repo TEXT PRIMARY KEY COLLATE NOCASE,
-  control_provider TEXT NOT NULL CHECK(control_provider IN ('linear', 'github')),
+  control_provider TEXT NOT NULL DEFAULT 'linear' CHECK(control_provider IN ('linear', 'github')),
   linear_team_key TEXT COLLATE NOCASE,
   linear_team_id TEXT,
   base_branch TEXT NOT NULL,
@@ -1940,7 +1942,15 @@ INSERT INTO repository_registrations_control_v33 (
 SELECT
   github_repo, 'linear', linear_team_key, linear_team_id,
   base_branch, webhook_id, snapshot, created_at, updated_at
-FROM repository_registrations;
+FROM (
+  SELECT repository_registrations.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY lower(github_repo)
+      ORDER BY updated_at DESC, created_at DESC, rowid DESC
+    ) AS repository_rank
+  FROM repository_registrations
+)
+WHERE repository_rank = 1;
 DROP TABLE repository_registrations;
 ALTER TABLE repository_registrations_control_v33 RENAME TO repository_registrations;
 CREATE UNIQUE INDEX repository_registrations_linear_team_key_idx
@@ -1997,6 +2007,8 @@ SELECT
 FROM pipeline_publication_receipts;
 DROP TABLE pipeline_publication_receipts;
 ALTER TABLE pipeline_publication_receipts_control_v34 RENAME TO pipeline_publication_receipts;
+CREATE INDEX pipeline_publications_process_idx
+  ON pipeline_publication_receipts(kind, status, next_attempt_at);
 
 CREATE TABLE pipeline_effect_intents_control_v34 (
   id TEXT PRIMARY KEY,
@@ -2031,6 +2043,8 @@ SELECT
 FROM pipeline_effect_intents;
 DROP TABLE pipeline_effect_intents;
 ALTER TABLE pipeline_effect_intents_control_v34 RENAME TO pipeline_effect_intents;
+CREATE INDEX pipeline_effects_pending_idx
+  ON pipeline_effect_intents(status, next_attempt_at);
 PRAGMA foreign_keys = ON;
 `;
 
@@ -2806,6 +2820,10 @@ const definitions: DatabaseMigrationDefinition[] = [
     source: neutralControlIdentifierMigrationSource,
     up(db) {
       migrateNeutralControlIdentifiers(db);
+      // V13 cannot use the neutral writer on a legacy schema. Reconcile after
+      // the identifier/vocabulary migration so direct upgrades still receive
+      // every missing selection publication exactly once.
+      backfillSelectionPublications(db);
     },
   },
 ];
