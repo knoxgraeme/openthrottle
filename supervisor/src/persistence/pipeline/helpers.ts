@@ -518,7 +518,10 @@ export function createPipelinePublicationWriter(db: Database.Database) {
         input.timestamp,
         input.timestamp
       );
-      const statusId = deterministicPublicationId(`control-status:${input.instance.id}`);
+      // This prefix is part of the durable projection identity, not provider
+      // routing vocabulary. Keep it stable so a v35 upgrade updates the
+      // existing status comment instead of creating a duplicate projection.
+      const statusId = deterministicPublicationId(`linear-status:${input.instance.id}`);
       const statusPayload = pipelineStatusOutboxPayload(envelope);
       db.prepare(`
         INSERT INTO control_outbox (
@@ -568,8 +571,17 @@ export function createPipelinePublicationWriter(db: Database.Database) {
         timestamp: input.timestamp,
       });
     } else {
-      const stableKey = `github-summary:${input.instance.ticket_id}`;
-      const stableId = deterministicPublicationId(stableKey);
+      const existingProjection = db.prepare(`
+        SELECT ppr.id, ppr.idempotency_key
+        FROM pipeline_publication_receipts ppr
+        JOIN pipeline_instances prior ON prior.id = ppr.pipeline_instance_id
+        WHERE ppr.kind = 'github_summary' AND prior.ticket_id = ?
+        ORDER BY ppr.created_at, ppr.id
+        LIMIT 1
+      `).get(input.instance.ticket_id) as { id: string; idempotency_key: string } | undefined;
+      const stableKey = existingProjection?.idempotency_key ??
+        `github-summary:${input.instance.ticket_id}`;
+      const stableId = existingProjection?.id ?? deterministicPublicationId(stableKey);
       db.prepare(`
         INSERT INTO pipeline_publication_receipts (
           id, pipeline_instance_id, attempt_id, kind, idempotency_key,
