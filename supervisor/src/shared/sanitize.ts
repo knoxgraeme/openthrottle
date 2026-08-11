@@ -4,8 +4,30 @@ const TOKEN_PATTERNS = [
   /\bgithub_pat_[A-Za-z0-9_]+\b/g,
   /\bsk-[A-Za-z0-9_-]+\b/g,
   /\blin_(?:api|oauth)_[A-Za-z0-9_]+\b/g,
-  /Bearer\s+\S+/gi,
 ];
+const BEARER_CANDIDATE = /\bBearer[ \t]+([A-Za-z0-9._~+/\-]+={0,2})/gi;
+const BEARER_PROSE = new Set(["authentication", "authorization", "credential", "credentials", "token", "tokens"]);
+
+function isSecretBearerCandidate(text: string, candidate: string, offset: number): boolean {
+  const context = text.slice(Math.max(0, offset - 48), offset).replaceAll("\\", "");
+  if (/Authorization["']?[ \t]*:[ \t]*["']?[ \t]*$/i.test(context)) return true;
+  return !BEARER_PROSE.has(candidate.toLowerCase());
+}
+
+function redactBearerSecrets(text: string): string {
+  return text.replace(BEARER_CANDIDATE, (match, candidate: string, offset: number) =>
+    isSecretBearerCandidate(text, candidate, offset) ? "[REDACTED]" : match);
+}
+
+export function containsSecretShapedValue(text: string): boolean {
+  if (TOKEN_PATTERNS.some((pattern) => new RegExp(pattern.source, pattern.flags.replace("g", "")).test(text))) {
+    return true;
+  }
+  for (const match of text.matchAll(BEARER_CANDIDATE)) {
+    if (isSecretBearerCandidate(text, match[1]!, match.index)) return true;
+  }
+  return false;
+}
 
 function nestedSecretStrings(value: string): string[] {
   if (!value.trim().startsWith("{") && !value.trim().startsWith("[")) return [];
@@ -45,5 +67,5 @@ export function sanitizeText(
     .sort((left, right) => right.length - left.length);
   for (const value of new Set(values)) sanitized = sanitized.split(value).join("[REDACTED]");
   for (const pattern of TOKEN_PATTERNS) sanitized = sanitized.replace(pattern, "[REDACTED]");
-  return sanitized;
+  return redactBearerSecrets(sanitized).replace(/\bBearer[ \t]+\[REDACTED\]/gi, "[REDACTED]");
 }

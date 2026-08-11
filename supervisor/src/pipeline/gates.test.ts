@@ -705,8 +705,16 @@ describe("deterministic supervisor stage gates", () => {
     wrongAssurance.resultHash = wrongAssurance.artifacts![0]!.hash;
     expect(() => evaluateStageGate(fixture.pipelines, wrongAssurance)).toThrow(/assurance mismatch/);
 
-    const leaked = event(fixture, "success", { summary: "Bearer secret-token-value" });
+    const leaked = event(fixture, "success", { summary: "Bearer opaque-secret-token-value-1234567890" });
     expect(() => evaluateStageGate(fixture.pipelines, leaked)).toThrow(/secret-shaped/);
+
+    const shortAuthorizationToken = event(fixture, "success", { summary: "Authorization: Bearer abc123" });
+    expect(() => evaluateStageGate(fixture.pipelines, shortAuthorizationToken)).toThrow(/secret-shaped/);
+
+    const safeBearerProse = event(fixture, "success", {
+      summary: "CODEX_AUTH_JSON bearer credentials are isolated from repository tools",
+    });
+    expect(() => evaluateStageGate(fixture.pipelines, safeBearerProse)).not.toThrow();
 
     const oversized = event(fixture, "success", { details: { output: "x".repeat(13 * 1024) } });
     expect(() => evaluateStageGate(fixture.pipelines, oversized)).toThrow(/size limit/);

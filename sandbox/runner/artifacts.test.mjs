@@ -8,6 +8,7 @@ import {
   isStageProposalShaped,
   isStandardReceiptShaped,
   parseAgentJson,
+  sanitizeArtifactText,
   validateStandardReceipt,
   validateSemanticProposal,
 } from "./artifacts.mjs";
@@ -98,6 +99,22 @@ describe("normalized stage artifacts", () => {
     expect(artifact.payload).not.toContain("private-value");
     expect(JSON.parse(artifact.payload).summary.length).toBeLessThanOrEqual(2_000);
     expect(Buffer.byteLength(artifact.payload, "utf8")).toBeLessThanOrEqual(12 * 1024);
+  });
+
+  it("keeps bearer prose but redacts bearer-token shapes", () => {
+    const prose = "CODEX_AUTH_JSON bearer credentials support Bearer authentication and Bearer token";
+    expect(sanitizeArtifactText(prose, {})).toBe(prose);
+    for (const secret of [
+      "Bearer eyJhbGciOiJIUzI1NiJ9.cGF5bG9hZA.c2lnbmF0dXJl",
+      "Bearer k7dP3nQ9xR2mV8z",
+      "Bearer opaque._~+/-value-1234567890=",
+      "Authorization: Bearer abc123",
+      '{"authorization":"Bearer abc123"}',
+      'summary: "{\\"authorization\\":\\"Bearer abc123\\"}"',
+    ]) {
+      expect(sanitizeArtifactText(secret, {})).not.toContain(secret.split("Bearer ")[1]);
+      expect(sanitizeArtifactText(secret, {})).toContain("[REDACTED]");
+    }
   });
 
   it("records mechanical command context and never treats termination as success", () => {

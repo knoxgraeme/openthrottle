@@ -19,18 +19,12 @@ import type {
   PipelineStageAttempt,
   PipelineStore,
 } from "./store.js";
+import { containsSecretShapedValue } from "../shared/sanitize.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
 const GIT_COMMIT = /^[a-f0-9]{40}$/;
 const ARTIFACT_LIMIT = 12 * 1024;
-const SECRET_PATTERNS = [
-  /gh[opsu]_[A-Za-z0-9_]+/,
-  /github_pat_[A-Za-z0-9_]+/,
-  /sk-[A-Za-z0-9_-]+/,
-  /lin_(?:api|oauth)_[A-Za-z0-9_]+/,
-  /Bearer\s+\S+/i,
-];
 const ARTIFACT_KEYS = new Set([
   "schema", "kind", "producer", "pipeline", "stage", "run", "repository",
   "assurance", "result", "summary", "evidence", "findings", "actions",
@@ -217,7 +211,7 @@ function parseArtifactPayload(artifact: PipelineEventArtifact): TypedArtifactPay
   if (Buffer.byteLength(artifact.payload, "utf8") > ARTIFACT_LIMIT) {
     throw new Error(`artifact ${artifact.kind} exceeds the gate size limit`);
   }
-  if (SECRET_PATTERNS.some((pattern) => pattern.test(artifact.payload))) {
+  if (containsSecretShapedValue(artifact.payload)) {
     throw new Error(`artifact ${artifact.kind} contains a secret-shaped value`);
   }
   if (!SHA256.test(artifact.hash) || digestNormalized(artifact.payload) !== artifact.hash) {
