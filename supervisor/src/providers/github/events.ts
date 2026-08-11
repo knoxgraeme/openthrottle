@@ -468,6 +468,8 @@ const CODEX_REVIEW_COMMAND = "@codex review";
 const CODEX_CLEAN_REVIEW_AUTHOR = "codex[bot]";
 const CODEX_CLEAN_REVIEW_PATTERN =
   /^Codex Review: Didn't find any major issues\n\nReviewed commit: `?([a-f0-9]{7,40})`?$/i;
+const CODEX_CONNECTOR_AUTHOR = /^[a-z0-9-]+-codex-connector\[bot\]$/;
+const CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE = "To use Codex here, create an environment for this repo.";
 const REVIEWED_COMMIT = /^[a-f0-9]{7,40}$/;
 
 function isGithubBotLinkback(author: string, body: string | undefined): boolean {
@@ -528,6 +530,16 @@ function codexCleanReviewMatchesCurrentHead(input: {
       input.authorType !== "Bot") return false;
   const reviewedCommit = reviewedCommitFromCodexCleanReview(input.body);
   return reviewedCommit !== undefined && input.headSha.startsWith(reviewedCommit);
+}
+
+function isCodexConnectorSetupRequiredNotice(input: {
+  author: string;
+  authorType?: string;
+  body: string | undefined;
+}): boolean {
+  return input.authorType === "Bot" &&
+    CODEX_CONNECTOR_AUTHOR.test(input.author.toLowerCase()) &&
+    input.body?.trim() === CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE;
 }
 
 function boundedSanitized(value: string, maxChars: number): string {
@@ -960,6 +972,7 @@ export async function handleGithubEvent(
     if (!ticket) return;
     const author = event.comment.user?.login;
     if (!author) return;
+    const authorType = event.comment.user?.type;
     // Provenance first: comment IDs persisted by supervisor publication are
     // the machine's own output. Body markup never establishes that provenance;
     // this separate check recognizes only explicit Linear bridge artifacts.
@@ -977,9 +990,24 @@ export async function handleGithubEvent(
       });
       return;
     }
+    if (isCodexConnectorSetupRequiredNotice({
+      author,
+      authorType,
+      body: event.comment.body,
+    })) {
+      recordIgnoredGithubProviderNoise({
+        pipelines,
+        ticket,
+        eventId: `github-comment:${event.comment.id}`,
+        eventKind: "issue_comment",
+        reason: "codex_connector_setup_required_notice",
+        headSha,
+      });
+      return;
+    }
     if (codexCleanReviewMatchesCurrentHead({
       author,
-      authorType: event.comment.user?.type,
+      authorType,
       body: event.comment.body,
       headSha,
     })) {

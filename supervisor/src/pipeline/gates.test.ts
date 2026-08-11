@@ -2099,6 +2099,104 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toBeUndefined();
   });
 
+  it("ignores exact trusted Codex connector setup-required notices before repair admission", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+    const setupNotice = (id: number) => handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id,
+          body: "To use Codex here, create an environment for this repo.",
+          html_url: `https://github.com/owner/repo/pull/1#issuecomment-${id}`,
+          user: { login: "openthrottle-codex-connector[bot]", type: "Bot" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    await setupNotice(703);
+    await setupNotice(703);
+
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+    expect(fixture.db.prepare("SELECT outcome FROM orchestration_journal WHERE outcome = ?").get("codex_connector_setup_required_notice"))
+      .toEqual({ outcome: "codex_connector_setup_required_notice" });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
+  });
+
+  it.each([
+    {
+      label: "near-match setup notice with extra feedback",
+      body: "To use Codex here, create an environment for this repo.\n\nPlease also fix the adapter.",
+      user: { login: "openthrottle-codex-connector[bot]", type: "Bot" },
+    },
+    {
+      label: "untrusted author copying setup notice",
+      body: "To use Codex here, create an environment for this repo.",
+      user: { login: "reviewer", type: "User" },
+    },
+    {
+      label: "non-connector bot copying setup notice",
+      body: "To use Codex here, create an environment for this repo.",
+      user: { login: "codex[bot]", type: "Bot" },
+    },
+  ])("admits $label as substantive PR comment feedback", async ({ body, user }) => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 704,
+          body,
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-704",
+          user,
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(activityPublisher.publishActivity).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      type: "action",
+      action: "PR comment",
+      parameter: user.login,
+      result: "https://github.com/owner/repo/pull/1#issuecomment-704",
+    }, "issue-1");
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(1);
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
   it.each([
     {
       label: "near-match clean review text",
