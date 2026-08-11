@@ -284,6 +284,52 @@ function publicationSubjects(payload: string): string[] {
   }
 }
 
+function publicationProviderHeads(payload: string): string[] {
+  try {
+    const parsed = JSON.parse(payload) as {
+      decision?: { subject?: unknown };
+      artifact_inline?: unknown;
+      attachment?: { content?: unknown };
+    };
+    const subjects = new Set<string>();
+    for (const artifacts of [parsed.artifact_inline, parsed.attachment?.content]) {
+      if (typeof artifacts !== "string") continue;
+      try {
+        for (const revision of providerRevisionsFromArtifacts(JSON.parse(artifacts) as unknown)) {
+          subjects.add(revision);
+        }
+      } catch {
+        // Older or malformed publication payloads simply cannot prove provider heads.
+      }
+    }
+    const subject = commitString(parsed.decision?.subject);
+    if (subjects.size === 0 && subject) subjects.add(subject);
+    return [...subjects];
+  } catch {
+    return [];
+  }
+}
+
+export function acknowledgedPublicationHeadAt(
+  pipelines: PipelineStore,
+  instance: PipelineInstance,
+  observedAt: string | undefined
+): string | undefined {
+  if (!observedAt || Number.isNaN(Date.parse(observedAt))) return undefined;
+  return pipelines.listPublications(instance.id)
+    .filter((publication) => publication.status === "acknowledged")
+    .map((publication) => ({
+      at: publication.acknowledged_at ?? publication.created_at,
+      publication,
+    }))
+    .filter(({ at }) => at <= observedAt)
+    .sort((left, right) =>
+      right.at.localeCompare(left.at) || right.publication.id.localeCompare(left.publication.id)
+    )
+    .flatMap(({ publication }) => publicationProviderHeads(publication.payload))
+    .at(0);
+}
+
 function snapshotBelongsToInstance(
   snapshot: FeedbackSnapshot,
   instance: PipelineInstance
@@ -370,14 +416,23 @@ function snapshotCompletedRepairBeforeCurrentPublication(
 function staleFeedbackNotice(params: {
   sessionId: string;
   eventCount: number;
+  eventIds: string[];
+  reviewedHead: string;
+  currentPublishedHead: string | null;
+  classification: "superseded_head";
 }): string {
   const count = Math.max(1, params.eventCount);
+  const eventIds = params.eventIds.length > 0
+    ? params.eventIds.slice(0, 3).map((eventId) => sanitizeText(eventId).slice(0, 120)).join(",")
+    : "unknown";
+  const reviewedHead = sanitizeText(params.reviewedHead).slice(0, 120);
+  const currentHead = sanitizeText(params.currentPublishedHead ?? "unknown").slice(0, 120);
   return JSON.stringify({
     type: "activity",
     activity: {
       sessionId: params.sessionId,
       type: "error",
-      body: `${count} feedback item(s) arrived against a superseded head and were not applied; re-comment on the current PR head.`,
+      body: `${count} feedback item(s) arrived against a superseded head and were not applied; classification=${params.classification}; event_ids=${eventIds}; reviewed_head=${reviewedHead}; current_published_head=${currentHead}; re-comment on the current PR head.`,
     },
   });
 }
@@ -388,12 +443,17 @@ function markStaleFeedbackWithNotice(params: {
   snapshot: FeedbackSnapshot;
   eventCount: number;
 }): void {
+  const events = params.store.listFeedbackSnapshotEvents(params.snapshot.id);
   params.store.markFeedbackSnapshotStaleWithNotice({
     snapshotId: params.snapshot.id,
     noticeId: `feedback-snapshot-stale:${params.snapshot.id}`,
     payload: staleFeedbackNotice({
       sessionId: params.instance.session_id,
       eventCount: params.eventCount,
+      eventIds: events.map((event) => `${event.provider}:${event.provider_event_id}`),
+      reviewedHead: params.snapshot.observed_head_sha ?? params.snapshot.head_sha,
+      currentPublishedHead: params.instance.published_commit,
+      classification: "superseded_head",
     }),
   });
 }

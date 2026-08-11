@@ -27,6 +27,7 @@ import type { PipelineStore } from "../../pipeline/store.js";
 import { processProviderEvidence } from "../../pipeline/gates.js";
 import { requestPipelineStop } from "../../pipeline/control.js";
 import {
+  acknowledgedPublicationHeadAt,
   pipelineIsTerminal,
   processPipelineFeedbackSnapshot,
   providerStageCanReceive,
@@ -471,6 +472,7 @@ const CODEX_CLEAN_REVIEW_PATTERN =
   /^Codex Review: Didn't find any major issues\. [^\n]{1,120}\n\n\*\*Reviewed commit:\*\* `([a-f0-9]{7,40})`\n\n<details> <summary>ℹ️ About Codex in GitHub<\/summary>\n<br\/>\n\n\[Your team has set up Codex to review pull requests in this repo\]\(https:\/\/chatgpt\.com\/codex\/cloud\/settings\/general\)\. Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment "@codex review"\.\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍\.\s+Codex can also answer questions or update the PR\. Try commenting "@codex address that feedback"\.\s*<\/details>$/i;
 const CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE =
   "To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).";
+const GITHUB_COMMIT_SHA = /^[a-f0-9]{40}$/;
 const REVIEWED_COMMIT = /^[a-f0-9]{7,40}$/;
 
 function isGithubBotLinkback(author: string, body: string | undefined): boolean {
@@ -519,6 +521,11 @@ function reviewedCommitFromCodexCleanReview(body: string | undefined): string | 
   const match = CODEX_CLEAN_REVIEW_PATTERN.exec(normalized);
   const commit = match?.[1]?.toLowerCase();
   return commit && REVIEWED_COMMIT.test(commit) ? commit : undefined;
+}
+
+function githubCommitSha(value: string | undefined): string | undefined {
+  const normalized = value?.toLowerCase();
+  return normalized && GITHUB_COMMIT_SHA.test(normalized) ? normalized : undefined;
 }
 
 function isTrustedCodexConnectorAuthor(input: {
@@ -749,11 +756,14 @@ export async function handleGithubEvent(
     // supervisor never authors pull-request reviews, so no machine-output
     // filtering applies here — every attested review is human.
     if (!author) return;
-    const headSha = event.pull_request.head.sha ??
+    const prHeadSha = event.pull_request.head.sha;
+    const reviewedHeadSha = githubCommitSha(event.review.commit_id);
+    const headSha = reviewedHeadSha ??
+      prHeadSha ??
       store.getSetting(`github-head:${ticket.ticket_id}`) ??
       `unknown:${event.pull_request.head.ref}`;
-    if (event.pull_request.head.sha) {
-      setAuthoritativeGithubHead(store, ticket.ticket_id, headSha);
+    if (prHeadSha) {
+      setAuthoritativeGithubHead(store, ticket.ticket_id, prHeadSha);
     } else if (!store.getSetting(`github-head:${ticket.ticket_id}`)) {
       store.setSetting(`github-head:${ticket.ticket_id}`, headSha);
     }
@@ -982,7 +992,11 @@ export async function handleGithubEvent(
     // the machine's own output. Body markup never establishes that provenance;
     // this separate check recognizes only explicit Linear bridge artifacts.
     if (isGithubBotLinkback(author, event.comment.body)) return;
-    const headSha = store.getSetting(`github-head:${ticket.ticket_id}`) ??
+    const instance = pipelines.getInstanceForSession(ticket.session_id);
+    const headSha = (instance && !pipelineIsTerminal(instance)
+      ? acknowledgedPublicationHeadAt(pipelines, instance, event.comment.created_at)
+      : undefined) ??
+      store.getSetting(`github-head:${ticket.ticket_id}`) ??
       `unknown:${ticket.branch}`;
     if (isExactCodexReviewCommand(event.comment.body)) {
       recordIgnoredGithubProviderNoise({

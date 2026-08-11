@@ -3314,6 +3314,126 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
+  it("records a delayed review against its reviewed commit instead of the newer PR head", async () => {
+    const fixture = setup("core/implement@4");
+    const reviewedHead = "d".repeat(40);
+    const repairedHead = PUBLISHED_COMMIT;
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    recordAcknowledgedPublication(fixture, "b".repeat(40), { publishedCommit: reviewedHead }, "publication-reviewed");
+    recordAcknowledgedPublication(fixture, SUBJECT, { publishedCommit: repairedHead }, "publication-repaired");
+    moveFixtureToProviderWait(fixture, SUBJECT, repairedHead);
+    fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
+      .run(fixture.instance.id);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          head: { ref: "ot/issue-1", sha: repairedHead },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 4907097134,
+          state: "commented",
+          commit_id: reviewedHead,
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-4907097134",
+          user: { login: "chatgpt-codex-connector[bot]" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.db.prepare(`
+      SELECT head_sha FROM provider_events WHERE provider_event_id = ?
+    `).get("github-review:4907097134")).toEqual({ head_sha: reviewedHead });
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots").get())
+      .toEqual({ status: "stale", head_sha: reviewedHead });
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "waiting_provider",
+      terminal_outcome: null,
+    });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
+    expect(fixture.db.prepare("SELECT payload FROM control_outbox WHERE id LIKE 'feedback-snapshot-stale:%'")
+      .get()).toBeDefined();
+  });
+
+  it("records a delayed top-level PR comment against the head published when it was created", async () => {
+    const fixture = setup("core/implement@4");
+    const commentedHead = "d".repeat(40);
+    const repairedHead = PUBLISHED_COMMIT;
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    recordAcknowledgedPublication(fixture, "b".repeat(40), { publishedCommit: commentedHead }, "publication-commented");
+    recordAcknowledgedPublication(fixture, SUBJECT, { publishedCommit: repairedHead }, "publication-repaired");
+    fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts SET created_at = ?, acknowledged_at = ?
+      WHERE id = ?
+    `).run("2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", "publication-commented");
+    fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts SET created_at = ?, acknowledged_at = ?
+      WHERE id = ?
+    `).run("2026-01-01T00:00:10.000Z", "2026-01-01T00:00:10.000Z", "publication-repaired");
+    moveFixtureToProviderWait(fixture, SUBJECT, repairedHead);
+    fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
+      .run(fixture.instance.id);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 4907098001,
+          body: "Please repair the provider feedback handling.",
+          created_at: "2026-01-01T00:00:05.000Z",
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-4907098001",
+          user: { login: "reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.db.prepare(`
+      SELECT head_sha FROM provider_events WHERE provider_event_id = ?
+    `).get("github-comment:4907098001")).toEqual({ head_sha: commentedHead });
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots").get())
+      .toEqual({ status: "stale", head_sha: commentedHead });
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "waiting_provider",
+      terminal_outcome: null,
+    });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
+    const staleNotice = fixture.db.prepare("SELECT payload FROM control_outbox WHERE id LIKE 'feedback-snapshot-stale:%'")
+      .get() as { payload: string };
+    expect(JSON.parse(staleNotice.payload).activity.body).toContain("github:github-comment:4907098001");
+    expect(JSON.parse(staleNotice.payload).activity.body).toContain(`reviewed_head=${commentedHead}`);
+    expect(JSON.parse(staleNotice.payload).activity.body).toContain(`current_published_head=${repairedHead}`);
+  });
+
   it("still carries later-round feedback that predates the current publication", async () => {
     const fixture = setup("core/implement@4");
     const previousHead = "d".repeat(40);
@@ -3715,9 +3835,12 @@ describe("deterministic supervisor stage gates", () => {
       activity: {
         sessionId: "session-1",
         type: "error",
-        body: "1 feedback item(s) arrived against a superseded head and were not applied; re-comment on the current PR head.",
+        body: expect.stringContaining("classification=superseded_head"),
       },
     });
+    expect(JSON.parse(staleNotice.payload).activity.body).toContain("github:github-review:stale");
+    expect(JSON.parse(staleNotice.payload).activity.body).toContain(`reviewed_head=${staleHead}`);
+    expect(JSON.parse(staleNotice.payload).activity.body).toContain(`current_published_head=${SUBJECT}`);
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
       stage_id: "repair_implementation",
       reentry_ordinal: 1,

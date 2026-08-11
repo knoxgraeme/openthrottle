@@ -163,6 +163,7 @@ export interface FeedbackCapability {
     | { status: "exhausted"; completedRounds: number }
     | { status: "stale"; snapshot?: FeedbackSnapshot; eventCount?: number };
   carryForwardFeedbackSnapshot(snapshotId: string, headSha: string, workItemId: string): FeedbackSnapshot | undefined;
+  listFeedbackSnapshotEvents(snapshotId: string): FeedbackSnapshotEvent[];
   markFeedbackSnapshotStaleWithNotice(params: {
     snapshotId: string;
     noticeId: string;
@@ -242,6 +243,9 @@ export function createSupervisorStore(
     },
     carryForwardFeedbackSnapshot(snapshotId, headSha, workItemId) {
       return feedbackStore.carryForward(snapshotId, headSha, workItemId);
+    },
+    listFeedbackSnapshotEvents(snapshotId) {
+      return feedbackStore.listEvents(snapshotId);
     },
     markFeedbackSnapshotStaleWithNotice(params) {
       return markFeedbackSnapshotStaleWithNotice.immediate(params);

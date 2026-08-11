@@ -98,13 +98,14 @@ describe("GitHub contracts", () => {
       review: {
         id: 9,
         state: "commented",
+        commit_id: "a".repeat(40),
         html_url: "https://github.com/o/r/pull/1#pullrequestreview-9",
         user: { login: "reviewer" },
       },
     });
     expect(parseGithubWebhook("pull_request_review", review)).toMatchObject({
       kind: "pull_request_review",
-      review: { id: 9 },
+      review: { id: 9, commit_id: "a".repeat(40) },
     });
     const comment = JSON.stringify({
       action: "created",

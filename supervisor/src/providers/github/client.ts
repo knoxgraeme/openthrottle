@@ -52,6 +52,7 @@ interface GithubReviewEvent extends GithubEventBase {
     id: number;
     state: string;
     html_url: string;
+    commit_id?: string;
     body?: string | null;
     user?: { login: string };
   };
