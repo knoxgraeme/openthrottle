@@ -1150,7 +1150,7 @@ describe("pipeline coordinator", () => {
     expect(notes).toHaveLength(1);
     expect(notes[0]).toMatchObject({
       actor: "stage_agent",
-      issue: "ISSUE-1",
+        issue: "issue-1",
       repository: "owner/repo",
       instance_id: instance.id,
       outcome: "success",
