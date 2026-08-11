@@ -159,6 +159,27 @@ describe("bounded Linear admission context", () => {
     expect(result.selectionError).toContain("does not match the authenticated session issue");
   });
 
+  it.each(["data-comment-id", "x-comment-id"])(
+    "does not decode GitHub entities for a spoofed %s directive attribute",
+    (attribute) => {
+      const context = [
+        `<issue identifier="GH-194"><title>Current Issue</title></issue>`,
+        `<primary-directive-thread ${attribute}="github-issue-body">`,
+        `<comment>Keep A &amp; B &lt; C &gt; D encoded.</comment>`,
+        `</primary-directive-thread>`,
+      ].join("\n");
+
+      const result = composeBoundedTaskContext(context, {
+        requireLinearSections: true,
+        expectedIssueIdentifier: "GH-194",
+      });
+
+      expect(result.selectionError).toBeUndefined();
+      expect(result.selectionContext).toContain("A &amp; B &lt; C &gt; D");
+      expect(result.selectionContext).not.toContain("A & B < C > D");
+    }
+  );
+
   it("rejects supplied sectionless context while preserving the no-prompt fallback", () => {
     const supplied = composeBoundedTaskContext("# unwrapped prompt", {
       requireLinearSections: true,
