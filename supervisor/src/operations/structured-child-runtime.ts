@@ -74,6 +74,7 @@ import type {
   RuntimeResource,
   SandboxRuntime,
 } from "../runtime/contracts.js";
+import { serializeRuntimeObservationError } from "../runtime/observation-error.js";
 import { extractJsonBlocks } from "../pipeline/markdown.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { createUnitEffectProcessor } from "./unit-effects.js";
@@ -86,10 +87,16 @@ const DIAGNOSTIC_TEXT_HEAD_CHARS = 1_500;
 
 class RetryableReviewRuntimeError extends Error {
   constructor(operation: string, cause: unknown) {
-    super(`${operation}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    const observed = serializeRuntimeObservationError(operation, cause);
+    // Provider wrappers do not always preserve a transport status when an
+    // acknowledgement is lost. This typed boundary is itself the proof that
+    // an unknown exception came from provider I/O, so make that retryability
+    // explicit for the durable outer observation budget.
+    super(observed.text.replace(/\bretryable=false\b/, "retryable=true"));
     this.name = "RetryableReviewRuntimeError";
   }
 }
+
 const ACTION_OUTPUT_ORDER: Record<UnitActionKind, number> = {
   implement: 10,
   repair: 10,
@@ -845,6 +852,11 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     try {
       return await execute();
     } catch (error) {
+      const observed = serializeRuntimeObservationError(operation, error);
+      // A known non-retryable provider response (notably 400/401/403) is a
+      // deterministic terminal. Statusless provider exceptions remain
+      // uncertain and must consume the bounded observation retry budget.
+      if (!observed.retryable && observed.statusCode !== null) throw new Error(observed.text);
       throw new RetryableReviewRuntimeError(operation, error);
     }
   };
@@ -2099,7 +2111,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       // Provider dispatch/collection failures are not semantic review
       // decisions. Leave the fenced parent action active so the next drain
       // can replay the same deterministic subaction ids idempotently.
-      if (error instanceof RetryableReviewRuntimeError) return null;
+      if (error instanceof RetryableReviewRuntimeError) throw error;
       return terminalFailure(error);
     }
   };
@@ -2124,13 +2136,13 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   } | null> => {
     if (!action.request_hash) return null;
     if (action.action_kind === "final_review") {
+      let request: LoopActionRequest;
       try {
         if (!action.request_payload) throw new Error("missing persisted selector request");
-        const request = JSON.parse(action.request_payload) as LoopActionRequest;
+        request = JSON.parse(action.request_payload) as LoopActionRequest;
         if (request.protocol !== "loop-action@2" || request.skill !== "select-review-personas") {
           throw new Error("final review request is not the sealed selector action");
         }
-        return collectOrchestratedFinalReview(resource, instance, action, request);
       } catch (error) {
         return {
           terminal: true,
@@ -2140,6 +2152,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           nativeSessionId: null,
         };
       }
+      return collectOrchestratedFinalReview(resource, instance, action, request);
     }
     let result: Awaited<ReturnType<SandboxRuntime["collectChildExecutorActionResult"]>> |
       Awaited<ReturnType<SandboxRuntime["collectLoopActionResult"]>>;
@@ -2153,7 +2166,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         ? await deps.runtime.collectChildExecutorActionResult(resource, collectionRequest)
         : await deps.runtime.collectLoopActionResult(resource, collectionRequest);
     } catch (error) {
-      const message = sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500);
+      const observed = serializeRuntimeObservationError(
+        `${action.action_kind} result collection`,
+        error
+      );
+      if (observed.retryable) throw new Error(observed.text);
+      const message = sanitizeText(observed.text).slice(-500);
       return {
         terminal: true,
         resultHash: digestCanonicalJson({

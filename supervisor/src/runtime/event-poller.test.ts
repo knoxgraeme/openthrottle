@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
-import { parseSandboxEvent } from "./events.js";
+import { parseSandboxEvent, type RuntimeProgressActivityInput } from "./events.js";
 import { pollSandboxEvents } from "./event-poller.js";
 
 let db: Database.Database | undefined;
@@ -160,6 +160,131 @@ describe("sandbox event contracts", () => {
     }
   });
 
+  it("deletes malformed downloaded content whose parser error says timeout and continues in sort order", async () => {
+    const store = seedRunningTicket();
+    const invalidPath = "/home/agent/.ot/outbox/001-timeout.json";
+    const validPath = "/home/agent/.ot/outbox/002-valid.json";
+    const validEvent = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: "12121212-1212-4121-8121-121212121212",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      type: "thought",
+      body: "continued after malformed event",
+    }));
+    const files = new Map<string, Buffer>([
+      [invalidPath, Buffer.from("timeout")],
+      [validPath, validEvent],
+    ]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async (directory: string) => directory === "/home/agent/.ot/outbox"
+          ? [...files.entries()].map(([path, value]) => ({
+              name: path.split("/").at(-1), path, size: value.length, isDir: false,
+            }))
+          : []),
+        downloadFile: vi.fn(async (path: string) => files.get(path)),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    };
+    const postActivity = vi.fn(async () => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await pollSandboxEvents({
+      runtime: {
+        getWorkspace: vi.fn(async () => sandbox),
+        setActive: vi.fn(async () => undefined),
+        setIdle: vi.fn(async () => undefined),
+      },
+      store,
+      postActivity,
+    });
+
+    expect(error).toHaveBeenCalledWith(
+      expect.stringMatching(/deleting invalid event 001-timeout\.json: .*timeout/i)
+    );
+    expect(postActivity).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "thought", body: "continued after malformed event" }),
+      expect.objectContaining({ event_id: "12121212-1212-4121-8121-121212121212" })
+    );
+    expect(store.getSandboxEvent("12121212-1212-4121-8121-121212121212")?.status).toBe("processed");
+    expect(files.size).toBe(0);
+    error.mockRestore();
+  });
+
+  it("preserves an event after an unclassified download failure and retries the ordered pass", async () => {
+    const store = seedRunningTicket();
+    const firstPath = "/home/agent/.ot/outbox/001-first.json";
+    const secondPath = "/home/agent/.ot/outbox/002-second.json";
+    const activity = (eventId: string, body: string) => Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: eventId,
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      type: "thought",
+      body,
+    }));
+    const files = new Map<string, Buffer>([
+      [firstPath, activity("13131313-1313-4131-8131-131313131313", "first activity")],
+      [secondPath, activity("14141414-1414-4141-8141-141414141414", "second activity")],
+    ]);
+    let firstDownloadFails = true;
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async (directory: string) => directory === "/home/agent/.ot/outbox"
+          ? [...files.entries()].map(([path, value]) => ({
+              name: path.split("/").at(-1), path, size: value.length, isDir: false,
+            }))
+          : []),
+        downloadFile: vi.fn(async (path: string) => {
+          if (path === firstPath && firstDownloadFails) {
+            firstDownloadFails = false;
+            throw new Error("opaque filesystem failure");
+          }
+          return files.get(path);
+        }),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    };
+    const postActivity = vi.fn(async (activity: RuntimeProgressActivityInput) => activity);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const params = {
+      runtime: {
+        getWorkspace: vi.fn(async () => sandbox),
+        setActive: vi.fn(async () => undefined),
+        setIdle: vi.fn(async () => undefined),
+      },
+      store,
+      postActivity,
+    };
+
+    await pollSandboxEvents(params);
+
+    expect(error).toHaveBeenCalledWith(expect.stringMatching(
+      /could not read 001-first\.json: .*retryable=false status=unknown.*opaque filesystem failure/
+    ));
+    expect(postActivity).not.toHaveBeenCalled();
+    expect(sandbox.fs.deleteFile).not.toHaveBeenCalled();
+    expect([...files.keys()]).toEqual([firstPath, secondPath]);
+
+    await pollSandboxEvents(params);
+
+    expect(postActivity.mock.calls.map(([posted]) => "body" in posted ? posted.body : null)).toEqual([
+      "first activity",
+      "second activity",
+    ]);
+    expect(files.size).toBe(0);
+    error.mockRestore();
+  });
+
   it("renews liveness from a sealed heartbeat without publishing semantic activity", async () => {
     const store = seedRunningTicket();
     const heartbeatAt = "2026-07-22T16:00:00.000Z";
@@ -244,6 +369,52 @@ describe("sandbox event contracts", () => {
       leaseUntilIso: expect.any(String),
     }));
     expect(store.getSandboxEvent("88888888-8888-4888-8888-888888888888")?.status)
+      .toBe("processed");
+  });
+
+  it("retries transient sealed result listing failures without deleting or duplicating the result", async () => {
+    const store = seedRunningTicket();
+    const resultPath = "/var/lib/openthrottle/stage-results/attempt-1.json";
+    const files = new Map([[resultPath, Buffer.from(stageResultEvent())]]);
+    let stageListCalls = 0;
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async (directory: string) => {
+          if (directory === "/var/lib/openthrottle/stage-results") {
+            stageListCalls += 1;
+            if (stageListCalls === 1) throw { response: { status: 502 }, message: "" };
+          }
+          return [...files.entries()]
+            .filter(([path]) => path.startsWith(`${directory}/`))
+            .map(([path, value]) => ({
+              name: path.split("/").at(-1), path, size: value.length, isDir: false,
+            }));
+        }),
+        downloadFile: vi.fn(async (path: string) => files.get(path)),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+      process: {
+        executeCommand: vi.fn(async () => ({ exitCode: 0, result: `${"c".repeat(40)}\n` })),
+      },
+    };
+    const postStageResult = vi.fn(async () => undefined);
+
+    const params = {
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) },
+      store,
+      postActivity: vi.fn(async () => undefined),
+      postStageResult,
+    };
+    await pollSandboxEvents(params);
+    await pollSandboxEvents(params);
+    await pollSandboxEvents(params);
+
+    expect(sandbox.fs.deleteFile).toHaveBeenCalledTimes(1);
+    expect(postStageResult).toHaveBeenCalledTimes(1);
+    expect(store.getSandboxEvent("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")?.status)
       .toBe("processed");
   });
 

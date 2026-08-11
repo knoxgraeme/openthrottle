@@ -1656,6 +1656,15 @@ WHERE terminal_result_outcome IS NULL;
 const executionWorkTerminalOutcomeMigrationSource = `${executionWorkTerminalOutcomeSchema}
 terminal-child-result-contract:child action terminal replay compares exact failure needs-human and retryable outcomes/v1`;
 
+const executionWorkObservationRetrySchema = `
+ALTER TABLE execution_work_attempts ADD COLUMN observation_failure_count INTEGER NOT NULL DEFAULT 0 CHECK(observation_failure_count >= 0);
+ALTER TABLE execution_work_attempts ADD COLUMN observation_retry_at TEXT;
+ALTER TABLE execution_work_attempts ADD COLUMN observation_epoch INTEGER NOT NULL DEFAULT 0 CHECK(observation_epoch >= 0);
+`;
+
+const executionWorkObservationRetryMigrationSource = `${executionWorkObservationRetrySchema}
+execution-work-observation-retry-contract:transient child result observation failures persist bounded epoch-fenced retry state/v2`;
+
 const executionPublicationEventsSchema = `
 CREATE TABLE execution_publication_events (
   id TEXT PRIMARY KEY,
@@ -3116,6 +3125,23 @@ const definitions: DatabaseMigrationDefinition[] = [
       if (!hasTable(db, "agent_sessions")) return;
       if (!hasColumns(db, "agent_sessions", ["provider_activation_id"])) {
         db.exec("ALTER TABLE agent_sessions ADD COLUMN provider_activation_id TEXT");
+      }
+    },
+  },
+  {
+    version: 39,
+    name: "execution-work-observation-retry",
+    source: executionWorkObservationRetryMigrationSource,
+    up(db) {
+      if (!hasTable(db, "execution_work_attempts")) return;
+      if (!hasColumns(db, "execution_work_attempts", ["observation_failure_count"])) {
+        db.exec("ALTER TABLE execution_work_attempts ADD COLUMN observation_failure_count INTEGER NOT NULL DEFAULT 0 CHECK(observation_failure_count >= 0)");
+      }
+      if (!hasColumns(db, "execution_work_attempts", ["observation_retry_at"])) {
+        db.exec("ALTER TABLE execution_work_attempts ADD COLUMN observation_retry_at TEXT");
+      }
+      if (!hasColumns(db, "execution_work_attempts", ["observation_epoch"])) {
+        db.exec("ALTER TABLE execution_work_attempts ADD COLUMN observation_epoch INTEGER NOT NULL DEFAULT 0 CHECK(observation_epoch >= 0)");
       }
     },
   },

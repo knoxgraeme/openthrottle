@@ -6,6 +6,7 @@ import type {
 import type { Ticket, SupervisorStore } from "../persistence/store.js";
 import type { ChildActionLivenessPort } from "../pipeline/store.js";
 import { reconcileSandboxAutostop } from "./lifecycle.js";
+import { serializeRuntimeObservationError } from "./observation-error.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import {
   parseSandboxEvent,
@@ -51,6 +52,8 @@ async function listActivityEventFiles(
   try {
     files = await sandbox.fs.listFiles!(directory);
   } catch (error) {
+    const observed = serializeRuntimeObservationError(`list activity events ${directory}`, error);
+    if (observed.retryable) throw new Error(observed.text);
     if (options.optional) return [];
     throw error;
   }
@@ -66,13 +69,21 @@ async function listActivityEventFiles(
 }
 
 async function listLoopActionOutboxFiles(sandbox: RuntimeWorkspace): Promise<SandboxEventFile[]> {
-  const attempts = await sandbox.fs.listFiles!(LOOP_ACTION_DIR).catch(() => []);
+  const attempts = await sandbox.fs.listFiles!(LOOP_ACTION_DIR).catch((error) => {
+    const observed = serializeRuntimeObservationError(`list loop action attempts ${LOOP_ACTION_DIR}`, error);
+    if (observed.retryable) throw new Error(observed.text);
+    return [];
+  });
   const events: SandboxEventFile[] = [];
   for (const attempt of attempts) {
     const attemptName = safeRemoteName(attempt.name);
     if (!attempt.isDir || !attemptName) continue;
     const attemptPath = `${LOOP_ACTION_DIR}/${attemptName}`;
-    const actions = await sandbox.fs.listFiles!(attemptPath).catch(() => []);
+    const actions = await sandbox.fs.listFiles!(attemptPath).catch((error) => {
+      const observed = serializeRuntimeObservationError(`list loop actions ${attemptPath}`, error);
+      if (observed.retryable) throw new Error(observed.text);
+      return [];
+    });
     for (const action of actions) {
       const actionName = safeRemoteName(action.name);
       if (!action.isDir || !actionName) continue;
@@ -104,7 +115,9 @@ async function listEventFiles(sandbox: RuntimeWorkspace): Promise<SandboxEventFi
         prefetched: heartbeat,
       });
     }
-  } catch {
+  } catch (error) {
+    const observed = serializeRuntimeObservationError(`read sealed heartbeat ${SEALED_HEARTBEAT_FILE}`, error);
+    if (observed.retryable) throw new Error(observed.text);
     // No sealed pulse has landed yet.
   }
   try {
@@ -119,7 +132,9 @@ async function listEventFiles(sandbox: RuntimeWorkspace): Promise<SandboxEventFi
         sealedHeartbeat: false,
         sealedStageResult: true,
       })));
-  } catch {
+  } catch (error) {
+    const observed = serializeRuntimeObservationError(`list sealed stage results ${SEALED_STAGE_RESULT_DIR}`, error);
+    if (observed.retryable) throw new Error(observed.text);
     // No sealed stage result has landed yet.
   }
   return events.sort((left, right) => left.name.localeCompare(right.name));
@@ -232,7 +247,8 @@ async function pollTicketEvents(
     }
     files = await listEventFiles(sandbox);
   } catch (error) {
-    console.error(`[sandbox-events] could not inspect ${ticket.ticket_reference}:`, error);
+    const observed = serializeRuntimeObservationError(`poll sandbox events ${ticket.ticket_reference}`, error);
+    console.error(`[sandbox-events] could not inspect ${ticket.ticket_reference}: ${observed.text}`);
     return;
   }
 
@@ -245,12 +261,27 @@ async function pollTicketEvents(
       continue;
     }
 
+    let raw: string;
+    try {
+      raw = (file.prefetched ?? await sandbox.fs.downloadFile!(remotePath))!.toString("utf8");
+    } catch (error) {
+      const observed = serializeRuntimeObservationError(`download sandbox event ${remotePath}`, error);
+      // A provider exception says nothing about the bytes on disk, even when
+      // its classification is unknown or non-retryable. Preserve the file and
+      // the sorted processing fence so a later poll can observe it again.
+      console.error(`[sandbox-events] could not read ${file.name}: ${observed.text}`);
+      break;
+    }
+
     let event: SandboxEvent;
     try {
-      const raw = (file.prefetched ?? await sandbox.fs.downloadFile!(remotePath))!.toString("utf8");
       event = parseSandboxEvent(raw);
     } catch (error) {
-      console.error(`[sandbox-events] deleting invalid event ${file.name}:`, error);
+      // Once bytes have been downloaded, malformed event content is
+      // deterministic. Do not classify parser text (which may itself contain
+      // words such as "timeout") as a transient provider failure.
+      const message = sanitizeText(error instanceof Error ? error.message : String(error)).slice(-2_000);
+      console.error(`[sandbox-events] deleting invalid event ${file.name}: ${message}`);
       await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
       continue;
     }

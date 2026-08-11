@@ -5,7 +5,21 @@ import type { ExecutionUnitState } from "../pipeline/unit-coordinator.js";
 import type { LoopActionRequest, SandboxRuntime } from "../runtime/contracts.js";
 import { MAX_VALID_DOWNSTREAM_CONTEXT } from "../pipeline/structured-loop-envelope.js";
 import { MAX_LOOP_REQUEST_ENVELOPE_BYTES } from "../pipeline/structured-loop-limits.js";
-import { aggregateOutcomeFor, createStructuredChildRuntime } from "./structured-child-runtime.js";
+import {
+  aggregateOutcomeFor,
+  createStructuredChildRuntime as createProductionStructuredChildRuntime,
+} from "./structured-child-runtime.js";
+
+function createStructuredChildRuntime(
+  deps: Parameters<typeof createProductionStructuredChildRuntime>[0]
+): ReturnType<typeof createProductionStructuredChildRuntime> {
+  return createProductionStructuredChildRuntime({
+    ...deps,
+    store: Object.assign({}, deps.store, {
+      clearActionObservationFailure: vi.fn(() => "cleared" as const),
+    }),
+  });
+}
 
 function unit(overrides: Partial<ExecutionUnitState> & { unitId: string; ordinal: number }): ExecutionUnitState {
   return {
@@ -71,6 +85,9 @@ function action(overrides: Partial<ExecutionWorkAttempt> & {
     native_session_id: null,
     lease_owner: null,
     lease_until: null,
+    observation_failure_count: 0,
+    observation_retry_at: null,
+    observation_epoch: 0,
     output_subject: null,
     payload: "",
     created_at: `2099-07-22T12:00:0${overrides.cycle}.000Z`,

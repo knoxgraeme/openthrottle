@@ -13,6 +13,11 @@ import type {
 } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
 import type { RuntimeResource, SandboxAutostopRuntime, SandboxRuntime } from "../runtime/contracts.js";
+import {
+  runtimeObservationErrorMatches,
+  serializeRuntimeObservationError,
+  type SerializedRuntimeObservationError,
+} from "../runtime/observation-error.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
 import { createStructuredChildRuntime } from "./structured-child-runtime.js";
@@ -35,32 +40,34 @@ const MAX_STAGE_TIMEOUT_SECONDS = 86_400;
 // only when unrelated resources are released, so they retry on a fixed patient
 // interval while still counting against MAX_EFFECT_ATTEMPTS.
 const AUTH_ERROR_PATTERNS: RegExp[] = [
-  /\bunauthorized\b/,
-  /\bforbidden\b/,
-  /\b40[13]\b/,
-  /write access to repository not granted/,
-  /resource not accessible/,
-  /bad credentials/,
-  /\b(?:invalid|expired|revoked)\b[^\n]{0,40}\btoken\b/,
-  /\btoken\b[^\n]{0,40}\b(?:invalid|expired|revoked)\b/,
+  /\bunauthorized\b/i,
+  /\bforbidden\b/i,
+  /\b40[13]\b/i,
+  /write access to repository not granted/i,
+  /resource not accessible/i,
+  /bad credentials/i,
+  /\b(?:invalid|expired|revoked)\b[^\n]{0,40}\btoken\b/i,
+  /\btoken\b[^\n]{0,40}\b(?:invalid|expired|revoked)\b/i,
 ];
 
 const CAPACITY_ERROR_PATTERNS: RegExp[] = [
-  /total (?:memory|disk|cpu) limit exceeded/,
-  /quota exceeded/,
-  /insufficient (?:memory|disk|capacity)/,
+  /total (?:memory|disk|cpu) limit exceeded/i,
+  /quota exceeded/i,
+  /insufficient (?:memory|disk|capacity)/i,
 ];
 
 type EffectErrorClass = "auth" | "capacity" | "transient";
 type RuntimeEffectHandlerResult = "acknowledge" | "skip_acknowledgement";
 
-function classifyEffectError(message: string): EffectErrorClass {
-  const text = message.toLowerCase();
+function classifyEffectError(error: unknown, observed: SerializedRuntimeObservationError): EffectErrorClass {
   // Capacity wins over auth: a provider may wrap a quota rejection in an HTTP
   // 403, and the broad 401/403 auth patterns would otherwise fast-fail an
   // error that clears once resources free up.
-  if (CAPACITY_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "capacity";
-  if (AUTH_ERROR_PATTERNS.some((pattern) => pattern.test(text))) return "auth";
+  if (runtimeObservationErrorMatches(error, CAPACITY_ERROR_PATTERNS)) return "capacity";
+  if (
+    observed.statusCode === 401 || observed.statusCode === 403 ||
+    runtimeObservationErrorMatches(error, AUTH_ERROR_PATTERNS)
+  ) return "auth";
   return "transient";
 }
 
@@ -677,8 +684,12 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     try {
       await handle(effect);
     } catch (error) {
-      const message = sanitizeText(String(error)).slice(-2_000);
-      const errorClass = classifyEffectError(message);
+      const observed = serializeRuntimeObservationError(
+        `pipeline effect ${effect.kind}`,
+        error
+      );
+      const message = observed.text.slice(-2_000);
+      const errorClass = classifyEffectError(error, observed);
       // Stop settlement keeps its full retry budget: exhausting it early would
       // reroute live actors into quarantine on the first provider auth blip.
       const exhausted = (errorClass === "auth" && effect.kind !== "stop") ||
