@@ -66,6 +66,25 @@ describe("loadConfig", () => {
     });
   });
 
+  it("boots without Linear configuration while preserving GitHub readiness requirements", () => {
+    setRequiredEnv();
+    delete process.env.LINEAR_WEBHOOK_SECRET;
+    delete process.env.LINEAR_CLIENT_ID;
+    delete process.env.LINEAR_CLIENT_SECRET;
+
+    expect(loadConfig()).toMatchObject({
+      linearWebhookSecret: undefined,
+      linearClientId: undefined,
+      linearClientSecret: undefined,
+      githubWebhookSecret: "github-webhook",
+      githubToken: "github-token",
+      githubReadToken: "github-read-token",
+    });
+
+    delete process.env.GITHUB_TOKEN;
+    expect(() => loadConfig()).toThrow("Missing required env var: GITHUB_TOKEN");
+  });
+
   it("loads and validates the runtime resource retention window", () => {
     setRequiredEnv();
     process.env.RUNTIME_RESOURCE_RETENTION_MINUTES = "15";

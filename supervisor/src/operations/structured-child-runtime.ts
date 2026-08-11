@@ -1200,7 +1200,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     action: ExecutionWorkAttempt
   ): { journal?: ReviewJournalContract; auditError?: string } => {
     if (action.cycle < 2) return {};
-    const entries = deps.store.listJournalEntries({ issueId: instance.linear_issue_id, limit: 1_000, order: "newest" })
+    const entries = deps.store.listJournalEntries({ issueId: instance.ticket_id, limit: 1_000, order: "newest" })
       .filter((entry) =>
         entry.instance_id === instance.id &&
         entry.run_id === action.parent_run_id &&
@@ -2019,7 +2019,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       const priorJournal = previousReviewJournal(instance, action);
       if (priorJournal.auditError) {
         deps.store.recordJournalEntry({
-          issueId: instance.linear_issue_id,
+          issueId: instance.ticket_id,
           instanceId: instance.id,
           runId: action.parent_run_id,
           actor: "supervisor",
@@ -2053,7 +2053,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         ...(priorJournal.journal ? { previousJournal: priorJournal.journal } : {}),
       });
       deps.store.recordJournalEntry({
-        issueId: instance.linear_issue_id,
+        issueId: instance.ticket_id,
         instanceId: instance.id,
         runId: action.parent_run_id,
         actor: "supervisor",

@@ -5,8 +5,8 @@ import type { AgentSession, Run, Ticket } from "./store.js";
 
 export interface SteerInboxRecord {
   id: string;
-  linear_issue_id: string;
-  linear_session_id: string;
+  ticket_id: string;
+  session_id: string;
   run_id: string | null;
   source: "human" | "operator";
   body: string;
@@ -39,12 +39,12 @@ export interface SteeringStore {
 
 export function createSteeringStore(db: Database.Database, workStore: WorkStore): SteeringStore {
   const now = () => new Date().toISOString();
-  const getByIssueIdStmt = db.prepare("SELECT * FROM tickets WHERE linear_issue_id = ?");
+  const getByIssueIdStmt = db.prepare("SELECT * FROM tickets WHERE ticket_id = ?");
   const getSessionStmt = db.prepare("SELECT * FROM agent_sessions WHERE id = ?");
   const getRunStmt = db.prepare("SELECT * FROM runs WHERE id = ?");
   const insertInboxStmt = db.prepare(`
     INSERT OR IGNORE INTO session_inbox (
-      id, linear_issue_id, linear_session_id, run_id, source, body, status, created_at
+      id, ticket_id, session_id, run_id, source, body, status, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
   `);
   const listPendingInboxStmt = db.prepare(`
@@ -54,11 +54,11 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
     FROM session_inbox si
     LEFT JOIN work_items wi ON wi.id = si.id
     LEFT JOIN work_deliveries wd ON wd.id = wi.active_delivery_id
-    WHERE si.linear_issue_id = ?
+    WHERE si.ticket_id = ?
       AND (si.status = 'pending'
         OR (si.status = 'dispatched' AND (
           wd.lease_until <= ? OR wd.run_id IS NOT (
-            SELECT t.run_id FROM tickets t WHERE t.linear_issue_id = si.linear_issue_id
+            SELECT t.run_id FROM tickets t WHERE t.ticket_id = si.ticket_id
           )
         )))
     ORDER BY si.created_at ASC, si.id ASC
@@ -67,7 +67,7 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
     "UPDATE session_inbox SET status = 'dispatched', delivered_at = ? WHERE id = ? AND status IN ('pending', 'dispatched')"
   );
   const cancelPendingInboxStmt = db.prepare(
-    "UPDATE session_inbox SET status = 'canceled' WHERE linear_issue_id = ? AND status IN ('pending', 'dispatched')"
+    "UPDATE session_inbox SET status = 'canceled' WHERE ticket_id = ? AND status IN ('pending', 'dispatched')"
   );
   const cancelInboxStmt = db.prepare(
     "UPDATE session_inbox SET status = 'canceled' WHERE id = ? AND status IN ('pending', 'dispatched')"
@@ -146,7 +146,7 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
       const activeTicket = getByIssueIdStmt.get(issueId) as Ticket | undefined;
       const activeRunId = activeTicket?.run_id;
       const activeSession = activeTicket
-        ? getSessionStmt.get(activeTicket.linear_session_id) as AgentSession | undefined
+        ? getSessionStmt.get(activeTicket.session_id) as AgentSession | undefined
         : undefined;
       for (const record of records) {
         const item = workStore.get(record.id);
@@ -155,7 +155,7 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
           ? workStore.getDelivery(record.delivery_id)
           : undefined;
         const inboxBelongsToSupersededSession = Boolean(
-          activeTicket && record.linear_session_id !== activeTicket.linear_session_id
+          activeTicket && record.session_id !== activeTicket.session_id
         );
         const inboxBelongsToSupersededGeneration = Boolean(
           activeSession && item.generation !== activeSession.generation
@@ -180,7 +180,7 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
             workStore.cancel(
               record.id,
               inboxBelongsToSupersededSession || inboxBelongsToSupersededGeneration
-                ? `steering was fenced to superseded session ${record.linear_session_id}`
+                ? `steering was fenced to superseded session ${record.session_id}`
                 : `steering was fenced to ended run ${record.run_id ?? "unknown"}`
             );
           })();
@@ -194,8 +194,8 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
           bindInboxRunStmt.run(activeRunId, record.id);
           workStore.lease({
             workItemId: record.id,
-            issueId: record.linear_issue_id,
-            sessionId: record.linear_session_id,
+            issueId: record.ticket_id,
+            sessionId: record.session_id,
             runId: activeRunId,
             nativeSessionId: item.native_session_id,
             generation: item.generation,
@@ -214,8 +214,8 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
         throw new Error(`inbox work ${id} has no leased delivery`);
       }
       const binding = {
-        issueId: record.linear_issue_id,
-        sessionId: record.linear_session_id,
+        issueId: record.ticket_id,
+        sessionId: record.session_id,
         runId: record.run_id,
         nativeSessionId: record.native_session_id,
         generation: record.generation,
@@ -241,7 +241,7 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
     cancelPendingInbox(issueId) {
       return db.transaction(() => {
         const ids = db.prepare(
-          "SELECT id FROM session_inbox WHERE linear_issue_id = ? AND status IN ('pending', 'dispatched')"
+          "SELECT id FROM session_inbox WHERE ticket_id = ? AND status IN ('pending', 'dispatched')"
         ).all(issueId) as Array<{ id: string }>;
         const changes = cancelPendingInboxStmt.run(issueId).changes;
         for (const { id } of ids) workStore.cancel(id, "inbox canceled");

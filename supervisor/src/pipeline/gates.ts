@@ -323,8 +323,8 @@ function validateFence(
     payload.stage.context_revision !== attempt.context_revision ||
     payload.stage.context_policy !== attempt.native_context_policy ||
     payload.run.id !== event.runId ||
-    payload.run.ticket_id !== instance.linear_issue_id ||
-    payload.run.session_id !== instance.linear_session_id ||
+    payload.run.ticket_id !== instance.ticket_id ||
+    payload.run.session_id !== instance.session_id ||
     payload.run.generation !== instance.generation ||
     payload.run.native_session_id !== (event.nativeSessionId ?? null) ||
     payload.repository.name !== instance.repository ||
@@ -630,8 +630,8 @@ export function processProviderEvidence(
       },
       run: {
         id: attempt.planned_run_id,
-        ticket_id: instance.linear_issue_id,
-        session_id: instance.linear_session_id,
+        ticket_id: instance.ticket_id,
+        session_id: instance.session_id,
         generation: instance.generation,
         native_session_id: stage.context === "none" ? null : attempt.native_session_id,
       },

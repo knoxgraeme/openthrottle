@@ -9,9 +9,9 @@ import {
 import type { Config } from "./config.js";
 import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
-import { handleLinearEvent } from "./session-service.js";
+import { handleControlEvent } from "./session-service.js";
 import type { LinearClient } from "../providers/linear/client.js";
-import { fetchIssueLabels, parseLinearWebhook } from "../providers/linear/events.js";
+import { fetchIssueLabels, linearControlEvent, parseLinearWebhook } from "../providers/linear/events.js";
 import {
   branchExists,
   getMergeReadiness,
@@ -255,7 +255,7 @@ describe("runAdmissionPreflight", () => {
           const instance = pipelines.getInstanceForSession(sessionId)!;
           pipelines.bindRuntimeResource(instance.id, "daytona", resourceId);
           pipelines.setRuntimeResourceStatus(instance.id, "stopped");
-          tickets.setSandboxId(instance.linear_issue_id, resourceId);
+          tickets.setSandboxId(instance.ticket_id, resourceId);
           fixtureDb.prepare(`
             UPDATE pipeline_effect_intents SET status = 'acknowledged'
             WHERE pipeline_instance_id = ? AND status = 'pending'
@@ -451,7 +451,7 @@ pipelines: { implement: implement }
     const providers = {
       activityPublisher: createLinearActivityPublisher(tickets, outbox),
       labelResolver: {
-        fetchIssueLabels: (issueId: string) => fetchIssueLabels(linear, issueId),
+        fetchThreadLabels: (issueId: string) => fetchIssueLabels(linear, issueId),
       },
       repositoryReader: {
         branchExists: (repository: string, branch: string) =>
@@ -471,11 +471,11 @@ pipelines: { implement: implement }
           mergePullRequest({ token: "github-token" }, repo, pullNumber, expectedHeadSha),
       },
     };
-    await handleLinearEvent(
+    await handleControlEvent(
       config(),
       tickets,
       providers,
-      payload(),
+      linearControlEvent(payload()),
       { catalog, runtime, store: pipelines },
       options.preflight
     );
@@ -494,14 +494,14 @@ pipelines: { implement: implement }
       treesStatus: 403,
     });
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
       state: "error",
       sandbox_id: null,
       run_id: null,
     });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) =>
       entry.includes("GITHUB_READ_TOKEN cannot read owner/repo (HTTP 403)") &&
       entry.includes("Contents: Read")
@@ -513,7 +513,7 @@ pipelines: { implement: implement }
   it("pins the pipeline when the read token can read and capacity fits", async () => {
     const { tickets, pipelines } = await admit({ preflight: cfgPreflight(emptyDaytona) });
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "active" });
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "active" });
     expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
       pipeline_id: "core/implement",
       base_commit: "a".repeat(40),
@@ -528,9 +528,9 @@ pipelines: { implement: implement }
 
     const { tickets } = await admit({ preflight: cfgPreflight(fullDaytona) });
 
-    expect(tickets.getByIssueId("issue-1")).toMatchObject({ state: "error" });
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "error" });
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
-    const payloads = db!.prepare("SELECT payload FROM linear_outbox ORDER BY sequence").pluck().all() as string[];
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("Daytona capacity: 8 GiB of 10 GiB"))).toBe(true);
   });
 

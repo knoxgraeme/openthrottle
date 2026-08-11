@@ -53,7 +53,7 @@ export interface PipelinePublicationEnvelope {
   };
   pipeline: {
     instance_id: string;
-    linear_issue_id: string;
+    ticket_id: string;
     id: string;
     version: number;
     manifest_digest: string;
@@ -926,7 +926,7 @@ export function buildSelectionPublication(instance: PipelineInstance): PipelineP
     template: { name: "selection" as const, version: PIPELINE_PUBLICATION_TEMPLATE_VERSION },
     pipeline: {
       instance_id: instance.id,
-      linear_issue_id: instance.linear_issue_id,
+      ticket_id: instance.ticket_id,
       id: instance.pipeline_id,
       version: instance.pipeline_version,
       manifest_digest: instance.manifest_digest,
@@ -971,7 +971,7 @@ export function buildLifecyclePublication(input: {
     },
     pipeline: {
       instance_id: input.instance.id,
-      linear_issue_id: input.instance.linear_issue_id,
+      ticket_id: input.instance.ticket_id,
       id: input.instance.pipeline_id,
       version: input.instance.pipeline_version,
       manifest_digest: input.instance.manifest_digest,
@@ -1071,7 +1071,7 @@ export function buildStagePublication(input: {
     template: { name: template, version: PIPELINE_PUBLICATION_TEMPLATE_VERSION },
     pipeline: {
       instance_id: input.instance.id,
-      linear_issue_id: input.instance.linear_issue_id,
+      ticket_id: input.instance.ticket_id,
       id: input.instance.pipeline_id,
       version: input.instance.pipeline_version,
       manifest_digest: input.instance.manifest_digest,
@@ -1143,7 +1143,7 @@ export function parsePipelinePublication(payload: string): PipelinePublicationEn
       !SUPPORTED_PIPELINE_PUBLICATION_TEMPLATE_VERSIONS.has(value.template?.version)) {
     throw new Error("pipeline publication schema is unsupported");
   }
-  if (!value.pipeline?.instance_id || !value.pipeline.linear_issue_id ||
+  if (!value.pipeline?.instance_id || !value.pipeline.ticket_id ||
       !value.body || !Array.isArray(value.evidence?.artifact_hashes) ||
       !Array.isArray(value.evidence?.summaries) || !Array.isArray(value.evidence?.details) ||
       !Array.isArray(value.evidence?.uncertainty)) {
@@ -1176,8 +1176,8 @@ export function pipelinePublicationOutboxPayload(envelope: PipelinePublicationEn
   });
 }
 
-export function pipelineStatusCommentMarker(linearIssueId: string): string {
-  return `<!-- openthrottle:pipeline-status:${linearIssueId} -->`;
+export function pipelineStatusCommentMarker(ticketId: string): string {
+  return `<!-- openthrottle:pipeline-status:${ticketId} -->`;
 }
 
 function statusBodyParts(envelope: PipelinePublicationEnvelope): {
@@ -1234,7 +1234,7 @@ export function publicationPayloadHash(envelope: PipelinePublicationEnvelope): s
 export function renderGithubPipelineSummary(envelope: PipelinePublicationEnvelope, prUrl?: string | null): string {
   const { detailLines } = statusBodyParts(envelope);
   const lines = [
-    `<!-- openthrottle:pipeline-summary:${envelope.pipeline.linear_issue_id} -->`,
+    `<!-- openthrottle:pipeline-summary:${envelope.pipeline.ticket_id} -->`,
     "## OpenThrottle pipeline summary",
     "",
     ...linearStatusCommentLines(envelope, prUrl),

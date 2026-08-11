@@ -5,6 +5,9 @@ CREATE TABLE IF NOT EXISTS tickets (
   linear_issue_id TEXT PRIMARY KEY,
   linear_issue_identifier TEXT NOT NULL,
   linear_session_id TEXT NOT NULL,
+  control_provider TEXT NOT NULL DEFAULT 'linear' CHECK(control_provider IN ('linear', 'github')),
+  external_thread_id TEXT,
+  external_thread_reference TEXT,
   sandbox_id TEXT,
   branch TEXT NOT NULL,
   agent TEXT NOT NULL DEFAULT 'claude',
@@ -41,7 +44,7 @@ CREATE TABLE IF NOT EXISTS runs (
   log_tail TEXT,
   FOREIGN KEY(linear_issue_id) REFERENCES tickets(linear_issue_id)
 );
-CREATE INDEX IF NOT EXISTS runs_ticket_idx ON runs(linear_issue_id, started_at);
+CREATE INDEX IF NOT EXISTS runs_linear_issue_idx ON runs(linear_issue_id, started_at);
 CREATE INDEX IF NOT EXISTS runs_expiry_idx ON runs(status, expires_at);
 
 CREATE TABLE IF NOT EXISTS agent_sessions (
@@ -146,17 +149,22 @@ CREATE INDEX IF NOT EXISTS webhook_deliveries_received_idx
   ON webhook_deliveries(received_at);
 
 CREATE TABLE IF NOT EXISTS repository_registrations (
-  linear_team_key TEXT PRIMARY KEY COLLATE NOCASE,
-  linear_team_id TEXT UNIQUE,
-  github_repo TEXT NOT NULL COLLATE NOCASE,
+  github_repo TEXT PRIMARY KEY COLLATE NOCASE,
+  control_provider TEXT NOT NULL DEFAULT 'linear' CHECK(control_provider IN ('linear', 'github')),
+  linear_team_key TEXT COLLATE NOCASE,
+  linear_team_id TEXT,
   base_branch TEXT NOT NULL,
   webhook_id INTEGER NOT NULL,
   snapshot TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS repository_registrations_repo_idx
-  ON repository_registrations(github_repo);
+CREATE UNIQUE INDEX IF NOT EXISTS repository_registrations_linear_team_key_idx
+  ON repository_registrations(linear_team_key)
+  WHERE control_provider = 'linear' AND linear_team_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS repository_registrations_linear_team_id_idx
+  ON repository_registrations(linear_team_id)
+  WHERE control_provider = 'linear' AND linear_team_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 `;
@@ -167,11 +175,31 @@ const ticketMigrations: Array<[string, string]> = [
   ["total_cost_usd", "ALTER TABLE tickets ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0"],
   ["last_error", "ALTER TABLE tickets ADD COLUMN last_error TEXT"],
   ["linear_context", "ALTER TABLE tickets ADD COLUMN linear_context TEXT"],
+  ["control_provider", "ALTER TABLE tickets ADD COLUMN control_provider TEXT NOT NULL DEFAULT 'linear' CHECK(control_provider IN ('linear', 'github'))"],
+  ["external_thread_id", "ALTER TABLE tickets ADD COLUMN external_thread_id TEXT"],
+  ["external_thread_reference", "ALTER TABLE tickets ADD COLUMN external_thread_reference TEXT"],
+  ["base_branch", "ALTER TABLE tickets ADD COLUMN base_branch TEXT NOT NULL DEFAULT 'main'"],
+];
+
+const neutralTicketMigrations: Array<[string, string]> = [
+  ["running_since", "ALTER TABLE tickets ADD COLUMN running_since TEXT"],
+  ["run_id", "ALTER TABLE tickets ADD COLUMN run_id TEXT"],
+  ["total_cost_usd", "ALTER TABLE tickets ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0"],
+  ["last_error", "ALTER TABLE tickets ADD COLUMN last_error TEXT"],
+  ["context", "ALTER TABLE tickets ADD COLUMN context TEXT"],
+  ["control_provider", "ALTER TABLE tickets ADD COLUMN control_provider TEXT NOT NULL DEFAULT 'linear' CHECK(control_provider IN ('linear', 'github'))"],
+  ["external_thread_id", "ALTER TABLE tickets ADD COLUMN external_thread_id TEXT"],
+  ["external_thread_reference", "ALTER TABLE tickets ADD COLUMN external_thread_reference TEXT"],
   ["base_branch", "ALTER TABLE tickets ADD COLUMN base_branch TEXT NOT NULL DEFAULT 'main'"],
 ];
 
 const runMigrations: Array<[string, string]> = [
   ["linear_session_id", "ALTER TABLE runs ADD COLUMN linear_session_id TEXT"],
+  ["session_generation", "ALTER TABLE runs ADD COLUMN session_generation INTEGER"],
+  ["log_tail", "ALTER TABLE runs ADD COLUMN log_tail TEXT"],
+];
+
+const neutralRunMigrations: Array<[string, string]> = [
   ["session_generation", "ALTER TABLE runs ADD COLUMN session_generation INTEGER"],
   ["log_tail", "ALTER TABLE runs ADD COLUMN log_tail TEXT"],
 ];
@@ -203,32 +231,63 @@ function applyColumnMigrations(
 
 function backfillAgentSessions(db: Database.Database): void {
   const timestamp = new Date().toISOString();
+  const ticketColumns = new Set(
+    (db.prepare("PRAGMA table_info(tickets)").all() as Array<{ name: string }>).map(
+      (column) => column.name
+    )
+  );
+  const sessionColumns = new Set(
+    (db.prepare("PRAGMA table_info(agent_sessions)").all() as Array<{ name: string }>).map(
+      (column) => column.name
+    )
+  );
+  const ticketIdColumn = ticketColumns.has("ticket_id") ? "ticket_id" : "linear_issue_id";
+  const sessionIdColumn = ticketColumns.has("session_id") ? "session_id" : "linear_session_id";
+  const sessionTicketIdColumn = sessionColumns.has("ticket_id") ? "ticket_id" : "linear_issue_id";
   db.prepare(`
     INSERT OR IGNORE INTO agent_sessions (
-      id, linear_issue_id, generation, state, created_at, updated_at
+      id, ${sessionTicketIdColumn}, generation, state, created_at, updated_at
     )
     SELECT
-      tickets.linear_session_id,
-      tickets.linear_issue_id,
+      tickets.${sessionIdColumn},
+      tickets.${ticketIdColumn},
       1,
       CASE tickets.state WHEN 'stopped' THEN 'stopped' ELSE 'current' END,
       COALESCE(tickets.created_at, ?),
       COALESCE(tickets.updated_at, ?)
     FROM tickets
-    WHERE tickets.linear_session_id IS NOT NULL
-      AND tickets.linear_session_id <> ''
+    WHERE tickets.${sessionIdColumn} IS NOT NULL
+      AND tickets.${sessionIdColumn} <> ''
       AND NOT EXISTS (
         SELECT 1 FROM agent_sessions
-        WHERE agent_sessions.linear_issue_id = tickets.linear_issue_id
+        WHERE agent_sessions.${sessionTicketIdColumn} = tickets.${ticketIdColumn}
       )
   `).run(timestamp, timestamp);
 }
 
 export function applyBaseSchema(db: Database.Database): void {
   db.exec(schema);
-  applyColumnMigrations(db, "tickets", ticketMigrations);
+  const ticketColumns = new Set(
+    (db.prepare("PRAGMA table_info(tickets)").all() as Array<{ name: string }>).map(
+      (column) => column.name
+    )
+  );
+  const runColumns = new Set(
+    (db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>).map(
+      (column) => column.name
+    )
+  );
+  applyColumnMigrations(
+    db,
+    "tickets",
+    ticketColumns.has("ticket_id") ? neutralTicketMigrations : ticketMigrations
+  );
   applyColumnMigrations(db, "webhook_deliveries", deliveryMigrations);
-  applyColumnMigrations(db, "runs", runMigrations);
+  applyColumnMigrations(
+    db,
+    "runs",
+    runColumns.has("session_id") ? neutralRunMigrations : runMigrations
+  );
   backfillAgentSessions(db);
 }
 
@@ -236,7 +295,16 @@ export function applyCompatibilityIndexes(db: Database.Database): void {
   db.exec(
     "CREATE INDEX IF NOT EXISTS tickets_repo_branch_idx ON tickets(repo, branch);" +
       "CREATE INDEX IF NOT EXISTS tickets_sandbox_idx ON tickets(sandbox_id);" +
-      "CREATE INDEX IF NOT EXISTS runs_session_idx ON runs(linear_session_id, session_generation);" +
       "CREATE INDEX IF NOT EXISTS webhook_deliveries_process_idx ON webhook_deliveries(status, next_attempt_at);"
   );
+  const runColumns = new Set(
+    (db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>).map(
+      (column) => column.name
+    )
+  );
+  if (runColumns.has("session_id")) {
+    db.exec("CREATE INDEX IF NOT EXISTS runs_session_idx ON runs(session_id, session_generation);");
+  } else {
+    db.exec("CREATE INDEX IF NOT EXISTS runs_session_idx ON runs(linear_session_id, session_generation);");
+  }
 }

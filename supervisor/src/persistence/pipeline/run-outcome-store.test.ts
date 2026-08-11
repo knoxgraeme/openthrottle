@@ -19,13 +19,13 @@ function seedInstance(database: Database.Database, id = "instance-1", agent: str
   const sessionId = `session-${id}`;
   database.prepare(`
     INSERT INTO tickets (
-      linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent, repo,
+      ticket_id, ticket_reference, session_id, branch, agent, repo,
       state, created_at, updated_at
     ) VALUES (?, ?, ?, 'ot/branch', 'claude', 'owner/repo', 'active', ?, ?)
   `).run(issueId, issueId.toUpperCase(), sessionId, TS, TS);
   database.prepare(`
     INSERT INTO agent_sessions (
-      id, linear_issue_id, generation, state, created_at, updated_at
+      id, ticket_id, generation, state, created_at, updated_at
     ) VALUES (?, ?, 1, 'current', ?, ?)
   `).run(sessionId, issueId, TS, TS);
   database.prepare(`
@@ -45,7 +45,7 @@ function seedInstance(database: Database.Database, id = "instance-1", agent: str
   `).run(TS);
   database.prepare(`
     INSERT INTO pipeline_instances (
-      id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+      id, ticket_id, session_id, generation, pipeline_id, pipeline_version,
       manifest_digest, normalized_manifest, repository, base_commit, branch, agent,
       repository_config_snapshot_id, repository_config_digest, runtime_release, capability_digest,
       executor_protocol, authorized_capabilities, status, active_stage_id, state_version,
@@ -98,11 +98,11 @@ function seedRun(database: Database.Database, id: string, instance: PipelineInst
 } = {}): void {
   database.prepare(`
     INSERT INTO runs (
-      id, linear_issue_id, linear_session_id, session_generation, task_type,
+      id, ticket_id, session_id, session_generation, task_type,
       token_hash, status, started_at, expires_at, completed_at, cost_usd, fault_attribution
     ) VALUES (?, ?, ?, 1, 'implement', ?, 'completed', ?, ?, ?, ?, ?)
   `).run(
-    id, instance.linear_issue_id, instance.linear_session_id, digestNormalized(`token-${id}`),
+    id, instance.ticket_id, instance.session_id, digestNormalized(`token-${id}`),
     TS, "2099-01-01T00:00:00.000Z", TS, overrides.costUsd ?? null, overrides.faultAttribution ?? null
   );
 }

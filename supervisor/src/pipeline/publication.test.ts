@@ -48,10 +48,10 @@ describe("pipeline publication", () => {
   });
 
   const getLinearOutbox = (id: string): LinearOutboxRecord | undefined =>
-    db!.prepare("SELECT * FROM linear_outbox WHERE id = ?").get(id) as LinearOutboxRecord | undefined;
+    db!.prepare("SELECT * FROM control_outbox WHERE id = ?").get(id) as LinearOutboxRecord | undefined;
 
   const listLinearOutbox = (): LinearOutboxRecord[] =>
-    db!.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
+    db!.prepare("SELECT * FROM control_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
 
   function setup(manifestKey = "fixture/command@1"): {
     tickets: SupervisorStore;
@@ -74,9 +74,9 @@ describe("pipeline publication", () => {
     });
     const manifest = catalog.manifests.get(manifestKey)!;
     tickets.upsert({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "ISSUE-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "ISSUE-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/issue-1",
       agent: "codex",
@@ -1650,7 +1650,7 @@ describe("pipeline publication", () => {
     const afterReview = coordinatePipelineEvent(pipelines, review.event, undefined, review.receipt);
     expect(afterReview.active_stage_id).toBe("resume");
     const reviewPublication = parsePipelinePublication(pipelines.listPublications(instance.id)
-      .find((row) => row.kind === "linear_ledger" && row.attempt_id === reviewAttempt.id)!.payload);
+      .find((row) => row.kind === "control_ledger" && row.attempt_id === reviewAttempt.id)!.payload);
     // Findings duplicated across stage_result and review artifacts render once
     // in the dispositions list; the repair banner may repeat the lead finding.
     expect(reviewPublication.body.match(/^\[P1\] provider-snapshot-bounding/gm)).toHaveLength(1);
@@ -1703,7 +1703,7 @@ describe("pipeline publication", () => {
     });
     coordinatePipelineEvent(pipelines, repair.event, undefined, repair.receipt);
     const repairPublication = parsePipelinePublication(pipelines.listPublications(instance.id)
-      .find((row) => row.kind === "linear_ledger" && row.attempt_id === repairAttempt.id)!.payload);
+      .find((row) => row.kind === "control_ledger" && row.attempt_id === repairAttempt.id)!.payload);
     // The repair stage emitted no findings of its own, yet earlier review
     // findings stop rendering as still carried to repair once the repair
     // branch produces a new tree.
@@ -1730,7 +1730,7 @@ describe("pipeline publication", () => {
     const terminal = coordinatePipelineEvent(pipelines, finalReview.event, undefined, finalReview.receipt);
     expect(terminal.terminal_outcome).toBe("shipped");
     const finalPublication = parsePipelinePublication(pipelines.listPublications(instance.id)
-      .find((row) => row.kind === "linear_ledger" && row.attempt_id === finalAttempt.id)!.payload);
+      .find((row) => row.kind === "control_ledger" && row.attempt_id === finalAttempt.id)!.payload);
     // The terminal publication and the GitHub summary show the whole run's
     // findings with their ultimate dispositions.
     expect(finalPublication.body)
@@ -1931,7 +1931,7 @@ describe("pipeline publication", () => {
     persistPublication({
       instance,
       attemptId: attempt.id,
-      kind: "linear_ledger",
+      kind: "control_ledger",
       idempotencyKey: "linear-provider-wait-test",
       payload: providerWait,
       timestamp: "2026-07-27T00:00:00.000Z",
@@ -1945,7 +1945,7 @@ describe("pipeline publication", () => {
     persistPublication({
       instance,
       attemptId: attempt.id,
-      kind: "linear_ledger",
+      kind: "control_ledger",
       idempotencyKey: "linear-shipped-test",
       payload: shipped,
       timestamp: "2026-07-27T00:00:01.000Z",
@@ -1960,7 +1960,7 @@ describe("pipeline publication", () => {
       persistPublication({
         instance,
         attemptId: attempt.id,
-        kind: "linear_ledger",
+        kind: "control_ledger",
         idempotencyKey: `linear-${outcome}-test`,
         payload,
         timestamp: "2026-07-27T00:00:02.000Z",
@@ -2045,7 +2045,7 @@ describe("pipeline publication", () => {
     const { tickets } = setup("fixture/agent@1");
     const status = listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
     const body = (JSON.parse(status.payload) as { publication: { body: string } }).publication.body;
-    db!.prepare("UPDATE linear_outbox SET external_id = ?, external_url = ? WHERE id = ?")
+    db!.prepare("UPDATE control_outbox SET external_id = ?, external_url = ? WHERE id = ?")
       .run("status-comment", "https://linear.test/comment/status", status.id);
     const calls: string[] = [];
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -2205,7 +2205,7 @@ describe("pipeline publication", () => {
     expect(calls).toEqual(["get:status-comment", "update:status-comment"]);
 
     outage = false;
-    db!.prepare("UPDATE linear_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+    db!.prepare("UPDATE control_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
       .run(status.id);
     await processor.process(status.id);
     expect(calls).toEqual([
@@ -2504,7 +2504,7 @@ describe("pipeline publication", () => {
     coordinatePipelineEvent(pipelines, noChange.event, undefined, noChange.receipt);
 
     const receipt = pipelines.listPublications(instance.id)
-      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+      .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
     const publication = parsePipelinePublication(receipt.payload);
     expect(publication.body).not.toContain("no pull request was created");
     expect(publication.body).toContain("already-published tree remains current");
@@ -2536,7 +2536,7 @@ describe("pipeline publication", () => {
     const transitioned = coordinatePipelineEvent(pipelines, noChange.event, undefined, noChange.receipt);
 
     const receipt = pipelines.listPublications(instance.id)
-      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+      .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
     const publication = parsePipelinePublication(receipt.payload);
     expect(transitioned.published_commit).toBeNull();
     expect(transitioned.published_subject).toBeNull();
@@ -2555,7 +2555,7 @@ describe("pipeline publication", () => {
     coordinatePipelineEvent(pipelines, noChange.event, undefined, noChange.receipt);
 
     const receipt = pipelines.listPublications(instance.id)
-      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+      .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
     const publication = parsePipelinePublication(receipt.payload);
     expect(publication.body).toContain("no pull request was created");
     expect(publication.body).not.toContain("already-published tree remains current");
@@ -2568,7 +2568,7 @@ describe("pipeline publication", () => {
     const transitioned = coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
     expect(transitioned.status).toBe("completion_pending_publication");
     const publication = pipelines.listPublications(instance.id)
-      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+      .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
 
     const outageFetch = vi.fn(async () =>
       new Response(JSON.stringify({ errors: [{ message: "temporary outage" }] }), { status: 503 })
@@ -2581,7 +2581,7 @@ describe("pipeline publication", () => {
     expect(pipelines.getPublication(publication.id)).toMatchObject({ status: "failed", attempts: 1 });
     expect(pipelines.getInstance(instance.id)?.status).toBe("completion_pending_publication");
 
-    db!.prepare("UPDATE linear_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+    db!.prepare("UPDATE control_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
       .run(publication.id);
     const successFetch = successfulLinearFetch();
     const recovered = createLinearOutboxProcessor({
@@ -2606,7 +2606,7 @@ describe("pipeline publication", () => {
     expect(afterFresh.status).toBe("dispatchable");
     expect(afterFresh.active_stage_id).toBe("resume");
     const firstPublication = pipelines.listPublications(instance.id)
-      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+      .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
     const outage = createLinearOutboxProcessor({
       store: tickets,
       getLinearClient: async () => ({
@@ -2635,7 +2635,7 @@ describe("pipeline publication", () => {
     const input = event(instance, attempt, "x".repeat(6_000));
     coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
     const publication = pipelines.listPublications(instance.id)
-      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+      .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
     expect(parsePipelinePublication(publication.payload).attachment?.content.length).toBeGreaterThan(4_000);
 
     let uploads = 0;
@@ -2680,7 +2680,7 @@ describe("pipeline publication", () => {
     const input = event(instance, attempt);
     coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
     const publication = pipelines.listPublications(instance.id)
-      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+      .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
     const denied = createLinearOutboxProcessor({
       store: tickets,
       getLinearClient: async () => ({
@@ -2693,7 +2693,7 @@ describe("pipeline publication", () => {
     });
     await denied.process(publication.id);
     expect(pipelines.getInstance(instance.id)?.status).toBe("publication_blocked");
-    expect(pipelines.getStatusForIssue(instance.linear_issue_id)).toMatchObject({
+    expect(pipelines.getStatusForIssue(instance.ticket_id)).toMatchObject({
       publication_state: "blocked",
       recovery_action: expect.stringContaining(publication.id),
     });
@@ -2714,7 +2714,7 @@ describe("pipeline publication", () => {
     const input = event(instance, attempt);
     coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
     const publication = pipelines.listPublications(instance.id)
-      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+      .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
 
     const flaky = createLinearOutboxProcessor({
       store: tickets,
@@ -2730,7 +2730,7 @@ describe("pipeline publication", () => {
     // text never matches a dead-token pattern -- the attempt cap, not the
     // error classification, is what dead-letters it.
     for (let attemptNumber = 1; attemptNumber <= 10; attemptNumber += 1) {
-      db!.prepare("UPDATE linear_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+      db!.prepare("UPDATE control_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
         .run(publication.id);
       await flaky.process(publication.id);
     }
@@ -2741,7 +2741,7 @@ describe("pipeline publication", () => {
 
     // A second failure right after the manual retry must not immediately
     // re-die on a stale attempts count -- it needs a genuine fresh budget.
-    db!.prepare("UPDATE linear_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+    db!.prepare("UPDATE control_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
       .run(publication.id);
     await flaky.process(publication.id);
     expect(getLinearOutbox(publication.id)).toMatchObject({ status: "failed", attempts: 1 });
@@ -2750,7 +2750,7 @@ describe("pipeline publication", () => {
       store: tickets,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: successfulLinearFetch() }),
     });
-    db!.prepare("UPDATE linear_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+    db!.prepare("UPDATE control_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
       .run(publication.id);
     await recovered.process(publication.id);
     expect(pipelines.getInstance(instance.id)?.status).toBe("shipped");
@@ -2759,9 +2759,9 @@ describe("pipeline publication", () => {
   it("keeps a late receipt bound to its original Linear session generation", async () => {
     const { tickets, pipelines, instance } = setup();
     tickets.upsert({
-      linear_issue_id: instance.linear_issue_id,
-      linear_issue_identifier: "ISSUE-1",
-      linear_session_id: "session-2",
+      ticket_id: instance.ticket_id,
+      ticket_reference: "ISSUE-1",
+      session_id: "session-2",
       sandbox_id: null,
       branch: "ot/issue-1-next",
       agent: "codex",
@@ -2797,9 +2797,9 @@ describe("pipeline publication", () => {
     const { tickets, instance } = setup("fixture/agent@1");
     const status = listLinearOutbox().find((row) => row.kind === "pipeline_status")!;
     tickets.upsert({
-      linear_issue_id: instance.linear_issue_id,
-      linear_issue_identifier: "ISSUE-1",
-      linear_session_id: "session-2",
+      ticket_id: instance.ticket_id,
+      ticket_reference: "ISSUE-1",
+      session_id: "session-2",
       sandbox_id: null,
       branch: "ot/issue-1-next",
       agent: "codex",
@@ -2848,9 +2848,9 @@ describe("pipeline publication", () => {
       config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\n"),
     });
     tickets.upsert({
-      linear_issue_id: instance.linear_issue_id,
-      linear_issue_identifier: "ISSUE-1",
-      linear_session_id: "session-2",
+      ticket_id: instance.ticket_id,
+      ticket_reference: "ISSUE-1",
+      session_id: "session-2",
       sandbox_id: null,
       branch: "ot/issue-1-next",
       agent: "codex",
@@ -2945,8 +2945,8 @@ describe("pipeline publication", () => {
       repository: "owner/repo", baseCommit: "a".repeat(40), blobSha: "b".repeat(40), config,
     });
     tickets.upsert({
-      linear_issue_id: "human-issue", linear_issue_identifier: "HUMAN-1",
-      linear_session_id: "human-session", sandbox_id: null, branch: "ot/human",
+      ticket_id: "human-issue", ticket_reference: "HUMAN-1",
+      session_id: "human-session", sandbox_id: null, branch: "ot/human",
       agent: "codex", repo: "owner/repo", pr_url: null, state: "active",
       pipeline: {
         repository: "owner/repo", baseCommit: "a".repeat(40), manifest,
@@ -2974,7 +2974,7 @@ describe("pipeline publication", () => {
     })).toThrow(/human answer can advance only a human-waiting instance/);
 
     const publication = pipelines.listPublications(instance.id)
-      .find((row) => row.kind === "linear_ledger" && row.attempt_id === attempt.id)!;
+      .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
     const processor = createLinearOutboxProcessor({
       store: tickets,
       getLinearClient: async () => ({ accessToken: "oauth", fetch: successfulLinearFetch() }),

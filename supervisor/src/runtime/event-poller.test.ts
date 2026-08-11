@@ -13,9 +13,9 @@ function seedRunningTicket() {
   db = openDb(":memory:");
   const store = createSupervisorStore(db);
   store.upsert({
-    linear_issue_id: "issue-1",
-    linear_issue_identifier: "OT-1",
-    linear_session_id: "session-1",
+    ticket_id: "issue-1",
+    ticket_reference: "OT-1",
+    session_id: "session-1",
     sandbox_id: "sandbox-1",
     branch: "ot/ot-1",
     agent: "codex",
@@ -371,7 +371,7 @@ describe("sandbox event contracts", () => {
     );
     expect(captureAgentAuth).toHaveBeenCalledWith(
       sandbox,
-      expect.objectContaining({ linear_issue_id: "issue-1" })
+      expect.objectContaining({ ticket_id: "issue-1" })
     );
     expect(warn).toHaveBeenCalledWith(
       "[sandbox-events] agent auth capture failed:",
@@ -885,7 +885,7 @@ describe("sandbox event contracts", () => {
     const store = seedRunningTicket();
     store.upsert({
       ...store.getByIssueId("issue-1")!,
-      linear_session_id: "session-2",
+      session_id: "session-2",
       sandbox_id: "sandbox-1",
       state: "active",
     });

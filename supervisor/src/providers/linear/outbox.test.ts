@@ -14,9 +14,9 @@ describe("Linear outbox retry bounding", () => {
     db = openDb(":memory:");
     store = createSupervisorStore(db);
     store.upsertUnpinned({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -28,17 +28,17 @@ describe("Linear outbox retry bounding", () => {
   }
 
   const getLinearOutbox = (id: string): LinearOutboxRecord | undefined =>
-    db.prepare("SELECT * FROM linear_outbox WHERE id = ?").get(id) as LinearOutboxRecord | undefined;
+    db.prepare("SELECT * FROM control_outbox WHERE id = ?").get(id) as LinearOutboxRecord | undefined;
 
   // Never expire the lease mid-test and always look claimable "now".
   const forceClaimable = (id: string) =>
-    db.prepare("UPDATE linear_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(id);
+    db.prepare("UPDATE control_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(id);
 
   it("dead-letters a persistently failing activity after the attempt cap instead of retrying forever", async () => {
     setup();
     const row = store.enqueueLinearOutbox({
       id: "linear-malformed",
-      linearSessionId: "session-1",
+      sessionId: "session-1",
       issueId: "issue-1",
       kind: "activity",
       payload: JSON.stringify({ type: "activity", activity: { sessionId: "session-1", type: "thought", body: "hello" } }),
@@ -68,14 +68,14 @@ describe("Linear outbox retry bounding", () => {
     setup();
     const blocking = store.enqueueLinearOutbox({
       id: "linear-malformed",
-      linearSessionId: "session-1",
+      sessionId: "session-1",
       issueId: "issue-1",
       kind: "activity",
       payload: JSON.stringify({ type: "activity", activity: { sessionId: "session-1", type: "thought", body: "hello" } }),
     });
     const terminalReceipt = store.enqueueLinearOutbox({
-      id: "linear-terminal-receipt",
-      linearSessionId: "session-1",
+      id: "control-terminal-receipt",
+      sessionId: "session-1",
       issueId: "issue-1",
       kind: "pipeline_receipt",
       payload: JSON.stringify({

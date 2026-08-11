@@ -48,7 +48,7 @@ describe("reclaimEligibleRuntimeResources", () => {
     const instance = pipelines.getInstanceForSession(params.sessionId)!;
     pipelines.bindRuntimeResource(instance.id, "daytona", params.resourceId);
     pipelines.setRuntimeResourceStatus(instance.id, "stopped");
-    tickets.setSandboxId(instance.linear_issue_id, params.resourceId);
+    tickets.setSandboxId(instance.ticket_id, params.resourceId);
     if (params.settleProvisionEffect !== false) {
       db.prepare(`
         UPDATE pipeline_effect_intents SET status = 'acknowledged'
@@ -82,8 +82,8 @@ describe("reclaimEligibleRuntimeResources", () => {
     expect(result).toEqual({ reclaimed: 1, candidates: 1 });
     expect(cleanup).toHaveBeenCalledWith({ providerResourceId: "sandbox-reclaim" });
     expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("cleaned");
-    expect(tickets.getByIssueId(instance.linear_issue_id)?.sandbox_id).toBeNull();
-    const entries = pipelines.listJournalEntries({ issueId: instance.linear_issue_id });
+    expect(tickets.getByIssueId(instance.ticket_id)?.sandbox_id).toBeNull();
+    const entries = pipelines.listJournalEntries({ issueId: instance.ticket_id });
     expect(entries).toContainEqual(expect.objectContaining({
       kind: "run_note",
       trigger: "test sweep",
@@ -221,7 +221,7 @@ describe("reclaimEligibleRuntimeResources", () => {
 
     expect(result.reclaimed).toBe(0);
     expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("stopped");
-    expect(tickets.getByIssueId(instance.linear_issue_id)?.sandbox_id).toBe("sandbox-cleanup-fails");
+    expect(tickets.getByIssueId(instance.ticket_id)?.sandbox_id).toBe("sandbox-cleanup-fails");
     error.mockRestore();
   });
 
@@ -254,7 +254,7 @@ describe("reclaimEligibleRuntimeResources", () => {
       resourceId: "sandbox-old-binding",
     });
     tickets.upsertUnpinned({
-      ...ticket("session-replacement-binding", instance.linear_issue_id),
+      ...ticket("session-replacement-binding", instance.ticket_id),
       sandbox_id: "sandbox-replacement-binding",
     });
     const cleanup = vi.fn(async () => undefined);
@@ -269,8 +269,8 @@ describe("reclaimEligibleRuntimeResources", () => {
 
     expect(cleanup).toHaveBeenCalledWith({ providerResourceId: "sandbox-old-binding" });
     expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("cleaned");
-    expect(tickets.getByIssueId(instance.linear_issue_id)).toMatchObject({
-      linear_session_id: "session-replacement-binding",
+    expect(tickets.getByIssueId(instance.ticket_id)).toMatchObject({
+      session_id: "session-replacement-binding",
       sandbox_id: "sandbox-replacement-binding",
     });
   });

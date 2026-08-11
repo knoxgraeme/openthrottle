@@ -30,31 +30,35 @@ export interface ActivityPublicationPort {
   ): Promise<void>;
 }
 
-export interface ResolvedLinearLabel {
+export type ControlProvider = "linear" | "github";
+
+export interface ResolvedControlLabel {
   name: string;
   parentName?: string;
 }
 
-export interface LinearLabelPort {
-  fetchIssueLabels(issueId: string): Promise<ResolvedLinearLabel[]>;
+export interface ControlLabelPort {
+  fetchThreadLabels(threadId: string): Promise<ResolvedControlLabel[]>;
 }
 
-export interface LinearIssueEventPayload {
+export interface ControlThread {
   id: string;
   identifier: string;
-  team?: { id?: string; key?: string; name?: string };
+  provider: ControlProvider;
+  route?: { id?: string; key?: string; name?: string };
   labels?: Array<{ id?: string; name: string }> | { nodes?: Array<{ name: string }> };
 }
 
-export interface LinearAgentSessionEvent {
+export interface ControlThreadEvent {
+  provider: ControlProvider;
   action: "created" | "prompted";
   promptContext?: string;
   agentSession: {
     id: string;
-    issueId?: string;
-    issue?: LinearIssueEventPayload;
+    threadId?: string;
+    thread?: ControlThread;
   };
-  agentActivity?: {
+  activity?: {
     id: string;
     signal?: string;
     content?: { type?: string; body?: string };

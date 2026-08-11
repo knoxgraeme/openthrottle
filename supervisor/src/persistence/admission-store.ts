@@ -13,6 +13,7 @@ export interface AdmissionStore {
   upsert(ticket: TicketUpsert): void;
   upsertUnpinned(ticket: Omit<TicketUpsert, "pipeline">): void;
   getByIssueId(issueId: string): Ticket | undefined;
+  getByExternalThread(provider: Ticket["control_provider"], externalThreadId: string): Ticket | undefined;
   getByIdentifier(identifier: string): Ticket | undefined;
   getByBranch(repo: string, branch: string): Ticket | undefined;
   getByPrUrl(repo: string, prUrl: string): Ticket | undefined;
@@ -25,7 +26,11 @@ export interface AdmissionStore {
   getSession(sessionId: string): AgentSession | undefined;
   markSessionState(sessionId: string, state: AgentSession["state"]): void;
   registerRepository(input: RepositoryRegistrationInput): RepositoryRegistration;
-  getRepositoryRegistration(teamId?: string, teamKey?: string): RepositoryRegistration | undefined;
+  getRepositoryRegistration(
+    teamId?: string,
+    teamKey?: string,
+    controlProvider?: RepositoryRegistration["control_provider"]
+  ): RepositoryRegistration | undefined;
   listRepositoryRegistrations(): RepositoryRegistration[];
 }
 
@@ -36,15 +41,19 @@ export function createAdmissionStore(
   const now = () => new Date().toISOString();
   const upsertStmt = db.prepare(`
     INSERT INTO tickets (
-      linear_issue_id, linear_issue_identifier, linear_session_id,
+      ticket_id, ticket_reference, session_id, control_provider,
+      external_thread_id, external_thread_reference,
       sandbox_id, branch, agent, repo, pr_url, state, base_branch, created_at, updated_at
     ) VALUES (
-      @linear_issue_id, @linear_issue_identifier, @linear_session_id,
+      @ticket_id, @ticket_reference, @session_id, @control_provider,
+      @external_thread_id, @external_thread_reference,
       @sandbox_id, @branch, @agent, @repo, @pr_url, @state, @base_branch, @created_at, @updated_at
     )
-    ON CONFLICT(linear_issue_id) DO UPDATE SET
-      linear_issue_identifier = excluded.linear_issue_identifier,
-      linear_session_id = excluded.linear_session_id,
+    ON CONFLICT(ticket_id) DO UPDATE SET
+      ticket_reference = excluded.ticket_reference,
+      session_id = excluded.session_id,
+      external_thread_id = excluded.external_thread_id,
+      external_thread_reference = excluded.external_thread_reference,
       sandbox_id = excluded.sandbox_id,
       branch = excluded.branch,
       agent = excluded.agent,
@@ -54,9 +63,12 @@ export function createAdmissionStore(
       base_branch = excluded.base_branch,
       updated_at = excluded.updated_at
   `);
-  const getByIssueIdStmt = db.prepare("SELECT * FROM tickets WHERE linear_issue_id = ?");
+  const getByIssueIdStmt = db.prepare("SELECT * FROM tickets WHERE ticket_id = ?");
+  const getByExternalThreadStmt = db.prepare(
+    "SELECT * FROM tickets WHERE control_provider = ? AND external_thread_id = ?"
+  );
   const getByIdentifierStmt = db.prepare(
-    "SELECT * FROM tickets WHERE lower(linear_issue_identifier) = lower(?)"
+    "SELECT * FROM tickets WHERE lower(ticket_reference) = lower(?)"
   );
   const getByBranchStmt = db.prepare("SELECT * FROM tickets WHERE repo = ? AND branch = ?");
   const getByPrUrlStmt = db.prepare(
@@ -64,13 +76,13 @@ export function createAdmissionStore(
   );
   const getBySandboxIdStmt = db.prepare("SELECT * FROM tickets WHERE sandbox_id = ?");
   const setSandboxIdStmt = db.prepare(
-    "UPDATE tickets SET sandbox_id = ?, updated_at = ? WHERE linear_issue_id = ?"
+    "UPDATE tickets SET sandbox_id = ?, updated_at = ? WHERE ticket_id = ?"
   );
   const setStateStmt = db.prepare(
-    "UPDATE tickets SET state = ?, last_error = ?, updated_at = ? WHERE linear_issue_id = ?"
+    "UPDATE tickets SET state = ?, last_error = ?, updated_at = ? WHERE ticket_id = ?"
   );
   const setPrUrlStmt = db.prepare(
-    "UPDATE tickets SET pr_url = ?, updated_at = ? WHERE linear_issue_id = ?"
+    "UPDATE tickets SET pr_url = ?, updated_at = ? WHERE ticket_id = ?"
   );
   const listAllStmt = db.prepare("SELECT * FROM tickets ORDER BY created_at DESC");
   const getRepositoryByTeamIdStmt = db.prepare(
@@ -80,37 +92,41 @@ export function createAdmissionStore(
     "SELECT * FROM repository_registrations WHERE lower(linear_team_key) = lower(?)"
   );
   const listRepositoryRegistrationsStmt = db.prepare(
-    "SELECT * FROM repository_registrations ORDER BY linear_team_key"
+    "SELECT * FROM repository_registrations ORDER BY github_repo"
+  );
+  const getRepositoryByRepoStmt = db.prepare(
+    "SELECT * FROM repository_registrations WHERE lower(github_repo) = lower(?)"
   );
   const upsertRepositoryRegistrationStmt = db.prepare(`
     INSERT INTO repository_registrations (
-      linear_team_key, linear_team_id, github_repo, base_branch,
+      github_repo, control_provider, linear_team_key, linear_team_id, base_branch,
       webhook_id, snapshot, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(linear_team_key) DO UPDATE SET
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(github_repo) DO UPDATE SET
+      linear_team_key = excluded.linear_team_key,
       linear_team_id = excluded.linear_team_id,
-      github_repo = excluded.github_repo,
       base_branch = excluded.base_branch,
       webhook_id = excluded.webhook_id,
       snapshot = excluded.snapshot,
       updated_at = excluded.updated_at
+    WHERE repository_registrations.control_provider = excluded.control_provider
   `);
   const getCurrentSessionStmt = db.prepare(
-    "SELECT * FROM agent_sessions WHERE linear_issue_id = ? AND state = 'current'"
+    "SELECT * FROM agent_sessions WHERE ticket_id = ? AND state = 'current'"
   );
   const getSessionStmt = db.prepare("SELECT * FROM agent_sessions WHERE id = ?");
   const maxSessionGenerationStmt = db.prepare(
-    "SELECT COALESCE(MAX(generation), 0) AS generation FROM agent_sessions WHERE linear_issue_id = ?"
+    "SELECT COALESCE(MAX(generation), 0) AS generation FROM agent_sessions WHERE ticket_id = ?"
   );
   const insertSessionStmt = db.prepare(`
     INSERT OR IGNORE INTO agent_sessions (
-      id, linear_issue_id, generation, state, created_at, updated_at
+      id, ticket_id, generation, state, created_at, updated_at
     ) VALUES (?, ?, ?, 'current', ?, ?)
   `);
   const supersedeSessionStmt = db.prepare(`
     UPDATE agent_sessions
     SET state = 'superseded', superseded_at = ?, updated_at = ?
-    WHERE linear_issue_id = ? AND state = 'current' AND id <> ?
+    WHERE ticket_id = ? AND state = 'current' AND id <> ?
   `);
   const markSessionStateStmt = db.prepare(
     "UPDATE agent_sessions SET state = ?, updated_at = ? WHERE id = ?"
@@ -135,49 +151,71 @@ export function createAdmissionStore(
   const registerRepositoryTransaction = db.transaction(
     (input: RepositoryRegistrationInput): RepositoryRegistration => {
       const timestamp = now();
-      const existing = getRepositoryByTeamKeyStmt.get(input.linearTeamKey) as
+      const controlProvider = input.controlProvider ?? "linear";
+      if (controlProvider === "linear" && !input.linearTeamKey) {
+        throw new Error("Linear repository registration requires a Linear team key");
+      }
+      const existing = getRepositoryByRepoStmt.get(input.githubRepo) as
         | RepositoryRegistration
         | undefined;
-      if (input.linearTeamId) {
-        db.prepare(`
-          DELETE FROM repository_registrations
-          WHERE linear_team_id = ? AND lower(linear_team_key) <> lower(?)
-        `).run(input.linearTeamId, input.linearTeamKey);
+      if (existing && existing.control_provider !== controlProvider) {
+        throw new Error(
+          `Repository ${input.githubRepo} is already registered for ${existing.control_provider} control`
+        );
+      }
+      if (controlProvider === "linear") {
+        const byKey = input.linearTeamKey
+          ? (getRepositoryByTeamKeyStmt.get(input.linearTeamKey) as RepositoryRegistration | undefined)
+          : undefined;
+        const byId = input.linearTeamId
+          ? (getRepositoryByTeamIdStmt.get(input.linearTeamId) as RepositoryRegistration | undefined)
+          : undefined;
+        for (const route of [byKey, byId]) {
+          if (route && route.github_repo.toLowerCase() !== input.githubRepo.toLowerCase()) {
+            throw new Error(
+              `Linear route is already registered for ${route.github_repo}; refusing to transfer authority to ${input.githubRepo}`
+            );
+          }
+        }
       }
       upsertRepositoryRegistrationStmt.run(
-        input.linearTeamKey,
-        input.linearTeamId ?? null,
         input.githubRepo,
+        controlProvider,
+        input.linearTeamKey ?? null,
+        input.linearTeamId ?? null,
         input.baseBranch,
         input.webhookId,
         input.snapshot,
         existing?.created_at ?? timestamp,
         timestamp
       );
-      return getRepositoryByTeamKeyStmt.get(input.linearTeamKey) as RepositoryRegistration;
+      return getRepositoryByRepoStmt.get(input.githubRepo) as RepositoryRegistration;
     }
   );
   return {
     upsert(ticket) {
-      const existing = getByIssueIdStmt.get(ticket.linear_issue_id) as Ticket | undefined;
+      const existing = getByIssueIdStmt.get(ticket.ticket_id) as Ticket | undefined;
       db.transaction(() => {
         const { pipeline, ...ticketRow } = ticket;
         upsertStmt.run({
           ...ticketRow,
+          control_provider: ticket.control_provider ?? existing?.control_provider ?? "linear",
+          external_thread_id: ticket.external_thread_id ?? existing?.external_thread_id ?? ticket.ticket_id,
+          external_thread_reference: ticket.external_thread_reference ?? existing?.external_thread_reference ?? ticket.ticket_reference,
           base_branch: ticket.base_branch ?? existing?.base_branch ?? "main",
           created_at: existing?.created_at ?? now(),
           updated_at: now(),
         });
         const session = supersedeCurrentSessionTransaction(
-          ticket.linear_issue_id,
-          ticket.linear_session_id
+          ticket.ticket_id,
+          ticket.session_id
         );
-        pipelineStore.supersedeOtherInstances(ticket.linear_issue_id, ticket.linear_session_id);
+        pipelineStore.supersedeOtherInstances(ticket.ticket_id, ticket.session_id);
         if (pipeline) {
           pipelineStore.createInstance({
             ...pipeline,
-            issueId: ticket.linear_issue_id,
-            sessionId: ticket.linear_session_id,
+            issueId: ticket.ticket_id,
+            sessionId: ticket.session_id,
             generation: session.generation,
             branch: ticket.branch,
             agent: ticket.agent,
@@ -186,20 +224,26 @@ export function createAdmissionStore(
       })();
     },
     upsertUnpinned(ticket) {
-      const existing = getByIssueIdStmt.get(ticket.linear_issue_id) as Ticket | undefined;
+      const existing = getByIssueIdStmt.get(ticket.ticket_id) as Ticket | undefined;
       db.transaction(() => {
         upsertStmt.run({
           ...ticket,
+          control_provider: ticket.control_provider ?? existing?.control_provider ?? "linear",
+          external_thread_id: ticket.external_thread_id ?? existing?.external_thread_id ?? ticket.ticket_id,
+          external_thread_reference: ticket.external_thread_reference ?? existing?.external_thread_reference ?? ticket.ticket_reference,
           base_branch: ticket.base_branch ?? existing?.base_branch ?? "main",
           created_at: existing?.created_at ?? now(),
           updated_at: now(),
         });
-        supersedeCurrentSessionTransaction(ticket.linear_issue_id, ticket.linear_session_id);
-        pipelineStore.supersedeOtherInstances(ticket.linear_issue_id, ticket.linear_session_id);
+        supersedeCurrentSessionTransaction(ticket.ticket_id, ticket.session_id);
+        pipelineStore.supersedeOtherInstances(ticket.ticket_id, ticket.session_id);
       })();
     },
     getByIssueId(issueId) {
       return getByIssueIdStmt.get(issueId) as Ticket | undefined;
+    },
+    getByExternalThread(provider, externalThreadId) {
+      return getByExternalThreadStmt.get(provider, externalThreadId) as Ticket | undefined;
     },
     getByIdentifier(identifier) {
       return getByIdentifierStmt.get(identifier) as Ticket | undefined;
@@ -237,14 +281,15 @@ export function createAdmissionStore(
     registerRepository(input) {
       return registerRepositoryTransaction(input);
     },
-    getRepositoryRegistration(teamId, teamKey) {
+    getRepositoryRegistration(teamId, teamKey, controlProvider = "linear") {
       if (teamId) {
         const byId = getRepositoryByTeamIdStmt.get(teamId) as RepositoryRegistration | undefined;
-        if (byId) return byId;
+        if (byId?.control_provider === controlProvider) return byId;
       }
-      return teamKey
+      const byKey = teamKey
         ? (getRepositoryByTeamKeyStmt.get(teamKey) as RepositoryRegistration | undefined)
         : undefined;
+      return byKey?.control_provider === controlProvider ? byKey : undefined;
     },
     listRepositoryRegistrations() {
       return listRepositoryRegistrationsStmt.all() as RepositoryRegistration[];

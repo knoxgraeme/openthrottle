@@ -41,13 +41,13 @@ export function routePipelineProviderEvent(params: {
   headSha: string | undefined;
   pullRequestUrl?: string;
 }): boolean {
-  const instance = params.pipelines.getInstanceForSession(params.ticket.linear_session_id);
+  const instance = params.pipelines.getInstanceForSession(params.ticket.session_id);
   if (!instance) return false;
   if (params.pullRequestUrl && params.ticket.pr_url && params.pullRequestUrl !== params.ticket.pr_url) {
     return true;
   }
   if (pipelineIsTerminal(instance)) return true;
-  const authoritativeHead = params.store.getSetting(`github-head:${params.ticket.linear_issue_id}`);
+  const authoritativeHead = params.store.getSetting(`github-head:${params.ticket.ticket_id}`);
   if (params.headSha === undefined) return true;
   const canReceive = providerStageCanReceive(params.pipelines, instance);
   const revisionMatches = instance.published_commit !== null && params.headSha === instance.published_commit;
@@ -272,13 +272,13 @@ export async function handleGithubEvent(
     if (!isOpenthrottleBranch(branch)) return;
     const ticket = store.getByBranch(event.repository.full_name, branch);
     if (!ticket) return;
-    const pipelineInstance = pipelines.getInstanceForSession(ticket.linear_session_id);
+    const pipelineInstance = pipelines.getInstanceForSession(ticket.session_id);
     if (!pipelineInstance) return;
     if (ticket.pr_url && ticket.pr_url !== event.pull_request.html_url) return;
     if (event.action === "opened" || event.action === "reopened" || event.action === "synchronize") {
-      store.setPrUrl(ticket.linear_issue_id, event.pull_request.html_url);
+      store.setPrUrl(ticket.ticket_id, event.pull_request.html_url);
       if (event.pull_request.head.sha) {
-        setAuthoritativeGithubHead(store, ticket.linear_issue_id, event.pull_request.head.sha);
+        setAuthoritativeGithubHead(store, ticket.ticket_id, event.pull_request.head.sha);
       }
     }
     if (event.action === "synchronize" && event.pull_request.head.sha) {
@@ -308,9 +308,9 @@ export async function handleGithubEvent(
         event.pull_request.head.sha ?? "unknown"
       );
       if (event.pull_request.head.sha) {
-        setAuthoritativeGithubHead(store, ticket.linear_issue_id, event.pull_request.head.sha);
+        setAuthoritativeGithubHead(store, ticket.ticket_id, event.pull_request.head.sha);
       }
-      store.setPrUrl(ticket.linear_issue_id, event.pull_request.html_url);
+      store.setPrUrl(ticket.ticket_id, event.pull_request.html_url);
       const routedPipeline = routePipelineProviderEvent({
         pipelines,
         store,
@@ -320,18 +320,18 @@ export async function handleGithubEvent(
         summary: event.pull_request.merged ? "GitHub reports the pull request merged." : "GitHub reports the pull request closed without merge.",
         evidence: [event.pull_request.html_url],
         payload: { kind: "pull_request", action: "closed", merged: event.pull_request.merged },
-        headSha: event.pull_request.head.sha ?? store.getSetting(`github-head:${ticket.linear_issue_id}`),
+        headSha: event.pull_request.head.sha ?? store.getSetting(`github-head:${ticket.ticket_id}`),
         pullRequestUrl: event.pull_request.html_url,
       });
       const currentPipeline = routedPipeline
-        ? pipelines.getInstanceForSession(ticket.linear_session_id)
+        ? pipelines.getInstanceForSession(ticket.session_id)
         : undefined;
       const providerEvidenceDeferred =
         pipelines.getInboxEvent(providerEventId)?.status === "pending";
       if (currentPipeline && !pipelineIsTerminal(currentPipeline) && !providerEvidenceDeferred) {
         requestPipelineStop({
           store: pipelines,
-          sessionId: ticket.linear_session_id,
+          sessionId: ticket.session_id,
           eventId: githubPullEventId(
             "closed-stop",
             event.repository.full_name,
@@ -348,7 +348,7 @@ export async function handleGithubEvent(
         const observed = currentPipeline ?? pipelineInstance;
         pipelines.recordJournalEntry({
           id: `journal-github-merged-${observed.repository}-${event.pull_request.number}-${event.pull_request.head.sha ?? "unknown"}`,
-          issueId: ticket.linear_issue_id,
+          issueId: ticket.ticket_id,
           instanceId: observed.id,
           actor: "supervisor",
           kind: "merged",
@@ -364,9 +364,9 @@ export async function handleGithubEvent(
       }
       // GitHub close is authoritative even when a stage already settled and
       // has no live attempt left for a stop event to cancel.
-      store.setState(ticket.linear_issue_id, "closed");
-      store.markSessionState(ticket.linear_session_id, "stopped");
-      store.cancelPendingInbox(ticket.linear_issue_id);
+      store.setState(ticket.ticket_id, "closed");
+      store.markSessionState(ticket.session_id, "stopped");
+      store.cancelPendingInbox(ticket.ticket_id);
     }
     return;
   }
@@ -375,12 +375,12 @@ export async function handleGithubEvent(
     const ticket = store.getByBranch(event.repository.full_name, event.pull_request.head.ref);
     if (!ticket || event.action !== "submitted") return;
     await activityPublisher.publishActivity({
-      sessionId: ticket.linear_session_id,
+      sessionId: ticket.session_id,
       type: "action",
       action: "PR review submitted",
       parameter: `${event.review.user?.login ?? "reviewer"}: ${event.review.state}`,
       result: event.review.html_url,
-    }, ticket.linear_issue_id);
+    }, ticket.ticket_id);
     const reviewState = event.review.state.toLowerCase();
     if (reviewState !== "changes_requested" && reviewState !== "commented") return;
     const author = event.review.user?.login;
@@ -389,12 +389,12 @@ export async function handleGithubEvent(
     // filtering applies here — every attested review is human.
     if (!author) return;
     const headSha = event.pull_request.head.sha ??
-      store.getSetting(`github-head:${ticket.linear_issue_id}`) ??
+      store.getSetting(`github-head:${ticket.ticket_id}`) ??
       `unknown:${event.pull_request.head.ref}`;
     if (event.pull_request.head.sha) {
-      setAuthoritativeGithubHead(store, ticket.linear_issue_id, headSha);
-    } else if (!store.getSetting(`github-head:${ticket.linear_issue_id}`)) {
-      store.setSetting(`github-head:${ticket.linear_issue_id}`, headSha);
+      setAuthoritativeGithubHead(store, ticket.ticket_id, headSha);
+    } else if (!store.getSetting(`github-head:${ticket.ticket_id}`)) {
+      store.setSetting(`github-head:${ticket.ticket_id}`, headSha);
     }
     routePipelineProviderEvent({
       pipelines,
@@ -427,13 +427,13 @@ export async function handleGithubEvent(
     if (looksLikeSupervisorSummary(event.comment.body)) return;
     if (isGithubBotLinkback(author, event.comment.body)) return;
     await activityPublisher.publishActivity({
-      sessionId: ticket.linear_session_id,
+      sessionId: ticket.session_id,
       type: "action",
       action: "PR comment",
       parameter: author,
       result: event.comment.html_url,
-    }, ticket.linear_issue_id);
-    const headSha = store.getSetting(`github-head:${ticket.linear_issue_id}`) ??
+    }, ticket.ticket_id);
+    const headSha = store.getSetting(`github-head:${ticket.ticket_id}`) ??
       `unknown:${ticket.branch}`;
     routePipelineProviderEvent({
       pipelines,
@@ -477,15 +477,15 @@ export async function handleGithubEvent(
   const ticket = store.getByBranch(event.repository.full_name, ci.branch);
   if (!ticket) return;
   await activityPublisher.publishActivity({
-    sessionId: ticket.linear_session_id,
+    sessionId: ticket.session_id,
     type: "action",
     action: "CI completed",
     parameter: ci.conclusion ?? "unknown",
     result: ci.url,
-  }, ticket.linear_issue_id);
+  }, ticket.ticket_id);
   considerCiGithubHead(
     store,
-    ticket.linear_issue_id,
+    ticket.ticket_id,
     ci.headSha,
     event.kind,
     ci.sequence
@@ -496,7 +496,7 @@ export async function handleGithubEvent(
   // event is the authoritative success boundary. Red checks can immediately
   // re-enter the bounded repair path, while every pipeline CI completion stays
   // out of the deterministic coordinator.
-  if (!pipelines.getInstanceForSession(ticket.linear_session_id)) return;
+  if (!pipelines.getInstanceForSession(ticket.session_id)) return;
   if (ci.conclusion === "failure" || ci.conclusion === "timed_out") {
     const enrichment = await enrichCiFailure({
       cfg: _cfg,

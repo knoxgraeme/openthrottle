@@ -198,15 +198,15 @@ function resolveProgressEventTarget(
   event: SandboxActivityEvent | SandboxPlanEvent
 ): ProgressEventTarget {
   const run = params.store.getRun(event.run_id);
-  const sessionId = run?.linear_session_id ?? ticket.linear_session_id;
-  const issueId = run?.linear_issue_id ?? ticket.linear_issue_id;
-  if (!run?.linear_session_id || run.linear_session_id === ticket.linear_session_id) {
+  const sessionId = run?.session_id ?? ticket.session_id;
+  const issueId = run?.ticket_id ?? ticket.ticket_id;
+  if (!run?.session_id || run.session_id === ticket.session_id) {
     return { sessionId, issueId, superseded: false };
   }
   return {
     sessionId,
     issueId,
-    superseded: params.store.getSession(run.linear_session_id)?.state === "superseded",
+    superseded: params.store.getSession(run.session_id)?.state === "superseded",
   };
 }
 
@@ -221,18 +221,18 @@ async function pollTicketEvents(
     sandbox = await params.runtime.getWorkspace(ticket.sandbox_id);
     if (sandbox.state !== "started") await sandbox.start?.(60);
     await params.runtime.setActive(ticket.sandbox_id);
-    if (params.store.getByIssueId(ticket.linear_issue_id)?.run_id !== ticket.run_id) {
+    if (params.store.getByIssueId(ticket.ticket_id)?.run_id !== ticket.run_id) {
       await reconcileSandboxAutostop({
         runtime: params.runtime,
         store: params.store,
-        issueId: ticket.linear_issue_id,
+        issueId: ticket.ticket_id,
         providerResourceId: ticket.sandbox_id,
       });
       return;
     }
     files = await listEventFiles(sandbox);
   } catch (error) {
-    console.error(`[sandbox-events] could not inspect ${ticket.linear_issue_identifier}:`, error);
+    console.error(`[sandbox-events] could not inspect ${ticket.ticket_reference}:`, error);
     return;
   }
 
@@ -375,7 +375,7 @@ async function pollTicketEvents(
         try {
           await params.postActivity({
             id: `sandbox-ingestion-diagnostic:${event.event_id}`,
-            sessionId: ticket.linear_session_id,
+            sessionId: ticket.session_id,
             type: "error",
             body: `The supervisor cannot ingest the stage result: ${message}. It will keep retrying.`,
           }, {
@@ -386,7 +386,7 @@ async function pollTicketEvents(
             created_at: event.created_at,
             type: "error",
             body: message,
-            issueId: ticket.linear_issue_id,
+            issueId: ticket.ticket_id,
           });
           params.store.markSandboxEventDiagnosed(event.event_id, new Date().toISOString());
         } catch (activityError) {

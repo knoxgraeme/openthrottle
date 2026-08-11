@@ -35,8 +35,8 @@ export interface RepositoryConfigSnapshot {
 
 export interface PipelineInstance {
   id: string;
-  linear_issue_id: string;
-  linear_session_id: string;
+  ticket_id: string;
+  session_id: string;
   generation: number;
   pipeline_id: string;
   pipeline_version: number;
@@ -120,7 +120,7 @@ export interface PipelineEffectIntent {
   id: string;
   pipeline_instance_id: string;
   transition_version: number;
-  kind: "provision" | "dispatch_stage" | "idle" | "stop" | "quarantine" | "cleanup" | "publish_linear" | "publish_github";
+  kind: "provision" | "dispatch_stage" | "idle" | "stop" | "quarantine" | "cleanup" | "publish_control" | "publish_github";
   idempotency_key: string;
   payload: string;
   payload_hash: string;
@@ -136,7 +136,7 @@ export interface PipelinePublicationReceipt {
   id: string;
   pipeline_instance_id: string;
   attempt_id: string | null;
-  kind: "linear_ledger" | "github_summary" | "pull_request";
+  kind: "control_ledger" | "github_summary" | "pull_request";
   idempotency_key: string;
   payload: string;
   payload_hash: string;
@@ -239,7 +239,7 @@ export interface OrchestrationJournalQuery {
 // persistence/pipeline/run-outcome-store.ts.
 export interface RunOutcome {
   pipeline_instance_id: string;
-  linear_issue_id: string;
+  ticket_id: string;
   generation: number;
   execution_graph_id: string | null;
   plan_digest: string | null;

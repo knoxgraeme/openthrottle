@@ -13,8 +13,8 @@ export type WorkItemStatus =
 
 export interface WorkItem {
   id: string;
-  linear_issue_id: string;
-  linear_session_id: string;
+  ticket_id: string;
+  session_id: string;
   pipeline_instance_id: string | null;
   run_id: string | null;
   native_session_id: string | null;
@@ -48,8 +48,8 @@ export interface WorkDelivery {
   work_item_id: string;
   attempt_ordinal: number;
   idempotency_key: string;
-  linear_issue_id: string;
-  linear_session_id: string;
+  ticket_id: string;
+  session_id: string;
   pipeline_instance_id: string | null;
   run_id: string;
   native_session_id: string | null;
@@ -105,8 +105,8 @@ function requestHash(params: {
 
 function assertBinding(delivery: WorkDelivery, binding: WorkBinding): void {
   if (
-    delivery.linear_issue_id !== binding.issueId ||
-    delivery.linear_session_id !== binding.sessionId ||
+    delivery.ticket_id !== binding.issueId ||
+    delivery.session_id !== binding.sessionId ||
     delivery.pipeline_instance_id !== (binding.pipelineInstanceId ?? null) ||
     delivery.run_id !== binding.runId ||
     delivery.native_session_id !== (binding.nativeSessionId ?? null) ||
@@ -167,7 +167,7 @@ export function createWorkStore(db: Database.Database): WorkStore {
       }
       db.prepare(`
         INSERT INTO work_items (
-          id, linear_issue_id, linear_session_id, pipeline_instance_id, run_id,
+          id, ticket_id, session_id, pipeline_instance_id, run_id,
           native_session_id, generation, context_revision, source, priority,
           body, request_hash, status, available_at, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
@@ -220,8 +220,8 @@ export function createWorkStore(db: Database.Database): WorkStore {
         ).run(active.id);
       }
       if (
-        item.linear_issue_id !== params.issueId ||
-        item.linear_session_id !== params.sessionId ||
+        item.ticket_id !== params.issueId ||
+        item.session_id !== params.sessionId ||
         item.pipeline_instance_id !== (params.pipelineInstanceId ?? null) ||
         (item.run_id !== null && item.run_id !== params.runId) ||
         item.native_session_id !== (params.nativeSessionId ?? null) ||
@@ -240,7 +240,7 @@ export function createWorkStore(db: Database.Database): WorkStore {
       db.prepare(`
         INSERT INTO work_deliveries (
           id, work_item_id, attempt_ordinal, idempotency_key,
-          linear_issue_id, linear_session_id, pipeline_instance_id, run_id,
+          ticket_id, session_id, pipeline_instance_id, run_id,
           native_session_id, generation, context_revision, request_hash,
           status, lease_until, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'leased', ?, ?)
@@ -422,8 +422,8 @@ export function createWorkStore(db: Database.Database): WorkStore {
       const consumed: string[] = [];
       for (const delivery of deliveries) {
         this.consume(delivery.id, {
-          issueId: delivery.linear_issue_id,
-          sessionId: delivery.linear_session_id,
+          issueId: delivery.ticket_id,
+          sessionId: delivery.session_id,
           pipelineInstanceId: delivery.pipeline_instance_id,
           runId: delivery.run_id,
           nativeSessionId: delivery.native_session_id,

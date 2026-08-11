@@ -113,7 +113,7 @@ export async function reapStalledRuns(params: {
       }
       try {
         const message = `OpenThrottle ${run.task_type} run reaped — no executor progress for over ${cfg.stallTimeoutSeconds}s. The stage executor likely crashed, never started, or exited without reporting a result; check the stage attempt logs.`;
-        const ticket = store.getByIssueId(run.linear_issue_id);
+        const ticket = store.getByIssueId(run.ticket_id);
         if (!ticket) continue;
         const pipelineAttempt = params.pipelines?.getAttemptForRun(run.id);
         const pipeline = pipelineAttempt
@@ -141,7 +141,7 @@ export async function reapStalledRuns(params: {
         if (settlement.kind === "quarantined") {
           recordReapJournalEntry({
             pipelines: params.pipelines,
-            issueId: run.linear_issue_id,
+            issueId: run.ticket_id,
             runId: run.id,
             pipeline,
             attempt: pipelineAttempt,
@@ -155,14 +155,14 @@ export async function reapStalledRuns(params: {
             params.pipelines.setRuntimeResourceStatus(pipeline.id, "quarantined");
           }
           await activityPublisher.publishError(
-            run.linear_session_id ?? ticket.linear_session_id,
-            ticket.linear_issue_id,
+            run.session_id ?? ticket.session_id,
+            ticket.ticket_id,
             settlement.message
           );
         } else if (settlement.kind === "settled" && !pipelineStillHealthy) {
           recordReapJournalEntry({
             pipelines: params.pipelines,
-            issueId: run.linear_issue_id,
+            issueId: run.ticket_id,
             runId: run.id,
             pipeline,
             attempt: pipelineAttempt,
@@ -173,8 +173,8 @@ export async function reapStalledRuns(params: {
             stallTimeoutSeconds: cfg.stallTimeoutSeconds,
           });
           await activityPublisher.publishError(
-            run.linear_session_id ?? ticket.linear_session_id,
-            ticket.linear_issue_id,
+            run.session_id ?? ticket.session_id,
+            ticket.ticket_id,
             message
           );
         }
@@ -195,7 +195,7 @@ export async function reapExpiredRuns(params: {
 }): Promise<void> {
   const owner = `expiry-reaper-${randomUUID()}`;
   for (const run of params.store.listExpiredRuns(new Date().toISOString())) {
-    const ticket = params.store.getByIssueId(run.linear_issue_id);
+    const ticket = params.store.getByIssueId(run.ticket_id);
     if (!ticket) continue;
     const attempt = params.pipelines.getAttemptForRun(run.id);
     if (!attempt) continue;
@@ -228,7 +228,7 @@ export async function reapExpiredRuns(params: {
       if (settlement.kind === "quarantined") {
         recordReapJournalEntry({
           pipelines: params.pipelines,
-          issueId: run.linear_issue_id,
+          issueId: run.ticket_id,
           runId: run.id,
           pipeline,
           attempt,
@@ -241,14 +241,14 @@ export async function reapExpiredRuns(params: {
           params.pipelines.setRuntimeResourceStatus(pipeline.id, "quarantined");
         }
         await params.activityPublisher.publishError(
-          run.linear_session_id ?? ticket.linear_session_id,
-          ticket.linear_issue_id,
+          run.session_id ?? ticket.session_id,
+          ticket.ticket_id,
           settlement.message
         );
       } else if (settlement.kind === "settled" && !pipelineStillHealthy) {
         recordReapJournalEntry({
           pipelines: params.pipelines,
-          issueId: run.linear_issue_id,
+          issueId: run.ticket_id,
           runId: run.id,
           pipeline,
           attempt,
@@ -258,8 +258,8 @@ export async function reapExpiredRuns(params: {
           outcome: "timed_out",
         });
         await params.activityPublisher.publishError(
-          run.linear_session_id ?? ticket.linear_session_id,
-          ticket.linear_issue_id,
+          run.session_id ?? ticket.session_id,
+          ticket.ticket_id,
           message
         );
       }

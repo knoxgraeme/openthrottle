@@ -93,7 +93,7 @@ export function createTransitionStore(db: Database.Database, now: () => string):
     if (!note.trim()) return;
     journal.recordJournalEntry({
       id: deterministicId("journal", [attempt.id, stageResult.hash, "run_note"]),
-      issueId: instance.linear_issue_id,
+      issueId: instance.ticket_id,
       instanceId: instance.id,
       runId: attempt.run_id,
       actor: "stage_agent",
@@ -334,8 +334,8 @@ export function createTransitionStore(db: Database.Database, now: () => string):
     }
     for (const effect of write.effects) {
       const payloadHash = digestNormalized(effect.payload);
-      const publicationKind = effect.kind === "publish_linear"
-        ? "linear_ledger" as const
+      const publicationKind = effect.kind === "publish_control"
+        ? "control_ledger" as const
         : effect.kind === "publish_github"
           ? "github_summary" as const
           : undefined;
@@ -348,13 +348,13 @@ export function createTransitionStore(db: Database.Database, now: () => string):
           payload: effect.payload,
           timestamp,
         });
-        if (publicationKind === "linear_ledger" && effect.payload.includes("\"structured_execution\"")) {
+        if (publicationKind === "control_ledger" && effect.payload.includes("\"structured_execution\"")) {
           try {
             const envelope = parsePipelinePublication(effect.payload);
             if (envelope.structured_execution) {
               journal.recordJournalEntry({
                 id: deterministicId("journal", [instance.id, attempt.id, write.resultHash, "structured-ledger"]),
-                issueId: instance.linear_issue_id,
+                issueId: instance.ticket_id,
                 instanceId: instance.id,
                 runId: attempt.run_id,
                 actor: "supervisor",
@@ -398,7 +398,7 @@ export function createTransitionStore(db: Database.Database, now: () => string):
     if (write.nextStageId?.startsWith("repair_")) {
       journal.recordJournalEntry({
         id: deterministicId("journal", [instance.id, attempt.id, write.nextStageId, "relayed_finding"]),
-        issueId: instance.linear_issue_id,
+        issueId: instance.ticket_id,
         instanceId: instance.id,
         runId: attempt.run_id,
         actor: "supervisor",
@@ -419,7 +419,7 @@ export function createTransitionStore(db: Database.Database, now: () => string):
     if (isPublishStage(JSON.parse(instance.normalized_manifest) as PipelineManifest, attempt.stage_id) && write.outcome === "success") {
       journal.recordJournalEntry({
         id: deterministicId("journal", [instance.id, attempt.id, "published"]),
-        issueId: instance.linear_issue_id,
+        issueId: instance.ticket_id,
         instanceId: instance.id,
         runId: attempt.run_id,
         actor: "supervisor",
@@ -439,7 +439,7 @@ export function createTransitionStore(db: Database.Database, now: () => string):
     if (write.terminalOutcome) {
       journal.recordJournalEntry({
         id: deterministicId("journal", [instance.id, attempt.id, write.terminalOutcome, "terminal_observed"]),
-        issueId: instance.linear_issue_id,
+        issueId: instance.ticket_id,
         instanceId: instance.id,
         runId: attempt.run_id,
         actor: "supervisor",

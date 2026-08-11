@@ -72,9 +72,9 @@ export function setupPipelineStore(dbPath = ":memory:", selectedCatalogPath = ca
 
 export function ticket(sessionId: string, issueId = `issue-${sessionId}`) {
   return {
-    linear_issue_id: issueId,
-    linear_issue_identifier: issueId.toUpperCase(),
-    linear_session_id: sessionId,
+    ticket_id: issueId,
+    ticket_reference: issueId.toUpperCase(),
+    session_id: sessionId,
     sandbox_id: null,
     branch: `ot/${issueId}`,
     agent: "codex" as const,

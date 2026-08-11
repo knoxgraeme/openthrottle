@@ -137,9 +137,9 @@ describe("coordinator-only server", () => {
 
   function seedTicket(): void {
     store.upsertUnpinned({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -166,9 +166,9 @@ describe("coordinator-only server", () => {
     });
     const manifest = catalog.manifests.get("fixture/command@1")!;
     store.upsert({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -210,9 +210,9 @@ describe("coordinator-only server", () => {
       config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }, { id: structured, kind: builtin, ref: core/structured@2 }]\npipelines: { implement: structured }\n"),
     });
     store.upsert({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -270,8 +270,17 @@ describe("coordinator-only server", () => {
     };
     expect(body).not.toHaveProperty("execution_summary");
     expect(body.tickets[0]).not.toHaveProperty("execution_mode");
+    expect(body.tickets[0]).not.toHaveProperty("ticket_reference");
     expect(body.tickets[0]).toMatchObject({
-      linear_issue_identifier: "OT-1",
+      id: "issue-1",
+      reference: "OT-1",
+      current_session_id: "session-1",
+      control_provider: "linear",
+      external_thread: {
+        provider: "linear",
+        id: "issue-1",
+        reference: "OT-1",
+      },
       pipeline: null,
     });
   });
@@ -313,13 +322,13 @@ describe("coordinator-only server", () => {
     const instance = pipelines.getInstanceForSession("session-1")!;
     db.prepare(`
       INSERT INTO run_outcomes (
-        pipeline_instance_id, linear_issue_id, generation, execution_graph_id, plan_digest,
+        pipeline_instance_id, ticket_id, generation, execution_graph_id, plan_digest,
         base_commit, engine, outcome, closed_reason, fault_attribution, generations_consumed,
         repair_rounds_by_unit, phase_durations_ms, token_cost_usd, skill_digests, created_at
       ) VALUES (?, ?, 1, NULL, NULL, ?, 'codex', 'shipped', 'success', NULL, 1, '{}', '{}', NULL, ?, ?)
     `).run(
       instance.id,
-      instance.linear_issue_id,
+      instance.ticket_id,
       instance.base_commit,
       JSON.stringify([{ skill: "builtin://ce/implement@1", skill_package_digest: null }]),
       "2026-08-08T00:00:00.000Z"
@@ -364,13 +373,13 @@ describe("coordinator-only server", () => {
     const instance = pipelines.getInstanceForSession("session-1")!;
     db.prepare(`
       INSERT INTO run_outcomes (
-        pipeline_instance_id, linear_issue_id, generation, execution_graph_id, plan_digest,
+        pipeline_instance_id, ticket_id, generation, execution_graph_id, plan_digest,
         base_commit, engine, outcome, closed_reason, fault_attribution, generations_consumed,
         repair_rounds_by_unit, phase_durations_ms, token_cost_usd, skill_digests, created_at
       ) VALUES (?, ?, 1, 'structured', NULL, ?, 'codex', 'failed', 'failure', 'agent', 1, '{}', '{}', NULL, ?, ?)
     `).run(
       instance.id,
-      instance.linear_issue_id,
+      instance.ticket_id,
       instance.base_commit,
       JSON.stringify([{ skill: "builtin://ce/implement@1", skill_package_digest: null }]),
       "2026-08-08T00:00:00.000Z"
@@ -592,7 +601,7 @@ describe("coordinator-only server", () => {
       expiresAt: "2099-01-01T00:00:00.000Z",
     })).toBe(false);
     db.prepare(`
-      INSERT INTO runs (id, linear_issue_id, task_type, token_hash, status, started_at, expires_at)
+      INSERT INTO runs (id, ticket_id, task_type, token_hash, status, started_at, expires_at)
       VALUES ('run-old-generation', 'issue-1', 'implement', 'token-hash', 'timed_out', '2026-07-25T00:00:00.000Z', '2026-07-25T02:00:00.000Z')
     `).run();
     store.insertSandboxEvent({
@@ -689,13 +698,13 @@ describe("coordinator-only server", () => {
     `).run(instance.id);
     db.prepare(`
       INSERT INTO runs (
-        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        id, ticket_id, session_id, session_generation, task_type,
         token_hash, status, started_at, expires_at
       ) VALUES (
         'run-latest', ?, 'session-1', 1, 'implement', 'request-hash',
         'completed', '2026-07-26T00:12:00.000Z', '2026-07-26T01:12:00.000Z'
       )
-    `).run(instance.linear_issue_id);
+    `).run(instance.ticket_id);
     db.prepare(`
       INSERT INTO pipeline_stage_attempts (
         id, pipeline_instance_id, stage_id, attempt_ordinal, reentry_ordinal,
@@ -883,7 +892,7 @@ describe("coordinator-only server", () => {
     db.prepare(`
       UPDATE tickets
       SET pr_url = NULL
-      WHERE linear_issue_id = 'issue-1'
+      WHERE ticket_id = 'issue-1'
     `).run();
     db.prepare(`
       INSERT INTO pipeline_publication_receipts (
@@ -1217,7 +1226,7 @@ describe("coordinator-only server", () => {
         },
       },
     });
-    const signature = createHmac("sha256", cfg.linearWebhookSecret).update(payload).digest("hex");
+    const signature = createHmac("sha256", cfg.linearWebhookSecret!).update(payload).digest("hex");
     const request = () => server.request("/webhooks/linear", {
       method: "POST",
       headers: {
@@ -1246,7 +1255,7 @@ describe("coordinator-only server", () => {
       webhookId: "linear-webhook-stale",
       webhookTimestamp: 0,
     });
-    const staleSignature = createHmac("sha256", cfg.linearWebhookSecret)
+    const staleSignature = createHmac("sha256", cfg.linearWebhookSecret!)
       .update(stalePayload).digest("hex");
     const stale = await server.request("/webhooks/linear", {
       method: "POST",
@@ -1255,6 +1264,26 @@ describe("coordinator-only server", () => {
     });
     expect(stale.status).toBe(401);
     expect(db.prepare("SELECT COUNT(*) FROM webhook_deliveries").pluck().get()).toBe(1);
+  });
+
+  it("fails Linear webhooks precisely when the Linear adapter is unavailable", async () => {
+    const server = app({
+      cfg: {
+        ...cfg,
+        linearWebhookSecret: undefined,
+        linearClientId: undefined,
+        linearClientSecret: undefined,
+      },
+    });
+
+    const response = await server.request("/webhooks/linear", {
+      method: "POST",
+      headers: { "Linear-Signature": "0".repeat(64) },
+      body: "{}",
+    });
+
+    expect(response.status).toBe(503);
+    expect(await response.text()).toContain("LINEAR_WEBHOOK_SECRET");
   });
 
   it("fails Linear deliveries before admission when OAuth is unavailable", async () => {

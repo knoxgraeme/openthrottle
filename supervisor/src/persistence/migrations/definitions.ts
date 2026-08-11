@@ -36,6 +36,27 @@ function hasIndex(db: Database.Database, name: string): boolean {
   );
 }
 
+function renameColumnIfPresent(
+  db: Database.Database,
+  table: string,
+  from: string,
+  to: string
+): void {
+  if (hasColumns(db, table, [from]) && !hasColumns(db, table, [to])) {
+    db.exec(`ALTER TABLE ${table} RENAME COLUMN ${from} TO ${to}`);
+  }
+}
+
+function renameTableIfPresent(
+  db: Database.Database,
+  from: string,
+  to: string
+): void {
+  if (hasTable(db, from) && !hasTable(db, to)) {
+    db.exec(`ALTER TABLE ${from} RENAME TO ${to}`);
+  }
+}
+
 function backfillPipelinePublicationState(db: Database.Database): void {
   if (!hasTable(db, "pipeline_publication_receipts")) return;
   const timestamp = new Date().toISOString();
@@ -745,7 +766,7 @@ function backfillSelectionPublications(db: Database.Database): void {
   if (
     !hasTable(db, "pipeline_instances") ||
     !hasTable(db, "pipeline_publication_receipts") ||
-    !hasTable(db, "linear_outbox")
+    !hasTable(db, "control_outbox")
   ) return;
   const timestamp = new Date().toISOString();
   const instances = db.prepare(`
@@ -756,7 +777,7 @@ function backfillSelectionPublications(db: Database.Database): void {
     )
       AND NOT EXISTS (
         SELECT 1 FROM pipeline_publication_receipts ppr
-        WHERE ppr.pipeline_instance_id = pi.id AND ppr.kind = 'linear_ledger'
+        WHERE ppr.pipeline_instance_id = pi.id AND ppr.kind = 'control_ledger'
       )
   `).all() as PipelineInstance[];
   for (const instance of instances) {
@@ -1899,6 +1920,246 @@ CREATE TABLE execution_review_subaction_dispatches (
 const reviewSubactionDispatchMigrationSource = `${reviewSubactionDispatchSchema}
 structured-review-dispatch-contract:selector fanout and validator subactions persist exact request dispatch intent plus acknowledged or conservative-fallback launch timing under their parent final-review action so crash replay remains heartbeat-mapped without rematerializing credentials or repeating launched provider work/v4`;
 
+const controlProviderRegistrationSchema = `
+CREATE TABLE repository_registrations_control_v33 (
+  github_repo TEXT PRIMARY KEY COLLATE NOCASE,
+  control_provider TEXT NOT NULL CHECK(control_provider IN ('linear', 'github')),
+  linear_team_key TEXT COLLATE NOCASE,
+  linear_team_id TEXT,
+  base_branch TEXT NOT NULL,
+  webhook_id INTEGER NOT NULL,
+  snapshot TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK(control_provider <> 'linear' OR linear_team_key IS NOT NULL)
+);
+INSERT INTO repository_registrations_control_v33 (
+  github_repo, control_provider, linear_team_key, linear_team_id,
+  base_branch, webhook_id, snapshot, created_at, updated_at
+)
+SELECT
+  github_repo, 'linear', linear_team_key, linear_team_id,
+  base_branch, webhook_id, snapshot, created_at, updated_at
+FROM repository_registrations;
+DROP TABLE repository_registrations;
+ALTER TABLE repository_registrations_control_v33 RENAME TO repository_registrations;
+CREATE UNIQUE INDEX repository_registrations_linear_team_key_idx
+  ON repository_registrations(linear_team_key)
+  WHERE control_provider = 'linear' AND linear_team_key IS NOT NULL;
+CREATE UNIQUE INDEX repository_registrations_linear_team_id_idx
+  ON repository_registrations(linear_team_id)
+  WHERE control_provider = 'linear' AND linear_team_id IS NOT NULL;
+`;
+
+const controlProviderRegistrationMigrationSource = `${controlProviderRegistrationSchema}
+registration authority is keyed by canonical github_repo with immutable control_provider/v1
+backfill-provider:existing route rows are linear/v1`;
+
+const controlPublicationVocabularySchema = `
+PRAGMA foreign_keys = OFF;
+CREATE TABLE pipeline_publication_receipts_control_v34 (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  attempt_id TEXT,
+  kind TEXT NOT NULL CHECK(kind IN ('control_ledger', 'github_summary', 'pull_request')),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  payload TEXT,
+  payload_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'acknowledged', 'failed', 'dead')),
+  external_id TEXT,
+  external_url TEXT,
+  target_url TEXT,
+  attachment_url TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+  next_attempt_at TEXT,
+  resume_status TEXT,
+  blocked_from_status TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT,
+  acknowledged_at TEXT,
+  last_error TEXT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(attempt_id, pipeline_instance_id)
+    REFERENCES pipeline_stage_attempts(id, pipeline_instance_id) ON DELETE RESTRICT
+);
+INSERT INTO pipeline_publication_receipts_control_v34 (
+  id, pipeline_instance_id, attempt_id, kind, idempotency_key,
+  payload, payload_hash, status, external_id, external_url, target_url,
+  attachment_url, attempts, next_attempt_at, resume_status, blocked_from_status,
+  created_at, updated_at, acknowledged_at, last_error
+)
+SELECT
+  id, pipeline_instance_id, attempt_id,
+  CASE kind WHEN 'linear_ledger' THEN 'control_ledger' ELSE kind END,
+  idempotency_key, payload, payload_hash, status, external_id, external_url, target_url,
+  attachment_url, attempts, next_attempt_at, resume_status, blocked_from_status,
+  created_at, updated_at, acknowledged_at, last_error
+FROM pipeline_publication_receipts;
+DROP TABLE pipeline_publication_receipts;
+ALTER TABLE pipeline_publication_receipts_control_v34 RENAME TO pipeline_publication_receipts;
+
+CREATE TABLE pipeline_effect_intents_control_v34 (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  transition_version INTEGER NOT NULL CHECK(transition_version >= 1),
+  kind TEXT NOT NULL CHECK(kind IN (
+    'provision', 'bootstrap', 'dispatch_stage', 'idle', 'stop', 'quarantine', 'cleanup',
+    'publish_control', 'publish_github', 'publish_pr'
+  )),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  payload TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'acknowledged', 'failed', 'dead')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+  next_attempt_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  acknowledged_at TEXT,
+  last_error TEXT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  UNIQUE(pipeline_instance_id, transition_version, kind, idempotency_key)
+);
+INSERT INTO pipeline_effect_intents_control_v34 (
+  id, pipeline_instance_id, transition_version, kind, idempotency_key,
+  payload, payload_hash, status, attempts, next_attempt_at, created_at,
+  acknowledged_at, last_error
+)
+SELECT
+  id, pipeline_instance_id, transition_version,
+  CASE kind WHEN 'publish_linear' THEN 'publish_control' ELSE kind END,
+  idempotency_key, payload, payload_hash, status, attempts, next_attempt_at,
+  created_at, acknowledged_at, last_error
+FROM pipeline_effect_intents;
+DROP TABLE pipeline_effect_intents;
+ALTER TABLE pipeline_effect_intents_control_v34 RENAME TO pipeline_effect_intents;
+PRAGMA foreign_keys = ON;
+`;
+
+const controlPublicationVocabularyMigrationSource = `${controlPublicationVocabularySchema}
+control-publication-contract:pipeline control publication effects and receipts use provider-neutral vocabulary while GitHub summary remains evidence publication/v1
+backfill-contract:legacy publish_linear effects and linear_ledger receipts are renamed in place without changing idempotency or payload fences/v1`;
+
+const neutralControlIdentifierMigrationSource = `
+rename live control-plane ticket/session/context identifiers from Linear-shaped storage names to provider-neutral storage names
+tables: tickets,runs,agent_sessions,control_outbox,session_inbox,pipeline_instances,work_items,work_deliveries,provider_events,feedback_snapshots,session_executions,run_outcomes,execution_publication_events
+backfill-contract:existing rows are retained in place, provider identity remains linear, external thread ids retain the old Linear issue id, internal ticket ids become linear-prefixed, and foreign keys must remain valid/v2`;
+
+function migrateNeutralControlIdentifiers(db: Database.Database): void {
+  db.exec("PRAGMA foreign_keys = OFF");
+  db.exec("PRAGMA defer_foreign_keys = ON");
+  renameTableIfPresent(db, "linear_outbox", "control_outbox");
+
+  renameColumnIfPresent(db, "tickets", "linear_issue_id", "ticket_id");
+  renameColumnIfPresent(db, "tickets", "linear_issue_identifier", "ticket_reference");
+  renameColumnIfPresent(db, "tickets", "linear_session_id", "session_id");
+  renameColumnIfPresent(db, "tickets", "linear_context", "context");
+
+  renameColumnIfPresent(db, "runs", "linear_issue_id", "ticket_id");
+  renameColumnIfPresent(db, "runs", "linear_session_id", "session_id");
+
+  renameColumnIfPresent(db, "agent_sessions", "linear_issue_id", "ticket_id");
+
+  renameColumnIfPresent(db, "control_outbox", "linear_issue_id", "ticket_id");
+  renameColumnIfPresent(db, "control_outbox", "linear_session_id", "session_id");
+
+  renameColumnIfPresent(db, "session_inbox", "linear_issue_id", "ticket_id");
+  renameColumnIfPresent(db, "session_inbox", "linear_session_id", "session_id");
+
+  renameColumnIfPresent(db, "pipeline_instances", "linear_issue_id", "ticket_id");
+  renameColumnIfPresent(db, "pipeline_instances", "linear_session_id", "session_id");
+
+  renameColumnIfPresent(db, "work_items", "linear_issue_id", "ticket_id");
+  renameColumnIfPresent(db, "work_items", "linear_session_id", "session_id");
+
+  renameColumnIfPresent(db, "work_deliveries", "linear_issue_id", "ticket_id");
+  renameColumnIfPresent(db, "work_deliveries", "linear_session_id", "session_id");
+
+  renameColumnIfPresent(db, "provider_events", "linear_issue_id", "ticket_id");
+  renameColumnIfPresent(db, "provider_events", "linear_session_id", "session_id");
+
+  renameColumnIfPresent(db, "feedback_snapshots", "linear_issue_id", "ticket_id");
+  renameColumnIfPresent(db, "feedback_snapshots", "linear_session_id", "session_id");
+
+  renameColumnIfPresent(db, "session_executions", "linear_issue_id", "ticket_id");
+  renameColumnIfPresent(db, "session_executions", "linear_session_id", "session_id");
+
+  renameColumnIfPresent(db, "run_outcomes", "linear_issue_id", "ticket_id");
+
+  renameColumnIfPresent(db, "execution_publication_events", "linear_outbox_id", "control_outbox_id");
+
+  if (hasTable(db, "tickets")) {
+    for (const [column, sql] of [
+      ["control_provider", "ALTER TABLE tickets ADD COLUMN control_provider TEXT NOT NULL DEFAULT 'linear' CHECK(control_provider IN ('linear', 'github'))"],
+      ["external_thread_id", "ALTER TABLE tickets ADD COLUMN external_thread_id TEXT"],
+      ["external_thread_reference", "ALTER TABLE tickets ADD COLUMN external_thread_reference TEXT"],
+    ] as const) {
+      if (!hasColumns(db, "tickets", [column])) db.exec(sql);
+    }
+    db.exec(`
+      UPDATE tickets
+      SET control_provider = COALESCE(control_provider, 'linear'),
+          external_thread_id = COALESCE(NULLIF(external_thread_id, ''), ticket_id),
+          external_thread_reference = COALESCE(NULLIF(external_thread_reference, ''), ticket_reference)
+    `);
+    for (const table of [
+      "runs",
+      "agent_sessions",
+      "control_outbox",
+      "session_inbox",
+      "pipeline_instances",
+      "work_items",
+      "work_deliveries",
+      "provider_events",
+      "feedback_snapshots",
+      "session_executions",
+      "run_outcomes",
+    ]) {
+      if (!hasColumns(db, table, ["ticket_id"])) continue;
+      db.exec(`
+        UPDATE ${table}
+        SET ticket_id = 'linear:' || ticket_id
+        WHERE ticket_id IN (
+          SELECT ticket_id FROM tickets
+          WHERE control_provider = 'linear' AND ticket_id NOT LIKE 'linear:%'
+        )
+      `);
+    }
+    if (hasTable(db, "settings")) {
+      db.exec(`
+        UPDATE settings
+        SET key = 'github-head:linear:' || substr(key, length('github-head:') + 1)
+        WHERE key LIKE 'github-head:%'
+          AND substr(key, length('github-head:') + 1) NOT LIKE 'linear:%'
+      `);
+    }
+    db.exec(`
+      UPDATE tickets
+      SET ticket_id = 'linear:' || ticket_id
+      WHERE control_provider = 'linear' AND ticket_id NOT LIKE 'linear:%'
+    `);
+  }
+
+  db.exec(`
+    DROP INDEX IF EXISTS linear_outbox_process_idx;
+    DROP INDEX IF EXISTS linear_outbox_session_order_idx;
+    DROP INDEX IF EXISTS run_outcomes_issue_idx;
+  `);
+  if (hasTable(db, "control_outbox")) {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS control_outbox_process_idx
+        ON control_outbox(status, next_attempt_at);
+      CREATE INDEX IF NOT EXISTS control_outbox_session_order_idx
+        ON control_outbox(session_id, sequence);
+    `);
+  }
+  if (hasTable(db, "run_outcomes")) {
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS run_outcomes_ticket_idx
+        ON run_outcomes(ticket_id, created_at DESC);
+    `);
+  }
+  db.exec("PRAGMA foreign_keys = ON");
+}
+
 function addExecutionGraphStopFence(db: Database.Database): void {
   if (!hasColumns(db, "execution_graphs", ["stopped_at"])) {
     db.exec("ALTER TABLE execution_graphs ADD COLUMN stopped_at TEXT");
@@ -1970,19 +2231,22 @@ function contractSatelliteTables(db: Database.Database): void {
         ON agent_sessions(pipeline_instance_id) WHERE pipeline_instance_id IS NOT NULL
     `);
     if (hasTable(db, "session_executions")) {
+      const sessionExecutionSessionColumn = hasColumns(db, "session_executions", ["linear_session_id"])
+        ? "linear_session_id"
+        : "session_id";
       db.exec(`
         UPDATE agent_sessions
         SET execution_mode = (
               SELECT execution_mode FROM session_executions
-              WHERE session_executions.linear_session_id = agent_sessions.id
+              WHERE session_executions.${sessionExecutionSessionColumn} = agent_sessions.id
             ),
             pipeline_instance_id = (
               SELECT pipeline_instance_id FROM session_executions
-              WHERE session_executions.linear_session_id = agent_sessions.id
+              WHERE session_executions.${sessionExecutionSessionColumn} = agent_sessions.id
             )
         WHERE EXISTS (
           SELECT 1 FROM session_executions
-          WHERE session_executions.linear_session_id = agent_sessions.id
+          WHERE session_executions.${sessionExecutionSessionColumn} = agent_sessions.id
         )
       `);
     }
@@ -2514,6 +2778,34 @@ const definitions: DatabaseMigrationDefinition[] = [
       if (hasTable(db, "execution_work_attempts") && !hasTable(db, "execution_review_subaction_dispatches")) {
         db.exec(reviewSubactionDispatchSchema);
       }
+    },
+  },
+  {
+    version: 33,
+    name: "control-provider-repository-registration",
+    source: controlProviderRegistrationMigrationSource,
+    up(db) {
+      if (hasTable(db, "repository_registrations") && !hasColumns(db, "repository_registrations", ["control_provider"])) {
+        db.exec(controlProviderRegistrationSchema);
+      }
+    },
+  },
+  {
+    version: 34,
+    name: "control-publication-vocabulary",
+    source: controlPublicationVocabularyMigrationSource,
+    up(db) {
+      if (hasTable(db, "pipeline_publication_receipts") && hasTable(db, "pipeline_effect_intents")) {
+        db.exec(controlPublicationVocabularySchema);
+      }
+    },
+  },
+  {
+    version: 35,
+    name: "neutral-control-identifiers",
+    source: neutralControlIdentifierMigrationSource,
+    up(db) {
+      migrateNeutralControlIdentifiers(db);
     },
   },
 ];

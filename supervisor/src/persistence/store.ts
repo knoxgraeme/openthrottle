@@ -23,9 +23,12 @@ export type TerminalRunStatus = "completed" | "failed" | "timed_out" | "stopped"
 export type RunStatus = "running" | "reaping" | "quarantined" | TerminalRunStatus;
 
 export interface Ticket {
-  linear_issue_id: string;
-  linear_issue_identifier: string;
-  linear_session_id: string;
+  ticket_id: string;
+  ticket_reference: string;
+  session_id: string;
+  control_provider: "linear" | "github";
+  external_thread_id: string;
+  external_thread_reference: string;
   sandbox_id: string | null;
   branch: string;
   agent: Agent;
@@ -36,7 +39,7 @@ export interface Ticket {
   run_id: string | null;
   total_cost_usd: number;
   last_error: string | null;
-  linear_context: string | null;
+  context: string | null;
   base_branch: string;
   created_at: string;
   updated_at: string;
@@ -44,8 +47,8 @@ export interface Ticket {
 
 export interface Run {
   id: string;
-  linear_issue_id: string;
-  linear_session_id: string | null;
+  ticket_id: string;
+  session_id: string | null;
   session_generation: number | null;
   task_type: TaskType;
   token_hash: string;
@@ -71,7 +74,7 @@ export interface Run {
 
 export interface AgentSession {
   id: string;
-  linear_issue_id: string;
+  ticket_id: string;
   generation: number;
   state: "current" | "stopping" | "stopped" | "superseded";
   provider_conversation_id: string | null;
@@ -82,9 +85,9 @@ export interface AgentSession {
 
 export type TicketUpsert = Pick<
   Ticket,
-  | "linear_issue_id"
-  | "linear_issue_identifier"
-  | "linear_session_id"
+  | "ticket_id"
+  | "ticket_reference"
+  | "session_id"
   | "sandbox_id"
   | "branch"
   | "agent"
@@ -92,12 +95,16 @@ export type TicketUpsert = Pick<
   | "pr_url"
   | "state"
 > & {
+  control_provider?: Ticket["control_provider"];
+  external_thread_id?: string;
+  external_thread_reference?: string;
   base_branch?: string;
   pipeline?: Omit<PipelineInstanceSeed, "issueId" | "sessionId" | "generation" | "branch" | "agent">;
 };
 
 export interface RepositoryRegistration {
-  linear_team_key: string;
+  control_provider: "linear" | "github";
+  linear_team_key: string | null;
   linear_team_id: string | null;
   github_repo: string;
   base_branch: string;
@@ -108,7 +115,8 @@ export interface RepositoryRegistration {
 }
 
 export interface RepositoryRegistrationInput {
-  linearTeamKey: string;
+  controlProvider?: "linear" | "github";
+  linearTeamKey?: string;
   linearTeamId?: string;
   githubRepo: string;
   baseBranch: string;
@@ -145,7 +153,7 @@ export interface FeedbackCapability {
     eventInserted: boolean;
     snapshotCreated: boolean;
   };
-  listPendingFeedbackSnapshots(linearSessionId: string, limit?: number): FeedbackSnapshot[];
+  listPendingFeedbackSnapshots(sessionId: string, limit?: number): FeedbackSnapshot[];
   claimFeedbackSnapshot(snapshotId: string, maxRounds: number):
     | { status: "claimed"; snapshot: FeedbackSnapshot; events: FeedbackSnapshotEvent[] }
     | { status: "exhausted"; completedRounds: number }
@@ -207,8 +215,8 @@ export function createSupervisorStore(
     if (update.changes !== 1) return false;
     deliveryStore.enqueueLinearOutbox({
       id: params.noticeId,
-      linearSessionId: snapshot.linear_session_id,
-      issueId: snapshot.linear_issue_id,
+      sessionId: snapshot.session_id,
+      issueId: snapshot.ticket_id,
       kind: "activity",
       payload: params.payload,
     });
@@ -218,12 +226,12 @@ export function createSupervisorStore(
     recordProviderFeedback(params) {
       return feedbackStore.record(params);
     },
-    listPendingFeedbackSnapshots(linearSessionId, limit = 50) {
+    listPendingFeedbackSnapshots(sessionId, limit = 50) {
       return db.prepare(`
         SELECT * FROM feedback_snapshots
-        WHERE linear_session_id = ? AND status IN ('collecting', 'claimed')
+        WHERE session_id = ? AND status IN ('collecting', 'claimed')
         ORDER BY created_at, id LIMIT ?
-      `).all(linearSessionId, limit) as FeedbackSnapshot[];
+      `).all(sessionId, limit) as FeedbackSnapshot[];
     },
     claimFeedbackSnapshot(snapshotId, maxRounds) {
       return feedbackStore.claimWithEvents(snapshotId, maxRounds);

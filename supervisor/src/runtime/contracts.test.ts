@@ -137,9 +137,9 @@ describe("sandbox runtime port", () => {
     db = openDb(":memory:");
     const store = createSupervisorStore(db);
     store.upsert({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "ISSUE-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "ISSUE-1",
+      session_id: "session-1",
       sandbox_id: "opaque-resource",
       branch: "ot/issue-1",
       agent: "codex",

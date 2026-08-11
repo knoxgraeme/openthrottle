@@ -110,7 +110,7 @@ export async function deliverPendingInbox(params: {
       if (params.canReceiveSteering && !params.canReceiveSteering(ticket)) {
         continue;
       }
-      const pending = params.store.listPendingInbox(ticket.linear_issue_id);
+      const pending = params.store.listPendingInbox(ticket.ticket_id);
       if (pending.length === 0) continue;
       // Best-effort dir creation; the entrypoint also mkdir's this on startup,
       // so an "already exists" here must not block delivery.
@@ -135,8 +135,8 @@ export async function deliverPendingInbox(params: {
             version: 1,
             delivery_id: message.delivery_id,
             request_hash: message.request_hash,
-            issue_id: message.linear_issue_id,
-            session_id: message.linear_session_id,
+            issue_id: message.ticket_id,
+            session_id: message.session_id,
             run_id: message.run_id,
             native_session_id: message.native_session_id,
             generation: message.generation,
@@ -159,7 +159,7 @@ export async function deliverPendingInbox(params: {
       // Never throw: one unreachable sandbox must not stall delivery for the
       // rest. Undispatched rows stay pending and retry next sweep.
       console.error(
-        `[inbox] could not deliver steering to ${ticket.linear_issue_identifier}:`,
+        `[inbox] could not deliver steering to ${ticket.ticket_reference}:`,
         error
       );
     }

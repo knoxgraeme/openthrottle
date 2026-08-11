@@ -645,8 +645,8 @@ function typedArtifactBase(input: {
     },
     run: {
       id: runId,
-      ticket_id: input.instance.linear_issue_id,
-      session_id: input.instance.linear_session_id,
+      ticket_id: input.instance.ticket_id,
+      session_id: input.instance.session_id,
       generation: input.instance.generation,
       native_session_id: input.parentAttempt.native_session_id,
     },

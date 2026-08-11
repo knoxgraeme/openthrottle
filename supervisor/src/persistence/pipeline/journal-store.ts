@@ -73,10 +73,10 @@ function metadataForIssue(db: Database.Database, issueId: string): {
   issue: string;
 } {
   const ticket = db.prepare(`
-    SELECT linear_issue_identifier, repo FROM tickets WHERE linear_issue_id = ?
-  `).get(issueId) as { linear_issue_identifier: string; repo: string } | undefined;
+    SELECT ticket_reference, repo FROM tickets WHERE ticket_id = ?
+  `).get(issueId) as { ticket_reference: string; repo: string } | undefined;
   const repository = ticket?.repo ?? "unknown";
-  const teamKey = issueTeamKey(ticket?.linear_issue_identifier);
+  const teamKey = issueTeamKey(ticket?.ticket_reference);
   const matchingRegistration = teamKey
     ? db.prepare(`
       SELECT linear_team_key FROM repository_registrations
@@ -92,7 +92,7 @@ function metadataForIssue(db: Database.Database, issueId: string): {
   return {
     team: matchingRegistration?.linear_team_key ?? teamKey ?? fallbackRegistration?.linear_team_key ?? "unknown",
     repository,
-    issue: ticket?.linear_issue_identifier ?? issueId,
+    issue: ticket?.ticket_reference ?? issueId,
   };
 }
 

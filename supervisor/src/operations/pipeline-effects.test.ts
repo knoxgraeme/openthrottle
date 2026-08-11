@@ -42,7 +42,7 @@ describe("pipeline effect processor", () => {
   });
 
   const listLinearOutbox = (): LinearOutboxRecord[] =>
-    db!.prepare("SELECT * FROM linear_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
+    db!.prepare("SELECT * FROM control_outbox ORDER BY created_at, sequence").all() as LinearOutboxRecord[];
 
   function repositoryStructuredGraphWithPublishStage(
     publishStageId: string,
@@ -172,9 +172,9 @@ describe("pipeline effect processor", () => {
     });
     const manifest = catalog.manifests.get("fixture/command@2")!;
     tickets.upsert({
-      linear_issue_id: issueId,
-      linear_issue_identifier: issueId.toUpperCase(),
-      linear_session_id: sessionId,
+      ticket_id: issueId,
+      ticket_reference: issueId.toUpperCase(),
+      session_id: sessionId,
       sandbox_id: null,
       branch: `ot/${issueId}`,
       agent: "codex",
@@ -421,9 +421,9 @@ describe("pipeline effect processor", () => {
     });
     const manifest = catalog.manifests.get("fixture/command@2")!;
     tickets.upsert({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -641,9 +641,9 @@ describe("pipeline effect processor", () => {
       "```",
     ].join("\n");
     tickets.upsert({
-      linear_issue_id: "issue-structured",
-      linear_issue_identifier: "OT-STRUCTURED",
-      linear_session_id: "session-structured",
+      ticket_id: "issue-structured",
+      ticket_reference: "OT-STRUCTURED",
+      session_id: "session-structured",
       sandbox_id: null,
       branch: "ot/structured",
       agent: "codex",
@@ -852,9 +852,9 @@ describe("pipeline effect processor", () => {
       commands: [],
     };
     tickets.upsert({
-      linear_issue_id: "issue-repo-skill",
-      linear_issue_identifier: "OT-REPO-SKILL",
-      linear_session_id: "session-repo-skill",
+      ticket_id: "issue-repo-skill",
+      ticket_reference: "OT-REPO-SKILL",
+      session_id: "session-repo-skill",
       sandbox_id: null,
       branch: "ot/repo-skill",
       agent: "codex",
@@ -985,9 +985,9 @@ describe("pipeline effect processor", () => {
       "```",
     ].join("\n");
     tickets.upsert({
-      linear_issue_id: "issue-child-drain",
-      linear_issue_identifier: "OT-CHILD-DRAIN",
-      linear_session_id: "session-child-drain",
+      ticket_id: "issue-child-drain",
+      ticket_reference: "OT-CHILD-DRAIN",
+      session_id: "session-child-drain",
       sandbox_id: null,
       branch: "ot/child-drain",
       agent: "codex",
@@ -1505,7 +1505,7 @@ describe("pipeline effect processor", () => {
     expect(persistedReviewReceipt.payload.findings).not.toContainEqual(advisoryFinding);
     expect(selectorReceipt).not.toBeNull();
     expect(persistedReviewReceipt.evidence).toContain(digestNormalized(selectorReceipt!));
-    const reviewJournalEntry = pipelines.listJournalEntries({ issueId: instance.linear_issue_id })
+    const reviewJournalEntry = pipelines.listJournalEntries({ issueId: instance.ticket_id })
       .find((entry) => entry.trigger === "structured_review_fanout");
     expect(reviewJournalEntry).toBeDefined();
     const reviewJournal = validateReviewJournalContract(JSON.parse(reviewJournalEntry!.structured!), {
@@ -1654,7 +1654,7 @@ describe("pipeline effect processor", () => {
     );
     for (let index = 0; index < 1_001; index += 1) {
       pipelines.recordJournalEntry({
-        issueId: instance.linear_issue_id,
+        issueId: instance.ticket_id,
         instanceId: instance.id,
         runId: review.parent_run_id,
         actor: "supervisor",
@@ -1668,7 +1668,7 @@ describe("pipeline effect processor", () => {
       .run("2000-01-01T00:00:00.000Z", "review_history_noise");
     pipelines.recordJournalEntry({
       id: "00000000-0000-4000-8000-000000001138",
-      issueId: instance.linear_issue_id,
+      issueId: instance.ticket_id,
       instanceId: instance.id,
       runId: freshReview.parent_run_id,
       actor: "supervisor",
@@ -1693,7 +1693,7 @@ describe("pipeline effect processor", () => {
       status: "completed",
       output_subject: finalIntegratedSubject,
     });
-    const newestJournalWindow = pipelines.listJournalEntries({ issueId: instance.linear_issue_id, order: "newest", limit: 1_000 });
+    const newestJournalWindow = pipelines.listJournalEntries({ issueId: instance.ticket_id, order: "newest", limit: 1_000 });
     expect(newestJournalWindow.some((entry) => entry.id === reviewJournalEntry!.id)).toBe(true);
     expect(newestJournalWindow.some((entry) => entry.id === "00000000-0000-4000-8000-000000001138")).toBe(true);
     expect(newestJournalWindow[0]?.id).toBe("00000000-0000-4000-8000-000000001138");
@@ -1845,7 +1845,7 @@ describe("pipeline effect processor", () => {
       status: "running",
       expected_subject: finalIntegratedTreeSubject,
     });
-    expect(tickets.getByIssueId(instance.linear_issue_id)?.run_id).toBe(intermediateRequest.runId);
+    expect(tickets.getByIssueId(instance.ticket_id)?.run_id).toBe(intermediateRequest.runId);
 
     const intermediateStagePayload = JSON.stringify({ id: "intermediate-release-check", outcome: "semantic_repair_required" });
     const intermediateCommandPayload = JSON.stringify({ command: "test", exit_code: 1, summary: "command requested repair" });
@@ -1948,9 +1948,9 @@ describe("pipeline effect processor", () => {
       commands: [],
     };
     tickets.upsert({
-      linear_issue_id: "issue-retryable-loop",
-      linear_issue_identifier: "OT-RETRYABLE-LOOP",
-      linear_session_id: "session-retryable-loop",
+      ticket_id: "issue-retryable-loop",
+      ticket_reference: "OT-RETRYABLE-LOOP",
+      session_id: "session-retryable-loop",
       sandbox_id: null,
       branch: "ot/retryable-loop",
       agent: "codex",
@@ -2085,9 +2085,9 @@ describe("pipeline effect processor", () => {
       commands: [],
     };
     tickets.upsert({
-      linear_issue_id: "issue-active-drain-throw",
-      linear_issue_identifier: "OT-ACTIVE-DRAIN-THROW",
-      linear_session_id: "session-active-drain-throw",
+      ticket_id: "issue-active-drain-throw",
+      ticket_reference: "OT-ACTIVE-DRAIN-THROW",
+      session_id: "session-active-drain-throw",
       sandbox_id: null,
       branch: "ot/active-drain-throw",
       agent: "codex",
@@ -2197,9 +2197,9 @@ describe("pipeline effect processor", () => {
       commands: [],
     };
     tickets.upsert({
-      linear_issue_id: "issue-command-failure",
-      linear_issue_identifier: "OT-COMMAND-FAILURE",
-      linear_session_id: "session-command-failure",
+      ticket_id: "issue-command-failure",
+      ticket_reference: "OT-COMMAND-FAILURE",
+      session_id: "session-command-failure",
       sandbox_id: null,
       branch: "ot/command-failure",
       agent: "codex",
@@ -2489,9 +2489,9 @@ describe("pipeline effect processor", () => {
     });
     const manifest = catalog.manifests.get("fixture/command@2")!;
     tickets.upsert({
-      linear_issue_id: "issue-2",
-      linear_issue_identifier: "OT-2",
-      linear_session_id: "session-2",
+      ticket_id: "issue-2",
+      ticket_reference: "OT-2",
+      session_id: "session-2",
       sandbox_id: null,
       branch: "ot/ot-2",
       agent: "codex",
@@ -2546,9 +2546,9 @@ describe("pipeline effect processor", () => {
     const runId = attempt.planned_run_id!;
 
     tickets.upsertUnpinned({
-      linear_issue_id: "issue-superseded",
-      linear_issue_identifier: "ISSUE-SUPERSEDED",
-      linear_session_id: "session-replacement",
+      ticket_id: "issue-superseded",
+      ticket_reference: "ISSUE-SUPERSEDED",
+      session_id: "session-replacement",
       sandbox_id: "sandbox-replacement",
       branch: "ot/issue-superseded",
       agent: "codex",
@@ -2562,7 +2562,7 @@ describe("pipeline effect processor", () => {
       terminal_outcome: "superseded",
     });
     expect(tickets.getByIssueId("issue-superseded")).toMatchObject({
-      linear_session_id: "session-replacement",
+      session_id: "session-replacement",
       sandbox_id: "sandbox-replacement",
       run_id: runId,
       state: "active",
@@ -2581,7 +2581,7 @@ describe("pipeline effect processor", () => {
       "SELECT actor_state FROM pipeline_stage_attempts WHERE run_id = ?"
     ).pluck().get(runId)).toBe("settled");
     expect(tickets.getByIssueId("issue-superseded")).toMatchObject({
-      linear_session_id: "session-replacement",
+      session_id: "session-replacement",
       sandbox_id: "sandbox-replacement",
       run_id: null,
       state: "active",
@@ -2638,9 +2638,9 @@ describe("pipeline effect processor", () => {
       db!.prepare("UPDATE pipeline_stage_attempts SET run_id = NULL WHERE id = ?").run(attempt.id);
     })();
     tickets.upsertUnpinned({
-      linear_issue_id: "issue-planned-run-superseded",
-      linear_issue_identifier: "ISSUE-PLANNED-RUN-SUPERSEDED",
-      linear_session_id: "session-planned-run-replacement",
+      ticket_id: "issue-planned-run-superseded",
+      ticket_reference: "ISSUE-PLANNED-RUN-SUPERSEDED",
+      session_id: "session-planned-run-replacement",
       sandbox_id: "sandbox-planned-run-replacement",
       branch: "ot/issue-planned-run-superseded",
       agent: "codex",
@@ -2659,7 +2659,7 @@ describe("pipeline effect processor", () => {
     );
     expect(tickets.getRun(runId)).toMatchObject({ status: "stopped" });
     expect(tickets.getByIssueId("issue-planned-run-superseded")).toMatchObject({
-      linear_session_id: "session-planned-run-replacement",
+      session_id: "session-planned-run-replacement",
       sandbox_id: "sandbox-planned-run-replacement",
       state: "active",
       run_id: null,
@@ -2675,9 +2675,9 @@ describe("pipeline effect processor", () => {
     const runId = attempt.planned_run_id!;
 
     tickets.upsertUnpinned({
-      linear_issue_id: "issue-legacy-superseded",
-      linear_issue_identifier: "ISSUE-LEGACY-SUPERSEDED",
-      linear_session_id: "session-legacy-replacement",
+      ticket_id: "issue-legacy-superseded",
+      ticket_reference: "ISSUE-LEGACY-SUPERSEDED",
+      session_id: "session-legacy-replacement",
       sandbox_id: "sandbox-legacy-replacement",
       branch: "ot/issue-legacy-superseded",
       agent: "codex",
@@ -2699,7 +2699,7 @@ describe("pipeline effect processor", () => {
       "SELECT actor_state FROM pipeline_stage_attempts WHERE run_id = ?"
     ).pluck().get(runId)).toBe("settled");
     expect(tickets.getByIssueId("issue-legacy-superseded")).toMatchObject({
-      linear_session_id: "session-legacy-replacement",
+      session_id: "session-legacy-replacement",
       sandbox_id: "sandbox-legacy-replacement",
       run_id: null,
       state: "active",
@@ -2731,9 +2731,9 @@ describe("pipeline effect processor", () => {
     const draining = processor.drain();
     await stopStarted;
     tickets.upsertUnpinned({
-      linear_issue_id: "issue-concurrent-replacement",
-      linear_issue_identifier: "ISSUE-CONCURRENT-REPLACEMENT",
-      linear_session_id: "session-concurrent-successor",
+      ticket_id: "issue-concurrent-replacement",
+      ticket_reference: "ISSUE-CONCURRENT-REPLACEMENT",
+      session_id: "session-concurrent-successor",
       sandbox_id: "sandbox-concurrent-successor",
       branch: "ot/issue-concurrent-replacement",
       agent: "codex",
@@ -2745,7 +2745,7 @@ describe("pipeline effect processor", () => {
     await draining;
 
     expect(tickets.getByIssueId("issue-concurrent-replacement")).toMatchObject({
-      linear_session_id: "session-concurrent-successor",
+      session_id: "session-concurrent-successor",
       sandbox_id: "sandbox-concurrent-successor",
       run_id: null,
       state: "active",
@@ -2858,8 +2858,8 @@ describe("pipeline effect processor", () => {
     expect(activities).toHaveLength(1);
     expect(activities[0]).toMatchObject({
       kind: "activity",
-      linear_session_id: "session-capacity",
-      linear_issue_id: "issue-capacity",
+      session_id: "session-capacity",
+      ticket_id: "issue-capacity",
     });
     const payload = JSON.parse(activities[0]!.payload) as { type: string; activity: { type: string; body: string } };
     expect(payload).toMatchObject({ type: "activity", activity: { type: "response" } });
@@ -2893,9 +2893,9 @@ describe("pipeline effect processor", () => {
     // should be able to free up before the provision retry is scheduled.
     const manifest = catalog.manifests.get("fixture/command@2")!;
     tickets.upsert({
-      linear_issue_id: "issue-stale-needs-human",
-      linear_issue_identifier: "ISSUE-STALE-NEEDS-HUMAN",
-      linear_session_id: "session-stale-needs-human",
+      ticket_id: "issue-stale-needs-human",
+      ticket_reference: "ISSUE-STALE-NEEDS-HUMAN",
+      session_id: "session-stale-needs-human",
       sandbox_id: null,
       branch: "ot/issue-stale-needs-human",
       agent: "codex",
@@ -3118,7 +3118,7 @@ describe("pipeline effect processor", () => {
     const runId = attempt.planned_run_id!;
     requestPipelineStop({
       store: pipelines,
-      sessionId: instance.linear_session_id,
+      sessionId: instance.session_id,
       eventId: `operator-stop:poison:${_case}`,
       reason: "Stopped by test.",
     });
@@ -3142,7 +3142,7 @@ describe("pipeline effect processor", () => {
     tickets.finishRun({ runId, status: "completed", ticketState: "active" });
     requestPipelineStop({
       store: pipelines,
-      sessionId: instance.linear_session_id,
+      sessionId: instance.session_id,
       eventId: "terminal-error-stop-exhaustion",
       reason: "Terminal pipeline failure.",
     });
@@ -3169,9 +3169,9 @@ describe("pipeline effect processor", () => {
     await processor.drain();
     const runId = attempt.planned_run_id!;
     tickets.upsertUnpinned({
-      linear_issue_id: "issue-superseded-quarantine",
-      linear_issue_identifier: "ISSUE-SUPERSEDED-QUARANTINE",
-      linear_session_id: "session-quarantine-replacement",
+      ticket_id: "issue-superseded-quarantine",
+      ticket_reference: "ISSUE-SUPERSEDED-QUARANTINE",
+      session_id: "session-quarantine-replacement",
       sandbox_id: "sandbox-quarantine-replacement",
       branch: "ot/issue-superseded-quarantine",
       agent: "codex",
@@ -3193,7 +3193,7 @@ describe("pipeline effect processor", () => {
     expect(runtime.quarantine).toHaveBeenCalledOnce();
     expect(tickets.getRun(runId)).toMatchObject({ status: "quarantined" });
     expect(tickets.getByIssueId("issue-superseded-quarantine")).toMatchObject({
-      linear_session_id: "session-quarantine-replacement",
+      session_id: "session-quarantine-replacement",
       sandbox_id: "sandbox-quarantine-replacement",
       run_id: runId,
       state: "active",
@@ -3207,7 +3207,7 @@ describe("pipeline effect processor", () => {
       failureTail: "old runtime termination confirmed",
     })).toMatchObject({ status: "stopped" });
     expect(tickets.getByIssueId("issue-superseded-quarantine")).toMatchObject({
-      linear_session_id: "session-quarantine-replacement",
+      session_id: "session-quarantine-replacement",
       sandbox_id: "sandbox-quarantine-replacement",
       run_id: null,
       state: "active",

@@ -11,9 +11,9 @@ describe("delivery store", () => {
     db = openDb(":memory:");
     store = createSupervisorStore(db);
     store.upsertUnpinned({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -27,19 +27,19 @@ describe("delivery store", () => {
   afterEach(() => db.close());
 
   const getLinearOutbox = (id: string): LinearOutboxRecord | undefined =>
-    db.prepare("SELECT * FROM linear_outbox WHERE id = ?").get(id) as LinearOutboxRecord | undefined;
+    db.prepare("SELECT * FROM control_outbox WHERE id = ?").get(id) as LinearOutboxRecord | undefined;
 
   it("keeps Linear publication ordered", () => {
     const first = store.enqueueLinearOutbox({
       id: "linear-1",
-      linearSessionId: "session-1",
+      sessionId: "session-1",
       issueId: "issue-1",
       kind: "activity",
       payload: '{"type":"thought"}',
     });
     const second = store.enqueueLinearOutbox({
       id: "linear-2",
-      linearSessionId: "session-1",
+      sessionId: "session-1",
       issueId: "issue-1",
       kind: "activity",
       payload: '{"type":"response"}',
@@ -49,14 +49,14 @@ describe("delivery store", () => {
 
   it("does not acknowledge a Linear outbox row after its payload changed", () => {
     const row = store.enqueueLinearOutbox({
-      id: "linear-status",
-      linearSessionId: "session-1",
+      id: "control-status",
+      sessionId: "session-1",
       issueId: "issue-1",
       kind: "pipeline_status",
       payload: '{"type":"pipeline_status","publication":{"body":"old"}}',
     });
     db.prepare(`
-      UPDATE linear_outbox
+      UPDATE control_outbox
       SET payload = ?, payload_hash = 'new-hash'
       WHERE id = ?
     `).run('{"type":"pipeline_status","publication":{"body":"new"}}', row.id);
@@ -78,14 +78,14 @@ describe("delivery store", () => {
   it("does not lease unrelated Linear outbox rows when a requested id is not claimable", () => {
     const first = store.enqueueLinearOutbox({
       id: "linear-1",
-      linearSessionId: "session-1",
+      sessionId: "session-1",
       issueId: "issue-1",
       kind: "activity",
       payload: '{"type":"activity","activity":{"sessionId":"session-1","type":"response","body":"first"}}',
     });
     const second = store.enqueueLinearOutbox({
       id: "linear-2",
-      linearSessionId: "session-2",
+      sessionId: "session-2",
       issueId: "issue-2",
       kind: "activity",
       payload: '{"type":"activity","activity":{"sessionId":"session-2","type":"response","body":"second"}}',
@@ -104,20 +104,20 @@ describe("delivery store", () => {
   it("does not let issue-state projections block later Linear outbox rows", () => {
     const state = store.enqueueLinearOutbox({
       id: "issue-state",
-      linearSessionId: "session-1",
+      sessionId: "session-1",
       issueId: "issue-1",
       kind: "issue_state",
       payload: '{"type":"issue_state","issueId":"issue-1","signal":"started"}',
     });
     const activity = store.enqueueLinearOutbox({
       id: "linear-activity",
-      linearSessionId: "session-1",
+      sessionId: "session-1",
       issueId: "issue-1",
       kind: "activity",
       payload: '{"type":"activity","activity":{"sessionId":"session-1","type":"response","body":"after projection"}}',
     });
     db.prepare(`
-      UPDATE linear_outbox
+      UPDATE control_outbox
       SET status = 'failed', next_attempt_at = '2101-01-01T00:00:00.000Z'
       WHERE id = ?
     `).run(state.id);

@@ -2,8 +2,8 @@ import type { Config } from "./config.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import type {
   ActivityPublicationPort,
-  LinearAgentSessionEvent,
-  LinearLabelPort,
+  ControlLabelPort,
+  ControlThreadEvent,
   MergePort,
   RepositoryReadPort,
 } from "./ports.js";
@@ -16,7 +16,7 @@ import { handlePrompted } from "./thread-control.js";
 
 export interface SessionServicePorts {
   activityPublisher: ActivityPublicationPort;
-  labelResolver: LinearLabelPort;
+  labelResolver: ControlLabelPort;
   repositoryReader: RepositoryReadPort;
   merger: MergePort;
 }
@@ -28,11 +28,11 @@ export interface PipelineCoordinatorContext {
   drainEffects?: () => Promise<void>;
 }
 
-export async function handleLinearEvent(
+export async function handleControlEvent(
   cfg: Config,
   store: SupervisorStore,
   providers: SessionServicePorts,
-  payload: LinearAgentSessionEvent,
+  payload: ControlThreadEvent,
   coordinator: PipelineCoordinatorContext,
   preflight?: AdmissionPreflight
 ): Promise<void> {

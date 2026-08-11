@@ -143,6 +143,9 @@ describe("database migrations", () => {
       "62d23bf76b20a18c4ff15352d3ef1558fe6bb364860d58915a26a84c8a6ed2b3",
       "1b9a06d171fdefd11b55aa4b785fc639310792b8de144d4c49c50206c4a6a3b2",
       "e1f1cc26fcd21df5ca8cb56548d2d38f90311d40d93bcd0e54d4ab62f9eb6ad4",
+      "11bdf53d0a0b59014ad94e49c190d3c1b55cd26c7e1d031c56dfb3df1916cad9",
+      "20e15db3951119345b7cd0b9080788e742bab11a9207fb41e564314fd9353b96",
+      "f1bdb3c566c1c190d679eede3ce2300855b654fe90dc303d5d18a7f91a762114",
     ]);
   });
 
@@ -219,6 +222,69 @@ describe("database migrations", () => {
       SELECT COUNT(*) AS count FROM pragma_foreign_key_list('execution_units')
       WHERE "table" = 'execution_work_attempts'
     `).get()).toEqual({ count: 6 });
+  });
+
+  it("converges a freshly opened database on neutral live control identifiers", () => {
+    db = openDb(":memory:");
+
+    expect(db.prepare(`
+      SELECT name FROM pragma_table_info('tickets') WHERE name = 'ticket_id'
+    `).get()).toEqual({ name: "ticket_id" });
+    expect(db.prepare(`
+      SELECT name FROM pragma_table_info('tickets') WHERE name = 'linear_issue_id'
+    `).get()).toBeUndefined();
+    expect(db.prepare(`
+      SELECT name FROM pragma_table_info('pipeline_instances') WHERE name = 'session_id'
+    `).get()).toEqual({ name: "session_id" });
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'control_outbox'"
+    ).get()).toEqual({ name: "control_outbox" });
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'linear_outbox'"
+    ).get()).toBeUndefined();
+  });
+
+  it("migrates repository registrations to provider-qualified repo authority", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE repository_registrations (
+        linear_team_key TEXT PRIMARY KEY COLLATE NOCASE,
+        linear_team_id TEXT UNIQUE,
+        github_repo TEXT NOT NULL COLLATE NOCASE,
+        base_branch TEXT NOT NULL,
+        webhook_id INTEGER NOT NULL,
+        snapshot TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO repository_registrations (
+        linear_team_key, linear_team_id, github_repo, base_branch,
+        webhook_id, snapshot, created_at, updated_at
+      ) VALUES (
+        'ENG', 'team-1', 'acme/widget', 'main', 42,
+        'openthrottle', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+    `);
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare(`
+      SELECT github_repo, control_provider, linear_team_key, linear_team_id
+      FROM repository_registrations
+    `).get()).toEqual({
+      github_repo: "acme/widget",
+      control_provider: "linear",
+      linear_team_key: "ENG",
+      linear_team_id: "team-1",
+    });
+    expect(db.prepare(`
+      SELECT name FROM pragma_table_info('repository_registrations') WHERE pk = 1
+    `).get()).toEqual({ name: "github_repo" });
+    expect(db.prepare(`
+      SELECT name FROM pragma_index_list('repository_registrations')
+      WHERE name = 'repository_registrations_linear_team_key_idx'
+    `).get()).toEqual({ name: "repository_registrations_linear_team_key_idx" });
+    expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
   });
 
   it("does not stamp v18 when composite identity prerequisites are missing", () => {
@@ -479,14 +545,14 @@ describe("database migrations", () => {
     const now = "2026-07-29T00:00:00.000Z";
     db.exec(`
       INSERT INTO tickets (
-        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        ticket_id, ticket_reference, session_id, branch, agent,
         repo, base_branch, created_at, updated_at
       ) VALUES ('issue-1', 'OPE-1', 'session-1', 'ot/ope-1', 'codex', 'owner/repo', 'main', '${now}', '${now}');
       INSERT INTO agent_sessions (
-        id, linear_issue_id, generation, state, created_at, updated_at
+        id, ticket_id, generation, state, created_at, updated_at
       ) VALUES ('session-1', 'issue-1', 1, 'current', '${now}', '${now}');
       INSERT INTO runs (
-        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        id, ticket_id, session_id, session_generation, task_type,
         token_hash, status, started_at, expires_at
       ) VALUES (
         'run-parent', 'issue-1', 'session-1', 1, 'implement', 'request-hash',
@@ -502,7 +568,7 @@ describe("database migrations", () => {
         pipeline_id, version, digest, normalized_manifest, accepted_at
       ) VALUES ('structured', 1, '${"e".repeat(64)}', '{}', '${now}');
       INSERT INTO pipeline_instances (
-        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        id, ticket_id, session_id, generation, pipeline_id, pipeline_version,
         manifest_digest, normalized_manifest, repository, base_commit, branch,
         repository_config_snapshot_id, repository_config_digest, runtime_release, capability_digest,
         executor_protocol, authorized_capabilities, status, active_stage_id, state_version,
@@ -582,7 +648,7 @@ describe("database migrations", () => {
         transition_version INTEGER NOT NULL CHECK(transition_version >= 1),
         kind TEXT NOT NULL CHECK(kind IN (
           'provision', 'bootstrap', 'dispatch_stage', 'stop', 'quarantine', 'cleanup',
-          'publish_linear', 'publish_github', 'publish_pr'
+          'publish_control', 'publish_github', 'publish_pr'
         )),
         idempotency_key TEXT NOT NULL UNIQUE,
         payload TEXT NOT NULL,
@@ -862,7 +928,7 @@ describe("database migrations", () => {
     ));
     db.prepare(`
       INSERT INTO tickets (
-        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        ticket_id, ticket_reference, session_id, branch, agent,
         repo, state, base_branch, created_at, updated_at
       ) VALUES (
         'issue-selection', 'OPE-SELECT', 'session-selection', 'ot/issue-selection',
@@ -871,7 +937,7 @@ describe("database migrations", () => {
     `).run(now, now);
     db.prepare(`
       INSERT INTO agent_sessions (
-        id, linear_issue_id, generation, state, provider_conversation_id,
+        id, ticket_id, generation, state, provider_conversation_id,
         created_at, updated_at
       ) VALUES (
         'session-selection', 'issue-selection', 1, 'current', NULL, ?, ?
@@ -894,7 +960,7 @@ describe("database migrations", () => {
     `).run("a".repeat(40), now);
     db.prepare(`
       INSERT INTO pipeline_instances (
-        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        id, ticket_id, session_id, generation, pipeline_id, pipeline_version,
         manifest_digest, normalized_manifest, repository, base_commit,
         repository_config_snapshot_id, repository_config_digest, runtime_release,
         capability_digest, executor_protocol, authorized_capabilities, status,
@@ -925,8 +991,8 @@ describe("database migrations", () => {
       WHERE pipeline_instance_id = 'instance-selection'
       ORDER BY kind
     `).all()).toEqual([
+      { kind: "control_ledger" },
       { kind: "github_summary" },
-      { kind: "linear_ledger" },
     ]);
   });
 
@@ -936,7 +1002,7 @@ describe("database migrations", () => {
     const now = "2026-01-01T00:00:00.000Z";
     db.prepare(`
       INSERT INTO tickets (
-        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        ticket_id, ticket_reference, session_id, branch, agent,
         repo, state, base_branch, created_at, updated_at
       ) VALUES (
         'issue-contract', 'OPE-CONTRACT', 'session-contract', 'ot/issue-contract',
@@ -945,7 +1011,7 @@ describe("database migrations", () => {
     `).run(now, now);
     db.prepare(`
       INSERT INTO agent_sessions (
-        id, linear_issue_id, generation, state, provider_conversation_id,
+        id, ticket_id, generation, state, provider_conversation_id,
         created_at, updated_at, execution_mode, pipeline_instance_id
       ) VALUES (
         'session-contract', 'issue-contract', 1, 'current', NULL, ?, ?,
@@ -969,7 +1035,7 @@ describe("database migrations", () => {
     `).run("a".repeat(40), now);
     db.prepare(`
       INSERT INTO pipeline_instances (
-        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        id, ticket_id, session_id, generation, pipeline_id, pipeline_version,
         manifest_digest, normalized_manifest, repository, base_commit,
         repository_config_snapshot_id, repository_config_digest, runtime_release,
         capability_digest, executor_protocol, authorized_capabilities, status,
@@ -987,7 +1053,7 @@ describe("database migrations", () => {
     `).run("a".repeat(64), "a".repeat(40), now, now);
     db.prepare(`
       INSERT INTO session_executions (
-        linear_session_id, linear_issue_id, generation, execution_mode,
+        session_id, ticket_id, generation, execution_mode,
         pipeline_instance_id, pinned_at
       ) VALUES (
         'session-contract', 'issue-contract', 1, 'pipeline', 'instance-contract', ?

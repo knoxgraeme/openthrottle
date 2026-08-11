@@ -14,7 +14,7 @@ describe("orchestration journal store", () => {
   function seedTicket(issueId = "issue-1", identifier = "OT-1"): void {
     db!.prepare(`
       INSERT INTO tickets (
-        linear_issue_id, linear_issue_identifier, linear_session_id,
+        ticket_id, ticket_reference, session_id,
         sandbox_id, branch, agent, repo, pr_url, state, base_branch, created_at, updated_at
       ) VALUES (?, ?, 'session-1', NULL, 'ot/ot-1', 'codex', 'owner/repo', NULL, 'active', 'main', ?, ?)
     `).run(issueId, identifier, "2026-07-27T00:00:00.000Z", "2026-07-27T00:00:00.000Z");
@@ -29,10 +29,9 @@ describe("orchestration journal store", () => {
     `).run(teamKey, `team-${teamKey}`, teamKey.length, "2026-07-27T00:00:00.000Z", updatedAt);
   }
 
-  it("preserves the issue team when multiple teams share a repository", () => {
+  it("prefers the issue team over the repository route fallback", () => {
     db = openDb(":memory:");
     seedTicket("issue-1", "OT-1");
-    registerRepository("OT", "2026-07-27T00:00:00.000Z");
     registerRepository("QA", "2026-07-27T01:00:00.000Z");
 
     const journal = createJournalStore(db, () => "2026-07-27T02:00:00.000Z");

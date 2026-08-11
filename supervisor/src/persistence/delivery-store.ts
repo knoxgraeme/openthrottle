@@ -50,8 +50,8 @@ export interface SandboxEventRecord {
 
 export interface LinearOutboxRecord {
   id: string;
-  linear_session_id: string | null;
-  linear_issue_id: string | null;
+  session_id: string | null;
+  ticket_id: string | null;
   run_id: string | null;
   sequence: number;
   kind: "activity" | "session_update" | "pipeline_receipt" | "pipeline_status" | "issue_state";
@@ -71,7 +71,7 @@ export interface LinearOutboxRecord {
 export interface DeliveryStore {
   enqueueLinearOutbox(params: {
     id?: string;
-    linearSessionId?: string | null;
+    sessionId?: string | null;
     issueId?: string | null;
     runId?: string | null;
     kind: LinearOutboxRecord["kind"];
@@ -116,15 +116,15 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
   const now = () => new Date().toISOString();
   const hashPayload = (payload: string) => createHash("sha256").update(payload).digest("hex");
   const nextOutboxSequenceStmt = db.prepare(
-    "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM linear_outbox WHERE linear_session_id IS ?"
+    "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM control_outbox WHERE session_id IS ?"
   );
   const insertLinearOutboxStmt = db.prepare(`
-    INSERT INTO linear_outbox (
-      id, linear_session_id, linear_issue_id, run_id, sequence, kind,
+    INSERT INTO control_outbox (
+      id, session_id, ticket_id, run_id, sequence, kind,
       payload, payload_hash, status, attempts, next_attempt_at, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
   `);
-  const getLinearOutboxStmt = db.prepare("SELECT * FROM linear_outbox WHERE id = ?");
+  const getLinearOutboxStmt = db.prepare("SELECT * FROM control_outbox WHERE id = ?");
   const claimDeliveryStmt = db.prepare(`
     INSERT OR IGNORE INTO webhook_deliveries (
       delivery_id, source, session_id, action, activity_id, event_name,
@@ -158,18 +158,18 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
         OR (kind = 'activity' AND json_extract(payload, '$.ephemeral') IS 1))
   `);
   const pruneEphemeralLinearOutboxStmt = db.prepare(`
-    DELETE FROM linear_outbox
+    DELETE FROM control_outbox
     WHERE status = 'processed' AND processed_at < ?
       AND kind = 'activity'
       AND json_extract(payload, '$.activity.ephemeral') IS 1
   `);
   const listClaimableLinearOutboxRowsStmt = db.prepare(`
-    SELECT * FROM linear_outbox candidate
+    SELECT * FROM control_outbox candidate
     WHERE ((candidate.status IN ('pending', 'failed') AND candidate.next_attempt_at <= ?)
       OR (candidate.status = 'processing' AND candidate.next_attempt_at <= ?))
       AND (candidate.kind = 'issue_state' OR NOT EXISTS (
-        SELECT 1 FROM linear_outbox earlier
-        WHERE earlier.linear_session_id IS candidate.linear_session_id
+        SELECT 1 FROM control_outbox earlier
+        WHERE earlier.session_id IS candidate.session_id
           AND earlier.sequence < candidate.sequence
           AND earlier.kind NOT IN ('pipeline_status', 'issue_state')
           AND earlier.status IN ('pending', 'processing', 'failed')
@@ -178,7 +178,7 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
     LIMIT ?
   `);
   const claimLinearOutboxRowStmt = db.prepare(`
-    UPDATE linear_outbox
+    UPDATE control_outbox
     SET status = 'processing', attempts = attempts + 1,
         next_attempt_at = ?, last_error = NULL
     WHERE id = ?
@@ -188,7 +188,7 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
   const enqueueLinearOutboxTransaction = db.transaction(
     (params: {
       id?: string;
-      linearSessionId?: string | null;
+      sessionId?: string | null;
       issueId?: string | null;
       runId?: string | null;
       kind: LinearOutboxRecord["kind"];
@@ -200,8 +200,8 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       const payloadHash = hashPayload(params.payload);
       if (existing) {
         if (
-          existing.linear_session_id !== (params.linearSessionId ?? null) ||
-          existing.linear_issue_id !== (params.issueId ?? null) ||
+          existing.session_id !== (params.sessionId ?? null) ||
+          existing.ticket_id !== (params.issueId ?? null) ||
           existing.run_id !== (params.runId ?? null) ||
           existing.kind !== params.kind ||
           existing.payload_hash !== payloadHash
@@ -210,12 +210,12 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
         }
         return existing;
       }
-      const sequence = (nextOutboxSequenceStmt.get(params.linearSessionId ?? null) as {
+      const sequence = (nextOutboxSequenceStmt.get(params.sessionId ?? null) as {
         sequence: number;
       }).sequence;
       insertLinearOutboxStmt.run(
         id,
-        params.linearSessionId ?? null,
+        params.sessionId ?? null,
         params.issueId ?? null,
         params.runId ?? null,
         sequence,
@@ -288,7 +288,7 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       if (!target) return [];
       return claimLinearOutboxRows(
         rows.filter((row) =>
-          row.linear_session_id === target.linear_session_id && row.sequence <= target.sequence
+          row.session_id === target.session_id && row.sequence <= target.sequence
         ),
         nowIso,
         leaseUntilIso
@@ -298,7 +298,7 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       db.transaction(() => {
         const processedAt = now();
         const update = db.prepare(`
-          UPDATE linear_outbox
+          UPDATE control_outbox
           SET status = 'processed', processed_at = ?, next_attempt_at = ?, last_error = NULL,
               external_id = COALESCE(?, external_id),
               external_url = COALESCE(?, external_url),
@@ -322,14 +322,14 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
     markLinearOutboxFailed(id, error, retryAt, expectedPayloadHash) {
       db.transaction(() => {
         const timestamp = now();
-        const attempts = (db.prepare("SELECT attempts FROM linear_outbox WHERE id = ?")
+        const attempts = (db.prepare("SELECT attempts FROM control_outbox WHERE id = ?")
           .get(id) as { attempts: number } | undefined)?.attempts;
         const status = markQueueFailed({
           error,
           retryAt,
           timestamp,
           update: (statusValue, nextAttemptAt, errorValue) => db.prepare(`
-          UPDATE linear_outbox
+          UPDATE control_outbox
           SET status = ?, next_attempt_at = ?, last_error = ?
           WHERE id = ?
             AND (? IS NULL OR payload_hash = ?)
@@ -356,7 +356,7 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
     },
     recordLinearOutboxAttachment(id, attachmentUrl) {
       const updated = db.prepare(`
-        UPDATE linear_outbox SET attachment_url = ?
+        UPDATE control_outbox SET attachment_url = ?
         WHERE id = ? AND status = 'processing'
       `).run(attachmentUrl, id);
       if (updated.changes !== 1) throw new Error(`linear outbox ${id} is not processing`);

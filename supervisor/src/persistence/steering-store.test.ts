@@ -10,9 +10,9 @@ describe("steering store", () => {
     db = openDb(":memory:");
     store = createSupervisorStore(db);
     store.upsertUnpinned({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -111,9 +111,9 @@ describe("steering store", () => {
       body: "Do not inject this into the replacement session.",
     });
     store.upsertUnpinned({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-2",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-2",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -154,9 +154,9 @@ describe("steering store", () => {
     // The issue is re-delegated: a fresh session (generation 2) supersedes the
     // old one and a replacement run begins for the successor pipeline.
     store.upsertUnpinned({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-2",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-2",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",

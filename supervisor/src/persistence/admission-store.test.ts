@@ -10,9 +10,9 @@ describe("admission store", () => {
     db = openDb(":memory:");
     store = createSupervisorStore(db);
     store.upsertUnpinned({
-      linear_issue_id: "issue-1",
-      linear_issue_identifier: "OT-1",
-      linear_session_id: "session-1",
+      ticket_id: "issue-1",
+      ticket_reference: "OT-1",
+      session_id: "session-1",
       sandbox_id: null,
       branch: "ot/ot-1",
       agent: "codex",
@@ -53,10 +53,54 @@ describe("admission store", () => {
     expect(store.getRepositoryRegistration(undefined, "missing")).toBeUndefined();
   });
 
+  it("keys repository registrations by repo and rejects different-provider authority transfer", () => {
+    store.registerRepository({
+      linearTeamKey: "ENG",
+      linearTeamId: "team-1",
+      githubRepo: "acme/widget",
+      baseBranch: "develop",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
+
+    expect(() =>
+      store.registerRepository({
+        controlProvider: "github",
+        githubRepo: "ACME/WIDGET",
+        baseBranch: "main",
+        webhookId: 43,
+        snapshot: "openthrottle",
+      })
+    ).toThrow(/already registered for linear control/);
+    expect(store.getRepositoryRegistration("team-1", undefined, "github")).toBeUndefined();
+  });
+
+  it("rejects moving a Linear route to another repository", () => {
+    store.registerRepository({
+      linearTeamKey: "ENG",
+      linearTeamId: "team-1",
+      githubRepo: "acme/widget",
+      baseBranch: "develop",
+      webhookId: 42,
+      snapshot: "openthrottle",
+    });
+
+    expect(() =>
+      store.registerRepository({
+        linearTeamKey: "ENG",
+        linearTeamId: "team-1",
+        githubRepo: "acme/other",
+        baseBranch: "main",
+        webhookId: 43,
+        snapshot: "openthrottle",
+      })
+    ).toThrow(/refusing to transfer authority/);
+  });
+
   it("supersedes session generations without carrying actor state forward", () => {
     store.upsertUnpinned({
       ...store.getByIssueId("issue-1")!,
-      linear_session_id: "session-2",
+      session_id: "session-2",
       sandbox_id: null,
     });
     expect(store.getSession("session-1")?.state).toBe("superseded");

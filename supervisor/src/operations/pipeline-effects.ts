@@ -181,8 +181,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     const attempt = deps.store.getAttemptForRun(runId);
     return attempt?.pipeline_instance_id === instance.id &&
       (!run || (
-        run.linear_issue_id === instance.linear_issue_id &&
-        run.linear_session_id === instance.linear_session_id
+        run.ticket_id === instance.ticket_id &&
+        run.session_id === instance.session_id
       ));
   };
 
@@ -216,16 +216,16 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
 
   const bindCompositeParentRun = (instance: PipelineInstance, request: StageRequestEnvelope): void => {
     assertActiveAttempt(instance, request);
-    const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
-    if (!ticket || ticket.linear_session_id !== instance.linear_session_id) {
+    const ticket = deps.tickets.getByIssueId(instance.ticket_id);
+    if (!ticket || ticket.session_id !== instance.session_id) {
       throw new Error(`pipeline instance ${instance.id} has no current ticket binding`);
     }
     if (ticket.run_id && ticket.run_id !== request.runId) {
-      throw new Error(`ticket ${ticket.linear_issue_identifier} already has active actor ${ticket.run_id}`);
+      throw new Error(`ticket ${ticket.ticket_reference} already has active actor ${ticket.run_id}`);
     }
     if (!ticket.run_id) {
       const started = deps.tickets.beginRun({
-        issueId: instance.linear_issue_id,
+        issueId: instance.ticket_id,
         runId: request.runId,
         taskType: instance.task_type,
         tokenHash: request.requestHash,
@@ -274,7 +274,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       runtimeRelease: instance.runtime_release,
     });
     deps.store.bindRuntimeResource(instance.id, "daytona", resource.providerResourceId);
-    deps.tickets.setSandboxId(instance.linear_issue_id, resource.providerResourceId);
+    deps.tickets.setSandboxId(instance.ticket_id, resource.providerResourceId);
     return resource;
   };
 
@@ -300,18 +300,18 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       throw new Error(`pipeline stage request ${request.attemptId} has a stale instance fence`);
     }
     assertActiveAttempt(instance, request);
-    const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
-    if (!ticket || ticket.linear_session_id !== instance.linear_session_id) {
+    const ticket = deps.tickets.getByIssueId(instance.ticket_id);
+    if (!ticket || ticket.session_id !== instance.session_id) {
       throw new Error(`pipeline instance ${instance.id} has no current ticket binding`);
     }
     await deps.runtime.materializeCredentials(resource, request.credentialScopes);
     assertActiveAttempt(instance, request);
     if (ticket.run_id && ticket.run_id !== request.runId) {
-      throw new Error(`ticket ${ticket.linear_issue_identifier} already has active actor ${ticket.run_id}`);
+      throw new Error(`ticket ${ticket.ticket_reference} already has active actor ${ticket.run_id}`);
     }
     if (!ticket.run_id) {
       const started = deps.tickets.beginRun({
-        issueId: instance.linear_issue_id,
+        issueId: instance.ticket_id,
         runId: request.runId,
         taskType: instance.task_type,
         // `runs.token_hash` predates the sealed stage protocol. Store the
@@ -414,9 +414,9 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       : ticketState === "error"
         ? "Pipeline infrastructure failed."
         : "Pipeline stopped.";
-    const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
+    const ticket = deps.tickets.getByIssueId(instance.ticket_id);
     const owner = `pipeline-stop:${effect.id}`;
-    const currentSession = ticket?.linear_session_id === instance.linear_session_id;
+    const currentSession = ticket?.session_id === instance.session_id;
     const activeRunId = resolveStopRunId(effect, instance, ticket, control, true);
     const boundRun = activeRunId ? deps.tickets.getRun(activeRunId) : undefined;
     if (!binding.resource && (boundRun?.status === "running" || boundRun?.status === "reaping")) {
@@ -464,29 +464,29 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       }
       deps.store.setRuntimeResourceStatus(instance.id, "stopped");
     }
-    const projectionTicket = deps.tickets.getByIssueId(instance.linear_issue_id);
-    if (projectionTicket?.linear_session_id === instance.linear_session_id) {
+    const projectionTicket = deps.tickets.getByIssueId(instance.ticket_id);
+    if (projectionTicket?.session_id === instance.session_id) {
       // The sealed run may already have completed before this terminal stop
       // drains. Project the terminal ticket state independently from actor
       // settlement so completed actors cannot leave a failed pipeline active.
       // Refresh after the provider call so a concurrent replacement session
       // cannot receive its predecessor's terminal projection.
       deps.tickets.setState(
-        projectionTicket.linear_issue_id,
+        projectionTicket.ticket_id,
         ticketState,
         settlementReason
       );
-      deps.tickets.markSessionState(instance.linear_session_id, "stopped");
-      deps.tickets.cancelPendingInbox(instance.linear_issue_id);
+      deps.tickets.markSessionState(instance.session_id, "stopped");
+      deps.tickets.cancelPendingInbox(instance.ticket_id);
     }
     if (binding.resource && binding.status !== "cleaned") {
       await deps.runtime.cleanup(binding.resource);
       deps.store.setRuntimeResourceStatus(instance.id, "cleaned");
     }
-    const cleanupTicket = deps.tickets.getByIssueId(instance.linear_issue_id);
-    if (cleanupTicket?.linear_session_id === instance.linear_session_id &&
+    const cleanupTicket = deps.tickets.getByIssueId(instance.ticket_id);
+    if (cleanupTicket?.session_id === instance.session_id &&
         (!binding.resource || cleanupTicket.sandbox_id === binding.resource.providerResourceId)) {
-      deps.tickets.setSandboxId(instance.linear_issue_id, null);
+      deps.tickets.setSandboxId(instance.ticket_id, null);
     }
   };
 
@@ -508,18 +508,18 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }
     if (runId) {
       const quarantined = deps.tickets.quarantineRun(runId, owner, reason);
-      const refreshed = deps.tickets.getByIssueId(instance.linear_issue_id);
+      const refreshed = deps.tickets.getByIssueId(instance.ticket_id);
       if (!quarantined && refreshed?.run_id === runId) {
         throw new Error(`pipeline actor ${runId} could not be quarantined by ${owner}`);
       }
     } else {
-      const refreshed = deps.tickets.getByIssueId(instance.linear_issue_id);
-      if (refreshed?.linear_session_id === instance.linear_session_id) {
+      const refreshed = deps.tickets.getByIssueId(instance.ticket_id);
+      if (refreshed?.session_id === instance.session_id) {
         // A stage actor can complete before its terminal runtime stop. If
         // provider termination then exhausts there is no live run to
         // quarantine, but the current ticket must still expose the
         // infrastructure failure.
-        deps.tickets.setState(instance.linear_issue_id, "error", reason);
+        deps.tickets.setState(instance.ticket_id, "error", reason);
       }
     }
   };
@@ -543,10 +543,10 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         deps.store.setRuntimeResourceStatus(instance.id, "cleaned");
       }
     }
-    const ticket = deps.tickets.getByIssueId(instance.linear_issue_id);
-    if (!preserve && ticket?.linear_session_id === instance.linear_session_id &&
+    const ticket = deps.tickets.getByIssueId(instance.ticket_id);
+    if (!preserve && ticket?.session_id === instance.session_id &&
         (!binding.resource || ticket.sandbox_id === binding.resource.providerResourceId)) {
-      deps.tickets.setSandboxId(instance.linear_issue_id, null);
+      deps.tickets.setSandboxId(instance.ticket_id, null);
     }
   };
 
@@ -618,7 +618,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
   const drainActiveCompositeGraphs = async (): Promise<void> => {
     const tickets = deps.tickets.listRunning();
     for (const ticket of tickets) {
-      const instance = deps.store.getInstanceForSession(ticket.linear_session_id);
+      const instance = deps.store.getInstanceForSession(ticket.session_id);
       if (!instance || ticket.run_id === null) continue;
       const attempt = deps.store.getActiveAttempt(instance.id);
       if (!attempt || attempt.run_id !== ticket.run_id || attempt.status === "completed") continue;
@@ -640,13 +640,13 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       const holding = sanitizeText(message).replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim();
       deps.tickets.enqueueLinearOutbox({
         id,
-        linearSessionId: instance.linear_session_id,
-        issueId: instance.linear_issue_id,
+        sessionId: instance.session_id,
+        issueId: instance.ticket_id,
         kind: "activity",
         payload: JSON.stringify({
           type: "activity",
           activity: {
-            sessionId: instance.linear_session_id,
+            sessionId: instance.session_id,
             type: "response",
             body: `This run is waiting on sandbox capacity. Daytona is holding it because ${holding || "capacity is not available"}. OpenThrottle will retry automatically.`,
           },
@@ -718,7 +718,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       }
       if (exhausted && effect.kind === "stop") {
         const instance = deps.store.getInstance(effect.pipeline_instance_id);
-        const ticket = instance ? deps.tickets.getByIssueId(instance.linear_issue_id) : undefined;
+        const ticket = instance ? deps.tickets.getByIssueId(instance.ticket_id) : undefined;
         let control: StopEffectControl;
         try {
           control = parseStopEffectControl(effect);

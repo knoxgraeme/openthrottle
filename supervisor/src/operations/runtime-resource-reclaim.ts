@@ -104,15 +104,15 @@ export async function reclaimEligibleRuntimeResources(params: {
       continue;
     }
     params.store.setRuntimeResourceStatus(instance.id, "cleaned");
-    const ticket = params.tickets.getByIssueId(instance.linear_issue_id);
-    if (ticket?.linear_session_id === instance.linear_session_id &&
+    const ticket = params.tickets.getByIssueId(instance.ticket_id);
+    if (ticket?.session_id === instance.session_id &&
         ticket.sandbox_id === binding.provider_resource_id) {
-      params.tickets.setSandboxId(instance.linear_issue_id, null);
+      params.tickets.setSandboxId(instance.ticket_id, null);
     }
     try {
       params.store.recordJournalEntry({
         id: `journal-reclaim-${instance.id}`,
-        issueId: instance.linear_issue_id,
+        issueId: instance.ticket_id,
         instanceId: instance.id,
         actor: "supervisor",
         kind: "run_note",

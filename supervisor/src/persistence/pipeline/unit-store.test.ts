@@ -219,14 +219,14 @@ function setup(path = ":memory:"): ReturnType<typeof createExecutionUnitStore> {
   db = openDb(path);
   db.exec(`
     INSERT INTO tickets (
-      linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+      ticket_id, ticket_reference, session_id, branch, agent,
       repo, base_branch, created_at, updated_at
     ) VALUES ('issue-1', 'OPE-1', 'session-1', 'ot/ope-1', 'codex', 'owner/repo', 'main', '${timestamp}', '${timestamp}');
     INSERT INTO agent_sessions (
-      id, linear_issue_id, generation, state, created_at, updated_at
+      id, ticket_id, generation, state, created_at, updated_at
     ) VALUES ('session-1', 'issue-1', 1, 'current', '${timestamp}', '${timestamp}');
     INSERT INTO runs (
-      id, linear_issue_id, linear_session_id, session_generation, task_type,
+      id, ticket_id, session_id, session_generation, task_type,
       token_hash, status, started_at, expires_at
     ) VALUES (
       'run-parent', 'issue-1', 'session-1', 1, 'implement', 'request-hash',
@@ -242,7 +242,7 @@ function setup(path = ":memory:"): ReturnType<typeof createExecutionUnitStore> {
       pipeline_id, version, digest, normalized_manifest, accepted_at
     ) VALUES ('structured', 1, '${"e".repeat(64)}', '{}', '${timestamp}');
     INSERT INTO pipeline_instances (
-      id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+      id, ticket_id, session_id, generation, pipeline_id, pipeline_version,
       manifest_digest, normalized_manifest, repository, base_commit, branch,
       repository_config_snapshot_id, repository_config_digest, runtime_release, capability_digest,
       executor_protocol, authorized_capabilities, status, active_stage_id, state_version,
@@ -400,21 +400,21 @@ describe("execution unit store", () => {
     });
     db!.exec(`
       INSERT INTO tickets (
-        linear_issue_id, linear_issue_identifier, linear_session_id, branch, agent,
+        ticket_id, ticket_reference, session_id, branch, agent,
         repo, base_branch, created_at, updated_at
       ) VALUES ('issue-2', 'OPE-2', 'session-2', 'ot/ope-2', 'codex', 'owner/repo', 'main', '${timestamp}', '${timestamp}');
       INSERT INTO agent_sessions (
-        id, linear_issue_id, generation, state, created_at, updated_at
+        id, ticket_id, generation, state, created_at, updated_at
       ) VALUES ('session-2', 'issue-2', 1, 'current', '${timestamp}', '${timestamp}');
       INSERT INTO runs (
-        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        id, ticket_id, session_id, session_generation, task_type,
         token_hash, status, started_at, expires_at
       ) VALUES (
         'run-other', 'issue-2', 'session-2', 1, 'implement', 'request-hash',
         'running', '${timestamp}', '2026-07-29T01:00:00.000Z'
       );
       INSERT INTO pipeline_instances (
-        id, linear_issue_id, linear_session_id, generation, pipeline_id, pipeline_version,
+        id, ticket_id, session_id, generation, pipeline_id, pipeline_version,
         manifest_digest, normalized_manifest, repository, base_commit, branch,
         repository_config_snapshot_id, repository_config_digest, runtime_release, capability_digest,
         executor_protocol, authorized_capabilities, status, active_stage_id, state_version,
@@ -499,7 +499,7 @@ describe("execution unit store", () => {
 
     db!.exec(`
       INSERT INTO runs (
-        id, linear_issue_id, linear_session_id, session_generation, task_type,
+        id, ticket_id, session_id, session_generation, task_type,
         token_hash, status, started_at, expires_at
       ) VALUES (
         'run-other', 'issue-1', 'session-1', 1, 'implement', 'request-hash-other',
@@ -3212,7 +3212,7 @@ describe("execution unit store", () => {
     const rows = db!.prepare(`
       SELECT e.sequence, e.kind, e.unit_id, e.body, o.kind AS outboxKind, o.status AS outboxStatus, o.payload AS outboxPayload
       FROM execution_publication_events e
-      JOIN linear_outbox o ON o.id = e.linear_outbox_id
+      JOIN control_outbox o ON o.id = e.control_outbox_id
       WHERE e.parent_attempt_id = ?
       ORDER BY e.sequence ASC
     `).all(parentAttemptId) as Array<{
@@ -3236,7 +3236,7 @@ describe("execution unit store", () => {
     kind: string;
     unit_id: string | null;
     body: string;
-    linear_outbox_id: string;
+    control_outbox_id: string;
   };
   type ReplayOutboxRow = {
     id: string;
@@ -3262,14 +3262,14 @@ describe("execution unit store", () => {
     expect(snapshot).toBeDefined();
     return {
       events: db!.prepare(`
-        SELECT id, sequence, kind, unit_id, body, linear_outbox_id
+        SELECT id, sequence, kind, unit_id, body, control_outbox_id
         FROM execution_publication_events
         WHERE parent_attempt_id = ?
         ORDER BY sequence ASC
       `).all(parentAttemptId) as ReplayPublicationEventRow[],
       outbox: db!.prepare(`
         SELECT id, sequence, kind, payload_hash, status
-        FROM linear_outbox
+        FROM control_outbox
         ORDER BY sequence ASC, id ASC
       `).all() as ReplayOutboxRow[],
       actionOrdinals: db!.prepare(`
@@ -3634,7 +3634,7 @@ describe("execution unit store", () => {
     expect(publicationEvents("attempt-without-a-graph")).toHaveLength(0);
   });
 
-  it("gives the correlated linear_outbox activity an RFC-4122-shaped id", () => {
+  it("gives the correlated control_outbox activity an RFC-4122-shaped id", () => {
     const store = setup();
     store.createGraph({
       pipelineInstanceId: "instance-1",
@@ -3649,12 +3649,12 @@ describe("execution unit store", () => {
     store.settleUnitTerminal({ parentAttemptId: "attempt-parent", unitId: "a", reason: "structural_exit" });
 
     const outboxIds = db!.prepare(
-      "SELECT linear_outbox_id FROM execution_publication_events WHERE parent_attempt_id = ?"
-    ).all("attempt-parent") as Array<{ linear_outbox_id: string }>;
+      "SELECT control_outbox_id FROM execution_publication_events WHERE parent_attempt_id = ?"
+    ).all("attempt-parent") as Array<{ control_outbox_id: string }>;
     expect(outboxIds).toHaveLength(1);
     // Linear's AgentActivityCreateInput.id is client-supplied and must be
     // RFC-4122-shaped, same as every other id on this path (deterministicPublicationId).
-    expect(outboxIds[0]!.linear_outbox_id).toMatch(
+    expect(outboxIds[0]!.control_outbox_id).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
     );
   });
@@ -3690,16 +3690,16 @@ describe("execution unit store", () => {
     // The repair round produced exactly one durable event, inserted in the same
     // transaction as the state change. The read path must expose it immediately
     // from that durable row rather than waiting on the event's own correlated
-    // linear_outbox activity to be delivered -- delivery of that activity is a
+    // control_outbox activity to be delivered -- delivery of that activity is a
     // separate, independent concern from this projection converging.
     const activityLog = store.getStructuredExecutionPublication("attempt-parent")?.activity_log ?? [];
     expect(activityLog).toHaveLength(1);
     expect(activityLog[0]).toMatchObject({ kind: "unit_repair", unit_id: "a", sequence: 1 });
 
     const outboxId = db!.prepare(
-      "SELECT linear_outbox_id FROM execution_publication_events WHERE parent_attempt_id = ?"
-    ).get("attempt-parent") as { linear_outbox_id: string };
-    const outboxRow = db!.prepare("SELECT status FROM linear_outbox WHERE id = ?").get(outboxId.linear_outbox_id) as { status: string };
+      "SELECT control_outbox_id FROM execution_publication_events WHERE parent_attempt_id = ?"
+    ).get("attempt-parent") as { control_outbox_id: string };
+    const outboxRow = db!.prepare("SELECT status FROM control_outbox WHERE id = ?").get(outboxId.control_outbox_id) as { status: string };
     expect(outboxRow.status).toBe("pending");
   });
 });
