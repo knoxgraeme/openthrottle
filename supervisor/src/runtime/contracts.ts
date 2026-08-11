@@ -132,6 +132,10 @@ export interface LoopActionResult {
   // action-scoped CODEX_HOME rotated its OAuth refresh token. Never derived
   // from agent-authored text.
   codexAuthJson?: string | null;
+  // Present only for terminal receipt-correction exhaustion/mutation failure.
+  // Contains a private, bounded recovery artifact persisted by the supervisor
+  // before the sandbox may be cleaned up.
+  recoveryArtifact?: string | null;
 }
 
 export interface ChildExecutorActionRequest {

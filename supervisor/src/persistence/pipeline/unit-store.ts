@@ -235,12 +235,14 @@ export interface ExecutionUnitStore {
     outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
     lastError: string;
     nativeSessionId?: string | null;
+    terminalPayload?: string;
   }): ExecutionWorkAttempt;
   stopRetryableUnitAction(input: {
     actionId: string;
     resultHash: string;
     lastError: string;
     nativeSessionId?: string | null;
+    terminalPayload?: string;
     observationExhaustion?: {
       expectedFailureCount: number;
       expectedEpoch: number;
@@ -638,13 +640,15 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     resultHash: string;
     nativeSessionId?: string | null;
     lastError: string;
+    terminalPayload?: string;
   }): void {
     if (
       input.action.status !== input.status ||
       input.action.terminal_result_outcome !== input.outcome ||
       input.action.result_hash !== input.resultHash ||
       input.action.last_error !== input.lastError ||
-      (input.nativeSessionId !== undefined && input.action.native_session_id !== input.nativeSessionId)
+      (input.nativeSessionId !== undefined && input.action.native_session_id !== input.nativeSessionId) ||
+      (input.terminalPayload !== undefined && input.action.payload !== input.terminalPayload)
     ) {
       throw new Error(`execution work attempt ${input.action.id} already terminated with a different result`);
     }
@@ -1113,6 +1117,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         resultHash: input.resultHash,
         nativeSessionId: input.nativeSessionId,
         lastError,
+        terminalPayload: input.terminalPayload,
       });
       return action;
     }
@@ -1126,9 +1131,19 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       UPDATE execution_work_attempts
       SET status = 'failed', result_hash = ?, terminal_result_outcome = ?,
           native_session_id = COALESCE(?, native_session_id),
+          payload = COALESCE(?, payload),
           lease_until = NULL, last_error = ?, completed_at = ?, updated_at = ?
       WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
-    `).run(input.resultHash, input.outcome, input.nativeSessionId ?? null, lastError, timestamp, timestamp, input.actionId);
+    `).run(
+      input.resultHash,
+      input.outcome,
+      input.nativeSessionId ?? null,
+      input.terminalPayload ?? null,
+      lastError,
+      timestamp,
+      timestamp,
+      input.actionId
+    );
     if (update.changes !== 1) throw new Error(`execution work attempt ${input.actionId} failure compare-and-set failed`);
     if (action.execution_unit_id && action.unit_id) {
       const unitUpdate = db.prepare(`
@@ -1189,6 +1204,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         resultHash: input.resultHash,
         nativeSessionId: input.nativeSessionId,
         lastError,
+        terminalPayload: input.terminalPayload,
       });
       return action;
     }
@@ -1202,6 +1218,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       UPDATE execution_work_attempts
       SET status = 'dead', result_hash = ?, terminal_result_outcome = 'retryable_infrastructure_failure',
           native_session_id = COALESCE(?, native_session_id),
+          payload = COALESCE(?, payload),
           lease_until = NULL,
           observation_failure_count = CASE WHEN ? IS NULL THEN observation_failure_count ELSE ? END,
           observation_retry_at = CASE WHEN ? IS NULL THEN observation_retry_at ELSE NULL END,
@@ -1211,6 +1228,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     `).run(
       input.resultHash,
       input.nativeSessionId ?? null,
+      input.terminalPayload ?? null,
       observationExhaustion?.expectedFailureCount ?? null,
       observationExhaustion?.exhaustedFailureCount ?? null,
       observationExhaustion?.expectedFailureCount ?? null,

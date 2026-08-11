@@ -3636,7 +3636,7 @@ describe("executeLoopAction", () => {
         timedOut: false,
         stdout: JSON.stringify(goodReceipt),
         stderr: "",
-        nativeSessionId: "native-correction",
+        nativeSessionId: "native-correction-helper",
         integrationRepoDir: "/tmp/integration-current",
       });
 
@@ -3650,12 +3650,15 @@ describe("executeLoopAction", () => {
     });
 
     expect(result.outcome).toBe("success");
+    expect(result.native_session_id).toBe("native-correction");
     expect(result.subject).toBe(originalSubject);
     expect(computeWorkspaceTreeOid(loopWorktreeDirectory(valid))).toBe(originalSubject);
     expect(runLoopAgent).toHaveBeenCalledTimes(2);
     expect(runLoopAgent.mock.calls[1][0]).toMatchObject({
-      invocation: { mode: "resume", nativeSessionId: "native-correction" },
+      invocation: { mode: "fresh", nativeSessionId: null },
       request: {
+        nativeSessionId: null,
+        contextPolicy: "fresh",
         worktree: null,
         allowedMcpServers: [],
         credentialScopes: ["model.invoke"],
@@ -3686,6 +3689,8 @@ describe("executeLoopAction", () => {
         }
         if (options.input.includes("receipt-correction continuation")) {
           correctionLaunchCwd = options.cwd;
+          expect(args.invocation).toEqual({ mode: "fresh", nativeSessionId: null });
+          expect(args.request).toMatchObject({ nativeSessionId: null, contextPolicy: "fresh" });
           expect(options.cwd).toMatch(/repo-view$/);
           expect(options.cwd).not.toBe(loopWorktreeDirectory(valid));
           expect(processArgs).not.toContain("--dangerously-bypass-approvals-and-sandbox");
@@ -3792,7 +3797,7 @@ describe("executeLoopAction", () => {
         timedOut: false,
         stdout: JSON.stringify(goodReceipt),
         stderr: "",
-        nativeSessionId: "native-review",
+        nativeSessionId: "native-review-helper",
         integrationRepoDir,
       });
 
@@ -3807,6 +3812,7 @@ describe("executeLoopAction", () => {
     });
 
     expect(result.outcome).toBe("success");
+    expect(result.native_session_id).toBe("native-review");
     expect(result.subject).toBe(subject);
     expect(runLoopAgent).toHaveBeenCalledTimes(2);
     expect(runLoopAgent.mock.calls[1][0].request).toMatchObject({
@@ -3861,7 +3867,14 @@ describe("executeLoopAction", () => {
     expect(result.receipt).toContain("agent_output_contract_failure");
     expect(result.receipt).toContain("receipt correction exhausted after 1 attempt");
     expect(result.receipt).toContain("/payload/status");
-    expect(result.receipt).toContain("private_recovery_commit=");
+    expect(result.receipt).toContain("private_recovery_artifact=");
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      schema: "openthrottle.loop-receipt-recovery/v1",
+      action_id: valid.actionId,
+      attempt_id: valid.attemptId,
+      request_hash: valid.requestHash,
+      subject: originalSubject,
+    });
   });
 
   it("resumes a persisted receipt correction without relaunching the implementation", () => {
@@ -3879,7 +3892,9 @@ describe("executeLoopAction", () => {
         integrationRepoDir: "/tmp/integration-current",
       })
       .mockImplementationOnce(() => {
-        throw new Error("correction dispatch interrupted");
+        const error = new Error("correction dispatch interrupted");
+        error.retryableInfrastructureFailure = true;
+        throw error;
       });
 
     const first = executeLoopActionWithIntegration({
@@ -3891,7 +3906,8 @@ describe("executeLoopAction", () => {
       now: () => "2026-07-29T00:00:00.000Z",
     });
 
-    expect(first.outcome).toBe("failure");
+    expect(first.outcome).toBe("retryable_infrastructure_failure");
+    expect(first.receipt).toContain("receipt correction infrastructure failure");
     expect(firstRunLoopAgent).toHaveBeenCalledTimes(2);
     const resumedRunLoopAgent = vi.fn().mockReturnValueOnce({
       status: 0,
@@ -3899,7 +3915,7 @@ describe("executeLoopAction", () => {
       timedOut: false,
       stdout: JSON.stringify(goodReceipt),
       stderr: "",
-      nativeSessionId: "native-correction",
+      nativeSessionId: "native-resumed-helper",
       integrationRepoDir: "/tmp/integration-current",
     });
 
@@ -3913,13 +3929,55 @@ describe("executeLoopAction", () => {
     });
 
     expect(resumed.outcome).toBe("success");
+    expect(resumed.native_session_id).toBe("native-correction");
     expect(resumedRunLoopAgent).toHaveBeenCalledTimes(1);
     expect(resumedRunLoopAgent.mock.calls[0][0].request).toMatchObject({
+      nativeSessionId: null,
+      contextPolicy: "fresh",
       worktree: null,
       allowedMcpServers: [],
       credentialScopes: ["model.invoke"],
     });
     expect(resumedRunLoopAgent.mock.calls[0][0].request.receiptCorrectionPrompt).toContain("/payload/status");
+  });
+
+  it("classifies receipt correction process failures as retryable infrastructure without exhausting the receipt contract", () => {
+    const valid = request();
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = { ...goodReceipt, payload: { ...goodReceipt.payload, status: "done" } };
+    const runLoopAgent = vi.fn()
+      .mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(badReceipt),
+        stderr: "",
+        nativeSessionId: "native-correction",
+        integrationRepoDir: "/tmp/integration-current",
+      })
+      .mockReturnValueOnce({
+        status: null,
+        signal: null,
+        timedOut: true,
+        stdout: "",
+        stderr: "provider did not return before timeout",
+        nativeSessionId: null,
+        integrationRepoDir: "/tmp/integration-current",
+      });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(result.receipt).toContain("receipt correction infrastructure failure");
+    expect(result.receipt).not.toContain("agent_output_contract_failure");
+    expect(result.recovery_artifact).toBeUndefined();
   });
 
   it("rejects a correction that mutates the candidate tree instead of accepting the receipt", () => {
@@ -3962,7 +4020,12 @@ describe("executeLoopAction", () => {
     expect(result.outcome).toBe("failure");
     expect(result.subject).toBe(originalSubject);
     expect(result.receipt).toContain("receipt correction mutated the candidate tree");
-    expect(result.receipt).toContain("private_recovery_commit=");
+    expect(result.receipt).toContain("private_recovery_artifact=");
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      schema: "openthrottle.loop-receipt-recovery/v1",
+      action_id: valid.actionId,
+      subject: originalSubject,
+    });
   });
 
   it("names the nested validator defect and keeps the model's final message when a receipt misses a field", () => {

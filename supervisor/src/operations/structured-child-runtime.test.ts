@@ -1323,6 +1323,72 @@ describe("structured child runtime repair fences", () => {
     }));
   });
 
+  it("persists a loop receipt recovery artifact on terminal action failure", async () => {
+    const recoveryArtifact = canonicalJson({
+      schema: "openthrottle.loop-receipt-recovery/v1",
+      action_id: "implement-recovery",
+      attempt_id: "parent-attempt",
+      request_hash: "b".repeat(64),
+      subject: "a".repeat(40),
+      candidate_tree: "c".repeat(40),
+      diff_base64: "",
+      diff_truncated: false,
+    });
+    const implement = action({
+      id: "implement-recovery",
+      action_kind: "implement",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 1,
+      request_hash: "b".repeat(64),
+      request_launch_state: "launched",
+    });
+    const failUnitAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        collectLoopActionResult: async () => ({
+          actionId: implement.id,
+          attemptId: "parent-attempt",
+          requestHash: "b".repeat(64),
+          outcome: "failure",
+          nativeSessionId: "native-1",
+          subject: "a".repeat(40),
+          receipt: "agent_output_contract_failure: receipt correction exhausted",
+          recoveryArtifact,
+          completedAt: "2099-07-22T12:00:00.000Z",
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => implement,
+        failUnitAction,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+    } as any, "parent-attempt");
+
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: implement.id,
+      outcome: "failure",
+      nativeSessionId: "native-1",
+      terminalPayload: canonicalJson({
+        schema: "openthrottle.execution-work-terminal-payload/v1",
+        receipt_recovery_artifact: JSON.parse(recoveryArtifact),
+      }),
+    }));
+  });
+
   it("reseals deterministic worker worktrees and carries full plan context on requestless dispatch replay", async () => {
     const implement = action({
       id: "implement-replay",

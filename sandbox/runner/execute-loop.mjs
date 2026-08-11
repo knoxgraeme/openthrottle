@@ -110,6 +110,7 @@ const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
 const RECEIPT_CORRECTION_MODEL_HELPER = fileURLToPath(new URL("./receipt-correction-model.mjs", import.meta.url));
 const RECEIPT_CORRECTION_ATTEMPTS = 1;
+const MAX_PRIVATE_RECOVERY_DIFF_BYTES = 48 * 1024;
 const ROOT_UID = 0;
 const ROOT_GID = 0;
 const ABSOLUTE_PATH = /^\/[^\u0000]{0,500}$/;
@@ -444,6 +445,23 @@ function runRootGit(repoDir, args, env = {}, { safeDirectories = [] } = {}) {
     throw new Error(`git ${args.join(" ")} failed: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-800)}`);
   }
   return result.stdout.trim();
+}
+
+function runRootGitRaw(repoDir, args, env = {}, { safeDirectories = [] } = {}) {
+  const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir, safeDirectories), ...args], {
+    cwd: repoDir,
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: "0",
+      ...env,
+    },
+    timeout: 120_000,
+    captureBytes: 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-800)}`);
+  }
+  return result.stdout;
 }
 
 export function createLoopRequestHash(requestWithoutFence) {
@@ -1051,6 +1069,8 @@ function receiptCorrectionRuntimeRequest(request, prompt, { subject = null, gitO
     ...request,
     role: "reviewer",
     loop: "review",
+    nativeSessionId: null,
+    contextPolicy: "fresh",
     worktree: null,
     candidateSubject: null,
     priorEvidence: undefined,
@@ -1061,6 +1081,56 @@ function receiptCorrectionRuntimeRequest(request, prompt, { subject = null, gitO
     ...receiptCorrectionRepositorySource(request, subject, gitObjectEnv),
     receiptCorrectionPrompt: prompt,
   };
+}
+
+function receiptCorrectionInvocation() {
+  return { mode: "fresh", nativeSessionId: null };
+}
+
+function receiptCorrectionInfrastructureFailure({ request, execution = null, error = null, credentialEnv = {}, sanitizeEnv }) {
+  if (error?.retryableInfrastructureFailure) {
+    return sanitizeArtifactText(
+      `receipt correction infrastructure failure: ${error instanceof Error ? error.message : String(error)}`,
+      sanitizeEnv
+    ).slice(0, 2_000);
+  }
+  if (!execution) return null;
+  if (execution.retryableInfrastructureFailure) {
+    return sanitizeArtifactText(
+      `receipt correction infrastructure failure: ${execution.stderr || "executor reported a retryable infrastructure failure"}`,
+      sanitizeEnv
+    ).slice(0, 2_000);
+  }
+  if (execution.timedOut) {
+    return "receipt correction infrastructure failure: correction process timed out";
+  }
+  if (execution.signal) {
+    return sanitizeArtifactText(
+      `receipt correction infrastructure failure: correction process terminated by signal ${execution.signal}`,
+      sanitizeEnv
+    ).slice(0, 2_000);
+  }
+  if (execution.status === 0) return null;
+  const launchFailure = classifyLaunchFailure({
+    agent: request.agent,
+    stdout: execution.stdout ?? "",
+    stderr: execution.stderr ?? "",
+    credentialPresent: engineCredentialPresent(
+      request.agent,
+      request.credentialScopes.includes("model.invoke") ? credentialEnv : undefined,
+    ),
+  });
+  if (!launchFailure.retryable) return null;
+  const tail = launchDiagnosticTail({
+    stdout: execution.stdout ?? "",
+    stderr: execution.stderr ?? "",
+    env: sanitizeEnv,
+  });
+  return sanitizeArtifactText([
+    `receipt correction failed (reason=${launchFailure.reason})`,
+    launchFailure.remediation,
+    tail,
+  ].filter(Boolean).join(" "), sanitizeEnv).slice(0, 2_000);
 }
 
 function readReceiptCorrectionState(request) {
@@ -1470,8 +1540,15 @@ function receiptCorrectionPrompt({ request, invalidReceipt, diagnostics, invalid
     `## Invalid Receipt Candidate\n${invalid}`;
 }
 
-function privateRecoveryReference(request, worktreeDir, subject, env) {
-  if (!worktreeDir) return subject ? `private_recovery_subject=${subject}` : "private_recovery_subject=unavailable";
+function privateRecoveryArtifact(request, worktreeDir, subject, env) {
+  const base = {
+    schema: "openthrottle.loop-receipt-recovery/v1",
+    action_id: request.actionId,
+    attempt_id: request.attemptId,
+    request_hash: request.requestHash,
+    subject: subject ?? null,
+  };
+  if (!worktreeDir) return { ...base, recovery_subject: subject ?? null, error: "worktree unavailable" };
   try {
     const baseCommit = request.inputSubject ?? request.baseSubject ?? runRootGit(worktreeDir, ["rev-parse", "HEAD"]);
     const candidate = deriveCandidateCommit({
@@ -1479,13 +1556,35 @@ function privateRecoveryReference(request, worktreeDir, subject, env) {
       baseCommit,
       message: `OpenThrottle private receipt recovery ${request.actionId}`,
     });
-    return `private_recovery_commit=${candidate.candidateCommit ?? "<clean>"} tree=${candidate.tree}`;
+    const diff = runRootGitRaw(worktreeDir, ["diff", "--binary", "--full-index", `${baseCommit}^{tree}`, candidate.tree]);
+    const diffBytes = Buffer.byteLength(diff, "utf8");
+    return {
+      ...base,
+      base_commit: baseCommit,
+      candidate_commit: candidate.candidateCommit ?? null,
+      candidate_tree: candidate.tree,
+      changed_paths: candidate.changedPaths ?? [],
+      diff_base64: diffBytes <= MAX_PRIVATE_RECOVERY_DIFF_BYTES ? Buffer.from(diff, "utf8").toString("base64") : null,
+      diff_bytes: diffBytes,
+      diff_truncated: diffBytes > MAX_PRIVATE_RECOVERY_DIFF_BYTES,
+    };
   } catch (error) {
-    return sanitizeArtifactText(
-      `private_recovery_subject=${subject ?? "unavailable"} recovery_commit_error=${error instanceof Error ? error.message : String(error)}`,
-      env
-    ).slice(0, 1_000);
+    return {
+      ...base,
+      recovery_subject: subject ?? null,
+      error: sanitizeArtifactText(error instanceof Error ? error.message : String(error), env).slice(0, 1_000),
+    };
   }
+}
+
+function privateRecoveryReference(artifact) {
+  const artifactHash = digest(canonicalJson(artifact));
+  return [
+    `private_recovery_artifact=${artifactHash}`,
+    artifact.candidate_commit ? `commit=${artifact.candidate_commit}` : null,
+    artifact.candidate_tree ? `tree=${artifact.candidate_tree}` : null,
+    artifact.subject ? `subject=${artifact.subject}` : null,
+  ].filter(Boolean).join(" ");
 }
 
 function assertLoopReceiptFence(receipt, request, subject) {
@@ -1658,6 +1757,8 @@ export function executeLoopAction({
     let correctionExecution = null;
     let correctionDiagnostics = [];
     let recoveryReference = null;
+    let recoveryArtifact = null;
+    let correctionRetryableInfrastructureFailure = null;
     if (persistedCorrectionState) {
       receiptError = persistedCorrectionState.original_error;
       correctionDiagnostics = persistedCorrectionState.diagnostics;
@@ -1675,15 +1776,14 @@ export function executeLoopAction({
         subject,
         gitObjectEnv: execution.gitObjectEnv ?? null,
       });
-      const correctionInvocation = execution.nativeSessionId
-        ? { mode: "resume", nativeSessionId: execution.nativeSessionId }
-        : resolveLoopInvocation(request);
+      const correctionInvocation = receiptCorrectionInvocation();
+      const correctionCredentialEnv = receiptCorrectionCredentialEnv(request, credentialEnv);
       try {
         correctionExecution = runLoopAgent({
           request: correctionRequest,
           invocation: correctionInvocation,
           integrationRepoDir,
-          credentialEnv: receiptCorrectionCredentialEnv(request, credentialEnv),
+          credentialEnv: correctionCredentialEnv,
         });
         if (correctionExecution.codexAuthJson) {
           sanitizeEnv = { ...sanitizeEnv, OT_ROTATED_CODEX_AUTH_JSON: correctionExecution.codexAuthJson };
@@ -1706,14 +1806,33 @@ export function executeLoopAction({
           receiptError = null;
           receiptErrorObject = null;
         } else {
+          const retryableCorrection = receiptCorrectionInfrastructureFailure({
+            request,
+            execution: correctionExecution,
+            credentialEnv: correctionCredentialEnv,
+            sanitizeEnv,
+          });
+          if (retryableCorrection) {
+            correctionRetryableInfrastructureFailure = retryableCorrection;
+          } else {
           const correctionFailure = launchDiagnosticTail({
             stdout: correctionExecution.stdout ?? "",
             stderr: correctionExecution.stderr ?? "",
             env: sanitizeEnv,
           });
           throw new Error(correctionFailure || "receipt correction did not exit successfully");
+          }
         }
       } catch (error) {
+        const retryableCorrection = receiptCorrectionInfrastructureFailure({
+          request,
+          error,
+          credentialEnv: correctionCredentialEnv,
+          sanitizeEnv,
+        });
+        if (retryableCorrection) {
+          correctionRetryableInfrastructureFailure = retryableCorrection;
+        } else {
         receiptError = [
           `agent_output_contract_failure: receipt correction exhausted after ${RECEIPT_CORRECTION_ATTEMPTS} attempt`,
           `original=${receiptError}`,
@@ -1721,7 +1840,9 @@ export function executeLoopAction({
           `diagnostics=${canonicalJson(correctionDiagnostics)}`,
         ].join(" ");
         const worktreeDir = loopWorktreeDirectory(request);
-        recoveryReference = privateRecoveryReference(request, worktreeDir, subject, sanitizeEnv);
+          recoveryArtifact = privateRecoveryArtifact(request, worktreeDir, subject, sanitizeEnv);
+          recoveryReference = privateRecoveryReference(recoveryArtifact);
+        }
       }
     } else if (!subjectError && !execution.timedOut && !execution.signal && execution.status === 0) {
       try {
@@ -1760,15 +1881,14 @@ export function executeLoopAction({
           subject,
           gitObjectEnv: execution.gitObjectEnv ?? null,
         });
-        const correctionInvocation = execution.nativeSessionId
-          ? { mode: "resume", nativeSessionId: execution.nativeSessionId }
-          : resolveLoopInvocation(request);
+        const correctionInvocation = receiptCorrectionInvocation();
+        const correctionCredentialEnv = receiptCorrectionCredentialEnv(request, credentialEnv);
         try {
           correctionExecution = runLoopAgent({
             request: correctionRequest,
             invocation: correctionInvocation,
             integrationRepoDir,
-            credentialEnv: receiptCorrectionCredentialEnv(request, credentialEnv),
+            credentialEnv: correctionCredentialEnv,
           });
           if (correctionExecution.codexAuthJson) {
             sanitizeEnv = { ...sanitizeEnv, OT_ROTATED_CODEX_AUTH_JSON: correctionExecution.codexAuthJson };
@@ -1791,14 +1911,33 @@ export function executeLoopAction({
             receiptError = null;
             receiptErrorObject = null;
           } else {
+            const retryableCorrection = receiptCorrectionInfrastructureFailure({
+              request,
+              execution: correctionExecution,
+              credentialEnv: correctionCredentialEnv,
+              sanitizeEnv,
+            });
+            if (retryableCorrection) {
+              correctionRetryableInfrastructureFailure = retryableCorrection;
+            } else {
             const correctionFailure = launchDiagnosticTail({
               stdout: correctionExecution.stdout ?? "",
               stderr: correctionExecution.stderr ?? "",
               env: sanitizeEnv,
             });
             throw new Error(correctionFailure || "receipt correction did not exit successfully");
+            }
           }
         } catch (error) {
+          const retryableCorrection = receiptCorrectionInfrastructureFailure({
+            request,
+            error,
+            credentialEnv: correctionCredentialEnv,
+            sanitizeEnv,
+          });
+          if (retryableCorrection) {
+            correctionRetryableInfrastructureFailure = retryableCorrection;
+          } else {
           receiptError = [
             `agent_output_contract_failure: receipt correction exhausted after ${RECEIPT_CORRECTION_ATTEMPTS} attempt`,
             `original=${receiptError}`,
@@ -1806,11 +1945,14 @@ export function executeLoopAction({
             `diagnostics=${canonicalJson(correctionDiagnostics)}`,
           ].join(" ");
           const worktreeDir = loopWorktreeDirectory(request);
-          recoveryReference = privateRecoveryReference(request, worktreeDir, subject, sanitizeEnv);
+            recoveryArtifact = privateRecoveryArtifact(request, worktreeDir, subject, sanitizeEnv);
+            recoveryReference = privateRecoveryReference(recoveryArtifact);
+          }
         }
       }
     }
-    const retryableInfrastructureFailure = Boolean(execution.retryableInfrastructureFailure);
+    const retryableInfrastructureFailure = Boolean(execution.retryableInfrastructureFailure) ||
+      Boolean(correctionRetryableInfrastructureFailure);
     const failed = Boolean(subjectError) || execution.timedOut || execution.signal || execution.status !== 0 || Boolean(receiptError);
     // The agent process itself died: classify why (missing credential, rejected
     // credential, provider usage limit, or a genuine crash) and carry a
@@ -1871,13 +2013,14 @@ export function executeLoopAction({
       outcome: retryableInfrastructureFailure || launchFailure?.retryable
         ? "retryable_infrastructure_failure"
         : failed ? "failure" : "success",
-      native_session_id: correctionExecution?.nativeSessionId ?? execution.nativeSessionId ?? request.nativeSessionId ?? null,
+      native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
       subject: subject ?? parsedReceipt?.subject?.post ?? null,
       receipt: parsedReceipt && !receiptError
         ? canonicalJson(parsedReceipt)
         : sanitizeArtifactText(retryableInfrastructureFailure
-          ? execution.stderr || "loop action infrastructure failure"
+          ? execution.stderr || correctionRetryableInfrastructureFailure || "loop action infrastructure failure"
           : failureNarrative, sanitizeEnv).slice(0, 128_000),
+      ...(recoveryArtifact ? { recovery_artifact: canonicalJson(recoveryArtifact) } : {}),
       created_at: now(),
       // Never derived from agent-authored stdout/stderr (which is sanitized
       // and truncated above): this travels as its own typed field so a

@@ -244,6 +244,22 @@ function parseCollectedStageResult(raw: string, attemptId: string): StageExecuti
 function parseCollectedLoopResult(raw: string, input: { attemptId: string; actionId: string; requestHash: string }): LoopActionResult {
   if (Buffer.byteLength(raw, "utf8") > 256 * 1024) throw new Error("sealed loop result exceeds 256 KiB");
   const event = JSON.parse(raw) as Record<string, unknown>;
+  let recoveryArtifact: string | null = null;
+  if (event.recovery_artifact !== undefined) {
+    if (typeof event.recovery_artifact !== "string" ||
+        Buffer.byteLength(event.recovery_artifact, "utf8") > 128 * 1024) {
+      throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} has an invalid recovery artifact`);
+    }
+    const artifact = JSON.parse(event.recovery_artifact) as Record<string, unknown>;
+    if (artifact.schema !== "openthrottle.loop-receipt-recovery/v1" ||
+        artifact.action_id !== input.actionId ||
+        artifact.attempt_id !== input.attemptId ||
+        artifact.request_hash !== input.requestHash ||
+        (artifact.subject !== null && (typeof artifact.subject !== "string" || !/^[a-f0-9]{40,64}$/.test(artifact.subject)))) {
+      throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} has an invalid recovery artifact fence`);
+    }
+    recoveryArtifact = event.recovery_artifact;
+  }
   if (event.kind !== "loop_action_result" || event.version !== 1 || event.action_id !== input.actionId ||
       event.attempt_id !== input.attemptId || event.request_hash !== input.requestHash ||
       !["success", "failure", "needs_human", "retryable_infrastructure_failure"].includes(String(event.outcome)) ||
@@ -265,6 +281,7 @@ function parseCollectedLoopResult(raw: string, input: { attemptId: string; actio
     receipt: event.receipt as string,
     completedAt: event.created_at as string,
     ...(typeof event.codex_auth_json === "string" ? { codexAuthJson: event.codex_auth_json } : {}),
+    ...(recoveryArtifact ? { recoveryArtifact } : {}),
   };
 }
 

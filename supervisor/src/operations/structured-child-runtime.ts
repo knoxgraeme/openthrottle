@@ -85,6 +85,14 @@ const GIT_SHA1_SUBJECT = /^[a-f0-9]{40}$/;
 // the 2,000-char budget the store applies (unit-store.ts) with room to spare.
 const DIAGNOSTIC_TEXT_HEAD_CHARS = 1_500;
 
+function terminalPayloadForLoopResult(result: LoopActionResult): string | undefined {
+  if (!result.recoveryArtifact) return undefined;
+  return canonicalJson({
+    schema: "openthrottle.execution-work-terminal-payload/v1",
+    receipt_recovery_artifact: JSON.parse(result.recoveryArtifact) as unknown,
+  });
+}
+
 class RetryableReviewRuntimeError extends Error {
   constructor(operation: string, cause: unknown) {
     const observed = serializeRuntimeObservationError(operation, cause);
@@ -1000,6 +1008,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     resultHash: string;
     outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
     lastError: string;
+    terminalPayload?: string;
   }> => {
     const receipts: SemanticReviewReceipt[] = [];
     const receiptResults: Array<{
@@ -1034,6 +1043,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
               ? "needs_human"
               : "failure",
           lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
+          terminalPayload: terminalPayloadForLoopResult(result),
         };
       }
       let receipt: StandardReceipt;
@@ -1129,6 +1139,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     resultHash: string;
     outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
     lastError: string;
+    terminalPayload?: string;
   }> => {
     const result = input.precollected ?? await reviewRuntimeCall(
       `review subaction ${input.request.actionId} result collection failed`,
@@ -1148,6 +1159,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           ? "retryable_infrastructure_failure"
           : result.outcome === "needs_human" ? "needs_human" : "failure",
         lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
+        terminalPayload: terminalPayloadForLoopResult(result),
       };
     }
     let receipt: StandardReceipt;
@@ -2133,6 +2145,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
     lastError: string;
     nativeSessionId?: string | null;
+    terminalPayload?: string;
   } | null> => {
     if (!action.request_hash) return null;
     if (action.action_kind === "final_review") {
@@ -2226,7 +2239,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     // head (not tail): the tail is byte-identical padding across different
     // failure reasons, while the head is the one place the classification
     // signal actually lives.
-    const receiptIsDiagnosticText = isChildExecutorActionKind(action.action_kind)
+    const actionIsChildExecutor = isChildExecutorActionKind(action.action_kind);
+    const receiptIsDiagnosticText = actionIsChildExecutor
       ? result.outcome === "retryable_infrastructure_failure"
       : result.outcome !== "success";
     if (receiptIsDiagnosticText) {
@@ -2241,6 +2255,9 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         outcome,
         lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
         nativeSessionId,
+        terminalPayload: actionIsChildExecutor
+          ? undefined
+          : terminalPayloadForLoopResult(result as LoopActionResult),
       };
     }
     let receipt: StandardReceipt;

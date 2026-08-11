@@ -1312,6 +1312,10 @@ describe("execution unit store", () => {
       leaseUntilIso: "2026-07-29T00:01:00.000Z",
     })!;
     store.markActionDispatched(failed.id, "request-hash", "native-session");
+    const terminalPayload = JSON.stringify({
+      schema: "openthrottle.execution-work-terminal-payload/v1",
+      receipt_recovery_artifact: { schema: "openthrottle.loop-receipt-recovery/v1" },
+    });
 
     expect(store.failUnitAction({
       actionId: failed.id,
@@ -1319,6 +1323,7 @@ describe("execution unit store", () => {
       outcome: "failure",
       lastError: "child action returned failure",
       nativeSessionId: "native-session-2",
+      terminalPayload,
     })).toMatchObject({
       id: failed.id,
       status: "failed",
@@ -1326,6 +1331,7 @@ describe("execution unit store", () => {
       result_hash: "result-hash",
       native_session_id: "native-session-2",
       last_error: "child action returned failure",
+      payload: terminalPayload,
     });
     expect(store.listUnits("attempt-parent")).toEqual([
       expect.objectContaining({
@@ -1349,7 +1355,16 @@ describe("execution unit store", () => {
       outcome: "failure",
       lastError: "child action returned failure",
       nativeSessionId: "native-session-2",
+      terminalPayload,
     })).toMatchObject({ id: failed.id, status: "failed" });
+    expect(() => store.failUnitAction({
+      actionId: failed.id,
+      resultHash: "result-hash",
+      outcome: "failure",
+      lastError: "child action returned failure",
+      nativeSessionId: "native-session-2",
+      terminalPayload: JSON.stringify({ schema: "different" }),
+    })).toThrow(/already terminated with a different result/);
     expect(() => store.failUnitAction({
       actionId: failed.id,
       resultHash: "different-result",

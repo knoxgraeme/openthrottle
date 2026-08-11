@@ -25,6 +25,7 @@ export interface UnitEffectRuntime {
     outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
     lastError: string;
     nativeSessionId?: string | null;
+    terminalPayload?: string;
   } | null>;
 }
 
@@ -125,6 +126,7 @@ export function createUnitEffectProcessor(input: {
                 resultHash: recovered.resultHash,
                 lastError: recovered.lastError,
                 nativeSessionId: recovered.nativeSessionId,
+                terminalPayload: recovered.terminalPayload,
               });
               return action;
             }
@@ -134,6 +136,7 @@ export function createUnitEffectProcessor(input: {
               outcome: recovered.outcome,
               lastError: recovered.lastError,
               nativeSessionId: recovered.nativeSessionId,
+              terminalPayload: recovered.terminalPayload,
             });
             return action;
           }

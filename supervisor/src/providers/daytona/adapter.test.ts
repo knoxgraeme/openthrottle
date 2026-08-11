@@ -597,6 +597,75 @@ describe("Daytona stage execution", () => {
     })).rejects.toThrow(/invalid envelope/);
   });
 
+  it("parses a fenced private recovery artifact from terminal loop results", async () => {
+    const remoteFiles = new Map<string, Buffer>();
+    const sandbox = {
+      id: "provider-opaque-recovery",
+      state: "started",
+      fs: {
+        downloadFile: vi.fn(async (path: string) => {
+          const file = remoteFiles.get(path);
+          if (!file) throw new Error("not found");
+          return file;
+        }),
+      },
+    } as unknown as Sandbox;
+    const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+    const recoveryArtifact = canonicalJson({
+      schema: "openthrottle.loop-receipt-recovery/v1",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      request_hash: "a".repeat(64),
+      subject: "d".repeat(40),
+      candidate_tree: "e".repeat(40),
+      diff_base64: "",
+      diff_truncated: false,
+    });
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "loop_action_result",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      request_hash: "a".repeat(64),
+      outcome: "failure",
+      native_session_id: "thread-1",
+      subject: "d".repeat(40),
+      receipt: "agent_output_contract_failure",
+      recovery_artifact: recoveryArtifact,
+      created_at: "2026-07-22T00:00:00.000Z",
+    })));
+    await expect(runtime.collectLoopActionResult({ providerResourceId: "provider-opaque-recovery" }, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "a".repeat(64),
+    })).resolves.toMatchObject({
+      actionId: "loop-1",
+      recoveryArtifact,
+    });
+
+    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "loop_action_result",
+      action_id: "loop-1",
+      attempt_id: "attempt-child",
+      request_hash: "b".repeat(64),
+      outcome: "failure",
+      native_session_id: "thread-1",
+      subject: "d".repeat(40),
+      receipt: "agent_output_contract_failure",
+      recovery_artifact: recoveryArtifact,
+      created_at: "2026-07-22T00:00:00.000Z",
+    })));
+    await expect(runtime.collectLoopActionResult({ providerResourceId: "provider-opaque-recovery" }, {
+      attemptId: "attempt-child",
+      actionId: "loop-1",
+      requestHash: "b".repeat(64),
+    })).rejects.toThrow(/invalid recovery artifact fence/);
+  });
+
   it("refuses credentials outside the sandbox allowlist", async () => {
     const sandbox = {
       id: "provider-opaque-2",
