@@ -26,6 +26,7 @@
     "@clack/prompts": "^0.10.0",
     "@daytona/sdk": "^0.199.0",
     "@openthrottle/contracts": "file:../contracts",
+    "skillfish": "1.0.39",
     "yaml": "^2.6.1"
   },
   "bundleDependencies": [

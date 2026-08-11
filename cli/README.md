@@ -12,6 +12,8 @@ openthrottle ship <plan.md>
 openthrottle status
 openthrottle stop <ticket>
 openthrottle logs <ticket>
+openthrottle operator-skill install
+openthrottle operator-skill status --json
 ```
 
 - `setup` verifies the canonical Daytona snapshot when local Daytona
@@ -39,6 +41,12 @@ openthrottle logs <ticket>
   issue body, not in later comment or parent context.
 - `status`, `stop`, and `logs` call authenticated supervisor endpoints using
   `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN`.
+- `operator-skill install|status|refresh|remove` manages the explicit local
+  `openthrottle` agent skill through the pinned `skillfish` dependency. It
+  installs from the immutable public source recorded at CLI build time, disables
+  Skillfish telemetry for the embedded flow, never forwards OpenThrottle or
+  provider credentials, and scopes removal to the exact Skillfish-managed
+  OpenThrottle skill directory.
 
 Other environment values: `DAYTONA_API_KEY`/`DAYTONA_SNAPSHOT` for `setup`;
 optional `LINEAR_TEAM_KEY`/`LINEAR_TEAM_ID` defaults for `init`; and
@@ -58,6 +66,16 @@ and repair implementation loops only; review, simplification, publication, and
 structured-unit roles remain platform-owned until their graph bindings can be
 represented faithfully. Repository registrations live in the supervisor's
 durable SQLite database; they are not Fly secrets.
+
+Repositories can recommend the local skill in their own onboarding docs with:
+
+```bash
+openthrottle operator-skill install
+```
+
+Do not commit the installed skill, provider credentials, or user-global agent
+configuration. The canonical source remains `skills/operator/openthrottle/` in
+the public OpenThrottle repository.
 
 Development:
 
