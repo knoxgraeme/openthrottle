@@ -3820,6 +3820,134 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
+  it("keeps old-head feedback stale across nested command repair reentries", async () => {
+    const fixture = setup("core/implement@4");
+    const oldSubject = "1".repeat(40);
+    const oldHead = "a".repeat(40);
+    const firstRepairSubject = "2".repeat(40);
+    const repairedSubject = "3".repeat(40);
+    const repairedHead = "b".repeat(40);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    await settleRepairRoundPublishes(fixture, 1);
+
+    await routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "github-review:f1-provider-repair",
+      outcome: "semantic_repair_required",
+      summary: "F1 starts the provider repair from old head A.",
+      evidence: ["https://github.com/owner/repo/pull/1#pullrequestreview-f1"],
+      payload: { kind: "pull_request_review", id: "f1-provider-repair" },
+      headSha: oldHead,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    });
+    const providerRepairStartedAt = fixture.pipelines.listAttempts(fixture.instance.id)
+      .filter((attempt) => attempt.stage_id === "repair_implementation" && attempt.reentry_ordinal === 1)
+      .map((attempt) => attempt.created_at)
+      .sort()
+      .at(0);
+    expect(providerRepairStartedAt).toBeDefined();
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+
+    const f2ReceivedAt = new Date(Date.parse(providerRepairStartedAt!) + 1000).toISOString();
+    const f2Payload = canonicalJson({
+      outcome: "semantic_repair_required",
+      summary: "F2 is old-head feedback delivered after the provider repair started.",
+      evidence: ["https://github.com/owner/repo/pull/1#pullrequestreview-f2"],
+      payload: canonicalJson({ kind: "pull_request_review", id: "f2-old-head" }),
+    });
+    const f2Snapshot = fixture.tickets.recordProviderFeedback({
+      provider: "github",
+      providerEventId: "github-review:f2-old-head",
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
+      generation: fixture.instance.generation,
+      repository: fixture.instance.repository,
+      pullNumber: 1,
+      headSha: oldHead,
+      kind: "pipeline_provider_event",
+      payload: f2Payload,
+      workItemId: `pipeline-feedback:${fixture.instance.id}:${oldHead}`,
+      receivedAt: f2ReceivedAt,
+    }).snapshot;
+
+    let instance = settleCurrentStage(fixture, "success", {
+      id: "repair-implementation-f1",
+      subject: firstRepairSubject,
+      preSubject: oldSubject,
+    });
+    instance = settleCurrentStage(fixture, "success", {
+      id: "repair-semantic-review-f1",
+      subject: firstRepairSubject,
+      preSubject: firstRepairSubject,
+    });
+    expect(instance.active_stage_id).toBe("test");
+    instance = settleCurrentStage(fixture, "failure", {
+      id: "test-failure-f1",
+      subject: firstRepairSubject,
+      preSubject: firstRepairSubject,
+      details: { not_configured: false, timed_out: false, exit_code: 1, signal: null },
+    });
+    expect(instance.active_stage_id).toBe("repair_implementation");
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 2,
+    });
+
+    const publishing = settleForwardChainToPublish(fixture, repairedSubject, firstRepairSubject, 3);
+    expect(publishing.active_stage_id).toBe("publish");
+    settleCurrentStage(fixture, "success", {
+      id: "publish-repaired-head-after-command-repair",
+      subject: repairedSubject,
+      preSubject: repairedSubject,
+      details: {
+        proposal_schema: "openthrottle.stage-proposal/v1",
+        published_commit: repairedHead,
+        provider_revision: repairedHead,
+      },
+    });
+    fixture.tickets.setSetting("github-head:issue-1", repairedHead);
+
+    await routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: `github-pull-synchronize:owner/repo:1:${repairedHead}`,
+      outcome: "needs_human",
+      summary: "GitHub reported the repaired head synchronize.",
+      evidence: ["https://github.com/owner/repo/pull/1"],
+      payload: { kind: "pull_request", action: "synchronize" },
+      headSha: repairedHead,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    });
+    const repairsBeforeDrain = fixture.db.prepare(`
+      SELECT COUNT(*) FROM pipeline_stage_attempts
+      WHERE pipeline_instance_id = ? AND stage_id = 'repair_implementation'
+    `).pluck().get(fixture.instance.id) as number;
+
+    expect(await drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(0);
+
+    expect(fixture.db.prepare("SELECT status, head_sha, observed_head_sha FROM feedback_snapshots WHERE id = ?")
+      .get(f2Snapshot.id)).toEqual({
+      status: "stale",
+      head_sha: oldHead,
+      observed_head_sha: oldHead,
+    });
+    expect(fixture.db.prepare("SELECT payload FROM control_outbox WHERE id = ?")
+      .get(`feedback-snapshot-stale:${f2Snapshot.id}`)).toBeDefined();
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+    });
+    expect(fixture.db.prepare(`
+      SELECT COUNT(*) FROM pipeline_stage_attempts
+      WHERE pipeline_instance_id = ? AND stage_id = 'repair_implementation'
+    `).pluck().get(fixture.instance.id)).toBe(repairsBeforeDrain);
+  });
+
   it("replays an already-stale feedback snapshot without regenerating its notice", async () => {
     const fixture = setup("core/implement@4");
     const oldHead = "d".repeat(40);

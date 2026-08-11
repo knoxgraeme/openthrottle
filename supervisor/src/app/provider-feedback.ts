@@ -376,12 +376,49 @@ function currentRepairReentryStartedAt(pipelines: PipelineStore, instance: Pipel
     .at(0);
 }
 
-function snapshotFeedbackPredatesCurrentRepairReentry(
+function currentProviderRepairLineageStartedAt(
+  pipelines: PipelineStore,
+  instance: PipelineInstance
+): string | undefined {
+  if (instance.reentry_count <= 0) return undefined;
+  const attempts = pipelines.listAttempts(instance.id);
+  const currentProviderAttemptIndex = attempts
+    .map((attempt, index) => ({ attempt, index }))
+    .filter(({ attempt }) =>
+      attempt.stage_id === "provider" &&
+      attempt.reentry_ordinal <= instance.reentry_count
+    )
+    .at(-1)?.index;
+  if (currentProviderAttemptIndex === undefined) {
+    return currentRepairReentryStartedAt(pipelines, instance);
+  }
+  // A command/test failure can create nested repair reentries before the
+  // current provider wait. The stale-evidence cutoff is the first repair pass
+  // after the previous provider wait, not the latest nested reentry.
+  const previousProviderAttemptIndex = attempts
+    .slice(0, currentProviderAttemptIndex)
+    .map((attempt, index) => ({ attempt, index }))
+    .filter(({ attempt }) => attempt.stage_id === "provider")
+    .at(-1)?.index ?? -1;
+  const startedAt = attempts
+    .slice(previousProviderAttemptIndex + 1, currentProviderAttemptIndex)
+    .filter((attempt) =>
+      attempt.stage_id === "repair_implementation" &&
+      attempt.reentry_ordinal > 0 &&
+      attempt.reentry_ordinal <= instance.reentry_count
+    )
+    .map((attempt) => attempt.created_at)
+    .sort()
+    .at(0);
+  return startedAt ?? currentRepairReentryStartedAt(pipelines, instance);
+}
+
+function snapshotFeedbackPredatesCurrentProviderRepairLineage(
   pipelines: PipelineStore,
   snapshot: FeedbackSnapshot,
   instance: PipelineInstance
 ): boolean {
-  const repairStartedAt = currentRepairReentryStartedAt(pipelines, instance);
+  const repairStartedAt = currentProviderRepairLineageStartedAt(pipelines, instance);
   return repairStartedAt !== undefined && snapshot.provider_watermark < repairStartedAt;
 }
 
@@ -473,7 +510,7 @@ export function processPipelineFeedbackSnapshot(params: {
   // causal request for this republish. Later old-head feedback is not causal for
   // the repaired head even if publication acknowledgement has not happened yet.
   const canCarryPastFirstRepair = params.instance.reentry_count === 0 ||
-    snapshotFeedbackPredatesCurrentRepairReentry(params.pipelines, params.snapshot, params.instance);
+    snapshotFeedbackPredatesCurrentProviderRepairLineage(params.pipelines, params.snapshot, params.instance);
   const currentSnapshot = subjects && snapshotCanCarryForward(subjects, params.snapshot, params.instance)
     && canCarryPastFirstRepair
     ? params.store.carryForwardFeedbackSnapshot(
