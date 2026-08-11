@@ -30,6 +30,7 @@ interface GithubPullRequest {
   merged?: boolean;
   head: { ref: string; sha?: string };
   base: { ref: string };
+  user?: { login?: string };
 }
 
 interface GithubEventBase {
@@ -51,6 +52,7 @@ interface GithubReviewEvent extends GithubEventBase {
     id: number;
     state: string;
     html_url: string;
+    body?: string | null;
     user?: { login: string };
   };
 }
@@ -195,6 +197,8 @@ export const GITHUB_ISSUE_CONTEXT_FETCH_BYTE_LIMIT = 8 * 1024 * 1024;
 const GITHUB_ISSUE_EVENT_PAGE_LIMIT = 10;
 const GITHUB_ISSUE_TIMELINE_PAGE_LIMIT = 10;
 const GITHUB_ISSUE_TIMELINE_PAGE_BYTE_LIMIT = 512 * 1024;
+const GITHUB_REVIEW_COMMENTS_PAGE_LIMIT = 10;
+const GITHUB_REVIEW_COMMENTS_BYTE_LIMIT = 512 * 1024;
 
 export function classifyGithubIssueComment(
   event: GithubIssueCommentEvent
@@ -591,6 +595,58 @@ export async function fetchGithubIssueControlEvents(
     if (events.length < 100) return controlEvents;
   }
   throw new Error("GitHub Issue event history exceeded the bounded scan");
+}
+
+export interface GithubPullRequestReviewCommentRecord {
+  id: number;
+  inReplyToId?: number;
+}
+
+interface GithubPullRequestReviewCommentPayload {
+  id?: number;
+  in_reply_to_id?: number;
+}
+
+export async function fetchGithubPullRequestReviewComments(
+  client: GithubClient,
+  repo: string,
+  pullNumber: number,
+  reviewId: number
+): Promise<GithubPullRequestReviewCommentRecord[] | undefined> {
+  const records: GithubPullRequestReviewCommentRecord[] = [];
+  for (let page = 1; page <= GITHUB_REVIEW_COMMENTS_PAGE_LIMIT; page += 1) {
+    const comments = await githubBoundedJsonArrayRequest<GithubPullRequestReviewCommentPayload>(
+      client,
+      `/repos/${repo}/pulls/${pullNumber}/reviews/${reviewId}/comments?per_page=100${page === 1 ? "" : `&page=${page}`}`,
+      GITHUB_REVIEW_COMMENTS_BYTE_LIMIT
+    );
+    if (!comments) return undefined;
+    records.push(...comments.flatMap((comment) =>
+      Number.isSafeInteger(comment.id)
+        ? [{
+            id: comment.id!,
+            ...(Number.isSafeInteger(comment.in_reply_to_id)
+              ? { inReplyToId: comment.in_reply_to_id }
+              : {}),
+          }]
+        : []
+    ));
+    if (comments.length < 100) return records;
+  }
+  return undefined;
+}
+
+export async function fetchGithubPullRequestHeadSha(
+  client: GithubClient,
+  repo: string,
+  pullNumber: number
+): Promise<string> {
+  const pull = await githubRequest<{ head?: { sha?: string } }>(
+    client,
+    `/repos/${repo}/pulls/${pullNumber}`
+  );
+  if (!pull.head?.sha) throw new Error("GitHub pull request is missing head sha");
+  return pull.head.sha;
 }
 
 export async function fetchGithubIssueContext(
