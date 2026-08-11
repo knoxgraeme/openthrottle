@@ -1138,7 +1138,23 @@ export function buildStagePublication(input: {
 }
 
 export function parsePipelinePublication(payload: string): PipelinePublicationEnvelope {
-  const value = JSON.parse(payload) as PipelinePublicationEnvelope;
+  const raw = JSON.parse(payload) as PipelinePublicationEnvelope & {
+    pipeline?: PipelinePublicationEnvelope["pipeline"] & { linear_issue_id?: string };
+  };
+  if (canonicalJson(raw) !== payload) throw new Error("pipeline publication is not canonical");
+  let value: PipelinePublicationEnvelope = raw;
+  if (!raw.pipeline?.ticket_id && raw.pipeline?.linear_issue_id) {
+    const { linear_issue_id: linearIssueId, ...pipeline } = raw.pipeline;
+    value = {
+      ...raw,
+      pipeline: {
+        ...pipeline,
+        ticket_id: linearIssueId.startsWith("linear:")
+          ? linearIssueId
+          : `linear:${linearIssueId}`,
+      },
+    } as PipelinePublicationEnvelope;
+  }
   if (value.schema !== PIPELINE_PUBLICATION_SCHEMA ||
       !SUPPORTED_PIPELINE_PUBLICATION_TEMPLATE_VERSIONS.has(value.template?.version)) {
     throw new Error("pipeline publication schema is unsupported");
@@ -1153,7 +1169,6 @@ export function parsePipelinePublication(payload: string): PipelinePublicationEn
       (value.evidence.actions !== undefined && !Array.isArray(value.evidence.actions))) {
     throw new Error("pipeline publication is incomplete");
   }
-  if (canonicalJson(value) !== payload) throw new Error("pipeline publication is not canonical");
   if (sanitizeText(value.body) !== value.body || value.body.length > PUBLICATION_BODY_LIMIT) {
     throw new Error("pipeline publication body is unsafe");
   }
