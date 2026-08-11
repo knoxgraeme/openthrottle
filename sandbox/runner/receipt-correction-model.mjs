@@ -2,6 +2,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_CORRECTION_MODEL = "gpt-5.1-code";
 const REQUEST_TIMEOUT_MS = 60_000;
@@ -41,6 +42,19 @@ function codexAccessToken(auth) {
   return typeof token === "string" && token.length > 0 ? token : null;
 }
 
+export function codexAccountId(auth) {
+  const accountId = auth?.tokens?.account_id;
+  return typeof accountId === "string" && accountId.length > 0 ? accountId : null;
+}
+
+export function requestHeaders({ bearer, accountId = null }) {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${bearer}`,
+    ...(accountId ? { "ChatGPT-Account-Id": accountId } : {}),
+  };
+}
+
 function responseBody({ prompt, model }) {
   return {
     model: model || process.env.OT_RECEIPT_CORRECTION_MODEL || DEFAULT_CORRECTION_MODEL,
@@ -64,16 +78,13 @@ function responseBody({ prompt, model }) {
   };
 }
 
-async function fetchJson(url, { bearer, body }) {
+async function fetchJson(url, { bearer, accountId = null, body }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
     const response = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${bearer}`,
-      },
+      headers: requestHeaders({ bearer, accountId }),
       body: JSON.stringify(body),
       signal: controller.signal,
     });
@@ -111,16 +122,19 @@ async function main() {
   const auth = codexAuthFromEnvironment();
   const apiKey = openAiApiKey(auth);
   const accessToken = codexAccessToken(auth);
+  const accountId = codexAccountId(auth);
   const body = responseBody({ prompt, model });
   const response = apiKey
     ? await fetchJson("https://api.openai.com/v1/responses", { bearer: apiKey, body })
     : accessToken
-      ? await fetchJson("https://chatgpt.com/backend-api/codex/responses", { bearer: accessToken, body })
+      ? await fetchJson("https://chatgpt.com/backend-api/codex/responses", { bearer: accessToken, accountId, body })
       : (() => { throw new Error("missing model credential for receipt correction"); })();
   process.stdout.write(textFromResponse(response).trim());
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : "receipt correction failed"}\n`);
-  process.exit(1);
-});
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : "receipt correction failed"}\n`);
+    process.exit(1);
+  });
+}

@@ -3868,13 +3868,19 @@ describe("executeLoopAction", () => {
     expect(result.receipt).toContain("receipt correction exhausted after 1 attempt");
     expect(result.receipt).toContain("/payload/status");
     expect(result.receipt).toContain("private_recovery_artifact=");
-    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+    const recoveryArtifact = JSON.parse(result.recovery_artifact);
+    expect(recoveryArtifact).toMatchObject({
       schema: "openthrottle.loop-receipt-recovery/v1",
       action_id: valid.actionId,
       attempt_id: valid.attemptId,
       request_hash: valid.requestHash,
       subject: originalSubject,
     });
+    expect(recoveryArtifact.candidate_tree).toMatch(/^[a-f0-9]{40}$/);
+    expect(recoveryArtifact.changed_paths).toContain("changed-after-work.txt");
+    expect(recoveryArtifact.diff_truncated).toBe(false);
+    expect(recoveryArtifact.diff_base64).toEqual(expect.any(String));
+    expect(Buffer.from(recoveryArtifact.diff_base64, "base64").toString("utf8")).toContain("changed-after-work.txt");
   });
 
   it("resumes a persisted receipt correction without relaunching the implementation", () => {
