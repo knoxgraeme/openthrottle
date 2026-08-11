@@ -132,7 +132,7 @@ async function readBoundedUtf8Body(request: Request, maxBytes: number): Promise<
 }
 
 function findTicket(store: SupervisorStore, identifier: string): Ticket | undefined {
-  return store.getByIssueId(identifier) ?? store.getByIdentifier(identifier);
+  return store.getByIssueId(identifier);
 }
 
 const LINEAR_TEAM_KEY_PATTERN = /^[A-Za-z0-9_-]+$/;
