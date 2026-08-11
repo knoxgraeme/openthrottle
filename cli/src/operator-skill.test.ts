@@ -74,6 +74,10 @@ describe("operator skill package", () => {
     expect(ship).toContain("openthrottle plan prepare <file.md> --graph structured --json");
     expect(ship).toContain("openthrottle plan validate <file.md> --graph structured --json");
     expect(ship).toContain("openthrottle ship <file.md> --graph structured");
+    expect(ship).toContain("explicit authorization for that write");
+    expect(ship).toMatch(/not a read-only preview or\s+dry run/);
+    expect(ship).toContain("validated digest from the validation JSON output");
+    expect(ship).toContain("never fall back to `simple`");
     expect(ship).toContain("Ticket reuse, trigger-state JSON, and recovery commands are capability-gated");
   });
 });
@@ -182,7 +186,12 @@ describe("operator skill Skillfish wrapper", () => {
       if (args[0] === "list") {
         return spawnResult({
           success: true,
-          installed: [{ skill: "openthrottle", agent: "Codex", path, location: "global" }],
+          installed: [{
+            skill: "openthrottle",
+            agent: "Codex",
+            path: join(options.env.HOME ?? "", ".codex", "skills", "openthrottle"),
+            location: "global",
+          }],
           agents_detected: ["Codex"],
         });
       }
@@ -203,6 +212,30 @@ describe("operator skill Skillfish wrapper", () => {
     expect(calls).toEqual([
       ["list", "--global", "--json"],
       ["install", "--global", "--yes", "--json"],
+    ]);
+  });
+
+  it("attributes Skillfish install failures to every agent attempted by that command", () => {
+    const home = temporaryDirectory();
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    mkdirSync(join(home, ".config", "opencode"), { recursive: true });
+    const runner = (args: string[]) => {
+      if (args[0] === "list") {
+        return spawnResult({
+          success: true,
+          installed: [],
+          agents_detected: ["Claude Code", "OpenCode"],
+        });
+      }
+      return spawnResult({ success: false, errors: ["remote install failed"] }, 1);
+    };
+
+    const result = runOperatorSkillAction("install", { home, runner, sourceRef });
+
+    expect(result.success).toBe(false);
+    expect(result.conflicted).toEqual([
+      { agent: "Claude Code", status: "conflicted", reason: "remote install failed" },
+      { agent: "OpenCode", status: "conflicted", reason: "remote install failed" },
     ]);
   });
 
@@ -386,6 +419,31 @@ describe("operator skill Skillfish wrapper", () => {
     expect(result.skipped).toEqual([{ agent: "Codex", status: "skipped", reason: "not installed" }]);
   });
 
+  it("normalizes Skillfish list paths before its temporary HOME is removed", () => {
+    const home = temporaryDirectory();
+    const path = installedSkill(home, ".codex", {
+      owner: "knoxgraeme",
+      repo: "openthrottle-v2",
+      path: "skills/operator/openthrottle",
+      source: "manifest",
+    });
+    const runner = (_args: string[], options: { env: NodeJS.ProcessEnv }) => spawnResult({
+      success: true,
+      installed: [{
+        skill: "openthrottle",
+        agent: "Codex",
+        path: join(options.env.HOME ?? "", ".codex", "skills", "openthrottle"),
+        location: "global",
+      }],
+      agents_detected: ["Codex"],
+    });
+
+    const result = runOperatorSkillAction("status", { home, runner, sourceRef });
+
+    expect(result.success).toBe(true);
+    expect(result.installed).toEqual([{ agent: "Codex", status: "installed", path }]);
+  });
+
   it("skips exact matching installs idempotently", () => {
     const home = temporaryDirectory();
     const path = installedSkill(home, ".codex", {
@@ -457,14 +515,24 @@ describe("operator skill Skillfish wrapper", () => {
       source: "manual",
     });
     const calls: string[][] = [];
-    const runner = (args: string[]) => {
+    const runner = (args: string[], options: { env: NodeJS.ProcessEnv }) => {
       calls.push(args);
       if (args[0] === "list") {
         return spawnResult({
           success: true,
           installed: [
-            { skill: "openthrottle", agent: "Codex", path: codexPath, location: "global" },
-            { skill: "openthrottle", agent: "Claude Code", path: claudePath, location: "global" },
+            {
+              skill: "openthrottle",
+              agent: "Codex",
+              path: join(options.env.HOME ?? "", ".codex", "skills", "openthrottle"),
+              location: "global",
+            },
+            {
+              skill: "openthrottle",
+              agent: "Claude Code",
+              path: join(options.env.HOME ?? "", ".claude", "skills", "openthrottle"),
+              location: "global",
+            },
           ],
           agents_detected: ["Codex", "Claude Code"],
         });
@@ -499,7 +567,7 @@ describe("operator skill Skillfish wrapper", () => {
       source: "manifest",
     });
     const calls: string[][] = [];
-    const runner = (args: string[]) => {
+    const runner = (args: string[], options: { env: NodeJS.ProcessEnv }) => {
       calls.push(args);
       return spawnResult({
         success: true,
