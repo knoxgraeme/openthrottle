@@ -468,7 +468,7 @@ const LINEAR_LINKBACK_MARKER = "<!-- linear-linkback -->";
 const CODEX_REVIEW_COMMAND = "@codex review";
 const CODEX_CONNECTOR_AUTHOR = "chatgpt-codex-connector[bot]";
 const CODEX_CLEAN_REVIEW_PATTERN =
-  /^Codex Review: Didn't find any major issues\.\n\n[^\n]+\n\n\*\*Reviewed commit:\*\* `([a-f0-9]{7,40})`\n\n<details>\n<summary>About Codex in GitHub<\/summary>\n\n[\s\S]+<\/details>$/i;
+  /^Codex Review: Didn't find any major issues\. [^\n]{1,120}\n\n\*\*Reviewed commit:\*\* `([a-f0-9]{7,40})`\n\n<details> <summary>ℹ️ About Codex in GitHub<\/summary>\n<br\/>\n\n\[Your team has set up Codex to review pull requests in this repo\]\(https:\/\/chatgpt\.com\/codex\/cloud\/settings\/general\)\. Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment "@codex review"\.\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍\.\s+Codex can also answer questions or update the PR\. Try commenting "@codex address that feedback"\.\s*<\/details>$/i;
 const CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE =
   "To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).";
 const REVIEWED_COMMIT = /^[a-f0-9]{7,40}$/;

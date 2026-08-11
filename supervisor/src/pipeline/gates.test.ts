@@ -44,16 +44,26 @@ function codexCleanReviewBody(
   encouragement = "Delightful!"
 ): string {
   return [
-    "Codex Review: Didn't find any major issues.",
-    "",
-    encouragement,
+    `Codex Review: Didn't find any major issues. ${encouragement}`,
     "",
     `**Reviewed commit:** \`${reviewedCommit}\``,
     "",
-    "<details>",
-    "<summary>About Codex in GitHub</summary>",
+    "<details> <summary>ℹ️ About Codex in GitHub</summary>",
+    "<br/>",
     "",
-    "Codex can help review pull requests from GitHub.",
+    "[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you",
+    "- Open a pull request for review",
+    "- Mark a draft as ready",
+    "- Comment \"@codex review\".",
+    "",
+    "If Codex has suggestions, it will comment; otherwise it will react with 👍.",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "Codex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".",
+    "            ",
     "</details>",
   ].join("\n");
 }
@@ -2081,52 +2091,55 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("routes exact trusted Codex clean review completion as successful current-head evidence", async () => {
-    const fixture = setup("core/implement@4");
-    const activityPublisher = {
-      publishActivity: vi.fn(async () => undefined),
-      publishError: vi.fn(async () => undefined),
-    };
-    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
-    moveFixtureToProviderWait(fixture);
-    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
-      const url = String(input);
-      if (url.endsWith("/pulls/1")) {
-        return Response.json({ head: { sha: PUBLISHED_COMMIT } });
-      }
-      throw new Error(`Unexpected GitHub request: ${url}`);
-    }) as unknown as typeof fetch);
-    const body = codexCleanReviewBody(PUBLISHED_COMMIT.slice(0, 10), "Keep it up!");
-    const cleanReview = (id: number) => handleGithubEvent(
-      { githubReadToken: "github-read-token" } as never,
-      fixture.tickets,
-      activityPublisher,
-      {
-        kind: "issue_comment",
-        action: "created",
-        repository: { full_name: "owner/repo" },
-        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
-        comment: {
-          id,
-          body,
-          html_url: `https://github.com/owner/repo/pull/1#issuecomment-${id}`,
-          user: { login: CODEX_CONNECTOR_LOGIN, type: "Bot" },
+  it.each(["Keep it up!", "Delightful!"])(
+    "routes exact trusted Codex clean review completion with %s as successful current-head evidence",
+    async (encouragement) => {
+      const fixture = setup("core/implement@4");
+      const activityPublisher = {
+        publishActivity: vi.fn(async () => undefined),
+        publishError: vi.fn(async () => undefined),
+      };
+      fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+      moveFixtureToProviderWait(fixture);
+      vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/1")) {
+          return Response.json({ head: { sha: PUBLISHED_COMMIT } });
+        }
+        throw new Error(`Unexpected GitHub request: ${url}`);
+      }) as unknown as typeof fetch);
+      const body = codexCleanReviewBody(PUBLISHED_COMMIT.slice(0, 10), encouragement);
+      const cleanReview = (id: number) => handleGithubEvent(
+        { githubReadToken: "github-read-token" } as never,
+        fixture.tickets,
+        activityPublisher,
+        {
+          kind: "issue_comment",
+          action: "created",
+          repository: { full_name: "owner/repo" },
+          issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+          comment: {
+            id,
+            body,
+            html_url: `https://github.com/owner/repo/pull/1#issuecomment-${id}`,
+            user: { login: CODEX_CONNECTOR_LOGIN, type: "Bot" },
+          },
         },
-      },
-      fixture.pipelines
-    );
+        fixture.pipelines
+      );
 
-    await cleanReview(701);
-    await cleanReview(701);
+      await cleanReview(701);
+      await cleanReview(701);
 
-    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
-    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
-    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
-      status: "completion_pending_publication",
-      terminal_outcome: "shipped",
-    });
-    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toBeUndefined();
-  });
+      expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+      expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+      expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+        status: "completion_pending_publication",
+        terminal_outcome: "shipped",
+      });
+      expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toBeUndefined();
+    }
+  );
 
   it("admits a trusted Codex clean review when the live PR head differs from the reviewed commit", async () => {
     const fixture = setup("core/implement@4");
