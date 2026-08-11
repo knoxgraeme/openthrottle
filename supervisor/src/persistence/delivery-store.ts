@@ -30,6 +30,7 @@ export interface WebhookDelivery {
   next_attempt_at: string | null;
   processed_at: string | null;
   last_error: string | null;
+  redelivered_at: string | null;
   received_at: string;
 }
 
@@ -94,6 +95,7 @@ export interface DeliveryStore {
   }): WebhookDelivery | undefined;
   markDeliveryProcessed(deliveryId: string): void;
   markDeliveryFailed(deliveryId: string, error: string, retryAt: string | null): void;
+  requeueFailedDeliveriesForRedelivery(source: WebhookDelivery["source"], nowIso: string, limit: number): number;
   listProcessableDeliveries(nowIso: string, limit: number): WebhookDelivery[];
   pruneDeliveries(beforeIso: string): number;
   insertSandboxEvent(params: {
@@ -140,6 +142,26 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       OR (status = 'processing' AND next_attempt_at <= ?))
     ORDER BY received_at
     LIMIT ?
+  `);
+  const listRedeliverableDeliveriesStmt = db.prepare(`
+    SELECT delivery_id
+    FROM webhook_deliveries
+    WHERE source = ?
+      AND status IN ('failed', 'dead')
+      AND redelivered_at IS NULL
+    ORDER BY received_at
+    LIMIT ?
+  `);
+  const requeueDeliveryForRedeliveryStmt = db.prepare(`
+    UPDATE webhook_deliveries
+    SET status = 'pending',
+        next_attempt_at = ?,
+        last_error = NULL,
+        redelivered_at = ?
+    WHERE delivery_id = ?
+      AND source = ?
+      AND status IN ('failed', 'dead')
+      AND redelivered_at IS NULL
   `);
   const pruneDeliveriesStmt = db.prepare(
     "DELETE FROM webhook_deliveries WHERE received_at < ?"
@@ -260,6 +282,19 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
       return getSandboxEventStmt.get(eventId) as SandboxEventRecord;
     }
   );
+  const requeueFailedDeliveriesForRedeliveryTransaction = db.transaction((
+    source: WebhookDelivery["source"],
+    nowIso: string,
+    limit: number
+  ): number => {
+    const rows = listRedeliverableDeliveriesStmt.all(source, limit) as Array<{ delivery_id: string }>;
+    return rows.reduce((count, row) => count + requeueDeliveryForRedeliveryStmt.run(
+      nowIso,
+      nowIso,
+      row.delivery_id,
+      source
+    ).changes, 0);
+  });
   const listClaimableLinearOutboxRows = (nowIso: string, limit: number): LinearOutboxRecord[] =>
     listClaimableLinearOutboxRowsStmt.all(nowIso, nowIso, limit) as LinearOutboxRecord[];
   const claimLinearOutboxRows = (
@@ -401,6 +436,9 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
         WHERE delivery_id = ?
       `).run(status, nextAttemptAt, errorValue, deliveryId).changes,
       });
+    },
+    requeueFailedDeliveriesForRedelivery(source, nowIso, limit) {
+      return requeueFailedDeliveriesForRedeliveryTransaction(source, nowIso, limit);
     },
     listProcessableDeliveries(nowIso, limit) {
       return listProcessableDeliveriesStmt.all(nowIso, nowIso, limit) as WebhookDelivery[];

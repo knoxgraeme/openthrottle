@@ -1282,6 +1282,86 @@ describe("deterministic supervisor stage gates", () => {
       terminal_outcome: terminalOutcome,
     });
   });
+
+  it.each(["issue-first", "merge-first"] as const)(
+    "settles GitHub Issue close and exact PR merge monotonically when %s",
+    async (order) => {
+      const fixture = setup("core/implement@4");
+      moveFixtureToProviderWait(fixture);
+      fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+      fixture.db.prepare(`
+        UPDATE tickets
+        SET control_provider = 'github',
+            external_thread_id = 'owner/repo#1',
+            external_thread_reference = 'GH-1'
+        WHERE ticket_id = 'issue-1'
+      `).run();
+
+      const closeIssue = () => handleGithubEvent(
+        {} as never,
+        fixture.tickets,
+        {} as never,
+        {
+          kind: "issues",
+          action: "closed",
+          repository: { full_name: "owner/repo" },
+          issue: {
+            number: 1,
+            title: "Ship the provider path",
+            html_url: "https://github.com/owner/repo/issues/1",
+          },
+        },
+        fixture.pipelines
+      );
+      const mergePull = () => handleGithubEvent(
+        {} as never,
+        fixture.tickets,
+        {} as never,
+        {
+          kind: "pull_request",
+          action: "closed",
+          repository: { full_name: "owner/repo" },
+          pull_request: {
+            number: 1,
+            html_url: "https://github.com/owner/repo/pull/1",
+            merged: true,
+            head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+            base: { ref: "main" },
+          },
+        },
+        fixture.pipelines
+      );
+
+      if (order === "issue-first") {
+        await closeIssue();
+        expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+          status: "waiting_provider",
+          terminal_outcome: null,
+        });
+        expect(fixture.db.prepare(`
+          SELECT COUNT(*) FROM pipeline_inbox_events
+          WHERE id LIKE 'github-issue-closed:%'
+        `).pluck().get()).toBe(0);
+        await mergePull();
+      } else {
+        await mergePull();
+        await closeIssue();
+      }
+
+      expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+        status: "completion_pending_publication",
+        terminal_outcome: "shipped",
+      });
+      expect(fixture.tickets.getByIssueId("issue-1")).toMatchObject({
+        state: "closed",
+      });
+      expect(fixture.db.prepare(`
+        SELECT COUNT(*) FROM orchestration_journal
+        WHERE instance_id = ? AND kind = 'merged'
+      `).pluck().get(fixture.instance.id)).toBe(1);
+    }
+  );
+
   it("scopes merged pull request journal idempotency keys by repository", async () => {
     const recordJournalEntry = vi.fn();
     const ticket = {

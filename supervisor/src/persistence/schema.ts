@@ -143,6 +143,7 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
   next_attempt_at TEXT,
   processed_at TEXT,
   last_error TEXT,
+  redelivered_at TEXT,
   received_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS webhook_deliveries_received_idx
@@ -207,6 +208,7 @@ const deliveryMigrations: Array<[string, string]> = [
   ["next_attempt_at", "ALTER TABLE webhook_deliveries ADD COLUMN next_attempt_at TEXT"],
   ["processed_at", "ALTER TABLE webhook_deliveries ADD COLUMN processed_at TEXT"],
   ["last_error", "ALTER TABLE webhook_deliveries ADD COLUMN last_error TEXT"],
+  ["redelivered_at", "ALTER TABLE webhook_deliveries ADD COLUMN redelivered_at TEXT"],
 ];
 
 function applyColumnMigrations(

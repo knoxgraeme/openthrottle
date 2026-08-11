@@ -1,6 +1,7 @@
 import type { SupervisorStore } from "../persistence/store.js";
 
 const DEFAULT_WEBHOOK_RECONCILIATION_CONCURRENCY = 4;
+const DEFAULT_WEBHOOK_REDELIVERY_LIMIT = 50;
 
 export interface RepositoryWebhookReconciliation {
   repo: string;
@@ -24,6 +25,7 @@ export interface GithubWebhookReconcilerOptions<TClient> {
     }
   ) => Promise<RepositoryWebhookReconciliation>;
   concurrency?: number;
+  redeliveryLimit?: number;
   logger?: Pick<Console, "error" | "warn">;
 }
 
@@ -49,6 +51,7 @@ export function createGithubWebhookReconciler<TClient>(
 ): () => Promise<void> {
   const logger = options.logger ?? console;
   const concurrency = options.concurrency ?? DEFAULT_WEBHOOK_RECONCILIATION_CONCURRENCY;
+  const redeliveryLimit = options.redeliveryLimit ?? DEFAULT_WEBHOOK_REDELIVERY_LIMIT;
   return async () => {
     await runBounded(options.store.listRepositoryRegistrations(), concurrency, async (registration) => {
       try {
@@ -85,5 +88,13 @@ export function createGithubWebhookReconciler<TClient>(
         );
       }
     });
+    const requeued = options.store.requeueFailedDeliveriesForRedelivery(
+      "github",
+      new Date().toISOString(),
+      redeliveryLimit
+    );
+    if (requeued > 0) {
+      logger.warn(`[github-webhook] requeued ${requeued} failed delivery(s) for one redelivery attempt`);
+    }
   };
 }

@@ -116,4 +116,67 @@ describe("GitHub webhook reconciliation", () => {
       expect.any(Error)
     );
   });
+
+  it("requeues failed GitHub deliveries once after hook reconciliation", async () => {
+    store.registerRepository({
+      linearTeamKey: "ENG",
+      linearTeamId: "team-1",
+      githubRepo: "acme/widget",
+      baseBranch: "main",
+      webhookId: 7,
+      snapshot: "openthrottle",
+    });
+    store.claimDelivery({
+      deliveryId: "github-dead",
+      source: "github",
+      action: "closed",
+      eventName: "pull_request",
+      payload: "{}",
+    });
+    store.markDeliveryFailed("github-dead", "delivery handler crashed", null);
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/repos/acme/widget/hooks/7")) {
+        return Response.json({
+          id: 7,
+          active: true,
+          events: OPENTHROTTLE_WEBHOOK_EVENTS,
+          config: { url: "https://ot.test/webhooks/github" },
+        });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+    const logger = { warn: vi.fn(), error: vi.fn() };
+
+    await createGithubWebhookReconciler({
+      store,
+      client: { token: "github", fetch: fetchMock },
+      webhookUrl: "https://ot.test/webhooks/github",
+      webhookSecret: "webhook-secret",
+      reconcileRepositoryWebhook,
+      logger,
+    })();
+
+    expect(db.prepare(`
+      SELECT status, next_attempt_at, last_error, redelivered_at
+      FROM webhook_deliveries WHERE delivery_id = ?
+    `).get("github-dead")).toMatchObject({
+      status: "pending",
+      last_error: null,
+      redelivered_at: expect.any(String),
+    });
+    expect(logger.warn).toHaveBeenCalledWith(
+      "[github-webhook] requeued 1 failed delivery(s) for one redelivery attempt"
+    );
+
+    await createGithubWebhookReconciler({
+      store,
+      client: { token: "github", fetch: fetchMock },
+      webhookUrl: "https://ot.test/webhooks/github",
+      webhookSecret: "webhook-secret",
+      reconcileRepositoryWebhook,
+      logger,
+    })();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
 });

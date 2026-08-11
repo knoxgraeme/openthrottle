@@ -156,4 +156,55 @@ describe("delivery store", () => {
       last_error: "permanent failure",
     });
   });
+
+  it("requeues failed webhook deliveries for exactly one reconciled redelivery", () => {
+    expect(store.claimDelivery({
+      deliveryId: "github-dead",
+      source: "github",
+      action: "closed",
+      eventName: "pull_request",
+      payload: "{}",
+    })).toBe(true);
+    expect(store.claimDelivery({
+      deliveryId: "github-processed",
+      source: "github",
+      action: "opened",
+      eventName: "pull_request",
+      payload: "{}",
+    })).toBe(true);
+    expect(store.claimDelivery({
+      deliveryId: "linear-dead",
+      source: "linear",
+      action: "created",
+      payload: "{}",
+    })).toBe(true);
+    store.markDeliveryFailed("github-dead", "permanent GitHub failure", null);
+    store.markDeliveryProcessed("github-processed");
+    store.markDeliveryFailed("linear-dead", "permanent Linear failure", null);
+
+    expect(store.requeueFailedDeliveriesForRedelivery(
+      "github",
+      "2099-01-01T00:00:00.000Z",
+      50
+    )).toBe(1);
+    expect(db.prepare(`
+      SELECT status, next_attempt_at, last_error, redelivered_at
+      FROM webhook_deliveries
+      WHERE delivery_id = ?
+    `).get("github-dead")).toEqual({
+      status: "pending",
+      next_attempt_at: "2099-01-01T00:00:00.000Z",
+      last_error: null,
+      redelivered_at: "2099-01-01T00:00:00.000Z",
+    });
+    expect(store.requeueFailedDeliveriesForRedelivery(
+      "github",
+      "2099-01-01T00:01:00.000Z",
+      50
+    )).toBe(0);
+    expect(db.prepare("SELECT status FROM webhook_deliveries WHERE delivery_id = ?").get("github-processed"))
+      .toEqual({ status: "processed" });
+    expect(db.prepare("SELECT status FROM webhook_deliveries WHERE delivery_id = ?").get("linear-dead"))
+      .toEqual({ status: "dead" });
+  });
 });

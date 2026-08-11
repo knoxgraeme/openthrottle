@@ -507,7 +507,11 @@ export async function handleGithubEvent(
       );
       if (!ticket) return;
       const pipelineInstance = pipelines.getInstanceForSession(ticket.session_id);
-      if (pipelineInstance && !pipelineIsTerminal(pipelineInstance)) {
+      if (
+        pipelineInstance &&
+        !pipelineIsTerminal(pipelineInstance) &&
+        !providerStageCanReceive(pipelines, pipelineInstance)
+      ) {
         requestPipelineStop({
           store: pipelines,
           sessionId: ticket.session_id,
