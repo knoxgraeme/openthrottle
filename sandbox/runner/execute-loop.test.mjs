@@ -4341,6 +4341,62 @@ describe("executeLoopAction", () => {
       .toThrow();
   });
 
+  it("preserves the workspace when recovery changes a working-tree-encoded file", () => {
+    const initial = request();
+    const worktreeDir = loopWorktreeDirectory(initial);
+    writeFileSync(join(worktreeDir, ".gitattributes"), "encoded.txt working-tree-encoding=UTF-16LE\n");
+    writeFileSync(join(worktreeDir, "encoded.txt"), Buffer.from("durable encoded text\n", "utf16le"));
+    execFileSync("git", ["add", ".gitattributes", "encoded.txt"], { cwd: worktreeDir });
+    execFileSync("git", ["commit", "--quiet", "-m", "encoded baseline"], { cwd: worktreeDir });
+    const durableBase = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: worktreeDir,
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(worktreeDir, "encoded.txt"), Buffer.from("candidate encoded text\n", "utf16le"));
+    const candidateTree = computeWorkspaceTreeOid(worktreeDir);
+    const valid = withFreshLoopFence(initial, {
+      baseSubject: durableBase,
+      recoveryBaseSubject: durableBase,
+    });
+    const badReceipt = standardReceipt(valid, {
+      subject: {
+        base: "1".repeat(40),
+        pre: "1".repeat(40),
+        post: candidateTree,
+      },
+      payload: {
+        ...standardReceipt(valid).payload,
+        summary: ["not-authoritative"],
+      },
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn().mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(badReceipt),
+        stderr: "",
+        nativeSessionId: "native-encoded-recovery",
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+      error: expect.stringContaining("working-tree-encoded path"),
+    });
+    expect(readFileSync(join(worktreeDir, "encoded.txt"))).toEqual(
+      Buffer.from("candidate encoded text\n", "utf16le"),
+    );
+  });
+
   it("preserves the workspace when no sealed durable recovery base exists", () => {
     const valid = withFreshLoopFence(request(), { recoveryBaseSubject: undefined });
     const worktreeDir = loopWorktreeDirectory(valid);

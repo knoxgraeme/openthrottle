@@ -116,6 +116,7 @@ const MAX_INLINE_PRIVATE_RECOVERY_DIFF_BYTES = 48 * 1024;
 // travel in a separate root-owned file that the supervisor downloads before
 // Daytona cleanup; they never inflate the sealed result envelope itself.
 const MAX_PRIVATE_RECOVERY_DIFF_BYTES = 8 * 1024 * 1024;
+const MAX_PRIVATE_RECOVERY_ATTRIBUTE_BYTES = 16 * 1024 * 1024;
 const PRIVATE_RECOVERY_DIFF_FILE = "recovery.patch.gz";
 const MAX_PRIVATE_RECOVERY_CHANGED_PATHS = 256;
 const MAX_PRIVATE_RECOVERY_CHANGED_PATH_BYTES = 16 * 1024;
@@ -1582,6 +1583,70 @@ function assertRecoveryTreeHasNoChangedGitlinks(rawTreeChanges) {
   }
 }
 
+function assertRecoveryPathsHavePortableEncodings({
+  worktreeDir,
+  recoveryDirectory,
+  rawPathsPath,
+  baseTree,
+  candidateTree,
+  env,
+}) {
+  const indexPath = pathInside(recoveryDirectory, "recovery.attributes.index.tmp");
+  const outputPath = pathInside(recoveryDirectory, "recovery.attributes.tmp");
+  for (const [label, tree] of [["base", baseTree], ["candidate", candidateTree]]) {
+    rmSync(indexPath, { force: true });
+    rmSync(outputPath, { force: true });
+    try {
+      const attributeEnv = {
+        ...env,
+        GIT_INDEX_FILE: indexPath,
+        GIT_WORK_TREE: worktreeDir,
+      };
+      runRootGit(worktreeDir, ["read-tree", tree], attributeEnv);
+      // Git check-attr has no input-file option. This fixed shell fragment
+      // only redirects executor-owned files; dynamic values remain quoted
+      // positional arguments and are never interpolated shell source.
+      const result = runCapturedProcess("/bin/sh", [
+        "-c",
+        "exec git -c \"safe.directory=$3\" check-attr --cached -z --stdin working-tree-encoding < \"$1\" > \"$2\"",
+        "ot-check-recovery-attributes",
+        rawPathsPath,
+        outputPath,
+        worktreeDir,
+      ], {
+        cwd: worktreeDir,
+        env: { ...process.env, ...attributeEnv, GIT_TERMINAL_PROMPT: "0" },
+        timeout: 120_000,
+        captureBytes: 1024 * 1024,
+      });
+      if (result.error || result.status !== 0) {
+        throw new Error(`private recovery could not inspect ${label} path encodings: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-800)}`);
+      }
+      const outputBytes = statSync(outputPath).size;
+      if (outputBytes > MAX_PRIVATE_RECOVERY_ATTRIBUTE_BYTES) {
+        throw new Error(`private recovery ${label} path encoding evidence exceeds ${MAX_PRIVATE_RECOVERY_ATTRIBUTE_BYTES} byte platform bound`);
+      }
+      const fields = readFileSync(outputPath).toString("utf8").split("\0");
+      if (fields.at(-1) !== "" || (fields.length - 1) % 3 !== 0) {
+        throw new Error(`private recovery ${label} path encoding evidence is malformed`);
+      }
+      for (let index = 0; index < fields.length - 1; index += 3) {
+        const attribute = fields[index + 1];
+        const value = fields[index + 2];
+        if (attribute !== "working-tree-encoding") {
+          throw new Error(`private recovery ${label} path encoding evidence is malformed`);
+        }
+        if (value !== "unspecified" && value !== "unset") {
+          throw new Error("private recovery includes a working-tree-encoded path whose raw workspace bytes are not carried by a Git text patch");
+        }
+      }
+    } finally {
+      rmSync(indexPath, { force: true });
+      rmSync(outputPath, { force: true });
+    }
+  }
+}
+
 function privateRecoveryArtifact(request, worktreeDir, subject, env) {
   const base = {
     schema: "openthrottle.loop-receipt-recovery/v1",
@@ -1617,6 +1682,7 @@ function privateRecoveryArtifact(request, worktreeDir, subject, env) {
     const rawDiffPath = pathInside(recoveryDirectory, "recovery.patch.tmp");
     const rawModesPath = pathInside(recoveryDirectory, "recovery.modes.tmp");
     const rawPathsPath = pathInside(recoveryDirectory, "recovery.paths.tmp");
+    const rawAttributePathsPath = pathInside(recoveryDirectory, "recovery.attribute-paths.tmp");
     const recoveryDiffPath = loopPrivateRecoveryDiffPath({
       attemptId: request.attemptId,
       actionId: request.actionId,
@@ -1625,6 +1691,7 @@ function privateRecoveryArtifact(request, worktreeDir, subject, env) {
     rmSync(rawDiffPath, { force: true });
     rmSync(rawModesPath, { force: true });
     rmSync(rawPathsPath, { force: true });
+    rmSync(rawAttributePathsPath, { force: true });
     rmSync(recoveryDiffPath, { force: true });
     runRootGit(worktreeDir, [
       "-c",
@@ -1650,6 +1717,36 @@ function privateRecoveryArtifact(request, worktreeDir, subject, env) {
     const rawTreeChanges = readFileSync(rawModesPath, "utf8");
     rmSync(rawModesPath, { force: true });
     assertRecoveryTreeHasNoChangedGitlinks(rawTreeChanges);
+    runRootGit(worktreeDir, [
+      "diff",
+      "--name-only",
+      "-z",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--ignore-submodules=none",
+      "--no-renames",
+      `--output=${rawAttributePathsPath}`,
+      `${baseCommit}^{tree}`,
+      candidate.tree,
+    ], recoveryGitEnv);
+    const rawAttributePathsBytes = statSync(rawAttributePathsPath).size;
+    if (rawAttributePathsBytes > MAX_PRIVATE_RECOVERY_DIFF_BYTES) {
+      rmSync(rawAttributePathsPath, { force: true });
+      throw new Error(`private recovery attribute path evidence exceeds ${MAX_PRIVATE_RECOVERY_DIFF_BYTES} byte platform bound`);
+    }
+    try {
+      assertRecoveryPathsHavePortableEncodings({
+        worktreeDir,
+        recoveryDirectory,
+        rawPathsPath: rawAttributePathsPath,
+        baseTree: `${baseCommit}^{tree}`,
+        candidateTree: candidate.tree,
+        env: recoveryGitEnv,
+      });
+    } finally {
+      rmSync(rawAttributePathsPath, { force: true });
+    }
     runRootGit(worktreeDir, [
       "diff",
       "--binary",
