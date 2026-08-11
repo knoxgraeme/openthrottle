@@ -311,6 +311,17 @@ function validateFence(
   event: PipelineCoordinatorEvent,
   subject: string
 ): void {
+  const sealedRequestTicketId = attempt.request_payload === null
+    ? null
+    : (JSON.parse(attempt.request_payload) as { issueId?: unknown }).issueId;
+  // V35 provider-qualifies existing Linear identities without rewriting an
+  // already-sealed request or its hash. Accept that one rolling-deploy shape
+  // only when the artifact repeats the immutable request identity and the
+  // durable instance is its exact `linear:` qualification.
+  const ticketIdentityMatches = payload.run.ticket_id === instance.ticket_id ||
+    (typeof sealedRequestTicketId === "string" &&
+      payload.run.ticket_id === sealedRequestTicketId &&
+      instance.ticket_id === `linear:${sealedRequestTicketId}`);
   if (
     payload.producer.capability !== stage.executor.capability ||
     payload.producer.runtime_release !== instance.runtime_release ||
@@ -323,7 +334,7 @@ function validateFence(
     payload.stage.context_revision !== attempt.context_revision ||
     payload.stage.context_policy !== attempt.native_context_policy ||
     payload.run.id !== event.runId ||
-    payload.run.ticket_id !== instance.ticket_id ||
+    !ticketIdentityMatches ||
     payload.run.session_id !== instance.session_id ||
     payload.run.generation !== instance.generation ||
     payload.run.native_session_id !== (event.nativeSessionId ?? null) ||
