@@ -152,6 +152,7 @@ describe("database migrations", () => {
       "0d0aa73d6cbb944697d6815f5bd1c8dd766a919b8692945b905298759dd766a7",
       "be4b0a09caf911013a376efe34aed76843fc89901c59dfe195eda0be4b4a852a",
       "0550761a59df3d2178bcdfd5113c0d270c35fe090da08fb0f732eccf7d2d2fd3",
+      "fd013193d587a17350c261bc411384c0420e432babc2cd87af648d8c1348a0d2",
     ]);
   });
 
@@ -216,7 +217,7 @@ describe("database migrations", () => {
     `).get()).toEqual({ name: "github_webhook_redelivery_process_idx" });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 37, name: "session-provider-activation-fence" });
+    `).get()).toEqual({ version: 38, name: "session-provider-activation-identity" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
     });
@@ -258,11 +259,15 @@ describe("database migrations", () => {
     applyDatabaseMigrations(db);
 
     expect(db.prepare(`
-      SELECT provider_activated_at FROM agent_sessions WHERE id = 'session-legacy'
-    `).get()).toEqual({ provider_activated_at: "2026-08-11T00:05:00.987Z" });
+      SELECT provider_activated_at, provider_activation_id
+      FROM agent_sessions WHERE id = 'session-legacy'
+    `).get()).toEqual({
+      provider_activated_at: "2026-08-11T00:05:00.987Z",
+      provider_activation_id: null,
+    });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 37, name: "session-provider-activation-fence" });
+    `).get()).toEqual({ version: 38, name: "session-provider-activation-identity" });
   });
 
   it("commits a complete ledger that reopens idempotently from a real SQLite file", () => {

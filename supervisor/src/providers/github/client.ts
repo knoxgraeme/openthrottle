@@ -191,6 +191,9 @@ export const GITHUB_CONTROL_LABEL = "openthrottle";
 export const GITHUB_ISSUE_CONTEXT_LIMIT = 64_000;
 export const GITHUB_ISSUE_CONTEXT_PAGE_LIMIT = 10;
 export const GITHUB_ISSUE_CONTEXT_FETCH_BYTE_LIMIT = 8 * 1024 * 1024;
+const GITHUB_ISSUE_EVENT_PAGE_LIMIT = 10;
+const GITHUB_ISSUE_TIMELINE_PAGE_LIMIT = 10;
+const GITHUB_ISSUE_TIMELINE_PAGE_BYTE_LIMIT = 512 * 1024;
 
 export function classifyGithubIssueComment(
   event: GithubIssueCommentEvent
@@ -200,7 +203,14 @@ export function classifyGithubIssueComment(
 
 export function githubIssueControlEvent(
   event: GithubIssueControlWebhookEvent,
-  options: { promptContext?: string; sessionId?: string; providerActivatedAt?: string } = {}
+  options: {
+    promptContext?: string;
+    sessionId?: string;
+    providerActivatedAt?: string;
+    providerActivationId?: string;
+    providerActivationAdvances?: boolean;
+    providerActivationPreviousId?: string;
+  } = {}
 ): ControlThreadEvent {
   const isIssue = event.kind === "issues";
   const repository = event.repository.full_name;
@@ -221,6 +231,15 @@ export function githubIssueControlEvent(
     provider: "github",
     action: isIssue ? "created" : "prompted",
     ...(providerActivatedAt ? { providerActivatedAt } : {}),
+    ...(isIssue && options.providerActivationId
+      ? { providerActivationId: options.providerActivationId }
+      : {}),
+    ...(isIssue && options.providerActivationAdvances
+      ? { providerActivationAdvances: true }
+      : {}),
+    ...(isIssue && options.providerActivationPreviousId
+      ? { providerActivationPreviousId: options.providerActivationPreviousId }
+      : {}),
     promptContext: isIssue ? options.promptContext ?? body : undefined,
     agentSession: {
       id: options.sessionId ?? `github:${threadId}`,
@@ -460,6 +479,110 @@ export async function fetchGithubIssueLifecycle(
   return { state: issue.state, updatedAt, labels: labels.map((label) => ({ name: label.name })) };
 }
 
+export type GithubIssueControlEventRecord = {
+  id: string;
+  kind: "closed" | "reopened" | "labeled" | "unlabeled";
+  createdAt: string;
+  actorLogin: string;
+};
+
+export type GithubIssueActivationCommentOrder =
+  | "activation_before_comment"
+  | "comment_before_activation"
+  | "unresolved";
+
+type GithubIssueTimelineEventRecord = {
+  id?: number | string;
+  event?: string;
+  created_at?: string;
+  actor?: { login?: string };
+  label?: { name?: string };
+};
+
+export async function compareGithubIssueActivationAndComment(
+  client: GithubClient,
+  repo: string,
+  issueNumber: number,
+  input: {
+    activation: { id: string; createdAt: string; actorLogin?: string };
+    comment: { id: string; createdAt: string; actorLogin: string };
+  }
+): Promise<GithubIssueActivationCommentOrder> {
+  let activationSeen = false;
+  let commentSeen = false;
+  for (let page = 1; page <= GITHUB_ISSUE_TIMELINE_PAGE_LIMIT; page += 1) {
+    const events = await githubBoundedJsonArrayRequest<GithubIssueTimelineEventRecord>(
+      client,
+      `/repos/${repo}/issues/${issueNumber}/timeline?per_page=100${page === 1 ? "" : `&page=${page}`}`,
+      GITHUB_ISSUE_TIMELINE_PAGE_BYTE_LIMIT
+    );
+    if (!events) return "unresolved";
+    for (const event of events) {
+      const id = event.id === undefined ? undefined : String(event.id);
+      const actorLogin = event.actor?.login;
+      const matchesActivation =
+        id === input.activation.id &&
+        (event.event === "labeled" || event.event === "reopened") &&
+        event.created_at === input.activation.createdAt &&
+        (input.activation.actorLogin === undefined ||
+          actorLogin?.toLowerCase() === input.activation.actorLogin.toLowerCase()) &&
+        (event.event !== "labeled" || event.label?.name === GITHUB_CONTROL_LABEL);
+      const matchesComment =
+        id === input.comment.id &&
+        event.event === "commented" &&
+        event.created_at === input.comment.createdAt &&
+        actorLogin?.toLowerCase() === input.comment.actorLogin.toLowerCase();
+      if (matchesActivation) activationSeen = true;
+      if (matchesComment) commentSeen = true;
+      if (activationSeen && commentSeen) {
+        return matchesComment
+          ? "activation_before_comment"
+          : "comment_before_activation";
+      }
+    }
+    if (events.length < 100) return "unresolved";
+  }
+  return "unresolved";
+}
+
+export async function fetchGithubIssueControlEvents(
+  client: GithubClient,
+  repo: string,
+  issueNumber: number
+): Promise<GithubIssueControlEventRecord[]> {
+  const controlEvents: GithubIssueControlEventRecord[] = [];
+  for (let page = 1; page <= GITHUB_ISSUE_EVENT_PAGE_LIMIT; page += 1) {
+    const events = await githubRequest<Array<{
+      id?: number | string;
+      event?: string;
+      created_at?: string;
+      label?: { name?: string };
+      actor?: { login?: string };
+    }>>(
+      client,
+      `/repos/${repo}/issues/${issueNumber}/events?per_page=100${page === 1 ? "" : `&page=${page}`}`
+    );
+    for (const event of events) {
+      const kind = event.event === "closed" || event.event === "reopened"
+        ? event.event
+        : (event.event === "labeled" || event.event === "unlabeled") &&
+            event.label?.name === GITHUB_CONTROL_LABEL
+          ? event.event
+          : undefined;
+      if (!kind || event.id === undefined || !event.created_at || !event.actor?.login ||
+          Number.isNaN(Date.parse(event.created_at))) continue;
+      controlEvents.push({
+        id: String(event.id),
+        kind,
+        createdAt: event.created_at,
+        actorLogin: event.actor.login,
+      });
+    }
+    if (events.length < 100) return controlEvents;
+  }
+  throw new Error("GitHub Issue event history exceeded the bounded scan");
+}
+
 export async function fetchGithubIssueContext(
   client: GithubClient,
   repo: string,
@@ -558,6 +681,54 @@ async function githubRequest<T>(
   const body = await response.text();
   if (!body) return undefined as T;
   return JSON.parse(body) as T;
+}
+
+async function githubBoundedJsonArrayRequest<T>(
+  client: GithubClient,
+  path: string,
+  maxBytes: number
+): Promise<T[] | undefined> {
+  const fetchImpl = client.fetch ?? fetch;
+  const response = await fetchImpl(`${client.apiBaseUrl ?? "https://api.github.com"}${path}`, {
+    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${client.token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub API error (${response.status}): ${await response.text()}`);
+  }
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    await response.body?.cancel();
+    return undefined;
+  }
+  if (!response.body) {
+    const body = await response.text();
+    if (Buffer.byteLength(body, "utf8") > maxBytes) return undefined;
+    const value: unknown = body ? JSON.parse(body) : [];
+    if (!Array.isArray(value)) throw new Error("GitHub API returned a non-array timeline page");
+    return value as T[];
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    totalBytes += value.byteLength;
+    if (totalBytes > maxBytes) {
+      await reader.cancel();
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  const body = Buffer.concat(chunks, totalBytes).toString("utf8");
+  const value: unknown = body ? JSON.parse(body) : [];
+  if (!Array.isArray(value)) throw new Error("GitHub API returned a non-array timeline page");
+  return value as T[];
 }
 
 async function githubTextTailRequest(

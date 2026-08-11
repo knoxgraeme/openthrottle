@@ -2,13 +2,22 @@ import { createHmac } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { createSupervisorStore } from "../../persistence/store.js";
 import { openDb } from "../../persistence/database.js";
-import { considerCiGithubHead, githubIssueControlSessionId } from "./events.js";
+import { createPipelineStore } from "../../persistence/pipeline/create-store.js";
+import type { Config } from "../../app/config.js";
+import {
+  considerCiGithubHead,
+  githubIssueAdmissionPreflight,
+  githubIssueControlSessionId,
+  handleGithubEvent,
+} from "./events.js";
 import { composeBoundedTaskContext } from "../../app/admission-context.js";
 import {
   OPENTHROTTLE_WEBHOOK_EVENTS,
   branchExists,
   classifyGithubIssueComment,
+  compareGithubIssueActivationAndComment,
   ensureRepositoryControlLabel,
+  fetchGithubIssueControlEvents,
   fetchGithubIssueContext,
   getRepositoryConfigAtCommit,
   getRepositoryDirectoryAtCommit,
@@ -295,10 +304,461 @@ describe("GitHub contracts", () => {
 
     (pipelines as { getInstanceForSession: ReturnType<typeof vi.fn> }).getInstanceForSession
       .mockReturnValue({ status: "canceled", terminal_outcome: "canceled" });
-    expect(githubIssueControlSessionId({ store, pipelines, event: event("labeled") }))
-      .toBe("github:owner/repo#12:label:2026-08-11T00:00:00.000Z");
-    expect(githubIssueControlSessionId({ store, pipelines, event: event("reopened") }))
-      .toBe("github:owner/repo#12:reopened:2026-08-11T00:00:00.000Z");
+    expect(githubIssueControlSessionId({
+      store,
+      pipelines,
+      event: event("labeled"),
+      providerActivationId: "event-101",
+    })).toBe("github:owner/repo#12:label:event-101");
+    expect(githubIssueControlSessionId({
+      store,
+      pipelines,
+      event: event("labeled"),
+      providerActivationId: "event-102",
+    })).toBe("github:owner/repo#12:label:event-102");
+    expect(githubIssueControlSessionId({
+      store,
+      pipelines,
+      event: event("reopened"),
+      providerActivationId: "event-103",
+    })).toBe("github:owner/repo#12:reopened:event-103");
+  });
+
+  it("reconciles equal-second close and reopen conflicts from live provider state in either delivery order", async () => {
+    const db = openDb(":memory:");
+    const store = createSupervisorStore(db);
+    const pipelines = createPipelineStore(db);
+    const observedAt = "2026-08-11T00:00:00Z";
+    const providerStates = new Map<number, "open" | "closed">([
+      [12, "open"],
+      [13, "closed"],
+      [14, "open"],
+    ]);
+    const eventHistory = (issueNumber: number) => issueNumber === 13
+      ? [
+          { id: 1300, event: "labeled", created_at: observedAt, label: { name: "openthrottle" }, actor: { login: "operator" } },
+          { id: 1301, event: "reopened", created_at: observedAt, actor: { login: "operator" } },
+          { id: 1302, event: "closed", created_at: observedAt, actor: { login: "operator" } },
+        ]
+      : [
+          { id: issueNumber * 100, event: "labeled", created_at: observedAt, label: { name: "openthrottle" }, actor: { login: "operator" } },
+          { id: issueNumber * 100 + 1, event: "closed", created_at: observedAt, actor: { login: "operator" } },
+          { id: issueNumber * 100 + 2, event: "reopened", created_at: observedAt, actor: { login: "operator" } },
+        ];
+    let liveReads = 0;
+    let eventReads = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/collaborators/operator/permission")) {
+        return Response.json({ permission: "triage", role_name: "triage" });
+      }
+      if (/\/repos\/owner\/repo\/issues\/(12|13|14)\/events\?per_page=100$/.test(url)) {
+        eventReads += 1;
+        const issueNumber = Number(url.match(/issues\/(\d+)\/events/)?.[1]);
+        return Response.json(eventHistory(issueNumber));
+      }
+      if (/\/repos\/owner\/repo\/issues\/(12|13|14)$/.test(url)) {
+        liveReads += 1;
+        const issueNumber = Number(url.match(/issues\/(\d+)$/)?.[1]);
+        const providerState = providerStates.get(issueNumber)!;
+        return Response.json({
+          number: issueNumber,
+          title: "Ship it",
+          html_url: `https://github.com/owner/repo/issues/${issueNumber}`,
+          state: providerState,
+          created_at: observedAt,
+          updated_at: observedAt,
+          labels: providerState === "open" ? [{ name: "openthrottle" }] : [],
+        });
+      }
+      throw new Error(`unexpected GitHub request ${url}`);
+    }));
+    const cfg = { githubReadToken: "read-token" } as Config;
+    const publisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    } as never;
+    const issueEvent = (
+      issueNumber: number,
+      action: "closed" | "reopened"
+    ) => ({
+      kind: "issues" as const,
+      action,
+      repository: { full_name: "owner/repo" },
+      sender: { login: "operator" },
+      issue: {
+        number: issueNumber,
+        title: "Ship it",
+        html_url: `https://github.com/owner/repo/issues/${issueNumber}`,
+        state: action === "closed" ? "closed" as const : "open" as const,
+        updated_at: observedAt,
+        ...(action === "closed" ? { closed_at: observedAt } : {}),
+        labels: action === "reopened" ? [{ name: "openthrottle" }] : [],
+      },
+    });
+    const seedSession = (issueNumber: number, sessionId: string, activationId: string) => {
+      store.upsertUnpinned({
+        ticket_id: `github:owner/repo#${issueNumber}`,
+        ticket_reference: `GH-${issueNumber}`,
+        session_id: sessionId,
+        control_provider: "github",
+        external_thread_id: `owner/repo#${issueNumber}`,
+        external_thread_reference: `GH-${issueNumber}`,
+        provider_activated_at: observedAt,
+        provider_activation_id: activationId,
+        sandbox_id: null,
+        branch: `ot/gh-${issueNumber}`,
+        agent: "codex",
+        repo: "owner/repo",
+        base_branch: "main",
+        pr_url: null,
+        state: "active",
+      });
+    };
+
+    try {
+      // C→R with reverse webhook arrival: the provider sequence still stops A,
+      // then a delayed close cannot stop successor R.
+      seedSession(12, "session-12-a", "1200");
+      await handleGithubEvent(cfg, store, publisher, issueEvent(12, "reopened"), pipelines);
+      expect(store.getSession("session-12-a")?.state).toBe("stopped");
+      seedSession(12, "session-12-r", "1202");
+      await handleGithubEvent(cfg, store, publisher, issueEvent(12, "closed"), pipelines);
+      expect(store.getCurrentSession("github:owner/repo#12")?.id).toBe("session-12-r");
+      expect(store.getByIssueId("github:owner/repo#12")?.state).toBe("active");
+      expect(JSON.parse(store.getSetting("github-issue-lifecycle:owner/repo#12")!))
+        .toEqual({ state: "open", observedAt });
+
+      // R→C with reverse webhook arrival: live closed plus provider sequence
+      // prevents the reopen from preserving/admitting A.
+      seedSession(13, "session-13-a", "1300");
+      await handleGithubEvent(cfg, store, publisher, issueEvent(13, "reopened"), pipelines);
+      expect(store.getSession("session-13-a")?.state).toBe("stopped");
+      await handleGithubEvent(cfg, store, publisher, issueEvent(13, "closed"), pipelines);
+      expect(store.getByIssueId("github:owner/repo#13")?.state).toBe("closed");
+      expect(JSON.parse(store.getSetting("github-issue-lifecycle:owner/repo#13")!))
+        .toEqual({ state: "closed", observedAt });
+
+      // C→R in webhook order reaches the same result.
+      seedSession(14, "session-14-a", "1400");
+      await handleGithubEvent(cfg, store, publisher, issueEvent(14, "closed"), pipelines);
+      expect(store.getSession("session-14-a")?.state).toBe("stopped");
+      await handleGithubEvent(cfg, store, publisher, issueEvent(14, "reopened"), pipelines);
+      seedSession(14, "session-14-r", "1402");
+      expect(store.getCurrentSession("github:owner/repo#14")?.id).toBe("session-14-r");
+      expect(liveReads).toBe(6);
+      expect(eventReads).toBe(6);
+    } finally {
+      vi.unstubAllGlobals();
+      db.close();
+    }
+  });
+
+  it("returns only body-free exact control events across bounded Issue Event pages", async () => {
+    const requests: string[] = [];
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({
+      id: index + 1,
+      event: "commented",
+      created_at: "2026-08-11T00:00:30Z",
+      actor: { login: "operator" },
+      body: "untrusted body must not participate in activation proof",
+    }));
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.endsWith("/events?per_page=100")) return Response.json(firstPage);
+      if (url.endsWith("/events?per_page=100&page=2")) {
+        return Response.json([
+          {
+            id: 101,
+            event: "labeled",
+            created_at: "2026-08-11T00:00:45Z",
+            label: { name: "OpenThrottle" },
+            actor: { login: "operator" },
+          },
+          {
+            id: 102,
+            event: "labeled",
+            created_at: "2026-08-11T00:00:00Z",
+            label: { name: "openthrottle" },
+            actor: { login: "operator" },
+          },
+          {
+            id: 103,
+            event: "reopened",
+            created_at: "2026-08-11T00:01:01Z",
+            actor: { login: "operator" },
+          },
+          {
+            id: 104,
+            event: "labeled",
+            created_at: "2026-08-11T00:00:45Z",
+            label: { name: "openthrottle" },
+            actor: { login: "operator" },
+          },
+          {
+            id: 105,
+            event: "unlabeled",
+            created_at: "2026-08-11T00:02:00Z",
+            label: { name: "openthrottle" },
+            actor: { login: "operator" },
+          },
+        ]);
+      }
+      throw new Error(`unexpected GitHub request ${url}`);
+    });
+
+    await expect(fetchGithubIssueControlEvents(
+      { token: "read-token", fetch: fetchMock },
+      "owner/repo",
+      12
+    )).resolves.toEqual([
+      {
+        id: "102",
+        kind: "labeled",
+        createdAt: "2026-08-11T00:00:00Z",
+        actorLogin: "operator",
+      },
+      {
+        id: "103",
+        kind: "reopened",
+        createdAt: "2026-08-11T00:01:01Z",
+        actorLogin: "operator",
+      },
+      {
+        id: "104",
+        kind: "labeled",
+        createdAt: "2026-08-11T00:00:45Z",
+        actorLogin: "operator",
+      },
+      {
+        id: "105",
+        kind: "unlabeled",
+        createdAt: "2026-08-11T00:02:00Z",
+        actorLogin: "operator",
+      },
+    ]);
+    expect(requests).toHaveLength(2);
+  });
+
+  it("orders equal-second activation and comments only by their bounded provider timeline sequence", async () => {
+    const activation = {
+      id: "905",
+      event: "labeled",
+      created_at: "2026-08-11T00:03:00Z",
+      label: { name: "openthrottle" },
+      actor: { login: "operator" },
+    };
+    const comment = {
+      id: 112,
+      event: "commented",
+      created_at: "2026-08-11T00:03:00Z",
+      actor: { login: "operator" },
+      body: "untrusted body is discarded after the bounded response is parsed",
+    };
+    for (const [events, expected] of [
+      [[activation, comment], "activation_before_comment"],
+      [[comment, activation], "comment_before_activation"],
+    ] as const) {
+      const fetchMock = vi.fn(async (_input: string | URL | Request) => Response.json(events));
+      await expect(compareGithubIssueActivationAndComment(
+        { token: "read-token", fetch: fetchMock },
+        "owner/repo",
+        12,
+        {
+          activation: { id: "905", createdAt: activation.created_at, actorLogin: "operator" },
+          comment: { id: "112", createdAt: comment.created_at, actorLogin: "operator" },
+        }
+      )).resolves.toBe(expected);
+      expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/timeline?per_page=100");
+    }
+  });
+
+  it("fails timeline ordering closed at the response-byte and page bounds", async () => {
+    const oversizedFetch = vi.fn(async () => Response.json([{
+      id: 1,
+      event: "commented",
+      created_at: "2026-08-11T00:03:00Z",
+      actor: { login: "operator" },
+      body: "x".repeat(600_000),
+    }]));
+    const comparison = {
+      activation: { id: "905", createdAt: "2026-08-11T00:03:00Z" },
+      comment: { id: "112", createdAt: "2026-08-11T00:03:00Z", actorLogin: "operator" },
+    };
+    await expect(compareGithubIssueActivationAndComment(
+      { token: "read-token", fetch: oversizedFetch },
+      "owner/repo",
+      12,
+      comparison
+    )).resolves.toBe("unresolved");
+    expect(oversizedFetch).toHaveBeenCalledTimes(1);
+
+    const fullPage = Array.from({ length: 100 }, (_, index) => ({
+      id: index + 1,
+      event: "assigned",
+      created_at: "2026-08-11T00:03:00Z",
+      actor: { login: "operator" },
+    }));
+    const paginatedFetch = vi.fn(async () => Response.json(fullPage));
+    await expect(compareGithubIssueActivationAndComment(
+      { token: "read-token", fetch: paginatedFetch },
+      "owner/repo",
+      12,
+      comparison
+    )).resolves.toBe("unresolved");
+    expect(paginatedFetch).toHaveBeenCalledTimes(10);
+  });
+
+  it("fails the final admission preflight when the control label was removed after activation", async () => {
+    const db = openDb(":memory:");
+    const store = createSupervisorStore(db);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      number: 12,
+      state: "open",
+      created_at: "2026-08-11T00:00:00Z",
+      updated_at: "2026-08-11T00:01:00Z",
+      labels: [],
+    })));
+    try {
+      const preflight = githubIssueAdmissionPreflight({
+        cfg: { githubReadToken: "read-token" } as Config,
+        store,
+        repository: "owner/repo",
+        issueNumber: 12,
+        expectedProviderActivation: { id: "905", actorLogin: "operator" },
+      });
+      await expect(preflight({ repository: "owner/repo", baseCommit: "abc123" }))
+        .resolves.toEqual({
+          ok: false,
+          reason: expect.stringContaining("no longer has the exact openthrottle control label"),
+        });
+    } finally {
+      vi.unstubAllGlobals();
+      db.close();
+    }
+  });
+
+  it("fails the final admission preflight when selection outlives its exact activation epoch", async () => {
+    const db = openDb(":memory:");
+    const store = createSupervisorStore(db);
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/repo/issues/12")) {
+        return Response.json({
+          number: 12,
+          state: "open",
+          created_at: "2026-08-11T00:00:00Z",
+          updated_at: "2026-08-11T00:03:00Z",
+          labels: [{ name: "openthrottle" }],
+        });
+      }
+      if (url.endsWith("/collaborators/operator/permission")) {
+        return Response.json({ permission: "triage", role_name: "triage" });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/events?per_page=100")) {
+        return Response.json([{
+          id: 906,
+          event: "labeled",
+          created_at: "2026-08-11T00:03:00Z",
+          label: { name: "openthrottle" },
+          actor: { login: "operator" },
+        }]);
+      }
+      throw new Error(`unexpected GitHub request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const preflight = githubIssueAdmissionPreflight({
+        cfg: { githubReadToken: "read-token" } as Config,
+        store,
+        repository: "owner/repo",
+        issueNumber: 12,
+        expectedProviderActivation: { id: "905", actorLogin: "operator" },
+      });
+      await expect(preflight({ repository: "owner/repo", baseCommit: "abc123" }))
+        .resolves.toEqual({
+          ok: false,
+          reason: expect.stringContaining("activation epoch changed"),
+        });
+    } finally {
+      vi.unstubAllGlobals();
+      db.close();
+    }
+  });
+
+  it("fails the final admission preflight when the exact label is removed after its live read", async () => {
+    const db = openDb(":memory:");
+    const store = createSupervisorStore(db);
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/repo/issues/12")) {
+        return Response.json({
+          number: 12,
+          state: "open",
+          created_at: "2026-08-11T00:00:00Z",
+          updated_at: "2026-08-11T00:03:00Z",
+          labels: [{ name: "openthrottle" }],
+        });
+      }
+      if (url.endsWith("/collaborators/operator/permission")) {
+        return Response.json({ permission: "triage", role_name: "triage" });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/events?per_page=100")) {
+        return Response.json([
+          {
+            id: 905,
+            event: "labeled",
+            created_at: "2026-08-11T00:03:00Z",
+            label: { name: "openthrottle" },
+            actor: { login: "operator" },
+          },
+          {
+            id: 906,
+            event: "unlabeled",
+            created_at: "2026-08-11T00:03:01Z",
+            label: { name: "openthrottle" },
+            actor: { login: "operator" },
+          },
+        ]);
+      }
+      throw new Error(`unexpected GitHub request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const preflight = githubIssueAdmissionPreflight({
+        cfg: { githubReadToken: "read-token" } as Config,
+        store,
+        repository: "owner/repo",
+        issueNumber: 12,
+        expectedProviderActivation: { id: "905", actorLogin: "operator" },
+      });
+      await expect(preflight({ repository: "owner/repo", baseCommit: "abc123" }))
+        .resolves.toEqual({
+          ok: false,
+          reason: expect.stringContaining("activation epoch changed"),
+        });
+    } finally {
+      vi.unstubAllGlobals();
+      db.close();
+    }
+  });
+
+  it("fails closed when the bounded Issue Event history cannot reach its newest page", async () => {
+    const fullPage = Array.from({ length: 100 }, (_, index) => ({
+      id: index + 1,
+      event: "assigned",
+      created_at: "2026-08-11T00:00:00Z",
+      actor: { login: "operator" },
+    }));
+    const fetchMock = vi.fn(async () => Response.json(fullPage));
+
+    await expect(fetchGithubIssueControlEvents(
+      { token: "read-token", fetch: fetchMock },
+      "owner/repo",
+      12
+    )).rejects.toThrow("exceeded the bounded scan");
+    expect(fetchMock).toHaveBeenCalledTimes(10);
   });
 
   it("maps current GitHub collaborator permissions and authorizes triage or stronger", async () => {

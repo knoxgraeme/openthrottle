@@ -215,7 +215,26 @@ describe("deterministic supervisor stage gates", () => {
   }
 
   async function closeGithubIssue(fixture: Fixture): Promise<void> {
-    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ permission: "write" })));
+    const closedAt = "2098-01-01T00:00:00.000Z";
+    vi.stubGlobal("fetch", vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/repo/issues/1/events?per_page=100")) {
+        return Response.json([{
+          id: 101,
+          event: "closed",
+          created_at: closedAt,
+          actor: { login: "operator" },
+        }]);
+      }
+      if (url.endsWith("/repos/owner/repo/issues/1")) {
+        return Response.json({
+          state: "closed",
+          updated_at: closedAt,
+          labels: [],
+        });
+      }
+      return Response.json({ permission: "write" });
+    }));
     await handleGithubEvent(
       { githubReadToken: "read-token" } as never,
       fixture.tickets,
@@ -229,6 +248,9 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           title: "Ship the provider path",
           html_url: "https://github.com/owner/repo/issues/1",
+          state: "closed",
+          closed_at: closedAt,
+          updated_at: closedAt,
         },
       },
       fixture.pipelines

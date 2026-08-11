@@ -4,8 +4,11 @@
 import type { Config } from "../../app/config.js";
 import type { SupervisorStore } from "../../persistence/store.js";
 import {
+  GITHUB_CONTROL_LABEL,
+  compareGithubIssueActivationAndComment,
   getFailingGithubCheckDetails,
   fetchGithubIssueContext,
+  fetchGithubIssueControlEvents,
   fetchGithubIssueLifecycle,
   getRepositoryCollaboratorPermission,
   githubIssueHasExactControlLabel,
@@ -14,6 +17,7 @@ import {
   classifyGithubIssueComment,
   isAuthorizedGithubControlPermission,
   isOpenthrottleBranch,
+  type GithubIssueControlEventRecord,
   type GithubWebhookEvent,
 } from "./client.js";
 import type { ActivityPublicationPort } from "../../app/ports.js";
@@ -37,6 +41,10 @@ type ProviderFinding = {
   code: string;
   summary: string;
 };
+
+const GITHUB_COMMENT_ORDERING_GUIDANCE =
+  "OpenThrottle could not prove whether this same-second GitHub Issue comment followed the activation. " +
+  "Please resend the comment after the activation is visible so it can be routed safely.";
 
 export function routePipelineProviderEvent(params: {
   pipelines: PipelineStore;
@@ -212,7 +220,8 @@ function recordGithubIssueLifecycle(
   store: SupervisorStore,
   repository: string,
   issueNumber: number,
-  lifecycle: GithubIssueLifecycle
+  lifecycle: GithubIssueLifecycle,
+  providerAuthoritative = false
 ): GithubIssueLifecycle {
   const prior = readGithubIssueLifecycle(store, repository, issueNumber);
   const nextTime = Date.parse(lifecycle.observedAt);
@@ -220,7 +229,8 @@ function recordGithubIssueLifecycle(
   if (prior) {
     const priorTime = Date.parse(prior.observedAt);
     if (nextTime < priorTime ||
-        (nextTime === priorTime && prior.state === "closed" && lifecycle.state === "open")) {
+        (!providerAuthoritative && nextTime === priorTime &&
+          prior.state === "closed" && lifecycle.state === "open")) {
       return prior;
     }
   }
@@ -249,6 +259,23 @@ function eventPredatesCurrentSession(
     Date.parse(providerTimestamp) < Date.parse(providerActivatedAt);
 }
 
+function githubIssueCommentTimestampOrder(
+  store: SupervisorStore,
+  ticket: NonNullable<ReturnType<SupervisorStore["getByIssueId"]>>,
+  providerTimestamp: string | undefined
+): "before" | "equal" | "after" | "unknown" {
+  const session = store.getCurrentSession(ticket.ticket_id) ?? store.getSession(ticket.session_id);
+  const providerActivatedAt = session?.provider_activated_at ?? session?.created_at;
+  if (!providerActivatedAt || !providerTimestamp ||
+      Number.isNaN(Date.parse(providerActivatedAt)) ||
+      Number.isNaN(Date.parse(providerTimestamp))) return "unknown";
+  const commentTime = Date.parse(providerTimestamp);
+  const activationTime = Date.parse(providerActivatedAt);
+  if (commentTime < activationTime) return "before";
+  if (commentTime > activationTime) return "after";
+  return "equal";
+}
+
 function lifecycleFromIssueEvent(
   event: Extract<GithubWebhookEvent, { kind: "issues" }>
 ): GithubIssueLifecycle | undefined {
@@ -258,11 +285,129 @@ function lifecycleFromIssueEvent(
   return { state, observedAt };
 }
 
+export function githubIssueAdmissionPreflight(input: {
+  cfg: Config;
+  store: SupervisorStore;
+  repository: string;
+  issueNumber: number;
+  expectedProviderActivation: Pick<GithubIssueControlEventRecord, "id" | "actorLogin">;
+  upstream?: AdmissionPreflight;
+}): AdmissionPreflight {
+  return async (target) => {
+    if (input.upstream) {
+      const verdict = await input.upstream(target);
+      if (!verdict.ok) return verdict;
+    }
+    const live = await fetchGithubIssueLifecycle(
+      { token: input.cfg.githubReadToken },
+      input.repository,
+      input.issueNumber
+    );
+    const current = recordGithubIssueLifecycle(
+      input.store,
+      input.repository,
+      input.issueNumber,
+      { state: live.state, observedAt: live.updatedAt },
+      true
+    );
+    if (current.state === "closed") {
+      return {
+        ok: false,
+        reason: `GitHub Issue ${input.repository}#${input.issueNumber} is closed, so no pipeline was admitted. Reopen it to start a new generation.`,
+      };
+    }
+    if (!githubIssueHasExactControlLabel(live.labels)) {
+      return {
+        ok: false,
+        reason: `GitHub Issue ${input.repository}#${input.issueNumber} no longer has the exact ${GITHUB_CONTROL_LABEL} control label, so no pipeline was admitted.`,
+      };
+    }
+    if (!await authorizedGithubControlActor(
+      input.cfg,
+      input.repository,
+      input.expectedProviderActivation.actorLogin
+    )) {
+      return {
+        ok: false,
+        reason: `GitHub Issue ${input.repository}#${input.issueNumber}'s activation actor is no longer authorized, so no pipeline was admitted.`,
+      };
+    }
+    // Make the body-free Issue Event stream the last provider read before the
+    // synchronous admission transaction. Live state and label alone cannot
+    // prove that a slow selection still belongs to the same activation epoch.
+    const controlEvents = await fetchGithubIssueControlEvents(
+      { token: input.cfg.githubReadToken },
+      input.repository,
+      input.issueNumber
+    );
+    const currentActivation = currentGithubIssueActivation(controlEvents);
+    if (!currentActivation ||
+        currentActivation.id !== input.expectedProviderActivation.id ||
+        currentActivation.actorLogin.toLowerCase() !==
+          input.expectedProviderActivation.actorLogin.toLowerCase()) {
+      return {
+        ok: false,
+        reason: `GitHub Issue ${input.repository}#${input.issueNumber}'s activation epoch changed while admission was prepared, so this stale delivery admitted no pipeline.`,
+      };
+    }
+    return { ok: true };
+  };
+}
+
+function latestGithubIssueControlEvent(
+  events: GithubIssueControlEventRecord[],
+  kinds: ReadonlySet<GithubIssueControlEventRecord["kind"]>
+): GithubIssueControlEventRecord | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (!kinds.has(event.kind)) continue;
+    return event;
+  }
+  return undefined;
+}
+
+function currentGithubIssueActivation(
+  events: GithubIssueControlEventRecord[]
+): GithubIssueControlEventRecord | undefined {
+  let latestDeactivationIndex = -1;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index]!.kind === "closed" || events[index]!.kind === "unlabeled") {
+      latestDeactivationIndex = index;
+      break;
+    }
+  }
+  for (let index = events.length - 1; index > latestDeactivationIndex; index -= 1) {
+    const event = events[index]!;
+    if (event.kind === "labeled" || event.kind === "reopened") return event;
+  }
+  return undefined;
+}
+
+function githubIssueControlEventIsAfterSession(
+  events: GithubIssueControlEventRecord[],
+  event: GithubIssueControlEventRecord,
+  session: NonNullable<ReturnType<SupervisorStore["getSession"]>>,
+  allowEqualTimestampWithoutCursor = false
+): boolean {
+  if (session.provider_activation_id) {
+    const sessionIndex = events.findIndex((candidate) => candidate.id === session.provider_activation_id);
+    if (sessionIndex < 0) {
+      throw new Error("GitHub Issue activation cursor is outside the bounded event history");
+    }
+    return events.findIndex((candidate) => candidate.id === event.id) > sessionIndex;
+  }
+  const activatedAt = session.provider_activated_at ?? session.created_at;
+  return allowEqualTimestampWithoutCursor
+    ? Date.parse(event.createdAt) >= Date.parse(activatedAt)
+    : Date.parse(event.createdAt) > Date.parse(activatedAt);
+}
+
 export function githubIssueControlSessionId(input: {
   store: SupervisorStore;
   pipelines: PipelineStore;
   event: Extract<GithubWebhookEvent, { kind: "issues" }>;
   deliveryId?: string;
+  providerActivationId?: string;
 }): string | undefined {
   const externalThreadId = `${input.event.repository.full_name}#${input.event.issue.number}`;
   const ticket = input.store.getByExternalThread("github", externalThreadId);
@@ -271,10 +416,10 @@ export function githubIssueControlSessionId(input: {
     : undefined;
   if (current && !pipelineIsTerminal(current)) return ticket!.session_id;
   if (input.event.action === "reopened") {
-    return `github:${externalThreadId}:reopened:${input.event.issue.updated_at ?? input.deliveryId ?? "current"}`;
+    return `github:${externalThreadId}:reopened:${input.providerActivationId ?? input.deliveryId ?? "current"}`;
   }
   if (ticket && input.event.action === "labeled") {
-    return `github:${externalThreadId}:label:${input.event.issue.updated_at ?? input.deliveryId ?? "current"}`;
+    return `github:${externalThreadId}:label:${input.providerActivationId ?? input.deliveryId ?? "current"}`;
   }
   if (ticket) return undefined;
   return `github:${externalThreadId}:initial`;
@@ -576,6 +721,52 @@ export async function handleGithubEvent(
       const currentPipeline = existingTicket
         ? pipelines.getInstanceForSession(existingTicket.session_id)
         : undefined;
+      const currentSession = existingTicket
+        ? store.getCurrentSession(existingTicket.ticket_id) ??
+          store.getSession(existingTicket.session_id)
+        : undefined;
+      if (existingTicket && currentSession) {
+        const timestampOrder = githubIssueCommentTimestampOrder(
+          store,
+          existingTicket,
+          event.comment.created_at
+        );
+        if (timestampOrder === "before") return;
+        if (timestampOrder === "equal" || timestampOrder === "unknown") {
+          const providerActivatedAt = currentSession.provider_activated_at ??
+            currentSession.created_at;
+          const exactOrder = timestampOrder === "equal" &&
+              currentSession.provider_activation_id && providerActivatedAt &&
+              event.comment.created_at
+            ? await compareGithubIssueActivationAndComment(
+                { token: _cfg.githubReadToken },
+                event.repository.full_name,
+                event.issue.number,
+                {
+                  activation: {
+                    id: currentSession.provider_activation_id,
+                    createdAt: providerActivatedAt,
+                  },
+                  comment: {
+                    id: String(event.comment.id),
+                    createdAt: event.comment.created_at,
+                    actorLogin: author!,
+                  },
+                }
+              )
+            : "unresolved";
+          if (exactOrder === "comment_before_activation") return;
+          if (exactOrder === "unresolved" && currentPipeline &&
+              !pipelineIsTerminal(currentPipeline)) {
+            await activityPublisher.publishError(
+              currentSession.id,
+              existingTicket.ticket_id,
+              GITHUB_COMMENT_ORDERING_GUIDANCE
+            );
+            return;
+          }
+        }
+      }
       if (
         (!existingTicket || !currentPipeline || pipelineIsTerminal(currentPipeline)) &&
         store.githubIssueAdmissionInFlight(
@@ -602,12 +793,71 @@ export async function handleGithubEvent(
           // it cannot acknowledge a missing workspace ahead of admission.
           throw new Error("GitHub Issue activation is not durable yet");
         }
+      } else if (!currentPipeline || pipelineIsTerminal(currentPipeline)) {
+        const session = currentSession;
+        const providerActivatedAt = session?.provider_activated_at ?? session?.created_at;
+        const live = await fetchGithubIssueLifecycle(
+          { token: _cfg.githubReadToken },
+          event.repository.full_name,
+          event.issue.number
+        );
+        if (providerActivatedAt && event.comment.created_at && live.state === "open" &&
+            githubIssueHasExactControlLabel(live.labels)) {
+          const controlEvents = await fetchGithubIssueControlEvents(
+              { token: _cfg.githubReadToken },
+              event.repository.full_name,
+              event.issue.number
+          );
+          const latestActivation = currentGithubIssueActivation(controlEvents);
+          const activationFollowsSession = Boolean(session && latestActivation &&
+            githubIssueControlEventIsAfterSession(controlEvents, latestActivation, session));
+          const activationIsAuthorized = latestActivation
+            ? await authorizedGithubControlActor(
+                _cfg,
+                event.repository.full_name,
+                latestActivation.actorLogin
+              )
+            : false;
+          let activationPrecedesComment = false;
+          if (session && latestActivation && activationFollowsSession && activationIsAuthorized) {
+            const activationTime = Date.parse(latestActivation.createdAt);
+            const commentTime = Date.parse(event.comment.created_at);
+            if (activationTime < commentTime) {
+              activationPrecedesComment = true;
+            } else if (activationTime === commentTime && author) {
+              const exactOrder = await compareGithubIssueActivationAndComment(
+                { token: _cfg.githubReadToken },
+                event.repository.full_name,
+                event.issue.number,
+                {
+                  activation: latestActivation,
+                  comment: {
+                    id: String(event.comment.id),
+                    createdAt: event.comment.created_at,
+                    actorLogin: author,
+                  },
+                }
+              );
+              if (exactOrder === "unresolved") {
+                await activityPublisher.publishError(
+                  session.id,
+                  existingTicket.ticket_id,
+                  GITHUB_COMMENT_ORDERING_GUIDANCE
+                );
+                return;
+              }
+              activationPrecedesComment = exactOrder === "activation_before_comment";
+            }
+          }
+          if (activationPrecedesComment) {
+            // A provider-authoritative activation newer than the retained
+            // terminal session exists, but its delivery has not become durable.
+            // Keep the comment retryable without treating a merely still-labeled
+            // terminal Issue as evidence of a successor generation.
+            throw new Error("GitHub Issue activation is not durable yet");
+          }
+        }
       }
-      if (existingTicket && eventPredatesCurrentSession(
-        store,
-        existingTicket,
-        event.comment.created_at
-      )) return;
       await handleControlEvent(
         _cfg,
         store,
@@ -655,32 +905,69 @@ export async function handleGithubEvent(
   }
 
   if (event.kind === "issues") {
+    const carriesControl = githubIssuesEventCarriesExactControlLabel(event);
+    const needsProviderOrdering = event.action === "closed" || carriesControl;
+    if (needsProviderOrdering) {
+      const author = event.sender?.login;
+      if (!await authorizedGithubControlActor(_cfg, event.repository.full_name, author)) return;
+    }
     const eventLifecycle = lifecycleFromIssueEvent(event);
-    const lifecycle = eventLifecycle
+    const priorLifecycle = readGithubIssueLifecycle(
+      store,
+      event.repository.full_name,
+      event.issue.number
+    );
+    const live = needsProviderOrdering
+      ? await fetchGithubIssueLifecycle(
+          { token: _cfg.githubReadToken },
+          event.repository.full_name,
+          event.issue.number
+        )
+      : undefined;
+    const controlEvents = needsProviderOrdering
+      ? await fetchGithubIssueControlEvents(
+          { token: _cfg.githubReadToken },
+          event.repository.full_name,
+          event.issue.number
+        )
+      : [];
+    const latestLifecycleEvent = latestGithubIssueControlEvent(
+      controlEvents,
+      new Set(["closed", "reopened"])
+    );
+    const lifecycle = live
       ? recordGithubIssueLifecycle(
           store,
           event.repository.full_name,
           event.issue.number,
-          eventLifecycle
+          { state: live.state, observedAt: latestLifecycleEvent?.createdAt ?? live.updatedAt },
+          true
         )
-      : readGithubIssueLifecycle(store, event.repository.full_name, event.issue.number);
-    if (event.action === "closed" || githubIssuesEventCarriesExactControlLabel(event)) {
-      const author = event.sender?.login;
-      if (!await authorizedGithubControlActor(_cfg, event.repository.full_name, author)) return;
-    }
-    if (event.action === "closed") {
-      const ticket = store.getByExternalThread(
-        "github",
-        `${event.repository.full_name}#${event.issue.number}`
-      );
-      if (!ticket) return;
-      if (eventPredatesCurrentSession(store, ticket, githubIssueEventTimestamp(event))) return;
+      : eventLifecycle
+        ? recordGithubIssueLifecycle(
+            store,
+            event.repository.full_name,
+            event.issue.number,
+            eventLifecycle
+          )
+        : priorLifecycle;
+    const externalThreadId = `${event.repository.full_name}#${event.issue.number}`;
+    let ticket = store.getByExternalThread("github", externalThreadId);
+    const currentSession = ticket
+      ? store.getCurrentSession(ticket.ticket_id) ?? store.getSession(ticket.session_id)
+      : undefined;
+    const latestClose = latestGithubIssueControlEvent(controlEvents, new Set(["closed"]));
+    const closeCrossesCurrentSession = Boolean(
+      currentSession && latestClose &&
+      githubIssueControlEventIsAfterSession(controlEvents, latestClose, currentSession, true)
+    );
+    if (ticket && closeCrossesCurrentSession && latestClose) {
       const pipelineInstance = pipelines.getInstanceForSession(ticket.session_id);
       if (pipelineInstance && !pipelineIsTerminal(pipelineInstance)) {
         requestPipelineStop({
           store: pipelines,
           sessionId: ticket.session_id,
-          eventId: `github-issue-closed:${pipelineInstance.id}:${event.repository.full_name}:${event.issue.number}`,
+          eventId: `github-issue-closed:${pipelineInstance.id}:${latestClose.id}`,
           reason: "GitHub Issue closed while a pipeline stage was active.",
           ticketState: "closed",
         });
@@ -689,49 +976,74 @@ export async function handleGithubEvent(
       store.markSessionState(ticket.session_id, "stopped");
       store.cancelPendingInbox(ticket.ticket_id);
       await control?.coordinator.drainEffects?.();
+      ticket = store.getByExternalThread("github", externalThreadId);
+    }
+    if (event.action === "closed") {
+      // A delayed close older than the current activation must never cancel
+      // that successor. If GitHub is currently open, the authoritative event
+      // stream still closes the crossed older generation, then leaves the
+      // matching reopen delivery to admit its successor.
       return;
     }
-    if (!control || !githubIssuesEventCarriesExactControlLabel(event)) return;
-    const externalThreadId = `${event.repository.full_name}#${event.issue.number}`;
-    const ticket = store.getByExternalThread("github", externalThreadId);
-    if (ticket && eventPredatesCurrentSession(store, ticket, githubIssueEventTimestamp(event))) return;
-    if (lifecycle?.state === "closed") return;
+    if (!control || !carriesControl) return;
+    if (lifecycle?.state === "closed" || live?.state === "closed" ||
+        !live || !githubIssueHasExactControlLabel(live.labels)) return;
+    if (ticket && !closeCrossesCurrentSession && eventPredatesCurrentSession(
+      store,
+      ticket,
+      githubIssueEventTimestamp(event)
+    )) return;
+    const providerActivatedAt = githubIssueEventTimestamp(event);
+    const activationKind = event.action === "reopened" ? "reopened" : "labeled";
+    const sender = event.sender?.login;
+    const providerActivation = providerActivatedAt && sender
+      ? [...controlEvents].reverse().find((candidate) =>
+          candidate.kind === activationKind &&
+          candidate.actorLogin.toLowerCase() === sender.toLowerCase() &&
+          Date.parse(candidate.createdAt) === Date.parse(providerActivatedAt)
+        )
+      : undefined;
+    if (!providerActivation) {
+      throw new Error("GitHub Issue activation is not yet durable in provider event history");
+    }
+    const currentProviderActivation = currentGithubIssueActivation(controlEvents);
+    if (!currentProviderActivation) {
+      throw new Error("GitHub Issue current activation epoch is not yet durable in provider event history");
+    }
+    if (providerActivation.id !== currentProviderActivation.id) {
+      // The signed delivery is authentic but stale: a later provider epoch is
+      // already authoritative and its independently authorized webhook owns
+      // admission. Never let this delivery borrow that later epoch's cursor.
+      return;
+    }
+    const providerActivationAdvances = Boolean(
+      currentSession && providerActivation &&
+      githubIssueControlEventIsAfterSession(controlEvents, providerActivation, currentSession, true)
+    );
     const sessionId = githubIssueControlSessionId({
       store,
       pipelines,
       event,
       deliveryId: control.deliveryId,
+      providerActivationId: providerActivation.id,
     });
     if (!sessionId) return;
-    const providerActivatedAt = githubIssueEventTimestamp(event);
     const promptContext = await fetchGithubIssueContext(
-      { token: _cfg.githubReadToken },
-      event.repository.full_name,
-      event.issue.number
-    );
-    const finalIssuePreflight: AdmissionPreflight = async (target) => {
-      if (control.preflight) {
-        const verdict = await control.preflight(target);
-        if (!verdict.ok) return verdict;
-      }
-      const live = await fetchGithubIssueLifecycle(
         { token: _cfg.githubReadToken },
         event.repository.full_name,
         event.issue.number
       );
-      const current = recordGithubIssueLifecycle(
-        store,
-        event.repository.full_name,
-        event.issue.number,
-        { state: live.state, observedAt: live.updatedAt }
-      );
-      return current.state === "closed"
-        ? {
-            ok: false,
-            reason: `GitHub Issue ${event.repository.full_name}#${event.issue.number} is closed, so no pipeline was admitted. Reopen it to start a new generation.`,
-          }
-        : { ok: true };
-    };
+    const finalIssuePreflight = githubIssueAdmissionPreflight({
+      cfg: _cfg,
+      store,
+      repository: event.repository.full_name,
+      issueNumber: event.issue.number,
+      expectedProviderActivation: {
+        id: providerActivation.id,
+        actorLogin: providerActivation.actorLogin,
+      },
+      upstream: control.preflight,
+    });
     await handleControlEvent(
       _cfg,
       store,
@@ -740,6 +1052,11 @@ export async function handleGithubEvent(
         promptContext,
         sessionId,
         ...(providerActivatedAt ? { providerActivatedAt } : {}),
+        ...(providerActivation ? { providerActivationId: providerActivation.id } : {}),
+        ...(providerActivationAdvances ? { providerActivationAdvances: true } : {}),
+        ...(providerActivationAdvances && currentSession?.provider_activation_id
+          ? { providerActivationPreviousId: currentSession.provider_activation_id }
+          : {}),
       }),
       control.coordinator,
       finalIssuePreflight

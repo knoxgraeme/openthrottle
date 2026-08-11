@@ -79,6 +79,7 @@ export interface AgentSession {
   state: "current" | "stopping" | "stopped" | "superseded";
   provider_conversation_id: string | null;
   provider_activated_at: string | null;
+  provider_activation_id: string | null;
   created_at: string;
   updated_at: string;
   superseded_at: string | null;
@@ -100,6 +101,7 @@ export type TicketUpsert = Pick<
   external_thread_id?: string;
   external_thread_reference?: string;
   provider_activated_at?: string;
+  provider_activation_id?: string;
   base_branch?: string;
   pipeline?: Omit<PipelineInstanceSeed, "issueId" | "sessionId" | "generation" | "branch" | "agent">;
 };

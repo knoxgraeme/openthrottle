@@ -2090,6 +2090,10 @@ SET provider_activated_at = created_at
 WHERE provider_activated_at IS NULL;
 provider-activation-fence-contract:session generations retain the provider timestamp that activated them; legacy rows conservatively fall back to their local creation timestamp/v1`;
 
+const providerActivationIdentityMigrationSource = `
+ALTER TABLE agent_sessions ADD COLUMN provider_activation_id TEXT;
+provider-activation-identity-contract:GitHub-controlled session generations retain the opaque Issue Event id that authoritatively activated them/v1`;
+
 type GithubHeadSource =
   | { kind: "authoritative" }
   | { kind: "sequenced"; source: string; sequence: number };
@@ -3102,6 +3106,17 @@ const definitions: DatabaseMigrationDefinition[] = [
         SET provider_activated_at = created_at
         WHERE provider_activated_at IS NULL
       `);
+    },
+  },
+  {
+    version: 38,
+    name: "session-provider-activation-identity",
+    source: providerActivationIdentityMigrationSource,
+    up(db) {
+      if (!hasTable(db, "agent_sessions")) return;
+      if (!hasColumns(db, "agent_sessions", ["provider_activation_id"])) {
+        db.exec("ALTER TABLE agent_sessions ADD COLUMN provider_activation_id TEXT");
+      }
     },
   },
 ];

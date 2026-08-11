@@ -153,7 +153,11 @@ describe("coordinator-only server", () => {
     });
   }
 
-  function seedPipelineTicket(sessionId = "session-1"): void {
+  function seedPipelineTicket(
+    sessionId = "session-1",
+    ticketId = "issue-1",
+    ticketReference = "OT-1"
+  ): void {
     const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
     const catalog = loadPipelineCatalog(
       fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url)),
@@ -169,8 +173,8 @@ describe("coordinator-only server", () => {
     });
     const manifest = catalog.manifests.get("fixture/command@1")!;
     store.upsert({
-      ticket_id: "issue-1",
-      ticket_reference: "OT-1",
+      ticket_id: ticketId,
+      ticket_reference: ticketReference,
       session_id: sessionId,
       sandbox_id: null,
       branch: "ot/ot-1",
@@ -1963,23 +1967,94 @@ describe("coordinator-only server", () => {
     ).get("github-comment-after-durable-admission")).toEqual({ status: "processed" });
   });
 
-  it("defers a terminal generation comment only while a successor admission is durable", async () => {
+  it("uses the Issue Event cursor to advance an active session and defer only a newer terminal relabel", async () => {
     const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
     const catalog = loadPipelineCatalog(
-      fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url)),
+      fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url)),
       runtime.descriptor
     );
     pipelines.acceptRuntimeDescriptor(runtime);
     pipelines.acceptCatalog(catalog);
     const postedBodies: string[] = [];
+    let liveUpdatedAt = "2026-08-11T00:01:00Z";
+    let advanceEpochDuringNextSelection = false;
+    let timelineResponseMode: "normal" | "oversized" | "full-pages" = "normal";
+    const repositoryConfigContent = "schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\n";
+    const timelineEvents: Array<Record<string, unknown>> = [{
+      id: 900,
+      event: "labeled",
+      created_at: "2026-08-11T00:00:00Z",
+      label: { name: "openthrottle" },
+      actor: { login: "operator" },
+    }];
+    const issueTimeline: Array<Record<string, unknown>> = [];
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.endsWith("/collaborators/operator/permission")) {
         return Response.json({ permission: "triage", role_name: "triage" });
       }
+      if (url.endsWith("/repos/owner/repo/issues/12") && method === "GET") {
+        return Response.json({
+          number: 12,
+          title: "Ship it",
+          html_url: "https://github.com/owner/repo/issues/12",
+          state: "open",
+          created_at: "2026-08-11T00:00:00Z",
+          updated_at: liveUpdatedAt,
+          labels: [{ name: "openthrottle" }],
+        });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/events?per_page=100")) {
+        return Response.json(timelineEvents);
+      }
+      if (url.includes("/repos/owner/repo/issues/12/timeline?per_page=100")) {
+        if (timelineResponseMode === "oversized") {
+          return Response.json([{
+            id: 999,
+            event: "commented",
+            created_at: "2026-08-11T00:03:00Z",
+            actor: { login: "operator" },
+            body: "x".repeat(600_000),
+          }]);
+        }
+        if (timelineResponseMode === "full-pages") {
+          return Response.json(Array.from({ length: 100 }, (_, index) => ({
+            id: 10_000 + index,
+            event: "assigned",
+            created_at: "2026-08-11T00:04:00Z",
+            actor: { login: "operator" },
+          })));
+        }
+        return Response.json(issueTimeline);
+      }
       if (url.endsWith("/repos/owner/repo/issues/12/comments?per_page=100")) {
         return Response.json([]);
+      }
+      if (url.endsWith("/repos/owner/repo/commits/main")) {
+        return Response.json({ sha: "a".repeat(40) });
+      }
+      if (url.endsWith(`/repos/owner/repo/contents/.openthrottle.yml?ref=${"a".repeat(40)}`)) {
+        if (advanceEpochDuringNextSelection) {
+          const event = {
+            id: 906,
+            event: "labeled",
+            created_at: "2026-08-11T00:03:00Z",
+            label: { name: "openthrottle" },
+            actor: { login: "operator" },
+          };
+          timelineEvents.push(event);
+          issueTimeline.push(event);
+          liveUpdatedAt = "2026-08-11T00:03:00Z";
+          advanceEpochDuringNextSelection = false;
+        }
+        return Response.json({
+          type: "file",
+          sha: "b".repeat(40),
+          encoding: "base64",
+          content: Buffer.from(repositoryConfigContent).toString("base64"),
+          size: Buffer.byteLength(repositoryConfigContent),
+        });
       }
       if ((url.endsWith("/repos/owner/repo/issues/12/comments") && method === "POST") ||
           (url.includes("/repos/owner/repo/issues/comments/") && method === "PATCH")) {
@@ -2002,22 +2077,169 @@ describe("coordinator-only server", () => {
       getLinearClient: async () => undefined,
       pipelineCoordinator: { catalog, runtime, store: pipelines },
     });
-    seedPipelineTicket();
+    const activeSessionId = "github:owner/repo#12:initial";
+    seedPipelineTicket(activeSessionId, "github:owner/repo#12", "GH-12");
     db.prepare(`
       UPDATE tickets
       SET control_provider = 'github', external_thread_id = 'owner/repo#12',
           external_thread_reference = 'GH-12'
-      WHERE ticket_id = 'issue-1'
+      WHERE ticket_id = 'github:owner/repo#12'
     `).run();
+    store.registerRepository({
+      controlProvider: "github",
+      githubRepo: "owner/repo",
+      baseBranch: "main",
+      webhookId: 7,
+      snapshot: "snapshot",
+    });
     db.prepare(`
-      UPDATE agent_sessions SET provider_activated_at = ? WHERE id = 'session-1'
-    `).run("2026-08-11T00:00:00Z");
-    const prior = pipelines.getInstanceForSession("session-1")!;
+      UPDATE agent_sessions
+      SET provider_activated_at = ?, provider_activation_id = ?
+      WHERE id = ?
+    `).run("2026-08-11T00:00:00Z", "900", activeSessionId);
+    timelineEvents.push({
+      id: 901,
+      event: "labeled",
+      created_at: "2026-08-11T00:01:00Z",
+      label: { name: "openthrottle" },
+      actor: { login: "operator" },
+    });
+    store.claimDelivery({
+      deliveryId: "github-active-session-relabel",
+      source: "github",
+      action: "issues:labeled",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "labeled",
+        repository: { full_name: "owner/repo" },
+        sender: { login: "operator" },
+        label: { name: "openthrottle" },
+        issue: {
+          number: 12,
+          title: "Ship it",
+          html_url: "https://github.com/owner/repo/issues/12",
+          state: "open",
+          updated_at: "2026-08-11T00:01:00Z",
+          labels: [{ name: "openthrottle" }],
+        },
+      }),
+    });
+    await expect(processor.process("github-active-session-relabel")).resolves.toBeUndefined();
+    expect(store.getCurrentSession("github:owner/repo#12")).toMatchObject({
+      id: activeSessionId,
+      provider_activated_at: "2026-08-11T00:01:00Z",
+      provider_activation_id: "901",
+    });
+
+    timelineEvents.push({
+      id: 902,
+      event: "labeled",
+      created_at: "2026-08-11T00:01:00Z",
+      label: { name: "openthrottle" },
+      actor: { login: "outsider" },
+    });
+    store.claimDelivery({
+      deliveryId: "github-old-authorized-before-unauthorized-epoch",
+      source: "github",
+      action: "issues:labeled",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "labeled",
+        repository: { full_name: "owner/repo" },
+        sender: { login: "operator" },
+        label: { name: "openthrottle" },
+        issue: {
+          number: 12,
+          title: "Ship it",
+          html_url: "https://github.com/owner/repo/issues/12",
+          state: "open",
+          updated_at: "2026-08-11T00:01:00Z",
+          labels: [{ name: "openthrottle" }],
+        },
+      }),
+    });
+    await expect(processor.process("github-old-authorized-before-unauthorized-epoch"))
+      .resolves.toBeUndefined();
+    expect(store.getCurrentSession("github:owner/repo#12")?.provider_activation_id).toBe("901");
+
+    timelineEvents.push(
+      {
+        id: 903,
+        event: "closed",
+        created_at: "2026-08-11T00:02:00Z",
+        actor: { login: "operator" },
+      },
+      {
+        id: 904,
+        event: "reopened",
+        created_at: "2026-08-11T00:02:00Z",
+        actor: { login: "operator" },
+      }
+    );
+    liveUpdatedAt = "2026-08-11T00:02:00Z";
+    store.claimDelivery({
+      deliveryId: "github-reopen-before-close-delivery",
+      source: "github",
+      action: "issues:reopened",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "reopened",
+        repository: { full_name: "owner/repo" },
+        sender: { login: "operator" },
+        issue: {
+          number: 12,
+          title: "Ship it",
+          html_url: "https://github.com/owner/repo/issues/12",
+          state: "open",
+          updated_at: liveUpdatedAt,
+          labels: [{ name: "openthrottle" }],
+        },
+      }),
+    });
+    await expect(processor.process("github-reopen-before-close-delivery"))
+      .resolves.toBeUndefined();
+    const reopenedSessionId = "github:owner/repo#12:reopened:904";
+    expect(store.getSession(activeSessionId)?.state).toBe("stopped");
+    expect(store.getCurrentSession("github:owner/repo#12")).toMatchObject({
+      id: reopenedSessionId,
+      generation: 2,
+      provider_activation_id: "904",
+    });
+    expect(pipelines.getInstanceForSession(reopenedSessionId)).toMatchObject({
+      status: "dispatchable",
+    });
+
+    store.claimDelivery({
+      deliveryId: "github-delayed-close-after-reopen",
+      source: "github",
+      action: "issues:closed",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "closed",
+        repository: { full_name: "owner/repo" },
+        sender: { login: "operator" },
+        issue: {
+          number: 12,
+          title: "Ship it",
+          html_url: "https://github.com/owner/repo/issues/12",
+          state: "closed",
+          updated_at: liveUpdatedAt,
+          closed_at: liveUpdatedAt,
+          labels: [{ name: "openthrottle" }],
+        },
+      }),
+    });
+    await expect(processor.process("github-delayed-close-after-reopen"))
+      .resolves.toBeUndefined();
+    expect(store.getCurrentSession("github:owner/repo#12")?.id).toBe(reopenedSessionId);
+    expect(store.getByIssueId("github:owner/repo#12")?.state).toBe("active");
+
+    const successor = pipelines.getInstanceForSession(reopenedSessionId)!;
     db.prepare(`
       UPDATE pipeline_instances
       SET status = 'shipped', terminal_outcome = 'shipped'
       WHERE id = ?
-    `).run(prior.id);
+    `).run(successor.id);
 
     store.claimDelivery({
       deliveryId: "github-ordinary-post-terminal-comment",
@@ -2031,7 +2253,7 @@ describe("coordinator-only server", () => {
         comment: {
           id: 110,
           body: "ordinary post-terminal comment",
-          created_at: "2026-08-11T00:00:30Z",
+          created_at: "2026-08-11T00:02:01Z",
           html_url: "https://github.com/owner/repo/issues/12#issuecomment-110",
           user: { login: "operator" },
         },
@@ -2042,21 +2264,53 @@ describe("coordinator-only server", () => {
     expect(store.getInbox("github-comment:110")).toBeUndefined();
     expect(postedBodies.at(-1)).toContain("does not accept live steering");
 
+    timelineEvents.push({
+      id: 905,
+      event: "labeled",
+      created_at: "2026-08-11T00:03:00Z",
+      label: { name: "openthrottle" },
+      actor: { login: "operator" },
+    });
+    issueTimeline.push(
+      {
+        id: 112,
+        event: "commented",
+        created_at: "2026-08-11T00:03:00Z",
+        actor: { login: "operator" },
+        body: "untrusted comment body must be discarded",
+      },
+      {
+        id: 905,
+        event: "labeled",
+        created_at: "2026-08-11T00:03:00Z",
+        label: { name: "openthrottle" },
+        actor: { login: "operator" },
+      }
+    );
     store.claimDelivery({
-      deliveryId: "github-pending-successor-admission",
+      deliveryId: "github-ambiguous-same-second-terminal-comment",
       source: "github",
-      action: "issues:reopened",
-      eventName: "issues",
+      action: "issue_comment:created",
+      eventName: "issue_comment",
       payload: JSON.stringify({
-        action: "reopened",
+        action: "created",
         repository: { full_name: "owner/repo" },
-        issue: {
-          number: 12,
-          updated_at: "2026-08-11T00:01:00Z",
-          labels: [{ name: "openthrottle" }],
+        issue: { number: 12 },
+        comment: {
+          id: 112,
+          body: "this comment may predate the same-second relabel",
+          created_at: "2026-08-11T00:03:00Z",
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-112",
+          user: { login: "operator" },
         },
       }),
     });
+    await expect(processor.process("github-ambiguous-same-second-terminal-comment"))
+      .resolves.toBeUndefined();
+    expect(store.getInbox("github-comment:112")).toBeUndefined();
+    expect(postedBodies.at(-1)).toContain("does not accept live steering");
+    const postsBeforeSuccessorRetry = postedBodies.length;
+
     store.claimDelivery({
       deliveryId: "github-comment-before-successor-admission",
       source: "github",
@@ -2069,7 +2323,7 @@ describe("coordinator-only server", () => {
         comment: {
           id: 111,
           body: "carry this into the successor generation",
-          created_at: "2026-08-11T00:01:01Z",
+          created_at: "2026-08-11T00:03:01Z",
           html_url: "https://github.com/owner/repo/issues/12#issuecomment-111",
           user: { login: "operator" },
         },
@@ -2077,15 +2331,70 @@ describe("coordinator-only server", () => {
     });
 
     await expect(processor.process("github-comment-before-successor-admission"))
-      .rejects.toThrow("Issue admission is still in flight");
+      .rejects.toThrow("Issue activation is not durable yet");
     expect(store.getInbox("github-comment:111")).toBeUndefined();
-    expect(postedBodies).toHaveLength(1);
+    expect(postedBodies).toHaveLength(postsBeforeSuccessorRetry);
 
-    seedPipelineTicket("session-2");
-    db.prepare(`
-      UPDATE agent_sessions SET provider_activated_at = ? WHERE id = 'session-2'
-    `).run("2026-08-11T00:01:00Z");
-    store.markDeliveryProcessed("github-pending-successor-admission");
+    liveUpdatedAt = "2026-08-11T00:03:00Z";
+    issueTimeline.push({
+      id: 113,
+      event: "commented",
+      created_at: "2026-08-11T00:03:00Z",
+      actor: { login: "operator" },
+      body: "another untrusted body that must not affect ordering",
+    });
+    store.claimDelivery({
+      deliveryId: "github-newer-label-admission",
+      source: "github",
+      action: "issues:labeled",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "labeled",
+        repository: { full_name: "owner/repo" },
+        sender: { login: "operator" },
+        label: { name: "openthrottle" },
+        issue: {
+          number: 12,
+          title: "Ship it",
+          html_url: "https://github.com/owner/repo/issues/12",
+          state: "open",
+          updated_at: liveUpdatedAt,
+          labels: [{ name: "openthrottle" }],
+        },
+      }),
+    });
+    advanceEpochDuringNextSelection = true;
+    await expect(processor.process("github-newer-label-admission")).resolves.toBeUndefined();
+    expect(store.getCurrentSession("github:owner/repo#12")?.id).toBe(reopenedSessionId);
+    expect(store.getSession("github:owner/repo#12:label:905")).toBeUndefined();
+
+    store.claimDelivery({
+      deliveryId: "github-current-label-admission",
+      source: "github",
+      action: "issues:labeled",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "labeled",
+        repository: { full_name: "owner/repo" },
+        sender: { login: "operator" },
+        label: { name: "openthrottle" },
+        issue: {
+          number: 12,
+          title: "Ship it",
+          html_url: "https://github.com/owner/repo/issues/12",
+          state: "open",
+          updated_at: liveUpdatedAt,
+          labels: [{ name: "openthrottle" }],
+        },
+      }),
+    });
+    await expect(processor.process("github-current-label-admission")).resolves.toBeUndefined();
+    const relabeledSessionId = "github:owner/repo#12:label:906";
+    expect(store.getCurrentSession("github:owner/repo#12")).toMatchObject({
+      id: relabeledSessionId,
+      generation: 3,
+      provider_activation_id: "906",
+    });
     db.prepare(`
       UPDATE webhook_deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z'
       WHERE delivery_id = 'github-comment-before-successor-admission'
@@ -2093,15 +2402,211 @@ describe("coordinator-only server", () => {
 
     await expect(processor.process("github-comment-before-successor-admission"))
       .resolves.toBeUndefined();
-    expect(store.getByExternalThread("github", "owner/repo#12")?.session_id).toBe("session-2");
+    expect(store.getByExternalThread("github", "owner/repo#12")?.session_id)
+      .toBe(relabeledSessionId);
     expect(store.getInbox("github-comment:111")).toMatchObject({
-      ticket_id: "issue-1",
-      session_id: "session-2",
+      ticket_id: "github:owner/repo#12",
+      session_id: relabeledSessionId,
       run_id: null,
       body: "carry this into the successor generation",
       status: "pending",
     });
     expect(postedBodies.at(-1)).toContain("Captured your message");
+
+    const postsBeforeAmbiguousLateDelivery = postedBodies.length;
+    store.claimDelivery({
+      deliveryId: "github-ambiguous-comment-delivered-after-admission",
+      source: "github",
+      action: "issue_comment:created",
+      eventName: "issue_comment",
+      payload: JSON.stringify({
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 12 },
+        comment: {
+          id: 113,
+          body: "do not route this ambiguous delayed comment",
+          created_at: "2026-08-11T00:03:00Z",
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-113",
+          user: { login: "operator" },
+        },
+      }),
+    });
+    await expect(processor.process("github-ambiguous-comment-delivered-after-admission"))
+      .resolves.toBeUndefined();
+    expect(store.getInbox("github-comment:113")).toBeUndefined();
+    expect(postedBodies).toHaveLength(postsBeforeAmbiguousLateDelivery);
+
+    issueTimeline.push({
+      id: 114,
+      event: "commented",
+      created_at: "2026-08-11T00:03:00Z",
+      actor: { login: "operator" },
+      body: "provider body is irrelevant to exact ordering",
+    });
+    store.claimDelivery({
+      deliveryId: "github-same-second-comment-after-admission",
+      source: "github",
+      action: "issue_comment:created",
+      eventName: "issue_comment",
+      payload: JSON.stringify({
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 12 },
+        comment: {
+          id: 114,
+          body: "route this provider-ordered same-second comment",
+          created_at: "2026-08-11T00:03:00Z",
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-114",
+          user: { login: "operator" },
+        },
+      }),
+    });
+    await expect(processor.process("github-same-second-comment-after-admission"))
+      .resolves.toBeUndefined();
+    expect(store.getInbox("github-comment:114")).toMatchObject({
+      ticket_id: "github:owner/repo#12",
+      session_id: relabeledSessionId,
+      body: "route this provider-ordered same-second comment",
+      status: "pending",
+    });
+
+    timelineResponseMode = "oversized";
+    store.claimDelivery({
+      deliveryId: "github-unresolved-same-second-comment",
+      source: "github",
+      action: "issue_comment:created",
+      eventName: "issue_comment",
+      payload: JSON.stringify({
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 12 },
+        comment: {
+          id: 115,
+          body: "ask me to resend if provider ordering cannot be bounded",
+          created_at: "2026-08-11T00:03:00Z",
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-115",
+          user: { login: "operator" },
+        },
+      }),
+    });
+    await expect(processor.process("github-unresolved-same-second-comment"))
+      .resolves.toBeUndefined();
+    expect(store.getInbox("github-comment:115")).toBeUndefined();
+    expect(postedBodies.at(-1)).toContain("Please resend the comment");
+
+    const relabeled = pipelines.getInstanceForSession(relabeledSessionId)!;
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'shipped', terminal_outcome = 'shipped'
+      WHERE id = ?
+    `).run(relabeled.id);
+    liveUpdatedAt = "2026-08-11T00:04:00Z";
+    const finalActivation = {
+      id: 907,
+      event: "labeled",
+      created_at: liveUpdatedAt,
+      label: { name: "openthrottle" },
+      actor: { login: "operator" },
+    };
+    timelineEvents.push(finalActivation);
+    for (const [mode, commentId] of [
+      ["oversized", 116],
+      ["full-pages", 118],
+    ] as const) {
+      timelineResponseMode = mode;
+      store.claimDelivery({
+        deliveryId: `github-terminal-unresolved-${mode}-comment`,
+        source: "github",
+        action: "issue_comment:created",
+        eventName: "issue_comment",
+        payload: JSON.stringify({
+          action: "created",
+          repository: { full_name: "owner/repo" },
+          issue: { number: 12 },
+          comment: {
+            id: commentId,
+            body: "give me explicit resend guidance when ordering cannot be bounded",
+            created_at: liveUpdatedAt,
+            html_url: `https://github.com/owner/repo/issues/12#issuecomment-${commentId}`,
+            user: { login: "operator" },
+          },
+        }),
+      });
+      await expect(processor.process(`github-terminal-unresolved-${mode}-comment`))
+        .resolves.toBeUndefined();
+      expect(store.getInbox(`github-comment:${commentId}`)).toBeUndefined();
+      expect(postedBodies.at(-1)).toContain("Please resend the comment");
+    }
+
+    timelineResponseMode = "normal";
+    issueTimeline.push(finalActivation, {
+      id: 117,
+      event: "commented",
+      created_at: liveUpdatedAt,
+      actor: { login: "operator" },
+      body: "timeline body must not enter the terminal successor proof",
+    });
+    store.claimDelivery({
+      deliveryId: "github-provider-ordered-terminal-comment",
+      source: "github",
+      action: "issue_comment:created",
+      eventName: "issue_comment",
+      payload: JSON.stringify({
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 12 },
+        comment: {
+          id: 117,
+          body: "carry this exact-order comment into the next generation",
+          created_at: liveUpdatedAt,
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-117",
+          user: { login: "operator" },
+        },
+      }),
+    });
+    await expect(processor.process("github-provider-ordered-terminal-comment"))
+      .rejects.toThrow("Issue activation is not durable yet");
+
+    store.claimDelivery({
+      deliveryId: "github-final-label-admission",
+      source: "github",
+      action: "issues:labeled",
+      eventName: "issues",
+      payload: JSON.stringify({
+        action: "labeled",
+        repository: { full_name: "owner/repo" },
+        sender: { login: "operator" },
+        label: { name: "openthrottle" },
+        issue: {
+          number: 12,
+          title: "Ship it",
+          html_url: "https://github.com/owner/repo/issues/12",
+          state: "open",
+          updated_at: liveUpdatedAt,
+          labels: [{ name: "openthrottle" }],
+        },
+      }),
+    });
+    await expect(processor.process("github-final-label-admission")).resolves.toBeUndefined();
+    const finalSessionId = "github:owner/repo#12:label:907";
+    expect(store.getCurrentSession("github:owner/repo#12")).toMatchObject({
+      id: finalSessionId,
+      generation: 4,
+      provider_activation_id: "907",
+    });
+    db.prepare(`
+      UPDATE webhook_deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z'
+      WHERE delivery_id = 'github-provider-ordered-terminal-comment'
+    `).run();
+    await expect(processor.process("github-provider-ordered-terminal-comment"))
+      .resolves.toBeUndefined();
+    expect(store.getInbox("github-comment:117")).toMatchObject({
+      ticket_id: "github:owner/repo#12",
+      session_id: finalSessionId,
+      body: "carry this exact-order comment into the next generation",
+      status: "pending",
+    });
   });
 
   it("retries a ticketless comment when the live Issue is labeled before its admission delivery is stored", async () => {
@@ -2248,7 +2753,17 @@ describe("coordinator-only server", () => {
           created_at: "2026-08-11T00:00:00.000Z",
           updated_at: "2026-08-11T00:00:00.000Z",
           html_url: "https://github.com/owner/repo/issues/12",
+          labels: [{ name: "openthrottle" }],
         });
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/events?per_page=100")) {
+        return Response.json([{
+          id: 700,
+          event: "labeled",
+          created_at: "2026-08-11T00:00:00.000Z",
+          label: { name: "openthrottle" },
+          actor: { login: "operator" },
+        }]);
       }
       if (url.endsWith("/repos/owner/repo/issues/12/comments?per_page=100")) {
         return Response.json([]);

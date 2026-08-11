@@ -24,6 +24,12 @@ export interface AdmissionStore {
   listAll(): Ticket[];
   getCurrentSession(issueId: string): AgentSession | undefined;
   getSession(sessionId: string): AgentSession | undefined;
+  advanceSessionProviderActivation(
+    sessionId: string,
+    expectedActivationId: string | null,
+    activatedAt: string,
+    activationId: string
+  ): boolean;
   markSessionState(sessionId: string, state: AgentSession["state"]): void;
   registerRepository(input: RepositoryRegistrationInput): RepositoryRegistration;
   getRepositoryRegistration(
@@ -120,13 +126,20 @@ export function createAdmissionStore(
   );
   const insertSessionStmt = db.prepare(`
     INSERT OR IGNORE INTO agent_sessions (
-      id, ticket_id, generation, state, provider_activated_at, created_at, updated_at
-    ) VALUES (?, ?, ?, 'current', ?, ?, ?)
+      id, ticket_id, generation, state, provider_activated_at, provider_activation_id,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, 'current', ?, ?, ?, ?)
   `);
   const setSessionProviderActivationStmt = db.prepare(`
     UPDATE agent_sessions
-    SET provider_activated_at = COALESCE(provider_activated_at, ?)
+    SET provider_activated_at = COALESCE(provider_activated_at, ?),
+        provider_activation_id = COALESCE(provider_activation_id, ?)
     WHERE id = ?
+  `);
+  const advanceSessionProviderActivationStmt = db.prepare(`
+    UPDATE agent_sessions
+    SET provider_activated_at = ?, provider_activation_id = ?, updated_at = ?
+    WHERE id = ? AND state = 'current' AND provider_activation_id IS ?
   `);
   const supersedeSessionStmt = db.prepare(`
     UPDATE agent_sessions
@@ -137,7 +150,12 @@ export function createAdmissionStore(
     "UPDATE agent_sessions SET state = ?, updated_at = ? WHERE id = ?"
   );
   const supersedeCurrentSessionTransaction = db.transaction(
-    (issueId: string, newSessionId: string, providerActivatedAt?: string): AgentSession => {
+    (
+      issueId: string,
+      newSessionId: string,
+      providerActivatedAt?: string,
+      providerActivationId?: string
+    ): AgentSession => {
       const timestamp = now();
       const activationTimestamp =
         providerActivatedAt && !Number.isNaN(Date.parse(providerActivatedAt))
@@ -147,7 +165,11 @@ export function createAdmissionStore(
       if (existing) {
         supersedeSessionStmt.run(timestamp, timestamp, issueId, newSessionId);
         markSessionStateStmt.run("current", timestamp, newSessionId);
-        setSessionProviderActivationStmt.run(activationTimestamp, newSessionId);
+        setSessionProviderActivationStmt.run(
+          activationTimestamp,
+          providerActivationId ?? null,
+          newSessionId
+        );
         return getSessionStmt.get(newSessionId) as AgentSession;
       }
       const generation =
@@ -159,6 +181,7 @@ export function createAdmissionStore(
         issueId,
         generation,
         activationTimestamp,
+        providerActivationId ?? null,
         timestamp,
         timestamp
       );
@@ -208,7 +231,12 @@ export function createAdmissionStore(
     upsert(ticket) {
       const existing = getByIssueIdStmt.get(ticket.ticket_id) as Ticket | undefined;
       db.transaction(() => {
-        const { pipeline, provider_activated_at: providerActivatedAt, ...ticketRow } = ticket;
+        const {
+          pipeline,
+          provider_activated_at: providerActivatedAt,
+          provider_activation_id: providerActivationId,
+          ...ticketRow
+        } = ticket;
         upsertStmt.run({
           ...ticketRow,
           control_provider: ticket.control_provider ?? existing?.control_provider ?? "linear",
@@ -221,7 +249,8 @@ export function createAdmissionStore(
         const session = supersedeCurrentSessionTransaction(
           ticket.ticket_id,
           ticket.session_id,
-          providerActivatedAt
+          providerActivatedAt,
+          providerActivationId
         );
         pipelineStore.supersedeOtherInstances(ticket.ticket_id, ticket.session_id);
         if (pipeline) {
@@ -239,7 +268,11 @@ export function createAdmissionStore(
     upsertUnpinned(ticket) {
       const existing = getByIssueIdStmt.get(ticket.ticket_id) as Ticket | undefined;
       db.transaction(() => {
-        const { provider_activated_at: providerActivatedAt, ...ticketRow } = ticket;
+        const {
+          provider_activated_at: providerActivatedAt,
+          provider_activation_id: providerActivationId,
+          ...ticketRow
+        } = ticket;
         upsertStmt.run({
           ...ticketRow,
           control_provider: ticket.control_provider ?? existing?.control_provider ?? "linear",
@@ -252,7 +285,8 @@ export function createAdmissionStore(
         supersedeCurrentSessionTransaction(
           ticket.ticket_id,
           ticket.session_id,
-          providerActivatedAt
+          providerActivatedAt,
+          providerActivationId
         );
         pipelineStore.supersedeOtherInstances(ticket.ticket_id, ticket.session_id);
       })();
@@ -293,6 +327,18 @@ export function createAdmissionStore(
     },
     getSession(sessionId) {
       return getSessionStmt.get(sessionId) as AgentSession | undefined;
+    },
+    advanceSessionProviderActivation(sessionId, expectedActivationId, activatedAt, activationId) {
+      if (!activationId || Number.isNaN(Date.parse(activatedAt))) return false;
+      const current = getSessionStmt.get(sessionId) as AgentSession | undefined;
+      if (current?.provider_activation_id === activationId) return true;
+      return advanceSessionProviderActivationStmt.run(
+        activatedAt,
+        activationId,
+        now(),
+        sessionId,
+        expectedActivationId
+      ).changes === 1;
     },
     markSessionState(sessionId, state) {
       markSessionStateStmt.run(state, now(), sessionId);

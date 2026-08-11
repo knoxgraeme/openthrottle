@@ -45,6 +45,7 @@ describe("admission store", () => {
       external_thread_id: "owner/repo#1",
       external_thread_reference: "GH-1",
       provider_activated_at: "2026-08-11T00:00:00Z",
+      provider_activation_id: "activation-1",
       sandbox_id: null,
       branch: "ot/gh-1",
       agent: "codex",
@@ -57,6 +58,7 @@ describe("admission store", () => {
     expect(store.getCurrentSession("github:owner/repo#1")).toMatchObject({
       id: "github:owner/repo#1:initial",
       provider_activated_at: "2026-08-11T00:00:00Z",
+      provider_activation_id: "activation-1",
     });
 
     // A duplicate delivery for the same deterministic session must not move
@@ -69,6 +71,7 @@ describe("admission store", () => {
       external_thread_id: "owner/repo#1",
       external_thread_reference: "GH-1",
       provider_activated_at: "2026-08-11T00:00:05Z",
+      provider_activation_id: "activation-2",
       sandbox_id: null,
       branch: "ot/gh-1",
       agent: "codex",
@@ -79,6 +82,27 @@ describe("admission store", () => {
     });
     expect(store.getCurrentSession("github:owner/repo#1")?.provider_activated_at)
       .toBe("2026-08-11T00:00:00Z");
+    expect(store.getCurrentSession("github:owner/repo#1")?.provider_activation_id)
+      .toBe("activation-1");
+
+    expect(store.advanceSessionProviderActivation(
+      "github:owner/repo#1:initial",
+      "activation-1",
+      "2026-08-11T00:00:05Z",
+      "activation-2"
+    )).toBe(true);
+    expect(store.getCurrentSession("github:owner/repo#1")).toMatchObject({
+      provider_activated_at: "2026-08-11T00:00:05Z",
+      provider_activation_id: "activation-2",
+    });
+    expect(store.advanceSessionProviderActivation(
+      "github:owner/repo#1:initial",
+      "activation-1",
+      "2026-08-11T00:00:10Z",
+      "activation-3"
+    )).toBe(false);
+    expect(store.getCurrentSession("github:owner/repo#1")?.provider_activation_id)
+      .toBe("activation-2");
   });
 
   it("routes only through durable repository registrations", () => {

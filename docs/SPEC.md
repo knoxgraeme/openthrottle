@@ -548,10 +548,25 @@ collaborator is steering for the current generation. Closing the Issue stops
 every nonterminal stage, including provider wait; reopening it or reapplying the
 label after a terminal generation creates a new session. Webhook timestamps and
 a live Issue lookup immediately before admission prevent stale or close-racing
-events from starting or stopping the wrong generation. Permission lookup
+events from starting or stopping the wrong generation. The final admission
+preflight also re-reads the bounded Issue Events stream and requires the exact
+authorized activation cursor selected by the delivery to remain current; a
+newer close/reopen/relabel epoch supersedes the slow admission before any
+ticket or pipeline instance is created. Permission lookup
 outages fail with a retryable response before the delivery or untrusted body is
 persisted, while a confirmed insufficient permission is acknowledged without
 admission.
+
+Issue Events remain the body-free source of activation ordering. When an Issue
+comment and the current activation have equal second-precision timestamps, the
+supervisor resolves only that rare ambiguity through a bounded, byte-capped
+Issue timeline scan. It immediately projects the response to event identity,
+kind, timestamp, and actor, discards comment bodies, and compares API sequence
+rather than numeric ids. A comment is deferred or routed to a successor only
+when that sequence proves activation-before-comment; comment-before-activation
+falls through to terminal guidance before admission and is not delivered after
+admission. An incomplete bounded proof fails closed, with resend guidance for
+an otherwise active generation.
 
 The supervisor publishes one upserted, pinned Issue status comment containing
 the current lifecycle, structured activity, PR link, and revision marker. Its
@@ -767,10 +782,16 @@ SQLite is the authority. Core tables include:
   `schema_migrations`, `migration_reconciliation`.
 
 Each `agent_sessions` generation stores `provider_activated_at`, copied from
-the provider event that activated that generation. Provider event timestamps
-are fenced against this value, preserving the provider's native precision;
-the supervisor's later local `created_at` is not an activation watermark.
-Legacy sessions backfill this field from `created_at` conservatively.
+the provider event that activated that generation. GitHub-controlled sessions
+also store `provider_activation_id`, the opaque id of the correlated,
+authorized Issue Event that owns the activation epoch. The supervisor compares
+that cursor by its position in a bounded, body-free Issue Events stream, never
+by numeric id arithmetic; exact lowercase `unlabeled` events are deactivation
+boundaries for admission reconciliation, and an incomplete bounded scan fails closed. Provider
+event timestamps remain the compatibility fence preserving native precision,
+while the cursor distinguishes same-second close/reopen/relabel ordering. The
+supervisor's later local `created_at` is not an activation watermark. Legacy
+sessions backfill only the timestamp from `created_at` conservatively.
 
 `orchestration_journal` is append-only data capture, keyed by team,
 repository, issue, and recorded time. Supervisor-owned orchestration decisions
