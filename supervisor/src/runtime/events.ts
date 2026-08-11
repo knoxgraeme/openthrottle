@@ -2,6 +2,7 @@ import { sanitizeText } from "../shared/sanitize.js";
 import { STAGE_OUTCOMES } from "../pipeline/manifest.js";
 import { LAUNCH_FAULT_REASONS, type LaunchFaultReason } from "../pipeline/fault-attribution.js";
 import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "../pipeline/coordinator.js";
+import { isPathSafeActionId } from "./action-id.js";
 
 const MAX_EVENT_BYTES = 32 * 1024;
 const MAX_STAGE_EVENT_BYTES = 64 * 1024;
@@ -154,7 +155,7 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
 
   if (value.kind === "heartbeat") {
     if (value.child_action_id !== undefined &&
-        (typeof value.child_action_id !== "string" || !RUN_ID_PATTERN.test(value.child_action_id))) {
+        (typeof value.child_action_id !== "string" || !isPathSafeActionId(value.child_action_id))) {
       throw new Error("sandbox heartbeat has an invalid child_action_id");
     }
     return {

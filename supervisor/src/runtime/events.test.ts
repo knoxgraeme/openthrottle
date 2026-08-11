@@ -44,6 +44,38 @@ describe("runtime event contracts", () => {
     expect(source).not.toContain("@daytona/sdk");
   });
 
+  it("accepts dotted path-safe child action heartbeats without widening run identifiers", () => {
+    const selector = "execution-work-ae57a59455a2ff9c73af69b9d6266328.review.selector";
+    const persona = "execution-work-ae57a59455a2ff9c73af69b9d6266328.review.correctness-dataflow";
+
+    for (const [eventId, childActionId] of [
+      ["44444444-4444-4444-8444-444444444444", selector],
+      ["55555555-5555-4555-8555-555555555555", persona],
+    ] as const) {
+      expect(parseSandboxEvent(JSON.stringify({
+        version: 1,
+        kind: "heartbeat",
+        event_id: eventId,
+        run_id: "run-1",
+        created_at: "2026-07-18T00:00:00.000Z",
+        child_action_id: childActionId,
+      }))).toMatchObject({
+        kind: "heartbeat",
+        run_id: "run-1",
+        child_action_id: childActionId,
+      });
+    }
+
+    expect(() => parseSandboxEvent(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "66666666-6666-4666-8666-666666666666",
+      run_id: "run.1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      child_action_id: selector,
+    }))).toThrow(/run_id/);
+  });
+
   it("rejects invalid heartbeat, plan, and stage-result envelopes", () => {
     expect(() => parseSandboxEvent(JSON.stringify({
       version: 1,
@@ -70,14 +102,23 @@ describe("runtime event contracts", () => {
       child_action_id: "action-1",
     });
 
-    expect(() => parseSandboxEvent(JSON.stringify({
-      version: 1,
-      kind: "heartbeat",
-      event_id: "44444444-4444-4444-8444-444444444444",
-      run_id: "run-1",
-      created_at: "2026-07-18T00:00:00.000Z",
-      child_action_id: "../bad",
-    }))).toThrow(/child_action_id/);
+    for (const child_action_id of [
+      "../bad",
+      "action/../bad",
+      ".leading-punctuation",
+      " action-1",
+      "action 1",
+      `a${"b".repeat(128)}`,
+    ]) {
+      expect(() => parseSandboxEvent(JSON.stringify({
+        version: 1,
+        kind: "heartbeat",
+        event_id: "44444444-4444-4444-8444-444444444444",
+        run_id: "run-1",
+        created_at: "2026-07-18T00:00:00.000Z",
+        child_action_id,
+      }))).toThrow(/child_action_id/);
+    }
 
     expect(() => parseSandboxEvent(JSON.stringify({
       version: 1,

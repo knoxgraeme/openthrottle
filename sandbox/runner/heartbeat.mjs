@@ -15,9 +15,13 @@ const parsedInterval = Number(process.env.OT_EXECUTOR_HEARTBEAT_INTERVAL_MS);
 const intervalMs = Number.isFinite(parsedInterval) && parsedInterval >= 1_000
   ? parsedInterval
   : 15_000;
+const PATH_SAFE_ACTION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 export function buildExecutorHeartbeat(id, createdAt, targetRunId = runId, targetChildActionId = childActionId) {
   if (!targetRunId) throw new Error("RUN_ID is required for executor heartbeat");
+  if (targetChildActionId && !PATH_SAFE_ACTION_ID.test(targetChildActionId)) {
+    throw new Error("OT_CHILD_ACTION_ID is invalid for executor heartbeat");
+  }
   return {
     version: 1,
     kind: "heartbeat",

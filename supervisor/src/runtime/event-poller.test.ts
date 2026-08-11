@@ -204,13 +204,14 @@ describe("sandbox event contracts", () => {
 
   it("renews child action liveness from a sealed parent heartbeat", async () => {
     const store = seedRunningTicket();
+    const childActionId = "execution-work-ae57a59455a2ff9c73af69b9d6266328.review.correctness-dataflow";
     const heartbeat = Buffer.from(JSON.stringify({
       version: 1,
       kind: "heartbeat",
       event_id: "88888888-8888-4888-8888-888888888888",
       run_id: "run-1",
       created_at: "2026-07-22T16:00:00.000Z",
-      child_action_id: "action-1",
+      child_action_id: childActionId,
     }));
     const files = new Map([["/var/lib/openthrottle/heartbeat/heartbeat.json", heartbeat]]);
     const sandbox = {
@@ -238,12 +239,60 @@ describe("sandbox event contracts", () => {
 
     expect(childActions.renewChildActionLiveness).toHaveBeenCalledWith(expect.objectContaining({
       parentRunId: "run-1",
-      actionId: "action-1",
+      actionId: childActionId,
       heartbeatAtIso: expect.any(String),
       leaseUntilIso: expect.any(String),
     }));
     expect(store.getSandboxEvent("88888888-8888-4888-8888-888888888888")?.status)
       .toBe("processed");
+  });
+
+  it("keeps stale child action heartbeats ignored after renewing parent liveness", async () => {
+    const store = seedRunningTicket();
+    const childActionId = "execution-work-ae57a59455a2ff9c73af69b9d6266328.review.selector";
+    const heartbeat = Buffer.from(JSON.stringify({
+      version: 1,
+      kind: "heartbeat",
+      event_id: "88888888-8888-4888-8888-999999999999",
+      run_id: "run-1",
+      created_at: "2026-07-22T16:00:00.000Z",
+      child_action_id: childActionId,
+    }));
+    const files = new Map([["/var/lib/openthrottle/heartbeat/heartbeat.json", heartbeat]]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async (directory: string) => [...files.entries()]
+          .filter(([path]) => path.startsWith(`${directory}/`))
+          .map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    };
+    const childActions = { renewChildActionLiveness: vi.fn(() => false) };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await pollSandboxEvents({
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) },
+      store,
+      childActions,
+      postActivity: vi.fn(async () => undefined),
+    });
+
+    expect(childActions.renewChildActionLiveness).toHaveBeenCalledWith(expect.objectContaining({
+      parentRunId: "run-1",
+      actionId: childActionId,
+    }));
+    expect(db!.prepare(
+      "SELECT actor_state, last_heartbeat_at FROM runs WHERE id = 'run-1'"
+    ).get()).toEqual({ actor_state: "running", last_heartbeat_at: expect.any(String) });
+    expect(store.getSandboxEvent("88888888-8888-4888-8888-999999999999")?.status)
+      .toBe("processed");
+    warn.mockRestore();
   });
 
   it("does not poll child heartbeats for inactive parent runs", async () => {
