@@ -17,6 +17,7 @@ import {
   createStageRequestHash,
   type StageRequestEnvelope,
 } from "../../pipeline/stage-request.js";
+import { assertPathSafeActionId } from "../../runtime/action-id.js";
 
 const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
 const IDLE_SANDBOX_AUTOSTOP_MINUTES = 5;
@@ -69,8 +70,7 @@ function ensureSandboxActive(sandbox: Sandbox): Promise<void> {
 }
 
 function safeStagePathId(value: string, label: string): string {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) throw new Error(`${label} is not path-safe`);
-  return value;
+  return assertPathSafeActionId(value, label);
 }
 
 function loopActionDispatchTimeoutSeconds(timeoutMs: number): number {
