@@ -1048,6 +1048,46 @@ describe("loop action request validation", () => {
     }
   });
 
+  it("uses a constrained model-only launch shape for receipt correction continuations", () => {
+    for (const agent of ["claude", "codex"]) {
+      const valid = validateLoopRequest(request({
+        agent,
+        nativeSessionId: "native-1",
+        contextPolicy: "resume_required",
+      }));
+      const correction = {
+        ...valid,
+        role: "reviewer",
+        loop: "review",
+        worktree: null,
+        allowedMcpServers: [],
+        credentialScopes: ["model.invoke"],
+        repositorySkill: undefined,
+        receiptCorrectionPrompt: "receipt-correction continuation",
+        receiptCorrectionSubject: "a".repeat(40),
+      };
+      const built = loopAgentCommand({ request: correction, invocation: { mode: "resume", nativeSessionId: "native-1" } });
+      const args = built.args.join("\n");
+
+      expect(built.input).toBe("receipt-correction continuation");
+      expect(args).not.toContain("dangerously");
+      if (agent === "codex") {
+        expect(built.command).toBe(process.execPath);
+        expect(built.args[0]).toMatch(/receipt-correction-model\.mjs$/);
+        expect(built.args).not.toContain("exec");
+        expect(built.args).not.toContain("--sandbox");
+        expect(built.args).not.toContain("--output-schema");
+      } else {
+        expect(built.args).toEqual(expect.arrayContaining([
+          "--tools", "",
+          "--permission-mode", "dontAsk",
+          "--disable-slash-commands",
+          "--json-schema",
+        ]));
+      }
+    }
+  });
+
   it("passes sealed models to each engine adapter and leaves omitted models on provider defaults", () => {
     const claude = validateLoopRequest(request({ agent: "claude", model: "claude-opus-4-1" }));
     const codex = validateLoopRequest(request({ agent: "codex", model: "gpt-5.1-code" }));
@@ -3648,6 +3688,11 @@ describe("executeLoopAction", () => {
           correctionLaunchCwd = options.cwd;
           expect(options.cwd).toMatch(/repo-view$/);
           expect(options.cwd).not.toBe(loopWorktreeDirectory(valid));
+          expect(processArgs).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+          expect(processArgs).not.toContain("codex");
+          expect(processArgs).not.toContain("exec");
+          expect(processArgs).not.toContain("--sandbox");
+          expect(processArgs.some((arg) => /receipt-correction-model\.mjs$/.test(arg))).toBe(true);
           expect(processArgs).not.toContain(`GIT_WORK_TREE=${loopWorktreeDirectory(valid)}`);
           return {
             status: 0,

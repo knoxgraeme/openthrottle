@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import {
   digest,
@@ -108,6 +108,7 @@ const MAX_DOWNSTREAM_CONTEXT_BYTES = 32_768;
 const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
 const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
+const RECEIPT_CORRECTION_MODEL_HELPER = fileURLToPath(new URL("./receipt-correction-model.mjs", import.meta.url));
 const RECEIPT_CORRECTION_ATTEMPTS = 1;
 const ROOT_UID = 0;
 const ROOT_GID = 0;
@@ -894,7 +895,19 @@ function makeCurrentActionDirectoryTraverseOnly(request) {
 
 export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDirectory(request) ?? "/home/agent/repo", mcpConfigPath = null }) {
   const prompt = loopPrompt(request);
+  const isReceiptCorrection = Boolean(request.receiptCorrectionPrompt);
   if (request.agent === "codex") {
+    if (isReceiptCorrection) {
+      return {
+        repoDir,
+        command: process.execPath,
+        args: [
+          RECEIPT_CORRECTION_MODEL_HELPER,
+          ...(request.model ? ["--model", request.model] : []),
+        ],
+        input: prompt,
+      };
+    }
     // The prompt always travels over stdin ("-" tells Codex to read it there)
     // rather than argv: an admitted sealed prompt can exceed Linux's
     // MAX_ARG_STRLEN per-argument ceiling, and argv is visible to any
@@ -909,6 +922,14 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
   if (request.agent === "opencode") {
     throw new Error("OpenCode loop actions are not supported yet");
   }
+  const correctionArgs = isReceiptCorrection
+    ? [
+      "--tools", "",
+      "--permission-mode", "dontAsk",
+      "--disable-slash-commands",
+      "--json-schema", "{\"type\":\"object\",\"additionalProperties\":true}",
+    ]
+    : ["--dangerously-skip-permissions"];
   return {
     repoDir,
     command: "claude",
@@ -918,7 +939,7 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
       // prompt itself is never passed via argv (see the Codex note above for
       // why: MAX_ARG_STRLEN and /proc/<pid>/cmdline visibility).
       "--print", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []),
-      "--output-format", "stream-json", "--verbose", ...(request.model ? ["--model", request.model] : []), "--dangerously-skip-permissions",
+      "--output-format", "stream-json", "--verbose", ...(request.model ? ["--model", request.model] : []), ...correctionArgs,
       // Unconditional: --strict-mcp-config closes MCP entirely to just the
       // declared set (or to nothing, when no MCP servers were declared),
       // rather than leaving a repo-committed .mcp.json or other ambient
