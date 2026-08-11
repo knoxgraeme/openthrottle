@@ -89,7 +89,7 @@ function hasValidElementParent(
 ): boolean {
   const parent = stack.at(-1)?.kind;
   if (kind === "sub-issues") {
-    return parent !== undefined && isContextSectionKind(parent);
+    return parent === "issue" || parent === "parent-issue";
   }
   if (kind === "sub-issue") {
     return parent === "sub-issues" || parent === "parent-issue";

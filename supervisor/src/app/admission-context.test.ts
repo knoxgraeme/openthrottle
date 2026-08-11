@@ -233,6 +233,27 @@ describe("bounded Linear admission context", () => {
       ].join("\n"),
     ],
     [
+      "sub-issues wrapper inside the primary directive",
+      [
+        `<issue identifier="OPE-139"><description>current child</description></issue>`,
+        `<primary-directive-thread>`,
+        `<comment>current directive</comment>`,
+        `<sub-issues><sub-issue identifier="OPE-OLD">stale child</sub-issue></sub-issues>`,
+        `</primary-directive-thread>`,
+      ].join("\n"),
+    ],
+    [
+      "sub-issues wrapper inside an other thread",
+      [
+        `<issue identifier="OPE-139"><description>current child</description></issue>`,
+        `<primary-directive-thread><comment>current directive</comment></primary-directive-thread>`,
+        `<other-thread>`,
+        `<comment>history</comment>`,
+        `<sub-issues><sub-issue identifier="OPE-OLD">stale child</sub-issue></sub-issues>`,
+        `</other-thread>`,
+      ].join("\n"),
+    ],
+    [
       "unclosed nested sub-issues wrapper",
       [
         `<issue identifier="OPE-139">`,
