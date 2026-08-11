@@ -66,6 +66,7 @@ afterEach(() => {
   delete process.env.OT_INTEGRATION_REPO_DIR;
   delete process.env.OT_NATIVE_SESSION_SOURCE_ROOT;
   delete process.env.OT_STAGE_CONFIG_FILE;
+  delete process.env.OT_HOSTILE_DIFF_MARKER;
 });
 
 function repository() {
@@ -4130,6 +4131,111 @@ describe("executeLoopAction", () => {
       .toThrow();
     execFileSync("git", ["checkout", "--quiet", durableBase], { cwd: recoveryRepo });
     const recoveryPatch = join(recoveryRoot, "recovery.patch");
+    writeFileSync(recoveryPatch, Buffer.from(artifact.diff_base64, "base64"));
+    execFileSync("git", ["apply", recoveryPatch], { cwd: recoveryRepo });
+    expect(computeWorkspaceTreeOid(recoveryRepo)).toBe(artifact.candidate_tree);
+  });
+
+  it("exports raw portable recovery without invoking repository diff drivers or textconv", () => {
+    const initial = request();
+    const worktreeDir = loopWorktreeDirectory(initial);
+    const hostileRoot = mkdtempSync(join(tmpdir(), "ot-hostile-diff-"));
+    directories.push(hostileRoot);
+    const marker = join(hostileRoot, "driver-invoked");
+    const externalDriver = join(hostileRoot, "external-driver.sh");
+    const textconvDriver = join(hostileRoot, "textconv-driver.sh");
+    process.env.OT_HOSTILE_DIFF_MARKER = marker;
+    writeFileSync(externalDriver, [
+      "#!/bin/sh",
+      "printf 'external\\n' >> \"$OT_HOSTILE_DIFF_MARKER\"",
+      "exit 0",
+      "",
+    ].join("\n"));
+    writeFileSync(textconvDriver, [
+      "#!/bin/sh",
+      "printf 'textconv\\n' >> \"$OT_HOSTILE_DIFF_MARKER\"",
+      "printf 'hidden-by-textconv\\n'",
+      "",
+    ].join("\n"));
+    chmodSync(externalDriver, 0o755);
+    chmodSync(textconvDriver, 0o755);
+    writeFileSync(join(worktreeDir, ".gitattributes"), [
+      "external-driver.txt diff=hostile-external",
+      "textconv-driver.dat diff=hostile-textconv",
+      "",
+    ].join("\n"));
+    writeFileSync(join(worktreeDir, "external-driver.txt"), "durable external state\n");
+    writeFileSync(join(worktreeDir, "textconv-driver.dat"), "durable textconv state\n");
+    execFileSync("git", ["add", ".gitattributes", "external-driver.txt", "textconv-driver.dat"], { cwd: worktreeDir });
+    execFileSync("git", ["commit", "--quiet", "-m", "hostile diff baseline"], { cwd: worktreeDir });
+    const durableBase = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreeDir, encoding: "utf8" }).trim();
+    const remoteRepo = join(hostileRoot, "origin.git");
+    execFileSync("git", ["clone", "--bare", "--quiet", worktreeDir, remoteRepo]);
+    execFileSync("git", ["config", "diff.hostile-external.command", externalDriver], { cwd: worktreeDir });
+    execFileSync("git", ["config", "diff.hostile-textconv.textconv", textconvDriver], { cwd: worktreeDir });
+    writeFileSync(join(worktreeDir, "external-driver.txt"), "candidate external state\n");
+    writeFileSync(join(worktreeDir, "textconv-driver.dat"), "candidate textconv state\n");
+    const candidateTree = computeWorkspaceTreeOid(worktreeDir);
+
+    // Prove the local configuration is hostile: the same tree diff without
+    // recovery's raw-content fences invokes both helpers, and both helpers
+    // suppress their file's real content delta.
+    const hiddenControlDiff = join(hostileRoot, "hidden-control.patch");
+    execFileSync("git", [
+      "diff",
+      "--binary",
+      "--full-index",
+      `--output=${hiddenControlDiff}`,
+      `${durableBase}^{tree}`,
+      candidateTree,
+    ], { cwd: worktreeDir });
+    expect(readFileSync(marker, "utf8")).toContain("external\n");
+    expect(readFileSync(marker, "utf8")).toContain("textconv\n");
+    expect(statSync(hiddenControlDiff).size).toBe(0);
+    rmSync(marker, { force: true });
+
+    const valid = withFreshLoopFence(initial, {
+      baseSubject: durableBase,
+      recoveryBaseSubject: durableBase,
+    });
+    const preTree = computeWorkspaceTreeOid(worktreeDir);
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn(() => {
+        const receipt = standardReceipt(valid, {
+          subject: { base: durableBase, pre: preTree, post: preTree },
+        });
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: JSON.stringify({
+            ...receipt,
+            payload: { ...receipt.payload, summary: ["not-authoritative"] },
+          }),
+          stderr: "",
+          nativeSessionId: "native-hostile-diff",
+        };
+      }),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(existsSync(marker)).toBe(false);
+    const artifact = JSON.parse(result.recovery_artifact);
+    expect(artifact).toMatchObject({
+      base_commit: durableBase,
+      candidate_tree: candidateTree,
+      changed_paths: expect.arrayContaining(["external-driver.txt", "textconv-driver.dat"]),
+      diff_encoding: "git-diff",
+      diff_truncated: false,
+    });
+    expect(Buffer.from(artifact.diff_base64, "base64").byteLength).toBeGreaterThan(0);
+
+    const recoveryRepo = join(hostileRoot, "recovery");
+    execFileSync("git", ["clone", "--quiet", remoteRepo, recoveryRepo]);
+    execFileSync("git", ["checkout", "--quiet", durableBase], { cwd: recoveryRepo });
+    const recoveryPatch = join(hostileRoot, "recovery.patch");
     writeFileSync(recoveryPatch, Buffer.from(artifact.diff_base64, "base64"));
     execFileSync("git", ["apply", recoveryPatch], { cwd: recoveryRepo });
     expect(computeWorkspaceTreeOid(recoveryRepo)).toBe(artifact.candidate_tree);
