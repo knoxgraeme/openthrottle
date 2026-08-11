@@ -116,6 +116,8 @@ export interface ExecutionWorkAttempt {
   status: "pending" | "leased" | "dispatched" | "running" | "completed" | "failed" | "dead";
   lease_owner: string | null;
   lease_until: string | null;
+  observation_failure_count: number;
+  observation_retry_at: string | null;
   output_subject: string | null;
   payload: string;
   created_at: string;
@@ -202,6 +204,7 @@ export interface ExecutionUnitStore {
   recordActionObservationFailure(input: {
     actionId: string;
     lastError: string;
+    retryAtIso: string;
   }): void;
   completeUnitAction(input: {
     actionId: string;
@@ -769,12 +772,20 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     const dispatched = db.prepare(`
       SELECT * FROM execution_work_attempts
       WHERE parent_attempt_id = ? AND status IN ('dispatched', 'running')
+        AND (observation_retry_at IS NULL OR observation_retry_at <= ?)
       ORDER BY created_at, id
       LIMIT 1
-    `).get(input.parentAttemptId) as ExecutionWorkAttempt | undefined;
+    `).get(input.parentAttemptId, input.nowIso) as ExecutionWorkAttempt | undefined;
     if (dispatched) {
       return dispatched;
     }
+    const observationBackoff = db.prepare(`
+      SELECT 1 FROM execution_work_attempts
+      WHERE parent_attempt_id = ? AND status IN ('dispatched', 'running')
+        AND observation_retry_at IS NOT NULL AND observation_retry_at > ?
+      LIMIT 1
+    `).get(input.parentAttemptId, input.nowIso);
+    if (observationBackoff) return undefined;
     const active = db.prepare(`
       SELECT 1 FROM execution_work_attempts
       WHERE parent_attempt_id = ? AND status = 'leased'
@@ -1569,9 +1580,10 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     recordActionObservationFailure(input) {
       db.prepare(`
         UPDATE execution_work_attempts
-        SET lease_owner = NULL, last_error = ?, updated_at = ?
+        SET lease_owner = NULL, observation_failure_count = observation_failure_count + 1,
+            observation_retry_at = ?, last_error = ?, updated_at = ?
         WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
-      `).run(input.lastError.slice(0, 2_000), now(), input.actionId);
+      `).run(input.retryAtIso, input.lastError.slice(0, 2_000), now(), input.actionId);
     },
     completeUnitAction,
     completeGatedAction,

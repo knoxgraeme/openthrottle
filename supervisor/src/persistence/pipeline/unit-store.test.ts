@@ -1640,7 +1640,7 @@ describe("execution unit store", () => {
     });
   });
 
-  it("records observation failures without clearing the child action deadline", () => {
+  it("records observation failures with bounded retry state without clearing the child action deadline", () => {
     const store = setup();
     store.createGraph({
       pipelineInstanceId: "instance-1",
@@ -1663,17 +1663,34 @@ describe("execution unit store", () => {
     store.recordActionObservationFailure({
       actionId: active.id,
       lastError: "operation=FileSystem.listFiles retryable=true status=502 message=empty body",
+      retryAtIso: "2026-07-29T00:00:05.000Z",
     });
 
     expect(db!.prepare(`
-      SELECT status, lease_owner, lease_until, last_error
+      SELECT status, lease_owner, lease_until, observation_failure_count, observation_retry_at, last_error
       FROM execution_work_attempts WHERE id = ?
     `).get(active.id)).toEqual({
       status: "dispatched",
       lease_owner: null,
       lease_until: "2026-07-29T00:01:00.000Z",
+      observation_failure_count: 1,
+      observation_retry_at: "2026-07-29T00:00:05.000Z",
       last_error: "operation=FileSystem.listFiles retryable=true status=502 message=empty body",
     });
+
+    expect(store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: "2026-07-29T00:00:04.000Z",
+      leaseUntilIso: "2026-07-29T00:01:04.000Z",
+    })).toBeUndefined();
+
+    expect(store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: "2026-07-29T00:00:05.000Z",
+      leaseUntilIso: "2026-07-29T00:01:05.000Z",
+    })?.id).toBe(active.id);
 
     expect(store.healExpiredCurrentChildAction({
       parentAttemptId: "attempt-parent",

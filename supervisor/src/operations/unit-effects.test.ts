@@ -25,6 +25,8 @@ function action(overrides: Partial<ExecutionWorkAttempt> = {}): ExecutionWorkAtt
     status: "leased",
     lease_owner: "owner",
     lease_until: "2026-07-29T00:01:00.000Z",
+    observation_failure_count: 0,
+    observation_retry_at: null,
     output_subject: null,
     payload: "{}",
     created_at: "2026-07-29T00:00:00.000Z",
@@ -237,7 +239,7 @@ describe("unit effect processor", () => {
     expect(runtime.dispatchUnitAction).not.toHaveBeenCalled();
   });
 
-  it("retains an expired action when collection errors", async () => {
+  it("backs off an expired action when transient collection observation errors remain within budget", async () => {
     const expired = action({
       status: "running",
       request_hash: "request-hash",
@@ -261,10 +263,46 @@ describe("unit effect processor", () => {
 
     expect(store.recordActionObservationFailure).toHaveBeenCalledWith({
       actionId: "action-1",
-      lastError: "runtime unavailable",
+      lastError: "observation_attempt=1/3 runtime unavailable",
+      retryAtIso: "2026-07-29T00:00:05.000Z",
     });
     expect(store.healExpiredCurrentChildAction).not.toHaveBeenCalled();
+    expect(store.stopRetryableUnitAction).not.toHaveBeenCalled();
     expect(store.completeUnitAction).not.toHaveBeenCalled();
+    expect(runtime.dispatchUnitAction).not.toHaveBeenCalled();
+  });
+
+  it("terminalizes repeated transient collection observation errors when the budget is exhausted", async () => {
+    const expired = action({
+      status: "running",
+      request_hash: "request-hash",
+      native_session_id: "native-1",
+      lease_until: "2026-07-28T23:59:59.000Z",
+      observation_failure_count: 2,
+    });
+    const store = storeFor(expired);
+    const runtime: UnitEffectRuntime = {
+      collectUnitAction: vi.fn(async () => {
+        throw new Error("runtime unavailable");
+      }),
+      dispatchUnitAction: vi.fn(),
+    };
+
+    await createUnitEffectProcessor({
+      store,
+      runtime,
+      leaseOwner: "owner",
+      now: () => new Date("2026-07-29T00:00:00.000Z"),
+    }).drain("attempt-parent");
+
+    expect(store.stopRetryableUnitAction).toHaveBeenCalledWith({
+      actionId: "action-1",
+      resultHash: expect.any(String),
+      lastError: "observation_attempt=3/3 runtime unavailable",
+      nativeSessionId: "native-1",
+    });
+    expect(store.recordActionObservationFailure).not.toHaveBeenCalled();
+    expect(store.healExpiredCurrentChildAction).not.toHaveBeenCalled();
     expect(runtime.dispatchUnitAction).not.toHaveBeenCalled();
   });
 });

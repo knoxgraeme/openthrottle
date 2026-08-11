@@ -26,6 +26,8 @@ function fakeAction(): ExecutionWorkAttempt {
     status: "completed",
     lease_owner: null,
     lease_until: null,
+    observation_failure_count: 0,
+    observation_retry_at: null,
     output_subject: null,
     payload: "{}",
     created_at: "2026-08-08T00:00:00.000Z",

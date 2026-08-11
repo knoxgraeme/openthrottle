@@ -1,5 +1,10 @@
+import { digestCanonicalJson } from "@openthrottle/contracts";
 import type { ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
+import { sanitizeText } from "../shared/sanitize.js";
+
+const OBSERVATION_FAILURE_MAX_ATTEMPTS = 3;
+const OBSERVATION_FAILURE_RETRY_BASE_MS = 5_000;
 
 export interface UnitEffectRuntime {
   dispatchUnitAction(action: ExecutionWorkAttempt): Promise<{
@@ -54,9 +59,30 @@ export function createUnitEffectProcessor(input: {
         try {
           recovered = await input.runtime.collectUnitAction(action);
         } catch (error) {
+          const attempt = action.observation_failure_count + 1;
+          const message = sanitizeText(error instanceof Error ? error.message : String(error)).slice(-1_500);
+          const lastError = `observation_attempt=${attempt}/${OBSERVATION_FAILURE_MAX_ATTEMPTS} ${message}`;
+          if (attempt >= OBSERVATION_FAILURE_MAX_ATTEMPTS) {
+            input.store.stopRetryableUnitAction({
+              actionId: action.id,
+              resultHash: digestCanonicalJson({
+                schema: "openthrottle.child-action-observation-exhausted/v1",
+                action_id: action.id,
+                attempt,
+                error: lastError,
+              }),
+              lastError,
+              nativeSessionId: action.native_session_id,
+            });
+            return action;
+          }
+          const retryAtIso = new Date(
+            leasedAt.getTime() + OBSERVATION_FAILURE_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1)
+          ).toISOString();
           input.store.recordActionObservationFailure({
             actionId: action.id,
-            lastError: error instanceof Error ? error.message : String(error),
+            lastError,
+            retryAtIso,
           });
           return action;
         }

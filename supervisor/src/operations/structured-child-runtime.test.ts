@@ -71,6 +71,8 @@ function action(overrides: Partial<ExecutionWorkAttempt> & {
     native_session_id: null,
     lease_owner: null,
     lease_until: null,
+    observation_failure_count: 0,
+    observation_retry_at: null,
     output_subject: null,
     payload: "",
     created_at: `2099-07-22T12:00:0${overrides.cycle}.000Z`,

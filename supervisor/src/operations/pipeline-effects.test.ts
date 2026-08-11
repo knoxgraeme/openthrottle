@@ -1336,7 +1336,7 @@ describe("pipeline effect processor", () => {
       stopped_at: null,
       stop_reason: null,
     });
-    db!.prepare("UPDATE execution_work_attempts SET lease_until = ?, last_error = NULL WHERE id = ?")
+    db!.prepare("UPDATE execution_work_attempts SET lease_until = ?, observation_retry_at = NULL, last_error = NULL WHERE id = ?")
       .run("2099-07-22T12:01:00.000Z", review.id);
     const acceptedFinding = {
       severity: "P1" as const,
@@ -2134,13 +2134,14 @@ describe("pipeline effect processor", () => {
     const instance = pipelines.getInstanceForSession("session-active-drain-throw")!;
     const attempt = pipelines.getActiveAttempt(instance.id)!;
     const runtime = sandboxRuntimeMock({ issueId: "active-drain-throw" });
+    let now = new Date("2099-07-22T12:00:00.000Z");
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
       runtime,
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
-      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      now: () => now,
     });
 
     await processor.drain();
@@ -2159,6 +2160,9 @@ describe("pipeline effect processor", () => {
       stop_reason: null,
       aggregate_emitted_at: null,
     });
+    const collectionCalls = runtime.collectLoopActionResult.mock.calls.length;
+    await processor.drain();
+    expect(runtime.collectLoopActionResult).toHaveBeenCalledTimes(collectionCalls);
 
     const completedSubject = "1".repeat(40);
     runtime.collectLoopActionResult.mockResolvedValueOnce({
@@ -2179,6 +2183,7 @@ describe("pipeline effect processor", () => {
       }),
       completedAt: "2099-07-22T12:00:00.000Z",
     });
+    now = new Date("2099-07-22T12:00:05.000Z");
     await processor.drain();
     expect(runtime.dispatchLoopAction).toHaveBeenCalledTimes(dispatchCalls);
     expect(pipelines.listWorkAttempts(attempt.id)[0]).toMatchObject({
