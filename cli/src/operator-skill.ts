@@ -32,7 +32,7 @@ const AGENT_ROOTS: Record<SupportedAgent, string> = {
 const AGENT_SKILL_DIRS: Record<SupportedAgent, string> = {
   "Claude Code": ".claude/skills",
   Codex: ".codex/skills",
-  OpenCode: ".opencode/skills",
+  OpenCode: ".config/opencode/skills",
 };
 const OPENCODE_CONFIG_ROOT = ".config/opencode";
 
@@ -267,6 +267,7 @@ function prepareSkillfishStagingHome(agents: SupportedAgent[]): string {
   const tempHome = mkdtempSync(join(tmpdir(), "openthrottle-skillfish-stage-"));
   for (const agent of agents) {
     mkdirSync(join(tempHome, AGENT_ROOTS[agent]), { recursive: true });
+    if (agent === "OpenCode") mkdirSync(join(tempHome, OPENCODE_CONFIG_ROOT), { recursive: true });
   }
   return tempHome;
 }
@@ -293,6 +294,41 @@ function installStagedSkillAtomically(sourcePath: string, targetPath: string): v
     rmSync(tempTarget, { recursive: true, force: true });
     throw error;
   }
+}
+
+function replaceStagedSkillAtomically(sourcePath: string, targetPath: string): void {
+  if (!existsSync(join(sourcePath, "SKILL.md"))) {
+    throw new Error(`staged OpenThrottle skill is missing SKILL.md: ${sourcePath}`);
+  }
+  const targetParent = dirname(targetPath);
+  mkdirSync(targetParent, { recursive: true });
+  const tempTarget = join(targetParent, `.openthrottle.tmp.${process.pid}.${Date.now()}`);
+  const backupTarget = join(targetParent, `.openthrottle.backup.${process.pid}.${Date.now()}`);
+  rmSync(tempTarget, { recursive: true, force: true });
+  rmSync(backupTarget, { recursive: true, force: true });
+  try {
+    cpSync(sourcePath, tempTarget, { recursive: true });
+    if (existsSync(targetPath)) renameSync(targetPath, backupTarget);
+    renameSync(tempTarget, targetPath);
+    rmSync(backupTarget, { recursive: true, force: true });
+  } catch (error) {
+    rmSync(tempTarget, { recursive: true, force: true });
+    if (!existsSync(targetPath) && existsSync(backupTarget)) renameSync(backupTarget, targetPath);
+    rmSync(backupTarget, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function removeOwnedSkillDirectory(targetPath: string): void {
+  const stat = lstatSync(targetPath, { throwIfNoEntry: false });
+  if (!stat) return;
+  if (stat.isSymbolicLink()) {
+    rmSync(targetPath);
+    return;
+  }
+  if (!stat.isDirectory()) throw new Error(`OpenThrottle skill target is not a directory: ${targetPath}`);
+  rmSync(targetPath, { recursive: true, force: true });
+  if (existsSync(targetPath)) throw new Error(`OpenThrottle skill target still exists after removal: ${targetPath}`);
 }
 
 function parseSkillfishJson(result: SpawnSyncReturns<Buffer>): SkillfishJson {
@@ -419,13 +455,21 @@ function parseErrors(json: SkillfishJson, raw: SpawnSyncReturns<Buffer>): string
 function classifyCurrentInstalls(
   listJson: SkillfishJson,
   result: OperatorSkillResult,
-  expectedDigest: string
+  expectedDigest: string,
+  home: string
 ): { detected: SupportedAgent[]; installs: Map<SupportedAgent, OwnedInstall> } {
   const detected = detectedSupportedAgents(listJson);
   const installs = new Map<SupportedAgent, OwnedInstall>();
   for (const entry of installedEntries(listJson)) {
     const inspected = inspectOwnedInstall(entry, expectedDigest);
     if (inspected) installs.set(inspected.agent, inspected);
+  }
+  for (const agent of detected) {
+    const targetPath = operatorSkillTargetPath(home, agent);
+    if (existsSync(targetPath) && !installs.has(agent)) {
+      const inspected = inspectOwnedInstall({ skill: SKILL_NAME, agent, path: targetPath }, expectedDigest);
+      if (inspected) installs.set(agent, inspected);
+    }
   }
   for (const agent of SUPPORTED_AGENTS) {
     if (!detected.includes(agent)) {
@@ -455,9 +499,10 @@ export function runOperatorSkillAction(
   const sourceRef = resolveOperatorSkillSourceRef(options);
   const sourceDigest = operatorSkillBundleDigest();
   const result = baseResult(action, sourceRef, sourceDigest);
+  const realHome = options.home ?? homedir();
   const listed = runSkillfishJson(["list", "--global"], options);
   if (!ensureSuccessfulSkillfish(listed.json, listed.raw, result)) return result;
-  const { detected, installs } = classifyCurrentInstalls(listed.json, result, sourceDigest);
+  const { detected, installs } = classifyCurrentInstalls(listed.json, result, sourceDigest, realHome);
 
   if (action === "status") {
     for (const agent of detected) {
@@ -483,30 +528,46 @@ export function runOperatorSkillAction(
       result.conflicted.push({ agent: install.agent, status: "conflicted", path: install.path, reason: install.reason });
     }
     for (const install of removable) {
+      if (install.agent === "OpenCode" && resolve(install.path) === operatorSkillTargetPath(realHome, "OpenCode")) {
+        try {
+          removeOwnedSkillDirectory(install.path);
+          result.removed.push({ agent: install.agent, status: "removed", path: install.path });
+        } catch (error) {
+          result.success = false;
+          result.conflicted.push({ agent: install.agent, status: "conflicted", path: install.path, reason: getErrorMessage(error) });
+        }
+        continue;
+      }
       const removed = runSkillfishJson(["remove", SKILL_NAME, "--global", "--yes"], options, [install.agent]);
-      if (ensureSuccessfulSkillfish(removed.json, removed.raw, result)) {
+      if (ensureSuccessfulSkillfish(removed.json, removed.raw, result) && !existsSync(install.path)) {
         result.removed.push({ agent: install.agent, status: "removed", path: install.path });
+      } else if (existsSync(install.path)) {
+        result.success = false;
+        result.conflicted.push({ agent: install.agent, status: "conflicted", path: install.path, reason: "OpenThrottle skill target still exists after removal" });
       }
     }
     return result;
   }
 
   const needsInstall: SupportedAgent[] = [];
+  const needsReplace = new Set<SupportedAgent>();
   for (const agent of detected) {
     const install = installs.get(agent);
     if (!install) {
       needsInstall.push(agent);
     } else if (install.exact && install.digestMatches) {
       result.skipped.push({ agent, status: "skipped", path: install.path, reason: "already installed from matching source" });
+    } else if (action === "refresh" && install.exact) {
+      needsInstall.push(agent);
+      needsReplace.add(agent);
     } else {
       result.success = false;
       result.conflicted.push({ agent, status: "conflicted", path: install.path, reason: install.reason });
-      addRecovery(result, "openthrottle operator-skill remove && openthrottle operator-skill install");
+      addRecovery(result, install.exact ? "openthrottle operator-skill refresh" : "openthrottle operator-skill remove && openthrottle operator-skill install");
     }
   }
   if (result.conflicted.length > 0 || needsInstall.length === 0) return result;
 
-  const realHome = options.home ?? homedir();
   const tempHome = prepareSkillfishStagingHome(needsInstall);
   try {
     writeFileSync(join(tempHome, "skillfish.json"), JSON.stringify({ version: 1, skills: [result.source] }, null, 2));
@@ -520,7 +581,8 @@ export function runOperatorSkillAction(
       if (entry.skill === SKILL_NAME && typeof entry.agent === "string" && isSupportedAgent(entry.agent) && typeof entry.path === "string") {
         const targetPath = operatorSkillTargetPath(realHome, entry.agent);
         try {
-          installStagedSkillAtomically(entry.path, targetPath);
+          if (needsReplace.has(entry.agent)) replaceStagedSkillAtomically(entry.path, targetPath);
+          else installStagedSkillAtomically(entry.path, targetPath);
           result.installed.push({ agent: entry.agent, status: "installed", path: targetPath });
         } catch (error) {
           result.success = false;

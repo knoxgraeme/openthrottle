@@ -1,5 +1,5 @@
 import type { SpawnSyncReturns } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -38,7 +38,7 @@ function spawnResult(json: unknown, status = 0): SpawnSyncReturns<Buffer> {
   } as SpawnSyncReturns<Buffer>;
 }
 
-function installedSkill(home: string, agentRoot: ".codex" | ".claude" | ".opencode", manifest: unknown): string {
+function installedSkill(home: string, agentRoot: ".codex" | ".claude" | ".opencode" | ".config/opencode", manifest: unknown): string {
   const target = join(home, agentRoot, "skills", "openthrottle");
   mkdirSync(target, { recursive: true });
   cpSync(resolve(process.cwd(), "../skills/operator/openthrottle"), target, { recursive: true });
@@ -106,6 +106,7 @@ describe("operator skill Skillfish wrapper", () => {
     const home = temporaryDirectory();
     mkdirSync(join(home, ".codex"), { recursive: true });
     mkdirSync(join(home, ".claude"), { recursive: true });
+    mkdirSync(join(home, ".config", "opencode"), { recursive: true });
     const unrelatedSkill = join(home, ".codex", "skills", "other-skill", "SKILL.md");
     mkdirSync(join(home, ".codex", "skills", "other-skill"), { recursive: true });
     writeFileSync(unrelatedSkill, "---\nname: other-skill\n---\n");
@@ -116,18 +117,20 @@ describe("operator skill Skillfish wrapper", () => {
         return spawnResult({
           success: true,
           installed: [],
-          agents_detected: ["Codex", "Claude Code"],
+          agents_detected: ["Codex", "Claude Code", "OpenCode"],
         });
       }
       const manifest = JSON.parse(readFileSync(join(options.env.HOME ?? "", "skillfish.json"), "utf8")) as { skills: string[] };
       expect(manifest.skills).toEqual([operatorSkillSource(sourceRef)]);
       const stagedCodexPath = stagedSkill(options.env.HOME ?? "", ".codex");
       const stagedClaudePath = stagedSkill(options.env.HOME ?? "", ".claude");
+      const stagedOpenCodePath = stagedSkill(options.env.HOME ?? "", ".opencode");
       return spawnResult({
         success: true,
         installed: [
           { skill: "openthrottle", agent: "Codex", path: stagedCodexPath, location: "global" },
           { skill: "openthrottle", agent: "Claude Code", path: stagedClaudePath, location: "global" },
+          { skill: "openthrottle", agent: "OpenCode", path: stagedOpenCodePath, location: "global" },
         ],
         skipped: [],
       });
@@ -137,13 +140,15 @@ describe("operator skill Skillfish wrapper", () => {
     const result = runOperatorSkillAction("install", { home, runner, sourceRef });
 
     expect(result.success).toBe(true);
-    expect(result.installed.map((entry) => entry.agent).sort()).toEqual(["Claude Code", "Codex"]);
+    expect(result.installed.map((entry) => entry.agent).sort()).toEqual(["Claude Code", "Codex", "OpenCode"]);
     expect(result.installed.map((entry) => entry.path).sort()).toEqual([
       join(home, ".claude", "skills", "openthrottle"),
       join(home, ".codex", "skills", "openthrottle"),
-    ]);
+      join(home, ".config", "opencode", "skills", "openthrottle"),
+    ].sort());
+    expect(result.installed.map((entry) => entry.path)).not.toContain(join(home, ".opencode", "skills", "openthrottle"));
     expect(readFileSync(unrelatedSkill, "utf8")).toContain("other-skill");
-    expect(result.unsupported.map((entry) => entry.agent)).toEqual(["OpenCode"]);
+    expect(result.unsupported).toEqual([]);
     expect(calls.map((call) => call.args)).toEqual([
       ["list", "--global", "--json"],
       ["install", "--global", "--yes", "--json"],
@@ -152,6 +157,83 @@ describe("operator skill Skillfish wrapper", () => {
     expect(calls[1]!.env.CI).toBe("1");
     expect(calls[1]!.env.GITHUB_TOKEN).toBeUndefined();
     expect(calls[1]!.env.OT_STATUS_TOKEN).toBeUndefined();
+  });
+
+  it("refresh replaces stale owned installs without removing unrelated skills", () => {
+    const home = temporaryDirectory();
+    const path = installedSkill(home, ".codex", {
+      owner: "knoxgraeme",
+      repo: "openthrottle-v2",
+      path: "skills/operator/openthrottle",
+      source: "manifest",
+    });
+    writeFileSync(join(path, "SKILL.md"), "---\nname: openthrottle\n---\nlocally modified\n");
+    const unrelatedSkill = join(home, ".codex", "skills", "other-skill", "SKILL.md");
+    mkdirSync(join(home, ".codex", "skills", "other-skill"), { recursive: true });
+    writeFileSync(unrelatedSkill, "---\nname: other-skill\n---\n");
+    const calls: string[][] = [];
+    const runner = (args: string[], options: { env: NodeJS.ProcessEnv }) => {
+      calls.push(args);
+      if (args[0] === "list") {
+        return spawnResult({
+          success: true,
+          installed: [{ skill: "openthrottle", agent: "Codex", path, location: "global" }],
+          agents_detected: ["Codex"],
+        });
+      }
+      const stagedCodexPath = stagedSkill(options.env.HOME ?? "", ".codex");
+      return spawnResult({
+        success: true,
+        installed: [{ skill: "openthrottle", agent: "Codex", path: stagedCodexPath, location: "global" }],
+        skipped: [],
+      });
+    };
+
+    const result = runOperatorSkillAction("refresh", { home, runner, sourceRef });
+
+    expect(result.success).toBe(true);
+    expect(result.installed).toEqual([{ agent: "Codex", status: "installed", path }]);
+    expect(readFileSync(join(path, "SKILL.md"), "utf8")).not.toContain("locally modified");
+    expect(readFileSync(unrelatedSkill, "utf8")).toContain("other-skill");
+    expect(calls).toEqual([
+      ["list", "--global", "--json"],
+      ["install", "--global", "--yes", "--json"],
+    ]);
+  });
+
+  it("keeps install from overwriting stale owned installs without refresh", () => {
+    const home = temporaryDirectory();
+    const path = installedSkill(home, ".codex", {
+      owner: "knoxgraeme",
+      repo: "openthrottle-v2",
+      path: "skills/operator/openthrottle",
+      source: "manifest",
+    });
+    writeFileSync(join(path, "SKILL.md"), "---\nname: openthrottle\n---\nlocally modified\n");
+    let calls = 0;
+    const runner = () => {
+      calls += 1;
+      return spawnResult({
+        success: true,
+        installed: [{ skill: "openthrottle", agent: "Codex", path, location: "global" }],
+        agents_detected: ["Codex"],
+      });
+    };
+
+    const result = runOperatorSkillAction("install", { home, runner, sourceRef });
+
+    expect(calls).toBe(1);
+    expect(result.success).toBe(false);
+    expect(result.conflicted).toEqual([
+      {
+        agent: "Codex",
+        status: "conflicted",
+        path,
+        reason: "installed OpenThrottle skill differs from the packaged source",
+      },
+    ]);
+    expect(result.recovery).toEqual(["openthrottle operator-skill refresh"]);
+    expect(readFileSync(join(path, "SKILL.md"), "utf8")).toContain("locally modified");
   });
 
   it("reports detected agents without installs in read-only status", () => {
@@ -252,6 +334,7 @@ describe("operator skill Skillfish wrapper", () => {
           agents_detected: ["Codex", "Claude Code"],
         });
       }
+      rmSync(codexPath, { recursive: true, force: true });
       return spawnResult({ success: true, removed: [{ skill: "openthrottle", agent: "Codex", path: codexPath }] });
     };
 
@@ -270,5 +353,31 @@ describe("operator skill Skillfish wrapper", () => {
         reason: "existing openthrottle skill is not Skillfish-managed from OpenThrottle",
       },
     ]);
+  });
+
+  it("removes exact OpenCode config installs without relying on Skillfish's legacy path", () => {
+    const home = temporaryDirectory();
+    const openCodePath = installedSkill(home, ".config/opencode", {
+      owner: "knoxgraeme",
+      repo: "openthrottle-v2",
+      path: "skills/operator/openthrottle",
+      source: "manifest",
+    });
+    const calls: string[][] = [];
+    const runner = (args: string[]) => {
+      calls.push(args);
+      return spawnResult({
+        success: true,
+        installed: [],
+        agents_detected: ["OpenCode"],
+      });
+    };
+
+    const result = runOperatorSkillAction("remove", { home, runner, sourceRef });
+
+    expect(calls).toEqual([["list", "--global", "--json"]]);
+    expect(result.success).toBe(true);
+    expect(result.removed).toEqual([{ agent: "OpenCode", status: "removed", path: openCodePath }]);
+    expect(existsSync(openCodePath)).toBe(false);
   });
 });

@@ -24,9 +24,9 @@ OpenThrottle.
 4. Resolve the repository root before any mutation and require a valid
    `.openthrottle.yml`. For preparation or ambiguity, use dry-run/read-only CLI
    flows and show the JSON result.
-5. For explicit mutation requests, run the matching CLI command with `--json`,
-   report only CLI-evidenced ticket/run URLs and trigger state, then inspect
-   progress with `openthrottle status`.
+5. For explicit mutation requests, use `--json` only when the selected CLI
+   command supports it. Report only CLI-evidenced ticket/run URLs and trigger
+   state, then inspect progress with `openthrottle status`.
 6. If ticket creation succeeded but trigger failed, surface the CLI recovery
    command exactly and reuse that ticket. Do not create a second ticket unless
    the user explicitly asks after seeing the recovery.
@@ -42,8 +42,9 @@ OpenThrottle.
 
 ## Result Handling
 
-Prefer JSON CLI output where available. If JSON parsing fails, show the bounded
-stderr/stdout summary and stop. When the CLI reports partial success, preserve
-its recovery command and identifiers exactly; when it reports missing
-registration, ambiguous input, unsupported capability, or authentication
-failure, do not improvise a provider-side workaround.
+Prefer JSON CLI output where available. For commands that do not yet expose
+JSON, show a bounded stdout/stderr summary and stop if the result is ambiguous.
+When the CLI reports partial success, preserve its recovery command and
+identifiers exactly; when it reports missing registration, ambiguous input,
+unsupported capability, or authentication failure, do not improvise a
+provider-side workaround.
