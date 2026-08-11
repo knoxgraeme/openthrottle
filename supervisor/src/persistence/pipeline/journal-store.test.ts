@@ -11,13 +11,25 @@ describe("orchestration journal store", () => {
     db = undefined;
   });
 
-  function seedTicket(issueId = "issue-1", identifier = "OT-1"): void {
+  function seedTicket(
+    issueId = "linear:issue-1",
+    identifier = "OT-1",
+    sessionId = "session-1",
+    provider: "linear" | "github" = "linear"
+  ): void {
     db!.prepare(`
       INSERT INTO tickets (
-        ticket_id, ticket_reference, session_id,
+        ticket_id, ticket_reference, session_id, control_provider,
         sandbox_id, branch, agent, repo, pr_url, state, base_branch, created_at, updated_at
-      ) VALUES (?, ?, 'session-1', NULL, 'ot/ot-1', 'codex', 'owner/repo', NULL, 'active', 'main', ?, ?)
-    `).run(issueId, identifier, "2026-07-27T00:00:00.000Z", "2026-07-27T00:00:00.000Z");
+      ) VALUES (?, ?, ?, ?, NULL, 'ot/ot-1', 'codex', 'owner/repo', NULL, 'active', 'main', ?, ?)
+    `).run(
+      issueId,
+      identifier,
+      sessionId,
+      provider,
+      "2026-07-27T00:00:00.000Z",
+      "2026-07-27T00:00:00.000Z"
+    );
   }
 
   function registerRepository(teamKey: string, updatedAt: string): void {
@@ -31,13 +43,13 @@ describe("orchestration journal store", () => {
 
   it("prefers the issue team over the repository route fallback", () => {
     db = openDb(":memory:");
-    seedTicket("issue-1", "OT-1");
+    seedTicket("linear:issue-1", "OT-1");
     registerRepository("QA", "2026-07-27T01:00:00.000Z");
 
     const journal = createJournalStore(db, () => "2026-07-27T02:00:00.000Z");
     journal.recordJournalEntry({
       id: "team-row",
-      issueId: "issue-1",
+      issueId: "linear:issue-1",
       actor: "supervisor",
       kind: "delegated",
       trigger: "test",
@@ -45,11 +57,43 @@ describe("orchestration journal store", () => {
       refs: {},
     });
 
-    expect(journal.listJournalEntries({ issueId: "issue-1" })[0]).toMatchObject({
+    expect(journal.listJournalEntries({ issueId: "linear:issue-1" })[0]).toMatchObject({
       team: "OT",
       repository: "owner/repo",
-      issue: "OT-1",
+      issue: "linear:issue-1",
     });
+  });
+
+  it("keeps journal identity provider-qualified when display references collide", () => {
+    db = openDb(":memory:");
+    seedTicket("linear:issue-1", "OT-1", "linear-session");
+    seedTicket("github:issue-1", "OT-1", "github-session", "github");
+    registerRepository("OT", "2026-07-27T00:00:00.000Z");
+
+    const journal = createJournalStore(db, () => "2026-07-27T02:00:00.000Z");
+    for (const [id, issueId] of [
+      ["00000000-0000-4000-8000-000000000001", "linear:issue-1"],
+      ["00000000-0000-4000-8000-000000000002", "github:issue-1"],
+    ] as const) {
+      journal.recordJournalEntry({
+        id,
+        issueId,
+        actor: "supervisor",
+        kind: "delegated",
+        trigger: "test",
+        action: `Delegated ${issueId}.`,
+        refs: {},
+      });
+    }
+
+    expect(journal.listJournalEntries({ issueId: "linear:issue-1" }).map((entry) => entry.id))
+      .toEqual(["00000000-0000-4000-8000-000000000001"]);
+    expect(journal.listJournalEntries({ issueId: "github:issue-1" }).map((entry) => entry.id))
+      .toEqual(["00000000-0000-4000-8000-000000000002"]);
+    expect(db.prepare("SELECT id, issue FROM orchestration_journal ORDER BY id").all()).toEqual([
+      { id: "00000000-0000-4000-8000-000000000001", issue: "linear:issue-1" },
+      { id: "00000000-0000-4000-8000-000000000002", issue: "github:issue-1" },
+    ]);
   });
 
   it("normalizes offset timestamp filters before comparing recorded_at values", () => {
@@ -60,7 +104,7 @@ describe("orchestration journal store", () => {
     const journal = createJournalStore(db, () => "2026-07-27T00:00:00.000Z");
     journal.recordJournalEntry({
       id: "timestamp-row",
-      issueId: "issue-1",
+      issueId: "linear:issue-1",
       actor: "supervisor",
       kind: "published",
       trigger: "test",
@@ -69,11 +113,11 @@ describe("orchestration journal store", () => {
     });
 
     expect(journal.listJournalEntries({
-      issueId: "issue-1",
+      issueId: "linear:issue-1",
       from: "2026-07-27T01:00:00+02:00",
     })).toHaveLength(1);
     expect(journal.listJournalEntries({
-      issueId: "issue-1",
+      issueId: "linear:issue-1",
       to: "2026-07-27T01:00:00+02:00",
     })).toHaveLength(0);
 
@@ -81,11 +125,11 @@ describe("orchestration journal store", () => {
     // extended form above and Date.parse itself already accepts it -- a
     // stricter shape check must not reject it (PR #158 review).
     expect(journal.listJournalEntries({
-      issueId: "issue-1",
+      issueId: "linear:issue-1",
       from: "2026-07-27T01:00:00+0200",
     })).toHaveLength(1);
     expect(journal.listJournalEntries({
-      issueId: "issue-1",
+      issueId: "linear:issue-1",
       to: "2026-07-27T01:00:00+0200",
     })).toHaveLength(0);
   });
@@ -101,11 +145,11 @@ describe("orchestration journal store", () => {
     registerRepository("OT", "2026-07-27T00:00:00.000Z");
     const journal = createJournalStore(db, () => "2026-07-27T00:00:00.000Z");
 
-    expect(() => journal.listJournalEntries({ issueId: "issue-1", from: "0" }))
+    expect(() => journal.listJournalEntries({ issueId: "linear:issue-1", from: "0" }))
       .toThrow(/from must be an ISO-8601 timestamp/);
-    expect(() => journal.listJournalEntries({ issueId: "issue-1", from: "08/08/2026" }))
+    expect(() => journal.listJournalEntries({ issueId: "linear:issue-1", from: "08/08/2026" }))
       .toThrow(/from must be an ISO-8601 timestamp/);
-    expect(() => journal.listJournalEntries({ issueId: "issue-1", to: "2026-08-08" }))
+    expect(() => journal.listJournalEntries({ issueId: "linear:issue-1", to: "2026-08-08" }))
       .toThrow(/to must be an ISO-8601 timestamp/);
   });
 
@@ -119,11 +163,11 @@ describe("orchestration journal store", () => {
     registerRepository("OT", "2026-07-27T00:00:00.000Z");
     const journal = createJournalStore(db, () => "2026-07-27T00:00:00.000Z");
 
-    expect(() => journal.listJournalEntries({ issueId: "issue-1", limit: Number.NaN }))
+    expect(() => journal.listJournalEntries({ issueId: "linear:issue-1", limit: Number.NaN }))
       .toThrow(/limit must be a safe integer/);
-    expect(() => journal.listJournalEntries({ issueId: "issue-1", limit: Number.POSITIVE_INFINITY }))
+    expect(() => journal.listJournalEntries({ issueId: "linear:issue-1", limit: Number.POSITIVE_INFINITY }))
       .toThrow(/limit must be a safe integer/);
-    expect(() => journal.listJournalEntries({ issueId: "issue-1", limit: 1.5 }))
+    expect(() => journal.listJournalEntries({ issueId: "linear:issue-1", limit: 1.5 }))
       .toThrow(/limit must be a safe integer/);
   });
 
@@ -141,7 +185,7 @@ describe("orchestration journal store", () => {
       recordedAt = at;
       journal.recordJournalEntry({
         id,
-        issueId: "issue-1",
+        issueId: "linear:issue-1",
         actor: "supervisor",
         kind: "run_note",
         trigger: "ordering",
@@ -150,7 +194,7 @@ describe("orchestration journal store", () => {
       });
     }
 
-    expect(journal.listJournalEntries({ issueId: "issue-1", order: "newest", limit: 2 }).map((entry) => entry.id))
+    expect(journal.listJournalEntries({ issueId: "linear:issue-1", order: "newest", limit: 2 }).map((entry) => entry.id))
       .toEqual([
         "00000000-0000-4000-8000-000000000003",
         "00000000-0000-4000-8000-000000000002",
