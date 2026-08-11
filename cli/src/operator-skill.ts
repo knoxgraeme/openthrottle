@@ -429,16 +429,45 @@ function runSkillfishJson(
   options: OperatorSkillOptions,
   agents?: SupportedAgent[]
 ): { json: SkillfishJson; raw: SpawnSyncReturns<Buffer> } {
-  const tempHome = prepareSkillfishHome(options.home ?? homedir(), agents);
+  const realHome = options.home ?? homedir();
+  const tempHome = prepareSkillfishHome(realHome, agents);
   try {
     const result = (options.runner ?? defaultRunner)([...args, "--json"], {
       cwd: options.cwd ?? process.cwd(),
       env: safeSkillfishEnv(tempHome),
     });
-    return { json: parseSkillfishJson(result), raw: result };
+    const json = parseSkillfishJson(result);
+    return {
+      json: args[0] === "list" ? normalizeListedInstallPaths(json, tempHome, realHome) : json,
+      raw: result,
+    };
   } finally {
     rmSync(tempHome, { recursive: true, force: true });
   }
+}
+
+function normalizeListedInstallPaths(json: SkillfishJson, tempHome: string, realHome: string): SkillfishJson {
+  if (!Array.isArray(json.installed)) return json;
+  return {
+    ...json,
+    installed: json.installed.map((entry) => {
+      if (
+        typeof entry !== "object" || entry === null ||
+        typeof entry.agent !== "string" || !isSupportedAgent(entry.agent) ||
+        typeof entry.path !== "string"
+      ) {
+        return entry;
+      }
+      const reportedPath = resolve(entry.path);
+      const temporaryPaths = new Set([
+        stagedOperatorSkillPath(tempHome, entry.agent),
+        operatorSkillTargetPath(tempHome, entry.agent),
+      ]);
+      return temporaryPaths.has(reportedPath)
+        ? { ...entry, path: operatorSkillTargetPath(realHome, entry.agent) }
+        : entry;
+    }),
+  };
 }
 
 function installedEntries(json: SkillfishJson): SkillfishInstalledSkill[] {
@@ -559,14 +588,18 @@ function classifyCurrentInstalls(
   return { detected, installs };
 }
 
-function ensureSuccessfulSkillfish(json: SkillfishJson, raw: SpawnSyncReturns<Buffer>, result: OperatorSkillResult): boolean {
+function ensureSuccessfulSkillfish(
+  json: SkillfishJson,
+  raw: SpawnSyncReturns<Buffer>,
+  result: OperatorSkillResult,
+  attemptedAgents: readonly SupportedAgent[]
+): boolean {
   if (raw.error || raw.status !== 0 || json.success === false) {
     result.success = false;
-    result.conflicted.push({
-      agent: "Codex",
-      status: "conflicted",
-      reason: parseErrors(json, raw).join("; ") || raw.error?.message || "skillfish command failed",
-    });
+    const reason = parseErrors(json, raw).join("; ") || raw.error?.message || "skillfish command failed";
+    for (const agent of attemptedAgents) {
+      result.conflicted.push({ agent, status: "conflicted", reason });
+    }
     return false;
   }
   return true;
@@ -581,7 +614,7 @@ export function runOperatorSkillAction(
   const result = baseResult(action, sourceRef, sourceDigest);
   const realHome = options.home ?? homedir();
   const listed = runSkillfishJson(["list", "--global"], options);
-  if (!ensureSuccessfulSkillfish(listed.json, listed.raw, result)) return result;
+  if (!ensureSuccessfulSkillfish(listed.json, listed.raw, result, SUPPORTED_AGENTS)) return result;
   const { detected, installs } = classifyCurrentInstalls(listed.json, result, sourceDigest, realHome);
 
   if (action === "status") {
@@ -619,9 +652,10 @@ export function runOperatorSkillAction(
         continue;
       }
       const removed = runSkillfishJson(["remove", SKILL_NAME, "--global", "--yes"], options, [install.agent]);
-      if (ensureSuccessfulSkillfish(removed.json, removed.raw, result) && !existsSync(install.path)) {
+      if (!ensureSuccessfulSkillfish(removed.json, removed.raw, result, [install.agent])) continue;
+      if (!existsSync(install.path)) {
         result.removed.push({ agent: install.agent, status: "removed", path: install.path });
-      } else if (existsSync(install.path)) {
+      } else {
         result.success = false;
         result.conflicted.push({ agent: install.agent, status: "conflicted", path: install.path, reason: "OpenThrottle skill target still exists after removal" });
       }
@@ -656,7 +690,7 @@ export function runOperatorSkillAction(
       env: safeSkillfishEnv(tempHome),
     });
     const json = parseSkillfishJson(install);
-    if (!ensureSuccessfulSkillfish(json, install, result)) return result;
+    if (!ensureSuccessfulSkillfish(json, install, result, needsInstall)) return result;
     let staged: Map<SupportedAgent, string>;
     try {
       staged = validatedStagedInstallEntries(json, needsInstall, tempHome, sourceDigest);
