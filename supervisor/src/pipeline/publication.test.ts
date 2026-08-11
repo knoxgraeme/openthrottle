@@ -452,6 +452,13 @@ describe("pipeline publication", () => {
     });
     const canonical = canonicalJson(publication);
     expect(parsePipelinePublication(canonical)).toEqual(publication);
+    const legacy = structuredClone(publication) as unknown as {
+      pipeline: Record<string, unknown>;
+    };
+    legacy.pipeline.linear_issue_id = publication.pipeline.ticket_id;
+    delete legacy.pipeline.ticket_id;
+    expect(parsePipelinePublication(canonicalJson(legacy)).pipeline.ticket_id)
+      .toBe(`linear:${publication.pipeline.ticket_id}`);
     expectReceiptShape(
       publication.body,
       /^\*\*Your move: nothing — this run is finished\. The job shipped\./m
