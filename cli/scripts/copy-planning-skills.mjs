@@ -1,10 +1,14 @@
-import { cpSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { cpSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = resolve(here, "../../skills/planning");
 const target = resolve(here, "../dist/skills/planning");
+const operatorSkillSource = resolve(here, "../../skills/operator");
+const operatorSkillTarget = resolve(here, "../dist/skills/operator");
+const operatorSkillMetadataTarget = resolve(here, "../dist/operator-skill-source.json");
 const editableTaskSource = resolve(here, "../../skills/tasks/implement-plan");
 const editableTaskTarget = resolve(here, "../dist/skills/tasks/implement-plan");
 const editableGraphSource = resolve(here, "../../supervisor/graphs/simple-v1.json");
@@ -53,6 +57,8 @@ function editableTaskFiles(root) {
 
 rmSync(target, { recursive: true, force: true });
 cpSync(source, target, { recursive: true });
+rmSync(operatorSkillTarget, { recursive: true, force: true });
+cpSync(operatorSkillSource, operatorSkillTarget, { recursive: true });
 rmSync(editableTaskTarget, { recursive: true, force: true });
 for (const path of editableTaskFiles(editableTaskSource)) {
   const destination = resolve(editableTaskTarget, path);
@@ -61,3 +67,42 @@ for (const path of editableTaskFiles(editableTaskSource)) {
 }
 mkdirSync(resolve(here, "../dist/scaffolds"), { recursive: true });
 cpSync(editableGraphSource, editableGraphTarget);
+
+const immutableSourceRef = (ref) =>
+  /^[a-f0-9]{40}$/i.test(ref) || /^v?\d+\.\d+\.\d+(?:[-.][A-Za-z0-9]+)*$/.test(ref);
+const sourcePaths = [
+  "skills/operator/openthrottle",
+  "cli/src/operator-skill.ts",
+  "cli/src/operator-skill.test.ts",
+  "cli/src/index.ts",
+  "cli/scripts/copy-planning-skills.mjs",
+  "cli/package.json",
+  "cli/package-lock.json",
+];
+const explicitSourceRef = process.env.OT_OPERATOR_SKILL_SOURCE_REF?.trim();
+let sourceRef = explicitSourceRef;
+let sourceUnavailableReason;
+if (sourceRef) {
+  if (!immutableSourceRef(sourceRef)) {
+    throw new Error("operator skill source ref is unavailable; set OT_OPERATOR_SKILL_SOURCE_REF to an immutable release ref or commit");
+  }
+} else {
+  const inferredHead = spawnSync("git", ["rev-parse", "HEAD"], { cwd: resolve(here, "../.."), encoding: "utf8" }).stdout?.trim();
+  const dirty = spawnSync("git", ["diff", "--quiet", "HEAD", "--", ...sourcePaths], { cwd: resolve(here, "../..") });
+  const untracked = spawnSync("git", ["ls-files", "--others", "--exclude-standard", "--", ...sourcePaths], {
+    cwd: resolve(here, "../.."),
+    encoding: "utf8",
+  }).stdout?.trim();
+  if (!inferredHead || !immutableSourceRef(inferredHead)) {
+    sourceUnavailableReason = "operator skill source ref is unavailable; rebuild from a git checkout or set OT_OPERATOR_SKILL_SOURCE_REF to a release ref";
+  } else if (dirty.status !== 0 || untracked) {
+    sourceUnavailableReason = "operator skill source ref would not match the working tree; commit changes or set OT_OPERATOR_SKILL_SOURCE_REF to a release ref";
+  } else {
+    sourceRef = inferredHead;
+  }
+}
+writeFileSync(operatorSkillMetadataTarget, `${JSON.stringify({
+  source: sourceRef ? `knoxgraeme/openthrottle-v2@${sourceRef}/skills/operator/openthrottle` : null,
+  source_ref: sourceRef ?? null,
+  ...(sourceUnavailableReason ? { source_unavailable_reason: sourceUnavailableReason } : {}),
+}, null, 2)}\n`);
