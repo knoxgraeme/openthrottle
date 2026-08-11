@@ -143,8 +143,8 @@ describe("database migrations", () => {
       "62d23bf76b20a18c4ff15352d3ef1558fe6bb364860d58915a26a84c8a6ed2b3",
       "1b9a06d171fdefd11b55aa4b785fc639310792b8de144d4c49c50206c4a6a3b2",
       "e1f1cc26fcd21df5ca8cb56548d2d38f90311d40d93bcd0e54d4ab62f9eb6ad4",
-      "11bdf53d0a0b59014ad94e49c190d3c1b55cd26c7e1d031c56dfb3df1916cad9",
-      "20e15db3951119345b7cd0b9080788e742bab11a9207fb41e564314fd9353b96",
+      "36f3c74ad261f3e4e9e5014221e5ff8510dc7123b03ab92f2875b02ab0cf4fb2",
+      "8ede2103ae2f761958e4a21fc672b1c7a2a6c8fe39f75109ca3843b2fe492597",
       "f1bdb3c566c1c190d679eede3ce2300855b654fe90dc303d5d18a7f91a762114",
     ]);
   });
@@ -242,6 +242,40 @@ describe("database migrations", () => {
     expect(db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'linear_outbox'"
     ).get()).toBeUndefined();
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'pipeline_publications_process_idx'
+    `).get()).toEqual({ name: "pipeline_publications_process_idx" });
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'index' AND name = 'pipeline_effects_pending_idx'
+    `).get()).toEqual({ name: "pipeline_effects_pending_idx" });
+    expect(() => db!.prepare(`
+      INSERT INTO repository_registrations (
+        github_repo, control_provider, linear_team_key, base_branch,
+        webhook_id, snapshot, created_at, updated_at
+      ) VALUES (
+        'acme/missing-linear-team', 'linear', NULL, 'main', 1, '{}',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      )
+    `).run()).toThrow();
+  });
+
+  it("does not recreate the retired Linear outbox after reopening a migrated database", () => {
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-neutral-reopen-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "supervisor.db");
+
+    db = openDb(path);
+    db.close();
+    db = openDb(path);
+
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'control_outbox'"
+    ).get()).toEqual({ name: "control_outbox" });
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'linear_outbox'"
+    ).get()).toBeUndefined();
   });
 
   it("migrates repository registrations to provider-qualified repo authority", () => {
@@ -260,9 +294,14 @@ describe("database migrations", () => {
       INSERT INTO repository_registrations (
         linear_team_key, linear_team_id, github_repo, base_branch,
         webhook_id, snapshot, created_at, updated_at
-      ) VALUES (
+      ) VALUES
+      (
         'ENG', 'team-1', 'acme/widget', 'main', 42,
         'openthrottle', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      ),
+      (
+        'OPS', 'team-2', 'ACME/WIDGET', 'release', 43,
+        'newer-route', '2026-01-02T00:00:00.000Z', '2026-01-02T00:00:00.000Z'
       );
     `);
 
@@ -272,10 +311,10 @@ describe("database migrations", () => {
       SELECT github_repo, control_provider, linear_team_key, linear_team_id
       FROM repository_registrations
     `).get()).toEqual({
-      github_repo: "acme/widget",
+      github_repo: "ACME/WIDGET",
       control_provider: "linear",
-      linear_team_key: "ENG",
-      linear_team_id: "team-1",
+      linear_team_key: "OPS",
+      linear_team_id: "team-2",
     });
     expect(db.prepare(`
       SELECT name FROM pragma_table_info('repository_registrations') WHERE pk = 1
