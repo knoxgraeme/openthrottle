@@ -27,6 +27,7 @@ const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
 const MAX_EFFECT_ATTEMPTS = 8;
 const CAPACITY_RETRY_MS = 5 * 60_000;
+const MAX_STAGE_TIMEOUT_SECONDS = 86_400;
 
 // Deterministic provider failures must not burn the whole retry budget on hot
 // exponential backoff. Auth failures never self-heal, so they exhaust on the
@@ -166,6 +167,18 @@ function parseProvisionRequest(effect: PipelineEffectIntent, store: PipelineStor
   return request;
 }
 
+function compositeParentTimeoutSeconds(instance: PipelineInstance, request: StageRequestEnvelope, fallbackSeconds: number): number {
+  const stage = stageById(instance.normalized_manifest, request.stageId);
+  if (!stage) throw new Error(`pipeline composite request ${request.attemptId} references missing stage ${request.stageId}`);
+  const phaseTimeouts = (stage.unitPhaseBindings ?? [])
+    .flatMap((binding) => binding.kind === "agent" || binding.kind === "gate" ? [binding.loop.timeout_seconds] : []);
+  const timeoutSeconds = Math.max(fallbackSeconds, ...phaseTimeouts);
+  if (timeoutSeconds > MAX_STAGE_TIMEOUT_SECONDS) {
+    throw new Error(`pipeline composite stage ${request.attemptId} timeout ${timeoutSeconds}s exceeds maximum ${MAX_STAGE_TIMEOUT_SECONDS}s`);
+  }
+  return timeoutSeconds;
+}
+
 export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps): PipelineEffectProcessor {
   const now = deps.now ?? (() => new Date());
   const reconcileRuntimeResources = deps.reconcileRuntimeResources ??
@@ -229,7 +242,9 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         runId: request.runId,
         taskType: instance.task_type,
         tokenHash: request.requestHash,
-        expiresAt: new Date(now().getTime() + deps.taskTimeoutSeconds * 1_000).toISOString(),
+        expiresAt: new Date(
+          now().getTime() + compositeParentTimeoutSeconds(instance, request, deps.taskTimeoutSeconds) * 1_000
+        ).toISOString(),
       });
       if (!started) throw new Error(`pipeline composite stage ${request.attemptId} could not acquire the ticket actor`);
     }

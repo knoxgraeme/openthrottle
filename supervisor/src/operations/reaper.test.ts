@@ -6,7 +6,7 @@ import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { setupPipelineStore, ticket } from "../__fixtures__/pipeline-store.js";
 import { createLinearActivityPublisher, createLinearOutboxProcessor } from "../providers/linear/outbox.js";
-import { reapStalledRuns } from "./reaper.js";
+import { reapExpiredRuns, reapStalledRuns } from "./reaper.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 
@@ -48,6 +48,65 @@ const addTicket = (store: SupervisorStore, id: string, sandboxId: string | null)
   });
 
 describe("reapStalledRuns", () => {
+  it("honors a structured parent hard deadline across the ordinary task timeout boundary", async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = setupPipelineStore();
+      db = fixture.db;
+      const store = fixture.tickets;
+      const { runtime } = makeDaytona();
+      const linearOutbox = makeOutbox(store);
+      const manifest = fixture.catalog.manifests.get("fixture/command@2")!;
+      store.upsert({
+        ...ticket("session-structured-expiry", "issue-structured-expiry"),
+        sandbox_id: "sandbox-structured-expiry",
+        pipeline: {
+          repository: "owner/repo",
+          baseCommit: "a".repeat(40),
+          manifest,
+          repositoryConfig: fixture.snapshot,
+          runtime: fixture.runtime,
+          authorizedCapabilities: manifest.manifest.requires.capabilities,
+          taskType: "implement",
+        },
+      });
+      const instance = fixture.pipelines.getInstanceForSession("session-structured-expiry")!;
+      const attempt = fixture.pipelines.getActiveAttempt(instance.id)!;
+      const runId = attempt.planned_run_id!;
+      const expiresAt = "2026-01-02T00:00:00.000Z";
+      const reapExpired = () => reapExpiredRuns({
+        runtime,
+        store,
+        activityPublisher: makeActivityPublisher(store, linearOutbox),
+        pipelines: fixture.pipelines,
+      });
+      expect(store.beginRun({
+        issueId: "issue-structured-expiry",
+        runId,
+        taskType: "implement",
+        tokenHash: "hash",
+        expiresAt,
+      })).toBe(true);
+      store.renewRunLiveness(runId, "2026-01-01T01:59:59.000Z");
+      const initialOutboxCount = listLinearOutbox().length;
+
+      vi.setSystemTime(new Date("2026-01-01T02:00:00.000Z"));
+      await reapExpired();
+      expect(store.getRun(runId)?.status).toBe("running");
+      expect(store.getRun(runId)?.expires_at).toBe(expiresAt);
+      expect(listLinearOutbox()).toHaveLength(initialOutboxCount);
+
+      store.renewRunLiveness(runId, "2026-01-01T23:59:59.000Z");
+      vi.setSystemTime(new Date("2026-01-02T00:00:00.000Z"));
+      await reapExpired();
+      expect(store.getRun(runId)?.status).toBe("timed_out");
+      expect(store.getRun(runId)?.expires_at).toBe(expiresAt);
+      expect(listLinearOutbox().length).toBeGreaterThan(initialOutboxCount);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reaps a silent run, settles its sandbox, and leaves fresh runs alone", async () => {
     db = openDb(":memory:");
     const store = createSupervisorStore(db);

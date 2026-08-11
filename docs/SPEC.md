@@ -190,6 +190,13 @@ whole-stage sandbox request; entering it provisions/bootstrap the runtime,
 binds the parent actor, seeds one child execution graph from the sealed
 execution-plan block and graph-declared phase sequence, and drains child work
 actions through the provider-neutral unit effect port.
+Composite parent actor hard expiry is derived at binding time from the sealed
+manifest stage: `expires_at` is `started_at` plus the maximum of supervisor
+`TASK_TIMEOUT` and every loop-backed unit phase `timeout_seconds` declared for
+that `graph/for-each-unit@1` stage. The value is not a sum of phase budgets and
+must never exceed 86,400 seconds. Ordinary pipeline stages continue to persist
+`expires_at = started_at + TASK_TIMEOUT`; repository `limits.task_timeout`
+does not extend the supervisor parent deadline.
 For a `for_each_unit` node, the repository graph owns the ordered `phases`
 array. The platform owns the closed mechanism vocabulary and the security
 contract behind each mechanism:
@@ -276,7 +283,11 @@ resume unfinished work. A new instance must not reuse another instance’s
 resource. Ticket `sandbox_id` and `run_id` are projections used for operator
 visibility and event polling, not coordinator authority.
 
-Hard expiry uses `TASK_TIMEOUT`. Stalled actors are detected from actor state
+Ordinary-stage hard expiry uses `TASK_TIMEOUT`; structured composite parent
+hard expiry uses the bounded graph-aware deadline described above. Heartbeats
+renew only actor liveness and leases; they never slide or rewrite
+`runs.expires_at`, so a pulsing but wedged actor still hits its absolute
+deadline. Stalled actors are detected from actor state
 on `runs` and `pipeline_stage_attempts` plus `STALL_TIMEOUT_SECONDS`. The sweep also resumes pending effects,
 reaps expired runs, releases or quarantines resources safely, and removes
 unbound Daytona orphans after `ORPHAN_GRACE_MINUTES`. "Unbound" means no
@@ -1046,7 +1057,11 @@ Optional/defaulted:
   `DAYTONA_SNAPSHOT=openthrottle`;
 - `DEFAULT_AGENT=codex`, plus the selected agent credential:
   `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_AUTH_JSON`, or `KIMI_CODE_API_KEY`;
-- `TASK_TIMEOUT=7200`, `ORPHAN_GRACE_MINUTES=5`,
+- `TASK_TIMEOUT=7200` for ordinary stage hard expiry; must be between 1 and
+  86,400 seconds. A structured composite parent may extend its immutable
+  `expires_at` up to the sealed graph phase maximum, also capped at 86,400
+  seconds;
+- `ORPHAN_GRACE_MINUTES=5`,
   `RUNTIME_RESOURCE_RETENTION_MINUTES=60`,
   `WEBHOOK_MAX_AGE_SECONDS=60`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`,
   `STALL_TIMEOUT_SECONDS=900`, `ALLOW_LINEAR_MERGE=false`,
