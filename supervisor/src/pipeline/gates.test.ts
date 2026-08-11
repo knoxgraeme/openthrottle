@@ -35,6 +35,28 @@ const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml",
 const runtime = buildInstalledRuntimeDescriptor("gate-test/v1");
 const SUBJECT = "c".repeat(40);
 const PUBLISHED_COMMIT = "9".repeat(40);
+const CODEX_CONNECTOR_LOGIN = "chatgpt-codex-connector[bot]";
+const CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE =
+  "To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).";
+
+function codexCleanReviewBody(
+  reviewedCommit = PUBLISHED_COMMIT.slice(0, 10),
+  encouragement = "Delightful!"
+): string {
+  return [
+    "Codex Review: Didn't find any major issues.",
+    "",
+    encouragement,
+    "",
+    `**Reviewed commit:** \`${reviewedCommit}\``,
+    "",
+    "<details>",
+    "<summary>About Codex in GitHub</summary>",
+    "",
+    "Codex can help review pull requests from GitHub.",
+    "</details>",
+  ].join("\n");
+}
 
 interface Fixture {
   db: Database.Database;
@@ -2067,9 +2089,16 @@ describe("deterministic supervisor stage gates", () => {
     };
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     moveFixtureToProviderWait(fixture);
-    const body = `Codex Review: Didn't find any major issues\n\nReviewed commit: ${PUBLISHED_COMMIT.slice(0, 10)}`;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/1")) {
+        return Response.json({ head: { sha: PUBLISHED_COMMIT } });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch);
+    const body = codexCleanReviewBody(PUBLISHED_COMMIT.slice(0, 10), "Keep it up!");
     const cleanReview = (id: number) => handleGithubEvent(
-      {} as never,
+      { githubReadToken: "github-read-token" } as never,
       fixture.tickets,
       activityPublisher,
       {
@@ -2081,7 +2110,7 @@ describe("deterministic supervisor stage gates", () => {
           id,
           body,
           html_url: `https://github.com/owner/repo/pull/1#issuecomment-${id}`,
-          user: { login: "codex[bot]", type: "Bot" },
+          user: { login: CODEX_CONNECTOR_LOGIN, type: "Bot" },
         },
       },
       fixture.pipelines
@@ -2097,6 +2126,98 @@ describe("deterministic supervisor stage gates", () => {
       terminal_outcome: "shipped",
     });
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toBeUndefined();
+  });
+
+  it("admits a trusted Codex clean review when the live PR head differs from the reviewed commit", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/1")) {
+        return Response.json({ head: { sha: "8".repeat(40) } });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch);
+
+    await handleGithubEvent(
+      { githubReadToken: "github-read-token" } as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 705,
+          body: codexCleanReviewBody(PUBLISHED_COMMIT.slice(0, 10)),
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-705",
+          user: { login: CODEX_CONNECTOR_LOGIN, type: "Bot" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(activityPublisher.publishActivity).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      type: "action",
+      action: "PR comment",
+      parameter: CODEX_CONNECTOR_LOGIN,
+      result: "https://github.com/owner/repo/pull/1#issuecomment-705",
+    }, "issue-1");
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(1);
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
+  it("leaves trusted Codex clean review lookup failures retryable", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/1")) {
+        return new Response("unavailable", { status: 503 });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch);
+
+    await expect(handleGithubEvent(
+      { githubReadToken: "github-read-token" } as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 706,
+          body: codexCleanReviewBody(PUBLISHED_COMMIT.slice(0, 10)),
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-706",
+          user: { login: CODEX_CONNECTOR_LOGIN, type: "Bot" },
+        },
+      },
+      fixture.pipelines
+    )).rejects.toThrow("GitHub API error (503)");
+
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
   });
 
   it("ignores exact trusted Codex connector setup-required notices before repair admission", async () => {
@@ -2118,9 +2239,9 @@ describe("deterministic supervisor stage gates", () => {
         issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
         comment: {
           id,
-          body: "To use Codex here, create an environment for this repo.",
+          body: CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE,
           html_url: `https://github.com/owner/repo/pull/1#issuecomment-${id}`,
-          user: { login: "openthrottle-codex-connector[bot]", type: "Bot" },
+          user: { login: CODEX_CONNECTOR_LOGIN, type: "Bot" },
         },
       },
       fixture.pipelines
@@ -2142,18 +2263,18 @@ describe("deterministic supervisor stage gates", () => {
   it.each([
     {
       label: "near-match setup notice with extra feedback",
-      body: "To use Codex here, create an environment for this repo.\n\nPlease also fix the adapter.",
-      user: { login: "openthrottle-codex-connector[bot]", type: "Bot" },
+      body: `${CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE}\n\nPlease also fix the adapter.`,
+      user: { login: CODEX_CONNECTOR_LOGIN, type: "Bot" },
     },
     {
       label: "untrusted author copying setup notice",
-      body: "To use Codex here, create an environment for this repo.",
+      body: CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE,
       user: { login: "reviewer", type: "User" },
     },
     {
-      label: "non-connector bot copying setup notice",
-      body: "To use Codex here, create an environment for this repo.",
-      user: { login: "codex[bot]", type: "Bot" },
+      label: "lookalike connector bot copying setup notice",
+      body: CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE,
+      user: { login: "untrusted-codex-connector[bot]", type: "Bot" },
     },
   ])("admits $label as substantive PR comment feedback", async ({ body, user }) => {
     const fixture = setup("core/implement@4");
@@ -2200,18 +2321,23 @@ describe("deterministic supervisor stage gates", () => {
   it.each([
     {
       label: "near-match clean review text",
-      body: `Codex Review: Didn't find any major issues\n\nReviewed commit: ${PUBLISHED_COMMIT.slice(0, 10)}\n\nPlease fix naming.`,
-      user: { login: "codex[bot]", type: "Bot" },
+      body: `${codexCleanReviewBody(PUBLISHED_COMMIT.slice(0, 10))}\n\nPlease fix naming.`,
+      user: { login: CODEX_CONNECTOR_LOGIN, type: "Bot" },
     },
     {
       label: "untrusted author copying clean review text",
-      body: `Codex Review: Didn't find any major issues\n\nReviewed commit: ${PUBLISHED_COMMIT.slice(0, 10)}`,
+      body: codexCleanReviewBody(PUBLISHED_COMMIT.slice(0, 10)),
       user: { login: "reviewer", type: "User" },
     },
     {
       label: "mismatched reviewed commit",
-      body: `Codex Review: Didn't find any major issues\n\nReviewed commit: ${"f".repeat(10)}`,
-      user: { login: "codex[bot]", type: "Bot" },
+      body: codexCleanReviewBody("f".repeat(10)),
+      user: { login: CODEX_CONNECTOR_LOGIN, type: "Bot" },
+    },
+    {
+      label: "lookalike connector bot copying clean review text",
+      body: codexCleanReviewBody(PUBLISHED_COMMIT.slice(0, 10)),
+      user: { login: "untrusted-codex-connector[bot]", type: "Bot" },
     },
   ])("admits $label as substantive PR comment feedback", async ({ body, user }) => {
     const fixture = setup("core/implement@4");
@@ -2221,9 +2347,16 @@ describe("deterministic supervisor stage gates", () => {
     };
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     moveFixtureToProviderWait(fixture);
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/1")) {
+        return Response.json({ head: { sha: PUBLISHED_COMMIT } });
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch);
 
     await handleGithubEvent(
-      {} as never,
+      { githubReadToken: "github-read-token" } as never,
       fixture.tickets,
       activityPublisher,
       {

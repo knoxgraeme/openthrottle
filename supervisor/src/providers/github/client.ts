@@ -626,6 +626,19 @@ export async function fetchGithubPullRequestReviewComments(
   return undefined;
 }
 
+export async function fetchGithubPullRequestHeadSha(
+  client: GithubClient,
+  repo: string,
+  pullNumber: number
+): Promise<string> {
+  const pull = await githubRequest<{ head?: { sha?: string } }>(
+    client,
+    `/repos/${repo}/pulls/${pullNumber}`
+  );
+  if (!pull.head?.sha) throw new Error("GitHub pull request is missing head sha");
+  return pull.head.sha;
+}
+
 export async function fetchGithubIssueContext(
   client: GithubClient,
   repo: string,

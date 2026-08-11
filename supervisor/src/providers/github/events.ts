@@ -9,6 +9,7 @@ import {
   getFailingGithubCheckDetails,
   fetchGithubIssueContext,
   fetchGithubIssueControlEvents,
+  fetchGithubPullRequestHeadSha,
   fetchGithubPullRequestReviewComments,
   fetchGithubIssueLifecycle,
   getRepositoryCollaboratorPermission,
@@ -465,11 +466,11 @@ const LINEAR_BRIDGE_BOT_LOGINS = new Set(["linear-code[bot]", "linear[bot]"]);
 // recorded as provider evidence.
 const LINEAR_LINKBACK_MARKER = "<!-- linear-linkback -->";
 const CODEX_REVIEW_COMMAND = "@codex review";
-const CODEX_CLEAN_REVIEW_AUTHOR = "codex[bot]";
+const CODEX_CONNECTOR_AUTHOR = "chatgpt-codex-connector[bot]";
 const CODEX_CLEAN_REVIEW_PATTERN =
-  /^Codex Review: Didn't find any major issues\n\nReviewed commit: `?([a-f0-9]{7,40})`?$/i;
-const CODEX_CONNECTOR_AUTHOR = /^[a-z0-9-]+-codex-connector\[bot\]$/;
-const CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE = "To use Codex here, create an environment for this repo.";
+  /^Codex Review: Didn't find any major issues\.\n\n[^\n]+\n\n\*\*Reviewed commit:\*\* `([a-f0-9]{7,40})`\n\n<details>\n<summary>About Codex in GitHub<\/summary>\n\n[\s\S]+<\/details>$/i;
+const CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE =
+  "To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).";
 const REVIEWED_COMMIT = /^[a-f0-9]{7,40}$/;
 
 function isGithubBotLinkback(author: string, body: string | undefined): boolean {
@@ -520,16 +521,13 @@ function reviewedCommitFromCodexCleanReview(body: string | undefined): string | 
   return commit && REVIEWED_COMMIT.test(commit) ? commit : undefined;
 }
 
-function codexCleanReviewMatchesCurrentHead(input: {
+function reviewedCommitFromTrustedCodexCleanReview(input: {
   author: string;
   authorType?: string;
   body: string | undefined;
-  headSha: string;
-}): boolean {
-  if (input.author.toLowerCase() !== CODEX_CLEAN_REVIEW_AUTHOR ||
-      input.authorType !== "Bot") return false;
-  const reviewedCommit = reviewedCommitFromCodexCleanReview(input.body);
-  return reviewedCommit !== undefined && input.headSha.startsWith(reviewedCommit);
+}): string | undefined {
+  if (input.author.toLowerCase() !== CODEX_CONNECTOR_AUTHOR || input.authorType !== "Bot") return undefined;
+  return reviewedCommitFromCodexCleanReview(input.body);
 }
 
 function isCodexConnectorSetupRequiredNotice(input: {
@@ -538,7 +536,7 @@ function isCodexConnectorSetupRequiredNotice(input: {
   body: string | undefined;
 }): boolean {
   return input.authorType === "Bot" &&
-    CODEX_CONNECTOR_AUTHOR.test(input.author.toLowerCase()) &&
+    input.author.toLowerCase() === CODEX_CONNECTOR_AUTHOR &&
     input.body?.trim() === CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE;
 }
 
@@ -1005,28 +1003,37 @@ export async function handleGithubEvent(
       });
       return;
     }
-    if (codexCleanReviewMatchesCurrentHead({
+    const reviewedCommit = reviewedCommitFromTrustedCodexCleanReview({
       author,
       authorType,
       body: event.comment.body,
-      headSha,
-    })) {
-      routePipelineProviderEvent({
-        pipelines,
-        store,
-        ticket,
-        eventId: `github-comment:${event.comment.id}`,
-        outcome: "success",
-        summary: "Trusted Codex review completed for the current head with no findings.",
-        evidence: [event.comment.html_url],
-        payload: {
-          kind: "issue_comment",
-          classification: "codex_clean_review_completion",
-          head_sha: headSha,
-        },
-        headSha,
-      });
-      return;
+    });
+    if (reviewedCommit !== undefined) {
+      const instance = pipelines.getInstanceForSession(ticket.session_id);
+      if (!instance || pipelineIsTerminal(instance)) return;
+      const liveHeadSha = await fetchGithubPullRequestHeadSha(
+        { token: _cfg.githubReadToken },
+        event.repository.full_name,
+        event.issue.number
+      );
+      if (instance?.published_commit === liveHeadSha && liveHeadSha.startsWith(reviewedCommit)) {
+        routePipelineProviderEvent({
+          pipelines,
+          store,
+          ticket,
+          eventId: `github-comment:${event.comment.id}`,
+          outcome: "success",
+          summary: "Trusted Codex review completed for the current head with no findings.",
+          evidence: [event.comment.html_url],
+          payload: {
+            kind: "issue_comment",
+            classification: "codex_clean_review_completion",
+            head_sha: liveHeadSha,
+          },
+          headSha: liveHeadSha,
+        });
+        return;
+      }
     }
     await activityPublisher.publishActivity({
       sessionId: ticket.session_id,
