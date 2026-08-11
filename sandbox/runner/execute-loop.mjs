@@ -1612,6 +1612,7 @@ function privateRecoveryArtifact(request, worktreeDir, subject, env) {
       message: `OpenThrottle private receipt recovery ${request.actionId}`,
     });
     const baseCommit = request.recoveryBaseSubject;
+    const recoveryGitEnv = { GIT_NO_REPLACE_OBJECTS: "1" };
     const recoveryDirectory = actionDirectory(request);
     const rawDiffPath = pathInside(recoveryDirectory, "recovery.patch.tmp");
     const rawModesPath = pathInside(recoveryDirectory, "recovery.modes.tmp");
@@ -1630,15 +1631,17 @@ function privateRecoveryArtifact(request, worktreeDir, subject, env) {
       "core.quotePath=true",
       "diff",
       "--raw",
+      "--no-color",
       "--no-ext-diff",
       "--no-textconv",
+      "--ignore-submodules=none",
       "--no-renames",
       "--full-index",
       `--output=${rawModesPath}`,
       `${baseCommit}^{tree}`,
       candidate.tree,
       "--",
-    ]);
+    ], recoveryGitEnv);
     const rawModesBytes = statSync(rawModesPath).size;
     if (rawModesBytes > MAX_PRIVATE_RECOVERY_DIFF_BYTES) {
       rmSync(rawModesPath, { force: true });
@@ -1650,13 +1653,19 @@ function privateRecoveryArtifact(request, worktreeDir, subject, env) {
     runRootGit(worktreeDir, [
       "diff",
       "--binary",
+      "--no-color",
       "--no-ext-diff",
       "--no-textconv",
+      "--ignore-submodules=none",
+      "--no-renames",
       "--full-index",
+      "--unified=3",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
       `--output=${rawDiffPath}`,
       `${baseCommit}^{tree}`,
       candidate.tree,
-    ]);
+    ], recoveryGitEnv);
     const diffBytes = statSync(rawDiffPath).size;
     if (diffBytes > MAX_PRIVATE_RECOVERY_DIFF_BYTES) {
       rmSync(rawDiffPath, { force: true });
@@ -1669,12 +1678,15 @@ function privateRecoveryArtifact(request, worktreeDir, subject, env) {
       "core.quotePath=true",
       "diff",
       "--name-only",
+      "--no-color",
       "--no-ext-diff",
       "--no-textconv",
+      "--ignore-submodules=none",
+      "--no-renames",
       `--output=${rawPathsPath}`,
       `${baseCommit}^{tree}`,
       candidate.tree,
-    ]);
+    ], recoveryGitEnv);
     const rawPaths = readFileSync(rawPathsPath);
     rmSync(rawPathsPath, { force: true });
     if (rawPaths.byteLength > MAX_PRIVATE_RECOVERY_DIFF_BYTES) {

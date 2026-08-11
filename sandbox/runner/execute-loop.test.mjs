@@ -4056,6 +4056,15 @@ describe("executeLoopAction", () => {
     directories.push(remoteRoot);
     const remoteRepo = join(remoteRoot, "origin.git");
     execFileSync("git", ["clone", "--bare", "--quiet", worktreeDir, remoteRepo]);
+    writeFileSync(join(worktreeDir, "replacement-only.txt"), "sandbox replacement ref\n");
+    execFileSync("git", ["add", "replacement-only.txt"], { cwd: worktreeDir });
+    execFileSync("git", ["commit", "--quiet", "-m", "sandbox replacement base"], { cwd: worktreeDir });
+    const replacementBase = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: worktreeDir,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["reset", "--hard", "--quiet", durableBase], { cwd: worktreeDir });
+    execFileSync("git", ["replace", durableBase, replacementBase], { cwd: worktreeDir });
     writeFileSync(join(worktreeDir, "integrated-locally.txt"), "integrated\n");
     execFileSync("git", ["add", "integrated-locally.txt"], { cwd: worktreeDir });
     execFileSync("git", ["commit", "--quiet", "-m", "sandbox-only integration"], { cwd: worktreeDir });
@@ -4113,6 +4122,7 @@ describe("executeLoopAction", () => {
       ]),
       diff_encoding: "git-diff",
     });
+    expect(artifact.changed_paths).not.toContain("replacement-only.txt");
     expect(artifact).not.toHaveProperty("requires_workspace_preservation");
 
     const recoveryRoot = mkdtempSync(join(tmpdir(), "ot-portable-recovery-"));
@@ -4166,15 +4176,21 @@ describe("executeLoopAction", () => {
     ].join("\n"));
     writeFileSync(join(worktreeDir, "external-driver.txt"), "durable external state\n");
     writeFileSync(join(worktreeDir, "textconv-driver.dat"), "durable textconv state\n");
-    execFileSync("git", ["add", ".gitattributes", "external-driver.txt", "textconv-driver.dat"], { cwd: worktreeDir });
+    writeFileSync(join(worktreeDir, "ordinary.txt"), "durable ordinary state\n");
+    execFileSync("git", ["add", ".gitattributes", "external-driver.txt", "textconv-driver.dat", "ordinary.txt"], { cwd: worktreeDir });
     execFileSync("git", ["commit", "--quiet", "-m", "hostile diff baseline"], { cwd: worktreeDir });
     const durableBase = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreeDir, encoding: "utf8" }).trim();
     const remoteRepo = join(hostileRoot, "origin.git");
     execFileSync("git", ["clone", "--bare", "--quiet", worktreeDir, remoteRepo]);
     execFileSync("git", ["config", "diff.hostile-external.command", externalDriver], { cwd: worktreeDir });
     execFileSync("git", ["config", "diff.hostile-textconv.textconv", textconvDriver], { cwd: worktreeDir });
+    execFileSync("git", ["config", "diff.noprefix", "true"], { cwd: worktreeDir });
+    execFileSync("git", ["config", "color.ui", "always"], { cwd: worktreeDir });
+    execFileSync("git", ["config", "color.diff", "always"], { cwd: worktreeDir });
+    execFileSync("git", ["config", "diff.context", "0"], { cwd: worktreeDir });
     writeFileSync(join(worktreeDir, "external-driver.txt"), "candidate external state\n");
     writeFileSync(join(worktreeDir, "textconv-driver.dat"), "candidate textconv state\n");
+    writeFileSync(join(worktreeDir, "ordinary.txt"), "candidate ordinary state\n");
     const candidateTree = computeWorkspaceTreeOid(worktreeDir);
 
     // Prove the local configuration is hostile: the same tree diff without
@@ -4191,7 +4207,16 @@ describe("executeLoopAction", () => {
     ], { cwd: worktreeDir });
     expect(readFileSync(marker, "utf8")).toContain("external\n");
     expect(readFileSync(marker, "utf8")).toContain("textconv\n");
-    expect(statSync(hiddenControlDiff).size).toBe(0);
+    expect(readFileSync(hiddenControlDiff, "utf8")).toContain("diff --git ordinary.txt ordinary.txt");
+    expect(readFileSync(hiddenControlDiff, "utf8")).not.toContain("diff --git a/ordinary.txt b/ordinary.txt");
+    expect(readFileSync(hiddenControlDiff)).toContain(0x1b);
+    const controlRepo = join(hostileRoot, "unportable-control");
+    execFileSync("git", ["clone", "--quiet", remoteRepo, controlRepo]);
+    execFileSync("git", ["checkout", "--quiet", durableBase], { cwd: controlRepo });
+    expect(() => execFileSync("git", ["apply", hiddenControlDiff], {
+      cwd: controlRepo,
+      stdio: ["ignore", "ignore", "pipe"],
+    })).toThrow();
     rmSync(marker, { force: true });
 
     const valid = withFreshLoopFence(initial, {
@@ -4226,7 +4251,7 @@ describe("executeLoopAction", () => {
     expect(artifact).toMatchObject({
       base_commit: durableBase,
       candidate_tree: candidateTree,
-      changed_paths: expect.arrayContaining(["external-driver.txt", "textconv-driver.dat"]),
+      changed_paths: expect.arrayContaining(["external-driver.txt", "textconv-driver.dat", "ordinary.txt"]),
       diff_encoding: "git-diff",
       diff_truncated: false,
     });
@@ -4237,6 +4262,7 @@ describe("executeLoopAction", () => {
     execFileSync("git", ["checkout", "--quiet", durableBase], { cwd: recoveryRepo });
     const recoveryPatch = join(hostileRoot, "recovery.patch");
     writeFileSync(recoveryPatch, Buffer.from(artifact.diff_base64, "base64"));
+    expect(readFileSync(recoveryPatch)).not.toContain(0x1b);
     execFileSync("git", ["apply", recoveryPatch], { cwd: recoveryRepo });
     expect(computeWorkspaceTreeOid(recoveryRepo)).toBe(artifact.candidate_tree);
   });
@@ -4260,11 +4286,20 @@ describe("executeLoopAction", () => {
       cwd: sandboxGitlink,
       encoding: "utf8",
     }).trim();
+    execFileSync("git", ["config", "diff.ignoreSubmodules", "all"], { cwd: worktreeDir });
+    execFileSync("git", ["config", "submodule.sandbox-only-gitlink.ignore", "all"], { cwd: worktreeDir });
+    const candidateTree = computeWorkspaceTreeOid(worktreeDir);
+    expect(execFileSync("git", [
+      "diff",
+      "--raw",
+      `${valid.recoveryBaseSubject}^{tree}`,
+      candidateTree,
+    ], { cwd: worktreeDir, encoding: "utf8" })).toBe("");
     const badReceipt = standardReceipt(valid, {
       subject: {
         base: "1".repeat(40),
         pre: "1".repeat(40),
-        post: computeWorkspaceTreeOid(worktreeDir),
+        post: candidateTree,
       },
       payload: {
         ...standardReceipt(valid).payload,

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -117,6 +117,81 @@ describe("computeWorkspaceTreeOid", () => {
       }
     }
   }
+
+  it("attests executable-bit changes even when repository config ignores file modes", () => {
+    const repoDir = repository();
+    const before = computeWorkspaceTreeOid(repoDir);
+    execFileSync("git", ["config", "core.fileMode", "false"], { cwd: repoDir });
+    chmodSync(join(repoDir, "file.txt"), 0o755);
+
+    const after = computeWorkspaceTreeOid(repoDir);
+
+    expect(after).not.toBe(before);
+    expect(execFileSync("git", ["ls-tree", after, "file.txt"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    })).toContain("100755");
+  });
+
+  it.runIf(process.platform !== "darwin")("attests case-only renames even when repository config ignores case", () => {
+    const repoDir = repository();
+    const before = computeWorkspaceTreeOid(repoDir);
+    execFileSync("git", ["config", "core.ignoreCase", "true"], { cwd: repoDir });
+    renameSync(join(repoDir, "file.txt"), join(repoDir, "FILE.txt"));
+
+    const after = computeWorkspaceTreeOid(repoDir);
+    const paths = execFileSync("git", ["ls-tree", "--name-only", after], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).trim().split("\n");
+
+    expect(after).not.toBe(before);
+    expect(paths).toContain("FILE.txt");
+    expect(paths).not.toContain("file.txt");
+  });
+
+  it("attests symlink-to-file changes even when repository config disables symlinks", () => {
+    const repoDir = repository();
+    symlinkSync("target", join(repoDir, "item"));
+    execFileSync("git", ["add", "item"], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "symlink base"], { cwd: repoDir });
+    execFileSync("git", ["config", "core.symlinks", "false"], { cwd: repoDir });
+    const before = computeWorkspaceTreeOid(repoDir);
+    rmSync(join(repoDir, "item"));
+    writeFileSync(join(repoDir, "item"), "target");
+
+    const after = computeWorkspaceTreeOid(repoDir);
+
+    expect(after).not.toBe(before);
+    expect(execFileSync("git", ["ls-tree", after, "item"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    })).toContain("100644");
+  });
+
+  it("attests the selected checkout when repository config redirects core.worktree", () => {
+    const repoDir = repository();
+    const alternate = mkdtempSync(join(tmpdir(), "ot-control-alternate-worktree-"));
+    directories.push(alternate);
+    writeFileSync(join(alternate, "file.txt"), "initial\n");
+    writeFileSync(join(alternate, "other.txt"), "other\n");
+    execFileSync("git", ["config", "core.worktree", alternate], { cwd: repoDir });
+    writeFileSync(join(repoDir, "file.txt"), "selected checkout\n");
+
+    const subject = computeWorkspaceTreeOid(repoDir);
+
+    expect(execFileSync("git", ["show", `${subject}:file.txt`], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).trim()).toBe("selected checkout");
+  });
+
+  it("fails closed when repository config enables sparse checkout", () => {
+    const repoDir = repository();
+    execFileSync("git", ["config", "core.sparseCheckout", "true"], { cwd: repoDir });
+
+    expect(() => computeWorkspaceTreeOid(repoDir)).toThrow(/requires a full non-sparse checkout/);
+  });
 
   it("uses a supplied Git directory when linked worktree metadata is locked", () => {
     const repoDir = repository();

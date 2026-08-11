@@ -176,15 +176,33 @@ export function computeWorkspaceTreeOidFromTree(repoDir, baseTree, extraGitEnv =
     const alternates = extraAlternates.length > 0 ? extraAlternates : (commonObjects ? [commonObjects] : []);
     const env = {
       ...gitRepositoryEnvironment(effectiveGitEnv),
+      // A repository-level core.worktree must not redirect canonical subject
+      // evidence away from the checkout selected by the executor.
+      GIT_WORK_TREE: repoDir,
       GIT_INDEX_FILE: indexPath,
+      // Local replace refs must not change the meaning of a sealed object id.
+      GIT_NO_REPLACE_OBJECTS: "1",
       ...(isolateObjects ? {
         GIT_OBJECT_DIRECTORY: objectPath,
         GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates.join(delimiter),
       } : {}),
     };
     const runOwnerGit = ownerGit(asExecutor);
+    const sparseCheckout = runOwnerGit(repoDir, [
+      "config", "--bool", "--default=false", "--get", "core.sparseCheckout",
+    ], env);
+    if (sparseCheckout === "true") {
+      throw new Error("workspace subject requires a full non-sparse checkout");
+    }
     runOwnerGit(repoDir, ["read-tree", baseTree], env);
-    runOwnerGit(repoDir, ["add", "-A", "--", "."], env);
+    // Subject attestation is canonical and must not inherit a repository's
+    // choice to ignore executable-bit changes in its ordinary worktree.
+    runOwnerGit(repoDir, [
+      "-c", "core.fileMode=true",
+      "-c", "core.ignoreCase=false",
+      "-c", "core.symlinks=true",
+      "add", "-A", "--", ".",
+    ], env);
     return commit(runOwnerGit(repoDir, ["write-tree"], env), "workspace tree");
   } finally {
     rmSync(temporary, { recursive: true, force: true });

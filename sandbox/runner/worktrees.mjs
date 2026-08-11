@@ -217,9 +217,29 @@ export function deriveCandidateCommit({
     }
     const head = runGitAsExecutor(worktreeDir, ["rev-parse", "HEAD"]);
     if (head !== safeBase) throw new Error("worker moved HEAD; executor refuses candidate creation");
-    const env = { GIT_INDEX_FILE: indexPath };
+    const env = {
+      GIT_INDEX_FILE: indexPath,
+      GIT_NO_REPLACE_OBJECTS: "1",
+      // Never let repository core.worktree redirect evidence away from the
+      // executor-selected worker checkout.
+      GIT_WORK_TREE: worktreeDir,
+    };
+    const sparseCheckout = runGitAsExecutor(worktreeDir, [
+      "config", "--bool", "--default=false", "--get", "core.sparseCheckout",
+    ], env);
+    if (sparseCheckout === "true") {
+      throw new Error("candidate creation requires a full non-sparse checkout");
+    }
     runGitAsExecutor(worktreeDir, ["read-tree", "HEAD"], env);
-    runGitAsExecutor(worktreeDir, ["add", "-A", "--", "."], env);
+    // The repository's core.fileMode setting is untrusted input. Candidate
+    // evidence must preserve executable-bit changes even when a checkout has
+    // disabled ordinary worktree mode tracking.
+    runGitAsExecutor(worktreeDir, [
+      "-c", "core.fileMode=true",
+      "-c", "core.ignoreCase=false",
+      "-c", "core.symlinks=true",
+      "add", "-A", "--", ".",
+    ], env);
     const tree = runGitAsExecutor(worktreeDir, ["write-tree"], env);
     const changedPaths = runGitAsExecutor(worktreeDir, ["diff", "--name-only", `${safeBase}^{tree}`, tree], env)
       .split("\n")

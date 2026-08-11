@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -123,16 +123,83 @@ describe("executor-owned worktrees", () => {
     const { rootDir, markerRootDir } = worktreeEnvironment();
     const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
     const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-2", baseCommit });
+    git(created.path, ["config", "core.fileMode", "false"]);
     writeFileSync(join(created.path, "file.txt"), "changed\n");
     writeFileSync(join(created.path, "new-executable.sh"), "#!/bin/sh\n");
     chmodSync(join(created.path, "new-executable.sh"), 0o755);
+    chmodSync(join(created.path, "file.txt"), 0o755);
 
     const candidate = deriveCandidateCommit({ worktreeDir: created.path, baseCommit, message: "candidate" });
 
     expect(candidate.candidateCommit).toMatch(/^[a-f0-9]{40}$/);
     expect(candidate.changedPaths).toEqual(["file.txt", "new-executable.sh"]);
+    expect(git(repoDir, ["ls-tree", candidate.candidateCommit, "file.txt"])).toContain("100755");
     expect(git(repoDir, ["ls-tree", candidate.candidateCommit, "new-executable.sh"])).toContain("100755");
     expect(git(created.path, ["rev-parse", "HEAD"])).toBe(baseCommit);
+  });
+
+  it.runIf(process.platform !== "darwin")("derives a case-only rename even when repository config ignores case", () => {
+    const repoDir = repository();
+    const { rootDir, markerRootDir } = worktreeEnvironment();
+    const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-case", baseCommit });
+    git(created.path, ["config", "core.ignoreCase", "true"]);
+    renameSync(join(created.path, "file.txt"), join(created.path, "FILE.txt"));
+
+    const candidate = deriveCandidateCommit({ worktreeDir: created.path, baseCommit, message: "case candidate" });
+    const paths = git(repoDir, ["ls-tree", "--name-only", candidate.candidateCommit]).split("\n");
+
+    expect(candidate.candidateCommit).toMatch(/^[a-f0-9]{40}$/);
+    expect(paths).toContain("FILE.txt");
+    expect(paths).not.toContain("file.txt");
+  });
+
+  it("derives a symlink-to-file change even when repository config disables symlinks", () => {
+    const repoDir = repository();
+    symlinkSync("target", join(repoDir, "item"));
+    git(repoDir, ["add", "item"]);
+    git(repoDir, ["commit", "-qm", "symlink base"]);
+    const { rootDir, markerRootDir } = worktreeEnvironment();
+    const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-symlink", baseCommit });
+    git(created.path, ["config", "core.symlinks", "false"]);
+    rmSync(join(created.path, "item"));
+    writeFileSync(join(created.path, "item"), "target");
+
+    const candidate = deriveCandidateCommit({ worktreeDir: created.path, baseCommit, message: "symlink candidate" });
+
+    expect(candidate.candidateCommit).toMatch(/^[a-f0-9]{40}$/);
+    expect(git(repoDir, ["ls-tree", candidate.candidateCommit, "item"])).toContain("100644");
+  });
+
+  it("derives from the selected worktree when repository config redirects core.worktree", () => {
+    const repoDir = repository();
+    const { rootDir, markerRootDir } = worktreeEnvironment();
+    const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-redirect", baseCommit });
+    const alternate = mkdtempSync(join(tmpdir(), "ot-alternate-worktree-"));
+    directories.push(alternate);
+    writeFileSync(join(alternate, "file.txt"), "initial\n");
+    writeFileSync(join(alternate, "run.sh"), "#!/bin/sh\n");
+    chmodSync(join(alternate, "run.sh"), 0o755);
+    git(created.path, ["config", "core.worktree", alternate]);
+    writeFileSync(join(created.path, "file.txt"), "selected checkout\n");
+
+    const candidate = deriveCandidateCommit({ worktreeDir: created.path, baseCommit, message: "redirect candidate" });
+
+    expect(candidate.candidateCommit).toMatch(/^[a-f0-9]{40}$/);
+    expect(git(repoDir, ["show", `${candidate.candidateCommit}:file.txt`])).toBe("selected checkout");
+  });
+
+  it("fails closed when repository config enables sparse checkout", () => {
+    const repoDir = repository();
+    const { rootDir, markerRootDir } = worktreeEnvironment();
+    const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-sparse", baseCommit });
+    git(created.path, ["config", "core.sparseCheckout", "true"]);
+
+    expect(() => deriveCandidateCommit({ worktreeDir: created.path, baseCommit }))
+      .toThrow(/requires a full non-sparse checkout/);
   });
 
   it("removes only the selected worktree handle", () => {
