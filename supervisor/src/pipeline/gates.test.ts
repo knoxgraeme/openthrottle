@@ -3434,6 +3434,133 @@ describe("deterministic supervisor stage gates", () => {
     expect(JSON.parse(staleNotice.payload).activity.body).toContain(`current_published_head=${repairedHead}`);
   });
 
+  it.each([
+    {
+      label: "before the repaired publication is acknowledged",
+      commentCreatedAt: "2026-01-01T00:00:07.000Z",
+      repairedCreatedAt: "2026-01-01T00:00:05.000Z",
+      repairedAcknowledgedAt: "2026-01-01T00:00:10.000Z",
+    },
+    {
+      label: "in the same second as the repaired publication acknowledgement",
+      commentCreatedAt: "2026-01-01T00:00:10.000Z",
+      repairedCreatedAt: "2026-01-01T00:00:05.000Z",
+      repairedAcknowledgedAt: "2026-01-01T00:00:10.000Z",
+    },
+  ])("keeps a fresh top-level PR comment on the repaired head $label", async ({
+    commentCreatedAt,
+    repairedCreatedAt,
+    repairedAcknowledgedAt,
+  }) => {
+    const fixture = setup("core/implement@4");
+    const previousHead = "d".repeat(40);
+    const repairedHead = PUBLISHED_COMMIT;
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    recordAcknowledgedPublication(fixture, "b".repeat(40), { publishedCommit: previousHead }, "publication-previous");
+    recordAcknowledgedPublication(fixture, SUBJECT, { publishedCommit: repairedHead }, "publication-repaired");
+    fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts SET created_at = ?, acknowledged_at = ?
+      WHERE id = ?
+    `).run("2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", "publication-previous");
+    fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts SET created_at = ?, acknowledged_at = ?
+      WHERE id = ?
+    `).run(repairedCreatedAt, repairedAcknowledgedAt, "publication-repaired");
+    moveFixtureToProviderWait(fixture, SUBJECT, repairedHead);
+    fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
+      .run(fixture.instance.id);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 4907098002,
+          body: "Please repair the current provider feedback handling.",
+          created_at: commentCreatedAt,
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-4907098002",
+          user: { login: "reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.db.prepare(`
+      SELECT head_sha FROM provider_events WHERE provider_event_id = ?
+    `).get("github-comment:4907098002")).toEqual({ head_sha: repairedHead });
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots").get())
+      .toEqual({ status: "consumed", head_sha: repairedHead });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM control_outbox WHERE id LIKE 'feedback-snapshot-stale:%'")
+      .pluck().get()).toBe(0);
+  });
+
+  it("keeps a same-second old PR comment stale when the repaired publication is later within that second", async () => {
+    const fixture = setup("core/implement@4");
+    const commentedHead = "d".repeat(40);
+    const repairedHead = PUBLISHED_COMMIT;
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    recordAcknowledgedPublication(fixture, "b".repeat(40), { publishedCommit: commentedHead }, "publication-commented");
+    recordAcknowledgedPublication(fixture, SUBJECT, { publishedCommit: repairedHead }, "publication-repaired");
+    fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts SET created_at = ?, acknowledged_at = ?
+      WHERE id = ?
+    `).run("2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", "publication-commented");
+    fixture.db.prepare(`
+      UPDATE pipeline_publication_receipts SET created_at = ?, acknowledged_at = ?
+      WHERE id = ?
+    `).run("2026-01-01T00:00:10.500Z", "2026-01-01T00:00:12.000Z", "publication-repaired");
+    moveFixtureToProviderWait(fixture, SUBJECT, repairedHead);
+    fixture.db.prepare("UPDATE pipeline_instances SET reentry_count = 1 WHERE id = ?")
+      .run(fixture.instance.id);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 4907098003,
+          body: "Please repair the previous provider feedback handling.",
+          created_at: "2026-01-01T00:00:10Z",
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-4907098003",
+          user: { login: "reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.db.prepare(`
+      SELECT head_sha FROM provider_events WHERE provider_event_id = ?
+    `).get("github-comment:4907098003")).toEqual({ head_sha: commentedHead });
+    expect(fixture.db.prepare("SELECT status, head_sha FROM feedback_snapshots").get())
+      .toEqual({ status: "stale", head_sha: commentedHead });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
+  });
+
   it("still carries later-round feedback that predates the current publication", async () => {
     const fixture = setup("core/implement@4");
     const previousHead = "d".repeat(40);

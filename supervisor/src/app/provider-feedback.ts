@@ -315,16 +315,17 @@ export function acknowledgedPublicationHeadAt(
   instance: PipelineInstance,
   observedAt: string | undefined
 ): string | undefined {
-  if (!observedAt || Number.isNaN(Date.parse(observedAt))) return undefined;
+  const observedAtMs = observedAt ? Date.parse(observedAt) : Number.NaN;
+  if (Number.isNaN(observedAtMs)) return undefined;
   return pipelines.listPublications(instance.id)
     .filter((publication) => publication.status === "acknowledged")
     .map((publication) => ({
-      at: publication.acknowledged_at ?? publication.created_at,
+      atMs: Date.parse(publication.created_at),
       publication,
     }))
-    .filter(({ at }) => at <= observedAt)
+    .filter(({ atMs }) => !Number.isNaN(atMs) && atMs <= observedAtMs)
     .sort((left, right) =>
-      right.at.localeCompare(left.at) || right.publication.id.localeCompare(left.publication.id)
+      right.atMs - left.atMs || right.publication.id.localeCompare(left.publication.id)
     )
     .flatMap(({ publication }) => publicationProviderHeads(publication.payload))
     .at(0);
