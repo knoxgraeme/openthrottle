@@ -29,6 +29,7 @@ interface GithubPullRequest {
   number: number;
   html_url: string;
   merged?: boolean;
+  updated_at?: string;
   head: { ref: string; sha?: string };
   base: { ref: string };
   user?: { login?: string };
@@ -167,6 +168,10 @@ function validatePullRequestShape(payload: Record<string, unknown>): Record<stri
   const pullRequest = recordField(payload, "pull_request");
   numberField(pullRequest, "number");
   stringField(pullRequest, "html_url");
+  const updatedAt = stringField(pullRequest, "updated_at");
+  if (Number.isNaN(Date.parse(updatedAt))) {
+    throw new Error("GitHub webhook has invalid pull_request.updated_at");
+  }
   stringField(recordField(pullRequest, "head"), "ref");
   stringField(recordField(pullRequest, "base"), "ref");
   return pullRequest;

@@ -34,11 +34,12 @@ export async function handleControlEvent(
   providers: SessionServicePorts,
   payload: ControlThreadEvent,
   coordinator: PipelineCoordinatorContext,
-  preflight?: AdmissionPreflight
+  preflight?: AdmissionPreflight,
+  receivedAt?: string
 ): Promise<void> {
   if (payload.action === "created") {
     await handleCreated(cfg, store, providers, payload, coordinator, preflight);
   } else {
-    await handlePrompted(cfg, store, providers, payload, coordinator);
+    await handlePrompted(cfg, store, providers, payload, coordinator, receivedAt);
   }
 }

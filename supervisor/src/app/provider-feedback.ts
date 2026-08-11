@@ -128,6 +128,7 @@ export function recordPipelineProviderEvent(params: {
   payload: Record<string, unknown>;
   headSha: string;
   pullRequestUrl?: string;
+  receivedAt?: string;
 }): FeedbackSnapshot {
   const stored = canonicalJson({
     outcome: params.outcome,
@@ -152,6 +153,7 @@ export function recordPipelineProviderEvent(params: {
     kind: "pipeline_provider_event",
     payload: stored,
     workItemId: pipelineFeedbackWorkItemId(params.instance.id, params.headSha),
+    receivedAt: params.receivedAt,
   }).snapshot;
 }
 
@@ -285,7 +287,9 @@ export function acknowledgedPublicationHeadAt(
   pipelines: PipelineStore,
   instance: PipelineInstance,
   observedAt: string | undefined,
-  providerObservation?: { headSha: string; observedAt: string }
+  providerObservation?:
+    | { headSha: string; observedAt: string }
+    | ReadonlyArray<{ headSha: string; observedAt: string }>
 ): string | undefined {
   const observedAtMs = observedAt ? Date.parse(observedAt) : Number.NaN;
   if (Number.isNaN(observedAtMs)) return undefined;
@@ -306,22 +310,37 @@ export function acknowledgedPublicationHeadAt(
         providerObserved: false,
       }))
     );
-  const providerObservedAtMs = providerObservation
-    ? Date.parse(providerObservation.observedAt)
-    : Number.NaN;
-  if (providerObservation && !Number.isNaN(providerObservedAtMs) &&
-      providerObservedAtMs < observedAtMs) {
-    candidates.push({
-      atMs: providerObservedAtMs,
-      headSha: providerObservation.headSha,
-      id: `provider-observation:${providerObservation.headSha}`,
-      providerObserved: true,
-    });
+  const providerObservations = providerObservation === undefined
+    ? []
+    : Array.isArray(providerObservation)
+      ? providerObservation
+      : [providerObservation];
+  for (const observation of providerObservations) {
+    const providerObservedAtMs = Date.parse(observation.observedAt);
+    if (!Number.isNaN(providerObservedAtMs) && providerObservedAtMs < observedAtMs) {
+      candidates.push({
+        atMs: providerObservedAtMs,
+        headSha: observation.headSha,
+        id: `provider-observation:${observation.observedAt}:${observation.headSha}`,
+        providerObserved: true,
+      });
+    }
   }
-  return candidates.sort((left, right) =>
+  const ordered = candidates.sort((left, right) =>
     right.atMs - left.atMs || Number(right.providerObserved) - Number(left.providerObserved) ||
     right.id.localeCompare(left.id)
-  ).at(0)?.headSha;
+  );
+  const latestAtMs = ordered.at(0)?.atMs;
+  if (latestAtMs !== undefined) {
+    const equalTimeProviderHeads = new Set(ordered
+      .filter((candidate) => candidate.atMs === latestAtMs && candidate.providerObserved)
+      .map((candidate) => candidate.headSha));
+    // GitHub provider timestamps are not a total order. Two different heads
+    // observed at the same instant remain ambiguous regardless of SHA or the
+    // lexical order of their durable setting keys.
+    if (equalTimeProviderHeads.size > 1) return undefined;
+  }
+  return ordered.at(0)?.headSha;
 }
 
 function snapshotBelongsToInstance(
