@@ -5,6 +5,7 @@ import { sanitizeText } from "../../shared/sanitize.js";
 const HTTP_TIMEOUT_MS = 15_000;
 const GITHUB_PULL_REQUEST_URL_PATTERN =
   /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+$/;
+const GITHUB_COMMIT_SHA_PATTERN = /^[a-f0-9]{40}$/;
 
 export function isGithubPullRequestUrl(value: unknown): value is string {
   return typeof value === "string" && GITHUB_PULL_REQUEST_URL_PATTERN.test(value);
@@ -52,7 +53,7 @@ interface GithubReviewEvent extends GithubEventBase {
     id: number;
     state: string;
     html_url: string;
-    commit_id?: string;
+    commit_id: string;
     body?: string | null;
     user?: { login: string };
   };
@@ -301,11 +302,19 @@ export function parseGithubWebhook(eventName: string | undefined, raw: string): 
     numberField(review, "id");
     stringField(review, "state");
     stringField(review, "html_url");
+    const commitId = stringField(review, "commit_id");
+    if (!GITHUB_COMMIT_SHA_PATTERN.test(commitId)) {
+      throw new Error("GitHub webhook has invalid review.commit_id");
+    }
   } else if (eventName === "issue_comment") {
     numberField(recordField(payload, "issue"), "number");
     const comment = recordField(payload, "comment");
     numberField(comment, "id");
     stringField(comment, "html_url");
+    const createdAt = stringField(comment, "created_at");
+    if (Number.isNaN(Date.parse(createdAt))) {
+      throw new Error("GitHub webhook has invalid comment.created_at");
+    }
   } else if (eventName === "workflow_run") {
     const run = recordField(payload, "workflow_run");
     numberField(run, "id");

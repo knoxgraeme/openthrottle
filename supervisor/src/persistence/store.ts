@@ -212,6 +212,9 @@ export function createSupervisorStore(
     const snapshot = db.prepare("SELECT * FROM feedback_snapshots WHERE id = ?")
       .get(params.snapshotId) as FeedbackSnapshot | undefined;
     if (!snapshot) return false;
+    const existingNotice = db.prepare("SELECT 1 FROM control_outbox WHERE id = ?")
+      .get(params.noticeId);
+    if (snapshot.status === "stale" && existingNotice) return true;
     const update = db.prepare(`
       UPDATE feedback_snapshots
       SET status = 'stale'

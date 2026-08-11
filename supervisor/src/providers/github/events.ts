@@ -762,9 +762,7 @@ export async function handleGithubEvent(
       prHeadSha ??
       store.getSetting(`github-head:${ticket.ticket_id}`) ??
       `unknown:${event.pull_request.head.ref}`;
-    if (prHeadSha) {
-      setAuthoritativeGithubHead(store, ticket.ticket_id, prHeadSha);
-    } else if (!store.getSetting(`github-head:${ticket.ticket_id}`)) {
+    if (!store.getSetting(`github-head:${ticket.ticket_id}`)) {
       store.setSetting(`github-head:${ticket.ticket_id}`, headSha);
     }
     const reviewBody = event.review.body?.trim() ?? "";
