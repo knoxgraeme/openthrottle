@@ -247,6 +247,52 @@ describe("sandbox event contracts", () => {
       .toBe("processed");
   });
 
+  it("retries transient sealed result listing failures without deleting or duplicating the result", async () => {
+    const store = seedRunningTicket();
+    const resultPath = "/var/lib/openthrottle/stage-results/attempt-1.json";
+    const files = new Map([[resultPath, Buffer.from(stageResultEvent())]]);
+    let stageListCalls = 0;
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      fs: {
+        listFiles: vi.fn(async (directory: string) => {
+          if (directory === "/var/lib/openthrottle/stage-results") {
+            stageListCalls += 1;
+            if (stageListCalls === 1) throw { response: { status: 502 }, message: "" };
+          }
+          return [...files.entries()]
+            .filter(([path]) => path.startsWith(`${directory}/`))
+            .map(([path, value]) => ({
+              name: path.split("/").at(-1), path, size: value.length, isDir: false,
+            }));
+        }),
+        downloadFile: vi.fn(async (path: string) => files.get(path)),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+      process: {
+        executeCommand: vi.fn(async () => ({ exitCode: 0, result: `${"c".repeat(40)}\n` })),
+      },
+    };
+    const postStageResult = vi.fn(async () => undefined);
+
+    const params = {
+      runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) },
+      store,
+      postActivity: vi.fn(async () => undefined),
+      postStageResult,
+    };
+    await pollSandboxEvents(params);
+    await pollSandboxEvents(params);
+    await pollSandboxEvents(params);
+
+    expect(sandbox.fs.deleteFile).toHaveBeenCalledTimes(1);
+    expect(postStageResult).toHaveBeenCalledTimes(1);
+    expect(store.getSandboxEvent("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")?.status)
+      .toBe("processed");
+  });
+
   it("keeps stale child action heartbeats ignored after renewing parent liveness", async () => {
     const store = seedRunningTicket();
     const childActionId = "execution-work-ae57a59455a2ff9c73af69b9d6266328.review.selector";

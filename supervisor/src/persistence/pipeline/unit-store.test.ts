@@ -1640,6 +1640,49 @@ describe("execution unit store", () => {
     });
   });
 
+  it("records observation failures without clearing the child action deadline", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+
+    const active = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(active.id, "request-hash", "native-session");
+    store.recordActionObservationFailure({
+      actionId: active.id,
+      lastError: "operation=FileSystem.listFiles retryable=true status=502 message=empty body",
+    });
+
+    expect(db!.prepare(`
+      SELECT status, lease_owner, lease_until, last_error
+      FROM execution_work_attempts WHERE id = ?
+    `).get(active.id)).toEqual({
+      status: "dispatched",
+      lease_owner: null,
+      lease_until: "2026-07-29T00:01:00.000Z",
+      last_error: "operation=FileSystem.listFiles retryable=true status=502 message=empty body",
+    });
+
+    expect(store.healExpiredCurrentChildAction({
+      parentAttemptId: "attempt-parent",
+      actionId: active.id,
+      nowIso: "2026-07-29T00:01:01.000Z",
+      reason: "child action missed heartbeat fence",
+    })).toBe("healed");
+  });
+
   it("cascades structural exit to dependents blocked by a healed prerequisite", () => {
     const store = setup();
     store.createGraph({

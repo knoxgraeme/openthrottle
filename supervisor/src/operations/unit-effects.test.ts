@@ -40,6 +40,7 @@ function storeFor(leased: ExecutionWorkAttempt): ExecutionUnitStore {
     leaseNextUnitAction: vi.fn(() => leased),
     markActionDispatching: vi.fn(),
     markActionDispatched: vi.fn(),
+    recordActionObservationFailure: vi.fn(),
     completeUnitAction: vi.fn(),
     failUnitAction: vi.fn(),
     stopRetryableUnitAction: vi.fn(),
@@ -256,8 +257,12 @@ describe("unit effect processor", () => {
       runtime,
       leaseOwner: "owner",
       now: () => new Date("2026-07-29T00:00:00.000Z"),
-    }).drain("attempt-parent")).rejects.toThrow(/runtime unavailable/);
+    }).drain("attempt-parent")).resolves.toEqual(expired);
 
+    expect(store.recordActionObservationFailure).toHaveBeenCalledWith({
+      actionId: "action-1",
+      lastError: "runtime unavailable",
+    });
     expect(store.healExpiredCurrentChildAction).not.toHaveBeenCalled();
     expect(store.completeUnitAction).not.toHaveBeenCalled();
     expect(runtime.dispatchUnitAction).not.toHaveBeenCalled();

@@ -2039,7 +2039,7 @@ describe("pipeline effect processor", () => {
     expect(pipelines.getGraphForAttempt(attempt.id)!.aggregate_emitted_at).toBe(aggregateEmittedAt);
   });
 
-  it("settles active composite drain exceptions as retryable instead of wedging the action", async () => {
+  it("retries transient active composite collection failures without rerunning the action", async () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
     const tickets = createSupervisorStore(db, pipelines);
@@ -2128,26 +2128,47 @@ describe("pipeline effect processor", () => {
     });
 
     await processor.drain();
+    const action = pipelines.listWorkAttempts(attempt.id)[0]!;
+    const dispatchCalls = runtime.dispatchLoopAction.mock.calls.length;
     runtime.collectLoopActionResult.mockRejectedValueOnce(new Error("Daytona collection timeout"));
 
     await expect(processor.drain()).resolves.toBeUndefined();
     expect(pipelines.listWorkAttempts(attempt.id)[0]).toMatchObject({
-      status: "dead",
+      id: action.id,
+      status: "dispatched",
       last_error: expect.stringContaining("Daytona collection timeout"),
     });
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
-      stopped_at: expect.any(String),
-      stop_reason: expect.stringContaining("retryable_infrastructure_failure"),
+      stopped_at: null,
+      stop_reason: null,
       aggregate_emitted_at: null,
     });
 
-    await processor.drain();
-    expect(pipelines.getAttempt(attempt.id)).toMatchObject({
-      status: "failed",
-      outcome: "retryable_infrastructure_failure",
+    const completedSubject = "1".repeat(40);
+    runtime.collectLoopActionResult.mockResolvedValueOnce({
+      actionId: action.id,
+      attemptId: attempt.id,
+      requestHash: action.request_hash!,
+      outcome: "success",
+      nativeSessionId: "thread-unit-a",
+      subject: completedSubject,
+      receipt: receiptJson({
+        instance,
+        action,
+        type: "unit_completion",
+        subject: completedSubject,
+        baseSubject: instance.base_commit,
+        preSubject: instance.base_commit,
+        nativeSessionId: null,
+      }),
+      completedAt: "2099-07-22T12:00:00.000Z",
     });
-    expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
-      aggregate_emitted_at: expect.any(String),
+    await processor.drain();
+    expect(runtime.dispatchLoopAction).toHaveBeenCalledTimes(dispatchCalls);
+    expect(pipelines.listWorkAttempts(attempt.id)[0]).toMatchObject({
+      id: action.id,
+      status: "completed",
+      output_subject: completedSubject,
     });
   });
 

@@ -13,6 +13,7 @@ import type {
 } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
 import type { RuntimeResource, SandboxAutostopRuntime, SandboxRuntime } from "../runtime/contracts.js";
+import { serializeRuntimeObservationError } from "../runtime/observation-error.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
 import { createStructuredChildRuntime } from "./structured-child-runtime.js";
@@ -677,7 +678,10 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     try {
       await handle(effect);
     } catch (error) {
-      const message = sanitizeText(String(error)).slice(-2_000);
+      const message = serializeRuntimeObservationError(
+        `pipeline effect ${effect.kind}`,
+        error
+      ).text.slice(-2_000);
       const errorClass = classifyEffectError(message);
       // Stop settlement keeps its full retry budget: exhausting it early would
       // reroute live actors into quarantine on the first provider auth blip.

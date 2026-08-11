@@ -50,7 +50,16 @@ export function createUnitEffectProcessor(input: {
         action.request_launch_state !== "launched";
       const requestlessDispatch = action.status === "dispatched" && !action.request_hash;
       if (!requestlessDispatch && !preparedNotLaunched) {
-        const recovered = await input.runtime.collectUnitAction(action);
+        let recovered: Awaited<ReturnType<UnitEffectRuntime["collectUnitAction"]>>;
+        try {
+          recovered = await input.runtime.collectUnitAction(action);
+        } catch (error) {
+          input.store.recordActionObservationFailure({
+            actionId: action.id,
+            lastError: error instanceof Error ? error.message : String(error),
+          });
+          return action;
+        }
         if (recovered) {
           if (recovered.terminal) {
             if (recovered.outcome === "retryable_infrastructure_failure") {

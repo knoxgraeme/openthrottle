@@ -74,6 +74,7 @@ import type {
   RuntimeResource,
   SandboxRuntime,
 } from "../runtime/contracts.js";
+import { serializeRuntimeObservationError } from "../runtime/observation-error.js";
 import { extractJsonBlocks } from "../pipeline/markdown.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { createUnitEffectProcessor } from "./unit-effects.js";
@@ -86,7 +87,7 @@ const DIAGNOSTIC_TEXT_HEAD_CHARS = 1_500;
 
 class RetryableReviewRuntimeError extends Error {
   constructor(operation: string, cause: unknown) {
-    super(`${operation}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    super(serializeRuntimeObservationError(operation, cause).text);
     this.name = "RetryableReviewRuntimeError";
   }
 }
@@ -845,6 +846,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     try {
       return await execute();
     } catch (error) {
+      const observed = serializeRuntimeObservationError(operation, error);
+      if (!observed.retryable) throw new Error(observed.text);
       throw new RetryableReviewRuntimeError(operation, error);
     }
   };
@@ -2153,7 +2156,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         ? await deps.runtime.collectChildExecutorActionResult(resource, collectionRequest)
         : await deps.runtime.collectLoopActionResult(resource, collectionRequest);
     } catch (error) {
-      const message = sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500);
+      const observed = serializeRuntimeObservationError(
+        `${action.action_kind} result collection`,
+        error
+      );
+      if (observed.retryable) throw new Error(observed.text);
+      const message = sanitizeText(observed.text).slice(-500);
       return {
         terminal: true,
         resultHash: digestCanonicalJson({

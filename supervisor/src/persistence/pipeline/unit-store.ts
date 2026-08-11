@@ -199,6 +199,10 @@ export interface ExecutionUnitStore {
   }): ExecutionWorkAttempt;
   markActionWorktreeReady(actionId: string): void;
   markActionDispatched(actionId: string, requestHash: string, nativeSessionId?: string | null): void;
+  recordActionObservationFailure(input: {
+    actionId: string;
+    lastError: string;
+  }): void;
   completeUnitAction(input: {
     actionId: string;
     resultHash: string;
@@ -1561,6 +1565,13 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
       `).run(requestHash, nativeSessionId, timestamp, actionId);
       if (update.changes !== 1) throw new Error(`execution work attempt ${actionId} is not active`);
+    },
+    recordActionObservationFailure(input) {
+      db.prepare(`
+        UPDATE execution_work_attempts
+        SET lease_owner = NULL, last_error = ?, updated_at = ?
+        WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
+      `).run(input.lastError.slice(0, 2_000), now(), input.actionId);
     },
     completeUnitAction,
     completeGatedAction,
