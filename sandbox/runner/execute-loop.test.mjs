@@ -3402,7 +3402,7 @@ describe("executeLoopAction", () => {
         integrationRepoDir: "/tmp/integration-current",
       }),
     });
-    expect(result.outcome).toBe("needs_human");
+    expect(result.outcome).toBe("failure");
     expect(result.receipt).not.toContain("gh-leaked-secret-value");
     expect(result.receipt).toContain("[REDACTED]");
   });
