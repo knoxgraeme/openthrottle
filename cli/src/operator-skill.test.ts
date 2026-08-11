@@ -72,7 +72,9 @@ describe("operator skill package", () => {
     }
     const ship = readFileSync(resolve(process.cwd(), "../skills/operator/openthrottle/references/ship.md"), "utf8");
     expect(ship).toContain("openthrottle plan prepare <file.md> --graph structured --json");
+    expect(ship).toContain("openthrottle plan validate <file.md> --graph structured --json");
     expect(ship).toContain("openthrottle ship <file.md> --graph structured");
+    expect(ship).toContain("Ticket reuse, trigger-state JSON, and recovery commands are capability-gated");
   });
 });
 
@@ -298,6 +300,40 @@ describe("operator skill Skillfish wrapper", () => {
       },
     ]);
     expect(existsSync(join(home, ".codex", "skills", "openthrottle"))).toBe(false);
+  });
+
+  it("leaves every real agent target unchanged when destination preparation fails", () => {
+    const home = temporaryDirectory();
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    writeFileSync(join(home, ".claude", "skills"), "blocks the destination directory");
+    const runner = (args: string[], options: { env: NodeJS.ProcessEnv }) => {
+      if (args[0] === "list") {
+        return spawnResult({
+          success: true,
+          installed: [],
+          agents_detected: ["Codex", "Claude Code"],
+        });
+      }
+      const stagedCodexPath = stagedSkill(options.env.HOME ?? "", ".codex");
+      const stagedClaudePath = stagedSkill(options.env.HOME ?? "", ".claude");
+      return spawnResult({
+        success: true,
+        installed: [
+          { skill: "openthrottle", agent: "Codex", path: stagedCodexPath, location: "global" },
+          { skill: "openthrottle", agent: "Claude Code", path: stagedClaudePath, location: "global" },
+        ],
+        skipped: [],
+      });
+    };
+
+    const result = runOperatorSkillAction("install", { home, runner, sourceRef });
+
+    expect(result.success).toBe(false);
+    expect(result.installed).toEqual([]);
+    expect(result.conflicted.map((entry) => entry.agent).sort()).toEqual(["Claude Code", "Codex"]);
+    expect(existsSync(join(home, ".codex", "skills", "openthrottle"))).toBe(false);
+    expect(readFileSync(join(home, ".claude", "skills"), "utf8")).toBe("blocks the destination directory");
   });
 
   it("keeps install from overwriting stale owned installs without refresh", () => {
