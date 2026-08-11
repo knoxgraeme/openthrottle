@@ -111,8 +111,9 @@ describe("database migrations", () => {
     expect(rows.map((row) => row.version)).toEqual(databaseMigrations.map((migration) => migration.version));
     expect(rows.every((row) => /^[a-f0-9]{64}$/.test(row.checksum))).toBe(true);
     // These hashes come only from stable migration manifests, never transpiled
-    // Function#toString output. Changing one means adding a new migration, not
-    // rewriting an already accepted ledger entry.
+    // Function#toString output. Changing one normally means adding a new
+    // migration. V35 was corrected before its first successful deployment:
+    // the initial rollout could not commit it on the staging database.
     expect(databaseMigrations.map((migration) => migration.checksum)).toEqual([
       "b94ca61aba6b4e06872210f58f19d7dc8c53fbdec42f6ad238be7cf4d96bebef",
       "504d954a847f08dbd3db3f144c208b3270de4ecd8b52cddcbb02893353c40b68",
@@ -148,7 +149,7 @@ describe("database migrations", () => {
       "e1f1cc26fcd21df5ca8cb56548d2d38f90311d40d93bcd0e54d4ab62f9eb6ad4",
       "36f3c74ad261f3e4e9e5014221e5ff8510dc7123b03ab92f2875b02ab0cf4fb2",
       "8ede2103ae2f761958e4a21fc672b1c7a2a6c8fe39f75109ca3843b2fe492597",
-      "7d3a9df445ca32dde099ec99c6f2128a9e87b5f86732f94f61690fe13d53ebcb",
+      "0d0aa73d6cbb944697d6815f5bd1c8dd766a919b8692945b905298759dd766a7",
     ]);
   });
 
@@ -279,6 +280,79 @@ describe("database migrations", () => {
     expect(db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'linear_outbox'"
     ).get()).toBeUndefined();
+  });
+
+  it("rekeys retained legacy work rows before changing their ticket parent key", () => {
+    db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    db.exec(`
+      CREATE TABLE tickets (
+        linear_issue_id TEXT PRIMARY KEY,
+        linear_issue_identifier TEXT NOT NULL,
+        linear_session_id TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE agent_sessions (
+        id TEXT PRIMARY KEY,
+        linear_issue_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(linear_issue_id, generation),
+        FOREIGN KEY(linear_issue_id) REFERENCES tickets(linear_issue_id)
+      );
+      CREATE TABLE session_work (
+        id TEXT PRIMARY KEY,
+        linear_session_id TEXT NOT NULL,
+        linear_issue_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        priority INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        status TEXT NOT NULL,
+        claimed_run_id TEXT,
+        available_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        consumed_at TEXT,
+        canceled_at TEXT,
+        FOREIGN KEY(linear_session_id) REFERENCES agent_sessions(id),
+        FOREIGN KEY(linear_issue_id) REFERENCES tickets(linear_issue_id)
+      );
+      INSERT INTO tickets (
+        linear_issue_id, linear_issue_identifier, linear_session_id,
+        branch, agent, repo, created_at, updated_at
+      ) VALUES (
+        'issue-legacy', 'OPE-1', 'session-legacy',
+        'ot/ope-1', 'codex', 'owner/repo', '2026-01-01', '2026-01-01'
+      );
+      INSERT INTO agent_sessions (
+        id, linear_issue_id, generation, state, created_at, updated_at
+      ) VALUES (
+        'session-legacy', 'issue-legacy', 1, 'current', '2026-01-01', '2026-01-01'
+      );
+      INSERT INTO session_work (
+        id, linear_session_id, linear_issue_id, source, priority, body,
+        status, claimed_run_id, available_at, created_at, consumed_at, canceled_at
+      ) VALUES (
+        'work-legacy', 'session-legacy', 'issue-legacy', 'human', 0, 'steer',
+        'consumed', NULL, '2026-01-01', '2026-01-01', '2026-01-01', NULL
+      );
+    `);
+
+    const migration = databaseMigrations.find((candidate) => candidate.version === 35)!;
+    expect(() => db!.transaction(() => migration.up(db!))()).not.toThrow();
+
+    expect(db.prepare(`
+      SELECT ticket_id, session_id FROM session_work WHERE id = 'work-legacy'
+    `).get()).toEqual({
+      ticket_id: "linear:issue-legacy",
+      session_id: "session-legacy",
+    });
+    expect(db.pragma("foreign_key_check")).toEqual([]);
   });
 
   it("rekeys the complete GitHub head fence without losing canonical or newer state", () => {
