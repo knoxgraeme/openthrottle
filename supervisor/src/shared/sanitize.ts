@@ -11,7 +11,8 @@ const BEARER_PROSE = new Set(["authentication", "authorization", "credential", "
 function isSecretBearerCandidate(text: string, candidate: string, offset: number): boolean {
   const context = text.slice(Math.max(0, offset - 48), offset).replaceAll("\\", "");
   if (/Authorization["']?[ \t]*:[ \t]*["']?[ \t]*$/i.test(context)) return true;
-  return !BEARER_PROSE.has(candidate.toLowerCase());
+  const proseCandidate = candidate.toLowerCase().replace(/\.+$/, "");
+  return !BEARER_PROSE.has(proseCandidate);
 }
 
 function redactBearerSecrets(text: string): string {

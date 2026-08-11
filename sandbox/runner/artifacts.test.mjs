@@ -102,7 +102,7 @@ describe("normalized stage artifacts", () => {
   });
 
   it("keeps bearer prose but redacts bearer-token shapes", () => {
-    const prose = "CODEX_AUTH_JSON bearer credentials support Bearer authentication and Bearer token";
+    const prose = "CODEX_AUTH_JSON bearer credentials. Supports Bearer authentication, and Bearer token.";
     expect(sanitizeArtifactText(prose, {})).toBe(prose);
     for (const secret of [
       "Bearer eyJhbGciOiJIUzI1NiJ9.cGF5bG9hZA.c2lnbmF0dXJl",

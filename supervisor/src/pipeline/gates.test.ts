@@ -712,7 +712,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(() => evaluateStageGate(fixture.pipelines, shortAuthorizationToken)).toThrow(/secret-shaped/);
 
     const safeBearerProse = event(fixture, "success", {
-      summary: "CODEX_AUTH_JSON bearer credentials are isolated from repository tools",
+      summary: "CODEX_AUTH_JSON bearer credentials. Repository tools remain isolated.",
     });
     expect(() => evaluateStageGate(fixture.pipelines, safeBearerProse)).not.toThrow();
 
