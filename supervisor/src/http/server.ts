@@ -447,7 +447,8 @@ export function createServerWebhookDeliveryProcessor(deps: {
           createSessionServicePorts(linear),
           linearControlEvent(parseLinearWebhook(delivery.payload)),
           deps.pipelineCoordinator,
-          admissionPreflight
+          admissionPreflight,
+          delivery.received_at
         );
         return;
       }
@@ -462,6 +463,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
           coordinator: deps.pipelineCoordinator,
           preflight: admissionPreflight,
           deliveryId: delivery.id,
+          receivedAt: delivery.received_at,
         }
       );
       await deps.pipelineCoordinator.drainEffects?.();

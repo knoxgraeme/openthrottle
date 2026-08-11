@@ -5,6 +5,7 @@ import { sanitizeText } from "../../shared/sanitize.js";
 const HTTP_TIMEOUT_MS = 15_000;
 const GITHUB_PULL_REQUEST_URL_PATTERN =
   /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+$/;
+const GITHUB_COMMIT_SHA_PATTERN = /^[a-f0-9]{40}$/;
 
 export function isGithubPullRequestUrl(value: unknown): value is string {
   return typeof value === "string" && GITHUB_PULL_REQUEST_URL_PATTERN.test(value);
@@ -28,6 +29,7 @@ interface GithubPullRequest {
   number: number;
   html_url: string;
   merged?: boolean;
+  updated_at?: string;
   head: { ref: string; sha?: string };
   base: { ref: string };
   user?: { login?: string };
@@ -52,6 +54,7 @@ interface GithubReviewEvent extends GithubEventBase {
     id: number;
     state: string;
     html_url: string;
+    commit_id: string;
     body?: string | null;
     user?: { login: string };
   };
@@ -165,6 +168,10 @@ function validatePullRequestShape(payload: Record<string, unknown>): Record<stri
   const pullRequest = recordField(payload, "pull_request");
   numberField(pullRequest, "number");
   stringField(pullRequest, "html_url");
+  const updatedAt = stringField(pullRequest, "updated_at");
+  if (Number.isNaN(Date.parse(updatedAt))) {
+    throw new Error("GitHub webhook has invalid pull_request.updated_at");
+  }
   stringField(recordField(pullRequest, "head"), "ref");
   stringField(recordField(pullRequest, "base"), "ref");
   return pullRequest;
@@ -300,11 +307,19 @@ export function parseGithubWebhook(eventName: string | undefined, raw: string): 
     numberField(review, "id");
     stringField(review, "state");
     stringField(review, "html_url");
+    const commitId = stringField(review, "commit_id");
+    if (!GITHUB_COMMIT_SHA_PATTERN.test(commitId)) {
+      throw new Error("GitHub webhook has invalid review.commit_id");
+    }
   } else if (eventName === "issue_comment") {
     numberField(recordField(payload, "issue"), "number");
     const comment = recordField(payload, "comment");
     numberField(comment, "id");
     stringField(comment, "html_url");
+    const createdAt = stringField(comment, "created_at");
+    if (Number.isNaN(Date.parse(createdAt))) {
+      throw new Error("GitHub webhook has invalid comment.created_at");
+    }
   } else if (eventName === "workflow_run") {
     const run = recordField(payload, "workflow_run");
     numberField(run, "id");

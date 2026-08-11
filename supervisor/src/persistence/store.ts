@@ -163,6 +163,7 @@ export interface FeedbackCapability {
     | { status: "exhausted"; completedRounds: number }
     | { status: "stale"; snapshot?: FeedbackSnapshot; eventCount?: number };
   carryForwardFeedbackSnapshot(snapshotId: string, headSha: string, workItemId: string): FeedbackSnapshot | undefined;
+  listFeedbackSnapshotEvents(snapshotId: string): FeedbackSnapshotEvent[];
   markFeedbackSnapshotStaleWithNotice(params: {
     snapshotId: string;
     noticeId: string;
@@ -211,6 +212,9 @@ export function createSupervisorStore(
     const snapshot = db.prepare("SELECT * FROM feedback_snapshots WHERE id = ?")
       .get(params.snapshotId) as FeedbackSnapshot | undefined;
     if (!snapshot) return false;
+    const existingNotice = db.prepare("SELECT 1 FROM control_outbox WHERE id = ?")
+      .get(params.noticeId);
+    if (snapshot.status === "stale" && existingNotice) return true;
     const update = db.prepare(`
       UPDATE feedback_snapshots
       SET status = 'stale'
@@ -242,6 +246,9 @@ export function createSupervisorStore(
     },
     carryForwardFeedbackSnapshot(snapshotId, headSha, workItemId) {
       return feedbackStore.carryForward(snapshotId, headSha, workItemId);
+    },
+    listFeedbackSnapshotEvents(snapshotId) {
+      return feedbackStore.listEvents(snapshotId);
     },
     markFeedbackSnapshotStaleWithNotice(params) {
       return markFeedbackSnapshotStaleWithNotice.immediate(params);

@@ -80,6 +80,7 @@ describe("GitHub contracts", () => {
         number: 1,
         html_url: "https://github.com/o/r/pull/1",
         merged: false,
+        updated_at: "2026-08-11T00:00:00.000Z",
         head: { ref: "ot/test" },
         base: { ref: "main" },
       },
@@ -92,19 +93,21 @@ describe("GitHub contracts", () => {
         number: 1,
         html_url: "https://github.com/o/r/pull/1",
         merged_at: null,
+        updated_at: "2026-08-11T00:00:00.000Z",
         head: { ref: "ot/test" },
         base: { ref: "main" },
       },
       review: {
         id: 9,
         state: "commented",
+        commit_id: "a".repeat(40),
         html_url: "https://github.com/o/r/pull/1#pullrequestreview-9",
         user: { login: "reviewer" },
       },
     });
     expect(parseGithubWebhook("pull_request_review", review)).toMatchObject({
       kind: "pull_request_review",
-      review: { id: 9 },
+      review: { id: 9, commit_id: "a".repeat(40) },
     });
     const comment = JSON.stringify({
       action: "created",
@@ -113,6 +116,7 @@ describe("GitHub contracts", () => {
       comment: {
         id: 7,
         body: "Please double-check the retry logic.",
+        created_at: "2026-08-11T00:00:00.000Z",
         html_url: "https://github.com/o/r/pull/1#issuecomment-7",
         user: { login: "reviewer" },
       },
@@ -141,6 +145,78 @@ describe("GitHub contracts", () => {
         JSON.stringify({ action: "created", repository: { full_name: "o/r" }, issue: { number: 1 } })
       )
     ).toThrow(/comment/);
+    expect(() =>
+      parseGithubWebhook(
+        "pull_request_review",
+        JSON.stringify({
+          action: "submitted",
+          repository: { full_name: "o/r" },
+          pull_request: {
+            number: 1,
+            html_url: "https://github.com/o/r/pull/1",
+            updated_at: "2026-08-11T00:00:00.000Z",
+            head: { ref: "ot/test" },
+            base: { ref: "main" },
+          },
+          review: {
+            id: 9,
+            state: "commented",
+            html_url: "https://github.com/o/r/pull/1#pullrequestreview-9",
+          },
+        })
+      )
+    ).toThrow(/commit_id/);
+    expect(() =>
+      parseGithubWebhook(
+        "pull_request_review",
+        JSON.stringify({
+          action: "submitted",
+          repository: { full_name: "o/r" },
+          pull_request: {
+            number: 1,
+            html_url: "https://github.com/o/r/pull/1",
+            updated_at: "2026-08-11T00:00:00.000Z",
+            head: { ref: "ot/test" },
+            base: { ref: "main" },
+          },
+          review: {
+            id: 9,
+            state: "commented",
+            commit_id: "not-a-sha",
+            html_url: "https://github.com/o/r/pull/1#pullrequestreview-9",
+          },
+        })
+      )
+    ).toThrow(/review\.commit_id/);
+    expect(() =>
+      parseGithubWebhook(
+        "issue_comment",
+        JSON.stringify({
+          action: "created",
+          repository: { full_name: "o/r" },
+          issue: { number: 1, pull_request: { url: "https://api.github.com/repos/o/r/pulls/1" } },
+          comment: {
+            id: 7,
+            html_url: "https://github.com/o/r/pull/1#issuecomment-7",
+          },
+        })
+      )
+    ).toThrow(/created_at/);
+    expect(() =>
+      parseGithubWebhook(
+        "issue_comment",
+        JSON.stringify({
+          action: "created",
+          repository: { full_name: "o/r" },
+          issue: { number: 1, pull_request: { url: "https://api.github.com/repos/o/r/pulls/1" } },
+          comment: {
+            id: 7,
+            created_at: "not-a-date",
+            html_url: "https://github.com/o/r/pull/1#issuecomment-7",
+          },
+        })
+      )
+    ).toThrow(/comment\.created_at/);
     expect(() =>
       parseGithubWebhook(
         "issues",
@@ -200,6 +276,7 @@ describe("GitHub contracts", () => {
       comment: {
         id: 99,
         body: "Please continue.",
+        created_at: "2026-08-11T00:00:01Z",
         html_url: "https://github.com/owner/repo/issues/12#issuecomment-99",
       },
     }));
@@ -221,6 +298,7 @@ describe("GitHub contracts", () => {
       comment: {
         id: 100,
         body: "Repair the PR.",
+        created_at: "2026-08-11T00:00:02Z",
         html_url: "https://github.com/owner/repo/pull/7#issuecomment-100",
       },
     }));

@@ -128,6 +128,7 @@ export function recordPipelineProviderEvent(params: {
   payload: Record<string, unknown>;
   headSha: string;
   pullRequestUrl?: string;
+  receivedAt?: string;
 }): FeedbackSnapshot {
   const stored = canonicalJson({
     outcome: params.outcome,
@@ -152,6 +153,7 @@ export function recordPipelineProviderEvent(params: {
     kind: "pipeline_provider_event",
     payload: stored,
     workItemId: pipelineFeedbackWorkItemId(params.instance.id, params.headSha),
+    receivedAt: params.receivedAt,
   }).snapshot;
 }
 
@@ -258,16 +260,13 @@ function providerRevisionsFromArtifacts(value: unknown): string[] {
   });
 }
 
-function publicationSubjects(payload: string): string[] {
+function publicationProviderHeads(payload: string): string[] {
   try {
     const parsed = JSON.parse(payload) as {
-      decision?: { subject?: unknown };
       artifact_inline?: unknown;
       attachment?: { content?: unknown };
     };
     const subjects = new Set<string>();
-    const subject = commitString(parsed.decision?.subject);
-    if (subject) subjects.add(subject);
     for (const artifacts of [parsed.artifact_inline, parsed.attachment?.content]) {
       if (typeof artifacts !== "string") continue;
       try {
@@ -275,13 +274,73 @@ function publicationSubjects(payload: string): string[] {
           subjects.add(revision);
         }
       } catch {
-        // Older or malformed publication payloads simply cannot carry feedback.
+        // Older or malformed publication payloads simply cannot prove provider heads.
       }
     }
     return [...subjects];
   } catch {
     return [];
   }
+}
+
+export function acknowledgedPublicationHeadAt(
+  pipelines: PipelineStore,
+  instance: PipelineInstance,
+  observedAt: string | undefined,
+  providerObservation?:
+    | { headSha: string; observedAt: string }
+    | ReadonlyArray<{ headSha: string; observedAt: string }>
+): string | undefined {
+  const observedAtMs = observedAt ? Date.parse(observedAt) : Number.NaN;
+  if (Number.isNaN(observedAtMs)) return undefined;
+  const candidates = pipelines.listPublications(instance.id)
+    .filter((publication) =>
+      publication.kind !== "github_summary" && publication.status !== "dead"
+    )
+    .map((publication) => ({
+      atMs: Date.parse(publication.created_at),
+      publication,
+    }))
+    .filter(({ atMs }) => !Number.isNaN(atMs) && atMs < observedAtMs)
+    .flatMap(({ atMs, publication }) =>
+      publicationProviderHeads(publication.payload).map((headSha) => ({
+        atMs,
+        headSha,
+        id: publication.id,
+        providerObserved: false,
+      }))
+    );
+  const providerObservations = providerObservation === undefined
+    ? []
+    : Array.isArray(providerObservation)
+      ? providerObservation
+      : [providerObservation];
+  for (const observation of providerObservations) {
+    const providerObservedAtMs = Date.parse(observation.observedAt);
+    if (!Number.isNaN(providerObservedAtMs) && providerObservedAtMs < observedAtMs) {
+      candidates.push({
+        atMs: providerObservedAtMs,
+        headSha: observation.headSha,
+        id: `provider-observation:${observation.observedAt}:${observation.headSha}`,
+        providerObserved: true,
+      });
+    }
+  }
+  const ordered = candidates.sort((left, right) =>
+    right.atMs - left.atMs || Number(right.providerObserved) - Number(left.providerObserved) ||
+    right.id.localeCompare(left.id)
+  );
+  const latestAtMs = ordered.at(0)?.atMs;
+  if (latestAtMs !== undefined) {
+    const equalTimeProviderHeads = new Set(ordered
+      .filter((candidate) => candidate.atMs === latestAtMs && candidate.providerObserved)
+      .map((candidate) => candidate.headSha));
+    // GitHub provider timestamps are not a total order. Two different heads
+    // observed at the same instant remain ambiguous regardless of SHA or the
+    // lexical order of their durable setting keys.
+    if (equalTimeProviderHeads.size > 1) return undefined;
+  }
+  return ordered.at(0)?.headSha;
 }
 
 function snapshotBelongsToInstance(
@@ -316,7 +375,7 @@ function snapshotCanCarryForward(
 function acknowledgedPublicationSubjects(pipelines: PipelineStore, instanceId: string): ReadonlySet<string> {
   return new Set(pipelines.listPublications(instanceId)
     .filter((publication) => publication.status === "acknowledged")
-    .flatMap((publication) => publicationSubjects(publication.payload)));
+    .flatMap((publication) => publicationProviderHeads(publication.payload)));
 }
 
 function currentPublicationAcknowledgedAt(pipelines: PipelineStore, instance: PipelineInstance): string | undefined {
@@ -324,7 +383,7 @@ function currentPublicationAcknowledgedAt(pipelines: PipelineStore, instance: Pi
   return pipelines.listPublications(instance.id)
     .filter((publication) =>
       publication.status === "acknowledged" &&
-      publicationSubjects(publication.payload).includes(instance.published_commit!)
+      publicationProviderHeads(publication.payload).includes(instance.published_commit!)
     )
     .map((publication) => publication.acknowledged_at ?? publication.created_at)
     .sort()
@@ -336,7 +395,7 @@ function currentPublicationRecorded(pipelines: PipelineStore, instance: Pipeline
   return pipelines.listPublications(instance.id)
     .some((publication) =>
       publication.status !== "dead" &&
-      publicationSubjects(publication.payload).includes(instance.published_commit!)
+      publicationProviderHeads(publication.payload).includes(instance.published_commit!)
     );
 }
 
@@ -347,6 +406,61 @@ function snapshotFeedbackPredatesCurrentPublication(
 ): boolean {
   const acknowledgedAt = currentPublicationAcknowledgedAt(pipelines, instance);
   return acknowledgedAt !== undefined && snapshot.provider_watermark < acknowledgedAt;
+}
+
+function currentRepairReentryStartedAt(pipelines: PipelineStore, instance: PipelineInstance): string | undefined {
+  if (instance.reentry_count <= 0) return undefined;
+  return pipelines.listAttempts(instance.id)
+    .filter((attempt) => attempt.reentry_ordinal === instance.reentry_count)
+    .map((attempt) => attempt.created_at)
+    .sort()
+    .at(0);
+}
+
+function currentProviderRepairLineageStartedAt(
+  pipelines: PipelineStore,
+  instance: PipelineInstance
+): string | undefined {
+  if (instance.reentry_count <= 0) return undefined;
+  const attempts = pipelines.listAttempts(instance.id);
+  const currentProviderAttemptIndex = attempts
+    .map((attempt, index) => ({ attempt, index }))
+    .filter(({ attempt }) =>
+      attempt.stage_id === "provider" &&
+      attempt.reentry_ordinal <= instance.reentry_count
+    )
+    .at(-1)?.index;
+  if (currentProviderAttemptIndex === undefined) {
+    return currentRepairReentryStartedAt(pipelines, instance);
+  }
+  // A command/test failure can create nested repair reentries before the
+  // current provider wait. The stale-evidence cutoff is the first repair pass
+  // after the previous provider wait, not the latest nested reentry.
+  const previousProviderAttemptIndex = attempts
+    .slice(0, currentProviderAttemptIndex)
+    .map((attempt, index) => ({ attempt, index }))
+    .filter(({ attempt }) => attempt.stage_id === "provider")
+    .at(-1)?.index ?? -1;
+  const startedAt = attempts
+    .slice(previousProviderAttemptIndex + 1, currentProviderAttemptIndex)
+    .filter((attempt) =>
+      attempt.stage_id === "repair_implementation" &&
+      attempt.reentry_ordinal > 0 &&
+      attempt.reentry_ordinal <= instance.reentry_count
+    )
+    .map((attempt) => attempt.created_at)
+    .sort()
+    .at(0);
+  return startedAt ?? currentRepairReentryStartedAt(pipelines, instance);
+}
+
+function snapshotFeedbackPredatesCurrentProviderRepairLineage(
+  pipelines: PipelineStore,
+  snapshot: FeedbackSnapshot,
+  instance: PipelineInstance
+): boolean {
+  const repairStartedAt = currentProviderRepairLineageStartedAt(pipelines, instance);
+  return repairStartedAt !== undefined && snapshot.provider_watermark < repairStartedAt;
 }
 
 function snapshotCompletedRepairBeforeCurrentPublication(
@@ -370,14 +484,23 @@ function snapshotCompletedRepairBeforeCurrentPublication(
 function staleFeedbackNotice(params: {
   sessionId: string;
   eventCount: number;
+  eventIds: string[];
+  reviewedHead: string;
+  currentPublishedHead: string | null;
+  classification: "superseded_head";
 }): string {
   const count = Math.max(1, params.eventCount);
+  const eventIds = params.eventIds.length > 0
+    ? params.eventIds.slice(0, 3).map((eventId) => sanitizeText(eventId).slice(0, 120)).join(",")
+    : "unknown";
+  const reviewedHead = sanitizeText(params.reviewedHead).slice(0, 120);
+  const currentHead = sanitizeText(params.currentPublishedHead ?? "unknown").slice(0, 120);
   return JSON.stringify({
     type: "activity",
     activity: {
       sessionId: params.sessionId,
       type: "error",
-      body: `${count} feedback item(s) arrived against a superseded head and were not applied; re-comment on the current PR head.`,
+      body: `${count} feedback item(s) arrived against a superseded head and were not applied; classification=${params.classification}; event_ids=${eventIds}; reviewed_head=${reviewedHead}; current_published_head=${currentHead}; re-comment on the current PR head.`,
     },
   });
 }
@@ -388,12 +511,17 @@ function markStaleFeedbackWithNotice(params: {
   snapshot: FeedbackSnapshot;
   eventCount: number;
 }): void {
+  const events = params.store.listFeedbackSnapshotEvents(params.snapshot.id);
   params.store.markFeedbackSnapshotStaleWithNotice({
     snapshotId: params.snapshot.id,
     noticeId: `feedback-snapshot-stale:${params.snapshot.id}`,
     payload: staleFeedbackNotice({
       sessionId: params.instance.session_id,
       eventCount: params.eventCount,
+      eventIds: events.map((event) => `${event.provider}:${event.provider_event_id}`),
+      reviewedHead: params.snapshot.observed_head_sha ?? params.snapshot.head_sha,
+      currentPublishedHead: params.instance.published_commit,
+      classification: "superseded_head",
     }),
   });
 }
@@ -419,12 +547,11 @@ export function processPipelineFeedbackSnapshot(params: {
     params.store.consumeFeedbackSnapshot(params.snapshot.id);
     return false;
   }
-  // Feedback observed before the current head was published may still be the
-  // repair request that caused this republish. The provider watermark tracks
-  // the latest event in the snapshot, so delayed post-publication stale anchors
-  // appended to an older snapshot cannot ride along with pre-publication events.
+  // Feedback observed before the current repair reentry began may still be the
+  // causal request for this republish. Later old-head feedback is not causal for
+  // the repaired head even if publication acknowledgement has not happened yet.
   const canCarryPastFirstRepair = params.instance.reentry_count === 0 ||
-    snapshotFeedbackPredatesCurrentPublication(params.pipelines, params.snapshot, params.instance);
+    snapshotFeedbackPredatesCurrentProviderRepairLineage(params.pipelines, params.snapshot, params.instance);
   const currentSnapshot = subjects && snapshotCanCarryForward(subjects, params.snapshot, params.instance)
     && canCarryPastFirstRepair
     ? params.store.carryForwardFeedbackSnapshot(

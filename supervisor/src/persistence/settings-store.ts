@@ -4,7 +4,9 @@ export interface SettingsStore {
   acquireSupervisorLease(name: string, owner: string, nowIso: string, leaseUntilIso: string): boolean;
   releaseSupervisorLease(name: string, owner: string): boolean;
   getSetting(key: string): string | undefined;
+  listSettings(prefix: string): Array<{ key: string; value: string }>;
   setSetting(key: string, value: string): void;
+  setSettings(entries: ReadonlyArray<{ key: string; value: string }>): void;
 }
 
 export function createSettingsStore(db: Database.Database): SettingsStore {
@@ -13,6 +15,11 @@ export function createSettingsStore(db: Database.Database): SettingsStore {
     INSERT INTO settings (key, value) VALUES (?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value
   `);
+  const setSettingsTransaction = db.transaction(
+    (entries: ReadonlyArray<{ key: string; value: string }>): void => {
+      for (const entry of entries) setSettingStmt.run(entry.key, entry.value);
+    }
+  );
   const acquireSupervisorLeaseTransaction = db.transaction(
     (name: string, owner: string, nowIso: string, leaseUntilIso: string): boolean => {
       const existing = db.prepare(
@@ -43,8 +50,18 @@ export function createSettingsStore(db: Database.Database): SettingsStore {
       const row = getSettingStmt.get(key) as { value: string } | undefined;
       return row?.value;
     },
+    listSettings(prefix) {
+      return db.prepare(`
+        SELECT key, value FROM settings
+        WHERE key >= ? AND key < ?
+        ORDER BY key
+      `).all(prefix, `${prefix}\uffff`) as Array<{ key: string; value: string }>;
+    },
     setSetting(key, value) {
       setSettingStmt.run(key, value);
+    },
+    setSettings(entries) {
+      setSettingsTransaction.immediate(entries);
     },
   };
 }

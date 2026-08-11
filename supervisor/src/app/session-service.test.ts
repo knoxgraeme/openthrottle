@@ -282,13 +282,14 @@ describe("pipeline admission", () => {
 
   function providerEvents() {
     return db!.prepare(`
-      SELECT provider, provider_event_id, kind, payload FROM provider_events
+      SELECT provider, provider_event_id, kind, payload, received_at FROM provider_events
       ORDER BY received_at, provider, provider_event_id
     `).all() as Array<{
       provider: string;
       provider_event_id: string;
       kind: string;
       payload: string;
+      received_at: string;
     }>;
   }
 
@@ -467,13 +468,16 @@ describe("pipeline admission", () => {
     };
     const invoke = async (
       overrides: Partial<Config> = {},
-      event = payload()
+      event = payload(),
+      receivedAt?: string
     ) => handleControlEvent(
       { ...config(), ...overrides },
       tickets,
       providers,
       linearControlEvent(event),
-      { catalog, runtime, store: pipelines }
+      { catalog, runtime, store: pipelines },
+      undefined,
+      receivedAt
     );
     await invoke(overrides, event);
     return {
@@ -481,12 +485,14 @@ describe("pipeline admission", () => {
       pipelines,
       githubFetch,
       invoke,
-      invokeControl: (controlEvent: ControlThreadEvent) => handleControlEvent(
+      invokeControl: (controlEvent: ControlThreadEvent, receivedAt?: string) => handleControlEvent(
         config(),
         tickets,
         providers,
         controlEvent,
-        { catalog, runtime, store: pipelines }
+        { catalog, runtime, store: pipelines },
+        undefined,
+        receivedAt
       ),
       setRepositoryConfig(value: string) {
         currentRepositoryConfig = value;
@@ -3056,6 +3062,26 @@ intents:
     expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(false);
   });
 
+  it("orders a delayed Linear reply by durable webhook ingress time", async () => {
+    const { pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
+    moveToProviderWait(pipelines, "c".repeat(40));
+    const receivedAt = "2026-01-01T00:00:03.000Z";
+
+    await invoke(
+      {},
+      promptedReply("please repair the delayed Linear note", "activity-delayed-linear"),
+      receivedAt
+    );
+
+    expect(providerEvents()).toEqual([
+      expect.objectContaining({
+        provider: "linear",
+        provider_event_id: "linear-reply:activity-delayed-linear",
+        received_at: receivedAt,
+      }),
+    ]);
+  });
+
   it("derives waiting-provider feedback identity and payload from the control provider", async () => {
     const { pipelines, invokeControl } = await run(repositoryConfigYaml("{ implement: implement }"));
     moveToProviderWait(pipelines, "c".repeat(40));
@@ -3089,6 +3115,38 @@ intents:
       kind: "github_reply",
       activity_id: "github-comment:81",
     });
+  });
+
+  it("orders a delayed GitHub Issue reply by durable webhook ingress time", async () => {
+    const { pipelines, invokeControl } = await run(repositoryConfigYaml("{ implement: implement }"));
+    moveToProviderWait(pipelines, "c".repeat(40));
+    const receivedAt = "2026-01-01T00:00:04.000Z";
+
+    await invokeControl({
+      provider: "github",
+      action: "prompted",
+      agentSession: {
+        id: "stale-provider-session",
+        thread: {
+          id: "issue-1",
+          identifier: "OT-1",
+          provider: "linear",
+          route: { key: "OT" },
+        },
+      },
+      activity: {
+        id: "github-comment:delayed-82",
+        content: { type: "text", body: "please repair the delayed GitHub note" },
+      },
+    }, receivedAt);
+
+    expect(providerEvents()).toEqual([
+      expect.objectContaining({
+        provider: "github",
+        provider_event_id: "github-reply:github-comment:delayed-82",
+        received_at: receivedAt,
+      }),
+    ]);
   });
 
   it("sanitizes and bounds waiting-provider Linear reply feedback", async () => {

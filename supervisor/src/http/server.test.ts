@@ -1479,6 +1479,7 @@ describe("coordinator-only server", () => {
       comment: {
         id: 101,
         body: "unauthorized steering body",
+        created_at: "2026-08-11T00:00:00Z",
         html_url: "https://github.com/owner/repo/issues/12#issuecomment-101",
         user: { login: "reader" },
       },
@@ -1521,6 +1522,7 @@ describe("coordinator-only server", () => {
       comment: {
         id: 102,
         body: "retry this authorized command later",
+        created_at: "2026-08-11T00:00:00Z",
         html_url: "https://github.com/owner/repo/issues/12#issuecomment-102",
         user: { login: "operator" },
       },
@@ -1746,6 +1748,7 @@ describe("coordinator-only server", () => {
         comment: {
           id: 103,
           body: "authorized command",
+          created_at: "2026-08-11T00:00:00Z",
           html_url: "https://github.com/owner/repo/issues/12#issuecomment-103",
           user: { login: "operator" },
         },

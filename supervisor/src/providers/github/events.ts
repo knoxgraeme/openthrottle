@@ -1,6 +1,7 @@
 // GitHub feedback is committed as typed provider evidence for the generation-
 // pinned pipeline. There is no automatic task-resume fallback.
 
+import { randomUUID } from "node:crypto";
 import type { Config } from "../../app/config.js";
 import type { SupervisorStore } from "../../persistence/store.js";
 import {
@@ -27,6 +28,7 @@ import type { PipelineStore } from "../../pipeline/store.js";
 import { processProviderEvidence } from "../../pipeline/gates.js";
 import { requestPipelineStop } from "../../pipeline/control.js";
 import {
+  acknowledgedPublicationHeadAt,
   pipelineIsTerminal,
   processPipelineFeedbackSnapshot,
   providerStageCanReceive,
@@ -47,7 +49,27 @@ type ProviderFinding = {
 const GITHUB_COMMENT_ORDERING_GUIDANCE =
   "OpenThrottle could not prove whether this same-second GitHub Issue comment followed the activation. " +
   "Please resend the comment after the activation is visible so it can be routed safely.";
+const GITHUB_PR_COMMENT_ORDERING_GUIDANCE =
+  "OpenThrottle could not prove which pull-request head this comment reviewed. " +
+  "The comment was retained as stale evidence instead of being applied to another revision; " +
+  "please resend it on the current PR head.";
 const GITHUB_HISTORICAL_ACTOR_PERMISSION_LOOKUP_LIMIT = 32;
+const GITHUB_HEAD_LIVE_RECONCILIATION_ATTEMPT_LIMIT = 3;
+
+type GithubHeadObservationProvenance =
+  | "provider_event"
+  | "provider_projection"
+  | "live_reconciliation";
+type GithubHeadObservation = {
+  headSha: string;
+  observedAt: string;
+  provenance: GithubHeadObservationProvenance;
+};
+
+type GithubHeadEvidenceKind = "head_transition" | "current_projection";
+type GithubHeadReconciliationStep =
+  | { kind: "done"; headSha: string }
+  | { kind: "retry"; projectionRevision: string };
 
 export function routePipelineProviderEvent(params: {
   pipelines: PipelineStore;
@@ -61,6 +83,7 @@ export function routePipelineProviderEvent(params: {
   payload: Record<string, unknown>;
   headSha: string | undefined;
   pullRequestUrl?: string;
+  receivedAt?: string;
 }): boolean {
   const instance = params.pipelines.getInstanceForSession(params.ticket.session_id);
   if (!instance) return false;
@@ -112,6 +135,7 @@ export function routePipelineProviderEvent(params: {
       payload: params.payload,
       headSha: params.headSha,
       pullRequestUrl: params.pullRequestUrl,
+      receivedAt: params.receivedAt,
     });
     if (canReceive) {
       processPipelineFeedbackSnapshot({
@@ -163,9 +187,299 @@ export function routePipelineProviderEvent(params: {
   return true;
 }
 
-function setAuthoritativeGithubHead(store: SupervisorStore, issueId: string, headSha: string): void {
-  store.setSetting(`github-head:${issueId}`, headSha);
-  store.setSetting(`github-head-source:${issueId}`, "authoritative");
+function setAuthoritativeGithubHead(
+  store: SupervisorStore,
+  issueId: string,
+  headSha: string,
+  providerObservedAt?: string,
+  mode: "monotonic" | "force" | "history_only" = "monotonic",
+  provenance: GithubHeadObservationProvenance = "provider_event"
+): boolean {
+  const headKey = `github-head:${issueId}`;
+  const sourceKey = `github-head-source:${issueId}`;
+  const observedAtKey = `github-head-observed-at:${issueId}`;
+  const provenanceKey = `github-head-observed-provenance:${issueId}`;
+  const generationKey = `github-head-projection-generation:${issueId}`;
+  const observedAt = providerObservedAt ?? new Date().toISOString();
+  const observedAtMs = Date.parse(observedAt);
+  if (Number.isNaN(observedAtMs)) return false;
+  const observationKey =
+    `github-head-observation:${issueId}:${observedAt}:${headSha}:${provenance}`;
+  const priorHead = store.getSetting(headKey);
+  const priorSource = store.getSetting(sourceKey);
+  const priorObservedAt = store.getSetting(observedAtKey);
+  const rawPriorProvenance = store.getSetting(provenanceKey);
+  const priorProvenance: GithubHeadObservationProvenance =
+    rawPriorProvenance === "live_reconciliation" || rawPriorProvenance === "provider_projection"
+      ? rawPriorProvenance
+      : "provider_event";
+  const priorObservedAtMs = priorObservedAt ? Date.parse(priorObservedAt) : Number.NaN;
+  let promote = mode === "force";
+  if (mode === "monotonic") {
+    promote = priorSource !== "authoritative" || !priorHead;
+    if (priorSource === "authoritative") {
+      if (priorHead === headSha) {
+        promote = Number.isNaN(priorObservedAtMs) ||
+          (priorProvenance !== "provider_event" && provenance === "provider_event");
+      } else if (!Number.isNaN(priorObservedAtMs)) {
+        promote = observedAtMs > priorObservedAtMs;
+      }
+    }
+  }
+  const entries = [{
+    key: observationKey,
+    value: JSON.stringify({ headSha, observedAt, provenance }),
+  }];
+  if (priorSource === "authoritative" && !Number.isNaN(priorObservedAtMs) &&
+      priorHead === headSha &&
+      !(priorProvenance !== "provider_event" && provenance === "provider_event")) {
+    // Keep the first durable observation of one head: later reviews/checks on
+    // the same revision must not erase when that revision became visible.
+    promote = false;
+  }
+  if (promote && mode !== "history_only") {
+    entries.push(
+      { key: observedAtKey, value: observedAt },
+      { key: provenanceKey, value: provenance },
+      { key: headKey, value: headSha },
+      { key: sourceKey, value: "authoritative" },
+      { key: generationKey, value: randomUUID() }
+    );
+  }
+  // The observation, four-field current projection, and opaque generation
+  // commit together, so restart and ABA races cannot hide a promotion.
+  store.setSettings(entries);
+  return priorHead === headSha || (promote && mode !== "history_only");
+}
+
+function currentGithubHeadObservation(
+  store: SupervisorStore,
+  issueId: string
+): GithubHeadObservation | undefined {
+  if (store.getSetting(`github-head-source:${issueId}`) !== "authoritative") return undefined;
+  const head = githubCommitSha(store.getSetting(`github-head:${issueId}`));
+  const headObservedAt = store.getSetting(`github-head-observed-at:${issueId}`);
+  const rawProvenance = store.getSetting(`github-head-observed-provenance:${issueId}`);
+  const provenance: GithubHeadObservationProvenance =
+    rawProvenance === "live_reconciliation" || rawProvenance === "provider_projection"
+      ? rawProvenance
+      : "provider_event";
+  const headObservedAtMs = headObservedAt ? Date.parse(headObservedAt) : Number.NaN;
+  return head && headObservedAt && !Number.isNaN(headObservedAtMs)
+    ? { headSha: head, observedAt: headObservedAt, provenance }
+    : undefined;
+}
+
+function providerTimestampedGithubHeads(
+  store: SupervisorStore,
+  issueId: string
+): GithubHeadObservation[] {
+  const observations = store.listSettings(`github-head-observation:${issueId}:`)
+    .flatMap(({ value }) => {
+      try {
+        const parsed = JSON.parse(value) as {
+          headSha?: unknown;
+          observedAt?: unknown;
+          provenance?: unknown;
+        };
+        const headSha = typeof parsed.headSha === "string"
+          ? githubCommitSha(parsed.headSha)
+          : undefined;
+        const observedAt = typeof parsed.observedAt === "string" ? parsed.observedAt : undefined;
+        const provenance: GithubHeadObservationProvenance =
+          parsed.provenance === "live_reconciliation" ||
+            parsed.provenance === "provider_projection"
+            ? parsed.provenance
+            : "provider_event";
+        return headSha && observedAt && !Number.isNaN(Date.parse(observedAt))
+          ? [{ headSha, observedAt, provenance }]
+          : [];
+      } catch {
+        return [];
+      }
+    });
+  const current = currentGithubHeadObservation(store, issueId);
+  if (current && !observations.some((observation) =>
+    observation.headSha === current.headSha && observation.observedAt === current.observedAt &&
+      observation.provenance === current.provenance
+  )) {
+    observations.push(current);
+  }
+  return observations.filter((observation) => observation.provenance === "provider_event");
+}
+
+function githubHeadProjectionRevision(store: SupervisorStore, issueId: string): string {
+  return JSON.stringify([
+    store.getSetting(`github-head:${issueId}`) ?? null,
+    store.getSetting(`github-head-source:${issueId}`) ?? null,
+    store.getSetting(`github-head-observed-at:${issueId}`) ?? null,
+    store.getSetting(`github-head-observed-provenance:${issueId}`) ?? null,
+    store.getSetting(`github-head-projection-generation:${issueId}`) ?? null,
+  ]);
+}
+
+function withGithubHeadProjectionLease<T>(
+  store: SupervisorStore,
+  issueId: string,
+  operation: () => T
+): T {
+  const owner = `github-head-reconciliation:${process.pid}:${randomUUID()}`;
+  const now = new Date();
+  const acquired = store.acquireSupervisorLease(
+    `github-head-reconciliation:${issueId}`,
+    owner,
+    now.toISOString(),
+    new Date(now.getTime() + 30_000).toISOString()
+  );
+  if (!acquired) throw new Error("GitHub head projection reconciliation is already in progress");
+  try {
+    return operation();
+  } finally {
+    store.releaseSupervisorLease(`github-head-reconciliation:${issueId}`, owner);
+  }
+}
+
+async function reconcileAuthoritativeGithubHead(params: {
+  cfg: Config;
+  store: SupervisorStore;
+  issueId: string;
+  repository: string;
+  pullNumber: number;
+  eventHeadSha: string;
+  providerObservedAt?: string;
+  evidenceKind: GithubHeadEvidenceKind;
+}): Promise<string> {
+  const priorHead = githubCommitSha(params.store.getSetting(`github-head:${params.issueId}`));
+  const priorSource = params.store.getSetting(`github-head-source:${params.issueId}`);
+  if (priorSource === "authoritative" && priorHead && priorHead !== params.eventHeadSha &&
+      params.cfg.githubReadToken) {
+    const priorObservation = currentGithubHeadObservation(params.store, params.issueId);
+    if (priorObservation) {
+      // Backfill legacy/current projections into the durable timeline before a
+      // promotion can replace them. This also preserves equal-time ambiguity.
+      setAuthoritativeGithubHead(
+        params.store,
+        params.issueId,
+        priorObservation.headSha,
+        priorObservation.observedAt,
+        "history_only",
+        priorObservation.provenance
+      );
+    }
+    if (params.evidenceKind === "head_transition") {
+      // Retain a signed head-transition timestamp even when its delivery
+      // arrived out of order. Generic PR/review updated_at values are not
+      // transition cursors and must never enter this temporal evidence set.
+      setAuthoritativeGithubHead(
+        params.store,
+        params.issueId,
+        params.eventHeadSha,
+        params.providerObservedAt,
+        "history_only"
+      );
+    }
+    let expectedProjectionRevision = githubHeadProjectionRevision(
+      params.store,
+      params.issueId
+    );
+    let retriedAfterConcurrentChange = false;
+    for (let attempt = 0; attempt < GITHUB_HEAD_LIVE_RECONCILIATION_ATTEMPT_LIMIT; attempt += 1) {
+      const liveHeadSha = githubCommitSha(await fetchGithubPullRequestHeadSha(
+        { token: params.cfg.githubReadToken },
+        params.repository,
+        params.pullNumber
+      ));
+      if (!liveHeadSha) throw new Error("GitHub pull request returned an invalid current head");
+      const step: GithubHeadReconciliationStep = withGithubHeadProjectionLease(
+        params.store,
+        params.issueId,
+        () => {
+          const currentProjectionRevision = githubHeadProjectionRevision(
+            params.store,
+            params.issueId
+          );
+          if (currentProjectionRevision !== expectedProjectionRevision) {
+            // The provider read began against an older projection. Refetch
+            // against the newly committed revision instead of deciding that
+            // either the response or the concurrent projection is newer.
+            return {
+              kind: "retry",
+              projectionRevision: currentProjectionRevision,
+            };
+          }
+          const currentHead = githubCommitSha(
+            params.store.getSetting(`github-head:${params.issueId}`)
+          );
+          const currentSource = params.store.getSetting(`github-head-source:${params.issueId}`);
+          if (currentSource === "authoritative" && liveHeadSha === currentHead) {
+            // The live resource confirms the current projection. Do not replace
+            // its earlier provenance with a generic or handler-time observation.
+            return { kind: "done", headSha: liveHeadSha };
+          }
+          if (!retriedAfterConcurrentChange && liveHeadSha === params.eventHeadSha) {
+            const transitionEvidence = params.evidenceKind === "head_transition";
+            setAuthoritativeGithubHead(
+              params.store,
+              params.issueId,
+              liveHeadSha,
+              params.providerObservedAt ?? new Date().toISOString(),
+              "force",
+              transitionEvidence ? "provider_event" : "provider_projection"
+            );
+          } else {
+            // A live resource read proves only handler-time state. After a
+            // concurrent projection change, even a head matching this event is
+            // causally a fresh read rather than evidence from the old snapshot.
+            setAuthoritativeGithubHead(
+              params.store,
+              params.issueId,
+              liveHeadSha,
+              new Date().toISOString(),
+              "force",
+              "live_reconciliation"
+            );
+          }
+          return { kind: "done", headSha: liveHeadSha };
+        }
+      );
+      if (step.kind === "done") return step.headSha;
+      if (attempt === GITHUB_HEAD_LIVE_RECONCILIATION_ATTEMPT_LIMIT - 1) {
+        throw new Error("GitHub head projection changed repeatedly during live reconciliation");
+      }
+      expectedProjectionRevision = step.projectionRevision;
+      retriedAfterConcurrentChange = true;
+    }
+    throw new Error("GitHub head live reconciliation attempt limit exhausted");
+  }
+  return withGithubHeadProjectionLease(params.store, params.issueId, () => {
+    const currentHead = githubCommitSha(
+      params.store.getSetting(`github-head:${params.issueId}`)
+    );
+    const currentSource = params.store.getSetting(`github-head-source:${params.issueId}`);
+    if (currentSource === "authoritative" && currentHead === params.eventHeadSha) {
+      if (params.evidenceKind === "head_transition") {
+        setAuthoritativeGithubHead(
+          params.store,
+          params.issueId,
+          params.eventHeadSha,
+          params.providerObservedAt,
+          "monotonic",
+          "provider_event"
+        );
+      }
+      return currentHead;
+    }
+    setAuthoritativeGithubHead(
+      params.store,
+      params.issueId,
+      params.eventHeadSha,
+      params.providerObservedAt ?? new Date().toISOString(),
+      "monotonic",
+      params.evidenceKind === "head_transition" ? "provider_event" : "provider_projection"
+    );
+    return githubCommitSha(params.store.getSetting(`github-head:${params.issueId}`)) ??
+      params.eventHeadSha;
+  });
 }
 
 function githubPullEventId(
@@ -437,6 +751,7 @@ export function considerCiGithubHead(
 ): void {
   const headKey = `github-head:${issueId}`;
   const sourceKey = `github-head-source:${issueId}`;
+  const generationKey = `github-head-projection-generation:${issueId}`;
   const watermarkKey = `github-head-watermark:${issueId}:${source}`;
   const currentHead = store.getSetting(headKey);
   const rawSource = store.getSetting(sourceKey);
@@ -449,9 +764,12 @@ export function considerCiGithubHead(
     currentHead === headSha ||
     rawSource !== "authoritative";
   if (!canAdvance) return;
-  store.setSetting(watermarkKey, String(sequence));
-  store.setSetting(headKey, headSha);
-  store.setSetting(sourceKey, JSON.stringify({ source, sequence }));
+  store.setSettings([
+    { key: watermarkKey, value: String(sequence) },
+    { key: headKey, value: headSha },
+    { key: sourceKey, value: JSON.stringify({ source, sequence }) },
+    { key: generationKey, value: randomUUID() },
+  ]);
 }
 
 // Known Linear↔GitHub bridge identities whose PR comments are linkage
@@ -471,6 +789,7 @@ const CODEX_CLEAN_REVIEW_PATTERN =
   /^Codex Review: Didn't find any major issues\. [^\n]{1,120}\n\n\*\*Reviewed commit:\*\* `([a-f0-9]{7,40})`\n\n<details> <summary>ℹ️ About Codex in GitHub<\/summary>\n<br\/>\n\n\[Your team has set up Codex to review pull requests in this repo\]\(https:\/\/chatgpt\.com\/codex\/cloud\/settings\/general\)\. Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment "@codex review"\.\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍\.\s+Codex can also answer questions or update the PR\. Try commenting "@codex address that feedback"\.\s*<\/details>$/i;
 const CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE =
   "To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).";
+const GITHUB_COMMIT_SHA = /^[a-f0-9]{40}$/;
 const REVIEWED_COMMIT = /^[a-f0-9]{7,40}$/;
 
 function isGithubBotLinkback(author: string, body: string | undefined): boolean {
@@ -519,6 +838,11 @@ function reviewedCommitFromCodexCleanReview(body: string | undefined): string | 
   const match = CODEX_CLEAN_REVIEW_PATTERN.exec(normalized);
   const commit = match?.[1]?.toLowerCase();
   return commit && REVIEWED_COMMIT.test(commit) ? commit : undefined;
+}
+
+function githubCommitSha(value: string | undefined): string | undefined {
+  const normalized = value?.toLowerCase();
+  return normalized && GITHUB_COMMIT_SHA.test(normalized) ? normalized : undefined;
 }
 
 function isTrustedCodexConnectorAuthor(input: {
@@ -626,6 +950,7 @@ export async function handleGithubEvent(
     coordinator: PipelineCoordinatorContext;
     preflight?: AdmissionPreflight;
     deliveryId?: string;
+    receivedAt?: string;
   }
 ): Promise<void> {
   if (event.kind === "pull_request") {
@@ -639,7 +964,18 @@ export async function handleGithubEvent(
     if (event.action === "opened" || event.action === "reopened" || event.action === "synchronize") {
       store.setPrUrl(ticket.ticket_id, event.pull_request.html_url);
       if (event.pull_request.head.sha) {
-        setAuthoritativeGithubHead(store, ticket.ticket_id, event.pull_request.head.sha);
+        await reconcileAuthoritativeGithubHead({
+          cfg: _cfg,
+          store,
+          issueId: ticket.ticket_id,
+          repository: event.repository.full_name,
+          pullNumber: event.pull_request.number,
+          eventHeadSha: event.pull_request.head.sha,
+          providerObservedAt: event.pull_request.updated_at,
+          evidenceKind: event.action === "opened" || event.action === "synchronize"
+            ? "head_transition"
+            : "current_projection",
+        });
       }
     }
     if (event.action === "synchronize" && event.pull_request.head.sha) {
@@ -659,6 +995,7 @@ export async function handleGithubEvent(
         payload: { kind: "pull_request", action: "synchronize" },
         headSha: event.pull_request.head.sha,
         pullRequestUrl: event.pull_request.html_url,
+        receivedAt: control?.receivedAt,
       });
     }
     if (event.action === "closed") {
@@ -669,7 +1006,16 @@ export async function handleGithubEvent(
         event.pull_request.head.sha ?? "unknown"
       );
       if (event.pull_request.head.sha) {
-        setAuthoritativeGithubHead(store, ticket.ticket_id, event.pull_request.head.sha);
+        await reconcileAuthoritativeGithubHead({
+          cfg: _cfg,
+          store,
+          issueId: ticket.ticket_id,
+          repository: event.repository.full_name,
+          pullNumber: event.pull_request.number,
+          eventHeadSha: event.pull_request.head.sha,
+          providerObservedAt: event.pull_request.updated_at,
+          evidenceKind: "current_projection",
+        });
       }
       store.setPrUrl(ticket.ticket_id, event.pull_request.html_url);
       const routedPipeline = routePipelineProviderEvent({
@@ -683,6 +1029,7 @@ export async function handleGithubEvent(
         payload: { kind: "pull_request", action: "closed", merged: event.pull_request.merged },
         headSha: event.pull_request.head.sha ?? store.getSetting(`github-head:${ticket.ticket_id}`),
         pullRequestUrl: event.pull_request.html_url,
+        receivedAt: control?.receivedAt,
       });
       const currentPipeline = routedPipeline
         ? pipelines.getInstanceForSession(ticket.session_id)
@@ -735,6 +1082,19 @@ export async function handleGithubEvent(
   if (event.kind === "pull_request_review") {
     const ticket = store.getByBranch(event.repository.full_name, event.pull_request.head.ref);
     if (!ticket || event.action !== "submitted") return;
+    const prHeadSha = githubCommitSha(event.pull_request.head.sha);
+    if (prHeadSha) {
+      await reconcileAuthoritativeGithubHead({
+        cfg: _cfg,
+        store,
+        issueId: ticket.ticket_id,
+        repository: event.repository.full_name,
+        pullNumber: event.pull_request.number,
+        eventHeadSha: prHeadSha,
+        providerObservedAt: event.pull_request.updated_at,
+        evidenceKind: "current_projection",
+      });
+    }
     await activityPublisher.publishActivity({
       sessionId: ticket.session_id,
       type: "action",
@@ -749,13 +1109,19 @@ export async function handleGithubEvent(
     // supervisor never authors pull-request reviews, so no machine-output
     // filtering applies here — every attested review is human.
     if (!author) return;
-    const headSha = event.pull_request.head.sha ??
+    const reviewedHeadSha = githubCommitSha(event.review.commit_id);
+    const headSha = reviewedHeadSha ??
+      prHeadSha ??
       store.getSetting(`github-head:${ticket.ticket_id}`) ??
       `unknown:${event.pull_request.head.ref}`;
-    if (event.pull_request.head.sha) {
-      setAuthoritativeGithubHead(store, ticket.ticket_id, headSha);
-    } else if (!store.getSetting(`github-head:${ticket.ticket_id}`)) {
-      store.setSetting(`github-head:${ticket.ticket_id}`, headSha);
+    if (!prHeadSha && !store.getSetting(`github-head:${ticket.ticket_id}`)) {
+      store.setSettings([
+        { key: `github-head:${ticket.ticket_id}`, value: headSha },
+        {
+          key: `github-head-projection-generation:${ticket.ticket_id}`,
+          value: randomUUID(),
+        },
+      ]);
     }
     const reviewBody = event.review.body?.trim() ?? "";
     const pullRequestAuthor = event.pull_request.user?.login;
@@ -791,6 +1157,7 @@ export async function handleGithubEvent(
       payload: { kind: "pull_request_review", state: event.review.state, head_sha: headSha },
       headSha,
       pullRequestUrl: event.pull_request.html_url,
+      receivedAt: control?.receivedAt,
     });
     return;
   }
@@ -964,7 +1331,8 @@ export async function handleGithubEvent(
         control.ports,
         githubIssueControlEvent(event),
         control.coordinator,
-        control.preflight
+        control.preflight,
+        control.receivedAt
       );
       await control.coordinator.drainEffects?.();
       return;
@@ -982,8 +1350,41 @@ export async function handleGithubEvent(
     // the machine's own output. Body markup never establishes that provenance;
     // this separate check recognizes only explicit Linear bridge artifacts.
     if (isGithubBotLinkback(author, event.comment.body)) return;
-    const headSha = store.getSetting(`github-head:${ticket.ticket_id}`) ??
-      `unknown:${ticket.branch}`;
+    const instance = pipelines.getInstanceForSession(ticket.session_id);
+    const currentHeadObservation = currentGithubHeadObservation(store, ticket.ticket_id);
+    const providerObservations = providerTimestampedGithubHeads(store, ticket.ticket_id);
+    const commentAtMs = event.comment.created_at
+      ? Date.parse(event.comment.created_at)
+      : Number.NaN;
+    const observationsBeforeComment = Number.isNaN(commentAtMs)
+      ? []
+      : providerObservations
+        .filter((observation) => Date.parse(observation.observedAt) < commentAtMs)
+        .sort((left, right) => Date.parse(left.observedAt) - Date.parse(right.observedAt));
+    const latestObservationBeforeComment = observationsBeforeComment.at(-1);
+    const latestProviderObservationAtMs = latestObservationBeforeComment
+      ? Date.parse(latestObservationBeforeComment.observedAt)
+      : undefined;
+    const providerTimestampAmbiguous = latestProviderObservationAtMs !== undefined &&
+      new Set(observationsBeforeComment
+        .filter((observation) =>
+          Date.parse(observation.observedAt) === latestProviderObservationAtMs
+        )
+        .map((observation) => observation.headSha)).size > 1;
+    const observedTransitionBeforeComment = latestObservationBeforeComment !== undefined &&
+      observationsBeforeComment.some((observation) =>
+        observation.headSha !== latestObservationBeforeComment.headSha
+      );
+    const inferredHeadSha = instance && !pipelineIsTerminal(instance)
+      ? acknowledgedPublicationHeadAt(
+        pipelines,
+        instance,
+        event.comment.created_at,
+        providerObservations
+      )
+      : undefined;
+    let headSha = inferredHeadSha ?? `unknown:${ticket.branch}`;
+    let headOrderingAmbiguous = inferredHeadSha === undefined && providerTimestampAmbiguous;
     if (isExactCodexReviewCommand(event.comment.body)) {
       recordIgnoredGithubProviderNoise({
         pipelines,
@@ -1038,8 +1439,68 @@ export async function handleGithubEvent(
             head_sha: liveHeadSha,
           },
           headSha: liveHeadSha,
+          receivedAt: control?.receivedAt,
         });
         return;
+      }
+    }
+    if (instance && !pipelineIsTerminal(instance) && inferredHeadSha && _cfg.githubReadToken) {
+      const liveHeadSha = githubCommitSha(await fetchGithubPullRequestHeadSha(
+        { token: _cfg.githubReadToken },
+        event.repository.full_name,
+        event.issue.number
+      ));
+      if (!liveHeadSha) {
+        throw new Error("GitHub pull request returned an invalid current head");
+      }
+      if (liveHeadSha !== inferredHeadSha) {
+        const providerObservedAtMs = currentHeadObservation
+          ? Date.parse(currentHeadObservation.observedAt)
+          : Number.NaN;
+        if (currentHeadObservation?.provenance === "provider_event" &&
+            currentHeadObservation.headSha === liveHeadSha &&
+            !Number.isNaN(commentAtMs) && !Number.isNaN(providerObservedAtMs)) {
+          if (providerObservedAtMs < commentAtMs) {
+            // A provider-authoritative observation proves the live head was
+            // already visible before this comment. Prefer it over a delayed
+            // older publication receipt whose local creation time is newer.
+            headSha = liveHeadSha;
+          } else if (providerObservedAtMs > commentAtMs &&
+              latestObservationBeforeComment?.headSha === inferredHeadSha &&
+              observedTransitionBeforeComment) {
+            // A delayed synchronize/review can arrive after the successor but
+            // still append its provider timestamp. A recorded A -> B transition
+            // before this comment and C after it binds the comment to B without
+            // ever promoting B back to the mutable current projection.
+            headSha = inferredHeadSha;
+          } else {
+            // A later (or same-instant) current-head observation does not prove
+            // the inferred predecessor was still current when the comment was
+            // created: an intermediate push may have arrived out of order.
+            // Persist visible stale evidence instead of retrying to dead-letter
+            // or silently carrying the comment onto the live head.
+            headSha = `unknown:${ticket.branch}`;
+            headOrderingAmbiguous = true;
+          }
+        } else {
+          const projectedHead = githubCommitSha(
+            store.getSetting(`github-head:${ticket.ticket_id}`)
+          );
+          const projectedSource = store.getSetting(`github-head-source:${ticket.ticket_id}`);
+          if (projectedSource === "authoritative" && projectedHead === liveHeadSha) {
+            // Legacy state may know the live head without a usable timestamp.
+            // Its temporal subject is unprovable, but retrying cannot create
+            // that missing history, so settle it visibly as ambiguous.
+            headSha = `unknown:${ticket.branch}`;
+            headOrderingAmbiguous = true;
+          } else {
+            // A push may be visible through the live PR API before either its
+            // synchronize delivery or immutable publish receipt. Persisting the
+            // older inferred head would permanently misclassify fresh feedback;
+            // leave the webhook retryable until provider ordering is durable.
+            throw new Error("GitHub pull-request head transition is not durable yet");
+          }
+        }
       }
     }
     await activityPublisher.publishActivity({
@@ -1055,10 +1516,17 @@ export async function handleGithubEvent(
       ticket,
       eventId: `github-comment:${event.comment.id}`,
       outcome: "semantic_repair_required",
-      summary: `GitHub comment from ${author} requires another implementation pass.`,
+      summary: headOrderingAmbiguous
+        ? GITHUB_PR_COMMENT_ORDERING_GUIDANCE
+        : `GitHub comment from ${author} requires another implementation pass.`,
       evidence: [event.comment.html_url],
-      payload: { kind: "issue_comment", head_sha: headSha },
+      payload: {
+        kind: "issue_comment",
+        head_sha: headSha,
+        ...(headOrderingAmbiguous ? { classification: "head_ordering_ambiguous" } : {}),
+      },
       headSha,
+      receivedAt: control?.receivedAt,
     });
     return;
   }
@@ -1263,7 +1731,8 @@ export async function handleGithubEvent(
           : {}),
       }),
       control.coordinator,
-      finalIssuePreflight
+      finalIssuePreflight,
+      control.receivedAt
     );
     await control.coordinator.drainEffects?.();
     return;
@@ -1351,6 +1820,7 @@ export async function handleGithubEvent(
         ...(enrichment.note === null ? {} : { enrichment_note: enrichment.note }),
       },
       headSha: ci.headSha,
+      receivedAt: control?.receivedAt,
     });
   }
 }

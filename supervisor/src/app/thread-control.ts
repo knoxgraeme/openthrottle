@@ -29,7 +29,8 @@ export async function handlePrompted(
   store: SupervisorStore,
   providers: SessionServicePorts,
   payload: ControlThreadEvent,
-  coordinator: PipelineCoordinatorContext
+  coordinator: PipelineCoordinatorContext,
+  receivedAt?: string
 ): Promise<void> {
   const sessionId = payload.agentSession.id;
   const issue = payload.agentSession.thread;
@@ -154,6 +155,7 @@ export async function handlePrompted(
           body: sanitizedReply,
         },
         headSha: pipelineInstance.published_commit,
+        receivedAt,
       });
       processPipelineFeedbackSnapshot({
         pipelines: coordinator.store,
