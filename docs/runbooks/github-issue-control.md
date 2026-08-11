@@ -174,9 +174,12 @@ state.
 ## Fail-safe stop
 
 Prefer closing the GitHub Issue when the desired operator action is "stop this
-Issue-controlled generation." Use the authenticated stop command when the Issue
-cannot be used, the run is wedged, or the operator needs a provider-neutral
-stop:
+Issue-controlled generation." Closing schedules asynchronous stop work; it does
+not itself prove that the runtime has terminated. After closing the Issue, run
+the authenticated stop command below until it returns `200 stopped` and prints
+`Stopped ...` before restoring the repository registration. Use the same command
+when the Issue cannot be used, the run is wedged, or the operator needs a
+provider-neutral stop:
 
 ```bash
 npx openthrottle stop "<ticket-id-from-status>"
