@@ -1868,6 +1868,295 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
+  it("ignores only the exact Codex review trigger command before repair admission", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+
+    const comment = (id: number, body: string) => handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id,
+          body,
+          html_url: `https://github.com/owner/repo/pull/1#issuecomment-${id}`,
+          user: { login: "knoxgraeme" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    await comment(501, "@codex review");
+
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+    expect(fixture.db.prepare("SELECT outcome FROM orchestration_journal WHERE outcome = ?").get("exact_codex_review_command"))
+      .toEqual({ outcome: "exact_codex_review_command" });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
+
+    await comment(502, "@codex review\nPlease also check the retry loop.");
+
+    expect(activityPublisher.publishActivity).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      type: "action",
+      action: "PR comment",
+      parameter: "knoxgraeme",
+      result: "https://github.com/owner/repo/pull/1#issuecomment-502",
+    }, "issue-1");
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(1);
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
+  it("ignores empty PR-author reviews only when every attached comment is a reply", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/1/reviews/601/comments?per_page=100")) {
+        return Response.json([{ id: 71, in_reply_to_id: 11 }]);
+      }
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    }) as unknown as typeof fetch;
+    vi.stubGlobal("fetch", fetchMock);
+
+    await handleGithubEvent(
+      { githubReadToken: "github-read-token" } as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+          user: { login: "knoxgraeme" },
+        },
+        review: {
+          id: 601,
+          state: "commented",
+          body: "",
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-601",
+          user: { login: "knoxgraeme" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+    expect(fixture.db.prepare("SELECT outcome FROM orchestration_journal WHERE outcome = ?").get("author_empty_reply_only_review"))
+      .toEqual({ outcome: "author_empty_reply_only_review" });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
+  });
+
+  it.each([
+    {
+      label: "an author-created top-level inline finding",
+      review: { id: 602, state: "commented", body: "" },
+      comments: [{ id: 72 }],
+      author: "knoxgraeme",
+      pullAuthor: "knoxgraeme",
+    },
+    {
+      label: "an author-created top-level inline finding on a later bounded page",
+      review: { id: 605, state: "commented", body: "" },
+      comments: [
+        ...Array.from({ length: 100 }, (_, index) => ({ id: 800 + index, in_reply_to_id: 700 + index })),
+        { id: 901 },
+      ],
+      author: "knoxgraeme",
+      pullAuthor: "knoxgraeme",
+    },
+    {
+      label: "a non-empty author review",
+      review: { id: 603, state: "commented", body: "The provider event needs a structural guard." },
+      comments: undefined,
+      author: "knoxgraeme",
+      pullAuthor: "knoxgraeme",
+    },
+    {
+      label: "reply-only feedback from another identity",
+      review: { id: 604, state: "commented", body: "" },
+      comments: undefined,
+      author: "reviewer",
+      pullAuthor: "knoxgraeme",
+    },
+  ])("admits $label as review feedback", async ({ review, comments, author, pullAuthor }) => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+    if (comments) {
+      vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith(`/pulls/1/reviews/${review.id}/comments?per_page=100`)) {
+          return Response.json(comments.slice(0, 100));
+        }
+        if (url.endsWith(`/pulls/1/reviews/${review.id}/comments?per_page=100&page=2`)) {
+          return Response.json(comments.slice(100));
+        }
+        throw new Error(`Unexpected GitHub request: ${url}`);
+      }) as unknown as typeof fetch);
+    }
+
+    await handleGithubEvent(
+      { githubReadToken: "github-read-token" } as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+          user: { login: pullAuthor },
+        },
+        review: {
+          ...review,
+          html_url: `https://github.com/owner/repo/pull/1#pullrequestreview-${review.id}`,
+          user: { login: author },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(1);
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
+  it("routes exact trusted Codex clean review completion as successful current-head evidence", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+    const body = `Codex Review: Didn't find any major issues\n\nReviewed commit: ${PUBLISHED_COMMIT.slice(0, 10)}`;
+    const cleanReview = (id: number) => handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id,
+          body,
+          html_url: `https://github.com/owner/repo/pull/1#issuecomment-${id}`,
+          user: { login: "codex[bot]", type: "Bot" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    await cleanReview(701);
+    await cleanReview(701);
+
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "shipped",
+    });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toBeUndefined();
+  });
+
+  it.each([
+    {
+      label: "near-match clean review text",
+      body: `Codex Review: Didn't find any major issues\n\nReviewed commit: ${PUBLISHED_COMMIT.slice(0, 10)}\n\nPlease fix naming.`,
+      user: { login: "codex[bot]", type: "Bot" },
+    },
+    {
+      label: "untrusted author copying clean review text",
+      body: `Codex Review: Didn't find any major issues\n\nReviewed commit: ${PUBLISHED_COMMIT.slice(0, 10)}`,
+      user: { login: "reviewer", type: "User" },
+    },
+    {
+      label: "mismatched reviewed commit",
+      body: `Codex Review: Didn't find any major issues\n\nReviewed commit: ${"f".repeat(10)}`,
+      user: { login: "codex[bot]", type: "Bot" },
+    },
+  ])("admits $label as substantive PR comment feedback", async ({ body, user }) => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 702,
+          body,
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-702",
+          user,
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(activityPublisher.publishActivity).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      type: "action",
+      action: "PR comment",
+      parameter: user.login,
+      result: "https://github.com/owner/repo/pull/1#issuecomment-702",
+    }, "issue-1");
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(1);
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
   it("ignores a bridge linkback comment self-identified by the linear-linkback marker", async () => {
     const fixture = setup("core/implement@4");
     const activityPublisher = {

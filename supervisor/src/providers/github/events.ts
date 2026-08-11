@@ -9,6 +9,7 @@ import {
   getFailingGithubCheckDetails,
   fetchGithubIssueContext,
   fetchGithubIssueControlEvents,
+  fetchGithubPullRequestReviewComments,
   fetchGithubIssueLifecycle,
   getRepositoryCollaboratorPermission,
   githubIssueHasExactControlLabel,
@@ -463,12 +464,70 @@ const LINEAR_BRIDGE_BOT_LOGINS = new Set(["linear-code[bot]", "linear[bot]"]);
 // (e.g. an app comment that merely says "linear issue" in prose) before it is
 // recorded as provider evidence.
 const LINEAR_LINKBACK_MARKER = "<!-- linear-linkback -->";
+const CODEX_REVIEW_COMMAND = "@codex review";
+const CODEX_CLEAN_REVIEW_AUTHOR = "codex[bot]";
+const CODEX_CLEAN_REVIEW_PATTERN =
+  /^Codex Review: Didn't find any major issues\n\nReviewed commit: `?([a-f0-9]{7,40})`?$/i;
+const REVIEWED_COMMIT = /^[a-f0-9]{7,40}$/;
 
 function isGithubBotLinkback(author: string, body: string | undefined): boolean {
   const normalizedAuthor = author.toLowerCase();
   if (LINEAR_BRIDGE_BOT_LOGINS.has(normalizedAuthor)) return true;
   if (!normalizedAuthor.endsWith("[bot]")) return false;
   return (body ?? "").startsWith(LINEAR_LINKBACK_MARKER);
+}
+
+function recordIgnoredGithubProviderNoise(params: {
+  pipelines: PipelineStore;
+  ticket: NonNullable<ReturnType<SupervisorStore["getByIssueId"]>>;
+  eventId: string;
+  eventKind: string;
+  reason: string;
+  headSha?: string;
+}): void {
+  const instance = params.pipelines.getInstanceForSession(params.ticket.session_id);
+  if (!instance || pipelineIsTerminal(instance)) return;
+  params.pipelines.recordJournalEntry({
+    id: `github-provider-noise:${params.eventId}`,
+    issueId: params.ticket.ticket_id,
+    instanceId: instance.id,
+    actor: "supervisor",
+    kind: "run_note",
+    trigger: "GitHub provider feedback normalization",
+    action: "Ignored non-actionable GitHub provider event before repair admission.",
+    outcome: params.reason,
+    refs: {
+      provider: "github",
+      event_kind: params.eventKind,
+      provider_event_id: params.eventId,
+      reason: params.reason,
+      ...(params.headSha ? { head_sha: params.headSha } : {}),
+    },
+  });
+}
+
+function isExactCodexReviewCommand(body: string | undefined): boolean {
+  return body?.trim() === CODEX_REVIEW_COMMAND;
+}
+
+function reviewedCommitFromCodexCleanReview(body: string | undefined): string | undefined {
+  if (!body) return undefined;
+  const normalized = body.replaceAll("\r\n", "\n").trim();
+  const match = CODEX_CLEAN_REVIEW_PATTERN.exec(normalized);
+  const commit = match?.[1]?.toLowerCase();
+  return commit && REVIEWED_COMMIT.test(commit) ? commit : undefined;
+}
+
+function codexCleanReviewMatchesCurrentHead(input: {
+  author: string;
+  authorType?: string;
+  body: string | undefined;
+  headSha: string;
+}): boolean {
+  if (input.author.toLowerCase() !== CODEX_CLEAN_REVIEW_AUTHOR ||
+      input.authorType !== "Bot") return false;
+  const reviewedCommit = reviewedCommitFromCodexCleanReview(input.body);
+  return reviewedCommit !== undefined && input.headSha.startsWith(reviewedCommit);
 }
 
 function boundedSanitized(value: string, maxChars: number): string {
@@ -681,6 +740,29 @@ export async function handleGithubEvent(
     } else if (!store.getSetting(`github-head:${ticket.ticket_id}`)) {
       store.setSetting(`github-head:${ticket.ticket_id}`, headSha);
     }
+    const reviewBody = event.review.body?.trim() ?? "";
+    const pullRequestAuthor = event.pull_request.user?.login;
+    if (reviewState === "commented" && reviewBody.length === 0 &&
+        pullRequestAuthor &&
+        pullRequestAuthor.toLowerCase() === author.toLowerCase()) {
+      const comments = await fetchGithubPullRequestReviewComments(
+        { token: _cfg.githubReadToken },
+        event.repository.full_name,
+        event.pull_request.number,
+        event.review.id
+      );
+      if (comments && comments.length > 0 && comments.every((comment) => comment.inReplyToId !== undefined)) {
+        recordIgnoredGithubProviderNoise({
+          pipelines,
+          ticket,
+          eventId: `github-review:${event.review.id}`,
+          eventKind: "pull_request_review",
+          reason: "author_empty_reply_only_review",
+          headSha,
+        });
+        return;
+      }
+    }
     routePipelineProviderEvent({
       pipelines,
       store,
@@ -882,6 +964,42 @@ export async function handleGithubEvent(
     // the machine's own output. Body markup never establishes that provenance;
     // this separate check recognizes only explicit Linear bridge artifacts.
     if (isGithubBotLinkback(author, event.comment.body)) return;
+    const headSha = store.getSetting(`github-head:${ticket.ticket_id}`) ??
+      `unknown:${ticket.branch}`;
+    if (isExactCodexReviewCommand(event.comment.body)) {
+      recordIgnoredGithubProviderNoise({
+        pipelines,
+        ticket,
+        eventId: `github-comment:${event.comment.id}`,
+        eventKind: "issue_comment",
+        reason: "exact_codex_review_command",
+        headSha,
+      });
+      return;
+    }
+    if (codexCleanReviewMatchesCurrentHead({
+      author,
+      authorType: event.comment.user?.type,
+      body: event.comment.body,
+      headSha,
+    })) {
+      routePipelineProviderEvent({
+        pipelines,
+        store,
+        ticket,
+        eventId: `github-comment:${event.comment.id}`,
+        outcome: "success",
+        summary: "Trusted Codex review completed for the current head with no findings.",
+        evidence: [event.comment.html_url],
+        payload: {
+          kind: "issue_comment",
+          classification: "codex_clean_review_completion",
+          head_sha: headSha,
+        },
+        headSha,
+      });
+      return;
+    }
     await activityPublisher.publishActivity({
       sessionId: ticket.session_id,
       type: "action",
@@ -889,8 +1007,6 @@ export async function handleGithubEvent(
       parameter: author,
       result: event.comment.html_url,
     }, ticket.ticket_id);
-    const headSha = store.getSetting(`github-head:${ticket.ticket_id}`) ??
-      `unknown:${ticket.branch}`;
     routePipelineProviderEvent({
       pipelines,
       store,
