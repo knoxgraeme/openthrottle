@@ -2026,6 +2026,16 @@ export function executeLoopAction({
     let correctionDiagnostics = [];
     let recoveryReference = null;
     let recoveryArtifact = null;
+    if (subjectError && !execution.timedOut && !execution.signal && execution.status === 0 &&
+        !isUnregisteredCommandResult(execution.stdout)) {
+      // A clean engine exit can still leave completed work that the canonical
+      // staging boundary cannot attest (for example, its bounded untracked
+      // path inventory overflowed). Attempt portable recovery; if the same
+      // staging fault prevents that too, privateRecoveryArtifact explicitly
+      // requires workspace preservation instead of permitting cleanup.
+      recoveryArtifact = privateRecoveryArtifact(request, loopWorktreeDirectory(request), subject, sanitizeEnv);
+      recoveryReference = privateRecoveryReference(recoveryArtifact);
+    }
     if (persistedCorrectionState) {
       receiptError = persistedCorrectionState.original_error;
       correctionDiagnostics = persistedCorrectionState.diagnostics;

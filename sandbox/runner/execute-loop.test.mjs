@@ -4449,6 +4449,79 @@ describe("executeLoopAction", () => {
     });
   });
 
+  it("preserves completed work when canonical subject staging cannot produce evidence", () => {
+    const valid = request();
+    const worktreeDir = loopWorktreeDirectory(valid);
+    const receipt = standardReceipt(valid);
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn().mockImplementationOnce(() => {
+        writeFileSync(join(worktreeDir, "completed-but-unattested.txt"), "preserve me\n");
+        // Exercise the same post-execution path as the bounded untracked-path
+        // inventory failure: canonical subject staging and recovery staging
+        // both fail before they can prove a portable candidate.
+        execFileSync("git", ["config", "core.sparseCheckout", "true"], { cwd: worktreeDir });
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: JSON.stringify(receipt),
+          stderr: "",
+          nativeSessionId: "native-unattested",
+          integrationRepoDir: "/tmp/integration-current",
+        };
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(result.receipt).toMatch(/workspace subject attestation failed/);
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+      error: expect.stringContaining("full non-sparse checkout"),
+    });
+    expect(readFileSync(join(worktreeDir, "completed-but-unattested.txt"), "utf8")).toBe("preserve me\n");
+  });
+
+  it("keeps an unregistered-command launch retryable when subject staging also fails", () => {
+    const valid = request({ agent: "claude" });
+    const worktreeDir = loopWorktreeDirectory(valid);
+    const unregisteredCommand = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Unknown command: /implement-unit",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn().mockImplementationOnce(() => {
+        execFileSync("git", ["config", "core.sparseCheckout", "true"], { cwd: worktreeDir });
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: `${JSON.stringify({ type: "system", subtype: "init" })}\n${unregisteredCommand}`,
+          stderr: "",
+          nativeSessionId: null,
+          integrationRepoDir: "/tmp/integration-current",
+        };
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(result.receipt).toContain("reason=unregistered_command");
+    expect(result).not.toHaveProperty("recovery_artifact");
+  });
+
   it.each([
     ["worker worktree lock", "lockWorkerWorktree"],
     ["action directory lock", "lockActionDirectory"],
