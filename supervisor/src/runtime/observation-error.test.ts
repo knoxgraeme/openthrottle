@@ -35,6 +35,25 @@ describe("serializeRuntimeObservationError", () => {
     expect(result.text).toContain("status=404");
   });
 
+  it("inspects status fields attached to Error instances", () => {
+    const statusCodeError = Object.assign(new Error("request failed"), { statusCode: 502 });
+    const responseStatusError = Object.assign(new Error("request failed"), { response: { status: 503 } });
+
+    expect(serializeRuntimeObservationError("FileSystem.listFiles", statusCodeError))
+      .toMatchObject({ retryable: true, statusCode: 502 });
+    expect(serializeRuntimeObservationError("FileSystem.downloadFile", responseStatusError))
+      .toMatchObject({ retryable: true, statusCode: 503 });
+  });
+
+  it("retries transient HTTP client statuses without retrying deterministic 4xx", () => {
+    expect(serializeRuntimeObservationError("FileSystem.listFiles", { status: 408, message: "timeout" }))
+      .toMatchObject({ retryable: true, statusCode: 408 });
+    expect(serializeRuntimeObservationError("FileSystem.listFiles", { status: 429, message: "rate limited" }))
+      .toMatchObject({ retryable: true, statusCode: 429 });
+    expect(serializeRuntimeObservationError("FileSystem.listFiles", { status: 400, message: "bad request" }))
+      .toMatchObject({ retryable: false, statusCode: 400 });
+  });
+
   it("handles circular values, redacts secrets, and bounds text", () => {
     const circular: Record<string, unknown> = {
       status: 503,

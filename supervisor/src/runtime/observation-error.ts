@@ -10,6 +10,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "ETIMEDOUT",
   "EAI_AGAIN",
 ]);
+const RETRYABLE_HTTP_STATUS_CODES = new Set([408, 429]);
 const RETRYABLE_MESSAGE_PATTERNS = [
   /\btimeout\b/i,
   /\btimed out\b/i,
@@ -41,7 +42,7 @@ function boundedText(value: unknown): string {
 function candidateStatus(value: unknown, seen = new Set<unknown>()): number | null {
   if (value instanceof Error) {
     const match = /\bstatus=([1-5][0-9][0-9])\b/.exec(value.message);
-    return match ? Number(match[1]) : null;
+    if (match) return Number(match[1]);
   }
   if (!value || typeof value !== "object" || seen.has(value)) return null;
   seen.add(value);
@@ -92,7 +93,7 @@ export function serializeRuntimeObservationError(
   const message = candidateMessage(error);
   const cause = candidateCause(error);
   const retryable = statusCode !== null
-    ? statusCode >= 500
+    ? statusCode >= 500 || RETRYABLE_HTTP_STATUS_CODES.has(statusCode)
     : (error instanceof Error && /\bretryable=true\b/.test(error.message)) ||
       hasRetryableCode(error) ||
       RETRYABLE_MESSAGE_PATTERNS.some((pattern) =>
