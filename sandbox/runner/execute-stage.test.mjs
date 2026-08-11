@@ -300,6 +300,38 @@ describe("one-stage executor", () => {
     const slashAttemptRequest = { ...unsealedRequest, attemptId: "parent/child" };
     expect(() => validateStageRequest({ ...slashAttemptRequest, ...createStageRequestHash(slashAttemptRequest) }))
       .toThrow(/attemptId/);
+    const githubIssueRequest = {
+      ...unsealedRequest,
+      issueId: "github:knoxgraeme/openthrottle-v2#194",
+      sessionId: "github:knoxgraeme/openthrottle-v2#194:initial",
+    };
+    expect(validateStageRequest({
+      ...githubIssueRequest,
+      ...createStageRequestHash(githubIssueRequest),
+    })).toMatchObject({
+      issueId: "github:knoxgraeme/openthrottle-v2#194",
+      sessionId: "github:knoxgraeme/openthrottle-v2#194:initial",
+    });
+    const invalidIssueCharacterRequest = { ...unsealedRequest, issueId: "github:owner/repo#194?" };
+    expect(() => validateStageRequest({
+      ...invalidIssueCharacterRequest,
+      ...createStageRequestHash(invalidIssueCharacterRequest),
+    })).toThrow(/issueId/);
+    const overlongIssueIdRequest = { ...unsealedRequest, issueId: `a${"#".repeat(200)}` };
+    expect(() => validateStageRequest({
+      ...overlongIssueIdRequest,
+      ...createStageRequestHash(overlongIssueIdRequest),
+    })).toThrow(/issueId/);
+    const invalidSessionCharacterRequest = { ...unsealedRequest, sessionId: "github:owner/repo#194:initial?" };
+    expect(() => validateStageRequest({
+      ...invalidSessionCharacterRequest,
+      ...createStageRequestHash(invalidSessionCharacterRequest),
+    })).toThrow(/sessionId/);
+    const maxLengthSessionIdRequest = { ...unsealedRequest, sessionId: `a${"#".repeat(199)}` };
+    expect(validateStageRequest({
+      ...maxLengthSessionIdRequest,
+      ...createStageRequestHash(maxLengthSessionIdRequest),
+    })).toMatchObject({ sessionId: `a${"#".repeat(199)}` });
     const slashNativeSessionRequest = { ...unsealedRequest, nativeSessionId: "native/../sibling" };
     expect(() => validateStageRequest({ ...slashNativeSessionRequest, ...createStageRequestHash(slashNativeSessionRequest) }))
       .toThrow(/nativeSessionId/);

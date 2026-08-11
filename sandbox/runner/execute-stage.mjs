@@ -81,6 +81,14 @@ const REQUEST_KEYS = new Set([
   "repositorySkill", "childActionId",
 ]);
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
+// Ticket identities are provider-qualified and GitHub's external thread
+// identifier includes a `#` (for example, github:owner/repo#123). Keep this
+// distinct from generic IDs so accepting ticket syntax does not widen fields
+// that may be used as path components.
+const ISSUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,199}$/;
+// Session identities extend ticket identities with a provider activation
+// suffix, so GitHub sessions retain the same safe `#` thread separator.
+const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,199}$/;
 const STAGE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -198,8 +206,8 @@ export function validateStageRequest(value) {
     stageId: string(input.stageId, "stageId"),
     attemptId: string(input.attemptId, "attemptId", STAGE_PATH_ID),
     runId: string(input.runId, "runId"),
-    issueId: string(input.issueId, "issueId"),
-    sessionId: string(input.sessionId, "sessionId"),
+    issueId: string(input.issueId, "issueId", ISSUE_ID),
+    sessionId: string(input.sessionId, "sessionId", SESSION_ID),
     generation: input.generation,
     taskType: string(input.taskType, "taskType", /^(?:implement|investigate)$/),
     taskContext: boundedText(input.taskContext, "taskContext", 64_000),
