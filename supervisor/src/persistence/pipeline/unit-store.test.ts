@@ -1721,7 +1721,7 @@ describe("execution unit store", () => {
     })).toBe("healed");
   });
 
-  it("counts the first retryable final-review selector dispatch against the exact observation cap", async () => {
+  it("counts an unknown final-review selector dispatch against the exact observation cap", async () => {
     const store = setup();
     store.createGraph({
       pipelineInstanceId: "instance-1",
@@ -1735,7 +1735,9 @@ describe("execution unit store", () => {
     });
     completeUnitToTerminal(store, "1".repeat(40));
     const dispatchUnitAction = vi.fn(async () => {
-      throw Object.assign(new Error("selector provider launch throttled"), { statusCode: 429 });
+      throw new Error(
+        "operation=review selector dispatch failed retryable=true status=unknown message=selector provider launch acknowledgement lost"
+      );
     });
     const processor = createUnitEffectProcessor({
       store,
@@ -1755,7 +1757,7 @@ describe("execution unit store", () => {
       observation_failure_count: 1,
       observation_retry_at: "2026-07-29T00:00:05.000Z",
       observation_epoch: 1,
-      last_error: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=429/),
+      last_error: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=unknown.*acknowledgement lost/),
     });
     expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ stopped_at: null, stop_reason: null });
 
@@ -1770,7 +1772,7 @@ describe("execution unit store", () => {
       observation_failure_count: 2,
       observation_retry_at: "2026-07-29T00:00:15.000Z",
       observation_epoch: 1,
-      last_error: expect.stringMatching(/observation_attempt=2\/3 .*retryable=true status=429/),
+      last_error: expect.stringMatching(/observation_attempt=2\/3 .*retryable=true status=unknown.*acknowledgement lost/),
     });
 
     timestamp = "2026-07-29T00:00:15.000Z";
@@ -1781,7 +1783,7 @@ describe("execution unit store", () => {
       observation_failure_count: 3,
       observation_retry_at: null,
       observation_epoch: 1,
-      last_error: expect.stringMatching(/observation_attempt=3\/3 .*retryable=true status=429/),
+      last_error: expect.stringMatching(/observation_attempt=3\/3 .*retryable=true status=unknown.*acknowledgement lost/),
     });
     expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
       stopped_at: "2026-07-29T00:00:15.000Z",

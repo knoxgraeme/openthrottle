@@ -1284,7 +1284,7 @@ describe("pipeline effect processor", () => {
     await drainCommandActions("final_command", integratedSubjectB);
 
     runtime.dispatchLoopAction.mockImplementationOnce(async () => {
-      throw Object.assign(new Error("selector provider launch throttled"), { statusCode: 429 });
+      throw new Error("selector provider launch acknowledgement lost");
     });
     await expect(processor.drain()).resolves.toBeUndefined();
     const preparedReview = latestAction("final_review");
@@ -1293,7 +1293,7 @@ describe("pipeline effect processor", () => {
       observation_failure_count: 1,
       observation_retry_at: "2099-07-22T12:00:05.000Z",
       observation_epoch: 1,
-      last_error: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=429/),
+      last_error: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=unknown.*acknowledgement lost/),
     });
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({ stopped_at: null, stop_reason: null });
     const preparedSelectorDispatch = db!.prepare(`
@@ -1332,6 +1332,19 @@ describe("pipeline effect processor", () => {
     expect(runtime.dispatchLoopAction.mock.calls.filter(([, request]) =>
       request.skill === "select-review-personas"
     )).toHaveLength(2);
+    runtime.collectLoopActionResult.mockRejectedValueOnce(
+      new Error("selector provider collection acknowledgement lost")
+    );
+    await processor.drain();
+    expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
+      status: "dispatched",
+      observation_failure_count: 2,
+      observation_retry_at: "2099-07-22T12:00:10.000Z",
+      observation_epoch: 1,
+      last_error: expect.stringMatching(/observation_attempt=2\/3 .*retryable=true status=unknown.*acknowledgement lost/),
+    });
+    db!.prepare("UPDATE execution_work_attempts SET observation_retry_at = NULL WHERE id = ?")
+      .run(review.id);
     // A successful provider observation with no result starts a fresh retry
     // epoch before later review subactions are dispatched.
     await processor.drain();
@@ -1444,11 +1457,11 @@ describe("pipeline effect processor", () => {
     runtime.dispatchLoopAction.mockImplementation(async (_resource, request) => {
       if (request.skill === "correctness-dataflow" && !fanoutDispatchFailed) {
         fanoutDispatchFailed = true;
-        throw Object.assign(new Error("persona provider request timed out"), { statusCode: 408 });
+        throw new Error("persona provider launch acknowledgement lost");
       }
       if (request.skill === "validate-review-findings" && !validatorDispatchFailed) {
         validatorDispatchFailed = true;
-        throw Object.assign(new Error("validator provider unavailable"), { statusCode: 502 });
+        throw new Error("validator provider launch acknowledgement lost");
       }
       reviewAuthEvents.push(`dispatch:${request.skill}`);
       successfullyDispatchedReviewActions.add(request.actionId);
@@ -1470,7 +1483,7 @@ describe("pipeline effect processor", () => {
     expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
       status: "dispatched",
       observation_failure_count: 1,
-      last_error: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=408/),
+      last_error: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=unknown.*acknowledgement lost/),
     });
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
       stopped_at: null,
@@ -1488,7 +1501,7 @@ describe("pipeline effect processor", () => {
     expect(pipelines.listWorkAttempts(attempt.id).find((entry) => entry.id === review.id)).toMatchObject({
       status: "dispatched",
       observation_failure_count: 1,
-      last_error: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=502/),
+      last_error: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=unknown.*acknowledgement lost/),
     });
     db!.prepare("UPDATE execution_work_attempts SET observation_retry_at = NULL WHERE id = ?")
       .run(review.id);

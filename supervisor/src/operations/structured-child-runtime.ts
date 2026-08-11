@@ -87,7 +87,12 @@ const DIAGNOSTIC_TEXT_HEAD_CHARS = 1_500;
 
 class RetryableReviewRuntimeError extends Error {
   constructor(operation: string, cause: unknown) {
-    super(serializeRuntimeObservationError(operation, cause).text);
+    const observed = serializeRuntimeObservationError(operation, cause);
+    // Provider wrappers do not always preserve a transport status when an
+    // acknowledgement is lost. This typed boundary is itself the proof that
+    // an unknown exception came from provider I/O, so make that retryability
+    // explicit for the durable outer observation budget.
+    super(observed.text.replace(/\bretryable=false\b/, "retryable=true"));
     this.name = "RetryableReviewRuntimeError";
   }
 }
@@ -848,7 +853,10 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       return await execute();
     } catch (error) {
       const observed = serializeRuntimeObservationError(operation, error);
-      if (!observed.retryable) throw new Error(observed.text);
+      // A known non-retryable provider response (notably 400/401/403) is a
+      // deterministic terminal. Statusless provider exceptions remain
+      // uncertain and must consume the bounded observation retry budget.
+      if (!observed.retryable && observed.statusCode !== null) throw new Error(observed.text);
       throw new RetryableReviewRuntimeError(operation, error);
     }
   };
