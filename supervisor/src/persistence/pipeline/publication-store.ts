@@ -14,6 +14,7 @@ export function createPublicationStore(db: Database.Database, now: () => string)
   | "claimGithubPublications"
   | "bindGithubPublicationTarget"
   | "markGithubPublicationProcessed"
+  | "requeueGithubPublicationAfterStaleWrite"
   | "markGithubPublicationSkipped"
   | "markGithubPublicationFailed"
   | "retryPublication"
@@ -73,9 +74,15 @@ export function createPublicationStore(db: Database.Database, now: () => string)
           JOIN tickets t ON t.ticket_id = pi.ticket_id
           WHERE pi.id = pipeline_publication_receipts.pipeline_instance_id
             AND t.session_id = pi.session_id
-            AND t.pr_url = ?
+            AND (
+              t.pr_url = ?
+              OR (
+                t.control_provider = 'github'
+                AND ? = 'https://github.com/' || replace(t.external_thread_id, '#', '/issues/')
+              )
+            )
         )
-    `).run(targetUrl, now(), id, expectedPayloadHash, targetUrl);
+    `).run(targetUrl, now(), id, expectedPayloadHash, targetUrl, targetUrl);
     if (update.changes !== 1) return undefined;
     return db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
       .get(id) as PipelinePublicationReceipt;
@@ -95,6 +102,23 @@ export function createPublicationStore(db: Database.Database, now: () => string)
       WHERE id = ? AND kind = 'github_summary' AND status = 'processing'
         AND payload_hash = ?
     `).run(externalId, externalUrl, timestamp, timestamp, id, expectedPayloadHash);
+    return update.changes === 1;
+  });
+
+  const requeueGithubPublicationAfterStaleWrite = db.transaction((
+    id: string,
+    stalePayloadHash: string,
+    externalId: string,
+    externalUrl: string
+  ): boolean => {
+    const timestamp = now();
+    const update = db.prepare(`
+      UPDATE pipeline_publication_receipts
+      SET status = 'pending', next_attempt_at = ?, last_error = NULL,
+          external_id = ?, external_url = ?, updated_at = ?
+      WHERE id = ? AND kind = 'github_summary' AND status = 'processing'
+        AND payload_hash <> ?
+    `).run(timestamp, externalId, externalUrl, timestamp, id, stalePayloadHash);
     return update.changes === 1;
   });
 
@@ -209,6 +233,7 @@ export function createPublicationStore(db: Database.Database, now: () => string)
     claimGithubPublications,
     bindGithubPublicationTarget,
     markGithubPublicationProcessed,
+    requeueGithubPublicationAfterStaleWrite,
     markGithubPublicationSkipped,
     markGithubPublicationFailed,
     retryPublication,

@@ -5,17 +5,17 @@ proof of concept.
 
 ## Concept
 
-OpenThrottle turns an approved Linear delegation into an immutable,
-deterministic coding pipeline:
+OpenThrottle turns an approved Linear delegation or GitHub Issue into an
+immutable, deterministic coding pipeline:
 
 ```text
-Linear delegation
+Linear delegation or labeled GitHub Issue
   -> durable repository route + catalog selection
   -> pinned manifest/config/runtime/base commit/generation
   -> one fenced Daytona stage at a time
   -> typed artifacts and deterministic gates
   -> exact-subject GitHub publication/provider evidence
-  -> durable Linear acknowledgement and resource cleanup
+  -> durable provider acknowledgement and resource cleanup
 ```
 
 The Fly supervisor owns state, admission, ordering, retries, effects, and
@@ -55,10 +55,13 @@ Compound Engineering. There is no second execution architecture.
 
 ## Admission and routing
 
-1. Linear HMAC and timestamp freshness are verified before persistence.
-2. A `created` agent-session event must contain an issue, session, and a durable
-   `repository_registrations` match by Linear team id or key. Routing is
-   fail-closed; no environment or label value may choose an arbitrary repo.
+1. Linear HMAC and timestamp freshness, or GitHub webhook HMAC, are verified
+   before persistence.
+2. A Linear `created` agent-session event must contain an issue, session, and a
+   durable `repository_registrations` match by team id or key. A GitHub Issue
+   admission event must come from the registered repository and carry the exact
+   lowercase `openthrottle` label. Routing is fail-closed; no environment or
+   unregistered Issue may choose an arbitrary repo.
 3. The branch label may override the registration’s base branch for this
    delegation. Agent labels select Claude, Codex, or OpenCode; `investigate`
    selects the investigate intent, otherwise the intent is implement.
@@ -547,6 +550,48 @@ synchronize events establish the authoritative head for the ticket branch.
 Reviews, PR comments, workflow runs, and check suites are stored as typed
 provider evidence for the pipeline generation.
 
+For a repository registered with `control_provider=github`, `openthrottle init`
+creates or normalizes the exact lowercase `openthrottle` label. An authorized
+collaborator with `triage`, `write`, `maintain`, or `admin` permission starts a
+generation by applying that label to an open Issue; opening or reopening an
+already-labeled Issue is equivalent. A plain Issue comment from an authorized
+collaborator is steering for the current generation. Closing the Issue stops
+every nonterminal stage, including provider wait; reopening it or reapplying the
+label after a terminal generation creates a new session. Webhook timestamps and
+a live Issue lookup immediately before admission prevent stale or close-racing
+events from starting or stopping the wrong generation. The final admission
+preflight also re-reads the bounded Issue Events stream and requires the exact
+authorized activation cursor selected by the delivery to remain current; a
+newer close/reopen/relabel epoch supersedes the slow admission before any
+ticket or pipeline instance is created. When reverse delivery reconciliation
+applies historical closes while handling a later reopen, it scans the bounded
+history after the current activation cursor from newest to oldest and stops at
+the first independently authorized close. Actor permission lookups are cached
+per reconciliation and capped at 32 distinct historical actors; an exhausted
+cap or lookup outage fails retryably before session mutation. A signed close
+also retries until its exact actor and timestamp appear in Issue Events.
+Confirmed insufficient permission is acknowledged without admission.
+
+Issue Events remain the body-free source of activation ordering. When an Issue
+comment and the current activation have equal second-precision timestamps, the
+supervisor resolves only that rare ambiguity through a bounded, byte-capped
+Issue timeline scan. It immediately projects the response to event identity,
+kind, timestamp, and actor, discards comment bodies, and compares API sequence
+rather than numeric ids. A comment is deferred or routed to a successor only
+when that sequence proves activation-before-comment; comment-before-activation
+falls through to terminal guidance before admission and is not delivered after
+admission. An incomplete bounded proof fails closed, with resend guidance for
+an otherwise active generation.
+
+The supervisor publishes one upserted, pinned Issue status comment containing
+the current lifecycle, structured activity, PR link, and revision marker. Its
+persisted GitHub comment id, not body markup supplied by a user, establishes
+machine provenance. A durable, expiring pre-network write intent defers a
+matching webhook until that exact id can be recorded; it never treats copied
+marker text as provenance. Concurrent writers use compare-and-swap plus a
+durable requeue so a stale network response cannot overwrite a newer desired
+revision.
+
 Provider evidence advances only an active provider-wait stage and only when its
 head SHA equals the executor-verified published commit. The one same-run
 exception is feedback captured against an earlier acknowledged publication from
@@ -673,6 +718,17 @@ Bearer tokens are compared by hashed value with timing-safe equality. Webhook
 deliveries are acknowledged after durable claim and processed asynchronously
 through leases so restart does not lose accepted work.
 
+After a registered webhook is reconciled successfully, the supervisor requeues
+dead local GitHub deliveries only for that repository and inspects the hook's
+recent failed provider deliveries. Each exact provider delivery is claimed in
+`github_webhook_redelivery_requests` before requesting GitHub redelivery; an
+accepted request requeues only the matching local delivery, and failures remain
+lease- and backoff-retryable. This prevents a global dead-letter replay or a
+reconciliation failure from crossing repository boundaries. The ordinary
+seven-day webhook retention sweep prunes bounded batches of old accepted
+redelivery requests while preserving pending, claimed, and retryable failed
+requests.
+
 `GET /status` returns one provider-neutral block per ticket. Its identity fields
 are `id` (the provider-qualified command and persistence identity), `reference`
 (the human-facing display label), `current_session_id`, `control_provider`, and
@@ -739,6 +795,18 @@ SQLite is the authority. Core tables include:
 - settlement rollup measurement corpus: `run_outcomes`;
 - operations: `repository_registrations`, `supervisor_leases`, `settings`,
   `schema_migrations`, `migration_reconciliation`.
+
+Each `agent_sessions` generation stores `provider_activated_at`, copied from
+the provider event that activated that generation. GitHub-controlled sessions
+also store `provider_activation_id`, the opaque id of the correlated,
+authorized Issue Event that owns the activation epoch. The supervisor compares
+that cursor by its position in a bounded, body-free Issue Events stream, never
+by numeric id arithmetic; exact lowercase `unlabeled` events are deactivation
+boundaries for admission reconciliation, and an incomplete bounded scan fails closed. Provider
+event timestamps remain the compatibility fence preserving native precision,
+while the cursor distinguishes same-second close/reopen/relabel ordering. The
+supervisor's later local `created_at` is not an activation watermark. Legacy
+sessions backfill only the timestamp from `created_at` conservatively.
 
 `orchestration_journal` is append-only data capture, keyed by team,
 repository, issue, and recorded time. Supervisor-owned orchestration decisions
@@ -1093,8 +1161,14 @@ fresh checkout runnable, and unit worktrees are fresh checkouts.
 
 `openthrottle setup` verifies snapshot availability and prints the supervisor
 secret checklist. `openthrottle init` detects the GitHub origin/default branch,
-writes `.openthrottle.yml`, and idempotently registers the Linear-team route and
-GitHub webhook. Its explicit `--editable-skills` option transactionally writes
+writes `.openthrottle.yml`, and idempotently registers either a Linear-team or
+GitHub-Issue control route plus the GitHub webhook. The registration body uses
+`controlProvider: "linear" | "github"` (default `linear` for existing clients);
+Linear team fields are required only for Linear and rejected for GitHub.
+Re-registering the same repository may switch its future control route
+atomically; already-admitted tickets and sessions retain their pinned provider,
+and a Linear team route may never be transferred to another repository. Its
+explicit `--editable-skills` option transactionally writes
 an editable `simple_editable` repository graph, the exact referenced
 `implement-plan` package closure under `.openthrottle/skills/`, and
 `.openthrottle/skills.lock.json`. The lock pins the OpenThrottle release plus

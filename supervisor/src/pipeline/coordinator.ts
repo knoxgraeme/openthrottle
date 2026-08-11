@@ -149,9 +149,15 @@ function transitionContext(event: PipelineCoordinatorEvent, fromStage: string): 
 }
 
 function activeStage(input: PipelineReductionInput): PipelineStage {
-  const stage = input.manifest.stages.find((candidate) => candidate.id === input.instance.active_stage_id);
-  if (!stage) throw new Error(`active stage ${input.instance.active_stage_id ?? "<none>"} is absent from the pinned manifest`);
-  if (stage.id !== input.attempt.stage_id) throw new Error("active attempt does not match the pinned stage");
+  const canceledMergeRecovery = isCanceledProviderMergeRecovery(input);
+  const stageId = canceledMergeRecovery
+    ? input.attempt.stage_id
+    : input.instance.active_stage_id;
+  const stage = input.manifest.stages.find((candidate) => candidate.id === stageId);
+  if (!stage) throw new Error(`active stage ${stageId ?? "<none>"} is absent from the pinned manifest`);
+  if (!canceledMergeRecovery && stage.id !== input.attempt.stage_id) {
+    throw new Error("active attempt does not match the pinned stage");
+  }
   return stage;
 }
 
@@ -233,6 +239,30 @@ function publishedSubjectForEvent(input: PipelineReductionInput, stage: Pipeline
     : null;
 }
 
+function isCanceledProviderMergeRecovery(input: PipelineReductionInput): boolean {
+  if (
+    input.instance.status !== "canceled" ||
+    input.instance.terminal_outcome !== "canceled" ||
+    input.event.kind !== "provider_snapshot" ||
+    input.event.outcome !== "success" ||
+    input.event.providerRevision !== input.instance.published_commit
+  ) {
+    return false;
+  }
+  const stageResult = input.event.artifacts?.find((artifact) => artifact.kind === "stage_result");
+  if (!stageResult) return false;
+  try {
+    const payload = JSON.parse(stageResult.payload) as {
+      details?: { kind?: unknown; action?: unknown; merged?: unknown };
+    };
+    return payload.details?.kind === "pull_request" &&
+      payload.details.action === "closed" &&
+      payload.details.merged === true;
+  } catch {
+    return false;
+  }
+}
+
 function verifyInput(input: PipelineReductionInput): PipelineStage {
   const { manifest, instance, attempt, event } = input;
   const normalized = canonicalJson(manifest);
@@ -257,7 +287,11 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     throw new Error("pipeline publication is blocked and must be recovered before progression");
   }
   const stage = activeStage(input);
-  if (event.kind === "provider_snapshot" && instance.status !== "waiting_provider") {
+  if (
+    event.kind === "provider_snapshot" &&
+    instance.status !== "waiting_provider" &&
+    !isCanceledProviderMergeRecovery(input)
+  ) {
     throw new Error("provider feedback can re-enter only a provider-waiting instance");
   }
   if (event.kind === "human_answer" && instance.status !== "waiting_human") {
@@ -546,6 +580,9 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
   const eventPayloadHash = digestNormalized(canonicalJson(input.event));
   const transition = stage.transitions[input.event.outcome];
   if (!transition) throw new Error(`stage ${stage.id} has no transition for ${input.event.outcome}`);
+  if (isCanceledProviderMergeRecovery(input) && transition.terminal !== "shipped") {
+    throw new Error("a canceled provider merge recovery must settle the pipeline as shipped");
+  }
 
   if (input.event.kind === "stop" || input.event.kind === "supersede") {
     const terminal = input.event.kind === "stop" ? "canceled" : "superseded";

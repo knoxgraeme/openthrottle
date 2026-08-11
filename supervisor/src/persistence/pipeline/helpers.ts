@@ -598,8 +598,15 @@ export function createPipelinePublicationWriter(db: Database.Database) {
           attempt_id = excluded.attempt_id,
           payload = excluded.payload,
           payload_hash = excluded.payload_hash,
-          status = 'pending',
-          next_attempt_at = excluded.next_attempt_at,
+          status = CASE
+            WHEN pipeline_publication_receipts.status = 'processing' THEN 'processing'
+            ELSE 'pending'
+          END,
+          next_attempt_at = CASE
+            WHEN pipeline_publication_receipts.status = 'processing'
+              THEN pipeline_publication_receipts.next_attempt_at
+            ELSE excluded.next_attempt_at
+          END,
           last_error = NULL,
           updated_at = excluded.updated_at
       `).run(

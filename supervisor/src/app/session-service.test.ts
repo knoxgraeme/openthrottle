@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExecutionPlanContract } from "@openthrottle/contracts";
 import type { Config } from "./config.js";
-import type { ActivityPublicationInput } from "./ports.js";
+import type { ActivityPublicationInput, ControlThreadEvent } from "./ports.js";
 import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { handleControlEvent } from "./session-service.js";
@@ -481,6 +481,13 @@ describe("pipeline admission", () => {
       pipelines,
       githubFetch,
       invoke,
+      invokeControl: (controlEvent: ControlThreadEvent) => handleControlEvent(
+        config(),
+        tickets,
+        providers,
+        controlEvent,
+        { catalog, runtime, store: pipelines }
+      ),
       setRepositoryConfig(value: string) {
         currentRepositoryConfig = value;
       },
@@ -3049,6 +3056,41 @@ intents:
     expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(false);
   });
 
+  it("derives waiting-provider feedback identity and payload from the control provider", async () => {
+    const { pipelines, invokeControl } = await run(repositoryConfigYaml("{ implement: implement }"));
+    moveToProviderWait(pipelines, "c".repeat(40));
+
+    await invokeControl({
+      provider: "github",
+      action: "prompted",
+      agentSession: {
+        id: "stale-provider-session",
+        thread: {
+          id: "issue-1",
+          identifier: "OT-1",
+          provider: "linear",
+          route: { key: "OT" },
+        },
+      },
+      activity: {
+        id: "github-comment:81",
+        content: { type: "text", body: "please repair from the Issue" },
+      },
+    });
+
+    const [event] = providerEvents();
+    expect(event).toMatchObject({
+      provider: "github",
+      provider_event_id: "github-reply:github-comment:81",
+    });
+    const stored = JSON.parse(event!.payload) as { summary: string; payload: string };
+    expect(stored.summary).toBe("GitHub reply requires another implementation pass.");
+    expect(JSON.parse(stored.payload)).toMatchObject({
+      kind: "github_reply",
+      activity_id: "github-comment:81",
+    });
+  });
+
   it("sanitizes and bounds waiting-provider Linear reply feedback", async () => {
     const { pipelines, invoke } = await run(repositoryConfigYaml("{ implement: implement }"));
     moveToProviderWait(pipelines);
@@ -3181,6 +3223,45 @@ intents:
     expect(db!.prepare("SELECT id, body FROM session_inbox").get()).toEqual({
       id: "activity-steer",
       body: "please adjust the current stage",
+    });
+  });
+
+  it("fences live steering to the ticket's current session rather than the provider event session", async () => {
+    const { tickets, pipelines, invokeControl } = await run(repositoryConfigYaml("{ implement: implement }"));
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const request = pipelines.getStageRequest(attempt.id);
+    expect(tickets.beginRun({
+      issueId: "linear:issue-1",
+      runId: request.runId,
+      taskType: "implement",
+      tokenHash: "token-hash",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    })).toBe(true);
+    pipelines.bindStageRun(attempt.id, request.runId);
+    pipelines.markStageDispatched(attempt.id);
+
+    await invokeControl({
+      provider: "github",
+      action: "prompted",
+      agentSession: {
+        id: "stale-provider-session",
+        thread: {
+          id: "issue-1",
+          identifier: "OT-1",
+          provider: "linear",
+          route: { key: "OT" },
+        },
+      },
+      activity: {
+        id: "github-comment:82",
+        content: { type: "text", body: "steer the live attempt" },
+      },
+    });
+
+    expect(db!.prepare("SELECT session_id, run_id FROM session_inbox").get()).toEqual({
+      session_id: "session-1",
+      run_id: request.runId,
     });
   });
 

@@ -2,7 +2,11 @@ import { loadConfig } from "./app/config.js";
 import { createSupervisorStore } from "./persistence/store.js";
 import { openDb } from "./persistence/database.js";
 import { listen } from "./http/listener.js";
-import { createServer, createServerWebhookDeliveryProcessor } from "./http/server.js";
+import {
+  createProviderAwareActivityPublisher,
+  createServer,
+  createServerWebhookDeliveryProcessor,
+} from "./http/server.js";
 import { runSweep } from "./operations/sweep.js";
 import { createLinearClientProvider } from "./providers/linear/auth.js";
 import {
@@ -13,7 +17,7 @@ import {
 import { pollSandboxEvents } from "./runtime/event-poller.js";
 import { deliverPendingInbox } from "./runtime/steering.js";
 import { reapStalledRuns } from "./operations/reaper.js";
-import { activityPayload, createLinearActivityPublisher, createLinearOutboxProcessor, enqueueSessionUpdate } from "./providers/linear/outbox.js";
+import { createLinearActivityPublisher, createLinearOutboxProcessor, enqueueSessionUpdate } from "./providers/linear/outbox.js";
 import { loadPipelineCatalog } from "./pipeline/manifest.js";
 import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { createAnalysisStore } from "./persistence/pipeline/analysis-store.js";
@@ -26,7 +30,11 @@ import { createDaytonaRuntime } from "./providers/daytona/adapter.js";
 import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js";
 import { drainPipelineFeedbackSnapshots } from "./app/provider-feedback.js";
 import { createGithubWebhookReconciler } from "./operations/github-webhook-reconciliation.js";
-import { reconcileRepositoryWebhook } from "./providers/github/client.js";
+import {
+  listFailedRepositoryWebhookDeliveries,
+  reconcileRepositoryWebhook,
+  redeliverRepositoryWebhookDelivery,
+} from "./providers/github/client.js";
 import { canSteerPipelineRun } from "./pipeline/control.js";
 import {
   createRuntimeResourceReconciler,
@@ -64,7 +72,12 @@ async function main() {
 
   const getLinearClient = createLinearClientProvider(cfg, store);
   const linearOutboxProcessor = createLinearOutboxProcessor({ store, getLinearClient });
-  const activityPublisher = createLinearActivityPublisher(store, linearOutboxProcessor);
+  const linearActivityPublisher = createLinearActivityPublisher(store, linearOutboxProcessor);
+  const activityPublisher = createProviderAwareActivityPublisher(
+    cfg,
+    store,
+    linearActivityPublisher
+  );
   const runtime = createDaytonaRuntime({
     apiKey: cfg.daytonaApiKey,
     snapshot: cfg.daytonaSnapshot,
@@ -104,6 +117,26 @@ async function main() {
     webhookUrl: `${cfg.supervisorUrl}/webhooks/github`,
     webhookSecret: cfg.githubWebhookSecret,
     reconcileRepositoryWebhook,
+    listRepositoryWebhookDeliveries: async (client, input) =>
+      (await listFailedRepositoryWebhookDeliveries(
+        client,
+        input.repo,
+        input.webhookId,
+        input.limit
+      )).map((delivery) => ({
+        id: delivery.id,
+        guid: delivery.guid,
+        deliveredAt: delivery.delivered_at,
+        statusCode: delivery.status_code,
+        redelivery: delivery.redelivery,
+      })),
+    redeliverRepositoryWebhookDelivery: (client, input) =>
+      redeliverRepositoryWebhookDelivery(
+        client,
+        input.repo,
+        input.webhookId,
+        input.deliveryId
+      ),
     concurrency: WEBHOOK_RECONCILIATION_CONCURRENCY,
   });
   const reconcileRuntimeCapacity = () =>
@@ -152,24 +185,36 @@ async function main() {
         runtime,
         store,
         childActions: pipelineStore,
-        postActivity: async (activity, event) => {
-          const row = store.enqueueLinearOutbox({
-            id: event.event_id,
-            sessionId: activity.sessionId,
-            issueId: event.issueId,
-            runId: event.run_id,
-            kind: "activity",
-            payload: activityPayload(activity),
-          });
-          await linearOutboxProcessor.process(row.id);
-        },
-        postSessionUpdate: (params) =>
-          enqueueSessionUpdate(store, linearOutboxProcessor, {
+        postActivity: (activity, event) => activityPublisher.publishActivity(
+          { ...activity, id: event.event_id },
+          event.issueId,
+          event.run_id
+        ),
+        postSessionUpdate: (params) => {
+          const ticket = store.getByIssueId(params.issueId);
+          if (ticket?.control_provider === "github") {
+            const plan = params.plan.map((item) => {
+              const marker = item.status === "completed"
+                ? "x"
+                : item.status === "canceled"
+                  ? "-"
+                  : " ";
+              return `- [${marker}] ${item.content} (${item.status})`;
+            }).join("\n");
+            return activityPublisher.publishActivity({
+              id: params.eventId,
+              sessionId: params.sessionId,
+              type: "response",
+              body: `Plan update:\n${plan}`,
+            }, params.issueId);
+          }
+          return enqueueSessionUpdate(store, linearOutboxProcessor, {
             id: params.eventId,
             sessionId: params.sessionId,
             issueId: params.issueId,
             plan: params.plan,
-          }),
+          });
+        },
         postStageResult: async (event, observedSubject) => {
           completeStageAttemptActor(
             pipelineStore,

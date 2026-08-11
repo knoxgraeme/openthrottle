@@ -607,16 +607,32 @@ export function processProviderEvidence(
     }
     return instance;
   }
-  const attempt = store.getActiveAttempt(instance.id);
-  if (!attempt) throw new Error(`pipeline instance ${input.instanceId} has no provider attempt`);
+  const providerRevision = providerRevisionFromPayload(input.providerPayload);
+  const recoveringCanceledMerge =
+    instance.status === "canceled" &&
+    instance.terminal_outcome === "canceled" &&
+    input.outcome === "success" &&
+    input.providerPayload.kind === "pull_request" &&
+    input.providerPayload.action === "closed" &&
+    input.providerPayload.merged === true &&
+    providerRevision !== undefined &&
+    providerRevision === instance.published_commit;
   const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
+  const attempt = store.getActiveAttempt(instance.id) ?? (recoveringCanceledMerge
+    ? [...store.listAttempts(instance.id)].reverse().find((candidate) => {
+        const candidateStage = manifest.stages.find((stage) => stage.id === candidate.stage_id);
+        return candidate.status === "canceled" &&
+          candidateStage?.executor.kind === "provider_wait" &&
+          candidateStage.evaluator.kind === "provider";
+      })
+    : undefined);
+  if (!attempt) throw new Error(`pipeline instance ${input.instanceId} has no provider attempt`);
   const stage = manifest.stages.find((candidate) => candidate.id === attempt.stage_id);
   if (!stage || stage.executor.kind !== "provider_wait" || stage.evaluator.kind !== "provider") {
     throw new Error(`pipeline attempt ${attempt.id} is not a provider-wait stage`);
   }
   const subject = instance.immutable_subject;
   if (!subject || !GIT_SUBJECT.test(subject)) throw new Error("provider evidence has no immutable subject");
-  const providerRevision = providerRevisionFromPayload(input.providerPayload);
   // Provider webhook identities are replayed by GitHub. Bind receipt time to
   // the immutable provider attempt so the same stable event ID always hashes
   // to the same inbox payload across retries and supervisor restarts.
@@ -699,7 +715,7 @@ export function processProviderEvidence(
     });
     return instance;
   }
-  if (instance.status !== "waiting_provider") {
+  if (instance.status !== "waiting_provider" && !recoveringCanceledMerge) {
     throw new Error(`pipeline instance ${input.instanceId} is not waiting for provider evidence`);
   }
   return coordinatePipelineEvent(store, event, undefined, providerGateReceipt(instance, attempt, stage, event));

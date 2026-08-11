@@ -2885,6 +2885,14 @@ describe("pipeline publication", () => {
       "SELECT COUNT(*) AS count FROM pipeline_publication_receipts WHERE kind = 'github_summary'"
     ).get()).toEqual({ count: 1 });
     expect(pipelines.listPublications(replacement.id).find((row) => row.kind === "github_summary"))
+      .toMatchObject({ status: "processing", pipeline_instance_id: replacement.id });
+    expect(pipelines.requeueGithubPublicationAfterStaleWrite(
+      claimed.id,
+      claimed.payload_hash,
+      "stale-comment",
+      "https://github.com/owner/repo/pull/1#issuecomment-stale"
+    )).toBe(true);
+    expect(pipelines.listPublications(replacement.id).find((row) => row.kind === "github_summary"))
       .toMatchObject({ status: "pending", pipeline_instance_id: replacement.id });
   });
 

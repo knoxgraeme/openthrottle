@@ -490,6 +490,18 @@ export async function handleCreated(
     if (existingSessionInstance.ticket_id !== ticketId) {
       throw new Error(`pipeline session ${sessionId} has an invalid issue binding`);
     }
+    if (payload.providerActivationAdvances && payload.providerActivationId &&
+        payload.providerActivatedAt) {
+      const advanced = store.advanceSessionProviderActivation(
+        sessionId,
+        payload.providerActivationPreviousId ?? null,
+        payload.providerActivatedAt,
+        payload.providerActivationId
+      );
+      if (!advanced) {
+        throw new Error("provider activation cursor changed before it could advance atomically");
+      }
+    }
     return;
   }
   // Engine selection must derive from the issue's labels as they stand right
@@ -579,6 +591,8 @@ export async function handleCreated(
     control_provider: issue.provider,
     external_thread_id: issue.id,
     external_thread_reference: issue.identifier,
+    provider_activated_at: payload.providerActivatedAt,
+    provider_activation_id: payload.providerActivationId,
     sandbox_id: null,
     branch: branchFor(issue.identifier),
     agent: selectedAgent,

@@ -12,6 +12,7 @@ import {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
+const WEBHOOK_REDELIVERY_PRUNE_LIMIT = 1_000;
 
 function daysAgoIso(days: number): string {
   return new Date(Date.now() - days * DAY_MS).toISOString();
@@ -64,6 +65,10 @@ export async function runSweep(
   }
   const retentionCutoff = daysAgoIso(7);
   store.pruneDeliveries(retentionCutoff);
+  store.pruneAcceptedGithubWebhookRedeliveryRequests(
+    retentionCutoff,
+    WEBHOOK_REDELIVERY_PRUNE_LIMIT
+  );
   store.pruneSandboxEvents(retentionCutoff);
   store.pruneEphemeralLinearOutbox(retentionCutoff);
   pipelines.pruneRunOutcomes(daysAgoIso(cfg.runOutcomeRetentionDays));

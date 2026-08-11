@@ -27,6 +27,8 @@ import {
   recordPipelineProviderEvent,
 } from "../app/provider-feedback.js";
 import { handleGithubEvent, routePipelineProviderEvent } from "../providers/github/events.js";
+import { beginGithubSupervisorCommentWrite } from "../providers/github/comment-provenance.js";
+import { createLinearOutboxProcessor } from "../providers/linear/outbox.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -182,6 +184,77 @@ describe("deterministic supervisor stage gates", () => {
       WHERE id = ?
     `).run(subject, publishedCommit, subject, fixture.instance.id);
     fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
+  }
+
+  async function acknowledgeGithubControlGate(
+    fixture: Fixture,
+    resumeStatus: "canceled" | "shipped"
+  ): Promise<void> {
+    const row = fixture.db.prepare(`
+      SELECT outbox.id
+      FROM control_outbox outbox
+      JOIN pipeline_publication_receipts receipt ON receipt.id = outbox.id
+      WHERE receipt.pipeline_instance_id = ? AND receipt.resume_status = ?
+      ORDER BY receipt.created_at DESC, receipt.id DESC
+      LIMIT 1
+    `).get(fixture.instance.id, resumeStatus) as { id: string } | undefined;
+    expect(row).toBeDefined();
+    const getLinearClient = vi.fn(async () => undefined);
+    const processor = createLinearOutboxProcessor({
+      store: fixture.tickets,
+      getLinearClient,
+    });
+    for (let pass = 0; pass < 10; pass += 1) {
+      await processor.drain(50);
+      if (fixture.pipelines.getInstance(fixture.instance.id)?.status === resumeStatus) break;
+    }
+    expect(getLinearClient).not.toHaveBeenCalled();
+    expect(fixture.db.prepare(`
+      SELECT status FROM pipeline_publication_receipts WHERE id = ?
+    `).pluck().get(row!.id)).toBe("acknowledged");
+  }
+
+  async function closeGithubIssue(fixture: Fixture): Promise<void> {
+    const closedAt = "2098-01-01T00:00:00.000Z";
+    vi.stubGlobal("fetch", vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+      const url = String(input);
+      if (url.endsWith("/repos/owner/repo/issues/1/events?per_page=100")) {
+        return Response.json([{
+          id: 101,
+          event: "closed",
+          created_at: closedAt,
+          actor: { login: "operator" },
+        }]);
+      }
+      if (url.endsWith("/repos/owner/repo/issues/1")) {
+        return Response.json({
+          state: "closed",
+          updated_at: closedAt,
+          labels: [],
+        });
+      }
+      return Response.json({ permission: "write" });
+    }));
+    await handleGithubEvent(
+      { githubReadToken: "read-token" } as never,
+      fixture.tickets,
+      {} as never,
+      {
+        kind: "issues",
+        action: "closed",
+        repository: { full_name: "owner/repo" },
+        sender: { login: "operator" },
+        issue: {
+          number: 1,
+          title: "Ship the provider path",
+          html_url: "https://github.com/owner/repo/issues/1",
+          state: "closed",
+          closed_at: closedAt,
+          updated_at: closedAt,
+        },
+      },
+      fixture.pipelines
+    );
   }
 
   function recordAcknowledgedPublication(
@@ -1282,6 +1355,151 @@ describe("deterministic supervisor stage gates", () => {
       terminal_outcome: terminalOutcome,
     });
   });
+
+  it("promotes an Issue-canceled provider wait to shipped only for its exact merged head", async () => {
+    const fixture = setup("core/implement@4");
+    moveFixtureToProviderWait(fixture);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.db.prepare(`
+      UPDATE tickets
+      SET control_provider = 'github',
+          external_thread_id = 'owner/repo#1',
+          external_thread_reference = 'GH-1'
+      WHERE ticket_id = 'issue-1'
+    `).run();
+
+    await closeGithubIssue(fixture);
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "canceled",
+    });
+    await acknowledgeGithubControlGate(fixture, "canceled");
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "canceled",
+      terminal_outcome: "canceled",
+    });
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      {} as never,
+      {
+        kind: "pull_request",
+        action: "closed",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          merged: true,
+          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+      },
+      fixture.pipelines
+    );
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "shipped",
+    });
+    await acknowledgeGithubControlGate(fixture, "shipped");
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "shipped",
+      terminal_outcome: "shipped",
+    });
+    expect(fixture.db.prepare(`
+      SELECT outcome, closed_reason FROM run_outcomes WHERE pipeline_instance_id = ?
+    `).get(fixture.instance.id)).toEqual({ outcome: "shipped", closed_reason: "success" });
+    expect(fixture.db.prepare(`
+      SELECT COUNT(*) FROM orchestration_journal
+      WHERE instance_id = ? AND kind = 'merged'
+    `).pluck().get(fixture.instance.id)).toBe(1);
+  });
+
+  it.each([
+    {
+      label: "a non-merged pull request close",
+      event: {
+        kind: "pull_request",
+        action: "closed",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          merged: false,
+          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+      },
+    },
+    {
+      label: "a merged pull request with the wrong head",
+      event: {
+        kind: "pull_request",
+        action: "closed",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          merged: true,
+          head: { ref: "ot/issue-1", sha: "f".repeat(40) },
+          base: { ref: "main" },
+        },
+      },
+    },
+    {
+      label: "a non-provider review event",
+      event: {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 9,
+          state: "commented",
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-9",
+          user: { login: "reviewer" },
+        },
+      },
+    },
+  ] as const)("keeps an Issue-canceled run terminal after $label", async ({ event }) => {
+    const fixture = setup("core/implement@4");
+    moveFixtureToProviderWait(fixture);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.db.prepare(`
+      UPDATE tickets
+      SET control_provider = 'github',
+          external_thread_id = 'owner/repo#1',
+          external_thread_reference = 'GH-1'
+      WHERE ticket_id = 'issue-1'
+    `).run();
+    await closeGithubIssue(fixture);
+    await acknowledgeGithubControlGate(fixture, "canceled");
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      {
+        publishActivity: vi.fn(async () => undefined),
+        publishError: vi.fn(async () => undefined),
+      },
+      event,
+      fixture.pipelines
+    );
+
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "canceled",
+      terminal_outcome: "canceled",
+    });
+    expect(fixture.db.prepare(`
+      SELECT outcome, closed_reason FROM run_outcomes WHERE pipeline_instance_id = ?
+    `).get(fixture.instance.id)).toEqual({ outcome: "canceled", closed_reason: "canceled" });
+  });
+
   it("scopes merged pull request journal idempotency keys by repository", async () => {
     const recordJournalEntry = vi.fn();
     const ticket = {
@@ -1340,7 +1558,7 @@ describe("deterministic supervisor stage gates", () => {
     );
   });
 
-  it("treats unmarked feedback as human and marker-bearing bodies as the pipeline's own, regardless of author", async () => {
+  it("filters supervisor comments only by exact persisted comment-id provenance", async () => {
     const fixture = setup("core/implement@4");
     const publishActivity = vi.fn(async () => undefined);
     const activityPublisher = { publishActivity, publishError: vi.fn(async () => undefined) };
@@ -1371,7 +1589,7 @@ describe("deterministic supervisor stage gates", () => {
       fixture.pipelines
     );
 
-    const comment = (id: number, body: string) => handleGithubEvent(
+    const comment = (id: number, body: string, authorType = "User") => handleGithubEvent(
       {} as never,
       fixture.tickets,
       activityPublisher,
@@ -1384,7 +1602,7 @@ describe("deterministic supervisor stage gates", () => {
           id,
           body,
           html_url: `https://github.com/owner/repo/pull/1#issuecomment-${id}`,
-          user: { login: "knoxgraeme" },
+          user: { login: authorType === "Bot" ? "openthrottle[bot]" : "knoxgraeme", type: authorType },
         },
       },
       fixture.pipelines
@@ -1416,16 +1634,45 @@ describe("deterministic supervisor stage gates", () => {
       expect.anything()
     );
 
-    // Fallback for the webhook-races-acknowledgement window: a full summary
-    // marker at the start of an unknown-ID comment is treated as the machine's.
-    await comment(33, "<!-- openthrottle:pipeline-summary:pipeline-1 -->\nGate summary body");
+    // The publisher persists this exact ID immediately after the API upsert,
+    // before pinning and receipt acknowledgement, closing that race without
+    // trusting machine-looking body text or a caller-controlled author type.
+    fixture.tickets.setSetting("github-supervisor-comment:33", "pipeline-status");
+    await comment(33, "<!-- openthrottle:pipeline-summary:pipeline-1 -->\nGate summary body", "Bot");
     expect(providerEventCount()).toBe(2);
+
+    // A webhook can arrive after GitHub creates a comment but before the API
+    // response lets publication persist its exact id. The pre-network intent
+    // defers that delivery; it does not trust or permanently discard marker
+    // text, and the exact id remains the final provenance decision.
+    const pendingMarker = "<!-- openthrottle:pipeline-summary:issue-1 -->";
+    beginGithubSupervisorCommentWrite(
+      fixture.tickets,
+      "owner/repo",
+      1,
+      pendingMarker
+    );
+    await expect(comment(36, `${pendingMarker}\nIn-flight summary`))
+      .rejects.toThrow("publication is still in flight");
+    expect(providerEventCount()).toBe(2);
+    fixture.tickets.setSetting("github-supervisor-comment:36", "pipeline-summary");
+    await comment(36, `${pendingMarker}\nIn-flight summary`);
+    expect(providerEventCount()).toBe(2);
+
+    // Marker text and a Bot author type alone are untrusted input.
+    await comment(34, "<!-- openthrottle:pipeline-status:github:owner/repo#12 -->\nStatus body", "Bot");
+    expect(providerEventCount()).toBe(3);
+
+    // An operator can type the same marker; authorship prevents that body from
+    // colliding with supervisor output and silently dropping real feedback.
+    await comment(35, "<!-- openthrottle:pipeline-summary:pipeline-1 -->\nOperator-authored feedback");
+    expect(providerEventCount()).toBe(4);
 
     await comment(32, "the retry loop still double-counts attempts");
     // Events on the same PR head coalesce into one snapshot; the human comment
     // joins the human reviews as another provider event inside it.
     expect(fixture.tickets.listPendingFeedbackSnapshots("session-1")).toHaveLength(1);
-    expect(providerEventCount()).toBe(3);
+    expect(providerEventCount()).toBe(5);
   });
 
   it("publishes Linear activity for GitHub review and CI completion events through the injected port", async () => {

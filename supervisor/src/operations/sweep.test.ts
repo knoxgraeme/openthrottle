@@ -42,6 +42,21 @@ describe("runSweep", () => {
     store.claimDelivery({ deliveryId: "old-delivery", source: "linear", action: "created" });
     db.prepare("UPDATE webhook_deliveries SET received_at = ?")
       .run("2020-01-01T00:00:00.000Z");
+    db.prepare(`
+      INSERT INTO github_webhook_redelivery_requests (
+        repository, webhook_id, delivery_id, delivery_guid, delivered_at,
+        status, attempts, next_attempt_at, accepted_at, last_error, updated_at
+      ) VALUES
+        ('acme/widget', 42, 1, 'accepted-guid', '2020-01-01T00:00:00.000Z',
+          'accepted', 1, '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z', NULL,
+          '2020-01-01T00:00:00.000Z'),
+        ('acme/widget', 42, 2, 'claimed-guid', '2020-01-01T00:00:00.000Z',
+          'claimed', 1, '2020-01-01T00:00:00.000Z', NULL, NULL,
+          '2020-01-01T00:00:00.000Z'),
+        ('acme/widget', 42, 3, 'failed-guid', '2020-01-01T00:00:00.000Z',
+          'failed', 1, '2020-01-01T00:00:00.000Z', NULL, 'retry later',
+          '2020-01-01T00:00:00.000Z')
+    `).run();
 
     const oldOrphan = {
       id: "old-orphan",
@@ -82,6 +97,14 @@ describe("runSweep", () => {
     expect(remove).not.toHaveBeenCalledWith("new-orphan");
     expect(remove).not.toHaveBeenCalledWith("known-active");
     expect(db.prepare("SELECT COUNT(*) FROM webhook_deliveries").pluck().get()).toBe(0);
+    expect(db.prepare(`
+      SELECT delivery_id, status
+      FROM github_webhook_redelivery_requests
+      ORDER BY delivery_id
+    `).all()).toEqual([
+      { delivery_id: 2, status: "claimed" },
+      { delivery_id: 3, status: "failed" },
+    ]);
   });
 
   it("continues orphan cleanup and retention pruning when webhook reconciliation rejects", async () => {

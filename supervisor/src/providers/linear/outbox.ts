@@ -268,9 +268,13 @@ export function createLinearOutboxProcessor(params: {
       : undefined;
     const ticket = params.store.getByIssueId(row.ticket_id ?? session?.ticket_id ?? "");
     if (ticket && ticket.control_provider !== "linear") {
-      throw new Error(
-        `invalid control provider ${ticket.control_provider} for Linear outbox ${row.id}`
-      );
+      // The control ledger is provider-neutral durable state even though its
+      // legacy queue table is named control_outbox. GitHub-controlled tickets
+      // project the same envelope through the GitHub summary receipt; locally
+      // acknowledge this companion row so it can release publication-gated
+      // pipeline transitions without attempting a Linear API call.
+      params.store.markLinearOutboxProcessed(row.id, undefined, row.payload_hash);
+      return;
     }
     const linear = await params.getLinearClient();
     if (!linear) throw new Error("No valid Linear OAuth token is stored");

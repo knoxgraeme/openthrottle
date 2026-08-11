@@ -19,10 +19,11 @@ openthrottle operator-skill status --json
 - `setup` verifies the canonical Daytona snapshot when local Daytona
   credentials are present and prints the one-time Fly secrets checklist.
 - `init` detects the GitHub origin/default branch and package scripts, writes
-  `.openthrottle.yml`, registers a Linear-team route with the deployed
-  supervisor, creates or refreshes the repository webhook, and verifies
-  GitHub/Daytona readiness. It also supports non-Node repositories with
-  manually entered commands.
+  `.openthrottle.yml`, registers the repository for either Linear-team or
+  GitHub-Issue control with the deployed supervisor, creates or refreshes the
+  repository webhook, and verifies GitHub/Daytona readiness. Linear control
+  asks for a team key and optional team ID; GitHub control does not. It also
+  supports non-Node repositories with manually entered commands.
 - `init --editable-skills` additionally scaffolds the editable implementation
   adapter for the simple pipeline at
   `.openthrottle/skills/implement-plan/`, writes its repository graph at
@@ -49,7 +50,8 @@ openthrottle operator-skill status --json
   OpenThrottle skill directory.
 
 Other environment values: `DAYTONA_API_KEY`/`DAYTONA_SNAPSHOT` for `setup`;
-optional `LINEAR_TEAM_KEY`/`LINEAR_TEAM_ID` defaults for `init`; and
+optional `LINEAR_TEAM_KEY`/`LINEAR_TEAM_ID` defaults when `init` selects Linear
+control; and
 `LINEAR_API_KEY`, optional `LINEAR_TEAM_ID`, and `OT_AGENT_APP_ID` for
 shipping.
 
@@ -60,12 +62,13 @@ snapshot once from the OpenThrottle repository:
 daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .
 ```
 
-`init` is idempotent. Re-run it to change a team route, base branch, or project
-commands. Editable scaffolding currently covers the simple pipeline's initial
-and repair implementation loops only; review, simplification, publication, and
-structured-unit roles remain platform-owned until their graph bindings can be
-represented faithfully. Repository registrations live in the supervisor's
-durable SQLite database; they are not Fly secrets.
+`init` is idempotent. Re-run it to change the selected control-provider route,
+base branch, or project commands. Editable scaffolding currently covers the
+simple pipeline's initial and repair implementation loops only; review,
+simplification, publication, and structured-unit roles remain platform-owned
+until their graph bindings can be represented faithfully. Repository
+registrations live in the supervisor's durable SQLite database; they are not
+Fly secrets.
 
 Repositories can recommend the local skill in their own onboarding docs with:
 

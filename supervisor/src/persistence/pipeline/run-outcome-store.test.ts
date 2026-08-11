@@ -408,18 +408,75 @@ describe("run outcome store", () => {
     expect(runOutcomes.getRunOutcome(instance.id)).toBeUndefined();
   });
 
-  it("is idempotent: a replayed call for an already-recorded instance is a no-op", () => {
+  it("corrects only a canceled outcome when exact provider evidence later ships the run", () => {
     db = openDb(":memory:");
     const instance = seedInstance(db);
     seedRun(db, "run-1", instance);
     const attempt = seedAttempt(db, instance.id, { id: "attempt-1", stageId: "units", runId: "run-1" });
 
     const runOutcomes = createRunOutcomeStore(db);
-    runOutcomes.recordSettlement(instance, attempt, { terminalOutcome: "shipped", outcome: "success" }, TS);
-    runOutcomes.recordSettlement(instance, attempt, { terminalOutcome: "failed", outcome: "failure" }, "2026-08-08T01:00:00.000Z");
+    runOutcomes.recordSettlement(instance, attempt, { terminalOutcome: "canceled", outcome: "canceled" }, TS);
+    runOutcomes.recordSettlement(
+      instance,
+      attempt,
+      { terminalOutcome: "shipped", outcome: "success" },
+      "2026-08-08T01:00:00.000Z"
+    );
 
     const outcome = runOutcomes.getRunOutcome(instance.id)!;
-    expect(outcome.outcome).toBe("shipped");
-    expect(outcome.created_at).toBe(TS);
+    expect(outcome).toMatchObject({
+      outcome: "shipped",
+      closed_reason: "success",
+      created_at: "2026-08-08T01:00:00.000Z",
+    });
   });
+
+  it.each([
+    {
+      first: { terminalOutcome: "shipped", outcome: "success" },
+      second: { terminalOutcome: "canceled", outcome: "canceled" },
+      expected: { outcome: "shipped", closed_reason: "success" },
+    },
+    {
+      first: { terminalOutcome: "failed", outcome: "failure" },
+      second: { terminalOutcome: "shipped", outcome: "success" },
+      expected: { outcome: "failed", closed_reason: "failure" },
+    },
+    {
+      first: { terminalOutcome: "canceled", outcome: "canceled" },
+      second: { terminalOutcome: "no_change", outcome: "no_change" },
+      expected: { outcome: "canceled", closed_reason: "canceled" },
+    },
+    {
+      first: { terminalOutcome: "canceled", outcome: "canceled" },
+      second: { terminalOutcome: "needs_human", outcome: "needs_human" },
+      expected: { outcome: "canceled", closed_reason: "canceled" },
+    },
+  ] as const)(
+    "keeps $first.terminalOutcome when a later $second.terminalOutcome settlement is not the canceled-to-shipped correction",
+    ({ first, second, expected }) => {
+      db = openDb(":memory:");
+      const instance = seedInstance(db);
+      seedRun(db, "run-1", instance);
+      const attempt = seedAttempt(db, instance.id, {
+        id: "attempt-1",
+        stageId: "units",
+        runId: "run-1",
+      });
+
+      const runOutcomes = createRunOutcomeStore(db);
+      runOutcomes.recordSettlement(instance, attempt, first, TS);
+      runOutcomes.recordSettlement(
+        instance,
+        attempt,
+        second,
+        "2026-08-08T01:00:00.000Z"
+      );
+
+      expect(runOutcomes.getRunOutcome(instance.id)).toMatchObject({
+        ...expected,
+        created_at: TS,
+      });
+    }
+  );
 });

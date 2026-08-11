@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import type { ControlThreadEvent } from "../../app/ports.js";
 
 const HTTP_TIMEOUT_MS = 15_000;
 const GITHUB_PULL_REQUEST_URL_PATTERN =
@@ -32,6 +33,7 @@ interface GithubPullRequest {
 
 interface GithubEventBase {
   repository: { full_name: string };
+  sender?: { login?: string };
 }
 
 interface GithubPullRequestEvent extends GithubEventBase {
@@ -79,6 +81,26 @@ interface GithubCheckSuiteEvent extends GithubEventBase {
   };
 }
 
+export interface GithubIssueThread {
+  number: number;
+  title: string;
+  html_url: string;
+  state?: "open" | "closed";
+  created_at?: string;
+  updated_at?: string;
+  closed_at?: string | null;
+  body?: string | null;
+  user?: { login: string };
+  labels?: Array<{ id?: string; name: string }> | { nodes?: Array<{ name: string }> };
+}
+
+export interface GithubIssuesEvent extends GithubEventBase {
+  kind: "issues";
+  action: string;
+  issue: GithubIssueThread;
+  label?: { name?: string };
+}
+
 export interface GithubIssueCommentEvent extends GithubEventBase {
   kind: "issue_comment";
   action: string;
@@ -90,13 +112,16 @@ export interface GithubIssueCommentEvent extends GithubEventBase {
     id: number;
     body?: string;
     html_url: string;
-    user?: { login: string };
+    created_at?: string;
+    updated_at?: string;
+    user?: { login: string; type?: string };
   };
 }
 
 export type GithubWebhookEvent =
   | GithubPullRequestEvent
   | GithubReviewEvent
+  | GithubIssuesEvent
   | GithubIssueCommentEvent
   | GithubWorkflowRunEvent
   | GithubCheckSuiteEvent;
@@ -150,6 +175,7 @@ function validatePullRequestEvent(payload: Record<string, unknown>): void {
 }
 
 const OPENTHROTTLE_WEBHOOK_EVENTS = [
+  "issues",
   "pull_request",
   "pull_request_review",
   "issue_comment",
@@ -158,6 +184,87 @@ const OPENTHROTTLE_WEBHOOK_EVENTS = [
 ] as const;
 
 export { OPENTHROTTLE_WEBHOOK_EVENTS };
+
+export type GithubIssueCommentClassification = "pull_request_comment" | "plain_issue_comment";
+export type GithubIssueControlWebhookEvent = GithubIssuesEvent | GithubIssueCommentEvent;
+export const GITHUB_CONTROL_LABEL = "openthrottle";
+export const GITHUB_ISSUE_CONTEXT_LIMIT = 64_000;
+export const GITHUB_ISSUE_CONTEXT_PAGE_LIMIT = 10;
+export const GITHUB_ISSUE_CONTEXT_FETCH_BYTE_LIMIT = 8 * 1024 * 1024;
+const GITHUB_ISSUE_EVENT_PAGE_LIMIT = 10;
+const GITHUB_ISSUE_TIMELINE_PAGE_LIMIT = 10;
+const GITHUB_ISSUE_TIMELINE_PAGE_BYTE_LIMIT = 512 * 1024;
+
+export function classifyGithubIssueComment(
+  event: GithubIssueCommentEvent
+): GithubIssueCommentClassification {
+  return event.issue.pull_request ? "pull_request_comment" : "plain_issue_comment";
+}
+
+export function githubIssueControlEvent(
+  event: GithubIssueControlWebhookEvent,
+  options: {
+    promptContext?: string;
+    sessionId?: string;
+    providerActivatedAt?: string;
+    providerActivationId?: string;
+    providerActivationAdvances?: boolean;
+    providerActivationPreviousId?: string;
+  } = {}
+): ControlThreadEvent {
+  const isIssue = event.kind === "issues";
+  const repository = event.repository.full_name;
+  const issueNumber = event.issue.number;
+  const threadId = `${repository}#${issueNumber}`;
+  const htmlUrl =
+    "html_url" in event.issue && typeof event.issue.html_url === "string"
+      ? event.issue.html_url
+      : `https://github.com/${repository}/issues/${issueNumber}`;
+  const body =
+    isIssue
+      ? event.issue.body ?? undefined
+      : event.comment.body;
+  const providerActivatedAt = isIssue
+    ? options.providerActivatedAt ?? event.issue.updated_at ?? event.issue.created_at
+    : undefined;
+  return {
+    provider: "github",
+    action: isIssue ? "created" : "prompted",
+    ...(providerActivatedAt ? { providerActivatedAt } : {}),
+    ...(isIssue && options.providerActivationId
+      ? { providerActivationId: options.providerActivationId }
+      : {}),
+    ...(isIssue && options.providerActivationAdvances
+      ? { providerActivationAdvances: true }
+      : {}),
+    ...(isIssue && options.providerActivationPreviousId
+      ? { providerActivationPreviousId: options.providerActivationPreviousId }
+      : {}),
+    promptContext: isIssue ? options.promptContext ?? body : undefined,
+    agentSession: {
+      id: options.sessionId ?? `github:${threadId}`,
+      threadId,
+      thread: {
+        id: threadId,
+        identifier: `GH-${issueNumber}`,
+        provider: "github",
+        route: { key: repository },
+        labels: isIssue ? event.issue.labels : undefined,
+      },
+    },
+    activity: event.kind === "issue_comment"
+      ? {
+          id: `github-comment:${event.comment.id}`,
+          content: { type: "text", body: body ?? "" },
+          body: body ?? "",
+        }
+      : {
+          id: `github-issue:${threadId}`,
+          content: { type: "text", body: body ?? "" },
+          body: htmlUrl,
+        },
+  };
+}
 
 export function parseGithubWebhook(eventName: string | undefined, raw: string): GithubWebhookEvent {
   const payload = parseObject(raw);
@@ -172,7 +279,18 @@ export function parseGithubWebhook(eventName: string | undefined, raw: string): 
   } else if (eventName === "pull_request_review") {
     validatePullRequestShape(payload);
   }
-  if (eventName === "pull_request_review") {
+  if (eventName === "issues") {
+    const issue = recordField(payload, "issue");
+    numberField(issue, "number");
+    stringField(issue, "title");
+    stringField(issue, "html_url");
+    if (issue.pull_request !== undefined) {
+      throw new Error("GitHub issues webhook unexpectedly references a pull request");
+    }
+    if (payload.label !== undefined) {
+      stringField(recordField(payload, "label"), "name");
+    }
+  } else if (eventName === "pull_request_review") {
     const review = recordField(payload, "review");
     numberField(review, "id");
     stringField(review, "state");
@@ -203,6 +321,317 @@ export function parseGithubWebhook(eventName: string | undefined, raw: string): 
   return { ...payload, kind: eventName } as unknown as GithubWebhookEvent;
 }
 
+export function githubIssueHasExactControlLabel(
+  labels: GithubIssueThread["labels"] | undefined
+): boolean {
+  const nodes = Array.isArray(labels) ? labels : labels?.nodes ?? [];
+  return nodes.some((label) => label.name === GITHUB_CONTROL_LABEL);
+}
+
+export function githubIssuesEventCarriesExactControlLabel(event: GithubIssuesEvent): boolean {
+  if (event.action === "labeled") return event.label?.name === GITHUB_CONTROL_LABEL;
+  if (event.action === "opened" || event.action === "reopened") {
+    return githubIssueHasExactControlLabel(event.issue.labels);
+  }
+  return false;
+}
+
+export type GithubRepositoryPermission =
+  | "none"
+  | "read"
+  | "triage"
+  | "write"
+  | "maintain"
+  | "admin";
+
+export function isAuthorizedGithubControlPermission(permission: GithubRepositoryPermission): boolean {
+  return ["triage", "write", "maintain", "admin"].includes(permission);
+}
+
+export async function getRepositoryCollaboratorPermission(
+  client: GithubClient,
+  repo: string,
+  username: string
+): Promise<GithubRepositoryPermission> {
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(username)) {
+    throw new Error("GitHub collaborator permission lookup requires a safe username");
+  }
+  const permission = await githubRequest<{
+    permission?: string;
+    role_name?: string;
+  }>(
+    client,
+    `/repos/${repo}/collaborators/${encodeURIComponent(username)}/permission`
+  );
+  const role = String(permission.role_name ?? permission.permission ?? "none").toLowerCase();
+  if (role === "admin") return "admin";
+  if (role === "maintain") return "maintain";
+  if (role === "write" || role === "push") return "write";
+  if (role === "triage") return "triage";
+  if (role === "read" || role === "pull") return "read";
+  return "none";
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;");
+}
+
+function boundedGithubIssueContext(input: {
+  identifier: string;
+  title: string;
+  body: string;
+  comments: Array<{
+    id: number;
+    body: string;
+    author: string;
+    url: string;
+    createdAt: string;
+  }>;
+  paginationTruncated: boolean;
+}): string {
+  const title = input.title.slice(0, 1_000);
+  const body = input.body.slice(0, 20_000);
+  const issue = [
+    `<issue identifier="${escapeXml(input.identifier)}">`,
+    `<title>${escapeXml(title)}</title>`,
+    `<description>${escapeXml(body)}</description>`,
+    `</issue>`,
+  ].join("");
+  const primary = [
+    `<primary-directive-thread comment-id="github-issue-body">`,
+    `<comment>${escapeXml(body || title)}</comment>`,
+    `</primary-directive-thread>`,
+  ].join("");
+  const optional = [...input.comments]
+    .sort((left, right) =>
+      left.createdAt.localeCompare(right.createdAt) || left.id - right.id
+    )
+    .map((comment) => [
+    `<other-thread comment-id="github-comment-${comment.id}" author="${escapeXml(comment.author)}" url="${escapeXml(comment.url)}" created-at="${escapeXml(comment.createdAt)}">`,
+    `<comment>${escapeXml(comment.body.slice(0, 4_000))}</comment>`,
+    `</other-thread>`,
+  ].join(""));
+  const selected: string[] = [];
+  let omitted = 0;
+  const omissionSection = (count: number) => [
+    `<other-thread comment-id="github-comments-omitted" author="openthrottle" omitted-count="${count}" pagination-truncated="${input.paginationTruncated}">`,
+    `<comment>Older GitHub Issue comments were omitted by the deterministic context bound.</comment>`,
+    `</other-thread>`,
+  ].join("");
+  for (let index = optional.length - 1; index >= 0; index -= 1) {
+    const candidate = optional[index]!;
+    const marker = omissionSection(omitted + index);
+    const parts = [issue, primary, marker, candidate, ...selected];
+    if (Buffer.byteLength(parts.join("\n"), "utf8") <= GITHUB_ISSUE_CONTEXT_LIMIT) {
+      selected.unshift(candidate);
+    } else {
+      omitted += 1;
+    }
+  }
+  const includeOmission = omitted > 0 || input.paginationTruncated;
+  const omission = includeOmission
+    ? omissionSection(omitted)
+    : undefined;
+  const parts = [issue, primary, ...(omission ? [omission] : []), ...selected];
+  while (Buffer.byteLength(parts.join("\n"), "utf8") > GITHUB_ISSUE_CONTEXT_LIMIT && selected.length > 0) {
+    selected.shift();
+    omitted += 1;
+    parts.splice(2, parts.length - 2,
+      omissionSection(omitted),
+      ...selected
+    );
+  }
+  return parts.join("\n");
+}
+
+export async function fetchGithubIssueLabels(
+  client: GithubClient,
+  repo: string,
+  issueNumber: number
+): Promise<Array<{ name: string }>> {
+  const issue = await githubRequest<GithubIssueThread>(client, `/repos/${repo}/issues/${issueNumber}`);
+  const labels = Array.isArray(issue.labels) ? issue.labels : issue.labels?.nodes ?? [];
+  return labels.map((label) => ({ name: label.name }));
+}
+
+export async function fetchGithubIssueLifecycle(
+  client: GithubClient,
+  repo: string,
+  issueNumber: number
+): Promise<{
+  state: "open" | "closed";
+  updatedAt: string;
+  labels: Array<{ name: string }>;
+}> {
+  const issue = await githubRequest<GithubIssueThread>(client, `/repos/${repo}/issues/${issueNumber}`);
+  if (issue.state !== "open" && issue.state !== "closed") {
+    throw new Error("GitHub Issue lifecycle lookup returned an invalid state");
+  }
+  const updatedAt = issue.updated_at ?? issue.created_at;
+  if (!updatedAt || Number.isNaN(Date.parse(updatedAt))) {
+    throw new Error("GitHub Issue lifecycle lookup returned an invalid timestamp");
+  }
+  const labels = Array.isArray(issue.labels) ? issue.labels : issue.labels?.nodes ?? [];
+  return { state: issue.state, updatedAt, labels: labels.map((label) => ({ name: label.name })) };
+}
+
+export type GithubIssueControlEventRecord = {
+  id: string;
+  kind: "closed" | "reopened" | "labeled" | "unlabeled";
+  createdAt: string;
+  actorLogin: string;
+};
+
+export type GithubIssueActivationCommentOrder =
+  | "activation_before_comment"
+  | "comment_before_activation"
+  | "unresolved";
+
+type GithubIssueTimelineEventRecord = {
+  id?: number | string;
+  event?: string;
+  created_at?: string;
+  actor?: { login?: string };
+  label?: { name?: string };
+};
+
+export async function compareGithubIssueActivationAndComment(
+  client: GithubClient,
+  repo: string,
+  issueNumber: number,
+  input: {
+    activation: { id: string; createdAt: string; actorLogin?: string };
+    comment: { id: string; createdAt: string; actorLogin: string };
+  }
+): Promise<GithubIssueActivationCommentOrder> {
+  let activationSeen = false;
+  let commentSeen = false;
+  for (let page = 1; page <= GITHUB_ISSUE_TIMELINE_PAGE_LIMIT; page += 1) {
+    const events = await githubBoundedJsonArrayRequest<GithubIssueTimelineEventRecord>(
+      client,
+      `/repos/${repo}/issues/${issueNumber}/timeline?per_page=100${page === 1 ? "" : `&page=${page}`}`,
+      GITHUB_ISSUE_TIMELINE_PAGE_BYTE_LIMIT
+    );
+    if (!events) return "unresolved";
+    for (const event of events) {
+      const id = event.id === undefined ? undefined : String(event.id);
+      const actorLogin = event.actor?.login;
+      const matchesActivation =
+        id === input.activation.id &&
+        (event.event === "labeled" || event.event === "reopened") &&
+        event.created_at === input.activation.createdAt &&
+        (input.activation.actorLogin === undefined ||
+          actorLogin?.toLowerCase() === input.activation.actorLogin.toLowerCase()) &&
+        (event.event !== "labeled" || event.label?.name === GITHUB_CONTROL_LABEL);
+      const matchesComment =
+        id === input.comment.id &&
+        event.event === "commented" &&
+        event.created_at === input.comment.createdAt &&
+        actorLogin?.toLowerCase() === input.comment.actorLogin.toLowerCase();
+      if (matchesActivation) activationSeen = true;
+      if (matchesComment) commentSeen = true;
+      if (activationSeen && commentSeen) {
+        return matchesComment
+          ? "activation_before_comment"
+          : "comment_before_activation";
+      }
+    }
+    if (events.length < 100) return "unresolved";
+  }
+  return "unresolved";
+}
+
+export async function fetchGithubIssueControlEvents(
+  client: GithubClient,
+  repo: string,
+  issueNumber: number
+): Promise<GithubIssueControlEventRecord[]> {
+  const controlEvents: GithubIssueControlEventRecord[] = [];
+  for (let page = 1; page <= GITHUB_ISSUE_EVENT_PAGE_LIMIT; page += 1) {
+    const events = await githubRequest<Array<{
+      id?: number | string;
+      event?: string;
+      created_at?: string;
+      label?: { name?: string };
+      actor?: { login?: string };
+    }>>(
+      client,
+      `/repos/${repo}/issues/${issueNumber}/events?per_page=100${page === 1 ? "" : `&page=${page}`}`
+    );
+    for (const event of events) {
+      const kind = event.event === "closed" || event.event === "reopened"
+        ? event.event
+        : (event.event === "labeled" || event.event === "unlabeled") &&
+            event.label?.name === GITHUB_CONTROL_LABEL
+          ? event.event
+          : undefined;
+      if (!kind || event.id === undefined || !event.created_at || !event.actor?.login ||
+          Number.isNaN(Date.parse(event.created_at))) continue;
+      controlEvents.push({
+        id: String(event.id),
+        kind,
+        createdAt: event.created_at,
+        actorLogin: event.actor.login,
+      });
+    }
+    if (events.length < 100) return controlEvents;
+  }
+  throw new Error("GitHub Issue event history exceeded the bounded scan");
+}
+
+export async function fetchGithubIssueContext(
+  client: GithubClient,
+  repo: string,
+  issueNumber: number
+): Promise<string> {
+  const issue = await githubRequest<GithubIssueThread>(client, `/repos/${repo}/issues/${issueNumber}`);
+  const comments: Array<{
+    id: number;
+    body?: string | null;
+    html_url?: string;
+    created_at?: string;
+    user?: { login?: string };
+  }> = [];
+  let fetchedBytes = 0;
+  let paginationTruncated = false;
+  for (let page = 1; page <= GITHUB_ISSUE_CONTEXT_PAGE_LIMIT; page += 1) {
+    const pageComments = await githubRequest<typeof comments>(
+      client,
+      `/repos/${repo}/issues/${issueNumber}/comments?per_page=100${page === 1 ? "" : `&page=${page}`}`
+    );
+    for (const comment of pageComments) {
+      const serializedBytes = Buffer.byteLength(JSON.stringify(comment), "utf8");
+      if (fetchedBytes + serializedBytes > GITHUB_ISSUE_CONTEXT_FETCH_BYTE_LIMIT) {
+        paginationTruncated = true;
+        break;
+      }
+      fetchedBytes += serializedBytes;
+      comments.push(comment);
+    }
+    if (paginationTruncated || pageComments.length < 100) break;
+    if (page === GITHUB_ISSUE_CONTEXT_PAGE_LIMIT) paginationTruncated = true;
+  }
+  return boundedGithubIssueContext({
+    identifier: `GH-${issue.number}`,
+    title: issue.title,
+    body: issue.body ?? "",
+    comments: comments
+      .map((comment) => ({
+        id: comment.id,
+        body: comment.body ?? "",
+        author: comment.user?.login ?? "unknown",
+        url: comment.html_url ?? `https://github.com/${repo}/issues/${issueNumber}#issuecomment-${comment.id}`,
+        createdAt: comment.created_at ?? "9999-12-31T23:59:59.999Z",
+      }))
+      .filter((comment) => comment.body.length > 0),
+    paginationTruncated,
+  });
+}
+
 export function isOpenthrottleBranch(ref: string | null | undefined): ref is string {
   return typeof ref === "string" && ref.startsWith("ot/");
 }
@@ -226,6 +655,7 @@ export interface GithubClient {
   token: string;
   apiBaseUrl?: string;
   fetch?: typeof fetch;
+  actorLogin?: string;
 }
 
 async function githubRequest<T>(
@@ -248,7 +678,57 @@ async function githubRequest<T>(
     throw new Error(`GitHub API error (${response.status}): ${await response.text()}`);
   }
   if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  const body = await response.text();
+  if (!body) return undefined as T;
+  return JSON.parse(body) as T;
+}
+
+async function githubBoundedJsonArrayRequest<T>(
+  client: GithubClient,
+  path: string,
+  maxBytes: number
+): Promise<T[] | undefined> {
+  const fetchImpl = client.fetch ?? fetch;
+  const response = await fetchImpl(`${client.apiBaseUrl ?? "https://api.github.com"}${path}`, {
+    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${client.token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub API error (${response.status}): ${await response.text()}`);
+  }
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    await response.body?.cancel();
+    return undefined;
+  }
+  if (!response.body) {
+    const body = await response.text();
+    if (Buffer.byteLength(body, "utf8") > maxBytes) return undefined;
+    const value: unknown = body ? JSON.parse(body) : [];
+    if (!Array.isArray(value)) throw new Error("GitHub API returned a non-array timeline page");
+    return value as T[];
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    totalBytes += value.byteLength;
+    if (totalBytes > maxBytes) {
+      await reader.cancel();
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  const body = Buffer.concat(chunks, totalBytes).toString("utf8");
+  const value: unknown = body ? JSON.parse(body) : [];
+  if (!Array.isArray(value)) throw new Error("GitHub API returned a non-array timeline page");
+  return value as T[];
 }
 
 async function githubTextTailRequest(
@@ -348,6 +828,42 @@ async function createRepositoryWebhook(
   });
 }
 
+export async function ensureRepositoryControlLabel(
+  client: GithubClient,
+  repo: string
+): Promise<"unchanged" | "created" | "renamed"> {
+  for (let page = 1; page <= 10; page += 1) {
+    const labels = await githubRequest<Array<{ name: string }>>(
+      client,
+      `/repos/${repo}/labels?per_page=100${page === 1 ? "" : `&page=${page}`}`
+    );
+    const exact = labels.find((label) => label.name === GITHUB_CONTROL_LABEL);
+    if (exact) return "unchanged";
+    const caseVariant = labels.find(
+      (label) => label.name.toLowerCase() === GITHUB_CONTROL_LABEL
+    );
+    if (caseVariant) {
+      await githubRequest(client, `/repos/${repo}/labels/${encodeURIComponent(caseVariant.name)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ new_name: GITHUB_CONTROL_LABEL }),
+      });
+      return "renamed";
+    }
+    if (labels.length < 100) break;
+  }
+  await githubRequest(client, `/repos/${repo}/labels`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: GITHUB_CONTROL_LABEL,
+      color: "0e8a16",
+      description: "Delegate this GitHub Issue to OpenThrottle",
+    }),
+  });
+  return "created";
+}
+
 export async function prepareRepository(
   client: GithubClient,
   input: {
@@ -434,6 +950,58 @@ export async function reconcileRepositoryWebhook(
     webhookAction: needsPatch ? "updated" : "unchanged",
     missingEvents,
   };
+}
+
+export interface FailedRepositoryWebhookDelivery {
+  id: number;
+  guid: string;
+  status_code: number;
+  redelivery: boolean;
+  delivered_at: string;
+}
+
+export async function listFailedRepositoryWebhookDeliveries(
+  client: GithubClient,
+  repo: string,
+  hookId: number,
+  limit = 50
+): Promise<FailedRepositoryWebhookDelivery[]> {
+  if (!Number.isSafeInteger(hookId) || hookId <= 0) {
+    throw new Error("GitHub webhook id must be a positive safe integer");
+  }
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    throw new Error("GitHub webhook delivery limit must be between 1 and 100");
+  }
+  const deliveries = await githubRequest<FailedRepositoryWebhookDelivery[]>(
+    client,
+    `/repos/${repo}/hooks/${hookId}/deliveries?per_page=${limit}`
+  );
+  return deliveries
+    .filter((delivery) => delivery.status_code < 200 || delivery.status_code >= 300)
+    .slice(0, limit)
+    .map((delivery) => ({
+      id: delivery.id,
+      guid: delivery.guid,
+      status_code: delivery.status_code,
+      redelivery: delivery.redelivery,
+      delivered_at: delivery.delivered_at,
+    }));
+}
+
+export async function redeliverRepositoryWebhookDelivery(
+  client: GithubClient,
+  repo: string,
+  hookId: number,
+  deliveryId: number
+): Promise<void> {
+  if (![hookId, deliveryId].every((value) => Number.isSafeInteger(value) && value > 0)) {
+    throw new Error("GitHub webhook and delivery ids must be positive safe integers");
+  }
+  await githubRequest<void>(
+    client,
+    `/repos/${repo}/hooks/${hookId}/deliveries/${deliveryId}/attempts`,
+    { method: "POST" }
+  );
 }
 
 export async function branchExists(
@@ -671,11 +1239,72 @@ export async function getRepositoryDirectoryAtCommit(
   if (files.length === 0) throw new Error(`${directory} package contains no regular files`);
   return { repository, commit: commit.toLowerCase(), directory, files };
 }
-// Every supervisor-authored PR comment starts with this prefix — enforced at
-// the single write path below — so the webhook filter can recognize the
-// pipeline's own comments without relying on account identity. That is what
-// lets a solo operator share one GitHub account with the pipeline.
+// Every supervisor-authored comment starts with this prefix. Marker text is a
+// stable upsert identity, not provenance: webhook handling trusts exact
+// persisted comment IDs and only defers a marker while its durable write
+// intent is still in flight.
 export const OPENTHROTTLE_COMMENT_MARKER_PREFIX = "<!-- openthrottle:";
+
+export function pipelineSummaryCommentMarker(identity: string): string {
+  if (!/^[A-Za-z0-9_.:/#-]{1,200}$/.test(identity)) {
+    throw new Error("GitHub comment identity is unsafe");
+  }
+  return `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-summary:${identity} -->`;
+}
+
+async function upsertIssueCommentWithMarker(
+  client: GithubClient,
+  repo: string,
+  issueNumber: number,
+  marker: string,
+  body: string
+): Promise<{ id: number; html_url: string }> {
+  if (!marker.startsWith(OPENTHROTTLE_COMMENT_MARKER_PREFIX) || !marker.endsWith(" -->")) {
+    throw new Error("GitHub comment marker is unsafe");
+  }
+  if (!body.startsWith(marker)) throw new Error("GitHub comment is missing its stable marker");
+  const candidates: Array<{
+    id: number;
+    body?: string;
+    html_url: string;
+    user?: { login?: string };
+  }> = [];
+  for (let page = 1; page <= 10; page += 1) {
+    const comments = await githubRequest<typeof candidates>(
+      client,
+      `/repos/${repo}/issues/${issueNumber}/comments?per_page=100${page === 1 ? "" : `&page=${page}`}`
+    );
+    candidates.push(...comments.filter((comment) =>
+      comment.body === marker || comment.body?.startsWith(`${marker}\n`) === true
+    ));
+    if (comments.length < 100) break;
+  }
+  let actorLogin = client.actorLogin;
+  if (!actorLogin && candidates.some((comment) => comment.user?.login)) {
+    try {
+      actorLogin = (await githubRequest<{ login?: string }>(client, "/user")).login;
+    } catch {
+      // Without an authenticated identity, never adopt an attributed comment:
+      // a user can type a syntactically valid marker too.
+    }
+  }
+  const existing = candidates.find((comment) =>
+    !comment.user?.login ||
+    (actorLogin !== undefined && comment.user.login.toLowerCase() === actorLogin.toLowerCase())
+  );
+  if (existing) {
+    return githubRequest(client, `/repos/${repo}/issues/comments/${existing.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ body }),
+    });
+  }
+  return githubRequest(client, `/repos/${repo}/issues/${issueNumber}/comments`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body }),
+  });
+}
 
 export async function upsertPullRequestComment(
   client: GithubClient,
@@ -684,29 +1313,36 @@ export async function upsertPullRequestComment(
   identity: string,
   body: string
 ): Promise<{ id: number; html_url: string }> {
-  if (!/^[A-Za-z0-9_.:-]{1,200}$/.test(identity)) throw new Error("GitHub comment identity is unsafe");
-  const marker = `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-summary:${identity} -->`;
-  if (!body.startsWith(marker)) throw new Error("GitHub pipeline summary is missing its stable marker");
-  let existing: { id: number; body?: string; html_url: string } | undefined;
-  for (let page = 1; page <= 10 && !existing; page += 1) {
-    const comments = await githubRequest<Array<{ id: number; body?: string; html_url: string }>>(
-      client,
-      `/repos/${repo}/issues/${pullNumber}/comments?per_page=100${page === 1 ? "" : `&page=${page}`}`
-    );
-    existing = comments.find((comment) => comment.body?.includes(marker));
-    if (comments.length < 100) break;
+  return upsertIssueCommentWithMarker(
+    client,
+    repo,
+    pullNumber,
+    pipelineSummaryCommentMarker(identity),
+    body
+  );
+}
+
+export async function upsertIssueStatusComment(
+  client: GithubClient,
+  repo: string,
+  issueNumber: number,
+  marker: string,
+  body: string
+): Promise<{ id: number; html_url: string }> {
+  return upsertIssueCommentWithMarker(client, repo, issueNumber, marker, body);
+}
+
+export async function pinIssueComment(
+  client: GithubClient,
+  repo: string,
+  commentId: number
+): Promise<void> {
+  if (!Number.isSafeInteger(commentId) || commentId <= 0) {
+    throw new Error("GitHub Issue comment id must be a positive safe integer");
   }
-  if (existing) {
-    return githubRequest(client, `/repos/${repo}/issues/comments/${existing.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ body }),
-    });
-  }
-  return githubRequest(client, `/repos/${repo}/issues/${pullNumber}/comments`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ body }),
+  await githubRequest<void>(client, `/repos/${repo}/issues/comments/${commentId}/pin`, {
+    method: "PUT",
+    headers: { "X-GitHub-Api-Version": "2026-03-10" },
   });
 }
 

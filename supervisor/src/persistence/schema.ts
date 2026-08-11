@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   generation INTEGER NOT NULL,
   state TEXT NOT NULL DEFAULT 'current',
   provider_conversation_id TEXT,
+  provider_activated_at TEXT,
+  provider_activation_id TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   superseded_at TEXT,
@@ -143,10 +145,28 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
   next_attempt_at TEXT,
   processed_at TEXT,
   last_error TEXT,
+  redelivered_at TEXT,
   received_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS webhook_deliveries_received_idx
   ON webhook_deliveries(received_at);
+
+CREATE TABLE IF NOT EXISTS github_webhook_redelivery_requests (
+  repository TEXT NOT NULL COLLATE NOCASE,
+  webhook_id INTEGER NOT NULL,
+  delivery_id INTEGER NOT NULL,
+  delivery_guid TEXT NOT NULL,
+  delivered_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('claimed', 'accepted', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+  next_attempt_at TEXT NOT NULL,
+  accepted_at TEXT,
+  last_error TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(repository, webhook_id, delivery_id)
+);
+CREATE INDEX IF NOT EXISTS github_webhook_redelivery_process_idx
+  ON github_webhook_redelivery_requests(status, next_attempt_at);
 
 CREATE TABLE IF NOT EXISTS repository_registrations (
   github_repo TEXT PRIMARY KEY COLLATE NOCASE,

@@ -26,6 +26,15 @@ run, use one registered test repository/team and capture:
 - a fenced semantic or command stage result;
 - PR creation and exact-subject provider evidence;
 - one failed review/check repair through the same native session;
+- a GitHub Issue control-thread delegation by an authorized repository actor,
+  proving the Issue-to-PR path without exposing Fly, Daytona, install, webhook,
+  supervisor, or operator-only credentials to the sandbox;
+- exact PR merge settlement and Issue close settlement observed in both orders
+  on equivalent fixtures: merge then close, and close then merge, with a single
+  monotonic terminal outcome and no reopened actor;
+- webhook delivery recovery: force one failed GitHub webhook delivery, run hook
+  reconciliation, and confirm it is requeued once and then processed exactly
+  once after the handler succeeds;
 - terminal Linear acknowledgement and sandbox cleanup.
 
 Skipping this exercise is a documented verification gap, not a reason to add

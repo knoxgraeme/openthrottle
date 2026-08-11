@@ -1,8 +1,9 @@
 # OpenThrottle
 
 OpenThrottle is a plan-first coding pipeline: delegate an approved Linear
-ticket, run an immutable configurable pipeline through fenced Daytona stages
-using Claude Code, Codex, or OpenCode, and review the resulting GitHub PR.
+ticket or labeled GitHub Issue, run an immutable configurable pipeline through
+fenced Daytona stages using Claude Code, Codex, or OpenCode, and review the
+resulting GitHub PR.
 
 The GitHub repository is `openthrottle-v2`; the product, CLI, npm package,
 and Daytona snapshot are all named `openthrottle`.
@@ -10,9 +11,9 @@ and Daytona snapshot are all named `openthrottle`.
 ## How it works
 
 ```text
-Linear ticket ──> Fly supervisor ──> Daytona sandbox ──> ot/* branch + PR
-     ▲                 │     ▲              │                    │
-     └── activities ───┘     └── outbox ────┴── GitHub events ──┘
+Linear ticket or GitHub Issue ──> Fly supervisor ──> Daytona ──> ot/* branch + PR
+          ▲                           │     ▲                        │
+          └──── activities/status ────┘     └──── GitHub events ────┘
 ```
 
 The supervisor authenticates and durably retries webhooks, pins the manifest,
@@ -64,11 +65,11 @@ fly secrets set SUPERVISOR_URL=... OT_STATUS_TOKEN=... OT_INSTALL_SECRET=... # p
 fly deploy
 ```
 
-Then install the Linear OAuth app through authenticated `/oauth/install`.
-Run `init` from each target repository; it detects the GitHub origin, writes
-the repo-local execution config, registers the Linear-team route in Fly's
-SQLite database, creates or refreshes that repository's GitHub webhook, and
-verifies the canonical Daytona snapshot:
+For Linear control, install the Linear OAuth app through authenticated
+`/oauth/install`. Run `init` from each target repository; it detects the GitHub
+origin, writes the repo-local execution config, registers either the Linear-team
+or GitHub-Issue route in Fly's SQLite database, creates or refreshes that
+repository's GitHub webhook, and verifies the canonical Daytona snapshot:
 
 ```bash
 npx openthrottle init
@@ -76,10 +77,14 @@ npx openthrottle ship docs/plans/my-change.md
 npx openthrottle status
 ```
 
-`init` requires `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN`. One Linear team
-currently routes to one GitHub repository; re-running `init` updates that
-registration without restarting Fly or creating a new Daytona snapshot.
-Delegations from unmatched teams fail closed.
+`init` requires `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN` and asks which control
+provider to use. One Linear team currently routes to one GitHub repository;
+GitHub-Issue control is repository-native and needs no Linear team. Re-running
+`init` updates that registration without restarting Fly or creating a new
+Daytona snapshot. Linear delegations from unmatched teams and GitHub Issues
+from unregistered repositories fail closed. In GitHub mode, an authorized
+collaborator starts work by applying the exact `openthrottle` label to an open
+Issue; the supervisor maintains a pinned status comment on that Issue.
 
 The team route also fixes the base branch each run is cut from. To target a
 different base for a single ticket, label the issue with a `branch` label before
