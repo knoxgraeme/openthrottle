@@ -117,6 +117,30 @@ describe("normalized stage artifacts", () => {
       expect(sanitizeArtifactText(secret, {})).not.toContain(secret.split("Bearer ")[1]);
       expect(sanitizeArtifactText(secret, {})).toContain("[REDACTED]");
     }
+
+    const proseRoots = [
+      "authentication",
+      "authorization",
+      "credential",
+      "credentials",
+      "token",
+      "tokens",
+    ];
+    const wrappedAuthorizationPrefixes = [
+      "Authorization:\nBearer ",
+      "Authorization:\r\n\tBearer ",
+      "Authorization:\\nBearer ",
+      "Authorization:\\r\\n\\tBearer ",
+      "{\"authorization\":\"\\nBearer ",
+      'summary: "{\\"authorization\\":\\"\\nBearer ',
+    ];
+    for (const root of proseRoots) {
+      for (const candidate of [root, `${root}-based...`]) {
+        for (const prefix of wrappedAuthorizationPrefixes) {
+          expect(sanitizeArtifactText(`${prefix}${candidate}`, {})).toContain("[REDACTED]");
+        }
+      }
+    }
   });
 
   it("records mechanical command context and never treats termination as success", () => {

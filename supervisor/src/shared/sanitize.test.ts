@@ -54,5 +54,31 @@ describe("sanitizeText", () => {
       expect(sanitizeText(secret, {})).toContain("[REDACTED]");
       expect(containsSecretShapedValue(secret)).toBe(true);
     }
+
+    const proseRoots = [
+      "authentication",
+      "authorization",
+      "credential",
+      "credentials",
+      "token",
+      "tokens",
+    ];
+    const wrappedAuthorizationPrefixes = [
+      "Authorization:\nBearer ",
+      "Authorization:\r\n\tBearer ",
+      "Authorization:\\nBearer ",
+      "Authorization:\\r\\n\\tBearer ",
+      "{\"authorization\":\"\\nBearer ",
+      'summary: "{\\"authorization\\":\\"\\nBearer ',
+    ];
+    for (const root of proseRoots) {
+      for (const candidate of [root, `${root}-based...`]) {
+        for (const prefix of wrappedAuthorizationPrefixes) {
+          const secret = `${prefix}${candidate}`;
+          expect(sanitizeText(secret, {})).toContain("[REDACTED]");
+          expect(containsSecretShapedValue(secret)).toBe(true);
+        }
+      }
+    }
   });
 });
