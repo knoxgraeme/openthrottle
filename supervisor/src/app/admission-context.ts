@@ -9,11 +9,22 @@ const LINEAR_CONTEXT_SECTION_KINDS = [
   "parent-issue",
   "other-thread",
 ] as const;
+const LINEAR_NESTED_ISSUE_MATERIAL_KINDS = [
+  "sub-issues",
+  "sub-issue",
+] as const;
+const LINEAR_CONTEXT_ELEMENT_KINDS = [
+  ...LINEAR_CONTEXT_SECTION_KINDS,
+  ...LINEAR_NESTED_ISSUE_MATERIAL_KINDS,
+] as const;
+const LINEAR_CONTEXT_SECTION_KIND_SET: ReadonlySet<string> = new Set(LINEAR_CONTEXT_SECTION_KINDS);
 
 type ContextSectionKind = typeof LINEAR_CONTEXT_SECTION_KINDS[number];
+type NestedIssueMaterialKind = typeof LINEAR_NESTED_ISSUE_MATERIAL_KINDS[number];
+type LinearContextElementKind = ContextSectionKind | NestedIssueMaterialKind;
 
 interface NestedSpan {
-  kind: ContextSectionKind;
+  kind: LinearContextElementKind;
   start: number;
   end: number;
 }
@@ -68,20 +79,24 @@ function issueIdentifierMismatchMessage(): string {
     "No sandbox was provisioned.";
 }
 
+function isContextSectionKind(kind: LinearContextElementKind): kind is ContextSectionKind {
+  return LINEAR_CONTEXT_SECTION_KIND_SET.has(kind);
+}
+
 function linearContextSections(context: string): ParsedLinearContextSections {
   const tokenPattern = new RegExp(
-    `</?(${LINEAR_CONTEXT_SECTION_KINDS.join("|")})\\b[^>]*>`,
+    `</?(${LINEAR_CONTEXT_ELEMENT_KINDS.join("|")})\\b[^>]*>`,
     "gi"
   );
   const sections: ContextSection[] = [];
   const stack: Array<{
-    kind: ContextSectionKind;
+    kind: LinearContextElementKind;
     start: number;
     nestedSpans: NestedSpan[];
   }> = [];
   for (const match of context.matchAll(tokenPattern)) {
     const raw = match[0]!;
-    const kind = match[1]!.toLowerCase() as ContextSectionKind;
+    const kind = match[1]!.toLowerCase() as LinearContextElementKind;
     const closing = raw.startsWith("</");
     if (!closing) {
       stack.push({ kind, start: match.index!, nestedSpans: [] });
@@ -104,6 +119,9 @@ function linearContextSections(context: string): ParsedLinearContextSections {
         end: end - root.start,
       });
     } else if (stack.length === 0) {
+      if (!isContextSectionKind(kind)) {
+        return { sections, error: invalidLinearContextShapeMessage() };
+      }
       sections.push({
         kind,
         text: context.slice(open.start, end),
@@ -178,7 +196,7 @@ function withoutSections(context: string, sections: ContextSection[]): string {
 
 function hasLinearContextStructuralDelimiter(context: string): boolean {
   return new RegExp(
-    `</?(?:${LINEAR_CONTEXT_SECTION_KINDS.join("|")})\\b[^>]*>`,
+    `</?(?:${LINEAR_CONTEXT_ELEMENT_KINDS.join("|")})\\b[^>]*>`,
     "i"
   ).test(context);
 }

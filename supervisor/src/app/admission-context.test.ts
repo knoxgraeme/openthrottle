@@ -5,6 +5,51 @@ import {
 } from "./admission-context.js";
 
 describe("bounded Linear admission context", () => {
+  it("strips OPE-147's contradictory selection from OPE-115 sub-issue metadata", () => {
+    const structuredSelection = [
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const simpleSelection = [
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "simple" }, null, 2),
+      "```",
+    ].join("\n");
+    const context = [
+      `<issue identifier="OPE-115">`,
+      `<title>Add the tune pipeline</title>`,
+      `<description>Implement the structured tune plan.\n${structuredSelection}</description>`,
+      `<sub-issues>`,
+      `<sub-issue identifier="OPE-147">`,
+      `<title>Accept dotted review heartbeat ids</title>`,
+      `<description>Ship this prerequisite through the simple pipeline.\n${simpleSelection}</description>`,
+      `</sub-issue>`,
+      `</sub-issues>`,
+      `</issue>`,
+      `<primary-directive-thread comment-id="retry">`,
+      `<comment>Retry OPE-115 from current main with Codex.</comment>`,
+      `</primary-directive-thread>`,
+    ].join("\n");
+
+    const result = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "OPE-115",
+    });
+
+    expect(result.selectionError).toBeUndefined();
+    expect(result.ordinaryLimitError).toBeUndefined();
+    expect(result.selectionContext).toContain("Add the tune pipeline");
+    expect(result.selectionContext).toContain('"graph_id": "structured"');
+    expect(result.selectionContext).toContain("Retry OPE-115 from current main with Codex.");
+    expect(result.selectionContext).not.toContain("OPE-147");
+    expect(result.selectionContext).not.toContain('"graph_id": "simple"');
+    expect(result.context).toContain('"graph_id": "structured"');
+    expect(result.context).not.toContain("OPE-147");
+    expect(result.context).not.toContain('"graph_id": "simple"');
+    expect(result.selectionContext.match(/```json openthrottle\.ship-selection\/v1/g)).toHaveLength(1);
+  });
+
   it("matches the captured delegated wire shape and strips its nested parent issue", () => {
     const context = [
       `<issue identifier="OPE-113">`,
