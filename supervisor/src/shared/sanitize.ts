@@ -5,14 +5,13 @@ const TOKEN_PATTERNS = [
   /\bsk-[A-Za-z0-9_-]+\b/g,
   /\blin_(?:api|oauth)_[A-Za-z0-9_]+\b/g,
 ];
-const BEARER_CANDIDATE = /\bBearer[ \t]+([A-Za-z0-9._~+/\-]+={0,2})/gi;
-const BEARER_PROSE = new Set(["authentication", "authorization", "credential", "credentials", "token", "tokens"]);
+const BEARER_CANDIDATE = /\bBearer(?:\s|\\[nrt])+([A-Za-z0-9._~+/\-]+={0,2})/gi;
+const BEARER_PROSE = /^(?:authentication|authorization|credentials?|tokens?)(?:-based)?\.*$/i;
 
 function isSecretBearerCandidate(text: string, candidate: string, offset: number): boolean {
   const context = text.slice(Math.max(0, offset - 48), offset).replaceAll("\\", "");
   if (/Authorization["']?[ \t]*:[ \t]*["']?[ \t]*$/i.test(context)) return true;
-  const proseCandidate = candidate.toLowerCase().replace(/\.+$/, "");
-  return !BEARER_PROSE.has(proseCandidate);
+  return !BEARER_PROSE.test(candidate);
 }
 
 function redactBearerSecrets(text: string): string {
@@ -68,5 +67,6 @@ export function sanitizeText(
     .sort((left, right) => right.length - left.length);
   for (const value of new Set(values)) sanitized = sanitized.split(value).join("[REDACTED]");
   for (const pattern of TOKEN_PATTERNS) sanitized = sanitized.replace(pattern, "[REDACTED]");
-  return redactBearerSecrets(sanitized).replace(/\bBearer[ \t]+\[REDACTED\]/gi, "[REDACTED]");
+  return redactBearerSecrets(sanitized)
+    .replace(/\bBearer(?:\s|\\[nrt])+\[REDACTED\]/gi, "[REDACTED]");
 }

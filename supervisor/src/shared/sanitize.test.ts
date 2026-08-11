@@ -36,7 +36,7 @@ describe("sanitizeText", () => {
   });
 
   it("distinguishes bearer-token shapes from ordinary bearer prose", () => {
-    const prose = "CODEX_AUTH_JSON bearer credentials. Supports Bearer authentication, and Bearer token.";
+    const prose = "CODEX_AUTH_JSON bearer credentials. Supports bearer token-based authentication and Bearer token.";
     expect(sanitizeText(prose, {})).toBe(prose);
     expect(containsSecretShapedValue(prose)).toBe(false);
 
@@ -45,6 +45,8 @@ describe("sanitizeText", () => {
       "Bearer k7dP3nQ9xR2mV8z",
       "Bearer opaque._~+/-value-1234567890=",
       "Authorization: Bearer abc123",
+      "Authorization: Bearer\nabc123",
+      "{\"authorization\":\"Bearer\\nabc123\"}",
       '{"authorization":"Bearer abc123"}',
       'summary: "{\\"authorization\\":\\"Bearer abc123\\"}"',
     ]) {

@@ -81,14 +81,13 @@ const SECRET_PATTERNS = [
   /sk-[A-Za-z0-9_-]+/g,
   /lin_(?:api|oauth)_[A-Za-z0-9_]+/g,
 ];
-const BEARER_CANDIDATE = /\bBearer[ \t]+([A-Za-z0-9._~+/\-]+={0,2})/gi;
-const BEARER_PROSE = new Set(["authentication", "authorization", "credential", "credentials", "token", "tokens"]);
+const BEARER_CANDIDATE = /\bBearer(?:\s|\\[nrt])+([A-Za-z0-9._~+/\-]+={0,2})/gi;
+const BEARER_PROSE = /^(?:authentication|authorization|credentials?|tokens?)(?:-based)?\.*$/i;
 
 function isSecretBearerCandidate(text, candidate, offset) {
   const context = text.slice(Math.max(0, offset - 48), offset).replaceAll("\\", "");
   if (/Authorization["']?[ \t]*:[ \t]*["']?[ \t]*$/i.test(context)) return true;
-  const proseCandidate = candidate.toLowerCase().replace(/\.+$/, "");
-  return !BEARER_PROSE.has(proseCandidate);
+  return !BEARER_PROSE.test(candidate);
 }
 
 function redactBearerSecrets(text) {
@@ -224,7 +223,8 @@ export function sanitizeArtifactText(value, env = process.env) {
     .sort((left, right) => right.length - left.length);
   for (const secret of secrets) output = output.split(secret).join("[REDACTED]");
   for (const pattern of SECRET_PATTERNS) output = output.replace(pattern, "[REDACTED]");
-  return redactBearerSecrets(output).replace(/\bBearer[ \t]+\[REDACTED\]/gi, "[REDACTED]");
+  return redactBearerSecrets(output)
+    .replace(/\bBearer(?:\s|\\[nrt])+\[REDACTED\]/gi, "[REDACTED]");
 }
 
 export function commandDiagnosticTail(value, env = process.env) {
