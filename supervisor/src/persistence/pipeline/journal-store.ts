@@ -92,7 +92,10 @@ function metadataForIssue(db: Database.Database, issueId: string): {
   return {
     team: matchingRegistration?.linear_team_key ?? teamKey ?? fallbackRegistration?.linear_team_key ?? "unknown",
     repository,
-    issue: ticket?.ticket_reference ?? issueId,
+    // `issue` predates provider-neutral tickets, but it is the journal's
+    // persisted ticket identity. Keep the provider-qualified durable ID here;
+    // a display reference is not unique across control providers.
+    issue: issueId,
   };
 }
 
@@ -140,9 +143,8 @@ export function createJournalStore(db: Database.Database, now: () => string): Pi
       const filters: string[] = [];
       const args: unknown[] = [];
       if (query.issueId) {
-        const metadata = metadataForIssue(db, query.issueId);
         filters.push("issue = ?");
-        args.push(metadata.issue);
+        args.push(query.issueId);
       } else if (query.issue) {
         filters.push("lower(issue) = lower(?)");
         args.push(query.issue);
