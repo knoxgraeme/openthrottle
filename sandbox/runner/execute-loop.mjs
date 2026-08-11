@@ -1583,7 +1583,10 @@ function privateRecoveryArtifact(request, worktreeDir, subject, env) {
     };
   }
   try {
-    const baseCommit = request.inputSubject ?? request.baseSubject ?? runRootGit(worktreeDir, ["rev-parse", "HEAD"]);
+    // inputSubject is the prior action's output tree for reusable worktrees
+    // (for example, implement -> simplify), not the commit checked out at
+    // HEAD. Candidate creation must stay anchored to the sealed worktree base.
+    const baseCommit = request.baseSubject ?? runRootGit(worktreeDir, ["rev-parse", "HEAD"]);
     const candidate = deriveCandidateCommit({
       worktreeDir,
       baseCommit,

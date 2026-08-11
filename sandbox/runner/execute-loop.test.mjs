@@ -3783,6 +3783,74 @@ describe("executeLoopAction", () => {
     });
   });
 
+  it("exports portable recovery for a simplify receipt failure after prior worktree output", () => {
+    const initial = request();
+    const worktreeDir = loopWorktreeDirectory(initial);
+    const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreeDir, encoding: "utf8" }).trim();
+    writeFileSync(join(worktreeDir, "implemented-before-simplify.txt"), "implemented\n");
+    const inputSubject = computeWorkspaceTreeOid(worktreeDir);
+    const valid = withFreshLoopFence(initial, {
+      loop: "simplify",
+      skill: "ce-simplify-code",
+      baseSubject: baseCommit,
+      inputSubject,
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn(() => {
+        writeFileSync(join(worktreeDir, "changed-by-simplify.txt"), "simplified\n");
+        const receipt = standardReceipt(valid, {
+          subject: {
+            base: baseCommit,
+            pre: inputSubject,
+            post: computeWorkspaceTreeOid(worktreeDir),
+          },
+        });
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: JSON.stringify({
+            ...receipt,
+            payload: { ...receipt.payload, summary: ["not-authoritative"] },
+          }),
+          stderr: "",
+          nativeSessionId: "native-simplify",
+          integrationRepoDir: "/tmp/integration-current",
+        };
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    const artifact = JSON.parse(result.recovery_artifact);
+    expect(artifact).toMatchObject({
+      base_commit: baseCommit,
+      candidate_commit: expect.stringMatching(/^[a-f0-9]{40}$/),
+      candidate_tree: expect.stringMatching(/^[a-f0-9]{40}$/),
+      changed_paths: expect.arrayContaining([
+        "implemented-before-simplify.txt",
+        "changed-by-simplify.txt",
+      ]),
+      diff_encoding: "git-diff",
+    });
+    expect(artifact).not.toHaveProperty("requires_workspace_preservation");
+
+    const recoveryRoot = mkdtempSync(join(tmpdir(), "ot-portable-recovery-"));
+    directories.push(recoveryRoot);
+    const recoveryRepo = join(recoveryRoot, "repo");
+    execFileSync("git", ["clone", "-q", worktreeDir, recoveryRepo]);
+    execFileSync("git", ["checkout", "--quiet", baseCommit], { cwd: recoveryRepo });
+    const recoveryPatch = join(recoveryRoot, "recovery.patch");
+    writeFileSync(recoveryPatch, Buffer.from(artifact.diff_base64, "base64"));
+    execFileSync("git", ["apply", recoveryPatch], { cwd: recoveryRepo });
+    expect(computeWorkspaceTreeOid(recoveryRepo)).toBe(artifact.candidate_tree);
+  });
+
   it("preserves work when a semantic receipt defect cannot be repaired from sealed authority", () => {
     const valid = request();
     const goodReceipt = standardReceipt(valid);
