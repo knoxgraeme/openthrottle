@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { canonicalJson, digestNormalized } from "../pipeline/manifest.js";
 import type { ExecutionGateReceipt, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
@@ -1324,6 +1325,7 @@ describe("structured child runtime repair fences", () => {
   });
 
   it("persists a loop receipt recovery artifact on terminal action failure", async () => {
+    const recoveryPayload = Buffer.from("compressed recovery bytes");
     const recoveryArtifact = canonicalJson({
       schema: "openthrottle.loop-receipt-recovery/v1",
       action_id: "implement-recovery",
@@ -1357,6 +1359,7 @@ describe("structured child runtime repair fences", () => {
           subject: "a".repeat(40),
           receipt: "agent_output_contract_failure: receipt correction exhausted",
           recoveryArtifact,
+          recoveryPayload,
           completedAt: "2099-07-22T12:00:00.000Z",
         }),
       } as any,
@@ -1386,6 +1389,13 @@ describe("structured child runtime repair fences", () => {
         schema: "openthrottle.execution-work-terminal-payload/v1",
         receipt_recovery_artifact: JSON.parse(recoveryArtifact),
       }),
+      privateArtifact: {
+        schema: "openthrottle.execution-work-private-artifact/v1",
+        manifest: recoveryArtifact,
+        payload: recoveryPayload,
+        payloadSha256: createHash("sha256").update(recoveryPayload).digest("hex"),
+        payloadBytes: recoveryPayload.byteLength,
+      },
     }));
   });
 

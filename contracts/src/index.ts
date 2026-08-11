@@ -90,6 +90,20 @@ export {
   type RatchetTunerAuthority,
 } from "./ratchet-contract.js";
 export {
+  EXECUTION_WORK_PRIVATE_ARTIFACT_SCHEMA,
+  LOOP_RECEIPT_RECOVERY_SCHEMA,
+  MAX_INLINE_RECOVERY_DIFF_BYTES,
+  MAX_PRIVATE_RECOVERY_DIFF_BYTES,
+  MAX_RECOVERY_CHANGED_PATHS,
+  parseLoopReceiptRecoveryContract,
+  validateLoopReceiptRecoveryContract,
+  type ExecutionWorkPrivatePayloadDescriptor,
+  type LoopReceiptRecoveryContract,
+  type LoopReceiptRecoveryPayloadDescriptor,
+  type LoopReceiptRecoveryPortable,
+  type LoopReceiptRecoveryPreserved,
+} from "./recovery.js";
+export {
   ASSURANCE_CLASSES,
   COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES,
   RECEIPT_RESULTS_BY_TYPE,

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { parseLoopReceiptRecoveryContract } from "@openthrottle/contracts";
 import type Database from "better-sqlite3";
 import {
   canonicalJson,
@@ -127,6 +129,14 @@ export interface ExecutionWorkAttempt {
   last_error: string | null;
 }
 
+export interface ExecutionWorkPrivateArtifact {
+  schema: "openthrottle.execution-work-private-artifact/v1";
+  manifest: string;
+  payload: Uint8Array;
+  payloadSha256: string;
+  payloadBytes: number;
+}
+
 export interface ExecutionGateReceipt {
   id: string;
   execution_graph_id: string;
@@ -187,6 +197,7 @@ export interface ExecutionUnitStore {
   getGraphForAttempt(parentAttemptId: string): ExecutionUnitGraph | undefined;
   listUnits(parentAttemptId: string): ExecutionUnitState[];
   listWorkAttempts(parentAttemptId: string): ExecutionWorkAttempt[];
+  pruneExecutionWorkPrivateArtifacts(beforeIso: string, limit: number): number;
   leaseNextUnitAction(input: {
     parentAttemptId: string;
     leaseOwner: string;
@@ -236,6 +247,7 @@ export interface ExecutionUnitStore {
     lastError: string;
     nativeSessionId?: string | null;
     terminalPayload?: string;
+    privateArtifact?: ExecutionWorkPrivateArtifact;
   }): ExecutionWorkAttempt;
   stopRetryableUnitAction(input: {
     actionId: string;
@@ -243,6 +255,7 @@ export interface ExecutionUnitStore {
     lastError: string;
     nativeSessionId?: string | null;
     terminalPayload?: string;
+    privateArtifact?: ExecutionWorkPrivateArtifact;
     observationExhaustion?: {
       expectedFailureCount: number;
       expectedEpoch: number;
@@ -652,6 +665,77 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     ) {
       throw new Error(`execution work attempt ${input.action.id} already terminated with a different result`);
     }
+  }
+
+  function persistPrivateArtifact(
+    actionId: string,
+    artifact: ExecutionWorkPrivateArtifact | undefined,
+    timestamp: string
+  ): void {
+    if (!artifact) return;
+    const payload = Buffer.from(artifact.payload);
+    const payloadHash = createHash("sha256").update(payload).digest("hex");
+    const manifest = parseLoopReceiptRecoveryContract(JSON.parse(artifact.manifest), {
+      source: `execution_work_private_artifact.${actionId}.manifest`,
+    }).value;
+    const privatePayload = "private_payload" in manifest ? manifest.private_payload : undefined;
+    if (artifact.schema !== "openthrottle.execution-work-private-artifact/v1" ||
+        Buffer.byteLength(artifact.manifest, "utf8") > 128 * 1024 ||
+        payload.byteLength === 0 || payload.byteLength > 8 * 1024 * 1024 ||
+        artifact.payloadBytes !== payload.byteLength ||
+        artifact.payloadSha256 !== payloadHash || manifest.action_id !== actionId ||
+        !privatePayload || privatePayload.bytes !== payload.byteLength ||
+        privatePayload.sha256 !== payloadHash) {
+      throw new Error(`execution work attempt ${actionId} has an invalid private artifact`);
+    }
+    const existing = db.prepare(`
+      SELECT schema, manifest, payload_sha256, payload_bytes
+      FROM execution_work_private_artifacts WHERE action_id = ?
+    `).get(actionId) as {
+      schema: string;
+      manifest: string;
+      payload_sha256: string;
+      payload_bytes: number;
+    } | undefined;
+    if (existing) {
+      if (existing.schema !== artifact.schema || existing.manifest !== artifact.manifest ||
+          existing.payload_sha256 !== payloadHash || existing.payload_bytes !== payload.byteLength) {
+        throw new Error(`execution work attempt ${actionId} private artifact replay mismatch`);
+      }
+      return;
+    }
+    db.prepare(`
+      INSERT INTO execution_work_private_artifacts (
+        action_id, schema, manifest, payload, payload_sha256, payload_bytes, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(actionId, artifact.schema, artifact.manifest, payload, payloadHash, payload.byteLength, timestamp);
+  }
+
+  function pruneExecutionWorkPrivateArtifacts(beforeIso: string, limit: number): number {
+    if (typeof beforeIso !== "string" || Number.isNaN(Date.parse(beforeIso))) {
+      throw new Error("execution work private artifact prune cutoff is invalid");
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new Error("execution work private artifact prune limit must be between 1 and 1000");
+    }
+    return db.prepare(`
+      DELETE FROM execution_work_private_artifacts
+      WHERE action_id IN (
+        SELECT artifact.action_id
+        FROM execution_work_private_artifacts AS artifact
+        JOIN execution_work_attempts AS action ON action.id = artifact.action_id
+        JOIN pipeline_instances AS instance ON instance.id = action.pipeline_instance_id
+        WHERE artifact.created_at < ?
+          AND instance.updated_at < ?
+          AND action.status IN ('completed', 'failed', 'dead')
+          AND instance.status IN (
+            'shipped', 'no_change', 'needs_human', 'canceled', 'superseded',
+            'failed', 'publication_blocked'
+          )
+        ORDER BY artifact.created_at, artifact.action_id
+        LIMIT ?
+      )
+    `).run(beforeIso, beforeIso, limit).changes;
   }
 
   function assertPreparedRequestReplayMatches(input: {
@@ -1108,6 +1192,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   ): ExecutionWorkAttempt => {
     const timestamp = now();
     const action = loadActiveAction(db, input.actionId);
+    persistPrivateArtifact(input.actionId, input.privateArtifact, timestamp);
     const lastError = input.lastError.slice(0, 2_000);
     if (action.status === "failed") {
       assertTerminalActionReplayMatches({
@@ -1171,6 +1256,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   ): ExecutionWorkAttempt => {
     const timestamp = now();
     const action = loadActiveAction(db, input.actionId);
+    persistPrivateArtifact(input.actionId, input.privateArtifact, timestamp);
     const observationExhaustion = input.observationExhaustion;
     if (
       observationExhaustion &&
@@ -1761,6 +1847,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     getStructuredExecutionPublicationForInstance(pipelineInstanceId) {
       return getStructuredExecutionPublicationForInstance(db, pipelineInstanceId);
     },
+    pruneExecutionWorkPrivateArtifacts,
     appendDownstreamContext,
     listDownstreamContext(parentAttemptId, toUnitId) {
       if (toUnitId != null) {

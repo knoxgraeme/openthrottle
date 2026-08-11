@@ -154,6 +154,7 @@ describe("database migrations", () => {
       "0550761a59df3d2178bcdfd5113c0d270c35fe090da08fb0f732eccf7d2d2fd3",
       "fd013193d587a17350c261bc411384c0420e432babc2cd87af648d8c1348a0d2",
       "4942852ca8dc280d8b9b86f79e7dc6621317667eaec0ec3c848fa1415fe67d48",
+      "acb5e6c121d5ed18ec87b5c717c190dd4a6c486a88824807c5c25c32b12edeb4",
     ]);
   });
 
@@ -218,7 +219,7 @@ describe("database migrations", () => {
     `).get()).toEqual({ name: "github_webhook_redelivery_process_idx" });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 39, name: "execution-work-observation-retry" });
+    `).get()).toEqual({ version: 40, name: "execution-work-private-artifacts" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
     });
@@ -268,7 +269,7 @@ describe("database migrations", () => {
     });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 39, name: "execution-work-observation-retry" });
+    `).get()).toEqual({ version: 40, name: "execution-work-private-artifacts" });
   });
 
   it("adds epoch-fenced observation retry defaults to a v38 work-attempt table", () => {

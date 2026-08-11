@@ -1665,6 +1665,22 @@ ALTER TABLE execution_work_attempts ADD COLUMN observation_epoch INTEGER NOT NUL
 const executionWorkObservationRetryMigrationSource = `${executionWorkObservationRetrySchema}
 execution-work-observation-retry-contract:transient child result observation failures persist bounded epoch-fenced retry state/v2`;
 
+const executionWorkPrivateArtifactsSchema = `
+CREATE TABLE execution_work_private_artifacts (
+  action_id TEXT PRIMARY KEY,
+  schema TEXT NOT NULL CHECK(schema = 'openthrottle.execution-work-private-artifact/v1'),
+  manifest TEXT NOT NULL CHECK(length(manifest) <= 131072),
+  payload BLOB NOT NULL CHECK(length(payload) > 0 AND length(payload) <= 8388608),
+  payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256) = 64),
+  payload_bytes INTEGER NOT NULL CHECK(payload_bytes > 0 AND payload_bytes <= 8388608),
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(action_id) REFERENCES execution_work_attempts(id) ON DELETE CASCADE
+);
+`;
+
+const executionWorkPrivateArtifactsMigrationSource = `${executionWorkPrivateArtifactsSchema}
+execution-work-private-artifact-contract:bounded recovery bytes live outside hot execution work rows and settle atomically/v1`;
+
 const executionPublicationEventsSchema = `
 CREATE TABLE execution_publication_events (
   id TEXT PRIMARY KEY,
@@ -3142,6 +3158,16 @@ const definitions: DatabaseMigrationDefinition[] = [
       }
       if (!hasColumns(db, "execution_work_attempts", ["observation_epoch"])) {
         db.exec("ALTER TABLE execution_work_attempts ADD COLUMN observation_epoch INTEGER NOT NULL DEFAULT 0 CHECK(observation_epoch >= 0)");
+      }
+    },
+  },
+  {
+    version: 40,
+    name: "execution-work-private-artifacts",
+    source: executionWorkPrivateArtifactsMigrationSource,
+    up(db) {
+      if (hasTable(db, "execution_work_attempts") && !hasTable(db, "execution_work_private_artifacts")) {
+        db.exec(executionWorkPrivateArtifactsSchema);
       }
     },
   },

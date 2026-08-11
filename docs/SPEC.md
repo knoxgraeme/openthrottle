@@ -425,6 +425,42 @@ holding that exact action's dispatch/replay lock. Exact replay removes any
 action-local repository-skill proposal before invoking the engine, so stale
 agent output cannot satisfy the receipt/proposal fence.
 
+A clean engine exit that contains exactly one parsed standard-receipt candidate
+may receive one deterministic envelope correction. Correction is executor code,
+not another model invocation: it may delete only validator-diagnosed unknown
+fields, set the top-level receipt schema, and replace exact fence, subject, or
+producer leaves for which the sealed request is authoritative. It validates the
+complete corrected receipt, reapplies every action fence, and requires all
+non-diagnosed content to remain byte-equivalent under canonical JSON. It never
+changes assurance, result, evidence, semantic payload values, or repository
+content, and it refuses missing semantic values or an unparsed candidate.
+Before correction, the executor atomically writes a root-owned
+`openthrottle.loop-receipt-correction/v1` state file bound to the attempt,
+action, and request hash. The diagnostic engine-output tail is capped at 64 KiB
+and the complete serialized state at 3 MiB; the Daytona collector enforces the
+same state-file ceiling. If the process stops before `result.json`, collection
+redispatches the same executor under the original action lock; the persisted
+state suppresses the original agent launch, making correction restart-safe and
+idempotent without repeating a provider request.
+
+When correction cannot safely produce a receipt, the executor emits an
+`openthrottle.loop-receipt-recovery/v1` artifact. Diffs through 48 KiB remain
+inline. Larger diffs through 8 MiB are gzip-compressed into the root-owned
+action directory and downloaded and hash/size/gzip verified before cleanup.
+The supervisor stores those compressed bytes atomically with terminal action
+settlement in `execution_work_private_artifacts`; the hot
+`execution_work_attempts.payload` row contains only the bounded manifest and
+private-payload digest/size pointer, never base64-expanded recovery bytes. The
+manifest schema and its inline, sandbox-external, and supervisor-persisted
+payload phases are closed shared contracts in `contracts/`. Changed paths use
+Git's reversible ASCII C-style quoting, so embedded newlines and non-UTF-8
+pathname bytes are never lossily decoded. The display array is unique and
+bounded to 256 entries/16 KiB of canonical JSON, with full count, digest, and
+truncation metadata. If a diff exceeds the platform bound or export,
+compression, download, or verification cannot produce portable evidence, the
+result is `needs_human`; normal terminal cleanup therefore stops and preserves
+the Daytona workspace instead of deleting the only recovery source.
+
 Native session continuation is materialized only from the exact sealed
 executor-owned package selected by the request. Claude and Codex packages must
 contain engine-native durable records for the selected session id, must be
@@ -790,7 +826,8 @@ SQLite is the authority. Core tables include:
   `pipeline_publication_receipts`, `pipeline_effect_intents`;
 - structured child execution: `execution_graphs`, `execution_units`,
   `execution_work_attempts`, `execution_review_subaction_dispatches`, `execution_gate_receipts`,
-  `execution_downstream_context`, `execution_publication_events`;
+  `execution_downstream_context`, `execution_publication_events`,
+  `execution_work_private_artifacts`;
 - cross-run orchestration history: `orchestration_journal`;
 - settlement rollup measurement corpus: `run_outcomes`;
 - operations: `repository_registrations`, `supervisor_leases`, `settings`,
@@ -1058,6 +1095,15 @@ action was active. A gate decision (`unit_acceptance`, `integration`, or
 receipt fence and producer bindings; the reducer only persists it once and
 applies its routing exactly once, so a replayed identical decision is a no-op
 rather than a duplicate repair round.
+
+`execution_work_private_artifacts` contains at most one bounded, digest-fenced
+recovery BLOB per `execution_work_attempts` row. Insertion and terminal action
+settlement share one SQLite transaction; replay must match the exact schema,
+manifest, byte count, and sha256 or fail closed. Ordinary work listings do not
+read the BLOB column. The periodic sweep deletes at most 100 BLOBs per pass once
+they are older than 30 days and their owning action and pipeline have both been
+terminal for that retention window; active pipelines and recent `needs_human`
+recovery remain available.
 
 `execution_gate_receipts` records deterministic child gate decisions by work
 attempt and gate kind. A receipt is accepted only after the typed child evidence

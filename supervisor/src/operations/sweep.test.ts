@@ -27,6 +27,7 @@ describe("runSweep", () => {
 
   it("deletes old orphan runtimes, protects active bindings, and prunes deliveries", async () => {
     const pipelines = createPipelineStore(db);
+    const prunePrivateArtifacts = vi.spyOn(pipelines, "pruneExecutionWorkPrivateArtifacts");
     const store = createSupervisorStore(db, pipelines);
     store.upsertUnpinned({
       ticket_id: "active",
@@ -81,6 +82,7 @@ describe("runSweep", () => {
       listLabeledResources: async () => [oldOrphan, newOrphan, knownActive],
     };
     const reconcileWebhooks = vi.fn(async () => undefined);
+    const sweepStartedAt = Date.now();
 
     await runSweep(
       runtime,
@@ -105,6 +107,12 @@ describe("runSweep", () => {
       { delivery_id: 2, status: "claimed" },
       { delivery_id: 3, status: "failed" },
     ]);
+    expect(prunePrivateArtifacts).toHaveBeenCalledOnce();
+    const [privateArtifactCutoff, privateArtifactLimit] = prunePrivateArtifacts.mock.calls[0]!;
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1_000;
+    expect(privateArtifactLimit).toBe(100);
+    expect(Date.parse(privateArtifactCutoff)).toBeGreaterThanOrEqual(sweepStartedAt - thirtyDaysMs);
+    expect(Date.parse(privateArtifactCutoff)).toBeLessThanOrEqual(Date.now() - thirtyDaysMs);
   });
 
   it("continues orphan cleanup and retention pruning when webhook reconciliation rejects", async () => {

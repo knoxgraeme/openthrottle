@@ -136,6 +136,9 @@ export interface LoopActionResult {
   // Contains a private, bounded recovery artifact persisted by the supervisor
   // before the sandbox may be cleaned up.
   recoveryArtifact?: string | null;
+  // Compressed recovery bytes are deliberately separate from the JSON result
+  // so they can be stored in a cold BLOB row without inflating hot work rows.
+  recoveryPayload?: Uint8Array | null;
 }
 
 export interface ChildExecutorActionRequest {

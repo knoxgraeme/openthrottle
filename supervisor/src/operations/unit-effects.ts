@@ -1,5 +1,9 @@
 import { digestCanonicalJson } from "@openthrottle/contracts";
-import type { ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
+import type {
+  ExecutionUnitStore,
+  ExecutionWorkAttempt,
+  ExecutionWorkPrivateArtifact,
+} from "../persistence/pipeline/unit-store.js";
 import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
 import { serializeRuntimeObservationError } from "../runtime/observation-error.js";
 import { sanitizeText } from "../shared/sanitize.js";
@@ -26,6 +30,7 @@ export interface UnitEffectRuntime {
     lastError: string;
     nativeSessionId?: string | null;
     terminalPayload?: string;
+    privateArtifact?: ExecutionWorkPrivateArtifact;
   } | null>;
 }
 
@@ -127,6 +132,7 @@ export function createUnitEffectProcessor(input: {
                 lastError: recovered.lastError,
                 nativeSessionId: recovered.nativeSessionId,
                 terminalPayload: recovered.terminalPayload,
+                privateArtifact: recovered.privateArtifact,
               });
               return action;
             }
@@ -137,6 +143,7 @@ export function createUnitEffectProcessor(input: {
               lastError: recovered.lastError,
               nativeSessionId: recovered.nativeSessionId,
               terminalPayload: recovered.terminalPayload,
+              privateArtifact: recovered.privateArtifact,
             });
             return action;
           }

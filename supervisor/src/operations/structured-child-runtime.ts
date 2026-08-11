@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   EXECUTION_PLAN_SCHEMA,
   deriveReviewSubactionActionId,
@@ -66,9 +67,15 @@ import {
 } from "../pipeline/execution-gates.js";
 import type { PipelineInstance, PipelineStore } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
-import type { ExecutionGateReceipt, ExecutionUnitStore, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
+import type {
+  ExecutionGateReceipt,
+  ExecutionUnitStore,
+  ExecutionWorkAttempt,
+  ExecutionWorkPrivateArtifact,
+} from "../persistence/pipeline/unit-store.js";
 import type {
   ChildExecutorActionRequest,
+  ChildExecutorActionResult,
   LoopActionRequest,
   LoopActionResult,
   RuntimeResource,
@@ -90,6 +97,31 @@ function terminalPayloadForLoopResult(result: LoopActionResult): string | undefi
   return canonicalJson({
     schema: "openthrottle.execution-work-terminal-payload/v1",
     receipt_recovery_artifact: JSON.parse(result.recoveryArtifact) as unknown,
+  });
+}
+
+function privateArtifactForLoopResult(result: LoopActionResult): ExecutionWorkPrivateArtifact | undefined {
+  if (!result.recoveryArtifact || !result.recoveryPayload) return undefined;
+  const payload = Buffer.from(result.recoveryPayload);
+  return {
+    schema: "openthrottle.execution-work-private-artifact/v1",
+    manifest: result.recoveryArtifact,
+    payload,
+    payloadSha256: createHash("sha256").update(payload).digest("hex"),
+    payloadBytes: payload.byteLength,
+  };
+}
+
+function actionResultHash(result: ChildExecutorActionResult | LoopActionResult): string {
+  if (!("recoveryPayload" in result) || !result.recoveryPayload) return digestCanonicalJson(result);
+  const { recoveryPayload, ...boundedResult } = result;
+  const payload = Buffer.from(recoveryPayload);
+  return digestCanonicalJson({
+    ...boundedResult,
+    recoveryPayload: {
+      bytes: payload.byteLength,
+      sha256: createHash("sha256").update(payload).digest("hex"),
+    },
   });
 }
 
@@ -1009,6 +1041,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
     lastError: string;
     terminalPayload?: string;
+    privateArtifact?: ExecutionWorkPrivateArtifact;
   }> => {
     const receipts: SemanticReviewReceipt[] = [];
     const receiptResults: Array<{
@@ -1036,7 +1069,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (result.outcome !== "success") {
         return {
           terminal: true,
-          resultHash: digestCanonicalJson(result),
+          resultHash: actionResultHash(result),
           outcome: result.outcome === "retryable_infrastructure_failure"
             ? "retryable_infrastructure_failure"
             : result.outcome === "needs_human"
@@ -1044,6 +1077,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
               : "failure",
           lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
           terminalPayload: terminalPayloadForLoopResult(result),
+          privateArtifact: privateArtifactForLoopResult(result),
         };
       }
       let receipt: StandardReceipt;
@@ -1052,7 +1086,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       } catch {
         return {
           terminal: true,
-          resultHash: digestCanonicalJson(result),
+          resultHash: actionResultHash(result),
           outcome: "failure",
           lastError: `review fanout action ${request.actionId} returned malformed success receipt`,
         };
@@ -1060,7 +1094,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (receipt.type !== "semantic_review") {
         return {
           terminal: true,
-          resultHash: digestCanonicalJson(result),
+          resultHash: actionResultHash(result),
           outcome: "failure",
           lastError: `review fanout action ${request.actionId} returned ${receipt.type}, expected semantic_review`,
         };
@@ -1082,7 +1116,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       } catch (error) {
         return {
           terminal: true,
-          resultHash: digestCanonicalJson(result),
+          resultHash: actionResultHash(result),
           outcome: "failure",
           lastError: `review fanout action ${request.actionId} returned invalid receipt: ${
             sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
@@ -1093,7 +1127,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (!dispatch?.dispatched_at || !dispatch.dispatch_time_source) {
         return {
           terminal: true,
-          resultHash: digestCanonicalJson(result),
+          resultHash: actionResultHash(result),
           outcome: "failure",
           lastError: `review fanout action ${request.actionId} has no persisted dispatch timing`,
         };
@@ -1140,6 +1174,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
     lastError: string;
     terminalPayload?: string;
+    privateArtifact?: ExecutionWorkPrivateArtifact;
   }> => {
     const result = input.precollected ?? await reviewRuntimeCall(
       `review subaction ${input.request.actionId} result collection failed`,
@@ -1154,12 +1189,13 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     if (result.outcome !== "success") {
       return {
         terminal: true,
-        resultHash: digestCanonicalJson(result),
+        resultHash: actionResultHash(result),
         outcome: result.outcome === "retryable_infrastructure_failure"
           ? "retryable_infrastructure_failure"
           : result.outcome === "needs_human" ? "needs_human" : "failure",
         lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
         terminalPayload: terminalPayloadForLoopResult(result),
+        privateArtifact: privateArtifactForLoopResult(result),
       };
     }
     let receipt: StandardReceipt;
@@ -1188,7 +1224,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     } catch (error) {
       return {
         terminal: true,
-        resultHash: digestCanonicalJson(result),
+        resultHash: actionResultHash(result),
         outcome: "failure",
         lastError: `review subaction ${input.request.actionId} returned invalid receipt: ${
           sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
@@ -2146,6 +2182,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     lastError: string;
     nativeSessionId?: string | null;
     terminalPayload?: string;
+    privateArtifact?: ExecutionWorkPrivateArtifact;
   } | null> => {
     if (!action.request_hash) return null;
     if (action.action_kind === "final_review") {
@@ -2216,7 +2253,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       receipt: StandardReceipt,
       decision?: ReturnType<typeof evaluateUnitAcceptanceGate>
     ) => ({
-      resultHash: digestCanonicalJson(result),
+      resultHash: actionResultHash(result),
       outputSubject,
       receipt: canonicalJson(receipt),
       nativeSessionId,
@@ -2251,13 +2288,16 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           : "failure";
       return {
         terminal: true,
-        resultHash: digestCanonicalJson(result),
+        resultHash: actionResultHash(result),
         outcome,
         lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
         nativeSessionId,
         terminalPayload: actionIsChildExecutor
           ? undefined
           : terminalPayloadForLoopResult(result as LoopActionResult),
+        privateArtifact: actionIsChildExecutor
+          ? undefined
+          : privateArtifactForLoopResult(result as LoopActionResult),
       };
     }
     let receipt: StandardReceipt;
@@ -2266,7 +2306,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     } catch (error) {
       return {
         terminal: true,
-        resultHash: digestCanonicalJson(result),
+        resultHash: actionResultHash(result),
         outcome: "failure",
         lastError: `child action ${action.id} returned malformed ${result.outcome} receipt: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
         nativeSessionId,
@@ -2314,7 +2354,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           lead: receipt as UnitDecisionReceipt,
         });
         return {
-          resultHash: digestCanonicalJson(result),
+          resultHash: actionResultHash(result),
           outputSubject: acceptedSubject,
           receipt: canonicalJson(receipt),
           nativeSessionId,
@@ -2368,7 +2408,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     } catch (error) {
       return {
         terminal: true,
-        resultHash: digestCanonicalJson(result),
+        resultHash: actionResultHash(result),
         outcome: "failure",
         lastError: `child action ${action.id} returned invalid ${result.outcome} receipt: ${
           sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
