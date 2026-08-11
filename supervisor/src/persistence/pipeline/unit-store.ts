@@ -118,6 +118,7 @@ export interface ExecutionWorkAttempt {
   lease_until: string | null;
   observation_failure_count: number;
   observation_retry_at: string | null;
+  observation_epoch: number;
   output_subject: string | null;
   payload: string;
   created_at: string;
@@ -201,11 +202,18 @@ export interface ExecutionUnitStore {
   }): ExecutionWorkAttempt;
   markActionWorktreeReady(actionId: string): void;
   markActionDispatched(actionId: string, requestHash: string, nativeSessionId?: string | null): void;
+  clearActionObservationFailure(input: {
+    actionId: string;
+    expectedFailureCount: number;
+    expectedEpoch: number;
+  }): "cleared" | "stale";
   recordActionObservationFailure(input: {
     actionId: string;
+    expectedFailureCount: number;
+    expectedEpoch: number;
     lastError: string;
     retryAtIso: string;
-  }): void;
+  }): "recorded" | "stale";
   completeUnitAction(input: {
     actionId: string;
     resultHash: string;
@@ -233,6 +241,11 @@ export interface ExecutionUnitStore {
     resultHash: string;
     lastError: string;
     nativeSessionId?: string | null;
+    observationExhaustion?: {
+      expectedFailureCount: number;
+      expectedEpoch: number;
+      exhaustedFailureCount: 3;
+    };
   }): ExecutionWorkAttempt;
   emitAggregateOnce(input: {
     parentAttemptId: string;
@@ -1143,6 +1156,30 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   ): ExecutionWorkAttempt => {
     const timestamp = now();
     const action = loadActiveAction(db, input.actionId);
+    const observationExhaustion = input.observationExhaustion;
+    if (
+      observationExhaustion &&
+      (
+        !Number.isInteger(observationExhaustion.expectedFailureCount) ||
+        observationExhaustion.expectedFailureCount < 0 ||
+        !Number.isInteger(observationExhaustion.expectedEpoch) ||
+        observationExhaustion.expectedEpoch < 0 ||
+        observationExhaustion.exhaustedFailureCount !== 3 ||
+        observationExhaustion.expectedFailureCount + 1 !== observationExhaustion.exhaustedFailureCount
+      )
+    ) {
+      throw new Error(`execution work attempt ${input.actionId} has an invalid observation exhaustion fence`);
+    }
+    if (
+      observationExhaustion &&
+      (
+        !["leased", "dispatched", "running"].includes(action.status) ||
+        action.observation_failure_count !== observationExhaustion.expectedFailureCount ||
+        action.observation_epoch !== observationExhaustion.expectedEpoch
+      )
+    ) {
+      return action;
+    }
     const lastError = `retryable_infrastructure_failure: ${input.lastError}`.slice(0, 2_000);
     if (action.status === "dead") {
       assertTerminalActionReplayMatches({
@@ -1165,9 +1202,27 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       UPDATE execution_work_attempts
       SET status = 'dead', result_hash = ?, terminal_result_outcome = 'retryable_infrastructure_failure',
           native_session_id = COALESCE(?, native_session_id),
-          lease_until = NULL, last_error = ?, completed_at = ?, updated_at = ?
+          lease_until = NULL,
+          observation_failure_count = CASE WHEN ? IS NULL THEN observation_failure_count ELSE ? END,
+          observation_retry_at = CASE WHEN ? IS NULL THEN observation_retry_at ELSE NULL END,
+          last_error = ?, completed_at = ?, updated_at = ?
       WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
-    `).run(input.resultHash, input.nativeSessionId ?? null, lastError, timestamp, timestamp, input.actionId);
+        AND (? IS NULL OR (observation_failure_count = ? AND observation_epoch = ?))
+    `).run(
+      input.resultHash,
+      input.nativeSessionId ?? null,
+      observationExhaustion?.expectedFailureCount ?? null,
+      observationExhaustion?.exhaustedFailureCount ?? null,
+      observationExhaustion?.expectedFailureCount ?? null,
+      lastError,
+      timestamp,
+      timestamp,
+      input.actionId,
+      observationExhaustion?.expectedFailureCount ?? null,
+      observationExhaustion?.expectedFailureCount ?? null,
+      observationExhaustion?.expectedEpoch ?? null
+    );
+    if (update.changes !== 1 && observationExhaustion) return loadActiveAction(db, input.actionId);
     if (update.changes !== 1) throw new Error(`execution work attempt ${input.actionId} retryable stop compare-and-set failed`);
     const graph = graphStmt.get(action.parent_attempt_id) as ExecutionUnitGraph | undefined;
     if (graph && !graph.aggregate_emitted_at && !graph.stopped_at) {
@@ -1577,14 +1632,50 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       `).run(requestHash, nativeSessionId, timestamp, actionId);
       if (update.changes !== 1) throw new Error(`execution work attempt ${actionId} is not active`);
     },
-    recordActionObservationFailure(input) {
-      db.prepare(`
+    clearActionObservationFailure(input) {
+      if (
+        !Number.isInteger(input.expectedFailureCount) || input.expectedFailureCount < 0 ||
+        !Number.isInteger(input.expectedEpoch) || input.expectedEpoch < 0
+      ) {
+        throw new Error(`execution work attempt ${input.actionId} has an invalid observation clear fence`);
+      }
+      const update = db.prepare(`
         UPDATE execution_work_attempts
-        SET lease_owner = NULL, observation_failure_count = observation_failure_count + 1,
+        SET observation_epoch = observation_epoch + 1,
+            observation_failure_count = 0,
+            observation_retry_at = NULL,
+            last_error = NULL,
+            updated_at = ?
+        WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
+          AND observation_failure_count = ? AND observation_epoch = ?
+      `).run(now(), input.actionId, input.expectedFailureCount, input.expectedEpoch);
+      return update.changes === 1 ? "cleared" : "stale";
+    },
+    recordActionObservationFailure: db.transaction((input) => {
+      if (
+        !Number.isInteger(input.expectedFailureCount) ||
+        input.expectedFailureCount < 0 || input.expectedFailureCount >= 2 ||
+        !Number.isInteger(input.expectedEpoch) || input.expectedEpoch < 0
+      ) {
+        throw new Error(`execution work attempt ${input.actionId} has an invalid observation failure fence`);
+      }
+      const update = db.prepare(`
+        UPDATE execution_work_attempts
+        SET lease_owner = NULL, observation_failure_count = ?,
             observation_retry_at = ?, last_error = ?, updated_at = ?
         WHERE id = ? AND status IN ('leased', 'dispatched', 'running')
-      `).run(input.retryAtIso, input.lastError.slice(0, 2_000), now(), input.actionId);
-    },
+          AND observation_failure_count = ? AND observation_epoch = ?
+      `).run(
+        input.expectedFailureCount + 1,
+        input.retryAtIso,
+        input.lastError.slice(0, 2_000),
+        now(),
+        input.actionId,
+        input.expectedFailureCount,
+        input.expectedEpoch
+      );
+      return update.changes === 1 ? "recorded" : "stale";
+    }),
     completeUnitAction,
     completeGatedAction,
     failUnitAction,

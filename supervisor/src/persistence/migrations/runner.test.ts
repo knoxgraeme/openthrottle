@@ -153,7 +153,7 @@ describe("database migrations", () => {
       "be4b0a09caf911013a376efe34aed76843fc89901c59dfe195eda0be4b4a852a",
       "0550761a59df3d2178bcdfd5113c0d270c35fe090da08fb0f732eccf7d2d2fd3",
       "fd013193d587a17350c261bc411384c0420e432babc2cd87af648d8c1348a0d2",
-      "2e2820cedd8111728c0edc63a058077b69fe44414a3b7bf3dd8c733865bf4aa5",
+      "4942852ca8dc280d8b9b86f79e7dc6621317667eaec0ec3c848fa1415fe67d48",
     ]);
   });
 
@@ -271,6 +271,42 @@ describe("database migrations", () => {
     `).get()).toEqual({ version: 39, name: "execution-work-observation-retry" });
   });
 
+  it("adds epoch-fenced observation retry defaults to a v38 work-attempt table", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      CREATE TABLE execution_work_attempts (id TEXT PRIMARY KEY);
+      INSERT INTO execution_work_attempts(id) VALUES ('legacy-action');
+    `);
+    for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 38)) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-08-11T00:05:00.987Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare(`
+      SELECT observation_failure_count, observation_retry_at, observation_epoch
+      FROM execution_work_attempts WHERE id = 'legacy-action'
+    `).get()).toEqual({
+      observation_failure_count: 0,
+      observation_retry_at: null,
+      observation_epoch: 0,
+    });
+    expect(db.prepare(`
+      SELECT name, "notnull", dflt_value
+      FROM pragma_table_info('execution_work_attempts')
+      WHERE name = 'observation_epoch'
+    `).get()).toEqual({ name: "observation_epoch", notnull: 1, dflt_value: "0" });
+  });
+
   it("commits a complete ledger that reopens idempotently from a real SQLite file", () => {
     const directory = mkdtempSync(join(tmpdir(), "openthrottle-migration-"));
     temporaryDirectories.push(directory);
@@ -332,6 +368,11 @@ describe("database migrations", () => {
       SELECT name FROM sqlite_master
       WHERE type = 'index' AND name = 'execution_units_graph_status_idx'
     `).get()).toEqual({ name: "execution_units_graph_status_idx" });
+    expect(db.prepare(`
+      SELECT name, "notnull", dflt_value
+      FROM pragma_table_info('execution_work_attempts')
+      WHERE name = 'observation_epoch'
+    `).get()).toEqual({ name: "observation_epoch", notnull: 1, dflt_value: "0" });
     expect(db.prepare(`
       SELECT COUNT(*) AS count FROM pragma_foreign_key_list('execution_units')
       WHERE "table" = 'execution_graphs'

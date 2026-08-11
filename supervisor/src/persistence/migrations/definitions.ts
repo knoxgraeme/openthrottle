@@ -1659,10 +1659,11 @@ terminal-child-result-contract:child action terminal replay compares exact failu
 const executionWorkObservationRetrySchema = `
 ALTER TABLE execution_work_attempts ADD COLUMN observation_failure_count INTEGER NOT NULL DEFAULT 0 CHECK(observation_failure_count >= 0);
 ALTER TABLE execution_work_attempts ADD COLUMN observation_retry_at TEXT;
+ALTER TABLE execution_work_attempts ADD COLUMN observation_epoch INTEGER NOT NULL DEFAULT 0 CHECK(observation_epoch >= 0);
 `;
 
 const executionWorkObservationRetryMigrationSource = `${executionWorkObservationRetrySchema}
-execution-work-observation-retry-contract:transient child result observation failures persist bounded retry state/v1`;
+execution-work-observation-retry-contract:transient child result observation failures persist bounded epoch-fenced retry state/v2`;
 
 const executionPublicationEventsSchema = `
 CREATE TABLE execution_publication_events (
@@ -3138,6 +3139,9 @@ const definitions: DatabaseMigrationDefinition[] = [
       }
       if (!hasColumns(db, "execution_work_attempts", ["observation_retry_at"])) {
         db.exec("ALTER TABLE execution_work_attempts ADD COLUMN observation_retry_at TEXT");
+      }
+      if (!hasColumns(db, "execution_work_attempts", ["observation_epoch"])) {
+        db.exec("ALTER TABLE execution_work_attempts ADD COLUMN observation_epoch INTEGER NOT NULL DEFAULT 0 CHECK(observation_epoch >= 0)");
       }
     },
   },

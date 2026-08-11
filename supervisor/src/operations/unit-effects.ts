@@ -73,6 +73,11 @@ export function createUnitEffectProcessor(input: {
               }),
               lastError,
               nativeSessionId: action.native_session_id,
+              observationExhaustion: {
+                expectedFailureCount: action.observation_failure_count,
+                expectedEpoch: action.observation_epoch,
+                exhaustedFailureCount: OBSERVATION_FAILURE_MAX_ATTEMPTS,
+              },
             });
             return action;
           }
@@ -81,11 +86,19 @@ export function createUnitEffectProcessor(input: {
           ).toISOString();
           input.store.recordActionObservationFailure({
             actionId: action.id,
+            expectedFailureCount: action.observation_failure_count,
+            expectedEpoch: action.observation_epoch,
             lastError,
             retryAtIso,
           });
           return action;
         }
+        const observationClear = input.store.clearActionObservationFailure({
+          actionId: action.id,
+          expectedFailureCount: action.observation_failure_count,
+          expectedEpoch: action.observation_epoch,
+        });
+        if (observationClear === "stale") return action;
         if (recovered) {
           if (recovered.terminal) {
             if (recovered.outcome === "retryable_infrastructure_failure") {

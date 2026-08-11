@@ -28,6 +28,7 @@ function fakeAction(): ExecutionWorkAttempt {
     lease_until: null,
     observation_failure_count: 0,
     observation_retry_at: null,
+    observation_epoch: 0,
     output_subject: null,
     payload: "{}",
     created_at: "2026-08-08T00:00:00.000Z",

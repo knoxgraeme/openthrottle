@@ -1480,6 +1480,22 @@ describe("execution unit store", () => {
       outputSubject: "1".repeat(40),
       receipt: receiptJson("unit_completion"),
     });
+    expect(store.stopRetryableUnitAction({
+      actionId: expired.id,
+      resultHash: "stale-observation-exhaustion",
+      lastError: "observation_attempt=3/3 stale after successful completion",
+      nativeSessionId: "stale-native-session",
+      observationExhaustion: {
+        expectedFailureCount: 2,
+        expectedEpoch: 0,
+        exhaustedFailureCount: 3,
+      },
+    })).toMatchObject({
+      status: "completed",
+      result_hash: "result-hash",
+      observation_failure_count: 0,
+    });
+    expect(store.getGraphForAttempt("attempt-parent")?.stopped_at).toBeNull();
     expect(store.healExpiredCurrentChildAction({
       parentAttemptId: "attempt-parent",
       actionId: expired.id,
@@ -1662,12 +1678,15 @@ describe("execution unit store", () => {
     store.markActionDispatched(active.id, "request-hash", "native-session");
     store.recordActionObservationFailure({
       actionId: active.id,
+      expectedFailureCount: 0,
+      expectedEpoch: 0,
       lastError: "operation=FileSystem.listFiles retryable=true status=502 message=empty body",
       retryAtIso: "2026-07-29T00:00:05.000Z",
     });
 
     expect(db!.prepare(`
-      SELECT status, lease_owner, lease_until, observation_failure_count, observation_retry_at, last_error
+      SELECT status, lease_owner, lease_until, observation_failure_count,
+             observation_retry_at, observation_epoch, last_error
       FROM execution_work_attempts WHERE id = ?
     `).get(active.id)).toEqual({
       status: "dispatched",
@@ -1675,6 +1694,7 @@ describe("execution unit store", () => {
       lease_until: "2026-07-29T00:01:00.000Z",
       observation_failure_count: 1,
       observation_retry_at: "2026-07-29T00:00:05.000Z",
+      observation_epoch: 0,
       last_error: "operation=FileSystem.listFiles retryable=true status=502 message=empty body",
     });
 
@@ -1698,6 +1718,336 @@ describe("execution unit store", () => {
       nowIso: "2026-07-29T00:01:01.000Z",
       reason: "child action missed heartbeat fence",
     })).toBe("healed");
+  });
+
+  it("compare-and-sets observation writes and clears a recovered outage epoch", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    const active = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(active.id, "request-hash", "native-session");
+
+    expect(store.recordActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 0,
+      expectedEpoch: 0,
+      lastError: "observation_attempt=1/3 operation=collect status=502",
+      retryAtIso: "2026-07-29T00:00:05.000Z",
+    })).toBe("recorded");
+    expect(store.recordActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 0,
+      expectedEpoch: 0,
+      lastError: "stale writer must not overwrite current evidence",
+      retryAtIso: "2026-07-29T00:00:10.000Z",
+    })).toBe("stale");
+    expect(() => store.recordActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 2,
+      expectedEpoch: 0,
+      lastError: "the third failure must use typed exhaustion",
+      retryAtIso: "2026-07-29T00:00:10.000Z",
+    })).toThrow(/invalid observation failure fence/);
+    expect(store.clearActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 0,
+      expectedEpoch: 0,
+    })).toBe("stale");
+    expect(db!.prepare(`
+      SELECT observation_failure_count, observation_retry_at, last_error
+      FROM execution_work_attempts WHERE id = ?
+    `).get(active.id)).toEqual({
+      observation_failure_count: 1,
+      observation_retry_at: "2026-07-29T00:00:05.000Z",
+      last_error: "observation_attempt=1/3 operation=collect status=502",
+    });
+
+    expect(store.clearActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 1,
+      expectedEpoch: 0,
+    })).toBe("cleared");
+    expect(db!.prepare(`
+      SELECT observation_failure_count, observation_retry_at, observation_epoch, last_error
+      FROM execution_work_attempts WHERE id = ?
+    `).get(active.id)).toEqual({
+      observation_failure_count: 0,
+      observation_retry_at: null,
+      observation_epoch: 1,
+      last_error: null,
+    });
+    expect(store.recordActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 0,
+      expectedEpoch: 1,
+      lastError: "observation_attempt=1/3 operation=collect status=502",
+      retryAtIso: "2026-07-29T00:00:15.000Z",
+    })).toBe("recorded");
+    expect(db!.prepare(`
+      SELECT observation_failure_count, observation_retry_at, observation_epoch, last_error
+      FROM execution_work_attempts WHERE id = ?
+    `).get(active.id)).toEqual({
+      observation_failure_count: 1,
+      observation_retry_at: "2026-07-29T00:00:15.000Z",
+      observation_epoch: 1,
+      last_error: "observation_attempt=1/3 operation=collect status=502",
+    });
+  });
+
+  it("advances a clean successful observation epoch before a stale same-epoch failure can land", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    const cleanSnapshot = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-success",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(cleanSnapshot.id, "request-hash", "native-session");
+    expect(cleanSnapshot).toMatchObject({
+      observation_failure_count: 0,
+      observation_epoch: 0,
+    });
+
+    expect(store.clearActionObservationFailure({
+      actionId: cleanSnapshot.id,
+      expectedFailureCount: 0,
+      expectedEpoch: 0,
+    })).toBe("cleared");
+    expect(store.recordActionObservationFailure({
+      actionId: cleanSnapshot.id,
+      expectedFailureCount: 0,
+      expectedEpoch: 0,
+      lastError: "stale same-epoch failure after successful collection",
+      retryAtIso: "2026-07-29T00:00:05.000Z",
+    })).toBe("stale");
+    expect(store.listWorkAttempts("attempt-parent")).toEqual([
+      expect.objectContaining({
+        id: cleanSnapshot.id,
+        status: "dispatched",
+        observation_failure_count: 0,
+        observation_retry_at: null,
+        observation_epoch: 1,
+        last_error: null,
+      }),
+    ]);
+  });
+
+  it("epoch-fences exhaustion across a recovered ABA retry interleaving", () => {
+    const store = setup();
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    const active = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(active.id, "request-hash", "native-session");
+    expect(store.recordActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 0,
+      expectedEpoch: 0,
+      lastError: "observation_attempt=1/3 status=502",
+      retryAtIso: "2026-07-29T00:00:05.000Z",
+    })).toBe("recorded");
+    expect(store.recordActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 1,
+      expectedEpoch: 0,
+      lastError: "observation_attempt=2/3 status=502",
+      retryAtIso: "2026-07-29T00:00:10.000Z",
+    })).toBe("recorded");
+    expect(store.clearActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 2,
+      expectedEpoch: 0,
+    })).toBe("cleared");
+    expect(store.recordActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 0,
+      expectedEpoch: 1,
+      lastError: "observation_attempt=1/3 status=502",
+      retryAtIso: "2026-07-29T00:00:15.000Z",
+    })).toBe("recorded");
+    expect(store.recordActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 1,
+      expectedEpoch: 1,
+      lastError: "observation_attempt=2/3 status=502",
+      retryAtIso: "2026-07-29T00:00:20.000Z",
+    })).toBe("recorded");
+
+    const staleStop = store.stopRetryableUnitAction({
+      actionId: active.id,
+      resultHash: "stale-result-hash",
+      lastError: "observation_attempt=3/3 stale",
+      nativeSessionId: "native-session",
+      observationExhaustion: {
+        expectedFailureCount: 2,
+        expectedEpoch: 0,
+        exhaustedFailureCount: 3,
+      },
+    });
+    expect(staleStop).toMatchObject({
+      status: "dispatched",
+      observation_failure_count: 2,
+      observation_epoch: 1,
+    });
+    expect(store.getGraphForAttempt("attempt-parent")?.stopped_at).toBeNull();
+
+    expect(store.stopRetryableUnitAction({
+      actionId: active.id,
+      resultHash: "exhausted-result-hash",
+      lastError: "observation_attempt=3/3 status=502",
+      nativeSessionId: "native-session",
+      observationExhaustion: {
+        expectedFailureCount: 2,
+        expectedEpoch: 1,
+        exhaustedFailureCount: 3,
+      },
+    })).toMatchObject({
+      status: "dead",
+      terminal_result_outcome: "retryable_infrastructure_failure",
+      observation_failure_count: 3,
+      observation_retry_at: null,
+      observation_epoch: 1,
+    });
+    expect(db!.prepare(`
+      SELECT COUNT(*) AS count FROM execution_publication_events
+      WHERE parent_attempt_id = ? AND kind = 'graph_stopped'
+    `).get("attempt-parent")).toEqual({ count: 1 });
+    expect(store.stopRetryableUnitAction({
+      actionId: active.id,
+      resultHash: "exhausted-result-hash",
+      lastError: "observation_attempt=3/3 status=502",
+      nativeSessionId: "native-session",
+      observationExhaustion: {
+        expectedFailureCount: 2,
+        expectedEpoch: 1,
+        exhaustedFailureCount: 3,
+      },
+    })).toMatchObject({ status: "dead", observation_failure_count: 3 });
+    expect(store.stopRetryableUnitAction({
+      actionId: active.id,
+      resultHash: "stale-terminal-writer-result",
+      lastError: "observation_attempt=3/3 stale terminal writer",
+      nativeSessionId: "stale-native-session",
+      observationExhaustion: {
+        expectedFailureCount: 2,
+        expectedEpoch: 0,
+        exhaustedFailureCount: 3,
+      },
+    })).toMatchObject({
+      status: "dead",
+      result_hash: "exhausted-result-hash",
+      native_session_id: "native-session",
+      observation_failure_count: 3,
+      observation_epoch: 1,
+    });
+    expect(db!.prepare(`
+      SELECT COUNT(*) AS count FROM execution_publication_events
+      WHERE parent_attempt_id = ? AND kind = 'graph_stopped'
+    `).get("attempt-parent")).toEqual({ count: 1 });
+  });
+
+  it("preserves the observation epoch and rejects stale retry writers after restart", () => {
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-observation-epoch-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "supervisor.db");
+    const store = setup(path);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    const active = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: "2026-07-29T00:00:00.000Z",
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(active.id, "request-hash", "native-session");
+    expect(store.recordActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 0,
+      expectedEpoch: 0,
+      lastError: "observation_attempt=1/3 status=502",
+      retryAtIso: "2026-07-29T00:00:05.000Z",
+    })).toBe("recorded");
+    expect(store.clearActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 1,
+      expectedEpoch: 0,
+    })).toBe("cleared");
+    expect(store.recordActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 0,
+      expectedEpoch: 1,
+      lastError: "observation_attempt=1/3 status=502",
+      retryAtIso: "2026-07-29T00:00:10.000Z",
+    })).toBe("recorded");
+
+    db!.close();
+    db = openDb(path);
+    const restartedStore = createExecutionUnitStore(db, () => timestamp);
+    expect(restartedStore.listWorkAttempts("attempt-parent")).toEqual([
+      expect.objectContaining({
+        id: active.id,
+        status: "dispatched",
+        observation_failure_count: 1,
+        observation_retry_at: "2026-07-29T00:00:10.000Z",
+        observation_epoch: 1,
+      }),
+    ]);
+    expect(restartedStore.recordActionObservationFailure({
+      actionId: active.id,
+      expectedFailureCount: 1,
+      expectedEpoch: 0,
+      lastError: "stale pre-restart epoch",
+      retryAtIso: "2026-07-29T00:00:15.000Z",
+    })).toBe("stale");
+    expect(restartedStore.listWorkAttempts("attempt-parent")[0]).toMatchObject({
+      observation_failure_count: 1,
+      observation_retry_at: "2026-07-29T00:00:10.000Z",
+      observation_epoch: 1,
+      last_error: "observation_attempt=1/3 status=502",
+    });
   });
 
   it("cascades structural exit to dependents blocked by a healed prerequisite", () => {
