@@ -196,9 +196,31 @@ export interface StructuredChildRuntime {
   compositeGraphNeedsDrain(parentAttemptId: string): boolean;
 }
 
+function terminalAttemptOutcomeFor(
+  attempts: readonly ExecutionWorkAttempt[]
+): "failure" | "needs_human" | "retryable_infrastructure_failure" | undefined {
+  // failUnitAction persists both semantic failure and needs_human rows with
+  // status='failed'. The exact terminal result is therefore authoritative;
+  // preservation must win over every non-preserving cleanup outcome whenever
+  // any action has recoverable work that requires a human.
+  if (attempts.some((attempt) => attempt.terminal_result_outcome === "needs_human")) {
+    return "needs_human";
+  }
+  // In the absence of preservation-required work, retain retryable provider /
+  // runtime semantics ahead of ordinary semantic failure.
+  if (attempts.some((attempt) => attempt.terminal_result_outcome === "retryable_infrastructure_failure")) {
+    return "retryable_infrastructure_failure";
+  }
+  if (attempts.some((attempt) => attempt.terminal_result_outcome === "failure")) {
+    return "failure";
+  }
+  return undefined;
+}
+
 export function aggregateOutcomeFor(
   units: readonly ExecutionUnitState[],
-  gates: readonly ExecutionGateReceipt[] = []
+  gates: readonly ExecutionGateReceipt[] = [],
+  attempts: readonly ExecutionWorkAttempt[] = []
 ): StageOutcome | undefined {
   if (units.length === 0 || units.some((unit) => unit.terminalLevel === null)) return undefined;
   const acceptedIntegrationSubjects = new Map<string, Set<string>>();
@@ -214,6 +236,8 @@ export function aggregateOutcomeFor(
     subjects.add(gate.subject);
     acceptedIntegrationSubjects.set(gate.unit_id, subjects);
   }
+  const terminalAttemptOutcome = terminalAttemptOutcomeFor(attempts);
+  if (terminalAttemptOutcome) return terminalAttemptOutcome;
   const allAcceptedIntegrated = units.every((unit) =>
     unit.terminalLevel === "completed" &&
     unit.integrationSubject !== null &&
@@ -226,10 +250,13 @@ export function aggregateOutcomeFor(
 }
 
 function stoppedAggregateOutcome(stopReason: string | null, attempts: readonly ExecutionWorkAttempt[]): StageOutcome {
-  if (/\bretryable_infrastructure_failure\b/i.test(stopReason ?? "")) {
+  const terminalAttemptOutcome = terminalAttemptOutcomeFor(attempts);
+  if (terminalAttemptOutcome === "needs_human") return "needs_human";
+  if (terminalAttemptOutcome === "retryable_infrastructure_failure" ||
+      /\bretryable_infrastructure_failure\b/i.test(stopReason ?? "")) {
     return "retryable_infrastructure_failure";
   }
-  if (attempts.some((attempt) => attempt.status === "failed") ||
+  if (terminalAttemptOutcome === "failure" || attempts.some((attempt) => attempt.status === "failed") ||
       /\b(fail(?:ed|ure)?|error|timed out|missed heartbeat)\b/i.test(stopReason ?? "")) {
     return "failure";
   }
@@ -2466,7 +2493,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       const gates = deps.store.listGateReceipts(parentAttemptId);
       const outcome = graph.stopped_at
         ? stoppedAggregateOutcome(graph.stop_reason, attempts)
-        : aggregateOutcomeFor(units, gates);
+        : aggregateOutcomeFor(units, gates, attempts);
       if (!outcome) return;
       if (outcome === "success" && graph.final_phase !== "done") return;
       const integrationSubject = outcome === "success"

@@ -110,6 +110,7 @@ const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
 const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
 const RECEIPT_CORRECTION_ATTEMPTS = 1;
+const MAX_RECEIPT_CORRECTION_DIAGNOSTICS = 8;
 const MAX_INLINE_PRIVATE_RECOVERY_DIFF_BYTES = 48 * 1024;
 // Recovery is exceptional and private, but still bounded. Larger payloads
 // travel in a separate root-owned file that the supervisor downloads before
@@ -1457,23 +1458,23 @@ function authoritativeCorrectionValues(request, subject) {
   const contract = receiptAuthorityContract(request);
   return new Map([
     ["/schema", STANDARD_RECEIPT_SCHEMA],
-    ["/assurance", contract.assurance],
-    ["/fence/pipeline_instance_id", contract.pipeline_instance_id],
-    ["/fence/graph_digest", contract.graph_digest],
-    ["/fence/parent_run_id", contract.parent_run_id],
-    ["/fence/generation", contract.generation],
+    ["/assurance", request.expectedProducer?.assurance],
+    ["/fence/pipeline_instance_id", request.pipelineInstanceId],
+    ["/fence/graph_digest", request.graphDigest],
+    ["/fence/parent_run_id", request.parentRunId],
+    ["/fence/generation", request.generation],
     ["/fence/native_session_id", contract.native_session_id],
     ["/fence/unit_id", contract.unit_id],
     ["/fence/attempt_id", contract.attempt_id],
     ["/fence/action_attempt_id", contract.action_attempt_id],
     ["/fence/request_hash", contract.request_hash],
-    ["/subject/base", contract.subject.base],
-    ["/subject/pre", contract.subject.pre],
-    ["/subject/post", subject],
-    ["/producer/worker_id", contract.producer.worker_id],
+    ["/subject/base", request.baseSubject],
+    ["/subject/pre", request.inputSubject],
+    ["/subject/post", subject ?? undefined],
+    ["/producer/worker_id", request.expectedProducer?.workerId],
     ["/producer/skill", contract.producer.skill],
-    ["/producer/capability_digest", contract.producer.capability_digest],
-    ["/producer/skill_package_digest", contract.producer.skill_package_digest],
+    ["/producer/capability_digest", request.expectedProducer?.capabilityDigest],
+    ["/producer/skill_package_digest", request.expectedProducer?.skillPackageDigest],
   ]);
 }
 
@@ -1507,38 +1508,18 @@ function receiptCorrectionDiagnostics({ errorMessage, invalidReceipt, request, s
       message: sanitizeArtifactText(String(message ?? errorMessage)).slice(0, 500),
     });
   };
-  if (/standard receipt (?:has an invalid schema|is missing field schema)/.test(errorMessage)) {
+  const schemaMismatch = /standard receipt (?:has an invalid schema|is missing field schema)/.test(errorMessage);
+  const envelopeMismatch = /loop receipt (?:.*fence mismatch|.*subject mismatch|producer)/.test(errorMessage);
+  if (schemaMismatch) {
     add("/schema", JSON.stringify(STANDARD_RECEIPT_SCHEMA), JSON.stringify(invalidReceipt?.schema), errorMessage);
-  } else if (/loop receipt request fence mismatch/.test(errorMessage) && invalidReceipt?.fence) {
-    const expected = {
-      "/fence/attempt_id": request.attemptId,
-      "/fence/request_hash": request.requestHash,
-      "/fence/action_attempt_id": request.actionId,
-    };
-    for (const [pointer, expectedValue] of Object.entries(expected)) {
-      const observed = valueAtPointer(invalidReceipt, pointer);
-      if (observed !== expectedValue) add(pointer, JSON.stringify(expectedValue), JSON.stringify(observed), errorMessage);
-    }
-  } else if (/loop receipt .*fence mismatch|loop receipt .*subject mismatch|loop receipt producer/.test(errorMessage) && invalidReceipt) {
-    const contract = receiptAuthorityContract(request);
-    const candidates = {
-      "/fence/pipeline_instance_id": contract.pipeline_instance_id,
-      "/fence/graph_digest": contract.graph_digest,
-      "/fence/parent_run_id": contract.parent_run_id,
-      "/fence/generation": contract.generation,
-      "/fence/native_session_id": contract.native_session_id,
-      "/fence/unit_id": contract.unit_id,
-      "/subject/base": contract.subject.base,
-      "/subject/pre": contract.subject.pre,
-      "/subject/post": subject,
-      "/assurance": contract.assurance,
-      "/producer/worker_id": contract.producer.worker_id,
-      "/producer/skill": contract.producer.skill,
-      "/producer/capability_digest": contract.producer.capability_digest,
-      "/producer/skill_package_digest": contract.producer.skill_package_digest,
-    };
-    for (const [pointer, expectedValue] of Object.entries(candidates)) {
-      if (expectedValue === undefined) continue;
+  }
+  if ((schemaMismatch || envelopeMismatch) && invalidReceipt && typeof invalidReceipt === "object" && !Array.isArray(invalidReceipt)) {
+    // assertLoopReceiptFence reports the first mismatch it sees, but the one
+    // deterministic correction pass must repair the whole sealed envelope.
+    // Schema validation can mask those mismatches too, so an otherwise parsed
+    // object receives all authoritative envelope diagnostics in the same pass.
+    for (const [pointer, expectedValue] of authoritativeCorrectionValues(request, subject)) {
+      if (pointer === "/schema" || expectedValue === undefined) continue;
       const observed = valueAtPointer(invalidReceipt, pointer);
       if (observed !== expectedValue) add(pointer, JSON.stringify(expectedValue), JSON.stringify(observed), errorMessage);
     }
@@ -1547,7 +1528,19 @@ function receiptCorrectionDiagnostics({ errorMessage, invalidReceipt, request, s
     const pointer = jsonPointerFromLabel(errorMessage);
     add(pointer, expectedSummary(errorMessage), observedSummary(valueAtPointer(invalidReceipt, pointer)), errorMessage);
   }
-  return diagnostics.slice(0, 8);
+  if (diagnostics.length > MAX_RECEIPT_CORRECTION_DIAGNOSTICS) {
+    // Never truncate to a partially correctable subset. Partial mutation
+    // would consume the only pass and leave a misleading correction record;
+    // one non-envelope diagnostic deliberately routes the receipt to the
+    // preservation path without changing any candidate-authored value.
+    return [{
+      pointer: "/",
+      expected: `at most ${MAX_RECEIPT_CORRECTION_DIAGNOSTICS} sealed envelope mismatches`,
+      observed: `${diagnostics.length} sealed envelope mismatches`,
+      message: "receipt correction mismatch count exceeds the deterministic correction bound",
+    }];
+  }
+  return diagnostics;
 }
 
 function boundedRecoveryChangedPaths(paths) {
@@ -1573,6 +1566,22 @@ export function recoveryChangedPathsFromGitQuotedOutput(raw) {
     throw new Error("private recovery path evidence is not reversible Git-quoted ASCII");
   }
   return ascii.split("\n").filter(Boolean);
+}
+
+function assertRecoveryTreeHasNoChangedGitlinks(rawTreeChanges) {
+  for (const line of String(rawTreeChanges).split("\n").filter(Boolean)) {
+    const match = line.match(/^:([0-7]{6}) ([0-7]{6}) [a-f0-9]+ [a-f0-9]+ [A-Z][0-9]*\t/);
+    if (!match) {
+      throw new Error("private recovery could not prove changed tree modes are portable");
+    }
+    if (match[2] === "160000") {
+      // A Git binary patch records only the referenced commit id for a
+      // gitlink; it does not carry that nested commit. A fresh clone can
+      // therefore reconstruct ordinary blobs but not an added or updated
+      // submodule reference. Unchanged gitlinks do not appear in this diff.
+      throw new Error("private recovery adds or changes a gitlink whose nested commit is not carried by the recovery patch");
+    }
+  }
 }
 
 function privateRecoveryArtifact(request, worktreeDir, subject, env) {
@@ -1607,6 +1616,7 @@ function privateRecoveryArtifact(request, worktreeDir, subject, env) {
     const baseCommit = request.recoveryBaseSubject;
     const recoveryDirectory = actionDirectory(request);
     const rawDiffPath = pathInside(recoveryDirectory, "recovery.patch.tmp");
+    const rawModesPath = pathInside(recoveryDirectory, "recovery.modes.tmp");
     const rawPathsPath = pathInside(recoveryDirectory, "recovery.paths.tmp");
     const recoveryDiffPath = loopPrivateRecoveryDiffPath({
       attemptId: request.attemptId,
@@ -1614,8 +1624,29 @@ function privateRecoveryArtifact(request, worktreeDir, subject, env) {
       rootDir: configuredActionRoot(),
     });
     rmSync(rawDiffPath, { force: true });
+    rmSync(rawModesPath, { force: true });
     rmSync(rawPathsPath, { force: true });
     rmSync(recoveryDiffPath, { force: true });
+    runRootGit(worktreeDir, [
+      "-c",
+      "core.quotePath=true",
+      "diff",
+      "--raw",
+      "--no-renames",
+      "--full-index",
+      `--output=${rawModesPath}`,
+      `${baseCommit}^{tree}`,
+      candidate.tree,
+      "--",
+    ]);
+    const rawModesBytes = statSync(rawModesPath).size;
+    if (rawModesBytes > MAX_PRIVATE_RECOVERY_DIFF_BYTES) {
+      rmSync(rawModesPath, { force: true });
+      throw new Error(`private recovery tree mode evidence exceeds ${MAX_PRIVATE_RECOVERY_DIFF_BYTES} byte platform bound`);
+    }
+    const rawTreeChanges = readFileSync(rawModesPath, "utf8");
+    rmSync(rawModesPath, { force: true });
+    assertRecoveryTreeHasNoChangedGitlinks(rawTreeChanges);
     runRootGit(worktreeDir, [
       "diff",
       "--binary",

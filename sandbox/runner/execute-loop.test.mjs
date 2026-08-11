@@ -3629,6 +3629,157 @@ describe("executeLoopAction", () => {
   });
 
   it.each([
+    ["request, subject, and producer", null, [
+      "/fence/attempt_id",
+      "/subject/base",
+      "/producer/worker_id",
+    ]],
+    ["schema, request, subject, and producer", "openthrottle.receipt/v0", [
+      "/schema",
+      "/fence/attempt_id",
+      "/subject/base",
+      "/producer/worker_id",
+    ]],
+  ])("repairs %s envelope mismatches in one deterministic pass", (_name, wrongSchema, expectedPointers) => {
+    const valid = request({
+      pipelineInstanceId: "instance-1",
+      graphDigest: "a".repeat(64),
+      generation: 1,
+      baseSubject: "1".repeat(40),
+      inputSubject: "1".repeat(40),
+      expectedProducer: {
+        workerId: "worker-1",
+        skill: "builtin://implement-unit@1",
+        capabilityDigest: "c".repeat(64),
+        skillPackageDigest: null,
+        assurance: "semantic_attested",
+      },
+    });
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = {
+      ...goodReceipt,
+      ...(wrongSchema ? { schema: wrongSchema } : {}),
+      fence: { ...goodReceipt.fence, attempt_id: "wrong-attempt" },
+      subject: { ...goodReceipt.subject, base: "2".repeat(40) },
+      producer: { ...goodReceipt.producer, worker_id: "wrong-worker" },
+    };
+    const originalSubject = computeWorkspaceTreeOid(loopWorktreeDirectory(valid));
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-multi-envelope-correction",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.subject).toBe(originalSubject);
+    expect(computeWorkspaceTreeOid(loopWorktreeDirectory(valid))).toBe(originalSubject);
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.receipt)).toEqual(goodReceipt);
+    const correctionState = JSON.parse(readFileSync(join(
+      process.env.OT_LOOP_ACTION_ROOT,
+      valid.attemptId,
+      valid.actionId,
+      "receipt-correction.json",
+    ), "utf8"));
+    expect(correctionState.diagnostics.map(({ pointer }) => pointer)).toEqual(expectedPointers);
+  });
+
+  it("fails closed without partial correction when sealed envelope mismatches exceed the diagnostic bound", () => {
+    const valid = request({
+      pipelineInstanceId: "instance-1",
+      graphDigest: "a".repeat(64),
+      generation: 1,
+      baseSubject: "1".repeat(40),
+      inputSubject: "1".repeat(40),
+      expectedProducer: {
+        workerId: "worker-1",
+        skill: "builtin://implement-unit@1",
+        capabilityDigest: "c".repeat(64),
+        skillPackageDigest: null,
+        assurance: "semantic_attested",
+      },
+    });
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = {
+      ...goodReceipt,
+      schema: "openthrottle.receipt/v0",
+      assurance: "semantic_corroborated",
+      fence: {
+        ...goodReceipt.fence,
+        pipeline_instance_id: "wrong-instance",
+        graph_digest: "b".repeat(64),
+        parent_run_id: "wrong-run",
+        generation: 2,
+        native_session_id: "wrong-native-session",
+        unit_id: "wrong-unit",
+        attempt_id: "wrong-attempt",
+        action_attempt_id: "wrong-action",
+        request_hash: "b".repeat(64),
+      },
+      subject: {
+        base: "2".repeat(40),
+        pre: "2".repeat(40),
+        post: "2".repeat(40),
+      },
+      producer: {
+        worker_id: "wrong-worker",
+        skill: "builtin://wrong-skill@1",
+        capability_digest: "d".repeat(64),
+        skill_package_digest: "e".repeat(64),
+      },
+    };
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-over-bound-correction",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(result.receipt).toContain("cannot invent or replace semantic receipt content");
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+    });
+    const correctionState = JSON.parse(readFileSync(join(
+      process.env.OT_LOOP_ACTION_ROOT,
+      valid.attemptId,
+      valid.actionId,
+      "receipt-correction.json",
+    ), "utf8"));
+    expect(correctionState.diagnostics).toEqual([expect.objectContaining({
+      pointer: "/",
+      observed: expect.stringMatching(/^\d+ sealed envelope mismatches$/),
+    })]);
+    expect(correctionState.invalid_receipt).toEqual(badReceipt);
+  });
+
+  it.each([
     ["worker id", "worker_id", "worker-from-another-action", "/producer/worker_id"],
     ["skill", "skill", "builtin://another-skill@1", "/producer/skill"],
     ["capability digest", "capability_digest", "d".repeat(64), "/producer/capability_digest"],
@@ -3853,6 +4004,19 @@ describe("executeLoopAction", () => {
   it("exports portable recovery when simplify uses a sandbox-local worktree base", () => {
     const initial = request();
     const worktreeDir = loopWorktreeDirectory(initial);
+    const unchangedGitlink = join(worktreeDir, "unchanged-gitlink");
+    execFileSync("git", ["init", "-q", "-b", "main", unchangedGitlink]);
+    execFileSync("git", ["config", "user.name", "Nested Test"], { cwd: unchangedGitlink });
+    execFileSync("git", ["config", "user.email", "nested@example.com"], { cwd: unchangedGitlink });
+    writeFileSync(join(unchangedGitlink, "nested.txt"), "durable nested state\n");
+    execFileSync("git", ["add", "nested.txt"], { cwd: unchangedGitlink });
+    execFileSync("git", ["commit", "--quiet", "-m", "nested baseline"], { cwd: unchangedGitlink });
+    const unchangedGitlinkSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: unchangedGitlink,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["add", "--", "unchanged-gitlink"], { cwd: worktreeDir });
+    execFileSync("git", ["commit", "--quiet", "-m", "durable gitlink baseline"], { cwd: worktreeDir });
     const durableBase = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreeDir, encoding: "utf8" }).trim();
     const remoteRoot = mkdtempSync(join(tmpdir(), "ot-recovery-origin-"));
     directories.push(remoteRoot);
@@ -3868,6 +4032,7 @@ describe("executeLoopAction", () => {
       loop: "simplify",
       skill: "ce-simplify-code",
       baseSubject: localBase,
+      recoveryBaseSubject: durableBase,
       inputSubject,
     });
 
@@ -3925,11 +4090,81 @@ describe("executeLoopAction", () => {
       stdio: ["ignore", "ignore", "pipe"],
     }))
       .toThrow();
+    expect(() => execFileSync("git", ["cat-file", "-e", `${unchangedGitlinkSubject}^{commit}`], {
+      cwd: recoveryRepo,
+      stdio: ["ignore", "ignore", "pipe"],
+    }))
+      .toThrow();
     execFileSync("git", ["checkout", "--quiet", durableBase], { cwd: recoveryRepo });
     const recoveryPatch = join(recoveryRoot, "recovery.patch");
     writeFileSync(recoveryPatch, Buffer.from(artifact.diff_base64, "base64"));
     execFileSync("git", ["apply", recoveryPatch], { cwd: recoveryRepo });
     expect(computeWorkspaceTreeOid(recoveryRepo)).toBe(artifact.candidate_tree);
+  });
+
+  it("preserves the workspace when recovery adds a gitlink whose nested commit is sandbox-local", () => {
+    const valid = request();
+    const worktreeDir = loopWorktreeDirectory(valid);
+    const remoteRoot = mkdtempSync(join(tmpdir(), "ot-gitlink-recovery-origin-"));
+    directories.push(remoteRoot);
+    const remoteRepo = join(remoteRoot, "origin.git");
+    execFileSync("git", ["clone", "--bare", "--quiet", worktreeDir, remoteRepo]);
+
+    const sandboxGitlink = join(worktreeDir, "sandbox-only-gitlink");
+    execFileSync("git", ["init", "-q", "-b", "main", sandboxGitlink]);
+    execFileSync("git", ["config", "user.name", "Nested Test"], { cwd: sandboxGitlink });
+    execFileSync("git", ["config", "user.email", "nested@example.com"], { cwd: sandboxGitlink });
+    writeFileSync(join(sandboxGitlink, "nested.txt"), "sandbox-only nested state\n");
+    execFileSync("git", ["add", "nested.txt"], { cwd: sandboxGitlink });
+    execFileSync("git", ["commit", "--quiet", "-m", "sandbox-only nested commit"], { cwd: sandboxGitlink });
+    const nestedSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: sandboxGitlink,
+      encoding: "utf8",
+    }).trim();
+    const badReceipt = standardReceipt(valid, {
+      subject: {
+        base: "1".repeat(40),
+        pre: "1".repeat(40),
+        post: computeWorkspaceTreeOid(worktreeDir),
+      },
+      payload: {
+        ...standardReceipt(valid).payload,
+        summary: ["not-authoritative"],
+      },
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn().mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(badReceipt),
+        stderr: "",
+        nativeSessionId: "native-gitlink-recovery",
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+      error: expect.stringContaining("adds or changes a gitlink"),
+    });
+
+    const freshRoot = mkdtempSync(join(tmpdir(), "ot-gitlink-fresh-clone-"));
+    directories.push(freshRoot);
+    const freshRepo = join(freshRoot, "repo");
+    execFileSync("git", ["clone", "--quiet", remoteRepo, freshRepo]);
+    expect(() => execFileSync("git", ["cat-file", "-e", `${nestedSubject}^{commit}`], {
+      cwd: freshRepo,
+      stdio: ["ignore", "ignore", "pipe"],
+    }))
+      .toThrow();
   });
 
   it("preserves the workspace when no sealed durable recovery base exists", () => {
