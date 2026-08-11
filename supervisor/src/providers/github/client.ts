@@ -886,21 +886,22 @@ export async function getRepositoryDirectoryAtCommit(
 // lets a solo operator share one GitHub account with the pipeline.
 export const OPENTHROTTLE_COMMENT_MARKER_PREFIX = "<!-- openthrottle:";
 
-export async function upsertPullRequestComment(
+async function upsertIssueCommentWithMarker(
   client: GithubClient,
   repo: string,
-  pullNumber: number,
-  identity: string,
+  issueNumber: number,
+  marker: string,
   body: string
 ): Promise<{ id: number; html_url: string }> {
-  if (!/^[A-Za-z0-9_.:-]{1,200}$/.test(identity)) throw new Error("GitHub comment identity is unsafe");
-  const marker = `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-summary:${identity} -->`;
-  if (!body.startsWith(marker)) throw new Error("GitHub pipeline summary is missing its stable marker");
+  if (!marker.startsWith(OPENTHROTTLE_COMMENT_MARKER_PREFIX) || !marker.endsWith(" -->")) {
+    throw new Error("GitHub comment marker is unsafe");
+  }
+  if (!body.startsWith(marker)) throw new Error("GitHub comment is missing its stable marker");
   let existing: { id: number; body?: string; html_url: string } | undefined;
   for (let page = 1; page <= 10 && !existing; page += 1) {
     const comments = await githubRequest<Array<{ id: number; body?: string; html_url: string }>>(
       client,
-      `/repos/${repo}/issues/${pullNumber}/comments?per_page=100${page === 1 ? "" : `&page=${page}`}`
+      `/repos/${repo}/issues/${issueNumber}/comments?per_page=100${page === 1 ? "" : `&page=${page}`}`
     );
     existing = comments.find((comment) => comment.body?.includes(marker));
     if (comments.length < 100) break;
@@ -912,11 +913,38 @@ export async function upsertPullRequestComment(
       body: JSON.stringify({ body }),
     });
   }
-  return githubRequest(client, `/repos/${repo}/issues/${pullNumber}/comments`, {
+  return githubRequest(client, `/repos/${repo}/issues/${issueNumber}/comments`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ body }),
   });
+}
+
+export async function upsertPullRequestComment(
+  client: GithubClient,
+  repo: string,
+  pullNumber: number,
+  identity: string,
+  body: string
+): Promise<{ id: number; html_url: string }> {
+  if (!/^[A-Za-z0-9_.:-]{1,200}$/.test(identity)) throw new Error("GitHub comment identity is unsafe");
+  return upsertIssueCommentWithMarker(
+    client,
+    repo,
+    pullNumber,
+    `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-summary:${identity} -->`,
+    body
+  );
+}
+
+export async function upsertIssueStatusComment(
+  client: GithubClient,
+  repo: string,
+  issueNumber: number,
+  marker: string,
+  body: string
+): Promise<{ id: number; html_url: string }> {
+  return upsertIssueCommentWithMarker(client, repo, issueNumber, marker, body);
 }
 
 export interface MergeReadiness {

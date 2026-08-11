@@ -1,7 +1,9 @@
 import type { GithubClient } from "./client.js";
-import { parsePullRequestUrl, upsertPullRequestComment } from "./client.js";
+import { parsePullRequestUrl, upsertIssueStatusComment, upsertPullRequestComment } from "./client.js";
 import {
+  pipelineStatusCommentMarker,
   parsePipelinePublication,
+  renderGithubIssueStatusComment,
   renderGithubPipelineSummary,
 } from "../../pipeline/publication.js";
 import type { PipelinePublicationReceipt, PipelineStore } from "../../pipeline/store.js";
@@ -12,8 +14,33 @@ export interface GithubPublicationProcessor {
   drain(limit?: number): Promise<void>;
 }
 
+interface GithubPublicationTicket {
+  session_id: string;
+  control_provider: "linear" | "github";
+  external_thread_id: string;
+  pr_url: string | null;
+}
+
 interface GithubPublicationTicketStore {
-  getByIssueId(issueId: string): { session_id: string; pr_url: string | null } | undefined;
+  getByIssueId(issueId: string): GithubPublicationTicket | undefined;
+}
+
+interface GithubIssueTarget {
+  number: number;
+  url: string;
+}
+
+function githubIssueTargetForTicket(
+  ticket: GithubPublicationTicket | undefined,
+  repository: string
+): GithubIssueTarget | undefined {
+  if (ticket?.control_provider !== "github") return undefined;
+  const match = ticket.external_thread_id.match(/^(.+)#(\d+)$/);
+  if (!match || match[1].toLowerCase() !== repository.toLowerCase()) return undefined;
+  const issueNumber = Number(match[2]);
+  return Number.isSafeInteger(issueNumber) && issueNumber > 0
+    ? { number: issueNumber, url: `https://github.com/${repository}/issues/${issueNumber}` }
+    : undefined;
 }
 
 function githubRetry(error: unknown): { retry: boolean; message: string } {
@@ -34,10 +61,22 @@ export function createGithubPublicationProcessor(params: {
   async function deliver(publication: PipelinePublicationReceipt): Promise<void> {
     const instance = params.store.getInstance(publication.pipeline_instance_id);
     if (!instance) throw new Error(`unknown pipeline instance ${publication.pipeline_instance_id}`);
+    const ticket = params.tickets.getByIssueId(instance.ticket_id);
+    if (ticket && ticket.session_id !== instance.session_id) {
+      throw new Error("pipeline publication no longer has its original session binding");
+    }
+    const issueTarget = githubIssueTargetForTicket(ticket, instance.repository);
     let bound = publication;
     if (!bound.target_url) {
-      const ticket = params.tickets.getByIssueId(instance.ticket_id);
-      if (!ticket?.pr_url) {
+      if (issueTarget) {
+        const persisted = params.store.bindGithubPublicationTarget(
+          publication.id,
+          publication.payload_hash,
+          issueTarget.url
+        );
+        if (!persisted) throw new Error("pipeline publication target binding is stale");
+        bound = persisted;
+      } else if (!ticket?.pr_url) {
         const terminal = instance.terminal_outcome != null || [
           "shipped", "no_change", "needs_human", "canceled", "superseded", "failed",
         ].includes(instance.status);
@@ -48,17 +87,15 @@ export function createGithubPublicationProcessor(params: {
           return;
         }
         throw new Error("pipeline pull request is not available yet");
+      } else {
+        const persisted = params.store.bindGithubPublicationTarget(
+          publication.id,
+          publication.payload_hash,
+          ticket.pr_url
+        );
+        if (!persisted) throw new Error("pipeline publication target binding is stale");
+        bound = persisted;
       }
-      if (ticket.session_id !== instance.session_id) {
-        throw new Error("pipeline publication no longer has its original session binding");
-      }
-      const persisted = params.store.bindGithubPublicationTarget(
-        publication.id,
-        publication.payload_hash,
-        ticket.pr_url
-      );
-      if (!persisted) throw new Error("pipeline publication target binding is stale");
-      bound = persisted;
     }
     const current = params.store.getPublication(publication.id);
     if (!current || current.pipeline_instance_id !== publication.pipeline_instance_id ||
@@ -66,18 +103,29 @@ export function createGithubPublicationProcessor(params: {
         current.target_url !== bound.target_url) {
       throw new Error("pipeline publication changed before delivery");
     }
-    const pull = parsePullRequestUrl(bound.target_url!);
-    if (pull.host !== "github.com" || pull.repo.toLowerCase() !== instance.repository.toLowerCase()) {
-      throw new Error("invalid pipeline pull request binding for the pinned instance");
-    }
     const envelope = parsePipelinePublication(publication.payload);
-    const result = await upsertPullRequestComment(
-      params.client,
-      instance.repository,
-      pull.number,
-      instance.ticket_id,
-      renderGithubPipelineSummary(envelope, bound.target_url)
-    );
+    let result: { id: number; html_url: string };
+    if (issueTarget && bound.target_url === issueTarget.url) {
+      result = await upsertIssueStatusComment(
+        params.client,
+        instance.repository,
+        issueTarget.number,
+        pipelineStatusCommentMarker(instance.ticket_id),
+        renderGithubIssueStatusComment(envelope, bound.target_url)
+      );
+    } else {
+      const pull = parsePullRequestUrl(bound.target_url!);
+      if (pull.host !== "github.com" || pull.repo.toLowerCase() !== instance.repository.toLowerCase()) {
+        throw new Error("invalid pipeline pull request binding for the pinned instance");
+      }
+      result = await upsertPullRequestComment(
+        params.client,
+        instance.repository,
+        pull.number,
+        instance.ticket_id,
+        renderGithubPipelineSummary(envelope, bound.target_url)
+      );
+    }
     const processed = params.store.markGithubPublicationProcessed(
       publication.id,
       publication.payload_hash,

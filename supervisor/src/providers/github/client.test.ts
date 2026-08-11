@@ -21,6 +21,7 @@ import {
   isAuthorizedGithubControlPermission,
   parseGithubWebhook,
   parsePullRequestUrl,
+  upsertIssueStatusComment,
   prepareRepository,
   reconcileRepositoryWebhook,
   upsertPullRequestComment,
@@ -891,5 +892,40 @@ describe("GitHub contracts", () => {
     expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
     expect(requests.filter((request) => request.method === "PATCH")).toHaveLength(1);
     expect(requests.some((request) => request.url.includes("/reviews"))).toBe(false);
+  });
+
+  it("creates then updates one stable marked Issue status comment", async () => {
+    const requests: Array<{ url: string; method: string }> = [];
+    let existing = false;
+    const marker = "<!-- openthrottle:pipeline-status:github:owner/repo#12 -->";
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      requests.push({ url, method });
+      if (url.endsWith("/issues/12/comments?per_page=100")) {
+        return Response.json(existing ? [{
+          id: 101,
+          body: `${marker}\nold`,
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-101",
+        }] : []);
+      }
+      if (url.endsWith("/issues/12/comments") && method === "POST") {
+        existing = true;
+        return Response.json({ id: 101, html_url: "https://github.com/owner/repo/issues/12#issuecomment-101" });
+      }
+      if (url.endsWith("/issues/comments/101") && method === "PATCH") {
+        return Response.json({ id: 101, html_url: "https://github.com/owner/repo/issues/12#issuecomment-101" });
+      }
+      throw new Error(`Unexpected GitHub request: ${method} ${url}`);
+    }) as unknown as typeof fetch;
+    const client = { token: "github", fetch: fetchMock };
+
+    const first = await upsertIssueStatusComment(client, "owner/repo", 12, marker, `${marker}\nfirst`);
+    const second = await upsertIssueStatusComment(client, "owner/repo", 12, marker, `${marker}\nsecond`);
+
+    expect(first.id).toBe(101);
+    expect(second.id).toBe(101);
+    expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
+    expect(requests.filter((request) => request.method === "PATCH")).toHaveLength(1);
   });
 });

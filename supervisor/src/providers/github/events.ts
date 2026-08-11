@@ -193,10 +193,13 @@ export function considerCiGithubHead(
 // cycle, bounded by the manifest's provider re-entry limit — a distinct
 // machine identity (machine user or GitHub App) restores account-level
 // filtering if this ever runs multi-user.
-const SUMMARY_MARKER_PREFIX = `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-summary:`;
+const SUPERVISOR_COMMENT_MARKER_PREFIXES = [
+  `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-summary:`,
+  `${OPENTHROTTLE_COMMENT_MARKER_PREFIX}pipeline-status:`,
+] as const;
 
-function looksLikeSupervisorSummary(body: string | undefined): boolean {
-  return body?.startsWith(SUMMARY_MARKER_PREFIX) === true;
+function looksLikeSupervisorComment(body: string | undefined): boolean {
+  return SUPERVISOR_COMMENT_MARKER_PREFIXES.some((prefix) => body?.startsWith(prefix) === true);
 }
 
 // Known Linear↔GitHub bridge identities whose PR comments are linkage
@@ -444,6 +447,8 @@ export async function handleGithubEvent(
   }
 
   if (event.kind === "issue_comment") {
+    if (pipelines.isSupervisorGithubComment(String(event.comment.id))) return;
+    if (looksLikeSupervisorComment(event.comment.body)) return;
     if (classifyGithubIssueComment(event) === "plain_issue_comment") {
       if (!control || event.action !== "created") return;
       const author = event.comment.user?.login;
@@ -470,8 +475,6 @@ export async function handleGithubEvent(
     // Provenance first: comment IDs the supervisor's summary upsert persisted
     // are the machine's own output. The marker check only covers the window
     // where this webhook races the receipt acknowledgement.
-    if (pipelines.isSupervisorGithubComment(String(event.comment.id))) return;
-    if (looksLikeSupervisorSummary(event.comment.body)) return;
     if (isGithubBotLinkback(author, event.comment.body)) return;
     await activityPublisher.publishActivity({
       sessionId: ticket.session_id,

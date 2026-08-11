@@ -1,4 +1,7 @@
 import type Database from "better-sqlite3";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore, type SupervisorStore } from "../../persistence/store.js";
@@ -32,7 +35,14 @@ describe("github publication delivery", () => {
     vi.restoreAllMocks();
   });
 
-  function setup(manifestKey = "fixture/command@1"): {
+  function setup(manifestKey = "fixture/command@1", ticket?: Partial<{
+    ticket_id: string;
+    ticket_reference: string;
+    session_id: string;
+    control_provider: "linear" | "github";
+    external_thread_id: string;
+    external_thread_reference: string;
+  }>): {
     tickets: SupervisorStore;
     pipelines: PipelineStore;
     instance: PipelineInstance;
@@ -53,9 +63,12 @@ describe("github publication delivery", () => {
     });
     const manifest = catalog.manifests.get(manifestKey)!;
     tickets.upsert({
-      ticket_id: "issue-1",
-      ticket_reference: "ISSUE-1",
-      session_id: "session-1",
+      ticket_id: ticket?.ticket_id ?? "issue-1",
+      ticket_reference: ticket?.ticket_reference ?? "ISSUE-1",
+      session_id: ticket?.session_id ?? "session-1",
+      control_provider: ticket?.control_provider,
+      external_thread_id: ticket?.external_thread_id,
+      external_thread_reference: ticket?.external_thread_reference,
       sandbox_id: null,
       branch: "ot/issue-1",
       agent: "codex",
@@ -72,7 +85,7 @@ describe("github publication delivery", () => {
         taskType: "implement",
       },
     });
-    const instance = pipelines.getInstanceForSession("session-1")!;
+    const instance = pipelines.getInstanceForSession(ticket?.session_id ?? "session-1")!;
     return { tickets, pipelines, instance, attempt: pipelines.getActiveAttempt(instance.id)! };
   }
 
@@ -179,6 +192,132 @@ describe("github publication delivery", () => {
     await processor.drain();
     expect(methods.filter((method) => method === "POST")).toHaveLength(1);
     expect(methods.filter((method) => method === "PATCH")).toHaveLength(1);
+  });
+
+  it("publishes one durable marked GitHub Issue status comment across restart and re-dispatch", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ot-github-status-"));
+    const path = join(dir, "supervisor.sqlite");
+    let restarted: Database.Database | undefined;
+    try {
+      db = openDb(path);
+      let pipelines = createPipelineStore(db);
+      const tickets = createSupervisorStore(db, pipelines);
+      const catalog = loadPipelineCatalog(catalogPath, runtime.descriptor);
+      pipelines.acceptRuntimeDescriptor(runtime);
+      pipelines.acceptCatalog(catalog);
+      const config = parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\n");
+      const snapshot = pipelines.saveRepositoryConfigSnapshot({
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        blobSha: "b".repeat(40),
+        config,
+      });
+      const manifest = catalog.manifests.get("fixture/command@1")!;
+      tickets.upsert({
+        ticket_id: "github:owner/repo#12",
+        ticket_reference: "GH-12",
+        session_id: "github:owner/repo#12",
+        control_provider: "github",
+        external_thread_id: "owner/repo#12",
+        external_thread_reference: "GH-12",
+        sandbox_id: null,
+        branch: "ot/gh-12",
+        agent: "codex",
+        repo: "owner/repo",
+        pr_url: null,
+        state: "active",
+        pipeline: {
+          repository: "owner/repo",
+          baseCommit: "a".repeat(40),
+          manifest,
+          repositoryConfig: snapshot,
+          runtime,
+          authorizedCapabilities: manifest.manifest.requires.capabilities,
+          taskType: "implement",
+        },
+      });
+      const instance = pipelines.getInstanceForSession("github:owner/repo#12")!;
+      db.close();
+      db = undefined;
+
+      restarted = openDb(path);
+      pipelines = createPipelineStore(restarted);
+      const restartedTickets = createSupervisorStore(restarted, pipelines);
+      let commentExists = false;
+      const methods: string[] = [];
+      const bodies: string[] = [];
+      const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        methods.push(method);
+        if (url.endsWith("/issues/12/comments?per_page=100")) {
+          return Response.json(commentExists ? [{
+            id: 808,
+            body: "<!-- openthrottle:pipeline-status:github:owner/repo#12 -->\nold",
+            html_url: "https://github.com/owner/repo/issues/12#issuecomment-808",
+          }] : []);
+        }
+        if (method === "POST") commentExists = true;
+        if (init?.body) bodies.push(String(init.body));
+        return Response.json({ id: 808, html_url: "https://github.com/owner/repo/issues/12#issuecomment-808" });
+      }) as unknown as typeof fetch;
+      const processor = createGithubPublicationProcessor({
+        store: pipelines,
+        tickets: restartedTickets,
+        client: { token: "github", fetch: fetchMock },
+      });
+
+      await processor.drain();
+      await processor.drain();
+
+      const publication = pipelines.listPublications(instance.id)
+        .find((row) => row.kind === "github_summary")!;
+      expect(publication).toMatchObject({
+        status: "acknowledged",
+        external_id: "808",
+        target_url: "https://github.com/owner/repo/issues/12",
+      });
+      expect(methods.filter((method) => method === "POST")).toHaveLength(1);
+      expect(methods.filter((method) => method === "PATCH")).toHaveLength(0);
+      expect(bodies[0]).toContain("<!-- openthrottle:pipeline-status:github:owner/repo#12 -->");
+    } finally {
+      restarted?.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let a stale GitHub Issue status delivery acknowledge a newer revision", async () => {
+    const { pipelines, instance, attempt } = setup("fixture/command@1", {
+      ticket_id: "github:owner/repo#12",
+      ticket_reference: "GH-12",
+      session_id: "github:owner/repo#12",
+      control_provider: "github",
+      external_thread_id: "owner/repo#12",
+      external_thread_reference: "GH-12",
+    });
+    const publication = pipelines.listPublications(instance.id)
+      .find((row) => row.kind === "github_summary")!;
+    const claimed = pipelines.claimGithubPublications(
+      "2999-01-01T00:00:00.000Z",
+      "2999-01-01T00:01:00.000Z"
+    )[0]!;
+    expect(claimed.id).toBe(publication.id);
+    const input = event(instance, attempt, "A newer revision superseded the claimed status.");
+    coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+    const newer = pipelines.getPublication(claimed.id)!;
+
+    expect(pipelines.markGithubPublicationProcessed(
+      claimed.id,
+      claimed.payload_hash,
+      "1",
+      "https://github.com/owner/repo/issues/12#issuecomment-1"
+    )).toBe(false);
+
+    expect(pipelines.getPublication(claimed.id)).toMatchObject({
+      status: "pending",
+      payload_hash: newer.payload_hash,
+      external_id: null,
+    });
   });
 
   it("surfaces a permanent GitHub summary failure as publication-blocked", async () => {

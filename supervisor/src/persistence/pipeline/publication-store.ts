@@ -73,9 +73,15 @@ export function createPublicationStore(db: Database.Database, now: () => string)
           JOIN tickets t ON t.ticket_id = pi.ticket_id
           WHERE pi.id = pipeline_publication_receipts.pipeline_instance_id
             AND t.session_id = pi.session_id
-            AND t.pr_url = ?
+            AND (
+              t.pr_url = ?
+              OR (
+                t.control_provider = 'github'
+                AND ? = 'https://github.com/' || replace(t.external_thread_id, '#', '/issues/')
+              )
+            )
         )
-    `).run(targetUrl, now(), id, expectedPayloadHash, targetUrl);
+    `).run(targetUrl, now(), id, expectedPayloadHash, targetUrl, targetUrl);
     if (update.changes !== 1) return undefined;
     return db.prepare("SELECT * FROM pipeline_publication_receipts WHERE id = ?")
       .get(id) as PipelinePublicationReceipt;

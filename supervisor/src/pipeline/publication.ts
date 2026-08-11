@@ -1263,6 +1263,21 @@ export function renderGithubPipelineSummary(envelope: PipelinePublicationEnvelop
   return boundedSanitized(dedupeLines(lines).join("\n"), 60_000);
 }
 
+export function renderGithubIssueStatusComment(
+  envelope: PipelinePublicationEnvelope,
+  issueUrl?: string | null
+): string {
+  const lines = [
+    pipelineStatusCommentMarker(envelope.pipeline.ticket_id),
+    "## OpenThrottle status",
+    "",
+    ...linearStatusCommentLines(envelope, issueUrl),
+    "",
+    "_This status comment is maintained by OpenThrottle._",
+  ];
+  return boundedSanitized(dedupeLines(lines).join("\n"), PUBLICATION_BODY_LIMIT);
+}
+
 export function renderPipelineLogHeader(status: {
   pipeline_id: string;
   pipeline_version: number;

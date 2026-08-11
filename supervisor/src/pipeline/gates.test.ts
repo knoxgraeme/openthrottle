@@ -1421,6 +1421,9 @@ describe("deterministic supervisor stage gates", () => {
     await comment(33, "<!-- openthrottle:pipeline-summary:pipeline-1 -->\nGate summary body");
     expect(providerEventCount()).toBe(2);
 
+    await comment(34, "<!-- openthrottle:pipeline-status:github:owner/repo#12 -->\nStatus body");
+    expect(providerEventCount()).toBe(2);
+
     await comment(32, "the retry loop still double-counts attempts");
     // Events on the same PR head coalesce into one snapshot; the human comment
     // joins the human reviews as another provider event inside it.
