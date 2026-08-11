@@ -3628,6 +3628,67 @@ describe("executeLoopAction", () => {
     }
   });
 
+  it.each([
+    ["worker id", "worker_id", "worker-from-another-action", "/producer/worker_id"],
+    ["skill", "skill", "builtin://another-skill@1", "/producer/skill"],
+    ["capability digest", "capability_digest", "d".repeat(64), "/producer/capability_digest"],
+    ["skill package digest", "skill_package_digest", "e".repeat(64), "/producer/skill_package_digest"],
+    ["assurance", "assurance", "semantic_corroborated", "/assurance"],
+  ])("deterministically repairs a wrong sealed producer %s without changing the candidate tree", (_name, field, wrongValue, expectedPointer) => {
+    const valid = request({
+      pipelineInstanceId: "instance-1",
+      graphDigest: "a".repeat(64),
+      generation: 1,
+      baseSubject: "1".repeat(40),
+      inputSubject: "1".repeat(40),
+      expectedProducer: {
+        workerId: "worker-1",
+        skill: "builtin://implement-unit@1",
+        capabilityDigest: "c".repeat(64),
+        skillPackageDigest: null,
+        assurance: "semantic_attested",
+      },
+    });
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = expectedPointer === "/assurance"
+      ? { ...goodReceipt, assurance: wrongValue }
+      : { ...goodReceipt, producer: { ...goodReceipt.producer, [field]: wrongValue } };
+    const originalSubject = computeWorkspaceTreeOid(loopWorktreeDirectory(valid));
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-producer-correction",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.subject).toBe(originalSubject);
+    expect(computeWorkspaceTreeOid(loopWorktreeDirectory(valid))).toBe(originalSubject);
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.receipt)).toEqual(goodReceipt);
+    const correctionState = JSON.parse(readFileSync(join(
+      process.env.OT_LOOP_ACTION_ROOT,
+      valid.attemptId,
+      valid.actionId,
+      "receipt-correction.json",
+    ), "utf8"));
+    expect(correctionState.diagnostics).toContainEqual(expect.objectContaining({
+      pointer: expectedPointer,
+    }));
+  });
+
   it("does not invent semantic payload values when a receipt field has the wrong type", () => {
     const valid = request();
     const goodReceipt = standardReceipt(valid);

@@ -1427,6 +1427,7 @@ function setJsonPointer(value, pointer, replacement) {
 function correctionDiagnosticIsEnvelopeOnly(diagnostic) {
   if (/unknown field/.test(String(diagnostic.message))) return true;
   return diagnostic.pointer === "/schema" ||
+    diagnostic.pointer === "/assurance" ||
     /^\/(fence|subject|producer)\/[A-Za-z0-9_]+$/.test(diagnostic.pointer);
 }
 
@@ -1456,6 +1457,7 @@ function authoritativeCorrectionValues(request, subject) {
   const contract = receiptAuthorityContract(request);
   return new Map([
     ["/schema", STANDARD_RECEIPT_SCHEMA],
+    ["/assurance", contract.assurance],
     ["/fence/pipeline_instance_id", contract.pipeline_instance_id],
     ["/fence/graph_digest", contract.graph_digest],
     ["/fence/parent_run_id", contract.parent_run_id],
@@ -1529,7 +1531,11 @@ function receiptCorrectionDiagnostics({ errorMessage, invalidReceipt, request, s
       "/subject/base": contract.subject.base,
       "/subject/pre": contract.subject.pre,
       "/subject/post": subject,
+      "/assurance": contract.assurance,
+      "/producer/worker_id": contract.producer.worker_id,
       "/producer/skill": contract.producer.skill,
+      "/producer/capability_digest": contract.producer.capability_digest,
+      "/producer/skill_package_digest": contract.producer.skill_package_digest,
     };
     for (const [pointer, expectedValue] of Object.entries(candidates)) {
       if (expectedValue === undefined) continue;
