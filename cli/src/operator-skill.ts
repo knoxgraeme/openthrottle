@@ -280,47 +280,88 @@ function stagedOperatorSkillPath(home: string, agent: SupportedAgent): string {
   return resolve(home, AGENT_ROOTS[agent], "skills", SKILL_NAME);
 }
 
-function installStagedSkillAtomically(sourcePath: string, targetPath: string): void {
-  if (!existsSync(join(sourcePath, "SKILL.md"))) {
-    throw new Error(`staged OpenThrottle skill is missing SKILL.md: ${sourcePath}`);
-  }
-  const targetParent = dirname(targetPath);
-  mkdirSync(targetParent, { recursive: true });
-  if (existsSync(targetPath)) {
-    throw new Error(`OpenThrottle skill target already exists: ${targetPath}`);
-  }
-  const tempTarget = join(targetParent, `.openthrottle.tmp.${process.pid}.${Date.now()}`);
-  rmSync(tempTarget, { recursive: true, force: true });
-  try {
-    cpSync(sourcePath, tempTarget, { recursive: true });
-    renameSync(tempTarget, targetPath);
-  } catch (error) {
-    rmSync(tempTarget, { recursive: true, force: true });
-    throw error;
-  }
+interface StagedSkillOperation {
+  agent: SupportedAgent;
+  sourcePath: string;
+  targetPath: string;
+  tempTarget: string;
+  backupTarget: string;
+  replace: boolean;
+  backupCreated: boolean;
+  targetInstalled: boolean;
 }
 
-function replaceStagedSkillAtomically(sourcePath: string, targetPath: string): void {
-  if (!existsSync(join(sourcePath, "SKILL.md"))) {
-    throw new Error(`staged OpenThrottle skill is missing SKILL.md: ${sourcePath}`);
-  }
-  const targetParent = dirname(targetPath);
-  mkdirSync(targetParent, { recursive: true });
-  const tempTarget = join(targetParent, `.openthrottle.tmp.${process.pid}.${Date.now()}`);
-  const backupTarget = join(targetParent, `.openthrottle.backup.${process.pid}.${Date.now()}`);
-  rmSync(tempTarget, { recursive: true, force: true });
-  rmSync(backupTarget, { recursive: true, force: true });
+function installStagedSkillsAtomically(
+  staged: Map<SupportedAgent, string>,
+  home: string,
+  needsReplace: Set<SupportedAgent>
+): OperatorSkillAgentResult[] {
+  const nonce = `${process.pid}.${Date.now()}`;
+  const operations: StagedSkillOperation[] = [...staged].map(([agent, sourcePath], index) => {
+    const targetPath = operatorSkillTargetPath(home, agent);
+    const targetParent = dirname(targetPath);
+    return {
+      agent,
+      sourcePath,
+      targetPath,
+      tempTarget: join(targetParent, `.openthrottle.tmp.${nonce}.${index}`),
+      backupTarget: join(targetParent, `.openthrottle.backup.${nonce}.${index}`),
+      replace: needsReplace.has(agent),
+      backupCreated: false,
+      targetInstalled: false,
+    };
+  });
+
   try {
-    cpSync(sourcePath, tempTarget, { recursive: true });
-    if (existsSync(targetPath)) renameSync(targetPath, backupTarget);
-    renameSync(tempTarget, targetPath);
-    rmSync(backupTarget, { recursive: true, force: true });
+    // Prepare every destination before changing any installed skill. This makes
+    // ordinary path/copy failures fail closed without a partial multi-agent install.
+    for (const operation of operations) {
+      if (!existsSync(join(operation.sourcePath, "SKILL.md"))) {
+        throw new Error(`staged OpenThrottle skill is missing SKILL.md: ${operation.sourcePath}`);
+      }
+      mkdirSync(dirname(operation.targetPath), { recursive: true });
+      const target = lstatSync(operation.targetPath, { throwIfNoEntry: false });
+      if (operation.replace ? !target : Boolean(target)) {
+        throw new Error(
+          operation.replace
+            ? `OpenThrottle skill target disappeared before refresh: ${operation.targetPath}`
+            : `OpenThrottle skill target already exists: ${operation.targetPath}`
+        );
+      }
+      rmSync(operation.tempTarget, { recursive: true, force: true });
+      rmSync(operation.backupTarget, { recursive: true, force: true });
+      cpSync(operation.sourcePath, operation.tempTarget, { recursive: true });
+    }
+
+    for (const operation of operations) {
+      if (operation.replace) {
+        renameSync(operation.targetPath, operation.backupTarget);
+        operation.backupCreated = true;
+      }
+      renameSync(operation.tempTarget, operation.targetPath);
+      operation.targetInstalled = true;
+    }
   } catch (error) {
-    rmSync(tempTarget, { recursive: true, force: true });
-    if (!existsSync(targetPath) && existsSync(backupTarget)) renameSync(backupTarget, targetPath);
-    rmSync(backupTarget, { recursive: true, force: true });
-    throw error;
+    const rollbackErrors: string[] = [];
+    for (const operation of [...operations].reverse()) {
+      try {
+        if (operation.targetInstalled) rmSync(operation.targetPath, { recursive: true, force: true });
+        if (operation.backupCreated) renameSync(operation.backupTarget, operation.targetPath);
+        rmSync(operation.tempTarget, { recursive: true, force: true });
+      } catch (rollbackError) {
+        rollbackErrors.push(`${operation.agent}: ${getErrorMessage(rollbackError)}`);
+      }
+    }
+    const rollbackSuffix = rollbackErrors.length > 0
+      ? `; rollback failed (${rollbackErrors.join("; ")})`
+      : "";
+    throw new Error(`${getErrorMessage(error)}${rollbackSuffix}`);
   }
+
+  for (const operation of operations) {
+    rmSync(operation.backupTarget, { recursive: true, force: true });
+  }
+  return operations.map(({ agent, targetPath }) => ({ agent, status: "installed", path: targetPath }));
 }
 
 function removeOwnedSkillDirectory(targetPath: string): void {
@@ -627,19 +668,17 @@ export function runOperatorSkillAction(
       }
       return result;
     }
-    for (const [agent, stagedPath] of staged) {
-      const targetPath = operatorSkillTargetPath(realHome, agent);
-      try {
-        if (needsReplace.has(agent)) replaceStagedSkillAtomically(stagedPath, targetPath);
-        else installStagedSkillAtomically(stagedPath, targetPath);
-        result.installed.push({ agent, status: "installed", path: targetPath });
-      } catch (error) {
-        result.success = false;
+    try {
+      result.installed.push(...installStagedSkillsAtomically(staged, realHome, needsReplace));
+    } catch (error) {
+      result.success = false;
+      const reason = getErrorMessage(error);
+      for (const agent of needsInstall) {
         result.conflicted.push({
           agent,
           status: "conflicted",
-          path: targetPath,
-          reason: getErrorMessage(error),
+          path: operatorSkillTargetPath(realHome, agent),
+          reason,
         });
       }
     }
