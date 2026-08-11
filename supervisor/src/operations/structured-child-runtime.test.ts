@@ -1476,6 +1476,7 @@ describe("structured child runtime repair fences", () => {
       model: "gpt-5.1-code",
       generation: 7,
       baseSubject: "a".repeat(40),
+      recoveryBaseSubject: "a".repeat(40),
       inputSubject: "a".repeat(40),
       timeoutMs: 17_000,
       expectedProducer: {

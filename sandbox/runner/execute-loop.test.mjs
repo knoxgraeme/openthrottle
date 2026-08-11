@@ -96,6 +96,10 @@ function request(overrides = {}) {
   directories.push(rootDir);
   const handle = "unit-1";
   renameSync(repoDir, join(rootDir, handle));
+  const recoveryBaseSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: join(rootDir, handle),
+    encoding: "utf8",
+  }).trim();
   process.env.OT_WORKTREE_ROOT = rootDir;
   if (!process.env.OT_LOOP_ACTION_ROOT) {
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
@@ -114,6 +118,7 @@ function request(overrides = {}) {
     agent: "codex",
     skill: "implement-unit",
     worktree: { id: handle },
+    recoveryBaseSubject,
     nativeSessionId: null,
     contextPolicy: "prefer_resume",
     timeoutMs: 30_000,
@@ -298,6 +303,7 @@ describe("loop action request validation", () => {
       worktree: { id: "unit-1" },
     });
     expect(() => validateLoopRequest({ ...valid, skill: "ce-code-review" })).toThrow(/stale/);
+    expect(() => validateLoopRequest({ ...valid, recoveryBaseSubject: "c".repeat(40) })).toThrow(/stale/);
   });
 
   it("allows every installed review persona only as an independently fenced read-only review action", () => {
@@ -3783,16 +3789,24 @@ describe("executeLoopAction", () => {
     });
   });
 
-  it("exports portable recovery for a simplify receipt failure after prior worktree output", () => {
+  it("exports portable recovery when simplify uses a sandbox-local worktree base", () => {
     const initial = request();
     const worktreeDir = loopWorktreeDirectory(initial);
-    const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreeDir, encoding: "utf8" }).trim();
+    const durableBase = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreeDir, encoding: "utf8" }).trim();
+    const remoteRoot = mkdtempSync(join(tmpdir(), "ot-recovery-origin-"));
+    directories.push(remoteRoot);
+    const remoteRepo = join(remoteRoot, "origin.git");
+    execFileSync("git", ["clone", "--bare", "--quiet", worktreeDir, remoteRepo]);
+    writeFileSync(join(worktreeDir, "integrated-locally.txt"), "integrated\n");
+    execFileSync("git", ["add", "integrated-locally.txt"], { cwd: worktreeDir });
+    execFileSync("git", ["commit", "--quiet", "-m", "sandbox-only integration"], { cwd: worktreeDir });
+    const localBase = execFileSync("git", ["rev-parse", "HEAD"], { cwd: worktreeDir, encoding: "utf8" }).trim();
     writeFileSync(join(worktreeDir, "implemented-before-simplify.txt"), "implemented\n");
     const inputSubject = computeWorkspaceTreeOid(worktreeDir);
     const valid = withFreshLoopFence(initial, {
       loop: "simplify",
       skill: "ce-simplify-code",
-      baseSubject: baseCommit,
+      baseSubject: localBase,
       inputSubject,
     });
 
@@ -3802,7 +3816,7 @@ describe("executeLoopAction", () => {
         writeFileSync(join(worktreeDir, "changed-by-simplify.txt"), "simplified\n");
         const receipt = standardReceipt(valid, {
           subject: {
-            base: baseCommit,
+            base: localBase,
             pre: inputSubject,
             post: computeWorkspaceTreeOid(worktreeDir),
           },
@@ -3829,10 +3843,11 @@ describe("executeLoopAction", () => {
     expect(result.outcome).toBe("failure");
     const artifact = JSON.parse(result.recovery_artifact);
     expect(artifact).toMatchObject({
-      base_commit: baseCommit,
+      base_commit: durableBase,
       candidate_commit: expect.stringMatching(/^[a-f0-9]{40}$/),
       candidate_tree: expect.stringMatching(/^[a-f0-9]{40}$/),
       changed_paths: expect.arrayContaining([
+        "integrated-locally.txt",
         "implemented-before-simplify.txt",
         "changed-by-simplify.txt",
       ]),
@@ -3843,12 +3858,50 @@ describe("executeLoopAction", () => {
     const recoveryRoot = mkdtempSync(join(tmpdir(), "ot-portable-recovery-"));
     directories.push(recoveryRoot);
     const recoveryRepo = join(recoveryRoot, "repo");
-    execFileSync("git", ["clone", "-q", worktreeDir, recoveryRepo]);
-    execFileSync("git", ["checkout", "--quiet", baseCommit], { cwd: recoveryRepo });
+    execFileSync("git", ["clone", "--quiet", remoteRepo, recoveryRepo]);
+    expect(() => execFileSync("git", ["cat-file", "-e", `${localBase}^{commit}`], {
+      cwd: recoveryRepo,
+      stdio: ["ignore", "ignore", "pipe"],
+    }))
+      .toThrow();
+    execFileSync("git", ["checkout", "--quiet", durableBase], { cwd: recoveryRepo });
     const recoveryPatch = join(recoveryRoot, "recovery.patch");
     writeFileSync(recoveryPatch, Buffer.from(artifact.diff_base64, "base64"));
     execFileSync("git", ["apply", recoveryPatch], { cwd: recoveryRepo });
     expect(computeWorkspaceTreeOid(recoveryRepo)).toBe(artifact.candidate_tree);
+  });
+
+  it("preserves the workspace when no sealed durable recovery base exists", () => {
+    const valid = withFreshLoopFence(request(), { recoveryBaseSubject: undefined });
+    const worktreeDir = loopWorktreeDirectory(valid);
+    writeFileSync(join(worktreeDir, "unrecoverable.txt"), "sandbox only\n");
+    const receipt = standardReceipt(valid);
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn().mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify({
+          ...receipt,
+          payload: { ...receipt.payload, summary: ["not-authoritative"] },
+        }),
+        stderr: "",
+        nativeSessionId: "native-unrecoverable",
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("needs_human");
+    expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+      requires_workspace_preservation: true,
+      error: "private recovery has no sealed durable base subject",
+    });
   });
 
   it("preserves work when a semantic receipt defect cannot be repaired from sealed authority", () => {

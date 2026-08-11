@@ -492,7 +492,7 @@ export function validateLoopRequest(value) {
   const input = record(value, "loop request");
   const allowed = new Set([
     "protocol", "actionId", "attemptId", "graphId", "pipelineInstanceId", "graphDigest", "parentRunId",
-    "unitId", "generation", "role", "loop", "agent", "model", "skill", "worktree", "baseSubject", "inputSubject",
+    "unitId", "generation", "role", "loop", "agent", "model", "skill", "worktree", "baseSubject", "recoveryBaseSubject", "inputSubject",
     "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
     "transitionContext", "priorEvidence", "downstreamContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
     "expectedProducerSkill", "expectedProducer", "repositorySkill", "requestHash", "idempotencyKey",
@@ -527,6 +527,9 @@ export function validateLoopRequest(value) {
       id: string(worktree.id, "worktree.id", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
     },
     ...(input.baseSubject === undefined ? {} : { baseSubject: string(input.baseSubject, "baseSubject", GIT_OBJECT_ID) }),
+    ...(input.recoveryBaseSubject === undefined
+      ? {}
+      : { recoveryBaseSubject: string(input.recoveryBaseSubject, "recoveryBaseSubject", GIT_OBJECT_ID) }),
     ...(input.inputSubject === undefined ? {} : { inputSubject: string(input.inputSubject, "inputSubject", GIT_OBJECT_ID) }),
     nativeSessionId: nullableString(input.nativeSessionId, "nativeSessionId", NATIVE_SESSION_ID),
     contextPolicy: string(input.contextPolicy, "contextPolicy"),
@@ -1586,12 +1589,16 @@ function privateRecoveryArtifact(request, worktreeDir, subject, env) {
     // inputSubject is the prior action's output tree for reusable worktrees
     // (for example, implement -> simplify), not the commit checked out at
     // HEAD. Candidate creation must stay anchored to the sealed worktree base.
-    const baseCommit = request.baseSubject ?? runRootGit(worktreeDir, ["rev-parse", "HEAD"]);
+    const worktreeBaseCommit = request.baseSubject ?? runRootGit(worktreeDir, ["rev-parse", "HEAD"]);
+    if (!request.recoveryBaseSubject) {
+      throw new Error("private recovery has no sealed durable base subject");
+    }
     const candidate = deriveCandidateCommit({
       worktreeDir,
-      baseCommit,
+      baseCommit: worktreeBaseCommit,
       message: `OpenThrottle private receipt recovery ${request.actionId}`,
     });
+    const baseCommit = request.recoveryBaseSubject;
     const recoveryDirectory = actionDirectory(request);
     const rawDiffPath = pathInside(recoveryDirectory, "recovery.patch.tmp");
     const rawPathsPath = pathInside(recoveryDirectory, "recovery.paths.tmp");

@@ -1847,6 +1847,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       skill: workerBinding.repositorySkill?.invocation ?? adapterSkillFor(action.action_kind),
       worktree,
       baseSubject: worktreeBaseFor(instance, action),
+      recoveryBaseSubject: instance.base_commit,
       inputSubject,
       nativeSessionId: action.native_session_id,
       contextPolicy,

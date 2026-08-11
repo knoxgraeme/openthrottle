@@ -80,6 +80,7 @@ export interface LoopActionRequest {
   skill: string;
   worktree: RuntimeWorktreeHandle | null;
   baseSubject?: string;
+  recoveryBaseSubject?: string;
   inputSubject?: string;
   candidateSubject?: string | null;
   nativeSessionId: string | null;
