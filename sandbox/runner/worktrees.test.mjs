@@ -202,6 +202,69 @@ describe("executor-owned worktrees", () => {
       .toThrow(/requires a full non-sparse checkout/);
   });
 
+  it("derives new worker files hidden by global and Git metadata excludes", () => {
+    const repoDir = repository();
+    const { rootDir, markerRootDir } = worktreeEnvironment();
+    const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-excludes", baseCommit });
+    const excludesRoot = mkdtempSync(join(tmpdir(), "ot-global-excludes-"));
+    directories.push(excludesRoot);
+    const excludesFile = join(excludesRoot, "ignore");
+    writeFileSync(excludesFile, "*.worker-output\n");
+    git(created.path, ["config", "core.excludesFile", excludesFile]);
+    const infoExclude = git(created.path, ["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"]);
+    writeFileSync(infoExclude, "*.info-output\n*.hidden-executable\n");
+    git(created.path, ["config", "core.fileMode", "false"]);
+    writeFileSync(join(created.path, ".gitignore"), "*.intentionally-ignored\nignored-nested/\n");
+    writeFileSync(join(created.path, "completed.worker-output"), "completed work\n");
+    writeFileSync(join(created.path, "completed.info-output"), "completed info-excluded work\n");
+    writeFileSync(join(created.path, "tool.hidden-executable"), "#!/bin/sh\n");
+    chmodSync(join(created.path, "tool.hidden-executable"), 0o755);
+    writeFileSync(join(created.path, "cache.intentionally-ignored"), "ignored cache\n");
+    const ignoredNested = join(created.path, "ignored-nested");
+    execFileSync("git", ["init", "-q", "-b", "main", ignoredNested]);
+    execFileSync("git", ["config", "user.name", "Nested Test"], { cwd: ignoredNested });
+    execFileSync("git", ["config", "user.email", "nested@example.com"], { cwd: ignoredNested });
+    writeFileSync(join(ignoredNested, "nested.txt"), "ignored nested work\n");
+    execFileSync("git", ["add", "nested.txt"], { cwd: ignoredNested });
+    execFileSync("git", ["commit", "--quiet", "-m", "ignored nested"], { cwd: ignoredNested });
+    const ignoredCacheBlob = git(created.path, ["hash-object", "--no-filters", "cache.intentionally-ignored"]);
+
+    const candidate = deriveCandidateCommit({ worktreeDir: created.path, baseCommit, message: "exclude candidate" });
+
+    expect(candidate.candidateCommit).toMatch(/^[a-f0-9]{40}$/);
+    expect(candidate.changedPaths).toContain("completed.worker-output");
+    expect(candidate.changedPaths).toContain("completed.info-output");
+    expect(candidate.changedPaths).toContain("tool.hidden-executable");
+    expect(candidate.changedPaths).not.toContain("cache.intentionally-ignored");
+    expect(candidate.changedPaths).not.toContain("ignored-nested");
+    expect(git(repoDir, ["show", `${candidate.candidateCommit}:completed.worker-output`])).toBe("completed work");
+    expect(git(repoDir, ["show", `${candidate.candidateCommit}:completed.info-output`])).toBe("completed info-excluded work");
+    expect(git(repoDir, ["ls-tree", candidate.candidateCommit, "tool.hidden-executable"])).toContain("100755");
+    expect(() => git(repoDir, ["cat-file", "-e", ignoredCacheBlob])).toThrow();
+  });
+
+  it("derives a changed gitlink when repository diff config ignores submodules", () => {
+    const repoDir = repository();
+    const { rootDir, markerRootDir } = worktreeEnvironment();
+    const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-gitlink-diff", baseCommit });
+    git(created.path, ["config", "diff.ignoreSubmodules", "all"]);
+    const nested = join(created.path, "nested-worker-repo");
+    execFileSync("git", ["init", "-q", "-b", "main", nested]);
+    execFileSync("git", ["config", "user.name", "Nested Test"], { cwd: nested });
+    execFileSync("git", ["config", "user.email", "nested@example.com"], { cwd: nested });
+    writeFileSync(join(nested, "nested.txt"), "nested work\n");
+    execFileSync("git", ["add", "nested.txt"], { cwd: nested });
+    execFileSync("git", ["commit", "--quiet", "-m", "nested worker"], { cwd: nested });
+
+    const candidate = deriveCandidateCommit({ worktreeDir: created.path, baseCommit, message: "gitlink candidate" });
+
+    expect(candidate.candidateCommit).toMatch(/^[a-f0-9]{40}$/);
+    expect(candidate.changedPaths).toContain("nested-worker-repo");
+    expect(git(repoDir, ["ls-tree", candidate.candidateCommit, "nested-worker-repo"])).toContain("160000");
+  });
+
   it("removes only the selected worktree handle", () => {
     const repoDir = repository();
     const { rootDir, markerRootDir } = worktreeEnvironment();

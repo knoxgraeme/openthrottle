@@ -3629,18 +3629,36 @@ describe("executeLoopAction", () => {
   });
 
   it.each([
-    ["request, subject, and producer", null, [
+    ["request, subject, and producer", null, null, [
       "/fence/attempt_id",
       "/subject/base",
       "/producer/worker_id",
     ]],
-    ["schema, request, subject, and producer", "openthrottle.receipt/v0", [
+    ["schema, request, subject, and producer", "openthrottle.receipt/v0", null, [
       "/schema",
       "/fence/attempt_id",
       "/subject/base",
       "/producer/worker_id",
     ]],
-  ])("repairs %s envelope mismatches in one deterministic pass", (_name, wrongSchema, expectedPointers) => {
+    ["unknown field, request, subject, and producer", null, "unexpected", [
+      "/unexpected",
+      "/fence/attempt_id",
+      "/subject/base",
+      "/producer/worker_id",
+    ]],
+    ["classifier-spoofing unknown field plus request, subject, and producer", null, "loop receipt producer", [
+      "/loop receipt producer",
+      "/fence/attempt_id",
+      "/subject/base",
+      "/producer/worker_id",
+    ]],
+    ["schema-spoofing unknown field plus request, subject, and producer", null, "standard receipt has an invalid schema", [
+      "/standard receipt has an invalid schema",
+      "/fence/attempt_id",
+      "/subject/base",
+      "/producer/worker_id",
+    ]],
+  ])("repairs %s envelope mismatches in one deterministic pass", (_name, wrongSchema, unknownField, expectedPointers) => {
     const valid = request({
       pipelineInstanceId: "instance-1",
       graphDigest: "a".repeat(64),
@@ -3659,6 +3677,7 @@ describe("executeLoopAction", () => {
     const badReceipt = {
       ...goodReceipt,
       ...(wrongSchema ? { schema: wrongSchema } : {}),
+      ...(unknownField ? { [unknownField]: "delete me" } : {}),
       fence: { ...goodReceipt.fence, attempt_id: "wrong-attempt" },
       subject: { ...goodReceipt.subject, base: "2".repeat(40) },
       producer: { ...goodReceipt.producer, worker_id: "wrong-worker" },

@@ -193,6 +193,57 @@ describe("computeWorkspaceTreeOid", () => {
     expect(() => computeWorkspaceTreeOid(repoDir)).toThrow(/requires a full non-sparse checkout/);
   });
 
+  it("attests new worker files hidden by global and Git metadata excludes", () => {
+    const repoDir = repository();
+    const excludesRoot = mkdtempSync(join(tmpdir(), "ot-control-global-excludes-"));
+    directories.push(excludesRoot);
+    const excludesFile = join(excludesRoot, "ignore");
+    writeFileSync(excludesFile, "*.worker-output\n");
+    execFileSync("git", ["config", "core.excludesFile", excludesFile], { cwd: repoDir });
+    const infoExclude = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(infoExclude, "*.info-output\n*.hidden-executable\n");
+    execFileSync("git", ["config", "core.fileMode", "false"], { cwd: repoDir });
+    writeFileSync(join(repoDir, ".gitignore"), "*.intentionally-ignored\nignored-nested/\n");
+    writeFileSync(join(repoDir, "completed.worker-output"), "completed work\n");
+    writeFileSync(join(repoDir, "completed.info-output"), "completed info-excluded work\n");
+    writeFileSync(join(repoDir, "tool.hidden-executable"), "#!/bin/sh\n");
+    chmodSync(join(repoDir, "tool.hidden-executable"), 0o755);
+    writeFileSync(join(repoDir, "cache.intentionally-ignored"), "ignored cache\n");
+    const ignoredNested = join(repoDir, "ignored-nested");
+    execFileSync("git", ["init", "-q", "-b", "main", ignoredNested]);
+    execFileSync("git", ["config", "user.name", "Nested Test"], { cwd: ignoredNested });
+    execFileSync("git", ["config", "user.email", "nested@example.com"], { cwd: ignoredNested });
+    writeFileSync(join(ignoredNested, "nested.txt"), "ignored nested work\n");
+    execFileSync("git", ["add", "nested.txt"], { cwd: ignoredNested });
+    execFileSync("git", ["commit", "--quiet", "-m", "ignored nested"], { cwd: ignoredNested });
+
+    const subject = computeWorkspaceTreeOid(repoDir);
+
+    expect(execFileSync("git", ["show", `${subject}:completed.worker-output`], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).trim()).toBe("completed work");
+    expect(execFileSync("git", ["show", `${subject}:completed.info-output`], {
+      cwd: repoDir,
+      encoding: "utf8",
+    }).trim()).toBe("completed info-excluded work");
+    expect(execFileSync("git", ["ls-tree", subject, "tool.hidden-executable"], {
+      cwd: repoDir,
+      encoding: "utf8",
+    })).toContain("100755");
+    expect(() => execFileSync("git", ["cat-file", "-e", `${subject}:cache.intentionally-ignored`], {
+      cwd: repoDir,
+      stdio: ["ignore", "ignore", "pipe"],
+    })).toThrow();
+    expect(() => execFileSync("git", ["cat-file", "-e", `${subject}:ignored-nested`], {
+      cwd: repoDir,
+      stdio: ["ignore", "ignore", "pipe"],
+    })).toThrow();
+  });
+
   it("uses a supplied Git directory when linked worktree metadata is locked", () => {
     const repoDir = repository();
     const gitDir = mkdtempSync(join(tmpdir(), "ot-control-git-dir-"));

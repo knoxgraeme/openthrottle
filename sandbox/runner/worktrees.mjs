@@ -4,7 +4,7 @@ import { chmodSync, chownSync, existsSync, lstatSync, mkdtempSync, readFileSync,
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { runGitAsExecutor } from "./repository-control.mjs";
+import { runGitAsExecutor, stageCanonicalWorkspaceIndex } from "./repository-control.mjs";
 import { removeWorktreeBootstrapMarker } from "./worktree-bootstrap.mjs";
 import { chmodOwnerPrivateTree, chmodTree, chownTree, ensureSandboxRootTraversal, ensureTraverseOnlyDirectory, identityForUser, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
 
@@ -231,20 +231,23 @@ export function deriveCandidateCommit({
       throw new Error("candidate creation requires a full non-sparse checkout");
     }
     runGitAsExecutor(worktreeDir, ["read-tree", "HEAD"], env);
-    // The repository's core.fileMode setting is untrusted input. Candidate
-    // evidence must preserve executable-bit changes even when a checkout has
-    // disabled ordinary worktree mode tracking.
-    runGitAsExecutor(worktreeDir, [
-      "-c", "core.fileMode=true",
-      "-c", "core.ignoreCase=false",
-      "-c", "core.symlinks=true",
-      "add", "-A", "--", ".",
-    ], env);
+    stageCanonicalWorkspaceIndex(worktreeDir, env, { asExecutor: true, scratchDir: temporary });
     const tree = runGitAsExecutor(worktreeDir, ["write-tree"], env);
-    const changedPaths = runGitAsExecutor(worktreeDir, ["diff", "--name-only", `${safeBase}^{tree}`, tree], env)
+    const baseTree = runGitAsExecutor(worktreeDir, ["rev-parse", `${safeBase}^{tree}`], env);
+    const changedPaths = runGitAsExecutor(worktreeDir, [
+      "-c", "core.quotePath=true",
+      "diff", "--name-only",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--ignore-submodules=none",
+      "--no-renames",
+      `${safeBase}^{tree}`,
+      tree,
+    ], env)
       .split("\n")
       .filter(Boolean);
-    if (changedPaths.length === 0) return { candidateCommit: null, tree, changedPaths };
+    if (tree === baseTree) return { candidateCommit: null, tree, changedPaths };
     const candidateCommit = runGitAsExecutor(worktreeDir, ["commit-tree", tree, "-p", safeBase, "-m", message], env);
     return { candidateCommit, tree, changedPaths };
   } finally {

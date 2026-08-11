@@ -1482,7 +1482,7 @@ function deterministicallyCorrectReceipt({ invalidReceipt, diagnostics, request,
   const corrected = JSON.parse(canonicalJson(invalidReceipt));
   const authoritative = authoritativeCorrectionValues(request, subject);
   for (const diagnostic of diagnostics) {
-    if (/unknown field/.test(String(diagnostic.message))) {
+    if (diagnostic.expected === "field absent" && /unknown field/.test(String(diagnostic.message))) {
       deleteJsonPointer(corrected, diagnostic.pointer);
       continue;
     }
@@ -1507,16 +1507,24 @@ function receiptCorrectionDiagnostics({ errorMessage, invalidReceipt, request, s
       message: sanitizeArtifactText(String(message ?? errorMessage)).slice(0, 500),
     });
   };
-  const schemaMismatch = /standard receipt (?:has an invalid schema|is missing field schema)/.test(errorMessage);
-  const envelopeMismatch = /loop receipt (?:.*fence mismatch|.*subject mismatch|producer)/.test(errorMessage);
+  const receiptValidationError = errorMessage.replace(/^loop action emitted invalid standard receipt:\s*/, "");
+  const schemaMismatch = /^standard receipt (?:has an invalid schema|is missing field schema)$/.test(receiptValidationError);
+  const envelopeMismatch = /^loop receipt (?:.*fence mismatch|.*subject mismatch|producer(?: skill)? mismatch)$/.test(errorMessage);
   if (schemaMismatch) {
     add("/schema", JSON.stringify(STANDARD_RECEIPT_SCHEMA), JSON.stringify(invalidReceipt?.schema), errorMessage);
+  } else if (!envelopeMismatch) {
+    // Preserve the primary schema/semantic failure alongside any masked sealed
+    // mismatches. Unknown fields are themselves correctable; other semantic
+    // failures deliberately keep the candidate on the fail-closed path.
+    const pointer = jsonPointerFromLabel(errorMessage);
+    add(pointer, expectedSummary(errorMessage), observedSummary(valueAtPointer(invalidReceipt, pointer)), errorMessage);
   }
-  if ((schemaMismatch || envelopeMismatch) && invalidReceipt && typeof invalidReceipt === "object" && !Array.isArray(invalidReceipt)) {
+  if (invalidReceipt && typeof invalidReceipt === "object" && !Array.isArray(invalidReceipt)) {
     // assertLoopReceiptFence reports the first mismatch it sees, but the one
     // deterministic correction pass must repair the whole sealed envelope.
-    // Schema validation can mask those mismatches too, so an otherwise parsed
-    // object receives all authoritative envelope diagnostics in the same pass.
+    // Schema validation, including an unknown-field error, can mask those
+    // mismatches too, so every otherwise parsed object receives all
+    // authoritative envelope diagnostics in the same pass.
     for (const [pointer, expectedValue] of authoritativeCorrectionValues(request, subject)) {
       if (pointer === "/schema" || expectedValue === undefined) continue;
       const observed = valueAtPointer(invalidReceipt, pointer);
