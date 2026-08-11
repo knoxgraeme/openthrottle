@@ -53,6 +53,28 @@ describe("admission store", () => {
     expect(store.getRepositoryRegistration(undefined, "missing")).toBeUndefined();
   });
 
+  it("fails closed when a human ticket reference is ambiguous across providers", () => {
+    store.upsertUnpinned({
+      ticket_id: "github:issue-1",
+      ticket_reference: "OT-1",
+      session_id: "github-session-1",
+      control_provider: "github",
+      external_thread_id: "1",
+      external_thread_reference: "OT-1",
+      sandbox_id: null,
+      branch: "ot/github-ot-1",
+      agent: "codex",
+      repo: "owner/repo",
+      base_branch: "main",
+      pr_url: null,
+      state: "active",
+    });
+
+    expect(store.getByIdentifier("OT-1")).toBeUndefined();
+    expect(store.getByIssueId("issue-1")?.control_provider).toBe("linear");
+    expect(store.getByIssueId("github:issue-1")?.control_provider).toBe("github");
+  });
+
   it("keys repository registrations by repo and rejects different-provider authority transfer", () => {
     store.registerRepository({
       linearTeamKey: "ENG",
