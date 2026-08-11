@@ -67,6 +67,7 @@ describe("operator skill package", () => {
   });
 
   it("provides focused one-level references for operator workflows", () => {
+    const skill = readFileSync(resolve(process.cwd(), "../skills/operator/openthrottle/SKILL.md"), "utf8");
     for (const name of ["ship", "trigger", "tune", "monitor"]) {
       expect(readFileSync(resolve(process.cwd(), `../skills/operator/openthrottle/references/${name}.md`), "utf8")).toContain(`# ${name[0]!.toUpperCase()}${name.slice(1)}`);
     }
@@ -79,6 +80,10 @@ describe("operator skill package", () => {
     expect(ship).toContain("validated digest from the validation JSON output");
     expect(ship).toContain("never fall back to `simple`");
     expect(ship).toContain("Ticket reuse, trigger-state JSON, and recovery commands are capability-gated");
+    expect(skill).toContain("Keep ambiguity resolution and discovery read-only");
+    expect(skill).toContain("obtain the user's explicit authorization");
+    expect(skill).toContain("validate the written plan, and report the");
+    expect(skill).toContain("never fall back to `simple`");
   });
 });
 
@@ -417,6 +422,32 @@ describe("operator skill Skillfish wrapper", () => {
 
     expect(result.success).toBe(true);
     expect(result.skipped).toEqual([{ agent: "Codex", status: "skipped", reason: "not installed" }]);
+  });
+
+  it("fails install when Skillfish detects no supported agent", () => {
+    const home = temporaryDirectory();
+    let calls = 0;
+    const runner = () => {
+      calls += 1;
+      return spawnResult({
+        success: true,
+        installed: [],
+        agents_detected: [],
+      });
+    };
+
+    const result = runOperatorSkillAction("install", { home, runner, sourceRef });
+
+    expect(calls).toBe(1);
+    expect(result.success).toBe(false);
+    expect(result.installed).toEqual([]);
+    expect(result.skipped).toEqual([]);
+    expect(result.conflicted).toEqual([]);
+    expect(result.unsupported).toEqual([
+      { agent: "Claude Code", status: "unsupported", reason: "agent not detected by Skillfish" },
+      { agent: "Codex", status: "unsupported", reason: "agent not detected by Skillfish" },
+      { agent: "OpenCode", status: "unsupported", reason: "agent not detected by Skillfish" },
+    ]);
   });
 
   it("normalizes Skillfish list paths before its temporary HOME is removed", () => {
