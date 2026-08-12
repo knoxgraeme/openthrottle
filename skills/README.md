@@ -40,6 +40,9 @@ capability→skill map, not task type):
   request for the already-gated exact subject.
 - `investigate` (`ce/investigate@1`) diagnoses a reported defect and applies a
   convergent fix only.
+- `tune` (`core/tune@1`) analyzes sealed tune contracts and typed corpus rows,
+  then emits only strict standard receipts proposing reviewable config or
+  unlocked skill-craft/reference changes under the sealed policy.
 
 Structured graphs use five direct loop-path task adapters plus the orchestrated
 whole-change review packages:

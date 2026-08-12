@@ -223,6 +223,47 @@ function successProposal() {
   };
 }
 
+function tuneReceipt(request) {
+  return {
+    schema: "openthrottle.receipt/v1",
+    type: "semantic_review",
+    assurance: "semantic_attested",
+    result: "semantic_repair_required",
+    producer: {
+      worker_id: "tuner",
+      skill: "builtin://tune@1",
+      capability_digest: runtimeCapabilityDigest(),
+      skill_package_digest: null,
+    },
+    subject: {
+      base: request.expectedSubject,
+      pre: request.expectedSubject,
+      post: request.expectedSubject,
+    },
+    fence: {
+      pipeline_instance_id: request.pipelineInstanceId,
+      graph_digest: request.manifestDigest,
+      unit_id: "__tune__",
+      attempt_id: request.attemptId,
+      parent_run_id: request.runId,
+      action_attempt_id: request.attemptId,
+      generation: request.generation,
+      native_session_id: null,
+      request_hash: request.requestHash,
+    },
+    evidence: ["typed tune corpus row_one reproduced"],
+    payload: {
+      summary: "One reviewable tune proposal was produced.",
+      findings: [{
+        severity: "P2",
+        message: "[skills/tasks/tune/SKILL.md#Receipt|strict-summary-string: tune receipts remain schema-strict] Proposal keeps payload.summary as a string.",
+        path: "skills/tasks/tune/SKILL.md",
+      }],
+    },
+    issued_at: "2026-01-01T00:00:00Z",
+  };
+}
+
 function publishFixture() {
   return fixture({
     capability: "ce/publish@1",
@@ -344,7 +385,7 @@ describe("one-stage executor", () => {
     // state that differs between environments.
     const stageSkillRoot = mkdtempSync(join(tmpdir(), "ot-stage-publish-skill-"));
     directories.push(stageSkillRoot);
-    for (const name of ["publish", "implement-plan"]) {
+    for (const name of ["publish", "implement-plan", "tune"]) {
       mkdirSync(join(stageSkillRoot, name), { recursive: true });
       writeFileSync(join(stageSkillRoot, name, "SKILL.md"), `---\nname: ${name}\n---\nFixture.\n`);
     }
@@ -358,13 +399,18 @@ describe("one-stage executor", () => {
       "/tmp/proposal.json",
       { agent: "claude", skillRoot: stageSkillRoot }
     )).toMatch(/^\/implement-plan/);
+    expect(stagePrompt(
+      { ...request, capability: "core/tune@1", requiredArtifacts: ["stage_result", "standard_receipt"] },
+      "/tmp/proposal.json",
+      { skillRoot: stageSkillRoot },
+    )).toMatch(/^\$tune/);
   });
 
   it("selects the stage skill from the capability, not the task type", () => {
     const { request } = fixture();
     const skillRoot = mkdtempSync(join(tmpdir(), "ot-stage-capability-skills-"));
     directories.push(skillRoot);
-    for (const name of ["implement-plan", "investigate", "publish"]) {
+    for (const name of ["implement-plan", "investigate", "publish", "tune"]) {
       mkdirSync(join(skillRoot, name), { recursive: true });
       writeFileSync(join(skillRoot, name, "SKILL.md"), `---\nname: ${name}\n---\nFixture.\n`);
     }
@@ -372,6 +418,7 @@ describe("one-stage executor", () => {
 
     expect(prompt("ce/investigate@1")).toMatch(/^\$investigate/);
     expect(prompt("ce/publish@1")).toMatch(/^\$publish/);
+    expect(prompt("core/tune@1")).toMatch(/^\$tune/);
     // ce/plan@1 is a registered capability with no drafted skill of its own;
     // it maps explicitly to implement-plan rather than failing closed like a
     // genuinely unmapped capability.
@@ -664,6 +711,33 @@ describe("one-stage executor", () => {
     });
     expect(result.outcome).toBe("failure");
     expect(JSON.parse(result.artifacts[0].payload).summary).toMatch(/proposal was rejected/);
+  });
+
+  it("seals core tune receipts as standard receipt artifacts", () => {
+    const input = fixture({
+      capability: "core/tune@1",
+      requiredArtifacts: ["stage_result", "standard_receipt"],
+      credentialScopes: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+    });
+    const receipt = tuneReceipt(input.request);
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent: () => ({
+        exitCode: 0,
+        nativeSessionId: "native-1",
+        stdout: JSON.stringify(receipt),
+        receipt,
+      }),
+    });
+
+    expect(result.outcome).toBe("semantic_repair_required");
+    expect(result.artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result", "standard_receipt"]);
+    const standardReceipt = JSON.parse(result.artifacts[1].payload);
+    expect(standardReceipt.details.receipt.type).toBe("semantic_review");
+    expect(standardReceipt.details.receipt.payload.findings[0].message).toMatch(
+      /^\[skills\/tasks\/tune\/SKILL\.md#Receipt\|strict-summary-string: tune receipts remain schema-strict\]/
+    );
   });
 
   it("redacts a Codex token rotated during execution from semantic artifacts", () => {

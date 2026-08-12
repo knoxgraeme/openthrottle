@@ -38,13 +38,14 @@ const reviewPersonaTasks = [
   "tests-contracts",
   ...optionalReviewPersonaTasks,
 ];
+const tuneTasks = ["tune"];
 const findingReviewPersonaTasks = [
   "correctness-dataflow",
   "tests-contracts",
   ...optionalReviewPersonaTasks,
 ];
 const selectorAndPersonaTasks = ["select-review-personas", ...findingReviewPersonaTasks];
-const tasks = [...stageTasks, ...loopTasks, ...reviewPersonaTasks];
+const tasks = [...stageTasks, ...loopTasks, ...reviewPersonaTasks, ...tuneTasks];
 
 // The four loop skills that own an executor-owned worktree and author
 // `subject.post` via `ot-subject-post`.
@@ -192,6 +193,30 @@ describe("OpenThrottle canonical task skills", () => {
     expect(skillBody("project-standards")).toContain("Task skills remain self-contained");
     expect(skillBody("project-standards")).toContain("quoted standard text");
     expect(skillBody("project-standards")).toContain("Bounded Depth");
+  });
+
+  it("ships the corpus-only tune package as a standard receipt producer", () => {
+    const body = skillBody("tune");
+    expect(body).toContain("capability `core/tune@1`");
+    expect(body).toContain("corpus-only");
+    expect(body).toContain("Never ingest raw ticket prose");
+    expect(body).toContain("openthrottle.receipt/v1");
+    expect(body).toContain("payload.summary` is one string");
+    expect(body).toContain("payload.findings` is always an\narray of typed objects");
+    expect(body).toContain("[path#anchor|claim-discriminator: invariant]");
+    expect(body).toContain("expected metric movement");
+    expect(body).toContain("rollback notes");
+    expect(body).toMatch(/Do not propose graph\s+authority expansion/);
+
+    const matches = [...body.matchAll(/```json\n([\s\S]*?)\n```/g)];
+    expect(matches.length).toBe(1);
+    const receipt = validateStandardReceipt(JSON.parse(matches[0][1]), {});
+    expect(receipt.type).toBe("semantic_review");
+    expect(receipt.result).toBe("semantic_repair_required");
+    expect(typeof receipt.payload.summary).toBe("string");
+    expect(receipt.payload.findings[0].message).toMatch(
+      /^\[[^#\]]+#[^|\]]+\|[^:\]]+: [^\]]+\]/
+    );
   });
 
   it("ships non-CE fixture skills for the same standard receipt contracts", () => {

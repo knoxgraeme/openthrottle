@@ -1,0 +1,38 @@
+{
+  "schema": "openthrottle.receipt/v1",
+  "type": "semantic_review",
+  "assurance": "semantic_attested",
+  "result": "semantic_repair_required",
+  "producer": {
+    "worker_id": "reviewer",
+    "skill": "builtin://review-change@1",
+    "capability_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "skill_package_digest": null
+  },
+  "subject": {
+    "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "pre": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "post": "cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "fence": {
+    "pipeline_instance_id": "instance-1",
+    "graph_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "unit_id": "__final__",
+    "attempt_id": "attempt-1",
+    "parent_run_id": "run-1",
+    "action_attempt_id": "action-1",
+    "generation": 1,
+    "native_session_id": null,
+    "request_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "evidence": [
+    "review inspected the subject"
+  ],
+  "payload": {
+    "summary": "One finding exists.",
+    "findings": [
+      "[src/example.ts#example|bad-shape: findings are typed objects] This must be an object, not a string."
+    ]
+  },
+  "issued_at": "2026-07-28T00:00:00.000Z"
+}
