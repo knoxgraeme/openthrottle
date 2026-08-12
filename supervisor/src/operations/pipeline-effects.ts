@@ -5,13 +5,19 @@ import { canonicalJson, stageById } from "../pipeline/manifest.js";
 import { digestNormalized } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import {
+  EXECUTION_PLAN_SCHEMA,
+  TUNE_DECISION_SCHEMA,
+  TUNE_EDIT_AUTHORIZATION_SCHEMA,
+  TUNE_RELEASE_DESCRIPTOR_SCHEMA,
   digestCanonicalJson,
   validateStandardReceipt,
   validateTuneDecisionContract,
   validateTuneEditAuthorizationContract,
   validateTuneProposalContract,
+  validateTuneReleaseDescriptorContract,
   type StandardReceipt,
   type TuneProposal,
+  type ValidatedContract,
 } from "@openthrottle/contracts";
 import { evaluateCitationGate, type ResolvedCitation } from "../pipeline/citation-gate.js";
 import { evaluateImprovementProposalGate } from "../pipeline/improvement-proposal-gate.js";
@@ -375,7 +381,10 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     });
   };
 
-  const typedReceiptFromInput = (request: StageRequestEnvelope, type: StandardReceipt["type"]): StandardReceipt => {
+  const typedReceiptFromInput = <T extends StandardReceipt["type"]>(
+    request: StageRequestEnvelope,
+    type: T
+  ): Extract<StandardReceipt, { type: T }> => {
     const artifact = request.inputArtifacts?.find((entry) => entry.kind === "standard_receipt");
     if (!artifact || digestNormalized(artifact.payload) !== artifact.hash) {
       throw new Error(`supervisor tune stage ${request.stageId} is missing its sealed predecessor receipt`);
@@ -385,15 +394,15 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       source: `stage.${request.stageId}.input_receipt`,
     }).value;
     if (receipt.type !== type) throw new Error(`supervisor tune stage ${request.stageId} requires ${type}`);
-    return receipt;
+    return receipt as Extract<StandardReceipt, { type: T }>;
   };
 
-  const tuneProposalFromInput = (request: StageRequestEnvelope): TuneProposal => {
+  const tuneProposalFromInput = (request: StageRequestEnvelope): ValidatedContract<TuneProposal> => {
     const receiptArtifact = request.inputArtifacts?.find((entry) => entry.kind === "standard_receipt");
     let candidate: unknown;
     if (receiptArtifact) {
       const receipt = typedReceiptFromInput(request, "tune_proposal");
-      candidate = receipt.type === "tune_proposal" ? receipt.payload.proposal : undefined;
+      candidate = receipt.payload.proposal;
     } else {
       const stageArtifact = request.inputArtifacts?.find((entry) => entry.kind === "stage_result");
       const wrapper = stageArtifact
@@ -403,23 +412,25 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }
     return validateTuneProposalContract(candidate, {
       source: `stage.${request.stageId}.proposal`,
-    }).value;
+    });
   };
 
-  const comparableCorpusRows = (proposal: TuneProposal): ResolvedCitation[] =>
-    proposal.citation_contract.citations.map((citation) => ({
+  const comparableCorpusRows = (proposal: TuneProposal): ResolvedCitation[] => {
+    const rows = proposal.analysis.corpus_rows.map((row) => ({
+      pipeline_instance_id: row.pipeline_instance_id,
+      generation: row.generation,
+      execution_graph_id: row.execution_graph_id,
+      outcome: row.outcome,
+      closed_reason: row.closed_reason,
+      fault_attribution: row.fault_attribution,
+      created_at: row.created_at,
+    }));
+    return proposal.citation_contract.citations.map((citation) => ({
       id: citation.id,
-      actual_result: proposal.analysis.corpus_rows
-        .map((row) => ({
-          pipeline_instance_id: row.pipeline_instance_id,
-          generation: row.generation,
-          execution_graph_id: row.execution_graph_id,
-          outcome: row.outcome,
-          closed_reason: row.closed_reason,
-          fault_attribution: row.fault_attribution,
-          created_at: row.created_at,
-        }))
+      actual_result: rows
         .filter((row) =>
+          (citation.query.skill_digest === undefined ||
+            citation.query.skill_digest === proposal.analysis.intent.task.query.skill) &&
           (citation.query.outcome === undefined || row.outcome === citation.query.outcome) &&
           (citation.query.reason === undefined || row.closed_reason === citation.query.reason) &&
           (citation.query.attribution === undefined || row.fault_attribution === citation.query.attribution) &&
@@ -429,6 +440,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         )
         .slice(0, citation.query.limit ?? 50),
     }));
+  };
 
   const supervisorArtifact = (input: {
     request: StageRequestEnvelope;
@@ -486,7 +498,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
   };
 
   const executionPlanForProposal = (proposal: TuneProposal) => ({
-    schema: "openthrottle.execution-plan/v1",
+    schema: EXECUTION_PLAN_SCHEMA,
     graph_id: "structured",
     plan_id: `tune-${proposal.id}`,
     instructions: {
@@ -514,8 +526,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     assertActiveAttempt(instance, request);
     deps.store.bindStageRun(request.attemptId, request.runId);
     deps.store.markStageDispatched(request.attemptId);
-    const proposal = tuneProposalFromInput(request);
-    const proposalDigest = validateTuneProposalContract(proposal).digest;
+    const proposalContract = tuneProposalFromInput(request);
+    const { value: proposal, digest: proposalDigest } = proposalContract;
     let outcome: "success" | "failure" | "no_change" | "needs_human" = "failure";
     let summary = "Tune gate rejected the proposal.";
     let details: Record<string, unknown>;
@@ -551,19 +563,20 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           improvement_gate: evaluation.journal,
         };
       } else {
-        const decision = validateTuneDecisionContract({
-          schema: "openthrottle.tune-decision/v1",
+        const ratchetDecisionDigest = digestCanonicalJson(ratchetDecision);
+        const decisionContract = validateTuneDecisionContract({
+          schema: TUNE_DECISION_SCHEMA,
           id: `decision-${proposal.id}`,
           proposal_digest: proposalDigest,
           citation_decision_digest: citationDecision.hash,
-          ratchet_decision_digest: digestCanonicalJson(ratchetDecision),
+          ratchet_decision_digest: ratchetDecisionDigest,
           outcome: "accept",
           rationale: "Supervisor citation and differential-ratchet gates passed.",
-        }, { proposal, citationDecisionDigest: citationDecision.hash, ratchetDecision }).value;
-        const decisionDigest = validateTuneDecisionContract(decision).digest;
+        }, { proposal, citationDecisionDigest: citationDecision.hash, ratchetDecision });
+        const { value: decision, digest: decisionDigest } = decisionContract;
         const timestamp = now();
-        const authorization = validateTuneEditAuthorizationContract({
-          schema: "openthrottle.tune-edit-authorization/v1",
+        const authorizationContract = validateTuneEditAuthorizationContract({
+          schema: TUNE_EDIT_AUTHORIZATION_SCHEMA,
           id: `edit-${proposal.id}`,
           proposal_digest: proposalDigest,
           decision_digest: decisionDigest,
@@ -571,8 +584,22 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           authorized_at: timestamp.toISOString(),
           expires_at: new Date(timestamp.getTime() + 60 * 60_000).toISOString(),
           actor_id: "openthrottle-supervisor",
-        }, { proposal, decision }).value;
-        const authorizationDigest = validateTuneEditAuthorizationContract(authorization).digest;
+        }, { proposal, decision });
+        const { value: authorization, digest: authorizationDigest } = authorizationContract;
+        const releaseDescriptorContract = validateTuneReleaseDescriptorContract({
+          schema: TUNE_RELEASE_DESCRIPTOR_SCHEMA,
+          id: `release-${proposal.id}`,
+          runtime_release: instance.runtime_release,
+          capability_digest: instance.capability_digest,
+          contract_digests: [
+            proposalDigest,
+            citationDecision.hash,
+            ratchetDecisionDigest,
+            decisionDigest,
+            authorizationDigest,
+          ],
+          issued_at: timestamp.toISOString(),
+        });
         deps.tickets.recordTuneState({
           id: `tune-state-${proposal.id}`,
           intentId: proposal.analysis.intent.id,
@@ -580,11 +607,17 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           proposalId: proposal.id,
           proposalDigest,
           citationDecisionDigest: citationDecision.hash,
-          ratchetDecisionDigest: digestCanonicalJson(ratchetDecision),
+          ratchetDecisionDigest,
           editAuthorizationDigest: authorizationDigest,
-          releaseDescriptorDigest: inputReleaseDescriptorDigest(instance),
+          releaseDescriptorDigest: releaseDescriptorContract.digest,
           outcome: "accepted",
-          payload: { proposal, decision, authorization, improvement_gate: evaluation.journal },
+          payload: {
+            proposal,
+            decision,
+            authorization,
+            release_descriptor: releaseDescriptorContract.value,
+            improvement_gate: evaluation.journal,
+          },
         });
         outcome = "success";
         summary = "Supervisor citation and differential-ratchet gates accepted the tune proposal.";
@@ -621,14 +654,6 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     });
     acknowledgeEffect(effect, event.id, { resultHash: artifact.hash, outcome });
   };
-
-  function inputReleaseDescriptorDigest(instance: PipelineInstance): string {
-    return digestCanonicalJson({
-      runtime_release: instance.runtime_release,
-      capability_digest: instance.capability_digest,
-      manifest_digest: instance.manifest_digest,
-    });
-  }
 
   const runtimeBindingFor = (instance: PipelineInstance): EffectRuntimeBinding => {
     const binding = deps.store.getRuntimeResource(instance.id);

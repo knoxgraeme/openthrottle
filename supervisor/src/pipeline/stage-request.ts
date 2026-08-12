@@ -1,5 +1,6 @@
 import {
   type ArtifactKind,
+  type AssuranceClass,
   canonicalJson,
   COMMAND_NAMES,
   type CommandName,
@@ -8,13 +9,14 @@ import {
   type PipelineStage,
   type RepositorySkillPackage,
 } from "./manifest.js";
+import type { TaskType } from "./types.js";
 
 export const STAGE_EXECUTOR_PROTOCOL = "stage-executor@1";
 
 export interface StageRequestInputArtifact {
   kind: ArtifactKind;
   schemaVersion: number;
-  assurance: string;
+  assurance: AssuranceClass;
   subject: string | null;
   payload: string;
   hash: string;
@@ -35,7 +37,7 @@ export interface StageRequestEnvelope {
   issueId: string;
   sessionId: string;
   generation: number;
-  taskType: "implement" | "investigate" | "tune";
+  taskType: TaskType;
   taskContext: string;
   transitionContext: string;
   inputArtifacts?: StageRequestInputArtifact[];
@@ -92,7 +94,7 @@ export function buildStageRequest(input: {
   issueId: string;
   sessionId: string;
   generation: number;
-  taskType: "implement" | "investigate" | "tune";
+  taskType: TaskType;
   taskContext: string;
   transitionContext: string;
   inputArtifacts?: StageRequestInputArtifact[];

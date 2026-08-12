@@ -347,6 +347,15 @@ describe("Stage C contract fixtures", () => {
       .toThrow(/proposal\.analysis_digest: does not match canonical tune analysis digest/);
   });
 
+  it("keeps citation and ratchet gates mandatory for every tune task", () => {
+    for (const field of ["requires_citation_gate", "requires_ratchet"] as const) {
+      const task = tuneTask();
+      (task.policy as Record<string, unknown>)[field] = false;
+      expect(() => validateTuneTaskContract(task, { source: "task" }))
+        .toThrow(new RegExp(`task\\.policy\\.${field}: must be true`));
+    }
+  });
+
   it("rejects raw corpus prose, evidence substitution, and changes outside sealed policy", () => {
     const badAnalysis = tuneAnalysis();
     badAnalysis.corpus_rows = [{ ...corpusRow(), raw_ticket_text: "untrusted prose" }];

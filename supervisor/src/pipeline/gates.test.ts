@@ -140,6 +140,11 @@ describe("deterministic supervisor stage gates", () => {
     manifestKey = "core/investigate@1",
     options: { maxAttempts?: number } = {}
   ): Fixture {
+    const taskType = manifestKey.startsWith("core/investigate")
+      ? "investigate"
+      : manifestKey.startsWith("core/tune")
+        ? "tune"
+        : "implement";
     database = openDb(":memory:");
     const pipelines = createPipelineStore(database);
     const tickets = createSupervisorStore(database, pipelines);
@@ -177,7 +182,7 @@ describe("deterministic supervisor stage gates", () => {
         repositoryConfig: snapshot,
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
-        taskType: manifestKey.startsWith("core/investigate") ? "investigate" : "implement",
+        taskType,
       },
     });
     const instance = pipelines.getInstanceForSession("session-1")!;
@@ -186,7 +191,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(tickets.beginRun({
       issueId: "issue-1",
       runId: request.runId,
-      taskType: manifestKey.startsWith("core/investigate") ? "investigate" : "implement",
+      taskType,
       tokenHash: "token-hash",
       expiresAt: "2099-01-01T00:00:00.000Z",
     })).toBe(true);
@@ -909,13 +914,13 @@ describe("deterministic supervisor stage gates", () => {
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM pipeline_artifacts").get()).toEqual({ count: 2 });
   });
 
-  it("executes tune citation gates before isolated mutation", () => {
+  it("executes tune citation gates before structured mutation", () => {
     const failedFixture = moveFixtureToStage(setup("core/tune@1"), "citation_gate");
     const failed = processStageEvidence(failedFixture.pipelines, event(failedFixture, "success", {
       details: { citation_gate: tuneCitationDecision(false) },
     }), { observedSubject: SUBJECT });
     expect(failed).toMatchObject({ status: "completion_pending_publication", terminal_outcome: "failed" });
-    expect(failed.active_stage_id).not.toBe("isolated_edit");
+    expect(failed.active_stage_id).not.toBe("structured_edit");
     expect(recordedStageGate(failedFixture)).toMatchObject({ evaluator_kind: "citation", result: "failed" });
 
     const passedFixture = moveFixtureToStage(setup("core/tune@1"), "citation_gate");
@@ -923,10 +928,15 @@ describe("deterministic supervisor stage gates", () => {
       details: { citation_gate: tuneCitationDecision(true) },
     }), { observedSubject: SUBJECT });
     expect(passed).toMatchObject({ status: "dispatchable", active_stage_id: "differential_ratchet" });
+    const nextRequest = passedFixture.pipelines.getStageRequest(
+      passedFixture.pipelines.getActiveAttempt(passed.id)!.id
+    );
+    expect(nextRequest.taskContext).toBe("Supervisor-sealed tune evidence is carried only by inputArtifacts.");
+    expect(nextRequest.inputArtifacts?.map((artifact) => artifact.kind)).toContain("stage_result");
     expect(recordedStageGate(passedFixture)).toMatchObject({ evaluator_kind: "citation", result: "passed" });
   });
 
-  it("executes tune differential-ratchet gates before isolated mutation", () => {
+  it("executes tune differential-ratchet gates before structured mutation", () => {
     const citation = tuneCitationDecision(true);
     const failedFixture = moveFixtureToStage(setup("core/tune@1"), "differential_ratchet");
     const failed = processStageEvidence(failedFixture.pipelines, event(failedFixture, "success", {
@@ -937,7 +947,7 @@ describe("deterministic supervisor stage gates", () => {
       },
     }), { observedSubject: SUBJECT });
     expect(failed).toMatchObject({ status: "completion_pending_publication", terminal_outcome: "failed" });
-    expect(failed.active_stage_id).not.toBe("isolated_edit");
+    expect(failed.active_stage_id).not.toBe("structured_edit");
     expect(recordedStageGate(failedFixture)).toMatchObject({
       evaluator_kind: "differential_ratchet",
       result: "failed",
@@ -951,7 +961,7 @@ describe("deterministic supervisor stage gates", () => {
         ratchet_input: tuneRatchetInput(),
       },
     }), { observedSubject: SUBJECT });
-    expect(passed).toMatchObject({ status: "dispatchable", active_stage_id: "isolated_edit" });
+    expect(passed).toMatchObject({ status: "dispatchable", active_stage_id: "structured_edit" });
     expect(recordedStageGate(passedFixture)).toMatchObject({
       evaluator_kind: "differential_ratchet",
       result: "passed",

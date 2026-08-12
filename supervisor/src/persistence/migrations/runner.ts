@@ -13,9 +13,6 @@ export function applyDatabaseMigrations(db: Database.Database): void {
     )
   `);
   const validateLedger = () => {
-    // Read the ledger only after the exclusive lock is held. A second
-    // supervisor starting concurrently then observes the first one's committed
-    // ledger instead of replaying a migration from a stale pre-lock snapshot.
     const applied = db.prepare(
       "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
     ).all() as Array<{ version: number; name: string; checksum: string }>;
@@ -32,18 +29,29 @@ export function applyDatabaseMigrations(db: Database.Database): void {
     }
     return applied;
   };
-  const applyOrdinary = () => db.transaction(() => {
-    const applied = validateLedger();
-    for (const migration of databaseMigrations) {
-      if (migration.mode === "foreign-keys-off" || applied.some((row) => row.version === migration.version)) continue;
-      migration.up(db);
-      db.prepare(
-        "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)"
-      ).run(migration.version, migration.name, migration.checksum, new Date().toISOString());
+  const initiallyApplied = new Set(validateLedger().map((row) => row.version));
+  if (databaseMigrations.every((migration) => initiallyApplied.has(migration.version))) return;
+  const applyOrdinaryBatch = (batch: typeof databaseMigrations): void => {
+    if (batch.length === 0) return;
+    db.transaction(() => {
+      const applied = new Set(validateLedger().map((row) => row.version));
+      for (const migration of batch) {
+        if (applied.has(migration.version)) continue;
+        migration.up(db);
+        db.prepare(
+          "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)"
+        ).run(migration.version, migration.name, migration.checksum, new Date().toISOString());
+      }
+    }).exclusive();
+  };
+  let ordinaryBatch: typeof databaseMigrations = [];
+  for (const migration of databaseMigrations) {
+    if (migration.mode !== "foreign-keys-off") {
+      ordinaryBatch.push(migration);
+      continue;
     }
-  }).exclusive();
-  applyOrdinary();
-  for (const migration of databaseMigrations.filter((entry) => entry.mode === "foreign-keys-off")) {
+    applyOrdinaryBatch(ordinaryBatch);
+    ordinaryBatch = [];
     if (validateLedger().some((row) => row.version === migration.version)) continue;
     db.pragma("foreign_keys = OFF");
     try {
@@ -65,4 +73,5 @@ export function applyDatabaseMigrations(db: Database.Database): void {
       db.pragma("foreign_keys = ON");
     }
   }
+  applyOrdinaryBatch(ordinaryBatch);
 }

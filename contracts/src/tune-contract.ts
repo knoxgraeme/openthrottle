@@ -285,12 +285,15 @@ function parseBaseline(value: unknown, path: string): TuneBaseline {
 
 function parsePolicy(value: unknown, path: string): TunePolicy {
   const input = objectAt(value, path, POLICY_FIELDS);
-  return {
+  const policy = {
     allow_edit_paths: parsePaths(input.allow_edit_paths, `${path}.allow_edit_paths`, { min: 1, max: 64 }),
     requires_citation_gate: booleanAt(input.requires_citation_gate, `${path}.requires_citation_gate`),
     requires_ratchet: booleanAt(input.requires_ratchet, `${path}.requires_ratchet`),
     max_changed_files: integerAt(input.max_changed_files, `${path}.max_changed_files`, 0, 64),
   };
+  if (!policy.requires_citation_gate) fail(`${path}.requires_citation_gate`, "must be true");
+  if (!policy.requires_ratchet) fail(`${path}.requires_ratchet`, "must be true");
+  return policy;
 }
 
 function parseTaskValue(value: unknown, source: string): TuneTask {
@@ -414,7 +417,7 @@ function assertProposalMatchesIntent(proposal: TuneProposal, source: string): vo
   }
 }
 
-function assertProposalEvidenceBindings(proposal: TuneProposal, source: string): void {
+function assertProposalEvidenceBindings(proposal: TuneProposal, source: string, citationDigest: string): void {
   if (proposal.citation_contract.id !== proposal.id) {
     fail(`${source}.citation_contract.id`, "must match tune proposal id");
   }
@@ -422,9 +425,6 @@ function assertProposalEvidenceBindings(proposal: TuneProposal, source: string):
     fail(`${source}.ratchet_input.id`, "must match tune proposal id");
   }
 
-  const citationDigest = validateCitationContractProposal(proposal.citation_contract, {
-    source: `${source}.citation_contract`,
-  }).digest;
   if (proposal.ratchet_input.tuner_authority?.proposal_digest !== citationDigest) {
     fail(
       `${source}.ratchet_input.tuner_authority.proposal_digest`,
@@ -504,7 +504,7 @@ export function validateTuneAnalysisContract(value: unknown, options: { source?:
     corpus_digest: stringAt(input.corpus_digest, `${source}.corpus_digest`, { pattern: SHA256 }),
     generated_at: timestamp(input.generated_at, `${source}.generated_at`),
   };
-  if (validateTuneSealedIntentContract(intent, { source: `${source}.intent` }).digest !== analysis.intent_digest) {
+  if (digestCanonicalJson(intent) !== analysis.intent_digest) {
     fail(`${source}.intent_digest`, "does not match canonical sealed intent digest");
   }
   if (deriveTuneCorpusDigest(analysis.corpus_rows) !== analysis.corpus_digest) {
@@ -548,10 +548,14 @@ export function validateTuneProposalContract(value: unknown, options: { source?:
   const source = options.source ?? "tune_proposal";
   const input = objectAt(value, source, PROPOSAL_FIELDS);
   if (input.schema !== TUNE_PROPOSAL_SCHEMA) fail(`${source}.schema`, `must be ${TUNE_PROPOSAL_SCHEMA}`);
+  const analysis = validateTuneAnalysisContract(input.analysis, { source: `${source}.analysis` });
+  const citationContract = validateCitationContractProposal(input.citation_contract, {
+    source: `${source}.citation_contract`,
+  });
   const proposal: TuneProposal = {
     schema: TUNE_PROPOSAL_SCHEMA,
     id: stringAt(input.id, `${source}.id`, { pattern: IDENTIFIER }),
-    analysis: validateTuneAnalysisContract(input.analysis, { source: `${source}.analysis` }).value,
+    analysis: analysis.value,
     analysis_digest: stringAt(input.analysis_digest, `${source}.analysis_digest`, { pattern: SHA256 }),
     target: parseTarget(input.target, `${source}.target`),
     query: parseQuery(input.query, `${source}.query`),
@@ -561,14 +565,12 @@ export function validateTuneProposalContract(value: unknown, options: { source?:
     policy: parsePolicy(input.policy, `${source}.policy`),
     outcome: enumAt(input.outcome, `${source}.outcome`, TUNE_PROPOSAL_OUTCOMES),
     changes: arrayAt(input.changes, `${source}.changes`, parseChange, { max: 64 }),
-    citation_contract: validateCitationContractProposal(input.citation_contract, {
-      source: `${source}.citation_contract`,
-    }).value,
+    citation_contract: citationContract.value,
     ratchet_input: validateRatchetDifferentialInput(input.ratchet_input, {
       source: `${source}.ratchet_input`,
     }).value,
   };
-  if (validateTuneAnalysisContract(proposal.analysis, { source: `${source}.analysis` }).digest !== proposal.analysis_digest) {
+  if (analysis.digest !== proposal.analysis_digest) {
     fail(`${source}.analysis_digest`, "does not match canonical tune analysis digest");
   }
   if (proposal.outcome === "propose" && proposal.changes.length === 0) {
@@ -581,7 +583,7 @@ export function validateTuneProposalContract(value: unknown, options: { source?:
     fail(`${source}.changes`, "must not contain duplicate paths");
   }
   assertProposalMatchesIntent(proposal, source);
-  assertProposalEvidenceBindings(proposal, source);
+  assertProposalEvidenceBindings(proposal, source, citationContract.digest);
   return normalizedContract(proposal);
 }
 

@@ -400,7 +400,7 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     : null;
   if (!input.attempt.request_payload) throw new Error(`pipeline attempt ${input.attempt.id} has no sealed request`);
   const priorRequest = JSON.parse(input.attempt.request_payload) as { taskContext?: unknown };
-  const taskContext = typeof priorRequest.taskContext === "string" ? priorRequest.taskContext : "";
+  const priorTaskContext = typeof priorRequest.taskContext === "string" ? priorRequest.taskContext : "";
   // Tune stages pass only the immediately preceding, already gate-validated
   // artifacts through the next sealed request. This is the deterministic data
   // channel between isolated sessions; native-session memory and ticket prose
@@ -415,6 +415,9 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
       hash: artifact.hash,
     })).sort((left, right) => left.kind.localeCompare(right.kind))
     : undefined;
+  const taskContext = input.instance.task_type === "tune"
+    ? "Supervisor-sealed tune evidence is carried only by inputArtifacts."
+    : priorTaskContext;
   const request = buildStageRequest({
     instanceId: input.instance.id,
     manifestDigest: input.instance.manifest_digest,

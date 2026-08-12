@@ -1,6 +1,5 @@
 import type Database from "better-sqlite3";
-import { createHash } from "node:crypto";
-import { canonicalJson } from "@openthrottle/contracts";
+import { canonicalJson, digestCanonicalJson } from "@openthrottle/contracts";
 
 export interface TuneStateRecord {
   id: string;
@@ -42,7 +41,7 @@ function digestPayload(payload: unknown): { normalized: string; digest: string }
   const normalized = canonicalJson(payload);
   return {
     normalized,
-    digest: createHash("sha256").update(normalized).digest("hex"),
+    digest: digestCanonicalJson(payload),
   };
 }
 

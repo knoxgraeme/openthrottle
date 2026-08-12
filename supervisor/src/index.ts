@@ -106,6 +106,7 @@ async function main() {
     runtime: runtimeCapabilities,
     store: pipelineStore,
     drainEffects: () => pipelineEffectProcessor.drain(),
+    tuneCorpus: analysisStore,
   };
   const githubPublicationProcessor = createGithubPublicationProcessor({
     store: pipelineStore,

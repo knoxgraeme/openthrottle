@@ -11,6 +11,7 @@ import type { ValidatedPipelineCatalog } from "../pipeline/manifest.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import type { ValidatedRuntimeCapabilityDescriptor } from "../runtime/contracts.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
+import type { RunOutcome } from "../pipeline/store.js";
 import { handleCreated } from "./admission.js";
 import { handlePrompted } from "./thread-control.js";
 
@@ -26,6 +27,18 @@ export interface PipelineCoordinatorContext {
   runtime: ValidatedRuntimeCapabilityDescriptor;
   store: PipelineStore;
   drainEffects?: () => Promise<void>;
+  tuneCorpus?: {
+    listRunOutcomes(query: {
+      outcome?: string;
+      reason?: string;
+      attribution?: string;
+      graph?: string;
+      skillDigest?: string;
+      from?: string;
+      to?: string;
+      limit?: number;
+    }): RunOutcome[];
+  };
 }
 
 export async function handleControlEvent(
