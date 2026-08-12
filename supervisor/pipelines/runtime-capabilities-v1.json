@@ -26,10 +26,12 @@
     "reliability-adversarial@1",
     "security@1",
     "select-review-personas@1",
+    "supervisor/citation-gate@1",
+    "supervisor/differential-ratchet@1",
     "tests-contracts@1",
     "validate-review-findings@1"
   ],
-  "executors": ["agent", "command", "loop_action", "provider_wait"],
+  "executors": ["agent", "command", "loop_action", "provider_wait", "supervisor"],
   "evaluators": ["citation", "command", "differential_ratchet", "human", "provider", "publish_subject", "semantic"],
   "artifacts": ["candidate_evidence", "command_result", "execution_graph_result", "human_approval", "integration_evidence", "provider_check", "publish_subject", "review", "stage_result", "standard_receipt"],
   "contextPolicies": ["fresh", "none", "prefer_resume", "resume_required"],

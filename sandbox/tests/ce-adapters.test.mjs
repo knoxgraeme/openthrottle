@@ -195,28 +195,19 @@ describe("OpenThrottle canonical task skills", () => {
     expect(skillBody("project-standards")).toContain("Bounded Depth");
   });
 
-  it("ships the corpus-only tune package as a standard receipt producer", () => {
+  it("ships distinct typed tune analysis and proposal receipt producers", () => {
     const body = skillBody("tune");
     expect(body).toContain("capability `core/tune@1`");
-    expect(body).toContain("corpus-only");
-    expect(body).toContain("Never ingest raw ticket prose");
+    expect(body).toContain("typed,\n  authorized input artifacts");
     expect(body).toContain("openthrottle.receipt/v1");
-    expect(body).toContain("payload.summary` is one string");
-    expect(body).toContain("payload.findings` is always an\narray of typed objects");
-    expect(body).toContain("[path#anchor|claim-discriminator: invariant]");
+    expect(body).toContain("`tune_analysis` receipt");
+    expect(body).toContain("`tune_proposal` receipt");
+    expect(body).toContain("`payload.summary` is always\none bounded string");
     expect(body).toContain("expected metric movement");
-    expect(body).toContain("rollback notes");
-    expect(body).toMatch(/Do not propose graph\s+authority expansion/);
-
-    const matches = [...body.matchAll(/```json\n([\s\S]*?)\n```/g)];
-    expect(matches.length).toBe(1);
-    const receipt = validateStandardReceipt(JSON.parse(matches[0][1]), {});
-    expect(receipt.type).toBe("semantic_review");
-    expect(receipt.result).toBe("semantic_repair_required");
-    expect(typeof receipt.payload.summary).toBe("string");
-    expect(receipt.payload.findings[0].message).toMatch(
-      /^\[[^#\]]+#[^|\]]+\|[^:\]]+: [^\]]+\]/
-    );
+    expect(body).toContain("scope, and rollback");
+    expect(body).toContain("Never edit files, stage, commit, push, publish");
+    expect(body).toContain("Citation grading, differential-ratchet");
+    expect(body).not.toContain('type": "semantic_review"');
   });
 
   it("ships non-CE fixture skills for the same standard receipt contracts", () => {

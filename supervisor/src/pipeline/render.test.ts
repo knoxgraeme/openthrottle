@@ -88,6 +88,10 @@ describe("renderManifestMermaid node shapes", () => {
     expect(output).toContain('alpha["alpha<br/>agent"]');
     expect(output).toContain('bravo[/"bravo<br/>command gate"/]');
     expect(output).toContain('charlie{{"charlie<br/>provider wait"}}');
+
+    const tuneOutput = renderManifestMermaid(shippedManifest("tune"), { collapseUniform: false });
+    expect(tuneOutput).toContain('citation_gate{"citation_gate<br/>supervisor gate"}');
+    expect(tuneOutput).toContain('structured_edit[("structured_edit<br/>loop action")]');
   });
 
   it("starts with a flowchart header and the pipeline identity comment", () => {

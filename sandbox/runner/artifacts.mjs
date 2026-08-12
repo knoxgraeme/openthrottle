@@ -49,6 +49,8 @@ const STANDARD_RECEIPT_RESULTS = Object.freeze({
   publish_subject: ["success", "failure"],
   provider_evidence: ["success", "semantic_repair_required", "failure"],
   human_approval: ["approved", "rejected", "needs_human"],
+  tune_analysis: ["success", "failure", "needs_human"],
+  tune_proposal: ["success", "no_change", "failure", "needs_human"],
 });
 const STANDARD_RECEIPT_STAGE_OUTCOMES = Object.freeze({
   accept: "success",
@@ -64,7 +66,13 @@ const STANDARD_RECEIPT_STAGE_OUTCOMES = Object.freeze({
   semantic_repair_required: "semantic_repair_required",
   success: "success",
 });
-const SEMANTIC_RECEIPTS = new Set(["unit_completion", "unit_decision", "semantic_review"]);
+const SEMANTIC_RECEIPTS = new Set([
+  "unit_completion",
+  "unit_decision",
+  "semantic_review",
+  "tune_analysis",
+  "tune_proposal",
+]);
 const SEVERITIES = new Set(["P0", "P1", "P2", "P3"]);
 const SHA256 = /^[a-f0-9]{64}$/;
 const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
@@ -378,6 +386,23 @@ function receiptPayload(type, value, env) {
     return {
       summary: boundedText(payload.summary, "standard receipt payload summary", 4_000, env),
       findings: boundedFindings(payload.findings, "standard receipt payload findings", env),
+    };
+  }
+  if (type === "tune_analysis" || type === "tune_proposal") {
+    const contractField = type === "tune_analysis" ? "analysis" : "proposal";
+    const expectedSchema = type === "tune_analysis"
+      ? "openthrottle.tune-analysis/v1"
+      : "openthrottle.tune-proposal/v1";
+    const payload = exactPayload(value, "standard receipt payload", new Set(["summary", contractField]), env);
+    if (!payload[contractField] || typeof payload[contractField] !== "object" || Array.isArray(payload[contractField])) {
+      throw new Error(`standard receipt payload ${contractField} must be an object`);
+    }
+    if (payload[contractField].schema !== expectedSchema) {
+      throw new Error(`standard receipt payload ${contractField} has an invalid schema`);
+    }
+    return {
+      summary: boundedText(payload.summary, "standard receipt payload summary", 4_000, env),
+      [contractField]: payload[contractField],
     };
   }
   if (type === "command_result") {

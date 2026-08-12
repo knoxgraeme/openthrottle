@@ -40,8 +40,8 @@ capability→skill map, not task type):
   request for the already-gated exact subject.
 - `investigate` (`ce/investigate@1`) diagnoses a reported defect and applies a
   convergent fix only.
-- `tune` (`core/tune@1`) analyzes sealed tune contracts and typed corpus rows,
-  then emits only strict standard receipts proposing reviewable config or
+- `tune` (`core/tune@1`) packages a sealed corpus as a `tune_analysis` receipt,
+  then emits a separate `tune_proposal` receipt for reviewable config or
   unlocked skill-craft/reference changes under the sealed policy.
 
 Structured graphs use five direct loop-path task adapters plus the orchestrated
@@ -160,9 +160,10 @@ The current catalog aliases `implement`, `investigate`, and `tune` to immutable
   Repair transitions use the manifest's scoped repair stages and round budget.
 - `core/investigate@1`: investigation → conditional exact-subject publication.
   Convergent fixes may ship; divergent decisions terminate as `needs_human`.
-- `core/tune@1`: corpus-only analysis → proposal → supervisor-owned
-  citation and differential-ratchet gates → isolated edit → commands and
-  review → exact-subject publication and provider verification.
+- `core/tune@1`: typed corpus analysis → typed proposal → supervisor-owned
+  citation and differential-ratchet gates → the structured unit composite
+  (isolated edit, commands, deterministic persona review fanout, synthesis, and
+  bounded repair) → exact-subject publication and provider verification.
 
 Agent stages emit semantic proposals. Command stages produce
 executor-verified results. Publication is fenced to the expected Git subject,

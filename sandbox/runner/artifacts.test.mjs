@@ -275,6 +275,72 @@ describe("normalized stage artifacts", () => {
     expect(JSON.parse(artifacts[1].payload).details.receipt.result).toBe("accept");
   });
 
+  it("accepts typed tune analysis and proposal receipts without granting gate authority", () => {
+    const baseReceipt = {
+      schema: "openthrottle.receipt/v1",
+      assurance: "semantic_attested",
+      producer: {
+        worker_id: "tuner",
+        skill: "builtin://tune@1",
+        capability_digest: "e".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: { base: "1".repeat(40), pre: "1".repeat(40), post: "1".repeat(40) },
+      fence: {
+        pipeline_instance_id: "pipeline-1",
+        graph_digest: "f".repeat(64),
+        unit_id: "__tune__",
+        attempt_id: "attempt-1",
+        parent_run_id: "run-1",
+        action_attempt_id: "action-1",
+        generation: 1,
+        native_session_id: null,
+        request_hash: "a".repeat(64),
+      },
+      evidence: ["sealed tune contract"],
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+
+    const analysis = {
+      schema: "openthrottle.tune-analysis/v1",
+      id: "analysis-1",
+    };
+    expect(validateStandardReceipt({
+      ...baseReceipt,
+      type: "tune_analysis",
+      result: "success",
+      payload: { summary: "Sealed corpus packaged.", analysis },
+    }, {}).payload.analysis).toEqual(analysis);
+
+    const proposal = {
+      schema: "openthrottle.tune-proposal/v1",
+      id: "proposal-1",
+    };
+    expect(validateStandardReceipt({
+      ...baseReceipt,
+      type: "tune_proposal",
+      result: "no_change",
+      payload: { summary: "No eligible change.", proposal },
+    }, {}).payload.proposal).toEqual(proposal);
+
+    expect(() => validateStandardReceipt({
+      ...baseReceipt,
+      type: "tune_proposal",
+      result: "success",
+      payload: {
+        summary: "Agent-authored gate decision is forbidden.",
+        proposal,
+        citation_gate: { outcome: "pass" },
+      },
+    }, {})).toThrow(/unknown field citation_gate/);
+    expect(() => validateStandardReceipt({
+      ...baseReceipt,
+      type: "tune_analysis",
+      result: "success",
+      payload: { summary: "Wrong contract.", analysis: proposal },
+    }, {})).toThrow(/analysis has an invalid schema/);
+  });
+
   it("maps every standard receipt result to a stage outcome", () => {
     const baseReceipt = {
       schema: "openthrottle.receipt/v1",

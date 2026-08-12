@@ -1,7 +1,7 @@
 schema: openthrottle.pipeline/v1
 id: core/tune
 version: 1
-description: Immutable self-tuning pipeline with read-only corpus analysis and proposal generation, supervisor citation and differential-ratchet gates, fresh isolated mutation, command gates, semantic review and repair, exact-subject publication, provider verification, and mandatory human merge.
+description: Immutable self-tuning pipeline with read-only typed corpus analysis and proposal generation, supervisor-owned citation and differential-ratchet gates, a structured isolated edit with deterministic review fanout and bounded repair, exact-subject publication, provider verification, and mandatory human merge.
 entry_stage: analysis
 max_attempts: 200
 max_repair_rounds: 5
@@ -9,10 +9,13 @@ requires:
   protocol: stage-executor@1
   capabilities:
     - core/tune@1
+    - supervisor/citation-gate@1
+    - supervisor/differential-ratchet@1
     - ce/implement@1
-    - ce/review@1
+    - ce/simplify@1
+    - accept-unit@1
+    - graph/for-each-unit@1
     - ce/publish@1
-    - command/run@1
     - provider/wait@1
 defaults:
   transitions:
@@ -36,7 +39,7 @@ stages:
   - id: proposal
     executor: { kind: agent, capability: core/tune@1 }
     evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [standard_receipt] }
-    context: resume_required
+    context: fresh
     live_steering: false
     credentials: [model.invoke, provider.read, repo.read]
     produces: [stage_result, standard_receipt]
@@ -44,88 +47,106 @@ stages:
       success: { to: citation_gate }
       no_change: { terminal: no_change }
   - id: citation_gate
-    executor: { kind: agent, capability: core/tune@1 }
-    evaluator: { kind: citation, assurance: semantic_attested, required_artifacts: [standard_receipt] }
-    context: resume_required
+    executor: { kind: supervisor, capability: supervisor/citation-gate@1 }
+    evaluator: { kind: citation, assurance: executor_verified, required_artifacts: [stage_result] }
+    context: none
     live_steering: false
-    credentials: [model.invoke, provider.read, repo.read]
-    produces: [stage_result, standard_receipt]
+    credentials: []
+    produces: [stage_result]
     transitions:
       success: { to: differential_ratchet }
       no_change: { terminal: no_change }
   - id: differential_ratchet
-    executor: { kind: agent, capability: core/tune@1 }
-    evaluator: { kind: differential_ratchet, assurance: semantic_attested, required_artifacts: [standard_receipt] }
-    context: resume_required
-    live_steering: false
-    credentials: [model.invoke, provider.read, repo.read]
-    produces: [stage_result, standard_receipt]
-    transitions:
-      success: { to: isolated_edit }
-      no_change: { terminal: no_change }
-  - id: isolated_edit
-    executor: { kind: agent, capability: ce/implement@1 }
-    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result] }
-    context: fresh
-    live_steering: true
-    credentials: [model.invoke, provider.read, repo.read, repo.write]
-    produces: [stage_result]
-    retry: { max_reentries: 3, on_exhausted: failed }
-    transitions:
-      success: { to: test }
-      no_change: { terminal: no_change }
-      semantic_repair_required: { to: isolated_edit, max_reentries: 5, on_exhausted: needs_human }
-  - id: repair_edit
-    executor: { kind: agent, capability: ce/implement@1 }
-    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result] }
-    context: resume_required
-    live_steering: true
-    credentials: [model.invoke, provider.read, repo.read, repo.write]
-    produces: [stage_result]
-    retry: { max_reentries: 3, on_exhausted: failed }
-    transitions:
-      success: { to: test }
-      no_change: { to: test }
-      semantic_repair_required: { to: repair_edit, max_reentries: 5, on_exhausted: needs_human }
-  - id: test
-    executor: { kind: command, capability: command/run@1 }
-    commandName: test
-    evaluator: { kind: command, assurance: executor_verified, required_artifacts: [command_result] }
+    executor: { kind: supervisor, capability: supervisor/differential-ratchet@1 }
+    evaluator: { kind: differential_ratchet, assurance: executor_verified, required_artifacts: [stage_result] }
     context: none
     live_steering: false
-    credentials: [repo.read]
-    produces: [stage_result, command_result]
+    credentials: []
+    produces: [stage_result]
     transitions:
-      success: { to: build }
-      no_change: { to: build }
-      failure: { to: repair_edit, max_reentries: 5, on_exhausted: needs_human }
-  - id: build
-    executor: { kind: command, capability: command/run@1 }
-    commandName: build
-    evaluator: { kind: command, assurance: executor_verified, required_artifacts: [command_result] }
+      success: { to: structured_edit }
+      no_change: { terminal: no_change }
+  - id: structured_edit
+    executor: { kind: loop_action, capability: graph/for-each-unit@1 }
+    evaluator: { kind: semantic, assurance: executor_verified, required_artifacts: [execution_graph_result] }
     context: none
     live_steering: false
-    credentials: [repo.read]
-    produces: [stage_result, command_result]
-    transitions:
-      success: { to: semantic_review }
-      no_change: { to: semantic_review }
-      failure: { to: repair_edit, max_reentries: 5, on_exhausted: needs_human }
-  - id: semantic_review
-    executor: { kind: agent, capability: ce/review@1 }
-    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result, review] }
-    context: resume_required
-    live_steering: false
-    credentials: [model.invoke, repo.read, repo.write]
-    produces: [stage_result, review]
+    credentials: [provider.read, repo.read]
+    produces: [stage_result, execution_graph_result]
+    unitPhases: [implement, simplify, command, candidate, lead, integrate]
+    unitCommandNames: [test, lint, build]
+    unitPhaseBindings:
+      - id: implement
+        kind: agent
+        loop:
+          id: unit-loop
+          skill: builtin://ce/implement@1
+          input_scope: unit
+          receipt: unit_completion
+          max_parallel: 1
+          max_rounds: 8
+          timeout_seconds: 86400
+        worker:
+          id: unit-worker
+          engine: agent
+          allowed_mcp_servers: []
+          session_scope: attempt
+          credentials: [model.invoke, provider.read, repo.read]
+        executor: { kind: agent, capability: ce/implement@1 }
+        context: resume_required
+        credentials: [model.invoke, provider.read, repo.read]
+      - id: simplify
+        kind: agent
+        loop:
+          id: simplify-loop
+          skill: builtin://ce/simplify@1
+          input_scope: unit
+          receipt: unit_completion
+          max_parallel: 1
+          max_rounds: 3
+          timeout_seconds: 86400
+        worker:
+          id: simplify-worker
+          engine: agent
+          allowed_mcp_servers: []
+          session_scope: attempt
+          credentials: [model.invoke, repo.read]
+        executor: { kind: agent, capability: ce/simplify@1 }
+        context: resume_required
+        credentials: [model.invoke, repo.read]
+      - id: command
+        kind: command
+        commands: [test, lint, build]
+      - id: candidate
+        kind: evidence
+      - id: lead
+        kind: gate
+        loop:
+          id: lead-loop
+          skill: builtin://accept-unit@1
+          input_scope: unit
+          receipt: unit_decision
+          max_parallel: 1
+          max_rounds: 1
+          timeout_seconds: 86400
+        worker:
+          id: lead-worker
+          engine: agent
+          allowed_mcp_servers: []
+          session_scope: graph
+          credentials: [model.invoke, repo.read]
+        executor: { kind: agent, capability: accept-unit@1 }
+        context: prefer_resume
+        credentials: [model.invoke, repo.read]
+      - id: integrate
+        kind: integrate
     transitions:
       success: { to: publish }
-      no_change: { to: publish }
-      semantic_repair_required: { to: repair_edit, max_reentries: 5, on_exhausted: needs_human }
+      no_change: { terminal: no_change }
   - id: publish
     executor: { kind: agent, capability: ce/publish@1 }
     evaluator: { kind: publish_subject, assurance: semantic_attested, required_artifacts: [publish_subject] }
-    context: resume_required
+    context: prefer_resume
     live_steering: false
     credentials: [model.invoke, provider.read, repo.read, repo.write]
     produces: [stage_result, publish_subject]

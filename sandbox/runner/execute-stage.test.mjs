@@ -226,9 +226,9 @@ function successProposal() {
 function tuneReceipt(request) {
   return {
     schema: "openthrottle.receipt/v1",
-    type: "semantic_review",
+    type: "tune_analysis",
     assurance: "semantic_attested",
-    result: "semantic_repair_required",
+    result: "success",
     producer: {
       worker_id: "tuner",
       skill: "builtin://tune@1",
@@ -253,12 +253,11 @@ function tuneReceipt(request) {
     },
     evidence: ["typed tune corpus row_one reproduced"],
     payload: {
-      summary: "One reviewable tune proposal was produced.",
-      findings: [{
-        severity: "P2",
-        message: "[skills/tasks/tune/SKILL.md#Receipt|strict-summary-string: tune receipts remain schema-strict] Proposal keeps payload.summary as a string.",
-        path: "skills/tasks/tune/SKILL.md",
-      }],
+      summary: "The sealed corpus was packaged for proposal analysis.",
+      analysis: {
+        schema: "openthrottle.tune-analysis/v1",
+        id: "analysis-1",
+      },
     },
     issued_at: "2026-01-01T00:00:00Z",
   };
@@ -713,11 +712,11 @@ describe("one-stage executor", () => {
     expect(JSON.parse(result.artifacts[0].payload).summary).toMatch(/proposal was rejected/);
   });
 
-  it("seals core tune receipts as standard receipt artifacts", () => {
+  it("seals typed core tune analysis receipts as standard receipt artifacts", () => {
     const input = fixture({
       capability: "core/tune@1",
       requiredArtifacts: ["stage_result", "standard_receipt"],
-      credentialScopes: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      credentialScopes: ["model.invoke", "provider.read", "repo.read"],
     });
     const receipt = tuneReceipt(input.request);
     const result = executeStage({
@@ -731,13 +730,27 @@ describe("one-stage executor", () => {
       }),
     });
 
-    expect(result.outcome).toBe("semantic_repair_required");
+    expect(result.outcome).toBe("success");
     expect(result.artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result", "standard_receipt"]);
     const standardReceipt = JSON.parse(result.artifacts[1].payload);
-    expect(standardReceipt.details.receipt.type).toBe("semantic_review");
-    expect(standardReceipt.details.receipt.payload.findings[0].message).toMatch(
-      /^\[skills\/tasks\/tune\/SKILL\.md#Receipt\|strict-summary-string: tune receipts remain schema-strict\]/
-    );
+    expect(standardReceipt.details.receipt.type).toBe("tune_analysis");
+    expect(standardReceipt.details.receipt.payload.analysis.schema)
+      .toBe("openthrottle.tune-analysis/v1");
+  });
+
+  it("never dispatches supervisor-owned tune gates inside the sandbox", () => {
+    const input = fixture({
+      capability: "supervisor/citation-gate@1",
+      contextPolicy: "none",
+      requiredArtifacts: ["stage_result"],
+      credentialScopes: [],
+      liveSteering: false,
+    });
+    const runAgent = vi.fn();
+
+    expect(() => executeStage({ ...input, now: clock(), runAgent }))
+      .toThrow(/supervisor stages execute in the supervisor/);
+    expect(runAgent).not.toHaveBeenCalled();
   });
 
   it("redacts a Codex token rotated during execution from semantic artifacts", () => {

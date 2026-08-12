@@ -160,11 +160,7 @@ const CORE_TUNE_V1_STAGE_IDS = [
   "proposal",
   "citation_gate",
   "differential_ratchet",
-  "isolated_edit",
-  "repair_edit",
-  "test",
-  "build",
-  "semantic_review",
+  "structured_edit",
   "publish",
   "provider",
 ];
@@ -399,7 +395,7 @@ describe("pipeline manifest validation", () => {
     expect(repairSemanticReview.transitions.no_change).toEqual({ to: "test" });
   });
 
-  it("ships core/tune@1 as a fail-closed production path through proposal, gated edit, review, publish, and provider wait", () => {
+  it("ships core/tune@1 through typed receipts, supervisor gates, and the structured review composite", () => {
     const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
     const catalog = loadPipelineCatalog(path, buildInstalledRuntimeDescriptor("test-runtime/v1").descriptor);
     const tune = resolvePipelineReference(catalog, "tune").manifest;
@@ -415,10 +411,13 @@ describe("pipeline manifest validation", () => {
         protocol: "stage-executor@1",
         capabilities: [
           "core/tune@1",
+          "supervisor/citation-gate@1",
+          "supervisor/differential-ratchet@1",
           "ce/implement@1",
-          "ce/review@1",
+          "ce/simplify@1",
+          "accept-unit@1",
+          "graph/for-each-unit@1",
           "ce/publish@1",
-          "command/run@1",
           "provider/wait@1",
         ],
       },
@@ -435,13 +434,15 @@ describe("pipeline manifest validation", () => {
     });
     expect(stage("proposal")).toMatchObject({
       executor: { kind: "agent", capability: "core/tune@1" },
-      context: "resume_required",
+      evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["standard_receipt"] },
+      context: "fresh",
       transitions: { success: { to: "citation_gate" }, no_change: { terminal: "no_change" } },
     });
     expect(stage("citation_gate")).toMatchObject({
-      executor: { kind: "agent", capability: "core/tune@1" },
-      evaluator: { kind: "citation", assurance: "semantic_attested", required_artifacts: ["standard_receipt"] },
-      context: "resume_required",
+      executor: { kind: "supervisor", capability: "supervisor/citation-gate@1" },
+      evaluator: { kind: "citation", assurance: "executor_verified", required_artifacts: ["stage_result"] },
+      context: "none",
+      credentials: [],
       transitions: {
         success: { to: "differential_ratchet" },
         semantic_repair_required: { terminal: "needs_human" },
@@ -449,69 +450,49 @@ describe("pipeline manifest validation", () => {
       },
     });
     expect(stage("differential_ratchet")).toMatchObject({
-      executor: { kind: "agent", capability: "core/tune@1" },
-      evaluator: { kind: "differential_ratchet", assurance: "semantic_attested", required_artifacts: ["standard_receipt"] },
-      context: "resume_required",
+      executor: { kind: "supervisor", capability: "supervisor/differential-ratchet@1" },
+      evaluator: { kind: "differential_ratchet", assurance: "executor_verified", required_artifacts: ["stage_result"] },
+      context: "none",
+      credentials: [],
       transitions: {
-        success: { to: "isolated_edit" },
+        success: { to: "structured_edit" },
         semantic_repair_required: { terminal: "needs_human" },
         failure: { terminal: "failed" },
       },
     });
 
-    expect(stage("isolated_edit")).toMatchObject({
-      executor: { kind: "agent", capability: "ce/implement@1" },
-      evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["stage_result"] },
-      context: "fresh",
-      live_steering: true,
-      credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
-      transitions: {
-        success: { to: "test" },
-        semantic_repair_required: { to: "isolated_edit", max_reentries: 5, on_exhausted: "needs_human" },
-        failure: { terminal: "failed" },
-      },
-    });
-    expect(stage("repair_edit")).toMatchObject({
-      executor: { kind: "agent", capability: "ce/implement@1" },
-      context: "resume_required",
-      live_steering: true,
-      transitions: {
-        success: { to: "test" },
-        no_change: { to: "test" },
-        semantic_repair_required: { to: "repair_edit", max_reentries: 5, on_exhausted: "needs_human" },
-      },
-    });
-
-    expect(stage("test")).toMatchObject({
-      executor: { kind: "command", capability: "command/run@1" },
-      commandName: "test",
-      evaluator: { kind: "command", assurance: "executor_verified", required_artifacts: ["command_result"] },
+    expect(stage("structured_edit")).toMatchObject({
+      executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
+      evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
       context: "none",
-      credentials: ["repo.read"],
-      transitions: { success: { to: "build" }, failure: { to: "repair_edit", max_reentries: 5, on_exhausted: "needs_human" } },
-    });
-    expect(stage("build")).toMatchObject({
-      executor: { kind: "command", capability: "command/run@1" },
-      commandName: "build",
-      evaluator: { kind: "command", assurance: "executor_verified", required_artifacts: ["command_result"] },
-      context: "none",
-      transitions: { success: { to: "semantic_review" }, failure: { to: "repair_edit", max_reentries: 5, on_exhausted: "needs_human" } },
-    });
-    expect(stage("semantic_review")).toMatchObject({
-      executor: { kind: "agent", capability: "ce/review@1" },
-      evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["stage_result", "review"] },
-      context: "resume_required",
       live_steering: false,
+      credentials: ["provider.read", "repo.read"],
+      produces: ["stage_result", "execution_graph_result"],
+      unitPhases: ["implement", "simplify", "command", "candidate", "lead", "integrate"],
+      unitCommandNames: ["test", "lint", "build"],
       transitions: {
         success: { to: "publish" },
-        no_change: { to: "publish" },
-        semantic_repair_required: { to: "repair_edit", max_reentries: 5, on_exhausted: "needs_human" },
+        no_change: { terminal: "no_change" },
       },
+    });
+    expect(stage("structured_edit").unitPhaseBindings?.map((binding) => [binding.id, binding.kind]))
+      .toEqual([
+        ["implement", "agent"],
+        ["simplify", "agent"],
+        ["command", "command"],
+        ["candidate", "evidence"],
+        ["lead", "gate"],
+        ["integrate", "integrate"],
+      ]);
+    expect(stage("structured_edit").unitPhaseBindings?.[4]).toMatchObject({
+      worker: { id: "lead-worker", session_scope: "graph" },
+      context: "prefer_resume",
+      executor: { kind: "agent", capability: "accept-unit@1" },
     });
     expect(stage("publish")).toMatchObject({
       executor: { kind: "agent", capability: "ce/publish@1" },
       evaluator: { kind: "publish_subject", assurance: "semantic_attested", required_artifacts: ["publish_subject"] },
-      context: "resume_required",
+      context: "prefer_resume",
       credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
       transitions: { success: { to: "provider" }, no_change: { terminal: "no_change" } },
     });
