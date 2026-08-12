@@ -131,6 +131,60 @@ describe("improvement proposal gate", () => {
     expect(first.journal.hash).toMatch(/^[a-f0-9]{64}$/);
   });
 
+  it("accepts a bounded skill ratchet with duplicated exact file material", () => {
+    const skillPath = ".openthrottle/skills/review/SKILL.md";
+    const referencePath = ".openthrottle/skills/review/references/craft.md";
+    const skill = "---\nname: review\ndescription: Review changes.\n---\n\n# Review\n";
+    const pinnedReference = "a".repeat(64 * 1024);
+    const proposedReference = pinnedReference;
+    const ratchet = ratchetInput();
+    const repositoryConfig = {
+      schema: "openthrottle.config/v1" as const,
+      default_graph: "simple",
+      graphs: [{ id: "simple", kind: "builtin" as const, ref: "core/simple@1" }],
+      skills: [{ id: "review", path: ".openthrottle/skills/review", tunable: true }],
+    };
+    ratchet.pinned_config = repositoryConfig;
+    ratchet.proposed_config = structuredClone(repositoryConfig);
+    ratchet.pinned_repository_skills = [{
+      id: "review",
+      tunable: true,
+      files: [
+        { path: skillPath, content: skill },
+        { path: referencePath, content: pinnedReference },
+      ],
+    }];
+    ratchet.proposed_repository_skills = [{
+      id: "review",
+      tunable: true,
+      files: [
+        { path: skillPath, content: skill },
+        { path: referencePath, content: proposedReference },
+      ],
+    }];
+    ratchet.pinned_files = [
+      { path: skillPath, content: skill },
+      { path: referencePath, content: pinnedReference },
+    ];
+    ratchet.proposed_files = [
+      { path: skillPath, content: skill },
+      { path: referencePath, content: proposedReference },
+    ];
+    expect(Buffer.byteLength(canonicalJson(ratchet), "utf8")).toBeGreaterThan(256 * 1024);
+
+    const decision = citationGate();
+    const evaluation = evaluateImprovementProposalGate({
+      citationGate: decision,
+      ratchetInput: ratchet,
+    }, receiptPorts(citationReceipt(decision)));
+    expect(evaluation.decision?.differences).toEqual([]);
+    expect(evaluation).toMatchObject({
+      accepted: true,
+      decision: { outcome: "accept", reject_reasons: [] },
+      journal: { result: "passed", reasons: [] },
+    });
+  });
+
   it("returns complete bounded reasons for missing or malformed inputs", () => {
     expect(evaluateImprovementProposalGate({
       citationGate: null,

@@ -93,7 +93,7 @@ flowchart TD
 
 ### Legend
 
-- Rectangle = agent stage, parallelogram = command gate, hexagon = provider wait.
+- Rectangle = agent stage, parallelogram = command gate, rounded node = loop action, diamond = supervisor gate, hexagon = provider wait.
 - Solid arrow = forward transition; dashed arrow = re-entry (the target is the
   stage itself or sits at/before it in the declared stage order, matching the
   shared `isPipelineReentry` manifest helper); thick arrow = terminal outcome.

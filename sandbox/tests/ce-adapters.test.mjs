@@ -38,13 +38,14 @@ const reviewPersonaTasks = [
   "tests-contracts",
   ...optionalReviewPersonaTasks,
 ];
+const tuneTasks = ["tune"];
 const findingReviewPersonaTasks = [
   "correctness-dataflow",
   "tests-contracts",
   ...optionalReviewPersonaTasks,
 ];
 const selectorAndPersonaTasks = ["select-review-personas", ...findingReviewPersonaTasks];
-const tasks = [...stageTasks, ...loopTasks, ...reviewPersonaTasks];
+const tasks = [...stageTasks, ...loopTasks, ...reviewPersonaTasks, ...tuneTasks];
 
 // The four loop skills that own an executor-owned worktree and author
 // `subject.post` via `ot-subject-post`.
@@ -192,6 +193,21 @@ describe("OpenThrottle canonical task skills", () => {
     expect(skillBody("project-standards")).toContain("Task skills remain self-contained");
     expect(skillBody("project-standards")).toContain("quoted standard text");
     expect(skillBody("project-standards")).toContain("Bounded Depth");
+  });
+
+  it("ships distinct typed tune analysis and proposal receipt producers", () => {
+    const body = skillBody("tune");
+    expect(body).toContain("capability `core/tune@1`");
+    expect(body).toContain("typed,\n  authorized input artifacts");
+    expect(body).toContain("openthrottle.receipt/v1");
+    expect(body).toContain("`tune_analysis` receipt");
+    expect(body).toContain("`tune_proposal` receipt");
+    expect(body).toContain("`payload.summary` is always\none bounded string");
+    expect(body).toContain("expected metric movement");
+    expect(body).toContain("scope, and rollback");
+    expect(body).toContain("Never edit files, stage, commit, push, publish");
+    expect(body).toContain("Citation grading, differential-ratchet");
+    expect(body).not.toContain('type": "semantic_review"');
   });
 
   it("ships non-CE fixture skills for the same standard receipt contracts", () => {

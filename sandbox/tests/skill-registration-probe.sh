@@ -52,6 +52,7 @@ SKILL_NAMES=(
   data-migration
   performance
   project-standards
+  tune
 )
 
 docker run --rm --entrypoint bash "$IMAGE" -lc '

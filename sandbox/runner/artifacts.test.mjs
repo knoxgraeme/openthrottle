@@ -48,6 +48,15 @@ const proposal = {
   uncertainty: ["Semantic judgment"],
 };
 
+function authorityFor(receipt) {
+  return {
+    assurance: receipt.assurance,
+    producer: receipt.producer,
+    subject: receipt.subject,
+    fence: receipt.fence,
+  };
+}
+
 describe("normalized stage artifacts", () => {
   it("seals supervisor-authored provenance and deterministic hashes", () => {
     const first = buildSemanticArtifacts({
@@ -252,6 +261,7 @@ describe("normalized stage artifacts", () => {
 
     const artifacts = buildStandardReceiptArtifacts({
       receipt,
+      authority: authorityFor(receipt),
       fence: {
         ...fence,
         capability: "agent/semantic@1",
@@ -263,6 +273,103 @@ describe("normalized stage artifacts", () => {
     });
     expect(artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result", "standard_receipt"]);
     expect(JSON.parse(artifacts[1].payload).details.receipt.result).toBe("accept");
+  });
+
+  it("accepts typed tune analysis and proposal receipts without granting gate authority", () => {
+    const baseReceipt = {
+      schema: "openthrottle.receipt/v1",
+      assurance: "semantic_attested",
+      producer: {
+        worker_id: "tuner",
+        skill: "builtin://tune@1",
+        capability_digest: "e".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: { base: "1".repeat(40), pre: "1".repeat(40), post: "1".repeat(40) },
+      fence: {
+        pipeline_instance_id: "pipeline-1",
+        graph_digest: "f".repeat(64),
+        unit_id: "__tune__",
+        attempt_id: "attempt-1",
+        parent_run_id: "run-1",
+        action_attempt_id: "action-1",
+        generation: 1,
+        native_session_id: null,
+        request_hash: "a".repeat(64),
+      },
+      evidence: ["sealed tune contract"],
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+
+    const analysis = {
+      schema: "openthrottle.tune-analysis/v1",
+      id: "analysis-1",
+    };
+    expect(validateStandardReceipt({
+      ...baseReceipt,
+      type: "tune_analysis",
+      result: "success",
+      payload: { summary: "Sealed corpus packaged.", analysis },
+    }, {}).payload.analysis).toEqual(analysis);
+
+    const largeReceipt = {
+      ...baseReceipt,
+      type: "tune_analysis",
+      result: "success",
+      payload: {
+        summary: "Sealed corpus packaged.",
+        analysis: { ...analysis, sealed_rows: "x".repeat(40 * 1024) },
+      },
+    };
+    const largeArtifacts = buildStandardReceiptArtifacts({
+      receipt: largeReceipt,
+      authority: authorityFor(largeReceipt),
+      fence: { ...fence, capability: "core/tune@1" },
+      env: {},
+    });
+    expect(Buffer.byteLength(largeArtifacts.find((artifact) => artifact.kind === "standard_receipt").payload, "utf8"))
+      .toBeGreaterThan(32 * 1024);
+
+    expect(validateStandardReceipt({
+      ...baseReceipt,
+      type: "tune_analysis",
+      result: "success",
+      payload: { summary: "Near the analysis bound.", analysis: { ...analysis, sealed_rows: "x".repeat(240 * 1024) } },
+    }, {}).payload.analysis.sealed_rows).toHaveLength(240 * 1024);
+
+    const proposal = {
+      schema: "openthrottle.tune-proposal/v1",
+      id: "proposal-1",
+    };
+    expect(validateStandardReceipt({
+      ...baseReceipt,
+      type: "tune_proposal",
+      result: "no_change",
+      payload: { summary: "No eligible change.", proposal },
+    }, {}).payload.proposal).toEqual(proposal);
+    expect(validateStandardReceipt({
+      ...baseReceipt,
+      type: "tune_proposal",
+      result: "success",
+      payload: { summary: "Near the proposal bound.", proposal: { ...proposal, material: "x".repeat(600 * 1024) } },
+    }, {}).payload.proposal.material).toHaveLength(600 * 1024);
+
+    expect(() => validateStandardReceipt({
+      ...baseReceipt,
+      type: "tune_proposal",
+      result: "success",
+      payload: {
+        summary: "Agent-authored gate decision is forbidden.",
+        proposal,
+        citation_gate: { outcome: "pass" },
+      },
+    }, {})).toThrow(/unknown field citation_gate/);
+    expect(() => validateStandardReceipt({
+      ...baseReceipt,
+      type: "tune_analysis",
+      result: "success",
+      payload: { summary: "Wrong contract.", analysis: proposal },
+    }, {})).toThrow(/analysis has an invalid schema/);
   });
 
   it("maps every standard receipt result to a stage outcome", () => {
@@ -294,6 +401,7 @@ describe("normalized stage artifacts", () => {
 
     const [stageResult] = buildStandardReceiptArtifacts({
       receipt: { ...baseReceipt, type: "human_approval", result: "rejected" },
+      authority: authorityFor(baseReceipt),
       fence: {
         ...fence,
         capability: "agent/semantic@1",
@@ -302,6 +410,65 @@ describe("normalized stage artifacts", () => {
     });
 
     expect(JSON.parse(stageResult.payload).result).toBe("failure");
+  });
+
+  it("rejects replayed or substituted authority before sealing a standard receipt", () => {
+    const receipt = {
+      schema: "openthrottle.receipt/v1",
+      type: "semantic_review",
+      assurance: "semantic_attested",
+      result: "success",
+      producer: {
+        worker_id: "tuner",
+        skill: "builtin://tune@1",
+        capability_digest: "b".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: { base: "1".repeat(40), pre: "1".repeat(40), post: "1".repeat(40) },
+      fence: {
+        pipeline_instance_id: "pipeline-1",
+        graph_digest: "a".repeat(64),
+        unit_id: "__tune__",
+        attempt_id: "attempt-1",
+        parent_run_id: "run-1",
+        action_attempt_id: "attempt-1",
+        generation: 1,
+        native_session_id: null,
+        request_hash: "c".repeat(64),
+      },
+      evidence: ["typed corpus inspected"],
+      payload: { summary: "No change needed.", findings: [] },
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+    const authority = authorityFor(receipt);
+    const substitutions = [
+      ["assurance", (value) => ({ ...value, assurance: "semantic_corroborated" })],
+      ["producer worker", (value) => ({ ...value, producer: { ...value.producer, worker_id: "sibling-tuner" } })],
+      ["producer skill", (value) => ({ ...value, producer: { ...value.producer, skill: "builtin://final-review@1" } })],
+      ["producer capability", (value) => ({ ...value, producer: { ...value.producer, capability_digest: "e".repeat(64) } })],
+      ["producer package", (value) => ({ ...value, producer: { ...value.producer, skill_package_digest: "d".repeat(64) } })],
+      ["pipeline", (value) => ({ ...value, fence: { ...value.fence, pipeline_instance_id: "pipeline-sibling" } })],
+      ["graph", (value) => ({ ...value, fence: { ...value.fence, graph_digest: "f".repeat(64) } })],
+      ["unit", (value) => ({ ...value, fence: { ...value.fence, unit_id: "__other__" } })],
+      ["attempt", (value) => ({ ...value, fence: { ...value.fence, attempt_id: "attempt-old" } })],
+      ["run", (value) => ({ ...value, fence: { ...value.fence, parent_run_id: "run-old" } })],
+      ["action", (value) => ({ ...value, fence: { ...value.fence, action_attempt_id: "action-old" } })],
+      ["generation", (value) => ({ ...value, fence: { ...value.fence, generation: 2 } })],
+      ["native session", (value) => ({ ...value, fence: { ...value.fence, native_session_id: "native-old" } })],
+      ["request", (value) => ({ ...value, fence: { ...value.fence, request_hash: "f".repeat(64) } })],
+      ["base subject", (value) => ({ ...value, subject: { ...value.subject, base: "2".repeat(40) } })],
+      ["pre subject", (value) => ({ ...value, subject: { ...value.subject, pre: "2".repeat(40) } })],
+      ["post subject", (value) => ({ ...value, subject: { ...value.subject, post: "2".repeat(40) } })],
+    ];
+
+    for (const [label, substitute] of substitutions) {
+      expect(() => buildStandardReceiptArtifacts({
+        receipt: substitute(receipt),
+        fence,
+        authority,
+        env: {},
+      }), label).toThrow(/does not match the sealed stage authority/);
+    }
   });
 
   it("allows semantic review findings without paths", () => {

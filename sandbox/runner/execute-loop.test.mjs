@@ -307,6 +307,43 @@ describe("loop action request validation", () => {
     expect(() => validateLoopRequest({ ...valid, recoveryBaseSubject: "c".repeat(40) })).toThrow(/stale/);
   });
 
+  it("delivers exact tune bytes through a separately sealed worker material contract", () => {
+    const afterContent = `${"bounded tune material\n".repeat(200)}`;
+    const tuneMaterial = {
+      schema: "openthrottle.tune-change-material/v1",
+      proposalDigest: "a".repeat(64),
+      changes: [{
+        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        operation: "modify",
+        before_digest: "b".repeat(64),
+        after_digest: digest(afterContent),
+        after_content: afterContent,
+        rationale: "Apply the supervisor-authorized replacement bytes.",
+      }],
+    };
+    const valid = validateLoopRequest(request({ tuneMaterial }));
+    expect(valid.tuneMaterial).toEqual(tuneMaterial);
+    expect(loopPrompt(valid)).toContain(`## Tune Change Material Contract\n${canonicalJson(tuneMaterial)}`);
+
+    expect(() => validateLoopRequest(request({
+      tuneMaterial: {
+        ...tuneMaterial,
+        changes: [{ ...tuneMaterial.changes[0], after_digest: "c".repeat(64) }],
+      },
+    }))).toThrow(/tuneMaterial\.changes\[0\] is invalid/);
+    expect(() => validateLoopRequest(leadRequest({ tuneMaterial }))).toThrow(/worktree-owning worker/);
+    expect(() => validateLoopRequest(request({
+      tuneMaterial: {
+        ...tuneMaterial,
+        changes: [{
+          ...tuneMaterial.changes[0],
+          after_content: "\\".repeat(90 * 1024),
+          after_digest: digest("\\".repeat(90 * 1024)),
+        }],
+      },
+    }))).toThrow(/canonical JSON exceeds the bounded request material/);
+  });
+
   it("allows every installed review persona only as an independently fenced read-only review action", () => {
     const personas = [
       "select-review-personas",

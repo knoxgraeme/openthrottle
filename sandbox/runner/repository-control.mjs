@@ -22,6 +22,7 @@ import { identityForUser } from "./filesystem-isolation.mjs";
 const COMMIT = /^[a-f0-9]{40}$/;
 const LOCAL_GIT_TIMEOUT_MS = 120_000;
 const REPOSITORY_CONTROL_TIMEOUT_MS = 30_000;
+const MAX_VERIFIED_TUNE_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_CANONICAL_UNTRACKED_PATH_BYTES = 8 * 1024 * 1024;
 const REPOSITORY_CONTROL_HELPER = fileURLToPath(new URL("./repository-control-helper.mjs", import.meta.url));
 const GIT_OPERATION_STATE = [
@@ -89,6 +90,56 @@ export function runGitAsRepositoryOwner(repoDir, args, env = {}, { timeoutMs = L
 
 export function runGitAsExecutor(repoDir, args, env = {}, { timeoutMs = LOCAL_GIT_TIMEOUT_MS } = {}) {
   return runGit(repoDir, args, env, { timeoutMs });
+}
+
+export function readGitBlobAsExecutor(repoDir, subject, path) {
+  const revision = commit(subject, "tune verification subject");
+  if (typeof path !== "string" ||
+      !/^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/.test(path)) {
+    throw new Error("tune verification path is invalid");
+  }
+  const object = `${revision}:${path}`;
+  let size;
+  try {
+    size = Number(runGitAsExecutor(repoDir, ["cat-file", "-s", object]));
+  } catch {
+    return null;
+  }
+  if (!Number.isSafeInteger(size) || size < 0 || size > MAX_VERIFIED_TUNE_FILE_BYTES) {
+    throw new Error(`tune verification file ${path} exceeds the executor size limit`);
+  }
+  const result = runCapturedProcess("git", [
+    "-c", `safe.directory=${repoDir}`, "cat-file", "blob", object,
+  ], {
+    cwd: repoDir,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    timeout: REPOSITORY_CONTROL_TIMEOUT_MS,
+    captureBytes: Math.max(1024, size + 1),
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`tune verification could not read ${path}`);
+  }
+  if (Buffer.byteLength(result.stdout, "utf8") !== size) {
+    throw new Error(`tune verification file ${path} is not exact UTF-8 content`);
+  }
+  return result.stdout;
+}
+
+export function readGitFileEntryAsExecutor(repoDir, subject, path) {
+  const revision = commit(subject, "tune verification subject");
+  if (typeof path !== "string" ||
+      !/^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/.test(path)) {
+    throw new Error("tune verification path is invalid");
+  }
+  const listing = runGitAsExecutor(repoDir, ["-c", "core.quotepath=false", "ls-tree", revision, "--", path]);
+  if (listing === "") return null;
+  const match = /^(\d{6}) ([a-z]+) ([a-f0-9]{40,64})\t(.+)$/.exec(listing);
+  if (!match || match[4] !== path) throw new Error(`tune verification could not resolve the exact tree entry for ${path}`);
+  return {
+    mode: match[1],
+    type: match[2],
+    content: match[2] === "blob" ? readGitBlobAsExecutor(repoDir, revision, path) : null,
+  };
 }
 
 function ownerGit(asExecutor) {

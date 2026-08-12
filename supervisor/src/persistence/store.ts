@@ -13,6 +13,7 @@ import {
 import { createRunStore, type RunStore } from "./run-store.js";
 import { createSettingsStore, type SettingsStore } from "./settings-store.js";
 import { createSteeringStore, type SteeringStore } from "./steering-store.js";
+import { createTuneStore, type TuneStore } from "./tune-store.js";
 import { createWorkStore } from "./work-store.js";
 import type { PipelineInstance, PipelineInstanceSeed } from "../pipeline/store.js";
 import type { Agent, TaskType } from "../pipeline/types.js";
@@ -178,7 +179,8 @@ export type SupervisorStore =
   DeliveryStore &
   SteeringStore &
   SettingsStore &
-  FeedbackCapability;
+  FeedbackCapability &
+  TuneStore;
 
 export interface PipelineAdmissionCapability {
   createInstance(seed: PipelineInstanceSeed): PipelineInstance;
@@ -262,6 +264,7 @@ export function createSupervisorStore(
     ...createRunStore(db, workStore),
     ...deliveryStore,
     ...createSteeringStore(db, workStore),
+    ...createTuneStore(db),
     ...settingsStore,
     ...feedbackCapability,
   };

@@ -128,7 +128,7 @@ export function loadConfig(): Config {
       "PIPELINE_CATALOG_PATH",
       fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url))
     ),
-    sandboxRuntimeRelease: optional("SANDBOX_RUNTIME_RELEASE", "openthrottle-snapshot/v11"),
+    sandboxRuntimeRelease: optional("SANDBOX_RUNTIME_RELEASE", "openthrottle-snapshot/v12"),
     sandboxRuntimeDescriptorPath: optional(
       "SANDBOX_RUNTIME_DESCRIPTOR_PATH",
       fileURLToPath(new URL("../../pipelines/runtime-capabilities-v1.json", import.meta.url))

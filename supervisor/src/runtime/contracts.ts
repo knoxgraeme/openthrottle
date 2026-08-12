@@ -16,7 +16,7 @@ import {
   type StageRequestEnvelope,
 } from "../pipeline/stage-request.js";
 import type { RepositorySkillPackage } from "../pipeline/manifest.js";
-import { LOGICAL_CREDENTIALS, type LogicalCredential } from "@openthrottle/contracts";
+import { LOGICAL_CREDENTIALS, type LogicalCredential, type TuneProposalChange } from "@openthrottle/contracts";
 
 // The closed logical-scope set a loop action may declare (contracts/src/graph.ts
 // LOGICAL_CREDENTIALS). Enforced again here at the runtime boundary so a loop
@@ -87,6 +87,11 @@ export interface LoopActionRequest {
   contextPolicy: "fresh" | "resume_required" | "prefer_resume";
   timeoutMs: number;
   transitionContext: string;
+  tuneMaterial?: {
+    schema: "openthrottle.tune-change-material/v1";
+    proposalDigest: string;
+    changes: TuneProposalChange[];
+  };
   priorEvidence?: {
     schema: "openthrottle.loop-prior-evidence/v1";
     role: "lead" | "repair" | "final_review" | "final_repair";
@@ -159,6 +164,22 @@ export interface ChildExecutorActionRequest {
   baseSubject: string;
   inputSubject: string;
   candidateSubject?: string;
+  tuneAuthorization?: {
+    schema: "openthrottle.tune-edit-verification/v1";
+    proposalDigest: string;
+    decisionDigest: string;
+    authorizationDigest: string;
+    baseSubject: string;
+    expiresAt: string;
+    changes: Array<{
+      path: string;
+      operation: "add" | "modify" | "delete";
+      before_digest: string | null;
+      after_digest: string | null;
+      after_content: string | null;
+      rationale: string;
+    }>;
+  };
   requestHash: string;
   idempotencyKey: string;
 }

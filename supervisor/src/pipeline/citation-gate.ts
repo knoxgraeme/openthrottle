@@ -18,6 +18,9 @@ export const CITATION_GATE_REASONS = Object.freeze([
 ] as const);
 export type CitationGateReason = (typeof CITATION_GATE_REASONS)[number];
 
+const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const SHA256 = /^[a-f0-9]{64}$/;
+
 export interface CitationGradeCitation {
   id: string;
   result: "reproduced" | "mismatch";
@@ -193,4 +196,72 @@ export function evaluateRawCitationGate(input: {
     grade: evaluated.grade,
     decision: evaluated.decision,
   };
+}
+
+function stringArray(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((entry): entry is string => typeof entry === "string")
+    ? value
+    : null;
+}
+
+export function validateCitationGateDecision(value: unknown): CitationGateDecision {
+  const input = value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+  if (!input || input.schema !== CITATION_GATE_SCHEMA) throw new Error("citation gate decision is invalid");
+  const proposalId = typeof input.proposal_id === "string" ? input.proposal_id : "";
+  const proposalHash = typeof input.proposal_hash === "string" ? input.proposal_hash : "";
+  const result: CitationGateDecision["result"] | null =
+    input.result === "passed" || input.result === "failed" ? input.result : null;
+  const outcome: CitationGateDecision["outcome"] | null =
+    input.outcome === "success" || input.outcome === "failure" ? input.outcome : null;
+  const reason = typeof input.reason === "string" && CITATION_GATE_REASONS.includes(
+    input.reason as (typeof CITATION_GATE_REASONS)[number]
+  ) ? input.reason as CitationGateReason : null;
+  const survivingClaimIds = stringArray(input.surviving_claim_ids);
+  const droppedClaimIds = stringArray(input.dropped_claim_ids);
+  const sourceDigests = stringArray(input.source_digests);
+  const gradeHash = typeof input.grade_hash === "string" ? input.grade_hash : "";
+  if (
+    !IDENTIFIER.test(proposalId) ||
+    !SHA256.test(proposalHash) ||
+    !SHA256.test(gradeHash) ||
+    !result ||
+    !outcome ||
+    !reason ||
+    !survivingClaimIds ||
+    !droppedClaimIds ||
+    !sourceDigests ||
+    survivingClaimIds.some((entry) => !IDENTIFIER.test(entry)) ||
+    droppedClaimIds.some((entry) => !IDENTIFIER.test(entry)) ||
+    sourceDigests.length === 0 ||
+    sourceDigests.some((entry) => !SHA256.test(entry)) ||
+    (result === "passed") !== (outcome === "success") ||
+    (result === "passed" && survivingClaimIds.length === 0) ||
+    (result === "failed" && (survivingClaimIds.length !== 0 || droppedClaimIds.length === 0)) ||
+    (reason === "all_citations_reproduced" && (result !== "passed" || droppedClaimIds.length !== 0)) ||
+    (reason === "partial_claim_survival" && (result !== "passed" || droppedClaimIds.length === 0)) ||
+    ((reason === "no_claims_survived" || reason === "stale_evidence") && result !== "failed") ||
+    new Set([...survivingClaimIds, ...droppedClaimIds]).size !== survivingClaimIds.length + droppedClaimIds.length ||
+    canonicalJson(sourceDigests) !== canonicalJson([...new Set(sourceDigests)].sort())
+  ) throw new Error("citation gate decision is invalid");
+
+  const payloadValue = {
+    schema: CITATION_GATE_SCHEMA,
+    proposal_id: proposalId,
+    proposal_hash: proposalHash,
+    result,
+    outcome,
+    reason,
+    surviving_claim_ids: survivingClaimIds,
+    dropped_claim_ids: droppedClaimIds,
+    grade_hash: gradeHash,
+    source_digests: sourceDigests,
+  };
+  const payload = canonicalJson(payloadValue);
+  if (input.payload !== payload || input.hash !== digestNormalized(payload)) {
+    throw new Error("citation gate decision hash mismatch");
+  }
+  if (Object.keys(input).length !== 12) throw new Error("citation gate decision has unknown fields");
+  return { ...payloadValue, payload, hash: input.hash as string };
 }

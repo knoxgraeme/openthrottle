@@ -391,6 +391,7 @@ function projectConfigDocument(config: ProjectConfig, editableSkills = false): R
         ? [{ id: EDITABLE_GRAPH_ID, kind: "repository", ref: EDITABLE_GRAPH_PATH }]
         : []),
     ],
+    pipelines: { implement: "implement", investigate: "investigate", tune: "tune" },
     ...config,
     commands,
     ...aliases,

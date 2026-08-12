@@ -3,9 +3,12 @@ import { STAGE_OUTCOMES } from "../pipeline/manifest.js";
 import { LAUNCH_FAULT_REASONS, type LaunchFaultReason } from "../pipeline/fault-attribution.js";
 import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "../pipeline/coordinator.js";
 import { isPathSafeActionId } from "./action-id.js";
+import {
+  SEALED_STAGE_RESULT_LIMIT_BYTES,
+  TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES,
+} from "../pipeline/evidence-limits.js";
 
 const MAX_EVENT_BYTES = 32 * 1024;
-const MAX_STAGE_EVENT_BYTES = 64 * 1024;
 const MAX_BODY_LENGTH = 8_000;
 const EVENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RUN_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
@@ -139,7 +142,7 @@ function parsePlanItems(value: unknown): RuntimePlanItem[] {
 
 export function parseSandboxEvent(raw: string): SandboxEvent {
   const rawBytes = Buffer.byteLength(raw);
-  if (rawBytes > MAX_STAGE_EVENT_BYTES) throw new Error("sandbox event is too large");
+  if (rawBytes > SEALED_STAGE_RESULT_LIMIT_BYTES) throw new Error("sandbox event is too large");
   const value: unknown = JSON.parse(raw);
   if (!isRecord(value) || value.version !== 1) throw new Error("unsupported sandbox event");
   if (value.kind !== "stage_result" && rawBytes > MAX_EVENT_BYTES) throw new Error("sandbox event is too large");
@@ -199,7 +202,8 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
           !Number.isSafeInteger(entry.schema_version) || (entry.schema_version as number) < 1 ||
           typeof entry.assurance !== "string" || entry.assurance.length > 80 ||
           typeof entry.subject !== "string" || !/^[a-f0-9]{40,64}$/.test(entry.subject) ||
-          typeof entry.payload !== "string" || Buffer.byteLength(entry.payload, "utf8") > 256 * 1024) {
+          typeof entry.payload !== "string" ||
+          Buffer.byteLength(entry.payload, "utf8") > TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES) {
         throw new Error(`stage result artifact ${index} is invalid`);
       }
       return {

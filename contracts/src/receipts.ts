@@ -14,7 +14,13 @@ import {
   stringAt,
   type ValidatedContract,
 } from "./validation.js";
-import { RECEIPT_TYPES, type ReceiptType } from "./graph.js";
+import { RECEIPT_TYPES } from "./graph.js";
+import {
+  validateTuneAnalysisContract,
+  validateTuneProposalContract,
+  type TuneAnalysis,
+  type TuneProposal,
+} from "./tune-contract.js";
 
 export const RECEIPT_SCHEMA = "openthrottle.receipt/v1" as const;
 // Kept byte-identical with sandbox/runner/artifacts.mjs. A structured repair
@@ -29,6 +35,9 @@ export const ASSURANCE_CLASSES = [
   "provider_verified",
   "human_approved",
 ] as const;
+export const TUNE_RECEIPT_TYPES = ["tune_analysis", "tune_proposal"] as const;
+export const STANDARD_RECEIPT_TYPES = [...RECEIPT_TYPES, ...TUNE_RECEIPT_TYPES] as const;
+export type StandardReceiptType = (typeof STANDARD_RECEIPT_TYPES)[number];
 export const RECEIPT_RESULTS_BY_TYPE = {
   unit_completion: ["success", "failure", "needs_human", "exited"],
   unit_decision: ["accept", "revise", "context_update", "needs_human"],
@@ -39,7 +48,9 @@ export const RECEIPT_RESULTS_BY_TYPE = {
   publish_subject: ["success", "failure"],
   provider_evidence: ["success", "semantic_repair_required", "failure"],
   human_approval: ["approved", "rejected", "needs_human"],
-} as const satisfies Record<ReceiptType, readonly string[]>;
+  tune_analysis: ["success", "failure", "needs_human"],
+  tune_proposal: ["success", "no_change", "failure", "needs_human"],
+} as const satisfies Record<StandardReceiptType, readonly string[]>;
 
 export interface ReceiptProducer {
   worker_id: string;
@@ -122,7 +133,17 @@ export interface HumanApprovalPayload {
   rationale: string;
 }
 
-interface StandardReceiptBase<TType extends ReceiptType, TResult extends string, TPayload> {
+export interface TuneAnalysisReceiptPayload {
+  summary: string;
+  analysis: TuneAnalysis;
+}
+
+export interface TuneProposalReceiptPayload {
+  summary: string;
+  proposal: TuneProposal;
+}
+
+interface StandardReceiptBase<TType extends StandardReceiptType, TResult extends string, TPayload> {
   schema: typeof RECEIPT_SCHEMA;
   type: TType;
   assurance: ReceiptAssurance;
@@ -184,6 +205,16 @@ export type HumanApprovalReceipt = StandardReceiptBase<
   (typeof RECEIPT_RESULTS_BY_TYPE.human_approval)[number],
   HumanApprovalPayload
 >;
+export type TuneAnalysisReceipt = StandardReceiptBase<
+  "tune_analysis",
+  (typeof RECEIPT_RESULTS_BY_TYPE.tune_analysis)[number],
+  TuneAnalysisReceiptPayload
+>;
+export type TuneProposalReceipt = StandardReceiptBase<
+  "tune_proposal",
+  (typeof RECEIPT_RESULTS_BY_TYPE.tune_proposal)[number],
+  TuneProposalReceiptPayload
+>;
 
 export type StandardReceipt =
   | UnitCompletionReceipt
@@ -194,9 +225,13 @@ export type StandardReceipt =
   | IntegrationEvidenceReceipt
   | PublishSubjectReceipt
   | ProviderEvidenceReceipt
-  | HumanApprovalReceipt;
+  | HumanApprovalReceipt
+  | TuneAnalysisReceipt
+  | TuneProposalReceipt;
 
-const SEMANTIC_RECEIPTS = new Set<ReceiptType>(["unit_completion", "semantic_review", "unit_decision"]);
+const SEMANTIC_RECEIPTS = new Set<StandardReceiptType>([
+  "unit_completion", "semantic_review", "unit_decision", "tune_analysis", "tune_proposal",
+]);
 
 function parseProducer(value: unknown, path: string): ReceiptProducer {
   const input = objectAt(value, path, ["worker_id", "skill", "capability_digest", "skill_package_digest"]);
@@ -295,7 +330,9 @@ function parseReceiptPayload(type: "candidate_evidence" | "integration_evidence"
 function parseReceiptPayload(type: "publish_subject", value: unknown, path: string): PublishSubjectPayload;
 function parseReceiptPayload(type: "provider_evidence", value: unknown, path: string): ProviderEvidencePayload;
 function parseReceiptPayload(type: "human_approval", value: unknown, path: string): HumanApprovalPayload;
-function parseReceiptPayload(type: ReceiptType, value: unknown, path: string): StandardReceipt["payload"] {
+function parseReceiptPayload(type: "tune_analysis", value: unknown, path: string): TuneAnalysisReceiptPayload;
+function parseReceiptPayload(type: "tune_proposal", value: unknown, path: string): TuneProposalReceiptPayload;
+function parseReceiptPayload(type: StandardReceiptType, value: unknown, path: string): StandardReceipt["payload"] {
   if (type === "unit_completion") {
     const input = objectAt(value, path, [
       "summary", "assumptions", "decisions", "issues", "verification", "downstream_context", "requested_human_input",
@@ -369,10 +406,24 @@ function parseReceiptPayload(type: ReceiptType, value: unknown, path: string): S
       summary: stringAt(input.summary, `${path}.summary`, { max: 4_000 }),
     };
   }
-  const input = objectAt(value, path, ["approver", "rationale"]);
+  if (type === "human_approval") {
+    const input = objectAt(value, path, ["approver", "rationale"]);
+    return {
+      approver: stringAt(input.approver, `${path}.approver`, { max: 160 }),
+      rationale: stringAt(input.rationale, `${path}.rationale`, { max: 4_000 }),
+    };
+  }
+  if (type === "tune_analysis") {
+    const input = objectAt(value, path, ["summary", "analysis"]);
+    return {
+      summary: stringAt(input.summary, `${path}.summary`, { max: 4_000 }),
+      analysis: validateTuneAnalysisContract(input.analysis, { source: `${path}.analysis` }).value,
+    };
+  }
+  const input = objectAt(value, path, ["summary", "proposal"]);
   return {
-    approver: stringAt(input.approver, `${path}.approver`, { max: 160 }),
-    rationale: stringAt(input.rationale, `${path}.rationale`, { max: 4_000 }),
+    summary: stringAt(input.summary, `${path}.summary`, { max: 4_000 }),
+    proposal: validateTuneProposalContract(input.proposal, { source: `${path}.proposal` }).value,
   };
 }
 
@@ -385,10 +436,10 @@ export function validateStandardReceipt(
     "schema", "type", "assurance", "result", "producer", "subject", "fence", "evidence", "payload", "issued_at",
   ]);
   if (input.schema !== RECEIPT_SCHEMA) fail(`${source}.schema`, `must be ${RECEIPT_SCHEMA}`);
-  const type = enumAt(input.type, `${source}.type`, RECEIPT_TYPES);
+  const type = enumAt(input.type, `${source}.type`, STANDARD_RECEIPT_TYPES);
   const result = enumAt(input.result, `${source}.result`, RECEIPT_RESULTS_BY_TYPE[type]);
   const parsePayload = parseReceiptPayload as (
-    receiptType: ReceiptType,
+    receiptType: StandardReceiptType,
     payload: unknown,
     payloadPath: string
   ) => StandardReceipt["payload"];
@@ -410,6 +461,12 @@ export function validateStandardReceipt(
       && (receipt.payload.stdout_tail !== undefined || receipt.payload.stderr_tail !== undefined)) {
     fail(`${source}.payload`, "diagnostic tails are only valid for failed command receipts");
   }
+  if (receipt.type === "tune_proposal" && receipt.result !== "failure") {
+    const expectedOutcome = receipt.result === "success" ? "propose" : receipt.result;
+    if (receipt.payload.proposal.outcome !== expectedOutcome) {
+      fail(`${source}.result`, "must match the typed tune proposal outcome");
+    }
+  }
   if (SEMANTIC_RECEIPTS.has(type) && ["executor_verified", "provider_verified", "human_approved"].includes(receipt.assurance)) {
     fail(`${source}.assurance`, "semantic receipts cannot claim executor, provider, or human assurance");
   }
@@ -418,6 +475,15 @@ export function validateStandardReceipt(
 }
 
 export function parseStandardReceipt(raw: string, options: { source?: string } = {}): ValidatedContract<StandardReceipt> {
-  if (Buffer.byteLength(raw, "utf8") > 64 * 1024) fail(options.source ?? "receipt", "JSON exceeds 64 KiB");
-  return validateStandardReceipt(JSON.parse(raw) as unknown, options);
+  const source = options.source ?? "receipt";
+  const bytes = Buffer.byteLength(raw, "utf8");
+  if (bytes > 768 * 1024) fail(source, "JSON exceeds 768 KiB");
+  const value = JSON.parse(raw) as unknown;
+  const type = typeof value === "object" && value !== null && "type" in value
+    ? (value as { type?: unknown }).type
+    : undefined;
+  if (!TUNE_RECEIPT_TYPES.includes(type as (typeof TUNE_RECEIPT_TYPES)[number]) && bytes > 64 * 1024) {
+    fail(source, "JSON exceeds 64 KiB");
+  }
+  return validateStandardReceipt(value, options);
 }

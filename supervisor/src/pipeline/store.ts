@@ -1,5 +1,6 @@
 import type {
   AssuranceClass,
+  EvaluatorKind,
   PipelineOutcome,
   StageOutcome,
   ValidatedPipelineCatalog,
@@ -12,6 +13,7 @@ import type {
 } from "../runtime/contracts.js";
 import type { StageRequestEnvelope } from "./stage-request.js";
 import type { ExecutionPublicationSnapshot } from "./execution-publication.js";
+import type { TaskType } from "./types.js";
 
 export type PipelineInstanceStatus =
   | "pending"
@@ -47,7 +49,7 @@ export interface PipelineInstance {
   base_branch: string;
   branch: string;
   agent: "claude" | "codex" | "opencode";
-  task_type: "implement" | "investigate";
+  task_type: TaskType;
   published_commit: string | null;
   published_subject: string | null;
   repository_config_snapshot_id: string;
@@ -275,7 +277,7 @@ export interface PipelineStatusProjection {
   pipeline_id: string;
   pipeline_version: number;
   generation: number;
-  task_type: "implement" | "investigate";
+  task_type: TaskType;
   status: PipelineInstanceStatus;
   terminal_outcome: PipelineInstance["terminal_outcome"];
   stage_id: string | null;
@@ -326,7 +328,7 @@ export interface PipelineInstanceSeed {
   baseBranch?: string;
   branch: string;
   agent: "claude" | "codex" | "opencode";
-  taskType: "implement" | "investigate";
+  taskType: TaskType;
   manifest: ValidatedPipelineManifest;
   repositoryConfig: RepositoryConfigSnapshot;
   runtime: ValidatedRuntimeCapabilityDescriptor;
@@ -353,7 +355,7 @@ export interface CoordinatorEffectWrite {
 
 export interface CoordinatorGateReceiptWrite {
   id?: string;
-  evaluatorKind: "semantic" | "command" | "provider" | "human" | "publish_subject";
+  evaluatorKind: EvaluatorKind;
   policyDigest: string;
   subject?: string | null;
   result: "passed" | "failed" | "indeterminate" | "not_configured";

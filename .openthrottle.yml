@@ -29,6 +29,7 @@ mcp_servers: {}
 pipelines:
   implement: implement
   investigate: investigate
+  tune: tune
 intents:
   implement:
     default_graph: simple

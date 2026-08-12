@@ -22,6 +22,7 @@ import {
   createStageRequestHash,
   type StageRequestEnvelope,
 } from "../../pipeline/stage-request.js";
+import { SEALED_STAGE_RESULT_LIMIT_BYTES } from "../../pipeline/evidence-limits.js";
 import { assertPathSafeActionId } from "../../runtime/action-id.js";
 
 const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
@@ -221,7 +222,9 @@ function loopActionEnv(request: LoopActionRequest): string {
 }
 
 function parseCollectedStageResult(raw: string, attemptId: string): StageExecutionResult {
-  if (Buffer.byteLength(raw, "utf8") > 64 * 1024) throw new Error("sealed stage result exceeds 64 KiB");
+  if (Buffer.byteLength(raw, "utf8") > SEALED_STAGE_RESULT_LIMIT_BYTES) {
+    throw new Error("sealed stage result exceeds 4 MiB");
+  }
   const event = JSON.parse(raw) as Record<string, unknown>;
   if (event.kind !== "stage_result" || event.version !== 1 || event.attempt_id !== attemptId ||
       typeof event.request_hash !== "string" || !/^[a-f0-9]{64}$/.test(event.request_hash) ||

@@ -1,5 +1,6 @@
 import {
   type ArtifactKind,
+  type AssuranceClass,
   canonicalJson,
   COMMAND_NAMES,
   type CommandName,
@@ -8,8 +9,18 @@ import {
   type PipelineStage,
   type RepositorySkillPackage,
 } from "./manifest.js";
+import type { TaskType } from "./types.js";
 
 export const STAGE_EXECUTOR_PROTOCOL = "stage-executor@1";
+
+export interface StageRequestInputArtifact {
+  kind: ArtifactKind;
+  schemaVersion: number;
+  assurance: AssuranceClass;
+  subject: string | null;
+  payload: string;
+  hash: string;
+}
 
 export interface StageRequestEnvelope {
   protocol: typeof STAGE_EXECUTOR_PROTOCOL;
@@ -26,9 +37,10 @@ export interface StageRequestEnvelope {
   issueId: string;
   sessionId: string;
   generation: number;
-  taskType: "implement" | "investigate";
+  taskType: TaskType;
   taskContext: string;
   transitionContext: string;
+  inputArtifacts?: StageRequestInputArtifact[];
   repository: string;
   baseCommit: string;
   baseBranch: string;
@@ -82,9 +94,10 @@ export function buildStageRequest(input: {
   issueId: string;
   sessionId: string;
   generation: number;
-  taskType: "implement" | "investigate";
+  taskType: TaskType;
   taskContext: string;
   transitionContext: string;
+  inputArtifacts?: StageRequestInputArtifact[];
   repository: string;
   baseCommit: string;
   baseBranch: string;
@@ -112,6 +125,9 @@ export function buildStageRequest(input: {
     taskType: input.taskType,
     taskContext: input.taskContext,
     transitionContext: input.transitionContext,
+    ...(input.inputArtifacts && input.inputArtifacts.length > 0
+      ? { inputArtifacts: input.inputArtifacts }
+      : {}),
     repository: input.repository,
     baseCommit: input.baseCommit,
     baseBranch: input.baseBranch,

@@ -68,7 +68,7 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
               implement-unit repair-unit simplify-unit accept-unit final-review \
               final-repair select-review-personas validate-review-findings correctness-dataflow \
               tests-contracts reliability-adversarial agent-native-contracts \
-              security data-migration performance project-standards; do
+              security data-migration performance project-standards tune; do
     test -f "/opt/openthrottle/skills/tasks/$name/SKILL.md" || exit 1
   done &&
   test ! -e /opt/openthrottle/skills/claude &&
@@ -89,7 +89,7 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
               implement-unit simplify-unit repair-unit accept-unit final-review \
               final-repair select-review-personas validate-review-findings correctness-dataflow \
               tests-contracts reliability-adversarial agent-native-contracts \
-              security data-migration performance project-standards; do
+              security data-migration performance project-standards tune; do
     test -f "/etc/codex/skills/$name/SKILL.md" || exit 1
     yaml="/etc/codex/skills/$name/agents/openai.yaml"
     test -f "$yaml" || exit 1

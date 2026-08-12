@@ -61,13 +61,15 @@ export const ASSURANCE_CLASSES = [
 ] as const;
 export type AssuranceClass = (typeof ASSURANCE_CLASSES)[number];
 
-export const EXECUTOR_KINDS = ["agent", "command", "loop_action", "provider_wait"] as const;
+export const EXECUTOR_KINDS = ["agent", "command", "loop_action", "provider_wait", "supervisor"] as const;
 export type ExecutorKind = (typeof EXECUTOR_KINDS)[number];
 export const COMMAND_NAMES = ["test", "lint", "build", "format"] as const;
 export type CommandName = string;
 export const EVALUATOR_KINDS = [
   "semantic",
   "command",
+  "citation",
+  "differential_ratchet",
   "provider",
   "human",
   "publish_subject",

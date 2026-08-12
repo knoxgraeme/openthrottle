@@ -95,6 +95,7 @@ async function main() {
     runtime,
     taskTimeoutSeconds: cfg.taskTimeout,
     runtimeResourceRetentionMinutes: cfg.runtimeResourceRetentionMinutes,
+    citationGateStore,
     reconcileRuntimeResources,
     captureCodexAuth: (blob) => {
       captureCodexAuthJson(store, blob);
@@ -105,6 +106,7 @@ async function main() {
     runtime: runtimeCapabilities,
     store: pipelineStore,
     drainEffects: () => pipelineEffectProcessor.drain(),
+    tuneCorpus: analysisStore,
   };
   const githubPublicationProcessor = createGithubPublicationProcessor({
     store: pipelineStore,

@@ -1,6 +1,6 @@
 {
   "schema": "openthrottle.runtime-capabilities/v1",
-  "release": "openthrottle-snapshot/v11",
+  "release": "openthrottle-snapshot/v12",
   "generatedBy": "sandbox-runtime-build",
   "protocol": "stage-executor@1",
   "capabilities": [
@@ -15,6 +15,7 @@
     "ce/review@1",
     "ce/simplify@1",
     "command/run@1",
+    "core/tune@1",
     "correctness-dataflow@1",
     "data-migration@1",
     "graph/for-each-unit@1",
@@ -25,11 +26,13 @@
     "reliability-adversarial@1",
     "security@1",
     "select-review-personas@1",
+    "supervisor/citation-gate@1",
+    "supervisor/differential-ratchet@1",
     "tests-contracts@1",
     "validate-review-findings@1"
   ],
-  "executors": ["agent", "command", "loop_action", "provider_wait"],
-  "evaluators": ["command", "human", "provider", "publish_subject", "semantic"],
+  "executors": ["agent", "command", "loop_action", "provider_wait", "supervisor"],
+  "evaluators": ["citation", "command", "differential_ratchet", "human", "provider", "publish_subject", "semantic"],
   "artifacts": ["candidate_evidence", "command_result", "execution_graph_result", "human_approval", "integration_evidence", "provider_check", "publish_subject", "review", "stage_result", "standard_receipt"],
   "contextPolicies": ["fresh", "none", "prefer_resume", "resume_required"],
   "credentialScopes": ["mcp", "model.invoke", "provider.read", "repo.read", "repo.write"],

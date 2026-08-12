@@ -387,7 +387,7 @@ describe("Daytona stage execution", () => {
       providerDispatchId: "dispatch-opaque-1",
     });
 
-    const artifactPayload = canonicalJson({ result: "success" });
+    const artifactPayload = canonicalJson({ result: "success", sealed_tune_corpus: "x".repeat(70 * 1024) });
     remoteFiles.set("/var/lib/openthrottle/stage-results/attempt-1.json", Buffer.from(JSON.stringify({
       version: 1,
       kind: "stage_result",

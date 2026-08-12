@@ -59,6 +59,8 @@ function executorShape(kind: ExecutorKind): ExecutorShape {
       return { display: "loop action", node: (id, label) => `${id}[("${label}")]` };
     case "provider_wait":
       return { display: "provider wait", node: (id, label) => `${id}{{"${label}"}}` };
+    case "supervisor":
+      return { display: "supervisor gate", node: (id, label) => `${id}{"${label}"}` };
     default: {
       const unhandled: never = kind;
       throw new Error(`unhandled executor kind: ${String(unhandled)}`);
@@ -236,7 +238,7 @@ export function renderPipelineDocPage(manifest: PipelineManifest): string {
     "",
     "### Legend",
     "",
-    "- Rectangle = agent stage, parallelogram = command gate, hexagon = provider wait.",
+    "- Rectangle = agent stage, parallelogram = command gate, rounded node = loop action, diamond = supervisor gate, hexagon = provider wait.",
     "- Solid arrow = forward transition; dashed arrow = re-entry (the target is the",
     "  stage itself or sits at/before it in the declared stage order, matching the",
     "  shared `isPipelineReentry` manifest helper); thick arrow = terminal outcome.",

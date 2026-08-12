@@ -19,6 +19,7 @@ import type {
   PipelineStageAttempt,
   PipelineStore,
 } from "./store.js";
+import { TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES } from "./evidence-limits.js";
 import { buildStageRequest, plannedStageRunId } from "./stage-request.js";
 import {
   accumulatedPublicationFindings,
@@ -330,7 +331,8 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     if (!Number.isSafeInteger(artifact.schemaVersion) || artifact.schemaVersion < 1 || artifact.schemaVersion > 1_000) {
       throw new Error(`artifact ${artifact.kind} schema version is invalid`);
     }
-    if (Buffer.byteLength(artifact.payload, "utf8") > 256 * 1024) {
+    const artifactLimit = instance.task_type === "tune" ? TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES : 256 * 1024;
+    if (Buffer.byteLength(artifact.payload, "utf8") > artifactLimit) {
       throw new Error(`artifact ${artifact.kind} exceeds the coordinator size limit`);
     }
     if (digestNormalized(artifact.payload) !== artifact.hash) throw new Error(`artifact ${artifact.kind} hash mismatch`);
@@ -400,7 +402,24 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     : null;
   if (!input.attempt.request_payload) throw new Error(`pipeline attempt ${input.attempt.id} has no sealed request`);
   const priorRequest = JSON.parse(input.attempt.request_payload) as { taskContext?: unknown };
-  const taskContext = typeof priorRequest.taskContext === "string" ? priorRequest.taskContext : "";
+  const priorTaskContext = typeof priorRequest.taskContext === "string" ? priorRequest.taskContext : "";
+  // Tune stages pass only the immediately preceding, already gate-validated
+  // artifacts through the next sealed request. This is the deterministic data
+  // channel between isolated sessions; native-session memory and ticket prose
+  // are never authority for a tune proposal or mutation.
+  const inputArtifacts = input.instance.task_type === "tune"
+    ? (input.event.artifacts ?? []).map((artifact) => ({
+      kind: artifact.kind as import("./manifest.js").ArtifactKind,
+      schemaVersion: artifact.schemaVersion,
+      assurance: artifact.assurance,
+      subject: artifact.subject ?? null,
+      payload: artifact.payload,
+      hash: artifact.hash,
+    })).sort((left, right) => left.kind.localeCompare(right.kind))
+    : undefined;
+  const taskContext = input.instance.task_type === "tune"
+    ? "Supervisor-sealed tune evidence is carried only by inputArtifacts."
+    : priorTaskContext;
   const request = buildStageRequest({
     instanceId: input.instance.id,
     manifestDigest: input.instance.manifest_digest,
@@ -416,6 +435,7 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     taskType: input.instance.task_type,
     taskContext,
     transitionContext: transitionContext(input.event, input.attempt.stage_id),
+    inputArtifacts,
     repository: input.instance.repository,
     baseCommit: input.instance.base_commit,
     baseBranch: input.instance.base_branch,

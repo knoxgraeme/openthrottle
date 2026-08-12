@@ -18,7 +18,15 @@ describe("installed stage capabilities", () => {
     expect(RUNTIME_DESCRIPTOR.capabilities).toContain("loop-action@2");
     expect(RUNTIME_DESCRIPTOR.capabilities).toEqual(expect.arrayContaining(REVIEW_PERSONA_CAPABILITIES));
     expect(RUNTIME_DESCRIPTOR.executors).toContain("loop_action");
+    expect(RUNTIME_DESCRIPTOR.executors).toContain("supervisor");
     expect(capabilityContract("command/run@1").kind).toBe("command");
+    expect(capabilityContract("supervisor/citation-gate@1").kind).toBe("supervisor");
+    expect(() => authorizeCapability({
+      capability: "core/tune@1",
+      contextPolicy: "fresh",
+      credentialScopes: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      requiredArtifacts: ["stage_result", "standard_receipt"],
+    })).toThrow(/not authorized.*repo.write/);
     const supervisorDescriptor = JSON.parse(readFileSync(
       new URL("../../supervisor/pipelines/runtime-capabilities-v1.json", import.meta.url),
       "utf8"

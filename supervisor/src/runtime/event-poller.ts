@@ -19,6 +19,7 @@ import {
   type SandboxPlanEvent,
   type SandboxStageResultEvent,
 } from "./events.js";
+import { SEALED_STAGE_RESULT_LIMIT_BYTES } from "../pipeline/evidence-limits.js";
 
 const OUTBOX_DIR = "/home/agent/.ot/outbox";
 const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
@@ -26,7 +27,6 @@ const SEALED_HEARTBEAT_FILE = "/var/lib/openthrottle/heartbeat/heartbeat.json";
 const SEALED_STAGE_RESULT_DIR = "/var/lib/openthrottle/stage-results";
 const WORKSPACE_SUBJECT_COMMAND = "node /opt/openthrottle/runner/execute-stage.mjs --print-subject --repo /home/agent/repo";
 const MAX_EVENT_BYTES = 32 * 1024;
-const MAX_STAGE_EVENT_BYTES = 64 * 1024;
 const INGESTION_DIAGNOSTIC_ATTEMPTS = 5;
 const CHILD_ACTION_HEARTBEAT_LEASE_MS = 60_000;
 
@@ -254,7 +254,7 @@ async function pollTicketEvents(
 
   for (const file of files) {
     const remotePath = file.remotePath;
-    const eventLimit = file.sealedStageResult ? MAX_STAGE_EVENT_BYTES : MAX_EVENT_BYTES;
+    const eventLimit = file.sealedStageResult ? SEALED_STAGE_RESULT_LIMIT_BYTES : MAX_EVENT_BYTES;
     if (file.size > eventLimit) {
       console.error(`[sandbox-events] deleting oversized event ${file.name}`);
       await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);

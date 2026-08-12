@@ -6,6 +6,9 @@ import {
   parseExecutionPlanContract,
   parseStandardReceipt,
   RECEIPT_SCHEMA,
+  validateTuneDecisionContract,
+  validateTuneEditAuthorizationContract,
+  validateTuneProposalContract,
   validateReviewJournalContract,
   type CandidateEvidenceReceipt,
   type CommandResultReceipt,
@@ -501,12 +504,82 @@ function compareAttemptOrder(left: ExecutionWorkAttempt, right: ExecutionWorkAtt
     left.id.localeCompare(right.id);
 }
 
+function requestContextForStructuredPlan(payload: {
+  taskContext?: unknown;
+  inputArtifacts?: unknown;
+}): string {
+  if (Array.isArray(payload.inputArtifacts)) {
+    for (const entry of payload.inputArtifacts) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const artifact = entry as { payload?: unknown };
+      if (typeof artifact.payload !== "string") continue;
+      try {
+        const parsed = JSON.parse(artifact.payload) as { details?: { execution_plan?: unknown } };
+        const executionPlan = parsed.details?.execution_plan;
+        if (executionPlan !== undefined) {
+          return `\`\`\`json ${EXECUTION_PLAN_SCHEMA}\n${JSON.stringify(executionPlan)}\n\`\`\``;
+        }
+      } catch {
+        // The stage gate validates artifact JSON. Ignore unrelated artifacts.
+      }
+    }
+  }
+  return typeof payload.taskContext === "string" ? payload.taskContext : "";
+}
+
 function parentTaskContextFor(store: PipelineStore, parentAttemptId: string): string {
   if (typeof (store as { getAttempt?: unknown }).getAttempt !== "function") return "";
   const attempt = store.getAttempt(parentAttemptId);
   if (!attempt?.request_payload) return "";
-  const payload = JSON.parse(attempt.request_payload) as { taskContext?: unknown };
-  return typeof payload.taskContext === "string" ? payload.taskContext : "";
+  const payload = JSON.parse(attempt.request_payload) as { taskContext?: unknown; inputArtifacts?: unknown };
+  return requestContextForStructuredPlan(payload);
+}
+
+function tuneAuthorizationForParent(
+  store: PipelineStore,
+  parentAttemptId: string,
+  baseSubject: string,
+  now: Date
+): ChildExecutorActionRequest["tuneAuthorization"] {
+  const attempt = store.getAttempt(parentAttemptId);
+  if (!attempt?.request_payload) throw new Error(`tune parent attempt ${parentAttemptId} has no sealed request`);
+  const request = JSON.parse(attempt.request_payload) as {
+    taskType?: unknown;
+    inputArtifacts?: Array<{ kind?: unknown; payload?: unknown; hash?: unknown }>;
+  };
+  if (request.taskType !== "tune") return undefined;
+  const artifact = request.inputArtifacts?.find((entry) => entry.kind === "stage_result");
+  if (!artifact || typeof artifact.payload !== "string" || typeof artifact.hash !== "string" ||
+      digestNormalized(artifact.payload) !== artifact.hash) {
+    throw new Error("tune structured edit is missing its sealed supervisor authorization");
+  }
+  const wrapper = JSON.parse(artifact.payload) as {
+    details?: { proposal?: unknown; decision?: unknown; edit_authorization?: unknown };
+  };
+  const proposal = validateTuneProposalContract(wrapper.details?.proposal, {
+    source: "structured_edit.proposal",
+  });
+  const decision = validateTuneDecisionContract(wrapper.details?.decision, {
+    source: "structured_edit.decision",
+    proposal: proposal.value,
+  });
+  const authorization = validateTuneEditAuthorizationContract(wrapper.details?.edit_authorization, {
+    source: "structured_edit.authorization",
+    proposal: proposal.value,
+    decision: decision.value,
+  });
+  if (authorization.value.expires_at < now.toISOString()) {
+    throw new Error("tune structured edit authorization expired before executor verification");
+  }
+  return {
+    schema: "openthrottle.tune-edit-verification/v1",
+    proposalDigest: proposal.digest,
+    decisionDigest: decision.digest,
+    authorizationDigest: authorization.digest,
+    baseSubject: sha1SubjectForGitOperation(baseSubject, "tune verification base subject"),
+    expiresAt: authorization.value.expires_at,
+    changes: proposal.value.changes,
+  };
 }
 
 function assertLoopRequestEnvelopeBound(request: LoopActionRequest): void {
@@ -1707,6 +1780,9 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       const integrationCandidateSubject = candidateSubject
         ? sha1SubjectForGitOperation(candidateSubject, "child integration candidate subject")
         : undefined;
+      const tuneAuthorization = action.action_kind === "candidate" || action.action_kind === "integrate"
+        ? tuneAuthorizationForParent(deps.store, action.parent_attempt_id, instance.base_commit, deps.now())
+        : undefined;
       const request = buildChildExecutorActionRequest({
         protocol: "child-executor-action@1",
         actionId: action.id,
@@ -1728,6 +1804,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         baseSubject,
         inputSubject: actionInputSubjectFor(instance, action),
         ...(integrationCandidateSubject ? { candidateSubject: integrationCandidateSubject } : {}),
+        ...(tuneAuthorization ? { tuneAuthorization } : {}),
       });
       deps.store.prepareActionDispatch?.({
         actionId: action.id,
@@ -1816,6 +1893,9 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       : workerBinding.context === "resume_required" && !action.native_session_id
         ? "prefer_resume"
         : workerBinding.context;
+    const tuneAuthorization = ["implement", "repair", "simplify", "final_repair"].includes(action.action_kind)
+      ? tuneAuthorizationForParent(deps.store, action.parent_attempt_id, instance.base_commit, deps.now())
+      : undefined;
     const reviewSubject = action.action_kind === "lead" ? leadCandidateSubject
       : action.action_kind === "final_review" ? inputSubject
         : undefined;
@@ -1890,6 +1970,13 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         actionKind: action.action_kind,
         unitId: action.unit_id,
       }),
+      ...(tuneAuthorization ? {
+        tuneMaterial: {
+          schema: "openthrottle.tune-change-material/v1" as const,
+          proposalDigest: tuneAuthorization.proposalDigest,
+          changes: tuneAuthorization.changes,
+        },
+      } : {}),
       ...(priorEvidence ? { priorEvidence } : {}),
       ...(downstreamContext.length > 0 ? { downstreamContext } : {}),
       ...(action.action_kind === "lead"
@@ -2452,7 +2539,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (!stage || stage.executor.capability !== FOR_EACH_UNIT_CAPABILITY) {
         throw new Error(`pipeline composite stage ${request.stageId} is not active`);
       }
-      const plan = extractExecutionPlan(request.taskContext);
+      const plan = extractExecutionPlan(requestContextForStructuredPlan(request));
       const commandPlan = commandPlanForUnits({
         plan,
         fallbackCommandNames: stage.unitCommandNames ?? [],

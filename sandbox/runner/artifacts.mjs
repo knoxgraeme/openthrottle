@@ -49,6 +49,8 @@ const STANDARD_RECEIPT_RESULTS = Object.freeze({
   publish_subject: ["success", "failure"],
   provider_evidence: ["success", "semantic_repair_required", "failure"],
   human_approval: ["approved", "rejected", "needs_human"],
+  tune_analysis: ["success", "failure", "needs_human"],
+  tune_proposal: ["success", "no_change", "failure", "needs_human"],
 });
 const STANDARD_RECEIPT_STAGE_OUTCOMES = Object.freeze({
   accept: "success",
@@ -64,13 +66,20 @@ const STANDARD_RECEIPT_STAGE_OUTCOMES = Object.freeze({
   semantic_repair_required: "semantic_repair_required",
   success: "success",
 });
-const SEMANTIC_RECEIPTS = new Set(["unit_completion", "unit_decision", "semantic_review"]);
+const SEMANTIC_RECEIPTS = new Set([
+  "unit_completion",
+  "unit_decision",
+  "semantic_review",
+  "tune_analysis",
+  "tune_proposal",
+]);
 const SEVERITIES = new Set(["P0", "P1", "P2", "P3"]);
 const SHA256 = /^[a-f0-9]{64}$/;
 const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
 const SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+|repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?:(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+\/)*(?!\.{1,2}$)[A-Za-z0-9._-]+)$/;
 const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const MAX_ARTIFACT_PAYLOAD_BYTES = 12 * 1024;
+const MAX_TUNE_ARTIFACT_PAYLOAD_BYTES = 768 * 1024;
 // Kept byte-identical with contracts/src/receipts.ts. Sixteen command receipts
 // can enter one bounded prior-evidence envelope, so these diagnostics are byte
 // bounded independently of the outer artifact limit.
@@ -301,8 +310,8 @@ function objectWithKnownKeys(value, label, keys) {
   return value;
 }
 
-function exactPayload(value, label, keys, env) {
-  return boundedPlainObject(objectWithKnownKeys(value, label, keys), label, env);
+function exactPayload(value, label, keys, env, maxBytes = 32 * 1024) {
+  return boundedPlainObject(objectWithKnownKeys(value, label, keys), label, env, maxBytes);
 }
 
 function boundedContextRecords(value, label, env) {
@@ -378,6 +387,29 @@ function receiptPayload(type, value, env) {
     return {
       summary: boundedText(payload.summary, "standard receipt payload summary", 4_000, env),
       findings: boundedFindings(payload.findings, "standard receipt payload findings", env),
+    };
+  }
+  if (type === "tune_analysis" || type === "tune_proposal") {
+    const contractField = type === "tune_analysis" ? "analysis" : "proposal";
+    const expectedSchema = type === "tune_analysis"
+      ? "openthrottle.tune-analysis/v1"
+      : "openthrottle.tune-proposal/v1";
+    const payload = exactPayload(
+      value,
+      "standard receipt payload",
+      new Set(["summary", contractField]),
+      env,
+      type === "tune_analysis" ? 256 * 1024 : 640 * 1024
+    );
+    if (!payload[contractField] || typeof payload[contractField] !== "object" || Array.isArray(payload[contractField])) {
+      throw new Error(`standard receipt payload ${contractField} must be an object`);
+    }
+    if (payload[contractField].schema !== expectedSchema) {
+      throw new Error(`standard receipt payload ${contractField} has an invalid schema`);
+    }
+    return {
+      summary: boundedText(payload.summary, "standard receipt payload summary", 4_000, env),
+      [contractField]: payload[contractField],
     };
   }
   if (type === "command_result") {
@@ -490,10 +522,10 @@ function exactObject(value, label, keys) {
   return value;
 }
 
-function boundedPlainObject(value, label, env) {
+function boundedPlainObject(value, label, env, maxBytes = 32 * 1024) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
   const sanitized = sanitizeArtifactText(JSON.stringify(value), env);
-  if (Buffer.byteLength(sanitized, "utf8") > 32 * 1024) throw new Error(`${label} exceeds the receipt payload limit`);
+  if (Buffer.byteLength(sanitized, "utf8") > maxBytes) throw new Error(`${label} exceeds the receipt payload limit`);
   return JSON.parse(sanitized);
 }
 
@@ -630,7 +662,11 @@ function artifactPayload({ kind, fence, assurance, result, summary, evidence, fi
 
 function sealArtifact(payload) {
   const normalized = canonicalJson(payload);
-  if (Buffer.byteLength(normalized, "utf8") > MAX_ARTIFACT_PAYLOAD_BYTES) {
+  const limit = payload.details?.receipt_type === "tune_analysis" ||
+      payload.details?.receipt_type === "tune_proposal"
+    ? MAX_TUNE_ARTIFACT_PAYLOAD_BYTES
+    : MAX_ARTIFACT_PAYLOAD_BYTES;
+  if (Buffer.byteLength(normalized, "utf8") > limit) {
     throw new Error(`artifact ${payload.kind} exceeds the sealed payload limit`);
   }
   return {
@@ -711,8 +747,49 @@ export function buildCommandArtifacts({ fence, command, commandName, execution, 
   })));
 }
 
-export function buildStandardReceiptArtifacts({ receipt, fence, requiredArtifacts = ["standard_receipt"], env = process.env }) {
+function assertStandardReceiptAuthority(receipt, authority) {
+  if (!authority || typeof authority !== "object" || Array.isArray(authority)) {
+    throw new Error("standard receipt sealing authority is missing");
+  }
+  if (receipt.assurance !== authority.assurance) {
+    throw new Error("standard receipt assurance does not match the sealed stage authority");
+  }
+  for (const field of ["worker_id", "skill", "capability_digest", "skill_package_digest"]) {
+    if (receipt.producer[field] !== authority.producer?.[field]) {
+      throw new Error(`standard receipt producer ${field} does not match the sealed stage authority`);
+    }
+  }
+  for (const field of ["base", "pre", "post"]) {
+    if (receipt.subject[field] !== authority.subject?.[field]) {
+      throw new Error(`standard receipt subject ${field} does not match the sealed stage authority`);
+    }
+  }
+  for (const field of [
+    "pipeline_instance_id",
+    "graph_digest",
+    "unit_id",
+    "attempt_id",
+    "parent_run_id",
+    "action_attempt_id",
+    "generation",
+    "native_session_id",
+    "request_hash",
+  ]) {
+    if (receipt.fence[field] !== authority.fence?.[field]) {
+      throw new Error(`standard receipt fence ${field} does not match the sealed stage authority`);
+    }
+  }
+}
+
+export function buildStandardReceiptArtifacts({
+  receipt,
+  fence,
+  authority,
+  requiredArtifacts = ["standard_receipt"],
+  env = process.env,
+}) {
   const normalized = validateStandardReceipt(receipt, env);
+  assertStandardReceiptAuthority(normalized, authority);
   const receiptPayload = canonicalJson(normalized);
   const receiptHash = digest(receiptPayload);
   const result = STANDARD_RECEIPT_STAGE_OUTCOMES[normalized.result];

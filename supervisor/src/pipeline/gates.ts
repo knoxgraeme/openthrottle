@@ -1,4 +1,10 @@
 import {
+  TUNE_ANALYSIS_SCHEMA,
+  validateStandardReceipt,
+  validateTuneAnalysisContract,
+  type StandardReceipt,
+} from "@openthrottle/contracts";
+import {
   ASSURANCE_CLASSES,
   STAGE_OUTCOMES,
   canonicalJson,
@@ -8,17 +14,21 @@ import {
   type PipelineStage,
   type StageOutcome,
 } from "./manifest.js";
+import { validateCitationGateDecision } from "./citation-gate.js";
 import {
   coordinatePipelineEvent,
   type PipelineCoordinatorEvent,
   type PipelineEventArtifact,
 } from "./coordinator.js";
+import { evaluateImprovementProposalGate } from "./improvement-proposal-gate.js";
 import type {
   CoordinatorGateReceiptWrite,
   PipelineInstance,
   PipelineStageAttempt,
   PipelineStore,
 } from "./store.js";
+import { extractJsonBlocks } from "./markdown.js";
+import { TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES } from "./evidence-limits.js";
 import { containsSecretShapedValue } from "../shared/sanitize.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -63,6 +73,12 @@ export const GATE_RECEIPT_REASONS = Object.freeze([
   "integration_evidence_failed",
 ] as const);
 export type GateReceiptReason = (typeof GATE_RECEIPT_REASONS)[number];
+type StageGateReason =
+  | GateReceiptReason
+  | "citation_gate_passed"
+  | "citation_gate_failed"
+  | "differential_ratchet_passed"
+  | "differential_ratchet_failed";
 
 function providerRevisionFromPayload(payload: Record<string, unknown>): string | undefined {
   const revision = payload.expected_published_commit ?? payload.head_sha;
@@ -206,9 +222,9 @@ function parseFindings(value: unknown): Finding[] {
   });
 }
 
-function parseArtifactPayload(artifact: PipelineEventArtifact): TypedArtifactPayload {
+function parseArtifactPayload(artifact: PipelineEventArtifact, limit = ARTIFACT_LIMIT): TypedArtifactPayload {
   if (artifact.schemaVersion !== 1) throw new Error(`artifact ${artifact.kind} schema version is unsupported`);
-  if (Buffer.byteLength(artifact.payload, "utf8") > ARTIFACT_LIMIT) {
+  if (Buffer.byteLength(artifact.payload, "utf8") > limit) {
     throw new Error(`artifact ${artifact.kind} exceeds the gate size limit`);
   }
   if (containsSecretShapedValue(artifact.payload)) {
@@ -294,6 +310,59 @@ function parseArtifactPayload(artifact: PipelineEventArtifact): TypedArtifactPay
     completed_at: completedAt,
     details: record(input.details, "artifact details"),
   };
+}
+
+function tuneReceipt<T extends "tune_analysis" | "tune_proposal">(
+  payloads: readonly TypedArtifactPayload[],
+  expectedType: T,
+  source: string
+): Extract<StandardReceipt, { type: T }> {
+  const artifact = payloads.find((payload) => payload.kind === "standard_receipt");
+  if (!artifact) throw new Error(`${source} is missing its standard receipt`);
+  const receipt = validateStandardReceipt(artifact.details.receipt, { source }).value;
+  if (receipt.type !== expectedType) throw new Error(`${source} must be ${expectedType}`);
+  return receipt as Extract<StandardReceipt, { type: T }>;
+}
+
+function validateTuneReceiptAuthority(
+  attempt: PipelineStageAttempt,
+  stage: PipelineStage,
+  payloads: readonly TypedArtifactPayload[]
+): void {
+  if (stage.id !== "analysis" && stage.id !== "proposal") return;
+  if (!attempt.request_payload) throw new Error(`tune ${stage.id} request is not sealed`);
+  const request = JSON.parse(attempt.request_payload) as {
+    taskContext?: unknown;
+    inputArtifacts?: Array<{ kind?: unknown; payload?: unknown; hash?: unknown }>;
+  };
+  if (stage.id === "analysis") {
+    const receipt = tuneReceipt(payloads, "tune_analysis", "stage.analysis.receipt");
+    if (typeof request.taskContext !== "string") throw new Error("tune analysis has no sealed task context");
+    const blocks = extractJsonBlocks(request.taskContext, TUNE_ANALYSIS_SCHEMA);
+    if (blocks.length !== 1) throw new Error("tune analysis requires one supervisor-sealed analysis contract");
+    const authorized = validateTuneAnalysisContract(JSON.parse(blocks[0]!) as unknown, {
+      source: "stage.analysis.authorized_analysis",
+    });
+    if (canonicalJson(receipt.payload.analysis) !== authorized.normalized) {
+      throw new Error("tune analysis receipt does not match the supervisor-sealed corpus");
+    }
+    return;
+  }
+
+  const receipt = tuneReceipt(payloads, "tune_proposal", "stage.proposal.receipt");
+  const predecessor = request.inputArtifacts?.find((artifact) => artifact.kind === "standard_receipt");
+  if (!predecessor || typeof predecessor.payload !== "string" || typeof predecessor.hash !== "string" ||
+      digestNormalized(predecessor.payload) !== predecessor.hash) {
+    throw new Error("tune proposal is missing its sealed analysis receipt");
+  }
+  const wrapper = JSON.parse(predecessor.payload) as { details?: { receipt?: unknown } };
+  const analysisReceipt = validateStandardReceipt(wrapper.details?.receipt, {
+    source: "stage.proposal.authorized_analysis_receipt",
+  }).value;
+  if (analysisReceipt.type !== "tune_analysis" ||
+      canonicalJson(receipt.payload.proposal.analysis) !== canonicalJson(analysisReceipt.payload.analysis)) {
+    throw new Error("tune proposal is not bound to its authorized analysis receipt");
+  }
 }
 
 function validateFence(
@@ -433,6 +502,49 @@ function commandDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutc
   });
 }
 
+function evaluatorDetails(stage: PipelineStage, payloads: TypedArtifactPayload[]): Record<string, unknown> {
+  const evidence = payloads.find((payload) =>
+    payload.kind === (stage.executor.kind === "supervisor" ? "stage_result" : "standard_receipt")
+  );
+  if (!evidence) throw new Error("supervisor evaluator is missing its authoritative artifact");
+  return evidence.details;
+}
+
+function citationDecision(stage: PipelineStage, payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: StageGateReason } {
+  const details = evaluatorDetails(stage, payloads);
+  const decision = validateCitationGateDecision(details.citation_gate);
+  return decision.result === "passed" && decision.outcome === "success"
+    ? { outcome: "success", result: "passed", reason: "citation_gate_passed" }
+    : { outcome: "failure", result: "failed", reason: "citation_gate_failed" };
+}
+
+function differentialRatchetDecision(stage: PipelineStage, payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: StageGateReason } {
+  const details = evaluatorDetails(stage, payloads);
+  const evaluation = evaluateImprovementProposalGate({
+    citationGate: details.citation_gate,
+    ratchetInput: details.ratchet_input,
+  }, {
+    citationReceipts: {
+      getCitationGateReceipt() {
+        return details.citation_receipt;
+      },
+    },
+  });
+  return evaluation.accepted
+    ? { outcome: "success", result: "passed", reason: "differential_ratchet_passed" }
+    : { outcome: "failure", result: "failed", reason: "differential_ratchet_failed" };
+}
+
+function stageDecision(
+  stage: PipelineStage,
+  payloads: TypedArtifactPayload[]
+): { outcome: StageOutcome; result: GateResult; reason: StageGateReason } {
+  if (stage.evaluator.kind === "command") return commandDecision(payloads);
+  if (stage.evaluator.kind === "citation") return citationDecision(stage, payloads);
+  if (stage.evaluator.kind === "differential_ratchet") return differentialRatchetDecision(stage, payloads);
+  return semanticDecision(payloads);
+}
+
 export function evaluateStageGate(
   store: PipelineStore,
   event: PipelineCoordinatorEvent,
@@ -469,11 +581,13 @@ export function evaluateStageGate(
   if (options.observedSubject && event.subject !== options.observedSubject) {
     throw new Error("workspace changed after stage evidence was sealed");
   }
+  const artifactLimit = instance.task_type === "tune" ? TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES : ARTIFACT_LIMIT;
   const payloads = artifacts.map((artifact) => {
-    const payload = parseArtifactPayload(artifact);
+    const payload = parseArtifactPayload(artifact, artifactLimit);
     validateFence(payload, artifact, instance, attempt, stage, event, subject);
     return payload;
   });
+  if (instance.task_type === "tune") validateTuneReceiptAuthority(attempt, stage, payloads);
   const stageResult = payloads.find((payload) => payload.kind === "stage_result")!;
   if (artifacts.find((artifact) => artifact.kind === "stage_result")?.hash !== event.resultHash) {
     throw new Error("stage result event hash does not match its artifact");
@@ -481,9 +595,7 @@ export function evaluateStageGate(
   if (payloads.some((payload) => payload.result !== stageResult.result)) {
     throw new Error("stage artifacts disagree on their proposed result");
   }
-  const decision = stage.evaluator.kind === "command"
-    ? commandDecision(payloads)
-    : semanticDecision(payloads);
+  const decision = stageDecision(stage, payloads);
   let providerRevision: string | undefined;
   if (stage.evaluator.kind === "publish_subject" && decision.outcome === "success") {
     const revision = payloads.find((payload) => payload.kind === "publish_subject")?.details.published_commit;

@@ -988,6 +988,24 @@ proposal worktree. Ordinary structured candidate integration is unchanged and
 does not carry self-improvement evidence; any later proposal producer inherits
 the same pre-mutation call requirement.
 
+An accepted tune change carries bounded exact `after_content` bytes (null only
+for deletion) whose digest is the declared `after_digest`. The differential
+input also carries paired exact `pinned_files`/`proposed_files`; before issuing
+edit authority, the supervisor derives the complete file diff from those bytes
+and requires exact equality with the proposal change set. Config, graph, or
+repository-skill policy structures must parse from those same bytes; pipeline
+and runtime mutation targets fail closed until they have an equivalent
+deterministic policy comparator. Structured workers receive the exact content
+in a separately hash-bound `openthrottle.tune-change-material/v1` request field
+(execution-plan instructions remain compact and identify its entries),
+with a separate canonical-JSON bound that reserves space inside the fixed child
+request envelope even when replacement text contains JSON-escaped characters,
+and the root-owned child executor independently checks the original pinned base,
+path set, operations, content bytes, and digests both before candidate acceptance
+and again before integration. Authorization remains valid for the bounded
+structured composite-stage deadline, not merely the ordinary single-stage
+timeout.
+
 For config comparison, absent repository limits resolve to the runtime defaults
 (`max_turns=200`, `task_timeout=7200`) before monotonic comparison. Repository
 skill package tunability is bound to the matching exact config entry, where an

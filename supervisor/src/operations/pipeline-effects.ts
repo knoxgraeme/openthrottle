@@ -1,9 +1,29 @@
 import type { Ticket, SupervisorStore } from "../persistence/store.js";
+import type { CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import { canonicalJson, stageById } from "../pipeline/manifest.js";
 import { digestNormalized } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
+import {
+  TUNE_DECISION_SCHEMA,
+  TUNE_EDIT_AUTHORIZATION_SCHEMA,
+  TUNE_RELEASE_DESCRIPTOR_SCHEMA,
+  digestCanonicalJson,
+  validateStandardReceipt,
+  validateTuneDecisionContract,
+  validateTuneEditAuthorizationContract,
+  validateTuneProposalContract,
+  validateTuneReleaseDescriptorContract,
+  type StandardReceipt,
+  type RepositoryConfigContract,
+  type TuneProposal,
+  type ValidatedContract,
+} from "@openthrottle/contracts";
+import { evaluateCitationGate, type ResolvedCitation } from "../pipeline/citation-gate.js";
+import { evaluateImprovementProposalGate } from "../pipeline/improvement-proposal-gate.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "../pipeline/coordinator.js";
+import { completeStageAttemptActor } from "../pipeline/settlement.js";
+import { assertTuneRatchetMaterialBinding, executionPlanForTuneProposal } from "../pipeline/tune-material.js";
 import { deriveStageFaultAttribution } from "../pipeline/fault-attribution.js";
 import type {
   PipelineEffectIntent,
@@ -87,6 +107,7 @@ interface PipelineEffectProcessorDeps {
   // capacity-constrained admission preflight (the same eligibility rule
   // everywhere -- see operations/runtime-resource-reclaim.ts).
   runtimeResourceRetentionMinutes: number;
+  citationGateStore?: CitationGateStore;
   /** Shared production single-flight reconciler; tests may omit it. */
   reconcileRuntimeResources?: RuntimeResourceReconciler;
   now?: () => Date;
@@ -174,14 +195,14 @@ function parseProvisionRequest(effect: PipelineEffectIntent, store: PipelineStor
   return request;
 }
 
-function compositeParentTimeoutSeconds(instance: PipelineInstance, request: StageRequestEnvelope, fallbackSeconds: number): number {
-  const stage = stageById(instance.normalized_manifest, request.stageId);
-  if (!stage) throw new Error(`pipeline composite request ${request.attemptId} references missing stage ${request.stageId}`);
+function compositeStageTimeoutSeconds(instance: PipelineInstance, stageId: string, fallbackSeconds: number): number {
+  const stage = stageById(instance.normalized_manifest, stageId);
+  if (!stage) throw new Error(`pipeline composite request references missing stage ${stageId}`);
   const phaseTimeouts = (stage.unitPhaseBindings ?? [])
     .flatMap((binding) => binding.kind === "agent" || binding.kind === "gate" ? [binding.loop.timeout_seconds] : []);
   const timeoutSeconds = Math.max(fallbackSeconds, ...phaseTimeouts);
   if (timeoutSeconds > MAX_STAGE_TIMEOUT_SECONDS) {
-    throw new Error(`pipeline composite stage ${request.attemptId} timeout ${timeoutSeconds}s exceeds maximum ${MAX_STAGE_TIMEOUT_SECONDS}s`);
+    throw new Error(`pipeline composite stage ${stageId} timeout ${timeoutSeconds}s exceeds maximum ${MAX_STAGE_TIMEOUT_SECONDS}s`);
   }
   return timeoutSeconds;
 }
@@ -250,7 +271,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         taskType: instance.task_type,
         tokenHash: request.requestHash,
         expiresAt: new Date(
-          now().getTime() + compositeParentTimeoutSeconds(instance, request, deps.taskTimeoutSeconds) * 1_000
+          now().getTime() + compositeStageTimeoutSeconds(instance, request.stageId, deps.taskTimeoutSeconds) * 1_000
         ).toISOString(),
       });
       if (!started) throw new Error(`pipeline composite stage ${request.attemptId} could not acquire the ticket actor`);
@@ -361,6 +382,270 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     });
   };
 
+  const typedReceiptFromInput = <T extends StandardReceipt["type"]>(
+    request: StageRequestEnvelope,
+    type: T
+  ): Extract<StandardReceipt, { type: T }> => {
+    const artifact = request.inputArtifacts?.find((entry) => entry.kind === "standard_receipt");
+    if (!artifact || digestNormalized(artifact.payload) !== artifact.hash) {
+      throw new Error(`supervisor tune stage ${request.stageId} is missing its sealed predecessor receipt`);
+    }
+    const wrapper = JSON.parse(artifact.payload) as { details?: { receipt?: unknown } };
+    const receipt = validateStandardReceipt(wrapper.details?.receipt, {
+      source: `stage.${request.stageId}.input_receipt`,
+    }).value;
+    if (receipt.type !== type) throw new Error(`supervisor tune stage ${request.stageId} requires ${type}`);
+    return receipt as Extract<StandardReceipt, { type: T }>;
+  };
+
+  const tuneProposalFromInput = (request: StageRequestEnvelope): ValidatedContract<TuneProposal> => {
+    const receiptArtifact = request.inputArtifacts?.find((entry) => entry.kind === "standard_receipt");
+    let candidate: unknown;
+    if (receiptArtifact) {
+      const receipt = typedReceiptFromInput(request, "tune_proposal");
+      candidate = receipt.payload.proposal;
+    } else {
+      const stageArtifact = request.inputArtifacts?.find((entry) => entry.kind === "stage_result");
+      const wrapper = stageArtifact
+        ? JSON.parse(stageArtifact.payload) as { details?: { proposal?: unknown } }
+        : undefined;
+      candidate = wrapper?.details?.proposal;
+    }
+    return validateTuneProposalContract(candidate, {
+      source: `stage.${request.stageId}.proposal`,
+    });
+  };
+
+  const comparableCorpusRows = (proposal: TuneProposal): ResolvedCitation[] => {
+    const rows = proposal.analysis.corpus_rows.map((row) => ({
+      pipeline_instance_id: row.pipeline_instance_id,
+      generation: row.generation,
+      execution_graph_id: row.execution_graph_id,
+      outcome: row.outcome,
+      closed_reason: row.closed_reason,
+      fault_attribution: row.fault_attribution,
+      created_at: row.created_at,
+    }));
+    return proposal.citation_contract.citations.map((citation) => ({
+      id: citation.id,
+      actual_result: rows
+        .filter((row) =>
+          (citation.query.skill_digest === undefined ||
+            citation.query.skill_digest === proposal.analysis.intent.task.query.skill) &&
+          (citation.query.outcome === undefined || row.outcome === citation.query.outcome) &&
+          (citation.query.reason === undefined || row.closed_reason === citation.query.reason) &&
+          (citation.query.attribution === undefined || row.fault_attribution === citation.query.attribution) &&
+          (citation.query.graph === undefined || row.execution_graph_id === citation.query.graph) &&
+          (citation.query.from === undefined || row.created_at >= citation.query.from) &&
+          (citation.query.to === undefined || row.created_at <= citation.query.to)
+        )
+        .slice(0, citation.query.limit ?? 50),
+    }));
+  };
+
+  const supervisorArtifact = (input: {
+    request: StageRequestEnvelope;
+    instance: PipelineInstance;
+    outcome: "success" | "failure" | "no_change" | "needs_human";
+    summary: string;
+    details: Record<string, unknown>;
+  }) => {
+    const payload = canonicalJson({
+      schema: "openthrottle.artifact/stage_result@1",
+      kind: "stage_result",
+      producer: {
+        capability: input.request.capability,
+        runtime_release: input.request.runtimeRelease,
+        capability_digest: input.request.capabilityDigest,
+        version: 1,
+      },
+      pipeline: { instance_id: input.instance.id, manifest_digest: input.instance.manifest_digest },
+      stage: {
+        id: input.request.stageId,
+        attempt_id: input.request.attemptId,
+        request_hash: input.request.requestHash,
+        context_revision: input.request.contextRevision,
+        context_policy: input.request.contextPolicy,
+      },
+      run: {
+        id: input.request.runId,
+        ticket_id: input.instance.ticket_id,
+        session_id: input.instance.session_id,
+        generation: input.instance.generation,
+        native_session_id: null,
+      },
+      repository: {
+        name: input.instance.repository,
+        base_commit: input.instance.base_commit,
+        subject: input.request.expectedSubject ?? input.instance.base_commit,
+        pre_subject: input.request.expectedSubject ?? input.instance.base_commit,
+        post_subject: input.request.expectedSubject ?? input.instance.base_commit,
+      },
+      assurance: "executor_verified",
+      result: input.outcome,
+      summary: input.summary,
+      evidence: [], findings: [], actions: [], uncertainty: [],
+      started_at: now().toISOString(), completed_at: now().toISOString(),
+      details: input.details,
+    });
+    return {
+      kind: "stage_result",
+      schemaVersion: 1,
+      assurance: "executor_verified" as const,
+      subject: input.request.expectedSubject ?? input.instance.base_commit,
+      payload,
+      hash: digestNormalized(payload),
+    };
+  };
+
+  const executeSupervisorTuneStage = (
+    effect: PipelineEffectIntent,
+    instance: PipelineInstance,
+    request: StageRequestEnvelope
+  ): void => {
+    if (!deps.citationGateStore) throw new Error("supervisor tune gates are not configured");
+    assertActiveAttempt(instance, request);
+    deps.store.bindStageRun(request.attemptId, request.runId);
+    deps.store.markStageDispatched(request.attemptId);
+    const proposalContract = tuneProposalFromInput(request);
+    const { value: proposal, digest: proposalDigest } = proposalContract;
+    let outcome: "success" | "failure" | "no_change" | "needs_human" = "failure";
+    let summary = "Tune gate rejected the proposal.";
+    let details: Record<string, unknown>;
+    if (request.capability === "supervisor/citation-gate@1") {
+      const citationProposalDigest = digestCanonicalJson(proposal.citation_contract);
+      const decision = evaluateCitationGate({
+        proposal: proposal.citation_contract,
+        proposalHash: citationProposalDigest,
+        resolvedCitations: comparableCorpusRows(proposal),
+      });
+      const receipt = deps.citationGateStore.recordCitationGateDecision(decision);
+      outcome = decision.outcome === "success" ? "success" : "failure";
+      summary = `Supervisor citation gate ${decision.result}.`;
+      details = { proposal, citation_gate: decision, citation_receipt: receipt };
+    } else if (request.capability === "supervisor/differential-ratchet@1") {
+      const citationInput = request.inputArtifacts?.find((entry) => entry.kind === "stage_result");
+      const citationDetails = citationInput
+        ? (JSON.parse(citationInput.payload) as { details?: Record<string, unknown> }).details
+        : undefined;
+      if (!citationDetails) throw new Error("differential ratchet is missing the supervisor citation result");
+      const repositoryConfig = deps.store.getRepositoryConfigSnapshot(instance.repository_config_snapshot_id);
+      if (!repositoryConfig || repositoryConfig.digest !== instance.repository_config_digest ||
+          repositoryConfig.base_commit !== instance.base_commit) {
+        throw new Error("differential ratchet lost its supervisor-pinned repository config");
+      }
+      assertTuneRatchetMaterialBinding(proposal, {
+        repositoryConfig: JSON.parse(repositoryConfig.normalized_config) as RepositoryConfigContract,
+      });
+      const evaluation = evaluateImprovementProposalGate({
+        citationGate: citationDetails.citation_gate,
+        ratchetInput: proposal.ratchet_input,
+      }, { citationReceipts: deps.citationGateStore });
+      const ratchetDecision = evaluation.decision;
+      const citationDecision = citationDetails.citation_gate as { hash?: unknown };
+      if (!evaluation.accepted || !ratchetDecision || typeof citationDecision.hash !== "string") {
+        details = {
+          proposal,
+          citation_gate: citationDetails.citation_gate,
+          citation_receipt: citationDetails.citation_receipt,
+          ratchet_input: proposal.ratchet_input,
+          improvement_gate: evaluation.journal,
+        };
+      } else {
+        const ratchetDecisionDigest = digestCanonicalJson(ratchetDecision);
+        const decisionContract = validateTuneDecisionContract({
+          schema: TUNE_DECISION_SCHEMA,
+          id: `decision-${proposal.id}`,
+          proposal_digest: proposalDigest,
+          citation_decision_digest: citationDecision.hash,
+          ratchet_decision_digest: ratchetDecisionDigest,
+          outcome: "accept",
+          rationale: "Supervisor citation and differential-ratchet gates passed.",
+        }, { proposal, citationDecisionDigest: citationDecision.hash, ratchetDecision });
+        const { value: decision, digest: decisionDigest } = decisionContract;
+        const timestamp = now();
+        const authorizationContract = validateTuneEditAuthorizationContract({
+          schema: TUNE_EDIT_AUTHORIZATION_SCHEMA,
+          id: `edit-${proposal.id}`,
+          proposal_digest: proposalDigest,
+          decision_digest: decisionDigest,
+          authorized_paths: proposal.changes.map((change) => change.path),
+          authorized_at: timestamp.toISOString(),
+          expires_at: new Date(
+            timestamp.getTime() + compositeStageTimeoutSeconds(instance, "structured_edit", deps.taskTimeoutSeconds) * 1_000
+          ).toISOString(),
+          actor_id: "openthrottle-supervisor",
+        }, { proposal, decision });
+        const { value: authorization, digest: authorizationDigest } = authorizationContract;
+        const releaseDescriptorContract = validateTuneReleaseDescriptorContract({
+          schema: TUNE_RELEASE_DESCRIPTOR_SCHEMA,
+          id: `release-${proposal.id}`,
+          runtime_release: instance.runtime_release,
+          capability_digest: instance.capability_digest,
+          contract_digests: [
+            proposalDigest,
+            citationDecision.hash,
+            ratchetDecisionDigest,
+            decisionDigest,
+            authorizationDigest,
+          ],
+          issued_at: timestamp.toISOString(),
+        });
+        deps.tickets.recordTuneState({
+          id: `tune-state-${proposal.id}`,
+          intentId: proposal.analysis.intent.id,
+          intentDigest: proposal.analysis.intent_digest,
+          proposalId: proposal.id,
+          proposalDigest,
+          citationDecisionDigest: citationDecision.hash,
+          ratchetDecisionDigest,
+          editAuthorizationDigest: authorizationDigest,
+          releaseDescriptorDigest: releaseDescriptorContract.digest,
+          outcome: "accepted",
+          payload: {
+            proposal,
+            decision,
+            authorization,
+            release_descriptor: releaseDescriptorContract.value,
+            improvement_gate: evaluation.journal,
+          },
+        });
+        outcome = "success";
+        summary = "Supervisor citation and differential-ratchet gates accepted the tune proposal.";
+        details = {
+          proposal, decision, edit_authorization: authorization,
+          citation_gate: citationDetails.citation_gate,
+          citation_receipt: citationDetails.citation_receipt,
+          ratchet_input: proposal.ratchet_input,
+          improvement_gate: evaluation.journal,
+          execution_plan: executionPlanForTuneProposal(proposal),
+        };
+      }
+    } else {
+      throw new Error(`unknown supervisor tune capability ${request.capability}`);
+    }
+    const artifact = supervisorArtifact({ request, instance, outcome, summary, details });
+    const event: PipelineCoordinatorEvent = {
+      id: `supervisor-stage-${request.attemptId}-${artifact.hash.slice(0, 16)}`,
+      kind: "stage_result",
+      instanceId: instance.id,
+      generation: instance.generation,
+      runId: request.runId,
+      stageId: request.stageId,
+      attemptId: request.attemptId,
+      requestHash: request.requestHash,
+      outcome,
+      resultHash: artifact.hash,
+      subject: artifact.subject,
+      nativeSessionId: null,
+      artifacts: [artifact],
+    };
+    completeStageAttemptActor(deps.store, deps.tickets, event, {
+      observedSubject: artifact.subject,
+    });
+    acknowledgeEffect(effect, event.id, { resultHash: artifact.hash, outcome });
+  };
+
   const runtimeBindingFor = (instance: PipelineInstance): EffectRuntimeBinding => {
     const binding = deps.store.getRuntimeResource(instance.id);
     return {
@@ -387,11 +672,30 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     instance: PipelineInstance,
     eventId: string
   ): Promise<void> => {
-    const resource = await resourceFor(instance);
-    await bootstrap(instance, resource);
     const request = effect.kind === "dispatch_stage"
       ? parseRequest(effect, deps.store)
       : parseProvisionRequest(effect, deps.store);
+    if (request.capability === "supervisor/citation-gate@1" ||
+        request.capability === "supervisor/differential-ratchet@1") {
+      const ticket = deps.tickets.getByIssueId(instance.ticket_id);
+      if (!ticket || ticket.session_id !== instance.session_id) {
+        throw new Error(`pipeline instance ${instance.id} has no current ticket binding`);
+      }
+      if (!ticket.run_id) {
+        const started = deps.tickets.beginRun({
+          issueId: instance.ticket_id,
+          runId: request.runId,
+          taskType: instance.task_type,
+          tokenHash: request.requestHash,
+          expiresAt: new Date(now().getTime() + deps.taskTimeoutSeconds * 1_000).toISOString(),
+        });
+        if (!started) throw new Error(`pipeline supervisor stage ${request.attemptId} could not acquire the ticket actor`);
+      }
+      executeSupervisorTuneStage(effect, instance, request);
+      return;
+    }
+    const resource = await resourceFor(instance);
+    await bootstrap(instance, resource);
     if (request.capability === FOR_EACH_UNIT_CAPABILITY) {
       if (request.pipelineInstanceId !== instance.id || request.generation !== instance.generation) {
         throw new Error(`pipeline composite request ${request.attemptId} has a stale instance fence`);

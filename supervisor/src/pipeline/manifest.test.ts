@@ -155,6 +155,16 @@ const CORE_IMPLEMENT_V4_STAGE_IDS = [
   "provider",
 ];
 
+const CORE_TUNE_V1_STAGE_IDS = [
+  "analysis",
+  "proposal",
+  "citation_gate",
+  "differential_ratchet",
+  "structured_edit",
+  "publish",
+  "provider",
+];
+
 describe("pipeline manifest validation", () => {
   it("loads the shipped catalog deterministically against independent runtime evidence", () => {
     const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -166,10 +176,14 @@ describe("pipeline manifest validation", () => {
     expect([...first.manifests.keys()]).toEqual([
       "core/implement@4",
       "core/investigate@1",
+      "core/tune@1",
     ]);
     const implementManifest = resolvePipelineReference(first, "implement").manifest;
     expect(implementManifest.id).toBe("core/implement");
     expect(implementManifest.version).toBe(4);
+    const tuneManifest = resolvePipelineReference(first, "tune").manifest;
+    expect(tuneManifest.id).toBe("core/tune");
+    expect(tuneManifest.version).toBe(1);
     expect(() => resolvePipelineReference(first, "core/implement@3"))
       .toThrow(/unknown pipeline selection/);
     expect(() => resolvePipelineReference(first, "core/implement@1"))
@@ -379,6 +393,121 @@ describe("pipeline manifest validation", () => {
     expect(repairSemanticReview.executor).toEqual(semanticReview.executor);
     expect(repairSemanticReview.transitions.success).toEqual({ to: "test" });
     expect(repairSemanticReview.transitions.no_change).toEqual({ to: "test" });
+  });
+
+  it("ships core/tune@1 through typed receipts, supervisor gates, and the structured review composite", () => {
+    const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
+    const catalog = loadPipelineCatalog(path, buildInstalledRuntimeDescriptor("test-runtime/v1").descriptor);
+    const tune = resolvePipelineReference(catalog, "tune").manifest;
+    const stage = (id: string) => tune.stages.find((candidate) => candidate.id === id)!;
+
+    expect(tune).toMatchObject({
+      id: "core/tune",
+      version: 1,
+      entry_stage: "analysis",
+      max_attempts: 200,
+      max_repair_rounds: 5,
+      requires: {
+        protocol: "stage-executor@1",
+        capabilities: [
+          "core/tune@1",
+          "supervisor/citation-gate@1",
+          "supervisor/differential-ratchet@1",
+          "ce/implement@1",
+          "ce/simplify@1",
+          "accept-unit@1",
+          "graph/for-each-unit@1",
+          "ce/publish@1",
+          "provider/wait@1",
+        ],
+      },
+    });
+    expect(tune.stages.map((candidate) => candidate.id)).toEqual(CORE_TUNE_V1_STAGE_IDS);
+
+    expect(stage("analysis")).toMatchObject({
+      executor: { kind: "agent", capability: "core/tune@1" },
+      evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["standard_receipt"] },
+      context: "fresh",
+      live_steering: false,
+      credentials: ["model.invoke", "provider.read", "repo.read"],
+      transitions: { success: { to: "proposal" }, no_change: { terminal: "no_change" } },
+    });
+    expect(stage("proposal")).toMatchObject({
+      executor: { kind: "agent", capability: "core/tune@1" },
+      evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["standard_receipt"] },
+      context: "fresh",
+      transitions: { success: { to: "citation_gate" }, no_change: { terminal: "no_change" } },
+    });
+    expect(stage("citation_gate")).toMatchObject({
+      executor: { kind: "supervisor", capability: "supervisor/citation-gate@1" },
+      evaluator: { kind: "citation", assurance: "executor_verified", required_artifacts: ["stage_result"] },
+      context: "none",
+      credentials: [],
+      transitions: {
+        success: { to: "differential_ratchet" },
+        semantic_repair_required: { terminal: "needs_human" },
+        failure: { terminal: "failed" },
+      },
+    });
+    expect(stage("differential_ratchet")).toMatchObject({
+      executor: { kind: "supervisor", capability: "supervisor/differential-ratchet@1" },
+      evaluator: { kind: "differential_ratchet", assurance: "executor_verified", required_artifacts: ["stage_result"] },
+      context: "none",
+      credentials: [],
+      transitions: {
+        success: { to: "structured_edit" },
+        semantic_repair_required: { terminal: "needs_human" },
+        failure: { terminal: "failed" },
+      },
+    });
+
+    expect(stage("structured_edit")).toMatchObject({
+      executor: { kind: "loop_action", capability: "graph/for-each-unit@1" },
+      evaluator: { kind: "semantic", assurance: "executor_verified", required_artifacts: ["execution_graph_result"] },
+      context: "none",
+      live_steering: false,
+      credentials: ["provider.read", "repo.read"],
+      produces: ["stage_result", "execution_graph_result"],
+      unitPhases: ["implement", "simplify", "command", "candidate", "lead", "integrate"],
+      unitCommandNames: ["test", "lint", "build"],
+      transitions: {
+        success: { to: "publish" },
+        no_change: { terminal: "no_change" },
+      },
+    });
+    expect(stage("structured_edit").unitPhaseBindings?.map((binding) => [binding.id, binding.kind]))
+      .toEqual([
+        ["implement", "agent"],
+        ["simplify", "agent"],
+        ["command", "command"],
+        ["candidate", "evidence"],
+        ["lead", "gate"],
+        ["integrate", "integrate"],
+      ]);
+    expect(stage("structured_edit").unitPhaseBindings?.[4]).toMatchObject({
+      worker: { id: "lead-worker", session_scope: "graph" },
+      context: "prefer_resume",
+      executor: { kind: "agent", capability: "accept-unit@1" },
+    });
+    expect(stage("publish")).toMatchObject({
+      executor: { kind: "agent", capability: "ce/publish@1" },
+      evaluator: { kind: "publish_subject", assurance: "semantic_attested", required_artifacts: ["publish_subject"] },
+      context: "prefer_resume",
+      credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+      transitions: { success: { to: "provider" }, no_change: { terminal: "no_change" } },
+    });
+    expect(stage("provider")).toMatchObject({
+      executor: { kind: "provider_wait", capability: "provider/wait@1" },
+      evaluator: { kind: "provider", assurance: "provider_verified", required_artifacts: ["provider_check"] },
+      context: "none",
+      credentials: ["provider.read"],
+      transitions: {
+        success: { terminal: "shipped" },
+        no_change: { terminal: "no_change" },
+        semantic_repair_required: { terminal: "needs_human" },
+        failure: { terminal: "failed" },
+      },
+    });
   });
 
   it("keeps multi-version and provider-neutral manifests in a test-only catalog", () => {

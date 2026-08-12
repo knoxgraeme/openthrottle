@@ -61,6 +61,8 @@ const STAGE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const CODEX_ITEM_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const GIT_OBJECT_ID = /^[a-f0-9]{40,64}$/;
+const SHA256 = /^[a-f0-9]{64}$/;
+const TUNE_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
 const AGENTS = new Set(["claude", "codex", "opencode"]);
 const ROLES = new Set(["worker", "lead", "reviewer", "publisher"]);
 const LOOPS = new Set(["implement", "simplify", "command", "repair", "lead", "review", "publish"]);
@@ -178,6 +180,45 @@ function boundedArray(value, label, max = 32) {
     throw new Error(`${label} must be a bounded unique string array`);
   }
   return [...value].sort();
+}
+
+function tuneMaterial(value, label) {
+  const input = record(value, label);
+  const allowed = new Set(["schema", "proposalDigest", "changes"]);
+  const unknown = Object.keys(input).find((key) => !allowed.has(key));
+  if (unknown || input.schema !== "openthrottle.tune-change-material/v1" ||
+      typeof input.proposalDigest !== "string" || !SHA256.test(input.proposalDigest) ||
+      !Array.isArray(input.changes) || input.changes.length < 1 || input.changes.length > 64) {
+    throw new Error(`${label} is invalid`);
+  }
+  let contentBytes = 0;
+  const paths = new Set();
+  const changes = input.changes.map((value, index) => {
+    const change = record(value, `${label}.changes[${index}]`);
+    const changeAllowed = new Set(["path", "operation", "before_digest", "after_digest", "after_content", "rationale"]);
+    if (Object.keys(change).some((key) => !changeAllowed.has(key)) ||
+        typeof change.path !== "string" || !TUNE_PATH.test(change.path) || paths.has(change.path) ||
+        !["add", "modify", "delete"].includes(change.operation) ||
+        (change.before_digest !== null && (typeof change.before_digest !== "string" || !SHA256.test(change.before_digest))) ||
+        (change.after_digest !== null && (typeof change.after_digest !== "string" || !SHA256.test(change.after_digest))) ||
+        (change.after_content !== null && (typeof change.after_content !== "string" || change.after_content.length < 1 ||
+          Buffer.byteLength(change.after_content, "utf8") > 128 * 1024)) ||
+        typeof change.rationale !== "string" || change.rationale.length < 1 || change.rationale.length > 1_000 ||
+        (change.operation === "add" && (change.before_digest !== null || change.after_digest === null || change.after_content === null)) ||
+        (change.operation === "modify" && (change.before_digest === null || change.after_digest === null || change.after_content === null)) ||
+        (change.operation === "delete" && (change.before_digest === null || change.after_digest !== null || change.after_content !== null)) ||
+        (change.after_content !== null && digest(change.after_content) !== change.after_digest)) {
+      throw new Error(`${label}.changes[${index}] is invalid`);
+    }
+    paths.add(change.path);
+    contentBytes += change.after_content === null ? 0 : Buffer.byteLength(change.after_content, "utf8");
+    return change;
+  });
+  if (contentBytes > 192 * 1024) throw new Error(`${label} content exceeds the bounded change set`);
+  if (Buffer.byteLength(canonicalJson(changes), "utf8") > 160 * 1024) {
+    throw new Error(`${label} canonical JSON exceeds the bounded request material`);
+  }
+  return { schema: input.schema, proposalDigest: input.proposalDigest, changes };
 }
 
 function expectedProducer(value, label) {
@@ -496,7 +537,7 @@ export function validateLoopRequest(value) {
     "protocol", "actionId", "attemptId", "graphId", "pipelineInstanceId", "graphDigest", "parentRunId",
     "unitId", "generation", "role", "loop", "agent", "model", "skill", "worktree", "baseSubject", "recoveryBaseSubject", "inputSubject",
     "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
-    "transitionContext", "priorEvidence", "downstreamContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
+    "transitionContext", "tuneMaterial", "priorEvidence", "downstreamContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
     "expectedProducerSkill", "expectedProducer", "repositorySkill", "requestHash", "idempotencyKey",
   ]);
   const unknown = Object.keys(input).find((key) => !allowed.has(key));
@@ -537,6 +578,7 @@ export function validateLoopRequest(value) {
     contextPolicy: string(input.contextPolicy, "contextPolicy"),
     timeoutMs: input.timeoutMs,
     transitionContext: boundedText(input.transitionContext, "transitionContext", 262_144),
+    ...(input.tuneMaterial === undefined ? {} : { tuneMaterial: tuneMaterial(input.tuneMaterial, "tuneMaterial") }),
     ...(input.priorEvidence === undefined ? {} : { priorEvidence: priorEvidence(input.priorEvidence, "priorEvidence") }),
     ...(input.downstreamContext === undefined ? {} : { downstreamContext: downstreamContext(input.downstreamContext, "downstreamContext") }),
     allowedMcpServers: boundedArray(input.allowedMcpServers, "allowedMcpServers"),
@@ -551,6 +593,10 @@ export function validateLoopRequest(value) {
   if (!ROLES.has(request.role)) throw new Error("role is invalid");
   if (!LOOPS.has(request.loop)) throw new Error("loop is invalid");
   if (!AGENTS.has(request.agent)) throw new Error("agent is invalid");
+  if (request.tuneMaterial && (request.role !== "worker" || request.worktree === null ||
+      !["implement", "simplify", "repair"].includes(request.loop))) {
+    throw new Error("tune material is allowed only for a worktree-owning worker action");
+  }
   const unknownScope = request.credentialScopes.find((scope) => !LOGICAL_CREDENTIAL_SCOPES.has(scope));
   if (unknownScope) throw new Error(`credential scope ${unknownScope} is not a recognized logical credential`);
   if (request.role !== "publisher" && request.credentialScopes.includes("repo.write")) {
@@ -672,11 +718,14 @@ export function loopPrompt(request) {
   const contract = canonicalJson(contractPayload);
   const priorEvidence = canonicalJson(request.priorEvidence ?? { schema: PRIOR_EVIDENCE_SCHEMA, role: null, receipts: [] });
   const downstreamContext = canonicalJson(request.downstreamContext ?? []);
+  const tuneMaterialContract = request.tuneMaterial
+    ? `## Tune Change Material Contract\n${canonicalJson(request.tuneMaterial)}\n\n`
+    : "";
   return `${entry}\n\n` +
     `This is one fenced OpenThrottle loop action (${request.actionId}) for ${request.role}/${request.loop}. ` +
     `Edit only the provided worktree when one is present. Do not commit, push, or alter executor state. ` +
     `Return one receipt matching ${request.receiptSchema} and the authority contract below.\n\n` +
-    `## Receipt Authority Contract\n${contract}\n\n${request.transitionContext}\n\n` +
+    `## Receipt Authority Contract\n${contract}\n\n${tuneMaterialContract}${request.transitionContext}\n\n` +
     `## Prior Evidence\n${priorEvidence}\n\n` +
     `## Downstream Context\n${downstreamContext}`;
 }
