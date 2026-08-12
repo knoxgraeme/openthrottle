@@ -7,6 +7,7 @@ interface DatabaseMigrationDefinition {
   version: number;
   name: string;
   source: string;
+  mode?: "foreign-keys-off";
   up(db: Database.Database): void;
 }
 
@@ -2011,6 +2012,98 @@ ALTER TABLE pipeline_gate_receipts_tune_next RENAME TO pipeline_gate_receipts;
 const tuneGateReceiptVocabularyMigrationSource = `${tuneGateReceiptVocabularySchema}
 tune-gate-contract:standard_receipt artifacts and citation/differential_ratchet gate receipts persist before isolated edit/v1`;
 
+const tuneTaskTypeSchema = `
+CREATE TABLE pipeline_instances_tune_next (
+  id TEXT PRIMARY KEY,
+  ticket_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK(generation >= 1),
+  pipeline_id TEXT NOT NULL,
+  pipeline_version INTEGER NOT NULL,
+  manifest_digest TEXT NOT NULL,
+  normalized_manifest TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  base_commit TEXT NOT NULL,
+  repository_config_snapshot_id TEXT NOT NULL,
+  repository_config_digest TEXT NOT NULL,
+  runtime_release TEXT NOT NULL,
+  capability_digest TEXT NOT NULL,
+  executor_protocol TEXT NOT NULL,
+  authorized_capabilities TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN (
+    'pending', 'dispatchable', 'running', 'waiting_provider', 'waiting_human',
+    'completion_pending_publication', 'shipped', 'no_change', 'needs_human',
+    'canceled', 'superseded', 'failed', 'publication_blocked'
+  )),
+  active_stage_id TEXT,
+  wait_reason TEXT,
+  state_version INTEGER NOT NULL DEFAULT 0 CHECK(state_version >= 0),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+  reentry_count INTEGER NOT NULL DEFAULT 0 CHECK(reentry_count >= 0),
+  immutable_subject TEXT,
+  terminal_outcome TEXT CHECK(terminal_outcome IS NULL OR terminal_outcome IN (
+    'shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed'
+  )),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  branch TEXT,
+  agent TEXT,
+  task_type TEXT NOT NULL DEFAULT 'implement' CHECK(task_type IN ('implement', 'investigate', 'tune')),
+  base_branch TEXT NOT NULL DEFAULT 'main',
+  published_commit TEXT,
+  runtime_provider TEXT,
+  runtime_provider_resource_id TEXT,
+  runtime_resource_status TEXT CHECK(runtime_resource_status IS NULL OR runtime_resource_status IN ('active', 'stopped', 'quarantined', 'cleaned')),
+  runtime_resource_created_at TEXT,
+  runtime_resource_updated_at TEXT,
+  published_subject TEXT,
+  FOREIGN KEY(ticket_id) REFERENCES tickets(ticket_id) ON DELETE RESTRICT,
+  FOREIGN KEY(session_id) REFERENCES agent_sessions(id) ON DELETE RESTRICT,
+  FOREIGN KEY(session_id, ticket_id, generation)
+    REFERENCES agent_sessions(id, ticket_id, generation) ON DELETE RESTRICT,
+  FOREIGN KEY(pipeline_id, pipeline_version, manifest_digest)
+    REFERENCES pipeline_catalog_entries(pipeline_id, version, digest) ON DELETE RESTRICT,
+  FOREIGN KEY(repository_config_snapshot_id, repository, base_commit, repository_config_digest)
+    REFERENCES repository_config_snapshots(id, repository, base_commit, digest) ON DELETE RESTRICT,
+  FOREIGN KEY(runtime_release, capability_digest)
+    REFERENCES runtime_capability_descriptors(runtime_release, digest) ON DELETE RESTRICT,
+  UNIQUE(session_id, generation),
+  UNIQUE(id, generation),
+  UNIQUE(id, session_id, ticket_id, generation)
+);
+INSERT INTO pipeline_instances_tune_next (
+  id, ticket_id, session_id, generation, pipeline_id, pipeline_version,
+  manifest_digest, normalized_manifest, repository, base_commit,
+  repository_config_snapshot_id, repository_config_digest, runtime_release,
+  capability_digest, executor_protocol, authorized_capabilities, status,
+  active_stage_id, wait_reason, state_version, attempt_count, reentry_count,
+  immutable_subject, terminal_outcome, created_at, updated_at, branch, agent,
+  task_type, base_branch, published_commit, runtime_provider,
+  runtime_provider_resource_id, runtime_resource_status,
+  runtime_resource_created_at, runtime_resource_updated_at, published_subject
+)
+SELECT
+  id, ticket_id, session_id, generation, pipeline_id, pipeline_version,
+  manifest_digest, normalized_manifest, repository, base_commit,
+  repository_config_snapshot_id, repository_config_digest, runtime_release,
+  capability_digest, executor_protocol, authorized_capabilities, status,
+  active_stage_id, wait_reason, state_version, attempt_count, reentry_count,
+  immutable_subject, terminal_outcome, created_at, updated_at, branch, agent,
+  task_type, base_branch, published_commit, runtime_provider,
+  runtime_provider_resource_id, runtime_resource_status,
+  runtime_resource_created_at, runtime_resource_updated_at, published_subject
+FROM pipeline_instances;
+DROP TABLE pipeline_instances;
+ALTER TABLE pipeline_instances_tune_next RENAME TO pipeline_instances;
+CREATE INDEX pipeline_instances_status_idx ON pipeline_instances(status, updated_at);
+CREATE UNIQUE INDEX pipeline_instances_runtime_resource_unique
+  ON pipeline_instances(runtime_provider_resource_id) WHERE runtime_provider_resource_id IS NOT NULL;
+`;
+
+const tuneTaskTypeMigrationSource = `${tuneTaskTypeSchema}
+pipeline-task-type-contract:tune is a first-class persisted execution intent without weakening unknown-value rejection/v1
+migration-mode:foreign keys are disabled before the exclusive transaction and verified before its ledger commit/v1`;
+
 const reviewSubactionDispatchSchema = `
 CREATE TABLE execution_review_subaction_dispatches (
   parent_action_id TEXT NOT NULL,
@@ -3289,6 +3382,22 @@ const definitions: DatabaseMigrationDefinition[] = [
       ) {
         db.exec(tuneGateReceiptVocabularySchema);
       }
+    },
+  },
+  {
+    version: 43,
+    name: "tune-task-type",
+    source: tuneTaskTypeMigrationSource,
+    mode: "foreign-keys-off",
+    up(db) {
+      const table = db.prepare(`
+        SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_instances'
+      `).get() as { sql: string } | undefined;
+      if (
+        table &&
+        hasColumns(db, "pipeline_instances", ["ticket_id", "session_id", "task_type", "published_subject"]) &&
+        !table.sql.includes("'tune'")
+      ) db.exec(tuneTaskTypeSchema);
     },
   },
 ];

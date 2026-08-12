@@ -501,12 +501,35 @@ function compareAttemptOrder(left: ExecutionWorkAttempt, right: ExecutionWorkAtt
     left.id.localeCompare(right.id);
 }
 
+function requestContextForStructuredPlan(payload: {
+  taskContext?: unknown;
+  inputArtifacts?: unknown;
+}): string {
+  if (Array.isArray(payload.inputArtifacts)) {
+    for (const entry of payload.inputArtifacts) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const artifact = entry as { payload?: unknown };
+      if (typeof artifact.payload !== "string") continue;
+      try {
+        const parsed = JSON.parse(artifact.payload) as { details?: { execution_plan?: unknown } };
+        const executionPlan = parsed.details?.execution_plan;
+        if (executionPlan !== undefined) {
+          return `\`\`\`json ${EXECUTION_PLAN_SCHEMA}\n${JSON.stringify(executionPlan)}\n\`\`\``;
+        }
+      } catch {
+        // The stage gate validates artifact JSON. Ignore unrelated artifacts.
+      }
+    }
+  }
+  return typeof payload.taskContext === "string" ? payload.taskContext : "";
+}
+
 function parentTaskContextFor(store: PipelineStore, parentAttemptId: string): string {
   if (typeof (store as { getAttempt?: unknown }).getAttempt !== "function") return "";
   const attempt = store.getAttempt(parentAttemptId);
   if (!attempt?.request_payload) return "";
-  const payload = JSON.parse(attempt.request_payload) as { taskContext?: unknown };
-  return typeof payload.taskContext === "string" ? payload.taskContext : "";
+  const payload = JSON.parse(attempt.request_payload) as { taskContext?: unknown; inputArtifacts?: unknown };
+  return requestContextForStructuredPlan(payload);
 }
 
 function assertLoopRequestEnvelopeBound(request: LoopActionRequest): void {
@@ -2452,7 +2475,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (!stage || stage.executor.capability !== FOR_EACH_UNIT_CAPABILITY) {
         throw new Error(`pipeline composite stage ${request.stageId} is not active`);
       }
-      const plan = extractExecutionPlan(request.taskContext);
+      const plan = extractExecutionPlan(requestContextForStructuredPlan(request));
       const commandPlan = commandPlanForUnits({
         plan,
         fallbackCommandNames: stage.unitCommandNames ?? [],

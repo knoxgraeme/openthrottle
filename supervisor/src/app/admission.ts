@@ -583,7 +583,12 @@ export async function handleCreated(
     }
     selectedRepository.baseBranch = requestedBase;
   }
-  const taskType: TaskType = routingLabels.includes("investigate") ? "investigate" : "implement";
+  const normalizedRoutingLabels = new Set(routingLabels.map((label) => label.trim().toLowerCase()));
+  const taskType: TaskType = normalizedRoutingLabels.has("tune")
+    ? "tune"
+    : normalizedRoutingLabels.has("investigate")
+      ? "investigate"
+      : "implement";
   const ticketCore = {
     ticket_id: ticketId,
     ticket_reference: issue.identifier,

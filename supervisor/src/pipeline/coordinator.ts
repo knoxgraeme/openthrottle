@@ -401,6 +401,20 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
   if (!input.attempt.request_payload) throw new Error(`pipeline attempt ${input.attempt.id} has no sealed request`);
   const priorRequest = JSON.parse(input.attempt.request_payload) as { taskContext?: unknown };
   const taskContext = typeof priorRequest.taskContext === "string" ? priorRequest.taskContext : "";
+  // Tune stages pass only the immediately preceding, already gate-validated
+  // artifacts through the next sealed request. This is the deterministic data
+  // channel between isolated sessions; native-session memory and ticket prose
+  // are never authority for a tune proposal or mutation.
+  const inputArtifacts = input.instance.task_type === "tune"
+    ? (input.event.artifacts ?? []).map((artifact) => ({
+      kind: artifact.kind as import("./manifest.js").ArtifactKind,
+      schemaVersion: artifact.schemaVersion,
+      assurance: artifact.assurance,
+      subject: artifact.subject ?? null,
+      payload: artifact.payload,
+      hash: artifact.hash,
+    })).sort((left, right) => left.kind.localeCompare(right.kind))
+    : undefined;
   const request = buildStageRequest({
     instanceId: input.instance.id,
     manifestDigest: input.instance.manifest_digest,
@@ -416,6 +430,7 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     taskType: input.instance.task_type,
     taskContext,
     transitionContext: transitionContext(input.event, input.attempt.stage_id),
+    inputArtifacts,
     repository: input.instance.repository,
     baseCommit: input.instance.base_commit,
     baseBranch: input.instance.base_branch,

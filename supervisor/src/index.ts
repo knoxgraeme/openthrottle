@@ -95,6 +95,7 @@ async function main() {
     runtime,
     taskTimeoutSeconds: cfg.taskTimeout,
     runtimeResourceRetentionMinutes: cfg.runtimeResourceRetentionMinutes,
+    citationGateStore,
     reconcileRuntimeResources,
     captureCodexAuth: (blob) => {
       captureCodexAuthJson(store, blob);

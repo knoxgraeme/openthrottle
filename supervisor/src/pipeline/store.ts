@@ -48,7 +48,7 @@ export interface PipelineInstance {
   base_branch: string;
   branch: string;
   agent: "claude" | "codex" | "opencode";
-  task_type: "implement" | "investigate";
+  task_type: "implement" | "investigate" | "tune";
   published_commit: string | null;
   published_subject: string | null;
   repository_config_snapshot_id: string;
@@ -276,7 +276,7 @@ export interface PipelineStatusProjection {
   pipeline_id: string;
   pipeline_version: number;
   generation: number;
-  task_type: "implement" | "investigate";
+  task_type: "implement" | "investigate" | "tune";
   status: PipelineInstanceStatus;
   terminal_outcome: PipelineInstance["terminal_outcome"];
   stage_id: string | null;
@@ -327,7 +327,7 @@ export interface PipelineInstanceSeed {
   baseBranch?: string;
   branch: string;
   agent: "claude" | "codex" | "opencode";
-  taskType: "implement" | "investigate";
+  taskType: "implement" | "investigate" | "tune";
   manifest: ValidatedPipelineManifest;
   repositoryConfig: RepositoryConfigSnapshot;
   runtime: ValidatedRuntimeCapabilityDescriptor;

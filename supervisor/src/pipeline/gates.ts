@@ -441,22 +441,24 @@ function commandDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutc
   });
 }
 
-function standardReceiptDetails(payloads: TypedArtifactPayload[]): Record<string, unknown> {
-  const standardReceipt = payloads.find((payload) => payload.kind === "standard_receipt");
-  if (!standardReceipt) throw new Error("supervisor evaluator is missing standard_receipt");
-  return standardReceipt.details;
+function evaluatorDetails(stage: PipelineStage, payloads: TypedArtifactPayload[]): Record<string, unknown> {
+  const evidence = payloads.find((payload) =>
+    payload.kind === (stage.executor.kind === "supervisor" ? "stage_result" : "standard_receipt")
+  );
+  if (!evidence) throw new Error("supervisor evaluator is missing its authoritative artifact");
+  return evidence.details;
 }
 
-function citationDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: StageGateReason } {
-  const details = standardReceiptDetails(payloads);
+function citationDecision(stage: PipelineStage, payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: StageGateReason } {
+  const details = evaluatorDetails(stage, payloads);
   const decision = validateCitationGateDecision(details.citation_gate);
   return decision.result === "passed" && decision.outcome === "success"
     ? { outcome: "success", result: "passed", reason: "citation_gate_passed" }
     : { outcome: "failure", result: "failed", reason: "citation_gate_failed" };
 }
 
-function differentialRatchetDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: StageGateReason } {
-  const details = standardReceiptDetails(payloads);
+function differentialRatchetDecision(stage: PipelineStage, payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: StageGateReason } {
+  const details = evaluatorDetails(stage, payloads);
   const evaluation = evaluateImprovementProposalGate({
     citationGate: details.citation_gate,
     ratchetInput: details.ratchet_input,
@@ -477,8 +479,8 @@ function stageDecision(
   payloads: TypedArtifactPayload[]
 ): { outcome: StageOutcome; result: GateResult; reason: StageGateReason } {
   if (stage.evaluator.kind === "command") return commandDecision(payloads);
-  if (stage.evaluator.kind === "citation") return citationDecision(payloads);
-  if (stage.evaluator.kind === "differential_ratchet") return differentialRatchetDecision(payloads);
+  if (stage.evaluator.kind === "citation") return citationDecision(stage, payloads);
+  if (stage.evaluator.kind === "differential_ratchet") return differentialRatchetDecision(stage, payloads);
   return semanticDecision(payloads);
 }
 

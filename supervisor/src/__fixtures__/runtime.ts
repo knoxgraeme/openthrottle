@@ -54,6 +54,8 @@ export function buildInstalledRuntimeDescriptor(
       "graph/for-each-unit@1",
       "loop-action@2",
       "provider/wait@1",
+      "supervisor/citation-gate@1",
+      "supervisor/differential-ratchet@1",
     ]),
     executors: sortedUnique(overrides.executors ?? EXECUTOR_KINDS) as ExecutorKind[],
     evaluators: sortedUnique(overrides.evaluators ?? EVALUATOR_KINDS) as EvaluatorKind[],

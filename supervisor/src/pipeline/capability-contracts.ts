@@ -104,9 +104,21 @@ const CAPABILITY_CREDENTIALS: Readonly<Record<string, CapabilityCredentialContra
   },
   "core/tune@1": {
     minimum: ["model.invoke", "provider.read", "repo.read"],
-    allowed: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+    allowed: ["model.invoke", "provider.read", "repo.read"],
     contexts: ["fresh", "resume_required", "prefer_resume"],
     artifacts: ["stage_result", "standard_receipt"],
+  },
+  "supervisor/citation-gate@1": {
+    minimum: [],
+    allowed: [],
+    contexts: ["none"],
+    artifacts: ["stage_result"],
+  },
+  "supervisor/differential-ratchet@1": {
+    minimum: [],
+    allowed: [],
+    contexts: ["none"],
+    artifacts: ["stage_result"],
   },
   "accept-unit@1": {
     minimum: ["model.invoke", "repo.read"],
