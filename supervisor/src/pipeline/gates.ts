@@ -8,11 +8,13 @@ import {
   type PipelineStage,
   type StageOutcome,
 } from "./manifest.js";
+import { validateCitationGateDecision } from "./citation-gate.js";
 import {
   coordinatePipelineEvent,
   type PipelineCoordinatorEvent,
   type PipelineEventArtifact,
 } from "./coordinator.js";
+import { evaluateImprovementProposalGate } from "./improvement-proposal-gate.js";
 import type {
   CoordinatorGateReceiptWrite,
   PipelineInstance,
@@ -63,6 +65,12 @@ export const GATE_RECEIPT_REASONS = Object.freeze([
   "integration_evidence_failed",
 ] as const);
 export type GateReceiptReason = (typeof GATE_RECEIPT_REASONS)[number];
+type StageGateReason =
+  | GateReceiptReason
+  | "citation_gate_passed"
+  | "citation_gate_failed"
+  | "differential_ratchet_passed"
+  | "differential_ratchet_failed";
 
 function providerRevisionFromPayload(payload: Record<string, unknown>): string | undefined {
   const revision = payload.expected_published_commit ?? payload.head_sha;
@@ -433,6 +441,47 @@ function commandDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutc
   });
 }
 
+function standardReceiptDetails(payloads: TypedArtifactPayload[]): Record<string, unknown> {
+  const standardReceipt = payloads.find((payload) => payload.kind === "standard_receipt");
+  if (!standardReceipt) throw new Error("supervisor evaluator is missing standard_receipt");
+  return standardReceipt.details;
+}
+
+function citationDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: StageGateReason } {
+  const details = standardReceiptDetails(payloads);
+  const decision = validateCitationGateDecision(details.citation_gate);
+  return decision.result === "passed" && decision.outcome === "success"
+    ? { outcome: "success", result: "passed", reason: "citation_gate_passed" }
+    : { outcome: "failure", result: "failed", reason: "citation_gate_failed" };
+}
+
+function differentialRatchetDecision(payloads: TypedArtifactPayload[]): { outcome: StageOutcome; result: GateResult; reason: StageGateReason } {
+  const details = standardReceiptDetails(payloads);
+  const evaluation = evaluateImprovementProposalGate({
+    citationGate: details.citation_gate,
+    ratchetInput: details.ratchet_input,
+  }, {
+    citationReceipts: {
+      getCitationGateReceipt() {
+        return details.citation_receipt;
+      },
+    },
+  });
+  return evaluation.accepted
+    ? { outcome: "success", result: "passed", reason: "differential_ratchet_passed" }
+    : { outcome: "failure", result: "failed", reason: "differential_ratchet_failed" };
+}
+
+function stageDecision(
+  stage: PipelineStage,
+  payloads: TypedArtifactPayload[]
+): { outcome: StageOutcome; result: GateResult; reason: StageGateReason } {
+  if (stage.evaluator.kind === "command") return commandDecision(payloads);
+  if (stage.evaluator.kind === "citation") return citationDecision(payloads);
+  if (stage.evaluator.kind === "differential_ratchet") return differentialRatchetDecision(payloads);
+  return semanticDecision(payloads);
+}
+
 export function evaluateStageGate(
   store: PipelineStore,
   event: PipelineCoordinatorEvent,
@@ -481,9 +530,7 @@ export function evaluateStageGate(
   if (payloads.some((payload) => payload.result !== stageResult.result)) {
     throw new Error("stage artifacts disagree on their proposed result");
   }
-  const decision = stage.evaluator.kind === "command"
-    ? commandDecision(payloads)
-    : semanticDecision(payloads);
+  const decision = stageDecision(stage, payloads);
   let providerRevision: string | undefined;
   if (stage.evaluator.kind === "publish_subject" && decision.outcome === "success") {
     const revision = payloads.find((payload) => payload.kind === "publish_subject")?.details.published_commit;

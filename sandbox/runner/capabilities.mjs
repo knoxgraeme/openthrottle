@@ -99,7 +99,7 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
   },
   "core/tune@1": {
     kind: "agent",
-    minimumCredentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+    minimumCredentials: ["model.invoke", "provider.read", "repo.read"],
     allowedCredentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
     contexts: ["fresh", "resume_required", "prefer_resume"],
     artifacts: ["stage_result", "standard_receipt"],
@@ -134,7 +134,7 @@ export const RUNTIME_DESCRIPTOR = Object.freeze({
   protocol: STAGE_EXECUTOR_PROTOCOL,
   capabilities: Object.keys(CAPABILITY_CONTRACTS).sort(),
   executors: ["agent", "command", "loop_action", "provider_wait"],
-  evaluators: ["command", "human", "provider", "publish_subject", "semantic"],
+  evaluators: ["citation", "command", "differential_ratchet", "human", "provider", "publish_subject", "semantic"],
   artifacts: ["candidate_evidence", "command_result", "execution_graph_result", "human_approval", "integration_evidence", "provider_check", "publish_subject", "review", "stage_result", "standard_receipt"],
   contextPolicies: ["fresh", "none", "prefer_resume", "resume_required"],
   credentialScopes: ["mcp", "model.invoke", "provider.read", "repo.read", "repo.write"],

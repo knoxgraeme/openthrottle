@@ -1,0 +1,144 @@
+schema: openthrottle.pipeline/v1
+id: core/tune
+version: 1
+description: Immutable self-tuning pipeline with read-only corpus analysis and proposal generation, supervisor citation and differential-ratchet gates, fresh isolated mutation, command gates, semantic review and repair, exact-subject publication, provider verification, and mandatory human merge.
+entry_stage: analysis
+max_attempts: 200
+max_repair_rounds: 5
+requires:
+  protocol: stage-executor@1
+  capabilities:
+    - core/tune@1
+    - ce/implement@1
+    - ce/review@1
+    - ce/publish@1
+    - command/run@1
+    - provider/wait@1
+defaults:
+  transitions:
+    retryable_infrastructure_failure: { to: analysis, max_reentries: 2, on_exhausted: failed }
+    semantic_repair_required: { terminal: needs_human }
+    needs_human: { terminal: needs_human }
+    canceled: { terminal: canceled }
+    superseded: { terminal: superseded }
+    failure: { terminal: failed }
+stages:
+  - id: analysis
+    executor: { kind: agent, capability: core/tune@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [standard_receipt] }
+    context: fresh
+    live_steering: false
+    credentials: [model.invoke, provider.read, repo.read]
+    produces: [stage_result, standard_receipt]
+    transitions:
+      success: { to: proposal }
+      no_change: { terminal: no_change }
+  - id: proposal
+    executor: { kind: agent, capability: core/tune@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [standard_receipt] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, provider.read, repo.read]
+    produces: [stage_result, standard_receipt]
+    transitions:
+      success: { to: citation_gate }
+      no_change: { terminal: no_change }
+  - id: citation_gate
+    executor: { kind: agent, capability: core/tune@1 }
+    evaluator: { kind: citation, assurance: semantic_attested, required_artifacts: [standard_receipt] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, provider.read, repo.read]
+    produces: [stage_result, standard_receipt]
+    transitions:
+      success: { to: differential_ratchet }
+      no_change: { terminal: no_change }
+  - id: differential_ratchet
+    executor: { kind: agent, capability: core/tune@1 }
+    evaluator: { kind: differential_ratchet, assurance: semantic_attested, required_artifacts: [standard_receipt] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, provider.read, repo.read]
+    produces: [stage_result, standard_receipt]
+    transitions:
+      success: { to: isolated_edit }
+      no_change: { terminal: no_change }
+  - id: isolated_edit
+    executor: { kind: agent, capability: ce/implement@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result] }
+    context: fresh
+    live_steering: true
+    credentials: [model.invoke, provider.read, repo.read, repo.write]
+    produces: [stage_result]
+    retry: { max_reentries: 3, on_exhausted: failed }
+    transitions:
+      success: { to: test }
+      no_change: { terminal: no_change }
+      semantic_repair_required: { to: isolated_edit, max_reentries: 5, on_exhausted: needs_human }
+  - id: repair_edit
+    executor: { kind: agent, capability: ce/implement@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result] }
+    context: resume_required
+    live_steering: true
+    credentials: [model.invoke, provider.read, repo.read, repo.write]
+    produces: [stage_result]
+    retry: { max_reentries: 3, on_exhausted: failed }
+    transitions:
+      success: { to: test }
+      no_change: { to: test }
+      semantic_repair_required: { to: repair_edit, max_reentries: 5, on_exhausted: needs_human }
+  - id: test
+    executor: { kind: command, capability: command/run@1 }
+    commandName: test
+    evaluator: { kind: command, assurance: executor_verified, required_artifacts: [command_result] }
+    context: none
+    live_steering: false
+    credentials: [repo.read]
+    produces: [stage_result, command_result]
+    transitions:
+      success: { to: build }
+      no_change: { to: build }
+      failure: { to: repair_edit, max_reentries: 5, on_exhausted: needs_human }
+  - id: build
+    executor: { kind: command, capability: command/run@1 }
+    commandName: build
+    evaluator: { kind: command, assurance: executor_verified, required_artifacts: [command_result] }
+    context: none
+    live_steering: false
+    credentials: [repo.read]
+    produces: [stage_result, command_result]
+    transitions:
+      success: { to: semantic_review }
+      no_change: { to: semantic_review }
+      failure: { to: repair_edit, max_reentries: 5, on_exhausted: needs_human }
+  - id: semantic_review
+    executor: { kind: agent, capability: ce/review@1 }
+    evaluator: { kind: semantic, assurance: semantic_attested, required_artifacts: [stage_result, review] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, repo.read, repo.write]
+    produces: [stage_result, review]
+    transitions:
+      success: { to: publish }
+      no_change: { to: publish }
+      semantic_repair_required: { to: repair_edit, max_reentries: 5, on_exhausted: needs_human }
+  - id: publish
+    executor: { kind: agent, capability: ce/publish@1 }
+    evaluator: { kind: publish_subject, assurance: semantic_attested, required_artifacts: [publish_subject] }
+    context: resume_required
+    live_steering: false
+    credentials: [model.invoke, provider.read, repo.read, repo.write]
+    produces: [stage_result, publish_subject]
+    transitions:
+      success: { to: provider }
+      no_change: { terminal: no_change }
+  - id: provider
+    executor: { kind: provider_wait, capability: provider/wait@1 }
+    evaluator: { kind: provider, assurance: provider_verified, required_artifacts: [provider_check] }
+    context: none
+    live_steering: false
+    credentials: [provider.read]
+    produces: [stage_result, provider_check]
+    transitions:
+      success: { terminal: shipped }
+      no_change: { terminal: no_change }

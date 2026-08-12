@@ -50,6 +50,7 @@ export function buildInstalledRuntimeDescriptor(
       "ce/review@1",
       "ce/simplify@1",
       "command/run@1",
+      "core/tune@1",
       "graph/for-each-unit@1",
       "loop-action@2",
       "provider/wait@1",

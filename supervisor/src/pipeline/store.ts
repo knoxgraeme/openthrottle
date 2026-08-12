@@ -1,5 +1,6 @@
 import type {
   AssuranceClass,
+  EvaluatorKind,
   PipelineOutcome,
   StageOutcome,
   ValidatedPipelineCatalog,
@@ -353,7 +354,7 @@ export interface CoordinatorEffectWrite {
 
 export interface CoordinatorGateReceiptWrite {
   id?: string;
-  evaluatorKind: "semantic" | "command" | "provider" | "human" | "publish_subject";
+  evaluatorKind: EvaluatorKind;
   policyDigest: string;
   subject?: string | null;
   result: "passed" | "failed" | "indeterminate" | "not_configured";

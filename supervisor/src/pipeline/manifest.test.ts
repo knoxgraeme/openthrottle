@@ -166,10 +166,14 @@ describe("pipeline manifest validation", () => {
     expect([...first.manifests.keys()]).toEqual([
       "core/implement@4",
       "core/investigate@1",
+      "core/tune@1",
     ]);
     const implementManifest = resolvePipelineReference(first, "implement").manifest;
     expect(implementManifest.id).toBe("core/implement");
     expect(implementManifest.version).toBe(4);
+    const tuneManifest = resolvePipelineReference(first, "tune").manifest;
+    expect(tuneManifest.id).toBe("core/tune");
+    expect(tuneManifest.version).toBe(1);
     expect(() => resolvePipelineReference(first, "core/implement@3"))
       .toThrow(/unknown pipeline selection/);
     expect(() => resolvePipelineReference(first, "core/implement@1"))

@@ -68,6 +68,8 @@ export type CommandName = string;
 export const EVALUATOR_KINDS = [
   "semantic",
   "command",
+  "citation",
+  "differential_ratchet",
   "provider",
   "human",
   "publish_subject",

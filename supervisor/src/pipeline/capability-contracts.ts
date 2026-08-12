@@ -10,6 +10,7 @@ export const ORDINARY_STAGE_BUILTIN_CAPABILITIES = [
   "ce/investigate@1",
   "ce/review@1",
   "ce/simplify@1",
+  "core/tune@1",
 ] as const;
 export const ORDINARY_STAGE_INPUT_SCOPE: Readonly<Partial<Record<string, "graph" | "diff">>> = {
   "agent/semantic@1": "graph",
@@ -100,6 +101,12 @@ const CAPABILITY_CREDENTIALS: Readonly<Record<string, CapabilityCredentialContra
     allowed: ["model.invoke", "repo.read", "repo.write"],
     contexts: ["resume_required", "prefer_resume"],
     artifacts: ["stage_result"],
+  },
+  "core/tune@1": {
+    minimum: ["model.invoke", "provider.read", "repo.read"],
+    allowed: ["model.invoke", "provider.read", "repo.read", "repo.write"],
+    contexts: ["fresh", "resume_required", "prefer_resume"],
+    artifacts: ["stage_result", "standard_receipt"],
   },
   "accept-unit@1": {
     minimum: ["model.invoke", "repo.read"],

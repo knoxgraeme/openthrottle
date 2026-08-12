@@ -2,10 +2,14 @@ schema: openthrottle.catalog/v1
 manifests:
   - core-implement-v4.yaml
   - core-investigate-v1.yaml
+  - core-tune-v1.yaml
 aliases:
   implement:
     id: core/implement
     version: 4
   investigate:
     id: core/investigate
+    version: 1
+  tune:
+    id: core/tune
     version: 1

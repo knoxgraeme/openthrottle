@@ -2,8 +2,10 @@ import Database from "better-sqlite3";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
+import type { RatchetDifferentialInput } from "@openthrottle/contracts";
 import { openDb } from "../persistence/database.js";
 import { drainDeferredProviderEvidence, evaluateStageGate, processProviderEvidence } from "./gates.js";
+import { evaluateCitationGate, type CitationGateDecision } from "./citation-gate.js";
 import {
   canonicalJson,
   digestNormalized,
@@ -40,6 +42,7 @@ const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml",
 const runtime = buildInstalledRuntimeDescriptor("gate-test/v1");
 const SUBJECT = "c".repeat(40);
 const PUBLISHED_COMMIT = "9".repeat(40);
+const TUNE_PROPOSAL_HASH = "d".repeat(64);
 const CODEX_CONNECTOR_LOGIN = "chatgpt-codex-connector[bot]";
 const CODEX_CONNECTOR_SETUP_REQUIRED_NOTICE =
   "To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).";
@@ -223,6 +226,120 @@ describe("deterministic supervisor stage gates", () => {
     fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
     fixture.tickets.setSetting("github-head-source:issue-1", "authoritative");
     fixture.tickets.setSetting("github-head-observed-at:issue-1", "2025-01-01T00:00:00.000Z");
+  }
+
+  function moveFixtureToStage(fixture: Fixture, stageId: string): Fixture {
+    const stage = fixture.manifest.stages.find((candidate) => candidate.id === stageId)!;
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = ?, native_context_policy = ?, expected_subject = ?
+      WHERE id = ?
+    `).run(stage.id, stage.context, fixture.instance.base_commit, fixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instance_stages SET status = 'waiting'
+      WHERE pipeline_instance_id = ? AND stage_id = ?
+    `).run(fixture.instance.id, stage.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET active_stage_id = ?
+      WHERE id = ?
+    `).run(stage.id, fixture.instance.id);
+    return {
+      ...fixture,
+      stage,
+      attempt: fixture.pipelines.getAttempt(fixture.attempt.id)!,
+      instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+    };
+  }
+
+  function tuneCitationDecision(passed = true): CitationGateDecision {
+    const run = {
+      pipeline_instance_id: "instance-1",
+      generation: 1,
+      execution_graph_id: "structured",
+      outcome: "failed" as const,
+      closed_reason: "failure" as const,
+      fault_attribution: "agent" as const,
+      created_at: "2026-08-08T00:00:00.000Z",
+    };
+    return evaluateCitationGate({
+      proposalHash: TUNE_PROPOSAL_HASH,
+      proposal: {
+        schema: "openthrottle.citation-contract/v1",
+        id: "proposal_one",
+        summary: "Grounded tune proposal.",
+        claims: [{ id: "claim_one", text: "First claim.", citation_ids: ["citation_one"] }],
+        citations: [{
+          id: "citation_one",
+          query: { outcome: "failed" },
+          expected_result: [run],
+          source_digests: ["a".repeat(64)],
+        }],
+        dispositions: [{
+          claim_id: "claim_one",
+          disposition: "supported",
+          rationale: "Reproduced.",
+          citation_ids: ["citation_one"],
+        }],
+        grades: [{ id: "overall", value: "pass", disposition_claim_ids: ["claim_one"], rationale: "Survives." }],
+      },
+      resolvedCitations: [{
+        id: "citation_one",
+        actual_result: passed ? [run] : [],
+      }],
+    });
+  }
+
+  function tuneCitationReceipt(decision = tuneCitationDecision()) {
+    return {
+      id: `citation-gate-${digestNormalized(canonicalJson([
+        decision.proposal_hash,
+        decision.hash,
+      ])).slice(0, 32)}`,
+      proposal_id: decision.proposal_id,
+      proposal_hash: decision.proposal_hash,
+      gate_result: decision.result,
+      outcome: decision.outcome,
+      reason: decision.reason,
+      grade_hash: decision.grade_hash,
+      payload: decision.payload,
+      receipt_hash: decision.hash,
+      created_at: "2026-08-08T00:00:00.000Z",
+    };
+  }
+
+  function tuneRatchetInput(proposalDigest = TUNE_PROPOSAL_HASH): RatchetDifferentialInput {
+    return {
+      schema: "openthrottle.ratchet-contract/v1",
+      id: "proposal_one",
+      pinned: [{
+        id: "skill_package",
+        kind: "standard_receipt",
+        artifact_digest: "a".repeat(64),
+        provenance_digest: "b".repeat(64),
+      }],
+      proposed: [{
+        id: "skill_package",
+        kind: "standard_receipt",
+        artifact_digest: "a".repeat(64),
+        provenance_digest: "b".repeat(64),
+      }],
+      human_authority: {
+        actor_id: "linear-user-1",
+        approval_digest: "c".repeat(64),
+      },
+      tuner_authority: {
+        tuner_id: "structured_tuner",
+        proposal_digest: proposalDigest,
+        model_digest: "e".repeat(64),
+      },
+    };
+  }
+
+  function recordedStageGate(fixture: Fixture) {
+    return fixture.db.prepare(`
+      SELECT evaluator_kind, result, payload FROM pipeline_gate_receipts
+    `).get();
   }
 
   async function acknowledgeGithubControlGate(
@@ -790,6 +907,55 @@ describe("deterministic supervisor stage gates", () => {
       "SELECT evaluator_kind, result, payload, receipt_hash FROM pipeline_gate_receipts"
     ).get()).toMatchObject({ evaluator_kind: "semantic", result: "passed" });
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM pipeline_artifacts").get()).toEqual({ count: 2 });
+  });
+
+  it("executes tune citation gates before isolated mutation", () => {
+    const failedFixture = moveFixtureToStage(setup("core/tune@1"), "citation_gate");
+    const failed = processStageEvidence(failedFixture.pipelines, event(failedFixture, "success", {
+      details: { citation_gate: tuneCitationDecision(false) },
+    }), { observedSubject: SUBJECT });
+    expect(failed).toMatchObject({ status: "completion_pending_publication", terminal_outcome: "failed" });
+    expect(failed.active_stage_id).not.toBe("isolated_edit");
+    expect(recordedStageGate(failedFixture)).toMatchObject({ evaluator_kind: "citation", result: "failed" });
+
+    const passedFixture = moveFixtureToStage(setup("core/tune@1"), "citation_gate");
+    const passed = processStageEvidence(passedFixture.pipelines, event(passedFixture, "success", {
+      details: { citation_gate: tuneCitationDecision(true) },
+    }), { observedSubject: SUBJECT });
+    expect(passed).toMatchObject({ status: "dispatchable", active_stage_id: "differential_ratchet" });
+    expect(recordedStageGate(passedFixture)).toMatchObject({ evaluator_kind: "citation", result: "passed" });
+  });
+
+  it("executes tune differential-ratchet gates before isolated mutation", () => {
+    const citation = tuneCitationDecision(true);
+    const failedFixture = moveFixtureToStage(setup("core/tune@1"), "differential_ratchet");
+    const failed = processStageEvidence(failedFixture.pipelines, event(failedFixture, "success", {
+      details: {
+        citation_gate: citation,
+        citation_receipt: tuneCitationReceipt(citation),
+        ratchet_input: tuneRatchetInput("f".repeat(64)),
+      },
+    }), { observedSubject: SUBJECT });
+    expect(failed).toMatchObject({ status: "completion_pending_publication", terminal_outcome: "failed" });
+    expect(failed.active_stage_id).not.toBe("isolated_edit");
+    expect(recordedStageGate(failedFixture)).toMatchObject({
+      evaluator_kind: "differential_ratchet",
+      result: "failed",
+    });
+
+    const passedFixture = moveFixtureToStage(setup("core/tune@1"), "differential_ratchet");
+    const passed = processStageEvidence(passedFixture.pipelines, event(passedFixture, "success", {
+      details: {
+        citation_gate: citation,
+        citation_receipt: tuneCitationReceipt(citation),
+        ratchet_input: tuneRatchetInput(),
+      },
+    }), { observedSubject: SUBJECT });
+    expect(passed).toMatchObject({ status: "dispatchable", active_stage_id: "isolated_edit" });
+    expect(recordedStageGate(passedFixture)).toMatchObject({
+      evaluator_kind: "differential_ratchet",
+      result: "passed",
+    });
   });
 
   it("settles the actor and pipeline transition in one replayable transaction", async () => {
