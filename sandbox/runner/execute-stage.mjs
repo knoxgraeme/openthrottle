@@ -124,30 +124,47 @@ const STAGE_CAPABILITY_SKILLS = {
   "ce/plan@1": "implement-plan",
 };
 
-function stageReceiptAuthorityContract(request) {
-  const subject = request.expectedSubject ?? request.baseCommit;
+function standardReceiptAuthority(request, { preSubject, postSubject }) {
+  const baseSubject = request.expectedSubject ?? request.baseCommit;
   return {
-    schema: "openthrottle.stage-receipt-contract/v1",
-    pipeline_instance_id: request.pipelineInstanceId,
-    graph_digest: request.manifestDigest,
-    unit_id: "__tune__",
-    attempt_id: request.attemptId,
-    parent_run_id: request.runId,
-    action_attempt_id: request.attemptId,
-    generation: request.generation,
     assurance: "semantic_attested",
-    native_session_id: request.nativeSessionId,
-    request_hash: request.requestHash,
-    subject: {
-      base: subject,
-      pre: subject,
-    },
     producer: {
       worker_id: "tuner",
       skill: "builtin://tune@1",
       capability_digest: request.capabilityDigest,
       skill_package_digest: null,
     },
+    subject: {
+      base: baseSubject,
+      pre: preSubject,
+      post: postSubject,
+    },
+    fence: {
+      pipeline_instance_id: request.pipelineInstanceId,
+      graph_digest: request.manifestDigest,
+      unit_id: "__tune__",
+      attempt_id: request.attemptId,
+      parent_run_id: request.runId,
+      action_attempt_id: request.attemptId,
+      generation: request.generation,
+      native_session_id: request.nativeSessionId,
+      request_hash: request.requestHash,
+    },
+  };
+}
+
+function stageReceiptAuthorityContract(request) {
+  const subject = request.expectedSubject ?? request.baseCommit;
+  const authority = standardReceiptAuthority(request, {
+    preSubject: subject,
+    postSubject: subject,
+  });
+  return {
+    schema: "openthrottle.stage-receipt-contract/v1",
+    ...authority.fence,
+    assurance: authority.assurance,
+    subject: authority.subject,
+    producer: authority.producer,
     evidence: "Bind this receipt to exact output evidence for the requested tune action.",
   };
 }
@@ -1115,6 +1132,10 @@ export function executeStage({
       artifacts = buildStandardReceiptArtifacts({
         receipt: execution.receipt,
         fence,
+        authority: standardReceiptAuthority(request, {
+          preSubject,
+          postSubject: gatedSubject,
+        }),
         requiredArtifacts: request.requiredArtifacts,
         env: redactionEnv,
       });

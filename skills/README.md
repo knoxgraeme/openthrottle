@@ -151,8 +151,8 @@ session identifier. Continuation is a context policy, not a separate task type.
 
 ## Coordinator-owned composition
 
-The current catalog aliases `implement` and `investigate` to immutable `core/`
-manifests:
+The current catalog aliases `implement`, `investigate`, and `tune` to immutable
+`core/` manifests:
 
 - `core/implement@4`: implementation → semantic review → simplification →
   post-simplify review → test → lint → build → exact-subject publication →
@@ -160,6 +160,9 @@ manifests:
   Repair transitions use the manifest's scoped repair stages and round budget.
 - `core/investigate@1`: investigation → conditional exact-subject publication.
   Convergent fixes may ship; divergent decisions terminate as `needs_human`.
+- `core/tune@1`: corpus-only analysis → proposal → supervisor-owned
+  citation and differential-ratchet gates → isolated edit → commands and
+  review → exact-subject publication and provider verification.
 
 Agent stages emit semantic proposals. Command stages produce
 executor-verified results. Publication is fenced to the expected Git subject,

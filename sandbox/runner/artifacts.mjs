@@ -711,8 +711,49 @@ export function buildCommandArtifacts({ fence, command, commandName, execution, 
   })));
 }
 
-export function buildStandardReceiptArtifacts({ receipt, fence, requiredArtifacts = ["standard_receipt"], env = process.env }) {
+function assertStandardReceiptAuthority(receipt, authority) {
+  if (!authority || typeof authority !== "object" || Array.isArray(authority)) {
+    throw new Error("standard receipt sealing authority is missing");
+  }
+  if (receipt.assurance !== authority.assurance) {
+    throw new Error("standard receipt assurance does not match the sealed stage authority");
+  }
+  for (const field of ["worker_id", "skill", "capability_digest", "skill_package_digest"]) {
+    if (receipt.producer[field] !== authority.producer?.[field]) {
+      throw new Error(`standard receipt producer ${field} does not match the sealed stage authority`);
+    }
+  }
+  for (const field of ["base", "pre", "post"]) {
+    if (receipt.subject[field] !== authority.subject?.[field]) {
+      throw new Error(`standard receipt subject ${field} does not match the sealed stage authority`);
+    }
+  }
+  for (const field of [
+    "pipeline_instance_id",
+    "graph_digest",
+    "unit_id",
+    "attempt_id",
+    "parent_run_id",
+    "action_attempt_id",
+    "generation",
+    "native_session_id",
+    "request_hash",
+  ]) {
+    if (receipt.fence[field] !== authority.fence?.[field]) {
+      throw new Error(`standard receipt fence ${field} does not match the sealed stage authority`);
+    }
+  }
+}
+
+export function buildStandardReceiptArtifacts({
+  receipt,
+  fence,
+  authority,
+  requiredArtifacts = ["standard_receipt"],
+  env = process.env,
+}) {
   const normalized = validateStandardReceipt(receipt, env);
+  assertStandardReceiptAuthority(normalized, authority);
   const receiptPayload = canonicalJson(normalized);
   const receiptHash = digest(receiptPayload);
   const result = STANDARD_RECEIPT_STAGE_OUTCOMES[normalized.result];
