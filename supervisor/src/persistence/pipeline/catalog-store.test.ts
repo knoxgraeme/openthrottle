@@ -29,6 +29,7 @@ describe("pipeline catalog store", () => {
   const temporaryDirectories: string[] = [];
   const structuredV1GraphPath = fileURLToPath(new URL("../../../graphs/structured-v1.json", import.meta.url));
   const structuredV2GraphPath = fileURLToPath(new URL("../../../graphs/structured-v2.json", import.meta.url));
+  const structuredV3GraphPath = fileURLToPath(new URL("../../../graphs/structured-v3.json", import.meta.url));
   const legacyStructuredV1Digest = "13f4b9ed94324317a78a2228a53f781d5f382b406063316bfeb85e53c37b0830";
 
   afterEach(() => {
@@ -105,7 +106,7 @@ describe("pipeline catalog store", () => {
     expect(pipelines.getInstanceForSession("session-v2")?.pipeline_version).toBe(3);
   });
 
-  it("keeps the exact legacy structured v1 catalog entry immutable while admitting repaired structured v2", () => {
+  it("keeps accepted structured versions immutable while admitting graph-scoped lead v3", () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
     const runtimeDescriptor = buildInstalledRuntimeDescriptor("structured-catalog-test/v1");
@@ -127,6 +128,15 @@ describe("pipeline catalog store", () => {
       runtime: runtimeDescriptor.descriptor,
       aggregatePublishContext: "prefer_resume",
     }).manifest;
+    const graphScopedLeadV3 = parseAndCompileExecutionGraph(readFileSync(structuredV3GraphPath, "utf8"), {
+      source: "builtin:core/structured@3",
+      id: "builtin/structured",
+      version: 3,
+      description: "Compiled execution graph structured from builtin core/structured@3.",
+      maxAttempts: 200,
+      runtime: runtimeDescriptor.descriptor,
+      aggregatePublishContext: "prefer_resume",
+    }).manifest;
     expect(legacyV1.digest).toBe(legacyStructuredV1Digest);
     db.prepare(`
       INSERT INTO pipeline_catalog_entries (
@@ -144,6 +154,8 @@ describe("pipeline catalog store", () => {
     expect(() => pipelines.acceptManifest(changedLegacyV1)).toThrow(/different digest/);
     pipelines.acceptManifest(repairedV2);
     expect(() => pipelines.acceptManifest(repairedV2)).not.toThrow();
+    pipelines.acceptManifest(graphScopedLeadV3);
+    expect(() => pipelines.acceptManifest(graphScopedLeadV3)).not.toThrow();
 
     expect(db.prepare(`
       SELECT pipeline_id, version, digest FROM pipeline_catalog_entries
@@ -152,8 +164,10 @@ describe("pipeline catalog store", () => {
     `).all()).toEqual([
       { pipeline_id: "builtin/structured", version: 1, digest: legacyV1.digest },
       { pipeline_id: "builtin/structured", version: 2, digest: repairedV2.digest },
+      { pipeline_id: "builtin/structured", version: 3, digest: graphScopedLeadV3.digest },
     ]);
     expect(legacyV1.digest).not.toBe(repairedV2.digest);
+    expect(repairedV2.digest).not.toBe(graphScopedLeadV3.digest);
   });
 
   it("re-admits an unchanged repository graph with a direct aggregate publish edge", () => {

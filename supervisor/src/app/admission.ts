@@ -58,12 +58,21 @@ const BUILTIN_GRAPHS = {
     id: "builtin/structured",
     version: 1,
     description: "Compiled execution graph structured from builtin core/structured@1.",
+    aggregatePublishContext: undefined,
   },
   "core/structured@2": {
     path: fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url)),
     id: "builtin/structured",
     version: 2,
     description: "Compiled execution graph structured from builtin core/structured@2.",
+    aggregatePublishContext: "prefer_resume",
+  },
+  "core/structured@3": {
+    path: fileURLToPath(new URL("../../graphs/structured-v3.json", import.meta.url)),
+    id: "builtin/structured",
+    version: 3,
+    description: "Compiled execution graph structured from builtin core/structured@3.",
+    aggregatePublishContext: "prefer_resume",
   },
 } as const;
 const SIMPLE_IMPLEMENT_DESCRIPTION = "Staged CE implementation from a pre-approved plan with round-based repair budgeting, scoped repair re-entry, sealed repository gates, exact-tree publication, and bounded provider repair. The initial forward pass may simplify; repair passes re-run semantic review and command gates without re-running simplification.";
@@ -484,7 +493,9 @@ async function resolvePipelineSelection(
       version: builtinGraph.version,
       description: builtinGraph.description,
       maxAttempts: 200,
-      ...(source.ref === "core/structured@2" ? { aggregatePublishContext: "prefer_resume" as const } : {}),
+      ...(builtinGraph.aggregatePublishContext
+        ? { aggregatePublishContext: builtinGraph.aggregatePublishContext }
+        : {}),
     } : {
       id: manifestId,
       description: `Compiled execution graph ${graphId} from ${blobDescription}.`,

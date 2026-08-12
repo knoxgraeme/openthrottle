@@ -1065,7 +1065,8 @@ cycle with command index reset, bounded by the graph's max repair rounds, after
 which the unit settles as `failed`. Once every unit has settled,
 and at least one unit reached `completed`, the same fenced-action mechanics
 rerun the full configured commands and one fresh, report-only final review
-against the final integrated subject; a `semantic_repair_required` final
+against the final integrated subject; either a nonzero final-command decision
+(`failure` / `command_exit_nonzero`) or a `semantic_repair_required` final
 review routes through a dedicated final-repair action and a fresh command/review
 cycle, invalidating the prior review's authority. Final review is a sealed
 supervisor orchestration, not one reviewer's opinion: the supervisor first

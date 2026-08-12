@@ -150,7 +150,7 @@ describe("init project detection", () => {
       default_graph: "simple",
       graphs: [
         { id: "simple", kind: "builtin", ref: "core/simple@1" },
-        { id: "structured", kind: "builtin", ref: "core/structured@2" },
+        { id: "structured", kind: "builtin", ref: "core/structured@3" },
       ],
       agent: "claude",
       commands: { test: "npm test" },

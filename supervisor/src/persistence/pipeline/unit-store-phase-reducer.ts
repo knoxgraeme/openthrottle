@@ -1,5 +1,11 @@
 import type Database from "better-sqlite3";
-import { canonicalJson, digestNormalized, STAGE_OUTCOMES, type StageOutcome } from "../../pipeline/manifest.js";
+import {
+  canonicalJson,
+  digestNormalized,
+  STAGE_OUTCOMES,
+  type PipelineUnitPhaseBinding,
+  type StageOutcome,
+} from "../../pipeline/manifest.js";
 import { GATE_RECEIPT_REASONS, type GateReceiptReason } from "../../pipeline/gates.js";
 import {
   assertValidUnitPhaseSequence,
@@ -130,6 +136,12 @@ export function phaseSequenceOf(graph: { unit_phases?: string }): UnitPhase[] {
   return phases.length > 0 ? phases : [...BUILTIN_UNIT_PHASES];
 }
 
+function unitPhaseBindingsOf(graph: { unit_phase_bindings: string }): PipelineUnitPhaseBinding[] {
+  const value = JSON.parse(graph.unit_phase_bindings) as unknown;
+  if (!Array.isArray(value)) throw new Error("execution graph unit phase bindings must be a JSON array");
+  return value as PipelineUnitPhaseBinding[];
+}
+
 function lastMutatingPhase(phases: readonly UnitPhase[]): UnitPhase {
   return phases.includes("simplify") ? "simplify" : "implement";
 }
@@ -254,6 +266,49 @@ export function priorSessionId(
   return row?.native_session_id ?? null;
 }
 
+function priorGraphScopedSessionId(
+  db: Database.Database,
+  input: { graphId: string; actionKind: UnitActionKind }
+): string | null {
+  const row = db.prepare(`
+    SELECT native_session_id FROM execution_work_attempts
+    WHERE execution_graph_id = ?
+      AND action_kind = ?
+      AND status = 'completed'
+      AND native_session_id IS NOT NULL
+    ORDER BY completed_at DESC, rowid DESC LIMIT 1
+  `).get(input.graphId, input.actionKind) as { native_session_id: string } | undefined;
+  return row?.native_session_id ?? null;
+}
+
+function resumeSessionIdForUnitAction(
+  db: Database.Database,
+  input: {
+    unitRow: ExecutionUnitRow;
+    graph: ExecutionUnitGraph;
+    actionKind: UnitActionKind;
+  }
+): string | null {
+  if (input.actionKind === "repair") {
+    return priorSessionId(db, {
+      unitRowId: input.unitRow.id,
+      graphId: input.graph.id,
+      kinds: ["implement", "repair"],
+    });
+  }
+  if (input.actionKind === "simplify") {
+    return priorSessionId(db, {
+      unitRowId: input.unitRow.id,
+      graphId: input.graph.id,
+      kinds: ["implement", "repair", "simplify"],
+    });
+  }
+  if (input.actionKind !== "lead") return null;
+  const phaseBinding = unitPhaseBindingsOf(input.graph).find((binding) => binding.id === input.unitRow.phase);
+  if (phaseBinding?.kind !== "gate" || phaseBinding.worker.session_scope !== "graph") return null;
+  return priorGraphScopedSessionId(db, { graphId: input.graph.id, actionKind: input.actionKind });
+}
+
 export function insertWorkAttempt(
   db: Database.Database,
   input: {
@@ -349,11 +404,11 @@ export function createOrResumeUnitAction(
     }
     const actionKind = actionKindForUnitPhase(unitRow.phase, unitRow.current_cycle);
     const commandName = unitRow.phase === "command" ? commandNames[unitRow.command_index]! : null;
-    const resumeNativeSessionId = actionKind === "repair"
-      ? priorSessionId(db, { unitRowId: unitRow.id, graphId: input.graph.id, kinds: ["implement", "repair"] })
-      : actionKind === "simplify"
-        ? priorSessionId(db, { unitRowId: unitRow.id, graphId: input.graph.id, kinds: ["implement", "repair", "simplify"] })
-        : null;
+    const resumeNativeSessionId = resumeSessionIdForUnitAction(db, {
+      unitRow,
+      graph: input.graph,
+      actionKind,
+    });
     return insertWorkAttempt(db, {
       unitRow,
       graph: input.graph,

@@ -386,7 +386,7 @@ function projectConfigDocument(config: ProjectConfig, editableSkills = false): R
     default_graph: editableSkills ? EDITABLE_GRAPH_ID : "simple",
     graphs: [
       { id: "simple", kind: "builtin", ref: "core/simple@1" },
-      { id: "structured", kind: "builtin", ref: "core/structured@2" },
+      { id: "structured", kind: "builtin", ref: "core/structured@3" },
       ...(editableSkills
         ? [{ id: EDITABLE_GRAPH_ID, kind: "repository", ref: EDITABLE_GRAPH_PATH }]
         : []),
