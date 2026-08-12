@@ -10,6 +10,9 @@ import {
   parseCitationContractProposal,
   parseRatchetDifferentialInput,
   parseStandardReceipt,
+  validateTuneProposalContract,
+  validateTuneSealedIntentContract,
+  validateTuneTaskContract,
   validateRatchetDecision,
   validateStandardReceipt,
 } from "./index.js";
@@ -100,6 +103,64 @@ const invalidCases = [
 ] as const;
 
 describe("Stage C contract fixtures", () => {
+  function tuneTask(): Record<string, unknown> {
+    return {
+      schema: "openthrottle.tune-task/v1",
+      id: "tune_contracts",
+      target: {
+        kind: "skill",
+        id: "implement_unit",
+        path: "skills/tasks/implement-unit/SKILL.md",
+        digest: "a".repeat(64),
+      },
+      query: { outcome: "failure", graph: "structured", limit: 50 },
+      scope: "repository",
+      window: {
+        from: "2026-08-01T00:00:00.000Z",
+        to: "2026-08-12T00:00:00.000Z",
+        limit: 200,
+      },
+      baseline: {
+        base_ref: "main",
+        base_digest: "b".repeat(64),
+        runtime_release: "openthrottle-snapshot/v12",
+        capability_digest: "c".repeat(64),
+      },
+      policy: {
+        allow_edit_paths: ["skills/tasks/implement-unit", "docs/solutions"],
+        requires_citation_gate: true,
+        requires_ratchet: true,
+        max_changed_files: 2,
+      },
+    };
+  }
+
+  function tuneIntent(): Record<string, unknown> {
+    const task = tuneTask();
+    return {
+      schema: "openthrottle.tune-sealed-intent/v1",
+      id: "intent_one",
+      task,
+      task_digest: validateTuneTaskContract(task).digest,
+      sealed_at: "2026-08-12T00:01:00.000Z",
+      authority_digest: "d".repeat(64),
+    };
+  }
+
+  function corpusRow(): Record<string, unknown> {
+    return {
+      id: "row_one",
+      pipeline_instance_id: "pipeline-1",
+      generation: 5,
+      graph_id: "structured",
+      outcome: "failure",
+      reason: "failure",
+      created_at: "2026-08-11T00:00:00.000Z",
+      artifact_digests: ["e".repeat(64)],
+      row_digest: "f".repeat(64),
+    };
+  }
+
   it("accepts bounded command diagnostic tails and rejects oversized UTF-8 tails", () => {
     const receipt = JSON.parse(readFixture("valid", "receipt-unit-decision.json")) as Record<string, unknown>;
     receipt.type = "command_result";
@@ -170,6 +231,77 @@ describe("Stage C contract fixtures", () => {
       expect(JSON.parse(validated.normalized)).toEqual(validated.value);
       expect(validated.digest).toBe(digestCanonicalJson(validated.value));
     }
+  });
+
+  it("validates tune proposals against the sealed intent fields, not digest equality alone", () => {
+    const intent = tuneIntent();
+    const task = intent.task as Record<string, unknown>;
+    const proposal: Record<string, unknown> = {
+      schema: "openthrottle.tune-proposal/v1",
+      id: "proposal_one",
+      intent,
+      corpus_rows: [corpusRow()],
+      corpus_digest: "1".repeat(64),
+      target: structuredClone(task.target),
+      query: structuredClone(task.query),
+      scope: task.scope,
+      window: structuredClone(task.window),
+      baseline: structuredClone(task.baseline),
+      policy: structuredClone(task.policy),
+      outcome: "propose",
+      changes: [{
+        path: "skills/tasks/implement-unit/SKILL.md",
+        operation: "modify",
+        before_digest: "2".repeat(64),
+        after_digest: "3".repeat(64),
+        rationale: "Tighten bounded receipt guidance.",
+      }],
+      citation_contract_digest: "4".repeat(64),
+      ratchet_contract_digest: "5".repeat(64),
+    };
+
+    expect(validateTuneSealedIntentContract(intent).digest).toBeTruthy();
+    expect(validateTuneProposalContract(proposal).value.changes).toHaveLength(1);
+
+    const mismatched = structuredClone(proposal);
+    (mismatched.query as Record<string, unknown>).graph = "other_graph";
+    expect(() => validateTuneProposalContract(mismatched, { source: "proposal" }))
+      .toThrow(/proposal\.query: must match sealed intent query/);
+  });
+
+  it("rejects raw untyped prose in tune corpus rows and changes outside the sealed policy", () => {
+    const intent = tuneIntent();
+    const task = intent.task as Record<string, unknown>;
+    const proposal: Record<string, unknown> = {
+      schema: "openthrottle.tune-proposal/v1",
+      id: "proposal_one",
+      intent,
+      corpus_rows: [{ ...corpusRow(), raw_ticket_text: "untrusted prose" }],
+      corpus_digest: "1".repeat(64),
+      target: structuredClone(task.target),
+      query: structuredClone(task.query),
+      scope: task.scope,
+      window: structuredClone(task.window),
+      baseline: structuredClone(task.baseline),
+      policy: structuredClone(task.policy),
+      outcome: "propose",
+      changes: [],
+      citation_contract_digest: "4".repeat(64),
+      ratchet_contract_digest: "5".repeat(64),
+    };
+
+    expect(() => validateTuneProposalContract(proposal, { source: "proposal" }))
+      .toThrow(/raw_ticket_text: unknown field/);
+    proposal.corpus_rows = [corpusRow()];
+    proposal.changes = [{
+      path: "supervisor/src/index.ts",
+      operation: "modify",
+      before_digest: "2".repeat(64),
+      after_digest: "3".repeat(64),
+      rationale: "Outside authorized tune target.",
+    }];
+    expect(() => validateTuneProposalContract(proposal, { source: "proposal" }))
+      .toThrow(/outside policy allow_edit_paths/);
   });
 
   it("requires claims and their dispositions to cite evidence", () => {

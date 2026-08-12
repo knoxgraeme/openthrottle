@@ -155,6 +155,7 @@ describe("database migrations", () => {
       "fd013193d587a17350c261bc411384c0420e432babc2cd87af648d8c1348a0d2",
       "4942852ca8dc280d8b9b86f79e7dc6621317667eaec0ec3c848fa1415fe67d48",
       "acb5e6c121d5ed18ec87b5c717c190dd4a6c486a88824807c5c25c32b12edeb4",
+      "9e3ab22f612eab044e4c1f0e4fda8ac471b8c24befcb59594add21658d429564",
     ]);
   });
 
@@ -219,7 +220,7 @@ describe("database migrations", () => {
     `).get()).toEqual({ name: "github_webhook_redelivery_process_idx" });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 40, name: "execution-work-private-artifacts" });
+    `).get()).toEqual({ version: 41, name: "tune-state" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
     });
@@ -269,7 +270,7 @@ describe("database migrations", () => {
     });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 40, name: "execution-work-private-artifacts" });
+    `).get()).toEqual({ version: 41, name: "tune-state" });
   });
 
   it("adds epoch-fenced observation retry defaults to a v38 work-attempt table", () => {
@@ -386,6 +387,53 @@ describe("database migrations", () => {
       SELECT COUNT(*) AS count FROM pragma_foreign_key_list('execution_units')
       WHERE "table" = 'execution_work_attempts'
     `).get()).toEqual({ count: 6 });
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tune_state'"
+    ).get()).toEqual({ name: "tune_state" });
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'tune_state_intent_idx'"
+    ).get()).toEqual({ name: "tune_state_intent_idx" });
+  });
+
+  it("restarts the tune-state migration after a partial pre-ledger interruption", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      CREATE TABLE tune_state (
+        id TEXT PRIMARY KEY,
+        intent_id TEXT NOT NULL,
+        intent_digest TEXT NOT NULL,
+        proposal_id TEXT NOT NULL,
+        proposal_digest TEXT NOT NULL UNIQUE,
+        citation_decision_digest TEXT NOT NULL,
+        ratchet_decision_digest TEXT NOT NULL,
+        edit_authorization_digest TEXT NOT NULL,
+        release_descriptor_digest TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK(outcome IN ('accepted', 'rejected', 'needs_human')),
+        payload TEXT NOT NULL,
+        payload_digest TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX tune_state_intent_idx ON tune_state(intent_digest, created_at);
+    `);
+    for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 40)) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-08-12T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare("SELECT version, name FROM schema_migrations WHERE version = 41").get())
+      .toEqual({ version: 41, name: "tune-state" });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get())
+      .toEqual({ count: databaseMigrations.length });
   });
 
   it("converges a freshly opened database on neutral live control identifiers", () => {

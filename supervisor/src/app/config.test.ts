@@ -60,7 +60,7 @@ describe("loadConfig", () => {
       githubReadToken: "github-read-token",
       kimiCodeApiKey: "kimi",
       sandboxEventPollIntervalMs: 5_000,
-      sandboxRuntimeRelease: "openthrottle-snapshot/v11",
+      sandboxRuntimeRelease: "openthrottle-snapshot/v12",
       runtimeResourceRetentionMinutes: 60,
       runOutcomeRetentionDays: 180,
     });

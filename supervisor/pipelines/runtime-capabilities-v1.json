@@ -1,6 +1,6 @@
 {
   "schema": "openthrottle.runtime-capabilities/v1",
-  "release": "openthrottle-snapshot/v11",
+  "release": "openthrottle-snapshot/v12",
   "generatedBy": "sandbox-runtime-build",
   "protocol": "stage-executor@1",
   "capabilities": [
@@ -15,6 +15,7 @@
     "ce/review@1",
     "ce/simplify@1",
     "command/run@1",
+    "core/tune@1",
     "correctness-dataflow@1",
     "data-migration@1",
     "graph/for-each-unit@1",

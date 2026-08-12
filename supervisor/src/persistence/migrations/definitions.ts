@@ -1681,6 +1681,28 @@ CREATE TABLE execution_work_private_artifacts (
 const executionWorkPrivateArtifactsMigrationSource = `${executionWorkPrivateArtifactsSchema}
 execution-work-private-artifact-contract:bounded recovery bytes live outside hot execution work rows and settle atomically/v1`;
 
+const tuneStateSchema = `
+CREATE TABLE tune_state (
+  id TEXT PRIMARY KEY,
+  intent_id TEXT NOT NULL,
+  intent_digest TEXT NOT NULL,
+  proposal_id TEXT NOT NULL,
+  proposal_digest TEXT NOT NULL UNIQUE,
+  citation_decision_digest TEXT NOT NULL,
+  ratchet_decision_digest TEXT NOT NULL,
+  edit_authorization_digest TEXT NOT NULL,
+  release_descriptor_digest TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK(outcome IN ('accepted', 'rejected', 'needs_human')),
+  payload TEXT NOT NULL,
+  payload_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX tune_state_intent_idx ON tune_state(intent_digest, created_at);
+`;
+
+const tuneStateMigrationSource = `${tuneStateSchema}
+tune-state-contract:append-only bounded tune evidence binds sealed intent proposal gates authorization and release identity/v1`;
+
 const executionPublicationEventsSchema = `
 CREATE TABLE execution_publication_events (
   id TEXT PRIMARY KEY,
@@ -3168,6 +3190,16 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (hasTable(db, "execution_work_attempts") && !hasTable(db, "execution_work_private_artifacts")) {
         db.exec(executionWorkPrivateArtifactsSchema);
+      }
+    },
+  },
+  {
+    version: 41,
+    name: "tune-state",
+    source: tuneStateMigrationSource,
+    up(db) {
+      if (!hasTable(db, "tune_state")) {
+        db.exec(tuneStateSchema);
       }
     },
   },
