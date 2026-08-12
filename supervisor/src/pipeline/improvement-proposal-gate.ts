@@ -2,6 +2,7 @@ import {
   canonicalJson,
   decideDifferentialRatchet,
   digestNormalized,
+  RATCHET_CONTRACT_MAX_BYTES,
   validateRatchetDifferentialInput,
   type RatchetDecision,
   type RatchetDifferentialInput,
@@ -80,7 +81,6 @@ export interface CitationGateReceiptLookup {
 const SHA256 = /^[a-f0-9]{64}$/;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
-const MAX_RATCHET_INPUT_BYTES = 256 * 1024;
 
 function recordValue(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -215,7 +215,7 @@ function validatedCitationReceipt(
 
 function validatedRatchetInput(value: unknown): RatchetDifferentialInput | null {
   try {
-    if (Buffer.byteLength(canonicalJson(value), "utf8") > MAX_RATCHET_INPUT_BYTES) return null;
+    if (Buffer.byteLength(canonicalJson(value), "utf8") > RATCHET_CONTRACT_MAX_BYTES) return null;
     return validateRatchetDifferentialInput(value, { source: "improvement_proposal.ratchet" }).value;
   } catch {
     return null;

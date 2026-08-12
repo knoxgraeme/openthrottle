@@ -191,4 +191,46 @@ describe("runtime event contracts", () => {
     expect(() => parseSandboxEvent(JSON.stringify({ ...validStageResult, fault_reason: "not_a_real_reason" })))
       .toThrow(/fault_reason/);
   });
+
+  it("accepts a tune-sized sealed stage artifact while ordinary events remain small", () => {
+    const payload = JSON.stringify({ sealed_tune_corpus: "x".repeat(300 * 1024) });
+    const event = parseSandboxEvent(JSON.stringify({
+      version: 1,
+      kind: "stage_result",
+      event_id: "77777777-7777-4777-8777-777777777777",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      pipeline_instance_id: "pipeline-1",
+      generation: 1,
+      stage_id: "analysis",
+      attempt_id: "attempt-1",
+      request_hash: "1".repeat(64),
+      outcome: "success",
+      result_hash: "2".repeat(64),
+      native_session_id: null,
+      subject: "c".repeat(40),
+      artifacts: [{
+        kind: "standard_receipt",
+        schema_version: 1,
+        assurance: "semantic_attested",
+        subject: "c".repeat(40),
+        payload,
+        hash: "2".repeat(64),
+      }],
+    }));
+    expect(event.kind).toBe("stage_result");
+    if (event.kind !== "stage_result") throw new Error("expected stage_result event");
+    expect(event.artifacts[0]!.payload).toHaveLength(payload.length);
+
+    expect(() => parseSandboxEvent(JSON.stringify({
+      version: 1,
+      kind: "activity",
+      event_id: "88888888-8888-4888-8888-888888888888",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      type: "action",
+      body: "x".repeat(40 * 1024),
+      ephemeral: true,
+    }))).toThrow(/too large/);
+  });
 });

@@ -6,6 +6,9 @@ import {
   parseExecutionPlanContract,
   parseStandardReceipt,
   RECEIPT_SCHEMA,
+  validateTuneDecisionContract,
+  validateTuneEditAuthorizationContract,
+  validateTuneProposalContract,
   validateReviewJournalContract,
   type CandidateEvidenceReceipt,
   type CommandResultReceipt,
@@ -530,6 +533,53 @@ function parentTaskContextFor(store: PipelineStore, parentAttemptId: string): st
   if (!attempt?.request_payload) return "";
   const payload = JSON.parse(attempt.request_payload) as { taskContext?: unknown; inputArtifacts?: unknown };
   return requestContextForStructuredPlan(payload);
+}
+
+function tuneAuthorizationForParent(
+  store: PipelineStore,
+  parentAttemptId: string,
+  baseSubject: string,
+  now: Date
+): ChildExecutorActionRequest["tuneAuthorization"] {
+  const attempt = store.getAttempt(parentAttemptId);
+  if (!attempt?.request_payload) throw new Error(`tune parent attempt ${parentAttemptId} has no sealed request`);
+  const request = JSON.parse(attempt.request_payload) as {
+    taskType?: unknown;
+    inputArtifacts?: Array<{ kind?: unknown; payload?: unknown; hash?: unknown }>;
+  };
+  if (request.taskType !== "tune") return undefined;
+  const artifact = request.inputArtifacts?.find((entry) => entry.kind === "stage_result");
+  if (!artifact || typeof artifact.payload !== "string" || typeof artifact.hash !== "string" ||
+      digestNormalized(artifact.payload) !== artifact.hash) {
+    throw new Error("tune structured edit is missing its sealed supervisor authorization");
+  }
+  const wrapper = JSON.parse(artifact.payload) as {
+    details?: { proposal?: unknown; decision?: unknown; edit_authorization?: unknown };
+  };
+  const proposal = validateTuneProposalContract(wrapper.details?.proposal, {
+    source: "structured_edit.proposal",
+  });
+  const decision = validateTuneDecisionContract(wrapper.details?.decision, {
+    source: "structured_edit.decision",
+    proposal: proposal.value,
+  });
+  const authorization = validateTuneEditAuthorizationContract(wrapper.details?.edit_authorization, {
+    source: "structured_edit.authorization",
+    proposal: proposal.value,
+    decision: decision.value,
+  });
+  if (authorization.value.expires_at < now.toISOString()) {
+    throw new Error("tune structured edit authorization expired before executor verification");
+  }
+  return {
+    schema: "openthrottle.tune-edit-verification/v1",
+    proposalDigest: proposal.digest,
+    decisionDigest: decision.digest,
+    authorizationDigest: authorization.digest,
+    baseSubject: sha1SubjectForGitOperation(baseSubject, "tune verification base subject"),
+    expiresAt: authorization.value.expires_at,
+    changes: proposal.value.changes,
+  };
 }
 
 function assertLoopRequestEnvelopeBound(request: LoopActionRequest): void {
@@ -1730,6 +1780,9 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       const integrationCandidateSubject = candidateSubject
         ? sha1SubjectForGitOperation(candidateSubject, "child integration candidate subject")
         : undefined;
+      const tuneAuthorization = action.action_kind === "candidate" || action.action_kind === "integrate"
+        ? tuneAuthorizationForParent(deps.store, action.parent_attempt_id, instance.base_commit, deps.now())
+        : undefined;
       const request = buildChildExecutorActionRequest({
         protocol: "child-executor-action@1",
         actionId: action.id,
@@ -1751,6 +1804,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         baseSubject,
         inputSubject: actionInputSubjectFor(instance, action),
         ...(integrationCandidateSubject ? { candidateSubject: integrationCandidateSubject } : {}),
+        ...(tuneAuthorization ? { tuneAuthorization } : {}),
       });
       deps.store.prepareActionDispatch?.({
         actionId: action.id,
@@ -1839,6 +1893,9 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       : workerBinding.context === "resume_required" && !action.native_session_id
         ? "prefer_resume"
         : workerBinding.context;
+    const tuneAuthorization = ["implement", "repair", "simplify", "final_repair"].includes(action.action_kind)
+      ? tuneAuthorizationForParent(deps.store, action.parent_attempt_id, instance.base_commit, deps.now())
+      : undefined;
     const reviewSubject = action.action_kind === "lead" ? leadCandidateSubject
       : action.action_kind === "final_review" ? inputSubject
         : undefined;
@@ -1913,6 +1970,13 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         actionKind: action.action_kind,
         unitId: action.unit_id,
       }),
+      ...(tuneAuthorization ? {
+        tuneMaterial: {
+          schema: "openthrottle.tune-change-material/v1" as const,
+          proposalDigest: tuneAuthorization.proposalDigest,
+          changes: tuneAuthorization.changes,
+        },
+      } : {}),
       ...(priorEvidence ? { priorEvidence } : {}),
       ...(downstreamContext.length > 0 ? { downstreamContext } : {}),
       ...(action.action_kind === "lead"

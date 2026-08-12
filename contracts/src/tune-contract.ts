@@ -1,4 +1,4 @@
-import { canonicalJson, digestCanonicalJson } from "./canonical.js";
+import { canonicalJson, digestCanonicalJson, digestNormalized } from "./canonical.js";
 import {
   ANALYSIS_QUERY_ATTRIBUTIONS,
   ANALYSIS_QUERY_OUTCOMES,
@@ -56,7 +56,10 @@ const CORPUS_ROW_FIELDS = [
   "fault_attribution", "created_at", "source_digests", "row_digest",
 ] as const;
 const ANALYSIS_FIELDS = ["schema", "id", "intent", "intent_digest", "corpus_rows", "corpus_digest", "generated_at"] as const;
-const CHANGE_FIELDS = ["path", "operation", "before_digest", "after_digest", "rationale"] as const;
+const CHANGE_FIELDS = ["path", "operation", "before_digest", "after_digest", "after_content", "rationale"] as const;
+const TUNE_CHANGE_CONTENT_MAX_BYTES = 128 * 1024;
+const TUNE_CHANGE_SET_CONTENT_MAX_BYTES = 192 * 1024;
+const TUNE_CHANGE_SET_SERIALIZED_MAX_BYTES = 160 * 1024;
 const PROPOSAL_FIELDS = [
   "schema", "id", "analysis", "analysis_digest", "target", "query",
   "scope", "window", "baseline", "policy", "outcome", "changes",
@@ -158,6 +161,7 @@ export interface TuneProposalChange {
   operation: "add" | "modify" | "delete";
   before_digest: string | null;
   after_digest: string | null;
+  after_content: string | null;
   rationale: string;
 }
 
@@ -383,19 +387,28 @@ function parseChange(value: unknown, path: string): TuneProposalChange {
     operation: enumAt(input.operation, `${path}.operation`, ["add", "modify", "delete"] as const),
     before_digest: input.before_digest === null ? null : stringAt(input.before_digest, `${path}.before_digest`, { pattern: SHA256 }),
     after_digest: input.after_digest === null ? null : stringAt(input.after_digest, `${path}.after_digest`, { pattern: SHA256 }),
+    after_content: input.after_content === null
+      ? null
+      : stringAt(input.after_content, `${path}.after_content`, { max: TUNE_CHANGE_CONTENT_MAX_BYTES }),
     rationale: stringAt(input.rationale, `${path}.rationale`, { max: 1_000 }),
   };
-  if (change.operation === "add" && (change.before_digest !== null || change.after_digest === null)) {
-    fail(path, "add requires null before_digest and a non-null after_digest");
+  if (change.after_content !== null && Buffer.byteLength(change.after_content, "utf8") > TUNE_CHANGE_CONTENT_MAX_BYTES) {
+    fail(`${path}.after_content`, `must contain at most ${TUNE_CHANGE_CONTENT_MAX_BYTES} UTF-8 bytes`);
   }
-  if (change.operation === "modify" && (change.before_digest === null || change.after_digest === null)) {
-    fail(path, "modify requires non-null before_digest and after_digest");
+  if (change.operation === "add" && (change.before_digest !== null || change.after_digest === null || change.after_content === null)) {
+    fail(path, "add requires null before_digest and non-null after_digest and after_content");
   }
-  if (change.operation === "delete" && (change.before_digest === null || change.after_digest !== null)) {
-    fail(path, "delete requires a non-null before_digest and null after_digest");
+  if (change.operation === "modify" && (change.before_digest === null || change.after_digest === null || change.after_content === null)) {
+    fail(path, "modify requires non-null before_digest, after_digest, and after_content");
+  }
+  if (change.operation === "delete" && (change.before_digest === null || change.after_digest !== null || change.after_content !== null)) {
+    fail(path, "delete requires a non-null before_digest and null after_digest and after_content");
   }
   if (change.before_digest !== null && change.before_digest === change.after_digest) {
     fail(path, "before_digest and after_digest must differ");
+  }
+  if (change.after_content !== null && digestNormalized(change.after_content) !== change.after_digest) {
+    fail(`${path}.after_content`, "does not match after_digest");
   }
   return change;
 }
@@ -409,6 +422,16 @@ function assertProposalMatchesIntent(proposal: TuneProposal, source: string): vo
   if (canonicalJson(proposal.baseline) !== canonicalJson(task.baseline)) fail(`${source}.baseline`, "must match sealed intent baseline");
   if (canonicalJson(proposal.policy) !== canonicalJson(task.policy)) fail(`${source}.policy`, "must match sealed intent policy");
   if (proposal.changes.length > proposal.policy.max_changed_files) fail(`${source}.changes`, "exceeds policy max_changed_files");
+  const contentBytes = proposal.changes.reduce(
+    (sum, change) => sum + (change.after_content === null ? 0 : Buffer.byteLength(change.after_content, "utf8")),
+    0
+  );
+  if (contentBytes > TUNE_CHANGE_SET_CONTENT_MAX_BYTES) {
+    fail(`${source}.changes`, `after_content must contain at most ${TUNE_CHANGE_SET_CONTENT_MAX_BYTES} UTF-8 bytes in total`);
+  }
+  if (Buffer.byteLength(canonicalJson(proposal.changes), "utf8") > TUNE_CHANGE_SET_SERIALIZED_MAX_BYTES) {
+    fail(`${source}.changes`, `canonical JSON must contain at most ${TUNE_CHANGE_SET_SERIALIZED_MAX_BYTES} UTF-8 bytes`);
+  }
   const allowed = proposal.policy.allow_edit_paths;
   for (const change of proposal.changes) {
     if (!allowed.some((prefix) => change.path === prefix || change.path.startsWith(`${prefix}/`))) {

@@ -6,7 +6,11 @@ import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import { commandDiagnosticTail, digest } from "./artifacts.mjs";
 import { writeJsonAtomic } from "./atomic-write.mjs";
-import { computeWorkspaceTreeOidAsExecutor, runGitAsExecutor } from "./repository-control.mjs";
+import {
+  computeWorkspaceTreeOidAsExecutor,
+  readGitFileEntryAsExecutor,
+  runGitAsExecutor,
+} from "./repository-control.mjs";
 import {
   defaultExecuteCommand,
   REPOSITORY_COMMAND_TIMEOUT_MS,
@@ -24,6 +28,8 @@ const INTEGRATION_REPO_DIR = "/home/agent/repo";
 const WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const GIT_OBJECT_ID = /^[a-f0-9]{40,64}$/;
 const GIT_SHA1_OBJECT_ID = /^[a-f0-9]{40}$/;
+const SHA256 = /^[a-f0-9]{64}$/;
+const TUNE_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
 
 function arg(name, fallback) {
   const index = process.argv.indexOf(name);
@@ -64,7 +70,54 @@ function validateRequest(value) {
   if (value.actionKind === "integrate" && !value.candidateSubject) {
     throw new Error("child executor integration action requires a candidate subject");
   }
+  if (value.tuneAuthorization !== undefined) validateTuneAuthorization(value.tuneAuthorization);
   return value;
+}
+
+function validateTuneAuthorization(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("tune edit authorization must be an object");
+  }
+  const allowed = new Set([
+    "schema", "proposalDigest", "decisionDigest", "authorizationDigest", "baseSubject", "expiresAt", "changes",
+  ]);
+  if (Object.keys(value).some((key) => !allowed.has(key)) ||
+      value.schema !== "openthrottle.tune-edit-verification/v1" ||
+      ![value.proposalDigest, value.decisionDigest, value.authorizationDigest].every((entry) =>
+        typeof entry === "string" && SHA256.test(entry)) ||
+      typeof value.baseSubject !== "string" || !GIT_SHA1_OBJECT_ID.test(value.baseSubject) ||
+      typeof value.expiresAt !== "string" || Number.isNaN(Date.parse(value.expiresAt)) ||
+      !Array.isArray(value.changes) || value.changes.length < 1 || value.changes.length > 64) {
+    throw new Error("tune edit authorization is invalid");
+  }
+  const paths = new Set();
+  let contentBytes = 0;
+  for (const change of value.changes) {
+    if (!change || typeof change !== "object" || Array.isArray(change) ||
+        Object.keys(change).some((key) =>
+          !["path", "operation", "before_digest", "after_digest", "after_content", "rationale"].includes(key)) ||
+        typeof change.path !== "string" || !TUNE_PATH.test(change.path) || paths.has(change.path) ||
+        !["add", "modify", "delete"].includes(change.operation) ||
+        (change.before_digest !== null && (typeof change.before_digest !== "string" || !SHA256.test(change.before_digest))) ||
+        (change.after_digest !== null && (typeof change.after_digest !== "string" || !SHA256.test(change.after_digest))) ||
+        (change.after_content !== null && (typeof change.after_content !== "string" ||
+          change.after_content.length < 1 || Buffer.byteLength(change.after_content, "utf8") > 128 * 1024)) ||
+        typeof change.rationale !== "string" || change.rationale.length < 1 || change.rationale.length > 1_000) {
+      throw new Error("tune edit authorization has an invalid change");
+    }
+    if ((change.operation === "add" && (change.before_digest !== null || change.after_digest === null || change.after_content === null)) ||
+        (change.operation === "modify" && (change.before_digest === null || change.after_digest === null || change.after_content === null)) ||
+        (change.operation === "delete" && (change.before_digest === null || change.after_digest !== null || change.after_content !== null)) ||
+        (change.after_content !== null && digest(change.after_content) !== change.after_digest)) {
+      throw new Error("tune edit authorization has inconsistent change digests");
+    }
+    contentBytes += change.after_content === null ? 0 : Buffer.byteLength(change.after_content, "utf8");
+    paths.add(change.path);
+  }
+  if (contentBytes > 192 * 1024) throw new Error("tune edit authorization content exceeds the bounded change set");
+  if (Buffer.byteLength(canonicalJson(value.changes), "utf8") > 160 * 1024) {
+    throw new Error("tune edit authorization canonical JSON exceeds the bounded request material");
+  }
 }
 
 function subject(value, label) {
@@ -157,6 +210,57 @@ function integrationEvidence(request, evidence) {
   return [
     `executor:integration:${request.actionId}:${evidence.integrated_head}:${evidence.tree}:${digest(canonicalJson(evidence.changed_paths ?? []))}`,
   ];
+}
+
+function changedPathsBetween(repoDir, baseSubject, candidateSubject) {
+  const output = runGitAsExecutor(repoDir, [
+    "-c", "core.quotepath=false", "diff", "--name-only", "--no-renames", baseSubject, candidateSubject, "--",
+  ]);
+  return output.split("\n").filter(Boolean).sort();
+}
+
+export function verifyTuneCandidate(request, candidateSubject, repoDir = INTEGRATION_REPO_DIR) {
+  const authorization = request.tuneAuthorization;
+  if (!authorization) return changedPathsBetween(repoDir, request.baseSubject, candidateSubject);
+  if (authorization.expiresAt < new Date().toISOString()) {
+    throw new Error("tune edit authorization expired before integration");
+  }
+  const actualPaths = changedPathsBetween(repoDir, authorization.baseSubject, candidateSubject);
+  const authorizedPaths = authorization.changes.map((change) => change.path).sort();
+  if (canonicalJson(actualPaths) !== canonicalJson(authorizedPaths)) {
+    throw new Error("tune candidate paths do not match the authorized change set");
+  }
+  for (const change of authorization.changes) {
+    const beforeEntry = readGitFileEntryAsExecutor(repoDir, authorization.baseSubject, change.path);
+    const afterEntry = readGitFileEntryAsExecutor(repoDir, candidateSubject, change.path);
+    if ((change.operation === "add" && beforeEntry !== null) ||
+        (change.operation === "modify" && (beforeEntry === null || afterEntry === null)) ||
+        (change.operation === "delete" && afterEntry !== null)) {
+      throw new Error(`tune candidate operation does not match ${change.path}`);
+    }
+    const regularModes = new Set(["100644", "100755"]);
+    if ((beforeEntry && (beforeEntry.type !== "blob" || !regularModes.has(beforeEntry.mode))) ||
+        (afterEntry && (afterEntry.type !== "blob" || !regularModes.has(afterEntry.mode))) ||
+        (change.operation === "add" && afterEntry?.mode !== "100644") ||
+        (change.operation === "modify" && beforeEntry?.mode !== afterEntry?.mode)) {
+      throw new Error(`tune candidate file type or mode does not match ${change.path}`);
+    }
+    const before = beforeEntry?.content ?? null;
+    const after = afterEntry?.content ?? null;
+    if ((before === null ? null : digest(before)) !== change.before_digest ||
+        (after === null ? null : digest(after)) !== change.after_digest) {
+      throw new Error(`tune candidate content digest does not match ${change.path}`);
+    }
+    if (after !== change.after_content) {
+      throw new Error(`tune candidate content does not match the authorized bytes for ${change.path}`);
+    }
+  }
+  return actualPaths;
+}
+
+function tuneVerificationEvidence(request, result, error) {
+  const reason = error instanceof Error ? error.message : String(error);
+  return `executor:tune-authorization:${request.actionId}:${result}:${digest(reason)}`;
 }
 
 function commandReceipt(request, {
@@ -279,12 +383,23 @@ function candidateReceipt(request) {
     message: `OpenThrottle candidate ${request.actionId}`,
   });
   const candidateSubject = candidate.candidateCommit ?? baseSubject;
+  let result = "success";
+  let authorizationEvidence = [];
+  if (request.tuneAuthorization) {
+    try {
+      verifyTuneCandidate(request, candidateSubject);
+      authorizationEvidence = [tuneVerificationEvidence(request, "accepted", request.tuneAuthorization.authorizationDigest)];
+    } catch (error) {
+      result = "failure";
+      authorizationEvidence = [tuneVerificationEvidence(request, "rejected", error)];
+    }
+  }
   return receiptBase({
     request,
     type: "candidate_evidence",
-    result: "success",
+    result,
     post: candidateSubject,
-    evidence: candidateEvidence(request, candidate),
+    evidence: [...candidateEvidence(request, candidate), ...authorizationEvidence],
     payload: {
       tree: candidate.tree,
       diff_digest: digest(canonicalJson({
@@ -301,6 +416,25 @@ function candidateReceipt(request) {
 function integrationReceipt(request) {
   const inputSubject = sha1Subject(request.inputSubject, "inputSubject");
   const candidateSubject = sha1Subject(request.candidateSubject, "candidateSubject");
+  let changedPaths;
+  try {
+    changedPaths = verifyTuneCandidate(request, candidateSubject);
+  } catch (error) {
+    const tree = runGitAsExecutor(INTEGRATION_REPO_DIR, ["rev-parse", `${inputSubject}^{tree}`]);
+    return receiptBase({
+      request,
+      type: "integration_evidence",
+      result: "failure",
+      post: inputSubject,
+      evidence: [tuneVerificationEvidence(request, "rejected", error)],
+      payload: {
+        tree,
+        diff_digest: digest(canonicalJson({ inputSubject, candidateSubject })),
+        changed_paths: [],
+        clean: cleanCheckout(INTEGRATION_REPO_DIR),
+      },
+    });
+  }
   const evidence = integrateCandidate({
     repoDir: INTEGRATION_REPO_DIR,
     expectedHead: inputSubject,
@@ -311,11 +445,16 @@ function integrationReceipt(request) {
     type: "integration_evidence",
     result: "success",
     post: evidence.integrated_head,
-    evidence: integrationEvidence(request, evidence),
+    evidence: [
+      ...integrationEvidence(request, evidence),
+      ...(request.tuneAuthorization
+        ? [tuneVerificationEvidence(request, "accepted", request.tuneAuthorization.authorizationDigest)]
+        : []),
+    ],
     payload: {
       tree: evidence.tree,
       diff_digest: digest(canonicalJson(evidence)),
-      changed_paths: [],
+      changed_paths: changedPaths,
       clean: true,
     },
   });

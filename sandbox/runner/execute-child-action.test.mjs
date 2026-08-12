@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -9,7 +9,7 @@ import {
   digest,
   validateStandardReceipt,
 } from "./artifacts.mjs";
-import { childActionFailureResult, executeChildAction } from "./execute-child-action.mjs";
+import { childActionFailureResult, executeChildAction, verifyTuneCandidate } from "./execute-child-action.mjs";
 
 const directories = [];
 
@@ -60,6 +60,94 @@ function useRepositoryConfig(commands, extra = {}) {
 }
 
 describe("child executor action", () => {
+  it("verifies the exact authorized tune paths and before/after content digests", () => {
+    const repoDir = mkdtempSync(join(tmpdir(), "ot-tune-verification-"));
+    directories.push(repoDir);
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repoDir });
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: repoDir });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir });
+    writeFileSync(join(repoDir, "SKILL.md"), "before\n");
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "base"], { cwd: repoDir });
+    const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    writeFileSync(join(repoDir, "SKILL.md"), "after\n");
+    execFileSync("git", ["commit", "-qam", "candidate"], { cwd: repoDir });
+    const candidate = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const tuneAuthorization = {
+      schema: "openthrottle.tune-edit-verification/v1",
+      proposalDigest: "a".repeat(64),
+      decisionDigest: "b".repeat(64),
+      authorizationDigest: "c".repeat(64),
+      baseSubject: base,
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      changes: [{
+        path: "SKILL.md",
+        operation: "modify",
+        before_digest: digest("before\n"),
+        after_digest: digest("after\n"),
+        after_content: "after\n",
+        rationale: "Apply the approved skill correction.",
+      }],
+    };
+    const request = childExecutorRequest({
+      actionKind: "integrate",
+      commandName: undefined,
+      worktree: null,
+      baseSubject: base,
+      inputSubject: base,
+      candidateSubject: candidate,
+      tuneAuthorization,
+    });
+
+    expect(verifyTuneCandidate(request, candidate, repoDir)).toEqual(["SKILL.md"]);
+    expect(() => verifyTuneCandidate({
+      ...request,
+      tuneAuthorization: {
+        ...tuneAuthorization,
+        changes: [{ ...tuneAuthorization.changes[0], after_digest: "d".repeat(64) }],
+      },
+    }, candidate, repoDir)).toThrow(/content digest/);
+
+    chmodSync(join(repoDir, "SKILL.md"), 0o755);
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "mode drift"], { cwd: repoDir });
+    const modeDrift = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    expect(() => verifyTuneCandidate(request, modeDrift, repoDir)).toThrow(/file type or mode/);
+
+    execFileSync("git", ["checkout", "-q", base], { cwd: repoDir });
+    unlinkSync(join(repoDir, "SKILL.md"));
+    symlinkSync("after\n", join(repoDir, "SKILL.md"));
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "symlink drift"], { cwd: repoDir });
+    const symlinkDrift = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    expect(() => verifyTuneCandidate(request, symlinkDrift, repoDir)).toThrow(/file type or mode/);
+
+    execFileSync("git", ["checkout", "-q", candidate], { cwd: repoDir });
+    writeFileSync(join(repoDir, "SKILL.md"), "repaired after review\n");
+    execFileSync("git", ["commit", "-qam", "repair"], { cwd: repoDir });
+    const repaired = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    expect(verifyTuneCandidate({
+      ...request,
+      baseSubject: candidate,
+      inputSubject: candidate,
+      candidateSubject: repaired,
+      tuneAuthorization: {
+        ...tuneAuthorization,
+        changes: [{
+          ...tuneAuthorization.changes[0],
+          after_digest: digest("repaired after review\n"),
+          after_content: "repaired after review\n",
+        }],
+      },
+    }, repaired, repoDir)).toEqual(["SKILL.md"]);
+
+    writeFileSync(join(repoDir, "extra.txt"), "outside scope\n");
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "outside scope"], { cwd: repoDir });
+    const expanded = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    expect(() => verifyTuneCandidate(request, expanded, repoDir)).toThrow(/paths do not match/);
+  });
+
   it("binds unconfigured command receipts to the sealed input subject without reading the tree", async () => {
     useRepositoryConfig({});
 

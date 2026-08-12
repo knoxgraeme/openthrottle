@@ -219,7 +219,7 @@ function inputArtifacts(value) {
     if (!Number.isSafeInteger(artifact.schemaVersion) || artifact.schemaVersion < 1 || artifact.schemaVersion > 1_000) {
       throw new Error(`inputArtifacts[${index}].schemaVersion is invalid`);
     }
-    const payload = boundedText(artifact.payload, `inputArtifacts[${index}].payload`, 256 * 1024);
+    const payload = boundedText(artifact.payload, `inputArtifacts[${index}].payload`, 2 * 1024 * 1024);
     totalBytes += Buffer.byteLength(payload, "utf8");
     const subject = artifact.subject === null
       ? null
@@ -233,7 +233,7 @@ function inputArtifacts(value) {
       hash: string(artifact.hash, `inputArtifacts[${index}].hash`, DIGEST),
     };
   });
-  if (totalBytes > 768 * 1024) throw new Error("inputArtifacts exceed the sealed request limit");
+  if (totalBytes > 3 * 1024 * 1024) throw new Error("inputArtifacts exceed the sealed request limit");
   if (new Set(artifacts.map((artifact) => artifact.kind)).size !== artifacts.length) {
     throw new Error("inputArtifacts contain duplicate kinds");
   }
@@ -298,7 +298,11 @@ export function validateStageRequest(value) {
     sessionId: string(input.sessionId, "sessionId", SESSION_ID),
     generation: input.generation,
     taskType: string(input.taskType, "taskType", /^(?:implement|investigate|tune)$/),
-    taskContext: boundedText(input.taskContext, "taskContext", 64_000),
+    taskContext: boundedText(
+      input.taskContext,
+      "taskContext",
+      input.taskType === "tune" ? 384 * 1024 : 64_000,
+    ),
     transitionContext: boundedText(input.transitionContext, "transitionContext", 16_000),
     ...(input.inputArtifacts === undefined ? {} : { inputArtifacts: inputArtifacts(input.inputArtifacts) }),
     repository: string(input.repository, "repository", /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),

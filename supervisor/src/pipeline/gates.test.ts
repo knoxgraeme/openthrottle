@@ -1,8 +1,20 @@
 import Database from "better-sqlite3";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
-import type { RatchetDifferentialInput } from "@openthrottle/contracts";
+import {
+  deriveTuneCorpusDigest,
+  deriveTuneCorpusRowDigest,
+  parseRatchetDifferentialInput,
+  validateCitationContractProposal,
+  validateTuneAnalysisContract,
+  validateTuneSealedIntentContract,
+  validateTuneTaskContract,
+  type RatchetDifferentialInput,
+  type TuneCorpusRow,
+  type TuneCorpusRowContent,
+} from "@openthrottle/contracts";
 import { openDb } from "../persistence/database.js";
 import { drainDeferredProviderEvidence, evaluateStageGate, processProviderEvidence } from "./gates.js";
 import { evaluateCitationGate, type CitationGateDecision } from "./citation-gate.js";
@@ -22,7 +34,7 @@ import type { PipelineInstance, PipelineStageAttempt, PipelineStore } from "./st
 import type { FeedbackSnapshot } from "../persistence/feedback-store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 import { processPipelineInfrastructureFailure } from "./control.js";
-import { createStageRequestHash, type StageRequestEnvelope } from "./stage-request.js";
+import { buildStageRequest, createStageRequestHash, type StageRequestEnvelope } from "./stage-request.js";
 import {
   acknowledgedPublicationHeadAt,
   drainPipelineFeedbackSnapshots,
@@ -255,6 +267,209 @@ describe("deterministic supervisor stage gates", () => {
       attempt: fixture.pipelines.getAttempt(fixture.attempt.id)!,
       instance: fixture.pipelines.getInstance(fixture.instance.id)!,
     };
+  }
+
+  function tuneAnalysisFixture(): Record<string, unknown> {
+    const task = {
+      schema: "openthrottle.tune-task/v1",
+      id: "task_one",
+      target: {
+        kind: "skill",
+        id: "implement_unit",
+        path: "skills/tasks/implement-unit/SKILL.md",
+        digest: "1".repeat(64),
+      },
+      query: { outcome: "failed", reason: "failure", graph: "structured", limit: 1 },
+      scope: "repository",
+      window: {
+        from: "2026-08-01T00:00:00.000Z",
+        to: "2026-08-12T00:00:00.000Z",
+        limit: 1,
+      },
+      baseline: {
+        base_ref: "main",
+        base_digest: digestNormalized("a".repeat(40)),
+        runtime_release: runtime.descriptor.release,
+        capability_digest: runtime.digest,
+      },
+      policy: {
+        allow_edit_paths: ["skills/tasks/implement-unit"],
+        requires_citation_gate: true,
+        requires_ratchet: true,
+        max_changed_files: 1,
+      },
+    };
+    const intent = {
+      schema: "openthrottle.tune-sealed-intent/v1",
+      id: "intent_one",
+      task,
+      task_digest: validateTuneTaskContract(task).digest,
+      sealed_at: "2026-08-12T00:01:00.000Z",
+      authority_digest: "2".repeat(64),
+    };
+    const rowContent: TuneCorpusRowContent = {
+      id: "row_one",
+      pipeline_instance_id: "pipeline-1",
+      generation: 5,
+      execution_graph_id: "structured",
+      outcome: "failed",
+      closed_reason: "failure",
+      fault_attribution: "agent",
+      created_at: "2026-08-11T00:00:00.000Z",
+      source_digests: ["3".repeat(64)],
+    };
+    const rows: TuneCorpusRow[] = [{ ...rowContent, row_digest: deriveTuneCorpusRowDigest(rowContent) }];
+    return {
+      schema: "openthrottle.tune-analysis/v1",
+      id: "analysis_one",
+      intent,
+      intent_digest: validateTuneSealedIntentContract(intent).digest,
+      corpus_rows: rows,
+      corpus_digest: deriveTuneCorpusDigest(rows),
+      generated_at: "2026-08-12T00:02:00.000Z",
+    };
+  }
+
+  function tuneProposalFixture(analysis: Record<string, unknown>): Record<string, unknown> {
+    const task = ((analysis.intent as Record<string, unknown>).task as Record<string, unknown>);
+    const row = (analysis.corpus_rows as Record<string, unknown>[])[0]!;
+    const citationContract = {
+      schema: "openthrottle.citation-contract/v1",
+      id: "proposal_one",
+      summary: "The proposed change is grounded in a sealed failed run.",
+      claims: [{ id: "claim_one", text: "A failed structured run exists.", citation_ids: ["citation_one"] }],
+      citations: [{
+        id: "citation_one",
+        query: { outcome: "failed", reason: "failure", graph: "structured", limit: 1 },
+        expected_result: [{
+          pipeline_instance_id: row.pipeline_instance_id,
+          generation: row.generation,
+          execution_graph_id: row.execution_graph_id,
+          outcome: row.outcome,
+          closed_reason: row.closed_reason,
+          fault_attribution: row.fault_attribution,
+          created_at: row.created_at,
+        }],
+        source_digests: structuredClone(row.source_digests),
+      }],
+      dispositions: [{
+        claim_id: "claim_one",
+        disposition: "supported",
+        rationale: "The sealed corpus contains the cited run.",
+        citation_ids: ["citation_one"],
+      }],
+      grades: [{
+        id: "overall",
+        value: "pass",
+        disposition_claim_ids: ["claim_one"],
+        rationale: "The claim is grounded.",
+      }],
+    };
+    const ratchet = parseRatchetDifferentialInput(readFileSync(
+      new URL("../../../contracts/fixtures/valid/ratchet-contract.json", import.meta.url),
+      "utf8"
+    )).value;
+    ratchet.id = "proposal_one";
+    ratchet.tuner_authority!.proposal_digest = validateCitationContractProposal(citationContract).digest;
+    return {
+      schema: "openthrottle.tune-proposal/v1",
+      id: "proposal_one",
+      analysis,
+      analysis_digest: validateTuneAnalysisContract(analysis).digest,
+      target: structuredClone(task.target),
+      query: structuredClone(task.query),
+      scope: task.scope,
+      window: structuredClone(task.window),
+      baseline: structuredClone(task.baseline),
+      policy: structuredClone(task.policy),
+      outcome: "propose",
+      changes: [{
+        path: "skills/tasks/implement-unit/SKILL.md",
+        operation: "modify",
+        before_digest: "4".repeat(64),
+        after_digest: digestNormalized("tightened guidance\n"),
+        after_content: "tightened guidance\n",
+        rationale: "Tighten bounded receipt guidance.",
+      }],
+      citation_contract: citationContract,
+      ratchet_input: ratchet,
+    };
+  }
+
+  function tuneReceiptFor(
+    fixture: Fixture,
+    type: "tune_analysis" | "tune_proposal",
+    payload: Record<string, unknown>
+  ): Record<string, unknown> {
+    return {
+      schema: "openthrottle.receipt/v1",
+      type,
+      assurance: "semantic_attested",
+      result: "success",
+      producer: {
+        worker_id: "tuner",
+        skill: "builtin://tune@1",
+        capability_digest: fixture.instance.capability_digest,
+        skill_package_digest: null,
+      },
+      subject: {
+        base: fixture.instance.base_commit,
+        pre: fixture.instance.base_commit,
+        post: fixture.instance.base_commit,
+      },
+      fence: {
+        pipeline_instance_id: fixture.instance.id,
+        graph_digest: fixture.instance.manifest_digest,
+        unit_id: "__tune__",
+        attempt_id: fixture.attempt.id,
+        parent_run_id: fixture.attempt.planned_run_id!,
+        action_attempt_id: fixture.attempt.id,
+        generation: fixture.instance.generation,
+        native_session_id: null,
+        request_hash: fixture.attempt.request_hash,
+      },
+      evidence: ["sealed tune contract"],
+      payload,
+      issued_at: "2026-08-12T00:03:00.000Z",
+    };
+  }
+
+  function resealTuneStage(
+    fixture: Fixture,
+    taskContext: string,
+    inputArtifacts?: StageRequestEnvelope["inputArtifacts"]
+  ): Fixture {
+    const request = buildStageRequest({
+      instanceId: fixture.instance.id,
+      manifestDigest: fixture.instance.manifest_digest,
+      runtimeRelease: fixture.instance.runtime_release,
+      capabilityDigest: fixture.instance.capability_digest,
+      repositoryConfigDigest: fixture.instance.repository_config_digest,
+      stage: fixture.stage,
+      attemptId: fixture.attempt.id,
+      runId: fixture.attempt.planned_run_id!,
+      issueId: fixture.instance.ticket_id,
+      sessionId: fixture.instance.session_id,
+      generation: fixture.instance.generation,
+      taskType: "tune",
+      taskContext,
+      transitionContext: "sealed tune test",
+      inputArtifacts,
+      repository: fixture.instance.repository,
+      baseCommit: fixture.instance.base_commit,
+      baseBranch: fixture.instance.base_branch,
+      branch: fixture.instance.branch,
+      agent: fixture.instance.agent,
+      contextRevision: fixture.attempt.context_revision,
+      expectedSubject: fixture.instance.base_commit,
+      nativeSessionId: null,
+    });
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET request_payload = ?, request_hash = ?, idempotency_key = ?
+      WHERE id = ?
+    `).run(canonicalJson(request), request.requestHash, request.idempotencyKey, fixture.attempt.id);
+    return currentStageFixture(fixture);
   }
 
   function tuneCitationDecision(passed = true): CitationGateDecision {
@@ -934,6 +1149,80 @@ describe("deterministic supervisor stage gates", () => {
     expect(nextRequest.taskContext).toBe("Supervisor-sealed tune evidence is carried only by inputArtifacts.");
     expect(nextRequest.inputArtifacts?.map((artifact) => artifact.kind)).toContain("stage_result");
     expect(recordedStageGate(passedFixture)).toMatchObject({ evaluator_kind: "citation", result: "passed" });
+  });
+
+  it("binds tune analysis receipts to the supervisor-sealed corpus", () => {
+    const analysis = tuneAnalysisFixture();
+    const taskContext = [
+      "```json openthrottle.tune-analysis/v1",
+      canonicalJson(analysis),
+      "```",
+    ].join("\n");
+    const accepted = resealTuneStage(setup("core/tune@1"), taskContext);
+    const acceptedReceipt = tuneReceiptFor(accepted, "tune_analysis", {
+      summary: "Sealed corpus packaged.",
+      analysis,
+    });
+    expect(() => evaluateStageGate(accepted.pipelines, event(accepted, "success", {
+      details: { receipt: acceptedReceipt },
+    }))).not.toThrow();
+
+    const forgedAnalysis = { ...analysis, id: "analysis_forged" };
+    const rejected = resealTuneStage(setup("core/tune@1"), taskContext);
+    const rejectedReceipt = tuneReceiptFor(rejected, "tune_analysis", {
+      summary: "Attempted corpus replacement.",
+      analysis: forgedAnalysis,
+    });
+    expect(() => evaluateStageGate(rejected.pipelines, event(rejected, "success", {
+      details: { receipt: rejectedReceipt },
+    }))).toThrow(/does not match the supervisor-sealed corpus/);
+  });
+
+  it("binds tune proposals to the immediately preceding analysis receipt", () => {
+    const analysis = tuneAnalysisFixture();
+    const createProposalFixture = () => {
+      const fixture = moveFixtureToStage(setup("core/tune@1"), "proposal");
+      const predecessorReceipt = tuneReceiptFor(fixture, "tune_analysis", {
+        summary: "Sealed corpus packaged.",
+        analysis,
+      });
+      const predecessor = artifact(fixture, "standard_receipt", "success", {
+        details: { receipt: predecessorReceipt },
+        subject: fixture.instance.base_commit,
+        preSubject: fixture.instance.base_commit,
+      });
+      return resealTuneStage(fixture, "Supervisor-sealed tune evidence is carried only by inputArtifacts.", [{
+        kind: "standard_receipt",
+        schemaVersion: predecessor.schemaVersion,
+        assurance: predecessor.assurance,
+        subject: predecessor.subject ?? null,
+        payload: predecessor.payload,
+        hash: predecessor.hash,
+      }]);
+    };
+
+    const accepted = createProposalFixture();
+    const acceptedReceipt = tuneReceiptFor(accepted, "tune_proposal", {
+      summary: "One bounded change proposed.",
+      proposal: tuneProposalFixture(analysis),
+    });
+    expect(() => evaluateStageGate(accepted.pipelines, event(accepted, "success", {
+      details: { receipt: acceptedReceipt },
+      subject: accepted.instance.base_commit,
+      preSubject: accepted.instance.base_commit,
+    }))).not.toThrow();
+
+    const forgedAnalysis = { ...analysis, id: "analysis_forged" };
+    const rejected = createProposalFixture();
+    const rejectedReceipt = tuneReceiptFor(rejected, "tune_proposal", {
+      summary: "Attempted predecessor replacement.",
+      proposal: tuneProposalFixture(forgedAnalysis),
+    });
+    expect(() => evaluateStageGate(rejected.pipelines, event(rejected, "success", {
+      details: { receipt: rejectedReceipt },
+      subject: rejected.instance.base_commit,
+      preSubject: rejected.instance.base_commit,
+    }))).toThrow(/not bound to its authorized analysis receipt/);
   });
 
   it("executes tune differential-ratchet gates before structured mutation", () => {

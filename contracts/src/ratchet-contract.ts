@@ -21,6 +21,7 @@ import {
 
 export const RATCHET_CONTRACT_SCHEMA = "openthrottle.ratchet-contract/v1" as const;
 export const RATCHET_DECISION_SCHEMA = "openthrottle.ratchet-decision/v1" as const;
+export const RATCHET_CONTRACT_MAX_BYTES = 768 * 1024;
 
 export const RATCHET_ARTIFACT_KINDS = [
   "candidate_evidence",
@@ -85,6 +86,11 @@ export interface RatchetRepositorySkillPackage {
   files: RatchetRepositorySkillPackageFile[];
 }
 
+export interface RatchetFileSnapshot {
+  path: string;
+  content: string;
+}
+
 export interface RatchetDifferentialInput {
   schema: typeof RATCHET_CONTRACT_SCHEMA;
   id: string;
@@ -96,6 +102,8 @@ export interface RatchetDifferentialInput {
   proposed_graph?: GraphContract;
   pinned_repository_skills?: RatchetRepositorySkillPackage[];
   proposed_repository_skills?: RatchetRepositorySkillPackage[];
+  pinned_files?: RatchetFileSnapshot[];
+  proposed_files?: RatchetFileSnapshot[];
   human_authority: RatchetHumanAuthority | null;
   tuner_authority: RatchetTunerAuthority | null;
 }
@@ -663,6 +671,22 @@ function parseRepositorySkillPackageList(value: unknown, path: string): RatchetR
   return skills;
 }
 
+function parseFileSnapshot(value: unknown, path: string): RatchetFileSnapshot {
+  const input = objectAt(value, path, ["path", "content"]);
+  return {
+    path: stringAt(input.path, `${path}.path`, { max: 320, pattern: SKILL_PATH }),
+    content: stringAt(input.content, `${path}.content`, { max: SKILL_PACKAGE_MAX_BYTES }),
+  };
+}
+
+function parseFileSnapshots(value: unknown, path: string): RatchetFileSnapshot[] {
+  const files = arrayAt(value, path, parseFileSnapshot, { max: 64 });
+  unique(files.map((file) => file.path), path);
+  const bytes = files.reduce((sum, file) => sum + Buffer.byteLength(file.content, "utf8"), 0);
+  if (bytes > SKILL_PACKAGE_MAX_BYTES) fail(path, `must contain at most ${SKILL_PACKAGE_MAX_BYTES} UTF-8 bytes`);
+  return files;
+}
+
 export function validateRatchetDifferentialInput(
   value: unknown,
   options: { source?: string } = {}
@@ -670,7 +694,8 @@ export function validateRatchetDifferentialInput(
   const source = options.source ?? "ratchet_contract";
   const input = objectAt(value, source, [
     "schema", "id", "pinned", "proposed", "pinned_config", "proposed_config", "pinned_graph", "proposed_graph",
-    "pinned_repository_skills", "proposed_repository_skills", "human_authority", "tuner_authority",
+    "pinned_repository_skills", "proposed_repository_skills", "pinned_files", "proposed_files",
+    "human_authority", "tuner_authority",
   ]);
   if (input.schema !== RATCHET_CONTRACT_SCHEMA) fail(`${source}.schema`, `must be ${RATCHET_CONTRACT_SCHEMA}`);
   const pinnedConfig = parseOptionalConfig(input.pinned_config, `${source}.pinned_config`);
@@ -706,6 +731,12 @@ export function validateRatchetDifferentialInput(
         `${source}.proposed_repository_skills`
       ),
     }),
+    ...(input.pinned_files === undefined ? {} : {
+      pinned_files: parseFileSnapshots(input.pinned_files, `${source}.pinned_files`),
+    }),
+    ...(input.proposed_files === undefined ? {} : {
+      proposed_files: parseFileSnapshots(input.proposed_files, `${source}.proposed_files`),
+    }),
     human_authority: input.human_authority === null
       ? null
       : parseHumanAuthority(input.human_authority, `${source}.human_authority`),
@@ -720,7 +751,9 @@ export function parseRatchetDifferentialInput(
   raw: string,
   options: { source?: string } = {}
 ): ValidatedContract<RatchetDifferentialInput> {
-  if (Buffer.byteLength(raw, "utf8") > 256 * 1024) fail(options.source ?? "ratchet_contract", "JSON exceeds 256 KiB");
+  if (Buffer.byteLength(raw, "utf8") > RATCHET_CONTRACT_MAX_BYTES) {
+    fail(options.source ?? "ratchet_contract", `JSON exceeds ${RATCHET_CONTRACT_MAX_BYTES / 1024} KiB`);
+  }
   return validateRatchetDifferentialInput(JSON.parse(raw) as unknown, options);
 }
 

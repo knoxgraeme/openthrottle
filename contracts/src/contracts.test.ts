@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { digestCanonicalJson } from "./canonical.js";
+import { digestCanonicalJson, digestNormalized } from "./canonical.js";
 import { parseRepositoryConfigContract } from "./config.js";
 import { parseExecutionPlanContract } from "./execution-plan.js";
 import { parseGraphContract } from "./graph.js";
@@ -242,7 +242,8 @@ describe("Stage C contract fixtures", () => {
         path: "skills/tasks/implement-unit/SKILL.md",
         operation: "modify",
         before_digest: "2".repeat(64),
-        after_digest: "3".repeat(64),
+        after_digest: digestNormalized("tightened guidance\n"),
+        after_content: "tightened guidance\n",
         rationale: "Tighten bounded receipt guidance.",
       }],
       citation_contract: citationContract,
@@ -347,6 +348,15 @@ describe("Stage C contract fixtures", () => {
       .toThrow(/proposal\.analysis_digest: does not match canonical tune analysis digest/);
   });
 
+  it("bounds serialized exact tune material before structured request sealing", () => {
+    const proposal = tuneProposal();
+    const change = (proposal.changes as Record<string, unknown>[])[0]!;
+    change.after_content = "\\".repeat(90 * 1024);
+    change.after_digest = digestNormalized(change.after_content as string);
+    expect(() => validateTuneProposalContract(proposal, { source: "proposal" }))
+      .toThrow(/proposal\.changes: canonical JSON must contain at most 163840 UTF-8 bytes/);
+  });
+
   it("keeps citation and ratchet gates mandatory for every tune task", () => {
     for (const field of ["requires_citation_gate", "requires_ratchet"] as const) {
       const task = tuneTask();
@@ -393,7 +403,8 @@ describe("Stage C contract fixtures", () => {
       path: "supervisor/src/index.ts",
       operation: "modify",
       before_digest: "2".repeat(64),
-      after_digest: "3".repeat(64),
+      after_digest: digestNormalized("outside scope\n"),
+      after_content: "outside scope\n",
       rationale: "Outside authorized tune target.",
     }];
     expect(() => validateTuneProposalContract(proposal, { source: "proposal" }))

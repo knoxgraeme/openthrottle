@@ -19,6 +19,7 @@ import type {
   PipelineStageAttempt,
   PipelineStore,
 } from "./store.js";
+import { TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES } from "./evidence-limits.js";
 import { buildStageRequest, plannedStageRunId } from "./stage-request.js";
 import {
   accumulatedPublicationFindings,
@@ -330,7 +331,8 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     if (!Number.isSafeInteger(artifact.schemaVersion) || artifact.schemaVersion < 1 || artifact.schemaVersion > 1_000) {
       throw new Error(`artifact ${artifact.kind} schema version is invalid`);
     }
-    if (Buffer.byteLength(artifact.payload, "utf8") > 256 * 1024) {
+    const artifactLimit = instance.task_type === "tune" ? TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES : 256 * 1024;
+    if (Buffer.byteLength(artifact.payload, "utf8") > artifactLimit) {
       throw new Error(`artifact ${artifact.kind} exceeds the coordinator size limit`);
     }
     if (digestNormalized(artifact.payload) !== artifact.hash) throw new Error(`artifact ${artifact.kind} hash mismatch`);

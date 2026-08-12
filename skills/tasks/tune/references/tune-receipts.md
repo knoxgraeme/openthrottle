@@ -10,7 +10,7 @@ Both stages emit `openthrottle.receipt/v1` with the exact authority-provided
 `assurance`, `producer`, `subject`, and `fence`, plus a bounded string array
 `evidence`, a stage-specific payload, and `issued_at`.
 
-The entire sealed artifact stays under 12 KiB. Never meet that bound by
+The entire sealed tune artifact stays under 768 KiB. Never meet that bound by
 truncating a typed contract; an oversize exact result is not a valid receipt.
 
 - `tune_analysis` results: `success`, `failure`, `needs_human`. Payload keys:
@@ -52,8 +52,12 @@ smaller of `task.query.limit` and `task.window.limit`.
 - `outcome` is `propose`, `no_change`, or `needs_human`. Only `propose` may have
   changes, and it must have at least one.
 - Each unique change contains exactly `path`, `operation` (`add`, `modify`, or
-  `delete`), nullable `before_digest`, nullable `after_digest`, and `rationale`.
-  Its path must be allowed and the total cannot exceed `max_changed_files`.
+  `delete`), nullable `before_digest`, nullable `after_digest`, nullable
+  `after_content`, and `rationale`. Add/modify changes carry the exact bounded
+  replacement bytes in `after_content`; deletion alone uses null. Its digest
+  must equal `after_digest`. Paths must be allowed, the total cannot exceed
+  `max_changed_files`, and replacement content stays within the contract's
+  per-change, aggregate-content, and canonical-JSON request bounds.
 
 The citation contract is a complete `openthrottle.citation-contract/v1` with
 exactly `schema`, `id`, `summary`, `claims`, `citations`, `dispositions`, and
@@ -66,10 +70,13 @@ references resolve, and every expected result/source digest exists in the
 sealed analysis corpus.
 
 The ratchet input is a complete `openthrottle.ratchet-contract/v1` with exactly
-`schema`, `id`, `pinned`, `proposed`, optional paired config/graph/repository
-skill values, nullable `human_authority`, and nullable `tuner_authority`.
+`schema`, `id`, `pinned`, `proposed`, paired exact `pinned_files` and
+`proposed_files`, optional paired config/graph/repository skill values, nullable
+`human_authority`, and nullable `tuner_authority`.
 Pinned/proposed artifact entries use `id`, `kind`, `artifact_digest`, and
 `provenance_digest`. Tuner authority uses `tuner_id`, `proposal_digest`, and
 `model_digest`; its `proposal_digest` is the canonical citation-contract digest.
-The differential input must be directly comparable and preserve or tighten
-the pinned gates, scopes, and resource policy.
+The exact file snapshots must produce precisely the proposal's change set and
+the target-specific policy values must parse from those same bytes. The
+differential input must be directly comparable and preserve or tighten the
+pinned gates, scopes, and resource policy.

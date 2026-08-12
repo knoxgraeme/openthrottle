@@ -73,6 +73,7 @@ export {
 } from "./execution-plan.js";
 export {
   RATCHET_ARTIFACT_KINDS,
+  RATCHET_CONTRACT_MAX_BYTES,
   RATCHET_CONTRACT_SCHEMA,
   RATCHET_DECISION_SCHEMA,
   RATCHET_REJECTION_REASONS,
@@ -84,6 +85,7 @@ export {
   type RatchetDecision,
   type RatchetDifference,
   type RatchetDifferentialInput,
+  type RatchetFileSnapshot,
   type RatchetHumanAuthority,
   type RatchetRepositorySkillPackage,
   type RatchetRepositorySkillPackageFile,

@@ -5,7 +5,6 @@ import { canonicalJson, stageById } from "../pipeline/manifest.js";
 import { digestNormalized } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import {
-  EXECUTION_PLAN_SCHEMA,
   TUNE_DECISION_SCHEMA,
   TUNE_EDIT_AUTHORIZATION_SCHEMA,
   TUNE_RELEASE_DESCRIPTOR_SCHEMA,
@@ -16,6 +15,7 @@ import {
   validateTuneProposalContract,
   validateTuneReleaseDescriptorContract,
   type StandardReceipt,
+  type RepositoryConfigContract,
   type TuneProposal,
   type ValidatedContract,
 } from "@openthrottle/contracts";
@@ -23,6 +23,7 @@ import { evaluateCitationGate, type ResolvedCitation } from "../pipeline/citatio
 import { evaluateImprovementProposalGate } from "../pipeline/improvement-proposal-gate.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "../pipeline/coordinator.js";
 import { completeStageAttemptActor } from "../pipeline/settlement.js";
+import { assertTuneRatchetMaterialBinding, executionPlanForTuneProposal } from "../pipeline/tune-material.js";
 import { deriveStageFaultAttribution } from "../pipeline/fault-attribution.js";
 import type {
   PipelineEffectIntent,
@@ -194,14 +195,14 @@ function parseProvisionRequest(effect: PipelineEffectIntent, store: PipelineStor
   return request;
 }
 
-function compositeParentTimeoutSeconds(instance: PipelineInstance, request: StageRequestEnvelope, fallbackSeconds: number): number {
-  const stage = stageById(instance.normalized_manifest, request.stageId);
-  if (!stage) throw new Error(`pipeline composite request ${request.attemptId} references missing stage ${request.stageId}`);
+function compositeStageTimeoutSeconds(instance: PipelineInstance, stageId: string, fallbackSeconds: number): number {
+  const stage = stageById(instance.normalized_manifest, stageId);
+  if (!stage) throw new Error(`pipeline composite request references missing stage ${stageId}`);
   const phaseTimeouts = (stage.unitPhaseBindings ?? [])
     .flatMap((binding) => binding.kind === "agent" || binding.kind === "gate" ? [binding.loop.timeout_seconds] : []);
   const timeoutSeconds = Math.max(fallbackSeconds, ...phaseTimeouts);
   if (timeoutSeconds > MAX_STAGE_TIMEOUT_SECONDS) {
-    throw new Error(`pipeline composite stage ${request.attemptId} timeout ${timeoutSeconds}s exceeds maximum ${MAX_STAGE_TIMEOUT_SECONDS}s`);
+    throw new Error(`pipeline composite stage ${stageId} timeout ${timeoutSeconds}s exceeds maximum ${MAX_STAGE_TIMEOUT_SECONDS}s`);
   }
   return timeoutSeconds;
 }
@@ -270,7 +271,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         taskType: instance.task_type,
         tokenHash: request.requestHash,
         expiresAt: new Date(
-          now().getTime() + compositeParentTimeoutSeconds(instance, request, deps.taskTimeoutSeconds) * 1_000
+          now().getTime() + compositeStageTimeoutSeconds(instance, request.stageId, deps.taskTimeoutSeconds) * 1_000
         ).toISOString(),
       });
       if (!started) throw new Error(`pipeline composite stage ${request.attemptId} could not acquire the ticket actor`);
@@ -497,26 +498,6 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     };
   };
 
-  const executionPlanForProposal = (proposal: TuneProposal) => ({
-    schema: EXECUTION_PLAN_SCHEMA,
-    graph_id: "structured",
-    plan_id: `tune-${proposal.id}`,
-    instructions: {
-      approved_change: `Apply only the supervisor-approved tune proposal ${proposal.id}. Authorized paths: ${proposal.changes.map((change) => change.path).join(", ")}.`,
-    },
-    acceptance: {
-      authorized_scope: "Only the approved change set is applied; deterministic command and review gates pass.",
-    },
-    units: [{
-      id: "approved_tune_change",
-      title: `Apply approved tune proposal ${proposal.id}`,
-      depends_on: [],
-      instructions: ["approved_change"],
-      acceptance: ["authorized_scope"],
-    }],
-    commands: [{ name: "test" }, { name: "build" }],
-  });
-
   const executeSupervisorTuneStage = (
     effect: PipelineEffectIntent,
     instance: PipelineInstance,
@@ -548,6 +529,14 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         ? (JSON.parse(citationInput.payload) as { details?: Record<string, unknown> }).details
         : undefined;
       if (!citationDetails) throw new Error("differential ratchet is missing the supervisor citation result");
+      const repositoryConfig = deps.store.getRepositoryConfigSnapshot(instance.repository_config_snapshot_id);
+      if (!repositoryConfig || repositoryConfig.digest !== instance.repository_config_digest ||
+          repositoryConfig.base_commit !== instance.base_commit) {
+        throw new Error("differential ratchet lost its supervisor-pinned repository config");
+      }
+      assertTuneRatchetMaterialBinding(proposal, {
+        repositoryConfig: JSON.parse(repositoryConfig.normalized_config) as RepositoryConfigContract,
+      });
       const evaluation = evaluateImprovementProposalGate({
         citationGate: citationDetails.citation_gate,
         ratchetInput: proposal.ratchet_input,
@@ -582,7 +571,9 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           decision_digest: decisionDigest,
           authorized_paths: proposal.changes.map((change) => change.path),
           authorized_at: timestamp.toISOString(),
-          expires_at: new Date(timestamp.getTime() + 60 * 60_000).toISOString(),
+          expires_at: new Date(
+            timestamp.getTime() + compositeStageTimeoutSeconds(instance, "structured_edit", deps.taskTimeoutSeconds) * 1_000
+          ).toISOString(),
           actor_id: "openthrottle-supervisor",
         }, { proposal, decision });
         const { value: authorization, digest: authorizationDigest } = authorizationContract;
@@ -627,7 +618,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           citation_receipt: citationDetails.citation_receipt,
           ratchet_input: proposal.ratchet_input,
           improvement_gate: evaluation.journal,
-          execution_plan: executionPlanForProposal(proposal),
+          execution_plan: executionPlanForTuneProposal(proposal),
         };
       }
     } else {

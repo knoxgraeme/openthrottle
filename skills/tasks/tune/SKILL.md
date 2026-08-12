@@ -38,9 +38,9 @@ manifest stages.
    query filter, window bound, and the minimum of the query/window row limits.
 3. Order and preserve the exact supervisor-supplied rows. Do not add narrative,
    raw output, inferred history, or repository-derived pseudo-rows.
-4. Build `openthrottle.tune-analysis/v1`, binding the full sealed intent,
-   canonical intent digest, exact rows, canonical corpus digest, and current
-   generation timestamp.
+4. Return the exact supervisor-sealed `openthrottle.tune-analysis/v1`, including
+   its intent, rows, digests, and generated timestamp. Validation never grants
+   authority to rewrite or regenerate any field.
 5. Return one `tune_analysis` receipt with `result: "success"`. Use `failure`
    only when a valid analysis can still describe the failed operation, and
    `needs_human` only when the sealed authority is internally valid but its
@@ -55,13 +55,17 @@ manifest stages.
    from a summary or from native-session memory.
 2. Inspect only the sealed target and allowed paths. Derive the smallest useful
    change set, bounded by `policy.max_changed_files`. Each change names its
-   operation, before/after content digests, and a rationale that includes the
-   observed failure pattern, expected metric movement, scope, and rollback.
+   operation, before/after content digests, exact bounded `after_content` bytes
+   (null only for deletion), and a rationale that includes the observed failure
+   pattern, expected metric movement, scope, and rollback.
 3. Every material claim must cite a deterministic query whose expected rows are
    byte-for-byte projections of rows in the sealed corpus. Source digests must
    come from those rows. Unsupported claims make the receipt `failure`, not a
    lower-confidence proposal.
-4. Build the complete citation contract and differential-ratchet input. Bind
+4. Build the complete citation contract and differential-ratchet input. Its
+   paired `pinned_files` and `proposed_files` must contain the exact repository
+   bytes described by `changes`, and its config, graph, or repository-skill
+   policy structures must describe those same bytes. Bind
    ratchet tuner authority to the canonical citation-contract digest. The
    proposal must not expand credentials/MCP scope, weaken required commands or
    gates, increase resource limits, touch locked/immutable skill material, or
@@ -87,7 +91,7 @@ one bounded string. The other payload field is exactly `analysis` or
 claims, edit authorization, or extra fields.
 
 The complete sealed artifact, including the embedded receipt, must remain under
-12 KiB. This is a hard failure boundary, not permission to truncate rows,
+768 KiB. This is a hard failure boundary, not permission to truncate rows,
 citations, evidence, or any digest binding. If the exact typed result cannot fit,
 return a valid bounded `needs_human` proposal when the contract permits it;
 otherwise let the executor reject the attempt instead of emitting partial data.

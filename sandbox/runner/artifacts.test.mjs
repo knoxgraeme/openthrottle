@@ -312,6 +312,31 @@ describe("normalized stage artifacts", () => {
       payload: { summary: "Sealed corpus packaged.", analysis },
     }, {}).payload.analysis).toEqual(analysis);
 
+    const largeReceipt = {
+      ...baseReceipt,
+      type: "tune_analysis",
+      result: "success",
+      payload: {
+        summary: "Sealed corpus packaged.",
+        analysis: { ...analysis, sealed_rows: "x".repeat(40 * 1024) },
+      },
+    };
+    const largeArtifacts = buildStandardReceiptArtifacts({
+      receipt: largeReceipt,
+      authority: authorityFor(largeReceipt),
+      fence: { ...fence, capability: "core/tune@1" },
+      env: {},
+    });
+    expect(Buffer.byteLength(largeArtifacts.find((artifact) => artifact.kind === "standard_receipt").payload, "utf8"))
+      .toBeGreaterThan(32 * 1024);
+
+    expect(validateStandardReceipt({
+      ...baseReceipt,
+      type: "tune_analysis",
+      result: "success",
+      payload: { summary: "Near the analysis bound.", analysis: { ...analysis, sealed_rows: "x".repeat(240 * 1024) } },
+    }, {}).payload.analysis.sealed_rows).toHaveLength(240 * 1024);
+
     const proposal = {
       schema: "openthrottle.tune-proposal/v1",
       id: "proposal-1",
@@ -322,6 +347,12 @@ describe("normalized stage artifacts", () => {
       result: "no_change",
       payload: { summary: "No eligible change.", proposal },
     }, {}).payload.proposal).toEqual(proposal);
+    expect(validateStandardReceipt({
+      ...baseReceipt,
+      type: "tune_proposal",
+      result: "success",
+      payload: { summary: "Near the proposal bound.", proposal: { ...proposal, material: "x".repeat(600 * 1024) } },
+    }, {}).payload.proposal.material).toHaveLength(600 * 1024);
 
     expect(() => validateStandardReceipt({
       ...baseReceipt,

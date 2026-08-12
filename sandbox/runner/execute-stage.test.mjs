@@ -372,6 +372,29 @@ describe("one-stage executor", () => {
       ...maxLengthSessionIdRequest,
       ...createStageRequestHash(maxLengthSessionIdRequest),
     })).toMatchObject({ sessionId: `a${"#".repeat(199)}` });
+    const tuneArtifactPayload = canonicalJson({ sealed_corpus: "x".repeat(300 * 1024) });
+    const tuneRequest = {
+      ...unsealedRequest,
+      taskType: "tune",
+      taskContext: "sealed analysis ".repeat(5_000),
+      inputArtifacts: [{
+        kind: "standard_receipt",
+        schemaVersion: 1,
+        assurance: "semantic_attested",
+        subject: unsealedRequest.baseCommit,
+        payload: tuneArtifactPayload,
+        hash: digest(tuneArtifactPayload),
+      }],
+    };
+    expect(validateStageRequest({
+      ...tuneRequest,
+      ...createStageRequestHash(tuneRequest),
+    }).inputArtifacts[0].payload).toHaveLength(tuneArtifactPayload.length);
+    const oversizedOrdinaryContext = { ...unsealedRequest, taskContext: tuneRequest.taskContext };
+    expect(() => validateStageRequest({
+      ...oversizedOrdinaryContext,
+      ...createStageRequestHash(oversizedOrdinaryContext),
+    })).toThrow(/taskContext/);
     const slashNativeSessionRequest = { ...unsealedRequest, nativeSessionId: "native/../sibling" };
     expect(() => validateStageRequest({ ...slashNativeSessionRequest, ...createStageRequestHash(slashNativeSessionRequest) }))
       .toThrow(/nativeSessionId/);

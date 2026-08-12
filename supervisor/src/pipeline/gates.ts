@@ -1,4 +1,10 @@
 import {
+  TUNE_ANALYSIS_SCHEMA,
+  validateStandardReceipt,
+  validateTuneAnalysisContract,
+  type StandardReceipt,
+} from "@openthrottle/contracts";
+import {
   ASSURANCE_CLASSES,
   STAGE_OUTCOMES,
   canonicalJson,
@@ -21,6 +27,8 @@ import type {
   PipelineStageAttempt,
   PipelineStore,
 } from "./store.js";
+import { extractJsonBlocks } from "./markdown.js";
+import { TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES } from "./evidence-limits.js";
 import { containsSecretShapedValue } from "../shared/sanitize.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -214,9 +222,9 @@ function parseFindings(value: unknown): Finding[] {
   });
 }
 
-function parseArtifactPayload(artifact: PipelineEventArtifact): TypedArtifactPayload {
+function parseArtifactPayload(artifact: PipelineEventArtifact, limit = ARTIFACT_LIMIT): TypedArtifactPayload {
   if (artifact.schemaVersion !== 1) throw new Error(`artifact ${artifact.kind} schema version is unsupported`);
-  if (Buffer.byteLength(artifact.payload, "utf8") > ARTIFACT_LIMIT) {
+  if (Buffer.byteLength(artifact.payload, "utf8") > limit) {
     throw new Error(`artifact ${artifact.kind} exceeds the gate size limit`);
   }
   if (containsSecretShapedValue(artifact.payload)) {
@@ -302,6 +310,59 @@ function parseArtifactPayload(artifact: PipelineEventArtifact): TypedArtifactPay
     completed_at: completedAt,
     details: record(input.details, "artifact details"),
   };
+}
+
+function tuneReceipt<T extends "tune_analysis" | "tune_proposal">(
+  payloads: readonly TypedArtifactPayload[],
+  expectedType: T,
+  source: string
+): Extract<StandardReceipt, { type: T }> {
+  const artifact = payloads.find((payload) => payload.kind === "standard_receipt");
+  if (!artifact) throw new Error(`${source} is missing its standard receipt`);
+  const receipt = validateStandardReceipt(artifact.details.receipt, { source }).value;
+  if (receipt.type !== expectedType) throw new Error(`${source} must be ${expectedType}`);
+  return receipt as Extract<StandardReceipt, { type: T }>;
+}
+
+function validateTuneReceiptAuthority(
+  attempt: PipelineStageAttempt,
+  stage: PipelineStage,
+  payloads: readonly TypedArtifactPayload[]
+): void {
+  if (stage.id !== "analysis" && stage.id !== "proposal") return;
+  if (!attempt.request_payload) throw new Error(`tune ${stage.id} request is not sealed`);
+  const request = JSON.parse(attempt.request_payload) as {
+    taskContext?: unknown;
+    inputArtifacts?: Array<{ kind?: unknown; payload?: unknown; hash?: unknown }>;
+  };
+  if (stage.id === "analysis") {
+    const receipt = tuneReceipt(payloads, "tune_analysis", "stage.analysis.receipt");
+    if (typeof request.taskContext !== "string") throw new Error("tune analysis has no sealed task context");
+    const blocks = extractJsonBlocks(request.taskContext, TUNE_ANALYSIS_SCHEMA);
+    if (blocks.length !== 1) throw new Error("tune analysis requires one supervisor-sealed analysis contract");
+    const authorized = validateTuneAnalysisContract(JSON.parse(blocks[0]!) as unknown, {
+      source: "stage.analysis.authorized_analysis",
+    });
+    if (canonicalJson(receipt.payload.analysis) !== authorized.normalized) {
+      throw new Error("tune analysis receipt does not match the supervisor-sealed corpus");
+    }
+    return;
+  }
+
+  const receipt = tuneReceipt(payloads, "tune_proposal", "stage.proposal.receipt");
+  const predecessor = request.inputArtifacts?.find((artifact) => artifact.kind === "standard_receipt");
+  if (!predecessor || typeof predecessor.payload !== "string" || typeof predecessor.hash !== "string" ||
+      digestNormalized(predecessor.payload) !== predecessor.hash) {
+    throw new Error("tune proposal is missing its sealed analysis receipt");
+  }
+  const wrapper = JSON.parse(predecessor.payload) as { details?: { receipt?: unknown } };
+  const analysisReceipt = validateStandardReceipt(wrapper.details?.receipt, {
+    source: "stage.proposal.authorized_analysis_receipt",
+  }).value;
+  if (analysisReceipt.type !== "tune_analysis" ||
+      canonicalJson(receipt.payload.proposal.analysis) !== canonicalJson(analysisReceipt.payload.analysis)) {
+    throw new Error("tune proposal is not bound to its authorized analysis receipt");
+  }
 }
 
 function validateFence(
@@ -520,11 +581,13 @@ export function evaluateStageGate(
   if (options.observedSubject && event.subject !== options.observedSubject) {
     throw new Error("workspace changed after stage evidence was sealed");
   }
+  const artifactLimit = instance.task_type === "tune" ? TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES : ARTIFACT_LIMIT;
   const payloads = artifacts.map((artifact) => {
-    const payload = parseArtifactPayload(artifact);
+    const payload = parseArtifactPayload(artifact, artifactLimit);
     validateFence(payload, artifact, instance, attempt, stage, event, subject);
     return payload;
   });
+  if (instance.task_type === "tune") validateTuneReceiptAuthority(attempt, stage, payloads);
   const stageResult = payloads.find((payload) => payload.kind === "stage_result")!;
   if (artifacts.find((artifact) => artifact.kind === "stage_result")?.hash !== event.resultHash) {
     throw new Error("stage result event hash does not match its artifact");

@@ -79,6 +79,7 @@ const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
 const SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+|repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?:(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+\/)*(?!\.{1,2}$)[A-Za-z0-9._-]+)$/;
 const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const MAX_ARTIFACT_PAYLOAD_BYTES = 12 * 1024;
+const MAX_TUNE_ARTIFACT_PAYLOAD_BYTES = 768 * 1024;
 // Kept byte-identical with contracts/src/receipts.ts. Sixteen command receipts
 // can enter one bounded prior-evidence envelope, so these diagnostics are byte
 // bounded independently of the outer artifact limit.
@@ -309,8 +310,8 @@ function objectWithKnownKeys(value, label, keys) {
   return value;
 }
 
-function exactPayload(value, label, keys, env) {
-  return boundedPlainObject(objectWithKnownKeys(value, label, keys), label, env);
+function exactPayload(value, label, keys, env, maxBytes = 32 * 1024) {
+  return boundedPlainObject(objectWithKnownKeys(value, label, keys), label, env, maxBytes);
 }
 
 function boundedContextRecords(value, label, env) {
@@ -393,7 +394,13 @@ function receiptPayload(type, value, env) {
     const expectedSchema = type === "tune_analysis"
       ? "openthrottle.tune-analysis/v1"
       : "openthrottle.tune-proposal/v1";
-    const payload = exactPayload(value, "standard receipt payload", new Set(["summary", contractField]), env);
+    const payload = exactPayload(
+      value,
+      "standard receipt payload",
+      new Set(["summary", contractField]),
+      env,
+      type === "tune_analysis" ? 256 * 1024 : 640 * 1024
+    );
     if (!payload[contractField] || typeof payload[contractField] !== "object" || Array.isArray(payload[contractField])) {
       throw new Error(`standard receipt payload ${contractField} must be an object`);
     }
@@ -515,10 +522,10 @@ function exactObject(value, label, keys) {
   return value;
 }
 
-function boundedPlainObject(value, label, env) {
+function boundedPlainObject(value, label, env, maxBytes = 32 * 1024) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
   const sanitized = sanitizeArtifactText(JSON.stringify(value), env);
-  if (Buffer.byteLength(sanitized, "utf8") > 32 * 1024) throw new Error(`${label} exceeds the receipt payload limit`);
+  if (Buffer.byteLength(sanitized, "utf8") > maxBytes) throw new Error(`${label} exceeds the receipt payload limit`);
   return JSON.parse(sanitized);
 }
 
@@ -655,7 +662,11 @@ function artifactPayload({ kind, fence, assurance, result, summary, evidence, fi
 
 function sealArtifact(payload) {
   const normalized = canonicalJson(payload);
-  if (Buffer.byteLength(normalized, "utf8") > MAX_ARTIFACT_PAYLOAD_BYTES) {
+  const limit = payload.details?.receipt_type === "tune_analysis" ||
+      payload.details?.receipt_type === "tune_proposal"
+    ? MAX_TUNE_ARTIFACT_PAYLOAD_BYTES
+    : MAX_ARTIFACT_PAYLOAD_BYTES;
+  if (Buffer.byteLength(normalized, "utf8") > limit) {
     throw new Error(`artifact ${payload.kind} exceeds the sealed payload limit`);
   }
   return {
