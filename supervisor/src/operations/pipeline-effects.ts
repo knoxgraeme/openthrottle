@@ -16,6 +16,7 @@ import {
 import { evaluateCitationGate, type ResolvedCitation } from "../pipeline/citation-gate.js";
 import { evaluateImprovementProposalGate } from "../pipeline/improvement-proposal-gate.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "../pipeline/coordinator.js";
+import { completeStageAttemptActor } from "../pipeline/settlement.js";
 import { deriveStageFaultAttribution } from "../pipeline/fault-attribution.js";
 import type {
   PipelineEffectIntent,
@@ -615,13 +616,9 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       nativeSessionId: null,
       artifacts: [artifact],
     };
-    deps.tickets.finishRunAndThen({
-      runId: request.runId,
-      status: outcome === "failure" ? "failed" : "completed",
-      exitCode: outcome === "failure" ? 1 : 0,
-      ticketState: "active",
-      faultAttribution: outcome === "failure" ? "executor" : null,
-    }, () => coordinatePipelineEvent(deps.store, event));
+    completeStageAttemptActor(deps.store, deps.tickets, event, {
+      observedSubject: artifact.subject,
+    });
     acknowledgeEffect(effect, event.id, { resultHash: artifact.hash, outcome });
   };
 
