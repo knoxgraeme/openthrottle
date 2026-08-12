@@ -168,7 +168,10 @@ export function routeFinalReviewDecision(input: {
   maxRepairRounds: number;
 }): FinalReviewRouting {
   if (input.outcome === "success" || input.outcome === "no_change") return { action: "done" };
-  if (input.outcome === "semantic_repair_required") {
+  if (
+    input.outcome === "semantic_repair_required" ||
+    (input.outcome === "failure" && input.reason === "command_exit_nonzero")
+  ) {
     if (input.repairRounds + 1 > input.maxRepairRounds) {
       return { action: "escalate", reason: "final_review_repair_rounds_exhausted" };
     }

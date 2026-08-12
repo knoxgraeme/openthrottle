@@ -32,7 +32,7 @@ import {
 import { buildReviewSelectorAuthority } from "../pipeline/review-fanout.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
-const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url));
+const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v3.json", import.meta.url));
 
 describe("pipeline effect processor", () => {
   let db: Database.Database | undefined;
@@ -601,7 +601,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@2",
+      "    ref: core/structured@3",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -766,7 +766,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@2",
+      "    ref: core/structured@3",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -925,7 +925,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@2",
+      "    ref: core/structured@3",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -1159,10 +1159,13 @@ describe("pipeline effect processor", () => {
       });
 
       await processor.drain();
+      const expectedLeadSessionId = input.unitId === "unit_a" ? null : "thread-lead";
       expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
         { providerResourceId: "sandbox-child-drain" },
         expect.objectContaining({
           protocol: "loop-action@2",
+          contextPolicy: "prefer_resume",
+          nativeSessionId: expectedLeadSessionId,
           role: "lead",
           skill: "accept-unit",
           candidateSubject: input.candidate,
@@ -1182,7 +1185,7 @@ describe("pipeline effect processor", () => {
         attemptId: lead.parent_attempt_id,
         requestHash: lead.request_hash!,
         outcome: "success",
-        nativeSessionId: null,
+        nativeSessionId: "thread-lead",
         subject: input.candidate,
         receipt: receiptJson({
           instance,
@@ -1240,7 +1243,11 @@ describe("pipeline effect processor", () => {
       });
       await processor.drain();
       expect(pipelines.listWorkAttempts(attempt.id).find((attempt) => attempt.id === lead.id))
-        .toMatchObject({ status: "completed", output_subject: input.candidate });
+        .toMatchObject({
+          status: "completed",
+          output_subject: input.candidate,
+          native_session_id: "thread-lead",
+        });
 
       await processor.drain();
       expect(runtime.dispatchChildExecutorAction).toHaveBeenLastCalledWith(
@@ -1963,7 +1970,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@2",
+      "    ref: core/structured@3",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -2100,7 +2107,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@2",
+      "    ref: core/structured@3",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));
@@ -2238,7 +2245,7 @@ describe("pipeline effect processor", () => {
       "    ref: core/simple@1",
       "  - id: structured",
       "    kind: builtin",
-      "    ref: core/structured@2",
+      "    ref: core/structured@3",
       "commands: { test: npm test, lint: npm run lint, build: npm run build }",
       "pipelines: { implement: implement }",
     ].join("\n"));

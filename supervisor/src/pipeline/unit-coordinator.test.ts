@@ -440,7 +440,13 @@ describe("unit coordinator", () => {
       outcome: "semantic_repair_required", reason: "unresolved_review_finding", repairRounds: 0, maxRepairRounds: 3,
     })).toEqual({ action: "repair", repairRounds: 1 });
     expect(routeFinalReviewDecision({
+      outcome: "failure", reason: "command_exit_nonzero", repairRounds: 0, maxRepairRounds: 3,
+    })).toEqual({ action: "repair", repairRounds: 1 });
+    expect(routeFinalReviewDecision({
       outcome: "semantic_repair_required", reason: "unresolved_review_finding", repairRounds: 3, maxRepairRounds: 3,
+    })).toEqual({ action: "escalate", reason: "final_review_repair_rounds_exhausted" });
+    expect(routeFinalReviewDecision({
+      outcome: "failure", reason: "command_exit_nonzero", repairRounds: 3, maxRepairRounds: 3,
     })).toEqual({ action: "escalate", reason: "final_review_repair_rounds_exhausted" });
     expect(routeFinalReviewDecision({
       outcome: "needs_human", reason: "review_needs_human", repairRounds: 0, maxRepairRounds: 3,

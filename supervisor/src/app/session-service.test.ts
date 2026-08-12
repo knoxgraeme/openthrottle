@@ -657,7 +657,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@2
+    ref: core/structured@3
 pipelines: { implement: implement, structured: fixture-command }
 intents:
   implement:
@@ -676,7 +676,7 @@ intents:
     });
     expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
       pipeline_id: "builtin/structured",
-      pipeline_version: 2,
+      pipeline_version: 3,
       active_stage_id: "units",
     });
   });
@@ -2755,7 +2755,7 @@ graphs:
     ref: core/simple@1
   - id: structured
     kind: builtin
-    ref: core/structured@3
+    ref: core/structured@4
 pipelines: { implement: implement }
 intents:
   implement:
@@ -2769,7 +2769,7 @@ intents:
 
     expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "error" });
     const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
-    expect(payloads.some((entry) => entry.includes("unknown built-in graph reference core/structured@3"))).toBe(true);
+    expect(payloads.some((entry) => entry.includes("unknown built-in graph reference core/structured@4"))).toBe(true);
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
   });
 

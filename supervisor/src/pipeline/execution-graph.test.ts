@@ -14,11 +14,12 @@ const simpleGraphPath = fileURLToPath(new URL("../../graphs/simple-v1.json", imp
 const investigateGraphPath = fileURLToPath(new URL("../../graphs/investigate-v1.json", import.meta.url));
 const structuredV1GraphPath = fileURLToPath(new URL("../../graphs/structured-v1.json", import.meta.url));
 const structuredV2GraphPath = fileURLToPath(new URL("../../graphs/structured-v2.json", import.meta.url));
+const structuredV3GraphPath = fileURLToPath(new URL("../../graphs/structured-v3.json", import.meta.url));
 const SIMPLE_GRAPH_DIGEST = "2f25ae9b891405d0e73e5f3c0f103354183c8cb27ca923cbd06baa6c470b76d1";
 const SIMPLE_MANIFEST_DIGEST = "f49011080d9f377bf4b9507eb1b47243e7a87f0918acfcc10e80b5940b505c0d";
 const INVESTIGATE_GRAPH_DIGEST = "a76d3e1360d92f41bc7aa9ed2372e294555478d5854808bf0c2a5ed7febaf317";
 const INVESTIGATE_MANIFEST_DIGEST = "80bb12f5b10d771d65d7235e308c2489b33ff6878a452069cf8c23621dec9329";
-const STRUCTURED_V2_COMPILE_OPTIONS = {
+const STRUCTURED_AGGREGATE_PUBLISH_OPTIONS = {
   aggregatePublishContext: "prefer_resume",
 } as const;
 
@@ -273,7 +274,7 @@ describe("execution graph compiler", () => {
     const compiled = parseAndCompileExecutionGraph(readFileSync(structuredV2GraphPath, "utf8"), {
       source: structuredV2GraphPath,
       runtime: runtime.descriptor,
-      ...STRUCTURED_V2_COMPILE_OPTIONS,
+      ...STRUCTURED_AGGREGATE_PUBLISH_OPTIONS,
     });
 
     expect(compiled.manifest.manifest).toMatchObject({
@@ -345,12 +346,19 @@ describe("execution graph compiler", () => {
   });
 
   it("compiles the structured graph against the shipped production runtime descriptor", () => {
-    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredV2GraphPath, "utf8"), {
-      source: structuredV2GraphPath,
+    const compiled = parseAndCompileExecutionGraph(readFileSync(structuredV3GraphPath, "utf8"), {
+      source: structuredV3GraphPath,
       runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
-      ...STRUCTURED_V2_COMPILE_OPTIONS,
+      ...STRUCTURED_AGGREGATE_PUBLISH_OPTIONS,
     });
     expect(compiled.manifest.manifest.requires.capabilities).toContain("graph/for-each-unit@1");
+    expect(compiled.manifest.manifest.version).toBe(3);
+    expect(compiled.manifest.manifest.stages[0]?.unitPhaseBindings?.find((binding) => binding.id === "lead"))
+      .toMatchObject({
+        kind: "gate",
+        context: "prefer_resume",
+        worker: { id: "lead-worker", session_scope: "graph" },
+      });
   });
 
   it("preserves repository graph output for direct aggregate publish unless explicitly opted in", () => {

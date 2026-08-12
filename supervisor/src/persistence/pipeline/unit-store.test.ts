@@ -90,6 +90,17 @@ function unitPhaseBindings(model = "gpt-5"): PipelineUnitPhaseBinding[] {
   ];
 }
 
+function graphScopedLeadUnitPhaseBindings(): PipelineUnitPhaseBinding[] {
+  return unitPhaseBindings().map((binding) => {
+    if (binding.id !== "lead" || binding.kind !== "gate") return binding;
+    return {
+      ...binding,
+      worker: { ...binding.worker, session_scope: "graph" },
+      context: "prefer_resume",
+    };
+  });
+}
+
 function commandFirstUnitPhaseBindings(commands: string[]): PipelineUnitPhaseBinding[] {
   return [
     { id: "command", kind: "command", commands },
@@ -702,6 +713,78 @@ describe("execution unit store", () => {
     // The second unit only starts once the first has fully settled.
     const second = lease(store);
     expect(second).toMatchObject({ unit_id: "b", action_kind: "implement" });
+  });
+
+  it("reuses a graph-scoped lead session across unit decisions", () => {
+    const store = setup();
+    const firstSubject = "1".repeat(40);
+    const secondSubject = "2".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b" }],
+      unitPhaseBindings: graphScopedLeadUnitPhaseBindings(),
+    });
+
+    const firstImplement = lease(store);
+    store.completeUnitAction({
+      actionId: firstImplement.id,
+      resultHash: "r-implement-a",
+      outputSubject: firstSubject,
+      receipt: receiptJson("unit_completion"),
+    });
+    const firstCandidate = lease(store);
+    store.completeUnitAction({
+      actionId: firstCandidate.id,
+      resultHash: "r-candidate-a",
+      outputSubject: firstSubject,
+      receipt: receiptJson("candidate_evidence"),
+    });
+    const firstLead = lease(store);
+    expect(firstLead).toMatchObject({ action_kind: "lead", unit_id: "a", native_session_id: null });
+    store.markActionDispatched(firstLead.id, "request-hash-a", "native-lead-graph");
+    store.completeGatedAction({
+      actionId: firstLead.id,
+      resultHash: "r-lead-a",
+      outputSubject: firstSubject,
+      receipt: receiptJson("unit_decision"),
+      decision: gateDecision({ gateKind: "unit_acceptance", outcome: "success", subject: firstSubject }),
+    });
+    const firstIntegrate = lease(store);
+    store.completeGatedAction({
+      actionId: firstIntegrate.id,
+      resultHash: "r-integrate-a",
+      outputSubject: firstSubject,
+      decision: gateDecision({ gateKind: "integration", outcome: "success", subject: firstSubject }),
+    });
+
+    const secondImplement = lease(store);
+    store.completeUnitAction({
+      actionId: secondImplement.id,
+      resultHash: "r-implement-b",
+      outputSubject: secondSubject,
+      receipt: receiptJson("unit_completion"),
+    });
+    const secondCandidate = lease(store);
+    store.completeUnitAction({
+      actionId: secondCandidate.id,
+      resultHash: "r-candidate-b",
+      outputSubject: secondSubject,
+      receipt: receiptJson("candidate_evidence"),
+    });
+    const secondLead = lease(store);
+    expect(secondLead).toMatchObject({
+      action_kind: "lead",
+      unit_id: "b",
+      native_session_id: "native-lead-graph",
+    });
+    expect(JSON.parse(secondLead.payload)).toMatchObject({
+      resume_native_session_id: "native-lead-graph",
+    });
   });
 
   it("traverses a graph-declared unit phase order", () => {
@@ -3629,6 +3712,48 @@ describe("execution unit store", () => {
       attempt.action_kind === "final_repair"
     )).toHaveLength(1);
     expect(lease(store)).toBeUndefined();
+  });
+
+  it("routes an exact nonzero final-command decision into bounded final repair", () => {
+    const store = setup();
+    const subject = "1".repeat(40);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }],
+      unitPhaseBindings: builtinUnitPhaseBindings(["test"]),
+    });
+    completeUnitToTerminal(store, subject, ["test"]);
+
+    const finalCommand = lease(store);
+    store.completeUnitAction({
+      actionId: finalCommand.id,
+      resultHash: "r-final-command",
+      outputSubject: subject,
+      receipt: receiptJson("command_result", { payload: { command: "test", exit_code: 1 } }),
+    });
+    const finalReview = lease(store);
+    store.completeGatedAction({
+      actionId: finalReview.id,
+      resultHash: "r-final-review",
+      outputSubject: subject,
+      decision: gateDecision({
+        gateKind: "final_review",
+        outcome: "failure",
+        subject,
+        reason: "command_exit_nonzero",
+      }),
+    });
+
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      final_phase: "repair",
+      final_repair_rounds: 1,
+    });
+    expect(lease(store)).toMatchObject({ action_kind: "final_repair", cycle: 1 });
   });
 
   it("rejects completing a gated phase through the non-gated method and vice versa", () => {
