@@ -1,3 +1,17 @@
+import { canonicalJson, digestCanonicalJson } from "./canonical.js";
+import {
+  ANALYSIS_QUERY_ATTRIBUTIONS,
+  ANALYSIS_QUERY_OUTCOMES,
+  ANALYSIS_QUERY_REASONS,
+  validateCitationContractProposal,
+  type AnalysisRunResult,
+  type CitationContractProposal,
+} from "./citation-contract.js";
+import {
+  validateRatchetDecision,
+  validateRatchetDifferentialInput,
+  type RatchetDifferentialInput,
+} from "./ratchet-contract.js";
 import {
   IDENTIFIER,
   SHA256,
@@ -26,7 +40,7 @@ export const TUNE_TARGET_KINDS = ["contract", "graph", "pipeline", "runtime", "s
 export const TUNE_SCOPES = ["repository", "pipeline", "runtime"] as const;
 export const TUNE_PROPOSAL_OUTCOMES = ["propose", "no_change", "needs_human"] as const;
 export const TUNE_DECISION_OUTCOMES = ["accept", "reject", "needs_human"] as const;
-export const TUNE_CORPUS_OUTCOMES = ["success", "failure", "needs_human", "canceled", "superseded"] as const;
+export const TUNE_CORPUS_OUTCOMES = ANALYSIS_QUERY_OUTCOMES;
 
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const PATH_PATTERN = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
@@ -38,15 +52,15 @@ const BASELINE_FIELDS = ["base_ref", "base_digest", "runtime_release", "capabili
 const TASK_FIELDS = ["schema", "id", "target", "query", "scope", "window", "baseline", "policy"] as const;
 const SEALED_INTENT_FIELDS = ["schema", "id", "task", "task_digest", "sealed_at", "authority_digest"] as const;
 const CORPUS_ROW_FIELDS = [
-  "id", "pipeline_instance_id", "generation", "graph_id", "outcome", "reason",
-  "created_at", "artifact_digests", "row_digest",
+  "id", "pipeline_instance_id", "generation", "execution_graph_id", "outcome", "closed_reason",
+  "fault_attribution", "created_at", "source_digests", "row_digest",
 ] as const;
-const ANALYSIS_FIELDS = ["schema", "id", "intent_digest", "corpus_rows", "corpus_digest", "generated_at"] as const;
+const ANALYSIS_FIELDS = ["schema", "id", "intent", "intent_digest", "corpus_rows", "corpus_digest", "generated_at"] as const;
 const CHANGE_FIELDS = ["path", "operation", "before_digest", "after_digest", "rationale"] as const;
 const PROPOSAL_FIELDS = [
-  "schema", "id", "intent", "corpus_rows", "corpus_digest", "target", "query",
+  "schema", "id", "analysis", "analysis_digest", "target", "query",
   "scope", "window", "baseline", "policy", "outcome", "changes",
-  "citation_contract_digest", "ratchet_contract_digest",
+  "citation_contract", "ratchet_input",
 ] as const;
 const DECISION_FIELDS = [
   "schema", "id", "proposal_digest", "citation_decision_digest", "ratchet_decision_digest", "outcome", "rationale",
@@ -67,7 +81,7 @@ export interface TuneTarget {
 
 export interface TuneQuery {
   outcome?: (typeof TUNE_CORPUS_OUTCOMES)[number];
-  reason?: string;
+  reason?: (typeof ANALYSIS_QUERY_REASONS)[number];
   graph?: string;
   skill?: string;
   limit: number;
@@ -113,21 +127,26 @@ export interface TuneSealedIntent {
   authority_digest: string;
 }
 
-export interface TuneCorpusRow {
+export interface TuneCorpusRowContent {
   id: string;
   pipeline_instance_id: string;
   generation: number;
-  graph_id: string;
+  execution_graph_id: string | null;
   outcome: (typeof TUNE_CORPUS_OUTCOMES)[number];
-  reason: string;
+  closed_reason: (typeof ANALYSIS_QUERY_REASONS)[number];
+  fault_attribution: (typeof ANALYSIS_QUERY_ATTRIBUTIONS)[number] | null;
   created_at: string;
-  artifact_digests: string[];
+  source_digests: string[];
+}
+
+export interface TuneCorpusRow extends TuneCorpusRowContent {
   row_digest: string;
 }
 
 export interface TuneAnalysis {
   schema: typeof TUNE_ANALYSIS_SCHEMA;
   id: string;
+  intent: TuneSealedIntent;
   intent_digest: string;
   corpus_rows: TuneCorpusRow[];
   corpus_digest: string;
@@ -145,9 +164,8 @@ export interface TuneProposalChange {
 export interface TuneProposal {
   schema: typeof TUNE_PROPOSAL_SCHEMA;
   id: string;
-  intent: TuneSealedIntent;
-  corpus_rows: TuneCorpusRow[];
-  corpus_digest: string;
+  analysis: TuneAnalysis;
+  analysis_digest: string;
   target: TuneTarget;
   query: TuneQuery;
   scope: (typeof TUNE_SCOPES)[number];
@@ -156,8 +174,8 @@ export interface TuneProposal {
   policy: TunePolicy;
   outcome: (typeof TUNE_PROPOSAL_OUTCOMES)[number];
   changes: TuneProposalChange[];
-  citation_contract_digest: string;
-  ratchet_contract_digest: string;
+  citation_contract: CitationContractProposal;
+  ratchet_input: RatchetDifferentialInput;
 }
 
 export interface TuneDecision {
@@ -190,6 +208,19 @@ export interface TuneReleaseDescriptor {
   issued_at: string;
 }
 
+export interface TuneDecisionValidationOptions {
+  source?: string;
+  proposal?: unknown;
+  citationDecisionDigest?: string;
+  ratchetDecision?: unknown;
+}
+
+export interface TuneEditAuthorizationValidationOptions {
+  source?: string;
+  proposal?: unknown;
+  decision?: unknown;
+}
+
 function timestamp(value: unknown, path: string): string {
   return stringAt(value, path, { max: 64, pattern: ISO_TIMESTAMP });
 }
@@ -220,7 +251,7 @@ function parseQuery(value: unknown, path: string): TuneQuery {
   const input = objectAt(value, path, QUERY_FIELDS);
   const query = {
     ...optional(input.outcome, (entry) => ({ outcome: enumAt(entry, `${path}.outcome`, TUNE_CORPUS_OUTCOMES) })),
-    ...optional(input.reason, (entry) => ({ reason: stringAt(entry, `${path}.reason`, { max: 120, pattern: IDENTIFIER }) })),
+    ...optional(input.reason, (entry) => ({ reason: enumAt(entry, `${path}.reason`, ANALYSIS_QUERY_REASONS) })),
     ...optional(input.graph, (entry) => ({ graph: stringAt(entry, `${path}.graph`, { max: 120, pattern: IDENTIFIER }) })),
     ...optional(input.skill, (entry) => ({ skill: stringAt(entry, `${path}.skill`, { max: 160 }) })),
     limit: integerAt(input.limit, `${path}.limit`, 1, 200),
@@ -295,45 +326,139 @@ function parseSealedIntentValue(value: unknown, source: string): TuneSealedInten
   return intent;
 }
 
+export function deriveTuneCorpusRowDigest(row: TuneCorpusRowContent): string {
+  return digestCanonicalJson(row);
+}
+
+export function deriveTuneCorpusDigest(rows: readonly TuneCorpusRow[]): string {
+  return digestCanonicalJson(rows);
+}
+
 function parseCorpusRow(value: unknown, path: string): TuneCorpusRow {
   const input = objectAt(value, path, CORPUS_ROW_FIELDS);
-  return {
+  const rowWithoutDigest = {
     id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
     pipeline_instance_id: stringAt(input.pipeline_instance_id, `${path}.pipeline_instance_id`, { max: 160 }),
     generation: integerAt(input.generation, `${path}.generation`, 1, 1_000_000),
-    graph_id: stringAt(input.graph_id, `${path}.graph_id`, { pattern: IDENTIFIER }),
+    execution_graph_id: input.execution_graph_id === null
+      ? null
+      : stringAt(input.execution_graph_id, `${path}.execution_graph_id`, { pattern: IDENTIFIER }),
     outcome: enumAt(input.outcome, `${path}.outcome`, TUNE_CORPUS_OUTCOMES),
-    reason: stringAt(input.reason, `${path}.reason`, { max: 120, pattern: IDENTIFIER }),
+    closed_reason: enumAt(input.closed_reason, `${path}.closed_reason`, ANALYSIS_QUERY_REASONS),
+    fault_attribution: input.fault_attribution === null
+      ? null
+      : enumAt(input.fault_attribution, `${path}.fault_attribution`, ANALYSIS_QUERY_ATTRIBUTIONS),
     created_at: timestamp(input.created_at, `${path}.created_at`),
-    artifact_digests: parseDigestList(input.artifact_digests, `${path}.artifact_digests`, { min: 1, max: 32 }),
+    source_digests: parseDigestList(input.source_digests, `${path}.source_digests`, { min: 1, max: 32 }),
+  };
+  const row: TuneCorpusRow = {
+    ...rowWithoutDigest,
     row_digest: stringAt(input.row_digest, `${path}.row_digest`, { pattern: SHA256 }),
+  };
+  if (deriveTuneCorpusRowDigest(rowWithoutDigest) !== row.row_digest) {
+    fail(`${path}.row_digest`, "does not match canonical row digest");
+  }
+  return row;
+}
+
+function analysisRunResult(row: TuneCorpusRow): AnalysisRunResult {
+  return {
+    pipeline_instance_id: row.pipeline_instance_id,
+    generation: row.generation,
+    execution_graph_id: row.execution_graph_id,
+    outcome: row.outcome,
+    closed_reason: row.closed_reason,
+    fault_attribution: row.fault_attribution,
+    created_at: row.created_at,
   };
 }
 
 function parseChange(value: unknown, path: string): TuneProposalChange {
   const input = objectAt(value, path, CHANGE_FIELDS);
-  return {
+  const change: TuneProposalChange = {
     path: stringAt(input.path, `${path}.path`, { max: 240, pattern: PATH_PATTERN }),
     operation: enumAt(input.operation, `${path}.operation`, ["add", "modify", "delete"] as const),
     before_digest: input.before_digest === null ? null : stringAt(input.before_digest, `${path}.before_digest`, { pattern: SHA256 }),
     after_digest: input.after_digest === null ? null : stringAt(input.after_digest, `${path}.after_digest`, { pattern: SHA256 }),
     rationale: stringAt(input.rationale, `${path}.rationale`, { max: 1_000 }),
   };
+  if (change.operation === "add" && (change.before_digest !== null || change.after_digest === null)) {
+    fail(path, "add requires null before_digest and a non-null after_digest");
+  }
+  if (change.operation === "modify" && (change.before_digest === null || change.after_digest === null)) {
+    fail(path, "modify requires non-null before_digest and after_digest");
+  }
+  if (change.operation === "delete" && (change.before_digest === null || change.after_digest !== null)) {
+    fail(path, "delete requires a non-null before_digest and null after_digest");
+  }
+  if (change.before_digest !== null && change.before_digest === change.after_digest) {
+    fail(path, "before_digest and after_digest must differ");
+  }
+  return change;
 }
 
 function assertProposalMatchesIntent(proposal: TuneProposal, source: string): void {
-  const task = proposal.intent.task;
-  if (JSON.stringify(proposal.target) !== JSON.stringify(task.target)) fail(`${source}.target`, "must match sealed intent target");
-  if (JSON.stringify(proposal.query) !== JSON.stringify(task.query)) fail(`${source}.query`, "must match sealed intent query");
+  const task = proposal.analysis.intent.task;
+  if (canonicalJson(proposal.target) !== canonicalJson(task.target)) fail(`${source}.target`, "must match sealed intent target");
+  if (canonicalJson(proposal.query) !== canonicalJson(task.query)) fail(`${source}.query`, "must match sealed intent query");
   if (proposal.scope !== task.scope) fail(`${source}.scope`, "must match sealed intent scope");
-  if (JSON.stringify(proposal.window) !== JSON.stringify(task.window)) fail(`${source}.window`, "must match sealed intent window");
-  if (JSON.stringify(proposal.baseline) !== JSON.stringify(task.baseline)) fail(`${source}.baseline`, "must match sealed intent baseline");
-  if (JSON.stringify(proposal.policy) !== JSON.stringify(task.policy)) fail(`${source}.policy`, "must match sealed intent policy");
+  if (canonicalJson(proposal.window) !== canonicalJson(task.window)) fail(`${source}.window`, "must match sealed intent window");
+  if (canonicalJson(proposal.baseline) !== canonicalJson(task.baseline)) fail(`${source}.baseline`, "must match sealed intent baseline");
+  if (canonicalJson(proposal.policy) !== canonicalJson(task.policy)) fail(`${source}.policy`, "must match sealed intent policy");
   if (proposal.changes.length > proposal.policy.max_changed_files) fail(`${source}.changes`, "exceeds policy max_changed_files");
   const allowed = proposal.policy.allow_edit_paths;
   for (const change of proposal.changes) {
     if (!allowed.some((prefix) => change.path === prefix || change.path.startsWith(`${prefix}/`))) {
       fail(`${source}.changes.${change.path}`, "is outside policy allow_edit_paths");
+    }
+  }
+}
+
+function assertProposalEvidenceBindings(proposal: TuneProposal, source: string): void {
+  if (proposal.citation_contract.id !== proposal.id) {
+    fail(`${source}.citation_contract.id`, "must match tune proposal id");
+  }
+  if (proposal.ratchet_input.id !== proposal.id) {
+    fail(`${source}.ratchet_input.id`, "must match tune proposal id");
+  }
+
+  const citationDigest = validateCitationContractProposal(proposal.citation_contract, {
+    source: `${source}.citation_contract`,
+  }).digest;
+  if (proposal.ratchet_input.tuner_authority?.proposal_digest !== citationDigest) {
+    fail(
+      `${source}.ratchet_input.tuner_authority.proposal_digest`,
+      "must match the canonical citation contract digest"
+    );
+  }
+
+  const sealedRowsByResult = new Map<string, Set<string>>();
+  for (const row of proposal.analysis.corpus_rows) {
+    const key = canonicalJson(analysisRunResult(row));
+    const sources = sealedRowsByResult.get(key) ?? new Set<string>();
+    for (const digest of row.source_digests) sources.add(digest);
+    sealedRowsByResult.set(key, sources);
+  }
+  for (let citationIndex = 0; citationIndex < proposal.citation_contract.citations.length; citationIndex += 1) {
+    const citation = proposal.citation_contract.citations[citationIndex]!;
+    const citationSources = new Set<string>();
+    for (let resultIndex = 0; resultIndex < citation.expected_result.length; resultIndex += 1) {
+      const sealedSources = sealedRowsByResult.get(canonicalJson(citation.expected_result[resultIndex]));
+      if (sealedSources === undefined) {
+        fail(
+          `${source}.citation_contract.citations[${citationIndex}].expected_result[${resultIndex}]`,
+          "is not present in the sealed analysis corpus"
+        );
+      }
+      for (const digest of sealedSources) citationSources.add(digest);
+    }
+    for (let digestIndex = 0; digestIndex < citation.source_digests.length; digestIndex += 1) {
+      if (!citationSources.has(citation.source_digests[digestIndex]!)) {
+        fail(
+          `${source}.citation_contract.citations[${citationIndex}].source_digests`,
+          "is not present in the sealed analysis corpus"
+        );
+      }
     }
   }
 }
@@ -369,18 +494,54 @@ export function validateTuneAnalysisContract(value: unknown, options: { source?:
   const source = options.source ?? "tune_analysis";
   const input = objectAt(value, source, ANALYSIS_FIELDS);
   if (input.schema !== TUNE_ANALYSIS_SCHEMA) fail(`${source}.schema`, `must be ${TUNE_ANALYSIS_SCHEMA}`);
-  return normalizedContract({
+  const intent = parseSealedIntentValue(input.intent, `${source}.intent`);
+  const analysis: TuneAnalysis = {
     schema: TUNE_ANALYSIS_SCHEMA,
     id: stringAt(input.id, `${source}.id`, { pattern: IDENTIFIER }),
+    intent,
     intent_digest: stringAt(input.intent_digest, `${source}.intent_digest`, { pattern: SHA256 }),
     corpus_rows: arrayAt(input.corpus_rows, `${source}.corpus_rows`, parseCorpusRow, { max: 200 }),
     corpus_digest: stringAt(input.corpus_digest, `${source}.corpus_digest`, { pattern: SHA256 }),
     generated_at: timestamp(input.generated_at, `${source}.generated_at`),
-  });
+  };
+  if (validateTuneSealedIntentContract(intent, { source: `${source}.intent` }).digest !== analysis.intent_digest) {
+    fail(`${source}.intent_digest`, "does not match canonical sealed intent digest");
+  }
+  if (deriveTuneCorpusDigest(analysis.corpus_rows) !== analysis.corpus_digest) {
+    fail(`${source}.corpus_digest`, "does not match canonical corpus digest");
+  }
+  const maximumRows = Math.min(intent.task.query.limit, intent.task.window.limit);
+  if (analysis.corpus_rows.length > maximumRows) {
+    fail(`${source}.corpus_rows`, "exceeds sealed intent query/window limit");
+  }
+  if (new Set(analysis.corpus_rows.map((row) => row.id)).size !== analysis.corpus_rows.length) {
+    fail(`${source}.corpus_rows`, "must not contain duplicate ids");
+  }
+  const runKeys = analysis.corpus_rows.map((row) => `${row.pipeline_instance_id}:${row.generation}`);
+  if (new Set(runKeys).size !== runKeys.length) {
+    fail(`${source}.corpus_rows`, "must not contain duplicate pipeline generation rows");
+  }
+  for (let index = 0; index < analysis.corpus_rows.length; index += 1) {
+    const row = analysis.corpus_rows[index]!;
+    if (row.created_at < intent.task.window.from || row.created_at > intent.task.window.to) {
+      fail(`${source}.corpus_rows[${index}].created_at`, "is outside the sealed intent window");
+    }
+    const query = intent.task.query;
+    if (query.outcome !== undefined && row.outcome !== query.outcome) {
+      fail(`${source}.corpus_rows[${index}].outcome`, "does not match sealed intent query");
+    }
+    if (query.reason !== undefined && row.closed_reason !== query.reason) {
+      fail(`${source}.corpus_rows[${index}].closed_reason`, "does not match sealed intent query");
+    }
+    if (query.graph !== undefined && row.execution_graph_id !== query.graph) {
+      fail(`${source}.corpus_rows[${index}].execution_graph_id`, "does not match sealed intent query");
+    }
+  }
+  return normalizedContract(analysis);
 }
 
 export function parseTuneAnalysisContract(raw: string, options: { source?: string } = {}): ValidatedContract<TuneAnalysis> {
-  return parseBoundedJsonContract(raw, options, "tune_analysis", 128, validateTuneAnalysisContract);
+  return parseBoundedJsonContract(raw, options, "tune_analysis", 256, validateTuneAnalysisContract);
 }
 
 export function validateTuneProposalContract(value: unknown, options: { source?: string } = {}): ValidatedContract<TuneProposal> {
@@ -390,9 +551,8 @@ export function validateTuneProposalContract(value: unknown, options: { source?:
   const proposal: TuneProposal = {
     schema: TUNE_PROPOSAL_SCHEMA,
     id: stringAt(input.id, `${source}.id`, { pattern: IDENTIFIER }),
-    intent: parseSealedIntentValue(input.intent, `${source}.intent`),
-    corpus_rows: arrayAt(input.corpus_rows, `${source}.corpus_rows`, parseCorpusRow, { max: 200 }),
-    corpus_digest: stringAt(input.corpus_digest, `${source}.corpus_digest`, { pattern: SHA256 }),
+    analysis: validateTuneAnalysisContract(input.analysis, { source: `${source}.analysis` }).value,
+    analysis_digest: stringAt(input.analysis_digest, `${source}.analysis_digest`, { pattern: SHA256 }),
     target: parseTarget(input.target, `${source}.target`),
     query: parseQuery(input.query, `${source}.query`),
     scope: enumAt(input.scope, `${source}.scope`, TUNE_SCOPES),
@@ -401,22 +561,42 @@ export function validateTuneProposalContract(value: unknown, options: { source?:
     policy: parsePolicy(input.policy, `${source}.policy`),
     outcome: enumAt(input.outcome, `${source}.outcome`, TUNE_PROPOSAL_OUTCOMES),
     changes: arrayAt(input.changes, `${source}.changes`, parseChange, { max: 64 }),
-    citation_contract_digest: stringAt(input.citation_contract_digest, `${source}.citation_contract_digest`, { pattern: SHA256 }),
-    ratchet_contract_digest: stringAt(input.ratchet_contract_digest, `${source}.ratchet_contract_digest`, { pattern: SHA256 }),
+    citation_contract: validateCitationContractProposal(input.citation_contract, {
+      source: `${source}.citation_contract`,
+    }).value,
+    ratchet_input: validateRatchetDifferentialInput(input.ratchet_input, {
+      source: `${source}.ratchet_input`,
+    }).value,
   };
+  if (validateTuneAnalysisContract(proposal.analysis, { source: `${source}.analysis` }).digest !== proposal.analysis_digest) {
+    fail(`${source}.analysis_digest`, "does not match canonical tune analysis digest");
+  }
+  if (proposal.outcome === "propose" && proposal.changes.length === 0) {
+    fail(`${source}.changes`, "must contain at least one change when outcome is propose");
+  }
+  if (proposal.outcome !== "propose" && proposal.changes.length !== 0) {
+    fail(`${source}.changes`, "must be empty unless outcome is propose");
+  }
+  if (new Set(proposal.changes.map((change) => change.path)).size !== proposal.changes.length) {
+    fail(`${source}.changes`, "must not contain duplicate paths");
+  }
   assertProposalMatchesIntent(proposal, source);
+  assertProposalEvidenceBindings(proposal, source);
   return normalizedContract(proposal);
 }
 
 export function parseTuneProposalContract(raw: string, options: { source?: string } = {}): ValidatedContract<TuneProposal> {
-  return parseBoundedJsonContract(raw, options, "tune_proposal", 256, validateTuneProposalContract);
+  return parseBoundedJsonContract(raw, options, "tune_proposal", 640, validateTuneProposalContract);
 }
 
-export function validateTuneDecisionContract(value: unknown, options: { source?: string } = {}): ValidatedContract<TuneDecision> {
+export function validateTuneDecisionContract(
+  value: unknown,
+  options: TuneDecisionValidationOptions = {}
+): ValidatedContract<TuneDecision> {
   const source = options.source ?? "tune_decision";
   const input = objectAt(value, source, DECISION_FIELDS);
   if (input.schema !== TUNE_DECISION_SCHEMA) fail(`${source}.schema`, `must be ${TUNE_DECISION_SCHEMA}`);
-  return normalizedContract({
+  const decision: TuneDecision = {
     schema: TUNE_DECISION_SCHEMA,
     id: stringAt(input.id, `${source}.id`, { pattern: IDENTIFIER }),
     proposal_digest: stringAt(input.proposal_digest, `${source}.proposal_digest`, { pattern: SHA256 }),
@@ -424,14 +604,59 @@ export function validateTuneDecisionContract(value: unknown, options: { source?:
     ratchet_decision_digest: stringAt(input.ratchet_decision_digest, `${source}.ratchet_decision_digest`, { pattern: SHA256 }),
     outcome: enumAt(input.outcome, `${source}.outcome`, TUNE_DECISION_OUTCOMES),
     rationale: stringAt(input.rationale, `${source}.rationale`, { max: 2_000 }),
-  });
+  };
+  let proposal: TuneProposal | undefined;
+  if (options.proposal !== undefined) {
+    const validatedProposal = validateTuneProposalContract(options.proposal, { source: `${source}.proposal` });
+    proposal = validatedProposal.value;
+    if (decision.proposal_digest !== validatedProposal.digest) {
+      fail(`${source}.proposal_digest`, "does not match canonical tune proposal digest");
+    }
+    if (decision.outcome === "accept" && proposal.outcome !== "propose") {
+      fail(`${source}.outcome`, "cannot accept a proposal without proposed changes");
+    }
+  }
+  if (options.citationDecisionDigest !== undefined) {
+    const expected = stringAt(options.citationDecisionDigest, `${source}.expected_citation_decision_digest`, {
+      pattern: SHA256,
+    });
+    if (decision.citation_decision_digest !== expected) {
+      fail(`${source}.citation_decision_digest`, "does not match supervisor citation decision digest");
+    }
+  }
+  if (options.ratchetDecision !== undefined) {
+    const validatedRatchetDecision = validateRatchetDecision(options.ratchetDecision, {
+      source: `${source}.ratchet_decision`,
+    });
+    if (decision.ratchet_decision_digest !== validatedRatchetDecision.digest) {
+      fail(`${source}.ratchet_decision_digest`, "does not match canonical ratchet decision digest");
+    }
+    if (proposal !== undefined) {
+      const ratchetInputDigest = validateRatchetDifferentialInput(proposal.ratchet_input, {
+        source: `${source}.proposal.ratchet_input`,
+      }).digest;
+      if (validatedRatchetDecision.value.input_digest !== ratchetInputDigest) {
+        fail(`${source}.ratchet_decision_digest`, "ratchet decision does not bind the proposal ratchet input");
+      }
+    }
+    if (decision.outcome === "accept" && validatedRatchetDecision.value.outcome !== "accept") {
+      fail(`${source}.outcome`, "cannot accept when the ratchet decision rejects");
+    }
+  }
+  return normalizedContract(decision);
 }
 
-export function parseTuneDecisionContract(raw: string, options: { source?: string } = {}): ValidatedContract<TuneDecision> {
+export function parseTuneDecisionContract(
+  raw: string,
+  options: TuneDecisionValidationOptions = {}
+): ValidatedContract<TuneDecision> {
   return parseBoundedJsonContract(raw, options, "tune_decision", 32, validateTuneDecisionContract);
 }
 
-export function validateTuneEditAuthorizationContract(value: unknown, options: { source?: string } = {}): ValidatedContract<TuneEditAuthorization> {
+export function validateTuneEditAuthorizationContract(
+  value: unknown,
+  options: TuneEditAuthorizationValidationOptions = {}
+): ValidatedContract<TuneEditAuthorization> {
   const source = options.source ?? "tune_edit_authorization";
   const input = objectAt(value, source, EDIT_AUTHORIZATION_FIELDS);
   if (input.schema !== TUNE_EDIT_AUTHORIZATION_SCHEMA) fail(`${source}.schema`, `must be ${TUNE_EDIT_AUTHORIZATION_SCHEMA}`);
@@ -446,10 +671,43 @@ export function validateTuneEditAuthorizationContract(value: unknown, options: {
     actor_id: stringAt(input.actor_id, `${source}.actor_id`, { max: 160, pattern: IDENTIFIER }),
   };
   if (authorization.authorized_at > authorization.expires_at) fail(source, "authorized_at must not be later than expires_at");
+  let proposal: ValidatedContract<TuneProposal> | undefined;
+  if (options.proposal !== undefined) {
+    proposal = validateTuneProposalContract(options.proposal, { source: `${source}.proposal` });
+    if (authorization.proposal_digest !== proposal.digest) {
+      fail(`${source}.proposal_digest`, "does not match canonical tune proposal digest");
+    }
+    if (proposal.value.outcome !== "propose") {
+      fail(`${source}.proposal_digest`, "must reference a proposal with proposed changes");
+    }
+    const proposedPaths = proposal.value.changes.map((change) => change.path).sort();
+    const authorizedPaths = [...authorization.authorized_paths].sort();
+    if (canonicalJson(proposedPaths) !== canonicalJson(authorizedPaths)) {
+      fail(`${source}.authorized_paths`, "must exactly match the accepted proposal change paths");
+    }
+  }
+  if (options.decision !== undefined) {
+    const decision = validateTuneDecisionContract(options.decision, {
+      source: `${source}.decision`,
+      ...(proposal === undefined ? {} : { proposal: proposal.value }),
+    });
+    if (authorization.decision_digest !== decision.digest) {
+      fail(`${source}.decision_digest`, "does not match canonical tune decision digest");
+    }
+    if (authorization.proposal_digest !== decision.value.proposal_digest) {
+      fail(`${source}.proposal_digest`, "does not match the tune decision proposal digest");
+    }
+    if (decision.value.outcome !== "accept") {
+      fail(`${source}.decision_digest`, "must reference an accepted tune decision");
+    }
+  }
   return normalizedContract(authorization);
 }
 
-export function parseTuneEditAuthorizationContract(raw: string, options: { source?: string } = {}): ValidatedContract<TuneEditAuthorization> {
+export function parseTuneEditAuthorizationContract(
+  raw: string,
+  options: TuneEditAuthorizationValidationOptions = {}
+): ValidatedContract<TuneEditAuthorization> {
   return parseBoundedJsonContract(raw, options, "tune_edit_authorization", 32, validateTuneEditAuthorizationContract);
 }
 

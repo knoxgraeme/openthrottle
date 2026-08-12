@@ -7,14 +7,22 @@ import { parseExecutionPlanContract } from "./execution-plan.js";
 import { parseGraphContract } from "./graph.js";
 import {
   decideDifferentialRatchet,
+  deriveTuneCorpusDigest,
+  deriveTuneCorpusRowDigest,
   parseCitationContractProposal,
   parseRatchetDifferentialInput,
   parseStandardReceipt,
+  validateCitationContractProposal,
+  validateTuneAnalysisContract,
+  validateTuneDecisionContract,
+  validateTuneEditAuthorizationContract,
   validateTuneProposalContract,
   validateTuneSealedIntentContract,
   validateTuneTaskContract,
   validateRatchetDecision,
   validateStandardReceipt,
+  type TuneCorpusRow,
+  type TuneCorpusRowContent,
 } from "./index.js";
 
 const fixtureRoot = new URL("../fixtures", import.meta.url);
@@ -115,7 +123,7 @@ describe("Stage C contract fixtures", () => {
         path: "skills/tasks/implement-unit/SKILL.md",
         digest: "a".repeat(64),
       },
-      query: { outcome: "failure", graph: "structured", limit: 50 },
+      query: { outcome: "failed", graph: "structured", limit: 50 },
       scope: "repository",
       window: {
         from: "2026-08-01T00:00:00.000Z",
@@ -149,17 +157,96 @@ describe("Stage C contract fixtures", () => {
     };
   }
 
-  function corpusRow(): Record<string, unknown> {
-    return {
+  function corpusRow(): TuneCorpusRow {
+    const row: TuneCorpusRowContent = {
       id: "row_one",
       pipeline_instance_id: "pipeline-1",
       generation: 5,
-      graph_id: "structured",
-      outcome: "failure",
-      reason: "failure",
+      execution_graph_id: "structured",
+      outcome: "failed",
+      closed_reason: "failure",
+      fault_attribution: "agent",
       created_at: "2026-08-11T00:00:00.000Z",
-      artifact_digests: ["e".repeat(64)],
-      row_digest: "f".repeat(64),
+      source_digests: ["e".repeat(64)],
+    };
+    return { ...row, row_digest: deriveTuneCorpusRowDigest(row) };
+  }
+
+  function tuneAnalysis(): Record<string, unknown> {
+    const intent = tuneIntent();
+    const rows = [corpusRow()];
+    return {
+      schema: "openthrottle.tune-analysis/v1",
+      id: "analysis_one",
+      intent,
+      intent_digest: validateTuneSealedIntentContract(intent).digest,
+      corpus_rows: rows,
+      corpus_digest: deriveTuneCorpusDigest(rows),
+      generated_at: "2026-08-12T00:02:00.000Z",
+    };
+  }
+
+  function tuneProposal(): Record<string, unknown> {
+    const analysis = tuneAnalysis();
+    const intent = analysis.intent as Record<string, unknown>;
+    const task = intent.task as Record<string, unknown>;
+    const row = (analysis.corpus_rows as Record<string, unknown>[])[0]!;
+    const citationContract: Record<string, unknown> = {
+      schema: "openthrottle.citation-contract/v1",
+      id: "proposal_one",
+      summary: "The proposed change is grounded in a sealed failed run.",
+      claims: [{ id: "claim_one", text: "A failed structured run exists.", citation_ids: ["citation_one"] }],
+      citations: [{
+        id: "citation_one",
+        query: { outcome: "failed", reason: "failure", graph: "structured", limit: 50 },
+        expected_result: [{
+          pipeline_instance_id: row.pipeline_instance_id,
+          generation: row.generation,
+          execution_graph_id: row.execution_graph_id,
+          outcome: row.outcome,
+          closed_reason: row.closed_reason,
+          fault_attribution: row.fault_attribution,
+          created_at: row.created_at,
+        }],
+        source_digests: structuredClone(row.source_digests),
+      }],
+      dispositions: [{
+        claim_id: "claim_one",
+        disposition: "supported",
+        rationale: "The sealed corpus contains the cited run.",
+        citation_ids: ["citation_one"],
+      }],
+      grades: [{
+        id: "overall",
+        value: "pass",
+        disposition_claim_ids: ["claim_one"],
+        rationale: "The claim is grounded.",
+      }],
+    };
+    const ratchetInput = parseRatchetDifferentialInput(readFixture("valid", "ratchet-contract.json")).value;
+    ratchetInput.id = "proposal_one";
+    ratchetInput.tuner_authority!.proposal_digest = validateCitationContractProposal(citationContract).digest;
+    return {
+      schema: "openthrottle.tune-proposal/v1",
+      id: "proposal_one",
+      analysis,
+      analysis_digest: validateTuneAnalysisContract(analysis).digest,
+      target: structuredClone(task.target),
+      query: structuredClone(task.query),
+      scope: task.scope,
+      window: structuredClone(task.window),
+      baseline: structuredClone(task.baseline),
+      policy: structuredClone(task.policy),
+      outcome: "propose",
+      changes: [{
+        path: "skills/tasks/implement-unit/SKILL.md",
+        operation: "modify",
+        before_digest: "2".repeat(64),
+        after_digest: "3".repeat(64),
+        rationale: "Tighten bounded receipt guidance.",
+      }],
+      citation_contract: citationContract,
+      ratchet_input: ratchetInput,
     };
   }
 
@@ -235,66 +322,64 @@ describe("Stage C contract fixtures", () => {
     }
   });
 
-  it("validates tune proposals against the sealed intent fields, not digest equality alone", () => {
-    const intent = tuneIntent();
-    const task = intent.task as Record<string, unknown>;
-    const proposal: Record<string, unknown> = {
-      schema: "openthrottle.tune-proposal/v1",
-      id: "proposal_one",
-      intent,
-      corpus_rows: [corpusRow()],
-      corpus_digest: "1".repeat(64),
-      target: structuredClone(task.target),
-      query: structuredClone(task.query),
-      scope: task.scope,
-      window: structuredClone(task.window),
-      baseline: structuredClone(task.baseline),
-      policy: structuredClone(task.policy),
-      outcome: "propose",
-      changes: [{
-        path: "skills/tasks/implement-unit/SKILL.md",
-        operation: "modify",
-        before_digest: "2".repeat(64),
-        after_digest: "3".repeat(64),
-        rationale: "Tighten bounded receipt guidance.",
-      }],
-      citation_contract_digest: "4".repeat(64),
-      ratchet_contract_digest: "5".repeat(64),
-    };
-
-    expect(validateTuneSealedIntentContract(intent).digest).toBeTruthy();
+  it("recomputes tune corpus and analysis bindings before accepting a proposal", () => {
+    const proposal = tuneProposal();
     expect(validateTuneProposalContract(proposal).value.changes).toHaveLength(1);
 
     const mismatched = structuredClone(proposal);
     (mismatched.query as Record<string, unknown>).graph = "other_graph";
     expect(() => validateTuneProposalContract(mismatched, { source: "proposal" }))
       .toThrow(/proposal\.query: must match sealed intent query/);
+
+    const badRow = structuredClone(tuneAnalysis());
+    ((badRow.corpus_rows as Record<string, unknown>[])[0]!).outcome = "shipped";
+    expect(() => validateTuneAnalysisContract(badRow, { source: "analysis" }))
+      .toThrow(/analysis\.corpus_rows\[0\]\.row_digest: does not match canonical row digest/);
+
+    const badCorpus = structuredClone(tuneAnalysis());
+    badCorpus.corpus_digest = "f".repeat(64);
+    expect(() => validateTuneAnalysisContract(badCorpus, { source: "analysis" }))
+      .toThrow(/analysis\.corpus_digest: does not match canonical corpus digest/);
+
+    const badAnalysisDigest = tuneProposal();
+    badAnalysisDigest.analysis_digest = "f".repeat(64);
+    expect(() => validateTuneProposalContract(badAnalysisDigest, { source: "proposal" }))
+      .toThrow(/proposal\.analysis_digest: does not match canonical tune analysis digest/);
   });
 
-  it("rejects raw untyped prose in tune corpus rows and changes outside the sealed policy", () => {
-    const intent = tuneIntent();
-    const task = intent.task as Record<string, unknown>;
-    const proposal: Record<string, unknown> = {
-      schema: "openthrottle.tune-proposal/v1",
-      id: "proposal_one",
-      intent,
-      corpus_rows: [{ ...corpusRow(), raw_ticket_text: "untrusted prose" }],
-      corpus_digest: "1".repeat(64),
-      target: structuredClone(task.target),
-      query: structuredClone(task.query),
-      scope: task.scope,
-      window: structuredClone(task.window),
-      baseline: structuredClone(task.baseline),
-      policy: structuredClone(task.policy),
-      outcome: "propose",
-      changes: [],
-      citation_contract_digest: "4".repeat(64),
-      ratchet_contract_digest: "5".repeat(64),
-    };
-
+  it("rejects raw corpus prose, evidence substitution, and changes outside sealed policy", () => {
+    const badAnalysis = tuneAnalysis();
+    badAnalysis.corpus_rows = [{ ...corpusRow(), raw_ticket_text: "untrusted prose" }];
+    const proposal = tuneProposal();
+    proposal.analysis = badAnalysis;
+    proposal.analysis_digest = validateTuneAnalysisContract(tuneAnalysis()).digest;
     expect(() => validateTuneProposalContract(proposal, { source: "proposal" }))
       .toThrow(/raw_ticket_text: unknown field/);
-    proposal.corpus_rows = [corpusRow()];
+
+    Object.assign(proposal, tuneProposal());
+    const citation = ((proposal.citation_contract as Record<string, unknown>).citations as Record<string, unknown>[])[0]!;
+    citation.source_digests = ["f".repeat(64)];
+    ((proposal.ratchet_input as Record<string, unknown>).tuner_authority as Record<string, unknown>).proposal_digest =
+      validateCitationContractProposal(proposal.citation_contract).digest;
+    expect(() => validateTuneProposalContract(proposal, { source: "proposal" }))
+      .toThrow(/source_digests: is not present in the sealed analysis corpus/);
+
+    Object.assign(proposal, tuneProposal());
+    ((proposal.ratchet_input as Record<string, unknown>).tuner_authority as Record<string, unknown>).proposal_digest =
+      "f".repeat(64);
+    expect(() => validateTuneProposalContract(proposal, { source: "proposal" }))
+      .toThrow(/tuner_authority\.proposal_digest: must match the canonical citation contract digest/);
+
+    Object.assign(proposal, tuneProposal());
+    const substitutedResult = ((((proposal.citation_contract as Record<string, unknown>).citations as Record<string, unknown>[])[0]!
+      .expected_result as Record<string, unknown>[])[0])!;
+    substitutedResult.generation = 99;
+    ((proposal.ratchet_input as Record<string, unknown>).tuner_authority as Record<string, unknown>).proposal_digest =
+      validateCitationContractProposal(proposal.citation_contract).digest;
+    expect(() => validateTuneProposalContract(proposal, { source: "proposal" }))
+      .toThrow(/expected_result\[0\]: is not present in the sealed analysis corpus/);
+
+    Object.assign(proposal, tuneProposal());
     proposal.changes = [{
       path: "supervisor/src/index.ts",
       operation: "modify",
@@ -304,6 +389,72 @@ describe("Stage C contract fixtures", () => {
     }];
     expect(() => validateTuneProposalContract(proposal, { source: "proposal" }))
       .toThrow(/outside policy allow_edit_paths/);
+  });
+
+  it("binds tune decision and edit authorization digests to validated upstream contracts", () => {
+    const proposal = tuneProposal();
+    const proposalDigest = validateTuneProposalContract(proposal).digest;
+    const ratchetDecision = decideDifferentialRatchet(
+      (proposal.ratchet_input as ReturnType<typeof parseRatchetDifferentialInput>["value"])
+    );
+    const decision: Record<string, unknown> = {
+      schema: "openthrottle.tune-decision/v1",
+      id: "decision_one",
+      proposal_digest: proposalDigest,
+      citation_decision_digest: "8".repeat(64),
+      ratchet_decision_digest: validateRatchetDecision(ratchetDecision).digest,
+      outcome: "accept",
+      rationale: "Both deterministic gates passed.",
+    };
+    const validatedDecision = validateTuneDecisionContract(decision, {
+      proposal,
+      citationDecisionDigest: "8".repeat(64),
+      ratchetDecision,
+    });
+    const authorization: Record<string, unknown> = {
+      schema: "openthrottle.tune-edit-authorization/v1",
+      id: "authorization_one",
+      proposal_digest: proposalDigest,
+      decision_digest: validatedDecision.digest,
+      authorized_paths: ["skills/tasks/implement-unit/SKILL.md"],
+      authorized_at: "2026-08-12T00:03:00.000Z",
+      expires_at: "2026-08-12T01:03:00.000Z",
+      actor_id: "supervisor",
+    };
+    expect(validateTuneEditAuthorizationContract(authorization, { proposal, decision }).digest).toBeTruthy();
+
+    expect(() => validateTuneDecisionContract(
+      { ...decision, proposal_digest: "9".repeat(64) },
+      { source: "decision", proposal, citationDecisionDigest: "8".repeat(64), ratchetDecision }
+    )).toThrow(/decision\.proposal_digest: does not match canonical tune proposal digest/);
+    expect(() => validateTuneEditAuthorizationContract(
+      { ...authorization, authorized_paths: ["skills/tasks/implement-unit"] },
+      { source: "authorization", proposal, decision }
+    )).toThrow(/authorization\.authorized_paths: must exactly match the accepted proposal change paths/);
+  });
+
+  it("parses typed tune receipts without allowing semantic payloads to claim gate authority", () => {
+    const receipt = JSON.parse(readFixture("valid", "receipt-unit-completion.json")) as Record<string, unknown>;
+    receipt.type = "tune_analysis";
+    receipt.assurance = "semantic_attested";
+    receipt.result = "success";
+    receipt.payload = { summary: "Sealed run corpus analyzed.", analysis: tuneAnalysis() };
+    expect(validateStandardReceipt(receipt).value.type).toBe("tune_analysis");
+
+    receipt.type = "tune_proposal";
+    receipt.payload = { summary: "One bounded change proposed.", proposal: tuneProposal() };
+    expect(validateStandardReceipt(receipt).value.type).toBe("tune_proposal");
+    receipt.assurance = "executor_verified";
+    expect(() => validateStandardReceipt(receipt, { source: "receipt" }))
+      .toThrow(/receipt\.assurance: semantic receipts cannot claim/);
+    receipt.assurance = "semantic_attested";
+    receipt.payload = {
+      summary: "One bounded change proposed.",
+      proposal: tuneProposal(),
+      citation_gate: { outcome: "passed" },
+    };
+    expect(() => validateStandardReceipt(receipt, { source: "receipt" }))
+      .toThrow(/receipt\.payload\.citation_gate: unknown field/);
   });
 
   it("requires claims and their dispositions to cite evidence", () => {
