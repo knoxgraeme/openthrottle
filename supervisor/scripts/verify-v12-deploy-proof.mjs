@@ -63,6 +63,12 @@ assert(
   deployWorkflow.includes("'supervisor/pipelines/runtime-capabilities-v1.json'"),
   "runtime descriptor changes must rebuild the Daytona snapshot"
 );
+assert(
+  deployWorkflow.includes("predicate-quantifier: every") &&
+    deployWorkflow.includes("'!sandbox/tests/**'") &&
+    deployWorkflow.includes("'!sandbox/**/*.test.mjs'"),
+  "test-only sandbox changes must not build or stage a Daytona snapshot"
+);
 
 const ciWorkflow = read(".github/workflows/ci.yml");
 assert(
