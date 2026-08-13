@@ -5,9 +5,10 @@ one carries its own craft — implementation discipline, review lenses,
 simplification heuristics, diagnostic method — instead of delegating to a
 second-hop toolkit. The supervisor selects a versioned pipeline manifest; each
 agent stage or structured-loop action invokes one canonical adapter for the
-capability named in its sealed request. Planning skills (`skills/planning/`)
-still author against native Compound Engineering at authoring time — that is
-a separate, upstream-of-delegation surface this split does not change.
+capability named in its sealed request. The planning adapter
+(`skills/planning/prepare-execution-plan`) accepts any sufficiently complete
+implementation plan or task specification and normalizes only its explicit
+scope, ordering, acceptance criteria, and verification commands.
 
 ```text
 skills/
@@ -185,9 +186,9 @@ words rather than inherited from a shared toolkit:
   touching a sibling worktree or the integration checkout;
 - no silent backlog: fix, explain, or return `needs_human`.
 
-The snapshot still installs the commit-pinned Compound Engineering plugin
-natively for Claude Code, Codex, and OpenCode, for planning-time authoring
-skills. No task skill under `skills/tasks/` invokes it.
+The current snapshot still installs the commit-pinned Compound Engineering
+plugin as a legacy ambient image input. No planning or task skill in this
+repository invokes it or relies on it.
 
 ## Runtime trust boundary
 

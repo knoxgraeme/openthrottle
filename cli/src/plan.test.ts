@@ -217,6 +217,17 @@ describe("plan validation", () => {
     expect(resolvePrepareSkillPath(pathToFileURL(join(dist, "plan.js")).href)).toBe(skill);
   });
 
+  it("keeps the planning skill independent of Compound Engineering", () => {
+    const planningSkillRoot = new URL("../../skills/planning/prepare-execution-plan/", import.meta.url);
+    const bundle = [
+      "SKILL.md",
+      "agents/openai.yaml",
+      "references/execution-plan.md",
+    ].map((path) => readFileSync(new URL(path, planningSkillRoot), "utf8")).join("\n");
+
+    expect(bundle).not.toMatch(/compound[- ]engineering|\bCE\b|\bce-[a-z]/i);
+  });
+
   it("rejects a failed prepare runner even if it wrote a valid block", () => {
     const directory = temporaryProject();
     const planPath = join(directory, "plan.md");

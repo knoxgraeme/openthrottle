@@ -19,8 +19,8 @@ Linear delegation or labeled GitHub Issue
 ```
 
 The Fly supervisor owns state, admission, ordering, retries, effects, and
-publication. Agent reasoning lives only inside stage executors through native
-Compound Engineering. There is no second execution architecture.
+publication. Agent reasoning lives only inside stage executors through
+self-contained OpenThrottle skills. There is no second execution architecture.
 
 ### Canonical vocabulary
 
@@ -48,7 +48,7 @@ Compound Engineering. There is no second execution architecture.
 - `supervisor/`: Hono control plane, SQLite state, webhook inbox, coordinator,
   Daytona effects, GitHub provider handling, `control_outbox`, sweep/recovery.
 - `sandbox/`: sealed single-stage executor and agent runtime boundary.
-- `skills/`: thin OpenThrottle adapters over the pinned native CE plugin.
+- `skills/`: self-contained OpenThrottle planning and execution adapters.
 - `cli/`: target-repository onboarding and operator commands.
 - `supervisor/pipelines/`: immutable manifests, catalog aliases, and runtime
   capability descriptor.
@@ -392,8 +392,8 @@ limit.
 
 The executor runs exactly one stage:
 
-- agent capabilities invoke the appropriate OpenThrottle adapter and native CE
-  skill, under the manifest context policy;
+- agent capabilities invoke the appropriate self-contained OpenThrottle adapter
+  under the manifest context policy;
 - command capabilities invoke one validated `.openthrottle.yml` command;
 - provider-wait stages run in the supervisor and do not launch a sandbox actor.
 

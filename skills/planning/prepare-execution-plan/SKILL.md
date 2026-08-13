@@ -1,29 +1,37 @@
 ---
 name: prepare-execution-plan
-description: Convert a completed CE unified plan into one validated OpenThrottle execution-plan block.
+description: Convert a completed implementation plan or task specification into one validated OpenThrottle execution-plan block for a structured run.
 ---
 
 # Prepare Execution Plan
 
-Use this skill only at planning time, against a completed CE unified plan. The
-output is a single fenced JSON block with schema
-`openthrottle.execution-plan/v1`; the runtime consumes that block, while the
-plan prose remains the human-authoritative source.
+Use this skill at planning time against a completed implementation plan or task
+specification. Its surrounding format and section names do not matter. The
+source must define enough scope, ordering, acceptance, and verification detail
+to decompose the work without guessing.
+
+The output is a single fenced JSON block with schema
+`openthrottle.execution-plan/v1`. The runtime consumes that block, while the
+source prose remains the human-authoritative source.
 
 ## Workflow
 
-1. Read the plan metadata, Goal Capsule, Product Contract, Implementation Units,
-   Verification Contract, Definition of Done, and any explicit execution
-   contract.
+1. Read the complete source and identify its goal and scope, implementation
+   units or workstreams, dependencies, instructions or requirements,
+   acceptance criteria or definition of done, and verification commands.
+   These may use any headings or document structure.
 2. Read `references/execution-plan.md` before drafting JSON.
 3. Preserve the plan's semantic decomposition:
-   - Preserve stable authored U-IDs in titles and reference text; normalize
-     runtime `units[].id` and dependency IDs to the lowercase identifier form
-     accepted by the frozen contract, such as `u1` or `u4a`.
+   - Preserve stable authored unit IDs when present. Otherwise derive concise,
+     stable lowercase IDs from unambiguous unit titles. Do not invent a split
+     merely to create units.
+   - Normalize runtime `units[].id` and dependency IDs to the identifier form
+     accepted by the frozen contract, such as `contracts` or `api_tests`.
    - Keep declared dependency order; infer a dependency only when the plan text
      directly states it.
-   - Reference existing requirement, flow, acceptance-example, verification, or
-     Definition-of-Done IDs when present.
+   - Preserve existing requirement, acceptance, verification, or
+     definition-of-done IDs when present. Otherwise create descriptive map keys
+     while copying the source meaning without expansion.
    - Do not invent product requirements, acceptance criteria, commands, or unit
      splits.
 4. Write or replace exactly one fenced block:
@@ -43,7 +51,8 @@ plan prose remains the human-authoritative source.
 
 Return a human decision request when any of these are unresolved:
 
-- a unit has no stable ID or combines multiple incompatible scopes;
+- a unit boundary is unclear, combines incompatible scopes, or cannot receive a
+  stable ID without choosing between competing decompositions;
 - dependency order has more than one defensible interpretation;
 - required verification commands are unnamed or conflict with repository config;
 - acceptance references are missing for behavior-bearing units;
