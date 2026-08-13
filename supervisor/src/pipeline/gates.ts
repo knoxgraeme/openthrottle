@@ -1,7 +1,7 @@
 import {
-  TUNE_ANALYSIS_SCHEMA,
+  TUNE_ANALYSIS_INPUT_SCHEMA,
   validateStandardReceipt,
-  validateTuneAnalysisContract,
+  validateTuneAnalysisInputContract,
   type StandardReceipt,
 } from "@openthrottle/contracts";
 import {
@@ -338,13 +338,18 @@ function validateTuneReceiptAuthority(
   if (stage.id === "analysis") {
     const receipt = tuneReceipt(payloads, "tune_analysis", "stage.analysis.receipt");
     if (typeof request.taskContext !== "string") throw new Error("tune analysis has no sealed task context");
-    const blocks = extractJsonBlocks(request.taskContext, TUNE_ANALYSIS_SCHEMA);
-    if (blocks.length !== 1) throw new Error("tune analysis requires one supervisor-sealed analysis contract");
-    const authorized = validateTuneAnalysisContract(JSON.parse(blocks[0]!) as unknown, {
-      source: "stage.analysis.authorized_analysis",
+    const blocks = extractJsonBlocks(request.taskContext, TUNE_ANALYSIS_INPUT_SCHEMA);
+    if (blocks.length !== 1) throw new Error("tune analysis requires one supervisor-sealed analysis input");
+    const authorized = validateTuneAnalysisInputContract(JSON.parse(blocks[0]!) as unknown, {
+      source: "stage.analysis.authorized_input",
     });
-    if (canonicalJson(receipt.payload.analysis) !== authorized.normalized) {
-      throw new Error("tune analysis receipt does not match the supervisor-sealed corpus");
+    const { generated_at: _generatedAt, ...analysisMaterial } = receipt.payload.analysis;
+    const producedInput = validateTuneAnalysisInputContract({
+      ...analysisMaterial,
+      schema: TUNE_ANALYSIS_INPUT_SCHEMA,
+    }, { source: "stage.analysis.receipt_input" });
+    if (producedInput.normalized !== authorized.normalized) {
+      throw new Error("tune analysis receipt does not preserve the supervisor-sealed input");
     }
     return;
   }

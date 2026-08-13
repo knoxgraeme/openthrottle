@@ -22,10 +22,10 @@ No tune receipt carries semantic-review findings or supervisor gate results.
 
 ## Analysis
 
-`openthrottle.tune-analysis/v1` contains exactly:
+`openthrottle.tune-analysis-input/v1` is the bounded input material for
+analysis and proposal reasoning. It contains exactly:
 
-- `schema`, `id`, `intent`, `intent_digest`, `corpus_rows`, `corpus_digest`,
-  `generated_at`.
+- `schema`, `id`, `intent`, `intent_digest`, `corpus_rows`, `corpus_digest`.
 - `intent` is the complete `openthrottle.tune-sealed-intent/v1`: `schema`,
   `id`, complete `task`, `task_digest`, `sealed_at`, `authority_digest`.
 - `task` is the complete `openthrottle.tune-task/v1`: `schema`, `id`, `target`,
@@ -38,6 +38,12 @@ The row digest covers the row without `row_digest`. The corpus digest covers
 the exact row array. Rows must satisfy the sealed query and window, must not
 duplicate an id or pipeline-instance/generation pair, and cannot exceed the
 smaller of `task.query.limit` and `task.window.limit`.
+
+`openthrottle.tune-analysis/v1` contains the same closed typed input fields plus
+`generated_at`. It is the only analysis object a later proposal may consume.
+Raw ticket, review, finding, comment, or prompt prose is never a field in either
+contract; agents may use only the typed corpus row values and the row/source
+digests derived from supervisor-selected evidence.
 
 ## Proposal
 
@@ -80,3 +86,30 @@ The exact file snapshots must produce precisely the proposal's change set and
 the target-specific policy values must parse from those same bytes. The
 differential input must be directly comparable and preserve or tighten the
 pinned gates, scopes, and resource policy.
+
+## Reviewable diff closure
+
+A tune proposal is evidence for later supervisor gates, not an edit authority.
+The proposal must be independently reproducible from the sealed analysis,
+repository bytes, citation contract, and ratchet input it carries. Do not depend
+on chat memory, hidden scratch work, provider state, ticket prose, or an
+unstated local command result.
+
+Eligible proposed changes are limited to:
+
+- repository config bytes that preserve or tighten required gates and authority;
+- graph/config material whose before and after contracts are both parseable and
+  directly comparable by the ratchet gate;
+- unlocked repository skill craft/reference files under the sealed skill root.
+
+Skill proposals may improve instructions, decision procedure, citations,
+rationale, examples, or rollback clarity. They must not change executor
+identity, receipt schema, result vocabulary, provenance fields, credential
+requirements, MCP/server scope, deterministic supervisor policy, or locked
+runtime material.
+
+Each change rationale must stand on its own for human review and later rollback:
+name the cited corpus pattern, why this specific file is the smallest
+appropriate scope, the expected metric movement, and the exact rollback path.
+When any of those elements cannot be reproduced from sealed corpus rows and
+repository bytes, emit no proposal for that change.

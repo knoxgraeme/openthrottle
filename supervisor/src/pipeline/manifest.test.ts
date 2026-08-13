@@ -583,6 +583,54 @@ describe("pipeline manifest validation", () => {
     expect(() => validatePipelineManifest(undeclared)).toThrow(/not declared in requires.capabilities/);
   });
 
+  it("enforces tune and supervisor stage credential contracts without changing ordinary fixture validation", () => {
+    const writableTune = manifest();
+    writableTune.requires = { protocol: "stage-executor@1", capabilities: ["core/tune@1"] };
+    const tuneStage = firstStage(writableTune);
+    tuneStage.executor = { kind: "agent", capability: "core/tune@1" };
+    tuneStage.evaluator = {
+      kind: "semantic",
+      assurance: "semantic_attested",
+      required_artifacts: ["standard_receipt"],
+    };
+    tuneStage.credentials = ["model.invoke", "provider.read", "repo.read", "repo.write"];
+    tuneStage.produces = ["stage_result", "standard_receipt"];
+
+    expect(() => validatePipelineManifest(writableTune))
+      .toThrow(/pipeline\.stages\[0\]\.credentials: core\/tune@1 is not authorized for credential scope repo\.write/);
+
+    const supervisorWithCredentials = manifest();
+    supervisorWithCredentials.requires = {
+      protocol: "stage-executor@1",
+      capabilities: ["supervisor/citation-gate@1"],
+    };
+    const supervisorStage = firstStage(supervisorWithCredentials);
+    supervisorStage.executor = { kind: "supervisor", capability: "supervisor/citation-gate@1" };
+    supervisorStage.evaluator = {
+      kind: "citation",
+      assurance: "executor_verified",
+      required_artifacts: ["stage_result"],
+    };
+    supervisorStage.context = "none";
+    supervisorStage.live_steering = false;
+    supervisorStage.credentials = ["repo.read"];
+
+    expect(() => validatePipelineManifest(supervisorWithCredentials))
+      .toThrow(/pipeline\.stages\[0\]\.credentials: supervisor\/citation-gate@1 is not authorized for credential scope repo\.read/);
+
+    const renderFixtureShape = manifest();
+    const renderStage = firstStage(renderFixtureShape);
+    renderStage.context = "none";
+    renderStage.live_steering = false;
+    renderStage.credentials = [];
+
+    expect(validatePipelineManifest(renderFixtureShape).manifest.stages[0]).toMatchObject({
+      executor: { kind: "agent", capability: "agent/semantic@1" },
+      context: "none",
+      credentials: [],
+    });
+  });
+
   it("rejects ordinary agent capabilities without a stage dispatch adapter", () => {
     const value = manifest();
     value.requires = { protocol: "stage-executor@1", capabilities: ["accept-unit@1"] };
@@ -984,15 +1032,17 @@ commands:
   test: npm test --prefix supervisor
 test: npm test --prefix supervisor
 limits: { max_turns: 20, task_timeout: 300 }
-pipelines: { implement: implement, investigate: core/investigate@2 }
+pipelines: { implement: implement, investigate: core/investigate@2, tune: tune }
 mcp_servers: {}
 intents:
   implement: { default_graph: simple, allowed_graphs: [simple] }
   investigate: { default_graph: simple, allowed_graphs: [simple] }
+  tune: { default_graph: simple, allowed_graphs: [simple] }
 `);
     expect(parsed.config.pipelines).toEqual({
       implement: "implement",
       investigate: "core/investigate@2",
+      tune: "tune",
     });
     expect(parseRepositoryConfig(parsed.normalized.replace(/^/, "")).digest).toBe(parsed.digest);
     expect(() => parseRepositoryConfig("pipelines: { implement: implement }\n"))

@@ -92,6 +92,7 @@ export {
   type RatchetTunerAuthority,
 } from "./ratchet-contract.js";
 export {
+  TUNE_ANALYSIS_INPUT_SCHEMA,
   TUNE_ANALYSIS_SCHEMA,
   TUNE_CORPUS_OUTCOMES,
   TUNE_DECISION_OUTCOMES,
@@ -107,6 +108,7 @@ export {
   deriveTuneCorpusDigest,
   deriveTuneCorpusRowDigest,
   parseTuneAnalysisContract,
+  parseTuneAnalysisInputContract,
   parseTuneDecisionContract,
   parseTuneEditAuthorizationContract,
   parseTuneProposalContract,
@@ -114,6 +116,7 @@ export {
   parseTuneSealedIntentContract,
   parseTuneTaskContract,
   validateTuneAnalysisContract,
+  validateTuneAnalysisInputContract,
   validateTuneDecisionContract,
   validateTuneEditAuthorizationContract,
   validateTuneProposalContract,
@@ -121,6 +124,7 @@ export {
   validateTuneSealedIntentContract,
   validateTuneTaskContract,
   type TuneAnalysis,
+  type TuneAnalysisInput,
   type TuneBaseline,
   type TuneCorpusRow,
   type TuneCorpusRowContent,

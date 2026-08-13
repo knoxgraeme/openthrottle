@@ -30,6 +30,7 @@ import {
 
 export const TUNE_TASK_SCHEMA = "openthrottle.tune-task/v1" as const;
 export const TUNE_SEALED_INTENT_SCHEMA = "openthrottle.tune-sealed-intent/v1" as const;
+export const TUNE_ANALYSIS_INPUT_SCHEMA = "openthrottle.tune-analysis-input/v1" as const;
 export const TUNE_ANALYSIS_SCHEMA = "openthrottle.tune-analysis/v1" as const;
 export const TUNE_PROPOSAL_SCHEMA = "openthrottle.tune-proposal/v1" as const;
 export const TUNE_DECISION_SCHEMA = "openthrottle.tune-decision/v1" as const;
@@ -55,6 +56,7 @@ const CORPUS_ROW_FIELDS = [
   "id", "pipeline_instance_id", "generation", "execution_graph_id", "outcome", "closed_reason",
   "fault_attribution", "created_at", "source_digests", "row_digest",
 ] as const;
+const ANALYSIS_INPUT_FIELDS = ["schema", "id", "intent", "intent_digest", "corpus_rows", "corpus_digest"] as const;
 const ANALYSIS_FIELDS = ["schema", "id", "intent", "intent_digest", "corpus_rows", "corpus_digest", "generated_at"] as const;
 const CHANGE_FIELDS = ["path", "operation", "before_digest", "after_digest", "after_content", "rationale"] as const;
 const TUNE_CHANGE_CONTENT_MAX_BYTES = 128 * 1024;
@@ -145,6 +147,17 @@ export interface TuneCorpusRowContent {
 export interface TuneCorpusRow extends TuneCorpusRowContent {
   row_digest: string;
 }
+
+export interface TuneAnalysisInput {
+  schema: typeof TUNE_ANALYSIS_INPUT_SCHEMA;
+  id: string;
+  intent: TuneSealedIntent;
+  intent_digest: string;
+  corpus_rows: TuneCorpusRow[];
+  corpus_digest: string;
+}
+
+type TuneAnalysisMaterial = Omit<TuneAnalysisInput, "schema">;
 
 export interface TuneAnalysis {
   schema: typeof TUNE_ANALYSIS_SCHEMA;
@@ -380,6 +393,58 @@ function analysisRunResult(row: TuneCorpusRow): AnalysisRunResult {
   };
 }
 
+function assertAnalysisMaterial(input: TuneAnalysisMaterial, source: string): void {
+  if (digestCanonicalJson(input.intent) !== input.intent_digest) {
+    fail(`${source}.intent_digest`, "does not match canonical sealed intent digest");
+  }
+  if (deriveTuneCorpusDigest(input.corpus_rows) !== input.corpus_digest) {
+    fail(`${source}.corpus_digest`, "does not match canonical corpus digest");
+  }
+  const maximumRows = Math.min(input.intent.task.query.limit, input.intent.task.window.limit);
+  if (input.corpus_rows.length > maximumRows) {
+    fail(`${source}.corpus_rows`, "exceeds sealed intent query/window limit");
+  }
+  if (new Set(input.corpus_rows.map((row) => row.id)).size !== input.corpus_rows.length) {
+    fail(`${source}.corpus_rows`, "must not contain duplicate ids");
+  }
+  const runKeys = input.corpus_rows.map((row) => `${row.pipeline_instance_id}:${row.generation}`);
+  if (new Set(runKeys).size !== runKeys.length) {
+    fail(`${source}.corpus_rows`, "must not contain duplicate pipeline generation rows");
+  }
+  for (let index = 0; index < input.corpus_rows.length; index += 1) {
+    const row = input.corpus_rows[index]!;
+    if (row.created_at < input.intent.task.window.from || row.created_at > input.intent.task.window.to) {
+      fail(`${source}.corpus_rows[${index}].created_at`, "is outside the sealed intent window");
+    }
+    const query = input.intent.task.query;
+    if (query.outcome !== undefined && row.outcome !== query.outcome) {
+      fail(`${source}.corpus_rows[${index}].outcome`, "does not match sealed intent query");
+    }
+    if (query.reason !== undefined && row.closed_reason !== query.reason) {
+      fail(`${source}.corpus_rows[${index}].closed_reason`, "does not match sealed intent query");
+    }
+    if (query.graph !== undefined && row.execution_graph_id !== query.graph) {
+      fail(`${source}.corpus_rows[${index}].execution_graph_id`, "does not match sealed intent query");
+    }
+  }
+}
+
+function parseAnalysisInputValue(value: unknown, source: string): TuneAnalysisInput {
+  const input = objectAt(value, source, ANALYSIS_INPUT_FIELDS);
+  if (input.schema !== TUNE_ANALYSIS_INPUT_SCHEMA) fail(`${source}.schema`, `must be ${TUNE_ANALYSIS_INPUT_SCHEMA}`);
+  const intent = parseSealedIntentValue(input.intent, `${source}.intent`);
+  const analysisInput: TuneAnalysisInput = {
+    schema: TUNE_ANALYSIS_INPUT_SCHEMA,
+    id: stringAt(input.id, `${source}.id`, { pattern: IDENTIFIER }),
+    intent,
+    intent_digest: stringAt(input.intent_digest, `${source}.intent_digest`, { pattern: SHA256 }),
+    corpus_rows: arrayAt(input.corpus_rows, `${source}.corpus_rows`, parseCorpusRow, { max: 200 }),
+    corpus_digest: stringAt(input.corpus_digest, `${source}.corpus_digest`, { pattern: SHA256 }),
+  };
+  assertAnalysisMaterial(analysisInput, source);
+  return analysisInput;
+}
+
 function parseChange(value: unknown, path: string): TuneProposalChange {
   const input = objectAt(value, path, CHANGE_FIELDS);
   const change: TuneProposalChange = {
@@ -513,6 +578,14 @@ export function parseTuneSealedIntentContract(raw: string, options: { source?: s
   return parseBoundedJsonContract(raw, options, "tune_intent", 96, validateTuneSealedIntentContract);
 }
 
+export function validateTuneAnalysisInputContract(value: unknown, options: { source?: string } = {}): ValidatedContract<TuneAnalysisInput> {
+  return normalizedContract(parseAnalysisInputValue(value, options.source ?? "tune_analysis_input"));
+}
+
+export function parseTuneAnalysisInputContract(raw: string, options: { source?: string } = {}): ValidatedContract<TuneAnalysisInput> {
+  return parseBoundedJsonContract(raw, options, "tune_analysis_input", 256, validateTuneAnalysisInputContract);
+}
+
 export function validateTuneAnalysisContract(value: unknown, options: { source?: string } = {}): ValidatedContract<TuneAnalysis> {
   const source = options.source ?? "tune_analysis";
   const input = objectAt(value, source, ANALYSIS_FIELDS);
@@ -527,39 +600,13 @@ export function validateTuneAnalysisContract(value: unknown, options: { source?:
     corpus_digest: stringAt(input.corpus_digest, `${source}.corpus_digest`, { pattern: SHA256 }),
     generated_at: timestamp(input.generated_at, `${source}.generated_at`),
   };
-  if (digestCanonicalJson(intent) !== analysis.intent_digest) {
-    fail(`${source}.intent_digest`, "does not match canonical sealed intent digest");
-  }
-  if (deriveTuneCorpusDigest(analysis.corpus_rows) !== analysis.corpus_digest) {
-    fail(`${source}.corpus_digest`, "does not match canonical corpus digest");
-  }
-  const maximumRows = Math.min(intent.task.query.limit, intent.task.window.limit);
-  if (analysis.corpus_rows.length > maximumRows) {
-    fail(`${source}.corpus_rows`, "exceeds sealed intent query/window limit");
-  }
-  if (new Set(analysis.corpus_rows.map((row) => row.id)).size !== analysis.corpus_rows.length) {
-    fail(`${source}.corpus_rows`, "must not contain duplicate ids");
-  }
-  const runKeys = analysis.corpus_rows.map((row) => `${row.pipeline_instance_id}:${row.generation}`);
-  if (new Set(runKeys).size !== runKeys.length) {
-    fail(`${source}.corpus_rows`, "must not contain duplicate pipeline generation rows");
-  }
-  for (let index = 0; index < analysis.corpus_rows.length; index += 1) {
-    const row = analysis.corpus_rows[index]!;
-    if (row.created_at < intent.task.window.from || row.created_at > intent.task.window.to) {
-      fail(`${source}.corpus_rows[${index}].created_at`, "is outside the sealed intent window");
-    }
-    const query = intent.task.query;
-    if (query.outcome !== undefined && row.outcome !== query.outcome) {
-      fail(`${source}.corpus_rows[${index}].outcome`, "does not match sealed intent query");
-    }
-    if (query.reason !== undefined && row.closed_reason !== query.reason) {
-      fail(`${source}.corpus_rows[${index}].closed_reason`, "does not match sealed intent query");
-    }
-    if (query.graph !== undefined && row.execution_graph_id !== query.graph) {
-      fail(`${source}.corpus_rows[${index}].execution_graph_id`, "does not match sealed intent query");
-    }
-  }
+  assertAnalysisMaterial({
+    id: analysis.id,
+    intent: analysis.intent,
+    intent_digest: analysis.intent_digest,
+    corpus_rows: analysis.corpus_rows,
+    corpus_digest: analysis.corpus_digest,
+  }, source);
   return normalizedContract(analysis);
 }
 
