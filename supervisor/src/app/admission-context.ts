@@ -90,6 +90,9 @@ function hasValidElementParent(
   kind: LinearContextElementKind
 ): boolean {
   const parent = stack.at(-1)?.kind;
+  if (parent === "issue-relations") {
+    return kind === "issue-ref";
+  }
   if (kind === "sub-issues") {
     return parent === "issue" || parent === "parent-issue";
   }
@@ -100,7 +103,7 @@ function hasValidElementParent(
     return parent === "issue" || parent === "parent-issue";
   }
   if (kind === "issue-ref") {
-    return parent === "issue-relations";
+    return false;
   }
   return parent !== "sub-issues" && parent !== "sub-issue";
 }
