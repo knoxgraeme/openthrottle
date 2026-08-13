@@ -151,6 +151,33 @@ describe("bounded Linear admission context", () => {
     expect(result.context).toContain("prior run failed");
   });
 
+  it("strips relation-shaped provider metadata repeated in historical threads", () => {
+    const context = [
+      `<issue identifier="OPE-157">`,
+      `<description>Implement the current structured plan.</description>`,
+      `<issue-relations><issue-ref identifier="OPE-158"/></issue-relations>`,
+      `</issue>`,
+      `<primary-directive-thread><comment>Retry with Codex.</comment></primary-directive-thread>`,
+      `<other-thread>`,
+      `<comment>A prior operator message quoted provider metadata:</comment>`,
+      `<issue-relations><issue-ref .../></issue-relations>`,
+      `<comment>Keep this remaining history.</comment>`,
+      `</other-thread>`,
+    ].join("\n");
+
+    const result = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "OPE-157",
+    });
+
+    expect(result.selectionError).toBeUndefined();
+    expect(result.selectionContext).toContain("Retry with Codex.");
+    expect(result.selectionContext).not.toContain("provider metadata");
+    expect(result.context).toContain("Keep this remaining history.");
+    expect(result.context).not.toContain("issue-relations");
+    expect(result.context).not.toContain("issue-ref");
+  });
+
   it.each(["issue", "parent-issue", "other-thread"] as const)(
     "removes nested %s history from directive selection authority",
     (kind) => {
