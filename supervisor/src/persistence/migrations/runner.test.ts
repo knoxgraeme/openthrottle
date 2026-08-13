@@ -157,6 +157,7 @@ describe("database migrations", () => {
       "9e3ab22f612eab044e4c1f0e4fda8ac471b8c24befcb59594add21658d429564",
       "793d6ba7d049343e8275d0994677f5b8ebe00c942796512879544da10d45bfab",
       "816a31439db18b9975c2d66b9dda45f3bfa9375d0d43309b46eeb28acf486a3a",
+      "71bba805a7a02e1efb77633f9458b63ce55b7ee6546d2c26ac2124ee3e802c31",
     ]);
   });
 
@@ -262,7 +263,7 @@ describe("database migrations", () => {
     `).get()).toEqual({ name: "github_webhook_redelivery_process_idx" });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 43, name: "tune-task-type" });
+    `).get()).toEqual({ version: 44, name: "execution-graph-initial-subject" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
     });
@@ -312,7 +313,7 @@ describe("database migrations", () => {
     });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 43, name: "tune-task-type" });
+    `).get()).toEqual({ version: 44, name: "execution-graph-initial-subject" });
   });
 
   it("adds epoch-fenced observation retry defaults to a v38 work-attempt table", () => {

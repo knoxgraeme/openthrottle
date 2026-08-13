@@ -680,9 +680,10 @@ describe("structured child runtime command seeding", () => {
       } as any,
     });
 
-    childRuntime.seedCompositeGraph(instance as any, request(executionPlan) as any);
+    childRuntime.seedCompositeGraph(instance as any, request(executionPlan) as any, "a".repeat(40));
 
     expect(createGraph).toHaveBeenCalledWith(expect.objectContaining({
+      initialSubject: "a".repeat(40),
       commandNames: ["docs-check", "test"],
       units: [
         { id: "unit_a", dependencies: [], commandNames: ["docs-check", "test"] },
@@ -770,7 +771,7 @@ describe("structured child runtime command seeding", () => {
       }),
     };
 
-    childRuntime.seedCompositeGraph(manifestInstance as any, request(executionPlan) as any);
+    childRuntime.seedCompositeGraph(manifestInstance as any, request(executionPlan) as any, "a".repeat(40));
 
     expect(createGraph).toHaveBeenCalledWith(expect.objectContaining({
       maxRepairRounds: 1,
@@ -790,7 +791,7 @@ describe("structured child runtime command seeding", () => {
       } as any,
     });
 
-    expect(() => childRuntime.seedCompositeGraph(instance as any, request(executionPlan) as any))
+    expect(() => childRuntime.seedCompositeGraph(instance as any, request(executionPlan) as any, "a".repeat(40)))
       .toThrow(/execution plan command docs-check is not configured/);
   });
 });

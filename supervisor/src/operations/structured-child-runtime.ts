@@ -194,7 +194,7 @@ type LoopDispatchBinding = {
 };
 
 export interface StructuredChildRuntime {
-  seedCompositeGraph(instance: PipelineInstance, request: StageRequestEnvelope): void;
+  seedCompositeGraph(instance: PipelineInstance, request: StageRequestEnvelope, initialSubject: string): void;
   drainCompositeChildren(resource: RuntimeResource, instance: PipelineInstance, parentAttemptId: string): Promise<void>;
   compositeGraphNeedsDrain(parentAttemptId: string): boolean;
 }
@@ -2534,7 +2534,10 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   };
 
   return {
-    seedCompositeGraph(instance, request) {
+    seedCompositeGraph(instance, request, initialSubject) {
+      if (!GIT_SUBJECT.test(initialSubject)) {
+        throw new Error(`pipeline composite stage ${request.stageId} has an invalid prepared subject`);
+      }
       const stage = stageById(instance.normalized_manifest, instance.active_stage_id);
       if (!stage || stage.executor.capability !== FOR_EACH_UNIT_CAPABILITY) {
         throw new Error(`pipeline composite stage ${request.stageId} is not active`);
@@ -2552,6 +2555,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         parentRunId: request.runId,
         graphDigest: instance.manifest_digest,
         planDigest: digestCanonicalJson(plan),
+        initialSubject,
         units: commandPlan.units,
         commandNames: commandPlan.graphCommandNames,
         unitPhases: stage.unitPhases,

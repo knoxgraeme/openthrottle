@@ -300,6 +300,7 @@ describe("execution unit store", () => {
       parentRunId: "run-parent",
       graphDigest: "graph-digest",
       planDigest: "plan-digest",
+      initialSubject: "a".repeat(40),
       units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
       unitPhases: ["implement", "candidate", "lead", "integrate"] as const,
       unitPhaseBindings: unitPhaseBindings(),
@@ -308,6 +309,8 @@ describe("execution unit store", () => {
     expect(store.createGraph(input)).toMatchObject({
       parent_attempt_id: "attempt-parent",
       unit_phase_bindings: canonicalJson(unitPhaseBindings()),
+      initial_subject: "a".repeat(40),
+      integration_subject: "a".repeat(40),
     });
     expect(store.createGraph(input)).toMatchObject({ parent_attempt_id: "attempt-parent" });
     expect(store.listUnits("attempt-parent").map((unit) => [unit.unitId, unit.dependencies])).toEqual([
@@ -317,6 +320,10 @@ describe("execution unit store", () => {
     expect(() => store.createGraph({
       ...input,
       graphDigest: "changed-graph-digest",
+    })).toThrow(/replay fence mismatch/);
+    expect(() => store.createGraph({
+      ...input,
+      initialSubject: "b".repeat(40),
     })).toThrow(/replay fence mismatch/);
     expect(() => store.createGraph({
       ...input,

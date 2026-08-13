@@ -211,7 +211,10 @@ export interface SandboxRuntime {
     normalizedManifest: string;
     manifestDigest: string;
   }): Promise<void>;
-  prepareCompositeWorkspace(resource: RuntimeResource, request: StageRequestEnvelope): Promise<void>;
+  prepareCompositeWorkspace(
+    resource: RuntimeResource,
+    request: StageRequestEnvelope
+  ): Promise<{ subject: string }>;
   dispatchStage(resource: RuntimeResource, request: StageRequestEnvelope): Promise<{ providerDispatchId: string }>;
   collectStageResult(resource: RuntimeResource, attemptId: string): Promise<StageExecutionResult | null>;
   createWorktree(resource: RuntimeResource, input: {

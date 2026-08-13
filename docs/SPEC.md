@@ -190,9 +190,14 @@ The composite `graph/for-each-unit@1` capability (structured multi-unit
 execution) is installed only with the composition root that constructs and
 drains the child unit runtime. A composite host stage dispatches no
 whole-stage sandbox request; entering it provisions/bootstrap the runtime,
-binds the parent actor, seeds one child execution graph from the sealed
+binds the parent actor, prepares the ticket branch, returns its exact checked-out
+Git subject to the supervisor, seeds one child execution graph from the sealed
 execution-plan block and graph-declared phase sequence, and drains child work
-actions through the provider-neutral unit effect port.
+actions through the provider-neutral unit effect port. The prepared subject may
+be the head published by an earlier generation rather than the repository
+base-branch commit. It is persisted as the graph's immutable initial subject and
+also initializes the advancing integration subject, so every first-unit request
+and worktree is fenced to the checkout the sandbox actually prepared.
 Composite parent actor hard expiry is derived at binding time from the sealed
 manifest stage: `expires_at` is `started_at` plus the maximum of supervisor
 `TASK_TIMEOUT` and every loop-backed unit phase `timeout_seconds` declared for
@@ -1032,6 +1037,8 @@ Stage C child-unit work must add any needed live binding state to the owning
 unit/work records rather than reviving empty historical binding tables.
 For the serial `for_each_unit` composite stage, `execution_graphs` binds one
 parent pipeline attempt/run to an immutable execution graph and plan digest,
+the exact prepared initial Git subject independently of the mutable current
+integration subject,
 plus the graph-declared unit phase sequence, the pinned configured command
 names, the bounded max repair rounds, and the whole-change final phase
 (`command`/`review`/`repair`/`done`, `NULL` before the first unit integrates);

@@ -128,12 +128,16 @@ describe("pipeline effect processor", () => {
     return JSON.stringify(graph);
   }
 
-  function sandboxRuntimeMock(ids: { issueId?: string; providerDispatchId?: string } = {}) {
+  function sandboxRuntimeMock(ids: {
+    issueId?: string;
+    providerDispatchId?: string;
+    preparedSubject?: string;
+  } = {}) {
     const issueId = ids.issueId ?? "1";
     return {
       provision: vi.fn(async () => ({ providerResourceId: `sandbox-${issueId}` })),
       bootstrap: vi.fn(async () => undefined),
-      prepareCompositeWorkspace: vi.fn(async () => undefined),
+      prepareCompositeWorkspace: vi.fn(async () => ({ subject: ids.preparedSubject ?? "a".repeat(40) })),
       materializeCredentials: vi.fn(async () => undefined),
       dispatchStage: vi.fn(async () => ({ providerDispatchId: ids.providerDispatchId ?? `dispatch-${issueId}` })),
       collectStageResult: vi.fn(async () => null),
@@ -664,7 +668,8 @@ describe("pipeline effect processor", () => {
     });
     const instance = pipelines.getInstanceForSession("session-structured")!;
     const attempt = pipelines.getActiveAttempt(instance.id)!;
-    const runtime = sandboxRuntimeMock({ issueId: "structured" });
+    const preparedSubject = "b".repeat(40);
+    const runtime = sandboxRuntimeMock({ issueId: "structured", preparedSubject });
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
@@ -690,7 +695,7 @@ describe("pipeline effect processor", () => {
       { providerResourceId: "sandbox-structured" },
       expect.objectContaining({
         attemptId: attempt.id,
-        baseCommit: "a".repeat(40),
+        baseCommit: preparedSubject,
       })
     );
     expect(runtime.dispatchLoopAction).toHaveBeenCalledWith(
@@ -703,11 +708,14 @@ describe("pipeline effect processor", () => {
         loop: "implement",
         skill: "implement-unit",
         expectedProducerSkill: "builtin://ce/implement@1",
+        baseSubject: preparedSubject,
       })
     );
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
       parent_attempt_id: attempt.id,
       parent_run_id: attempt.planned_run_id,
+      initial_subject: preparedSubject,
+      integration_subject: preparedSubject,
     });
     expect(tickets.getRun(attempt.planned_run_id!)).toMatchObject({
       expires_at: "2099-07-23T12:00:00.000Z",
@@ -731,7 +739,7 @@ describe("pipeline effect processor", () => {
       { providerResourceId: "sandbox-structured" },
       expect.objectContaining({
         attemptId: attempt.id,
-        baseCommit: "a".repeat(40),
+        baseCommit: preparedSubject,
       })
     );
     expect(runtime.dispatchLoopAction).toHaveBeenCalledWith(
