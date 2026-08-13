@@ -991,6 +991,7 @@ async function listLabeledSandboxes(daytona: Daytona, limit?: number): Promise<R
   const effectiveLimit = limit === undefined ? undefined : Math.max(1, Math.floor(limit));
   const sandboxes: RuntimeInventoryResource[] = [];
   for await (const sandbox of daytona.list({ labels: { openthrottle: "true" } })) {
+    if (sandbox.state === "destroyed") continue;
     sandboxes.push({
       id: sandbox.id,
       state: sandbox.state,

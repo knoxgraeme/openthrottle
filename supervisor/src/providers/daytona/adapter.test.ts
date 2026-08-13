@@ -75,6 +75,26 @@ function fencedChildExecutorRequest(
 }
 
 describe("Daytona stage execution", () => {
+  it("does not let destroyed inventory consume the bounded live-resource window", async () => {
+    const list = vi.fn(async function* () {
+      for (let index = 0; index < 60; index += 1) {
+        yield { id: `destroyed-${index}`, state: "destroyed" };
+      }
+      yield { id: "destroying-live", state: "destroying" };
+      yield { id: "started-live", state: "started" };
+    });
+    const runtime = createDaytonaSandboxRuntime({ list } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+
+    await expect(runtime.listLabeledResources(2)).resolves.toEqual([
+      expect.objectContaining({ id: "destroying-live", state: "destroying" }),
+      expect.objectContaining({ id: "started-live", state: "started" }),
+    ]);
+    expect(list).toHaveBeenCalledWith({ labels: { openthrottle: "true" } });
+  });
+
   it("implements the opaque, fenced one-stage lifecycle without leaking provider details", async () => {
     const remoteFiles = new Map<string, Buffer>();
     const updateEnv = vi.fn(async () => undefined);

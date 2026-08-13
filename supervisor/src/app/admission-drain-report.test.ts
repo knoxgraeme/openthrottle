@@ -87,6 +87,14 @@ function setup() {
   return { ...fixture, seed };
 }
 
+function acknowledgePublications(instanceId: string): void {
+  db!.prepare(`
+    UPDATE pipeline_publication_receipts
+    SET status = 'acknowledged', acknowledged_at = ?, updated_at = ?
+    WHERE pipeline_instance_id = ?
+  `).run(nowIso, nowIso, instanceId);
+}
+
 async function report(options: {
   runtime?: { listLabeledResources: (limit?: number) => Promise<Array<{ id: string; state?: string; createdAt?: string; memory?: number }>> };
   limit?: number;
@@ -185,7 +193,6 @@ describe("admission drain report", () => {
       leaseUntilIso: "2026-08-13T00:05:00.000Z",
     });
     expect(leased).toMatchObject({ status: "leased" });
-
     const verdict = await report({ limit: 10 });
 
     expect(verdict.clear).toBe(false);
@@ -194,6 +201,7 @@ describe("admission drain report", () => {
       "pre_epoch_webhook_delivery_lease",
       "nonterminal_pipeline_instance",
       "runnable_pipeline_effect",
+      "runnable_publication_receipt",
       "leased_child_action",
       "bound_active_runtime_resource",
     ]);
@@ -201,6 +209,7 @@ describe("admission drain report", () => {
       "delivery-pre-epoch",
       instance.id,
       effect.id,
+      expect.any(String),
       leased!.id,
       "sandbox-bound",
     ]);
@@ -254,6 +263,7 @@ describe("admission drain report", () => {
   it("reports runnable github publication receipts after terminal pipeline settlement", async () => {
     const { seed } = setup();
     const terminal = seed("session-publication");
+    acknowledgePublications(terminal.id);
     db!.prepare(`
       UPDATE pipeline_instances
       SET status = 'shipped', terminal_outcome = 'shipped'
@@ -274,7 +284,14 @@ describe("admission drain report", () => {
         'pub-terminal', ?, NULL, 'github_summary', 'github-summary:terminal',
         ?, ?, 'pending', 0, ?, ?, ?
       )
-    `).run(terminal.id, payload, digestNormalized(payload), nowIso, nowIso, nowIso);
+    `).run(
+      terminal.id,
+      payload,
+      digestNormalized(payload),
+      "2026-08-14T00:00:00.000Z",
+      nowIso,
+      nowIso
+    );
 
     const verdict = await report();
 
@@ -287,9 +304,37 @@ describe("admission drain report", () => {
     ]);
   });
 
+  it("keeps delayed effect retries in the drain after terminal settlement", async () => {
+    const { seed, pipelines } = setup();
+    const terminal = seed("session-delayed-effect");
+    acknowledgePublications(terminal.id);
+    const effect = pipelines.listEffects(terminal.id)[0]!;
+    db!.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'shipped', terminal_outcome = 'shipped'
+      WHERE id = ?
+    `).run(terminal.id);
+    db!.prepare(`
+      UPDATE pipeline_effect_intents
+      SET status = 'failed', next_attempt_at = ?
+      WHERE id = ?
+    `).run("2026-08-14T00:00:00.000Z", effect.id);
+
+    const verdict = await report();
+
+    expect(verdict.clear).toBe(false);
+    expect(verdict.blockers).toEqual([
+      expect.objectContaining({
+        kind: "runnable_pipeline_effect",
+        id: effect.id,
+      }),
+    ]);
+  });
+
   it("does not let terminal rows or destroyed resources block a clear report", async () => {
     const { seed, pipelines } = setup();
     const terminal = seed("session-terminal");
+    acknowledgePublications(terminal.id);
     pipelines.bindRuntimeResource(terminal.id, "daytona", "sandbox-terminal");
     db!.prepare(`
       UPDATE pipeline_instances
@@ -379,6 +424,7 @@ describe("admission drain report", () => {
   it("canonicalizes known provider resources independently of terminal rows", async () => {
     const { seed, pipelines } = setup();
     const instance = seed("session-bound");
+    acknowledgePublications(instance.id);
     pipelines.bindRuntimeResource(instance.id, "daytona", "sandbox-bound");
     db!.prepare(`
       UPDATE pipeline_effect_intents

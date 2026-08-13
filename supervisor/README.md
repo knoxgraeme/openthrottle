@@ -93,7 +93,8 @@ receive `GITHUB_TOKEN`.
 - `workflow_dispatch` inputs force either half manually. The optional
   `prepare_v12_cutover` path uses `OT_DEPLOY_TOKEN` to pause admission, wait for
   the bounded fail-closed drain to clear, deploy, recheck the drain, and resume
-  admission only when `resume_after_v12_cutover` is set.
+  admission only when `resume_after_v12_cutover` is set. If the run does not
+  build a snapshot, pass its exact name as `expected_snapshot`.
 
 It needs the repository secrets `DAYTONA_API_KEY`, `FLY_API_TOKEN` (org-scoped
 so it can create the app on first run), and `OT_DEPLOY_TOKEN`, plus optional repository variables
@@ -102,13 +103,15 @@ first-time creation, default `personal`), and `FLY_REGION` (volume region,
 default `sjc`). Both `flyctl` deploy steps pass `--app` explicitly, so the
 committed `fly.toml` app value never has to match.
 
-The post-merge v12 operator gate is: trigger the deploy workflow with
-`prepare_v12_cutover`, let it pause admission and wait until
-`/deployment/cutover-evidence` reports `drain.clear`, deploy, verify the same
-fail-closed evidence again, then resume only when `resume_after_v12_cutover` is
-also selected. The rollback pair is to redeploy the previous supervisor image
-or restore the prior `DAYTONA_SNAPSHOT` secret, then resume admission only after
-cutover evidence shows the rolled-back runtime and a clear drain.
+This non-breaking supervisor-only fence release deploys first on the existing
+v12 snapshot because its parent does not yet have the maintenance endpoints.
+After that bootstrap, every push that builds a new snapshot automatically
+pauses, drains, deploys, verifies the pinned runtime release/digest and exact
+snapshot, and resumes. To exercise the v12 fence without building a snapshot,
+manually dispatch with `prepare_v12_cutover`, `resume_after_v12_cutover`, and
+the current `expected_snapshot`. The rollback pair is the previous supervisor
+image plus its exact `DAYTONA_SNAPSHOT`; resume only after cutover evidence
+shows that identity and a clear drain.
 
 The workflow does **not** set the runtime secrets — those are operator-owned and
 still set once with `fly secrets set ...` (see [Deploy to Fly](#deploy-to-fly)).

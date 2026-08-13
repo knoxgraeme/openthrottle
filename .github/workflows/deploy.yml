@@ -34,13 +34,17 @@ on:
         type: boolean
         default: false
       prepare_v12_cutover:
-        description: "Pause admission and drain work before the v12 deploy"
+        description: "Use the deployed v12 fence before a later cutover"
         type: boolean
         default: false
       resume_after_v12_cutover:
         description: "Resume admission after the v12 cutover proves clear"
         type: boolean
         default: false
+      expected_snapshot:
+        description: "Exact snapshot expected after cutover (defaults to one built in this run)"
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -120,6 +124,7 @@ jobs:
       FLY_REGION: ${{ vars.FLY_REGION || 'sjc' }}
       SUPERVISOR_URL: ${{ vars.SUPERVISOR_URL || format('https://{0}.fly.dev', vars.FLY_APP || 'openthrottle-supervisor') }}
       OT_DEPLOY_TOKEN: ${{ secrets.OT_DEPLOY_TOKEN }}
+      EXPECTED_SNAPSHOT: ${{ needs.snapshot.outputs.name || inputs.expected_snapshot }}
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
@@ -149,9 +154,16 @@ jobs:
         if: needs.snapshot.result == 'success'
         run: flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="${{ needs.snapshot.outputs.name }}"
       - name: Pause admission and wait for the v12 cutover drain
-        if: inputs.prepare_v12_cutover
+        # This supervisor-only fence release does not build a snapshot, so its
+        # first push deploys without calling endpoints its parent lacks. Once
+        # installed, every push that builds a new snapshot gates automatically.
+        if: inputs.prepare_v12_cutover || (github.event_name == 'push' && needs.snapshot.result == 'success')
         run: |
           set -euo pipefail
+          if [[ -z "${EXPECTED_SNAPSHOT}" ]]; then
+            echo "expected_snapshot is required when this run does not build a snapshot" >&2
+            exit 1
+          fi
           curl -fsS -X POST \
             -H "Authorization: Bearer ${OT_DEPLOY_TOKEN}" \
             -H "content-type: application/json" \
@@ -178,17 +190,28 @@ jobs:
         # dependency is inside the Docker build context.
         run: flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
       - name: Verify v12 cutover evidence after deploy
-        if: inputs.prepare_v12_cutover
+        if: inputs.prepare_v12_cutover || (github.event_name == 'push' && needs.snapshot.result == 'success')
         run: |
           set -euo pipefail
           evidence="$(curl -fsS \
             -H "Authorization: Bearer ${OT_DEPLOY_TOKEN}" \
             "${SUPERVISOR_URL%/}/deployment/cutover-evidence")"
           printf '%s\n' "$evidence" | jq .
+          expected_release="$(jq -r '.runtime.release' supervisor/pipelines/v12-deploy-proof.json)"
+          expected_digest="$(jq -r '.runtime.digest' supervisor/pipelines/v12-deploy-proof.json)"
           printf '%s\n' "$evidence" | jq -e \
-            '.admission.paused == 1 and .drain.clear == true' >/dev/null
+            --arg release "$expected_release" \
+            --arg digest "$expected_digest" \
+            --arg snapshot "$EXPECTED_SNAPSHOT" \
+            '.admission.paused == 1 and
+             .drain.clear == true and
+             .runtime.release == $release and
+             .runtime.capabilityDigest == $digest and
+             .snapshot == $snapshot' >/dev/null
       - name: Resume admission after v12 cutover
-        if: inputs.prepare_v12_cutover && inputs.resume_after_v12_cutover
+        if: >-
+          (github.event_name == 'push' && needs.snapshot.result == 'success') ||
+          (inputs.prepare_v12_cutover && inputs.resume_after_v12_cutover)
         run: |
           curl -fsS -X POST \
             -H "Authorization: Bearer ${OT_DEPLOY_TOKEN}" \

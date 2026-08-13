@@ -1194,6 +1194,11 @@ Required:
 `OT_DEPLOY_TOKEN` is the only authority allowed to mutate supervisor
 maintenance or read deployment cutover evidence. It is held by the supervisor
 and deploy workflow only, and is outside the sandbox credential allowlist.
+The supervisor-only fence release bootstraps on the unchanged v12 snapshot;
+after that release is installed, every push that builds a new snapshot must
+pause and drain before deploy, then verify the pinned runtime release, runtime
+digest, and exact snapshot before resuming admission. A manual cutover without
+a snapshot build must supply the exact expected snapshot explicitly.
 
 Optional/defaulted:
 

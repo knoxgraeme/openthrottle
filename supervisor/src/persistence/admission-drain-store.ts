@@ -135,18 +135,17 @@ export function createAdmissionDrainStore(db: Database.Database): AdmissionDrain
             `
               SELECT id, pipeline_instance_id, kind, status, next_attempt_at
               FROM pipeline_effect_intents
-              WHERE ((status IN ('pending', 'failed') AND next_attempt_at <= ?)
-                OR (status = 'processing' AND next_attempt_at <= ?))
+              WHERE status IN ('pending', 'failed', 'processing')
               ORDER BY next_attempt_at, created_at, id
               LIMIT ?
             `,
-            [nowIso, nowIso],
+            [],
             remaining()
           ),
           (row) => ({
             kind: "runnable_pipeline_effect",
             id: row.id,
-            detail: `instance=${row.pipeline_instance_id} kind=${row.kind} status=${row.status} next_attempt_at=${row.next_attempt_at}`,
+            detail: `instance=${row.pipeline_instance_id} kind=${row.kind} status=${row.status} next_attempt_at=${row.next_attempt_at} observed_at=${nowIso}`,
           })
         );
       }
@@ -165,18 +164,17 @@ export function createAdmissionDrainStore(db: Database.Database): AdmissionDrain
               SELECT id, pipeline_instance_id, kind, status, next_attempt_at
               FROM pipeline_publication_receipts
               WHERE kind = 'github_summary'
-                AND ((status IN ('pending', 'failed') AND COALESCE(next_attempt_at, created_at) <= ?)
-                  OR (status = 'processing' AND COALESCE(next_attempt_at, created_at) <= ?))
+                AND status IN ('pending', 'failed', 'processing')
               ORDER BY COALESCE(next_attempt_at, created_at), created_at, id
               LIMIT ?
             `,
-            [nowIso, nowIso],
+            [],
             remaining()
           ),
           (row) => ({
             kind: "runnable_publication_receipt",
             id: row.id,
-            detail: `instance=${row.pipeline_instance_id} kind=${row.kind} status=${row.status} next_attempt_at=${row.next_attempt_at ?? "none"}`,
+            detail: `instance=${row.pipeline_instance_id} kind=${row.kind} status=${row.status} next_attempt_at=${row.next_attempt_at ?? "none"} observed_at=${nowIso}`,
           })
         );
       }

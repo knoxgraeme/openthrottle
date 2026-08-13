@@ -40,7 +40,12 @@ assert(
     deployWorkflow.includes("/maintenance/admission/pause") &&
     deployWorkflow.includes("/deployment/cutover-evidence") &&
     deployWorkflow.includes("/maintenance/admission/resume") &&
-    deployWorkflow.includes(".drain.clear == true"),
+    deployWorkflow.includes(".drain.clear == true") &&
+    deployWorkflow.includes(".runtime.release == $release") &&
+    deployWorkflow.includes(".runtime.capabilityDigest == $digest") &&
+    deployWorkflow.includes(".snapshot == $snapshot") &&
+    deployWorkflow.includes("EXPECTED_SNAPSHOT") &&
+    deployWorkflow.includes("github.event_name == 'push' && needs.snapshot.result == 'success'"),
   "deploy workflow must expose a fail-closed supervisor-only v12 cutover path"
 );
 assert(
