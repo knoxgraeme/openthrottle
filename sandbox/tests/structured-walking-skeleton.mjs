@@ -422,6 +422,19 @@ function createDockerSandboxRuntime(container) {
           `composite workspace preparation failed (${result.status}): stderr=${result.stderr} stdout=${result.stdout}`
         );
       }
+      const preparedSubject = dockerExecStatus(container, [
+        "git",
+        "-C",
+        "/home/agent/repo",
+        "rev-parse",
+        "HEAD",
+      ]);
+      if (preparedSubject.status !== 0 || !/^[a-f0-9]{40}$/.test(preparedSubject.stdout.trim())) {
+        throw new Error(
+          `composite workspace subject lookup failed (${preparedSubject.status}): stderr=${preparedSubject.stderr} stdout=${preparedSubject.stdout}`
+        );
+      }
+      return { subject: preparedSubject.stdout.trim() };
     },
 
     async dispatchStage() {
