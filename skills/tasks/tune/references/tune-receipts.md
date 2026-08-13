@@ -22,10 +22,10 @@ No tune receipt carries semantic-review findings or supervisor gate results.
 
 ## Analysis
 
-`openthrottle.tune-analysis/v1` contains exactly:
+`openthrottle.tune-analysis-input/v1` is the bounded input material for
+analysis and proposal reasoning. It contains exactly:
 
-- `schema`, `id`, `intent`, `intent_digest`, `corpus_rows`, `corpus_digest`,
-  `generated_at`.
+- `schema`, `id`, `intent`, `intent_digest`, `corpus_rows`, `corpus_digest`.
 - `intent` is the complete `openthrottle.tune-sealed-intent/v1`: `schema`,
   `id`, complete `task`, `task_digest`, `sealed_at`, `authority_digest`.
 - `task` is the complete `openthrottle.tune-task/v1`: `schema`, `id`, `target`,
@@ -38,6 +38,12 @@ The row digest covers the row without `row_digest`. The corpus digest covers
 the exact row array. Rows must satisfy the sealed query and window, must not
 duplicate an id or pipeline-instance/generation pair, and cannot exceed the
 smaller of `task.query.limit` and `task.window.limit`.
+
+`openthrottle.tune-analysis/v1` contains the same closed typed input fields plus
+`generated_at`. It is the only analysis object a later proposal may consume.
+Raw ticket, review, finding, comment, or prompt prose is never a field in either
+contract; agents may use only the typed corpus row values and the row/source
+digests derived from supervisor-selected evidence.
 
 ## Proposal
 

@@ -13,6 +13,7 @@ import {
   parseRatchetDifferentialInput,
   parseStandardReceipt,
   validateCitationContractProposal,
+  validateTuneAnalysisInputContract,
   validateTuneAnalysisContract,
   validateTuneDecisionContract,
   validateTuneEditAuthorizationContract,
@@ -186,6 +187,18 @@ describe("Stage C contract fixtures", () => {
     };
   }
 
+  function tuneAnalysisInput(): Record<string, unknown> {
+    const analysis = tuneAnalysis();
+    return {
+      schema: "openthrottle.tune-analysis-input/v1",
+      id: analysis.id,
+      intent: analysis.intent,
+      intent_digest: analysis.intent_digest,
+      corpus_rows: analysis.corpus_rows,
+      corpus_digest: analysis.corpus_digest,
+    };
+  }
+
   function tuneProposal(): Record<string, unknown> {
     const analysis = tuneAnalysis();
     const intent = analysis.intent as Record<string, unknown>;
@@ -326,6 +339,7 @@ describe("Stage C contract fixtures", () => {
   it("recomputes tune corpus and analysis bindings before accepting a proposal", () => {
     const proposal = tuneProposal();
     expect(validateTuneProposalContract(proposal).value.changes).toHaveLength(1);
+    expect(validateTuneAnalysisInputContract(tuneAnalysisInput()).digest).toBeTruthy();
 
     const mismatched = structuredClone(proposal);
     (mismatched.query as Record<string, unknown>).graph = "other_graph";
@@ -341,6 +355,11 @@ describe("Stage C contract fixtures", () => {
     badCorpus.corpus_digest = "f".repeat(64);
     expect(() => validateTuneAnalysisContract(badCorpus, { source: "analysis" }))
       .toThrow(/analysis\.corpus_digest: does not match canonical corpus digest/);
+
+    const badAnalysisInput = tuneAnalysisInput();
+    badAnalysisInput.corpus_rows = [{ ...corpusRow(), raw_prompt_prose: "untrusted prompt" }];
+    expect(() => validateTuneAnalysisInputContract(badAnalysisInput, { source: "analysis_input" }))
+      .toThrow(/raw_prompt_prose: unknown field/);
 
     const badAnalysisDigest = tuneProposal();
     badAnalysisDigest.analysis_digest = "f".repeat(64);
