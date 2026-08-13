@@ -100,7 +100,7 @@ function hasValidElementParent(
     return parent === "sub-issues" || parent === "parent-issue";
   }
   if (kind === "issue-relations") {
-    return parent === "issue" || parent === "parent-issue";
+    return parent !== undefined && isContextSectionKind(parent);
   }
   if (kind === "issue-ref") {
     return false;
@@ -319,13 +319,13 @@ export function composeBoundedTaskContext(
   }
 
   const parentSections = contextSectionsOf(sections, "parent-issue");
-  const otherThreadSections = contextSectionsOf(sections, "other-thread");
+  const rawOtherThreadSections = contextSectionsOf(sections, "other-thread");
   const parentSectionCount = parentSections.length;
   const knownSections = [
     ...rawIssueSections,
     ...rawDirectiveSections,
     ...parentSections,
-    ...otherThreadSections,
+    ...rawOtherThreadSections,
   ];
   const remaining = withoutSections(sanitized, knownSections);
   if (remaining || hasLinearContextStructuralDelimiter(remaining)) {
@@ -343,11 +343,11 @@ export function composeBoundedTaskContext(
   const decodeGithubAuthority = rawDirectiveSections.length === 1 &&
     isGithubIssueBodyDirective(rawDirectiveSections[0]!);
   const requiredOmissionSections = decodeGithubAuthority
-    ? otherThreadSections.filter(isGithubCommentsOmittedMarker)
+    ? rawOtherThreadSections.filter(isGithubCommentsOmittedMarker)
     : [];
-  const optionalThreadSections = otherThreadSections.filter(
+  const optionalThreadSections = rawOtherThreadSections.filter(
     (section) => !requiredOmissionSections.includes(section)
-  );
+  ).map(stripNestedLinearContextSections);
   const selectionContext = requiredSections
     .map((section) => decodeGithubAuthority ? decodeXmlText(section) : section)
     .join("\n\n")
