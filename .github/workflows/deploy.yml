@@ -56,6 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       sandbox: ${{ steps.filter.outputs.sandbox }}
+      skills: ${{ steps.filter.outputs.skills }}
+      runtime_descriptor: ${{ steps.filter.outputs.runtime_descriptor }}
       supervisor: ${{ steps.filter.outputs.supervisor }}
     steps:
       - uses: actions/checkout@v4
@@ -68,14 +70,20 @@ jobs:
               - 'sandbox/**'
               - '!sandbox/tests/**'
               - '!sandbox/**/*.test.mjs'
+            skills:
               - 'skills/**'
+            runtime_descriptor:
               - 'supervisor/pipelines/runtime-capabilities-v1.json'
             supervisor:
               - 'supervisor/**'
 
   snapshot:
     needs: changes
-    if: needs.changes.outputs.sandbox == 'true' || inputs.build_snapshot
+    if: >-
+      needs.changes.outputs.sandbox == 'true' ||
+      needs.changes.outputs.skills == 'true' ||
+      needs.changes.outputs.runtime_descriptor == 'true' ||
+      inputs.build_snapshot
     runs-on: ubuntu-latest
     outputs:
       name: ${{ steps.build.outputs.name }}
