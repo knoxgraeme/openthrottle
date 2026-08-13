@@ -702,8 +702,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       }
       await deps.runtime.materializeCredentials(resource, request.credentialScopes);
       bindCompositeParentRun(instance, request);
-      await deps.runtime.prepareCompositeWorkspace(resource, request);
-      structuredChildren.seedCompositeGraph(instance, request);
+      const preparedWorkspace = await deps.runtime.prepareCompositeWorkspace(resource, request);
+      structuredChildren.seedCompositeGraph(instance, request, preparedWorkspace.subject);
       await structuredChildren.drainCompositeChildren(resource, instance, request.attemptId);
       acknowledgeEffect(effect, eventId, {
         providerResourceId: resource.providerResourceId,

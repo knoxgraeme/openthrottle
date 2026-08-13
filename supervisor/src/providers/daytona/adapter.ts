@@ -617,6 +617,7 @@ export function createDaytonaSandboxRuntime(
       await prepareStageInput(sandbox, request);
       await sandbox.updateEnv({ OT_COMPOSITE_PREPARE_ONLY: "1" }, { unset: [] });
       const marker = `${STAGE_RESULT_DIR}/${request.attemptId}.composite-prepared`;
+      const markerTemp = `${marker}.tmp`;
       const sessionId = `composite-prepare-${request.attemptId}`;
       await sandbox.process?.createSession?.(sessionId).catch(() => undefined);
       if (!sandbox.process?.executeSessionCommand) {
@@ -624,13 +625,24 @@ export function createDaytonaSandboxRuntime(
       }
       const prepared = await sandbox.process.executeSessionCommand(sessionId, {
         command: `flock --nonblock ${STAGE_RESULT_DIR}/${request.attemptId}.prepare.lock sh -c ` +
-          shellSingleQuoted(`test -f ${marker} || (OT_COMPOSITE_PREPARE_ONLY=1 /opt/openthrottle/entrypoint.sh && install -o root -g root -m 0400 /dev/null ${marker})`),
+          shellSingleQuoted(`(test -s ${marker} || (` + [
+            "OT_COMPOSITE_PREPARE_ONLY=1 /opt/openthrottle/entrypoint.sh",
+            `subject="$(git -c safe.directory=/home/agent/repo -C /home/agent/repo rev-parse HEAD)"`,
+            `printf '%s\\n' "$subject" > ${markerTemp}`,
+            `install -o root -g root -m 0400 ${markerTemp} ${marker}`,
+            `rm -f ${markerTemp}`,
+          ].join(" && ") + `)) && cat ${marker}`),
         runAsync: false,
         suppressInputEcho: true,
       }, options.taskTimeoutSeconds ?? 7_200);
       if (prepared.exitCode !== undefined && prepared.exitCode !== 0) {
         throw new Error(`composite workspace preparation failed with exit ${prepared.exitCode}`);
       }
+      const subject = String(prepared.stdout ?? prepared.output ?? "").trim().split(/\r?\n/).at(-1) ?? "";
+      if (!/^[a-f0-9]{40}$/.test(subject)) {
+        throw new Error("composite workspace preparation returned an invalid Git subject");
+      }
+      return { subject };
     },
 
     async collectStageResult(resource, attemptId) {

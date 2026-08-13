@@ -76,6 +76,7 @@ export interface ExecutionUnitGraph {
   parent_run_id: string;
   graph_digest: string;
   plan_digest: string;
+  initial_subject: string | null;
   command_names: string;
   unit_phases: string;
   unit_phase_bindings: string;
@@ -188,6 +189,7 @@ export interface ExecutionUnitStore {
     parentRunId: string;
     graphDigest: string;
     planDigest: string;
+    initialSubject?: string;
     units: readonly ExecutionPlanUnit[];
     commandNames?: readonly string[];
     unitPhases?: readonly UnitPhase[];
@@ -591,6 +593,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       existing.parent_run_id !== input.parentRunId ||
       existing.graph_digest !== input.graphDigest ||
       existing.plan_digest !== input.planDigest ||
+      (input.initialSubject !== undefined && existing.initial_subject !== input.initialSubject) ||
       existing.command_names !== expectedCommandNames ||
       (existing.unit_phases !== expectedUnitPhases && !legacyBuiltinUnitPhasesReplay) ||
       (existing.unit_phase_bindings !== expectedUnitPhaseBindings && !legacyUnboundPhaseReplay) ||
@@ -794,12 +797,15 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     if (!Number.isInteger(maxRepairRounds) || maxRepairRounds < 0) {
       throw new Error("execution graph maxRepairRounds must be a non-negative integer");
     }
+    if (input.initialSubject !== undefined && !/^[a-f0-9]{40}$/.test(input.initialSubject)) {
+      throw new Error("execution graph initialSubject must be an exact Git commit");
+    }
     db.prepare(`
       INSERT INTO execution_graphs (
         id, pipeline_instance_id, parent_attempt_id, parent_stage_id, parent_run_id,
         graph_digest, plan_digest, command_names, unit_phases, unit_phase_bindings,
-        max_repair_rounds, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        max_repair_rounds, initial_subject, integration_subject, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(parent_attempt_id) DO NOTHING
     `).run(
       graphId,
@@ -813,6 +819,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       unitPhases,
       unitPhaseBindings,
       maxRepairRounds,
+      input.initialSubject ?? null,
+      input.initialSubject ?? null,
       timestamp,
       timestamp
     );

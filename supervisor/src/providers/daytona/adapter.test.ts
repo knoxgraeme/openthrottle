@@ -109,7 +109,10 @@ describe("Daytona stage execution", () => {
       process: {
         executeCommand: vi.fn(async () => ({ exitCode: 0, result: "{}" })),
         createSession: vi.fn(async () => undefined),
-        executeSessionCommand: vi.fn(async () => ({ cmdId: "dispatch-opaque-1" })),
+        executeSessionCommand: vi.fn(async (sessionId: string) => ({
+          cmdId: "dispatch-opaque-1",
+          ...(sessionId.startsWith("composite-prepare-") ? { stdout: "a".repeat(40) } : {}),
+        })),
       },
     } as unknown as Sandbox;
     const list = vi.fn(() => (async function* () {})());
@@ -243,13 +246,15 @@ describe("Daytona stage execution", () => {
       commandName: undefined,
     };
     const compositeRequest = { ...compositeWithoutFence, ...createStageRequestHash(compositeWithoutFence) };
-    await expect(runtime.prepareCompositeWorkspace(resource, compositeRequest)).resolves.toBeUndefined();
+    await expect(runtime.prepareCompositeWorkspace(resource, compositeRequest)).resolves.toEqual({
+      subject: "a".repeat(40),
+    });
     expect(sandbox.updateEnv).toHaveBeenLastCalledWith({ OT_COMPOSITE_PREPARE_ONLY: "1" }, { unset: [] });
     expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
       "composite-prepare-attempt-composite",
       expect.objectContaining({
         runAsync: false,
-        command: expect.stringContaining("OT_COMPOSITE_PREPARE_ONLY=1 /opt/openthrottle/entrypoint.sh"),
+        command: expect.stringMatching(/OT_COMPOSITE_PREPARE_ONLY=1 \/opt\/openthrottle\/entrypoint\.sh.*rev-parse HEAD.*cat \/var\/lib\/openthrottle\/stage-results\/attempt-composite\.composite-prepared/),
       }),
       expect.any(Number)
     );

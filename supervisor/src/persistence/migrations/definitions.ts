@@ -1609,6 +1609,13 @@ ALTER TABLE execution_graphs ADD COLUMN unit_phase_bindings TEXT NOT NULL DEFAUL
 const executionGraphUnitPhaseBindingsMigrationSource = `${executionGraphUnitPhaseBindingsSchema}
 unit-phase-binding-contract:execution graphs persist the full compiled ordered unit phase binding without rereading mutable graph data/v1`;
 
+const executionGraphInitialSubjectSchema = `
+ALTER TABLE execution_graphs ADD COLUMN initial_subject TEXT;
+`;
+
+const executionGraphInitialSubjectMigrationSource = `${executionGraphInitialSubjectSchema}
+composite-subject-contract:structured execution persists the exact prepared ticket-branch head separately from its advancing integration subject/v1`;
+
 const executionUnitPlanCommandNamesSchema = `
 ALTER TABLE execution_units ADD COLUMN command_names TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(command_names));
 UPDATE execution_units
@@ -3398,6 +3405,16 @@ const definitions: DatabaseMigrationDefinition[] = [
         hasColumns(db, "pipeline_instances", ["ticket_id", "session_id", "task_type", "published_subject"]) &&
         !table.sql.includes("'tune'")
       ) db.exec(tuneTaskTypeSchema);
+    },
+  },
+  {
+    version: 44,
+    name: "execution-graph-initial-subject",
+    source: executionGraphInitialSubjectMigrationSource,
+    up(db) {
+      if (hasTable(db, "execution_graphs") && !hasColumns(db, "execution_graphs", ["initial_subject"])) {
+        db.exec(executionGraphInitialSubjectSchema);
+      }
     },
   },
 ];
