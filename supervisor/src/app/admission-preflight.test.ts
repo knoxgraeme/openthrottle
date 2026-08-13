@@ -339,6 +339,7 @@ describe("admission preflight wired into Linear admission", () => {
       databasePath: ":memory:",
       supervisorUrl: "https://ot.test",
       statusToken: "status",
+      deployToken: "deploy",
       installSecret: "install",
       linearWebhookSecret: "linear",
       linearClientId: "client",

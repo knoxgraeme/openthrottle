@@ -8,6 +8,7 @@ import { openDb } from "../persistence/database.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { createAnalysisStore, type AnalysisStore } from "../persistence/pipeline/analysis-store.js";
 import { createCitationGateStore, type CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
+import { createAdmissionDrainStore } from "../persistence/admission-drain-store.js";
 import { STRUCTURED_STATUS_UNITS_SQL } from "../persistence/pipeline/status-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
@@ -24,6 +25,7 @@ const cfg: Config = {
   databasePath: ":memory:",
   supervisorUrl: "https://supervisor.test",
   statusToken: "status-token",
+  deployToken: "deploy-token",
   installSecret: "install-secret",
   linearWebhookSecret: "linear-secret",
   linearClientId: "linear-client",
@@ -127,6 +129,7 @@ describe("coordinator-only server", () => {
       runtime: {} as ServerRuntime,
       analysisStore,
       citationGateStore,
+      admissionDrainStore: createAdmissionDrainStore(db),
       getLinearClient: async () => undefined,
       pipelineCoordinator: {
         catalog: {} as never,
@@ -263,6 +266,88 @@ describe("coordinator-only server", () => {
       capabilityDigest: runtime.digest,
       capabilities: runtime.descriptor.capabilities,
       limits: { taskTimeoutSeconds: 7200 },
+    });
+  });
+
+  it("reserves maintenance mutation and fail-closed cutover evidence for the deployment token", async () => {
+    const descriptor = buildInstalledRuntimeDescriptor("deploy-evidence-test/v1");
+    const runtime = {
+      listLabeledResources: vi.fn(async () => []),
+    } as unknown as ServerRuntime;
+    const server = app({
+      runtime,
+      pipelineCoordinator: { catalog: {} as never, runtime: descriptor, store: pipelines },
+    });
+
+    const statusTokenPause = await server.request("/maintenance/admission/pause", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(statusTokenPause.status).toBe(401);
+
+    const paused = await server.request("/maintenance/admission/pause", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({ reason: "v12 cutover drain" }),
+    });
+    expect(paused.status).toBe(200);
+    expect(await paused.json()).toMatchObject({
+      admission: { paused: 1, epoch: 1, reason: "v12 cutover drain" },
+    });
+
+    const statusTokenEvidence = await server.request("/deployment/cutover-evidence", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(statusTokenEvidence.status).toBe(401);
+
+    const evidence = await server.request("/deployment/cutover-evidence", {
+      headers: { Authorization: "Bearer deploy-token" },
+    });
+    expect(evidence.status).toBe(200);
+    expect(await evidence.json()).toMatchObject({
+      admission: { paused: 1, reason: "v12 cutover drain" },
+      runtime: { release: descriptor.descriptor.release, capabilityDigest: descriptor.digest },
+      snapshot: "snapshot",
+      drain: { clear: true, blockers: [], truncated: false },
+    });
+    expect(runtime.listLabeledResources).toHaveBeenCalledWith(51);
+
+    runtime.listLabeledResources = vi.fn(async () => [{
+      id: "orphan-runtime",
+      state: "started",
+      createdAt: "2026-08-13T00:00:00.000Z",
+      memory: 8,
+    }]);
+    const orphanEvidence = await server.request("/deployment/cutover-evidence", {
+      headers: { Authorization: "Bearer deploy-token" },
+    });
+    expect(await orphanEvidence.json()).toMatchObject({
+      drain: {
+        clear: false,
+        blockers: [{ kind: "unknown_runtime_inventory_resource", id: "orphan-runtime" }],
+      },
+    });
+
+    runtime.listLabeledResources = vi.fn(async () => {
+      throw new Error("provider inventory unavailable");
+    });
+    const failedInventoryEvidence = await server.request("/deployment/cutover-evidence", {
+      headers: { Authorization: "Bearer deploy-token" },
+    });
+    expect(await failedInventoryEvidence.json()).toMatchObject({
+      drain: {
+        clear: false,
+        blockers: [{ kind: "runtime_inventory_error", id: "runtime-inventory" }],
+      },
+    });
+
+    const resumed = await server.request("/maintenance/admission/resume", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token" },
+    });
+    expect(resumed.status).toBe(200);
+    expect(await resumed.json()).toMatchObject({
+      admission: { paused: 0, epoch: 2, reason: null },
     });
   });
 
@@ -1203,6 +1288,9 @@ describe("coordinator-only server", () => {
       ["/status", "GET"],
       ["/status/journal", "GET"],
       ["/capabilities", "GET"],
+      ["/deployment/cutover-evidence", "GET"],
+      ["/maintenance/admission/pause", "POST"],
+      ["/maintenance/admission/resume", "POST"],
       ["/analysis/runs", "GET"],
       ["/repositories", "GET"],
       ["/repositories/register", "POST"],

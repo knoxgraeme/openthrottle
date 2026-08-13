@@ -845,7 +845,7 @@ describe("Daytona stage execution", () => {
     });
   });
 
-  it("refuses credentials outside the sandbox allowlist", async () => {
+  it("refuses credentials outside the sandbox allowlist, including the deployment token", async () => {
     const sandbox = {
       id: "provider-opaque-2",
       state: "started",
@@ -855,12 +855,12 @@ describe("Daytona stage execution", () => {
     } as unknown as Sandbox;
     const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
       snapshot: "snapshot-v1",
-      materializeCredentialEnv: vi.fn(async () => ({ env: { DAYTONA_API_KEY: "forbidden" } })),
+      materializeCredentialEnv: vi.fn(async () => ({ env: { OT_DEPLOY_TOKEN: "forbidden" } })),
     });
     await expect(runtime.materializeCredentials(
       { providerResourceId: "provider-opaque-2" },
       ["repo.read"]
-    )).rejects.toThrow(/forbidden sandbox variable/);
+    )).rejects.toThrow(/forbidden sandbox variable OT_DEPLOY_TOKEN/);
     expect(sandbox.updateEnv).not.toHaveBeenCalled();
   });
 

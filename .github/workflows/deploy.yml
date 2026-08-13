@@ -12,10 +12,13 @@ name: Deploy
 #   DAYTONA_API_KEY — builds/registers snapshots (same key the supervisor uses)
 #   FLY_API_TOKEN   — deploy token for the supervisor app (org-scoped, so it can
 #                     create the app on first run)
+#   OT_DEPLOY_TOKEN — supervisor-only deploy authority for admission pause/resume
+#                     and cutover evidence; never forwarded to Daytona sandboxes
 # Optional repository variables:
 #   FLY_APP    — Fly app name; defaults to openthrottle-supervisor
 #   FLY_ORG    — Fly org for first-time app creation; defaults to personal
 #   FLY_REGION — region for the app's data volume; defaults to sjc
+#   SUPERVISOR_URL — deployed supervisor URL; defaults to https://$FLY_APP.fly.dev
 
 on:
   push:
@@ -28,6 +31,14 @@ on:
         default: false
       deploy_supervisor:
         description: "Force a Fly supervisor deploy"
+        type: boolean
+        default: false
+      prepare_v12_cutover:
+        description: "Pause admission and drain work before the v12 deploy"
+        type: boolean
+        default: false
+      resume_after_v12_cutover:
+        description: "Resume admission after the v12 cutover proves clear"
         type: boolean
         default: false
 
@@ -107,6 +118,8 @@ jobs:
       FLY_APP: ${{ vars.FLY_APP || 'openthrottle-supervisor' }}
       FLY_ORG: ${{ vars.FLY_ORG || 'personal' }}
       FLY_REGION: ${{ vars.FLY_REGION || 'sjc' }}
+      SUPERVISOR_URL: ${{ vars.SUPERVISOR_URL || format('https://{0}.fly.dev', vars.FLY_APP || 'openthrottle-supervisor') }}
+      OT_DEPLOY_TOKEN: ${{ secrets.OT_DEPLOY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
@@ -135,7 +148,48 @@ jobs:
       - name: Stage the new snapshot name
         if: needs.snapshot.result == 'success'
         run: flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="${{ needs.snapshot.outputs.name }}"
+      - name: Pause admission and wait for the v12 cutover drain
+        if: inputs.prepare_v12_cutover
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${OT_DEPLOY_TOKEN}" \
+            -H "content-type: application/json" \
+            --data '{"reason":"v12 post-merge deployment drain"}' \
+            "${SUPERVISOR_URL%/}/maintenance/admission/pause"
+          deadline=$((SECONDS + 600))
+          while true; do
+            evidence="$(curl -fsS \
+              -H "Authorization: Bearer ${OT_DEPLOY_TOKEN}" \
+              "${SUPERVISOR_URL%/}/deployment/cutover-evidence")"
+            printf '%s\n' "$evidence" | jq .
+            if printf '%s\n' "$evidence" | jq -e \
+              '.admission.paused == 1 and .drain.clear == true' >/dev/null; then
+              break
+            fi
+            if (( SECONDS >= deadline )); then
+              echo "v12 cutover drain did not clear within 600 seconds" >&2
+              exit 1
+            fi
+            sleep 10
+          done
       - name: Deploy the supervisor
         # Build from the repository root so the supervisor's file:../contracts
         # dependency is inside the Docker build context.
         run: flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
+      - name: Verify v12 cutover evidence after deploy
+        if: inputs.prepare_v12_cutover
+        run: |
+          set -euo pipefail
+          evidence="$(curl -fsS \
+            -H "Authorization: Bearer ${OT_DEPLOY_TOKEN}" \
+            "${SUPERVISOR_URL%/}/deployment/cutover-evidence")"
+          printf '%s\n' "$evidence" | jq .
+          printf '%s\n' "$evidence" | jq -e \
+            '.admission.paused == 1 and .drain.clear == true' >/dev/null
+      - name: Resume admission after v12 cutover
+        if: inputs.prepare_v12_cutover && inputs.resume_after_v12_cutover
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${OT_DEPLOY_TOKEN}" \
+            "${SUPERVISOR_URL%/}/maintenance/admission/resume"

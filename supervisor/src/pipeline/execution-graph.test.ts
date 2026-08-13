@@ -690,8 +690,12 @@ describe("execution graph compiler", () => {
     });
     expect(() => validateAndCompileExecutionGraph(graph))
       .toThrow(/repository skill implement_unit was not pinned by admission/);
+    const runtimeWithoutRepositorySkills = buildInstalledRuntimeDescriptor("production-like/v1", {
+      capabilities: buildInstalledRuntimeDescriptor("production-like-base/v1").descriptor.capabilities
+        .filter((capability) => capability !== REPOSITORY_SKILL_CAPABILITY),
+    });
     expect(() => validateAndCompileExecutionGraph(graph, {
-      runtime: buildInstalledRuntimeDescriptor("production-like/v1").descriptor,
+      runtime: runtimeWithoutRepositorySkills.descriptor,
       repositorySkills: new Map([["implement_unit", repositorySkillPackage()]]),
     })).toThrow(/runtime capability mismatch: capability:agent\/repository-skill@1/);
   });

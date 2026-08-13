@@ -493,7 +493,7 @@ attempt's stage-level credentials are. The Daytona adapter maps the action's
 exact declared scopes to the same minimal, closed sandbox credential-name
 allowlist as stage dispatch (`GITHUB_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
 `CODEX_AUTH_JSON`, `KIMI_CODE_API_KEY`) and rejects any operator-only Daytona,
-Fly, webhook, install, or supervisor credential the materializer might
+Fly, webhook, install, deployment, or supervisor credential the materializer might
 mistakenly return; provider secret identifiers never appear in repository
 schemas or sealed loop requests. The resulting envelope is uploaded to a
 root-owned, action-attempt-namespaced file next to the sealed request and
@@ -746,6 +746,9 @@ sentence, or links rendered after it.
 | `GET` | `/oauth/callback` | one-time OAuth state | exchange and store installation |
 | `GET` | `/status` | `OT_STATUS_TOKEN` bearer | tickets and pipeline/effect/publication state |
 | `GET` | `/capabilities` | `OT_STATUS_TOKEN` bearer | active runtime release, capability digest/IDs, and effective limits |
+| `GET` | `/deployment/cutover-evidence` | `OT_DEPLOY_TOKEN` bearer | bounded, fail-closed admission drain plus runtime and snapshot identity |
+| `POST` | `/maintenance/admission/pause` | `OT_DEPLOY_TOKEN` bearer | pause new admission and advance the maintenance epoch before deploy drain |
+| `POST` | `/maintenance/admission/resume` | `OT_DEPLOY_TOKEN` bearer | resume new admission after cutover evidence is clear |
 | `GET` | `/analysis/runs` | `OT_STATUS_TOKEN` bearer | read-only, filterable `run_outcomes` evidence for improvement proposals |
 | `POST` | `/analysis/citations/grade` | `OT_STATUS_TOKEN` bearer | reproduce proposal citations and deterministically grade their evidence graph |
 | `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered routes |
@@ -1182,10 +1185,15 @@ same transaction.
 
 Required:
 
-- HTTP/storage: `SUPERVISOR_URL`, `OT_STATUS_TOKEN`, `OT_INSTALL_SECRET`;
+- HTTP/storage: `SUPERVISOR_URL`, `OT_STATUS_TOKEN`, `OT_DEPLOY_TOKEN`,
+  `OT_INSTALL_SECRET`;
 - GitHub: `GITHUB_WEBHOOK_SECRET`, write-capable `GITHUB_TOKEN`, and
   read-only `GITHUB_READ_TOKEN`;
 - Daytona: `DAYTONA_API_KEY`.
+
+`OT_DEPLOY_TOKEN` is the only authority allowed to mutate supervisor
+maintenance or read deployment cutover evidence. It is held by the supervisor
+and deploy workflow only, and is outside the sandbox credential allowlist.
 
 Optional/defaulted:
 

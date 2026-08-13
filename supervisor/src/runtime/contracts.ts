@@ -298,7 +298,7 @@ export interface RuntimeStopper {
 export type RuntimeInventoryResource = Pick<RuntimeWorkspace, "id" | "state" | "createdAt" | "labels" | "memory">;
 
 export interface RuntimeInventory {
-  listLabeledResources(): Promise<RuntimeInventoryResource[]>;
+  listLabeledResources(limit?: number): Promise<RuntimeInventoryResource[]>;
   deleteResource(providerResourceId: string): Promise<void>;
 }
 

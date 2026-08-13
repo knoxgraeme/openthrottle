@@ -945,8 +945,8 @@ export function createDaytonaSandboxRuntime(
       await stopSandbox(daytona, providerResourceId);
     },
 
-    async listLabeledResources() {
-      return listLabeledSandboxes(daytona);
+    async listLabeledResources(limit) {
+      return listLabeledSandboxes(daytona, limit);
     },
 
     async deleteResource(providerResourceId) {
@@ -987,7 +987,8 @@ async function getSandboxLogs(daytona: Daytona, sandboxId: string): Promise<stri
   return logs.output ?? [logs.stdout, logs.stderr].filter(Boolean).join("\n");
 }
 
-async function listLabeledSandboxes(daytona: Daytona): Promise<RuntimeInventoryResource[]> {
+async function listLabeledSandboxes(daytona: Daytona, limit?: number): Promise<RuntimeInventoryResource[]> {
+  const effectiveLimit = limit === undefined ? undefined : Math.max(1, Math.floor(limit));
   const sandboxes: RuntimeInventoryResource[] = [];
   for await (const sandbox of daytona.list({ labels: { openthrottle: "true" } })) {
     sandboxes.push({
@@ -997,6 +998,7 @@ async function listLabeledSandboxes(daytona: Daytona): Promise<RuntimeInventoryR
       labels: sandbox.labels,
       memory: sandbox.memory,
     });
+    if (effectiveLimit !== undefined && sandboxes.length >= effectiveLimit) break;
   }
   return sandboxes;
 }

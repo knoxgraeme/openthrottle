@@ -42,6 +42,7 @@ function config(): Config {
     databasePath: ":memory:",
     supervisorUrl: "https://ot.test",
     statusToken: "status",
+    deployToken: "deploy",
     installSecret: "install",
     linearWebhookSecret: "linear",
     linearClientId: "client",
@@ -339,7 +340,8 @@ describe("pipeline admission", () => {
       | Array<{ name: string; parentName?: string }>
       | (() => Array<{ name: string; parentName?: string }>) = [],
     linearLabelsFetchError?: string,
-    tuneOutcomes: RunOutcome[] = []
+    tuneOutcomes: RunOutcome[] = [],
+    onFetchLabels?: (tickets: ReturnType<typeof createSupervisorStore>) => void
   ) {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
@@ -421,6 +423,7 @@ describe("pipeline admission", () => {
         if (linearLabelsFetchError !== undefined) {
           throw new Error(linearLabelsFetchError);
         }
+        onFetchLabels?.(tickets);
         const labels = typeof controlThreadLabels === "function" ? controlThreadLabels() : controlThreadLabels;
         return Response.json({
           data: {
@@ -529,6 +532,49 @@ mcp_servers: {}
     expect(pipelines.getActiveAttempt(instance.id)?.stage_id).toBe("implementation");
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
     expect(githubFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("fences an admission whose durable maintenance epoch changes before the pipeline transaction", async () => {
+    const result = await run(`
+schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+agent: codex
+pipelines: { implement: implement }
+limits: { max_turns: 20, task_timeout: 300 }
+mcp_servers: {}
+`,
+      {},
+      shippedCatalogPath,
+      payload(),
+      {},
+      {},
+      [],
+      undefined,
+      [],
+      (tickets) => {
+        tickets.pauseAdmission("restart");
+      }
+    );
+    expect(result.tickets.getAdmissionMaintenanceState()).toMatchObject({
+      paused: 1,
+      epoch: 1,
+      reason: "restart",
+    });
+
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_effect_intents").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_publication_receipts").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM orchestration_journal").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM tickets WHERE ticket_id = 'linear:issue-1'").pluck().get()).toBe(1);
+    expect(result.tickets.getByIssueId("linear:issue-1")).toMatchObject({
+      state: "error",
+      last_error: expect.stringContaining("retryable_infrastructure_failure: admission maintenance is paused: restart"),
+    });
   });
 
   it("seals tune admission from the authenticated outcome corpus and removes ticket prose", async () => {

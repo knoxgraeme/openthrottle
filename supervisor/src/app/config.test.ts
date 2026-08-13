@@ -32,6 +32,7 @@ function setRequiredEnv(): void {
   Object.assign(process.env, {
     SUPERVISOR_URL: "https://openthrottle.test/",
     OT_STATUS_TOKEN: "status",
+    OT_DEPLOY_TOKEN: "deploy",
     OT_INSTALL_SECRET: "install",
     LINEAR_WEBHOOK_SECRET: "linear-webhook",
     LINEAR_CLIENT_ID: "linear-client",
@@ -53,6 +54,7 @@ describe("loadConfig", () => {
 
     expect(loadConfig()).toMatchObject({
       supervisorUrl: "https://openthrottle.test",
+      deployToken: "deploy",
       port: 8080,
       taskTimeout: 7200,
       allowLinearMerge: true,
@@ -83,6 +85,22 @@ describe("loadConfig", () => {
 
     delete process.env.GITHUB_TOKEN;
     expect(() => loadConfig()).toThrow("Missing required env var: GITHUB_TOKEN");
+  });
+
+  it("requires a dedicated deployment token separate from operator status auth", () => {
+    setRequiredEnv();
+    delete process.env.OT_DEPLOY_TOKEN;
+    expect(() => loadConfig()).toThrow("Missing required env var: OT_DEPLOY_TOKEN");
+
+    process.env.OT_DEPLOY_TOKEN = "deploy-token";
+    process.env.OT_STATUS_TOKEN = "status-token";
+    expect(loadConfig()).toMatchObject({
+      deployToken: "deploy-token",
+      statusToken: "status-token",
+    });
+
+    process.env.OT_STATUS_TOKEN = "deploy-token";
+    expect(() => loadConfig()).toThrow("OT_DEPLOY_TOKEN must be distinct");
   });
 
   it("loads and validates the runtime resource retention window", () => {

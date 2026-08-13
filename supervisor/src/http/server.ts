@@ -50,6 +50,7 @@ import {
 import { createLinearActivityPublisher, createLinearOutboxProcessor, tryPostError, type LinearOutboxProcessor } from "../providers/linear/outbox.js";
 import { handleControlEvent, type PipelineCoordinatorContext, type SessionServicePorts } from "../app/session-service.js";
 import { createAdmissionPreflight } from "../app/admission-preflight.js";
+import { buildAdmissionDrainReport } from "../app/admission-drain-report.js";
 import { handleGithubEvent } from "../providers/github/events.js";
 import {
   beginGithubSupervisorCommentWrite,
@@ -62,6 +63,7 @@ import type { PipelineStore } from "../pipeline/store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { AnalysisStore } from "../persistence/pipeline/analysis-store.js";
 import type { CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
+import type { AdmissionDrainStore } from "../persistence/admission-drain-store.js";
 import type { RuntimeInventory, RuntimeLogs, RuntimeSnapshotReadiness } from "../runtime/contracts.js";
 import { executeRawCitationGate } from "./citation-executor.js";
 
@@ -77,6 +79,7 @@ export interface ServerDeps {
   // scheduler/effect-drain code consumes. See analysis-store.ts.
   analysisStore: AnalysisStore;
   citationGateStore: CitationGateStore;
+  admissionDrainStore: AdmissionDrainStore;
   runBackground?: (task: Promise<void>) => void;
   getLinearClient?: () => Promise<LinearClient | undefined>;
   deliveryProcessor?: WebhookDeliveryProcessor;
@@ -497,6 +500,8 @@ export function createServer(deps: ServerDeps): Hono {
 
   const requireStatusAuth = (authorization: string | undefined) =>
     hasBearer(authorization, cfg.statusToken);
+  const requireDeployAuth = (authorization: string | undefined) =>
+    hasBearer(authorization, cfg.deployToken);
 
   app.get("/healthz", (context) => context.json({ ok: true }));
 
@@ -515,6 +520,46 @@ export function createServer(deps: ServerDeps): Hono {
       capabilities: runtime.descriptor.capabilities,
       limits: { taskTimeoutSeconds: cfg.taskTimeout },
     });
+  });
+
+  app.get("/deployment/cutover-evidence", async (context) => {
+    if (!requireDeployAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    const admission = store.getAdmissionMaintenanceState();
+    const drain = await buildAdmissionDrainReport({
+      store: deps.admissionDrainStore,
+      runtime,
+      epochStartedAtIso: admission.updated_at,
+      nowIso: new Date().toISOString(),
+    });
+    return context.json({
+      admission,
+      runtime: {
+        release: deps.pipelineCoordinator.runtime.descriptor.release,
+        capabilityDigest: deps.pipelineCoordinator.runtime.digest,
+      },
+      snapshot: cfg.daytonaSnapshot,
+      drain,
+    });
+  });
+
+  app.post("/maintenance/admission/pause", async (context) => {
+    if (!requireDeployAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    const body = await context.req.json().catch(() => ({})) as { reason?: unknown };
+    const reason = typeof body.reason === "string" && body.reason.trim() !== ""
+      ? sanitizeText(body.reason).slice(0, 500)
+      : undefined;
+    return context.json({ admission: store.pauseAdmission(reason) });
+  });
+
+  app.post("/maintenance/admission/resume", (context) => {
+    if (!requireDeployAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    return context.json({ admission: store.resumeAdmission() });
   });
 
   app.get("/status", (context) => {

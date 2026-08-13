@@ -53,6 +53,7 @@ jobs:
           git diff --exit-code -- docs/pipelines
       - name: Verify supervisor architecture, catalog, runtime, and adapter parity
         run: |
+          npm run verify:v12-deploy-proof --prefix supervisor
           npm test --prefix supervisor -- src/__tests__/architecture.test.ts src/pipeline/manifest.test.ts src/pipeline/stage-request.test.ts src/runtime/contracts.test.ts
           npm test --prefix sandbox -- runner/capabilities.test.mjs tests/ce-adapters.test.mjs
       - name: Test

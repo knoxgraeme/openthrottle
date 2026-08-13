@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { canonicalJson, digestNormalized } from "../../pipeline/manifest.js";
+import { admissionMaintenanceError } from "../maintenance-store.js";
 import {
   buildStageRequest,
   createStageRequestHash,
@@ -64,6 +65,9 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   | "getPublication"
 > {
   const getInstanceStmt = db.prepare("SELECT * FROM pipeline_instances WHERE id = ?");
+  const getAdmissionMaintenanceStmt = db.prepare(
+    "SELECT paused, epoch, reason FROM supervisor_maintenance WHERE key = 'admission'"
+  );
   const getInstanceByRuntimeResourceIdStmt = db.prepare(
     "SELECT * FROM pipeline_instances WHERE runtime_provider_resource_id = ?"
   );
@@ -427,6 +431,19 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   const createInstance = db.transaction((seed: PipelineInstanceSeed): PipelineInstance => {
     const validated = validateSeed(seed);
     if ("existing" in validated) return validated.existing;
+    if (seed.admissionEpoch !== undefined) {
+      const maintenance = getAdmissionMaintenanceStmt.get() as
+        | { paused: 0 | 1; epoch: number; reason: string | null }
+        | undefined;
+      const paused = maintenance?.paused === 1;
+      const epoch = maintenance?.epoch ?? 0;
+      if (paused || epoch !== seed.admissionEpoch) {
+        const reason = paused
+          ? `admission maintenance is paused${maintenance?.reason ? `: ${maintenance.reason}` : ""}`
+          : `admission maintenance epoch changed from ${seed.admissionEpoch} to ${epoch}`;
+        throw admissionMaintenanceError(reason);
+      }
+    }
     const timestamp = now();
     insertInstanceGraph(seed, validated, timestamp);
     const sealed = sealEntryAttempt(seed, validated, timestamp);

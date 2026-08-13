@@ -8,9 +8,10 @@ import { openDb } from "../database.js";
 import { createSupervisorStore } from "../store.js";
 import { createPipelineStore } from "./create-store.js";
 import { createRunOutcomeStore } from "./run-outcome-store.js";
-import { catalogPath, runtime, setupPipelineStore, shippedCatalogPath, ticket } from "../../__fixtures__/pipeline-store.js";
+import { catalogPath, runtime, runtimeDescriptorPath, setupPipelineStore, shippedCatalogPath, ticket } from "../../__fixtures__/pipeline-store.js";
 import { parsePipelinePublication } from "../../pipeline/publication.js";
 import type { ExecutionUnitStore } from "./unit-store.js";
+import { loadRuntimeCapabilityDescriptor } from "../../runtime/contracts.js";
 
 function unitPhaseBindings(): PipelineUnitPhaseBinding[] {
   const worker = {
@@ -345,6 +346,92 @@ describe("pipeline instance store", () => {
     expect(after).toEqual(before);
     expect(recovered.getActiveAttempt(after.id)?.request_hash).toHaveLength(64);
     expect(recovered.listEffects(after.id).map((effect) => [effect.kind, effect.status])).toEqual([
+      ["provision", "pending"],
+    ]);
+  });
+
+  it("persists an admission pause across restart, fences stale epochs, and resumes v12 admission unchanged", () => {
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-admission-fence-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "supervisor.db");
+    const baseCommit = "a".repeat(40);
+    const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v12");
+    const catalog = loadPipelineCatalog(shippedCatalogPath, shippedRuntime.descriptor);
+    const manifest = catalog.manifests.get("core/implement@4")!;
+    const config = parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: implement }\n");
+
+    db = openDb(path);
+    let pipelines = createPipelineStore(db);
+    let tickets = createSupervisorStore(db, pipelines);
+    pipelines.acceptRuntimeDescriptor(shippedRuntime);
+    pipelines.acceptCatalog(catalog);
+    const snapshot = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit,
+      blobSha: "b".repeat(40),
+      config,
+    });
+    const pipelineForAdmissionEpoch = (admissionEpoch: number) => ({
+      admissionEpoch,
+      repository: "owner/repo",
+      baseCommit,
+      baseBranch: "main",
+      manifest,
+      repositoryConfig: snapshot,
+      runtime: shippedRuntime,
+      authorizedCapabilities: manifest.manifest.requires.capabilities,
+      taskType: "implement" as const,
+      taskContext: "ship the v12 admission fence",
+    });
+    const capturedEpoch = tickets.getAdmissionMaintenanceState().epoch;
+    expect(capturedEpoch).toBe(0);
+    expect(tickets.pauseAdmission("operator restart")).toMatchObject({
+      paused: 1,
+      epoch: 1,
+      reason: "operator restart",
+    });
+    db.close();
+
+    db = openDb(path);
+    pipelines = createPipelineStore(db);
+    tickets = createSupervisorStore(db, pipelines);
+    expect(tickets.getAdmissionMaintenanceState()).toMatchObject({
+      paused: 1,
+      epoch: 1,
+      reason: "operator restart",
+    });
+    expect(() => tickets.upsert({
+      ...ticket("stale-admission", "stale-issue"),
+      pipeline: pipelineForAdmissionEpoch(capturedEpoch),
+    }))
+      .toThrow(/retryable_infrastructure_failure: admission maintenance is paused: operator restart/);
+    expect(db.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) FROM pipeline_effect_intents").pluck().get()).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) FROM pipeline_publication_receipts").pluck().get()).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) FROM orchestration_journal").pluck().get()).toBe(0);
+
+    const resumed = tickets.resumeAdmission();
+    expect(resumed).toMatchObject({ paused: 0, epoch: 2, reason: null });
+    tickets.upsert({
+      ...ticket("resumed-admission", "resumed-issue"),
+      pipeline: pipelineForAdmissionEpoch(resumed.epoch),
+    });
+    const instance = pipelines.getInstanceForSession("resumed-admission")!;
+    expect(instance).toMatchObject({
+      pipeline_id: "core/implement",
+      pipeline_version: 4,
+      manifest_digest: manifest.digest,
+      normalized_manifest: manifest.normalized,
+      repository_config_snapshot_id: snapshot.id,
+      repository_config_digest: snapshot.digest,
+      runtime_release: "openthrottle-snapshot/v12",
+      capability_digest: shippedRuntime.digest,
+      status: "dispatchable",
+      active_stage_id: manifest.manifest.entry_stage,
+    });
+    expect(pipelines.getActiveAttempt(instance.id)?.request_hash).toHaveLength(64);
+    expect(pipelines.listEffects(instance.id).map((effect) => [effect.kind, effect.status])).toEqual([
       ["provision", "pending"],
     ]);
   });
