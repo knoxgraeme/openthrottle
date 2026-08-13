@@ -66,7 +66,11 @@ assert(
 assert(
   deployWorkflow.includes("predicate-quantifier: every") &&
     deployWorkflow.includes("'!sandbox/tests/**'") &&
-    deployWorkflow.includes("'!sandbox/**/*.test.mjs'"),
+    deployWorkflow.includes("'!sandbox/**/*.test.mjs'") &&
+    deployWorkflow.includes("skills: ${{ steps.filter.outputs.skills }}") &&
+    deployWorkflow.includes("runtime_descriptor: ${{ steps.filter.outputs.runtime_descriptor }}") &&
+    deployWorkflow.includes("needs.changes.outputs.skills == 'true'") &&
+    deployWorkflow.includes("needs.changes.outputs.runtime_descriptor == 'true'"),
   "test-only sandbox changes must not build or stage a Daytona snapshot"
 );
 
