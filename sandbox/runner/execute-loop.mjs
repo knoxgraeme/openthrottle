@@ -1530,7 +1530,12 @@ function deterministicallyCorrectReceipt({ invalidReceipt, diagnostics, request,
   assertCorrectableReceiptCandidate(invalidReceipt, diagnostics);
   const corrected = JSON.parse(canonicalJson(invalidReceipt));
   const authoritative = authoritativeCorrectionValues(request, subject);
-  for (const diagnostic of diagnostics) {
+  const appliedDiagnostics = [...diagnostics];
+  // Closed-object validators report only the first unknown field. Keep the
+  // correction deterministic, but revalidate after each deletion so one
+  // otherwise valid receipt with several extra fields does not discard a
+  // completed workspace (OPE-157).
+  for (const diagnostic of appliedDiagnostics) {
     if (diagnostic.expected === "field absent" && /unknown field/.test(String(diagnostic.message))) {
       deleteJsonPointer(corrected, diagnostic.pointer);
       continue;
@@ -1540,10 +1545,30 @@ function deterministicallyCorrectReceipt({ invalidReceipt, diagnostics, request,
     }
     setJsonPointer(corrected, diagnostic.pointer, authoritative.get(diagnostic.pointer));
   }
-  const validated = validateStandardReceipt(corrected, env);
-  assertLoopReceiptFence(validated, request, subject);
-  assertReceiptCorrectionPreservesCandidate(invalidReceipt, validated, diagnostics);
-  return validated;
+  while (true) {
+    try {
+      const validated = validateStandardReceipt(corrected, env);
+      assertLoopReceiptFence(validated, request, subject);
+      assertReceiptCorrectionPreservesCandidate(invalidReceipt, validated, appliedDiagnostics);
+      return validated;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/unknown field/.test(message)) throw error;
+      const [diagnostic] = receiptCorrectionDiagnostics({
+        errorMessage: message,
+        invalidReceipt: corrected,
+        request,
+        subject,
+      });
+      if (!diagnostic || diagnostic.expected !== "field absent" ||
+          appliedDiagnostics.some((entry) => entry.pointer === diagnostic.pointer)) throw error;
+      if (appliedDiagnostics.length >= MAX_RECEIPT_CORRECTION_DIAGNOSTICS) {
+        throw new Error("receipt correction unknown-field count exceeds the deterministic correction bound");
+      }
+      appliedDiagnostics.push(diagnostic);
+      deleteJsonPointer(corrected, diagnostic.pointer);
+    }
+  }
 }
 
 function receiptCorrectionDiagnostics({ errorMessage, invalidReceipt, request, subject }) {
