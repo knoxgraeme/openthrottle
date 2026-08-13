@@ -285,6 +285,17 @@ describe("coordinator-only server", () => {
     });
     expect(statusTokenPause.status).toBe(401);
 
+    const unpausedEvidence = await server.request("/deployment/cutover-evidence", {
+      headers: { Authorization: "Bearer deploy-token" },
+    });
+    expect(await unpausedEvidence.json()).toMatchObject({
+      admission: { paused: 0 },
+      drain: {
+        clear: false,
+        blockers: [{ kind: "admission_not_paused", id: "admission" }],
+      },
+    });
+
     const paused = await server.request("/maintenance/admission/pause", {
       method: "POST",
       headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },

@@ -4,7 +4,7 @@ import type { RuntimeInventory, RuntimeInventoryResource } from "../runtime/cont
 export type AdmissionDrainReportBlocker =
   | AdmissionDrainBlocker
   | {
-      kind: "runtime_inventory_resource" | "unknown_runtime_inventory_resource" | "runtime_inventory_error";
+      kind: "admission_not_paused" | "runtime_inventory_resource" | "unknown_runtime_inventory_resource" | "runtime_inventory_error";
       id: string;
       detail: string;
     };
@@ -18,6 +18,7 @@ export interface AdmissionDrainReport {
 export interface AdmissionDrainReportDeps {
   store: AdmissionDrainStore;
   runtime: Pick<RuntimeInventory, "listLabeledResources">;
+  admissionPaused: boolean;
   epochStartedAtIso: string;
   nowIso: string;
   limit?: number;
@@ -50,17 +51,29 @@ export async function buildAdmissionDrainReport(
   deps: AdmissionDrainReportDeps
 ): Promise<AdmissionDrainReport> {
   const limit = normalizeLimit(deps.limit);
+  const blockers: AdmissionDrainReportBlocker[] = [];
+  if (!deps.admissionPaused) {
+    blockers.push({
+      kind: "admission_not_paused",
+      id: "admission",
+      detail: "admission maintenance pause is not active",
+    });
+  }
+  const durableCapacity = limit - blockers.length;
+  if (durableCapacity === 0) {
+    return { clear: false, blockers, truncated: true };
+  }
   const durable = deps.store.collectAdmissionDrainBlockers({
     epochStartedAtIso: deps.epochStartedAtIso,
     nowIso: deps.nowIso,
-    limit,
+    limit: durableCapacity,
   });
-  const blockers: AdmissionDrainReportBlocker[] = [...durable.blockers];
+  blockers.push(...durable.blockers);
   let truncated = durable.truncated;
   const knownRuntimeResourceIds = new Set(durable.knownRuntimeResourceIds);
 
   try {
-    const inventoryCapacity = Math.max(0, limit - durable.blockers.length);
+    const inventoryCapacity = Math.max(0, limit - blockers.length);
     if (inventoryCapacity === 0) {
       truncated = true;
     } else {

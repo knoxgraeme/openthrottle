@@ -530,6 +530,7 @@ export function createServer(deps: ServerDeps): Hono {
     const drain = await buildAdmissionDrainReport({
       store: deps.admissionDrainStore,
       runtime,
+      admissionPaused: admission.paused === 1,
       epochStartedAtIso: admission.updated_at,
       nowIso: new Date().toISOString(),
     });

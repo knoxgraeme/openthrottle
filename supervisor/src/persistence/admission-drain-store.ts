@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 
 export type AdmissionDrainBlockerKind =
   | "pre_epoch_webhook_delivery_lease"
+  | "active_webhook_delivery_lease"
   | "nonterminal_pipeline_instance"
   | "runnable_pipeline_effect"
   | "runnable_publication_receipt"
@@ -76,17 +77,19 @@ export function createAdmissionDrainStore(db: Database.Database): AdmissionDrain
             `
               SELECT delivery_id, source, action, received_at, next_attempt_at
               FROM webhook_deliveries
-              WHERE status = 'processing' AND received_at < ?
+              WHERE status = 'processing'
               ORDER BY received_at, delivery_id
               LIMIT ?
             `,
-            [epochStartedAtIso],
+            [],
             remaining()
           ),
           (row) => ({
-            kind: "pre_epoch_webhook_delivery_lease",
+            kind: row.received_at < epochStartedAtIso
+              ? "pre_epoch_webhook_delivery_lease"
+              : "active_webhook_delivery_lease",
             id: row.delivery_id,
-            detail: `${row.source}:${row.action} received_at=${row.received_at} lease_until=${row.next_attempt_at ?? "unknown"}`,
+            detail: `${row.source}:${row.action} received_at=${row.received_at} epoch_started_at=${epochStartedAtIso} lease_until=${row.next_attempt_at ?? "unknown"}`,
           })
         );
       }

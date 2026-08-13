@@ -95,6 +95,7 @@ async function report(options: {
   return buildAdmissionDrainReport({
     store: createAdmissionDrainStore(db),
     runtime: options.runtime ?? { listLabeledResources: async () => [] },
+    admissionPaused: true,
     epochStartedAtIso,
     nowIso,
     limit: options.limit,
@@ -102,6 +103,27 @@ async function report(options: {
 }
 
 describe("admission drain report", () => {
+  it("cannot report clear before the admission pause is active", async () => {
+    setup();
+    const verdict = await buildAdmissionDrainReport({
+      store: createAdmissionDrainStore(db!),
+      runtime: { listLabeledResources: async () => [] },
+      admissionPaused: false,
+      epochStartedAtIso,
+      nowIso,
+    });
+
+    expect(verdict).toEqual({
+      clear: false,
+      blockers: [{
+        kind: "admission_not_paused",
+        id: "admission",
+        detail: "admission maintenance pause is not active",
+      }],
+      truncated: false,
+    });
+  });
+
   it("clears only after successful provider inventory and no durable blockers", async () => {
     setup();
 
@@ -181,6 +203,25 @@ describe("admission drain report", () => {
       effect.id,
       leased!.id,
       "sandbox-bound",
+    ]);
+  });
+
+  it("blocks an active webhook lease even when it began after the maintenance epoch", async () => {
+    setup();
+    db!.prepare(`
+      INSERT INTO webhook_deliveries (
+        delivery_id, source, action, status, attempts, next_attempt_at, received_at
+      ) VALUES ('delivery-post-epoch', 'github', 'issues:labeled', 'processing', 1, ?, ?)
+    `).run("2026-08-13T00:06:00.000Z", "2026-08-13T00:05:00.000Z");
+
+    const verdict = await report();
+
+    expect(verdict.clear).toBe(false);
+    expect(verdict.blockers).toEqual([
+      expect.objectContaining({
+        kind: "active_webhook_delivery_lease",
+        id: "delivery-post-epoch",
+      }),
     ]);
   });
 
