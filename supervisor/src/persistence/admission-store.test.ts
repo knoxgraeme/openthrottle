@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { openDb } from "./database.js";
 import { createSupervisorStore, type SupervisorStore } from "./store.js";
 
 describe("admission store", () => {
   let db: ReturnType<typeof openDb>;
   let store: SupervisorStore;
+  const temporaryDirectories: string[] = [];
 
   beforeEach(() => {
     db = openDb(":memory:");
@@ -23,7 +27,12 @@ describe("admission store", () => {
     });
   });
 
-  afterEach(() => db.close());
+  afterEach(() => {
+    db.close();
+    for (const directory of temporaryDirectories.splice(0)) {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
 
   it("does not create the removed session-work projection", () => {
     expect(db.prepare(
@@ -120,6 +129,42 @@ describe("admission store", () => {
     });
     expect(store.getRepositoryRegistration("team-1", "OTHER")?.linear_team_key).toBe("ENG");
     expect(store.getRepositoryRegistration(undefined, "missing")).toBeUndefined();
+  });
+
+  it("persists admission maintenance pause and epoch across restart", () => {
+    db.close();
+    const directory = mkdtempSync(join(tmpdir(), "ot-admission-maintenance-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "supervisor.sqlite");
+
+    db = openDb(path);
+    store = createSupervisorStore(db);
+    expect(store.getAdmissionMaintenanceState()).toMatchObject({
+      key: "admission",
+      paused: 0,
+      epoch: 0,
+      reason: null,
+    });
+    expect(store.pauseAdmission("operator deploy")).toMatchObject({
+      paused: 1,
+      epoch: 1,
+      reason: "operator deploy",
+    });
+    db.close();
+
+    db = openDb(path);
+    store = createSupervisorStore(db);
+    expect(store.getAdmissionMaintenanceState()).toMatchObject({
+      key: "admission",
+      paused: 1,
+      epoch: 1,
+      reason: "operator deploy",
+    });
+    expect(store.resumeAdmission()).toMatchObject({
+      paused: 0,
+      epoch: 2,
+      reason: null,
+    });
   });
 
   it("fails closed when a human ticket reference is ambiguous across providers", () => {

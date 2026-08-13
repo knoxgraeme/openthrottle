@@ -2301,6 +2301,20 @@ const providerActivationIdentityMigrationSource = `
 ALTER TABLE agent_sessions ADD COLUMN provider_activation_id TEXT;
 provider-activation-identity-contract:GitHub-controlled session generations retain the opaque Issue Event id that authoritatively activated them/v1`;
 
+const supervisorMaintenanceSchema = `
+CREATE TABLE supervisor_maintenance (
+  key TEXT PRIMARY KEY,
+  paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0, 1)),
+  epoch INTEGER NOT NULL DEFAULT 0 CHECK(epoch >= 0),
+  reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`;
+
+const supervisorMaintenanceMigrationSource = `${supervisorMaintenanceSchema}
+supervisor-maintenance-contract:admission pause and epoch are durable supervisor state; admissions capture epoch before async selection and atomically reject paused or stale epochs before creating pipeline instances, attempts, effects, publications, or journal entries/v1`;
+
 type GithubHeadSource =
   | { kind: "authoritative" }
   | { kind: "sequenced"; source: string; sequence: number };
@@ -3398,6 +3412,16 @@ const definitions: DatabaseMigrationDefinition[] = [
         hasColumns(db, "pipeline_instances", ["ticket_id", "session_id", "task_type", "published_subject"]) &&
         !table.sql.includes("'tune'")
       ) db.exec(tuneTaskTypeSchema);
+    },
+  },
+  {
+    version: 44,
+    name: "supervisor-maintenance-admission-epoch",
+    source: supervisorMaintenanceMigrationSource,
+    up(db) {
+      if (!hasTable(db, "supervisor_maintenance")) {
+        db.exec(supervisorMaintenanceSchema);
+      }
     },
   },
 ];

@@ -42,6 +42,7 @@ import type { PipelineStore } from "../pipeline/store.js";
 import { extractJsonBlocks } from "../pipeline/markdown.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
+import { admissionMaintenanceError } from "../persistence/maintenance-store.js";
 import {
   composeBoundedTaskContext,
   ORDINARY_STAGE_TASK_CONTEXT_LIMIT,
@@ -595,16 +596,21 @@ export async function handleCreated(
     `# ${issue.identifier}\n\nNo Linear prompt context was supplied for this delegation.`
   );
   const hasSuppliedPromptContext = Boolean(payload.promptContext?.trim());
+  const labels = extractLabelNames(payload);
+  const ticketId = controlTicketId(issue.provider, issue.id);
+  const existing = store.getByExternalThread(issue.provider, issue.id) ?? store.getByIssueId(ticketId);
+  const admissionMaintenance = store.getAdmissionMaintenanceState();
+  if (admissionMaintenance.paused) {
+    throw admissionMaintenanceError(
+      `admission maintenance is paused${admissionMaintenance.reason ? `: ${admissionMaintenance.reason}` : ""}`
+    );
+  }
   await providers.activityPublisher.publishActivity({
     sessionId,
     type: "thought",
     body: "Spinning up a workspace…",
     ephemeral: true,
   });
-
-  const labels = extractLabelNames(payload);
-  const ticketId = controlTicketId(issue.provider, issue.id);
-  const existing = store.getByExternalThread(issue.provider, issue.id) ?? store.getByIssueId(ticketId);
   const existingSessionInstance = coordinator.store.getInstanceForSession(sessionId);
   if (existingSessionInstance) {
     if (existingSessionInstance.ticket_id !== ticketId) {
@@ -867,6 +873,7 @@ export async function handleCreated(
     store.upsert({
       ...ticketCore,
       pipeline: {
+        admissionEpoch: admissionMaintenance.epoch,
         repository: selectedRepository.repo,
         baseCommit: pinned.remote.baseCommit,
         baseBranch: selectedRepository.baseBranch,
