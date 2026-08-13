@@ -891,6 +891,38 @@ intents:
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(1);
   });
 
+  it("admits prompted Linear context with non-authoritative issue relations", async () => {
+    const context = [
+      `<issue identifier="OT-1">`,
+      `<title>Related assignment</title>`,
+      `<description>Implement the simple default pipeline.</description>`,
+      `<issue-relations>`,
+      `<issue-ref identifier="OT-2" title="A blocked follow-up"/>`,
+      `</issue-relations>`,
+      `</issue>`,
+      `<primary-directive-thread comment-id="directive">`,
+      `<comment>Retry this ticket from current main.</comment>`,
+      `</primary-directive-thread>`,
+    ].join("\n");
+
+    const { pipelines } = await run(
+      repositoryConfigYaml("{ implement: implement }"),
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const request = pipelines.getStageRequest(pipelines.getActiveAttempt(instance.id)!.id);
+    expect(instance).toMatchObject({
+      pipeline_id: "core/implement",
+      pipeline_version: 4,
+    });
+    expect(request.taskContext).toContain("Retry this ticket from current main.");
+    expect(request.taskContext).not.toContain("issue-relations");
+    expect(request.taskContext).not.toContain("OT-2");
+  });
+
   it("rejects an assignment-created context whose issue identifier does not match the session issue", async () => {
     const context = [
       `<issue identifier="OT-2">`,
