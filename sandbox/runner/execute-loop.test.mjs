@@ -3962,8 +3962,12 @@ describe("executeLoopAction", () => {
     expect(result.receipt).toContain("private_recovery_artifact=");
   });
 
-  it("repairs the receipt without launching a second process or regranting the writable worktree", () => {
-    const valid = request();
+  it("repairs every unknown simplify payload field without relaunching or regranting the worktree", () => {
+    const valid = validateLoopRequest(request({
+      loop: "simplify",
+      skill: "simplify-unit",
+      expectedProducerSkill: "builtin://simplify-unit@1",
+    }));
     let goodReceipt = null;
     const runLoopAgent = vi.fn((args) => runLoopAgentInPreparedRepository({
       ...args,
@@ -3978,14 +3982,25 @@ describe("executeLoopAction", () => {
         }
         expect(options.cwd).toBe(loopWorktreeDirectory(valid));
         writeFileSync(join(loopWorktreeDirectory(valid), "completed-work.txt"), "completed work\n");
-        goodReceipt = standardReceipt(valid);
+        goodReceipt = standardReceipt(valid, {
+          producer: {
+            worker_id: "worker-1",
+            skill: "builtin://simplify-unit@1",
+            capability_digest: "c".repeat(64),
+            skill_package_digest: null,
+          },
+        });
         return {
           status: 0,
           signal: null,
           timedOut: false,
           stdout: JSON.stringify({
             ...goodReceipt,
-            payload: { ...goodReceipt.payload, status: "done" },
+            payload: {
+              ...goodReceipt.payload,
+              changed: false,
+              commands_not_run: ["The executor owns configured commands."],
+            },
           }),
           stderr: "",
         };
@@ -4003,7 +4018,54 @@ describe("executeLoopAction", () => {
 
     expect(result.outcome).toBe("success");
     expect(result.subject).toBe(goodReceipt.subject.post);
+    expect(JSON.parse(result.receipt)).toEqual(goodReceipt);
     expect(runLoopAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [8, "success"],
+    [9, "failure"],
+  ])("keeps the unknown-field correction bound at %i fields", (unknownFieldCount, expectedOutcome) => {
+    const valid = request();
+    writeFileSync(join(loopWorktreeDirectory(valid), "completed-work.txt"), "completed work\n");
+    const goodReceipt = standardReceipt(valid);
+    const extras = Object.fromEntries(Array.from(
+      { length: unknownFieldCount },
+      (_, index) => [`unknown_${index + 1}`, index + 1],
+    ));
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify({
+        ...goodReceipt,
+        payload: { ...goodReceipt.payload, ...extras },
+      }),
+      stderr: "",
+      nativeSessionId: "native-unknown-bound",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe(expectedOutcome);
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    if (expectedOutcome === "success") {
+      expect(JSON.parse(result.receipt)).toEqual(goodReceipt);
+    } else {
+      expect(result.receipt).toContain("unknown-field count exceeds the deterministic correction bound");
+      expect(JSON.parse(result.recovery_artifact)).toMatchObject({
+        candidate_tree: goodReceipt.subject.post,
+        changed_paths: ["completed-work.txt"],
+      });
+    }
   });
 
   it("does not rewrite invalid semantic review findings through receipt correction", () => {
@@ -4763,7 +4825,14 @@ describe("executeLoopAction", () => {
   it("resumes a persisted receipt correction without relaunching the implementation", () => {
     const valid = request();
     const goodReceipt = standardReceipt(valid);
-    const badReceipt = { ...goodReceipt, payload: { ...goodReceipt.payload, status: "done" } };
+    const badReceipt = {
+      ...goodReceipt,
+      payload: {
+        ...goodReceipt.payload,
+        changed: false,
+        commands_not_run: ["The executor owns configured commands."],
+      },
+    };
     const staleCodexAuth = JSON.stringify({ tokens: { access_token: "stale", refresh_token: "spent", account_id: "account-1" } });
     const rotatedCodexAuth = JSON.stringify({ tokens: { access_token: "current", refresh_token: "rotated", account_id: "account-1" } });
     const firstRunLoopAgent = vi.fn().mockReturnValueOnce({
