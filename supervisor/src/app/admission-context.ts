@@ -12,6 +12,8 @@ const LINEAR_CONTEXT_SECTION_KINDS = [
 const LINEAR_NESTED_ISSUE_MATERIAL_KINDS = [
   "sub-issues",
   "sub-issue",
+  "issue-relations",
+  "issue-ref",
 ] as const;
 const LINEAR_CONTEXT_ELEMENT_KINDS = [
   ...LINEAR_CONTEXT_SECTION_KINDS,
@@ -88,18 +90,27 @@ function hasValidElementParent(
   kind: LinearContextElementKind
 ): boolean {
   const parent = stack.at(-1)?.kind;
+  if (parent === "issue-relations") {
+    return kind === "issue-ref";
+  }
   if (kind === "sub-issues") {
     return parent === "issue" || parent === "parent-issue";
   }
   if (kind === "sub-issue") {
     return parent === "sub-issues" || parent === "parent-issue";
   }
+  if (kind === "issue-relations") {
+    return parent === "issue" || parent === "parent-issue";
+  }
+  if (kind === "issue-ref") {
+    return false;
+  }
   return parent !== "sub-issues" && parent !== "sub-issue";
 }
 
 function linearContextSections(context: string): ParsedLinearContextSections {
   const tokenPattern = new RegExp(
-    `</?(${LINEAR_CONTEXT_ELEMENT_KINDS.join("|")})\\b[^>]*>`,
+    `</?(${LINEAR_CONTEXT_ELEMENT_KINDS.join("|")})(?=\\s|/?>)[^>]*>`,
     "gi"
   );
   const sections: ContextSection[] = [];
@@ -115,6 +126,12 @@ function linearContextSections(context: string): ParsedLinearContextSections {
     if (!closing) {
       if (!hasValidElementParent(stack, kind)) {
         return { sections, error: invalidLinearContextShapeMessage() };
+      }
+      if (/\/\s*>$/.test(raw)) {
+        if (kind !== "issue-ref") {
+          return { sections, error: invalidLinearContextShapeMessage() };
+        }
+        continue;
       }
       stack.push({ kind, start: match.index!, nestedSpans: [] });
       continue;
@@ -233,7 +250,7 @@ function withoutSections(context: string, sections: ContextSection[]): string {
 
 function hasLinearContextStructuralDelimiter(context: string): boolean {
   return new RegExp(
-    `</?(?:${LINEAR_CONTEXT_ELEMENT_KINDS.join("|")})\\b[^>]*>`,
+    `</?(?:${LINEAR_CONTEXT_ELEMENT_KINDS.join("|")})(?=\\s|/?>)[^>]*>`,
     "i"
   ).test(context);
 }

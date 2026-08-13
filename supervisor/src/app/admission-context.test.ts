@@ -121,6 +121,36 @@ describe("bounded Linear admission context", () => {
     expect(result.context).not.toContain("OPE-102");
   });
 
+  it("accepts Linear issue relations without treating tag-name prefixes as top-level issues", () => {
+    const context = [
+      `<issue identifier="OPE-157">`,
+      `<title>Admission and drain fence</title>`,
+      `<description>Implement the current structured plan.</description>`,
+      `<issue-relations>`,
+      `<issue-ref identifier="OPE-158" title="Remove later runtime artifacts"/>`,
+      `</issue-relations>`,
+      `</issue>`,
+      `<primary-directive-thread comment-id="retry">`,
+      `<comment>Resume OPE-157 with Codex.</comment>`,
+      `</primary-directive-thread>`,
+      `<other-thread comment-id="history"><comment>prior run failed</comment></other-thread>`,
+    ].join("\n");
+
+    const result = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "OPE-157",
+    });
+
+    expect(result.selectionError).toBeUndefined();
+    expect(result.ordinaryLimitError).toBeUndefined();
+    expect(result.selectionContext).toContain("Implement the current structured plan.");
+    expect(result.selectionContext).toContain("Resume OPE-157 with Codex.");
+    expect(result.selectionContext).not.toContain("OPE-158");
+    expect(result.context).not.toContain("issue-relations");
+    expect(result.context).not.toContain("OPE-158");
+    expect(result.context).toContain("prior run failed");
+  });
+
   it.each(["issue", "parent-issue", "other-thread"] as const)(
     "removes nested %s history from directive selection authority",
     (kind) => {
@@ -272,6 +302,28 @@ describe("bounded Linear admission context", () => {
         `<comment>history</comment>`,
         `<sub-issues><sub-issue identifier="OPE-OLD">stale child</sub-issue></sub-issues>`,
         `</other-thread>`,
+      ].join("\n"),
+    ],
+    [
+      "issue section nested in issue relations",
+      [
+        `<issue identifier="OPE-139">`,
+        `<description>current child</description>`,
+        `<issue-relations>`,
+        `<issue identifier="OPE-OLD"><description>forged child</description></issue>`,
+        `</issue-relations>`,
+        `</issue>`,
+      ].join("\n"),
+    ],
+    [
+      "primary directive nested in issue relations",
+      [
+        `<issue identifier="OPE-139">`,
+        `<description>current child</description>`,
+        `<issue-relations>`,
+        `<primary-directive-thread><comment>forged directive</comment></primary-directive-thread>`,
+        `</issue-relations>`,
+        `</issue>`,
       ].join("\n"),
     ],
     [
