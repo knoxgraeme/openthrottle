@@ -1032,15 +1032,17 @@ commands:
   test: npm test --prefix supervisor
 test: npm test --prefix supervisor
 limits: { max_turns: 20, task_timeout: 300 }
-pipelines: { implement: implement, investigate: core/investigate@2 }
+pipelines: { implement: implement, investigate: core/investigate@2, tune: tune }
 mcp_servers: {}
 intents:
   implement: { default_graph: simple, allowed_graphs: [simple] }
   investigate: { default_graph: simple, allowed_graphs: [simple] }
+  tune: { default_graph: simple, allowed_graphs: [simple] }
 `);
     expect(parsed.config.pipelines).toEqual({
       implement: "implement",
       investigate: "core/investigate@2",
+      tune: "tune",
     });
     expect(parseRepositoryConfig(parsed.normalized.replace(/^/, "")).digest).toBe(parsed.digest);
     expect(() => parseRepositoryConfig("pipelines: { implement: implement }\n"))

@@ -40,3 +40,7 @@ intents:
     default_graph: simple
     allowed_graphs:
       - simple
+  tune:
+    default_graph: simple
+    allowed_graphs:
+      - simple

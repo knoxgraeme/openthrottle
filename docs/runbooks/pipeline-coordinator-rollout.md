@@ -35,10 +35,25 @@ run, use one registered test repository/team and capture:
 - webhook delivery recovery: force one failed GitHub webhook delivery, run hook
   reconciliation, and confirm it is requeued once and then processed exactly
   once after the handler succeeds;
+- tune dogfood: label a representative corpus-backed ticket `tune`, include
+  exactly one canonical `openthrottle.tune-task/v1` block, and confirm the
+  ordinary PR contains the citation-gate receipt, differential-ratchet journal,
+  structured edit evidence, exact publish subject, and provider check;
+- journal projection: compare `/status`, ticket logs, Linear activities, and
+  the PR ledger against `orchestration_journal` and
+  `pipeline_publication_receipts`; they must converge after a supervisor
+  restart without duplicating activity rows or trusting ticket/comment/review
+  prose as future instructions;
 - terminal Linear acknowledgement and sandbox cleanup.
 
 Skipping this exercise is a documented verification gap, not a reason to add
 an inactive alternate execution cohort.
+
+Replay of a tune proposal is explicitly unavailable in v1. Operators may
+redeliver provider webhooks and retry durable publication/effect rows, but a
+stale citation receipt, weakened ratchet policy, locked skill edit, or proposed
+change outside the sealed allowlist must be rejected by a fresh tune run rather
+than replayed into edit authority.
 
 ## Failure handling
 
