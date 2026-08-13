@@ -428,7 +428,7 @@ function createDockerSandboxRuntime(container) {
         "/home/agent/repo",
         "rev-parse",
         "HEAD",
-      ]);
+      ], { user: "agent" });
       if (preparedSubject.status !== 0 || !/^[a-f0-9]{40}$/.test(preparedSubject.stdout.trim())) {
         throw new Error(
           `composite workspace subject lookup failed (${preparedSubject.status}): stderr=${preparedSubject.stderr} stdout=${preparedSubject.stdout}`
