@@ -444,6 +444,20 @@ function validateUnitPhaseBindingCapabilityContract(
   }
 }
 
+function validateTunePipelineStageCapabilityContract(stage: PipelineStage, path: string): void {
+  if (stage.executor.capability !== "core/tune@1" && !stage.executor.capability.startsWith("supervisor/")) {
+    return;
+  }
+  for (const violation of capabilityCredentialContractViolations({
+    capability: stage.executor.capability,
+    context: stage.context,
+    credentials: stage.credentials,
+    requiredArtifacts: stage.evaluator.required_artifacts,
+  })) {
+    fail(`${path}.${violation.field}`, violation.message);
+  }
+}
+
 function capabilityForLoopSkill(
   loop: { skill: string },
   repositorySkill: RepositorySkillPackage | undefined,
@@ -718,6 +732,7 @@ function parseStage(
   if (!stage.produces.includes("stage_result")) {
     fail(`${path}.produces`, "must include the typed stage_result artifact");
   }
+  validateTunePipelineStageCapabilityContract(stage, path);
   return stage;
 }
 
