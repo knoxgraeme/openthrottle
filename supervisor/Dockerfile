@@ -48,6 +48,7 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/graphs ./graphs
 COPY --from=build /app/pipelines ./pipelines
+COPY supervisor/scripts/cutover-control.mjs ./scripts/cutover-control.mjs
 
 # /data is where the SQLite DB lives (see fly.toml [mounts] and DATABASE_PATH default).
 RUN mkdir -p /data

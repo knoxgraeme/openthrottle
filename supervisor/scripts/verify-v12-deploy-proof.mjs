@@ -35,11 +35,11 @@ assert(
 );
 
 const deployWorkflow = read(".github/workflows/deploy.yml");
+const cutoverControl = read("supervisor/scripts/cutover-control.mjs");
 assert(
-  deployWorkflow.includes("OT_DEPLOY_TOKEN") &&
-    deployWorkflow.includes("/maintenance/admission/pause") &&
-    deployWorkflow.includes("/deployment/cutover-evidence") &&
-    deployWorkflow.includes("/maintenance/admission/resume") &&
+  deployWorkflow.includes("/app/scripts/cutover-control.mjs pause") &&
+    deployWorkflow.includes("/app/scripts/cutover-control.mjs evidence") &&
+    deployWorkflow.includes("/app/scripts/cutover-control.mjs resume") &&
     deployWorkflow.includes(".drain.clear == true") &&
     deployWorkflow.includes(".runtime.release == $release") &&
     deployWorkflow.includes(".runtime.capabilityDigest == $digest") &&
@@ -47,6 +47,13 @@ assert(
     deployWorkflow.includes("EXPECTED_SNAPSHOT") &&
     deployWorkflow.includes("github.event_name == 'push' && needs.snapshot.result == 'success'"),
   "deploy workflow must expose a fail-closed supervisor-only v12 cutover path"
+);
+assert(
+  cutoverControl.includes("OT_DEPLOY_TOKEN") &&
+    cutoverControl.includes("/maintenance/admission/pause") &&
+    cutoverControl.includes("/deployment/cutover-evidence") &&
+    cutoverControl.includes("/maintenance/admission/resume"),
+  "Fly-local cutover control must retain the deploy-token endpoint fence"
 );
 assert(
   deployWorkflow.includes('name="openthrottle-v2-ce-$(git rev-parse --short=7 HEAD)"'),

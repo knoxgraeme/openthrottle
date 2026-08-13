@@ -1191,9 +1191,11 @@ Required:
   read-only `GITHUB_READ_TOKEN`;
 - Daytona: `DAYTONA_API_KEY`.
 
-`OT_DEPLOY_TOKEN` is the only authority allowed to mutate supervisor
-maintenance or read deployment cutover evidence. It is held by the supervisor
-and deploy workflow only, and is outside the sandbox credential allowlist.
+`OT_DEPLOY_TOKEN` is the only bearer authority allowed to mutate supervisor
+maintenance or read deployment cutover evidence. It is held only by the Fly
+supervisor and is outside the sandbox and GitHub Actions credential allowlists.
+The deploy workflow uses its existing Fly deploy authority to run the bounded
+cutover client inside that supervisor; the token never leaves the machine.
 The supervisor-only fence release bootstraps on the unchanged v12 snapshot;
 after that release is installed, every push that builds a new snapshot must
 pause and drain before deploy, then verify the pinned runtime release, runtime
