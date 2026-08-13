@@ -1,7 +1,8 @@
 # Execution Plan Reference
 
-The execution plan is a normalized runtime index over a CE unified plan. It is
-not a replacement for the plan prose.
+The execution plan is a normalized runtime index over an implementation plan or
+task specification. It is not a replacement for the source prose, and it does
+not require any particular planning format or section names.
 
 ## Required Shape
 
@@ -11,22 +12,22 @@ not a replacement for the plan prose.
   "graph_id": "structured",
   "plan_id": "stable_plan_slug",
   "instructions": {
-    "u1_instructions": "Human-readable pointer to the source plan slice."
+    "contracts_instructions": "Freeze the public schemas and validators described in the source plan."
   },
   "acceptance": {
-    "u1_acceptance": "Requirement, acceptance-example, and verification references."
+    "contracts_acceptance": "The contracts package exports the required parser and validator entry points."
   },
   "units": [
     {
-      "id": "u1",
-      "title": "U1. Freeze contracts",
+      "id": "contracts",
+      "title": "Freeze contracts",
       "depends_on": [],
-      "instructions": ["u1_instructions"],
-      "acceptance": ["u1_acceptance"]
+      "instructions": ["contracts_instructions"],
+      "acceptance": ["contracts_acceptance"]
     }
   ],
   "commands": [
-    { "name": "test", "unit": "u1" },
+    { "name": "test", "unit": "contracts" },
     { "name": "build" }
   ]
 }
@@ -42,6 +43,8 @@ not a replacement for the plan prose.
   `instructions` and `acceptance` maps.
 - Command names must reference repository command names, not shell strings.
 - A command may name a unit only when the command is unit-scoped.
+- Source headings and planning vocabulary are never parsed as runtime fields;
+  only this fenced JSON contract is consumed by the structured pipeline.
 - Keep graph topology and units immutable after validation; proposed splits or
   scope expansion require a human and a new validated plan.
 
