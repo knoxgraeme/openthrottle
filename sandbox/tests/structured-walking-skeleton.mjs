@@ -68,7 +68,6 @@ const LOOP_DISPATCH_DIR = "/var/lib/openthrottle/loop-dispatch";
 const CHILD_EXECUTOR_DIR = "/var/lib/openthrottle/child-executor-actions";
 const STAGE_INPUT_DIR = "/var/lib/openthrottle/stage-input";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
-const MAX_DRAIN_STEPS = 400;
 // A wedged container init or hung `docker exec` must fail this proof gate
 // loudly and fast, not hang until an outer CI timeout eventually kills it.
 const DOCKER_EXEC_TIMEOUT_MS = 10 * 60 * 1000;
@@ -77,6 +76,7 @@ const DOCKER_EXEC_TIMEOUT_MS = 10 * 60 * 1000;
 // command repair this harness exercises, without hot-looping through a
 // genuine failure's real backoff schedule only to discard the cause.
 const DRAIN_RETRY_BUDGET_MS = 3 * 60 * 1000;
+const DRAIN_IDLE_POLL_MS = 25;
 
 const BASE_EXEC_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 // The image's `claude` at /usr/local/bin/claude resolves through a symlink
@@ -771,9 +771,9 @@ function readGraphFile() {
 
 // pipeline-effects schedules a failed effect's retry at RETRY_BASE_MS * 2^n
 // against real wall-clock `now`. A tight drain() loop with no wait between
-// steps burns through MAX_DRAIN_STEPS in milliseconds without ever reaching
-// that retryAt, so a single transient effect failure looks identical to a
-// hang -- and the real cause (last_error) was discarded. This honors the
+// steps can burn through an iteration limit without ever reaching that
+// retryAt, so a single transient effect failure looks identical to a hang --
+// and the real cause (last_error) was discarded. This honors the
 // processor's own backoff with a bounded real wait instead, and surfaces the
 // underlying effect error verbatim when the retry budget is exhausted. Every
 // drain loop in this harness (full settlement, or a scenario's own
@@ -783,14 +783,22 @@ function readGraphFile() {
 async function drainWithBackoff(processor, pipelines, instanceId, isDone, label) {
   const deadline = Date.now() + DRAIN_RETRY_BUDGET_MS;
   let lastEffectError = null;
-  for (let step = 0; step < MAX_DRAIN_STEPS; step += 1) {
+  let drainSteps = 0;
+  while (Date.now() <= deadline) {
+    drainSteps += 1;
     await processor.drain();
     const result = isDone();
     if (result) return result;
     const pendingEffects = instanceId
       ? pipelines.listEffects(instanceId).filter((effect) => effect.status === "pending" || effect.status === "failed")
       : [];
-    if (pendingEffects.length === 0) continue;
+    if (pendingEffects.length === 0) {
+      // A dispatched child executor can still be making progress even when
+      // the durable effect queue is empty. Yield to it instead of exhausting
+      // an arbitrary drain-iteration cap on a slower CI runner.
+      await sleep(DRAIN_IDLE_POLL_MS);
+      continue;
+    }
     for (const effect of pendingEffects) {
       if (effect.last_error) lastEffectError = effect.last_error;
     }
@@ -809,7 +817,7 @@ async function drainWithBackoff(processor, pipelines, instanceId, isDone, label)
     await sleep(waitMs);
   }
   throw new Error(
-    `${label}: did not settle within ${MAX_DRAIN_STEPS} drain steps` +
+    `${label}: did not settle within the ${DRAIN_RETRY_BUDGET_MS}ms drain budget after ${drainSteps} steps` +
       (lastEffectError ? `; last effect error: ${lastEffectError}` : "")
   );
 }

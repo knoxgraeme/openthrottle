@@ -60,7 +60,7 @@ reliable.
 ```bash
 fly volumes create openthrottle_data --region sjc --size 1
 fly secrets set SUPERVISOR_URL=https://<app>.fly.dev \
-  OT_STATUS_TOKEN=<random> OT_INSTALL_SECRET=<random> \
+  OT_STATUS_TOKEN=<random> OT_DEPLOY_TOKEN=<random> OT_INSTALL_SECRET=<random> \
   LINEAR_WEBHOOK_SECRET=... LINEAR_CLIENT_ID=... LINEAR_CLIENT_SECRET=... \
   GITHUB_WEBHOOK_SECRET=... GITHUB_TOKEN=... GITHUB_READ_TOKEN=... \
   DAYTONA_API_KEY=... DAYTONA_SNAPSHOT=openthrottle
@@ -69,7 +69,8 @@ fly deploy
 
 Add `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_AUTH_JSON`, and/or `KIMI_CODE_API_KEY`
 from subscription logins. `DEFAULT_AGENT=codex` applies when the ticket has no agent label.
-Linear credentials remain in Fly and are never passed into Daytona.
+Linear credentials and `OT_DEPLOY_TOKEN` remain in Fly and are never passed into
+Daytona.
 Use a separate fine-grained `GITHUB_READ_TOKEN` with contents, pull-request,
 checks, and Actions read access. Actions read powers CI-failure enrichment
 (failing jobs, steps, and log tails); without it GitHub returns 403 on the
@@ -89,14 +90,28 @@ receive `GITHUB_TOKEN`.
   itself instead of failing with `Could not find App`.
 - Changes under `supervisor/` (or a freshly built snapshot, whose staged
   secret applies on release) run `flyctl deploy --remote-only`.
-- `workflow_dispatch` inputs force either half manually.
+- `workflow_dispatch` inputs force either half manually. The optional
+  `prepare_v12_cutover` path uses `OT_DEPLOY_TOKEN` to pause admission, wait for
+  the bounded fail-closed drain to clear, deploy, recheck the drain, and resume
+  admission only when `resume_after_v12_cutover` is set. If the run does not
+  build a snapshot, pass its exact name as `expected_snapshot`.
 
-It needs the repository secrets `DAYTONA_API_KEY` and `FLY_API_TOKEN` (org-scoped
-so it can create the app on first run), plus optional repository variables
+It needs the repository secrets `DAYTONA_API_KEY`, `FLY_API_TOKEN` (org-scoped
+so it can create the app on first run), and `OT_DEPLOY_TOKEN`, plus optional repository variables
 `FLY_APP` (app name, default `openthrottle-supervisor`), `FLY_ORG` (org for
 first-time creation, default `personal`), and `FLY_REGION` (volume region,
 default `sjc`). Both `flyctl` deploy steps pass `--app` explicitly, so the
 committed `fly.toml` app value never has to match.
+
+This non-breaking supervisor-only fence release deploys first on the existing
+v12 snapshot because its parent does not yet have the maintenance endpoints.
+After that bootstrap, every push that builds a new snapshot automatically
+pauses, drains, deploys, verifies the pinned runtime release/digest and exact
+snapshot, and resumes. To exercise the v12 fence without building a snapshot,
+manually dispatch with `prepare_v12_cutover`, `resume_after_v12_cutover`, and
+the current `expected_snapshot`. The rollback pair is the previous supervisor
+image plus its exact `DAYTONA_SNAPSHOT`; resume only after cutover evidence
+shows that identity and a clear drain.
 
 The workflow does **not** set the runtime secrets — those are operator-owned and
 still set once with `fly secrets set ...` (see [Deploy to Fly](#deploy-to-fly)).
@@ -144,8 +159,9 @@ durable registration is rejected and never sent to a configured fallback.
 ## Operator endpoints
 
 `/status`, `/repositories`, `/repositories/register`, `/tickets/:id/stop`, and
-`/tickets/:id/logs` require
-`Authorization: Bearer $OT_STATUS_TOKEN`. `/oauth/install` uses the separate
+`/tickets/:id/logs` require `Authorization: Bearer $OT_STATUS_TOKEN`.
+Maintenance pause/resume and `/deployment/cutover-evidence` require
+`Authorization: Bearer $OT_DEPLOY_TOKEN`. `/oauth/install` uses the separate
 install token. The logs endpoint prefers sanitized live Daytona output and
 falls back to the newest bounded private run tail. Publication retry uses
 `/tickets/:id/publications/:publicationId/retry` and reopens only a persisted

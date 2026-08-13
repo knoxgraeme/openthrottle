@@ -182,6 +182,15 @@ CREATE TABLE IF NOT EXISTS repository_registrations (
 );
 
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+
+CREATE TABLE IF NOT EXISTS supervisor_maintenance (
+  key TEXT PRIMARY KEY,
+  paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0, 1)),
+  epoch INTEGER NOT NULL DEFAULT 0 CHECK(epoch >= 0),
+  reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `;
 
 const ticketMigrations: Array<[string, string]> = [

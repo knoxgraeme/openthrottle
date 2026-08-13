@@ -55,6 +55,7 @@ export interface Config {
   databasePath: string;
   supervisorUrl: string;
   statusToken: string;
+  deployToken: string;
   installSecret: string;
 
   linearWebhookSecret: string | undefined;
@@ -96,6 +97,7 @@ export function loadConfig(): Config {
     databasePath: optional("DATABASE_PATH", "/data/openthrottle.db"),
     supervisorUrl: required("SUPERVISOR_URL").replace(/\/+$/, ""),
     statusToken: required("OT_STATUS_TOKEN"),
+    deployToken: required("OT_DEPLOY_TOKEN"),
     installSecret: required("OT_INSTALL_SECRET"),
 
     linearWebhookSecret: process.env.LINEAR_WEBHOOK_SECRET,
@@ -167,6 +169,9 @@ export function loadConfig(): Config {
   requireRange("STALL_TIMEOUT_SECONDS", cfg.stallTimeoutSeconds, 60);
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$/.test(cfg.sandboxRuntimeRelease)) {
     throw new Error(`SANDBOX_RUNTIME_RELEASE has an invalid format: ${cfg.sandboxRuntimeRelease}`);
+  }
+  if (cfg.deployToken === cfg.statusToken || cfg.deployToken === cfg.installSecret) {
+    throw new Error("OT_DEPLOY_TOKEN must be distinct from OT_STATUS_TOKEN and OT_INSTALL_SECRET");
   }
   try {
     const url = new URL(cfg.supervisorUrl);

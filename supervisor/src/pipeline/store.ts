@@ -323,6 +323,7 @@ export interface PipelineInstanceSeed {
   issueId: string;
   sessionId: string;
   generation: number;
+  admissionEpoch?: number;
   repository: string;
   baseCommit: string;
   baseBranch?: string;

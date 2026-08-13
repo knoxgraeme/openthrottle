@@ -75,6 +75,26 @@ function fencedChildExecutorRequest(
 }
 
 describe("Daytona stage execution", () => {
+  it("does not let destroyed inventory consume the bounded live-resource window", async () => {
+    const list = vi.fn(async function* () {
+      for (let index = 0; index < 60; index += 1) {
+        yield { id: `destroyed-${index}`, state: "destroyed" };
+      }
+      yield { id: "destroying-live", state: "destroying" };
+      yield { id: "started-live", state: "started" };
+    });
+    const runtime = createDaytonaSandboxRuntime({ list } as never, {
+      snapshot: "snapshot-v1",
+      materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
+    });
+
+    await expect(runtime.listLabeledResources(2)).resolves.toEqual([
+      expect.objectContaining({ id: "destroying-live", state: "destroying" }),
+      expect.objectContaining({ id: "started-live", state: "started" }),
+    ]);
+    expect(list).toHaveBeenCalledWith({ labels: { openthrottle: "true" } });
+  });
+
   it("implements the opaque, fenced one-stage lifecycle without leaking provider details", async () => {
     const remoteFiles = new Map<string, Buffer>();
     const updateEnv = vi.fn(async () => undefined);
@@ -845,7 +865,7 @@ describe("Daytona stage execution", () => {
     });
   });
 
-  it("refuses credentials outside the sandbox allowlist", async () => {
+  it("refuses credentials outside the sandbox allowlist, including the deployment token", async () => {
     const sandbox = {
       id: "provider-opaque-2",
       state: "started",
@@ -855,12 +875,12 @@ describe("Daytona stage execution", () => {
     } as unknown as Sandbox;
     const runtime = createDaytonaSandboxRuntime({ get: vi.fn(async () => sandbox) } as never, {
       snapshot: "snapshot-v1",
-      materializeCredentialEnv: vi.fn(async () => ({ env: { DAYTONA_API_KEY: "forbidden" } })),
+      materializeCredentialEnv: vi.fn(async () => ({ env: { OT_DEPLOY_TOKEN: "forbidden" } })),
     });
     await expect(runtime.materializeCredentials(
       { providerResourceId: "provider-opaque-2" },
       ["repo.read"]
-    )).rejects.toThrow(/forbidden sandbox variable/);
+    )).rejects.toThrow(/forbidden sandbox variable OT_DEPLOY_TOKEN/);
     expect(sandbox.updateEnv).not.toHaveBeenCalled();
   });
 
