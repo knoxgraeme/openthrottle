@@ -1153,21 +1153,27 @@ describe("deterministic supervisor stage gates", () => {
 
   it("binds tune analysis receipts to the supervisor-sealed corpus", () => {
     const analysis = tuneAnalysisFixture();
+    const { generated_at: _generatedAt, ...analysisMaterial } = analysis;
+    const analysisInput = {
+      ...analysisMaterial,
+      schema: "openthrottle.tune-analysis-input/v1",
+    };
     const taskContext = [
-      "```json openthrottle.tune-analysis/v1",
-      canonicalJson(analysis),
+      "```json openthrottle.tune-analysis-input/v1",
+      canonicalJson(analysisInput),
       "```",
     ].join("\n");
     const accepted = resealTuneStage(setup("core/tune@1"), taskContext);
+    const producedAnalysis = { ...analysis, generated_at: "2026-08-12T00:03:00.000Z" };
     const acceptedReceipt = tuneReceiptFor(accepted, "tune_analysis", {
       summary: "Sealed corpus packaged.",
-      analysis,
+      analysis: producedAnalysis,
     });
     expect(() => evaluateStageGate(accepted.pipelines, event(accepted, "success", {
       details: { receipt: acceptedReceipt },
     }))).not.toThrow();
 
-    const forgedAnalysis = { ...analysis, id: "analysis_forged" };
+    const forgedAnalysis = { ...producedAnalysis, id: "analysis_forged" };
     const rejected = resealTuneStage(setup("core/tune@1"), taskContext);
     const rejectedReceipt = tuneReceiptFor(rejected, "tune_analysis", {
       summary: "Attempted corpus replacement.",
@@ -1175,7 +1181,7 @@ describe("deterministic supervisor stage gates", () => {
     });
     expect(() => evaluateStageGate(rejected.pipelines, event(rejected, "success", {
       details: { receipt: rejectedReceipt },
-    }))).toThrow(/does not match the supervisor-sealed corpus/);
+    }))).toThrow(/does not preserve the supervisor-sealed input/);
   });
 
   it("binds tune proposals to the immediately preceding analysis receipt", () => {

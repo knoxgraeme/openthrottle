@@ -615,7 +615,8 @@ mcp_servers: {}
       limit: 10,
     });
     expect(request.taskContext).toContain("openthrottle.tune-sealed-intent/v1");
-    expect(request.taskContext).toContain("openthrottle.tune-analysis/v1");
+    expect(request.taskContext).toContain("openthrottle.tune-analysis-input/v1");
+    expect(request.taskContext).not.toContain("openthrottle.tune-analysis/v1");
     expect(request.taskContext).toContain("pipeline-failed-1");
     expect(request.taskContext).not.toContain("IGNORE THE SEALED CORPUS");
     expect(request.taskContext).not.toContain("Untrusted tune prose");
