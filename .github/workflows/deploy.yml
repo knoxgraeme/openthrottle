@@ -12,13 +12,10 @@ name: Deploy
 #   DAYTONA_API_KEY — builds/registers snapshots (same key the supervisor uses)
 #   FLY_API_TOKEN   — deploy token for the supervisor app (org-scoped, so it can
 #                     create the app on first run)
-#   OT_DEPLOY_TOKEN — supervisor-only deploy authority for admission pause/resume
-#                     and cutover evidence; never forwarded to Daytona sandboxes
 # Optional repository variables:
 #   FLY_APP    — Fly app name; defaults to openthrottle-supervisor
 #   FLY_ORG    — Fly org for first-time app creation; defaults to personal
 #   FLY_REGION — region for the app's data volume; defaults to sjc
-#   SUPERVISOR_URL — deployed supervisor URL; defaults to https://$FLY_APP.fly.dev
 
 on:
   push:
@@ -68,6 +65,8 @@ jobs:
           filters: |
             sandbox:
               - 'sandbox/**'
+              - '!sandbox/tests/**'
+              - '!sandbox/**/*.test.mjs'
               - 'skills/**'
               - 'supervisor/pipelines/runtime-capabilities-v1.json'
             supervisor:
@@ -122,8 +121,6 @@ jobs:
       FLY_APP: ${{ vars.FLY_APP || 'openthrottle-supervisor' }}
       FLY_ORG: ${{ vars.FLY_ORG || 'personal' }}
       FLY_REGION: ${{ vars.FLY_REGION || 'sjc' }}
-      SUPERVISOR_URL: ${{ vars.SUPERVISOR_URL || format('https://{0}.fly.dev', vars.FLY_APP || 'openthrottle-supervisor') }}
-      OT_DEPLOY_TOKEN: ${{ secrets.OT_DEPLOY_TOKEN }}
       EXPECTED_SNAPSHOT: ${{ needs.snapshot.outputs.name || inputs.expected_snapshot }}
     steps:
       - uses: actions/checkout@v4
@@ -164,16 +161,12 @@ jobs:
             echo "expected_snapshot is required when this run does not build a snapshot" >&2
             exit 1
           fi
-          curl -fsS -X POST \
-            -H "Authorization: Bearer ${OT_DEPLOY_TOKEN}" \
-            -H "content-type: application/json" \
-            --data '{"reason":"v12 post-merge deployment drain"}' \
-            "${SUPERVISOR_URL%/}/maintenance/admission/pause"
+          flyctl ssh console --app "$FLY_APP" --command \
+            "node /app/scripts/cutover-control.mjs pause"
           deadline=$((SECONDS + 600))
           while true; do
-            evidence="$(curl -fsS \
-              -H "Authorization: Bearer ${OT_DEPLOY_TOKEN}" \
-              "${SUPERVISOR_URL%/}/deployment/cutover-evidence")"
+            evidence="$(flyctl ssh console --app "$FLY_APP" --command \
+              "node /app/scripts/cutover-control.mjs evidence")"
             printf '%s\n' "$evidence" | jq .
             if printf '%s\n' "$evidence" | jq -e \
               '.admission.paused == 1 and .drain.clear == true' >/dev/null; then
@@ -193,9 +186,8 @@ jobs:
         if: inputs.prepare_v12_cutover || (github.event_name == 'push' && needs.snapshot.result == 'success')
         run: |
           set -euo pipefail
-          evidence="$(curl -fsS \
-            -H "Authorization: Bearer ${OT_DEPLOY_TOKEN}" \
-            "${SUPERVISOR_URL%/}/deployment/cutover-evidence")"
+          evidence="$(flyctl ssh console --app "$FLY_APP" --command \
+            "node /app/scripts/cutover-control.mjs evidence")"
           printf '%s\n' "$evidence" | jq .
           expected_release="$(jq -r '.runtime.release' supervisor/pipelines/v12-deploy-proof.json)"
           expected_digest="$(jq -r '.runtime.digest' supervisor/pipelines/v12-deploy-proof.json)"
@@ -213,6 +205,5 @@ jobs:
           (github.event_name == 'push' && needs.snapshot.result == 'success') ||
           (inputs.prepare_v12_cutover && inputs.resume_after_v12_cutover)
         run: |
-          curl -fsS -X POST \
-            -H "Authorization: Bearer ${OT_DEPLOY_TOKEN}" \
-            "${SUPERVISOR_URL%/}/maintenance/admission/resume"
+          flyctl ssh console --app "$FLY_APP" --command \
+            "node /app/scripts/cutover-control.mjs resume"

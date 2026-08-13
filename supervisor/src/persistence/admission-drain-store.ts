@@ -191,10 +191,17 @@ export function createAdmissionDrainStore(db: Database.Database): AdmissionDrain
           }>(
             db,
             `
-              SELECT id, parent_run_id, unit_id, action_kind, status, lease_until
-              FROM execution_work_attempts
-              WHERE status IN ('leased', 'dispatched', 'running')
-              ORDER BY created_at, id
+              SELECT work.id, work.parent_run_id, work.unit_id,
+                work.action_kind, work.status, work.lease_until
+              FROM execution_work_attempts AS work
+              JOIN pipeline_stage_attempts AS parent
+                ON parent.id = work.parent_attempt_id
+              JOIN pipeline_instances AS instance
+                ON instance.id = work.pipeline_instance_id
+              WHERE work.status IN ('leased', 'dispatched', 'running')
+                AND parent.status IN ('pending', 'leased', 'dispatched', 'acknowledged', 'running')
+                AND instance.terminal_outcome IS NULL
+              ORDER BY work.created_at, work.id
               LIMIT ?
             `,
             [],

@@ -81,7 +81,8 @@ receive `GITHUB_TOKEN`.
 
 `.github/workflows/deploy.yml` runs on every push to `main`:
 
-- Changes under `sandbox/` or `skills/` build a commit-pinned Daytona snapshot
+- Runtime changes under `sandbox/` (excluding test-only paths) or `skills/`
+  build a commit-pinned Daytona snapshot
   named `openthrottle-v2-ce-<short-sha>` via
   `supervisor/scripts/build-snapshot.mjs` (the pinned `@daytona/sdk`, no CLI
   install), then stage `DAYTONA_SNAPSHOT` on the Fly app.
@@ -91,13 +92,14 @@ receive `GITHUB_TOKEN`.
 - Changes under `supervisor/` (or a freshly built snapshot, whose staged
   secret applies on release) run `flyctl deploy --remote-only`.
 - `workflow_dispatch` inputs force either half manually. The optional
-  `prepare_v12_cutover` path uses `OT_DEPLOY_TOKEN` to pause admission, wait for
-  the bounded fail-closed drain to clear, deploy, recheck the drain, and resume
+  `prepare_v12_cutover` path invokes the Fly-local cutover client to pause
+  admission, wait for the bounded fail-closed drain to clear, deploy, recheck
+  the drain, and resume
   admission only when `resume_after_v12_cutover` is set. If the run does not
   build a snapshot, pass its exact name as `expected_snapshot`.
 
-It needs the repository secrets `DAYTONA_API_KEY`, `FLY_API_TOKEN` (org-scoped
-so it can create the app on first run), and `OT_DEPLOY_TOKEN`, plus optional repository variables
+It needs the repository secrets `DAYTONA_API_KEY` and `FLY_API_TOKEN` (org-scoped
+so it can create the app on first run), plus optional repository variables
 `FLY_APP` (app name, default `openthrottle-supervisor`), `FLY_ORG` (org for
 first-time creation, default `personal`), and `FLY_REGION` (volume region,
 default `sjc`). Both `flyctl` deploy steps pass `--app` explicitly, so the
@@ -112,6 +114,9 @@ manually dispatch with `prepare_v12_cutover`, `resume_after_v12_cutover`, and
 the current `expected_snapshot`. The rollback pair is the previous supervisor
 image plus its exact `DAYTONA_SNAPSHOT`; resume only after cutover evidence
 shows that identity and a clear drain.
+
+The cutover client executes inside the Fly machine and reads
+`OT_DEPLOY_TOKEN` there. GitHub Actions never stores or receives that token.
 
 The workflow does **not** set the runtime secrets — those are operator-owned and
 still set once with `fly secrets set ...` (see [Deploy to Fly](#deploy-to-fly)).

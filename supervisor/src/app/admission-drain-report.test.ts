@@ -334,8 +334,32 @@ describe("admission drain report", () => {
   it("does not let terminal rows or destroyed resources block a clear report", async () => {
     const { seed, pipelines } = setup();
     const terminal = seed("session-terminal");
+    const activeAttempt = pipelines.getActiveAttempt(terminal.id)!;
+    const unitStore = createExecutionUnitStore(db!, () => nowIso);
+    unitStore.createGraph({
+      pipelineInstanceId: terminal.id,
+      parentAttemptId: activeAttempt.id,
+      parentStageId: activeAttempt.stage_id,
+      parentRunId: activeAttempt.planned_run_id!,
+      graphDigest: "terminal-graph-digest",
+      planDigest: "terminal-plan-digest",
+      units: [{ id: "u1" }],
+      unitPhaseBindings: unitPhaseBindings(),
+    });
+    const orphanedLease = unitStore.leaseNextUnitAction({
+      parentAttemptId: activeAttempt.id,
+      leaseOwner: "worker",
+      nowIso,
+      leaseUntilIso: "2026-08-12T23:00:00.000Z",
+    });
+    expect(orphanedLease).toMatchObject({ status: "leased" });
     acknowledgePublications(terminal.id);
     pipelines.bindRuntimeResource(terminal.id, "daytona", "sandbox-terminal");
+    db!.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET status = 'failed', outcome = 'needs_human', completed_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(nowIso, nowIso, activeAttempt.id);
     db!.prepare(`
       UPDATE pipeline_instances
       SET status = 'needs_human', terminal_outcome = 'needs_human'
