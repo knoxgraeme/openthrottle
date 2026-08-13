@@ -19,8 +19,9 @@ Linear ticket or GitHub Issue ──> Fly supervisor ──> Daytona ──> ot/
 The supervisor authenticates and durably retries webhooks, pins the manifest,
 repository config, runtime descriptor, base commit, and generation, then
 dispatches one sealed stage at a time. Typed artifacts and gates determine the
-next transition; external effects are persisted before execution. Native
-Compound Engineering supplies agent reasoning inside the stage boundary.
+next transition; external effects are persisted before execution.
+Self-contained OpenThrottle skills supply agent reasoning inside the stage
+boundary.
 
 The implement pipeline separates planning, implementation, semantic review,
 simplification, command gates, exact-subject publication, and provider

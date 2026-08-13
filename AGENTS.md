@@ -149,12 +149,14 @@ Engineering / "CE")**. Keep new logic on the correct side:
 
 ## Invariants worth knowing before you change things
 
-- **Task skills are self-contained, not CE delegation.** Every
+- **OpenThrottle skills are self-contained, not CE delegation.** Every
   `skills/tasks/` adapter restates its own craft in its own words instead of
-  invoking a second-hop toolkit; none references `ce-*` or
-  `compound-engineering`. Planning-time authoring skills (`skills/planning/`)
-  still use the pinned `compound-engineering` plugin, which the snapshot
-  installs natively for all three engines — never copy CE source into
+  invoking a second-hop toolkit; the planning adapter in `skills/planning/`
+  normalizes any sufficiently complete implementation plan or task
+  specification without requiring a particular authoring workflow. None of
+  these skills references `ce-*` or `compound-engineering`. The current
+  snapshot still contains the pinned plugin as a legacy ambient image input,
+  but no OpenThrottle skill may depend on it. Never copy CE source into
   `skills/` or into target repos. Each `SKILL.md` is agent-neutral and
   maintained once; the only per-agent difference is *delivery*, which lives
   entirely in `sandbox/entrypoint.sh` + `sandbox/Dockerfile` (Claude: copy into

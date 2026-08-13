@@ -10,8 +10,10 @@ This file records the active product-level plan after that cutover.
 
 OpenThrottle is a pre-production proof of concept. A Linear delegation selects
 one immutable configurable pipeline; a deterministic Fly supervisor coordinates
-fenced stages in Daytona; native Compound Engineering supplies agent reasoning;
-and GitHub is the publication/provider surface.
+fenced stages in Daytona; self-contained OpenThrottle skills supply agent
+reasoning; and GitHub is the publication/provider surface. The current snapshot
+still carries the Compound Engineering plugin as an unused legacy image input;
+removing that ambient dependency is separate cleanup, not a planning contract.
 
 There is one execution architecture. New generations never select a direct
 task runner, automatic resume scheduler, callback endpoint, preview revival
