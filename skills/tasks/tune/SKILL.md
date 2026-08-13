@@ -1,6 +1,6 @@
 ---
 name: tune
-description: Packages sealed tune corpora and proposes bounded skill or repository-config changes as typed tune receipts.
+description: Packages sealed tune corpora and proposes reviewable config or eligible skill changes as typed tune receipts.
 ---
 
 # Tune
@@ -10,10 +10,13 @@ stage returns a `tune_analysis` receipt. The `proposal` stage returns a
 `tune_proposal` receipt. Read `references/tune-receipts.md` before producing
 either receipt.
 
-This skill never edits the checkout. Citation grading, differential-ratchet
-decisions, edit authorization, structured implementation, deterministic review
-fanout, repair, publication, and provider verification all belong to later
-manifest stages.
+This is an agent-neutral tune adapter, not an implementation worker. It can
+propose only eligible reviewable diffs with reproducible citations, rationale,
+expected metric movement, scope, and rollback notes. It never mutates policy,
+bypasses gates, edits deterministic authority, or applies its own proposal.
+Citation grading, differential-ratchet decisions, edit authorization,
+structured implementation, deterministic review fanout, repair, publication,
+and provider verification all belong to later manifest stages.
 
 ## Authority
 
@@ -30,6 +33,12 @@ manifest stages.
 - Never edit files, stage, commit, push, publish, invoke write-capable tools, run
   a gate, claim executor verification, or emit a tune decision/edit
   authorization.
+- Never alter deterministic authority: pipeline topology, graph sequencing,
+  required command gates, citation gates, differential-ratchet gates, credential
+  scope, MCP/server scope, resource limits, receipt provenance, release
+  descriptors, or any locked/immutable skill material. When a useful improvement
+  would require one of those changes, return a bounded `needs_human` or
+  `failure` instead of proposing it.
 
 ## Analysis Stage
 
@@ -54,15 +63,23 @@ manifest stages.
    authorized artifact and bind its canonical digest. Do not reconstruct it
    from a summary or from native-session memory.
 2. Inspect only the sealed target and allowed paths. Derive the smallest useful
-   change set, bounded by `policy.max_changed_files`. Each change names its
-   operation, before/after content digests, exact bounded `after_content` bytes
-   (null only for deletion), and a rationale that includes the observed failure
-   pattern, expected metric movement, scope, and rollback.
-3. Every material claim must cite a deterministic query whose expected rows are
+   change set, bounded by `policy.max_changed_files`. Eligible targets are
+   reviewable repository config bytes, graph/config material that preserves or
+   tightens deterministic gates, or an unlocked repository skill package under
+   its sealed skill root. Eligible skill edits are craft/reference text only:
+   they may clarify instructions, add bounded decision procedure, or improve
+   examples, but they must not change executor identity, credential scope,
+   output schemas, or deterministic supervisor policy.
+3. For every changed path, snapshot the exact before bytes and exact after bytes
+   through the proposal contract. Each change names its operation,
+   before/after content digests, exact bounded `after_content` bytes (null only
+   for deletion), and a rationale that includes the observed failure pattern,
+   expected metric movement, scope, and rollback.
+4. Every material claim must cite a deterministic query whose expected rows are
    byte-for-byte projections of rows in the sealed corpus. Source digests must
    come from those rows. Unsupported claims make the receipt `failure`, not a
    lower-confidence proposal.
-4. Build the complete citation contract and differential-ratchet input. Its
+5. Build the complete citation contract and differential-ratchet input. Its
    paired `pinned_files` and `proposed_files` must contain the exact repository
    bytes described by `changes`, and its config, graph, or repository-skill
    policy structures must describe those same bytes. Bind
@@ -70,7 +87,7 @@ manifest stages.
    proposal must not expand credentials/MCP scope, weaken required commands or
    gates, increase resource limits, touch locked/immutable skill material, or
    edit outside the allowlist.
-5. Return `tune_proposal` with:
+6. Return `tune_proposal` with:
    - `result: "success"` and `proposal.outcome: "propose"` for one or more
      eligible changes;
    - `result: "no_change"`, `proposal.outcome: "no_change"`, and no changes
@@ -79,6 +96,30 @@ manifest stages.
      when only human authority can settle the proposal;
    - `result: "failure"` when any input, citation, or proposal binding is
      invalid.
+
+## Proposal Craft
+
+Work from the sealed corpus, not hunches. Group rows by the deterministic
+filters the intent authorized: outcome, closed reason, graph, skill, time
+window, and source digest. A proposal is justified only when those rows expose
+a repeated failure or missed-success pattern that maps to a specific allowed
+file and to a reversible textual or config change.
+
+Keep the proposal reviewable:
+
+- Prefer one narrow changed file. Use more only when the exact target package or
+  config format requires it, and never exceed `policy.max_changed_files`.
+- Preserve existing wording style and package layout. Do not introduce a shared
+  include, external dependency, generated file, or per-agent variant to solve a
+  prose problem.
+- Each rationale must name the cited failure pattern, expected metric movement
+  in operational terms such as fewer rejected receipts or fewer repair rounds,
+  the limited scope of the diff, and the rollback path as reverting the named
+  file bytes.
+- If the evidence supports no eligible diff, return `no_change`. If the only
+  plausible diff touches locked policy, asks for broader authority, or cannot
+  be reproduced from sealed rows, return `needs_human` or `failure` as the
+  contract permits.
 
 ## Output
 

@@ -197,14 +197,31 @@ describe("OpenThrottle canonical task skills", () => {
 
   it("ships distinct typed tune analysis and proposal receipt producers", () => {
     const body = skillBody("tune");
-    expect(body).toContain("capability `core/tune@1`");
-    expect(body).toContain("typed,\n  authorized input artifacts");
-    expect(body).toContain("openthrottle.receipt/v1");
-    expect(body).toContain("`tune_analysis` receipt");
-    expect(body).toContain("`tune_proposal` receipt");
-    expect(body).toContain("`payload.summary` is always\none bounded string");
-    expect(body).toContain("expected metric movement");
-    expect(body).toContain("scope, and rollback");
+    const reference = readFileSync(resolve(skillsRoot, "tasks", "tune", "references", "tune-receipts.md"), "utf8");
+    for (const snippet of [
+      "capability `core/tune@1`",
+      "typed,\n  authorized input artifacts",
+      "openthrottle.receipt/v1",
+      "`tune_analysis` receipt",
+      "`tune_proposal` receipt",
+      "`payload.summary` is always\none bounded string",
+      "eligible reviewable diffs with reproducible citations",
+      "expected metric movement",
+      "scope, and rollback",
+      "Never alter deterministic authority",
+      "unlocked repository skill package under\n   its sealed skill root",
+      "Eligible skill edits are craft/reference text only",
+      "return `no_change`",
+    ]) {
+      expect(body).toContain(snippet);
+    }
+    for (const snippet of [
+      "## Reviewable diff closure",
+      "unlocked repository skill craft/reference files",
+      "must not change executor\nidentity, receipt schema, result vocabulary, provenance fields, credential",
+    ]) {
+      expect(reference).toContain(snippet);
+    }
     expect(body).toContain("Never edit files, stage, commit, push, publish");
     expect(body).toContain("Citation grading, differential-ratchet");
     expect(body).not.toContain('type": "semantic_review"');
