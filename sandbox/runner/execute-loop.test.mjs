@@ -1137,17 +1137,32 @@ describe("loop action request validation", () => {
     }
   });
 
-  it("passes sealed models to each engine adapter and leaves omitted models on provider defaults", () => {
-    const claude = validateLoopRequest(request({ agent: "claude", model: "claude-opus-4-1" }));
-    const codex = validateLoopRequest(request({ agent: "codex", model: "gpt-5.1-code" }));
+  it("passes sealed models and reasoning effort to each engine adapter and leaves omitted values on provider defaults", () => {
+    const claude = validateLoopRequest(request({
+      agent: "claude", model: "claude-opus-5", reasoningEffort: "high",
+    }));
+    const codex = validateLoopRequest(request({
+      agent: "codex", model: "gpt-5.6-sol", reasoningEffort: "high",
+    }));
     const defaultCodex = validateLoopRequest(request({ agent: "codex" }));
 
     expect(loopAgentCommand({ request: claude, invocation: resolveLoopInvocation(claude) }).args)
-      .toEqual(expect.arrayContaining(["--model", "claude-opus-4-1"]));
+      .toEqual(expect.arrayContaining(["--model", "claude-opus-5", "--effort", "high"]));
     expect(loopAgentCommand({ request: codex, invocation: resolveLoopInvocation(codex) }).args)
-      .toEqual(expect.arrayContaining(["-m", "gpt-5.1-code"]));
+      .toEqual(expect.arrayContaining(["-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"']));
     expect(loopAgentCommand({ request: defaultCodex, invocation: resolveLoopInvocation(defaultCodex) }).args)
       .not.toContain("-m");
+    expect(loopAgentCommand({ request: defaultCodex, invocation: resolveLoopInvocation(defaultCodex) }).args)
+      .not.toContain("-c");
+  });
+
+  it("rejects unsupported reasoning effort and binds supported effort into the request hash", () => {
+    expect(() => validateLoopRequest(request({ reasoningEffort: "extreme" })))
+      .toThrow(/reasoningEffort is invalid/);
+
+    const valid = request({ reasoningEffort: "high" });
+    expect(() => validateLoopRequest({ ...valid, reasoningEffort: "medium" }))
+      .toThrow(/loop request hash or idempotency key is stale/);
   });
 
   it("rejects correctly hashed OpenCode loop requests before launch", () => {

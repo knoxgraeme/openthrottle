@@ -12,6 +12,7 @@ import {
   validateTuneEditAuthorizationContract,
   validateTuneProposalContract,
   validateReviewJournalContract,
+  type RepositoryConfigContract,
   type AnyExecutionPlanContract,
   type CandidateEvidenceReceipt,
   type CommandResultReceipt,
@@ -328,6 +329,31 @@ function configuredCommandNamesFor(instance: PipelineInstance, store: PipelineSt
   }
   const config = JSON.parse(snapshot.normalized_config) as { commands?: Record<string, unknown> };
   return new Set(Object.keys(config.commands ?? {}));
+}
+
+function agentExecutionDefaultsFor(
+  instance: PipelineInstance,
+  store: PipelineStore,
+  agent: LoopActionRequest["agent"],
+  workerModel?: string,
+): { model?: string; reasoningEffort?: LoopActionRequest["reasoningEffort"] } {
+  if (!instance.repository_config_snapshot_id || !instance.repository_config_digest) {
+    return workerModel === undefined ? {} : { model: workerModel };
+  }
+  const snapshot = store.getRepositoryConfigSnapshot(instance.repository_config_snapshot_id);
+  if (!snapshot || snapshot.digest !== instance.repository_config_digest) {
+    throw new Error(`pipeline instance ${instance.id} lost its sealed repository config`);
+  }
+  const config = JSON.parse(snapshot.normalized_config) as RepositoryConfigContract;
+  const defaults = config.agent_defaults?.[agent];
+  const legacyModel = config.agent === agent ? config.model : undefined;
+  const effectiveModel = workerModel ?? defaults?.model ?? legacyModel;
+  return {
+    ...(effectiveModel === undefined ? {} : { model: effectiveModel }),
+    ...(defaults?.reasoning_effort === undefined
+      ? {}
+      : { reasoningEffort: defaults.reasoning_effort }),
+  };
 }
 
 function uniqueInOrder(values: readonly string[]): string[] {
@@ -796,6 +822,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     baseSubject: string;
     agent: LoopActionRequest["agent"];
     model?: string;
+    reasoningEffort?: LoopActionRequest["reasoningEffort"];
     timeoutMs: number;
   }): LoopActionRequest[] =>
     input.fanout.personas.map((persona) => buildLoopActionRequest({
@@ -812,6 +839,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       loop: "review",
       agent: input.agent,
       ...(input.model === undefined ? {} : { model: input.model }),
+      ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
       skill: persona.id,
       worktree: null,
       baseSubject: input.baseSubject,
@@ -856,6 +884,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     baseSubject: string;
     agent: LoopActionRequest["agent"];
     model?: string;
+    reasoningEffort?: LoopActionRequest["reasoningEffort"];
     timeoutMs: number;
     priorEvidence?: LoopActionRequest["priorEvidence"];
   }): LoopActionRequest => buildLoopActionRequest({
@@ -872,6 +901,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     loop: "review",
     agent: input.agent,
     ...(input.model === undefined ? {} : { model: input.model }),
+    ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
     skill: "select-review-personas",
     worktree: null,
     baseSubject: input.baseSubject,
@@ -922,6 +952,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     baseSubject: string;
     agent: LoopActionRequest["agent"];
     model?: string;
+    reasoningEffort?: LoopActionRequest["reasoningEffort"];
     timeoutMs: number;
   }): LoopActionRequest => buildLoopActionRequest({
     protocol: "loop-action@2",
@@ -937,6 +968,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     loop: "review",
     agent: input.agent,
     ...(input.model === undefined ? {} : { model: input.model }),
+    ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
     skill: "validate-review-findings",
     worktree: null,
     baseSubject: input.baseSubject,
@@ -1915,6 +1947,15 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     const reviewSubject = action.action_kind === "lead" ? leadCandidateSubject
       : action.action_kind === "final_review" ? inputSubject
         : undefined;
+    const effectiveAgent = workerBinding.worker.agent && workerBinding.worker.agent !== "inherit"
+      ? workerBinding.worker.agent
+      : instance.agent;
+    const executionDefaults = agentExecutionDefaultsFor(
+      instance,
+      deps.store,
+      effectiveAgent,
+      workerBinding.worker.model,
+    );
     if (action.action_kind === "final_review") {
       if (!executionPlan || !reviewSubject) throw new Error(`child final review ${action.id} has no sealed execution plan`);
       const previousFanout = previousReviewFanoutSynthesis(action);
@@ -1929,10 +1970,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         authority,
         inputSubject: reviewSubject,
         baseSubject: instance.base_commit,
-        agent: workerBinding.worker.agent && workerBinding.worker.agent !== "inherit"
-          ? workerBinding.worker.agent
-          : instance.agent,
-        ...(workerBinding.worker.model === undefined ? {} : { model: workerBinding.worker.model }),
+        agent: effectiveAgent,
+        ...executionDefaults,
         timeoutMs: (workerBinding.loop.timeout_seconds ?? deps.taskTimeoutSeconds) * 1_000,
         ...(priorEvidence ? { priorEvidence } : {}),
       });
@@ -1963,10 +2002,8 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       generation: instance.generation,
       role: roleFor(action.action_kind),
       loop: loopKindFor(action.action_kind),
-      agent: workerBinding.worker.agent && workerBinding.worker.agent !== "inherit"
-        ? workerBinding.worker.agent
-        : instance.agent,
-      ...(workerBinding.worker.model === undefined ? {} : { model: workerBinding.worker.model }),
+      agent: effectiveAgent,
+      ...executionDefaults,
       skill: workerBinding.repositorySkill?.invocation ?? adapterSkillFor(action.action_kind),
       worktree,
       baseSubject: worktreeBaseFor(instance, action),
@@ -2101,6 +2138,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         baseSubject: instance.base_commit,
         agent: selectorRequest.agent,
         ...(selectorRequest.model === undefined ? {} : { model: selectorRequest.model }),
+        ...(selectorRequest.reasoningEffort === undefined ? {} : { reasoningEffort: selectorRequest.reasoningEffort }),
         timeoutMs: selectorRequest.timeoutMs,
       });
       for (const request of fanoutRequests) assertLoopRequestEnvelopeBound(request);
@@ -2145,6 +2183,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           baseSubject: instance.base_commit,
           agent: selectorRequest.agent,
           ...(selectorRequest.model === undefined ? {} : { model: selectorRequest.model }),
+          ...(selectorRequest.reasoningEffort === undefined ? {} : { reasoningEffort: selectorRequest.reasoningEffort }),
           timeoutMs: selectorRequest.timeoutMs,
         });
         assertLoopRequestEnvelopeBound(validatorRequest);

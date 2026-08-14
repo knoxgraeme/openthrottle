@@ -535,7 +535,7 @@ export function validateLoopRequest(value) {
   const input = record(value, "loop request");
   const allowed = new Set([
     "protocol", "actionId", "attemptId", "graphId", "pipelineInstanceId", "graphDigest", "parentRunId",
-    "unitId", "generation", "role", "loop", "agent", "model", "skill", "worktree", "baseSubject", "recoveryBaseSubject", "inputSubject",
+    "unitId", "generation", "role", "loop", "agent", "model", "reasoningEffort", "skill", "worktree", "baseSubject", "recoveryBaseSubject", "inputSubject",
     "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
     "transitionContext", "tuneMaterial", "priorEvidence", "downstreamContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
     "expectedProducerSkill", "expectedProducer", "repositorySkill", "requestHash", "idempotencyKey",
@@ -565,6 +565,9 @@ export function validateLoopRequest(value) {
     loop: string(input.loop, "loop"),
     agent: string(input.agent, "agent"),
     ...(input.model === undefined ? {} : { model: string(input.model, "model", MODEL_REFERENCE) }),
+    ...(input.reasoningEffort === undefined ? {} : {
+      reasoningEffort: string(input.reasoningEffort, "reasoningEffort", /^(?:low|medium|high|xhigh|max)$/),
+    }),
     skill: string(input.skill, "skill", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
     worktree: worktree === null ? null : {
       id: string(worktree.id, "worktree.id", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
@@ -1007,7 +1010,7 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
     return {
       repoDir,
       command: "codex",
-      args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(request.model ? ["-m", request.model] : []), ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, "-"] : ["-"])],
+      args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(request.model ? ["-m", request.model] : []), ...(request.reasoningEffort ? ["-c", `model_reasoning_effort=\"${request.reasoningEffort}\"`] : []), ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, "-"] : ["-"])],
       input: prompt,
     };
   }
@@ -1023,7 +1026,7 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
       // prompt itself is never passed via argv (see the Codex note above for
       // why: MAX_ARG_STRLEN and /proc/<pid>/cmdline visibility).
       "--print", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []),
-      "--output-format", "stream-json", "--verbose", ...(request.model ? ["--model", request.model] : []), "--dangerously-skip-permissions",
+      "--output-format", "stream-json", "--verbose", ...(request.model ? ["--model", request.model] : []), ...(request.reasoningEffort ? ["--effort", request.reasoningEffort] : []), "--dangerously-skip-permissions",
       // Unconditional: --strict-mcp-config closes MCP entirely to just the
       // declared set (or to nothing, when no MCP servers were declared),
       // rather than leaving a repo-committed .mcp.json or other ambient
