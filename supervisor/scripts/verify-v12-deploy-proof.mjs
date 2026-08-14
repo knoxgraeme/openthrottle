@@ -52,6 +52,9 @@ assert(
   deployWorkflow.includes("database_migrations: ${{ steps.filter.outputs.database_migrations }}") &&
     deployWorkflow.includes("'supervisor/src/persistence/migrations/definitions.ts'") &&
     deployWorkflow.includes("EXPECTED_MIGRATION_ROLLBACK_CONTRACT: schema-migrations-name-additive-rollback-compatible/v1") &&
+    deployWorkflow.includes("fetch-depth: 0") &&
+    deployWorkflow.includes("Validate migration rollback markers") &&
+    deployWorkflow.includes("node supervisor/scripts/verify-migration-rollback-markers.mjs") &&
     deployWorkflow.includes("needs.changes.outputs.database_migrations == 'true'") &&
     deployWorkflow.includes("requires_migration_contract=\"${{ needs.changes.outputs.database_migrations == 'true' }}\"") &&
     !deployWorkflow.includes("github.event_name == 'push' && needs.changes.outputs.database_migrations == 'true'") &&

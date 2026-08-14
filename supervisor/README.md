@@ -92,7 +92,8 @@ receive `GITHUB_TOKEN`.
 - Changes under `supervisor/` (or a freshly built snapshot, whose staged
   secret applies on release) run `flyctl deploy --remote-only`.
 - Changes to `supervisor/src/persistence/migrations/definitions.ts`, including
-  `workflow_dispatch` runs on such refs, pause and drain admission before
+  `workflow_dispatch` runs on such refs, first reject newly added migration
+  definitions without the rollback marker, then pause and drain admission before
   deploy and require the live pre-deploy supervisor's cutover evidence to
   advertise
   `schema-migrations-name-additive-rollback-compatible/v1` before the new image
@@ -128,9 +129,10 @@ rollback-compatible migration runner first and confirm
 release apply additive future migrations marked in `schema_migrations.name` with
 ` [rollback-compatible:additive/v1]`. The deploy workflow enforces that proof
 for push and `workflow_dispatch` runs on refs that change
-`supervisor/src/persistence/migrations/definitions.ts` before the new supervisor
-image can open SQLite. Unmarked or malformed future ledger rows remain
-startup-fatal for rollback safety.
+`supervisor/src/persistence/migrations/definitions.ts`; it also rejects newly
+added migration definitions missing the marker before the new supervisor image
+can open SQLite. Unmarked or malformed future ledger rows remain startup-fatal
+for rollback safety.
 
 The cutover client executes inside the Fly machine and reads
 `OT_DEPLOY_TOKEN` there. GitHub Actions never stores or receives that token.

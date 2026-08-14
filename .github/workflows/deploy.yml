@@ -137,6 +137,13 @@ jobs:
       EXPECTED_MIGRATION_ROLLBACK_CONTRACT: schema-migrations-name-additive-rollback-compatible/v1
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate migration rollback markers
+        if: needs.changes.outputs.database_migrations == 'true'
+        env:
+          MIGRATION_DIFF_BASE: ${{ github.event.before || format('origin/{0}', github.event.repository.default_branch) }}
+        run: node supervisor/scripts/verify-migration-rollback-markers.mjs
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Ensure the Fly app and data volume exist
         run: |

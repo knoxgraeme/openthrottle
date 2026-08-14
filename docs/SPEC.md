@@ -988,10 +988,12 @@ malformed suffix.
 The deploy workflow treats changes to
 `supervisor/src/persistence/migrations/definitions.ts` as migration-bearing
 releases, including `workflow_dispatch` runs on such refs: before deployment it
-pauses admission, waits for a clear drain, and requires the live pre-deploy
+rejects any newly added migration definition without the marker suffix, pauses
+admission, waits for a clear drain, and requires the live pre-deploy
 supervisor's cutover evidence to expose that database contract. This preserves
 the initial precursor bootstrap while making later migration-bearing releases
-prove rollback compatibility before they open SQLite.
+prove rollback compatibility before they open SQLite or write unmarked future
+ledger rows.
 
 Citation-backed proposal flows use a separate provider-neutral citation gate.
 `/analysis/citations/grade` is still the only production path that resolves
@@ -1229,8 +1231,9 @@ a snapshot build must supply the exact expected snapshot explicitly.
 Any cutover release that adds a schema migration must also verify the live
 pre-deploy supervisor's `/deployment/cutover-evidence` includes the expected
 `schema-migrations-name-additive-rollback-compatible/v1` database contract
-before it opens and mutates SQLite. The deploy workflow enforces this for
-push and `workflow_dispatch` runs on refs that change
+and reject newly added migration definitions that lack the exact marker suffix
+before it opens and mutates SQLite. The deploy workflow enforces this for push
+and `workflow_dispatch` runs on refs that change
 `supervisor/src/persistence/migrations/definitions.ts`; the standalone
 precursor release itself remains a supervisor-only bootstrap because its parent
 cannot yet advertise the contract.
