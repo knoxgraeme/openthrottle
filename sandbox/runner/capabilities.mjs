@@ -111,7 +111,7 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
     contexts: ["none"],
     artifacts: ["stage_result", "execution_graph_result"],
   },
-  "loop-action@2": {
+  "loop-action@3": {
     kind: "loop_action",
     minimumCredentials: ["model.invoke", "repo.read"],
     allowedCredentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
@@ -143,7 +143,7 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
 
 export const RUNTIME_DESCRIPTOR = Object.freeze({
   schema: "openthrottle.runtime-capabilities/v1",
-  release: "openthrottle-snapshot/v12",
+  release: "openthrottle-snapshot/v13",
   generatedBy: "sandbox-runtime-build",
   protocol: STAGE_EXECUTOR_PROTOCOL,
   capabilities: Object.keys(CAPABILITY_CONTRACTS).sort(),

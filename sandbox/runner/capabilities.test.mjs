@@ -15,7 +15,7 @@ describe("installed stage capabilities", () => {
     expect(canonicalJson(RUNTIME_DESCRIPTOR)).not.toContain("ce-implement-v1.yaml");
     expect(RUNTIME_DESCRIPTOR.capabilities).not.toContain("repository/publish@1");
     expect(RUNTIME_DESCRIPTOR.executors).not.toContain("publish");
-    expect(RUNTIME_DESCRIPTOR.capabilities).toContain("loop-action@2");
+    expect(RUNTIME_DESCRIPTOR.capabilities).toContain("loop-action@3");
     expect(RUNTIME_DESCRIPTOR.capabilities).toEqual(expect.arrayContaining(REVIEW_PERSONA_CAPABILITIES));
     expect(RUNTIME_DESCRIPTOR.executors).toContain("loop_action");
     expect(RUNTIME_DESCRIPTOR.executors).toContain("supervisor");
@@ -66,7 +66,7 @@ describe("installed stage capabilities", () => {
       requiredArtifacts: ["stage_result"],
     }).kind).toBe("agent");
     expect(authorizeCapability({
-      capability: "loop-action@2",
+      capability: "loop-action@3",
       contextPolicy: "prefer_resume",
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
       requiredArtifacts: ["stage_result"],

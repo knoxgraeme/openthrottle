@@ -634,7 +634,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     if (action.request_payload) {
       try {
         const request = JSON.parse(action.request_payload) as { protocol?: unknown; baseSubject?: unknown };
-        if (request.protocol === "loop-action@2" &&
+        if (request.protocol === "loop-action@3" &&
             typeof request.baseSubject === "string" &&
             GIT_SUBJECT.test(request.baseSubject)) {
           return request.baseSubject;
@@ -791,7 +791,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     timeoutMs: number;
   }): LoopActionRequest[] =>
     input.fanout.personas.map((persona) => buildLoopActionRequest({
-      protocol: "loop-action@2",
+      protocol: "loop-action@3",
       actionId: fanoutActionId(input.action, persona.id),
       attemptId: input.action.parent_attempt_id,
       graphId: input.action.execution_graph_id,
@@ -852,7 +852,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     timeoutMs: number;
     priorEvidence?: LoopActionRequest["priorEvidence"];
   }): LoopActionRequest => buildLoopActionRequest({
-    protocol: "loop-action@2",
+    protocol: "loop-action@3",
     actionId: selectorActionId(input.action),
     attemptId: input.action.parent_attempt_id,
     graphId: input.action.execution_graph_id,
@@ -918,7 +918,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     model?: string;
     timeoutMs: number;
   }): LoopActionRequest => buildLoopActionRequest({
-    protocol: "loop-action@2",
+    protocol: "loop-action@3",
     actionId: validatorActionId(input.action),
     attemptId: input.action.parent_attempt_id,
     graphId: input.action.execution_graph_id,
@@ -1947,7 +1947,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       return { requestHash: selectorRequest.requestHash, nativeSessionId: null };
     }
     const loopRequest = buildLoopActionRequest({
-      protocol: "loop-action@2",
+      protocol: "loop-action@3",
       actionId: action.id,
       attemptId: action.parent_attempt_id,
       graphId: action.execution_graph_id,
@@ -2317,7 +2317,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       try {
         if (!action.request_payload) throw new Error("missing persisted selector request");
         request = JSON.parse(action.request_payload) as LoopActionRequest;
-        if (request.protocol !== "loop-action@2" || request.skill !== "select-review-personas") {
+        if (request.protocol !== "loop-action@3" || request.skill !== "select-review-personas") {
           throw new Error("final review request is not the sealed selector action");
         }
       } catch (error) {

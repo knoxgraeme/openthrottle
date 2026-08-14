@@ -419,7 +419,7 @@ const unsignedPackage = {
 };
 const repositorySkill = { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) };
 const base = {
-  protocol: "loop-action@2",
+  protocol: "loop-action@3",
   actionId: "action-current",
   attemptId: "attempt-current",
   graphId: "graph-1",
@@ -456,7 +456,7 @@ import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs
 const requestPath = process.argv[2];
 const candidateSubject = process.argv[3];
 const base = {
-  protocol: "loop-action@2",
+  protocol: "loop-action@3",
   actionId: "action-lead",
   attemptId: "attempt-current",
   graphId: "graph-1",
@@ -493,7 +493,7 @@ import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs
 const requestPath = process.argv[2];
 const inputSubject = process.argv[3];
 const base = {
-  protocol: "loop-action@2",
+  protocol: "loop-action@3",
   actionId: "action-reviewer",
   attemptId: "attempt-current",
   graphId: "graph-1",
@@ -530,7 +530,7 @@ import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs
 const requestPath = process.argv[2];
 const candidateSubject = process.argv[3];
 const base = {
-  protocol: "loop-action@2",
+  protocol: "loop-action@3",
   actionId: "action-builtin",
   attemptId: "attempt-current",
   graphId: "graph-1",
@@ -782,7 +782,7 @@ import { createLoopRequestHash } from "/opt/openthrottle/runner/execute-loop.mjs
 
 const [requestPath, actionId, worktreeId] = process.argv.slice(2);
 const base = {
-  protocol: "loop-action@2",
+  protocol: "loop-action@3",
   actionId,
   attemptId: "attempt-current",
   graphId: "graph-1",

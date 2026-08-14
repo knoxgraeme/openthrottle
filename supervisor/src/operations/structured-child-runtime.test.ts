@@ -936,7 +936,7 @@ describe("structured child runtime review fanout", () => {
       request_hash: "9".repeat(64),
       request_launch_state: "launched",
       request_payload: canonicalJson({
-        protocol: "loop-action@2",
+        protocol: "loop-action@3",
         actionId: "lead-fanout-collect",
         attemptId: "parent-attempt",
         graphId: "graph-1",
@@ -1699,7 +1699,7 @@ describe("structured child runtime repair fences", () => {
 
   it("re-dispatches (and so re-stages a fresh credential envelope for) a prepared/worktree_ready replay instead of assuming the prior invocation is still credentialed", async () => {
     const requestPayload: LoopActionRequest = {
-      protocol: "loop-action@2",
+      protocol: "loop-action@3",
       actionId: "implement-worktree-ready-replay",
       attemptId: "parent-attempt",
       graphId: "graph-1",
@@ -2771,7 +2771,7 @@ describe("structured child runtime repair fences", () => {
       execution_unit_id: null,
       request_hash: requestHash,
       request_payload: canonicalJson({
-        protocol: "loop-action@2",
+        protocol: "loop-action@3",
         baseSubject: integratedSubject,
       }),
       request_launch_state: "launched",

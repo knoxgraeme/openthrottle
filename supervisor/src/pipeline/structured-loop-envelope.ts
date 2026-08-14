@@ -628,7 +628,7 @@ function loopRequestProbe(input: {
 }): Record<string, unknown> {
   const expectedProducerSkill = expectedSkillFor(input.binding);
   const requestWithoutFence = {
-    protocol: "loop-action@2",
+    protocol: "loop-action@3",
     actionId: "execution-work-" + "c".repeat(32),
     attemptId: "attempt-" + "a".repeat(32),
     graphId: "execution-graph-" + "d".repeat(32),

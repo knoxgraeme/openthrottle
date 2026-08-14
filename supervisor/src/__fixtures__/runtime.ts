@@ -56,7 +56,7 @@ export function buildInstalledRuntimeDescriptor(
       "correctness-dataflow@1",
       "data-migration@1",
       "graph/for-each-unit@1",
-      "loop-action@2",
+      "loop-action@3",
       "performance@1",
       "project-standards@1",
       "provider/wait@1",

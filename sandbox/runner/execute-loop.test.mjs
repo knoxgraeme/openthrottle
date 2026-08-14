@@ -108,7 +108,7 @@ function request(overrides = {}) {
     process.env.OT_LOOP_ACTION_ROOT = actionRoot;
   }
   const withoutFence = {
-    protocol: "loop-action@2",
+    protocol: "loop-action@3",
     actionId: "action-1",
     attemptId: "attempt-1",
     graphId: "graph-1",
@@ -176,7 +176,7 @@ function repositorySkillRequest() {
   process.env.OT_WORKTREE_ROOT = rootDir;
   const repositorySkill = repositorySkillPackage(worktreeDir);
   const withoutFence = {
-    protocol: "loop-action@2",
+    protocol: "loop-action@3",
     actionId: "action-repo-skill",
     attemptId: "attempt-repo-skill",
     graphId: "graph-1",
@@ -314,6 +314,15 @@ function standardReceipt(loopRequest, overrides = {}) {
   };
 }
 
+function narratedJson(value) {
+  return [
+    "Completed the action. Returning the receipt now.",
+    "```json",
+    JSON.stringify(value),
+    "```",
+  ].join("\n");
+}
+
 function executeLoopActionWithIntegration(options) {
   return executeLoopAction({
     integrationRepoDir: repository(),
@@ -393,6 +402,7 @@ describe("loop action request validation", () => {
         contextPolicy: "fresh",
         allowedMcpServers: [],
         credentialScopes: ["model.invoke", "repo.read"],
+        expectedReceiptType: "semantic_review",
       }));
       expect(valid).toMatchObject({ role: "reviewer", loop: "review", skill, worktree: null });
     }
@@ -404,6 +414,7 @@ describe("loop action request validation", () => {
       worktree: null,
       inputSubject: "b".repeat(40),
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      expectedReceiptType: "semantic_review",
     });
     expect(() => validateLoopRequest(writable)).toThrow(/structured loop actions cannot request repo.write/);
 
@@ -414,19 +425,53 @@ describe("loop action request validation", () => {
       worktree: null,
       inputSubject: undefined,
       credentialScopes: ["model.invoke", "repo.read"],
+      expectedReceiptType: "semantic_review",
     });
     expect(() => validateLoopRequest(unfencedSubject)).toThrow(/requires an exact input subject/);
   });
 
-  it("keeps loop-action@2 backward-compatible when parentRunId is absent", () => {
-    const { parentRunId: _parentRunId, requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...legacyWithoutFence } = request();
+  it("rejects loop-action@2 requests instead of preserving wire compatibility", () => {
+    const valid = request();
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...withoutFence } = valid;
+    const legacyWithoutFence = { ...withoutFence, protocol: "loop-action@2" };
     const legacy = { ...legacyWithoutFence, ...createLoopRequestHash(legacyWithoutFence) };
 
-    expect(validateLoopRequest(legacy)).toMatchObject({
-      actionId: "action-1",
-      worktree: { id: "unit-1" },
-    });
-    expect(validateLoopRequest(legacy)).not.toHaveProperty("parentRunId");
+    expect(() => validateLoopRequest(legacy)).toThrow(/protocol is unsupported/);
+  });
+
+  it.each([
+    ["worker", "implement", "unit_completion", { skill: "implement-unit", worktree: { id: "unit-1" } }],
+    ["worker", "simplify", "unit_completion", { skill: "simplify-unit", worktree: { id: "unit-1" } }],
+    ["worker", "repair", "unit_completion", { skill: "repair-unit", worktree: { id: "unit-1" } }],
+    ["worker", "command", "command_result", { skill: "implement-unit", worktree: { id: "unit-1" } }],
+    ["lead", "lead", "unit_decision", { skill: "accept-unit", worktree: null, candidateSubject: "a".repeat(40) }],
+    ["reviewer", "review", "semantic_review", { skill: "final-review", worktree: null, inputSubject: "b".repeat(40) }],
+    ["publisher", "publish", "publish_subject", { skill: "publish", worktree: null, credentialScopes: ["model.invoke", "repo.read", "repo.write"] }],
+  ])("binds %s/%s loop requests to %s receipts", (role, loop, expectedReceiptType, overrides) => {
+    const valid = validateLoopRequest(request({ role, loop, expectedReceiptType, ...overrides }));
+    expect(valid).toMatchObject({ role, loop, expectedReceiptType });
+
+    const wrongWithoutFence = {
+      ...valid,
+      expectedReceiptType: expectedReceiptType === "unit_completion" ? "semantic_review" : "unit_completion",
+    };
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...unfenced } = wrongWithoutFence;
+    expect(() => validateLoopRequest({ ...unfenced, ...createLoopRequestHash(unfenced) }))
+      .toThrow(/expected receipt type must be/);
+  });
+
+  it("hash-binds the sealed expected receipt type", () => {
+    const valid = request();
+    expect(() => validateLoopRequest({
+      ...valid,
+      role: "reviewer",
+      loop: "review",
+      skill: "final-review",
+      worktree: null,
+      inputSubject: "b".repeat(40),
+      expectedReceiptType: "semantic_review",
+    }))
+      .toThrow(/stale/);
   });
 
   it("accepts deterministic path-safe selector, persona, and validator review action ids", () => {
@@ -447,6 +492,7 @@ describe("loop action request validation", () => {
         contextPolicy: "fresh",
         allowedMcpServers: [],
         credentialScopes: ["model.invoke", "repo.read"],
+        expectedReceiptType: "semantic_review",
       }))).toMatchObject({ actionId, role: "reviewer", loop: "review", skill });
     }
   });
@@ -501,7 +547,7 @@ describe("loop action request validation", () => {
 
   it("rejects absolute worktree paths and writes action-attempt scoped result paths", () => {
     const withPath = {
-      protocol: "loop-action@2",
+      protocol: "loop-action@3",
       actionId: "action-2",
       attemptId: "attempt-2",
       graphId: "graph-1",
@@ -888,6 +934,7 @@ describe("loop action request validation", () => {
       worktree: null,
       inputSubject: "2".repeat(40),
       credentialScopes: ["repo.read"],
+      expectedReceiptType: "semantic_review",
     });
     const fixedSubject = { base: "1".repeat(40), pre: "1".repeat(40), post: "2".repeat(40) };
     const baseFence = { ...standardReceipt(request()).fence, unit_id: "__final__" };
@@ -1947,6 +1994,7 @@ describe("loop action request validation", () => {
       worktree: null,
       candidateSubject,
       credentialScopes: ["repo.read"],
+      expectedReceiptType: "unit_decision",
     }));
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
     directories.push(actionRoot);
@@ -2019,6 +2067,7 @@ describe("loop action request validation", () => {
       worktree: null,
       candidateSubject,
       credentialScopes: ["repo.read"],
+      expectedReceiptType: "unit_decision",
     }));
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
     directories.push(actionRoot);
@@ -2096,6 +2145,7 @@ describe("loop action request validation", () => {
         worktree: null,
         inputSubject: reviewSubject,
         credentialScopes: ["model.invoke", "repo.read"],
+        expectedReceiptType: "semantic_review",
       }));
       const expectedView = join(actionRoot, valid.attemptId, valid.actionId, "repo-view");
       const result = runLoopAgentInPreparedRepository({
@@ -3853,6 +3903,88 @@ describe("executeLoopAction", () => {
     }
   });
 
+  it.each([
+    ["missing", (receipt) => {
+      const { type: _type, ...withoutType } = receipt;
+      return withoutType;
+    }],
+    ["unknown", (receipt) => ({ ...receipt, type: "unit_complete" })],
+    ["cross-role", (receipt) => ({ ...receipt, type: "semantic_review" })],
+  ])("extracts and corrects a narrated fenced receipt with %s type", (_name, mutate) => {
+    const valid = request();
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = mutate(goodReceipt);
+    const runLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: narratedJson(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-narrated-type",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(runLoopAgent).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(result.receipt)).toEqual(goodReceipt);
+    const correctionState = JSON.parse(readFileSync(join(
+      process.env.OT_LOOP_ACTION_ROOT,
+      valid.attemptId,
+      valid.actionId,
+      "receipt-correction.json",
+    ), "utf8"));
+    expect(correctionState.diagnostics).toEqual([expect.objectContaining({ pointer: "/type" })]);
+  });
+
+  it("revalidates after type correction without deleting newly exposed payload fields", () => {
+    const valid = request();
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = {
+      ...goodReceipt,
+      type: "semantic_review",
+      payload: {
+        ...goodReceipt.payload,
+        status: "done",
+      },
+    };
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: vi.fn().mockReturnValueOnce({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: narratedJson(badReceipt),
+        stderr: "",
+        nativeSessionId: "native-type-full-revalidation",
+        integrationRepoDir: "/tmp/integration-current",
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result.outcome).toBe("failure");
+    expect(result.receipt).toContain("receipt correction exhausted");
+    expect(result.receipt).toContain("standard receipt payload has unknown field status");
+    const correctionState = JSON.parse(readFileSync(join(
+      process.env.OT_LOOP_ACTION_ROOT,
+      valid.attemptId,
+      valid.actionId,
+      "receipt-correction.json",
+    ), "utf8"));
+    expect(correctionState.diagnostics).toEqual([expect.objectContaining({ pointer: "/type" })]);
+  });
+
   it("does not rewrite semantic review content when correcting a sealed repair receipt type", () => {
     const valid = request({
       expectedReceiptType: "unit_completion",
@@ -3903,6 +4035,7 @@ describe("executeLoopAction", () => {
     expect(result.outcome).toBe("needs_human");
     expect(runLoopAgent).toHaveBeenCalledTimes(1);
     expect(result.receipt).toContain("receipt correction exhausted");
+    expect(result.receipt).toContain("loop receipt type mismatch");
     expect(result.receipt).toContain("standard receipt has an invalid result");
     const correctionState = JSON.parse(readFileSync(join(
       process.env.OT_LOOP_ACTION_ROOT,
@@ -5128,6 +5261,50 @@ describe("executeLoopAction", () => {
     expect(resumed.outcome).toBe("success");
     expect(resumed.native_session_id).toBe("native-correction");
     expect(resumed.codex_auth_json).toBe(rotatedCodexAuth);
+    expect(resumedRunLoopAgent).not.toHaveBeenCalled();
+    expect(JSON.parse(resumed.receipt)).toEqual(goodReceipt);
+  });
+
+  it("resumes a persisted receipt type correction without relaunching the implementation", () => {
+    const valid = request();
+    const goodReceipt = standardReceipt(valid);
+    const badReceipt = { ...goodReceipt, type: "semantic_review" };
+    const firstRunLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: narratedJson(badReceipt),
+      stderr: "",
+      nativeSessionId: "native-type-correction",
+      integrationRepoDir: "/tmp/integration-current",
+    });
+
+    const first = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: firstRunLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(first.outcome).toBe("success");
+    expect(firstRunLoopAgent).toHaveBeenCalledTimes(1);
+    const resumedRunLoopAgent = vi.fn(() => {
+      throw new Error("persisted receipt type correction must not relaunch the agent");
+    });
+
+    const resumed = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent: resumedRunLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:01.000Z",
+    });
+
+    expect(resumed.outcome).toBe("success");
+    expect(resumed.native_session_id).toBe("native-type-correction");
     expect(resumedRunLoopAgent).not.toHaveBeenCalled();
     expect(JSON.parse(resumed.receipt)).toEqual(goodReceipt);
   });

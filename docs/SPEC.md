@@ -209,7 +209,7 @@ For a `for_each_unit` node, the repository graph owns the ordered `phases`
 array. The platform owns the closed mechanism vocabulary and the security
 contract behind each mechanism:
 
-- `agent`: one sealed `loop-action@2` invocation in the unit worktree, using a
+- `agent`: one sealed `loop-action@3` invocation in the unit worktree, using a
   declared unit loop and its pinned worker/skill/MCP/credential/session scope.
 - `command`: one or more repository-configured command names, run by the
   executor without model credentials.
