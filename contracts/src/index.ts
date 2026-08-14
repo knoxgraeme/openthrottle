@@ -11,11 +11,14 @@ export {
 } from "./determinism-fixture.js";
 export {
   CONFIG_SCHEMA,
+  CONFIG_AGENTS,
   DEFAULT_CONFIG_LIMITS,
   GRAPH_SOURCE_KINDS,
+  REASONING_EFFORTS,
   parseRepositoryConfigContract,
   validateRepositoryConfigContract,
   type ConfigGraphSource,
+  type ConfigAgentDefault,
   type ConfigLimits,
   type ConfigMcpServer,
   type ConfigRepositorySkill,

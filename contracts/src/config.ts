@@ -16,6 +16,8 @@ import {
 
 export const CONFIG_SCHEMA = "openthrottle.config/v1" as const;
 export const GRAPH_SOURCE_KINDS = ["builtin", "repository"] as const;
+export const CONFIG_AGENTS = ["claude", "codex", "opencode"] as const;
+export const REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export const DEFAULT_CONFIG_LIMITS = Object.freeze({
   max_turns: 200,
   task_timeout: 7_200,
@@ -47,6 +49,11 @@ export interface ConfigRepositorySkill {
   tunable?: boolean;
 }
 
+export interface ConfigAgentDefault {
+  model?: string;
+  reasoning_effort?: (typeof REASONING_EFFORTS)[number];
+}
+
 export interface RepositoryConfigContract {
   schema: typeof CONFIG_SCHEMA;
   default_graph: string;
@@ -54,6 +61,7 @@ export interface RepositoryConfigContract {
   skills?: ConfigRepositorySkill[];
   agent?: string;
   model?: string;
+  agent_defaults?: Partial<Record<(typeof CONFIG_AGENTS)[number], ConfigAgentDefault>>;
   commands?: Record<string, string>;
   test?: string;
   lint?: string;
@@ -255,13 +263,28 @@ function parseIntent(value: unknown, path: string): { default_graph: string; all
   };
 }
 
+function parseAgentDefault(value: unknown, path: string, agent: string): ConfigAgentDefault {
+  const input = objectAt(value, path, ["model", "reasoning_effort"]);
+  if (agent === "opencode" && input.reasoning_effort !== undefined) {
+    fail(`${path}.reasoning_effort`, "is not supported for OpenCode");
+  }
+  return {
+    ...(input.model === undefined ? {} : {
+      model: stringAt(input.model, `${path}.model`, { max: 240, pattern: MODEL_REFERENCE }),
+    }),
+    ...(input.reasoning_effort === undefined ? {} : {
+      reasoning_effort: enumAt(input.reasoning_effort, `${path}.reasoning_effort`, REASONING_EFFORTS),
+    }),
+  };
+}
+
 export function validateRepositoryConfigContract(
   value: unknown,
   options: { source?: string } = {}
 ): ValidatedContract<RepositoryConfigContract> {
   const source = options.source ?? "config";
   const input = objectAt(value, source, [
-    "schema", "default_graph", "graphs", "skills", "agent", "model", "commands", "test", "lint", "build", "dev", "format",
+    "schema", "default_graph", "graphs", "skills", "agent", "model", "agent_defaults", "commands", "test", "lint", "build", "dev", "format",
     "post_bootstrap", "limits", "mcp_servers", "pipelines", "intents",
   ]);
   if (input.schema !== CONFIG_SCHEMA) fail(`${source}.schema`, `must be ${CONFIG_SCHEMA}`);
@@ -275,6 +298,12 @@ export function validateRepositoryConfigContract(
     }),
     ...(input.agent === undefined ? {} : { agent: stringAt(input.agent, `${source}.agent`, { pattern: IDENTIFIER }) }),
     ...(input.model === undefined ? {} : { model: stringAt(input.model, `${source}.model`, { max: 240, pattern: MODEL_REFERENCE }) }),
+    ...(input.agent_defaults === undefined ? {} : {
+      agent_defaults: recordAt(input.agent_defaults, `${source}.agent_defaults`, parseAgentDefault, {
+        max: CONFIG_AGENTS.length,
+        keyPattern: /^(?:claude|codex|opencode)$/,
+      }),
+    }),
     ...(commandAliases.commands === undefined ? {} : { commands: commandAliases.commands }),
     ...(commandAliases.aliases.test === undefined ? {} : { test: commandAliases.aliases.test }),
     ...(commandAliases.aliases.lint === undefined ? {} : { lint: commandAliases.aliases.lint }),

@@ -7,6 +7,7 @@ import {
   UNIT_PHASE_IDS,
   validateRepositoryConfigContract,
   type ConfigGraphSource,
+  type ConfigAgentDefault,
   type ConfigMcpServer,
   type ConfigRepositorySkill,
   type GraphUnitPhaseId,
@@ -250,6 +251,7 @@ export interface RepositoryPipelineConfig {
   skills?: ConfigRepositorySkill[];
   agent?: "claude" | "codex" | "opencode";
   model?: string;
+  agent_defaults?: Partial<Record<"claude" | "codex" | "opencode", ConfigAgentDefault>>;
   commands?: Record<string, string>;
   test?: string;
   lint?: string;
@@ -1095,6 +1097,7 @@ export function parseRepositoryConfig(raw: string, source = ".openthrottle.yml")
     ...(value.skills === undefined ? {} : { skills: value.skills }),
     ...(value.agent === undefined ? {} : { agent: enumAt(value.agent, `${source}.agent`, ["claude", "codex", "opencode"] as const) }),
     ...(value.model === undefined ? {} : { model: value.model }),
+    ...(value.agent_defaults === undefined ? {} : { agent_defaults: value.agent_defaults }),
     ...(value.commands === undefined ? {} : { commands: value.commands }),
     ...(value.test === undefined ? {} : { test: value.test }),
     ...(value.lint === undefined ? {} : { lint: value.lint }),

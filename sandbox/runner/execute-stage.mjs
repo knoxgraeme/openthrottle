@@ -614,6 +614,7 @@ export function defaultRunAgent({
   proposalPath,
   timeoutMs,
   model,
+  reasoningEffort,
   agent = request.agent,
   lockPersistentProfiles = lockRepositorySkillStagePersistentProfiles,
   restorePersistentProfiles = restorePersistentAgentPrivateRoots,
@@ -660,6 +661,7 @@ export function defaultRunAgent({
         "--output-format", "stream-json", "--verbose",
         ...(maxTurns ? ["--max-turns", maxTurns] : []),
         ...(model ? ["--model", model] : []),
+        ...(reasoningEffort ? ["--effort", reasoningEffort] : []),
         "--dangerously-skip-permissions",
         ...(mcpConfig ? ["--mcp-config", mcpConfig, "--strict-mcp-config"] : []),
         "--plugin-dir", "/opt/openthrottle/compound-engineering-marketplace",
@@ -678,6 +680,7 @@ export function defaultRunAgent({
       args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
         ...(process.env.OT_CODEX_HOOK_TRUST_FLAG === "1" ? ["--dangerously-bypass-hook-trust"] : []),
         "--skip-git-repo-check", "-C", repoDir, ...(model ? ["-m", model] : []),
+        ...(reasoningEffort ? ["-c", `model_reasoning_effort=\"${reasoningEffort}\"`] : []),
         ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])];
       if (invocation.mode !== "resume") stdin = prompt;
     } else {
@@ -1090,13 +1093,15 @@ export function executeStage({
     }
     if (!execution) {
       try {
+        const agentDefault = config.agent_defaults?.[request.agent];
         execution = runAgent({
           request,
           invocation,
           repoDir,
           proposalPath,
           timeoutMs,
-          model: config.model,
+          model: agentDefault?.model ?? (config.agent === request.agent ? config.model : undefined),
+          reasoningEffort: agentDefault?.reasoning_effort,
           agent: request.agent,
         });
         nativeSessionId = execution.nativeSessionId ?? nativeSessionId;

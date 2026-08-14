@@ -1741,6 +1741,15 @@ describe("structured child runtime repair fences", () => {
           command_names: "[]",
         }),
         getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+        getRepositoryConfigSnapshot: () => ({
+          digest: "f".repeat(64),
+          normalized_config: canonicalJson({
+            agent: "codex",
+            agent_defaults: {
+              codex: { model: "gpt-5.6-sol", reasoning_effort: "high" },
+            },
+          }),
+        }),
       } as any,
     });
 
@@ -1753,6 +1762,8 @@ describe("structured child runtime repair fences", () => {
       immutable_subject: "a".repeat(40),
       manifest_digest: "c".repeat(64),
       capability_digest: "d".repeat(64),
+      repository_config_snapshot_id: "config-1",
+      repository_config_digest: "f".repeat(64),
       normalized_manifest: canonicalJson({
         stages: [{
           id: "structured",
@@ -1766,7 +1777,6 @@ describe("structured child runtime repair fences", () => {
             worker: {
               id: "worker-1",
               agent: "inherit",
-              model: "gpt-5.1-code",
               allowed_mcp_servers: [],
             },
             credentials: ["model.invoke", "repo.read", "repo.write"],
@@ -1784,7 +1794,8 @@ describe("structured child runtime repair fences", () => {
       pipelineInstanceId: "instance-1",
       graphDigest: "c".repeat(64),
       parentRunId: "run-1",
-      model: "gpt-5.1-code",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "high",
       generation: 7,
       baseSubject: "a".repeat(40),
       recoveryBaseSubject: "a".repeat(40),
