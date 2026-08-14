@@ -978,6 +978,13 @@ release apply additive, rollback-compatible future migrations whose
 contract still validate every known migration name and checksum exactly, and
 they fail closed on any unknown future row without that exact suffix or with a
 malformed suffix.
+The deploy workflow treats changes to
+`supervisor/src/persistence/migrations/definitions.ts` as migration-bearing
+releases: before deployment it pauses admission, waits for a clear drain, and
+requires the live pre-deploy supervisor's cutover evidence to expose that
+database contract. This preserves the initial precursor bootstrap while making
+later migration-bearing releases prove rollback compatibility before they open
+SQLite.
 
 Citation-backed proposal flows use a separate provider-neutral citation gate.
 `/analysis/citations/grade` is still the only production path that resolves
@@ -1215,7 +1222,10 @@ a snapshot build must supply the exact expected snapshot explicitly.
 Any cutover release that adds a schema migration must also verify the live
 pre-deploy supervisor's `/deployment/cutover-evidence` includes the expected
 `schema-migrations-name-additive-rollback-compatible/v1` database contract
-before it opens and mutates SQLite.
+before it opens and mutates SQLite. The deploy workflow enforces this for
+changes to `supervisor/src/persistence/migrations/definitions.ts`; the
+standalone precursor release itself remains a supervisor-only bootstrap because
+its parent cannot yet advertise the contract.
 
 Optional/defaulted:
 
