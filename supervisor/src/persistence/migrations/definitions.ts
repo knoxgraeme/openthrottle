@@ -15,6 +15,9 @@ export interface DatabaseMigration extends DatabaseMigrationDefinition {
   checksum: string;
 }
 
+export const ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX = " [rollback-compatible:additive/v1]";
+export const MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT = "schema-migrations-name-additive-rollback-compatible/v1";
+
 function hasTable(db: Database.Database, name: string): boolean {
   return Boolean(
     db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name)
@@ -2322,6 +2325,37 @@ CREATE TABLE supervisor_maintenance (
 const supervisorMaintenanceMigrationSource = `${supervisorMaintenanceSchema}
 supervisor-maintenance-contract:admission pause and epoch are durable supervisor state; admissions capture epoch before async selection and atomically reject paused or stale epochs before creating pipeline instances, attempts, effects, publications, or journal entries/v1`;
 
+const deploymentCutoverSchema = `
+CREATE TABLE deployment_cutovers (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK(status IN ('active', 'completed', 'recovery_required')),
+  old_runtime_release TEXT NOT NULL,
+  old_snapshot TEXT NOT NULL,
+  candidate_snapshot TEXT NOT NULL,
+  pause_epoch INTEGER,
+  phase TEXT NOT NULL CHECK(phase IN (
+    'registered', 'paused', 'drain_clear', 'staged', 'deployed',
+    'verified', 'restored', 'recovery_required', 'resumed'
+  )),
+  evidence TEXT NOT NULL DEFAULT '',
+  recovery_command TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT
+);
+`;
+
+const deploymentCutoverOpenIndexSchema = `
+CREATE UNIQUE INDEX deployment_cutovers_open_idx
+  ON deployment_cutovers((1))
+  WHERE status IN ('active', 'recovery_required');
+`;
+
+const deploymentCutoverMigrationSql = `${deploymentCutoverSchema}${deploymentCutoverOpenIndexSchema}`;
+
+const deploymentCutoverMigrationSource = `${deploymentCutoverMigrationSql}
+deployment-cutover-contract:snapshot-changing deploys persist one resumable transaction with old release/snapshot, candidate snapshot, pause epoch, phase, and recovery evidence before staging or activating DAYTONA_SNAPSHOT/v1`;
+
 type GithubHeadSource =
   | { kind: "authoritative" }
   | { kind: "sequenced"; source: string; sequence: number };
@@ -3438,6 +3472,18 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (!hasTable(db, "supervisor_maintenance")) {
         db.exec(supervisorMaintenanceSchema);
+      }
+    },
+  },
+  {
+    version: 46,
+    name: `deployment-cutover-transaction${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+    source: deploymentCutoverMigrationSource,
+    up(db) {
+      if (!hasTable(db, "deployment_cutovers")) {
+        db.exec(deploymentCutoverMigrationSql);
+      } else if (!hasIndex(db, "deployment_cutovers_open_idx")) {
+        db.exec(deploymentCutoverOpenIndexSchema);
       }
     },
   },

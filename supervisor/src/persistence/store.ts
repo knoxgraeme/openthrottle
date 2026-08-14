@@ -16,6 +16,10 @@ import { createSteeringStore, type SteeringStore } from "./steering-store.js";
 import { createTuneStore, type TuneStore } from "./tune-store.js";
 import { createWorkStore } from "./work-store.js";
 import { createMaintenanceStore, type MaintenanceStore } from "./maintenance-store.js";
+import {
+  createDeploymentCutoverStore,
+  type DeploymentCutoverStore,
+} from "./deployment-cutover-store.js";
 import type { PipelineInstance, PipelineInstanceSeed } from "../pipeline/store.js";
 import type { Agent, TaskType } from "../pipeline/types.js";
 import type { FaultAttribution } from "../pipeline/fault-attribution.js";
@@ -182,7 +186,8 @@ export type SupervisorStore =
   SettingsStore &
   FeedbackCapability &
   TuneStore &
-  MaintenanceStore;
+  MaintenanceStore &
+  DeploymentCutoverStore;
 
 export interface PipelineAdmissionCapability {
   createInstance(seed: PipelineInstanceSeed): PipelineInstance;
@@ -205,6 +210,7 @@ export function createSupervisorStore(
   const workStore = createWorkStore(db);
   const settingsStore = createSettingsStore(db);
   const maintenanceStore = createMaintenanceStore(db);
+  const deploymentCutoverStore = createDeploymentCutoverStore(db);
   const deliveryStore = createDeliveryStore(db);
   const feedbackStore = createFeedbackStore(db, (issueId) =>
     settingsStore.getSetting(`github-head:${issueId}`)
@@ -270,6 +276,7 @@ export function createSupervisorStore(
     ...createTuneStore(db),
     ...settingsStore,
     ...maintenanceStore,
+    ...deploymentCutoverStore,
     ...feedbackCapability,
   };
 }

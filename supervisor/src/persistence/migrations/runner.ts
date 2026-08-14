@@ -1,16 +1,33 @@
 import type Database from "better-sqlite3";
-import { databaseMigrations } from "./definitions.js";
+import {
+  databaseMigrations,
+  ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+  type DatabaseMigration,
+} from "./definitions.js";
 
-export { databaseMigrations } from "./definitions.js";
+export {
+  databaseMigrations,
+  MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT,
+  ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+} from "./definitions.js";
 
-export const ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX = " [rollback-compatible:additive/v1]";
-export const MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT = "schema-migrations-name-additive-rollback-compatible/v1";
-
-function isMarkedRollbackCompatibleFutureMigration(name: string): boolean {
-  return name.endsWith(ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX);
+export interface DatabaseMigrationAuthority {
+  migrations: readonly DatabaseMigration[];
+  rollbackCompatibleMigrationNameSuffix: string;
 }
 
-export function applyDatabaseMigrations(db: Database.Database): void {
+/**
+ * Run the production migration algorithm under an explicit release authority.
+ *
+ * Keeping the catalog and rollback marker in the authority lets compatibility
+ * tests execute the same runtime path with a pinned predecessor catalog instead
+ * of maintaining a test-local approximation of the runner.
+ */
+export function applyDatabaseMigrationsForAuthority(
+  db: Database.Database,
+  authority: DatabaseMigrationAuthority
+): void {
+  const { migrations, rollbackCompatibleMigrationNameSuffix } = authority;
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version INTEGER PRIMARY KEY,
@@ -23,17 +40,20 @@ export function applyDatabaseMigrations(db: Database.Database): void {
     const applied = db.prepare(
       "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
     ).all() as Array<{ version: number; name: string; checksum: string }>;
-    const latestKnown = databaseMigrations.at(-1)?.version ?? 0;
+    const latestKnown = migrations.at(-1)?.version ?? 0;
     let hasFutureMigration = false;
     for (const row of applied) {
-      const expected = databaseMigrations.find((migration) => migration.version === row.version);
+      const expected = migrations.find((migration) => migration.version === row.version);
       if (expected) {
         if (row.name !== expected.name || row.checksum !== expected.checksum) {
           throw new Error(`schema migration ${row.version} checksum mismatch`);
         }
         continue;
       }
-      if (row.version > latestKnown && isMarkedRollbackCompatibleFutureMigration(row.name)) {
+      if (
+        row.version > latestKnown &&
+        row.name.endsWith(rollbackCompatibleMigrationNameSuffix)
+      ) {
         hasFutureMigration = true;
         continue;
       }
@@ -47,7 +67,7 @@ export function applyDatabaseMigrations(db: Database.Database): void {
       }
     }
     if (hasFutureMigration) {
-      const missing = databaseMigrations.find(
+      const missing = migrations.find(
         (migration) => !applied.some((row) => row.version === migration.version)
       );
       if (missing) {
@@ -59,8 +79,8 @@ export function applyDatabaseMigrations(db: Database.Database): void {
     return applied;
   };
   const initiallyApplied = new Set(validateLedger().map((row) => row.version));
-  if (databaseMigrations.every((migration) => initiallyApplied.has(migration.version))) return;
-  const applyOrdinaryBatch = (batch: typeof databaseMigrations): void => {
+  if (migrations.every((migration) => initiallyApplied.has(migration.version))) return;
+  const applyOrdinaryBatch = (batch: readonly DatabaseMigration[]): void => {
     if (batch.length === 0) return;
     db.transaction(() => {
       const applied = new Set(validateLedger().map((row) => row.version));
@@ -73,8 +93,8 @@ export function applyDatabaseMigrations(db: Database.Database): void {
       }
     }).exclusive();
   };
-  let ordinaryBatch: typeof databaseMigrations = [];
-  for (const migration of databaseMigrations) {
+  let ordinaryBatch: DatabaseMigration[] = [];
+  for (const migration of migrations) {
     if (migration.mode !== "foreign-keys-off") {
       ordinaryBatch.push(migration);
       continue;
@@ -103,4 +123,11 @@ export function applyDatabaseMigrations(db: Database.Database): void {
     }
   }
   applyOrdinaryBatch(ordinaryBatch);
+}
+
+export function applyDatabaseMigrations(db: Database.Database): void {
+  applyDatabaseMigrationsForAuthority(db, {
+    migrations: databaseMigrations,
+    rollbackCompatibleMigrationNameSuffix: ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+  });
 }
