@@ -150,17 +150,75 @@ function topLevelMigrationObjects(source) {
   throw new Error("could not statically parse the database migration definitions array");
 }
 
+function isObjectFreezeCall(value, argument) {
+  return ts.isCallExpression(value) &&
+    value.arguments.length === 1 &&
+    value.arguments[0] === argument &&
+    ts.isPropertyAccessExpression(value.expression) &&
+    ts.isIdentifier(value.expression.expression) &&
+    value.expression.expression.text === "Object" &&
+    value.expression.name.text === "freeze";
+}
+
+function isStringLiteral(value, expected) {
+  return ts.isStringLiteral(value) && value.text === expected;
+}
+
+function isMigrationProperty(value, expected) {
+  return ts.isPropertyAccessExpression(value) &&
+    ts.isIdentifier(value.expression) &&
+    value.expression.text === "migration" &&
+    value.name.text === expected;
+}
+
+function isCanonicalChecksumInitializer(value) {
+  if (
+    !ts.isCallExpression(value) ||
+    value.arguments.length !== 1 ||
+    !isStringLiteral(value.arguments[0], "hex") ||
+    !ts.isPropertyAccessExpression(value.expression) ||
+    value.expression.name.text !== "digest"
+  ) return false;
+  const updateCall = value.expression.expression;
+  if (
+    !ts.isCallExpression(updateCall) ||
+    updateCall.arguments.length !== 1 ||
+    !ts.isPropertyAccessExpression(updateCall.expression) ||
+    updateCall.expression.name.text !== "update"
+  ) return false;
+  const createHashCall = updateCall.expression.expression;
+  if (
+    !ts.isCallExpression(createHashCall) ||
+    !ts.isIdentifier(createHashCall.expression) ||
+    createHashCall.expression.text !== "createHash" ||
+    createHashCall.arguments.length !== 1 ||
+    !isStringLiteral(createHashCall.arguments[0], "sha256")
+  ) return false;
+  const checksumMaterial = updateCall.arguments[0];
+  return ts.isTemplateExpression(checksumMaterial) &&
+    checksumMaterial.head.text === "" &&
+    checksumMaterial.templateSpans.length === 3 &&
+    isMigrationProperty(checksumMaterial.templateSpans[0].expression, "version") &&
+    checksumMaterial.templateSpans[0].literal.text === "\0" &&
+    isMigrationProperty(checksumMaterial.templateSpans[1].expression, "name") &&
+    checksumMaterial.templateSpans[1].literal.text === "\0" &&
+    isMigrationProperty(checksumMaterial.templateSpans[2].expression, "source") &&
+    checksumMaterial.templateSpans[2].literal.text === "";
+}
+
 function isExportedMigrationProjection(identifier, sourceFile) {
   const access = identifier.parent;
   if (!ts.isPropertyAccessExpression(access) || access.expression !== identifier || access.name.text !== "map") {
     return false;
   }
-  const call = access.parent;
-  if (!ts.isCallExpression(call) || call.expression !== access || call.arguments.length !== 1) return false;
-  const declaration = call.parent;
+  const mapCall = access.parent;
+  if (!ts.isCallExpression(mapCall) || mapCall.expression !== access || mapCall.arguments.length !== 1) return false;
+  const freezeCall = mapCall.parent;
+  if (!isObjectFreezeCall(freezeCall, mapCall)) return false;
+  const declaration = freezeCall.parent;
   if (
     !ts.isVariableDeclaration(declaration) ||
-    declaration.initializer !== call ||
+    declaration.initializer !== freezeCall ||
     !ts.isIdentifier(declaration.name) ||
     declaration.name.text !== "databaseMigrations"
   ) return false;
@@ -174,7 +232,7 @@ function isExportedMigrationProjection(identifier, sourceFile) {
     !statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
   ) return false;
 
-  const callback = call.arguments[0];
+  const callback = mapCall.arguments[0];
   if (
     !ts.isArrowFunction(callback) ||
     callback.parameters.length !== 1 ||
@@ -182,14 +240,19 @@ function isExportedMigrationProjection(identifier, sourceFile) {
     callback.parameters[0].name.text !== "migration"
   ) return false;
   const body = ts.isParenthesizedExpression(callback.body) ? callback.body.expression : callback.body;
-  if (!ts.isObjectLiteralExpression(body) || body.properties.length !== 2) return false;
-  const [migrationSpread, checksum] = body.properties;
+  if (!ts.isCallExpression(body) || body.arguments.length !== 1) return false;
+  const migration = body.arguments[0];
+  if (!isObjectFreezeCall(body, migration) || !ts.isObjectLiteralExpression(migration) || migration.properties.length !== 2) {
+    return false;
+  }
+  const [migrationSpread, checksum] = migration.properties;
   return ts.isSpreadAssignment(migrationSpread) &&
     ts.isIdentifier(migrationSpread.expression) &&
     migrationSpread.expression.text === "migration" &&
     ts.isPropertyAssignment(checksum) &&
     ts.isIdentifier(checksum.name) &&
-    checksum.name.text === "checksum";
+    checksum.name.text === "checksum" &&
+    isCanonicalChecksumInitializer(checksum.initializer);
 }
 
 function assertCanonicalDefinitionsUsage(source) {
@@ -235,6 +298,19 @@ function assertCanonicalDefinitionsUsage(source) {
     throw new Error(
       "database migration definitions may only be referenced by the canonical databaseMigrations export projection"
     );
+  }
+  const exportedCatalogIdentifiers = [];
+  function visitExportedCatalog(node) {
+    if (ts.isIdentifier(node) && node.text === "databaseMigrations") exportedCatalogIdentifiers.push(node);
+    ts.forEachChild(node, visitExportedCatalog);
+  }
+  visitExportedCatalog(sourceFile);
+  if (
+    exportedCatalogIdentifiers.length !== 1 ||
+    !ts.isVariableDeclaration(exportedCatalogIdentifiers[0].parent) ||
+    exportedCatalogIdentifiers[0].parent.name !== exportedCatalogIdentifiers[0]
+  ) {
+    throw new Error("databaseMigrations may only appear as the deeply frozen canonical export declaration");
   }
 }
 

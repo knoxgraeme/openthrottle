@@ -1371,6 +1371,24 @@ describe("database migrations", () => {
     })).toThrow(/incompatible newer schema version 46/i);
   });
 
+  it("rejects an unmarked protected migration before touching SQLite", () => {
+    db = new Database(":memory:");
+    expect(() => applyDatabaseMigrationsForAuthority(db!, {
+      migrations: [{
+        version: 47,
+        name: "unsafe-future-migration",
+        source: "CREATE TABLE unsafe (id TEXT);",
+        checksum: "unsafe",
+        up(database) {
+          database.exec("CREATE TABLE unsafe (id TEXT)");
+        },
+      }],
+      rollbackCompatibleMigrationNameSuffix: ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+    })).toThrow(/migration 47 is not rollback-compatible/);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'schema_migrations'").get()).toBeUndefined();
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'unsafe'").get()).toBeUndefined();
+  });
+
   it("creates only the missing deployment cutover index when the table already exists", () => {
     db = new Database(":memory:");
     const createdAt = "2026-08-14T00:00:00.000Z";

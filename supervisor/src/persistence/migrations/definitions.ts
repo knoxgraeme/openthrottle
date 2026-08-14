@@ -16,6 +16,7 @@ export interface DatabaseMigration extends DatabaseMigrationDefinition {
 }
 
 export const ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX = " [rollback-compatible:additive/v1]";
+export const ROLLBACK_COMPATIBLE_MIGRATION_REQUIRED_FROM_VERSION = 47;
 export const MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT = "schema-migrations-name-additive-rollback-compatible/v1";
 
 function hasTable(db: Database.Database, name: string): boolean {
@@ -3489,9 +3490,9 @@ const definitions: DatabaseMigrationDefinition[] = [
   },
 ];
 
-export const databaseMigrations: DatabaseMigration[] = definitions.map((migration) => ({
+export const databaseMigrations = Object.freeze(definitions.map((migration) => Object.freeze({
   ...migration,
   checksum: createHash("sha256")
     .update(`${migration.version}\0${migration.name}\0${migration.source}`)
     .digest("hex"),
-}));
+})));

@@ -17,10 +17,10 @@ function source(...definitions) {
     "const definitions: DatabaseMigrationDefinition[] = [",
     ...definitions,
     "];",
-    "export const databaseMigrations: DatabaseMigration[] = definitions.map((migration) => ({",
+    "export const databaseMigrations = Object.freeze(definitions.map((migration) => Object.freeze({",
     "  ...migration,",
-    '  checksum: createHash("sha256").update(migration.source).digest("hex"),',
-    "}));",
+    '  checksum: createHash("sha256").update(`${migration.version}\\0${migration.name}\\0${migration.source}`).digest("hex"),',
+    "})));",
     "",
   ].join("\n");
 }
@@ -31,10 +31,10 @@ function sourceWithCatalogUse(use, ...definitions) {
     ...definitions,
     "];",
     use,
-    "export const databaseMigrations: DatabaseMigration[] = definitions.map((migration) => ({",
+    "export const databaseMigrations = Object.freeze(definitions.map((migration) => Object.freeze({",
     "  ...migration,",
-    '  checksum: createHash("sha256").update(migration.source).digest("hex"),',
-    "}));",
+    '  checksum: createHash("sha256").update(`${migration.version}\\0${migration.name}\\0${migration.source}`).digest("hex"),',
+    "})));",
     "",
   ].join("\n");
 }
@@ -184,5 +184,25 @@ describe("migration rollback marker verifier", () => {
       `  { version: 47, name: "safe${suffix}", source: "" },`,
     ).replace("  checksum:", '  name: "unmarked",\n  checksum:');
     expect(() => assertMigrationNamesMarked(input)).toThrow(/canonical databaseMigrations export projection/);
+  });
+
+  it("rejects checksum side effects that mutate a later definition before projection", () => {
+    const input = source(
+      `  { version: 47, name: "one${suffix}", source: "" },`,
+      `  { version: 48, name: "two${suffix}", source: "" },`,
+    ).replace(
+      'createHash("sha256").update(`${migration.version}\\0${migration.name}\\0${migration.source}`).digest("hex")',
+      'eval(\'definitions[1].name = "unmarked"\')',
+    );
+    expect(() => assertMigrationNamesMarked(input)).toThrow(/canonical databaseMigrations export projection/);
+  });
+
+  it.each([
+    ["push mutation", 'databaseMigrations.push({ version: 48, name: "unmarked", source: "" });'],
+    ["alias mutation", 'const alias = databaseMigrations; alias.push({ version: 48, name: "unmarked", source: "" });'],
+    ["direct name mutation", 'databaseMigrations[0].name = "unmarked";'],
+  ])("rejects a post-export %s of the runtime catalog", (_label, use) => {
+    const input = `${source(`  { version: 47, name: "safe${suffix}", source: "" },`)}\n${use}\n`;
+    expect(() => assertMigrationNamesMarked(input)).toThrow(/deeply frozen canonical export/);
   });
 });

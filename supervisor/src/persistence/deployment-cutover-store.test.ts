@@ -61,6 +61,23 @@ describe("deployment cutover store", () => {
         completed_at: "2026-08-14T04:44:22.000Z",
       });
       expect(store.getOpenDeploymentCutover()).toBeUndefined();
+
+      const retry = store.beginDeploymentCutover({
+        oldRuntimeRelease: "openthrottle-snapshot/v12",
+        oldSnapshot: "openthrottle-v2-ce-old",
+        candidateSnapshot: "openthrottle-v2-ce-new",
+      });
+      expect(retry).toMatchObject({
+        id: "snapshot-cutover:openthrottle-v2-ce-new:attempt-2",
+        status: "active",
+        phase: "registered",
+        candidate_snapshot: "openthrottle-v2-ce-new",
+      });
+      expect(store.beginDeploymentCutover({
+        oldRuntimeRelease: "openthrottle-snapshot/v12",
+        oldSnapshot: "openthrottle-v2-ce-old",
+        candidateSnapshot: "openthrottle-v2-ce-new",
+      })).toEqual(retry);
     } finally {
       db.close();
     }
