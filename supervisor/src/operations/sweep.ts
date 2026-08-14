@@ -16,6 +16,16 @@ const MINUTE_MS = 60 * 1000;
 const WEBHOOK_REDELIVERY_PRUNE_LIMIT = 1_000;
 const EXECUTION_PRIVATE_ARTIFACT_RETENTION_DAYS = 30;
 const EXECUTION_PRIVATE_ARTIFACT_PRUNE_LIMIT = 100;
+// Monotonic settings key families (one row per external event, never
+// rewritten) that would otherwise grow without bound. Their rows are
+// idempotence/provenance markers for webhook replays, which the 7-day
+// delivery retention and provider redelivery windows bound well inside this.
+const MONOTONIC_SETTINGS_RETENTION_DAYS = 30;
+const MONOTONIC_SETTINGS_PREFIXES = [
+  "github-supervisor-comment:",
+  "feedback-snapshot-drained-at:",
+  "feedback-snapshot-drain-source:",
+] as const;
 
 function daysAgoIso(days: number): string {
   return new Date(Date.now() - days * DAY_MS).toISOString();
@@ -79,6 +89,17 @@ export async function runSweep(
     daysAgoIso(EXECUTION_PRIVATE_ARTIFACT_RETENTION_DAYS),
     EXECUTION_PRIVATE_ARTIFACT_PRUNE_LIMIT
   );
+  const monotonicSettingsCutoff = daysAgoIso(MONOTONIC_SETTINGS_RETENTION_DAYS);
+  for (const prefix of MONOTONIC_SETTINGS_PREFIXES) {
+    store.pruneSettings(prefix, monotonicSettingsCutoff);
+  }
+  // Accumulated head observations feed providerTimestampedGithubHeads()
+  // (providers/github/events.ts), which orders PR comments against the head
+  // history of a still-live ticket, so they keep the sweep's longest
+  // retention. The current head projection lives under separate per-issue
+  // keys (github-head:/github-head-observed-at:/...) that are never pruned,
+  // so only superseded historical heads can age out here.
+  store.pruneSettings("github-head-observation:", daysAgoIso(cfg.runOutcomeRetentionDays));
 }
 
 async function deleteOrphanSandboxes(

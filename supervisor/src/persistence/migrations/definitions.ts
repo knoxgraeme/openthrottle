@@ -2183,6 +2183,12 @@ const controlProviderRegistrationMigrationSource = `${controlProviderRegistratio
 registration authority is keyed by canonical github_repo with immutable control_provider/v1
 backfill-provider:existing route rows are linear/v1`;
 
+// Frozen v34 source (checksummed; never edit the string). Its PRAGMA
+// foreign_keys statements are silently ignored because the runner executes it
+// inside a transaction, so the drop/recreate below actually runs with foreign
+// keys ON. That is safe only while no other table declares a REFERENCES
+// clause into pipeline_publication_receipts or pipeline_effect_intents --
+// pinned by a regression fence in runner.test.ts.
 const controlPublicationVocabularySchema = `
 PRAGMA foreign_keys = OFF;
 CREATE TABLE pipeline_publication_receipts_control_v34 (
@@ -2356,6 +2362,10 @@ const deploymentCutoverMigrationSql = `${deploymentCutoverSchema}${deploymentCut
 
 const deploymentCutoverMigrationSource = `${deploymentCutoverMigrationSql}
 deployment-cutover-contract:snapshot-changing deploys persist one resumable transaction with old release/snapshot, candidate snapshot, pause epoch, phase, and recovery evidence before staging or activating DAYTONA_SNAPSHOT/v1`;
+
+const settingsUpdatedAtMigrationSource = `
+ALTER TABLE settings ADD COLUMN updated_at TEXT;
+settings-retention-contract:every settings write stamps its last write time so the sweep can prune monotonic key families by age; rows written before this migration or by a rolled-back predecessor keep NULL and are never pruned until rewritten/v1`;
 
 type GithubHeadSource =
   | { kind: "authoritative" }
@@ -2568,6 +2578,13 @@ function rekeyOrchestrationJournalIssues(db: Database.Database, rawTicketIds: st
   }
 }
 
+// Frozen v35 body (its behavior is pinned by the applied checksum ledger;
+// never change it). The PRAGMA foreign_keys below is silently ignored inside
+// the runner's transaction, so this migration actually runs with foreign keys
+// ON -- and depends on that: ALTER TABLE ... RENAME TO rewrites other tables'
+// REFERENCES clauses (execution_publication_events -> control_outbox) only
+// while foreign keys are enabled. Never "fix" this by moving it to
+// mode: "foreign-keys-off"; runner.test.ts fences the rewritten reference.
 function migrateNeutralControlIdentifiers(db: Database.Database): void {
   db.exec("PRAGMA foreign_keys = OFF");
   db.exec("PRAGMA defer_foreign_keys = ON");
@@ -3485,6 +3502,16 @@ const definitions: DatabaseMigrationDefinition[] = [
         db.exec(deploymentCutoverMigrationSql);
       } else if (!hasIndex(db, "deployment_cutovers_open_idx")) {
         db.exec(deploymentCutoverOpenIndexSchema);
+      }
+    },
+  },
+  {
+    version: 47,
+    name: "settings-updated-at [rollback-compatible:additive/v1]",
+    source: settingsUpdatedAtMigrationSource,
+    up(db) {
+      if (hasTable(db, "settings") && !hasColumns(db, "settings", ["updated_at"])) {
+        db.exec("ALTER TABLE settings ADD COLUMN updated_at TEXT");
       }
     },
   },

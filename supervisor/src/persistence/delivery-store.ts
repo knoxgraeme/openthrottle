@@ -530,10 +530,16 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
     },
     markDeliveryProcessed(deliveryId) {
       const processedAt = now();
+      // Only a claimed delivery may settle. Without the status fence a worker
+      // finishing after its lease expired could resurrect a delivery another
+      // worker already drove to 'dead' (or re-settle a requeued one) and erase
+      // the operator-visible failure. Silent no-op matches
+      // markLinearOutboxProcessed above: the caller's own claim is the fence.
       db.prepare(`
         UPDATE webhook_deliveries
         SET status = 'processed', processed_at = ?, next_attempt_at = NULL, last_error = NULL
         WHERE delivery_id = ?
+          AND status = 'processing'
       `).run(processedAt, deliveryId);
     },
     markDeliveryFailed(deliveryId, error, retryAt) {
@@ -628,10 +634,14 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
     },
     markSandboxEventProcessed(eventId) {
       const processedAt = now();
+      // Same fence as markDeliveryProcessed: only the claim holder's
+      // processing lease may settle the event; a late worker must not
+      // overwrite a state another worker has since advanced.
       db.prepare(`
         UPDATE sandbox_events
         SET status = 'processed', processed_at = ?, next_attempt_at = ?, last_error = NULL
         WHERE event_id = ?
+          AND status = 'processing'
       `).run(processedAt, processedAt, eventId);
     },
     markSandboxEventFailed(eventId, error, retryAt) {

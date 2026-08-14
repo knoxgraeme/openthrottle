@@ -45,7 +45,8 @@ function optionalBool(name: string, fallback: boolean): boolean {
 }
 
 function optionalAgent(name: string, fallback: Agent): Agent {
-  const value = process.env[name]?.trim().toLowerCase() ?? fallback;
+  const value = process.env[name]?.trim().toLowerCase();
+  if (!value) return fallback;
   if (value === "claude" || value === "codex" || value === "opencode") return value;
   throw new Error(`Env var ${name} must be claude, codex, or opencode, got: ${value}`);
 }
@@ -172,6 +173,9 @@ export function loadConfig(): Config {
   }
   if (cfg.deployToken === cfg.statusToken || cfg.deployToken === cfg.installSecret) {
     throw new Error("OT_DEPLOY_TOKEN must be distinct from OT_STATUS_TOKEN and OT_INSTALL_SECRET");
+  }
+  if (cfg.statusToken === cfg.installSecret) {
+    throw new Error("OT_STATUS_TOKEN must be distinct from OT_INSTALL_SECRET");
   }
   try {
     const url = new URL(cfg.supervisorUrl);

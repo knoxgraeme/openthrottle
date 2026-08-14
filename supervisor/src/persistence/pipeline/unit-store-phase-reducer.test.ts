@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { insertGateReceipt } from "./unit-store-phase-reducer.js";
+import { insertGateReceipt, markActionCompleted } from "./unit-store-phase-reducer.js";
 import type { ExecutionWorkAttempt } from "./unit-store.js";
 
 function fakeAction(): ExecutionWorkAttempt {
@@ -42,6 +42,63 @@ function fakeAction(): ExecutionWorkAttempt {
 // insertGateReceipt is the only runtime enforcement point short of the DB
 // CHECK constraint. These assert the fail-closed validation fires before any
 // write is attempted -- a bare, tableless DB proves it never reaches SQL.
+// markActionCompleted's UPDATE is fenced on the active statuses. Both store
+// callers pre-check the loaded status in the same transaction, so the throw is
+// today's unreachable backstop; these prove the fence itself fails closed
+// instead of silently dropping a completion. A minimal table is enough -- the
+// helper touches only execution_work_attempts.
+describe("markActionCompleted", () => {
+  function actionTable(): Database.Database {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE execution_work_attempts (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        result_hash TEXT,
+        output_subject TEXT,
+        receipt TEXT,
+        receipt_hash TEXT,
+        native_session_id TEXT,
+        completed_at TEXT,
+        updated_at TEXT
+      );
+    `);
+    return db;
+  }
+
+  it("completes an active action exactly once", () => {
+    const db = actionTable();
+    db.prepare("INSERT INTO execution_work_attempts (id, status) VALUES ('action-1', 'running')").run();
+
+    markActionCompleted(db, {
+      action: fakeAction(),
+      resultHash: "1".repeat(64),
+      outputSubject: "a".repeat(40),
+      timestamp: "2026-08-14T00:00:00.000Z",
+    });
+
+    expect(db.prepare("SELECT status, output_subject FROM execution_work_attempts WHERE id = 'action-1'").get())
+      .toEqual({ status: "completed", output_subject: "a".repeat(40) });
+  });
+
+  it("fails closed instead of silently dropping a completion for an inactive action", () => {
+    const db = actionTable();
+    for (const status of ["completed", "failed"]) {
+      db.prepare("DELETE FROM execution_work_attempts").run();
+      db.prepare("INSERT INTO execution_work_attempts (id, status) VALUES ('action-1', ?)").run(status);
+
+      expect(() => markActionCompleted(db, {
+        action: fakeAction(),
+        resultHash: "1".repeat(64),
+        outputSubject: "a".repeat(40),
+        timestamp: "2026-08-14T00:00:00.000Z",
+      })).toThrow("execution work attempt action-1 is not active");
+      expect(db.prepare("SELECT status FROM execution_work_attempts WHERE id = 'action-1'").get())
+        .toEqual({ status });
+    }
+  });
+});
+
 describe("insertGateReceipt", () => {
   it("fails closed on an unrecognized outcome before touching the database", () => {
     const db = new Database(":memory:");

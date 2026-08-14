@@ -181,7 +181,7 @@ CREATE TABLE IF NOT EXISTS repository_registrations (
   CHECK(control_provider <> 'linear' OR linear_team_key IS NOT NULL)
 );
 
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
 
 CREATE TABLE IF NOT EXISTS supervisor_maintenance (
   key TEXT PRIMARY KEY,

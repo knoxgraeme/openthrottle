@@ -1,3 +1,7 @@
+import Database from "better-sqlite3";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { openDb } from "./database.js";
 import { createDeploymentCutoverStore } from "./deployment-cutover-store.js";
@@ -80,6 +84,59 @@ describe("deployment cutover store", () => {
       })).toEqual(retry);
     } finally {
       db.close();
+    }
+  });
+
+  it("advances inside one immediate transaction so a writer cannot interleave with its read", () => {
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-cutover-txn-"));
+    const path = join(directory, "supervisor.db");
+    const db = openDb(path);
+    const interloper = new Database(path);
+    try {
+      interloper.pragma("busy_timeout = 0");
+      const cutoverId = createDeploymentCutoverStore(db, () => "2026-08-14T05:00:00.000Z")
+        .beginDeploymentCutover({
+          oldRuntimeRelease: "openthrottle-snapshot/v12",
+          oldSnapshot: "openthrottle-v2-ce-old",
+          candidateSnapshot: "openthrottle-v2-ce-new",
+        }).id;
+
+      // now() runs between advance's read and its update. A second connection
+      // writing there must hit the held write lock; if advance ever loses its
+      // immediate transaction, this write commits mid-advance and the
+      // read-modify-write silently resurrects the state it read.
+      let interleavedWrite: unknown;
+      const store = createDeploymentCutoverStore(db, () => {
+        try {
+          interloper.prepare(
+            "UPDATE deployment_cutovers SET evidence = 'interloper' WHERE id = ?"
+          ).run(cutoverId);
+          interleavedWrite = "committed";
+        } catch (error) {
+          interleavedWrite = error;
+        }
+        return "2026-08-14T05:00:01.000Z";
+      });
+
+      const advanced = store.advanceDeploymentCutover({
+        id: cutoverId,
+        phase: "resumed",
+        status: "completed",
+        evidence: "candidate deployed and admission resumed",
+      });
+
+      expect(interleavedWrite).toBeInstanceOf(Error);
+      expect((interleavedWrite as { code?: string }).code).toBe("SQLITE_BUSY");
+      expect(advanced).toMatchObject({
+        status: "completed",
+        phase: "resumed",
+        evidence: "candidate deployed and admission resumed",
+        completed_at: "2026-08-14T05:00:01.000Z",
+      });
+    } finally {
+      interloper.close();
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 

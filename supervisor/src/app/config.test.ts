@@ -103,6 +103,15 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow("OT_DEPLOY_TOKEN must be distinct");
   });
 
+  it("requires the operator status token to be distinct from the install secret", () => {
+    setRequiredEnv();
+    process.env.OT_STATUS_TOKEN = "shared-secret";
+    process.env.OT_INSTALL_SECRET = "shared-secret";
+    expect(() => loadConfig()).toThrow(
+      "OT_STATUS_TOKEN must be distinct from OT_INSTALL_SECRET"
+    );
+  });
+
   it("loads and validates the runtime resource retention window", () => {
     setRequiredEnv();
     process.env.RUNTIME_RESOURCE_RETENTION_MINUTES = "15";
@@ -168,5 +177,14 @@ describe("loadConfig", () => {
     setRequiredEnv();
     process.env.DEFAULT_AGENT = "opencode";
     expect(loadConfig().defaultAgent).toBe("opencode");
+  });
+
+  it("treats an empty or blank DEFAULT_AGENT as unset like every other optional var", () => {
+    setRequiredEnv();
+    process.env.DEFAULT_AGENT = "";
+    expect(loadConfig().defaultAgent).toBe("codex");
+
+    process.env.DEFAULT_AGENT = "   ";
+    expect(loadConfig().defaultAgent).toBe("codex");
   });
 });
