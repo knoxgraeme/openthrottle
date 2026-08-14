@@ -18,7 +18,11 @@ import { FAULT_ATTRIBUTIONS } from "../../pipeline/fault-attribution.js";
 import { ENGINES } from "../pipeline/run-outcome-store.js";
 import { createSettingsStore } from "../settings-store.js";
 import { considerCiGithubHead } from "../../providers/github/events.js";
-import { applyDatabaseMigrations, databaseMigrations } from "./runner.js";
+import {
+  applyDatabaseMigrations,
+  databaseMigrations,
+  ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+} from "./runner.js";
 
 let db: Database.Database | undefined;
 const temporaryDirectories: string[] = [];
@@ -1288,7 +1292,67 @@ describe("database migrations", () => {
     `).run()).not.toThrow();
   });
 
-  it("fails closed on a checksum mismatch or unknown newer version", () => {
+  it("accepts explicitly marked additive future migrations while preserving existing stores", () => {
+    db = openDb(":memory:");
+    const latestKnown = databaseMigrations.at(-1)!;
+    db.prepare(
+      "INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)"
+    ).run(
+      latestKnown.version + 1,
+      `future-additive${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      "future-checksum",
+      "2026-01-01T00:00:00.000Z"
+    );
+
+    expect(() => applyDatabaseMigrations(db!)).not.toThrow();
+
+    const settings = createSettingsStore(db);
+    settings.setSetting("rollback-compatible-future-test", "opened");
+    expect(settings.getSetting("rollback-compatible-future-test")).toBe("opened");
+  });
+
+  it("fails closed on incompatible future migration ledger rows", () => {
+    const latestKnown = databaseMigrations.at(-1)!;
+    const incompatibleFutureRows = [
+      {
+        name: "unmarked future",
+        rows: [{ version: latestKnown.version + 1, name: "future", checksum: "x" }],
+        error: /incompatible newer schema version/i,
+      },
+      {
+        name: "malformed marker",
+        rows: [{ version: latestKnown.version + 1, name: "future [rollback-compatible:additive/v2]", checksum: "x" }],
+        error: /incompatible newer schema version/i,
+      },
+      {
+        name: "mixed marked and unmarked future rows",
+        rows: [
+          {
+            version: latestKnown.version + 1,
+            name: `future-additive${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+            checksum: "x",
+          },
+          { version: latestKnown.version + 2, name: "future-unmarked", checksum: "y" },
+        ],
+        error: /incompatible newer schema version/i,
+      },
+    ];
+
+    for (const scenario of incompatibleFutureRows) {
+      db = new Database(":memory:");
+      applyDatabaseMigrations(db);
+      for (const row of scenario.rows) {
+        db.prepare(
+          "INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z')"
+        ).run(row.version, row.name, row.checksum);
+      }
+      expect(() => applyDatabaseMigrations(db!), scenario.name).toThrow(scenario.error);
+      db.close();
+      db = undefined;
+    }
+  });
+
+  it("fails closed on a known migration name or checksum mismatch", () => {
     db = new Database(":memory:");
     applyDatabaseMigrations(db);
     db.prepare("UPDATE schema_migrations SET checksum = 'tampered' WHERE version = 1").run();
@@ -1297,10 +1361,8 @@ describe("database migrations", () => {
     db.prepare("UPDATE schema_migrations SET checksum = ? WHERE version = 1").run(
       databaseMigrations[0].checksum
     );
-    db.prepare(
-      "INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (999, 'future', 'x', '2026-01-01T00:00:00.000Z')"
-    ).run();
-    expect(() => applyDatabaseMigrations(db!)).toThrow(/newer schema version/i);
+    db.prepare("UPDATE schema_migrations SET name = 'renamed' WHERE version = 1").run();
+    expect(() => applyDatabaseMigrations(db!)).toThrow(/checksum mismatch/i);
   });
 
   it("widens pipeline idle effects without losing queued effect data", () => {

@@ -115,6 +115,14 @@ the current `expected_snapshot`. The rollback pair is the previous supervisor
 image plus its exact `DAYTONA_SNAPSHOT`; resume only after cutover evidence
 shows that identity and a clear drain.
 
+Schema-migration cutovers also require a two-release sequence. Deploy the
+rollback-compatible migration runner first and confirm
+`/deployment/cutover-evidence` reports
+`schema-migrations-name-additive-rollback-compatible/v1`; only then may a later
+release apply additive future migrations marked in `schema_migrations.name` with
+` [rollback-compatible:additive/v1]`. Unmarked or malformed future ledger rows
+remain startup-fatal for rollback safety.
+
 The cutover client executes inside the Fly machine and reads
 `OT_DEPLOY_TOKEN` there. GitHub Actions never stores or receives that token.
 
