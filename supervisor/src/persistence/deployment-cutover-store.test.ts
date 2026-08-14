@@ -96,4 +96,68 @@ describe("deployment cutover store", () => {
       db.close();
     }
   });
+
+  it("keeps pre-stage and pre-deploy recovery evidence resumable for the same transaction", () => {
+    const db = openDb(":memory:");
+    try {
+      const store = createDeploymentCutoverStore(db, () => "2026-08-14T04:49:22.000Z");
+      const cutover = store.beginDeploymentCutover({
+        oldRuntimeRelease: "openthrottle-snapshot/v12",
+        oldSnapshot: "openthrottle-v2-ce-old",
+        candidateSnapshot: "openthrottle-v2-ce-new",
+      });
+
+      const preStage = store.advanceDeploymentCutover({
+        id: cutover.id,
+        phase: "recovery_required",
+        status: "recovery_required",
+        evidence: "candidate not staged yet",
+        recoveryCommand: "restore old snapshot and resume admission",
+      });
+      expect(preStage).toMatchObject({
+        status: "recovery_required",
+        phase: "recovery_required",
+        recovery_command: "restore old snapshot and resume admission",
+      });
+      expect(store.getOpenDeploymentCutover()).toEqual(preStage);
+
+      const staged = store.advanceDeploymentCutover({
+        id: cutover.id,
+        phase: "staged",
+        status: "active",
+        evidence: "candidate staged after drain clear",
+      });
+      expect(staged).toMatchObject({
+        status: "active",
+        phase: "staged",
+        recovery_command: "restore old snapshot and resume admission",
+      });
+
+      const preDeploy = store.advanceDeploymentCutover({
+        id: cutover.id,
+        phase: "recovery_required",
+        status: "recovery_required",
+        evidence: "candidate staged before deploy",
+        recoveryCommand: "restore old snapshot, deploy old runtime, and resume admission",
+      });
+      expect(preDeploy).toMatchObject({
+        status: "recovery_required",
+        phase: "recovery_required",
+        recovery_command: "restore old snapshot, deploy old runtime, and resume admission",
+      });
+
+      const deployed = store.advanceDeploymentCutover({
+        id: cutover.id,
+        phase: "deployed",
+        status: "active",
+        evidence: "candidate deployed and ready for verification",
+      });
+      expect(deployed).toMatchObject({
+        status: "active",
+        phase: "deployed",
+      });
+    } finally {
+      db.close();
+    }
+  });
 });

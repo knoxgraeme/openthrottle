@@ -160,7 +160,7 @@ jobs:
         # This supervisor-only fence release does not build a snapshot, so its
         # first push deploys without calling endpoints its parent lacks. Once
         # installed, every push that builds a new snapshot gates automatically.
-        if: inputs.prepare_v12_cutover || (github.event_name == 'push' && needs.snapshot.result == 'success')
+        if: inputs.prepare_v12_cutover || needs.snapshot.result == 'success'
         run: |
           set -euo pipefail
           if [[ -z "${EXPECTED_SNAPSHOT}" ]]; then
@@ -231,8 +231,18 @@ jobs:
 
           initial_evidence="$(cutover_command evidence)"
           printf '%s\n' "$initial_evidence" | jq .
-          old_release="$(printf '%s\n' "$initial_evidence" | jq -r '.runtime.release')"
-          old_snapshot="$(printf '%s\n' "$initial_evidence" | jq -r '.snapshot')"
+          open_candidate="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.candidate_snapshot // ""')"
+          if [[ -n "$open_candidate" ]]; then
+            if [[ "$open_candidate" != "$EXPECTED_SNAPSHOT" ]]; then
+              echo "open cutover candidate $open_candidate does not match expected snapshot $EXPECTED_SNAPSHOT" >&2
+              exit 1
+            fi
+            old_release="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.old_runtime_release')"
+            old_snapshot="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.old_snapshot')"
+          else
+            old_release="$(printf '%s\n' "$initial_evidence" | jq -r '.runtime.release')"
+            old_snapshot="$(printf '%s\n' "$initial_evidence" | jq -r '.snapshot')"
+          fi
           begin_payload="$(jq -nc \
             --arg oldRuntimeRelease "$old_release" \
             --arg oldSnapshot "$old_snapshot" \
@@ -272,9 +282,15 @@ jobs:
             sleep 10
           done
           advance_cutover drain_clear active "$evidence"
+          advance_cutover recovery_required recovery_required \
+            "candidate not staged yet; restore old runtime/snapshot and resume admission if runner is lost before staging" \
+            "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs resume'"
 
           flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="$EXPECTED_SNAPSHOT"
           advance_cutover staged active "candidate DAYTONA_SNAPSHOT staged only after drain_clear for epoch $pause_epoch"
+          advance_cutover recovery_required recovery_required \
+            "candidate DAYTONA_SNAPSHOT staged; restore old snapshot and inspect release if runner is lost before verification" \
+            "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl deploy --remote-only --app $FLY_APP --config supervisor/fly.toml --dockerfile supervisor/Dockerfile && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs resume'"
 
           flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
           deployed=1
@@ -304,7 +320,26 @@ jobs:
           fi
           trap - ERR
       - name: Deploy the supervisor
-        if: ${{ !(inputs.prepare_v12_cutover || (github.event_name == 'push' && needs.snapshot.result == 'success')) }}
+        if: ${{ !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}
         # Build from the repository root so the supervisor's file:../contracts
         # dependency is inside the Docker build context.
-        run: flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
+        run: |
+          set -euo pipefail
+          set +e
+          cutover_evidence="$(flyctl ssh console --app "$FLY_APP" --command \
+            "node /app/scripts/cutover-control.mjs evidence" 2>&1)"
+          cutover_status=$?
+          set -e
+          if (( cutover_status != 0 )); then
+            if printf '%s\n' "$cutover_evidence" | grep -qiE \
+              "Cannot find module.*cutover-control\\.mjs|MODULE_NOT_FOUND|evidence failed with status 404|no machines"; then
+              echo "cutover evidence endpoint is unavailable on the bootstrap runtime; proceeding with supervisor deploy"
+            else
+              echo "refusing supervisor-only deploy because cutover evidence is unavailable" >&2
+              exit "$cutover_status"
+            fi
+          elif printf '%s\n' "$cutover_evidence" | jq -e '.cutover != null' >/dev/null; then
+            echo "refusing supervisor-only deploy while a snapshot cutover is open" >&2
+            exit 1
+          fi
+          flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile

@@ -47,13 +47,23 @@ assert(
     deployWorkflow.includes("flyctl secrets set --stage --app \"$FLY_APP\" DAYTONA_SNAPSHOT=\"$old_snapshot\"") &&
     deployWorkflow.includes("advance_cutover restored active") &&
     deployWorkflow.includes("abort_cutover 1") &&
+    deployWorkflow.includes("open_candidate=\"$(printf '%s\\n' \"$initial_evidence\" | jq -r '.cutover.candidate_snapshot // \"\"')\"") &&
+    deployWorkflow.includes("old_release=\"$(printf '%s\\n' \"$initial_evidence\" | jq -r '.cutover.old_runtime_release')\"") &&
+    deployWorkflow.includes("old_snapshot=\"$(printf '%s\\n' \"$initial_evidence\" | jq -r '.cutover.old_snapshot')\"") &&
+    deployWorkflow.indexOf("advance_cutover recovery_required recovery_required") < deployWorkflow.indexOf("DAYTONA_SNAPSHOT=\"$EXPECTED_SNAPSHOT\"") &&
+    deployWorkflow.lastIndexOf("advance_cutover recovery_required recovery_required") < deployWorkflow.indexOf("flyctl deploy --remote-only --app \"$FLY_APP\" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile") &&
+    deployWorkflow.includes("refusing supervisor-only deploy while a snapshot cutover is open") &&
+    deployWorkflow.includes("refusing supervisor-only deploy because cutover evidence is unavailable") &&
+    deployWorkflow.includes("cutover evidence endpoint is unavailable on the bootstrap runtime") &&
+    deployWorkflow.includes("cutover_status=$?") &&
+    !deployWorkflow.includes("cutover-control.mjs evidence\" 2>/dev/null || true") &&
     deployWorkflow.includes(".drain.clear == true") &&
     deployWorkflow.includes(".admission.epoch == $epoch") &&
     deployWorkflow.includes(".runtime.release == $release") &&
     deployWorkflow.includes(".runtime.capabilityDigest == $digest") &&
     deployWorkflow.includes(".snapshot == $snapshot") &&
     deployWorkflow.includes("EXPECTED_SNAPSHOT") &&
-    deployWorkflow.includes("github.event_name == 'push' && needs.snapshot.result == 'success'"),
+    deployWorkflow.includes("if: inputs.prepare_v12_cutover || needs.snapshot.result == 'success'"),
   "deploy workflow must expose a fail-closed supervisor-only v12 cutover path"
 );
 assert(
