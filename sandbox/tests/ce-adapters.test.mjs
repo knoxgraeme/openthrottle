@@ -511,6 +511,7 @@ describe("OpenThrottle canonical task skills", () => {
         allowedMcpServers: [],
         credentialScopes: ["model.invoke", "repo.read"],
         receiptSchema: "openthrottle.receipt/v1",
+        expectedReceiptType: "semantic_review",
         expectedProducer: {
           workerId,
           skill: `builtin://${task}@1`,

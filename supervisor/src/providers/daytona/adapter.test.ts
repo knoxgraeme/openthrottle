@@ -28,6 +28,7 @@ function fencedLoopRequest(overrides: Partial<Omit<LoopActionRequest, "requestHa
     allowedMcpServers: ["github"],
     credentialScopes: ["model.invoke", "repo.read"] as const,
     receiptSchema: "openthrottle.receipt/v1",
+    expectedReceiptType: "unit_completion" as const,
     ...overrides,
   } as Omit<LoopActionRequest, "requestHash" | "idempotencyKey">;
   const { candidateSubject, ...withoutCandidateSubject } = withoutFence;
@@ -916,6 +917,7 @@ describe("Daytona stage execution", () => {
       allowedMcpServers: [],
       credentialScopes: ["repo.read"] as const,
       receiptSchema: "openthrottle.receipt/v1",
+      expectedReceiptType: "unit_decision" as const,
       candidateSubject: "a".repeat(40),
       requestHash: "",
       idempotencyKey: "",
@@ -1137,6 +1139,7 @@ describe("Daytona stage execution", () => {
       allowedMcpServers: [],
       credentialScopes: ["repo.read"] as const,
       receiptSchema: "openthrottle.receipt/v1",
+      expectedReceiptType: "unit_completion" as const,
       requestHash: "",
       idempotencyKey: "",
     };
@@ -1207,6 +1210,7 @@ describe("Daytona stage execution", () => {
       allowedMcpServers: [],
       credentialScopes: ["daytona.admin"],
       receiptSchema: "openthrottle.receipt/v1",
+      expectedReceiptType: "semantic_review" as const,
       requestHash: "",
       idempotencyKey: "",
     };

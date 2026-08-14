@@ -437,6 +437,7 @@ const base = {
   allowedMcpServers: [],
   credentialScopes: [],
   receiptSchema: "openthrottle.receipt/v1",
+  expectedReceiptType: "unit_completion",
   repositorySkill,
 };
 mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
@@ -474,6 +475,7 @@ const base = {
   allowedMcpServers: [],
   credentialScopes: [],
   receiptSchema: "openthrottle.receipt/v1",
+  expectedReceiptType: "unit_decision",
 };
 mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
 writeFileSync(requestPath, canonicalJson({ ...base, ...createLoopRequestHash(base) }), { mode: 0o400 });
@@ -510,6 +512,7 @@ const base = {
   allowedMcpServers: [],
   credentialScopes: [],
   receiptSchema: "openthrottle.receipt/v1",
+  expectedReceiptType: "semantic_review",
 };
 mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
 writeFileSync(requestPath, canonicalJson({ ...base, ...createLoopRequestHash(base) }), { mode: 0o400 });
@@ -546,6 +549,7 @@ const base = {
   allowedMcpServers: [],
   credentialScopes: [],
   receiptSchema: "openthrottle.receipt/v1",
+  expectedReceiptType: "unit_decision",
 };
 mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
 writeFileSync(requestPath, canonicalJson({ ...base, ...createLoopRequestHash(base) }), { mode: 0o400 });
@@ -796,6 +800,7 @@ const base = {
   allowedMcpServers: [],
   credentialScopes: [],
   receiptSchema: "openthrottle.receipt/v1",
+  expectedReceiptType: "unit_completion",
 };
 mkdirSync(dirname(requestPath), { recursive: true, mode: 0o700 });
 writeFileSync(requestPath, canonicalJson({ ...base, ...createLoopRequestHash(base) }), { mode: 0o400 });

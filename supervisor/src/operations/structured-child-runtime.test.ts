@@ -956,6 +956,7 @@ describe("structured child runtime review fanout", () => {
         allowedMcpServers: [],
         credentialScopes: ["model.invoke", "repo.read"],
         receiptSchema: "openthrottle.receipt/v1",
+        expectedReceiptType: "unit_decision",
         requestHash: "9".repeat(64),
         idempotencyKey: "lead",
       } satisfies LoopActionRequest),
@@ -1715,6 +1716,7 @@ describe("structured child runtime repair fences", () => {
       allowedMcpServers: [],
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
       receiptSchema: "openthrottle.receipt/v1",
+      expectedReceiptType: "unit_completion",
       requestHash: "b".repeat(64),
       idempotencyKey: "idem-implement-worktree-ready-replay",
     };

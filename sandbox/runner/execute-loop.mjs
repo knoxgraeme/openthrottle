@@ -98,6 +98,19 @@ const SKILLS = new Set([
 ]);
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
 const STANDARD_RECEIPT_SCHEMA = "openthrottle.receipt/v1";
+const STANDARD_RECEIPT_TYPES = new Set([
+  "unit_completion",
+  "unit_decision",
+  "semantic_review",
+  "command_result",
+  "candidate_evidence",
+  "integration_evidence",
+  "publish_subject",
+  "provider_evidence",
+  "human_approval",
+  "tune_analysis",
+  "tune_proposal",
+]);
 const PRIOR_EVIDENCE_SCHEMA = "openthrottle.loop-prior-evidence/v1";
 const DOWNSTREAM_CONTEXT_SCHEMA = "openthrottle.downstream-context/v1";
 const MODEL_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,239}$/;
@@ -538,7 +551,7 @@ export function validateLoopRequest(value) {
     "unitId", "generation", "role", "loop", "agent", "model", "skill", "worktree", "baseSubject", "recoveryBaseSubject", "inputSubject",
     "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
     "transitionContext", "tuneMaterial", "priorEvidence", "downstreamContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
-    "expectedProducerSkill", "expectedProducer", "repositorySkill", "requestHash", "idempotencyKey",
+    "expectedReceiptType", "expectedProducerSkill", "expectedProducer", "repositorySkill", "requestHash", "idempotencyKey",
   ]);
   const unknown = Object.keys(input).find((key) => !allowed.has(key));
   if (unknown) throw new Error(`loop request has unknown field ${unknown}`);
@@ -584,12 +597,14 @@ export function validateLoopRequest(value) {
     allowedMcpServers: boundedArray(input.allowedMcpServers, "allowedMcpServers"),
     credentialScopes: boundedArray(input.credentialScopes, "credentialScopes"),
     receiptSchema: string(input.receiptSchema, "receiptSchema", /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,159}$/),
+    expectedReceiptType: string(input.expectedReceiptType, "expectedReceiptType", /^[A-Za-z0-9_]{1,80}$/),
     ...(input.expectedProducerSkill === undefined
       ? {}
       : { expectedProducerSkill: string(input.expectedProducerSkill, "expectedProducerSkill", /^[A-Za-z0-9][A-Za-z0-9._:/@#-]{0,255}$/) }),
     ...(input.expectedProducer === undefined ? {} : { expectedProducer: expectedProducer(input.expectedProducer, "expectedProducer") }),
   };
   if (request.receiptSchema !== STANDARD_RECEIPT_SCHEMA) throw new Error("loop receipt schema is unsupported");
+  if (!STANDARD_RECEIPT_TYPES.has(request.expectedReceiptType)) throw new Error("loop expected receipt type is unsupported");
   if (!ROLES.has(request.role)) throw new Error("role is invalid");
   if (!LOOPS.has(request.loop)) throw new Error("loop is invalid");
   if (!AGENTS.has(request.agent)) throw new Error("agent is invalid");
@@ -698,6 +713,7 @@ function receiptAuthorityContract(request) {
     // `producer` here or an agent that echoes the contract verbatim would
     // produce a receipt the schema rejects.
     assurance: request.expectedProducer?.assurance ?? null,
+    expected_receipt_type: request.expectedReceiptType,
     native_session_id: request.nativeSessionId,
     request_hash: request.requestHash,
     subject: {
@@ -1407,6 +1423,8 @@ function jsonPointerFromLabel(label) {
   }
   const normalized = receiptLabel
     .replace(/^standard receipt(?:\s+|$)/, "")
+    .replace(/^has an invalid type$/, "type")
+    .replace(/^is missing field type$/, "type")
     .replace(/^payload\b/, "payload")
     .replace(/^producer\b/, "producer")
     .replace(/^subject\b/, "subject")
@@ -1487,6 +1505,7 @@ function setJsonPointer(value, pointer, replacement) {
 function correctionDiagnosticIsEnvelopeOnly(diagnostic) {
   if (/unknown field/.test(String(diagnostic.message))) return true;
   return diagnostic.pointer === "/schema" ||
+    diagnostic.pointer === "/type" ||
     /^\/(fence|subject|producer)\/[A-Za-z0-9_]+$/.test(diagnostic.pointer);
 }
 
@@ -1516,6 +1535,7 @@ function authoritativeCorrectionValues(request, subject) {
   const contract = receiptAuthorityContract(request);
   return new Map([
     ["/schema", STANDARD_RECEIPT_SCHEMA],
+    ["/type", request.expectedReceiptType],
     ["/fence/pipeline_instance_id", request.pipelineInstanceId],
     ["/fence/graph_digest", request.graphDigest],
     ["/fence/parent_run_id", request.parentRunId],
@@ -1592,9 +1612,21 @@ function receiptCorrectionDiagnostics({ errorMessage, invalidReceipt, request, s
   };
   const receiptValidationError = errorMessage.replace(/^loop action emitted invalid standard receipt:\s*/, "");
   const schemaMismatch = /^standard receipt (?:has an invalid schema|is missing field schema)$/.test(receiptValidationError);
+  const typeMismatch = /^standard receipt (?:has an invalid type|is missing field type)$/.test(receiptValidationError);
+  const sealedTypeMismatch = /^loop receipt type mismatch: expected [A-Za-z0-9_]+, received [A-Za-z0-9_]+$/.test(receiptValidationError);
   const envelopeMismatch = /^loop receipt (?:.*fence mismatch|.*subject mismatch|producer(?: skill)? mismatch)$/.test(errorMessage);
   if (schemaMismatch) {
     add("/schema", JSON.stringify(STANDARD_RECEIPT_SCHEMA), JSON.stringify(invalidReceipt?.schema), errorMessage);
+  } else if (typeMismatch || sealedTypeMismatch) {
+    add("/type", JSON.stringify(request.expectedReceiptType), JSON.stringify(invalidReceipt?.type), errorMessage);
+  } else if (invalidReceipt && typeof invalidReceipt === "object" && !Array.isArray(invalidReceipt) &&
+      invalidReceipt.type !== undefined && invalidReceipt.type !== request.expectedReceiptType) {
+    // A wrong but known type can make the schema validator report payload or
+    // result errors for that wrong role before the executor can compare the
+    // sealed type. Correct only /type; the corrected receipt is then
+    // revalidated as the expected role, so payload/result content still fails
+    // closed when it was not independently valid for that type.
+    add("/type", JSON.stringify(request.expectedReceiptType), JSON.stringify(invalidReceipt.type), errorMessage);
   } else if (!envelopeMismatch) {
     // Preserve the primary schema/semantic failure alongside any masked sealed
     // mismatches. Unknown fields are themselves correctable; other semantic
@@ -1609,7 +1641,7 @@ function receiptCorrectionDiagnostics({ errorMessage, invalidReceipt, request, s
     // mismatches too, so every otherwise parsed object receives all
     // authoritative envelope diagnostics in the same pass.
     for (const [pointer, expectedValue] of authoritativeCorrectionValues(request, subject)) {
-      if (pointer === "/schema" || expectedValue === undefined) continue;
+      if (pointer === "/schema" || pointer === "/type" || expectedValue === undefined) continue;
       const observed = valueAtPointer(invalidReceipt, pointer);
       if (observed !== expectedValue) add(pointer, JSON.stringify(expectedValue), JSON.stringify(observed), errorMessage);
     }
@@ -1936,6 +1968,9 @@ function privateRecoveryReference(artifact) {
 }
 
 function assertLoopReceiptFence(receipt, request, subject) {
+  if (receipt.type !== request.expectedReceiptType) {
+    throw new Error(`loop receipt type mismatch: expected ${request.expectedReceiptType}, received ${receipt.type}`);
+  }
   if (receipt.fence.attempt_id !== request.attemptId || receipt.fence.request_hash !== request.requestHash ||
       receipt.fence.action_attempt_id !== request.actionId) {
     throw new Error("loop receipt request fence mismatch");

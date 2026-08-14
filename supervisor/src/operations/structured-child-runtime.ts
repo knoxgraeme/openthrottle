@@ -16,6 +16,7 @@ import {
   type IntegrationEvidenceReceipt,
   type ReviewJournalContract,
   type SemanticReviewReceipt,
+  type StandardReceiptType,
   type StandardReceipt,
   type UnitCompletionReceipt,
   type UnitDecisionReceipt,
@@ -468,6 +469,13 @@ function loopKindFor(actionKind: UnitActionKind): LoopActionRequest["loop"] {
   throw new Error(`child action kind ${actionKind} has no loop kind`);
 }
 
+function expectedReceiptTypeFor(actionKind: UnitActionKind): StandardReceiptType {
+  if (actionKind === "lead") return "unit_decision";
+  if (actionKind === "final_review") return "semantic_review";
+  if (["implement", "repair", "simplify", "final_repair"].includes(actionKind)) return "unit_completion";
+  throw new Error(`child action kind ${actionKind} has no agent receipt type`);
+}
+
 function receiptRoleFor(actionKind: UnitActionKind): ReceiptProducerRole {
   if (actionKind === "command" || actionKind === "final_command") return "command";
   if (actionKind === "candidate") return "candidate";
@@ -827,6 +835,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       allowedMcpServers: [],
       credentialScopes: ["model.invoke", "repo.read"],
       receiptSchema: RECEIPT_SCHEMA,
+      expectedReceiptType: "semantic_review",
       expectedProducerSkill: `builtin://${persona.id}@1`,
       expectedProducer: fanoutProducerFor(input.instance, persona.id),
     }));
@@ -886,6 +895,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     allowedMcpServers: [],
     credentialScopes: ["model.invoke", "repo.read"],
     receiptSchema: RECEIPT_SCHEMA,
+    expectedReceiptType: "semantic_review",
     expectedProducerSkill: "builtin://select-review-personas@1",
     expectedProducer: {
       workerId: "review-selector",
@@ -951,6 +961,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     allowedMcpServers: [],
     credentialScopes: ["model.invoke", "repo.read"],
     receiptSchema: RECEIPT_SCHEMA,
+    expectedReceiptType: "semantic_review",
     expectedProducerSkill: "builtin://validate-review-findings@1",
     expectedProducer: {
       workerId: "review-validator",
@@ -1987,6 +1998,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       allowedMcpServers: workerBinding.worker.allowed_mcp_servers,
       credentialScopes: workerBinding.credentials as LoopActionRequest["credentialScopes"],
       receiptSchema: RECEIPT_SCHEMA,
+      expectedReceiptType: expectedReceiptTypeFor(action.action_kind),
       expectedProducerSkill: expectedSkillFor(workerBinding),
       expectedProducer: expectedProducerForAction(instance, action),
       ...(workerBinding.repositorySkill ? { repositorySkill: workerBinding.repositorySkill } : {}),
