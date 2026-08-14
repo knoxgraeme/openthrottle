@@ -771,6 +771,13 @@ function loopKindFor(actionKind: UnitActionKind): string {
   throw new Error(`child action kind ${actionKind} has no loop kind`);
 }
 
+function expectedReceiptTypeFor(actionKind: UnitActionKind): string {
+  if (actionKind === "lead") return "unit_decision";
+  if (actionKind === "final_review") return "semantic_review";
+  if (["implement", "repair", "simplify", "final_repair"].includes(actionKind)) return "unit_completion";
+  throw new Error(`child action kind ${actionKind} has no agent receipt type`);
+}
+
 function roleFor(actionKind: UnitActionKind): string {
   if (actionKind === "lead") return "lead";
   if (actionKind === "final_review") return "reviewer";
@@ -1048,7 +1055,7 @@ function loopRequestProbe(input: {
 }): Record<string, unknown> {
   const expectedProducerSkill = expectedSkillFor(input.binding);
   const requestWithoutFence = {
-    protocol: "loop-action@2",
+    protocol: "loop-action@3",
     actionId: "execution-work-" + "c".repeat(32),
     attemptId: "attempt-" + "a".repeat(32),
     graphId: "execution-graph-" + "d".repeat(32),
@@ -1075,6 +1082,7 @@ function loopRequestProbe(input: {
     allowedMcpServers: input.binding.allowedMcpServers,
     credentialScopes: input.binding.credentialScopes,
     receiptSchema: "openthrottle.receipt/v1",
+    expectedReceiptType: expectedReceiptTypeFor(input.actionKind),
     expectedProducerSkill,
     expectedProducer: {
       workerId: roleFor(input.actionKind) === "reviewer" ? "reviewer" : input.binding.workerId,

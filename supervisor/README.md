@@ -91,10 +91,12 @@ receive `GITHUB_TOKEN`.
   itself instead of failing with `Could not find App`.
 - Changes under `supervisor/` (or a freshly built snapshot, whose staged
   secret applies on release) run `flyctl deploy --remote-only`.
-- Changes to `supervisor/src/persistence/migrations/definitions.ts`, including
-  `workflow_dispatch` runs on such refs, pause and drain admission before
-  deploy and require the live pre-deploy supervisor's cutover evidence to
-  advertise
+- Every supervisor deploy, including `workflow_dispatch`, first checks the
+  complete current migration catalog and rejects post-cutover definitions
+  without one statically verifiable, double-quoted literal name carrying the
+  rollback marker. Every non-bootstrap supervisor or snapshot deploy then
+  pauses and drains admission before deploy and requires the live pre-deploy
+  supervisor's cutover evidence to advertise
   `schema-migrations-name-additive-rollback-compatible/v1` before the new image
   can open SQLite.
 - `workflow_dispatch` inputs force either half manually. The optional
@@ -126,11 +128,13 @@ rollback-compatible migration runner first and confirm
 `/deployment/cutover-evidence` reports
 `schema-migrations-name-additive-rollback-compatible/v1`; only then may a later
 release apply additive future migrations marked in `schema_migrations.name` with
-` [rollback-compatible:additive/v1]`. The deploy workflow enforces that proof
-for push and `workflow_dispatch` runs on refs that change
-`supervisor/src/persistence/migrations/definitions.ts` before the new supervisor
-image can open SQLite. Unmarked or malformed future ledger rows remain
-startup-fatal for rollback safety.
+` [rollback-compatible:additive/v1]`. Before every supervisor push or
+`workflow_dispatch` deploy, the workflow checks the complete current migration
+catalog and rejects post-cutover definitions missing a statically verifiable
+literal marker. That whole-tree check also catches migrations introduced by an
+earlier failed deployment when a later unrelated commit retries the same HEAD
+catalog. Unmarked or malformed future ledger rows remain startup-fatal for
+rollback safety.
 
 The cutover client executes inside the Fly machine and reads
 `OT_DEPLOY_TOKEN` there. GitHub Actions never stores or receives that token.

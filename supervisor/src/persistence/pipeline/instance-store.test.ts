@@ -355,7 +355,7 @@ describe("pipeline instance store", () => {
     temporaryDirectories.push(directory);
     const path = join(directory, "supervisor.db");
     const baseCommit = "a".repeat(40);
-    const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v12");
+    const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v13");
     const catalog = loadPipelineCatalog(shippedCatalogPath, shippedRuntime.descriptor);
     const manifest = catalog.manifests.get("core/implement@4")!;
     const config = parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: implement }\n");
@@ -425,7 +425,7 @@ describe("pipeline instance store", () => {
       normalized_manifest: manifest.normalized,
       repository_config_snapshot_id: snapshot.id,
       repository_config_digest: snapshot.digest,
-      runtime_release: "openthrottle-snapshot/v12",
+      runtime_release: "openthrottle-snapshot/v13",
       capability_digest: shippedRuntime.digest,
       status: "dispatchable",
       active_stage_id: manifest.manifest.entry_stage,

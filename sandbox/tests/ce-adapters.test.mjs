@@ -498,7 +498,7 @@ describe("OpenThrottle canonical task skills", () => {
       const receipt = JSON.parse(matches[0][1]);
       const workerId = task === "select-review-personas" ? "review-selector" : task;
       const requestWithoutFence = {
-        protocol: "loop-action@2",
+        protocol: "loop-action@3",
         actionId: "action-example",
         attemptId: "attempt-example",
         graphId: "graph-example",
@@ -521,6 +521,7 @@ describe("OpenThrottle canonical task skills", () => {
         allowedMcpServers: [],
         credentialScopes: ["model.invoke", "repo.read"],
         receiptSchema: "openthrottle.receipt/v1",
+        expectedReceiptType: "semantic_review",
         expectedProducer: {
           workerId,
           skill: `builtin://${task}@1`,

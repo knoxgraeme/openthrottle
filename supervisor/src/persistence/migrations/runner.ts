@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import {
   databaseMigrations,
   ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+  ROLLBACK_COMPATIBLE_MIGRATION_REQUIRED_FROM_VERSION,
   type DatabaseMigration,
 } from "./definitions.js";
 
@@ -28,6 +29,16 @@ export function applyDatabaseMigrationsForAuthority(
   authority: DatabaseMigrationAuthority
 ): void {
   const { migrations, rollbackCompatibleMigrationNameSuffix } = authority;
+  const unmarkedMigration = migrations.find(
+    (migration) => migration.version >= ROLLBACK_COMPATIBLE_MIGRATION_REQUIRED_FROM_VERSION &&
+      !migration.name.endsWith(rollbackCompatibleMigrationNameSuffix)
+  );
+  if (unmarkedMigration) {
+    throw new Error(
+      `database migration ${unmarkedMigration.version} is not rollback-compatible: ` +
+      `name must end with ${JSON.stringify(rollbackCompatibleMigrationNameSuffix)}`
+    );
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version INTEGER PRIMARY KEY,

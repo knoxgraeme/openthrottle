@@ -1043,7 +1043,7 @@ describe("structured child runtime review fanout", () => {
       request_hash: "9".repeat(64),
       request_launch_state: "launched",
       request_payload: canonicalJson({
-        protocol: "loop-action@2",
+        protocol: "loop-action@3",
         actionId: "lead-fanout-collect",
         attemptId: "parent-attempt",
         graphId: "graph-1",
@@ -1063,6 +1063,7 @@ describe("structured child runtime review fanout", () => {
         allowedMcpServers: [],
         credentialScopes: ["model.invoke", "repo.read"],
         receiptSchema: "openthrottle.receipt/v1",
+        expectedReceiptType: "unit_decision",
         requestHash: "9".repeat(64),
         idempotencyKey: "lead",
       } satisfies LoopActionRequest),
@@ -1816,7 +1817,7 @@ describe("structured child runtime repair fences", () => {
 
   it("re-dispatches (and so re-stages a fresh credential envelope for) a prepared/worktree_ready replay instead of assuming the prior invocation is still credentialed", async () => {
     const requestPayload: LoopActionRequest = {
-      protocol: "loop-action@2",
+      protocol: "loop-action@3",
       actionId: "implement-worktree-ready-replay",
       attemptId: "parent-attempt",
       graphId: "graph-1",
@@ -1833,6 +1834,7 @@ describe("structured child runtime repair fences", () => {
       allowedMcpServers: [],
       credentialScopes: ["model.invoke", "repo.read", "repo.write"],
       receiptSchema: "openthrottle.receipt/v1",
+      expectedReceiptType: "unit_completion",
       requestHash: "b".repeat(64),
       idempotencyKey: "idem-implement-worktree-ready-replay",
     };
@@ -2962,7 +2964,7 @@ describe("structured child runtime repair fences", () => {
       request_launch_state: "prepared",
     });
     repair.request_payload = canonicalJson({
-        protocol: "loop-action@2",
+        protocol: "loop-action@3",
         actionId: "repair-cycle-2-replay",
         attemptId: "parent-attempt",
         graphId: "graph-1",
@@ -2982,6 +2984,7 @@ describe("structured child runtime repair fences", () => {
         allowedMcpServers: [],
         credentialScopes: ["model.invoke", "provider.read", "repo.read"],
         receiptSchema: "openthrottle.receipt/v1",
+        expectedReceiptType: "unit_completion",
         expectedProducerSkill: "repair-unit",
         expectedProducer: {
           workerId: "unit-worker",
@@ -3045,7 +3048,7 @@ describe("structured child runtime repair fences", () => {
       request_hash: "3".repeat(64),
       request_launch_state: "prepared",
       request_payload: canonicalJson({
-        protocol: "loop-action@2",
+        protocol: "loop-action@3",
         actionId: "repair-cycle-2-stale-replay",
         attemptId: "parent-attempt",
         graphId: "graph-1",
@@ -3065,6 +3068,7 @@ describe("structured child runtime repair fences", () => {
         allowedMcpServers: [],
         credentialScopes: ["model.invoke", "provider.read", "repo.read"],
         receiptSchema: "openthrottle.receipt/v1",
+        expectedReceiptType: "unit_completion",
         expectedProducerSkill: "repair-unit",
         expectedProducer: {
           workerId: "unit-worker",
@@ -3396,7 +3400,7 @@ describe("structured child runtime repair fences", () => {
       execution_unit_id: null,
       request_hash: requestHash,
       request_payload: canonicalJson({
-        protocol: "loop-action@2",
+        protocol: "loop-action@3",
         baseSubject: integratedSubject,
       }),
       request_launch_state: "launched",

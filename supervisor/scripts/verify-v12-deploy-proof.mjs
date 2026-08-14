@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { RUNTIME_DESCRIPTOR, canonicalJson } from "../../sandbox/runner/capabilities.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const V12_RUNTIME_RELEASE = "openthrottle-snapshot/v12";
+const ACTIVE_RUNTIME_RELEASE = "openthrottle-snapshot/v13";
 const V12_PROOF_FILE = "v12-deploy-proof.json";
 const V12_PROOF_PATH = `supervisor/pipelines/${V12_PROOF_FILE}`;
 const SNAPSHOT_IDENTITY = "openthrottle-v2-ce-${short_head}";
@@ -30,8 +30,8 @@ assert(
   "supervisor runtime descriptor must match sandbox installed capabilities"
 );
 assert(
-  supervisorDescriptor.release === V12_RUNTIME_RELEASE,
-  `v12 deploy proof must stay bound to ${V12_RUNTIME_RELEASE}`
+  supervisorDescriptor.release === ACTIVE_RUNTIME_RELEASE,
+  `deploy proof must stay bound to ${ACTIVE_RUNTIME_RELEASE}`
 );
 
 const deployWorkflow = read(".github/workflows/deploy.yml");
@@ -84,14 +84,19 @@ assert(
   "deploy workflow must expose a fail-closed supervisor-only v12 cutover path"
 );
 assert(
-  deployWorkflow.includes("database_migrations: ${{ steps.filter.outputs.database_migrations }}") &&
-    deployWorkflow.includes("'supervisor/src/persistence/migrations/definitions.ts'") &&
-    deployWorkflow.includes("EXPECTED_MIGRATION_ROLLBACK_CONTRACT: schema-migrations-name-additive-rollback-compatible/v1") &&
-    deployWorkflow.includes("needs.changes.outputs.database_migrations == 'true'") &&
-    deployWorkflow.includes("requires_migration_contract=\"${{ needs.changes.outputs.database_migrations == 'true' }}\"") &&
-    !deployWorkflow.includes("github.event_name == 'push' && needs.changes.outputs.database_migrations == 'true'") &&
+  deployWorkflow.includes("EXPECTED_MIGRATION_ROLLBACK_CONTRACT: schema-migrations-name-additive-rollback-compatible/v1") &&
+    deployWorkflow.includes("fetch-depth: 0") &&
+    deployWorkflow.includes("Validate migration rollback markers") &&
+    !deployWorkflow.includes("MIGRATION_DIFF_BASE:") &&
+    !deployWorkflow.includes("MIGRATION_EVENT_NAME:") &&
+    deployWorkflow.indexOf("Validate migration rollback markers") <
+      deployWorkflow.indexOf("superfly/flyctl-actions/setup-flyctl@master") &&
+    deployWorkflow.includes("node supervisor/scripts/verify-migration-rollback-markers.mjs") &&
+    !deployWorkflow.includes("needs.changes.outputs.database_migrations") &&
+    deployWorkflow.includes('requires_migration_contract="true"') &&
+    deployWorkflow.includes("first-install supervisor bootstrap has no predecessor contract to verify") &&
     deployWorkflow.includes(".database.migrationRollbackCompatibility.contract == $migration_contract"),
-  "migration-bearing supervisor deploys, including workflow_dispatch refs, must prove rollback compatibility before opening SQLite"
+  "every non-bootstrap supervisor deploy must prove rollback compatibility before opening SQLite"
 );
 assert(
   cutoverControl.includes("OT_DEPLOY_TOKEN") &&

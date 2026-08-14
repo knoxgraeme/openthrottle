@@ -209,7 +209,7 @@ For a `for_each_unit` node, the repository graph owns the ordered `phases`
 array. The platform owns the closed mechanism vocabulary and the security
 contract behind each mechanism:
 
-- `agent`: one sealed `loop-action@2` invocation in the unit worktree, using a
+- `agent`: one sealed `loop-action@3` invocation in the unit worktree, using a
   declared unit loop and its pinned worker/skill/MCP/credential/session scope.
 - `command`: one or more repository-configured command names, run by the
   executor without model credentials.
@@ -434,12 +434,19 @@ agent output cannot satisfy the receipt/proposal fence.
 A clean engine exit that contains exactly one parsed standard-receipt candidate
 may receive one deterministic envelope correction. Correction is executor code,
 not another model invocation: it may delete only validator-diagnosed unknown
-fields, set the top-level receipt schema, and replace exact fence, subject, or
-producer leaves for which the sealed request is authoritative. It validates the
-complete corrected receipt, reapplies every action fence, and requires all
-non-diagnosed content to remain byte-equivalent under canonical JSON. It never
-changes assurance, result, evidence, semantic payload values, or repository
-content, and it refuses missing semantic values or an unparsed candidate.
+fields, set the top-level receipt schema, replace the top-level receipt type
+from the sealed expected receipt type, and replace exact fence, subject, or
+producer leaves for which the sealed request is authoritative. The expected
+receipt type is part of the hash-bound loop-action request and is echoed in the
+Receipt Authority Contract; it is derived by the compiled phase binding/action
+kind, not by agent output or action-name prefixes. It validates the complete
+corrected receipt, reapplies every action fence including receipt-type equality,
+and requires all non-diagnosed content to remain byte-equivalent under canonical
+JSON. It never changes assurance, result, evidence, semantic payload values, or
+repository content, and it refuses missing semantic values or an unparsed
+candidate. A schema-valid cross-role receipt can be accepted only if correcting
+`/type` to the sealed expected type leaves its existing result and payload
+independently valid for that expected type; semantic content is never rewritten.
 Before correction, the executor atomically writes a root-owned
 `openthrottle.loop-receipt-correction/v1` state file bound to the attempt,
 action, and request hash. The diagnostic engine-output tail is capped at 64 KiB
@@ -979,13 +986,17 @@ release apply additive, rollback-compatible future migrations whose
 contract still validate every known migration name and checksum exactly, and
 they fail closed on any unknown future row without that exact suffix or with a
 malformed suffix.
-The deploy workflow treats changes to
-`supervisor/src/persistence/migrations/definitions.ts` as migration-bearing
-releases, including `workflow_dispatch` runs on such refs: before deployment it
-pauses admission, waits for a clear drain, and requires the live pre-deploy
+The deploy workflow validates the complete current
+`supervisor/src/persistence/migrations/definitions.ts` catalog before every
+supervisor deployment, including `workflow_dispatch` runs. It rejects any
+post-cutover migration definition without one statically verifiable,
+double-quoted literal name carrying the marker suffix, even when that migration
+was introduced by an earlier failed deployment rather than the triggering
+diff; it pauses admission, waits for a clear drain, and requires the live pre-deploy
 supervisor's cutover evidence to expose that database contract. This preserves
 the initial precursor bootstrap while making later migration-bearing releases
-prove rollback compatibility before they open SQLite.
+prove rollback compatibility before they open SQLite or write unmarked future
+ledger rows.
 
 Citation-backed proposal flows use a separate provider-neutral citation gate.
 `/analysis/citations/grade` is still the only production path that resolves
@@ -1220,14 +1231,16 @@ after that release is installed, every push that builds a new snapshot must
 pause and drain before deploy, then verify the pinned runtime release, runtime
 digest, and exact snapshot before resuming admission. A manual cutover without
 a snapshot build must supply the exact expected snapshot explicitly.
-Any cutover release that adds a schema migration must also verify the live
+Every non-bootstrap cutover or supervisor deployment must also verify the live
 pre-deploy supervisor's `/deployment/cutover-evidence` includes the expected
 `schema-migrations-name-additive-rollback-compatible/v1` database contract
-before it opens and mutates SQLite. The deploy workflow enforces this for
-push and `workflow_dispatch` runs on refs that change
-`supervisor/src/persistence/migrations/definitions.ts`; the standalone
-precursor release itself remains a supervisor-only bootstrap because its parent
-cannot yet advertise the contract.
+and reject any post-cutover definition in the complete current catalog that
+lacks one statically verifiable, double-quoted literal name with the exact
+marker suffix before it opens and mutates SQLite. The whole-catalog check runs
+before every supervisor push or `workflow_dispatch` deployment so an unrelated
+retry cannot bypass a migration introduced by an earlier failed deployment;
+the standalone precursor release itself remains a supervisor-only bootstrap
+because its parent cannot yet advertise the contract.
 
 Optional/defaulted:
 

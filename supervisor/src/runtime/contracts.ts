@@ -16,7 +16,7 @@ import {
   type StageRequestEnvelope,
 } from "../pipeline/stage-request.js";
 import type { RepositorySkillPackage } from "../pipeline/manifest.js";
-import { LOGICAL_CREDENTIALS, type LogicalCredential, type TuneProposalChange } from "@openthrottle/contracts";
+import { LOGICAL_CREDENTIALS, type LogicalCredential, type StandardReceiptType, type TuneProposalChange } from "@openthrottle/contracts";
 
 // The closed logical-scope set a loop action may declare (contracts/src/graph.ts
 // LOGICAL_CREDENTIALS). Enforced again here at the runtime boundary so a loop
@@ -64,7 +64,7 @@ export interface RuntimeWorktreeHandle {
 }
 
 export interface LoopActionRequest {
-  protocol: "loop-action@2";
+  protocol: "loop-action@3";
   actionId: string;
   attemptId: string;
   graphId: string;
@@ -111,6 +111,7 @@ export interface LoopActionRequest {
   allowedMcpServers: readonly string[];
   credentialScopes: readonly LogicalCredential[];
   receiptSchema: string;
+  expectedReceiptType: StandardReceiptType;
   expectedProducerSkill?: string;
   expectedProducer?: {
     workerId: string;

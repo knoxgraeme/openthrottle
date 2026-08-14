@@ -58,7 +58,6 @@ jobs:
       sandbox: ${{ steps.filter.outputs.sandbox }}
       skills: ${{ steps.filter.outputs.skills }}
       runtime_descriptor: ${{ steps.filter.outputs.runtime_descriptor }}
-      database_migrations: ${{ steps.filter.outputs.database_migrations }}
       supervisor: ${{ steps.filter.outputs.supervisor }}
     steps:
       - uses: actions/checkout@v4
@@ -75,8 +74,6 @@ jobs:
               - 'skills/**'
             runtime_descriptor:
               - 'supervisor/pipelines/runtime-capabilities-v1.json'
-            database_migrations:
-              - 'supervisor/src/persistence/migrations/definitions.ts'
             supervisor:
               - 'supervisor/**'
 
@@ -137,6 +134,21 @@ jobs:
       EXPECTED_MIGRATION_ROLLBACK_CONTRACT: schema-migrations-name-additive-rollback-compatible/v1
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: supervisor/package-lock.json
+      - name: Install migration-verifier dependencies
+        run: npm ci --prefix supervisor --ignore-scripts
+      - name: Validate migration rollback markers
+        # Check the complete current migration catalog on every deploy. A prior
+        # migration push may have failed before deployment; a later unrelated
+        # push must not bypass the marker gate simply because its own diff did
+        # not touch definitions.ts.
+        run: node supervisor/scripts/verify-migration-rollback-markers.mjs
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Ensure the Fly app and data volume exist
         run: |
@@ -173,7 +185,10 @@ jobs:
         run: |
           set -euo pipefail
           requires_snapshot_check="${{ inputs.prepare_v12_cutover || needs.snapshot.result == 'success' }}"
-          requires_migration_contract="${{ needs.changes.outputs.database_migrations == 'true' }}"
+          # The complete current catalog may include a marked migration from a
+          # prior push whose deployment failed. Contract authority therefore
+          # cannot be inferred from this push's changed paths.
+          requires_migration_contract="true"
           if [[ "${requires_snapshot_check}" == "true" && -z "${EXPECTED_SNAPSHOT}" ]]; then
             echo "expected_snapshot is required when this run does not build a snapshot" >&2
             exit 1
@@ -477,9 +492,13 @@ jobs:
           fi
           trap - ERR
       - name: Pause admission and verify migration rollback contract
-        if: ${{ needs.changes.outputs.database_migrations == 'true' && !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}
+        if: ${{ !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}
         run: |
           set -euo pipefail
+          if [[ "${OT_FIRST_INSTALL_BOOTSTRAP:-0}" == "1" ]]; then
+            echo "first-install supervisor bootstrap has no predecessor contract to verify"
+            exit 0
+          fi
           flyctl ssh console --app "$FLY_APP" --command \
             "node /app/scripts/cutover-control.mjs pause"
           deadline=$((SECONDS + 600))
@@ -523,8 +542,11 @@ jobs:
             exit 1
           fi
           flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
-      - name: Resume admission after migration deploy
-        if: ${{ needs.changes.outputs.database_migrations == 'true' && !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}
+      - name: Resume admission after supervisor deploy
+        if: ${{ !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}
         run: |
+          if [[ "${OT_FIRST_INSTALL_BOOTSTRAP:-0}" == "1" ]]; then
+            exit 0
+          fi
           flyctl ssh console --app "$FLY_APP" --command \
             "node /app/scripts/cutover-control.mjs resume"

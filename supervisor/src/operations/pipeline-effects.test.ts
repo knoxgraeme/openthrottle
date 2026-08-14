@@ -701,7 +701,7 @@ describe("pipeline effect processor", () => {
     expect(runtime.dispatchLoopAction).toHaveBeenCalledWith(
       { providerResourceId: "sandbox-structured" },
       expect.objectContaining({
-        protocol: "loop-action@2",
+        protocol: "loop-action@3",
         attemptId: attempt.id,
         unitId: "unit_a",
         role: "worker",
@@ -907,7 +907,7 @@ describe("pipeline effect processor", () => {
     expect(runtime.dispatchLoopAction).toHaveBeenCalledWith(
       { providerResourceId: "sandbox-repo-skill" },
       expect.objectContaining({
-        protocol: "loop-action@2",
+        protocol: "loop-action@3",
         attemptId: attempt.id,
         skill: "implement_unit",
         expectedProducerSkill: repoSkill.reference,
@@ -1091,7 +1091,7 @@ describe("pipeline effect processor", () => {
       expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
         { providerResourceId: "sandbox-child-drain" },
         expect.objectContaining({
-          protocol: "loop-action@2",
+          protocol: "loop-action@3",
           contextPolicy: "prefer_resume",
           nativeSessionId: null,
           role: "worker",
@@ -1126,7 +1126,7 @@ describe("pipeline effect processor", () => {
       expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
         { providerResourceId: "sandbox-child-drain" },
         expect.objectContaining({
-          protocol: "loop-action@2",
+          protocol: "loop-action@3",
           contextPolicy: "resume_required",
           nativeSessionId: `thread-${input.unitId}`,
           role: "worker",
@@ -1171,7 +1171,7 @@ describe("pipeline effect processor", () => {
       expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
         { providerResourceId: "sandbox-child-drain" },
         expect.objectContaining({
-          protocol: "loop-action@2",
+          protocol: "loop-action@3",
           contextPolicy: "prefer_resume",
           nativeSessionId: expectedLeadSessionId,
           role: "lead",
@@ -1326,7 +1326,7 @@ describe("pipeline effect processor", () => {
     expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
       expect.objectContaining({
-        protocol: "loop-action@2",
+        protocol: "loop-action@3",
         role: "reviewer",
         skill: "select-review-personas",
         expectedProducerSkill: "builtin://select-review-personas@1",
@@ -1621,7 +1621,7 @@ describe("pipeline effect processor", () => {
     expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
       expect.objectContaining({
-        protocol: "loop-action@2",
+        protocol: "loop-action@3",
         role: "worker",
         skill: "final-repair",
       })
@@ -1708,7 +1708,7 @@ describe("pipeline effect processor", () => {
     expect(runtime.dispatchLoopAction).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },
       expect.objectContaining({
-        protocol: "loop-action@2",
+        protocol: "loop-action@3",
         role: "reviewer",
         skill: "select-review-personas",
         baseSubject: instance.base_commit,

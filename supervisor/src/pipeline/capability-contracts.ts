@@ -150,7 +150,7 @@ const CAPABILITY_CREDENTIALS: Readonly<Record<string, CapabilityCredentialContra
     contexts: ["none"],
     artifacts: ["stage_result", "command_result"],
   },
-  "loop-action@2": {
+  "loop-action@3": {
     minimum: ["model.invoke", "repo.read"],
     allowed: ["model.invoke", "provider.read", "repo.read", "repo.write"],
     contexts: ["fresh", "resume_required", "prefer_resume"],

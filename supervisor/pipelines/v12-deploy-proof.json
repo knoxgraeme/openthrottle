@@ -1,8 +1,8 @@
 {
   "schema": "openthrottle.v12-deploy-proof/v1",
   "runtime": {
-    "release": "openthrottle-snapshot/v12",
-    "digest": "46c5e3bfc38724e34898fd1d7642d293a61cd8cdcbaecb22c2b9a0a47b0bbe1a",
+    "release": "openthrottle-snapshot/v13",
+    "digest": "e3e8d8bb62cb8723fd4adfb68fe69df4b6708808384460dabdb348f9de415b2f",
     "capabilities": 26
   },
   "catalog_digest": "a35032af1b4e3f9168a676adadd4004861a667b1a8a6462b47b65f8cffa9fc6e",
@@ -18,7 +18,7 @@
     "core-implement-v4.yaml": "a75faf8829655c4507bc07182a96385ffd54a9af1dcf9815be7fcd91b0ab99f5",
     "core-investigate-v1.yaml": "340f1661fe9f80810a30ee2bea304879a5106f50106cf4b62f9beb25aec7defe",
     "core-tune-v1.yaml": "49bb1315cb3be775e3329f57a34004df0b67db682bbb3c49bcb926ace887de1a",
-    "runtime-capabilities-v1.json": "5f89ecc4e13f79705a4ae8e8faccf8fb91ab4d8d66cce23889f5e8683b2810b4"
+    "runtime-capabilities-v1.json": "a40df9ea83681e5979d7777276a05057a30d0b649113079f7d4ea74a4c3cad29"
   },
   "snapshot_identity": "openthrottle-v2-ce-${short_head}"
 }

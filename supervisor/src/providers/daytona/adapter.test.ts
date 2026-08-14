@@ -9,7 +9,7 @@ import type { ChildExecutorActionRequest, LoopActionRequest } from "../../runtim
 
 function fencedLoopRequest(overrides: Partial<Omit<LoopActionRequest, "requestHash" | "idempotencyKey">> = {}): LoopActionRequest {
   const withoutFence = {
-    protocol: "loop-action@2" as const,
+    protocol: "loop-action@3" as const,
     actionId: "loop-1",
     attemptId: "attempt-child",
     graphId: "graph-1",
@@ -28,6 +28,7 @@ function fencedLoopRequest(overrides: Partial<Omit<LoopActionRequest, "requestHa
     allowedMcpServers: ["github"],
     credentialScopes: ["model.invoke", "repo.read"] as const,
     receiptSchema: "openthrottle.receipt/v1",
+    expectedReceiptType: "unit_completion" as const,
     ...overrides,
   } as Omit<LoopActionRequest, "requestHash" | "idempotencyKey">;
   const { candidateSubject, ...withoutCandidateSubject } = withoutFence;
@@ -898,7 +899,7 @@ describe("Daytona stage execution", () => {
       materializeCredentialEnv: vi.fn(async () => ({ env: { DAYTONA_API_KEY: "forbidden" } })),
     });
     const withoutFence = {
-      protocol: "loop-action@2" as const,
+      protocol: "loop-action@3" as const,
       actionId: "loop-forbidden",
       attemptId: "attempt-forbidden",
       graphId: "graph-1",
@@ -916,6 +917,7 @@ describe("Daytona stage execution", () => {
       allowedMcpServers: [],
       credentialScopes: ["repo.read"] as const,
       receiptSchema: "openthrottle.receipt/v1",
+      expectedReceiptType: "unit_decision" as const,
       candidateSubject: "a".repeat(40),
       requestHash: "",
       idempotencyKey: "",
@@ -1119,7 +1121,7 @@ describe("Daytona stage execution", () => {
       materializeCredentialEnv: vi.fn(async () => ({ env: { GITHUB_TOKEN: "secret-token" } })),
     });
     const withoutFence = {
-      protocol: "loop-action@2" as const,
+      protocol: "loop-action@3" as const,
       actionId: "loop-redispatch",
       attemptId: "attempt-redispatch",
       graphId: "graph-1",
@@ -1137,6 +1139,7 @@ describe("Daytona stage execution", () => {
       allowedMcpServers: [],
       credentialScopes: ["repo.read"] as const,
       receiptSchema: "openthrottle.receipt/v1",
+      expectedReceiptType: "unit_completion" as const,
       requestHash: "",
       idempotencyKey: "",
     };
@@ -1189,7 +1192,7 @@ describe("Daytona stage execution", () => {
       materializeCredentialEnv: vi.fn(async () => ({ env: {} })),
     });
     const withoutFence = {
-      protocol: "loop-action@2" as const,
+      protocol: "loop-action@3" as const,
       actionId: "loop-scope",
       attemptId: "attempt-scope",
       graphId: "graph-1",
@@ -1207,6 +1210,7 @@ describe("Daytona stage execution", () => {
       allowedMcpServers: [],
       credentialScopes: ["daytona.admin"],
       receiptSchema: "openthrottle.receipt/v1",
+      expectedReceiptType: "semantic_review" as const,
       requestHash: "",
       idempotencyKey: "",
     };

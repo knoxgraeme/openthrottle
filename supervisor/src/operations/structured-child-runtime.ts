@@ -19,6 +19,7 @@ import {
   type IntegrationEvidenceReceipt,
   type ReviewJournalContract,
   type SemanticReviewReceipt,
+  type StandardReceiptType,
   type StandardReceipt,
   type UnitCompletionReceipt,
   type UnitDecisionReceipt,
@@ -497,6 +498,13 @@ function loopKindFor(actionKind: UnitActionKind): LoopActionRequest["loop"] {
   throw new Error(`child action kind ${actionKind} has no loop kind`);
 }
 
+function expectedReceiptTypeFor(actionKind: UnitActionKind): StandardReceiptType {
+  if (actionKind === "lead") return "unit_decision";
+  if (actionKind === "final_review") return "semantic_review";
+  if (["implement", "repair", "simplify", "final_repair"].includes(actionKind)) return "unit_completion";
+  throw new Error(`child action kind ${actionKind} has no agent receipt type`);
+}
+
 function receiptRoleFor(actionKind: UnitActionKind): ReceiptProducerRole {
   if (actionKind === "command" || actionKind === "final_command") return "command";
   if (actionKind === "candidate") return "candidate";
@@ -698,7 +706,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     if (action.request_payload) {
       try {
         const request = JSON.parse(action.request_payload) as { protocol?: unknown; baseSubject?: unknown };
-        if (request.protocol === "loop-action@2" &&
+        if (request.protocol === "loop-action@3" &&
             typeof request.baseSubject === "string" &&
             GIT_SUBJECT.test(request.baseSubject)) {
           return request.baseSubject;
@@ -857,7 +865,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     timeoutMs: number;
   }): LoopActionRequest[] =>
     input.fanout.personas.map((persona) => buildLoopActionRequest({
-      protocol: "loop-action@2",
+      protocol: "loop-action@3",
       actionId: fanoutActionId(input.action, persona.id),
       attemptId: input.action.parent_attempt_id,
       graphId: input.action.execution_graph_id,
@@ -902,6 +910,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       allowedMcpServers: [],
       credentialScopes: ["model.invoke", "repo.read"],
       receiptSchema: RECEIPT_SCHEMA,
+      expectedReceiptType: "semantic_review",
       expectedProducerSkill: `builtin://${persona.id}@1`,
       expectedProducer: fanoutProducerFor(input.instance, persona.id),
     }));
@@ -919,7 +928,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     timeoutMs: number;
     priorEvidence?: LoopActionRequest["priorEvidence"];
   }): LoopActionRequest => buildLoopActionRequest({
-    protocol: "loop-action@2",
+    protocol: "loop-action@3",
     actionId: selectorActionId(input.action),
     attemptId: input.action.parent_attempt_id,
     graphId: input.action.execution_graph_id,
@@ -963,6 +972,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     allowedMcpServers: [],
     credentialScopes: ["model.invoke", "repo.read"],
     receiptSchema: RECEIPT_SCHEMA,
+    expectedReceiptType: "semantic_review",
     expectedProducerSkill: "builtin://select-review-personas@1",
     expectedProducer: {
       workerId: "review-selector",
@@ -986,7 +996,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     reasoningEffort?: LoopActionRequest["reasoningEffort"];
     timeoutMs: number;
   }): LoopActionRequest => buildLoopActionRequest({
-    protocol: "loop-action@2",
+    protocol: "loop-action@3",
     actionId: validatorActionId(input.action),
     attemptId: input.action.parent_attempt_id,
     graphId: input.action.execution_graph_id,
@@ -1030,6 +1040,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     allowedMcpServers: [],
     credentialScopes: ["model.invoke", "repo.read"],
     receiptSchema: RECEIPT_SCHEMA,
+    expectedReceiptType: "semantic_review",
     expectedProducerSkill: "builtin://validate-review-findings@1",
     expectedProducer: {
       workerId: "review-validator",
@@ -2129,7 +2140,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       return { requestHash: selectorRequest.requestHash, nativeSessionId: null };
     }
     const loopRequest = buildLoopActionRequest({
-      protocol: "loop-action@2",
+      protocol: "loop-action@3",
       actionId: action.id,
       attemptId: action.parent_attempt_id,
       graphId: action.execution_graph_id,
@@ -2178,6 +2189,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       allowedMcpServers: workerBinding.worker.allowed_mcp_servers,
       credentialScopes: workerBinding.credentials as LoopActionRequest["credentialScopes"],
       receiptSchema: RECEIPT_SCHEMA,
+      expectedReceiptType: expectedReceiptTypeFor(action.action_kind),
       expectedProducerSkill: expectedSkillFor(workerBinding),
       expectedProducer: expectedProducerForAction(instance, action),
       ...(workerBinding.repositorySkill ? { repositorySkill: workerBinding.repositorySkill } : {}),
@@ -2497,7 +2509,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       try {
         if (!action.request_payload) throw new Error("missing persisted selector request");
         request = JSON.parse(action.request_payload) as LoopActionRequest;
-        if (request.protocol !== "loop-action@2" || request.skill !== "select-review-personas") {
+        if (request.protocol !== "loop-action@3" || request.skill !== "select-review-personas") {
           throw new Error("final review request is not the sealed selector action");
         }
       } catch (error) {

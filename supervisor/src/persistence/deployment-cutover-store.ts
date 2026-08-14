@@ -76,13 +76,12 @@ export function createDeploymentCutoverStore(
 
   return {
     beginDeploymentCutover(input) {
-      const id = input.id ?? defaultCutoverId(input.candidateSnapshot);
       const timestamp = now();
       return db.transaction(() => {
         const open = getOpenStmt.get() as DeploymentCutover | undefined;
         if (open) {
           if (
-            open.id !== id ||
+            (input.id !== undefined && open.id !== input.id) ||
             open.old_runtime_release !== input.oldRuntimeRelease ||
             open.old_snapshot !== input.oldSnapshot ||
             open.candidate_snapshot !== input.candidateSnapshot
@@ -92,6 +91,17 @@ export function createDeploymentCutoverStore(
             );
           }
           return open;
+        }
+        const baseId = input.id ?? defaultCutoverId(input.candidateSnapshot);
+        let id = baseId;
+        if (input.id === undefined) {
+          let attempt = 2;
+          while (getStmt.get(id)) {
+            id = `${baseId}:attempt-${attempt}`;
+            attempt += 1;
+          }
+        } else if (getStmt.get(id)) {
+          throw new Error(`deployment cutover ${id} is already completed; use a new transaction id`);
         }
         insertStmt.run(
           id,

@@ -90,6 +90,36 @@ abort_cutover 1
 }
 
 describe("deploy workflow cutover recovery", () => {
+  it("validates the complete migration catalog before Fly setup on every deploy", () => {
+    const steps = deployWorkflow().jobs.deploy.steps;
+    const validationIndex = steps.findIndex((step) => step.name === "Validate migration rollback markers");
+    const flySetupIndex = steps.findIndex((step) => step.uses === "superfly/flyctl-actions/setup-flyctl@master");
+
+    expect(validationIndex).toBeGreaterThanOrEqual(0);
+    expect(flySetupIndex).toBeGreaterThan(validationIndex);
+    expect(steps[validationIndex].if).toBeUndefined();
+    expect(steps[validationIndex].run).toBe(
+      "node supervisor/scripts/verify-migration-rollback-markers.mjs"
+    );
+  });
+
+  it("requires the live rollback contract on unrelated retries as well as migration pushes", () => {
+    const snapshotCutover = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+    const supervisorProof = stepRun("deploy", "Pause admission and verify migration rollback contract");
+    const resume = stepRun("deploy", "Resume admission after supervisor deploy");
+    const steps = deployWorkflow().jobs.deploy.steps;
+    const proofStep = steps.find((step) => step.name === "Pause admission and verify migration rollback contract");
+    const resumeStep = steps.find((step) => step.name === "Resume admission after supervisor deploy");
+
+    expect(snapshotCutover).toContain('requires_migration_contract="true"');
+    expect(snapshotCutover).not.toContain("needs.changes.outputs.database_migrations");
+    expect(proofStep.if).toBe("${{ !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}");
+    expect(resumeStep.if).toBe("${{ !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}");
+    expect(supervisorProof).toContain("first-install supervisor bootstrap has no predecessor contract to verify");
+    expect(supervisorProof).toContain(".database.migrationRollbackCompatibility.contract == $migration_contract");
+    expect(resume).toContain('if [[ "${OT_FIRST_INSTALL_BOOTSTRAP:-0}" == "1" ]]');
+  });
+
   it("fails closed when machine enumeration fails even if releases has a plausible image", () => {
     const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
     const helperStart = script.indexOf("active_image_ref() {");
