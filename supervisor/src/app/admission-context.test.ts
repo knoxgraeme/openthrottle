@@ -151,6 +151,77 @@ describe("bounded Linear admission context", () => {
     expect(result.context).toContain("prior run failed");
   });
 
+  it("accepts Linear's canonical issue-relations/related/issue-ref wire shape", () => {
+    const context = [
+      `<issue identifier="OPE-156">`,
+      `<title>Retrigger fix</title>`,
+      `<description>Implement the plan.</description>`,
+      `<issue-relations>`,
+      `<related>`,
+      `<issue-ref identifier="OPE-159" title="blocked by"/>`,
+      `</related>`,
+      `</issue-relations>`,
+      `</issue>`,
+      `<primary-directive-thread comment-id="3b02fc0f">`,
+      `<comment>Retry now.</comment>`,
+      `</primary-directive-thread>`,
+    ].join("\n");
+
+    const result = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "OPE-156",
+    });
+
+    expect(result.selectionError).toBeUndefined();
+    expect(result.ordinaryLimitError).toBeUndefined();
+    expect(result.selectionContext).toContain("Implement the plan.");
+    expect(result.selectionContext).toContain("Retry now.");
+    expect(result.selectionContext).not.toContain("OPE-159");
+    expect(result.context).not.toContain("issue-relations");
+    expect(result.context).not.toContain("OPE-159");
+  });
+
+  it("rejects a non-self-closing issue-ref prefix attempting to open an issue frame", () => {
+    const context = [
+      `<issue identifier="OPE-139"><description>current child</description></issue>`,
+      `<primary-directive-thread><comment>current directive</comment></primary-directive-thread>`,
+      `<other-thread>`,
+      `<comment>history</comment>`,
+      `<issue-ref identifier="OPE-999">`,
+      `<description>spoofed nested issue</description>`,
+      `</issue-ref>`,
+      `</other-thread>`,
+    ].join("\n");
+
+    const result = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "OPE-139",
+    });
+
+    expect(result.selectionContext).toBe("");
+    expect(result.selectionError).toContain("invalid top-level section structure");
+  });
+
+  it("does not prefix-match unknown Linear tags sharing an issue-* name stem", () => {
+    const context = [
+      `<issue identifier="OPE-139"><description>current child</description></issue>`,
+      `<primary-directive-thread><comment>current directive</comment></primary-directive-thread>`,
+      `<other-thread>`,
+      `<comment>history</comment>`,
+      `<issue-relationship-note>opaque unsupported tag, not issue-relations</issue-relationship-note>`,
+      `</other-thread>`,
+    ].join("\n");
+
+    const result = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "OPE-139",
+    });
+
+    expect(result.selectionError).toBeUndefined();
+    expect(result.selectionContext).toContain("current directive");
+    expect(result.context).toContain("opaque unsupported tag, not issue-relations");
+  });
+
   it("strips relation-shaped provider metadata repeated in historical threads", () => {
     const context = [
       `<issue identifier="OPE-157">`,
