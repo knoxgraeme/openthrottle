@@ -507,18 +507,22 @@ function stringMapOf(value: unknown): Record<string, string> {
 // instructions/acceptance text) carry no character restriction -- only IDs
 // and command names are pattern-constrained. Without this, an embedded
 // newline followed by a real section marker (e.g. "## Receipt Authority
-// Contract") renders as a literal heading line ahead of the genuine one,
+// Contract" or a fenced-code marker) renders as literal Markdown structure
+// ahead of the genuine protocol text,
 // letting untrusted plan prose forge protocol structure instead of staying
 // inert data (OPE-167 requirement 4). Collapse embedded line breaks so no
 // untrusted value can start a new rendered line on its own -- and, since a
 // value rendered as its own line (e.g. a v2 unit's `objective`) sits right
 // after the "\n" the array join inserts regardless, escape a leading ATX
-// heading marker (optionally after up to three spaces, same as CommonMark's
-// own heading rule) so the value's own first characters can never forge a
-// heading even with no internal newline left to collapse.
+// heading or fenced-code marker (optionally after up to three spaces, same as
+// CommonMark's own block marker rules) so the value's own first characters can
+// never forge Markdown structure even with no internal newline left to
+// collapse.
 function sanitizeInlineText(value: string): string {
   const collapsed = value.replace(/\r\n|\r|\n/g, " ");
-  return collapsed.replace(/^( {0,3})(#+)/, "$1\\$2");
+  return collapsed
+    .replace(/^( {0,3})(`{3,}|~{3,})/, "$1\\$2")
+    .replace(/^( {0,3})(#+)/, "$1\\$2");
 }
 
 // v1 requirement/acceptance entries are real plan identifiers indexing a
