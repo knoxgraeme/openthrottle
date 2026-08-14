@@ -46,6 +46,7 @@ assert(
     deployWorkflow.indexOf("advance_cutover drain_clear") < deployWorkflow.indexOf("DAYTONA_SNAPSHOT=\"$EXPECTED_SNAPSHOT\"") &&
     deployWorkflow.includes("flyctl secrets set --stage --app \"$FLY_APP\" DAYTONA_SNAPSHOT=\"$old_snapshot\"") &&
     deployWorkflow.includes("advance_cutover restored active") &&
+    deployWorkflow.includes("abort_cutover 1") &&
     deployWorkflow.includes(".drain.clear == true") &&
     deployWorkflow.includes(".admission.epoch == $epoch") &&
     deployWorkflow.includes(".runtime.release == $release") &&
