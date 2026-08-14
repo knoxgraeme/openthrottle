@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   digestNormalized,
-  validateExecutionPlanContract,
+  validateExecutionPlanContractV2,
   type RepositoryConfigContract,
   type TuneProposal,
 } from "@openthrottle/contracts";
@@ -73,7 +73,7 @@ describe("tune ratchet material binding", () => {
     value.changes[0]!.after_content = exactContent;
     value.changes[0]!.after_digest = digestNormalized(exactContent);
     const plan = executionPlanForTuneProposal(value);
-    expect(() => validateExecutionPlanContract(plan)).not.toThrow();
+    expect(() => validateExecutionPlanContractV2(plan)).not.toThrow();
     expect(JSON.stringify(plan)).not.toContain("observation\\nobservation");
   });
 
@@ -89,6 +89,6 @@ describe("tune ratchet material binding", () => {
     const plan = executionPlanForTuneProposal(value);
 
     expect(JSON.stringify(plan)).not.toContain("git push");
-    expect(plan.instructions.approved_change_001).toContain("sealed openthrottle.tune-change-material/v1 contract");
+    expect(plan.units[0]!.requirements[0]).toContain("sealed openthrottle.tune-change-material/v1 contract");
   });
 });

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   EXECUTION_PLAN_SCHEMA,
+  EXECUTION_PLAN_SCHEMA_V2,
   EXECUTION_PLAN_SCHEMAS,
   deriveReviewSubactionActionId,
   digestCanonicalJson,
@@ -513,11 +514,20 @@ function requestContextForStructuredPlan(payload: {
   if (Array.isArray(payload.inputArtifacts)) {
     for (const entry of payload.inputArtifacts) {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-      const artifact = entry as { payload?: unknown };
+      const artifact = entry as { payload?: unknown; hash?: unknown };
       if (typeof artifact.payload !== "string") continue;
+      if (typeof artifact.hash === "string" && digestNormalized(artifact.payload) !== artifact.hash) {
+        throw new Error("structured execution-plan input artifact hash mismatch");
+      }
       try {
-        const parsed = JSON.parse(artifact.payload) as { details?: { execution_plan?: unknown } };
-        const executionPlan = parsed.details?.execution_plan;
+        const parsed = JSON.parse(artifact.payload) as {
+          schema?: unknown;
+          execution_plan?: unknown;
+          details?: { execution_plan?: unknown };
+        };
+        const executionPlan = parsed.schema === EXECUTION_PLAN_SCHEMA_V2
+          ? parsed.execution_plan
+          : parsed.details?.execution_plan;
         if (executionPlan !== undefined) {
           const schema = executionPlan && typeof executionPlan === "object" && !Array.isArray(executionPlan) &&
             typeof (executionPlan as { schema?: unknown }).schema === "string"

@@ -621,6 +621,33 @@ describe("v2 self-contained execution-plan dispatch context", () => {
     expect(Buffer.byteLength(canonicalJson(context), "utf8")).toBeLessThanOrEqual(48 * 1024);
   });
 
+  it.each(["lead", "repair"] as const)(
+    "projects selected-unit completeness and sibling exclusion into v2 %s review fanout",
+    (actionKind) => {
+      const plan = twoUnitPlanV2();
+
+      const context = loopActionPlanContext({
+        plan,
+        actionKind,
+        unitId: "api",
+        reviewSubject: "2".repeat(40),
+      }) as {
+        unit: Record<string, unknown>;
+        review_fanout: { subject: string; personas: Array<{ id: string }> };
+      };
+
+      expect(context.unit).toMatchObject({
+        id: "api",
+        requirements: ["The API must accept the new input shape."],
+        acceptance: ["The API accepts the new input."],
+        verification: ["Run the API test suite."],
+      });
+      expect(JSON.stringify(context)).not.toContain("The UI must render the new state.");
+      expect(context.review_fanout.subject).toBe("2".repeat(40));
+      expect(context.review_fanout.personas.map((persona) => persona.id)).toContain("tests-contracts");
+    }
+  );
+
   function unitAtFieldScale(id: string, scale: number): ExecutionPlanContractV2["units"][number] {
     return {
       id,

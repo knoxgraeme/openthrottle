@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ExecutionPlanContract } from "@openthrottle/contracts";
+import type { ExecutionPlanContractV2 } from "@openthrottle/contracts";
 import type { Config } from "./config.js";
 import type { ActivityPublicationInput, ControlThreadEvent } from "./ports.js";
 import { createSupervisorStore } from "../persistence/store.js";
@@ -33,7 +33,7 @@ import {
 
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const fixtureCatalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
-const executionPlanFixturePath = fileURLToPath(new URL("../../../contracts/fixtures/valid/execution-plan.json", import.meta.url));
+const executionPlanFixturePath = fileURLToPath(new URL("../../../contracts/fixtures/valid/execution-plan-v2.json", import.meta.url));
 const executionPlanV2FixturePath = fileURLToPath(new URL("../../../contracts/fixtures/valid/execution-plan-v2.json", import.meta.url));
 const executionPlanV2MissingFieldFixturePath = fileURLToPath(
   new URL("../../../contracts/fixtures/invalid/execution-plan-v2-missing-field.json", import.meta.url)
@@ -113,6 +113,10 @@ function issueOnlyPromptContext(
   ].join("\n");
 }
 
+function escapeXmlText(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
 function repositoryConfigYaml(pipelines: string, extra = ""): string {
   return `schema: openthrottle.config/v1
 default_graph: simple
@@ -124,40 +128,49 @@ pipelines: ${pipelines}
 ${extra}`;
 }
 
-function structuredPlanWithContextExtra(extraBytes: number): ExecutionPlanContract {
-  const instructions: Record<string, string> = {};
-  const acceptance: Record<string, string> = {};
+function structuredPlanWithContextExtra(extraBytes: number): ExecutionPlanContractV2 {
+  const requirements: string[] = [];
+  const approach: string[] = [];
+  const tests: string[] = [];
+  const acceptance: string[] = [];
+  const verification: string[] = [];
   let remaining = extraBytes;
-  const nextText = () => {
-    const extra = Math.min(1_999, remaining);
+  const nextText = (limit = 1_999) => {
+    const extra = Math.min(limit, remaining);
     remaining -= extra;
     return "x".repeat(1 + extra);
   };
-  for (let index = 0; index < 64; index += 1) instructions[`instruction_${index}`] = nextText();
-  for (let index = 0; index < 64; index += 1) acceptance[`acceptance_${index}`] = nextText();
+  for (let index = 0; index < 32; index += 1) requirements.push(nextText());
+  for (let index = 0; index < 32; index += 1) approach.push(nextText());
+  for (let index = 0; index < 32; index += 1) tests.push(nextText());
+  for (let index = 0; index < 32; index += 1) acceptance.push(nextText());
+  for (let index = 0; index < 32; index += 1) verification.push(nextText());
   if (remaining > 0) throw new Error("test plan context exceeds per-entry execution plan limits");
   return {
-    schema: "openthrottle.execution-plan/v1" as const,
+    schema: "openthrottle.execution-plan/v2",
     graph_id: "structured",
     plan_id: "structured_envelope_bound",
-    instructions,
-    acceptance,
     units: [{
       id: "unit_a",
       title: "Unit A",
       depends_on: [],
-      instructions: Object.keys(instructions),
-      acceptance: Object.keys(acceptance),
+      objective: nextText(),
+      requirements,
+      files: ["src/unit-a.ts"],
+      approach,
+      tests,
+      acceptance,
+      verification,
     }],
     commands: [],
   };
 }
 
 function structuredPlanContextBoundary(): {
-  accepted: ExecutionPlanContract;
-  rejected: ExecutionPlanContract;
+  accepted: ExecutionPlanContractV2;
+  rejected: ExecutionPlanContractV2;
 } {
-  const maxExtra = (64 + 64) * 1_999;
+  const maxExtra = (32 * 5) * 1_999;
   let low = 0;
   let high = maxExtra;
   let acceptedExtra = 0;
@@ -198,8 +211,8 @@ function resumePayloadDeltaBytes(): number {
   }), "utf8") - Buffer.byteLength(canonicalJson(payload), "utf8");
 }
 
-function structuredPlanAcceptedOnlyWithoutResumePayload(): ExecutionPlanContract {
-  const maxExtra = (64 + 64) * 1_999;
+function structuredPlanAcceptedOnlyWithoutResumePayload(): ExecutionPlanContractV2 {
+  const maxExtra = (32 * 5) * 1_999;
   const delta = resumePayloadDeltaBytes();
   let low = 0;
   let high = maxExtra;
@@ -691,7 +704,7 @@ mcp_servers: {}
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -736,7 +749,7 @@ intents:
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
     ].join("\n"));
@@ -857,7 +870,7 @@ intents:
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const selection = [
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -1378,7 +1391,7 @@ intents:
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const selection = [
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -1438,7 +1451,7 @@ intents:
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const selection = [
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -1510,7 +1523,7 @@ intents:
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -1569,7 +1582,7 @@ intents:
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "repo_structured";
     const context = issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -1876,7 +1889,7 @@ intents:
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -1929,7 +1942,7 @@ intents:
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -2040,7 +2053,7 @@ intents:
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -2655,9 +2668,29 @@ intents:
         JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
         "```",
       ].join("\n")),
-      "graph structured requires a canonical openthrottle.execution-plan/v1 block"
+      "graph structured requires a canonical openthrottle.execution-plan/v2 block"
     );
   });
+
+  it("rejects fresh legacy v1 structured execution plans before provisioning", async () => {
+    const executionPlan = JSON.parse(
+      readFileSync(new URL("../../../contracts/fixtures/valid/execution-plan.json", import.meta.url), "utf8")
+    ) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+
+    await expectSelectionFailure(
+      issueOnlyPromptContext([
+        "```json openthrottle.execution-plan/v1",
+        JSON.stringify(executionPlan, null, 2),
+        "```",
+        "```json openthrottle.ship-selection/v1",
+        JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }),
+        "```",
+      ].join("\n")),
+      "fresh structured admission requires openthrottle.execution-plan/v2"
+    );
+  });
+
   it("fails closed before provisioning for malformed shipped graph selections", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
@@ -2667,7 +2700,7 @@ intents:
         JSON.stringify({ graph_id: "structured" }),
         "```",
       ].join("\n")),
-      "openthrottle.ship-selection/v1.schema: must be openthrottle.ship-selection/v1"
+      "openthrottle.ship-selection/v1 block payload schema must be openthrottle.ship-selection/v1"
     );
 
     await expectSelectionFailure(
@@ -2676,7 +2709,7 @@ intents:
         "{\"schema\":\"openthrottle.ship-selection/v1\",",
         "```",
       ].join("\n")),
-      "SyntaxError"
+      "openthrottle.ship-selection/v1 block must contain valid JSON"
     );
 
     await expectSelectionFailure(
@@ -2693,7 +2726,7 @@ intents:
 
     await expectSelectionFailure(
       issueOnlyPromptContext([
-        "```json openthrottle.execution-plan/v1",
+        "```json openthrottle.execution-plan/v2",
         JSON.stringify(executionPlan, null, 2),
         "```",
         "```json openthrottle.ship-selection/v1",
@@ -2717,7 +2750,7 @@ intents:
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -2764,11 +2797,71 @@ intents:
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_stage_attempts").pluck().get()).toBe(1);
   });
 
+  it("seals the decoded v2 plan artifact before retained threads can add plan bytes", async () => {
+    const primaryPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    primaryPlan.graph_id = "structured";
+    (primaryPlan.units as Array<Record<string, unknown>>)[0]!.requirements = [
+      "Preserve A & B < C > D exactly.",
+    ];
+    const retainedPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    retainedPlan.graph_id = "structured";
+    retainedPlan.plan_id = "retained-plan-must-not-win";
+    const selection = { schema: "openthrottle.ship-selection/v1", graph_id: "structured" };
+    const directive = [
+      "```json openthrottle.execution-plan/v2",
+      JSON.stringify(primaryPlan, null, 2),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify(selection, null, 2),
+      "```",
+    ].join("\n");
+    const retained = [
+      "```json openthrottle.execution-plan/v2",
+      JSON.stringify(retainedPlan, null, 2),
+      "```",
+    ].join("\n");
+    const context = [
+      `<issue identifier="OT-1"><title>GitHub structured body</title></issue>`,
+      `<primary-directive-thread comment-id="github-issue-body"><comment>${escapeXmlText(directive)}</comment></primary-directive-thread>`,
+      `<other-thread comment-id="retained"><comment>${escapeXmlText(retained)}</comment></other-thread>`,
+    ].join("\n");
+
+    const { pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@2
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context)
+    );
+
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const request = pipelines.getStageRequest(pipelines.getActiveAttempt(instance.id)!.id);
+    const artifact = request.inputArtifacts?.find((entry) => entry.kind === "stage_result");
+    expect(artifact).toBeDefined();
+    expect(artifact?.hash).toBe(digestNormalized(artifact!.payload));
+    const sealed = JSON.parse(artifact!.payload) as { execution_plan: Record<string, unknown> };
+    expect(sealed.execution_plan).toEqual(JSON.parse(canonicalJson(primaryPlan)));
+    expect(sealed.execution_plan.plan_id).not.toBe("retained-plan-must-not-win");
+  });
+
   it("keeps legacy structured config on v1 until an explicit config upgrade selects v2", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const contextFor = (identifier: string) => issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -2832,7 +2925,7 @@ intents:
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "release";
     const contextFor = (identifier: string) => issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -2885,7 +2978,7 @@ intents:
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
     executionPlan.graph_id = "structured";
     const context = issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -2936,8 +3029,8 @@ intents:
     default_graph: simple
     allowed_graphs: [simple, structured]
 `;
-    const contextFor = (executionPlan: ExecutionPlanContract, identifier: string) => issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+    const contextFor = (executionPlan: ExecutionPlanContractV2, identifier: string) => issueOnlyPromptContext([
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -3010,7 +3103,7 @@ intents:
 `;
     const executionPlan = structuredPlanAcceptedOnlyWithoutResumePayload();
     const context = issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan),
       "```",
       "```json openthrottle.ship-selection/v1",
@@ -3046,7 +3139,7 @@ intents:
     const skillPath = ".openthrottle/skills/implement_unit/SKILL.md";
     const boundary = structuredPlanContextBoundary();
     const context = issueOnlyPromptContext([
-      "```json openthrottle.execution-plan/v1",
+      "```json openthrottle.execution-plan/v2",
       JSON.stringify(boundary.rejected),
       "```",
       "```json openthrottle.ship-selection/v1",

@@ -665,6 +665,41 @@ function createDockerSandboxRuntime(container) {
 
 function buildTwoUnitPlan({ planId, unitBAcceptanceSuffix = "" }) {
   return {
+    schema: "openthrottle.execution-plan/v2",
+    graph_id: "structured",
+    plan_id: planId,
+    units: [
+      {
+        id: "unit_a",
+        title: "Unit A",
+        depends_on: [],
+        objective: "Append a fixture note to WORK.md for unit A.",
+        requirements: ["WORK.md must contain unit A's fixture note."],
+        files: ["WORK.md"],
+        approach: ["Append the deterministic unit A fixture note."],
+        tests: ["Run the configured structured walking skeleton test command."],
+        acceptance: ["Unit A's fixture note is present."],
+        verification: ["The structured walking skeleton test command passes for unit A."],
+      },
+      {
+        id: "unit_b",
+        title: "Unit B",
+        depends_on: ["unit_a"],
+        objective: "Append a fixture note to WORK.md for unit B.",
+        requirements: ["WORK.md must contain unit B's fixture note."],
+        files: ["WORK.md"],
+        approach: ["Append the deterministic unit B fixture note after unit A integrates."],
+        tests: ["Run the configured structured walking skeleton test command."],
+        acceptance: [`Unit B's fixture note is present.${unitBAcceptanceSuffix}`],
+        verification: ["The structured walking skeleton test command passes for unit B."],
+      },
+    ],
+    commands: [],
+  };
+}
+
+function buildLegacyTwoUnitPlanV1({ planId }) {
+  return {
     schema: "openthrottle.execution-plan/v1",
     graph_id: "structured",
     plan_id: planId,
@@ -674,7 +709,7 @@ function buildTwoUnitPlan({ planId, unitBAcceptanceSuffix = "" }) {
     },
     acceptance: {
       unit_a_done: "Unit A's fixture note is present.",
-      unit_b_done: `Unit B's fixture note is present.${unitBAcceptanceSuffix}`,
+      unit_b_done: "Unit B's fixture note is present.",
     },
     units: [
       { id: "unit_a", title: "Unit A", depends_on: [], instructions: ["implement_a"], acceptance: ["unit_a_done"] },
@@ -685,7 +720,7 @@ function buildTwoUnitPlan({ planId, unitBAcceptanceSuffix = "" }) {
 }
 
 function taskContextFor(plan) {
-  return ["Approved structured plan.", "", "```json openthrottle.execution-plan/v1", JSON.stringify(plan, null, 2), "```"].join("\n");
+  return ["Approved structured plan.", "", `\`\`\`json ${plan.schema}`, JSON.stringify(plan, null, 2), "```"].join("\n");
 }
 
 function setupInstance({ db, pipelines, tickets, runtimeDescriptor, fixture, issueId, plan }) {
@@ -1046,23 +1081,24 @@ async function runHappyPath({ db, container, fixture }) {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario: restart/replay -- paused at a genuinely NON-TERMINAL, mid-flight
-// point (unit_a integrated, unit_b not yet started -- real outstanding
-// work), a fresh processor and runtime bound to the SAME durable store must
-// resume without re-running or duplicating unit_a's already-completed
-// integration. Re-draining an already-terminal attempt (the prior version of
-// this scenario) can't exercise that resume path at all, and its aggregate
-// check could pass vacuously as null === null; this drives the run to a
-// real, non-null aggregate hash.
+// Scenario: legacy v1 restart/replay -- paused at a genuinely NON-TERMINAL,
+// mid-flight point (unit_a integrated, unit_b not yet started -- real
+// outstanding work), a fresh processor and runtime bound to the SAME durable
+// store must resume without re-running or duplicating unit_a's already-completed
+// integration. This is the focused already-sealed v1 replay proof; fresh
+// structured plans use the v2 builder above. Re-draining an already-terminal
+// attempt (the prior version of this scenario) can't exercise that resume path
+// at all, and its aggregate check could pass vacuously as null === null; this
+// drives the run to a real, non-null aggregate hash.
 // ---------------------------------------------------------------------------
 
 async function runReplayScenario({ db, container, fixture }) {
-  log("scenario: restart/replay from a non-terminal mid-integration state does not duplicate integration");
+  log("scenario: legacy v1 restart/replay from a non-terminal mid-integration state does not duplicate integration");
   const pipelines = createPipelineStore(db);
   const tickets = createSupervisorStore(db, pipelines);
   const runtimeDescriptor = readRuntimeDescriptor(container);
   const runtimeA = createDockerSandboxRuntime(container);
-  const plan = buildTwoUnitPlan({ planId: "walking-skeleton-replay" });
+  const plan = buildLegacyTwoUnitPlanV1({ planId: "walking-skeleton-replay" });
   const { instance, attempt } = setupInstance({
     db,
     pipelines,

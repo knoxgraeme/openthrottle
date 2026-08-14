@@ -19,7 +19,7 @@ import {
   parseTuneTaskContract,
   validateTuneAnalysisInputContract,
   validateTuneSealedIntentContract,
-  type AnyExecutionPlanContract,
+  type ExecutionPlanContractV2,
   type TuneCorpusRow,
 } from "@openthrottle/contracts";
 import type {
@@ -42,6 +42,7 @@ import { assertStructuredPlanLoopEnvelopeBound } from "../pipeline/structured-lo
 import type { RepositorySkillPackage } from "../pipeline/manifest.js";
 import type { PipelineStore } from "../pipeline/store.js";
 import { extractJsonBlocks, extractJsonBlocksAny } from "../pipeline/markdown.js";
+import type { StageRequestInputArtifact } from "../pipeline/stage-request.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
 import { admissionMaintenanceError } from "../persistence/maintenance-store.js";
@@ -53,6 +54,7 @@ import type { PipelineCoordinatorContext, SessionServicePorts } from "./session-
 
 const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
 const EXECUTION_PLAN_FENCES = EXECUTION_PLAN_SCHEMAS;
+const EXECUTION_PLAN_ARTIFACT_SCHEMA_VERSION = 2;
 const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
 const TUNE_TASK_FENCE = TUNE_TASK_SCHEMA;
 const BUILTIN_SIMPLE_GRAPH = fileURLToPath(new URL("../../graphs/simple-v1.json", import.meta.url));
@@ -235,13 +237,33 @@ function extractShipSelectionGraphId(context: string): string | undefined {
 // missing required fields, unresolved dependency references, values over
 // bound -- is therefore rejected here, naming the offending unit and field,
 // never inside a provisioned sandbox (OPE-166).
-function extractExecutionPlan(context: string): AnyExecutionPlanContract | undefined {
+function extractExecutionPlan(context: string): ExecutionPlanContractV2 | undefined {
   const blocks = extractJsonBlocksAny(context, EXECUTION_PLAN_FENCES);
   if (blocks.length === 0) return undefined;
   if (blocks.length > 1) {
     throw new Error(`expected at most one execution-plan block, found ${blocks.length}`);
   }
-  return parseAnyExecutionPlanContract(blocks[0]!, { source: "issue.execution_plan" }).value;
+  const plan = parseAnyExecutionPlanContract(blocks[0]!, { source: "issue.execution_plan" }).value;
+  if (plan.schema !== EXECUTION_PLAN_SCHEMA_V2) {
+    throw new Error(`fresh structured admission requires ${EXECUTION_PLAN_SCHEMA_V2}; ${EXECUTION_PLAN_FENCE} is replay-only`);
+  }
+  return plan;
+}
+
+function executionPlanInputArtifact(plan: ExecutionPlanContractV2 | undefined): StageRequestInputArtifact[] | undefined {
+  if (!plan) return undefined;
+  const payload = canonicalJson({
+    schema: EXECUTION_PLAN_SCHEMA_V2,
+    execution_plan: plan,
+  });
+  return [{
+    kind: "stage_result",
+    schemaVersion: EXECUTION_PLAN_ARTIFACT_SCHEMA_VERSION,
+    assurance: "executor_verified",
+    subject: null,
+    payload,
+    hash: digestNormalized(payload),
+  }];
 }
 
 async function sealTuneTaskContext(input: {
@@ -344,7 +366,7 @@ async function sealTuneTaskContext(input: {
 function extractRequestedGraph(context: string): {
   graphId?: string;
   hasExecutionPlan: boolean;
-  executionPlan?: AnyExecutionPlanContract;
+  executionPlan?: ExecutionPlanContractV2;
 } {
   const selected = extractShipSelectionGraphId(context);
   const executionPlan = extractExecutionPlan(context);
@@ -531,7 +553,7 @@ async function resolvePipelineSelection(
     }
   }
   if (compiled.manifest.manifest.requires.capabilities.includes(FOR_EACH_UNIT_CAPABILITY) && !requested.hasExecutionPlan) {
-    throw new Error(`graph ${graphId} requires a canonical ${EXECUTION_PLAN_FENCE} block (or its ${EXECUTION_PLAN_SCHEMA_V2} successor)`);
+    throw new Error(`graph ${graphId} requires a canonical ${EXECUTION_PLAN_SCHEMA_V2} block`);
   }
   if (compiled.manifest.manifest.requires.capabilities.includes(FOR_EACH_UNIT_CAPABILITY) && requested.executionPlan) {
     assertStructuredPlanLoopEnvelopeBound(requested.executionPlan, {
@@ -758,6 +780,7 @@ export async function handleCreated(
     manifest: ValidatedPipelineManifest;
     snapshot: ReturnType<PipelineStore["saveRepositoryConfigSnapshot"]>;
     taskContext: string;
+    inputArtifacts?: StageRequestInputArtifact[];
   };
   const boundedTaskContext = composeBoundedTaskContext(initialContext, {
     requireLinearSections: hasSuppliedPromptContext,
@@ -824,6 +847,9 @@ export async function handleCreated(
     if (boundedTaskContext.ordinaryLimitError) {
       throw new Error(boundedTaskContext.ordinaryLimitError);
     }
+    const inputArtifacts = taskType === "implement"
+      ? executionPlanInputArtifact(requested.executionPlan)
+      : undefined;
     const taskContext = taskType === "tune"
       ? await sealTuneTaskContext({
         context: boundedTaskContext.selectionContext,
@@ -850,7 +876,7 @@ export async function handleCreated(
       config: repositoryConfig,
     });
     coordinator.store.acceptManifest(manifest);
-    pinned = { remote, manifest, snapshot, taskContext };
+    pinned = { remote, manifest, snapshot, taskContext, inputArtifacts };
   } catch (error) {
     await failSelection(error);
     return;
@@ -894,6 +920,7 @@ export async function handleCreated(
         authorizedCapabilities: pinned.manifest.manifest.requires.capabilities,
         taskType,
         taskContext: pinned.taskContext,
+        inputArtifacts: pinned.inputArtifacts,
       },
     });
   } catch (error) {
