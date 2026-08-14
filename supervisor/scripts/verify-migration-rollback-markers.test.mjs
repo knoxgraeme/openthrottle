@@ -17,7 +17,24 @@ function source(...definitions) {
     "const definitions: DatabaseMigrationDefinition[] = [",
     ...definitions,
     "];",
-    "export const databaseMigrations = definitions;",
+    "export const databaseMigrations: DatabaseMigration[] = definitions.map((migration) => ({",
+    "  ...migration,",
+    '  checksum: createHash("sha256").update(migration.source).digest("hex"),',
+    "}));",
+    "",
+  ].join("\n");
+}
+
+function sourceWithCatalogUse(use, ...definitions) {
+  return [
+    "const definitions: DatabaseMigrationDefinition[] = [",
+    ...definitions,
+    "];",
+    use,
+    "export const databaseMigrations: DatabaseMigration[] = definitions.map((migration) => ({",
+    "  ...migration,",
+    '  checksum: createHash("sha256").update(migration.source).digest("hex"),',
+    "}));",
     "",
   ].join("\n");
 }
@@ -147,5 +164,25 @@ describe("migration rollback marker verifier", () => {
       `  { version: 48, name: "two${suffix}", source: "" },`,
     )}`;
     expect(() => assertMigrationNamesMarked(input)).toThrow(/exactly one top-level/);
+  });
+
+  it.each([
+    ["push mutation", 'definitions.push({ version: 48, name: "unmarked", source: "" });'],
+    ["alias mutation", 'const alias = definitions; alias.push({ version: 48, name: "unmarked", source: "" });'],
+    ["direct name mutation", 'definitions[0].name = "unmarked";'],
+  ])("rejects a %s outside the canonical catalog literal", (_label, use) => {
+    const input = sourceWithCatalogUse(
+      use,
+      `  { version: 47, name: "safe${suffix}", source: "" },`,
+    );
+    expect(() => assertMigrationNamesMarked(input)).toThrow(/may only be referenced/);
+  });
+
+  it("rejects a projection that can override a marked migration name", () => {
+    const input = sourceWithCatalogUse(
+      "",
+      `  { version: 47, name: "safe${suffix}", source: "" },`,
+    ).replace("  checksum:", '  name: "unmarked",\n  checksum:');
+    expect(() => assertMigrationNamesMarked(input)).toThrow(/canonical databaseMigrations export projection/);
   });
 });

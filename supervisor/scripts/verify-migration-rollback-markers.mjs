@@ -2,6 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 const DEFINITIONS_PATH = "supervisor/src/persistence/migrations/definitions.ts";
 const DEFINITIONS_DECLARATION = "const definitions: DatabaseMigrationDefinition[] = [";
@@ -149,6 +150,94 @@ function topLevelMigrationObjects(source) {
   throw new Error("could not statically parse the database migration definitions array");
 }
 
+function isExportedMigrationProjection(identifier, sourceFile) {
+  const access = identifier.parent;
+  if (!ts.isPropertyAccessExpression(access) || access.expression !== identifier || access.name.text !== "map") {
+    return false;
+  }
+  const call = access.parent;
+  if (!ts.isCallExpression(call) || call.expression !== access || call.arguments.length !== 1) return false;
+  const declaration = call.parent;
+  if (
+    !ts.isVariableDeclaration(declaration) ||
+    declaration.initializer !== call ||
+    !ts.isIdentifier(declaration.name) ||
+    declaration.name.text !== "databaseMigrations"
+  ) return false;
+  const declarationList = declaration.parent;
+  const statement = declarationList.parent;
+  if (
+    !ts.isVariableDeclarationList(declarationList) ||
+    (declarationList.flags & ts.NodeFlags.Const) === 0 ||
+    !ts.isVariableStatement(statement) ||
+    statement.parent !== sourceFile ||
+    !statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
+  ) return false;
+
+  const callback = call.arguments[0];
+  if (
+    !ts.isArrowFunction(callback) ||
+    callback.parameters.length !== 1 ||
+    !ts.isIdentifier(callback.parameters[0].name) ||
+    callback.parameters[0].name.text !== "migration"
+  ) return false;
+  const body = ts.isParenthesizedExpression(callback.body) ? callback.body.expression : callback.body;
+  if (!ts.isObjectLiteralExpression(body) || body.properties.length !== 2) return false;
+  const [migrationSpread, checksum] = body.properties;
+  return ts.isSpreadAssignment(migrationSpread) &&
+    ts.isIdentifier(migrationSpread.expression) &&
+    migrationSpread.expression.text === "migration" &&
+    ts.isPropertyAssignment(checksum) &&
+    ts.isIdentifier(checksum.name) &&
+    checksum.name.text === "checksum";
+}
+
+function assertCanonicalDefinitionsUsage(source) {
+  const sourceFile = ts.createSourceFile(
+    "definitions.ts",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
+  if (sourceFile.parseDiagnostics.length > 0) {
+    throw new Error("database migration source must be syntactically valid TypeScript");
+  }
+
+  const identifiers = [];
+  function visit(node) {
+    if (ts.isIdentifier(node) && node.text === "definitions") identifiers.push(node);
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+
+  const declarations = identifiers.filter((identifier) =>
+    ts.isVariableDeclaration(identifier.parent) && identifier.parent.name === identifier
+  );
+  if (declarations.length !== 1) {
+    throw new Error("database migration catalog must have exactly one definitions binding");
+  }
+  const declaration = declarations[0].parent;
+  const declarationList = declaration.parent;
+  const statement = declarationList.parent;
+  if (
+    !ts.isVariableDeclarationList(declarationList) ||
+    (declarationList.flags & ts.NodeFlags.Const) === 0 ||
+    !ts.isVariableStatement(statement) ||
+    statement.parent !== sourceFile ||
+    !ts.isArrayLiteralExpression(declaration.initializer)
+  ) {
+    throw new Error("database migration definitions binding must be one top-level const array literal");
+  }
+
+  const references = identifiers.filter((identifier) => identifier !== declarations[0]);
+  if (references.length !== 1 || !isExportedMigrationProjection(references[0], sourceFile)) {
+    throw new Error(
+      "database migration definitions may only be referenced by the canonical databaseMigrations export projection"
+    );
+  }
+}
+
 function assertCanonicalMigrationProperties(object, definitionIndex) {
   const allowedProperties = new Set(["version", "name", "source", "mode", "up"]);
   const properties = new Set();
@@ -252,7 +341,9 @@ function assertCanonicalMigrationProperties(object, definitionIndex) {
 }
 
 export function migrationDefinitionsFromSource(source) {
-  const definitions = topLevelMigrationObjects(source).map((object, index) => {
+  const objects = topLevelMigrationObjects(source);
+  assertCanonicalDefinitionsUsage(source);
+  const definitions = objects.map((object, index) => {
     assertCanonicalMigrationProperties(object, index + 1);
     const match = object.match(
       /^\s*\{\s*version\s*:\s*(\d+)\s*,\s*name[ \t]*:[ \t]*"((?:[^"\\]|\\.)*)"[ \t]*,/s
