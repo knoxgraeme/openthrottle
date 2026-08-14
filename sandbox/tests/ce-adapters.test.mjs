@@ -108,6 +108,16 @@ describe("OpenThrottle canonical task skills", () => {
     expect(existsSync(resolve(repoRoot, "supervisor/src/scheduler.ts"))).toBe(false);
   });
 
+  it("resolves OpenCode's provider-specific model before entrypoint validation", () => {
+    const entrypoint = readFileSync(resolve(repoRoot, "sandbox/entrypoint.sh"), "utf8");
+    expect(entrypoint).toContain('CFG_AGENT_MODEL="$(yq_get ".agent_defaults.${AGENT}.model" \'\')"');
+    expect(entrypoint).toContain('if [[ -z "$RESOLVED_CONFIG_MODEL" && "$CFG_AGENT" == "$AGENT" ]]');
+    expect(entrypoint).toContain('OPENCODE_MODEL="$RESOLVED_CONFIG_MODEL"');
+    expect(entrypoint.indexOf('CFG_AGENT_MODEL="$(yq_get')).toBeLessThan(
+      entrypoint.indexOf('OPENCODE_MODEL="$RESOLVED_CONFIG_MODEL"'),
+    );
+  });
+
   it("keeps core execution policies aligned with installed stage contracts", () => {
     const implement = readFileSync(resolve(repoRoot, "supervisor/pipelines/core-implement-v4.yaml"), "utf8");
     const investigate = readFileSync(resolve(repoRoot, "supervisor/pipelines/core-investigate-v1.yaml"), "utf8");
