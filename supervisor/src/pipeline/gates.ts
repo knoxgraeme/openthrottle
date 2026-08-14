@@ -6,6 +6,7 @@ import {
 } from "@openthrottle/contracts";
 import {
   ASSURANCE_CLASSES,
+  PIPELINE_OUTCOMES,
   STAGE_OUTCOMES,
   canonicalJson,
   digestNormalized,
@@ -832,11 +833,22 @@ export function processProviderEvidence(
   return coordinatePipelineEvent(store, event, undefined, providerGateReceipt(instance, attempt, stage, event));
 }
 
+const TERMINAL_INSTANCE_STATUSES = new Set<string>(PIPELINE_OUTCOMES);
+
 export function drainDeferredProviderEvidence(store: PipelineStore, limit = 50): number {
   let processed = 0;
   for (const record of store.listPendingInboxEvents("provider_snapshot", limit)) {
     const instance = store.getInstance(record.pipeline_instance_id);
-    if (!instance || instance.status !== "waiting_provider") continue;
+    if (!instance || TERMINAL_INSTANCE_STATUSES.has(instance.status)) {
+      // A terminal or vanished instance can never return to waiting_provider,
+      // and the pending query is a global oldest-first window: leaving these
+      // rows pending would eventually starve every live deferred event.
+      store.markInboxEventDead(record.id);
+      continue;
+    }
+    // A live instance that is merely mid-stage keeps its row pending; the
+    // evidence becomes coordinatable when it re-enters waiting_provider.
+    if (instance.status !== "waiting_provider") continue;
     const event = JSON.parse(record.payload) as PipelineCoordinatorEvent;
     const attempt = store.getAttempt(event.attemptId);
     if (!attempt || attempt.pipeline_instance_id !== instance.id) {

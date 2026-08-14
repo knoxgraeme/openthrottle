@@ -200,7 +200,7 @@ describe("unit effect processor", () => {
     expect(store.markActionDispatched).not.toHaveBeenCalled();
   });
 
-  it("keeps non-final-review dispatch failures on the existing caller retry path", async () => {
+  it("backs off retryable non-final-review dispatch failures through the observation budget", async () => {
     const leased = action({ action_kind: "implement" });
     const store = storeFor(leased);
     const runtime: UnitEffectRuntime = {
@@ -215,10 +215,82 @@ describe("unit effect processor", () => {
       runtime,
       leaseOwner: "owner",
       now: () => new Date("2026-07-29T00:00:00.000Z"),
-    }).drain("attempt-parent")).rejects.toThrow("worker provider unavailable");
+    }).drain("attempt-parent")).resolves.toEqual(leased);
 
-    expect(store.recordActionObservationFailure).not.toHaveBeenCalled();
+    expect(store.recordActionObservationFailure).toHaveBeenCalledWith({
+      actionId: "action-1",
+      expectedFailureCount: 0,
+      expectedEpoch: 1,
+      lastError: expect.stringMatching(/observation_attempt=1\/3 .*retryable=true status=502/),
+      retryAtIso: "2026-07-29T00:00:05.000Z",
+    });
     expect(store.failUnitAction).not.toHaveBeenCalled();
+    expect(store.stopRetryableUnitAction).not.toHaveBeenCalled();
+    expect(store.markActionDispatched).not.toHaveBeenCalled();
+  });
+
+  it("terminalizes exhausted retryable non-final-review dispatch failures through the retryable stop", async () => {
+    const leased = action({
+      action_kind: "implement",
+      status: "dispatched",
+      request_hash: "request-hash",
+      request_payload: "{}",
+      request_launch_state: "prepared",
+      observation_failure_count: 2,
+    });
+    const store = storeFor(leased);
+    const runtime: UnitEffectRuntime = {
+      collectUnitAction: vi.fn(),
+      dispatchUnitAction: vi.fn(async () => {
+        throw Object.assign(new Error("worker provider unavailable"), { statusCode: 502 });
+      }),
+    };
+
+    await createUnitEffectProcessor({
+      store,
+      runtime,
+      leaseOwner: "owner",
+      now: () => new Date("2026-07-29T00:00:00.000Z"),
+    }).drain("attempt-parent");
+
+    expect(store.stopRetryableUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: "action-1",
+      lastError: expect.stringMatching(/observation_attempt=3\/3 .*retryable=true status=502/),
+      observationExhaustion: {
+        expectedFailureCount: 2,
+        expectedEpoch: 0,
+        exhaustedFailureCount: 3,
+      },
+    }));
+    expect(store.failUnitAction).not.toHaveBeenCalled();
+    expect(store.markActionDispatched).not.toHaveBeenCalled();
+  });
+
+  it("terminalizes a deterministic non-final-review dispatch failure through the action fail path", async () => {
+    const leased = action({ action_kind: "implement" });
+    const store = storeFor(leased);
+    const runtime: UnitEffectRuntime = {
+      collectUnitAction: vi.fn(async () => null),
+      dispatchUnitAction: vi.fn(async () => {
+        throw Object.assign(new Error("worker authorization denied"), { statusCode: 403 });
+      }),
+    };
+
+    await expect(createUnitEffectProcessor({
+      store,
+      runtime,
+      leaseOwner: "owner",
+      now: () => new Date("2026-07-29T00:00:00.000Z"),
+    }).drain("attempt-parent")).resolves.toEqual(leased);
+
+    expect(store.failUnitAction).toHaveBeenCalledWith({
+      actionId: "action-1",
+      resultHash: expect.any(String),
+      outcome: "failure",
+      lastError: expect.stringMatching(/implement dispatch failed: .*retryable=false status=403/),
+      nativeSessionId: null,
+    });
+    expect(store.recordActionObservationFailure).not.toHaveBeenCalled();
     expect(store.stopRetryableUnitAction).not.toHaveBeenCalled();
   });
 

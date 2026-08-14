@@ -1173,6 +1173,14 @@ async function runReplayScenario({ db, container, fixture }) {
     runtime: runtimeA,
     taskTimeoutSeconds: 300,
     now: () => new Date(),
+    // The pause below depends on one-child-action-per-drain granularity: the
+    // production walk would collect unit_a's integrate result and lease
+    // unit_b's first action inside the same drain(), so the predicate could
+    // never observe "unit_a integrated, unit_b untouched". Capping the setup
+    // processor's walk at 1 restores that granularity; the restart processor
+    // below keeps the production default so the replay proof runs against
+    // real multi-action drain behavior.
+    maxChildDrainsPerTick: 1,
   });
 
   const unitAIntegrated = await drainWithBackoff(

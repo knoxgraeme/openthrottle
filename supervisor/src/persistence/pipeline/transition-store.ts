@@ -34,7 +34,7 @@ function attemptStatusForOutcome(
 
 export function createTransitionStore(db: Database.Database, now: () => string): Pick<
   PipelineStore,
-  "getInboxEvent" | "listPendingInboxEvents" | "enqueueInboxEvent" | "applyTransition"
+  "getInboxEvent" | "listPendingInboxEvents" | "markInboxEventDead" | "enqueueInboxEvent" | "applyTransition"
 > {
   const getInstanceStmt = db.prepare("SELECT * FROM pipeline_instances WHERE id = ?");
   const getAttemptStmt = db.prepare("SELECT * FROM pipeline_stage_attempts WHERE id = ?");
@@ -491,6 +491,12 @@ export function createTransitionStore(db: Database.Database, now: () => string):
         WHERE kind = ? AND status = 'pending'
         ORDER BY created_at, id LIMIT ?
       `).all(kind, limit) as PipelineInboxEventRecord[];
+    },
+    markInboxEventDead(id) {
+      db.prepare(`
+        UPDATE pipeline_inbox_events SET status = 'dead'
+        WHERE id = ? AND status = 'pending'
+      `).run(id);
     },
     enqueueInboxEvent,
     applyTransition,

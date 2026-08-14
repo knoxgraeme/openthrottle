@@ -77,6 +77,7 @@ import type { PipelineInstance, PipelineStore } from "../pipeline/store.js";
 import type { StageRequestEnvelope } from "../pipeline/stage-request.js";
 import type {
   ExecutionGateReceipt,
+  ExecutionUnitGraph,
   ExecutionUnitStore,
   ExecutionWorkAttempt,
   ExecutionWorkPrivateArtifact,
@@ -99,6 +100,9 @@ const GIT_SHA1_SUBJECT = /^[a-f0-9]{40}$/;
 // Head slice for a non-success diagnostic stored as lastError -- fits inside
 // the 2,000-char budget the store applies (unit-store.ts) with room to spare.
 const DIAGNOSTIC_TEXT_HEAD_CHARS = 1_500;
+// Bounds the per-tick child-action walk in drainCompositeChildren so one
+// graph with a deep chain of ready results cannot monopolize a drain tick.
+const MAX_CHILD_DRAINS_PER_TICK = 64;
 
 function terminalPayloadForLoopResult(result: LoopActionResult): string | undefined {
   if (!result.recoveryArtifact) return undefined;
@@ -174,6 +178,11 @@ type StructuredChildRuntimeDeps = {
   // that action's own sealed request (see collectChildAction). Best-effort:
   // malformed/stale/unchanged blobs are rejected by the callee.
   captureCodexAuth?: (blob: string) => void;
+  // Per-tick bound on the drainCompositeChildren walk. Production always uses
+  // the default; harnesses that must pause a run at an exact mid-flight state
+  // (sandbox/tests/structured-walking-skeleton.mjs) set 1 to restore
+  // one-action-per-drain granularity for their setup phase.
+  maxChildDrainsPerTick?: number;
 };
 
 type LoopDispatchBinding = {
@@ -257,15 +266,22 @@ export function aggregateOutcomeFor(
   return units.some((unit) => unit.terminalLevel === "failed" || unit.alarm) ? "failure" : "needs_human";
 }
 
-function stoppedAggregateOutcome(stopReason: string | null, attempts: readonly ExecutionWorkAttempt[]): StageOutcome {
+function stoppedAggregateOutcome(
+  stopOutcome: ExecutionUnitGraph["stop_outcome"],
+  attempts: readonly ExecutionWorkAttempt[]
+): StageOutcome {
   const terminalAttemptOutcome = terminalAttemptOutcomeFor(attempts);
   if (terminalAttemptOutcome === "needs_human") return "needs_human";
+  // The typed stop_outcome is the only stop-side authority; stop_reason is
+  // sanitized agent text and must never select the outcome. Graphs stopped
+  // before the typed column existed (NULL) take the conservative
+  // non-retryable path below.
   if (terminalAttemptOutcome === "retryable_infrastructure_failure" ||
-      /\bretryable_infrastructure_failure\b/i.test(stopReason ?? "")) {
+      stopOutcome === "retryable_infrastructure_failure") {
     return "retryable_infrastructure_failure";
   }
-  if (terminalAttemptOutcome === "failure" || attempts.some((attempt) => attempt.status === "failed") ||
-      /\b(fail(?:ed|ure)?|error|timed out|missed heartbeat)\b/i.test(stopReason ?? "")) {
+  if (terminalAttemptOutcome === "failure" || stopOutcome === "failure" ||
+      attempts.some((attempt) => attempt.status === "failed")) {
     return "failure";
   }
   return "needs_human";
@@ -2769,16 +2785,45 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     },
 
     async drainCompositeChildren(resource, instance, parentAttemptId) {
-      const action = await createUnitEffectProcessor({
+      // The processor settles at most one child action per drain() call, and
+      // the only production driver is a periodic tick: walking the drain here
+      // lets a chain of already-collectable results land in one tick instead
+      // of one scheduler interval each. A drain that did not settle a fresh
+      // result (a dispatch, an in-flight wait, or an observation backoff)
+      // ends the walk -- polling the same child again in the same tick cannot
+      // advance it -- and the settled-id fence keeps a store that failed to
+      // advance a settled action from being collected forever.
+      const settledActionIds = new Set<string>();
+      let settledResultThisDrain = false;
+      const processor = createUnitEffectProcessor({
         store: deps.store,
         runtime: {
           dispatchUnitAction: (action) => dispatchChildAction(resource, instance, action),
-          collectUnitAction: (action) => collectChildAction(resource, instance, action),
+          collectUnitAction: async (action) => {
+            if (settledActionIds.has(action.id)) return null;
+            const result = await collectChildAction(resource, instance, action);
+            if (result) {
+              settledActionIds.add(action.id);
+              settledResultThisDrain = true;
+            }
+            return result;
+          },
         },
         leaseOwner: `pipeline-effects:${instance.id}`,
         now: deps.now,
-      }).drain(parentAttemptId);
-      if (action) return;
+      });
+      const maxChildDrains = deps.maxChildDrainsPerTick ?? MAX_CHILD_DRAINS_PER_TICK;
+      for (let drains = 1; ; drains += 1) {
+        settledResultThisDrain = false;
+        const action = await processor.drain(parentAttemptId);
+        if (!action) {
+          // A tick that processed child work leaves the aggregate for the
+          // next tick, exactly as the single-drain behavior did.
+          if (drains > 1) return;
+          break;
+        }
+        if (!settledResultThisDrain || drains >= maxChildDrains) return;
+      }
       const graph = deps.store.getGraphForAttempt(parentAttemptId);
       if (!graph) return;
       const parentAttempt = deps.store.getAttempt(parentAttemptId);
@@ -2787,7 +2832,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       const attempts = deps.store.listWorkAttempts(parentAttemptId);
       const gates = deps.store.listGateReceipts(parentAttemptId);
       const outcome = graph.stopped_at
-        ? stoppedAggregateOutcome(graph.stop_reason, attempts)
+        ? stoppedAggregateOutcome(graph.stop_outcome, attempts)
         : aggregateOutcomeFor(units, gates, attempts);
       if (!outcome) return;
       if (outcome === "success" && graph.final_phase !== "done") return;

@@ -1842,6 +1842,50 @@ describe("deterministic supervisor stage gates", () => {
     ).get(fixture.attempt.id)).toEqual({ evaluator_kind: "provider", result: "passed" });
   });
 
+  it("marks deferred provider evidence dead once its instance is terminal while live rows survive", async () => {
+    const fixture = setup("core/implement@4");
+    const publishedCommit = "d".repeat(40);
+    fixture.db.prepare(`
+      UPDATE pipeline_stage_attempts
+      SET stage_id = 'provider', native_context_policy = 'none', expected_subject = ?
+      WHERE id = ?
+    `).run(SUBJECT, fixture.attempt.id);
+    fixture.db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'completion_pending_publication', active_stage_id = 'provider',
+          immutable_subject = ?, published_commit = ?, published_subject = ?
+      WHERE id = ?
+    `).run(SUBJECT, publishedCommit, SUBJECT, fixture.instance.id);
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
+    expect(await routePipelineProviderEvent({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      ticket: fixture.tickets.getByIssueId("issue-1")!,
+      eventId: "provider-deferred-terminal",
+      outcome: "success",
+      summary: "GitHub reports the pull request merged.",
+      evidence: ["https://github.com/owner/repo/pull/1"],
+      payload: { merged: true, head_sha: publishedCommit },
+      headSha: publishedCommit,
+      pullRequestUrl: "https://github.com/owner/repo/pull/1",
+    })).toBe(true);
+    expect(fixture.pipelines.getInboxEvent("provider-deferred-terminal")?.status).toBe("pending");
+
+    // Live but mid-publication: the deferred row survives untouched so it can
+    // coordinate when the instance returns to waiting_provider.
+    expect(await drainDeferredProviderEvidence(fixture.pipelines)).toBe(0);
+    expect(fixture.pipelines.getInboxEvent("provider-deferred-terminal")?.status).toBe("pending");
+
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'failed', terminal_outcome = 'failed' WHERE id = ?
+    `).run(fixture.instance.id);
+    expect(await drainDeferredProviderEvidence(fixture.pipelines)).toBe(0);
+    expect(fixture.pipelines.getInboxEvent("provider-deferred-terminal")?.status).toBe("dead");
+    // The dead row no longer occupies the global oldest-first pending window.
+    expect(fixture.pipelines.listPendingInboxEvents("provider_snapshot")).toEqual([]);
+  });
+
   it.each([
     { merged: true, terminalOutcome: "shipped" },
     { merged: false, terminalOutcome: "no_change" },

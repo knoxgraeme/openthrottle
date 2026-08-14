@@ -188,17 +188,22 @@ export function createUnitEffectProcessor(input: {
       try {
         dispatched = await input.runtime.dispatchUnitAction(action);
       } catch (error) {
+        // Every action kind takes the bounded path: retryable dispatch faults
+        // burn the observation budget (terminalizing through the retryable
+        // stop when it exhausts), deterministic ones terminal-fail at once.
+        // Rethrowing here would retry identical dispatches without a budget
+        // and abort the caller's whole per-ticket drain cycle.
         const observed = serializeRuntimeObservationError(`dispatch child action ${action.id}`, error);
-        if (action.action_kind !== "final_review") throw error;
         if (observed.retryable) {
           recordObservationFailure(observationFence, observed.text);
           return action;
         }
-        const lastError = `final-review dispatch failed: ${observed.text}`.slice(0, 2_000);
+        const kindLabel = action.action_kind.replace(/_/g, "-");
+        const lastError = `${kindLabel} dispatch failed: ${observed.text}`.slice(0, 2_000);
         input.store.failUnitAction({
           actionId: action.id,
           resultHash: digestCanonicalJson({
-            schema: "openthrottle.final-review-dispatch-failure/v1",
+            schema: `openthrottle.${kindLabel}-dispatch-failure/v1`,
             action_id: action.id,
             error: observed.text,
           }),

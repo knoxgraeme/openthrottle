@@ -722,6 +722,249 @@ describe("structured child runtime aggregate outcome", () => {
       subject,
     }));
   });
+
+  it.each([
+    {
+      name: "a typed non-retry stop never becomes an infra retry on agent-authored stop text",
+      stopOutcome: "failure" as const,
+      expected: "failure",
+    },
+    {
+      name: "a typed retryable stop drives the infra-retry outcome",
+      stopOutcome: "retryable_infrastructure_failure" as const,
+      expected: "retryable_infrastructure_failure",
+    },
+    {
+      name: "a pre-migration stop without a typed outcome takes the conservative non-retryable path",
+      stopOutcome: null,
+      expected: "needs_human",
+    },
+  ])("drains a stopped graph where $name", async ({ stopOutcome, expected }) => {
+    const subject = "1".repeat(40);
+    // The sanitized agent receipt text carries the literal token; only the
+    // typed stop_outcome may select the aggregate outcome.
+    const poisonedStopReason =
+      "failure: the agent wrote retryable_infrastructure_failure in its receipt";
+    const deadAttempt = action({
+      id: "dead-untyped-stop",
+      action_kind: "final_review",
+      cycle: 1,
+      status: "dead",
+      unit_id: null,
+      execution_unit_id: null,
+      completed_at: "2099-07-22T12:00:00.000Z",
+      last_error: poisonedStopReason,
+    });
+    const parentAttempt = {
+      id: "parent-attempt",
+      pipeline_instance_id: "instance-1",
+      stage_id: "structured",
+      attempt_ordinal: 1,
+      reentry_ordinal: 0,
+      run_id: "run-1",
+      planned_run_id: null,
+      expected_subject: subject,
+      native_session_id: null,
+      request_payload: parentAttemptRequestPayload(),
+      request_hash: "3".repeat(64),
+      idempotency_key: "parent-idempotency-key",
+      context_revision: 1,
+      native_context_policy: "fresh",
+      status: "running",
+      outcome: null,
+      result_hash: null,
+      started_at: "2099-07-22T11:59:00.000Z",
+      completed_at: null,
+      actor_state: "running",
+      last_heartbeat_at: null,
+      settlement_owner: null,
+      settlement_reason: null,
+      termination_confirmed_at: null,
+      quarantine_reason: null,
+      actor_created_at: "2099-07-22T11:59:00.000Z",
+      actor_updated_at: "2099-07-22T11:59:00.000Z",
+      created_at: "2099-07-22T11:59:00.000Z",
+      updated_at: "2099-07-22T11:59:00.000Z",
+    };
+    const instance = {
+      id: "instance-1",
+      ticket_id: "ticket-1",
+      session_id: "session-1",
+      generation: 7,
+      repository: "knoxgraeme/openthrottle-v2",
+      base_commit: "a".repeat(40),
+      immutable_subject: subject,
+      runtime_release: "test-runtime",
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({
+        stages: [{
+          id: "structured",
+          executor: { capability: "graph/for-each-unit@1" },
+          evaluator: { assurance: "semantic_attested" },
+        }],
+      }),
+    };
+    const completeParentStage = vi.fn(() => instance as any);
+    const emitAggregateOnce = vi.fn(() => "emitted" as const);
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {} as SandboxRuntime,
+      completeParentStage,
+      store: {
+        leaseNextUnitAction: () => undefined,
+        getGraphForAttempt: () => ({
+          stopped_at: "2099-07-22T12:00:00.000Z",
+          stop_reason: poisonedStopReason,
+          stop_outcome: stopOutcome,
+          integration_subject: subject,
+          final_phase: "repair",
+          aggregate_emitted_at: null,
+          aggregate_artifact_hash: null,
+        }),
+        getAttempt: () => parentAttempt,
+        listUnits: () => [unit({ unitId: "unit_a", ordinal: 0, integrationSubject: subject })],
+        listWorkAttempts: () => [deadAttempt],
+        listGateReceipts: () => [],
+        emitAggregateOnce,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren(
+      { providerResourceId: "sandbox-1" },
+      instance as any,
+      "parent-attempt"
+    );
+
+    expect(completeParentStage).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "stage_result",
+      outcome: expected,
+      subject,
+    }));
+  });
+
+  it("settles a chain of collectable child actions in one drainCompositeChildren call", async () => {
+    const first = action({
+      id: "implement-chain-1",
+      action_kind: "implement",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 1,
+      request_hash: "b".repeat(64),
+    });
+    const second = action({
+      id: "implement-chain-2",
+      action_kind: "implement",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 2,
+      request_hash: "b".repeat(64),
+    });
+    const ready = [first, second];
+    const failUnitAction = vi.fn((input: { actionId: string }) => {
+      if (ready[0]?.id === input.actionId) ready.shift();
+    });
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {
+        collectLoopActionResult: async (_resource: unknown, collection: { actionId: string; requestHash: string }) => ({
+          actionId: collection.actionId,
+          attemptId: "parent-attempt",
+          requestHash: collection.requestHash,
+          outcome: "failure",
+          nativeSessionId: null,
+          subject: null,
+          receipt: `loop action failed (reason=${collection.actionId})`,
+          completedAt: "2099-07-22T12:00:00.000Z",
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => ready[0],
+        failUnitAction,
+        getGraphForAttempt: () => undefined,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+    } as any, "parent-attempt");
+
+    // One drain call walks the whole ready chain instead of settling a single
+    // action per 30s scheduler tick.
+    expect(failUnitAction).toHaveBeenCalledTimes(2);
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({ actionId: first.id }));
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({ actionId: second.id }));
+  });
+
+  it("honors the maxChildDrainsPerTick seam so harnesses can pause at one action per drain", async () => {
+    const first = action({
+      id: "implement-capped-1",
+      action_kind: "implement",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 1,
+      request_hash: "b".repeat(64),
+    });
+    const second = action({
+      id: "implement-capped-2",
+      action_kind: "implement",
+      cycle: 1,
+      status: "dispatched",
+      attempt_ordinal: 2,
+      request_hash: "b".repeat(64),
+    });
+    const ready = [first, second];
+    const failUnitAction = vi.fn((input: { actionId: string }) => {
+      if (ready[0]?.id === input.actionId) ready.shift();
+    });
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      maxChildDrainsPerTick: 1,
+      runtime: {
+        collectLoopActionResult: async (_resource: unknown, collection: { actionId: string; requestHash: string }) => ({
+          actionId: collection.actionId,
+          attemptId: "parent-attempt",
+          requestHash: collection.requestHash,
+          outcome: "failure",
+          nativeSessionId: null,
+          subject: null,
+          receipt: `loop action failed (reason=${collection.actionId})`,
+          completedAt: "2099-07-22T12:00:00.000Z",
+        }),
+      } as any,
+      store: {
+        leaseNextUnitAction: () => ready[0],
+        failUnitAction,
+        getGraphForAttempt: () => undefined,
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+      id: "instance-1",
+      active_stage_id: "structured",
+      agent: "codex",
+      generation: 1,
+      base_commit: "a".repeat(40),
+      immutable_subject: "a".repeat(40),
+      manifest_digest: "c".repeat(64),
+      capability_digest: "d".repeat(64),
+      normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
+    } as any, "parent-attempt");
+
+    expect(failUnitAction).toHaveBeenCalledTimes(1);
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({ actionId: first.id }));
+  });
 });
 
 describe("structured child runtime command seeding", () => {
@@ -2090,6 +2333,7 @@ describe("structured child runtime repair fences", () => {
       native_session_id: "native-session-final-repair-1",
     });
     const dispatchLoopAction = vi.fn();
+    const failUnitAction = vi.fn();
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       taskTimeoutSeconds: 300,
@@ -2102,6 +2346,7 @@ describe("structured child runtime repair fences", () => {
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
         markActionWorktreeReady: vi.fn(),
+        failUnitAction,
         listWorkAttempts: () => attempts(finalReview, finalRepair),
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),
@@ -2111,7 +2356,7 @@ describe("structured child runtime repair fences", () => {
       } as any,
     });
 
-    await expect(childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
       id: "instance-1",
       active_stage_id: "structured",
       agent: "codex",
@@ -2121,7 +2366,15 @@ describe("structured child runtime repair fences", () => {
       manifest_digest: "c".repeat(64),
       capability_digest: "d".repeat(64),
       normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings: [] }] }),
-    } as any, "parent-attempt")).rejects.toThrow(error);
+    } as any, "parent-attempt");
+
+    // A deterministic dispatch fence violation terminal-fails the action
+    // through the bounded path instead of rethrowing into the drain cycle.
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: finalRepair.id,
+      outcome: "failure",
+      lastError: expect.stringMatching(error),
+    }));
     expect(dispatchLoopAction).not.toHaveBeenCalled();
   });
 
@@ -2820,6 +3073,7 @@ describe("structured child runtime repair fences", () => {
       childRequests.set(request.actionId, request);
       return { providerDispatchId: `child-${request.actionId}` };
     });
+    const failUnitAction = vi.fn();
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       taskTimeoutSeconds: 300,
@@ -2829,6 +3083,7 @@ describe("structured child runtime repair fences", () => {
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
         markActionWorktreeReady: vi.fn(),
+        failUnitAction,
         listUnits: () => [unit({
           unitId: "unit_a",
           ordinal: 0,
@@ -2940,11 +3195,16 @@ describe("structured child runtime repair fences", () => {
     attempts.push(staleReplay);
     leased = staleReplay;
     dispatchChildExecutorAction.mockClear();
-    await expect(childRuntime.drainCompositeChildren(
+    await childRuntime.drainCompositeChildren(
       { providerResourceId: "sandbox-1" },
       repairCycleStructuredInstance(),
       "parent-attempt"
-    )).rejects.toThrow(/prepared request is not bound to the current unit worktree/);
+    );
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: staleReplay.id,
+      outcome: "failure",
+      lastError: expect.stringMatching(/prepared request is not bound to the current unit worktree/),
+    }));
     expect(dispatchChildExecutorAction).not.toHaveBeenCalled();
   });
 
@@ -3083,6 +3343,7 @@ describe("structured child runtime repair fences", () => {
     });
     const createWorktree = vi.fn(async () => ({ id: "worktree-handle" }));
     const dispatchLoopAction = vi.fn();
+    const failUnitAction = vi.fn();
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       taskTimeoutSeconds: 300,
@@ -3092,6 +3353,7 @@ describe("structured child runtime repair fences", () => {
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
         markActionWorktreeReady: vi.fn(),
+        failUnitAction,
         listWorkAttempts: () => [candidate, repair],
         getGraphForAttempt: () => ({
           integration_subject: staleBaseSubject,
@@ -3100,14 +3362,19 @@ describe("structured child runtime repair fences", () => {
       } as any,
     });
 
-    await expect(childRuntime.drainCompositeChildren(
+    await childRuntime.drainCompositeChildren(
       { providerResourceId: "sandbox-1" },
       structuredInstance({
         base_commit: staleBaseSubject,
         immutable_subject: staleBaseSubject,
       }),
       "parent-attempt"
-    )).rejects.toThrow(/prepared request is not bound to the current unit worktree/);
+    );
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: repair.id,
+      outcome: "failure",
+      lastError: expect.stringMatching(/prepared request is not bound to the current unit worktree/),
+    }));
     expect(createWorktree).not.toHaveBeenCalled();
     expect(dispatchLoopAction).not.toHaveBeenCalled();
   });
@@ -3133,6 +3400,7 @@ describe("structured child runtime repair fences", () => {
     });
     const createWorktree = vi.fn(async () => ({ id: "worktree-handle" }));
     const dispatchLoopAction = vi.fn();
+    const failUnitAction = vi.fn();
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       taskTimeoutSeconds: 300,
@@ -3142,6 +3410,7 @@ describe("structured child runtime repair fences", () => {
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
         markActionWorktreeReady: vi.fn(),
+        failUnitAction,
         listWorkAttempts: () => [lead, repair],
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),
@@ -3151,11 +3420,16 @@ describe("structured child runtime repair fences", () => {
       } as any,
     });
 
-    await expect(childRuntime.drainCompositeChildren(
+    await childRuntime.drainCompositeChildren(
       { providerResourceId: "sandbox-1" },
       repairStructuredInstance(),
       "parent-attempt"
-    )).rejects.toThrow(/requires exactly one rejected candidate evidence/);
+    );
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: repair.id,
+      outcome: "failure",
+      lastError: expect.stringMatching(/requires exactly one rejected candidate evidence/),
+    }));
     expect(createWorktree).not.toHaveBeenCalled();
     expect(dispatchLoopAction).not.toHaveBeenCalled();
   });
@@ -3191,6 +3465,7 @@ describe("structured child runtime repair fences", () => {
     });
     const createWorktree = vi.fn(async () => ({ id: "worktree-handle" }));
     const dispatchLoopAction = vi.fn();
+    const failUnitAction = vi.fn();
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       taskTimeoutSeconds: 300,
@@ -3200,6 +3475,7 @@ describe("structured child runtime repair fences", () => {
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
         markActionWorktreeReady: vi.fn(),
+        failUnitAction,
         listWorkAttempts: () => [firstCandidate, secondCandidate, lead, repair],
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),
@@ -3209,11 +3485,16 @@ describe("structured child runtime repair fences", () => {
       } as any,
     });
 
-    await expect(childRuntime.drainCompositeChildren(
+    await childRuntime.drainCompositeChildren(
       { providerResourceId: "sandbox-1" },
       repairStructuredInstance(),
       "parent-attempt"
-    )).rejects.toThrow(/requires exactly one rejected candidate evidence/);
+    );
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: repair.id,
+      outcome: "failure",
+      lastError: expect.stringMatching(/requires exactly one rejected candidate evidence/),
+    }));
     expect(createWorktree).not.toHaveBeenCalled();
     expect(dispatchLoopAction).not.toHaveBeenCalled();
   });
@@ -3245,6 +3526,7 @@ describe("structured child runtime repair fences", () => {
     });
     const createWorktree = vi.fn(async () => ({ id: "worktree-handle" }));
     const dispatchLoopAction = vi.fn();
+    const failUnitAction = vi.fn();
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       taskTimeoutSeconds: 300,
@@ -3254,6 +3536,7 @@ describe("structured child runtime repair fences", () => {
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
         markActionWorktreeReady: vi.fn(),
+        failUnitAction,
         listWorkAttempts: () => [candidate, lead, repair],
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),
@@ -3263,11 +3546,16 @@ describe("structured child runtime repair fences", () => {
       } as any,
     });
 
-    await expect(childRuntime.drainCompositeChildren(
+    await childRuntime.drainCompositeChildren(
       { providerResourceId: "sandbox-1" },
       repairStructuredInstance(),
       "parent-attempt"
-    )).rejects.toThrow(/rejected candidate subject disagrees/);
+    );
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: repair.id,
+      outcome: "failure",
+      lastError: expect.stringMatching(/rejected candidate subject disagrees/),
+    }));
     expect(createWorktree).not.toHaveBeenCalled();
     expect(dispatchLoopAction).not.toHaveBeenCalled();
   });
@@ -3299,6 +3587,7 @@ describe("structured child runtime repair fences", () => {
       attempt_ordinal: 4,
     });
     const dispatchLoopAction = vi.fn();
+    const failUnitAction = vi.fn();
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       taskTimeoutSeconds: 300,
@@ -3311,6 +3600,7 @@ describe("structured child runtime repair fences", () => {
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
         markActionWorktreeReady: vi.fn(),
+        failUnitAction,
         listWorkAttempts: () => [candidate, lead, repair],
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),
@@ -3320,11 +3610,16 @@ describe("structured child runtime repair fences", () => {
       } as any,
     });
 
-    await expect(childRuntime.drainCompositeChildren(
+    await childRuntime.drainCompositeChildren(
       { providerResourceId: "sandbox-1" },
       repairStructuredInstance(),
       "parent-attempt"
-    )).rejects.toThrow(/triggering lead fence is invalid/);
+    );
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: repair.id,
+      outcome: "failure",
+      lastError: expect.stringMatching(/triggering lead fence is invalid/),
+    }));
     expect(dispatchLoopAction).not.toHaveBeenCalled();
   });
 
@@ -3804,6 +4099,7 @@ describe("structured child runtime repair fences", () => {
       attempt_ordinal: 20,
     });
     const dispatchLoopAction = vi.fn();
+    const failUnitAction = vi.fn();
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       taskTimeoutSeconds: 300,
@@ -3812,6 +4108,7 @@ describe("structured child runtime repair fences", () => {
         leaseNextUnitAction: () => lead,
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
+        failUnitAction,
         listUnits: () => [unit({
           unitId: "unit_a",
           ordinal: 0,
@@ -3830,7 +4127,7 @@ describe("structured child runtime repair fences", () => {
       } as any,
     });
 
-    await expect(childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
       id: "instance-1",
       active_stage_id: "structured",
       agent: "codex",
@@ -3852,7 +4149,12 @@ describe("structured child runtime repair fences", () => {
           }],
         }],
       }),
-    } as any, "parent-attempt")).rejects.toThrow(/prior evidence exceeds aggregate bound/);
+    } as any, "parent-attempt");
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: lead.id,
+      outcome: "failure",
+      lastError: expect.stringMatching(/prior evidence exceeds aggregate bound/),
+    }));
     expect(dispatchLoopAction).not.toHaveBeenCalled();
   });
 
@@ -3903,6 +4205,7 @@ describe("structured child runtime repair fences", () => {
       attempt_ordinal: 21,
     });
     const dispatchLoopAction = vi.fn();
+    const failUnitAction = vi.fn();
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       taskTimeoutSeconds: 300,
@@ -3911,6 +4214,7 @@ describe("structured child runtime repair fences", () => {
         leaseNextUnitAction: () => lead,
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
+        failUnitAction,
         listUnits: () => [unit({
           unitId: "unit_a",
           ordinal: 0,
@@ -3929,7 +4233,7 @@ describe("structured child runtime repair fences", () => {
       } as any,
     });
 
-    await expect(childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
+    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
       id: "instance-1",
       active_stage_id: "structured",
       agent: "codex",
@@ -3951,7 +4255,12 @@ describe("structured child runtime repair fences", () => {
           }],
         }],
       }),
-    } as any, "parent-attempt")).rejects.toThrow(/prior evidence has too many receipts/);
+    } as any, "parent-attempt");
+    expect(failUnitAction).toHaveBeenCalledWith(expect.objectContaining({
+      actionId: lead.id,
+      outcome: "failure",
+      lastError: expect.stringMatching(/prior evidence has too many receipts/),
+    }));
     expect(dispatchLoopAction).not.toHaveBeenCalled();
   });
 });
