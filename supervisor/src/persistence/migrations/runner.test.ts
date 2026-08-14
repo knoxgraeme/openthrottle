@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +21,7 @@ import { createSettingsStore } from "../settings-store.js";
 import { considerCiGithubHead } from "../../providers/github/events.js";
 import {
   applyDatabaseMigrations,
+  applyDatabaseMigrationsForAuthority,
   databaseMigrations,
   ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
 } from "./runner.js";
@@ -27,50 +29,23 @@ import {
 let db: Database.Database | undefined;
 const temporaryDirectories: string[] = [];
 const PREDECESSOR_MIGRATION_VERSION = 45;
+const PREDECESSOR_RELEASE_COMMIT = "463aa48a2d31257e2ccb93b1a48f6e3b550c58c4";
+const PREDECESSOR_ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX =
+  " [rollback-compatible:additive/v1]";
+const PREDECESSOR_MIGRATION_CATALOG_SHA256 =
+  "31171c29d16f19b28e86ec0e5580600c7066547ef309936a4cc10cb6fbeeafdf";
 
-function applyPredecessorMigrationAuthorityThrough45(db: Database.Database): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version INTEGER PRIMARY KEY,
-      name TEXT NOT NULL,
-      checksum TEXT NOT NULL,
-      applied_at TEXT NOT NULL
-    )
-  `);
-  const predecessorMigrations = databaseMigrations.filter(
-    (migration) => migration.version <= PREDECESSOR_MIGRATION_VERSION
-  );
-  const applied = db.prepare(
-    "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
-  ).all() as Array<{ version: number; name: string; checksum: string }>;
-  const hasRollbackCompatibleFuture = applied.some((row) => {
-    const expected = predecessorMigrations.find((migration) => migration.version === row.version);
-    if (expected) {
-      if (row.name !== expected.name || row.checksum !== expected.checksum) {
-        throw new Error(`schema migration ${row.version} checksum mismatch`);
-      }
-      return false;
-    }
-    if (
-      row.version > PREDECESSOR_MIGRATION_VERSION &&
-      row.name.endsWith(ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX)
-    ) {
-      return true;
-    }
-    throw new Error(
-      `database has incompatible newer schema version ${row.version}; this release supports ${PREDECESSOR_MIGRATION_VERSION}`
-    );
-  });
-  if (hasRollbackCompatibleFuture) {
-    const missing = predecessorMigrations.find(
-      (migration) => !applied.some((row) => row.version === migration.version)
-    );
-    if (missing) {
-      throw new Error(
-        `database has rollback-compatible future migrations but is missing known schema migration ${missing.version}`
-      );
-    }
-  }
+function migrationCatalogDigest(
+  migrations: ReadonlyArray<{ version: number; name: string; checksum: string; mode?: string }>
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify(migrations.map(({ version, name, checksum, mode }) => ({
+      version,
+      name,
+      checksum,
+      mode: mode ?? null,
+    }))))
+    .digest("hex");
 }
 
 function builtinUnitPhaseBindings(): PipelineUnitPhaseBinding[] {
@@ -1345,10 +1320,25 @@ describe("database migrations", () => {
     `).run()).not.toThrow();
   });
 
-  it("reopens a v46 database under the v45 migration authority", () => {
+  it(`reopens a v46 database under the v45 migration authority from ${PREDECESSOR_RELEASE_COMMIT.slice(0, 7)}`, () => {
     const directory = mkdtempSync(join(tmpdir(), "openthrottle-v46-reopen-"));
     temporaryDirectories.push(directory);
     const path = join(directory, "supervisor.db");
+    const predecessorMigrations = databaseMigrations.filter(
+      (migration) => migration.version <= PREDECESSOR_MIGRATION_VERSION
+    );
+
+    // This is the migration authority shipped by the exact release immediately
+    // preceding v46. The digest prevents this proof from silently following a
+    // later edit to the current catalog while the production runner seam keeps
+    // the runtime behavior identical to normal supervisor startup.
+    expect(predecessorMigrations.at(-1)).toMatchObject({
+      version: PREDECESSOR_MIGRATION_VERSION,
+      name: "supervisor-maintenance-admission-epoch",
+      checksum: "072679bbc79c4a0f930e8d56be07c4a1a4a124014c0e1453be9709306765a197",
+    });
+    expect(migrationCatalogDigest(predecessorMigrations))
+      .toBe(PREDECESSOR_MIGRATION_CATALOG_SHA256);
 
     db = openDb(path);
     const v46 = databaseMigrations.find((migration) => migration.version === 46)!;
@@ -1362,7 +1352,11 @@ describe("database migrations", () => {
 
     db = new Database(path);
     db.pragma("foreign_keys = ON");
-    applyPredecessorMigrationAuthorityThrough45(db);
+    applyDatabaseMigrationsForAuthority(db, {
+      migrations: predecessorMigrations,
+      rollbackCompatibleMigrationNameSuffix:
+        PREDECESSOR_ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+    });
     const settings = createSettingsStore(db);
     settings.setSetting("rollback-compatible-v46-reopen-test", "opened");
     expect(settings.getSetting("rollback-compatible-v46-reopen-test")).toBe("opened");
@@ -1370,7 +1364,11 @@ describe("database migrations", () => {
       .toEqual({ name: "deployment_cutovers" });
     db.prepare("UPDATE schema_migrations SET name = ? WHERE version = 46")
       .run("deployment-cutover-transaction [rollback-compatible:additive/v2]");
-    expect(() => applyPredecessorMigrationAuthorityThrough45(db!)).toThrow(/incompatible newer schema version 46/i);
+    expect(() => applyDatabaseMigrationsForAuthority(db!, {
+      migrations: predecessorMigrations,
+      rollbackCompatibleMigrationNameSuffix:
+        PREDECESSOR_ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+    })).toThrow(/incompatible newer schema version 46/i);
   });
 
   it("creates only the missing deployment cutover index when the table already exists", () => {
