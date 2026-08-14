@@ -105,6 +105,7 @@ export interface ReviewFanoutUnitContext {
   title: string;
   instructions: readonly string[];
   acceptance: readonly string[];
+  files?: readonly string[];
 }
 
 export interface ReviewFanoutPlan {
@@ -184,6 +185,7 @@ function normalizedSearchText(input: {
   return [
     unit?.id,
     unit?.title,
+    ...(unit?.files ?? []),
     ...instructionText,
     ...acceptanceText,
     ...(input.commandNames ?? []),

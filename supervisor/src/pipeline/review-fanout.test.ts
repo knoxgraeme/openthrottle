@@ -76,6 +76,31 @@ describe("review fanout runtime contract", () => {
     expect(new Set(plan.personas.map((persona) => persona.id)).size).toBe(plan.personas.length);
   });
 
+  it("matches v2 title and file path risk signals without prose keywords", () => {
+    const subject = "8".repeat(40);
+    const plan = buildReviewFanoutPlan({
+      subject,
+      unit: {
+        id: "unit_schema_auth",
+        title: "Normalize standards adapter",
+        instructions: ["Plain implementation text."],
+        acceptance: ["Plain acceptance text."],
+        files: [
+          "supervisor/src/persistence/migrations/definitions.ts",
+          "supervisor/src/providers/github/auth.ts",
+        ],
+      },
+    });
+
+    expect(plan.personas.map((persona) => persona.id)).toEqual([
+      "correctness-dataflow",
+      "tests-contracts",
+      "security",
+      "data-migration",
+      "project-standards",
+    ]);
+  });
+
   it("requires every selected persona to complete against the exact subject before synthesis", () => {
     const subject = "2".repeat(40);
     const plan = buildReviewFanoutPlan({

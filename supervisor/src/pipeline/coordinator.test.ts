@@ -28,6 +28,7 @@ import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { ExecutionGateDecision } from "./execution-gates.js";
 import type { GateReceiptReason } from "./gates.js";
 import { createLinearOutboxProcessor } from "../providers/linear/outbox.js";
+import type { StageRequestInputArtifact } from "./stage-request.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -85,7 +86,10 @@ describe("pipeline coordinator", () => {
   let db: Database.Database | undefined;
   afterEach(() => db?.close());
 
-  function setup(manifestKey = "fixture/command@1") {
+  function setup(
+    manifestKey = "fixture/command@1",
+    options: { inputArtifacts?: StageRequestInputArtifact[] } = {}
+  ) {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
     const tickets = createSupervisorStore(db, pipelines);
@@ -122,6 +126,7 @@ describe("pipeline coordinator", () => {
         authorizedCapabilities: manifest.manifest.requires.capabilities,
         taskType: "implement",
         taskContext: "Approved ticket plan",
+        inputArtifacts: options.inputArtifacts,
       },
     });
     const instance = pipelines.getInstanceForSession("session-1")!;
@@ -1760,6 +1765,31 @@ describe("pipeline coordinator", () => {
       kind: "dispatch_stage",
       payload: next.request_payload,
     });
+  });
+
+  it("carries sealed input artifacts into an implement repair attempt", () => {
+    const sealedPlanPayload = canonicalJson({
+      schema: "openthrottle.execution-plan/v2",
+      execution_plan: { schema: "openthrottle.execution-plan/v2", graph_id: "structured", plan_id: "sealed" },
+    });
+    const inputArtifacts = [{
+      kind: "stage_result" as const,
+      schemaVersion: 2,
+      assurance: "executor_verified" as const,
+      subject: null,
+      payload: sealedPlanPayload,
+      hash: digestNormalized(sealedPlanPayload),
+    }];
+    const { pipelines, instance } = setup("core/implement@4", { inputArtifacts });
+    const repaired = coordinatePipelineEvent(
+      pipelines,
+      event(instance, pipelines.getActiveAttempt(instance.id)!, "semantic_repair_required", "repair-request")
+    );
+    const next = pipelines.getActiveAttempt(repaired.id)!;
+    const request = pipelines.getStageRequest(next.id);
+
+    expect(request.taskContext).toBe("Approved ticket plan");
+    expect(request.inputArtifacts).toEqual(inputArtifacts);
   });
 
   it("cannot enter provider wait until the publishing stage establishes an exact subject", () => {
