@@ -91,6 +91,12 @@ receive `GITHUB_TOKEN`.
   itself instead of failing with `Could not find App`.
 - Changes under `supervisor/` (or a freshly built snapshot, whose staged
   secret applies on release) run `flyctl deploy --remote-only`.
+- Changes to `supervisor/src/persistence/migrations/definitions.ts`, including
+  `workflow_dispatch` runs on such refs, pause and drain admission before
+  deploy and require the live pre-deploy supervisor's cutover evidence to
+  advertise
+  `schema-migrations-name-additive-rollback-compatible/v1` before the new image
+  can open SQLite.
 - `workflow_dispatch` inputs force either half manually. The optional
   `prepare_v12_cutover` path invokes the Fly-local cutover client to pause
   admission, wait for the bounded fail-closed drain to clear, deploy, recheck
@@ -114,6 +120,17 @@ manually dispatch with `prepare_v12_cutover`, `resume_after_v12_cutover`, and
 the current `expected_snapshot`. The rollback pair is the previous supervisor
 image plus its exact `DAYTONA_SNAPSHOT`; resume only after cutover evidence
 shows that identity and a clear drain.
+
+Schema-migration cutovers also require a two-release sequence. Deploy the
+rollback-compatible migration runner first and confirm
+`/deployment/cutover-evidence` reports
+`schema-migrations-name-additive-rollback-compatible/v1`; only then may a later
+release apply additive future migrations marked in `schema_migrations.name` with
+` [rollback-compatible:additive/v1]`. The deploy workflow enforces that proof
+for push and `workflow_dispatch` runs on refs that change
+`supervisor/src/persistence/migrations/definitions.ts` before the new supervisor
+image can open SQLite. Unmarked or malformed future ledger rows remain
+startup-fatal for rollback safety.
 
 The cutover client executes inside the Fly machine and reads
 `OT_DEPLOY_TOKEN` there. GitHub Actions never stores or receives that token.

@@ -753,7 +753,7 @@ sentence, or links rendered after it.
 | `GET` | `/oauth/callback` | one-time OAuth state | exchange and store installation |
 | `GET` | `/status` | `OT_STATUS_TOKEN` bearer | tickets and pipeline/effect/publication state |
 | `GET` | `/capabilities` | `OT_STATUS_TOKEN` bearer | active runtime release, capability digest/IDs, and effective limits |
-| `GET` | `/deployment/cutover-evidence` | `OT_DEPLOY_TOKEN` bearer | bounded, fail-closed admission drain plus runtime and snapshot identity |
+| `GET` | `/deployment/cutover-evidence` | `OT_DEPLOY_TOKEN` bearer | bounded, fail-closed admission drain plus runtime, snapshot, and migration rollback-compatibility identity |
 | `POST` | `/maintenance/admission/pause` | `OT_DEPLOY_TOKEN` bearer | pause new admission and advance the maintenance epoch before deploy drain |
 | `POST` | `/maintenance/admission/resume` | `OT_DEPLOY_TOKEN` bearer | resume new admission after cutover evidence is clear |
 | `GET` | `/analysis/runs` | `OT_STATUS_TOKEN` bearer | read-only, filterable `run_outcomes` evidence for improvement proposals |
@@ -974,6 +974,24 @@ tables such as `run_liveness`, `session_executions`,
 `pipeline_runtime_resources`, `run_stage_bindings`, and
 `pipeline_work_bindings` remain in immutable migrations only; live state is
 stored on the owning actor, session, instance, attempt, or work row.
+
+Rollback-compatible migration cutovers use a two-release sequence. First deploy
+a supervisor that advertises
+`schema-migrations-name-additive-rollback-compatible/v1` in
+`/deployment/cutover-evidence`. Only after that evidence is live may a later
+release apply additive, rollback-compatible future migrations whose
+`schema_migrations.name` deliberately ends with
+` [rollback-compatible:additive/v1]`. Older supervisors that implement this
+contract still validate every known migration name and checksum exactly, and
+they fail closed on any unknown future row without that exact suffix or with a
+malformed suffix.
+The deploy workflow treats changes to
+`supervisor/src/persistence/migrations/definitions.ts` as migration-bearing
+releases, including `workflow_dispatch` runs on such refs: before deployment it
+pauses admission, waits for a clear drain, and requires the live pre-deploy
+supervisor's cutover evidence to expose that database contract. This preserves
+the initial precursor bootstrap while making later migration-bearing releases
+prove rollback compatibility before they open SQLite.
 
 Citation-backed proposal flows use a separate provider-neutral citation gate.
 `/analysis/citations/grade` is still the only production path that resolves
@@ -1208,6 +1226,14 @@ after that release is installed, every push that builds a new snapshot must
 pause and drain before deploy, then verify the pinned runtime release, runtime
 digest, and exact snapshot before resuming admission. A manual cutover without
 a snapshot build must supply the exact expected snapshot explicitly.
+Any cutover release that adds a schema migration must also verify the live
+pre-deploy supervisor's `/deployment/cutover-evidence` includes the expected
+`schema-migrations-name-additive-rollback-compatible/v1` database contract
+before it opens and mutates SQLite. The deploy workflow enforces this for
+push and `workflow_dispatch` runs on refs that change
+`supervisor/src/persistence/migrations/definitions.ts`; the standalone
+precursor release itself remains a supervisor-only bootstrap because its parent
+cannot yet advertise the contract.
 
 Optional/defaulted:
 
