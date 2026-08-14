@@ -72,6 +72,37 @@ import type { RuntimeInventory, RuntimeLogs, RuntimeSnapshotReadiness } from "..
 import { executeRawCitationGate } from "./citation-executor.js";
 
 const MAX_CITATION_CONTRACT_BYTES = 256 * 1024;
+const MAX_CUTOVER_EVIDENCE_CHARS = 4_000;
+const CUTOVER_PHASES = new Set([
+  "registered",
+  "paused",
+  "drain_clear",
+  "staged",
+  "deployed",
+  "verified",
+  "restored",
+  "recovery_required",
+  "resumed",
+]);
+
+function boundedString(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${field} must be a non-empty string`);
+  }
+  return sanitizeText(value).slice(0, 500);
+}
+
+function boundedEvidence(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error("evidence must be a string");
+  return sanitizeText(value).slice(0, MAX_CUTOVER_EVIDENCE_CHARS);
+}
+
+function cutoverPhase(value: unknown) {
+  const phase = boundedString(value, "phase");
+  if (!CUTOVER_PHASES.has(phase)) throw new Error(`unsupported cutover phase: ${phase}`);
+  return phase as Parameters<SupervisorStore["advanceDeploymentCutover"]>[0]["phase"];
+}
 
 export interface ServerDeps {
   cfg: Config;
@@ -545,6 +576,7 @@ export function createServer(deps: ServerDeps): Hono {
         capabilityDigest: deps.pipelineCoordinator.runtime.digest,
       },
       snapshot: cfg.daytonaSnapshot,
+      cutover: store.getOpenDeploymentCutover() ?? null,
       database: {
         migrationRollbackCompatibility: {
           contract: MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT,
@@ -554,6 +586,48 @@ export function createServer(deps: ServerDeps): Hono {
       },
       drain,
     });
+  });
+
+  app.post("/deployment/cutover/begin", async (context) => {
+    if (!requireDeployAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    try {
+      const body = await context.req.json().catch(() => ({})) as Record<string, unknown>;
+      const cutover = store.beginDeploymentCutover({
+        id: typeof body.id === "string" && body.id.trim() !== "" ? sanitizeText(body.id).slice(0, 200) : undefined,
+        oldRuntimeRelease: boundedString(body.oldRuntimeRelease, "oldRuntimeRelease"),
+        oldSnapshot: boundedString(body.oldSnapshot, "oldSnapshot"),
+        candidateSnapshot: boundedString(body.candidateSnapshot, "candidateSnapshot"),
+        evidence: boundedEvidence(body.evidence),
+      });
+      return context.json({ cutover });
+    } catch (error) {
+      return context.json({ error: String(error) }, 409);
+    }
+  });
+
+  app.post("/deployment/cutover/advance", async (context) => {
+    if (!requireDeployAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    try {
+      const body = await context.req.json().catch(() => ({})) as Record<string, unknown>;
+      const pauseEpoch = body.pauseEpoch === undefined ? undefined : Number(body.pauseEpoch);
+      const cutover = store.advanceDeploymentCutover({
+        id: boundedString(body.id, "id"),
+        phase: cutoverPhase(body.phase),
+        evidence: boundedEvidence(body.evidence),
+        pauseEpoch: Number.isSafeInteger(pauseEpoch) ? pauseEpoch : undefined,
+        recoveryCommand: body.recoveryCommand === null ? null : boundedEvidence(body.recoveryCommand),
+        status: body.status === "active" || body.status === "completed" || body.status === "recovery_required"
+          ? body.status
+          : undefined,
+      });
+      return context.json({ cutover });
+    } catch (error) {
+      return context.json({ error: String(error) }, 409);
+    }
   });
 
   app.post("/maintenance/admission/pause", async (context) => {
