@@ -6,9 +6,12 @@ and the shape of a revision request the three things worth getting right.
 
 ## 1. Reading an acceptance entry
 
-The `acceptance` entries are the contract. The unit's `instructions` are context
-that explains them; the plan prose around them is background. When the two
-disagree, the acceptance entry decides.
+In the current v2 plan format, both `requirements` and `acceptance` entries are
+the contract. `tests` and `verification` are proof expectations: use them to
+judge whether requirements and acceptance are actually demonstrated, but never
+accept a candidate that meets acceptance while violating a requirement. In a
+legacy replay plan, resolved `instructions` are the requirement context and
+resolved `acceptance` entries remain mandatory.
 
 Classify each entry before judging it:
 
@@ -61,7 +64,7 @@ trips, accept and move on. "I would have done it differently" is not a tripwire;
 
 **Revise when:**
 
-- A stated acceptance entry is unmet at this candidate — behavioural, artifact,
+- A stated requirement or acceptance entry is unmet at this candidate — behavioural, artifact,
   or constraint.
 - The change reaches outside the unit's stated scope in a way that must be
   undone: another unit's files, an unrelated defect fixed in passing, a

@@ -1,5 +1,5 @@
 import {
-  EXECUTION_PLAN_SCHEMA,
+  EXECUTION_PLAN_SCHEMA_V2,
   canonicalJson,
   digestNormalized,
   validateGraphContract,
@@ -153,27 +153,32 @@ export function assertTuneRatchetMaterialBinding(
 }
 
 export function executionPlanForTuneProposal(proposal: TuneProposal) {
-  const instructionIds = proposal.changes.map((_change, index) =>
-    `approved_change_${String(index + 1).padStart(3, "0")}`);
-  const instructions = Object.fromEntries(proposal.changes.map((change, index) => [
-    instructionIds[index]!,
-    `Apply only ${change.operation} for ${change.path} from the sealed openthrottle.tune-change-material/v1 contract. ` +
-      "Use its exact after_content bytes; do not reconstruct content from a digest or rationale.",
-  ]));
   return {
-    schema: EXECUTION_PLAN_SCHEMA,
+    schema: EXECUTION_PLAN_SCHEMA_V2,
     graph_id: "structured",
     plan_id: `tune-${proposal.id}`,
-    instructions,
-    acceptance: {
-      authorized_scope: "The exact sealed tune material is applied and deterministic command and review gates pass.",
-    },
     units: [{
       id: "approved_tune_change",
       title: `Apply approved tune proposal ${proposal.id}`,
       depends_on: [],
-      instructions: instructionIds,
-      acceptance: ["authorized_scope"],
+      objective: "Apply exactly the supervisor-approved tune material.",
+      requirements: [
+        "Apply every authorized change from the sealed openthrottle.tune-change-material/v1 contract. " +
+          "Use each exact after_content byte sequence; do not reconstruct content from a digest or rationale.",
+      ],
+      files: [...new Set(proposal.changes.map((change) => change.path))],
+      approach: [
+        "Read the sealed tune edit verification payload and apply only the authorized changed bytes.",
+      ],
+      tests: [
+        "Run the configured deterministic command gates for the structured graph.",
+      ],
+      acceptance: [
+        "The exact sealed tune material is applied and deterministic command and review gates pass.",
+      ],
+      verification: [
+        "The executor verifies the tune edit authorization and command receipts before integration.",
+      ],
     }],
     commands: [{ name: "test" }, { name: "build" }],
   };

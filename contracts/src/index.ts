@@ -72,6 +72,18 @@ export {
   type ExecutionPlanUnit,
 } from "./execution-plan.js";
 export {
+  EXECUTION_PLAN_SCHEMA_V2,
+  parseExecutionPlanContractV2,
+  validateExecutionPlanContractV2,
+  type ExecutionPlanContractV2,
+  type ExecutionPlanUnitV2,
+} from "./execution-plan-v2.js";
+export {
+  EXECUTION_PLAN_SCHEMAS,
+  parseAnyExecutionPlanContract,
+  type AnyExecutionPlanContract,
+} from "./execution-plan-any.js";
+export {
   RATCHET_ARTIFACT_KINDS,
   RATCHET_CONTRACT_MAX_BYTES,
   RATCHET_CONTRACT_SCHEMA,

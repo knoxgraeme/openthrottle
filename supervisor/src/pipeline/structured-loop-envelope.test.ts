@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { ExecutionPlanContract } from "@openthrottle/contracts";
+import type { ExecutionPlanContract, ExecutionPlanContractV2 } from "@openthrottle/contracts";
 import { canonicalJson } from "./manifest.js";
 import {
   MAX_VALID_DOWNSTREAM_CONTEXT,
+  assertStructuredPlanLoopEnvelopeBound,
   loopActionPlanContext,
   structuredPlanLoopEnvelopeBytes,
 } from "./structured-loop-envelope.js";
@@ -528,5 +529,177 @@ describe("downstream-context admission bound", () => {
     expect(unitDetails.ids[63]).toBe(plan.units[63]!.id);
     expect(unitDetails.titles[0]).toContain("Dense legacy unit 0");
     expect(unitDetails.detail_counts[63]).toEqual([32, 64, 64]);
+  });
+});
+
+function twoUnitPlanV2(): ExecutionPlanContractV2 {
+  return {
+    schema: "openthrottle.execution-plan/v2",
+    graph_id: "structured",
+    plan_id: "v2-dispatch-context",
+    units: [
+      {
+        id: "api",
+        title: "API",
+        depends_on: [],
+        objective: "Build the API behavior.",
+        requirements: ["The API must accept the new input shape."],
+        files: ["src/api.ts"],
+        approach: ["Add the new field to the handler."],
+        tests: ["A request with the new field is accepted."],
+        acceptance: ["The API accepts the new input."],
+        verification: ["Run the API test suite."],
+      },
+      {
+        id: "ui",
+        title: "UI",
+        depends_on: ["api"],
+        objective: "Build the UI behavior.",
+        requirements: ["The UI must render the new state."],
+        files: ["src/ui.ts"],
+        approach: ["Render the new field."],
+        tests: ["The new state renders correctly."],
+        acceptance: ["The UI renders the new state."],
+        verification: ["Run the UI test suite."],
+      },
+    ],
+    commands: [{ name: "test" }],
+  };
+}
+
+describe("v2 self-contained execution-plan dispatch context", () => {
+  it("projects exactly the selected unit's complete typed context, excluding unrelated units and any full-plan text", () => {
+    const plan = twoUnitPlanV2();
+
+    const context = loopActionPlanContext({ plan, actionKind: "implement", unitId: "api" }) as {
+      unit: Record<string, unknown>;
+      commands: Array<{ name: string }>;
+    };
+
+    expect(context.unit).toEqual({
+      id: "api",
+      title: "API",
+      depends_on: [],
+      objective: "Build the API behavior.",
+      requirements: ["The API must accept the new input shape."],
+      files: ["src/api.ts"],
+      approach: ["Add the new field to the handler."],
+      tests: ["A request with the new field is accepted."],
+      acceptance: ["The API accepts the new input."],
+      verification: ["Run the API test suite."],
+    });
+    // No unrelated unit's detail, and no plan-level instructions/acceptance
+    // map (v1's index-over-source-prose shape) leaks into the dispatched context.
+    expect(context).not.toHaveProperty("instructions");
+    expect(context).not.toHaveProperty("acceptance");
+    expect(context).not.toHaveProperty("units");
+    expect(JSON.stringify(context.unit)).not.toContain("\"ui\"");
+    expect(JSON.stringify(context.unit)).not.toContain("UI");
+  });
+
+  it("keeps the final-review whole-plan context lightweight and bounded, still projecting a review-fanout roster", () => {
+    const plan = twoUnitPlanV2();
+
+    const context = loopActionPlanContext({
+      plan,
+      actionKind: "final_review",
+      unitId: null,
+      reviewSubject: "1".repeat(40),
+    }) as {
+      whole_plan: boolean;
+      units: Array<{ id: string; title: string }>;
+      review_fanout: { subject: string; personas: Array<{ id: string }> };
+    };
+
+    expect(context.whole_plan).toBe(true);
+    expect(context.units).toEqual([
+      { id: "api", title: "API", depends_on: [] },
+      { id: "ui", title: "UI", depends_on: ["api"] },
+    ]);
+    expect(context.review_fanout.subject).toBe("1".repeat(40));
+    expect(context.review_fanout.personas.map((persona) => persona.id)).toContain("correctness-dataflow");
+    expect(Buffer.byteLength(canonicalJson(context), "utf8")).toBeLessThanOrEqual(48 * 1024);
+  });
+
+  it.each(["lead", "repair"] as const)(
+    "projects selected-unit completeness and sibling exclusion into v2 %s review fanout",
+    (actionKind) => {
+      const plan = twoUnitPlanV2();
+
+      const context = loopActionPlanContext({
+        plan,
+        actionKind,
+        unitId: "api",
+        reviewSubject: "2".repeat(40),
+      }) as {
+        unit: Record<string, unknown>;
+        review_fanout: { subject: string; personas: Array<{ id: string }> };
+      };
+
+      expect(context.unit).toMatchObject({
+        id: "api",
+        requirements: ["The API must accept the new input shape."],
+        acceptance: ["The API accepts the new input."],
+        verification: ["Run the API test suite."],
+      });
+      expect(JSON.stringify(context)).not.toContain("The UI must render the new state.");
+      expect(context.review_fanout.subject).toBe("2".repeat(40));
+      expect(context.review_fanout.personas.map((persona) => persona.id)).toContain("tests-contracts");
+    }
+  );
+
+  function unitAtFieldScale(id: string, scale: number): ExecutionPlanContractV2["units"][number] {
+    return {
+      id,
+      title: `Unit ${id}`,
+      depends_on: [],
+      objective: "x".repeat(scale),
+      requirements: Array.from({ length: 2 }, () => "x".repeat(scale)),
+      files: Array.from({ length: 2 }, () => "x".repeat(Math.min(scale, 512))),
+      approach: Array.from({ length: 2 }, () => "x".repeat(scale)),
+      tests: Array.from({ length: 2 }, () => "x".repeat(scale)),
+      acceptance: Array.from({ length: 2 }, () => "x".repeat(scale)),
+      verification: Array.from({ length: 2 }, () => "x".repeat(scale)),
+    };
+  }
+
+  it("admits a realistically-sized single-unit v2 plan comfortably under the envelope bound", () => {
+    const plan: ExecutionPlanContractV2 = {
+      schema: "openthrottle.execution-plan/v2",
+      graph_id: "structured",
+      plan_id: "v2-envelope-realistic",
+      units: [unitAtFieldScale("solo", 500)],
+      commands: [{ name: "test" }],
+    };
+
+    expect(() => assertStructuredPlanLoopEnvelopeBound(plan)).not.toThrow();
+    expect(structuredPlanLoopEnvelopeBytes(plan)).toBeLessThanOrEqual(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
+  });
+
+  it("rejects before provisioning a v2 plan whose projected envelope exceeds the limit (requirement: reject, never truncate)", () => {
+    // Every field at the contract's own per-field/array bound, on a single
+    // unit -- structurally valid per the v2 contract, but its dispatch
+    // envelope is far larger than a worker request may carry.
+    const plan: ExecutionPlanContractV2 = {
+      schema: "openthrottle.execution-plan/v2",
+      graph_id: "structured",
+      plan_id: "v2-envelope-oversized",
+      units: [{
+        id: "oversized",
+        title: "Oversized unit",
+        depends_on: [],
+        objective: "x".repeat(2_000),
+        requirements: Array.from({ length: 32 }, () => "x".repeat(2_000)),
+        files: Array.from({ length: 64 }, () => "x".repeat(512)),
+        approach: Array.from({ length: 32 }, () => "x".repeat(2_000)),
+        tests: Array.from({ length: 32 }, () => "x".repeat(2_000)),
+        acceptance: Array.from({ length: 32 }, () => "x".repeat(2_000)),
+        verification: Array.from({ length: 32 }, () => "x".repeat(2_000)),
+      }],
+      commands: [{ name: "test" }],
+    };
+
+    expect(structuredPlanLoopEnvelopeBytes(plan)).toBeGreaterThan(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
+    expect(() => assertStructuredPlanLoopEnvelopeBound(plan)).toThrow(/No sandbox was provisioned/);
   });
 });

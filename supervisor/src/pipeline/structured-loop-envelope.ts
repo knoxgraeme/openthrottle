@@ -1,5 +1,10 @@
-import type { ExecutionPlanContract } from "@openthrottle/contracts";
-import { digestCanonicalJson, digestNormalized } from "@openthrottle/contracts";
+import type {
+  AnyExecutionPlanContract,
+  ExecutionPlanContract,
+  ExecutionPlanContractV2,
+  ExecutionPlanUnitV2,
+} from "@openthrottle/contracts";
+import { EXECUTION_PLAN_SCHEMA_V2, digestCanonicalJson, digestNormalized } from "@openthrottle/contracts";
 import { canonicalJson } from "./manifest.js";
 import type {
   PipelineUnitAgentPhaseBinding,
@@ -21,12 +26,46 @@ export { MAX_LOOP_REQUEST_ENVELOPE_BYTES } from "./structured-loop-limits.js";
 const MAX_NATIVE_SESSION_ID = "n" + "s".repeat(199);
 
 type LoopActionPlanContextInput = {
-  plan: ExecutionPlanContract | null;
+  plan: AnyExecutionPlanContract | null;
   actionKind: UnitActionKind;
   unitId: string | null;
   reviewSubject?: string;
 };
 type ExecutionPlanUnitContext = ExecutionPlanContract["units"][number];
+
+// v2's search text for review-fanout persona triggers is built directly from
+// the unit's own inline fields -- no plan-level instructions/acceptance map
+// exists to resolve IDs against, so each array element already IS the text
+// (see review-fanout.ts's normalizedSearchText fallback when no map is
+// supplied).
+function unitSearchFieldsV2(unit: ExecutionPlanUnitV2): readonly string[] {
+  return [
+    unit.title,
+    unit.objective,
+    ...unit.requirements,
+    ...unit.files,
+    ...unit.approach,
+    ...unit.tests,
+    ...unit.verification,
+  ];
+}
+
+function reviewFanoutUnitContextV2(unit: ExecutionPlanUnitV2 | undefined): {
+  id: string;
+  title: string;
+  instructions: readonly string[];
+  acceptance: readonly string[];
+  files: readonly string[];
+} | undefined {
+  if (!unit) return undefined;
+  return {
+    id: unit.id,
+    title: unit.title,
+    instructions: unitSearchFieldsV2(unit),
+    acceptance: unit.acceptance,
+    files: unit.files,
+  };
+}
 
 const FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES = 48 * 1024;
 
@@ -279,9 +318,130 @@ function addReviewFanoutContext(
   };
 }
 
+// v2 units already carry literal text, not IDs into a plan-level map, so the
+// whole-plan (final_review) search text is synthesized per unit instead of
+// resolved from a shared map.
+function reviewFanoutSearchMapsV2(
+  plan: ExecutionPlanContractV2
+): { instructions: Record<string, string>; acceptance: Record<string, string> } {
+  const instructions: Record<string, string> = {};
+  const acceptance: Record<string, string> = {};
+  plan.units.forEach((unit, index) => {
+    instructions[`unit_${index}`] = unitSearchFieldsV2(unit).join("\n");
+    acceptance[`unit_${index}`] = unit.acceptance.join("\n");
+  });
+  return { instructions, acceptance };
+}
+
+// The whole-plan instructions/acceptance search maps `buildReviewFanoutPlan`
+// uses to trigger optional review personas, resolved for either plan
+// version. Exported so the review orchestration in
+// structured-child-runtime.ts (a separate dispatch path from
+// loopActionPlanContext, for the persona fanout and validator sub-actions)
+// applies the identical rule instead of re-deriving it.
+export function reviewFanoutSearchMapsFor(
+  plan: AnyExecutionPlanContract
+): { instructions: Record<string, string>; acceptance: Record<string, string> } {
+  if (plan.schema === EXECUTION_PLAN_SCHEMA_V2) return reviewFanoutSearchMapsV2(plan);
+  return { instructions: plan.instructions, acceptance: plan.acceptance };
+}
+
+function addReviewFanoutContextV2(
+  context: Record<string, unknown>,
+  input: {
+    subject: string;
+    plan: ExecutionPlanContractV2;
+    unit?: ExecutionPlanUnitV2;
+    commandNames: readonly string[];
+  }
+): Record<string, unknown> {
+  const maps = input.unit ? undefined : reviewFanoutSearchMapsV2(input.plan);
+  return {
+    ...context,
+    review_fanout: buildReviewFanoutPlan({
+      subject: input.subject,
+      unit: reviewFanoutUnitContextV2(input.unit),
+      ...(maps ? { instructions: maps.instructions, acceptance: maps.acceptance } : {}),
+      commandNames: input.commandNames,
+    }),
+  };
+}
+
+// The reviewer works from the diff and prior command/review evidence, not
+// per-unit implementation detail (see skills/tasks/final-review/SKILL.md) --
+// so unlike v1's finalReviewPlanContext, this never needs truncation: a
+// 64-unit worst case (id + title + depends_on only) stays far under
+// FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES.
+function finalReviewPlanContextV2(plan: ExecutionPlanContractV2, actionKind: UnitActionKind): Record<string, unknown> {
+  return {
+    schema: "openthrottle.loop-action-plan-context/v1",
+    graph_id: plan.graph_id,
+    plan_id: plan.plan_id,
+    action_kind: actionKind,
+    unit: null,
+    whole_plan: true,
+    units: plan.units.map((unit) => ({ id: unit.id, title: unit.title, depends_on: unit.depends_on })),
+    commands: plan.commands,
+  };
+}
+
+// The complete typed self-contained unit context (OPE-166): every applicable
+// field the worker needs, copied directly rather than referenced by ID.
+function unitPlanContextV2(unit: ExecutionPlanUnitV2 | undefined): Record<string, unknown> | null {
+  if (!unit) return null;
+  return {
+    id: unit.id,
+    title: unit.title,
+    depends_on: unit.depends_on,
+    objective: unit.objective,
+    requirements: unit.requirements,
+    files: unit.files,
+    approach: unit.approach,
+    tests: unit.tests,
+    acceptance: unit.acceptance,
+    verification: unit.verification,
+  };
+}
+
+function loopActionPlanContextV2(
+  plan: ExecutionPlanContractV2,
+  input: LoopActionPlanContextInput
+): Record<string, unknown> | null {
+  if (input.unitId === null && input.actionKind === "final_review") {
+    const context = finalReviewPlanContextV2(plan, input.actionKind);
+    return input.reviewSubject
+      ? addReviewFanoutContextV2(context, {
+          subject: input.reviewSubject,
+          plan,
+          commandNames: plan.commands.map((command) => command.name),
+        })
+      : context;
+  }
+  const unit = input.unitId ? plan.units.find((unit) => unit.id === input.unitId) : undefined;
+  const commands = input.unitId
+    ? plan.commands.filter((command) => command.unit === undefined || command.unit === input.unitId)
+    : plan.commands;
+  const context = {
+    schema: "openthrottle.loop-action-plan-context/v1",
+    graph_id: plan.graph_id,
+    plan_id: plan.plan_id,
+    action_kind: input.actionKind,
+    unit: unitPlanContextV2(unit),
+    commands,
+  };
+  if ((input.actionKind !== "lead" && input.actionKind !== "repair") || !input.reviewSubject) return context;
+  return addReviewFanoutContextV2(context, {
+    subject: input.reviewSubject,
+    plan,
+    unit,
+    commandNames: commands.map((command) => command.name),
+  });
+}
+
 export function loopActionPlanContext(input: LoopActionPlanContextInput): Record<string, unknown> | null {
   const plan = input.plan;
   if (!plan) return null;
+  if (plan.schema === EXECUTION_PLAN_SCHEMA_V2) return loopActionPlanContextV2(plan, input);
   if (input.unitId === null && input.actionKind === "final_review") {
     const context = finalReviewPlanContext(plan, input.actionKind);
     return input.reviewSubject
@@ -798,7 +958,7 @@ function withAggregatePriorEvidenceBudget(request: Record<string, unknown>): Rec
 }
 
 function loopActionEnvelopeBytes(input: {
-  plan: ExecutionPlanContract;
+  plan: AnyExecutionPlanContract;
   actionKind: UnitActionKind;
   unitId: string | null;
   binding: LoopEnvelopeBinding;
@@ -821,7 +981,7 @@ function loopActionEnvelopeBytes(input: {
 }
 
 function unitEnvelopeActionsForManifest(input: {
-  plan: ExecutionPlanContract;
+  plan: AnyExecutionPlanContract;
   manifest?: ValidatedPipelineManifest;
 }): Array<{
   actionKind: UnitActionKind;
@@ -859,7 +1019,7 @@ function unitEnvelopeActionsForManifest(input: {
 }
 
 export function structuredPlanLoopEnvelopeBytes(
-  plan: ExecutionPlanContract,
+  plan: AnyExecutionPlanContract,
   options: {
     manifest?: ValidatedPipelineManifest;
     selectedAgent?: "claude" | "codex" | "opencode";
@@ -886,7 +1046,7 @@ export function structuredPlanLoopEnvelopeBytes(
 }
 
 export function assertStructuredPlanLoopEnvelopeBound(
-  plan: ExecutionPlanContract,
+  plan: AnyExecutionPlanContract,
   options: {
     manifest?: ValidatedPipelineManifest;
     selectedAgent?: "claude" | "codex" | "opencode";
