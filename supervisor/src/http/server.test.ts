@@ -319,6 +319,7 @@ describe("coordinator-only server", () => {
       admission: { paused: 1, reason: "v12 cutover drain" },
       runtime: { release: descriptor.descriptor.release, capabilityDigest: descriptor.digest },
       snapshot: "snapshot",
+      cutover: null,
       database: {
         migrationRollbackCompatibility: {
           contract: "schema-migrations-name-additive-rollback-compatible/v1",
@@ -366,6 +367,153 @@ describe("coordinator-only server", () => {
     expect(resumed.status).toBe(200);
     expect(await resumed.json()).toMatchObject({
       admission: { paused: 0, epoch: 2, reason: null },
+    });
+  });
+
+  it("persists deployment cutover transactions behind the deploy token", async () => {
+    const descriptor = buildInstalledRuntimeDescriptor("deploy-evidence-test/v1");
+    const runtime = { listLabeledResources: vi.fn(async () => []) } as unknown as ServerRuntime;
+    const server = app({
+      runtime,
+      pipelineCoordinator: { catalog: {} as never, runtime: descriptor, store: pipelines },
+    });
+
+    const unauthorized = await server.request("/deployment/cutover/begin", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token", "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(unauthorized.status).toBe(401);
+
+    const begin = await server.request("/deployment/cutover/begin", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        oldRuntimeRelease: descriptor.descriptor.release,
+        oldSnapshot: "snapshot",
+        candidateSnapshot: "openthrottle-v2-ce-new",
+        evidence: "initial proof",
+      }),
+    });
+    expect(begin.status).toBe(200);
+    const beginBody = await begin.json() as { cutover: { id: string } };
+    expect(beginBody.cutover).toMatchObject({
+      status: "active",
+      phase: "registered",
+      old_runtime_release: descriptor.descriptor.release,
+      old_snapshot: "snapshot",
+      candidate_snapshot: "openthrottle-v2-ce-new",
+    });
+
+    const duplicate = await server.request("/deployment/cutover/begin", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        oldRuntimeRelease: descriptor.descriptor.release,
+        oldSnapshot: "snapshot",
+        candidateSnapshot: "openthrottle-v2-ce-new",
+      }),
+    });
+    expect(await duplicate.json()).toMatchObject({ cutover: { id: beginBody.cutover.id } });
+
+    const ambiguous = await server.request("/deployment/cutover/begin", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        oldRuntimeRelease: descriptor.descriptor.release,
+        oldSnapshot: "snapshot",
+        candidateSnapshot: "openthrottle-v2-ce-other",
+      }),
+    });
+    expect(ambiguous.status).toBe(409);
+
+    const paused = await server.request("/deployment/cutover/advance", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        id: beginBody.cutover.id,
+        phase: "paused",
+        pauseEpoch: 1,
+        evidence: "pause evidence",
+      }),
+    });
+    expect(await paused.json()).toMatchObject({
+      cutover: { phase: "paused", pause_epoch: 1, evidence: "pause evidence" },
+    });
+
+    const evidence = await server.request("/deployment/cutover-evidence", {
+      headers: { Authorization: "Bearer deploy-token" },
+    });
+    expect(await evidence.json()).toMatchObject({
+      cutover: { id: beginBody.cutover.id, phase: "paused", pause_epoch: 1 },
+    });
+  });
+
+  it("keeps compact sealed cutover evidence recoverable through the 4000-character HTTP bound", async () => {
+    const descriptor = buildInstalledRuntimeDescriptor("deploy-evidence-test/v1");
+    const runtime = { listLabeledResources: vi.fn(async () => []) } as unknown as ServerRuntime;
+    const server = app({
+      runtime,
+      pipelineCoordinator: { catalog: {} as never, runtime: descriptor, store: pipelines },
+    });
+    const blockers = Array.from({ length: 50 }, (_, index) => ({
+      id: `session-${index}`,
+      reason: "drain blocker ".repeat(80),
+    }));
+    const oversizedInitialEvidence = JSON.stringify({
+      admission: { paused: 0, epoch: 7 },
+      runtime: { release: descriptor.descriptor.release, capabilityDigest: descriptor.digest },
+      snapshot: "snapshot",
+      drain: { clear: false, blockers },
+    });
+    expect(oversizedInitialEvidence.length).toBeGreaterThan(4_000);
+    const compactSeal = JSON.stringify({
+      schema: "openthrottle.cutover-evidence/v1",
+      event: "begin",
+      source_sha256: `sha256:${"a".repeat(64)}`,
+      summary: {
+        admission: { paused: 0, epoch: 7 },
+        runtime: { release: descriptor.descriptor.release, capabilityDigest: descriptor.digest },
+        snapshot: "snapshot",
+        drain: { clear: false, blocker_count: 50 },
+      },
+      sealed_old_runtime: {
+        old_runtime_capability_digest: descriptor.digest,
+        old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
+      },
+    });
+    expect(compactSeal.length).toBeLessThan(4_000);
+
+    const begin = await server.request("/deployment/cutover/begin", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        oldRuntimeRelease: descriptor.descriptor.release,
+        oldSnapshot: "snapshot",
+        candidateSnapshot: "openthrottle-v2-ce-new",
+        evidence: compactSeal,
+      }),
+    });
+    const beginBody = await begin.json() as { cutover: { id: string; evidence: string } };
+    expect(JSON.parse(beginBody.cutover.evidence).sealed_old_runtime).toEqual({
+      old_runtime_capability_digest: descriptor.digest,
+      old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
+    });
+
+    const paused = await server.request("/deployment/cutover/advance", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        id: beginBody.cutover.id,
+        phase: "paused",
+        pauseEpoch: 8,
+        evidence: JSON.stringify({ ...JSON.parse(compactSeal), event: "paused" }),
+      }),
+    });
+    const pausedBody = await paused.json() as { cutover: { evidence: string } };
+    expect(JSON.parse(pausedBody.cutover.evidence).sealed_old_runtime).toEqual({
+      old_runtime_capability_digest: descriptor.digest,
+      old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
     });
   });
 

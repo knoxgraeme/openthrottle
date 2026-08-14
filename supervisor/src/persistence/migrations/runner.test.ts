@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,12 +21,32 @@ import { createSettingsStore } from "../settings-store.js";
 import { considerCiGithubHead } from "../../providers/github/events.js";
 import {
   applyDatabaseMigrations,
+  applyDatabaseMigrationsForAuthority,
   databaseMigrations,
   ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
 } from "./runner.js";
 
 let db: Database.Database | undefined;
 const temporaryDirectories: string[] = [];
+const PREDECESSOR_MIGRATION_VERSION = 45;
+const PREDECESSOR_RELEASE_COMMIT = "463aa48a2d31257e2ccb93b1a48f6e3b550c58c4";
+const PREDECESSOR_ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX =
+  " [rollback-compatible:additive/v1]";
+const PREDECESSOR_MIGRATION_CATALOG_SHA256 =
+  "31171c29d16f19b28e86ec0e5580600c7066547ef309936a4cc10cb6fbeeafdf";
+
+function migrationCatalogDigest(
+  migrations: ReadonlyArray<{ version: number; name: string; checksum: string; mode?: string }>
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify(migrations.map(({ version, name, checksum, mode }) => ({
+      version,
+      name,
+      checksum,
+      mode: mode ?? null,
+    }))))
+    .digest("hex");
+}
 
 function builtinUnitPhaseBindings(): PipelineUnitPhaseBinding[] {
   const worker = {
@@ -163,6 +184,7 @@ describe("database migrations", () => {
       "816a31439db18b9975c2d66b9dda45f3bfa9375d0d43309b46eeb28acf486a3a",
       "71bba805a7a02e1efb77633f9458b63ce55b7ee6546d2c26ac2124ee3e802c31",
       "072679bbc79c4a0f930e8d56be07c4a1a4a124014c0e1453be9709306765a197",
+      "ccdf4a1bedafc52eea3aab537d55799e666e25cd78ab5dcc61b8c4c976bde7d7",
     ]);
   });
 
@@ -268,7 +290,10 @@ describe("database migrations", () => {
     `).get()).toEqual({ name: "github_webhook_redelivery_process_idx" });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 45, name: "supervisor-maintenance-admission-epoch" });
+    `).get()).toEqual({
+      version: 46,
+      name: `deployment-cutover-transaction${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+    });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
     });
@@ -318,7 +343,10 @@ describe("database migrations", () => {
     });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 45, name: "supervisor-maintenance-admission-epoch" });
+    `).get()).toEqual({
+      version: 46,
+      name: `deployment-cutover-transaction${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+    });
   });
 
   it("adds epoch-fenced observation retry defaults to a v38 work-attempt table", () => {
@@ -1292,40 +1320,93 @@ describe("database migrations", () => {
     `).run()).not.toThrow();
   });
 
-  it("accepts explicitly marked additive future migrations while preserving existing stores", () => {
-    const directory = mkdtempSync(join(tmpdir(), "openthrottle-future-reopen-"));
+  it(`reopens a v46 database under the v45 migration authority from ${PREDECESSOR_RELEASE_COMMIT.slice(0, 7)}`, () => {
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-v46-reopen-"));
     temporaryDirectories.push(directory);
     const path = join(directory, "supervisor.db");
-    const latestKnown = databaseMigrations.at(-1)!;
+    const predecessorMigrations = databaseMigrations.filter(
+      (migration) => migration.version <= PREDECESSOR_MIGRATION_VERSION
+    );
+
+    // This is the migration authority shipped by the exact release immediately
+    // preceding v46. The digest prevents this proof from silently following a
+    // later edit to the current catalog while the production runner seam keeps
+    // the runtime behavior identical to normal supervisor startup.
+    expect(predecessorMigrations.at(-1)).toMatchObject({
+      version: PREDECESSOR_MIGRATION_VERSION,
+      name: "supervisor-maintenance-admission-epoch",
+      checksum: "072679bbc79c4a0f930e8d56be07c4a1a4a124014c0e1453be9709306765a197",
+    });
+    expect(migrationCatalogDigest(predecessorMigrations))
+      .toBe(PREDECESSOR_MIGRATION_CATALOG_SHA256);
 
     db = openDb(path);
+    const v46 = databaseMigrations.find((migration) => migration.version === 46)!;
+    expect(v46.name).toBe(`deployment-cutover-transaction${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`);
+    expect(db.prepare("SELECT version, name, checksum FROM schema_migrations WHERE version = 46").get())
+      .toEqual({ version: 46, name: v46.name, checksum: v46.checksum });
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'deployment_cutovers'").get())
+      .toEqual({ name: "deployment_cutovers" });
     db.close();
     db = undefined;
 
-    const futureDb = new Database(path);
-    futureDb.exec(`
-      CREATE TABLE future_additive_table (
+    db = new Database(path);
+    db.pragma("foreign_keys = ON");
+    applyDatabaseMigrationsForAuthority(db, {
+      migrations: predecessorMigrations,
+      rollbackCompatibleMigrationNameSuffix:
+        PREDECESSOR_ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+    });
+    const settings = createSettingsStore(db);
+    settings.setSetting("rollback-compatible-v46-reopen-test", "opened");
+    expect(settings.getSetting("rollback-compatible-v46-reopen-test")).toBe("opened");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'deployment_cutovers'").get())
+      .toEqual({ name: "deployment_cutovers" });
+    db.prepare("UPDATE schema_migrations SET name = ? WHERE version = 46")
+      .run("deployment-cutover-transaction [rollback-compatible:additive/v2]");
+    expect(() => applyDatabaseMigrationsForAuthority(db!, {
+      migrations: predecessorMigrations,
+      rollbackCompatibleMigrationNameSuffix:
+        PREDECESSOR_ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+    })).toThrow(/incompatible newer schema version 46/i);
+  });
+
+  it("creates only the missing deployment cutover index when the table already exists", () => {
+    db = new Database(":memory:");
+    const createdAt = "2026-08-14T00:00:00.000Z";
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      CREATE TABLE deployment_cutovers (
         id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      INSERT INTO deployment_cutovers(id, status, created_at)
+      VALUES ('cutover-existing', 'active', '${createdAt}');
     `);
-    futureDb.prepare(
-      "INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)"
-    ).run(
-      latestKnown.version + 1,
-      `future-additive${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
-      "future-checksum",
-      "2026-01-01T00:00:00.000Z"
-    );
-    futureDb.close();
+    for (const migration of databaseMigrations.filter(
+      (candidate) => candidate.version <= PREDECESSOR_MIGRATION_VERSION
+    )) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-08-14T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
 
-    db = openDb(path);
+    applyDatabaseMigrations(db);
 
-    const settings = createSettingsStore(db);
-    settings.setSetting("rollback-compatible-future-test", "opened");
-    expect(settings.getSetting("rollback-compatible-future-test")).toBe("opened");
-    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'future_additive_table'").get())
-      .toEqual({ name: "future_additive_table" });
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'deployment_cutovers_open_idx'").get())
+      .toEqual({ name: "deployment_cutovers_open_idx" });
+    expect(db.prepare("SELECT id, status, created_at FROM deployment_cutovers").get()).toEqual({
+      id: "cutover-existing",
+      status: "active",
+      created_at: createdAt,
+    });
   });
 
   it("fails closed on incompatible future migration ledger rows", () => {
