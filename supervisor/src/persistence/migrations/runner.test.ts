@@ -160,7 +160,6 @@ describe("database migrations", () => {
       "71bba805a7a02e1efb77633f9458b63ce55b7ee6546d2c26ac2124ee3e802c31",
       "072679bbc79c4a0f930e8d56be07c4a1a4a124014c0e1453be9709306765a197",
       "60ffc8cdcf07bbdc66fdcd8db7f76d42568f8a07373d3a2abb8415ffa9fe6820",
-      "ed9fb97976fcb38e0e6349f7d9d91ca1414198399bcb5de783586f268a3877d2",
     ]);
   });
 
@@ -203,77 +202,6 @@ describe("database migrations", () => {
     expect(() => insert.run("bad", "a".repeat(64), "c".repeat(40), "d".repeat(64), "b".repeat(64), now, now, "unknown"))
       .toThrow(/CHECK constraint failed/);
     expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
-  });
-
-  it("backfills cutover old runtime authority from parent-runtime evidence", () => {
-    db = new Database(":memory:");
-    db.exec(`
-      CREATE TABLE schema_migrations (
-        version INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        checksum TEXT NOT NULL,
-        applied_at TEXT NOT NULL
-      );
-      CREATE TABLE deployment_cutovers (
-        id TEXT PRIMARY KEY,
-        status TEXT NOT NULL CHECK(status IN ('active', 'completed', 'recovery_required')),
-        old_runtime_release TEXT NOT NULL,
-        old_snapshot TEXT NOT NULL,
-        candidate_snapshot TEXT NOT NULL,
-        pause_epoch INTEGER,
-        phase TEXT NOT NULL CHECK(phase IN (
-          'registered', 'paused', 'drain_clear', 'staged', 'deployed',
-          'verified', 'restored', 'recovery_required', 'resumed'
-        )),
-        evidence TEXT NOT NULL DEFAULT '',
-        recovery_command TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        completed_at TEXT
-      );
-      CREATE UNIQUE INDEX deployment_cutovers_open_idx
-        ON deployment_cutovers((1))
-        WHERE status IN ('active', 'recovery_required');
-    `);
-    for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 46)) {
-      db.prepare(`
-        INSERT INTO schema_migrations(version, name, checksum, applied_at)
-        VALUES (?, ?, ?, '2026-08-14T00:00:00.000Z')
-      `).run(migration.version, migration.name, migration.checksum);
-    }
-    db.prepare(`
-      INSERT INTO deployment_cutovers (
-        id, status, old_runtime_release, old_snapshot, candidate_snapshot,
-        pause_epoch, phase, evidence, recovery_command, created_at, updated_at, completed_at
-      ) VALUES (
-        'snapshot-cutover:openthrottle-v2-ce-new', 'recovery_required',
-        'openthrottle-snapshot/v12', 'openthrottle-v2-ce-old',
-        'openthrottle-v2-ce-new', 7, 'recovery_required', ?, NULL,
-        '2026-08-14T00:00:00.000Z', '2026-08-14T00:01:00.000Z', NULL
-      )
-    `).run(JSON.stringify({
-      admission: { paused: 1, epoch: 7 },
-      runtime: {
-        release: "openthrottle-snapshot/v12",
-        capabilityDigest: "sha256:old-runtime-digest",
-      },
-      snapshot: "openthrottle-v2-ce-old",
-      sealed_old_runtime: {
-        old_runtime_capability_digest: "sha256:old-runtime-digest",
-        old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
-      },
-    }));
-
-    applyDatabaseMigrations(db);
-
-    expect(db.prepare(`
-      SELECT old_runtime_capability_digest, old_runtime_image
-      FROM deployment_cutovers
-      WHERE id = 'snapshot-cutover:openthrottle-v2-ce-new'
-    `).get()).toEqual({
-      old_runtime_capability_digest: "sha256:old-runtime-digest",
-      old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
-    });
   });
 
   it("adds durable GitHub redelivery state to a v35 database without losing deliveries or ledger rows", () => {
@@ -337,7 +265,7 @@ describe("database migrations", () => {
     `).get()).toEqual({ name: "github_webhook_redelivery_process_idx" });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 47, name: "deployment-cutover-runtime-image-authority" });
+    `).get()).toEqual({ version: 46, name: "deployment-cutover-transaction" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
     });
@@ -387,7 +315,7 @@ describe("database migrations", () => {
     });
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
-    `).get()).toEqual({ version: 47, name: "deployment-cutover-runtime-image-authority" });
+    `).get()).toEqual({ version: 46, name: "deployment-cutover-transaction" });
   });
 
   it("adds epoch-fenced observation retry defaults to a v38 work-attempt table", () => {

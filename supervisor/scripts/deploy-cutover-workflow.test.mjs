@@ -73,9 +73,11 @@ describe("deploy workflow cutover recovery", () => {
 
     expect(script.indexOf("active_image_ref()")).toBeLessThan(script.indexOf("begin_payload="));
     expect(script).toContain("oldRuntimeRelease:$oldRuntimeRelease");
-    expect(script).toContain("oldRuntimeCapabilityDigest:$oldRuntimeCapabilityDigest");
-    expect(script).toContain("oldRuntimeImage:$oldRuntimeImage");
     expect(script).toContain("sealed_old_runtime");
+    expect(script).toContain("seal_cutover_evidence()");
+    expect(script).toContain("sealed_evidence=\"$(seal_cutover_evidence \"$evidence\")\"");
+    expect(script).toContain("advance_cutover paused active \"$pause_evidence\" \"\" \"$pause_epoch\"");
+    expect(script).not.toContain("--arg evidence \"$pause_evidence\"");
     expect(script).toContain(".cutover.evidence // \"\" | fromjson?");
     expect(script).toContain("open cutover lacks sealed old runtime capability digest");
     expect(script).toContain("open cutover lacks sealed old Fly image authority");
@@ -87,6 +89,36 @@ describe("deploy workflow cutover recovery", () => {
     expect(script.indexOf("pauseEpoch:$pauseEpoch")).toBeLessThan(
       script.indexOf("DAYTONA_SNAPSHOT=\"$EXPECTED_SNAPSHOT\"")
     );
+  });
+
+  it("seals the paused advance payload before a runner-loss recovery window", () => {
+    const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+    const helperStart = script.indexOf("seal_cutover_evidence() {");
+    const helperEnd = script.indexOf("abort_cutover() {");
+    if (helperStart < 0 || helperEnd < helperStart) throw new Error("missing cutover helper block");
+    const helperBlock = script.slice(helperStart, helperEnd);
+    const harness = `
+set -euo pipefail
+FLY_APP=openthrottle-supervisor
+cutover_id=cutover-1
+old_digest=sha256:old
+old_runtime_image=registry.fly.io/openthrottle-supervisor@sha256:old
+${helperBlock}
+cutover_command() { printf '%s\\n' "$2"; }
+pause_evidence='{"admission":{"paused":1,"epoch":42},"snapshot":"old-snapshot"}'
+advance_cutover paused active "$pause_evidence" "" "42"
+`;
+    const result = spawnSync("bash", ["-c", harness], { cwd: repoRoot, encoding: "utf8" });
+
+    expect(result.status).toBe(0);
+    const payload = JSON.parse(result.stdout);
+    expect(payload.phase).toBe("paused");
+    expect(payload.pauseEpoch).toBe(42);
+    const evidence = JSON.parse(payload.evidence);
+    expect(evidence.sealed_old_runtime).toEqual({
+      old_runtime_capability_digest: "sha256:old",
+      old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
+    });
   });
 
   it("executes the recorded recovery shape as staged old snapshot plus pinned image deploy plus evidence, without resume", () => {

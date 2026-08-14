@@ -191,6 +191,21 @@ jobs:
             printf '%s\n' "$image_ref"
           }
 
+          seal_cutover_evidence() {
+            local evidence="$1"
+            if [[ -z "${old_digest:-}" || -z "${old_runtime_image:-}" ]]; then
+              printf '%s\n' "$evidence"
+              return
+            fi
+            printf '%s\n' "$evidence" | jq -Rsc \
+              --arg digest "$old_digest" \
+              --arg image "$old_runtime_image" \
+              '(try fromjson catch {message: .}) + {sealed_old_runtime: {
+                old_runtime_capability_digest: $digest,
+                old_runtime_image: $image
+              }}'
+          }
+
           cutover_command() {
             local action="$1"
             local payload="${2:-}"
@@ -208,15 +223,20 @@ jobs:
             local status="${2:-active}"
             local evidence="${3:-}"
             local recovery="${4:-}"
+            local pause_epoch_value="${5:-}"
             local payload
+            local sealed_evidence
+            sealed_evidence="$(seal_cutover_evidence "$evidence")"
             payload="$(jq -nc \
               --arg id "$cutover_id" \
               --arg phase "$phase" \
               --arg status "$status" \
-              --arg evidence "$evidence" \
+              --arg evidence "$sealed_evidence" \
               --arg recovery "$recovery" \
+              --arg pauseEpoch "$pause_epoch_value" \
               '{id:$id, phase:$phase, status:$status, evidence:$evidence} +
-               (if $recovery == "" then {} else {recoveryCommand:$recovery} end)')"
+               (if $recovery == "" then {} else {recoveryCommand:$recovery} end) +
+               (if $pauseEpoch == "" then {} else {pauseEpoch: ($pauseEpoch | tonumber)} end)')"
             cutover_command advance "$payload" | jq .
           }
 
@@ -289,23 +309,13 @@ jobs:
             fi
             old_runtime_image="$(active_image_ref)"
           fi
-          begin_evidence_payload="$(printf '%s\n' "$initial_evidence" | jq -c \
-            --arg digest "$old_digest" \
-            --arg image "$old_runtime_image" \
-            '. + {sealed_old_runtime: {
-              old_runtime_capability_digest: $digest,
-              old_runtime_image: $image
-            }}')"
+          begin_evidence_payload="$(seal_cutover_evidence "$initial_evidence")"
           begin_payload="$(jq -nc \
             --arg oldRuntimeRelease "$old_release" \
-            --arg oldRuntimeCapabilityDigest "$old_digest" \
-            --arg oldRuntimeImage "$old_runtime_image" \
             --arg oldSnapshot "$old_snapshot" \
             --arg candidateSnapshot "$EXPECTED_SNAPSHOT" \
             --arg evidence "$begin_evidence_payload" \
-            '{oldRuntimeRelease:$oldRuntimeRelease,
-              oldRuntimeCapabilityDigest:$oldRuntimeCapabilityDigest,
-              oldRuntimeImage:$oldRuntimeImage, oldSnapshot:$oldSnapshot,
+            '{oldRuntimeRelease:$oldRuntimeRelease, oldSnapshot:$oldSnapshot,
               candidateSnapshot:$candidateSnapshot, evidence:$evidence}')"
           begin_evidence="$(cutover_command begin "$begin_payload")"
           printf '%s\n' "$begin_evidence" | jq .
@@ -314,14 +324,7 @@ jobs:
           pause_evidence="$(cutover_command pause)"
           printf '%s\n' "$pause_evidence" | jq .
           pause_epoch="$(printf '%s\n' "$pause_evidence" | jq -r '.admission.epoch')"
-          advance_payload="$(jq -nc \
-            --arg id "$cutover_id" \
-            --arg phase paused \
-            --arg status active \
-            --arg evidence "$pause_evidence" \
-            --argjson pauseEpoch "$pause_epoch" \
-            '{id:$id, phase:$phase, status:$status, evidence:$evidence, pauseEpoch:$pauseEpoch}')"
-          cutover_command advance "$advance_payload" | jq .
+          advance_cutover paused active "$pause_evidence" "" "$pause_epoch"
 
           deadline=$((SECONDS + 600))
           while true; do

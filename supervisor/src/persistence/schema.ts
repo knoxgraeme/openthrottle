@@ -196,8 +196,6 @@ CREATE TABLE IF NOT EXISTS deployment_cutovers (
   id TEXT PRIMARY KEY,
   status TEXT NOT NULL CHECK(status IN ('active', 'completed', 'recovery_required')),
   old_runtime_release TEXT NOT NULL,
-  old_runtime_capability_digest TEXT NOT NULL DEFAULT '',
-  old_runtime_image TEXT NOT NULL DEFAULT '',
   old_snapshot TEXT NOT NULL,
   candidate_snapshot TEXT NOT NULL,
   pause_epoch INTEGER,

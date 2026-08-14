@@ -2348,17 +2348,6 @@ CREATE UNIQUE INDEX deployment_cutovers_open_idx
 const deploymentCutoverMigrationSource = `${deploymentCutoverSchema}
 deployment-cutover-contract:snapshot-changing deploys persist one resumable transaction with old release/snapshot, candidate snapshot, pause epoch, phase, and recovery evidence before staging or activating DAYTONA_SNAPSHOT/v1`;
 
-const deploymentCutoverRuntimeImageMigrationSource = `
-ALTER TABLE deployment_cutovers ADD COLUMN old_runtime_capability_digest TEXT NOT NULL DEFAULT '';
-ALTER TABLE deployment_cutovers ADD COLUMN old_runtime_image TEXT NOT NULL DEFAULT '';
-UPDATE deployment_cutovers
-SET old_runtime_capability_digest = COALESCE(json_extract(evidence, '$.sealed_old_runtime.old_runtime_capability_digest'), '')
-WHERE old_runtime_capability_digest = '' AND json_valid(evidence);
-UPDATE deployment_cutovers
-SET old_runtime_image = COALESCE(json_extract(evidence, '$.sealed_old_runtime.old_runtime_image'), '')
-WHERE old_runtime_image = '' AND json_valid(evidence);
-deployment-cutover-runtime-image-contract:snapshot-changing deploys persist the immutable old Fly image authority and capability digest before secret staging, including parent-runtime evidence backfill, so recovery can redeploy and attest the sealed old supervisor runtime instead of rebuilding the candidate checkout/v1`;
-
 type GithubHeadSource =
   | { kind: "authoritative" }
   | { kind: "sequenced"; source: string; sequence: number };
@@ -3486,28 +3475,6 @@ const definitions: DatabaseMigrationDefinition[] = [
       if (!hasTable(db, "deployment_cutovers")) {
         db.exec(deploymentCutoverSchema);
       }
-    },
-  },
-  {
-    version: 47,
-    name: "deployment-cutover-runtime-image-authority",
-    source: deploymentCutoverRuntimeImageMigrationSource,
-    up(db) {
-      if (!hasTable(db, "deployment_cutovers")) return;
-      if (!hasColumns(db, "deployment_cutovers", ["old_runtime_capability_digest"])) {
-        db.exec("ALTER TABLE deployment_cutovers ADD COLUMN old_runtime_capability_digest TEXT NOT NULL DEFAULT ''");
-      }
-      if (!hasColumns(db, "deployment_cutovers", ["old_runtime_image"])) {
-        db.exec("ALTER TABLE deployment_cutovers ADD COLUMN old_runtime_image TEXT NOT NULL DEFAULT ''");
-      }
-      db.exec(`
-        UPDATE deployment_cutovers
-        SET old_runtime_capability_digest = COALESCE(json_extract(evidence, '$.sealed_old_runtime.old_runtime_capability_digest'), '')
-        WHERE old_runtime_capability_digest = '' AND json_valid(evidence);
-        UPDATE deployment_cutovers
-        SET old_runtime_image = COALESCE(json_extract(evidence, '$.sealed_old_runtime.old_runtime_image'), '')
-        WHERE old_runtime_image = '' AND json_valid(evidence);
-      `);
     },
   },
 ];

@@ -55,9 +55,9 @@ assert(
     deployWorkflow.includes("old_digest=\"$(printf '%s\\n' \"$initial_evidence\" | jq -r '.cutover.old_runtime_capability_digest')\"") &&
     deployWorkflow.includes("old_runtime_image=\"$(printf '%s\\n' \"$initial_evidence\" | jq -r '.cutover.old_runtime_image')\"") &&
     deployWorkflow.includes("old_snapshot=\"$(printf '%s\\n' \"$initial_evidence\" | jq -r '.cutover.old_snapshot')\"") &&
-    deployWorkflow.includes("oldRuntimeCapabilityDigest:$oldRuntimeCapabilityDigest") &&
-    deployWorkflow.includes("oldRuntimeImage:$oldRuntimeImage") &&
     deployWorkflow.includes("sealed_old_runtime") &&
+    deployWorkflow.includes("seal_cutover_evidence()") &&
+    deployWorkflow.includes("sealed_evidence=\"$(seal_cutover_evidence \"$evidence\")\"") &&
     deployWorkflow.includes(".cutover.evidence // \"\" | fromjson?") &&
     deployWorkflow.includes("open cutover lacks sealed old runtime capability digest") &&
     deployWorkflow.includes("open cutover lacks sealed old Fly image authority") &&
