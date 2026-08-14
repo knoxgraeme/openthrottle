@@ -1293,9 +1293,23 @@ describe("database migrations", () => {
   });
 
   it("accepts explicitly marked additive future migrations while preserving existing stores", () => {
-    db = openDb(":memory:");
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-future-reopen-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "supervisor.db");
     const latestKnown = databaseMigrations.at(-1)!;
-    db.prepare(
+
+    db = openDb(path);
+    db.close();
+    db = undefined;
+
+    const futureDb = new Database(path);
+    futureDb.exec(`
+      CREATE TABLE future_additive_table (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL
+      );
+    `);
+    futureDb.prepare(
       "INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)"
     ).run(
       latestKnown.version + 1,
@@ -1303,12 +1317,15 @@ describe("database migrations", () => {
       "future-checksum",
       "2026-01-01T00:00:00.000Z"
     );
+    futureDb.close();
 
-    expect(() => applyDatabaseMigrations(db!)).not.toThrow();
+    db = openDb(path);
 
     const settings = createSettingsStore(db);
     settings.setSetting("rollback-compatible-future-test", "opened");
     expect(settings.getSetting("rollback-compatible-future-test")).toBe("opened");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'future_additive_table'").get())
+      .toEqual({ name: "future_additive_table" });
   });
 
   it("fails closed on incompatible future migration ledger rows", () => {
@@ -1350,6 +1367,23 @@ describe("database migrations", () => {
       db.close();
       db = undefined;
     }
+  });
+
+  it("fails closed on marked future migrations when a known migration is missing", () => {
+    db = openDb(":memory:");
+    const latestKnown = databaseMigrations.at(-1)!;
+    db.prepare("DELETE FROM schema_migrations WHERE version = ?").run(latestKnown.version);
+    db.prepare(
+      "INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z')"
+    ).run(
+      latestKnown.version + 1,
+      `future-additive${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      "future-checksum"
+    );
+
+    expect(() => applyDatabaseMigrations(db!)).toThrow(
+      new RegExp(`missing known schema migration ${latestKnown.version}`)
+    );
   });
 
   it("fails closed on a known migration name or checksum mismatch", () => {

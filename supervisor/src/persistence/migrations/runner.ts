@@ -24,6 +24,7 @@ export function applyDatabaseMigrations(db: Database.Database): void {
       "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
     ).all() as Array<{ version: number; name: string; checksum: string }>;
     const latestKnown = databaseMigrations.at(-1)?.version ?? 0;
+    let hasFutureMigration = false;
     for (const row of applied) {
       const expected = databaseMigrations.find((migration) => migration.version === row.version);
       if (expected) {
@@ -33,6 +34,7 @@ export function applyDatabaseMigrations(db: Database.Database): void {
         continue;
       }
       if (row.version > latestKnown && isMarkedRollbackCompatibleFutureMigration(row.name)) {
+        hasFutureMigration = true;
         continue;
       }
       if (row.version > latestKnown) {
@@ -42,6 +44,16 @@ export function applyDatabaseMigrations(db: Database.Database): void {
       }
       if (!expected) {
         throw new Error(`schema migration ${row.version} checksum mismatch`);
+      }
+    }
+    if (hasFutureMigration) {
+      const missing = databaseMigrations.find(
+        (migration) => !applied.some((row) => row.version === migration.version)
+      );
+      if (missing) {
+        throw new Error(
+          `database has rollback-compatible future migrations but is missing known schema migration ${missing.version}`
+        );
       }
     }
     return applied;

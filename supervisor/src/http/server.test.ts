@@ -9,10 +9,6 @@ import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { createAnalysisStore, type AnalysisStore } from "../persistence/pipeline/analysis-store.js";
 import { createCitationGateStore, type CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
 import { createAdmissionDrainStore } from "../persistence/admission-drain-store.js";
-import {
-  MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT,
-  ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
-} from "../persistence/migrations/runner.js";
 import { STRUCTURED_STATUS_UNITS_SQL } from "../persistence/pipeline/status-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
@@ -325,9 +321,9 @@ describe("coordinator-only server", () => {
       snapshot: "snapshot",
       database: {
         migrationRollbackCompatibility: {
-          contract: MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT,
+          contract: "schema-migrations-name-additive-rollback-compatible/v1",
           markerField: "schema_migrations.name",
-          markerSuffix: ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+          markerSuffix: " [rollback-compatible:additive/v1]",
         },
       },
       drain: { clear: true, blockers: [], truncated: false },
