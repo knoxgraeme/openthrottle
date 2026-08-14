@@ -185,6 +185,7 @@ describe("database migrations", () => {
       "71bba805a7a02e1efb77633f9458b63ce55b7ee6546d2c26ac2124ee3e802c31",
       "072679bbc79c4a0f930e8d56be07c4a1a4a124014c0e1453be9709306765a197",
       "ccdf4a1bedafc52eea3aab537d55799e666e25cd78ab5dcc61b8c4c976bde7d7",
+      "e9ef3b9a4ddc219cfaa755bd72e73580ef497bcb3c361b5622ab1b412a32dd2a",
     ]);
   });
 
@@ -291,8 +292,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 46,
-      name: `deployment-cutover-transaction${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 47,
+      name: `settings-updated-at${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -344,8 +345,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 46,
-      name: `deployment-cutover-transaction${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 47,
+      name: `settings-updated-at${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 
@@ -383,6 +384,134 @@ describe("database migrations", () => {
       FROM pragma_table_info('execution_work_attempts')
       WHERE name = 'observation_epoch'
     `).get()).toEqual({ name: "observation_epoch", notnull: 1, dflt_value: "0" });
+  });
+
+  it("adds the settings write-time column in v47 while retaining legacy rows unstamped", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+      INSERT INTO settings(key, value) VALUES ('github-supervisor-comment:1', 'control-session');
+    `);
+    for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 46)) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-08-14T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare("SELECT key, value, updated_at FROM settings").get()).toEqual({
+      key: "github-supervisor-comment:1",
+      value: "control-session",
+      updated_at: null,
+    });
+    const settings = createSettingsStore(db);
+    settings.setSetting("github-supervisor-comment:1", "control-session");
+    const stamped = db.prepare(
+      "SELECT updated_at FROM settings WHERE key = 'github-supervisor-comment:1'"
+    ).get() as { updated_at: string | null };
+    expect(stamped.updated_at).toBeTruthy();
+    expect(Number.isNaN(Date.parse(stamped.updated_at!))).toBe(false);
+  });
+
+  // Migrations 34 and 35 issue PRAGMA foreign_keys from inside the runner's
+  // exclusive transaction, where SQLite silently ignores it, so both actually
+  // run with foreign keys ON. The next three fences pin the schema properties
+  // that make that safe (see the notes beside the frozen sources in
+  // definitions.ts).
+  it("keeps the v34 publication/effect rebuild safe: no table declares foreign keys into the rebuilt tables", () => {
+    db = openDb(":memory:");
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table'
+        AND (sql LIKE '%REFERENCES pipeline_publication_receipts%'
+          OR sql LIKE '%REFERENCES pipeline_effect_intents%')
+    `).all()).toEqual([]);
+  });
+
+  it("rewrites execution_publication_events' outbox reference through the v35 rename on a fresh database", () => {
+    db = openDb(":memory:");
+    const { sql } = db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'execution_publication_events'
+    `).get() as { sql: string };
+    expect(sql).toMatch(/REFERENCES "?control_outbox"?\s*\(/);
+    expect(sql).not.toContain("linear_outbox");
+  });
+
+  it("rewrites a legacy linear_outbox reference in place when upgrading through v35", () => {
+    db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      CREATE TABLE linear_outbox (
+        id TEXT PRIMARY KEY,
+        linear_session_id TEXT,
+        linear_issue_id TEXT,
+        run_id TEXT,
+        sequence INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT NOT NULL,
+        processed_at TEXT,
+        last_error TEXT,
+        external_id TEXT,
+        external_url TEXT,
+        attachment_url TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE execution_publication_events (
+        id TEXT PRIMARY KEY,
+        linear_outbox_id TEXT NOT NULL,
+        body TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(linear_outbox_id) REFERENCES linear_outbox(id) ON DELETE RESTRICT
+      );
+      INSERT INTO linear_outbox (
+        id, linear_session_id, linear_issue_id, sequence, kind, payload,
+        payload_hash, status, next_attempt_at, created_at
+      ) VALUES (
+        'outbox-1', 'session-1', 'issue-1', 1, 'activity', '{}', 'hash',
+        'processed', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      INSERT INTO execution_publication_events (id, linear_outbox_id, body, created_at)
+      VALUES ('event-1', 'outbox-1', 'published', '2026-01-01T00:00:00.000Z');
+    `);
+    for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 34)) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-01-01T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+
+    applyDatabaseMigrations(db);
+
+    const { sql } = db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'execution_publication_events'
+    `).get() as { sql: string };
+    // RENAME TO only rewrites other tables' REFERENCES clauses while foreign
+    // keys are enabled. If the v35 pragma ever took effect, this reference
+    // would still name the dropped linear_outbox table.
+    expect(sql).toMatch(/REFERENCES "?control_outbox"?\s*\(/);
+    expect(sql).not.toContain("linear_outbox");
+    expect(db.prepare(`
+      SELECT control_outbox_id FROM execution_publication_events WHERE id = 'event-1'
+    `).get()).toEqual({ control_outbox_id: "outbox-1" });
+    expect(db.pragma("foreign_key_check")).toEqual([]);
   });
 
   it("commits a complete ledger that reopens idempotently from a real SQLite file", () => {
@@ -686,6 +815,8 @@ describe("database migrations", () => {
 
     const migration = databaseMigrations.find((candidate) => candidate.version === 35)!;
     migration.up(db);
+    // The current settings store writes the v47 write-time column.
+    databaseMigrations.find((candidate) => candidate.version === 47)!.up(db);
 
     const settings = createSettingsStore(db);
     expect(settings.getSetting("github-head:linear:issue-authoritative")).toBe("authoritative-head");

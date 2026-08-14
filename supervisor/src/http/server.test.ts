@@ -15,6 +15,7 @@ import type { PipelineStore } from "../pipeline/store.js";
 import { loadPipelineCatalog, parseRepositoryConfig, stageById, type PipelineUnitPhaseBinding } from "../pipeline/manifest.js";
 import { parseAndCompileExecutionGraph } from "../pipeline/execution-graph.js";
 import { buildInstalledRuntimeDescriptor, type RuntimeInventory, type RuntimeLogs, type RuntimeSnapshotReadiness } from "../__fixtures__/runtime.js";
+import { beginGithubSupervisorCommentWrite } from "../providers/github/comment-provenance.js";
 import { createServer, createServerWebhookDeliveryProcessor } from "./server.js";
 import { CITATION_GRADE_SCHEMA } from "./citation-executor.js";
 
@@ -139,6 +140,21 @@ describe("coordinator-only server", () => {
       },
       ...overrides,
     });
+  }
+
+  // markDeliveryProcessed settles only a claimed ('processing') delivery, so
+  // tests settle through the same claim -> mark path production uses.
+  function settleDelivery(deliveryId: string): void {
+    db.prepare(`
+      UPDATE webhook_deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z'
+      WHERE delivery_id = ?
+    `).run(deliveryId);
+    store.claimDeliveryForProcessing({
+      deliveryId,
+      nowIso: new Date().toISOString(),
+      leaseUntilIso: new Date(Date.now() + 60_000).toISOString(),
+    });
+    store.markDeliveryProcessed(deliveryId);
   }
 
   function seedTicket(): void {
@@ -2105,7 +2121,7 @@ describe("coordinator-only server", () => {
     db.prepare(`
       UPDATE agent_sessions SET provider_activated_at = ? WHERE id = 'session-1'
     `).run("2026-08-11T00:00:00Z");
-    store.markDeliveryProcessed("github-issue-admission-in-flight");
+    settleDelivery("github-issue-admission-in-flight");
     db.prepare(`
       UPDATE webhook_deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z'
       WHERE delivery_id = 'github-comment-during-admission'
@@ -2472,7 +2488,7 @@ describe("coordinator-only server", () => {
       id: activeSessionId,
       provider_activation_id: "901",
     });
-    store.markDeliveryProcessed("github-excessive-historical-close-actors");
+    settleDelivery("github-excessive-historical-close-actors");
     timelineEvents.splice(excessiveHistoryStart);
     liveUpdatedAt = "2026-08-11T00:01:00Z";
 
@@ -3133,7 +3149,7 @@ describe("coordinator-only server", () => {
     db.prepare(`
       UPDATE agent_sessions SET provider_activated_at = ? WHERE id = 'session-1'
     `).run("2026-08-11T00:00:00Z");
-    store.markDeliveryProcessed("github-late-issue-admission");
+    settleDelivery("github-late-issue-admission");
     db.prepare(`
       UPDATE webhook_deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z'
       WHERE delivery_id = 'github-comment-before-admission-delivery'
@@ -3238,6 +3254,97 @@ describe("coordinator-only server", () => {
     expect(db.prepare("SELECT COUNT(*) FROM control_outbox").pluck().get()).toBe(0);
     expect(postedBodies.some((body) => body.includes("No repository is registered"))).toBe(true);
     expect(postedBodies.every((body) => body.startsWith("<!-- openthrottle:control-session:"))).toBe(true);
+  });
+
+  it("surfaces a dead GitHub delivery on the ticket's Issue thread and in the durable journal", async () => {
+    const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
+    const catalog = loadPipelineCatalog(
+      fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url)),
+      runtime.descriptor
+    );
+    pipelines.acceptRuntimeDescriptor(runtime);
+    pipelines.acceptCatalog(catalog);
+    seedPipelineTicket();
+    db.prepare(`
+      UPDATE tickets
+      SET control_provider = 'github', external_thread_id = 'owner/repo#12',
+          external_thread_reference = 'GH-12'
+      WHERE ticket_id = 'issue-1'
+    `).run();
+    const postedBodies: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/repos/owner/repo/issues/12/comments?per_page=100")) {
+        return Response.json([]);
+      }
+      if (url.endsWith("/repos/owner/repo/issues/12/comments") && method === "POST") {
+        postedBodies.push((JSON.parse(String(init?.body)) as { body: string }).body);
+        return Response.json({
+          id: 900,
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-900",
+        });
+      }
+      throw new Error(`unexpected GitHub request ${method} ${url}`);
+    }));
+    const processor = createServerWebhookDeliveryProcessor({
+      cfg,
+      store,
+      runtime: {
+        listLabeledResources: async () => [],
+        deleteResource: async () => undefined,
+      },
+      getLinearClient: async () => undefined,
+      pipelineCoordinator: { catalog, runtime, store: pipelines },
+    });
+    // A pending supervisor comment write intent makes handling throw
+    // deterministically ("publication is still in flight") without provider
+    // reads; the delivery is on its final attempt, so this failure is dead.
+    const marker = "<!-- openthrottle:in-flight-test -->";
+    beginGithubSupervisorCommentWrite(store, "owner/repo", 12, marker);
+    store.claimDelivery({
+      deliveryId: "github-dead-delivery",
+      source: "github",
+      action: "issue_comment:created",
+      eventName: "issue_comment",
+      payload: JSON.stringify({
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 12 },
+        comment: {
+          id: 110,
+          body: `${marker}\nnot actually supervisor output`,
+          created_at: "2026-08-11T00:00:01Z",
+          html_url: "https://github.com/owner/repo/issues/12#issuecomment-110",
+          user: { login: "operator" },
+        },
+      }),
+    });
+    db.prepare(`
+      UPDATE webhook_deliveries SET attempts = 7 WHERE delivery_id = 'github-dead-delivery'
+    `).run();
+    const outboxRowsBeforeDeath = db.prepare("SELECT COUNT(*) FROM control_outbox").pluck().get();
+
+    await expect(processor.process("github-dead-delivery"))
+      .rejects.toThrow("publication is still in flight");
+
+    expect(db.prepare(
+      "SELECT status, attempts FROM webhook_deliveries WHERE delivery_id = 'github-dead-delivery'"
+    ).get()).toEqual({ status: "dead", attempts: 8 });
+    expect(postedBodies).toHaveLength(1);
+    expect(postedBodies[0]).toContain("could not process this event after 8 attempts");
+    expect(postedBodies[0]).toContain("publication is still in flight");
+    // The GitHub route never enters the Linear outbox.
+    expect(db.prepare("SELECT COUNT(*) FROM control_outbox").pluck().get())
+      .toBe(outboxRowsBeforeDeath);
+    const journal = pipelines.listJournalEntries({ issueId: "issue-1", limit: 50 });
+    expect(journal).toContainEqual(expect.objectContaining({
+      kind: "run_note",
+      actor: "supervisor",
+      outcome: "dead",
+      trigger: "GitHub webhook delivery processing",
+      action: "Abandoned GitHub delivery github-dead-delivery (issue_comment:created) after 8 attempts.",
+    }));
   });
 
   it("serves a sanitized bounded durable run tail after cleanup", async () => {

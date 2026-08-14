@@ -122,26 +122,33 @@ export function createDeploymentCutoverStore(
       return getStmt.get(id) as DeploymentCutover | undefined;
     },
     advanceDeploymentCutover(input) {
-      const existing = getStmt.get(input.id) as DeploymentCutover | undefined;
-      if (!existing) throw new Error(`deployment cutover ${input.id} does not exist`);
-      const status = input.status ?? existing.status;
-      const completedAt = status === "completed" ? now() : existing.completed_at;
-      const recoveryCommand =
-        input.recoveryCommand === undefined ? existing.recovery_command : input.recoveryCommand;
-      const result = updateStmt.run(
-        status,
-        input.phase,
-        input.evidence ?? existing.evidence,
-        input.pauseEpoch ?? null,
-        recoveryCommand,
-        now(),
-        completedAt,
-        input.id
-      );
-      if (result.changes !== 1) {
-        throw new Error(`deployment cutover ${input.id} is not open`);
-      }
-      return getStmt.get(input.id) as DeploymentCutover;
+      // The carried-forward fields (evidence, recovery_command, completed_at)
+      // are read-modify-write, so the read and update commit as one
+      // transaction (immediate, taking the write lock up front) the way
+      // beginDeploymentCutover wraps its read-then-insert; a concurrent
+      // advance cannot interleave between them and resurrect superseded state.
+      return db.transaction(() => {
+        const existing = getStmt.get(input.id) as DeploymentCutover | undefined;
+        if (!existing) throw new Error(`deployment cutover ${input.id} does not exist`);
+        const status = input.status ?? existing.status;
+        const completedAt = status === "completed" ? now() : existing.completed_at;
+        const recoveryCommand =
+          input.recoveryCommand === undefined ? existing.recovery_command : input.recoveryCommand;
+        const result = updateStmt.run(
+          status,
+          input.phase,
+          input.evidence ?? existing.evidence,
+          input.pauseEpoch ?? null,
+          recoveryCommand,
+          now(),
+          completedAt,
+          input.id
+        );
+        if (result.changes !== 1) {
+          throw new Error(`deployment cutover ${input.id} is not open`);
+        }
+        return getStmt.get(input.id) as DeploymentCutover;
+      }).immediate();
     },
   };
 }

@@ -565,7 +565,7 @@ export function markActionCompleted(
     receiptJson = input.receipt;
     receiptHash = digestNormalized(input.receipt);
   }
-  db.prepare(`
+  const update = db.prepare(`
     UPDATE execution_work_attempts
     SET status = 'completed', result_hash = ?, output_subject = ?, receipt = ?, receipt_hash = ?,
         native_session_id = COALESCE(?, native_session_id),
@@ -581,6 +581,13 @@ export function markActionCompleted(
     input.timestamp,
     input.action.id
   );
+  // Both callers (completeUnitAction/completeGatedAction in unit-store.ts)
+  // pre-check the loaded status inside the same transaction, so today this is
+  // unreachable; it fails closed if a future caller skips that check and the
+  // status fence silently rejects the completion.
+  if (update.changes !== 1) {
+    throw new Error(`execution work attempt ${input.action.id} is not active`);
+  }
 }
 
 export function insertGateReceipt(

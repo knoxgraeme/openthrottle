@@ -7,19 +7,28 @@ export interface SettingsStore {
   listSettings(prefix: string): Array<{ key: string; value: string }>;
   setSetting(key: string, value: string): void;
   setSettings(entries: ReadonlyArray<{ key: string; value: string }>): void;
+  pruneSettings(prefix: string, updatedBeforeIso: string): number;
 }
 
 export function createSettingsStore(db: Database.Database): SettingsStore {
+  const now = () => new Date().toISOString();
   const getSettingStmt = db.prepare("SELECT value FROM settings WHERE key = ?");
   const setSettingStmt = db.prepare(`
-    INSERT INTO settings (key, value) VALUES (?, ?)
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
   `);
   const setSettingsTransaction = db.transaction(
-    (entries: ReadonlyArray<{ key: string; value: string }>): void => {
-      for (const entry of entries) setSettingStmt.run(entry.key, entry.value);
+    (entries: ReadonlyArray<{ key: string; value: string }>, timestamp: string): void => {
+      for (const entry of entries) setSettingStmt.run(entry.key, entry.value, timestamp);
     }
   );
+  // Rows written before migration 47 (or by a rolled-back predecessor release)
+  // carry a NULL updated_at; they are conservatively retained until rewritten.
+  const pruneSettingsStmt = db.prepare(`
+    DELETE FROM settings
+    WHERE key >= ? AND key < ?
+      AND updated_at IS NOT NULL AND updated_at < ?
+  `);
   const acquireSupervisorLeaseTransaction = db.transaction(
     (name: string, owner: string, nowIso: string, leaseUntilIso: string): boolean => {
       const existing = db.prepare(
@@ -58,10 +67,13 @@ export function createSettingsStore(db: Database.Database): SettingsStore {
       `).all(prefix, `${prefix}\uffff`) as Array<{ key: string; value: string }>;
     },
     setSetting(key, value) {
-      setSettingStmt.run(key, value);
+      setSettingStmt.run(key, value, now());
     },
     setSettings(entries) {
-      setSettingsTransaction.immediate(entries);
+      setSettingsTransaction.immediate(entries, now());
+    },
+    pruneSettings(prefix, updatedBeforeIso) {
+      return pruneSettingsStmt.run(prefix, `${prefix}\uffff`, updatedBeforeIso).changes;
     },
   };
 }

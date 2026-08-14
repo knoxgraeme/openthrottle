@@ -157,6 +157,94 @@ describe("delivery store", () => {
     });
   });
 
+  it("settles a delivery only from its processing claim", () => {
+    expect(store.claimDelivery({
+      deliveryId: "delivery-guarded",
+      source: "linear",
+      action: "created",
+    })).toBe(true);
+
+    store.markDeliveryProcessed("delivery-guarded");
+    expect(db.prepare(
+      "SELECT status FROM webhook_deliveries WHERE delivery_id = ?"
+    ).get("delivery-guarded")).toEqual({ status: "pending" });
+
+    expect(store.claimDeliveryForProcessing({
+      deliveryId: "delivery-guarded",
+      nowIso: new Date().toISOString(),
+      leaseUntilIso: new Date(Date.now() + 60_000).toISOString(),
+    })).toMatchObject({ status: "processing" });
+    store.markDeliveryProcessed("delivery-guarded");
+    expect(db.prepare(
+      "SELECT status FROM webhook_deliveries WHERE delivery_id = ?"
+    ).get("delivery-guarded")).toEqual({ status: "processed" });
+  });
+
+  it("does not let a late worker resurrect a dead delivery as processed", () => {
+    expect(store.claimDelivery({
+      deliveryId: "delivery-late-worker",
+      source: "github",
+      action: "issues:opened",
+      eventName: "issues",
+      payload: JSON.stringify({ repository: { full_name: "acme/widget" } }),
+    })).toBe(true);
+    store.markDeliveryFailed("delivery-late-worker", "permanent failure", null);
+
+    store.markDeliveryProcessed("delivery-late-worker");
+
+    expect(db.prepare(`
+      SELECT status, last_error, processed_at
+      FROM webhook_deliveries WHERE delivery_id = ?
+    `).get("delivery-late-worker")).toEqual({
+      status: "dead",
+      last_error: "permanent failure",
+      processed_at: null,
+    });
+    // The dead delivery remains discoverable by the redelivery recovery path.
+    expect(store.requeueDeadDeliveriesForRedelivery(
+      "github",
+      "acme/widget",
+      "2099-01-01T00:00:00.000Z",
+      50
+    )).toBe(1);
+  });
+
+  it("settles a sandbox event only from its processing claim", () => {
+    store.beginRun({
+      issueId: "issue-1",
+      runId: "run-guard",
+      taskType: "implement",
+      tokenHash: "a".repeat(64),
+      expiresAt: "2999-01-01T00:00:00.000Z",
+    });
+    store.insertSandboxEvent({
+      eventId: "event-guarded",
+      runId: "run-guard",
+      sandboxId: "sandbox-1",
+      kind: "activity",
+      payload: "{}",
+    });
+
+    store.markSandboxEventProcessed("event-guarded");
+    expect(store.getSandboxEvent("event-guarded")).toMatchObject({ status: "pending" });
+
+    expect(store.claimSandboxEvent(
+      "event-guarded",
+      new Date().toISOString(),
+      new Date(Date.now() + 60_000).toISOString()
+    )).toMatchObject({ status: "processing" });
+    store.markSandboxEventProcessed("event-guarded");
+    expect(store.getSandboxEvent("event-guarded")).toMatchObject({ status: "processed" });
+
+    // A late processed mark cannot overwrite a failed retry state.
+    store.markSandboxEventFailed("event-guarded", "late failure", "2999-01-01T00:00:00.000Z");
+    store.markSandboxEventProcessed("event-guarded");
+    expect(store.getSandboxEvent("event-guarded")).toMatchObject({
+      status: "failed",
+      last_error: "late failure",
+    });
+  });
+
   it("requeues dead webhook deliveries once within the reconciled repository", () => {
     expect(store.claimDelivery({
       deliveryId: "github-dead",
@@ -187,6 +275,11 @@ describe("delivery store", () => {
     })).toBe(true);
     store.markDeliveryFailed("github-dead", "permanent GitHub failure", null);
     store.markDeliveryFailed("github-other-dead", "other repository failure", null);
+    store.claimDeliveryForProcessing({
+      deliveryId: "github-processed",
+      nowIso: new Date().toISOString(),
+      leaseUntilIso: new Date(Date.now() + 60_000).toISOString(),
+    });
     store.markDeliveryProcessed("github-processed");
     store.markDeliveryFailed("linear-dead", "permanent Linear failure", null);
 

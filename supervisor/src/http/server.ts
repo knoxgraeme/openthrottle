@@ -355,6 +355,43 @@ export function createProviderAwareActivityPublisher(
   };
 }
 
+// A dead GitHub delivery carries no session binding the way Linear deliveries
+// do, so its ticket is recovered from the stored webhook payload: the Issue
+// thread first (issues/issue_comment; a PR comment's issue number is its pull
+// number), then the pull-request branch/URL (pull_request, reviews, CI).
+function githubDeliveryTicket(
+  store: SupervisorStore,
+  delivery: WebhookDelivery
+): Ticket | undefined {
+  if (!delivery.payload) return undefined;
+  let payload: {
+    repository?: { full_name?: unknown };
+    issue?: { number?: unknown };
+    pull_request?: { head?: { ref?: unknown }; html_url?: unknown };
+  };
+  try {
+    payload = JSON.parse(delivery.payload) as typeof payload;
+  } catch {
+    return undefined;
+  }
+  const repo = payload.repository?.full_name;
+  if (typeof repo !== "string" || !isGithubRepository(repo)) return undefined;
+  const issueNumber = payload.issue?.number;
+  if (typeof issueNumber === "number" && Number.isSafeInteger(issueNumber) && issueNumber > 0) {
+    const ticket = store.getByExternalThread("github", `${repo}#${issueNumber}`) ??
+      store.getByPrUrl(repo, `https://github.com/${repo}/pull/${issueNumber}`);
+    if (ticket) return ticket;
+  }
+  const headRef = payload.pull_request?.head?.ref;
+  if (typeof headRef === "string" && headRef) {
+    const ticket = store.getByBranch(repo, headRef);
+    if (ticket) return ticket;
+  }
+  const prUrl = payload.pull_request?.html_url;
+  if (typeof prUrl === "string" && prUrl) return store.getByPrUrl(repo, prUrl);
+  return undefined;
+}
+
 function githubControlEventPredatesCurrentSession(
   store: SupervisorStore,
   event: GithubWebhookEvent
@@ -465,14 +502,46 @@ export function createServerWebhookDeliveryProcessor(deps: {
     maxAttempts: 8,
     baseDelayMs: 30_000,
     onDead: async (delivery, error) => {
-      if (delivery.source !== "linear" || !delivery.session_id) return;
-      await tryPostError(
-        deps.store,
-        linearOutbox,
-        delivery.session_id,
-        undefined,
-        `OpenThrottle could not process this event after ${delivery.attempts} attempts: ${String(error)}`
-      );
+      const message =
+        `OpenThrottle could not process this event after ${delivery.attempts} attempts: ` +
+        sanitizeText(String(error)).slice(-4_000);
+      if (delivery.source === "linear") {
+        if (!delivery.session_id) return;
+        await tryPostError(deps.store, linearOutbox, delivery.session_id, undefined, message);
+        return;
+      }
+      // Dead GitHub deliveries must stay operator-visible: events.ts throws
+      // to retry in many places, and exhausting maxAttempts would otherwise
+      // leave nothing but a webhook_deliveries.last_error row.
+      const ticket = githubDeliveryTicket(deps.store, delivery);
+      if (!ticket) return;
+      // Durable journal trace first, so the abandonment survives even when
+      // the provider publication below fails as well.
+      try {
+        deps.pipelineCoordinator.store.recordJournalEntry({
+          id: `github-delivery-dead:${delivery.id}`,
+          issueId: ticket.ticket_id,
+          instanceId:
+            deps.pipelineCoordinator.store.getInstanceForSession(ticket.session_id)?.id ?? null,
+          actor: "supervisor",
+          kind: "run_note",
+          trigger: "GitHub webhook delivery processing",
+          action: `Abandoned GitHub delivery ${delivery.id} (${delivery.action}) after ${delivery.attempts} attempts.`,
+          outcome: "dead",
+          refs: {
+            provider: "github",
+            delivery_id: delivery.id,
+            event: delivery.action,
+            last_error: sanitizeText(String(error)).slice(0, 500),
+          },
+        });
+      } catch (journalError) {
+        console.error(
+          `[webhooks/github] failed to journal dead delivery ${delivery.id}:`,
+          journalError
+        );
+      }
+      await activityPublisher.publishError(ticket.session_id, ticket.ticket_id, message);
     },
     handler: async (delivery: WebhookDelivery) => {
       if (!delivery.payload) throw new Error(`Delivery ${delivery.id} has no stored payload`);

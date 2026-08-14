@@ -115,6 +115,68 @@ describe("runSweep", () => {
     expect(Date.parse(privateArtifactCutoff)).toBeLessThanOrEqual(Date.now() - thirtyDaysMs);
   });
 
+  it("prunes aged monotonic settings families without touching live head projections", async () => {
+    const pipelines = createPipelineStore(db);
+    const store = createSupervisorStore(db, pipelines);
+    const stamp = (key: string, updatedAt: string | null) =>
+      db.prepare("UPDATE settings SET updated_at = ? WHERE key = ?").run(updatedAt, key);
+
+    store.setSetting("github-supervisor-comment:100", "control-session");
+    stamp("github-supervisor-comment:100", "2020-01-01T00:00:00.000Z");
+    store.setSetting("github-supervisor-comment:200", "pipeline-status");
+    store.setSetting("feedback-snapshot-drained-at:snap-old", "2020-01-01T00:00:00.000Z");
+    stamp("feedback-snapshot-drained-at:snap-old", "2020-01-01T00:00:00.000Z");
+    store.setSetting("feedback-snapshot-drain-source:snap-old", "github-webhook");
+    stamp("feedback-snapshot-drain-source:snap-old", "2020-01-01T00:00:00.000Z");
+    // Pre-migration row without a write timestamp: conservatively retained.
+    db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)")
+      .run("github-supervisor-comment:1", "control-session");
+    // Head observations follow the longest sweep retention
+    // (runOutcomeRetentionDays), not the 30-day marker retention.
+    const observation = JSON.stringify({
+      headSha: "a".repeat(40),
+      observedAt: "2020-01-01T00:00:00.000Z",
+      provenance: "provider_event",
+    });
+    store.setSetting("github-head-observation:issue-1:2020-01-01T00:00:00.000Z", observation);
+    stamp("github-head-observation:issue-1:2020-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z");
+    store.setSetting("github-head-observation:issue-1:recent", observation);
+    stamp(
+      "github-head-observation:issue-1:recent",
+      new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString()
+    );
+    // The per-issue current projection keys are never pruned regardless of age.
+    store.setSetting("github-head:issue-1", "a".repeat(40));
+    stamp("github-head:issue-1", "2020-01-01T00:00:00.000Z");
+    store.setSetting("github-head-observed-at:issue-1", "2020-01-01T00:00:00.000Z");
+    stamp("github-head-observed-at:issue-1", "2020-01-01T00:00:00.000Z");
+
+    await runSweep(
+      {
+        deleteResource: vi.fn(async () => undefined),
+        stopResource: vi.fn(async () => undefined),
+        cleanup: vi.fn(async () => undefined),
+        listLabeledResources: async () => [],
+      },
+      store,
+      { orphanGraceMinutes: 5, runtimeResourceRetentionMinutes: 60, runOutcomeRetentionDays: 180 } as Config,
+      pipelines,
+      activityPublisherFor(store)
+    );
+
+    expect(store.getSetting("github-supervisor-comment:100")).toBeUndefined();
+    expect(store.getSetting("feedback-snapshot-drained-at:snap-old")).toBeUndefined();
+    expect(store.getSetting("feedback-snapshot-drain-source:snap-old")).toBeUndefined();
+    expect(store.getSetting("github-supervisor-comment:200")).toBe("pipeline-status");
+    expect(store.getSetting("github-supervisor-comment:1")).toBe("control-session");
+    expect(
+      store.getSetting("github-head-observation:issue-1:2020-01-01T00:00:00.000Z")
+    ).toBeUndefined();
+    expect(store.getSetting("github-head-observation:issue-1:recent")).toBe(observation);
+    expect(store.getSetting("github-head:issue-1")).toBe("a".repeat(40));
+    expect(store.getSetting("github-head-observed-at:issue-1")).toBe("2020-01-01T00:00:00.000Z");
+  });
+
   it("continues orphan cleanup and retention pruning when webhook reconciliation rejects", async () => {
     const pipelines = createPipelineStore(db);
     const store = createSupervisorStore(db, pipelines);
