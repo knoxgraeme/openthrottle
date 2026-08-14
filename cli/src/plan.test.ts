@@ -63,6 +63,18 @@ function planWithBlock(graphId = "structured"): string {
   return `${cePlan}\n## Execution Plan\n\n${executionPlanBlock(graphId)}\n`;
 }
 
+function executionPlanBlockV2(graphId = "structured"): string {
+  const contract = JSON.parse(
+    readFileSync(new URL("../../contracts/fixtures/valid/execution-plan-v2.json", import.meta.url), "utf8")
+  ) as Record<string, unknown>;
+  contract.graph_id = graphId;
+  return `\`\`\`json openthrottle.execution-plan/v2\n${JSON.stringify(contract, null, 2)}\n\`\`\``;
+}
+
+function planWithBlockV2(graphId = "structured"): string {
+  return `${cePlan}\n## Execution Plan\n\n${executionPlanBlockV2(graphId)}\n`;
+}
+
 function writeConfig(directory: string, allowedGraphs = ["simple", "structured"]): void {
   writeFileSync(
     join(directory, ".openthrottle.yml"),
@@ -90,6 +102,26 @@ describe("plan validation", () => {
     expect(result.plan.value.units.map((unit) => unit.id)).toEqual(["contracts", "corpora"]);
     expect(result.plan.value.units[1]!.depends_on).toEqual(["contracts"]);
     expect(result.coverage).toMatchObject({ units: 2, instruction_refs: 2, acceptance_refs: 2 });
+  });
+
+  it("validates one self-contained v2 execution-plan block", () => {
+    const updated = planWithBlockV2();
+    const result = readExecutionPlanFromMarkdown(updated, "sample.md");
+
+    expect(extractExecutionPlanBlocks(updated)).toHaveLength(1);
+    expect(result.plan.value.schema).toBe("openthrottle.execution-plan/v2");
+    expect(result.plan.value.units.map((unit) => unit.id)).toEqual(["contracts", "corpora"]);
+    expect(result.coverage).toMatchObject({
+      schema: "openthrottle.execution-plan/v2",
+      units: 2,
+      requirement_count: 3,
+      acceptance_count: 3,
+    });
+  });
+
+  it("rejects a v1 and a v2 execution-plan block coexisting in the same file", () => {
+    const combined = `${cePlan}\n${executionPlanBlock()}\n${executionPlanBlockV2()}\n`;
+    expect(() => readExecutionPlanFromMarkdown(combined, "mixed.md")).toThrow(/expected exactly one/);
   });
 
   it("rejects missing, duplicated, and invalid execution-plan blocks", () => {

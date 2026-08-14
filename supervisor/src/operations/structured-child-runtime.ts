@@ -1,18 +1,19 @@
 import { createHash } from "node:crypto";
 import {
   EXECUTION_PLAN_SCHEMA,
+  EXECUTION_PLAN_SCHEMAS,
   deriveReviewSubactionActionId,
   digestCanonicalJson,
-  parseExecutionPlanContract,
+  parseAnyExecutionPlanContract,
   parseStandardReceipt,
   RECEIPT_SCHEMA,
   validateTuneDecisionContract,
   validateTuneEditAuthorizationContract,
   validateTuneProposalContract,
   validateReviewJournalContract,
+  type AnyExecutionPlanContract,
   type CandidateEvidenceReceipt,
   type CommandResultReceipt,
-  type ExecutionPlanContract,
   type IntegrationEvidenceReceipt,
   type ReviewJournalContract,
   type SemanticReviewReceipt,
@@ -41,6 +42,7 @@ import {
   MAX_LOOP_REQUEST_ENVELOPE_BYTES,
   loopActionPlanContext,
   loopActionTransitionContext,
+  reviewFanoutSearchMapsFor,
 } from "../pipeline/structured-loop-envelope.js";
 import {
   MAX_PRIOR_EVIDENCE_BYTES,
@@ -85,7 +87,7 @@ import type {
   SandboxRuntime,
 } from "../runtime/contracts.js";
 import { serializeRuntimeObservationError } from "../runtime/observation-error.js";
-import { extractJsonBlocks } from "../pipeline/markdown.js";
+import { extractJsonBlocksAny } from "../pipeline/markdown.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { createUnitEffectProcessor } from "./unit-effects.js";
 
@@ -310,12 +312,12 @@ const FINAL_REPAIR_BINDING = builtinLoopBinding({
   maxRounds: FINAL_REPAIR_MAX_ROUNDS,
 });
 
-function extractExecutionPlan(context: string): ExecutionPlanContract {
-  const blocks = extractJsonBlocks(context, EXECUTION_PLAN_SCHEMA);
+function extractExecutionPlan(context: string): AnyExecutionPlanContract {
+  const blocks = extractJsonBlocksAny(context, EXECUTION_PLAN_SCHEMAS);
   if (blocks.length !== 1) {
-    throw new Error(`structured composite stage requires exactly one ${EXECUTION_PLAN_SCHEMA} block`);
+    throw new Error(`structured composite stage requires exactly one execution-plan block, found ${blocks.length}`);
   }
-  return parseExecutionPlanContract(blocks[0]!, { source: "sealed.execution_plan" }).value;
+  return parseAnyExecutionPlanContract(blocks[0]!, { source: "sealed.execution_plan" }).value;
 }
 
 function configuredCommandNamesFor(instance: PipelineInstance, store: PipelineStore): Set<string> {
@@ -343,7 +345,7 @@ function authoredUnitRepairMaxRounds(bindings: readonly PipelineUnitPhaseBinding
 }
 
 function commandPlanForUnits(input: {
-  plan: ExecutionPlanContract;
+  plan: AnyExecutionPlanContract;
   fallbackCommandNames: readonly string[];
   configuredCommandNames: ReadonlySet<string>;
 }): {
@@ -517,7 +519,11 @@ function requestContextForStructuredPlan(payload: {
         const parsed = JSON.parse(artifact.payload) as { details?: { execution_plan?: unknown } };
         const executionPlan = parsed.details?.execution_plan;
         if (executionPlan !== undefined) {
-          return `\`\`\`json ${EXECUTION_PLAN_SCHEMA}\n${JSON.stringify(executionPlan)}\n\`\`\``;
+          const schema = executionPlan && typeof executionPlan === "object" && !Array.isArray(executionPlan) &&
+            typeof (executionPlan as { schema?: unknown }).schema === "string"
+            ? (executionPlan as { schema: string }).schema
+            : EXECUTION_PLAN_SCHEMA;
+          return `\`\`\`json ${schema}\n${JSON.stringify(executionPlan)}\n\`\`\``;
         }
       } catch {
         // The stage gate validates artifact JSON. Ignore unrelated artifacts.
@@ -774,7 +780,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   const buildReviewFanoutRequests = (input: {
     instance: PipelineInstance;
     action: ExecutionWorkAttempt;
-    plan: ExecutionPlanContract;
+    plan: AnyExecutionPlanContract;
     fanout: ReviewFanoutPlan;
     inputSubject: string;
     baseSubject: string;
@@ -834,7 +840,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   const buildReviewSelectorRequest = (input: {
     instance: PipelineInstance;
     action: ExecutionWorkAttempt;
-    plan: ExecutionPlanContract;
+    plan: AnyExecutionPlanContract;
     authority: ReviewSelectorAuthority;
     inputSubject: string;
     baseSubject: string;
@@ -899,7 +905,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
   const buildReviewValidatorRequest = (input: {
     instance: PipelineInstance;
     action: ExecutionWorkAttempt;
-    plan: ExecutionPlanContract;
+    plan: AnyExecutionPlanContract;
     fanout: ReviewFanoutPlan;
     synthesis: ReviewFanoutSynthesis;
     inputSubject: string;
@@ -2069,8 +2075,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       const recommendation = parseReviewSelectorRecommendation(selector.receipt.payload.summary, authority);
       const fanoutPlan = buildReviewFanoutPlan({
         subject: reviewSubject,
-        instructions: executionPlan.instructions,
-        acceptance: executionPlan.acceptance,
+        ...reviewFanoutSearchMapsFor(executionPlan),
         commandNames: executionPlan.commands.map((command) => command.name),
         recommendation,
         selectorReceiptHash: digestNormalized(canonicalJson(selector.receipt)),

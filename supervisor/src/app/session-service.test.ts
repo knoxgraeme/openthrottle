@@ -34,6 +34,10 @@ import {
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 const fixtureCatalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const executionPlanFixturePath = fileURLToPath(new URL("../../../contracts/fixtures/valid/execution-plan.json", import.meta.url));
+const executionPlanV2FixturePath = fileURLToPath(new URL("../../../contracts/fixtures/valid/execution-plan-v2.json", import.meta.url));
+const executionPlanV2MissingFieldFixturePath = fileURLToPath(
+  new URL("../../../contracts/fixtures/invalid/execution-plan-v2-missing-field.json", import.meta.url)
+);
 const EXECUTION_PLAN_PARSE_LIMIT_BYTES = 256 * 1024;
 
 function config(): Config {
@@ -1967,6 +1971,69 @@ intents:
       pipeline_id: "builtin/structured",
       active_stage_id: "units",
     });
+  });
+
+  it("admits a unit-consuming graph from a self-contained v2 execution plan", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanV2FixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = issueOnlyPromptContext([
+      "```json openthrottle.execution-plan/v2",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n"));
+    const { pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@2
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      { claudeCodeOauthToken: "claude-oauth", codexAuthJson: undefined, kimiCodeApiKey: undefined },
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context),
+      {},
+      {
+        capabilities: [
+          ...buildInstalledRuntimeDescriptor("base-structured-credential-test/v1").descriptor.capabilities,
+          "accept-unit@1",
+          "ce/simplify@1",
+          "graph/for-each-unit@1",
+        ],
+      },
+      [{ name: "agent:claude" }]
+    );
+
+    expect(pipelines.getInstanceForSession("session-1")).toMatchObject({
+      pipeline_id: "builtin/structured",
+      active_stage_id: "units",
+    });
+  });
+
+  it("fails closed before provisioning when a v2 unit is missing a required self-contained field (OPE-156-equivalent pointer-only unit)", async () => {
+    const executionPlan = JSON.parse(readFileSync(executionPlanV2MissingFieldFixturePath, "utf8")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const context = issueOnlyPromptContext([
+      "```json openthrottle.execution-plan/v2",
+      JSON.stringify(executionPlan, null, 2),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n"));
+
+    await expectSelectionFailure(context, "units[0].tests: must be an array");
   });
 
   it("refuses OpenCode unit-consuming graphs before provisioning even when its credential is configured", async () => {

@@ -5,10 +5,10 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import {
-  parseExecutionPlanContract,
+  parseAnyExecutionPlanContract,
   parseGraphContract,
   validateRepositoryConfigContract,
-  type ExecutionPlanContract,
+  type AnyExecutionPlanContract,
   type GraphContract,
   type RepositoryConfigContract,
   type ValidatedContract,
@@ -16,6 +16,8 @@ import {
 import { getErrorMessage } from "./util.js";
 
 export const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
+export const EXECUTION_PLAN_FENCE_V2 = "openthrottle.execution-plan/v2";
+const EXECUTION_PLAN_FENCES = [EXECUTION_PLAN_FENCE, EXECUTION_PLAN_FENCE_V2];
 
 export interface ExecutionPlanBlock {
   json: string;
@@ -24,13 +26,21 @@ export interface ExecutionPlanBlock {
 }
 
 export interface ValidationResult {
-  plan: ValidatedContract<ExecutionPlanContract>;
+  plan: ValidatedContract<AnyExecutionPlanContract>;
   coverage: {
     units: number;
-    instruction_refs: number;
-    acceptance_refs: number;
     commands: string[];
-  };
+  } & (
+    | { schema: typeof EXECUTION_PLAN_FENCE; instruction_refs: number; acceptance_refs: number }
+    | {
+        schema: typeof EXECUTION_PLAN_FENCE_V2;
+        requirement_count: number;
+        file_count: number;
+        test_count: number;
+        acceptance_count: number;
+        verification_count: number;
+      }
+  );
 }
 
 export interface LocalGraphSelection {
@@ -76,11 +86,34 @@ export function extractExecutionPlanBlocks(markdown: string): ExecutionPlanBlock
   const blocks: ExecutionPlanBlock[] = [];
   for (const match of markdown.matchAll(FENCE_PATTERN)) {
     const marker = match[1]?.trim().split(/\s+/) ?? [];
-    if (!marker.includes(EXECUTION_PLAN_FENCE)) continue;
+    if (!EXECUTION_PLAN_FENCES.some((fence) => marker.includes(fence))) continue;
     const json = match[2]?.trim() ?? "";
     blocks.push({ json, start: match.index ?? 0, end: (match.index ?? 0) + match[0].length });
   }
   return blocks;
+}
+
+function coverageFor(plan: AnyExecutionPlanContract): ValidationResult["coverage"] {
+  const commands = plan.commands.map((command) => command.name);
+  if (plan.schema === EXECUTION_PLAN_FENCE_V2) {
+    return {
+      schema: EXECUTION_PLAN_FENCE_V2,
+      units: plan.units.length,
+      requirement_count: plan.units.reduce((count, unit) => count + unit.requirements.length, 0),
+      file_count: plan.units.reduce((count, unit) => count + unit.files.length, 0),
+      test_count: plan.units.reduce((count, unit) => count + unit.tests.length, 0),
+      acceptance_count: plan.units.reduce((count, unit) => count + unit.acceptance.length, 0),
+      verification_count: plan.units.reduce((count, unit) => count + unit.verification.length, 0),
+      commands,
+    };
+  }
+  return {
+    schema: EXECUTION_PLAN_FENCE,
+    units: plan.units.length,
+    instruction_refs: Object.keys(plan.instructions).length,
+    acceptance_refs: Object.keys(plan.acceptance).length,
+    commands,
+  };
 }
 
 export function readExecutionPlanFromMarkdown(
@@ -89,17 +122,12 @@ export function readExecutionPlanFromMarkdown(
 ): ValidationResult {
   const blocks = extractExecutionPlanBlocks(markdown);
   if (blocks.length !== 1) {
-    throw new Error(`${source}: expected exactly one ${EXECUTION_PLAN_FENCE} block, found ${blocks.length}`);
+    throw new Error(`${source}: expected exactly one execution-plan block, found ${blocks.length}`);
   }
-  const plan = parseExecutionPlanContract(blocks[0]!.json, { source: `${source}.execution_plan` });
+  const plan = parseAnyExecutionPlanContract(blocks[0]!.json, { source: `${source}.execution_plan` });
   return {
     plan,
-    coverage: {
-      units: plan.value.units.length,
-      instruction_refs: Object.keys(plan.value.instructions).length,
-      acceptance_refs: Object.keys(plan.value.acceptance).length,
-      commands: plan.value.commands.map((command) => command.name),
-    },
+    coverage: coverageFor(plan.value),
   };
 }
 
@@ -453,7 +481,7 @@ export function prepareExecutionPlanFile(
   const original = readFileSync(file, "utf8");
   const before = extractExecutionPlanBlocks(original);
   if (before.length > 1) {
-    throw new Error(`${file}: expected at most one ${EXECUTION_PLAN_FENCE} block before prepare, found ${before.length}`);
+    throw new Error(`${file}: expected at most one execution-plan block before prepare, found ${before.length}`);
   }
   const isolatedDirectory = mkdtempSync(join(tmpdir(), "openthrottle-prepare-"));
   const isolatedFile = join(isolatedDirectory, basename(file));
@@ -507,7 +535,10 @@ function printValidation(result: ValidationResult, json: boolean): void {
   else {
     console.log(`ok ${body.schema}`);
     console.log(`digest ${body.digest}`);
-    console.log(`coverage units=${body.coverage.units} instructions=${body.coverage.instruction_refs} acceptance=${body.coverage.acceptance_refs}`);
+    const coverage = body.coverage.schema === EXECUTION_PLAN_FENCE_V2
+      ? `coverage units=${body.coverage.units} requirements=${body.coverage.requirement_count} files=${body.coverage.file_count} tests=${body.coverage.test_count} acceptance=${body.coverage.acceptance_count} verification=${body.coverage.verification_count}`
+      : `coverage units=${body.coverage.units} instructions=${body.coverage.instruction_refs} acceptance=${body.coverage.acceptance_refs}`;
+    console.log(coverage);
   }
 }
 
