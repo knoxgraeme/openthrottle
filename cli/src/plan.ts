@@ -582,7 +582,6 @@ function parseArgs(args: string[]): { command?: string; file?: string; graphId?:
   for (let index = 1; index < args.length; index += 1) {
     const arg = args[index]!;
     if (arg === "--json") parsed.json = true;
-    else if (arg === "--write") continue;
     else if (arg === "--graph") {
       parsed.graphId = args[++index];
       if (!parsed.graphId) throw new Error("--graph requires a graph ID");
@@ -598,7 +597,7 @@ export async function plan(args: string[]): Promise<void> {
   try {
     parsed = parseArgs(args);
     if (!parsed.command || !["prepare", "validate"].includes(parsed.command) || !parsed.file) {
-      throw new Error("Usage: openthrottle plan <prepare|validate> <file.md> [--graph <id>] [--json] [--write]");
+      throw new Error("Usage: openthrottle plan <prepare|validate> <file.md> [--graph <id>] [--json]");
     }
     const result = parsed.command === "prepare"
       ? prepareExecutionPlanFile(parsed.file, { graphId: parsed.graphId })
@@ -611,15 +610,5 @@ export async function plan(args: string[]): Promise<void> {
 }
 
 export async function validate(args: string[]): Promise<void> {
-  const file = args.find((arg) => !arg.startsWith("-"));
-  const json = args.includes("--json");
-  if (!file) {
-    exitWithError("Usage: openthrottle validate <file.md> [--json]", json);
-  }
-  try {
-    const result = readExecutionPlanFromMarkdown(readFileSync(file, "utf8"), file);
-    printValidation(result, json);
-  } catch (error) {
-    exitWithError(getErrorMessage(error), json);
-  }
+  await plan(["validate", ...args]);
 }

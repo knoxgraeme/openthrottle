@@ -616,6 +616,44 @@ describe("plan validation", () => {
     }
   });
 
+  it("parses flags through the validate alias exactly like plan validate", async () => {
+    const directory = temporaryProject();
+    const planPath = join(directory, "plan.md");
+    writeConfig(directory);
+    writeFileSync(planPath, planWithBlockV2("structured"));
+    const exit = process.exit;
+    const log = console.log;
+    const output: string[] = [];
+    process.exit = ((code?: string | number | null) => {
+      throw new Error(`exit ${code}`);
+    }) as typeof process.exit;
+    console.log = (message?: unknown) => {
+      output.push(String(message));
+    };
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(directory);
+      const { validate } = await import("./plan.js");
+      await validate(["--graph", "structured", planPath, "--json"]);
+      expect(JSON.parse(output[0]!)).toMatchObject({
+        ok: true,
+        schema: "openthrottle.execution-plan/v2",
+      });
+
+      output.length = 0;
+      writeFileSync(planPath, planWithBlockV2("other"));
+      await expect(validate(["--graph", "structured", planPath, "--json"])).rejects.toThrow(/exit 1/);
+      expect(JSON.parse(output[0]!)).toMatchObject({
+        ok: false,
+        error: expect.stringContaining("graph_id must match selected graph structured"),
+      });
+    } finally {
+      process.chdir(previousCwd);
+      process.exit = exit;
+      console.log = log;
+    }
+  });
+
   it("validates local graph selection and detects unit-consuming graphs", () => {
     const directory = temporaryProject();
     mkdirSync(join(directory, ".openthrottle", "graphs"), { recursive: true });

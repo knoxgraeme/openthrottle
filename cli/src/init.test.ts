@@ -21,6 +21,7 @@ import {
   getSupervisorTaskTimeoutSeconds,
   initOutro,
   parseGithubRemote,
+  planEditableSkillsDryRun,
   planEditableSkillsRefresh,
   promptConfig,
   registerTargetRepository,
@@ -603,6 +604,28 @@ describe("init project detection", () => {
     expect(readFileSync(join(directory, ".openthrottle/graphs/simple.json"), "utf8")).toBe(graphBefore);
     expect(readFileSync(join(directory, ".openthrottle/skills.lock.json"), "utf8")).toBe(lockBefore);
     expect(readFileSync(skillPath, "utf8")).toContain("User-owned edit");
+  });
+
+  it("previews the config-overwrite migration in the dry run exactly like the real run", () => {
+    const config = completeProjectConfig();
+
+    const migratingDirectory = temporaryProject();
+    writeProjectConfig(config, migratingDirectory);
+    const { plan, assumesConfigOverwrite } = planEditableSkillsDryRun(config, migratingDirectory);
+    expect(assumesConfigOverwrite).toBe(true);
+    expect(plan).toEqual(planEditableSkillsRefresh(config, migratingDirectory, { allowConfigOverwrite: true }));
+    expect(plan).toMatchObject({
+      writable: true,
+      entries: expect.arrayContaining([
+        expect.objectContaining({ path: ".openthrottle.yml", status: "upstream-only" }),
+      ]),
+    });
+    expect(planEditableSkillsRefresh(config, migratingDirectory)).toMatchObject({ writable: false });
+
+    const freshDirectory = temporaryProject();
+    const fresh = planEditableSkillsDryRun(config, freshDirectory);
+    expect(fresh.assumesConfigOverwrite).toBe(false);
+    expect(fresh.plan).toEqual(planEditableSkillsRefresh(config, freshDirectory));
   });
 
   it("refuses undeclared files in the repository package closure", () => {
