@@ -1234,13 +1234,13 @@ a snapshot build must supply the exact expected snapshot explicitly.
 Any cutover release that adds a schema migration must also verify the live
 pre-deploy supervisor's `/deployment/cutover-evidence` includes the expected
 `schema-migrations-name-additive-rollback-compatible/v1` database contract
-and reject newly added migration definitions that lack one statically
-verifiable, double-quoted literal name with the exact marker suffix
-before it opens and mutates SQLite. The deploy workflow enforces this for push
-and `workflow_dispatch` runs on refs that change
-`supervisor/src/persistence/migrations/definitions.ts`; the standalone
-precursor release itself remains a supervisor-only bootstrap because its parent
-cannot yet advertise the contract.
+and reject any post-cutover definition in the complete current catalog that
+lacks one statically verifiable, double-quoted literal name with the exact
+marker suffix before it opens and mutates SQLite. The whole-catalog check runs
+before every supervisor push or `workflow_dispatch` deployment so an unrelated
+retry cannot bypass a migration introduced by an earlier failed deployment;
+the standalone precursor release itself remains a supervisor-only bootstrap
+because its parent cannot yet advertise the contract.
 
 Optional/defaulted:
 
