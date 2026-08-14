@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { canonicalJson, digestNormalized } from "../pipeline/manifest.js";
 import type { ExecutionGateReceipt, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { ExecutionUnitState } from "../pipeline/unit-coordinator.js";
-import type { LoopActionRequest, SandboxRuntime } from "../runtime/contracts.js";
+import type { ChildExecutorActionRequest, LoopActionRequest, SandboxRuntime } from "../runtime/contracts.js";
 import { MAX_VALID_DOWNSTREAM_CONTEXT } from "../pipeline/structured-loop-envelope.js";
 import { MAX_LOOP_REQUEST_ENVELOPE_BYTES } from "../pipeline/structured-loop-limits.js";
 import {
@@ -16,7 +16,14 @@ function createStructuredChildRuntime(
 ): ReturnType<typeof createProductionStructuredChildRuntime> {
   return createProductionStructuredChildRuntime({
     ...deps,
-    store: Object.assign({}, deps.store, {
+    store: Object.assign({
+      completeGatedAction: vi.fn(),
+      completeUnitAction: vi.fn(),
+      failUnitAction: vi.fn(),
+      healExpiredCurrentChildAction: vi.fn(),
+      recordActionObservationFailure: vi.fn(),
+      stopRetryableUnitAction: vi.fn(),
+    }, deps.store, {
       clearActionObservationFailure: vi.fn(() => "cleared" as const),
     }),
   });
@@ -107,7 +114,12 @@ function reviewSubactionDispatchStore() {
   };
 }
 
-function candidateReceipt(subject: string, attempt: ExecutionWorkAttempt): string {
+function candidateReceipt(
+  subject: string,
+  attempt: ExecutionWorkAttempt,
+  preSubject = "a".repeat(40),
+  baseSubject = "a".repeat(40)
+): string {
   return canonicalJson({
     schema: "openthrottle.receipt/v1",
     type: "candidate_evidence",
@@ -120,8 +132,8 @@ function candidateReceipt(subject: string, attempt: ExecutionWorkAttempt): strin
       skill_package_digest: null,
     },
     subject: {
-      base: "a".repeat(40),
-      pre: "a".repeat(40),
+      base: baseSubject,
+      pre: preSubject,
       post: subject,
     },
     fence: {
@@ -146,7 +158,43 @@ function candidateReceipt(subject: string, attempt: ExecutionWorkAttempt): strin
   });
 }
 
-function completionReceipt(subject: string, attempt: ExecutionWorkAttempt): string {
+function completedCandidateAction(input: {
+  id: string;
+  subject: string;
+  cycle?: number;
+  attemptOrdinal?: number;
+  preSubject?: string;
+  baseSubject?: string;
+  outputSubject?: string;
+}): ExecutionWorkAttempt {
+  const candidate = action({
+    id: input.id,
+    action_kind: "candidate",
+    cycle: input.cycle ?? 1,
+    status: "completed",
+    attempt_ordinal: input.attemptOrdinal ?? 2,
+    request_hash: "b".repeat(64),
+    output_subject: input.outputSubject ?? input.subject,
+  });
+  candidate.receipt = candidateReceipt(input.subject, candidate, input.preSubject, input.baseSubject);
+  candidate.receipt_hash = digestNormalized(candidate.receipt);
+  return candidate;
+}
+
+function worktreeHandleId(action: ExecutionWorkAttempt, baseCommit: string): string {
+  return digestNormalized(canonicalJson({
+    idempotencyKey: `worktree:${action.parent_attempt_id}:${action.unit_id ?? "final"}:${action.cycle}`,
+    attemptId: action.parent_attempt_id,
+    baseCommit,
+  })).slice(0, 32);
+}
+
+function completionReceipt(
+  subject: string,
+  attempt: ExecutionWorkAttempt,
+  preSubject = "a".repeat(40),
+  baseSubject = "a".repeat(40)
+): string {
   return canonicalJson({
     schema: "openthrottle.receipt/v1",
     type: "unit_completion",
@@ -159,8 +207,8 @@ function completionReceipt(subject: string, attempt: ExecutionWorkAttempt): stri
       skill_package_digest: null,
     },
     subject: {
-      base: "a".repeat(40),
-      pre: "a".repeat(40),
+      base: baseSubject,
+      pre: preSubject,
       post: subject,
     },
     fence: {
@@ -230,7 +278,12 @@ function semanticReviewReceipt(
   });
 }
 
-function unitDecisionReceipt(unitId: string, attempt: ExecutionWorkAttempt, revisionRequest: string): string {
+function unitDecisionReceipt(
+  unitId: string,
+  attempt: ExecutionWorkAttempt,
+  revisionRequest: string,
+  subject = "a".repeat(40)
+): string {
   return canonicalJson({
     schema: "openthrottle.receipt/v1",
     type: "unit_decision",
@@ -244,8 +297,8 @@ function unitDecisionReceipt(unitId: string, attempt: ExecutionWorkAttempt, revi
     },
     subject: {
       base: "a".repeat(40),
-      pre: "a".repeat(40),
-      post: "a".repeat(40),
+      pre: subject,
+      post: subject,
     },
     fence: {
       pipeline_instance_id: "instance-1",
@@ -366,6 +419,60 @@ function parentAttemptRequestPayload(plan: object = {
       "```",
     ].join("\n"),
   });
+}
+
+function structuredInstance(
+  overrides: Record<string, unknown> = {},
+  unitPhaseBindings: unknown[] = []
+): any {
+  return {
+    id: "instance-1",
+    active_stage_id: "structured",
+    agent: "codex",
+    generation: 1,
+    base_commit: "a".repeat(40),
+    immutable_subject: "a".repeat(40),
+    manifest_digest: "c".repeat(64),
+    capability_digest: "d".repeat(64),
+    normalized_manifest: canonicalJson({ stages: [{ id: "structured", unitPhaseBindings }] }),
+    ...overrides,
+  };
+}
+
+function repairStructuredInstance(overrides: Record<string, unknown> = {}): any {
+  return structuredInstance(overrides, [{
+    id: "implement",
+    kind: "agent",
+    loop: { skill: "builtin://ce/implement@1", timeout_seconds: 60 },
+    worker: { id: "unit-worker", agent: "inherit", allowed_mcp_servers: [] },
+    credentials: ["model.invoke", "provider.read", "repo.read"],
+    context: "resume_required",
+  }]);
+}
+
+function repairCycleStructuredInstance(overrides: Record<string, unknown> = {}): any {
+  return structuredInstance(overrides, [{
+    id: "implement",
+    kind: "agent",
+    loop: { skill: "builtin://ce/implement@1", timeout_seconds: 60 },
+    worker: { id: "unit-worker", agent: "inherit", allowed_mcp_servers: [] },
+    credentials: ["model.invoke", "provider.read", "repo.read"],
+    context: "resume_required",
+  }, {
+    id: "simplify",
+    kind: "agent",
+    loop: { skill: "builtin://ce/simplify@1", timeout_seconds: 60 },
+    worker: { id: "unit-worker", agent: "inherit", allowed_mcp_servers: [] },
+    credentials: ["model.invoke", "provider.read", "repo.read"],
+    context: "resume_required",
+  }, {
+    id: "lead",
+    kind: "gate",
+    loop: { skill: "builtin://accept-unit@1", timeout_seconds: 60 },
+    worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
+    credentials: ["model.invoke", "repo.read"],
+    context: "fresh",
+  }]);
 }
 
 describe("structured child runtime aggregate outcome", () => {
@@ -2535,6 +2642,12 @@ describe("structured child runtime repair fences", () => {
   });
 
   it("gives a repair action the triggering lead decision and failing command evidence", async () => {
+    const rejectedCandidateSubject = "2".repeat(40);
+    const candidate = completedCandidateAction({
+      id: "candidate-cycle-1",
+      subject: rejectedCandidateSubject,
+      preSubject: rejectedCandidateSubject,
+    });
     const lead = action({
       id: "lead-cycle-1",
       action_kind: "lead",
@@ -2542,9 +2655,9 @@ describe("structured child runtime repair fences", () => {
       status: "completed",
       attempt_ordinal: 3,
       request_hash: "f".repeat(64),
-      output_subject: "a".repeat(40),
+      output_subject: rejectedCandidateSubject,
     });
-    lead.receipt = unitDecisionReceipt("unit_a", lead, "Fix the off-by-one in the paginator.");
+    lead.receipt = unitDecisionReceipt("unit_a", lead, "Fix the off-by-one in the paginator.", rejectedCandidateSubject);
     lead.receipt_hash = digestNormalized(lead.receipt);
     const command = action({
       id: "command-cycle-1",
@@ -2554,9 +2667,9 @@ describe("structured child runtime repair fences", () => {
       attempt_ordinal: 1,
       command_name: "test",
       request_hash: "e".repeat(64),
-      output_subject: "a".repeat(40),
+      output_subject: rejectedCandidateSubject,
     });
-    command.receipt = commandReceipt("a".repeat(40), command, "unit tests failed: off-by-one");
+    command.receipt = commandReceipt(rejectedCandidateSubject, command, "unit tests failed: off-by-one");
     command.receipt_hash = digestNormalized(command.receipt);
     const repair = action({
       id: "repair-cycle-2",
@@ -2565,12 +2678,13 @@ describe("structured child runtime repair fences", () => {
       status: "leased",
       attempt_ordinal: 4,
     });
+    const createWorktree = vi.fn(async () => ({ id: "worktree-handle" }));
     let dispatched: LoopActionRequest | undefined;
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       taskTimeoutSeconds: 300,
       runtime: {
-        createWorktree: vi.fn(async () => ({ id: "worktree-handle" })),
+        createWorktree,
         dispatchLoopAction: async (_resource: { providerResourceId: string }, request: LoopActionRequest) => {
           dispatched = request;
           return { providerDispatchId: "dispatch-1" };
@@ -2581,7 +2695,7 @@ describe("structured child runtime repair fences", () => {
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
         markActionWorktreeReady: vi.fn(),
-        listWorkAttempts: () => [lead, command, repair],
+        listWorkAttempts: () => [command, candidate, lead, repair],
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),
           command_names: "[]",
@@ -2590,47 +2704,402 @@ describe("structured child runtime repair fences", () => {
       } as any,
     });
 
-    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
-      id: "instance-1",
-      active_stage_id: "structured",
-      agent: "codex",
-      generation: 1,
-      base_commit: "a".repeat(40),
-      immutable_subject: "a".repeat(40),
-      manifest_digest: "c".repeat(64),
-      capability_digest: "d".repeat(64),
-      normalized_manifest: canonicalJson({
-        stages: [{
-          id: "structured",
-          unitPhaseBindings: [{
-            id: "implement",
-            kind: "agent",
-            loop: { skill: "builtin://ce/implement@1", timeout_seconds: 60 },
-            worker: { id: "unit-worker", agent: "inherit", allowed_mcp_servers: [] },
-            credentials: ["model.invoke", "provider.read", "repo.read"],
-            context: "resume_required",
-          }],
-        }],
-      }),
-    } as any, "parent-attempt");
+    await childRuntime.drainCompositeChildren(
+      { providerResourceId: "sandbox-1" },
+      repairStructuredInstance(),
+      "parent-attempt"
+    );
 
+    expect(createWorktree).toHaveBeenCalledWith({ providerResourceId: "sandbox-1" }, expect.objectContaining({
+      attemptId: "parent-attempt",
+      baseCommit: rejectedCandidateSubject,
+    }));
     expect(dispatched).toMatchObject({
       actionId: "repair-cycle-2",
       skill: "repair-unit",
       loop: "repair",
+      baseSubject: rejectedCandidateSubject,
+      inputSubject: rejectedCandidateSubject,
+      recoveryBaseSubject: "a".repeat(40),
       priorEvidence: {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "repair",
       },
     });
-    expect(dispatched?.priorEvidence?.receipts.map((receipt) => receipt.role)).toEqual(["lead", "command"]);
-    expect(dispatched?.priorEvidence?.receipts[0]?.receipt).toContain("Fix the off-by-one in the paginator.");
-    expect(dispatched?.priorEvidence?.receipts[1]?.receipt).toContain("unit tests failed: off-by-one");
+    expect(dispatched?.worktree).not.toBeNull();
+    expect(dispatched?.priorEvidence?.receipts.map((receipt) => receipt.role)).toEqual(["candidate", "lead", "command"]);
+    expect(dispatched?.priorEvidence?.receipts[0]?.actionAttemptId).toBe("candidate-cycle-1");
+    expect(dispatched?.priorEvidence?.receipts[1]?.receipt).toContain("Fix the off-by-one in the paginator.");
+    expect(dispatched?.priorEvidence?.receipts[2]?.receipt).toContain("unit tests failed: off-by-one");
   });
 
-  it("fails closed before repair dispatch when the triggering lead receipt's request-hash fence does not match", async () => {
+  it("reuses the rejected candidate worktree base across a repair cycle and rejects stale replay", async () => {
+    const rejectedCandidateSubject = "2".repeat(40);
+    const repairOutputSubject = "3".repeat(40);
+    const simplifyOutputSubject = "4".repeat(40);
+    const commandOutputSubject = "5".repeat(40);
+    const candidateOutputSubject = "6".repeat(40);
+    const staleBaseSubject = "a".repeat(40);
+    const previousCandidate = completedCandidateAction({
+      id: "candidate-cycle-1-worktree",
+      subject: rejectedCandidateSubject,
+    });
+    const triggeringLead = action({
+      id: "lead-cycle-1-worktree",
+      action_kind: "lead",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 3,
+      request_hash: "f".repeat(64),
+      output_subject: rejectedCandidateSubject,
+    });
+    triggeringLead.receipt = unitDecisionReceipt("unit_a", triggeringLead, "Fix the failed repair-cycle command.", rejectedCandidateSubject);
+    triggeringLead.receipt_hash = digestNormalized(triggeringLead.receipt);
+    const repair = action({
+      id: "repair-cycle-2-worktree",
+      action_kind: "repair",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 4,
+    });
+    const simplify = action({
+      id: "simplify-cycle-2-worktree",
+      action_kind: "simplify",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 5,
+    });
+    const command = action({
+      id: "command-cycle-2-worktree",
+      action_kind: "command",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 6,
+      command_name: "test",
+    });
+    const candidate = action({
+      id: "candidate-cycle-2-worktree",
+      action_kind: "candidate",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 7,
+    });
     const lead = action({
-      id: "lead-cycle-1-invalid",
+      id: "lead-cycle-2-worktree",
+      action_kind: "lead",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 8,
+    });
+    const attempts = [previousCandidate, triggeringLead, repair, simplify, command, candidate, lead];
+    let leased: ExecutionWorkAttempt | null = null;
+    const createWorktree = vi.fn(async () => ({ id: "worktree-handle" }));
+    const loopRequests = new Map<string, LoopActionRequest>();
+    const childRequests = new Map<string, ChildExecutorActionRequest>();
+    const dispatchLoopAction = vi.fn(async (_resource: { providerResourceId: string }, request: LoopActionRequest) => {
+      loopRequests.set(request.actionId, request);
+      return { providerDispatchId: `loop-${request.actionId}` };
+    });
+    const dispatchChildExecutorAction = vi.fn(async (
+      _resource: { providerResourceId: string },
+      request: ChildExecutorActionRequest
+    ) => {
+      childRequests.set(request.actionId, request);
+      return { providerDispatchId: `child-${request.actionId}` };
+    });
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: { createWorktree, dispatchLoopAction, dispatchChildExecutorAction } as any,
+      store: {
+        leaseNextUnitAction: () => leased,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        markActionWorktreeReady: vi.fn(),
+        listUnits: () => [unit({
+          unitId: "unit_a",
+          ordinal: 0,
+          status: "running",
+          phase: "lead",
+          currentCycle: 2,
+          integrationSubject: null,
+          terminalLevel: null,
+        })],
+        listWorkAttempts: () => attempts,
+        getGraphForAttempt: () => ({
+          integration_subject: staleBaseSubject,
+          command_names: JSON.stringify(["test"]),
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+      } as any,
+    });
+    const drain = async (actionToLease: ExecutionWorkAttempt) => {
+      leased = actionToLease;
+      await childRuntime.drainCompositeChildren(
+        { providerResourceId: "sandbox-1" },
+        repairCycleStructuredInstance(),
+        "parent-attempt"
+      );
+      leased = null;
+    };
+
+    await drain(repair);
+    const repairRequest = loopRequests.get(repair.id)!;
+    repair.status = "completed";
+    repair.output_subject = repairOutputSubject;
+    repair.request_hash = repairRequest.requestHash;
+    repair.receipt = completionReceipt(repairOutputSubject, repair, rejectedCandidateSubject, rejectedCandidateSubject);
+    repair.receipt_hash = digestNormalized(repair.receipt);
+    const repairHandle = repairRequest.worktree?.id;
+    expect(repairRequest).toMatchObject({
+      baseSubject: rejectedCandidateSubject,
+      inputSubject: rejectedCandidateSubject,
+      recoveryBaseSubject: staleBaseSubject,
+    });
+    expect(createWorktree).toHaveBeenCalledWith({ providerResourceId: "sandbox-1" }, expect.objectContaining({
+      baseCommit: rejectedCandidateSubject,
+    }));
+
+    await drain(simplify);
+    const simplifyRequest = loopRequests.get(simplify.id)!;
+    simplify.status = "completed";
+    simplify.output_subject = simplifyOutputSubject;
+    simplify.request_hash = simplifyRequest.requestHash;
+    simplify.receipt = completionReceipt(simplifyOutputSubject, simplify, repairOutputSubject, rejectedCandidateSubject);
+    simplify.receipt_hash = digestNormalized(simplify.receipt);
+    expect(simplifyRequest).toMatchObject({
+      baseSubject: rejectedCandidateSubject,
+      inputSubject: repairOutputSubject,
+      worktree: { id: repairHandle },
+    });
+
+    await drain(command);
+    const commandRequest = childRequests.get(command.id)!;
+    command.status = "completed";
+    command.output_subject = commandOutputSubject;
+    command.request_hash = commandRequest.requestHash;
+    expect(commandRequest).toMatchObject({
+      baseSubject: rejectedCandidateSubject,
+      inputSubject: simplifyOutputSubject,
+      worktree: { id: repairHandle },
+    });
+
+    await drain(candidate);
+    const candidateRequest = childRequests.get(candidate.id)!;
+    candidate.status = "completed";
+    candidate.output_subject = candidateOutputSubject;
+    candidate.request_hash = candidateRequest.requestHash;
+    candidate.receipt = candidateReceipt(candidateOutputSubject, candidate, commandOutputSubject, rejectedCandidateSubject);
+    candidate.receipt_hash = digestNormalized(candidate.receipt);
+    expect(candidateRequest).toMatchObject({
+      baseSubject: rejectedCandidateSubject,
+      inputSubject: commandOutputSubject,
+      worktree: { id: repairHandle },
+    });
+
+    await drain(lead);
+    const leadRequest = loopRequests.get(lead.id)!;
+    expect(leadRequest).toMatchObject({
+      baseSubject: rejectedCandidateSubject,
+      inputSubject: candidateOutputSubject,
+      candidateSubject: candidateOutputSubject,
+      worktree: null,
+    });
+
+    const staleReplay = action({
+      id: "command-cycle-2-stale-replay-worktree",
+      action_kind: "command",
+      cycle: 2,
+      status: "dispatched",
+      attempt_ordinal: 9,
+      command_name: "test",
+      request_hash: "3".repeat(64),
+      request_launch_state: "prepared",
+      request_payload: canonicalJson({
+        ...commandRequest,
+        actionId: "command-cycle-2-stale-replay-worktree",
+        baseSubject: staleBaseSubject,
+        inputSubject: staleBaseSubject,
+        worktree: { id: "stale-worktree-handle" },
+        requestHash: "3".repeat(64),
+      } satisfies ChildExecutorActionRequest),
+    });
+    attempts.push(staleReplay);
+    leased = staleReplay;
+    dispatchChildExecutorAction.mockClear();
+    await expect(childRuntime.drainCompositeChildren(
+      { providerResourceId: "sandbox-1" },
+      repairCycleStructuredInstance(),
+      "parent-attempt"
+    )).rejects.toThrow(/prepared request is not bound to the current unit worktree/);
+    expect(dispatchChildExecutorAction).not.toHaveBeenCalled();
+  });
+
+  it("replays prepared repair dispatch with the rejected candidate worktree base", async () => {
+    const rejectedCandidateSubject = "2".repeat(40);
+    const candidate = completedCandidateAction({
+      id: "candidate-cycle-1-replay",
+      subject: rejectedCandidateSubject,
+    });
+    const repair = action({
+      id: "repair-cycle-2-replay",
+      action_kind: "repair",
+      cycle: 2,
+      status: "dispatched",
+      attempt_ordinal: 4,
+      request_hash: "3".repeat(64),
+      request_launch_state: "prepared",
+    });
+    repair.request_payload = canonicalJson({
+        protocol: "loop-action@2",
+        actionId: "repair-cycle-2-replay",
+        attemptId: "parent-attempt",
+        graphId: "graph-1",
+        unitId: "unit_a",
+        role: "worker",
+        loop: "repair",
+        agent: "codex",
+        skill: "repair-unit",
+        worktree: { id: worktreeHandleId(repair, rejectedCandidateSubject) },
+        baseSubject: rejectedCandidateSubject,
+        recoveryBaseSubject: "a".repeat(40),
+        inputSubject: rejectedCandidateSubject,
+        nativeSessionId: "native-repair-1",
+        contextPolicy: "resume_required",
+        timeoutMs: 60_000,
+        transitionContext: "",
+        allowedMcpServers: [],
+        credentialScopes: ["model.invoke", "provider.read", "repo.read"],
+        receiptSchema: "openthrottle.receipt/v1",
+        expectedProducerSkill: "repair-unit",
+        expectedProducer: {
+          workerId: "unit-worker",
+          skill: "repair-unit",
+          capabilityDigest: "d".repeat(64),
+          skillPackageDigest: null,
+          assurance: "semantic_attested",
+        },
+        requestHash: "3".repeat(64),
+        idempotencyKey: "loop:parent-attempt:repair-cycle-2-replay:prepared",
+    } satisfies LoopActionRequest);
+    const createWorktree = vi.fn(async () => ({ id: "worktree-handle" }));
+    const dispatchLoopAction = vi.fn(async () => ({ providerDispatchId: "dispatch-1" }));
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: { createWorktree, dispatchLoopAction } as any,
+      store: {
+        leaseNextUnitAction: () => repair,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        markActionWorktreeReady: vi.fn(),
+        listWorkAttempts: () => [candidate, repair],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+      } as any,
+    });
+
+    await childRuntime.drainCompositeChildren(
+      { providerResourceId: "sandbox-1" },
+      structuredInstance(),
+      "parent-attempt"
+    );
+
+    expect(createWorktree).toHaveBeenCalledWith({ providerResourceId: "sandbox-1" }, expect.objectContaining({
+      baseCommit: rejectedCandidateSubject,
+    }));
+    expect(dispatchLoopAction).toHaveBeenCalledWith({ providerResourceId: "sandbox-1" }, expect.objectContaining({
+      requestHash: "3".repeat(64),
+      baseSubject: rejectedCandidateSubject,
+      inputSubject: rejectedCandidateSubject,
+      recoveryBaseSubject: "a".repeat(40),
+    }));
+  });
+
+  it("fails closed before replaying a prepared repair request with stale subjects", async () => {
+    const rejectedCandidateSubject = "2".repeat(40);
+    const staleBaseSubject = "a".repeat(40);
+    const candidate = completedCandidateAction({
+      id: "candidate-cycle-1-stale-replay",
+      subject: rejectedCandidateSubject,
+    });
+    const repair = action({
+      id: "repair-cycle-2-stale-replay",
+      action_kind: "repair",
+      cycle: 2,
+      status: "dispatched",
+      attempt_ordinal: 4,
+      request_hash: "3".repeat(64),
+      request_launch_state: "prepared",
+      request_payload: canonicalJson({
+        protocol: "loop-action@2",
+        actionId: "repair-cycle-2-stale-replay",
+        attemptId: "parent-attempt",
+        graphId: "graph-1",
+        unitId: "unit_a",
+        role: "worker",
+        loop: "repair",
+        agent: "codex",
+        skill: "repair-unit",
+        worktree: { id: "worktree-stale" },
+        baseSubject: staleBaseSubject,
+        recoveryBaseSubject: staleBaseSubject,
+        inputSubject: staleBaseSubject,
+        nativeSessionId: "native-repair-1",
+        contextPolicy: "resume_required",
+        timeoutMs: 60_000,
+        transitionContext: "",
+        allowedMcpServers: [],
+        credentialScopes: ["model.invoke", "provider.read", "repo.read"],
+        receiptSchema: "openthrottle.receipt/v1",
+        expectedProducerSkill: "repair-unit",
+        expectedProducer: {
+          workerId: "unit-worker",
+          skill: "repair-unit",
+          capabilityDigest: "d".repeat(64),
+          skillPackageDigest: null,
+          assurance: "semantic_attested",
+        },
+        requestHash: "3".repeat(64),
+        idempotencyKey: "loop:parent-attempt:repair-cycle-2-stale-replay:prepared",
+      } satisfies LoopActionRequest),
+    });
+    const createWorktree = vi.fn(async () => ({ id: "worktree-handle" }));
+    const dispatchLoopAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: { createWorktree, dispatchLoopAction } as any,
+      store: {
+        leaseNextUnitAction: () => repair,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        markActionWorktreeReady: vi.fn(),
+        listWorkAttempts: () => [candidate, repair],
+        getGraphForAttempt: () => ({
+          integration_subject: staleBaseSubject,
+          command_names: "[]",
+        }),
+      } as any,
+    });
+
+    await expect(childRuntime.drainCompositeChildren(
+      { providerResourceId: "sandbox-1" },
+      structuredInstance({
+        base_commit: staleBaseSubject,
+        immutable_subject: staleBaseSubject,
+      }),
+      "parent-attempt"
+    )).rejects.toThrow(/prepared request is not bound to the current unit worktree/);
+    expect(createWorktree).not.toHaveBeenCalled();
+    expect(dispatchLoopAction).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before repair worktree creation without unique rejected candidate evidence", async () => {
+    const lead = action({
+      id: "lead-cycle-1-no-candidate",
       action_kind: "lead",
       cycle: 1,
       status: "completed",
@@ -2639,6 +3108,171 @@ describe("structured child runtime repair fences", () => {
       output_subject: "a".repeat(40),
     });
     lead.receipt = unitDecisionReceipt("unit_a", lead, "Fix the off-by-one in the paginator.");
+    lead.receipt_hash = digestNormalized(lead.receipt);
+    const repair = action({
+      id: "repair-cycle-2-no-candidate",
+      action_kind: "repair",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 4,
+    });
+    const createWorktree = vi.fn(async () => ({ id: "worktree-handle" }));
+    const dispatchLoopAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: { createWorktree, dispatchLoopAction } as any,
+      store: {
+        leaseNextUnitAction: () => repair,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        markActionWorktreeReady: vi.fn(),
+        listWorkAttempts: () => [lead, repair],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+      } as any,
+    });
+
+    await expect(childRuntime.drainCompositeChildren(
+      { providerResourceId: "sandbox-1" },
+      repairStructuredInstance(),
+      "parent-attempt"
+    )).rejects.toThrow(/requires exactly one rejected candidate evidence/);
+    expect(createWorktree).not.toHaveBeenCalled();
+    expect(dispatchLoopAction).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before repair worktree creation with ambiguous rejected candidate evidence", async () => {
+    const rejectedCandidateSubject = "2".repeat(40);
+    const firstCandidate = completedCandidateAction({
+      id: "candidate-cycle-1-ambiguous-a",
+      subject: rejectedCandidateSubject,
+    });
+    const secondCandidate = completedCandidateAction({
+      id: "candidate-cycle-1-ambiguous-b",
+      subject: rejectedCandidateSubject,
+      attemptOrdinal: 3,
+    });
+    const lead = action({
+      id: "lead-cycle-1-ambiguous-candidate",
+      action_kind: "lead",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 4,
+      request_hash: "f".repeat(64),
+      output_subject: rejectedCandidateSubject,
+    });
+    lead.receipt = unitDecisionReceipt("unit_a", lead, "Fix the off-by-one in the paginator.", rejectedCandidateSubject);
+    lead.receipt_hash = digestNormalized(lead.receipt);
+    const repair = action({
+      id: "repair-cycle-2-ambiguous-candidate",
+      action_kind: "repair",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 5,
+    });
+    const createWorktree = vi.fn(async () => ({ id: "worktree-handle" }));
+    const dispatchLoopAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: { createWorktree, dispatchLoopAction } as any,
+      store: {
+        leaseNextUnitAction: () => repair,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        markActionWorktreeReady: vi.fn(),
+        listWorkAttempts: () => [firstCandidate, secondCandidate, lead, repair],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+      } as any,
+    });
+
+    await expect(childRuntime.drainCompositeChildren(
+      { providerResourceId: "sandbox-1" },
+      repairStructuredInstance(),
+      "parent-attempt"
+    )).rejects.toThrow(/requires exactly one rejected candidate evidence/);
+    expect(createWorktree).not.toHaveBeenCalled();
+    expect(dispatchLoopAction).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before repair worktree creation when rejected candidate evidence is stale", async () => {
+    const rejectedCandidateSubject = "2".repeat(40);
+    const candidate = completedCandidateAction({
+      id: "candidate-cycle-1-stale",
+      subject: rejectedCandidateSubject,
+      outputSubject: "3".repeat(40),
+    });
+    const lead = action({
+      id: "lead-cycle-1-stale-candidate",
+      action_kind: "lead",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 3,
+      request_hash: "f".repeat(64),
+      output_subject: rejectedCandidateSubject,
+    });
+    lead.receipt = unitDecisionReceipt("unit_a", lead, "Fix the off-by-one in the paginator.", rejectedCandidateSubject);
+    lead.receipt_hash = digestNormalized(lead.receipt);
+    const repair = action({
+      id: "repair-cycle-2-stale-candidate",
+      action_kind: "repair",
+      cycle: 2,
+      status: "leased",
+      attempt_ordinal: 4,
+    });
+    const createWorktree = vi.fn(async () => ({ id: "worktree-handle" }));
+    const dispatchLoopAction = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: { createWorktree, dispatchLoopAction } as any,
+      store: {
+        leaseNextUnitAction: () => repair,
+        markActionDispatching: vi.fn(),
+        markActionDispatched: vi.fn(),
+        markActionWorktreeReady: vi.fn(),
+        listWorkAttempts: () => [candidate, lead, repair],
+        getGraphForAttempt: () => ({
+          integration_subject: "a".repeat(40),
+          command_names: "[]",
+        }),
+        getAttempt: () => ({ request_payload: parentAttemptRequestPayload() }),
+      } as any,
+    });
+
+    await expect(childRuntime.drainCompositeChildren(
+      { providerResourceId: "sandbox-1" },
+      repairStructuredInstance(),
+      "parent-attempt"
+    )).rejects.toThrow(/rejected candidate subject disagrees/);
+    expect(createWorktree).not.toHaveBeenCalled();
+    expect(dispatchLoopAction).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before repair dispatch when the triggering lead receipt's request-hash fence does not match", async () => {
+    const rejectedCandidateSubject = "2".repeat(40);
+    const candidate = completedCandidateAction({
+      id: "candidate-cycle-1-invalid-lead",
+      subject: rejectedCandidateSubject,
+    });
+    const lead = action({
+      id: "lead-cycle-1-invalid",
+      action_kind: "lead",
+      cycle: 1,
+      status: "completed",
+      attempt_ordinal: 3,
+      request_hash: "f".repeat(64),
+      output_subject: rejectedCandidateSubject,
+    });
+    lead.receipt = unitDecisionReceipt("unit_a", lead, "Fix the off-by-one in the paginator.", rejectedCandidateSubject);
     const receipt = JSON.parse(lead.receipt);
     lead.receipt = canonicalJson({ ...receipt, fence: { ...receipt.fence, request_hash: "1".repeat(64) } });
     lead.receipt_hash = digestNormalized(lead.receipt);
@@ -2662,7 +3296,7 @@ describe("structured child runtime repair fences", () => {
         markActionDispatching: vi.fn(),
         markActionDispatched: vi.fn(),
         markActionWorktreeReady: vi.fn(),
-        listWorkAttempts: () => [lead, repair],
+        listWorkAttempts: () => [candidate, lead, repair],
         getGraphForAttempt: () => ({
           integration_subject: "a".repeat(40),
           command_names: "[]",
@@ -2671,29 +3305,11 @@ describe("structured child runtime repair fences", () => {
       } as any,
     });
 
-    await expect(childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
-      id: "instance-1",
-      active_stage_id: "structured",
-      agent: "codex",
-      generation: 1,
-      base_commit: "a".repeat(40),
-      immutable_subject: "a".repeat(40),
-      manifest_digest: "c".repeat(64),
-      capability_digest: "d".repeat(64),
-      normalized_manifest: canonicalJson({
-        stages: [{
-          id: "structured",
-          unitPhaseBindings: [{
-            id: "implement",
-            kind: "agent",
-            loop: { skill: "builtin://ce/implement@1", timeout_seconds: 60 },
-            worker: { id: "unit-worker", agent: "inherit", allowed_mcp_servers: [] },
-            credentials: ["model.invoke", "provider.read", "repo.read"],
-            context: "resume_required",
-          }],
-        }],
-      }),
-    } as any, "parent-attempt")).rejects.toThrow(/triggering lead fence is invalid/);
+    await expect(childRuntime.drainCompositeChildren(
+      { providerResourceId: "sandbox-1" },
+      repairStructuredInstance(),
+      "parent-attempt"
+    )).rejects.toThrow(/triggering lead fence is invalid/);
     expect(dispatchLoopAction).not.toHaveBeenCalled();
   });
 

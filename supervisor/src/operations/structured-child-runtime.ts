@@ -631,6 +631,36 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     coordinatePipelineEvent(deps.store, event));
 
   const worktreeBaseFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string => {
+    if (action.action_kind === "repair") return repairRejectedCandidateSubjectFor(instance, action);
+    if (
+      action.unit_id !== null &&
+      action.cycle > 1 &&
+      (
+        action.action_kind === "simplify" ||
+        action.action_kind === "command" ||
+        action.action_kind === "candidate" ||
+        action.action_kind === "lead"
+      )
+    ) {
+      const unitCycleAttempts = deps.store.listWorkAttempts(action.parent_attempt_id).filter((attempt) =>
+        attempt.unit_id === action.unit_id &&
+        attempt.cycle === action.cycle
+      );
+      const hasRepairCycleWork = unitCycleAttempts.some((attempt) => attempt.action_kind === "repair");
+      if (!hasRepairCycleWork) {
+        const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
+        const base = graph?.integration_subject ?? instance.immutable_subject ?? instance.base_commit;
+        if (!GIT_SUBJECT.test(base)) throw new Error(`child action ${action.id} has no exact worktree base`);
+        return base;
+      }
+      const repairs = unitCycleAttempts.filter((attempt) =>
+        attempt.action_kind === "repair" &&
+        attempt.status === "completed");
+      if (repairs.length !== 1) {
+        throw new Error(`child action ${action.id} requires exactly one completed repair worktree for cycle ${action.cycle}`);
+      }
+      return repairRejectedCandidateSubjectFor(instance, repairs[0]!);
+    }
     const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
     const base = graph?.integration_subject ?? instance.immutable_subject ?? instance.base_commit;
     if (!GIT_SUBJECT.test(base)) throw new Error(`child action ${action.id} has no exact worktree base`);
@@ -676,6 +706,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
 
   const actionInputSubjectFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string => {
     const base = worktreeBaseFor(instance, action);
+    if (action.action_kind === "repair") return base;
     if (action.action_kind === "command") {
       return latestPriorOutputSubject(action, ["implement", "repair", "simplify", "command"]) ?? base;
     }
@@ -1514,6 +1545,94 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     throw new Error(`missing ${type} receipt for ${unitId ?? "final"}`);
   };
 
+  const repairRejectedCandidateAttemptReceipt = (
+    instance: PipelineInstance,
+    action: ExecutionWorkAttempt,
+    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[] =
+      completedAttemptReceiptsFor(action.parent_attempt_id)
+  ): { attempt: ExecutionWorkAttempt; receipt: CandidateEvidenceReceipt } => {
+    if (action.action_kind !== "repair") throw new Error(`child action ${action.id} is not a unit repair`);
+    if (action.unit_id === null) throw new Error(`child repair action ${action.id} has no unit id`);
+    const rejectedCycle = action.cycle - 1;
+    const candidates = receipts.filter((entry): entry is {
+      attempt: ExecutionWorkAttempt;
+      receipt: CandidateEvidenceReceipt;
+    } =>
+      entry.attempt.action_kind === "candidate" &&
+      entry.attempt.unit_id === action.unit_id &&
+      entry.attempt.cycle === rejectedCycle &&
+      entry.receipt.type === "candidate_evidence");
+    if (candidates.length !== 1) {
+      throw new Error(`child repair action ${action.id} requires exactly one rejected candidate evidence receipt for cycle ${rejectedCycle}`);
+    }
+    const candidate = candidates[0]!;
+    if (
+      candidate.receipt.assurance !== "executor_verified" ||
+      candidate.receipt.result !== "success" ||
+      !GIT_SUBJECT.test(candidate.receipt.subject.post)
+    ) {
+      throw new Error(`child repair action ${action.id} rejected candidate evidence is not executor verified`);
+    }
+    if (candidate.attempt.output_subject !== candidate.receipt.subject.post) {
+      throw new Error(`child repair action ${action.id} rejected candidate subject disagrees with its action output`);
+    }
+    const candidateProducer = expectedProducerForAction(instance, candidate.attempt);
+    assertCandidateEvidenceFence({
+      expected: {
+        pipelineInstanceId: instance.id,
+        graphDigest: instance.manifest_digest,
+        unitId: candidate.attempt.unit_id ?? "__final__",
+        attemptId: candidate.attempt.parent_attempt_id,
+        parentRunId: candidate.attempt.parent_run_id,
+        actionAttemptId: candidate.attempt.id,
+        generation: instance.generation,
+        nativeSessionId: candidate.receipt.fence.native_session_id,
+        requestHash: candidate.attempt.request_hash ?? "",
+        baseSubject: receiptBaseFor(instance, candidate.attempt),
+        preSubject: actionInputSubjectFor(instance, candidate.attempt),
+        subject: candidate.receipt.subject.post,
+        producers: {
+          completion: candidateProducer,
+          candidate: candidateProducer,
+          command: candidateProducer,
+          lead: candidateProducer,
+          integration: candidateProducer,
+          review: candidateProducer,
+        },
+      },
+      candidate: candidate.receipt,
+    });
+    return candidate;
+  };
+
+  const repairRejectedCandidateSubjectFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string =>
+    repairRejectedCandidateAttemptReceipt(instance, action).receipt.subject.post;
+
+  const assertPreparedUnitWorktreeRequestBound = (
+    request: Pick<LoopActionRequest | ChildExecutorActionRequest, "baseSubject" | "inputSubject" | "worktree">,
+    instance: PipelineInstance,
+    action: ExecutionWorkAttempt
+  ): void => {
+    if (action.unit_id === null) return;
+    if (
+      action.action_kind !== "repair" &&
+      action.action_kind !== "simplify" &&
+      action.action_kind !== "command" &&
+      action.action_kind !== "candidate" &&
+      action.action_kind !== "lead"
+    ) return;
+    const expectedBase = sha1SubjectForGitOperation(worktreeBaseFor(instance, action), "child action base subject");
+    const expectedInput = actionInputSubjectFor(instance, action);
+    const expectedWorktree = action.action_kind === "lead" ? null : worktreeHandleFor(action, expectedBase).id;
+    if (
+      request.baseSubject !== expectedBase ||
+      request.inputSubject !== expectedInput ||
+      (expectedWorktree === null ? request.worktree !== null : request.worktree?.id !== expectedWorktree)
+    ) {
+      throw new Error(`child action ${action.id} prepared request is not bound to the current unit worktree`);
+    }
+  };
+
   const verifiedAggregateTreeSubject = (input: {
     parentAttemptId: string;
     integrationSubject: string;
@@ -1703,10 +1822,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         throw new Error(`child repair action ${action.id} triggering lead fence is invalid`);
       }
       const commands = commandAttemptReceipts(receipts, action.unit_id, action.cycle - 1);
+      const candidate = repairRejectedCandidateAttemptReceipt(instance, action, receipts);
       const evidence = {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "repair",
         receipts: [
+          priorReceiptEntry("candidate", candidate),
           priorReceiptEntry("lead", lead),
           ...commands.map((command) => priorReceiptEntry("command", command)),
         ],
@@ -1776,6 +1897,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     if (isChildExecutorActionKind(action.action_kind)) {
       if (action.request_payload && action.request_hash) {
         const replayRequest = JSON.parse(action.request_payload) as ChildExecutorActionRequest;
+        assertPreparedUnitWorktreeRequestBound(replayRequest, instance, action);
         await deps.runtime.dispatchChildExecutorAction(resource, replayRequest);
         return { requestHash: replayRequest.requestHash, nativeSessionId: null };
       }
@@ -1841,6 +1963,22 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           label: "review selector action",
         });
         return { requestHash: replayRequest.requestHash, nativeSessionId: null };
+      }
+      if (action.action_kind === "repair") {
+        assertPreparedUnitWorktreeRequestBound(replayRequest, instance, action);
+        const rejectedCandidateSubject = sha1SubjectForGitOperation(
+          worktreeBaseFor(instance, action),
+          "child action base subject"
+        );
+        if (
+          replayRequest.baseSubject !== rejectedCandidateSubject ||
+          replayRequest.inputSubject !== rejectedCandidateSubject ||
+          replayRequest.recoveryBaseSubject !== instance.base_commit
+        ) {
+          throw new Error(`child repair action ${action.id} prepared request is not bound to the rejected candidate`);
+        }
+      } else {
+        assertPreparedUnitWorktreeRequestBound(replayRequest, instance, action);
       }
       const needsWorktree = replayRequest.worktree !== null &&
         (action.request_launch_state === "prepared" || action.request_launch_state == null) &&
@@ -1969,7 +2107,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       ...(workerBinding.worker.model === undefined ? {} : { model: workerBinding.worker.model }),
       skill: workerBinding.repositorySkill?.invocation ?? adapterSkillFor(action.action_kind),
       worktree,
-      baseSubject: worktreeBaseFor(instance, action),
+      baseSubject: baseCommit,
       recoveryBaseSubject: instance.base_commit,
       inputSubject,
       nativeSessionId: action.native_session_id,
