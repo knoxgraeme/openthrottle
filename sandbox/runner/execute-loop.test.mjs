@@ -764,6 +764,17 @@ describe("loop action request validation", () => {
         context_updates: [],
       },
     });
+    const candidateReceipt = priorReceipt("candidate", "candidate-1", {
+      type: "candidate_evidence",
+      assurance: "executor_verified",
+      result: "success",
+      payload: {
+        tree: "2".repeat(40),
+        diff_digest: "d".repeat(64),
+        changed_paths: ["src/paginator.ts"],
+        clean: true,
+      },
+    });
     const commandReceipt = priorReceipt("command", "command-1", {
       type: "command_result",
       result: "failure",
@@ -780,14 +791,15 @@ describe("loop action request validation", () => {
       priorEvidence: {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "repair",
-        receipts: [leadReceipt, commandReceipt],
+        receipts: [candidateReceipt, leadReceipt, commandReceipt],
       },
     };
     const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...unfenced } = withoutFence;
     const valid = validateLoopRequest({ ...unfenced, ...createLoopRequestHash(unfenced) });
 
-    expect(valid.priorEvidence.receipts).toHaveLength(2);
+    expect(valid.priorEvidence.receipts).toHaveLength(3);
     const prompt = loopPrompt(valid);
+    expect(prompt).toContain("candidate_evidence");
     expect(prompt).toContain("Fix the off-by-one in the paginator.");
     expect(prompt).toContain("AssertionError: expected 2 to equal 3");
     expect(prompt).toContain("FAIL runner/command.test.mjs");
@@ -804,14 +816,45 @@ describe("loop action request validation", () => {
     });
     const oversizedEvidence = {
       ...unfenced,
-      priorEvidence: { ...unfenced.priorEvidence, receipts: [leadReceipt, oversizedCommand] },
+      priorEvidence: { ...unfenced.priorEvidence, receipts: [candidateReceipt, leadReceipt, oversizedCommand] },
     };
     expect(() => validateLoopRequest({ ...oversizedEvidence, ...createLoopRequestHash(oversizedEvidence) }))
       .toThrow(/stderr_tail must contain at most 512 UTF-8 bytes/);
 
+    const missingCandidate = {
+      ...unfenced,
+      priorEvidence: { ...unfenced.priorEvidence, receipts: [leadReceipt, commandReceipt] },
+    };
+    expect(() => validateLoopRequest({ ...missingCandidate, ...createLoopRequestHash(missingCandidate) }))
+      .toThrow(/exactly one rejected candidate receipt/);
+
+    const duplicateCandidate = {
+      ...unfenced,
+      priorEvidence: { ...unfenced.priorEvidence, receipts: [candidateReceipt, { ...candidateReceipt, actionAttemptId: "candidate-duplicate" }, leadReceipt, commandReceipt] },
+    };
+    expect(() => validateLoopRequest({ ...duplicateCandidate, ...createLoopRequestHash(duplicateCandidate) }))
+      .toThrow(/exactly one rejected candidate receipt/);
+
+    const wrongCandidateType = {
+      ...unfenced,
+      priorEvidence: {
+        ...unfenced.priorEvidence,
+        receipts: [
+          priorReceipt("candidate", "candidate-1", {
+            type: "unit_completion",
+            assurance: "semantic_attested",
+          }),
+          leadReceipt,
+          commandReceipt,
+        ],
+      },
+    };
+    expect(() => validateLoopRequest({ ...wrongCandidateType, ...createLoopRequestHash(wrongCandidateType) }))
+      .toThrow(/rejected candidate receipt must be successful executor_verified candidate_evidence/);
+
     const missingLead = {
       ...unfenced,
-      priorEvidence: { ...unfenced.priorEvidence, receipts: [commandReceipt] },
+      priorEvidence: { ...unfenced.priorEvidence, receipts: [candidateReceipt, commandReceipt] },
     };
     expect(() => validateLoopRequest({ ...missingLead, ...createLoopRequestHash(missingLead) }))
       .toThrow(/exactly one triggering lead receipt/);
@@ -820,7 +863,7 @@ describe("loop action request validation", () => {
       ...unfenced,
       priorEvidence: {
         ...unfenced.priorEvidence,
-        receipts: [{ ...leadReceipt, role: "candidate" }, commandReceipt],
+        receipts: [candidateReceipt, { ...leadReceipt, role: "command" }, commandReceipt],
       },
     };
     expect(() => validateLoopRequest({ ...nonRevisionEvidence, ...createLoopRequestHash(nonRevisionEvidence) }))
@@ -834,7 +877,7 @@ describe("loop action request validation", () => {
       ...unfenced,
       priorEvidence: {
         ...unfenced.priorEvidence,
-        receipts: [priorReceipt("lead", "lead-1"), commandReceipt],
+        receipts: [candidateReceipt, priorReceipt("lead", "lead-1"), commandReceipt],
       },
     };
     expect(() => validateLoopRequest({ ...nonDecisionLead, ...createLoopRequestHash(nonDecisionLead) }))
@@ -844,11 +887,11 @@ describe("loop action request validation", () => {
       ...unfenced,
       priorEvidence: {
         ...unfenced.priorEvidence,
-        receipts: [leadReceipt, priorReceipt("completion", "completion-1")],
+        receipts: [candidateReceipt, leadReceipt, priorReceipt("completion", "completion-1")],
       },
     };
     expect(() => validateLoopRequest({ ...foreignEvidence, ...createLoopRequestHash(foreignEvidence) }))
-      .toThrow(/outside lead\/command for a repair action/);
+      .toThrow(/outside candidate\/lead\/command for a repair action/);
   });
 
   it("includes the prior review round and intervening repair completion for final-review anti-churn", () => {
