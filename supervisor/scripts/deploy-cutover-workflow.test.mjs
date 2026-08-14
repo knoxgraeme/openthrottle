@@ -35,6 +35,9 @@ if [[ "\${1:-}" == "releases" ]]; then
   printf '%s\\n' "\${FLYCTL_RELEASES_RESPONSE:-[]}"
   exit "\${FLYCTL_RELEASES_STATUS:-0}"
 fi
+if [[ "\${1:-}" == "deploy" ]]; then
+  exit "\${FLYCTL_DEPLOY_STATUS:-0}"
+fi
 if [[ "$*" == *"ssh console"* ]]; then
   printf '%s\\n' "\${FLYCTL_SSH_RESPONSE:-no machines}"
   exit "\${FLYCTL_SSH_STATUS:-1}"
@@ -58,6 +61,32 @@ exit 0
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+}
+
+function rollbackHarness() {
+  const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+  const helperStart = script.indexOf("active_image_ref() {");
+  const helperEnd = script.indexOf("trap 'abort_cutover $?' ERR");
+  if (helperStart < 0 || helperEnd < helperStart) throw new Error("missing rollback helper block");
+  const helperBlock = script.slice(helperStart, helperEnd);
+  return `
+set -euo pipefail
+FLY_APP=openthrottle-supervisor
+cutover_id=cutover-1
+old_snapshot=old-snapshot
+old_release=old-release
+old_digest=sha256:old
+old_runtime_image=registry.fly.io/openthrottle-supervisor@sha256:old
+${helperBlock}
+cutover_command() {
+  case "$1" in
+    evidence) printf '%s\\n' '{"admission":{"paused":1},"runtime":{"release":"old-release","capabilityDigest":"sha256:old"},"snapshot":"old-snapshot"}' ;;
+    resume) printf '%s\\n' '{"admission":{"paused":0}}' ;;
+    advance) printf '%s\\n' "$2" ;;
+  esac
+}
+abort_cutover 1
+`;
 }
 
 describe("deploy workflow cutover recovery", () => {
@@ -228,6 +257,89 @@ advance_cutover paused active "$pause_evidence" "" "42"
       old_runtime_capability_digest: "sha256:old",
       old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
     });
+  });
+
+  it("compacts oversized cutover evidence so the old runtime seal survives the parent 4000-character bound", () => {
+    const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+    const helperStart = script.indexOf("seal_cutover_evidence() {");
+    const helperEnd = script.indexOf("cutover_command() {");
+    if (helperStart < 0 || helperEnd < helperStart) throw new Error("missing cutover seal helper");
+    const helperBlock = script.slice(helperStart, helperEnd);
+    const blockers = Array.from({ length: 50 }, (_, index) => ({
+      id: `blocker-${index}`,
+      reason: "active run ".repeat(100),
+    }));
+    const harness = `
+set -euo pipefail
+old_digest=sha256:old
+old_runtime_image=registry.fly.io/openthrottle-supervisor@sha256:old
+${helperBlock}
+seal_cutover_evidence '${JSON.stringify({ admission: { paused: 0, epoch: 1 }, runtime: { release: "old-release", capabilityDigest: "sha256:old" }, snapshot: "old-snapshot", drain: { clear: false, blockers } })}' begin
+`;
+    const result = spawnSync("bash", ["-c", harness], { cwd: repoRoot, encoding: "utf8" });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout.length).toBeLessThan(4_000);
+    const evidence = JSON.parse(result.stdout);
+    expect(evidence.schema).toBe("openthrottle.cutover-evidence/v1");
+    expect(evidence.summary.drain.blocker_count).toBe(50);
+    expect(evidence.sealed_old_runtime).toEqual({
+      old_runtime_capability_digest: "sha256:old",
+      old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
+    });
+  });
+
+  it("keeps admission paused when rollback evidence matches release, digest, and snapshot but machines still run the candidate image", () => {
+    const result = runBash(rollbackHarness(), {
+      FLYCTL_MACHINES_RESPONSE:
+        '[{"id":"one","state":"started","config":{"image":"registry.fly.io/openthrottle-supervisor@sha256:candidate"}}]',
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.commands).toContain("--image registry.fly.io/openthrottle-supervisor@sha256:old");
+    const payload = JSON.parse(result.stdout);
+    expect(payload.phase).toBe("recovery_required");
+    const evidence = JSON.parse(payload.evidence);
+    expect(evidence.summary.rollback.observedImage).toBe("registry.fly.io/openthrottle-supervisor@sha256:candidate");
+    expect(result.stdout).not.toContain('{"admission":{"paused":0}}');
+  });
+
+  it("keeps admission paused when rollback machine enumeration fails after deploying the old image", () => {
+    const result = runBash(rollbackHarness(), { FLYCTL_MACHINES_STATUS: "1" });
+
+    expect(result.status).toBe(1);
+    const payload = JSON.parse(result.stdout);
+    expect(payload.phase).toBe("recovery_required");
+    const evidence = JSON.parse(payload.evidence);
+    expect(evidence.summary.rollback.machineStatus).toBe(1);
+    expect(result.stdout).not.toContain('{"admission":{"paused":0}}');
+  });
+
+  it("keeps admission paused when the old-image rollback deploy fails", () => {
+    const result = runBash(rollbackHarness(), {
+      FLYCTL_DEPLOY_STATUS: "1",
+      FLYCTL_MACHINES_RESPONSE:
+        '[{"id":"one","state":"started","config":{"image":"registry.fly.io/openthrottle-supervisor@sha256:old"}}]',
+    });
+
+    expect(result.status).toBe(1);
+    const payload = JSON.parse(result.stdout);
+    expect(payload.phase).toBe("recovery_required");
+    const evidence = JSON.parse(payload.evidence);
+    expect(evidence.summary.rollback.deployStatus).toBe(1);
+    expect(result.stdout).not.toContain('{"admission":{"paused":0}}');
+  });
+
+  it("attests old image, release, digest, and snapshot before resuming after a successful rollback", () => {
+    const result = runBash(rollbackHarness(), {
+      FLYCTL_MACHINES_RESPONSE:
+        '[{"id":"one","state":"started","config":{"image":"registry.fly.io/openthrottle-supervisor@sha256:old"}}]',
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('"phase": "restored"');
+    expect(result.stdout).not.toContain('"phase": "recovery_required"');
+    expect(result.stdout.indexOf('"phase": "restored"')).toBeLessThan(result.stdout.indexOf('"paused": 0'));
   });
 
   it("executes the recorded recovery shape as staged old snapshot plus pinned image deploy plus evidence, without resume", () => {
