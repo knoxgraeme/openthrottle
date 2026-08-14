@@ -153,10 +153,6 @@ export function assertTuneRatchetMaterialBinding(
 }
 
 export function executionPlanForTuneProposal(proposal: TuneProposal) {
-  const requirements = proposal.changes.map((change) =>
-    `Apply only ${change.operation} for ${change.path} from the sealed openthrottle.tune-change-material/v1 contract. ` +
-      "Use its exact after_content bytes; do not reconstruct content from a digest or rationale."
-  );
   return {
     schema: EXECUTION_PLAN_SCHEMA_V2,
     graph_id: "structured",
@@ -166,7 +162,10 @@ export function executionPlanForTuneProposal(proposal: TuneProposal) {
       title: `Apply approved tune proposal ${proposal.id}`,
       depends_on: [],
       objective: "Apply exactly the supervisor-approved tune material.",
-      requirements,
+      requirements: [
+        "Apply every authorized change from the sealed openthrottle.tune-change-material/v1 contract. " +
+          "Use each exact after_content byte sequence; do not reconstruct content from a digest or rationale.",
+      ],
       files: [...new Set(proposal.changes.map((change) => change.path))],
       approach: [
         "Read the sealed tune edit verification payload and apply only the authorized changed bytes.",

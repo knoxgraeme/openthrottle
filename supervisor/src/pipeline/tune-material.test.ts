@@ -91,4 +91,25 @@ describe("tune ratchet material binding", () => {
     expect(JSON.stringify(plan)).not.toContain("git push");
     expect(plan.units[0]!.requirements[0]).toContain("sealed openthrottle.tune-change-material/v1 contract");
   });
+
+  it("keeps the generated v2 plan valid for the maximum tune change count", () => {
+    const value = proposal();
+    value.changes = Array.from({ length: 64 }, (_, index) => {
+      const content = `${after}\nchange-${index}\n`;
+      return {
+        path: `.openthrottle/skills/implement_unit/file-${index}.md`,
+        operation: "modify",
+        before_digest: digestNormalized(before),
+        after_digest: digestNormalized(content),
+        after_content: content,
+        rationale: `Exercise maximum change count ${index}.`,
+      };
+    });
+
+    const plan = executionPlanForTuneProposal(value);
+
+    expect(plan.units[0]!.requirements).toHaveLength(1);
+    expect(plan.units[0]!.files).toHaveLength(64);
+    expect(() => validateExecutionPlanContractV2(plan)).not.toThrow();
+  });
 });
