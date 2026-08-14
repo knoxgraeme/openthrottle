@@ -63,6 +63,18 @@ function planWithBlock(graphId = "structured"): string {
   return `${cePlan}\n## Execution Plan\n\n${executionPlanBlock(graphId)}\n`;
 }
 
+function executionPlanBlockV2(graphId = "structured"): string {
+  const contract = JSON.parse(
+    readFileSync(new URL("../../contracts/fixtures/valid/execution-plan-v2.json", import.meta.url), "utf8")
+  ) as Record<string, unknown>;
+  contract.graph_id = graphId;
+  return `\`\`\`json openthrottle.execution-plan/v2\n${JSON.stringify(contract, null, 2)}\n\`\`\``;
+}
+
+function planWithBlockV2(graphId = "structured"): string {
+  return `${cePlan}\n## Execution Plan\n\n${executionPlanBlockV2(graphId)}\n`;
+}
+
 function writeConfig(directory: string, allowedGraphs = ["simple", "structured"]): void {
   writeFileSync(
     join(directory, ".openthrottle.yml"),
@@ -82,14 +94,31 @@ function writeConfig(directory: string, allowedGraphs = ["simple", "structured"]
 }
 
 describe("plan validation", () => {
-  it("validates one execution-plan block prepared by the planning skill", () => {
+  it("rejects a fresh legacy v1 execution-plan block", () => {
     const updated = planWithBlock();
+
+    expect(extractExecutionPlanBlocks(updated)).toHaveLength(1);
+    expect(() => readExecutionPlanFromMarkdown(updated, "sample.md")).toThrow(/fresh execution plans must use openthrottle\.execution-plan\/v2/);
+  });
+
+  it("validates one self-contained v2 execution-plan block", () => {
+    const updated = planWithBlockV2();
     const result = readExecutionPlanFromMarkdown(updated, "sample.md");
 
     expect(extractExecutionPlanBlocks(updated)).toHaveLength(1);
+    expect(result.plan.value.schema).toBe("openthrottle.execution-plan/v2");
     expect(result.plan.value.units.map((unit) => unit.id)).toEqual(["contracts", "corpora"]);
-    expect(result.plan.value.units[1]!.depends_on).toEqual(["contracts"]);
-    expect(result.coverage).toMatchObject({ units: 2, instruction_refs: 2, acceptance_refs: 2 });
+    expect(result.coverage).toMatchObject({
+      schema: "openthrottle.execution-plan/v2",
+      units: 2,
+      requirement_count: 3,
+      acceptance_count: 3,
+    });
+  });
+
+  it("rejects a v1 and a v2 execution-plan block coexisting in the same file", () => {
+    const combined = `${cePlan}\n${executionPlanBlock()}\n${executionPlanBlockV2()}\n`;
+    expect(() => readExecutionPlanFromMarkdown(combined, "mixed.md")).toThrow(/expected exactly one/);
   });
 
   it("rejects missing, duplicated, and invalid execution-plan blocks", () => {
@@ -100,10 +129,20 @@ describe("plan validation", () => {
     expect(() => readExecutionPlanFromMarkdown(`${cePlan}\n${nonCanonical}`, "non-canonical.md")).toThrow(/found 0/);
     expect(() =>
       readExecutionPlanFromMarkdown(
-        `# Invalid\n\n\`\`\`json openthrottle.execution-plan/v1\n{"schema":"openthrottle.execution-plan/v1","units":[]}\n\`\`\``,
+        `# Invalid\n\n\`\`\`json openthrottle.execution-plan/v2\n{"schema":"openthrottle.execution-plan/v2","units":[]}\n\`\`\``,
         "invalid.md"
       )
     ).toThrow(/graph_id/);
+  });
+
+  it("rejects fence/schema mismatches and dual execution-plan markers", () => {
+    const v2Json = executionPlanBlockV2("structured")
+      .replace("json openthrottle.execution-plan/v2", "json openthrottle.execution-plan/v1");
+    expect(() => extractExecutionPlanBlocks(v2Json)).toThrow(/payload schema must be openthrottle\.execution-plan\/v1/);
+
+    const dual = executionPlanBlockV2("structured")
+      .replace("json openthrottle.execution-plan/v2", "json openthrottle.execution-plan/v1 openthrottle.execution-plan/v2");
+    expect(() => extractExecutionPlanBlocks(dual)).toThrow(/declares multiple schemas/);
   });
 
   it("prepares a plan by invoking the configured local engine with the canonical skill", () => {
@@ -121,7 +160,7 @@ describe("plan validation", () => {
         directory: input.directory,
         targetFile: input.targetFile,
       });
-      writeFileSync(input.targetFile!, planWithBlock("structured"));
+      writeFileSync(input.targetFile!, planWithBlockV2("structured"));
       return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
     };
     try {
@@ -137,6 +176,28 @@ describe("plan validation", () => {
       expect(calls[0]!.targetFile).not.toBe(planPath);
       expect(calls[0]!.directory).not.toBe(directory);
       expect(calls[0]!.prompt).toContain(`Target plan file: ${calls[0]!.targetFile}`);
+    } finally {
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+    }
+  });
+
+  it("rejects prepare output that leaves a legacy v1 block unchanged", () => {
+    const directory = temporaryProject();
+    const planPath = join(directory, "plan.md");
+    writeConfig(directory);
+    writeFileSync(planPath, `${cePlan}\n## Execution Plan\n\n${executionPlanBlock("structured")}\n`);
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "test-key";
+    const runner: PrepareRunner = (input) => {
+      writeFileSync(input.targetFile!, planWithBlock("structured"));
+      return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
+    };
+    try {
+      expect(() => prepareExecutionPlanFile(planPath, { directory, graphId: "structured", runner })).toThrow(
+        /fresh execution plans must use openthrottle\.execution-plan\/v2/
+      );
+      expect(readFileSync(planPath, "utf8")).toBe(`${cePlan}\n## Execution Plan\n\n${executionPlanBlock("structured")}\n`);
     } finally {
       if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = previousOpenAiKey;
@@ -190,7 +251,7 @@ describe("plan validation", () => {
     delete process.env.CODEX_AUTH_JSON;
     process.env.CODEX_HOME = codexHome;
     const runner: PrepareRunner = (input) => {
-      writeFileSync(input.targetFile!, planWithBlock("structured"));
+      writeFileSync(input.targetFile!, planWithBlockV2("structured"));
       return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
     };
     try {
@@ -236,7 +297,7 @@ describe("plan validation", () => {
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = "test-key";
     const runner: PrepareRunner = (input) => {
-      writeFileSync(input.targetFile!, planWithBlock("structured"));
+      writeFileSync(input.targetFile!, planWithBlockV2("structured"));
       return {
         status: 1,
         signal: null,
@@ -266,7 +327,7 @@ describe("plan validation", () => {
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = "test-key";
     const runner: PrepareRunner = (input) => {
-      writeFileSync(input.targetFile!, `# Rewritten requirements\n\n${executionPlanBlock("structured")}\n`);
+      writeFileSync(input.targetFile!, `# Rewritten requirements\n\n${executionPlanBlockV2("structured")}\n`);
       return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
     };
     try {
@@ -427,7 +488,7 @@ describe("plan validation", () => {
     const directory = temporaryProject();
     const bin = join(directory, "bin");
     const planPath = join(directory, "plan.md");
-    const preparedPlan = planWithBlock("structured");
+    const preparedPlan = planWithBlockV2("structured");
     mkdirSync(bin);
     writeConfig(directory);
     writeFileSync(planPath, cePlan);
@@ -475,7 +536,7 @@ describe("plan validation", () => {
       await plan(["prepare", planPath, "--graph", "structured", "--json"]);
       expect(JSON.parse(output[0]!)).toMatchObject({
         ok: true,
-        coverage: { units: 2, instruction_refs: 2, acceptance_refs: 2 },
+        coverage: { units: 2, requirement_count: 3, file_count: 4, test_count: 3, acceptance_count: 3, verification_count: 2 },
       });
       expect(readExecutionPlanFromMarkdown(readFileSync(planPath, "utf8"), planPath).plan.value.graph_id).toBe(
         "structured"
@@ -529,7 +590,7 @@ describe("plan validation", () => {
     const directory = temporaryProject();
     const planPath = join(directory, "plan.md");
     writeConfig(directory);
-    writeFileSync(planPath, planWithBlock("other"));
+    writeFileSync(planPath, planWithBlockV2("other"));
     const exit = process.exit;
     const log = console.log;
     const output: string[] = [];
@@ -653,7 +714,7 @@ describe("plan validation", () => {
     const directory = temporaryProject();
     const planPath = join(directory, "plan.md");
     writeConfig(directory);
-    writeFileSync(planPath, planWithBlock("other"));
+    writeFileSync(planPath, planWithBlockV2("other"));
 
     expect(() => validatePlanFileForGraph(planPath, { directory, graphId: "structured" })).toThrow(
       /graph_id must match/
