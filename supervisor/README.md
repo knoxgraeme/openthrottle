@@ -128,12 +128,13 @@ rollback-compatible migration runner first and confirm
 `/deployment/cutover-evidence` reports
 `schema-migrations-name-additive-rollback-compatible/v1`; only then may a later
 release apply additive future migrations marked in `schema_migrations.name` with
-` [rollback-compatible:additive/v1]`. The deploy workflow enforces that proof
-for push and `workflow_dispatch` runs on refs that change
-`supervisor/src/persistence/migrations/definitions.ts`; it also rejects newly
-added migration definitions missing the marker before the new supervisor image
-can open SQLite. Unmarked or malformed future ledger rows remain startup-fatal
-for rollback safety.
+` [rollback-compatible:additive/v1]`. Before every supervisor push or
+`workflow_dispatch` deploy, the workflow checks the complete current migration
+catalog and rejects post-cutover definitions missing a statically verifiable
+literal marker. That whole-tree check also catches migrations introduced by an
+earlier failed deployment when a later unrelated commit retries the same HEAD
+catalog. Unmarked or malformed future ledger rows remain startup-fatal for
+rollback safety.
 
 The cutover client executes inside the Fly machine and reads
 `OT_DEPLOY_TOKEN` there. GitHub Actions never stores or receives that token.

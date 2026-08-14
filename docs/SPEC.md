@@ -986,12 +986,13 @@ release apply additive, rollback-compatible future migrations whose
 contract still validate every known migration name and checksum exactly, and
 they fail closed on any unknown future row without that exact suffix or with a
 malformed suffix.
-The deploy workflow treats changes to
-`supervisor/src/persistence/migrations/definitions.ts` as migration-bearing
-releases, including `workflow_dispatch` runs on such refs: before deployment it
-rejects any newly added migration definition without one statically verifiable,
-double-quoted literal name carrying the marker suffix, pauses
-admission, waits for a clear drain, and requires the live pre-deploy
+The deploy workflow validates the complete current
+`supervisor/src/persistence/migrations/definitions.ts` catalog before every
+supervisor deployment, including `workflow_dispatch` runs. It rejects any
+post-cutover migration definition without one statically verifiable,
+double-quoted literal name carrying the marker suffix, even when that migration
+was introduced by an earlier failed deployment rather than the triggering
+diff; it pauses admission, waits for a clear drain, and requires the live pre-deploy
 supervisor's cutover evidence to expose that database contract. This preserves
 the initial precursor bootstrap while making later migration-bearing releases
 prove rollback compatibility before they open SQLite or write unmarked future

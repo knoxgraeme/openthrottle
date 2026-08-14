@@ -3477,7 +3477,7 @@ const definitions: DatabaseMigrationDefinition[] = [
   },
   {
     version: 46,
-    name: `deployment-cutover-transaction${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+    name: "deployment-cutover-transaction [rollback-compatible:additive/v1]",
     source: deploymentCutoverMigrationSource,
     up(db) {
       if (!hasTable(db, "deployment_cutovers")) {

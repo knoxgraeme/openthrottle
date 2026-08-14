@@ -90,6 +90,19 @@ abort_cutover 1
 }
 
 describe("deploy workflow cutover recovery", () => {
+  it("validates the complete migration catalog before Fly setup on every deploy", () => {
+    const steps = deployWorkflow().jobs.deploy.steps;
+    const validationIndex = steps.findIndex((step) => step.name === "Validate migration rollback markers");
+    const flySetupIndex = steps.findIndex((step) => step.uses === "superfly/flyctl-actions/setup-flyctl@master");
+
+    expect(validationIndex).toBeGreaterThanOrEqual(0);
+    expect(flySetupIndex).toBeGreaterThan(validationIndex);
+    expect(steps[validationIndex].if).toBeUndefined();
+    expect(steps[validationIndex].run).toBe(
+      "node supervisor/scripts/verify-migration-rollback-markers.mjs"
+    );
+  });
+
   it("fails closed when machine enumeration fails even if releases has a plausible image", () => {
     const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
     const helperStart = script.indexOf("active_image_ref() {");

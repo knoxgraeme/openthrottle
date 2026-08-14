@@ -1,127 +1,121 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
-  addedMigrationDefinitionCountFromDiff,
-  addedMigrationNamesFromDiff,
-  assertAddedMigrationNamesMarked,
-  migrationDiffBase,
+  assertMigrationNamesMarked,
+  migrationDefinitionsFromSource,
 } from "./verify-migration-rollback-markers.mjs";
 
 const verifierPath = fileURLToPath(new URL("./verify-migration-rollback-markers.mjs", import.meta.url));
+const suffix = " [rollback-compatible:additive/v1]";
 
-function git(directory, args) {
-  return execFileSync("git", args, { cwd: directory, encoding: "utf8" }).trim();
+function source(...definitions) {
+  return [
+    "const definitions: DatabaseMigrationDefinition[] = [",
+    ...definitions,
+    "];",
+    "export const databaseMigrations = definitions;",
+    "",
+  ].join("\n");
 }
 
 describe("migration rollback marker verifier", () => {
-  it("extracts added migration definition names from a definitions diff", () => {
-    const diff = [
-      "diff --git a/supervisor/src/persistence/migrations/definitions.ts b/supervisor/src/persistence/migrations/definitions.ts",
-      "+++ b/supervisor/src/persistence/migrations/definitions.ts",
-      "+    version: 46,",
-      "+    name: \"future-additive [rollback-compatible:additive/v1]\",",
-      "+    source: `CREATE TABLE future_additive (id TEXT PRIMARY KEY);`,",
-    ].join("\n");
+  it("verifies every protected migration in the complete current source", () => {
+    const input = source(
+      '  { version: 45, name: "legacy", source: "" },',
+      '  { version: 46, name: "legacy-cutover", source: "" },',
+      [
+        "  {",
+        "    version: 47,",
+        `    name: "future${suffix}",`,
+        "    source: `CREATE TABLE future (id TEXT PRIMARY KEY);`,",
+        "  },",
+      ].join("\n"),
+    );
 
-    expect(addedMigrationNamesFromDiff(diff)).toEqual([
-      "future-additive [rollback-compatible:additive/v1]",
+    expect(migrationDefinitionsFromSource(input)).toEqual([
+      { version: 45, name: "legacy" },
+      { version: 46, name: "legacy-cutover" },
+      { version: 47, name: `future${suffix}` },
     ]);
-    expect(addedMigrationDefinitionCountFromDiff(diff)).toBe(1);
-    expect(assertAddedMigrationNamesMarked(diff)).toBe(1);
+    expect(assertMigrationNamesMarked(input)).toBe(1);
   });
 
-  it("rejects added migration definition names without the rollback marker", () => {
-    const diff = [
-      "+    version: 46,",
-      "+    name: \"future-unmarked\",",
-      "+    source: `CREATE TABLE future_unmarked (id TEXT PRIMARY KEY);`,",
-    ].join("\n");
+  it("rejects an unmarked one-line migration definition", () => {
+    const input = source(
+      '  { version: 46, name: "legacy-cutover", source: "" },',
+      '  { version: 47, name: "future-unmarked", source: "" },',
+    );
 
-    expect(() => assertAddedMigrationNamesMarked(diff)).toThrow(
-      /new migration definitions must end their name/
+    expect(() => assertMigrationNamesMarked(input)).toThrow(
+      /migration definitions at version 47 or later must end their name/
     );
   });
 
   it.each([
-    ["single-quoted", "+    name: 'future [rollback-compatible:additive/v1]',"],
-    ["computed", "+    name: `future${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,"],
-    ["concatenated", "+    name: \"future\" + ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,"],
-    ["multiline", "+    name:\n+      \"future [rollback-compatible:additive/v1]\","],
-    ["missing", "+    source: `CREATE TABLE future (id TEXT PRIMARY KEY);`,"],
-  ])("fails closed for a %s migration name", (_label, nameLine) => {
-    const diff = [
-      "+    version: 47,",
-      nameLine,
-      "+    source: `CREATE TABLE future (id TEXT PRIMARY KEY);`,",
-    ].join("\n");
-
-    expect(() => assertAddedMigrationNamesMarked(diff)).toThrow(
-      /could not statically verify exactly one double-quoted literal name/
+    ["single-quoted", `  { version: 47, name: 'future${suffix}', source: "" },`],
+    ["computed", "  { version: 47, name: `future${suffix}`, source: \"\" },"],
+    ["concatenated", '  { version: 47, name: "future" + suffix, source: "" },'],
+    ["multiline", `  { version: 47, name:\n      \"future${suffix}\", source: \"\" },`],
+    ["missing", '  { version: 47, source: "" },'],
+    ["computed keys", `  { ["version"]: 47, ["name"]: "future${suffix}", source: "" },`],
+    ["reordered", `  { name: "future${suffix}", version: 47, source: "" },`],
+    ["shorthand", '  { version, name, source: "" },'],
+  ])("fails closed for a %s migration name", (_label, definition) => {
+    expect(() => assertMigrationNamesMarked(source(definition))).toThrow(
+      /could not statically verify a literal version and double-quoted literal name/
     );
   });
 
-  it("uses the predecessor for a default-branch manual dispatch", () => {
-    expect(migrationDiffBase({
-      MIGRATION_EVENT_NAME: "workflow_dispatch",
-      MIGRATION_REF_NAME: "main",
-      MIGRATION_DEFAULT_BRANCH: "main",
-    })).toBe("HEAD^");
-    expect(migrationDiffBase({
-      MIGRATION_EVENT_NAME: "workflow_dispatch",
-      MIGRATION_REF_NAME: "release-test",
-      MIGRATION_DEFAULT_BRANCH: "main",
-    })).toBe("origin/main");
-    expect(migrationDiffBase({
-      MIGRATION_DIFF_BASE: "abc123",
-      MIGRATION_EVENT_NAME: "push",
-    })).toBe("abc123");
+  it.each([
+    ["spread", `  { version: 47, name: "future${suffix}", source: "" },\n  ...moreDefinitions,`],
+    ["helper", "  migration(47),"],
+  ])("fails closed for a top-level %s definition", (_label, definition) => {
+    expect(() => assertMigrationNamesMarked(source(definition))).toThrow(
+      /top-level object literals/
+    );
   });
 
-  it("rejects an unmarked migration in a default-branch workflow dispatch", () => {
-    const directory = mkdtempSync(join(tmpdir(), "ot-migration-marker-dispatch-"));
-    const definitions = join(
-      directory,
-      "supervisor/src/persistence/migrations/definitions.ts"
-    );
+  it("ignores braces and migration-like text inside strings and comments", () => {
+    const input = source([
+      "  {",
+      "    version: 47,",
+      `    name: "future${suffix}",`,
+      "    source: `CREATE TABLE text (value TEXT DEFAULT '{ version: 99 }');`,",
+      "    up() { /* { version: 100 } */ return \"}\"; },",
+      "  },",
+    ].join("\n"));
+
+    expect(assertMigrationNamesMarked(input)).toBe(1);
+  });
+
+  it("rejects duplicate or out-of-order migration versions", () => {
+    expect(() => migrationDefinitionsFromSource(source(
+      `  { version: 47, name: "one${suffix}", source: "" },`,
+      `  { version: 47, name: "two${suffix}", source: "" },`,
+    ))).toThrow(/strictly increasing/);
+  });
+
+  it("checks the complete HEAD file when invoked, independent of the triggering diff", () => {
+    const directory = mkdtempSync(join(tmpdir(), "ot-migration-marker-head-"));
+    const definitions = join(directory, "supervisor/src/persistence/migrations/definitions.ts");
     try {
       mkdirSync(dirname(definitions), { recursive: true });
-      git(directory, ["init", "-q"]);
-      git(directory, ["config", "user.name", "OpenThrottle Test"]);
-      git(directory, ["config", "user.email", "test@openthrottle.local"]);
-      writeFileSync(definitions, "export const definitions = [];\n");
-      git(directory, ["add", "."]);
-      git(directory, ["commit", "-qm", "base"]);
-      writeFileSync(definitions, [
-        "export const definitions = [",
-        "  {",
-        "    version: 47,",
-        "    name: \"future-unmarked\",",
-        "    source: `CREATE TABLE future_unmarked (id TEXT PRIMARY KEY);`,",
-        "  },",
-        "];",
-        "",
-      ].join("\n"));
-      git(directory, ["add", "."]);
-      git(directory, ["commit", "-qm", "add unmarked migration"]);
+      writeFileSync(definitions, source(
+        '  { version: 46, name: "legacy-cutover", source: "" },',
+        '  { version: 47, name: "previously-merged-unmarked", source: "" },',
+      ));
 
       const result = spawnSync(process.execPath, [verifierPath], {
         cwd: directory,
         encoding: "utf8",
-        env: {
-          ...process.env,
-          MIGRATION_DIFF_BASE: "",
-          MIGRATION_EVENT_NAME: "workflow_dispatch",
-          MIGRATION_REF_NAME: "main",
-          MIGRATION_DEFAULT_BRANCH: "main",
-        },
       });
 
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("new migration definitions must end their name");
+      expect(result.stderr).toContain("previously-merged-unmarked");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
