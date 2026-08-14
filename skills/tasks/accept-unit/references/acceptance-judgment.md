@@ -6,9 +6,11 @@ and the shape of a revision request the three things worth getting right.
 
 ## 1. Reading an acceptance entry
 
-The `acceptance` entries are the contract. The unit's `instructions` are context
-that explains them; the plan prose around them is background. When the two
-disagree, the acceptance entry decides.
+The `acceptance` entries are the contract. The rest of the unit's context —
+`objective`/`requirements`/`approach` in the current plan format, or the
+resolved `instructions` text in a legacy plan — explains them; the plan prose
+around them is background. When the two disagree, the acceptance entry
+decides.
 
 Classify each entry before judging it:
 

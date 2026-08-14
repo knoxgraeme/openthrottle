@@ -507,6 +507,11 @@ export function prepareExecutionPlanFile(
       throw new Error(`${file}: prepare modified content outside the execution-plan block`);
     }
     const result = readExecutionPlanFromMarkdown(prepared, file);
+    if (result.plan.value.schema !== EXECUTION_PLAN_FENCE_V2) {
+      throw new Error(
+        `${file}: prepare must produce a ${EXECUTION_PLAN_FENCE_V2} block, found ${result.plan.value.schema}`
+      );
+    }
     if (result.plan.value.graph_id !== graph.graphId) {
       throw new Error(`${file}: execution_plan.graph_id must match selected graph ${graph.graphId}`);
     }

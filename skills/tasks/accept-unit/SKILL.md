@@ -25,9 +25,13 @@ This is a scope-match decision, **not a code review**.
 
 - `## Receipt Authority Contract` — the identity envelope your receipt must echo
   (`fence`, `producer`, `assurance`, `subject.base`, `subject.pre`).
-- `## Unit Action Context` and `## Execution Plan Context` — this unit, its
-  `instructions`, its `acceptance` entries, and the commands configured for it.
-  **The `acceptance` entries are the criteria. Nothing else is.**
+- `## Unit Action Context` and `## Execution Plan Context` — this unit and the
+  commands configured for it. In the current plan format the unit carries
+  `objective`/`requirements`/`files`/`approach`/`tests`/`verification` as
+  context plus `acceptance` entries directly as text; in a legacy plan
+  (replay-only) the unit's `instructions`/`acceptance` ID arrays resolve
+  against top-level text maps in the same context. **The `acceptance` entries
+  are the criteria. Nothing else is.**
 - `## Prior Evidence` — a JSON object whose `receipts` array holds the sealed
   inputs to your decision. Each entry has `role` (`completion`, `candidate`, or
   `command`), `actionAttemptId`, `receiptHash`, and the full `receipt` text.

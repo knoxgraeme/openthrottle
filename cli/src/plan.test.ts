@@ -153,7 +153,7 @@ describe("plan validation", () => {
         directory: input.directory,
         targetFile: input.targetFile,
       });
-      writeFileSync(input.targetFile!, planWithBlock("structured"));
+      writeFileSync(input.targetFile!, planWithBlockV2("structured"));
       return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
     };
     try {
@@ -169,6 +169,28 @@ describe("plan validation", () => {
       expect(calls[0]!.targetFile).not.toBe(planPath);
       expect(calls[0]!.directory).not.toBe(directory);
       expect(calls[0]!.prompt).toContain(`Target plan file: ${calls[0]!.targetFile}`);
+    } finally {
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+    }
+  });
+
+  it("rejects prepare output that leaves a legacy v1 block unchanged", () => {
+    const directory = temporaryProject();
+    const planPath = join(directory, "plan.md");
+    writeConfig(directory);
+    writeFileSync(planPath, `${cePlan}\n## Execution Plan\n\n${executionPlanBlock("structured")}\n`);
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "test-key";
+    const runner: PrepareRunner = (input) => {
+      writeFileSync(input.targetFile!, planWithBlock("structured"));
+      return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
+    };
+    try {
+      expect(() => prepareExecutionPlanFile(planPath, { directory, graphId: "structured", runner })).toThrow(
+        /prepare must produce a openthrottle\.execution-plan\/v2 block, found openthrottle\.execution-plan\/v1/
+      );
+      expect(readFileSync(planPath, "utf8")).toBe(`${cePlan}\n## Execution Plan\n\n${executionPlanBlock("structured")}\n`);
     } finally {
       if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = previousOpenAiKey;
@@ -222,7 +244,7 @@ describe("plan validation", () => {
     delete process.env.CODEX_AUTH_JSON;
     process.env.CODEX_HOME = codexHome;
     const runner: PrepareRunner = (input) => {
-      writeFileSync(input.targetFile!, planWithBlock("structured"));
+      writeFileSync(input.targetFile!, planWithBlockV2("structured"));
       return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
     };
     try {
@@ -459,7 +481,7 @@ describe("plan validation", () => {
     const directory = temporaryProject();
     const bin = join(directory, "bin");
     const planPath = join(directory, "plan.md");
-    const preparedPlan = planWithBlock("structured");
+    const preparedPlan = planWithBlockV2("structured");
     mkdirSync(bin);
     writeConfig(directory);
     writeFileSync(planPath, cePlan);
@@ -507,7 +529,7 @@ describe("plan validation", () => {
       await plan(["prepare", planPath, "--graph", "structured", "--json"]);
       expect(JSON.parse(output[0]!)).toMatchObject({
         ok: true,
-        coverage: { units: 2, instruction_refs: 2, acceptance_refs: 2 },
+        coverage: { units: 2, requirement_count: 3, file_count: 4, test_count: 3, acceptance_count: 3, verification_count: 2 },
       });
       expect(readExecutionPlanFromMarkdown(readFileSync(planPath, "utf8"), planPath).plan.value.graph_id).toBe(
         "structured"

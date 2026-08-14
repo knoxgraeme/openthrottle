@@ -31,12 +31,22 @@ return one receipt. Nothing else in the run is yours.
 
 The sealed prompt carries, in order: the **Receipt Authority Contract** (the
 identity you echo back verbatim); the **Unit Action Context** (parent identity,
-`unit_id`, `action_kind`, `cycle`); the **Execution Plan Context** (`unit` with
-`id`/`title`/`depends_on`, the `instructions` and `acceptance` texts this unit
-references, and the `commands` that will gate it); and **Prior Evidence** plus
-**Downstream Context** — receipts and notes handed forward from already
-integrated units, which are constraints, not extra work. The unit's `title`
-plus its `instructions` are the specification; `acceptance` is the bar. If they
+`unit_id`, `action_kind`, `cycle`); the **Execution Plan Context** (`unit` plus
+the `commands` that will gate it); and **Prior Evidence** plus **Downstream
+Context** — receipts and notes handed forward from already integrated units,
+which are constraints, not extra work.
+
+`unit` is your complete specification; there is no separate source plan to
+consult. In the current plan format, `unit` carries `id`/`title`/`depends_on`
+plus `objective`, `requirements`, `files`, `approach`, `tests`, `acceptance`,
+and `verification` directly as literal text — `objective`/`requirements`/
+`approach` are the specification, `files` names the expected touch points,
+`tests`/`verification` name what to check and how, and `acceptance` is the
+bar. In a legacy plan (replay of an already-sealed run only), `unit` instead
+carries `instructions`/`acceptance` ID arrays that index into top-level
+`instructions`/`acceptance` text maps in the same context; resolve the IDs,
+and `title` plus the resolved `instructions` text is the specification while
+`acceptance` is the bar. Either way, if the specification and acceptance
 conflict, acceptance wins and you record it in `issues`.
 
 ## Scope
