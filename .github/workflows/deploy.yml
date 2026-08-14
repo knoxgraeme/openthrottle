@@ -167,18 +167,17 @@ jobs:
         # This supervisor-only fence release does not build a snapshot, so its
         # first push deploys without calling endpoints its parent lacks. Once
         # installed, every push that builds a new snapshot gates automatically.
-        # Migration-bearing supervisor releases also gate here even when they
-        # do not build a snapshot, so the live rollback image proves it supports
-        # marked future migrations before the new image opens SQLite.
+        # Migration-bearing supervisor releases also gate here, including
+        # workflow_dispatch deploys, so the live rollback image proves it
+        # supports marked future migrations before the new image opens SQLite.
         if: >-
           inputs.prepare_v12_cutover ||
-          (github.event_name == 'push' &&
-           (needs.snapshot.result == 'success' ||
-            needs.changes.outputs.database_migrations == 'true'))
+          (github.event_name == 'push' && needs.snapshot.result == 'success') ||
+          needs.changes.outputs.database_migrations == 'true'
         run: |
           set -euo pipefail
           requires_snapshot_check="${{ inputs.prepare_v12_cutover || needs.snapshot.result == 'success' }}"
-          requires_migration_contract="${{ github.event_name == 'push' && needs.changes.outputs.database_migrations == 'true' }}"
+          requires_migration_contract="${{ needs.changes.outputs.database_migrations == 'true' }}"
           if [[ "${requires_snapshot_check}" == "true" && -z "${EXPECTED_SNAPSHOT}" ]]; then
             echo "expected_snapshot is required when this run does not build a snapshot" >&2
             exit 1
@@ -229,9 +228,8 @@ jobs:
              .snapshot == $snapshot' >/dev/null
       - name: Resume admission after v12 cutover
         if: >-
-          (github.event_name == 'push' &&
-           (needs.snapshot.result == 'success' ||
-            needs.changes.outputs.database_migrations == 'true')) ||
+          (github.event_name == 'push' && needs.snapshot.result == 'success') ||
+          needs.changes.outputs.database_migrations == 'true' ||
           (inputs.prepare_v12_cutover && inputs.resume_after_v12_cutover)
         run: |
           flyctl ssh console --app "$FLY_APP" --command \
