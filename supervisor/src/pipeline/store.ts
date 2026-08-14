@@ -11,7 +11,7 @@ import type { FaultAttribution } from "./fault-attribution.js";
 import type {
   ValidatedRuntimeCapabilityDescriptor,
 } from "../runtime/contracts.js";
-import type { StageRequestEnvelope } from "./stage-request.js";
+import type { StageRequestEnvelope, StageRequestInputArtifact } from "./stage-request.js";
 import type { ExecutionPublicationSnapshot } from "./execution-publication.js";
 import type { TaskType } from "./types.js";
 
@@ -335,6 +335,7 @@ export interface PipelineInstanceSeed {
   runtime: ValidatedRuntimeCapabilityDescriptor;
   authorizedCapabilities: string[];
   taskContext?: string;
+  inputArtifacts?: StageRequestInputArtifact[];
 }
 
 export interface CoordinatorArtifactWrite {

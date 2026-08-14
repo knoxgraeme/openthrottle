@@ -39,7 +39,15 @@ type ExecutionPlanUnitContext = ExecutionPlanContract["units"][number];
 // (see review-fanout.ts's normalizedSearchText fallback when no map is
 // supplied).
 function unitSearchFieldsV2(unit: ExecutionPlanUnitV2): readonly string[] {
-  return [unit.objective, ...unit.requirements, ...unit.approach, ...unit.tests, ...unit.verification];
+  return [
+    unit.title,
+    unit.objective,
+    ...unit.requirements,
+    ...unit.files,
+    ...unit.approach,
+    ...unit.tests,
+    ...unit.verification,
+  ];
 }
 
 function reviewFanoutUnitContextV2(unit: ExecutionPlanUnitV2 | undefined): {
@@ -47,6 +55,7 @@ function reviewFanoutUnitContextV2(unit: ExecutionPlanUnitV2 | undefined): {
   title: string;
   instructions: readonly string[];
   acceptance: readonly string[];
+  files: readonly string[];
 } | undefined {
   if (!unit) return undefined;
   return {
@@ -54,6 +63,7 @@ function reviewFanoutUnitContextV2(unit: ExecutionPlanUnitV2 | undefined): {
     title: unit.title,
     instructions: unitSearchFieldsV2(unit),
     acceptance: unit.acceptance,
+    files: unit.files,
   };
 }
 

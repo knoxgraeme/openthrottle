@@ -94,14 +94,11 @@ function writeConfig(directory: string, allowedGraphs = ["simple", "structured"]
 }
 
 describe("plan validation", () => {
-  it("validates one execution-plan block prepared by the planning skill", () => {
+  it("rejects a fresh legacy v1 execution-plan block", () => {
     const updated = planWithBlock();
-    const result = readExecutionPlanFromMarkdown(updated, "sample.md");
 
     expect(extractExecutionPlanBlocks(updated)).toHaveLength(1);
-    expect(result.plan.value.units.map((unit) => unit.id)).toEqual(["contracts", "corpora"]);
-    expect(result.plan.value.units[1]!.depends_on).toEqual(["contracts"]);
-    expect(result.coverage).toMatchObject({ units: 2, instruction_refs: 2, acceptance_refs: 2 });
+    expect(() => readExecutionPlanFromMarkdown(updated, "sample.md")).toThrow(/fresh execution plans must use openthrottle\.execution-plan\/v2/);
   });
 
   it("validates one self-contained v2 execution-plan block", () => {
@@ -132,10 +129,20 @@ describe("plan validation", () => {
     expect(() => readExecutionPlanFromMarkdown(`${cePlan}\n${nonCanonical}`, "non-canonical.md")).toThrow(/found 0/);
     expect(() =>
       readExecutionPlanFromMarkdown(
-        `# Invalid\n\n\`\`\`json openthrottle.execution-plan/v1\n{"schema":"openthrottle.execution-plan/v1","units":[]}\n\`\`\``,
+        `# Invalid\n\n\`\`\`json openthrottle.execution-plan/v2\n{"schema":"openthrottle.execution-plan/v2","units":[]}\n\`\`\``,
         "invalid.md"
       )
     ).toThrow(/graph_id/);
+  });
+
+  it("rejects fence/schema mismatches and dual execution-plan markers", () => {
+    const v2Json = executionPlanBlockV2("structured")
+      .replace("json openthrottle.execution-plan/v2", "json openthrottle.execution-plan/v1");
+    expect(() => extractExecutionPlanBlocks(v2Json)).toThrow(/payload schema must be openthrottle\.execution-plan\/v1/);
+
+    const dual = executionPlanBlockV2("structured")
+      .replace("json openthrottle.execution-plan/v2", "json openthrottle.execution-plan/v1 openthrottle.execution-plan/v2");
+    expect(() => extractExecutionPlanBlocks(dual)).toThrow(/declares multiple schemas/);
   });
 
   it("prepares a plan by invoking the configured local engine with the canonical skill", () => {
@@ -188,7 +195,7 @@ describe("plan validation", () => {
     };
     try {
       expect(() => prepareExecutionPlanFile(planPath, { directory, graphId: "structured", runner })).toThrow(
-        /prepare must produce a openthrottle\.execution-plan\/v2 block, found openthrottle\.execution-plan\/v1/
+        /fresh execution plans must use openthrottle\.execution-plan\/v2/
       );
       expect(readFileSync(planPath, "utf8")).toBe(`${cePlan}\n## Execution Plan\n\n${executionPlanBlock("structured")}\n`);
     } finally {
@@ -290,7 +297,7 @@ describe("plan validation", () => {
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = "test-key";
     const runner: PrepareRunner = (input) => {
-      writeFileSync(input.targetFile!, planWithBlock("structured"));
+      writeFileSync(input.targetFile!, planWithBlockV2("structured"));
       return {
         status: 1,
         signal: null,
@@ -320,7 +327,7 @@ describe("plan validation", () => {
     const previousOpenAiKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = "test-key";
     const runner: PrepareRunner = (input) => {
-      writeFileSync(input.targetFile!, `# Rewritten requirements\n\n${executionPlanBlock("structured")}\n`);
+      writeFileSync(input.targetFile!, `# Rewritten requirements\n\n${executionPlanBlockV2("structured")}\n`);
       return { status: 0, signal: null, output: [], pid: 123, stdout: Buffer.from(""), stderr: Buffer.from("") };
     };
     try {
@@ -583,7 +590,7 @@ describe("plan validation", () => {
     const directory = temporaryProject();
     const planPath = join(directory, "plan.md");
     writeConfig(directory);
-    writeFileSync(planPath, planWithBlock("other"));
+    writeFileSync(planPath, planWithBlockV2("other"));
     const exit = process.exit;
     const log = console.log;
     const output: string[] = [];
@@ -707,7 +714,7 @@ describe("plan validation", () => {
     const directory = temporaryProject();
     const planPath = join(directory, "plan.md");
     writeConfig(directory);
-    writeFileSync(planPath, planWithBlock("other"));
+    writeFileSync(planPath, planWithBlockV2("other"));
 
     expect(() => validatePlanFileForGraph(planPath, { directory, graphId: "structured" })).toThrow(
       /graph_id must match/

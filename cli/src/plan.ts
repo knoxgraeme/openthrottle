@@ -21,6 +21,7 @@ const EXECUTION_PLAN_FENCES = [EXECUTION_PLAN_FENCE, EXECUTION_PLAN_FENCE_V2];
 
 export interface ExecutionPlanBlock {
   json: string;
+  schema: string;
   start: number;
   end: number;
 }
@@ -86,9 +87,25 @@ export function extractExecutionPlanBlocks(markdown: string): ExecutionPlanBlock
   const blocks: ExecutionPlanBlock[] = [];
   for (const match of markdown.matchAll(FENCE_PATTERN)) {
     const marker = match[1]?.trim().split(/\s+/) ?? [];
-    if (!EXECUTION_PLAN_FENCES.some((fence) => marker.includes(fence))) continue;
+    const markerSchemas = EXECUTION_PLAN_FENCES.filter((fence) => marker.includes(fence));
+    if (markerSchemas.length === 0) continue;
+    if (markerSchemas.length > 1) {
+      throw new Error(`execution-plan fence declares multiple schemas: ${markerSchemas.join(", ")}`);
+    }
     const json = match[2]?.trim() ?? "";
-    blocks.push({ json, start: match.index ?? 0, end: (match.index ?? 0) + match[0].length });
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(json) as unknown;
+    } catch {
+      throw new Error(`${markerSchemas[0]} block must contain valid JSON`);
+    }
+    const payloadSchema = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as { schema?: unknown }).schema
+      : undefined;
+    if (payloadSchema !== markerSchemas[0]) {
+      throw new Error(`${markerSchemas[0]} block payload schema must be ${markerSchemas[0]}`);
+    }
+    blocks.push({ json, schema: markerSchemas[0]!, start: match.index ?? 0, end: (match.index ?? 0) + match[0].length });
   }
   return blocks;
 }
@@ -118,11 +135,15 @@ function coverageFor(plan: AnyExecutionPlanContract): ValidationResult["coverage
 
 export function readExecutionPlanFromMarkdown(
   markdown: string,
-  source = "plan"
+  source = "plan",
+  options: { allowLegacyV1?: boolean } = {}
 ): ValidationResult {
   const blocks = extractExecutionPlanBlocks(markdown);
   if (blocks.length !== 1) {
     throw new Error(`${source}: expected exactly one execution-plan block, found ${blocks.length}`);
+  }
+  if (!options.allowLegacyV1 && blocks[0]!.schema === EXECUTION_PLAN_FENCE) {
+    throw new Error(`${source}: fresh execution plans must use ${EXECUTION_PLAN_FENCE_V2}; ${EXECUTION_PLAN_FENCE} is replay-only`);
   }
   const plan = parseAnyExecutionPlanContract(blocks[0]!.json, { source: `${source}.execution_plan` });
   return {
