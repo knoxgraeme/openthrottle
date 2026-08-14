@@ -151,9 +151,12 @@ jobs:
       - name: Ensure the Fly app and data volume exist
         run: |
           set -euo pipefail
+          first_install_bootstrap=0
           # Create the app if it is missing. Tolerate only the already-exists
           # error so real failures (bad token, unknown org) still surface.
-          if ! flyctl apps create "$FLY_APP" --org "$FLY_ORG" 2>create.log; then
+          if flyctl apps create "$FLY_APP" --org "$FLY_ORG" 2>create.log; then
+            first_install_bootstrap=1
+          else
             if grep -qiE "taken|already exists|already been" create.log; then
               echo "Fly app $FLY_APP already exists."
             else
@@ -169,21 +172,14 @@ jobs:
             echo "Creating openthrottle_data volume in $FLY_REGION."
             flyctl volumes create openthrottle_data \
               --app "$FLY_APP" --region "$FLY_REGION" --size 1 --yes
+            first_install_bootstrap=1
           fi
-      - name: Stage the new snapshot name
-        if: needs.snapshot.result == 'success'
-        run: flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="${{ needs.snapshot.outputs.name }}"
-      - name: Pause admission and wait for cutover evidence
+          echo "OT_FIRST_INSTALL_BOOTSTRAP=$first_install_bootstrap" >> "$GITHUB_ENV"
+      - name: Execute the v12 snapshot cutover transaction
         # This supervisor-only fence release does not build a snapshot, so its
         # first push deploys without calling endpoints its parent lacks. Once
         # installed, every push that builds a new snapshot gates automatically.
-        # Migration-bearing supervisor releases also gate here, including
-        # workflow_dispatch deploys, so the live rollback image proves it
-        # supports marked future migrations before the new image opens SQLite.
-        if: >-
-          inputs.prepare_v12_cutover ||
-          (github.event_name == 'push' && needs.snapshot.result == 'success') ||
-          needs.changes.outputs.database_migrations == 'true'
+        if: inputs.prepare_v12_cutover || needs.snapshot.result == 'success'
         run: |
           set -euo pipefail
           requires_snapshot_check="${{ inputs.prepare_v12_cutover || needs.snapshot.result == 'success' }}"
@@ -192,6 +188,308 @@ jobs:
             echo "expected_snapshot is required when this run does not build a snapshot" >&2
             exit 1
           fi
+          deployed=0
+          cutover_id=""
+
+          active_image_ref() {
+            local machines_json
+            if ! machines_json="$(flyctl machines list --app "$FLY_APP" --json)"; then
+              echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
+              return 1
+            fi
+            local started_machine_count
+            if ! started_machine_count="$(printf '%s\n' "$machines_json" | jq -r '
+              [ .[] | select(((.state // .State // "") | ascii_downcase) == "started") ] | length
+            ')"; then
+              echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
+              return 1
+            fi
+            local resolved_machine_count
+            if ! resolved_machine_count="$(printf '%s\n' "$machines_json" | jq -r '
+              [ .[] | select(((.state // .State // "") | ascii_downcase) == "started")
+                | (.config.image // .Config.Image // .imageRef // .ImageRef // .image // .Image // "")
+                | select(. != "" and . != "null")
+              ] | length
+            ')"; then
+              echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
+              return 1
+            fi
+            if (( started_machine_count == 0 || resolved_machine_count != started_machine_count )); then
+              echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
+              return 1
+            fi
+            local machine_images
+            if ! machine_images="$(printf '%s\n' "$machines_json" | jq -r '
+              [ .[] | select(((.state // .State // "") | ascii_downcase) == "started")
+                | (.config.image // .Config.Image // .imageRef // .ImageRef // .image // .Image // "")
+                | select(. != "" and . != "null")
+              ] | unique[]
+            ')"; then
+              echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
+              return 1
+            fi
+            local machine_image_count
+            machine_image_count="$(printf '%s\n' "$machine_images" | sed '/^$/d' | wc -l | tr -d ' ')"
+            if (( machine_image_count == 1 )); then
+              printf '%s\n' "$machine_images"
+              return
+            fi
+            if (( machine_image_count > 1 )); then
+              echo "started Fly machines disagree on active image for $FLY_APP" >&2
+              printf '%s\n' "$machine_images" >&2
+              return 1
+            fi
+            echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
+            return 1
+          }
+
+          seal_cutover_evidence() {
+            local evidence="$1"
+            local event="${2:-cutover_advance}"
+            local summary
+            if ! summary="$(printf '%s\n' "$evidence" | jq -c '{
+              admission: {paused: .admission.paused, epoch: .admission.epoch},
+              runtime: {release: .runtime.release, capabilityDigest: .runtime.capabilityDigest},
+              snapshot: .snapshot,
+              drain: {clear: .drain.clear, blocker_count: ((.drain.blockers // []) | length)},
+              rollback: {
+                stageStatus: .rollback.stageStatus,
+                deployStatus: .rollback.deployStatus,
+                machineStatus: .rollback.machineStatus,
+                expectedImage: .rollback.expectedImage,
+                observedImage: .rollback.observedImage
+              },
+              cutover: {
+                id: .cutover.id,
+                status: .cutover.status,
+                phase: .cutover.phase,
+                candidate_snapshot: .cutover.candidate_snapshot
+              }
+            }' 2>/dev/null)"; then
+              summary='{"parse":"failed"}'
+            fi
+            local source_sha
+            source_sha="$(printf '%s' "$evidence" | sha256sum | awk '{print $1}')"
+            jq -nc \
+              --arg event "$event" \
+              --arg sourceSha "sha256:$source_sha" \
+              --arg digest "$old_digest" \
+              --arg image "$old_runtime_image" \
+              --argjson summary "$summary" \
+              '{
+                schema: "openthrottle.cutover-evidence/v1",
+                event: $event,
+                source_sha256: $sourceSha,
+                summary: $summary,
+                sealed_old_runtime: {
+                  old_runtime_capability_digest: $digest,
+                  old_runtime_image: $image
+                }
+              }'
+          }
+
+          cutover_command() {
+            local action="$1"
+            local payload="${2:-}"
+            if [[ -n "$payload" ]]; then
+              flyctl ssh console --app "$FLY_APP" --command \
+                "node /app/scripts/cutover-control.mjs $action $(printf '%q' "$payload")"
+            else
+              flyctl ssh console --app "$FLY_APP" --command \
+                "node /app/scripts/cutover-control.mjs $action"
+            fi
+          }
+
+          advance_cutover() {
+            local phase="$1"
+            local status="${2:-active}"
+            local evidence="${3:-}"
+            local recovery="${4:-}"
+            local pause_epoch_value="${5:-}"
+            local payload
+            local sealed_evidence
+            sealed_evidence="$(seal_cutover_evidence "$evidence")"
+            payload="$(jq -nc \
+              --arg id "$cutover_id" \
+              --arg phase "$phase" \
+              --arg status "$status" \
+              --arg evidence "$sealed_evidence" \
+              --arg recovery "$recovery" \
+              --arg pauseEpoch "$pause_epoch_value" \
+              '{id:$id, phase:$phase, status:$status, evidence:$evidence} +
+               (if $recovery == "" then {} else {recoveryCommand:$recovery} end) +
+               (if $pauseEpoch == "" then {} else {pauseEpoch: ($pauseEpoch | tonumber)} end)')"
+            cutover_command advance "$payload" | jq .
+          }
+
+          abort_cutover() {
+            local exit_code="$1"
+            trap - ERR
+            if [[ -z "$cutover_id" ]]; then
+              exit "$exit_code"
+            fi
+
+            local stage_status=0
+            local deploy_status=0
+            local machine_status=0
+            flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="$old_snapshot" || stage_status=$?
+            flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --image "$old_runtime_image" || deploy_status=$?
+            local restored_image=""
+            restored_image="$(active_image_ref)" || machine_status=$?
+            local restored
+            restored="$(cutover_command evidence || true)"
+            if (( stage_status == 0 && deploy_status == 0 && machine_status == 0 )) &&
+              [[ "$restored_image" == "$old_runtime_image" ]] &&
+              printf '%s\n' "$restored" | jq -e \
+              --arg release "$old_release" \
+              --arg digest "$old_digest" \
+              --arg snapshot "$old_snapshot" \
+              --arg image "$restored_image" \
+              '.admission.paused == 1 and
+               .runtime.release == $release and
+               .runtime.capabilityDigest == $digest and
+               .snapshot == $snapshot and
+               $image != ""' >/dev/null; then
+              advance_cutover restored active "$restored"
+              cutover_command resume | jq .
+            else
+              local rollback_failure_evidence
+              rollback_failure_evidence="$(jq -nc \
+                --argjson stageStatus "$stage_status" \
+                --argjson deployStatus "$deploy_status" \
+                --argjson machineStatus "$machine_status" \
+                --arg expectedImage "$old_runtime_image" \
+                --arg observedImage "$restored_image" \
+                --arg evidence "$restored" \
+                '{rollback:{stageStatus:$stageStatus,deployStatus:$deployStatus,machineStatus:$machineStatus,
+                  expectedImage:$expectedImage,observedImage:$observedImage}, evidence:$evidence}')"
+              advance_cutover recovery_required recovery_required "$rollback_failure_evidence" \
+                "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl deploy --remote-only --app $FLY_APP --config supervisor/fly.toml --image $old_runtime_image && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs evidence'"
+            fi
+            exit "$exit_code"
+          }
+          trap 'abort_cutover $?' ERR
+
+          initial_evidence="$(cutover_command evidence)"
+          printf '%s\n' "$initial_evidence" | jq .
+          open_candidate="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.candidate_snapshot // ""')"
+          adopting_open_cutover=0
+          if [[ -n "$open_candidate" ]]; then
+            adopting_open_cutover=1
+            if [[ "$open_candidate" != "$EXPECTED_SNAPSHOT" ]]; then
+              echo "open cutover candidate $open_candidate does not match expected snapshot $EXPECTED_SNAPSHOT" >&2
+              exit 1
+            fi
+            old_release="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.old_runtime_release')"
+            old_digest="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.old_runtime_capability_digest')"
+            old_runtime_image="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.old_runtime_image')"
+            old_snapshot="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.old_snapshot')"
+            if [[ -z "$old_digest" || "$old_digest" == "null" ]]; then
+              old_digest="$(printf '%s\n' "$initial_evidence" | jq -r '(.cutover.evidence // "" | fromjson? | .sealed_old_runtime.old_runtime_capability_digest) // ""')"
+            fi
+            if [[ -z "$old_runtime_image" || "$old_runtime_image" == "null" ]]; then
+              old_runtime_image="$(printf '%s\n' "$initial_evidence" | jq -r '(.cutover.evidence // "" | fromjson? | .sealed_old_runtime.old_runtime_image) // ""')"
+            fi
+          else
+            old_release="$(printf '%s\n' "$initial_evidence" | jq -r '.runtime.release')"
+            old_digest="$(printf '%s\n' "$initial_evidence" | jq -r '.runtime.capabilityDigest')"
+            old_snapshot="$(printf '%s\n' "$initial_evidence" | jq -r '.snapshot')"
+            old_runtime_image="$(active_image_ref)"
+          fi
+          if [[ -z "${old_digest:-}" || "$old_digest" == "null" ]]; then
+            if (( adopting_open_cutover == 1 )); then
+              echo "open cutover lacks sealed old runtime capability digest; refusing automatic recovery" >&2
+              exit 1
+            fi
+            old_digest="$(printf '%s\n' "$initial_evidence" | jq -r '.runtime.capabilityDigest')"
+          fi
+          if [[ -z "${old_runtime_image:-}" || "$old_runtime_image" == "null" ]]; then
+            if (( adopting_open_cutover == 1 )); then
+              echo "open cutover lacks sealed old Fly image authority; refusing automatic recovery" >&2
+              exit 1
+            fi
+            old_runtime_image="$(active_image_ref)"
+          fi
+          begin_evidence_payload="$(seal_cutover_evidence "$initial_evidence" begin)"
+          begin_payload="$(jq -nc \
+            --arg oldRuntimeRelease "$old_release" \
+            --arg oldSnapshot "$old_snapshot" \
+            --arg candidateSnapshot "$EXPECTED_SNAPSHOT" \
+            --arg evidence "$begin_evidence_payload" \
+            '{oldRuntimeRelease:$oldRuntimeRelease, oldSnapshot:$oldSnapshot,
+              candidateSnapshot:$candidateSnapshot, evidence:$evidence}')"
+          begin_evidence="$(cutover_command begin "$begin_payload")"
+          printf '%s\n' "$begin_evidence" | jq .
+          cutover_id="$(printf '%s\n' "$begin_evidence" | jq -r '.cutover.id')"
+
+          pause_evidence="$(cutover_command pause)"
+          printf '%s\n' "$pause_evidence" | jq .
+          pause_epoch="$(printf '%s\n' "$pause_evidence" | jq -r '.admission.epoch')"
+          advance_cutover paused active "$pause_evidence" "" "$pause_epoch"
+
+          deadline=$((SECONDS + 600))
+          while true; do
+            evidence="$(cutover_command evidence)"
+            printf '%s\n' "$evidence" | jq .
+            if printf '%s\n' "$evidence" | jq -e \
+              --argjson epoch "$pause_epoch" \
+              --arg requires_migration_contract "$requires_migration_contract" \
+              --arg migration_contract "$EXPECTED_MIGRATION_ROLLBACK_CONTRACT" \
+              '.admission.paused == 1 and
+               .admission.epoch == $epoch and
+               .drain.clear == true and
+               ($requires_migration_contract != "true" or
+                .database.migrationRollbackCompatibility.contract == $migration_contract)' >/dev/null; then
+              break
+            fi
+            if (( SECONDS >= deadline )); then
+              echo "cutover evidence did not clear within 600 seconds" >&2
+              abort_cutover 1
+            fi
+            sleep 10
+          done
+          advance_cutover drain_clear active "$evidence"
+          advance_cutover recovery_required recovery_required \
+            "candidate not staged yet; restore and prove old runtime/snapshot before any admission resume if runner is lost before staging" \
+            "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl deploy --remote-only --app $FLY_APP --config supervisor/fly.toml --image $old_runtime_image && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs evidence'"
+
+          flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="$EXPECTED_SNAPSHOT"
+          advance_cutover staged active "candidate DAYTONA_SNAPSHOT staged only after drain_clear for epoch $pause_epoch"
+          advance_cutover recovery_required recovery_required \
+            "candidate DAYTONA_SNAPSHOT staged; restore old snapshot and inspect release if runner is lost before verification" \
+            "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl deploy --remote-only --app $FLY_APP --config supervisor/fly.toml --image $old_runtime_image && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs evidence'"
+
+          flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
+          deployed=1
+          advance_cutover deployed active "flyctl deploy completed for candidate snapshot $EXPECTED_SNAPSHOT"
+
+          evidence="$(cutover_command evidence)"
+          printf '%s\n' "$evidence" | jq .
+          expected_release="$(jq -r '.runtime.release' supervisor/pipelines/v12-deploy-proof.json)"
+          expected_digest="$(jq -r '.runtime.digest' supervisor/pipelines/v12-deploy-proof.json)"
+          printf '%s\n' "$evidence" | jq -e \
+            --arg release "$expected_release" \
+            --arg digest "$expected_digest" \
+            --arg snapshot "$EXPECTED_SNAPSHOT" \
+            --argjson epoch "$pause_epoch" \
+            '.admission.paused == 1 and
+             .admission.epoch == $epoch and
+             .drain.clear == true and
+             .runtime.release == $release and
+             .runtime.capabilityDigest == $digest and
+             .snapshot == $snapshot' >/dev/null
+          advance_cutover verified active "$evidence"
+
+          if [[ "${{ github.event_name }}" == "push" || "${{ inputs.resume_after_v12_cutover }}" == "true" ]]; then
+            resume_evidence="$(cutover_command resume)"
+            printf '%s\n' "$resume_evidence" | jq .
+            advance_cutover resumed completed "$resume_evidence"
+          fi
+          trap - ERR
+      - name: Pause admission and verify migration rollback contract
+        if: ${{ needs.changes.outputs.database_migrations == 'true' && !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}
+        run: |
+          set -euo pipefail
           flyctl ssh console --app "$FLY_APP" --command \
             "node /app/scripts/cutover-control.mjs pause"
           deadline=$((SECONDS + 600))
@@ -200,47 +498,43 @@ jobs:
               "node /app/scripts/cutover-control.mjs evidence")"
             printf '%s\n' "$evidence" | jq .
             if printf '%s\n' "$evidence" | jq -e \
-              --arg requires_migration_contract "$requires_migration_contract" \
               --arg migration_contract "$EXPECTED_MIGRATION_ROLLBACK_CONTRACT" \
               '.admission.paused == 1 and
                .drain.clear == true and
-               ($requires_migration_contract != "true" or
-                .database.migrationRollbackCompatibility.contract == $migration_contract)' >/dev/null; then
+               .database.migrationRollbackCompatibility.contract == $migration_contract' >/dev/null; then
               break
             fi
             if (( SECONDS >= deadline )); then
-              echo "cutover evidence did not clear within 600 seconds" >&2
+              echo "migration rollback contract evidence did not clear within 600 seconds" >&2
               exit 1
             fi
             sleep 10
           done
       - name: Deploy the supervisor
+        if: ${{ !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}
         # Build from the repository root so the supervisor's file:../contracts
         # dependency is inside the Docker build context.
-        run: flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
-      - name: Verify v12 cutover evidence after deploy
-        if: inputs.prepare_v12_cutover || (github.event_name == 'push' && needs.snapshot.result == 'success')
         run: |
           set -euo pipefail
-          evidence="$(flyctl ssh console --app "$FLY_APP" --command \
-            "node /app/scripts/cutover-control.mjs evidence")"
-          printf '%s\n' "$evidence" | jq .
-          expected_release="$(jq -r '.runtime.release' supervisor/pipelines/v12-deploy-proof.json)"
-          expected_digest="$(jq -r '.runtime.digest' supervisor/pipelines/v12-deploy-proof.json)"
-          printf '%s\n' "$evidence" | jq -e \
-            --arg release "$expected_release" \
-            --arg digest "$expected_digest" \
-            --arg snapshot "$EXPECTED_SNAPSHOT" \
-            '.admission.paused == 1 and
-             .drain.clear == true and
-             .runtime.release == $release and
-             .runtime.capabilityDigest == $digest and
-             .snapshot == $snapshot' >/dev/null
-      - name: Resume admission after v12 cutover
-        if: >-
-          (github.event_name == 'push' && needs.snapshot.result == 'success') ||
-          needs.changes.outputs.database_migrations == 'true' ||
-          (inputs.prepare_v12_cutover && inputs.resume_after_v12_cutover)
+          set +e
+          cutover_evidence="$(flyctl ssh console --app "$FLY_APP" --command \
+            "node /app/scripts/cutover-control.mjs evidence" 2>&1)"
+          cutover_status=$?
+          set -e
+          if (( cutover_status != 0 )); then
+            if [[ "${OT_FIRST_INSTALL_BOOTSTRAP:-0}" == "1" ]]; then
+              echo "cutover evidence endpoint is unavailable after first-install app or volume creation; proceeding with bootstrap supervisor deploy"
+            else
+              echo "refusing supervisor-only deploy because cutover evidence is unavailable" >&2
+              exit "$cutover_status"
+            fi
+          elif printf '%s\n' "$cutover_evidence" | jq -e '.cutover != null' >/dev/null; then
+            echo "refusing supervisor-only deploy while a snapshot cutover is open" >&2
+            exit 1
+          fi
+          flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
+      - name: Resume admission after migration deploy
+        if: ${{ needs.changes.outputs.database_migrations == 'true' && !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}
         run: |
           flyctl ssh console --app "$FLY_APP" --command \
             "node /app/scripts/cutover-control.mjs resume"

@@ -308,13 +308,23 @@ function priorEvidence(value, label) {
     }
   }
   if (role === "repair") {
+    const rejectedCandidate = receipts.filter((receipt) => receipt.role === "candidate");
+    if (rejectedCandidate.length !== 1) throw new Error(`${label} must contain exactly one rejected candidate receipt`);
+    const candidateReceipt = JSON.parse(rejectedCandidate[0].receipt);
+    if (
+      candidateReceipt.type !== "candidate_evidence" ||
+      candidateReceipt.assurance !== "executor_verified" ||
+      candidateReceipt.result !== "success"
+    ) {
+      throw new Error(`${label} rejected candidate receipt must be successful executor_verified candidate_evidence`);
+    }
     const triggeringLead = receipts.filter((receipt) => receipt.role === "lead");
     if (triggeringLead.length !== 1) throw new Error(`${label} must contain exactly one triggering lead receipt`);
     if (JSON.parse(triggeringLead[0].receipt).type !== "unit_decision") {
       throw new Error(`${label} triggering lead receipt must be unit_decision`);
     }
-    if (receipts.some((receipt) => receipt.role !== "lead" && receipt.role !== "command")) {
-      throw new Error(`${label} contains evidence outside lead/command for a repair action`);
+    if (receipts.some((receipt) => receipt.role !== "candidate" && receipt.role !== "lead" && receipt.role !== "command")) {
+      throw new Error(`${label} contains evidence outside candidate/lead/command for a repair action`);
     }
   }
   // A prior semantic_review round (role final_review) is embedded both as
@@ -556,7 +566,7 @@ export function validateLoopRequest(value) {
   const input = record(value, "loop request");
   const allowed = new Set([
     "protocol", "actionId", "attemptId", "graphId", "pipelineInstanceId", "graphDigest", "parentRunId",
-    "unitId", "generation", "role", "loop", "agent", "model", "skill", "worktree", "baseSubject", "recoveryBaseSubject", "inputSubject",
+    "unitId", "generation", "role", "loop", "agent", "model", "reasoningEffort", "skill", "worktree", "baseSubject", "recoveryBaseSubject", "inputSubject",
     "candidateSubject", "nativeSessionId", "contextPolicy", "timeoutMs",
     "transitionContext", "tuneMaterial", "priorEvidence", "downstreamContext", "allowedMcpServers", "credentialScopes", "receiptSchema",
     "expectedReceiptType", "expectedProducerSkill", "expectedProducer", "repositorySkill", "requestHash", "idempotencyKey",
@@ -586,6 +596,9 @@ export function validateLoopRequest(value) {
     loop: string(input.loop, "loop"),
     agent: string(input.agent, "agent"),
     ...(input.model === undefined ? {} : { model: string(input.model, "model", MODEL_REFERENCE) }),
+    ...(input.reasoningEffort === undefined ? {} : {
+      reasoningEffort: string(input.reasoningEffort, "reasoningEffort", /^(?:low|medium|high|xhigh|max)$/),
+    }),
     skill: string(input.skill, "skill", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
     worktree: worktree === null ? null : {
       id: string(worktree.id, "worktree.id", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
@@ -1036,7 +1049,7 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
     return {
       repoDir,
       command: "codex",
-      args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(request.model ? ["-m", request.model] : []), ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, "-"] : ["-"])],
+      args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(request.model ? ["-m", request.model] : []), ...(request.reasoningEffort ? ["-c", `model_reasoning_effort=\"${request.reasoningEffort}\"`] : []), ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, "-"] : ["-"])],
       input: prompt,
     };
   }
@@ -1052,7 +1065,7 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
       // prompt itself is never passed via argv (see the Codex note above for
       // why: MAX_ARG_STRLEN and /proc/<pid>/cmdline visibility).
       "--print", ...(invocation.mode === "resume" ? ["--resume", invocation.nativeSessionId] : []),
-      "--output-format", "stream-json", "--verbose", ...(request.model ? ["--model", request.model] : []), "--dangerously-skip-permissions",
+      "--output-format", "stream-json", "--verbose", ...(request.model ? ["--model", request.model] : []), ...(request.reasoningEffort ? ["--effort", request.reasoningEffort] : []), "--dangerously-skip-permissions",
       // Unconditional: --strict-mcp-config closes MCP entirely to just the
       // declared set (or to nothing, when no MCP servers were declared),
       // rather than leaving a repo-committed .mcp.json or other ambient

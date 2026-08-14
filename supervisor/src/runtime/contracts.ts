@@ -77,6 +77,7 @@ export interface LoopActionRequest {
   loop: "implement" | "simplify" | "command" | "repair" | "lead" | "review" | "publish";
   agent: "claude" | "codex" | "opencode";
   model?: string;
+  reasoningEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   skill: string;
   worktree: RuntimeWorktreeHandle | null;
   baseSubject?: string;

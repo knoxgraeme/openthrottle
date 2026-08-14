@@ -191,6 +191,27 @@ CREATE TABLE IF NOT EXISTS supervisor_maintenance (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS deployment_cutovers (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK(status IN ('active', 'completed', 'recovery_required')),
+  old_runtime_release TEXT NOT NULL,
+  old_snapshot TEXT NOT NULL,
+  candidate_snapshot TEXT NOT NULL,
+  pause_epoch INTEGER,
+  phase TEXT NOT NULL CHECK(phase IN (
+    'registered', 'paused', 'drain_clear', 'staged', 'deployed',
+    'verified', 'restored', 'recovery_required', 'resumed'
+  )),
+  evidence TEXT NOT NULL DEFAULT '',
+  recovery_command TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS deployment_cutovers_open_idx
+  ON deployment_cutovers((1))
+  WHERE status IN ('active', 'recovery_required');
 `;
 
 const ticketMigrations: Array<[string, string]> = [

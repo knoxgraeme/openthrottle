@@ -15,6 +15,7 @@ const HOOKS_PATH = "/opt/openthrottle/safety";
 const DISABLED_PUSH_URL = "DISABLED_BY_OPENTHROTTLE_LOOP_WORKTREE";
 const ROOT_UID = 0;
 const ROOT_GID = 0;
+const NO_REPLACE_OBJECTS_ENV = { GIT_NO_REPLACE_OBJECTS: "1" };
 
 function safeHandle(value) {
   if (typeof value !== "string" || !HANDLE.test(value)) throw new Error("worktree handle is invalid");
@@ -135,15 +136,29 @@ export function grantWorktreeToAgent({ rootDir = DEFAULT_ROOT, handle, grantLink
 }
 
 function requireClean(repoDir) {
-  const status = runGitAsExecutor(repoDir, ["status", "--porcelain=v1", "--untracked-files=all"]);
+  const status = runGitAsExecutor(repoDir, ["status", "--porcelain=v1", "--untracked-files=all"], NO_REPLACE_OBJECTS_ENV);
   if (status) throw new Error("integration checkout must be clean before creating a unit worktree");
+}
+
+function requireReachableWorktreeBase(repoDir, baseCommit) {
+  const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"], NO_REPLACE_OBJECTS_ENV);
+  try {
+    runGitAsExecutor(repoDir, ["rev-parse", "--verify", `${baseCommit}^{commit}`], NO_REPLACE_OBJECTS_ENV);
+  } catch {
+    throw new Error("requested worktree base commit does not exist");
+  }
+  try {
+    runGitAsExecutor(repoDir, ["merge-base", "--is-ancestor", head, baseCommit], NO_REPLACE_OBJECTS_ENV);
+  } catch {
+    throw new Error("requested worktree base is not a descendant of the integration checkout HEAD");
+  }
 }
 
 function existingWorktree({ rootDir, target, handle, baseCommit, hooksPath }) {
   assertDirectory(target, "worktree");
-  const head = runGitAsExecutor(target, ["rev-parse", "HEAD"]);
+  const head = runGitAsExecutor(target, ["rev-parse", "HEAD"], NO_REPLACE_OBJECTS_ENV);
   if (head !== baseCommit) throw new Error("existing worktree handle points at a different base commit");
-  const status = runGitAsExecutor(target, ["status", "--porcelain=v1", "--untracked-files=all"]);
+  const status = runGitAsExecutor(target, ["status", "--porcelain=v1", "--untracked-files=all"], NO_REPLACE_OBJECTS_ENV);
   if (status) throw new Error("existing worktree is dirty");
   runGitAsExecutor(target, ["config", "extensions.worktreeConfig", "true"]);
   runGitAsExecutor(target, ["config", "--worktree", "core.hooksPath", hooksPath]);
@@ -172,18 +187,19 @@ export function createWorktree({
     throw new Error("worktree handle already exists");
   }
   requireClean(repoDir);
-  const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
-  if (head !== safeBase) throw new Error("integration checkout HEAD does not match requested worktree base");
+  requireReachableWorktreeBase(repoDir, safeBase);
   prepareWorktreeRoot(rootDir);
   // A fresh checkout has no dependency state yet: a bootstrap marker left by
   // an earlier same-handle worktree must not let this one skip bootstrap.
   removeWorktreeBootstrapMarker({ ...(markerRootDir === undefined ? {} : { markerRootDir }), handle });
   try {
-    runGitAsExecutor(repoDir, ["worktree", "add", "--detach", target, safeBase]);
+    runGitAsExecutor(repoDir, ["worktree", "add", "--detach", target, safeBase], NO_REPLACE_OBJECTS_ENV);
+    const materializedHead = runGitAsExecutor(target, ["rev-parse", "HEAD"], NO_REPLACE_OBJECTS_ENV);
+    if (materializedHead !== safeBase) throw new Error("new worktree HEAD does not match requested base commit");
     runGitAsExecutor(target, ["config", "extensions.worktreeConfig", "true"]);
     runGitAsExecutor(target, ["config", "--worktree", "core.hooksPath", hooksPath]);
     runGitAsExecutor(target, ["config", "--worktree", "remote.origin.pushurl", DISABLED_PUSH_URL]);
-    const status = runGitAsExecutor(target, ["status", "--porcelain=v1", "--untracked-files=all"]);
+    const status = runGitAsExecutor(target, ["status", "--porcelain=v1", "--untracked-files=all"], NO_REPLACE_OBJECTS_ENV);
     if (status) throw new Error("new worktree is dirty");
     lockWorktree({ rootDir, handle });
     return { id: safeHandle(handle), path: target, baseCommit: safeBase };

@@ -37,15 +37,50 @@ assert(
 const deployWorkflow = read(".github/workflows/deploy.yml");
 const cutoverControl = read("supervisor/scripts/cutover-control.mjs");
 assert(
-  deployWorkflow.includes("/app/scripts/cutover-control.mjs pause") &&
-    deployWorkflow.includes("/app/scripts/cutover-control.mjs evidence") &&
-    deployWorkflow.includes("/app/scripts/cutover-control.mjs resume") &&
+  deployWorkflow.includes("/app/scripts/cutover-control.mjs $action") &&
+    deployWorkflow.includes("cutover_command begin") &&
+    deployWorkflow.includes("cutover_command advance") &&
+    deployWorkflow.includes("cutover_command evidence") &&
+    deployWorkflow.includes("cutover_command resume") &&
+    deployWorkflow.includes("active_image_ref()") &&
+    deployWorkflow.includes("flyctl machines list --app \"$FLY_APP\" --json") &&
+    deployWorkflow.includes("resolved_machine_count != started_machine_count") &&
+    deployWorkflow.includes("started Fly machines disagree on active image") &&
+    deployWorkflow.includes("could not determine immutable active Fly machine image") &&
+    !deployWorkflow.includes("flyctl releases --app \"$FLY_APP\" --json") &&
+    deployWorkflow.includes("flyctl secrets set --stage --app \"$FLY_APP\" DAYTONA_SNAPSHOT=\"$EXPECTED_SNAPSHOT\"") &&
+    deployWorkflow.indexOf("advance_cutover drain_clear") < deployWorkflow.indexOf("DAYTONA_SNAPSHOT=\"$EXPECTED_SNAPSHOT\"") &&
+    deployWorkflow.includes("flyctl secrets set --stage --app \"$FLY_APP\" DAYTONA_SNAPSHOT=\"$old_snapshot\"") &&
+    deployWorkflow.includes("flyctl deploy --remote-only --app \"$FLY_APP\" --config supervisor/fly.toml --image \"$old_runtime_image\"") &&
+    deployWorkflow.includes("advance_cutover restored active") &&
+    deployWorkflow.includes("abort_cutover 1") &&
+    deployWorkflow.includes("open_candidate=\"$(printf '%s\\n' \"$initial_evidence\" | jq -r '.cutover.candidate_snapshot // \"\"')\"") &&
+    deployWorkflow.includes("old_release=\"$(printf '%s\\n' \"$initial_evidence\" | jq -r '.cutover.old_runtime_release')\"") &&
+    deployWorkflow.includes("old_digest=\"$(printf '%s\\n' \"$initial_evidence\" | jq -r '.cutover.old_runtime_capability_digest')\"") &&
+    deployWorkflow.includes("old_runtime_image=\"$(printf '%s\\n' \"$initial_evidence\" | jq -r '.cutover.old_runtime_image')\"") &&
+    deployWorkflow.includes("old_snapshot=\"$(printf '%s\\n' \"$initial_evidence\" | jq -r '.cutover.old_snapshot')\"") &&
+    deployWorkflow.includes("sealed_old_runtime") &&
+    deployWorkflow.includes("seal_cutover_evidence()") &&
+    deployWorkflow.includes("sealed_evidence=\"$(seal_cutover_evidence \"$evidence\")\"") &&
+    deployWorkflow.includes(".cutover.evidence // \"\" | fromjson?") &&
+    deployWorkflow.includes("open cutover lacks sealed old runtime capability digest") &&
+    deployWorkflow.includes("open cutover lacks sealed old Fly image authority") &&
+    deployWorkflow.indexOf("advance_cutover recovery_required recovery_required") < deployWorkflow.indexOf("DAYTONA_SNAPSHOT=\"$EXPECTED_SNAPSHOT\"") &&
+    deployWorkflow.lastIndexOf("advance_cutover recovery_required recovery_required") < deployWorkflow.indexOf("flyctl deploy --remote-only --app \"$FLY_APP\" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile") &&
+    deployWorkflow.includes("refusing supervisor-only deploy while a snapshot cutover is open") &&
+    deployWorkflow.includes("refusing supervisor-only deploy because cutover evidence is unavailable") &&
+    deployWorkflow.includes("OT_FIRST_INSTALL_BOOTSTRAP") &&
+    deployWorkflow.includes("first-install app or volume creation") &&
+    deployWorkflow.includes("cutover_status=$?") &&
+    !deployWorkflow.includes("cutover-control.mjs evidence\" 2>/dev/null || true") &&
+    !deployWorkflow.includes("--dockerfile supervisor/Dockerfile && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs resume'") &&
     deployWorkflow.includes(".drain.clear == true") &&
+    deployWorkflow.includes(".admission.epoch == $epoch") &&
     deployWorkflow.includes(".runtime.release == $release") &&
     deployWorkflow.includes(".runtime.capabilityDigest == $digest") &&
     deployWorkflow.includes(".snapshot == $snapshot") &&
     deployWorkflow.includes("EXPECTED_SNAPSHOT") &&
-    deployWorkflow.includes("github.event_name == 'push' && needs.snapshot.result == 'success'"),
+    deployWorkflow.includes("if: inputs.prepare_v12_cutover || needs.snapshot.result == 'success'"),
   "deploy workflow must expose a fail-closed supervisor-only v12 cutover path"
 );
 assert(
@@ -66,6 +101,8 @@ assert(
 );
 assert(
   cutoverControl.includes("OT_DEPLOY_TOKEN") &&
+    cutoverControl.includes("/deployment/cutover/begin") &&
+    cutoverControl.includes("/deployment/cutover/advance") &&
     cutoverControl.includes("/maintenance/admission/pause") &&
     cutoverControl.includes("/deployment/cutover-evidence") &&
     cutoverControl.includes("/maintenance/admission/resume"),

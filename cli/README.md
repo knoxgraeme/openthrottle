@@ -83,8 +83,11 @@ the public OpenThrottle repository.
 Development:
 
 For OpenCode projects, choose `agent: opencode`; `init` writes
-`model: kimi-code/kimi-for-coding`. The `model` setting is ignored by Claude
-and Codex runs, and OpenCode resumes keep the model saved from the first run.
+`model: kimi-code/kimi-for-coding`. A top-level `model` is a legacy default for
+the matching top-level `agent` only. Repositories that allow multiple agent
+providers should use `agent_defaults` to pin each provider independently; the
+Claude and Codex entries may also set `reasoning_effort`. OpenCode resumes keep
+the model saved from the first run.
 
 ```bash
 npm ci

@@ -1480,6 +1480,34 @@ describe("Stage C contract fixtures", () => {
     });
   });
 
+  it("normalizes provider-specific model and reasoning defaults", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as Record<string, unknown>;
+    config.agent_defaults = {
+      claude: { model: "claude-opus-5", reasoning_effort: "high" },
+      codex: { model: "gpt-5.6-sol", reasoning_effort: "high" },
+    };
+
+    const parsed = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
+
+    expect(parsed.value.agent_defaults).toEqual(config.agent_defaults);
+    expect(JSON.parse(parsed.normalized)).toMatchObject({ agent_defaults: config.agent_defaults });
+  });
+
+  it("rejects unknown agent defaults and unsupported reasoning effort", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as Record<string, unknown>;
+    config.agent_defaults = { cursor: { model: "fast" } };
+    expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
+      .toThrow(/config\.agent_defaults\.cursor: has an invalid key/);
+
+    config.agent_defaults = { codex: { reasoning_effort: "extreme" } };
+    expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
+      .toThrow(/config\.agent_defaults\.codex\.reasoning_effort: must be one of/);
+
+    config.agent_defaults = { opencode: { reasoning_effort: "high" } };
+    expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
+      .toThrow(/config\.agent_defaults\.opencode\.reasoning_effort: is not supported for OpenCode/);
+  });
+
   it("synthesizes canonical commands from legacy aliases and rejects mismatches", () => {
     const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
       commands?: Record<string, string>;

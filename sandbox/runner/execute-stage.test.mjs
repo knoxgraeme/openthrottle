@@ -155,13 +155,15 @@ function fixture({
   commandName,
   configuredCommand = true,
   repositorySkill,
+  repositoryConfig,
 } = {}) {
   const repoDir = repository();
   let sealedRepositorySkill = repositorySkill;
   if (repositorySkill === "fixture") {
     sealedRepositorySkill = sealedRepositorySkillPackage(repoDir, { body: "# Fixture Skill\n" }).repositorySkill;
   }
-  const config = commandName && configuredCommand ? { commands: { [commandName]: "test-command" } } : {};
+  const config = repositoryConfig
+    ?? (commandName && configuredCommand ? { commands: { [commandName]: "test-command" } } : {});
   const stage = {
     id: commandName ? "command" : "review",
     executor: { kind: commandName ? "command" : "agent", capability },
@@ -718,6 +720,47 @@ describe("one-stage executor", () => {
     // generic "engine_crash" fallback; that is not evidence of an actual
     // crash, so it must not be surfaced as a structured fault reason.
     expect(result.faultReason).toBeNull();
+  });
+
+  it("selects the sealed model and reasoning default for the requested provider", () => {
+    const defaults = {
+      agent: "codex",
+      model: "legacy-codex-model",
+      agent_defaults: {
+        claude: { model: "claude-opus-5", reasoning_effort: "high" },
+        codex: { model: "gpt-5.6-sol", reasoning_effort: "high" },
+      },
+    };
+    for (const [agent, model] of [["claude", "claude-opus-5"], ["codex", "gpt-5.6-sol"]]) {
+      const input = fixture({ agent, repositoryConfig: defaults });
+      const runAgent = vi.fn(() => ({
+        exitCode: 0,
+        nativeSessionId: "native-1",
+        proposal: successProposal(),
+      }));
+
+      expect(executeStage({ ...input, now: clock(), runAgent }).outcome).toBe("success");
+      expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({
+        agent,
+        model,
+        reasoningEffort: "high",
+      }));
+    }
+  }, 10_000);
+
+  it("does not apply a legacy top-level model across providers", () => {
+    const input = fixture({
+      agent: "claude",
+      repositoryConfig: { agent: "codex", model: "gpt-legacy" },
+    });
+    const runAgent = vi.fn(() => ({
+      exitCode: 0,
+      nativeSessionId: "native-1",
+      proposal: successProposal(),
+    }));
+
+    expect(executeStage({ ...input, now: clock(), runAgent }).outcome).toBe("success");
+    expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({ agent: "claude", model: undefined }));
   });
 
   it("turns an invalid terminal proposal into typed failure evidence", () => {

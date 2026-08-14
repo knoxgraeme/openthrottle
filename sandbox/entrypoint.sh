@@ -489,15 +489,27 @@ case "$AGENT" in
   *) log "FATAL: resolved AGENT='${AGENT}' is invalid (expected claude|codex|opencode)"; exit 1 ;;
 esac
 
+# Provider-specific defaults follow the same precedence as the sealed stage
+# executor: the selected provider's explicit default wins, while the legacy
+# top-level model applies only when the repository's configured agent is the
+# provider actually selected for this stage. This early resolution is needed
+# for OpenCode because its private config is validated and rendered here,
+# before execute-stage.mjs receives control.
+CFG_AGENT_MODEL="$(yq_get ".agent_defaults.${AGENT}.model" '')"
+RESOLVED_CONFIG_MODEL="$CFG_AGENT_MODEL"
+if [[ -z "$RESOLVED_CONFIG_MODEL" && "$CFG_AGENT" == "$AGENT" ]]; then
+  RESOLVED_CONFIG_MODEL="$CFG_MODEL"
+fi
+
 OPENCODE_MODEL=""
 if [[ "$AGENT" == "opencode" && "$STAGE_MODEL_REQUIRED" == "1" ]]; then
   if [[ -z "$KIMI_CODE_API_KEY" ]]; then
     log "FATAL: KIMI_CODE_API_KEY is required for AGENT=opencode"
     exit 1
   fi
-  OPENCODE_MODEL="$CFG_MODEL"
+  OPENCODE_MODEL="$RESOLVED_CONFIG_MODEL"
   if [[ -z "$OPENCODE_MODEL" ]]; then
-    log "FATAL: AGENT=opencode requires model: kimi-code/kimi-for-coding in .openthrottle.yml"
+    log "FATAL: AGENT=opencode requires agent_defaults.opencode.model (or a matching legacy model) in .openthrottle.yml"
     exit 1
   fi
   OPENCODE_VALIDATION_DIR="$(mktemp -d /tmp/ot-opencode-validate-XXXXXX)"

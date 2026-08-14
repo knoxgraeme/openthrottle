@@ -341,8 +341,9 @@ root-owned, read-only inputs:
 The request includes pipeline/manifest/runtime/config identities; stage,
 attempt, run, issue, session, and generation identities; ticket intent and
 bounded task/transition context; repository, exact base commit, base branch,
-working branch, and expected subject; agent and context policy; native session
-id where allowed; capability, required artifacts, credential scopes, and live
+working branch, and expected subject; agent, optional effective model and
+reasoning effort, and context policy; native session id where allowed;
+capability, required artifacts, credential scopes, and live
 steering permission; repository-skill package identity where the capability is
 `agent/repository-skill@1`; and a request hash/idempotency key covering the
 fence.
@@ -1271,11 +1272,22 @@ must come from authenticated durable registration.
 
 ## Repository config
 
-Committed `.openthrottle.yml` may declare `agent`, OpenCode `model`,
-`test`/`lint`/`build`/`dev`/`format` commands, `post_bootstrap`, limits,
-`mcp_servers`, and implement/investigate pipeline aliases. It is fetched from
-the exact base commit, strictly validated, normalized, hashed, and uploaded as a
-sealed snapshot. Registered repositories are trusted for code execution because
+Committed `.openthrottle.yml` may declare `agent`, the legacy provider-bound
+`model`, provider-specific `agent_defaults`, `test`/`lint`/`build`/`dev`/
+`format` commands, `post_bootstrap`, limits, `mcp_servers`, and implement/
+investigate pipeline aliases. `agent_defaults` accepts `claude`, `codex`, and
+`opencode` entries with an optional `model`; Claude and Codex entries may also
+set `reasoning_effort` to `low`, `medium`, `high`, `xhigh`, or `max`. OpenCode
+reasoning effort is rejected because its CLI has no equivalent sealed option.
+The selected worker's provider default applies to ordinary and structured
+agent actions; an explicit structured worker model wins, followed by the
+provider default, while the legacy top-level model applies only when the
+selected worker matches the top-level `agent`. Effective model and reasoning
+effort are copied into the sealed, hash-bound action request and rendered as
+provider CLI flags rather than inherited from ambient user configuration.
+The config is fetched from the exact base commit, strictly validated,
+normalized, hashed, and uploaded as a sealed snapshot. Registered repositories
+are trusted for code execution because
 `post_bootstrap` is arbitrary code. `post_bootstrap` runs once per sandbox
 lifetime under the bake-once marker (see Sandbox stage contract), not once per
 stage, plus once per structured unit worktree before the first repository

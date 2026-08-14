@@ -507,22 +507,30 @@ function stringMapOf(value: unknown): Record<string, string> {
 // instructions/acceptance text) carry no character restriction -- only IDs
 // and command names are pattern-constrained. Without this, an embedded
 // newline followed by a real section marker (e.g. "## Receipt Authority
-// Contract" or a fenced-code marker) renders as literal Markdown structure
-// ahead of the genuine protocol text,
+// Contract") renders as a literal heading line ahead of the genuine one,
 // letting untrusted plan prose forge protocol structure instead of staying
 // inert data (OPE-167 requirement 4). Collapse embedded line breaks so no
 // untrusted value can start a new rendered line on its own -- and, since a
 // value rendered as its own line (e.g. a v2 unit's `objective`) sits right
-// after the "\n" the array join inserts regardless, escape a leading ATX
-// heading or fenced-code marker (optionally after up to three spaces, same as
-// CommonMark's own block marker rules) so the value's own first characters can
-// never forge Markdown structure even with no internal newline left to
-// collapse.
+// after the "\n" the array join inserts regardless, escape any leading
+// Markdown block opener (optionally after up to three spaces, same as
+// CommonMark's own marker rule) so the value's own first characters can never
+// forge a heading, fence, quote/list, thematic break, or HTML comment even
+// with no internal newline left to collapse.
+const MARKDOWN_BLOCK_OPENER =
+  /^( {0,3})(#{1,6}(?=\s|$)|`{3,}|~{3,}|<(?=\S)|>(?=\s|$)|[-+*](?=\s|$)|[-*_]{3,}(?=\s*$)|={3,}(?=\s*$)|\d{1,9}[.)](?=\s|$))/;
+
+function escapeMarkdownBlockOpener(value: string): string {
+  if (/^(?:\t| {4,})/.test(value)) return `\\${value}`;
+  return value.replace(MARKDOWN_BLOCK_OPENER, (_match, indent: string, opener: string) => {
+    if (/^\d/.test(opener)) return `${indent}${opener.replace(/([.)])/, "\\$1")}`;
+    return `${indent}\\${opener}`;
+  });
+}
+
 function sanitizeInlineText(value: string): string {
   const collapsed = value.replace(/\r\n|\r|\n/g, " ");
-  return collapsed
-    .replace(/^( {0,3})(`{3,}|~{3,})/, "$1\\$2")
-    .replace(/^( {0,3})(#+)/, "$1\\$2");
+  return escapeMarkdownBlockOpener(collapsed);
 }
 
 // v1 requirement/acceptance entries are real plan identifiers indexing a
