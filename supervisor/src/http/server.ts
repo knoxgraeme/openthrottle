@@ -586,6 +586,8 @@ export function createServer(deps: ServerDeps): Hono {
       const cutover = store.beginDeploymentCutover({
         id: typeof body.id === "string" && body.id.trim() !== "" ? sanitizeText(body.id).slice(0, 200) : undefined,
         oldRuntimeRelease: boundedString(body.oldRuntimeRelease, "oldRuntimeRelease"),
+        oldRuntimeCapabilityDigest: boundedString(body.oldRuntimeCapabilityDigest, "oldRuntimeCapabilityDigest"),
+        oldRuntimeImage: boundedString(body.oldRuntimeImage, "oldRuntimeImage"),
         oldSnapshot: boundedString(body.oldSnapshot, "oldSnapshot"),
         candidateSnapshot: boundedString(body.candidateSnapshot, "candidateSnapshot"),
         evidence: boundedEvidence(body.evidence),

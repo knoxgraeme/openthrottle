@@ -15,6 +15,8 @@ export interface DeploymentCutover {
   id: string;
   status: "active" | "completed" | "recovery_required";
   old_runtime_release: string;
+  old_runtime_capability_digest: string;
+  old_runtime_image: string;
   old_snapshot: string;
   candidate_snapshot: string;
   pause_epoch: number | null;
@@ -30,6 +32,8 @@ export interface DeploymentCutoverStore {
   beginDeploymentCutover(input: {
     id?: string;
     oldRuntimeRelease: string;
+    oldRuntimeCapabilityDigest: string;
+    oldRuntimeImage: string;
     oldSnapshot: string;
     candidateSnapshot: string;
     evidence?: string;
@@ -63,9 +67,9 @@ export function createDeploymentCutoverStore(
   `);
   const insertStmt = db.prepare(`
     INSERT INTO deployment_cutovers (
-      id, status, old_runtime_release, old_snapshot, candidate_snapshot,
+      id, status, old_runtime_release, old_runtime_capability_digest, old_runtime_image, old_snapshot, candidate_snapshot,
       pause_epoch, phase, evidence, recovery_command, created_at, updated_at, completed_at
-    ) VALUES (?, 'active', ?, ?, ?, NULL, 'registered', ?, NULL, ?, ?, NULL)
+    ) VALUES (?, 'active', ?, ?, ?, ?, ?, NULL, 'registered', ?, NULL, ?, ?, NULL)
   `);
   const updateStmt = db.prepare(`
     UPDATE deployment_cutovers
@@ -84,6 +88,8 @@ export function createDeploymentCutoverStore(
           if (
             open.id !== id ||
             open.old_runtime_release !== input.oldRuntimeRelease ||
+            open.old_runtime_capability_digest !== input.oldRuntimeCapabilityDigest ||
+            open.old_runtime_image !== input.oldRuntimeImage ||
             open.old_snapshot !== input.oldSnapshot ||
             open.candidate_snapshot !== input.candidateSnapshot
           ) {
@@ -96,6 +102,8 @@ export function createDeploymentCutoverStore(
         insertStmt.run(
           id,
           input.oldRuntimeRelease,
+          input.oldRuntimeCapabilityDigest,
+          input.oldRuntimeImage,
           input.oldSnapshot,
           input.candidateSnapshot,
           input.evidence ?? "",

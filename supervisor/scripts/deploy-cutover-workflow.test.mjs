@@ -1,0 +1,140 @@
+import { mkdtempSync, readFileSync, writeFileSync, chmodSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import YAML from "yaml";
+
+const repoRoot = join(fileURLToPath(new URL("../..", import.meta.url)));
+
+function deployWorkflow() {
+  return YAML.parse(readFileSync(join(repoRoot, ".github/workflows/deploy.yml"), "utf8"));
+}
+
+function stepRun(jobName, stepName) {
+  const step = deployWorkflow().jobs[jobName].steps.find((candidate) => candidate.name === stepName);
+  if (!step?.run) throw new Error(`missing workflow step ${jobName}/${stepName}`);
+  return step.run;
+}
+
+function runBash(script, env = {}) {
+  const directory = mkdtempSync(join(tmpdir(), "ot-deploy-workflow-"));
+  try {
+    const bin = join(directory, "bin");
+    const log = join(directory, "commands.log");
+    spawnSync("mkdir", ["-p", bin], { check: true });
+    writeFileSync(join(bin, "flyctl"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "flyctl $*" >> "${log}"
+if [[ "$*" == *"ssh console"* ]]; then
+  printf '%s\\n' "\${FLYCTL_SSH_RESPONSE:-no machines}"
+  exit "\${FLYCTL_SSH_STATUS:-1}"
+fi
+exit 0
+`);
+    chmodSync(join(bin, "flyctl"), 0o755);
+    const result = spawnSync("bash", ["-c", script], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        FLY_APP: "openthrottle-supervisor",
+        OT_FIRST_INSTALL_BOOTSTRAP: "0",
+        ...env,
+      },
+      encoding: "utf8",
+    });
+    const commands = readFileSync(log, "utf8");
+    return { ...result, commands };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+describe("deploy workflow cutover recovery", () => {
+  it("records recovery commands that redeploy the pinned old image before evidence and never rebuild the candidate checkout", () => {
+    const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+    const recoveryCommands = [
+      ...script.matchAll(/recovery_required recovery_required[\s\S]*?"(flyctl secrets set --stage --app \$FLY_APP DAYTONA_SNAPSHOT=\$old_snapshot[^"]+)"/g),
+    ].map((match) => match[1]);
+
+    expect(recoveryCommands.length).toBeGreaterThanOrEqual(2);
+    for (const command of recoveryCommands) {
+      expect(command).toContain("--image $old_runtime_image");
+      expect(command).toContain("cutover-control.mjs evidence");
+      expect(command).not.toContain("--dockerfile supervisor/Dockerfile");
+      expect(command).not.toContain("cutover-control.mjs resume");
+    }
+  });
+
+  it("persists old release, capability digest, image authority, snapshot, pause epoch, and candidate before staging the candidate secret", () => {
+    const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+
+    expect(script.indexOf("active_image_ref()")).toBeLessThan(script.indexOf("begin_payload="));
+    expect(script).toContain("oldRuntimeRelease:$oldRuntimeRelease");
+    expect(script).toContain("oldRuntimeCapabilityDigest:$oldRuntimeCapabilityDigest");
+    expect(script).toContain("oldRuntimeImage:$oldRuntimeImage");
+    expect(script).toContain("sealed_old_runtime");
+    expect(script).toContain(".cutover.evidence // \"\" | fromjson?");
+    expect(script).toContain("open cutover lacks sealed old runtime capability digest");
+    expect(script).toContain("open cutover lacks sealed old Fly image authority");
+    expect(script).toContain("oldSnapshot:$oldSnapshot");
+    expect(script).toContain("candidateSnapshot:$candidateSnapshot");
+    expect(script.indexOf("begin_evidence=")).toBeLessThan(
+      script.indexOf("DAYTONA_SNAPSHOT=\"$EXPECTED_SNAPSHOT\"")
+    );
+    expect(script.indexOf("pauseEpoch:$pauseEpoch")).toBeLessThan(
+      script.indexOf("DAYTONA_SNAPSHOT=\"$EXPECTED_SNAPSHOT\"")
+    );
+  });
+
+  it("executes the recorded recovery shape as staged old snapshot plus pinned image deploy plus evidence, without resume", () => {
+    const command = "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl deploy --remote-only --app $FLY_APP --config supervisor/fly.toml --image $old_runtime_image && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs evidence'";
+    const result = runBash(command, {
+      old_snapshot: "openthrottle-v2-ce-old",
+      old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
+      FLYCTL_SSH_STATUS: "0",
+      FLYCTL_SSH_RESPONSE: '{"admission":{"paused":1},"runtime":{"release":"openthrottle-snapshot/v12","capabilityDigest":"sha256:old"},"snapshot":"openthrottle-v2-ce-old"}',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.commands).toContain("flyctl secrets set --stage --app openthrottle-supervisor DAYTONA_SNAPSHOT=openthrottle-v2-ce-old");
+    expect(result.commands).toContain("flyctl deploy --remote-only --app openthrottle-supervisor --config supervisor/fly.toml --image registry.fly.io/openthrottle-supervisor@sha256:old");
+    expect(result.commands).toContain("cutover-control.mjs evidence");
+    expect(result.commands).not.toContain("cutover-control.mjs resume");
+    expect(result.commands).not.toContain("--dockerfile supervisor/Dockerfile");
+  });
+
+  it("refuses supervisor-only deploy on unavailable evidence unless this run created first-install evidence", () => {
+    const script = stepRun("deploy", "Deploy the supervisor");
+    const existingApp = runBash(script, { OT_FIRST_INSTALL_BOOTSTRAP: "0", FLYCTL_SSH_STATUS: "1" });
+
+    expect(existingApp.status).not.toBe(0);
+    expect(existingApp.stderr).toContain("refusing supervisor-only deploy because cutover evidence is unavailable");
+    expect(existingApp.commands).not.toContain("flyctl deploy --remote-only");
+
+    const firstInstall = runBash(script, { OT_FIRST_INSTALL_BOOTSTRAP: "1", FLYCTL_SSH_STATUS: "1" });
+    expect(firstInstall.status).toBe(0);
+    expect(firstInstall.stdout).toContain("first-install app or volume creation");
+    expect(firstInstall.commands).toContain("flyctl deploy --remote-only");
+  });
+
+  it("covers the drain-timeout path as executable shell, not only a static substring", () => {
+    const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+    const timeoutBlock = script.match(/if \(\( SECONDS >= deadline \)\); then[\s\S]*?fi/)?.[0];
+    if (!timeoutBlock) throw new Error("missing drain timeout block");
+    const harness = `
+set -euo pipefail
+SECONDS=601
+deadline=600
+abort_cutover() { printf 'abort:%s\\n' "$1"; exit "$1"; }
+${timeoutBlock}
+`;
+    const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("v12 cutover drain did not clear within 600 seconds");
+    expect(result.stdout).toContain("abort:1");
+  });
+});

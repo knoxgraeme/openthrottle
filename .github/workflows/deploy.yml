@@ -137,9 +137,12 @@ jobs:
       - name: Ensure the Fly app and data volume exist
         run: |
           set -euo pipefail
+          first_install_bootstrap=0
           # Create the app if it is missing. Tolerate only the already-exists
           # error so real failures (bad token, unknown org) still surface.
-          if ! flyctl apps create "$FLY_APP" --org "$FLY_ORG" 2>create.log; then
+          if flyctl apps create "$FLY_APP" --org "$FLY_ORG" 2>create.log; then
+            first_install_bootstrap=1
+          else
             if grep -qiE "taken|already exists|already been" create.log; then
               echo "Fly app $FLY_APP already exists."
             else
@@ -155,7 +158,9 @@ jobs:
             echo "Creating openthrottle_data volume in $FLY_REGION."
             flyctl volumes create openthrottle_data \
               --app "$FLY_APP" --region "$FLY_REGION" --size 1 --yes
+            first_install_bootstrap=1
           fi
+          echo "OT_FIRST_INSTALL_BOOTSTRAP=$first_install_bootstrap" >> "$GITHUB_ENV"
       - name: Execute the v12 snapshot cutover transaction
         # This supervisor-only fence release does not build a snapshot, so its
         # first push deploys without calling endpoints its parent lacks. Once
@@ -169,6 +174,22 @@ jobs:
           fi
           deployed=0
           cutover_id=""
+
+          active_image_ref() {
+            local image_ref
+            image_ref="$(flyctl releases --app "$FLY_APP" --json | jq -r '
+              [ .[] | select(
+                  ((.status // .Status // "") | ascii_downcase) == "succeeded" or
+                  (.stable // .Stable // false) == true
+                )
+              ][0] | (.imageRef // .ImageRef // .image_ref // .image // .Image // "")
+            ')"
+            if [[ -z "$image_ref" || "$image_ref" == "null" ]]; then
+              echo "could not determine immutable active Fly image for $FLY_APP" >&2
+              exit 1
+            fi
+            printf '%s\n' "$image_ref"
+          }
 
           cutover_command() {
             local action="$1"
@@ -205,25 +226,24 @@ jobs:
             if [[ -z "$cutover_id" ]]; then
               exit "$exit_code"
             fi
-            if (( deployed == 1 )); then
-              advance_cutover recovery_required recovery_required \
-                "deploy started before workflow abort; operator must inspect active release before resuming" \
-                "flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs evidence'"
-              exit "$exit_code"
-            fi
 
             flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="$old_snapshot" || true
+            flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --image "$old_runtime_image" || true
             local restored
             restored="$(cutover_command evidence || true)"
             if printf '%s\n' "$restored" | jq -e \
               --arg release "$old_release" \
+              --arg digest "$old_digest" \
               --arg snapshot "$old_snapshot" \
-              '.runtime.release == $release and .snapshot == $snapshot' >/dev/null; then
+              '.admission.paused == 1 and
+               .runtime.release == $release and
+               .runtime.capabilityDigest == $digest and
+               .snapshot == $snapshot' >/dev/null; then
               cutover_command resume | jq .
               advance_cutover restored active "$restored"
             else
               advance_cutover recovery_required recovery_required "$restored" \
-                "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs resume'"
+                "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl deploy --remote-only --app $FLY_APP --config supervisor/fly.toml --image $old_runtime_image && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs evidence'"
             fi
             exit "$exit_code"
           }
@@ -232,23 +252,60 @@ jobs:
           initial_evidence="$(cutover_command evidence)"
           printf '%s\n' "$initial_evidence" | jq .
           open_candidate="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.candidate_snapshot // ""')"
+          adopting_open_cutover=0
           if [[ -n "$open_candidate" ]]; then
+            adopting_open_cutover=1
             if [[ "$open_candidate" != "$EXPECTED_SNAPSHOT" ]]; then
               echo "open cutover candidate $open_candidate does not match expected snapshot $EXPECTED_SNAPSHOT" >&2
               exit 1
             fi
             old_release="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.old_runtime_release')"
+            old_digest="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.old_runtime_capability_digest')"
+            old_runtime_image="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.old_runtime_image')"
             old_snapshot="$(printf '%s\n' "$initial_evidence" | jq -r '.cutover.old_snapshot')"
+            if [[ -z "$old_digest" || "$old_digest" == "null" ]]; then
+              old_digest="$(printf '%s\n' "$initial_evidence" | jq -r '(.cutover.evidence // "" | fromjson? | .sealed_old_runtime.old_runtime_capability_digest) // ""')"
+            fi
+            if [[ -z "$old_runtime_image" || "$old_runtime_image" == "null" ]]; then
+              old_runtime_image="$(printf '%s\n' "$initial_evidence" | jq -r '(.cutover.evidence // "" | fromjson? | .sealed_old_runtime.old_runtime_image) // ""')"
+            fi
           else
             old_release="$(printf '%s\n' "$initial_evidence" | jq -r '.runtime.release')"
+            old_digest="$(printf '%s\n' "$initial_evidence" | jq -r '.runtime.capabilityDigest')"
             old_snapshot="$(printf '%s\n' "$initial_evidence" | jq -r '.snapshot')"
+            old_runtime_image="$(active_image_ref)"
           fi
+          if [[ -z "${old_digest:-}" || "$old_digest" == "null" ]]; then
+            if (( adopting_open_cutover == 1 )); then
+              echo "open cutover lacks sealed old runtime capability digest; refusing automatic recovery" >&2
+              exit 1
+            fi
+            old_digest="$(printf '%s\n' "$initial_evidence" | jq -r '.runtime.capabilityDigest')"
+          fi
+          if [[ -z "${old_runtime_image:-}" || "$old_runtime_image" == "null" ]]; then
+            if (( adopting_open_cutover == 1 )); then
+              echo "open cutover lacks sealed old Fly image authority; refusing automatic recovery" >&2
+              exit 1
+            fi
+            old_runtime_image="$(active_image_ref)"
+          fi
+          begin_evidence_payload="$(printf '%s\n' "$initial_evidence" | jq -c \
+            --arg digest "$old_digest" \
+            --arg image "$old_runtime_image" \
+            '. + {sealed_old_runtime: {
+              old_runtime_capability_digest: $digest,
+              old_runtime_image: $image
+            }}')"
           begin_payload="$(jq -nc \
             --arg oldRuntimeRelease "$old_release" \
+            --arg oldRuntimeCapabilityDigest "$old_digest" \
+            --arg oldRuntimeImage "$old_runtime_image" \
             --arg oldSnapshot "$old_snapshot" \
             --arg candidateSnapshot "$EXPECTED_SNAPSHOT" \
-            --arg evidence "$initial_evidence" \
-            '{oldRuntimeRelease:$oldRuntimeRelease, oldSnapshot:$oldSnapshot,
+            --arg evidence "$begin_evidence_payload" \
+            '{oldRuntimeRelease:$oldRuntimeRelease,
+              oldRuntimeCapabilityDigest:$oldRuntimeCapabilityDigest,
+              oldRuntimeImage:$oldRuntimeImage, oldSnapshot:$oldSnapshot,
               candidateSnapshot:$candidateSnapshot, evidence:$evidence}')"
           begin_evidence="$(cutover_command begin "$begin_payload")"
           printf '%s\n' "$begin_evidence" | jq .
@@ -283,14 +340,14 @@ jobs:
           done
           advance_cutover drain_clear active "$evidence"
           advance_cutover recovery_required recovery_required \
-            "candidate not staged yet; restore old runtime/snapshot and resume admission if runner is lost before staging" \
-            "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs resume'"
+            "candidate not staged yet; restore and prove old runtime/snapshot before any admission resume if runner is lost before staging" \
+            "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl deploy --remote-only --app $FLY_APP --config supervisor/fly.toml --image $old_runtime_image && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs evidence'"
 
           flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="$EXPECTED_SNAPSHOT"
           advance_cutover staged active "candidate DAYTONA_SNAPSHOT staged only after drain_clear for epoch $pause_epoch"
           advance_cutover recovery_required recovery_required \
             "candidate DAYTONA_SNAPSHOT staged; restore old snapshot and inspect release if runner is lost before verification" \
-            "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl deploy --remote-only --app $FLY_APP --config supervisor/fly.toml --dockerfile supervisor/Dockerfile && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs resume'"
+            "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl deploy --remote-only --app $FLY_APP --config supervisor/fly.toml --image $old_runtime_image && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs evidence'"
 
           flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
           deployed=1
@@ -331,9 +388,8 @@ jobs:
           cutover_status=$?
           set -e
           if (( cutover_status != 0 )); then
-            if printf '%s\n' "$cutover_evidence" | grep -qiE \
-              "Cannot find module.*cutover-control\\.mjs|MODULE_NOT_FOUND|evidence failed with status 404|no machines"; then
-              echo "cutover evidence endpoint is unavailable on the bootstrap runtime; proceeding with supervisor deploy"
+            if [[ "${OT_FIRST_INSTALL_BOOTSTRAP:-0}" == "1" ]]; then
+              echo "cutover evidence endpoint is unavailable after first-install app or volume creation; proceeding with bootstrap supervisor deploy"
             else
               echo "refusing supervisor-only deploy because cutover evidence is unavailable" >&2
               exit "$cutover_status"

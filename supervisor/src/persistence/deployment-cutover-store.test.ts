@@ -9,6 +9,8 @@ describe("deployment cutover store", () => {
       const store = createDeploymentCutoverStore(db, () => "2026-08-14T04:44:22.000Z");
       const cutover = store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
+        oldRuntimeCapabilityDigest: "sha256:old-runtime-digest",
+        oldRuntimeImage: "registry.fly.io/openthrottle-supervisor@sha256:old",
         oldSnapshot: "openthrottle-v2-ce-old",
         candidateSnapshot: "openthrottle-v2-ce-new",
         evidence: "initial evidence",
@@ -18,16 +20,22 @@ describe("deployment cutover store", () => {
         status: "active",
         phase: "registered",
         old_runtime_release: "openthrottle-snapshot/v12",
+        old_runtime_capability_digest: "sha256:old-runtime-digest",
+        old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
         old_snapshot: "openthrottle-v2-ce-old",
         candidate_snapshot: "openthrottle-v2-ce-new",
       });
       expect(store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
+        oldRuntimeCapabilityDigest: "sha256:old-runtime-digest",
+        oldRuntimeImage: "registry.fly.io/openthrottle-supervisor@sha256:old",
         oldSnapshot: "openthrottle-v2-ce-old",
         candidateSnapshot: "openthrottle-v2-ce-new",
       })).toEqual(cutover);
       expect(() => store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
+        oldRuntimeCapabilityDigest: "sha256:old-runtime-digest",
+        oldRuntimeImage: "registry.fly.io/openthrottle-supervisor@sha256:old",
         oldSnapshot: "openthrottle-v2-ce-old",
         candidateSnapshot: "openthrottle-v2-ce-other",
       })).toThrow(/retry must adopt that transaction/);
@@ -45,6 +53,8 @@ describe("deployment cutover store", () => {
       });
       expect(store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
+        oldRuntimeCapabilityDigest: "sha256:old-runtime-digest",
+        oldRuntimeImage: "registry.fly.io/openthrottle-supervisor@sha256:old",
         oldSnapshot: "openthrottle-v2-ce-old",
         candidateSnapshot: "openthrottle-v2-ce-new",
       })).toEqual(restored);
@@ -72,6 +82,8 @@ describe("deployment cutover store", () => {
       const store = createDeploymentCutoverStore(db, () => "2026-08-14T04:54:22.000Z");
       const cutover = store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
+        oldRuntimeCapabilityDigest: "sha256:old-runtime-digest",
+        oldRuntimeImage: "registry.fly.io/openthrottle-supervisor@sha256:old",
         oldSnapshot: "openthrottle-v2-ce-old",
         candidateSnapshot: "openthrottle-v2-ce-new",
       });
@@ -89,6 +101,8 @@ describe("deployment cutover store", () => {
       });
       expect(() => store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
+        oldRuntimeCapabilityDigest: "sha256:old-runtime-digest",
+        oldRuntimeImage: "registry.fly.io/openthrottle-supervisor@sha256:other",
         oldSnapshot: "openthrottle-v2-ce-other-old",
         candidateSnapshot: "openthrottle-v2-ce-other",
       })).toThrow(/retry must adopt that transaction/);
@@ -103,6 +117,8 @@ describe("deployment cutover store", () => {
       const store = createDeploymentCutoverStore(db, () => "2026-08-14T04:49:22.000Z");
       const cutover = store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
+        oldRuntimeCapabilityDigest: "sha256:old-runtime-digest",
+        oldRuntimeImage: "registry.fly.io/openthrottle-supervisor@sha256:old",
         oldSnapshot: "openthrottle-v2-ce-old",
         candidateSnapshot: "openthrottle-v2-ce-new",
       });

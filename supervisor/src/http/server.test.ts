@@ -383,6 +383,8 @@ describe("coordinator-only server", () => {
       headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
       body: JSON.stringify({
         oldRuntimeRelease: descriptor.descriptor.release,
+        oldRuntimeCapabilityDigest: descriptor.digest,
+        oldRuntimeImage: "registry.fly.io/openthrottle-supervisor@sha256:old",
         oldSnapshot: "snapshot",
         candidateSnapshot: "openthrottle-v2-ce-new",
         evidence: "initial proof",
@@ -394,6 +396,8 @@ describe("coordinator-only server", () => {
       status: "active",
       phase: "registered",
       old_runtime_release: descriptor.descriptor.release,
+      old_runtime_capability_digest: descriptor.digest,
+      old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
       old_snapshot: "snapshot",
       candidate_snapshot: "openthrottle-v2-ce-new",
     });
@@ -403,6 +407,8 @@ describe("coordinator-only server", () => {
       headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
       body: JSON.stringify({
         oldRuntimeRelease: descriptor.descriptor.release,
+        oldRuntimeCapabilityDigest: descriptor.digest,
+        oldRuntimeImage: "registry.fly.io/openthrottle-supervisor@sha256:old",
         oldSnapshot: "snapshot",
         candidateSnapshot: "openthrottle-v2-ce-new",
       }),
@@ -414,6 +420,8 @@ describe("coordinator-only server", () => {
       headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
       body: JSON.stringify({
         oldRuntimeRelease: descriptor.descriptor.release,
+        oldRuntimeCapabilityDigest: descriptor.digest,
+        oldRuntimeImage: "registry.fly.io/openthrottle-supervisor@sha256:old",
         oldSnapshot: "snapshot",
         candidateSnapshot: "openthrottle-v2-ce-other",
       }),
