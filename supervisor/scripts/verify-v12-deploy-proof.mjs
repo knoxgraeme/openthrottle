@@ -37,10 +37,17 @@ assert(
 const deployWorkflow = read(".github/workflows/deploy.yml");
 const cutoverControl = read("supervisor/scripts/cutover-control.mjs");
 assert(
-  deployWorkflow.includes("/app/scripts/cutover-control.mjs pause") &&
-    deployWorkflow.includes("/app/scripts/cutover-control.mjs evidence") &&
-    deployWorkflow.includes("/app/scripts/cutover-control.mjs resume") &&
+  deployWorkflow.includes("/app/scripts/cutover-control.mjs $action") &&
+    deployWorkflow.includes("cutover_command begin") &&
+    deployWorkflow.includes("cutover_command advance") &&
+    deployWorkflow.includes("cutover_command evidence") &&
+    deployWorkflow.includes("cutover_command resume") &&
+    deployWorkflow.includes("flyctl secrets set --stage --app \"$FLY_APP\" DAYTONA_SNAPSHOT=\"$EXPECTED_SNAPSHOT\"") &&
+    deployWorkflow.indexOf("advance_cutover drain_clear") < deployWorkflow.indexOf("DAYTONA_SNAPSHOT=\"$EXPECTED_SNAPSHOT\"") &&
+    deployWorkflow.includes("flyctl secrets set --stage --app \"$FLY_APP\" DAYTONA_SNAPSHOT=\"$old_snapshot\"") &&
+    deployWorkflow.includes("advance_cutover restored active") &&
     deployWorkflow.includes(".drain.clear == true") &&
+    deployWorkflow.includes(".admission.epoch == $epoch") &&
     deployWorkflow.includes(".runtime.release == $release") &&
     deployWorkflow.includes(".runtime.capabilityDigest == $digest") &&
     deployWorkflow.includes(".snapshot == $snapshot") &&
@@ -50,6 +57,8 @@ assert(
 );
 assert(
   cutoverControl.includes("OT_DEPLOY_TOKEN") &&
+    cutoverControl.includes("/deployment/cutover/begin") &&
+    cutoverControl.includes("/deployment/cutover/advance") &&
     cutoverControl.includes("/maintenance/admission/pause") &&
     cutoverControl.includes("/deployment/cutover-evidence") &&
     cutoverControl.includes("/maintenance/admission/resume"),

@@ -319,6 +319,7 @@ describe("coordinator-only server", () => {
       admission: { paused: 1, reason: "v12 cutover drain" },
       runtime: { release: descriptor.descriptor.release, capabilityDigest: descriptor.digest },
       snapshot: "snapshot",
+      cutover: null,
       drain: { clear: true, blockers: [], truncated: false },
     });
     expect(runtime.listLabeledResources).toHaveBeenCalledWith(51);
@@ -359,6 +360,85 @@ describe("coordinator-only server", () => {
     expect(resumed.status).toBe(200);
     expect(await resumed.json()).toMatchObject({
       admission: { paused: 0, epoch: 2, reason: null },
+    });
+  });
+
+  it("persists deployment cutover transactions behind the deploy token", async () => {
+    const descriptor = buildInstalledRuntimeDescriptor("deploy-evidence-test/v1");
+    const runtime = { listLabeledResources: vi.fn(async () => []) } as unknown as ServerRuntime;
+    const server = app({
+      runtime,
+      pipelineCoordinator: { catalog: {} as never, runtime: descriptor, store: pipelines },
+    });
+
+    const unauthorized = await server.request("/deployment/cutover/begin", {
+      method: "POST",
+      headers: { Authorization: "Bearer status-token", "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(unauthorized.status).toBe(401);
+
+    const begin = await server.request("/deployment/cutover/begin", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        oldRuntimeRelease: descriptor.descriptor.release,
+        oldSnapshot: "snapshot",
+        candidateSnapshot: "openthrottle-v2-ce-new",
+        evidence: "initial proof",
+      }),
+    });
+    expect(begin.status).toBe(200);
+    const beginBody = await begin.json() as { cutover: { id: string } };
+    expect(beginBody.cutover).toMatchObject({
+      status: "active",
+      phase: "registered",
+      old_runtime_release: descriptor.descriptor.release,
+      old_snapshot: "snapshot",
+      candidate_snapshot: "openthrottle-v2-ce-new",
+    });
+
+    const duplicate = await server.request("/deployment/cutover/begin", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        oldRuntimeRelease: descriptor.descriptor.release,
+        oldSnapshot: "snapshot",
+        candidateSnapshot: "openthrottle-v2-ce-new",
+      }),
+    });
+    expect(await duplicate.json()).toMatchObject({ cutover: { id: beginBody.cutover.id } });
+
+    const ambiguous = await server.request("/deployment/cutover/begin", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        oldRuntimeRelease: descriptor.descriptor.release,
+        oldSnapshot: "snapshot",
+        candidateSnapshot: "openthrottle-v2-ce-other",
+      }),
+    });
+    expect(ambiguous.status).toBe(409);
+
+    const paused = await server.request("/deployment/cutover/advance", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        id: beginBody.cutover.id,
+        phase: "paused",
+        pauseEpoch: 1,
+        evidence: "pause evidence",
+      }),
+    });
+    expect(await paused.json()).toMatchObject({
+      cutover: { phase: "paused", pause_epoch: 1, evidence: "pause evidence" },
+    });
+
+    const evidence = await server.request("/deployment/cutover-evidence", {
+      headers: { Authorization: "Bearer deploy-token" },
+    });
+    expect(await evidence.json()).toMatchObject({
+      cutover: { id: beginBody.cutover.id, phase: "paused", pause_epoch: 1 },
     });
   });
 
