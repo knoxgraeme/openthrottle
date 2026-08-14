@@ -61,19 +61,40 @@ exit 0
 }
 
 describe("deploy workflow cutover recovery", () => {
-  it("resolves the live capitalized complete release image when no started machine image is available", () => {
+  it("fails closed when machine enumeration fails even if releases has a plausible image", () => {
     const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
     const helperStart = script.indexOf("active_image_ref() {");
     const helperEnd = script.indexOf("seal_cutover_evidence() {");
     if (helperStart < 0 || helperEnd < helperStart) throw new Error("missing active image helper");
     const helperBlock = script.slice(helperStart, helperEnd);
     const result = runBash(`${helperBlock}\nactive_image_ref`, {
+      FLYCTL_MACHINES_STATUS: "1",
       FLYCTL_RELEASES_RESPONSE:
         '[{"Version":188,"Status":"complete","Stable":false,"ImageRef":"registry.fly.io/openthrottle-staging-knoxgraeme:deployment-01KZZ90"}]',
     });
 
-    expect(result.status).toBe(0);
-    expect(result.stdout.trim()).toBe("registry.fly.io/openthrottle-staging-knoxgraeme:deployment-01KZZ90");
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).not.toContain("registry.fly.io/openthrottle-staging-knoxgraeme:deployment-01KZZ90");
+    expect(result.commands).not.toContain("flyctl releases");
+    expect(result.stderr).toContain("could not determine immutable active Fly machine image");
+  });
+
+  it("fails closed when machine enumeration returns malformed JSON", () => {
+    const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+    const helperStart = script.indexOf("active_image_ref() {");
+    const helperEnd = script.indexOf("seal_cutover_evidence() {");
+    if (helperStart < 0 || helperEnd < helperStart) throw new Error("missing active image helper");
+    const helperBlock = script.slice(helperStart, helperEnd);
+    const result = runBash(`${helperBlock}\nactive_image_ref`, {
+      FLYCTL_MACHINES_RESPONSE: "{not json",
+      FLYCTL_RELEASES_RESPONSE:
+        '[{"Version":188,"Status":"complete","Stable":false,"ImageRef":"registry.fly.io/app:newer"}]',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).not.toContain("registry.fly.io/app:newer");
+    expect(result.commands).not.toContain("flyctl releases");
+    expect(result.stderr).toContain("could not determine immutable active Fly machine image");
   });
 
   it("uses the started machine image as the sealed runtime authority", () => {
@@ -105,7 +126,23 @@ describe("deploy workflow cutover recovery", () => {
     });
 
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("could not determine immutable active Fly image");
+    expect(result.stderr).toContain("could not determine immutable active Fly machine image");
+  });
+
+  it("fails closed when any started Fly machine lacks an image authority", () => {
+    const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+    const helperStart = script.indexOf("active_image_ref() {");
+    const helperEnd = script.indexOf("seal_cutover_evidence() {");
+    if (helperStart < 0 || helperEnd < helperStart) throw new Error("missing active image helper");
+    const helperBlock = script.slice(helperStart, helperEnd);
+    const result = runBash(`${helperBlock}\nactive_image_ref`, {
+      FLYCTL_MACHINES_RESPONSE:
+        '[{"id":"one","state":"started","config":{"image":"registry.fly.io/app:running"}},{"id":"two","state":"started","config":{}}]',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).not.toContain("registry.fly.io/app:running");
+    expect(result.stderr).toContain("could not determine immutable active Fly machine image");
   });
 
   it("fails closed when started Fly machines report different active images", () => {

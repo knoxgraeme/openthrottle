@@ -176,13 +176,42 @@ jobs:
           cutover_id=""
 
           active_image_ref() {
+            local machines_json
+            if ! machines_json="$(flyctl machines list --app "$FLY_APP" --json)"; then
+              echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
+              exit 1
+            fi
+            local started_machine_count
+            if ! started_machine_count="$(printf '%s\n' "$machines_json" | jq -r '
+              [ .[] | select(((.state // .State // "") | ascii_downcase) == "started") ] | length
+            ')"; then
+              echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
+              exit 1
+            fi
+            local resolved_machine_count
+            if ! resolved_machine_count="$(printf '%s\n' "$machines_json" | jq -r '
+              [ .[] | select(((.state // .State // "") | ascii_downcase) == "started")
+                | (.config.image // .Config.Image // .imageRef // .ImageRef // .image // .Image // "")
+                | select(. != "" and . != "null")
+              ] | length
+            ')"; then
+              echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
+              exit 1
+            fi
+            if (( started_machine_count == 0 || resolved_machine_count != started_machine_count )); then
+              echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
+              exit 1
+            fi
             local machine_images
-            machine_images="$(flyctl machines list --app "$FLY_APP" --json 2>/dev/null | jq -r '
+            if ! machine_images="$(printf '%s\n' "$machines_json" | jq -r '
               [ .[] | select(((.state // .State // "") | ascii_downcase) == "started")
                 | (.config.image // .Config.Image // .imageRef // .ImageRef // .image // .Image // "")
                 | select(. != "" and . != "null")
               ] | unique[]
-            ' || true)"
+            ')"; then
+              echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
+              exit 1
+            fi
             local machine_image_count
             machine_image_count="$(printf '%s\n' "$machine_images" | sed '/^$/d' | wc -l | tr -d ' ')"
             if (( machine_image_count == 1 )); then
@@ -194,21 +223,8 @@ jobs:
               printf '%s\n' "$machine_images" >&2
               exit 1
             fi
-
-            local image_ref
-            image_ref="$(flyctl releases --app "$FLY_APP" --json | jq -r '
-              [ .[] | select(
-                  ((.status // .Status // "") | ascii_downcase) == "complete" or
-                  ((.status // .Status // "") | ascii_downcase) == "succeeded" or
-                  (.stable // .Stable // false) == true
-                )
-              ][0] | (.imageRef // .ImageRef // .image_ref // .image // .Image // "")
-            ')"
-            if [[ -z "$image_ref" || "$image_ref" == "null" ]]; then
-              echo "could not determine immutable active Fly image for $FLY_APP" >&2
-              exit 1
-            fi
-            printf '%s\n' "$image_ref"
+            echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
+            exit 1
           }
 
           seal_cutover_evidence() {
