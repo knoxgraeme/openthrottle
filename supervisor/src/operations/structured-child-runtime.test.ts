@@ -146,6 +146,28 @@ function candidateReceipt(subject: string, attempt: ExecutionWorkAttempt, preSub
   });
 }
 
+function completedCandidateAction(input: {
+  id: string;
+  subject: string;
+  cycle?: number;
+  attemptOrdinal?: number;
+  preSubject?: string;
+  outputSubject?: string;
+}): ExecutionWorkAttempt {
+  const candidate = action({
+    id: input.id,
+    action_kind: "candidate",
+    cycle: input.cycle ?? 1,
+    status: "completed",
+    attempt_ordinal: input.attemptOrdinal ?? 2,
+    request_hash: "b".repeat(64),
+    output_subject: input.outputSubject ?? input.subject,
+  });
+  candidate.receipt = candidateReceipt(input.subject, candidate, input.preSubject);
+  candidate.receipt_hash = digestNormalized(candidate.receipt);
+  return candidate;
+}
+
 function completionReceipt(subject: string, attempt: ExecutionWorkAttempt): string {
   return canonicalJson({
     schema: "openthrottle.receipt/v1",
@@ -2570,17 +2592,11 @@ describe("structured child runtime repair fences", () => {
 
   it("gives a repair action the triggering lead decision and failing command evidence", async () => {
     const rejectedCandidateSubject = "2".repeat(40);
-    const candidate = action({
+    const candidate = completedCandidateAction({
       id: "candidate-cycle-1",
-      action_kind: "candidate",
-      cycle: 1,
-      status: "completed",
-      attempt_ordinal: 2,
-      request_hash: "b".repeat(64),
-      output_subject: rejectedCandidateSubject,
+      subject: rejectedCandidateSubject,
+      preSubject: rejectedCandidateSubject,
     });
-    candidate.receipt = candidateReceipt(rejectedCandidateSubject, candidate, rejectedCandidateSubject);
-    candidate.receipt_hash = digestNormalized(candidate.receipt);
     const lead = action({
       id: "lead-cycle-1",
       action_kind: "lead",
@@ -2653,7 +2669,7 @@ describe("structured child runtime repair fences", () => {
       loop: "repair",
       baseSubject: rejectedCandidateSubject,
       inputSubject: rejectedCandidateSubject,
-      recoveryBaseSubject: rejectedCandidateSubject,
+      recoveryBaseSubject: "a".repeat(40),
       priorEvidence: {
         schema: "openthrottle.loop-prior-evidence/v1",
         role: "repair",
@@ -2668,17 +2684,10 @@ describe("structured child runtime repair fences", () => {
 
   it("replays prepared repair dispatch with the rejected candidate worktree base", async () => {
     const rejectedCandidateSubject = "2".repeat(40);
-    const candidate = action({
+    const candidate = completedCandidateAction({
       id: "candidate-cycle-1-replay",
-      action_kind: "candidate",
-      cycle: 1,
-      status: "completed",
-      attempt_ordinal: 2,
-      request_hash: "b".repeat(64),
-      output_subject: rejectedCandidateSubject,
+      subject: rejectedCandidateSubject,
     });
-    candidate.receipt = candidateReceipt(rejectedCandidateSubject, candidate);
-    candidate.receipt_hash = digestNormalized(candidate.receipt);
     const repair = action({
       id: "repair-cycle-2-replay",
       action_kind: "repair",
@@ -2699,7 +2708,7 @@ describe("structured child runtime repair fences", () => {
         skill: "repair-unit",
         worktree: { id: `worktree-repair-cycle-2-replay-${rejectedCandidateSubject.slice(0, 12)}` },
         baseSubject: rejectedCandidateSubject,
-        recoveryBaseSubject: rejectedCandidateSubject,
+        recoveryBaseSubject: "a".repeat(40),
         inputSubject: rejectedCandidateSubject,
         nativeSessionId: "native-repair-1",
         contextPolicy: "resume_required",
@@ -2752,24 +2761,17 @@ describe("structured child runtime repair fences", () => {
       requestHash: "3".repeat(64),
       baseSubject: rejectedCandidateSubject,
       inputSubject: rejectedCandidateSubject,
-      recoveryBaseSubject: rejectedCandidateSubject,
+      recoveryBaseSubject: "a".repeat(40),
     }));
   });
 
   it("fails closed before replaying a prepared repair request with stale subjects", async () => {
     const rejectedCandidateSubject = "2".repeat(40);
     const staleBaseSubject = "a".repeat(40);
-    const candidate = action({
+    const candidate = completedCandidateAction({
       id: "candidate-cycle-1-stale-replay",
-      action_kind: "candidate",
-      cycle: 1,
-      status: "completed",
-      attempt_ordinal: 2,
-      request_hash: "b".repeat(64),
-      output_subject: rejectedCandidateSubject,
+      subject: rejectedCandidateSubject,
     });
-    candidate.receipt = candidateReceipt(rejectedCandidateSubject, candidate);
-    candidate.receipt_hash = digestNormalized(candidate.receipt);
     const repair = action({
       id: "repair-cycle-2-stale-replay",
       action_kind: "repair",
@@ -2892,28 +2894,15 @@ describe("structured child runtime repair fences", () => {
 
   it("fails closed before repair worktree creation with ambiguous rejected candidate evidence", async () => {
     const rejectedCandidateSubject = "2".repeat(40);
-    const firstCandidate = action({
+    const firstCandidate = completedCandidateAction({
       id: "candidate-cycle-1-ambiguous-a",
-      action_kind: "candidate",
-      cycle: 1,
-      status: "completed",
-      attempt_ordinal: 2,
-      request_hash: "b".repeat(64),
-      output_subject: rejectedCandidateSubject,
+      subject: rejectedCandidateSubject,
     });
-    firstCandidate.receipt = candidateReceipt(rejectedCandidateSubject, firstCandidate);
-    firstCandidate.receipt_hash = digestNormalized(firstCandidate.receipt);
-    const secondCandidate = action({
+    const secondCandidate = completedCandidateAction({
       id: "candidate-cycle-1-ambiguous-b",
-      action_kind: "candidate",
-      cycle: 1,
-      status: "completed",
-      attempt_ordinal: 3,
-      request_hash: "b".repeat(64),
-      output_subject: rejectedCandidateSubject,
+      subject: rejectedCandidateSubject,
+      attemptOrdinal: 3,
     });
-    secondCandidate.receipt = candidateReceipt(rejectedCandidateSubject, secondCandidate);
-    secondCandidate.receipt_hash = digestNormalized(secondCandidate.receipt);
     const lead = action({
       id: "lead-cycle-1-ambiguous-candidate",
       action_kind: "lead",
@@ -2963,17 +2952,11 @@ describe("structured child runtime repair fences", () => {
 
   it("fails closed before repair worktree creation when rejected candidate evidence is stale", async () => {
     const rejectedCandidateSubject = "2".repeat(40);
-    const candidate = action({
+    const candidate = completedCandidateAction({
       id: "candidate-cycle-1-stale",
-      action_kind: "candidate",
-      cycle: 1,
-      status: "completed",
-      attempt_ordinal: 2,
-      request_hash: "b".repeat(64),
-      output_subject: "3".repeat(40),
+      subject: rejectedCandidateSubject,
+      outputSubject: "3".repeat(40),
     });
-    candidate.receipt = candidateReceipt(rejectedCandidateSubject, candidate);
-    candidate.receipt_hash = digestNormalized(candidate.receipt);
     const lead = action({
       id: "lead-cycle-1-stale-candidate",
       action_kind: "lead",
@@ -3023,17 +3006,10 @@ describe("structured child runtime repair fences", () => {
 
   it("fails closed before repair dispatch when the triggering lead receipt's request-hash fence does not match", async () => {
     const rejectedCandidateSubject = "2".repeat(40);
-    const candidate = action({
+    const candidate = completedCandidateAction({
       id: "candidate-cycle-1-invalid-lead",
-      action_kind: "candidate",
-      cycle: 1,
-      status: "completed",
-      attempt_ordinal: 2,
-      request_hash: "b".repeat(64),
-      output_subject: rejectedCandidateSubject,
+      subject: rejectedCandidateSubject,
     });
-    candidate.receipt = candidateReceipt(rejectedCandidateSubject, candidate);
-    candidate.receipt_hash = digestNormalized(candidate.receipt);
     const lead = action({
       id: "lead-cycle-1-invalid",
       action_kind: "lead",

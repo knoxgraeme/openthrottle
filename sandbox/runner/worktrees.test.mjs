@@ -85,11 +85,52 @@ describe("executor-owned worktrees", () => {
     const { rootDir, markerRootDir } = worktreeEnvironment();
     const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
     expect(() => createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "wrong", baseCommit: "b".repeat(40) }))
-      .toThrow(/does not match requested/);
+      .toThrow(/does not exist/);
 
     writeFileSync(join(repoDir, "dirty.txt"), "dirty\n");
     expect(() => createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "dirty", baseCommit }))
       .toThrow(/must be clean/);
+  });
+
+  it("creates a clean worktree at a requested descendant commit", () => {
+    const repoDir = repository();
+    const { rootDir, markerRootDir } = worktreeEnvironment();
+    const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    writeFileSync(join(repoDir, "candidate.txt"), "candidate\n");
+    git(repoDir, ["add", "candidate.txt"]);
+    git(repoDir, ["commit", "-qm", "candidate"]);
+    const candidateCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    git(repoDir, ["checkout", "-q", baseCommit]);
+
+    const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unit-repair", baseCommit: candidateCommit });
+
+    expect(git(created.path, ["rev-parse", "HEAD"])).toBe(candidateCommit);
+    expect(git(created.path, ["status", "--porcelain"])).toBe("");
+    expect(statSync(join(created.path, "candidate.txt")).isFile()).toBe(true);
+  });
+
+  it("rejects a missing requested worktree base commit", () => {
+    const repoDir = repository();
+    const { rootDir, markerRootDir } = worktreeEnvironment();
+
+    expect(() => createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "missing", baseCommit: "b".repeat(40) }))
+      .toThrow(/does not exist/);
+  });
+
+  it("rejects an unrelated requested worktree base commit", () => {
+    const repoDir = repository();
+    const otherRepoDir = repository();
+    const { rootDir, markerRootDir } = worktreeEnvironment();
+    git(otherRepoDir, ["checkout", "--orphan", "unrelated"]);
+    git(otherRepoDir, ["rm", "-qrf", "."]);
+    writeFileSync(join(otherRepoDir, "other.txt"), "other\n");
+    git(otherRepoDir, ["add", "other.txt"]);
+    git(otherRepoDir, ["commit", "-qm", "unrelated"]);
+    const otherCommit = git(otherRepoDir, ["rev-parse", "HEAD"]);
+    git(repoDir, ["fetch", "-q", otherRepoDir, otherCommit]);
+
+    expect(() => createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unrelated", baseCommit: otherCommit }))
+      .toThrow(/not a descendant/);
   });
 
   it("reuses an existing clean exact-base worktree only in idempotent mode", () => {

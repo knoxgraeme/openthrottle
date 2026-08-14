@@ -1901,7 +1901,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         if (
           replayRequest.baseSubject !== rejectedCandidateSubject ||
           replayRequest.inputSubject !== rejectedCandidateSubject ||
-          replayRequest.recoveryBaseSubject !== rejectedCandidateSubject
+          replayRequest.recoveryBaseSubject !== instance.base_commit
         ) {
           throw new Error(`child repair action ${action.id} prepared request is not bound to the rejected candidate`);
         }
@@ -2034,7 +2034,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       skill: workerBinding.repositorySkill?.invocation ?? adapterSkillFor(action.action_kind),
       worktree,
       baseSubject: baseCommit,
-      recoveryBaseSubject: action.action_kind === "repair" ? baseCommit : instance.base_commit,
+      recoveryBaseSubject: instance.base_commit,
       inputSubject,
       nativeSessionId: action.native_session_id,
       contextPolicy,

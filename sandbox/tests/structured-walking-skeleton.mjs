@@ -941,6 +941,35 @@ async function runLoopAdapterReplayScenario({ db, container, fixture }) {
   log(`active-loop replay kept ${request.actionId} to one executor and a stateless restart collected its result`);
 }
 
+function assertRepairRequestsSeededFromPreviousCandidates({ pipelines, attemptId, runtime, durableBaseCommit }) {
+  const actions = pipelines.listWorkAttempts(attemptId);
+  const completedCandidates = new Map();
+  for (const action of actions) {
+    if (
+      action.action_kind === "candidate" &&
+      action.status === "completed" &&
+      action.output_subject &&
+      action.unit_id !== null
+    ) {
+      completedCandidates.set(`${action.unit_id}:${action.cycle}`, action.output_subject);
+    }
+  }
+  for (const repair of actions.filter((action) => action.action_kind === "repair" && action.status === "completed")) {
+    const rejectedCandidate = completedCandidates.get(`${repair.unit_id}:${repair.cycle - 1}`);
+    assert(rejectedCandidate, `repair ${repair.id} has no previous-cycle candidate output subject`);
+    const request = runtime.dispatchedLoopRequests.get(`${repair.parent_attempt_id}:${repair.id}`);
+    assert(request, `repair ${repair.id} had no captured loop request`);
+    assert(request.baseSubject === rejectedCandidate, `repair ${repair.id} baseSubject was not the previous candidate`);
+    assert(request.inputSubject === rejectedCandidate, `repair ${repair.id} inputSubject was not the previous candidate`);
+    assert(request.recoveryBaseSubject === durableBaseCommit, `repair ${repair.id} recoveryBaseSubject was not the durable base`);
+    assert(request.worktree?.id, `repair ${repair.id} had no worktree handle`);
+    assert(
+      runtime.worktreeHandles.get(request.worktree.id) === rejectedCandidate,
+      `repair ${repair.id} worktree base was not the previous candidate`
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Scenario: happy path -- two ordered stub units through the full sequence,
 // including two consecutive deliberate command failures/repairs on unit A.
@@ -1021,6 +1050,12 @@ async function runHappyPath({ db, container, fixture }) {
     [...runtime.resumedSessionWorktrees.values()].some((handles) => handles.size > 2),
     "no native session was resumed across three different worktrees; the second restore relocation is untested"
   );
+  assertRepairRequestsSeededFromPreviousCandidates({
+    pipelines,
+    attemptId: attempt.id,
+    runtime,
+    durableBaseCommit: fixture.baseCommit,
+  });
 
   assert(
     runtime.counters.serialReviewPersonaTransitions > 0,

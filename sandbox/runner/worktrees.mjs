@@ -139,6 +139,20 @@ function requireClean(repoDir) {
   if (status) throw new Error("integration checkout must be clean before creating a unit worktree");
 }
 
+function requireReachableWorktreeBase(repoDir, baseCommit) {
+  const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
+  try {
+    runGitAsExecutor(repoDir, ["rev-parse", "--verify", `${baseCommit}^{commit}`]);
+  } catch {
+    throw new Error("requested worktree base commit does not exist");
+  }
+  try {
+    runGitAsExecutor(repoDir, ["merge-base", "--is-ancestor", head, baseCommit]);
+  } catch {
+    throw new Error("requested worktree base is not a descendant of the integration checkout HEAD");
+  }
+}
+
 function existingWorktree({ rootDir, target, handle, baseCommit, hooksPath }) {
   assertDirectory(target, "worktree");
   const head = runGitAsExecutor(target, ["rev-parse", "HEAD"]);
@@ -172,8 +186,7 @@ export function createWorktree({
     throw new Error("worktree handle already exists");
   }
   requireClean(repoDir);
-  const head = runGitAsExecutor(repoDir, ["rev-parse", "HEAD"]);
-  if (head !== safeBase) throw new Error("integration checkout HEAD does not match requested worktree base");
+  requireReachableWorktreeBase(repoDir, safeBase);
   prepareWorktreeRoot(rootDir);
   // A fresh checkout has no dependency state yet: a bootstrap marker left by
   // an earlier same-handle worktree must not let this one skip bootstrap.
