@@ -179,14 +179,14 @@ jobs:
             local machines_json
             if ! machines_json="$(flyctl machines list --app "$FLY_APP" --json)"; then
               echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
-              exit 1
+              return 1
             fi
             local started_machine_count
             if ! started_machine_count="$(printf '%s\n' "$machines_json" | jq -r '
               [ .[] | select(((.state // .State // "") | ascii_downcase) == "started") ] | length
             ')"; then
               echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
-              exit 1
+              return 1
             fi
             local resolved_machine_count
             if ! resolved_machine_count="$(printf '%s\n' "$machines_json" | jq -r '
@@ -196,11 +196,11 @@ jobs:
               ] | length
             ')"; then
               echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
-              exit 1
+              return 1
             fi
             if (( started_machine_count == 0 || resolved_machine_count != started_machine_count )); then
               echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
-              exit 1
+              return 1
             fi
             local machine_images
             if ! machine_images="$(printf '%s\n' "$machines_json" | jq -r '
@@ -210,7 +210,7 @@ jobs:
               ] | unique[]
             ')"; then
               echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
-              exit 1
+              return 1
             fi
             local machine_image_count
             machine_image_count="$(printf '%s\n' "$machine_images" | sed '/^$/d' | wc -l | tr -d ' ')"
@@ -221,25 +221,55 @@ jobs:
             if (( machine_image_count > 1 )); then
               echo "started Fly machines disagree on active image for $FLY_APP" >&2
               printf '%s\n' "$machine_images" >&2
-              exit 1
+              return 1
             fi
             echo "could not determine immutable active Fly machine image for $FLY_APP" >&2
-            exit 1
+            return 1
           }
 
           seal_cutover_evidence() {
             local evidence="$1"
-            if [[ -z "${old_digest:-}" || -z "${old_runtime_image:-}" ]]; then
-              printf '%s\n' "$evidence"
-              return
+            local event="${2:-cutover_advance}"
+            local summary
+            if ! summary="$(printf '%s\n' "$evidence" | jq -c '{
+              admission: {paused: .admission.paused, epoch: .admission.epoch},
+              runtime: {release: .runtime.release, capabilityDigest: .runtime.capabilityDigest},
+              snapshot: .snapshot,
+              drain: {clear: .drain.clear, blocker_count: ((.drain.blockers // []) | length)},
+              rollback: {
+                stageStatus: .rollback.stageStatus,
+                deployStatus: .rollback.deployStatus,
+                machineStatus: .rollback.machineStatus,
+                expectedImage: .rollback.expectedImage,
+                observedImage: .rollback.observedImage
+              },
+              cutover: {
+                id: .cutover.id,
+                status: .cutover.status,
+                phase: .cutover.phase,
+                candidate_snapshot: .cutover.candidate_snapshot
+              }
+            }' 2>/dev/null)"; then
+              summary='{"parse":"failed"}'
             fi
-            printf '%s\n' "$evidence" | jq -Rsc \
+            local source_sha
+            source_sha="$(printf '%s' "$evidence" | sha256sum | awk '{print $1}')"
+            jq -nc \
+              --arg event "$event" \
+              --arg sourceSha "sha256:$source_sha" \
               --arg digest "$old_digest" \
               --arg image "$old_runtime_image" \
-              '(try fromjson catch {message: .}) + {sealed_old_runtime: {
-                old_runtime_capability_digest: $digest,
-                old_runtime_image: $image
-              }}'
+              --argjson summary "$summary" \
+              '{
+                schema: "openthrottle.cutover-evidence/v1",
+                event: $event,
+                source_sha256: $sourceSha,
+                summary: $summary,
+                sealed_old_runtime: {
+                  old_runtime_capability_digest: $digest,
+                  old_runtime_image: $image
+                }
+              }'
           }
 
           cutover_command() {
@@ -283,22 +313,41 @@ jobs:
               exit "$exit_code"
             fi
 
-            flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="$old_snapshot" || true
-            flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --image "$old_runtime_image" || true
+            local stage_status=0
+            local deploy_status=0
+            local machine_status=0
+            flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="$old_snapshot" || stage_status=$?
+            flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --image "$old_runtime_image" || deploy_status=$?
+            local restored_image=""
+            restored_image="$(active_image_ref)" || machine_status=$?
             local restored
             restored="$(cutover_command evidence || true)"
-            if printf '%s\n' "$restored" | jq -e \
+            if (( stage_status == 0 && deploy_status == 0 && machine_status == 0 )) &&
+              [[ "$restored_image" == "$old_runtime_image" ]] &&
+              printf '%s\n' "$restored" | jq -e \
               --arg release "$old_release" \
               --arg digest "$old_digest" \
               --arg snapshot "$old_snapshot" \
+              --arg image "$restored_image" \
               '.admission.paused == 1 and
                .runtime.release == $release and
                .runtime.capabilityDigest == $digest and
-               .snapshot == $snapshot' >/dev/null; then
-              cutover_command resume | jq .
+               .snapshot == $snapshot and
+               $image != ""' >/dev/null; then
               advance_cutover restored active "$restored"
+              cutover_command resume | jq .
             else
-              advance_cutover recovery_required recovery_required "$restored" \
+              local rollback_failure_evidence
+              rollback_failure_evidence="$(jq -nc \
+                --argjson stageStatus "$stage_status" \
+                --argjson deployStatus "$deploy_status" \
+                --argjson machineStatus "$machine_status" \
+                --arg expectedImage "$old_runtime_image" \
+                --arg observedImage "$restored_image" \
+                --arg evidence "$restored" \
+                '{rollback:{stageStatus:$stageStatus,deployStatus:$deployStatus,machineStatus:$machineStatus,
+                  expectedImage:$expectedImage,observedImage:$observedImage}, evidence:$evidence}')"
+              advance_cutover recovery_required recovery_required "$rollback_failure_evidence" \
                 "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl deploy --remote-only --app $FLY_APP --config supervisor/fly.toml --image $old_runtime_image && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs evidence'"
             fi
             exit "$exit_code"
@@ -345,7 +394,7 @@ jobs:
             fi
             old_runtime_image="$(active_image_ref)"
           fi
-          begin_evidence_payload="$(seal_cutover_evidence "$initial_evidence")"
+          begin_evidence_payload="$(seal_cutover_evidence "$initial_evidence" begin)"
           begin_payload="$(jq -nc \
             --arg oldRuntimeRelease "$old_release" \
             --arg oldSnapshot "$old_snapshot" \

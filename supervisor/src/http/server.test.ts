@@ -442,6 +442,74 @@ describe("coordinator-only server", () => {
     });
   });
 
+  it("keeps compact sealed cutover evidence recoverable through the 4000-character HTTP bound", async () => {
+    const descriptor = buildInstalledRuntimeDescriptor("deploy-evidence-test/v1");
+    const runtime = { listLabeledResources: vi.fn(async () => []) } as unknown as ServerRuntime;
+    const server = app({
+      runtime,
+      pipelineCoordinator: { catalog: {} as never, runtime: descriptor, store: pipelines },
+    });
+    const blockers = Array.from({ length: 50 }, (_, index) => ({
+      id: `session-${index}`,
+      reason: "drain blocker ".repeat(80),
+    }));
+    const oversizedInitialEvidence = JSON.stringify({
+      admission: { paused: 0, epoch: 7 },
+      runtime: { release: descriptor.descriptor.release, capabilityDigest: descriptor.digest },
+      snapshot: "snapshot",
+      drain: { clear: false, blockers },
+    });
+    expect(oversizedInitialEvidence.length).toBeGreaterThan(4_000);
+    const compactSeal = JSON.stringify({
+      schema: "openthrottle.cutover-evidence/v1",
+      event: "begin",
+      source_sha256: `sha256:${"a".repeat(64)}`,
+      summary: {
+        admission: { paused: 0, epoch: 7 },
+        runtime: { release: descriptor.descriptor.release, capabilityDigest: descriptor.digest },
+        snapshot: "snapshot",
+        drain: { clear: false, blocker_count: 50 },
+      },
+      sealed_old_runtime: {
+        old_runtime_capability_digest: descriptor.digest,
+        old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
+      },
+    });
+    expect(compactSeal.length).toBeLessThan(4_000);
+
+    const begin = await server.request("/deployment/cutover/begin", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        oldRuntimeRelease: descriptor.descriptor.release,
+        oldSnapshot: "snapshot",
+        candidateSnapshot: "openthrottle-v2-ce-new",
+        evidence: compactSeal,
+      }),
+    });
+    const beginBody = await begin.json() as { cutover: { id: string; evidence: string } };
+    expect(JSON.parse(beginBody.cutover.evidence).sealed_old_runtime).toEqual({
+      old_runtime_capability_digest: descriptor.digest,
+      old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
+    });
+
+    const paused = await server.request("/deployment/cutover/advance", {
+      method: "POST",
+      headers: { Authorization: "Bearer deploy-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        id: beginBody.cutover.id,
+        phase: "paused",
+        pauseEpoch: 8,
+        evidence: JSON.stringify({ ...JSON.parse(compactSeal), event: "paused" }),
+      }),
+    });
+    const pausedBody = await paused.json() as { cutover: { evidence: string } };
+    expect(JSON.parse(pausedBody.cutover.evidence).sealed_old_runtime).toEqual({
+      old_runtime_capability_digest: descriptor.digest,
+      old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
+    });
+  });
+
   it("reports coordinator status without execution-mode compatibility fields", async () => {
     seedTicket();
     const response = await app().request("/status", {
