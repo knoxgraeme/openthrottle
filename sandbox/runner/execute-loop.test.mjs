@@ -3422,6 +3422,153 @@ describe("executeLoopAction", () => {
     });
   });
 
+  it("corrects a read-only lead needs_human receipt missing subject.post to the sealed candidate subject", () => {
+    const integrationRepoDir = repository();
+    const candidateSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: integrationRepoDir,
+      encoding: "utf8",
+    }).trim();
+    const valid = validateLoopRequest(leadRequest({ candidateSubject, skill: "accept-unit" }));
+    const goodReceipt = {
+      schema: "openthrottle.receipt/v1",
+      type: "unit_decision",
+      assurance: "semantic_attested",
+      result: "needs_human",
+      producer: {
+        worker_id: "worker-1",
+        skill: "builtin://accept-unit@1",
+        capability_digest: "c".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: {
+        base: candidateSubject,
+        pre: candidateSubject,
+        post: candidateSubject,
+      },
+      fence: {
+        pipeline_instance_id: "instance-1",
+        graph_digest: "a".repeat(64),
+        unit_id: valid.unitId,
+        attempt_id: valid.attemptId,
+        parent_run_id: valid.parentRunId ?? "run-1",
+        action_attempt_id: valid.actionId,
+        generation: 1,
+        native_session_id: valid.nativeSessionId,
+        request_hash: valid.requestHash,
+      },
+      evidence: ["candidate is ambiguous"],
+      payload: {
+        rationale: "The candidate does not clearly satisfy the unit; a human should decide.",
+        context_updates: [],
+      },
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+    // The agent-authored receipt omits subject.post entirely -- the executor
+    // must recover it from the sealed candidateSubject, never infer it.
+    const badReceipt = { ...goodReceipt, subject: { base: candidateSubject, pre: candidateSubject } };
+
+    const result = executeLoopAction({
+      request: valid,
+      integrationRepoDir,
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: canonicalJson(badReceipt),
+        stderr: "",
+        nativeSessionId: null,
+        integrationRepoDir,
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result).toMatchObject({
+      outcome: "success",
+      subject: candidateSubject,
+    });
+    expect(JSON.parse(result.receipt)).toEqual(goodReceipt);
+    const correctionState = JSON.parse(readFileSync(join(
+      process.env.OT_LOOP_ACTION_ROOT,
+      valid.attemptId,
+      valid.actionId,
+      "receipt-correction.json",
+    ), "utf8"));
+    expect(correctionState.diagnostics).toContainEqual(expect.objectContaining({ pointer: "/subject/post" }));
+    expect(correctionState.subject).toBe(candidateSubject);
+  });
+
+  it("corrects a read-only lead receipt with a mismatched subject.post to the sealed candidate subject", () => {
+    const integrationRepoDir = repository();
+    const candidateSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: integrationRepoDir,
+      encoding: "utf8",
+    }).trim();
+    const valid = validateLoopRequest(leadRequest({ candidateSubject, skill: "accept-unit" }));
+    const goodReceipt = {
+      schema: "openthrottle.receipt/v1",
+      type: "unit_decision",
+      assurance: "semantic_attested",
+      result: "accept",
+      producer: {
+        worker_id: "worker-1",
+        skill: "builtin://accept-unit@1",
+        capability_digest: "c".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: {
+        base: candidateSubject,
+        pre: candidateSubject,
+        post: candidateSubject,
+      },
+      fence: {
+        pipeline_instance_id: "instance-1",
+        graph_digest: "a".repeat(64),
+        unit_id: valid.unitId,
+        attempt_id: valid.attemptId,
+        parent_run_id: valid.parentRunId ?? "run-1",
+        action_attempt_id: valid.actionId,
+        generation: 1,
+        native_session_id: valid.nativeSessionId,
+        request_hash: valid.requestHash,
+      },
+      evidence: ["accepted exact candidate"],
+      payload: {
+        rationale: "Candidate matches the unit.",
+        context_updates: [],
+        accepted_subject: candidateSubject,
+      },
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+    const badReceipt = { ...goodReceipt, subject: { ...goodReceipt.subject, post: "9".repeat(40) } };
+
+    const result = executeLoopAction({
+      request: valid,
+      integrationRepoDir,
+      runLoopAgent: () => ({
+        status: 0,
+        signal: null,
+        timedOut: false,
+        stdout: canonicalJson(badReceipt),
+        stderr: "",
+        nativeSessionId: null,
+        integrationRepoDir,
+      }),
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(result).toMatchObject({
+      outcome: "success",
+      subject: candidateSubject,
+    });
+    expect(JSON.parse(result.receipt)).toEqual(goodReceipt);
+  });
+
   it("redacts a materialized credential from the failure receipt even when it never touched this process's own env", () => {
     const lockWorkerWorktree = vi.fn();
     const lockActionDirectory = vi.fn();
@@ -4143,7 +4290,10 @@ describe("executeLoopAction", () => {
 
     expect(result.outcome).toBe("needs_human");
     expect(result.native_session_id).toBe("native-review");
-    expect(result.subject).toBeNull();
+    // Even though correction is refused (a genuine semantic defect, not an
+    // envelope mismatch), the executor still knows the reviewer's sealed read
+    // subject and reports it rather than dropping it to null.
+    expect(result.subject).toBe(subject);
     expect(runLoopAgent).toHaveBeenCalledTimes(1);
     expect(result.receipt).toContain("cannot invent or replace semantic receipt content");
     expect(result.receipt).toContain("private_recovery_artifact=");
@@ -4875,6 +5025,90 @@ describe("executeLoopAction", () => {
     expect(resumed.outcome).toBe("success");
     expect(resumed.native_session_id).toBe("native-correction");
     expect(resumed.codex_auth_json).toBe(rotatedCodexAuth);
+    expect(resumedRunLoopAgent).not.toHaveBeenCalled();
+    expect(JSON.parse(resumed.receipt)).toEqual(goodReceipt);
+  });
+
+  it("retains the sealed candidate as the authoritative post subject for a read-only lead across a persisted correction resume", () => {
+    const integrationRepoDir = repository();
+    const candidateSubject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: integrationRepoDir,
+      encoding: "utf8",
+    }).trim();
+    const valid = validateLoopRequest(leadRequest({ candidateSubject, skill: "accept-unit" }));
+    const goodReceipt = {
+      schema: "openthrottle.receipt/v1",
+      type: "unit_decision",
+      assurance: "semantic_attested",
+      result: "needs_human",
+      producer: {
+        worker_id: "worker-1",
+        skill: "builtin://accept-unit@1",
+        capability_digest: "c".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: {
+        base: candidateSubject,
+        pre: candidateSubject,
+        post: candidateSubject,
+      },
+      fence: {
+        pipeline_instance_id: "instance-1",
+        graph_digest: "a".repeat(64),
+        unit_id: valid.unitId,
+        attempt_id: valid.attemptId,
+        parent_run_id: valid.parentRunId ?? "run-1",
+        action_attempt_id: valid.actionId,
+        generation: 1,
+        native_session_id: valid.nativeSessionId,
+        request_hash: valid.requestHash,
+      },
+      evidence: ["candidate is ambiguous"],
+      payload: {
+        rationale: "The candidate does not clearly satisfy the unit; a human should decide.",
+        context_updates: [],
+      },
+      issued_at: "2026-07-29T00:00:00.000Z",
+    };
+    const badReceipt = { ...goodReceipt, subject: { base: candidateSubject, pre: candidateSubject } };
+    const firstRunLoopAgent = vi.fn().mockReturnValueOnce({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: canonicalJson(badReceipt),
+      stderr: "",
+      nativeSessionId: null,
+      integrationRepoDir,
+    });
+
+    const first = executeLoopAction({
+      request: valid,
+      integrationRepoDir,
+      runLoopAgent: firstRunLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(first).toMatchObject({ outcome: "success", subject: candidateSubject });
+    expect(firstRunLoopAgent).toHaveBeenCalledTimes(1);
+
+    const resumedRunLoopAgent = vi.fn(() => {
+      throw new Error("persisted deterministic correction must not relaunch the agent");
+    });
+
+    const resumed = executeLoopAction({
+      request: valid,
+      integrationRepoDir,
+      runLoopAgent: resumedRunLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      now: () => "2026-07-29T00:00:01.000Z",
+    });
+
+    expect(resumed).toMatchObject({ outcome: "success", subject: candidateSubject });
     expect(resumedRunLoopAgent).not.toHaveBeenCalled();
     expect(JSON.parse(resumed.receipt)).toEqual(goodReceipt);
   });
