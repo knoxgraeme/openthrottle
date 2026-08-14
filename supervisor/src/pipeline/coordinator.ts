@@ -20,7 +20,7 @@ import type {
   PipelineStore,
 } from "./store.js";
 import { TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES } from "./evidence-limits.js";
-import { buildStageRequest, plannedStageRunId } from "./stage-request.js";
+import { buildStageRequest, plannedStageRunId, type StageRequestInputArtifact } from "./stage-request.js";
 import {
   accumulatedPublicationFindings,
   accumulatedPublicationRepairSource,
@@ -401,7 +401,10 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     ? nativeSessionId
     : null;
   if (!input.attempt.request_payload) throw new Error(`pipeline attempt ${input.attempt.id} has no sealed request`);
-  const priorRequest = JSON.parse(input.attempt.request_payload) as { taskContext?: unknown };
+  const priorRequest = JSON.parse(input.attempt.request_payload) as {
+    taskContext?: unknown;
+    inputArtifacts?: StageRequestInputArtifact[];
+  };
   const priorTaskContext = typeof priorRequest.taskContext === "string" ? priorRequest.taskContext : "";
   // Tune stages pass only the immediately preceding, already gate-validated
   // artifacts through the next sealed request. This is the deterministic data
@@ -416,7 +419,9 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
       payload: artifact.payload,
       hash: artifact.hash,
     })).sort((left, right) => left.kind.localeCompare(right.kind))
-    : undefined;
+    : Array.isArray(priorRequest.inputArtifacts)
+      ? priorRequest.inputArtifacts
+      : undefined;
   const taskContext = input.instance.task_type === "tune"
     ? "Supervisor-sealed tune evidence is carried only by inputArtifacts."
     : priorTaskContext;

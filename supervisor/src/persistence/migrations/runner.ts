@@ -3,6 +3,13 @@ import { databaseMigrations } from "./definitions.js";
 
 export { databaseMigrations } from "./definitions.js";
 
+export const ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX = " [rollback-compatible:additive/v1]";
+export const MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT = "schema-migrations-name-additive-rollback-compatible/v1";
+
+function isMarkedRollbackCompatibleFutureMigration(name: string): boolean {
+  return name.endsWith(ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX);
+}
+
 export function applyDatabaseMigrations(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -17,14 +24,36 @@ export function applyDatabaseMigrations(db: Database.Database): void {
       "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
     ).all() as Array<{ version: number; name: string; checksum: string }>;
     const latestKnown = databaseMigrations.at(-1)?.version ?? 0;
-    const future = applied.find((row) => row.version > latestKnown);
-    if (future) {
-      throw new Error(`database has newer schema version ${future.version}; this release supports ${latestKnown}`);
-    }
+    let hasFutureMigration = false;
     for (const row of applied) {
       const expected = databaseMigrations.find((migration) => migration.version === row.version);
-      if (!expected || row.name !== expected.name || row.checksum !== expected.checksum) {
+      if (expected) {
+        if (row.name !== expected.name || row.checksum !== expected.checksum) {
+          throw new Error(`schema migration ${row.version} checksum mismatch`);
+        }
+        continue;
+      }
+      if (row.version > latestKnown && isMarkedRollbackCompatibleFutureMigration(row.name)) {
+        hasFutureMigration = true;
+        continue;
+      }
+      if (row.version > latestKnown) {
+        throw new Error(
+          `database has incompatible newer schema version ${row.version}; this release supports ${latestKnown}`
+        );
+      }
+      if (!expected) {
         throw new Error(`schema migration ${row.version} checksum mismatch`);
+      }
+    }
+    if (hasFutureMigration) {
+      const missing = databaseMigrations.find(
+        (migration) => !applied.some((row) => row.version === migration.version)
+      );
+      if (missing) {
+        throw new Error(
+          `database has rollback-compatible future migrations but is missing known schema migration ${missing.version}`
+        );
       }
     }
     return applied;

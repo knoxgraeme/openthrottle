@@ -319,6 +319,13 @@ describe("coordinator-only server", () => {
       admission: { paused: 1, reason: "v12 cutover drain" },
       runtime: { release: descriptor.descriptor.release, capabilityDigest: descriptor.digest },
       snapshot: "snapshot",
+      database: {
+        migrationRollbackCompatibility: {
+          contract: "schema-migrations-name-additive-rollback-compatible/v1",
+          markerField: "schema_migrations.name",
+          markerSuffix: " [rollback-compatible:additive/v1]",
+        },
+      },
       drain: { clear: true, blockers: [], truncated: false },
     });
     expect(runtime.listLabeledResources).toHaveBeenCalledWith(51);

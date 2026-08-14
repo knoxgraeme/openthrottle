@@ -5,10 +5,10 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import {
-  parseExecutionPlanContract,
+  parseAnyExecutionPlanContract,
   parseGraphContract,
   validateRepositoryConfigContract,
-  type ExecutionPlanContract,
+  type AnyExecutionPlanContract,
   type GraphContract,
   type RepositoryConfigContract,
   type ValidatedContract,
@@ -16,21 +16,32 @@ import {
 import { getErrorMessage } from "./util.js";
 
 export const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
+export const EXECUTION_PLAN_FENCE_V2 = "openthrottle.execution-plan/v2";
+const EXECUTION_PLAN_FENCES = [EXECUTION_PLAN_FENCE, EXECUTION_PLAN_FENCE_V2];
 
 export interface ExecutionPlanBlock {
   json: string;
+  schema: string;
   start: number;
   end: number;
 }
 
 export interface ValidationResult {
-  plan: ValidatedContract<ExecutionPlanContract>;
+  plan: ValidatedContract<AnyExecutionPlanContract>;
   coverage: {
     units: number;
-    instruction_refs: number;
-    acceptance_refs: number;
     commands: string[];
-  };
+  } & (
+    | { schema: typeof EXECUTION_PLAN_FENCE; instruction_refs: number; acceptance_refs: number }
+    | {
+        schema: typeof EXECUTION_PLAN_FENCE_V2;
+        requirement_count: number;
+        file_count: number;
+        test_count: number;
+        acceptance_count: number;
+        verification_count: number;
+      }
+  );
 }
 
 export interface LocalGraphSelection {
@@ -76,30 +87,68 @@ export function extractExecutionPlanBlocks(markdown: string): ExecutionPlanBlock
   const blocks: ExecutionPlanBlock[] = [];
   for (const match of markdown.matchAll(FENCE_PATTERN)) {
     const marker = match[1]?.trim().split(/\s+/) ?? [];
-    if (!marker.includes(EXECUTION_PLAN_FENCE)) continue;
+    const markerSchemas = EXECUTION_PLAN_FENCES.filter((fence) => marker.includes(fence));
+    if (markerSchemas.length === 0) continue;
+    if (markerSchemas.length > 1) {
+      throw new Error(`execution-plan fence declares multiple schemas: ${markerSchemas.join(", ")}`);
+    }
     const json = match[2]?.trim() ?? "";
-    blocks.push({ json, start: match.index ?? 0, end: (match.index ?? 0) + match[0].length });
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(json) as unknown;
+    } catch {
+      throw new Error(`${markerSchemas[0]} block must contain valid JSON`);
+    }
+    const payloadSchema = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as { schema?: unknown }).schema
+      : undefined;
+    if (payloadSchema !== markerSchemas[0]) {
+      throw new Error(`${markerSchemas[0]} block payload schema must be ${markerSchemas[0]}`);
+    }
+    blocks.push({ json, schema: markerSchemas[0]!, start: match.index ?? 0, end: (match.index ?? 0) + match[0].length });
   }
   return blocks;
 }
 
+function coverageFor(plan: AnyExecutionPlanContract): ValidationResult["coverage"] {
+  const commands = plan.commands.map((command) => command.name);
+  if (plan.schema === EXECUTION_PLAN_FENCE_V2) {
+    return {
+      schema: EXECUTION_PLAN_FENCE_V2,
+      units: plan.units.length,
+      requirement_count: plan.units.reduce((count, unit) => count + unit.requirements.length, 0),
+      file_count: plan.units.reduce((count, unit) => count + unit.files.length, 0),
+      test_count: plan.units.reduce((count, unit) => count + unit.tests.length, 0),
+      acceptance_count: plan.units.reduce((count, unit) => count + unit.acceptance.length, 0),
+      verification_count: plan.units.reduce((count, unit) => count + unit.verification.length, 0),
+      commands,
+    };
+  }
+  return {
+    schema: EXECUTION_PLAN_FENCE,
+    units: plan.units.length,
+    instruction_refs: Object.keys(plan.instructions).length,
+    acceptance_refs: Object.keys(plan.acceptance).length,
+    commands,
+  };
+}
+
 export function readExecutionPlanFromMarkdown(
   markdown: string,
-  source = "plan"
+  source = "plan",
+  options: { allowLegacyV1?: boolean } = {}
 ): ValidationResult {
   const blocks = extractExecutionPlanBlocks(markdown);
   if (blocks.length !== 1) {
-    throw new Error(`${source}: expected exactly one ${EXECUTION_PLAN_FENCE} block, found ${blocks.length}`);
+    throw new Error(`${source}: expected exactly one execution-plan block, found ${blocks.length}`);
   }
-  const plan = parseExecutionPlanContract(blocks[0]!.json, { source: `${source}.execution_plan` });
+  if (!options.allowLegacyV1 && blocks[0]!.schema === EXECUTION_PLAN_FENCE) {
+    throw new Error(`${source}: fresh execution plans must use ${EXECUTION_PLAN_FENCE_V2}; ${EXECUTION_PLAN_FENCE} is replay-only`);
+  }
+  const plan = parseAnyExecutionPlanContract(blocks[0]!.json, { source: `${source}.execution_plan` });
   return {
     plan,
-    coverage: {
-      units: plan.value.units.length,
-      instruction_refs: Object.keys(plan.value.instructions).length,
-      acceptance_refs: Object.keys(plan.value.acceptance).length,
-      commands: plan.value.commands.map((command) => command.name),
-    },
+    coverage: coverageFor(plan.value),
   };
 }
 
@@ -453,7 +502,7 @@ export function prepareExecutionPlanFile(
   const original = readFileSync(file, "utf8");
   const before = extractExecutionPlanBlocks(original);
   if (before.length > 1) {
-    throw new Error(`${file}: expected at most one ${EXECUTION_PLAN_FENCE} block before prepare, found ${before.length}`);
+    throw new Error(`${file}: expected at most one execution-plan block before prepare, found ${before.length}`);
   }
   const isolatedDirectory = mkdtempSync(join(tmpdir(), "openthrottle-prepare-"));
   const isolatedFile = join(isolatedDirectory, basename(file));
@@ -479,6 +528,11 @@ export function prepareExecutionPlanFile(
       throw new Error(`${file}: prepare modified content outside the execution-plan block`);
     }
     const result = readExecutionPlanFromMarkdown(prepared, file);
+    if (result.plan.value.schema !== EXECUTION_PLAN_FENCE_V2) {
+      throw new Error(
+        `${file}: prepare must produce a ${EXECUTION_PLAN_FENCE_V2} block, found ${result.plan.value.schema}`
+      );
+    }
     if (result.plan.value.graph_id !== graph.graphId) {
       throw new Error(`${file}: execution_plan.graph_id must match selected graph ${graph.graphId}`);
     }
@@ -507,7 +561,10 @@ function printValidation(result: ValidationResult, json: boolean): void {
   else {
     console.log(`ok ${body.schema}`);
     console.log(`digest ${body.digest}`);
-    console.log(`coverage units=${body.coverage.units} instructions=${body.coverage.instruction_refs} acceptance=${body.coverage.acceptance_refs}`);
+    const coverage = body.coverage.schema === EXECUTION_PLAN_FENCE_V2
+      ? `coverage units=${body.coverage.units} requirements=${body.coverage.requirement_count} files=${body.coverage.file_count} tests=${body.coverage.test_count} acceptance=${body.coverage.acceptance_count} verification=${body.coverage.verification_count}`
+      : `coverage units=${body.coverage.units} instructions=${body.coverage.instruction_refs} acceptance=${body.coverage.acceptance_refs}`;
+    console.log(coverage);
   }
 }
 
