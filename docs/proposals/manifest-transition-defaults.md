@@ -1,6 +1,6 @@
 # Proposal: manifest transition defaults
 
-**Status:** draft, for review
+**Status:** implemented — `defaults.transitions` and `defaults.retry` are part of the `openthrottle.pipeline/v1` manifest contract (see docs/SPEC.md, "Manifest and catalog contract"; `same_as` was dropped in review and is reserved/rejected)
 **Scope:** authoring ergonomics for `openthrottle.pipeline/v1` manifests
 **Risk:** low — no coordinator, store, or sandbox changes
 

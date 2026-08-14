@@ -26,8 +26,9 @@ the entrypoint:
 - `gh` is authenticated against `GITHUB_REPO`.
 - `~/.ot/linear-context.md` contains the signed Linear delegation context.
 - `ot-activity` writes structured updates for Fly to publish as OpenThrottle.
-- `OT_CE_PIPELINE` declares the native Compound Engineering skills expected for
-  this task. OpenThrottle adapters enforce product boundaries around them.
+- `OT_CE_PIPELINE` carries the sealed capability id for this stage (the
+  `.capability` field of the sealed stage request). The variable name is
+  historical and implies no Compound Engineering dependency.
 
 You do **not** have a Daytona API key, a Fly key, or any webhook secret —
 you were never given them. Don't go looking for them.
@@ -99,11 +100,6 @@ publish through another surface unless this is the publication stage.
   decisions" section listing each judgment call made without asking.
 
 ## Which skill you're running
-
-- `implement-plan` — one of planning, implementation, semantic review,
-  simplification, or publication, as named by the sealed capability.
-- `investigate` — one investigation or publication stage, as named by the
-  sealed capability.
 
 Whichever skill you were invoked with, it was named via `$<skill-name>` at
 the top of your prompt and its full body is loaded automatically from your

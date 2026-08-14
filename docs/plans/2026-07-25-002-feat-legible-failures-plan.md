@@ -2,6 +2,7 @@
 title: "Legible failures: enriched check-failure snapshots and deep ticket status - Plan"
 type: feat
 date: 2026-07-25
+status: shipped
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
 execution: code

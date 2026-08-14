@@ -2,6 +2,7 @@
 title: "Manifest transition defaults and neutral pipeline IDs - Plan"
 type: refactor
 date: 2026-07-25
+status: shipped
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
 execution: code

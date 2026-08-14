@@ -83,8 +83,8 @@ ran locally.
 ## Architecture: two collaborators with a hard split
 
 The whole system is split between a **deterministic outer state machine (Fly
-supervisor)** and **agent reasoning inside the sandbox (native Compound
-Engineering / "CE")**. Keep new logic on the correct side:
+supervisor)** and **agent reasoning inside the sandbox (self-contained
+OpenThrottle skills)**. Keep new logic on the correct side:
 
 - **`supervisor/`** — Hono + `better-sqlite3` control plane deployed on Fly.
   `src/index.ts` is the only top-level production module and composition root:
@@ -142,9 +142,12 @@ Engineering / "CE")**. Keep new logic on the correct side:
   `skills/README.md` before editing anything here.
 
 - **`cli/`** — the published `openthrottle` package (`src/index.ts` is a plain
-  argv router, no framework). Commands: `setup`, `init`, `ship <file.md>`,
-  `status`, `stop <ticket>`, `logs <ticket>`. `init` registers the GitHub
-  repo + Linear-team route and writes `.openthrottle.yml`; it requires
+  argv router, no framework). Commands: `setup`, `init`, `plan validate
+  <file.md>`, `plan prepare <file.md>`, `validate <file.md>` (alias for
+  `plan validate`), `ship <file.md>`, `status`, `stop <ticket>`,
+  `logs <ticket>`, `analysis`, and `operator-skill`. `init` registers the
+  GitHub repo with either a Linear-team or a GitHub-Issue control route (the
+  two are equal routing options) and writes `.openthrottle.yml`; it requires
   `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN`.
 
 ## Invariants worth knowing before you change things

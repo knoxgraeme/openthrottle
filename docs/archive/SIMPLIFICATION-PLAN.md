@@ -1,3 +1,5 @@
+> **Archived:** describes the retired pre-coordinator direct-task architecture; kept as provenance only.
+
 # Pipeline simplification plan
 
 > **Historical design record:** this plan describes the retired direct-task

@@ -129,9 +129,12 @@ Assurance classes are `semantic_attested`,
 `semantic_corroborated`, `executor_verified`, `provider_verified`, and
 `human_approved`. An evaluator may accept only its declared assurance class.
 
-Platform-authored pipelines use the `core/` namespace. CE remains the default
-skill pack, but the `ce/` namespace is reserved for capability IDs such as
-`core/implement@4`, `ce/review@1`, and `ce/publish@1`.
+Platform-authored pipeline manifests use the `core/` namespace (for example
+`core/implement@4`). The `ce/` prefix survives only as a historical
+capability-id namespace (`ce/implement@1`, `ce/review@1`, `ce/publish@1`, and
+peers in the runtime capability descriptor); it implies no Compound
+Engineering dependency — the skills behind those capabilities are
+self-contained OpenThrottle adapters.
 
 Repository-authored graphs may reference committed repository skills only
 through `repo://<skill-id>`. The repository config owns the allowlist that maps
@@ -544,11 +547,6 @@ config, or rotated Codex auth state: the same per-action-attempt namespacing,
 deletion, and tree relock that isolate worktrees and native sessions (above)
 cover this material too.
 
-RU5/RU6 do not validate standard receipt authority, activate the structured
-reducer, or compose production child execution. Those contracts remain
-fail-closed until their owning RU7, RU8/RU9, and RU9/RU11 slices install
-them.
-
 The supervisor also accepts run-bound `activity`, `plan`, and `heartbeat`
 events. Every event is checked against the current ticket run and pipeline
 attempt before processing; late events from older actors are discarded.
@@ -753,8 +751,11 @@ sentence, or links rendered after it.
 | `GET` | `/oauth/install` | `OT_INSTALL_SECRET` bearer | begin Linear OAuth |
 | `GET` | `/oauth/callback` | one-time OAuth state | exchange and store installation |
 | `GET` | `/status` | `OT_STATUS_TOKEN` bearer | tickets and pipeline/effect/publication state |
+| `GET` | `/status/journal` | `OT_STATUS_TOKEN` bearer | orchestration journal entries filtered by issue or repository |
 | `GET` | `/capabilities` | `OT_STATUS_TOKEN` bearer | active runtime release, capability digest/IDs, and effective limits |
 | `GET` | `/deployment/cutover-evidence` | `OT_DEPLOY_TOKEN` bearer | bounded, fail-closed admission drain plus runtime, snapshot, and migration rollback-compatibility identity |
+| `POST` | `/deployment/cutover/begin` | `OT_DEPLOY_TOKEN` bearer | open a snapshot cutover record with old runtime/snapshot identity, candidate snapshot, and evidence |
+| `POST` | `/deployment/cutover/advance` | `OT_DEPLOY_TOKEN` bearer | advance, complete, or mark recovery on the open cutover with phase evidence and pause-epoch checks |
 | `POST` | `/maintenance/admission/pause` | `OT_DEPLOY_TOKEN` bearer | pause new admission and advance the maintenance epoch before deploy drain |
 | `POST` | `/maintenance/admission/resume` | `OT_DEPLOY_TOKEN` bearer | resume new admission after cutover evidence is clear |
 | `GET` | `/analysis/runs` | `OT_STATUS_TOKEN` bearer | read-only, filterable `run_outcomes` evidence for improvement proposals |
@@ -764,6 +765,7 @@ sentence, or links rendered after it.
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | coordinator stop |
 | `POST` | `/tickets/:id/steer` | `OT_STATUS_TOKEN` bearer | capture or queue steering |
 | `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized live or durable bounded logs |
+| `GET` | `/tickets/:id/journal` | `OT_STATUS_TOKEN` bearer | orchestration journal entries for one ticket |
 | `POST` | `/tickets/:id/publications/:publicationId/retry` | `OT_STATUS_TOKEN` bearer | reopen a failed receipt |
 
 Bearer tokens are compared by hashed value with timing-safe equality. Webhook

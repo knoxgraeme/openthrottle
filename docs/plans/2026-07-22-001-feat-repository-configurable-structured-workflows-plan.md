@@ -2,6 +2,7 @@
 title: "Repository-configurable execution graphs - Plan"
 type: feat
 date: 2026-07-22
+status: shipped
 deepened: 2026-07-22
 regrounded: 2026-07-28
 artifact_contract: ce-unified-plan/v1
@@ -605,7 +606,7 @@ The U4a→U4b→U4c chain and U5 may proceed independently only after U1/U3 free
 - `docs/SPEC.md` — normative PR #36 pipeline, stage, gate, effect, runtime, publication, and persistence contracts.
 - `docs/PLAN.md` — completed coordinator cutover and current POC boundary.
 - `docs/plans/2026-07-21-001-feat-configurable-agentic-pipeline-coordinator-plan.md` — implemented predecessor and explicit no-fan-out boundary.
-- `docs/AGENTIC-LOOP-REVIEW.md` — original findings and current cutover re-audit.
+- `docs/archive/AGENTIC-LOOP-REVIEW.md` — original findings and current cutover re-audit.
 - `supervisor/pipelines/catalog.yaml` and `supervisor/pipelines/core-implement-v4.yaml` — the current default (`implement → core/implement@4`), whose true shape is 11 stages: a forward path `implementation → semantic_review → simplification → post_simplify_review → test → lint → build → publish → provider` (with `implementation` self-looping on `semantic_repair_required` and terminating `failed` on `failure`, and a conditional `post_simplify_review`), plus a conditional `repair_implementation → repair_semantic_review` side-loop entered when a downstream stage (`semantic_review`, `simplification`, `post_simplify_review`, `test`, `lint`, `build`, `provider`) returns `failure`/`semantic_repair_required`, rejoining at `test`. The `simple` graph must reproduce this **behaviorally** (re-pinned to a new digest, not byte-for-byte), emitting all three first-class repair-budget fields: top-level `max_repair_rounds: 5` (global), per-transition `max_reentries` (scoped), and `max_attempts: 200`.
 - `supervisor/src/pipeline/manifest.ts` — strict manifest/config schema, installed executor/evaluator/artifact vocabulary, normalized digests, and the closed `COMMAND_NAMES = [test, lint, build, format]` enum that R32/KTD12 turns into a named map.
 - `supervisor/src/pipeline/coordinator.ts`, `supervisor/src/pipeline/store.ts`, the SQLite implementations under `supervisor/src/persistence/pipeline/`, and `supervisor/src/operations/pipeline-effects.ts` — pure reduction, durable attempts/effects, one runtime resource, the current single-stage dispatch seam, and the three-tier repair budget (`instance.reentry_count` vs `manifest.max_repair_rounds`; `targetState.reentry_count` vs transition `max_reentries`; `instance.attempt_count` vs `manifest.max_attempts`) the child reducer parametrizes.
@@ -1006,7 +1007,7 @@ The U4a→U4b→U4c chain and U5 may proceed independently only after U1/U3 free
 - Modify `.openthrottle.yml` and add one repository graph under `.openthrottle/graphs/` — define canonical intents, commands, limits, MCP inventory, simple default, and an explicit structured canary.
 - Modify `sandbox/tests/smoke.sh`, `.github/workflows/ci.yml`, and lifecycle fixtures — cover simple parity, structured serial units, repair, stop, restart, and one publication subject.
 - Add `docs/runbooks/execution-graphs-rollout.md`; modify `README.md`, `sandbox/README.md`, `supervisor/README.md`, and CLI help.
-- Update `docs/AGENTIC-LOOP-REVIEW.md` with a post-feature audit, retaining findings not actually resolved by PR #36 or this implementation.
+- Update `docs/archive/AGENTIC-LOOP-REVIEW.md` with a post-feature audit, retaining findings not actually resolved by PR #36 or this implementation.
 
 **Approach:**
 

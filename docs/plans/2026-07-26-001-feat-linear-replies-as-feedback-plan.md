@@ -2,6 +2,7 @@
 title: "Linear replies during provider waits become feedback - Plan"
 type: feat
 date: 2026-07-26
+status: shipped
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
 execution: code

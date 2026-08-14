@@ -1,3 +1,5 @@
+> **Archived:** describes the retired pre-coordinator architecture and cites files that no longer exist; kept as provenance only.
+
 ## Code Review Results
 
 > **Historical review record:** file paths and scheduler/direct-run findings
@@ -68,7 +70,7 @@ The strongest consolidation path is:
 
 ### Requirements Completeness
 
-The discovered plan is inferred from `docs/SIMPLIFICATION-PLAN.md`, so this checklist informs the review but does not independently block it.
+The discovered plan is inferred from `docs/archive/SIMPLIFICATION-PLAN.md`, so this checklist informs the review but does not independently block it.
 
 - Partial: Phase 1 removed internal review loops and moved feedback to same-session resume, but #4, #7, #17, and #22 prevent reliable bounded delivery.
 - Partial: Phase 2 extracted scheduler/event/lifecycle modules, but #32 shows the promised registry does not drive transitions and several current transitions remain non-durable.

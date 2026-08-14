@@ -2,6 +2,7 @@
 title: Configurable Agentic Pipeline Coordinator
 type: feat
 date: 2026-07-21
+status: shipped
 deepened: 2026-07-21
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
@@ -105,7 +106,7 @@ The new design must preserve OpenThrottle's hard role split: Linear is the human
 
 - R28. Existing active and PR-waiting tickets must remain explicitly marked legacy until they drain or a human re-delegates them. New pipeline instances launch behind a cutover flag; silent mid-loop conversion is prohibited.
 - R29. Pipeline manifests may narrow logical credential capabilities but cannot grant authority. The executable capability declares minimum needs, installation/operator policy defines the maximum grant, repository config cannot expand it, and the authorized envelope carries only their permitted intersection as logical scope IDs. Manifests must never contain Daytona secret identifiers or values; credential materialization stays behind the sandbox-runtime provider boundary.
-- R30. The final cutover must rerun every finding in `docs/AGENTIC-LOOP-REVIEW.md`, mark each prerequisite/resolved/deferred/obsolete disposition with evidence, and keep unresolved credential trust work visible rather than treating replacement of a code path as resolution.
+- R30. The final cutover must rerun every finding in `docs/archive/AGENTIC-LOOP-REVIEW.md`, mark each prerequisite/resolved/deferred/obsolete disposition with evidence, and keep unresolved credential trust work visible rather than treating replacement of a code path as resolution.
 
 ### Key Flows
 
@@ -475,9 +476,9 @@ Before canary, name primary and backup owners for release/flag control, database
 
 ### Sources and Research
 
-- `docs/AGENTIC-LOOP-REVIEW.md` — original structural, reliability, and security audit that this plan must disposition and rerun.
+- `docs/archive/AGENTIC-LOOP-REVIEW.md` — original structural, reliability, and security audit that this plan must disposition and rerun.
 - `docs/SPEC.md` — current normative endpoint, persistence, sandbox, publication, and security contracts.
-- `docs/SIMPLIFICATION-PLAN.md` — role boundaries, CE adapter intent, consolidation history, and queue rationale.
+- `docs/archive/SIMPLIFICATION-PLAN.md` — role boundaries, CE adapter intent, consolidation history, and queue rationale.
 - `docs/PLAN.md` — current delivery/acceptance posture and agent-engine constraints.
 - `skills/README.md`, `skills/tasks/implement-plan/SKILL.md`, `sandbox/lib/runtime.sh`, `sandbox/entrypoint.sh`, and `supervisor/src/scheduler.ts` — current competing pipeline declarations.
 - [Linear agent interaction](https://linear.app/developers/agent-interaction) — validated activity types, Markdown activity bodies, and replaceable plan behavior.
@@ -496,8 +497,8 @@ Before canary, name primary and backup owners for release/flag control, database
 - **Files:**
   - `docs/SPEC.md`
   - `docs/PLAN.md`
-  - `docs/SIMPLIFICATION-PLAN.md`
-  - `docs/AGENTIC-LOOP-REVIEW.md`
+  - `docs/archive/SIMPLIFICATION-PLAN.md`
+  - `docs/archive/AGENTIC-LOOP-REVIEW.md`
   - `skills/README.md`
   - `skills/tasks/implement-plan/SKILL.md`
   - `sandbox/tests/ce-adapters.test.mjs`
@@ -505,7 +506,7 @@ Before canary, name primary and backup owners for release/flag control, database
   - `supervisor/src/scheduler.test.ts`
 - **Approach:**
   - Define the canonical vocabulary, role split, pipeline/catalog/stage/gate/artifact contracts, assurance classes, context policies, terminal outcomes, immutable-subject rule, publication acknowledgement semantics, and legacy cutover in `docs/SPEC.md` before code changes.
-  - Add an audit-disposition table to `docs/AGENTIC-LOOP-REVIEW.md` with one of `prerequisite`, `resolved by U-ID`, `orthogonal follow-up`, or `verified obsolete`, plus expected verification evidence. Do not mark findings resolved in U1.
+  - Add an audit-disposition table to `docs/archive/AGENTIC-LOOP-REVIEW.md` with one of `prerequisite`, `resolved by U-ID`, `orthogonal follow-up`, or `verified obsolete`, plus expected verification evidence. Do not mark findings resolved in U1.
   - Probe the exact pinned engine and CE-plugin installation path for named skill invocation, native session capture/resume, fresh review context, live steer hooks, structured result emission, and side effects. Record capability differences as data used by later catalog validation.
   - Correct the current adapter reference from `ce-simplify` to `ce-simplify-code` and make contract tests verify every referenced skill exists in the built snapshot.
   - Resolve documentation conflicts such as the current statement that v2 has no orchestrator: it has no reasoning orchestrator in the supervisor, but it will have a deterministic pipeline coordinator.
@@ -823,7 +824,7 @@ Before canary, name primary and backup owners for release/flag control, database
   - `.github/workflows/deploy.yml`
   - `docs/SPEC.md`
   - `docs/PLAN.md`
-  - `docs/AGENTIC-LOOP-REVIEW.md`
+  - `docs/archive/AGENTIC-LOOP-REVIEW.md`
   - `docs/runbooks/pipeline-coordinator-rollout.md`
 - **Approach:**
   - Encode the CE implement flow as manifest stages/transitions: planning, implementation, local semantic review, conditional simplification receipt, configured commands, exact-tree publish, provider wait, bounded current-head feedback repair, and terminal publication. Keep a stage atomic where U1 proved an engine cannot safely expose a finer boundary.
@@ -900,7 +901,7 @@ The final deployment gate consumes operator credentials and therefore remains ou
 - The comprehensive cross-domain legacy drain predicate—not only active-run count—remains zero through the required soak before legacy cleanup.
 - Activation, legacy-code removal, and destructive schema contraction are independent release decisions; previous-release compatibility and backup restoration are proven before crossing cleanup boundaries.
 - The full local contract suite, image smoke, real pinned-engine checks, and live deployment acceptance pass.
-- `docs/AGENTIC-LOOP-REVIEW.md` is rerun line by line with evidence, and deferred credential trust work remains explicit.
+- `docs/archive/AGENTIC-LOOP-REVIEW.md` is rerun line by line with evidence, and deferred credential trust work remains explicit.
 - Abandoned schemas, flags, adapters, false registries, compatibility shims, experimental branches, and dead code from unsuccessful approaches are removed before completion.
 - Product Contract preservation note: Product Contract unchanged after planning deepening; technical assumptions and sequencing were added without expanding the confirmed product scope.
 
