@@ -326,6 +326,7 @@ function readRuntimeDescriptor(container) {
 function createDockerSandboxRuntime(container) {
   const cachedLoopResults = new Map();
   const dispatchedLoopRequests = new Map();
+  const dispatchedChildExecutorRequests = new Map();
   const completedReviewPersonaActions = new Set();
   const lastReviewPersonaByParent = new Map();
   const cachedChildResults = new Map();
@@ -369,6 +370,7 @@ function createDockerSandboxRuntime(container) {
   return {
     counters,
     dispatchedLoopRequests,
+    dispatchedChildExecutorRequests,
     worktreeHandles,
     dispatchedWorktreeIds,
     resumedSessionWorktrees,
@@ -588,6 +590,7 @@ function createDockerSandboxRuntime(container) {
     async dispatchChildExecutorAction(_resource, request) {
       counters.dispatchChildExecutorAction += 1;
       if (request.worktree?.id) dispatchedWorktreeIds.add(request.worktree.id);
+      dispatchedChildExecutorRequests.set(`${request.attemptId}:${request.actionId}`, request);
       const requestPath = `${CHILD_EXECUTOR_DIR}/${request.attemptId}/${request.actionId}/request.json`;
       const outputPath = `${CHILD_EXECUTOR_DIR}/${request.attemptId}/${request.actionId}/result.json`;
       dockerWriteRootFile(container, requestPath, JSON.stringify(request));
@@ -976,6 +979,56 @@ async function runLoopAdapterReplayScenario({ db, container, fixture }) {
   log(`active-loop replay kept ${request.actionId} to one executor and a stateless restart collected its result`);
 }
 
+function assertRepairRequestsSeededFromPreviousCandidates({ pipelines, attemptId, runtime, durableBaseCommit }) {
+  const actions = pipelines.listWorkAttempts(attemptId);
+  const completedCandidates = new Map();
+  for (const action of actions) {
+    if (
+      action.action_kind === "candidate" &&
+      action.status === "completed" &&
+      action.output_subject &&
+      action.unit_id !== null
+    ) {
+      completedCandidates.set(`${action.unit_id}:${action.cycle}`, action.output_subject);
+    }
+  }
+  for (const repair of actions.filter((action) => action.action_kind === "repair" && action.status === "completed")) {
+    const rejectedCandidate = completedCandidates.get(`${repair.unit_id}:${repair.cycle - 1}`);
+    assert(rejectedCandidate, `repair ${repair.id} has no previous-cycle candidate output subject`);
+    const repairRequest = runtime.dispatchedLoopRequests.get(`${repair.parent_attempt_id}:${repair.id}`);
+    assert(repairRequest, `repair ${repair.id} had no captured loop request`);
+    assert(repairRequest.baseSubject === rejectedCandidate, `repair ${repair.id} baseSubject was not the previous candidate`);
+    assert(repairRequest.inputSubject === rejectedCandidate, `repair ${repair.id} inputSubject was not the previous candidate`);
+    assert(repairRequest.recoveryBaseSubject === durableBaseCommit, `repair ${repair.id} recoveryBaseSubject was not the durable base`);
+    assert(repairRequest.worktree?.id, `repair ${repair.id} had no worktree handle`);
+    assert(
+      runtime.worktreeHandles.get(repairRequest.worktree.id) === rejectedCandidate,
+      `repair ${repair.id} worktree base was not the previous candidate`
+    );
+    const sameCycleActions = actions.filter((action) =>
+      action.unit_id === repair.unit_id &&
+      action.cycle === repair.cycle &&
+      ["repair", "simplify", "command", "candidate", "lead"].includes(action.action_kind)
+    );
+    for (const action of sameCycleActions) {
+      const key = `${action.parent_attempt_id}:${action.id}`;
+      const request = action.action_kind === "command" || action.action_kind === "candidate"
+        ? runtime.dispatchedChildExecutorRequests.get(key)
+        : runtime.dispatchedLoopRequests.get(key);
+      assert(request, `${action.action_kind} ${action.id} had no captured request`);
+      assert(request.baseSubject === rejectedCandidate, `${action.action_kind} ${action.id} baseSubject was not the previous candidate`);
+      if (action.action_kind === "lead") {
+        assert(request.worktree === null, `lead ${action.id} unexpectedly used a worktree handle`);
+      } else {
+        assert(
+          request.worktree?.id === repairRequest.worktree.id,
+          `${action.action_kind} ${action.id} did not reuse the repair worktree handle`
+        );
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Scenario: happy path -- two ordered stub units through the full sequence,
 // including two consecutive deliberate command failures/repairs on unit A.
@@ -1056,6 +1109,12 @@ async function runHappyPath({ db, container, fixture }) {
     [...runtime.resumedSessionWorktrees.values()].some((handles) => handles.size > 2),
     "no native session was resumed across three different worktrees; the second restore relocation is untested"
   );
+  assertRepairRequestsSeededFromPreviousCandidates({
+    pipelines,
+    attemptId: attempt.id,
+    runtime,
+    durableBaseCommit: fixture.baseCommit,
+  });
 
   assert(
     runtime.counters.serialReviewPersonaTransitions > 0,

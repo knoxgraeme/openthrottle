@@ -287,13 +287,23 @@ function priorEvidence(value, label) {
     }
   }
   if (role === "repair") {
+    const rejectedCandidate = receipts.filter((receipt) => receipt.role === "candidate");
+    if (rejectedCandidate.length !== 1) throw new Error(`${label} must contain exactly one rejected candidate receipt`);
+    const candidateReceipt = JSON.parse(rejectedCandidate[0].receipt);
+    if (
+      candidateReceipt.type !== "candidate_evidence" ||
+      candidateReceipt.assurance !== "executor_verified" ||
+      candidateReceipt.result !== "success"
+    ) {
+      throw new Error(`${label} rejected candidate receipt must be successful executor_verified candidate_evidence`);
+    }
     const triggeringLead = receipts.filter((receipt) => receipt.role === "lead");
     if (triggeringLead.length !== 1) throw new Error(`${label} must contain exactly one triggering lead receipt`);
     if (JSON.parse(triggeringLead[0].receipt).type !== "unit_decision") {
       throw new Error(`${label} triggering lead receipt must be unit_decision`);
     }
-    if (receipts.some((receipt) => receipt.role !== "lead" && receipt.role !== "command")) {
-      throw new Error(`${label} contains evidence outside lead/command for a repair action`);
+    if (receipts.some((receipt) => receipt.role !== "candidate" && receipt.role !== "lead" && receipt.role !== "command")) {
+      throw new Error(`${label} contains evidence outside candidate/lead/command for a repair action`);
     }
   }
   // A prior semantic_review round (role final_review) is embedded both as
