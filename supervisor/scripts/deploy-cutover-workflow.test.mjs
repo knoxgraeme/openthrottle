@@ -27,6 +27,14 @@ function runBash(script, env = {}) {
     writeFileSync(join(bin, "flyctl"), `#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "flyctl $*" >> "${log}"
+if [[ "\${1:-}" == "machines" && "\${2:-}" == "list" ]]; then
+  printf '%s\\n' "\${FLYCTL_MACHINES_RESPONSE:-[]}"
+  exit "\${FLYCTL_MACHINES_STATUS:-0}"
+fi
+if [[ "\${1:-}" == "releases" ]]; then
+  printf '%s\\n' "\${FLYCTL_RELEASES_RESPONSE:-[]}"
+  exit "\${FLYCTL_RELEASES_STATUS:-0}"
+fi
 if [[ "$*" == *"ssh console"* ]]; then
   printf '%s\\n' "\${FLYCTL_SSH_RESPONSE:-no machines}"
   exit "\${FLYCTL_SSH_STATUS:-1}"
@@ -53,6 +61,70 @@ exit 0
 }
 
 describe("deploy workflow cutover recovery", () => {
+  it("resolves the live capitalized complete release image when no started machine image is available", () => {
+    const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+    const helperStart = script.indexOf("active_image_ref() {");
+    const helperEnd = script.indexOf("seal_cutover_evidence() {");
+    if (helperStart < 0 || helperEnd < helperStart) throw new Error("missing active image helper");
+    const helperBlock = script.slice(helperStart, helperEnd);
+    const result = runBash(`${helperBlock}\nactive_image_ref`, {
+      FLYCTL_RELEASES_RESPONSE:
+        '[{"Version":188,"Status":"complete","Stable":false,"ImageRef":"registry.fly.io/openthrottle-staging-knoxgraeme:deployment-01KZZ90"}]',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe("registry.fly.io/openthrottle-staging-knoxgraeme:deployment-01KZZ90");
+  });
+
+  it("uses the started machine image as the sealed runtime authority", () => {
+    const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+    const helperStart = script.indexOf("active_image_ref() {");
+    const helperEnd = script.indexOf("seal_cutover_evidence() {");
+    if (helperStart < 0 || helperEnd < helperStart) throw new Error("missing active image helper");
+    const helperBlock = script.slice(helperStart, helperEnd);
+    const result = runBash(`${helperBlock}\nactive_image_ref`, {
+      FLYCTL_MACHINES_RESPONSE:
+        '[{"id":"one","state":"started","config":{"image":"registry.fly.io/app:running"}}]',
+      FLYCTL_RELEASES_RESPONSE:
+        '[{"Version":188,"Status":"complete","Stable":false,"ImageRef":"registry.fly.io/app:release"}]',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe("registry.fly.io/app:running");
+  });
+
+  it("fails closed when no active Fly image can be resolved", () => {
+    const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+    const helperStart = script.indexOf("active_image_ref() {");
+    const helperEnd = script.indexOf("seal_cutover_evidence() {");
+    if (helperStart < 0 || helperEnd < helperStart) throw new Error("missing active image helper");
+    const helperBlock = script.slice(helperStart, helperEnd);
+    const result = runBash(`${helperBlock}\nactive_image_ref`, {
+      FLYCTL_MACHINES_RESPONSE: "[]",
+      FLYCTL_RELEASES_RESPONSE: "[]",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("could not determine immutable active Fly image");
+  });
+
+  it("fails closed when started Fly machines report different active images", () => {
+    const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
+    const helperStart = script.indexOf("active_image_ref() {");
+    const helperEnd = script.indexOf("seal_cutover_evidence() {");
+    if (helperStart < 0 || helperEnd < helperStart) throw new Error("missing active image helper");
+    const helperBlock = script.slice(helperStart, helperEnd);
+    const result = runBash(`${helperBlock}\nactive_image_ref`, {
+      FLYCTL_MACHINES_RESPONSE:
+        '[{"id":"one","state":"started","config":{"image":"registry.fly.io/app:old"}},{"id":"two","state":"started","config":{"image":"registry.fly.io/app:new"}}]',
+      FLYCTL_RELEASES_RESPONSE:
+        '[{"Version":188,"Status":"complete","Stable":false,"ImageRef":"registry.fly.io/app:new"}]',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("started Fly machines disagree on active image");
+  });
+
   it("records recovery commands that redeploy the pinned old image before evidence and never rebuild the candidate checkout", () => {
     const script = stepRun("deploy", "Execute the v12 snapshot cutover transaction");
     const recoveryCommands = [

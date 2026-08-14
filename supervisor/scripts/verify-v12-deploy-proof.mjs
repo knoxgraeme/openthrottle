@@ -43,7 +43,10 @@ assert(
     deployWorkflow.includes("cutover_command evidence") &&
     deployWorkflow.includes("cutover_command resume") &&
     deployWorkflow.includes("active_image_ref()") &&
+    deployWorkflow.includes("flyctl machines list --app \"$FLY_APP\" --json") &&
+    deployWorkflow.includes("started Fly machines disagree on active image") &&
     deployWorkflow.includes("flyctl releases --app \"$FLY_APP\" --json") &&
+    deployWorkflow.includes('((.status // .Status // "") | ascii_downcase) == "complete"') &&
     deployWorkflow.includes("flyctl secrets set --stage --app \"$FLY_APP\" DAYTONA_SNAPSHOT=\"$EXPECTED_SNAPSHOT\"") &&
     deployWorkflow.indexOf("advance_cutover drain_clear") < deployWorkflow.indexOf("DAYTONA_SNAPSHOT=\"$EXPECTED_SNAPSHOT\"") &&
     deployWorkflow.includes("flyctl secrets set --stage --app \"$FLY_APP\" DAYTONA_SNAPSHOT=\"$old_snapshot\"") &&
