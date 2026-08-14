@@ -855,6 +855,19 @@ export function prepareLoopGitObjectEnvironment(request, repoDir) {
   };
 }
 
+// The sealed subject a read-only role is bound to: a lead never touches a
+// worktree, so the candidate it was dispatched to evaluate is both its read
+// subject and (having made no edits) its authoritative post subject; a
+// reviewer is likewise read-only over its exact sealed input subject. Neither
+// value is ever derived from agent output. Returns null for a role with no
+// sealed read-only subject (worker, whose post subject instead comes from
+// attesting the writable worktree, and publisher).
+function sealedReadOnlySubject(request) {
+  if (request.role === "lead") return request.candidateSubject;
+  if (request.role === "reviewer") return request.inputSubject;
+  return null;
+}
+
 function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo") {
   const actionRoot = configuredActionRoot();
   const currentActionDirectory = ensureCurrentActionTraversal(request, actionRoot);
@@ -863,11 +876,7 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   lockNonCurrentActionDirectories(request, actionRoot);
   const viewSourceRepoDir = request.receiptCorrectionSourceRepoDir ?? sourceRepoDir;
   const viewSourceEnv = request.receiptCorrectionGitObjectEnv ?? {};
-  const sourceSubject = request.receiptCorrectionSubject ?? (request.role === "lead"
-    ? request.candidateSubject
-    : request.role === "reviewer"
-      ? request.inputSubject
-      : "HEAD");
+  const sourceSubject = request.receiptCorrectionSubject ?? sealedReadOnlySubject(request) ?? "HEAD";
   const subject = runRootGit(viewSourceRepoDir, ["rev-parse", sourceSubject], viewSourceEnv);
   const objectType = runRootGit(viewSourceRepoDir, ["cat-file", "-t", subject], viewSourceEnv);
   if (objectType !== "commit" && objectType !== "tree") {
@@ -2087,11 +2096,18 @@ export function executeLoopAction({
     const worktreeDir = loopWorktreeDirectory(request);
     let subject = persistedCorrectionState?.subject ?? null;
     let subjectError = null;
-    if (worktreeDir && !persistedCorrectionState) {
-      try {
-        subject = computeWorkspaceTreeOid(worktreeDir, execution.gitObjectEnv ?? undefined);
-      } catch (error) {
-        subjectError = `workspace subject attestation failed: ${error instanceof Error ? error.message : String(error)}`;
+    if (!persistedCorrectionState) {
+      if (worktreeDir) {
+        try {
+          subject = computeWorkspaceTreeOid(worktreeDir, execution.gitObjectEnv ?? undefined);
+        } catch (error) {
+          subjectError = `workspace subject attestation failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      } else {
+        // A read-only role has no workspace to attest; its authoritative post
+        // subject is the sealed subject it was dispatched to read, not
+        // anything the agent reported.
+        subject = sealedReadOnlySubject(request);
       }
     }
     let parsedReceipt = null;
