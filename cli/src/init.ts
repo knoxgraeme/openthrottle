@@ -839,6 +839,21 @@ export function planEditableSkillsRefresh(
   };
 }
 
+export function planEditableSkillsDryRun(
+  config: ProjectConfig,
+  directory = process.cwd(),
+  options: Pick<WriteProjectConfigOptions, "resources" | "supervisorTaskTimeoutSeconds"> = {}
+): { plan: EditableSkillsRefreshPlan; assumesConfigOverwrite: boolean } {
+  // A real run prompts before overwriting an existing .openthrottle.yml and
+  // then plans with allowConfigOverwrite, so the preview must assume the same.
+  const assumesConfigOverwrite = existsSync(join(directory, ".openthrottle.yml"));
+  const plan = planEditableSkillsRefresh(config, directory, {
+    ...options,
+    allowConfigOverwrite: assumesConfigOverwrite,
+  });
+  return { plan, assumesConfigOverwrite };
+}
+
 function writeEditableSkillsScaffold(
   config: ProjectConfig,
   directory: string,
@@ -967,9 +982,14 @@ export default async function init(args: string[] = []): Promise<void> {
     supervisorTaskTimeoutSeconds = await getSupervisorTaskTimeoutSeconds();
   }
   if (dryRun) {
-    const plan = planEditableSkillsRefresh(selection.project, process.cwd(), {
+    const { plan, assumesConfigOverwrite } = planEditableSkillsDryRun(selection.project, process.cwd(), {
       supervisorTaskTimeoutSeconds,
     });
+    if (assumesConfigOverwrite) {
+      p.log.info(
+        ".openthrottle.yml already exists; a real run prompts before overwriting it, so this preview assumes overwrite."
+      );
+    }
     for (const line of editableSkillsRefreshSummary(plan)) p.log.info(line);
     p.outro(plan.writable
       ? "Dry run only: the editable-skill refresh can be applied safely; no files or registrations changed."
