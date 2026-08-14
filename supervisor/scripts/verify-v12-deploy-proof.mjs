@@ -84,9 +84,7 @@ assert(
   "deploy workflow must expose a fail-closed supervisor-only v12 cutover path"
 );
 assert(
-  deployWorkflow.includes("database_migrations: ${{ steps.filter.outputs.database_migrations }}") &&
-    deployWorkflow.includes("'supervisor/src/persistence/migrations/definitions.ts'") &&
-    deployWorkflow.includes("EXPECTED_MIGRATION_ROLLBACK_CONTRACT: schema-migrations-name-additive-rollback-compatible/v1") &&
+  deployWorkflow.includes("EXPECTED_MIGRATION_ROLLBACK_CONTRACT: schema-migrations-name-additive-rollback-compatible/v1") &&
     deployWorkflow.includes("fetch-depth: 0") &&
     deployWorkflow.includes("Validate migration rollback markers") &&
     !deployWorkflow.includes("MIGRATION_DIFF_BASE:") &&
@@ -94,11 +92,11 @@ assert(
     deployWorkflow.indexOf("Validate migration rollback markers") <
       deployWorkflow.indexOf("superfly/flyctl-actions/setup-flyctl@master") &&
     deployWorkflow.includes("node supervisor/scripts/verify-migration-rollback-markers.mjs") &&
-    deployWorkflow.includes("needs.changes.outputs.database_migrations == 'true'") &&
-    deployWorkflow.includes("requires_migration_contract=\"${{ needs.changes.outputs.database_migrations == 'true' }}\"") &&
-    !deployWorkflow.includes("github.event_name == 'push' && needs.changes.outputs.database_migrations == 'true'") &&
+    !deployWorkflow.includes("needs.changes.outputs.database_migrations") &&
+    deployWorkflow.includes('requires_migration_contract="true"') &&
+    deployWorkflow.includes("first-install supervisor bootstrap has no predecessor contract to verify") &&
     deployWorkflow.includes(".database.migrationRollbackCompatibility.contract == $migration_contract"),
-  "migration-bearing supervisor deploys, including workflow_dispatch refs, must prove rollback compatibility before opening SQLite"
+  "every non-bootstrap supervisor deploy must prove rollback compatibility before opening SQLite"
 );
 assert(
   cutoverControl.includes("OT_DEPLOY_TOKEN") &&

@@ -131,4 +131,21 @@ describe("migration rollback marker verifier", () => {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    ["string", 'const decoy = "const definitions: DatabaseMigrationDefinition[] = [{ version: 47, name: \\\"safe [rollback-compatible:additive/v1]\\\" }]";'],
+    ["template", "const decoy = `const definitions: DatabaseMigrationDefinition[] = [{ version: 47, name: \\\"safe [rollback-compatible:additive/v1]\\\" }]`;"],
+    ["line comment", "// const definitions: DatabaseMigrationDefinition[] = [{ version: 47, name: \"safe [rollback-compatible:additive/v1]\" }]"],
+    ["block comment", "/* const definitions: DatabaseMigrationDefinition[] = [{ version: 47, name: \"safe [rollback-compatible:additive/v1]\" }] */"],
+  ])("ignores a pre-catalog %s declaration decoy", (_label, decoy) => {
+    const input = `${decoy}\n${source('  { version: 47, name: "real-unmarked", source: "" },')}`;
+    expect(() => assertMigrationNamesMarked(input)).toThrow(/real-unmarked/);
+  });
+
+  it("rejects multiple top-level catalog declarations", () => {
+    const input = `${source(`  { version: 47, name: "one${suffix}", source: "" },`)}\n${source(
+      `  { version: 48, name: "two${suffix}", source: "" },`,
+    )}`;
+    expect(() => assertMigrationNamesMarked(input)).toThrow(/exactly one top-level/);
+  });
 });

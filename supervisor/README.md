@@ -94,9 +94,9 @@ receive `GITHUB_TOKEN`.
 - Every supervisor deploy, including `workflow_dispatch`, first checks the
   complete current migration catalog and rejects post-cutover definitions
   without one statically verifiable, double-quoted literal name carrying the
-  rollback marker. Migration-bearing deploys then pause and drain admission
-  before deploy and require the live pre-deploy supervisor's cutover evidence
-  to advertise
+  rollback marker. Every non-bootstrap supervisor or snapshot deploy then
+  pauses and drains admission before deploy and requires the live pre-deploy
+  supervisor's cutover evidence to advertise
   `schema-migrations-name-additive-rollback-compatible/v1` before the new image
   can open SQLite.
 - `workflow_dispatch` inputs force either half manually. The optional

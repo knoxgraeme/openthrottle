@@ -1231,7 +1231,7 @@ after that release is installed, every push that builds a new snapshot must
 pause and drain before deploy, then verify the pinned runtime release, runtime
 digest, and exact snapshot before resuming admission. A manual cutover without
 a snapshot build must supply the exact expected snapshot explicitly.
-Any cutover release that adds a schema migration must also verify the live
+Every non-bootstrap cutover or supervisor deployment must also verify the live
 pre-deploy supervisor's `/deployment/cutover-evidence` includes the expected
 `schema-migrations-name-additive-rollback-compatible/v1` database contract
 and reject any post-cutover definition in the complete current catalog that

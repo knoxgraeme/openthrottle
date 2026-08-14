@@ -8,12 +8,62 @@ const DEFINITIONS_DECLARATION = "const definitions: DatabaseMigrationDefinition[
 const ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX = " [rollback-compatible:additive/v1]";
 const ROLLBACK_MARKER_REQUIRED_FROM_VERSION = 47;
 
-function topLevelMigrationObjects(source) {
-  const declaration = source.indexOf(DEFINITIONS_DECLARATION);
-  if (declaration < 0) {
-    throw new Error("could not locate the database migration definitions array");
+function definitionsArrayStart(source) {
+  const starts = [];
+  let braceDepth = 0;
+  let quote = "";
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    const next = source[index + 1];
+    if (lineComment) {
+      if (character === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (character === "*" && next === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "/" && next === "/") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === "/" && next === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      quote = character;
+      continue;
+    }
+    if (character === "{") braceDepth += 1;
+    else if (character === "}") braceDepth -= 1;
+    if (braceDepth === 0 && source.startsWith(DEFINITIONS_DECLARATION, index)) {
+      starts.push(index + DEFINITIONS_DECLARATION.length - 1);
+      index += DEFINITIONS_DECLARATION.length - 1;
+    }
   }
-  const arrayStart = declaration + DEFINITIONS_DECLARATION.length - 1;
+  if (starts.length !== 1) {
+    throw new Error(`expected exactly one top-level database migration definitions array, found ${starts.length}`);
+  }
+  return starts[0];
+}
+
+function topLevelMigrationObjects(source) {
+  const arrayStart = definitionsArrayStart(source);
   const objects = [];
   let arrayDepth = 0;
   let braceDepth = 0;
