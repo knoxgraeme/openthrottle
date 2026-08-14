@@ -7,18 +7,21 @@ description: Convert a completed implementation plan or task specification into 
 
 Use this skill at planning time against a completed implementation plan or task
 specification. Its surrounding format and section names do not matter. The
-source must define enough scope, ordering, acceptance, and verification detail
-to decompose the work without guessing.
+source must define enough scope, ordering, requirements, acceptance, tests,
+and verification detail to fill every unit's fields without guessing.
 
 The output is a single fenced JSON block with schema
-`openthrottle.execution-plan/v1`. The runtime consumes that block, while the
-source prose remains the human-authoritative source.
+`openthrottle.execution-plan/v2`. That block is the complete runtime authority
+for the run: a dispatched unit worker only ever sees its own unit's fields,
+never the source prose, so every applicable value must be materialized into
+the unit directly. The source prose remains the human-authored input this
+skill reads, not something the runtime reads back.
 
 ## Workflow
 
 1. Read the complete source and identify its goal and scope, implementation
-   units or workstreams, dependencies, instructions or requirements,
-   acceptance criteria or definition of done, and verification commands.
+   units or workstreams, dependencies, requirements, file scope, implementation
+   approach, test scenarios, acceptance criteria, and verification steps.
    These may use any headings or document structure.
 2. Read `references/execution-plan.md` before drafting JSON.
 3. Preserve the plan's semantic decomposition:
@@ -29,15 +32,18 @@ source prose remains the human-authoritative source.
      accepted by the frozen contract, such as `contracts` or `api_tests`.
    - Keep declared dependency order; infer a dependency only when the plan text
      directly states it.
-   - Preserve existing requirement, acceptance, verification, or
-     definition-of-done IDs when present. Otherwise create descriptive map keys
-     while copying the source meaning without expansion.
+   - For every behavior-bearing unit, copy the source's applicable meaning
+     directly into that unit's `objective`, `requirements`, `files`,
+     `approach`, `tests`, `acceptance`, and `verification` fields in full. A
+     value that only points back at the source ("see above", "as described in
+     the plan") is never acceptable -- write the actual requirement, file,
+     step, or check in the field itself.
    - Do not invent product requirements, acceptance criteria, commands, or unit
      splits.
 4. Write or replace exactly one fenced block:
 
    ```text
-   ```json openthrottle.execution-plan/v1
+   ```json openthrottle.execution-plan/v2
    { ... }
    ```
    ```
@@ -55,11 +61,12 @@ Return a human decision request when any of these are unresolved:
   stable ID without choosing between competing decompositions;
 - dependency order has more than one defensible interpretation;
 - required verification commands are unnamed or conflict with repository config;
-- acceptance references are missing for behavior-bearing units;
+- requirements, files, approach, tests, acceptance, or verification content is
+  missing for a behavior-bearing unit;
 - the chosen graph requires capabilities the repository graph does not declare.
 
 ## Completion
 
 Report the validation command and digest. Success means the plan contains
-exactly one valid `openthrottle.execution-plan/v1` block and no unresolved
+exactly one valid `openthrottle.execution-plan/v2` block and no unresolved
 semantic ambiguity remains.

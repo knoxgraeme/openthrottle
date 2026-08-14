@@ -58,6 +58,7 @@ jobs:
       sandbox: ${{ steps.filter.outputs.sandbox }}
       skills: ${{ steps.filter.outputs.skills }}
       runtime_descriptor: ${{ steps.filter.outputs.runtime_descriptor }}
+      database_migrations: ${{ steps.filter.outputs.database_migrations }}
       supervisor: ${{ steps.filter.outputs.supervisor }}
     steps:
       - uses: actions/checkout@v4
@@ -74,6 +75,8 @@ jobs:
               - 'skills/**'
             runtime_descriptor:
               - 'supervisor/pipelines/runtime-capabilities-v1.json'
+            database_migrations:
+              - 'supervisor/src/persistence/migrations/definitions.ts'
             supervisor:
               - 'supervisor/**'
 
@@ -131,6 +134,7 @@ jobs:
       FLY_ORG: ${{ vars.FLY_ORG || 'personal' }}
       FLY_REGION: ${{ vars.FLY_REGION || 'sjc' }}
       EXPECTED_SNAPSHOT: ${{ needs.snapshot.outputs.name || inputs.expected_snapshot }}
+      EXPECTED_MIGRATION_ROLLBACK_CONTRACT: schema-migrations-name-additive-rollback-compatible/v1
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
@@ -168,7 +172,9 @@ jobs:
         if: inputs.prepare_v12_cutover || needs.snapshot.result == 'success'
         run: |
           set -euo pipefail
-          if [[ -z "${EXPECTED_SNAPSHOT}" ]]; then
+          requires_snapshot_check="${{ inputs.prepare_v12_cutover || needs.snapshot.result == 'success' }}"
+          requires_migration_contract="${{ needs.changes.outputs.database_migrations == 'true' }}"
+          if [[ "${requires_snapshot_check}" == "true" && -z "${EXPECTED_SNAPSHOT}" ]]; then
             echo "expected_snapshot is required when this run does not build a snapshot" >&2
             exit 1
           fi
@@ -417,11 +423,17 @@ jobs:
             printf '%s\n' "$evidence" | jq .
             if printf '%s\n' "$evidence" | jq -e \
               --argjson epoch "$pause_epoch" \
-              '.admission.paused == 1 and .admission.epoch == $epoch and .drain.clear == true' >/dev/null; then
+              --arg requires_migration_contract "$requires_migration_contract" \
+              --arg migration_contract "$EXPECTED_MIGRATION_ROLLBACK_CONTRACT" \
+              '.admission.paused == 1 and
+               .admission.epoch == $epoch and
+               .drain.clear == true and
+               ($requires_migration_contract != "true" or
+                .database.migrationRollbackCompatibility.contract == $migration_contract)' >/dev/null; then
               break
             fi
             if (( SECONDS >= deadline )); then
-              echo "v12 cutover drain did not clear within 600 seconds" >&2
+              echo "cutover evidence did not clear within 600 seconds" >&2
               abort_cutover 1
             fi
             sleep 10
@@ -464,6 +476,30 @@ jobs:
             advance_cutover resumed completed "$resume_evidence"
           fi
           trap - ERR
+      - name: Pause admission and verify migration rollback contract
+        if: ${{ needs.changes.outputs.database_migrations == 'true' && !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}
+        run: |
+          set -euo pipefail
+          flyctl ssh console --app "$FLY_APP" --command \
+            "node /app/scripts/cutover-control.mjs pause"
+          deadline=$((SECONDS + 600))
+          while true; do
+            evidence="$(flyctl ssh console --app "$FLY_APP" --command \
+              "node /app/scripts/cutover-control.mjs evidence")"
+            printf '%s\n' "$evidence" | jq .
+            if printf '%s\n' "$evidence" | jq -e \
+              --arg migration_contract "$EXPECTED_MIGRATION_ROLLBACK_CONTRACT" \
+              '.admission.paused == 1 and
+               .drain.clear == true and
+               .database.migrationRollbackCompatibility.contract == $migration_contract' >/dev/null; then
+              break
+            fi
+            if (( SECONDS >= deadline )); then
+              echo "migration rollback contract evidence did not clear within 600 seconds" >&2
+              exit 1
+            fi
+            sleep 10
+          done
       - name: Deploy the supervisor
         if: ${{ !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}
         # Build from the repository root so the supervisor's file:../contracts
@@ -487,3 +523,8 @@ jobs:
             exit 1
           fi
           flyctl deploy --remote-only --app "$FLY_APP" --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
+      - name: Resume admission after migration deploy
+        if: ${{ needs.changes.outputs.database_migrations == 'true' && !(inputs.prepare_v12_cutover || needs.snapshot.result == 'success') }}
+        run: |
+          flyctl ssh console --app "$FLY_APP" --command \
+            "node /app/scripts/cutover-control.mjs resume"

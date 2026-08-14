@@ -372,6 +372,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
       taskType: seed.taskType,
       taskContext: seed.taskContext ?? "",
       transitionContext: "",
+      inputArtifacts: seed.inputArtifacts,
       repository: seed.repository,
       baseCommit: seed.baseCommit,
       baseBranch: validated.baseBranch,

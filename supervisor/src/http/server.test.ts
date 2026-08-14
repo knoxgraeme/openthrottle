@@ -320,6 +320,13 @@ describe("coordinator-only server", () => {
       runtime: { release: descriptor.descriptor.release, capabilityDigest: descriptor.digest },
       snapshot: "snapshot",
       cutover: null,
+      database: {
+        migrationRollbackCompatibility: {
+          contract: "schema-migrations-name-additive-rollback-compatible/v1",
+          markerField: "schema_migrations.name",
+          markerSuffix: " [rollback-compatible:additive/v1]",
+        },
+      },
       drain: { clear: true, blockers: [], truncated: false },
     });
     expect(runtime.listLabeledResources).toHaveBeenCalledWith(51);

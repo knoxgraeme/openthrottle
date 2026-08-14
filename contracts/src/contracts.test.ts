@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { digestCanonicalJson, digestNormalized } from "./canonical.js";
 import { parseRepositoryConfigContract } from "./config.js";
 import { parseExecutionPlanContract } from "./execution-plan.js";
+import { parseExecutionPlanContractV2 } from "./execution-plan-v2.js";
 import { parseGraphContract } from "./graph.js";
 import {
   decideDifferentialRatchet,
@@ -56,6 +57,9 @@ function parseByName(name: string, raw: string): unknown {
   if (name.startsWith("config-")) return parseRepositoryConfigContract(raw, { source: name });
   if (name.startsWith("citation-contract")) return parseCitationContractProposal(raw, { source: name });
   if (name.startsWith("graph-")) return parseGraphContract(raw, { source: name });
+  if (name === "execution-plan-v2.json" || name.startsWith("execution-plan-v2-")) {
+    return parseExecutionPlanContractV2(raw, { source: name });
+  }
   if (name === "execution-plan.json" || name.startsWith("execution-plan-")) {
     return parseExecutionPlanContract(raw, { source: name });
   }
@@ -96,6 +100,12 @@ const invalidCases = [
   ["execution-plan-cycle.json", /depends_on: creates a cycle/],
   ["execution-plan-bad-ref.json", /depends_on: references an unknown unit/],
   ["execution-plan-invalid-command.json", /commands\[0\]\.name: has an invalid format/],
+  ["execution-plan-v2-unknown-field.json", /inline_prompt: unknown field/],
+  ["execution-plan-v2-duplicate-unit.json", /units: must not contain duplicate IDs/],
+  ["execution-plan-v2-cycle.json", /depends_on: creates a cycle/],
+  ["execution-plan-v2-bad-ref.json", /depends_on: references an unknown unit/],
+  ["execution-plan-v2-invalid-command.json", /commands\[0\]\.name: has an invalid format/],
+  ["execution-plan-v2-missing-field.json", /units\[0\]\.tests: must be an array/],
   ["ratchet-contract-duplicate-artifact.json", /pinned: must not contain duplicates/],
   ["ratchet-contract-invalid-authority.json", /tuner_authority\.proposal_digest: has an invalid format/],
   ["ratchet-contract-unknown-field.json", /pinned\[0\]\.digest: unknown field/],
@@ -322,6 +332,7 @@ describe("Stage C contract fixtures", () => {
       "citation-contract.json",
       "graph-structured.json",
       "execution-plan.json",
+      "execution-plan-v2.json",
       "ratchet-contract.json",
       "receipt-unit-completion.json",
       "receipt-unit-decision.json",
@@ -834,6 +845,38 @@ describe("Stage C contract fixtures", () => {
     const reversed = JSON.parse(raw) as { units: unknown[] };
     reversed.units = [...reversed.units].reverse();
     expect(parseExecutionPlanContract(JSON.stringify(reversed), { source: "plan" }).digest).not.toBe(first.digest);
+  });
+
+  it("keeps v2 units self-contained: every applicable field is carried inline, ordering is preserved", () => {
+    const raw = readFixture("valid", "execution-plan-v2.json");
+    const first = parseExecutionPlanContractV2(raw, { source: "plan" });
+    for (const unit of first.value.units) {
+      expect(unit.objective.length).toBeGreaterThan(0);
+      expect(unit.requirements.length).toBeGreaterThan(0);
+      expect(unit.files.length).toBeGreaterThan(0);
+      expect(unit.approach.length).toBeGreaterThan(0);
+      expect(unit.tests.length).toBeGreaterThan(0);
+      expect(unit.acceptance.length).toBeGreaterThan(0);
+      expect(unit.verification.length).toBeGreaterThan(0);
+    }
+
+    const reversedUnits = JSON.parse(raw) as { units: unknown[] };
+    reversedUnits.units = [...reversedUnits.units].reverse();
+    expect(parseExecutionPlanContractV2(JSON.stringify(reversedUnits), { source: "plan" }).digest).not.toBe(first.digest);
+
+    const reversedRequirements = JSON.parse(raw) as { units: Array<{ requirements: string[] }> };
+    reversedRequirements.units[0]!.requirements = [...reversedRequirements.units[0]!.requirements].reverse();
+    expect(parseExecutionPlanContractV2(JSON.stringify(reversedRequirements), { source: "plan" }).digest)
+      .not.toBe(first.digest);
+  });
+
+  it("rejects ordinary self-contained English that an ID-pointer classifier would have misclassified", () => {
+    const raw = JSON.parse(readFixture("valid", "execution-plan-v2.json")) as {
+      units: Array<{ requirements: string[]; verification: string[] }>;
+    };
+    raw.units[0]!.requirements.push("See that latency stays under 200ms.");
+    raw.units[0]!.verification.push("Refer clients to error code 429.");
+    expect(() => parseExecutionPlanContractV2(JSON.stringify(raw), { source: "plan" })).not.toThrow();
   });
 
   it.each(invalidCases)("rejects invalid fixture %s with a stable path", (fixture, message) => {

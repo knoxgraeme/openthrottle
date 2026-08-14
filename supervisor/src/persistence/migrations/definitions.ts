@@ -15,6 +15,9 @@ export interface DatabaseMigration extends DatabaseMigrationDefinition {
   checksum: string;
 }
 
+export const ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX = " [rollback-compatible:additive/v1]";
+export const MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT = "schema-migrations-name-additive-rollback-compatible/v1";
+
 function hasTable(db: Database.Database, name: string): boolean {
   return Boolean(
     db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name)
@@ -2340,12 +2343,17 @@ CREATE TABLE deployment_cutovers (
   updated_at TEXT NOT NULL,
   completed_at TEXT
 );
+`;
+
+const deploymentCutoverOpenIndexSchema = `
 CREATE UNIQUE INDEX deployment_cutovers_open_idx
   ON deployment_cutovers((1))
   WHERE status IN ('active', 'recovery_required');
 `;
 
-const deploymentCutoverMigrationSource = `${deploymentCutoverSchema}
+const deploymentCutoverMigrationSql = `${deploymentCutoverSchema}${deploymentCutoverOpenIndexSchema}`;
+
+const deploymentCutoverMigrationSource = `${deploymentCutoverMigrationSql}
 deployment-cutover-contract:snapshot-changing deploys persist one resumable transaction with old release/snapshot, candidate snapshot, pause epoch, phase, and recovery evidence before staging or activating DAYTONA_SNAPSHOT/v1`;
 
 type GithubHeadSource =
@@ -3469,11 +3477,13 @@ const definitions: DatabaseMigrationDefinition[] = [
   },
   {
     version: 46,
-    name: "deployment-cutover-transaction",
+    name: `deployment-cutover-transaction${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     source: deploymentCutoverMigrationSource,
     up(db) {
       if (!hasTable(db, "deployment_cutovers")) {
-        db.exec(deploymentCutoverSchema);
+        db.exec(deploymentCutoverMigrationSql);
+      } else if (!hasIndex(db, "deployment_cutovers_open_idx")) {
+        db.exec(deploymentCutoverOpenIndexSchema);
       }
     },
   },

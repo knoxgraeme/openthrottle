@@ -100,7 +100,9 @@ npx openthrottle plan validate docs/plans/<plan>.md --graph structured
 ```
 
 If the plan already contains a valid
-`json openthrottle.execution-plan/v1` block, run only validation. The plan's
+`json openthrottle.execution-plan/v2` block (the self-contained format
+`plan prepare` writes -- `v1`, index-into-a-source-map plans remain valid only
+for replaying already-sealed runs), run only validation. The plan's
 `graph_id` must be `structured`; do not activate a prose-only issue as a
 structured run.
 
@@ -118,7 +120,7 @@ Continue only when the response includes `graph/for-each-unit@1` and a nonempty
 ## Activate from a GitHub Issue
 
 Create an open GitHub Issue in `OWNER/REPO`. Its complete body, including the
-prepared plan text and the `openthrottle.execution-plan/v1` block, must fit the
+prepared plan text and the `openthrottle.execution-plan/v2` block, must fit the
 20,000-character admission limit. Count the final body before creating or
 editing the Issue; shortening only the prose while omitting the execution-plan
 block is not valid structured input. Do not put credentials or operator-only

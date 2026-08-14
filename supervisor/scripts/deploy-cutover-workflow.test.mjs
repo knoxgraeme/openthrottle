@@ -387,7 +387,7 @@ ${timeoutBlock}
     const result = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("v12 cutover drain did not clear within 600 seconds");
+    expect(result.stderr).toContain("cutover evidence did not clear within 600 seconds");
     expect(result.stdout).toContain("abort:1");
   });
 });

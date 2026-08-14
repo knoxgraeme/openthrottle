@@ -19,6 +19,14 @@ function cleanupDirectories(): void {
 
 function executionPlanBlock(graphId = "structured"): string {
   const contract = JSON.parse(
+    readFileSync(new URL("../../contracts/fixtures/valid/execution-plan-v2.json", import.meta.url), "utf8")
+  ) as Record<string, unknown>;
+  contract.graph_id = graphId;
+  return `\`\`\`json openthrottle.execution-plan/v2\n${JSON.stringify(contract, null, 2)}\n\`\`\``;
+}
+
+function legacyExecutionPlanBlock(graphId = "structured"): string {
+  const contract = JSON.parse(
     readFileSync(new URL("../../contracts/fixtures/valid/execution-plan.json", import.meta.url), "utf8")
   ) as Record<string, unknown>;
   contract.graph_id = graphId;
@@ -167,8 +175,10 @@ describe("ship", () => {
     try {
       process.chdir(directory);
       await expect(ship([planPath, "--graph", "structured"])).rejects.toThrow(/exit 1/);
+      writeFileSync(planPath, `# Ship it\n\n${legacyExecutionPlanBlock("structured")}`);
+      await expect(ship([planPath, "--graph", "structured"])).rejects.toThrow(/exit 1/);
       const nonCanonical = executionPlanBlock("structured").replace(
-        "json openthrottle.execution-plan/v1",
+        "json openthrottle.execution-plan/v2",
         "json"
       );
       writeFileSync(planPath, `# Ship it\n\n${nonCanonical}`);
