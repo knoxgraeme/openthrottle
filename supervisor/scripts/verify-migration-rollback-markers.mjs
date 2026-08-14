@@ -10,17 +10,37 @@ function git(args) {
   return execFileSync("git", args, { encoding: "utf8" });
 }
 
-function diffBase() {
-  const requested = process.env.MIGRATION_DIFF_BASE?.trim();
+export function migrationDiffBase(env = process.env) {
+  const requested = env.MIGRATION_DIFF_BASE?.trim();
   if (requested && !/^0+$/.test(requested)) return requested;
+  const eventName = env.MIGRATION_EVENT_NAME?.trim();
+  const refName = env.MIGRATION_REF_NAME?.trim();
+  const defaultBranch = env.MIGRATION_DEFAULT_BRANCH?.trim();
+  if (
+    eventName === "workflow_dispatch" &&
+    refName &&
+    defaultBranch &&
+    refName !== defaultBranch
+  ) {
+    return `origin/${defaultBranch}`;
+  }
   return "HEAD^";
 }
 
-export function addedMigrationNamesFromDiff(diff) {
+function addedLines(diff) {
   return diff
     .split("\n")
     .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
-    .map((line) => line.match(/^\+\s*name:\s*"([^"]+)",?\s*$/)?.[1])
+    .map((line) => line.slice(1));
+}
+
+export function addedMigrationDefinitionCountFromDiff(diff) {
+  return addedLines(diff).filter((line) => /^\s*version\s*:/.test(line)).length;
+}
+
+export function addedMigrationNamesFromDiff(diff) {
+  return addedLines(diff)
+    .map((line) => line.match(/^\s*name:\s*"([^"]+)",?\s*$/)?.[1])
     .filter((name) => name !== undefined);
 }
 
@@ -29,7 +49,13 @@ export function unmarkedMigrationNames(names) {
 }
 
 export function assertAddedMigrationNamesMarked(diff) {
+  const addedMigrationDefinitions = addedMigrationDefinitionCountFromDiff(diff);
   const addedMigrationNames = addedMigrationNamesFromDiff(diff);
+  if (addedMigrationDefinitions !== addedMigrationNames.length) {
+    throw new Error(
+      "could not statically verify exactly one double-quoted literal name for every added migration definition"
+    );
+  }
   const unmarked = unmarkedMigrationNames(addedMigrationNames);
   if (unmarked.length > 0) {
     throw new Error(
@@ -37,7 +63,7 @@ export function assertAddedMigrationNamesMarked(diff) {
         unmarked.join(", ")
     );
   }
-  return addedMigrationNames.length;
+  return addedMigrationDefinitions;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
@@ -46,7 +72,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     "--unified=0",
     "--no-ext-diff",
     "--no-color",
-    diffBase(),
+    migrationDiffBase(),
     "HEAD",
     "--",
     DEFINITIONS_PATH,

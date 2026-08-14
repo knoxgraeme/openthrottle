@@ -54,6 +54,9 @@ assert(
     deployWorkflow.includes("EXPECTED_MIGRATION_ROLLBACK_CONTRACT: schema-migrations-name-additive-rollback-compatible/v1") &&
     deployWorkflow.includes("fetch-depth: 0") &&
     deployWorkflow.includes("Validate migration rollback markers") &&
+    deployWorkflow.includes("MIGRATION_EVENT_NAME: ${{ github.event_name }}") &&
+    deployWorkflow.includes("MIGRATION_REF_NAME: ${{ github.ref_name }}") &&
+    deployWorkflow.includes("MIGRATION_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}") &&
     deployWorkflow.includes("node supervisor/scripts/verify-migration-rollback-markers.mjs") &&
     deployWorkflow.includes("needs.changes.outputs.database_migrations == 'true'") &&
     deployWorkflow.includes("requires_migration_contract=\"${{ needs.changes.outputs.database_migrations == 'true' }}\"") &&

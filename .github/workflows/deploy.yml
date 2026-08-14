@@ -142,7 +142,10 @@ jobs:
       - name: Validate migration rollback markers
         if: needs.changes.outputs.database_migrations == 'true'
         env:
-          MIGRATION_DIFF_BASE: ${{ github.event.before || format('origin/{0}', github.event.repository.default_branch) }}
+          MIGRATION_DIFF_BASE: ${{ github.event.before }}
+          MIGRATION_EVENT_NAME: ${{ github.event_name }}
+          MIGRATION_REF_NAME: ${{ github.ref_name }}
+          MIGRATION_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: node supervisor/scripts/verify-migration-rollback-markers.mjs
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Ensure the Fly app and data volume exist

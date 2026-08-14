@@ -93,7 +93,8 @@ receive `GITHUB_TOKEN`.
   secret applies on release) run `flyctl deploy --remote-only`.
 - Changes to `supervisor/src/persistence/migrations/definitions.ts`, including
   `workflow_dispatch` runs on such refs, first reject newly added migration
-  definitions without the rollback marker, then pause and drain admission before
+  definitions without one statically verifiable, double-quoted literal name
+  carrying the rollback marker, then pause and drain admission before
   deploy and require the live pre-deploy supervisor's cutover evidence to
   advertise
   `schema-migrations-name-additive-rollback-compatible/v1` before the new image
