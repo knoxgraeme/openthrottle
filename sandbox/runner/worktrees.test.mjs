@@ -23,6 +23,14 @@ function git(repoDir, args) {
   return execFileSync("git", args, { cwd: repoDir, encoding: "utf8" }).trim();
 }
 
+function gitNoReplace(repoDir, args) {
+  return execFileSync("git", args, {
+    cwd: repoDir,
+    encoding: "utf8",
+    env: { ...process.env, GIT_NO_REPLACE_OBJECTS: "1" },
+  }).trim();
+}
+
 function repository() {
   const directory = mkdtempSync(join(tmpdir(), "ot-worktree-repo-"));
   directories.push(directory);
@@ -131,6 +139,37 @@ describe("executor-owned worktrees", () => {
 
     expect(() => createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "unrelated", baseCommit: otherCommit }))
       .toThrow(/not a descendant/);
+  });
+
+  it("ignores replacement refs for ancestry checks and materializes the requested commit tree", () => {
+    const repoDir = repository();
+    const otherRepoDir = repository();
+    const { rootDir, markerRootDir } = worktreeEnvironment();
+    const baseCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    writeFileSync(join(repoDir, "candidate.txt"), "candidate\n");
+    git(repoDir, ["add", "candidate.txt"]);
+    git(repoDir, ["commit", "-qm", "candidate"]);
+    const candidateCommit = git(repoDir, ["rev-parse", "HEAD"]);
+    git(repoDir, ["checkout", "-q", baseCommit]);
+    git(otherRepoDir, ["checkout", "--orphan", "unrelated"]);
+    git(otherRepoDir, ["rm", "-qrf", "."]);
+    writeFileSync(join(otherRepoDir, "other.txt"), "other\n");
+    git(otherRepoDir, ["add", "other.txt"]);
+    git(otherRepoDir, ["commit", "-qm", "unrelated"]);
+    const otherCommit = git(otherRepoDir, ["rev-parse", "HEAD"]);
+    git(repoDir, ["fetch", "-q", otherRepoDir, otherCommit]);
+
+    git(repoDir, ["replace", otherCommit, candidateCommit]);
+    expect(() => createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "replaced-unrelated", baseCommit: otherCommit }))
+      .toThrow(/not a descendant/);
+    git(repoDir, ["replace", "-d", otherCommit]);
+
+    git(repoDir, ["replace", candidateCommit, otherCommit]);
+    const created = createTestWorktree({ repoDir, rootDir, markerRootDir, handle: "replaced-candidate", baseCommit: candidateCommit });
+
+    expect(gitNoReplace(created.path, ["rev-parse", "HEAD"])).toBe(candidateCommit);
+    expect(existsSync(join(created.path, "candidate.txt"))).toBe(true);
+    expect(existsSync(join(created.path, "other.txt"))).toBe(false);
   });
 
   it("reuses an existing clean exact-base worktree only in idempotent mode", () => {
