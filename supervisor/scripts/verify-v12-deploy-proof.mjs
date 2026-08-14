@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { RUNTIME_DESCRIPTOR, canonicalJson } from "../../sandbox/runner/capabilities.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const V12_RUNTIME_RELEASE = "openthrottle-snapshot/v12";
+const ACTIVE_RUNTIME_RELEASE = "openthrottle-snapshot/v13";
 const V12_PROOF_FILE = "v12-deploy-proof.json";
 const V12_PROOF_PATH = `supervisor/pipelines/${V12_PROOF_FILE}`;
 const SNAPSHOT_IDENTITY = "openthrottle-v2-ce-${short_head}";
@@ -30,8 +30,8 @@ assert(
   "supervisor runtime descriptor must match sandbox installed capabilities"
 );
 assert(
-  supervisorDescriptor.release === V12_RUNTIME_RELEASE,
-  `v12 deploy proof must stay bound to ${V12_RUNTIME_RELEASE}`
+  supervisorDescriptor.release === ACTIVE_RUNTIME_RELEASE,
+  `deploy proof must stay bound to ${ACTIVE_RUNTIME_RELEASE}`
 );
 
 const deployWorkflow = read(".github/workflows/deploy.yml");
