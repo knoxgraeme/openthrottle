@@ -50,6 +50,11 @@ terminate_agent_processes() {
 # Preserve native session/auth data, but discard every executable user-level
 # config surface. Claude loads CE from the root-owned marketplace; Codex loads
 # CE from /etc/codex/skills. Per-stage hooks/config are rebuilt later below.
+# ~/.claude/backups is part of that surface: the CLI's corruption recovery
+# moves ~/.claude.json there, and heal_claude_config (lib/runtime.sh) restores
+# the newest backup when the config is missing — exactly the state this reset
+# creates — so leaving backups behind would resurrect the previous stage's
+# config across the stage boundary.
 reset_agent_execution_state() {
   for profile in "${AGENT_HOME}/.claude" "${AGENT_HOME}/.codex"; do
     if [[ -L "$profile" ]]; then
@@ -72,6 +77,7 @@ reset_agent_execution_state() {
   rm -rf \
     "${AGENT_HOME}/.agents" \
     "${AGENT_HOME}/.claude/agents" \
+    "${AGENT_HOME}/.claude/backups" \
     "${AGENT_HOME}/.claude/commands" \
     "${AGENT_HOME}/.claude/hooks" \
     "${AGENT_HOME}/.claude/plugins" \

@@ -7,10 +7,13 @@
 # `decision:block` + `reason` continues the run (Claude reads additionalContext,
 # Codex uses reason as the continuation prompt), so one script serves both.
 #
-# The Fly supervisor's inbox poller (supervisor/src/inbox.ts) writes per-message
-# fenced steering envelopes into ~/.ot/inbox/<delivery-id>.json while the agent
-# runs. On each hook boundary this script emits an `additionalContext` injection,
-# then atomically journals the processed delivery before removing its envelope.
+# The Fly supervisor's inbox poller (supervisor/src/runtime/steering.ts) writes
+# per-message fenced steering envelopes into ~/.ot/inbox/<delivery-id>.json
+# while the agent runs, staging each upload as <delivery-id>.json.part and
+# renaming it into place so a torn write is never visible under a name this
+# script reads. On each hook boundary this script emits an `additionalContext`
+# injection, then atomically journals the processed delivery before removing
+# its envelope.
 # The running agent sees the steering WITHOUT the run being killed. On `Stop` it
 # blocks the stop so a run cannot END with unread steering.
 #
@@ -35,7 +38,9 @@ if [ -n "$event_json" ]; then
 fi
 
 # Collect pending steering files. bash expands the glob in lexical (roughly
-# chronological, since ids sort stably) order. Silent no-op when the inbox is
+# chronological, since ids sort stably) order. The supervisor stages uploads
+# as `<delivery-id>.json.part` and renames them into place, so this `*.json`
+# glob never matches an in-flight staged file. Silent no-op when the inbox is
 # absent or empty so the agent proceeds/stops normally — NO stdout.
 shopt -s nullglob
 files=("$INBOX_DIR"/*.json)
@@ -50,13 +55,17 @@ for f in "${files[@]}"; do
   [ -f "$f" ] || continue
   envelope="$(cat "$f" 2>/dev/null || true)"
   if ! content="$(printf '%s' "$envelope" | jq -er '.body | strings | select(length > 0)' 2>/dev/null)"; then
-    rm -f "$f"
+    # Unreadable or malformed: leave the file and skip it this pass. The
+    # supervisor marks a delivery dispatched on upload and never re-writes it,
+    # so deleting here would destroy the message forever; retention costs one
+    # skipped file per pass and preserves it for a repaired later read.
     continue
   fi
   delivery_id="$(printf '%s' "$envelope" | jq -r '.delivery_id // empty')"
   request_hash="$(printf '%s' "$envelope" | jq -r '.request_hash // empty')"
   if [[ ! "$delivery_id" =~ ^[0-9a-fA-F-]{36}$ || ! "$request_hash" =~ ^[0-9a-f]{64}$ ]]; then
-    rm -f "$f"
+    # Same retention rule as the parse failure above: an envelope without a
+    # well-formed fence identity is never injected, but never destroyed either.
     continue
   fi
   envelope_run_id="$(printf '%s' "$envelope" | jq -r '.run_id // empty')"

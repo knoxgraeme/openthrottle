@@ -2414,6 +2414,31 @@ function arg(name, fallback) {
   return index >= 0 ? process.argv[index + 1] : fallback;
 }
 
+// Minimal sealed loop result for a throw executeLoopAction never got to
+// classify (mirrors fallbackStageResultEvent in execute-stage.mjs): the
+// supervisor polls only the sealed result path, so a crash that writes
+// nothing reads as "pending" until the reaper misreports it. Diagnostics are
+// bounded and sanitized like every other receipt; the credential-envelope
+// bytes themselves can never appear here because readLoopActionCredentialEnv
+// throws fixed messages only.
+export function fallbackLoopActionResult({ request, error, now = () => new Date().toISOString() }) {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    version: 1,
+    kind: "loop_action_result",
+    event_id: randomUUID(),
+    action_id: request.actionId,
+    attempt_id: request.attemptId,
+    request_hash: request.requestHash,
+    outcome: "retryable_infrastructure_failure",
+    native_session_id: request.nativeSessionId ?? null,
+    subject: null,
+    receipt: sanitizeArtifactText(`loop executor failed before sealing a result: ${message}`)
+      .slice(0, 128_000),
+    created_at: now(),
+  };
+}
+
 function main() {
   const requestPath = resolve(arg("--request", process.env.OT_LOOP_REQUEST_FILE));
   const rawRequest = JSON.parse(readFileSync(requestPath, "utf8"));
@@ -2422,22 +2447,38 @@ function main() {
     writeFileSync(1, `${canonicalJson(request)}\n`);
     return;
   }
-  const credentialsPath = resolve(arg("--credentials", process.env.OT_LOOP_CREDENTIALS_FILE ?? loopCredentialsPath({
-    attemptId: request.attemptId,
-    actionId: request.actionId,
-    rootDir: configuredActionRoot(),
-  })));
-  const credentialEnvelope = readLoopActionCredentialEnv(credentialsPath);
   const outputPath = resolve(arg("--output", process.env.OT_LOOP_RESULT_FILE ?? loopResultPath({
     attemptId: request.attemptId,
     actionId: request.actionId,
     rootDir: configuredActionRoot(),
   })));
-  writeJsonAtomic(outputPath, executeLoopAction({
-    request,
-    credentialEnv: credentialEnvelope ?? {},
-    credentialEnvelopeMissing: credentialEnvelope === null,
-  }));
+  try {
+    const credentialsPath = resolve(arg("--credentials", process.env.OT_LOOP_CREDENTIALS_FILE ?? loopCredentialsPath({
+      attemptId: request.attemptId,
+      actionId: request.actionId,
+      rootDir: configuredActionRoot(),
+    })));
+    const credentialEnvelope = readLoopActionCredentialEnv(credentialsPath);
+    writeJsonAtomic(outputPath, executeLoopAction({
+      request,
+      credentialEnv: credentialEnvelope ?? {},
+      credentialEnvelopeMissing: credentialEnvelope === null,
+    }));
+  } catch (error) {
+    // Last-resort fence: the request is validated and the output path is
+    // known, so any throw executeLoopAction did not fold into its own result
+    // (a malformed credential envelope, a missing integration repository, a
+    // corrupt persisted correction state) must still leave a sealed typed
+    // result the supervisor can settle as retryable and re-dispatch.
+    try {
+      writeJsonAtomic(outputPath, fallbackLoopActionResult({ request, error }));
+    } catch (fallbackError) {
+      console.error(`execute-loop: fallback loop result was not written: ${
+        fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+      }`);
+    }
+    throw error;
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

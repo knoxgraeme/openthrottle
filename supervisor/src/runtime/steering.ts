@@ -128,6 +128,11 @@ export async function deliverPendingInbox(params: {
         // Delivery IDs are supervisor-generated UUIDs. Do not put provider-
         // supplied semantic work IDs into a remote path.
         const remotePath = `${INBOX_DIR}/${message.delivery_id}.json`;
+        // Stage to a `.json.part` sibling and rename into place: the drain
+        // hook's `*.json` glob never matches the staged name, so it can never
+        // observe (and discard) a torn, half-uploaded envelope of a delivery
+        // this poller will already have marked dispatched and never re-writes.
+        const stagedPath = `${remotePath}.part`;
         // The body is untrusted human/operator data — written verbatim as file
         // contents only, never interpreted here.
         await sandbox.fs.uploadFile!(
@@ -143,13 +148,16 @@ export async function deliverPendingInbox(params: {
             context_revision: message.context_revision,
             body: message.body,
           })),
-          remotePath
+          stagedPath
         );
-        await sandbox.fs.setFilePermissions!(remotePath, {
+        // Permissions land on the staged file so the rename publishes the
+        // envelope fully formed AND fully owned in one step.
+        await sandbox.fs.setFilePermissions!(stagedPath, {
           owner: "agent",
           group: "agent",
           mode: "600",
         });
+        await sandbox.fs.moveFiles!(stagedPath, remotePath);
         // Upload is only dispatch. The sandbox hook writes a processed journal
         // after injection; a later poll observes that receipt and acknowledges
         // the exact fenced delivery.

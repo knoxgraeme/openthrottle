@@ -49,6 +49,16 @@ function validateCredentialEnvelope(value) {
 // which knows the request's credentialScopes, is the one that can tell that
 // apart from an engine invocation that needed a credential and never got
 // one -- this function only reports presence, never adjudicates it).
+//
+// The delete deliberately runs BEFORE validation: a malformed envelope's
+// bytes are still credential-grade material and must not survive on disk for
+// a later reader just because they failed to parse. Recovery is the caller's
+// job, not retention's: execute-loop.mjs's main() seals every throw from here
+// into a retryable_infrastructure_failure fallback result, so the supervisor
+// re-dispatches the action with a freshly materialized envelope instead of
+// polling a doomed "pending" forever. Every throw below is a fixed message
+// (never raw envelope content), so that fallback result can carry it
+// verbatim without leaking a secret fragment.
 export function readLoopActionCredentialEnv(path) {
   if (!existsSync(path)) return null;
   let raw;
@@ -69,5 +79,14 @@ export function readLoopActionCredentialEnv(path) {
   if (Buffer.byteLength(raw, "utf8") > MAX_CREDENTIAL_ENVELOPE_BYTES) {
     throw new Error("loop action credential envelope exceeds 64 KiB");
   }
-  return validateCredentialEnvelope(JSON.parse(raw));
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // Never rethrow JSON.parse's own error: on malformed input it embeds a
+    // snippet of the raw text -- here, credential material -- and this
+    // message travels into the sealed fallback result the supervisor reads.
+    throw new Error("loop action credential envelope is not valid JSON");
+  }
+  return validateCredentialEnvelope(parsed);
 }

@@ -41,6 +41,26 @@ describe("loop action credential envelope", () => {
     expect(existsSync(path)).toBe(false);
   });
 
+  it("deletes a malformed envelope and throws a fixed message carrying none of its bytes", () => {
+    const path = tempPath("credentials.json");
+    // Distinctive credential-like bytes: JSON.parse's own error message would
+    // embed a snippet of them, and this message travels into the sealed
+    // fallback result the supervisor reads.
+    writeFileSync(path, 'ghp_leaked-fragment{{{"env":');
+    let caught;
+    try {
+      readLoopActionCredentialEnv(path);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeTruthy();
+    expect(caught.message).toBe("loop action credential envelope is not valid JSON");
+    expect(caught.message).not.toContain("ghp_leaked-fragment");
+    // The delete-before-validate invariant holds: malformed bytes are still
+    // credential-grade material and must not survive for a later reader.
+    expect(existsSync(path)).toBe(false);
+  });
+
   it("rejects a credential envelope naming a variable outside the sandbox allowlist", () => {
     const path = tempPath("credentials.json");
     writeFileSync(path, JSON.stringify({ env: { FLY_API_TOKEN: "forbidden" } }));
