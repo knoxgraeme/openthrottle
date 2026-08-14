@@ -107,7 +107,11 @@ function architectureViolations(modules: SourceModule[]): string[] {
         }
         if (!edge.resolved) violations.push(`${rel}: relative import ${edge.specifier} does not resolve`);
       }
-      if (rel.startsWith("onboarding/") && edge.specifier === "@daytona/sdk") {
+      if (
+        rel.startsWith("onboarding/") &&
+        !rel.startsWith("onboarding/providers/") &&
+        edge.specifier === "@daytona/sdk"
+      ) {
         violations.push(`${rel}: provider SDK imports are confined to adapter subtrees`);
       }
       if (
@@ -168,5 +172,16 @@ describe("CLI onboarding architecture", () => {
         "onboarding/bad-require-command.ts: provider commands are confined to adapter subtrees",
       ])
     );
+  });
+
+  it("allows provider SDK imports inside adapter subtrees", () => {
+    const fixtures: SourceModule[] = [
+      {
+        file: path.join(sourceRoot, "onboarding", "providers", "daytona", "good-sdk.ts"),
+        source: "import '@daytona/sdk';",
+      },
+    ];
+
+    expect(architectureViolations([...productionSources(), ...fixtures])).toEqual([]);
   });
 });

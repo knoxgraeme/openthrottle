@@ -151,13 +151,24 @@ describe("setup orchestrator", () => {
       configuration: { snapshot: "fake-runtime-a-snapshot" },
     });
     expect(Object.keys(hosting.bundles.at(-1)?.secrets ?? {}).sort()).toEqual([
+      "DAYTONA_API_KEY",
+      "GITHUB_READ_TOKEN",
+      "GITHUB_TOKEN",
       "GITHUB_WEBHOOK_SECRET",
       "LINEAR_WEBHOOK_SECRET",
+      "OT_DEPLOY_TOKEN",
       "OT_INSTALL_SECRET",
       "OT_STATUS_TOKEN",
     ]);
+    expect(hosting.bundles.at(-1)?.secrets.OT_DEPLOY_TOKEN).toEqual({ owner: "provisioning", name: "deploy_token" });
+    expect(hosting.bundles.at(-1)?.secrets.GITHUB_TOKEN).toEqual({ owner: "operator", name: "github_token" });
+    expect(hosting.bundles.at(-1)?.secrets.GITHUB_READ_TOKEN).toEqual({ owner: "operator", name: "github_read_token" });
+    expect(hosting.bundles.at(-1)?.secrets.DAYTONA_API_KEY).toEqual({ owner: "operator", name: "daytona_api_key" });
     expect(JSON.stringify(store.profile)).not.toContain("daytona_api_key");
     expect(JSON.stringify(store.profile)).not.toContain("install_secret");
+    expect(JSON.stringify(store.profile)).not.toContain("deploy_token");
+    expect(JSON.stringify(store.profile)).not.toContain("github_token");
+    expect(JSON.stringify(store.profile)).not.toContain("github_read_token");
     expect(JSON.stringify(store.profile)).not.toContain("linear_webhook_secret");
     expect(JSON.stringify(store.profile)).not.toContain("github_webhook_secret");
   });
@@ -249,6 +260,37 @@ describe("setup orchestrator", () => {
         confirmMutations: async () => true,
       }).run()
     ).rejects.toThrow("digest-pinned");
+    expect(runtime.ensureCalls).toBe(0);
+    expect(hosting.ensureCalls).toBe(0);
+  });
+
+  it("accepts a name-addressed runtime snapshot and rejects malformed snapshot names before mutation", async () => {
+    const runtime = new FakeRuntime();
+    const hosting = new FakeHosting();
+    const catalogs = createProviderCatalogs({ hosting: [hosting], runtime: [runtime] });
+    const options = {
+      hostingProviderId: hosting.id,
+      runtimeProviderId: runtime.id,
+      catalogs,
+      profileStore: new MemoryProfileStore(),
+      confirmMutations: async () => true,
+      now: () => new Date("2026-07-28T00:00:00Z"),
+    };
+
+    const named = await new SetupOrchestrator({
+      ...options,
+      release: { ...release, runtime: { ...release.runtime, snapshotName: "openthrottle-v13" } },
+    }).run();
+    expect(named.outcome).toBe("ready");
+
+    runtime.ensureCalls = 0;
+    hosting.ensureCalls = 0;
+    await expect(
+      new SetupOrchestrator({
+        ...options,
+        release: { ...release, runtime: { ...release.runtime, snapshotName: ".starts-with-dot" } },
+      }).run()
+    ).rejects.toThrow("snapshot name");
     expect(runtime.ensureCalls).toBe(0);
     expect(hosting.ensureCalls).toBe(0);
   });

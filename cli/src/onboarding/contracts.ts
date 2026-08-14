@@ -25,6 +25,9 @@ export interface ReleaseManifest {
   runtime: {
     release: string;
     descriptorDigest: string;
+    // Some runtime providers address snapshots by name; `release` remains the
+    // runtime descriptor id, never a snapshot name.
+    snapshotName?: string;
   };
   recommendedResources: {
     cpu: number;
@@ -34,7 +37,7 @@ export interface ReleaseManifest {
 }
 
 export interface SecretRef {
-  owner: "cli" | "provisioning";
+  owner: "cli" | "provisioning" | "operator";
   name: string;
 }
 
@@ -106,5 +109,11 @@ export function assertProviderId(value: string, label = "provider ID"): void {
 export function assertDigestPinnedImage(value: string, label: string): void {
   if (!/^[^@\s]+@sha256:[a-f0-9]{64}$/i.test(value)) {
     throw new Error(`${label} must be a digest-pinned image reference`);
+  }
+}
+
+export function assertSnapshotName(value: string, label = "snapshot name"): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) {
+    throw new Error(`${label} must be 1-128 characters of letters, numbers, dots, dashes, and underscores`);
   }
 }

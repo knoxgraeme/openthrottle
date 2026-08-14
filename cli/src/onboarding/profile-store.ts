@@ -57,6 +57,24 @@ export function createProfile(input: {
   };
 }
 
+// Resource pins provider adapters record on the profile so a resumed setup can
+// find the same external resources it created or adopted.
+export const RESOURCE_KEYS = ["daytona_snapshot", "fly_app", "fly_org", "fly_region"] as const;
+
+export type ResourceKey = (typeof RESOURCE_KEYS)[number];
+
+export type ResourcePatch = Partial<Record<ResourceKey, string>>;
+
+export function withResources(profile: OnboardingProfile, patch: ResourcePatch, now = new Date()): OnboardingProfile {
+  const resources = { ...profile.resources };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) continue;
+    if (!value.trim()) throw new Error(`profile resource ${key} must be a non-empty string`);
+    resources[key] = value;
+  }
+  return validateProfile({ ...profile, resources, updatedAt: now.toISOString() });
+}
+
 export function validateProfile(value: unknown, expectedName?: string): OnboardingProfile {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("profile must be a JSON object");
