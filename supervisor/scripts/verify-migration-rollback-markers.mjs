@@ -99,8 +99,111 @@ function topLevelMigrationObjects(source) {
   throw new Error("could not statically parse the database migration definitions array");
 }
 
+function assertCanonicalMigrationProperties(object, definitionIndex) {
+  const allowedProperties = new Set(["version", "name", "source", "mode", "up"]);
+  const properties = new Set();
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let parenthesisDepth = 0;
+  let expectingProperty = false;
+  let quote = "";
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+
+  for (let index = 0; index < object.length; index += 1) {
+    const character = object[index];
+    const next = object[index + 1];
+    if (lineComment) {
+      if (character === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (character === "*" && next === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = "";
+      continue;
+    }
+    if (character === "/" && next === "/") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === "/" && next === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      if (braceDepth === 1 && expectingProperty) {
+        throw new Error(`migration definition ${definitionIndex} property keys must be identifiers`);
+      }
+      quote = character;
+      continue;
+    }
+    if (character === "{") {
+      braceDepth += 1;
+      if (braceDepth === 1) expectingProperty = true;
+      continue;
+    }
+    if (character === "}") {
+      if (braceDepth === 1) return;
+      braceDepth -= 1;
+      continue;
+    }
+    if (braceDepth !== 1) continue;
+
+    if (expectingProperty) {
+      if (/[\s,]/.test(character)) continue;
+      if (object.startsWith("...", index)) {
+        throw new Error(`migration definition ${definitionIndex} may not contain object spreads`);
+      }
+      if (character === "[") {
+        throw new Error(`migration definition ${definitionIndex} may not contain computed properties`);
+      }
+      const property = object.slice(index).match(/^[A-Za-z_$][A-Za-z0-9_$]*/)?.[0];
+      if (!property || property === "get" || property === "set") {
+        throw new Error(`migration definition ${definitionIndex} has a non-canonical property`);
+      }
+      let delimiterIndex = index + property.length;
+      while (/\s/.test(object[delimiterIndex] ?? "")) delimiterIndex += 1;
+      const delimiter = object[delimiterIndex];
+      if (delimiter !== ":" && delimiter !== "(") {
+        throw new Error(`migration definition ${definitionIndex} may not contain shorthand properties`);
+      }
+      if (!allowedProperties.has(property)) {
+        throw new Error(`migration definition ${definitionIndex} has unknown property ${property}`);
+      }
+      if (properties.has(property)) {
+        throw new Error(`migration definition ${definitionIndex} has duplicate property ${property}`);
+      }
+      properties.add(property);
+      expectingProperty = false;
+      index = delimiterIndex - 1;
+      continue;
+    }
+
+    if (character === "[") bracketDepth += 1;
+    else if (character === "]") bracketDepth -= 1;
+    else if (character === "(") parenthesisDepth += 1;
+    else if (character === ")") parenthesisDepth -= 1;
+    else if (character === "," && bracketDepth === 0 && parenthesisDepth === 0) {
+      expectingProperty = true;
+    }
+  }
+  throw new Error(`could not statically parse migration definition ${definitionIndex}`);
+}
+
 export function migrationDefinitionsFromSource(source) {
   const definitions = topLevelMigrationObjects(source).map((object, index) => {
+    assertCanonicalMigrationProperties(object, index + 1);
     const match = object.match(
       /^\s*\{\s*version\s*:\s*(\d+)\s*,\s*name[ \t]*:[ \t]*"((?:[^"\\]|\\.)*)"[ \t]*,/s
     );

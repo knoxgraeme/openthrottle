@@ -66,7 +66,7 @@ describe("migration rollback marker verifier", () => {
     ["shorthand", '  { version, name, source: "" },'],
   ])("fails closed for a %s migration name", (_label, definition) => {
     expect(() => assertMigrationNamesMarked(source(definition))).toThrow(
-      /could not statically verify a literal version and double-quoted literal name/
+      /could not statically verify a literal version and double-quoted literal name|may not contain/
     );
   });
 
@@ -76,6 +76,17 @@ describe("migration rollback marker verifier", () => {
   ])("fails closed for a top-level %s definition", (_label, definition) => {
     expect(() => assertMigrationNamesMarked(source(definition))).toThrow(
       /top-level object literals/
+    );
+  });
+
+  it.each([
+    ["in-object spread override", `  { version: 47, name: "safe${suffix}", ...{ name: "unmarked" }, source: "" },`],
+    ["duplicate name override", `  { version: 47, name: "safe${suffix}", name: "unmarked", source: "" },`],
+    ["computed name override", `  { version: 47, name: "safe${suffix}", ["name"]: "unmarked", source: "" },`],
+    ["getter name override", `  { version: 47, name: "safe${suffix}", get name() { return "unmarked"; }, source: "" },`],
+  ])("fails closed for an %s after a valid prefix", (_label, definition) => {
+    expect(() => assertMigrationNamesMarked(source(definition))).toThrow(
+      /may not contain|duplicate property|non-canonical property/
     );
   });
 
