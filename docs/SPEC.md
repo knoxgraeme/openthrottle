@@ -341,8 +341,8 @@ root-owned, read-only inputs:
 The request includes pipeline/manifest/runtime/config identities; stage,
 attempt, run, issue, session, and generation identities; ticket intent and
 bounded task/transition context; repository, exact base commit, base branch,
-working branch, and expected subject; agent, optional effective model and
-reasoning effort, and context policy; native session id where allowed;
+working branch, and expected subject; agent and context policy; native session
+id where allowed;
 capability, required artifacts, credential scopes, and live
 steering permission; repository-skill package identity where the capability is
 `agent/repository-skill@1`; and a request hash/idempotency key covering the
@@ -1283,8 +1283,10 @@ The selected worker's provider default applies to ordinary and structured
 agent actions; an explicit structured worker model wins, followed by the
 provider default, while the legacy top-level model applies only when the
 selected worker matches the top-level `agent`. Effective model and reasoning
-effort are copied into the sealed, hash-bound action request and rendered as
-provider CLI flags rather than inherited from ambient user configuration.
+effort for ordinary stages are derived from the exact sealed repository config
+identified by the hash-bound config digest. Structured child actions copy the
+effective values directly into their hash-bound action request. Both paths
+render provider CLI flags rather than inheriting ambient user configuration.
 The config is fetched from the exact base commit, strictly validated,
 normalized, hashed, and uploaded as a sealed snapshot. Registered repositories
 are trusted for code execution because
