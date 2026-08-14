@@ -58,6 +58,7 @@ jobs:
       sandbox: ${{ steps.filter.outputs.sandbox }}
       skills: ${{ steps.filter.outputs.skills }}
       runtime_descriptor: ${{ steps.filter.outputs.runtime_descriptor }}
+      database_migrations: ${{ steps.filter.outputs.database_migrations }}
       supervisor: ${{ steps.filter.outputs.supervisor }}
     steps:
       - uses: actions/checkout@v4
@@ -74,6 +75,8 @@ jobs:
               - 'skills/**'
             runtime_descriptor:
               - 'supervisor/pipelines/runtime-capabilities-v1.json'
+            database_migrations:
+              - 'supervisor/src/persistence/migrations/definitions.ts'
             supervisor:
               - 'supervisor/**'
 
@@ -131,6 +134,7 @@ jobs:
       FLY_ORG: ${{ vars.FLY_ORG || 'personal' }}
       FLY_REGION: ${{ vars.FLY_REGION || 'sjc' }}
       EXPECTED_SNAPSHOT: ${{ needs.snapshot.outputs.name || inputs.expected_snapshot }}
+      EXPECTED_MIGRATION_ROLLBACK_CONTRACT: schema-migrations-name-additive-rollback-compatible/v1
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
@@ -159,14 +163,22 @@ jobs:
       - name: Stage the new snapshot name
         if: needs.snapshot.result == 'success'
         run: flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="${{ needs.snapshot.outputs.name }}"
-      - name: Pause admission and wait for the v12 cutover drain
+      - name: Pause admission and wait for cutover evidence
         # This supervisor-only fence release does not build a snapshot, so its
         # first push deploys without calling endpoints its parent lacks. Once
         # installed, every push that builds a new snapshot gates automatically.
-        if: inputs.prepare_v12_cutover || (github.event_name == 'push' && needs.snapshot.result == 'success')
+        # Migration-bearing supervisor releases also gate here, including
+        # workflow_dispatch deploys, so the live rollback image proves it
+        # supports marked future migrations before the new image opens SQLite.
+        if: >-
+          inputs.prepare_v12_cutover ||
+          (github.event_name == 'push' && needs.snapshot.result == 'success') ||
+          needs.changes.outputs.database_migrations == 'true'
         run: |
           set -euo pipefail
-          if [[ -z "${EXPECTED_SNAPSHOT}" ]]; then
+          requires_snapshot_check="${{ inputs.prepare_v12_cutover || needs.snapshot.result == 'success' }}"
+          requires_migration_contract="${{ needs.changes.outputs.database_migrations == 'true' }}"
+          if [[ "${requires_snapshot_check}" == "true" && -z "${EXPECTED_SNAPSHOT}" ]]; then
             echo "expected_snapshot is required when this run does not build a snapshot" >&2
             exit 1
           fi
@@ -178,11 +190,16 @@ jobs:
               "node /app/scripts/cutover-control.mjs evidence")"
             printf '%s\n' "$evidence" | jq .
             if printf '%s\n' "$evidence" | jq -e \
-              '.admission.paused == 1 and .drain.clear == true' >/dev/null; then
+              --arg requires_migration_contract "$requires_migration_contract" \
+              --arg migration_contract "$EXPECTED_MIGRATION_ROLLBACK_CONTRACT" \
+              '.admission.paused == 1 and
+               .drain.clear == true and
+               ($requires_migration_contract != "true" or
+                .database.migrationRollbackCompatibility.contract == $migration_contract)' >/dev/null; then
               break
             fi
             if (( SECONDS >= deadline )); then
-              echo "v12 cutover drain did not clear within 600 seconds" >&2
+              echo "cutover evidence did not clear within 600 seconds" >&2
               exit 1
             fi
             sleep 10
@@ -212,6 +229,7 @@ jobs:
       - name: Resume admission after v12 cutover
         if: >-
           (github.event_name == 'push' && needs.snapshot.result == 'success') ||
+          needs.changes.outputs.database_migrations == 'true' ||
           (inputs.prepare_v12_cutover && inputs.resume_after_v12_cutover)
         run: |
           flyctl ssh console --app "$FLY_APP" --command \
