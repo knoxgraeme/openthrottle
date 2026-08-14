@@ -433,12 +433,19 @@ agent output cannot satisfy the receipt/proposal fence.
 A clean engine exit that contains exactly one parsed standard-receipt candidate
 may receive one deterministic envelope correction. Correction is executor code,
 not another model invocation: it may delete only validator-diagnosed unknown
-fields, set the top-level receipt schema, and replace exact fence, subject, or
-producer leaves for which the sealed request is authoritative. It validates the
-complete corrected receipt, reapplies every action fence, and requires all
-non-diagnosed content to remain byte-equivalent under canonical JSON. It never
-changes assurance, result, evidence, semantic payload values, or repository
-content, and it refuses missing semantic values or an unparsed candidate.
+fields, set the top-level receipt schema, replace the top-level receipt type
+from the sealed expected receipt type, and replace exact fence, subject, or
+producer leaves for which the sealed request is authoritative. The expected
+receipt type is part of the hash-bound loop-action request and is echoed in the
+Receipt Authority Contract; it is derived by the compiled phase binding/action
+kind, not by agent output or action-name prefixes. It validates the complete
+corrected receipt, reapplies every action fence including receipt-type equality,
+and requires all non-diagnosed content to remain byte-equivalent under canonical
+JSON. It never changes assurance, result, evidence, semantic payload values, or
+repository content, and it refuses missing semantic values or an unparsed
+candidate. A schema-valid cross-role receipt can be accepted only if correcting
+`/type` to the sealed expected type leaves its existing result and payload
+independently valid for that expected type; semantic content is never rewritten.
 Before correction, the executor atomically writes a root-owned
 `openthrottle.loop-receipt-correction/v1` state file bound to the attempt,
 action, and request hash. The diagnostic engine-output tail is capped at 64 KiB
