@@ -1,5 +1,13 @@
 name: Deploy
 
+# NOTE: this workflow deploys the LIVE supervisor via Fly's remote builder and
+# rebuilds the Daytona snapshot — both mutable references. The digest-pinned
+# images (ghcr.io/knoxgraeme/openthrottle-{supervisor,sandbox}) and the baked
+# CLI release manifest that `openthrottle setup` verifies against are produced
+# by .github/workflows/release.yml instead. Converging this deploy path onto
+# the pinned supervisor release image is a deliberate follow-up; nothing here
+# consumes release.yml output yet.
+
 # Rebuilds the Daytona sandbox snapshot and/or deploys the Fly supervisor when
 # the paths that feed them change on main. Manual dispatch can force either.
 #
