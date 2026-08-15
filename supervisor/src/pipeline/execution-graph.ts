@@ -1,7 +1,6 @@
 import {
   COMMAND_NAME_PATTERN,
   parseGraphContract,
-  validateGraphContract,
   type GraphContract,
   type GraphNode,
   type GraphUnitPhase,
@@ -588,21 +587,6 @@ export function parseAndCompileExecutionGraph(
   options: CompileExecutionGraphOptions & { source?: string } = {}
 ): CompiledExecutionGraph {
   const graph = parseGraphContract(raw, { source: options.source ?? "graph", config: options.config });
-  const compiledManifest = compileExecutionGraph(graph.value, options);
-  const unitPhaseProjection = unitPhaseProjectionFromManifest(compiledManifest.manifest);
-  return {
-    graph: graph.value,
-    graphDigest: graph.digest,
-    ...unitPhaseProjection,
-    manifest: compiledManifest,
-  };
-}
-
-export function validateAndCompileExecutionGraph(
-  value: unknown,
-  options: CompileExecutionGraphOptions & { source?: string } = {}
-): CompiledExecutionGraph {
-  const graph = validateGraphContract(value, { source: options.source ?? "graph", config: options.config });
   const compiledManifest = compileExecutionGraph(graph.value, options);
   const unitPhaseProjection = unitPhaseProjectionFromManifest(compiledManifest.manifest);
   return {

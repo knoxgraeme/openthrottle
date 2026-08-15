@@ -3,13 +3,7 @@ import type { ControlThreadEvent } from "../../app/ports.js";
 import { sanitizeText } from "../../shared/sanitize.js";
 
 const HTTP_TIMEOUT_MS = 15_000;
-const GITHUB_PULL_REQUEST_URL_PATTERN =
-  /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+$/;
 const GITHUB_COMMIT_SHA_PATTERN = /^[a-f0-9]{40}$/;
-
-export function isGithubPullRequestUrl(value: unknown): value is string {
-  return typeof value === "string" && GITHUB_PULL_REQUEST_URL_PATTERN.test(value);
-}
 
 export function verifyGithubSignature(
   rawBody: string,

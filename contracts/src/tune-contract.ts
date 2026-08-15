@@ -574,16 +574,8 @@ export function validateTuneSealedIntentContract(value: unknown, options: { sour
   return normalizedContract(parseSealedIntentValue(value, options.source ?? "tune_intent"));
 }
 
-export function parseTuneSealedIntentContract(raw: string, options: { source?: string } = {}): ValidatedContract<TuneSealedIntent> {
-  return parseBoundedJsonContract(raw, options, "tune_intent", 96, validateTuneSealedIntentContract);
-}
-
 export function validateTuneAnalysisInputContract(value: unknown, options: { source?: string } = {}): ValidatedContract<TuneAnalysisInput> {
   return normalizedContract(parseAnalysisInputValue(value, options.source ?? "tune_analysis_input"));
-}
-
-export function parseTuneAnalysisInputContract(raw: string, options: { source?: string } = {}): ValidatedContract<TuneAnalysisInput> {
-  return parseBoundedJsonContract(raw, options, "tune_analysis_input", 256, validateTuneAnalysisInputContract);
 }
 
 export function validateTuneAnalysisContract(value: unknown, options: { source?: string } = {}): ValidatedContract<TuneAnalysis> {
@@ -608,10 +600,6 @@ export function validateTuneAnalysisContract(value: unknown, options: { source?:
     corpus_digest: analysis.corpus_digest,
   }, source);
   return normalizedContract(analysis);
-}
-
-export function parseTuneAnalysisContract(raw: string, options: { source?: string } = {}): ValidatedContract<TuneAnalysis> {
-  return parseBoundedJsonContract(raw, options, "tune_analysis", 256, validateTuneAnalysisContract);
 }
 
 export function validateTuneProposalContract(value: unknown, options: { source?: string } = {}): ValidatedContract<TuneProposal> {
@@ -655,10 +643,6 @@ export function validateTuneProposalContract(value: unknown, options: { source?:
   assertProposalMatchesIntent(proposal, source);
   assertProposalEvidenceBindings(proposal, source, citationContract.digest);
   return normalizedContract(proposal);
-}
-
-export function parseTuneProposalContract(raw: string, options: { source?: string } = {}): ValidatedContract<TuneProposal> {
-  return parseBoundedJsonContract(raw, options, "tune_proposal", 640, validateTuneProposalContract);
 }
 
 export function validateTuneDecisionContract(
@@ -718,13 +702,6 @@ export function validateTuneDecisionContract(
   return normalizedContract(decision);
 }
 
-export function parseTuneDecisionContract(
-  raw: string,
-  options: TuneDecisionValidationOptions = {}
-): ValidatedContract<TuneDecision> {
-  return parseBoundedJsonContract(raw, options, "tune_decision", 32, validateTuneDecisionContract);
-}
-
 export function validateTuneEditAuthorizationContract(
   value: unknown,
   options: TuneEditAuthorizationValidationOptions = {}
@@ -776,13 +753,6 @@ export function validateTuneEditAuthorizationContract(
   return normalizedContract(authorization);
 }
 
-export function parseTuneEditAuthorizationContract(
-  raw: string,
-  options: TuneEditAuthorizationValidationOptions = {}
-): ValidatedContract<TuneEditAuthorization> {
-  return parseBoundedJsonContract(raw, options, "tune_edit_authorization", 32, validateTuneEditAuthorizationContract);
-}
-
 export function validateTuneReleaseDescriptorContract(value: unknown, options: { source?: string } = {}): ValidatedContract<TuneReleaseDescriptor> {
   const source = options.source ?? "tune_release_descriptor";
   const input = objectAt(value, source, RELEASE_DESCRIPTOR_FIELDS);
@@ -795,8 +765,4 @@ export function validateTuneReleaseDescriptorContract(value: unknown, options: {
     contract_digests: parseDigestList(input.contract_digests, `${source}.contract_digests`, { min: 1, max: 32 }),
     issued_at: timestamp(input.issued_at, `${source}.issued_at`),
   });
-}
-
-export function parseTuneReleaseDescriptorContract(raw: string, options: { source?: string } = {}): ValidatedContract<TuneReleaseDescriptor> {
-  return parseBoundedJsonContract(raw, options, "tune_release_descriptor", 32, validateTuneReleaseDescriptorContract);
 }

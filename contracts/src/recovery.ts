@@ -215,7 +215,3 @@ export function parseLoopReceiptRecoveryContract(
     ...(sourceManifestSha256 ? { source_manifest_sha256: sourceManifestSha256 } : {}),
   });
 }
-
-export function validateLoopReceiptRecoveryContract(value: unknown): LoopReceiptRecoveryContract {
-  return parseLoopReceiptRecoveryContract(value).value;
-}

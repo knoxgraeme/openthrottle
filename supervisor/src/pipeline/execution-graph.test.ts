@@ -5,7 +5,6 @@ import { loadPipelineCatalog, resolvePipelineReference, type PipelineManifest, t
 import {
   REPOSITORY_SKILL_CAPABILITY,
   parseAndCompileExecutionGraph,
-  validateAndCompileExecutionGraph,
 } from "./execution-graph.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
@@ -30,6 +29,13 @@ function shippedManifest(reference: string): PipelineManifest {
 
 function compiledGraph(path: string, options: Parameters<typeof parseAndCompileExecutionGraph>[1]): PipelineManifest {
   return parseAndCompileExecutionGraph(readFileSync(path, "utf8"), { source: path, ...options }).manifest.manifest;
+}
+
+function compileGraphValue(
+  value: unknown,
+  options: Parameters<typeof parseAndCompileExecutionGraph>[1] = {}
+): ReturnType<typeof parseAndCompileExecutionGraph> {
+  return parseAndCompileExecutionGraph(JSON.stringify(value), options);
 }
 
 function stageBehavior(stage: PipelineStage): unknown {
@@ -384,7 +390,7 @@ describe("execution graph compiler", () => {
       },
     });
 
-    const compiled = validateAndCompileExecutionGraph(graph, {
+    const compiled = compileGraphValue(graph, {
       id: "repository/a",
       version: 7,
     });
@@ -415,22 +421,22 @@ describe("execution graph compiler", () => {
       },
     });
 
-    const compiled = validateAndCompileExecutionGraph(graph, {
+    const compiled = compileGraphValue(graph, {
       aggregatePublishContext: "prefer_resume",
     });
     const publish = compiled.manifest.manifest.stages.find((stage) => stage.id === "publish")!;
 
     expect(publish.context).toBe("prefer_resume");
-    expect(() => validateAndCompileExecutionGraph(graph, {
+    expect(() => compileGraphValue(graph, {
       aggregatePublishContext: "fresh" as unknown as "prefer_resume",
     })).toThrow(/compile\.aggregatePublishContext: must be prefer_resume when provided/);
   });
 
   it("changes the pinned manifest digest when only a unit phase worker binding changes", () => {
-    const base = validateAndCompileExecutionGraph(minimalUnitGraph({
+    const base = compileGraphValue(minimalUnitGraph({
       worker: { model: "gpt-5" },
     }));
-    const changed = validateAndCompileExecutionGraph(minimalUnitGraph({
+    const changed = compileGraphValue(minimalUnitGraph({
       worker: { model: "gpt-5-mini" },
     }));
 
@@ -449,7 +455,7 @@ describe("execution graph compiler", () => {
 
   it("pins repository skill package identity inside unit phase bindings", () => {
     const pkg = repositorySkillPackage();
-    const compiled = validateAndCompileExecutionGraph(minimalUnitGraph({
+    const compiled = compileGraphValue(minimalUnitGraph({
       worker: {
         skills: ["repo://implement_unit"],
         credentials: ["model.invoke", "provider.read", "repo.read"],
@@ -477,7 +483,7 @@ describe("execution graph compiler", () => {
   });
 
   it("preserves authored ordinary run loop execution settings on compiled stages", () => {
-    const compiled = validateAndCompileExecutionGraph(minimalGraph({
+    const compiled = compileGraphValue(minimalGraph({
       worker: {
         skills: ["builtin://ce/review@1"],
         credentials: ["model.invoke", "repo.read"],
@@ -513,7 +519,7 @@ describe("execution graph compiler", () => {
     const credentials = capability === "ce/implement@1"
       ? ["model.invoke", "provider.read", "repo.read", "repo.write"]
       : ["model.invoke", "repo.read"];
-    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+    expect(() => compileGraphValue(minimalGraph({
       worker: { skills: [`builtin://${capability}`], credentials },
       loop: { skill: `builtin://${capability}`, input_scope: scope },
     }))).toThrow(new RegExp(
@@ -522,7 +528,7 @@ describe("execution graph compiler", () => {
   });
 
   it.each([123, 600])("rejects ordinary run loop timeout %s when the enforced stage timeout is 300", (timeoutSeconds) => {
-    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+    expect(() => compileGraphValue(minimalGraph({
       loop: { timeout_seconds: timeoutSeconds },
     }), {
       ordinaryStageTimeoutSeconds: 300,
@@ -530,7 +536,7 @@ describe("execution graph compiler", () => {
   });
 
   it("preserves authored structured loop execution settings in unit phase bindings", () => {
-    const compiled = validateAndCompileExecutionGraph(minimalUnitGraph({
+    const compiled = compileGraphValue(minimalUnitGraph({
       loop: { max_rounds: 7, timeout_seconds: 123 },
       leadLoop: { max_rounds: 2, timeout_seconds: 45 },
     }));
@@ -556,13 +562,13 @@ describe("execution graph compiler", () => {
   });
 
   it("rejects gate phases whose worker requests write credentials", () => {
-    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+    expect(() => compileGraphValue(minimalUnitGraph({
       leadWorker: { credentials: ["model.invoke", "repo.read", "repo.write"] },
     }))).toThrow(/graph\.nodes\.units\.phases\[2\]\.worker\.credentials: gate phases cannot request repo\.write/);
   });
 
   it("rejects gate phases whose capability requires write credentials", () => {
-    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+    expect(() => compileGraphValue(minimalUnitGraph({
       leadWorker: {
         skills: ["builtin://ce/implement@1"],
         credentials: ["model.invoke", "provider.read", "repo.read", "repo.write"],
@@ -570,7 +576,7 @@ describe("execution graph compiler", () => {
       leadLoop: { skill: "builtin://ce/implement@1" },
     }))).toThrow(/graph\.nodes\.units\.phases\[2\]\.worker\.credentials: gate phases cannot request repo\.write/);
 
-    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+    expect(() => compileGraphValue(minimalUnitGraph({
       leadWorker: {
         skills: ["builtin://ce/implement@1"],
         credentials: ["model.invoke", "provider.read", "repo.read"],
@@ -580,7 +586,7 @@ describe("execution graph compiler", () => {
   });
 
   it("allows implement unit workers to request declared MCP access", () => {
-    const compiled = validateAndCompileExecutionGraph(minimalUnitGraph({
+    const compiled = compileGraphValue(minimalUnitGraph({
       worker: {
         allowed_mcp_servers: ["github"],
         credentials: ["model.invoke", "mcp", "provider.read", "repo.read"],
@@ -595,7 +601,7 @@ describe("execution graph compiler", () => {
   });
 
   it("rejects accept-unit gate phases that violate the shared credential contract", () => {
-    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+    expect(() => compileGraphValue(minimalUnitGraph({
       leadWorker: {
         skills: ["builtin://accept-unit@1"],
         credentials: ["repo.read"],
@@ -603,7 +609,7 @@ describe("execution graph compiler", () => {
       leadLoop: { skill: "builtin://accept-unit@1" },
     }))).toThrow(/unitPhaseBindings\[2\]\.credentials: accept-unit@1 requires credential scope model\.invoke/);
 
-    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+    expect(() => compileGraphValue(minimalUnitGraph({
       leadWorker: {
         skills: ["builtin://accept-unit@1"],
         credentials: ["model.invoke", "repo.read", "provider.read"],
@@ -620,7 +626,7 @@ describe("execution graph compiler", () => {
       ],
     });
     const pkg = repositorySkillPackage();
-    const compiled = validateAndCompileExecutionGraph(minimalGraph({
+    const compiled = compileGraphValue(minimalGraph({
       worker: {
         skills: ["repo://implement_unit"],
         credentials: ["model.invoke", "repo.read", "repo.write"],
@@ -640,7 +646,7 @@ describe("execution graph compiler", () => {
       credentials: ["model.invoke", "repo.read", "repo.write"],
     });
 
-    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+    expect(() => compileGraphValue(minimalGraph({
       worker: {
         skills: ["repo://implement_unit"],
         credentials: ["model.invoke", "repo.read", "repo.write"],
@@ -656,7 +662,7 @@ describe("execution graph compiler", () => {
   });
 
   it("compiles repository-defined command names from the pinned command inventory", () => {
-    const compiled = validateAndCompileExecutionGraph(minimalGraph({
+    const compiled = compileGraphValue(minimalGraph({
       node: {
         kind: "command",
         loop: undefined,
@@ -688,20 +694,20 @@ describe("execution graph compiler", () => {
         skill: "repo://implement_unit",
       },
     });
-    expect(() => validateAndCompileExecutionGraph(graph))
+    expect(() => compileGraphValue(graph))
       .toThrow(/repository skill implement_unit was not pinned by admission/);
     const runtimeWithoutRepositorySkills = buildInstalledRuntimeDescriptor("production-like/v1", {
       capabilities: buildInstalledRuntimeDescriptor("production-like-base/v1").descriptor.capabilities
         .filter((capability) => capability !== REPOSITORY_SKILL_CAPABILITY),
     });
-    expect(() => validateAndCompileExecutionGraph(graph, {
+    expect(() => compileGraphValue(graph, {
       runtime: runtimeWithoutRepositorySkills.descriptor,
       repositorySkills: new Map([["implement_unit", repositorySkillPackage()]]),
     })).toThrow(/runtime capability mismatch: capability:agent\/repository-skill@1/);
   });
 
   it("rejects syntactically valid but unsupported builtin loop skills during compilation", () => {
-    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+    expect(() => compileGraphValue(minimalGraph({
       worker: {
         skills: ["builtin://ce/imaginary@1"],
         credentials: ["model.invoke", "repo.read"],
@@ -711,7 +717,7 @@ describe("execution graph compiler", () => {
   });
 
   it("rejects syntactically valid but unsupported builtin unit phase skills during compilation", () => {
-    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+    expect(() => compileGraphValue(minimalUnitGraph({
       leadWorker: {
         skills: ["builtin://accept-imaginary@1"],
         credentials: ["model.invoke", "repo.read"],
@@ -721,7 +727,7 @@ describe("execution graph compiler", () => {
   });
 
   it("rejects known builtin capabilities that have no ordinary stage dispatch adapter", () => {
-    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+    expect(() => compileGraphValue(minimalGraph({
       worker: {
         skills: ["builtin://accept-unit@1"],
         credentials: ["model.invoke", "repo.read"],
@@ -731,7 +737,7 @@ describe("execution graph compiler", () => {
   });
 
   it("rejects builtin capabilities that do not match the structured phase adapter", () => {
-    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+    expect(() => compileGraphValue(minimalUnitGraph({
       worker: {
         skills: ["builtin://ce/review@1"],
         credentials: ["model.invoke", "repo.read"],
@@ -739,7 +745,7 @@ describe("execution graph compiler", () => {
       loop: { skill: "builtin://ce/review@1" },
     }))).toThrow(/graph\.nodes\.units\.phases\.0\.skill: ce\/review@1 is not runnable for the implement phase/);
 
-    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+    expect(() => compileGraphValue(minimalUnitGraph({
       phases: [
         { id: "implement", kind: "agent", loop: "loop" },
         { id: "simplify", kind: "agent", loop: "loop" },
@@ -749,7 +755,7 @@ describe("execution graph compiler", () => {
       ],
     }))).toThrow(/graph\.nodes\.units\.phases\.1\.skill: ce\/implement@1 is not runnable for the simplify phase/);
 
-    expect(() => validateAndCompileExecutionGraph(minimalUnitGraph({
+    expect(() => compileGraphValue(minimalUnitGraph({
       leadWorker: {
         skills: ["builtin://ce/review@1"],
         credentials: ["model.invoke", "repo.read"],
@@ -862,11 +868,11 @@ describe("execution graph compiler", () => {
       /graph\.nodes\.stage\.command: must be one of: test, lint, build, format/,
     ],
   ])("fails closed for unsupported %s", (_label, graph, error) => {
-    expect(() => validateAndCompileExecutionGraph(graph)).toThrow(error);
+    expect(() => compileGraphValue(graph)).toThrow(error);
   });
 
   it("rejects repository command nodes absent from the pinned command inventory", () => {
-    expect(() => validateAndCompileExecutionGraph(minimalGraph({
+    expect(() => compileGraphValue(minimalGraph({
       node: {
         kind: "command",
         loop: undefined,

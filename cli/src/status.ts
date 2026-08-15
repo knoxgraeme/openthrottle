@@ -19,14 +19,11 @@ interface TicketRow {
     pipeline_id: string;
     pipeline_version: number;
     generation: number;
-    task_type: 'implement' | 'investigate';
     status: string;
     terminal_outcome: string | null;
     stage_id: string | null;
     attempt_ordinal: number | null;
     reentry_ordinal: number | null;
-    retry_count: number;
-    reentry_count: number;
     wait_reason: string | null;
     whose_move: 'waiting on you' | 'waiting on GitHub' | 'working' | 'finished';
     last_error: string | null;
@@ -43,10 +40,7 @@ interface TicketRow {
     effect_state: string;
     effect_kind: string | null;
     effect_status: string | null;
-    effect_attempts: number | null;
     effect_error: string | null;
-    sandbox_event_id: string | null;
-    sandbox_event_attempts: number | null;
     sandbox_ingestion_error: string | null;
     structured_units?: Array<{
       unit_id: string;
