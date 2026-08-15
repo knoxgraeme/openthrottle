@@ -151,7 +151,7 @@ function validateEvidenceRecord(value: unknown): Record<string, ProviderEvidence
   return result;
 }
 
-function validateEvidence(value: unknown): ProviderEvidence {
+export function validateEvidence(value: unknown): ProviderEvidence {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("profile evidence entry must be an object");
   }
