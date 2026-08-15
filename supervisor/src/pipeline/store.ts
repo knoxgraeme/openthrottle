@@ -95,14 +95,6 @@ export interface PipelineStageAttempt {
   result_hash: string | null;
   started_at: string | null;
   completed_at: string | null;
-  actor_state: "running" | "reaping" | "quarantined" | "settled" | null;
-  last_heartbeat_at: string | null;
-  settlement_owner: string | null;
-  settlement_reason: string | null;
-  termination_confirmed_at: string | null;
-  quarantine_reason: string | null;
-  actor_created_at: string | null;
-  actor_updated_at: string | null;
   created_at: string;
   updated_at: string;
 }

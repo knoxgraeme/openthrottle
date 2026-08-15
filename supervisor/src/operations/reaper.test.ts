@@ -276,9 +276,9 @@ describe("reapStalledRuns", () => {
     fixture.pipelines.bindStageRun(attempt.id, runId);
     // The sealed executor heartbeat went silent long before the stall cutoff.
     // The whole stall-reap -> claim -> settle path runs against the owning
-    // pipeline_stage_attempts row.
+    // run row.
     store.renewRunLiveness(runId, "2020-01-01T00:00:00.000Z");
-    expect(db.prepare("SELECT actor_state FROM pipeline_stage_attempts WHERE run_id = ?").get(runId))
+    expect(db.prepare("SELECT actor_state FROM runs WHERE id = ?").get(runId))
       .toEqual({ actor_state: "running" });
 
     await reapStalledRuns({
@@ -293,7 +293,7 @@ describe("reapStalledRuns", () => {
     expect(store.getByIssueId("issue-stalled")).toMatchObject({ state: "error", run_id: null });
     expect(db.prepare(`
       SELECT actor_state, settlement_reason, termination_confirmed_at
-      FROM pipeline_stage_attempts WHERE run_id = ?
+      FROM runs WHERE id = ?
     `).get(runId)).toMatchObject({
       actor_state: "settled",
       settlement_reason: expect.stringContaining("run reaped"),

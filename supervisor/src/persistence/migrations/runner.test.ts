@@ -188,6 +188,7 @@ describe("database migrations", () => {
       "e9ef3b9a4ddc219cfaa755bd72e73580ef497bcb3c361b5622ab1b412a32dd2a",
       "ba1a28c92a0e3f84080ce6fe1b329f21855d5e96ebdf3312d22af646d182fff7",
       "0dd5b83a690d982be21f4232daa62ed45eaa66f082c6a100284004305bbde74b",
+      "5e755e28e1a6a500c108c9cf3c6c4a66f97dc78309b9be11fe1af204b688d7f2",
     ]);
   });
 
@@ -294,8 +295,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 49,
-      name: `dead-satellite-surface-drop${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 50,
+      name: `actor-state-single-owner${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -347,8 +348,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 49,
-      name: `dead-satellite-surface-drop${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 50,
+      name: `actor-state-single-owner${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 
@@ -1786,20 +1787,10 @@ describe("database migrations", () => {
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_liveness'"
     ).get()).toBeUndefined();
     expect(db.prepare(`
-      SELECT id, actor_state, actor_created_at, actor_updated_at FROM runs ORDER BY id
+      SELECT id, actor_state FROM runs ORDER BY id
     `).all()).toEqual([
-      {
-        id: "legacy-complete",
-        actor_state: "settled",
-        actor_created_at: "2025-01-01T00:00:00.000Z",
-        actor_updated_at: "2025-01-01T00:00:00.000Z",
-      },
-      {
-        id: "legacy-running",
-        actor_state: "running",
-        actor_created_at: "2026-01-01T00:00:00.000Z",
-        actor_updated_at: "2026-01-01T00:00:00.000Z",
-      },
+      { id: "legacy-complete", actor_state: "settled" },
+      { id: "legacy-running", actor_state: "running" },
     ]);
   });
 
@@ -1877,17 +1868,23 @@ describe("database migrations", () => {
     applyDatabaseMigrations(db);
 
     // The intermediate pipeline_attempt_actors backfill fed the owner-row fold
-    // asserted below and the satellite itself is retired by migration 49.
+    // asserted below and the satellite itself is retired by migration 49; the
+    // attempt-side actor mirror is dropped by migration 50, leaving the run
+    // rows as the single surviving owner of the folded lifecycle state.
     expect(db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_attempt_actors'"
     ).get()).toBeUndefined();
+    expect(
+      (db.prepare("PRAGMA table_info(pipeline_stage_attempts)").all() as Array<{ name: string }>)
+        .map((column) => column.name)
+    ).not.toContain("actor_state");
     expect(db.prepare(`
       SELECT id, actor_state, last_heartbeat_at, settlement_owner,
         settlement_reason, termination_confirmed_at, quarantine_reason
-      FROM pipeline_stage_attempts ORDER BY id
+      FROM runs ORDER BY id
     `).all()).toEqual([
       {
-        id: "attempt-bound",
+        id: "run-bound",
         actor_state: "running",
         last_heartbeat_at: "2026-01-01T00:00:02.000Z",
         settlement_owner: null,
@@ -1896,7 +1893,7 @@ describe("database migrations", () => {
         quarantine_reason: null,
       },
       {
-        id: "attempt-planned",
+        id: "run-planned",
         actor_state: "reaping",
         last_heartbeat_at: "2026-01-01T00:00:04.000Z",
         settlement_owner: "owner-1",
@@ -1905,7 +1902,7 @@ describe("database migrations", () => {
         quarantine_reason: null,
       },
       {
-        id: "attempt-quarantined",
+        id: "run-quarantined",
         actor_state: "quarantined",
         last_heartbeat_at: "2026-01-01T00:00:06.000Z",
         settlement_owner: "owner-2",
@@ -1914,7 +1911,7 @@ describe("database migrations", () => {
         quarantine_reason: "stop unconfirmed",
       },
       {
-        id: "attempt-settled",
+        id: "run-settled",
         actor_state: "settled",
         last_heartbeat_at: "2026-01-01T00:00:08.000Z",
         settlement_owner: "owner-3",
@@ -2204,40 +2201,31 @@ describe("database migrations", () => {
     applyDatabaseMigrations(db);
 
     const ownerColumns = `actor_state, last_heartbeat_at, settlement_owner, settlement_reason,
-      termination_confirmed_at, quarantine_reason, actor_created_at, actor_updated_at`;
+      termination_confirmed_at, quarantine_reason`;
     const runOwner = (runId: string) =>
       db!.prepare(`SELECT ${ownerColumns} FROM runs WHERE id = ?`).get(runId);
-    const attemptOwner = (attemptId: string) =>
-      db!.prepare(`SELECT ${ownerColumns} FROM pipeline_stage_attempts WHERE id = ?`).get(attemptId);
 
     // The reaping run folds from the authoritative attempt actor, NOT the stale
-    // 'running' run_liveness row, and matches its own attempt owner row exactly.
-    const reapingRunOwner = {
+    // 'running' run_liveness row. (The attempt-side mirror of the fold is
+    // dropped by migration 50, so the run row is the only surviving owner.)
+    expect(runOwner("run-reaping")).toEqual({
       actor_state: "reaping",
       last_heartbeat_at: "2026-01-01T00:00:12.000Z",
       settlement_owner: "reaper-1",
       settlement_reason: "stalled heartbeat",
       termination_confirmed_at: null,
       quarantine_reason: null,
-      actor_created_at: "2026-01-01T00:00:00.000Z",
-      actor_updated_at: "2026-01-01T00:00:12.000Z",
-    };
-    expect(runOwner("run-reaping")).toEqual(reapingRunOwner);
-    expect(attemptOwner("attempt-reaping")).toEqual(reapingRunOwner);
+    });
 
     // The settled run likewise folds the current settled/terminated state.
-    const settledRunOwner = {
+    expect(runOwner("run-settled")).toEqual({
       actor_state: "settled",
       last_heartbeat_at: "2026-01-01T00:00:13.000Z",
       settlement_owner: "reaper-2",
       settlement_reason: "operator stop",
       termination_confirmed_at: "2026-01-01T00:00:14.000Z",
       quarantine_reason: null,
-      actor_created_at: "2026-01-01T00:00:01.000Z",
-      actor_updated_at: "2026-01-01T00:00:14.000Z",
-    };
-    expect(runOwner("run-settled")).toEqual(settledRunOwner);
-    expect(attemptOwner("attempt-settled")).toEqual(settledRunOwner);
+    });
 
     // The legacy run keeps folding from run_liveness (fallback path intact).
     expect(runOwner("run-legacy")).toEqual({
@@ -2247,17 +2235,15 @@ describe("database migrations", () => {
       settlement_reason: "legacy stall",
       termination_confirmed_at: null,
       quarantine_reason: "legacy quarantine",
-      actor_created_at: "2026-01-01T00:00:02.000Z",
-      actor_updated_at: "2026-01-01T00:00:08.000Z",
     });
 
     // A conditional finish-reaping settlement update on the folded actor_state
     // now matches, where the stale run_liveness fold would have made it miss.
     const settlement = db.prepare(`
       UPDATE runs
-      SET actor_state = 'settled', termination_confirmed_at = ?, actor_updated_at = ?
+      SET actor_state = 'settled', termination_confirmed_at = ?
       WHERE id = ? AND actor_state = 'reaping' AND settlement_owner = ?
-    `).run("2026-01-01T00:00:30.000Z", "2026-01-01T00:00:30.000Z", "run-reaping", "reaper-1");
+    `).run("2026-01-01T00:00:30.000Z", "run-reaping", "reaper-1");
     expect(settlement.changes).toBe(1);
     expect(
       db.prepare("SELECT actor_state FROM runs WHERE id = 'run-reaping'").get()
@@ -2327,6 +2313,135 @@ describe("database migrations", () => {
     expect(db.prepare("SELECT delivery_id, source FROM webhook_deliveries").get()).toEqual({
       delivery_id: "legacy-delivery",
       source: "linear",
+    });
+  });
+
+  it("merges divergent dual-written actor state onto runs before dropping the attempt mirror", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    // Stamp the full pre-consolidation ledger so applyDatabaseMigrations runs
+    // only migration 50 against the hand-built v49-shaped dual-write fixture.
+    for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 49)) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-08-14T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+    db.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY, status TEXT NOT NULL, started_at TEXT NOT NULL,
+        actor_state TEXT, last_heartbeat_at TEXT, settlement_owner TEXT,
+        settlement_reason TEXT, termination_confirmed_at TEXT,
+        quarantine_reason TEXT, actor_created_at TEXT, actor_updated_at TEXT
+      );
+      CREATE INDEX runs_actor_state_idx ON runs(actor_state, last_heartbeat_at);
+      CREATE TABLE pipeline_stage_attempts (
+        id TEXT PRIMARY KEY, run_id TEXT, planned_run_id TEXT,
+        actor_state TEXT, last_heartbeat_at TEXT, settlement_owner TEXT,
+        settlement_reason TEXT, termination_confirmed_at TEXT,
+        quarantine_reason TEXT, actor_created_at TEXT, actor_updated_at TEXT
+      );
+      CREATE INDEX pipeline_stage_attempts_actor_state_idx
+        ON pipeline_stage_attempts(actor_state, last_heartbeat_at);
+
+      -- Divergent dual-write: the run row has NULL gaps the attempt mirror
+      -- still carries (owner/reason/heartbeat), plus one column where both
+      -- sides hold different values (quarantine_reason) so owner precedence
+      -- is observable.
+      INSERT INTO runs VALUES (
+        'run-merged', 'reaping', '2026-01-01T00:00:00.000Z',
+        'reaping', NULL, NULL, NULL, NULL, 'owner quarantine note',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:10.000Z'
+      );
+      INSERT INTO pipeline_stage_attempts VALUES (
+        'attempt-merged', 'run-merged', 'run-merged',
+        'running', '2026-01-01T00:00:05.000Z', 'reaper-legacy', 'stalled heartbeat',
+        NULL, 'attempt quarantine note',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:05.000Z'
+      );
+
+      -- A planned-only attempt (crash before bindStageRun) whose run row never
+      -- got any actor state: the merge adopts the attempt values wholesale.
+      INSERT INTO runs VALUES (
+        'run-planned', 'running', '2026-01-01T00:01:00.000Z',
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+      );
+      INSERT INTO pipeline_stage_attempts VALUES (
+        'attempt-planned', NULL, 'run-planned',
+        'running', '2026-01-01T00:01:30.000Z', NULL, NULL, NULL, NULL,
+        '2026-01-01T00:01:00.000Z', '2026-01-01T00:01:30.000Z'
+      );
+
+      -- An attempt-less direct run must pass through untouched.
+      INSERT INTO runs VALUES (
+        'run-direct', 'running', '2026-01-01T00:02:00.000Z',
+        'running', '2026-01-01T00:02:30.000Z', NULL, NULL, NULL, NULL,
+        '2026-01-01T00:02:00.000Z', '2026-01-01T00:02:30.000Z'
+      );
+    `);
+
+    applyDatabaseMigrations(db);
+
+    const v50 = databaseMigrations.find((migration) => migration.version === 50)!;
+    expect(v50.name).toBe(`actor-state-single-owner${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`);
+    expect(db.prepare("SELECT version, name, checksum FROM schema_migrations WHERE version = 50").get())
+      .toEqual({ version: 50, name: v50.name, checksum: v50.checksum });
+
+    const columnNames = (table: string) =>
+      (db!.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+        .map((row) => row.name);
+    for (const column of [
+      "actor_state", "last_heartbeat_at", "settlement_owner", "settlement_reason",
+      "termination_confirmed_at", "quarantine_reason", "actor_created_at", "actor_updated_at",
+    ]) {
+      expect(columnNames("pipeline_stage_attempts")).not.toContain(column);
+    }
+    expect(columnNames("runs")).not.toContain("actor_created_at");
+    expect(columnNames("runs")).not.toContain("actor_updated_at");
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'pipeline_stage_attempts_actor_state_idx'"
+    ).get()).toBeUndefined();
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'runs_actor_state_idx'"
+    ).get()).toEqual({ name: "runs_actor_state_idx" });
+
+    const owner = (runId: string) => db!.prepare(`
+      SELECT actor_state, last_heartbeat_at, settlement_owner, settlement_reason,
+        termination_confirmed_at, quarantine_reason
+      FROM runs WHERE id = ?
+    `).get(runId);
+    // Per column COALESCE(owner, attempt): the run keeps its own reaping state
+    // and quarantine note while adopting the mirror's owner/reason/heartbeat.
+    expect(owner("run-merged")).toEqual({
+      actor_state: "reaping",
+      last_heartbeat_at: "2026-01-01T00:00:05.000Z",
+      settlement_owner: "reaper-legacy",
+      settlement_reason: "stalled heartbeat",
+      termination_confirmed_at: null,
+      quarantine_reason: "owner quarantine note",
+    });
+    expect(owner("run-planned")).toEqual({
+      actor_state: "running",
+      last_heartbeat_at: "2026-01-01T00:01:30.000Z",
+      settlement_owner: null,
+      settlement_reason: null,
+      termination_confirmed_at: null,
+      quarantine_reason: null,
+    });
+    expect(owner("run-direct")).toEqual({
+      actor_state: "running",
+      last_heartbeat_at: "2026-01-01T00:02:30.000Z",
+      settlement_owner: null,
+      settlement_reason: null,
+      termination_confirmed_at: null,
+      quarantine_reason: null,
     });
   });
 
