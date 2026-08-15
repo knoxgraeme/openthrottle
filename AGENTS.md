@@ -142,7 +142,10 @@ OpenThrottle skills)**. Keep new logic on the correct side:
   `skills/README.md` before editing anything here.
 
 - **`cli/`** — the published `openthrottle` package (`src/index.ts` is a plain
-  argv router, no framework). Commands: `setup`, `init`, `plan validate
+  argv router, no framework). Commands: `setup` (guided onboarding from the
+  pinned release manifest; `--check` read-only readiness report,
+  `--legacy-checklist` manual secrets checklist, `--yes` pre-approves
+  mutations, `--profile <name>`), `init`, `plan validate
   <file.md>`, `plan prepare <file.md>`, `validate <file.md>` (alias for
   `plan validate`), `ship <file.md>`, `status`, `stop <ticket>`,
   `logs <ticket>`, `analysis`, and `operator-skill`. `init` registers the

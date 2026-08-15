@@ -57,6 +57,11 @@ All other production modules live under an owning boundary:
 shared machine so webhook acknowledgement and the in-process sweep remain
 reliable.
 
+`openthrottle setup` automates and verifies these steps (app, volume, generated
+supervisor secrets, and the pinned-release deploy) from the CLI's release
+manifest, with `openthrottle setup --check` as a read-only readiness report; the
+manual path below remains the fallback.
+
 ```bash
 fly volumes create openthrottle_data --region sjc --size 1
 fly secrets set SUPERVISOR_URL=https://<app>.fly.dev \

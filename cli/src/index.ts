@@ -8,8 +8,15 @@
 const USAGE = `openthrottle — plan-first autonomous coding pipeline CLI
 
 Usage:
-  openthrottle setup               Check one-time platform prerequisites and
-                                    print the Fly supervisor secrets checklist.
+  openthrottle setup [--profile <name>] [--check] [--yes] [--legacy-checklist]
+                                    Guided one-time platform onboarding from
+                                    the CLI's pinned release manifest: verify
+                                    credentials, approve mutations, provision
+                                    the runtime snapshot and supervisor, and
+                                    persist readiness evidence. --check is a
+                                    read-only readiness report; --yes
+                                    pre-approves mutations; --legacy-checklist
+                                    prints the manual secrets checklist.
   openthrottle init [--editable-skills] [--dry-run]
                                     Register the current GitHub repository and
                                     Linear team, verify readiness, and write
@@ -46,7 +53,7 @@ async function main(): Promise<void> {
   switch (command) {
     case 'setup': {
       const { default: setup } = await import('./setup.js');
-      await setup();
+      await setup(rest);
       break;
     }
     case 'init': {

@@ -4,7 +4,7 @@ Node 22 command line for configuring a target repository and operating the
 OpenThrottle supervisor.
 
 ```text
-openthrottle setup
+openthrottle setup [--profile <name>] [--check] [--yes] [--legacy-checklist]
 openthrottle init
 openthrottle init --editable-skills
 openthrottle init --editable-skills --dry-run
@@ -16,8 +16,18 @@ openthrottle operator-skill install
 openthrottle operator-skill status --json
 ```
 
-- `setup` verifies the canonical Daytona snapshot when local Daytona
-  credentials are present and prints the one-time Fly secrets checklist.
+- `setup` runs guided one-time platform onboarding from the CLI's pinned
+  release manifest: it preflights flyctl and Daytona credentials, inspects live
+  provider state, asks before every mutation (billable and externally visible
+  mutations are badged; `--yes` pre-approves), provisions the Daytona snapshot
+  and the Fly supervisor deployment, and persists readiness evidence plus
+  resource pins under `~/.openthrottle/profiles/`. Generated supervisor secrets
+  are stored in `~/.openthrottle/secrets/` and their values are never printed;
+  operator-owned credentials (`GITHUB_TOKEN`, `GITHUB_READ_TOKEN`,
+  `DAYTONA_API_KEY`, Linear OAuth) are never stored locally and must be set as
+  Fly secrets. `--check` renders the same readiness evidence strictly
+  read-only; `--legacy-checklist` prints the manual `fly secrets set`
+  checklist; `--profile <name>` selects an alternate onboarding profile.
 - `init` detects the GitHub origin/default branch and package scripts, writes
   `.openthrottle.yml`, registers the repository for either Linear-team or
   GitHub-Issue control with the deployed supervisor, creates or refreshes the
@@ -49,7 +59,9 @@ openthrottle operator-skill status --json
   provider credentials, and scopes removal to the exact Skillfish-managed
   OpenThrottle skill directory.
 
-Other environment values: `DAYTONA_API_KEY`/`DAYTONA_SNAPSHOT` for `setup`;
+Other environment values: `DAYTONA_API_KEY` (plus optional
+`OT_FLY_APP`/`OT_FLY_ORG`/`OT_FLY_REGION` resource overrides and
+`OT_RELEASE_MANIFEST` to point at an explicit release manifest) for `setup`;
 optional `LINEAR_TEAM_KEY`/`LINEAR_TEAM_ID` defaults when `init` selects Linear
 control; and
 `LINEAR_API_KEY`, optional `LINEAR_TEAM_ID`, and `OT_AGENT_APP_ID` for
