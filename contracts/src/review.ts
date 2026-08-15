@@ -26,16 +26,16 @@ export const REVIEW_VALIDATION_SCHEMA = "openthrottle.review-validation/v1" as c
 export const REVIEW_REPAIR_DISPOSITION_SCHEMA = "openthrottle.review-repair-disposition/v1" as const;
 export const REVIEW_JOURNAL_SCHEMA = "openthrottle.review-journal/v1" as const;
 
-export const REVIEW_SEVERITIES = ["P0", "P1", "P2", "P3"] as const;
-export const REVIEW_OUTCOMES = ["success", "semantic_repair_required", "failure", "needs_human"] as const;
-export const REPAIR_DISPOSITIONS = ["accepted", "fixed", "deferred", "rejected", "superseded"] as const;
-export const REVIEW_VALIDATOR_RESULTS = ["accepted", "rejected", "not_validated"] as const;
-export const REVIEW_RESOLUTION_STATES = ["resolved", "unresolved"] as const;
-export const FINDING_ID_PREFIX = "finding_" as const;
+const REVIEW_SEVERITIES = ["P0", "P1", "P2", "P3"] as const;
+const REVIEW_OUTCOMES = ["success", "semantic_repair_required", "failure", "needs_human"] as const;
+const REPAIR_DISPOSITIONS = ["accepted", "fixed", "deferred", "rejected", "superseded"] as const;
+const REVIEW_VALIDATOR_RESULTS = ["accepted", "rejected", "not_validated"] as const;
+const REVIEW_RESOLUTION_STATES = ["resolved", "unresolved"] as const;
+const FINDING_ID_PREFIX = "finding_" as const;
 const FINDING_ID_PATTERN = /^finding_[a-f0-9]{32}$/;
-export const SEMANTIC_GROUP_ID_PREFIX = "semantic_group_" as const;
+const SEMANTIC_GROUP_ID_PREFIX = "semantic_group_" as const;
 const SEMANTIC_GROUP_ID_PATTERN = /^semantic_group_[a-f0-9]{32}$/;
-export const REVIEW_SUBACTION_SEPARATOR = ".review." as const;
+const REVIEW_SUBACTION_SEPARATOR = ".review." as const;
 const LOOP_ACTION_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const GENERIC_SEMANTIC_ANCHOR = /^(?:the\s+)?(?:file|module|change|code|logic|implementation|behavior|review|function|method|class|contract|test|tests)$/i;
 const STABLE_CLAIM_DISCRIMINATOR = /^[a-z0-9]+(?:-[a-z0-9]+)+$/;
@@ -65,7 +65,7 @@ export function deriveReviewSubactionActionId(parentActionId: string, subactionI
   return actionId;
 }
 
-export interface ReviewPersonaPolicy {
+interface ReviewPersonaPolicy {
   persona_id: string;
   title: string;
   focus: string;
@@ -81,7 +81,7 @@ export interface ReviewPolicyContract {
   max_findings_per_journal: number;
 }
 
-export interface ReviewPersonaSnapshot {
+interface ReviewPersonaSnapshot {
   persona_id: string;
   title: string;
   focus: string;
@@ -97,7 +97,7 @@ export interface SealedReviewRosterContract {
   sealed_at: string;
 }
 
-export interface ReviewPersonaSelection {
+interface ReviewPersonaSelection {
   persona_id: string;
   rationale: string;
 }
@@ -109,7 +109,7 @@ export interface ReviewSelectionContract {
   personas: ReviewPersonaSelection[];
 }
 
-export interface ReviewFindingIdentity {
+interface ReviewFindingIdentity {
   path: string;
   semantic_anchor: string;
   claim_discriminator: string;
@@ -151,7 +151,7 @@ export interface ReviewRepairDispositionContract {
   }>;
 }
 
-export interface ReviewJournalEntry {
+interface ReviewJournalEntry {
   at: string;
   kind: ReviewJournalEntryKind;
   digest: string;
@@ -167,7 +167,7 @@ export interface ReviewPersonaReceiptEvidence {
   cost_microusd: number | null;
 }
 
-export interface ReviewFindingResolution {
+interface ReviewFindingResolution {
   finding_id: string;
   semantic_group_id: string;
   exact_dedup_personas: string[];
@@ -187,13 +187,13 @@ export interface ReviewSubactionTimingEvidence {
   latency_ms: number;
 }
 
-export interface ReviewTimingEvidence {
+interface ReviewTimingEvidence {
   selector: ReviewSubactionTimingEvidence;
   personas: Array<ReviewSubactionTimingEvidence & { persona_id: string }>;
   validator: ReviewSubactionTimingEvidence | null;
 }
 
-export interface ReviewMeasurements {
+interface ReviewMeasurements {
   persona_count: number;
   finding_count: number;
   accepted_finding_count: number;

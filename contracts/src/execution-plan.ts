@@ -13,7 +13,7 @@ import {
 
 export const EXECUTION_PLAN_SCHEMA = "openthrottle.execution-plan/v1" as const;
 
-export interface ExecutionPlanUnit {
+interface ExecutionPlanUnit {
   id: string;
   title: string;
   depends_on: string[];
@@ -84,7 +84,7 @@ function validatePlan(plan: ExecutionPlanContract, source: string): void {
   assertAcyclicDependencies(plan.units, `${source}.units`);
 }
 
-export function validateExecutionPlanContract(
+function validateExecutionPlanContract(
   value: unknown,
   options: { source?: string } = {}
 ): ValidatedContract<ExecutionPlanContract> {

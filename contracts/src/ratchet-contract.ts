@@ -19,11 +19,11 @@ import {
   type ValidatedContract,
 } from "./validation.js";
 
-export const RATCHET_CONTRACT_SCHEMA = "openthrottle.ratchet-contract/v1" as const;
-export const RATCHET_DECISION_SCHEMA = "openthrottle.ratchet-decision/v1" as const;
+const RATCHET_CONTRACT_SCHEMA = "openthrottle.ratchet-contract/v1" as const;
+const RATCHET_DECISION_SCHEMA = "openthrottle.ratchet-decision/v1" as const;
 export const RATCHET_CONTRACT_MAX_BYTES = 768 * 1024;
 
-export const RATCHET_ARTIFACT_KINDS = [
+const RATCHET_ARTIFACT_KINDS = [
   "candidate_evidence",
   "command_result",
   "execution_graph_result",
@@ -36,7 +36,7 @@ export const RATCHET_ARTIFACT_KINDS = [
   "standard_receipt",
 ] as const;
 
-export const RATCHET_REJECTION_REASONS = [
+const RATCHET_REJECTION_REASONS = [
   "missing_pinned_artifact",
   "missing_proposed_artifact",
   "artifact_digest_changed",
@@ -57,25 +57,25 @@ export const RATCHET_REJECTION_REASONS = [
   "incomparable_policy_change",
 ] as const;
 
-export interface RatchetArtifactDigest {
+interface RatchetArtifactDigest {
   id: string;
   kind: (typeof RATCHET_ARTIFACT_KINDS)[number];
   artifact_digest: string;
   provenance_digest: string;
 }
 
-export interface RatchetHumanAuthority {
+interface RatchetHumanAuthority {
   actor_id: string;
   approval_digest: string;
 }
 
-export interface RatchetTunerAuthority {
+interface RatchetTunerAuthority {
   tuner_id: string;
   proposal_digest: string;
   model_digest: string;
 }
 
-export interface RatchetRepositorySkillPackageFile {
+interface RatchetRepositorySkillPackageFile {
   path: string;
   content: string;
 }
@@ -108,7 +108,7 @@ export interface RatchetDifferentialInput {
   tuner_authority: RatchetTunerAuthority | null;
 }
 
-export interface RatchetDifference {
+interface RatchetDifference {
   reason: (typeof RATCHET_REJECTION_REASONS)[number];
   artifact_id?: string;
   path?: string;

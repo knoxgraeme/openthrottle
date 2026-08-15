@@ -15,7 +15,7 @@ import {
   type ValidatedContract,
 } from "./validation.js";
 
-export const CITATION_CONTRACT_SCHEMA = "openthrottle.citation-contract/v1" as const;
+const CITATION_CONTRACT_SCHEMA = "openthrottle.citation-contract/v1" as const;
 
 export const ANALYSIS_QUERY_OUTCOMES = ["shipped", "no_change", "needs_human", "canceled", "superseded", "failed"] as const;
 export const ANALYSIS_QUERY_REASONS = [
@@ -29,8 +29,8 @@ export const ANALYSIS_QUERY_REASONS = [
   "superseded",
 ] as const;
 export const ANALYSIS_QUERY_ATTRIBUTIONS = ["executor", "agent", "provider", "unknown"] as const;
-export const CLAIM_DISPOSITIONS = ["supported", "contradicted", "insufficient", "not_applicable"] as const;
-export const GRADE_VALUES = ["pass", "pass_with_concerns", "fail", "not_applicable"] as const;
+const CLAIM_DISPOSITIONS = ["supported", "contradicted", "insufficient", "not_applicable"] as const;
+const GRADE_VALUES = ["pass", "pass_with_concerns", "fail", "not_applicable"] as const;
 
 const ANALYSIS_RUN_QUERY_FIELDS = [
   "outcome", "reason", "attribution", "graph", "skill_digest", "from", "to", "limit",
@@ -62,27 +62,27 @@ export interface AnalysisRunResult {
   created_at: string;
 }
 
-export interface CitationContractCitation {
+interface CitationContractCitation {
   id: string;
   query: AnalysisRunQuery;
   expected_result: AnalysisRunResult[];
   source_digests: string[];
 }
 
-export interface CitationContractClaim {
+interface CitationContractClaim {
   id: string;
   text: string;
   citation_ids: string[];
 }
 
-export interface CitationContractDisposition {
+interface CitationContractDisposition {
   claim_id: string;
   disposition: (typeof CLAIM_DISPOSITIONS)[number];
   rationale: string;
   citation_ids: string[];
 }
 
-export interface CitationContractGrade {
+interface CitationContractGrade {
   id: string;
   value: (typeof GRADE_VALUES)[number];
   disposition_claim_ids: string[];
