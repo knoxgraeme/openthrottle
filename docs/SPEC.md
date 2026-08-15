@@ -1301,8 +1301,21 @@ fresh checkout runnable, and unit worktrees are fresh checkouts.
 
 ## CLI contract
 
-`openthrottle setup` verifies snapshot availability and prints the supervisor
-secret checklist. `openthrottle init` detects the GitHub origin/default branch,
+`openthrottle setup` loads the CLI's pinned release manifest and drives the
+provider-neutral onboarding orchestrator over the registered hosting and
+runtime adapters: it preflights operator credentials, inspects live provider
+state, requires approval of every planned mutation (billable and externally
+visible mutations are badged; `--yes` pre-approves), provisions the runtime
+snapshot and the supervisor deployment, and persists readiness evidence plus
+resource pins in the local onboarding profile. Generated supervisor secrets
+live in the local secret store and their values are never printed;
+operator-owned third-party credentials are never stored locally. `--check`
+renders the same preflight/inspect evidence strictly read-only,
+`--profile <name>` selects the onboarding profile, and `--legacy-checklist`
+prints the manual `fly secrets set` checklist generated from the same table
+that mirrors the supervisor env authority (deploy-owned `PORT` and
+`DATABASE_PATH` excluded). `openthrottle init` detects the GitHub
+origin/default branch,
 writes `.openthrottle.yml`, and idempotently registers either a Linear-team or
 GitHub-Issue control route plus the GitHub webhook. The registration body uses
 `controlProvider: "linear" | "github"` (default `linear` for existing clients);
