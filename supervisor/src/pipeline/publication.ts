@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 import {
-  canonicalJson,
-  digestNormalized,
   PIPELINE_OUTCOMES,
   type PipelineManifest,
   type PipelineOutcome,

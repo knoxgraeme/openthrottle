@@ -1,12 +1,15 @@
 import {
-  canonicalJson,
-  digestNormalized,
   type AssuranceClass,
   type PipelineManifest,
   type PipelineStage,
   type StageOutcome,
 } from "./manifest.js";
-import { UNIT_PHASE_IDS, type GraphUnitPhaseId } from "@openthrottle/contracts";
+import {
+  canonicalJson,
+  digestNormalized,
+  UNIT_PHASE_IDS,
+  type GraphUnitPhaseId,
+} from "@openthrottle/contracts";
 import type { PipelineCoordinatorEvent, PipelineEventArtifact } from "./coordinator.js";
 import {
   type GateReceiptReason,

@@ -1,10 +1,11 @@
 import type { Ticket, SupervisorStore } from "../persistence/store.js";
 import type { CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
-import { canonicalJson, stageById } from "../pipeline/manifest.js";
-import { digestNormalized } from "../pipeline/manifest.js";
+import { stageById } from "../pipeline/manifest.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import {
+  canonicalJson,
+  digestNormalized,
   TUNE_DECISION_SCHEMA,
   TUNE_EDIT_AUTHORIZATION_SCHEMA,
   TUNE_RELEASE_DESCRIPTOR_SCHEMA,
@@ -38,6 +39,7 @@ import {
   serializeRuntimeObservationError,
   type SerializedRuntimeObservationError,
 } from "../runtime/observation-error.js";
+import { exponentialBackoffDelayMs } from "../shared/backoff.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
 import { createStructuredChildRuntime } from "./structured-child-runtime.js";
@@ -50,6 +52,9 @@ import {
 
 const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
+// Leasing increments attempts before processing, so attempts >= 1 here; the
+// prior inline formula capped the exponent at 6, i.e. RETRY_BASE_MS * 2 ** 6.
+const MAX_RETRY_DELAY_MS = RETRY_BASE_MS * 2 ** 6;
 const MAX_EFFECT_ATTEMPTS = 8;
 const CAPACITY_RETRY_MS = 5 * 60_000;
 const MAX_STAGE_TIMEOUT_SECONDS = 86_400;
@@ -1027,7 +1032,10 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         ? null
         : errorClass === "capacity"
           ? new Date(now().getTime() + CAPACITY_RETRY_MS).toISOString()
-          : new Date(now().getTime() + RETRY_BASE_MS * 2 ** Math.min(effect.attempts - 1, 6)).toISOString();
+          : new Date(now().getTime() + exponentialBackoffDelayMs(effect.attempts, {
+              baseDelayMs: RETRY_BASE_MS,
+              maxDelayMs: MAX_RETRY_DELAY_MS,
+            })).toISOString();
       if (!exhausted && errorClass === "capacity") enqueueCapacityWaitActivity(effect, message);
       if (exhausted && (effect.kind === "provision" || effect.kind === "dispatch_stage")) {
         const instance = deps.store.getInstance(effect.pipeline_instance_id);

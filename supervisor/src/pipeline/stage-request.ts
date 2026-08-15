@@ -1,10 +1,9 @@
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 import {
   type ArtifactKind,
   type AssuranceClass,
-  canonicalJson,
   COMMAND_NAMES,
   type CommandName,
-  digestNormalized,
   type ContextPolicy,
   type PipelineStage,
   type RepositorySkillPackage,

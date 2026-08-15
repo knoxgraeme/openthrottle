@@ -4,8 +4,10 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
 import {
+  canonicalJson,
   deriveTuneCorpusDigest,
   deriveTuneCorpusRowDigest,
+  digestNormalized,
   parseRatchetDifferentialInput,
   validateCitationContractProposal,
   validateTuneAnalysisContract,
@@ -19,8 +21,6 @@ import { openDb } from "../persistence/database.js";
 import { drainDeferredProviderEvidence, evaluateStageGate, processProviderEvidence } from "./gates.js";
 import { evaluateCitationGate, type CitationGateDecision } from "./citation-gate.js";
 import {
-  canonicalJson,
-  digestNormalized,
   loadPipelineCatalog,
   parseRepositoryConfig,
   type PipelineManifest,

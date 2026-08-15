@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
-  canonicalJson as sharedCanonicalJson,
+  canonicalJson,
   COMMAND_NAME_PATTERN,
-  digestNormalized as sharedDigestNormalized,
+  digestNormalized,
   UNIT_PHASE_IDS,
   validateRepositoryConfigContract,
   type ConfigGraphSource,
@@ -495,13 +495,10 @@ function parseYaml(raw: string, source: string): unknown {
   return document.toJS({ maxAliasCount: 0 });
 }
 
-export function canonicalJson(value: unknown): string {
-  return sharedCanonicalJson(value);
-}
-
-export function digestNormalized(normalized: string): string {
-  return sharedDigestNormalized(normalized);
-}
+// Historical pass-through kept only for persistence/ importers (frozen by an
+// in-flight PR); everything else imports @openthrottle/contracts directly.
+// These are re-exports of the shared implementations, not local wrappers.
+export { canonicalJson, digestNormalized };
 
 export function stageById(normalizedManifest: string, stageId: string | null | undefined): PipelineStage | undefined {
   const manifest = JSON.parse(normalizedManifest) as { stages?: unknown };

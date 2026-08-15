@@ -4,9 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
 import { createLinearOutboxProcessor } from "../providers/linear/outbox.js";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 import {
-  canonicalJson,
-  digestNormalized,
   loadPipelineCatalog,
   parseRepositoryConfig,
   validatePipelineManifest,

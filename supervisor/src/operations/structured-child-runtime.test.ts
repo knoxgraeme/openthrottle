@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { canonicalJson, digestNormalized } from "../pipeline/manifest.js";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 import type { ExecutionGateReceipt, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { ExecutionUnitState } from "../pipeline/unit-coordinator.js";
 import type { ChildExecutorActionRequest, LoopActionRequest, SandboxRuntime } from "../runtime/contracts.js";

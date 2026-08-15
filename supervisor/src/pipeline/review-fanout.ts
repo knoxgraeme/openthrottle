@@ -7,13 +7,14 @@ import type {
 import {
   REVIEW_FINDING_SCHEMA,
   REVIEW_POLICY_SCHEMA,
+  canonicalJson,
   deriveReviewFindingId,
   deriveReviewSemanticGroupId,
   digestCanonicalJson,
   isStableReviewClaimDiscriminator,
   isSpecificReviewSemanticAnchor,
 } from "@openthrottle/contracts";
-import { canonicalJson, digestNormalized, type StageOutcome } from "./manifest.js";
+import type { StageOutcome } from "./manifest.js";
 
 export const REVIEW_FANOUT_PLAN_SCHEMA = "openthrottle.review-fanout-plan/v1" as const;
 export const REVIEW_FANOUT_SYNTHESIS_SCHEMA = "openthrottle.review-fanout-synthesis/v1" as const;
@@ -386,7 +387,7 @@ export function buildReviewFanoutPlan(input: {
 }
 
 function receiptHash(receipt: SemanticReviewReceipt): string {
-  return digestNormalized(canonicalJson(receipt));
+  return digestCanonicalJson(receipt);
 }
 
 const REVIEW_FINDING_IDENTITY = /^\[([^#\]]+)#([^|:\]]+)\|([^:\]]+): ([^\]]+)\]/;

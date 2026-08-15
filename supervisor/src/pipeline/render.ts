@@ -1,5 +1,5 @@
+import { canonicalJson } from "@openthrottle/contracts";
 import {
-  canonicalJson,
   isPipelineReentry,
   PIPELINE_OUTCOMES,
   STAGE_OUTCOMES,

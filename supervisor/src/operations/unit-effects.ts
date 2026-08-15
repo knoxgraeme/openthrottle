@@ -6,10 +6,17 @@ import type {
 } from "../persistence/pipeline/unit-store.js";
 import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
 import { serializeRuntimeObservationError } from "../runtime/observation-error.js";
+import { exponentialBackoffDelayMs } from "../shared/backoff.js";
 import { sanitizeText } from "../shared/sanitize.js";
 
 const OBSERVATION_FAILURE_MAX_ATTEMPTS = 3;
 const OBSERVATION_FAILURE_RETRY_BASE_MS = 5_000;
+// The prior inline formula was uncapped; the attempt budget above means the
+// largest reachable attempt below is OBSERVATION_FAILURE_MAX_ATTEMPTS - 1
+// (attempts at the budget stop instead of retrying), so this cap is never hit
+// and timing is byte-identical.
+const OBSERVATION_FAILURE_MAX_RETRY_DELAY_MS =
+  OBSERVATION_FAILURE_RETRY_BASE_MS * 2 ** (OBSERVATION_FAILURE_MAX_ATTEMPTS - 1);
 
 export interface UnitEffectRuntime {
   dispatchUnitAction(action: ExecutionWorkAttempt): Promise<{
@@ -76,7 +83,10 @@ export function createUnitEffectProcessor(input: {
       return;
     }
     const retryAtIso = new Date(
-      observedAt.getTime() + OBSERVATION_FAILURE_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1)
+      observedAt.getTime() + exponentialBackoffDelayMs(attempt, {
+        baseDelayMs: OBSERVATION_FAILURE_RETRY_BASE_MS,
+        maxDelayMs: OBSERVATION_FAILURE_MAX_RETRY_DELAY_MS,
+      })
     ).toISOString();
     input.store.recordActionObservationFailure({
       actionId: action.id,

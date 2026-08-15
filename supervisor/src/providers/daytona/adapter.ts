@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { Daytona, type Sandbox } from "@daytona/sdk";
 import {
+  canonicalJson,
+  digestNormalized,
   MAX_PRIVATE_RECOVERY_DIFF_BYTES,
   parseLoopReceiptRecoveryContract,
 } from "@openthrottle/contracts";
@@ -17,7 +19,7 @@ import {
   type StageExecutionResult,
   assertLogicalCredentialScopes,
 } from "../../runtime/contracts.js";
-import { canonicalJson, digestNormalized, STAGE_OUTCOMES } from "../../pipeline/manifest.js";
+import { STAGE_OUTCOMES } from "../../pipeline/manifest.js";
 import {
   createStageRequestHash,
   type StageRequestEnvelope,

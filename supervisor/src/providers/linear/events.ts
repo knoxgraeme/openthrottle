@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import type { ControlThreadEvent } from "../../app/ports.js";
+import type { ControlThreadEvent, ResolvedControlLabel } from "../../app/ports.js";
 import { linearGraphQL, type LinearClient } from "./client.js";
 
 export function verifyLinearSignature(
@@ -154,10 +154,10 @@ export function linearControlEvent(payload: ControlAgentSessionEventPayload): Co
   };
 }
 
-export interface ResolvedLabel {
-  name: string;
-  parentName?: string;
-}
+// Canonical shape lives on the provider-neutral control-label port
+// (app/ports.ts ResolvedControlLabel); this module keeps its historical name
+// for Linear-side callers instead of redeclaring the interface.
+export type ResolvedLabel = ResolvedControlLabel;
 
 export async function fetchIssueLabels(
   client: LinearClient,

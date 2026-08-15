@@ -21,7 +21,8 @@ import {
   parsePullRequestUrl,
 } from "../providers/github/client.js";
 import { enqueueActivity, tryPostError } from "../providers/linear/outbox.js";
-import { canonicalJson, digestNormalized, loadPipelineCatalog } from "../pipeline/manifest.js";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
+import { loadPipelineCatalog } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";

@@ -1,6 +1,5 @@
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 import {
-  canonicalJson,
-  digestNormalized,
   isPipelineReentry,
   type AssuranceClass,
   type PipelineManifest,

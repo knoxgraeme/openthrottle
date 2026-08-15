@@ -8,8 +8,7 @@ import {
   type RatchetDifferentialInput,
 } from "@openthrottle/contracts";
 import {
-  CITATION_GATE_REASONS,
-  CITATION_GATE_SCHEMA,
+  validateCitationGateDecision,
   type CitationGateDecision,
 } from "./citation-gate.js";
 
@@ -78,8 +77,6 @@ export interface CitationGateReceiptLookup {
   getCitationGateReceipt(proposalHash: string): unknown;
 }
 
-const SHA256 = /^[a-f0-9]{64}$/;
-const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 
 function recordValue(value: unknown): Record<string, unknown> | null {
@@ -88,92 +85,31 @@ function recordValue(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function boundedStringArray(value: unknown, options: {
-  max: number;
-  pattern?: RegExp;
-}): string[] | null {
-  if (!Array.isArray(value) || value.length > options.max) return null;
-  const result: string[] = [];
-  for (const entry of value) {
-    if (
-      typeof entry !== "string" ||
-      entry.length === 0 ||
-      entry.length > 200 ||
-      (options.pattern && !options.pattern.test(entry))
-    ) return null;
-    result.push(entry);
-  }
-  return result;
-}
-
+// The full structural predicate lives in validateCitationGateDecision
+// (citation-gate.ts); this wrapper converts its throwing contract into the
+// null-on-invalid contract used here. The only checks kept locally are the
+// stricter inbound bounds this gate has always applied to untrusted stage
+// output (id length, array entry counts, entry lengths), which the shared
+// validator deliberately does not impose.
 function validatedCitationGate(value: unknown): CitationGateDecision | null {
   const input = recordValue(value);
-  if (!input || input.schema !== CITATION_GATE_SCHEMA) return null;
-  const proposalId = typeof input.proposal_id === "string" &&
-    input.proposal_id.length <= 160 &&
-    IDENTIFIER.test(input.proposal_id)
-    ? input.proposal_id
-    : null;
-  const proposalHash = typeof input.proposal_hash === "string" && SHA256.test(input.proposal_hash)
-    ? input.proposal_hash
-    : null;
-  const gradeHash = typeof input.grade_hash === "string" && SHA256.test(input.grade_hash)
-    ? input.grade_hash
-    : null;
-  const result = input.result === "passed" || input.result === "failed" ? input.result : null;
-  const outcome = input.outcome === "success" || input.outcome === "failure" ? input.outcome : null;
-  const reason = typeof input.reason === "string" && CITATION_GATE_REASONS.includes(
-    input.reason as (typeof CITATION_GATE_REASONS)[number]
-  ) ? input.reason as (typeof CITATION_GATE_REASONS)[number] : null;
-  const survivingClaimIds = boundedStringArray(input.surviving_claim_ids, { max: 128, pattern: IDENTIFIER });
-  const droppedClaimIds = boundedStringArray(input.dropped_claim_ids, { max: 128, pattern: IDENTIFIER });
-  const sourceDigests = boundedStringArray(input.source_digests, { max: 128, pattern: SHA256 });
-  if (
-    !proposalId ||
-    !proposalHash ||
-    !gradeHash ||
-    !result ||
-    !outcome ||
-    !reason ||
-    !survivingClaimIds ||
-    !droppedClaimIds ||
-    !sourceDigests ||
-    sourceDigests.length === 0 ||
-    (result === "passed") !== (outcome === "success") ||
-    (result === "passed" && survivingClaimIds.length === 0) ||
-    (result === "failed" && (survivingClaimIds.length !== 0 || droppedClaimIds.length === 0)) ||
-    (reason === "all_citations_reproduced" && (result !== "passed" || droppedClaimIds.length !== 0)) ||
-    (reason === "partial_claim_survival" && (result !== "passed" || droppedClaimIds.length === 0)) ||
-    ((reason === "no_claims_survived" || reason === "stale_evidence") && result !== "failed") ||
-    new Set([...survivingClaimIds, ...droppedClaimIds]).size !== survivingClaimIds.length + droppedClaimIds.length ||
-    canonicalJson(sourceDigests) !== canonicalJson([...new Set(sourceDigests)].sort())
-  ) return null;
-
-  const payloadValue: Omit<CitationGateDecision, "payload" | "hash"> = {
-    schema: CITATION_GATE_SCHEMA,
-    proposal_id: proposalId,
-    proposal_hash: proposalHash,
-    result,
-    outcome,
-    reason,
-    surviving_claim_ids: survivingClaimIds,
-    dropped_claim_ids: droppedClaimIds,
-    grade_hash: gradeHash,
-    source_digests: sourceDigests,
-  };
-  const payload = canonicalJson(payloadValue);
-  if (
-    input.payload !== payload ||
-    typeof input.hash !== "string" ||
-    input.hash !== digestNormalized(payload)
-  ) return null;
-  if (Object.keys(input).length !== 12) return null;
-
-  return {
-    ...payloadValue,
-    payload,
-    hash: input.hash,
-  };
+  if (!input) return null;
+  if (typeof input.proposal_id === "string" && input.proposal_id.length > 160) return null;
+  for (const field of ["surviving_claim_ids", "dropped_claim_ids", "source_digests"]) {
+    const entries = input[field];
+    if (
+      Array.isArray(entries) &&
+      (entries.length > 128 ||
+        entries.some((entry) => typeof entry === "string" && entry.length > 200))
+    ) {
+      return null;
+    }
+  }
+  try {
+    return validateCitationGateDecision(value);
+  } catch {
+    return null;
+  }
 }
 
 function validatedCitationReceipt(

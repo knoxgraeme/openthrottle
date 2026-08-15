@@ -564,7 +564,12 @@ function githubIssueEventTimestamp(event: Extract<GithubWebhookEvent, { kind: "i
   return event.issue.updated_at ?? event.issue.created_at;
 }
 
-function eventPredatesCurrentSession(
+// Shared session-recency predicate: resolves the current session (falling
+// back to the ticket's bound session) and compares a caller-chosen provider
+// timestamp against its activation time. http/server.ts's GitHub control
+// webhook dedupe uses this too, with its own timestamp chooser -- keep the
+// resolution and comparison rules here so they cannot silently diverge.
+export function eventPredatesCurrentSession(
   store: SupervisorStore,
   ticket: NonNullable<ReturnType<SupervisorStore["getByIssueId"]>>,
   providerTimestamp: string | undefined

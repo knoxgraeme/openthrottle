@@ -4,8 +4,12 @@ import type {
   ExecutionPlanContractV2,
   ExecutionPlanUnitV2,
 } from "@openthrottle/contracts";
-import { EXECUTION_PLAN_SCHEMA_V2, digestCanonicalJson, digestNormalized } from "@openthrottle/contracts";
-import { canonicalJson } from "./manifest.js";
+import {
+  canonicalJson,
+  EXECUTION_PLAN_SCHEMA_V2,
+  digestCanonicalJson,
+  digestNormalized,
+} from "@openthrottle/contracts";
 import type {
   PipelineUnitAgentPhaseBinding,
   RepositorySkillPackage,

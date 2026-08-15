@@ -1,3 +1,5 @@
+import type { ActivityPublicationInput } from "../../app/ports.js";
+
 const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
 const LINEAR_OAUTH_AUTHORIZE_URL = "https://linear.app/oauth/authorize";
 const LINEAR_OAUTH_TOKEN_URL = "https://api.linear.app/oauth/token";
@@ -59,23 +61,10 @@ export async function linearGraphQL<T>(
   return json.data;
 }
 
-export type AgentActivityInput =
-  | {
-      id?: string;
-      sessionId: string;
-      type: "thought" | "elicitation" | "response" | "error";
-      body: string;
-      ephemeral?: boolean;
-    }
-  | {
-      id?: string;
-      sessionId: string;
-      type: "action";
-      action: string;
-      parameter: string;
-      result?: string;
-      ephemeral?: boolean;
-    };
+// One activity payload shape: the provider-neutral application port
+// (app/ports.ts ActivityPublicationInput) owns it; this module keeps its
+// historical name for Linear-side callers instead of redeclaring the union.
+export type AgentActivityInput = ActivityPublicationInput;
 
 export async function agentActivityCreate(
   client: LinearClient,

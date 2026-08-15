@@ -36,6 +36,7 @@ import {
   type GithubWebhookEvent,
 } from "../providers/github/client.js";
 import type { ActivityPublicationInput, ActivityPublicationPort } from "../app/ports.js";
+import { readStreamUpToByteLimit } from "../shared/bounded-stream.js";
 import { MAX_PRIVATE_LOG_TAIL_CHARS } from "../shared/logs.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import {
@@ -51,7 +52,7 @@ import { createLinearActivityPublisher, createLinearOutboxProcessor, tryPostErro
 import { handleControlEvent, type PipelineCoordinatorContext, type SessionServicePorts } from "../app/session-service.js";
 import { createAdmissionPreflight } from "../app/admission-preflight.js";
 import { buildAdmissionDrainReport } from "../app/admission-drain-report.js";
-import { handleGithubEvent } from "../providers/github/events.js";
+import { eventPredatesCurrentSession, handleGithubEvent } from "../providers/github/events.js";
 import {
   beginGithubSupervisorCommentWrite,
   settleGithubSupervisorCommentWrite,
@@ -154,31 +155,11 @@ async function readBoundedUtf8Body(request: Request, maxBytes: number): Promise<
   }
 
   if (request.body === null) return "";
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      totalBytes += value.byteLength;
-      if (totalBytes > maxBytes) {
-        await reader.cancel().catch(() => undefined);
-        throw new Error("citation_contract: JSON exceeds 256 KiB");
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  const body = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder("utf-8", { fatal: true }).decode(body);
+  // Cancellation rejections are deliberately swallowed here, matching the
+  // previous `reader.cancel().catch(() => undefined)` behavior.
+  const read = await readStreamUpToByteLimit(request.body, maxBytes);
+  if (read.exceeded) throw new Error("citation_contract: JSON exceeds 256 KiB");
+  return new TextDecoder("utf-8", { fatal: true }).decode(read.bytes);
 }
 
 function findTicket(store: SupervisorStore, identifier: string): Ticket | undefined {
@@ -412,10 +393,36 @@ function githubControlEventPredatesCurrentSession(
   if (!target?.timestamp || Number.isNaN(Date.parse(target.timestamp))) return false;
   const ticket = store.getByExternalThread("github", target.externalThreadId);
   if (!ticket) return false;
-  const session = store.getCurrentSession(ticket.ticket_id) ?? store.getSession(ticket.session_id);
-  const providerActivatedAt = session?.provider_activated_at ?? session?.created_at;
-  return providerActivatedAt !== undefined &&
-    Date.parse(target.timestamp) < Date.parse(providerActivatedAt);
+  // The timestamp chooser above is this call site's own; the session
+  // resolution and comparison are shared with providers/github/events.ts.
+  return eventPredatesCurrentSession(store, ticket, target.timestamp);
+}
+
+// Linear- and GitHub-controlled sessions use the exact same GitHub-backed
+// repository read and merge ports; build them in one place so the two port
+// sets cannot drift apart.
+function repositoryAndMergePorts(
+  cfg: Config
+): Pick<SessionServicePorts, "repositoryReader" | "merger"> {
+  return {
+    repositoryReader: {
+      branchExists: (repository: string, branch: string) =>
+        branchExists({ token: cfg.githubToken }, repository, branch),
+      getRepositoryConfigAtCommit: (repository: string, branch: string) =>
+        getRepositoryConfigAtCommit({ token: cfg.githubToken }, repository, branch),
+      getRepositoryFileAtCommit: (repository: string, commit: string, path: string) =>
+        getRepositoryFileAtCommit({ token: cfg.githubToken }, repository, commit, path),
+      getRepositoryDirectoryAtCommit: (repository: string, commit: string, path: string) =>
+        getRepositoryDirectoryAtCommit({ token: cfg.githubToken }, repository, commit, path),
+    },
+    merger: {
+      parsePullRequestUrl,
+      getMergeReadiness: (repo: string, pullNumber: number) =>
+        getMergeReadiness({ token: cfg.githubToken }, repo, pullNumber),
+      mergePullRequest: (repo: string, pullNumber: number, expectedHeadSha: string) =>
+        mergePullRequest({ token: cfg.githubToken }, repo, pullNumber, expectedHeadSha),
+    },
+  };
 }
 
 export function createServerWebhookDeliveryProcessor(deps: {
@@ -448,23 +455,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
     labelResolver: {
       fetchThreadLabels: (issueId: string) => fetchIssueLabels(linear, issueId),
     },
-    repositoryReader: {
-      branchExists: (repository: string, branch: string) =>
-        branchExists({ token: deps.cfg.githubToken }, repository, branch),
-      getRepositoryConfigAtCommit: (repository: string, branch: string) =>
-        getRepositoryConfigAtCommit({ token: deps.cfg.githubToken }, repository, branch),
-      getRepositoryFileAtCommit: (repository: string, commit: string, path: string) =>
-        getRepositoryFileAtCommit({ token: deps.cfg.githubToken }, repository, commit, path),
-      getRepositoryDirectoryAtCommit: (repository: string, commit: string, path: string) =>
-        getRepositoryDirectoryAtCommit({ token: deps.cfg.githubToken }, repository, commit, path),
-    },
-    merger: {
-      parsePullRequestUrl,
-      getMergeReadiness: (repo: string, pullNumber: number) =>
-        getMergeReadiness({ token: deps.cfg.githubToken }, repo, pullNumber),
-      mergePullRequest: (repo: string, pullNumber: number, expectedHeadSha: string) =>
-        mergePullRequest({ token: deps.cfg.githubToken }, repo, pullNumber, expectedHeadSha),
-    },
+    ...repositoryAndMergePorts(deps.cfg),
   });
   const githubSessionServicePorts: SessionServicePorts = {
     activityPublisher: githubActivityPublisher,
@@ -479,23 +470,7 @@ export function createServerWebhookDeliveryProcessor(deps: {
         );
       },
     },
-    repositoryReader: {
-      branchExists: (repository: string, branch: string) =>
-        branchExists({ token: deps.cfg.githubToken }, repository, branch),
-      getRepositoryConfigAtCommit: (repository: string, branch: string) =>
-        getRepositoryConfigAtCommit({ token: deps.cfg.githubToken }, repository, branch),
-      getRepositoryFileAtCommit: (repository: string, commit: string, path: string) =>
-        getRepositoryFileAtCommit({ token: deps.cfg.githubToken }, repository, commit, path),
-      getRepositoryDirectoryAtCommit: (repository: string, commit: string, path: string) =>
-        getRepositoryDirectoryAtCommit({ token: deps.cfg.githubToken }, repository, commit, path),
-    },
-    merger: {
-      parsePullRequestUrl,
-      getMergeReadiness: (repo: string, pullNumber: number) =>
-        getMergeReadiness({ token: deps.cfg.githubToken }, repo, pullNumber),
-      mergePullRequest: (repo: string, pullNumber: number, expectedHeadSha: string) =>
-        mergePullRequest({ token: deps.cfg.githubToken }, repo, pullNumber, expectedHeadSha),
-    },
+    ...repositoryAndMergePorts(deps.cfg),
   };
   return createWebhookDeliveryProcessor({
     store: deps.store,

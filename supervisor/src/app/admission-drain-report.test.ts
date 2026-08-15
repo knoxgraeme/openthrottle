@@ -2,7 +2,8 @@ import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { createAdmissionDrainStore } from "../persistence/admission-drain-store.js";
 import { createExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
-import { canonicalJson, digestNormalized, type PipelineUnitPhaseBinding } from "../pipeline/manifest.js";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
+import { type PipelineUnitPhaseBinding } from "../pipeline/manifest.js";
 import { setupPipelineStore, ticket } from "../__fixtures__/pipeline-store.js";
 import { buildAdmissionDrainReport } from "./admission-drain-report.js";
 

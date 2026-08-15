@@ -5,7 +5,8 @@ import { createSupervisorStore, type SupervisorStore } from "../persistence/stor
 import { openDb } from "../persistence/database.js";
 import { canSteerPipelineRun } from "./control.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "./coordinator.js";
-import { digestNormalized, loadPipelineCatalog, parseRepositoryConfig } from "./manifest.js";
+import { digestNormalized } from "@openthrottle/contracts";
+import { loadPipelineCatalog, parseRepositoryConfig } from "./manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 import type { PipelineInstance, PipelineStageAttempt, PipelineStore } from "./store.js";
