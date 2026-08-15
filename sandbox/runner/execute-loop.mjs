@@ -113,10 +113,6 @@ const SKILLS = new Set([
   "data-migration",
   "performance",
   "project-standards",
-  "ce-work",
-  "ce-simplify-code",
-  "ce-code-review",
-  "ce-commit-push-pr",
 ]);
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
 const STANDARD_RECEIPT_SCHEMA = "openthrottle.receipt/v1";
@@ -864,7 +860,6 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
       // rather than leaving a repo-committed .mcp.json or other ambient
       // discovery reachable when this action declared zero MCP servers.
       ...(mcpConfigPath ? ["--mcp-config", mcpConfigPath] : []), "--strict-mcp-config",
-      "--plugin-dir", "/opt/openthrottle/compound-engineering-marketplace",
       "--setting-sources", "user",
     ],
     input: prompt,

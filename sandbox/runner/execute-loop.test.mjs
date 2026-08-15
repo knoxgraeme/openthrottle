@@ -339,7 +339,7 @@ describe("loop action request validation", () => {
       parentRunId: "run-parent",
       worktree: { id: "unit-1" },
     });
-    expect(() => validateLoopRequest({ ...valid, skill: "ce-code-review" })).toThrow(/stale/);
+    expect(() => validateLoopRequest({ ...valid, skill: "investigate" })).toThrow(/stale/);
     expect(() => validateLoopRequest({ ...valid, recoveryBaseSubject: "c".repeat(40) })).toThrow(/stale/);
   });
 
@@ -678,9 +678,9 @@ describe("loop action request validation", () => {
   });
 
   it("enters only the sealed skill named by the loop request", () => {
-    const valid = validateLoopRequest(request({ skill: "ce-simplify-code", loop: "simplify" }));
-    expect(loopPrompt(valid).split("\n")[0]).toBe("$ce-simplify-code");
-    expect(loopPrompt(valid)).not.toContain("$ce-work");
+    const valid = validateLoopRequest(request({ skill: "simplify-unit", loop: "simplify" }));
+    expect(loopPrompt(valid).split("\n")[0]).toBe("$simplify-unit");
+    expect(loopPrompt(valid)).not.toContain("$implement-unit");
   });
 
   it("renders expected producers in standard receipt shape", () => {
@@ -1351,7 +1351,7 @@ describe("loop action request validation", () => {
     expect(withMcp.args).toContain("--strict-mcp-config");
   });
 
-  it("delivers the pinned Compound Engineering plugin to Claude loop actions", () => {
+  it("launches Claude loop actions without any plugin directory", () => {
     const fresh = validateLoopRequest(request({ agent: "claude" }));
     const resumed = validateLoopRequest(request({
       agent: "claude",
@@ -1361,7 +1361,7 @@ describe("loop action request validation", () => {
     for (const valid of [fresh, resumed]) {
       const built = loopAgentCommand({ request: valid, invocation: resolveLoopInvocation(valid) });
       const args = built.args.join("\n");
-      expect(args).toContain("--plugin-dir\n/opt/openthrottle/compound-engineering-marketplace");
+      expect(args).not.toContain("--plugin-dir");
       expect(args).toContain("--setting-sources\nuser");
     }
   });
@@ -4679,7 +4679,7 @@ describe("executeLoopAction", () => {
     const inputSubject = computeWorkspaceTreeOid(worktreeDir);
     const valid = withFreshLoopFence(initial, {
       loop: "simplify",
-      skill: "ce-simplify-code",
+      skill: "simplify-unit",
       baseSubject: localBase,
       recoveryBaseSubject: durableBase,
       inputSubject,

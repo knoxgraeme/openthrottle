@@ -160,9 +160,10 @@ OpenThrottle skills)**. Keep new logic on the correct side:
   invoking a second-hop toolkit; the planning adapter in `skills/planning/`
   normalizes any sufficiently complete implementation plan or task
   specification without requiring a particular authoring workflow. None of
-  these skills references `ce-*` or `compound-engineering`. The current
-  snapshot still contains the pinned plugin as a legacy ambient image input,
-  but no OpenThrottle skill may depend on it. Never copy CE source into
+  these skills references `ce-*` or `compound-engineering`. The sandbox image
+  no longer ships the Compound Engineering plugin at all — the `ce/`
+  capability-id namespace survives only as historical vocabulary with no CE
+  dependency behind it. Never copy CE source into
   `skills/` or into target repos. Each `SKILL.md` is agent-neutral and
   maintained once; the only per-agent difference is *delivery*, which lives
   entirely in `sandbox/entrypoint.sh` + `sandbox/Dockerfile` (Claude: copy into

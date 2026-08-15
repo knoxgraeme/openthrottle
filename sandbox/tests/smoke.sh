@@ -56,11 +56,10 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   claude --version | rg -q "^2\.1\.201" &&
   claude --help | rg -q -- "--setting-sources" &&
   claude --help | rg -q -- "--strict-mcp-config" &&
-  test "$(git -C /opt/openthrottle/compound-engineering-marketplace rev-parse HEAD)" = "8163a96e86656a89797869ac61905fe4641f81be" &&
-  test "$(jq -r '\''.plugins[] | select(.name == "compound-engineering").source.sha'\'' /opt/openthrottle/compound-engineering-marketplace/.agents/plugins/marketplace.json)" = "8163a96e86656a89797869ac61905fe4641f81be" &&
-  gosu agent env HOME=/home/agent claude plugin list --json | jq -e '\''.[] | select(.id == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
-  gosu agent env HOME=/home/agent claude plugin details compound-engineering@compound-engineering-plugin | rg -q "ce-work" &&
-  test -f /home/agent/.claude/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md &&
+  # The Compound Engineering plugin is no longer shipped: no pinned
+  # marketplace checkout, no per-profile plugin caches.
+  test ! -e /opt/openthrottle/compound-engineering-marketplace &&
+  test ! -e /home/agent/.claude/plugins &&
   # OPE-107: the self-contained task skills carry zero CE delegation tokens --
   # invert the old per-token plugin-resolution loop into a flat prohibition.
   ! rg -q "\bce-[a-z][a-z-]*[a-z]\b" /opt/openthrottle/skills &&
@@ -82,9 +81,8 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   codex exec --help | rg -q -- "--json" &&
   codex exec --help | rg -q -- "--dangerously-bypass-approvals-and-sandbox" &&
   codex exec resume --help | rg -q -- "--skip-git-repo-check" &&
-  gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex codex plugin list --json | jq -e '\''.installed[] | select(.pluginId == "compound-engineering@compound-engineering-plugin" and .version == "3.19.0" and .enabled == true)'\'' >/dev/null &&
-  test -f /home/agent/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.19.0/skills/ce-work/SKILL.md &&
-  test -f /etc/codex/skills/ce-work/SKILL.md &&
+  test ! -e /home/agent/.codex/plugins &&
+  test ! -e /etc/codex/skills/ce-work &&
   for name in implement-plan investigate review-change simplify-change publish \
               implement-unit simplify-unit repair-unit accept-unit final-review \
               final-repair select-review-personas validate-review-findings correctness-dataflow \
@@ -123,13 +121,8 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
 
 cat > "$SMOKE_DIR/bin/claude" <<'STUB'
 #!/usr/bin/env sh
-test -f /opt/openthrottle/compound-engineering-marketplace/skills/ce-work/SKILL.md || {
-  echo "Claude root-owned CE skill missing" >&2
-  exit 25
-}
 case " $* " in
-  *" --plugin-dir /opt/openthrottle/compound-engineering-marketplace "*) ;;
-  *) echo "Claude did not load the root-owned CE marketplace" >&2; exit 25 ;;
+  *" --plugin-dir "*) echo "Claude was launched with a plugin directory; none may ship" >&2; exit 25 ;;
 esac
 repo_dir="${OT_REPO_DIR:-$HOME/repo}"
 ot-activity action "smoke Claude agent started"
@@ -174,8 +167,8 @@ if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
   echo '--dangerously-bypass-hook-trust'
   exit 0
 fi
-test -f /etc/codex/skills/ce-work/SKILL.md || {
-  echo "Codex admin-scope CE skill missing" >&2
+test -f /etc/codex/skills/implement-plan/SKILL.md || {
+  echo "Codex admin-scope OpenThrottle skill missing" >&2
   exit 25
 }
 ot-activity action "smoke Codex agent started"
@@ -220,7 +213,10 @@ if [ -n "${OPENCODE_CONFIG_DIR:-}" ]; then
   test "${OPENCODE_DISABLE_CLAUDE_CODE:-}" = "1"
   test -f "$OPENCODE_CONFIG_DIR/opencode.json"
   test -r "$OPENCODE_CONFIG_DIR/opencode.json"
-  grep -Fq '/opt/openthrottle/compound-engineering-marketplace' "$OPENCODE_CONFIG_DIR/opencode.json"
+  if grep -Fq '/opt/openthrottle/compound-engineering-marketplace' "$OPENCODE_CONFIG_DIR/opencode.json"; then
+    echo "OpenCode config references the retired CE marketplace" >&2
+    exit 13
+  fi
   grep -Fq '{env:KIMI_CODE_API_KEY}' "$OPENCODE_CONFIG_DIR/opencode.json"
   grep -Fq 'fixture-mcp' "$OPENCODE_CONFIG_DIR/opencode.json"
   if grep -Fq "$KIMI_CODE_API_KEY" "$OPENCODE_CONFIG_DIR/opencode.json"; then
@@ -250,10 +246,6 @@ seed_agent_home() {
     -v "$home_dir:/seed" \
     "$IMAGE" -lc '
       gosu agent cp -a /home/agent/.claude /home/agent/.codex /seed/
-      # Docker Desktop bind mounts reject the entrypoint ownership refresh
-      # for copied git packfiles. Plugin discovery does not use cache VCS data.
-      find /seed/.claude /seed/.codex -type d -name .git -prune \
-        -exec rm -rf -- {} +
     '
 }
 

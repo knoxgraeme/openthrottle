@@ -14,8 +14,6 @@ const OPENCODE_MODEL_PROFILES = Object.freeze({
   }),
 });
 
-const CE_PLUGIN_PATH = "/opt/openthrottle/compound-engineering-marketplace";
-
 export function resolveOpenCodeModelProfile(model) {
   if (typeof model !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(model)) {
     throw new Error("OpenCode model must use provider/model format");
@@ -69,7 +67,6 @@ export function buildOpenCodeConfig({ model, mcpServers = {} }) {
     autoupdate: false,
     share: "disabled",
     permission: { edit: "allow", bash: "allow", webfetch: "allow" },
-    plugin: [CE_PLUGIN_PATH],
     provider: {
       [profile.providerId]: {
         npm: "@ai-sdk/openai-compatible",

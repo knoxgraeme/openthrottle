@@ -189,9 +189,8 @@ words rather than inherited from a shared toolkit:
   touching a sibling worktree or the integration checkout;
 - no silent backlog: fix, explain, or return `needs_human`.
 
-The current snapshot still installs the commit-pinned Compound Engineering
-plugin as a legacy ambient image input. No planning or task skill in this
-repository invokes it or relies on it.
+The sandbox image no longer installs the Compound Engineering plugin. No
+planning or task skill in this repository invokes it or relies on it.
 
 ## Runtime trust boundary
 

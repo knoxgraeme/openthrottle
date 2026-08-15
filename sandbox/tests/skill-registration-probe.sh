@@ -79,7 +79,6 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
     timeout 30 gosu agent env HOME="$home_dir" claude \
       --print --output-format stream-json --verbose \
       --dangerously-skip-permissions --strict-mcp-config \
-      --plugin-dir /opt/openthrottle/compound-engineering-marketplace \
       --setting-sources user <<<"$prompt" 2>&1
   }
 
