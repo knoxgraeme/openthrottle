@@ -34,7 +34,6 @@ export interface TuneStateInput {
 export interface TuneStore {
   recordTuneState(input: TuneStateInput): TuneStateRecord;
   getTuneStateByProposal(proposalDigest: string): TuneStateRecord | undefined;
-  listTuneStateByIntent(intentDigest: string, limit?: number): TuneStateRecord[];
 }
 
 function digestPayload(payload: unknown): { normalized: string; digest: string } {
@@ -53,15 +52,6 @@ export function createTuneStore(db: Database.Database, now: () => string = () =>
 
   return {
     getTuneStateByProposal,
-    listTuneStateByIntent(intentDigest, limit = 50) {
-      const boundedLimit = Number.isSafeInteger(limit) ? Math.min(Math.max(limit, 1), 200) : 50;
-      return db.prepare(`
-        SELECT * FROM tune_state
-        WHERE intent_digest = ?
-        ORDER BY created_at, id
-        LIMIT ?
-      `).all(intentDigest, boundedLimit) as TuneStateRecord[];
-    },
     recordTuneState(input) {
       const payload = digestPayload(input.payload);
       const existing = getTuneStateByProposal(input.proposalDigest);

@@ -990,7 +990,6 @@ export function createServer(deps: ServerDeps): Hono {
         source: "linear",
         sessionId: payload.agentSession.id,
         action: payload.action,
-        activityId: payload.agentActivity?.id,
         eventName: payload.type,
         payload: rawBody,
       })

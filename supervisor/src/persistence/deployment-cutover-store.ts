@@ -35,7 +35,6 @@ export interface DeploymentCutoverStore {
     evidence?: string;
   }): DeploymentCutover;
   getOpenDeploymentCutover(): DeploymentCutover | undefined;
-  getDeploymentCutover(id: string): DeploymentCutover | undefined;
   advanceDeploymentCutover(input: {
     id: string;
     phase: DeploymentCutoverPhase;
@@ -117,9 +116,6 @@ export function createDeploymentCutoverStore(
     },
     getOpenDeploymentCutover() {
       return getOpenStmt.get() as DeploymentCutover | undefined;
-    },
-    getDeploymentCutover(id) {
-      return getStmt.get(id) as DeploymentCutover | undefined;
     },
     advanceDeploymentCutover(input) {
       // The carried-forward fields (evidence, recovery_command, completed_at)

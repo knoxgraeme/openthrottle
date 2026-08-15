@@ -120,29 +120,6 @@ describe("durable work delivery", () => {
     ).toThrow(/acknowledged/i);
   });
 
-  it("single-assigns an unacknowledged item to a durable fallback attempt", () => {
-    db = openDb(":memory:");
-    const store = createWorkStore(db);
-    const item = store.enqueue({ id: "work-4", ...binding, source: "human", body: "steer" });
-    const delivery = store.lease({
-      workItemId: item.id,
-      ...binding,
-      leaseUntil: "2099-01-01T00:00:00.000Z",
-    });
-    store.markDispatched(delivery.id, binding);
-
-    expect(store.consumeFallback(item.id, "run-fallback")).toMatchObject({
-      status: "consumed",
-      consumed_by_attempt_id: "run-fallback",
-    });
-    expect(store.getDelivery(delivery.id)).toMatchObject({
-      status: "expired",
-      last_error: "superseded by durable fallback",
-    });
-    expect(store.consumeFallback(item.id, "run-fallback").status).toBe("consumed");
-    expect(() => store.consumeFallback(item.id, "other-run")).toThrow(/already consumed/i);
-  });
-
   it("returns every unacknowledged delivery to pending when its actor ends", () => {
     db = openDb(":memory:");
     const store = createWorkStore(db);

@@ -116,9 +116,6 @@ export function createSteeringStore(db: Database.Database, workStore: WorkStore)
             body: params.body,
           });
         }
-        db.prepare(
-          "INSERT OR IGNORE INTO work_item_sources(source_table, source_id, work_item_id) VALUES ('session_inbox', ?, ?)"
-        ).run(id, id);
         if (
           runId &&
           ticket?.run_id === runId &&

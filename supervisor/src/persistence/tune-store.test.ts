@@ -65,13 +65,4 @@ describe("tune store", () => {
     }))).toThrow(/tune state replay mismatch/);
   });
 
-  it("lists tune state by sealed intent with a bounded limit", () => {
-    db = openDb(":memory:");
-    const store = createTuneStore(db, () => "2026-08-12T00:00:00.000Z");
-    store.recordTuneState(tuneState({ id: "first", proposalDigest: "1".repeat(64) }));
-    store.recordTuneState(tuneState({ id: "second", proposalDigest: "2".repeat(64) }));
-
-    expect(store.listTuneStateByIntent("a".repeat(64), 1).map((row) => row.id)).toEqual(["first"]);
-    expect(store.listTuneStateByIntent("not-present")).toEqual([]);
-  });
 });

@@ -135,12 +135,6 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
         WHERE pipeline_instance_id = ?
         ORDER BY updated_at DESC, created_at DESC, id DESC
       `).all(instance.id) as PipelinePublicationReceipt[];
-      const publishedPr = db.prepare(`
-        SELECT external_url, target_url FROM pipeline_publication_receipts
-        WHERE pipeline_instance_id = ? AND kind = 'pull_request' AND status = 'acknowledged'
-        ORDER BY acknowledged_at DESC, updated_at DESC, created_at DESC, id DESC
-        LIMIT 1
-      `).get(instance.id) as { external_url: string | null; target_url: string | null } | undefined;
       const latest = publications[0];
       const blockedPublication = publications.find((item) => item.status === "dead");
       const failedPublication = publications.find((item) => item.status === "failed");
@@ -223,10 +217,10 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
           ? instance.published_commit
           : null,
         // Production transitions persist only control_ledger/github_summary
-        // receipts, so normal runs have no pull_request receipt; the ticket
-        // projection (populated by the pull-request webhook) is the durable
-        // fallback that keeps this field honest for the /status contract.
-        published_pr_url: publishedPr?.external_url ?? publishedPr?.target_url ?? instance.ticket_pr_url ?? null,
+        // receipts (no code has ever written a pull_request receipt), so the
+        // ticket projection (populated by the pull-request webhook) is the
+        // source that keeps this field honest for the /status contract.
+        published_pr_url: instance.ticket_pr_url ?? null,
         gate_result: gate?.result ?? null,
         assurance: gate?.assurance ?? null,
         policy_digest: gate?.policy_digest ?? null,
