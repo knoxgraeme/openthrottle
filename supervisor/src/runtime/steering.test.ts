@@ -49,6 +49,7 @@ function makeSandbox(overrides: Record<string, unknown> = {}) {
       createFolder: vi.fn(async () => undefined),
       uploadFile: vi.fn(async () => undefined),
       setFilePermissions: vi.fn(async () => undefined),
+      moveFiles: vi.fn(async () => undefined),
       listFiles: vi.fn(async () => []),
       downloadFile: vi.fn(async () => Buffer.alloc(0)),
       deleteFile: vi.fn(async () => undefined),
@@ -59,6 +60,7 @@ function makeSandbox(overrides: Record<string, unknown> = {}) {
       createFolder: ReturnType<typeof vi.fn>;
       uploadFile: ReturnType<typeof vi.fn>;
       setFilePermissions: ReturnType<typeof vi.fn>;
+      moveFiles: ReturnType<typeof vi.fn>;
       listFiles: ReturnType<typeof vi.fn>;
       downloadFile: ReturnType<typeof vi.fn>;
       deleteFile: ReturnType<typeof vi.fn>;
@@ -90,14 +92,17 @@ describe("deliverPendingInbox", () => {
     await deliverPendingInbox({ runtime, store });
 
     expect(sandbox.fs.createFolder).toHaveBeenCalledWith("/home/agent/.ot/inbox", "700");
+    // Uploads land on the `.json.part` staged name and are renamed into the
+    // final `.json` name only once fully written (and owned): the drain hook
+    // must never observe a torn envelope under a name its glob matches.
     const firstUpload = sandbox.fs.uploadFile.mock.calls.find(
-      (call) => call[1] === `/home/agent/.ot/inbox/${first.delivery_id}.json`
+      (call) => call[1] === `/home/agent/.ot/inbox/${first.delivery_id}.json.part`
     );
     const secondUpload = sandbox.fs.uploadFile.mock.calls.find(
-      (call) => call[1] === `/home/agent/.ot/inbox/${second.delivery_id}.json`
+      (call) => call[1] === `/home/agent/.ot/inbox/${second.delivery_id}.json.part`
     );
-    expect(firstUpload?.[1]).toBe(`/home/agent/.ot/inbox/${first.delivery_id}.json`);
-    expect(secondUpload?.[1]).toBe(`/home/agent/.ot/inbox/${second.delivery_id}.json`);
+    expect(firstUpload?.[1]).toBe(`/home/agent/.ot/inbox/${first.delivery_id}.json.part`);
+    expect(secondUpload?.[1]).toBe(`/home/agent/.ot/inbox/${second.delivery_id}.json.part`);
     expect(JSON.parse((firstUpload?.[0] as Buffer).toString("utf8"))).toMatchObject({
       version: 1,
       issue_id: "issue-1",
@@ -106,13 +111,81 @@ describe("deliverPendingInbox", () => {
       body: "focus on the failing migration test",
     });
     expect(sandbox.fs.setFilePermissions).toHaveBeenCalledWith(
-      `/home/agent/.ot/inbox/${first.delivery_id}.json`,
+      `/home/agent/.ot/inbox/${first.delivery_id}.json.part`,
       { owner: "agent", group: "agent", mode: "600" }
+    );
+    expect(sandbox.fs.moveFiles).toHaveBeenCalledWith(
+      `/home/agent/.ot/inbox/${first.delivery_id}.json.part`,
+      `/home/agent/.ot/inbox/${first.delivery_id}.json`
+    );
+    expect(sandbox.fs.moveFiles).toHaveBeenCalledWith(
+      `/home/agent/.ot/inbox/${second.delivery_id}.json.part`,
+      `/home/agent/.ot/inbox/${second.delivery_id}.json`
     );
     expect(store.listPendingInbox("issue-1")).toHaveLength(0);
     expect(store.getInbox(first.id)?.status).toBe("dispatched");
     expect(store.getInbox(second.id)?.status).toBe("dispatched");
     expect(workStore!.getDelivery(store.getInbox(first.id)!.delivery_id!)?.status).toBe("dispatched");
+  });
+
+  it("publishes each envelope atomically: staged write, permissions, then rename before dispatch", async () => {
+    const store = seedRunningTicket();
+    const record = store.enqueueInbox({
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: "run-1",
+      source: "operator",
+      body: "arrive whole or not at all",
+    });
+    const sandbox = makeSandbox();
+    const order: string[] = [];
+    sandbox.fs.uploadFile.mockImplementation(async (_content: Buffer, path: string) => {
+      order.push(`upload:${path}`);
+    });
+    sandbox.fs.setFilePermissions.mockImplementation(async (path: string) => {
+      order.push(`permissions:${path}`);
+    });
+    sandbox.fs.moveFiles.mockImplementation(async (source: string, destination: string) => {
+      order.push(`move:${source} -> ${destination}`);
+    });
+    const runtime = { getWorkspace: vi.fn(async () => sandbox) } ;
+
+    await deliverPendingInbox({ runtime, store });
+
+    const staged = `/home/agent/.ot/inbox/${record.delivery_id}.json.part`;
+    const final = `/home/agent/.ot/inbox/${record.delivery_id}.json`;
+    // The final `.json` name (the only one the drain hook's glob matches) must
+    // appear solely as a rename target of the fully written, fully owned
+    // staged file — never as a direct write destination.
+    expect(order).toEqual([
+      `upload:${staged}`,
+      `permissions:${staged}`,
+      `move:${staged} -> ${final}`,
+    ]);
+    expect(store.getInbox(record.id)?.status).toBe("dispatched");
+  });
+
+  it("does not mark steering dispatched when the rename into the inbox fails", async () => {
+    const store = seedRunningTicket();
+    const record = store.enqueueInbox({
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: "run-1",
+      source: "operator",
+      body: "stay pending on a torn publish",
+    });
+    const sandbox = makeSandbox();
+    sandbox.fs.moveFiles.mockRejectedValue(new Error("rename failed"));
+    const runtime = { getWorkspace: vi.fn(async () => sandbox) } ;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await expect(deliverPendingInbox({ runtime, store })).resolves.toBeUndefined();
+
+    // The envelope never reached its final name, so the delivery must not be
+    // considered dispatched.
+    expect(store.getInbox(record.id)?.status).toBe("pending");
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
   });
 
   it("acknowledges only an exact processed-journal receipt", async () => {
@@ -204,6 +277,10 @@ describe("deliverPendingInbox", () => {
     await deliverPendingInbox({ runtime, store });
     expect(sandbox.fs.uploadFile).toHaveBeenCalledWith(
       expect.any(Buffer),
+      `/home/agent/.ot/inbox/${record.delivery_id}.json.part`
+    );
+    expect(sandbox.fs.moveFiles).toHaveBeenCalledWith(
+      `/home/agent/.ot/inbox/${record.delivery_id}.json.part`,
       `/home/agent/.ot/inbox/${record.delivery_id}.json`
     );
     expect(store.getInbox(record.id)?.status).toBe("dispatched");

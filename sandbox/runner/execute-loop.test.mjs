@@ -1,7 +1,8 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { appendFileSync, chmodSync, chownSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -6065,6 +6066,84 @@ describe("executeLoopAction", () => {
         throw new Error("should not run without a real integration checkout");
       },
     })).toThrow(/integration repository path must be a real directory/);
+  });
+
+  // Throws that escape executeLoopAction's own fences (a malformed credential
+  // envelope, a missing integration checkout) previously left NO result.json
+  // at all, so the supervisor polled "pending" until the reaper misreported
+  // the stall. main()'s last-resort fence must seal a typed retryable result
+  // at the derivable output path before exiting non-zero, mirroring
+  // execute-stage.mjs.
+  it("seals a retryable fallback loop result when the credential envelope is malformed", () => {
+    const valid = request();
+    const actionDir = join(process.env.OT_LOOP_ACTION_ROOT, valid.attemptId, valid.actionId);
+    writeFileSync(join(actionDir, "request.json"), JSON.stringify(valid));
+    // Distinctive credential-like bytes that must never surface in the sealed
+    // result (see loop-credentials.mjs's fixed-message parse failure).
+    writeFileSync(join(actionDir, "credentials.json"), 'ghp_leaked-fragment{{{"env":');
+    const outputPath = join(actionDir, "result.json");
+
+    const executed = spawnSync(process.execPath, [
+      fileURLToPath(new URL("./execute-loop.mjs", import.meta.url)),
+      "--request", join(actionDir, "request.json"),
+      "--credentials", join(actionDir, "credentials.json"),
+      "--output", outputPath,
+    ], { encoding: "utf8", timeout: 30_000, env: { ...process.env } });
+
+    expect(executed.status).toBe(1);
+    expect(executed.stderr).toContain("loop action credential envelope is not valid JSON");
+    const event = JSON.parse(readFileSync(outputPath, "utf8"));
+    expect(event).toMatchObject({
+      version: 1,
+      kind: "loop_action_result",
+      action_id: valid.actionId,
+      attempt_id: valid.attemptId,
+      request_hash: valid.requestHash,
+      outcome: "retryable_infrastructure_failure",
+      subject: null,
+    });
+    expect(typeof event.receipt).toBe("string");
+    expect(event.receipt).toContain("credential envelope is not valid JSON");
+    expect(event.receipt).not.toContain("ghp_leaked-fragment");
+    // The malformed envelope was still consumed (delete-before-validate is a
+    // deliberate invariant), so the supervisor's re-dispatch starts from a
+    // freshly materialized envelope rather than replaying doomed bytes.
+    expect(existsSync(join(actionDir, "credentials.json"))).toBe(false);
+  });
+
+  it("seals a retryable fallback loop result when the integration repository is missing", () => {
+    const valid = request();
+    const actionDir = join(process.env.OT_LOOP_ACTION_ROOT, valid.attemptId, valid.actionId);
+    writeFileSync(join(actionDir, "request.json"), JSON.stringify(valid));
+    writeFileSync(join(actionDir, "credentials.json"), JSON.stringify({
+      env: { GITHUB_TOKEN: "fixture-github-token" },
+    }));
+    const outputPath = join(actionDir, "result.json");
+
+    const executed = spawnSync(process.execPath, [
+      fileURLToPath(new URL("./execute-loop.mjs", import.meta.url)),
+      "--request", join(actionDir, "request.json"),
+      "--credentials", join(actionDir, "credentials.json"),
+      "--output", outputPath,
+    ], {
+      encoding: "utf8",
+      timeout: 30_000,
+      env: { ...process.env, OT_INTEGRATION_REPO_DIR: join(tmpdir(), "ot-missing-integration-repo") },
+    });
+
+    expect(executed.status).toBe(1);
+    expect(executed.stderr).toContain("integration repository path must be a real directory");
+    const event = JSON.parse(readFileSync(outputPath, "utf8"));
+    expect(event).toMatchObject({
+      version: 1,
+      kind: "loop_action_result",
+      action_id: valid.actionId,
+      attempt_id: valid.attemptId,
+      request_hash: valid.requestHash,
+      outcome: "retryable_infrastructure_failure",
+      subject: null,
+    });
+    expect(event.receipt).toContain("integration repository path must be a real directory");
   });
 
   it("scopes Git safe.directory to the sealed integration worktree and git dir for read-only clones", () => {

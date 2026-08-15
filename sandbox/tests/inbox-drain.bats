@@ -116,6 +116,46 @@ write_message() {
   [ -f "$OT_INBOX_DIR/0002.json" ]
 }
 
+@test "a malformed envelope is left in place and skipped, not destroyed" {
+  mkdir -p "$OT_INBOX_DIR"
+  # A truncated write from before the supervisor's atomic staged upload (or
+  # any other corruption). The supervisor never re-writes a dispatched
+  # delivery, so deleting this file would lose the message forever.
+  printf '%s' '{"version":1,"delivery_id":"00000000-0000-4000-8000-0000000000' > "$OT_INBOX_DIR/0001.json"
+  write_message "$OT_INBOX_DIR/0002.json" 'valid sibling still injected' '00000000-0000-4000-8000-000000000002'
+
+  run bash -c "printf '%s' '{\"hook_event_name\":\"PostToolUse\"}' | '$DRAIN'"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'valid sibling still injected'* ]]
+  [ -f "$OT_INBOX_DIR/0001.json" ]
+  [ ! -f "$OT_INBOX_DIR/0002.json" ]
+}
+
+@test "an envelope failing the fence identity check is left in place, not injected" {
+  mkdir -p "$OT_INBOX_DIR"
+  write_message "$OT_INBOX_DIR/badid.json" 'never injected' 'not-a-uuid'
+
+  run bash -c "printf '%s' '{\"hook_event_name\":\"PostToolUse\"}' | '$DRAIN'"
+
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ -f "$OT_INBOX_DIR/badid.json" ]
+}
+
+@test "a staged .json.part upload is never read or consumed" {
+  mkdir -p "$OT_INBOX_DIR"
+  # Mid-upload staging name used by the supervisor's atomic publish; the glob
+  # must not match it even when its content is already complete.
+  write_message "$OT_INBOX_DIR/aaaa.json.part" 'still being staged'
+
+  run bash -c "printf '%s' '{\"hook_event_name\":\"PostToolUse\"}' | '$DRAIN'"
+
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [ -f "$OT_INBOX_DIR/aaaa.json.part" ]
+}
+
 @test "a prior run's envelope is discarded without injection or acknowledgement" {
   mkdir -p "$OT_INBOX_DIR"
   write_message "$OT_INBOX_DIR/stale.json" 'stale steering'

@@ -268,6 +268,10 @@ export interface RuntimeWorkspace {
     downloadFile?(path: string): Promise<Buffer | undefined>;
     uploadFile?(content: Buffer, path: string): Promise<void>;
     deleteFile?(path: string): Promise<unknown>;
+    // Atomic move/rename within the workspace filesystem. Lets writers stage
+    // a file and rename it into place so workspace-side readers never observe
+    // a torn upload.
+    moveFiles?(source: string, destination: string): Promise<unknown>;
     createFolder?(path: string, mode?: string): Promise<void>;
     setFilePermissions?(path: string, permissions: {
       owner: string;

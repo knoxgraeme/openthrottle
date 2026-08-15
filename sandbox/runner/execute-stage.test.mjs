@@ -156,6 +156,7 @@ function fixture({
   configuredCommand = true,
   repositorySkill,
   repositoryConfig,
+  transitionContext = "",
 } = {}) {
   const repoDir = repository();
   let sealedRepositorySkill = repositorySkill;
@@ -192,7 +193,7 @@ function fixture({
     generation: 1,
     taskType: "implement",
     taskContext: "Implement the approved fixture change.",
-    transitionContext: "",
+    transitionContext,
     repository: "owner/repo",
     baseCommit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim(),
     baseBranch: "main",
@@ -1474,6 +1475,92 @@ exit 1
       // id must not be returned as if it were valid evidence.
       expect(result.nativeSessionId).toBeNull();
     });
+  });
+
+  describe("stage launch shapes above Linux's per-argument prompt ceiling", () => {
+    // MAX_ARG_STRLEN on Linux is 131,072 bytes; a stage admits input
+    // artifacts far larger than that, so the rendered prompt can exceed any
+    // single argv element. It must therefore travel over stdin for every
+    // engine and mode (mirroring loopAgentCommand in execute-loop.mjs) --
+    // stdin is also invisible to co-resident processes, unlike
+    // /proc/<pid>/cmdline.
+    const LINUX_MAX_ARG_STRLEN = 131_072;
+    const hugeTransitionContext = "x".repeat(LINUX_MAX_ARG_STRLEN + 10_000);
+
+    const launchShapes = [
+      { label: "Claude fresh", agent: "claude", contextPolicy: "prefer_resume", nativeSessionId: null },
+      { label: "Claude resume", agent: "claude", contextPolicy: "resume_required", nativeSessionId: "native-claude-1" },
+      { label: "Codex fresh", agent: "codex", contextPolicy: "prefer_resume", nativeSessionId: null },
+      { label: "Codex resume", agent: "codex", contextPolicy: "resume_required", nativeSessionId: "native-codex-1" },
+      { label: "OpenCode fresh", agent: "opencode", contextPolicy: "prefer_resume", nativeSessionId: null },
+      { label: "OpenCode resume", agent: "opencode", contextPolicy: "resume_required", nativeSessionId: "native-opencode-1" },
+    ];
+
+    for (const shape of launchShapes) {
+      it(`keeps the prompt out of argv and carries it whole over stdin for ${shape.label}`, () => {
+        const input = fixture({
+          agent: shape.agent,
+          contextPolicy: shape.contextPolicy,
+          nativeSessionId: shape.nativeSessionId,
+          transitionContext: hugeTransitionContext,
+        });
+        const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+        const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+        const captureDir = mkdtempSync(join(tmpdir(), "ot-stage-launch-capture-"));
+        directories.push(actionRoot, binDir, captureDir);
+        process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+
+        installFakeGosu(binDir);
+        // NUL-separated so argv elements are reconstructed exactly. Exiting
+        // non-zero keeps the engine exit non-clean, which skips the native
+        // session seal step -- this test is about the launch shape only.
+        writeExecutable(join(binDir, shape.agent), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\0' "$@" > '${captureDir}/args.raw'
+cat > '${captureDir}/stdin.txt'
+exit 47
+`);
+        const result = withPrependedPath(binDir, () => defaultRunAgent({
+          request: input.request,
+          invocation: resolveContextInvocation(input.request),
+          repoDir: input.repoDir,
+          proposalPath: join(actionRoot, "proposal.json"),
+          timeoutMs: 10_000,
+          ...(shape.agent === "opencode" ? { model: "kimi-code/kimi-for-coding" } : {}),
+        }));
+        expect(result.exitCode).toBe(47);
+
+        const rawArgs = readFileSync(join(captureDir, "args.raw"), "utf8");
+        const capturedArgs = rawArgs.split("\0").slice(0, -1);
+        const capturedStdin = readFileSync(join(captureDir, "stdin.txt"), "utf8");
+
+        // The prompt (identified by its scaffold and its oversized sealed
+        // transition context) never appears in argv, and no argv element
+        // reaches the Linux ceiling.
+        expect(rawArgs).not.toContain("## Task context");
+        expect(rawArgs).not.toContain(hugeTransitionContext);
+        for (const capturedArg of capturedArgs) {
+          expect(Buffer.byteLength(capturedArg, "utf8")).toBeLessThan(LINUX_MAX_ARG_STRLEN);
+        }
+        expect(Buffer.byteLength(capturedStdin, "utf8")).toBeGreaterThan(LINUX_MAX_ARG_STRLEN);
+        expect(capturedStdin).toContain("## Task context");
+        expect(capturedStdin).toContain(hugeTransitionContext);
+
+        if (shape.agent === "claude") {
+          // The long-form --print is what makes Claude read stdin; -p would
+          // demand a positional prompt argument instead.
+          expect(capturedArgs).toContain("--print");
+          expect(capturedArgs).not.toContain("-p");
+        }
+        if (shape.agent === "codex") expect(capturedArgs.at(-1)).toBe("-");
+        if (shape.nativeSessionId) {
+          expect(capturedArgs).toContain(shape.nativeSessionId);
+          expect(capturedArgs).toContain(
+            shape.agent === "claude" ? "--resume" : shape.agent === "codex" ? "resume" : "--session",
+          );
+        }
+      });
+    }
   });
 
   it("executes only the sealed allowlisted command and records tree mutation", () => {

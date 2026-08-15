@@ -321,6 +321,34 @@ make_stage_branch_fixture() {
   [ "$output" = "FATAL: ${config} is present but not valid JSON; the supervisor must retry the stage" ]
 }
 
+@test "reset_agent_execution_state clears Claude config backups so heal cannot resurrect a prior stage's config" {
+  AGENT_HOME="${BATS_TEST_TMPDIR}/agent-home"
+  AGENT_USER="$(id -un)"
+  if ! install -d -o "$AGENT_USER" -g "$AGENT_USER" "${BATS_TEST_TMPDIR}/install-probe" 2>/dev/null; then
+    skip "cannot install with owner/group ${AGENT_USER} in this test environment"
+  fi
+  log() { printf '%s\n' "$*"; }
+  # The function is defined in entrypoint.sh, which cannot be sourced whole
+  # (it executes the stage lifecycle at load); extract exactly its definition.
+  eval "$(sed -n '/^reset_agent_execution_state()/,/^}/p' "${BATS_TEST_DIRNAME}/../entrypoint.sh")"
+
+  mkdir -p "$AGENT_HOME/.claude/backups"
+  printf '{"generation":"previous-stage"}\n' > "$AGENT_HOME/.claude/backups/.claude.json.backup.1753900000000"
+  printf '{"generation":"previous-stage"}\n' > "$AGENT_HOME/.claude.json"
+
+  run reset_agent_execution_state
+  [ "$status" -eq 0 ]
+  [ ! -e "$AGENT_HOME/.claude.json" ]
+  [ ! -e "$AGENT_HOME/.claude/backups" ]
+
+  # With the backups gone, the stage-boundary heal reports the normal absent
+  # state for CLI regeneration instead of restoring the prior stage's config
+  # across the security boundary.
+  run heal_claude_config "$AGENT_HOME/.claude.json" "$AGENT_HOME/.claude/backups"
+  [ "$status" -eq 0 ]
+  [ "$output" = "absent" ]
+}
+
 @test "codex_reconcile_auth orders ISO-8601 offsets and fractional seconds by instant" {
   before='{"tokens":{"account_id":"acct"},"last_refresh":"2026-07-01T23:59:59.900Z"}'
   after_offset='{"tokens":{"account_id":"acct"},"last_refresh":"2026-07-02T02:00:00.100+02:00"}'

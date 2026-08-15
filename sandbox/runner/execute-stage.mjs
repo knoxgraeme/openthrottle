@@ -654,6 +654,11 @@ export function defaultRunAgent({
       ...stageEnvironment.env,
       `OT_STAGE_PROPOSAL_FILE=${actionProposalPath}`,
     ];
+    // The prompt always travels over stdin rather than argv, for every engine
+    // and mode (mirroring loopAgentCommand in execute-loop.mjs): a stage
+    // admits far more sealed input than Linux's MAX_ARG_STRLEN per-argument
+    // ceiling (128 KiB) allows in a single argv element, and argv is visible
+    // to any co-resident process via /proc/<pid>/cmdline.
     if (agent === "claude") {
       const maxTurns = process.env.MAX_TURNS?.trim();
       const mcpConfig = process.env.OT_CLAUDE_MCP_CONFIG?.trim();
@@ -668,21 +673,29 @@ export function defaultRunAgent({
         "--setting-sources", "user",
       ];
       command = "claude";
+      // The long-form --print (not -p) is required for Claude to read the
+      // prompt from stdin instead of taking it as a positional argument.
       args = invocation.mode === "resume"
-        ? ["-p", "--resume", invocation.nativeSessionId, prompt, ...common]
-        : ["-p", prompt, ...common];
+        ? ["--print", "--resume", invocation.nativeSessionId, ...common]
+        : ["--print", ...common];
+      stdin = prompt;
     } else if (agent === "opencode") {
       if (!model) throw new Error("OpenCode stage execution requires a sealed model selection");
       command = "opencode";
-      args = ["run", "--format", "json", "--model", model, "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : []), prompt];
+      // `opencode run` reads the message from piped stdin when no positional
+      // message argument is supplied.
+      args = ["run", "--format", "json", "--model", model, "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : [])];
+      stdin = prompt;
     } else if (agent === "codex") {
       command = "codex";
+      // "-" tells Codex to read the prompt from stdin, in resume mode exactly
+      // as in a fresh launch.
       args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
         ...(process.env.OT_CODEX_HOOK_TRUST_FLAG === "1" ? ["--dangerously-bypass-hook-trust"] : []),
         "--skip-git-repo-check", "-C", repoDir, ...(model ? ["-m", model] : []),
         ...(reasoningEffort ? ["-c", `model_reasoning_effort=\"${reasoningEffort}\"`] : []),
-        ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, prompt] : ["-"])];
-      if (invocation.mode !== "resume") stdin = prompt;
+        ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, "-"] : ["-"])];
+      stdin = prompt;
     } else {
       throw new Error(`unsupported agent adapter ${agent}`);
     }

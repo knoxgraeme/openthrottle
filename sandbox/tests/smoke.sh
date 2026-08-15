@@ -133,10 +133,16 @@ case " $* " in
 esac
 repo_dir="${OT_REPO_DIR:-$HOME/repo}"
 ot-activity action "smoke Claude agent started"
+# The executor delivers the sealed prompt over stdin (never argv, which is
+# capped by MAX_ARG_STRLEN and visible via /proc/<pid>/cmdline).
+prompt="$(cat 2>/dev/null || true)"
 if [ -n "${OT_STAGE_PROPOSAL_FILE:-}" ]; then
-  case "$*" in
+  case "$prompt" in
     *"/implement-plan"*) ;;
-    *) echo "Claude stage did not use slash-command skill syntax" >&2; exit 26 ;;
+    *) echo "Claude stage did not receive slash-command skill syntax on stdin" >&2; exit 26 ;;
+  esac
+  case "$*" in
+    *"/implement-plan"*) echo "Claude stage prompt must not ride argv" >&2; exit 26 ;;
   esac
   case " $* " in *" --max-turns 2 "*) ;; *) exit 27 ;; esac
   case " $* " in *" --strict-mcp-config "*) ;; *) exit 28 ;; esac
@@ -222,9 +228,9 @@ if [ -n "${OPENCODE_CONFIG_DIR:-}" ]; then
   fi
 fi
 printf '%s\n' "$*" >> "$HOME/.ot/opencode-args.log"
-last=""
-for arg in "$@"; do last="$arg"; done
-printf '%s\n' "$last" >> "$HOME/.ot/opencode-prompt.log"
+# The executor pipes the sealed prompt over stdin instead of a positional
+# message argument (MAX_ARG_STRLEN / cmdline visibility).
+cat >> "$HOME/.ot/opencode-prompt.log" 2>/dev/null || true
 mkdir -p "$HOME/.local/share/opencode"
 printf '%s\n' \
   '{"type":"message","sessionID":"smoke-opencode-session","part":{"type":"text","text":"durable smoke session"}}' \
