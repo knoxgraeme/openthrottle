@@ -10,7 +10,11 @@ import type { ExecutionGateDecision } from "../../pipeline/execution-gates.js";
 import type { GateReceiptReason } from "../../pipeline/gates.js";
 import { openDb } from "../database.js";
 import { createPipelineStore } from "./create-store.js";
-import { createExecutionUnitStore, type ExecutionUnitStore } from "./unit-store.js";
+import {
+  createExecutionUnitStore,
+  getStructuredExecutionPublicationForAttempt,
+  type ExecutionUnitStore,
+} from "./unit-store.js";
 import { executionLedgerLines } from "../../pipeline/execution-publication.js";
 import { createUnitEffectProcessor } from "../../operations/unit-effects.js";
 
@@ -3248,7 +3252,7 @@ describe("execution unit store", () => {
       records: [{ toUnitId: "b", payload: { summary: "Use the accepted parser." } }],
     });
 
-    expect(store.getStructuredExecutionPublication("attempt-parent")).toMatchObject({
+    expect(getStructuredExecutionPublicationForAttempt(db!, "attempt-parent")).toMatchObject({
       graph: { parent_attempt_id: "attempt-parent", parent_stage_id: "units" },
       units: [
         {
@@ -3312,7 +3316,7 @@ describe("execution unit store", () => {
       }
     }
 
-    const attempts = store.getStructuredExecutionPublication("attempt-parent")?.units[0]?.attempts ?? [];
+    const attempts = getStructuredExecutionPublicationForAttempt(db!, "attempt-parent")?.units[0]?.attempts ?? [];
     expect(attempts.map((attempt) => attempt.attempt_ordinal)).toEqual([2, 3, 4]);
     expect(attempts.map((attempt) => attempt.status)).toEqual(["failed", "failed", "completed"]);
     expect(attempts.map((attempt) => attempt.request_hash)).not.toContain("request-1");
@@ -4043,13 +4047,13 @@ describe("execution unit store", () => {
     status: string;
   };
 
-  function replayProjectionSnapshot(store: ExecutionUnitStore, parentAttemptId: string): {
+  function replayProjectionSnapshot(parentAttemptId: string): {
     events: ReplayPublicationEventRow[];
     outbox: ReplayOutboxRow[];
     actionOrdinals: ReplayActionOrdinalRow[];
     ledger: string[];
   } {
-    const snapshot = store.getStructuredExecutionPublication(parentAttemptId);
+    const snapshot = getStructuredExecutionPublicationForAttempt(db!, parentAttemptId);
     expect(snapshot).toBeDefined();
     return {
       events: db!.prepare(`
@@ -4180,7 +4184,7 @@ describe("execution unit store", () => {
 
     // The store's own read path (the terminal ledger's convergence source)
     // exposes the same three events immediately and in the same order.
-    const activityLog = store.getStructuredExecutionPublication("attempt-parent")?.activity_log ?? [];
+    const activityLog = getStructuredExecutionPublicationForAttempt(db!, "attempt-parent")?.activity_log ?? [];
     expect(activityLog.map((event) => [event.sequence, event.unit_id])).toEqual([
       [1, "a"],
       [2, "b"],
@@ -4215,7 +4219,7 @@ describe("execution unit store", () => {
     const completion = { actionId: lead.id, resultHash: "rl", outputSubject: subject, decision };
     store.completeGatedAction(completion);
 
-    const afterCommit = replayProjectionSnapshot(store, "attempt-parent");
+    const afterCommit = replayProjectionSnapshot("attempt-parent");
 
     expect(afterCommit.events.map((event) => event.sequence)).toEqual([1]);
     expect(afterCommit.outbox.map((row) => row.sequence)).toEqual([1]);
@@ -4232,7 +4236,7 @@ describe("execution unit store", () => {
     // existing gate receipt and skip routing/event emission entirely.
     restartedStore.completeGatedAction(completion);
 
-    const afterReplay = replayProjectionSnapshot(restartedStore, "attempt-parent");
+    const afterReplay = replayProjectionSnapshot("attempt-parent");
     expect(afterReplay).toEqual(afterCommit);
     expect(afterReplay.events).toHaveLength(1);
     expect(afterReplay.outbox).toHaveLength(1);
@@ -4483,7 +4487,7 @@ describe("execution unit store", () => {
     // from that durable row rather than waiting on the event's own correlated
     // control_outbox activity to be delivered -- delivery of that activity is a
     // separate, independent concern from this projection converging.
-    const activityLog = store.getStructuredExecutionPublication("attempt-parent")?.activity_log ?? [];
+    const activityLog = getStructuredExecutionPublicationForAttempt(db!, "attempt-parent")?.activity_log ?? [];
     expect(activityLog).toHaveLength(1);
     expect(activityLog[0]).toMatchObject({ kind: "unit_repair", unit_id: "a", sequence: 1 });
 

@@ -87,7 +87,6 @@ export interface ExecutionUnitGraph {
   final_command_index: number;
   final_cycle: number;
   final_repair_rounds: number;
-  final_review_passed_at: string | null;
   integration_subject: string | null;
   aggregate_artifact_hash: string | null;
   aggregate_emitted_at: string | null;
@@ -344,7 +343,6 @@ export interface ExecutionUnitStore {
     heartbeatAtIso: string;
     leaseUntilIso: string;
   }): boolean;
-  getStructuredExecutionPublication(parentAttemptId: string): ReturnType<typeof buildExecutionPublicationSnapshot>;
   getStructuredExecutionPublicationForInstance(pipelineInstanceId: string): ReturnType<typeof buildExecutionPublicationSnapshot>;
 }
 
@@ -1172,8 +1170,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       });
       if (routing.action === "done") {
         db.prepare(`
-          UPDATE execution_graphs SET final_phase = 'done', final_review_passed_at = ?, updated_at = ? WHERE id = ?
-        `).run(timestamp, timestamp, graph.id);
+          UPDATE execution_graphs SET final_phase = 'done', updated_at = ? WHERE id = ?
+        `).run(timestamp, graph.id);
         insertExecutionPublicationEvent({
           db,
           id: deterministicId("execution-activity-final-review", [completedAction.parent_attempt_id, "done"]),
@@ -1564,13 +1562,11 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         SET status = 'dead', lease_until = NULL, last_error = ?, updated_at = ?, completed_at = COALESCE(completed_at, ?)
         WHERE parent_attempt_id = ? AND status IN ('leased', 'dispatched', 'running')
       `).run(input.reason, timestamp, timestamp, input.parentAttemptId);
-      db.prepare(`
-        UPDATE execution_units
-        SET status = 'exited', terminal_level = 'exited', alarm = 0,
-            active_work_attempt_id = NULL, updated_at = ?
-        WHERE parent_attempt_id = ? AND active_work_attempt_id IN (${activeActionIds.map(() => "?").join(",")})
-      `).run(timestamp, input.parentAttemptId, ...activeActionIds);
     }
+    // This also exits every unit still bound to one of the actions killed
+    // above: every terminal_level writer clears active_work_attempt_id in the
+    // same statement and activation only targets non-terminal units, so a unit
+    // with an active action always has terminal_level IS NULL.
     db.prepare(`
       UPDATE execution_units
       SET status = 'exited', terminal_level = 'exited', alarm = 0,
@@ -1731,6 +1727,12 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         WHERE id = ? AND request_hash IS NOT NULL AND request_payload IS NOT NULL
           AND (request_launch_state IS NULL OR request_launch_state IN ('prepared', 'worktree_ready'))
       `).run(timestamp, actionId);
+      // Unlike markActionCompleted, changes !== 1 is a real (not merely
+      // defensive) outcome here: a crash/redelivery re-dispatch of an action
+      // that already reached request_launch_state = 'launched' re-creates the
+      // worktree idempotently and re-marks readiness, and the fence above
+      // correctly refuses to regress 'launched'. The caller then proceeds to
+      // re-dispatch, so this stays a silent no-op rather than failing closed.
       if (update.changes !== 1) return;
     },
     markActionDispatched(actionId, requestHash, nativeSessionId = null) {
@@ -1856,9 +1858,6 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         WHERE parent_action_id = ? AND action_id = ?
       `).run(source, acknowledgedAt, source, parentActionId, actionId);
       if (update.changes !== 1) throw new Error(`unknown prepared review subaction ${actionId}`);
-    },
-    getStructuredExecutionPublication(parentAttemptId) {
-      return getStructuredExecutionPublicationForAttempt(db, parentAttemptId);
     },
     getStructuredExecutionPublicationForInstance(pipelineInstanceId) {
       return getStructuredExecutionPublicationForInstance(db, pipelineInstanceId);

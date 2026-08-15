@@ -41,7 +41,7 @@ describe("provider feedback snapshots", () => {
       "review:7",
       "check-suite:8",
     ]);
-    expect(store.claim(review.snapshot.id, 3)).toMatchObject({
+    expect(store.claimWithEvents(review.snapshot.id, 3)).toMatchObject({
       status: "claimed",
       snapshot: { repair_round: 1 },
     });
@@ -55,7 +55,7 @@ describe("provider feedback snapshots", () => {
       receivedAt: "2026-01-01T00:00:02.000Z",
     });
     expect(duringRepair.snapshot.id).not.toBe(review.snapshot.id);
-    expect(store.claim(duringRepair.snapshot.id, 3)).toMatchObject({
+    expect(store.claimWithEvents(duringRepair.snapshot.id, 3)).toMatchObject({
       status: "claimed",
       snapshot: { repair_round: 2 },
     });
@@ -126,7 +126,7 @@ describe("provider feedback snapshots", () => {
       payload: "a",
       workItemId: "gh-review-1",
     });
-    expect(store.claim(first.snapshot.id, 1).status).toBe("claimed");
+    expect(store.claimWithEvents(first.snapshot.id, 1).status).toBe("claimed");
     const oldHead = store.record({
       ...base,
       headSha: "head-old",
@@ -135,7 +135,7 @@ describe("provider feedback snapshots", () => {
       payload: "old",
       workItemId: "gh-comment-2",
     });
-    expect(store.claim(oldHead.snapshot.id, 1)).toEqual({
+    expect(store.claimWithEvents(oldHead.snapshot.id, 1)).toEqual({
       status: "exhausted",
       completedRounds: 1,
     });
@@ -152,7 +152,7 @@ describe("provider feedback snapshots", () => {
       workItemId: "gh-ci-head-a",
     });
     expect(first.snapshot.work_item_id).toBe("gh-ci-head-a");
-    expect(store.claim(first.snapshot.id, 3).status).toBe("claimed");
+    expect(store.claimWithEvents(first.snapshot.id, 3).status).toBe("claimed");
 
     const next = store.record({
       ...base,

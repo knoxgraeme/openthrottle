@@ -1166,19 +1166,6 @@ describe("coordinator-only server", () => {
     `).run("d".repeat(40), "c".repeat(40), "d".repeat(40), instance.id);
     store.setPrUrl("issue-1", "https://github.com/owner/repo/pull/11");
 
-    db.prepare(`
-      INSERT INTO pipeline_publication_receipts (
-        id, pipeline_instance_id, kind, idempotency_key, payload, payload_hash,
-        status, external_url, attempts, next_attempt_at, created_at, updated_at
-      ) VALUES (
-        'published-pr', ?, 'pull_request', 'published-pr', '{}',
-        '44136fa355b3678a1146ad16f7e8649e94fb4f35495fb8a8e07a41149dc82ca4',
-        'acknowledged', 'https://github.com/owner/repo/pull/12', 1,
-        '2026-07-26T00:20:00.000Z', '2026-07-26T00:20:00.000Z',
-        '2026-07-26T00:20:00.000Z'
-      )
-    `).run(instance.id);
-
     const providerResponse = await app().request("/status", {
       headers: { Authorization: "Bearer status-token" },
     });
@@ -1189,7 +1176,7 @@ describe("coordinator-only server", () => {
     expect(providerBody.tickets[0]?.pipeline).toMatchObject({
       status: "waiting_provider",
       whose_move: "waiting on GitHub",
-      published_pr_url: "https://github.com/owner/repo/pull/12",
+      published_pr_url: "https://github.com/owner/repo/pull/11",
     });
   });
 

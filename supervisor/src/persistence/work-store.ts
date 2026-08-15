@@ -142,7 +142,6 @@ export interface WorkStore {
   markDispatched(deliveryId: string, binding: WorkBinding): WorkDelivery;
   acknowledge(deliveryId: string, binding: WorkBinding): WorkDelivery;
   consume(deliveryId: string, binding: WorkBinding & { attemptId: string }): WorkDelivery;
-  consumeFallback(workItemId: string, attemptId: string): WorkItem;
   expireUnacknowledged(deliveryId: string, expectedRunId: string, reason: string): boolean;
   releaseUnacknowledgedForRun(runId: string, reason: string): string[];
   consumeAcknowledgedForRun(runId: string, attemptId: string): string[];
@@ -343,34 +342,6 @@ export function createWorkStore(db: Database.Database): WorkStore {
         if (result.changes !== 1) throw new Error(`work item ${item.id} consumption race`);
       }).immediate();
       return getDeliveryStmt.get(deliveryId) as WorkDelivery;
-    },
-    consumeFallback(workItemId, attemptId) {
-      const timestamp = now();
-      return db.transaction(() => {
-        const item = getItemStmt.get(workItemId) as WorkItem | undefined;
-        if (!item) throw new Error(`work item ${workItemId} not found`);
-        if (item.status === "consumed") {
-          if (item.consumed_by_attempt_id === attemptId) return item;
-          throw new Error(`work item ${item.id} already consumed by ${item.consumed_by_attempt_id}`);
-        }
-        if (["acknowledged", "canceled", "dead", "reconciliation"].includes(item.status)) {
-          throw new Error(`work item ${item.id} cannot be fallback-consumed from ${item.status}`);
-        }
-        if (item.active_delivery_id) {
-          db.prepare(`
-            UPDATE work_deliveries
-            SET status = 'expired', last_error = 'superseded by durable fallback'
-            WHERE id = ? AND status IN ('leased', 'dispatched')
-          `).run(item.active_delivery_id);
-        }
-        const result = db.prepare(`
-          UPDATE work_items
-          SET status = 'consumed', consumed_by_attempt_id = ?, consumed_at = ?, updated_at = ?
-          WHERE id = ? AND status IN ('pending', 'leased', 'dispatched')
-        `).run(attemptId, timestamp, timestamp, workItemId);
-        if (result.changes !== 1) throw new Error(`work item ${item.id} fallback consumption race`);
-        return getItemStmt.get(workItemId) as WorkItem;
-      }).immediate();
     },
     expireUnacknowledged(deliveryId, expectedRunId, reason) {
       return db.transaction(() => {

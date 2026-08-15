@@ -14,7 +14,6 @@ export interface AdmissionStore {
   upsertUnpinned(ticket: Omit<TicketUpsert, "pipeline">): void;
   getByIssueId(issueId: string): Ticket | undefined;
   getByExternalThread(provider: Ticket["control_provider"], externalThreadId: string): Ticket | undefined;
-  getByIdentifier(identifier: string): Ticket | undefined;
   getByBranch(repo: string, branch: string): Ticket | undefined;
   getByPrUrl(repo: string, prUrl: string): Ticket | undefined;
   getBySandboxId(sandboxId: string): Ticket | undefined;
@@ -72,9 +71,6 @@ export function createAdmissionStore(
   const getByIssueIdStmt = db.prepare("SELECT * FROM tickets WHERE ticket_id = ?");
   const getByExternalThreadStmt = db.prepare(
     "SELECT * FROM tickets WHERE control_provider = ? AND external_thread_id = ?"
-  );
-  const getByIdentifierStmt = db.prepare(
-    "SELECT * FROM tickets WHERE lower(ticket_reference) = lower(?) ORDER BY created_at, ticket_id"
   );
   const getByBranchStmt = db.prepare("SELECT * FROM tickets WHERE repo = ? AND branch = ?");
   const getByPrUrlStmt = db.prepare(
@@ -296,10 +292,6 @@ export function createAdmissionStore(
     },
     getByExternalThread(provider, externalThreadId) {
       return getByExternalThreadStmt.get(provider, externalThreadId) as Ticket | undefined;
-    },
-    getByIdentifier(identifier) {
-      const matches = getByIdentifierStmt.all(identifier) as Ticket[];
-      return matches.length === 1 ? matches[0] : undefined;
     },
     getByBranch(repo, branch) {
       return getByBranchStmt.get(repo, branch) as Ticket | undefined;

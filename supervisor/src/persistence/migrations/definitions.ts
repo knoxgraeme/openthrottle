@@ -2376,6 +2376,20 @@ ALTER TABLE execution_graphs ADD COLUMN stop_outcome TEXT CHECK(
 const executionGraphStopOutcomeMigrationSource = `${executionGraphStopOutcomeSchema}
 stop-outcome-contract:stopped execution graphs persist a typed terminal outcome so the aggregate outcome never derives from sanitized agent stop text/v1`;
 
+const deadSatelliteSurfaceDropSchema = `
+DROP TABLE IF EXISTS run_liveness;
+DROP TABLE IF EXISTS session_executions;
+DROP TABLE IF EXISTS pipeline_runtime_resources;
+DROP TABLE IF EXISTS pipeline_attempt_actors;
+DROP TABLE IF EXISTS migration_reconciliation;
+DROP TABLE IF EXISTS work_item_sources;
+`;
+
+const deadSatelliteSurfaceDropMigrationSource = `${deadSatelliteSurfaceDropSchema}
+ALTER TABLE execution_graphs DROP COLUMN final_review_passed_at;
+ALTER TABLE webhook_deliveries DROP COLUMN activity_id;
+dead-satellite-surface-contract:migration 14's contraction folded liveness, execution pinning, and runtime resources onto their owner rows, leaving these satellites as retained history that nothing reads; migration_reconciliation was never written and work_item_sources was write-only, so the 2026-08 repo audit retires all six tables plus the never-read final_review_passed_at and activity_id columns. Rollback note: the immediately preceding release still writes work_item_sources, execution_graphs.final_review_passed_at, and webhook_deliveries.activity_id, so this migration is deploy-forward-only despite carrying the mandatory additive rollback marker/v1`;
+
 type GithubHeadSource =
   | { kind: "authoritative" }
   | { kind: "sequenced"; source: string; sequence: number };
@@ -3531,6 +3545,25 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (hasTable(db, "execution_graphs") && !hasColumns(db, "execution_graphs", ["stop_outcome"])) {
         db.exec(executionGraphStopOutcomeSchema);
+      }
+    },
+  },
+  {
+    version: 49,
+    name: "dead-satellite-surface-drop [rollback-compatible:additive/v1]",
+    source: deadSatelliteSurfaceDropMigrationSource,
+    up(db) {
+      // The six tables are children of live parents (runs, work_items,
+      // pipeline_instances, ...) and nothing references them, so dropping them
+      // is safe under foreign_keys = ON. The two column drops are guarded:
+      // neither column is a key, indexed, generated, or named by any CHECK,
+      // trigger, or view, which is what SQLite's DROP COLUMN requires.
+      db.exec(deadSatelliteSurfaceDropSchema);
+      if (hasColumns(db, "execution_graphs", ["final_review_passed_at"])) {
+        db.exec("ALTER TABLE execution_graphs DROP COLUMN final_review_passed_at");
+      }
+      if (hasColumns(db, "webhook_deliveries", ["activity_id"])) {
+        db.exec("ALTER TABLE webhook_deliveries DROP COLUMN activity_id");
       }
     },
   },

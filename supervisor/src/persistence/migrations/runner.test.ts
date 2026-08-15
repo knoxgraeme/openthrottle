@@ -187,6 +187,7 @@ describe("database migrations", () => {
       "ccdf4a1bedafc52eea3aab537d55799e666e25cd78ab5dcc61b8c4c976bde7d7",
       "e9ef3b9a4ddc219cfaa755bd72e73580ef497bcb3c361b5622ab1b412a32dd2a",
       "ba1a28c92a0e3f84080ce6fe1b329f21855d5e96ebdf3312d22af646d182fff7",
+      "0dd5b83a690d982be21f4232daa62ed45eaa66f082c6a100284004305bbde74b",
     ]);
   });
 
@@ -293,8 +294,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 48,
-      name: `execution-graph-stop-outcome${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 49,
+      name: `dead-satellite-surface-drop${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -346,8 +347,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 48,
-      name: `execution-graph-stop-outcome${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 49,
+      name: `dead-satellite-surface-drop${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 
@@ -1779,13 +1780,11 @@ describe("database migrations", () => {
 
     applyDatabaseMigrations(db);
 
-    expect(db.prepare("SELECT run_id, actor_state, updated_at FROM run_liveness").all()).toEqual([
-      {
-        run_id: "legacy-running",
-        actor_state: "running",
-        updated_at: "2026-01-01T00:00:00.000Z",
-      },
-    ]);
+    // The intermediate run_liveness backfill fed the migration-14 fold below
+    // and the satellite itself is retired by migration 49.
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_liveness'"
+    ).get()).toBeUndefined();
     expect(db.prepare(`
       SELECT id, actor_state, actor_created_at, actor_updated_at FROM runs ORDER BY id
     `).all()).toEqual([
@@ -1877,52 +1876,11 @@ describe("database migrations", () => {
 
     applyDatabaseMigrations(db);
 
-    expect(db.prepare(`
-      SELECT attempt_id, run_id, actor_state, last_heartbeat_at, settlement_owner,
-        settlement_reason, termination_confirmed_at, quarantine_reason
-      FROM pipeline_attempt_actors ORDER BY attempt_id
-    `).all()).toEqual([
-      {
-        attempt_id: "attempt-bound",
-        run_id: "run-bound",
-        actor_state: "running",
-        last_heartbeat_at: "2026-01-01T00:00:02.000Z",
-        settlement_owner: null,
-        settlement_reason: null,
-        termination_confirmed_at: null,
-        quarantine_reason: null,
-      },
-      {
-        attempt_id: "attempt-planned",
-        run_id: "run-planned",
-        actor_state: "reaping",
-        last_heartbeat_at: "2026-01-01T00:00:04.000Z",
-        settlement_owner: "owner-1",
-        settlement_reason: "stalled",
-        termination_confirmed_at: null,
-        quarantine_reason: null,
-      },
-      {
-        attempt_id: "attempt-quarantined",
-        run_id: "run-quarantined",
-        actor_state: "quarantined",
-        last_heartbeat_at: "2026-01-01T00:00:06.000Z",
-        settlement_owner: "owner-2",
-        settlement_reason: "stalled",
-        termination_confirmed_at: null,
-        quarantine_reason: "stop unconfirmed",
-      },
-      {
-        attempt_id: "attempt-settled",
-        run_id: "run-settled",
-        actor_state: "settled",
-        last_heartbeat_at: "2026-01-01T00:00:08.000Z",
-        settlement_owner: "owner-3",
-        settlement_reason: "completed",
-        termination_confirmed_at: "2026-01-01T00:00:09.000Z",
-        quarantine_reason: null,
-      },
-    ]);
+    // The intermediate pipeline_attempt_actors backfill fed the owner-row fold
+    // asserted below and the satellite itself is retired by migration 49.
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_attempt_actors'"
+    ).get()).toBeUndefined();
     expect(db.prepare(`
       SELECT id, actor_state, last_heartbeat_at, settlement_owner,
         settlement_reason, termination_confirmed_at, quarantine_reason
@@ -2100,6 +2058,27 @@ describe("database migrations", () => {
         'implement', 'main', NULL, NULL, NULL, NULL, NULL
       )
     `).run("a".repeat(64), "a".repeat(40), now, now);
+    // Migration 49 drops the contracted satellites at the tail of the fresh
+    // openDb above, so rebuild them in their pre-contraction (post-rename)
+    // shape the way a legacy database would still carry them.
+    db.exec(`
+      CREATE TABLE session_executions (
+        session_id TEXT PRIMARY KEY,
+        ticket_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        execution_mode TEXT NOT NULL,
+        pipeline_instance_id TEXT UNIQUE,
+        pinned_at TEXT NOT NULL
+      );
+      CREATE TABLE pipeline_runtime_resources (
+        pipeline_instance_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        provider_resource_id TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
     db.prepare(`
       INSERT INTO session_executions (
         session_id, ticket_id, generation, execution_mode,
@@ -2283,6 +2262,72 @@ describe("database migrations", () => {
     expect(
       db.prepare("SELECT actor_state FROM runs WHERE id = 'run-reaping'").get()
     ).toEqual({ actor_state: "settled" });
+  });
+
+  it("retires the contracted satellite tables and dead columns on fresh and legacy databases", () => {
+    const deadTables = [
+      "run_liveness",
+      "session_executions",
+      "pipeline_runtime_resources",
+      "pipeline_attempt_actors",
+      "migration_reconciliation",
+      "work_item_sources",
+    ];
+    const tableNames = (database: Database.Database) =>
+      (database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all() as Array<{ name: string }>).map((row) => row.name);
+    const columnNames = (database: Database.Database, table: string) =>
+      (database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+        .map((row) => row.name);
+    const expectDeadSurfaceAbsent = (database: Database.Database) => {
+      const names = tableNames(database);
+      for (const table of deadTables) expect(names).not.toContain(table);
+      expect(columnNames(database, "webhook_deliveries")).not.toContain("activity_id");
+      expect(columnNames(database, "execution_graphs")).not.toContain("final_review_passed_at");
+    };
+
+    // Fresh path: base schema plus the full migration chain.
+    db = openDb(":memory:");
+    expectDeadSurfaceAbsent(db);
+    expect(columnNames(db, "webhook_deliveries")).toContain("event_name");
+    expect(columnNames(db, "execution_graphs")).toContain("stop_outcome");
+    db.close();
+
+    // Legacy path: a pre-migration-14 database (empty ledger, historical base
+    // schema shapes) replays the entire chain, so the satellites are created,
+    // backfilled, folded by migration 14, and finally dropped by migration 49.
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, started_at TEXT NOT NULL);
+      INSERT INTO runs VALUES ('legacy-running', 'running', '2026-01-01T00:00:00.000Z');
+      CREATE TABLE webhook_deliveries (
+        delivery_id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        session_id TEXT,
+        action TEXT NOT NULL,
+        activity_id TEXT,
+        event_name TEXT,
+        payload TEXT,
+        status TEXT NOT NULL DEFAULT 'processed',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT,
+        processed_at TEXT,
+        last_error TEXT,
+        redelivered_at TEXT,
+        received_at TEXT NOT NULL
+      );
+      INSERT INTO webhook_deliveries (delivery_id, source, action, activity_id, received_at)
+      VALUES ('legacy-delivery', 'linear', 'created', 'legacy-activity', '2026-01-01T00:00:00.000Z');
+    `);
+
+    applyDatabaseMigrations(db);
+
+    expectDeadSurfaceAbsent(db);
+    // The column drop rewrites the table without losing the retained rows.
+    expect(db.prepare("SELECT delivery_id, source FROM webhook_deliveries").get()).toEqual({
+      delivery_id: "legacy-delivery",
+      source: "linear",
+    });
   });
 
   it("closes the execution_gate_receipts reason vocabulary and enforces it", () => {

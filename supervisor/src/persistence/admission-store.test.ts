@@ -184,7 +184,6 @@ describe("admission store", () => {
       state: "active",
     });
 
-    expect(store.getByIdentifier("OT-1")).toBeUndefined();
     expect(store.getByIssueId("issue-1")?.control_provider).toBe("linear");
     expect(store.getByIssueId("github:issue-1")?.control_provider).toBe("github");
   });

@@ -137,7 +137,6 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
   source TEXT NOT NULL,
   session_id TEXT,
   action TEXT NOT NULL,
-  activity_id TEXT,
   event_name TEXT,
   payload TEXT,
   status TEXT NOT NULL DEFAULT 'processed',

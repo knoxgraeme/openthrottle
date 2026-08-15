@@ -12,7 +12,6 @@ export interface DeliveryClaim {
   source: "linear" | "github";
   sessionId?: string;
   action: string;
-  activityId?: string;
   eventName?: string;
   payload?: string;
 }
@@ -22,7 +21,6 @@ export interface WebhookDelivery {
   source: "linear" | "github";
   session_id: string | null;
   action: string;
-  activity_id: string | null;
   event_name: string | null;
   payload: string | null;
   status: "pending" | "processing" | "failed" | "processed" | "dead";
@@ -163,9 +161,9 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
   const getLinearOutboxStmt = db.prepare("SELECT * FROM control_outbox WHERE id = ?");
   const claimDeliveryStmt = db.prepare(`
     INSERT OR IGNORE INTO webhook_deliveries (
-      delivery_id, source, session_id, action, activity_id, event_name,
+      delivery_id, source, session_id, action, event_name,
       payload, status, attempts, next_attempt_at, received_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
   `);
   const getDeliveryStmt = db.prepare(
     "SELECT delivery_id AS id, * FROM webhook_deliveries WHERE delivery_id = ?"
@@ -517,7 +515,6 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
           claim.source,
           claim.sessionId ?? null,
           claim.action,
-          claim.activityId ?? null,
           claim.eventName ?? null,
           claim.payload ?? null,
           receivedAt,

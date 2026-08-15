@@ -45,17 +45,12 @@ export interface FeedbackStore {
     eventInserted: boolean;
     snapshotCreated: boolean;
   };
-  claim(snapshotId: string, maxRounds: number):
-    | { status: "claimed"; snapshot: FeedbackSnapshot }
-    | { status: "exhausted"; completedRounds: number }
-    | { status: "stale" };
   claimWithEvents(snapshotId: string, maxRounds: number):
     | { status: "claimed"; snapshot: FeedbackSnapshot; events: FeedbackSnapshotEvent[] }
     | { status: "exhausted"; completedRounds: number }
     | { status: "stale"; snapshot?: FeedbackSnapshot; eventCount?: number };
   carryForward(snapshotId: string, headSha: string, workItemId: string): FeedbackSnapshot | undefined;
   consume(snapshotId: string): boolean;
-  get(snapshotId: string): FeedbackSnapshot | undefined;
   listEvents(snapshotId: string): FeedbackSnapshotEvent[];
 }
 
@@ -298,9 +293,6 @@ export function createFeedbackStore(
     record(params) {
       return recordTransaction.immediate(params);
     },
-    claim(snapshotId, maxRounds) {
-      return claimTransaction.immediate(snapshotId, maxRounds);
-    },
     claimWithEvents(snapshotId, maxRounds) {
       const snapshot = getSnapshot.get(snapshotId) as FeedbackSnapshot | undefined;
       if (!snapshot) return { status: "stale" as const };
@@ -327,9 +319,6 @@ export function createFeedbackStore(
         SET status = 'consumed', consumed_at = ?
         WHERE id = ? AND status = 'claimed'
       `).run(timestamp, snapshotId).changes === 1;
-    },
-    get(snapshotId) {
-      return getSnapshot.get(snapshotId) as FeedbackSnapshot | undefined;
     },
     listEvents(snapshotId) {
       return listEvents(snapshotId);
