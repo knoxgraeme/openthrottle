@@ -1,6 +1,13 @@
+import {
+  ANALYSIS_QUERY_ATTRIBUTIONS,
+  ANALYSIS_QUERY_OUTCOMES,
+  ANALYSIS_QUERY_REASONS,
+} from "@openthrottle/contracts";
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { setupPipelineStore, ticket } from "../../__fixtures__/pipeline-store.js";
+import { FAULT_ATTRIBUTIONS } from "../../pipeline/fault-attribution.js";
+import { PIPELINE_OUTCOMES, STAGE_OUTCOMES } from "../../pipeline/manifest.js";
 import type { PipelineInstance } from "../../pipeline/store.js";
 import { createAnalysisStore } from "./analysis-store.js";
 
@@ -161,6 +168,44 @@ describe("analysis store", () => {
     expect(() => store.listRunOutcomes({ outcome: "not_a_real_outcome" })).toThrow(/outcome must be one of/);
     expect(() => store.listRunOutcomes({ reason: "not_a_real_reason" })).toThrow(/reason must be one of/);
     expect(() => store.listRunOutcomes({ attribution: "not_a_real_attribution" })).toThrow(/attribution must be one of/);
+  });
+
+  // The CLI rejects --outcome/--reason/--attribution locally against the
+  // contracts vocabularies (cli/src/analysis.ts), while this store validates
+  // the same three params against the supervisor-owned ones. The two lists
+  // share no source, so a value added here bottom-up per incident (see
+  // fault-attribution.ts) would otherwise make `openthrottle analysis` exit 1
+  // on a filter the endpoint serves fine -- same must-pin shape as the
+  // run_outcomes CHECK vocabularies in migrations/runner.test.ts.
+  it.each([
+    ["outcome", ANALYSIS_QUERY_OUTCOMES, PIPELINE_OUTCOMES],
+    ["reason", ANALYSIS_QUERY_REASONS, STAGE_OUTCOMES],
+    ["attribution", ANALYSIS_QUERY_ATTRIBUTIONS, FAULT_ATTRIBUTIONS],
+  ] as const)("keeps the %s filter vocabulary in sync with the contracts vocabulary the CLI filters on", (
+    _field,
+    contractVocabulary,
+    supervisorVocabulary
+  ) => {
+    expect(new Set(contractVocabulary)).toEqual(new Set(supervisorVocabulary));
+    expect(contractVocabulary).toHaveLength(supervisorVocabulary.length);
+  });
+
+  it("accepts every value the CLI's contracts vocabularies allow through the filter flags", () => {
+    // Set equality above is the structural proof; this is the behavioral one --
+    // every value the CLI will let an operator type reaches a real query
+    // instead of throwing "must be one of".
+    db = setupPipelineStore().db;
+    const store = createAnalysisStore(db);
+
+    for (const outcome of ANALYSIS_QUERY_OUTCOMES) {
+      expect(store.listRunOutcomes({ outcome })).toEqual([]);
+    }
+    for (const reason of ANALYSIS_QUERY_REASONS) {
+      expect(store.listRunOutcomes({ reason })).toEqual([]);
+    }
+    for (const attribution of ANALYSIS_QUERY_ATTRIBUTIONS) {
+      expect(store.listRunOutcomes({ attribution })).toEqual([]);
+    }
   });
 
   it("rejects a malformed time filter", () => {
