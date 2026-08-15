@@ -30,30 +30,6 @@ resolve_git_identity() {
   printf '%s\t%s\n' "$name" "$email"
 }
 
-sanitize_log() {
-  local text="$1"
-  local name value nested
-  while IFS='=' read -r name value; do
-    [[ "$name" =~ (TOKEN|KEY|SECRET|PASSWORD|AUTH_JSON) ]] || continue
-    [[ -z "$value" ]] && continue
-    text="${text//$value/[REDACTED]}"
-
-    # CODEX_AUTH_JSON and similar secret blobs can be logged one field at a
-    # time. Redact sufficiently long scalar strings inside valid JSON too.
-    while IFS= read -r nested; do
-      [[ "${#nested}" -lt 8 ]] && continue
-      text="${text//$nested/[REDACTED]}"
-    done < <(jq -r '.. | strings' <<<"$value" 2>/dev/null || true)
-  done < <(env)
-
-  printf '%s' "$text" | sed -E \
-    -e 's/gh[opsu]_[A-Za-z0-9_]+/[REDACTED]/g' \
-    -e 's/github_pat_[A-Za-z0-9_]+/[REDACTED]/g' \
-    -e 's/sk-[A-Za-z0-9_-]+/[REDACTED]/g' \
-    -e 's/lin_(api|oauth)_[A-Za-z0-9_]+/[REDACTED]/g' \
-    -e 's/Bearer [^[:space:]]+/Bearer [REDACTED]/g'
-}
-
 yq_value_or_default() {
   local file="$1"
   local filter="$2"

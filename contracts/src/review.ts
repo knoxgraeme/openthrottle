@@ -865,11 +865,3 @@ export function validateReviewJournalContract(
   validateCrossReferences(journal, source);
   return normalizedContract(journal);
 }
-
-export function parseReviewJournalContract(
-  raw: string,
-  options: { source?: string } = {}
-): ValidatedContract<ReviewJournalContract> {
-  if (Buffer.byteLength(raw, "utf8") > 256 * 1024) fail(options.source ?? "review_journal", "JSON exceeds 256 KiB");
-  return validateReviewJournalContract(JSON.parse(raw) as unknown, options);
-}

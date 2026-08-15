@@ -189,8 +189,6 @@ STAGE_BASE_COMMIT="$(jq -er '.baseCommit' "$OT_STAGE_REQUEST_FILE")"
 BASE_BRANCH="$(jq -er '.baseBranch' "$OT_STAGE_REQUEST_FILE")"
 STAGE_EXPECTED_SUBJECT="$(jq -r '.expectedSubject // empty' "$OT_STAGE_REQUEST_FILE")"
 AGENT="$(jq -er '.agent' "$OT_STAGE_REQUEST_FILE")"
-LINEAR_ISSUE_ID="$(jq -er '.issueId' "$OT_STAGE_REQUEST_FILE")"
-LINEAR_ISSUE_IDENTIFIER="$LINEAR_ISSUE_ID"
 TASK_TYPE="$(jq -er '.taskType' "$OT_STAGE_REQUEST_FILE")"
 STAGE_CONTEXT_POLICY="$(jq -er '.contextPolicy' "$OT_STAGE_REQUEST_FILE")"
 if ! jq -e '.credentialScopes | index("model.invoke") != null' "$OT_STAGE_REQUEST_FILE" >/dev/null; then
@@ -438,10 +436,6 @@ yq_get() { yq_value_or_default "$CONFIG_FILE" "$1" "$2"; }
 
 CFG_AGENT="$(yq_get '.agent' 'codex')"
 CFG_MODEL="$(yq_get '.model' '')"
-CFG_TEST="$(yq_get '.test' '')"
-CFG_LINT="$(yq_get '.lint' '')"
-CFG_BUILD="$(yq_get '.build' '')"
-CFG_FORMAT="$(yq_get '.format' '')"
 MAX_TURNS="$(yq_get '.limits.max_turns' "$MAX_TURNS")"
 TASK_TIMEOUT="$(yq_get '.limits.task_timeout' "$TASK_TIMEOUT")"
 
@@ -459,13 +453,6 @@ if [[ -f "$CONFIG_FILE" ]]; then
   done < <(yq -r '.post_bootstrap // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true)
 fi
 
-# Surface configured command gates to the agent process as env vars. The sealed
-# manifest decides which stage may run each command; exporting here lets the
-# relevant adapter read the validated command without reparsing yq.
-export OT_TEST_CMD="$CFG_TEST"
-export OT_LINT_CMD="$CFG_LINT"
-export OT_BUILD_CMD="$CFG_BUILD"
-export OT_FORMAT_CMD="$CFG_FORMAT"
 export MAX_TURNS TASK_TIMEOUT
 
 # Cap build-tool fan-out so heavy monorepo builds (Turbo/tsc/Jest launched

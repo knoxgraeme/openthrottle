@@ -1352,10 +1352,6 @@ function main() {
   const requestPath = resolve(arg("--request", process.env.OT_STAGE_REQUEST_FILE));
   const rawRequest = JSON.parse(readFileSync(requestPath, "utf8"));
   const validatedRequest = validateStageRequest(rawRequest);
-  if (process.argv.includes("--validate-request")) {
-    process.stdout.write(`${canonicalJson(validatedRequest)}\n`);
-    return;
-  }
   const configPath = resolve(arg("--config", process.env.OT_STAGE_CONFIG_FILE));
   const manifestPath = resolve(arg("--manifest", process.env.OT_STAGE_MANIFEST_FILE));
   const configRaw = readFileSync(configPath, "utf8");

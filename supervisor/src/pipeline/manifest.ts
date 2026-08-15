@@ -595,8 +595,7 @@ function parseStageLoopBinding(value: unknown, path: string): PipelineStageLoopB
 function parseStage(
   value: unknown,
   path: string,
-  defaults: ManifestDefaults,
-  options: { allowLegacyImplicitCommandName?: boolean } = {}
+  defaults: ManifestDefaults
 ): PipelineStage {
   const input = objectAt(value, path, [
     "id", "executor", "loop", "commandName", "unitPhases", "unitCommandNames", "unitPhaseBindings", "repositorySkill", "evaluator", "context", "live_steering", "credentials", "produces", "transitions", "retry",
@@ -694,7 +693,7 @@ function parseStage(
     }
   }
   if (stage.executor.kind === "command") {
-    if (!stage.commandName && !options.allowLegacyImplicitCommandName) {
+    if (!stage.commandName) {
       fail(`${path}.commandName`, "is required for command executors");
     }
   } else if (stage.commandName) {
@@ -858,13 +857,6 @@ function parseRepositorySkillPackage(value: unknown, path: string): RepositorySk
   };
 }
 
-function allowsLegacyImplicitCommandName(id: string, version: number): boolean {
-  return (
-    (id === "core/implement" && version === 1) ||
-    (id === "ce/implement" && (version === 2 || version === 3))
-  );
-}
-
 function validateGraph(manifest: PipelineManifest, source: string): void {
   const stageById = new Map(manifest.stages.map((stage) => [stage.id, stage]));
   if (stageById.size !== manifest.stages.length) fail(`${source}.stages`, "contains duplicate stage IDs");
@@ -934,7 +926,6 @@ export function validatePipelineManifest(
   const defaults = parseManifestDefaults(input.defaults, `${source}.defaults`);
   const id = stringAt(input.id, `${source}.id`, { max: 120, pattern: IDENTIFIER });
   const version = integerAt(input.version, `${source}.version`, 1, 1_000_000);
-  const allowLegacyImplicitCommandName = allowsLegacyImplicitCommandName(id, version);
   const manifest: PipelineManifest = {
     schema: "openthrottle.pipeline/v1",
     id,
@@ -957,9 +948,7 @@ export function validatePipelineManifest(
     stages: arrayAt(
       input.stages,
       `${source}.stages`,
-      (stage, path) => parseStage(stage, path, defaults, {
-        allowLegacyImplicitCommandName,
-      }),
+      (stage, path) => parseStage(stage, path, defaults),
       { min: 1, max: 32 }
     ),
   };

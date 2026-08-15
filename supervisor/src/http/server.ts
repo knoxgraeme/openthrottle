@@ -759,33 +759,6 @@ export function createServer(deps: ServerDeps): Hono {
     return context.json({ repositories: store.listRepositoryRegistrations() });
   });
 
-  app.get("/status/journal", (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
-      return context.json({ error: "unauthorized" }, 401);
-    }
-    const issue = context.req.query("issue");
-    const repository = context.req.query("repository");
-    const from = context.req.query("from");
-    const to = context.req.query("to");
-    const limit = context.req.query("limit");
-    if (!issue && !repository) {
-      return context.json({ error: "issue or repository is required" }, 400);
-    }
-    try {
-      return context.json({
-        journal: deps.pipelineCoordinator.store.listJournalEntries({
-          issue,
-          repository,
-          from,
-          to,
-          limit: limit ? Number(limit) : undefined,
-        }),
-      });
-    } catch (error) {
-      return context.json({ error: sanitizeText(String(error)) }, 400);
-    }
-  });
-
   // Read-only evidence for improvement proposals: run_outcomes and the
   // receipt data folded into it (see docs/SPEC.md "Analysis read-contract").
   // Never consumed by gate, transition, scheduler, or effect-drain code --
@@ -834,26 +807,6 @@ export function createServer(deps: ServerDeps): Hono {
           receipt_hash: execution.receipt.receipt_hash,
         },
       }, execution.grade.result === "pass" ? 200 : 422);
-    } catch (error) {
-      return context.json({ error: sanitizeText(String(error)) }, 400);
-    }
-  });
-
-  app.get("/tickets/:identifier/journal", (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
-      return context.json({ error: "unauthorized" }, 401);
-    }
-    const ticket = findTicket(store, context.req.param("identifier"));
-    if (!ticket) return context.json({ error: "ticket not found" }, 404);
-    try {
-      return context.json({
-        journal: deps.pipelineCoordinator.store.listJournalEntries({
-          issueId: ticket.ticket_id,
-          from: context.req.query("from"),
-          to: context.req.query("to"),
-          limit: context.req.query("limit") ? Number(context.req.query("limit")) : undefined,
-        }),
-      });
     } catch (error) {
       return context.json({ error: sanitizeText(String(error)) }, 400);
     }

@@ -537,23 +537,6 @@ function runRootGit(repoDir, args, env = {}, { safeDirectories = [] } = {}) {
   return result.stdout.trim();
 }
 
-function runRootGitRaw(repoDir, args, env = {}, { safeDirectories = [] } = {}) {
-  const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir, safeDirectories), ...args], {
-    cwd: repoDir,
-    env: {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: "0",
-      ...env,
-    },
-    timeout: 120_000,
-    captureBytes: 1024 * 1024,
-  });
-  if (result.error || result.status !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-800)}`);
-  }
-  return result.stdout;
-}
-
 export function createLoopRequestHash(requestWithoutFence) {
   const requestHash = digest(canonicalJson(requestWithoutFence));
   return {
@@ -1052,9 +1035,6 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
       args: ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", repoDir, ...(request.model ? ["-m", request.model] : []), ...(request.reasoningEffort ? ["-c", `model_reasoning_effort=\"${request.reasoningEffort}\"`] : []), ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, "-"] : ["-"])],
       input: prompt,
     };
-  }
-  if (request.agent === "opencode") {
-    throw new Error("OpenCode loop actions are not supported yet");
   }
   return {
     repoDir,
@@ -2443,10 +2423,6 @@ function main() {
   const requestPath = resolve(arg("--request", process.env.OT_LOOP_REQUEST_FILE));
   const rawRequest = JSON.parse(readFileSync(requestPath, "utf8"));
   const request = validateLoopRequest(rawRequest);
-  if (process.argv.includes("--validate-request")) {
-    writeFileSync(1, `${canonicalJson(request)}\n`);
-    return;
-  }
   const outputPath = resolve(arg("--output", process.env.OT_LOOP_RESULT_FILE ?? loopResultPath({
     attemptId: request.attemptId,
     actionId: request.actionId,

@@ -1,7 +1,6 @@
 import {
   canonicalJson,
   digestNormalized,
-  parseCitationContractProposal,
   type AnalysisRunResult,
   type CitationContractProposal,
 } from "@openthrottle/contracts";
@@ -162,40 +161,13 @@ function sealCitationGate(input: {
   };
 }
 
-function evaluateCitationGateWithGrade(input: {
-  proposal: CitationContractProposal;
-  proposalHash: string;
-  resolvedCitations: readonly ResolvedCitation[];
-}): { grade: CitationGrade; decision: CitationGateDecision } {
-  const grade = gradeCitationContractProposal(input.proposal, input.resolvedCitations);
-  return { grade, decision: sealCitationGate({ proposal: input.proposal, proposalHash: input.proposalHash, grade }) };
-}
-
 export function evaluateCitationGate(input: {
   proposal: CitationContractProposal;
   proposalHash: string;
   resolvedCitations: readonly ResolvedCitation[];
 }): CitationGateDecision {
-  return evaluateCitationGateWithGrade(input).decision;
-}
-
-export function evaluateRawCitationGate(input: {
-  raw: unknown;
-  resolvedCitations: readonly ResolvedCitation[];
-}): { proposal: CitationContractProposal; proposalHash: string; grade: CitationGrade; decision: CitationGateDecision } {
-  const proposalContract = parseCitationContractProposal(JSON.stringify(input.raw), { source: "citation_contract" });
-  const proposal = proposalContract.value;
-  const evaluated = evaluateCitationGateWithGrade({
-    proposal,
-    proposalHash: proposalContract.digest,
-    resolvedCitations: input.resolvedCitations,
-  });
-  return {
-    proposal,
-    proposalHash: proposalContract.digest,
-    grade: evaluated.grade,
-    decision: evaluated.decision,
-  };
+  const grade = gradeCitationContractProposal(input.proposal, input.resolvedCitations);
+  return sealCitationGate({ proposal: input.proposal, proposalHash: input.proposalHash, grade });
 }
 
 function stringArray(value: unknown): string[] | null {

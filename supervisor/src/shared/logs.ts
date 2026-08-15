@@ -1,2 +1,1 @@
-export const MAX_PRIVATE_LOG_TAIL_BYTES = 100_000;
 export const MAX_PRIVATE_LOG_TAIL_CHARS = 100_000;

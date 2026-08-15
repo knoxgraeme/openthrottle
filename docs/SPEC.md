@@ -751,7 +751,6 @@ sentence, or links rendered after it.
 | `GET` | `/oauth/install` | `OT_INSTALL_SECRET` bearer | begin Linear OAuth |
 | `GET` | `/oauth/callback` | one-time OAuth state | exchange and store installation |
 | `GET` | `/status` | `OT_STATUS_TOKEN` bearer | tickets and pipeline/effect/publication state |
-| `GET` | `/status/journal` | `OT_STATUS_TOKEN` bearer | orchestration journal entries filtered by issue or repository |
 | `GET` | `/capabilities` | `OT_STATUS_TOKEN` bearer | active runtime release, capability digest/IDs, and effective limits |
 | `GET` | `/deployment/cutover-evidence` | `OT_DEPLOY_TOKEN` bearer | bounded, fail-closed admission drain plus runtime, snapshot, and migration rollback-compatibility identity |
 | `POST` | `/deployment/cutover/begin` | `OT_DEPLOY_TOKEN` bearer | open a snapshot cutover record with old runtime/snapshot identity, candidate snapshot, and evidence |
@@ -765,7 +764,6 @@ sentence, or links rendered after it.
 | `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | coordinator stop |
 | `POST` | `/tickets/:id/steer` | `OT_STATUS_TOKEN` bearer | capture or queue steering |
 | `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized live or durable bounded logs |
-| `GET` | `/tickets/:id/journal` | `OT_STATUS_TOKEN` bearer | orchestration journal entries for one ticket |
 | `POST` | `/tickets/:id/publications/:publicationId/retry` | `OT_STATUS_TOKEN` bearer | reopen a failed receipt |
 
 Bearer tokens are compared by hashed value with timing-safe equality. Webhook

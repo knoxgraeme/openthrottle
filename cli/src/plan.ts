@@ -135,14 +135,13 @@ function coverageFor(plan: AnyExecutionPlanContract): ValidationResult["coverage
 
 export function readExecutionPlanFromMarkdown(
   markdown: string,
-  source = "plan",
-  options: { allowLegacyV1?: boolean } = {}
+  source = "plan"
 ): ValidationResult {
   const blocks = extractExecutionPlanBlocks(markdown);
   if (blocks.length !== 1) {
     throw new Error(`${source}: expected exactly one execution-plan block, found ${blocks.length}`);
   }
-  if (!options.allowLegacyV1 && blocks[0]!.schema === EXECUTION_PLAN_FENCE) {
+  if (blocks[0]!.schema === EXECUTION_PLAN_FENCE) {
     throw new Error(`${source}: fresh execution plans must use ${EXECUTION_PLAN_FENCE_V2}; ${EXECUTION_PLAN_FENCE} is replay-only`);
   }
   const plan = parseAnyExecutionPlanContract(blocks[0]!.json, { source: `${source}.execution_plan` });
