@@ -8,7 +8,7 @@ import { gzipSync } from "node:zlib";
 import { canonicalJson } from "./capabilities.mjs";
 import {
   digest,
-  parseAgentJson,
+  parseLoopReceipt,
   sanitizeArtifactText,
   validateStandardReceipt,
 } from "./artifacts.mjs";
@@ -23,12 +23,11 @@ import {
   chownTree,
   ensureSandboxRootTraversal,
   ensureTraverseOnlyDirectory,
-  identityForUser,
   isRoot,
   lockPersistentAgentPrivateRoots,
   lockedPersistentProfilesFrom,
   pathInside as containedPath,
-  prepareAgentOwnedDirectory,
+  restoreIntegrationCheckout,
   restorePersistentAgentPrivateRoots,
 } from "./filesystem-isolation.mjs";
 import { writeJsonAtomic } from "./atomic-write.mjs";
@@ -42,25 +41,40 @@ import {
   launchDiagnosticTail,
 } from "./launch-failure.mjs";
 import { prepareLoopAgentEnvironment } from "./loop-agent-environment.mjs";
-import { pathInside, PROFILE_ROOT_FENCE_FILE } from "./loop-paths.mjs";
+import {
+  ABSOLUTE_PATH,
+  DEFAULT_ACTION_ROOT,
+  PROFILE_ROOT_FENCE_FILE,
+  actionDirectory,
+  configuredActionRoot,
+  packReachableBaseObjects,
+  pathInside,
+  runRootGit,
+} from "./loop-paths.mjs";
 import {
   extractNativeSessionId,
   sealNativeSessionPackage,
 } from "./native-session-package.mjs";
+import { ID, NATIVE_SESSION_ID, SHA256, STAGE_PATH_ID, boundedText, record, string } from "./validate.mjs";
 
 export const LOOP_ACTION_PROTOCOL = "loop-action@3";
 export {
   lockPersistentAgentPrivateRoots,
   lockedPersistentProfilesFrom,
+  restoreIntegrationCheckout,
   restorePersistentAgentPrivateRoots,
 } from "./filesystem-isolation.mjs";
+export {
+  actionDirectory,
+  configuredActionRoot,
+  gitSafeDirectoryConfigArgs,
+  gitSafeDirectoryEnv,
+  prepareLoopGitObjectEnvironment,
+  prepareRootReadOnlyDirectory,
+} from "./loop-paths.mjs";
+export { parseLoopReceipt } from "./artifacts.mjs";
 
-const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
-const STAGE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
-const CODEX_ITEM_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const GIT_OBJECT_ID = /^[a-f0-9]{40,64}$/;
-const SHA256 = /^[a-f0-9]{64}$/;
 const TUNE_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
 const AGENTS = new Set(["claude", "codex", "opencode"]);
 const ROLES = new Set(["worker", "lead", "reviewer", "publisher"]);
@@ -129,7 +143,6 @@ const MAX_PRIOR_EVIDENCE_BYTES = 49_152;
 const MAX_PRIOR_EVIDENCE_RECEIPT_BYTES = 64 * 1024;
 const MAX_DOWNSTREAM_CONTEXT_RECORDS = 32;
 const MAX_DOWNSTREAM_CONTEXT_BYTES = 32_768;
-const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/loop-actions";
 const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
 const RECEIPT_CORRECTION_ATTEMPTS = 1;
@@ -147,40 +160,6 @@ const MAX_RECEIPT_CORRECTION_STATE_BYTES = 3 * 1024 * 1024;
 const MAX_RECEIPT_CORRECTION_OUTPUT_CHARS = 64 * 1024;
 const ROOT_UID = 0;
 const ROOT_GID = 0;
-const ABSOLUTE_PATH = /^\/[^\u0000]{0,500}$/;
-const UNSAFE_ACTION_ROOTS = new Set([
-  "/",
-  "/bin",
-  "/boot",
-  "/dev",
-  "/etc",
-  "/home",
-  "/home/agent",
-  "/home/agent/repo",
-  "/lib",
-  "/lib64",
-  "/opt",
-  "/opt/openthrottle",
-  "/proc",
-  "/root",
-  "/run",
-  "/sbin",
-  "/sys",
-  "/tmp",
-  "/usr",
-  "/var",
-  "/var/lib",
-  "/var/lib/openthrottle",
-]);
-function record(value, label) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
-  return value;
-}
-
-function string(value, label, pattern = ID) {
-  if (typeof value !== "string" || !pattern.test(value)) throw new Error(`${label} is invalid`);
-  return value;
-}
 
 function nullableString(value, label, pattern = ID) {
   return value === null ? null : string(value, label, pattern);
@@ -188,11 +167,6 @@ function nullableString(value, label, pattern = ID) {
 
 function stagePathId(value, label) {
   return string(value, label, STAGE_PATH_ID);
-}
-
-function boundedText(value, label, maxLength) {
-  if (typeof value !== "string" || value.length > maxLength) throw new Error(`${label} is invalid`);
-  return value;
 }
 
 function boundedArray(value, label, max = 32) {
@@ -395,28 +369,12 @@ function downstreamContext(value, label) {
   return records;
 }
 
-export function configuredActionRoot(env = process.env) {
-  const root = env.OT_LOOP_ACTION_ROOT ?? DEFAULT_ACTION_ROOT;
-  if (typeof root !== "string" || !ABSOLUTE_PATH.test(root)) throw new Error("loop action root is invalid");
-  const resolved = resolve(root);
-  if (UNSAFE_ACTION_ROOTS.has(resolved)) throw new Error("loop action root targets an unsafe system directory");
-  if (existsSync(resolved)) {
-    const metadata = lstatSync(resolved);
-    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("loop action root must be a real directory");
-  }
-  return resolved;
-}
-
 function configuredIntegrationRepoDir(env = process.env) {
   const repoDir = env.OT_INTEGRATION_REPO_DIR ?? INTEGRATION_REPO_DIR;
   if (typeof repoDir !== "string" || !ABSOLUTE_PATH.test(repoDir)) throw new Error("integration repository path is invalid");
   const resolved = resolve(repoDir);
   if (!existsSync(resolved) || !lstatSync(resolved).isDirectory()) throw new Error("integration repository path must be a real directory");
   return resolved;
-}
-
-export function actionDirectory(request, rootDir = configuredActionRoot()) {
-  return pathInside(pathInside(rootDir, request.attemptId), request.actionId);
 }
 
 function actionFilePath({ attemptId, actionId, rootDir = DEFAULT_ACTION_ROOT }, name) {
@@ -480,61 +438,6 @@ function lockNonCurrentActionDirectories(request, rootDir = configuredActionRoot
       }
     }
   }
-}
-
-function maybeRealPath(path) {
-  try {
-    return realpathSync(path);
-  } catch {
-    return path;
-  }
-}
-
-function gitdirFromFilesystem(repoDir) {
-  const dotGit = join(repoDir, ".git");
-  if (!existsSync(dotGit)) return [];
-  const metadata = lstatSync(dotGit);
-  if (metadata.isDirectory()) return [dotGit, maybeRealPath(dotGit)];
-  if (!metadata.isFile()) return [dotGit];
-  const match = readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+?)\s*$/m);
-  if (!match) return [dotGit];
-  const gitdir = resolve(repoDir, match[1]);
-  return [dotGit, gitdir, maybeRealPath(gitdir)];
-}
-
-export function gitSafeDirectoryConfigArgs(repoDir, extraSafeDirectories = []) {
-  const resolvedRepo = maybeRealPath(repoDir);
-  return [...new Set([repoDir, resolvedRepo, ...gitdirFromFilesystem(resolvedRepo), ...extraSafeDirectories.flatMap((path) => [path, maybeRealPath(path)])])]
-    .filter((path) => typeof path === "string" && path.length > 0)
-    .flatMap((path) => ["-c", `safe.directory=${path}`]);
-}
-
-export function gitSafeDirectoryEnv(repoDir) {
-  const directories = [...new Set([repoDir, maybeRealPath(repoDir)])].filter((path) => typeof path === "string" && path.length > 0);
-  return [
-    `GIT_CONFIG_COUNT=${directories.length}`,
-    ...directories.flatMap((directory, index) => [
-      `GIT_CONFIG_KEY_${index}=safe.directory`,
-      `GIT_CONFIG_VALUE_${index}=${directory}`,
-    ]),
-  ];
-}
-
-function runRootGit(repoDir, args, env = {}, { safeDirectories = [] } = {}) {
-  const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir, safeDirectories), ...args], {
-    cwd: repoDir,
-    env: {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: "0",
-      ...env,
-    },
-    timeout: 120_000,
-    captureBytes: 1024 * 1024,
-  });
-  if (result.error || result.status !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-800)}`);
-  }
-  return result.stdout.trim();
 }
 
 export function createLoopRequestHash(requestWithoutFence) {
@@ -763,12 +666,6 @@ export function loopPrompt(request) {
     `## Downstream Context\n${downstreamContext}`;
 }
 
-export function prepareRootReadOnlyDirectory(path) {
-  mkdirSync(path, { recursive: true, mode: 0o555 });
-  if (isRoot()) chownTree(path, ROOT_UID, ROOT_GID);
-  chmodTree(path, { fileMode: 0o444, directoryMode: 0o555 });
-}
-
 function retryableInfrastructureError(message, extra = {}) {
   const error = new Error(message);
   error.retryableInfrastructureFailure = true;
@@ -811,81 +708,6 @@ function assertProfileRootFence(profileRoot, nonce, sealedSkillTrees = []) {
     if (!treeMetadata.isDirectory() || treeMetadata.isSymbolicLink()) throw swapped;
     if (isRoot() && treeMetadata.uid !== ROOT_UID) throw swapped;
   }
-}
-
-function packReachableBaseObjects(repoDir, destinationPackBase, subject = "HEAD", env = {}) {
-  const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir), "pack-objects", "--revs", destinationPackBase], {
-    cwd: repoDir,
-    env: {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: "0",
-      ...env,
-    },
-    input: `${subject}\n`,
-    timeout: 120_000,
-    captureBytes: 1024 * 1024,
-  });
-  if (result.error || result.status !== 0) {
-    throw new Error(`git pack-objects failed: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-800)}`);
-  }
-}
-
-export function prepareLoopGitObjectEnvironment(request, repoDir) {
-  if (!request.worktree) return { env: [], values: null };
-  const objectRoot = pathInside(actionDirectory(request), "git-objects");
-  const baseObjectDir = pathInside(objectRoot, "base");
-  const basePackDir = pathInside(baseObjectDir, "pack");
-  const writeObjectDir = pathInside(objectRoot, "write");
-  const gitAdminDir = pathInside(actionDirectory(request), "git-admin");
-  const gitIndexPath = pathInside(gitAdminDir, "index");
-  rmSync(objectRoot, { recursive: true, force: true });
-  rmSync(gitAdminDir, { recursive: true, force: true });
-  mkdirSync(basePackDir, { recursive: true, mode: 0o755 });
-  packReachableBaseObjects(repoDir, join(basePackDir, "base"));
-  chmodTree(baseObjectDir, { fileMode: 0o444, directoryMode: 0o555 });
-  prepareAgentOwnedDirectory(writeObjectDir);
-  mkdirSync(gitAdminDir, { recursive: true, mode: 0o755 });
-  const head = runRootGit(repoDir, ["rev-parse", "HEAD"]);
-  writeFileSync(pathInside(gitAdminDir, "HEAD"), `${head}\n`, { mode: 0o444 });
-  writeFileSync(pathInside(gitAdminDir, "config"), [
-    "[core]",
-    "\trepositoryformatversion = 0",
-    "\tfilemode = true",
-    "\tbare = false",
-    "\tlogallrefupdates = false",
-    "",
-  ].join("\n"), { mode: 0o444 });
-  mkdirSync(pathInside(gitAdminDir, "objects"), { recursive: true, mode: 0o755 });
-  mkdirSync(pathInside(pathInside(gitAdminDir, "refs"), "heads"), { recursive: true, mode: 0o755 });
-  mkdirSync(pathInside(pathInside(gitAdminDir, "refs"), "tags"), { recursive: true, mode: 0o755 });
-  runRootGit(repoDir, ["read-tree", head], {
-    GIT_DIR: gitAdminDir,
-    GIT_WORK_TREE: repoDir,
-    GIT_INDEX_FILE: gitIndexPath,
-    GIT_OBJECT_DIRECTORY: writeObjectDir,
-    GIT_ALTERNATE_OBJECT_DIRECTORIES: baseObjectDir,
-  });
-  prepareRootReadOnlyDirectory(gitAdminDir);
-  const objectValues = {
-    GIT_OBJECT_DIRECTORY: writeObjectDir,
-    GIT_ALTERNATE_OBJECT_DIRECTORIES: baseObjectDir,
-  };
-  const agentValues = {
-    GIT_DIR: gitAdminDir,
-    GIT_WORK_TREE: repoDir,
-    GIT_INDEX_FILE: gitIndexPath,
-    ...objectValues,
-  };
-  return {
-    values: agentValues,
-    env: [
-      `GIT_DIR=${agentValues.GIT_DIR}`,
-      `GIT_WORK_TREE=${agentValues.GIT_WORK_TREE}`,
-      `GIT_INDEX_FILE=${agentValues.GIT_INDEX_FILE}`,
-      `GIT_OBJECT_DIRECTORY=${agentValues.GIT_OBJECT_DIRECTORY}`,
-      `GIT_ALTERNATE_OBJECT_DIRECTORIES=${agentValues.GIT_ALTERNATE_OBJECT_DIRECTORIES}`,
-    ],
-  };
 }
 
 // The sealed subject a read-only role is bound to: a lead never touches a
@@ -991,15 +813,6 @@ export function lockIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
     chownTree(child, ROOT_UID, ROOT_GID);
     chmodOwnerPrivateTree(child);
   }
-  return true;
-}
-
-export function restoreIntegrationCheckout(path = INTEGRATION_REPO_DIR) {
-  if (!isRoot() || !existsSync(path)) return false;
-  const identity = identityForUser("agent");
-  if (!identity) return false;
-  chownTree(path, identity.uid, identity.gid);
-  chmodOwnerPrivateTree(path);
   return true;
 }
 
@@ -1301,142 +1114,6 @@ function defaultRunLoopAgent({ request, invocation, integrationRepoDir = configu
     integrationRepoDir,
     credentialEnv,
   });
-}
-
-function receiptCandidatesFromJson(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-  if (value.type === "item.completed") {
-    const codexAgentMessage = codexAgentMessageText(value);
-    return codexAgentMessage === null ? [] : [codexAgentMessage];
-  }
-  const candidates = [];
-  for (const key of ["receipt", "output", "content", "message"]) {
-    if (value[key] !== undefined) candidates.push(value[key]);
-  }
-  if (value.type === "result" && value.result !== undefined) candidates.push(value.result);
-  return candidates;
-}
-
-function codexAgentMessageText(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value) ||
-      value.type !== "item.completed" || Object.keys(value).length !== 2 ||
-      !Object.hasOwn(value, "type") || !Object.hasOwn(value, "item")) return null;
-  const item = value.item;
-  if (!item || typeof item !== "object" || Array.isArray(item) ||
-      item.type !== "agent_message" || !Object.hasOwn(item, "type") ||
-      !Object.hasOwn(item, "text") || typeof item.text !== "string" ||
-      Object.keys(item).some((key) => !["id", "text", "type"].includes(key)) ||
-      (Object.hasOwn(item, "id") && (typeof item.id !== "string" || !CODEX_ITEM_ID.test(item.id)))) return null;
-  return item.text;
-}
-
-function isLoopReceiptCandidateShaped(value) {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value) &&
-    value.schema === STANDARD_RECEIPT_SCHEMA;
-}
-
-function validateStandardReceiptForLoop(value, env, expectedReceiptType) {
-  if (expectedReceiptType !== undefined && isLoopReceiptCandidateShaped(value)) {
-    if (!Object.hasOwn(value, "type")) throw new Error("standard receipt is missing field type");
-    if (!STANDARD_RECEIPT_TYPES.has(value.type)) throw new Error("standard receipt has an invalid type");
-    if (value.type !== expectedReceiptType) {
-      throw new Error(`loop receipt type mismatch: expected ${expectedReceiptType}, received ${value.type}`);
-    }
-  }
-  return validateStandardReceipt(value, env);
-}
-
-function ambiguousCodexReceiptError(jsonl, asReceipt) {
-  let receiptLikeMessages = 0;
-  for (const line of jsonl.split("\n")) {
-    let event;
-    try {
-      event = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const text = codexAgentMessageText(event);
-    if (text === null) continue;
-    try {
-      if (isLoopReceiptCandidateShaped(parseAgentJson(text, asReceipt))) receiptLikeMessages += 1;
-    } catch (error) {
-      if (error?.ambiguousAgentJson) return error;
-    }
-  }
-  if (receiptLikeMessages <= 1) return null;
-  const error = new Error(
-    `${receiptLikeMessages} receipt-like Codex agent messages found; refusing to guess which one is the receipt`,
-  );
-  error.ambiguousAgentJson = true;
-  return error;
-}
-
-export function parseLoopReceipt(raw, env = process.env, expectedReceiptType = undefined) {
-  const sanitized = sanitizeArtifactText(raw, env).trim();
-  if (!sanitized) throw new Error("loop action did not emit a receipt");
-  const candidates = [sanitized, ...sanitized.split("\n").map((line) => line.trim()).filter(Boolean).reverse()];
-  // The validator's rejection message is precise ("standard receipt is missing
-  // field schema"); discarding it made OPE-101 cost a full live reproduction to
-  // learn one sentence. Keep the first error from each layer and report the
-  // decisive one. Layer preference matters: the top-layer candidate is the
-  // engine's own stream-json envelope, whose rejection is always the same
-  // uninformative "unknown field subtype". The nested layer is where the
-  // agent-authored receipt actually lives (the `type: "result"` line's `result`
-  // text), so its error is the one that names the real defect.
-  // Several receipt-shaped blocks in one message is its own situation, and the
-  // most decisive thing we can say about that message: the receipt was found,
-  // more than once, and the executor declined to pick. It outranks either
-  // validator error, which would otherwise describe whichever candidate the
-  // scan happened to reach first.
-  let ambiguityError = null;
-  let nestedError = null;
-  let nestedCandidate = null;
-  let topError = null;
-  let topCandidate = null;
-  const asReceipt = { qualifies: isLoopReceiptCandidateShaped, label: "receipt" };
-  const codexAmbiguity = ambiguousCodexReceiptError(sanitized, asReceipt);
-  if (codexAmbiguity) {
-    throw new Error(`loop action emitted invalid standard receipt: ${codexAmbiguity.message}`);
-  }
-  for (const candidate of candidates) {
-    try {
-      // parseAgentJson, not JSON.parse: both layers carry text the model
-      // typed, so both get the fence peel (OPE-101 generation 6) and the
-      // single-qualifying-block extraction (generation 8). The parsed value is
-      // identical to the unfenced case, so validation below is untouched.
-      const parsed = typeof candidate === "string" ? parseAgentJson(candidate, asReceipt) : candidate;
-      try {
-        return validateStandardReceiptForLoop(parsed, env, expectedReceiptType);
-      } catch (error) {
-        topError ??= error;
-        topCandidate ??= parsed;
-        for (const nested of receiptCandidatesFromJson(parsed)) {
-          try {
-            const normalized = typeof nested === "string" ? parseAgentJson(nested, asReceipt) : nested;
-            return validateStandardReceiptForLoop(normalized, env, expectedReceiptType);
-          } catch (error) {
-            if (error?.ambiguousAgentJson) ambiguityError ??= error;
-            else {
-              nestedError ??= error;
-              try {
-                nestedCandidate ??= typeof nested === "string" ? parseAgentJson(nested, asReceipt) : nested;
-              } catch {
-                // Keep the validator message as the primary diagnostic.
-              }
-            }
-          }
-        }
-      }
-    } catch (error) {
-      // Continue searching bounded agent output for the structured receipt.
-      if (error?.ambiguousAgentJson) ambiguityError ??= error;
-    }
-  }
-  const cause = ambiguityError ?? nestedError ?? topError;
-  const detail = cause instanceof Error ? cause.message : cause ? String(cause) : "";
-  const error = new Error(`loop action emitted invalid standard receipt${detail ? `: ${detail}` : ""}`);
-  error.invalidReceiptCandidate = nestedCandidate ?? topCandidate;
-  throw error;
 }
 
 function jsonPointerFromLabel(label) {

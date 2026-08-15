@@ -17,7 +17,7 @@ import {
   resolveCommand,
 } from "./execute-stage.mjs";
 import { integrateCandidate } from "./integrate-unit.mjs";
-import { restoreIntegrationCheckout } from "./execute-loop.mjs";
+import { restoreIntegrationCheckout } from "./filesystem-isolation.mjs";
 import { deriveCandidateCommit, grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
 import { ensureWorktreeBootstrap } from "./worktree-bootstrap.mjs";
 

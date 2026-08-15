@@ -135,6 +135,72 @@ export function normalizeIso8601Timestamp(value: string): string | null {
   const timestamp = Date.parse(value);
   return Number.isNaN(timestamp) ? null : new Date(timestamp).toISOString();
 }
+// The one strict timestamp validator for every contract surface. The grammar
+// and calendar checks come from normalizeIso8601Timestamp; whether the
+// validated value is returned normalized or verbatim is a per-contract
+// property:
+//
+// - Normalizing (default): citation-contract query windows and results, whose
+//   stored bytes are the normalized form so equivalent offset spellings
+//   compare equal.
+// - Verbatim ({ normalize: false }): receipts, review journals, and tune
+//   contracts. Their canonical bytes participate in digest chains computed
+//   over the value exactly as the producer emitted it (sandbox
+//   artifacts.mjs receipt hashes are replayed by the supervisor's
+//   execution-gates evidence binding, and tune row/task digests are
+//   recomputed from validated values), and agents legitimately emit
+//   "...T00:00:00Z" without milliseconds -- rewriting those bytes here would
+//   break the chain.
+export function timestampAt(
+  value: unknown,
+  path: string,
+  options: { normalize?: boolean } = {}
+): string {
+  const result = stringAt(value, path, { max: 64 });
+  const normalized = normalizeIso8601Timestamp(result);
+  if (!normalized) fail(path, "must be an ISO-8601 timestamp");
+  return options.normalize === false ? result : normalized;
+}
+
+export function parseIdentifierList(
+  value: unknown,
+  path: string,
+  options: { min?: number; max: number }
+): string[] {
+  return unique(arrayAt(value, path, (entry, entryPath) => {
+    return stringAt(entry, entryPath, { pattern: IDENTIFIER });
+  }, options), path);
+}
+
+export function parsePlanCommand(value: unknown, path: string): { name: string; unit?: string } {
+  const input = objectAt(value, path, ["name", "unit"]);
+  return {
+    name: stringAt(input.name, `${path}.name`, { max: 80, pattern: COMMAND_NAME_PATTERN }),
+    ...(input.unit === undefined ? {} : { unit: stringAt(input.unit, `${path}.unit`, { pattern: IDENTIFIER }) }),
+  };
+}
+
+// Depth-first cycle detection over a dependency graph whose nodes carry
+// `{ id, depends_on }`. Callers must have verified that every dependency
+// references a known unit before walking.
+export function assertAcyclicDependencies(
+  units: ReadonlyArray<{ id: string; depends_on: readonly string[] }>,
+  path: string
+): void {
+  const byId = new Map(units.map((unit) => [unit.id, unit]));
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (id: string): void => {
+    if (visited.has(id)) return;
+    if (visiting.has(id)) fail(`${path}.${id}.depends_on`, "creates a cycle");
+    visiting.add(id);
+    for (const dependency of byId.get(id)!.depends_on) visit(dependency);
+    visiting.delete(id);
+    visited.add(id);
+  };
+  for (const unit of units) visit(unit.id);
+}
+
 // Matches sandbox/runner/artifacts.mjs's NATIVE_SESSION_ID and
 // native-session-package.mjs's PACKAGE_PATH_ID, since a native session id
 // is later used to build a filesystem path.

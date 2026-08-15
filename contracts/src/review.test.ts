@@ -210,6 +210,25 @@ describe("review journal contracts", () => {
       .toThrow(/not path-safe/);
   });
 
+  it("pins strict verbatim journal timestamps", () => {
+    // Producer-shaped values keep their exact bytes (journal timestamps feed
+    // digest-bound evidence), including the millisecond-free UTC form agents
+    // emit from the skill templates.
+    const verbatim = validJournal();
+    verbatim.entries[0]!.at = "2026-08-10T00:00:01Z";
+    expect(validateReviewJournalContract(verbatim, { source: "review" }).value.entries[0]!.at)
+      .toBe("2026-08-10T00:00:01Z");
+
+    // Date.parse alone accepted ambiguous values such as "Jan 1 2026"; the
+    // unified strict validator rejects them.
+    for (const rejected of ["2026", "Jan 1 2026", "0", "2026-02-30T00:00:00Z"]) {
+      const journal = validJournal();
+      journal.entries[0]!.at = rejected;
+      expect(() => validateReviewJournalContract(journal, { source: "review" }))
+        .toThrow(/entries\[0\]\.at: must be an ISO-8601 timestamp/);
+    }
+  });
+
   it("accepts a bounded canonical review journal with a sealed roster and semantic finding identity", () => {
     const validated = validateReviewJournalContract(validJournal(), { source: "review" });
 

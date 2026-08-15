@@ -12,6 +12,7 @@ import {
   nullable,
   objectAt,
   stringAt,
+  timestampAt,
   type ValidatedContract,
 } from "./validation.js";
 import { RECEIPT_TYPES } from "./graph.js";
@@ -272,10 +273,12 @@ function parseSubject(value: unknown, path: string): StandardReceipt["subject"] 
   };
 }
 
+// Verbatim mode: the receipt's canonical bytes are digest-chained across the
+// sandbox/supervisor boundary (artifacts.mjs receipt hashes are replayed by
+// execution-gates evidence binding), so a valid-but-unnormalized issued_at is
+// preserved exactly as the producer emitted it.
 function timestamp(value: unknown, path: string): string {
-  const result = stringAt(value, path, { max: 64 });
-  if (Number.isNaN(Date.parse(result))) fail(path, "must be an ISO timestamp");
-  return result;
+  return timestampAt(value, path, { normalize: false });
 }
 
 function stringList(value: unknown, path: string, max = 32): string[] {

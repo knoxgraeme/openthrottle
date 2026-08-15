@@ -29,7 +29,17 @@ import {
   sanitizeArtifactText,
   validateSemanticProposal,
 } from "./artifacts.mjs";
-import { parseLoopReceipt } from "./execute-loop.mjs";
+import { parseLoopReceipt } from "./artifacts.mjs";
+import {
+  DIGEST,
+  ISSUE_ID,
+  NATIVE_SESSION_ID,
+  SESSION_ID,
+  STAGE_PATH_ID,
+  boundedText,
+  record,
+  string,
+} from "./validate.mjs";
 import {
   computeWorkspaceTreeOid,
   runGitAsRepositoryOwner,
@@ -83,18 +93,6 @@ const REQUEST_KEYS = new Set([
   "requiredArtifacts", "credentialScopes", "liveSteering", "commandName",
   "repositorySkill", "childActionId",
 ]);
-const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
-// Ticket identities are provider-qualified and GitHub's external thread
-// identifier includes a `#` (for example, github:owner/repo#123). Keep this
-// distinct from generic IDs so accepting ticket syntax does not widen fields
-// that may be used as path components.
-const ISSUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,199}$/;
-// Session identities extend ticket identities with a provider activation
-// suffix, so GitHub sessions retain the same safe `#` thread separator.
-const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:/#-]{0,199}$/;
-const STAGE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
-const DIGEST = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
 const ARTIFACT_KINDS = new Set(RUNTIME_DESCRIPTOR.artifacts);
 const CONTEXT_POLICIES = new Set([
@@ -174,26 +172,9 @@ function withoutStandardReceiptArtifact(requiredArtifacts) {
   return requiredArtifacts.filter((kind) => kind !== STANDARD_RECEIPT_ARTIFACT);
 }
 
-function record(value, label) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${label} must be an object`);
-  }
-  return value;
-}
-
 function exactKeys(value, allowed, label) {
   const unknown = Object.keys(value).find((key) => !allowed.has(key));
   if (unknown) throw new Error(`${label} has unknown field ${unknown}`);
-}
-
-function string(value, label, pattern = ID) {
-  if (typeof value !== "string" || !pattern.test(value)) throw new Error(`${label} is invalid`);
-  return value;
-}
-
-function boundedText(value, label, maxLength) {
-  if (typeof value !== "string" || value.length > maxLength) throw new Error(`${label} is invalid`);
-  return value;
 }
 
 function stringList(value, label, allowed) {
