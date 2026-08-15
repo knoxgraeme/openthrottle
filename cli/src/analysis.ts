@@ -1,44 +1,57 @@
+import {
+  ANALYSIS_QUERY_ATTRIBUTIONS,
+  ANALYSIS_QUERY_OUTCOMES,
+  ANALYSIS_QUERY_REASONS,
+  type AnalysisRunQuery,
+  type AnalysisRunResult,
+} from '@openthrottle/contracts';
 import { getErrorMessage, printTable, supervisorRequest } from './util.js';
 
-interface RunOutcomeRow {
-  pipeline_instance_id: string;
+/**
+ * A /analysis/runs row: the contract's read shape plus the three operator-facing
+ * columns the supervisor also returns but the read contract does not model.
+ */
+type AnalysisRunRow = AnalysisRunResult & {
   ticket_id: string;
-  generation: number;
-  execution_graph_id: string | null;
-  plan_digest: string | null;
-  base_commit: string;
   engine: string;
-  outcome: string;
-  closed_reason: string;
-  fault_attribution: string | null;
-  generations_consumed: number;
   token_cost_usd: number | null;
-  created_at: string;
-}
+};
 
 interface AnalysisRunsResponse {
-  runs?: RunOutcomeRow[];
+  runs?: AnalysisRunRow[];
 }
 
-const FILTER_FLAGS: Record<string, string> = {
-  '--outcome': 'outcome',
-  '--reason': 'reason',
-  '--attribution': 'attribution',
-  '--graph': 'graph',
-  '--skill-digest': 'skill_digest',
-  '--from': 'from',
-  '--to': 'to',
-  '--limit': 'limit',
-};
+/**
+ * Allowed values per query field, keyed by the contract's own query shape —
+ * `satisfies` makes this table fail typecheck if @openthrottle/contracts adds or
+ * drops a filter. `null` means "any string"; the supervisor validates the value.
+ */
+const QUERY_FIELDS = {
+  outcome: ANALYSIS_QUERY_OUTCOMES,
+  reason: ANALYSIS_QUERY_REASONS,
+  attribution: ANALYSIS_QUERY_ATTRIBUTIONS,
+  graph: null,
+  skill_digest: null,
+  from: null,
+  to: null,
+  limit: null,
+} satisfies Record<keyof AnalysisRunQuery, readonly string[] | null>;
+
+type QueryField = keyof typeof QUERY_FIELDS;
+
+/** `skill_digest` is spelled `--skill-digest` on the command line. */
+const FIELD_BY_FLAG = new Map<string, QueryField>(
+  (Object.keys(QUERY_FIELDS) as QueryField[]).map((field) => [`--${field.replace(/_/g, '-')}`, field])
+);
 
 function parseFilters(args: string[]): URLSearchParams {
   const params = new URLSearchParams();
   for (let i = 0; i < args.length; i += 1) {
     const flag = args[i] ?? '';
-    const key = FILTER_FLAGS[flag];
-    if (!key) {
+    const field = FIELD_BY_FLAG.get(flag);
+    if (!field) {
       console.error(`Unknown flag: ${flag}\n`);
-      console.error(`Supported flags: ${Object.keys(FILTER_FLAGS).join(', ')}`);
+      console.error(`Supported flags: ${[...FIELD_BY_FLAG.keys()].join(', ')}`);
       process.exit(1);
     }
     const value = args[i + 1];
@@ -46,7 +59,15 @@ function parseFilters(args: string[]): URLSearchParams {
       console.error(`${flag} requires a value`);
       process.exit(1);
     }
-    params.set(key, value);
+    // Vocabulary-backed filters are checked here so a typo fails locally rather
+    // than as an HTTP 400 from the supervisor.
+    const allowed: readonly string[] | null = QUERY_FIELDS[field];
+    if (allowed && !allowed.includes(value)) {
+      console.error(`Invalid value for ${flag}: ${value}\n`);
+      console.error(`Allowed values: ${allowed.join(', ')}`);
+      process.exit(1);
+    }
+    params.set(field, value);
     i += 1;
   }
   return params;
