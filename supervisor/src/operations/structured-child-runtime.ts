@@ -1,11 +1,9 @@
-import { createHash } from "node:crypto";
 import {
   canonicalJson,
   digestNormalized,
   EXECUTION_PLAN_SCHEMA,
   EXECUTION_PLAN_SCHEMA_V2,
   EXECUTION_PLAN_SCHEMAS,
-  deriveReviewSubactionActionId,
   digestCanonicalJson,
   parseAnyExecutionPlanContract,
   parseStandardReceipt,
@@ -13,13 +11,11 @@ import {
   validateTuneDecisionContract,
   validateTuneEditAuthorizationContract,
   validateTuneProposalContract,
-  validateReviewJournalContract,
   type RepositoryConfigContract,
   type AnyExecutionPlanContract,
   type CandidateEvidenceReceipt,
   type CommandResultReceipt,
   type IntegrationEvidenceReceipt,
-  type ReviewJournalContract,
   type SemanticReviewReceipt,
   type StandardReceiptType,
   type StandardReceipt,
@@ -42,31 +38,12 @@ import {
   type UnitActionKind,
 } from "../pipeline/unit-coordinator.js";
 import {
-  MAX_LOOP_REQUEST_ENVELOPE_BYTES,
   loopActionPlanContext,
   loopActionTransitionContext,
-  reviewFanoutSearchMapsFor,
 } from "../pipeline/structured-loop-envelope.js";
 import {
-  MAX_PRIOR_EVIDENCE_BYTES,
-  MAX_PRIOR_EVIDENCE_RECEIPTS,
-} from "../pipeline/structured-loop-limits.js";
-import {
-  buildReviewFanoutPlan,
-  buildReviewSelectorAuthority,
-  parseReviewSelectorRecommendation,
-  synthesizeReviewFanout,
-  validateReviewFanoutBlockers,
-  validateReviewFanoutRepair,
-  type ReviewFanoutPlan,
-  type ReviewFanoutSynthesis,
-  type ReviewSelectorAuthority,
-} from "../pipeline/review-fanout.js";
-import { buildReviewJournal } from "../pipeline/review-journal.js";
-import {
-  assertStandardReceiptFence,
   assertCandidateEvidenceFence,
-  evaluateFinalReviewGate,
+  assertStandardReceiptFence,
   evaluateIntegrationGate,
   evaluateUnitAcceptanceGate,
   type ExpectedReceiptProducer,
@@ -84,7 +61,6 @@ import type {
 } from "../persistence/pipeline/unit-store.js";
 import type {
   ChildExecutorActionRequest,
-  ChildExecutorActionResult,
   LoopActionRequest,
   LoopActionResult,
   RuntimeResource,
@@ -93,77 +69,37 @@ import type {
 import { serializeRuntimeObservationError } from "../runtime/observation-error.js";
 import { extractJsonBlocksAny } from "../pipeline/markdown.js";
 import { sanitizeText } from "../shared/sanitize.js";
+import {
+  actionResultHash,
+  assertLoopRequestEnvelopeBound,
+  buildLoopActionRequest,
+  builtinProducer,
+  DIAGNOSTIC_TEXT_HEAD_CHARS,
+  privateArtifactForLoopResult,
+  terminalPayloadForLoopResult,
+} from "./structured-child-primitives.js";
+import {
+  commandAttemptReceipts,
+  createPriorEvidenceAssembler,
+  unitCompletionAttemptReceipt,
+} from "./prior-evidence.js";
+import {
+  completedAttemptReceiptsFrom,
+  createSubjectDerivation,
+  finalRepairWorktreeHandleFor,
+  GIT_SUBJECT,
+  latestAttemptReceipt,
+  sha1SubjectForGitOperation,
+  verifiedAggregateTreeSubject,
+  worktreeHandleFor,
+  worktreeIdempotencyKey,
+} from "./subject-derivation.js";
+import { createReviewOrchestrator, type ReviewOrchestrator } from "./review-orchestration.js";
 import { createUnitEffectProcessor } from "./unit-effects.js";
 
-const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
-const GIT_SHA1_SUBJECT = /^[a-f0-9]{40}$/;
-// Head slice for a non-success diagnostic stored as lastError -- fits inside
-// the 2,000-char budget the store applies (unit-store.ts) with room to spare.
-const DIAGNOSTIC_TEXT_HEAD_CHARS = 1_500;
 // Bounds the per-tick child-action walk in drainCompositeChildren so one
 // graph with a deep chain of ready results cannot monopolize a drain tick.
 const MAX_CHILD_DRAINS_PER_TICK = 64;
-
-function terminalPayloadForLoopResult(result: LoopActionResult): string | undefined {
-  if (!result.recoveryArtifact) return undefined;
-  return canonicalJson({
-    schema: "openthrottle.execution-work-terminal-payload/v1",
-    receipt_recovery_artifact: JSON.parse(result.recoveryArtifact) as unknown,
-  });
-}
-
-function privateArtifactForLoopResult(result: LoopActionResult): ExecutionWorkPrivateArtifact | undefined {
-  if (!result.recoveryArtifact || !result.recoveryPayload) return undefined;
-  const payload = Buffer.from(result.recoveryPayload);
-  return {
-    schema: "openthrottle.execution-work-private-artifact/v1",
-    manifest: result.recoveryArtifact,
-    payload,
-    payloadSha256: createHash("sha256").update(payload).digest("hex"),
-    payloadBytes: payload.byteLength,
-  };
-}
-
-function actionResultHash(result: ChildExecutorActionResult | LoopActionResult): string {
-  if (!("recoveryPayload" in result) || !result.recoveryPayload) return digestCanonicalJson(result);
-  const { recoveryPayload, ...boundedResult } = result;
-  const payload = Buffer.from(recoveryPayload);
-  return digestCanonicalJson({
-    ...boundedResult,
-    recoveryPayload: {
-      bytes: payload.byteLength,
-      sha256: createHash("sha256").update(payload).digest("hex"),
-    },
-  });
-}
-
-class RetryableReviewRuntimeError extends Error {
-  constructor(operation: string, cause: unknown) {
-    const observed = serializeRuntimeObservationError(operation, cause);
-    // Provider wrappers do not always preserve a transport status when an
-    // acknowledgement is lost. This typed boundary is itself the proof that
-    // an unknown exception came from provider I/O, so make that retryability
-    // explicit for the durable outer observation budget.
-    super(observed.text.replace(/\bretryable=false\b/, "retryable=true"));
-    this.name = "RetryableReviewRuntimeError";
-  }
-}
-
-const ACTION_OUTPUT_ORDER: Record<UnitActionKind, number> = {
-  implement: 10,
-  repair: 10,
-  simplify: 20,
-  command: 30,
-  candidate: 40,
-  lead: 50,
-  integrate: 60,
-  final_repair: 10,
-  final_command: 20,
-  final_review: 30,
-  aggregate: 40,
-  stop: 40,
-  cleanup: 40,
-};
 
 type StructuredChildRuntimeDeps = {
   store: PipelineStore & ExecutionUnitStore;
@@ -425,39 +361,6 @@ function commandPlanForUnits(input: {
   };
 }
 
-function normalizedLoopRequestForHash(
-  request: Omit<LoopActionRequest, "requestHash" | "idempotencyKey">
-): Omit<LoopActionRequest, "requestHash" | "idempotencyKey"> {
-  const { candidateSubject, ...withoutCandidate } = request;
-  return candidateSubject === null || candidateSubject === undefined
-    ? withoutCandidate
-    : { ...withoutCandidate, candidateSubject };
-}
-
-function buildLoopActionRequest(
-  request: Omit<LoopActionRequest, "requestHash" | "idempotencyKey">
-): LoopActionRequest {
-  const normalized = normalizedLoopRequestForHash(request);
-  const requestHash = digestCanonicalJson(normalized);
-  return {
-    ...normalized,
-    requestHash,
-    idempotencyKey: `loop:${request.attemptId}:${request.actionId}:${requestHash}`,
-  };
-}
-
-function fanoutActionId(action: ExecutionWorkAttempt, personaId: string): string {
-  return deriveReviewSubactionActionId(action.id, personaId);
-}
-
-function selectorActionId(action: ExecutionWorkAttempt): string {
-  return deriveReviewSubactionActionId(action.id, "selector");
-}
-
-function validatorActionId(action: ExecutionWorkAttempt): string {
-  return deriveReviewSubactionActionId(action.id, "validator");
-}
-
 function buildChildExecutorActionRequest(
   request: Omit<ChildExecutorActionRequest, "requestHash" | "idempotencyKey">
 ): ChildExecutorActionRequest {
@@ -492,20 +395,6 @@ function expectedSkillFor(binding: LoopDispatchBinding): string {
   return `builtin://${binding.loop.skill}@1`;
 }
 
-function builtinProducer(
-  skill: "command_result" | "candidate_evidence" | "integration_evidence" | "review-orchestrator",
-  capabilityDigest: string,
-  assurance: ExpectedReceiptProducer["assurance"] = "executor_verified"
-): ExpectedReceiptProducer {
-  return {
-    workerId: "executor",
-    skill: `builtin://${skill}@1`,
-    capabilityDigest,
-    skillPackageDigest: null,
-    assurance,
-  };
-}
-
 function loopKindFor(actionKind: UnitActionKind): LoopActionRequest["loop"] {
   if (actionKind === "repair" || actionKind === "final_repair") return "repair";
   if (actionKind === "final_review") return "review";
@@ -534,27 +423,6 @@ function roleFor(actionKind: UnitActionKind): LoopActionRequest["role"] {
   if (actionKind === "lead") return "lead";
   if (actionKind === "final_review") return "reviewer";
   return "worker";
-}
-
-function worktreeIdempotencyKey(action: ExecutionWorkAttempt): string {
-  return `worktree:${action.parent_attempt_id}:${action.unit_id ?? "final"}:${action.cycle}`;
-}
-
-function worktreeHandleFor(action: ExecutionWorkAttempt, baseCommit: string): { id: string } {
-  return {
-    id: digestCanonicalJson({
-      idempotencyKey: worktreeIdempotencyKey(action),
-      attemptId: action.parent_attempt_id,
-      baseCommit,
-    }).slice(0, 32),
-  };
-}
-
-function compareAttemptOrder(left: ExecutionWorkAttempt, right: ExecutionWorkAttempt): number {
-  return ACTION_OUTPUT_ORDER[left.action_kind] - ACTION_OUTPUT_ORDER[right.action_kind] ||
-    left.attempt_ordinal - right.attempt_ordinal ||
-    left.created_at.localeCompare(right.created_at) ||
-    left.id.localeCompare(right.id);
 }
 
 function requestContextForStructuredPlan(payload: {
@@ -648,143 +516,9 @@ function tuneAuthorizationForParent(
   };
 }
 
-function assertLoopRequestEnvelopeBound(request: LoopActionRequest): void {
-  if (Buffer.byteLength(canonicalJson(request), "utf8") > MAX_LOOP_REQUEST_ENVELOPE_BYTES) {
-    throw new Error("sealed loop action request exceeds 262144 bytes");
-  }
-}
-
-function sha1SubjectForGitOperation(subject: string, label: string): string {
-  if (!GIT_SHA1_SUBJECT.test(subject)) {
-    throw new Error(`${label} must be a 40-character Git object ID for child Git operations`);
-  }
-  return subject;
-}
-
-function finalRepairWorktreeHandleFor(
-  action: ExecutionWorkAttempt,
-  baseCommit: string,
-  attempts: readonly ExecutionWorkAttempt[]
-): { id: string } {
-  const finalRepair = attempts.find((attempt) =>
-    attempt.unit_id === null &&
-    attempt.action_kind === "final_repair" &&
-    attempt.cycle === action.cycle &&
-    attempt.status === "completed"
-  );
-  if (!finalRepair) throw new Error(`child final candidate action ${action.id} has no completed final repair worktree`);
-  return worktreeHandleFor(finalRepair, baseCommit);
-}
-
 export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): StructuredChildRuntime {
   const completeParentStage = deps.completeParentStage ?? ((event: PipelineCoordinatorEvent) =>
     coordinatePipelineEvent(deps.store, event));
-
-  const worktreeBaseFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string => {
-    if (action.action_kind === "repair") return repairRejectedCandidateSubjectFor(instance, action);
-    if (
-      action.unit_id !== null &&
-      action.cycle > 1 &&
-      (
-        action.action_kind === "simplify" ||
-        action.action_kind === "command" ||
-        action.action_kind === "candidate" ||
-        action.action_kind === "lead"
-      )
-    ) {
-      const unitCycleAttempts = deps.store.listWorkAttempts(action.parent_attempt_id).filter((attempt) =>
-        attempt.unit_id === action.unit_id &&
-        attempt.cycle === action.cycle
-      );
-      const hasRepairCycleWork = unitCycleAttempts.some((attempt) => attempt.action_kind === "repair");
-      if (!hasRepairCycleWork) {
-        const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
-        const base = graph?.integration_subject ?? instance.immutable_subject ?? instance.base_commit;
-        if (!GIT_SUBJECT.test(base)) throw new Error(`child action ${action.id} has no exact worktree base`);
-        return base;
-      }
-      const repairs = unitCycleAttempts.filter((attempt) =>
-        attempt.action_kind === "repair" &&
-        attempt.status === "completed");
-      if (repairs.length !== 1) {
-        throw new Error(`child action ${action.id} requires exactly one completed repair worktree for cycle ${action.cycle}`);
-      }
-      return repairRejectedCandidateSubjectFor(instance, repairs[0]!);
-    }
-    const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
-    const base = graph?.integration_subject ?? instance.immutable_subject ?? instance.base_commit;
-    if (!GIT_SUBJECT.test(base)) throw new Error(`child action ${action.id} has no exact worktree base`);
-    return base;
-  };
-
-  const receiptBaseFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string => {
-    if (action.action_kind !== "final_review") return worktreeBaseFor(instance, action);
-    if (action.request_payload) {
-      try {
-        const request = JSON.parse(action.request_payload) as { protocol?: unknown; baseSubject?: unknown };
-        if (request.protocol === "loop-action@3" &&
-            typeof request.baseSubject === "string" &&
-            GIT_SUBJECT.test(request.baseSubject)) {
-          return request.baseSubject;
-        }
-      } catch {
-        // The request-hash fence still rejects incompatible legacy receipts.
-      }
-    }
-    return instance.base_commit;
-  };
-
-  const latestPriorOutputSubject = (
-    action: ExecutionWorkAttempt,
-    kinds: readonly UnitActionKind[]
-  ): string | undefined => {
-    const attempts = deps.store.listWorkAttempts(action.parent_attempt_id);
-    let latest: ExecutionWorkAttempt | undefined;
-    for (const attempt of attempts) {
-      if (
-        attempt.status === "completed" &&
-        attempt.output_subject &&
-        attempt.unit_id === action.unit_id &&
-        attempt.cycle === action.cycle &&
-        kinds.includes(attempt.action_kind)
-      ) {
-        latest = latest && compareAttemptOrder(latest, attempt) > 0 ? latest : attempt;
-      }
-    }
-    return latest?.output_subject ?? undefined;
-  };
-
-  const actionInputSubjectFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string => {
-    const base = worktreeBaseFor(instance, action);
-    if (action.action_kind === "repair") return base;
-    if (action.action_kind === "command") {
-      return latestPriorOutputSubject(action, ["implement", "repair", "simplify", "command"]) ?? base;
-    }
-    if (action.action_kind === "candidate") {
-      if (action.unit_id === null) {
-        return latestPriorOutputSubject(action, ["final_repair"]) ?? base;
-      }
-      return latestPriorOutputSubject(action, ["implement", "repair", "simplify", "command"]) ?? base;
-    }
-    if (action.action_kind === "lead") {
-      return latestPriorOutputSubject(action, ["candidate"]) ?? base;
-    }
-    if (action.action_kind === "final_command") {
-      return latestPriorOutputSubject({ ...action, unit_id: null }, ["final_command"]) ??
-        deps.store.getGraphForAttempt(action.parent_attempt_id)?.integration_subject ?? base;
-    }
-    if (action.action_kind === "final_review") {
-      return latestPriorOutputSubject({ ...action, unit_id: null }, ["final_command", "final_repair"]) ??
-        deps.store.getGraphForAttempt(action.parent_attempt_id)?.integration_subject ?? base;
-    }
-    if (action.action_kind === "integrate") {
-      return deps.store.getGraphForAttempt(action.parent_attempt_id)?.integration_subject ?? base;
-    }
-    if (action.action_kind === "simplify") {
-      return latestPriorOutputSubject(action, ["implement", "repair"]) ?? base;
-    }
-    return base;
-  };
 
   const actionBinding = (instance: PipelineInstance, action: ExecutionWorkAttempt): LoopDispatchBinding | undefined => {
     if (action.action_kind === "final_review") return FINAL_REVIEW_BINDING;
@@ -857,691 +591,21 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     return agentProducerFor(instance, action, role);
   };
 
-  const fanoutProducerFor = (
-    instance: PipelineInstance,
-    personaId: string
-  ): ExpectedReceiptProducer => ({
-    workerId: personaId,
-    skill: `builtin://${personaId}@1`,
-    capabilityDigest: instance.capability_digest,
-    skillPackageDigest: null,
-    assurance: "semantic_attested",
+  // Owns every subject/worktree derivation this runtime dispatches against
+  // (worktree base, action input subject, worktree handles, the rejected
+  // candidate a repair rebuilds from), over the same sealed store and the
+  // producer projection above.
+  const {
+    worktreeBaseFor,
+    actionInputSubjectFor,
+    receiptBaseFor,
+    completedAttemptReceiptsFor,
+    repairRejectedCandidateAttemptReceipt,
+    assertPreparedUnitWorktreeRequestBound,
+  } = createSubjectDerivation({
+    store: deps.store,
+    expectedProducerForAction,
   });
-
-  const buildReviewFanoutRequests = (input: {
-    instance: PipelineInstance;
-    action: ExecutionWorkAttempt;
-    plan: AnyExecutionPlanContract;
-    fanout: ReviewFanoutPlan;
-    inputSubject: string;
-    baseSubject: string;
-    agent: LoopActionRequest["agent"];
-    model?: string;
-    reasoningEffort?: LoopActionRequest["reasoningEffort"];
-    timeoutMs: number;
-  }): LoopActionRequest[] =>
-    input.fanout.personas.map((persona) => buildLoopActionRequest({
-      protocol: "loop-action@3",
-      actionId: fanoutActionId(input.action, persona.id),
-      attemptId: input.action.parent_attempt_id,
-      graphId: input.action.execution_graph_id,
-      pipelineInstanceId: input.instance.id,
-      graphDigest: input.instance.manifest_digest,
-      parentRunId: input.action.parent_run_id,
-      unitId: input.action.unit_id,
-      generation: input.instance.generation,
-      role: "reviewer",
-      loop: "review",
-      agent: input.agent,
-      ...(input.model === undefined ? {} : { model: input.model }),
-      ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
-      skill: persona.id,
-      worktree: null,
-      baseSubject: input.baseSubject,
-      inputSubject: input.inputSubject,
-      nativeSessionId: null,
-      contextPolicy: "fresh",
-      timeoutMs: input.timeoutMs,
-      transitionContext: loopActionTransitionContext({
-        actionPayload: canonicalJson({
-          parent_attempt_id: input.action.parent_attempt_id,
-          parent_run_id: input.action.parent_run_id,
-          unit_id: input.action.unit_id,
-          action_kind: input.action.action_kind,
-          cycle: input.action.cycle,
-          review_persona_id: persona.id,
-        }),
-        planContext: {
-          schema: "openthrottle.loop-action-plan-context/v1",
-          action_kind: input.action.action_kind,
-          graph_id: input.plan.graph_id,
-          plan_id: input.plan.plan_id,
-          unit: input.action.unit_id ? input.plan.units.find((unit) => unit.id === input.action.unit_id) ?? null : null,
-          review_fanout: input.fanout,
-          review_persona: persona,
-        },
-        actionKind: input.action.action_kind,
-        unitId: input.action.unit_id,
-      }),
-      allowedMcpServers: [],
-      credentialScopes: ["model.invoke", "repo.read"],
-      receiptSchema: RECEIPT_SCHEMA,
-      expectedReceiptType: "semantic_review",
-      expectedProducerSkill: `builtin://${persona.id}@1`,
-      expectedProducer: fanoutProducerFor(input.instance, persona.id),
-    }));
-
-  const buildReviewSelectorRequest = (input: {
-    instance: PipelineInstance;
-    action: ExecutionWorkAttempt;
-    plan: AnyExecutionPlanContract;
-    authority: ReviewSelectorAuthority;
-    inputSubject: string;
-    baseSubject: string;
-    agent: LoopActionRequest["agent"];
-    model?: string;
-    reasoningEffort?: LoopActionRequest["reasoningEffort"];
-    timeoutMs: number;
-    priorEvidence?: LoopActionRequest["priorEvidence"];
-  }): LoopActionRequest => buildLoopActionRequest({
-    protocol: "loop-action@3",
-    actionId: selectorActionId(input.action),
-    attemptId: input.action.parent_attempt_id,
-    graphId: input.action.execution_graph_id,
-    pipelineInstanceId: input.instance.id,
-    graphDigest: input.instance.manifest_digest,
-    parentRunId: input.action.parent_run_id,
-    unitId: input.action.unit_id,
-    generation: input.instance.generation,
-    role: "reviewer",
-    loop: "review",
-    agent: input.agent,
-    ...(input.model === undefined ? {} : { model: input.model }),
-    ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
-    skill: "select-review-personas",
-    worktree: null,
-    baseSubject: input.baseSubject,
-    inputSubject: input.inputSubject,
-    nativeSessionId: null,
-    contextPolicy: "fresh",
-    timeoutMs: input.timeoutMs,
-    transitionContext: loopActionTransitionContext({
-      actionPayload: canonicalJson({
-        parent_attempt_id: input.action.parent_attempt_id,
-        parent_run_id: input.action.parent_run_id,
-        action_kind: input.action.action_kind,
-        cycle: input.action.cycle,
-        review_selector: true,
-      }),
-      planContext: {
-        schema: "openthrottle.loop-action-plan-context/v1",
-        action_kind: input.action.action_kind,
-        graph_id: input.plan.graph_id,
-        plan_id: input.plan.plan_id,
-        unit: null,
-        review_selector_authority: input.authority,
-      },
-      actionKind: input.action.action_kind,
-      unitId: input.action.unit_id,
-    }),
-    ...(input.priorEvidence ? { priorEvidence: input.priorEvidence } : {}),
-    allowedMcpServers: [],
-    credentialScopes: ["model.invoke", "repo.read"],
-    receiptSchema: RECEIPT_SCHEMA,
-    expectedReceiptType: "semantic_review",
-    expectedProducerSkill: "builtin://select-review-personas@1",
-    expectedProducer: {
-      workerId: "review-selector",
-      skill: "builtin://select-review-personas@1",
-      capabilityDigest: input.instance.capability_digest,
-      skillPackageDigest: null,
-      assurance: "semantic_attested",
-    },
-  });
-
-  const buildReviewValidatorRequest = (input: {
-    instance: PipelineInstance;
-    action: ExecutionWorkAttempt;
-    plan: AnyExecutionPlanContract;
-    fanout: ReviewFanoutPlan;
-    synthesis: ReviewFanoutSynthesis;
-    inputSubject: string;
-    baseSubject: string;
-    agent: LoopActionRequest["agent"];
-    model?: string;
-    reasoningEffort?: LoopActionRequest["reasoningEffort"];
-    timeoutMs: number;
-  }): LoopActionRequest => buildLoopActionRequest({
-    protocol: "loop-action@3",
-    actionId: validatorActionId(input.action),
-    attemptId: input.action.parent_attempt_id,
-    graphId: input.action.execution_graph_id,
-    pipelineInstanceId: input.instance.id,
-    graphDigest: input.instance.manifest_digest,
-    parentRunId: input.action.parent_run_id,
-    unitId: input.action.unit_id,
-    generation: input.instance.generation,
-    role: "reviewer",
-    loop: "review",
-    agent: input.agent,
-    ...(input.model === undefined ? {} : { model: input.model }),
-    ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
-    skill: "validate-review-findings",
-    worktree: null,
-    baseSubject: input.baseSubject,
-    inputSubject: input.inputSubject,
-    nativeSessionId: null,
-    contextPolicy: "fresh",
-    timeoutMs: input.timeoutMs,
-    transitionContext: loopActionTransitionContext({
-      actionPayload: canonicalJson({
-        parent_attempt_id: input.action.parent_attempt_id,
-        parent_run_id: input.action.parent_run_id,
-        action_kind: input.action.action_kind,
-        cycle: input.action.cycle,
-        review_validator: true,
-      }),
-      planContext: {
-        schema: "openthrottle.loop-action-plan-context/v1",
-        action_kind: input.action.action_kind,
-        graph_id: input.plan.graph_id,
-        plan_id: input.plan.plan_id,
-        unit: null,
-        review_fanout: input.fanout,
-        review_synthesis: input.synthesis,
-      },
-      actionKind: input.action.action_kind,
-      unitId: input.action.unit_id,
-    }),
-    allowedMcpServers: [],
-    credentialScopes: ["model.invoke", "repo.read"],
-    receiptSchema: RECEIPT_SCHEMA,
-    expectedReceiptType: "semantic_review",
-    expectedProducerSkill: "builtin://validate-review-findings@1",
-    expectedProducer: {
-      workerId: "review-validator",
-      skill: "builtin://validate-review-findings@1",
-      capabilityDigest: input.instance.capability_digest,
-      skillPackageDigest: null,
-      assurance: "semantic_attested",
-    },
-  });
-
-  const fanoutFenceFor = (input: {
-    instance: PipelineInstance;
-    action: ExecutionWorkAttempt;
-    request: LoopActionRequest;
-    personaId: string;
-    subject: string;
-    baseSubject: string;
-    expectedProducer?: ExpectedReceiptProducer;
-  }): StandardReceiptFence => ({
-    pipelineInstanceId: input.instance.id,
-    graphDigest: input.instance.manifest_digest,
-    unitId: input.action.unit_id ?? "__final__",
-    attemptId: input.action.parent_attempt_id,
-    parentRunId: input.action.parent_run_id,
-    actionAttemptId: input.request.actionId,
-    generation: input.instance.generation,
-    nativeSessionId: null,
-    requestHash: input.request.requestHash,
-    baseSubject: input.baseSubject,
-    preSubject: input.subject,
-    subject: input.subject,
-    producers: {
-      ...expectedProducersFor(input.instance, input.action),
-      review: input.expectedProducer ?? fanoutProducerFor(input.instance, input.personaId),
-    },
-  });
-
-  const reviewRuntimeCall = async <T>(operation: string, execute: () => Promise<T>): Promise<T> => {
-    try {
-      return await execute();
-    } catch (error) {
-      const observed = serializeRuntimeObservationError(operation, error);
-      // A known non-retryable provider response (notably 400/401/403) is a
-      // deterministic terminal. Statusless provider exceptions remain
-      // uncertain and must consume the bounded observation retry budget.
-      if (!observed.retryable && observed.statusCode !== null) throw new Error(observed.text);
-      throw new RetryableReviewRuntimeError(operation, error);
-    }
-  };
-
-  const captureLatestReviewCodexAuth = (
-    results: ReadonlyArray<{ request: LoopActionRequest; result: LoopActionResult | null }>
-  ): void => {
-    const latest = results
-      .filter((entry): entry is { request: LoopActionRequest; result: LoopActionResult & { codexAuthJson: string } } =>
-        typeof entry.result?.codexAuthJson === "string" && entry.result.codexAuthJson.length > 0)
-      .sort((left, right) =>
-        left.result.completedAt.localeCompare(right.result.completedAt) ||
-        left.request.actionId.localeCompare(right.request.actionId))
-      .at(-1);
-    if (latest) deps.captureCodexAuth?.(latest.result.codexAuthJson);
-  };
-
-  const ensureReviewSubactionLaunched = async (input: {
-    resource: RuntimeResource;
-    action: ExecutionWorkAttempt;
-    request: LoopActionRequest;
-    label: string;
-  }): Promise<boolean> => {
-    const persisted = deps.store.getReviewSubactionDispatch(input.action.id, input.request.actionId);
-    deps.store.prepareReviewSubactionDispatch({
-      parentActionId: input.action.id,
-      actionId: input.request.actionId,
-      requestHash: input.request.requestHash,
-      idempotencyKey: input.request.idempotencyKey,
-    });
-    if (persisted?.dispatched_at != null) return false;
-    await reviewRuntimeCall(
-      `${input.label} ${input.request.actionId} dispatch failed`,
-      () => deps.runtime.dispatchLoopAction(input.resource, input.request)
-    );
-    deps.store.markReviewSubactionDispatched(input.action.id, input.request.actionId, "acknowledged");
-    return true;
-  };
-
-  const prepareReviewSubaction = async (input: {
-    resource: RuntimeResource;
-    action: ExecutionWorkAttempt;
-    request: LoopActionRequest;
-    label: string;
-  }): Promise<{
-    result: LoopActionResult | null;
-    newlyDispatched: boolean;
-  }> => {
-    const persisted = deps.store.getReviewSubactionDispatch(input.action.id, input.request.actionId);
-    if (persisted) {
-      if (
-        persisted.request_hash !== input.request.requestHash ||
-        persisted.idempotency_key !== input.request.idempotencyKey
-      ) {
-        throw new Error(`persisted review subaction ${input.request.actionId} has a different request fence`);
-      }
-      if (persisted.dispatched_at !== null) return { result: null, newlyDispatched: false };
-    }
-    const recovered = await reviewRuntimeCall(
-      `${input.label} ${input.request.actionId} pre-dispatch collection failed`,
-      () => deps.runtime.collectLoopActionResult(input.resource, {
-        attemptId: input.request.attemptId,
-        actionId: input.request.actionId,
-        requestHash: input.request.requestHash,
-      })
-    );
-    if (!persisted) {
-      deps.store.prepareReviewSubactionDispatch({
-        parentActionId: input.action.id,
-        actionId: input.request.actionId,
-        requestHash: input.request.requestHash,
-        idempotencyKey: input.request.idempotencyKey,
-      });
-    }
-    const newlyDispatched = !recovered;
-    if (newlyDispatched) {
-      await ensureReviewSubactionLaunched(input);
-    } else {
-      deps.store.markReviewSubactionDispatched(input.action.id, input.request.actionId, "prepared_fallback");
-    }
-    return { result: recovered, newlyDispatched };
-  };
-
-  const prepareReviewFanout = async (input: {
-    resource: RuntimeResource;
-    action: ExecutionWorkAttempt;
-    requests: readonly LoopActionRequest[];
-  }): Promise<Map<string, LoopActionResult>> => {
-    const precollected = new Map<string, LoopActionResult>();
-    for (const request of input.requests) {
-      const prepared = await prepareReviewSubaction({
-        resource: input.resource,
-        action: input.action,
-        request,
-        label: "review fanout action",
-      });
-      let result = prepared.result;
-      if (!result && !prepared.newlyDispatched) {
-        result = await reviewRuntimeCall(
-          `review fanout action ${request.actionId} serialized result collection failed`,
-          () => deps.runtime.collectLoopActionResult(input.resource, {
-            attemptId: request.attemptId,
-            actionId: request.actionId,
-            requestHash: request.requestHash,
-          })
-        );
-      }
-      if (result) {
-        precollected.set(request.actionId, result);
-        captureLatestReviewCodexAuth([{ request, result }]);
-      }
-      if (prepared.newlyDispatched || !result || result.outcome !== "success") {
-        break;
-      }
-    }
-    return precollected;
-  };
-
-  const collectReviewFanout = async (input: {
-    resource: RuntimeResource;
-    instance: PipelineInstance;
-    action: ExecutionWorkAttempt;
-    plan: ReviewFanoutPlan;
-    requests: readonly LoopActionRequest[];
-    baseSubject: string;
-    precollected?: ReadonlyMap<string, LoopActionResult>;
-  }): Promise<{
-    synthesis: ReviewFanoutSynthesis;
-    receipts: SemanticReviewReceipt[];
-    receiptResults: Array<{
-      receipt: SemanticReviewReceipt;
-      actionId: string;
-      dispatchedAt: string;
-      dispatchTimeSource: "acknowledged" | "prepared_fallback";
-      completedAt: string;
-    }>;
-  } | {
-    pending: true;
-  } | {
-    terminal: true;
-    resultHash: string;
-    outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
-    lastError: string;
-    terminalPayload?: string;
-    privateArtifact?: ExecutionWorkPrivateArtifact;
-  }> => {
-    const receipts: SemanticReviewReceipt[] = [];
-    const receiptResults: Array<{
-      receipt: SemanticReviewReceipt;
-      actionId: string;
-      dispatchedAt: string;
-      dispatchTimeSource: "acknowledged" | "prepared_fallback";
-      completedAt: string;
-    }> = [];
-    const collected: Array<{ request: LoopActionRequest; result: LoopActionResult | null }> = [];
-    for (const request of input.requests) {
-      const result = input.precollected?.get(request.actionId) ?? await reviewRuntimeCall(
-        `review fanout action ${request.actionId} result collection failed`,
-        () => deps.runtime.collectLoopActionResult(input.resource, {
-          attemptId: request.attemptId,
-          actionId: request.actionId,
-          requestHash: request.requestHash,
-        })
-      );
-      collected.push({ request, result });
-    }
-    captureLatestReviewCodexAuth(collected);
-    for (const { request, result } of collected) {
-      if (!result) return { pending: true };
-      if (result.outcome !== "success") {
-        return {
-          terminal: true,
-          resultHash: actionResultHash(result),
-          outcome: result.outcome === "retryable_infrastructure_failure"
-            ? "retryable_infrastructure_failure"
-            : result.outcome === "needs_human"
-              ? "needs_human"
-              : "failure",
-          lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
-          terminalPayload: terminalPayloadForLoopResult(result),
-          privateArtifact: privateArtifactForLoopResult(result),
-        };
-      }
-      let receipt: StandardReceipt;
-      try {
-        receipt = parseStandardReceipt(result.receipt, { source: `review_fanout.${request.actionId}.receipt` }).value;
-      } catch {
-        return {
-          terminal: true,
-          resultHash: actionResultHash(result),
-          outcome: "failure",
-          lastError: `review fanout action ${request.actionId} returned malformed success receipt`,
-        };
-      }
-      if (receipt.type !== "semantic_review") {
-        return {
-          terminal: true,
-          resultHash: actionResultHash(result),
-          outcome: "failure",
-          lastError: `review fanout action ${request.actionId} returned ${receipt.type}, expected semantic_review`,
-        };
-      }
-      const personaId = receipt.producer.worker_id;
-      try {
-        assertStandardReceiptFence({
-          expected: fanoutFenceFor({
-            instance: input.instance,
-            action: input.action,
-            request,
-            personaId,
-            subject: input.plan.subject,
-            baseSubject: input.baseSubject,
-          }),
-          receipt,
-          role: "review",
-        });
-      } catch (error) {
-        return {
-          terminal: true,
-          resultHash: actionResultHash(result),
-          outcome: "failure",
-          lastError: `review fanout action ${request.actionId} returned invalid receipt: ${
-            sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
-          }`,
-        };
-      }
-      const dispatch = deps.store.getReviewSubactionDispatch(input.action.id, request.actionId);
-      if (!dispatch?.dispatched_at || !dispatch.dispatch_time_source) {
-        return {
-          terminal: true,
-          resultHash: actionResultHash(result),
-          outcome: "failure",
-          lastError: `review fanout action ${request.actionId} has no persisted dispatch timing`,
-        };
-      }
-      receipts.push(receipt as SemanticReviewReceipt);
-      receiptResults.push({
-        receipt: receipt as SemanticReviewReceipt,
-        actionId: request.actionId,
-        dispatchedAt: dispatch.dispatched_at,
-        dispatchTimeSource: dispatch.dispatch_time_source,
-        completedAt: result.completedAt,
-      });
-    }
-    try {
-      return { synthesis: synthesizeReviewFanout({ plan: input.plan, receipts }), receipts, receiptResults };
-    } catch (error) {
-      return {
-        terminal: true,
-        resultHash: digestCanonicalJson({ plan: input.plan, receipts }),
-        outcome: "failure",
-        lastError: `review fanout synthesis failed: ${
-          sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
-        }`,
-      };
-    }
-  };
-
-  const collectReviewSubaction = async (input: {
-    resource: RuntimeResource;
-    instance: PipelineInstance;
-    action: ExecutionWorkAttempt;
-    request: LoopActionRequest;
-    workerId: string;
-    skill: string;
-    subject: string;
-    baseSubject: string;
-    precollected?: LoopActionResult;
-  }): Promise<{
-    receipt: SemanticReviewReceipt;
-    completedAt: string;
-  } | { pending: true } | {
-    terminal: true;
-    resultHash: string;
-    outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
-    lastError: string;
-    terminalPayload?: string;
-    privateArtifact?: ExecutionWorkPrivateArtifact;
-  }> => {
-    const result = input.precollected ?? await reviewRuntimeCall(
-      `review subaction ${input.request.actionId} result collection failed`,
-      () => deps.runtime.collectLoopActionResult(input.resource, {
-        attemptId: input.request.attemptId,
-        actionId: input.request.actionId,
-        requestHash: input.request.requestHash,
-      })
-    );
-    if (!result) return { pending: true };
-    if (typeof result.codexAuthJson === "string" && result.codexAuthJson) deps.captureCodexAuth?.(result.codexAuthJson);
-    if (result.outcome !== "success") {
-      return {
-        terminal: true,
-        resultHash: actionResultHash(result),
-        outcome: result.outcome === "retryable_infrastructure_failure"
-          ? "retryable_infrastructure_failure"
-          : result.outcome === "needs_human" ? "needs_human" : "failure",
-        lastError: `${result.outcome}: ${sanitizeText(result.receipt).slice(0, DIAGNOSTIC_TEXT_HEAD_CHARS)}`,
-        terminalPayload: terminalPayloadForLoopResult(result),
-        privateArtifact: privateArtifactForLoopResult(result),
-      };
-    }
-    let receipt: StandardReceipt;
-    try {
-      receipt = parseStandardReceipt(result.receipt, { source: `review_subaction.${input.request.actionId}.receipt` }).value;
-      if (receipt.type !== "semantic_review") throw new Error(`expected semantic_review, received ${receipt.type}`);
-      assertStandardReceiptFence({
-        expected: fanoutFenceFor({
-          instance: input.instance,
-          action: input.action,
-          request: input.request,
-          personaId: input.workerId,
-          subject: input.subject,
-          baseSubject: input.baseSubject,
-          expectedProducer: {
-            workerId: input.workerId,
-            skill: input.skill,
-            capabilityDigest: input.instance.capability_digest,
-            skillPackageDigest: null,
-            assurance: "semantic_attested",
-          },
-        }),
-        receipt,
-        role: "review",
-      });
-    } catch (error) {
-      return {
-        terminal: true,
-        resultHash: actionResultHash(result),
-        outcome: "failure",
-        lastError: `review subaction ${input.request.actionId} returned invalid receipt: ${
-          sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)
-        }`,
-      };
-    }
-    return { receipt: receipt as SemanticReviewReceipt, completedAt: result.completedAt };
-  };
-
-  const previousReviewFanoutSynthesis = (
-    action: ExecutionWorkAttempt
-  ): ReviewFanoutSynthesis | undefined => {
-    if (action.cycle < 2) return undefined;
-    const gates = deps.store.listGateReceipts(action.parent_attempt_id)
-      .filter((gate) =>
-        gate.gate_kind === "final_review" &&
-        gate.unit_id === action.unit_id &&
-        gate.execution_work_attempt_id !== action.id)
-      .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.id.localeCompare(left.id));
-    for (const gate of gates) {
-      try {
-        const payload = JSON.parse(gate.payload) as { review_fanout_synthesis?: ReviewFanoutSynthesis };
-        if (payload.review_fanout_synthesis) return payload.review_fanout_synthesis;
-      } catch {
-        continue;
-      }
-    }
-    return undefined;
-  };
-
-  const previousReviewJournal = (
-    instance: PipelineInstance,
-    action: ExecutionWorkAttempt
-  ): { journal?: ReviewJournalContract; auditError?: string } => {
-    if (action.cycle < 2) return {};
-    const entries = deps.store.listJournalEntries({ issueId: instance.ticket_id, limit: 1_000, order: "newest" })
-      .filter((entry) =>
-        entry.instance_id === instance.id &&
-        entry.run_id === action.parent_run_id &&
-        entry.trigger === "structured_review_fanout" &&
-        entry.structured !== null);
-    let invalidEntries = 0;
-    for (const entry of entries) {
-      try {
-        const journal = validateReviewJournalContract(JSON.parse(entry.structured!), {
-          source: `orchestration_journal.${entry.id}.structured`,
-        }).value;
-        if (journal.finding_resolutions.some((resolution) => resolution.convergence_cycle === action.cycle - 1)) {
-          return {
-            journal,
-            ...(invalidEntries > 0
-              ? { auditError: `ignored ${invalidEntries} invalid prior review journal candidate row(s)` }
-              : {}),
-          };
-        }
-      } catch {
-        invalidEntries += 1;
-      }
-    }
-    return {
-      auditError: `final review cycle ${action.cycle} has no valid prior review journal (${invalidEntries} invalid candidate row(s))`,
-    };
-  };
-
-  const synthesizeFinalReviewReceipt = (input: {
-    expected: StandardReceiptFence;
-    synthesis: ReviewFanoutSynthesis;
-    commandHashes: readonly string[];
-    issuedAt: string;
-  }): SemanticReviewReceipt => {
-    const producer = input.expected.producers.review;
-    const result = input.synthesis.outcome === "needs_human" || input.synthesis.outcome === "failure"
-      ? input.synthesis.outcome
-      : input.synthesis.outcome === "success"
-        ? "success"
-        : "semantic_repair_required";
-    return {
-      schema: RECEIPT_SCHEMA,
-      type: "semantic_review",
-      assurance: producer.assurance,
-      result,
-      producer: {
-        worker_id: producer.workerId,
-        skill: producer.skill,
-        capability_digest: producer.capabilityDigest,
-        skill_package_digest: producer.skillPackageDigest,
-      },
-      subject: {
-        base: input.expected.baseSubject,
-        pre: input.expected.preSubject,
-        post: input.expected.subject,
-      },
-      fence: {
-        pipeline_instance_id: input.expected.pipelineInstanceId,
-        graph_digest: input.expected.graphDigest,
-        unit_id: input.expected.unitId,
-        attempt_id: input.expected.attemptId,
-        parent_run_id: input.expected.parentRunId,
-        action_attempt_id: input.expected.actionAttemptId,
-        generation: input.expected.generation,
-        native_session_id: input.expected.nativeSessionId,
-        request_hash: input.expected.requestHash,
-      },
-      evidence: [...input.commandHashes, ...input.synthesis.receipt_hashes, digestCanonicalJson(input.synthesis)],
-      payload: {
-        summary: input.synthesis.summary,
-        findings: input.synthesis.findings,
-      },
-      issued_at: input.issuedAt,
-    };
-  };
 
   const standardFenceFor = (
     instance: PipelineInstance,
@@ -1568,385 +632,28 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     };
   };
 
-  const completedAttemptReceiptsFor = (parentAttemptId: string): Array<{
-    attempt: ExecutionWorkAttempt;
-    receipt: StandardReceipt;
-  }> => completedAttemptReceiptsFrom(deps.store.listWorkAttempts(parentAttemptId));
+  // Owns the sealed prior-evidence envelope every lead/repair/final action
+  // carries, over the receipt selectors it shares with this runtime.
+  const { priorEvidenceForAction } = createPriorEvidenceAssembler({
+    latestAttemptReceipt,
+    repairRejectedCandidateAttemptReceipt,
+    actionInputSubjectFor,
+  });
 
-  const completedAttemptReceiptsFrom = (attempts: readonly ExecutionWorkAttempt[]): Array<{
-    attempt: ExecutionWorkAttempt;
-    receipt: StandardReceipt;
-  }> =>
-    attempts
-      .filter((attempt) => attempt.status === "completed" && attempt.receipt)
-      .map((attempt) => ({
-        attempt,
-        receipt: parseStandardReceipt(attempt.receipt!, { source: `child_action.${attempt.id}.receipt` }).value,
-      }));
-
-  const latestAttemptReceipt = <T extends StandardReceipt>(
-    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
-    type: T["type"],
-    unitId: string | null,
-    cycle?: number
-  ): { attempt: ExecutionWorkAttempt; receipt: T } => {
-    let latest: { attempt: ExecutionWorkAttempt; receipt: StandardReceipt } | undefined;
-    for (const entry of receipts) {
-      if (
-        entry.receipt.type === type &&
-        entry.receipt.fence.unit_id === (unitId ?? "__final__") &&
-        (cycle === undefined || entry.attempt.cycle === cycle)
-      ) {
-        latest = latest && compareAttemptOrder(latest.attempt, entry.attempt) > 0 ? latest : entry;
-      }
-    }
-    if (latest) return { attempt: latest.attempt, receipt: latest.receipt as T };
-    throw new Error(`missing ${type} receipt for ${unitId ?? "final"}`);
-  };
-
-  const repairRejectedCandidateAttemptReceipt = (
-    instance: PipelineInstance,
-    action: ExecutionWorkAttempt,
-    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[] =
-      completedAttemptReceiptsFor(action.parent_attempt_id)
-  ): { attempt: ExecutionWorkAttempt; receipt: CandidateEvidenceReceipt } => {
-    if (action.action_kind !== "repair") throw new Error(`child action ${action.id} is not a unit repair`);
-    if (action.unit_id === null) throw new Error(`child repair action ${action.id} has no unit id`);
-    const rejectedCycle = action.cycle - 1;
-    const candidates = receipts.filter((entry): entry is {
-      attempt: ExecutionWorkAttempt;
-      receipt: CandidateEvidenceReceipt;
-    } =>
-      entry.attempt.action_kind === "candidate" &&
-      entry.attempt.unit_id === action.unit_id &&
-      entry.attempt.cycle === rejectedCycle &&
-      entry.receipt.type === "candidate_evidence");
-    if (candidates.length !== 1) {
-      throw new Error(`child repair action ${action.id} requires exactly one rejected candidate evidence receipt for cycle ${rejectedCycle}`);
-    }
-    const candidate = candidates[0]!;
-    if (
-      candidate.receipt.assurance !== "executor_verified" ||
-      candidate.receipt.result !== "success" ||
-      !GIT_SUBJECT.test(candidate.receipt.subject.post)
-    ) {
-      throw new Error(`child repair action ${action.id} rejected candidate evidence is not executor verified`);
-    }
-    if (candidate.attempt.output_subject !== candidate.receipt.subject.post) {
-      throw new Error(`child repair action ${action.id} rejected candidate subject disagrees with its action output`);
-    }
-    const candidateProducer = expectedProducerForAction(instance, candidate.attempt);
-    assertCandidateEvidenceFence({
-      expected: {
-        pipelineInstanceId: instance.id,
-        graphDigest: instance.manifest_digest,
-        unitId: candidate.attempt.unit_id ?? "__final__",
-        attemptId: candidate.attempt.parent_attempt_id,
-        parentRunId: candidate.attempt.parent_run_id,
-        actionAttemptId: candidate.attempt.id,
-        generation: instance.generation,
-        nativeSessionId: candidate.receipt.fence.native_session_id,
-        requestHash: candidate.attempt.request_hash ?? "",
-        baseSubject: receiptBaseFor(instance, candidate.attempt),
-        preSubject: actionInputSubjectFor(instance, candidate.attempt),
-        subject: candidate.receipt.subject.post,
-        producers: {
-          completion: candidateProducer,
-          candidate: candidateProducer,
-          command: candidateProducer,
-          lead: candidateProducer,
-          integration: candidateProducer,
-          review: candidateProducer,
-        },
-      },
-      candidate: candidate.receipt,
-    });
-    return candidate;
-  };
-
-  const repairRejectedCandidateSubjectFor = (instance: PipelineInstance, action: ExecutionWorkAttempt): string =>
-    repairRejectedCandidateAttemptReceipt(instance, action).receipt.subject.post;
-
-  const assertPreparedUnitWorktreeRequestBound = (
-    request: Pick<LoopActionRequest | ChildExecutorActionRequest, "baseSubject" | "inputSubject" | "worktree">,
-    instance: PipelineInstance,
-    action: ExecutionWorkAttempt
-  ): void => {
-    if (action.unit_id === null) return;
-    if (
-      action.action_kind !== "repair" &&
-      action.action_kind !== "simplify" &&
-      action.action_kind !== "command" &&
-      action.action_kind !== "candidate" &&
-      action.action_kind !== "lead"
-    ) return;
-    const expectedBase = sha1SubjectForGitOperation(worktreeBaseFor(instance, action), "child action base subject");
-    const expectedInput = actionInputSubjectFor(instance, action);
-    const expectedWorktree = action.action_kind === "lead" ? null : worktreeHandleFor(action, expectedBase).id;
-    if (
-      request.baseSubject !== expectedBase ||
-      request.inputSubject !== expectedInput ||
-      (expectedWorktree === null ? request.worktree !== null : request.worktree?.id !== expectedWorktree)
-    ) {
-      throw new Error(`child action ${action.id} prepared request is not bound to the current unit worktree`);
-    }
-  };
-
-  const verifiedAggregateTreeSubject = (input: {
-    parentAttemptId: string;
-    integrationSubject: string;
-    attempts: readonly ExecutionWorkAttempt[];
-    gates: readonly ExecutionGateReceipt[];
-  }): string => {
-    const accepted = input.gates.filter((gate) =>
-      gate.gate_kind === "integration" &&
-      gate.outcome === "success" &&
-      gate.result === "passed" &&
-      gate.subject === input.integrationSubject
-    );
-    if (accepted.length === 0) {
-      throw new Error(`structured aggregate ${input.parentAttemptId} requires an accepted integration gate for the integrated commit`);
-    }
-    const trees = new Set<string>();
-    for (const gate of accepted) {
-      if (digestNormalized(gate.payload) !== gate.receipt_hash) {
-        throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration gate hash mismatch`);
-      }
-      const attempt = input.attempts.find((entry) => entry.id === gate.execution_work_attempt_id);
-      if (!attempt || attempt.action_kind !== "integrate" || attempt.status !== "completed" || !attempt.receipt) {
-        throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration receipt is missing`);
-      }
-      if (!attempt.receipt_hash || digestNormalized(attempt.receipt) !== attempt.receipt_hash) {
-        throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration receipt hash mismatch`);
-      }
-      const gateArtifactHashes = JSON.parse(gate.artifact_hashes) as unknown;
-      if (!Array.isArray(gateArtifactHashes) || !gateArtifactHashes.includes(attempt.receipt_hash)) {
-        throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration gate does not seal the receipt`);
-      }
-      if (attempt.output_subject !== input.integrationSubject) {
-        throw new Error(`structured aggregate ${input.parentAttemptId} integration action subject disagrees with graph subject`);
-      }
-      const receipt = parseStandardReceipt(attempt.receipt, { source: `child_action.${attempt.id}.receipt` }).value;
-      if (receipt.type !== "integration_evidence" || receipt.assurance !== "executor_verified") {
-        throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration receipt is not executor verified`);
-      }
-      if (
-        receipt.result !== "success" ||
-        receipt.subject.post !== input.integrationSubject ||
-        receipt.payload.clean !== true ||
-        !GIT_SUBJECT.test(receipt.payload.tree)
-      ) {
-        throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration receipt does not seal a clean tree`);
-      }
-      trees.add(receipt.payload.tree);
-    }
-    if (trees.size !== 1) {
-      throw new Error(`structured aggregate ${input.parentAttemptId} accepted integration receipts disagree on the tree subject`);
-    }
-    return [...trees][0]!;
-  };
-
-  const unitCompletionAttemptReceipt = (
-    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
-    unitId: string | null,
-    cycle: number
-  ): { attempt: ExecutionWorkAttempt; receipt: UnitCompletionReceipt } => {
-    for (let index = receipts.length - 1; index >= 0; index -= 1) {
-      const entry = receipts[index]!;
-      if (
-        entry.receipt.type === "unit_completion" &&
-        entry.receipt.fence.unit_id === (unitId ?? "__final__") &&
-        entry.attempt.cycle === cycle &&
-        (entry.attempt.action_kind === "implement" || entry.attempt.action_kind === "repair")
-      ) {
-        return { attempt: entry.attempt, receipt: entry.receipt as UnitCompletionReceipt };
-      }
-    }
-    throw new Error(`missing implement/repair unit_completion receipt for ${unitId ?? "final"}`);
-  };
-
-  // The lead decision that routed this unit back to `repair` (see
-  // routeUnitAcceptanceDecision / unit-store.ts): the store bumps
-  // current_cycle when it routes to repair, so the triggering lead ran one
-  // cycle earlier than the repair action it produced.
-  const triggeringLeadDecisionAttemptReceipt = (
-    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
-    unitId: string,
-    triggeringCycle: number
-  ): { attempt: ExecutionWorkAttempt; receipt: UnitDecisionReceipt } => {
-    for (let index = receipts.length - 1; index >= 0; index -= 1) {
-      const entry = receipts[index]!;
-      if (
-        entry.receipt.type === "unit_decision" &&
-        entry.attempt.action_kind === "lead" &&
-        entry.attempt.unit_id === unitId &&
-        entry.attempt.cycle === triggeringCycle
-      ) {
-        return { attempt: entry.attempt, receipt: entry.receipt as UnitDecisionReceipt };
-      }
-    }
-    throw new Error(`missing triggering lead unit_decision receipt for ${unitId} cycle ${triggeringCycle}`);
-  };
-
-  // The most recent final_repair action's own unit_completion receipt for
-  // this cycle, when a repair round ran between the prior final_review and
-  // this one -- prior evidence for anti-churn (Q3), not required.
-  const priorFinalRepairCompletionAttemptReceipt = (
-    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
-    cycle: number
-  ): { attempt: ExecutionWorkAttempt; receipt: UnitCompletionReceipt } | undefined => {
-    for (let index = receipts.length - 1; index >= 0; index -= 1) {
-      const entry = receipts[index]!;
-      if (
-        entry.receipt.type === "unit_completion" &&
-        entry.attempt.action_kind === "final_repair" &&
-        entry.attempt.cycle === cycle
-      ) {
-        return { attempt: entry.attempt, receipt: entry.receipt as UnitCompletionReceipt };
-      }
-    }
-    return undefined;
-  };
-
-  const commandAttemptReceipts = (
-    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[],
-    unitId: string | null,
-    cycle?: number
-  ): Array<{ attempt: ExecutionWorkAttempt; receipt: CommandResultReceipt }> =>
-    receipts
-      .filter((entry): entry is { attempt: ExecutionWorkAttempt; receipt: CommandResultReceipt } =>
-        entry.receipt.type === "command_result" &&
-        entry.receipt.fence.unit_id === (unitId ?? "__final__") &&
-        (cycle === undefined || entry.attempt.cycle === cycle));
-
-  const priorReceiptEntry = (
-    role: "completion" | "candidate" | "command" | "final_command" | "final_review" | "lead" | "final_repair",
-    entry: { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }
-  ): NonNullable<LoopActionRequest["priorEvidence"]>["receipts"][number] => {
-    const receipt = canonicalJson(entry.receipt);
-    return {
-      role,
-      actionAttemptId: entry.attempt.id,
-      receiptHash: digestNormalized(receipt),
-      receipt,
-    };
-  };
-
-  const assertPriorEvidenceEnvelopeBound = (
-    evidence: NonNullable<LoopActionRequest["priorEvidence"]>,
-    action: ExecutionWorkAttempt
-  ): void => {
-    if (evidence.receipts.length > MAX_PRIOR_EVIDENCE_RECEIPTS) {
-      throw new Error(`child action ${action.id} prior evidence has too many receipts`);
-    }
-    if (Buffer.byteLength(canonicalJson(evidence), "utf8") > MAX_PRIOR_EVIDENCE_BYTES) {
-      throw new Error(`child action ${action.id} prior evidence exceeds aggregate bound`);
-    }
-  };
-
-  const priorEvidenceForAction = (
-    instance: PipelineInstance,
-    action: ExecutionWorkAttempt,
-    receipts: readonly { attempt: ExecutionWorkAttempt; receipt: StandardReceipt }[]
-  ): LoopActionRequest["priorEvidence"] | undefined => {
-    if (action.action_kind === "lead") {
-      let completion: { attempt: ExecutionWorkAttempt; receipt: UnitCompletionReceipt };
-      let candidate: { attempt: ExecutionWorkAttempt; receipt: CandidateEvidenceReceipt };
-      try {
-        completion = unitCompletionAttemptReceipt(receipts, action.unit_id, action.cycle);
-        candidate = latestAttemptReceipt<CandidateEvidenceReceipt>(receipts, "candidate_evidence", action.unit_id, action.cycle);
-      } catch {
-        return undefined;
-      }
-      const commands = commandAttemptReceipts(receipts, action.unit_id, action.cycle);
-      const evidence = {
-        schema: "openthrottle.loop-prior-evidence/v1",
-        role: "lead",
-        receipts: [
-          priorReceiptEntry("completion", completion),
-          priorReceiptEntry("candidate", candidate),
-          ...commands.map((command) => priorReceiptEntry("command", command)),
-        ],
-      } satisfies NonNullable<LoopActionRequest["priorEvidence"]>;
-      assertPriorEvidenceEnvelopeBound(evidence, action);
-      return evidence;
-    }
-    if (action.action_kind === "repair") {
-      if (action.unit_id === null) throw new Error(`child repair action ${action.id} has no unit id`);
-      // The store bumps current_cycle in the same transaction that routes a
-      // lead's non-accept decision to repair (unit-store.ts insertGateReceipt),
-      // so the triggering lead ran at this repair's cycle minus one.
-      const lead = triggeringLeadDecisionAttemptReceipt(receipts, action.unit_id, action.cycle - 1);
-      if (lead.attempt.request_hash !== lead.receipt.fence.request_hash) {
-        throw new Error(`child repair action ${action.id} triggering lead fence is invalid`);
-      }
-      const commands = commandAttemptReceipts(receipts, action.unit_id, action.cycle - 1);
-      const candidate = repairRejectedCandidateAttemptReceipt(instance, action, receipts);
-      const evidence = {
-        schema: "openthrottle.loop-prior-evidence/v1",
-        role: "repair",
-        receipts: [
-          priorReceiptEntry("candidate", candidate),
-          priorReceiptEntry("lead", lead),
-          ...commands.map((command) => priorReceiptEntry("command", command)),
-        ],
-      } satisfies NonNullable<LoopActionRequest["priorEvidence"]>;
-      assertPriorEvidenceEnvelopeBound(evidence, action);
-      return evidence;
-    }
-    if (action.action_kind === "final_review") {
-      const commands = commandAttemptReceipts(receipts, null, action.cycle);
-      // Anti-churn (Q3): a re-review round can also see the previous round's
-      // findings and, when one ran, the intervening final_repair's own
-      // completion -- both settled at this review's cycle minus one, since
-      // the final-phase cycle only bumps after the repair/candidate/integrate
-      // sequence finishes and the next round's final_command begins.
-      const priorReview = action.cycle > 0
-        ? (() => {
-            try {
-              return latestAttemptReceipt<SemanticReviewReceipt>(receipts, "semantic_review", null, action.cycle - 1);
-            } catch {
-              return undefined;
-            }
-          })()
-        : undefined;
-      const priorRepair = priorReview ? priorFinalRepairCompletionAttemptReceipt(receipts, action.cycle - 1) : undefined;
-      const evidence = {
-        schema: "openthrottle.loop-prior-evidence/v1",
-        role: "final_review",
-        receipts: [
-          ...commands.map((command) => priorReceiptEntry("final_command", command)),
-          ...(priorReview ? [priorReceiptEntry("final_review", priorReview)] : []),
-          ...(priorRepair ? [priorReceiptEntry("final_repair", priorRepair)] : []),
-        ],
-      } satisfies NonNullable<LoopActionRequest["priorEvidence"]>;
-      assertPriorEvidenceEnvelopeBound(evidence, action);
-      return evidence;
-    }
-    if (action.action_kind === "final_repair") {
-      let review: { attempt: ExecutionWorkAttempt; receipt: SemanticReviewReceipt };
-      try {
-        review = latestAttemptReceipt<SemanticReviewReceipt>(receipts, "semantic_review", null, action.cycle);
-      } catch {
-        throw new Error(`child final repair action ${action.id} has no triggering final-review receipt`);
-      }
-      if (review.attempt.action_kind !== "final_review" || review.attempt.request_hash !== review.receipt.fence.request_hash) {
-        throw new Error(`child final repair action ${action.id} triggering final-review fence is invalid`);
-      }
-      const expectedSubject = actionInputSubjectFor(instance, review.attempt);
-      if (review.receipt.subject.post !== expectedSubject) {
-        throw new Error(`child final repair action ${action.id} triggering final-review subject is stale`);
-      }
-      const evidence = {
-        schema: "openthrottle.loop-prior-evidence/v1",
-        role: "final_repair",
-        receipts: [priorReceiptEntry("final_review", review)],
-      } satisfies NonNullable<LoopActionRequest["priorEvidence"]>;
-      assertPriorEvidenceEnvelopeBound(evidence, action);
-      return evidence;
-    }
-    return undefined;
-  };
+  // Owns every review subaction (selector, persona fanout, blocker validator)
+  // behind the same sealed store and runtime this runtime already holds.
+  const reviewOrchestrator: ReviewOrchestrator = createReviewOrchestrator({
+    store: deps.store,
+    runtime: deps.runtime,
+    now: deps.now,
+    ...(deps.captureCodexAuth ? { captureCodexAuth: deps.captureCodexAuth } : {}),
+    executionPlanFor: (action) => extractExecutionPlan(parentTaskContextFor(deps.store, action.parent_attempt_id)),
+    actionInputSubjectFor,
+    expectedProducersFor,
+    standardFenceFor,
+    commandAttemptReceiptsFor: (action) =>
+      commandAttemptReceipts(completedAttemptReceiptsFor(action.parent_attempt_id), null, action.cycle),
+  });
 
   const dispatchChildAction = async (
     resource: RuntimeResource,
@@ -2015,7 +722,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     if (action.request_payload && action.request_hash) {
       const replayRequest = JSON.parse(action.request_payload) as LoopActionRequest;
       if (action.action_kind === "final_review" && replayRequest.skill === "select-review-personas") {
-        await ensureReviewSubactionLaunched({
+        await reviewOrchestrator.ensureReviewSubactionLaunched({
           resource,
           action,
           request: replayRequest,
@@ -2123,37 +830,17 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     );
     if (action.action_kind === "final_review") {
       if (!executionPlan || !reviewSubject) throw new Error(`child final review ${action.id} has no sealed execution plan`);
-      const previousFanout = previousReviewFanoutSynthesis(action);
-      const authority = buildReviewSelectorAuthority({
-        subject: reviewSubject,
-        ...(previousFanout ? { requiredPersonaIds: previousFanout.persona_ids } : {}),
-      });
-      const selectorRequest = buildReviewSelectorRequest({
+      return reviewOrchestrator.dispatchFinalReviewSelector({
+        resource,
         instance,
         action,
         plan: executionPlan,
-        authority,
         inputSubject: reviewSubject,
-        baseSubject: instance.base_commit,
         agent: effectiveAgent,
         ...executionDefaults,
         timeoutMs: (workerBinding.loop.timeout_seconds ?? deps.taskTimeoutSeconds) * 1_000,
         ...(priorEvidence ? { priorEvidence } : {}),
       });
-      assertLoopRequestEnvelopeBound(selectorRequest);
-      deps.store.prepareActionDispatch?.({
-        actionId: action.id,
-        requestHash: selectorRequest.requestHash,
-        requestPayload: canonicalJson(selectorRequest),
-        nativeSessionId: null,
-      });
-      await ensureReviewSubactionLaunched({
-        resource,
-        action,
-        request: selectorRequest,
-        label: "review selector action",
-      });
-      return { requestHash: selectorRequest.requestHash, nativeSessionId: null };
     }
     const loopRequest = buildLoopActionRequest({
       protocol: "loop-action@3",
@@ -2229,276 +916,6 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     return { requestHash: loopRequest.requestHash, nativeSessionId: action.native_session_id ?? null };
   };
 
-  const collectOrchestratedFinalReview = async (
-    resource: RuntimeResource,
-    instance: PipelineInstance,
-    action: ExecutionWorkAttempt,
-    selectorRequest: LoopActionRequest
-  ): Promise<{
-    resultHash: string;
-    outputSubject: string;
-    receipt: string;
-    nativeSessionId: null;
-    decision: ReturnType<typeof evaluateFinalReviewGate>;
-  } | {
-    terminal: true;
-    resultHash: string;
-    outcome: "failure" | "needs_human" | "retryable_infrastructure_failure";
-    lastError: string;
-    nativeSessionId: null;
-  } | null> => {
-    const terminalFailure = (error: unknown, evidence: unknown = null) => ({
-      terminal: true as const,
-      resultHash: digestCanonicalJson({ action_id: action.id, evidence, error: error instanceof Error ? error.message : String(error) }),
-      outcome: "failure" as const,
-      lastError: `structured review orchestration failed: ${sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500)}`,
-      nativeSessionId: null,
-    });
-    try {
-      const parentTaskContext = parentTaskContextFor(deps.store, action.parent_attempt_id);
-      const executionPlan = extractExecutionPlan(parentTaskContext);
-      const reviewSubject = actionInputSubjectFor(instance, action);
-      if (selectorRequest.inputSubject !== reviewSubject || selectorRequest.baseSubject !== instance.base_commit) {
-        throw new Error("persisted review selector request is not bound to the current final subject");
-      }
-      const previousFanout = previousReviewFanoutSynthesis(action);
-      const authority = buildReviewSelectorAuthority({
-        subject: reviewSubject,
-        ...(previousFanout ? { requiredPersonaIds: previousFanout.persona_ids } : {}),
-      });
-      const selector = await collectReviewSubaction({
-        resource,
-        instance,
-        action,
-        request: selectorRequest,
-        workerId: "review-selector",
-        skill: "builtin://select-review-personas@1",
-        subject: reviewSubject,
-        baseSubject: instance.base_commit,
-      });
-      if ("pending" in selector) return null;
-      if ("terminal" in selector) return { ...selector, nativeSessionId: null };
-      if (selector.receipt.result !== "success" || selector.receipt.payload.findings.length > 0) {
-        throw new Error("review selector must return success with no review findings");
-      }
-      const selectorDispatch = deps.store.getReviewSubactionDispatch(action.id, selectorRequest.actionId);
-      if (!selectorDispatch?.dispatched_at || !selectorDispatch.dispatch_time_source) {
-        throw new Error("review selector has no persisted dispatch timing");
-      }
-      const recommendation = parseReviewSelectorRecommendation(selector.receipt.payload.summary, authority);
-      const fanoutPlan = buildReviewFanoutPlan({
-        subject: reviewSubject,
-        ...reviewFanoutSearchMapsFor(executionPlan),
-        commandNames: executionPlan.commands.map((command) => command.name),
-        recommendation,
-        selectorReceiptHash: digestNormalized(canonicalJson(selector.receipt)),
-        ...(previousFanout ? { requiredPersonaIds: previousFanout.persona_ids } : {}),
-      });
-      if (previousFanout) validateReviewFanoutRepair({ previous: previousFanout, nextPlan: fanoutPlan });
-      const fanoutRequests = buildReviewFanoutRequests({
-        instance,
-        action,
-        plan: executionPlan,
-        fanout: fanoutPlan,
-        inputSubject: reviewSubject,
-        baseSubject: instance.base_commit,
-        agent: selectorRequest.agent,
-        ...(selectorRequest.model === undefined ? {} : { model: selectorRequest.model }),
-        ...(selectorRequest.reasoningEffort === undefined ? {} : { reasoningEffort: selectorRequest.reasoningEffort }),
-        timeoutMs: selectorRequest.timeoutMs,
-      });
-      for (const request of fanoutRequests) assertLoopRequestEnvelopeBound(request);
-      // Review subactions share one sandbox. The sandbox seals every action by
-      // locking sibling action directories, so overlapping persona processes
-      // would lock one another's active engine homes. Run the deterministic
-      // roster one action at a time; for Codex this also preserves the rotating
-      // auth handoff before action N+1 materializes its credentials.
-      const precollectedFanout = await prepareReviewFanout({
-        resource,
-        action,
-        requests: fanoutRequests,
-      });
-      const fanout = await collectReviewFanout({
-        resource,
-        instance,
-        action,
-        plan: fanoutPlan,
-        requests: fanoutRequests,
-        baseSubject: instance.base_commit,
-        precollected: precollectedFanout,
-      });
-      if ("pending" in fanout) return null;
-      if ("terminal" in fanout) return { ...fanout, nativeSessionId: null };
-      const blocking = fanout.synthesis.findings.some((finding) => finding.severity === "P0" || finding.severity === "P1");
-      let validatorReceipt: SemanticReviewReceipt | null = null;
-      let validatorCompletedAt: string | null = null;
-      let validatorTiming: {
-        actionId: string;
-        dispatchedAt: string;
-        dispatchTimeSource: "acknowledged" | "prepared_fallback";
-        completedAt: string;
-      } | null = null;
-      if (blocking) {
-        const validatorRequest = buildReviewValidatorRequest({
-          instance,
-          action,
-          plan: executionPlan,
-          fanout: fanoutPlan,
-          synthesis: fanout.synthesis,
-          inputSubject: reviewSubject,
-          baseSubject: instance.base_commit,
-          agent: selectorRequest.agent,
-          ...(selectorRequest.model === undefined ? {} : { model: selectorRequest.model }),
-          ...(selectorRequest.reasoningEffort === undefined ? {} : { reasoningEffort: selectorRequest.reasoningEffort }),
-          timeoutMs: selectorRequest.timeoutMs,
-        });
-        assertLoopRequestEnvelopeBound(validatorRequest);
-        const precollectedValidator = await prepareReviewSubaction({
-          resource,
-          action,
-          request: validatorRequest,
-          label: "review validator action",
-        });
-        const validator = await collectReviewSubaction({
-          resource,
-          instance,
-          action,
-          request: validatorRequest,
-          workerId: "review-validator",
-          skill: "builtin://validate-review-findings@1",
-          subject: reviewSubject,
-          baseSubject: instance.base_commit,
-          ...(precollectedValidator.result ? { precollected: precollectedValidator.result } : {}),
-        });
-        if ("pending" in validator) return null;
-        if ("terminal" in validator) return { ...validator, nativeSessionId: null };
-        validatorReceipt = validator.receipt;
-        validatorCompletedAt = validator.completedAt;
-        const validatorDispatch = deps.store.getReviewSubactionDispatch(action.id, validatorRequest.actionId);
-        if (!validatorDispatch?.dispatched_at || !validatorDispatch.dispatch_time_source) {
-          throw new Error("review validator has no persisted dispatch timing");
-        }
-        validatorTiming = {
-          actionId: validatorRequest.actionId,
-          dispatchedAt: validatorDispatch.dispatched_at,
-          dispatchTimeSource: validatorDispatch.dispatch_time_source,
-          completedAt: validator.completedAt,
-        };
-      }
-      const validated = validateReviewFanoutBlockers({ synthesis: fanout.synthesis, validator: validatorReceipt });
-      const receipts = completedAttemptReceiptsFor(action.parent_attempt_id);
-      const graph = deps.store.getGraphForAttempt(action.parent_attempt_id);
-      const commands = commandAttemptReceipts(receipts, null, action.cycle);
-      const expectedBase = standardFenceFor(instance, action, reviewSubject);
-      const expected: StandardReceiptFence = {
-        ...expectedBase,
-        producers: {
-          ...expectedBase.producers,
-          review: builtinProducer("review-orchestrator", instance.capability_digest, "semantic_attested"),
-        },
-      };
-      const completedTimes = [selector.completedAt, ...fanout.receiptResults.map((entry) => entry.completedAt), validatorCompletedAt]
-        .filter((value): value is string => value !== null)
-        .sort();
-      const issuedAt = completedTimes.at(-1) ?? deps.now().toISOString();
-      const repairAuthoritativeSynthesis: ReviewFanoutSynthesis = {
-        ...validated.synthesis,
-        findings: validated.synthesis.findings.filter((finding) => finding.severity === "P0" || finding.severity === "P1"),
-      };
-      const reviewReceipt = synthesizeFinalReviewReceipt({
-        expected,
-        synthesis: repairAuthoritativeSynthesis,
-        commandHashes: commands.map((command) => digestNormalized(canonicalJson(command.receipt))),
-        issuedAt,
-      });
-      const priorJournal = previousReviewJournal(instance, action);
-      if (priorJournal.auditError) {
-        deps.store.recordJournalEntry({
-          issueId: instance.ticket_id,
-          instanceId: instance.id,
-          runId: action.parent_run_id,
-          actor: "supervisor",
-          kind: "run_note",
-          trigger: "structured_review_journal_gap",
-          action: priorJournal.auditError,
-          outcome: "failure",
-          refs: {
-            pipeline_instance_id: instance.id,
-            action_attempt_id: action.id,
-            cycle: action.cycle,
-            subject: reviewSubject,
-          },
-        });
-      }
-      const journal = buildReviewJournal({
-        plan: fanoutPlan,
-        baseSubject: instance.base_commit,
-        receipts: fanout.receiptResults,
-        selectorTiming: {
-          actionId: selectorRequest.actionId,
-          dispatchedAt: selectorDispatch.dispatched_at,
-          dispatchTimeSource: selectorDispatch.dispatch_time_source,
-          completedAt: selector.completedAt,
-        },
-        validatorTiming,
-        validation: validated,
-        cycle: action.cycle,
-        actionCreatedAt: action.created_at,
-        recordedAt: issuedAt,
-        ...(priorJournal.journal ? { previousJournal: priorJournal.journal } : {}),
-      });
-      deps.store.recordJournalEntry({
-        issueId: instance.ticket_id,
-        instanceId: instance.id,
-        runId: action.parent_run_id,
-        actor: "supervisor",
-        kind: "run_note",
-        trigger: "structured_review_fanout",
-        action: `Persisted sealed review selection, persona evidence, blocker validation, and cycle ${action.cycle} resolution state.`,
-        outcome: validated.synthesis.outcome,
-        refs: {
-          pipeline_instance_id: instance.id,
-          generation: instance.generation,
-          parent_attempt_id: action.parent_attempt_id,
-          action_attempt_id: action.id,
-          subject: reviewSubject,
-          selector_receipt_hash: fanoutPlan.selector_receipt_hash,
-          validator_receipt_hash: validated.validator_receipt_hash,
-        },
-        structured: { ...journal },
-      });
-      const decision = evaluateFinalReviewGate({
-        expected,
-        expectedReceipts: {
-          commands: commands.map((command) => standardFenceFor(instance, command.attempt, command.receipt.subject.post)),
-          review: expected,
-        },
-        commands: commands.map((command) => command.receipt),
-        expectedCommandNames: graph ? JSON.parse(graph.command_names) as string[] : [],
-        review: reviewReceipt,
-        reviewFanout: validated.synthesis,
-      });
-      return {
-        resultHash: digestCanonicalJson({
-          selector: selector.receipt,
-          fanout: fanout.synthesis,
-          validation: validated,
-          journal,
-        }),
-        outputSubject: reviewSubject,
-        receipt: canonicalJson(reviewReceipt),
-        nativeSessionId: null,
-        decision,
-      };
-    } catch (error) {
-      // Provider dispatch/collection failures are not semantic review
-      // decisions. Leave the fenced parent action active so the next drain
-      // can replay the same deterministic subaction ids idempotently.
-      if (error instanceof RetryableReviewRuntimeError) throw error;
-      return terminalFailure(error);
-    }
-  };
-
   const collectChildAction = async (
     resource: RuntimeResource,
     instance: PipelineInstance,
@@ -2537,7 +954,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           nativeSessionId: null,
         };
       }
-      return collectOrchestratedFinalReview(resource, instance, action, request);
+      return reviewOrchestrator.collectOrchestratedFinalReview(resource, instance, action, request);
     }
     let result: Awaited<ReturnType<SandboxRuntime["collectChildExecutorActionResult"]>> |
       Awaited<ReturnType<SandboxRuntime["collectLoopActionResult"]>>;
