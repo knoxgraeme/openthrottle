@@ -9,8 +9,7 @@ daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .
 ```
 
 It contains Node 22, git/curl/jq/yq/ripgrep/GitHub CLI, Claude Code, Codex,
-OpenCode, a pinned native Compound Engineering installation, and an
-unprivileged `agent` user. Its image entrypoint is inert; the supervisor uploads
+OpenCode, and an unprivileged `agent` user. Its image entrypoint is inert; the supervisor uploads
 sealed stage inputs and explicitly launches `/opt/openthrottle/entrypoint.sh`.
 
 ## Fenced stage lifecycle
@@ -64,9 +63,7 @@ events are bound to the current run before they enter the Linear outbox.
 
 ## Agent configuration
 
-Claude and Codex receive the same native Compound Engineering release through
-their standard plugin installations; Codex also receives OpenThrottle standing
-instructions outside the checkout. OpenCode receives a root-owned runtime
+Codex receives OpenThrottle standing instructions outside the checkout. OpenCode receives a root-owned runtime
 config outside the repository, with repository and compatibility config loading
 disabled. Only validated `.openthrottle.yml` MCP declarations and the
 allowlisted Kimi profile enter its config.
@@ -97,7 +94,7 @@ docker build -f sandbox/Dockerfile -t openthrottle:test .
 sandbox/tests/smoke.sh openthrottle:test
 ```
 
-The Docker smoke verifies pinned agent CLIs and native CE discovery, then runs
+The Docker smoke verifies pinned agent CLIs and skill delivery, then runs
 sealed agent stages for Claude, Codex, and OpenCode plus a command stage against
 a local bare repository. It checks stage-result assurance, branch fencing,
 environment-tamper resistance, and absence of old completion events.

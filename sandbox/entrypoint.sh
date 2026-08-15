@@ -48,8 +48,9 @@ terminate_agent_processes() {
 }
 
 # Preserve native session/auth data, but discard every executable user-level
-# config surface. Claude loads CE from the root-owned marketplace; Codex loads
-# CE from /etc/codex/skills. Per-stage hooks/config are rebuilt later below.
+# config surface. Claude gets the OpenThrottle skills recopied per stage;
+# Codex loads them from root-owned /etc/codex/skills. Per-stage hooks/config
+# are rebuilt later below.
 # ~/.claude/backups is part of that surface: the CLI's corruption recovery
 # moves ~/.claude.json there, and heal_claude_config (lib/runtime.sh) restores
 # the newest backup when the config is missing — exactly the state this reset

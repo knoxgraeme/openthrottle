@@ -22,7 +22,7 @@ describe("OpenCode config builder", () => {
       mcpServers: {},
     });
 
-    expect(config.plugin).toEqual(["/opt/openthrottle/compound-engineering-marketplace"]);
+    expect(config.plugin).toBeUndefined();
     expect(config.provider["kimi-code"]).toMatchObject({
       npm: "@ai-sdk/openai-compatible",
       options: {

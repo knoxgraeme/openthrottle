@@ -650,7 +650,6 @@ export function defaultRunAgent({
         ...(reasoningEffort ? ["--effort", reasoningEffort] : []),
         "--dangerously-skip-permissions",
         ...(mcpConfig ? ["--mcp-config", mcpConfig, "--strict-mcp-config"] : []),
-        "--plugin-dir", "/opt/openthrottle/compound-engineering-marketplace",
         "--setting-sources", "user",
       ];
       command = "claude";

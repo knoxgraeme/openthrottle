@@ -71,70 +71,8 @@ RUN npm install -g \
 # .git/config etc.
 # ---------------------------------------------------------------------------
 RUN useradd --create-home --home-dir /home/agent --shell /bin/bash --user-group agent \
-    && mkdir -p /home/agent/.ot /home/agent/.codex \
+    && mkdir -p /home/agent/.ot /home/agent/.claude /home/agent/.codex \
     && chown -R agent:agent /home/agent
-
-# Native Compound Engineering plugin installation for both agent CLIs. Keep a
-# single, exact marketplace checkout in the image and install it into both of
-# the sandbox user's normal agent profiles. Updating CE is therefore one
-# deliberate ref/version bump, and every target repository sees the same
-# skill set from its first agent invocation.
-ARG COMPOUND_ENGINEERING_REF=8163a96e86656a89797869ac61905fe4641f81be
-ARG COMPOUND_ENGINEERING_VERSION=3.19.0
-RUN set -eux; \
-    ce_marketplace="/opt/openthrottle/compound-engineering-marketplace"; \
-    install -d -m 0755 "$ce_marketplace"; \
-    git -C "$ce_marketplace" init -q; \
-    git -C "$ce_marketplace" remote add origin https://github.com/EveryInc/compound-engineering-plugin.git; \
-    git -C "$ce_marketplace" fetch -q --depth=1 origin "$COMPOUND_ENGINEERING_REF"; \
-    git -C "$ce_marketplace" checkout -q --detach FETCH_HEAD; \
-    test "$(git -C "$ce_marketplace" rev-parse HEAD)" = "$COMPOUND_ENGINEERING_REF"; \
-    gosu agent env HOME=/home/agent \
-      claude plugin marketplace add "$ce_marketplace" --scope user; \
-    gosu agent env HOME=/home/agent \
-      claude plugin install compound-engineering@compound-engineering-plugin --scope user; \
-    test "$(gosu agent env HOME=/home/agent claude plugin list --json \
-      | jq -r '.[] | select(.id == "compound-engineering@compound-engineering-plugin" and .enabled == true) | .version')" \
-      = "$COMPOUND_ENGINEERING_VERSION"; \
-    codex_marketplace="$ce_marketplace/.agents/plugins/marketplace.json"; \
-    jq --arg sha "$COMPOUND_ENGINEERING_REF" \
-      '(.plugins[] | select(.name == "compound-engineering").source.sha) = $sha' \
-      "$codex_marketplace" > "$codex_marketplace.tmp"; \
-    mv "$codex_marketplace.tmp" "$codex_marketplace"; \
-    test "$(jq -r '.plugins[] | select(.name == "compound-engineering").source.sha' "$codex_marketplace")" \
-      = "$COMPOUND_ENGINEERING_REF"; \
-    gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex \
-      codex plugin marketplace add "$ce_marketplace" --json; \
-    gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex \
-      codex plugin add compound-engineering@compound-engineering-plugin --json; \
-    test "$(gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex \
-      codex plugin list --json | jq -r '.installed[] | select(.pluginId == "compound-engineering@compound-engineering-plugin") | .version')" \
-      = "$COMPOUND_ENGINEERING_VERSION"
-
-# The Claude CLI's config-corruption recovery can move /home/agent/.claude.json
-# into /home/agent/.claude/backups/.claude.json.backup.<ms> WITHOUT recreating
-# it during the plugin bake above. A bake that flakes this way ships a snapshot
-# where every `claude` launch fails at startup ("Claude configuration file not
-# found ... A backup file exists at: ..."), which killed OPE-83 generation 3
-# (OPE-87). Heal from the newest backup if the config is missing, then
-# hard-assert a parseable config so a broken bake fails this build loudly
-# instead of shipping. Finally clear the backup debris: entrypoint.sh removes
-# ~/.claude.json at every stage boundary, and the CLI only regenerates a fresh
-# config when no backups are present, so a baked-in backup file poisons every
-# runtime launch even when the config itself survived the bake.
-RUN set -eux; \
-    claude_config="/home/agent/.claude.json"; \
-    claude_backups="/home/agent/.claude/backups"; \
-    if [ ! -f "$claude_config" ]; then \
-      newest_backup="$(ls -1 "$claude_backups/.claude.json.backup."* 2>/dev/null | sort | tail -n 1)"; \
-      if [ -n "$newest_backup" ]; then \
-        cp "$newest_backup" "$claude_config"; \
-        chown agent:agent "$claude_config"; \
-      fi; \
-    fi; \
-    test -f "$claude_config"; \
-    jq empty "$claude_config"; \
-    rm -f "$claude_backups/.claude.json.backup."*
 
 # ---------------------------------------------------------------------------
 # OpenThrottle payload. Build context is the repo root:
@@ -156,24 +94,19 @@ COPY skills /opt/openthrottle/skills
 RUN set -eux; \
     baseline="/opt/openthrottle/action-home-baseline"; \
     install -d -m 0755 "$baseline/claude/skills" "$baseline/codex"; \
-    cp -r /opt/openthrottle/compound-engineering-marketplace/skills/. "$baseline/claude/skills/"; \
     cp -r /opt/openthrottle/skills/tasks/. "$baseline/claude/skills/"; \
-    for file in config.toml AGENTS.md installation_id models_cache.json; do \
-      if [ -f "/home/agent/.codex/$file" ]; then cp "/home/agent/.codex/$file" "$baseline/codex/$file"; fi; \
-    done; \
     chown -R root:root "$baseline"; \
     chmod -R a-w "$baseline"
 
 # The canonical task skills (skills/tasks/<name>/SKILL.md, agents/openai.yaml)
-# are the single source of truth. Claude loads CE from the root-owned pinned
-# marketplace and gets only the OpenThrottle adapters copied into its runtime
-# profile. Codex gets both the pinned CE skills and the adapters baked at admin
-# scope (/etc/codex/skills), so mutable user plugin state is never executable
-# across stage credentials. Each adapter's agents/openai.yaml sets
-# policy.allow_implicit_invocation: false so a skill only runs when the
-# entrypoint's prompt names it explicitly via `$<skill-name>`.
+# are the single source of truth. Claude gets the OpenThrottle adapters copied
+# into its runtime profile from the root-owned baseline. Codex gets the same
+# adapters baked at admin scope (/etc/codex/skills), so mutable user plugin
+# state is never executable across stage credentials. Each adapter's
+# agents/openai.yaml sets policy.allow_implicit_invocation: false so a skill
+# only runs when the entrypoint's prompt names it explicitly via
+# `$<skill-name>`.
 RUN mkdir -p /etc/codex/skills \
-    && cp -r /opt/openthrottle/compound-engineering-marketplace/skills/. /etc/codex/skills/ \
     && cp -r /opt/openthrottle/skills/tasks/. /etc/codex/skills/ \
     && chown -R root:root /etc/codex/skills \
     && chmod -R a-w /etc/codex/skills

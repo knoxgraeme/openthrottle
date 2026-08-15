@@ -468,7 +468,7 @@ describe("one-stage executor", () => {
     mkdirSync(join(skillRoot, "implement-plan"), { recursive: true });
     writeFileSync(
       join(skillRoot, "implement-plan", "SKILL.md"),
-      "---\nname: implement-plan\n---\nUse $ce-work mode:return-to-caller for this fenced stage.\n"
+      "---\nname: implement-plan\n---\nRestate the sealed plan slice for this fenced stage.\n"
     );
     const prompt = stagePrompt(
       { ...fixture().request, capability: "ce/implement@1" },
@@ -479,7 +479,7 @@ describe("one-stage executor", () => {
       }
     );
     expect(prompt).toContain("$implement-plan");
-    expect(prompt).toContain("Use $ce-work mode:return-to-caller");
+    expect(prompt).toContain("Restate the sealed plan slice");
     expect(prompt).not.toContain("name: implement-plan");
   });
 

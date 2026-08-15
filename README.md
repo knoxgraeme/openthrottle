@@ -111,9 +111,8 @@ delegated (the `created` agent event), so apply the label before assigning.
 - `supervisor/` — Hono/SQLite control plane deployed on Fly.
 - `sandbox/` — Daytona image, safety boundary, entrypoint, tests.
 - `skills/` — self-contained OpenThrottle task adapters for Claude Code,
-  Codex, and OpenCode. Each skill carries its own craft; the pinned Compound
-  Engineering plugin remains only as a legacy ambient image input that no
-  skill depends on.
+  Codex, and OpenCode. Each skill carries its own craft; the sandbox image no
+  longer ships the Compound Engineering plugin.
 - `cli/` — the `openthrottle` command-line package.
 - `docs/` — architecture and execution plan.
 
