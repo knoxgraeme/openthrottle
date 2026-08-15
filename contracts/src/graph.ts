@@ -15,9 +15,9 @@ import {
 } from "./validation.js";
 import type { RepositoryConfigContract } from "./config.js";
 
-export const GRAPH_SCHEMA = "openthrottle.graph/v1" as const;
-export const SESSION_SCOPES = ["graph", "attempt", "fresh"] as const;
-export const INPUT_SCOPES = ["graph", "unit", "diff", "command", "review"] as const;
+const GRAPH_SCHEMA = "openthrottle.graph/v1" as const;
+const SESSION_SCOPES = ["graph", "attempt", "fresh"] as const;
+const INPUT_SCOPES = ["graph", "unit", "diff", "command", "review"] as const;
 export const RECEIPT_TYPES = [
   "unit_completion",
   "unit_decision",
@@ -29,12 +29,12 @@ export const RECEIPT_TYPES = [
   "provider_evidence",
   "human_approval",
 ] as const;
-export const WORKER_ENGINES = ["agent", "command", "provider", "human"] as const;
-export const NODE_KINDS = ["run", "for_each_unit", "command", "publish", "wait_for_provider", "human"] as const;
+const WORKER_ENGINES = ["agent", "command", "provider", "human"] as const;
+const NODE_KINDS = ["run", "for_each_unit", "command", "publish", "wait_for_provider", "human"] as const;
 const LOOP_BACKED_NODE_KINDS = new Set<NodeKind>(["run"]);
 export const UNIT_PHASE_IDS = ["implement", "simplify", "command", "candidate", "lead", "integrate"] as const;
-export const UNIT_PHASE_KINDS = ["agent", "command", "evidence", "integrate", "gate"] as const;
-export const GRAPH_OUTCOMES = [
+const UNIT_PHASE_KINDS = ["agent", "command", "evidence", "integrate", "gate"] as const;
+const GRAPH_OUTCOMES = [
   "success",
   "no_change",
   "repair_required",
@@ -43,17 +43,17 @@ export const GRAPH_OUTCOMES = [
   "failure",
 ] as const;
 export const LOGICAL_CREDENTIALS = ["model.invoke", "provider.read", "repo.read", "repo.write", "mcp"] as const;
-export const AGENT_INHERITANCE = ["inherit", "claude", "codex", "opencode"] as const;
+const AGENT_INHERITANCE = ["inherit", "claude", "codex", "opencode"] as const;
 const MODEL_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
 
 export type SessionScope = (typeof SESSION_SCOPES)[number];
 export type InputScope = (typeof INPUT_SCOPES)[number];
 export type ReceiptType = (typeof RECEIPT_TYPES)[number];
 export type WorkerEngine = (typeof WORKER_ENGINES)[number];
-export type AgentInheritance = (typeof AGENT_INHERITANCE)[number];
+type AgentInheritance = (typeof AGENT_INHERITANCE)[number];
 export type NodeKind = (typeof NODE_KINDS)[number];
 export type GraphUnitPhaseId = (typeof UNIT_PHASE_IDS)[number];
-export type GraphUnitPhaseKind = (typeof UNIT_PHASE_KINDS)[number];
+type GraphUnitPhaseKind = (typeof UNIT_PHASE_KINDS)[number];
 export type GraphOutcome = (typeof GRAPH_OUTCOMES)[number];
 export type LogicalCredential = (typeof LOGICAL_CREDENTIALS)[number];
 
@@ -68,7 +68,7 @@ export interface GraphWorker {
   credentials: LogicalCredential[];
 }
 
-export interface GraphLoop {
+interface GraphLoop {
   id: string;
   worker: string;
   skill: string;

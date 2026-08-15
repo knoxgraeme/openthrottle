@@ -33,17 +33,17 @@ import {
 export const TUNE_TASK_SCHEMA = "openthrottle.tune-task/v1" as const;
 export const TUNE_SEALED_INTENT_SCHEMA = "openthrottle.tune-sealed-intent/v1" as const;
 export const TUNE_ANALYSIS_INPUT_SCHEMA = "openthrottle.tune-analysis-input/v1" as const;
-export const TUNE_ANALYSIS_SCHEMA = "openthrottle.tune-analysis/v1" as const;
-export const TUNE_PROPOSAL_SCHEMA = "openthrottle.tune-proposal/v1" as const;
+const TUNE_ANALYSIS_SCHEMA = "openthrottle.tune-analysis/v1" as const;
+const TUNE_PROPOSAL_SCHEMA = "openthrottle.tune-proposal/v1" as const;
 export const TUNE_DECISION_SCHEMA = "openthrottle.tune-decision/v1" as const;
 export const TUNE_EDIT_AUTHORIZATION_SCHEMA = "openthrottle.tune-edit-authorization/v1" as const;
 export const TUNE_RELEASE_DESCRIPTOR_SCHEMA = "openthrottle.tune-release-descriptor/v1" as const;
 
-export const TUNE_TARGET_KINDS = ["contract", "graph", "pipeline", "runtime", "skill"] as const;
-export const TUNE_SCOPES = ["repository", "pipeline", "runtime"] as const;
-export const TUNE_PROPOSAL_OUTCOMES = ["propose", "no_change", "needs_human"] as const;
-export const TUNE_DECISION_OUTCOMES = ["accept", "reject", "needs_human"] as const;
-export const TUNE_CORPUS_OUTCOMES = ANALYSIS_QUERY_OUTCOMES;
+const TUNE_TARGET_KINDS = ["contract", "graph", "pipeline", "runtime", "skill"] as const;
+const TUNE_SCOPES = ["repository", "pipeline", "runtime"] as const;
+const TUNE_PROPOSAL_OUTCOMES = ["propose", "no_change", "needs_human"] as const;
+const TUNE_DECISION_OUTCOMES = ["accept", "reject", "needs_human"] as const;
+const TUNE_CORPUS_OUTCOMES = ANALYSIS_QUERY_OUTCOMES;
 
 const PATH_PATTERN = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
 const TARGET_FIELDS = ["kind", "id", "path", "digest"] as const;
@@ -78,14 +78,14 @@ const RELEASE_DESCRIPTOR_FIELDS = [
   "schema", "id", "runtime_release", "capability_digest", "contract_digests", "issued_at",
 ] as const;
 
-export interface TuneTarget {
+interface TuneTarget {
   kind: (typeof TUNE_TARGET_KINDS)[number];
   id: string;
   path?: string;
   digest: string;
 }
 
-export interface TuneQuery {
+interface TuneQuery {
   outcome?: (typeof TUNE_CORPUS_OUTCOMES)[number];
   reason?: (typeof ANALYSIS_QUERY_REASONS)[number];
   graph?: string;
@@ -93,27 +93,27 @@ export interface TuneQuery {
   limit: number;
 }
 
-export interface TuneWindow {
+interface TuneWindow {
   from: string;
   to: string;
   limit: number;
 }
 
-export interface TuneBaseline {
+interface TuneBaseline {
   base_ref: string;
   base_digest: string;
   runtime_release: string;
   capability_digest: string;
 }
 
-export interface TunePolicy {
+interface TunePolicy {
   allow_edit_paths: string[];
   requires_citation_gate: boolean;
   requires_ratchet: boolean;
   max_changed_files: number;
 }
 
-export interface TuneTask {
+interface TuneTask {
   schema: typeof TUNE_TASK_SCHEMA;
   id: string;
   target: TuneTarget;
@@ -124,7 +124,7 @@ export interface TuneTask {
   policy: TunePolicy;
 }
 
-export interface TuneSealedIntent {
+interface TuneSealedIntent {
   schema: typeof TUNE_SEALED_INTENT_SCHEMA;
   id: string;
   task: TuneTask;
@@ -149,7 +149,7 @@ export interface TuneCorpusRow extends TuneCorpusRowContent {
   row_digest: string;
 }
 
-export interface TuneAnalysisInput {
+interface TuneAnalysisInput {
   schema: typeof TUNE_ANALYSIS_INPUT_SCHEMA;
   id: string;
   intent: TuneSealedIntent;
@@ -196,7 +196,7 @@ export interface TuneProposal {
   ratchet_input: RatchetDifferentialInput;
 }
 
-export interface TuneDecision {
+interface TuneDecision {
   schema: typeof TUNE_DECISION_SCHEMA;
   id: string;
   proposal_digest: string;
@@ -206,7 +206,7 @@ export interface TuneDecision {
   rationale: string;
 }
 
-export interface TuneEditAuthorization {
+interface TuneEditAuthorization {
   schema: typeof TUNE_EDIT_AUTHORIZATION_SCHEMA;
   id: string;
   proposal_digest: string;
@@ -217,7 +217,7 @@ export interface TuneEditAuthorization {
   actor_id: string;
 }
 
-export interface TuneReleaseDescriptor {
+interface TuneReleaseDescriptor {
   schema: typeof TUNE_RELEASE_DESCRIPTOR_SCHEMA;
   id: string;
   runtime_release: string;
@@ -226,14 +226,14 @@ export interface TuneReleaseDescriptor {
   issued_at: string;
 }
 
-export interface TuneDecisionValidationOptions {
+interface TuneDecisionValidationOptions {
   source?: string;
   proposal?: unknown;
   citationDecisionDigest?: string;
   ratchetDecision?: unknown;
 }
 
-export interface TuneEditAuthorizationValidationOptions {
+interface TuneEditAuthorizationValidationOptions {
   source?: string;
   proposal?: unknown;
   decision?: unknown;

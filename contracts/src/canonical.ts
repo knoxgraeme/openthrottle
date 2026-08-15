@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-export function canonicalValue(value: unknown): unknown {
+function canonicalValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalValue);
   if (value && typeof value === "object") {
     return Object.fromEntries(

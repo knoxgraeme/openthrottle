@@ -15,9 +15,9 @@ import {
 
 export const LOOP_RECEIPT_RECOVERY_SCHEMA = "openthrottle.loop-receipt-recovery/v1" as const;
 export const EXECUTION_WORK_PRIVATE_ARTIFACT_SCHEMA = "openthrottle.execution-work-private-artifact/v1" as const;
-export const MAX_INLINE_RECOVERY_DIFF_BYTES = 48 * 1024;
+const MAX_INLINE_RECOVERY_DIFF_BYTES = 48 * 1024;
 export const MAX_PRIVATE_RECOVERY_DIFF_BYTES = 8 * 1024 * 1024;
-export const MAX_RECOVERY_CHANGED_PATHS = 256;
+const MAX_RECOVERY_CHANGED_PATHS = 256;
 export const MAX_RECOVERY_CHANGED_PATHS_CANONICAL_BYTES = 16 * 1024;
 
 interface LoopReceiptRecoveryBase {
@@ -28,26 +28,26 @@ interface LoopReceiptRecoveryBase {
   subject: string | null;
 }
 
-export interface LoopReceiptRecoveryPreserved extends LoopReceiptRecoveryBase {
+interface LoopReceiptRecoveryPreserved extends LoopReceiptRecoveryBase {
   recovery_subject: string | null;
   requires_workspace_preservation: true;
   error: string;
 }
 
-export interface LoopReceiptRecoveryPayloadDescriptor {
+interface LoopReceiptRecoveryPayloadDescriptor {
   file: "recovery.patch.gz";
   bytes: number;
   sha256: string;
 }
 
-export interface ExecutionWorkPrivatePayloadDescriptor {
+interface ExecutionWorkPrivatePayloadDescriptor {
   schema: typeof EXECUTION_WORK_PRIVATE_ARTIFACT_SCHEMA;
   encoding: "gzip+git-diff";
   bytes: number;
   sha256: string;
 }
 
-export interface LoopReceiptRecoveryPortable extends LoopReceiptRecoveryBase {
+interface LoopReceiptRecoveryPortable extends LoopReceiptRecoveryBase {
   base_commit: string;
   candidate_commit: string | null;
   candidate_tree: string;
@@ -65,7 +65,7 @@ export interface LoopReceiptRecoveryPortable extends LoopReceiptRecoveryBase {
   source_manifest_sha256?: string;
 }
 
-export type LoopReceiptRecoveryContract = LoopReceiptRecoveryPreserved | LoopReceiptRecoveryPortable;
+type LoopReceiptRecoveryContract = LoopReceiptRecoveryPreserved | LoopReceiptRecoveryPortable;
 
 const BASE_FIELDS = ["schema", "action_id", "attempt_id", "request_hash", "subject"] as const;
 const PRESERVED_FIELDS = [...BASE_FIELDS, "recovery_subject", "requires_workspace_preservation", "error"] as const;

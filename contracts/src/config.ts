@@ -14,10 +14,10 @@ import {
   type ValidatedContract,
 } from "./validation.js";
 
-export const CONFIG_SCHEMA = "openthrottle.config/v1" as const;
-export const GRAPH_SOURCE_KINDS = ["builtin", "repository"] as const;
-export const CONFIG_AGENTS = ["claude", "codex", "opencode"] as const;
-export const REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+const CONFIG_SCHEMA = "openthrottle.config/v1" as const;
+const GRAPH_SOURCE_KINDS = ["builtin", "repository"] as const;
+const CONFIG_AGENTS = ["claude", "codex", "opencode"] as const;
+const REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export const DEFAULT_CONFIG_LIMITS = Object.freeze({
   max_turns: 200,
   task_timeout: 7_200,
@@ -29,7 +29,7 @@ export interface ConfigGraphSource {
   ref: string;
 }
 
-export interface ConfigLimits {
+interface ConfigLimits {
   max_turns?: number;
   task_timeout?: number;
 }

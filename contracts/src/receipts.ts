@@ -29,15 +29,15 @@ export const RECEIPT_SCHEMA = "openthrottle.receipt/v1" as const;
 // envelope, so each stream gets a deliberately small byte (not character)
 // budget.
 export const COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES = 512;
-export const ASSURANCE_CLASSES = [
+const ASSURANCE_CLASSES = [
   "semantic_attested",
   "semantic_corroborated",
   "executor_verified",
   "provider_verified",
   "human_approved",
 ] as const;
-export const TUNE_RECEIPT_TYPES = ["tune_analysis", "tune_proposal"] as const;
-export const STANDARD_RECEIPT_TYPES = [...RECEIPT_TYPES, ...TUNE_RECEIPT_TYPES] as const;
+const TUNE_RECEIPT_TYPES = ["tune_analysis", "tune_proposal"] as const;
+const STANDARD_RECEIPT_TYPES = [...RECEIPT_TYPES, ...TUNE_RECEIPT_TYPES] as const;
 export type StandardReceiptType = (typeof STANDARD_RECEIPT_TYPES)[number];
 export const RECEIPT_RESULTS_BY_TYPE = {
   unit_completion: ["success", "failure", "needs_human", "exited"],
@@ -53,7 +53,7 @@ export const RECEIPT_RESULTS_BY_TYPE = {
   tune_proposal: ["success", "no_change", "failure", "needs_human"],
 } as const satisfies Record<StandardReceiptType, readonly string[]>;
 
-export interface ReceiptProducer {
+interface ReceiptProducer {
   worker_id: string;
   skill: string;
   capability_digest: string;
@@ -64,7 +64,7 @@ export interface ReceiptProducer {
   skill_package_digest: string | null;
 }
 
-export interface ReceiptFence {
+interface ReceiptFence {
   pipeline_instance_id: string;
   graph_digest: string;
   unit_id: string;
@@ -78,7 +78,7 @@ export interface ReceiptFence {
 
 export type ReceiptAssurance = (typeof ASSURANCE_CLASSES)[number];
 
-export interface UnitCompletionPayload {
+interface UnitCompletionPayload {
   summary: string;
   assumptions: string[];
   decisions: string[];
@@ -88,19 +88,19 @@ export interface UnitCompletionPayload {
   requested_human_input: string[];
 }
 
-export interface UnitDecisionPayload {
+interface UnitDecisionPayload {
   rationale: string;
   revision_request?: string;
   context_updates: ContextRecord[];
   accepted_subject?: string;
 }
 
-export interface SemanticReviewPayload {
+interface SemanticReviewPayload {
   summary: string;
   findings: ReviewFinding[];
 }
 
-export interface CommandResultPayload {
+interface CommandResultPayload {
   command: string;
   exit_code: number;
   summary: string;
@@ -110,36 +110,36 @@ export interface CommandResultPayload {
   stderr_tail?: string;
 }
 
-export interface SubjectEvidencePayload {
+interface SubjectEvidencePayload {
   tree: string;
   diff_digest: string;
   changed_paths: string[];
   clean: boolean;
 }
 
-export interface PublishSubjectPayload {
+interface PublishSubjectPayload {
   commit: string;
   tree: string;
   pr_url: string;
 }
 
-export interface ProviderEvidencePayload {
+interface ProviderEvidencePayload {
   review_url?: string;
   check_run_url?: string;
   summary: string;
 }
 
-export interface HumanApprovalPayload {
+interface HumanApprovalPayload {
   approver: string;
   rationale: string;
 }
 
-export interface TuneAnalysisReceiptPayload {
+interface TuneAnalysisReceiptPayload {
   summary: string;
   analysis: TuneAnalysis;
 }
 
-export interface TuneProposalReceiptPayload {
+interface TuneProposalReceiptPayload {
   summary: string;
   proposal: TuneProposal;
 }
@@ -191,27 +191,27 @@ export type IntegrationEvidenceReceipt = StandardReceiptBase<
   (typeof RECEIPT_RESULTS_BY_TYPE.integration_evidence)[number],
   SubjectEvidencePayload
 >;
-export type PublishSubjectReceipt = StandardReceiptBase<
+type PublishSubjectReceipt = StandardReceiptBase<
   "publish_subject",
   (typeof RECEIPT_RESULTS_BY_TYPE.publish_subject)[number],
   PublishSubjectPayload
 >;
-export type ProviderEvidenceReceipt = StandardReceiptBase<
+type ProviderEvidenceReceipt = StandardReceiptBase<
   "provider_evidence",
   (typeof RECEIPT_RESULTS_BY_TYPE.provider_evidence)[number],
   ProviderEvidencePayload
 >;
-export type HumanApprovalReceipt = StandardReceiptBase<
+type HumanApprovalReceipt = StandardReceiptBase<
   "human_approval",
   (typeof RECEIPT_RESULTS_BY_TYPE.human_approval)[number],
   HumanApprovalPayload
 >;
-export type TuneAnalysisReceipt = StandardReceiptBase<
+type TuneAnalysisReceipt = StandardReceiptBase<
   "tune_analysis",
   (typeof RECEIPT_RESULTS_BY_TYPE.tune_analysis)[number],
   TuneAnalysisReceiptPayload
 >;
-export type TuneProposalReceipt = StandardReceiptBase<
+type TuneProposalReceipt = StandardReceiptBase<
   "tune_proposal",
   (typeof RECEIPT_RESULTS_BY_TYPE.tune_proposal)[number],
   TuneProposalReceiptPayload
@@ -293,7 +293,7 @@ function commandDiagnosticTail(value: unknown, path: string): string {
   return tail;
 }
 
-export interface ContextRecord {
+interface ContextRecord {
   unit_id: string;
   summary: string;
 }
