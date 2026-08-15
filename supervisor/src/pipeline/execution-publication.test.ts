@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canonicalJson, digestNormalized } from "./manifest.js";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 import {
   buildExecutionPublicationSnapshot,
   executionLedgerLines,

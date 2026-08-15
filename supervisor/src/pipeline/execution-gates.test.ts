@@ -5,7 +5,7 @@ import {
   evaluateUnitAcceptanceGate,
   type StandardReceiptFence,
 } from "./execution-gates.js";
-import { canonicalJson, digestNormalized } from "./manifest.js";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 
 const expected: StandardReceiptFence = {
   pipelineInstanceId: "instance-1",

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { describe, expect, it, vi } from "vitest";
 import { createDaytonaSandboxRuntime } from "./adapter.js";
-import { canonicalJson, digestNormalized } from "../../pipeline/manifest.js";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 import { STAGE_EXECUTOR_PROTOCOL, createStageRequestHash, type StageRequestEnvelope } from "../../pipeline/stage-request.js";
 import type { ChildExecutorActionRequest, LoopActionRequest } from "../../runtime/contracts.js";
 

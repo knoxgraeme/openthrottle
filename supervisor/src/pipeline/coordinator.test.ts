@@ -11,10 +11,9 @@ import {
   reducePipelineEvent,
   type PipelineCoordinatorEvent,
 } from "./coordinator.js";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 import {
   STAGE_OUTCOMES,
-  canonicalJson,
-  digestNormalized,
   loadPipelineCatalog,
   parseRepositoryConfig,
   type PipelineManifest,

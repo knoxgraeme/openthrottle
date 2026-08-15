@@ -21,8 +21,8 @@
 
 import type { Config } from "./config.js";
 import type { RuntimeInventory } from "../runtime/contracts.js";
+import { githubApiResponse } from "../shared/github-request.js";
 
-const HTTP_TIMEOUT_MS = 15_000;
 export const DEFAULT_DAYTONA_TOTAL_MEMORY_GIB = 10;
 export const DEFAULT_DAYTONA_SANDBOX_MEMORY_GIB = 8;
 
@@ -94,19 +94,11 @@ async function checkReadToken(
   deps: AdmissionPreflightDeps,
   target: AdmissionPreflightTarget
 ): Promise<AdmissionPreflightResult> {
-  const fetchImpl = deps.fetch ?? fetch;
   let response: Response;
   try {
-    response = await fetchImpl(
-      `${deps.githubApiBaseUrl ?? "https://api.github.com"}/repos/${target.repository}/git/trees/${target.baseCommit}`,
-      {
-        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-        headers: {
-          Accept: "application/vnd.github+json",
-          Authorization: `Bearer ${deps.githubReadToken}`,
-          "X-GitHub-Api-Version": "2022-11-28",
-        },
-      }
+    response = await githubApiResponse(
+      { token: deps.githubReadToken, apiBaseUrl: deps.githubApiBaseUrl, fetch: deps.fetch },
+      `/repos/${target.repository}/git/trees/${target.baseCommit}`
     );
   } catch (error) {
     console.warn(

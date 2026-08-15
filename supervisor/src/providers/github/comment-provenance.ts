@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
+import { OPENTHROTTLE_COMMENT_MARKER_PREFIX } from "./client.js";
 
-const OPENTHROTTLE_MARKER_PREFIX = "<!-- openthrottle:";
 const WRITE_INTENT_TTL_MS = 5 * 60 * 1000;
 
 interface CommentProvenanceSettings {
@@ -31,7 +31,7 @@ interface PendingCommentWrite {
 function markerFromBody(body: string | null | undefined): string | undefined {
   const marker = body?.split("\n", 1)[0];
   if (!marker || marker.length > 512 ||
-      !marker.startsWith(OPENTHROTTLE_MARKER_PREFIX) || !marker.endsWith(" -->")) {
+      !marker.startsWith(OPENTHROTTLE_COMMENT_MARKER_PREFIX) || !marker.endsWith(" -->")) {
     return undefined;
   }
   return marker;

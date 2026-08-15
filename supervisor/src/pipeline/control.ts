@@ -1,4 +1,4 @@
-import { canonicalJson, digestNormalized } from "./manifest.js";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 import { coordinatePipelineEvent } from "./coordinator.js";
 import type { PipelineInstance, PipelineStageAttempt, PipelineStore } from "./store.js";
 

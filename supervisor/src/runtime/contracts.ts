@@ -4,8 +4,6 @@ import {
   CONTEXT_POLICIES,
   EVALUATOR_KINDS,
   EXECUTOR_KINDS,
-  canonicalJson,
-  digestNormalized,
   type ArtifactKind,
   type AssuranceClass,
   type RuntimeCapabilityInventory,
@@ -16,7 +14,14 @@ import {
   type StageRequestEnvelope,
 } from "../pipeline/stage-request.js";
 import type { RepositorySkillPackage } from "../pipeline/manifest.js";
-import { LOGICAL_CREDENTIALS, type LogicalCredential, type StandardReceiptType, type TuneProposalChange } from "@openthrottle/contracts";
+import {
+  canonicalJson,
+  digestNormalized,
+  LOGICAL_CREDENTIALS,
+  type LogicalCredential,
+  type StandardReceiptType,
+  type TuneProposalChange,
+} from "@openthrottle/contracts";
 
 // The closed logical-scope set a loop action may declare (contracts/src/graph.ts
 // LOGICAL_CREDENTIALS). Enforced again here at the runtime boundary so a loop

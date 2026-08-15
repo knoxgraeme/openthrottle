@@ -8,8 +8,6 @@ import { createPipelineEffectProcessor } from "./pipeline-effects.js";
 import { coordinatePipelineEvent } from "../pipeline/coordinator.js";
 import { requestPipelineStop } from "../pipeline/control.js";
 import {
-  canonicalJson,
-  digestNormalized,
   loadPipelineCatalog,
   parseRepositoryConfig,
 } from "../pipeline/manifest.js";
@@ -24,7 +22,9 @@ import type { PipelineInstance, PipelineStageAttempt } from "../pipeline/store.j
 import type { LinearOutboxRecord } from "../persistence/delivery-store.js";
 import type { RuntimeResourceReconciler } from "./runtime-resource-reclaim.js";
 import {
+  canonicalJson,
   digestCanonicalJson,
+  digestNormalized,
   validateReviewJournalContract,
   type ReviewFinding,
   type SemanticReviewReceipt,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ExecutionPlanContract, ExecutionPlanContractV2 } from "@openthrottle/contracts";
-import { canonicalJson } from "./manifest.js";
+import { canonicalJson } from "@openthrottle/contracts";
 import {
   MAX_VALID_DOWNSTREAM_CONTEXT,
   assertStructuredPlanLoopEnvelopeBound,

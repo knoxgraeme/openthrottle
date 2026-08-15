@@ -6,9 +6,8 @@ import type {
   UnitCompletionReceipt,
   UnitDecisionReceipt,
 } from "@openthrottle/contracts";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 import {
-  canonicalJson,
-  digestNormalized,
   type StageOutcome,
 } from "./manifest.js";
 import {

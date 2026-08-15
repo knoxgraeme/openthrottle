@@ -17,6 +17,7 @@ import {
   renderGithubPipelineSummary,
 } from "../../pipeline/publication.js";
 import type { PipelinePublicationReceipt, PipelineStore } from "../../pipeline/store.js";
+import { pipelineIsTerminal } from "../../app/provider-feedback.js";
 import { classifyPermanentFailure, exponentialBackoffDelayMs } from "../../shared/backoff.js";
 
 export interface GithubPublicationProcessor {
@@ -95,10 +96,7 @@ export function createGithubPublicationProcessor(params: {
         if (!persisted) throw new Error("pipeline publication target binding is stale");
         bound = persisted;
       } else if (!ticket?.pr_url) {
-        const terminal = instance.terminal_outcome != null || [
-          "shipped", "no_change", "needs_human", "canceled", "superseded", "failed",
-        ].includes(instance.status);
-        if (terminal) {
+        if (pipelineIsTerminal(instance)) {
           if (!params.store.markGithubPublicationSkipped(publication.id, publication.payload_hash)) {
             throw new Error("terminal pipeline publication changed before it could be skipped");
           }

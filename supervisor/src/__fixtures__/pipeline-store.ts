@@ -3,9 +3,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createSupervisorStore } from "../persistence/store.js";
 import { openDb } from "../persistence/database.js";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
 import {
-  canonicalJson,
-  digestNormalized,
   loadPipelineCatalog,
   parseRepositoryConfig,
   type ValidatedPipelineCatalog,

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { canonicalJson, digestNormalized, type PipelineManifest } from "./manifest.js";
+import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
+import { type PipelineManifest } from "./manifest.js";
 import {
   actionKindForUnitPhase,
   BUILTIN_UNIT_PHASES,

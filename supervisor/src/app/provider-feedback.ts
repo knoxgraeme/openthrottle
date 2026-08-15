@@ -3,7 +3,8 @@ import type { FeedbackSnapshot, FeedbackSnapshotEvent } from "../persistence/fee
 import { sanitizeText } from "../shared/sanitize.js";
 import type { PipelineInstance, PipelineStore } from "../pipeline/store.js";
 import { processProviderEvidence, type Finding } from "../pipeline/gates.js";
-import { canonicalJson, type PipelineManifest } from "../pipeline/manifest.js";
+import { canonicalJson } from "@openthrottle/contracts";
+import { type PipelineManifest } from "../pipeline/manifest.js";
 
 const UNBOUNDED_SNAPSHOT_CLAIM = Number.MAX_SAFE_INTEGER;
 const DEFAULT_FEEDBACK_SNAPSHOT_DRAIN_SOURCE = "direct";

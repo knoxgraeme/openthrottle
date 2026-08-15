@@ -1,8 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { ControlThreadEvent } from "../../app/ports.js";
+import { reduceStream, readStreamUpToByteLimit } from "../../shared/bounded-stream.js";
+import { assertGithubResponseOk, githubApiResponse } from "../../shared/github-request.js";
 import { sanitizeText } from "../../shared/sanitize.js";
 
-const HTTP_TIMEOUT_MS = 15_000;
 const GITHUB_COMMIT_SHA_PATTERN = /^[a-f0-9]{40}$/;
 
 export function verifyGithubSignature(
@@ -738,20 +739,7 @@ async function githubRequest<T>(
   path: string,
   init: RequestInit = {}
 ): Promise<T> {
-  const fetchImpl = client.fetch ?? fetch;
-  const response = await fetchImpl(`${client.apiBaseUrl ?? "https://api.github.com"}${path}`, {
-    ...init,
-    signal: init.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${client.token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-      ...(init.headers ?? {}),
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`GitHub API error (${response.status}): ${await response.text()}`);
-  }
+  const response = await assertGithubResponseOk(await githubApiResponse(client, path, init));
   if (response.status === 204) return undefined as T;
   const body = await response.text();
   if (!body) return undefined as T;
@@ -763,18 +751,7 @@ async function githubBoundedJsonArrayRequest<T>(
   path: string,
   maxBytes: number
 ): Promise<T[] | undefined> {
-  const fetchImpl = client.fetch ?? fetch;
-  const response = await fetchImpl(`${client.apiBaseUrl ?? "https://api.github.com"}${path}`, {
-    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${client.token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`GitHub API error (${response.status}): ${await response.text()}`);
-  }
+  const response = await assertGithubResponseOk(await githubApiResponse(client, path));
   const declaredLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     await response.body?.cancel();
@@ -787,20 +764,13 @@ async function githubBoundedJsonArrayRequest<T>(
     if (!Array.isArray(value)) throw new Error("GitHub API returned a non-array timeline page");
     return value as T[];
   }
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    totalBytes += value.byteLength;
-    if (totalBytes > maxBytes) {
-      await reader.cancel();
-      return undefined;
-    }
-    chunks.push(value);
+  const read = await readStreamUpToByteLimit(response.body, maxBytes);
+  if (read.exceeded) {
+    if (read.cancelError !== undefined) throw read.cancelError;
+    return undefined;
   }
-  const body = Buffer.concat(chunks, totalBytes).toString("utf8");
+  const body = Buffer.from(read.bytes.buffer, read.bytes.byteOffset, read.bytes.byteLength)
+    .toString("utf8");
   const value: unknown = body ? JSON.parse(body) : [];
   if (!Array.isArray(value)) throw new Error("GitHub API returned a non-array timeline page");
   return value as T[];
@@ -812,32 +782,18 @@ async function githubTextTailRequest(
   maxChars: number,
   init: RequestInit = {}
 ): Promise<string> {
-  const fetchImpl = client.fetch ?? fetch;
-  const response = await fetchImpl(`${client.apiBaseUrl ?? "https://api.github.com"}${path}`, {
-    ...init,
-    signal: init.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
-    headers: {
-      Accept: "text/plain",
-      Authorization: `Bearer ${client.token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-      ...(init.headers ?? {}),
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`GitHub API error (${response.status}): ${await response.text()}`);
-  }
+  const response = await assertGithubResponseOk(
+    await githubApiResponse(client, path, init, "text/plain")
+  );
   if (!response.body) return logTail(await response.text(), maxChars);
-  const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  let tail = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  const reduced = await reduceStream(response.body, "", (tail, value) => {
     const chunk = decoder.decode(value, { stream: true }).slice(-maxChars * 2);
-    tail += chunk;
-    if (tail.length > maxChars * 2) tail = tail.slice(-maxChars * 2);
-  }
-  tail += decoder.decode();
+    let next = tail + chunk;
+    if (next.length > maxChars * 2) next = next.slice(-maxChars * 2);
+    return { next };
+  });
+  const tail = (reduced.cancelled ? "" : reduced.value) + decoder.decode();
   return logTail(tail, maxChars);
 }
 
@@ -1084,22 +1040,12 @@ export async function branchExists(
   repo: string,
   branch: string
 ): Promise<boolean> {
-  const fetchImpl = client.fetch ?? fetch;
-  const response = await fetchImpl(
-    `${client.apiBaseUrl ?? "https://api.github.com"}/repos/${repo}/branches/${encodeURIComponent(branch)}`,
-    {
-      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${client.token}`,
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-    }
+  const response = await githubApiResponse(
+    client,
+    `/repos/${repo}/branches/${encodeURIComponent(branch)}`
   );
   if (response.status === 404) return false;
-  if (!response.ok) {
-    throw new Error(`GitHub API error (${response.status}): ${await response.text()}`);
-  }
+  await assertGithubResponseOk(response);
   return true;
 }
 

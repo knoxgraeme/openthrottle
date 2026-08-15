@@ -1,4 +1,6 @@
 import {
+  canonicalJson,
+  digestNormalized,
   TUNE_ANALYSIS_INPUT_SCHEMA,
   validateStandardReceipt,
   validateTuneAnalysisInputContract,
@@ -8,8 +10,6 @@ import {
   ASSURANCE_CLASSES,
   PIPELINE_OUTCOMES,
   STAGE_OUTCOMES,
-  canonicalJson,
-  digestNormalized,
   type AssuranceClass,
   type PipelineManifest,
   type PipelineStage,

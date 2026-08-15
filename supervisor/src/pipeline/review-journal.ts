@@ -18,7 +18,6 @@ import {
   type SemanticReviewReceipt,
   type SealedReviewRosterContract,
 } from "@openthrottle/contracts";
-import { canonicalJson, digestNormalized } from "./manifest.js";
 import {
   compareReviewFindingRepresentatives,
   contractReviewFinding,
@@ -127,7 +126,7 @@ export function buildReviewJournal(input: {
     personaTimings.set(personaId, { persona_id: personaId, ...timing });
     return {
       persona_id: personaId,
-      receipt_digest: digestNormalized(canonicalJson(receipt)),
+      receipt_digest: digestCanonicalJson(receipt),
       subject: input.plan.subject,
       finding_ids: findings.map((finding) => finding.finding_id),
       finding_count: findings.length,

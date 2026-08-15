@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import {
+  canonicalJson,
+  digestNormalized,
   EXECUTION_PLAN_SCHEMA,
   EXECUTION_PLAN_SCHEMA_V2,
   EXECUTION_PLAN_SCHEMAS,
@@ -25,8 +27,6 @@ import {
   type UnitDecisionReceipt,
 } from "@openthrottle/contracts";
 import {
-  canonicalJson,
-  digestNormalized,
   stageById,
   type PipelineUnitPhaseBinding,
   type StageOutcome,
