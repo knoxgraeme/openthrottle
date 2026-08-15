@@ -757,6 +757,53 @@ describe("Stage C contract fixtures", () => {
     expect(parsed.value.citations[0]!.expected_result[0]!.created_at).toBe("2026-08-08T00:00:00.000Z");
   });
 
+  it("pins strict verbatim receipt timestamps: producer shapes keep their bytes, garbage is rejected", () => {
+    const receipt = JSON.parse(readFixture("valid", "receipt-unit-decision.json")) as Record<string, unknown>;
+    // The sandbox hashes each receipt exactly as the agent emitted it and the
+    // supervisor replays that hash through evidence binding, so validation
+    // must accept every producer shape (toISOString, the skill templates'
+    // millisecond-free UTC form, offset spellings) without rewriting bytes.
+    for (const accepted of [
+      "2026-01-01T00:00:00.000Z",
+      "2026-01-01T00:00:00Z",
+      "2026-01-01T02:00:00+02:00",
+    ]) {
+      receipt.issued_at = accepted;
+      const parsed = validateStandardReceipt(receipt, { source: "receipt" });
+      expect(parsed.value.issued_at).toBe(accepted);
+      expect(parsed.normalized).toContain(`"issued_at":"${accepted}"`);
+    }
+    for (const rejected of ["2026", "Jan 1 2026", "0", "2026-02-30T00:00:00Z", "2026-08-08T24:00:00Z"]) {
+      receipt.issued_at = rejected;
+      expect(() => validateStandardReceipt(receipt, { source: "receipt" }))
+        .toThrow(/receipt\.issued_at: must be an ISO-8601 timestamp/);
+    }
+  });
+
+  it("pins strict verbatim tune timestamps with instant-based window ordering", () => {
+    const task = tuneTask();
+    const window = task.window as { from: string; to: string };
+
+    // Offset spellings are now accepted (previously rejected by a UTC-only
+    // regex) and preserved verbatim so producer-computed task digests keep
+    // matching.
+    window.from = "2026-08-01T02:00:00+02:00";
+    expect(validateTuneTaskContract(task, { source: "task" }).value.window.from)
+      .toBe("2026-08-01T02:00:00+02:00");
+
+    // Window ordering compares instants, so an offset spelling cannot smuggle
+    // a reversed window past a lexicographic comparison.
+    window.from = "2026-08-12T02:00:00+01:00";
+    expect(() => validateTuneTaskContract(task, { source: "task" }))
+      .toThrow(/window: from must not be later than to/);
+
+    // Calendar-invalid values were previously accepted by the digit-only
+    // regex; the unified validator rejects them.
+    window.from = "2026-13-01T00:00:00Z";
+    expect(() => validateTuneTaskContract(task, { source: "task" }))
+      .toThrow(/window\.from: must be an ISO-8601 timestamp/);
+  });
+
   it("rejects reversed citation windows after normalization while allowing equality", () => {
     const proposal = JSON.parse(readFixture("valid", "citation-contract.json")) as {
       citations: Array<{ query: { from?: string; to?: string } }>;

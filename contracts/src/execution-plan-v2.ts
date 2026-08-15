@@ -1,12 +1,13 @@
 import {
-  COMMAND_NAME_PATTERN,
   IDENTIFIER,
   arrayAt,
+  assertAcyclicDependencies,
   fail,
   normalizedContract,
   objectAt,
+  parseIdentifierList,
+  parsePlanCommand,
   stringAt,
-  unique,
   type ValidatedContract,
 } from "./validation.js";
 import type { ExecutionPlanCommand } from "./execution-plan.js";
@@ -43,16 +44,6 @@ export interface ExecutionPlanContractV2 {
   commands: ExecutionPlanCommand[];
 }
 
-function parseIdentifierList(
-  value: unknown,
-  path: string,
-  options: { min?: number; max: number }
-): string[] {
-  return unique(arrayAt(value, path, (entry, entryPath) => {
-    return stringAt(entry, entryPath, { pattern: IDENTIFIER });
-  }, options), path);
-}
-
 function parseTextList(
   value: unknown,
   path: string,
@@ -82,14 +73,6 @@ function parseUnitV2(value: unknown, path: string): ExecutionPlanUnitV2 {
   };
 }
 
-function parseCommandV2(value: unknown, path: string): ExecutionPlanCommand {
-  const input = objectAt(value, path, ["name", "unit"]);
-  return {
-    name: stringAt(input.name, `${path}.name`, { max: 80, pattern: COMMAND_NAME_PATTERN }),
-    ...(input.unit === undefined ? {} : { unit: stringAt(input.unit, `${path}.unit`, { pattern: IDENTIFIER }) }),
-  };
-}
-
 function validatePlanV2(plan: ExecutionPlanContractV2, source: string): void {
   const units = new Map(plan.units.map((unit) => [unit.id, unit]));
   if (units.size !== plan.units.length) fail(`${source}.units`, "must not contain duplicate IDs");
@@ -101,17 +84,7 @@ function validatePlanV2(plan: ExecutionPlanContractV2, source: string): void {
   for (const command of plan.commands) {
     if (command.unit && !units.has(command.unit)) fail(`${source}.commands.${command.name}.unit`, "references an unknown unit");
   }
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
-  const visit = (id: string): void => {
-    if (visited.has(id)) return;
-    if (visiting.has(id)) fail(`${source}.units.${id}.depends_on`, "creates a cycle");
-    visiting.add(id);
-    for (const dependency of units.get(id)!.depends_on) visit(dependency);
-    visiting.delete(id);
-    visited.add(id);
-  };
-  for (const unit of plan.units) visit(unit.id);
+  assertAcyclicDependencies(plan.units, `${source}.units`);
 }
 
 export function validateExecutionPlanContractV2(
@@ -126,7 +99,7 @@ export function validateExecutionPlanContractV2(
     graph_id: stringAt(input.graph_id, `${source}.graph_id`, { pattern: IDENTIFIER }),
     plan_id: stringAt(input.plan_id, `${source}.plan_id`, { pattern: IDENTIFIER }),
     units: arrayAt(input.units, `${source}.units`, parseUnitV2, { min: 1, max: 64 }),
-    commands: arrayAt(input.commands, `${source}.commands`, parseCommandV2, { max: 16 }),
+    commands: arrayAt(input.commands, `${source}.commands`, parsePlanCommand, { max: 16 }),
   };
   validatePlanV2(plan, source);
   return normalizedContract(plan);

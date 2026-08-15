@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { runGitAsExecutor } from "./repository-control.mjs";
-import { restoreIntegrationCheckout } from "./execute-loop.mjs";
+import { restoreIntegrationCheckout } from "./filesystem-isolation.mjs";
 
 const COMMIT = /^[a-f0-9]{40}$/;
 

@@ -5,11 +5,12 @@ import {
   enumAt,
   fail,
   integerAt,
-  normalizeIso8601Timestamp,
   normalizedContract,
   objectAt,
   optional,
+  parseIdentifierList,
   stringAt,
+  timestampAt,
   unique,
   type ValidatedContract,
 } from "./validation.js";
@@ -98,13 +99,6 @@ export interface CitationContractProposal {
   grades: CitationContractGrade[];
 }
 
-function timestamp(value: unknown, path: string): string {
-  const result = stringAt(value, path, { max: 64 });
-  const normalized = normalizeIso8601Timestamp(result);
-  if (!normalized) fail(path, "must be an ISO-8601 timestamp");
-  return normalized;
-}
-
 function parseAnalysisRunQuery(value: unknown, path: string): AnalysisRunQuery {
   const input = objectAt(value, path, ANALYSIS_RUN_QUERY_FIELDS);
   if (Object.keys(input).length === 0) fail(path, "must include at least one allowlisted filter");
@@ -118,8 +112,8 @@ function parseAnalysisRunQuery(value: unknown, path: string): AnalysisRunQuery {
     ...optional(input.skill_digest, (entry) => ({
       skill_digest: stringAt(entry, `${path}.skill_digest`, { max: 320 }),
     })),
-    ...optional(input.from, (entry) => ({ from: timestamp(entry, `${path}.from`) })),
-    ...optional(input.to, (entry) => ({ to: timestamp(entry, `${path}.to`) })),
+    ...optional(input.from, (entry) => ({ from: timestampAt(entry, `${path}.from`) })),
+    ...optional(input.to, (entry) => ({ to: timestampAt(entry, `${path}.to`) })),
     ...optional(input.limit, (entry) => ({ limit: integerAt(entry, `${path}.limit`, 1, 200) })),
   };
   if (query.from !== undefined && query.to !== undefined && query.from > query.to) {
@@ -141,7 +135,7 @@ function parseAnalysisRunResult(value: unknown, path: string): AnalysisRunResult
     fault_attribution: input.fault_attribution === null
       ? null
       : enumAt(input.fault_attribution, `${path}.fault_attribution`, ANALYSIS_QUERY_ATTRIBUTIONS),
-    created_at: timestamp(input.created_at, `${path}.created_at`),
+    created_at: timestampAt(input.created_at, `${path}.created_at`),
   };
 }
 
@@ -162,7 +156,7 @@ function parseClaim(value: unknown, path: string): CitationContractClaim {
   return {
     id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
     text: stringAt(input.text, `${path}.text`, { max: 2_000 }),
-    citation_ids: parseIdentifierList(input.citation_ids, `${path}.citation_ids`, 32, 1),
+    citation_ids: parseIdentifierList(input.citation_ids, `${path}.citation_ids`, { min: 1, max: 32 }),
   };
 }
 
@@ -172,7 +166,7 @@ function parseDisposition(value: unknown, path: string): CitationContractDisposi
     claim_id: stringAt(input.claim_id, `${path}.claim_id`, { pattern: IDENTIFIER }),
     disposition: enumAt(input.disposition, `${path}.disposition`, CLAIM_DISPOSITIONS),
     rationale: stringAt(input.rationale, `${path}.rationale`, { max: 2_000 }),
-    citation_ids: parseIdentifierList(input.citation_ids, `${path}.citation_ids`, 32, 1),
+    citation_ids: parseIdentifierList(input.citation_ids, `${path}.citation_ids`, { min: 1, max: 32 }),
   };
 }
 
@@ -181,16 +175,11 @@ function parseGrade(value: unknown, path: string): CitationContractGrade {
   return {
     id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
     value: enumAt(input.value, `${path}.value`, GRADE_VALUES),
-    disposition_claim_ids: parseIdentifierList(input.disposition_claim_ids, `${path}.disposition_claim_ids`, 64, 1),
+    disposition_claim_ids: parseIdentifierList(input.disposition_claim_ids, `${path}.disposition_claim_ids`, { min: 1, max: 64 }),
     rationale: stringAt(input.rationale, `${path}.rationale`, { max: 2_000 }),
   };
 }
 
-function parseIdentifierList(value: unknown, path: string, max: number, min = 0): string[] {
-  return unique(arrayAt(value, path, (entry, entryPath) => {
-    return stringAt(entry, entryPath, { pattern: IDENTIFIER });
-  }, { min, max }), path);
-}
 
 function validateReferences(proposal: CitationContractProposal, source: string): void {
   const citationIds = new Set(proposal.citations.map((citation) => citation.id));

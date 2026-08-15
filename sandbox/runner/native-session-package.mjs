@@ -4,6 +4,7 @@ import { basename, dirname, relative, resolve, sep } from "node:path";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { chmodTree, chownTree, isRoot, pathInside, prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
+import { string } from "./validate.mjs";
 
 const DEFAULT_NATIVE_SESSION_SOURCE_ROOT = "/var/lib/openthrottle/native-sessions";
 const NATIVE_SESSION_PACKAGE_MANIFEST = "openthrottle-native-session.json";
@@ -18,14 +19,8 @@ export const MAX_NATIVE_SESSION_BYTES = 256 * 1024 * 1024;
 const ROOT_UID = 0;
 const ROOT_GID = 0;
 const ABSOLUTE_PATH = /^\/[^\u0000]{0,500}$/;
-const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const PACKAGE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const OPENCODE_SESSION_EVENT_TYPES = new Set(["message", "step_start", "step_finish"]);
-
-function string(value, label, pattern = ID) {
-  if (typeof value !== "string" || !pattern.test(value)) throw new Error(`${label} is invalid`);
-  return value;
-}
 
 function configuredNativeSessionSourceRoot(env = process.env) {
   const root = env.OT_NATIVE_SESSION_SOURCE_ROOT ?? DEFAULT_NATIVE_SESSION_SOURCE_ROOT;

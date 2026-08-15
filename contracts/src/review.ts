@@ -12,6 +12,7 @@ import {
   normalizedContract,
   objectAt,
   stringAt,
+  timestampAt,
   unique,
   type ValidatedContract,
 } from "./validation.js";
@@ -224,10 +225,11 @@ export interface ReviewJournalContract {
   entries: ReviewJournalEntry[];
 }
 
+// Verbatim mode: journal timing evidence embeds receipt-derived timestamps
+// whose canonical bytes participate in cross-boundary digest chains, so a
+// valid-but-unnormalized timestamp is preserved exactly as produced.
 function timestamp(value: unknown, path: string): string {
-  const result = stringAt(value, path, { max: 64 });
-  if (Number.isNaN(Date.parse(result))) fail(path, "must be an ISO timestamp");
-  return result;
+  return timestampAt(value, path, { normalize: false });
 }
 
 function boundedTextList(value: unknown, path: string, max: number): string[] {

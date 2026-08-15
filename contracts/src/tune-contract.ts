@@ -21,9 +21,11 @@ import {
   fail,
   integerAt,
   normalizedContract,
+  normalizeIso8601Timestamp,
   objectAt,
   optional,
   stringAt,
+  timestampAt,
   unique,
   type ValidatedContract,
 } from "./validation.js";
@@ -43,7 +45,6 @@ export const TUNE_PROPOSAL_OUTCOMES = ["propose", "no_change", "needs_human"] as
 export const TUNE_DECISION_OUTCOMES = ["accept", "reject", "needs_human"] as const;
 export const TUNE_CORPUS_OUTCOMES = ANALYSIS_QUERY_OUTCOMES;
 
-const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 const PATH_PATTERN = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
 const TARGET_FIELDS = ["kind", "id", "path", "digest"] as const;
 const QUERY_FIELDS = ["outcome", "reason", "graph", "skill", "limit"] as const;
@@ -238,8 +239,11 @@ export interface TuneEditAuthorizationValidationOptions {
   decision?: unknown;
 }
 
+// Verbatim mode: tune row/task/intent digests are recomputed from validated
+// values and compared against digests the producer computed over the value as
+// emitted, so validated timestamps must keep their original bytes.
 function timestamp(value: unknown, path: string): string {
-  return stringAt(value, path, { max: 64, pattern: ISO_TIMESTAMP });
+  return timestampAt(value, path, { normalize: false });
 }
 
 function parseDigestList(value: unknown, path: string, options: { min?: number; max: number }): string[] {
@@ -286,7 +290,11 @@ function parseWindow(value: unknown, path: string): TuneWindow {
     to: timestamp(input.to, `${path}.to`),
     limit: integerAt(input.limit, `${path}.limit`, 1, 1_000),
   };
-  if (window.from > window.to) fail(path, "from must not be later than to");
+  // Compare instants, not verbatim bytes: the window fields may legitimately
+  // carry equivalent spellings (offset forms, differing fractional digits).
+  if (normalizeIso8601Timestamp(window.from)! > normalizeIso8601Timestamp(window.to)!) {
+    fail(path, "from must not be later than to");
+  }
   return window;
 }
 

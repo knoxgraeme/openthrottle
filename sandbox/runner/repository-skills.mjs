@@ -5,24 +5,14 @@ import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { runGitAsExecutor } from "./repository-control.mjs";
 import { chownTree, isRoot, pathInside as containedPath } from "./filesystem-isolation.mjs";
+import { DIGEST, record, string } from "./validate.mjs";
 
 export const REPOSITORY_SKILL_CAPABILITY = "agent/repository-skill@1";
 
-const DIGEST = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
 const INVOCATION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const REPOSITORY_SKILL_REFERENCE =
   /^repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
-
-function record(value, label) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
-  return value;
-}
-
-function string(value, label, pattern) {
-  if (typeof value !== "string" || !pattern.test(value)) throw new Error(`${label} is invalid`);
-  return value;
-}
 
 function boundedString(value, label, pattern, max) {
   if (typeof value !== "string" || value.length > max) throw new Error(`${label} is invalid`);

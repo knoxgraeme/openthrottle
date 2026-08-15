@@ -342,3 +342,16 @@ export function restorePersistentAgentPrivateRoots(paths = PERSISTENT_AGENT_PRIV
   if (errors.length > 0) throw new Error(`persistent profile restoration failed: ${errors.join("; ")}`);
   return restored;
 }
+
+// Returns the integration checkout to agent ownership after a fenced action
+// locked it away. Lives here (not execute-loop.mjs) because it is pure
+// ownership/permission restoration shared by the loop runner and the child
+// action executors.
+export function restoreIntegrationCheckout(path = "/home/agent/repo") {
+  if (!isRoot() || !existsSync(path)) return false;
+  const identity = identityForUser("agent");
+  if (!identity) return false;
+  chownTree(path, identity.uid, identity.gid);
+  chmodOwnerPrivateTree(path);
+  return true;
+}

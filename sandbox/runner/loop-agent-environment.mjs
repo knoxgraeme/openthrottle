@@ -14,8 +14,15 @@ import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } fro
 import { materializeNativeSessionState, nativeSessionStoragePath } from "./native-session-package.mjs";
 import { materializeRepositorySkillPackage } from "./repository-skills.mjs";
 import { appendCodexMcpConfig, selectAllowedMcpServers, writeClaudeMcpConfigFile } from "./loop-mcp-config.mjs";
-import { actionDirectory, configuredActionRoot, gitSafeDirectoryEnv, prepareLoopGitObjectEnvironment, prepareRootReadOnlyDirectory } from "./execute-loop.mjs";
-import { pathInside, PROFILE_ROOT_FENCE_FILE } from "./loop-paths.mjs";
+import {
+  PROFILE_ROOT_FENCE_FILE,
+  actionDirectory,
+  configuredActionRoot,
+  gitSafeDirectoryEnv,
+  pathInside,
+  prepareLoopGitObjectEnvironment,
+  prepareRootReadOnlyDirectory,
+} from "./loop-paths.mjs";
 
 const ROOT_UID = 0;
 const ROOT_GID = 0;
