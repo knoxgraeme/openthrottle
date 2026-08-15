@@ -2390,6 +2390,22 @@ ALTER TABLE execution_graphs DROP COLUMN final_review_passed_at;
 ALTER TABLE webhook_deliveries DROP COLUMN activity_id;
 dead-satellite-surface-contract:migration 14's contraction folded liveness, execution pinning, and runtime resources onto their owner rows, leaving these satellites as retained history that nothing reads; migration_reconciliation was never written and work_item_sources was write-only, so the 2026-08 repo audit retires all six tables plus the never-read final_review_passed_at and activity_id columns. Rollback note: the immediately preceding release still writes work_item_sources, execution_graphs.final_review_passed_at, and webhook_deliveries.activity_id, so this migration is deploy-forward-only despite carrying the mandatory additive rollback marker/v1`;
 
+const actorStateSingleOwnerMigrationSource = `
+UPDATE runs SET actor columns = COALESCE(runs actor columns, owning pipeline_stage_attempts actor columns);
+DROP INDEX IF EXISTS pipeline_stage_attempts_actor_state_idx;
+ALTER TABLE pipeline_stage_attempts DROP COLUMN actor_state;
+ALTER TABLE pipeline_stage_attempts DROP COLUMN last_heartbeat_at;
+ALTER TABLE pipeline_stage_attempts DROP COLUMN settlement_owner;
+ALTER TABLE pipeline_stage_attempts DROP COLUMN settlement_reason;
+ALTER TABLE pipeline_stage_attempts DROP COLUMN termination_confirmed_at;
+ALTER TABLE pipeline_stage_attempts DROP COLUMN quarantine_reason;
+ALTER TABLE pipeline_stage_attempts DROP COLUMN actor_created_at;
+ALTER TABLE pipeline_stage_attempts DROP COLUMN actor_updated_at;
+ALTER TABLE runs DROP COLUMN actor_created_at;
+ALTER TABLE runs DROP COLUMN actor_updated_at;
+actor-single-owner-contract:run actor liveness lives on runs only/v1
+migration 14's contraction dual-homed the folded actor lifecycle columns on both runs and pipeline_stage_attempts; every lifecycle transition wrote the pair in one transaction and every reader COALESCEd them, so the attempt-side copy never carried independent state (attempt-less runs already relied on the runs fallback). The 2026-08 repo audit consolidates ownership onto runs: any attempt-side value whose runs-side column is still NULL is merged into the owner first, then the attempt-side actor columns and their index are dropped, along with the written-but-never-read runs.actor_created_at and runs.actor_updated_at stamps. Rollback note: the immediately preceding release still dual-writes and COALESCE-reads the attempt-side actor columns, so this migration is deploy-forward-only per operator decision despite carrying the mandatory additive rollback marker/v1`;
+
 type GithubHeadSource =
   | { kind: "authoritative" }
   | { kind: "sequenced"; source: string; sequence: number };
@@ -3030,6 +3046,70 @@ function contractSatelliteTables(db: Database.Database): void {
   }
 }
 
+const RUN_ACTOR_LIFECYCLE_COLUMNS = [
+  "actor_state",
+  "last_heartbeat_at",
+  "settlement_owner",
+  "settlement_reason",
+  "termination_confirmed_at",
+  "quarantine_reason",
+] as const;
+
+function consolidateActorStateOntoRuns(db: Database.Database): void {
+  const lifecycleColumns = [...RUN_ACTOR_LIFECYCLE_COLUMNS];
+  if (
+    hasTable(db, "runs") &&
+    hasColumns(db, "runs", lifecycleColumns) &&
+    hasColumns(db, "pipeline_stage_attempts", [
+      ...lifecycleColumns,
+      "run_id",
+      "planned_run_id",
+    ])
+  ) {
+    // Merge any attempt-side value the owner row is still missing. The
+    // dual-write era wrote both rows in one transaction, so a divergence can
+    // only be a NULL owner column next to a populated attempt column; the
+    // owner value wins whenever it is present. Prefer the bound attempt over
+    // a planned-only attempt, mirroring the retired attempt-actor lookup.
+    const owningAttempt = (column: string) => `(
+        SELECT a.${column} FROM pipeline_stage_attempts a
+        WHERE a.run_id = runs.id OR (a.run_id IS NULL AND a.planned_run_id = runs.id)
+        ORDER BY CASE WHEN a.run_id = runs.id THEN 0 ELSE 1 END LIMIT 1
+      )`;
+    db.exec(`
+      UPDATE runs
+      SET ${lifecycleColumns
+        .map((column) => `${column} = COALESCE(${column}, ${owningAttempt(column)})`)
+        .join(",\n          ")}
+      WHERE EXISTS (
+        SELECT 1 FROM pipeline_stage_attempts a
+        WHERE a.run_id = runs.id OR (a.run_id IS NULL AND a.planned_run_id = runs.id)
+      )
+    `);
+  }
+  if (hasTable(db, "pipeline_stage_attempts")) {
+    // The composite actor index is the only schema object that depends on the
+    // attempt-side actor columns; none of them is a key, referenced by a
+    // foreign key, named in a trigger or view, or constrained beyond its own
+    // inline column CHECK, which is what SQLite's DROP COLUMN requires.
+    db.exec("DROP INDEX IF EXISTS pipeline_stage_attempts_actor_state_idx");
+    for (const column of [...lifecycleColumns, "actor_created_at", "actor_updated_at"]) {
+      if (hasColumns(db, "pipeline_stage_attempts", [column])) {
+        db.exec(`ALTER TABLE pipeline_stage_attempts DROP COLUMN ${column}`);
+      }
+    }
+  }
+  if (hasTable(db, "runs")) {
+    // The owner keeps the six live lifecycle columns; the created/updated
+    // stamps were written on every transition but never read anywhere.
+    for (const column of ["actor_created_at", "actor_updated_at"]) {
+      if (hasColumns(db, "runs", [column])) {
+        db.exec(`ALTER TABLE runs DROP COLUMN ${column}`);
+      }
+    }
+  }
+}
+
 const definitions: DatabaseMigrationDefinition[] = [
   {
     version: 1,
@@ -3565,6 +3645,14 @@ const definitions: DatabaseMigrationDefinition[] = [
       if (hasColumns(db, "webhook_deliveries", ["activity_id"])) {
         db.exec("ALTER TABLE webhook_deliveries DROP COLUMN activity_id");
       }
+    },
+  },
+  {
+    version: 50,
+    name: "actor-state-single-owner [rollback-compatible:additive/v1]",
+    source: actorStateSingleOwnerMigrationSource,
+    up(db) {
+      consolidateActorStateOntoRuns(db);
     },
   },
 ];

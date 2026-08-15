@@ -101,7 +101,7 @@ describe("run store", () => {
     });
   });
 
-  it("roots pipeline actor liveness on the owning attempt", () => {
+  it("roots pipeline actor liveness on the run row", () => {
     db.close();
     const fixture = setupPipelineStore();
     db = fixture.db;
@@ -132,23 +132,22 @@ describe("run store", () => {
     })).toBe(true);
     expect(store.renewRunLiveness(runId, "2026-07-22T10:00:00.000Z")).toBe(true);
 
+    // The attempt row carries no actor lifecycle state of its own; the run
+    // row is the single owner for pipeline-backed and direct runs alike.
+    expect(
+      (db.prepare("PRAGMA table_info(pipeline_stage_attempts)").all() as Array<{ name: string }>)
+        .map((column) => column.name)
+    ).not.toContain("actor_state");
     expect(db.prepare(`
-      SELECT id, planned_run_id, actor_state, last_heartbeat_at
-      FROM pipeline_stage_attempts WHERE planned_run_id = ?
+      SELECT actor_state, last_heartbeat_at, expires_at FROM runs WHERE id = ?
     `).get(runId)).toEqual({
-      id: attempt.id,
-      planned_run_id: runId,
       actor_state: "running",
       last_heartbeat_at: "2026-07-22T10:00:00.000Z",
+      expires_at: "2026-07-23T00:00:00.000Z",
     });
-    expect(db.prepare("SELECT actor_state, expires_at FROM runs WHERE id = ?").get(runId))
-      .toEqual({
-        actor_state: "running",
-        expires_at: "2026-07-23T00:00:00.000Z",
-      });
   });
 
-  it("lists a stalled run through its pipeline attempt actor", () => {
+  it("lists a stalled pipeline-backed run through the run-row actor", () => {
     db.close();
     const fixture = setupPipelineStore();
     db = fixture.db;
@@ -177,8 +176,8 @@ describe("run store", () => {
       tokenHash: "c".repeat(64),
       expiresAt: "2026-07-23T00:00:00.000Z",
     })).toBe(true);
-    // The owner-row actor state is the only stall source used by the reaper.
-    expect(db.prepare("SELECT actor_state FROM pipeline_stage_attempts WHERE planned_run_id = ?").get(runId))
+    // The run-row actor state is the only stall source used by the reaper.
+    expect(db.prepare("SELECT actor_state FROM runs WHERE id = ?").get(runId))
       .toEqual({ actor_state: "running" });
 
     expect(store.renewRunLiveness(runId, "2026-07-22T10:00:00.000Z")).toBe(true);

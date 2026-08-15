@@ -74,8 +74,6 @@ export interface Run {
   fault_attribution: FaultAttribution | null;
   termination_confirmed_at: string | null;
   quarantine_reason: string | null;
-  actor_created_at: string | null;
-  actor_updated_at: string | null;
 }
 
 export interface AgentSession {
