@@ -2,6 +2,7 @@
 title: Supervisor module boundaries and persistence decomposition - Plan
 type: refactor
 date: 2026-07-23
+status: shipped
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
 product_contract_source: ce-plan-bootstrap
@@ -147,7 +148,7 @@ This refactor treats those scenarios as characterization coverage: paths and own
 - Any behavior-changing operational or product work, including everything in the 2026-07-24 hardening wave (effect error taxonomy, terminal runtime release, command-stage fallback results, admission preflight, `ce/implement@3`): those land before this refactor via the pipeline-hardening staging PR, and this refactor rebases onto them. Humanized Linear receipts and `needs_human` reply re-delegation remain separate follow-ups after this refactor.
 - Adding repository-authored execution graphs, unit coordinators, parallel execution, or any feature from `docs/plans/2026-07-22-001-feat-repository-configurable-structured-workflows-plan.md`.
 - Renaming pipeline manifest versions or deleting historical migration compatibility solely because the pre-production deployment has no active consumers.
-- Rewriting point-in-time evidence in `docs/AGENTIC-LOOP-REVIEW.md` or prior implementation plans.
+- Rewriting point-in-time evidence in `docs/archive/AGENTIC-LOOP-REVIEW.md` or prior implementation plans.
 - Introducing a monorepo framework, dependency-injection framework, ORM, query builder, or module-resolution alias.
 
 ### Dependencies

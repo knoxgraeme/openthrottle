@@ -2,6 +2,7 @@
 title: "Complete structured workflows U2-U7 before live dogfood - Plan"
 type: fix
 date: 2026-07-29
+status: shipped
 origin: docs/plans/2026-07-22-001-feat-repository-configurable-structured-workflows-plan.md
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready

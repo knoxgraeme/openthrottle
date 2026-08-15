@@ -39,6 +39,7 @@ Requires Node 22, Docker, Fly CLI, Daytona CLI, and the service credentials in
 
 ```bash
 # test all non-live contracts
+npm ci --prefix contracts && npm run build --prefix contracts && npm test --prefix contracts
 npm ci --prefix supervisor && npm test --prefix supervisor
 npm ci --prefix cli && npm test --prefix cli
 npm ci --prefix sandbox && npm test --prefix sandbox
@@ -105,10 +106,14 @@ delegated (the `created` agent event), so apply the label before assigning.
 
 ## Repository layout
 
+- `contracts/` — shared library of canonical JSON and sha256 digest helpers
+  kept byte-identical across packages.
 - `supervisor/` — Hono/SQLite control plane deployed on Fly.
 - `sandbox/` — Daytona image, safety boundary, entrypoint, tests.
-- `skills/` — OpenThrottle stage adapters layered over the native Compound
-  Engineering toolkit installed for Claude Code, Codex, and OpenCode.
+- `skills/` — self-contained OpenThrottle task adapters for Claude Code,
+  Codex, and OpenCode. Each skill carries its own craft; the pinned Compound
+  Engineering plugin remains only as a legacy ambient image input that no
+  skill depends on.
 - `cli/` — the `openthrottle` command-line package.
 - `docs/` — architecture and execution plan.
 

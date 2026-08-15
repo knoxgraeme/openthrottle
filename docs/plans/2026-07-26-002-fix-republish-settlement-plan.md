@@ -2,6 +2,7 @@
 title: "Republish settlement: second publishes must settle like first ones - Plan"
 type: fix
 date: 2026-07-26
+status: shipped
 artifact_contract: ce-unified-plan/v1
 artifact_readiness: implementation-ready
 execution: code

@@ -28,9 +28,12 @@ terminal outcomes. `sandbox/runner/execute-stage.mjs` executes exactly one
 sealed stage and `sandbox/runner/execute-loop.mjs` executes exactly one sealed
 loop action; each writes exactly one typed result.
 
-Five stage-path skills adapt one agent stage each, keyed off the sealed
+Six stage-path skills adapt one agent stage each, keyed off the sealed
 request's `capability` (`sandbox/runner/execute-stage.mjs`'s
-capability→skill map, not task type):
+capability→skill map, not task type). Five of them share the byte-identical
+standing-rules canon; `tune` follows the same single-stage shape but sits
+outside that five-skill canon and is tracked separately by the sandbox skill
+test suite:
 
 - `implement-plan` (`ce/implement@1`) implements or repairs the approved plan.
 - `review-change` (`ce/review@1`) reviews the whole branch diff and returns
