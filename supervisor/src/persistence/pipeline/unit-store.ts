@@ -57,6 +57,8 @@ import {
 
 export type ExecutionGateKind = ChildGateDecision["gateKind"] | "integration" | "final_review";
 
+export type ExecutionGraphStopOutcome = "failure" | "needs_human" | "retryable_infrastructure_failure";
+
 function assertGateMatchesAction(action: ExecutionWorkAttempt, gateKind: ExecutionGateKind): void {
   const expectedAction = gateKind === "unit_acceptance"
     ? "lead"
@@ -91,6 +93,11 @@ export interface ExecutionUnitGraph {
   aggregate_emitted_at: string | null;
   stopped_at: string | null;
   stop_reason: string | null;
+  // Typed terminal outcome persisted alongside the free-text stop_reason so
+  // the aggregate outcome never has to be inferred from sanitized agent text.
+  // NULL on graphs stopped before the column existed and on semantic gate
+  // routing stops that carry only a typed reason.
+  stop_outcome: ExecutionGraphStopOutcome | null;
   created_at: string;
   updated_at: string;
 }
@@ -308,6 +315,7 @@ export interface ExecutionUnitStore {
   stopActiveWork(input: {
     parentAttemptId: string;
     reason: string;
+    outcome?: ExecutionGraphStopOutcome;
   }): "stopped" | "already_stopped";
   // Records that an operator steering reply arrived while this composite
   // run was active and could not be bound to a live child action fence
@@ -1254,7 +1262,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       });
       settleStructurallyBlockedDependents(action.parent_attempt_id, timestamp);
     } else {
-      stopActiveWork({ parentAttemptId: action.parent_attempt_id, reason: lastError });
+      stopActiveWork({ parentAttemptId: action.parent_attempt_id, reason: lastError, outcome: input.outcome });
     }
     return loadActiveAction(db, input.actionId);
   });
@@ -1340,7 +1348,7 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     if (graph && !graph.aggregate_emitted_at && !graph.stopped_at) {
       db.prepare(`
         UPDATE execution_graphs
-        SET stopped_at = ?, stop_reason = ?, updated_at = ?
+        SET stopped_at = ?, stop_reason = ?, stop_outcome = 'retryable_infrastructure_failure', updated_at = ?
         WHERE parent_attempt_id = ? AND stopped_at IS NULL
       `).run(timestamp, lastError, timestamp, action.parent_attempt_id);
       insertExecutionPublicationEvent({
@@ -1547,9 +1555,9 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     `).all(input.parentAttemptId) as Array<{ id: string }>).map((action) => action.id);
     db.prepare(`
       UPDATE execution_graphs
-      SET stopped_at = ?, stop_reason = ?, updated_at = ?
+      SET stopped_at = ?, stop_reason = ?, stop_outcome = ?, updated_at = ?
       WHERE parent_attempt_id = ? AND stopped_at IS NULL
-    `).run(timestamp, input.reason, timestamp, input.parentAttemptId);
+    `).run(timestamp, input.reason, input.outcome ?? null, timestamp, input.parentAttemptId);
     if (activeActionIds.length > 0) {
       db.prepare(`
         UPDATE execution_work_attempts

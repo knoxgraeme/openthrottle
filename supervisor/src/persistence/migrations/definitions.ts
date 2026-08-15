@@ -2367,6 +2367,15 @@ const settingsUpdatedAtMigrationSource = `
 ALTER TABLE settings ADD COLUMN updated_at TEXT;
 settings-retention-contract:every settings write stamps its last write time so the sweep can prune monotonic key families by age; rows written before this migration or by a rolled-back predecessor keep NULL and are never pruned until rewritten/v1`;
 
+const executionGraphStopOutcomeSchema = `
+ALTER TABLE execution_graphs ADD COLUMN stop_outcome TEXT CHECK(
+  stop_outcome IS NULL OR stop_outcome IN ('failure', 'needs_human', 'retryable_infrastructure_failure')
+);
+`;
+
+const executionGraphStopOutcomeMigrationSource = `${executionGraphStopOutcomeSchema}
+stop-outcome-contract:stopped execution graphs persist a typed terminal outcome so the aggregate outcome never derives from sanitized agent stop text/v1`;
+
 type GithubHeadSource =
   | { kind: "authoritative" }
   | { kind: "sequenced"; source: string; sequence: number };
@@ -3512,6 +3521,16 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (hasTable(db, "settings") && !hasColumns(db, "settings", ["updated_at"])) {
         db.exec("ALTER TABLE settings ADD COLUMN updated_at TEXT");
+      }
+    },
+  },
+  {
+    version: 48,
+    name: "execution-graph-stop-outcome [rollback-compatible:additive/v1]",
+    source: executionGraphStopOutcomeMigrationSource,
+    up(db) {
+      if (hasTable(db, "execution_graphs") && !hasColumns(db, "execution_graphs", ["stop_outcome"])) {
+        db.exec(executionGraphStopOutcomeSchema);
       }
     },
   },

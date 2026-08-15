@@ -2001,6 +2001,7 @@ describe("execution unit store", () => {
     expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
       stopped_at: "2026-07-29T00:00:15.000Z",
       stop_reason: expect.stringContaining("observation_attempt=3/3"),
+      stop_outcome: "retryable_infrastructure_failure",
     });
 
     timestamp = "2026-07-29T00:00:30.000Z";
@@ -2050,6 +2051,7 @@ describe("execution unit store", () => {
       expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
         stopped_at: timestamp,
         stop_reason: expect.stringContaining(`retryable=false status=${statusCode}`),
+        stop_outcome: "failure",
       });
 
       expect(await processor.drain("attempt-parent")).toBeUndefined();

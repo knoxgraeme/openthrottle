@@ -186,6 +186,7 @@ describe("database migrations", () => {
       "072679bbc79c4a0f930e8d56be07c4a1a4a124014c0e1453be9709306765a197",
       "ccdf4a1bedafc52eea3aab537d55799e666e25cd78ab5dcc61b8c4c976bde7d7",
       "e9ef3b9a4ddc219cfaa755bd72e73580ef497bcb3c361b5622ab1b412a32dd2a",
+      "ba1a28c92a0e3f84080ce6fe1b329f21855d5e96ebdf3312d22af646d182fff7",
     ]);
   });
 
@@ -292,8 +293,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 47,
-      name: `settings-updated-at${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 48,
+      name: `execution-graph-stop-outcome${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -345,8 +346,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 47,
-      name: `settings-updated-at${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 48,
+      name: `execution-graph-stop-outcome${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 
@@ -419,6 +420,40 @@ describe("database migrations", () => {
     ).get() as { updated_at: string | null };
     expect(stamped.updated_at).toBeTruthy();
     expect(Number.isNaN(Date.parse(stamped.updated_at!))).toBe(false);
+  });
+
+  it("adds the typed stop outcome to a v47 execution graph without disturbing legacy stop rows", () => {
+    db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      CREATE TABLE execution_graphs (id TEXT PRIMARY KEY, stopped_at TEXT, stop_reason TEXT);
+      INSERT INTO execution_graphs(id, stopped_at, stop_reason)
+      VALUES ('legacy-graph', '2026-08-13T00:00:00.000Z', 'retryable_infrastructure_failure: legacy stop');
+    `);
+    for (const migration of databaseMigrations.filter((candidate) => candidate.version <= 47)) {
+      db.prepare(`
+        INSERT INTO schema_migrations(version, name, checksum, applied_at)
+        VALUES (?, ?, ?, '2026-08-13T00:00:00.000Z')
+      `).run(migration.version, migration.name, migration.checksum);
+    }
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare(`
+      SELECT stopped_at, stop_reason, stop_outcome FROM execution_graphs WHERE id = 'legacy-graph'
+    `).get()).toEqual({
+      stopped_at: "2026-08-13T00:00:00.000Z",
+      stop_reason: "retryable_infrastructure_failure: legacy stop",
+      stop_outcome: null,
+    });
+    expect(() => db!.prepare(
+      "UPDATE execution_graphs SET stop_outcome = 'not-an-outcome' WHERE id = 'legacy-graph'"
+    ).run()).toThrow(/CHECK constraint failed/);
   });
 
   // Migrations 34 and 35 issue PRAGMA foreign_keys from inside the runner's
@@ -567,6 +602,9 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT name FROM pragma_table_info('execution_graphs') WHERE name = 'stop_reason'
     `).get()).toEqual({ name: "stop_reason" });
+    expect(db.prepare(`
+      SELECT name FROM pragma_table_info('execution_graphs') WHERE name = 'stop_outcome'
+    `).get()).toEqual({ name: "stop_outcome" });
     expect(db.prepare(`
       SELECT name FROM sqlite_master
       WHERE type = 'index' AND name = 'execution_work_one_active_idx'

@@ -115,6 +115,10 @@ interface PipelineEffectProcessorDeps {
   // own scoped CODEX_HOME. Supplied by the caller (see index.ts) rather than
   // imported here: `operations` may not depend on `providers` directly.
   captureCodexAuth?: (blob: string) => void;
+  // Per-tick bound on the composite child-drain walk; production uses the
+  // structured-child-runtime default. Harnesses that pause a run at an exact
+  // mid-flight state set 1 (see structured-walking-skeleton.mjs).
+  maxChildDrainsPerTick?: number;
 }
 
 interface StopEffectControl {
@@ -285,6 +289,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     runtime: deps.runtime,
     taskTimeoutSeconds: deps.taskTimeoutSeconds,
     now,
+    maxChildDrainsPerTick: deps.maxChildDrainsPerTick,
     completeParentStage(event: PipelineCoordinatorEvent): PipelineInstance {
       if (!event.runId) throw new Error(`pipeline composite event ${event.id} has no run binding`);
       return deps.tickets.finishRunAndThen(
@@ -944,17 +949,24 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
   const drainActiveCompositeGraphs = async (): Promise<void> => {
     const tickets = deps.tickets.listRunning();
     for (const ticket of tickets) {
-      const instance = deps.store.getInstanceForSession(ticket.session_id);
-      if (!instance || ticket.run_id === null) continue;
-      const attempt = deps.store.getActiveAttempt(instance.id);
-      if (!attempt || attempt.run_id !== ticket.run_id || attempt.status === "completed") continue;
-      const stage = stageById(instance.normalized_manifest, instance.active_stage_id);
-      if (!stage || stage.executor.capability !== FOR_EACH_UNIT_CAPABILITY) continue;
-      const binding = runtimeBindingFor(instance);
-      if (!binding.resource || binding.status !== "active") continue;
-      if (!structuredChildren.compositeGraphNeedsDrain(attempt.id)) continue;
-      await deps.runtime.setActive(binding.resource.providerResourceId);
-      await structuredChildren.drainCompositeChildren(binding.resource, instance, attempt.id);
+      // One ticket's failing drain must not abort the rest of this cycle;
+      // its own graph retries on the next tick.
+      try {
+        const instance = deps.store.getInstanceForSession(ticket.session_id);
+        if (!instance || ticket.run_id === null) continue;
+        const attempt = deps.store.getActiveAttempt(instance.id);
+        if (!attempt || attempt.run_id !== ticket.run_id || attempt.status === "completed") continue;
+        const stage = stageById(instance.normalized_manifest, instance.active_stage_id);
+        if (!stage || stage.executor.capability !== FOR_EACH_UNIT_CAPABILITY) continue;
+        const binding = runtimeBindingFor(instance);
+        if (!binding.resource || binding.status !== "active") continue;
+        if (!structuredChildren.compositeGraphNeedsDrain(attempt.id)) continue;
+        await deps.runtime.setActive(binding.resource.providerResourceId);
+        await structuredChildren.drainCompositeChildren(binding.resource, instance, attempt.id);
+      } catch (error) {
+        console.error(`[pipeline-effects] composite child drain failed for ticket ${ticket.ticket_id}:`,
+          sanitizeText(String(error)).slice(-500));
+      }
     }
   };
 

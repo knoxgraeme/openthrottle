@@ -588,6 +588,43 @@ describe("pipeline effect processor", () => {
     expect(tickets.getByIssueId("issue-1")?.sandbox_id).toBe("sandbox-new-generation");
   });
 
+  it("settles an actor bound to an already-cleaned runtime resource without regressing it", async () => {
+    const { tickets, pipelines, runtime, processor, instance, attempt } =
+      harness("issue-cleaned-settle", "session-cleaned-settle");
+
+    await processor.drain();
+    await processor.drain();
+    expect(pipelines.getRuntimeResource(instance.id)?.status).toBe("active");
+    expect(tickets.getRun(attempt.planned_run_id!)).toMatchObject({ status: "running" });
+
+    // The binding was already stopped and cleaned while the durable run
+    // projection still shows a live actor.
+    pipelines.setRuntimeResourceStatus(instance.id, "cleaned");
+    const retentionAnchor = "2099-07-22T11:00:00.000Z";
+    db!.prepare("UPDATE pipeline_instances SET runtime_resource_updated_at = ? WHERE id = ?")
+      .run(retentionAnchor, instance.id);
+
+    requestPipelineStop({
+      store: pipelines,
+      sessionId: "session-cleaned-settle",
+      eventId: "operator-stop:cleaned-settle",
+      reason: "Stopped by test.",
+    });
+    const stopCalls = runtime.stop.mock.calls.length;
+    await processor.drain();
+
+    // Nothing was terminated, so onTerminated must not fire: the resource
+    // stays cleaned and the reclaim retention window does not restart.
+    expect(runtime.stop.mock.calls.length).toBe(stopCalls);
+    expect(pipelines.getRuntimeResource(instance.id)).toMatchObject({
+      status: "cleaned",
+      updated_at: retentionAnchor,
+    });
+    expect(tickets.getRun(attempt.planned_run_id!)).toMatchObject({ status: "stopped" });
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.kind === "stop"))
+      .toMatchObject({ status: "acknowledged" });
+  });
+
   it("seeds and drains a structured composite host without dispatching a sandbox stage", async () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
@@ -1479,7 +1516,13 @@ describe("pipeline effect processor", () => {
         throw new Error("validator provider launch acknowledgement lost");
       }
       reviewAuthEvents.push(`dispatch:${request.skill}`);
-      successfullyDispatchedReviewActions.add(request.actionId);
+      // The same-tick child walk can dispatch the follow-up final-repair
+      // action right after the review settles; only review subactions may
+      // yield the mocked semantic_review results.
+      if (["select-review-personas", "correctness-dataflow", "tests-contracts", "validate-review-findings"]
+        .includes(request.skill)) {
+        successfullyDispatchedReviewActions.add(request.actionId);
+      }
       return { providerDispatchId: "loop-child-drain" };
     });
     const captureCodexAuth = vi.fn((blob: string) => reviewAuthEvents.push(`capture:${blob}`));
@@ -1803,7 +1846,18 @@ describe("pipeline effect processor", () => {
       "2099-07-22T12:00:00.000Z",
       freshReview.id
     );
-    await expect(processor.drain()).rejects.toThrow(/final review subject to match the integrated subject/);
+    // Aggregate-side fence violations no longer abort the whole drain cycle:
+    // the per-ticket guard logs them and the graph retries next tick.
+    const compositeDrainError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const expectLoggedCompositeDrainFailure = (pattern: RegExp) => {
+      expect(compositeDrainError).toHaveBeenLastCalledWith(
+        expect.stringContaining("composite child drain failed for ticket issue-child-drain"),
+        expect.stringMatching(pattern)
+      );
+      compositeDrainError.mockClear();
+    };
+    await processor.drain();
+    expectLoggedCompositeDrainFailure(/final review subject to match the integrated subject/);
     db!.prepare(`
       UPDATE execution_work_attempts
       SET output_subject = ?, receipt = ?, result_hash = ?, updated_at = ?
@@ -1821,7 +1875,8 @@ describe("pipeline effect processor", () => {
       SET integration_subject = NULL, updated_at = ?
       WHERE parent_attempt_id = ?
     `).run("2099-07-22T12:00:00.000Z", attempt.id);
-    await expect(processor.drain()).rejects.toThrow(/has no exact subject/);
+    await processor.drain();
+    expectLoggedCompositeDrainFailure(/has no exact subject/);
     db!.prepare(`
       UPDATE execution_graphs
       SET integration_subject = ?, updated_at = ?
@@ -1854,7 +1909,8 @@ describe("pipeline effect processor", () => {
       treeSubject: finalIntegratedTreeSubject,
       clean: false,
     }));
-    await expect(processor.drain()).rejects.toThrow(/accepted integration receipt does not seal a clean tree/);
+    await processor.drain();
+    expectLoggedCompositeDrainFailure(/accepted integration receipt does not seal a clean tree/);
     rewriteFinalIntegrationReceipt(receiptJson({
       instance,
       action: finalIntegrate,
@@ -1865,7 +1921,8 @@ describe("pipeline effect processor", () => {
 
     const beforeAggregateStatus = pipelines.getInstance(instance.id)!.status;
     db!.prepare("UPDATE pipeline_instances SET status = 'publication_blocked' WHERE id = ?").run(instance.id);
-    await expect(processor.drain()).rejects.toThrow(/pipeline publication is blocked/);
+    await processor.drain();
+    expectLoggedCompositeDrainFailure(/pipeline publication is blocked/);
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
       aggregate_emitted_at: expect.any(String),
       aggregate_artifact_hash: expect.any(String),
@@ -2079,6 +2136,7 @@ describe("pipeline effect processor", () => {
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({
       stopped_at: expect.any(String),
       stop_reason: expect.stringContaining("retryable_infrastructure_failure"),
+      stop_outcome: "retryable_infrastructure_failure",
       aggregate_emitted_at: null,
     });
 
@@ -2228,12 +2286,136 @@ describe("pipeline effect processor", () => {
     });
     now = new Date("2099-07-22T12:00:05.000Z");
     await processor.drain();
-    expect(runtime.dispatchLoopAction).toHaveBeenCalledTimes(dispatchCalls);
+    // The recovered action settles without being re-dispatched; the same-tick
+    // walk may dispatch the unit's next phase action, which is a fresh action.
+    expect(runtime.dispatchLoopAction.mock.calls.filter(([, request]) =>
+      (request as { actionId?: string }).actionId === action.id
+    )).toHaveLength(dispatchCalls);
     expect(pipelines.listWorkAttempts(attempt.id)[0]).toMatchObject({
       id: action.id,
       status: "completed",
       output_subject: completedSubject,
     });
+  });
+
+  it("keeps draining later composite tickets when an earlier ticket's drain fails", async () => {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const tickets = createSupervisorStore(db, pipelines);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("structured-drain-isolation-test/v1");
+    const catalog = loadPipelineCatalog(catalogPath, runtimeDescriptor.descriptor);
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    pipelines.acceptCatalog(catalog);
+    const repositoryConfig = parseRepositoryConfig([
+      "schema: openthrottle.config/v1",
+      "default_graph: simple",
+      "graphs:",
+      "  - id: simple",
+      "    kind: builtin",
+      "    ref: core/simple@1",
+      "  - id: structured",
+      "    kind: builtin",
+      "    ref: core/structured@3",
+      "commands: { test: npm test, lint: npm run lint, build: npm run build }",
+      "pipelines: { implement: implement }",
+    ].join("\n"));
+    const config = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: repositoryConfig,
+    });
+    const manifest = parseAndCompileExecutionGraph(readFileSync(structuredGraphPath, "utf8"), {
+      id: "builtin/structured",
+      runtime: runtimeDescriptor.descriptor,
+      config: repositoryConfig.config,
+      aggregatePublishContext: "prefer_resume",
+    }).manifest;
+    pipelines.acceptManifest(manifest);
+    const upsertStructuredTicket = (issueId: string, sessionId: string) => {
+      tickets.upsert({
+        ticket_id: issueId,
+        ticket_reference: issueId.toUpperCase(),
+        session_id: sessionId,
+        sandbox_id: null,
+        branch: `ot/${issueId}`,
+        agent: "codex",
+        repo: "owner/repo",
+        pr_url: null,
+        state: "active",
+        pipeline: {
+          repository: "owner/repo",
+          baseCommit: "a".repeat(40),
+          manifest,
+          repositoryConfig: config,
+          runtime: runtimeDescriptor,
+          authorizedCapabilities: manifest.manifest.requires.capabilities,
+          taskType: "implement",
+          taskContext: [
+            "Approved structured plan.",
+            "",
+            "```json openthrottle.execution-plan/v1",
+            JSON.stringify({
+              schema: "openthrottle.execution-plan/v1",
+              graph_id: "structured",
+              plan_id: `structured-${issueId}`,
+              instructions: { implement_a: "Implement unit A." },
+              acceptance: { unit_a_done: "Unit A is complete." },
+              units: [{
+                id: "unit_a",
+                title: "Unit A",
+                depends_on: [],
+                instructions: ["implement_a"],
+                acceptance: ["unit_a_done"],
+              }],
+              commands: [],
+            }, null, 2),
+            "```",
+          ].join("\n"),
+        },
+      });
+    };
+    upsertStructuredTicket("issue-drain-poison", "session-drain-poison");
+    upsertStructuredTicket("issue-drain-healthy", "session-drain-healthy");
+    const poisonedInstance = pipelines.getInstanceForSession("session-drain-poison")!;
+    const healthyInstance = pipelines.getInstanceForSession("session-drain-healthy")!;
+    const runtime = sandboxRuntimeMock({ issueId: "drain-isolation" });
+    let provisioned = 0;
+    runtime.provision.mockImplementation(async () => ({
+      providerResourceId: `sandbox-isolation-${provisioned += 1}`,
+    }));
+    const processor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+
+    await processor.drain();
+    const poisonedResource = pipelines.getRuntimeResource(poisonedInstance.id)!.provider_resource_id;
+    const healthyResource = pipelines.getRuntimeResource(healthyInstance.id)!.provider_resource_id;
+    expect(poisonedResource).not.toBe(healthyResource);
+    // The failing ticket must come first in the per-cycle walk to prove the
+    // later ticket is not starved by its error.
+    db.prepare("UPDATE tickets SET running_since = ? WHERE ticket_id = 'issue-drain-poison'")
+      .run("2099-07-22T11:00:00.000Z");
+    db.prepare("UPDATE tickets SET running_since = ? WHERE ticket_id = 'issue-drain-healthy'")
+      .run("2099-07-22T11:30:00.000Z");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    runtime.setActive.mockImplementation((async (providerResourceId: string) => {
+      if (providerResourceId === poisonedResource) throw new Error("poisoned sandbox activation failed");
+    }) as never);
+
+    await expect(processor.drain()).resolves.toBeUndefined();
+
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining("composite child drain failed for ticket issue-drain-poison"),
+      expect.stringContaining("poisoned sandbox activation failed")
+    );
+    expect(runtime.setActive).toHaveBeenCalledWith(poisonedResource);
+    expect(runtime.setActive).toHaveBeenCalledWith(healthyResource);
   });
 
   it("preserves valid failed command receipts for reducer handling", async () => {

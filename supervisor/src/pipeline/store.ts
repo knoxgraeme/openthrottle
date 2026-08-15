@@ -505,6 +505,7 @@ export interface PipelineStore extends ChildActionLivenessPort {
   }): void;
   getInboxEvent(id: string): PipelineInboxEventRecord | undefined;
   listPendingInboxEvents(kind: string, limit?: number): PipelineInboxEventRecord[];
+  markInboxEventDead(id: string): void;
   enqueueInboxEvent(input: {
     id: string;
     instanceId: string;

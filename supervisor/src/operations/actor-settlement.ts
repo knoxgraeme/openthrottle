@@ -42,8 +42,13 @@ export async function terminateAndSettleActor(params: {
   if (!claimed) return { kind: "lost" };
 
   try {
-    if (params.sandboxId) await params.runtime.stopResource(params.sandboxId, params.reason);
-    params.onTerminated?.();
+    // onTerminated reports a confirmed provider termination. With no sandbox
+    // bound there is nothing to terminate, and firing it would let callers
+    // regress an already-cleaned runtime resource back to "stopped".
+    if (params.sandboxId) {
+      await params.runtime.stopResource(params.sandboxId, params.reason);
+      params.onTerminated?.();
+    }
   } catch (error) {
     if (params.quarantineOnStopFailure === false) throw error;
     const message = sanitizeText(
