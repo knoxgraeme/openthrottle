@@ -831,8 +831,8 @@ its enforcement.
 SQLite is the authority. Core tables include:
 
 - ticket/run/session projections: `tickets`, `runs`, `agent_sessions`;
-- durable transport: `webhook_deliveries`, `control_outbox`, `session_inbox`,
-  `sandbox_events`, `work_items`, `work_item_sources`, `work_deliveries`;
+- durable transport: `webhook_deliveries`, `control_outbox`,
+  `steering_items`, `sandbox_events`;
 - provider evidence: `provider_events`, `feedback_snapshots`,
   `feedback_snapshot_events`;
 - immutable selection: `pipeline_catalog_entries`, `pipeline_catalog_aliases`,
@@ -849,6 +849,13 @@ SQLite is the authority. Core tables include:
 - settlement rollup measurement corpus: `run_outcomes`;
 - operations: `repository_registrations`, `supervisor_leases`, `settings`,
   `schema_migrations`, `migration_reconciliation`.
+
+Migration 51 makes `steering_items` the single owner of steering message,
+session/run fence, and active-delivery state. The legacy `session_inbox`,
+`work_items`, and `work_deliveries` tables remain as additive history and
+backfill inputs but receive no post-cutover steering writes. This cutover is
+deploy-forward-only by operator policy: after new steering is written, a
+pre-migration release cannot recover it from the legacy tables.
 
 Each `agent_sessions` generation stores `provider_activated_at`, copied from
 the provider event that activated that generation. GitHub-controlled sessions

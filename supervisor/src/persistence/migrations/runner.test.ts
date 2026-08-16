@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { openDb } from "../database.js";
+import { applyBaseSchema } from "../schema.js";
 import {
   canonicalJson,
   parsePipelineManifest,
@@ -18,6 +19,7 @@ import { GATE_RECEIPT_REASONS } from "../../pipeline/gates.js";
 import { FAULT_ATTRIBUTIONS } from "../../pipeline/fault-attribution.js";
 import { ENGINES } from "../pipeline/run-outcome-store.js";
 import { createSettingsStore } from "../settings-store.js";
+import { createSupervisorStore } from "../store.js";
 import { considerCiGithubHead } from "../../providers/github/events.js";
 import {
   applyDatabaseMigrations,
@@ -189,7 +191,156 @@ describe("database migrations", () => {
       "ba1a28c92a0e3f84080ce6fe1b329f21855d5e96ebdf3312d22af646d182fff7",
       "0dd5b83a690d982be21f4232daa62ed45eaa66f082c6a100284004305bbde74b",
       "5e755e28e1a6a500c108c9cf3c6c4a66f97dc78309b9be11fe1af204b688d7f2",
+      "dc95d1c2eadd2bdc4698af255b6d7aae6708159fdd28e1630954a57ff79be891",
     ]);
+  });
+
+  it("backfills the single steering owner from the legacy inbox and active delivery", () => {
+    // Migration 1 used this three-field encoding when it introduced WorkStore
+    // and backfilled the pre-ledger session inbox. Migration 51 must preserve
+    // those bytes while still accepting an exact provider retry of the ID.
+    const legacyRequestHash = createHash("sha256")
+      .update(JSON.stringify(["steer-1", "session-1", "keep this message"]))
+      .digest("hex");
+    db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    applyBaseSchema(db);
+    applyDatabaseMigrationsForAuthority(db, {
+      migrations: databaseMigrations.filter((migration) => migration.version <= 50),
+      rollbackCompatibleMigrationNameSuffix: ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+    });
+    db.exec(`
+      INSERT INTO tickets (
+        ticket_id, ticket_reference, session_id, control_provider, external_thread_id,
+        external_thread_reference, branch, agent, repo, state, total_cost_usd,
+        base_branch, created_at, updated_at
+      ) VALUES (
+        'issue-1', 'OT-1', 'session-1', 'linear', 'issue-1', 'OT-1',
+        'ot/ot-1', 'codex', 'owner/repo', 'active', 0, 'main',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      INSERT INTO agent_sessions (
+        id, ticket_id, generation, state, provider_conversation_id, created_at, updated_at
+      ) VALUES (
+        'session-1', 'issue-1', 2, 'current', 'native-1',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      INSERT INTO runs (
+        id, ticket_id, session_id, session_generation, task_type, token_hash,
+        status, started_at, expires_at, actor_state
+      ) VALUES (
+        'run-1', 'issue-1', 'session-1', 2, 'implement', 'hash', 'running',
+        '2026-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z', 'running'
+      );
+      INSERT INTO session_inbox (
+        id, ticket_id, session_id, run_id, source, body, status, created_at, delivered_at
+      ) VALUES (
+        'steer-1', 'issue-1', 'session-1', 'run-1', 'human', 'keep this message',
+        'dispatched', '2026-01-01T00:00:01.000Z', '2026-01-01T00:00:02.000Z'
+      );
+      INSERT INTO work_items (
+        id, ticket_id, session_id, run_id, native_session_id, generation,
+        context_revision, source, priority, body, request_hash, status,
+        active_delivery_id, available_at, created_at, updated_at
+      ) VALUES (
+        'steer-1', 'issue-1', 'session-1', NULL, 'native-1', 2, 0,
+        'human', 0, 'keep this message', '${legacyRequestHash}', 'dispatched',
+        'delivery-1', '2026-01-01T00:00:01.000Z', '2026-01-01T00:00:01.000Z',
+        '2026-01-01T00:00:02.000Z'
+      );
+      INSERT INTO work_deliveries (
+        id, work_item_id, attempt_ordinal, idempotency_key, ticket_id, session_id,
+        run_id, native_session_id, generation, context_revision, request_hash,
+        status, lease_until, created_at, dispatched_at
+      ) VALUES (
+        'delivery-1', 'steer-1', 1, 'delivery-key', 'issue-1', 'session-1',
+        'run-1', 'native-1', 2, 0, '${legacyRequestHash}', 'dispatched',
+        '2099-01-01T00:00:00.000Z', '2026-01-01T00:00:01.000Z',
+        '2026-01-01T00:00:02.000Z'
+      );
+    `);
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare("SELECT * FROM steering_items WHERE id = 'steer-1'").get()).toMatchObject({
+      ticket_id: "issue-1",
+      session_id: "session-1",
+      run_id: "run-1",
+      status: "dispatched",
+      delivery_id: "delivery-1",
+      request_hash: legacyRequestHash,
+      generation: 2,
+      native_session_id: "native-1",
+      lease_until: "2099-01-01T00:00:00.000Z",
+    });
+
+    const store = createSupervisorStore(db);
+    expect(store.enqueueInbox({
+      id: "steer-1",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: "run-1",
+      source: "human",
+      body: "keep this message",
+    })).toMatchObject({ id: "steer-1", request_hash: legacyRequestHash });
+    expect(db.prepare("SELECT request_hash FROM steering_items WHERE id = 'steer-1'").get())
+      .toEqual({ request_hash: legacyRequestHash });
+
+    const postCutover = store.enqueueInbox({
+      id: "steer-post-cutover",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: "run-1",
+      source: "operator",
+      body: "visible only to the deploy-forward owner",
+    });
+    expect(store.enqueueInbox({
+      id: "steer-post-cutover",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: "run-1",
+      source: "operator",
+      body: "visible only to the deploy-forward owner",
+    })).toEqual(postCutover);
+    expect(db.prepare("SELECT id FROM steering_items WHERE id = 'steer-post-cutover'").get())
+      .toEqual({ id: "steer-post-cutover" });
+    expect(db.prepare("SELECT id FROM session_inbox WHERE id = 'steer-post-cutover'").get())
+      .toBeUndefined();
+    expect(db.prepare("SELECT id FROM work_items WHERE id = 'steer-post-cutover'").get())
+      .toBeUndefined();
+    expect(db.prepare("SELECT work_item_id FROM work_deliveries WHERE work_item_id = 'steer-post-cutover'").get())
+      .toBeUndefined();
+  });
+
+  it("uses the v51 partial index for run-bound steering settlement", () => {
+    db = openDb(":memory:");
+
+    const index = db.prepare(`
+      SELECT sql FROM sqlite_master
+      WHERE type = 'index' AND name = 'steering_items_run_settlement_idx'
+    `).get() as { sql: string } | undefined;
+    expect(index?.sql).toContain("WHERE status IN ('pending', 'dispatched')");
+
+    const plan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      UPDATE steering_items SET status = 'canceled'
+      WHERE run_id = ? AND status IN ('pending', 'dispatched')
+    `).all("run-1") as Array<{ detail: string }>;
+    expect(plan.map((step) => step.detail).join("\n"))
+      .toContain("steering_items_run_settlement_idx");
+  });
+
+  it("marks migration 51 deploy-forward-only while retaining the mechanically required additive suffix", () => {
+    const migration = databaseMigrations.find((candidate) => candidate.version === 51)!;
+
+    expect(migration.name).toBe(
+      `steering-items-single-owner${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`
+    );
+    expect(migration.source).toContain("deployment-policy:deploy-forward-only/operator-authorized/v1");
+    expect(migration.source).toContain("copy work_items.request_hash byte-for-byte");
+    expect(migration.source).toContain("legacy tables remain only for additive schema and old-row backfill");
+    expect(migration.source).toContain("no dual-write");
+    expect(migration.source).toContain("rollback does not expose steering written after cutover");
   });
 
   it("persists tune as a closed task type on fresh and upgraded databases", () => {
@@ -295,8 +446,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 50,
-      name: `actor-state-single-owner${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 51,
+      name: `steering-items-single-owner${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -348,8 +499,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 50,
-      name: `actor-state-single-owner${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 51,
+      name: `steering-items-single-owner${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 
@@ -567,6 +718,9 @@ describe("database migrations", () => {
     expect(db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'work_deliveries'"
     ).get()).toEqual({ name: "work_deliveries" });
+    expect(db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'steering_items'"
+    ).get()).toEqual({ name: "steering_items" });
     expect(db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'orchestration_journal'"
     ).get()).toEqual({ name: "orchestration_journal" });
