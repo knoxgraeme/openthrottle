@@ -12,6 +12,20 @@ set -euo pipefail
 
 AGENT_USER="agent"
 AGENT_HOME="/home/agent"
+ACTION_USERS=(
+  "$AGENT_USER"
+  ot-review-final
+  ot-review-selector
+  ot-review-correctness
+  ot-review-tests
+  ot-review-reliability
+  ot-review-agent-native
+  ot-review-security
+  ot-review-data
+  ot-review-performance
+  ot-review-standards
+  ot-review-validator
+)
 REPO_DIR="${AGENT_HOME}/repo"
 OT_DIR="${AGENT_HOME}/.ot"
 OPT_DIR="/opt/openthrottle"
@@ -36,15 +50,19 @@ as_agent() {
 }
 
 # A stage may be followed by another stage in the same sandbox. Kill any
-# agent-owned descendants before new credentials or trusted runtime config are
-# materialized so a process from an untrusted review cannot cross that boundary.
+# descendants owned by the stage agent or any isolated review principal before
+# new credentials or trusted runtime config are materialized, so a process from
+# an untrusted review cannot cross that boundary.
 terminate_agent_processes() {
-  local status=0
-  pkill -KILL -u "$AGENT_USER" 2>/dev/null || status=$?
-  if [[ "$status" -ne 0 && "$status" -ne 1 ]]; then
-    log "FATAL: could not terminate stale agent processes"
-    return "$status"
-  fi
+  local user status
+  for user in "${ACTION_USERS[@]}"; do
+    status=0
+    pkill -KILL -u "$user" 2>/dev/null || status=$?
+    if [[ "$status" -ne 0 && "$status" -ne 1 ]]; then
+      log "FATAL: could not terminate stale ${user} processes"
+      return "$status"
+    fi
+  done
 }
 
 # Composite loop actions keep the shared stage profiles executor-sealed while

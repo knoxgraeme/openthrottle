@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { liveAgentPidsFromPs, runWithAgentProcessFence } from "./agent-process-fence.mjs";
+import { liveAgentPidsFromPs, runWithAgentProcessFence, runWithUserProcessFence } from "./agent-process-fence.mjs";
 
 describe("agent process fence", () => {
   it("ignores zombie agent processes during convergence", () => {
@@ -23,6 +23,25 @@ describe("agent process fence", () => {
 
     expect(result).toBe("ok");
     expect(events).toEqual(["converge", "execute", "converge"]);
+  });
+
+  it("scopes convergence to the selected action principal", () => {
+    const events = [];
+    const result = runWithUserProcessFence(
+      "ot-review-tests",
+      () => {
+        events.push("execute");
+        return "ok";
+      },
+      (user) => events.push(`converge:${user}`),
+    );
+
+    expect(result).toBe("ok");
+    expect(events).toEqual([
+      "converge:ot-review-tests",
+      "execute",
+      "converge:ot-review-tests",
+    ]);
   });
 
   it("still requires post-action convergence when execution throws", () => {

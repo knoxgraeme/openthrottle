@@ -183,13 +183,13 @@ function credentialPassthroughEnv(credentialEnv) {
 // full prepareActionHomeEnvironment pipeline depends on.
 export { writeCodexAuthFile };
 
-export function prepareLoopAgentEnvironment(request, repoDir, credentialEnv = {}) {
+export function prepareLoopAgentEnvironment(request, repoDir, credentialEnv = {}, principal = "agent") {
   const gitObjectEnv = prepareLoopGitObjectEnvironment(request, repoDir);
   const transportEnv = prepareLoopTransportEnvironment(request);
   const homeEnv = prepareActionHomeEnvironment(request, credentialEnv, repoDir);
   const repositoryViewGitEnv = request.worktree ? [] : gitSafeDirectoryEnv(repoDir);
   const env = [
-    "USER=agent", "GIT_OPTIONAL_LOCKS=0",
+    `USER=${principal}`, "GIT_OPTIONAL_LOCKS=0",
     ...repositoryViewGitEnv, ...gitObjectEnv.env, ...transportEnv, ...homeEnv.env,
   ];
   // The process env handed to gosu itself: safeBaseEnv() replaces whatever

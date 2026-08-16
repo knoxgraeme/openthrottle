@@ -74,7 +74,21 @@ RUN npm install -g \
 # ---------------------------------------------------------------------------
 RUN useradd --create-home --home-dir /home/agent --shell /bin/bash --user-group agent \
     && mkdir -p /home/agent/.ot /home/agent/.claude /home/agent/.codex \
-    && chown -R agent:agent /home/agent
+    && chown -R agent:agent /home/agent \
+    && for user in \
+      ot-review-final \
+      ot-review-selector \
+      ot-review-correctness \
+      ot-review-tests \
+      ot-review-reliability \
+      ot-review-agent-native \
+      ot-review-security \
+      ot-review-data \
+      ot-review-performance \
+      ot-review-standards \
+      ot-review-validator; do \
+        useradd --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group "$user"; \
+      done
 
 # ---------------------------------------------------------------------------
 # OpenThrottle payload. Build context is the repo root:

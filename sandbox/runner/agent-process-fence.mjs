@@ -7,14 +7,14 @@ function sleepMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function agentUid() {
+function userUid(user) {
   if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
-  const result = spawnSync("id", ["-u", "agent"], {
+  const result = spawnSync("id", ["-u", user], {
     encoding: "utf8",
     timeout: 2_000,
   });
   if (result.error || result.status !== 0 || !/^\d+\n?$/.test(result.stdout)) {
-    throw new Error("agent process fence could not resolve the installed agent uid");
+    throw new Error(`action process fence could not resolve the installed ${user} uid`);
   }
   return result.stdout.trim();
 }
@@ -42,8 +42,8 @@ function agentPids(uid) {
   return liveAgentPidsFromPs(result.stdout);
 }
 
-function convergeAgentProcessesToEmpty() {
-  const uid = agentUid();
+function convergeUserProcessesToEmpty(user) {
+  const uid = userUid(user);
   if (!uid) return;
   const deadline = Date.now() + AGENT_PROCESS_FENCE_TIMEOUT_MS;
   let signaled = false;
@@ -73,9 +73,10 @@ function unconfirmedTerminationError(error) {
   return wrapped;
 }
 
-export function runWithAgentProcessFence(execute, terminate = convergeAgentProcessesToEmpty) {
+export function runWithUserProcessFence(user, execute, terminate = convergeUserProcessesToEmpty) {
+  const converge = () => terminate(user);
   try {
-    terminate();
+    converge();
   } catch (error) {
     throw unconfirmedTerminationError(error);
   }
@@ -85,9 +86,17 @@ export function runWithAgentProcessFence(execute, terminate = convergeAgentProce
     // Executor-owned evidence must not be collected while escaped agent
     // processes can still mutate the repository or action-local state.
     try {
-      terminate();
+      converge();
     } catch (error) {
       throw unconfirmedTerminationError(error);
     }
   }
+}
+
+export function runWithAgentProcessFence(execute, terminate) {
+  return runWithUserProcessFence(
+    "agent",
+    execute,
+    terminate ? () => terminate() : convergeUserProcessesToEmpty,
+  );
 }

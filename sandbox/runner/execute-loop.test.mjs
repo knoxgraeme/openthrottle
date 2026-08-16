@@ -11,6 +11,7 @@ import {
   gitSafeDirectoryConfigArgs,
   lockPersistentAgentPrivateRoots,
   loopAgentCommand,
+  loopActionPrincipal,
   loopCredentialsPath,
   loopPrivateRecoveryDiffPath,
   loopRequestPath,
@@ -2182,6 +2183,70 @@ describe("loop action request validation", () => {
         return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
       },
     });
+  });
+
+  it("launches a review persona under its dedicated OS principal", () => {
+    const integrationRepoDir = repository();
+    const subject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: integrationRepoDir,
+      encoding: "utf8",
+    }).trim();
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const review = validateLoopRequest(request({
+      actionId: "review-parent.review.correctness-dataflow",
+      role: "reviewer",
+      loop: "review",
+      skill: "correctness-dataflow",
+      worktree: null,
+      baseSubject: subject,
+      inputSubject: subject,
+      credentialScopes: ["model.invoke", "repo.read"],
+      expectedReceiptType: "semantic_review",
+    }));
+    let launchArgs;
+
+    runLoopAgentInPreparedRepository({
+      request: review,
+      invocation: resolveLoopInvocation(review),
+      integrationRepoDir,
+      lockIntegration: () => true,
+      lockPersistentProfiles: () => [],
+      processFence: (execute) => execute(),
+      runProcess: (_command, args, options) => {
+        if ("input" in options) launchArgs = args;
+        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+      },
+    });
+
+    expect(loopActionPrincipal(review)).toBe("ot-review-correctness");
+    expect(launchArgs.slice(0, 2)).toEqual(["ot-review-correctness", "env"]);
+    expect(launchArgs).toContain("USER=ot-review-correctness");
+  });
+
+  it("assigns every review role a distinct fixed OS principal", () => {
+    const reviewSkills = [
+      "final-review",
+      "select-review-personas",
+      "correctness-dataflow",
+      "tests-contracts",
+      "reliability-adversarial",
+      "agent-native-contracts",
+      "security",
+      "data-migration",
+      "performance",
+      "project-standards",
+      "validate-review-findings",
+    ];
+    const principals = reviewSkills.map((skill) => loopActionPrincipal({
+      role: "reviewer",
+      loop: "review",
+      skill,
+    }));
+
+    expect(new Set(principals).size).toBe(reviewSkills.length);
+    expect(principals.every((principal) => principal.startsWith("ot-review-"))).toBe(true);
   });
 
   it("runs non-worker loops in an action-scoped read-only repository view", () => {
