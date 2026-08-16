@@ -142,7 +142,23 @@ const MAX_DOWNSTREAM_CONTEXT_BYTES = 32_768;
 const DEFAULT_WORKTREE_ROOT = "/var/lib/openthrottle/worktrees";
 const INTEGRATION_REPO_DIR = "/home/agent/repo";
 const RECEIPT_CORRECTION_ATTEMPTS = 1;
+// Caps how many sealed-envelope mismatches (schema/fence/subject/producer)
+// one correction pass will silently overwrite with authoritative values --
+// kept conservative, since a receipt wrong across many envelope fields at
+// once is more likely a confused/wrong-context candidate than simple noise.
 const MAX_RECEIPT_CORRECTION_DIAGNOSTICS = 8;
+// Caps how many distinct unknown-field deletions the iterative correction
+// loop in deterministicallyCorrectReceipt will apply. Unlike an envelope
+// mismatch, an unknown field is always a pure, safe deletion (never
+// semantic content -- see assertCorrectableReceiptCandidate), so this can
+// run higher: a whole-change final review can legitimately carry many
+// findings, and a reviewer that drifts from the {severity, message, path}
+// schema tends to repeat the same extra field(s) across most of them, not
+// just one. 8 was too low for that realistic case -- two live structured
+// runs (OPE-177, OPE-179) hit "unknown-field count exceeds the
+// deterministic correction bound" and escalated to needs_human even though
+// every diagnosed field was a safe, mechanical deletion.
+const MAX_RECEIPT_CORRECTION_UNKNOWN_FIELD_DIAGNOSTICS = 32;
 const MAX_INLINE_PRIVATE_RECOVERY_DIFF_BYTES = 48 * 1024;
 // Recovery is exceptional and private, but still bounded. Larger payloads
 // travel in a separate root-owned file that the supervisor downloads before
@@ -1294,7 +1310,7 @@ function deterministicallyCorrectReceipt({ invalidReceipt, diagnostics, request,
       });
       if (!diagnostic || diagnostic.expected !== "field absent" ||
           appliedDiagnostics.some((entry) => entry.pointer === diagnostic.pointer)) throw error;
-      if (appliedDiagnostics.length >= MAX_RECEIPT_CORRECTION_DIAGNOSTICS) {
+      if (appliedDiagnostics.length >= MAX_RECEIPT_CORRECTION_UNKNOWN_FIELD_DIAGNOSTICS) {
         throw new Error("receipt correction unknown-field count exceeds the deterministic correction bound");
       }
       appliedDiagnostics.push(diagnostic);

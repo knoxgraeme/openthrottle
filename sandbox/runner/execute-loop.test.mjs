@@ -4507,8 +4507,8 @@ describe("executeLoopAction", () => {
   });
 
   it.each([
-    [8, "success"],
-    [9, "failure"],
+    [32, "success"],
+    [33, "failure"],
   ])("keeps the unknown-field correction bound at %i fields", (unknownFieldCount, expectedOutcome) => {
     const valid = request();
     writeFileSync(join(loopWorktreeDirectory(valid), "completed-work.txt"), "completed work\n");
