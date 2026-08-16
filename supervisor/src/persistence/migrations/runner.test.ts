@@ -191,7 +191,7 @@ describe("database migrations", () => {
       "ba1a28c92a0e3f84080ce6fe1b329f21855d5e96ebdf3312d22af646d182fff7",
       "0dd5b83a690d982be21f4232daa62ed45eaa66f082c6a100284004305bbde74b",
       "5e755e28e1a6a500c108c9cf3c6c4a66f97dc78309b9be11fe1af204b688d7f2",
-      "dc95d1c2eadd2bdc4698af255b6d7aae6708159fdd28e1630954a57ff79be891",
+      "167edf7c177c22c3074446c93e742cf44b47a9dc5da5e338d64f9e06f8549f07",
     ]);
   });
 
@@ -237,6 +237,21 @@ describe("database migrations", () => {
       ) VALUES (
         'steer-1', 'issue-1', 'session-1', 'run-1', 'human', 'keep this message',
         'dispatched', '2026-01-01T00:00:01.000Z', '2026-01-01T00:00:02.000Z'
+      ), (
+        'steer-legacy-delivered', 'issue-1', 'session-1', 'run-1', 'operator',
+        'historically delivered then canceled', 'delivered',
+        '2026-01-01T00:00:03.000Z', '2026-01-01T00:00:04.000Z'
+      ), (
+        'steer-live-acknowledged', 'issue-1', 'session-1', 'run-1', 'operator',
+        'acknowledged and consumed', 'acknowledged',
+        '2026-01-01T00:00:05.000Z', '2026-01-01T00:00:06.000Z'
+      ), (
+        'steer-live-canceled', 'issue-1', 'session-1', 'run-1', 'operator',
+        'canceled before delivery', 'canceled',
+        '2026-01-01T00:00:07.000Z', NULL
+      ), (
+        'steer-live-pending', 'issue-1', 'session-1', NULL, 'human',
+        'still pending', 'pending', '2026-01-01T00:00:08.000Z', NULL
       );
       INSERT INTO work_items (
         id, ticket_id, session_id, run_id, native_session_id, generation,
@@ -247,6 +262,26 @@ describe("database migrations", () => {
         'human', 0, 'keep this message', '${legacyRequestHash}', 'dispatched',
         'delivery-1', '2026-01-01T00:00:01.000Z', '2026-01-01T00:00:01.000Z',
         '2026-01-01T00:00:02.000Z'
+      ), (
+        'steer-legacy-delivered', 'issue-1', 'session-1', NULL, 'native-1', 2, 0,
+        'operator', 10, 'historically delivered then canceled', 'legacy-canceled-hash',
+        'canceled', NULL, '2026-01-01T00:00:03.000Z', '2026-01-01T00:00:03.000Z',
+        '2026-01-01T00:00:04.000Z'
+      ), (
+        'steer-live-acknowledged', 'issue-1', 'session-1', NULL, 'native-1', 2, 0,
+        'operator', 10, 'acknowledged and consumed', 'legacy-consumed-hash',
+        'consumed', 'delivery-consumed', '2026-01-01T00:00:05.000Z',
+        '2026-01-01T00:00:05.000Z', '2026-01-01T00:00:06.000Z'
+      ), (
+        'steer-live-canceled', 'issue-1', 'session-1', NULL, 'native-1', 2, 0,
+        'operator', 10, 'canceled before delivery', 'legacy-canceled-pair-hash',
+        'canceled', NULL, '2026-01-01T00:00:07.000Z',
+        '2026-01-01T00:00:07.000Z', '2026-01-01T00:00:07.000Z'
+      ), (
+        'steer-live-pending', 'issue-1', 'session-1', NULL, 'native-1', 2, 0,
+        'human', 0, 'still pending', 'legacy-pending-hash', 'pending', NULL,
+        '2026-01-01T00:00:08.000Z', '2026-01-01T00:00:08.000Z',
+        '2026-01-01T00:00:08.000Z'
       );
       INSERT INTO work_deliveries (
         id, work_item_id, attempt_ordinal, idempotency_key, ticket_id, session_id,
@@ -257,6 +292,11 @@ describe("database migrations", () => {
         'run-1', 'native-1', 2, 0, '${legacyRequestHash}', 'dispatched',
         '2099-01-01T00:00:00.000Z', '2026-01-01T00:00:01.000Z',
         '2026-01-01T00:00:02.000Z'
+      ), (
+        'delivery-consumed', 'steer-live-acknowledged', 1, 'delivery-consumed-key',
+        'issue-1', 'session-1', 'run-1', 'native-1', 2, 0,
+        'legacy-consumed-hash', 'consumed', '2026-01-01T00:01:00.000Z',
+        '2026-01-01T00:00:05.000Z', '2026-01-01T00:00:06.000Z'
       );
     `);
 
@@ -285,6 +325,22 @@ describe("database migrations", () => {
     })).toMatchObject({ id: "steer-1", request_hash: legacyRequestHash });
     expect(db.prepare("SELECT request_hash FROM steering_items WHERE id = 'steer-1'").get())
       .toEqual({ request_hash: legacyRequestHash });
+    expect(db.prepare(`
+      SELECT status, run_id, delivery_id
+      FROM steering_items WHERE id = 'steer-legacy-delivered'
+    `).get()).toEqual({
+      status: "canceled",
+      run_id: "run-1",
+      delivery_id: null,
+    });
+    expect(db.prepare(`
+      SELECT id, status, delivery_id FROM steering_items
+      WHERE id LIKE 'steer-live-%' ORDER BY id
+    `).all()).toEqual([
+      { id: "steer-live-acknowledged", status: "acknowledged", delivery_id: "delivery-consumed" },
+      { id: "steer-live-canceled", status: "canceled", delivery_id: null },
+      { id: "steer-live-pending", status: "pending", delivery_id: null },
+    ]);
 
     const postCutover = store.enqueueInbox({
       id: "steer-post-cutover",
@@ -310,6 +366,75 @@ describe("database migrations", () => {
       .toBeUndefined();
     expect(db.prepare("SELECT work_item_id FROM work_deliveries WHERE work_item_id = 'steer-post-cutover'").get())
       .toBeUndefined();
+  });
+
+  it("maps every durable work status without reviving terminal legacy steering", () => {
+    db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    applyBaseSchema(db);
+    applyDatabaseMigrationsForAuthority(db, {
+      migrations: databaseMigrations.filter((migration) => migration.version <= 50),
+      rollbackCompatibleMigrationNameSuffix: ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+    });
+    db.exec(`
+      INSERT INTO tickets (
+        ticket_id, ticket_reference, session_id, control_provider, external_thread_id,
+        external_thread_reference, branch, agent, repo, state, total_cost_usd,
+        base_branch, created_at, updated_at
+      ) VALUES (
+        'issue-statuses', 'OT-STATUSES', 'session-statuses', 'linear',
+        'issue-statuses', 'OT-STATUSES', 'ot/statuses', 'codex', 'owner/repo',
+        'active', 0, 'main', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      INSERT INTO agent_sessions (
+        id, ticket_id, generation, state, created_at, updated_at
+      ) VALUES (
+        'session-statuses', 'issue-statuses', 1, 'current',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+    `);
+    const insertInbox = db.prepare(`
+      INSERT INTO session_inbox (
+        id, ticket_id, session_id, run_id, source, body, status, created_at
+      ) VALUES (?, 'issue-statuses', 'session-statuses', NULL, 'human', ?, ?, ?)
+    `);
+    const insertWork = db.prepare(`
+      INSERT INTO work_items (
+        id, ticket_id, session_id, run_id, native_session_id, generation,
+        context_revision, source, priority, body, request_hash, status,
+        active_delivery_id, available_at, created_at, updated_at
+      ) VALUES (
+        ?, 'issue-statuses', 'session-statuses', NULL, NULL, 1, 0,
+        'human', 0, ?, ?, ?, NULL, ?, ?, ?
+      )
+    `);
+    const cases = [
+      ["pending", "pending", "pending"],
+      ["leased", "pending", "pending"],
+      ["dispatched", "delivered", "dispatched"],
+      ["acknowledged", "acknowledged", "acknowledged"],
+      ["consumed", "acknowledged", "acknowledged"],
+      ["canceled", "delivered", "canceled"],
+      ["dead", "delivered", "canceled"],
+      ["reconciliation", "delivered", "canceled"],
+    ] as const;
+    cases.forEach(([workStatus, inboxStatus], index) => {
+      const id = `steer-status-${workStatus}`;
+      const body = `status ${workStatus}`;
+      const timestamp = `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`;
+      insertInbox.run(id, body, inboxStatus, timestamp);
+      insertWork.run(id, body, `hash-${workStatus}`, workStatus, timestamp, timestamp, timestamp);
+    });
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare(`
+      SELECT id, status FROM steering_items
+      WHERE ticket_id = 'issue-statuses' ORDER BY id
+    `).all()).toEqual(cases.map(([workStatus, , expectedStatus]) => ({
+      id: `steer-status-${workStatus}`,
+      status: expectedStatus,
+    })).sort((left, right) => left.id.localeCompare(right.id)));
   });
 
   it("uses the v51 partial index for run-bound steering settlement", () => {
@@ -338,6 +463,7 @@ describe("database migrations", () => {
     );
     expect(migration.source).toContain("deployment-policy:deploy-forward-only/operator-authorized/v1");
     expect(migration.source).toContain("copy work_items.request_hash byte-for-byte");
+    expect(migration.source).toContain("work_items is the newer status authority");
     expect(migration.source).toContain("legacy tables remain only for additive schema and old-row backfill");
     expect(migration.source).toContain("no dual-write");
     expect(migration.source).toContain("rollback does not expose steering written after cutover");
