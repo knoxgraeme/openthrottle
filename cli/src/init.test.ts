@@ -11,28 +11,40 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseGraphContract, validateRepositoryConfigContract } from "@openthrottle/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { parse } from "yaml";
-import {
+import init, {
   detectPackageManager,
   detectProject,
   detectRepository,
   editableSkillsRefreshSummary,
   getSupervisorTaskTimeoutSeconds,
   initOutro,
+  parseInitArgs,
   parseGithubRemote,
   planEditableSkillsDryRun,
   planEditableSkillsRefresh,
+  preflightSupervisor,
   promptConfig,
   registerTargetRepository,
   registrationSummary,
   writeProjectConfig,
+  type InitCommandOptions,
   type ProjectConfig,
 } from "./init.js";
+import { LocalFileSecretStore } from "./onboarding/secret-store.js";
+import {
+  LocalSupervisorAccessStore,
+  type SupervisorAccessStore,
+} from "./onboarding/supervisor-access-store.js";
+import { LOCAL_SECRET_KEYS } from "./setup.js";
 
 const directories: string[] = [];
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+  vi.unstubAllGlobals();
+  vi.doUnmock("@clack/prompts");
+  process.exitCode = undefined;
 });
 
 function temporaryProject(): string {
@@ -103,6 +115,74 @@ function initPromptHarness(controlProvider: "linear" | "github") {
   return { calls, prompts };
 }
 
+const configuredSupervisorEnv = {
+  OT_SUPERVISOR_URL: "https://supervisor.test",
+  OT_STATUS_TOKEN: "operator-token",
+} as const;
+
+function memorySupervisorAccessStore(
+  values: Record<string, { supervisorUrl: string; statusToken: string }> = {}
+): SupervisorAccessStore {
+  return {
+    load: async (profileName) => values[profileName],
+    save: async (profileName, access) => { values[profileName] = access; },
+    pathFor: (profileName) => `/home/test/.openthrottle/supervisor-access/${profileName}.json`,
+  };
+}
+
+const validCapabilities = {
+  release: "test-release",
+  capabilityDigest: "a".repeat(64),
+  capabilities: ["agent/semantic@1"],
+  limits: { taskTimeoutSeconds: 7200 },
+};
+
+function initPreflightHarness(
+  env: Record<string, string | undefined>,
+  request: NonNullable<InitCommandOptions["request"]>
+) {
+  const messages: string[] = [];
+  let downstreamCalls = 0;
+  const markDownstreamCall = () => {
+    downstreamCalls += 1;
+  };
+  const options: InitCommandOptions = {
+    env,
+    request,
+    supervisorAccessStore: memorySupervisorAccessStore(),
+    detectRepository: () => {
+      markDownstreamCall();
+      return { repo: "acme/widget" };
+    },
+    detectProject: () => {
+      markDownstreamCall();
+      return { pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" };
+    },
+    promptConfig: async () => {
+      markDownstreamCall();
+      throw new Error("questionnaire must not run");
+    },
+    registerTargetRepository: async () => {
+      markDownstreamCall();
+      throw new Error("registration must not run");
+    },
+    reportPreflightFailure: (message) => messages.push(message),
+  };
+  return { options, messages, downstreamCalls: () => downstreamCalls };
+}
+
+function recordSupervisorRequests(): Array<{ url: string; authorization: string | null }> {
+  const requests: Array<{ url: string; authorization: string | null }> = [];
+  vi.stubGlobal("fetch", async (input: string | URL | Request, requestInit?: RequestInit) => {
+    requests.push({
+      url: String(input),
+      authorization: new Headers(requestInit?.headers).get("Authorization"),
+    });
+    return Response.json(String(input).endsWith("/capabilities") ? validCapabilities : { ok: true });
+  });
+  return requests;
+}
+
 function mutableEditableResources(): { root: string; graphPath: string; skillDirectory: string } {
   const root = temporaryProject();
   const graphPath = join(root, "simple-v1.json");
@@ -111,6 +191,62 @@ function mutableEditableResources(): { root: string; graphPath: string; skillDir
   cpSync(resolve(process.cwd(), "../supervisor/graphs/simple-v1.json"), graphPath);
   cpSync(resolve(process.cwd(), "../skills/tasks/implement-plan"), skillDirectory, { recursive: true });
   return { root, graphPath, skillDirectory };
+}
+
+async function runInitWithSnapshotState(state: string) {
+  const directory = temporaryProject();
+  const originalDirectory = process.cwd();
+  const log = {
+    info: vi.fn(),
+    warn: vi.fn(),
+    success: vi.fn(),
+    error: vi.fn(),
+  };
+  const spinner = { start: vi.fn(), stop: vi.fn() };
+  const outro = vi.fn();
+  vi.resetModules();
+  vi.doMock("@clack/prompts", () => ({
+    cancel: vi.fn(),
+    confirm: vi.fn(async () => true),
+    group: vi.fn(),
+    intro: vi.fn(),
+    isCancel: vi.fn(() => false),
+    log,
+    outro,
+    select: vi.fn(),
+    spinner: vi.fn(() => spinner),
+    text: vi.fn(),
+  }));
+
+  try {
+    process.chdir(directory);
+    const { default: initWithMockPrompts } = await import("./init.js");
+    await initWithMockPrompts([], {
+      env: configuredSupervisorEnv,
+      request: async (path) => Response.json(path === "/capabilities" ? validCapabilities : { ok: true }),
+      detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
+      detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
+      promptConfig: async () => ({
+        project: completeProjectConfig(),
+        registration: {
+          repo: "acme/widget",
+          baseBranch: "main",
+          controlProvider: "github",
+        },
+      }),
+      registerTargetRepository: async () => ({
+        registration: { github_repo: "acme/widget", base_branch: "main" },
+        readiness: {
+          github: "ready",
+          webhook: "created",
+          snapshot: { name: "openthrottle", state },
+        },
+      }),
+    });
+  } finally {
+    process.chdir(originalDirectory);
+  }
+  return { log, outro, spinner };
 }
 
 describe("init project detection", () => {
@@ -405,6 +541,7 @@ describe("init project detection", () => {
       return Response.json({
         registration: { github_repo: "acme/widget", base_branch: "develop" },
         readiness: {
+          github: "ready",
           webhook: "created",
           snapshot: { name: "openthrottle", state: "active" },
         },
@@ -433,6 +570,7 @@ describe("init project detection", () => {
       return Response.json({
         registration: { github_repo: "acme/widget", base_branch: "main" },
         readiness: {
+          github: "ready",
           webhook: "created",
           snapshot: { name: "openthrottle", state: "active" },
         },
@@ -442,6 +580,57 @@ describe("init project detection", () => {
       repo: "acme/widget",
       controlProvider: "github",
     }, request)).resolves.toMatchObject({ registration: { github_repo: "acme/widget" } });
+  });
+
+  it("rejects a malformed successful registration response", async () => {
+    await expect(registerTargetRepository({
+      repo: "acme/widget",
+      controlProvider: "github",
+    }, async () => Response.json({
+      registration: { github_repo: "acme/widget", base_branch: "main" },
+      readiness: {},
+    }))).rejects.toThrow("invalid repository registration response");
+  });
+
+  it("rejects registration responses without ready GitHub and known webhook evidence", async () => {
+    for (const readiness of [
+      { github: "error", webhook: "created" },
+      { github: "ready", webhook: "installed" },
+    ]) {
+      await expect(registerTargetRepository({
+        repo: "acme/widget",
+        controlProvider: "github",
+      }, async () => Response.json({
+        registration: { github_repo: "acme/widget", base_branch: "main" },
+        readiness: {
+          ...readiness,
+          snapshot: { name: "openthrottle", state: "active" },
+        },
+      }))).rejects.toThrow("invalid repository registration response");
+    }
+  });
+
+  it("fails init with setup guidance when registration reports a not-ready snapshot", async () => {
+    const { log, outro, spinner } = await runInitWithSnapshotState("error");
+
+    expect(process.exitCode).toBe(1);
+    expect(spinner.stop).toHaveBeenCalledWith("Repository registered, but platform readiness failed");
+    expect(log.error).toHaveBeenCalledWith(
+      "Platform snapshot not ready — run `openthrottle setup` (Daytona snapshot openthrottle is error)."
+    );
+    expect(log.success).not.toHaveBeenCalledWith(expect.stringContaining("Daytona snapshot"));
+    expect(outro).not.toHaveBeenCalled();
+  });
+
+  it("still completes init when registration reports an active snapshot", async () => {
+    const { log, outro, spinner } = await runInitWithSnapshotState("active");
+
+    expect(process.exitCode).toBeUndefined();
+    expect(spinner.stop).toHaveBeenCalledWith("Registered acme/widget on main");
+    expect(log.success).toHaveBeenCalledWith(
+      "GitHub webhook created; Daytona snapshot openthrottle is active."
+    );
+    expect(outro).toHaveBeenCalledOnce();
   });
 
   it("scaffolds the exact editable simple-pipeline package under .openthrottle", () => {
@@ -866,6 +1055,290 @@ describe("init project detection", () => {
     expect(() => writeProjectConfig(config, directory, { editableSkills: true }))
       .toThrow(/requires a lint command/);
     expect(() => readFileSync(join(directory, ".openthrottle.yml"), "utf8")).toThrow();
+  });
+
+  it("diagnoses missing supervisor configuration before detection, prompts, or registration", async () => {
+    let requestCalls = 0;
+    const harness = initPreflightHarness({}, async () => {
+      requestCalls += 1;
+      return Response.json({});
+    });
+    await init([], harness.options);
+
+    expect(process.exitCode).toBe(1);
+    expect(requestCalls).toBe(0);
+    expect(harness.downstreamCalls()).toBe(0);
+    expect(harness.messages).toEqual([
+      expect.stringMatching(/run `openthrottle setup`.*export OT_SUPERVISOR_URL and OT_STATUS_TOKEN/),
+    ]);
+  });
+
+  it("uses default-profile supervisor access when init has no exported credentials", async () => {
+    const requests = recordSupervisorRequests();
+
+    await expect(init([], {
+      env: {},
+      supervisorAccessStore: memorySupervisorAccessStore({
+        default: {
+          supervisorUrl: "https://profile-supervisor.test",
+          statusToken: "profile-token",
+        },
+      }),
+      detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
+      detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
+      promptConfig: async () => {
+        throw new Error("questionnaire reached");
+      },
+    })).rejects.toThrow("questionnaire reached");
+
+    expect(requests).toEqual([
+      { url: "https://profile-supervisor.test/healthz", authorization: "Bearer profile-token" },
+      { url: "https://profile-supervisor.test/capabilities", authorization: "Bearer profile-token" },
+    ]);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("ignores a complete legacy secret document when loading separate supervisor access", async () => {
+    const secretRoot = temporaryProject();
+    const accessRoot = temporaryProject();
+    const legacyStore = new LocalFileSecretStore({ root: secretRoot, allowedKeys: LOCAL_SECRET_KEYS, env: {} });
+    for (const [key, value] of [
+      ["status_token", "legacy-token"],
+      ["deploy_token", "deploy-token"],
+      ["install_secret", "install-secret"],
+      ["linear_webhook_secret", "linear-secret"],
+      ["github_webhook_secret", "github-secret"],
+    ] as const) {
+      await legacyStore.set("default", key, value);
+    }
+    const legacyBefore = readFileSync(legacyStore.pathFor("default"), "utf8");
+    const accessStore = new LocalSupervisorAccessStore(accessRoot);
+    await accessStore.save("default", {
+      supervisorUrl: "https://profile-supervisor.test",
+      statusToken: "access-token",
+    });
+    const requests = recordSupervisorRequests();
+
+    await expect(init([], {
+      env: {},
+      supervisorAccessStore: accessStore,
+      detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
+      detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
+      promptConfig: async () => { throw new Error("questionnaire reached"); },
+    })).rejects.toThrow("questionnaire reached");
+
+    expect(requests[0]?.authorization).toBe("Bearer access-token");
+    expect(readFileSync(legacyStore.pathFor("default"), "utf8")).toBe(legacyBefore);
+    expect(legacyBefore).not.toContain("supervisor_url");
+  });
+
+  it("prefers explicit supervisor env vars over stored profile access", async () => {
+    let secretLoads = 0;
+    const requests = recordSupervisorRequests();
+
+    await expect(init([], {
+      env: configuredSupervisorEnv,
+      supervisorAccessStore: {
+        load: async () => {
+          secretLoads += 1;
+          return { supervisorUrl: "https://stored.test", statusToken: "profile-token" };
+        },
+      },
+      detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
+      detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
+      promptConfig: async () => {
+        throw new Error("questionnaire reached");
+      },
+    })).rejects.toThrow("questionnaire reached");
+
+    expect(secretLoads).toBe(0);
+    expect(requests).toEqual([
+      { url: "https://supervisor.test/healthz", authorization: "Bearer operator-token" },
+      { url: "https://supervisor.test/capabilities", authorization: "Bearer operator-token" },
+    ]);
+  });
+
+  it("selects a named profile and its matching supervisor-access entry", async () => {
+    const requests = recordSupervisorRequests();
+
+    await expect(init(["--profile", "prod"], {
+      env: {},
+      supervisorAccessStore: memorySupervisorAccessStore({
+        prod: {
+          supervisorUrl: "https://prod-supervisor.test",
+          statusToken: "prod-token",
+        },
+      }),
+      detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
+      detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
+      promptConfig: async () => {
+        throw new Error("questionnaire reached");
+      },
+    })).rejects.toThrow("questionnaire reached");
+
+    expect(requests).toEqual([
+      { url: "https://prod-supervisor.test/healthz", authorization: "Bearer prod-token" },
+      { url: "https://prod-supervisor.test/capabilities", authorization: "Bearer prod-token" },
+    ]);
+  });
+
+  it("does not mix partial environment credentials with profile fallback credentials", async () => {
+    for (const env of [
+      { OT_SUPERVISOR_URL: "https://attacker.test" },
+      { OT_STATUS_TOKEN: "explicit-token" },
+    ]) {
+      let secretLoads = 0;
+      const harness = initPreflightHarness(env, async () => {
+        throw new Error("partial credentials must not make a request");
+      });
+      harness.options.supervisorAccessStore = {
+        load: async () => {
+          secretLoads += 1;
+          return { supervisorUrl: "https://stored.test", statusToken: "profile-token" };
+        },
+      };
+
+      await init([], harness.options);
+
+      expect(process.exitCode).toBe(1);
+      expect(secretLoads).toBe(0);
+      expect(harness.downstreamCalls()).toBe(0);
+      process.exitCode = undefined;
+    }
+  });
+
+  it("reports an invalid stored access document without a stack trace or downstream work", async () => {
+    const harness = initPreflightHarness({}, async () => {
+      throw new Error("invalid access must not make a request");
+    });
+    harness.options.supervisorAccessStore = {
+      load: async () => { throw new Error("refusing to read supervisor access document"); },
+    };
+
+    await init(["--profile", "prod"], harness.options);
+
+    expect(process.exitCode).toBe(1);
+    expect(harness.downstreamCalls()).toBe(0);
+    expect(harness.messages).toEqual([
+      expect.stringMatching(
+        /Stored supervisor access for profile prod is invalid.*refusing to read supervisor access document.*setup --profile prod/
+      ),
+    ]);
+  });
+
+  it("parses init profile selection without weakening existing option validation", () => {
+    expect(parseInitArgs(["--profile", "prod", "--editable-skills", "--dry-run"])).toEqual({
+      profile: "prod",
+      editableSkills: true,
+      dryRun: true,
+    });
+    expect(() => parseInitArgs(["--profile"])).toThrow("--profile requires");
+    expect(() => parseInitArgs(["--unknown"])).toThrow("Unknown init option");
+  });
+
+  it("diagnoses an unreachable supervisor before detection, prompts, or registration", async () => {
+    const harness = initPreflightHarness(configuredSupervisorEnv, async () => {
+      throw new Error("connect ECONNREFUSED");
+    });
+    await init([], harness.options);
+
+    expect(process.exitCode).toBe(1);
+    expect(harness.downstreamCalls()).toBe(0);
+    expect(harness.messages).toEqual([
+      expect.stringMatching(/Supervisor is unreachable.*openthrottle setup --check/),
+    ]);
+  });
+
+  it("diagnoses a status-token mismatch separately from supervisor reachability", async () => {
+    const paths: string[] = [];
+    const harness = initPreflightHarness({
+      ...configuredSupervisorEnv,
+      OT_STATUS_TOKEN: "wrong-token",
+    }, async (path) => {
+      paths.push(path);
+      return path === "/healthz" ? Response.json({ ok: true }) : Response.json({}, { status: 401 });
+    });
+    await init([], harness.options);
+
+    expect(process.exitCode).toBe(1);
+    expect(paths).toEqual(["/healthz", "/capabilities"]);
+    expect(harness.downstreamCalls()).toBe(0);
+    expect(harness.messages).toEqual([
+      expect.stringMatching(/authentication failed.*OT_STATUS_TOKEN does not match/),
+    ]);
+    expect(harness.messages[0]).not.toContain("unreachable");
+  });
+
+  it("runs both supervisor checks before proceeding to the questionnaire", async () => {
+    const paths: string[] = [];
+    let promptCalls = 0;
+    let registrationCalls = 0;
+    await expect(init([], {
+      env: configuredSupervisorEnv,
+      request: async (path) => {
+        paths.push(path);
+        return Response.json(path === "/capabilities" ? validCapabilities : { ok: true });
+      },
+      detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
+      detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
+      promptConfig: async () => {
+        promptCalls += 1;
+        throw new Error("questionnaire reached");
+      },
+      registerTargetRepository: async () => {
+        registrationCalls += 1;
+        throw new Error("registration must not run before the questionnaire completes");
+      },
+    })).rejects.toThrow("questionnaire reached");
+
+    expect(paths).toEqual(["/healthz", "/capabilities"]);
+    expect(promptCalls).toBe(1);
+    expect(registrationCalls).toBe(0);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("fails closed when successful preflight responses have malformed bodies", async () => {
+    for (const responses of [
+      { health: { ok: false }, capabilities: validCapabilities },
+      { health: { ok: true }, capabilities: { limits: { taskTimeoutSeconds: 7200 } } },
+    ]) {
+      const harness = initPreflightHarness(configuredSupervisorEnv, async (path) => Response.json(
+        path === "/healthz" ? responses.health : responses.capabilities
+      ));
+
+      await init([], harness.options);
+
+      expect(process.exitCode).toBe(1);
+      expect(harness.downstreamCalls()).toBe(0);
+      expect(harness.messages).toEqual([
+        expect.stringMatching(/invalid.*response.*openthrottle setup --check/i),
+      ]);
+      process.exitCode = undefined;
+    }
+  });
+
+  it("fails closed when a successful preflight response is not JSON", async () => {
+    const harness = initPreflightHarness(configuredSupervisorEnv, async () => (
+      new Response("not-json", { status: 200 })
+    ));
+
+    await init([], harness.options);
+
+    expect(process.exitCode).toBe(1);
+    expect(harness.downstreamCalls()).toBe(0);
+    expect(harness.messages).toEqual([
+      expect.stringMatching(/invalid health response.*openthrottle setup --check/i),
+    ]);
+  });
+
+  it("classifies preflight HTTP failures without consuming response bodies", async () => {
+    await expect(preflightSupervisor(
+      async () => new Response(null, { status: 503 }),
+      configuredSupervisorEnv
+    )).resolves.toMatchObject({
+      status: "unreachable",
+      message: expect.stringContaining("openthrottle setup --check"),
+    });
   });
 
   it("reads the supervisor timeout capability and formats a read-only refresh plan", async () => {

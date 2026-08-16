@@ -23,7 +23,7 @@ function temporaryDirectory(): string {
 }
 
 describe("onboarding profile store", () => {
-  it("persists versioned non-secret provider state with owner-only permissions", async () => {
+  it("persists versioned provider state with owner-only permissions", async () => {
     const root = temporaryDirectory();
     const store = new FileProfileStore(root);
     const profile = createProfile({

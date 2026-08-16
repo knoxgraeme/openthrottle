@@ -75,12 +75,18 @@ repository's GitHub webhook, and verifies the canonical Daytona snapshot:
 
 ```bash
 npx openthrottle init
+# for a named setup profile: npx openthrottle init --profile prod
 npx openthrottle ship docs/plans/my-change.md
 npx openthrottle status
 ```
 
-`init` requires `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN` and asks which control
-provider to use. One Linear team currently routes to one GitHub repository;
+`setup` saves the supervisor URL and status token as an owner-only access
+document separate from the downgrade-compatible local secret store. `init`
+uses that document for the selected profile (default `default`) when both
+`OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN` are absent. A complete explicit pair
+takes precedence; supplying only one fails closed and never mixes environment
+and stored credentials. `init` asks which control provider to use. One Linear
+team currently routes to one GitHub repository;
 GitHub-Issue control is repository-native and needs no Linear team. Re-running
 `init` updates that registration without restarting Fly or creating a new
 Daytona snapshot. Linear delegations from unmatched teams and GitHub Issues

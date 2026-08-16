@@ -28,12 +28,18 @@ export function requireEnv(name: string, hint?: string): string {
   return v;
 }
 
-export function supervisorRequest(path: string, init?: RequestInit): Promise<Response> {
-  const supervisorUrl = requireEnv(
+export function supervisorRequest(
+  path: string,
+  init?: RequestInit,
+  env: Record<string, string | undefined> = process.env
+): Promise<Response> {
+  const supervisorUrl = requireSupervisorValue(
+    env,
     'OT_SUPERVISOR_URL',
     'the base URL of your deployed supervisor, e.g. https://openthrottle.fly.dev'
   );
-  const statusToken = requireEnv(
+  const statusToken = requireSupervisorValue(
+    env,
     'OT_STATUS_TOKEN',
     'the operator bearer token configured on the supervisor'
   );
@@ -44,6 +50,17 @@ export function supervisorRequest(path: string, init?: RequestInit): Promise<Res
     headers,
     signal: init?.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
   });
+}
+
+function requireSupervisorValue(
+  env: Record<string, string | undefined>,
+  name: 'OT_SUPERVISOR_URL' | 'OT_STATUS_TOKEN',
+  hint: string
+): string {
+  if (env === process.env) return requireEnv(name, hint);
+  const value = env[name]?.trim();
+  if (!value) throw new Error(`Missing required env var: ${name} — ${hint}`);
+  return value;
 }
 
 /**
