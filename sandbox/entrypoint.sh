@@ -263,32 +263,15 @@ if [[ -n "${CODEX_AUTH_JSON:-}" ]]; then
   # Only strip a *trailing* newline here — this is a JSON blob, not a bare
   # token, so we must not touch whitespace inside it.
   SEED_AUTH="${CODEX_AUTH_JSON%$'\n'}"
-  if [[ -s "${AGENT_HOME}/.codex/auth.json" ]]; then
-    # Resume reuses this sandbox, and Codex may have rotated its refresh token
-    # into auth.json (OpenAI invalidates the previous refresh token on every
-    # rotation). But the supervisor now refreshes centrally before seeding, so
-    # the seed can be *newer* than the local copy. Install whichever is newest
-    # and from the same account; fail closed if the accounts differ.
-    EXISTING_AUTH="$(as_agent "cat '${AGENT_HOME}/.codex/auth.json'")"
-    case "$(codex_reconcile_auth "$SEED_AUTH" "$EXISTING_AUTH")" in
-      incompatible)
-        log "FATAL: seeded Codex auth account does not match the sandbox's existing token; refusing to cross accounts"
-        exit 1
-        ;;
-      seed)
-        printf '%s' "$SEED_AUTH" | gosu "$AGENT_USER" tee "${AGENT_HOME}/.codex/auth.json" >/dev/null
-        chmod 0600 "${AGENT_HOME}/.codex/auth.json"
-        log "~/.codex/auth.json present but the seeded token is newer — installing the supervisor's refreshed token"
-        ;;
-      *)
-        log "~/.codex/auth.json present and newer-or-equal — keeping the sandbox's rotated token"
-        ;;
-    esac
-  else
-    printf '%s' "$SEED_AUTH" | gosu "$AGENT_USER" tee "${AGENT_HOME}/.codex/auth.json" >/dev/null
-    chmod 0600 "${AGENT_HOME}/.codex/auth.json"
-    log "wrote ~/.codex/auth.json"
-  fi
+  # The seed always wins. The supervisor is the sole refresh authority: it
+  # hands this sandbox an access-token-only blob (`tokens.refresh_token` is
+  # the empty string) that already covers the whole action timeout, so the
+  # sandbox can never mint a token worth preserving and any auth.json left
+  # over from an earlier stage of a resumed sandbox is strictly staler than
+  # what we are about to install.
+  printf '%s' "$SEED_AUTH" | gosu "$AGENT_USER" tee "${AGENT_HOME}/.codex/auth.json" >/dev/null
+  chmod 0600 "${AGENT_HOME}/.codex/auth.json"
+  log "wrote ~/.codex/auth.json"
 else
   rm -f "${AGENT_HOME}/.codex/auth.json"
 fi

@@ -56,7 +56,8 @@ export interface DaytonaSandboxRuntimeOptions {
   materializeCredentialEnv: (
     resource: RuntimeResource,
     scopes: readonly string[],
-    agent?: LoopActionRequest["agent"]
+    agent?: LoopActionRequest["agent"],
+    actionTimeoutMs?: number
   ) => Promise<DaytonaStageCredentialMaterialization>;
   taskTimeoutSeconds?: number;
 }
@@ -284,9 +285,7 @@ function parseCollectedLoopResult(raw: string, input: { attemptId: string; actio
       typeof event.created_at !== "string" || Number.isNaN(Date.parse(event.created_at)) ||
       (event.subject !== null && (typeof event.subject !== "string" || !/^[a-f0-9]{40,64}$/.test(event.subject))) ||
       (event.native_session_id !== null && typeof event.native_session_id !== "string") ||
-      typeof event.receipt !== "string" ||
-      (event.codex_auth_json !== undefined &&
-        (typeof event.codex_auth_json !== "string" || Buffer.byteLength(event.codex_auth_json, "utf8") > 65_536))) {
+      typeof event.receipt !== "string") {
     throw new Error(`sealed loop result ${input.attemptId}/${input.actionId} has an invalid envelope`);
   }
   const baseResult: LoopActionResult = {
@@ -298,7 +297,6 @@ function parseCollectedLoopResult(raw: string, input: { attemptId: string; actio
     subject: event.subject as string | null,
     receipt: event.receipt as string,
     completedAt: event.created_at as string,
-    ...(typeof event.codex_auth_json === "string" ? { codexAuthJson: event.codex_auth_json } : {}),
   };
   let recoveryArtifact: string | null = null;
   if (event.recovery_artifact !== undefined) {
@@ -693,7 +691,8 @@ export function createDaytonaSandboxRuntime(
       const credentialMaterialization = await options.materializeCredentialEnv(
         resource,
         request.credentialScopes,
-        request.agent
+        request.agent,
+        request.timeoutMs
       );
       assertSandboxCredentialEnv(credentialMaterialization.env, `loop action ${request.actionId}`);
       const actionDirectory = `${LOOP_ACTION_DIR}/${request.attemptId}/${request.actionId}`;

@@ -300,6 +300,12 @@ describe("Daytona stage execution", () => {
     await expect(runtime.dispatchLoopAction(resource, loopRequest)).resolves.toEqual({
       providerDispatchId: "dispatch-opaque-1",
     });
+    expect(credentialProvider).toHaveBeenLastCalledWith(
+      resource,
+      loopRequest.credentialScopes,
+      "codex",
+      loopRequest.timeoutMs
+    );
     // Each dispatch stages its request/credentials under a dispatch-unique
     // (nonce'd) path -- see the dedicated "stages each dispatch ... under a
     // dispatch-unique path" test for the concurrent-redispatch rationale --
@@ -363,7 +369,8 @@ describe("Daytona stage execution", () => {
     expect(credentialProvider).toHaveBeenLastCalledWith(
       resource,
       ["model.invoke", "repo.read"],
-      "codex"
+      "codex",
+      loopRequest.timeoutMs
     );
     expect(JSON.parse((uploadedCredentialsCall![0] as Buffer).toString("utf8"))).toEqual({
       env: { GITHUB_TOKEN: "secret-token" },
@@ -599,7 +606,7 @@ describe("Daytona stage execution", () => {
     )).resolves.toEqual({ providerDispatchId: "dispatch" });
   });
 
-  it("parses a rotated Codex auth blob within the byte cap and rejects an invalid or oversized one", async () => {
+  it("never carries auth material out of a sealed loop result", async () => {
     const remoteFiles = new Map<string, Buffer>();
     const sandbox = {
       id: "provider-opaque-codex-auth",
@@ -629,54 +636,23 @@ describe("Daytona stage execution", () => {
       created_at: "2026-07-22T00:00:00.000Z",
     };
 
+    // The supervisor is the sole Codex refresh authority and nothing is ever
+    // read back out of a sandbox, so a result that still carries a rotated
+    // blob (an older sandbox image, or a forged one) has that field dropped
+    // on the floor rather than parsed into the runtime contract.
     remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
       ...baseResult,
       request_hash: "a".repeat(64),
       codex_auth_json: "rotated-codex-auth-blob",
     })));
-    await expect(runtime.collectLoopActionResult(resource, {
+    const collected = await runtime.collectLoopActionResult(resource, {
       attemptId: "attempt-child",
       actionId: "loop-1",
       requestHash: "a".repeat(64),
-    })).resolves.toMatchObject({
-      actionId: "loop-1",
-      codexAuthJson: "rotated-codex-auth-blob",
     });
-
-    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
-      ...baseResult,
-      request_hash: "b".repeat(64),
-      codex_auth_json: 12345,
-    })));
-    await expect(runtime.collectLoopActionResult(resource, {
-      attemptId: "attempt-child",
-      actionId: "loop-1",
-      requestHash: "b".repeat(64),
-    })).rejects.toThrow(/invalid envelope/);
-
-    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
-      ...baseResult,
-      request_hash: "c".repeat(64),
-      codex_auth_json: "a".repeat(65_536),
-    })));
-    await expect(runtime.collectLoopActionResult(resource, {
-      attemptId: "attempt-child",
-      actionId: "loop-1",
-      requestHash: "c".repeat(64),
-    })).resolves.toMatchObject({
-      codexAuthJson: "a".repeat(65_536),
-    });
-
-    remoteFiles.set("/var/lib/openthrottle/loop-actions/attempt-child/loop-1/result.json", Buffer.from(JSON.stringify({
-      ...baseResult,
-      request_hash: "d".repeat(64),
-      codex_auth_json: "a".repeat(65_537),
-    })));
-    await expect(runtime.collectLoopActionResult(resource, {
-      attemptId: "attempt-child",
-      actionId: "loop-1",
-      requestHash: "d".repeat(64),
-    })).rejects.toThrow(/invalid envelope/);
+    expect(collected).toMatchObject({ actionId: "loop-1", outcome: "success" });
+    expect(collected).not.toHaveProperty("codexAuthJson");
+    expect(JSON.stringify(collected)).not.toContain("rotated-codex-auth-blob");
   });
 
   it("parses a fenced private recovery artifact with a long reversible path", async () => {

@@ -194,9 +194,6 @@ interface SandboxEventPollerParams {
     plan: RuntimePlanItem[];
     eventId: string;
   }) => Promise<unknown>;
-  // Best-effort read-back of a rotating agent credential (Codex refresh token)
-  // from the sandbox after a stage completes. Failures are logged and ignored.
-  captureAgentAuth?: (sandbox: RuntimeWorkspace, ticket: Ticket) => Promise<void>;
   postStageResult?: (event: SandboxStageResultEvent, observedSubject: string) => Promise<unknown>;
   childActions?: ChildActionLivenessPort;
 }
@@ -381,11 +378,6 @@ async function pollTicketEvents(
         }
       } else if (event.kind === "stage_result") {
         if (!params.postStageResult) throw new Error("sealed stage result handler is not configured");
-        try {
-          await params.captureAgentAuth?.(sandbox, ticket);
-        } catch (error) {
-          console.warn("[sandbox-events] agent auth capture failed:", sanitizeText(String(error)).slice(-2_000));
-        }
         await params.postStageResult(event, await readWorkspaceSubject(sandbox));
       }
       params.store.markSandboxEventProcessed(event.event_id);

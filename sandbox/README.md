@@ -80,9 +80,8 @@ The pre-push hook blocks main/master and non-fast-forward pushes, with
 against a clean origin URL so the token never appears in `.git/config`.
 
 Shell and Node sanitizers redact named secret values, nested values from
-`CODEX_AUTH_JSON`, the current Codex auth file after token rotation, and known
-GitHub/OpenAI/Linear/bearer token shapes before logs or activities leave the
-sandbox.
+`CODEX_AUTH_JSON`, and known GitHub/OpenAI/Linear/bearer token shapes before
+logs or activities leave the sandbox.
 
 ## Verification
 

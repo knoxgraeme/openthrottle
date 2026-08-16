@@ -4,8 +4,8 @@ import type { Config } from "../../app/config.js";
 import { createSupervisorStore, type SupervisorStore } from "../../persistence/store.js";
 import { openDb } from "../../persistence/database.js";
 import {
+  CodexSeedTokenError,
   SETTINGS_CODEX_AUTH_JSON,
-  captureCodexAuthJson,
   codexRefreshToken,
   createCredentialMaterializer,
   getCodexAuthForSeed,
@@ -13,8 +13,15 @@ import {
   resolveStoredCodexAuthJson,
 } from "./auth.js";
 
+// A seeded token must outlive `taskTimeout` plus a one-hour margin, and the
+// preflight refresh fires 15 minutes above that minimum. With a 300s timeout:
+// minimum = 3_900s, refresh threshold = 4_800s.
+const TASK_TIMEOUT_SECONDS = 300;
+const SEED_MINIMUM_SECONDS = TASK_TIMEOUT_SECONDS + 3600;
+const REFRESH_THRESHOLD_SECONDS = SEED_MINIMUM_SECONDS + 900;
+
 function cfgWith(codexAuthJson: string | undefined): Config {
-  return { codexAuthJson } as unknown as Config;
+  return { codexAuthJson, taskTimeout: TASK_TIMEOUT_SECONDS } as unknown as Config;
 }
 
 /** A JWT whose `exp` is `secondsFromNow` from now (unsigned; only exp matters). */
@@ -39,6 +46,19 @@ function authBlob(
     },
     ...(lastRefresh ? { last_refresh: lastRefresh } : {}),
   });
+}
+
+// Access tokens placed in each of the three bands seeding cares about: clear of
+// the preflight entirely, inside the preflight band but still covering a whole
+// action, and short of the minimum a seeded token must have.
+const aboveRefreshBand = () => jwtExpiringIn(REFRESH_THRESHOLD_SECONDS + 60);
+const insideRefreshBand = () => jwtExpiringIn(SEED_MINIMUM_SECONDS + 60);
+const belowSeedMinimum = () => jwtExpiringIn(120);
+
+/** The access-token-only copy seeding must produce from a stored blob. */
+function seededForm(storedBlob: string): unknown {
+  const stored = JSON.parse(storedBlob);
+  return { ...stored, tokens: { ...stored.tokens, refresh_token: "" } };
 }
 
 describe("Codex durable auth", () => {
@@ -99,47 +119,6 @@ describe("Codex durable auth", () => {
     });
   });
 
-  describe("captureCodexAuthJson", () => {
-    it("persists a token Codex rotated inside the sandbox", () => {
-      store.setSetting(SETTINGS_CODEX_AUTH_JSON, authBlob("rt-0", "2026-07-01T00:00:00Z"));
-      const rotated = authBlob("rt-1", "2026-07-02T00:00:00Z");
-
-      expect(captureCodexAuthJson(store, rotated)).toBe(true);
-      expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(rotated);
-    });
-
-    it("ignores an unchanged refresh token", () => {
-      const current = authBlob("rt-0", "2026-07-01T00:00:00Z");
-      store.setSetting(SETTINGS_CODEX_AUTH_JSON, current);
-
-      expect(captureCodexAuthJson(store, authBlob("rt-0", "2026-07-03T00:00:00Z"))).toBe(false);
-      expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(current);
-    });
-
-    it("ignores a blob without a usable refresh token", () => {
-      const current = authBlob("rt-0", "2026-07-01T00:00:00Z");
-      store.setSetting(SETTINGS_CODEX_AUTH_JSON, current);
-
-      expect(captureCodexAuthJson(store, "{}")).toBe(false);
-      expect(captureCodexAuthJson(store, "not json")).toBe(false);
-      expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(current);
-    });
-
-    it("ignores a stale rotation older than the stored token", () => {
-      const current = authBlob("rt-2", "2026-07-04T00:00:00Z");
-      store.setSetting(SETTINGS_CODEX_AUTH_JSON, current);
-
-      expect(captureCodexAuthJson(store, authBlob("rt-1", "2026-07-02T00:00:00Z"))).toBe(false);
-      expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(current);
-    });
-
-    it("captures into an empty store", () => {
-      const rotated = authBlob("rt-1", "2026-07-02T00:00:00Z");
-      expect(captureCodexAuthJson(store, rotated)).toBe(true);
-      expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(rotated);
-    });
-  });
-
   describe("refreshCodexAuthJson", () => {
     it("merges the rotated tokens back into the blob and stamps last_refresh", async () => {
       const fetchMock = vi.fn(async () => ({
@@ -162,8 +141,16 @@ describe("Codex durable auth", () => {
       expect(parsed.tokens.account_id).toBe("acct"); // preserved
       expect(parsed.last_refresh).toBe("2026-07-02T12:00:00Z");
 
-      const body = JSON.parse((fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1].body);
-      expect(body).toMatchObject({ grant_type: "refresh_token", refresh_token: "rt-0" });
+      const request = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1];
+      expect(new Headers(request.headers).get("content-type")).toBe(
+        "application/x-www-form-urlencoded"
+      );
+      expect(Object.fromEntries(new URLSearchParams(String(request.body)))).toEqual({
+        client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+        grant_type: "refresh_token",
+        refresh_token: "rt-0",
+        scope: "openid profile email",
+      });
     });
 
     it("throws on a non-2xx response so the caller can fall back", async () => {
@@ -248,42 +235,124 @@ describe("Codex durable auth", () => {
   });
 
   describe("getCodexAuthForSeed", () => {
-    it("seeds the stored token unchanged when it is not near expiry", async () => {
+    it.each([
+      ["an array root", "[]"],
+      ["an array token container", JSON.stringify({ tokens: [] })],
+      ["a missing access token", JSON.stringify({ tokens: { refresh_token: "" } })],
+      ["a non-JWT access token", JSON.stringify({ tokens: { access_token: "opaque", refresh_token: "" } })],
+    ])("fails closed for %s", async (_label, blob) => {
+      store.setSetting(SETTINGS_CODEX_AUTH_JSON, blob);
+
+      const error = await getCodexAuthForSeed(cfgWith(undefined), store).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(CodexSeedTokenError);
+      expect((error as CodexSeedTokenError).reason).toBe("unreadable");
+    });
+
+    it("uses the action timeout when it exceeds the supervisor default", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const fetchMock = vi.fn(async () => ({ ok: false, status: 401 }));
+      vi.stubGlobal("fetch", fetchMock);
+      const sixHours = 6 * 60 * 60;
+      const twelveHoursMs = 12 * 60 * 60 * 1000;
+      store.setSetting(
+        SETTINGS_CODEX_AUTH_JSON,
+        authBlob("rt-0", "2026-07-01T00:00:00Z", jwtExpiringIn(sixHours))
+      );
+
+      const error = await getCodexAuthForSeed(cfgWith(undefined), store, twelveHoursMs)
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(CodexSeedTokenError);
+      expect((error as CodexSeedTokenError).reason).toBe("expiring");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("uses a supplied shorter action timeout instead of the supervisor default", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const fetchMock = vi.fn(async () => ({ ok: false, status: 401 }));
+      vi.stubGlobal("fetch", fetchMock);
+      const thirtySecondsMs = 30 * 1000;
+      const token = authBlob(
+        "rt-0",
+        "2026-07-01T00:00:00Z",
+        jwtExpiringIn(60 * 60 + 60)
+      );
+      store.setSetting(SETTINGS_CODEX_AUTH_JSON, token);
+
+      const seeded = await getCodexAuthForSeed(cfgWith(undefined), store, thirtySecondsMs);
+      expect(seeded).toBeDefined();
+      expect(JSON.parse(seeded!)).toEqual(seededForm(token));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("seeds an access-token-only copy and leaves the stored blob intact", async () => {
       const fetchMock = vi.fn();
       vi.stubGlobal("fetch", fetchMock);
-      const fresh = authBlob("rt-0", "2026-07-01T00:00:00Z", jwtExpiringIn(3600));
+      const fresh = authBlob("rt-secret-live", "2026-07-01T00:00:00Z", aboveRefreshBand());
       store.setSetting(SETTINGS_CODEX_AUTH_JSON, fresh);
 
-      expect(await getCodexAuthForSeed(cfgWith(undefined), store)).toBe(fresh);
+      const seeded = await getCodexAuthForSeed(cfgWith(undefined), store);
+      expect(seeded).toBeDefined();
+      expect(seeded).not.toContain("rt-secret-live");
+
+      // access_token, id_token, account_id and last_refresh byte-identical to
+      // the stored blob; refresh_token present (a missing key would not equal
+      // the empty string) and empty.
+      const parsed = JSON.parse(seeded!);
+      expect(parsed).toEqual(seededForm(fresh));
+      expect(Object.prototype.hasOwnProperty.call(parsed.tokens, "refresh_token")).toBe(true);
+
+      // The store keeps the real refresh token, untouched.
+      expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(fresh);
+      expect(codexRefreshToken(store.getSetting(SETTINGS_CODEX_AUTH_JSON))).toBe("rt-secret-live");
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it("refreshes a near-expiry token centrally and persists the rotation", async () => {
+    it("preserves auth_mode in the seeded copy", async () => {
+      vi.stubGlobal("fetch", vi.fn());
+      const stored = JSON.stringify({
+        tokens: {
+          access_token: aboveRefreshBand(),
+          refresh_token: "rt-0",
+          account_id: "acct",
+          auth_mode: "chatgpt",
+        },
+      });
+      store.setSetting(SETTINGS_CODEX_AUTH_JSON, stored);
+
+      const parsed = JSON.parse((await getCodexAuthForSeed(cfgWith(undefined), store))!);
+      expect(parsed.tokens.auth_mode).toBe("chatgpt");
+      expect(parsed.tokens.refresh_token).toBe("");
+    });
+
+    it("refreshes a token inside the leeway window centrally and persists the rotation", async () => {
       const fetchMock = vi.fn(async () => ({
         ok: true,
-        json: async () => ({ access_token: jwtExpiringIn(3600), refresh_token: "rt-1" }),
+        json: async () => ({ access_token: aboveRefreshBand(), refresh_token: "rt-1" }),
       }));
       vi.stubGlobal("fetch", fetchMock);
       store.setSetting(
         SETTINGS_CODEX_AUTH_JSON,
-        authBlob("rt-0", "2026-07-01T00:00:00Z", jwtExpiringIn(60))
+        // Above the hard minimum but inside the preflight band: the old fixed
+        // 15-minute leeway would not have refreshed this at all.
+        authBlob("rt-0", "2026-07-01T00:00:00Z", insideRefreshBand())
       );
 
       const seeded = await getCodexAuthForSeed(cfgWith(undefined), store);
-      expect(codexRefreshToken(seeded)).toBe("rt-1");
+      // The rotation lands in the store; only the seeded copy is stripped.
       expect(codexRefreshToken(store.getSetting(SETTINGS_CODEX_AUTH_JSON))).toBe("rt-1");
+      expect(JSON.parse(seeded!).tokens.refresh_token).toBe("");
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it("coalesces concurrent seeds onto a single refresh", async () => {
       const fetchMock = vi.fn(async () => ({
         ok: true,
-        json: async () => ({ access_token: jwtExpiringIn(3600), refresh_token: "rt-1" }),
+        json: async () => ({ access_token: aboveRefreshBand(), refresh_token: "rt-1" }),
       }));
       vi.stubGlobal("fetch", fetchMock);
       store.setSetting(
         SETTINGS_CODEX_AUTH_JSON,
-        authBlob("rt-0", "2026-07-01T00:00:00Z", jwtExpiringIn(60))
+        authBlob("rt-0", "2026-07-01T00:00:00Z", belowSeedMinimum())
       );
 
       const [a, b] = await Promise.all([
@@ -294,14 +363,38 @@ describe("Codex durable auth", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
-    it("falls back to the stored token when the refresh fails", async () => {
+    it("still seeds when the refresh fails but the stored token covers the whole action", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const fetchMock = vi.fn(async () => ({ ok: false, status: 401 }));
       vi.stubGlobal("fetch", fetchMock);
-      const stale = authBlob("rt-0", "2026-07-01T00:00:00Z", jwtExpiringIn(60));
+      const stale = authBlob("rt-0", "2026-07-01T00:00:00Z", insideRefreshBand());
       store.setSetting(SETTINGS_CODEX_AUTH_JSON, stale);
 
-      expect(await getCodexAuthForSeed(cfgWith(undefined), store)).toBe(stale);
+      const seeded = await getCodexAuthForSeed(cfgWith(undefined), store);
+      expect(JSON.parse(seeded!).tokens.refresh_token).toBe("");
       expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(stale);
+      expect(warn).toHaveBeenCalled();
+    });
+
+    it("fails closed when the refresh fails and the token cannot cover the task timeout", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const fetchMock = vi.fn(async () => ({ ok: false, status: 401 }));
+      vi.stubGlobal("fetch", fetchMock);
+      const stale = authBlob("rt-0", "2026-07-01T00:00:00Z", belowSeedMinimum());
+      store.setSetting(SETTINGS_CODEX_AUTH_JSON, stale);
+
+      const error = await getCodexAuthForSeed(cfgWith(undefined), store).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(CodexSeedTokenError);
+      expect((error as CodexSeedTokenError).reason).toBe("expiring");
+      // The message names the remaining validity (120s, or 119s once the test
+      // itself has burned a millisecond) and the required minimum.
+      expect((error as Error).message).toMatch(/(119|120)s of validity left/);
+      expect((error as Error).message).toContain(`${SEED_MINIMUM_SECONDS}s required`);
+      expect((error as Error).message).not.toContain("rt-0");
+      // The near-expiry blob stays stored for the next attempt; nothing is seeded.
+      expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(stale);
+      expect((error as CodexSeedTokenError).statusCode).toBe(401);
+      expect((error as CodexSeedTokenError).retryable).toBe(false);
     });
 
     it("falls back on a transport failure and logs no token content (finding #3)", async () => {
@@ -310,15 +403,27 @@ describe("Codex durable auth", () => {
         throw new Error("boom refresh_token=rt-secret-2");
       });
       vi.stubGlobal("fetch", fetchMock);
-      const stale = authBlob("rt-secret-2", "2026-07-01T00:00:00Z", jwtExpiringIn(60));
+      const stale = authBlob("rt-secret-2", "2026-07-01T00:00:00Z", insideRefreshBand());
       store.setSetting(SETTINGS_CODEX_AUTH_JSON, stale);
 
-      expect(await getCodexAuthForSeed(cfgWith(undefined), store)).toBe(stale);
+      const seeded = await getCodexAuthForSeed(cfgWith(undefined), store);
+      expect(seeded).not.toContain("rt-secret-2");
       expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(stale);
       // The one warning emitted must carry only the sanitized reason.
       const logged = warn.mock.calls.map((c) => c.join(" ")).join("\n");
       expect(logged).not.toContain("rt-secret-2");
       expect(logged).toContain("Codex token refresh request failed");
+    });
+
+    it("refuses to seed a blob whose refresh token cannot be located", async () => {
+      store.setSetting(SETTINGS_CODEX_AUTH_JSON, "not json");
+      const error = await getCodexAuthForSeed(cfgWith(undefined), store).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(CodexSeedTokenError);
+      expect((error as CodexSeedTokenError).reason).toBe("unreadable");
+    });
+
+    it("returns undefined when no token is stored at all", async () => {
+      expect(await getCodexAuthForSeed(cfgWith(undefined), store)).toBeUndefined();
     });
   });
 
@@ -330,6 +435,7 @@ describe("Codex durable auth", () => {
         claudeCodeOauthToken: "claude-token",
         kimiCodeApiKey: "kimi-key",
         codexAuthJson: undefined,
+        taskTimeout: TASK_TIMEOUT_SECONDS,
         ...overrides,
       } as unknown as Config;
     }
@@ -362,7 +468,7 @@ describe("Codex durable auth", () => {
       // action CLAUDE_CODE_OAUTH_TOKEN -- a credential it cannot authenticate
       // with, and one it has no business receiving.
       seedTicket("claude");
-      const codexAuth = authBlob("rt-0", "2026-07-01T00:00:00Z");
+      const codexAuth = authBlob("rt-secret-live", "2026-07-01T00:00:00Z", aboveRefreshBand());
       store.setSetting(SETTINGS_CODEX_AUTH_JSON, codexAuth);
       const materialize = createCredentialMaterializer(fullCfg(), store);
 
@@ -374,7 +480,27 @@ describe("Codex durable auth", () => {
         ["model.invoke"],
         "codex"
       );
-      expect(actionAgentEnv.env).toEqual({ CODEX_AUTH_JSON: codexAuth });
+      // The sandbox is handed an access-token-only copy, never the live
+      // refresh token the store still holds.
+      expect(Object.keys(actionAgentEnv.env)).toEqual(["CODEX_AUTH_JSON"]);
+      expect(actionAgentEnv.env.CODEX_AUTH_JSON).not.toContain("rt-secret-live");
+      expect(JSON.parse(actionAgentEnv.env.CODEX_AUTH_JSON)).toEqual(seededForm(codexAuth));
+      expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(codexAuth);
+    });
+
+    it("surfaces a token that cannot cover the task timeout as a launch failure", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 401 })));
+      seedTicket("codex");
+      store.setSetting(
+        SETTINGS_CODEX_AUTH_JSON,
+        authBlob("rt-0", "2026-07-01T00:00:00Z", belowSeedMinimum())
+      );
+      const materialize = createCredentialMaterializer(fullCfg(), store);
+
+      await expect(
+        materialize({ providerResourceId: "sandbox-1" }, ["model.invoke"])
+      ).rejects.toBeInstanceOf(CodexSeedTokenError);
     });
 
     it("throws when the overriding agent has no available credential, rather than silently falling back", async () => {

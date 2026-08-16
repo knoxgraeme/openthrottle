@@ -30,6 +30,7 @@ import {
   type SemanticReviewReceipt,
 } from "@openthrottle/contracts";
 import { buildReviewSelectorAuthority } from "../pipeline/review-fanout.js";
+import { CodexSeedTokenError } from "../providers/codex/auth.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v3.json", import.meta.url));
@@ -1500,12 +1501,10 @@ describe("pipeline effect processor", () => {
         subject: integratedSubjectB,
         receipt,
         completedAt: "2099-07-22T12:00:00.000Z",
-        codexAuthJson: `auth-${dispatched.skill}`,
       };
     });
     let fanoutDispatchFailed = false;
     let validatorDispatchFailed = false;
-    const reviewAuthEvents: string[] = [];
     runtime.dispatchLoopAction.mockImplementation(async (_resource, request) => {
       if (request.skill === "correctness-dataflow" && !fanoutDispatchFailed) {
         fanoutDispatchFailed = true;
@@ -1515,7 +1514,6 @@ describe("pipeline effect processor", () => {
         validatorDispatchFailed = true;
         throw new Error("validator provider launch acknowledgement lost");
       }
-      reviewAuthEvents.push(`dispatch:${request.skill}`);
       // The same-tick child walk can dispatch the follow-up final-repair
       // action right after the review settles; only review subactions may
       // yield the mocked semantic_review results.
@@ -1525,7 +1523,6 @@ describe("pipeline effect processor", () => {
       }
       return { providerDispatchId: "loop-child-drain" };
     });
-    const captureCodexAuth = vi.fn((blob: string) => reviewAuthEvents.push(`capture:${blob}`));
     const restartedProcessor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
@@ -1533,7 +1530,6 @@ describe("pipeline effect processor", () => {
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
-      captureCodexAuth,
     });
     db!.prepare("UPDATE execution_work_attempts SET lease_until = ? WHERE id = ?")
       .run("2099-07-22T11:59:59.000Z", review.id);
@@ -1579,11 +1575,6 @@ describe("pipeline effect processor", () => {
     expect(reviewDispatchCounts["correctness-dataflow"]).toBe(2);
     expect(reviewDispatchCounts["tests-contracts"]).toBe(1);
     expect(reviewDispatchCounts["validate-review-findings"]).toBe(2);
-    expect(captureCodexAuth).toHaveBeenCalledWith("auth-correctness-dataflow");
-    expect(captureCodexAuth).toHaveBeenCalledWith("auth-tests-contracts");
-    expect(reviewAuthEvents.indexOf("capture:auth-correctness-dataflow")).toBeLessThan(
-      reviewAuthEvents.indexOf("dispatch:tests-contracts")
-    );
     const persistedReviewDispatches = db!.prepare(`
       SELECT action_id, request_hash, idempotency_key
       FROM execution_review_subaction_dispatches
@@ -3099,6 +3090,22 @@ describe("pipeline effect processor", () => {
       });
     expect(pipelines.getInboxEvent(`pipeline-effect-exhausted:${provision.id}`)?.payload)
       .toContain("Write access to repository not granted");
+  });
+
+  it("exhausts a typed Codex seed failure on its first effect attempt", async () => {
+    const { pipelines, runtime, processor, instance } =
+      harness("issue-codex-seed", "session-codex-seed");
+    runtime.provision.mockRejectedValue(new CodexSeedTokenError(
+      "unreadable",
+      "Codex access token expiry is unreadable; refusing to seed a sandbox"
+    ));
+    const provision = pipelines.listEffects(instance.id).find((effect) => effect.kind === "provision")!;
+
+    await processor.drain();
+
+    expect(runtime.provision).toHaveBeenCalledTimes(1);
+    expect(pipelines.listEffects(instance.id).find((effect) => effect.id === provision.id))
+      .toMatchObject({ status: "dead", attempts: 1 });
   });
 
   it("classifies an auth marker retained at the tail of a long provider error", async () => {

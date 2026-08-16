@@ -116,10 +116,6 @@ interface PipelineEffectProcessorDeps {
   /** Shared production single-flight reconciler; tests may omit it. */
   reconcileRuntimeResources?: RuntimeResourceReconciler;
   now?: () => Date;
-  // Persists a Codex OAuth blob rotated inside one structured child action's
-  // own scoped CODEX_HOME. Supplied by the caller (see index.ts) rather than
-  // imported here: `operations` may not depend on `providers` directly.
-  captureCodexAuth?: (blob: string) => void;
   // Per-tick bound on the composite child-drain walk; production uses the
   // structured-child-runtime default. Harnesses that pause a run at an exact
   // mid-flight state set 1 (see structured-walking-skeleton.mjs).
@@ -308,7 +304,6 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         () => coordinatePipelineEvent(deps.store, event)
       );
     },
-    captureCodexAuth: deps.captureCodexAuth,
   });
 
   const resourceFor = async (instance: PipelineInstance): Promise<RuntimeResource> => {

@@ -359,9 +359,6 @@ export type ReviewOrchestrationDeps = {
   store: ReviewOrchestrationStore;
   runtime: Pick<SandboxRuntime, "dispatchLoopAction" | "collectLoopActionResult">;
   now: () => Date;
-  // See StructuredChildRuntimeDeps.captureCodexAuth -- the orchestrator only
-  // ever forwards the blob of a subaction it fenced itself.
-  captureCodexAuth?: (blob: string) => void;
   // Host-owned projections of the sealed parent attempt. They stay with the
   // structured child runtime because non-review actions share them.
   executionPlanFor: (action: ExecutionWorkAttempt) => AnyExecutionPlanContract;
@@ -481,19 +478,6 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
     }
   };
 
-  const captureLatestReviewCodexAuth = (
-    results: ReadonlyArray<{ request: LoopActionRequest; result: LoopActionResult | null }>
-  ): void => {
-    const latest = results
-      .filter((entry): entry is { request: LoopActionRequest; result: LoopActionResult & { codexAuthJson: string } } =>
-        typeof entry.result?.codexAuthJson === "string" && entry.result.codexAuthJson.length > 0)
-      .sort((left, right) =>
-        left.result.completedAt.localeCompare(right.result.completedAt) ||
-        left.request.actionId.localeCompare(right.request.actionId))
-      .at(-1);
-    if (latest) deps.captureCodexAuth?.(latest.result.codexAuthJson);
-  };
-
   const ensureReviewSubactionLaunched = async (input: {
     resource: RuntimeResource;
     action: ExecutionWorkAttempt;
@@ -586,7 +570,6 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
       }
       if (result) {
         precollected.set(request.actionId, result);
-        captureLatestReviewCodexAuth([{ request, result }]);
       }
       if (prepared.newlyDispatched || !result || result.outcome !== "success") {
         break;
@@ -623,7 +606,6 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
       );
       collected.push({ request, result });
     }
-    captureLatestReviewCodexAuth(collected);
     for (const { request, result } of collected) {
       if (!result) return { pending: true };
       if (result.outcome !== "success") {
@@ -738,7 +720,6 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
       })
     );
     if (!result) return { pending: true };
-    if (typeof result.codexAuthJson === "string" && result.codexAuthJson) deps.captureCodexAuth?.(result.codexAuthJson);
     if (result.outcome !== "success") {
       return {
         terminal: true,

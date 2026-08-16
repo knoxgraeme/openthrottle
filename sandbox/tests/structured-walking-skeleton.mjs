@@ -576,7 +576,6 @@ function createDockerSandboxRuntime(container) {
         subject: event.subject,
         receipt: event.receipt,
         completedAt: event.created_at,
-        ...(typeof event.codex_auth_json === "string" ? { codexAuthJson: event.codex_auth_json } : {}),
       };
       if (input.actionId.includes(".review.") &&
           request.skill !== "select-review-personas" &&

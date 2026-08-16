@@ -2732,7 +2732,7 @@ describe("structured child runtime repair fences", () => {
     }));
   });
 
-  it("captures a rotated Codex auth blob from a completed action-scoped Codex worker under a Claude-selected ticket", async () => {
+  it("collects a completed Codex worker's result without carrying any auth material", async () => {
     const implement = action({
       id: "implement-codex-worker",
       action_kind: "implement",
@@ -2741,17 +2741,16 @@ describe("structured child runtime repair fences", () => {
       attempt_ordinal: 1,
       request_hash: "b".repeat(64),
     });
-    const rotatedBlob = JSON.stringify({ tokens: { refresh_token: "rotated-refresh-token" } });
-    const captureCodexAuth = vi.fn();
     const completeUnitAction = vi.fn();
     const failUnitAction = vi.fn();
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       taskTimeoutSeconds: 300,
-      captureCodexAuth,
       runtime: {
-        // The action's own engine (a Codex worker override) rotated its
-        // scoped CODEX_HOME auth even though the ticket itself is Claude.
+        // The action ran as a Codex worker override under a Claude-selected
+        // ticket. Under the token broker its sandbox holds an access-token-only
+        // copy of what the supervisor seeded, so there is nothing to read back
+        // and the sealed result carries no auth field at all.
         collectLoopActionResult: async () => ({
           actionId: implement.id,
           attemptId: "parent-attempt",
@@ -2761,87 +2760,6 @@ describe("structured child runtime repair fences", () => {
           subject: "a".repeat(40),
           receipt: completionReceipt("a".repeat(40), implement),
           completedAt: "2099-07-22T12:00:00.000Z",
-          codexAuthJson: rotatedBlob,
-        }),
-      } as any,
-      store: {
-        leaseNextUnitAction: () => implement,
-        completeUnitAction,
-        failUnitAction,
-        getGraphForAttempt: () => ({
-          integration_subject: "a".repeat(40),
-          command_names: "[]",
-        }),
-      } as any,
-    });
-
-    await childRuntime.drainCompositeChildren({ providerResourceId: "sandbox-1" }, {
-      id: "instance-1",
-      // The parent ticket's own engine is Claude; the completed action ran
-      // as an explicit Codex worker override, so capture must key off the
-      // action's own engine, not this field.
-      agent: "claude",
-      active_stage_id: "structured",
-      generation: 1,
-      base_commit: "a".repeat(40),
-      immutable_subject: "a".repeat(40),
-      manifest_digest: "c".repeat(64),
-      capability_digest: "d".repeat(64),
-      normalized_manifest: canonicalJson({
-        stages: [{
-          id: "structured",
-          unitPhaseBindings: [{
-            id: "implement",
-            kind: "agent",
-            loop: { skill: "builtin://implement-unit@1", timeout_seconds: 60 },
-            worker: { id: "worker-1", agent: "inherit", allowed_mcp_servers: [] },
-            credentials: ["model.invoke", "repo.read", "repo.write"],
-            context: "fresh",
-          }, {
-            id: "lead",
-            kind: "gate",
-            loop: { skill: "builtin://accept-unit@1", timeout_seconds: 60 },
-            worker: { id: "lead-worker", agent: "inherit", allowed_mcp_servers: [] },
-            credentials: ["model.invoke", "repo.read"],
-            context: "fresh",
-          }],
-        }],
-      }),
-    } as any, "parent-attempt");
-
-    expect(failUnitAction).not.toHaveBeenCalled();
-    expect(captureCodexAuth).toHaveBeenCalledTimes(1);
-    expect(captureCodexAuth).toHaveBeenCalledWith(rotatedBlob);
-    expect(completeUnitAction).toHaveBeenCalled();
-  });
-
-  it("never captures Codex auth from a non-Codex action's result", async () => {
-    const implement = action({
-      id: "implement-claude-worker",
-      action_kind: "implement",
-      cycle: 1,
-      status: "dispatched",
-      attempt_ordinal: 1,
-      request_hash: "b".repeat(64),
-    });
-    const captureCodexAuth = vi.fn();
-    const completeUnitAction = vi.fn();
-    const failUnitAction = vi.fn();
-    const childRuntime = createStructuredChildRuntime({
-      now: () => new Date("2099-07-22T12:00:00.000Z"),
-      taskTimeoutSeconds: 300,
-      captureCodexAuth,
-      runtime: {
-        collectLoopActionResult: async () => ({
-          actionId: implement.id,
-          attemptId: "parent-attempt",
-          requestHash: "b".repeat(64),
-          outcome: "success",
-          nativeSessionId: null,
-          subject: "a".repeat(40),
-          receipt: completionReceipt("a".repeat(40), implement),
-          completedAt: "2099-07-22T12:00:00.000Z",
-          // A Claude (or OpenCode) action never carries this field.
         }),
       } as any,
       store: {
@@ -2887,8 +2805,9 @@ describe("structured child runtime repair fences", () => {
     } as any, "parent-attempt");
 
     expect(failUnitAction).not.toHaveBeenCalled();
-    expect(captureCodexAuth).not.toHaveBeenCalled();
     expect(completeUnitAction).toHaveBeenCalled();
+    // Nothing the supervisor persists for this action carries auth material.
+    expect(JSON.stringify(completeUnitAction.mock.calls)).not.toMatch(/auth|refresh_token/i);
   });
 
   it("gives a repair action the triggering lead decision and failing command evidence", async () => {
