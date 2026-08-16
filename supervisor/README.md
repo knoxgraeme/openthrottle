@@ -88,7 +88,7 @@ receive `GITHUB_TOKEN`.
 
 - Runtime changes under `sandbox/` (excluding test-only paths) or `skills/`
   build a commit-pinned Daytona snapshot
-  named `openthrottle-v2-ce-<short-sha>` via
+  named `openthrottle-ce-<short-sha>` via
   `supervisor/scripts/build-snapshot.mjs` (the pinned `@daytona/sdk`, no CLI
   install), then stage `DAYTONA_SNAPSHOT` on the Fly app.
 - The deploy job first ensures the Fly app and its `openthrottle_data` volume

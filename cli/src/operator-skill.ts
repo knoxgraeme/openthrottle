@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import { getErrorMessage } from "./util.js";
 
 const OWNER = "knoxgraeme";
-const REPO = "openthrottle-v2";
+const REPO = "openthrottle";
 const SKILL_PATH = "skills/operator/openthrottle";
 const SKILL_NAME = "openthrottle";
 const SUPPORTED_AGENTS = ["Claude Code", "Codex", "OpenCode"] as const;

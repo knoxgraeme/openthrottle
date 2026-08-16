@@ -52,7 +52,7 @@ function stagedSkill(stageHome: string, agentRoot: ".codex" | ".claude" | ".open
   cpSync(resolve(process.cwd(), "../skills/operator/openthrottle"), target, { recursive: true });
   writeFileSync(join(target, ".skillfish.json"), JSON.stringify({
     owner: "knoxgraeme",
-    repo: "openthrottle-v2",
+    repo: "openthrottle",
     path: "skills/operator/openthrottle",
     source: "manifest",
   }, null, 2));
@@ -98,7 +98,7 @@ describe("operator skill command parsing and source", () => {
   it("rejects mutable source refs", () => {
     expect(() => resolveOperatorSkillSourceRef({ sourceRef: "main" })).toThrow(/not immutable/);
     expect(operatorSkillSource(sourceRef)).toBe(
-      "knoxgraeme/openthrottle-v2@0123456789abcdef0123456789abcdef01234567/skills/operator/openthrottle"
+      "knoxgraeme/openthrottle@0123456789abcdef0123456789abcdef01234567/skills/operator/openthrottle"
     );
   });
 
@@ -177,7 +177,7 @@ describe("operator skill Skillfish wrapper", () => {
     const home = temporaryDirectory();
     const path = installedSkill(home, ".codex", {
       owner: "knoxgraeme",
-      repo: "openthrottle-v2",
+      repo: "openthrottle",
       path: "skills/operator/openthrottle",
       source: "manifest",
     });
@@ -378,7 +378,7 @@ describe("operator skill Skillfish wrapper", () => {
     const home = temporaryDirectory();
     const path = installedSkill(home, ".codex", {
       owner: "knoxgraeme",
-      repo: "openthrottle-v2",
+      repo: "openthrottle",
       path: "skills/operator/openthrottle",
       source: "manifest",
     });
@@ -454,7 +454,7 @@ describe("operator skill Skillfish wrapper", () => {
     const home = temporaryDirectory();
     const path = installedSkill(home, ".codex", {
       owner: "knoxgraeme",
-      repo: "openthrottle-v2",
+      repo: "openthrottle",
       path: "skills/operator/openthrottle",
       source: "manifest",
     });
@@ -479,7 +479,7 @@ describe("operator skill Skillfish wrapper", () => {
     const home = temporaryDirectory();
     const path = installedSkill(home, ".codex", {
       owner: "knoxgraeme",
-      repo: "openthrottle-v2",
+      repo: "openthrottle",
       path: "skills/operator/openthrottle",
       source: "manifest",
     });
@@ -535,7 +535,7 @@ describe("operator skill Skillfish wrapper", () => {
     const home = temporaryDirectory();
     const codexPath = installedSkill(home, ".codex", {
       owner: "knoxgraeme",
-      repo: "openthrottle-v2",
+      repo: "openthrottle",
       path: "skills/operator/openthrottle",
       source: "manifest",
     });
@@ -593,7 +593,7 @@ describe("operator skill Skillfish wrapper", () => {
     const home = temporaryDirectory();
     const openCodePath = installedSkill(home, ".config/opencode", {
       owner: "knoxgraeme",
-      repo: "openthrottle-v2",
+      repo: "openthrottle",
       path: "skills/operator/openthrottle",
       source: "manifest",
     });

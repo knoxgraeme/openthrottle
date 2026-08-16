@@ -12,7 +12,7 @@ in evidence.
 ## Scope and prerequisites
 
 - A workstation with Node 22, Docker (with buildx), `gh` authenticated against
-  `knoxgraeme/openthrottle-v2`, and `flyctl`.
+  `knoxgraeme/openthrottle`, and `flyctl`.
 - A real Fly org token (`FLY_API_TOKEN`, org-scoped so setup can create apps)
   and a real Daytona API key (`DAYTONA_API_KEY`).
 - Use a DEDICATED throwaway Fly app name for this exercise. The CLI's default
@@ -28,9 +28,9 @@ Either push a `v*` tag (publishes to npm when `NPM_TOKEN` is configured) or
 dispatch manually (always degrades to workflow artifacts):
 
 ```bash
-gh workflow run release.yml --repo knoxgraeme/openthrottle-v2
+gh workflow run release.yml --repo knoxgraeme/openthrottle
 # optionally: -f release_id=<id>   (defaults to the cli package version)
-gh run watch --repo knoxgraeme/openthrottle-v2 "$(gh run list --repo knoxgraeme/openthrottle-v2 \
+gh run watch --repo knoxgraeme/openthrottle "$(gh run list --repo knoxgraeme/openthrottle \
   --workflow release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
 ```
 
@@ -62,7 +62,7 @@ Download the run's artifact (it contains `cli/release-manifest.json` and the
 packed `openthrottle-<version>.tgz`):
 
 ```bash
-gh run download --repo knoxgraeme/openthrottle-v2 <run-id> \
+gh run download --repo knoxgraeme/openthrottle <run-id> \
   --name "openthrottle-release-<release_id>" --dir release-acceptance
 jq . release-acceptance/cli/release-manifest.json
 ```

@@ -407,7 +407,7 @@ describe("coordinator-only server", () => {
       body: JSON.stringify({
         oldRuntimeRelease: descriptor.descriptor.release,
         oldSnapshot: "snapshot",
-        candidateSnapshot: "openthrottle-v2-ce-new",
+        candidateSnapshot: "openthrottle-ce-new",
         evidence: "initial proof",
       }),
     });
@@ -418,7 +418,7 @@ describe("coordinator-only server", () => {
       phase: "registered",
       old_runtime_release: descriptor.descriptor.release,
       old_snapshot: "snapshot",
-      candidate_snapshot: "openthrottle-v2-ce-new",
+      candidate_snapshot: "openthrottle-ce-new",
     });
 
     const duplicate = await server.request("/deployment/cutover/begin", {
@@ -427,7 +427,7 @@ describe("coordinator-only server", () => {
       body: JSON.stringify({
         oldRuntimeRelease: descriptor.descriptor.release,
         oldSnapshot: "snapshot",
-        candidateSnapshot: "openthrottle-v2-ce-new",
+        candidateSnapshot: "openthrottle-ce-new",
       }),
     });
     expect(await duplicate.json()).toMatchObject({ cutover: { id: beginBody.cutover.id } });
@@ -438,7 +438,7 @@ describe("coordinator-only server", () => {
       body: JSON.stringify({
         oldRuntimeRelease: descriptor.descriptor.release,
         oldSnapshot: "snapshot",
-        candidateSnapshot: "openthrottle-v2-ce-other",
+        candidateSnapshot: "openthrottle-ce-other",
       }),
     });
     expect(ambiguous.status).toBe(409);
@@ -506,7 +506,7 @@ describe("coordinator-only server", () => {
       body: JSON.stringify({
         oldRuntimeRelease: descriptor.descriptor.release,
         oldSnapshot: "snapshot",
-        candidateSnapshot: "openthrottle-v2-ce-new",
+        candidateSnapshot: "openthrottle-ce-new",
         evidence: compactSeal,
       }),
     });

@@ -111,7 +111,7 @@ if (sourceRef) {
   }
 }
 writeFileSync(operatorSkillMetadataTarget, `${JSON.stringify({
-  source: sourceRef ? `knoxgraeme/openthrottle-v2@${sourceRef}/skills/operator/openthrottle` : null,
+  source: sourceRef ? `knoxgraeme/openthrottle@${sourceRef}/skills/operator/openthrottle` : null,
   source_ref: sourceRef ?? null,
   ...(sourceUnavailableReason ? { source_unavailable_reason: sourceUnavailableReason } : {}),
 }, null, 2)}\n`);

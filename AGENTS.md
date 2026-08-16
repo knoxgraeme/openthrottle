@@ -10,7 +10,7 @@ OpenThrottle is a plan-first coding pipeline. An approved Linear ticket selects
 an immutable configurable pipeline. The Fly supervisor coordinates one fenced
 stage at a time in a Daytona sandbox running Claude Code, Codex, or OpenCode;
 GitHub supplies publication and provider evidence. The GitHub repo is
-`openthrottle-v2`; the product, CLI, npm package, and Daytona snapshot are all
+`openthrottle`; the product, CLI, npm package, and Daytona snapshot are all
 named `openthrottle`.
 
 ```

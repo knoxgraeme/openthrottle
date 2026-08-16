@@ -5,7 +5,7 @@ ticket or labeled GitHub Issue, run an immutable configurable pipeline through
 fenced Daytona stages using Claude Code, Codex, or OpenCode, and review the
 resulting GitHub PR.
 
-The GitHub repository is `openthrottle-v2`; the product, CLI, npm package,
+The GitHub repository is `openthrottle`; the product, CLI, npm package,
 and Daytona snapshot are all named `openthrottle`.
 
 ## How it works

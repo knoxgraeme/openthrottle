@@ -22,6 +22,7 @@ const release: ReleaseManifest = {
   recommendedResources: { cpu: 2, memoryMb: 4096, diskGb: 20 },
 };
 
+// The `v` belongs to the release ID (`v2.0.0`), not the former repository slug.
 const SNAPSHOT_NAME = "openthrottle-v2.0.0";
 const env = { DAYTONA_API_KEY: "test-api-key" };
 

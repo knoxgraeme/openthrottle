@@ -345,15 +345,15 @@ describe("one-stage executor", () => {
       .toThrow(/attemptId/);
     const githubIssueRequest = {
       ...unsealedRequest,
-      issueId: "github:knoxgraeme/openthrottle-v2#194",
-      sessionId: "github:knoxgraeme/openthrottle-v2#194:initial",
+      issueId: "github:knoxgraeme/openthrottle#194",
+      sessionId: "github:knoxgraeme/openthrottle#194:initial",
     };
     expect(validateStageRequest({
       ...githubIssueRequest,
       ...createStageRequestHash(githubIssueRequest),
     })).toMatchObject({
-      issueId: "github:knoxgraeme/openthrottle-v2#194",
-      sessionId: "github:knoxgraeme/openthrottle-v2#194:initial",
+      issueId: "github:knoxgraeme/openthrottle#194",
+      sessionId: "github:knoxgraeme/openthrottle#194:initial",
     });
     const invalidIssueCharacterRequest = { ...unsealedRequest, issueId: "github:owner/repo#194?" };
     expect(() => validateStageRequest({
