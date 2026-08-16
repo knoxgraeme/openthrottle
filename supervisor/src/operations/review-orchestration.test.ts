@@ -5,6 +5,7 @@ import { buildReviewSelectorAuthority, type ReviewFanoutPlan, type ReviewFanoutS
 import type { ExpectedReceiptProducer, ReceiptProducerRole, StandardReceiptFence } from "../pipeline/execution-gates.js";
 import type { PipelineInstance } from "../pipeline/store.js";
 import type { ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
+import type { LoopActionRequest, LoopActionResult } from "../runtime/contracts.js";
 import {
   buildReviewFanoutRequests,
   buildReviewSelectorRequest,
@@ -171,6 +172,52 @@ function orchestratorDeps(overrides: Partial<ReviewOrchestrationDeps> = {}): Rev
     standardFenceFor: (_instance, _action, subject) => fence({ subject }),
     commandAttemptReceiptsFor: () => [],
     ...overrides,
+  };
+}
+
+function successfulReviewResult(
+  request: LoopActionRequest,
+  summary = "No findings."
+): LoopActionResult {
+  const expected = request.expectedProducer!;
+  if (!request.inputSubject) throw new Error("successful review fixture requires an input subject");
+  const subject = request.inputSubject;
+  const receipt = canonicalJson({
+    schema: RECEIPT_SCHEMA,
+    type: "semantic_review",
+    assurance: expected.assurance,
+    result: "success",
+    producer: {
+      worker_id: expected.workerId,
+      skill: expected.skill,
+      capability_digest: expected.capabilityDigest,
+      skill_package_digest: expected.skillPackageDigest,
+    },
+    subject: { base: request.baseSubject, pre: subject, post: subject },
+    fence: {
+      pipeline_instance_id: request.pipelineInstanceId,
+      graph_digest: request.graphDigest,
+      unit_id: request.unitId ?? "__final__",
+      attempt_id: request.attemptId,
+      parent_run_id: request.parentRunId,
+      action_attempt_id: request.actionId,
+      generation: request.generation,
+      native_session_id: null,
+      request_hash: request.requestHash,
+    },
+    evidence: [`reviewed ${request.actionId}`],
+    payload: { summary, findings: [] },
+    issued_at: "2099-07-22T12:00:00.000Z",
+  });
+  return {
+    actionId: request.actionId,
+    attemptId: request.attemptId,
+    requestHash: request.requestHash,
+    outcome: "success",
+    nativeSessionId: null,
+    subject,
+    receipt,
+    completedAt: "2099-07-22T12:00:01.000Z",
   };
 }
 
@@ -430,5 +477,117 @@ describe("createReviewOrchestrator", () => {
       mockFn(deps.store.prepareActionDispatch).mock.calls[0]![0].requestPayload
     ) as { transitionContext: string };
     expect(sealed.transitionContext).toContain("\"required_persona_ids\":[\"security\",\"performance\"]");
+  });
+
+  it("caps active personas and survives rollback before recovering one prepared-only sibling", async () => {
+    const action = reviewAction();
+    const selectorRequest = launchInput().request;
+    const selectedPersonaIds = [
+      "correctness-dataflow",
+      "tests-contracts",
+      "reliability-adversarial",
+      "performance",
+    ];
+    const authority = buildReviewSelectorAuthority({ subject: SUBJECT });
+    const selectorSummary = JSON.stringify({
+      schema: "openthrottle.review-selector-recommendation/v1",
+      subject: SUBJECT,
+      policy_digest: authority.policy_digest,
+      personas: selectedPersonaIds.map((personaId) => ({
+        persona_id: personaId,
+        rationale: `Exercise bounded fanout for ${personaId}.`,
+      })),
+    });
+    const results = new Map<string, LoopActionResult>([
+      [selectorRequest.actionId, successfulReviewResult(selectorRequest, selectorSummary)],
+    ]);
+    const dispatches = new Map<string, any>([[selectorRequest.actionId, {
+      request_hash: selectorRequest.requestHash,
+      idempotency_key: selectorRequest.idempotencyKey,
+      dispatched_at: "2099-07-22T11:30:00.000Z",
+      dispatch_time_source: "acknowledged",
+    }]]);
+    const launched: LoopActionRequest[] = [];
+    let crashPersonaId: string | null = "reliability-adversarial";
+    const deps = orchestratorDeps({
+      maxParallel: 2,
+      store: {
+        ...orchestratorDeps().store,
+        getReviewSubactionDispatch: vi.fn((_parentActionId: string, actionId: string) => dispatches.get(actionId)),
+        prepareReviewSubactionDispatch: vi.fn((input: any) => {
+          if (!dispatches.has(input.actionId)) {
+            dispatches.set(input.actionId, {
+              request_hash: input.requestHash,
+              idempotency_key: input.idempotencyKey,
+              dispatched_at: null,
+              dispatch_time_source: null,
+            });
+          }
+          return "recorded" as const;
+        }),
+        markReviewSubactionDispatched: vi.fn((_parentActionId: string, actionId: string, source: string) => {
+          const row = dispatches.get(actionId)!;
+          row.dispatched_at = "2099-07-22T11:31:00.000Z";
+          row.dispatch_time_source = source;
+        }),
+      } as unknown as ReviewOrchestrationDeps["store"],
+      runtime: {
+        collectLoopActionResult: vi.fn(async (
+          _resource: unknown,
+          input: { actionId: string; requestHash: string }
+        ) => {
+          const result = results.get(input.actionId) ?? null;
+          if (result && result.requestHash !== input.requestHash) {
+            throw new Error(`sealed loop result ${input.actionId} has an invalid request hash`);
+          }
+          return result;
+        }),
+        dispatchLoopAction: vi.fn(async (_resource: unknown, request: LoopActionRequest) => {
+          launched.push(request);
+          if (request.skill === crashPersonaId) {
+            crashPersonaId = null;
+            results.set(request.actionId, successfulReviewResult(request));
+            throw new Error("launch acknowledgement lost");
+          }
+        }),
+      } as unknown as ReviewOrchestrationDeps["runtime"],
+    });
+    const orchestrator = createReviewOrchestrator(deps);
+
+    // First drain fills exactly two active slots.
+    await expect(orchestrator.collectOrchestratedFinalReview(
+      {} as never, instance(), action, selectorRequest
+    )).resolves.toBeNull();
+    expect(launched.map((request) => request.skill)).toEqual(selectedPersonaIds.slice(0, 2));
+    expect(launched[0]!.transitionContext).toContain("\"max_parallel\":1");
+
+    // Roll the live window back while two requests retain their exact durable
+    // hashes. The completed first sibling re-collects successfully, while the
+    // still-running second sibling occupies the single active slot.
+    results.set(launched[0]!.actionId, successfulReviewResult(launched[0]!));
+    const rolledBackOrchestrator = createReviewOrchestrator({ ...deps, maxParallel: 1 });
+    await expect(rolledBackOrchestrator.collectOrchestratedFinalReview(
+      {} as never, instance(), action, selectorRequest
+    )).resolves.toBeNull();
+    expect(launched.map((request) => request.skill)).toEqual(selectedPersonaIds.slice(0, 2));
+
+    // Completing the second sibling opens one serial slot. The third launch
+    // completes in the provider but loses its acknowledgement, leaving a
+    // prepared-only row under the same stable request identity.
+    results.set(launched[1]!.actionId, successfulReviewResult(launched[1]!));
+    await expect(rolledBackOrchestrator.collectOrchestratedFinalReview(
+      {} as never, instance(), action, selectorRequest
+    )).rejects.toBeInstanceOf(RetryableReviewRuntimeError);
+    expect(launched.map((request) => request.skill)).toEqual(selectedPersonaIds.slice(0, 3));
+
+    // The next drain recovers that exact third result before dispatch and
+    // fills the freed serial slot with only the fourth sibling. Earlier
+    // siblings are neither disturbed nor redispatched.
+    await expect(rolledBackOrchestrator.collectOrchestratedFinalReview(
+      {} as never, instance(), action, selectorRequest
+    )).resolves.toBeNull();
+    expect(launched.map((request) => request.skill)).toEqual(selectedPersonaIds);
+    expect(launched.filter((request) => request.skill === "tests-contracts")).toHaveLength(1);
+    expect(dispatches.get(launched[2]!.actionId)?.dispatch_time_source).toBe("prepared_fallback");
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { SemanticReviewReceipt } from "@openthrottle/contracts";
+import { canonicalJson, type SemanticReviewReceipt } from "@openthrottle/contracts";
 import {
   REVIEW_SELECTOR_RECOMMENDATION_SCHEMA,
   buildReviewFanoutPlan,
@@ -122,6 +122,19 @@ describe("review fanout runtime contract", () => {
         subject: persona.id === "tests-contracts" ? "3".repeat(40) : subject,
       })),
     })).toThrow(/is not bound to the exact subject/);
+  });
+
+  it("synthesizes byte-identically regardless of concurrent receipt arrival order", () => {
+    const subject = "3".repeat(40);
+    const plan = buildReviewFanoutPlan({
+      subject,
+      instructions: { one: "Review bounded parallel fanout retry dispatch." },
+    });
+    const receipts = plan.personas.map((persona) => reviewReceipt({ persona: persona.id, subject }));
+
+    expect(canonicalJson(synthesizeReviewFanout({ plan, receipts }))).toBe(
+      canonicalJson(synthesizeReviewFanout({ plan, receipts: [...receipts].reverse() }))
+    );
   });
 
   it("deduplicates semantically exact findings and rejects repair roster drift", () => {

@@ -80,6 +80,8 @@ export interface Config {
   kimiCodeApiKey: string | undefined;
 
   taskTimeout: number;
+  // Optional on hand-built Config fixtures; loadConfig always supplies it.
+  reviewFanoutConcurrency?: number;
   orphanGraceMinutes: number;
   runtimeResourceRetentionMinutes: number;
   runOutcomeRetentionDays: number;
@@ -120,6 +122,7 @@ export function loadConfig(): Config {
     kimiCodeApiKey: process.env.KIMI_CODE_API_KEY,
 
     taskTimeout: optionalInt("TASK_TIMEOUT", 7200),
+    reviewFanoutConcurrency: optionalInt("REVIEW_FANOUT_CONCURRENCY", 3),
     orphanGraceMinutes: optionalInt("ORPHAN_GRACE_MINUTES", 5),
     runtimeResourceRetentionMinutes: optionalInt("RUNTIME_RESOURCE_RETENTION_MINUTES", 60),
     runOutcomeRetentionDays: optionalInt("RUN_OUTCOME_RETENTION_DAYS", 180),
@@ -160,6 +163,7 @@ export function loadConfig(): Config {
   }
   requireRange("PORT", cfg.port, 1, 65_535);
   requireRange("TASK_TIMEOUT", cfg.taskTimeout, 1, 86_400);
+  requireRange("REVIEW_FANOUT_CONCURRENCY", cfg.reviewFanoutConcurrency!, 1, 8);
   requireRange("ORPHAN_GRACE_MINUTES", cfg.orphanGraceMinutes, 0);
   requireRange("RUNTIME_RESOURCE_RETENTION_MINUTES", cfg.runtimeResourceRetentionMinutes, 0);
   requireRange("RUN_OUTCOME_RETENTION_DAYS", cfg.runOutcomeRetentionDays, 1);

@@ -375,6 +375,8 @@ export type ReviewOrchestrationDeps = {
   commandAttemptReceiptsFor: (
     action: ExecutionWorkAttempt
   ) => Array<{ attempt: ExecutionWorkAttempt; receipt: CommandResultReceipt }>;
+  /** Runtime active-persona window, excluded from sealed request identity. One is exact serial rollback. */
+  maxParallel?: number;
 };
 
 // The sealed dispatch/completion window the review journal records per
@@ -438,6 +440,10 @@ export interface ReviewOrchestrator {
 }
 
 export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewOrchestrator {
+  const maxParallel = deps.maxParallel ?? 1;
+  if (!Number.isInteger(maxParallel) || maxParallel < 1 || maxParallel > 8) {
+    throw new Error("review fanout concurrency must be an integer between 1 and 8");
+  }
   const fanoutFenceFor = (input: {
     instance: PipelineInstance;
     action: ExecutionWorkAttempt;
@@ -550,29 +556,64 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
     requests: readonly LoopActionRequest[];
   }): Promise<Map<string, LoopActionResult>> => {
     const precollected = new Map<string, LoopActionResult>();
-    for (const request of input.requests) {
-      const prepared = await prepareReviewSubaction({
+    const collect = (request: LoopActionRequest) => reviewRuntimeCall(
+      `review fanout action ${request.actionId} result collection failed`,
+      () => deps.runtime.collectLoopActionResult(input.resource, {
+        attemptId: request.attemptId,
+        actionId: request.actionId,
+        requestHash: request.requestHash,
+      })
+    );
+
+    // Re-collect every durably launched sibling first. Completed siblings do
+    // not consume the active window; missing results do. This is the crash
+    // recovery boundary: a restart never redispatches a sibling merely
+    // because another sibling completed or failed.
+    const dispatches = input.requests.map((request) =>
+      deps.store.getReviewSubactionDispatch(input.action.id, request.actionId)
+    );
+    const launchedIndexes = dispatches
+      .map((dispatch, index) => dispatch?.dispatched_at ? index : -1)
+      .filter((index) => index >= 0);
+    const launchedResults = await Promise.all(launchedIndexes.map((index) => collect(input.requests[index]!)));
+    let active = 0;
+    let terminalObserved = false;
+    for (let offset = 0; offset < launchedIndexes.length; offset += 1) {
+      const request = input.requests[launchedIndexes[offset]!]!;
+      const result = launchedResults[offset];
+      if (result) {
+        precollected.set(request.actionId, result);
+        if (result.outcome !== "success") terminalObserved = true;
+      } else {
+        active += 1;
+      }
+    }
+
+    const unlaunched = input.requests.filter((_request, index) => !dispatches[index]?.dispatched_at);
+    let cursor = 0;
+    // Fill only the available active slots. A recovered prepared-only result
+    // frees its slot immediately, allowing the same drain to continue walking
+    // the deterministic roster. Actual launches remain active until a later
+    // collection observes their result.
+    while (!terminalObserved && cursor < unlaunched.length && active < maxParallel) {
+      const available = maxParallel - active;
+      const batch = unlaunched.slice(cursor, cursor + available);
+      cursor += batch.length;
+      const preparedBatch = await Promise.all(batch.map((request) => prepareReviewSubaction({
         resource: input.resource,
         action: input.action,
         request,
         label: "review fanout action",
-      });
-      let result = prepared.result;
-      if (!result && !prepared.newlyDispatched) {
-        result = await reviewRuntimeCall(
-          `review fanout action ${request.actionId} serialized result collection failed`,
-          () => deps.runtime.collectLoopActionResult(input.resource, {
-            attemptId: request.attemptId,
-            actionId: request.actionId,
-            requestHash: request.requestHash,
-          })
-        );
-      }
-      if (result) {
-        precollected.set(request.actionId, result);
-      }
-      if (prepared.newlyDispatched || !result || result.outcome !== "success") {
-        break;
+      })));
+      for (let index = 0; index < batch.length; index += 1) {
+        const request = batch[index]!;
+        const prepared = preparedBatch[index]!;
+        if (prepared.result) {
+          precollected.set(request.actionId, prepared.result);
+          if (prepared.result.outcome !== "success") terminalObserved = true;
+        } else {
+          active += 1;
+        }
       }
     }
     return precollected;
@@ -594,8 +635,7 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
   } | ReviewSubactionTerminal> => {
     const receipts: SemanticReviewReceipt[] = [];
     const receiptResults: ReviewFanoutReceiptResult[] = [];
-    const collected: Array<{ request: LoopActionRequest; result: LoopActionResult | null }> = [];
-    for (const request of input.requests) {
+    const collectOne = async (request: LoopActionRequest) => {
       const result = input.precollected?.get(request.actionId) ?? await reviewRuntimeCall(
         `review fanout action ${request.actionId} result collection failed`,
         () => deps.runtime.collectLoopActionResult(input.resource, {
@@ -604,7 +644,15 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
           requestHash: request.requestHash,
         })
       );
-      collected.push({ request, result });
+      return { request, result };
+    };
+    const collected: Array<{ request: LoopActionRequest; result: LoopActionResult | null }> = [];
+    if (maxParallel === 1) {
+      // Exact rollback path: retain the historical deterministic provider-call
+      // order as well as identical synthesized bytes.
+      for (const request of input.requests) collected.push(await collectOne(request));
+    } else {
+      collected.push(...await Promise.all(input.requests.map(collectOne)));
     }
     for (const { request, result } of collected) {
       if (!result) return { pending: true };
@@ -918,11 +966,9 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
         timeoutMs: selectorRequest.timeoutMs,
       });
       for (const request of fanoutRequests) assertLoopRequestEnvelopeBound(request);
-      // Review subactions share one sandbox. The sandbox seals every action by
-      // locking sibling action directories, so overlapping persona processes
-      // would lock one another's active engine homes. Run the deterministic
-      // roster one action at a time; for Codex this also preserves the rotating
-      // auth handoff before action N+1 materializes its credentials.
+      // Dispatch a deterministic, durable active window. Collection gathers
+      // the full roster, then synthesis and the optional validator remain
+      // strictly serial below this barrier.
       const precollectedFanout = await prepareReviewFanout({
         resource,
         action,

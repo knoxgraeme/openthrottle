@@ -2130,6 +2130,60 @@ describe("loop action request validation", () => {
     expect(statSync(siblingSecret).mode & 0o777).toBe(0o600);
   });
 
+  it("preserves a live sibling action home while locking stale siblings", () => {
+    const integrationRepoDir = repository();
+    const subject = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: integrationRepoDir,
+      encoding: "utf8",
+    }).trim();
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_LOOP_ACTION_ROOT = actionRoot;
+    const reviewer = (actionId) => validateLoopRequest(request({
+      actionId,
+      role: "reviewer",
+      loop: "review",
+      skill: "correctness-dataflow",
+      worktree: null,
+      baseSubject: subject,
+      inputSubject: subject,
+      credentialScopes: ["model.invoke", "repo.read"],
+      expectedReceiptType: "semantic_review",
+    }));
+    const first = reviewer("review-sibling-a");
+    const second = reviewer("review-sibling-b");
+    const firstSentinel = join(actionRoot, first.attemptId, first.actionId, "home", "live-sibling.txt");
+    let nested = false;
+
+    runLoopAgentInPreparedRepository({
+      request: first,
+      invocation: resolveLoopInvocation(first),
+      integrationRepoDir,
+      lockIntegration: () => true,
+      lockPersistentProfiles: () => [],
+      processFence: (execute) => execute(),
+      runProcess: (_command, _args, options) => {
+        if (nested || options.timeout === 5_000) {
+          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+        }
+        writeFileSync(firstSentinel, "live\n", { mode: 0o644 });
+        chmodSync(firstSentinel, 0o644);
+        nested = true;
+        runLoopAgentInPreparedRepository({
+          request: second,
+          invocation: resolveLoopInvocation(second),
+          integrationRepoDir,
+          lockIntegration: () => true,
+          lockPersistentProfiles: () => [],
+          processFence: (execute) => execute(),
+          runProcess: () => ({ status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" }),
+        });
+        expect(statSync(firstSentinel).mode & 0o777).toBe(0o644);
+        return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
+      },
+    });
+  });
+
   it("runs non-worker loops in an action-scoped read-only repository view", () => {
     const integrationRepoDir = repository();
     const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], {
@@ -5827,6 +5881,34 @@ describe("executeLoopAction", () => {
     expect(result.outcome).toBe("failure");
     expect(result.receipt).toMatch(/agent launch failed/);
     expect(restoreIntegration).toHaveBeenCalledWith(configuredIntegration);
+  });
+
+  it("does not restore the shared checkout while a sibling executor fence is live", () => {
+    const valid = request();
+    const actionRoot = process.env.OT_LOOP_ACTION_ROOT;
+    const siblingDirectory = join(actionRoot, valid.attemptId, "live-review-sibling");
+    mkdirSync(siblingDirectory, { recursive: true });
+    const processStat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
+    const startedAt = processStat.slice(processStat.lastIndexOf(")") + 2).trim().split(/\s+/)[19];
+    writeFileSync(
+      join(siblingDirectory, ".ot-active-action.json"),
+      JSON.stringify({ pid: process.pid, started_at: startedAt }),
+      { mode: 0o600 },
+    );
+    const restoreIntegration = vi.fn();
+
+    executeLoopAction({
+      request: valid,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration,
+      runLoopAgent: () => {
+        throw new Error("agent launch failed");
+      },
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(restoreIntegration).not.toHaveBeenCalled();
   });
 
   it("returns a typed failure when launch failure leaves subject attestation unavailable", () => {
