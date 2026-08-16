@@ -21,6 +21,7 @@ import { getErrorMessage } from "./util.js";
 
 const OWNER = "knoxgraeme";
 const REPO = "openthrottle";
+const OWNED_REPOSITORIES = new Set([REPO, "openthrottle-v2"]);
 const SKILL_PATH = "skills/operator/openthrottle";
 const SKILL_NAME = "openthrottle";
 const SUPPORTED_AGENTS = ["Claude Code", "Codex", "OpenCode"] as const;
@@ -496,7 +497,8 @@ function inspectOwnedInstall(entry: SkillfishInstalledSkill, expectedDigest: str
   const manifest = readManifest(entry.path);
   const exact =
     manifest?.owner === OWNER &&
-    manifest.repo === REPO &&
+    typeof manifest.repo === "string" &&
+    OWNED_REPOSITORIES.has(manifest.repo) &&
     manifest.path === SKILL_PATH &&
     (manifest.source === "manifest" || manifest.source === "manual");
   if (!exact) {
