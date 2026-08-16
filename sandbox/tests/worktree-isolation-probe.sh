@@ -304,12 +304,12 @@ console.log(JSON.stringify(receipt));
 NODE
 }
 
-test "$(id -un)" = "agent"
+test "$(id -un)" = "${PROBE_EXPECTED_PRINCIPAL:-agent}"
 if [ -n "${PROBE_READONLY_ACTION_DIR:-}" ]; then
   test "$(stat -c '%a' "$PROBE_READONLY_ACTION_DIR")" = "711"
   test "$(git rev-parse HEAD)" = "$PROBE_BASE"
-  git status --porcelain=v1 --untracked-files=all >/tmp/ot-probe-lead-status
-  git show --stat --oneline HEAD >/tmp/ot-probe-lead-show
+  git status --porcelain=v1 --untracked-files=all >/dev/null
+  git show --stat --oneline HEAD >/dev/null
   must_fail sh -c "printf bad > '$PWD/lead-write.txt'"
   must_fail git add lead-write.txt
   must_fail git commit -m "lead direct commit"
@@ -661,6 +661,7 @@ if (result.kind !== "loop_action_result" ||
 NODE
 
 write_probe_env \
+  PROBE_EXPECTED_PRINCIPAL "ot-review-final" \
   PROBE_INTEGRATION "$INTEGRATION" \
   PROBE_BASE "$BASE" \
   PROBE_SIBLING_ONLY_BLOB "$SIBLING_ONLY_BLOB" \

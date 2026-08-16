@@ -5950,6 +5950,7 @@ describe("executeLoopAction", () => {
 
   it("does not restore the shared checkout while a sibling executor fence is live", () => {
     const valid = request();
+    const integrationRepoDir = repository();
     const actionRoot = process.env.OT_LOOP_ACTION_ROOT;
     const siblingDirectory = join(actionRoot, valid.attemptId, "live-review-sibling");
     mkdirSync(siblingDirectory, { recursive: true });
@@ -5964,6 +5965,7 @@ describe("executeLoopAction", () => {
 
     executeLoopAction({
       request: valid,
+      integrationRepoDir,
       lockWorkerWorktree: vi.fn(),
       lockActionDirectory: vi.fn(),
       restoreIntegration,
