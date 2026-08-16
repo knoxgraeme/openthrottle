@@ -18,6 +18,7 @@ function setRequiredEnv(): void {
     "CODEX_AUTH_JSON",
     "KIMI_CODE_API_KEY",
     "TASK_TIMEOUT",
+    "REVIEW_FANOUT_CONCURRENCY",
     "ORPHAN_GRACE_MINUTES",
     "RUNTIME_RESOURCE_RETENTION_MINUTES",
     "WEBHOOK_MAX_AGE_SECONDS",
@@ -57,6 +58,7 @@ describe("loadConfig", () => {
       deployToken: "deploy",
       port: 8080,
       taskTimeout: 7200,
+      reviewFanoutConcurrency: 3,
       allowLinearMerge: true,
       defaultAgent: "codex",
       githubReadToken: "github-read-token",
@@ -165,6 +167,15 @@ describe("loadConfig", () => {
 
     process.env.TASK_TIMEOUT = "86401";
     expect(() => loadConfig()).toThrow("TASK_TIMEOUT must be between 1 and 86400");
+  });
+
+  it("accepts a serial review-fanout rollback and rejects an oversized fanout", () => {
+    setRequiredEnv();
+    process.env.REVIEW_FANOUT_CONCURRENCY = "1";
+    expect(loadConfig().reviewFanoutConcurrency).toBe(1);
+
+    process.env.REVIEW_FANOUT_CONCURRENCY = "9";
+    expect(() => loadConfig()).toThrow("REVIEW_FANOUT_CONCURRENCY must be between 1 and 8");
   });
 
   it("rejects an invalid default agent", () => {

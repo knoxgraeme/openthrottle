@@ -299,6 +299,24 @@ function main() {
       },
     });
   } else if (REVIEW_PERSONA_SKILLS.has(skill)) {
+    // Keep sibling processes overlapped long enough for the walking skeleton
+    // to prove the shared sandbox preserves each action-scoped CLI home.
+    Atomics.wait(
+      new Int32Array(new SharedArrayBuffer(4)),
+      0,
+      0,
+      skill === "correctness-dataflow" ? 100 : 400,
+    );
+    // The faster sibling exits while the slower one is still alive. The last
+    // action alone may restore the shared checkout; if the faster cleanup
+    // exposes it early, this agent-UID write succeeds and fails the scenario.
+    try {
+      writeFileSync("/home/agent/repo/.ot-review-shared-checkout-write-probe", `${skill}\n`);
+      throw new Error("concurrent review persona could write the shared integration checkout");
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("could write")) throw error;
+      if (error?.code !== "EACCES" && error?.code !== "ENOENT") throw error;
+    }
     receipt = buildReceipt({
       contract,
       type: "semantic_review",

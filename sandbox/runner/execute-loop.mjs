@@ -116,6 +116,7 @@ const SKILLS = new Set([
 ]);
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
 const STANDARD_RECEIPT_SCHEMA = "openthrottle.receipt/v1";
+const ACTIVE_ACTION_FENCE_FILE = ".ot-active-action.json";
 const STANDARD_RECEIPT_TYPES = new Set([
   "unit_completion",
   "unit_decision",
@@ -436,6 +437,68 @@ function ensureCurrentActionTraversal(request, rootDir = configuredActionRoot())
   return currentActionDirectory;
 }
 
+function processStartTime(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd < 0) return null;
+    return stat.slice(commandEnd + 2).trim().split(/\s+/)[19] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function claimCurrentAction(request, rootDir = configuredActionRoot()) {
+  const currentActionDirectory = ensureCurrentActionTraversal(request, rootDir);
+  const startedAt = processStartTime(process.pid);
+  if (!startedAt) throw new Error("could not fence the current loop executor process");
+  const fencePath = pathInside(currentActionDirectory, ACTIVE_ACTION_FENCE_FILE);
+  writeJsonAtomic(fencePath, { pid: process.pid, started_at: startedAt });
+  if (isRoot()) chownSync(fencePath, ROOT_UID, ROOT_GID);
+  chmodSync(fencePath, 0o600);
+}
+
+function actionDirectoryIsLive(path) {
+  const fencePath = pathInside(path, ACTIVE_ACTION_FENCE_FILE);
+  try {
+    const metadata = lstatSync(fencePath);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || (isRoot() && metadata.uid !== ROOT_UID)) return false;
+    const fence = JSON.parse(readFileSync(fencePath, "utf8"));
+    if (fence.process_termination_unconfirmed === true) return true;
+    return Number.isSafeInteger(fence.pid) && fence.pid > 0 &&
+      typeof fence.started_at === "string" && processStartTime(fence.pid) === fence.started_at;
+  } catch {
+    return false;
+  }
+}
+
+function preserveUnconfirmedActionClaim(request, rootDir = configuredActionRoot()) {
+  const fencePath = pathInside(actionDirectory(request, rootDir), ACTIVE_ACTION_FENCE_FILE);
+  writeJsonAtomic(fencePath, { process_termination_unconfirmed: true });
+  if (isRoot()) chownSync(fencePath, ROOT_UID, ROOT_GID);
+  chmodSync(fencePath, 0o600);
+}
+
+function releaseCurrentActionClaim(request, rootDir = configuredActionRoot()) {
+  rmSync(pathInside(actionDirectory(request, rootDir), ACTIVE_ACTION_FENCE_FILE), { force: true });
+}
+
+function hasOtherLiveAction(request, rootDir = configuredActionRoot()) {
+  if (!existsSync(rootDir)) return false;
+  const currentActionDirectory = actionDirectory(request, rootDir);
+  for (const attempt of readdirSync(rootDir)) {
+    const attemptDirectory = resolve(rootDir, attempt);
+    if (!lstatSync(attemptDirectory).isDirectory()) continue;
+    for (const action of readdirSync(attemptDirectory)) {
+      const sibling = resolve(attemptDirectory, action);
+      if (sibling !== currentActionDirectory && lstatSync(sibling).isDirectory() && actionDirectoryIsLive(sibling)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function lockNonCurrentActionDirectories(request, rootDir = configuredActionRoot()) {
   if (!existsSync(rootDir)) return;
   const currentActionDirectory = actionDirectory(request, rootDir);
@@ -445,6 +508,11 @@ function lockNonCurrentActionDirectories(request, rootDir = configuredActionRoot
     for (const action of readdirSync(attemptDirectory)) {
       const actionDirectoryPath = resolve(attemptDirectory, action);
       if (actionDirectoryPath !== currentActionDirectory && lstatSync(actionDirectoryPath).isDirectory()) {
+        // Concurrent review personas have independent action homes. Preserve
+        // a sibling only while its root-owned PID/start-time fence proves the
+        // executor is still alive; stale or completed siblings are locked by
+        // the same stage-boundary discipline as before.
+        if (actionDirectoryIsLive(actionDirectoryPath)) continue;
         chownTree(actionDirectoryPath, ROOT_UID, ROOT_GID);
         chmodTree(actionDirectoryPath, { fileMode: 0o600, directoryMode: 0o700 });
       }
@@ -956,13 +1024,18 @@ export function runLoopAgentInPreparedRepository({
   integrationRepoDir = INTEGRATION_REPO_DIR,
   lockIntegration = lockIntegrationCheckout,
   lockPersistentProfiles = lockPersistentAgentPrivateRoots,
-  restorePersistentProfiles = restorePersistentAgentPrivateRoots,
+  // Production keeps the shared stage profiles sealed until the next
+  // entrypoint reset. Per-action homes carry all engine state, so restoring a
+  // shared profile after one sibling exits would race another live sibling.
+  // Tests may inject an explicit restorer when exercising legacy snapshots.
+  restorePersistentProfiles = null,
   credentialEnv = {},
 }) {
   let lockedPersistentProfiles = [];
   const cleanupErrors = [];
   let bodyError = null;
   try {
+    claimCurrentAction(request);
     lockIntegration(integrationRepoDir);
     try {
       lockedPersistentProfiles = lockPersistentProfiles();
@@ -1048,7 +1121,7 @@ export function runLoopAgentInPreparedRepository({
     }
     // While agent process termination is unconfirmed, restoring profile access
     // would hand executor-locked state back to processes that may still run.
-    if (!bodyError?.processTerminationUnconfirmed) {
+    if (!bodyError?.processTerminationUnconfirmed && restorePersistentProfiles) {
       try {
         restorePersistentProfiles(lockedPersistentProfiles);
       } catch (error) {
@@ -1973,12 +2046,22 @@ export function executeLoopAction({
   } finally {
     const cleanups = [
       () => lockWorkerWorktree(request),
+      () => execution?.processTerminationUnconfirmed
+        ? preserveUnconfirmedActionClaim(request)
+        : releaseCurrentActionClaim(request),
       () => lockActionDirectory(request),
       // Restoring agent access to the integration checkout is unsafe while
       // agent process termination is unconfirmed; keep it executor-locked.
+      // A completed concurrent sibling also leaves it locked: only the last
+      // live action restores the shared checkout, so one persona can never
+      // expose it to another persona's still-running agent process.
       ...(execution?.processTerminationUnconfirmed
         ? []
-        : [() => restoreIntegration(execution?.integrationRepoDir ?? integrationRepoDir)]),
+        : [() => {
+          if (!hasOtherLiveAction(request)) {
+            restoreIntegration(execution?.integrationRepoDir ?? integrationRepoDir);
+          }
+        }]),
     ];
     for (const cleanup of cleanups) {
       try {

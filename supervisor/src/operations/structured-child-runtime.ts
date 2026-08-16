@@ -105,6 +105,7 @@ type StructuredChildRuntimeDeps = {
   store: PipelineStore & ExecutionUnitStore;
   runtime: SandboxRuntime;
   taskTimeoutSeconds: number;
+  reviewFanoutConcurrency?: number;
   now: () => Date;
   completeParentStage?: (event: PipelineCoordinatorEvent) => PipelineInstance;
   // Per-tick bound on the drainCompositeChildren walk. Production always uses
@@ -645,6 +646,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     standardFenceFor,
     commandAttemptReceiptsFor: (action) =>
       commandAttemptReceipts(completedAttemptReceiptsFor(action.parent_attempt_id), null, action.cycle),
+    maxParallel: deps.reviewFanoutConcurrency ?? 1,
   });
 
   const dispatchChildAction = async (

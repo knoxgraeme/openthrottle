@@ -105,6 +105,8 @@ interface PipelineEffectProcessorDeps {
   tickets: SupervisorStore;
   runtime: SandboxRuntime & SandboxAutostopRuntime;
   taskTimeoutSeconds: number;
+  /** Maximum concurrently active review-persona subactions. Defaults to 1 in test harnesses. */
+  reviewFanoutConcurrency?: number;
   // OPE-75: bounded diagnostic-retention window a terminal instance's stopped
   // runtime resource must clear before the reclaim path may delete it. Used
   // to run one reconciliation pass here too when a provision/dispatch effect
@@ -289,6 +291,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     store: deps.store,
     runtime: deps.runtime,
     taskTimeoutSeconds: deps.taskTimeoutSeconds,
+    reviewFanoutConcurrency: deps.reviewFanoutConcurrency,
     now,
     maxChildDrainsPerTick: deps.maxChildDrainsPerTick,
     completeParentStage(event: PipelineCoordinatorEvent): PipelineInstance {

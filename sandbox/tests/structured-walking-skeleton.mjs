@@ -327,8 +327,7 @@ function createDockerSandboxRuntime(container) {
   const cachedLoopResults = new Map();
   const dispatchedLoopRequests = new Map();
   const dispatchedChildExecutorRequests = new Map();
-  const completedReviewPersonaActions = new Set();
-  const lastReviewPersonaByParent = new Map();
+  const activeReviewPersonaActions = new Set();
   const cachedChildResults = new Map();
   const worktreeHandles = new Map();
   const dispatchedWorktreeIds = new Set();
@@ -343,7 +342,7 @@ function createDockerSandboxRuntime(container) {
     dispatchLoopAction: 0,
     dispatchChildExecutorAction: 0,
     cleanupWorktree: 0,
-    serialReviewPersonaTransitions: 0,
+    maxConcurrentReviewPersonas: 0,
   };
   // The container is genuinely shared across scenarios, but production
   // enforces one pipeline instance per runtime_provider_resource_id -- give
@@ -471,19 +470,15 @@ function createDockerSandboxRuntime(container) {
         request.skill !== "select-review-personas" &&
         request.skill !== "validate-review-findings";
       if (isReviewPersona) {
-        const parentActionId = request.actionId.slice(0, reviewSeparatorIndex);
-        const previousPersonaActionId = lastReviewPersonaByParent.get(parentActionId);
-        if (previousPersonaActionId && previousPersonaActionId !== request.actionId) {
-          // Non-Codex regression: Claude personas share one sealed sandbox.
-          // Persona N+1 may launch only after collect observed persona N's
-          // durable result; dispatch acknowledgement alone is insufficient.
-          assert(
-            completedReviewPersonaActions.has(previousPersonaActionId),
-            `review persona ${request.actionId} launched before ${previousPersonaActionId} completed`
-          );
-          counters.serialReviewPersonaTransitions += 1;
-        }
-        lastReviewPersonaByParent.set(parentActionId, request.actionId);
+        activeReviewPersonaActions.add(request.actionId);
+        counters.maxConcurrentReviewPersonas = Math.max(
+          counters.maxConcurrentReviewPersonas,
+          activeReviewPersonaActions.size
+        );
+        assert(
+          activeReviewPersonaActions.size <= 3,
+          `review fanout exceeded the configured concurrency cap: ${activeReviewPersonaActions.size}`
+        );
       }
       if (request.worktree?.id) dispatchedWorktreeIds.add(request.worktree.id);
       if (request.nativeSessionId && request.worktree?.id) {
@@ -580,7 +575,12 @@ function createDockerSandboxRuntime(container) {
       if (input.actionId.includes(".review.") &&
           request.skill !== "select-review-personas" &&
           request.skill !== "validate-review-findings") {
-        completedReviewPersonaActions.add(input.actionId);
+        activeReviewPersonaActions.delete(input.actionId);
+        const actionHome = `${LOOP_ACTION_DIR}/${input.attemptId}/${input.actionId}/home`;
+        assert(
+          dockerExecStatus(container, ["test", "-f", `${actionHome}/.claude/ot-stub-agent-startup.json`]).status === 0,
+          `review persona ${input.actionId} did not retain its isolated CLI home state`
+        );
       }
       cachedLoopResults.set(key, result);
       return result;
@@ -1055,6 +1055,7 @@ async function runHappyPath({ db, container, fixture }) {
     tickets,
     runtime,
     taskTimeoutSeconds: 300,
+    reviewFanoutConcurrency: 3,
     now: () => new Date(),
   });
 
@@ -1116,8 +1117,18 @@ async function runHappyPath({ db, container, fixture }) {
   });
 
   assert(
-    runtime.counters.serialReviewPersonaTransitions > 0,
-    "the Claude walking skeleton did not prove persona N+1 waited for persona N's collected result"
+    runtime.counters.maxConcurrentReviewPersonas >= 2,
+    "the Claude walking skeleton did not run multiple isolated review personas concurrently"
+  );
+  const finalReviewGate = pipelines.listGateReceipts(attempt.id)
+    .filter((gate) => gate.gate_kind === "final_review" && gate.result === "passed")
+    .at(-1);
+  assert(finalReviewGate, "the concurrent review fanout produced no final-review gate");
+  const reviewSynthesis = JSON.parse(finalReviewGate.payload).review_fanout_synthesis;
+  assert(reviewSynthesis?.persona_ids?.length >= 2, "the concurrent review synthesis lost its persona roster");
+  assert(
+    reviewSynthesis.receipt_hashes.length === reviewSynthesis.persona_ids.length + 1,
+    "the concurrent review synthesis did not collect the selector plus every persona receipt"
   );
 
   // Every sealed request that carried a worktree handle must be bound to a

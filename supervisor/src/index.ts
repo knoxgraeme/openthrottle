@@ -92,6 +92,7 @@ async function main() {
     tickets: store,
     runtime,
     taskTimeoutSeconds: cfg.taskTimeout,
+    reviewFanoutConcurrency: cfg.reviewFanoutConcurrency ?? 3,
     runtimeResourceRetentionMinutes: cfg.runtimeResourceRetentionMinutes,
     citationGateStore,
     reconcileRuntimeResources,

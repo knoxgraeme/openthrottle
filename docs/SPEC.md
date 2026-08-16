@@ -942,9 +942,16 @@ fixed, so diagnostic rewording cannot duplicate or prematurely resolve a
 finding. Rereview searches the newest bounded history window. A
 missing or malformed prior journal is appended as a separate audit-gap note and
 cannot block, pass, or otherwise authorize the live receipt/gate decision.
-Persona actions remain independent sessions, but all engines execute the
-deterministic roster one action at a time within the shared sealed sandbox.
-Concurrent siblings would race the sandbox's action-directory locks. Codex's
+Persona actions remain independent sessions. Each sibling gets a distinct
+action directory, transport state, `HOME`, engine profile (`~/.claude`,
+`CODEX_HOME`, or OpenCode state), and root-owned live-process fence. Completed
+or stale sibling directories are sealed; a concurrently live sibling is never
+relocked by another action. All siblings read exact-subject, action-scoped
+read-only repository views derived from the one shared integration checkout;
+no persona receives a worktree. The supervisor dispatches the deterministic
+roster through the `REVIEW_FANOUT_CONCURRENCY` active window, gathers every
+receipt, and only then runs deterministic synthesis and any blocker validator
+serially. Codex's
 shared subscription credential has a rotating one-time refresh token, so the
 supervisor is its sole refresh authority: it refreshes a near-expiry token
 behind a single in-flight exchange, so concurrent runs coalesce instead of
@@ -967,9 +974,11 @@ snapshot is captured, and the durable store is reloaded from the bootstrap env
 seed only when that seed carries a strictly newer `last_refresh`. Selector,
 persona, and validator dispatch intent is persisted before provider launch and
 marked launched after acknowledgement.
-Repeated drains collect a durably launched subaction before considering
-dispatch; a prepared-only crash window reuses the same provider idempotency
-fence.
+Repeated drains concurrently collect every durably launched sibling before
+filling free active slots; a prepared-only crash window reuses the same
+provider idempotency fence. Lowering the configured window never redispatches
+or cancels already-launched siblings, and setting it to one restores ordered
+one-at-a-time dispatch for new fanouts.
 
 `run_outcomes` holds one deterministic row per pipeline instance, written
 exactly once at its terminal transition -- either applyTransition's normal
@@ -1310,6 +1319,9 @@ Optional/defaulted:
   86,400 seconds. A structured composite parent may extend its immutable
   `expires_at` up to the sealed graph phase maximum, also capped at 86,400
   seconds;
+- `REVIEW_FANOUT_CONCURRENCY=3`, bounded from 1 through 8, caps concurrently
+  active review-persona subactions within one sandbox. Setting it to 1 restores
+  deterministic serial dispatch ordering without a code change;
 - `ORPHAN_GRACE_MINUTES=5`,
   `RUNTIME_RESOURCE_RETENTION_MINUTES=60`,
   `WEBHOOK_MAX_AGE_SECONDS=60`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`,

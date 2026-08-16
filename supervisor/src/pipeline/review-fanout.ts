@@ -381,6 +381,10 @@ export function buildReviewFanoutPlan(input: {
     policy_digest: authority.policy_digest,
     selection_id: selectionId,
     selector_receipt_hash: input.selectorReceiptHash ?? null,
+    // Scheduling concurrency is deliberately not part of the sealed review
+    // request identity. Keeping this historical semantic-plan field stable
+    // lets a restarted supervisor lower the live active window and re-collect
+    // already-launched persona requests under their exact durable hashes.
     max_parallel: 1,
     personas: selected,
   };

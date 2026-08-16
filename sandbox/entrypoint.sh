@@ -47,6 +47,29 @@ terminate_agent_processes() {
   fi
 }
 
+# Composite loop actions keep the shared stage profiles executor-sealed while
+# sibling engines use their action-scoped homes. After killing every stale
+# agent process, restore ownership at the stage boundary before the ordinary
+# reset below preserves or replaces selected state. `find` is physical by
+# default, so an agent-planted child symlink is never traversed as root.
+restore_agent_state_ownership() {
+  local path
+  for path in \
+    "${AGENT_HOME}/.claude" \
+    "${AGENT_HOME}/.codex" \
+    "${AGENT_HOME}/.local/share/opencode" \
+    "${AGENT_HOME}/.ot"; do
+    if [[ -L "$path" ]]; then
+      log "FATAL: agent state path is a symlink: ${path}"
+      return 1
+    fi
+    [[ -d "$path" ]] || continue
+    chown -R "${AGENT_USER}:${AGENT_USER}" "$path"
+    find "$path" -type d -exec chmod 0700 {} +
+    find "$path" -type f -exec chmod 0600 {} +
+  done
+}
+
 # Preserve native session/auth data, but discard every executable user-level
 # config surface. Claude gets the OpenThrottle skills recopied per stage;
 # Codex loads them from root-owned /etc/codex/skills. Per-stage hooks/config
@@ -201,6 +224,11 @@ fi
 trap 'handle_exit "$?"' EXIT
 
 terminate_agent_processes
+# An unconfirmed loop child keeps a persistent live-action fence so no sibling
+# can expose shared state. The stage boundary has now killed every agent-owned
+# process, so those conservative fences can be retired before new work begins.
+find /var/lib/openthrottle/loop-actions -name '.ot-active-action.json' -type f -delete 2>/dev/null || true
+restore_agent_state_ownership
 reset_agent_execution_state
 
 : "${TASK_TYPE:?TASK_TYPE is required}"
