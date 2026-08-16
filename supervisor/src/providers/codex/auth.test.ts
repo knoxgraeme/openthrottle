@@ -141,8 +141,16 @@ describe("Codex durable auth", () => {
       expect(parsed.tokens.account_id).toBe("acct"); // preserved
       expect(parsed.last_refresh).toBe("2026-07-02T12:00:00Z");
 
-      const body = JSON.parse((fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1].body);
-      expect(body).toMatchObject({ grant_type: "refresh_token", refresh_token: "rt-0" });
+      const request = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1];
+      expect(new Headers(request.headers).get("content-type")).toBe(
+        "application/x-www-form-urlencoded"
+      );
+      expect(Object.fromEntries(new URLSearchParams(String(request.body)))).toEqual({
+        client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+        grant_type: "refresh_token",
+        refresh_token: "rt-0",
+        scope: "openid profile email",
+      });
     });
 
     it("throws on a non-2xx response so the caller can fall back", async () => {

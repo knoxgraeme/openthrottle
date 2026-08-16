@@ -212,8 +212,8 @@ export async function refreshCodexAuthJson(
       response = await Promise.race([
         fetchImpl(CODEX_TOKEN_URL, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
             client_id: CODEX_OAUTH_CLIENT_ID,
             grant_type: "refresh_token",
             refresh_token: refreshToken,
