@@ -107,13 +107,6 @@ type StructuredChildRuntimeDeps = {
   taskTimeoutSeconds: number;
   now: () => Date;
   completeParentStage?: (event: PipelineCoordinatorEvent) => PipelineInstance;
-  // Persists a Codex OAuth blob rotated inside one action's own scoped
-  // CODEX_HOME (see readCodexAuthSnapshot in execute-loop.mjs). Keyed to the
-  // action that actually ran as a Codex worker -- never to the parent
-  // ticket's engine -- and only ever invoked with the exact-fenced result of
-  // that action's own sealed request (see collectChildAction). Best-effort:
-  // malformed/stale/unchanged blobs are rejected by the callee.
-  captureCodexAuth?: (blob: string) => void;
   // Per-tick bound on the drainCompositeChildren walk. Production always uses
   // the default; harnesses that must pause a run at an exact mid-flight state
   // (sandbox/tests/structured-walking-skeleton.mjs) set 1 to restore
@@ -646,7 +639,6 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     store: deps.store,
     runtime: deps.runtime,
     now: deps.now,
-    ...(deps.captureCodexAuth ? { captureCodexAuth: deps.captureCodexAuth } : {}),
     executionPlanFor: (action) => extractExecutionPlan(parentTaskContextFor(deps.store, action.parent_attempt_id)),
     actionInputSubjectFor,
     expectedProducersFor,
@@ -988,15 +980,6 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       };
     }
     if (!result) return null;
-    // Captured regardless of the action's eventual semantic outcome (success,
-    // failure, or needs_human): a Codex worker that rotated its refresh token
-    // and then failed a lead/review gate still spent the old token, so the
-    // rotation must not be lost. Only ever set when this exact action (fenced
-    // by attempt/action/request hash in parseCollectedLoopResult) ran as a
-    // Codex worker; a Claude or OpenCode action never carries this field.
-    if ("codexAuthJson" in result && typeof result.codexAuthJson === "string" && result.codexAuthJson) {
-      deps.captureCodexAuth?.(result.codexAuthJson);
-    }
     const nativeSessionId: string | null = "nativeSessionId" in result
       ? (result as { nativeSessionId: string | null }).nativeSessionId
       : null;

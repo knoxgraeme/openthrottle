@@ -572,32 +572,24 @@ describe("sandbox event contracts", () => {
       },
     } ;
     const postStageResult = vi.fn(async () => undefined);
-    const captureAgentAuth = vi.fn(async () => {
-      throw new Error("Bearer private-stage-token");
-    });
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     await pollSandboxEvents({
       runtime: { getWorkspace: vi.fn(async () => sandbox), setActive: vi.fn(async () => undefined), setIdle: vi.fn(async () => undefined) } ,
       store,
       postActivity: vi.fn(async () => undefined),
       postStageResult,
-      captureAgentAuth,
     });
 
     expect(postStageResult).toHaveBeenCalledWith(
       expect.objectContaining({ kind: "stage_result", attempt_id: "attempt-1" }),
       "c".repeat(40)
     );
-    expect(captureAgentAuth).toHaveBeenCalledWith(
-      sandbox,
-      expect.objectContaining({ ticket_id: "issue-1" })
-    );
-    expect(warn).toHaveBeenCalledWith(
-      "[sandbox-events] agent auth capture failed:",
-      expect.stringContaining("[REDACTED]")
-    );
-    expect(warn.mock.calls.flat().join(" ")).not.toContain("private-stage-token");
+    // No credential is ever read back out of the sandbox: the supervisor is
+    // the sole Codex refresh authority, so nothing here reaches for the
+    // agent's auth.json.
+    const downloaded = sandbox.fs.downloadFile.mock.calls.flat();
+    expect(downloaded).toContain(sealedPath);
+    expect(downloaded).not.toContain("/home/agent/.codex/auth.json");
     const stored = store.getSandboxEvent("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!;
     expect(stored.status).toBe("processed");
     expect(JSON.parse(stored.payload)).toEqual({
@@ -614,7 +606,6 @@ describe("sandbox event contracts", () => {
     expect(stored.payload).not.toContain("native_session_id");
     expect(stored.payload).not.toContain("private-stage-token");
     expect(files.size).toBe(0);
-    warn.mockRestore();
   });
 
   it("surfaces a repeated sealed stage-result ingestion failure once and keeps retrying", async () => {

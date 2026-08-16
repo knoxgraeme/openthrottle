@@ -9,11 +9,7 @@ import {
 } from "./http/server.js";
 import { runSweep } from "./operations/sweep.js";
 import { createLinearClientProvider } from "./providers/linear/auth.js";
-import {
-  captureCodexAuthFromSandbox,
-  captureCodexAuthJson,
-  createCredentialMaterializer,
-} from "./providers/codex/auth.js";
+import { createCredentialMaterializer } from "./providers/codex/auth.js";
 import { pollSandboxEvents } from "./runtime/event-poller.js";
 import { deliverPendingInbox } from "./runtime/steering.js";
 import { reapStalledRuns } from "./operations/reaper.js";
@@ -99,9 +95,6 @@ async function main() {
     runtimeResourceRetentionMinutes: cfg.runtimeResourceRetentionMinutes,
     citationGateStore,
     reconcileRuntimeResources,
-    captureCodexAuth: (blob) => {
-      captureCodexAuthJson(store, blob);
-    },
   });
   const pipelineCoordinator = {
     catalog: pipelineCatalog,
@@ -244,7 +237,6 @@ async function main() {
           );
           await pipelineEffectProcessor.drain();
         },
-        captureAgentAuth: (sandbox, ticket) => captureCodexAuthFromSandbox(store, sandbox, ticket),
       });
       // Deliver any queued mid-run steering into running sandboxes on the same
       // fast cadence, so a steer reaches the agent within one poll interval.

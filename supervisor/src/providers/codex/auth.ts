@@ -1,34 +1,35 @@
 import type { Config } from "../../app/config.js";
-import type { Ticket } from "../../persistence/store.js";
 import type { SupervisorStore } from "../../persistence/store.js";
-import type { RuntimeWorkspace } from "../../runtime/contracts.js";
 import type { Agent } from "../../pipeline/types.js";
-import { sanitizeText } from "../../shared/sanitize.js";
 
 /**
- * Durable Codex subscription auth.
+ * Durable Codex subscription auth: the supervisor as sole refresh authority.
  *
  * Codex logs in with an OAuth flow whose refresh token *rotates*: every
  * successful refresh mints a new refresh token and invalidates the previous
- * one. That token is refreshed inside the ephemeral Daytona sandbox and written
- * back to `~/.codex/auth.json`, which is destroyed with the sandbox. Reseeding
- * the frozen `CODEX_AUTH_JSON` env snapshot on the next run therefore replays a
- * spent refresh token and OpenAI answers "refresh token was already used".
+ * one. A sandbox that refreshed on its own would therefore spend — and rotate
+ * away — the shared subscription account's live refresh token underneath every
+ * concurrent run, and the rotated result would die with the ephemeral sandbox.
  *
- * The fix mirrors how `linear-auth.ts` handles Linear's rotating OAuth token:
- * the SQLite `settings` store — not the env var — is the source of truth. The
- * env var is a one-time bootstrap seed; the supervisor reads the rotated token
- * back out of each sandbox (see `captureCodexAuthJson`) so the next run seeds
- * the live token.
+ * So the refresh token never leaves this process. Mirroring how
+ * `linear-auth.ts` handles Linear's rotating OAuth token, the SQLite `settings`
+ * store — not the env var — is the source of truth; `CODEX_AUTH_JSON` is a
+ * one-time bootstrap seed adopted only into an empty store (or when an operator
+ * re-logs-in with a strictly newer `last_refresh`).
  *
- * `getCodexAuthForSeed` additionally refreshes a near-expiry token centrally,
- * behind a single in-flight promise, before seeding a sandbox. Concurrent runs
- * share one shared subscription account, so serializing the supervisor's own
- * refresh keeps two runs from racing to spend the same refresh token, and hands
- * each run the freshest possible token so it need not refresh mid-run. (Two
- * long runs that both outlive the access token can still race inside their
- * sandboxes — one shared account plus rotation cannot be made fully concurrent
- * without per-run credentials, e.g. an API key.)
+ * `getCodexAuthForSeed` is the single boundary to a sandbox. It refreshes a
+ * near-expiry token centrally behind one in-flight promise, so concurrent runs
+ * coalesce instead of racing to spend the same refresh token, and then hands
+ * out an access-token-only copy: `tokens.refresh_token` is the empty string,
+ * present because Codex expects the key and useless because it cannot rotate
+ * anything. Nothing is ever read back out of a sandbox.
+ *
+ * That contract only holds if the seeded access token outlives the longest
+ * action the sandbox can run, so the preflight refresh triggers on the
+ * exact sealed action timeout (or the configured stage timeout when there is
+ * no child action) plus a one-hour safety margin, and seeding fails closed when
+ * even a refreshed token cannot cover that window (better a visible launch
+ * failure than a sandbox that dies mid-action with no way to re-authenticate).
  */
 export const SETTINGS_CODEX_AUTH_JSON = "codex_auth_json";
 
@@ -39,9 +40,15 @@ const CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_OAUTH_SCOPE = "openid profile email";
 
-// Refresh preflight when the seeded access token would expire within this
-// window, so a fresh sandbox never starts on an already-spent token (which
-// would force an immediate — and, across concurrent runs, racing — refresh).
+// Safety margin on top of the authoritative action/stage timeout: a seeded access token
+// must cover the longest action the sandbox can run plus an hour of slack for
+// provisioning, bootstrap, and result capture.
+const SEED_VALIDITY_MARGIN_MS = 60 * 60 * 1000;
+
+// Refresh preflight band above that hard minimum. Refreshing only once the
+// token is already below the minimum would make every launch depend on OpenAI
+// being reachable at that instant; refreshing this much earlier leaves a window
+// in which a failed refresh is still safe to seed.
 const REFRESH_LEEWAY_MS = 15 * 60 * 1000;
 
 // Hard bound on the central refresh exchange. A refresh endpoint that accepts
@@ -59,7 +66,9 @@ function parseCodexAuth(blob: string | undefined): CodexAuthShape | undefined {
   if (!blob) return undefined;
   try {
     const value: unknown = JSON.parse(blob);
-    return value && typeof value === "object" ? (value as CodexAuthShape) : undefined;
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as CodexAuthShape)
+      : undefined;
   } catch {
     return undefined;
   }
@@ -106,51 +115,59 @@ export function resolveStoredCodexAuthJson(cfg: Config, store: SupervisorStore):
   return stored;
 }
 
-/**
- * Persist a refresh token that Codex rotated inside the sandbox so the next run
- * seeds the live token instead of the spent one. Best-effort: ignores blobs
- * with no refresh token, an unchanged token, or an older `last_refresh` than we
- * already hold. Returns whether the store was updated.
- */
-export function captureCodexAuthJson(store: SupervisorStore, blob: string): boolean {
-  const refreshToken = codexRefreshToken(blob);
-  if (!refreshToken) return false;
-  const stored = store.getSetting(SETTINGS_CODEX_AUTH_JSON);
-  if (stored) {
-    if (codexRefreshToken(stored) === refreshToken) return false;
-    const incomingTs = codexLastRefreshMs(blob);
-    const storedTs = codexLastRefreshMs(stored);
-    if (incomingTs !== undefined && storedTs !== undefined && incomingTs < storedTs) {
-      return false;
-    }
-  }
-  store.setSetting(SETTINGS_CODEX_AUTH_JSON, blob);
-  return true;
-}
-
 /** Decode a JWT's `exp` claim (epoch ms) without verifying the signature. */
 function jwtExpiryMs(token: unknown): number | undefined {
   if (typeof token !== "string") return undefined;
   const payload = token.split(".")[1];
   if (!payload) return undefined;
   try {
-    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
-      exp?: unknown;
-    };
-    return typeof claims.exp === "number" ? claims.exp * 1000 : undefined;
+    const claims: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (!claims || typeof claims !== "object" || Array.isArray(claims)) return undefined;
+    const exp = (claims as { exp?: unknown }).exp;
+    return typeof exp === "number" && Number.isFinite(exp) ? exp * 1000 : undefined;
   } catch {
     return undefined;
   }
 }
 
 /**
- * Whether the blob's access token is expired or within the refresh leeway. When
- * the expiry cannot be read we treat the token as fresh so we never refresh
- * blindly on every run.
+ * Remaining validity of the blob's access token, from its `exp` claim. Returns
+ * undefined when the expiry cannot be read. A brokered sandbox cannot refresh,
+ * so callers must never treat an unreadable expiry as evidence of freshness.
  */
-function codexAccessTokenNearExpiry(blob: string, nowMs: number): boolean {
+function codexAccessTokenRemainingMs(blob: string, nowMs: number): number | undefined {
   const expMs = jwtExpiryMs(parseCodexAuth(blob)?.tokens?.access_token);
-  return expMs !== undefined && expMs - nowMs < REFRESH_LEEWAY_MS;
+  return expMs === undefined ? undefined : expMs - nowMs;
+}
+
+/**
+ * Validity a seeded access token must still have: the exact sealed child-action
+ * timeout when supplied, otherwise the configured stage timeout, plus the
+ * safety margin. `taskTimeout` is validated at config load (1..86_400 seconds);
+ * the guards also keep malformed injected values from collapsing the minimum
+ * to NaN.
+ */
+function seedMinimumValidityMs(cfg: Config, actionTimeoutMs?: number): number {
+  const taskTimeoutSeconds = Number.isFinite(cfg.taskTimeout) ? Math.max(0, cfg.taskTimeout) : 0;
+  const configuredTimeoutMs = taskTimeoutSeconds * 1000;
+  const requiredTimeoutMs = Number.isFinite(actionTimeoutMs)
+    ? Math.max(0, actionTimeoutMs ?? 0)
+    : configuredTimeoutMs;
+  return requiredTimeoutMs + SEED_VALIDITY_MARGIN_MS;
+}
+
+/** Raised when no blob safe to seed into a sandbox could be produced. */
+export class CodexSeedTokenError extends Error {
+  readonly reason: "expiring" | "unreadable";
+  readonly code = "CODEX_SEED_TOKEN_UNSAFE";
+  readonly statusCode = 401;
+  readonly retryable = false;
+
+  constructor(reason: "expiring" | "unreadable", message: string) {
+    super(message);
+    this.name = "CodexSeedTokenError";
+    this.reason = reason;
+  }
 }
 
 interface CodexRefreshResponse {
@@ -251,48 +268,111 @@ export async function refreshCodexAuthJson(
 // One in-flight refresh per store (i.e. per supervisor process, one shared
 // account): concurrent seed requests coalesce onto the same promise so they
 // never spend the same refresh token twice.
-const refreshInFlight = new WeakMap<SupervisorStore, Promise<string | undefined>>();
+const refreshInFlight = new WeakMap<SupervisorStore, Promise<string>>();
 
 /**
- * Resolve the Codex auth blob to seed into a sandbox, refreshing a near-expiry
- * token centrally first. Best-effort: any refresh failure falls back to seeding
- * the stored token unchanged, so seeding never blocks on OpenAI availability.
+ * The single boundary between the stored blob and a sandbox. The seeded copy
+ * keeps every other field verbatim but carries an empty `tokens.refresh_token`
+ * — present (Codex expects the key) and useless (it cannot rotate the shared
+ * account's live token away from a concurrent run). The stored blob is never
+ * touched here.
+ */
+function stripRefreshTokenForSeed(blob: string): string {
+  const parsed = parseCodexAuth(blob) as Record<string, unknown> | undefined;
+  if (!parsed) {
+    // Unparseable: the refresh token cannot be located, let alone removed, so
+    // there is no copy we can prove is safe to hand a sandbox.
+    throw new CodexSeedTokenError(
+      "unreadable",
+      "Codex auth blob is not a JSON object; refusing to seed a sandbox with a blob whose refresh token cannot be stripped"
+    );
+  }
+  if (!parsed.tokens || typeof parsed.tokens !== "object" || Array.isArray(parsed.tokens)) {
+    throw new CodexSeedTokenError(
+      "unreadable",
+      "Codex auth token container is not a JSON object; refusing to seed a sandbox"
+    );
+  }
+  const tokens = parsed.tokens as Record<string, unknown>;
+  if (typeof tokens.account_id !== "string" || tokens.account_id.length === 0) {
+    throw new CodexSeedTokenError(
+      "unreadable",
+      "Codex auth account_id is missing; refusing to seed a sandbox that cannot preserve the account reload gate"
+    );
+  }
+  return JSON.stringify({ ...parsed, tokens: { ...tokens, refresh_token: "" } });
+}
+
+/**
+ * Resolve the Codex auth blob to seed into a sandbox: refresh centrally when
+ * the access token cannot comfortably outlive a whole action, then hand back an
+ * access-token-only copy.
+ *
+ * A failed refresh is tolerated only while the stored token still covers the
+ * task timeout plus the safety margin; below that it throws, because the
+ * sandbox has no refresh token of its own and would die mid-action.
  */
 export async function getCodexAuthForSeed(
   cfg: Config,
-  store: SupervisorStore
+  store: SupervisorStore,
+  actionTimeoutMs?: number
 ): Promise<string | undefined> {
   const current = resolveStoredCodexAuthJson(cfg, store);
-  if (!current || !codexAccessTokenNearExpiry(current, Date.now())) return current;
+  if (!current) return undefined;
 
-  const pending = refreshInFlight.get(store);
-  if (pending) return pending;
+  const minimumMs = seedMinimumValidityMs(cfg, actionTimeoutMs);
+  const remainingMs = codexAccessTokenRemainingMs(current, Date.now());
+  if (remainingMs !== undefined && remainingMs >= minimumMs + REFRESH_LEEWAY_MS) {
+    return stripRefreshTokenForSeed(current);
+  }
 
-  const inflight = (async () => {
-    try {
-      const refreshed = await refreshCodexAuthJson(current, new Date().toISOString());
-      if (!refreshed) return current;
-      store.setSetting(SETTINGS_CODEX_AUTH_JSON, refreshed);
-      return refreshed;
-    } catch (error) {
-      // Log only the sanitized message (never the error object/stack, which
-      // could carry request context) so no token material reaches logs.
-      const reason = error instanceof Error ? error.message : "unknown error";
-      console.warn(`[codex-auth] preflight refresh failed; seeding the stored token: ${reason}`);
-      return current;
-    } finally {
-      refreshInFlight.delete(store);
-    }
-  })();
-  refreshInFlight.set(store, inflight);
-  return inflight;
+  let inflight = refreshInFlight.get(store);
+  if (!inflight) {
+    inflight = (async () => {
+      try {
+        const refreshed = await refreshCodexAuthJson(current, new Date().toISOString());
+        if (!refreshed) return current;
+        store.setSetting(SETTINGS_CODEX_AUTH_JSON, refreshed);
+        return refreshed;
+      } catch (error) {
+        // Log only the sanitized message (never the error object/stack, which
+        // could carry request context) so no token material reaches logs.
+        const reason = error instanceof Error ? error.message : "unknown error";
+        console.warn(`[codex-auth] preflight refresh failed; falling back to the stored token: ${reason}`);
+        return current;
+      } finally {
+        refreshInFlight.delete(store);
+      }
+    })();
+    refreshInFlight.set(store, inflight);
+  }
+
+  const seedable = await inflight;
+  const seedableRemainingMs = codexAccessTokenRemainingMs(seedable, Date.now());
+  if (seedableRemainingMs === undefined) {
+    throw new CodexSeedTokenError(
+      "unreadable",
+      "Codex access token expiry is missing or unreadable; refusing to seed a sandbox that cannot refresh"
+    );
+  }
+  if (seedableRemainingMs < minimumMs) {
+    throw new CodexSeedTokenError(
+      "expiring",
+      `Codex access token has ${Math.floor(seedableRemainingMs / 1000)}s of validity left, ` +
+        `below the ${Math.floor(minimumMs / 1000)}s required to cover the authoritative action timeout ` +
+        `timeout plus the ${SEED_VALIDITY_MARGIN_MS / 1000}s safety margin; refusing to seed a sandbox ` +
+        "that would lose authentication mid-action"
+    );
+  }
+  return stripRefreshTokenForSeed(seedable);
 }
 
 export function createCredentialMaterializer(cfg: Config, store: SupervisorStore) {
   return async (
     resource: { providerResourceId: string },
     scopes: readonly string[],
-    agentOverride?: Agent
+    agentOverride?: Agent,
+    actionTimeoutMs?: number
   ): Promise<{ env: Record<string, string> }> => {
     const ticket = store.getBySandboxId(resource.providerResourceId);
     if (!ticket) throw new Error(`runtime resource ${resource.providerResourceId} has no ticket binding`);
@@ -314,7 +394,7 @@ export function createCredentialMaterializer(cfg: Config, store: SupervisorStore
       if (agent === "claude" && claudeCredential) {
         env.CLAUDE_CODE_OAUTH_TOKEN = claudeCredential;
       } else if (agent === "codex") {
-        const codexCredential = await getCodexAuthForSeed(cfg, store);
+        const codexCredential = await getCodexAuthForSeed(cfg, store, actionTimeoutMs);
         if (!codexCredential) throw new Error("model credential for codex is unavailable");
         env.CODEX_AUTH_JSON = codexCredential;
       } else if (agent === "opencode" && openCodeCredential) {
@@ -325,42 +405,4 @@ export function createCredentialMaterializer(cfg: Config, store: SupervisorStore
     }
     return { env };
   };
-}
-
-// Sandboxes that legitimately have no ~/.codex/auth.json (agent never logged
-// in) produce a FILE_NOT_FOUND on every capture attempt; warn once per sandbox
-// instead of on every poll.
-const missingCodexAuthWarnings = new Set<string>();
-
-export async function captureCodexAuthFromSandbox(
-  store: SupervisorStore,
-  sandbox: RuntimeWorkspace,
-  ticket: Ticket
-): Promise<void> {
-  // Codex rotates its OAuth refresh token inside the sandbox; persist it so the
-  // next run seeds the live token instead of a spent one.
-  if (ticket.agent !== "codex") return;
-  try {
-    const raw = (
-      await sandbox.fs.downloadFile!("/home/agent/.codex/auth.json")
-    )!.toString("utf8");
-    if (captureCodexAuthJson(store, raw)) {
-      console.log("[codex-auth] captured a rotated refresh token from the sandbox");
-    }
-  } catch (error) {
-    // A sandbox that never ran Codex login has no auth.json; that read miss is
-    // expected and would otherwise spam the log on every poll, so it is warned
-    // once per sandbox. Everything else stays a visible (sanitized) warning.
-    const message = String(error);
-    const sanitized = sanitizeText(message).slice(-2_000);
-    const warningKey = `${sandbox.id}:missing-codex-auth`;
-    if (message.includes("FILE_NOT_FOUND")) {
-      if (!missingCodexAuthWarnings.has(warningKey)) {
-        missingCodexAuthWarnings.add(warningKey);
-        console.warn("[codex-auth] could not read back ~/.codex/auth.json; will retry silently:", sanitized);
-      }
-    } else {
-      console.warn("[codex-auth] could not read back ~/.codex/auth.json:", sanitized);
-    }
-  }
 }

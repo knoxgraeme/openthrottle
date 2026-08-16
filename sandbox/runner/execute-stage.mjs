@@ -686,13 +686,6 @@ export function defaultRunAgent({
         timeout: timeoutMs,
       }),
     );
-    const authRead = agent === "codex"
-      ? spawnSync("gosu", ["agent", "head", "-c", "262144", "/home/agent/.codex/auth.json"], {
-          encoding: "utf8",
-          timeout: 2_000,
-          maxBuffer: 262_144,
-        })
-      : undefined;
     const proposalRead = spawnSync("gosu", ["agent", "head", "-c", "1048577", actionProposalPath], {
       encoding: "utf8",
       timeout: 2_000,
@@ -758,9 +751,8 @@ export function defaultRunAgent({
         ? parseAgentJson(proposalRead.stdout, { qualifies: isStageProposalShaped, label: "proposal" })
         : undefined,
       receipt: expectsStandardReceipt && engineExited
-        ? parseLoopReceipt(result.stdout ?? "", { ...process.env, OT_RUNTIME_AUTH_JSON: authRead?.stdout ?? "" })
+        ? parseLoopReceipt(result.stdout ?? "", process.env)
         : undefined,
-      authSnapshot: authRead?.status === 0 ? authRead.stdout : undefined,
     };
   } catch (error) {
     bodyError = error;
@@ -883,12 +875,9 @@ function classifyIncompleteAgentExecution({ execution, request, proposal, redact
     missingProposal: !proposal,
     stdout: execution.stdout ?? "",
     stderr: execution.stderr ?? "",
-    // A readable ~/.codex/auth.json is the concrete Codex credential even when
-    // the seed variable is no longer in this process's environment.
     credentialPresent: engineCredentialPresent(
       request.agent,
       request.credentialScopes.includes("model.invoke") ? process.env : undefined,
-      Boolean(execution.authSnapshot),
     ),
   });
 }
@@ -1072,7 +1061,12 @@ export function executeStage({
   } else {
     let invocation = { mode: "none", nativeSessionId: null, reconstructed: false, readOnly: false };
     let execution;
-    let redactionEnv = process.env;
+    // The seeded `CODEX_AUTH_JSON` credential is already in this process's
+    // environment and matches sanitizeArtifactText's secret-name pattern, so
+    // every redaction below covers the sandbox's Codex token without reading
+    // the live auth.json back: under the token broker the sandbox holds an
+    // access-token-only copy of exactly what the supervisor seeded.
+    const redactionEnv = process.env;
     try {
       invocation = resolveContextInvocation(request);
     } catch (error) {
@@ -1098,9 +1092,6 @@ export function executeStage({
           agent: request.agent,
         });
         nativeSessionId = execution.nativeSessionId ?? nativeSessionId;
-        redactionEnv = execution.authSnapshot
-          ? { ...process.env, OT_RUNTIME_AUTH_JSON: execution.authSnapshot }
-          : process.env;
       } catch (error) {
         execution = {
           exitCode: null,

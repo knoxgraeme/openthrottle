@@ -50,12 +50,13 @@ docker run --rm --entrypoint bash \
   "$IMAGE" /opt/openthrottle/tests/worktree-isolation-probe.sh
 
 docker run --rm --entrypoint bash "$IMAGE" -lc '
+  claude --help > /tmp/claude-help.txt 2>&1 &&
   for runner in /opt/openthrottle/runner/*.mjs; do
     test -x "$runner"
   done &&
   claude --version | rg -q "^2\.1\.201" &&
-  claude --help | rg -q -- "--setting-sources" &&
-  claude --help | rg -q -- "--strict-mcp-config" &&
+  rg -q -- "--setting-sources" /tmp/claude-help.txt &&
+  rg -q -- "--strict-mcp-config" /tmp/claude-help.txt &&
   # The Compound Engineering plugin is no longer shipped: no pinned
   # marketplace checkout, no per-profile plugin caches.
   test ! -e /opt/openthrottle/compound-engineering-marketplace &&
@@ -101,6 +102,101 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   opencode run --help 2>&1 | rg -q -- "--model" &&
   opencode run --help 2>&1 | rg -q -- "--dir" &&
   opencode run --help 2>&1 | rg -q -- "--auto"
+'
+
+# The Codex token broker seeds an auth.json whose tokens.refresh_token can be
+# the empty string (the supervisor holds the rotating token centrally). That is
+# a load-time contract of the *pinned* CLI in this image, not of whatever newer
+# codex a developer happens to have locally, so probe the baked binary itself:
+# an empty-string refresh token must load, and a deleted refresh_token key must
+# not. Both fixtures are synthetic and generated inline -- no real credential
+# material is involved.
+docker run --rm --network none --entrypoint bash "$IMAGE" -lc '
+  set -euo pipefail
+  # The fixture auth.json must be the only credential the CLI can see.
+  unset OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN CODEX_AUTH_JSON
+
+  # $1 is the failure message; $2 is the probe log to dump for triage.
+  fail_probe() { echo "$1" >&2; cat "$2" >&2; exit 1; }
+
+  b64url() { base64 -w0 | tr "+/" "-_" | tr -d "="; }
+  jwt() {
+    printf "%s.%s.fixturesignature" \
+      "$(printf "%s" "{\"alg\":\"none\",\"typ\":\"JWT\"}" | b64url)" \
+      "$(printf "%s" "$1" | b64url)"
+  }
+  # exp = 2100-01-01: far enough out that the CLI never proactively spends the
+  # fixture refresh token, which keeps both probes about credential *loading*.
+  ACCESS_TOKEN="$(jwt "{\"exp\":4102444800}")"
+  ID_TOKEN="$(jwt "{\"email\":\"smoke@openthrottle.invalid\"}")"
+  # Deliberately older than the CLI eight-day legacy fallback. Pinned Codex
+  # 0.143.0 gives a readable access-token exp precedence over last_refresh, so
+  # this also proves the empty refresh token does not trigger proactive refresh
+  # while the brokered access token is valid for the action.
+  LAST_REFRESH="2000-01-01T00:00:00Z"
+
+  # $1 is an isolated CODEX_HOME; $2 is the tokens.refresh_token member, or the
+  # empty string to omit the key entirely.
+  write_auth_fixture() {
+    mkdir -p "$1"
+    printf "%s" "{\"auth_mode\":\"chatgpt\",\"OPENAI_API_KEY\":null,\"tokens\":{\"id_token\":\"$ID_TOKEN\",\"access_token\":\"$ACCESS_TOKEN\",\"account_id\":\"ot-smoke-account\"$2},\"last_refresh\":\"$LAST_REFRESH\"}" \
+      > "$1/auth.json"
+    printf "%s\n" "{\"models\":[{\"slug\":\"gpt-5.4\",\"display_name\":\"Smoke model\",\"description\":null,\"supported_reasoning_levels\":[],\"shell_type\":\"shell_command\",\"visibility\":\"list\",\"supported_in_api\":true,\"priority\":0,\"availability_nux\":null,\"upgrade\":null,\"base_instructions\":\"\",\"supports_reasoning_summaries\":false,\"support_verbosity\":false,\"default_verbosity\":null,\"apply_patch_tool_type\":null,\"truncation_policy\":{\"mode\":\"tokens\",\"limit\":10000},\"supports_parallel_tool_calls\":true,\"experimental_supported_tools\":[]}] }" \
+      > "$1/models.json"
+    printf "model_catalog_json = \"%s/models.json\"\nmodel = \"gpt-5.4\"\n" "$1" \
+      > "$1/config.toml"
+    chmod 0600 "$1/auth.json"
+  }
+
+  EMPTY_HOME="$(mktemp -d)/codex-empty-refresh"
+  write_auth_fixture "$EMPTY_HOME" ",\"refresh_token\":\"\""
+  if ! CODEX_HOME="$EMPTY_HOME" codex login status > "$EMPTY_HOME/status.log" 2>&1; then
+    fail_probe "pinned codex rejected an empty-string refresh_token at credential load" \
+      "$EMPTY_HOME/status.log"
+  fi
+  if ! rg -q "Logged in using ChatGPT" "$EMPTY_HOME/status.log"; then
+    fail_probe "pinned codex did not load the empty-refresh_token fixture as ChatGPT auth" \
+      "$EMPTY_HOME/status.log"
+  fi
+  # A serde/JSON complaint naming the field is exactly what must never happen.
+  if rg -q "refresh_token" "$EMPTY_HOME/status.log"; then
+    fail_probe "pinned codex reported a refresh_token failure for the empty-string fixture" \
+      "$EMPTY_HOME/status.log"
+  fi
+
+  # The engine must also start on that credential without network access. It is
+  # expected to remain in the transport retry loop until the short bound; the
+  # proof is reaching thread.started with no auth.json parse failure.
+  exec_status=0
+  timeout 10 env CODEX_HOME="$EMPTY_HOME" codex exec --json --skip-git-repo-check \
+    --dangerously-bypass-approvals-and-sandbox "reply with ok" \
+    > "$EMPTY_HOME/exec.log" 2>&1 </dev/null || exec_status=$?
+  if [[ "$exec_status" -eq 0 ]]; then
+    fail_probe "pinned codex unexpectedly authenticated with the synthetic access token" \
+      "$EMPTY_HOME/exec.log"
+  fi
+  if rg -q "missing field|(invalid type|invalid value|expected)[^\n]{0,120}refresh_token" \
+      "$EMPTY_HOME/exec.log"; then
+    fail_probe "pinned codex failed to parse the empty-refresh_token fixture (exit $exec_status)" \
+      "$EMPTY_HOME/exec.log"
+  fi
+  if ! rg -q "thread.started|Thread started" "$EMPTY_HOME/exec.log"; then
+    fail_probe "pinned codex never reached session startup with the loaded credential" \
+      "$EMPTY_HOME/exec.log"
+  fi
+
+  # Inverse guard: an omitted key is a different contract from an empty string,
+  # so deleting tokens.refresh_token must fail at credential loading.
+  MISSING_HOME="$(mktemp -d)/codex-missing-refresh"
+  write_auth_fixture "$MISSING_HOME" ""
+  if CODEX_HOME="$MISSING_HOME" codex login status > "$MISSING_HOME/status.log" 2>&1; then
+    fail_probe "pinned codex accepted an auth.json with no refresh_token key" \
+      "$MISSING_HOME/status.log"
+  fi
+  if ! rg -q "refresh_token|Not logged in" "$MISSING_HOME/status.log"; then
+    fail_probe "pinned codex failed for an unexpected reason on the no-refresh_token fixture" \
+      "$MISSING_HOME/status.log"
+  fi
 '
 
 docker run --rm --entrypoint bash "$IMAGE" -lc '

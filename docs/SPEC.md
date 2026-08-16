@@ -520,14 +520,15 @@ credentials, passed as an explicit child-process environment rather than as
 command-line arguments (an argv vector is visible to any co-resident process
 via `/proc/<pid>/cmdline`, unlike an explicit env map). `CODEX_AUTH_JSON` is
 written to the action's isolated Codex home as `auth.json` rather than
-exported as a raw variable, so Codex's own token rotation stays confined to
-and is wiped with that action's directory. Cleanup is idempotent after a
-restart: a missing envelope (already consumed, or a role with no declared
-credential scopes) yields no credentials rather than an error, a retried
-dispatch re-uploads a fresh envelope regardless of what an earlier failed
-attempt already consumed, and a redispatch against an already-completed
-action removes its freshly re-uploaded envelope immediately rather than
-leaving it to be cleaned up by a script body that will never run again.
+exported as a raw variable, so whatever the engine writes over that seeded
+credential stays confined to and is wiped with that action's directory.
+Cleanup is idempotent after a restart: a missing envelope (already consumed,
+or a role with no declared credential scopes) yields no credentials rather
+than an error, a retried dispatch re-uploads a fresh envelope regardless of
+what an earlier failed attempt already consumed, and a redispatch against an
+already-completed action removes its freshly re-uploaded envelope immediately
+rather than leaving it to be cleaned up by a script body that will never run
+again.
 
 MCP configuration is built the same way, scoped to the action's declared
 `allowedMcpServers` and filtered from the sealed repository config uploaded at
@@ -907,12 +908,29 @@ missing or malformed prior journal is appended as a separate audit-gap note and
 cannot block, pass, or otherwise authorize the live receipt/gate decision.
 Persona actions remain independent sessions, but all engines execute the
 deterministic roster one action at a time within the shared sealed sandbox.
-Concurrent siblings would race the sandbox's action-directory locks. Codex has
-an additional serialization requirement because its shared subscription
-credential has a rotating one-time refresh token: the supervisor captures the
-completed persona's action-scoped auth snapshot before it materializes the next
-persona's credentials. Selector, persona, and validator dispatch intent is
-persisted before provider launch and marked launched after acknowledgement.
+Concurrent siblings would race the sandbox's action-directory locks. Codex's
+shared subscription credential has a rotating one-time refresh token, so the
+supervisor is its sole refresh authority: it refreshes a near-expiry token
+behind a single in-flight exchange, so concurrent runs coalesce instead of
+racing to spend the same one-time token, and seeds each sandbox an
+access-token-only copy whose `tokens.refresh_token` is the empty string --
+present because Codex expects the key, useless because it cannot rotate the
+shared account's live token away from another run. A seeded access token must
+have a readable JWT `exp` and cover the exact sealed child-action timeout (or
+the configured stage timeout when no child action exists) plus a safety margin;
+seeding fails closed instead of handing out one that could expire mid-action.
+The stored `last_refresh` and `tokens.account_id` are preserved byte-for-byte in
+the seed. Pinned Codex 0.143.0 gives a readable access-token `exp` precedence
+over its legacy eight-day `last_refresh` fallback, so that preserved timestamp
+cannot provoke proactive in-sandbox refresh. Its 401 recovery ladder can still
+attempt the deliberately empty refresh token, but that is a terminal signal
+that the supervisor-proven access token was rejected, never a rotation path.
+The seed therefore always wins when a resumed sandbox already holds an
+`auth.json`, and nothing is ever read back out of a sandbox: no per-action auth
+snapshot is captured, and the durable store is reloaded from the bootstrap env
+seed only when that seed carries a strictly newer `last_refresh`. Selector,
+persona, and validator dispatch intent is persisted before provider launch and
+marked launched after acknowledgement.
 Repeated drains collect a durably launched subaction before considering
 dispatch; a prepared-only crash window reuses the same provider idempotency
 fence.

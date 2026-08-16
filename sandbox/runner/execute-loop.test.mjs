@@ -1448,10 +1448,6 @@ describe("loop action request validation", () => {
           },
           runProcess: (command, args, options) => {
             expect(command).toBe("gosu");
-            // For Codex, the same runProcess is also used for the
-            // post-launch action-scoped auth-snapshot read (see
-            // readCodexAuthSnapshot); that call carries no `input`, so the
-            // main agent launch call is the one to identify by it.
             if ("input" in options) {
               capturedArgs = args;
               capturedOptions = options;
@@ -1553,14 +1549,6 @@ describe("loop action request validation", () => {
       },
       runProcess: (command, args, options) => {
         events.push(`run:${command}:${options.cwd}`);
-        if (args[1] === "cat") {
-          // The post-launch action-scoped Codex auth-snapshot read (see
-          // readCodexAuthSnapshot): a distinct, narrower gosu call than the
-          // main agent launch below, so it is asserted separately.
-          expect(command).toBe("gosu");
-          expect(args[0]).toBe("agent");
-          return { status: 0, signal: null, timedOut: false, stdout: "{}", stderr: "" };
-        }
         const actionDirectory = join(actionRoot, valid.attemptId, valid.actionId);
         expect(statSync(actionRoot).mode & 0o777).toBe(0o711);
         expect(statSync(join(actionRoot, valid.attemptId)).mode & 0o777).toBe(0o711);
@@ -1590,11 +1578,9 @@ describe("loop action request validation", () => {
       `lock-integration:${integrationRepoDir}`,
       "lock-persistent-profiles",
       "process-fence",
+      // The agent launch is the only process this action spawns: nothing
+      // reads the action-scoped Codex auth.json back out afterwards.
       `run:gosu:${loopWorktreeDirectory(valid)}`,
-      // The default request agent is Codex, so the action-scoped auth
-      // snapshot read (readCodexAuthSnapshot) runs a second, distinct gosu
-      // call after launch and before cleanup; it passes no cwd.
-      "run:gosu:undefined",
       `lock-integration:${integrationRepoDir}`,
       "restore-persistent-profiles:/home/agent/.codex",
     ]);
@@ -5321,8 +5307,7 @@ describe("executeLoopAction", () => {
         commands_not_run: ["The executor owns configured commands."],
       },
     };
-    const staleCodexAuth = JSON.stringify({ tokens: { access_token: "stale", refresh_token: "spent", account_id: "account-1" } });
-    const rotatedCodexAuth = JSON.stringify({ tokens: { access_token: "current", refresh_token: "rotated", account_id: "account-1" } });
+    const seededCodexAuth = JSON.stringify({ tokens: { access_token: "seeded", refresh_token: "", account_id: "account-1" } });
     const firstRunLoopAgent = vi.fn().mockReturnValueOnce({
       status: 0,
       signal: null,
@@ -5331,12 +5316,11 @@ describe("executeLoopAction", () => {
       stderr: "",
       nativeSessionId: "native-correction",
       integrationRepoDir: "/tmp/integration-current",
-      codexAuthJson: rotatedCodexAuth,
     });
 
     const first = executeLoopActionWithIntegration({
       request: valid,
-      credentialEnv: { CODEX_AUTH_JSON: staleCodexAuth },
+      credentialEnv: { CODEX_AUTH_JSON: seededCodexAuth },
       runLoopAgent: firstRunLoopAgent,
       lockWorkerWorktree: vi.fn(),
       lockActionDirectory: vi.fn(),
@@ -5352,7 +5336,7 @@ describe("executeLoopAction", () => {
 
     const resumed = executeLoopActionWithIntegration({
       request: valid,
-      credentialEnv: { CODEX_AUTH_JSON: staleCodexAuth },
+      credentialEnv: { CODEX_AUTH_JSON: seededCodexAuth },
       runLoopAgent: resumedRunLoopAgent,
       lockWorkerWorktree: vi.fn(),
       lockActionDirectory: vi.fn(),
@@ -5362,7 +5346,9 @@ describe("executeLoopAction", () => {
 
     expect(resumed.outcome).toBe("success");
     expect(resumed.native_session_id).toBe("native-correction");
-    expect(resumed.codex_auth_json).toBe(rotatedCodexAuth);
+    // The persisted correction state carries no auth material forward: the
+    // supervisor is the sole refresh authority and reseeds every action.
+    expect(resumed.codex_auth_json).toBeUndefined();
     expect(resumedRunLoopAgent).not.toHaveBeenCalled();
     expect(JSON.parse(resumed.receipt)).toEqual(goodReceipt);
   });
@@ -5496,11 +5482,10 @@ describe("executeLoopAction", () => {
     expect(JSON.parse(resumed.receipt)).toEqual(goodReceipt);
   });
 
-  it("never seeds or persists a rotated Codex credential from a different account", () => {
+  it("never carries Codex auth material out of a completed loop action", () => {
     const valid = request();
     const receipt = standardReceipt(valid);
-    const seed = JSON.stringify({ tokens: { refresh_token: "seed", account_id: "account-1" } });
-    const switched = JSON.stringify({ tokens: { refresh_token: "attacker", account_id: "account-2" } });
+    const seed = JSON.stringify({ tokens: { access_token: "seeded", refresh_token: "", account_id: "account-1" } });
     const result = executeLoopActionWithIntegration({
       request: valid,
       credentialEnv: { CODEX_AUTH_JSON: seed },
@@ -5512,7 +5497,9 @@ describe("executeLoopAction", () => {
         stderr: "",
         nativeSessionId: "native-correction",
         integrationRepoDir: "/tmp/integration-current",
-        codexAuthJson: switched,
+        // Nothing harvests auth.json any more, so even an attacker-supplied
+        // blob on the execution object has no field to ride out on.
+        codexAuthJson: JSON.stringify({ tokens: { refresh_token: "attacker", account_id: "account-2" } }),
       }),
       lockWorkerWorktree: vi.fn(),
       lockActionDirectory: vi.fn(),
@@ -5522,32 +5509,7 @@ describe("executeLoopAction", () => {
 
     expect(result.outcome).toBe("success");
     expect(result.codex_auth_json).toBeUndefined();
-  });
-
-  it("rejects rotated Codex auth when the seeded credential has no account binding", () => {
-    const valid = request();
-    const receipt = standardReceipt(valid);
-    const result = executeLoopActionWithIntegration({
-      request: valid,
-      credentialEnv: { CODEX_AUTH_JSON: JSON.stringify({ tokens: { refresh_token: "unbound-seed" } }) },
-      runLoopAgent: vi.fn().mockReturnValueOnce({
-        status: 0,
-        signal: null,
-        timedOut: false,
-        stdout: JSON.stringify(receipt),
-        stderr: "",
-        nativeSessionId: "native-correction",
-        integrationRepoDir: "/tmp/integration-current",
-        codexAuthJson: JSON.stringify({ tokens: { refresh_token: "rotated", account_id: "account-1" } }),
-      }),
-      lockWorkerWorktree: vi.fn(),
-      lockActionDirectory: vi.fn(),
-      restoreIntegration: vi.fn(),
-      now: () => "2026-07-29T00:00:00.000Z",
-    });
-
-    expect(result.outcome).toBe("success");
-    expect(result.codex_auth_json).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain("attacker");
   });
 
   it("refuses receipt correction when no parsed candidate can constrain semantic content", () => {

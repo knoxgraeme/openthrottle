@@ -141,10 +141,6 @@ export interface LoopActionResult {
   subject: string | null;
   receipt: string;
   completedAt: string;
-  // Present only when this exact action ran as a Codex worker and its
-  // action-scoped CODEX_HOME rotated its OAuth refresh token. Never derived
-  // from agent-authored text.
-  codexAuthJson?: string | null;
   // Present only for terminal receipt-correction exhaustion/mutation failure.
   // Contains a private, bounded recovery artifact persisted by the supervisor
   // before the sandbox may be cleaned up.

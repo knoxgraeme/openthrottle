@@ -820,20 +820,23 @@ describe("one-stage executor", () => {
     expect(runAgent).not.toHaveBeenCalled();
   });
 
-  it("redacts a Codex token rotated during execution from semantic artifacts", () => {
+  it("redacts the seeded Codex access token from semantic artifacts", () => {
     const input = fixture();
-    const rotated = "rotated-codex-secret-123456789";
+    // The supervisor is the sole refresh authority, so the sandbox's
+    // ~/.codex/auth.json only ever holds the access-token-only blob seeded
+    // through CODEX_AUTH_JSON. Nothing reads that file back; redaction works
+    // off the seed already present in the executor's own environment.
+    const seeded = "fixture-codex-access-credential";
     const result = executeStage({
       ...input,
       now: clock(),
       runAgent: () => ({
         exitCode: 0,
         nativeSessionId: "native-1",
-        authSnapshot: JSON.stringify({ tokens: { access_token: rotated } }),
-        proposal: { ...successProposal(), summary: `Stage completed with ${rotated}` },
+        proposal: { ...successProposal(), summary: `Stage completed with ${seeded}` },
       }),
     });
-    expect(result.artifacts[0].payload).not.toContain(rotated);
+    expect(result.artifacts[0].payload).not.toContain(seeded);
     expect(result.artifacts[0].payload).toContain("[REDACTED]");
   });
 

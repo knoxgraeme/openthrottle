@@ -882,32 +882,6 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
   };
 }
 
-const MAX_CODEX_AUTH_SNAPSHOT_BYTES = 65_536;
-
-// Codex may rotate its OAuth refresh token inside this action's own scoped
-// CODEX_HOME while running; that state is wiped with the rest of the action
-// directory once cleanup locks it, so it must be read back here -- after the
-// agent process exits but before cleanup -- rather than out-of-band later.
-// Keyed to this action's own engine (request.agent), never the parent
-// ticket's engine, so a Codex worker override inside a Claude-selected
-// ticket still has its rotation captured.
-function readCodexAuthSnapshot(codexHome, runProcess) {
-  const path = pathInside(codexHome, "auth.json");
-  let result;
-  try {
-    result = runProcess("gosu", ["agent", "cat", path], {
-      timeout: 5_000,
-      captureBytes: MAX_CODEX_AUTH_SNAPSHOT_BYTES,
-    });
-  } catch {
-    return null;
-  }
-  if (result.error || result.status !== 0) return null;
-  const blob = result.stdout;
-  if (!blob || Buffer.byteLength(blob, "utf8") > MAX_CODEX_AUTH_SNAPSHOT_BYTES) return null;
-  return blob;
-}
-
 // OPE-101/OPE-104: an untraversable sandbox root let the engine launch
 // without ever being able to resolve its own skill discovery root, so it
 // silently registered zero skills, answered `Unknown command: /...`, and
@@ -937,24 +911,6 @@ function assertSealedSkillPreflight({ request, profileRoot, runProcess }) {
       `sealed skill ${request.skill} is not readable by the agent uid before launch (${skillMarkdownPath})`,
     );
   }
-}
-
-function codexAccountId(authJson) {
-  if (typeof authJson !== "string" || authJson.length === 0) return null;
-  try {
-    const accountId = JSON.parse(authJson)?.tokens?.account_id;
-    return typeof accountId === "string" && accountId.length > 0 ? accountId : null;
-  } catch {
-    return null;
-  }
-}
-
-function accountBoundCodexAuthJson(seedAuthJson, observedAuthJson) {
-  if (typeof observedAuthJson !== "string" || observedAuthJson.length === 0) return null;
-  const seedAccountId = codexAccountId(seedAuthJson);
-  const observedAccountId = codexAccountId(observedAuthJson);
-  if (!seedAccountId || !observedAccountId) return null;
-  return observedAccountId === seedAccountId ? observedAuthJson : null;
 }
 
 function readReceiptCorrectionState(request) {
@@ -1075,15 +1031,11 @@ export function runLoopAgentInPreparedRepository({
         { engineStdout: result.stdout, engineStderr: result.stderr },
       );
     }
-    const codexAuthJson = request.agent === "codex"
-      ? readCodexAuthSnapshot(preparedEnvironment.nativeSessionProfileRoot, runProcess)
-      : null;
     return {
       ...result,
       nativeSessionId,
       gitObjectEnv: preparedEnvironment.gitObjectEnv,
       integrationRepoDir,
-      codexAuthJson,
     };
   } catch (error) {
     bodyError = error;
@@ -1760,7 +1712,7 @@ export function executeLoopAction({
   // the spawned agent process only), so sanitizeArtifactText's default
   // process.env lookup alone would miss them if a failure message ever
   // echoed one -- including in the cleanup-failure path below.
-  let sanitizeEnv = { ...process.env, ...credentialEnv };
+  const sanitizeEnv = { ...process.env, ...credentialEnv };
   let result;
   let execution;
   let requiresWorkspacePreservation = false;
@@ -1785,7 +1737,6 @@ export function executeLoopAction({
           stderr: "",
           nativeSessionId: persistedCorrectionState.native_session_id ?? request.nativeSessionId,
           integrationRepoDir,
-          codexAuthJson: persistedCorrectionState.codex_auth_json ?? null,
           gitObjectEnv: persistedCorrectionState.git_object_env ?? undefined,
         }
         : requiresEngineCredential && credentialEnvelopeMissing
@@ -1837,15 +1788,6 @@ export function executeLoopAction({
         retryableInfrastructureFailure: Boolean(error?.retryableInfrastructureFailure),
         processTerminationUnconfirmed: Boolean(error?.processTerminationUnconfirmed),
       };
-    }
-    // A rotated Codex auth blob matches sanitizeArtifactText's AUTH_JSON
-    // secret-name pattern, so any accidental echo of it in agent stdout/stderr
-    // is redacted the same way the seeded CODEX_AUTH_JSON credential is.
-    if (execution.codexAuthJson) {
-      execution.codexAuthJson = accountBoundCodexAuthJson(credentialEnv.CODEX_AUTH_JSON, execution.codexAuthJson);
-    }
-    if (execution.codexAuthJson) {
-      sanitizeEnv = { ...sanitizeEnv, OT_ROTATED_CODEX_AUTH_JSON: execution.codexAuthJson };
     }
     const worktreeDir = loopWorktreeDirectory(request);
     let subject = persistedCorrectionState?.subject ?? null;
@@ -1926,7 +1868,6 @@ export function executeLoopAction({
           diagnostics: correctionDiagnostics,
           subject,
           native_session_id: execution.nativeSessionId ?? request.nativeSessionId ?? null,
-          codex_auth_json: execution.codexAuthJson ?? null,
           git_object_env: execution.gitObjectEnv ?? null,
           created_at: now(),
         });
@@ -2028,11 +1969,6 @@ export function executeLoopAction({
           : failureNarrative, sanitizeEnv).slice(0, 128_000),
       ...(recoveryArtifact ? { recovery_artifact: canonicalJson(recoveryArtifact) } : {}),
       created_at: now(),
-      // Never derived from agent-authored stdout/stderr (which is sanitized
-      // and truncated above): this travels as its own typed field so a
-      // rotated Codex refresh token is captured regardless of the action's
-      // semantic outcome, without ever passing through free-text logging.
-      ...(execution.codexAuthJson ? { codex_auth_json: execution.codexAuthJson } : {}),
     };
   } finally {
     const cleanups = [
