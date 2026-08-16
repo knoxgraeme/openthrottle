@@ -2465,6 +2465,21 @@ deployment-policy:deploy-forward-only/operator-authorized/v1
 the [rollback-compatible:additive/v1] migration-name suffix is mechanically required for every v47+ migration; it does not promise application-level rollback visibility
 legacy tables remain only for additive schema and old-row backfill; no dual-write; rollback does not expose steering written after cutover`;
 
+const providerFeedbackBoundedOrderIndexSchema = `
+CREATE INDEX provider_events_feedback_snapshot_order_idx
+  ON provider_events(snapshot_id, received_at, provider, provider_event_id);
+`;
+
+const feedbackSnapshotsPendingSessionIndexSchema = `
+CREATE INDEX feedback_snapshots_pending_session_idx
+  ON feedback_snapshots(session_id, created_at, id)
+  WHERE status IN ('collecting', 'claimed');
+`;
+
+const providerFeedbackBoundedOrderIndexMigrationSource = `${providerFeedbackBoundedOrderIndexSchema}${feedbackSnapshotsPendingSessionIndexSchema}
+provider-feedback-bounded-order-contract:snapshot drains and carry-forward select the first bounded provider events directly by snapshot and stable receive order without sorting or scanning the full retained snapshot/v1
+provider-feedback-pending-session-contract:periodic drains select only collecting and claimed snapshots for one session in stable creation order/v1`;
+
 type GithubHeadSource =
   | { kind: "authoritative" }
   | { kind: "sequenced"; source: string; sequence: number };
@@ -3728,6 +3743,21 @@ const definitions: DatabaseMigrationDefinition[] = [
         ) {
           db.exec(steeringItemsBackfillSql);
         }
+      }
+    },
+  },
+  {
+    version: 52,
+    name: "provider-feedback-bounded-order-index [rollback-compatible:additive/v1]",
+    source: providerFeedbackBoundedOrderIndexMigrationSource,
+    up(db) {
+      if (hasTable(db, "provider_events") &&
+          !hasIndex(db, "provider_events_feedback_snapshot_order_idx")) {
+        db.exec(providerFeedbackBoundedOrderIndexSchema);
+      }
+      if (hasTable(db, "feedback_snapshots") &&
+          !hasIndex(db, "feedback_snapshots_pending_session_idx")) {
+        db.exec(feedbackSnapshotsPendingSessionIndexSchema);
       }
     },
   },

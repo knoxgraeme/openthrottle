@@ -265,7 +265,7 @@ human repair requests. A linkback is recognized only by the exact bridge bot
 identity (`linear[bot]`, `linear-code[bot]`) or by a bot comment whose body
 starts with the explicit `<!-- linear-linkback -->` marker — never by keyword
 heuristics over untrusted comment bodies, so substantive automated review
-feedback is still recorded as provider evidence. Human PR comments,
+feedback is still recorded as provider evidence. Authored PR comments,
 reviews requesting changes, Linear replies during provider waits, and failed
 workflow/check-suite completions for the exact published commit remain
 provider evidence and may start a bounded repair round. Feedback filed against a
@@ -598,6 +598,28 @@ synchronize events establish the authoritative head for the ticket branch.
 Reviews, PR comments, workflow runs, and check suites are stored as typed
 provider evidence for the pipeline generation.
 
+GitHub collaborator authorization intentionally differs between the Issue
+control surface and the PR feedback surface. Plain Issue comments and Issue
+lifecycle controls require an actor with `triage`, `write`, `maintain`, or
+`admin` permission. By contrast, PR-linked Issue comments and submitted
+`changes_requested` or `commented` PR reviews require an attested author but no
+collaborator-permission lookup before routing `semantic_repair_required`. This
+permits requested external reviewers and substantive automated reviewers to
+contribute feedback. A review must match the ticket's exact stored PR URL before
+it can reconcile head state, publish activity, or route provider feedback;
+branch-name correlation alone grants no ticket-scoped authority.
+The stored PR URL itself is bound only from a pull-request event whose head
+repository exactly matches the registered repository. A same-branch PR opened
+from an external fork cannot establish or replace that binding.
+The accepted blast radius is bounded: the manifest's `max_repair_rounds` caps
+repair re-entry for the pipeline, each snapshot drain materializes at most 20
+provider events and fails closed to `needs_human` when more are present, and
+provider routing returns before head-history scans or activity publication for
+a terminal pipeline instance, so PR feedback cannot revive terminal work or
+consume unbounded synchronous work after settlement. This asymmetry is
+deliberate and must not be inferred to grant PR actors authority over Issue
+admission, steering, closure, or generation lifecycle controls.
+
 For a repository registered with `control_provider=github`, `openthrottle init`
 creates or normalizes the exact lowercase `openthrottle` label. An authorized
 collaborator with `triage`, `write`, `maintain`, or `admin` permission starts a
@@ -649,7 +671,14 @@ executor-verified published commit and then drained normally. Mismatched heads
 outside that exception require human attention and enqueue a visible operator
 activity before the snapshot is marked stale; evidence for a future stage remains
 pending. A feedback snapshot is immutable once claimed and is consumed only after
-the coordinator commits the provider event.
+the coordinator commits the provider event. The coordinator transition and
+snapshot consumption commit in one database transaction, so interruption
+cannot leave terminal provider evidence next to a permanently claimed snapshot.
+Snapshot-event reads use the same 20-event materialization bound and an indexed
+snapshot/receive-order path. Carry-forward copies at most the 20-event bound
+plus one overflow sentinel; overflow is sealed as bounded human-required
+provider evidence rather than allocating, sorting, copying, or embedding the
+full event set.
 
 Linear replies sent while the current pipeline instance is in `waiting_provider`
 are recorded on the same provider-feedback channel as GitHub evidence, with

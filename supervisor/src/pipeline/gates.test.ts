@@ -1918,7 +1918,7 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           merged,
-          head: { ref: "ot/issue-1", sha: publishedCommit },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: publishedCommit },
           base: { ref: "main" },
         },
       },
@@ -1974,7 +1974,7 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           merged: true,
-          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
         },
       },
@@ -2063,7 +2063,7 @@ describe("deterministic supervisor stage gates", () => {
           html_url: "https://github.com/owner/repo/pull/1",
           merged: false,
           updated_at: "2026-01-01T00:00:05.000Z",
-          head: { ref: "ot/issue-1", sha: headB },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: headB },
           base: { ref: "main" },
         },
       },
@@ -2083,7 +2083,7 @@ describe("deterministic supervisor stage gates", () => {
           html_url: "https://github.com/owner/repo/pull/1",
           merged: true,
           updated_at: "2026-01-01T00:00:06.000Z",
-          head: { ref: "ot/issue-1", sha: headC },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: headC },
           base: { ref: "main" },
         },
       },
@@ -2122,7 +2122,7 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           merged: false,
-          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
         },
       },
@@ -2137,7 +2137,7 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           merged: true,
-          head: { ref: "ot/issue-1", sha: "f".repeat(40) },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: "f".repeat(40) },
           base: { ref: "main" },
         },
       },
@@ -2151,7 +2151,7 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
         },
         review: {
@@ -2244,7 +2244,7 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           merged: true,
-          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
         },
       },
@@ -2278,7 +2278,7 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          head: { ref: "ot/issue-1", sha: SUBJECT },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: SUBJECT },
           base: { ref: "main" },
         },
         review: {
@@ -2400,7 +2400,7 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
         },
         review: {
@@ -2660,7 +2660,7 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
           user: { login: "knoxgraeme" },
         },
@@ -2683,6 +2683,593 @@ describe("deterministic supervisor stage gates", () => {
       stage_id: "provider",
       reentry_ordinal: 0,
     });
+  });
+
+  it("routes an attested changes_requested review into persisted repair evidence", async () => {
+    const fixture = setup("core/implement@4");
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      { publishActivity: vi.fn(async () => undefined), publishError: vi.fn(async () => undefined) },
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 606,
+          state: "changes_requested",
+          body: "The repair path still accepts an unbound review.",
+          commit_id: PUBLISHED_COMMIT,
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-606",
+          user: { login: "external-reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.db.prepare(`
+      SELECT kind, head_sha FROM provider_events WHERE provider_event_id = ?
+    `).get("github-review:606")).toEqual({
+      kind: "pipeline_provider_event",
+      head_sha: PUBLISHED_COMMIT,
+    });
+    expect(fixture.db.prepare("SELECT status FROM feedback_snapshots").get())
+      .toEqual({ status: "consumed" });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+  });
+
+  it("retries a legitimate same-branch review until pull-request opened binds its URL", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    moveFixtureToProviderWait(fixture);
+
+    const earlyReview = () => handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 612,
+          state: "changes_requested",
+          body: "This review raced the opened webhook.",
+          commit_id: PUBLISHED_COMMIT,
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-612",
+          user: { login: "external-reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    await expect(earlyReview()).rejects.toThrow("review arrived before pull-request binding");
+    expect(fixture.tickets.getByIssueId("issue-1")?.pr_url).toBeNull();
+    expect(fixture.db.prepare(
+      "SELECT 1 FROM provider_events WHERE provider_event_id = ?"
+    ).get("github-review:612")).toBeUndefined();
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request",
+        action: "opened",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          merged: false,
+          updated_at: "2026-01-01T00:00:00.000Z",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+      },
+      fixture.pipelines
+    );
+    await earlyReview();
+
+    expect(fixture.tickets.getByIssueId("issue-1")?.pr_url)
+      .toBe("https://github.com/owner/repo/pull/1");
+    expect(fixture.db.prepare(
+      "SELECT head_sha FROM provider_events WHERE provider_event_id = ?"
+    ).get("github-review:612")).toEqual({ head_sha: PUBLISHED_COMMIT });
+
+    // Once the pull-request event closes the bind race, a different PR on the
+    // same branch must not use the fallback.
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 2,
+          html_url: "https://github.com/owner/repo/pull/2",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 613,
+          state: "changes_requested",
+          body: "This belongs to another pull request.",
+          commit_id: PUBLISHED_COMMIT,
+          html_url: "https://github.com/owner/repo/pull/2#pullrequestreview-613",
+          user: { login: "external-reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.db.prepare(
+      "SELECT 1 FROM provider_events WHERE provider_event_id = ?"
+    ).get("github-review:613")).toBeUndefined();
+    expect(activityPublisher.publishActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not bind a delayed predecessor review to a successor generation that reuses the branch", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.finishRun({
+      runId: fixture.attempt.planned_run_id!,
+      status: "failed",
+    });
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'failed', terminal_outcome = 'failed' WHERE id = ?
+    `).run(fixture.instance.id);
+
+    const catalog = loadPipelineCatalog(shippedCatalogPath, runtime.descriptor);
+    const manifest = catalog.manifests.get("core/implement@4")!;
+    const snapshot = fixture.pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: core/implement@4 }\ntest: npm test\n"),
+    });
+    fixture.tickets.upsert({
+      ticket_id: "issue-1",
+      ticket_reference: "ISSUE-1",
+      session_id: "session-2",
+      sandbox_id: null,
+      branch: "ot/issue-1",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: snapshot,
+        runtime,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+      },
+    });
+
+    const delayedPredecessorReview = () => handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: "d".repeat(40) },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 616,
+          state: "changes_requested",
+          body: "This review belongs to the predecessor generation.",
+          commit_id: "d".repeat(40),
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-616",
+          user: { login: "external-reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    await expect(delayedPredecessorReview()).rejects.toThrow(
+      "review arrived before pull-request binding"
+    );
+    expect(fixture.tickets.getByIssueId("issue-1")?.pr_url).toBeNull();
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request",
+        action: "opened",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 2,
+          html_url: "https://github.com/owner/repo/pull/2",
+          merged: false,
+          updated_at: "2026-01-01T00:00:00.000Z",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+      },
+      fixture.pipelines
+    );
+    await delayedPredecessorReview();
+
+    expect(fixture.tickets.getByIssueId("issue-1")?.pr_url)
+      .toBe("https://github.com/owner/repo/pull/2");
+    expect(fixture.db.prepare(
+      "SELECT 1 FROM provider_events WHERE provider_event_id = ?"
+    ).get("github-review:616")).toBeUndefined();
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+  });
+
+  it("rejects a pre-bind same-branch review from an external fork", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    moveFixtureToProviderWait(fixture);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 99,
+          html_url: "https://github.com/owner/repo/pull/99",
+          head: { repo: { full_name: "attacker/fork" }, ref: "ot/issue-1", sha: "f".repeat(40) },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 614,
+          state: "changes_requested",
+          body: "Do not bind this fork.",
+          commit_id: "f".repeat(40),
+          html_url: "https://github.com/owner/repo/pull/99#pullrequestreview-614",
+          user: { login: "external-reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.tickets.getByIssueId("issue-1")?.pr_url).toBeNull();
+    expect(fixture.db.prepare(
+      "SELECT 1 FROM provider_events WHERE provider_event_id = ?"
+    ).get("github-review:614")).toBeUndefined();
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+  });
+
+  it("does not bind a late same-branch review to an unbound terminal ticket", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'shipped', terminal_outcome = 'shipped' WHERE id = ?
+    `).run(fixture.instance.id);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 615,
+          state: "changes_requested",
+          body: "This review arrived after the pipeline settled.",
+          commit_id: PUBLISHED_COMMIT,
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-615",
+          user: { login: "external-reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.tickets.getByIssueId("issue-1")?.pr_url).toBeNull();
+    expect(fixture.db.prepare(
+      "SELECT 1 FROM provider_events WHERE provider_event_id = ?"
+    ).get("github-review:615")).toBeUndefined();
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+  });
+
+  it("rejects authorless PR comments and repair reviews without recording feedback", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 607,
+          state: "commented",
+          body: "Author identity is absent.",
+          commit_id: PUBLISHED_COMMIT,
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-607",
+        },
+      },
+      fixture.pipelines
+    );
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 611,
+          state: "changes_requested",
+          body: "Author identity is absent.",
+          commit_id: PUBLISHED_COMMIT,
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-611",
+        },
+      },
+      fixture.pipelines
+    );
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 608,
+          body: "Author identity is absent.",
+          created_at: "2099-01-01T00:00:00.000Z",
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-608",
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM feedback_snapshots").pluck().get()).toBe(0);
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
+  });
+
+  it("rejects a same-branch review for a pull request other than the ticket's bound PR", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    moveFixtureToProviderWait(fixture);
+    const originalHead = fixture.tickets.getSetting("github-head:issue-1");
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 2,
+          html_url: "https://github.com/owner/repo/pull/2",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: "f".repeat(40) },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 609,
+          state: "changes_requested",
+          commit_id: "f".repeat(40),
+          html_url: "https://github.com/owner/repo/pull/2#pullrequestreview-609",
+          user: { login: "unrelated-reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.tickets.getSetting("github-head:issue-1")).toBe(originalHead);
+    expect(fixture.tickets.listSettings("github-head-observation:issue-1:")).toHaveLength(0);
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "provider",
+      reentry_ordinal: 0,
+    });
+  });
+
+  it("does not bind a same-branch pull request opened from an external fork", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    moveFixtureToProviderWait(fixture);
+    const originalHead = fixture.tickets.getSetting("github-head:issue-1");
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request",
+        action: "opened",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 99,
+          html_url: "https://github.com/owner/repo/pull/99",
+          merged: false,
+          updated_at: "2026-01-01T00:00:00.000Z",
+          head: {
+            repo: { full_name: "attacker/fork" },
+            ref: "ot/issue-1",
+            sha: "f".repeat(40),
+          },
+          base: { ref: "main" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(fixture.tickets.getByIssueId("issue-1")?.pr_url).toBeNull();
+    expect(fixture.tickets.getSetting("github-head:issue-1")).toBe(originalHead);
+    expect(fixture.tickets.listSettings("github-head-observation:issue-1:")).toHaveLength(0);
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+  });
+
+  it("returns before head-history scans and activity publication for terminal PR comments", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'shipped', terminal_outcome = 'shipped' WHERE id = ?
+    `).run(fixture.instance.id);
+    const listSettings = vi.spyOn(fixture.tickets, "listSettings");
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "issue_comment",
+        action: "created",
+        repository: { full_name: "owner/repo" },
+        issue: { number: 1, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/1" } },
+        comment: {
+          id: 610,
+          body: "Late feedback must not scan retained head history.",
+          created_at: "2099-01-01T00:00:00.000Z",
+          html_url: "https://github.com/owner/repo/pull/1#issuecomment-610",
+          user: { login: "external-reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(listSettings).not.toHaveBeenCalled();
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
+  });
+
+  it("returns before reconciliation and activity publication for terminal PR reviews", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'shipped', terminal_outcome = 'shipped' WHERE id = ?
+    `).run(fixture.instance.id);
+    const getSetting = vi.spyOn(fixture.tickets, "getSetting");
+    const listSettings = vi.spyOn(fixture.tickets, "listSettings");
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          updated_at: "2099-01-01T00:00:00.000Z",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: "f".repeat(40) },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 612,
+          state: "commented",
+          body: "Late feedback must not reconcile retained head state.",
+          commit_id: "f".repeat(40),
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-612",
+          user: { login: "external-reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    expect(getSetting).not.toHaveBeenCalled();
+    expect(listSettings).not.toHaveBeenCalled();
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+    expect(fixture.db.prepare("SELECT COUNT(*) FROM provider_events").pluck().get()).toBe(0);
   });
 
   it.each([
@@ -2749,7 +3336,7 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
           user: { login: pullAuthor },
         },
@@ -3156,7 +3743,7 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          head: { ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
         },
         review: {
@@ -3624,7 +4211,7 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           updated_at: delayedIngressAt,
-          head: { ref: "ot/issue-1", sha: previousHead },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: previousHead },
           base: { ref: "main" },
         },
         review: {
@@ -3770,6 +4357,111 @@ describe("deterministic supervisor stage gates", () => {
       stage_id: "repair_implementation",
       reentry_ordinal: 1,
     });
+  });
+
+  it("processes exactly the feedback event limit without truncating or terminalizing", async () => {
+    const fixture = setup("core/implement@4");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    let snapshot: FeedbackSnapshot | undefined;
+    for (let index = 0; index < 20; index += 1) {
+      snapshot = fixture.tickets.recordProviderFeedback({
+        provider: "github",
+        providerEventId: `github-review:exact-${String(index).padStart(2, "0")}`,
+        issueId: fixture.instance.ticket_id,
+        sessionId: fixture.instance.session_id,
+        generation: fixture.instance.generation,
+        repository: fixture.instance.repository,
+        pullNumber: 1,
+        headSha: PUBLISHED_COMMIT,
+        kind: "pipeline_provider_event",
+        payload: canonicalJson({
+          outcome: "semantic_repair_required",
+          summary: `feedback ${index}`,
+          evidence: [`feedback ${index}`],
+          findings: [],
+          payload: canonicalJson({ kind: "pull_request_review", index }),
+        }),
+        workItemId: `pipeline-feedback:${fixture.instance.id}:${PUBLISHED_COMMIT}`,
+        receivedAt: `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
+      }).snapshot;
+    }
+
+    expect(processPipelineFeedbackSnapshot({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+      snapshot: snapshot!,
+    })).toBe(true);
+
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "dispatchable",
+      terminal_outcome: null,
+    });
+    expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({
+      stage_id: "repair_implementation",
+      reentry_ordinal: 1,
+    });
+    expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?")
+      .get(snapshot!.id)).toEqual({ status: "consumed" });
+    const sealed = fixture.db.prepare("SELECT payload FROM pipeline_artifacts WHERE kind = 'stage_result'")
+      .all()
+      .map((row) => JSON.parse((row as { payload: string }).payload) as {
+        details?: { events?: unknown[]; events_truncated?: boolean; event_limit?: number };
+      })
+      .find((artifact) => artifact.details?.event_limit === 20);
+    expect(sealed?.details).toMatchObject({ events_truncated: false, event_limit: 20 });
+    expect(sealed?.details?.events).toHaveLength(20);
+  });
+
+  it("fails closed with a bounded artifact when a feedback snapshot exceeds the event limit", async () => {
+    const fixture = setup("core/implement@4");
+    moveFixtureToProviderWait(fixture, SUBJECT);
+    let snapshot: FeedbackSnapshot | undefined;
+    for (let index = 0; index < 21; index += 1) {
+      snapshot = fixture.tickets.recordProviderFeedback({
+        provider: "github",
+        providerEventId: `github-review:overflow-${String(index).padStart(2, "0")}`,
+        issueId: fixture.instance.ticket_id,
+        sessionId: fixture.instance.session_id,
+        generation: fixture.instance.generation,
+        repository: fixture.instance.repository,
+        pullNumber: 1,
+        headSha: PUBLISHED_COMMIT,
+        kind: "pipeline_provider_event",
+        payload: canonicalJson({
+          outcome: "semantic_repair_required",
+          summary: `feedback ${index}`,
+          evidence: [`feedback ${index}`],
+          findings: [],
+          payload: canonicalJson({ kind: "pull_request_review", index }),
+        }),
+        workItemId: `pipeline-feedback:${fixture.instance.id}:${PUBLISHED_COMMIT}`,
+        receivedAt: `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
+      }).snapshot;
+    }
+
+    expect(processPipelineFeedbackSnapshot({
+      pipelines: fixture.pipelines,
+      store: fixture.tickets,
+      instance: fixture.pipelines.getInstance(fixture.instance.id)!,
+      snapshot: snapshot!,
+    })).toBe(true);
+
+    expect(fixture.pipelines.getInstance(fixture.instance.id)).toMatchObject({
+      status: "completion_pending_publication",
+      terminal_outcome: "needs_human",
+    });
+    const sealed = fixture.db.prepare("SELECT payload FROM pipeline_artifacts WHERE kind = 'stage_result'")
+      .all()
+      .map((row) => JSON.parse((row as { payload: string }).payload) as {
+        details?: { events?: unknown[]; events_truncated?: boolean; event_limit?: number };
+      })
+      .find((artifact) => artifact.details?.events_truncated === true);
+    expect(sealed?.details).toMatchObject({
+      events_truncated: true,
+      event_limit: 20,
+    });
+    expect(sealed?.details?.events).toHaveLength(20);
   });
 
   it("ships provider feedback with only live P2 findings after repair budget is exhausted", async () => {
@@ -4145,7 +4837,7 @@ describe("deterministic supervisor stage gates", () => {
         pull_request: {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
-          head: { ref: "ot/issue-1", sha: repairedHead },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: repairedHead },
           base: { ref: "main" },
         },
         review: {
@@ -4234,7 +4926,7 @@ describe("deterministic supervisor stage gates", () => {
               html_url: "https://github.com/owner/repo/pull/1",
               merged: false,
               updated_at: "2026-01-01T00:00:05.000Z",
-              head: { ref: "ot/issue-1", sha: previousHead },
+              head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: previousHead },
               base: { ref: "main" },
             },
           }
@@ -4246,7 +4938,7 @@ describe("deterministic supervisor stage gates", () => {
               number: 1,
               html_url: "https://github.com/owner/repo/pull/1",
               updated_at: "2026-01-01T00:00:05.000Z",
-              head: { ref: "ot/issue-1", sha: previousHead },
+              head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: previousHead },
               base: { ref: "main" },
             },
             review: {
@@ -4319,7 +5011,7 @@ describe("deterministic supervisor stage gates", () => {
           html_url: "https://github.com/owner/repo/pull/1",
           merged: false,
           updated_at: eventObservedAt,
-          head: { ref: "ot/issue-1", sha: liveHead },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: liveHead },
           base: { ref: "main" },
         },
       },
@@ -4369,7 +5061,7 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           updated_at: "2026-01-01T00:00:15.000Z",
-          head: { ref: "ot/issue-1", sha: reviewedHead },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: reviewedHead },
           base: { ref: "main" },
         },
         review: {
@@ -4425,7 +5117,7 @@ describe("deterministic supervisor stage gates", () => {
             html_url: "https://github.com/owner/repo/pull/1",
             merged: false,
             updated_at: updatedAt,
-            head: { ref: "ot/issue-1", sha: projectedHead },
+            head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: projectedHead },
             base: { ref: "main" },
           },
         },
@@ -4697,7 +5389,7 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           merged: false,
-          head: { ref: "ot/issue-1", sha: currentHead },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: currentHead },
           base: { ref: "main" },
         },
       },
@@ -4871,7 +5563,7 @@ describe("deterministic supervisor stage gates", () => {
           html_url: "https://github.com/owner/repo/pull/1",
           merged: false,
           updated_at: "2026-01-01T00:00:04.000Z",
-          head: { ref: "ot/issue-1", sha: pushedHead },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: pushedHead },
           base: { ref: "main" },
         },
       },
@@ -4942,7 +5634,7 @@ describe("deterministic supervisor stage gates", () => {
           html_url: "https://github.com/owner/repo/pull/1",
           merged: false,
           updated_at: "2026-01-01T00:00:05.000Z",
-          head: { ref: "ot/issue-1", sha: headB },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: headB },
           base: { ref: "main" },
         },
       },
@@ -5054,7 +5746,7 @@ describe("deterministic supervisor stage gates", () => {
           html_url: "https://github.com/owner/repo/pull/1",
           merged: false,
           updated_at: "2026-01-01T00:00:05.000Z",
-          head: { ref: "ot/issue-1", sha: headB },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: headB },
           base: { ref: "main" },
         },
       },
@@ -5119,7 +5811,7 @@ describe("deterministic supervisor stage gates", () => {
           html_url: "https://github.com/owner/repo/pull/1",
           merged: false,
           updated_at: "2026-01-01T00:00:05.000Z",
-          head: { ref: "ot/issue-1", sha: headB },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: headB },
           base: { ref: "main" },
         },
       },
@@ -5141,7 +5833,7 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           updated_at: "2026-01-01T00:00:06.000Z",
-          head: { ref: "ot/issue-1", sha: headC },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: headC },
           base: { ref: "main" },
         },
         review: {
@@ -5266,7 +5958,7 @@ describe("deterministic supervisor stage gates", () => {
           html_url: "https://github.com/owner/repo/pull/1",
           merged: false,
           updated_at: "2026-01-01T00:00:05.000Z",
-          head: { ref: "ot/issue-1", sha: headB },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: headB },
           base: { ref: "main" },
         },
       },
@@ -5286,7 +5978,7 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           updated_at: "2026-01-01T00:00:06.000Z",
-          head: { ref: "ot/issue-1", sha: headC },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: headC },
           base: { ref: "main" },
         },
         review: {
@@ -5386,7 +6078,7 @@ describe("deterministic supervisor stage gates", () => {
         html_url: "https://github.com/owner/repo/pull/1",
         merged: false,
         updated_at: updatedAt,
-        head: { ref: "ot/issue-1", sha: headSha },
+        head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: headSha },
         base: { ref: "main" },
       },
     });
@@ -5432,7 +6124,7 @@ describe("deterministic supervisor stage gates", () => {
           number: 1,
           html_url: "https://github.com/owner/repo/pull/1",
           updated_at: "2026-01-01T00:00:02.000Z",
-          head: { ref: "ot/issue-1", sha: headC },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: headC },
           base: { ref: "main" },
         },
         review: {
@@ -6500,20 +7192,25 @@ describe("deterministic supervisor stage gates", () => {
       evidence: [summary],
       payload: "{}",
     });
-    const stale = fixture.tickets.recordProviderFeedback({
-      provider: "github",
-      providerEventId: "github-review:stale",
-      issueId: fixture.instance.ticket_id,
-      sessionId: fixture.instance.session_id,
-      generation: fixture.instance.generation,
-      repository: fixture.instance.repository,
-      pullNumber: 1,
-      headSha: staleHead,
-      kind: "pipeline_provider_event",
-      payload: eventPayload("stale feedback"),
-      workItemId: `pipeline-feedback:${fixture.instance.id}:${staleHead}`,
-      receivedAt: "2026-01-01T00:00:00.000Z",
-    }).snapshot;
+    let stale: FeedbackSnapshot | undefined;
+    for (let index = 0; index < 25; index += 1) {
+      stale = fixture.tickets.recordProviderFeedback({
+        provider: "github",
+        providerEventId: index === 0
+          ? "github-review:stale"
+          : `github-review:stale-overflow-${index}`,
+        issueId: fixture.instance.ticket_id,
+        sessionId: fixture.instance.session_id,
+        generation: fixture.instance.generation,
+        repository: fixture.instance.repository,
+        pullNumber: 1,
+        headSha: staleHead,
+        kind: "pipeline_provider_event",
+        payload: eventPayload(`stale feedback ${index}`),
+        workItemId: `pipeline-feedback:${fixture.instance.id}:${staleHead}`,
+        receivedAt: `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
+      }).snapshot;
+    }
     const fresh = fixture.tickets.recordProviderFeedback({
       provider: "github",
       providerEventId: "github-review:fresh",
@@ -6550,12 +7247,12 @@ describe("deterministic supervisor stage gates", () => {
     `).run(SUBJECT, SUBJECT, fixture.instance.id);
 
     expect(await drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
-    expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(stale.id))
+    expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(stale!.id))
       .toEqual({ status: "stale" });
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(fresh.id))
       .toEqual({ status: "consumed" });
     const staleNotice = fixture.db.prepare("SELECT payload FROM control_outbox WHERE id = ?")
-      .get(`feedback-snapshot-stale:${stale.id}`) as { payload: string };
+      .get(`feedback-snapshot-stale:${stale!.id}`) as { payload: string };
     expect(JSON.parse(staleNotice.payload)).toMatchObject({
       type: "activity",
       activity: {
@@ -6565,6 +7262,8 @@ describe("deterministic supervisor stage gates", () => {
       },
     });
     expect(JSON.parse(staleNotice.payload).activity.body).toContain("github:github-review:stale");
+    expect(JSON.parse(staleNotice.payload).activity.body)
+      .toContain("at least 21 feedback item(s)");
     expect(JSON.parse(staleNotice.payload).activity.body).toContain(`reviewed_head=${staleHead}`);
     expect(JSON.parse(staleNotice.payload).activity.body).toContain(`current_published_head=${SUBJECT}`);
     expect(fixture.pipelines.getActiveAttempt(fixture.instance.id)).toMatchObject({

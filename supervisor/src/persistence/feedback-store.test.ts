@@ -89,6 +89,122 @@ describe("provider feedback snapshots", () => {
     })).toThrow(/changed payload/i);
   });
 
+  it("bounds event materialization when claiming a large snapshot", () => {
+    db = openDb(":memory:");
+    const store = createFeedbackStore(db);
+    let snapshotId = "";
+    for (let index = 0; index < 21; index += 1) {
+      snapshotId = store.record({
+        ...base,
+        providerEventId: `review:${index}`,
+        kind: "review",
+        payload: `review body ${index}`,
+        workItemId: "gh-review-batch",
+        receivedAt: `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
+      }).snapshot.id;
+    }
+
+    const claim = store.claimWithEvents(snapshotId, 3, 20);
+    expect(claim).toMatchObject({
+      status: "claimed",
+      eventsTruncated: true,
+      events: expect.arrayContaining([
+        expect.objectContaining({ provider_event_id: "review:0" }),
+      ]),
+    });
+    expect(claim.status === "claimed" ? claim.events : []).toHaveLength(20);
+  });
+
+  it("does not truncate a snapshot at the exact event limit", () => {
+    db = openDb(":memory:");
+    const store = createFeedbackStore(db);
+    let snapshotId = "";
+    for (let index = 0; index < 20; index += 1) {
+      snapshotId = store.record({
+        ...base,
+        providerEventId: `exact-review:${index}`,
+        kind: "review",
+        payload: `review body ${index}`,
+        workItemId: "gh-exact-review-batch",
+        receivedAt: `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
+      }).snapshot.id;
+    }
+
+    const claim = store.claimWithEvents(snapshotId, 3, 20);
+    expect(claim).toMatchObject({
+      status: "claimed",
+      eventsTruncated: false,
+    });
+    expect(claim.status === "claimed" ? claim.events : []).toHaveLength(20);
+  });
+
+  it("settles provider evidence and claim consumption in one transaction", () => {
+    db = openDb(":memory:");
+    const store = createFeedbackStore(db);
+    const recorded = store.record({
+      ...base,
+      providerEventId: "review:atomic",
+      kind: "review",
+      payload: "original",
+      workItemId: "gh-review-atomic",
+    });
+    expect(store.claimWithEvents(recorded.snapshot.id, 3, 20).status).toBe("claimed");
+
+    expect(() => store.settleClaim(recorded.snapshot.id, () => {
+      db!.prepare(`
+        UPDATE provider_events SET kind = 'mutated'
+        WHERE provider = 'github' AND provider_event_id = 'review:atomic'
+      `).run();
+      throw new Error("interrupt settlement");
+    })).toThrow(/interrupt settlement/);
+    expect(db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?")
+      .get(recorded.snapshot.id)).toEqual({ status: "claimed" });
+    expect(db.prepare(`
+      SELECT kind FROM provider_events
+      WHERE provider = 'github' AND provider_event_id = 'review:atomic'
+    `).get()).toEqual({ kind: "review" });
+
+    expect(store.settleClaim(recorded.snapshot.id, () => undefined)).toBe(true);
+    expect(db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?")
+      .get(recorded.snapshot.id)).toEqual({ status: "consumed" });
+    expect(store.claimWithEvents(recorded.snapshot.id, 3, 20)).toMatchObject({
+      status: "consumed",
+      snapshot: { id: recorded.snapshot.id },
+    });
+  });
+
+  it("carries only a bounded overflow sentinel into an existing target snapshot", () => {
+    db = openDb(":memory:");
+    const store = createFeedbackStore(db);
+    let sourceId = "";
+    for (let index = 0; index < 30; index += 1) {
+      sourceId = store.record({
+        ...base,
+        headSha: "head-old",
+        providerEventId: `old-review:${index}`,
+        kind: "review",
+        payload: `old review ${index}`,
+        workItemId: "gh-old-review-batch",
+        receivedAt: `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
+      }).snapshot.id;
+    }
+    const target = store.record({
+      ...base,
+      headSha: "head-new",
+      providerEventId: "new-review:0",
+      kind: "review",
+      payload: "new review",
+      workItemId: "gh-new-review",
+      receivedAt: "2026-01-01T00:01:00.000Z",
+    }).snapshot;
+
+    expect(store.carryForward(sourceId, "head-new", "gh-current", 21)?.id).toBe(target.id);
+    expect(store.listEvents(target.id)).toHaveLength(22);
+    expect(store.listEvents(sourceId)).toHaveLength(9);
+    expect(db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(sourceId))
+      .toEqual({ status: "stale" });
+  });
+
   it("keeps conversation comments separate from commit-scoped feedback on the same head", () => {
     db = openDb(":memory:");
     const store = createFeedbackStore(db);

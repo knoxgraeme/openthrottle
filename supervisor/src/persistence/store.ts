@@ -161,18 +161,30 @@ export interface FeedbackCapability {
     snapshotCreated: boolean;
   };
   listPendingFeedbackSnapshots(sessionId: string, limit?: number): FeedbackSnapshot[];
-  claimFeedbackSnapshot(snapshotId: string, maxRounds: number):
-    | { status: "claimed"; snapshot: FeedbackSnapshot; events: FeedbackSnapshotEvent[] }
+  claimFeedbackSnapshot(snapshotId: string, maxRounds: number, maxEvents?: number):
+    | {
+        status: "claimed";
+        snapshot: FeedbackSnapshot;
+        events: FeedbackSnapshotEvent[];
+        eventsTruncated: boolean;
+      }
     | { status: "exhausted"; completedRounds: number }
+    | { status: "consumed"; snapshot: FeedbackSnapshot }
     | { status: "stale"; snapshot?: FeedbackSnapshot; eventCount?: number };
-  carryForwardFeedbackSnapshot(snapshotId: string, headSha: string, workItemId: string): FeedbackSnapshot | undefined;
-  listFeedbackSnapshotEvents(snapshotId: string): FeedbackSnapshotEvent[];
+  carryForwardFeedbackSnapshot(
+    snapshotId: string,
+    headSha: string,
+    workItemId: string,
+    maxEventsToCarry: number
+  ): FeedbackSnapshot | undefined;
+  listFeedbackSnapshotEvents(snapshotId: string, limit?: number): FeedbackSnapshotEvent[];
   markFeedbackSnapshotStaleWithNotice(params: {
     snapshotId: string;
     noticeId: string;
     payload: string;
   }): boolean;
   consumeFeedbackSnapshot(snapshotId: string): boolean;
+  settleFeedbackSnapshot(snapshotId: string, settle: () => void): boolean;
 }
 
 export type SupervisorStore =
@@ -248,20 +260,23 @@ export function createSupervisorStore(
         ORDER BY created_at, id LIMIT ?
       `).all(sessionId, limit) as FeedbackSnapshot[];
     },
-    claimFeedbackSnapshot(snapshotId, maxRounds) {
-      return feedbackStore.claimWithEvents(snapshotId, maxRounds);
+    claimFeedbackSnapshot(snapshotId, maxRounds, maxEvents) {
+      return feedbackStore.claimWithEvents(snapshotId, maxRounds, maxEvents);
     },
-    carryForwardFeedbackSnapshot(snapshotId, headSha, workItemId) {
-      return feedbackStore.carryForward(snapshotId, headSha, workItemId);
+    carryForwardFeedbackSnapshot(snapshotId, headSha, workItemId, maxEventsToCarry) {
+      return feedbackStore.carryForward(snapshotId, headSha, workItemId, maxEventsToCarry);
     },
-    listFeedbackSnapshotEvents(snapshotId) {
-      return feedbackStore.listEvents(snapshotId);
+    listFeedbackSnapshotEvents(snapshotId, limit) {
+      return feedbackStore.listEvents(snapshotId, limit);
     },
     markFeedbackSnapshotStaleWithNotice(params) {
       return markFeedbackSnapshotStaleWithNotice.immediate(params);
     },
     consumeFeedbackSnapshot(snapshotId) {
       return feedbackStore.consume(snapshotId);
+    },
+    settleFeedbackSnapshot(snapshotId, settle) {
+      return feedbackStore.settleClaim(snapshotId, settle);
     },
   };
   return {

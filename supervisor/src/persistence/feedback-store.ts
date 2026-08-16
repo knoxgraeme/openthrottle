@@ -45,13 +45,25 @@ export interface FeedbackStore {
     eventInserted: boolean;
     snapshotCreated: boolean;
   };
-  claimWithEvents(snapshotId: string, maxRounds: number):
-    | { status: "claimed"; snapshot: FeedbackSnapshot; events: FeedbackSnapshotEvent[] }
+  claimWithEvents(snapshotId: string, maxRounds: number, maxEvents?: number):
+    | {
+        status: "claimed";
+        snapshot: FeedbackSnapshot;
+        events: FeedbackSnapshotEvent[];
+        eventsTruncated: boolean;
+      }
     | { status: "exhausted"; completedRounds: number }
+    | { status: "consumed"; snapshot: FeedbackSnapshot }
     | { status: "stale"; snapshot?: FeedbackSnapshot; eventCount?: number };
-  carryForward(snapshotId: string, headSha: string, workItemId: string): FeedbackSnapshot | undefined;
+  carryForward(
+    snapshotId: string,
+    headSha: string,
+    workItemId: string,
+    maxEventsToCarry: number
+  ): FeedbackSnapshot | undefined;
   consume(snapshotId: string): boolean;
-  listEvents(snapshotId: string): FeedbackSnapshotEvent[];
+  settleClaim(snapshotId: string, settle: () => void): boolean;
+  listEvents(snapshotId: string, limit?: number): FeedbackSnapshotEvent[];
 }
 
 export function createFeedbackStore(
@@ -196,9 +208,10 @@ export function createFeedbackStore(
   const claimTransaction = db.transaction((snapshotId: string, maxRounds: number) => {
     const snapshot = getSnapshot.get(snapshotId) as FeedbackSnapshot | undefined;
     if (!snapshot || snapshot.status === "stale") return { status: "stale" as const };
-    if (snapshot.status === "claimed" || snapshot.status === "consumed") {
+    if (snapshot.status === "claimed") {
       return { status: "claimed" as const, snapshot };
     }
+    if (snapshot.status === "consumed") return { status: "consumed" as const, snapshot };
     const completedRounds = (db.prepare(`
       SELECT COUNT(*) AS count FROM feedback_snapshots
       WHERE ticket_id = ? AND session_id = ?
@@ -225,19 +238,22 @@ export function createFeedbackStore(
       snapshot: getSnapshot.get(snapshotId) as FeedbackSnapshot,
     };
   });
-  const listEvents = (snapshotId: string): FeedbackSnapshotEvent[] =>
+  const listEvents = (
+    snapshotId: string,
+    limit = Number.MAX_SAFE_INTEGER
+  ): FeedbackSnapshotEvent[] =>
     db.prepare(`
-      SELECT pe.provider, pe.provider_event_id, pe.kind, pe.payload
-      FROM feedback_snapshot_events fse
-      JOIN provider_events pe
-        ON pe.provider = fse.provider AND pe.provider_event_id = fse.provider_event_id
-      WHERE fse.snapshot_id = ?
-      ORDER BY pe.received_at, pe.provider, pe.provider_event_id
-    `).all(snapshotId) as FeedbackSnapshotEvent[];
+      SELECT provider, provider_event_id, kind, payload
+      FROM provider_events
+      WHERE snapshot_id = ?
+      ORDER BY received_at, provider, provider_event_id
+      LIMIT ?
+    `).all(snapshotId, limit) as FeedbackSnapshotEvent[];
   const carryForwardTransaction = db.transaction((
     snapshotId: string,
     headSha: string,
-    workItemId: string
+    workItemId: string,
+    maxEventsToCarry: number
   ): FeedbackSnapshot | undefined => {
     const snapshot = getSnapshot.get(snapshotId) as FeedbackSnapshot | undefined;
     if (!snapshot || snapshot.status !== "collecting") return undefined;
@@ -254,21 +270,33 @@ export function createFeedbackStore(
       headSha
     ) as FeedbackSnapshot | undefined;
     if (target) {
-      db.prepare(`
-        INSERT OR IGNORE INTO feedback_snapshot_events(snapshot_id, provider, provider_event_id)
-        SELECT ?, provider, provider_event_id
-        FROM feedback_snapshot_events
+      const eventsToCarry = db.prepare(`
+        SELECT provider, provider_event_id
+        FROM provider_events
         WHERE snapshot_id = ?
-      `).run(target.id, snapshot.id);
-      db.prepare(`
-        UPDATE provider_events
-        SET snapshot_id = ?
-        WHERE (provider, provider_event_id) IN (
-          SELECT provider, provider_event_id
-          FROM feedback_snapshot_events
-          WHERE snapshot_id = ?
-        )
-      `).run(target.id, snapshot.id);
+        ORDER BY received_at, provider, provider_event_id
+        LIMIT ?
+      `).all(snapshot.id, maxEventsToCarry) as Array<{
+        provider: string;
+        provider_event_id: string;
+      }>;
+      const insertTargetEvent = db.prepare(`
+        INSERT OR IGNORE INTO feedback_snapshot_events(snapshot_id, provider, provider_event_id)
+        VALUES (?, ?, ?)
+      `);
+      const retargetProviderEvent = db.prepare(`
+        UPDATE provider_events SET snapshot_id = ?
+        WHERE provider = ? AND provider_event_id = ? AND snapshot_id = ?
+      `);
+      for (const event of eventsToCarry) {
+        insertTargetEvent.run(target.id, event.provider, event.provider_event_id);
+        retargetProviderEvent.run(
+          target.id,
+          event.provider,
+          event.provider_event_id,
+          snapshot.id
+        );
+      }
       db.prepare(`
         UPDATE feedback_snapshots
         SET status = 'stale'
@@ -288,29 +316,60 @@ export function createFeedbackStore(
     if (update.changes !== 1) return undefined;
     return getSnapshot.get(snapshot.id) as FeedbackSnapshot;
   });
+  const settleClaimTransaction = db.transaction((snapshotId: string, settle: () => void) => {
+    const snapshot = getSnapshot.get(snapshotId) as FeedbackSnapshot | undefined;
+    if (!snapshot || snapshot.status !== "claimed") return false;
+    settle();
+    const timestamp = new Date().toISOString();
+    const consumed = db.prepare(`
+      UPDATE feedback_snapshots
+      SET status = 'consumed', consumed_at = ?
+      WHERE id = ? AND status = 'claimed'
+    `).run(timestamp, snapshotId);
+    if (consumed.changes !== 1) {
+      throw new Error(`feedback snapshot ${snapshotId} could not be consumed after settlement`);
+    }
+    return true;
+  });
 
   return {
     record(params) {
       return recordTransaction.immediate(params);
     },
-    claimWithEvents(snapshotId, maxRounds) {
+    claimWithEvents(snapshotId, maxRounds, maxEvents = Number.MAX_SAFE_INTEGER) {
       const snapshot = getSnapshot.get(snapshotId) as FeedbackSnapshot | undefined;
       if (!snapshot) return { status: "stale" as const };
-      const events = listEvents(snapshot.id);
+      const queryLimit = maxEvents === Number.MAX_SAFE_INTEGER ? maxEvents : maxEvents + 1;
+      const queriedEvents = listEvents(snapshot.id, queryLimit);
+      const eventsTruncated = queriedEvents.length > maxEvents;
+      const events = eventsTruncated ? queriedEvents.slice(0, maxEvents) : queriedEvents;
       if (snapshot.status === "stale") {
-        return { status: "stale" as const, snapshot, eventCount: events.length };
+        return {
+          status: "stale" as const,
+          snapshot,
+          eventCount: eventsTruncated ? queryLimit : events.length,
+        };
       }
       const isConversationSnapshot = events.length > 0 &&
         events.every((event) => event.kind === "issue_comment");
       const currentHead = getCurrentHead(snapshot.ticket_id);
       if (!isConversationSnapshot && currentHead && currentHead !== snapshot.head_sha) {
-        return { status: "stale" as const, snapshot, eventCount: events.length };
+        return {
+          status: "stale" as const,
+          snapshot,
+          eventCount: eventsTruncated ? queryLimit : events.length,
+        };
       }
       const claim = claimTransaction.immediate(snapshot.id, maxRounds);
-      return claim.status === "claimed" ? { ...claim, events } : claim;
+      return claim.status === "claimed" ? { ...claim, events, eventsTruncated } : claim;
     },
-    carryForward(snapshotId, headSha, workItemId) {
-      return carryForwardTransaction.immediate(snapshotId, headSha, workItemId);
+    carryForward(snapshotId, headSha, workItemId, maxEventsToCarry) {
+      return carryForwardTransaction.immediate(
+        snapshotId,
+        headSha,
+        workItemId,
+        maxEventsToCarry
+      );
     },
     consume(snapshotId) {
       const timestamp = new Date().toISOString();
@@ -320,8 +379,11 @@ export function createFeedbackStore(
         WHERE id = ? AND status = 'claimed'
       `).run(timestamp, snapshotId).changes === 1;
     },
-    listEvents(snapshotId) {
-      return listEvents(snapshotId);
+    settleClaim(snapshotId, settle) {
+      return settleClaimTransaction.immediate(snapshotId, settle);
+    },
+    listEvents(snapshotId, limit) {
+      return listEvents(snapshotId, limit);
     },
   };
 }

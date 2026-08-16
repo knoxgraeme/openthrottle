@@ -192,6 +192,7 @@ describe("database migrations", () => {
       "0dd5b83a690d982be21f4232daa62ed45eaa66f082c6a100284004305bbde74b",
       "5e755e28e1a6a500c108c9cf3c6c4a66f97dc78309b9be11fe1af204b688d7f2",
       "167edf7c177c22c3074446c93e742cf44b47a9dc5da5e338d64f9e06f8549f07",
+      "fbf980b3a1190e637d7fd4775eb6e62f079e06dd51adc0e0483b2a1ec742cd62",
     ]);
   });
 
@@ -469,6 +470,48 @@ describe("database migrations", () => {
     expect(migration.source).toContain("rollback does not expose steering written after cutover");
   });
 
+  it("indexes bounded event reads and pending snapshot drains in stable order", () => {
+    db = openDb(":memory:");
+    const index = db.prepare(`
+      SELECT sql FROM sqlite_master
+      WHERE type = 'index' AND name = 'provider_events_feedback_snapshot_order_idx'
+    `).get() as { sql: string } | undefined;
+    expect(index?.sql).toContain(
+      "provider_events(snapshot_id, received_at, provider, provider_event_id)"
+    );
+    const plan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT provider, provider_event_id, kind, payload
+      FROM provider_events
+      WHERE snapshot_id = ?
+      ORDER BY received_at, provider, provider_event_id
+      LIMIT ?
+    `).all("snapshot-1", 21) as Array<{ detail: string }>;
+    expect(plan.some((row) =>
+      row.detail.includes("provider_events_feedback_snapshot_order_idx")
+    )).toBe(true);
+
+    const pendingIndex = db.prepare(`
+      SELECT sql FROM sqlite_master
+      WHERE type = 'index' AND name = 'feedback_snapshots_pending_session_idx'
+    `).get() as { sql: string } | undefined;
+    expect(pendingIndex?.sql).toContain(
+      "feedback_snapshots(session_id, created_at, id)"
+    );
+    expect(pendingIndex?.sql).toContain(
+      "WHERE status IN ('collecting', 'claimed')"
+    );
+    const pendingPlan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT * FROM feedback_snapshots
+      WHERE session_id = ? AND status IN ('collecting', 'claimed')
+      ORDER BY created_at, id LIMIT ?
+    `).all("session-1", 50) as Array<{ detail: string }>;
+    expect(pendingPlan.some((row) =>
+      row.detail.includes("feedback_snapshots_pending_session_idx")
+    )).toBe(true);
+  });
+
   it("persists tune as a closed task type on fresh and upgraded databases", () => {
     db = openDb(":memory:");
     const sql = (db.prepare(`
@@ -572,8 +615,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 51,
-      name: `steering-items-single-owner${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 52,
+      name: `provider-feedback-bounded-order-index${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -625,8 +668,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 51,
-      name: `steering-items-single-owner${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 52,
+      name: `provider-feedback-bounded-order-index${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 

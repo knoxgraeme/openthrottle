@@ -80,7 +80,7 @@ describe("GitHub contracts", () => {
         html_url: "https://github.com/o/r/pull/1",
         merged: false,
         updated_at: "2026-08-11T00:00:00.000Z",
-        head: { ref: "ot/test" },
+        head: { repo: { full_name: "o/r" }, ref: "ot/test" },
         base: { ref: "main" },
       },
     });
@@ -93,7 +93,7 @@ describe("GitHub contracts", () => {
         html_url: "https://github.com/o/r/pull/1",
         merged_at: null,
         updated_at: "2026-08-11T00:00:00.000Z",
-        head: { ref: "ot/test" },
+        head: { repo: { full_name: "o/r" }, ref: "ot/test" },
         base: { ref: "main" },
       },
       review: {
@@ -154,7 +154,7 @@ describe("GitHub contracts", () => {
             number: 1,
             html_url: "https://github.com/o/r/pull/1",
             updated_at: "2026-08-11T00:00:00.000Z",
-            head: { ref: "ot/test" },
+            head: { repo: { full_name: "o/r" }, ref: "ot/test" },
             base: { ref: "main" },
           },
           review: {
@@ -175,7 +175,7 @@ describe("GitHub contracts", () => {
             number: 1,
             html_url: "https://github.com/o/r/pull/1",
             updated_at: "2026-08-11T00:00:00.000Z",
-            head: { ref: "ot/test" },
+            head: { repo: { full_name: "o/r" }, ref: "ot/test" },
             base: { ref: "main" },
           },
           review: {
