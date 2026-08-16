@@ -89,6 +89,32 @@ describe("provider feedback snapshots", () => {
     })).toThrow(/changed payload/i);
   });
 
+  it("bounds event materialization when claiming a large snapshot", () => {
+    db = openDb(":memory:");
+    const store = createFeedbackStore(db);
+    let snapshotId = "";
+    for (let index = 0; index < 21; index += 1) {
+      snapshotId = store.record({
+        ...base,
+        providerEventId: `review:${index}`,
+        kind: "review",
+        payload: `review body ${index}`,
+        workItemId: "gh-review-batch",
+        receivedAt: `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
+      }).snapshot.id;
+    }
+
+    const claim = store.claimWithEvents(snapshotId, 3, 20);
+    expect(claim).toMatchObject({
+      status: "claimed",
+      eventsTruncated: true,
+      events: expect.arrayContaining([
+        expect.objectContaining({ provider_event_id: "review:0" }),
+      ]),
+    });
+    expect(claim.status === "claimed" ? claim.events : []).toHaveLength(20);
+  });
+
   it("keeps conversation comments separate from commit-scoped feedback on the same head", () => {
     db = openDb(":memory:");
     const store = createFeedbackStore(db);

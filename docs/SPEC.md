@@ -605,12 +605,17 @@ lifecycle controls require an actor with `triage`, `write`, `maintain`, or
 `changes_requested` or `commented` PR reviews require an attested author but no
 collaborator-permission lookup before routing `semantic_repair_required`. This
 permits requested external reviewers and substantive automated reviewers to
-contribute feedback.
+contribute feedback. A review must match the ticket's exact stored PR URL before
+it can reconcile head state, publish activity, or route provider feedback;
+branch-name correlation alone grants no ticket-scoped authority.
 The accepted blast radius is bounded: the manifest's `max_repair_rounds` caps
-repair re-entry for the pipeline, and provider routing returns early for a
-terminal pipeline instance, so PR feedback cannot revive terminal work. This
-asymmetry is deliberate and must not be inferred to grant PR actors authority
-over Issue admission, steering, closure, or generation lifecycle controls.
+repair re-entry for the pipeline, each snapshot drain materializes at most 20
+provider events and fails closed to `needs_human` when more are present, and
+provider routing returns before head-history scans or activity publication for
+a terminal pipeline instance, so PR feedback cannot revive terminal work or
+consume unbounded synchronous work after settlement. This asymmetry is
+deliberate and must not be inferred to grant PR actors authority over Issue
+admission, steering, closure, or generation lifecycle controls.
 
 For a repository registered with `control_provider=github`, `openthrottle init`
 creates or normalizes the exact lowercase `openthrottle` label. An authorized
@@ -663,7 +668,9 @@ executor-verified published commit and then drained normally. Mismatched heads
 outside that exception require human attention and enqueue a visible operator
 activity before the snapshot is marked stale; evidence for a future stage remains
 pending. A feedback snapshot is immutable once claimed and is consumed only after
-the coordinator commits the provider event.
+the coordinator commits the provider event. Snapshot-event reads use the same
+20-event materialization bound; overflow is sealed as bounded human-required
+provider evidence rather than allocating or embedding the full event set.
 
 Linear replies sent while the current pipeline instance is in `waiting_provider`
 are recorded on the same provider-feedback channel as GitHub evidence, with

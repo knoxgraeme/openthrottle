@@ -45,13 +45,18 @@ export interface FeedbackStore {
     eventInserted: boolean;
     snapshotCreated: boolean;
   };
-  claimWithEvents(snapshotId: string, maxRounds: number):
-    | { status: "claimed"; snapshot: FeedbackSnapshot; events: FeedbackSnapshotEvent[] }
+  claimWithEvents(snapshotId: string, maxRounds: number, maxEvents?: number):
+    | {
+        status: "claimed";
+        snapshot: FeedbackSnapshot;
+        events: FeedbackSnapshotEvent[];
+        eventsTruncated: boolean;
+      }
     | { status: "exhausted"; completedRounds: number }
     | { status: "stale"; snapshot?: FeedbackSnapshot; eventCount?: number };
   carryForward(snapshotId: string, headSha: string, workItemId: string): FeedbackSnapshot | undefined;
   consume(snapshotId: string): boolean;
-  listEvents(snapshotId: string): FeedbackSnapshotEvent[];
+  listEvents(snapshotId: string, limit?: number): FeedbackSnapshotEvent[];
 }
 
 export function createFeedbackStore(
@@ -225,7 +230,10 @@ export function createFeedbackStore(
       snapshot: getSnapshot.get(snapshotId) as FeedbackSnapshot,
     };
   });
-  const listEvents = (snapshotId: string): FeedbackSnapshotEvent[] =>
+  const listEvents = (
+    snapshotId: string,
+    limit = Number.MAX_SAFE_INTEGER
+  ): FeedbackSnapshotEvent[] =>
     db.prepare(`
       SELECT pe.provider, pe.provider_event_id, pe.kind, pe.payload
       FROM feedback_snapshot_events fse
@@ -233,7 +241,8 @@ export function createFeedbackStore(
         ON pe.provider = fse.provider AND pe.provider_event_id = fse.provider_event_id
       WHERE fse.snapshot_id = ?
       ORDER BY pe.received_at, pe.provider, pe.provider_event_id
-    `).all(snapshotId) as FeedbackSnapshotEvent[];
+      LIMIT ?
+    `).all(snapshotId, limit) as FeedbackSnapshotEvent[];
   const carryForwardTransaction = db.transaction((
     snapshotId: string,
     headSha: string,
@@ -293,12 +302,19 @@ export function createFeedbackStore(
     record(params) {
       return recordTransaction.immediate(params);
     },
-    claimWithEvents(snapshotId, maxRounds) {
+    claimWithEvents(snapshotId, maxRounds, maxEvents = Number.MAX_SAFE_INTEGER) {
       const snapshot = getSnapshot.get(snapshotId) as FeedbackSnapshot | undefined;
       if (!snapshot) return { status: "stale" as const };
-      const events = listEvents(snapshot.id);
+      const queryLimit = maxEvents === Number.MAX_SAFE_INTEGER ? maxEvents : maxEvents + 1;
+      const queriedEvents = listEvents(snapshot.id, queryLimit);
+      const eventsTruncated = queriedEvents.length > maxEvents;
+      const events = eventsTruncated ? queriedEvents.slice(0, maxEvents) : queriedEvents;
       if (snapshot.status === "stale") {
-        return { status: "stale" as const, snapshot, eventCount: events.length };
+        return {
+          status: "stale" as const,
+          snapshot,
+          eventCount: eventsTruncated ? queryLimit : events.length,
+        };
       }
       const isConversationSnapshot = events.length > 0 &&
         events.every((event) => event.kind === "issue_comment");
@@ -307,7 +323,7 @@ export function createFeedbackStore(
         return { status: "stale" as const, snapshot, eventCount: events.length };
       }
       const claim = claimTransaction.immediate(snapshot.id, maxRounds);
-      return claim.status === "claimed" ? { ...claim, events } : claim;
+      return claim.status === "claimed" ? { ...claim, events, eventsTruncated } : claim;
     },
     carryForward(snapshotId, headSha, workItemId) {
       return carryForwardTransaction.immediate(snapshotId, headSha, workItemId);
@@ -320,8 +336,8 @@ export function createFeedbackStore(
         WHERE id = ? AND status = 'claimed'
       `).run(timestamp, snapshotId).changes === 1;
     },
-    listEvents(snapshotId) {
-      return listEvents(snapshotId);
+    listEvents(snapshotId, limit) {
+      return listEvents(snapshotId, limit);
     },
   };
 }

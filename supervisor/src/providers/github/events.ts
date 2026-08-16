@@ -1085,8 +1085,11 @@ export async function handleGithubEvent(
   }
 
   if (event.kind === "pull_request_review") {
-    const ticket = store.getByBranch(event.repository.full_name, event.pull_request.head.ref);
+    const ticket = store.getByPrUrl(event.repository.full_name, event.pull_request.html_url);
     if (!ticket || event.action !== "submitted") return;
+    const reviewState = event.review.state.toLowerCase();
+    const author = event.review.user?.login;
+    if ((reviewState === "changes_requested" || reviewState === "commented") && !author) return;
     const prHeadSha = githubCommitSha(event.pull_request.head.sha);
     if (prHeadSha) {
       await reconcileAuthoritativeGithubHead({
@@ -1107,13 +1110,11 @@ export async function handleGithubEvent(
       parameter: `${event.review.user?.login ?? "reviewer"}: ${event.review.state}`,
       result: event.review.html_url,
     }, ticket.ticket_id);
-    const reviewState = event.review.state.toLowerCase();
     if (reviewState !== "changes_requested" && reviewState !== "commented") return;
-    const author = event.review.user?.login;
+    if (!author) return;
     // A review without an attested author cannot be trusted feedback. The
     // supervisor never authors pull-request reviews, so no machine-output
     // filtering applies here — every attested review is human.
-    if (!author) return;
     const reviewedHeadSha = githubCommitSha(event.review.commit_id);
     const headSha = reviewedHeadSha ??
       prHeadSha ??
@@ -1356,6 +1357,7 @@ export async function handleGithubEvent(
     // this separate check recognizes only explicit Linear bridge artifacts.
     if (isGithubBotLinkback(author, event.comment.body)) return;
     const instance = pipelines.getInstanceForSession(ticket.session_id);
+    if (instance && pipelineIsTerminal(instance)) return;
     const currentHeadObservation = currentGithubHeadObservation(store, ticket.ticket_id);
     const providerObservations = providerTimestampedGithubHeads(store, ticket.ticket_id);
     const commentAtMs = event.comment.created_at
