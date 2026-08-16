@@ -961,6 +961,7 @@ export async function handleGithubEvent(
   if (event.kind === "pull_request") {
     const branch = event.pull_request.head.ref;
     if (!isOpenthrottleBranch(branch)) return;
+    if (event.pull_request.head.repo.full_name !== event.repository.full_name) return;
     const ticket = store.getByBranch(event.repository.full_name, branch);
     if (!ticket) return;
     const pipelineInstance = pipelines.getInstanceForSession(ticket.session_id);
@@ -1085,8 +1086,32 @@ export async function handleGithubEvent(
   }
 
   if (event.kind === "pull_request_review") {
-    const ticket = store.getByPrUrl(event.repository.full_name, event.pull_request.html_url);
-    if (!ticket || event.action !== "submitted") return;
+    if (event.pull_request.head.repo.full_name !== event.repository.full_name) return;
+    if (event.action !== "submitted") return;
+    let ticket = store.getByPrUrl(event.repository.full_name, event.pull_request.html_url);
+    let needsPrBinding = false;
+    if (!ticket) {
+      ticket = store.getByBranch(
+        event.repository.full_name,
+        event.pull_request.head.ref
+      );
+      if (!ticket || ticket.pr_url !== null) return;
+      needsPrBinding = true;
+    }
+    const instance = pipelines.getInstanceForSession(ticket.session_id);
+    if (instance && pipelineIsTerminal(instance)) return;
+    if (needsPrBinding) {
+      // GitHub may deliver a submitted review before the pull_request/opened
+      // event that normally binds the URL. The exact same-repository branch is
+      // the only safe fallback, and the first observation closes the race by
+      // binding the URL so every later review must match it exactly.
+      store.setPrUrl(ticket.ticket_id, event.pull_request.html_url);
+      ticket = store.getByPrUrl(
+        event.repository.full_name,
+        event.pull_request.html_url
+      );
+    }
+    if (!ticket) return;
     const reviewState = event.review.state.toLowerCase();
     const author = event.review.user?.login;
     if ((reviewState === "changes_requested" || reviewState === "commented") && !author) return;

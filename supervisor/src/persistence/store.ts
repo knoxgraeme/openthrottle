@@ -169,8 +169,14 @@ export interface FeedbackCapability {
         eventsTruncated: boolean;
       }
     | { status: "exhausted"; completedRounds: number }
+    | { status: "consumed"; snapshot: FeedbackSnapshot }
     | { status: "stale"; snapshot?: FeedbackSnapshot; eventCount?: number };
-  carryForwardFeedbackSnapshot(snapshotId: string, headSha: string, workItemId: string): FeedbackSnapshot | undefined;
+  carryForwardFeedbackSnapshot(
+    snapshotId: string,
+    headSha: string,
+    workItemId: string,
+    maxEventsToCarry: number
+  ): FeedbackSnapshot | undefined;
   listFeedbackSnapshotEvents(snapshotId: string, limit?: number): FeedbackSnapshotEvent[];
   markFeedbackSnapshotStaleWithNotice(params: {
     snapshotId: string;
@@ -178,6 +184,7 @@ export interface FeedbackCapability {
     payload: string;
   }): boolean;
   consumeFeedbackSnapshot(snapshotId: string): boolean;
+  settleFeedbackSnapshot(snapshotId: string, settle: () => void): boolean;
 }
 
 export type SupervisorStore =
@@ -256,8 +263,8 @@ export function createSupervisorStore(
     claimFeedbackSnapshot(snapshotId, maxRounds, maxEvents) {
       return feedbackStore.claimWithEvents(snapshotId, maxRounds, maxEvents);
     },
-    carryForwardFeedbackSnapshot(snapshotId, headSha, workItemId) {
-      return feedbackStore.carryForward(snapshotId, headSha, workItemId);
+    carryForwardFeedbackSnapshot(snapshotId, headSha, workItemId, maxEventsToCarry) {
+      return feedbackStore.carryForward(snapshotId, headSha, workItemId, maxEventsToCarry);
     },
     listFeedbackSnapshotEvents(snapshotId, limit) {
       return feedbackStore.listEvents(snapshotId, limit);
@@ -267,6 +274,9 @@ export function createSupervisorStore(
     },
     consumeFeedbackSnapshot(snapshotId) {
       return feedbackStore.consume(snapshotId);
+    },
+    settleFeedbackSnapshot(snapshotId, settle) {
+      return feedbackStore.settleClaim(snapshotId, settle);
     },
   };
   return {

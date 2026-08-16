@@ -608,6 +608,9 @@ permits requested external reviewers and substantive automated reviewers to
 contribute feedback. A review must match the ticket's exact stored PR URL before
 it can reconcile head state, publish activity, or route provider feedback;
 branch-name correlation alone grants no ticket-scoped authority.
+The stored PR URL itself is bound only from a pull-request event whose head
+repository exactly matches the registered repository. A same-branch PR opened
+from an external fork cannot establish or replace that binding.
 The accepted blast radius is bounded: the manifest's `max_repair_rounds` caps
 repair re-entry for the pipeline, each snapshot drain materializes at most 20
 provider events and fails closed to `needs_human` when more are present, and
@@ -668,9 +671,14 @@ executor-verified published commit and then drained normally. Mismatched heads
 outside that exception require human attention and enqueue a visible operator
 activity before the snapshot is marked stale; evidence for a future stage remains
 pending. A feedback snapshot is immutable once claimed and is consumed only after
-the coordinator commits the provider event. Snapshot-event reads use the same
-20-event materialization bound; overflow is sealed as bounded human-required
-provider evidence rather than allocating or embedding the full event set.
+the coordinator commits the provider event. The coordinator transition and
+snapshot consumption commit in one database transaction, so interruption
+cannot leave terminal provider evidence next to a permanently claimed snapshot.
+Snapshot-event reads use the same 20-event materialization bound and an indexed
+snapshot/receive-order path. Carry-forward copies at most the 20-event bound
+plus one overflow sentinel; overflow is sealed as bounded human-required
+provider evidence rather than allocating, sorting, copying, or embedding the
+full event set.
 
 Linear replies sent while the current pipeline instance is in `waiting_provider`
 are recorded on the same provider-feedback channel as GitHub evidence, with

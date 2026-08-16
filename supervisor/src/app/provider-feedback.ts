@@ -491,6 +491,9 @@ function staleFeedbackNotice(params: {
   classification: "superseded_head";
 }): string {
   const count = Math.max(1, params.eventCount);
+  const countLabel = count > MAX_FEEDBACK_EVENTS_PER_SNAPSHOT_DRAIN
+    ? `at least ${count}`
+    : String(count);
   const eventIds = params.eventIds.length > 0
     ? params.eventIds.slice(0, 3).map((eventId) => sanitizeText(eventId).slice(0, 120)).join(",")
     : "unknown";
@@ -501,7 +504,7 @@ function staleFeedbackNotice(params: {
     activity: {
       sessionId: params.sessionId,
       type: "error",
-      body: `${count} feedback item(s) arrived against a superseded head and were not applied; classification=${params.classification}; event_ids=${eventIds}; reviewed_head=${reviewedHead}; current_published_head=${currentHead}; re-comment on the current PR head.`,
+      body: `${countLabel} feedback item(s) arrived against a superseded head and were not applied; classification=${params.classification}; event_ids=${eventIds}; reviewed_head=${reviewedHead}; current_published_head=${currentHead}; re-comment on the current PR head.`,
     },
   });
 }
@@ -561,7 +564,8 @@ export function processPipelineFeedbackSnapshot(params: {
     ? params.store.carryForwardFeedbackSnapshot(
       params.snapshot.id,
       params.instance.published_commit!,
-      pipelineFeedbackWorkItemId(params.instance.id, params.instance.published_commit!)
+      pipelineFeedbackWorkItemId(params.instance.id, params.instance.published_commit!),
+      MAX_FEEDBACK_EVENTS_PER_SNAPSHOT_DRAIN + 1
     ) ?? params.snapshot
     : params.snapshot;
   if (!snapshotBelongsToInstance(currentSnapshot, params.instance)) {
@@ -627,36 +631,40 @@ export function processPipelineFeedbackSnapshot(params: {
       })),
     });
   const artifactFindings = findings.slice(0, 50);
-  processProviderEvidence(params.pipelines, {
-    id: `provider-feedback-snapshot:${claim.snapshot.id}`,
-    instanceId: params.instance.id,
-    outcome,
-    summary: claim.eventsTruncated
-      ? `Provider feedback exceeded the bounded ${MAX_FEEDBACK_EVENTS_PER_SNAPSHOT_DRAIN}-event snapshot drain.`
-      : revisionMatches
-      ? `Immutable provider snapshot contains ${events.length} event(s) for the published commit.`
-      : "The current provider head does not match the executor-verified published commit.",
-    evidence: events.flatMap(({ parsed }) => parsed.evidence).slice(0, 50),
-    findings: artifactFindings,
-    providerPayload: {
-      snapshot_id: claim.snapshot.id,
-      repair_round: claim.snapshot.repair_round,
-      expected_published_commit: params.instance.published_commit,
-      // Seal against the head the evidence was actually observed against, not
-      // the drainable head it was carried forward to; the latter would falsely
-      // claim a superseded review was observed against the current subject.
-      observed_head_sha: claim.snapshot.observed_head_sha ?? claim.snapshot.head_sha,
-      events_truncated: claim.eventsTruncated,
-      event_limit: MAX_FEEDBACK_EVENTS_PER_SNAPSHOT_DRAIN,
-      events: events.map(({ event, parsed }) => ({
-        provider: event.provider,
-        provider_event_id: event.provider_event_id,
-        summary: parsed.summary,
-        payload: parsed.payload,
-      })),
-    },
+  const settled = params.store.settleFeedbackSnapshot(claim.snapshot.id, () => {
+    processProviderEvidence(params.pipelines, {
+      id: `provider-feedback-snapshot:${claim.snapshot.id}`,
+      instanceId: params.instance.id,
+      outcome,
+      summary: claim.eventsTruncated
+        ? `Provider feedback exceeded the bounded ${MAX_FEEDBACK_EVENTS_PER_SNAPSHOT_DRAIN}-event snapshot drain.`
+        : revisionMatches
+        ? `Immutable provider snapshot contains ${events.length} event(s) for the published commit.`
+        : "The current provider head does not match the executor-verified published commit.",
+      evidence: events.flatMap(({ parsed }) => parsed.evidence).slice(0, 50),
+      findings: artifactFindings,
+      providerPayload: {
+        snapshot_id: claim.snapshot.id,
+        repair_round: claim.snapshot.repair_round,
+        expected_published_commit: params.instance.published_commit,
+        // Seal against the head the evidence was actually observed against, not
+        // the drainable head it was carried forward to; the latter would falsely
+        // claim a superseded review was observed against the current subject.
+        observed_head_sha: claim.snapshot.observed_head_sha ?? claim.snapshot.head_sha,
+        events_truncated: claim.eventsTruncated,
+        event_limit: MAX_FEEDBACK_EVENTS_PER_SNAPSHOT_DRAIN,
+        events: events.map(({ event, parsed }) => ({
+          provider: event.provider,
+          provider_event_id: event.provider_event_id,
+          summary: parsed.summary,
+          payload: parsed.payload,
+        })),
+      },
+    });
   });
-  params.store.consumeFeedbackSnapshot(claim.snapshot.id);
+  if (!settled) {
+    throw new Error(`feedback snapshot ${claim.snapshot.id} lost its claim before settlement`);
+  }
   return true;
 }
 
