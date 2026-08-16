@@ -5,7 +5,7 @@ OpenThrottle supervisor.
 
 ```text
 openthrottle setup [--profile <name>] [--check] [--yes] [--legacy-checklist]
-openthrottle init
+openthrottle init [--profile <name>]
 openthrottle init --editable-skills
 openthrottle init --editable-skills --dry-run
 openthrottle ship <plan.md>
@@ -28,7 +28,9 @@ openthrottle operator-skill status --json
   Fly secrets. `--check` renders the same readiness evidence strictly
   read-only; `--legacy-checklist` prints the manual `fly secrets set`
   checklist; `--profile <name>` selects an alternate onboarding profile.
-- `init` detects the GitHub origin/default branch and package scripts, writes
+- `init` uses the selected onboarding profile (defaulting to `default`) when
+  supervisor environment credentials are absent. It detects the GitHub
+  origin/default branch and package scripts, writes
   `.openthrottle.yml`, registers the repository for either Linear-team or
   GitHub-Issue control with the deployed supervisor, creates or refreshes the
   repository webhook, and verifies GitHub/Daytona readiness. Linear control

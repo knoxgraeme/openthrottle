@@ -218,6 +218,7 @@ function harness(overrides: Partial<SetupCommandOptions> = {}, confirmResult: bo
   const hosting = new FakeHosting();
   const profileStore = new MemoryProfileStore();
   const secretStore = new MemorySecretStore();
+  secretStore.values.set("default:status_token", "operator-token");
   const catalogDeps: DefaultCatalogDeps[] = [];
   const { output, confirms, prompts } = recordingPrompts(confirmResult);
   const options: SetupCommandOptions = {
@@ -427,6 +428,10 @@ describe("setup full run", () => {
       fly_region: "sjc",
       daytona_snapshot: "openthrottle-test-snap",
     });
+    expect(saved).not.toHaveProperty("supervisor");
+    expect(h.secretStore.values.get("default:supervisor_url")).toBe(
+      "https://openthrottle-supervisor.fly.dev"
+    );
     // Documented defaults reached the adapters through the catalog deps.
     expect(h.catalogDeps[0]?.hosting).toEqual({ app: "openthrottle-supervisor", org: "personal", region: "sjc" });
   });
@@ -507,7 +512,7 @@ describe("setup full run", () => {
     expect(allOutput(h)).toContain("profile store is corrupt");
   });
 
-  it("never surfaces a stored secret value in any output or persisted profile", async () => {
+  it("keeps generated supervisor secrets out of the onboarding profile", async () => {
     const secretRoot = temporaryDirectory();
     const profileRoot = temporaryDirectory();
     const secretStore = new LocalFileSecretStore({ root: secretRoot, allowedKeys: LOCAL_SECRET_KEYS, env: {} });
@@ -523,8 +528,29 @@ describe("setup full run", () => {
     expect(text).not.toContain("SENTINEL_INSTALL_SECRET_VALUE");
     expect(text).toContain(join(secretRoot, "default.json"));
     const profileJson = readFileSync(join(profileRoot, "default.json"), "utf8");
-    expect(profileJson).not.toContain("SENTINEL");
+    expect(profileJson).not.toContain("SENTINEL_STATUS_TOKEN_VALUE");
+    expect(profileJson).not.toContain("SENTINEL_INSTALL_SECRET_VALUE");
     expect(profileJson).toContain("daytona_snapshot");
+    await expect(secretStore.get("default", "supervisor_url")).resolves.toBe(
+      "https://openthrottle-supervisor.fly.dev"
+    );
+  });
+
+  it("persists resource pins before reporting a missing local status token", async () => {
+    const h = harness();
+    h.secretStore.values.delete("default:status_token");
+
+    await setup([], h.options);
+
+    expect(process.exitCode).toBe(1);
+    expect(allOutput(h)).toContain("without a local supervisor status token");
+    expect((await h.profileStore.load("default"))?.resources).toMatchObject({
+      fly_app: "openthrottle-supervisor",
+      fly_org: "personal",
+      fly_region: "sjc",
+      daytona_snapshot: "openthrottle-test-snap",
+    });
+    expect(h.secretStore.values.has("default:supervisor_url")).toBe(false);
   });
 });
 

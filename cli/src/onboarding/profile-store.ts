@@ -80,7 +80,15 @@ export function validateProfile(value: unknown, expectedName?: string): Onboardi
     throw new Error("profile must be a JSON object");
   }
   const input = value as Record<string, unknown>;
-  const allowed = new Set(["schema", "name", "providers", "release", "resources", "evidence", "updatedAt"]);
+  const allowed = new Set([
+    "schema",
+    "name",
+    "providers",
+    "release",
+    "resources",
+    "evidence",
+    "updatedAt",
+  ]);
   const unknown = Object.keys(input).find((key) => !allowed.has(key));
   if (unknown) throw new Error(`profile has unknown field ${unknown}`);
   if (input.schema !== PROFILE_SCHEMA) throw new Error("unsupported profile schema");

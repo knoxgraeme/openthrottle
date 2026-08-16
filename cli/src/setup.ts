@@ -20,7 +20,11 @@ import type {
 import { isReadyEvidence } from "./onboarding/contracts.js";
 import { SetupOrchestrator } from "./onboarding/orchestrator.js";
 import type { ProviderCatalogs } from "./onboarding/provider-catalog.js";
-import { FileProfileStore, withResources, type ProfileStore } from "./onboarding/profile-store.js";
+import {
+  FileProfileStore,
+  withResources,
+  type ProfileStore,
+} from "./onboarding/profile-store.js";
 import {
   createDefaultCatalogs,
   DEFAULT_HOSTING_PROVIDER_ID,
@@ -37,11 +41,12 @@ import { loadReleaseManifest, type ReleaseManifestLoadResult } from "./onboardin
 import { LocalFileSecretStore } from "./onboarding/secret-store.js";
 import { getErrorMessage, printTable } from "./util.js";
 
-// Only orchestrator-generated supervisor secrets may land in the local store.
+// Only supervisor access values and orchestrator-generated secrets may land in the local store.
 // Operator third-party credentials (GitHub PATs, the Daytona API key, Linear
 // OAuth credentials) are NEVER written locally — they are set as Fly secrets
 // by the operator and only their names ever appear in evidence.
 export const LOCAL_SECRET_KEYS = [
+  "supervisor_url",
   "status_token",
   "deploy_token",
   "install_secret",
@@ -432,9 +437,12 @@ async function runGuidedSetup(
     },
     now()
   );
-  await profileStore.save(pinned);
-
   const supervisorUrl = `https://${hostingConfig.app}.fly.dev`;
+  await profileStore.save(pinned);
+  const statusToken = cleanEnv(await secretStore.get(args.profile, "status_token"));
+  if (!statusToken) throw new Error("setup completed without a local supervisor status token");
+  await secretStore.set(args.profile, "supervisor_url", supervisorUrl);
+
   prompts.log.success(`Supervisor ready at ${supervisorUrl}`);
   prompts.log.info(
     `Generated supervisor secrets (including the status token) are stored in ` +

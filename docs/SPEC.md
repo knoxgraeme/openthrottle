@@ -1366,7 +1366,9 @@ renders the same preflight/inspect evidence strictly read-only,
 `--profile <name>` selects the onboarding profile, and `--legacy-checklist`
 prints the manual `fly secrets set` checklist generated from the same table
 that mirrors the supervisor env authority (deploy-owned `PORT` and
-`DATABASE_PATH` excluded). `openthrottle init` detects the GitHub
+`DATABASE_PATH` excluded). `openthrottle init --profile <name>` selects that
+profile's local secret-store supervisor access (defaulting to the `default`
+profile), then detects the GitHub
 origin/default branch,
 writes `.openthrottle.yml`, and idempotently registers either a Linear-team or
 GitHub-Issue control route plus the GitHub webhook. The registration body uses
