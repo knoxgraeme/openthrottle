@@ -955,6 +955,85 @@ intents:
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(1);
   });
 
+  it("seals the current assignment plan when prior optional history contains a stale plan", async () => {
+    const currentPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    currentPlan.graph_id = "structured";
+    currentPlan.plan_id = "current-assignment-plan";
+    const stalePlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
+    stalePlan.graph_id = "structured";
+    stalePlan.plan_id = "stale-history-plan";
+    const currentSelection = [
+      "```json openthrottle.execution-plan/v2",
+      JSON.stringify(currentPlan, null, 2),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const staleSelection = [
+      "```json openthrottle.execution-plan/v2",
+      JSON.stringify(stalePlan, null, 2),
+      "```",
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "simple" }, null, 2),
+      "```",
+    ].join("\n");
+    const context = [
+      `<issue identifier="OT-1">`,
+      `<title>Retry after a prior run</title>`,
+      `<description>${currentSelection}</description>`,
+      `</issue>`,
+      `<other-thread comment-id="prior-run">`,
+      `<comment>Prior supervisor receipt. ${staleSelection}</comment>`,
+      `</other-thread>`,
+    ].join("\n");
+
+    const { pipelines } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@2
+pipelines: { implement: implement }
+intents:
+  implement:
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`,
+      {},
+      shippedCatalogPath,
+      payload("session-1", "issue-1", "OT-1", context),
+      {},
+      {
+        capabilities: [
+          ...buildInstalledRuntimeDescriptor("assignment-history-structured-test/v1").descriptor.capabilities,
+          "accept-unit@1",
+          "ce/simplify@1",
+          "graph/for-each-unit@1",
+        ],
+      }
+    );
+
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const request = pipelines.getStageRequest(pipelines.getActiveAttempt(instance.id)!.id);
+    expect(instance).toMatchObject({
+      pipeline_id: "builtin/structured",
+      pipeline_version: 2,
+    });
+    expect(request.taskContext).toContain("Prior supervisor receipt.");
+    expect(request.taskContext).toContain("stale-history-plan");
+    const artifact = request.inputArtifacts?.find((entry) => entry.kind === "stage_result");
+    expect(artifact).toBeDefined();
+    const sealed = JSON.parse(artifact!.payload) as { execution_plan: Record<string, unknown> };
+    expect(sealed.execution_plan.plan_id).toBe("current-assignment-plan");
+    expect(sealed.execution_plan.plan_id).not.toBe("stale-history-plan");
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(1);
+  });
+
   it("admits prompted Linear context with non-authoritative issue relations", async () => {
     const context = [
       `<issue identifier="OT-1">`,

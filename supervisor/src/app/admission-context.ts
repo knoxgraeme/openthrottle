@@ -71,9 +71,9 @@ function truncateUtf8(value: string, maxBytes: number): string {
 }
 
 function invalidLinearContextShapeMessage(): string {
-  return "Linear prompt context has an invalid top-level section structure. Expected either exactly one issue " +
-    "for an assignment-created delegation, or exactly one issue followed by exactly one primary directive, " +
-    "then an optional parent issue and comment threads. No sandbox was provisioned.";
+  return "Linear prompt context has an invalid top-level section structure. Expected exactly one issue, " +
+    "optionally followed by exactly one primary directive, then an optional parent issue and comment threads. " +
+    "No sandbox was provisioned.";
 }
 
 function issueIdentifierMismatchMessage(): string {
@@ -174,22 +174,18 @@ function contextSectionsOf(sections: ContextSection[], kind: ContextSectionKind)
 }
 
 function hasCanonicalLinearContextShape(sections: ContextSection[]): boolean {
-  if (sections.length === 1) {
-    return sections[0]?.kind === "issue";
-  }
-  if (sections.length < 2 ||
-      sections[0]?.kind !== "issue" ||
-      sections[1]?.kind !== "primary-directive-thread") {
+  if (sections.length === 0 || sections[0]?.kind !== "issue") {
     return false;
   }
   if (contextSectionsOf(sections, "issue").length !== 1 ||
-      contextSectionsOf(sections, "primary-directive-thread").length !== 1) {
+      contextSectionsOf(sections, "primary-directive-thread").length > 1) {
     return false;
   }
 
+  const optionalSectionsStart = sections[1]?.kind === "primary-directive-thread" ? 2 : 1;
   let parentCount = 0;
   let sawOtherThread = false;
-  for (const section of sections.slice(2)) {
+  for (const section of sections.slice(optionalSectionsStart)) {
     if (section.kind === "parent-issue") {
       parentCount += 1;
       if (parentCount > 1 || sawOtherThread) return false;
