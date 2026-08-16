@@ -21,10 +21,13 @@ import {
   type GraphContract,
 } from "@openthrottle/contracts";
 import { parse, stringify } from "yaml";
-import type { ProfileSecretStore } from "./onboarding/contracts.js";
 import { SUPERVISOR_SECRET_CHECKLIST } from "./setup.js";
 import { assertProfileName } from "./onboarding/profile-store.js";
-import { LocalFileSecretStore } from "./onboarding/secret-store.js";
+import {
+  defaultSupervisorAccessRoot,
+  LocalSupervisorAccessStore,
+  type SupervisorAccessReader,
+} from "./onboarding/supervisor-access-store.js";
 import { getErrorMessage, readEnv, supervisorRequest } from "./util.js";
 
 interface PackageJson {
@@ -89,7 +92,7 @@ export interface InitCommandOptions {
   promptConfig?: typeof promptConfig;
   registerTargetRepository?: typeof registerTargetRepository;
   reportPreflightFailure?: (message: string) => void;
-  secretStore?: ProfileSecretStore;
+  supervisorAccessStore?: SupervisorAccessReader;
 }
 
 type InitPromptApi = Pick<typeof p, "group" | "select" | "text">;
@@ -934,13 +937,21 @@ export function writeProjectConfig(
   writeFileSync(join(directory, ".openthrottle.yml"), renderProjectConfig(config));
 }
 
+export type RepositoryWebhookAction = "created" | "updated" | "unchanged";
+
+export interface RepositoryRegistrationResult {
+  registration: { github_repo: string; base_branch: string };
+  readiness: {
+    github: "ready";
+    webhook: RepositoryWebhookAction;
+    snapshot: { name: string; state: string };
+  };
+}
+
 export async function registerTargetRepository(
   input: RepositoryRegistrationInput,
   request: typeof supervisorRequest = supervisorRequest
-): Promise<{
-  registration: { github_repo: string; base_branch: string };
-  readiness: { webhook: string; snapshot: { name: string; state: string } };
-}> {
+): Promise<RepositoryRegistrationResult> {
   const response = await request("/repositories/register", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -959,10 +970,7 @@ export async function registerTargetRepository(
   return body;
 }
 
-function isRepositoryRegistrationResult(value: unknown): value is {
-  registration: { github_repo: string; base_branch: string };
-  readiness: { webhook: string; snapshot: { name: string; state: string } };
-} {
+function isRepositoryRegistrationResult(value: unknown): value is RepositoryRegistrationResult {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const input = value as Record<string, unknown>;
   if (!input.registration || typeof input.registration !== "object" || Array.isArray(input.registration)) return false;
@@ -973,7 +981,8 @@ function isRepositoryRegistrationResult(value: unknown): value is {
   const snapshot = readiness.snapshot as Record<string, unknown>;
   return typeof registration.github_repo === "string" &&
     typeof registration.base_branch === "string" &&
-    typeof readiness.webhook === "string" &&
+    readiness.github === "ready" &&
+    (readiness.webhook === "created" || readiness.webhook === "updated" || readiness.webhook === "unchanged") &&
     typeof snapshot.name === "string" &&
     typeof snapshot.state === "string";
 }
@@ -1000,9 +1009,26 @@ function supervisorCredentialName(checklistName: "SUPERVISOR_URL" | "OT_STATUS_T
   return checklistName === "SUPERVISOR_URL" ? `OT_${entry.name}` : entry.name;
 }
 
+function isHealthResponse(value: unknown): value is { ok: true } {
+  return !!value && typeof value === "object" && !Array.isArray(value) &&
+    (value as Record<string, unknown>).ok === true;
+}
+
+function isCapabilitiesResponse(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const input = value as Record<string, unknown>;
+  if (typeof input.release !== "string" || !input.release.trim()) return false;
+  if (typeof input.capabilityDigest !== "string" || !SHA256_DIGEST.test(input.capabilityDigest)) return false;
+  if (!Array.isArray(input.capabilities) ||
+    input.capabilities.some((capability) => typeof capability !== "string" || !capability.trim())) return false;
+  if (!input.limits || typeof input.limits !== "object" || Array.isArray(input.limits)) return false;
+  const timeout = (input.limits as Record<string, unknown>).taskTimeoutSeconds;
+  return typeof timeout === "number" && Number.isSafeInteger(timeout) && timeout >= 1;
+}
+
 const SUPERVISOR_PREFLIGHT_CHECKS = [
-  ["/healthz", "health"],
-  ["/capabilities", "capabilities"],
+  { path: "/healthz", label: "health", validate: isHealthResponse },
+  { path: "/capabilities", label: "capabilities", validate: isCapabilitiesResponse },
 ] as const;
 
 function unreachableSupervisor(message: string): SupervisorPreflightFailure {
@@ -1014,23 +1040,20 @@ function unreachableSupervisor(message: string): SupervisorPreflightFailure {
 
 async function resolveSupervisorEnv(
   env: Record<string, string | undefined>,
-  secretStore: ProfileSecretStore,
+  accessStore: SupervisorAccessReader,
   profileName: string
 ): Promise<Record<string, string | undefined>> {
   const supervisorUrl = env.OT_SUPERVISOR_URL?.trim();
   const statusToken = env.OT_STATUS_TOKEN?.trim();
-  if (supervisorUrl && statusToken) return env;
+  // Any explicit value blocks stored fallback, so partial pairs fail closed.
   if (supervisorUrl || statusToken) return env;
 
-  const [storedSupervisorUrl, storedStatusToken] = await Promise.all([
-    secretStore.get(profileName, "supervisor_url"),
-    secretStore.get(profileName, "status_token"),
-  ]);
-  if (!storedSupervisorUrl?.trim() || !storedStatusToken?.trim()) return env;
+  const access = await accessStore.load(profileName);
+  if (!access) return env;
   return {
     ...env,
-    OT_SUPERVISOR_URL: storedSupervisorUrl.trim(),
-    OT_STATUS_TOKEN: storedStatusToken.trim(),
+    OT_SUPERVISOR_URL: access.supervisorUrl,
+    OT_STATUS_TOKEN: access.statusToken,
   };
 }
 
@@ -1073,7 +1096,7 @@ export async function preflightSupervisor(
   }
 
   try {
-    for (const [path, label] of SUPERVISOR_PREFLIGHT_CHECKS) {
+    for (const { path, label, validate } of SUPERVISOR_PREFLIGHT_CHECKS) {
       const response = await request(path);
       if (response.status === 401) {
         return {
@@ -1084,6 +1107,13 @@ export async function preflightSupervisor(
       if (!response.ok) {
         return unreachableSupervisor(`Supervisor ${label} check failed with HTTP ${response.status}.`);
       }
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        return unreachableSupervisor(`Supervisor returned an invalid ${label} response.`);
+      }
+      if (!validate(body)) return unreachableSupervisor(`Supervisor returned an invalid ${label} response.`);
     }
     return { status: "ready" };
   } catch (error) {
@@ -1102,11 +1132,22 @@ export default async function init(args: string[] = [], options: InitCommandOpti
   }
   p.intro("openthrottle init");
   const env = options.env ?? process.env;
-  const secretStore = options.secretStore ?? new LocalFileSecretStore({
-    allowedKeys: ["supervisor_url", "status_token"],
-    env,
-  });
-  const resolvedEnv = await resolveSupervisorEnv(env, secretStore, profile);
+  const accessStore = options.supervisorAccessStore ??
+    new LocalSupervisorAccessStore(defaultSupervisorAccessRoot(env));
+  let resolvedEnv: Record<string, string | undefined>;
+  try {
+    resolvedEnv = await resolveSupervisorEnv(env, accessStore, profile);
+  } catch (error) {
+    const setupCommand = profile === "default"
+      ? "openthrottle setup"
+      : `openthrottle setup --profile ${profile}`;
+    (options.reportPreflightFailure ?? ((message) => p.log.error(message)))(
+      `Stored supervisor access for profile ${profile} is invalid (${getErrorMessage(error)}). ` +
+        `Fix or remove that access document, then run \`${setupCommand}\`.`
+    );
+    process.exitCode = 1;
+    return;
+  }
   const request = options.request ?? ((path, requestInit) => supervisorRequest(path, requestInit, resolvedEnv));
   const preflight = await preflightSupervisor(request, resolvedEnv);
   if (preflight.status !== "ready") {

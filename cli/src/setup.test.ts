@@ -24,6 +24,11 @@ import {
 import type { DefaultCatalogDeps } from "./onboarding/providers/index.js";
 import type { ReleaseManifestLoadResult } from "./onboarding/release-manifest.js";
 import { LocalFileSecretStore } from "./onboarding/secret-store.js";
+import {
+  LocalSupervisorAccessStore,
+  type SupervisorAccess,
+  type SupervisorAccessStore,
+} from "./onboarding/supervisor-access-store.js";
 import setup, {
   fallbackSecretLines,
   LOCAL_SECRET_KEYS,
@@ -80,6 +85,22 @@ class MemorySecretStore {
 
   pathFor(profileName: string): string {
     return `/home/test/.openthrottle/secrets/${profileName}.json`;
+  }
+}
+
+class MemorySupervisorAccessStore implements SupervisorAccessStore {
+  values = new Map<string, SupervisorAccess>();
+
+  async load(profileName: string): Promise<SupervisorAccess | undefined> {
+    return this.values.get(profileName);
+  }
+
+  async save(profileName: string, access: SupervisorAccess): Promise<void> {
+    this.values.set(profileName, access);
+  }
+
+  pathFor(profileName: string): string {
+    return `/home/test/.openthrottle/supervisor-access/${profileName}.json`;
   }
 }
 
@@ -207,6 +228,7 @@ interface Harness {
   hosting: FakeHosting;
   profileStore: ProfileStore;
   secretStore: MemorySecretStore;
+  supervisorAccessStore: MemorySupervisorAccessStore;
   catalogDeps: DefaultCatalogDeps[];
   options: SetupCommandOptions;
   output: string[];
@@ -218,6 +240,7 @@ function harness(overrides: Partial<SetupCommandOptions> = {}, confirmResult: bo
   const hosting = new FakeHosting();
   const profileStore = new MemoryProfileStore();
   const secretStore = new MemorySecretStore();
+  const supervisorAccessStore = new MemorySupervisorAccessStore();
   secretStore.values.set("default:status_token", "operator-token");
   const catalogDeps: DefaultCatalogDeps[] = [];
   const { output, confirms, prompts } = recordingPrompts(confirmResult);
@@ -225,6 +248,7 @@ function harness(overrides: Partial<SetupCommandOptions> = {}, confirmResult: bo
     loadManifest: pinnedManifest,
     profileStore,
     secretStore,
+    supervisorAccessStore,
     env: {},
     prompts,
     now: () => new Date("2026-08-14T00:00:00.000Z"),
@@ -234,7 +258,17 @@ function harness(overrides: Partial<SetupCommandOptions> = {}, confirmResult: bo
     },
     ...overrides,
   };
-  return { runtime, hosting, profileStore, secretStore, catalogDeps, options, output, confirms };
+  return {
+    runtime,
+    hosting,
+    profileStore,
+    secretStore,
+    supervisorAccessStore,
+    catalogDeps,
+    options,
+    output,
+    confirms,
+  };
 }
 
 const directories: string[] = [];
@@ -417,6 +451,7 @@ describe("setup full run", () => {
     expect(text).toContain("/oauth/install");
     expect(text).toContain("openthrottle init");
     expect(text).toContain(h.secretStore.pathFor("default"));
+    expect(text).toContain(h.supervisorAccessStore.pathFor("default"));
     const table = logged.join("\n");
     expect(table).toContain("hosting");
     expect(table).toContain("ready");
@@ -429,9 +464,11 @@ describe("setup full run", () => {
       daytona_snapshot: "openthrottle-test-snap",
     });
     expect(saved).not.toHaveProperty("supervisor");
-    expect(h.secretStore.values.get("default:supervisor_url")).toBe(
-      "https://openthrottle-supervisor.fly.dev"
-    );
+    expect(h.secretStore.values.has("default:supervisor_url")).toBe(false);
+    expect(h.supervisorAccessStore.values.get("default")).toEqual({
+      supervisorUrl: "https://openthrottle-supervisor.fly.dev",
+      statusToken: "operator-token",
+    });
     // Documented defaults reached the adapters through the catalog deps.
     expect(h.catalogDeps[0]?.hosting).toEqual({ app: "openthrottle-supervisor", org: "personal", region: "sjc" });
   });
@@ -514,26 +551,33 @@ describe("setup full run", () => {
 
   it("keeps generated supervisor secrets out of the onboarding profile", async () => {
     const secretRoot = temporaryDirectory();
+    const accessRoot = temporaryDirectory();
     const profileRoot = temporaryDirectory();
     const secretStore = new LocalFileSecretStore({ root: secretRoot, allowedKeys: LOCAL_SECRET_KEYS, env: {} });
+    const supervisorAccessStore = new LocalSupervisorAccessStore(accessRoot);
     await secretStore.set("default", "status_token", "SENTINEL_STATUS_TOKEN_VALUE");
     await secretStore.set("default", "install_secret", "SENTINEL_INSTALL_SECRET_VALUE");
+    const secretPath = secretStore.pathFor("default");
+    const originalSecretDocument = readFileSync(secretPath, "utf8");
     const profileStore = new FileProfileStore(profileRoot);
-    const h = harness({ secretStore, profileStore });
+    const h = harness({ secretStore, supervisorAccessStore, profileStore });
     await setup(["--yes"], h.options);
 
     expect(process.exitCode ?? 0).toBe(0);
     const text = allOutput(h);
     expect(text).not.toContain("SENTINEL_STATUS_TOKEN_VALUE");
     expect(text).not.toContain("SENTINEL_INSTALL_SECRET_VALUE");
-    expect(text).toContain(join(secretRoot, "default.json"));
+    expect(text).toContain(secretPath);
     const profileJson = readFileSync(join(profileRoot, "default.json"), "utf8");
     expect(profileJson).not.toContain("SENTINEL_STATUS_TOKEN_VALUE");
     expect(profileJson).not.toContain("SENTINEL_INSTALL_SECRET_VALUE");
     expect(profileJson).toContain("daytona_snapshot");
-    await expect(secretStore.get("default", "supervisor_url")).resolves.toBe(
-      "https://openthrottle-supervisor.fly.dev"
-    );
+    expect(readFileSync(secretPath, "utf8")).toBe(originalSecretDocument);
+    expect(originalSecretDocument).not.toContain("supervisor_url");
+    await expect(supervisorAccessStore.load("default")).resolves.toEqual({
+      supervisorUrl: "https://openthrottle-supervisor.fly.dev",
+      statusToken: "SENTINEL_STATUS_TOKEN_VALUE",
+    });
   });
 
   it("persists resource pins before reporting a missing local status token", async () => {
@@ -551,6 +595,19 @@ describe("setup full run", () => {
       daytona_snapshot: "openthrottle-test-snap",
     });
     expect(h.secretStore.values.has("default:supervisor_url")).toBe(false);
+    expect(h.supervisorAccessStore.values.has("default")).toBe(false);
+  });
+
+  it("prints matching init guidance for a named setup profile", async () => {
+    const h = harness();
+    h.secretStore.values.set("prod:status_token", "prod-token");
+
+    await setup(["--profile", "prod"], h.options);
+
+    expect(allOutput(h)).toContain("openthrottle init --profile prod");
+    expect(h.supervisorAccessStore.values.get("prod")).toMatchObject({
+      statusToken: "prod-token",
+    });
   });
 });
 

@@ -39,14 +39,18 @@ import {
 import { resolveDaytonaSnapshotName } from "./onboarding/providers/daytona/runtime-adapter.js";
 import { loadReleaseManifest, type ReleaseManifestLoadResult } from "./onboarding/release-manifest.js";
 import { LocalFileSecretStore } from "./onboarding/secret-store.js";
+import {
+  defaultSupervisorAccessRoot,
+  LocalSupervisorAccessStore,
+  type SupervisorAccessStore,
+} from "./onboarding/supervisor-access-store.js";
 import { getErrorMessage, printTable } from "./util.js";
 
-// Only supervisor access values and orchestrator-generated secrets may land in the local store.
+// Only orchestrator-generated secrets may land in the legacy local store.
 // Operator third-party credentials (GitHub PATs, the Daytona API key, Linear
 // OAuth credentials) are NEVER written locally — they are set as Fly secrets
 // by the operator and only their names ever appear in evidence.
 export const LOCAL_SECRET_KEYS = [
-  "supervisor_url",
   "status_token",
   "deploy_token",
   "install_secret",
@@ -195,6 +199,7 @@ export interface SetupCommandOptions {
   loadManifest?: () => ReleaseManifestLoadResult;
   profileStore?: ProfileStore;
   secretStore?: ProfileSecretStore & { pathFor(profileName: string): string };
+  supervisorAccessStore?: SupervisorAccessStore;
   createCatalogs?: (deps: DefaultCatalogDeps) => ProviderCatalogs;
   env?: Record<string, string | undefined>;
   prompts?: SetupPromptApi;
@@ -348,6 +353,8 @@ async function runGuidedSetup(
   const now = options.now ?? (() => new Date());
   const profileStore = options.profileStore ?? new FileProfileStore();
   const secretStore = options.secretStore ?? new LocalFileSecretStore({ allowedKeys: LOCAL_SECRET_KEYS, env });
+  const supervisorAccessStore = options.supervisorAccessStore ??
+    new LocalSupervisorAccessStore(defaultSupervisorAccessRoot(env));
 
   const existingProfile = await profileStore.load(args.profile);
   const hostingProviderId = existingProfile?.providers.hosting ?? DEFAULT_HOSTING_PROVIDER_ID;
@@ -441,7 +448,7 @@ async function runGuidedSetup(
   await profileStore.save(pinned);
   const statusToken = cleanEnv(await secretStore.get(args.profile, "status_token"));
   if (!statusToken) throw new Error("setup completed without a local supervisor status token");
-  await secretStore.set(args.profile, "supervisor_url", supervisorUrl);
+  await supervisorAccessStore.save(args.profile, { supervisorUrl, statusToken });
 
   prompts.log.success(`Supervisor ready at ${supervisorUrl}`);
   prompts.log.info(
@@ -449,13 +456,20 @@ async function runGuidedSetup(
       `${secretStore.pathFor(args.profile)}; values are never printed.`
   );
   prompts.log.info(
+    `Repository setup access is stored in ${supervisorAccessStore.pathFor(args.profile)} ` +
+      "with owner-only permissions."
+  );
+  const initCommand = args.profile === "default"
+    ? "openthrottle init"
+    : `openthrottle init --profile ${args.profile}`;
+  prompts.log.info(
     [
       "Next steps:",
       "  1. Using Linear control? Create the Linear OAuth agent app, then set",
       "     LINEAR_CLIENT_ID and LINEAR_CLIENT_SECRET as Fly secrets on the app.",
       `  2. Install the Linear OAuth app via ${supervisorUrl}/oauth/install`,
       "     (authorized with the install secret from the local store above).",
-      "  3. Run `openthrottle init` in each target repository to register it.",
+      `  3. Run \`${initCommand}\` in each target repository to register it.`,
       ...result.actions.map((action) => `  - ${action}`),
     ].join("\n")
   );

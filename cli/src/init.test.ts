@@ -32,7 +32,12 @@ import init, {
   type InitCommandOptions,
   type ProjectConfig,
 } from "./init.js";
-import type { ProfileSecretStore } from "./onboarding/contracts.js";
+import { LocalFileSecretStore } from "./onboarding/secret-store.js";
+import {
+  LocalSupervisorAccessStore,
+  type SupervisorAccessStore,
+} from "./onboarding/supervisor-access-store.js";
+import { LOCAL_SECRET_KEYS } from "./setup.js";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -115,14 +120,22 @@ const configuredSupervisorEnv = {
   OT_STATUS_TOKEN: "operator-token",
 } as const;
 
-function memorySecretStore(values: Record<string, string> = {}): ProfileSecretStore {
+function memorySupervisorAccessStore(
+  values: Record<string, { supervisorUrl: string; statusToken: string }> = {}
+): SupervisorAccessStore {
   return {
-    get: async (profileName, key) => values[`${profileName}:${key}`],
-    set: async (profileName, key, value) => {
-      values[`${profileName}:${key}`] = value;
-    },
+    load: async (profileName) => values[profileName],
+    save: async (profileName, access) => { values[profileName] = access; },
+    pathFor: (profileName) => `/home/test/.openthrottle/supervisor-access/${profileName}.json`,
   };
 }
+
+const validCapabilities = {
+  release: "test-release",
+  capabilityDigest: "a".repeat(64),
+  capabilities: ["agent/semantic@1"],
+  limits: { taskTimeoutSeconds: 7200 },
+};
 
 function initPreflightHarness(
   env: Record<string, string | undefined>,
@@ -136,7 +149,7 @@ function initPreflightHarness(
   const options: InitCommandOptions = {
     env,
     request,
-    secretStore: memorySecretStore(),
+    supervisorAccessStore: memorySupervisorAccessStore(),
     detectRepository: () => {
       markDownstreamCall();
       return { repo: "acme/widget" };
@@ -165,7 +178,7 @@ function recordSupervisorRequests(): Array<{ url: string; authorization: string 
       url: String(input),
       authorization: new Headers(requestInit?.headers).get("Authorization"),
     });
-    return Response.json({ ok: true });
+    return Response.json(String(input).endsWith("/capabilities") ? validCapabilities : { ok: true });
   });
   return requests;
 }
@@ -210,7 +223,7 @@ async function runInitWithSnapshotState(state: string) {
     const { default: initWithMockPrompts } = await import("./init.js");
     await initWithMockPrompts([], {
       env: configuredSupervisorEnv,
-      request: async () => Response.json({ ok: true }),
+      request: async (path) => Response.json(path === "/capabilities" ? validCapabilities : { ok: true }),
       detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
       detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
       promptConfig: async () => ({
@@ -224,6 +237,7 @@ async function runInitWithSnapshotState(state: string) {
       registerTargetRepository: async () => ({
         registration: { github_repo: "acme/widget", base_branch: "main" },
         readiness: {
+          github: "ready",
           webhook: "created",
           snapshot: { name: "openthrottle", state },
         },
@@ -527,6 +541,7 @@ describe("init project detection", () => {
       return Response.json({
         registration: { github_repo: "acme/widget", base_branch: "develop" },
         readiness: {
+          github: "ready",
           webhook: "created",
           snapshot: { name: "openthrottle", state: "active" },
         },
@@ -555,6 +570,7 @@ describe("init project detection", () => {
       return Response.json({
         registration: { github_repo: "acme/widget", base_branch: "main" },
         readiness: {
+          github: "ready",
           webhook: "created",
           snapshot: { name: "openthrottle", state: "active" },
         },
@@ -574,6 +590,24 @@ describe("init project detection", () => {
       registration: { github_repo: "acme/widget", base_branch: "main" },
       readiness: {},
     }))).rejects.toThrow("invalid repository registration response");
+  });
+
+  it("rejects registration responses without ready GitHub and known webhook evidence", async () => {
+    for (const readiness of [
+      { github: "error", webhook: "created" },
+      { github: "ready", webhook: "installed" },
+    ]) {
+      await expect(registerTargetRepository({
+        repo: "acme/widget",
+        controlProvider: "github",
+      }, async () => Response.json({
+        registration: { github_repo: "acme/widget", base_branch: "main" },
+        readiness: {
+          ...readiness,
+          snapshot: { name: "openthrottle", state: "active" },
+        },
+      }))).rejects.toThrow("invalid repository registration response");
+    }
   });
 
   it("fails init with setup guidance when registration reports a not-ready snapshot", async () => {
@@ -1039,14 +1073,16 @@ describe("init project detection", () => {
     ]);
   });
 
-  it("uses default-profile secret-store access when init has no exported credentials", async () => {
+  it("uses default-profile supervisor access when init has no exported credentials", async () => {
     const requests = recordSupervisorRequests();
 
     await expect(init([], {
       env: {},
-      secretStore: memorySecretStore({
-        "default:supervisor_url": "https://profile-supervisor.test",
-        "default:status_token": "profile-token",
+      supervisorAccessStore: memorySupervisorAccessStore({
+        default: {
+          supervisorUrl: "https://profile-supervisor.test",
+          statusToken: "profile-token",
+        },
       }),
       detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
       detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
@@ -1062,18 +1098,51 @@ describe("init project detection", () => {
     expect(process.exitCode).toBeUndefined();
   });
 
+  it("ignores a complete legacy secret document when loading separate supervisor access", async () => {
+    const secretRoot = temporaryProject();
+    const accessRoot = temporaryProject();
+    const legacyStore = new LocalFileSecretStore({ root: secretRoot, allowedKeys: LOCAL_SECRET_KEYS, env: {} });
+    for (const [key, value] of [
+      ["status_token", "legacy-token"],
+      ["deploy_token", "deploy-token"],
+      ["install_secret", "install-secret"],
+      ["linear_webhook_secret", "linear-secret"],
+      ["github_webhook_secret", "github-secret"],
+    ] as const) {
+      await legacyStore.set("default", key, value);
+    }
+    const legacyBefore = readFileSync(legacyStore.pathFor("default"), "utf8");
+    const accessStore = new LocalSupervisorAccessStore(accessRoot);
+    await accessStore.save("default", {
+      supervisorUrl: "https://profile-supervisor.test",
+      statusToken: "access-token",
+    });
+    const requests = recordSupervisorRequests();
+
+    await expect(init([], {
+      env: {},
+      supervisorAccessStore: accessStore,
+      detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
+      detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
+      promptConfig: async () => { throw new Error("questionnaire reached"); },
+    })).rejects.toThrow("questionnaire reached");
+
+    expect(requests[0]?.authorization).toBe("Bearer access-token");
+    expect(readFileSync(legacyStore.pathFor("default"), "utf8")).toBe(legacyBefore);
+    expect(legacyBefore).not.toContain("supervisor_url");
+  });
+
   it("prefers explicit supervisor env vars over stored profile access", async () => {
     let secretLoads = 0;
     const requests = recordSupervisorRequests();
 
     await expect(init([], {
       env: configuredSupervisorEnv,
-      secretStore: {
-        get: async () => {
+      supervisorAccessStore: {
+        load: async () => {
           secretLoads += 1;
-          return "profile-token";
+          return { supervisorUrl: "https://stored.test", statusToken: "profile-token" };
         },
-        set: async () => undefined,
       },
       detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
       detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
@@ -1089,14 +1158,16 @@ describe("init project detection", () => {
     ]);
   });
 
-  it("selects a named profile and its matching secret-store entry", async () => {
+  it("selects a named profile and its matching supervisor-access entry", async () => {
     const requests = recordSupervisorRequests();
 
     await expect(init(["--profile", "prod"], {
       env: {},
-      secretStore: memorySecretStore({
-        "prod:supervisor_url": "https://prod-supervisor.test",
-        "prod:status_token": "prod-token",
+      supervisorAccessStore: memorySupervisorAccessStore({
+        prod: {
+          supervisorUrl: "https://prod-supervisor.test",
+          statusToken: "prod-token",
+        },
       }),
       detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
       detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
@@ -1120,12 +1191,11 @@ describe("init project detection", () => {
       const harness = initPreflightHarness(env, async () => {
         throw new Error("partial credentials must not make a request");
       });
-      harness.options.secretStore = {
-        get: async () => {
+      harness.options.supervisorAccessStore = {
+        load: async () => {
           secretLoads += 1;
-          return "profile-token";
+          return { supervisorUrl: "https://stored.test", statusToken: "profile-token" };
         },
-        set: async () => undefined,
       };
 
       await init([], harness.options);
@@ -1135,6 +1205,25 @@ describe("init project detection", () => {
       expect(harness.downstreamCalls()).toBe(0);
       process.exitCode = undefined;
     }
+  });
+
+  it("reports an invalid stored access document without a stack trace or downstream work", async () => {
+    const harness = initPreflightHarness({}, async () => {
+      throw new Error("invalid access must not make a request");
+    });
+    harness.options.supervisorAccessStore = {
+      load: async () => { throw new Error("refusing to read supervisor access document"); },
+    };
+
+    await init(["--profile", "prod"], harness.options);
+
+    expect(process.exitCode).toBe(1);
+    expect(harness.downstreamCalls()).toBe(0);
+    expect(harness.messages).toEqual([
+      expect.stringMatching(
+        /Stored supervisor access for profile prod is invalid.*refusing to read supervisor access document.*setup --profile prod/
+      ),
+    ]);
   });
 
   it("parses init profile selection without weakening existing option validation", () => {
@@ -1188,7 +1277,7 @@ describe("init project detection", () => {
       env: configuredSupervisorEnv,
       request: async (path) => {
         paths.push(path);
-        return Response.json(path === "/capabilities" ? { limits: { taskTimeoutSeconds: 7200 } } : { ok: true });
+        return Response.json(path === "/capabilities" ? validCapabilities : { ok: true });
       },
       detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
       detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
@@ -1206,6 +1295,40 @@ describe("init project detection", () => {
     expect(promptCalls).toBe(1);
     expect(registrationCalls).toBe(0);
     expect(process.exitCode).toBeUndefined();
+  });
+
+  it("fails closed when successful preflight responses have malformed bodies", async () => {
+    for (const responses of [
+      { health: { ok: false }, capabilities: validCapabilities },
+      { health: { ok: true }, capabilities: { limits: { taskTimeoutSeconds: 7200 } } },
+    ]) {
+      const harness = initPreflightHarness(configuredSupervisorEnv, async (path) => Response.json(
+        path === "/healthz" ? responses.health : responses.capabilities
+      ));
+
+      await init([], harness.options);
+
+      expect(process.exitCode).toBe(1);
+      expect(harness.downstreamCalls()).toBe(0);
+      expect(harness.messages).toEqual([
+        expect.stringMatching(/invalid.*response.*openthrottle setup --check/i),
+      ]);
+      process.exitCode = undefined;
+    }
+  });
+
+  it("fails closed when a successful preflight response is not JSON", async () => {
+    const harness = initPreflightHarness(configuredSupervisorEnv, async () => (
+      new Response("not-json", { status: 200 })
+    ));
+
+    await init([], harness.options);
+
+    expect(process.exitCode).toBe(1);
+    expect(harness.downstreamCalls()).toBe(0);
+    expect(harness.messages).toEqual([
+      expect.stringMatching(/invalid health response.*openthrottle setup --check/i),
+    ]);
   });
 
   it("classifies preflight HTTP failures without consuming response bodies", async () => {

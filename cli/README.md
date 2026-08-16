@@ -23,13 +23,18 @@ openthrottle operator-skill status --json
   and the Fly supervisor deployment, and persists readiness evidence plus
   resource pins under `~/.openthrottle/profiles/`. Generated supervisor secrets
   are stored in `~/.openthrottle/secrets/` and their values are never printed;
+  repository setup access is stored separately with owner-only permissions in
+  `~/.openthrottle/supervisor-access/`, preserving the legacy secret document
+  for CLI downgrade compatibility;
   operator-owned credentials (`GITHUB_TOKEN`, `GITHUB_READ_TOKEN`,
   `DAYTONA_API_KEY`, Linear OAuth) are never stored locally and must be set as
   Fly secrets. `--check` renders the same readiness evidence strictly
   read-only; `--legacy-checklist` prints the manual `fly secrets set`
   checklist; `--profile <name>` selects an alternate onboarding profile.
 - `init` uses the selected onboarding profile (defaulting to `default`) when
-  supervisor environment credentials are absent. It detects the GitHub
+  both supervisor environment credentials are absent. A complete
+  `OT_SUPERVISOR_URL` plus `OT_STATUS_TOKEN` pair takes precedence; a partial
+  pair fails closed and is never combined with stored access. It detects the GitHub
   origin/default branch and package scripts, writes
   `.openthrottle.yml`, registers the repository for either Linear-team or
   GitHub-Issue control with the deployed supervisor, creates or refreshes the

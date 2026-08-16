@@ -145,13 +145,16 @@ OpenThrottle skills)**. Keep new logic on the correct side:
   argv router, no framework). Commands: `setup` (guided onboarding from the
   pinned release manifest; `--check` read-only readiness report,
   `--legacy-checklist` manual secrets checklist, `--yes` pre-approves
-  mutations, `--profile <name>`), `init`, `plan validate
+  mutations, `--profile <name>`), `init` (`--profile <name>`), `plan validate
   <file.md>`, `plan prepare <file.md>`, `validate <file.md>` (alias for
   `plan validate`), `ship <file.md>`, `status`, `stop <ticket>`,
   `logs <ticket>`, `analysis`, and `operator-skill`. `init` registers the
   GitHub repo with either a Linear-team or a GitHub-Issue control route (the
-  two are equal routing options) and writes `.openthrottle.yml`; it requires
-  `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN`.
+  two are equal routing options) and writes `.openthrottle.yml`. `init` uses
+  the selected profile's owner-only supervisor-access document when both
+  `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN` are absent. A complete explicit
+  environment pair takes precedence; a partial pair fails closed and is never
+  combined with stored access.
 
 ## Invariants worth knowing before you change things
 

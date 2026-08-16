@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ProfileSecretStore } from "./contracts.js";
@@ -99,9 +99,23 @@ export class LocalFileSecretStore implements ProfileSecretStore {
 }
 
 export function assertRestrictiveFile(path: string): void {
-  const mode = statSync(path).mode & 0o777;
+  assertRestrictiveMode(statSync(path).mode, "local secret store", path);
+}
+
+export function readRestrictiveFile(path: string, label = "local secret store"): string {
+  const descriptor = openSync(path, "r");
+  try {
+    assertRestrictiveMode(fstatSync(descriptor).mode, label, path);
+    return readFileSync(descriptor, "utf8");
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function assertRestrictiveMode(rawMode: number, label: string, path: string): void {
+  const mode = rawMode & 0o777;
   if ((mode & 0o077) !== 0) {
-    throw new Error(`refusing to read local secret store with permissions ${mode.toString(8)}`);
+    throw new Error(`refusing to read ${label} at ${path} with permissions ${mode.toString(8)}`);
   }
 }
 
