@@ -13,4 +13,10 @@ describe("sandbox Dockerfile", () => {
       /apt-get install -y --no-install-recommends[\s\S]*?\bbats\b[\s\S]*?rm -rf \/var\/lib\/apt\/lists\/\*/,
     );
   });
+
+  it("pins the Codex CLI release that supports the production model", () => {
+    const dockerfile = readFileSync(resolve(repoRoot, "sandbox/Dockerfile"), "utf8");
+
+    expect(dockerfile).toContain("ARG CODEX_VERSION=0.144.0");
+  });
 });
