@@ -2439,7 +2439,17 @@ INSERT INTO steering_items (
   context_revision, native_session_id, lease_until
 )
 SELECT
-  si.id, si.ticket_id, si.session_id, si.run_id, si.source, si.body, si.status,
+  si.id, si.ticket_id, si.session_id, si.run_id, si.source, si.body,
+  CASE wi.status
+    WHEN 'pending' THEN 'pending'
+    WHEN 'leased' THEN 'pending'
+    WHEN 'dispatched' THEN 'dispatched'
+    WHEN 'acknowledged' THEN 'acknowledged'
+    WHEN 'consumed' THEN 'acknowledged'
+    WHEN 'canceled' THEN 'canceled'
+    WHEN 'dead' THEN 'canceled'
+    WHEN 'reconciliation' THEN 'canceled'
+  END,
   si.created_at, si.delivered_at, wi.active_delivery_id, wi.request_hash,
   wi.generation, wi.context_revision, wi.native_session_id, wd.lease_until
 FROM session_inbox si
@@ -2450,6 +2460,7 @@ LEFT JOIN work_deliveries wd ON wd.id = wi.active_delivery_id;
 const steeringItemsMigrationSource = `${steeringItemsSchema}${steeringItemsBackfillSql}
 steering-single-owner-contract:steering_items owns message state, run and session fences, and the active delivery lease/v1
 backfill-replay-contract:copy work_items.request_hash byte-for-byte and retain the legacy work-item hash encoding for exact ID replay/v1
+legacy-status-contract:work_items is the newer status authority; map all eight durable work states into the four-state steering vocabulary without resurrecting terminal work/v1
 deployment-policy:deploy-forward-only/operator-authorized/v1
 the [rollback-compatible:additive/v1] migration-name suffix is mechanically required for every v47+ migration; it does not promise application-level rollback visibility
 legacy tables remain only for additive schema and old-row backfill; no dual-write; rollback does not expose steering written after cutover`;
