@@ -1089,29 +1089,24 @@ export async function handleGithubEvent(
     if (event.pull_request.head.repo.full_name !== event.repository.full_name) return;
     if (event.action !== "submitted") return;
     let ticket = store.getByPrUrl(event.repository.full_name, event.pull_request.html_url);
-    let needsPrBinding = false;
     if (!ticket) {
       ticket = store.getByBranch(
         event.repository.full_name,
         event.pull_request.head.ref
       );
       if (!ticket || ticket.pr_url !== null) return;
-      needsPrBinding = true;
+      const instance = pipelines.getInstanceForSession(ticket.session_id);
+      if (instance && pipelineIsTerminal(instance)) return;
+      // A branch is reused across ticket generations, so an early review
+      // cannot establish which pull request belongs to this session. Keep the
+      // durable delivery retryable until a same-repository pull_request event
+      // binds the exact URL.
+      throw new Error(
+        "GitHub pull-request review arrived before pull-request binding; retry after the matching pull_request event"
+      );
     }
     const instance = pipelines.getInstanceForSession(ticket.session_id);
     if (instance && pipelineIsTerminal(instance)) return;
-    if (needsPrBinding) {
-      // GitHub may deliver a submitted review before the pull_request/opened
-      // event that normally binds the URL. The exact same-repository branch is
-      // the only safe fallback, and the first observation closes the race by
-      // binding the URL so every later review must match it exactly.
-      store.setPrUrl(ticket.ticket_id, event.pull_request.html_url);
-      ticket = store.getByPrUrl(
-        event.repository.full_name,
-        event.pull_request.html_url
-      );
-    }
-    if (!ticket) return;
     const reviewState = event.review.state.toLowerCase();
     const author = event.review.user?.login;
     if ((reviewState === "changes_requested" || reviewState === "commented") && !author) return;

@@ -2730,7 +2730,7 @@ describe("deterministic supervisor stage gates", () => {
     });
   });
 
-  it("binds a legitimate same-branch review that arrives before pull-request opened", async () => {
+  it("retries a legitimate same-branch review until pull-request opened binds its URL", async () => {
     const fixture = setup("core/implement@4");
     const activityPublisher = {
       publishActivity: vi.fn(async () => undefined),
@@ -2738,7 +2738,7 @@ describe("deterministic supervisor stage gates", () => {
     };
     moveFixtureToProviderWait(fixture);
 
-    await handleGithubEvent(
+    const earlyReview = () => handleGithubEvent(
       {} as never,
       fixture.tickets,
       activityPublisher,
@@ -2764,14 +2764,42 @@ describe("deterministic supervisor stage gates", () => {
       fixture.pipelines
     );
 
+    await expect(earlyReview()).rejects.toThrow("review arrived before pull-request binding");
+    expect(fixture.tickets.getByIssueId("issue-1")?.pr_url).toBeNull();
+    expect(fixture.db.prepare(
+      "SELECT 1 FROM provider_events WHERE provider_event_id = ?"
+    ).get("github-review:612")).toBeUndefined();
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request",
+        action: "opened",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          merged: false,
+          updated_at: "2026-01-01T00:00:00.000Z",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+      },
+      fixture.pipelines
+    );
+    await earlyReview();
+
     expect(fixture.tickets.getByIssueId("issue-1")?.pr_url)
       .toBe("https://github.com/owner/repo/pull/1");
     expect(fixture.db.prepare(
       "SELECT head_sha FROM provider_events WHERE provider_event_id = ?"
     ).get("github-review:612")).toEqual({ head_sha: PUBLISHED_COMMIT });
 
-    // Once the first review closes the bind race, a different PR on the same
-    // branch must not use the fallback again.
+    // Once the pull-request event closes the bind race, a different PR on the
+    // same branch must not use the fallback.
     await handleGithubEvent(
       {} as never,
       fixture.tickets,
@@ -2802,6 +2830,110 @@ describe("deterministic supervisor stage gates", () => {
       "SELECT 1 FROM provider_events WHERE provider_event_id = ?"
     ).get("github-review:613")).toBeUndefined();
     expect(activityPublisher.publishActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not bind a delayed predecessor review to a successor generation that reuses the branch", async () => {
+    const fixture = setup("core/implement@4");
+    const activityPublisher = {
+      publishActivity: vi.fn(async () => undefined),
+      publishError: vi.fn(async () => undefined),
+    };
+    fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
+    fixture.tickets.finishRun({
+      runId: fixture.attempt.planned_run_id!,
+      status: "failed",
+    });
+    fixture.db.prepare(`
+      UPDATE pipeline_instances SET status = 'failed', terminal_outcome = 'failed' WHERE id = ?
+    `).run(fixture.instance.id);
+
+    const catalog = loadPipelineCatalog(shippedCatalogPath, runtime.descriptor);
+    const manifest = catalog.manifests.get("core/implement@4")!;
+    const snapshot = fixture.pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: core/implement@4 }\ntest: npm test\n"),
+    });
+    fixture.tickets.upsert({
+      ticket_id: "issue-1",
+      ticket_reference: "ISSUE-1",
+      session_id: "session-2",
+      sandbox_id: null,
+      branch: "ot/issue-1",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: snapshot,
+        runtime,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+      },
+    });
+
+    const delayedPredecessorReview = () => handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request_review",
+        action: "submitted",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 1,
+          html_url: "https://github.com/owner/repo/pull/1",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: "d".repeat(40) },
+          base: { ref: "main" },
+        },
+        review: {
+          id: 616,
+          state: "changes_requested",
+          body: "This review belongs to the predecessor generation.",
+          commit_id: "d".repeat(40),
+          html_url: "https://github.com/owner/repo/pull/1#pullrequestreview-616",
+          user: { login: "external-reviewer" },
+        },
+      },
+      fixture.pipelines
+    );
+
+    await expect(delayedPredecessorReview()).rejects.toThrow(
+      "review arrived before pull-request binding"
+    );
+    expect(fixture.tickets.getByIssueId("issue-1")?.pr_url).toBeNull();
+
+    await handleGithubEvent(
+      {} as never,
+      fixture.tickets,
+      activityPublisher,
+      {
+        kind: "pull_request",
+        action: "opened",
+        repository: { full_name: "owner/repo" },
+        pull_request: {
+          number: 2,
+          html_url: "https://github.com/owner/repo/pull/2",
+          merged: false,
+          updated_at: "2026-01-01T00:00:00.000Z",
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          base: { ref: "main" },
+        },
+      },
+      fixture.pipelines
+    );
+    await delayedPredecessorReview();
+
+    expect(fixture.tickets.getByIssueId("issue-1")?.pr_url)
+      .toBe("https://github.com/owner/repo/pull/2");
+    expect(fixture.db.prepare(
+      "SELECT 1 FROM provider_events WHERE provider_event_id = ?"
+    ).get("github-review:616")).toBeUndefined();
+    expect(activityPublisher.publishActivity).not.toHaveBeenCalled();
   });
 
   it("rejects a pre-bind same-branch review from an external fork", async () => {
