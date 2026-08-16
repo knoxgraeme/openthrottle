@@ -78,7 +78,9 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   test ! -e /opt/openthrottle/skills/codex/review-fix.md &&
   test ! -e /opt/openthrottle/skills/codex/investigate.md &&
   test -f /opt/openthrottle/skills/codex/AGENTS-fragment.md &&
-  codex --version | rg -q "0\.143\.0" &&
+  codex --version | rg -q "0\.144\.0" &&
+  codex debug models --bundled |
+    jq -e '"'"'.models[] | select(.slug == "gpt-5.6-sol" and .supported_in_api == true)'"'"' >/dev/null &&
   codex exec --help | rg -q -- "--json" &&
   codex exec --help | rg -q -- "--dangerously-bypass-approvals-and-sandbox" &&
   codex exec resume --help | rg -q -- "--skip-git-repo-check" &&
@@ -130,7 +132,7 @@ docker run --rm --network none --entrypoint bash "$IMAGE" -lc '
   ACCESS_TOKEN="$(jwt "{\"exp\":4102444800}")"
   ID_TOKEN="$(jwt "{\"email\":\"smoke@openthrottle.invalid\"}")"
   # Deliberately older than the CLI eight-day legacy fallback. Pinned Codex
-  # 0.143.0 gives a readable access-token exp precedence over last_refresh, so
+  # 0.144.0 gives a readable access-token exp precedence over last_refresh, so
   # this also proves the empty refresh token does not trigger proactive refresh
   # while the brokered access token is valid for the action.
   LAST_REFRESH="2000-01-01T00:00:00Z"

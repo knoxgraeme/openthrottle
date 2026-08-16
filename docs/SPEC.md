@@ -920,7 +920,7 @@ have a readable JWT `exp` and cover the exact sealed child-action timeout (or
 the configured stage timeout when no child action exists) plus a safety margin;
 seeding fails closed instead of handing out one that could expire mid-action.
 The stored `last_refresh` and `tokens.account_id` are preserved byte-for-byte in
-the seed. Pinned Codex 0.143.0 gives a readable access-token `exp` precedence
+the seed. Pinned Codex 0.144.0 gives a readable access-token `exp` precedence
 over its legacy eight-day `last_refresh` fallback, so that preserved timestamp
 cannot provoke proactive in-sandbox refresh. Its 401 recovery ladder can still
 attempt the deliberately empty refresh token, but that is a terminal signal

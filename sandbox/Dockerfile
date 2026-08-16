@@ -59,7 +59,7 @@ RUN corepack enable
 # Coding agent CLIs. Pin the versions whose flags and stage contracts are
 # covered by the smoke and runner tests; upgrade deliberately with those tests.
 ARG CLAUDE_CODE_VERSION=2.1.201
-ARG CODEX_VERSION=0.143.0
+ARG CODEX_VERSION=0.144.0
 ARG OPENCODE_VERSION=1.18.3
 RUN npm install -g \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
