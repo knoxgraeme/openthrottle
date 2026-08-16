@@ -265,7 +265,7 @@ human repair requests. A linkback is recognized only by the exact bridge bot
 identity (`linear[bot]`, `linear-code[bot]`) or by a bot comment whose body
 starts with the explicit `<!-- linear-linkback -->` marker — never by keyword
 heuristics over untrusted comment bodies, so substantive automated review
-feedback is still recorded as provider evidence. Human PR comments,
+feedback is still recorded as provider evidence. Authored PR comments,
 reviews requesting changes, Linear replies during provider waits, and failed
 workflow/check-suite completions for the exact published commit remain
 provider evidence and may start a bounded repair round. Feedback filed against a
@@ -597,6 +597,20 @@ GitHub webhook HMAC is verified before durable delivery. PR open/reopen and
 synchronize events establish the authoritative head for the ticket branch.
 Reviews, PR comments, workflow runs, and check suites are stored as typed
 provider evidence for the pipeline generation.
+
+GitHub collaborator authorization intentionally differs between the Issue
+control surface and the PR feedback surface. Plain Issue comments and Issue
+lifecycle controls require an actor with `triage`, `write`, `maintain`, or
+`admin` permission. By contrast, PR-linked Issue comments and submitted
+`changes_requested` or `commented` PR reviews require an attested author but no
+collaborator-permission lookup before routing `semantic_repair_required`. This
+permits requested external reviewers and substantive automated reviewers to
+contribute feedback.
+The accepted blast radius is bounded: the manifest's `max_repair_rounds` caps
+repair re-entry for the pipeline, and provider routing returns early for a
+terminal pipeline instance, so PR feedback cannot revive terminal work. This
+asymmetry is deliberate and must not be inferred to grant PR actors authority
+over Issue admission, steering, closure, or generation lifecycle controls.
 
 For a repository registered with `control_provider=github`, `openthrottle init`
 creates or normalizes the exact lowercase `openthrottle` label. An authorized
