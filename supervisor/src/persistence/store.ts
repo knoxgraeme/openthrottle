@@ -14,7 +14,6 @@ import { createRunStore, type RunStore } from "./run-store.js";
 import { createSettingsStore, type SettingsStore } from "./settings-store.js";
 import { createSteeringStore, type SteeringStore } from "./steering-store.js";
 import { createTuneStore, type TuneStore } from "./tune-store.js";
-import { createWorkStore } from "./work-store.js";
 import { createMaintenanceStore, type MaintenanceStore } from "./maintenance-store.js";
 import {
   createDeploymentCutoverStore,
@@ -205,7 +204,6 @@ export function createSupervisorStore(
   db: Database.Database,
   pipelineAdmission: PipelineAdmissionCapability = createNoopPipelineAdmission()
 ): SupervisorStore {
-  const workStore = createWorkStore(db);
   const settingsStore = createSettingsStore(db);
   const maintenanceStore = createMaintenanceStore(db);
   const deploymentCutoverStore = createDeploymentCutoverStore(db);
@@ -268,9 +266,9 @@ export function createSupervisorStore(
   };
   return {
     ...createAdmissionStore(db, pipelineAdmission),
-    ...createRunStore(db, workStore),
+    ...createRunStore(db),
     ...deliveryStore,
-    ...createSteeringStore(db, workStore),
+    ...createSteeringStore(db),
     ...createTuneStore(db),
     ...settingsStore,
     ...maintenanceStore,

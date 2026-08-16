@@ -42,6 +42,9 @@ describe("steering store", () => {
       body: "Please check the edge case.",
     });
     expect(steer).toMatchObject({ id: "steer-1", status: "pending" });
+    expect(db.prepare("SELECT COUNT(*) FROM session_inbox").pluck().get()).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) FROM work_items").pluck().get()).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) FROM work_deliveries").pluck().get()).toBe(0);
     expect(store.listPendingInbox("issue-1")).toHaveLength(1);
     expect(store.cancelPendingInbox("issue-1")).toBe(1);
     expect(store.listPendingInbox("issue-1")).toHaveLength(0);
@@ -135,7 +138,7 @@ describe("steering store", () => {
       status: "canceled",
       run_id: null,
     });
-    expect(db.prepare("SELECT status FROM work_items WHERE id = ?").pluck().get("steer-old-session"))
+    expect(db.prepare("SELECT status FROM steering_items WHERE id = ?").pluck().get("steer-old-session"))
       .toBe("canceled");
   });
 

@@ -2406,6 +2406,54 @@ ALTER TABLE runs DROP COLUMN actor_updated_at;
 actor-single-owner-contract:run actor liveness lives on runs only/v1
 migration 14's contraction dual-homed the folded actor lifecycle columns on both runs and pipeline_stage_attempts; every lifecycle transition wrote the pair in one transaction and every reader COALESCEd them, so the attempt-side copy never carried independent state (attempt-less runs already relied on the runs fallback). The 2026-08 repo audit consolidates ownership onto runs: any attempt-side value whose runs-side column is still NULL is merged into the owner first, then the attempt-side actor columns and their index are dropped, along with the written-but-never-read runs.actor_created_at and runs.actor_updated_at stamps. Rollback note: the immediately preceding release still dual-writes and COALESCE-reads the attempt-side actor columns, so this migration is deploy-forward-only per operator decision despite carrying the mandatory additive rollback marker/v1`;
 
+const steeringItemsSchema = `
+CREATE TABLE steering_items (
+  id TEXT PRIMARY KEY,
+  ticket_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  run_id TEXT,
+  source TEXT NOT NULL CHECK(source IN ('human', 'operator')),
+  body TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'dispatched', 'acknowledged', 'canceled')),
+  created_at TEXT NOT NULL,
+  delivered_at TEXT,
+  delivery_id TEXT UNIQUE,
+  request_hash TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK(generation >= 1),
+  context_revision INTEGER NOT NULL CHECK(context_revision >= 0),
+  native_session_id TEXT,
+  lease_until TEXT,
+  FOREIGN KEY(ticket_id) REFERENCES tickets(ticket_id) ON DELETE RESTRICT
+);
+CREATE INDEX steering_items_delivery_idx
+  ON steering_items(ticket_id, status, created_at, id);
+CREATE INDEX steering_items_run_settlement_idx
+  ON steering_items(run_id)
+  WHERE status IN ('pending', 'dispatched');
+`;
+
+const steeringItemsBackfillSql = `
+INSERT INTO steering_items (
+  id, ticket_id, session_id, run_id, source, body, status,
+  created_at, delivered_at, delivery_id, request_hash, generation,
+  context_revision, native_session_id, lease_until
+)
+SELECT
+  si.id, si.ticket_id, si.session_id, si.run_id, si.source, si.body, si.status,
+  si.created_at, si.delivered_at, wi.active_delivery_id, wi.request_hash,
+  wi.generation, wi.context_revision, wi.native_session_id, wd.lease_until
+FROM session_inbox si
+JOIN work_items wi ON wi.id = si.id
+LEFT JOIN work_deliveries wd ON wd.id = wi.active_delivery_id;
+`;
+
+const steeringItemsMigrationSource = `${steeringItemsSchema}${steeringItemsBackfillSql}
+steering-single-owner-contract:steering_items owns message state, run and session fences, and the active delivery lease/v1
+backfill-replay-contract:copy work_items.request_hash byte-for-byte and retain the legacy work-item hash encoding for exact ID replay/v1
+deployment-policy:deploy-forward-only/operator-authorized/v1
+the [rollback-compatible:additive/v1] migration-name suffix is mechanically required for every v47+ migration; it does not promise application-level rollback visibility
+legacy tables remain only for additive schema and old-row backfill; no dual-write; rollback does not expose steering written after cutover`;
+
 type GithubHeadSource =
   | { kind: "authoritative" }
   | { kind: "sequenced"; source: string; sequence: number };
@@ -3653,6 +3701,23 @@ const definitions: DatabaseMigrationDefinition[] = [
     source: actorStateSingleOwnerMigrationSource,
     up(db) {
       consolidateActorStateOntoRuns(db);
+    },
+  },
+  {
+    version: 51,
+    name: "steering-items-single-owner [rollback-compatible:additive/v1]",
+    source: steeringItemsMigrationSource,
+    up(db) {
+      if (!hasTable(db, "steering_items")) {
+        db.exec(steeringItemsSchema);
+        if (
+          hasTable(db, "session_inbox") &&
+          hasTable(db, "work_items") &&
+          hasTable(db, "work_deliveries")
+        ) {
+          db.exec(steeringItemsBackfillSql);
+        }
+      }
     },
   },
 ];

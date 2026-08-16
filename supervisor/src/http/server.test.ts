@@ -1238,7 +1238,7 @@ describe("coordinator-only server", () => {
       status: "captured",
       message: "captured — retained for the next implementation or repair stage",
     });
-    expect(db.prepare("SELECT run_id, source, body FROM session_inbox").get()).toEqual({
+    expect(db.prepare("SELECT run_id, source, body FROM steering_items").get()).toEqual({
       run_id: null,
       source: "operator",
       body: "carry this forward",
@@ -1284,7 +1284,7 @@ describe("coordinator-only server", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ok: true, status: "captured" });
-    expect(db.prepare("SELECT run_id, source, body FROM session_inbox").get()).toEqual({
+    expect(db.prepare("SELECT run_id, source, body FROM steering_items").get()).toEqual({
       run_id: null,
       source: "operator",
       body: "carry this forward",
@@ -1372,7 +1372,7 @@ describe("coordinator-only server", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ok: true, status: "captured" });
-    expect(db.prepare("SELECT run_id, source, body FROM session_inbox").get()).toEqual({
+    expect(db.prepare("SELECT run_id, source, body FROM steering_items").get()).toEqual({
       run_id: null,
       source: "operator",
       body: "carry this forward despite the ledger write failing",

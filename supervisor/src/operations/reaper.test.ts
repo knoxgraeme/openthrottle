@@ -122,6 +122,15 @@ describe("reapStalledRuns", () => {
       tokenHash: "hash",
       expiresAt: "2999-01-01T00:00:00.000Z",
     });
+    store.enqueueInbox({
+      id: "steer-stalled",
+      issueId: "stalled",
+      sessionId: "session-stalled",
+      runId: "run-stalled",
+      source: "operator",
+      body: "steering for the stalled run",
+    });
+    store.markInboxDispatched("steer-stalled");
     store.beginRun({
       issueId: "fresh",
       runId: "run-fresh",
@@ -154,6 +163,7 @@ describe("reapStalledRuns", () => {
     const stalledTicket = store.getByIssueId("stalled");
     expect(stalledTicket?.state).toBe("error");
     expect(stalledTicket?.run_id).toBeNull();
+    expect(store.getInbox("steer-stalled")?.status).toBe("canceled");
 
     // An error activity was enqueued for the reaped run.
     const rows = listLinearOutbox();
@@ -393,6 +403,15 @@ describe("reapStalledRuns", () => {
       tokenHash: "hash",
       expiresAt: "2999-01-01T00:00:00.000Z",
     });
+    store.enqueueInbox({
+      id: "steer-wedged",
+      issueId: "wedged",
+      sessionId: "session-wedged",
+      runId: "run-wedged",
+      source: "operator",
+      body: "steering for the quarantined run",
+    });
+    store.markInboxDispatched("steer-wedged");
     db.prepare("UPDATE runs SET started_at = ? WHERE id = ?").run(
       "2020-01-01T00:00:00.000Z",
       "run-wedged"
@@ -405,6 +424,7 @@ describe("reapStalledRuns", () => {
       state: "error",
       run_id: "run-wedged",
     });
+    expect(store.getInbox("steer-wedged")?.status).toBe("dispatched");
     expect(store.beginRun({
       issueId: "wedged",
       runId: "replacement",
@@ -421,6 +441,7 @@ describe("reapStalledRuns", () => {
       failureTail: "termination later confirmed",
     })).toMatchObject({ status: "stopped" });
     expect(store.getByIssueId("wedged")).toMatchObject({ state: "stopped", run_id: null });
+    expect(store.getInbox("steer-wedged")?.status).toBe("canceled");
   });
 
   it("quarantines a pipeline resource without advancing to a retry before actor termination", async () => {

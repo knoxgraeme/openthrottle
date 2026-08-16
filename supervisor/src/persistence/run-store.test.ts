@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { setupPipelineStore, ticket } from "../__fixtures__/pipeline-store.js";
 import { openDb } from "./database.js";
 import { createSupervisorStore, type SupervisorStore } from "./store.js";
+import { createWorkStore } from "./work-store.js";
 
 describe("run store", () => {
   let db: ReturnType<typeof openDb>;
@@ -25,6 +26,18 @@ describe("run store", () => {
   });
 
   afterEach(() => db.close());
+
+  function enqueueDispatchedSteering(id: string, runId: string): void {
+    store.enqueueInbox({
+      id,
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId,
+      source: "operator",
+      body: `steering for ${runId}`,
+    });
+    store.markInboxDispatched(id);
+  }
 
   it("serializes stage actors per ticket", () => {
     expect(store.beginRun({
@@ -99,6 +112,122 @@ describe("run store", () => {
       status: "timed_out",
       fault_attribution: "executor",
     });
+  });
+
+  it("settles run-bound steering immediately with a direct run finish", () => {
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-direct-steering",
+      taskType: "implement",
+      tokenHash: "a".repeat(64),
+      expiresAt: "2026-07-23T00:00:00.000Z",
+    })).toBe(true);
+    enqueueDispatchedSteering("steer-direct", "run-direct-steering");
+
+    store.finishRun({ runId: "run-direct-steering", status: "completed" });
+
+    expect(store.getInbox("steer-direct")?.status).toBe("canceled");
+  });
+
+  it("leaves retired WorkStore history untouched during run settlement", () => {
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-legacy-history",
+      taskType: "implement",
+      tokenHash: "a".repeat(64),
+      expiresAt: "2026-07-23T00:00:00.000Z",
+    })).toBe(true);
+    const legacy = createWorkStore(db);
+    const item = legacy.enqueue({
+      id: "legacy-steer",
+      issueId: "issue-1",
+      sessionId: "session-1",
+      generation: 1,
+      contextRevision: 0,
+      source: "operator",
+      body: "retained migration history",
+    });
+    const binding = {
+      issueId: "issue-1",
+      sessionId: "session-1",
+      runId: "run-legacy-history",
+      nativeSessionId: null,
+      generation: 1,
+      contextRevision: 0,
+    };
+    const delivery = legacy.lease({
+      ...binding,
+      workItemId: item.id,
+      leaseUntil: "2099-01-01T00:00:00.000Z",
+    });
+    legacy.markDispatched(delivery.id, binding);
+
+    store.finishRun({ runId: "run-legacy-history", status: "completed" });
+
+    expect(legacy.get(item.id)?.status).toBe("dispatched");
+    expect(legacy.getDelivery(delivery.id)?.status).toBe("dispatched");
+  });
+
+  it("settles run-bound steering immediately when a reaper finishes its claim", () => {
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-reaped-steering",
+      taskType: "implement",
+      tokenHash: "a".repeat(64),
+      expiresAt: "2026-07-23T00:00:00.000Z",
+    })).toBe(true);
+    enqueueDispatchedSteering("steer-reaped", "run-reaped-steering");
+    store.claimRunForReaping("run-reaped-steering", "reaper-a", "stalled", "executor");
+
+    store.finishReapingRun({
+      runId: "run-reaped-steering",
+      owner: "reaper-a",
+      status: "timed_out",
+    });
+
+    expect(store.getInbox("steer-reaped")?.status).toBe("canceled");
+  });
+
+  it("settles run-bound steering immediately after confirmed quarantine recovery", () => {
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-quarantined-steering",
+      taskType: "implement",
+      tokenHash: "a".repeat(64),
+      expiresAt: "2026-07-23T00:00:00.000Z",
+    })).toBe(true);
+    enqueueDispatchedSteering("steer-quarantined", "run-quarantined-steering");
+    store.claimRunForReaping("run-quarantined-steering", "reaper-a", "stalled", "executor");
+    store.quarantineRun("run-quarantined-steering", "reaper-a", "termination unconfirmed");
+    expect(store.getInbox("steer-quarantined")?.status).toBe("dispatched");
+
+    store.settleQuarantinedRun({
+      runId: "run-quarantined-steering",
+      status: "stopped",
+    });
+
+    expect(store.getInbox("steer-quarantined")?.status).toBe("canceled");
+  });
+
+  it("rolls steering settlement back with a failed direct-settlement continuation", () => {
+    expect(store.beginRun({
+      issueId: "issue-1",
+      runId: "run-atomic-steering",
+      taskType: "implement",
+      tokenHash: "a".repeat(64),
+      expiresAt: "2026-07-23T00:00:00.000Z",
+    })).toBe(true);
+    enqueueDispatchedSteering("steer-atomic", "run-atomic-steering");
+
+    expect(() => store.finishRunAndThen(
+      { runId: "run-atomic-steering", status: "completed" },
+      () => {
+        throw new Error("continuation failed");
+      }
+    )).toThrow("continuation failed");
+
+    expect(store.getRun("run-atomic-steering")?.status).toBe("running");
+    expect(store.getInbox("steer-atomic")?.status).toBe("dispatched");
   });
 
   it("roots pipeline actor liveness on the run row", () => {

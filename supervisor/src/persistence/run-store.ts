@@ -1,7 +1,6 @@
 import type Database from "better-sqlite3";
 import type { TaskType } from "../pipeline/types.js";
 import type { FaultAttribution } from "../pipeline/fault-attribution.js";
-import type { WorkStore } from "./work-store.js";
 import type { DirectFinishRunParams, FinishRunParams, Run, Ticket } from "./store.js";
 
 export interface RunStore {
@@ -35,7 +34,7 @@ export interface RunStore {
   listStalledRuns(cutoffIso: string): Run[];
 }
 
-export function createRunStore(db: Database.Database, workStore: WorkStore): RunStore {
+export function createRunStore(db: Database.Database): RunStore {
   const now = () => new Date().toISOString();
   const ticketFailureTail = (params: FinishRunParams): string | null =>
     params.ticketFailureTail === undefined
@@ -66,6 +65,11 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       AND actor_state = 'running'
       AND COALESCE(last_heartbeat_at, started_at) <= ?
     ORDER BY started_at
+  `);
+  const cancelUnacknowledgedSteeringForRunStmt = db.prepare(`
+    UPDATE steering_items
+    SET status = 'canceled'
+    WHERE run_id = ? AND status IN ('pending', 'dispatched')
   `);
   const ownedReapingActorPredicate =
     "runs.actor_state = 'reaping' AND runs.settlement_owner = ?";
@@ -155,11 +159,7 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       SET actor_state = 'settled', settlement_reason = ?, fault_attribution = ?
       WHERE id = ? AND actor_state = 'running'
     `).run(params.status, params.faultAttribution ?? null, params.runId);
-    workStore.consumeAcknowledgedForRun(params.runId, params.runId);
-    workStore.releaseUnacknowledgedForRun(
-      params.runId,
-      `owning run ${params.runId} ended before acknowledgement`
-    );
+    cancelUnacknowledgedSteeringForRunStmt.run(params.runId);
     return getRunStmt.get(params.runId) as Run;
   });
   const claimRunForReapingTransaction = db.transaction(
@@ -233,11 +233,7 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
         SET actor_state = 'settled', termination_confirmed_at = ?
         WHERE id = ? AND actor_state = 'reaping' AND settlement_owner = ?
       `).run(completedAt, params.runId, params.owner);
-      workStore.consumeAcknowledgedForRun(params.runId, params.runId);
-      workStore.releaseUnacknowledgedForRun(
-        params.runId,
-        `owning run ${params.runId} ended before acknowledgement`
-      );
+      cancelUnacknowledgedSteeringForRunStmt.run(params.runId);
       return getRunStmt.get(params.runId) as Run;
     }
   );
@@ -304,11 +300,7 @@ export function createRunStore(db: Database.Database, workStore: WorkStore): Run
       SET actor_state = 'settled', termination_confirmed_at = ?
       WHERE id = ? AND actor_state = 'quarantined'
     `).run(completedAt, params.runId);
-    workStore.consumeAcknowledgedForRun(params.runId, params.runId);
-    workStore.releaseUnacknowledgedForRun(
-      params.runId,
-      `owning run ${params.runId} ended after confirmed quarantine recovery`
-    );
+    cancelUnacknowledgedSteeringForRunStmt.run(params.runId);
     return getRunStmt.get(params.runId) as Run;
   });
   return {

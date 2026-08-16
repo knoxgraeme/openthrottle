@@ -3424,7 +3424,7 @@ intents:
       expect.objectContaining({ kind: "stop", status: "pending" }),
     ]));
     expect(db!.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_work'").pluck().get()).toBe(0);
-    expect(db!.prepare("SELECT COUNT(*) FROM session_inbox").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM steering_items").pluck().get()).toBe(0);
     expect(tickets.getByIssueId("linear:issue-1")?.run_id).toBeNull();
   });
 
@@ -3438,7 +3438,7 @@ intents:
     expect(pipelines.getInstance(instance.id)?.status).toBe("dispatchable");
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
     expect(db!.prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_work'").pluck().get()).toBe(0);
-    expect(db!.prepare("SELECT COUNT(*) FROM session_inbox").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM steering_items").pluck().get()).toBe(0);
     const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
     expect(payloads.some((entry) => entry.includes("does not accept live steering"))).toBe(true);
   });
@@ -3691,7 +3691,7 @@ intents:
     await invoke({}, promptedReply("please adjust the current stage", "activity-steer"));
 
     expect(providerEvents()).toHaveLength(0);
-    expect(db!.prepare("SELECT id, body FROM session_inbox").get()).toEqual({
+    expect(db!.prepare("SELECT id, body FROM steering_items").get()).toEqual({
       id: "activity-steer",
       body: "please adjust the current stage",
     });
@@ -3730,7 +3730,7 @@ intents:
       },
     });
 
-    expect(db!.prepare("SELECT session_id, run_id FROM session_inbox").get()).toEqual({
+    expect(db!.prepare("SELECT session_id, run_id FROM steering_items").get()).toEqual({
       session_id: "session-1",
       run_id: request.runId,
     });
@@ -3756,7 +3756,7 @@ intents:
     await invoke({}, promptedReply("please carry this into the repair", "activity-buffered"));
 
     expect(providerEvents()).toHaveLength(0);
-    expect(db!.prepare("SELECT id, run_id, body FROM session_inbox").get()).toEqual({
+    expect(db!.prepare("SELECT id, run_id, body FROM steering_items").get()).toEqual({
       id: "activity-buffered",
       run_id: null,
       body: "please carry this into the repair",

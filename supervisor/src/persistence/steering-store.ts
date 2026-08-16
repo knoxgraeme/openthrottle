@@ -1,7 +1,15 @@
 import type Database from "better-sqlite3";
-import { randomUUID } from "node:crypto";
-import type { WorkBinding, WorkStore } from "./work-store.js";
+import { createHash, randomUUID } from "node:crypto";
 import type { AgentSession, Run, Ticket } from "./store.js";
+
+interface InboxDeliveryBinding {
+  issueId: string;
+  sessionId: string;
+  runId: string;
+  nativeSessionId?: string | null;
+  generation: number;
+  contextRevision: number;
+}
 
 export interface SteerInboxRecord {
   id: string;
@@ -32,221 +40,234 @@ export interface SteeringStore {
   }): SteerInboxRecord;
   listPendingInbox(issueId: string): SteerInboxRecord[];
   markInboxDispatched(id: string): void;
-  acknowledgeInboxDelivery(deliveryId: string, binding: WorkBinding & { requestHash: string }): void;
+  acknowledgeInboxDelivery(
+    deliveryId: string,
+    binding: InboxDeliveryBinding & { requestHash: string }
+  ): void;
   cancelPendingInbox(issueId: string): number;
   getInbox(id: string): SteerInboxRecord | undefined;
 }
 
-export function createSteeringStore(db: Database.Database, workStore: WorkStore): SteeringStore {
+function requestHash(params: {
+  id: string;
+  issueId: string;
+  sessionId: string;
+  nativeSessionId: string | null;
+  generation: number;
+  source: "human" | "operator";
+  body: string;
+}): string {
+  return createHash("sha256")
+    .update(JSON.stringify([
+      params.id,
+      params.issueId,
+      params.sessionId,
+      null,
+      null,
+      params.nativeSessionId,
+      params.generation,
+      0,
+      params.source,
+      params.body,
+    ]))
+    .digest("hex");
+}
+
+function historicalRequestHash(params: {
+  id: string;
+  sessionId: string;
+  body: string;
+}): string {
+  return createHash("sha256")
+    .update(JSON.stringify([params.id, params.sessionId, params.body]))
+    .digest("hex");
+}
+
+function assertExactReplay(
+  record: SteerInboxRecord,
+  params: {
+    id: string;
+    issueId: string;
+    sessionId: string;
+    source: "human" | "operator";
+    body: string;
+  }
+): void {
+  const semanticMatch =
+    record.ticket_id === params.issueId &&
+    record.session_id === params.sessionId &&
+    record.source === params.source &&
+    record.body === params.body;
+  const modernHash = record.generation === null
+    ? null
+    : requestHash({
+        id: record.id,
+        issueId: record.ticket_id,
+        sessionId: record.session_id,
+        nativeSessionId: record.native_session_id,
+        generation: record.generation,
+        source: record.source,
+        body: record.body,
+      });
+  const v1Hash = historicalRequestHash({
+    id: record.id,
+    sessionId: record.session_id,
+    body: record.body,
+  });
+  if (!semanticMatch || (record.request_hash !== modernHash && record.request_hash !== v1Hash)) {
+    throw new Error(`inbox work ${record.id} already exists with different intent`);
+  }
+}
+
+export function createSteeringStore(db: Database.Database): SteeringStore {
   const now = () => new Date().toISOString();
-  const getByIssueIdStmt = db.prepare("SELECT * FROM tickets WHERE ticket_id = ?");
-  const getSessionStmt = db.prepare("SELECT * FROM agent_sessions WHERE id = ?");
-  const getRunStmt = db.prepare("SELECT * FROM runs WHERE id = ?");
-  const insertInboxStmt = db.prepare(`
-    INSERT OR IGNORE INTO session_inbox (
-      id, ticket_id, session_id, run_id, source, body, status, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+  const getTicket = db.prepare("SELECT * FROM tickets WHERE ticket_id = ?");
+  const getSession = db.prepare("SELECT * FROM agent_sessions WHERE id = ?");
+  const getRun = db.prepare("SELECT * FROM runs WHERE id = ?");
+  const getInbox = db.prepare("SELECT * FROM steering_items WHERE id = ?");
+  const getDelivery = db.prepare("SELECT * FROM steering_items WHERE delivery_id = ?");
+  const insertInbox = db.prepare(`
+    INSERT OR IGNORE INTO steering_items (
+      id, ticket_id, session_id, run_id, source, body, status, created_at,
+      request_hash, generation, context_revision, native_session_id
+    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, 0, ?)
   `);
-  const listPendingInboxStmt = db.prepare(`
-    SELECT si.*, wi.active_delivery_id AS delivery_id, wi.request_hash,
-      wi.generation, wi.context_revision, wi.native_session_id,
-      wd.lease_until
-    FROM session_inbox si
-    LEFT JOIN work_items wi ON wi.id = si.id
-    LEFT JOIN work_deliveries wd ON wd.id = wi.active_delivery_id
-    WHERE si.ticket_id = ?
-      AND (si.status = 'pending'
-        OR (si.status = 'dispatched' AND (
-          wd.lease_until <= ? OR wd.run_id IS NOT (
-            SELECT t.run_id FROM tickets t WHERE t.ticket_id = si.ticket_id
-          )
-        )))
-    ORDER BY si.created_at ASC, si.id ASC
+  const listPending = db.prepare(`
+    SELECT * FROM steering_items
+    WHERE ticket_id = ? AND (
+      status = 'pending' OR
+      (status = 'dispatched' AND (lease_until IS NULL OR lease_until <= ? OR run_id IS NOT ?))
+    )
+    ORDER BY created_at, id
   `);
-  const markInboxDispatchedStmt = db.prepare(
-    "UPDATE session_inbox SET status = 'dispatched', delivered_at = ? WHERE id = ? AND status IN ('pending', 'dispatched')"
-  );
-  const cancelPendingInboxStmt = db.prepare(
-    "UPDATE session_inbox SET status = 'canceled' WHERE ticket_id = ? AND status IN ('pending', 'dispatched')"
-  );
-  const cancelInboxStmt = db.prepare(
-    "UPDATE session_inbox SET status = 'canceled' WHERE id = ? AND status IN ('pending', 'dispatched')"
-  );
-  const bindInboxRunStmt = db.prepare(
-    "UPDATE session_inbox SET run_id = ? WHERE id = ? AND run_id IS NULL AND status IN ('pending', 'dispatched')"
-  );
-  const getInboxStmt = db.prepare(`
-    SELECT si.*, wi.active_delivery_id AS delivery_id, wi.request_hash,
-      wi.generation, wi.context_revision, wi.native_session_id,
-      wd.lease_until
-    FROM session_inbox si
-    LEFT JOIN work_items wi ON wi.id = si.id
-    LEFT JOIN work_deliveries wd ON wd.id = wi.active_delivery_id
-    WHERE si.id = ?
+  const lease = db.prepare(`
+    UPDATE steering_items SET run_id = ?, delivery_id = ?, lease_until = ?
+    WHERE id = ? AND status IN ('pending', 'dispatched')
   `);
+  const markDispatched = db.prepare(`
+    UPDATE steering_items SET status = 'dispatched', delivered_at = ?
+    WHERE id = ? AND status IN ('pending', 'dispatched')
+  `);
+  const acknowledge = db.prepare(`
+    UPDATE steering_items SET status = 'acknowledged'
+    WHERE delivery_id = ? AND status = 'dispatched'
+  `);
+  const cancel = db.prepare(`
+    UPDATE steering_items SET status = 'canceled'
+    WHERE id = ? AND status IN ('pending', 'dispatched')
+  `);
+  const cancelAll = db.prepare(`
+    UPDATE steering_items SET status = 'canceled'
+    WHERE ticket_id = ? AND status IN ('pending', 'dispatched')
+  `);
+
+  const leaseRecord = (record: SteerInboxRecord, runId: string, timestamp: string): SteerInboxRecord => {
+    if (record.delivery_id && record.run_id === runId && record.lease_until && record.lease_until > timestamp) {
+      return record;
+    }
+    const deliveryId = randomUUID();
+    if (lease.run(runId, deliveryId, new Date(Date.now() + 30_000).toISOString(), record.id).changes !== 1) {
+      throw new Error(`inbox work ${record.id} lease race`);
+    }
+    return getInbox.get(record.id) as SteerInboxRecord;
+  };
+
   return {
     enqueueInbox(params) {
       const id = params.id ?? randomUUID();
-      db.transaction(() => {
+      return db.transaction(() => {
         const timestamp = now();
-        insertInboxStmt.run(
+        const session = getSession.get(params.sessionId) as AgentSession | undefined;
+        const generation = session?.generation ?? 1;
+        const nativeSessionId = session?.provider_conversation_id ?? null;
+        const hash = requestHash({
           id,
-          params.issueId,
-          params.sessionId,
-          params.runId ?? null,
-          params.source,
-          params.body,
-          timestamp
+          issueId: params.issueId,
+          sessionId: params.sessionId,
+          generation,
+          nativeSessionId,
+          source: params.source,
+          body: params.body,
+        });
+        const inserted = insertInbox.run(
+          id, params.issueId, params.sessionId, params.runId ?? null, params.source,
+          params.body, timestamp, hash, generation, nativeSessionId
         );
-        const session = getSessionStmt.get(params.sessionId) as AgentSession | undefined;
-        const ticket = params.runId === null
-          ? undefined
-          : getByIssueIdStmt.get(params.issueId) as Ticket | undefined;
-        const runId = params.runId !== undefined ? params.runId : ticket?.run_id;
-        let item = workStore.get(id);
-        if (!item) {
-          item = workStore.enqueue({
+        let record = getInbox.get(id) as SteerInboxRecord;
+        if (inserted.changes === 0) {
+          assertExactReplay(record, {
             id,
             issueId: params.issueId,
             sessionId: params.sessionId,
-            generation: session?.generation ?? 1,
-            contextRevision: 0,
-            nativeSessionId: session?.provider_conversation_id ?? null,
             source: params.source,
             body: params.body,
           });
+        } else if (record.request_hash !== hash) {
+          throw new Error(`inbox work ${id} was inserted with an invalid request hash`);
         }
+        const ticket = params.runId === null ? undefined : getTicket.get(params.issueId) as Ticket | undefined;
+        const runId = params.runId !== undefined ? params.runId : ticket?.run_id;
         if (
-          runId &&
-          ticket?.run_id === runId &&
-          ticket.agent !== "opencode" &&
-          (getRunStmt.get(runId) as Run | undefined)?.status === "running"
+          runId && ticket?.run_id === runId && ticket.agent !== "opencode" &&
+          (getRun.get(runId) as Run | undefined)?.status === "running"
         ) {
-          workStore.lease({
-            workItemId: id,
-            issueId: params.issueId,
-            sessionId: params.sessionId,
-            runId,
-            nativeSessionId: item.native_session_id,
-            generation: item.generation,
-            contextRevision: item.context_revision,
-            leaseUntil: new Date(Date.now() + 30_000).toISOString(),
-          });
+          record = leaseRecord(record, runId, timestamp);
         }
+        return record;
       })();
-      return getInboxStmt.get(id) as SteerInboxRecord;
     },
     listPendingInbox(issueId) {
-      const timestamp = now();
-      const records = listPendingInboxStmt.all(issueId, timestamp) as SteerInboxRecord[];
-      const deliverable: SteerInboxRecord[] = [];
-      const activeTicket = getByIssueIdStmt.get(issueId) as Ticket | undefined;
-      const activeRunId = activeTicket?.run_id;
-      const activeSession = activeTicket
-        ? getSessionStmt.get(activeTicket.session_id) as AgentSession | undefined
-        : undefined;
-      for (const record of records) {
-        const item = workStore.get(record.id);
-        if (!item || !activeRunId) continue;
-        const activeDelivery = record.delivery_id
-          ? workStore.getDelivery(record.delivery_id)
-          : undefined;
-        const inboxBelongsToSupersededSession = Boolean(
-          activeTicket && record.session_id !== activeTicket.session_id
-        );
-        const inboxBelongsToSupersededGeneration = Boolean(
-          activeSession && item.generation !== activeSession.generation
-        );
-        const inboxBelongsToEndedRun = Boolean(record.run_id && record.run_id !== activeRunId);
-        const deliveryBelongsToEndedRun = Boolean(activeDelivery && activeDelivery.run_id !== activeRunId);
-        if (
-          inboxBelongsToSupersededSession ||
-          inboxBelongsToSupersededGeneration ||
-          inboxBelongsToEndedRun ||
-          deliveryBelongsToEndedRun
-        ) {
-          db.transaction(() => {
-            if (activeDelivery) {
-              workStore.expireUnacknowledged(
-                activeDelivery.id,
-                activeDelivery.run_id,
-                `owning run ${activeDelivery.run_id} ended before acknowledgement`
-              );
-            }
-            cancelInboxStmt.run(record.id);
-            workStore.cancel(
-              record.id,
-              inboxBelongsToSupersededSession || inboxBelongsToSupersededGeneration
-                ? `steering was fenced to superseded session ${record.session_id}`
-                : `steering was fenced to ended run ${record.run_id ?? "unknown"}`
-            );
-          })();
-          continue;
+      return db.transaction(() => {
+        const timestamp = now();
+        const ticket = getTicket.get(issueId) as Ticket | undefined;
+        const runId = ticket?.run_id;
+        const session = ticket ? getSession.get(ticket.session_id) as AgentSession | undefined : undefined;
+        const records = listPending.all(issueId, timestamp, runId ?? null) as SteerInboxRecord[];
+        if (!ticket || !runId || !session) return [];
+        const deliverable: SteerInboxRecord[] = [];
+        for (const record of records) {
+          if (
+            record.session_id !== ticket.session_id || record.generation !== session.generation ||
+            (record.run_id !== null && record.run_id !== runId)
+          ) {
+            cancel.run(record.id);
+            continue;
+          }
+          deliverable.push(leaseRecord(record, runId, timestamp));
         }
-        if (record.status === "pending" && record.delivery_id) {
-          deliverable.push(record);
-          continue;
-        }
-        db.transaction(() => {
-          bindInboxRunStmt.run(activeRunId, record.id);
-          workStore.lease({
-            workItemId: record.id,
-            issueId: record.ticket_id,
-            sessionId: record.session_id,
-            runId: activeRunId,
-            nativeSessionId: item.native_session_id,
-            generation: item.generation,
-            contextRevision: item.context_revision,
-            now: timestamp,
-            leaseUntil: new Date(Date.now() + 30_000).toISOString(),
-          });
-        })();
-        deliverable.push(getInboxStmt.get(record.id) as SteerInboxRecord);
-      }
-      return deliverable;
+        return deliverable;
+      })();
     },
     markInboxDispatched(id) {
-      const record = getInboxStmt.get(id) as SteerInboxRecord | undefined;
+      const record = getInbox.get(id) as SteerInboxRecord | undefined;
       if (!record?.delivery_id || !record.run_id || record.generation === null || record.context_revision === null) {
         throw new Error(`inbox work ${id} has no leased delivery`);
       }
-      const binding = {
-        issueId: record.ticket_id,
-        sessionId: record.session_id,
-        runId: record.run_id,
-        nativeSessionId: record.native_session_id,
-        generation: record.generation,
-        contextRevision: record.context_revision,
-      };
-      db.transaction(() => {
-        workStore.markDispatched(record.delivery_id!, binding);
-        markInboxDispatchedStmt.run(now(), id);
-      })();
+      markDispatched.run(now(), id);
     },
     acknowledgeInboxDelivery(deliveryId, binding) {
-      const delivery = workStore.getDelivery(deliveryId);
-      if (!delivery || delivery.request_hash !== binding.requestHash) {
+      const record = getDelivery.get(deliveryId) as SteerInboxRecord | undefined;
+      if (!record || record.request_hash !== binding.requestHash) {
         throw new Error(`inbox acknowledgement ${deliveryId} request hash mismatch`);
       }
-      db.transaction(() => {
-        workStore.acknowledge(deliveryId, binding);
-        db.prepare(
-          "UPDATE session_inbox SET status = 'acknowledged' WHERE id = ? AND status = 'dispatched'"
-        ).run(delivery.work_item_id);
-      })();
+      if (
+        record.ticket_id !== binding.issueId || record.session_id !== binding.sessionId ||
+        record.run_id !== binding.runId || record.native_session_id !== (binding.nativeSessionId ?? null) ||
+        record.generation !== binding.generation || record.context_revision !== binding.contextRevision
+      ) {
+        throw new Error(`inbox delivery ${deliveryId} binding mismatch`);
+      }
+      if (record.status === "acknowledged") return;
+      if (record.status !== "dispatched") {
+        throw new Error(`inbox delivery ${deliveryId} must be dispatched before acknowledgement`);
+      }
+      if (acknowledge.run(deliveryId).changes !== 1) throw new Error(`inbox delivery ${deliveryId} acknowledgement race`);
     },
     cancelPendingInbox(issueId) {
-      return db.transaction(() => {
-        const ids = db.prepare(
-          "SELECT id FROM session_inbox WHERE ticket_id = ? AND status IN ('pending', 'dispatched')"
-        ).all(issueId) as Array<{ id: string }>;
-        const changes = cancelPendingInboxStmt.run(issueId).changes;
-        for (const { id } of ids) workStore.cancel(id, "inbox canceled");
-        return changes;
-      })();
+      return cancelAll.run(issueId).changes;
     },
     getInbox(id) {
-      return getInboxStmt.get(id) as SteerInboxRecord | undefined;
+      return getInbox.get(id) as SteerInboxRecord | undefined;
     },
   };
 }
