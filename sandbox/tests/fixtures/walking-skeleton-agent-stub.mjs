@@ -2,7 +2,8 @@
 // Deterministic stand-in for the `claude` CLI used only by
 // sandbox/tests/structured-walking-skeleton.mjs. Bind-mounted over
 // /usr/local/bin/claude inside the built image so execute-loop.mjs's real
-// invocation path (gosu agent env ... claude --print ...) runs unmodified.
+// invocation path (gosu <action-principal> env ... claude --print ...) runs
+// unmodified.
 //
 // A structured loop action carries every fence value a worker needs inside
 // the "## Receipt Authority Contract" block of its prompt (see
@@ -17,8 +18,8 @@
 // without needing to guess.
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { extractJsonBlock } from "/opt/openthrottle/runner/json-block.mjs";
 import { claudeProjectSlug } from "/opt/openthrottle/runner/native-session-package.mjs";
 
@@ -39,6 +40,34 @@ const REVIEW_PERSONA_SKILLS = new Set([
   "performance",
   "project-standards",
 ]);
+const REVIEW_SUBACTION_SEPARATOR = ".review.";
+
+function assertSiblingHomeIsolation(contract, planContext) {
+  const home = process.env.HOME;
+  if (!home) throw new Error("stub review persona requires HOME for sibling isolation proof");
+  const currentActionId = contract.action_attempt_id;
+  const separatorIndex = currentActionId.lastIndexOf(REVIEW_SUBACTION_SEPARATOR);
+  if (separatorIndex < 0) throw new Error("stub review persona has no review action prefix");
+  const actionPrefix = currentActionId.slice(0, separatorIndex + REVIEW_SUBACTION_SEPARATOR.length);
+  const sibling = planContext?.review_fanout?.personas?.find(
+    (persona) => persona.id !== currentActionId.slice(separatorIndex + REVIEW_SUBACTION_SEPARATOR.length),
+  );
+  if (!sibling) throw new Error("stub review persona found no sibling in its sealed fanout plan");
+  const siblingHome = join(dirname(dirname(home)), `${actionPrefix}${sibling.id}`, "home");
+  const deadline = Date.now() + 2_000;
+  while (Date.now() <= deadline) {
+    try {
+      readdirSync(siblingHome);
+      throw new Error(`concurrent review persona could read sibling home ${sibling.id}`);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("could read sibling home")) throw error;
+      if (error?.code === "EACCES") return;
+      if (error?.code !== "ENOENT") throw error;
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  }
+  throw new Error(`concurrent review sibling home ${sibling.id} was never materialized`);
+}
 
 function readStdin() {
   try {
@@ -299,6 +328,7 @@ function main() {
       },
     });
   } else if (REVIEW_PERSONA_SKILLS.has(skill)) {
+    const planContext = extractJsonBlock(prompt, "## Execution Plan Context\n");
     // Keep sibling processes overlapped long enough for the walking skeleton
     // to prove the shared sandbox preserves each action-scoped CLI home.
     Atomics.wait(
@@ -307,9 +337,10 @@ function main() {
       0,
       skill === "correctness-dataflow" ? 100 : 400,
     );
+    assertSiblingHomeIsolation(contract, planContext);
     // The faster sibling exits while the slower one is still alive. The last
     // action alone may restore the shared checkout; if the faster cleanup
-    // exposes it early, this agent-UID write succeeds and fails the scenario.
+    // exposes it early, this action-principal write succeeds and fails the scenario.
     try {
       writeFileSync("/home/agent/repo/.ot-review-shared-checkout-write-probe", `${skill}\n`);
       throw new Error("concurrent review persona could write the shared integration checkout");

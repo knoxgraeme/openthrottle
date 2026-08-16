@@ -942,11 +942,14 @@ fixed, so diagnostic rewording cannot duplicate or prematurely resolve a
 finding. Rereview searches the newest bounded history window. A
 missing or malformed prior journal is appended as a separate audit-gap note and
 cannot block, pass, or otherwise authorize the live receipt/gate decision.
-Persona actions remain independent sessions. Each sibling gets a distinct
-action directory, transport state, `HOME`, engine profile (`~/.claude`,
-`CODEX_HOME`, or OpenCode state), and root-owned live-process fence. Completed
-or stale sibling directories are sealed; a concurrently live sibling is never
-relocked by another action. All siblings read exact-subject, action-scoped
+Persona actions remain independent sessions. Each fixed review role runs under
+a distinct pre-created OS principal and gets a distinct action directory,
+transport state, `HOME`, engine profile (`~/.claude`, `CODEX_HOME`, or OpenCode
+state), and root-owned live-process fence. Per-principal process cleanup cannot
+signal a concurrently live sibling, and owner-private sibling homes cannot be
+read or changed across principals. Completed or stale sibling directories are
+sealed; a concurrently live sibling is never relocked by another action. All
+siblings read exact-subject, action-scoped
 read-only repository views derived from the one shared integration checkout;
 no persona receives a worktree. The supervisor dispatches the deterministic
 roster through the `REVIEW_FANOUT_CONCURRENCY` active window, gathers every

@@ -14,7 +14,7 @@ import {
 } from "./artifacts.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
-import { runWithAgentProcessFence } from "./agent-process-fence.mjs";
+import { runWithUserProcessFence } from "./agent-process-fence.mjs";
 import { deriveCandidateCommit, grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
 import {
   chmodOwnerPrivateTree,
@@ -27,6 +27,7 @@ import {
   lockPersistentAgentPrivateRoots,
   lockedPersistentProfilesFrom,
   pathInside as containedPath,
+  reassignTreeOwner,
   restoreIntegrationCheckout,
   restorePersistentAgentPrivateRoots,
 } from "./filesystem-isolation.mjs";
@@ -117,6 +118,19 @@ const SKILLS = new Set([
 const CONTEXTS = new Set(["fresh", "resume_required", "prefer_resume"]);
 const STANDARD_RECEIPT_SCHEMA = "openthrottle.receipt/v1";
 const ACTIVE_ACTION_FENCE_FILE = ".ot-active-action.json";
+const REVIEW_ACTION_PRINCIPALS = new Map([
+  ["final-review", "ot-review-final"],
+  ["select-review-personas", "ot-review-selector"],
+  ["correctness-dataflow", "ot-review-correctness"],
+  ["tests-contracts", "ot-review-tests"],
+  ["reliability-adversarial", "ot-review-reliability"],
+  ["agent-native-contracts", "ot-review-agent-native"],
+  ["security", "ot-review-security"],
+  ["data-migration", "ot-review-data"],
+  ["performance", "ot-review-performance"],
+  ["project-standards", "ot-review-standards"],
+  ["validate-review-findings", "ot-review-validator"],
+]);
 const STANDARD_RECEIPT_TYPES = new Set([
   "unit_completion",
   "unit_decision",
@@ -173,6 +187,13 @@ const MAX_RECEIPT_CORRECTION_STATE_BYTES = 3 * 1024 * 1024;
 const MAX_RECEIPT_CORRECTION_OUTPUT_CHARS = 64 * 1024;
 const ROOT_UID = 0;
 const ROOT_GID = 0;
+
+export function loopActionPrincipal(request) {
+  if (request.role !== "reviewer" || request.loop !== "review") return "agent";
+  const principal = REVIEW_ACTION_PRINCIPALS.get(request.skill);
+  if (!principal) throw new Error(`review action ${request.skill} has no installed isolation principal`);
+  return principal;
+}
 
 function nullableString(value, label, pattern = ID) {
   return value === null ? null : string(value, label, pattern);
@@ -953,22 +974,20 @@ export function loopAgentCommand({ request, invocation, repoDir = loopWorktreeDi
 // OPE-101/OPE-104: an untraversable sandbox root let the engine launch
 // without ever being able to resolve its own skill discovery root, so it
 // silently registered zero skills, answered `Unknown command: /...`, and
-// exited 0 with no evidence of the real cause. Verified as the agent uid
-// (never root, which bypasses DAC permission checks and would never observe
-// the traversal-denied failure this exists to catch) so this fails closed
-// before the engine ever launches, instead of after it has already produced
-// an undiagnosable silent failure. Only checked where the sealed skill is
-// actually expected to be materialized under the profile root: always for
+// exited 0 with no evidence of the real cause. Verify as the selected action
+// principal (never root, which bypasses DAC permission checks) so this fails
+// closed before launch. Only checked where the sealed skill is actually
+// expected to be materialized under the profile root: always for
 // Claude (both built-in and repository skills land in
 // <profileRoot>/skills/), and for Codex only when a repository skill was
 // materialized there too -- a built-in Codex skill lives at the separate
 // admin-scope /etc/codex/skills instead, so this must not fire for that case.
-function assertSealedSkillPreflight({ request, profileRoot, runProcess }) {
+function assertSealedSkillPreflight({ request, profileRoot, principal, runProcess }) {
   if (request.agent !== "claude" && !request.repositorySkill) return;
   const skillMarkdownPath = pathInside(pathInside(pathInside(profileRoot, "skills"), request.skill), "SKILL.md");
   let result;
   try {
-    result = runProcess("gosu", ["agent", "test", "-r", skillMarkdownPath], { timeout: 5_000 });
+    result = runProcess("gosu", [principal, "test", "-r", skillMarkdownPath], { timeout: 5_000 });
   } catch (error) {
     throw retryableInfrastructureError(
       `sealed skill preflight for ${request.skill} could not run: ${error instanceof Error ? error.message : String(error)}`,
@@ -976,7 +995,7 @@ function assertSealedSkillPreflight({ request, profileRoot, runProcess }) {
   }
   if (result.error || result.status !== 0) {
     throw retryableInfrastructureError(
-      `sealed skill ${request.skill} is not readable by the agent uid before launch (${skillMarkdownPath})`,
+      `sealed skill ${request.skill} is not readable by the action principal before launch (${skillMarkdownPath})`,
     );
   }
 }
@@ -1020,7 +1039,7 @@ export function runLoopAgentInPreparedRepository({
   request,
   invocation,
   runProcess = runCapturedProcess,
-  processFence = runWithAgentProcessFence,
+  processFence = null,
   integrationRepoDir = INTEGRATION_REPO_DIR,
   lockIntegration = lockIntegrationCheckout,
   lockPersistentProfiles = lockPersistentAgentPrivateRoots,
@@ -1035,6 +1054,7 @@ export function runLoopAgentInPreparedRepository({
   const cleanupErrors = [];
   let bodyError = null;
   try {
+    const principal = loopActionPrincipal(request);
     claimCurrentAction(request);
     lockIntegration(integrationRepoDir);
     try {
@@ -1044,12 +1064,14 @@ export function runLoopAgentInPreparedRepository({
       throw error;
     }
     const repoDir = prepareLoopRepository(request, integrationRepoDir);
-    const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir, credentialEnv);
+    const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir, credentialEnv, principal);
+    reassignTreeOwner(actionDirectory(request), "agent", principal);
     const built = loopAgentCommand({ request, invocation, repoDir, mcpConfigPath: preparedEnvironment.mcpConfigPath });
     makeCurrentActionDirectoryTraverseOnly(request);
-    assertSealedSkillPreflight({ request, profileRoot: preparedEnvironment.nativeSessionProfileRoot, runProcess });
-    const result = processFence(() => runProcess("gosu", [
-      "agent", "env", ...preparedEnvironment.env, built.command, ...built.args,
+    assertSealedSkillPreflight({ request, profileRoot: preparedEnvironment.nativeSessionProfileRoot, principal, runProcess });
+    const runWithProcessFence = processFence ?? ((execute) => runWithUserProcessFence(principal, execute));
+    const result = runWithProcessFence(() => runProcess("gosu", [
+      principal, "env", ...preparedEnvironment.env, built.command, ...built.args,
     ], {
       cwd: built.repoDir,
       input: built.input,

@@ -19,4 +19,23 @@ describe("sandbox Dockerfile", () => {
 
     expect(dockerfile).toContain("ARG CODEX_VERSION=0.144.0");
   });
+
+  it("pre-creates every isolated review-action principal", () => {
+    const dockerfile = readFileSync(resolve(repoRoot, "sandbox/Dockerfile"), "utf8");
+    const principals = [
+      "ot-review-final",
+      "ot-review-selector",
+      "ot-review-correctness",
+      "ot-review-tests",
+      "ot-review-reliability",
+      "ot-review-agent-native",
+      "ot-review-security",
+      "ot-review-data",
+      "ot-review-performance",
+      "ot-review-standards",
+      "ot-review-validator",
+    ];
+
+    for (const principal of principals) expect(dockerfile).toContain(principal);
+  });
 });

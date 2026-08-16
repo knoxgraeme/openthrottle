@@ -96,6 +96,28 @@ export function chownTree(path, uid, gid) {
   for (const entry of readdirSync(path)) chownTree(resolve(path, entry), uid, gid);
 }
 
+// Reassign only entries owned by one unprivileged principal, preserving every
+// executor-owned root fence and read-only tree beneath the same action root.
+// This is used after an action has been materialized with the established
+// `agent` helpers so a concurrent review persona can run under its own UID
+// without weakening the uid-0 seals mixed into that tree.
+export function reassignTreeOwner(path, fromName, toName) {
+  if (!isRoot() || fromName === toName) return;
+  const source = identityForUser(fromName);
+  const target = identityForUser(toName);
+  const visit = (entry) => {
+    const metadata = lstatSync(entry);
+    if (metadata.isSymbolicLink()) {
+      if (metadata.uid === source.uid) lchownSync(entry, target.uid, target.gid);
+      return;
+    }
+    if (metadata.uid === source.uid) chownSync(entry, target.uid, target.gid);
+    if (!metadata.isDirectory()) return;
+    for (const child of readdirSync(entry)) visit(resolve(entry, child));
+  };
+  visit(path);
+}
+
 export function prepareAgentOwnedDirectory(path) {
   if (existsSync(path)) {
     const metadata = lstatSync(path);
