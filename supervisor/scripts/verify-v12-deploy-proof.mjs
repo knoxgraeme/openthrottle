@@ -10,7 +10,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const ACTIVE_RUNTIME_RELEASE = "openthrottle-snapshot/v13";
 const V12_PROOF_FILE = "v12-deploy-proof.json";
 const V12_PROOF_PATH = `supervisor/pipelines/${V12_PROOF_FILE}`;
-const SNAPSHOT_IDENTITY = "openthrottle-v2-ce-${short_head}";
+const SNAPSHOT_IDENTITY = "openthrottle-ce-${short_head}";
 
 function read(path) {
   return readFileSync(join(root, path), "utf8");
@@ -108,7 +108,7 @@ assert(
   "Fly-local cutover control must retain the deploy-token endpoint fence"
 );
 assert(
-  deployWorkflow.includes('name="openthrottle-v2-ce-$(git rev-parse --short=7 HEAD)"'),
+  deployWorkflow.includes('name="openthrottle-ce-$(git rev-parse --short=7 HEAD)"'),
   "Daytona snapshot identity must remain commit-pinned"
 );
 assert(

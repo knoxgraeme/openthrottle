@@ -375,14 +375,14 @@ seal_cutover_evidence '${JSON.stringify({ admission: { paused: 0, epoch: 1 }, ru
   it("executes the recorded recovery shape as staged old snapshot plus pinned image deploy plus evidence, without resume", () => {
     const command = "flyctl secrets set --stage --app $FLY_APP DAYTONA_SNAPSHOT=$old_snapshot && flyctl deploy --remote-only --app $FLY_APP --config supervisor/fly.toml --image $old_runtime_image && flyctl ssh console --app $FLY_APP --command 'node /app/scripts/cutover-control.mjs evidence'";
     const result = runBash(command, {
-      old_snapshot: "openthrottle-v2-ce-old",
+      old_snapshot: "openthrottle-ce-old",
       old_runtime_image: "registry.fly.io/openthrottle-supervisor@sha256:old",
       FLYCTL_SSH_STATUS: "0",
-      FLYCTL_SSH_RESPONSE: '{"admission":{"paused":1},"runtime":{"release":"openthrottle-snapshot/v12","capabilityDigest":"sha256:old"},"snapshot":"openthrottle-v2-ce-old"}',
+      FLYCTL_SSH_RESPONSE: '{"admission":{"paused":1},"runtime":{"release":"openthrottle-snapshot/v12","capabilityDigest":"sha256:old"},"snapshot":"openthrottle-ce-old"}',
     });
 
     expect(result.status).toBe(0);
-    expect(result.commands).toContain("flyctl secrets set --stage --app openthrottle-supervisor DAYTONA_SNAPSHOT=openthrottle-v2-ce-old");
+    expect(result.commands).toContain("flyctl secrets set --stage --app openthrottle-supervisor DAYTONA_SNAPSHOT=openthrottle-ce-old");
     expect(result.commands).toContain("flyctl deploy --remote-only --app openthrottle-supervisor --config supervisor/fly.toml --image registry.fly.io/openthrottle-supervisor@sha256:old");
     expect(result.commands).toContain("cutover-control.mjs evidence");
     expect(result.commands).not.toContain("cutover-control.mjs resume");

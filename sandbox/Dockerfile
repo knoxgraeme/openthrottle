@@ -9,6 +9,8 @@
 
 FROM node:22-bookworm
 
+LABEL org.opencontainers.image.source="https://github.com/knoxgraeme/openthrottle"
+
 # ---------------------------------------------------------------------------
 # System packages: git curl jq ripgrep bats gh yq gosu
 # ---------------------------------------------------------------------------

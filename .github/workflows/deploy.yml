@@ -118,7 +118,7 @@ jobs:
           DAYTONA_SANDBOX_MEMORY: ${{ vars.DAYTONA_SANDBOX_MEMORY }}
           DAYTONA_SANDBOX_DISK: ${{ vars.DAYTONA_SANDBOX_DISK }}
         run: |
-          name="openthrottle-v2-ce-$(git rev-parse --short=7 HEAD)"
+          name="openthrottle-ce-$(git rev-parse --short=7 HEAD)"
           node supervisor/scripts/build-snapshot.mjs "$name"
           echo "name=$name" >> "$GITHUB_OUTPUT"
 

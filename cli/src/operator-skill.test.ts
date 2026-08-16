@@ -52,7 +52,7 @@ function stagedSkill(stageHome: string, agentRoot: ".codex" | ".claude" | ".open
   cpSync(resolve(process.cwd(), "../skills/operator/openthrottle"), target, { recursive: true });
   writeFileSync(join(target, ".skillfish.json"), JSON.stringify({
     owner: "knoxgraeme",
-    repo: "openthrottle-v2",
+    repo: "openthrottle",
     path: "skills/operator/openthrottle",
     source: "manifest",
   }, null, 2));
@@ -98,7 +98,7 @@ describe("operator skill command parsing and source", () => {
   it("rejects mutable source refs", () => {
     expect(() => resolveOperatorSkillSourceRef({ sourceRef: "main" })).toThrow(/not immutable/);
     expect(operatorSkillSource(sourceRef)).toBe(
-      "knoxgraeme/openthrottle-v2@0123456789abcdef0123456789abcdef01234567/skills/operator/openthrottle"
+      "knoxgraeme/openthrottle@0123456789abcdef0123456789abcdef01234567/skills/operator/openthrottle"
     );
   });
 
@@ -213,11 +213,36 @@ describe("operator skill Skillfish wrapper", () => {
     expect(result.success).toBe(true);
     expect(result.installed).toEqual([{ agent: "Codex", status: "installed", path }]);
     expect(readFileSync(join(path, "SKILL.md"), "utf8")).not.toContain("locally modified");
+    expect(JSON.parse(readFileSync(join(path, ".skillfish.json"), "utf8"))).toMatchObject({
+      owner: "knoxgraeme",
+      repo: "openthrottle",
+      path: "skills/operator/openthrottle",
+    });
     expect(readFileSync(unrelatedSkill, "utf8")).toContain("other-skill");
     expect(calls).toEqual([
       ["list", "--global", "--json"],
       ["install", "--global", "--yes", "--json"],
     ]);
+  });
+
+  it("recognizes pre-rename manifests as owned during status", () => {
+    const home = temporaryDirectory();
+    const path = installedSkill(home, ".codex", {
+      owner: "knoxgraeme",
+      repo: "openthrottle-v2",
+      path: "skills/operator/openthrottle",
+      source: "manifest",
+    });
+    const runner = () => spawnResult({
+      success: true,
+      installed: [{ skill: "openthrottle", agent: "Codex", path, location: "global" }],
+      agents_detected: ["Codex"],
+    });
+
+    const result = runOperatorSkillAction("status", { home, runner, sourceRef });
+
+    expect(result.success).toBe(true);
+    expect(result.installed).toEqual([{ agent: "Codex", status: "installed", path }]);
   });
 
   it("attributes Skillfish install failures to every agent attempted by that command", () => {
@@ -378,7 +403,7 @@ describe("operator skill Skillfish wrapper", () => {
     const home = temporaryDirectory();
     const path = installedSkill(home, ".codex", {
       owner: "knoxgraeme",
-      repo: "openthrottle-v2",
+      repo: "openthrottle",
       path: "skills/operator/openthrottle",
       source: "manifest",
     });
@@ -454,7 +479,7 @@ describe("operator skill Skillfish wrapper", () => {
     const home = temporaryDirectory();
     const path = installedSkill(home, ".codex", {
       owner: "knoxgraeme",
-      repo: "openthrottle-v2",
+      repo: "openthrottle",
       path: "skills/operator/openthrottle",
       source: "manifest",
     });
@@ -479,7 +504,7 @@ describe("operator skill Skillfish wrapper", () => {
     const home = temporaryDirectory();
     const path = installedSkill(home, ".codex", {
       owner: "knoxgraeme",
-      repo: "openthrottle-v2",
+      repo: "openthrottle",
       path: "skills/operator/openthrottle",
       source: "manifest",
     });
@@ -531,7 +556,7 @@ describe("operator skill Skillfish wrapper", () => {
     expect(result.recovery).toEqual(["openthrottle operator-skill remove && openthrottle operator-skill install"]);
   });
 
-  it("removes only exact Skillfish-managed OpenThrottle installs", () => {
+  it("removes exact Skillfish-managed OpenThrottle installs, including the pre-rename slug", () => {
     const home = temporaryDirectory();
     const codexPath = installedSkill(home, ".codex", {
       owner: "knoxgraeme",
@@ -593,7 +618,7 @@ describe("operator skill Skillfish wrapper", () => {
     const home = temporaryDirectory();
     const openCodePath = installedSkill(home, ".config/opencode", {
       owner: "knoxgraeme",
-      repo: "openthrottle-v2",
+      repo: "openthrottle",
       path: "skills/operator/openthrottle",
       source: "manifest",
     });

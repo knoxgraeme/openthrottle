@@ -35,7 +35,7 @@ const bundle: SupervisorDeploymentBundle = {
   release,
   runtime: {
     providerId: "daytona",
-    configuration: { snapshot: "openthrottle-v2-ce-abc1234" },
+    configuration: { snapshot: "openthrottle-ce-abc1234" },
     secrets: {},
   },
   secrets: {
@@ -421,7 +421,7 @@ describe("fly hosting adapter ensure", () => {
         "--app",
         APP,
         "--stage",
-        "DAYTONA_SNAPSHOT=openthrottle-v2-ce-abc1234",
+        "DAYTONA_SNAPSHOT=openthrottle-ce-abc1234",
         "GITHUB_WEBHOOK_SECRET=generated-github_webhook_secret-secret-value",
         "LINEAR_WEBHOOK_SECRET=generated-linear_webhook_secret-secret-value",
         "OT_DEPLOY_TOKEN=generated-deploy_token-secret-value",

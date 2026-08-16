@@ -20,5 +20,5 @@
     "core-tune-v1.yaml": "49bb1315cb3be775e3329f57a34004df0b67db682bbb3c49bcb926ace887de1a",
     "runtime-capabilities-v1.json": "a40df9ea83681e5979d7777276a05057a30d0b649113079f7d4ea74a4c3cad29"
   },
-  "snapshot_identity": "openthrottle-v2-ce-${short_head}"
+  "snapshot_identity": "openthrottle-ce-${short_head}"
 }

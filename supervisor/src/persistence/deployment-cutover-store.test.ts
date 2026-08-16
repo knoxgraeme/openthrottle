@@ -13,8 +13,8 @@ describe("deployment cutover store", () => {
       const store = createDeploymentCutoverStore(db, () => "2026-08-14T04:44:22.000Z");
       const cutover = store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
-        oldSnapshot: "openthrottle-v2-ce-old",
-        candidateSnapshot: "openthrottle-v2-ce-new",
+        oldSnapshot: "openthrottle-ce-old",
+        candidateSnapshot: "openthrottle-ce-new",
         evidence: "initial evidence",
       });
 
@@ -22,18 +22,18 @@ describe("deployment cutover store", () => {
         status: "active",
         phase: "registered",
         old_runtime_release: "openthrottle-snapshot/v12",
-        old_snapshot: "openthrottle-v2-ce-old",
-        candidate_snapshot: "openthrottle-v2-ce-new",
+        old_snapshot: "openthrottle-ce-old",
+        candidate_snapshot: "openthrottle-ce-new",
       });
       expect(store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
-        oldSnapshot: "openthrottle-v2-ce-old",
-        candidateSnapshot: "openthrottle-v2-ce-new",
+        oldSnapshot: "openthrottle-ce-old",
+        candidateSnapshot: "openthrottle-ce-new",
       })).toEqual(cutover);
       expect(() => store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
-        oldSnapshot: "openthrottle-v2-ce-old",
-        candidateSnapshot: "openthrottle-v2-ce-other",
+        oldSnapshot: "openthrottle-ce-old",
+        candidateSnapshot: "openthrottle-ce-other",
       })).toThrow(/retry must adopt that transaction/);
 
       const restored = store.advanceDeploymentCutover({
@@ -49,8 +49,8 @@ describe("deployment cutover store", () => {
       });
       expect(store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
-        oldSnapshot: "openthrottle-v2-ce-old",
-        candidateSnapshot: "openthrottle-v2-ce-new",
+        oldSnapshot: "openthrottle-ce-old",
+        candidateSnapshot: "openthrottle-ce-new",
       })).toEqual(restored);
 
       const completed = store.advanceDeploymentCutover({
@@ -68,19 +68,19 @@ describe("deployment cutover store", () => {
 
       const retry = store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
-        oldSnapshot: "openthrottle-v2-ce-old",
-        candidateSnapshot: "openthrottle-v2-ce-new",
+        oldSnapshot: "openthrottle-ce-old",
+        candidateSnapshot: "openthrottle-ce-new",
       });
       expect(retry).toMatchObject({
-        id: "snapshot-cutover:openthrottle-v2-ce-new:attempt-2",
+        id: "snapshot-cutover:openthrottle-ce-new:attempt-2",
         status: "active",
         phase: "registered",
-        candidate_snapshot: "openthrottle-v2-ce-new",
+        candidate_snapshot: "openthrottle-ce-new",
       });
       expect(store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
-        oldSnapshot: "openthrottle-v2-ce-old",
-        candidateSnapshot: "openthrottle-v2-ce-new",
+        oldSnapshot: "openthrottle-ce-old",
+        candidateSnapshot: "openthrottle-ce-new",
       })).toEqual(retry);
     } finally {
       db.close();
@@ -97,8 +97,8 @@ describe("deployment cutover store", () => {
       const cutoverId = createDeploymentCutoverStore(db, () => "2026-08-14T05:00:00.000Z")
         .beginDeploymentCutover({
           oldRuntimeRelease: "openthrottle-snapshot/v12",
-          oldSnapshot: "openthrottle-v2-ce-old",
-          candidateSnapshot: "openthrottle-v2-ce-new",
+          oldSnapshot: "openthrottle-ce-old",
+          candidateSnapshot: "openthrottle-ce-new",
         }).id;
 
       // now() runs between advance's read and its update. A second connection
@@ -146,8 +146,8 @@ describe("deployment cutover store", () => {
       const store = createDeploymentCutoverStore(db, () => "2026-08-14T04:54:22.000Z");
       const cutover = store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
-        oldSnapshot: "openthrottle-v2-ce-old",
-        candidateSnapshot: "openthrottle-v2-ce-new",
+        oldSnapshot: "openthrottle-ce-old",
+        candidateSnapshot: "openthrottle-ce-new",
       });
 
       expect(store.advanceDeploymentCutover({
@@ -155,16 +155,16 @@ describe("deployment cutover store", () => {
         phase: "recovery_required",
         status: "recovery_required",
         evidence: "restoration proof failed",
-        recoveryCommand: "flyctl secrets set --stage --app app DAYTONA_SNAPSHOT=openthrottle-v2-ce-old",
+        recoveryCommand: "flyctl secrets set --stage --app app DAYTONA_SNAPSHOT=openthrottle-ce-old",
       })).toMatchObject({
         status: "recovery_required",
         phase: "recovery_required",
-        recovery_command: "flyctl secrets set --stage --app app DAYTONA_SNAPSHOT=openthrottle-v2-ce-old",
+        recovery_command: "flyctl secrets set --stage --app app DAYTONA_SNAPSHOT=openthrottle-ce-old",
       });
       expect(() => store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
-        oldSnapshot: "openthrottle-v2-ce-other-old",
-        candidateSnapshot: "openthrottle-v2-ce-other",
+        oldSnapshot: "openthrottle-ce-other-old",
+        candidateSnapshot: "openthrottle-ce-other",
       })).toThrow(/retry must adopt that transaction/);
     } finally {
       db.close();
@@ -177,8 +177,8 @@ describe("deployment cutover store", () => {
       const store = createDeploymentCutoverStore(db, () => "2026-08-14T04:49:22.000Z");
       const cutover = store.beginDeploymentCutover({
         oldRuntimeRelease: "openthrottle-snapshot/v12",
-        oldSnapshot: "openthrottle-v2-ce-old",
-        candidateSnapshot: "openthrottle-v2-ce-new",
+        oldSnapshot: "openthrottle-ce-old",
+        candidateSnapshot: "openthrottle-ce-new",
       });
 
       const preStage = store.advanceDeploymentCutover({
