@@ -5,6 +5,42 @@ import {
 } from "./admission-context.js";
 
 describe("bounded Linear admission context", () => {
+  it("accepts captured assignment-created metadata and history without giving it selection authority", () => {
+    const currentSelection = [
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
+      "```",
+    ].join("\n");
+    const staleSelection = [
+      "```json openthrottle.ship-selection/v1",
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "simple" }, null, 2),
+      "```",
+    ].join("\n");
+    const context = [
+      `<issue identifier="OPE-177">`,
+      `<description>${currentSelection}</description>`,
+      `<issue-relations><related><issue-ref identifier="OPE-OLD" title="prior relation"/></related></issue-relations>`,
+      `</issue>`,
+      `<parent-issue identifier="OPE-100"><title>Parent tracker</title><description>bounded parent</description></parent-issue>`,
+      `<other-thread comment-id="prior-run"><comment>${staleSelection}</comment></other-thread>`,
+      `<other-thread comment-id="latest-run"><comment>latest supervisor receipt</comment></other-thread>`,
+    ].join("\n");
+
+    const result = composeBoundedTaskContext(context, {
+      requireLinearSections: true,
+      expectedIssueIdentifier: "OPE-177",
+    });
+
+    expect(result.selectionError).toBeUndefined();
+    expect(result.selectionContext).toContain('"graph_id": "structured"');
+    expect(result.selectionContext).not.toContain('"graph_id": "simple"');
+    expect(result.selectionContext).not.toContain("OPE-OLD");
+    expect(result.context).toContain("bounded parent");
+    expect(result.context).toContain('"graph_id": "simple"');
+    expect(result.context).toContain("latest supervisor receipt");
+    expect(result.context).not.toContain("OPE-OLD");
+  });
+
   it("strips OPE-147's contradictory selection from OPE-115 sub-issue metadata", () => {
     const structuredSelection = [
       "```json openthrottle.ship-selection/v1",
@@ -343,6 +379,22 @@ describe("bounded Linear admission context", () => {
         `<primary-directive-thread><comment>current directive</comment></primary-directive-thread>`,
         `<other-thread><comment>history</comment></other-thread>`,
         `<parent-issue identifier="OPE-100"><description>parent</description></parent-issue>`,
+      ].join("\n"),
+    ],
+    [
+      "primary directive after an other thread",
+      [
+        `<issue identifier="OPE-139"><description>current child</description></issue>`,
+        `<other-thread><comment>history</comment></other-thread>`,
+        `<primary-directive-thread><comment>late directive</comment></primary-directive-thread>`,
+      ].join("\n"),
+    ],
+    [
+      "primary directive after a parent issue",
+      [
+        `<issue identifier="OPE-139"><description>current child</description></issue>`,
+        `<parent-issue identifier="OPE-100"><description>parent</description></parent-issue>`,
+        `<primary-directive-thread><comment>late directive</comment></primary-directive-thread>`,
       ].join("\n"),
     ],
     [

@@ -65,11 +65,11 @@ self-contained OpenThrottle skills. There is no second execution architecture.
 3. The branch label may override the registration’s base branch for this
    delegation. Agent labels select Claude, Codex, or OpenCode; `investigate`
    selects the investigate intent, otherwise the intent is implement.
-4. The supervisor accepts exactly two created-session prompt-context shapes:
-   assignment-created delegations carry one well-formed outer child `<issue>`
-   and no `<primary-directive-thread>`; comment-prompted delegations carry one
-   outer child `<issue>`, one `<primary-directive-thread>`, then only the
-   allowlisted optional parent issue and other-thread context. Pipeline
+4. The supervisor accepts exactly two created-session prompt-context shapes.
+   Both start with one well-formed outer child `<issue>` and may end with only
+   the allowlisted optional parent issue and other-thread context. Assignment-
+   created delegations have no `<primary-directive-thread>`; comment-prompted
+   delegations carry exactly one immediately after the child issue. Pipeline
    selection authority is limited to the sanitized child issue for assignment
    shape, and to the sanitized child issue plus the one primary directive for
    prompted shape. Nested parent/history material, parent descriptions,
