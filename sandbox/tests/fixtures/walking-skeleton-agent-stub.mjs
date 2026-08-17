@@ -41,6 +41,10 @@ const REVIEW_PERSONA_SKILLS = new Set([
   "project-standards",
 ]);
 const REVIEW_SUBACTION_SEPARATOR = ".review.";
+// The host harness enables concurrent review fanout only for this scenario.
+// Other scenarios deliberately retain the serial rollback path, so their
+// first persona must not wait for a sibling that is intentionally unlaunched.
+const CONCURRENT_REVIEW_PLAN_ID = "walking-skeleton-happy-path";
 
 function assertSiblingHomeIsolation(contract, planContext) {
   const home = process.env.HOME;
@@ -334,24 +338,26 @@ function main() {
     });
   } else if (REVIEW_PERSONA_SKILLS.has(skill)) {
     const planContext = extractJsonBlock(prompt, "## Execution Plan Context\n");
-    // Keep sibling processes overlapped long enough for the walking skeleton
-    // to prove the shared sandbox preserves each action-scoped CLI home.
-    Atomics.wait(
-      new Int32Array(new SharedArrayBuffer(4)),
-      0,
-      0,
-      skill === "correctness-dataflow" ? 100 : 400,
-    );
-    assertSiblingHomeIsolation(contract, planContext);
-    // The faster sibling exits while the slower one is still alive. The last
-    // action alone may restore the shared checkout; if the faster cleanup
-    // exposes it early, this action-principal write succeeds and fails the scenario.
-    try {
-      writeFileSync("/home/agent/repo/.ot-review-shared-checkout-write-probe", `${skill}\n`);
-      throw new Error("concurrent review persona could write the shared integration checkout");
-    } catch (error) {
-      if (error instanceof Error && error.message.includes("could write")) throw error;
-      if (error?.code !== "EACCES" && error?.code !== "ENOENT") throw error;
+    if (planContext?.plan_id === CONCURRENT_REVIEW_PLAN_ID) {
+      // Keep sibling processes overlapped long enough for the designated
+      // concurrent scenario to prove each action-scoped CLI home is private.
+      Atomics.wait(
+        new Int32Array(new SharedArrayBuffer(4)),
+        0,
+        0,
+        skill === "correctness-dataflow" ? 100 : 400,
+      );
+      assertSiblingHomeIsolation(contract, planContext);
+      // The faster sibling exits while the slower one is still alive. The last
+      // action alone may restore the shared checkout; if the faster cleanup
+      // exposes it early, this action-principal write succeeds and fails the scenario.
+      try {
+        writeFileSync("/home/agent/repo/.ot-review-shared-checkout-write-probe", `${skill}\n`);
+        throw new Error("concurrent review persona could write the shared integration checkout");
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("could write")) throw error;
+        if (error?.code !== "EACCES" && error?.code !== "ENOENT") throw error;
+      }
     }
     receipt = buildReceipt({
       contract,
