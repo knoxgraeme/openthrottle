@@ -592,6 +592,15 @@ function createDockerSandboxRuntime(container) {
           request.skill !== "select-review-personas" &&
           request.skill !== "validate-review-findings") {
         activeReviewPersonaActions.delete(input.actionId);
+        if (result.outcome !== "success") {
+          const receiptText = typeof result.receipt === "string"
+            ? result.receipt
+            : JSON.stringify(result.receipt ?? null);
+          const diagnostic = receiptText.slice(-4_000);
+          throw new Error(
+            `review persona ${input.actionId} returned ${result.outcome}: ${diagnostic}`
+          );
+        }
         const actionHome = `${LOOP_ACTION_DIR}/${input.attemptId}/${input.actionId}/home`;
         assert(
           dockerExecStatus(container, ["test", "-f", `${actionHome}/.claude/ot-stub-agent-startup.json`]).status === 0,

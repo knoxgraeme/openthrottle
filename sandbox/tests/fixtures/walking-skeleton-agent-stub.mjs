@@ -253,6 +253,11 @@ function main() {
   if (!contract) throw new Error("stub agent could not find the Receipt Authority Contract in its prompt");
   const cwd = process.cwd();
 
+  // This is launch evidence, so write it before any skill-specific probe can
+  // fail. Keeping it at the end of the turn made a failed isolation assertion
+  // indistinguishable from an engine that never reached its action home.
+  writeProfileRootStartupFile();
+
   let receipt;
   if (skill === "implement-unit" || skill === "repair-unit" || skill === "simplify-unit" || skill === "final-repair") {
     const subjectPost = makeDeterministicEdit(cwd, contract);
@@ -378,7 +383,6 @@ function main() {
   // the request; only mint a fresh id when the contract carries none (the
   // first action of an attempt).
   const sessionId = contract.native_session_id ?? `stub-${contract.action_attempt_id}`;
-  writeProfileRootStartupFile();
   writeNativeSessionTranscript(sessionId, contract);
 
   process.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, model: "stub" })}\n`);
