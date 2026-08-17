@@ -93,7 +93,9 @@ describe("deploy workflow cutover recovery", () => {
   it("validates the complete migration catalog before Fly setup on every deploy", () => {
     const steps = deployWorkflow().jobs.deploy.steps;
     const validationIndex = steps.findIndex((step) => step.name === "Validate migration rollback markers");
-    const flySetupIndex = steps.findIndex((step) => step.uses === "superfly/flyctl-actions/setup-flyctl@master");
+    const flySetupIndex = steps.findIndex((step) =>
+      /^superfly\/flyctl-actions\/setup-flyctl@[0-9a-f]{40}$/.test(step.uses ?? "")
+    );
 
     expect(validationIndex).toBeGreaterThanOrEqual(0);
     expect(flySetupIndex).toBeGreaterThan(validationIndex);

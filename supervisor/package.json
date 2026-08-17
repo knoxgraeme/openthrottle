@@ -24,6 +24,9 @@
     "hono": "^4.12.30",
     "yaml": "^2.9.0"
   },
+  "overrides": {
+    "@opentelemetry/propagator-jaeger": "2.9.0"
+  },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.10.0",

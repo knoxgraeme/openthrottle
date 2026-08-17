@@ -8,6 +8,18 @@
     "type": "git",
     "url": "https://github.com/knoxgraeme/openthrottle"
   },
+  "homepage": "https://github.com/knoxgraeme/openthrottle#readme",
+  "bugs": {
+    "url": "https://github.com/knoxgraeme/openthrottle/issues"
+  },
+  "keywords": [
+    "ai-agents",
+    "coding-agent",
+    "codex",
+    "developer-tools",
+    "github",
+    "linear"
+  ],
   "engines": {
     "node": ">=22"
   },
@@ -33,9 +45,15 @@
     "skillfish": "1.0.39",
     "yaml": "^2.6.1"
   },
+  "overrides": {
+    "@opentelemetry/propagator-jaeger": "2.9.0"
+  },
   "bundleDependencies": [
     "@openthrottle/contracts"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@vitest/coverage-v8": "^3.2.4",

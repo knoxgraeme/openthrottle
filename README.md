@@ -1,146 +1,144 @@
-# OpenThrottle
+<p align="center">
+  <img src="docs/assets/banner.jpg" alt="OpenThrottle" width="100%">
+</p>
 
-OpenThrottle is a plan-first coding pipeline: delegate an approved Linear
-ticket or labeled GitHub Issue, run an immutable configurable pipeline through
-fenced Daytona stages using Claude Code, Codex, or OpenCode, and review the
-resulting GitHub PR.
+<p align="center"><strong>Turn approved plans into reviewed pull requests with a self-hosted, deterministic agent pipeline.</strong></p>
 
-The GitHub repository is `openthrottle`; the product, CLI, npm package,
-and Daytona snapshot are all named `openthrottle`.
+<p align="center">
+  <a href="https://github.com/knoxgraeme/openthrottle/actions/workflows/ci.yml"><img src="https://github.com/knoxgraeme/openthrottle/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://www.npmjs.com/package/openthrottle"><img src="https://img.shields.io/npm/v/openthrottle" alt="npm version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+</p>
+
+OpenThrottle connects an approved Linear ticket or labeled GitHub Issue to a
+fenced coding agent, then carries the result through review, tests, publication,
+and provider verification. You keep the supervisor, credentials, policies, and
+execution environment under your control.
+
+> [!IMPORTANT]
+> OpenThrottle is pre-production software. Use it for controlled pilots, keep
+> branch protection enabled, and register only repositories you trust to run
+> code inside the sandbox.
+
+## Why OpenThrottle
+
+- **Plan first.** Work begins from an explicit task specification, not an
+  open-ended prompt.
+- **Deterministic control plane.** The supervisor owns stage order, retries,
+  gates, and external effects; agents reason only inside fenced stages.
+- **Agent choice.** Run Claude Code, Codex, or OpenCode without changing the
+  pipeline contract.
+- **Evidence before publication.** Typed results, command gates, semantic
+  review, and exact-commit verification decide whether work advances.
+- **Self-hosted boundaries.** Fly, Daytona, SQLite, GitHub, and optional Linear
+  integrations remain in infrastructure you operate.
 
 ## How it works
 
 ```text
-Linear ticket or GitHub Issue ──> Fly supervisor ──> Daytona ──> ot/* branch + PR
-          ▲                           │     ▲                        │
-          └──── activities/status ────┘     └──── GitHub events ────┘
+Linear ticket or GitHub Issue
+        |
+        v
+Fly supervisor -> sealed Daytona stage -> Claude Code / Codex / OpenCode
+        ^                   |
+        |                   v
+status + evidence <- gates, review, tests -> ot/* branch + GitHub PR
 ```
 
-The supervisor authenticates and durably retries webhooks, pins the manifest,
-repository config, runtime descriptor, base commit, and generation, then
-dispatches one sealed stage at a time. Typed artifacts and gates determine the
-next transition; external effects are persisted before execution.
-Self-contained OpenThrottle skills supply agent reasoning inside the stage
-boundary.
+The supervisor pins the pipeline manifest, repository config, runtime
+descriptor, base commit, generation, and expected Git subject. It dispatches
+one stage at a time and persists external effects before execution so retries
+remain bounded and recoverable.
 
-The implement pipeline separates planning, implementation, semantic review,
-simplification, command gates, exact-subject publication, and provider
-verification. Investigate uses its own immutable graph. GitHub reviews and CI
-are deduplicated as evidence for the published commit; bounded repair
-transitions may continue the native agent session when the manifest permits.
+## Quick start
 
-See [docs/SPEC.md](docs/SPEC.md) for the normative contracts and
-[docs/PLAN.md](docs/PLAN.md) for the delivery/acceptance plan.
+### Prerequisites
 
-## Bootstrap
+- Node.js 22
+- Docker
+- The Fly and Daytona CLIs, authenticated to accounts you control
+- A GitHub fine-grained token for the repositories OpenThrottle will manage
+- Optional: a Linear OAuth app when using Linear as the control surface
 
-Requires Node 22, Docker, Fly CLI, Daytona CLI, and the service credentials in
-`supervisor/.env.example`.
+Run the guided setup from any directory:
 
 ```bash
-# test all non-live contracts
-npm ci --prefix contracts && npm run build --prefix contracts && npm test --prefix contracts
-npm ci --prefix supervisor && npm test --prefix supervisor
-npm ci --prefix cli && npm test --prefix cli
-npm ci --prefix sandbox && npm test --prefix sandbox
-bats sandbox/tests/runtime.bats
-docker build -f sandbox/Dockerfile -t openthrottle:test .
-sandbox/tests/smoke.sh openthrottle:test
-
-# create the canonical Daytona snapshot once (requires `daytona login`)
-# Size it for real monorepo builds — the default tier OOM-kills pnpm/Turbo
-# build and type-check gates (exit 137). CI builds via
-# supervisor/scripts/build-snapshot.mjs read DAYTONA_SANDBOX_CPU/MEMORY/DISK
-# (default 4 vCPU / 8 GiB / 5 GiB; disk is kept small because Daytona's 30 GiB
-# total org quota is shared across every retained sandbox — raise it only on
-# a larger-quota plan).
-daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context . \
-  --cpu 4 --memory 8 --disk 5
-
-# inspect the one-time platform checklist
 npx openthrottle setup
-
-# deploy the always-on supervisor
-cd supervisor
-fly volumes create openthrottle_data --region sjc --size 1
-fly secrets set SUPERVISOR_URL=... OT_STATUS_TOKEN=... OT_DEPLOY_TOKEN=... OT_INSTALL_SECRET=... # plus .env.example
-fly deploy
 ```
 
-For Linear control, install the Linear OAuth app through authenticated
-`/oauth/install`. Run `init` from each target repository; it detects the GitHub
-origin, writes the repo-local execution config, installs the local `ot-plan` and
-`openthrottle` skills for detected agents, registers either the Linear-team or
-GitHub-Issue route in Fly's SQLite database, creates or refreshes that
-repository's GitHub webhook, and verifies the canonical Daytona snapshot:
+Then initialize a target repository:
 
 ```bash
+cd your-repository
 npx openthrottle init
-# for a named setup profile: npx openthrottle init --profile prod
+```
+
+`init` installs user-global planning/operator skills for detected local agents,
+writes `.openthrottle.yml`, registers either a Linear-team or GitHub-Issue route,
+creates the repository webhook, and verifies the runtime snapshot.
+
+With `LINEAR_API_KEY` and `OT_AGENT_APP_ID` exported, prepare and delegate a
+plan through Linear control:
+
+```bash
+npx openthrottle plan prepare docs/plans/my-change.md
 npx openthrottle ship docs/plans/my-change.md
 npx openthrottle status
 ```
 
-`setup` saves the supervisor URL and status token as an owner-only access
-document separate from the downgrade-compatible local secret store. `init`
-uses that document for the selected profile (default `default`) when both
-`OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN` are absent. A complete explicit pair
-takes precedence; supplying only one fails closed and never mixes environment
-and stored credentials. `init` asks which control provider to use. One Linear
-team currently routes to one GitHub repository;
-GitHub-Issue control is repository-native and needs no Linear team. Re-running
-`init` updates that registration without restarting Fly or creating a new
-Daytona snapshot. Linear delegations from unmatched teams and GitHub Issues
-from unregistered repositories fail closed. In GitHub mode, an authorized
-collaborator starts work by applying the exact `openthrottle` label to an open
-Issue; the supervisor maintains a pinned status comment on that Issue.
+With GitHub-Issue control, apply the exact `openthrottle` label to an open Issue
+from an authorized collaborator. OpenThrottle maintains status on that Issue.
 
-The team route also fixes the base branch each run is cut from. To target a
-different base for a single ticket, label the issue with a `branch` label before
-delegating. Two equivalent forms are supported:
+Useful setup variants:
 
-- **A Linear label group named `branch`** (recommended) whose child label is the
-  branch name — e.g. a `branch` group containing `feature/x`. This keeps branch
-  labels tidy under one group. Linear's webhook only carries the child's leaf
-  name, so the supervisor resolves the parent group through a GraphQL lookup.
-- **A flat `branch › <name>` label** (also `branch >`, `branch:`, or `branch/`),
-  matched directly from the webhook with no extra call.
+```bash
+npx openthrottle setup --check          # read-only readiness report
+npx openthrottle setup --profile prod   # named environment
+npx openthrottle init --profile prod
+```
 
-The supervisor verifies the branch exists on the resolved repository, cuts the
-`ot/*` branch from it, and opens the PR against it. An unmatched or malformed
-branch fails closed with a Linear error. The base is read when the run is
-delegated (the `created` agent event), so apply the label before assigning.
+For a manual source install, create the canonical snapshot with the production
+resource defaults:
+
+```bash
+daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context . \
+  --cpu 4 --memory 8 --disk 5
+```
+
+See the [CLI guide](cli/README.md) for every command and configuration option.
 
 ## Repository layout
 
-- `contracts/` — shared library of canonical JSON and sha256 digest helpers
-  kept byte-identical across packages.
-- `supervisor/` — Hono/SQLite control plane deployed on Fly.
-- `sandbox/` — Daytona image, safety boundary, entrypoint, tests.
-- `skills/` — self-contained OpenThrottle task adapters for Claude Code,
-  Codex, and OpenCode. Each skill carries its own craft; the sandbox image no
-  longer ships the Compound Engineering plugin.
-- `cli/` — the `openthrottle` command-line package.
-- `docs/` — architecture and execution plan.
+| Path | Purpose |
+| --- | --- |
+| `contracts/` | Shared canonical JSON, schema, and digest contracts |
+| `supervisor/` | Hono/SQLite control plane deployed on Fly |
+| `sandbox/` | Daytona image, stage executor, and safety boundary |
+| `skills/` | Self-contained planning and execution adapters |
+| `cli/` | Published `openthrottle` npm package |
+| `docs/` | Normative specification, plans, and operator runbooks |
 
-## Security boundary
+For the complete architecture and contracts, read [docs/SPEC.md](docs/SPEC.md).
+For delivery and acceptance status, read [docs/PLAN.md](docs/PLAN.md).
 
-Only credentials declared by the selected stage enter a sandbox—never Daytona,
-Fly, Linear app, webhook, install, or operator tokens. Webhooks are
-signature-verified; sealed requests bind the generation, attempt, run, config,
-runtime, and Git subject; and logs redact named/nested credentials and known
-token shapes. A bounded private task-log tail is stored in Fly's SQLite
-database so operator debugging survives workspace deletion; raw logs are not
-attached to Linear or GitHub. GitHub branch protection and a fine-grained PAT
-remain the outer enforcement layer.
+## Security model
 
-The deterministic contract suite and Docker smoke are green locally. Live
-Linear/Daytona/Fly acceptance is intentionally a separate deployment gate
-because it consumes operator-owned credentials and account state.
+Only credentials declared by the selected stage enter a sandbox. Daytona,
+Fly, webhook, installation, and operator credentials remain in the supervisor.
+Webhook signatures are verified before persistence; stage requests bind the
+run, generation, attempt, config, runtime, and Git subject; logs and retained
+tails are bounded and sanitized.
 
-OpenCode is an opt-in third engine. The first supported provider profile is
-`model: kimi-code/kimi-for-coding` using `KIMI_CODE_API_KEY` from the Kimi Code
-Console subscription endpoint (`https://api.kimi.com/coding/v1`), not a Kimi
-Open Platform pay-as-you-go key or `kimi-k3` model ID. Production enablement
-requires a live operator-owned check that this stable alias is currently backed
-by K3 and authorized for OpenCode.
+These controls complement—not replace—GitHub branch protection, least-privilege
+tokens, review rules, and normal dependency hygiene. See [SECURITY.md](SECURITY.md)
+for the disclosure process and supported versions.
+
+## Development
+
+The repository contains four independent npm projects and intentionally has no
+root `package.json`. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for setup,
+tests, project conventions, and pull-request expectations.
+
+## License
+
+OpenThrottle is available under the [MIT License](LICENSE).

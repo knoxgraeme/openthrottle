@@ -7,9 +7,10 @@
 # root (the Claude + Codex skill bodies), which lives as a sibling of
 # `sandbox/`, not inside it. See sandbox/README.md.
 
-FROM node:22-bookworm
+FROM node:22-bookworm@sha256:0557ac14e0d45d02ed563067b82856ca5e7aa3437fa28d98d4350ea9c3d9494a
 
-LABEL org.opencontainers.image.source="https://github.com/knoxgraeme/openthrottle"
+LABEL org.opencontainers.image.source="https://github.com/knoxgraeme/openthrottle" \
+      org.opencontainers.image.licenses="MIT"
 
 # ---------------------------------------------------------------------------
 # System packages: git curl jq ripgrep bats gh yq gosu
@@ -39,7 +40,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG GOSU_VERSION=1.17
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) gosu_sha256="bbc4136d03ab138b1ad66fa4fc051bafc6cc7ffae632b069a53657279a450de3" ;; \
+      arm64) gosu_sha256="c3805a85d17f4454c23d7059bcb97e1ec1af272b90126e79ed002342de08389b" ;; \
+      *) echo "unsupported gosu architecture: $arch" >&2; exit 1 ;; \
+    esac; \
     curl -fsSL -o /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${arch}"; \
+    echo "${gosu_sha256}  /usr/local/bin/gosu" | sha256sum -c -; \
     chmod +x /usr/local/bin/gosu; \
     gosu nobody true
 
@@ -49,7 +56,13 @@ RUN set -eux; \
 ARG YQ_VERSION=v4.44.3
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) yq_sha256="a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7" ;; \
+      arm64) yq_sha256="0e7e1524f68d91b3ff9b089872d185940ab0fa020a5a9052046ef10547023156" ;; \
+      *) echo "unsupported yq architecture: $arch" >&2; exit 1 ;; \
+    esac; \
     curl -fsSL -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${arch}"; \
+    echo "${yq_sha256}  /usr/local/bin/yq" | sha256sum -c -; \
     chmod +x /usr/local/bin/yq; \
     yq --version
 

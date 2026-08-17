@@ -1,5 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +16,10 @@ import { parse } from "yaml";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "../../..");
 const workflowSource = readFileSync(join(repositoryRoot, ".github/workflows/release.yml"), "utf8");
+const workflowDirectory = join(repositoryRoot, ".github/workflows");
+const workflowSources = readdirSync(workflowDirectory)
+  .filter((name) => /\.ya?ml$/.test(name))
+  .map((name) => readFileSync(join(workflowDirectory, name), "utf8"));
 const workflow = parse(workflowSource) as {
   on: { push: { branches: string[]; tags: string[] } };
   jobs: Record<string, {
@@ -61,6 +73,22 @@ function runReleasePlan(options: {
 }
 
 describe("npm release workflow", () => {
+  it("pins every third-party action to an immutable commit", () => {
+    const uses = workflowSources.flatMap((source) =>
+      [...source.matchAll(/^\s*(?:-\s*)?uses:\s*([^\s#]+)/gm)].map((match) => match[1]!)
+    );
+
+    expect(uses.length).toBeGreaterThan(0);
+    for (const reference of uses) {
+      if (reference.startsWith("./")) continue;
+      if (reference.startsWith("docker://")) {
+        expect(reference).toMatch(/^docker:\/\/[^@]+@sha256:[0-9a-f]{64}$/);
+      } else {
+        expect(reference).toMatch(/^[^@]+@[0-9a-f]{40}$/);
+      }
+    }
+  });
+
   it("publishes new main versions through npm trusted publishing", () => {
     expect(workflow.on.push.branches).toContain("main");
     expect(workflow.on.push.tags).toContain("v*");
@@ -92,6 +120,10 @@ describe("npm release workflow", () => {
 
     const packageJson = JSON.parse(readFileSync(join(repositoryRoot, "cli/package.json"), "utf8"));
     expect(packageJson.repository.url).toBe("https://github.com/knoxgraeme/openthrottle");
+    expect(packageJson.license).toBe("MIT");
+    expect(packageJson.publishConfig).toEqual({ access: "public" });
+    expect(readFileSync(join(repositoryRoot, "cli/LICENSE"), "utf8"))
+      .toBe(readFileSync(join(repositoryRoot, "LICENSE"), "utf8"));
   });
 
   it("skips duplicate main versions without weakening tag and manual artifacts", () => {

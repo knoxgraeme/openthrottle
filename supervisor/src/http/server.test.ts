@@ -1597,6 +1597,79 @@ describe("coordinator-only server", () => {
     expect(await response.text()).toContain("LINEAR_WEBHOOK_SECRET");
   });
 
+  it("bounds public webhook request bodies before signature verification", async () => {
+    const declaredSize = String((5 * 1024 * 1024) + 1);
+    const server = app();
+    const linear = await server.request("/webhooks/linear", {
+      method: "POST",
+      headers: {
+        "Content-Length": declaredSize,
+        "Linear-Signature": "0".repeat(64),
+      },
+      body: "{}",
+    });
+    const github = await server.request("/webhooks/github", {
+      method: "POST",
+      headers: {
+        "Content-Length": declaredSize,
+        "X-GitHub-Event": "push",
+        "X-Hub-Signature-256": `sha256=${"0".repeat(64)}`,
+      },
+      body: "{}",
+    });
+
+    expect(linear.status).toBe(413);
+    expect(github.status).toBe(413);
+    expect(await linear.text()).toBe("webhook payload exceeds 5 MiB");
+    expect(await github.text()).toBe("webhook payload exceeds 5 MiB");
+    expect(db.prepare("SELECT COUNT(*) FROM webhook_deliveries").pluck().get()).toBe(0);
+  });
+
+  it("bounds streamed public webhook bodies without trusting Content-Length", async () => {
+    const server = app();
+    const oversizedStream = () => {
+      let chunksEmitted = 0;
+      return new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.enqueue(new Uint8Array(1024 * 1024));
+          chunksEmitted += 1;
+          if (chunksEmitted === 6) controller.close();
+        },
+      });
+    };
+    const request = (
+      path: "/webhooks/linear" | "/webhooks/github",
+      headers: Record<string, string>
+    ) => {
+      const streamedRequest = new Request(`http://localhost${path}`, {
+        method: "POST",
+        headers,
+        body: oversizedStream(),
+        duplex: "half",
+      } as RequestInit & { duplex: "half" });
+      expect(streamedRequest.headers.get("content-length")).toBeNull();
+      return server.request(streamedRequest);
+    };
+
+    const linear = request("/webhooks/linear", {
+      "Linear-Signature": "0".repeat(64),
+    });
+    const github = request("/webhooks/github", {
+      "X-GitHub-Event": "push",
+      "X-Hub-Signature-256": `sha256=${"0".repeat(64)}`,
+    });
+    const [linearResponse, githubResponse] = await Promise.all([
+      linear,
+      github,
+    ]);
+
+    expect(linearResponse.status).toBe(413);
+    expect(githubResponse.status).toBe(413);
+    expect(await linearResponse.text()).toBe("webhook payload exceeds 5 MiB");
+    expect(await githubResponse.text()).toBe("webhook payload exceeds 5 MiB");
+    expect(db.prepare("SELECT COUNT(*) FROM webhook_deliveries").pluck().get()).toBe(0);
+  });
+
   it("fails Linear deliveries before admission when OAuth is unavailable", async () => {
     const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
     const catalog = loadPipelineCatalog(

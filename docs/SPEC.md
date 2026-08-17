@@ -55,8 +55,9 @@ self-contained OpenThrottle skills. There is no second execution architecture.
 
 ## Admission and routing
 
-1. Linear HMAC and timestamp freshness, or GitHub webhook HMAC, are verified
-   before persistence.
+1. Linear and GitHub webhook bodies are capped at 5 MiB before signature
+   verification. Linear HMAC and timestamp freshness, or GitHub webhook HMAC,
+   are then verified before persistence.
 2. A Linear `created` agent-session event must contain an issue, session, and a
    durable `repository_registrations` match by team id or key. A GitHub Issue
    admission event must come from the registered repository and carry the exact
