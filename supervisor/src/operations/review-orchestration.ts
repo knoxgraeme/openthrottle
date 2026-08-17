@@ -595,7 +595,11 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
     // frees its slot immediately, allowing the same drain to continue walking
     // the deterministic roster. Actual launches remain active until a later
     // collection observes their result.
-    while (!terminalObserved && cursor < unlaunched.length && active < maxParallel) {
+    while (
+      (maxParallel > 1 || !terminalObserved) &&
+      cursor < unlaunched.length &&
+      active < maxParallel
+    ) {
       const available = maxParallel - active;
       const batch = unlaunched.slice(cursor, cursor + available);
       cursor += batch.length;
@@ -653,6 +657,11 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
       for (const request of input.requests) collected.push(await collectOne(request));
     } else {
       collected.push(...await Promise.all(input.requests.map(collectOne)));
+      // Concurrent fanout is a gather barrier. Even when one sibling has
+      // already failed, keep the parent pending until every roster member has
+      // settled. The roster-order loop below then chooses the deterministic
+      // terminal result and skips synthesis and validation.
+      if (collected.some(({ result }) => !result)) return { pending: true };
     }
     for (const { request, result } of collected) {
       if (!result) return { pending: true };

@@ -303,6 +303,7 @@ function stopContainer(name) {
 // cache it the same way readGraphFile below caches the static graph file --
 // every scenario in main() shares the one container this harness starts.
 let runtimeDescriptorCache;
+let successfulStagePreparations = 0;
 function readRuntimeDescriptor(container) {
   if (!runtimeDescriptorCache) {
     const raw = dockerExec(container, ["node", "/opt/openthrottle/runner/capabilities.mjs", "--print"]);
@@ -423,6 +424,21 @@ function createDockerSandboxRuntime(container) {
           `composite workspace preparation failed (${result.status}): stderr=${result.stderr} stdout=${result.stdout}`
         );
       }
+      successfulStagePreparations += 1;
+      const homeBoundary = dockerExec(container, ["stat", "-c", "%U:%G %a", "/home/agent"]).trim();
+      assert(
+        homeBoundary === "agent:agent 700",
+        `stage preparation ${successfulStagePreparations} did not restore the agent home boundary: ${homeBoundary}`
+      );
+      const homeWriteProbe = dockerExecStatus(
+        container,
+        ["sh", "-c", "probe=/home/agent/.ot-home-boundary-probe; : > \"$probe\" && rm -f \"$probe\""],
+        { user: "agent" }
+      );
+      assert(
+        homeWriteProbe.status === 0,
+        `stage preparation ${successfulStagePreparations} left /home/agent unwritable: ${homeWriteProbe.stderr}`
+      );
       const preparedSubject = dockerExecStatus(container, [
         "git",
         "-C",
@@ -1412,6 +1428,11 @@ async function main() {
     await runReplayScenario({ db, container, fixture });
     await runNeedsHumanScenario({ db, container, fixture });
     await runLoopAdapterReplayScenario({ db, container, fixture });
+
+    assert(
+      successfulStagePreparations >= 2,
+      `home-boundary replay proof requires at least two stage preparations, observed ${successfulStagePreparations}`
+    );
 
     log("structured walking skeleton PASSED");
   } finally {
