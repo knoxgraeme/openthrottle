@@ -312,3 +312,70 @@ make_stage_branch_fixture() {
   [ "$status" -eq 0 ]
   [ "$output" = "absent" ]
 }
+
+@test "stage-boundary process cleanup rechecks until every live action process is gone" {
+  fake_bin="${BATS_TEST_TMPDIR}/process-fence-bin"
+  state_file="${BATS_TEST_TMPDIR}/process-state"
+  signal_log="${BATS_TEST_TMPDIR}/signals"
+  mkdir -p "$fake_bin"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'if [[ "$#" -eq 1 && "$1" == "-u" ]]; then printf "0\n"; exit 0; fi' \
+    'if [[ "$#" -eq 2 && "$1" == "-u" && "$2" == "agent" ]]; then printf "1001\n"; exit 0; fi' \
+    'exit 2' > "${fake_bin}/id"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'if [[ "$(< "$FAKE_PROCESS_STATE")" == "live" ]]; then printf " 101 S\n 102 Z\n"; fi' \
+    > "${fake_bin}/ps"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    '[[ "$1" == "-KILL" && "$2" == "-u" && "$3" == "1001" ]] || exit 2' \
+    'printf "signal\n" >> "$FAKE_SIGNAL_LOG"' \
+    'if [[ "$(< "$FAKE_PROCESS_STATE")" != "sticky" ]]; then printf "empty\n" > "$FAKE_PROCESS_STATE"; fi' \
+    > "${fake_bin}/pkill"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "${fake_bin}/sleep"
+  chmod 0755 "${fake_bin}/id" "${fake_bin}/ps" "${fake_bin}/pkill" "${fake_bin}/sleep"
+
+  ACTION_USERS=(agent)
+  PROCESS_FENCE_MAX_ATTEMPTS=3
+  PROCESS_FENCE_SLEEP_SECONDS=0
+  log() { printf '%s\n' "$*"; }
+  eval "$(sed -n '/^live_action_user_pids()/,/^}/p' "${BATS_TEST_DIRNAME}/../entrypoint.sh")"
+  eval "$(sed -n '/^terminate_agent_processes()/,/^}/p' "${BATS_TEST_DIRNAME}/../entrypoint.sh")"
+  printf 'live\n' > "$state_file"
+  export FAKE_PROCESS_STATE="$state_file" FAKE_SIGNAL_LOG="$signal_log"
+
+  run env PATH="${fake_bin}:$PATH" bash -c \
+    "$(declare -p ACTION_USERS PROCESS_FENCE_MAX_ATTEMPTS PROCESS_FENCE_SLEEP_SECONDS); $(declare -f log live_action_user_pids terminate_agent_processes); terminate_agent_processes"
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$signal_log" | tr -d ' ')" -eq 1 ]
+}
+
+@test "stage-boundary process cleanup fails closed when a principal never converges" {
+  fake_bin="${BATS_TEST_TMPDIR}/process-fence-bin"
+  state_file="${BATS_TEST_TMPDIR}/process-state"
+  signal_log="${BATS_TEST_TMPDIR}/signals"
+  mkdir -p "$fake_bin"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'if [[ "$#" -eq 1 && "$1" == "-u" ]]; then printf "0\n"; exit 0; fi' \
+    'if [[ "$#" -eq 2 && "$1" == "-u" && "$2" == "agent" ]]; then printf "1001\n"; exit 0; fi' \
+    'exit 2' > "${fake_bin}/id"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf " 201 Sl\n 202 Z+\n"' > "${fake_bin}/ps"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    '[[ "$1" == "-KILL" && "$2" == "-u" && "$3" == "1001" ]] || exit 2' \
+    'printf "signal\n" >> "$FAKE_SIGNAL_LOG"' > "${fake_bin}/pkill"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "${fake_bin}/sleep"
+  chmod 0755 "${fake_bin}/id" "${fake_bin}/ps" "${fake_bin}/pkill" "${fake_bin}/sleep"
+
+  ACTION_USERS=(agent)
+  PROCESS_FENCE_MAX_ATTEMPTS=2
+  PROCESS_FENCE_SLEEP_SECONDS=0
+  log() { printf '%s\n' "$*"; }
+  eval "$(sed -n '/^live_action_user_pids()/,/^}/p' "${BATS_TEST_DIRNAME}/../entrypoint.sh")"
+  eval "$(sed -n '/^terminate_agent_processes()/,/^}/p' "${BATS_TEST_DIRNAME}/../entrypoint.sh")"
+  printf 'sticky\n' > "$state_file"
+  export FAKE_PROCESS_STATE="$state_file" FAKE_SIGNAL_LOG="$signal_log"
+
+  run env PATH="${fake_bin}:$PATH" bash -c \
+    "$(declare -p ACTION_USERS PROCESS_FENCE_MAX_ATTEMPTS PROCESS_FENCE_SLEEP_SECONDS); $(declare -f log live_action_user_pids terminate_agent_processes); terminate_agent_processes"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cleanup did not converge to empty"* ]]
+  [ "$(wc -l < "$signal_log" | tr -d ' ')" -eq 2 ]
+}

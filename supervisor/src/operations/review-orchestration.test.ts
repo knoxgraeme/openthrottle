@@ -221,6 +221,14 @@ function successfulReviewResult(
   };
 }
 
+function failedReviewResult(request: LoopActionRequest): LoopActionResult {
+  return {
+    ...successfulReviewResult(request),
+    outcome: "failure",
+    receipt: "persona failed",
+  };
+}
+
 describe("review subaction identifiers", () => {
   it("derives one deterministic action id per review role", () => {
     const action = reviewAction();
@@ -366,6 +374,72 @@ describe("createReviewOrchestrator", () => {
     }),
     label: "review selector action",
   });
+
+  const failingFanoutScenario = (maxParallel: number) => {
+    const action = reviewAction();
+    const selectorRequest = launchInput().request;
+    const personaIds = [
+      "correctness-dataflow",
+      "tests-contracts",
+      "reliability-adversarial",
+      "performance",
+    ];
+    const authority = buildReviewSelectorAuthority({ subject: SUBJECT });
+    const selectorSummary = JSON.stringify({
+      schema: "openthrottle.review-selector-recommendation/v1",
+      subject: SUBJECT,
+      policy_digest: authority.policy_digest,
+      personas: personaIds.map((personaId) => ({
+        persona_id: personaId,
+        rationale: `Exercise fanout failure behavior for ${personaId}.`,
+      })),
+    });
+    const results = new Map<string, LoopActionResult>([
+      [selectorRequest.actionId, successfulReviewResult(selectorRequest, selectorSummary)],
+    ]);
+    const dispatches = new Map<string, any>([[selectorRequest.actionId, {
+      request_hash: selectorRequest.requestHash,
+      idempotency_key: selectorRequest.idempotencyKey,
+      dispatched_at: "2099-07-22T11:30:00.000Z",
+      dispatch_time_source: "acknowledged",
+    }]]);
+    const launched: LoopActionRequest[] = [];
+    const deps = orchestratorDeps({
+      maxParallel,
+      store: {
+        ...orchestratorDeps().store,
+        getReviewSubactionDispatch: vi.fn((_parentActionId: string, actionId: string) => dispatches.get(actionId)),
+        prepareReviewSubactionDispatch: vi.fn((input: any) => {
+          dispatches.set(input.actionId, {
+            request_hash: input.requestHash,
+            idempotency_key: input.idempotencyKey,
+            dispatched_at: null,
+            dispatch_time_source: null,
+          });
+          return "recorded" as const;
+        }),
+        markReviewSubactionDispatched: vi.fn((_parentActionId: string, actionId: string, source: string) => {
+          const row = dispatches.get(actionId)!;
+          row.dispatched_at = "2099-07-22T11:31:00.000Z";
+          row.dispatch_time_source = source;
+        }),
+      } as unknown as ReviewOrchestrationDeps["store"],
+      runtime: {
+        collectLoopActionResult: vi.fn(async (_resource: unknown, input: { actionId: string }) =>
+          results.get(input.actionId) ?? null),
+        dispatchLoopAction: vi.fn(async (_resource: unknown, request: LoopActionRequest) => {
+          launched.push(request);
+          results.set(
+            request.actionId,
+            request.skill === personaIds[0]
+              ? failedReviewResult(request)
+              : successfulReviewResult(request)
+          );
+        }),
+      } as unknown as ReviewOrchestrationDeps["runtime"],
+    });
+    return { action, selectorRequest, personaIds, launched, orchestrator: createReviewOrchestrator(deps) };
+  };
 
   it("dispatches an unlaunched subaction and records the acknowledged dispatch", async () => {
     const deps = orchestratorDeps();
@@ -589,5 +663,29 @@ describe("createReviewOrchestrator", () => {
     expect(launched.map((request) => request.skill)).toEqual(selectedPersonaIds);
     expect(launched.filter((request) => request.skill === "tests-contracts")).toHaveLength(1);
     expect(dispatches.get(launched[2]!.actionId)?.dispatch_time_source).toBe("prepared_fallback");
+  });
+
+  it("gathers every concurrent persona before returning a deterministic sibling failure", async () => {
+    const { action, selectorRequest, personaIds, launched, orchestrator } = failingFanoutScenario(3);
+
+    await expect(orchestrator.collectOrchestratedFinalReview(
+      {} as never, instance(), action, selectorRequest
+    )).resolves.toBeNull();
+    expect(launched.map((request) => request.skill)).toEqual(personaIds.slice(0, 3));
+
+    await expect(orchestrator.collectOrchestratedFinalReview(
+      {} as never, instance(), action, selectorRequest
+    )).resolves.toMatchObject({ terminal: true, outcome: "failure" });
+    expect(launched.map((request) => request.skill)).toEqual(personaIds);
+    expect(new Set(launched.map((request) => request.actionId))).toHaveLength(personaIds.length);
+  });
+
+  it("preserves serial early-stop behavior when concurrency is one", async () => {
+    const { action, selectorRequest, personaIds, launched, orchestrator } = failingFanoutScenario(1);
+
+    await expect(orchestrator.collectOrchestratedFinalReview(
+      {} as never, instance(), action, selectorRequest
+    )).resolves.toMatchObject({ terminal: true, outcome: "failure" });
+    expect(launched.map((request) => request.skill)).toEqual(personaIds.slice(0, 1));
   });
 });

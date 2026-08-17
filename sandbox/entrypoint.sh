@@ -26,6 +26,8 @@ ACTION_USERS=(
   ot-review-standards
   ot-review-validator
 )
+PROCESS_FENCE_MAX_ATTEMPTS=100
+PROCESS_FENCE_SLEEP_SECONDS=0.1
 REPO_DIR="${AGENT_HOME}/repo"
 OT_DIR="${AGENT_HOME}/.ot"
 OPT_DIR="/opt/openthrottle"
@@ -53,14 +55,73 @@ as_agent() {
 # descendants owned by the stage agent or any isolated review principal before
 # new credentials or trusted runtime config are materialized, so a process from
 # an untrusted review cannot cross that boundary.
+live_action_user_pids() {
+  local uid="$1" output status=0 pid process_state
+  output="$(ps -o pid=,stat= -u "$uid" 2>/dev/null)" || status=$?
+  if [[ "$status" -eq 1 ]]; then
+    return 0
+  fi
+  if [[ "$status" -ne 0 ]]; then
+    return "$status"
+  fi
+  while read -r pid process_state; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ && -n "$process_state" ]] || continue
+    # Zombies are already dead, cannot mutate state, and cannot be removed by
+    # SIGKILL while they wait for their parent to reap them.
+    [[ "$process_state" == *Z* ]] || printf '%s\n' "$pid"
+  done <<< "$output"
+}
+
 terminate_agent_processes() {
-  local user status
+  local user uid current_uid status attempt live_pids converged
+  current_uid="$(id -u)"
   for user in "${ACTION_USERS[@]}"; do
-    status=0
-    pkill -KILL -u "$user" 2>/dev/null || status=$?
-    if [[ "$status" -ne 0 && "$status" -ne 1 ]]; then
-      log "FATAL: could not terminate stale ${user} processes"
-      return "$status"
+    uid="$(id -u "$user" 2>/dev/null)" || {
+      log "FATAL: could not resolve action principal ${user}"
+      return 1
+    }
+    if [[ ! "$uid" =~ ^[1-9][0-9]*$ || "$uid" == "$current_uid" ]]; then
+      log "FATAL: refusing unsafe process cleanup for ${user} uid ${uid}"
+      return 1
+    fi
+
+    converged=0
+    attempt=0
+    while [[ "$attempt" -lt "$PROCESS_FENCE_MAX_ATTEMPTS" ]]; do
+      status=0
+      live_pids="$(live_action_user_pids "$uid")" || status=$?
+      if [[ "$status" -ne 0 ]]; then
+        log "FATAL: could not enumerate stale ${user} processes"
+        return "$status"
+      fi
+      if [[ -z "$live_pids" ]]; then
+        converged=1
+        break
+      fi
+
+      status=0
+      # Signal by UID, not by enumerated PID: a PID reused between observation
+      # and delivery cannot redirect root's signal outside this principal.
+      pkill -KILL -u "$uid" 2>/dev/null || status=$?
+      if [[ "$status" -ne 0 && "$status" -ne 1 ]]; then
+        log "FATAL: could not terminate stale ${user} processes"
+        return "$status"
+      fi
+      attempt=$((attempt + 1))
+      sleep "$PROCESS_FENCE_SLEEP_SECONDS"
+    done
+
+    if [[ "$converged" -ne 1 ]]; then
+      status=0
+      live_pids="$(live_action_user_pids "$uid")" || status=$?
+      if [[ "$status" -ne 0 ]]; then
+        log "FATAL: could not enumerate stale ${user} processes"
+        return "$status"
+      fi
+      if [[ -n "$live_pids" ]]; then
+        log "FATAL: stale ${user} process cleanup did not converge to empty"
+        return 1
+      fi
     fi
   done
 }
@@ -72,6 +133,16 @@ terminate_agent_processes() {
 # default, so an agent-planted child symlink is never traversed as root.
 restore_agent_state_ownership() {
   local path
+  if [[ -L "$AGENT_HOME" || ! -d "$AGENT_HOME" ]]; then
+    log "FATAL: agent home is not a real directory: ${AGENT_HOME}"
+    return 1
+  fi
+  # Concurrent loop actions lock this shared parent root:root 0711 so sibling
+  # homes cannot expose persistent stage state. With every action principal
+  # terminated above, restore only the boundary itself before the next stage
+  # writes ~/.gitconfig; sealed descendants retain their existing ownership.
+  chown "${AGENT_USER}:${AGENT_USER}" "$AGENT_HOME"
+  chmod 0700 "$AGENT_HOME"
   for path in \
     "${AGENT_HOME}/.claude" \
     "${AGENT_HOME}/.codex" \
