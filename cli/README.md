@@ -14,6 +14,8 @@ openthrottle stop <ticket>
 openthrottle logs <ticket>
 openthrottle operator-skill install
 openthrottle operator-skill status --json
+openthrottle planning-skill install
+openthrottle planning-skill status --json
 ```
 
 - `setup` runs guided one-time platform onboarding from the CLI's pinned
@@ -40,7 +42,11 @@ openthrottle operator-skill status --json
   GitHub-Issue control with the deployed supervisor, creates or refreshes the
   repository webhook, and verifies GitHub/Daytona readiness. Linear control
   asks for a team key and optional team ID; GitHub control does not. It also
-  supports non-Node repositories with manually entered commands.
+  supports non-Node repositories with manually entered commands. Before
+  registration, it idempotently installs the global `openthrottle` operator
+  skill and `ot-plan` authoring skill for every locally detected supported
+  agent. A skill conflict stops before repository registration and prints the
+  exact recovery command.
 - `init --editable-skills` additionally scaffolds the editable implementation
   adapter for the simple pipeline at
   `.openthrottle/skills/implement-plan/`, writes its repository graph at
@@ -65,6 +71,10 @@ openthrottle operator-skill status --json
   Skillfish telemetry for the embedded flow, never forwards OpenThrottle or
   provider credentials, and scopes removal to the exact Skillfish-managed
   OpenThrottle skill directory.
+- `planning-skill install|status|refresh|remove` applies the same lifecycle and
+  ownership fences to the local `ot-plan` authoring skill. `init` invokes both
+  installers automatically; the explicit commands remain available for repair
+  and inspection.
 
 Other environment values: `DAYTONA_API_KEY` (plus optional
 `OT_FLY_APP`/`OT_FLY_ORG`/`OT_FLY_REGION` resource overrides and
@@ -89,15 +99,17 @@ until their graph bindings can be represented faithfully. Repository
 registrations live in the supervisor's durable SQLite database; they are not
 Fly secrets.
 
-Repositories can recommend the local skill in their own onboarding docs with:
+`init` installs both local skills automatically. They can also be repaired or
+installed independently with:
 
 ```bash
 openthrottle operator-skill install
+openthrottle planning-skill install
 ```
 
-Do not commit the installed skill, provider credentials, or user-global agent
-configuration. The canonical source remains `skills/operator/openthrottle/` in
-the public OpenThrottle repository.
+Do not commit installed skills, provider credentials, or user-global agent
+configuration. Their canonical sources remain under `skills/operator/` and
+`skills/planning/` in the public OpenThrottle repository.
 
 Development:
 

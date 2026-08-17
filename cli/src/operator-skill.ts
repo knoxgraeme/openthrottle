@@ -22,8 +22,27 @@ import { getErrorMessage } from "./util.js";
 const OWNER = "knoxgraeme";
 const REPO = "openthrottle";
 const OWNED_REPOSITORIES = new Set([REPO, "openthrottle-v2"]);
-const SKILL_PATH = "skills/operator/openthrottle";
-const SKILL_NAME = "openthrottle";
+interface ManagedSkillDescriptor {
+  name: "openthrottle" | "ot-plan";
+  path: string;
+  packagedCategory: "operator" | "planning";
+  label: string;
+  recoveryCommand: "operator-skill" | "planning-skill";
+}
+const OPERATOR_SKILL: ManagedSkillDescriptor = {
+  name: "openthrottle",
+  path: "skills/operator/openthrottle",
+  packagedCategory: "operator",
+  label: "OpenThrottle operator skill",
+  recoveryCommand: "operator-skill",
+};
+const PLANNING_SKILL: ManagedSkillDescriptor = {
+  name: "ot-plan",
+  path: "skills/planning/ot-plan",
+  packagedCategory: "planning",
+  label: "OpenThrottle planning skill",
+  recoveryCommand: "planning-skill",
+};
 const SUPPORTED_AGENTS = ["Claude Code", "Codex", "OpenCode"] as const;
 const AGENT_ROOTS: Record<SupportedAgent, string> = {
   "Claude Code": ".claude",
@@ -66,7 +85,7 @@ export interface OperatorSkillAgentResult {
 }
 
 export interface OperatorSkillResult {
-  schema: "openthrottle.operator-skill/v1";
+  schema: "openthrottle.operator-skill/v1" | "openthrottle.planning-skill/v1";
   action: OperatorSkillAction;
   success: boolean;
   source: string;
@@ -85,7 +104,7 @@ type SkillfishRunner = (
   options: { cwd: string; env: NodeJS.ProcessEnv }
 ) => SpawnSyncReturns<Buffer>;
 
-interface OperatorSkillOptions {
+export interface OperatorSkillOptions {
   runner?: SkillfishRunner;
   cwd?: string;
   home?: string;
@@ -134,9 +153,11 @@ function gitHead(directory: string): string | undefined {
 }
 
 export function resolveOperatorSkillSourceRef(options: { sourceRef?: string; moduleUrl?: string } = {}): string {
-  const explicit = options.sourceRef?.trim() || process.env.OT_OPERATOR_SKILL_SOURCE_REF?.trim();
+  const explicit = options.sourceRef?.trim() ||
+    process.env.OT_LOCAL_SKILLS_SOURCE_REF?.trim() ||
+    process.env.OT_OPERATOR_SKILL_SOURCE_REF?.trim();
   if (explicit) {
-    if (!immutableRef(explicit)) throw new Error(`operator skill source ref is not immutable: ${explicit}`);
+    if (!immutableRef(explicit)) throw new Error(`local skill source ref is not immutable: ${explicit}`);
     return explicit;
   }
 
@@ -156,24 +177,36 @@ export function resolveOperatorSkillSourceRef(options: { sourceRef?: string; mod
   const sha = gitHead(sourceCheckout);
   if (sha) return sha;
 
-  throw new Error("operator skill source ref is unavailable; rebuild with git metadata or set OT_OPERATOR_SKILL_SOURCE_REF");
+  throw new Error("local skill source ref is unavailable; rebuild with git metadata or set OT_LOCAL_SKILLS_SOURCE_REF");
 }
 
 export function operatorSkillSource(sourceRef: string): string {
-  return `${OWNER}/${REPO}@${sourceRef}/${SKILL_PATH}`;
+  return managedSkillSource(OPERATOR_SKILL, sourceRef);
+}
+
+function managedSkillSource(skill: ManagedSkillDescriptor, sourceRef: string): string {
+  return `${OWNER}/${REPO}@${sourceRef}/${skill.path}`;
 }
 
 export function resolveOperatorSkillBundlePath(moduleUrl = import.meta.url): string {
+  return resolveManagedSkillBundlePath(OPERATOR_SKILL, moduleUrl);
+}
+
+export function resolvePlanningSkillBundlePath(moduleUrl = import.meta.url): string {
+  return resolveManagedSkillBundlePath(PLANNING_SKILL, moduleUrl);
+}
+
+function resolveManagedSkillBundlePath(skill: ManagedSkillDescriptor, moduleUrl = import.meta.url): string {
   const currentModuleDirectory = dirname(fileURLToPath(moduleUrl));
-  const packaged = join(currentModuleDirectory, "skills", "operator", SKILL_NAME, "SKILL.md");
+  const packaged = join(currentModuleDirectory, "skills", skill.packagedCategory, skill.name, "SKILL.md");
   if (existsSync(packaged)) return dirname(packaged);
-  return resolve(currentModuleDirectory, "..", "..", "skills", "operator", SKILL_NAME);
+  return resolve(currentModuleDirectory, "..", "..", "skills", skill.packagedCategory, skill.name);
 }
 
 function digestDirectory(root: string): string {
   const stat = lstatSync(root, { throwIfNoEntry: false });
   if (!stat?.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`operator skill bundle is not a real directory: ${root}`);
+    throw new Error(`local skill bundle is not a real directory: ${root}`);
   }
   const hash = createHash("sha256");
   const visit = (absolute: string, relative: string): void => {
@@ -181,7 +214,7 @@ function digestDirectory(root: string): string {
       const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
       const entryAbsolute = join(absolute, entry.name);
       if (entryRelative === ".skillfish.json") continue;
-      if (entry.isSymbolicLink()) throw new Error(`operator skill bundle must not contain symlinks: ${entryRelative}`);
+      if (entry.isSymbolicLink()) throw new Error(`local skill bundle must not contain symlinks: ${entryRelative}`);
       if (entry.isDirectory()) {
         visit(entryAbsolute, entryRelative);
       } else if (entry.isFile()) {
@@ -190,7 +223,7 @@ function digestDirectory(root: string): string {
         hash.update(readFileSync(entryAbsolute));
         hash.update("\0");
       } else {
-        throw new Error(`operator skill bundle contains a non-regular entry: ${entryRelative}`);
+        throw new Error(`local skill bundle contains a non-regular entry: ${entryRelative}`);
       }
     }
   };
@@ -200,6 +233,10 @@ function digestDirectory(root: string): string {
 
 export function operatorSkillBundleDigest(): string {
   return digestDirectory(resolveOperatorSkillBundlePath());
+}
+
+export function planningSkillBundleDigest(): string {
+  return digestDirectory(resolvePlanningSkillBundlePath());
 }
 
 function resolveSkillfishBin(): string {
@@ -273,12 +310,20 @@ function prepareSkillfishStagingHome(agents: SupportedAgent[]): string {
   return tempHome;
 }
 
-function operatorSkillTargetPath(home: string, agent: SupportedAgent): string {
-  return resolve(home, AGENT_SKILL_DIRS[agent], SKILL_NAME);
+function operatorSkillTargetPath(
+  home: string,
+  agent: SupportedAgent,
+  skill: ManagedSkillDescriptor = OPERATOR_SKILL
+): string {
+  return resolve(home, AGENT_SKILL_DIRS[agent], skill.name);
 }
 
-function stagedOperatorSkillPath(home: string, agent: SupportedAgent): string {
-  return resolve(home, AGENT_ROOTS[agent], "skills", SKILL_NAME);
+function stagedOperatorSkillPath(
+  home: string,
+  agent: SupportedAgent,
+  skill: ManagedSkillDescriptor = OPERATOR_SKILL
+): string {
+  return resolve(home, AGENT_ROOTS[agent], "skills", skill.name);
 }
 
 interface StagedSkillOperation {
@@ -295,18 +340,19 @@ interface StagedSkillOperation {
 function installStagedSkillsAtomically(
   staged: Map<SupportedAgent, string>,
   home: string,
-  needsReplace: Set<SupportedAgent>
+  needsReplace: Set<SupportedAgent>,
+  skill: ManagedSkillDescriptor = OPERATOR_SKILL
 ): OperatorSkillAgentResult[] {
   const nonce = `${process.pid}.${Date.now()}`;
   const operations: StagedSkillOperation[] = [...staged].map(([agent, sourcePath], index) => {
-    const targetPath = operatorSkillTargetPath(home, agent);
+    const targetPath = operatorSkillTargetPath(home, agent, skill);
     const targetParent = dirname(targetPath);
     return {
       agent,
       sourcePath,
       targetPath,
-      tempTarget: join(targetParent, `.openthrottle.tmp.${nonce}.${index}`),
-      backupTarget: join(targetParent, `.openthrottle.backup.${nonce}.${index}`),
+      tempTarget: join(targetParent, `.${skill.name}.tmp.${nonce}.${index}`),
+      backupTarget: join(targetParent, `.${skill.name}.backup.${nonce}.${index}`),
       replace: needsReplace.has(agent),
       backupCreated: false,
       targetInstalled: false,
@@ -394,12 +440,13 @@ function validatedStagedInstallEntries(
   json: SkillfishJson,
   expectedAgents: SupportedAgent[],
   tempHome: string,
-  expectedDigest: string
+  expectedDigest: string,
+  skill: ManagedSkillDescriptor = OPERATOR_SKILL
 ): Map<SupportedAgent, string> {
   const expected = new Set(expectedAgents);
   const staged = new Map<SupportedAgent, string>();
   for (const entry of installedEntries(json)) {
-    if (entry.skill !== SKILL_NAME) continue;
+    if (entry.skill !== skill.name) continue;
     if (typeof entry.agent !== "string" || !isSupportedAgent(entry.agent) || !expected.has(entry.agent)) {
       throw new Error(`Skillfish returned an unexpected OpenThrottle install agent: ${String(entry.agent)}`);
     }
@@ -410,7 +457,7 @@ function validatedStagedInstallEntries(
       throw new Error(`Skillfish returned an invalid OpenThrottle install path for ${entry.agent}`);
     }
     const stagedPath = resolve(entry.path);
-    const expectedPath = stagedOperatorSkillPath(tempHome, entry.agent);
+    const expectedPath = stagedOperatorSkillPath(tempHome, entry.agent, skill);
     if (stagedPath !== expectedPath) {
       throw new Error(`Skillfish staged ${entry.agent} at an unexpected path: ${entry.path}`);
     }
@@ -428,7 +475,8 @@ function validatedStagedInstallEntries(
 function runSkillfishJson(
   args: string[],
   options: OperatorSkillOptions,
-  agents?: SupportedAgent[]
+  agents?: SupportedAgent[],
+  skill: ManagedSkillDescriptor = OPERATOR_SKILL
 ): { json: SkillfishJson; raw: SpawnSyncReturns<Buffer> } {
   const realHome = options.home ?? homedir();
   const tempHome = prepareSkillfishHome(realHome, agents);
@@ -439,7 +487,7 @@ function runSkillfishJson(
     });
     const json = parseSkillfishJson(result);
     return {
-      json: args[0] === "list" ? normalizeListedInstallPaths(json, tempHome, realHome) : json,
+      json: args[0] === "list" ? normalizeListedInstallPaths(json, tempHome, realHome, skill) : json,
       raw: result,
     };
   } finally {
@@ -447,7 +495,12 @@ function runSkillfishJson(
   }
 }
 
-function normalizeListedInstallPaths(json: SkillfishJson, tempHome: string, realHome: string): SkillfishJson {
+function normalizeListedInstallPaths(
+  json: SkillfishJson,
+  tempHome: string,
+  realHome: string,
+  skill: ManagedSkillDescriptor = OPERATOR_SKILL
+): SkillfishJson {
   if (!Array.isArray(json.installed)) return json;
   return {
     ...json,
@@ -461,11 +514,11 @@ function normalizeListedInstallPaths(json: SkillfishJson, tempHome: string, real
       }
       const reportedPath = resolve(entry.path);
       const temporaryPaths = new Set([
-        stagedOperatorSkillPath(tempHome, entry.agent),
-        operatorSkillTargetPath(tempHome, entry.agent),
+        stagedOperatorSkillPath(tempHome, entry.agent, skill),
+        operatorSkillTargetPath(tempHome, entry.agent, skill),
       ]);
       return temporaryPaths.has(reportedPath)
-        ? { ...entry, path: operatorSkillTargetPath(realHome, entry.agent) }
+        ? { ...entry, path: operatorSkillTargetPath(realHome, entry.agent, skill) }
         : entry;
     }),
   };
@@ -490,8 +543,12 @@ function readManifest(skillPath: string): SkillManifest | undefined {
   }
 }
 
-function inspectOwnedInstall(entry: SkillfishInstalledSkill, expectedDigest: string): OwnedInstall | undefined {
-  if (entry.skill !== SKILL_NAME || typeof entry.agent !== "string" || !isSupportedAgent(entry.agent) || typeof entry.path !== "string") {
+function inspectOwnedInstall(
+  entry: SkillfishInstalledSkill,
+  expectedDigest: string,
+  skill: ManagedSkillDescriptor = OPERATOR_SKILL
+): OwnedInstall | undefined {
+  if (entry.skill !== skill.name || typeof entry.agent !== "string" || !isSupportedAgent(entry.agent) || typeof entry.path !== "string") {
     return undefined;
   }
   const manifest = readManifest(entry.path);
@@ -499,10 +556,10 @@ function inspectOwnedInstall(entry: SkillfishInstalledSkill, expectedDigest: str
     manifest?.owner === OWNER &&
     typeof manifest.repo === "string" &&
     OWNED_REPOSITORIES.has(manifest.repo) &&
-    manifest.path === SKILL_PATH &&
+    manifest.path === skill.path &&
     (manifest.source === "manifest" || manifest.source === "manual");
   if (!exact) {
-    return { agent: entry.agent, path: entry.path, exact: false, digestMatches: false, reason: "existing openthrottle skill is not Skillfish-managed from OpenThrottle" };
+    return { agent: entry.agent, path: entry.path, exact: false, digestMatches: false, reason: `existing ${skill.name} skill is not Skillfish-managed from OpenThrottle` };
   }
   let digestMatches = false;
   try {
@@ -519,12 +576,19 @@ function inspectOwnedInstall(entry: SkillfishInstalledSkill, expectedDigest: str
   };
 }
 
-function baseResult(action: OperatorSkillAction, sourceRef: string, sourceDigest: string): OperatorSkillResult {
+function baseResult(
+  action: OperatorSkillAction,
+  sourceRef: string,
+  sourceDigest: string,
+  skill: ManagedSkillDescriptor = OPERATOR_SKILL
+): OperatorSkillResult {
   return {
-    schema: "openthrottle.operator-skill/v1",
+    schema: skill === OPERATOR_SKILL
+      ? "openthrottle.operator-skill/v1"
+      : "openthrottle.planning-skill/v1",
     action,
     success: true,
-    source: operatorSkillSource(sourceRef),
+    source: managedSkillSource(skill, sourceRef),
     source_ref: sourceRef,
     source_digest: sourceDigest,
     installed: [],
@@ -540,7 +604,10 @@ function addRecovery(result: OperatorSkillResult, command: string): void {
   if (!result.recovery.includes(command)) result.recovery.push(command);
 }
 
-function writeHumanResult(result: OperatorSkillResult): void {
+function writeHumanResult(
+  result: OperatorSkillResult,
+  skill: ManagedSkillDescriptor = OPERATOR_SKILL
+): void {
   const rows = [
     ...result.installed,
     ...result.skipped,
@@ -548,7 +615,7 @@ function writeHumanResult(result: OperatorSkillResult): void {
     ...result.removed,
     ...result.unsupported,
   ];
-  console.log(`OpenThrottle operator skill ${result.action}: ${result.success ? "ok" : "attention required"}`);
+  console.log(`${skill.label} ${result.action}: ${result.success ? "ok" : "attention required"}`);
   console.log(`Source: ${result.source}`);
   for (const row of rows) {
     console.log(`- ${row.agent}: ${row.status}${row.reason ? ` (${row.reason})` : ""}${row.path ? ` ${row.path}` : ""}`);
@@ -567,18 +634,19 @@ function classifyCurrentInstalls(
   listJson: SkillfishJson,
   result: OperatorSkillResult,
   expectedDigest: string,
-  home: string
+  home: string,
+  skill: ManagedSkillDescriptor = OPERATOR_SKILL
 ): { detected: SupportedAgent[]; installs: Map<SupportedAgent, OwnedInstall> } {
   const detected = detectedSupportedAgents(listJson);
   const installs = new Map<SupportedAgent, OwnedInstall>();
   for (const entry of installedEntries(listJson)) {
-    const inspected = inspectOwnedInstall(entry, expectedDigest);
+    const inspected = inspectOwnedInstall(entry, expectedDigest, skill);
     if (inspected) installs.set(inspected.agent, inspected);
   }
   for (const agent of detected) {
-    const targetPath = operatorSkillTargetPath(home, agent);
+    const targetPath = operatorSkillTargetPath(home, agent, skill);
     if (existsSync(targetPath) && !installs.has(agent)) {
-      const inspected = inspectOwnedInstall({ skill: SKILL_NAME, agent, path: targetPath }, expectedDigest);
+      const inspected = inspectOwnedInstall({ skill: skill.name, agent, path: targetPath }, expectedDigest, skill);
       if (inspected) installs.set(agent, inspected);
     }
   }
@@ -607,17 +675,18 @@ function ensureSuccessfulSkillfish(
   return true;
 }
 
-export function runOperatorSkillAction(
+function runManagedSkillAction(
   action: OperatorSkillAction,
-  options: OperatorSkillOptions = {}
+  options: OperatorSkillOptions,
+  skill: ManagedSkillDescriptor
 ): OperatorSkillResult {
   const sourceRef = resolveOperatorSkillSourceRef(options);
-  const sourceDigest = operatorSkillBundleDigest();
-  const result = baseResult(action, sourceRef, sourceDigest);
+  const sourceDigest = digestDirectory(resolveManagedSkillBundlePath(skill));
+  const result = baseResult(action, sourceRef, sourceDigest, skill);
   const realHome = options.home ?? homedir();
-  const listed = runSkillfishJson(["list", "--global"], options);
+  const listed = runSkillfishJson(["list", "--global"], options, undefined, skill);
   if (!ensureSuccessfulSkillfish(listed.json, listed.raw, result, SUPPORTED_AGENTS)) return result;
-  const { detected, installs } = classifyCurrentInstalls(listed.json, result, sourceDigest, realHome);
+  const { detected, installs } = classifyCurrentInstalls(listed.json, result, sourceDigest, realHome, skill);
   if (action === "install" && detected.length === 0) {
     result.success = false;
     return result;
@@ -633,7 +702,7 @@ export function runOperatorSkillAction(
       } else {
         result.success = false;
         result.conflicted.push({ agent, status: "conflicted", path: install.path, reason: install.reason });
-        addRecovery(result, "openthrottle operator-skill remove && openthrottle operator-skill install");
+        addRecovery(result, `openthrottle ${skill.recoveryCommand} remove && openthrottle ${skill.recoveryCommand} install`);
       }
     }
     return result;
@@ -647,7 +716,7 @@ export function runOperatorSkillAction(
       result.conflicted.push({ agent: install.agent, status: "conflicted", path: install.path, reason: install.reason });
     }
     for (const install of removable) {
-      if (install.agent === "OpenCode" && resolve(install.path) === operatorSkillTargetPath(realHome, "OpenCode")) {
+      if (install.agent === "OpenCode" && resolve(install.path) === operatorSkillTargetPath(realHome, "OpenCode", skill)) {
         try {
           removeOwnedSkillDirectory(install.path);
           result.removed.push({ agent: install.agent, status: "removed", path: install.path });
@@ -657,7 +726,7 @@ export function runOperatorSkillAction(
         }
         continue;
       }
-      const removed = runSkillfishJson(["remove", SKILL_NAME, "--global", "--yes"], options, [install.agent]);
+      const removed = runSkillfishJson(["remove", skill.name, "--global", "--yes"], options, [install.agent], skill);
       if (!ensureSuccessfulSkillfish(removed.json, removed.raw, result, [install.agent])) continue;
       if (!existsSync(install.path)) {
         result.removed.push({ agent: install.agent, status: "removed", path: install.path });
@@ -683,7 +752,12 @@ export function runOperatorSkillAction(
     } else {
       result.success = false;
       result.conflicted.push({ agent, status: "conflicted", path: install.path, reason: install.reason });
-      addRecovery(result, install.exact ? "openthrottle operator-skill refresh" : "openthrottle operator-skill remove && openthrottle operator-skill install");
+      addRecovery(
+        result,
+        install.exact
+          ? `openthrottle ${skill.recoveryCommand} refresh`
+          : `openthrottle ${skill.recoveryCommand} remove && openthrottle ${skill.recoveryCommand} install`
+      );
     }
   }
   if (result.conflicted.length > 0 || needsInstall.length === 0) return result;
@@ -699,17 +773,17 @@ export function runOperatorSkillAction(
     if (!ensureSuccessfulSkillfish(json, install, result, needsInstall)) return result;
     let staged: Map<SupportedAgent, string>;
     try {
-      staged = validatedStagedInstallEntries(json, needsInstall, tempHome, sourceDigest);
+      staged = validatedStagedInstallEntries(json, needsInstall, tempHome, sourceDigest, skill);
     } catch (error) {
       result.success = false;
       const reason = getErrorMessage(error);
       for (const agent of needsInstall) {
-        result.conflicted.push({ agent, status: "conflicted", path: operatorSkillTargetPath(realHome, agent), reason });
+        result.conflicted.push({ agent, status: "conflicted", path: operatorSkillTargetPath(realHome, agent, skill), reason });
       }
       return result;
     }
     try {
-      result.installed.push(...installStagedSkillsAtomically(staged, realHome, needsReplace));
+      result.installed.push(...installStagedSkillsAtomically(staged, realHome, needsReplace, skill));
     } catch (error) {
       result.success = false;
       const reason = getErrorMessage(error);
@@ -717,7 +791,7 @@ export function runOperatorSkillAction(
         result.conflicted.push({
           agent,
           status: "conflicted",
-          path: operatorSkillTargetPath(realHome, agent),
+          path: operatorSkillTargetPath(realHome, agent, skill),
           reason,
         });
       }
@@ -728,12 +802,29 @@ export function runOperatorSkillAction(
   return result;
 }
 
-export function parseOperatorSkillArgs(args: string[]): { action: OperatorSkillAction; json: boolean } {
+export function runOperatorSkillAction(
+  action: OperatorSkillAction,
+  options: OperatorSkillOptions = {}
+): OperatorSkillResult {
+  return runManagedSkillAction(action, options, OPERATOR_SKILL);
+}
+
+export function runPlanningSkillAction(
+  action: OperatorSkillAction,
+  options: OperatorSkillOptions = {}
+): OperatorSkillResult {
+  return runManagedSkillAction(action, options, PLANNING_SKILL);
+}
+
+export function parseOperatorSkillArgs(
+  args: string[],
+  command = "operator-skill"
+): { action: OperatorSkillAction; json: boolean } {
   const json = args.includes("--json");
   const positional = args.filter((arg) => arg !== "--json");
   const action = positional[0] ?? "status";
   if (!["install", "status", "refresh", "remove"].includes(action)) {
-    throw new Error(`Unknown operator-skill action: ${action}`);
+    throw new Error(`Unknown ${command} action: ${action}`);
   }
   if (positional.length > 1) throw new Error(`Unexpected argument: ${positional[1]}`);
   return { action: action as OperatorSkillAction, json };
@@ -750,6 +841,24 @@ export default async function operatorSkill(args: string[] = []): Promise<void> 
     const message = sanitizeError(getErrorMessage(error));
     if (args.includes("--json")) {
       console.log(JSON.stringify({ schema: "openthrottle.operator-skill/v1", success: false, errors: [message] }, null, 2));
+    } else {
+      console.error(message);
+    }
+    process.exit(1);
+  }
+}
+
+export async function planningSkill(args: string[] = []): Promise<void> {
+  try {
+    const parsed = parseOperatorSkillArgs(args, "planning-skill");
+    const result = runPlanningSkillAction(parsed.action);
+    if (parsed.json) console.log(JSON.stringify(result, null, 2));
+    else writeHumanResult(result, PLANNING_SKILL);
+    if (!result.success) process.exit(1);
+  } catch (error) {
+    const message = sanitizeError(getErrorMessage(error));
+    if (args.includes("--json")) {
+      console.log(JSON.stringify({ schema: "openthrottle.planning-skill/v1", success: false, errors: [message] }, null, 2));
     } else {
       console.error(message);
     }

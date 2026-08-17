@@ -1376,8 +1376,12 @@ when both explicit environment values are absent. A complete
 `OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN` pair takes precedence; a partial pair
 fails closed and is never combined with stored access. Init then detects the GitHub
 origin/default branch,
-writes `.openthrottle.yml`, and idempotently registers either a Linear-team or
-GitHub-Issue control route plus the GitHub webhook. The registration body uses
+writes `.openthrottle.yml`, installs the pinned global `openthrottle` operator
+and `ot-plan` authoring skills through Skillfish for every detected supported
+local agent, and idempotently registers either a Linear-team or GitHub-Issue
+control route plus the GitHub webhook. Matching skill installs are skipped. A
+skill conflict or installation failure stops before external registration and
+prints the lifecycle recovery command. The registration body uses
 `controlProvider: "linear" | "github"` (default `linear` for existing clients);
 Linear team fields are required only for Linear and rejected for GitHub.
 Re-registering the same repository may switch its future control route

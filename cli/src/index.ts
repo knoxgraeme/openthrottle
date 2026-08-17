@@ -2,7 +2,7 @@
 // =============================================================================
 // openthrottle CLI entrypoint — a plain argv router, no CLI framework.
 //
-// Usage: openthrottle <setup|init|plan|validate|ship|status|stop|logs|operator-skill> [args]
+// Usage: openthrottle <setup|init|plan|validate|ship|status|stop|logs|operator-skill|planning-skill> [args]
 // =============================================================================
 
 const USAGE = `openthrottle — plan-first autonomous coding pipeline CLI
@@ -19,7 +19,8 @@ Usage:
                                     prints the manual secrets checklist.
   openthrottle init [--profile <name>] [--editable-skills] [--dry-run]
                                     Register the current GitHub repository and
-                                    Linear team, verify readiness, and write
+                                    control route, install local authoring/operator
+                                    skills, verify readiness, and write
                                     .openthrottle.yml. --profile selects saved
                                     onboarding state; the optional flag also
                                     scaffolds the editable simple pipeline;
@@ -43,6 +44,9 @@ Usage:
   openthrottle operator-skill <install|status|refresh|remove> [--json]
                                     Manage the explicit local OpenThrottle
                                     operator skill through pinned Skillfish.
+  openthrottle planning-skill <install|status|refresh|remove> [--json]
+                                    Manage the local ot-plan authoring skill
+                                    through pinned Skillfish.
 
   openthrottle --help              Show this message.
   openthrottle --version           Print the CLI version.
@@ -100,6 +104,11 @@ async function main(): Promise<void> {
     case 'operator-skill': {
       const { default: operatorSkill } = await import('./operator-skill.js');
       await operatorSkill(rest);
+      break;
+    }
+    case 'planning-skill': {
+      const { planningSkill } = await import('./operator-skill.js');
+      await planningSkill(rest);
       break;
     }
     case '--version':

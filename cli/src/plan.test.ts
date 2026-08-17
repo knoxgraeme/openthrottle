@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -287,6 +287,49 @@ describe("plan validation", () => {
     ].map((path) => readFileSync(new URL(path, planningSkillRoot), "utf8")).join("\n");
 
     expect(bundle).not.toMatch(/compound[- ]engineering|\bCE\b|\bce-[a-z]/i);
+  });
+
+  it("keeps the plan authoring skill self-contained", () => {
+    const planningSkillRoot = new URL("../../skills/planning/ot-plan/", import.meta.url);
+    const referenceFiles = readdirSync(new URL("references/", planningSkillRoot))
+      .filter((name) => name.endsWith(".md"))
+      .sort()
+      .map((name) => `references/${name}`);
+    const skillBody = readFileSync(new URL("SKILL.md", planningSkillRoot), "utf8");
+    const referencedFiles = [...skillBody.matchAll(/`(references\/[^`]+\.md)`/g)]
+      .map((match) => match[1]!)
+      .sort();
+    const bundle = [
+      "SKILL.md",
+      "agents/openai.yaml",
+      ...referenceFiles,
+    ].map((path) => readFileSync(new URL(path, planningSkillRoot), "utf8")).join("\n");
+
+    expect(referencedFiles).toEqual(referenceFiles);
+    for (const path of referencedFiles) {
+      expect(() => readFileSync(new URL(path, planningSkillRoot), "utf8")).not.toThrow();
+    }
+    expect(bundle).not.toMatch(/compound[- ]engineering|\bCE\b|\bce-[a-z]/i);
+    expect(bundle).not.toMatch(/\bTODO\b/);
+    expect(bundle).toMatch(/source-preservation ledger/i);
+    expect(bundle).toMatch(/fresh context/i);
+    expect(bundle).toMatch(/consequential/i);
+    expect(skillBody).toContain("for_each_unit");
+    expect(skillBody).toContain("input_scope");
+    expect(skillBody).toMatch(/built-in `simple` graph, do not consume units/i);
+    for (const field of [
+      "Question:",
+      "Planning decision affected:",
+      "Authoritative inputs:",
+      "Confirmed constraints:",
+      "Excluded scope:",
+      "Evidence targets:",
+      "Version or recency requirement:",
+      "Forbidden actions:",
+      "Return contract:",
+    ]) {
+      expect(bundle).toContain(field);
+    }
   });
 
   it("rejects a failed prepare runner even if it wrote a valid block", () => {

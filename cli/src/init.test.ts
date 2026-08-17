@@ -1,6 +1,7 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, type SpawnSyncReturns } from "node:child_process";
 import {
   cpSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -19,8 +20,10 @@ import init, {
   detectRepository,
   editableSkillsRefreshSummary,
   getSupervisorTaskTimeoutSeconds,
+  installLocalSkills,
   initOutro,
   parseInitArgs,
+  localSkillInstallSummary,
   parseGithubRemote,
   planEditableSkillsDryRun,
   planEditableSkillsRefresh,
@@ -51,6 +54,17 @@ function temporaryProject(): string {
   const directory = mkdtempSync(join(tmpdir(), "openthrottle-cli-test-"));
   directories.push(directory);
   return directory;
+}
+
+function skillfishResult(json: unknown): SpawnSyncReturns<Buffer> {
+  return {
+    pid: 1,
+    output: [],
+    stdout: Buffer.from(JSON.stringify(json)),
+    stderr: Buffer.from(""),
+    status: 0,
+    signal: null,
+  } as SpawnSyncReturns<Buffer>;
 }
 
 function completeProjectConfig(): ProjectConfig {
@@ -234,6 +248,7 @@ async function runInitWithSnapshotState(state: string) {
           controlProvider: "github",
         },
       }),
+      installLocalSkills: () => [],
       registerTargetRepository: async () => ({
         registration: { github_repo: "acme/widget", base_branch: "main" },
         readiness: {
@@ -483,6 +498,75 @@ describe("init project detection", () => {
     }, true)).toBe(
       "Commit .openthrottle.yml and .openthrottle/, then open or label a GitHub issue with `openthrottle`."
     );
+  });
+
+  it("installs the operator and planning skills idempotently for repo init", () => {
+    const home = temporaryProject();
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    const sourceRef = "0123456789abcdef0123456789abcdef01234567";
+    const manifests: string[] = [];
+    const runner = (args: string[], options: { env: NodeJS.ProcessEnv }) => {
+      if (args[0] === "list") {
+        const installed = [
+          ["openthrottle", "skills/operator/openthrottle"],
+          ["ot-plan", "skills/planning/ot-plan"],
+        ].flatMap(([name, path]) => {
+          const target = join(home, ".codex", "skills", name!);
+          return existsSync(target)
+            ? [{ skill: name, agent: "Codex", path: target, location: "global", path_source: path }]
+            : [];
+        });
+        return skillfishResult({ success: true, installed, agents_detected: ["Codex"] });
+      }
+      const manifest = JSON.parse(
+        readFileSync(join(options.env.HOME ?? "", "skillfish.json"), "utf8")
+      ) as { skills: string[] };
+      const source = manifest.skills[0]!;
+      manifests.push(source);
+      const planning = source.endsWith("/skills/planning/ot-plan");
+      const name = planning ? "ot-plan" : "openthrottle";
+      const sourceDirectory = resolve(
+        process.cwd(),
+        planning ? "../skills/planning/ot-plan" : "../skills/operator/openthrottle"
+      );
+      const target = join(options.env.HOME ?? "", ".codex", "skills", name);
+      mkdirSync(target, { recursive: true });
+      cpSync(sourceDirectory, target, { recursive: true });
+      writeFileSync(join(target, ".skillfish.json"), JSON.stringify({
+        owner: "knoxgraeme",
+        repo: "openthrottle",
+        path: planning ? "skills/planning/ot-plan" : "skills/operator/openthrottle",
+        source: "manifest",
+      }));
+      return skillfishResult({
+        success: true,
+        installed: [{ skill: name, agent: "Codex", path: target, location: "global" }],
+      });
+    };
+
+    const installs = installLocalSkills({ home, runner, sourceRef });
+
+    expect(installs.map(({ name, result }) => ({ name, success: result.success }))).toEqual([
+      { name: "openthrottle", success: true },
+      { name: "ot-plan", success: true },
+    ]);
+    expect(manifests).toEqual([
+      `knoxgraeme/openthrottle@${sourceRef}/skills/operator/openthrottle`,
+      `knoxgraeme/openthrottle@${sourceRef}/skills/planning/ot-plan`,
+    ]);
+    expect(readFileSync(join(home, ".codex", "skills", "openthrottle", "SKILL.md"), "utf8"))
+      .toContain("name: openthrottle");
+    expect(readFileSync(join(home, ".codex", "skills", "ot-plan", "SKILL.md"), "utf8"))
+      .toContain("name: ot-plan");
+    expect(localSkillInstallSummary(installs)).toEqual(expect.arrayContaining([
+      expect.stringContaining("openthrottle: installed for Codex"),
+      expect.stringContaining("ot-plan: installed for Codex"),
+    ]));
+
+    const repeated = installLocalSkills({ home, runner, sourceRef });
+    expect(repeated.every(({ result }) => result.success)).toBe(true);
+    expect(repeated.every(({ result }) => result.skipped.some(({ agent }) => agent === "Codex"))).toBe(true);
+    expect(manifests).toHaveLength(2);
   });
 
   it("defaults to Linear control and only prompts Linear registrations for a team", async () => {

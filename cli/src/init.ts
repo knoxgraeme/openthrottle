@@ -28,6 +28,12 @@ import {
   LocalSupervisorAccessStore,
   type SupervisorAccessReader,
 } from "./onboarding/supervisor-access-store.js";
+import {
+  runOperatorSkillAction,
+  runPlanningSkillAction,
+  type OperatorSkillOptions,
+  type OperatorSkillResult,
+} from "./operator-skill.js";
 import { getErrorMessage, readEnv, supervisorRequest } from "./util.js";
 
 interface PackageJson {
@@ -79,6 +85,11 @@ interface InitSelection {
   registration: RepositoryRegistrationInput;
 }
 
+export interface LocalSkillInstallResult {
+  name: "openthrottle" | "ot-plan";
+  result: OperatorSkillResult;
+}
+
 export type SupervisorPreflightResult =
   | { status: "ready" }
   | { status: "not-configured" | "unreachable" | "authentication-failed"; message: string };
@@ -93,6 +104,7 @@ export interface InitCommandOptions {
   registerTargetRepository?: typeof registerTargetRepository;
   reportPreflightFailure?: (message: string) => void;
   supervisorAccessStore?: SupervisorAccessReader;
+  installLocalSkills?: () => LocalSkillInstallResult[];
 }
 
 type InitPromptApi = Pick<typeof p, "group" | "select" | "text">;
@@ -261,6 +273,35 @@ export function initOutro(
     ? "delegate an issue from the configured Linear team"
     : "open or label a GitHub issue with `openthrottle`";
   return `Commit ${files}, then ${delegation}.`;
+}
+
+export function installLocalSkills(options: OperatorSkillOptions = {}): LocalSkillInstallResult[] {
+  const installs: LocalSkillInstallResult[] = [
+    { name: "openthrottle", result: runOperatorSkillAction("install", options) },
+    { name: "ot-plan", result: runPlanningSkillAction("install", options) },
+  ];
+  for (const install of installs) {
+    if (!install.result.success && install.result.recovery.length === 0) {
+      install.result.recovery.push(
+        install.name === "openthrottle"
+          ? "openthrottle operator-skill install"
+          : "openthrottle planning-skill install"
+      );
+    }
+  }
+  return installs;
+}
+
+export function localSkillInstallSummary(installs: LocalSkillInstallResult[]): string[] {
+  const lines: string[] = [];
+  for (const { name, result } of installs) {
+    for (const entry of result.installed) lines.push(`${name}: installed for ${entry.agent} at ${entry.path}`);
+    for (const entry of result.skipped) lines.push(`${name}: ${entry.reason ?? entry.status} for ${entry.agent}`);
+    for (const entry of result.unsupported) lines.push(`${name}: unavailable for ${entry.agent} (${entry.reason ?? "unsupported"})`);
+    for (const entry of result.conflicted) lines.push(`${name}: attention required for ${entry.agent} (${entry.reason ?? "conflict"})`);
+    for (const recovery of result.recovery) lines.push(`${name}: recovery: ${recovery}`);
+  }
+  return lines;
 }
 
 export async function promptConfig(
@@ -1193,7 +1234,7 @@ export default async function init(args: string[] = [], options: InitCommandOpti
       "If it is wrong, cancel and re-run `openthrottle init` from the correct repository checkout."
   );
   const proceed = await p.confirm({
-    message: `Register ${registrationSummary(selection.registration, resolvedEnv.OT_SUPERVISOR_URL)}?`,
+    message: `Initialize ${registrationSummary(selection.registration, resolvedEnv.OT_SUPERVISOR_URL)} and install local OpenThrottle skills?`,
     initialValue: false,
   });
   if (p.isCancel(proceed) || !proceed) {
@@ -1261,6 +1302,15 @@ export default async function init(args: string[] = [], options: InitCommandOpti
     p.log.success(editableSkills
       ? "Wrote .openthrottle.yml and editable simple-pipeline skills"
       : "Wrote .openthrottle.yml");
+  }
+
+  p.log.info("Installing local OpenThrottle skills for detected agents");
+  const localSkills = (options.installLocalSkills ?? installLocalSkills)();
+  for (const line of localSkillInstallSummary(localSkills)) p.log.info(line);
+  if (localSkills.some(({ result }) => !result.success)) {
+    p.log.error("Local OpenThrottle skill installation needs attention.");
+    p.log.warn("The local .openthrottle.yml is ready, but the repository was not registered. Apply the recovery command above, then rerun init.");
+    process.exit(1);
   }
 
   const spinner = p.spinner();

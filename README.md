@@ -69,8 +69,9 @@ fly deploy
 
 For Linear control, install the Linear OAuth app through authenticated
 `/oauth/install`. Run `init` from each target repository; it detects the GitHub
-origin, writes the repo-local execution config, registers either the Linear-team
-or GitHub-Issue route in Fly's SQLite database, creates or refreshes that
+origin, writes the repo-local execution config, installs the local `ot-plan` and
+`openthrottle` skills for detected agents, registers either the Linear-team or
+GitHub-Issue route in Fly's SQLite database, creates or refreshes that
 repository's GitHub webhook, and verifies the canonical Daytona snapshot:
 
 ```bash
