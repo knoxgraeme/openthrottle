@@ -360,7 +360,7 @@ seal_cutover_evidence '${JSON.stringify({ admission: { paused: 0, epoch: 1 }, ru
     expect(result.stdout).not.toContain('{"admission":{"paused":0}}');
   });
 
-  it("attests old image, release, digest, and snapshot before resuming after a successful rollback", () => {
+  it("attests the restored runtime, resumes admission, and completes a successful rollback", () => {
     const result = runBash(rollbackHarness(), {
       FLYCTL_MACHINES_RESPONSE:
         '[{"id":"one","state":"started","config":{"image":"registry.fly.io/openthrottle-supervisor@sha256:old"}}]',
@@ -370,6 +370,9 @@ seal_cutover_evidence '${JSON.stringify({ admission: { paused: 0, epoch: 1 }, ru
     expect(result.stdout).toContain('"phase": "restored"');
     expect(result.stdout).not.toContain('"phase": "recovery_required"');
     expect(result.stdout.indexOf('"phase": "restored"')).toBeLessThan(result.stdout.indexOf('"paused": 0'));
+    expect(result.stdout).toContain('"phase": "resumed"');
+    expect(result.stdout).toContain('"status": "completed"');
+    expect(result.stdout.indexOf('"paused": 0')).toBeLessThan(result.stdout.indexOf('"phase": "resumed"'));
   });
 
   it("executes the recorded recovery shape as staged old snapshot plus pinned image deploy plus evidence, without resume", () => {
