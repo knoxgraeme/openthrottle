@@ -4,6 +4,10 @@
   "description": "CLI for OpenThrottle — plan-first autonomous coding pipeline (Linear -> Daytona sandbox -> GitHub PR).",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/knoxgraeme/openthrottle"
+  },
   "engines": {
     "node": ">=22"
   },

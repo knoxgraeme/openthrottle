@@ -24,8 +24,28 @@ in evidence.
 
 ## 1. Trigger the release workflow
 
-Either push a `v*` tag (publishes to npm when `NPM_TOKEN` is configured) or
-dispatch manually (always degrades to workflow artifacts):
+Configure the `openthrottle` package's npm trusted publisher once before the
+first automatic publish:
+
+- provider: GitHub Actions;
+- repository owner and name: `knoxgraeme` / `openthrottle`;
+- workflow filename: `release.yml`;
+- environment: leave unset;
+- allowed action: `npm publish`.
+
+The repository does not need an `NPM_TOKEN`. Trusted publishing requires the
+workflow's OIDC identity and the exact repository URL declared in
+`cli/package.json`.
+
+Merge a version bump in `cli/package.json` and `cli/package-lock.json` to
+`main`. The resulting main push builds the digest-pinned images and manifest,
+then publishes the exact packed CLI tarball when that version does not already
+exist on npm. Prerelease versions publish under `next`; stable versions publish
+under `latest`. A main push whose version already exists ends after the release
+planning job without rebuilding or republishing artifacts.
+
+A `v*` tag still produces release artifacts and publishes only when its package
+version is new. A manual dispatch always produces artifacts without publishing:
 
 ```bash
 gh workflow run release.yml --repo knoxgraeme/openthrottle

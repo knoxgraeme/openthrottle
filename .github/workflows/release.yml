@@ -11,9 +11,10 @@ name: Release
 # Both images build from the REPO ROOT context: the supervisor for its
 # file:../contracts dependency, the sandbox for the root-level skills/ payload.
 #
-# Tag pushes (v*) publish the CLI to npm when the NPM_TOKEN secret is set.
-# Manual dispatch — or a missing NPM_TOKEN — never fails the workflow; it
-# degrades to uploading the manifest and a packed tarball as artifacts.
+# A push to main publishes a package version that is not already on npm. Tag
+# pushes still produce release artifacts and publish an unpublished version;
+# manual dispatch only produces artifacts. npm authentication uses a trusted
+# publisher configured for this workflow, never a long-lived repository token.
 #
 # GHCR packages are PRIVATE on first push. Make both image packages public
 # once (per package) or anonymous pulls of the pinned digests will fail; see
@@ -21,6 +22,7 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -29,36 +31,76 @@ on:
         type: string
         required: false
 
-permissions:
-  contents: read
-  packages: write
-
 # Serialize releases per ref; never cancel one mid-push.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  plan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release_id: ${{ steps.meta.outputs.release_id }}
+      run_release: ${{ steps.meta.outputs.run_release }}
+      publish_npm: ${{ steps.meta.outputs.publish_npm }}
+      dist_tag: ${{ steps.meta.outputs.dist_tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.14.0
+          registry-url: "https://registry.npmjs.org"
+      - name: Plan the release
+        id: meta
+        env:
+          RELEASE_ID_INPUT: ${{ inputs.release_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          release_id="${RELEASE_ID_INPUT:-$(node -p "require('./cli/package.json').version")}"
+          dist_tag="latest"
+          if [[ "$release_id" == *-* ]]; then
+            dist_tag="next"
+          fi
+
+          run_release="true"
+          publish_npm="false"
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            if npm view "openthrottle@${release_id}" version --json >/dev/null 2>&1; then
+              echo "openthrottle@${release_id} already exists on npm."
+              if [[ "$REF_TYPE" == "branch" ]]; then
+                run_release="false"
+              fi
+            else
+              publish_npm="true"
+            fi
+          fi
+
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "run_release=$run_release" >> "$GITHUB_OUTPUT"
+          echo "publish_npm=$publish_npm" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
+          echo "Release id: $release_id; npm tag: $dist_tag; run: $run_release; publish: $publish_npm"
+
+  release:
+    needs: plan
+    if: needs.plan.outputs.run_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
           cache: npm
           cache-dependency-path: |
             contracts/package-lock.json
             cli/package-lock.json
           registry-url: "https://registry.npmjs.org"
-      - name: Resolve release id
-        id: meta
-        env:
-          RELEASE_ID_INPUT: ${{ inputs.release_id }}
-        run: |
-          release_id="${RELEASE_ID_INPUT:-$(node -p "require('./cli/package.json').version")}"
-          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
-          echo "Release id: $release_id"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -72,7 +114,7 @@ jobs:
           context: .
           file: supervisor/Dockerfile
           push: true
-          tags: ghcr.io/knoxgraeme/openthrottle-supervisor:${{ steps.meta.outputs.release_id }}
+          tags: ghcr.io/knoxgraeme/openthrottle-supervisor:${{ needs.plan.outputs.release_id }}
           # Keep the pushed artifact a plain image manifest so the digest the
           # release manifest pins is the digest every consumer pulls.
           provenance: false
@@ -83,13 +125,13 @@ jobs:
           context: .
           file: sandbox/Dockerfile
           push: true
-          tags: ghcr.io/knoxgraeme/openthrottle-sandbox:${{ steps.meta.outputs.release_id }}
+          tags: ghcr.io/knoxgraeme/openthrottle-sandbox:${{ needs.plan.outputs.release_id }}
           provenance: false
       - name: Generate the release manifest
         # generate-release-manifest.mjs is dependency-free by design and runs
         # before any npm ci; it validates the digest-pinned refs itself.
         env:
-          RELEASE_ID: ${{ steps.meta.outputs.release_id }}
+          RELEASE_ID: ${{ needs.plan.outputs.release_id }}
           SUPERVISOR_DIGEST: ${{ steps.supervisor.outputs.digest }}
           SANDBOX_DIGEST: ${{ steps.sandbox.outputs.digest }}
         run: |
@@ -115,29 +157,34 @@ jobs:
       - name: Upload the manifest and tarball as workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: openthrottle-release-${{ steps.meta.outputs.release_id }}
+          name: openthrottle-release-${{ needs.plan.outputs.release_id }}
           path: |
             cli/release-manifest.json
             openthrottle-*.tgz
           if-no-files-found: error
-      - name: Resolve the npm publish gate
-        id: publish
-        # Publish only on tag pushes with NPM_TOKEN configured. A missing token
-        # must never fail the release — the artifacts above are the fallback.
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          REF_TYPE: ${{ github.ref_type }}
-        run: |
-          if [[ "$REF_TYPE" == "tag" && -n "$NPM_TOKEN" ]]; then
-            echo "npm=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "npm=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping npm publish (requires a v* tag and the NPM_TOKEN secret); artifacts uploaded instead."
-          fi
+
+  publish:
+    needs: [plan, release]
+    if: needs.plan.outputs.publish_npm == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@v4
+        with:
+          name: openthrottle-release-${{ needs.plan.outputs.release_id }}
+          path: release
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.5.1
       - name: Publish the CLI to npm
-        if: steps.publish.outputs.npm == 'true'
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_DIST_TAG: ${{ needs.plan.outputs.dist_tag }}
         # Publish the exact tarball uploaded as the release artifact so the
-        # published bytes match the acceptance evidence.
-        run: npm publish "$PWD"/openthrottle-*.tgz
+        # published bytes match the acceptance evidence. OIDC trusted
+        # publishing also attaches npm provenance to those bytes.
+        run: npm publish "$PWD"/release/openthrottle-*.tgz --access public --provenance --tag "$NPM_DIST_TAG"
