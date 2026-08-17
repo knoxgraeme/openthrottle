@@ -364,7 +364,9 @@ jobs:
                .snapshot == $snapshot and
                $image != ""' >/dev/null; then
               advance_cutover restored active "$restored"
-              cutover_command resume | jq .
+              resume_evidence="$(cutover_command resume)"
+              printf '%s\n' "$resume_evidence" | jq .
+              advance_cutover resumed completed "$resume_evidence"
             else
               local rollback_failure_evidence
               rollback_failure_evidence="$(jq -nc \
