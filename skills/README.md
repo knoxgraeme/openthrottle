@@ -5,10 +5,12 @@ one carries its own craft — implementation discipline, review lenses,
 simplification heuristics, diagnostic method — instead of delegating to a
 second-hop toolkit. The supervisor selects a versioned pipeline manifest; each
 agent stage or structured-loop action invokes one canonical adapter for the
-capability named in its sealed request. The planning adapter
-(`skills/planning/prepare-execution-plan`) accepts any sufficiently complete
-implementation plan or task specification and normalizes only its explicit
-scope, ordering, acceptance criteria, and verification commands.
+capability named in its sealed request. Local planning uses two adapters:
+`skills/planning/ot-plan` researches and authors the human implementation plan
+and supports focused deepening and independent document review, while
+`skills/planning/prepare-execution-plan` normalizes a completed plan or task
+specification into the structured execution contract without adding scope,
+acceptance criteria, or verification commands.
 
 ```text
 skills/
@@ -143,10 +145,12 @@ may call local CLI validators; it must not mutate Linear, publish branches, or
 claim runtime gate authority.
 
 The operator skill under `skills/operator/openthrottle/` is also local-only,
-but it is for an interactive human operator rather than plan authoring. It is
-installed by the CLI through pinned Skillfish into detected user-global agent
-skill directories. It must never be copied into `.openthrottle/skills` or
-treated as a sealed Daytona task adapter.
+but it is for an interactive human operator rather than plan authoring. During
+`openthrottle init`, the CLI installs it and `skills/planning/ot-plan/` through
+pinned Skillfish into detected user-global agent skill directories. The
+explicit `operator-skill` and `planning-skill` commands manage their separate
+lifecycles. Neither may be copied into `.openthrottle/skills` or treated as a
+sealed Daytona task adapter.
 
 The runtime chooses fresh, read-only fresh, required-resume, or preferred-resume
 context from the pinned manifest. When continuation is allowed, the sealed

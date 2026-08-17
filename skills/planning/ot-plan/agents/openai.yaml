@@ -1,0 +1,6 @@
+interface:
+  display_name: "OpenThrottle plan"
+  short_description: "Create researched OpenThrottle-ready plans"
+  default_prompt: "Use $ot-plan to turn our agreed change into a researched OpenThrottle-ready implementation plan."
+policy:
+  allow_implicit_invocation: false
