@@ -11,7 +11,7 @@
 # can't find a match for the target platform and falls back to node-gyp.
 
 # Build the shared contracts package first so file:../contracts resolves.
-FROM node:22-slim AS contracts
+FROM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS contracts
 WORKDIR /contracts
 COPY contracts/package.json contracts/package-lock.json* ./
 RUN npm ci
@@ -19,7 +19,7 @@ COPY contracts/tsconfig.json contracts/tsconfig.build.json ./
 COPY contracts/src ./src
 RUN npm run build
 
-FROM node:22-slim AS build
+FROM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS build
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 make g++ \
@@ -40,9 +40,11 @@ RUN npm run build
 # leaving the built better-sqlite3 native binary and the vendored contracts copy intact.
 RUN npm prune --omit=dev --install-links
 
-FROM node:22-slim AS runtime
+FROM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
+LABEL org.opencontainers.image.source="https://github.com/knoxgraeme/openthrottle" \
+      org.opencontainers.image.licenses="MIT"
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist

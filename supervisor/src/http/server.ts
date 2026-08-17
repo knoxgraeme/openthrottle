@@ -73,6 +73,8 @@ import type { RuntimeInventory, RuntimeLogs, RuntimeSnapshotReadiness } from "..
 import { executeRawCitationGate } from "./citation-executor.js";
 
 const MAX_CITATION_CONTRACT_BYTES = 256 * 1024;
+const MAX_WEBHOOK_BODY_BYTES = 5 * 1024 * 1024;
+const WEBHOOK_BODY_TOO_LARGE = "webhook payload exceeds 5 MiB";
 const MAX_CUTOVER_EVIDENCE_CHARS = 4_000;
 const CUTOVER_PHASES = new Set([
   "registered",
@@ -145,12 +147,16 @@ function hashesMatch(left: string, right: string): boolean {
   return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
 }
 
-async function readBoundedUtf8Body(request: Request, maxBytes: number): Promise<string> {
+async function readBoundedUtf8Body(
+  request: Request,
+  maxBytes: number,
+  tooLargeMessage = "citation_contract: JSON exceeds 256 KiB"
+): Promise<string> {
   const contentLength = request.headers.get("content-length");
   if (contentLength !== null) {
     const declaredBytes = Number(contentLength);
     if (Number.isSafeInteger(declaredBytes) && declaredBytes > maxBytes) {
-      throw new Error("citation_contract: JSON exceeds 256 KiB");
+      throw new Error(tooLargeMessage);
     }
   }
 
@@ -158,7 +164,7 @@ async function readBoundedUtf8Body(request: Request, maxBytes: number): Promise<
   // Cancellation rejections are deliberately swallowed here, matching the
   // previous `reader.cancel().catch(() => undefined)` behavior.
   const read = await readStreamUpToByteLimit(request.body, maxBytes);
-  if (read.exceeded) throw new Error("citation_contract: JSON exceeds 256 KiB");
+  if (read.exceeded) throw new Error(tooLargeMessage);
   return new TextDecoder("utf-8", { fatal: true }).decode(read.bytes);
 }
 
@@ -894,9 +900,20 @@ export function createServer(deps: ServerDeps): Hono {
   });
 
   app.post("/webhooks/linear", async (context) => {
-    const rawBody = await context.req.text();
     if (!cfg.linearWebhookSecret) {
       return context.text("Linear control provider is unavailable: LINEAR_WEBHOOK_SECRET is not configured.", 503);
+    }
+    let rawBody: string;
+    try {
+      rawBody = await readBoundedUtf8Body(
+        context.req.raw,
+        MAX_WEBHOOK_BODY_BYTES,
+        WEBHOOK_BODY_TOO_LARGE
+      );
+    } catch (error) {
+      return error instanceof Error && error.message === WEBHOOK_BODY_TOO_LARGE
+        ? context.text(WEBHOOK_BODY_TOO_LARGE, 413)
+        : context.text("invalid payload", 400);
     }
     if (!verifyLinearSignature(rawBody, context.req.header("Linear-Signature"), cfg.linearWebhookSecret)) {
       return context.text("invalid signature", 401);
@@ -930,7 +947,18 @@ export function createServer(deps: ServerDeps): Hono {
   });
 
   app.post("/webhooks/github", async (context) => {
-    const rawBody = await context.req.text();
+    let rawBody: string;
+    try {
+      rawBody = await readBoundedUtf8Body(
+        context.req.raw,
+        MAX_WEBHOOK_BODY_BYTES,
+        WEBHOOK_BODY_TOO_LARGE
+      );
+    } catch (error) {
+      return error instanceof Error && error.message === WEBHOOK_BODY_TOO_LARGE
+        ? context.text(WEBHOOK_BODY_TOO_LARGE, 413)
+        : context.text("invalid payload", 400);
+    }
     if (!verifyGithubSignature(rawBody, context.req.header("X-Hub-Signature-256"), cfg.githubWebhookSecret)) {
       return context.text("invalid signature", 401);
     }
