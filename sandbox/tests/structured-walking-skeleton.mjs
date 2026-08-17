@@ -36,6 +36,7 @@ const REPO_ROOT = join(__dirname, "..", "..");
 const IMAGE = process.argv[2] ?? "openthrottle:test";
 const STRUCTURED_GRAPH_PATH = join(REPO_ROOT, "supervisor", "graphs", "structured-v3.json");
 const WALKING_SKELETON_REPAIR_ROUNDS = 2;
+const CONCURRENT_REVIEW_PLAN_ID = "walking-skeleton-happy-path";
 const CATALOG_PATH = join(REPO_ROOT, "supervisor", "pipelines", "catalog.yaml");
 const STUB_AGENT_PATH = join(__dirname, "fixtures", "walking-skeleton-agent-stub.mjs");
 // The configured `test` command, shared by the fixture's own .openthrottle.yml
@@ -1065,7 +1066,7 @@ async function runHappyPath({ db, container, fixture }) {
   const tickets = createSupervisorStore(db, pipelines);
   const runtimeDescriptor = readRuntimeDescriptor(container);
   const runtime = createDockerSandboxRuntime(container);
-  const plan = buildTwoUnitPlan({ planId: "walking-skeleton-happy-path" });
+  const plan = buildTwoUnitPlan({ planId: CONCURRENT_REVIEW_PLAN_ID });
   const { instance, attempt } = setupInstance({
     db,
     pipelines,
@@ -1207,6 +1208,9 @@ async function runReplayScenario({ db, container, fixture }) {
     tickets,
     runtime: runtimeA,
     taskTimeoutSeconds: 300,
+    // This scenario is also the walking skeleton for the rollback knob. Keep
+    // both sides of the restart on the byte-identical serial scheduler.
+    reviewFanoutConcurrency: 1,
     now: () => new Date(),
     // The pause below depends on one-child-action-per-drain granularity: the
     // production walk would collect unit_a's integrate result and lease
@@ -1251,11 +1255,16 @@ async function runReplayScenario({ db, container, fixture }) {
     tickets,
     runtime: runtimeB,
     taskTimeoutSeconds: 300,
+    reviewFanoutConcurrency: 1,
     now: () => new Date(),
   });
   const settled = await drainUntilSettled(processorB, pipelines, attempt.id, "replay restart");
   if (settled.status !== "completed") dumpSettleDiagnostics({ pipelines, instance, attemptId: attempt.id, label: "replay restart" });
   assert(settled.status === "completed", `replay restart must still complete, got ${settled.status}`);
+  assert(
+    runtimeB.counters.maxConcurrentReviewPersonas === 1,
+    `serial replay launched ${runtimeB.counters.maxConcurrentReviewPersonas} review personas concurrently`
+  );
 
   const unitAAfter = pipelines.listWorkAttempts(attempt.id).find((action) => action.id === unitAIntegrated.id);
   assert(unitAAfter, "unit_a's original integrate action disappeared after restart");
