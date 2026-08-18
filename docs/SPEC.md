@@ -984,9 +984,11 @@ latency/count measurements (`cost_microusd = null` when unavailable). Total
 latency is the sum of those model-service intervals; critical-path latency is
 the wall interval from selector dispatch through the final persona or validator
 completion, so serialized Codex offsets are not counted more than once.
-Acknowledged launches use supervisor acknowledgement time; a result recovered
-from the launch-ack crash window uses the separately labeled conservative
-`prepared_fallback`. Timing action ids must be the exact deterministic selector,
+Acknowledged launches use supervisor acknowledgement time. A result recovered
+from the launch-ack crash window, or one that completes while the provider
+launch acknowledgement is still returning, uses the persisted pre-launch
+timestamp and the separately labeled conservative `prepared_fallback`. Timing
+action ids must be the exact deterministic selector,
 persona, and validator ids under one parent review prefix, and persona ids are
 also checked against their fenced receipt action ids. The live
 gate consumes the in-memory exact-fenced receipts and validated synthesis, not

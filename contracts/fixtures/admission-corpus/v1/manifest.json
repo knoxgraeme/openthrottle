@@ -1,0 +1,13 @@
+{
+  "schema": "openthrottle.admission-evaluation-corpus-manifest/v1",
+  "version": "2026-08-18",
+  "cases_digest": "368491f53811063e2d95b53c285c2774bf2d79f5daf38cff7536d6a10802a17d",
+  "labels_digest": "6a45f1d91e4c25b462db5c95b13deaa2efd342e228ac940f7cdc8c4c20e5de4a",
+  "corpus_digest": "70f552c53c32e0b51afe9e52876da44607e875fe498f79598c6a4ce5d7673f25",
+  "case_count": 45,
+  "distribution": {
+    "simple": 15,
+    "structured": 15,
+    "needs_human": 15
+  }
+}

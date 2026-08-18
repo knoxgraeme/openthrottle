@@ -8,6 +8,17 @@ const taskRoot = resolve(repoRoot, "skills/tasks");
 const skill = (name) => readFileSync(resolve(taskRoot, name, "SKILL.md"), "utf8");
 
 describe("automatic-admission task packages", () => {
+  it("runs the automatic proof in CI and reuses the structured lifecycle proof", () => {
+    const workflow = readFileSync(resolve(repoRoot, ".github/workflows/ci.yml"), "utf8");
+    const proof = readFileSync(resolve(repoRoot, "sandbox/tests/automatic-walking-skeleton.mjs"), "utf8");
+    expect(workflow).toContain("node sandbox/tests/automatic-walking-skeleton.mjs openthrottle:test");
+    expect(workflow).not.toContain("node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test");
+    expect(proof).toContain('join(repoRoot, "sandbox", "tests", "structured-walking-skeleton.mjs")');
+    expect(proof).toContain('"none"');
+    expect(proof).toContain("evaluateAdmissionDecisionGate");
+    expect(proof).toContain("evaluateAdmissionReviewGate");
+  });
+
   it("ships one complete canonical package per planning action", () => {
     for (const [name, reference] of [
       ["admission-plan", "route-rubric.md"],

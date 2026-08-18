@@ -1,11 +1,11 @@
 {
   "schema": "openthrottle.v12-deploy-proof/v1",
   "runtime": {
-    "release": "openthrottle-snapshot/v13",
-    "digest": "e3e8d8bb62cb8723fd4adfb68fe69df4b6708808384460dabdb348f9de415b2f",
-    "capabilities": 26
+    "release": "openthrottle-snapshot/v14",
+    "digest": "5cb5b7d8a3e10015432f11df3d2b36ecbb6a6d8c3b47103c54c49425a0f4d2fe",
+    "capabilities": 29
   },
-  "catalog_digest": "a35032af1b4e3f9168a676adadd4004861a667b1a8a6462b47b65f8cffa9fc6e",
+  "catalog_digest": "174c6f69205b137f5566313e44547de7cd92e5c24a69f7ce7e88271a07c7792d",
   "graph_digests": {
     "investigate-v1.json": "7227e7bff6b6e405135e268200a3784f7c659e236e10db9d97cdbe9bc29ffe49",
     "simple-v1.json": "1bc6b42e6bdbec7ddb54df10d72063cff5315634f3b42ae8bf196c4752729cba",
@@ -14,11 +14,12 @@
     "structured-v3.json": "2e167a78eb79875289a92b2979e6cb98beb584910e3ff90e9d93b272494fc5f7"
   },
   "pipeline_digests": {
-    "catalog.yaml": "a35032af1b4e3f9168a676adadd4004861a667b1a8a6462b47b65f8cffa9fc6e",
+    "catalog.yaml": "174c6f69205b137f5566313e44547de7cd92e5c24a69f7ce7e88271a07c7792d",
+    "core-automatic-v1.yaml": "2d944626689c858eeaf5a7c73d5a4df64b340e0f44de4642dc05f0c6e39c82e6",
     "core-implement-v4.yaml": "a75faf8829655c4507bc07182a96385ffd54a9af1dcf9815be7fcd91b0ab99f5",
     "core-investigate-v1.yaml": "340f1661fe9f80810a30ee2bea304879a5106f50106cf4b62f9beb25aec7defe",
     "core-tune-v1.yaml": "49bb1315cb3be775e3329f57a34004df0b67db682bbb3c49bcb926ace887de1a",
-    "runtime-capabilities-v1.json": "a40df9ea83681e5979d7777276a05057a30d0b649113079f7d4ea74a4c3cad29"
+    "runtime-capabilities-v1.json": "698195ecfc86f602b53d387ec11d2aec1e8deedadde4d3eeb5ddb6bb5f703444"
   },
   "snapshot_identity": "openthrottle-ce-${short_head}"
 }
