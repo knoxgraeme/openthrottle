@@ -2024,6 +2024,43 @@ ALTER TABLE pipeline_gate_receipts_tune_next RENAME TO pipeline_gate_receipts;
 const tuneGateReceiptVocabularyMigrationSource = `${tuneGateReceiptVocabularySchema}
 tune-gate-contract:standard_receipt artifacts and citation/differential_ratchet gate receipts persist before isolated edit/v1`;
 
+const admissionExecutionPlanArtifactSchema = `
+CREATE TABLE pipeline_artifacts_admission_next (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN (
+    'stage_result', 'execution_plan', 'execution_graph_result', 'review', 'command_result',
+    'provider_check', 'human_approval', 'publish_subject', 'standard_receipt'
+  )),
+  schema_version INTEGER NOT NULL CHECK(schema_version >= 1),
+  assurance TEXT NOT NULL CHECK(assurance IN (
+    'semantic_attested', 'semantic_corroborated', 'executor_verified',
+    'provider_verified', 'human_approved'
+  )),
+  subject TEXT,
+  payload TEXT NOT NULL,
+  artifact_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  FOREIGN KEY(attempt_id, pipeline_instance_id)
+    REFERENCES pipeline_stage_attempts(id, pipeline_instance_id) ON DELETE RESTRICT
+);
+INSERT INTO pipeline_artifacts_admission_next (
+  id, pipeline_instance_id, attempt_id, kind, schema_version,
+  assurance, subject, payload, artifact_hash, created_at
+)
+SELECT
+  id, pipeline_instance_id, attempt_id, kind, schema_version,
+  assurance, subject, payload, artifact_hash, created_at
+FROM pipeline_artifacts;
+DROP TABLE pipeline_artifacts;
+ALTER TABLE pipeline_artifacts_admission_next RENAME TO pipeline_artifacts;
+`;
+
+const admissionExecutionPlanArtifactMigrationSource = `${admissionExecutionPlanArtifactSchema}
+automatic-admission-artifact-contract:execution_plan is a distinct plan-bounded artifact and never aliases execution_graph_result or a standard receipt/v1`;
+
 const tuneTaskTypeSchema = `
 CREATE TABLE pipeline_instances_tune_next (
   id TEXT PRIMARY KEY,
@@ -4017,6 +4054,20 @@ const definitions: DatabaseMigrationDefinition[] = [
     up(db) {
       if (!hasTable(db, "pipeline_stage_checkpoint_objects")) {
         db.exec(ordinaryStageCheckpointObjectSchema);
+      }
+    },
+  },
+  {
+    version: 56,
+    name: "admission-execution-plan-artifact [rollback-compatible:additive/v1]",
+    source: admissionExecutionPlanArtifactMigrationSource,
+    mode: "foreign-keys-off",
+    up(db) {
+      const artifacts = db.prepare(`
+        SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_artifacts'
+      `).get() as { sql: string } | undefined;
+      if (artifacts && !artifacts.sql.includes("'execution_plan'")) {
+        db.exec(admissionExecutionPlanArtifactSchema);
       }
     },
   },

@@ -1,4 +1,10 @@
 import {
+  validateAdmissionDecision,
+  validateAdmissionReview,
+  type AdmissionDecision,
+  type AdmissionReview,
+} from "./admission-decision.js";
+import {
   GIT_SUBJECT,
   NATIVE_SESSION_ID,
   PRODUCER_SKILL_REFERENCE,
@@ -37,7 +43,8 @@ const ASSURANCE_CLASSES = [
   "human_approved",
 ] as const;
 const TUNE_RECEIPT_TYPES = ["tune_analysis", "tune_proposal"] as const;
-const STANDARD_RECEIPT_TYPES = [...RECEIPT_TYPES, ...TUNE_RECEIPT_TYPES] as const;
+const ADMISSION_RECEIPT_TYPES = ["admission_decision", "admission_review"] as const;
+const STANDARD_RECEIPT_TYPES = [...RECEIPT_TYPES, ...TUNE_RECEIPT_TYPES, ...ADMISSION_RECEIPT_TYPES] as const;
 export type StandardReceiptType = (typeof STANDARD_RECEIPT_TYPES)[number];
 export const RECEIPT_RESULTS_BY_TYPE = {
   unit_completion: ["success", "failure", "needs_human", "exited"],
@@ -51,6 +58,8 @@ export const RECEIPT_RESULTS_BY_TYPE = {
   human_approval: ["approved", "rejected", "needs_human"],
   tune_analysis: ["success", "failure", "needs_human"],
   tune_proposal: ["success", "no_change", "failure", "needs_human"],
+  admission_decision: ["simple", "structured", "needs_human"],
+  admission_review: ["approved", "rejected", "needs_human"],
 } as const satisfies Record<StandardReceiptType, readonly string[]>;
 
 interface ReceiptProducer {
@@ -144,6 +153,14 @@ interface TuneProposalReceiptPayload {
   proposal: TuneProposal;
 }
 
+interface AdmissionDecisionReceiptPayload {
+  decision: AdmissionDecision;
+}
+
+interface AdmissionReviewReceiptPayload {
+  review: AdmissionReview;
+}
+
 interface StandardReceiptBase<TType extends StandardReceiptType, TResult extends string, TPayload> {
   schema: typeof RECEIPT_SCHEMA;
   type: TType;
@@ -216,6 +233,16 @@ type TuneProposalReceipt = StandardReceiptBase<
   (typeof RECEIPT_RESULTS_BY_TYPE.tune_proposal)[number],
   TuneProposalReceiptPayload
 >;
+export type AdmissionDecisionReceipt = StandardReceiptBase<
+  "admission_decision",
+  (typeof RECEIPT_RESULTS_BY_TYPE.admission_decision)[number],
+  AdmissionDecisionReceiptPayload
+>;
+export type AdmissionReviewReceipt = StandardReceiptBase<
+  "admission_review",
+  (typeof RECEIPT_RESULTS_BY_TYPE.admission_review)[number],
+  AdmissionReviewReceiptPayload
+>;
 
 export type StandardReceipt =
   | UnitCompletionReceipt
@@ -228,10 +255,13 @@ export type StandardReceipt =
   | ProviderEvidenceReceipt
   | HumanApprovalReceipt
   | TuneAnalysisReceipt
-  | TuneProposalReceipt;
+  | TuneProposalReceipt
+  | AdmissionDecisionReceipt
+  | AdmissionReviewReceipt;
 
 const SEMANTIC_RECEIPTS = new Set<StandardReceiptType>([
   "unit_completion", "semantic_review", "unit_decision", "tune_analysis", "tune_proposal",
+  "admission_decision", "admission_review",
 ]);
 
 function parseProducer(value: unknown, path: string): ReceiptProducer {
@@ -335,6 +365,8 @@ function parseReceiptPayload(type: "provider_evidence", value: unknown, path: st
 function parseReceiptPayload(type: "human_approval", value: unknown, path: string): HumanApprovalPayload;
 function parseReceiptPayload(type: "tune_analysis", value: unknown, path: string): TuneAnalysisReceiptPayload;
 function parseReceiptPayload(type: "tune_proposal", value: unknown, path: string): TuneProposalReceiptPayload;
+function parseReceiptPayload(type: "admission_decision", value: unknown, path: string): AdmissionDecisionReceiptPayload;
+function parseReceiptPayload(type: "admission_review", value: unknown, path: string): AdmissionReviewReceiptPayload;
 function parseReceiptPayload(type: StandardReceiptType, value: unknown, path: string): StandardReceipt["payload"] {
   if (type === "unit_completion") {
     const input = objectAt(value, path, [
@@ -423,6 +455,18 @@ function parseReceiptPayload(type: StandardReceiptType, value: unknown, path: st
       analysis: validateTuneAnalysisContract(input.analysis, { source: `${path}.analysis` }).value,
     };
   }
+  if (type === "admission_decision") {
+    const input = objectAt(value, path, ["decision"]);
+    return {
+      decision: validateAdmissionDecision(input.decision, { source: `${path}.decision` }).value,
+    };
+  }
+  if (type === "admission_review") {
+    const input = objectAt(value, path, ["review"]);
+    return {
+      review: validateAdmissionReview(input.review, { source: `${path}.review` }).value,
+    };
+  }
   const input = objectAt(value, path, ["summary", "proposal"]);
   return {
     summary: stringAt(input.summary, `${path}.summary`, { max: 4_000 }),
@@ -469,6 +513,12 @@ export function validateStandardReceipt(
     if (receipt.payload.proposal.outcome !== expectedOutcome) {
       fail(`${source}.result`, "must match the typed tune proposal outcome");
     }
+  }
+  if (receipt.type === "admission_decision" && receipt.result !== receipt.payload.decision.route) {
+    fail(`${source}.result`, "must match the typed admission decision route");
+  }
+  if (receipt.type === "admission_review" && receipt.result !== receipt.payload.review.verdict) {
+    fail(`${source}.result`, "must match the typed admission review verdict");
   }
   if (SEMANTIC_RECEIPTS.has(type) && ["executor_verified", "provider_verified", "human_approved"].includes(receipt.assurance)) {
     fail(`${source}.assurance`, "semantic receipts cannot claim executor, provider, or human assurance");
