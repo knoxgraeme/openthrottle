@@ -186,9 +186,12 @@ function filesystemAvailableBytes(path) {
   return available > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(available);
 }
 
-function assertCopySpace({ destinationRoot, sourceBytes, replacementBytes = 0, availableBytes = undefined }) {
+function assertCopySpace({ destinationRoot, sourceBytes, availableBytes = undefined }) {
   const available = availableBytes ?? filesystemAvailableBytes(destinationRoot);
-  const required = sourceBytes + replacementBytes + NATIVE_SESSION_COPY_MARGIN_BYTES;
+  // statfs already excludes the bytes occupied by an existing destination.
+  // Atomic replacement needs additional room only for the staging copy; the
+  // old package is renamed in place and consumes no second allocation.
+  const required = sourceBytes + NATIVE_SESSION_COPY_MARGIN_BYTES;
   if (!Number.isSafeInteger(available) || available < required) {
     throw retryableStorageError(
       `native session transfer has insufficient space: required=${required} available=${available}`,
@@ -268,6 +271,13 @@ function assertPrivateNativeSessionPackage(path) {
   }
 }
 
+function removeNativeSessionScratch(path) {
+  if (!existsSync(path)) return;
+  const metadata = lstatSync(path);
+  if (!metadata.isSymbolicLink()) chmodTree(path, { fileMode: 0o600, directoryMode: 0o700 });
+  rmSync(path, metadata.isSymbolicLink() ? { force: true } : { recursive: true, force: true });
+}
+
 function validateNativeSessionPackage({ source, request }) {
   assertPrivateNativeSessionPackage(source);
   const manifestPath = resolve(source, NATIVE_SESSION_PACKAGE_MANIFEST);
@@ -302,7 +312,7 @@ export function sealNativeSessionPackage({
   sourceRoot = configuredNativeSessionSourceRoot(),
   availableBytes = undefined,
   copyFile = copyFileSync,
-  supersededNativeSessionId = null,
+  renameFile = renameSync,
 }) {
   if (!nativeSessionId || !profileRoot) return null;
   const sessionsSource = nativeSessionStoragePath(agent, profileRoot);
@@ -312,13 +322,9 @@ export function sealNativeSessionPackage({
   const destination = nativeSessionPackageDirectory({ sourceRoot, agent, nativeSessionId });
   prepareNativeSessionPackageParent({ sourceRoot, agent });
   sweepNativeSessionScratch({ agent, nativeSessionId, sourceRoot });
-  const replacementBytes = existsSync(destination)
-    ? collectNativeSessionFiles(destination).reduce((total, file) => total + file.size, 0)
-    : 0;
   assertCopySpace({
     destinationRoot: dirname(destination),
     sourceBytes,
-    replacementBytes,
     availableBytes,
   });
   const staging = resolve(dirname(destination), `.${nativeSessionId}.staging-${process.pid}-${randomUUID()}`);
@@ -350,27 +356,15 @@ export function sealNativeSessionPackage({
     });
     if (existsSync(destination)) {
       chmodTree(destination, { fileMode: 0o600, directoryMode: 0o700 });
-      renameSync(destination, rollback);
+      renameFile(destination, rollback);
       movedDestination = true;
     }
-    renameSync(staging, destination);
+    renameFile(staging, destination);
     movedDestination = false;
     rmSync(rollback, { recursive: true, force: true });
-    if (supersededNativeSessionId && supersededNativeSessionId !== nativeSessionId) {
-      const superseded = nativeSessionPackageDirectory({
-        sourceRoot,
-        agent,
-        nativeSessionId: supersededNativeSessionId,
-      });
-      if (existsSync(superseded)) {
-        const metadata = lstatSync(superseded);
-        if (!metadata.isSymbolicLink()) chmodTree(superseded, { fileMode: 0o600, directoryMode: 0o700 });
-        rmSync(superseded, metadata.isSymbolicLink() ? { force: true } : { recursive: true, force: true });
-      }
-    }
     return destination;
   } catch (error) {
-    rmSync(staging, { recursive: true, force: true });
+    removeNativeSessionScratch(staging);
     if (movedDestination && existsSync(rollback) && !existsSync(destination)) {
       try {
         renameSync(rollback, destination);
@@ -383,9 +377,26 @@ export function sealNativeSessionPackage({
     if (error?.code === "ENOSPC") throw retryableStorageError("native session transfer exhausted available space", error);
     throw error;
   } finally {
-    rmSync(staging, { recursive: true, force: true });
-    if (!movedDestination || existsSync(destination)) rmSync(rollback, { recursive: true, force: true });
+    removeNativeSessionScratch(staging);
+    if (!movedDestination || existsSync(destination)) removeNativeSessionScratch(rollback);
   }
+}
+
+// Retiring a superseded package is deliberately separate from sealing its
+// replacement. Callers may do this only after the result carrying the new ID
+// has reached its atomic commit point.
+export function retireNativeSessionPackage({
+  agent,
+  nativeSessionId,
+  sourceRoot = configuredNativeSessionSourceRoot(),
+}) {
+  if (!nativeSessionId) return false;
+  const packagePath = nativeSessionPackageDirectory({ sourceRoot, agent, nativeSessionId });
+  if (!existsSync(packagePath)) return false;
+  const metadata = lstatSync(packagePath);
+  if (!metadata.isSymbolicLink()) chmodTree(packagePath, { fileMode: 0o600, directoryMode: 0o700 });
+  rmSync(packagePath, metadata.isSymbolicLink() ? { force: true } : { recursive: true, force: true });
+  return true;
 }
 
 export function nativeSessionStoragePath(agent, profileRoot) {

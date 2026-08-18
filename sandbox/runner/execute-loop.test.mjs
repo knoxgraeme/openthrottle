@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  commitLoopActionResult,
   createLoopRequestHash,
   executeLoopAction,
   gitSafeDirectoryConfigArgs,
@@ -21,6 +22,7 @@ import {
   parseLoopReceipt,
   pruneCompletedLoopAction,
   recoveryChangedPathsFromGitQuotedOutput,
+  retireSupersededLoopSession,
   restorePersistentAgentPrivateRoots,
   loopPrompt,
   runLoopAgentInPreparedRepository,
@@ -43,6 +45,7 @@ import { identityForUser } from "./filesystem-isolation.mjs";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
 import { extractJsonBlock } from "./json-block.mjs";
+import { prepareLoopAgentEnvironment } from "./loop-agent-environment.mjs";
 import { subjectPost } from "../bin/ot-subject-post.mjs";
 
 const directories = [];
@@ -1725,7 +1728,7 @@ describe("loop action request validation", () => {
     });
   });
 
-  it("keeps 24 completed action homes bounded to sealed evidence instead of session-sized homes", () => {
+  it("reconciles only the exact redispatched action instead of scanning all history", () => {
     const valid = validateLoopRequest(request());
     const actionRoot = process.env.OT_LOOP_ACTION_ROOT;
     const outside = mkdtempSync(join(tmpdir(), "ot-retention-outside-"));
@@ -1749,11 +1752,15 @@ describe("loop action request validation", () => {
     }
     symlinkSync(outside, join(actionRoot, valid.attemptId, "action-0", "home", "outside-link"));
 
-    expect(sweepCompletedLoopActions(valid, actionRoot)).toEqual({ pruned: 24, retained: 0 });
+    expect(sweepCompletedLoopActions(valid, actionRoot)).toEqual({ pruned: 1, retained: 0 });
 
     for (let index = 0; index < 24; index += 1) {
       const entries = readdirSync(join(actionRoot, valid.attemptId, `action-${index}`)).sort();
-      expect(entries).toEqual(["request.json", "result.json"]);
+      if (index === 1) {
+        expect(entries).toEqual(["request.json", "result.json"]);
+      } else {
+        expect(entries).toContain("home");
+      }
     }
     expect(readFileSync(join(outside, "preserve.txt"), "utf8")).toBe("outside\n");
   });
@@ -1769,6 +1776,43 @@ describe("loop action request validation", () => {
     expect(pruneCompletedLoopAction({ request: valid, result })).toEqual({ retained: true, reason: "needs_human" });
     expect(readFileSync(join(actionPath, "home", "diagnostics", "trace.log"), "utf8")).toBe("preserve\n");
     expect(existsSync(loopWorktreeDirectory(valid))).toBe(true);
+  });
+
+  it("preserves unacknowledged flat outbox records while removing unobservable directory fanout", () => {
+    const valid = validateLoopRequest(request());
+    const actionPath = join(process.env.OT_LOOP_ACTION_ROOT, valid.attemptId, valid.actionId);
+    const outbox = join(actionPath, "outbox");
+    mkdirSync(join(outbox, "nested", "fanout"), { recursive: true });
+    writeFileSync(join(outbox, "nested", "fanout", "hidden.json"), "{}\n");
+    for (let index = 0; index < 65; index += 1) {
+      writeFileSync(join(outbox, `${String(index).padStart(3, "0")}.json`), "{}\n");
+    }
+    const result = { kind: "loop_action_result", outcome: "success" };
+    writeFileSync(join(actionPath, "result.json"), JSON.stringify(result));
+
+    pruneCompletedLoopAction({ request: valid, result });
+
+    expect(existsSync(join(outbox, "nested"))).toBe(false);
+    expect(readdirSync(outbox)).toHaveLength(65);
+  });
+
+  it("preserves a committed loop result when retention fails", () => {
+    const valid = validateLoopRequest(request());
+    const outputPath = join(process.env.OT_LOOP_ACTION_ROOT, valid.attemptId, valid.actionId, "result.json");
+    const result = {
+      kind: "loop_action_result",
+      action_id: valid.actionId,
+      attempt_id: valid.attemptId,
+      request_hash: valid.requestHash,
+      outcome: "success",
+      native_session_id: null,
+    };
+
+    expect(() => commitLoopActionResult(valid, result, outputPath, {
+      retire: () => false,
+      prune: () => { throw new Error("injected retention failure"); },
+    })).toThrow(/injected retention failure/);
+    expect(JSON.parse(readFileSync(outputPath, "utf8"))).toEqual(result);
   });
 
   it("keeps executor locks in place while agent process termination is unconfirmed", () => {
@@ -2620,6 +2664,72 @@ describe("loop action request validation", () => {
     }
   });
 
+  it("drives prefer-resume transfer failure through a fresh invocation and replacement session", () => {
+    const valid = validateLoopRequest(request({
+      nativeSessionId: "native-old",
+      contextPolicy: "prefer_resume",
+    }));
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    directories.push(sessionRoot);
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+    sealSessionFixture({ agent: "codex", nativeSessionId: "native-old", sourceRoot: sessionRoot });
+
+    const result = runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir: "/tmp/integration",
+      lockIntegration: () => true,
+      lockPersistentProfiles: () => [],
+      restorePersistentProfiles: () => {},
+      processFence: (execute) => execute(),
+      prepareEnvironment: (...args) => ({
+        ...prepareLoopAgentEnvironment(...args),
+        nativeSessionTransfer: { transferred: false, reason: "native_session_transfer_unavailable" },
+      }),
+      runProcess: (command, args) => {
+        expect(command).toBe("gosu");
+        expect(args).not.toContain("resume");
+        expect(args).not.toContain("native-old");
+        const codexHome = args.find((arg) => arg.startsWith("CODEX_HOME=")).slice("CODEX_HOME=".length);
+        const sessionStore = nativeSessionStoragePath("codex", codexHome);
+        writeFileSync(join(sessionStore, "native-new.jsonl"), sessionStorageFixture("codex", "native-new"));
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          stdout: '{"type":"thread.started","thread_id":"native-new"}\n',
+          stderr: "",
+        };
+      },
+    });
+
+    expect(result.nativeSessionId).toBe("native-new");
+    expect(existsSync(join(sessionRoot, "codex", "native-old"))).toBe(true);
+    expect(existsSync(join(sessionRoot, "codex", "native-new"))).toBe(true);
+  });
+
+  it("fails retryably when a fresh prefer-resume fallback reports no replacement session", () => {
+    const valid = validateLoopRequest(request({ nativeSessionId: "native-old", contextPolicy: "prefer_resume" }));
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    directories.push(sessionRoot);
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+    sealSessionFixture({ agent: "codex", nativeSessionId: "native-old", sourceRoot: sessionRoot });
+    expect(() => runLoopAgentInPreparedRepository({
+      request: valid,
+      invocation: resolveLoopInvocation(valid),
+      integrationRepoDir: "/tmp/integration",
+      lockIntegration: () => true,
+      lockPersistentProfiles: () => [],
+      restorePersistentProfiles: () => {},
+      processFence: (execute) => execute(),
+      prepareEnvironment: (...args) => ({
+        ...prepareLoopAgentEnvironment(...args),
+        nativeSessionTransfer: { transferred: false, reason: "native_session_transfer_unavailable" },
+      }),
+      runProcess: () => ({ status: 0, signal: null, timedOut: false, stdout: "{}\n", stderr: "" }),
+    })).toThrow(/fresh native-session fallback completed without reporting a replacement session id/);
+  });
+
   it("seals fresh loop native sessions for later action resume", () => {
     const valid = validateLoopRequest(request());
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
@@ -2867,7 +2977,7 @@ describe("loop action request validation", () => {
     )).toEqual({ mode: "fresh", nativeSessionId: null });
   });
 
-  it("rolls back low-space replacement and sweeps inactive scratch without following links", () => {
+  it("accepts replacement space for staging alone and restores interrupted rollback state", () => {
     const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
     const profileRoot = mkdtempSync(join(tmpdir(), "ot-loop-profile-"));
     const outside = mkdtempSync(join(tmpdir(), "ot-loop-outside-"));
@@ -2894,16 +3004,38 @@ describe("loop action request validation", () => {
       sourceRoot: sessionRoot,
       availableBytes: 0,
     })).toThrow(/insufficient space/);
-    const enospc = Object.assign(new Error("injected copy exhaustion"), { code: "ENOSPC" });
+    const sourceBytes = statSync(join(sessionStore, "native-rollback.jsonl")).size;
+    expect(sealNativeSessionPackage({
+      agent: "codex",
+      nativeSessionId: "native-rollback",
+      profileRoot,
+      sourceRoot: sessionRoot,
+      availableBytes: (16 * 1024 * 1024) + sourceBytes,
+    })).toBe(packageRoot);
+
+    let renameCount = 0;
+    const enospc = Object.assign(new Error("injected replacement exhaustion"), { code: "ENOSPC" });
     expect(() => sealNativeSessionPackage({
       agent: "codex",
       nativeSessionId: "native-rollback",
       profileRoot,
       sourceRoot: sessionRoot,
       availableBytes: Number.MAX_SAFE_INTEGER,
-      copyFile: () => { throw enospc; },
+      renameFile: (source, destination) => {
+        renameCount += 1;
+        if (renameCount === 2) throw enospc;
+        renameSync(source, destination);
+      },
     })).toThrow(/exhausted available space/);
-    sweepNativeSessionScratch({ agent: "codex", nativeSessionId: "native-rollback", sourceRoot: sessionRoot });
+    expect(readFileSync(join(packageRoot, "openthrottle-native-session.json"), "utf8")).toBe(originalManifest);
+
+    const staleRollback = join(agentRoot, ".native-rollback.rollback-999999-fixture");
+    renameSync(packageRoot, staleRollback);
+    expect(sweepNativeSessionScratch({
+      agent: "codex",
+      nativeSessionId: "native-rollback",
+      sourceRoot: sessionRoot,
+    })).toEqual({ removed: 0, restored: true });
 
     expect(readFileSync(join(packageRoot, "openthrottle-native-session.json"), "utf8")).toBe(originalManifest);
     expect(existsSync(staleLink)).toBe(false);
@@ -3192,7 +3324,7 @@ describe("loop action request validation", () => {
       .toBe(sessionStorageFixture("codex", "native-1"));
   });
 
-  it("removes a superseded native session only after its replacement is sealed", () => {
+  it("retires a superseded native session only after its replacement result commits", () => {
     const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
     const oldProfile = mkdtempSync(join(tmpdir(), "ot-old-profile-"));
     const newProfile = mkdtempSync(join(tmpdir(), "ot-new-profile-"));
@@ -3206,13 +3338,20 @@ describe("loop action request validation", () => {
     sealNativeSessionPackage({
       agent: "codex",
       nativeSessionId: "native-new",
-      supersededNativeSessionId: "native-old",
       profileRoot: newProfile,
       sourceRoot: sessionRoot,
     });
 
-    expect(existsSync(join(sessionRoot, "codex", "native-old"))).toBe(false);
+    expect(existsSync(join(sessionRoot, "codex", "native-old"))).toBe(true);
     expect(existsSync(join(sessionRoot, "codex", "native-new", "openthrottle-native-session.json"))).toBe(true);
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+    expect(retireSupersededLoopSession({
+      agent: "codex",
+      nativeSessionId: "native-old",
+    }, {
+      native_session_id: "native-new",
+    })).toBe(true);
+    expect(existsSync(join(sessionRoot, "codex", "native-old"))).toBe(false);
   });
 
   // OPE-101: `claude --resume <id>` resolves the id only under the project

@@ -337,8 +337,7 @@ describe("Daytona stage execution", () => {
       `loop-${REVIEW_PERSONA_ACTION_ID}`,
       expect.objectContaining({
         command: expect.stringMatching(new RegExp(
-          `loop-dispatch/attempt-child\\.${escapedReviewPersonaActionId}\\.lock.*if test -f .*loop-actions/attempt-child/${escapedReviewPersonaActionId}/result\\.json.*` +
-          `then rm -f .*${escapeForRegExp(stagedCredentialsPath)}.*exit 0; fi.*install -d .* -m 0711 .*loop-actions.*` +
+          `loop-dispatch/attempt-child\\.${escapedReviewPersonaActionId}\\.lock.*install -d .* -m 0711 .*loop-actions.*` +
           `loop-actions/attempt-child.*loop-actions/attempt-child/${escapedReviewPersonaActionId}.*` +
           `cp .*${escapeForRegExp(stagedRequestPath)}.*loop-actions/attempt-child/${escapedReviewPersonaActionId}/request\\.json.*` +
           `env -i .*RUN_ID=.*run-parent.*OT_CHILD_ACTION_ID=.*${escapedReviewPersonaActionId}.*heartbeat\\.mjs.*` +
@@ -396,12 +395,8 @@ describe("Daytona stage execution", () => {
     expect(dispatchLoopActionCommand).toMatch(new RegExp(
       `\\|\\| rm -f .*${escapeForRegExp(stagedCredentialsPath)}.*${escapeForRegExp(stagedRequestPath)}`
     ));
-    // A redispatch of an already-completed action must clean up both staged
-    // uploads, not just the credentials file -- the request file is not
-    // secret, but it is otherwise never removed on this fast-exit path.
-    expect(dispatchLoopActionCommand).toMatch(new RegExp(
-      `then rm -f .*${escapeForRegExp(stagedCredentialsPath)}.*${escapeForRegExp(stagedRequestPath)}.*; exit 0; fi`
-    ));
+    // Redispatch always reaches execute-loop so replay can finish retention.
+    expect(dispatchLoopActionCommand).not.toMatch(/if test -f .*result\.json/);
 
     const loopWithOpencodeAgent = fencedLoopRequest({
       actionId: "loop-opencode",
@@ -947,6 +942,7 @@ describe("Daytona stage execution", () => {
     expect(command).toMatch(/OT_CHILD_ACTION_ID=.*child-command/);
     expect(command).toContain("/opt/openthrottle/runner/heartbeat.mjs");
     expect(command).toContain("/opt/openthrottle/runner/execute-child-action.mjs");
+    expect(command).not.toMatch(/if test -f .*result\.json/);
     expect(command).not.toContain("GITHUB_TOKEN");
     expect(command).not.toContain("secret-token");
     expect(command).not.toContain("CODEX_AUTH_JSON");

@@ -40,7 +40,7 @@ function childRequestHash(requestWithoutFence) {
   return digest(canonicalJson(requestWithoutFence));
 }
 
-function validateRequest(value) {
+export function validateRequest(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("child executor request must be an object");
   const { requestHash, idempotencyKey, ...withoutFence } = value;
   const expectedHash = childRequestHash(withoutFence);
@@ -537,6 +537,7 @@ export function finalizeChildActionRetention(request, result, {
 }
 
 export function replayChildActionResult(request, outputPath, retention = {}) {
+  request = validateRequest(request);
   if (!existsSync(outputPath)) return null;
   const metadata = lstatSync(outputPath);
   if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("child result replay path must be a real file");
@@ -549,17 +550,25 @@ export function replayChildActionResult(request, outputPath, retention = {}) {
   return replay;
 }
 
+export function commitChildActionResult(request, result, outputPath, retention = {}) {
+  writeJsonAtomic(outputPath, result);
+  return finalizeChildActionRetention(request, result, retention);
+}
+
 function main() {
   const requestPath = resolve(arg("--request", process.env.OT_CHILD_EXECUTOR_REQUEST_FILE));
   const outputPath = resolve(arg("--output", process.env.OT_CHILD_EXECUTOR_RESULT_FILE));
-  const request = JSON.parse(readFileSync(requestPath, "utf8"));
+  const request = validateRequest(JSON.parse(readFileSync(requestPath, "utf8")));
   if (replayChildActionResult(request, outputPath)) return;
   try {
     const result = executeChildAction({ request });
-    writeJsonAtomic(outputPath, result);
-    finalizeChildActionRetention(request, result);
+    commitChildActionResult(request, result, outputPath);
   } catch (error) {
-    writeJsonAtomic(outputPath, childActionFailureResult(request, error));
+    // Candidate result persistence is the semantic commit point. A cleanup
+    // failure is replayable and must not replace the committed candidate.
+    if (!existsSync(outputPath)) {
+      writeJsonAtomic(outputPath, childActionFailureResult(request, error));
+    }
     throw error;
   }
 }

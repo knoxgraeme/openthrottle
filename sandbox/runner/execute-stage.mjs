@@ -385,6 +385,12 @@ export function resolveContextInvocation(request) {
     : { mode: "fresh", nativeSessionId: null, reconstructed: true, readOnly: false };
 }
 
+export function stageInvocationAfterNativeSessionTransfer(invocation, transfer) {
+  return transfer?.transferred === false
+    ? { mode: "fresh", nativeSessionId: null, reconstructed: true, readOnly: false }
+    : invocation;
+}
+
 export const REPOSITORY_COMMAND_TIMEOUT_MS = 7_200_000;
 const PRIVATE_REPOSITORY_COMMAND_ENV = new Set([
   "RUN_ID",
@@ -600,6 +606,7 @@ export function defaultRunAgent({
   lockPersistentProfiles = lockRepositorySkillStagePersistentProfiles,
   restorePersistentProfiles = restorePersistentAgentPrivateRoots,
   lockStageHome = lockRepositorySkillStageHome,
+  materializeNativeSession = materializeNativeSessionState,
 }) {
   const actionProposalPath = repositorySkillProposalPath(request, proposalPath);
   let command;
@@ -608,6 +615,7 @@ export function defaultRunAgent({
   let lockedPersistentProfiles = [];
   const cleanupErrors = [];
   let bodyError = null;
+  let effectiveInvocation = invocation;
   try {
     try {
       lockedPersistentProfiles = lockPersistentProfiles(request);
@@ -626,7 +634,12 @@ export function defaultRunAgent({
       // is what a Claude restore has to be aligned to (OPE-101). A stage keeps
       // one repoDir across its whole run, so this is a no-op relocation here
       // and load-bearing only for the per-worktree structured loop path.
-      materializeNativeSessionState({ request, profileRoot: stageEnvironment.nativeSessionProfileRoot, workingDirectory: repoDir });
+      const transfer = materializeNativeSession({
+        request,
+        profileRoot: stageEnvironment.nativeSessionProfileRoot,
+        workingDirectory: repoDir,
+      });
+      effectiveInvocation = stageInvocationAfterNativeSessionTransfer(invocation, transfer);
       rmSync(actionProposalPath, { force: true });
     }
     const prompt = stagePrompt(request, actionProposalPath, { agent, repositorySkillRoot });
@@ -655,8 +668,8 @@ export function defaultRunAgent({
       command = "claude";
       // The long-form --print (not -p) is required for Claude to read the
       // prompt from stdin instead of taking it as a positional argument.
-      args = invocation.mode === "resume"
-        ? ["--print", "--resume", invocation.nativeSessionId, ...common]
+      args = effectiveInvocation.mode === "resume"
+        ? ["--print", "--resume", effectiveInvocation.nativeSessionId, ...common]
         : ["--print", ...common];
       stdin = prompt;
     } else if (agent === "opencode") {
@@ -664,7 +677,7 @@ export function defaultRunAgent({
       command = "opencode";
       // `opencode run` reads the message from piped stdin when no positional
       // message argument is supplied.
-      args = ["run", "--format", "json", "--model", model, "--dir", repoDir, "--auto", ...(invocation.mode === "resume" ? ["--session", invocation.nativeSessionId] : [])];
+      args = ["run", "--format", "json", "--model", model, "--dir", repoDir, "--auto", ...(effectiveInvocation.mode === "resume" ? ["--session", effectiveInvocation.nativeSessionId] : [])];
       stdin = prompt;
     } else if (agent === "codex") {
       command = "codex";
@@ -674,7 +687,7 @@ export function defaultRunAgent({
         ...(process.env.OT_CODEX_HOOK_TRUST_FLAG === "1" ? ["--dangerously-bypass-hook-trust"] : []),
         "--skip-git-repo-check", "-C", repoDir, ...(model ? ["-m", model] : []),
         ...(reasoningEffort ? ["-c", `model_reasoning_effort=\"${reasoningEffort}\"`] : []),
-        ...(invocation.mode === "resume" ? ["resume", invocation.nativeSessionId, "-"] : ["-"])];
+        ...(effectiveInvocation.mode === "resume" ? ["resume", effectiveInvocation.nativeSessionId, "-"] : ["-"])];
       stdin = prompt;
     } else {
       throw new Error(`unsupported agent adapter ${agent}`);
@@ -695,7 +708,8 @@ export function defaultRunAgent({
       throw new Error("stage proposal exceeds the 1 MiB limit");
     }
     const reportedNativeSessionId = extractNativeSessionId(result.stdout, agent);
-    if (request.nativeSessionId && reportedNativeSessionId && reportedNativeSessionId !== request.nativeSessionId) {
+    const resumedNativeSessionId = effectiveInvocation.mode === "resume" ? request.nativeSessionId : null;
+    if (resumedNativeSessionId && reportedNativeSessionId && reportedNativeSessionId !== resumedNativeSessionId) {
       throw new Error("reported native session id does not match the sealed stage request");
     }
     // A genuine engine failure (timeout/signal/non-zero exit) has no complete
@@ -708,7 +722,11 @@ export function defaultRunAgent({
     // from a prior attempt) is trustworthy -- never a freshly reported id
     // from a crashed/timed-out engine, which would otherwise poison a later
     // resume attempt into sealing against a session that was never sealed.
-    const nativeSessionId = request.nativeSessionId ?? (engineExited ? reportedNativeSessionId : null);
+    const fellBackToFresh = effectiveInvocation.mode === "fresh" && invocation.mode === "resume";
+    if (engineExited && fellBackToFresh && !reportedNativeSessionId) {
+      throw new Error("fresh native-session fallback completed without reporting a replacement session id");
+    }
+    const nativeSessionId = resumedNativeSessionId ?? (engineExited ? reportedNativeSessionId : null);
     if (engineExited) {
       let sealedNativeSessionPackage;
       try {

@@ -1148,6 +1148,52 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
     });
   });
 
+  it("starts repository-skill stages fresh when prefer-resume transfer is unavailable", () => {
+    const repoDir = repository();
+    const { repositorySkill } = sealedRepositorySkillPackage(repoDir);
+    const input = fixture({
+      capability: "agent/repository-skill@1",
+      contextPolicy: "prefer_resume",
+      nativeSessionId: "native-old",
+      repositorySkill,
+    });
+    input.repoDir = repoDir;
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-stage-actions-"));
+    const sourceRoot = mkdtempSync(join(tmpdir(), "ot-stage-native-sessions-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, sourceRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
+    installFakeGosu(binDir);
+    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+case " $* " in *" resume "*) exit 31;; esac
+cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
+{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["fresh fallback"],"findings":[],"actions":[],"uncertainty":[]}
+JSON
+cat > "$CODEX_HOME/sessions/native-new.json" <<'JSON'
+${codexSessionStorageRecord("native-new")}
+JSON
+printf '{"type":"thread.started","thread_id":"native-new"}\\n'
+`);
+
+    const result = withPrependedPath(binDir, () => defaultRunAgent({
+      request: input.request,
+      invocation: resolveContextInvocation(input.request),
+      repoDir: input.repoDir,
+      proposalPath: join(actionRoot, "proposal.json"),
+      timeoutMs: 5_000,
+      materializeNativeSession: () => ({
+        transferred: false,
+        reason: "native_session_transfer_unavailable",
+      }),
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect(result.nativeSessionId).toBe("native-new");
+    expect(existsSync(join(sourceRoot, "codex", "native-new"))).toBe(true);
+  });
+
   it("reads the one recognizable proposal a narrated proposal file wraps, and refuses two", () => {
     // The executor reads this file once, after the agent has exited: a model
     // that writes it itself instead of calling ot-stage-result gets no second

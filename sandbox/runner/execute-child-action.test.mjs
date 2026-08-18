@@ -9,7 +9,7 @@ import {
   digest,
   validateStandardReceipt,
 } from "./artifacts.mjs";
-import { childActionFailureResult, executeChildAction, finalizeChildActionRetention, replayChildActionResult, verifyTuneCandidate } from "./execute-child-action.mjs";
+import { childActionFailureResult, commitChildActionResult, executeChildAction, finalizeChildActionRetention, replayChildActionResult, verifyTuneCandidate } from "./execute-child-action.mjs";
 import { removeWorktree } from "./worktrees.mjs";
 
 const directories = [];
@@ -122,6 +122,46 @@ describe("child executor action", () => {
     expect(execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repoDir, encoding: "utf8" }))
       .not.toContain(candidateWorktree);
     expect(JSON.parse(readFileSync(outputPath, "utf8"))).toEqual(replay);
+  });
+
+  it("validates the complete sealed child request before replay cleanup", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "ot-child-replay-fence-"));
+    directories.push(fixtureRoot);
+    const outputPath = join(fixtureRoot, "result.json");
+    const request = childExecutorRequest();
+    writeFileSync(outputPath, JSON.stringify({
+      kind: "child_executor_action_result",
+      action_id: request.actionId,
+      attempt_id: request.attemptId,
+      request_hash: request.requestHash,
+      outcome: "success",
+    }));
+    const remove = vi.fn();
+
+    expect(() => replayChildActionResult({
+      ...request,
+      actionKind: "candidate",
+    }, outputPath, { remove })).toThrow(/request hash or idempotency key is stale/);
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it("preserves a committed candidate result when retention fails", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "ot-child-retention-failure-"));
+    directories.push(fixtureRoot);
+    const outputPath = join(fixtureRoot, "result.json");
+    const request = childExecutorRequest({ actionKind: "candidate", commandName: undefined });
+    const result = {
+      kind: "child_executor_action_result",
+      action_id: request.actionId,
+      attempt_id: request.attemptId,
+      request_hash: request.requestHash,
+      outcome: "success",
+    };
+
+    expect(() => commitChildActionResult(request, result, outputPath, {
+      remove: () => { throw new Error("injected retention failure"); },
+    })).toThrow(/injected retention failure/);
+    expect(JSON.parse(readFileSync(outputPath, "utf8"))).toEqual(result);
   });
 
   it("verifies the exact authorized tune paths and before/after content digests", () => {
