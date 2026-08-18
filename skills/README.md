@@ -42,8 +42,9 @@ test suite:
   ranked, stable findings.
 - `simplify-change` (`ce/simplify@1`) simplifies the branch diff above an
   entry-gate size/complexity threshold, preserving behavior.
-- `publish` (`ce/publish@1`) commits, pushes, and opens or updates the pull
-  request for the already-gated exact subject.
+- `publish` (`ce/publish@1`) is the rolling-deployment compatibility adapter
+  for supervisors that still dispatch publication. Current supervisors own the
+  exact-SHA branch push and pull-request creation directly.
 - `investigate` (`ce/investigate@1`) diagnoses a reported defect and applies a
   convergent fix only.
 - `tune` (`core/tune@1`) packages a sealed corpus as a `tune_analysis` receipt,

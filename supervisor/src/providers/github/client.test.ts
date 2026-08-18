@@ -37,6 +37,7 @@ import {
   parseGithubWebhook,
   parsePullRequestUrl,
   pinIssueComment,
+  publishRepositoryTaskBranch,
   redeliverRepositoryWebhookDelivery,
   upsertIssueStatusComment,
   prepareRepository,
@@ -1397,7 +1398,6 @@ describe("GitHub contracts", () => {
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       requests.push({ url, init });
-      if (url.endsWith("/git/ref/heads%2Fot%2Fissue-1")) return new Response("Not Found", { status: 404 });
       if (url.endsWith("/git/refs")) return Response.json({ object: { sha } }, { status: 201 });
       throw new Error(`unexpected request ${url}`);
     }) as unknown as typeof fetch;
@@ -1407,12 +1407,22 @@ describe("GitHub contracts", () => {
       expectedNewSha: sha,
       allowExisting: false,
     })).resolves.toEqual({ sha });
+    expect(JSON.parse(String(requests[0]!.init?.body))).toEqual({
+      ref: expect.stringMatching(/^refs\/tags\/openthrottle-task-branches\/[a-f0-9]{64}$/),
+      sha,
+    });
     expect(JSON.parse(String(requests[1]!.init?.body))).toEqual({
       ref: "refs/heads/ot/issue-1",
       sha,
     });
 
-    const existingFetch = vi.fn(async () => Response.json({ object: { sha } })) as unknown as typeof fetch;
+    const existingFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/git/refs") && init?.method === "POST") {
+        return new Response("already exists", { status: 422 });
+      }
+      return Response.json({ object: { sha } });
+    }) as unknown as typeof fetch;
     await expect(createRepositoryRef({ token: "github", fetch: existingFetch }, {
       repository: "o/r",
       ref: "refs/heads/ot/issue-1",
@@ -1424,7 +1434,32 @@ describe("GitHub contracts", () => {
       ref: "refs/heads/ot/issue-1",
       expectedNewSha: sha,
       allowExisting: false,
-    })).rejects.toThrow(/already exists/);
+    })).rejects.toThrow(/ownership lock/);
+  });
+
+  it("does not adopt a concurrently-created exact task ref without prior ownership", async () => {
+    const sha = "a".repeat(40);
+    let createCount = 0;
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/git/refs") && init?.method === "POST") {
+        createCount += 1;
+        return createCount === 1
+          ? Response.json({ object: { sha } }, { status: 201 })
+          : new Response("already exists", { status: 422 });
+      }
+      if (url.endsWith("/git/ref/heads%2Fot%2Fissue-1")) {
+        return Response.json({ object: { sha } });
+      }
+      throw new Error(`unexpected request ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(createRepositoryRef({ token: "github", fetch: fetchMock }, {
+      repository: "o/r",
+      ref: "refs/heads/ot/issue-1",
+      expectedNewSha: sha,
+      allowExisting: true,
+    })).rejects.toThrow(/created concurrently/);
   });
 
   it("compare-and-advances without force and rejects wrong or non-fast-forward heads", async () => {
@@ -1467,6 +1502,86 @@ describe("GitHub contracts", () => {
       expectedNewSha: newSha,
       allowAlreadyAdvanced: false,
     })).rejects.toThrow(/without a force update/);
+  });
+
+  it("publishes only the exact checkpointed task branch and reuses its owned pull request", async () => {
+    const sha = "b".repeat(40);
+    const marker = "openthrottle:publish:pipeline-1:attempt-1";
+    let created = false;
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/git/ref/heads%2Fot%2Fissue-1")) {
+        return Response.json({ object: { sha } });
+      }
+      if (url.includes("/pulls?") && init?.method === undefined) {
+        return Response.json(created ? [{
+          number: 7,
+          html_url: "https://github.com/o/r/pull/7",
+          body: `<!-- ${marker} -->`,
+          head: { ref: "ot/issue-1", sha, repo: { full_name: "o/r" } },
+          base: { ref: "main" },
+        }] : []);
+      }
+      if (url.endsWith("/pulls") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as Record<string, string>;
+        expect(body).toMatchObject({
+          title: "fix: complete OPE-187",
+          head: "ot/issue-1",
+          base: "main",
+        });
+        expect(body.body).toContain(marker);
+        created = true;
+        return Response.json({
+          number: 7,
+          html_url: "https://github.com/o/r/pull/7",
+          body: body.body,
+          head: { ref: "ot/issue-1", sha, repo: { full_name: "o/r" } },
+          base: { ref: "main" },
+        }, { status: 201 });
+      }
+      throw new Error(`unexpected request ${url}`);
+    }) as unknown as typeof fetch;
+    const input = {
+      repository: "o/r",
+      branch: "ot/issue-1",
+      baseBranch: "main",
+      expectedHeadSha: sha,
+      title: "fix: complete OPE-187",
+      body: "Implements the approved task.",
+      ownershipMarker: marker,
+    };
+
+    await expect(publishRepositoryTaskBranch({ token: "github", fetch: fetchMock }, input))
+      .resolves.toEqual({ sha, url: "https://github.com/o/r/pull/7" });
+    await expect(publishRepositoryTaskBranch({ token: "github", fetch: fetchMock }, input))
+      .resolves.toEqual({ sha, url: "https://github.com/o/r/pull/7" });
+  });
+
+  it("rejects an unowned pull request targeting the task branch", async () => {
+    const sha = "b".repeat(40);
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/git/ref/heads%2Fot%2Fissue-1")) {
+        return Response.json({ object: { sha } });
+      }
+      return Response.json([{
+        number: 7,
+        html_url: "https://github.com/o/r/pull/7",
+        body: "human-created",
+        head: { ref: "ot/issue-1", sha, repo: { full_name: "o/r" } },
+        base: { ref: "main" },
+      }]);
+    }) as unknown as typeof fetch;
+
+    await expect(publishRepositoryTaskBranch({ token: "github", fetch: fetchMock }, {
+      repository: "o/r",
+      branch: "ot/issue-1",
+      baseBranch: "main",
+      expectedHeadSha: sha,
+      title: "fix: complete OPE-187",
+      body: "Implements the approved task.",
+      ownershipMarker: "openthrottle:publish:pipeline-1:attempt-1",
+    })).rejects.toThrow(/unowned/);
   });
 
   it("pins repository config to the exact resolved commit and blob", async () => {

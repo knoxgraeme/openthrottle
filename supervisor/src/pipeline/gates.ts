@@ -694,7 +694,7 @@ function assertPublishedTaskBranch(store: PipelineStore, instance: PipelineInsta
   if (
     taskBranch.status !== "published" ||
     taskBranch.accepted_integration_sha !== taskBranch.acknowledged_remote_sha ||
-    taskBranch.acknowledged_remote_sha !== instance.published_subject
+    taskBranch.acknowledged_remote_sha !== instance.published_commit
   ) {
     throw new Error("provider evidence requires the exact published task branch checkpoint");
   }

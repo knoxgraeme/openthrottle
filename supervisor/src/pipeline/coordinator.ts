@@ -27,6 +27,10 @@ import {
 } from "./publication.js";
 import type { LaunchFaultReason } from "./fault-attribution.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "./capability-contracts.js";
+import {
+  GIT_CHECKPOINT_OBJECT_SCHEMA,
+  type GitCheckpointObject,
+} from "./checkpoint-object.js";
 
 const PUBLISH_CAPABILITY = ["ce", "publish@1"].join("/");
 const GIT_COMMIT = /^[a-f0-9]{40}$/;
@@ -829,7 +833,8 @@ export function coordinatePipelineEvent(
   store: PipelineStore,
   event: PipelineCoordinatorEvent,
   faultAfterWrite?: (writeCount: number) => void,
-  gateReceipt?: CoordinatorGateReceiptWrite
+  gateReceipt?: CoordinatorGateReceiptWrite,
+  checkpointObject?: GitCheckpointObject,
 ): PipelineInstance {
   const queued = store.enqueueInboxEvent({
     id: event.id,
@@ -857,7 +862,7 @@ export function coordinatePipelineEvent(
   // integration. Later stage subjects may be canonical tree IDs, so they
   // must never be reinterpreted as commits by the simple-stage branch path.
   const structuredExecution = store.getStructuredExecutionPublicationForInstance(instance.id);
-  let taskBranch = store.getTaskBranch(instance.id);
+  const taskBranch = store.getTaskBranch(instance.id);
   if (
     taskBranch &&
     event.kind === "stage_result" &&
@@ -865,28 +870,29 @@ export function coordinatePipelineEvent(
     acceptsIntegratedSubject(stage) &&
     !structuredExecution &&
     !isPublicationStage(stage) &&
-    isExactCommitSubject(event.subject) &&
-    taskBranch.acknowledged_remote_sha !== event.subject
+    taskBranch.acknowledged_remote_sha !== null &&
+    write.outcome === "success"
   ) {
-    if (!taskBranch.acknowledged_remote_sha) {
-      throw new Error("pipeline task branch has no acknowledged remote head");
+    if (!checkpointObject || checkpointObject.schema !== GIT_CHECKPOINT_OBJECT_SCHEMA ||
+        checkpointObject.expectedOldSha !== taskBranch.acknowledged_remote_sha) {
+      throw new Error("ordinary write stage is missing its exact bounded checkpoint object");
     }
-    store.queueTaskBranchAdvance({
-      instanceId: instance.id,
+    write.checkpointAdvance = {
       generation: instance.generation,
       lineage: taskBranch.lineage,
-      expectedOldSha: taskBranch.acknowledged_remote_sha,
-      expectedNewSha: event.subject,
-    });
-    taskBranch = store.getTaskBranch(instance.id)!;
+      expectedTreeSha: event.subject!,
+      object: checkpointObject,
+    };
   }
   const nextStage = write.nextStageId
     ? manifest.stages.find((candidate) => candidate.id === write.nextStageId)
     : undefined;
   if (taskBranch && nextStage && isPublicationStage(nextStage)) {
     const structuredHandoff = structuredExecution !== undefined;
-    if ((!structuredHandoff &&
-          (!isExactCommitSubject(event.subject) || taskBranch.accepted_integration_sha !== event.subject)) ||
+    const ordinaryCheckpointPending = write.checkpointAdvance !== undefined;
+    if ((!structuredHandoff && !ordinaryCheckpointPending &&
+          (taskBranch.accepted_integration_sha === null ||
+           taskBranch.accepted_integration_sha !== taskBranch.acknowledged_remote_sha)) ||
         (structuredHandoff &&
           (taskBranch.accepted_integration_sha === null ||
            taskBranch.accepted_integration_sha !== taskBranch.acknowledged_remote_sha))) {
@@ -897,24 +903,25 @@ export function coordinatePipelineEvent(
     // undispatched until that effect acknowledges the remote head. Structured
     // execution reaches this handoff only after its unit checkpoint settled,
     // so it must already carry the stronger acknowledged state.
-    if ((!structuredHandoff && (taskBranch.status === "pending" || taskBranch.status === "failed")) ||
+    if ((!structuredHandoff && !ordinaryCheckpointPending &&
+          (taskBranch.status !== "checkpointed" && taskBranch.status !== "published")) ||
         (structuredHandoff && taskBranch.status !== "checkpointed" && taskBranch.status !== "published")) {
       throw new Error("pipeline publication requires a viable task branch checkpoint");
     }
   }
   if (taskBranch && isPublicationStage(stage) && write.outcome === "success") {
-    if (!isExactCommitSubject(event.subject) ||
-        taskBranch.accepted_integration_sha !== event.subject ||
-        taskBranch.acknowledged_remote_sha !== event.subject ||
+    if (!isExactCommitSubject(event.providerRevision) ||
+        taskBranch.accepted_integration_sha !== event.providerRevision ||
+        taskBranch.acknowledged_remote_sha !== event.providerRevision ||
         (taskBranch.status !== "checkpointed" && taskBranch.status !== "published")) {
       throw new Error("pipeline publish result does not match the acknowledged task branch checkpoint");
     }
-    write.taskBranchPublishedSha = event.subject;
+    write.taskBranchPublishedSha = event.providerRevision;
   }
   if (taskBranch && event.kind === "provider_snapshot") {
     if (taskBranch.status !== "published" ||
         taskBranch.accepted_integration_sha !== taskBranch.acknowledged_remote_sha ||
-        taskBranch.acknowledged_remote_sha !== instance.published_subject) {
+        taskBranch.acknowledged_remote_sha !== instance.published_commit) {
       throw new Error("provider evidence requires the exact published task branch checkpoint");
     }
   }

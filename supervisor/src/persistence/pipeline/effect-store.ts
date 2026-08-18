@@ -58,12 +58,14 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
       WHERE ((current.status IN ('pending', 'failed') AND current.next_attempt_at <= ?)
         OR (current.status = 'processing' AND current.next_attempt_at <= ?))
         AND (
-          current.kind = 'advance_task_branch' OR NOT EXISTS (
+          current.kind IN ('create_task_branch', 'advance_task_branch') OR NOT EXISTS (
             SELECT 1 FROM pipeline_effect_intents earlier
             WHERE earlier.pipeline_instance_id = current.pipeline_instance_id
               AND (
                 earlier.status NOT IN ('acknowledged', 'dead') OR
-                (earlier.status = 'dead' AND earlier.kind IN ('create_task_branch', 'advance_task_branch'))
+                (earlier.status = 'dead'
+                  AND earlier.kind IN ('create_task_branch', 'advance_task_branch')
+                  AND current.kind NOT IN ('stop', 'quarantine', 'cleanup'))
               )
               AND (
                 earlier.transition_version < current.transition_version OR
@@ -79,8 +81,11 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
           ) OR NOT EXISTS (
             SELECT 1 FROM pipeline_task_branches branch
             WHERE branch.pipeline_instance_id = current.pipeline_instance_id
-              AND branch.accepted_integration_sha IS NOT NULL
-              AND branch.accepted_integration_sha IS NOT branch.acknowledged_remote_sha
+              AND (
+                branch.status IN ('pending', 'failed') OR
+                (branch.accepted_integration_sha IS NOT NULL AND
+                 branch.accepted_integration_sha IS NOT branch.acknowledged_remote_sha)
+              )
           )
         )
       ORDER BY current.next_attempt_at, current.created_at, current.id LIMIT ?
@@ -227,6 +232,11 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
               throw new Error(`pipeline checkpoint effect ${effect.id} final frontier changed before acknowledgement`);
             }
           }
+        } else {
+          db.prepare(`
+            DELETE FROM pipeline_stage_checkpoint_objects
+            WHERE effect_id = ? AND expected_old_sha = ? AND expected_new_sha = ?
+          `).run(effect.id, control.expectedOldSha, control.expectedNewSha);
         }
       }
     }
@@ -421,6 +431,13 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
             WHERE parent_attempt_id = ?
           `).run(timestamp, boundedError, timestamp, checkpoint.parent_attempt_id);
         }
+        // The SHA/error ledger above is sufficient for terminal diagnostics.
+        // Retaining the bounded bundle after the effect can no longer retry
+        // would otherwise leak up to 64 MiB per failed checkpoint forever.
+        db.prepare("DELETE FROM execution_checkpoint_objects WHERE effect_id = ?")
+          .run(effectId);
+        db.prepare("DELETE FROM pipeline_stage_checkpoint_objects WHERE effect_id = ?")
+          .run(effectId);
       }
     }
   });

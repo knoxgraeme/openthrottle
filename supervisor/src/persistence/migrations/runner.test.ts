@@ -22,6 +22,12 @@ import { createSettingsStore } from "../settings-store.js";
 import { createSupervisorStore } from "../store.js";
 import { considerCiGithubHead } from "../../providers/github/events.js";
 import {
+  runtime,
+  setupPipelineStore,
+  shippedCatalogPath,
+  ticket,
+} from "../../__fixtures__/pipeline-store.js";
+import {
   applyDatabaseMigrations,
   applyDatabaseMigrationsForAuthority,
   databaseMigrations,
@@ -193,8 +199,9 @@ describe("database migrations", () => {
       "5e755e28e1a6a500c108c9cf3c6c4a66f97dc78309b9be11fe1af204b688d7f2",
       "167edf7c177c22c3074446c93e742cf44b47a9dc5da5e338d64f9e06f8549f07",
       "fbf980b3a1190e637d7fd4775eb6e62f079e06dd51adc0e0483b2a1ec742cd62",
-      "a6562a44ef61f591360c5cc9e5a270d374a7a3a9a93fd89c9b94e58b432e6b73",
+      "a3760c217ba409f362bfba2a9b78432ec12e1d23031723674f90492ad797b65a",
       "d6cc3e5c5b000c963b4bea1f92123f9ac97ef3abe0a59a9419e92e58b6db8616",
+      "3d9ff6c68452b4f8401989cb930b953e373cb9e27798110f49c09d1ccf707538",
     ]);
   });
 
@@ -617,8 +624,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 54,
-      name: `structured-checkpoint-ledger${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 55,
+      name: `ordinary-stage-checkpoint-objects${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -670,8 +677,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 54,
-      name: `structured-checkpoint-ledger${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 55,
+      name: `ordinary-stage-checkpoint-objects${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 
@@ -3021,6 +3028,54 @@ describe("database migrations", () => {
     expect(table.sql).toMatch(/closed_reason TEXT NOT NULL CHECK\(closed_reason IN \(/);
     expect(table.sql).toMatch(/fault_attribution TEXT CHECK\(/);
     expect(db.prepare("SELECT version FROM schema_migrations WHERE version = 29").get()).toEqual({ version: 29 });
+  });
+
+  it("recovers a progressed pre-v53 publication without recreating its branch at base", () => {
+    const setup = setupPipelineStore(":memory:", shippedCatalogPath);
+    db = setup.db;
+    const { tickets, pipelines, catalog, snapshot } = setup;
+    const manifest = catalog.manifests.get("core/implement@4")!;
+    tickets.upsert({
+      ...ticket("legacy-published-migration-session"),
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: snapshot,
+        runtime,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        planDigest: "c".repeat(64),
+      },
+    });
+    const instance = pipelines.getInstanceForSession("legacy-published-migration-session")!;
+    const publishedCommit = "d".repeat(40);
+    db.prepare(`
+      UPDATE pipeline_instances
+      SET status = 'waiting_provider', active_stage_id = 'provider',
+          immutable_subject = ?, published_subject = ?, published_commit = ?
+      WHERE id = ?
+    `).run("e".repeat(40), "e".repeat(40), publishedCommit, instance.id);
+    db.prepare(`
+      DELETE FROM pipeline_effect_intents
+      WHERE pipeline_instance_id = ? AND kind = 'create_task_branch'
+    `).run(instance.id);
+    db.prepare("DELETE FROM pipeline_task_branches WHERE pipeline_instance_id = ?").run(instance.id);
+
+    databaseMigrations.find((migration) => migration.version === 53)!.up(db);
+
+    expect(db.prepare(`
+      SELECT accepted_integration_sha, acknowledged_remote_sha, status
+      FROM pipeline_task_branches WHERE pipeline_instance_id = ?
+    `).get(instance.id)).toEqual({
+      accepted_integration_sha: publishedCommit,
+      acknowledged_remote_sha: publishedCommit,
+      status: "published",
+    });
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count FROM pipeline_effect_intents
+      WHERE pipeline_instance_id = ? AND kind = 'create_task_branch'
+    `).get(instance.id)).toEqual({ count: 0 });
   });
 
   // The four hand-maintained CHECK vocabularies on run_outcomes (outcome,

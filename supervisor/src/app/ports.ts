@@ -141,6 +141,18 @@ export interface RepositoryRefWritePort {
   }): Promise<{ sha: string }>;
 }
 
+export interface RepositoryPublicationPort {
+  publishTaskBranch(input: {
+    repository: string;
+    branch: string;
+    baseBranch: string;
+    expectedHeadSha: string;
+    title: string;
+    body: string;
+    ownershipMarker: string;
+  }): Promise<{ sha: string; url: string }>;
+}
+
 export interface PullRequestRef {
   host: string;
   repo: string;

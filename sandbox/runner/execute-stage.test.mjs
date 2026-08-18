@@ -600,6 +600,11 @@ describe("one-stage executor", () => {
       cwd: input.repoDir,
       encoding: "utf8",
     })).toContain(checkpoint);
+    expect(execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: input.repoDir,
+      encoding: "utf8",
+    }).trim()).toBe(checkpoint);
+    expect(computeWorkspaceTreeOid(input.repoDir)).toBe(result.subject);
   });
 
   it("records a missing required native session as explicit failed evidence", () => {
