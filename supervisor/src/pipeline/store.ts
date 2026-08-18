@@ -75,6 +75,23 @@ export interface PipelineInstance {
   updated_at: string;
 }
 
+export interface PipelineTaskBranch {
+  pipeline_instance_id: string;
+  ticket_id: string;
+  generation: number;
+  repository: string;
+  branch: string;
+  plan_digest: string;
+  lineage: string;
+  base_sha: string;
+  accepted_integration_sha: string | null;
+  acknowledged_remote_sha: string | null;
+  status: "pending" | "reserved" | "checkpointed" | "published" | "failed";
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface PipelineStageAttempt {
   id: string;
   pipeline_instance_id: string;
@@ -114,7 +131,7 @@ export interface PipelineEffectIntent {
   id: string;
   pipeline_instance_id: string;
   transition_version: number;
-  kind: "provision" | "dispatch_stage" | "idle" | "stop" | "quarantine" | "cleanup" | "publish_control" | "publish_github";
+  kind: "create_task_branch" | "advance_task_branch" | "provision" | "dispatch_stage" | "idle" | "stop" | "quarantine" | "cleanup" | "publish_control" | "publish_github";
   idempotency_key: string;
   payload: string;
   payload_hash: string;
@@ -292,6 +309,12 @@ export interface PipelineStatusProjection {
   publication_id: string | null;
   publication_external_id: string | null;
   publication_error: string | null;
+  task_branch_state: "none" | PipelineTaskBranch["status"];
+  task_branch_base_sha: string | null;
+  task_branch_accepted_integration_sha: string | null;
+  task_branch_remote_sha: string | null;
+  task_branch_lineage: string | null;
+  task_branch_error: string | null;
   recovery_action: string | null;
   effect_state: "none" | "pending" | "failed" | "blocked";
   effect_kind: string | null;
@@ -326,6 +349,7 @@ export interface PipelineInstanceSeed {
   repositoryConfig: RepositoryConfigSnapshot;
   runtime: ValidatedRuntimeCapabilityDescriptor;
   authorizedCapabilities: string[];
+  planDigest?: string;
   taskContext?: string;
   inputArtifacts?: StageRequestInputArtifact[];
 }
@@ -451,6 +475,14 @@ export interface PipelineStore extends ChildActionLivenessPort {
   listAttempts(instanceId: string): PipelineStageAttempt[];
   listProviderReadyInstances(limit?: number): PipelineInstance[];
   listStages(instanceId: string): PipelineInstanceStage[];
+  getTaskBranch(instanceId: string): PipelineTaskBranch | undefined;
+  queueTaskBranchAdvance(input: {
+    instanceId: string;
+    generation: number;
+    lineage: string;
+    expectedOldSha: string;
+    expectedNewSha: string;
+  }): PipelineEffectIntent;
   getEffect(id: string): PipelineEffectIntent | undefined;
   listEffects(instanceId: string): PipelineEffectIntent[];
   listPublications(instanceId: string): PipelinePublicationReceipt[];

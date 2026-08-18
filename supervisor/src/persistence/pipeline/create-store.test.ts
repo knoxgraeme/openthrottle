@@ -58,7 +58,10 @@ describe("pipeline store composition", () => {
     });
     expect(request.requestHash).toBe(attempt.request_hash);
     expect(request.idempotencyKey).toBe(attempt.idempotency_key);
-    expect(pipelines.listEffects(instance.id).map((effect) => effect.kind)).toEqual(["provision"]);
+    expect(pipelines.listEffects(instance.id).map((effect) => effect.kind)).toEqual([
+      "create_task_branch",
+      "provision",
+    ]);
     expect(db.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(1);
   });
 

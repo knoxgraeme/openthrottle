@@ -193,6 +193,7 @@ describe("database migrations", () => {
       "5e755e28e1a6a500c108c9cf3c6c4a66f97dc78309b9be11fe1af204b688d7f2",
       "167edf7c177c22c3074446c93e742cf44b47a9dc5da5e338d64f9e06f8549f07",
       "fbf980b3a1190e637d7fd4775eb6e62f079e06dd51adc0e0483b2a1ec742cd62",
+      "a6562a44ef61f591360c5cc9e5a270d374a7a3a9a93fd89c9b94e58b432e6b73",
     ]);
   });
 
@@ -615,8 +616,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 52,
-      name: `provider-feedback-bounded-order-index${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 53,
+      name: `task-branch-checkpoints${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -668,8 +669,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 52,
-      name: `provider-feedback-bounded-order-index${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 53,
+      name: `task-branch-checkpoints${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 

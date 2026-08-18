@@ -1,4 +1,5 @@
 import type { Ticket, SupervisorStore } from "../persistence/store.js";
+import type { RepositoryRefWritePort } from "../app/ports.js";
 import type { CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import { stageById } from "../pipeline/manifest.js";
@@ -81,7 +82,7 @@ const CAPACITY_ERROR_PATTERNS: RegExp[] = [
   /insufficient (?:memory|disk|capacity)/i,
 ];
 
-type EffectErrorClass = "auth" | "capacity" | "transient";
+type EffectErrorClass = "auth" | "capacity" | "permanent" | "transient";
 type RuntimeEffectHandlerResult = "acknowledge" | "skip_acknowledgement";
 
 function classifyEffectError(error: unknown, observed: SerializedRuntimeObservationError): EffectErrorClass {
@@ -89,6 +90,10 @@ function classifyEffectError(error: unknown, observed: SerializedRuntimeObservat
   // 403, and the broad 401/403 auth patterns would otherwise fast-fail an
   // error that clears once resources free up.
   if (runtimeObservationErrorMatches(error, CAPACITY_ERROR_PATTERNS)) return "capacity";
+  if (typeof error === "object" && error !== null &&
+      "retryable" in error && (error as { retryable?: unknown }).retryable === false) {
+    return "permanent";
+  }
   if (
     observed.statusCode === 401 || observed.statusCode === 403 ||
     runtimeObservationErrorMatches(error, AUTH_ERROR_PATTERNS)
@@ -104,6 +109,7 @@ interface PipelineEffectProcessorDeps {
   store: PipelineStore & ExecutionUnitStore;
   tickets: SupervisorStore;
   runtime: SandboxRuntime & SandboxAutostopRuntime;
+  repositoryWriter: RepositoryRefWritePort;
   taskTimeoutSeconds: number;
   /** Maximum concurrently active review-persona subactions. Defaults to 1 in test harnesses. */
   reviewFanoutConcurrency?: number;
@@ -138,6 +144,54 @@ interface IdleEffectControl {
   stageId: string;
   attemptId: string;
   reason: "provider wait" | "human wait";
+}
+
+interface TaskBranchEffectControl {
+  pipelineInstanceId: string;
+  ticketId: string;
+  generation: number;
+  repository: string;
+  ref: string;
+  planDigest: string;
+  lineage: string;
+  expectedOldSha: string | null;
+  expectedNewSha: string;
+}
+
+function isTaskBranchEffect(effect: Pick<PipelineEffectIntent, "kind">): boolean {
+  return effect.kind === "create_task_branch" || effect.kind === "advance_task_branch";
+}
+
+function parseTaskBranchEffectControl(
+  effect: PipelineEffectIntent,
+  instance: PipelineInstance,
+  store: PipelineStore
+): TaskBranchEffectControl {
+  const control = JSON.parse(effect.payload) as Partial<TaskBranchEffectControl> & { schema?: unknown };
+  const branch = store.getTaskBranch(instance.id);
+  if (
+    control.schema !== "openthrottle.task-branch-effect/v1" ||
+    !branch ||
+    control.pipelineInstanceId !== instance.id ||
+    control.ticketId !== instance.ticket_id ||
+    control.generation !== instance.generation ||
+    control.repository !== instance.repository ||
+    control.ref !== `refs/heads/${instance.branch}` ||
+    control.planDigest !== branch.plan_digest ||
+    control.lineage !== branch.lineage ||
+    (control.expectedOldSha !== null && typeof control.expectedOldSha !== "string") ||
+    typeof control.expectedNewSha !== "string"
+  ) throw new Error(`pipeline task branch effect ${effect.id} has a stale lineage fence`);
+  if (effect.kind === "create_task_branch" &&
+      (control.expectedOldSha !== null || control.expectedNewSha !== instance.base_commit)) {
+    throw new Error(`pipeline task branch effect ${effect.id} does not reserve the exact sealed base`);
+  }
+  if (effect.kind === "advance_task_branch" &&
+      (branch.acknowledged_remote_sha !== control.expectedOldSha ||
+       branch.accepted_integration_sha !== control.expectedNewSha)) {
+    throw new Error(`pipeline task branch effect ${effect.id} does not match the accepted integration`);
+  }
+  return control as TaskBranchEffectControl;
 }
 
 function parseStopEffectControl(effect: PipelineEffectIntent): StopEffectControl {
@@ -934,6 +988,28 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     const instance = deps.store.getInstance(effect.pipeline_instance_id);
     if (!instance) throw new Error(`pipeline effect ${effect.id} has no instance`);
     const eventId = `effect-ack-${effect.id}`;
+    if (isTaskBranchEffect(effect)) {
+      const control = parseTaskBranchEffectControl(effect, instance, deps.store);
+      const result = effect.kind === "create_task_branch"
+        ? await deps.repositoryWriter.createRef({
+            repository: control.repository,
+            ref: control.ref,
+            expectedNewSha: control.expectedNewSha,
+            allowExisting: effect.attempts > 1,
+          })
+        : await deps.repositoryWriter.compareAndAdvanceRef({
+            repository: control.repository,
+            ref: control.ref,
+            expectedOldSha: control.expectedOldSha!,
+            expectedNewSha: control.expectedNewSha,
+            allowAlreadyAdvanced: effect.attempts > 1,
+          });
+      if (result.sha !== control.expectedNewSha) {
+        throw new Error(`pipeline task branch effect ${effect.id} returned an unexpected SHA`);
+      }
+      acknowledgeEffect(effect, eventId, result);
+      return;
+    }
     if (effect.kind === "provision" || effect.kind === "dispatch_stage") {
       await handleStageDispatchEffect(effect, instance, eventId);
       return;
@@ -1011,7 +1087,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       const errorClass = classifyEffectError(error, observed);
       // Stop settlement keeps its full retry budget: exhausting it early would
       // reroute live actors into quarantine on the first provider auth blip.
-      const exhausted = (errorClass === "auth" && effect.kind !== "stop") ||
+      const exhausted = ((errorClass === "auth" || errorClass === "permanent") && effect.kind !== "stop") ||
         effect.attempts >= MAX_EFFECT_ATTEMPTS;
       if (!exhausted && errorClass === "capacity") {
         try {
@@ -1108,6 +1184,17 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           new Date(current.getTime() + EFFECT_LEASE_MS).toISOString()
         );
         await Promise.all(effects.map(processClaimed));
+        // Branch effects are a pre-dispatch fence, not a scheduler tick of
+        // latency. Once their durable acknowledgement commits, immediately
+        // lease the now-unblocked provision/dispatch batch in this same drain.
+        // A failed/dead branch remains an ordering blocker and yields no batch.
+        if (effects.length > 0 && effects.every(isTaskBranchEffect)) {
+          const nextEffects = deps.store.claimEffects(
+            current.toISOString(),
+            new Date(current.getTime() + EFFECT_LEASE_MS).toISOString()
+          );
+          await Promise.all(nextEffects.map(processClaimed));
+        }
         await drainActiveCompositeGraphs();
       } finally {
         draining = false;

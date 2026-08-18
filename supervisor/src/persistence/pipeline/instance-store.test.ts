@@ -432,6 +432,7 @@ describe("pipeline instance store", () => {
     });
     expect(pipelines.getActiveAttempt(instance.id)?.request_hash).toHaveLength(64);
     expect(pipelines.listEffects(instance.id).map((effect) => [effect.kind, effect.status])).toEqual([
+      ["create_task_branch", "pending"],
       ["provision", "pending"],
     ]);
   });

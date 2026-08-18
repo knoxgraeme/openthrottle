@@ -28,6 +28,8 @@ import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js"
 import { drainPipelineFeedbackSnapshots } from "./app/provider-feedback.js";
 import { createGithubWebhookReconciler } from "./operations/github-webhook-reconciliation.js";
 import {
+  compareAndAdvanceRepositoryRef,
+  createRepositoryRef,
   listFailedRepositoryWebhookDeliveries,
   reconcileRepositoryWebhook,
   redeliverRepositoryWebhookDelivery,
@@ -91,6 +93,10 @@ async function main() {
     store: pipelineStore,
     tickets: store,
     runtime,
+    repositoryWriter: {
+      createRef: (input) => createRepositoryRef({ token: cfg.githubToken }, input),
+      compareAndAdvanceRef: (input) => compareAndAdvanceRepositoryRef({ token: cfg.githubToken }, input),
+    },
     taskTimeoutSeconds: cfg.taskTimeout,
     reviewFanoutConcurrency: cfg.reviewFanoutConcurrency ?? 3,
     runtimeResourceRetentionMinutes: cfg.runtimeResourceRetentionMinutes,

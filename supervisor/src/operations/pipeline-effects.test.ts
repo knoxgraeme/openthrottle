@@ -31,6 +31,7 @@ import {
 } from "@openthrottle/contracts";
 import { buildReviewSelectorAuthority } from "../pipeline/review-fanout.js";
 import { CodexSeedTokenError } from "../providers/codex/auth.js";
+import { RepositoryRefConflictError, type RepositoryRefWritePort } from "../app/ports.js";
 
 const catalogPath = fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url));
 const structuredGraphPath = fileURLToPath(new URL("../../graphs/structured-v3.json", import.meta.url));
@@ -157,6 +158,63 @@ describe("pipeline effect processor", () => {
     } satisfies SandboxRuntime & SandboxAutostopRuntime;
   }
 
+  function repositoryWriterMock() {
+    return {
+      createRef: vi.fn(async (input: { expectedNewSha: string }) => ({ sha: input.expectedNewSha })),
+      compareAndAdvanceRef: vi.fn(async (input: { expectedNewSha: string }) => ({ sha: input.expectedNewSha })),
+    };
+  }
+
+  function writableHarness(repositoryWriter: RepositoryRefWritePort = repositoryWriterMock()) {
+    db = openDb(":memory:");
+    const pipelines = createPipelineStore(db);
+    const tickets = createSupervisorStore(db, pipelines);
+    const runtimeDescriptor = buildInstalledRuntimeDescriptor("branch-effect-test/v1");
+    const catalog = loadPipelineCatalog(catalogPath, runtimeDescriptor.descriptor);
+    pipelines.acceptRuntimeDescriptor(runtimeDescriptor);
+    pipelines.acceptCatalog(catalog);
+    const config = pipelines.saveRepositoryConfigSnapshot({
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      blobSha: "b".repeat(40),
+      config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-agent }\n"),
+    });
+    const manifest = catalog.manifests.get("fixture/agent@1")!;
+    tickets.upsert({
+      ticket_id: "issue-branch",
+      ticket_reference: "OT-BRANCH",
+      session_id: "session-branch",
+      sandbox_id: null,
+      branch: "ot/branch-lineage",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: config,
+        runtime: runtimeDescriptor,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        planDigest: "c".repeat(64),
+      },
+    });
+    const runtime = sandboxRuntimeMock({ issueId: "branch" });
+    const processor = createPipelineEffectProcessor({
+      store: pipelines,
+      tickets,
+      runtime,
+      repositoryWriter,
+      taskTimeoutSeconds: 300,
+      runtimeResourceRetentionMinutes: 60,
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+    });
+    const instance = pipelines.getInstanceForSession("session-branch")!;
+    return { pipelines, tickets, runtime, processor, instance, repositoryWriter };
+  }
+
   function harness(
     issueId: string,
     sessionId: string,
@@ -201,6 +259,7 @@ describe("pipeline effect processor", () => {
       store: pipelines,
       tickets,
       runtime,
+      repositoryWriter: repositoryWriterMock(),
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       ...(options.reconcileRuntimeResources
@@ -410,6 +469,76 @@ describe("pipeline effect processor", () => {
     };
   }
 
+  it("acknowledges the exact-base task branch before provisioning a write-capable stage", async () => {
+    const writer = repositoryWriterMock();
+    const { pipelines, runtime, processor, instance } = writableHarness(writer);
+
+    await processor.drain();
+
+    expect(writer.createRef).toHaveBeenCalledWith({
+      repository: "owner/repo",
+      ref: "refs/heads/ot/branch-lineage",
+      expectedNewSha: "a".repeat(40),
+      allowExisting: false,
+    });
+    expect(runtime.provision).toHaveBeenCalledTimes(1);
+    expect(writer.createRef.mock.invocationCallOrder[0]).toBeLessThan(
+      runtime.provision.mock.invocationCallOrder[0]!
+    );
+    expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
+      acknowledged_remote_sha: "a".repeat(40),
+      status: "reserved",
+    });
+
+    await processor.drain();
+    expect(runtime.provision).toHaveBeenCalledTimes(1);
+
+    const branch = pipelines.getTaskBranch(instance.id)!;
+    pipelines.queueTaskBranchAdvance({
+      instanceId: instance.id,
+      generation: instance.generation,
+      lineage: branch.lineage,
+      expectedOldSha: "a".repeat(40),
+      expectedNewSha: "d".repeat(40),
+    });
+    await processor.drain();
+    expect(writer.compareAndAdvanceRef).toHaveBeenCalledWith({
+      repository: "owner/repo",
+      ref: "refs/heads/ot/branch-lineage",
+      expectedOldSha: "a".repeat(40),
+      expectedNewSha: "d".repeat(40),
+      allowAlreadyAdvanced: false,
+    });
+    expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
+      accepted_integration_sha: "d".repeat(40),
+      acknowledged_remote_sha: "d".repeat(40),
+      status: "checkpointed",
+    });
+  });
+
+  it("fails a conflicting task ref permanently and never provisions the sandbox", async () => {
+    const writer: RepositoryRefWritePort = {
+      createRef: vi.fn(async () => {
+        throw new RepositoryRefConflictError("repository ref conflict: unowned ref");
+      }),
+      compareAndAdvanceRef: vi.fn(async (input) => ({ sha: input.expectedNewSha })),
+    };
+    const { pipelines, runtime, processor, instance } = writableHarness(writer);
+
+    await processor.drain();
+    await processor.drain();
+
+    expect(runtime.provision).not.toHaveBeenCalled();
+    expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
+      status: "failed",
+      last_error: expect.stringContaining("unowned ref"),
+    });
+    expect(pipelines.listEffects(instance.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "create_task_branch", status: "dead", attempts: 1 }),
+      expect.objectContaining({ kind: "provision", status: "pending", attempts: 0 }),
+    ]));
+  });
+
   it("provisions, seals, credentials, and dispatches the first stage exactly through the durable intent", async () => {
     db = openDb(":memory:");
     const pipelines = createPipelineStore(db);
@@ -452,6 +581,7 @@ describe("pipeline effect processor", () => {
       store: pipelines,
       tickets,
       runtime,
+      repositoryWriter: repositoryWriterMock(),
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -712,6 +842,7 @@ describe("pipeline effect processor", () => {
       store: pipelines,
       tickets,
       runtime,
+      repositoryWriter: repositoryWriterMock(),
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -935,6 +1066,7 @@ describe("pipeline effect processor", () => {
       store: pipelines,
       tickets,
       runtime,
+      repositoryWriter: repositoryWriterMock(),
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -1062,6 +1194,7 @@ describe("pipeline effect processor", () => {
       store: pipelines,
       tickets,
       runtime,
+      repositoryWriter: repositoryWriterMock(),
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -1527,6 +1660,7 @@ describe("pipeline effect processor", () => {
       store: pipelines,
       tickets,
       runtime,
+      repositoryWriter: repositoryWriterMock(),
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -2092,6 +2226,7 @@ describe("pipeline effect processor", () => {
       store: pipelines,
       tickets,
       runtime,
+      repositoryWriter: repositoryWriterMock(),
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -2231,6 +2366,7 @@ describe("pipeline effect processor", () => {
       store: pipelines,
       tickets,
       runtime,
+      repositoryWriter: repositoryWriterMock(),
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => now,
@@ -2379,6 +2515,7 @@ describe("pipeline effect processor", () => {
       store: pipelines,
       tickets,
       runtime,
+      repositoryWriter: repositoryWriterMock(),
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -2492,6 +2629,7 @@ describe("pipeline effect processor", () => {
       store: pipelines,
       tickets,
       runtime,
+      repositoryWriter: repositoryWriterMock(),
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -2776,6 +2914,7 @@ describe("pipeline effect processor", () => {
       store: pipelines,
       tickets,
       runtime,
+      repositoryWriter: repositoryWriterMock(),
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),

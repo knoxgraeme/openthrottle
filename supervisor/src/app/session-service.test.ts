@@ -21,7 +21,7 @@ import {
   parsePullRequestUrl,
 } from "../providers/github/client.js";
 import { enqueueActivity, tryPostError } from "../providers/linear/outbox.js";
-import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
+import { canonicalJson, digestCanonicalJson, digestNormalized } from "@openthrottle/contracts";
 import { loadPipelineCatalog } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
@@ -548,6 +548,14 @@ mcp_servers: {}
     expect(instance.base_branch).toBe("main");
     expect(pipelines.getStageRequest(pipelines.getActiveAttempt(instance.id)!.id).baseBranch).toBe("main");
     expect(pipelines.getActiveAttempt(instance.id)?.stage_id).toBe("implementation");
+    expect(pipelines.listEffects(instance.id).map((effect) => effect.kind)).toEqual([
+      "create_task_branch",
+      "provision",
+    ]);
+    expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
+      base_sha: "a".repeat(40),
+      status: "pending",
+    });
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
     expect(githubFetch).toHaveBeenCalledTimes(2);
   });
@@ -1654,6 +1662,15 @@ intents:
     const attempt = pipelines.getActiveAttempt(pipelines.getInstanceForSession("session-1")!.id)!;
     const request = pipelines.getStageRequest(attempt.id);
     expect(request.capability).toBe("graph/for-each-unit@1");
+    expect(pipelines.listEffects(request.pipelineInstanceId).map((effect) => effect.kind)).toEqual([
+      "create_task_branch",
+      "provision",
+    ]);
+    expect(pipelines.getTaskBranch(request.pipelineInstanceId)).toMatchObject({
+      plan_digest: digestCanonicalJson(executionPlan),
+      base_sha: "a".repeat(40),
+      status: "pending",
+    });
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
   });
 
@@ -3824,6 +3841,10 @@ intents:
 
     const current = pipelines.getInstanceForSession("session-2")!;
     expect(current.id).not.toBe(previous.id);
+    expect(current.branch).not.toBe(previous.branch);
+    expect(pipelines.getTaskBranch(current.id)?.lineage).not.toBe(
+      pipelines.getTaskBranch(previous.id)?.lineage
+    );
     expect(pipelines.getInstance(previous.id)).toMatchObject({
       status: "superseded",
       terminal_outcome: "superseded",

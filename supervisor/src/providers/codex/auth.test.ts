@@ -462,6 +462,18 @@ describe("Codex durable auth", () => {
       expect(env).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: "claude-token" });
     });
 
+    it("never materializes the supervisor GitHub write token for repo.write", async () => {
+      seedTicket("claude");
+      const materialize = createCredentialMaterializer(fullCfg(), store);
+
+      const { env } = await materialize(
+        { providerResourceId: "sandbox-1" },
+        ["repo.read", "repo.write"]
+      );
+      expect(env).toEqual({ GITHUB_TOKEN: "gh-read-token" });
+      expect(Object.values(env)).not.toContain("gh-write-token");
+    });
+
     it("selects the requesting action's own agent credential when it overrides the ticket's default agent", async () => {
       // A graph worker can run a Codex action inside an otherwise-Claude
       // ticket. Without the override, the materializer would hand this

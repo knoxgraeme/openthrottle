@@ -1,7 +1,7 @@
 import type Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { digestNormalized } from "../../pipeline/manifest.js";
-import { runtime, setupPipelineStore, ticket } from "../../__fixtures__/pipeline-store.js";
+import { runtime, setupPipelineStore, shippedCatalogPath, ticket } from "../../__fixtures__/pipeline-store.js";
 
 describe("pipeline effect store", () => {
   let db: Database.Database | undefined;
@@ -79,5 +79,107 @@ describe("pipeline effect store", () => {
       "2099-01-01T02:00:00.000Z",
       "2099-01-01T02:01:00.000Z"
     )).toEqual([]);
+  });
+
+  it("persists reservation and checkpoint heads separately from publication", () => {
+    const setup = setupPipelineStore(":memory:", shippedCatalogPath);
+    db = setup.db;
+    const { tickets, pipelines, catalog, snapshot } = setup;
+    const manifest = catalog.manifests.get("core/implement@4")!;
+    tickets.upsert({
+      ...ticket("branch-session"),
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: snapshot,
+        runtime,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        planDigest: "c".repeat(64),
+      },
+    });
+    const instance = pipelines.getInstanceForSession("branch-session")!;
+    expect(pipelines.listEffects(instance.id).map((effect) => effect.kind)).toEqual([
+      "create_task_branch",
+      "provision",
+    ]);
+    const create = pipelines.claimEffects(
+      "2099-01-01T00:00:00.000Z",
+      "2099-01-01T00:01:00.000Z"
+    )[0]!;
+    expect(create).toMatchObject({ kind: "create_task_branch", attempts: 1 });
+    pipelines.recordEffectAcknowledgement({
+      effectId: create.id,
+      eventId: "branch-created",
+      payload: JSON.stringify({ sha: "a".repeat(40) }),
+    });
+    const reserved = pipelines.getTaskBranch(instance.id)!;
+    expect(reserved).toMatchObject({
+      base_sha: "a".repeat(40),
+      acknowledged_remote_sha: "a".repeat(40),
+      accepted_integration_sha: null,
+      plan_digest: "c".repeat(64),
+      status: "reserved",
+    });
+    expect(() => pipelines.queueTaskBranchAdvance({
+      instanceId: instance.id,
+      generation: instance.generation + 1,
+      lineage: reserved.lineage,
+      expectedOldSha: "a".repeat(40),
+      expectedNewSha: "d".repeat(40),
+    })).toThrow(/stale lineage/);
+
+    const provision = pipelines.claimEffects(
+      "2099-01-01T00:02:00.000Z",
+      "2099-01-01T00:03:00.000Z"
+    )[0]!;
+    pipelines.recordEffectAcknowledgement({
+      effectId: provision.id,
+      eventId: "provisioned",
+      payload: JSON.stringify({ providerResourceId: "sandbox" }),
+    });
+    const advance = pipelines.queueTaskBranchAdvance({
+      instanceId: instance.id,
+      generation: instance.generation,
+      lineage: reserved.lineage,
+      expectedOldSha: "a".repeat(40),
+      expectedNewSha: "d".repeat(40),
+    });
+    expect(pipelines.queueTaskBranchAdvance({
+      instanceId: instance.id,
+      generation: instance.generation,
+      lineage: reserved.lineage,
+      expectedOldSha: "a".repeat(40),
+      expectedNewSha: "d".repeat(40),
+    }).id).toBe(advance.id);
+    const claimedAdvance = pipelines.claimEffects(
+      "2099-01-01T00:04:00.000Z",
+      "2099-01-01T00:05:00.000Z"
+    )[0]!;
+    pipelines.recordEffectAcknowledgement({
+      effectId: claimedAdvance.id,
+      eventId: "branch-advanced",
+      payload: JSON.stringify({ sha: "d".repeat(40) }),
+    });
+    expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
+      accepted_integration_sha: "d".repeat(40),
+      acknowledged_remote_sha: "d".repeat(40),
+      status: "checkpointed",
+    });
+    expect(pipelines.queueTaskBranchAdvance({
+      instanceId: instance.id,
+      generation: instance.generation,
+      lineage: reserved.lineage,
+      expectedOldSha: "a".repeat(40),
+      expectedNewSha: "d".repeat(40),
+    }).id).toBe(advance.id);
+    expect(pipelines.getStatusForIssue(instance.ticket_id)).toMatchObject({
+      task_branch_state: "checkpointed",
+      task_branch_remote_sha: "d".repeat(40),
+      published_commit: null,
+      published_pr_url: null,
+    });
+    expect(pipelines.listPublications(instance.id).some((receipt) => receipt.kind === "pull_request")).toBe(false);
   });
 });

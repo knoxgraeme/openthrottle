@@ -18,6 +18,8 @@ import {
   branchExists,
   classifyGithubIssueComment,
   compareGithubIssueActivationAndComment,
+  compareAndAdvanceRepositoryRef,
+  createRepositoryRef,
   ensureRepositoryControlLabel,
   fetchGithubIssueControlEvents,
   fetchGithubIssueContext,
@@ -1387,6 +1389,84 @@ describe("GitHub contracts", () => {
     expect(await branchExists(client, "o/r", "feature/x")).toBe(true);
     expect(await branchExists(client, "o/r", "missing")).toBe(false);
     await expect(branchExists(client, "o/r", "boom")).rejects.toThrow(/GitHub API error \(500\)/);
+  });
+
+  it("creates an exact task ref and accepts an exact existing ref only on retry", async () => {
+    const sha = "a".repeat(40);
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      requests.push({ url, init });
+      if (url.endsWith("/git/ref/heads%2Fot%2Fissue-1")) return new Response("Not Found", { status: 404 });
+      if (url.endsWith("/git/refs")) return Response.json({ object: { sha } }, { status: 201 });
+      throw new Error(`unexpected request ${url}`);
+    }) as unknown as typeof fetch;
+    await expect(createRepositoryRef({ token: "github", fetch: fetchMock }, {
+      repository: "o/r",
+      ref: "refs/heads/ot/issue-1",
+      expectedNewSha: sha,
+      allowExisting: false,
+    })).resolves.toEqual({ sha });
+    expect(JSON.parse(String(requests[1]!.init?.body))).toEqual({
+      ref: "refs/heads/ot/issue-1",
+      sha,
+    });
+
+    const existingFetch = vi.fn(async () => Response.json({ object: { sha } })) as unknown as typeof fetch;
+    await expect(createRepositoryRef({ token: "github", fetch: existingFetch }, {
+      repository: "o/r",
+      ref: "refs/heads/ot/issue-1",
+      expectedNewSha: sha,
+      allowExisting: true,
+    })).resolves.toEqual({ sha });
+    await expect(createRepositoryRef({ token: "github", fetch: existingFetch }, {
+      repository: "o/r",
+      ref: "refs/heads/ot/issue-1",
+      expectedNewSha: sha,
+      allowExisting: false,
+    })).rejects.toThrow(/already exists/);
+  });
+
+  it("compare-and-advances without force and rejects wrong or non-fast-forward heads", async () => {
+    const oldSha = "a".repeat(40);
+    const newSha = "b".repeat(40);
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        expect(JSON.parse(String(init.body))).toEqual({ sha: newSha, force: false });
+        return Response.json({ object: { sha: newSha } });
+      }
+      return Response.json({ object: { sha: oldSha } });
+    }) as unknown as typeof fetch;
+    await expect(compareAndAdvanceRepositoryRef({ token: "github", fetch: fetchMock }, {
+      repository: "o/r",
+      ref: "refs/heads/ot/issue-1",
+      expectedOldSha: oldSha,
+      expectedNewSha: newSha,
+      allowAlreadyAdvanced: false,
+    })).resolves.toEqual({ sha: newSha });
+
+    const wrongHeadFetch = vi.fn(async () => Response.json({ object: { sha: "c".repeat(40) } })) as unknown as typeof fetch;
+    await expect(compareAndAdvanceRepositoryRef({ token: "github", fetch: wrongHeadFetch }, {
+      repository: "o/r",
+      ref: "refs/heads/ot/issue-1",
+      expectedOldSha: oldSha,
+      expectedNewSha: newSha,
+      allowAlreadyAdvanced: false,
+    })).rejects.toThrow(/expected .* but found/);
+    expect(wrongHeadFetch).toHaveBeenCalledTimes(1);
+
+    const nonFastForwardFetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) =>
+      init?.method === "PATCH"
+        ? new Response("non-fast-forward", { status: 422 })
+        : Response.json({ object: { sha: oldSha } })
+    ) as unknown as typeof fetch;
+    await expect(compareAndAdvanceRepositoryRef({ token: "github", fetch: nonFastForwardFetch }, {
+      repository: "o/r",
+      ref: "refs/heads/ot/issue-1",
+      expectedOldSha: oldSha,
+      expectedNewSha: newSha,
+      allowAlreadyAdvanced: false,
+    })).rejects.toThrow(/without a force update/);
   });
 
   it("pins repository config to the exact resolved commit and blob", async () => {

@@ -6,6 +6,7 @@ import type {
   PipelineStageAttempt,
   PipelineStatusProjection,
   PipelineStore,
+  PipelineTaskBranch,
 } from "../../pipeline/store.js";
 import { sanitizeText } from "../../shared/sanitize.js";
 
@@ -143,6 +144,9 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
       );
       const relevantPublication = blockedPublication ?? failedPublication ?? pendingPublication ?? latest;
       const publicationState = publicationStateFor(publications, instance.status);
+      const taskBranch = db.prepare(`
+        SELECT * FROM pipeline_task_branches WHERE pipeline_instance_id = ?
+      `).get(instance.id) as PipelineTaskBranch | undefined;
       const effects = db.prepare(`
         SELECT *,
           CASE WHEN status IN ('failed', 'dead') THEN next_attempt_at ELSE created_at END AS status_sort_at
@@ -230,6 +234,12 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
         publication_external_id: relevantPublication?.external_id ?? null,
         publication_error:
           boundedStatusError((blockedPublication ?? failedPublication ?? publications.find((item) => item.last_error))?.last_error),
+        task_branch_state: taskBranch?.status ?? "none",
+        task_branch_base_sha: taskBranch?.base_sha ?? null,
+        task_branch_accepted_integration_sha: taskBranch?.accepted_integration_sha ?? null,
+        task_branch_remote_sha: taskBranch?.acknowledged_remote_sha ?? null,
+        task_branch_lineage: taskBranch?.lineage ?? null,
+        task_branch_error: boundedStatusError(taskBranch?.last_error),
         recovery_action: publicationState === "blocked" && blockedPublication
           ? `POST /tickets/:identifier/publications/${blockedPublication.id}/retry`
           : null,

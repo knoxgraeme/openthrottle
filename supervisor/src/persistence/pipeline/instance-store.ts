@@ -35,8 +35,11 @@ interface ValidatedInstanceSeed {
   authorized: string[];
   baseBranch: string;
   instanceId: string;
+  lineage: string;
+  planDigest: string;
   session: { ticket_id: string; generation: number; provider_conversation_id: string | null };
   snapshot: RepositoryConfigSnapshot;
+  writeCapable: boolean;
 }
 
 export function createInstanceStore(db: Database.Database, now: () => string): Pick<
@@ -228,6 +231,10 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
   const validateSeed = (seed: PipelineInstanceSeed): ValidatedInstanceSeed | { existing: PipelineInstance } => {
     const baseBranch = seed.baseBranch ?? "main";
     if (!SAFE_BRANCH.test(baseBranch)) throw new Error(`pipeline base branch ${baseBranch} is invalid`);
+    if (!SAFE_BRANCH.test(seed.branch) || !seed.branch.startsWith("ot/")) {
+      throw new Error(`pipeline task branch ${seed.branch} is invalid`);
+    }
+    if (!/^[a-f0-9]{40}$/.test(seed.baseCommit)) throw new Error("pipeline base commit is invalid");
     assertDigest("manifest", seed.manifest.normalized, seed.manifest.digest);
     if (canonicalJson(seed.manifest.manifest) !== seed.manifest.normalized) {
       throw new Error("manifest normalized content mismatch");
@@ -241,6 +248,21 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
       seed.issueId, seed.sessionId, seed.generation, seed.manifest.manifest.id,
       seed.manifest.manifest.version, seed.manifest.digest,
     ]);
+    const planDigest = seed.planDigest ?? digestNormalized(canonicalJson({
+      manifestDigest: seed.manifest.digest,
+      taskContext: seed.taskContext ?? "",
+    }));
+    if (!/^[a-f0-9]{64}$/.test(planDigest)) throw new Error("pipeline plan digest is invalid");
+    const lineage = digestNormalized(canonicalJson({
+      ticketId: seed.issueId,
+      pipelineInstanceId: instanceId,
+      generation: seed.generation,
+      planDigest,
+      baseSha: seed.baseCommit,
+    }));
+    const writeCapable = seed.manifest.manifest.stages.some((stage) =>
+      stage.credentials.includes("repo.write")
+    );
     const session = db.prepare(`
       SELECT ticket_id, generation, provider_conversation_id, execution_mode, pipeline_instance_id
       FROM agent_sessions WHERE id = ?
@@ -273,6 +295,21 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
           existing.capability_digest !== seed.runtime.digest ||
           existing.authorized_capabilities !== canonicalJson([...new Set(seed.authorizedCapabilities)].sort())
         ) throw new Error(`pipeline instance ${instanceId} is already pinned differently`);
+        const taskBranch = db.prepare(`
+          SELECT plan_digest, lineage, base_sha FROM pipeline_task_branches
+          WHERE pipeline_instance_id = ?
+        `).get(instanceId) as
+          | { plan_digest: string; lineage: string; base_sha: string }
+          | undefined;
+        if (writeCapable && (
+          !taskBranch ||
+          taskBranch.plan_digest !== planDigest ||
+          taskBranch.lineage !== lineage ||
+          taskBranch.base_sha !== seed.baseCommit
+        )) throw new Error(`pipeline instance ${instanceId} task branch is already pinned differently`);
+        if (!writeCapable && taskBranch) {
+          throw new Error(`pipeline instance ${instanceId} unexpectedly owns a task branch`);
+        }
         return { existing };
       }
       throw new Error(`session ${seed.sessionId} execution mode is already pinned`);
@@ -301,7 +338,7 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
         throw new Error(`authorized capability ${capability} is absent from the runtime descriptor`);
       }
     }
-    return { authorized, baseBranch, instanceId, session, snapshot };
+    return { authorized, baseBranch, instanceId, lineage, planDigest, session, snapshot, writeCapable };
   };
 
   const insertInstanceGraph = (
@@ -402,7 +439,8 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
     validated: ValidatedInstanceSeed,
     attemptId: string,
     stageRequest: StageRequestEnvelope,
-    timestamp: string
+    timestamp: string,
+    transitionVersion: number
   ): void => {
     const provisionPayload = canonicalJson({
       pipelineInstanceId: validated.instanceId,
@@ -417,13 +455,64 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
       INSERT INTO pipeline_effect_intents (
         id, pipeline_instance_id, transition_version, kind, idempotency_key,
         payload, payload_hash, status, next_attempt_at, created_at
-      ) VALUES (?, ?, 1, 'provision', ?, ?, ?, 'pending', ?, ?)
+      ) VALUES (?, ?, ?, 'provision', ?, ?, ?, 'pending', ?, ?)
     `).run(
-      deterministicId("effect", [validated.instanceId, 1, "provision"]),
+      deterministicId("effect", [validated.instanceId, transitionVersion, "provision"]),
       validated.instanceId,
+      transitionVersion,
       `provision:${validated.instanceId}`,
       provisionPayload,
       digestNormalized(provisionPayload),
+      timestamp,
+      timestamp
+    );
+  };
+
+  const reserveTaskBranch = (
+    seed: PipelineInstanceSeed,
+    validated: ValidatedInstanceSeed,
+    timestamp: string
+  ): void => {
+    db.prepare(`
+      INSERT INTO pipeline_task_branches (
+        pipeline_instance_id, ticket_id, generation, repository, branch,
+        plan_digest, lineage, base_sha, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+    `).run(
+      validated.instanceId,
+      seed.issueId,
+      seed.generation,
+      seed.repository,
+      seed.branch,
+      validated.planDigest,
+      validated.lineage,
+      seed.baseCommit,
+      timestamp,
+      timestamp
+    );
+    const payload = canonicalJson({
+      schema: "openthrottle.task-branch-effect/v1",
+      pipelineInstanceId: validated.instanceId,
+      ticketId: seed.issueId,
+      generation: seed.generation,
+      repository: seed.repository,
+      ref: `refs/heads/${seed.branch}`,
+      planDigest: validated.planDigest,
+      lineage: validated.lineage,
+      expectedOldSha: null,
+      expectedNewSha: seed.baseCommit,
+    });
+    db.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, next_attempt_at, created_at
+      ) VALUES (?, ?, 1, 'create_task_branch', ?, ?, ?, 'pending', ?, ?)
+    `).run(
+      deterministicId("effect", [validated.instanceId, 1, "create_task_branch", validated.lineage]),
+      validated.instanceId,
+      `create-task-branch:${validated.lineage}`,
+      payload,
+      digestNormalized(payload),
       timestamp,
       timestamp
     );
@@ -448,7 +537,15 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
     const timestamp = now();
     insertInstanceGraph(seed, validated, timestamp);
     const sealed = sealEntryAttempt(seed, validated, timestamp);
-    enqueueProvision(seed, validated, sealed.attemptId, sealed.stageRequest, timestamp);
+    if (validated.writeCapable) reserveTaskBranch(seed, validated, timestamp);
+    enqueueProvision(
+      seed,
+      validated,
+      sealed.attemptId,
+      sealed.stageRequest,
+      timestamp,
+      validated.writeCapable ? 2 : 1
+    );
     const result = getInstanceStmt.get(validated.instanceId) as PipelineInstance;
     validatePinnedInstance(db, result);
     persistSelectionPublications({ db, instance: result, timestamp });

@@ -941,6 +941,11 @@ function dumpSettleDiagnostics({ pipelines, instance, attemptId, label }) {
 // This mirrors Daytona's result short-circuit + action-scoped flock boundary.
 // ---------------------------------------------------------------------------
 
+const repositoryWriter = {
+  async createRef(input) { return { sha: input.expectedNewSha }; },
+  async compareAndAdvanceRef(input) { return { sha: input.expectedNewSha }; },
+};
+
 async function runLoopAdapterReplayScenario({ db, container, fixture }) {
   log("scenario: active loop lost-ack/restart stays single-execution and durably collectable");
   const pipelines = createPipelineStore(db);
@@ -961,6 +966,7 @@ async function runLoopAdapterReplayScenario({ db, container, fixture }) {
     store: pipelines,
     tickets,
     runtime: runtimeA,
+    repositoryWriter,
     taskTimeoutSeconds: 300,
     now: () => new Date(),
   });
@@ -1080,6 +1086,7 @@ async function runHappyPath({ db, container, fixture }) {
     store: pipelines,
     tickets,
     runtime,
+    repositoryWriter,
     taskTimeoutSeconds: 300,
     reviewFanoutConcurrency: 3,
     now: () => new Date(),
@@ -1207,6 +1214,7 @@ async function runReplayScenario({ db, container, fixture }) {
     store: pipelines,
     tickets,
     runtime: runtimeA,
+    repositoryWriter,
     taskTimeoutSeconds: 300,
     // This scenario is also the walking skeleton for the rollback knob. Keep
     // both sides of the restart on the byte-identical serial scheduler.
@@ -1254,6 +1262,7 @@ async function runReplayScenario({ db, container, fixture }) {
     store: pipelines,
     tickets,
     runtime: runtimeB,
+    repositoryWriter,
     taskTimeoutSeconds: 300,
     reviewFanoutConcurrency: 1,
     now: () => new Date(),
@@ -1307,6 +1316,7 @@ async function runNeedsHumanScenario({ db, container, fixture }) {
     store: pipelines,
     tickets,
     runtime,
+    repositoryWriter,
     taskTimeoutSeconds: 300,
     now: () => new Date(),
   });
