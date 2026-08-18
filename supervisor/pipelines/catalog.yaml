@@ -1,9 +1,13 @@
 schema: openthrottle.catalog/v1
 manifests:
+  - core-automatic-v1.yaml
   - core-implement-v4.yaml
   - core-investigate-v1.yaml
   - core-tune-v1.yaml
 aliases:
+  automatic:
+    id: core/automatic
+    version: 1
   implement:
     id: core/implement
     version: 4

@@ -20,6 +20,20 @@ export const REVIEW_PERSONA_CAPABILITIES = Object.freeze([
 ]);
 
 export const CAPABILITY_CONTRACTS = Object.freeze({
+  "admission/plan@1": {
+    kind: "agent",
+    minimumCredentials: ["model.invoke", "repo.read"],
+    allowedCredentials: ["model.invoke", "repo.read"],
+    contexts: ["fresh"],
+    artifacts: ["stage_result", "standard_receipt", "execution_plan"],
+  },
+  "admission/review@1": {
+    kind: "agent",
+    minimumCredentials: ["model.invoke", "repo.read"],
+    allowedCredentials: ["model.invoke", "repo.read"],
+    contexts: ["fresh"],
+    artifacts: ["stage_result", "standard_receipt"],
+  },
   "agent/repository-skill@1": {
     kind: "agent",
     minimumCredentials: ["model.invoke", "repo.read"],
@@ -139,17 +153,24 @@ export const CAPABILITY_CONTRACTS = Object.freeze({
     contexts: ["none"],
     artifacts: ["stage_result"],
   },
+  "supervisor/admission-gate@1": {
+    kind: "supervisor",
+    minimumCredentials: [],
+    allowedCredentials: [],
+    contexts: ["none"],
+    artifacts: ["stage_result", "execution_plan"],
+  },
 });
 
 export const RUNTIME_DESCRIPTOR = Object.freeze({
   schema: "openthrottle.runtime-capabilities/v1",
-  release: "openthrottle-snapshot/v13",
+  release: "openthrottle-snapshot/v14",
   generatedBy: "sandbox-runtime-build",
   protocol: STAGE_EXECUTOR_PROTOCOL,
   capabilities: Object.keys(CAPABILITY_CONTRACTS).sort(),
   executors: ["agent", "command", "loop_action", "provider_wait", "supervisor"],
   evaluators: ["citation", "command", "differential_ratchet", "human", "provider", "publish_subject", "semantic"],
-  artifacts: ["candidate_evidence", "command_result", "execution_graph_result", "human_approval", "integration_evidence", "provider_check", "publish_subject", "review", "stage_result", "standard_receipt"],
+  artifacts: ["candidate_evidence", "command_result", "execution_graph_result", "execution_plan", "human_approval", "integration_evidence", "provider_check", "publish_subject", "review", "stage_result", "standard_receipt"],
   contextPolicies: ["fresh", "none", "prefer_resume", "resume_required"],
   credentialScopes: ["mcp", "model.invoke", "provider.read", "repo.read", "repo.write"],
   adapters: {

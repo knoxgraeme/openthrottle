@@ -1,4 +1,8 @@
-import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
+import {
+  ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES,
+  canonicalJson,
+  digestNormalized,
+} from "@openthrottle/contracts";
 import {
   isPipelineReentry,
   type AssuranceClass,
@@ -345,7 +349,9 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     if (!Number.isSafeInteger(artifact.schemaVersion) || artifact.schemaVersion < 1 || artifact.schemaVersion > 1_000) {
       throw new Error(`artifact ${artifact.kind} schema version is invalid`);
     }
-    const artifactLimit = instance.task_type === "tune" ? TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES : 256 * 1024;
+    const artifactLimit = artifact.kind === "execution_plan"
+      ? ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES
+      : instance.task_type === "tune" ? TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES : 256 * 1024;
     if (Buffer.byteLength(artifact.payload, "utf8") > artifactLimit) {
       throw new Error(`artifact ${artifact.kind} exceeds the coordinator size limit`);
     }
@@ -353,7 +359,9 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     if (!stage.produces.some((kind) => kind === artifact.kind)) {
       throw new Error(`stage ${stage.id} did not declare artifact ${artifact.kind}`);
     }
-    if (artifact.assurance !== stage.evaluator.assurance) {
+    const carriesPlannerPlan = ["admission_decision_gate", "admission_review_gate"].includes(stage.id) &&
+      artifact.kind === "execution_plan" && artifact.assurance === "semantic_attested";
+    if (artifact.assurance !== stage.evaluator.assurance && !carriesPlannerPlan) {
       throw new Error(`artifact ${artifact.kind} has unsupported assurance ${artifact.assurance}`);
     }
     if ((artifact.subject ?? null) !== (expectedSubject ?? null)) {
@@ -424,6 +432,35 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
   // artifacts through the next sealed request. This is the deterministic data
   // channel between isolated sessions; native-session memory and ticket prose
   // are never authority for a tune proposal or mutation.
+  const automaticManifest = input.manifest.template?.id === "core/automatic" ||
+    input.manifest.id === "core/automatic" || input.manifest.id.startsWith("core/automatic/");
+  const eventArtifacts = (input.event.artifacts ?? []).map((artifact) => ({
+    kind: artifact.kind as import("./manifest.js").ArtifactKind,
+    schemaVersion: artifact.schemaVersion,
+    assurance: artifact.assurance,
+    subject: artifact.subject ?? null,
+    payload: artifact.payload,
+    hash: artifact.hash,
+  }));
+  const priorArtifacts = Array.isArray(priorRequest.inputArtifacts) ? priorRequest.inputArtifacts : [];
+  const automaticArtifacts = (): StageRequestInputArtifact[] | undefined => {
+    if (stage.id === "admission_decision_gate") {
+      return eventArtifacts.filter((artifact) => ["standard_receipt", "execution_plan"].includes(artifact.kind));
+    }
+    if (stage.id === "admission_reviewer") {
+      return eventArtifacts.filter((artifact) => ["stage_result", "execution_plan"].includes(artifact.kind));
+    }
+    if (stage.id === "admission_review_gate") {
+      return [
+        ...priorArtifacts.filter((artifact) => ["stage_result", "execution_plan"].includes(artifact.kind)),
+        ...eventArtifacts.filter((artifact) => artifact.kind === "standard_receipt"),
+      ].sort((left, right) => left.kind.localeCompare(right.kind));
+    }
+    if (stage.id === "structured_edit") {
+      return eventArtifacts.filter((artifact) => artifact.kind === "execution_plan");
+    }
+    return undefined;
+  };
   const inputArtifacts = input.instance.task_type === "tune"
     ? (input.event.artifacts ?? []).map((artifact) => ({
       kind: artifact.kind as import("./manifest.js").ArtifactKind,
@@ -433,6 +470,8 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
       payload: artifact.payload,
       hash: artifact.hash,
     })).sort((left, right) => left.kind.localeCompare(right.kind))
+    : automaticManifest
+      ? automaticArtifacts()
     : Array.isArray(priorRequest.inputArtifacts)
       ? priorRequest.inputArtifacts
       : undefined;
@@ -652,10 +691,20 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       throw new Error(`stage ${stage.id} cannot enter provider wait without an exact subject`);
     }
     const isReentry = isPipelineReentry(input.manifest, stage.id, target.id);
+    const isAdmissionCorrection = (
+      input.manifest.template?.id === "core/automatic" ||
+      input.manifest.id === "core/automatic" ||
+      input.manifest.id.startsWith("core/automatic/")
+    ) && (
+      (stage.id === "admission_decision_gate" && target.id === "admission_planner") ||
+      (stage.id === "admission_review_gate" && ["admission_planner", "admission_reviewer"].includes(target.id)) ||
+      (stage.id === "admission_planner" && target.id === "admission_planner") ||
+      (stage.id === "admission_reviewer" && target.id === "admission_reviewer")
+    );
     // Same-stage retries are governed by that transition's local
     // max_reentries. Only a backward transition into an earlier stage starts
     // a new whole-pipeline semantic repair round.
-    const isRepairRound = isReentry && target.id !== stage.id;
+    const isRepairRound = isReentry && target.id !== stage.id && !isAdmissionCorrection;
     const targetState = input.stages.find((candidate) => candidate.stage_id === target.id);
     if (!targetState) throw new Error(`stage state ${target.id} is absent for pipeline instance ${input.instance.id}`);
     if (isRepairRound && input.manifest.max_repair_rounds !== undefined &&

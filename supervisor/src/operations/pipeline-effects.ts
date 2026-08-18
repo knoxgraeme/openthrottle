@@ -3,6 +3,8 @@ import type { RepositoryPublicationPort, RepositoryRefWritePort } from "../app/p
 import type { CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import { stageById } from "../pipeline/manifest.js";
+import { evaluateAdmissionDecisionGate, evaluateAdmissionReviewGate, type AdmissionGateContext } from "../pipeline/admission-gate.js";
+import { extractJsonBlocks } from "../pipeline/markdown.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
 import {
   canonicalJson,
@@ -509,7 +511,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
   const supervisorArtifact = (input: {
     request: StageRequestEnvelope;
     instance: PipelineInstance;
-    outcome: "success" | "failure" | "no_change" | "needs_human";
+    outcome: "success" | "failure" | "no_change" | "needs_human" | "semantic_repair_required";
     summary: string;
     details: Record<string, unknown>;
     kind?: "stage_result" | "publish_subject";
@@ -802,6 +804,209 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     acknowledgeEffect(effect, event.id, { resultHash: artifact.hash, outcome });
   };
 
+  const automaticAdmissionContext = (
+    instance: PipelineInstance,
+    request: StageRequestEnvelope,
+  ): AdmissionGateContext => {
+    const blocks = extractJsonBlocks(request.taskContext, "openthrottle.admission-input/v1");
+    if (blocks.length !== 1) throw new Error("automatic admission gate requires one sealed admission input");
+    const sealed = JSON.parse(blocks[0]!) as {
+      admission_basis?: {
+        candidates?: Array<{ graph_id?: unknown }>;
+        lock?: { graph_id?: unknown } | null;
+        skills?: {
+          planner?: { reference?: unknown; package_digest?: unknown };
+          reviewer?: { reference?: unknown; package_digest?: unknown };
+        };
+      };
+      admission_basis_digest?: unknown;
+      effective_manifest_digest?: unknown;
+    };
+    if (sealed.effective_manifest_digest !== instance.manifest_digest) {
+      throw new Error("automatic admission sealed effective manifest digest mismatch");
+    }
+    const manifest = JSON.parse(instance.normalized_manifest) as import("../pipeline/manifest.js").PipelineManifest;
+    const plannerStage = manifest.stages.find((stage) => stage.id === "admission_planner");
+    const reviewerStage = manifest.stages.find((stage) => stage.id === "admission_reviewer");
+    const bindingFor = (stage: typeof plannerStage, name: "planner" | "reviewer") => {
+      const configured = sealed.admission_basis?.skills?.[name];
+      const skill = stage?.repositorySkill?.reference ?? stage?.loop?.skill;
+      const packageDigest = stage?.repositorySkill?.packageDigest ?? null;
+      if (typeof skill !== "string" || configured?.reference !== skill || configured.package_digest !== packageDigest) {
+        throw new Error(`automatic admission ${name} manifest provenance mismatch`);
+      }
+      return { skill, packageDigest };
+    };
+    const candidates = (sealed.admission_basis?.candidates ?? []).map((candidate) => candidate.graph_id)
+      .filter((route): route is "simple" | "structured" => route === "simple" || route === "structured");
+    if (candidates.length !== 2) throw new Error("automatic admission candidate policy is incomplete");
+    const lockValue = sealed.admission_basis?.lock?.graph_id;
+    const lock = lockValue === "simple" || lockValue === "structured" ? lockValue : null;
+    const authorizedCapabilities = JSON.parse(instance.authorized_capabilities) as string[];
+    const receiptWrapper = inputArtifactPayload(request, "standard_receipt") as {
+      stage?: { request_hash?: unknown };
+    };
+    if (typeof receiptWrapper.stage?.request_hash !== "string") {
+      throw new Error("automatic admission receipt wrapper is missing its producer request fence");
+    }
+    let planRequestHash = receiptWrapper.stage.request_hash;
+    if (request.stageId === "admission_review_gate") {
+      const decisionWrapper = inputArtifactPayload(request, "stage_result") as {
+        details?: { planner_request_hash?: unknown };
+      };
+      if (typeof decisionWrapper.details?.planner_request_hash !== "string") {
+        throw new Error("automatic admission review gate lost the planner request fence");
+      }
+      planRequestHash = decisionWrapper.details.planner_request_hash;
+    }
+    return {
+      admissionBasisDigest: String(sealed.admission_basis_digest),
+      effectiveManifestDigest: instance.manifest_digest,
+      requestHash: receiptWrapper.stage.request_hash,
+      planRequestHash,
+      subject: request.expectedSubject ?? instance.base_commit,
+      candidates,
+      lock,
+      runtime: {
+        release: instance.runtime_release,
+        capabilityDigest: instance.capability_digest,
+        capabilities: authorizedCapabilities,
+        credentialScopes: plannerStage?.credentials ?? [],
+      },
+      planner: bindingFor(plannerStage, "planner"),
+      reviewer: bindingFor(reviewerStage, "reviewer"),
+    };
+  };
+
+  const inputArtifactPayload = (request: StageRequestEnvelope, kind: string): unknown => {
+    const artifact = request.inputArtifacts?.find((entry) => entry.kind === kind);
+    if (!artifact || digestNormalized(artifact.payload) !== artifact.hash) {
+      throw new Error(`automatic admission gate is missing sealed ${kind}`);
+    }
+    return JSON.parse(artifact.payload) as unknown;
+  };
+
+  const inputReceipt = (request: StageRequestEnvelope, expectedType: "admission_decision" | "admission_review") => {
+    const wrapper = inputArtifactPayload(request, "standard_receipt") as { details?: { receipt?: unknown } };
+    const receipt = validateStandardReceipt(wrapper.details?.receipt, {
+      source: `stage.${request.stageId}.input_receipt`,
+    }).value;
+    if (receipt.type !== expectedType) throw new Error(`automatic admission gate requires ${expectedType}`);
+    return receipt;
+  };
+
+  const executeSupervisorAdmissionGate = (
+    effect: PipelineEffectIntent,
+    instance: PipelineInstance,
+    request: StageRequestEnvelope,
+  ): void => {
+    assertActiveAttempt(instance, request);
+    const ticket = deps.tickets.getByIssueId(instance.ticket_id);
+    if (!ticket || ticket.session_id !== instance.session_id) {
+      throw new Error(`pipeline instance ${instance.id} has no current ticket binding`);
+    }
+    if (!ticket.run_id) {
+      const started = deps.tickets.beginRun({
+        issueId: instance.ticket_id,
+        runId: request.runId,
+        taskType: instance.task_type,
+        tokenHash: request.requestHash,
+        expiresAt: new Date(now().getTime() + deps.taskTimeoutSeconds * 1_000).toISOString(),
+      });
+      if (!started) throw new Error(`pipeline supervisor stage ${request.attemptId} could not acquire the ticket actor`);
+    }
+    deps.store.bindStageRun(request.attemptId, request.runId);
+    deps.store.markStageDispatched(request.attemptId);
+    const context = automaticAdmissionContext(instance, request);
+    let outcome: "success" | "no_change" | "semantic_repair_required" | "needs_human" | "failure";
+    let summary: string;
+    let details: Record<string, unknown>;
+    let executionPlanArtifact: NonNullable<PipelineCoordinatorEvent["artifacts"]>[number] | undefined;
+    try {
+      if (request.stageId === "admission_decision_gate") {
+        const receipt = inputReceipt(request, "admission_decision");
+        const rawPlan = request.inputArtifacts?.some((entry) => entry.kind === "execution_plan")
+          ? inputArtifactPayload(request, "execution_plan")
+          : undefined;
+        const result = evaluateAdmissionDecisionGate({ context, receipt, executionPlan: rawPlan });
+        outcome = result.outcome;
+        summary = `Automatic admission selected ${result.route}.`;
+        details = {
+          decision: result.decision,
+          generated_plan_digest: result.generatedPlanDigest,
+          planner_request_hash: context.requestHash,
+        };
+        if (result.executionPlan) {
+          const payload = canonicalJson(result.executionPlan);
+          executionPlanArtifact = {
+            kind: "execution_plan",
+            schemaVersion: 1,
+            assurance: "semantic_attested",
+            subject: context.subject,
+            payload,
+            hash: digestNormalized(payload),
+          };
+        }
+      } else if (request.stageId === "admission_review_gate") {
+        const decisionWrapper = inputArtifactPayload(request, "stage_result") as {
+          details?: { decision?: unknown };
+        };
+        const result = evaluateAdmissionReviewGate({
+          context,
+          decision: decisionWrapper.details?.decision,
+          executionPlan: inputArtifactPayload(request, "execution_plan"),
+          receipt: inputReceipt(request, "admission_review"),
+        });
+        outcome = result.outcome;
+        summary = outcome === "success"
+          ? "Automatic admission review approved the exact structured plan."
+          : outcome === "needs_human"
+            ? "Automatic admission review requires human authority."
+            : "Automatic admission review rejected the candidate plan.";
+        details = { decision: result.decision, correction_owner: result.correctionOwner };
+        if (outcome === "success") {
+          const payload = canonicalJson(result.executionPlan);
+          executionPlanArtifact = {
+            kind: "execution_plan",
+            schemaVersion: 1,
+            assurance: "executor_verified",
+            subject: context.subject,
+            payload,
+            hash: digestNormalized(payload),
+          };
+        }
+      } else {
+        throw new Error(`unknown automatic admission gate stage ${request.stageId}`);
+      }
+    } catch (error) {
+      outcome = "semantic_repair_required";
+      summary = `Automatic admission evidence was rejected: ${sanitizeText(String(error)).slice(0, 800)}`;
+      details = { correction_owner: request.stageId === "admission_decision_gate" ? "planner" : "reviewer" };
+      if (request.stageId === "admission_review_gate") {
+        const carried = request.inputArtifacts?.find((entry) => entry.kind === "execution_plan");
+        if (carried) executionPlanArtifact = { ...carried };
+      }
+    }
+    const stageResult = supervisorArtifact({ request, instance, outcome, summary, details });
+    const event: PipelineCoordinatorEvent = {
+      id: `supervisor-admission-${request.attemptId}-${stageResult.hash.slice(0, 16)}`,
+      kind: "stage_result",
+      instanceId: instance.id,
+      generation: instance.generation,
+      runId: request.runId,
+      stageId: request.stageId,
+      attemptId: request.attemptId,
+      requestHash: request.requestHash,
+      outcome,
+      resultHash: stageResult.hash,
+      subject: stageResult.subject,
+      nativeSessionId: null,
+      artifacts: [stageResult, ...(executionPlanArtifact ? [executionPlanArtifact] : [])],
+    };
+    completeStageAttemptActor(deps.store, deps.tickets, event, { observedSubject: stageResult.subject });
+    acknowledgeEffect(effect, event.id, { resultHash: stageResult.hash, outcome });
+  };
+
   const runtimeBindingFor = (instance: PipelineInstance): EffectRuntimeBinding => {
     const binding = deps.store.getRuntimeResource(instance.id);
     return {
@@ -848,6 +1053,10 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         if (!started) throw new Error(`pipeline supervisor stage ${request.attemptId} could not acquire the ticket actor`);
       }
       executeSupervisorTuneStage(effect, instance, request);
+      return;
+    }
+    if (request.capability === "supervisor/admission-gate@1") {
+      executeSupervisorAdmissionGate(effect, instance, request);
       return;
     }
     if (request.capability === "ce/publish@1") {
