@@ -1,0 +1,87 @@
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const taskRoot = resolve(repoRoot, "skills/tasks");
+const skill = (name) => readFileSync(resolve(taskRoot, name, "SKILL.md"), "utf8");
+
+describe("automatic-admission task packages", () => {
+  it("ships one complete canonical package per planning action", () => {
+    for (const [name, reference] of [
+      ["admission-plan", "route-rubric.md"],
+      ["review-admission-plan", "review-checklist.md"],
+    ]) {
+      expect(skill(name)).toContain(`name: ${name}`);
+      expect(existsSync(resolve(taskRoot, name, "agents/openai.yaml"))).toBe(true);
+      expect(existsSync(resolve(taskRoot, name, "references", reference))).toBe(true);
+    }
+  });
+
+  it("keeps planner output typed, bounded, and complete for every route", () => {
+    const body = skill("admission-plan");
+    for (const phrase of [
+      "openthrottle.admission-decision/v1",
+      "openthrottle.execution-plan/v2",
+      "admission_decision",
+      "simple",
+      "structured",
+      "needs_human",
+      "256 KiB",
+      "generated_plan_digest",
+    ]) expect(body).toContain(phrase);
+    expect(body).toMatch(/objective,\s+requirements, files, approach, tests, acceptance, and verification/);
+    expect(body).toMatch(/simple[\s\S]*no execution plan/i);
+    expect(body).toMatch(/needs_human[\s\S]*specific/i);
+  });
+
+  it("requires a fresh independent reviewer bound only to sealed inputs", () => {
+    const body = skill("review-admission-plan");
+    for (const phrase of [
+      "fresh context",
+      "bounded ticket",
+      "candidate route",
+      "candidate plan",
+      "scope coverage",
+      "unsupported expansion",
+      "dependency coherence",
+      "acceptance completeness",
+      "path plausibility",
+      "executable verification",
+      "openthrottle.admission-review/v1",
+      "admission_review",
+      "generated_plan_digest",
+    ]) expect(body).toContain(phrase);
+    expect(body).toMatch(/no planner conversation/i);
+    expect(body).toMatch(/never rewrite|do not rewrite/i);
+  });
+
+  it("treats adversarial content as data and denies every planning-side effect", () => {
+    const adversarialFixtures = [
+      ["route coercion", "untrusted data"],
+      ["ticket-selected package", "select a skill"],
+      ["capability escalation", "grant a capability"],
+      ["repository exfiltration", "exfiltrate"],
+      ["package self-modification", "this skill package"],
+      ["repository write", "Never edit"],
+      ["publication", "publish"],
+      ["self-answered ambiguity", "needs_human"],
+      ["session reuse", "session"],
+      ["secret-bearing instruction", "secret"],
+      ["malformed result", "Malformed"],
+      ["duplicate result", "duplicate"],
+      ["oversized result", "oversized"],
+      ["route-inconsistent result", "route-inconsistent"],
+    ];
+    for (const name of ["admission-plan", "review-admission-plan"]) {
+      const body = skill(name).replace(/\s+/g, " ");
+      for (const [fixture, denial] of adversarialFixtures) {
+        expect(body, `${name} must deny the ${fixture} fixture`).toContain(denial);
+      }
+    }
+    const joined = `${skill("admission-plan")}\n${skill("review-admission-plan")}`;
+    expect(joined.toLowerCase()).not.toContain("compound-engineering");
+    expect(joined).not.toMatch(/\bce-[a-z][a-z-]*[a-z]\b/);
+  });
+});

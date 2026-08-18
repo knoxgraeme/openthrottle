@@ -40,13 +40,14 @@ const reviewPersonaTasks = [
   ...optionalReviewPersonaTasks,
 ];
 const tuneTasks = ["tune"];
+const admissionTasks = ["admission-plan", "review-admission-plan"];
 const findingReviewPersonaTasks = [
   "correctness-dataflow",
   "tests-contracts",
   ...optionalReviewPersonaTasks,
 ];
 const selectorAndPersonaTasks = ["select-review-personas", ...findingReviewPersonaTasks];
-const tasks = [...stageTasks, ...loopTasks, ...reviewPersonaTasks, ...tuneTasks];
+const tasks = [...stageTasks, ...loopTasks, ...reviewPersonaTasks, ...tuneTasks, ...admissionTasks];
 
 // The four loop skills that own an executor-owned worktree and author
 // `subject.post` via `ot-subject-post`.
