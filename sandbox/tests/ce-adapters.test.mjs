@@ -1,7 +1,8 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve, sep } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { validateStandardReceipt } from "../runner/artifacts.mjs";
 import { createLoopRequestHash, executeLoopAction } from "../runner/execute-loop.mjs";
@@ -492,6 +493,12 @@ describe("OpenThrottle canonical task skills", () => {
   });
 
   it("every selector and persona example satisfies the real sealed loop receipt fences", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-ce-adapter-actions-"));
+    vi.stubEnv("OT_LOOP_ACTION_ROOT", actionRoot);
+    onTestFinished(() => {
+      vi.unstubAllEnvs();
+      rmSync(actionRoot, { recursive: true, force: true });
+    });
     for (const task of selectorAndPersonaTasks) {
       const matches = [...skillBody(task).matchAll(/```json\n([\s\S]*?)\n```/g)];
       expect(matches.length, `${task} must carry exactly one json example`).toBe(1);

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -9,7 +9,8 @@ import {
   digest,
   validateStandardReceipt,
 } from "./artifacts.mjs";
-import { childActionFailureResult, executeChildAction, finalizeChildActionRetention, verifyTuneCandidate } from "./execute-child-action.mjs";
+import { childActionFailureResult, executeChildAction, finalizeChildActionRetention, replayChildActionResult, verifyTuneCandidate } from "./execute-child-action.mjs";
+import { removeWorktree } from "./worktrees.mjs";
 
 const directories = [];
 
@@ -73,7 +74,54 @@ describe("child executor action", () => {
 
     remove.mockClear();
     expect(finalizeChildActionRetention(request, { outcome: "failure" }, { remove })).toEqual({ removed: false });
+    expect(finalizeChildActionRetention(request, { outcome: "needs_human" }, { remove })).toEqual({ removed: false });
     expect(remove).not.toHaveBeenCalled();
+  });
+
+  it("replays a persisted candidate result and removes its leftover worktree", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "ot-child-replay-"));
+    directories.push(fixtureRoot);
+    const repoDir = join(fixtureRoot, "repo");
+    const rootDir = join(fixtureRoot, "worktrees");
+    const markerRootDir = join(fixtureRoot, "markers");
+    const outputPath = join(fixtureRoot, "result.json");
+    const handle = "replay-worktree";
+    const candidateWorktree = join(rootDir, handle);
+    const temporaryPack = join(candidateWorktree, "git-objects", "base", "pack", "temporary.pack");
+    mkdirSync(repoDir);
+    mkdirSync(rootDir);
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repoDir });
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: repoDir });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir });
+    writeFileSync(join(repoDir, "README.md"), "base\n");
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "base"], { cwd: repoDir });
+    execFileSync("git", ["worktree", "add", "-q", "--detach", candidateWorktree, "HEAD"], { cwd: repoDir });
+    mkdirSync(join(candidateWorktree, "git-objects", "base", "pack"), { recursive: true });
+    writeFileSync(temporaryPack, "pack\n");
+
+    const request = childExecutorRequest({
+      actionKind: "candidate",
+      commandName: undefined,
+      worktree: { id: handle },
+    });
+    const replay = {
+      kind: "child_executor_action_result",
+      action_id: request.actionId,
+      attempt_id: request.attemptId,
+      request_hash: request.requestHash,
+      outcome: "success",
+    };
+    writeFileSync(outputPath, JSON.stringify(replay));
+    const remove = vi.fn((options) => removeWorktree({ ...options, markerRootDir }));
+
+    expect(replayChildActionResult(request, outputPath, { repoDir, rootDir, remove })).toEqual(replay);
+    expect(remove).toHaveBeenCalledOnce();
+    expect(existsSync(candidateWorktree)).toBe(false);
+    expect(existsSync(temporaryPack)).toBe(false);
+    expect(execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: repoDir, encoding: "utf8" }))
+      .not.toContain(candidateWorktree);
+    expect(JSON.parse(readFileSync(outputPath, "utf8"))).toEqual(replay);
   });
 
   it("verifies the exact authorized tune paths and before/after content digests", () => {
