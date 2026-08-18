@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   canonicalJson,
   digestNormalized,
+  compileAutomaticManifest,
   loadPipelineCatalog,
   parsePipelineManifest,
   parseRepositoryConfig,
@@ -165,6 +166,27 @@ const CORE_TUNE_V1_STAGE_IDS = [
   "provider",
 ];
 
+const CORE_AUTOMATIC_V1_STAGE_IDS = [
+  "admission_planner",
+  "admission_decision_gate",
+  "admission_reviewer",
+  "admission_review_gate",
+  "simple_implementation",
+  "simple_repair_implementation",
+  "simple_repair_semantic_review",
+  "simple_semantic_review",
+  "simple_simplification",
+  "simple_post_simplify_review",
+  "simple_test",
+  "simple_lint",
+  "simple_build",
+  "simple_publish",
+  "simple_provider",
+  "structured_edit",
+  "structured_publish",
+  "structured_provider",
+];
+
 describe("pipeline manifest validation", () => {
   it("loads the shipped catalog deterministically against independent runtime evidence", () => {
     const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
@@ -174,6 +196,7 @@ describe("pipeline manifest validation", () => {
 
     expect(first.digest).toBe(second.digest);
     expect([...first.manifests.keys()]).toEqual([
+      "core/automatic@1",
       "core/implement@4",
       "core/investigate@1",
       "core/tune@1",
@@ -193,10 +216,82 @@ describe("pipeline manifest validation", () => {
     expect(() => resolvePipelineReference(first, "fixture-command"))
       .toThrow(/unknown pipeline selection/);
     expect(implementManifest.stages.map((stage) => stage.id)).toEqual(CORE_IMPLEMENT_V4_STAGE_IDS);
+    const automaticManifest = resolvePipelineReference(first, "automatic").manifest;
+    expect(automaticManifest.stages.map((stage) => stage.id)).toEqual(CORE_AUTOMATIC_V1_STAGE_IDS);
+    expect(automaticManifest.entry_stage).toBe("admission_planner");
+    expect(automaticManifest.max_repair_rounds).toBe(5);
+    expect(automaticManifest.stages.find((stage) => stage.id === "admission_decision_gate")?.transitions)
+      .toMatchObject({
+        success: { to: "admission_reviewer" },
+        no_change: { to: "simple_implementation" },
+        needs_human: { terminal: "needs_human" },
+        semantic_repair_required: { to: "admission_planner", max_reentries: 1, on_exhausted: "failed" },
+      });
+    expect(automaticManifest.stages.find((stage) => stage.id === "admission_review_gate")?.transitions)
+      .toMatchObject({
+        success: { to: "structured_edit" },
+        semantic_repair_required: { to: "admission_reviewer", max_reentries: 1, on_exhausted: "failed" },
+        failure: { to: "admission_planner", max_reentries: 1, on_exhausted: "failed" },
+      });
     expect(resolvePipelineReference(first, "investigate").manifest.stages.map((stage) => stage.id)).toEqual([
       "investigate",
       "publish",
     ]);
+  });
+
+  it("compiles repository admission skill bindings into a content-addressed effective manifest", () => {
+    const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
+    const runtime = buildInstalledRuntimeDescriptor("openthrottle-snapshot/v14");
+    const template = resolvePipelineReference(loadPipelineCatalog(path, runtime.descriptor), "automatic");
+    const base = {
+      template,
+      compilerVersion: "automatic-manifest-compiler/v1",
+      pinnedBase: "a".repeat(40),
+      candidatePolicy: ["core/simple@1", "core/structured@3"],
+      runtimeRelease: runtime.descriptor.release,
+      capabilityDigest: runtime.digest,
+    } as const;
+    const builtin = compileAutomaticManifest({
+      ...base,
+      planner: { reference: "builtin://admission-plan@1", packageDigest: null },
+      reviewer: { reference: "builtin://review-admission-plan@1", packageDigest: null },
+    });
+    const overridden = compileAutomaticManifest({
+      ...base,
+      planner: {
+        reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/planner`,
+        packageDigest: "1".repeat(64),
+        package: {
+          ...repositorySkillPackage(),
+          schema: "openthrottle.repository-skill-package/v1",
+          reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/planner`,
+          invocation: "planner",
+          directory: ".openthrottle/skills/planner",
+          commit: "a".repeat(40),
+          packageDigest: "1".repeat(64),
+          files: [{
+            path: ".openthrottle/skills/planner/SKILL.md",
+            blobSha: "c".repeat(40),
+            digest: "d".repeat(64),
+          }],
+        },
+      },
+      reviewer: { reference: "builtin://review-admission-plan@1", packageDigest: null },
+    });
+
+    expect(compileAutomaticManifest({
+      ...base,
+      planner: { reference: "builtin://admission-plan@1", packageDigest: null },
+      reviewer: { reference: "builtin://review-admission-plan@1", packageDigest: null },
+    })).toEqual(builtin);
+    expect(overridden.digest).not.toBe(builtin.digest);
+    expect(overridden.manifest.id).not.toBe(builtin.manifest.id);
+    expect(overridden.manifest.template).toMatchObject({ id: "core/automatic", version: 1 });
+    expect(overridden.manifest.stages.find((stage) => stage.id === "admission_planner"))
+      .toMatchObject({
+        loop: { skill: expect.stringMatching(/^repo:\/\//) },
+        executor: { capability: "agent/repository-skill@1" },
+      });
   });
 
   it("rejects ordinary loop bindings in directly loaded catalog manifests", () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { RUNTIME_DESCRIPTOR } from "./capabilities.mjs";
+import { RUNTIME_DESCRIPTOR, canonicalJson } from "./capabilities.mjs";
 import {
   buildCommandArtifacts,
   buildStandardReceiptArtifacts,
@@ -273,6 +273,92 @@ describe("normalized stage artifacts", () => {
     });
     expect(artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result", "standard_receipt"]);
     expect(JSON.parse(artifacts[1].payload).details.receipt.result).toBe("accept");
+  });
+
+  it("seals automatic admission decisions with a separate bounded execution plan artifact", () => {
+    const executionPlan = {
+      schema: "openthrottle.execution-plan/v2",
+      graph_id: "structured",
+      plan_id: "automatic",
+      units: [{
+        id: "unit_a", title: "Unit A", depends_on: [], objective: "Implement it.",
+        requirements: ["Keep the contract."], files: ["src/a.ts"], approach: ["Follow patterns."],
+        tests: ["Covers success."], acceptance: ["It works."], verification: ["npm test"],
+      }],
+      commands: [{ name: "test" }],
+    };
+    const generatedPlanDigest = digest(canonicalJson(executionPlan));
+    const authority = {
+      assurance: "semantic_attested",
+      producer: {
+        worker_id: "planner",
+        skill: "builtin://admission-plan@1",
+        capability_digest: "b".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: { base: "d".repeat(40), pre: "d".repeat(40), post: "d".repeat(40) },
+      fence: {
+        pipeline_instance_id: "pipeline-1", graph_digest: "a".repeat(64), unit_id: "admission_planner",
+        attempt_id: "attempt-1", parent_run_id: "run-1", action_attempt_id: "attempt-1",
+        generation: 1, native_session_id: null, request_hash: "c".repeat(64),
+      },
+    };
+    const receipt = {
+      schema: "openthrottle.receipt/v1",
+      type: "admission_decision",
+      assurance: "semantic_attested",
+      result: "structured",
+      producer: authority.producer,
+      subject: authority.subject,
+      fence: authority.fence,
+      evidence: ["bounded decision"],
+      payload: { decision: {
+        schema: "openthrottle.admission-decision/v1",
+        route: "structured",
+        rationale: "Multiple ordered units are required.",
+        questions: [],
+        admission_basis_digest: "e".repeat(64),
+        effective_manifest_digest: "a".repeat(64),
+        generated_plan_digest: generatedPlanDigest,
+      } },
+      issued_at: "2026-08-18T00:00:00.000Z",
+    };
+    const artifacts = buildStandardReceiptArtifacts({
+      receipt,
+      fence: { ...fence, capability: "admission/plan@1" },
+      authority,
+      requiredArtifacts: ["standard_receipt", "execution_plan"],
+      executionPlan: {
+        schema: "openthrottle.admission-execution-plan-artifact/v1",
+        execution_plan: executionPlan,
+        generated_plan_digest: generatedPlanDigest,
+        producer: {
+          skill: authority.producer.skill,
+          capability_digest: authority.producer.capability_digest,
+          skill_package_digest: null,
+        },
+        assurance: "semantic_attested",
+        source: {
+          admission_basis_digest: "e".repeat(64),
+          effective_manifest_digest: "a".repeat(64),
+          request_hash: "c".repeat(64),
+        },
+      },
+      env: {},
+    });
+    expect(artifacts.map((artifact) => artifact.kind)).toEqual([
+      "stage_result", "standard_receipt", "execution_plan",
+    ]);
+    expect(JSON.parse(artifacts[0].payload).result).toBe("success");
+    expect(JSON.parse(artifacts[2].payload).execution_plan).toEqual(executionPlan);
+    expect(artifacts[2].assurance).toBe("semantic_attested");
+    expect(() => buildStandardReceiptArtifacts({
+      receipt,
+      fence: { ...fence, capability: "admission/plan@1" },
+      authority,
+      requiredArtifacts: ["standard_receipt", "execution_plan"],
+      env: {},
+    })).toThrow(/requires an admission execution plan|inconsistent execution plan/);
   });
 
   it("accepts typed tune analysis and proposal receipts without granting gate authority", () => {

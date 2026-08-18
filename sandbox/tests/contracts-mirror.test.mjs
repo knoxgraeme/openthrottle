@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { canonicalJson, canonicalValue } from "../runner/capabilities.mjs";
 import {
   COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES,
+  ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES,
   STANDARD_RECEIPT_RESULTS,
   digest,
 } from "../runner/artifacts.mjs";
@@ -88,6 +89,17 @@ describe("contracts mirrors carried by the sandbox runner", () => {
       ? dist.COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES
       : Number(readContractsSource("receipts.ts").match(/export const COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES = (\d+);/)[1]);
     expect(COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES).toBe(contractsValue);
+  });
+
+  it("keeps the admission execution-plan artifact bound byte-identical with contracts", async () => {
+    const dist = await importContractsDist("admission-decision.js");
+    const sourceMatch = readContractsSource("admission-decision.ts")
+      .match(/export const ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES = (\d+) \* (\d+);/);
+    expect(sourceMatch).not.toBeNull();
+    const contractsValue = dist
+      ? dist.ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES
+      : Number(sourceMatch[1]) * Number(sourceMatch[2]);
+    expect(ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES).toBe(contractsValue);
   });
 
   it("keeps artifacts.mjs STANDARD_RECEIPT_RESULTS aligned with contracts RECEIPT_RESULTS_BY_TYPE", async () => {

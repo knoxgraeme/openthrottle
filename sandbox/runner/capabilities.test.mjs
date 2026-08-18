@@ -21,6 +21,19 @@ describe("installed stage capabilities", () => {
     expect(RUNTIME_DESCRIPTOR.executors).toContain("supervisor");
     expect(capabilityContract("command/run@1").kind).toBe("command");
     expect(capabilityContract("supervisor/citation-gate@1").kind).toBe("supervisor");
+    expect(capabilityContract("supervisor/admission-gate@1").kind).toBe("supervisor");
+    expect(authorizeCapability({
+      capability: "admission/plan@1",
+      contextPolicy: "fresh",
+      credentialScopes: ["model.invoke", "repo.read"],
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+    }).kind).toBe("agent");
+    expect(() => authorizeCapability({
+      capability: "admission/review@1",
+      contextPolicy: "fresh",
+      credentialScopes: ["model.invoke", "repo.read", "repo.write"],
+      requiredArtifacts: ["stage_result", "standard_receipt"],
+    })).toThrow(/not authorized.*repo.write/);
     expect(() => authorizeCapability({
       capability: "core/tune@1",
       contextPolicy: "fresh",

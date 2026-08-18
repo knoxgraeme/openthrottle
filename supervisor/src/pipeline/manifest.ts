@@ -156,7 +156,7 @@ export interface PipelineStageLoopBinding {
   id: string;
   skill: string;
   input_scope: "graph" | "diff" | "review";
-  receipt: "unit_completion" | "semantic_review";
+  receipt: "unit_completion" | "semantic_review" | "admission_decision" | "admission_review";
   max_parallel: number;
   max_rounds: number;
   timeout_seconds: number;
@@ -216,6 +216,30 @@ export interface PipelineManifest {
     capabilities: string[];
   };
   stages: PipelineStage[];
+  template?: {
+    id: "core/automatic";
+    version: 1;
+    digest: string;
+    compiler: string;
+    identity_digest: string;
+  };
+}
+
+export interface AutomaticManifestSkillBinding {
+  reference: string;
+  packageDigest: string | null;
+  package?: RepositorySkillPackage;
+}
+
+export interface CompileAutomaticManifestInput {
+  template: ValidatedPipelineManifest;
+  compilerVersion: string;
+  pinnedBase: string;
+  candidatePolicy: readonly [string, string] | readonly string[];
+  runtimeRelease: string;
+  capabilityDigest: string;
+  planner: AutomaticManifestSkillBinding;
+  reviewer: AutomaticManifestSkillBinding;
 }
 
 interface RetryDeclaration {
@@ -468,6 +492,8 @@ function capabilityForLoopSkill(
     if (repositorySkill) {
       fail(`${path}.repositorySkill`, "is allowed only for repo:// loop skills");
     }
+    if (loop.skill === "builtin://admission-plan@1") return "admission/plan@1";
+    if (loop.skill === "builtin://review-admission-plan@1") return "admission/review@1";
     return loop.skill.slice("builtin://".length);
   }
   if (loop.skill.startsWith("repo://")) {
@@ -581,7 +607,9 @@ function parseStageLoopBinding(value: unknown, path: string): PipelineStageLoopB
     id: stringAt(input.id, `${path}.id`, { pattern: IDENTIFIER }),
     skill: stringAt(input.skill, `${path}.skill`, { max: 240 }),
     input_scope: enumAt(input.input_scope, `${path}.input_scope`, ["graph", "diff", "review"] as const),
-    receipt: enumAt(input.receipt, `${path}.receipt`, ["unit_completion", "semantic_review"] as const),
+    receipt: enumAt(input.receipt, `${path}.receipt`, [
+      "unit_completion", "semantic_review", "admission_decision", "admission_review",
+    ] as const),
     max_parallel: integerAt(input.max_parallel, `${path}.max_parallel`, 1, 1),
     max_rounds: integerAt(input.max_rounds, `${path}.max_rounds`, 1, 20),
     timeout_seconds: integerAt(input.timeout_seconds, `${path}.timeout_seconds`, 1, 86_400),
@@ -915,7 +943,7 @@ export function validatePipelineManifest(
   const source = options.source ?? "pipeline";
   const input = objectAt(value, source, [
     "schema", "id", "version", "description", "entry_stage", "max_attempts", "max_repair_rounds",
-    "requires", "defaults", "stages",
+    "requires", "defaults", "stages", "template",
   ]);
   if (input.schema !== "openthrottle.pipeline/v1") fail(`${source}.schema`, "must be openthrottle.pipeline/v1");
   const requiresInput = objectAt(input.requires, `${source}.requires`, ["protocol", "capabilities"]);
@@ -947,6 +975,7 @@ export function validatePipelineManifest(
       (stage, path) => parseStage(stage, path, defaults),
       { min: 1, max: 32 }
     ),
+    ...(input.template === undefined ? {} : { template: parseAutomaticTemplate(input.template, `${source}.template`) }),
   };
   validateGraph(manifest, source);
   const requiredCapabilities = new Set(manifest.requires.capabilities);
@@ -1005,6 +1034,82 @@ export function validatePipelineManifest(
   return { manifest, normalized, digest: digestNormalized(normalized) };
 }
 
+function parseAutomaticTemplate(value: unknown, path: string): NonNullable<PipelineManifest["template"]> {
+  const input = objectAt(value, path, ["id", "version", "digest", "compiler", "identity_digest"]);
+  if (input.id !== "core/automatic") fail(`${path}.id`, "must be core/automatic");
+  if (input.version !== 1) fail(`${path}.version`, "must be 1");
+  return {
+    id: "core/automatic",
+    version: 1,
+    digest: stringAt(input.digest, `${path}.digest`, { pattern: /^[a-f0-9]{64}$/ }),
+    compiler: stringAt(input.compiler, `${path}.compiler`, { max: 120, pattern: /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*\/v\d+$/ }),
+    identity_digest: stringAt(input.identity_digest, `${path}.identity_digest`, { pattern: /^[a-f0-9]{64}$/ }),
+  };
+}
+
+function applyAutomaticSkillBinding(
+  manifest: PipelineManifest,
+  stageId: "admission_planner" | "admission_reviewer",
+  binding: AutomaticManifestSkillBinding
+): void {
+  const stage = manifest.stages.find((candidate) => candidate.id === stageId);
+  if (!stage?.loop) fail(`automatic.${stageId}`, "template stage is missing its loop binding");
+  if (binding.packageDigest === null) {
+    if (!binding.reference.startsWith("builtin://")) fail(`automatic.${stageId}.reference`, "must be builtin when packageDigest is null");
+    if (binding.package) fail(`automatic.${stageId}.package`, "is allowed only for repository bindings");
+    stage.loop.skill = binding.reference;
+    stage.executor.capability = capabilityForLoopSkill(stage.loop, undefined, `automatic.${stageId}`);
+    delete stage.repositorySkill;
+    return;
+  }
+  if (!binding.reference.startsWith("repo://") || !binding.package) {
+    fail(`automatic.${stageId}`, "repository bindings require exact package provenance");
+  }
+  if (binding.package.packageDigest !== binding.packageDigest || binding.package.reference !== binding.reference) {
+    fail(`automatic.${stageId}.package`, "does not match the configured reference and digest");
+  }
+  stage.loop.skill = `repo://${binding.package.invocation}`;
+  stage.executor.capability = REPOSITORY_SKILL_CAPABILITY;
+  stage.repositorySkill = binding.package;
+  if (!manifest.requires.capabilities.includes(REPOSITORY_SKILL_CAPABILITY)) {
+    manifest.requires.capabilities.push(REPOSITORY_SKILL_CAPABILITY);
+  }
+}
+
+export function compileAutomaticManifest(input: CompileAutomaticManifestInput): ValidatedPipelineManifest {
+  if (input.template.manifest.id !== "core/automatic" || input.template.manifest.version !== 1) {
+    fail("automatic.template", "must be core/automatic@1");
+  }
+  const identity = {
+    schema: "openthrottle.automatic-manifest-identity/v1",
+    template: {
+      id: input.template.manifest.id,
+      version: input.template.manifest.version,
+      digest: input.template.digest,
+    },
+    compiler: input.compilerVersion,
+    pinned_base: input.pinnedBase,
+    candidate_policy: [...input.candidatePolicy],
+    runtime: { release: input.runtimeRelease, capability_digest: input.capabilityDigest },
+    planner: { reference: input.planner.reference, package_digest: input.planner.packageDigest },
+    reviewer: { reference: input.reviewer.reference, package_digest: input.reviewer.packageDigest },
+  };
+  const identityDigest = digestNormalized(canonicalJson(identity));
+  const manifest = structuredClone(input.template.manifest);
+  manifest.id = `core/automatic/${identityDigest}`;
+  manifest.template = {
+    id: "core/automatic",
+    version: 1,
+    digest: input.template.digest,
+    compiler: input.compilerVersion,
+    identity_digest: identityDigest,
+  };
+  applyAutomaticSkillBinding(manifest, "admission_planner", input.planner);
+  applyAutomaticSkillBinding(manifest, "admission_reviewer", input.reviewer);
+  manifest.requires.capabilities.sort();
+  return validatePipelineManifest(manifest, { source: `effective:${manifest.id}` });
+}
+
 export function parsePipelineManifest(
   raw: string,
   options: { source?: string; runtime?: RuntimeCapabilityInventory } = {}
@@ -1036,7 +1141,7 @@ export function loadPipelineCatalog(
     const path = resolve(dirname(catalogPath), file);
     const validated = parsePipelineManifest(readFileSync(path, "utf8"), { source: path, runtime });
     for (const stage of validated.manifest.stages) {
-      if (stage.loop) {
+      if (stage.loop && validated.manifest.id !== "core/automatic") {
         fail(
           `${path}.stages.${stage.id}.loop`,
           "ordinary loop bindings are supported only in repository-compiled manifests"

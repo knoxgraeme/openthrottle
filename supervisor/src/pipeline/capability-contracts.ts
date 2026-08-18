@@ -3,6 +3,8 @@ import type { ArtifactKind, ContextPolicy } from "./manifest.js";
 export const FOR_EACH_UNIT_CAPABILITY = "graph/for-each-unit@1";
 export const REPOSITORY_SKILL_CAPABILITY = "agent/repository-skill@1";
 export const ORDINARY_STAGE_BUILTIN_CAPABILITIES = [
+  "admission/plan@1",
+  "admission/review@1",
   "agent/semantic@1",
   "ce/implement@1",
   "ce/plan@1",
@@ -12,7 +14,9 @@ export const ORDINARY_STAGE_BUILTIN_CAPABILITIES = [
   "ce/simplify@1",
   "core/tune@1",
 ] as const;
-export const ORDINARY_STAGE_INPUT_SCOPE: Readonly<Partial<Record<string, "graph" | "diff">>> = {
+export const ORDINARY_STAGE_INPUT_SCOPE: Readonly<Partial<Record<string, "graph" | "diff" | "review">>> = {
+  "admission/plan@1": "graph",
+  "admission/review@1": "review",
   "agent/semantic@1": "graph",
   "ce/implement@1": "graph",
   "ce/plan@1": "graph",
@@ -60,6 +64,24 @@ export interface CapabilityCredentialContractViolation {
 }
 
 const CAPABILITY_CREDENTIALS: Readonly<Record<string, CapabilityCredentialContract>> = {
+  "admission/plan@1": {
+    minimum: ["model.invoke", "repo.read"],
+    allowed: ["model.invoke", "repo.read"],
+    contexts: ["fresh"],
+    artifacts: ["stage_result", "standard_receipt", "execution_plan"],
+  },
+  "admission/review@1": {
+    minimum: ["model.invoke", "repo.read"],
+    allowed: ["model.invoke", "repo.read"],
+    contexts: ["fresh"],
+    artifacts: ["stage_result", "standard_receipt"],
+  },
+  "supervisor/admission-gate@1": {
+    minimum: [],
+    allowed: [],
+    contexts: ["none"],
+    artifacts: ["stage_result", "execution_plan"],
+  },
   "agent/semantic@1": {
     minimum: ["model.invoke", "repo.read"],
     allowed: ["model.invoke", "repo.read", "repo.write"],

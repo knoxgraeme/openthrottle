@@ -42,6 +42,8 @@ export function buildInstalledRuntimeDescriptor(
     capabilities: sortedUnique(overrides.capabilities ?? [
       "agent/semantic@1",
       "accept-unit@1",
+      "admission/plan@1",
+      "admission/review@1",
       "agent-native-contracts@1",
       "agent/repository-skill@1",
       "ce/plan@1",
@@ -62,6 +64,7 @@ export function buildInstalledRuntimeDescriptor(
       "reliability-adversarial@1",
       "security@1",
       "select-review-personas@1",
+      "supervisor/admission-gate@1",
       "supervisor/citation-gate@1",
       "supervisor/differential-ratchet@1",
       "tests-contracts@1",

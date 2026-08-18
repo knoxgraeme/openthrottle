@@ -53,6 +53,8 @@ export const STANDARD_RECEIPT_RESULTS = Object.freeze({
   human_approval: ["approved", "rejected", "needs_human"],
   tune_analysis: ["success", "failure", "needs_human"],
   tune_proposal: ["success", "no_change", "failure", "needs_human"],
+  admission_decision: ["simple", "structured", "needs_human"],
+  admission_review: ["approved", "rejected", "needs_human"],
 });
 const STANDARD_RECEIPT_STAGE_OUTCOMES = Object.freeze({
   accept: "success",
@@ -67,6 +69,8 @@ const STANDARD_RECEIPT_STAGE_OUTCOMES = Object.freeze({
   revise: "semantic_repair_required",
   semantic_repair_required: "semantic_repair_required",
   success: "success",
+  simple: "no_change",
+  structured: "success",
 });
 const SEMANTIC_RECEIPTS = new Set([
   "unit_completion",
@@ -74,6 +78,8 @@ const SEMANTIC_RECEIPTS = new Set([
   "semantic_review",
   "tune_analysis",
   "tune_proposal",
+  "admission_decision",
+  "admission_review",
 ]);
 const SEVERITIES = new Set(["P0", "P1", "P2", "P3"]);
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -82,6 +88,7 @@ const SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+
 const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const MAX_ARTIFACT_PAYLOAD_BYTES = 12 * 1024;
 const MAX_TUNE_ARTIFACT_PAYLOAD_BYTES = 768 * 1024;
+export const ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES = 320 * 1024;
 // Kept byte-identical with contracts/src/receipts.ts. Sixteen command receipts
 // can enter one bounded prior-evidence envelope, so these diagnostics are byte
 // bounded independently of the outer artifact limit.
@@ -391,6 +398,71 @@ function receiptPayload(type, value, env) {
       findings: boundedFindings(payload.findings, "standard receipt payload findings", env),
     };
   }
+  if (type === "admission_decision") {
+    const payload = exactPayload(value, "standard receipt payload", new Set(["decision"]), env);
+    const decision = exactObject(payload.decision, "standard receipt payload decision", new Set([
+      "schema", "route", "rationale", "questions", "admission_basis_digest",
+      "effective_manifest_digest", "generated_plan_digest",
+    ]));
+    if (decision.schema !== "openthrottle.admission-decision/v1") {
+      throw new Error("standard receipt payload decision has an invalid schema");
+    }
+    if (!["simple", "structured", "needs_human"].includes(decision.route)) {
+      throw new Error("standard receipt payload decision route is invalid");
+    }
+    const generatedPlanDigest = nullable(decision.generated_plan_digest, (entry) =>
+      patternedText(entry, "standard receipt payload decision generated_plan_digest", SHA256, env, 64));
+    if ((decision.route === "structured") !== (generatedPlanDigest !== null)) {
+      throw new Error("standard receipt payload decision generated_plan_digest is inconsistent with route");
+    }
+    const questions = boundedStrings(decision.questions, "standard receipt payload decision questions", 16, 1_000, env);
+    if ((decision.route === "needs_human") !== (questions.length > 0)) {
+      throw new Error("standard receipt payload decision questions are inconsistent with route");
+    }
+    return { decision: {
+      schema: decision.schema,
+      route: decision.route,
+      rationale: boundedText(decision.rationale, "standard receipt payload decision rationale", 4_000, env),
+      questions,
+      admission_basis_digest: patternedText(decision.admission_basis_digest, "standard receipt payload decision admission_basis_digest", SHA256, env, 64),
+      effective_manifest_digest: patternedText(decision.effective_manifest_digest, "standard receipt payload decision effective_manifest_digest", SHA256, env, 64),
+      generated_plan_digest: generatedPlanDigest,
+    } };
+  }
+  if (type === "admission_review") {
+    const payload = exactPayload(value, "standard receipt payload", new Set(["review"]), env);
+    const review = exactObject(payload.review, "standard receipt payload review", new Set([
+      "schema", "verdict", "summary", "findings", "questions", "admission_basis_digest",
+      "effective_manifest_digest", "generated_plan_digest",
+    ]));
+    if (review.schema !== "openthrottle.admission-review/v1") {
+      throw new Error("standard receipt payload review has an invalid schema");
+    }
+    if (!["approved", "rejected", "needs_human"].includes(review.verdict)) {
+      throw new Error("standard receipt payload review verdict is invalid");
+    }
+    const findings = boundedFindings(review.findings, "standard receipt payload review findings", env);
+    const questions = boundedStrings(review.questions, "standard receipt payload review questions", 16, 1_000, env);
+    if (review.verdict === "approved" && (findings.length > 0 || questions.length > 0)) {
+      throw new Error("approved admission review cannot carry findings or questions");
+    }
+    if (review.verdict === "rejected" && findings.length === 0) {
+      throw new Error("rejected admission review requires findings");
+    }
+    if ((review.verdict === "needs_human") !== (questions.length > 0)) {
+      throw new Error("admission review questions are inconsistent with verdict");
+    }
+    return { review: {
+      schema: review.schema,
+      verdict: review.verdict,
+      summary: boundedText(review.summary, "standard receipt payload review summary", 4_000, env),
+      findings,
+      questions,
+      admission_basis_digest: patternedText(review.admission_basis_digest, "standard receipt payload review admission_basis_digest", SHA256, env, 64),
+      effective_manifest_digest: patternedText(review.effective_manifest_digest, "standard receipt payload review effective_manifest_digest", SHA256, env, 64),
+      generated_plan_digest: patternedText(review.generated_plan_digest, "standard receipt payload review generated_plan_digest", SHA256, env, 64),
+    } };
+  }
   if (type === "tune_analysis" || type === "tune_proposal") {
     const contractField = type === "tune_analysis" ? "analysis" : "proposal";
     const expectedSchema = type === "tune_analysis"
@@ -681,6 +753,67 @@ function sealArtifact(payload) {
   };
 }
 
+function sealAdmissionExecutionPlan(value, fence, env) {
+  const artifact = exactObject(value, "admission execution plan artifact", new Set([
+    "schema", "execution_plan", "generated_plan_digest", "producer", "assurance", "source",
+  ]));
+  if (artifact.schema !== "openthrottle.admission-execution-plan-artifact/v1") {
+    throw new Error("admission execution plan artifact has an invalid schema");
+  }
+  if (artifact.assurance !== "semantic_attested") {
+    throw new Error("admission execution plan artifact has invalid assurance");
+  }
+  if (!artifact.execution_plan || typeof artifact.execution_plan !== "object" || Array.isArray(artifact.execution_plan) ||
+      artifact.execution_plan.schema !== "openthrottle.execution-plan/v2" ||
+      artifact.execution_plan.graph_id !== "structured") {
+    throw new Error("admission execution plan artifact has an invalid structured plan");
+  }
+  const generatedPlanDigest = patternedText(
+    artifact.generated_plan_digest,
+    "admission execution plan artifact generated_plan_digest",
+    SHA256,
+    env,
+    64,
+  );
+  if (digest(canonicalJson(artifact.execution_plan)) !== generatedPlanDigest) {
+    throw new Error("admission execution plan artifact digest does not match canonical plan bytes");
+  }
+  const producer = exactObject(artifact.producer, "admission execution plan artifact producer", new Set([
+    "skill", "capability_digest", "skill_package_digest",
+  ]));
+  const source = exactObject(artifact.source, "admission execution plan artifact source", new Set([
+    "admission_basis_digest", "effective_manifest_digest", "request_hash",
+  ]));
+  const normalized = canonicalJson({
+    schema: artifact.schema,
+    execution_plan: boundedPlainObject(artifact.execution_plan, "admission execution plan", env, 256 * 1024),
+    generated_plan_digest: generatedPlanDigest,
+    producer: {
+      skill: patternedText(producer.skill, "admission execution plan artifact producer skill", SKILL_REFERENCE, env, 320),
+      capability_digest: patternedText(producer.capability_digest, "admission execution plan artifact producer capability_digest", SHA256, env, 64),
+      skill_package_digest: nullable(producer.skill_package_digest, (entry) =>
+        patternedText(entry, "admission execution plan artifact producer skill_package_digest", SHA256, env, 64)),
+    },
+    assurance: artifact.assurance,
+    source: {
+      admission_basis_digest: patternedText(source.admission_basis_digest, "admission execution plan artifact source admission_basis_digest", SHA256, env, 64),
+      effective_manifest_digest: patternedText(source.effective_manifest_digest, "admission execution plan artifact source effective_manifest_digest", SHA256, env, 64),
+      request_hash: patternedText(source.request_hash, "admission execution plan artifact source request_hash", SHA256, env, 64),
+    },
+  });
+  if (Buffer.byteLength(normalized, "utf8") > ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES) {
+    throw new Error("admission execution plan artifact exceeds the sealed payload limit");
+  }
+  return {
+    kind: "execution_plan",
+    schemaVersion: 1,
+    assurance: "semantic_attested",
+    subject: fence.subject,
+    payload: normalized,
+    hash: digest(normalized),
+  };
+}
+
 export function buildSemanticArtifacts({
   proposal,
   fence,
@@ -787,6 +920,7 @@ export function buildStandardReceiptArtifacts({
   receipt,
   fence,
   authority,
+  executionPlan,
   requiredArtifacts = ["standard_receipt"],
   env = process.env,
 }) {
@@ -794,10 +928,24 @@ export function buildStandardReceiptArtifacts({
   assertStandardReceiptAuthority(normalized, authority);
   const receiptPayload = canonicalJson(normalized);
   const receiptHash = digest(receiptPayload);
-  const result = STANDARD_RECEIPT_STAGE_OUTCOMES[normalized.result];
+  // Admission agents report a typed recommendation, not a stage transition.
+  // The supervisor gate must see every valid decision/review receipt and own
+  // the branch outcome, including needs_human and rejected results.
+  const result = normalized.type === "admission_decision" || normalized.type === "admission_review"
+    ? "success"
+    : STANDARD_RECEIPT_STAGE_OUTCOMES[normalized.result];
   if (!result) throw new Error(`standard receipt result ${normalized.result} cannot map to a stage outcome`);
-  const kinds = [...new Set(["stage_result", ...requiredArtifacts])];
-  return kinds.map((kind) => sealArtifact(artifactPayload({
+  const expectsExecutionPlan = requiredArtifacts.includes("execution_plan");
+  if (normalized.type === "admission_decision") {
+    const structured = normalized.result === "structured";
+    if (structured !== Boolean(executionPlan)) {
+      throw new Error(`admission decision ${normalized.result} has inconsistent execution plan presence`);
+    }
+  } else if (executionPlan !== undefined) {
+    throw new Error("only admission decision receipts can carry an execution plan");
+  }
+  const kinds = [...new Set(["stage_result", ...requiredArtifacts.filter((kind) => kind !== "execution_plan")])];
+  const artifacts = kinds.map((kind) => sealArtifact(artifactPayload({
     kind,
     fence,
     assurance: normalized.assurance,
@@ -816,6 +964,11 @@ export function buildStandardReceiptArtifacts({
       ...(kind === "standard_receipt" ? { receipt: normalized } : {}),
     },
   })));
+  if (executionPlan !== undefined) artifacts.push(sealAdmissionExecutionPlan(executionPlan, fence, env));
+  if (expectsExecutionPlan && executionPlan === undefined) {
+    throw new Error("stage requires an admission execution plan artifact");
+  }
+  return artifacts;
 }
 
 // --- Loop receipt extraction -------------------------------------------------
