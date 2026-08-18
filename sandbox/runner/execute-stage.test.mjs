@@ -29,6 +29,11 @@ import {
   lockRepositorySkillStageHome,
   lockRepositorySkillStagePersistentProfiles,
   materializeRepositorySkill,
+  inspectionProcessEnvironment,
+  inspectionAgentPolicyArgs,
+  isAdmissionInspectionStage,
+  parseAdmissionPlannerOutput,
+  prepareAdmissionReadOnlyRepository,
   repositoryCommandEnvironment,
   repositorySkillStageEnvironment,
   resolveContextInvocation,
@@ -158,6 +163,7 @@ function fixture({
   repositorySkill,
   repositoryConfig,
   transitionContext = "",
+  stageId,
 } = {}) {
   const repoDir = repository();
   let sealedRepositorySkill = repositorySkill;
@@ -167,7 +173,7 @@ function fixture({
   const config = repositoryConfig
     ?? (commandName && configuredCommand ? { commands: { [commandName]: "test-command" } } : {});
   const stage = {
-    id: commandName ? "command" : "review",
+    id: stageId ?? (commandName ? "command" : "review"),
     executor: { kind: commandName ? "command" : "agent", capability },
     evaluator: { required_artifacts: requiredArtifacts.filter((kind) => kind !== "stage_result") },
     context: contextPolicy,
@@ -264,6 +270,83 @@ function tuneReceipt(request) {
       },
     },
     issued_at: "2026-01-01T00:00:00Z",
+  };
+}
+
+function admissionPlanFixture(request) {
+  const executionPlan = {
+    schema: "openthrottle.execution-plan/v2",
+    graph_id: "structured",
+    plan_id: "automatic",
+    units: [{
+      id: "unit_a",
+      title: "Unit A",
+      depends_on: [],
+      objective: "Implement it.",
+      requirements: ["Keep the contract."],
+      files: ["src/a.ts"],
+      approach: ["Follow existing patterns."],
+      tests: ["Covers success."],
+      acceptance: ["It works."],
+      verification: ["npm test"],
+    }],
+    commands: [{ name: "test" }],
+  };
+  const generatedPlanDigest = digest(canonicalJson(executionPlan));
+  const producer = {
+    worker_id: "planner",
+    skill: "builtin://admission-plan@1",
+    capability_digest: request.capabilityDigest,
+    skill_package_digest: null,
+  };
+  const receipt = {
+    schema: "openthrottle.receipt/v1",
+    type: "admission_decision",
+    assurance: "semantic_attested",
+    result: "structured",
+    producer,
+    subject: { base: request.expectedSubject, pre: request.expectedSubject, post: request.expectedSubject },
+    fence: {
+      pipeline_instance_id: request.pipelineInstanceId,
+      graph_digest: request.manifestDigest,
+      unit_id: request.stageId,
+      attempt_id: request.attemptId,
+      parent_run_id: request.runId,
+      action_attempt_id: request.attemptId,
+      generation: request.generation,
+      native_session_id: null,
+      request_hash: request.requestHash,
+    },
+    evidence: ["Repository inspection completed."],
+    payload: { decision: {
+      schema: "openthrottle.admission-decision/v1",
+      route: "structured",
+      rationale: "The work has multiple ordered units.",
+      questions: [],
+      admission_basis_digest: "e".repeat(64),
+      effective_manifest_digest: request.manifestDigest,
+      generated_plan_digest: generatedPlanDigest,
+    } },
+    issued_at: "2026-08-18T00:00:00.000Z",
+  };
+  return {
+    receipt,
+    execution_plan: {
+      schema: "openthrottle.admission-execution-plan-artifact/v1",
+      execution_plan: executionPlan,
+      generated_plan_digest: generatedPlanDigest,
+      producer: {
+        skill: producer.skill,
+        capability_digest: producer.capability_digest,
+        skill_package_digest: null,
+      },
+      assurance: "semantic_attested",
+      source: {
+        admission_basis_digest: "e".repeat(64),
+        effective_manifest_digest: request.manifestDigest,
+        request_hash: request.requestHash,
+      },
+    },
   };
 }
 
@@ -538,6 +621,157 @@ describe("one-stage executor", () => {
       .toMatchObject({ mode: "fresh", reconstructed: true });
     expect(resolveContextInvocation(fixture({ contextPolicy: "fresh", liveSteering: false }).request))
       .toMatchObject({ mode: "fresh", readOnly: false });
+    const planner = fixture({
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    }).request;
+    expect(isAdmissionInspectionStage(planner)).toBe(true);
+    expect(resolveContextInvocation(planner)).toEqual({
+      mode: "fresh",
+      nativeSessionId: null,
+      reconstructed: false,
+      readOnly: true,
+    });
+  });
+
+  it("dispatches admission skills with a sealed read-only output contract", () => {
+    const skillRoot = join(fileURLToPath(new URL("../..", import.meta.url)), "skills", "tasks");
+    const planner = fixture({
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["standard_receipt", "execution_plan"],
+      liveSteering: false,
+    }).request;
+    const reviewer = fixture({
+      capability: "admission/review@1",
+      stageId: "admission_reviewer",
+      requiredArtifacts: ["standard_receipt"],
+      liveSteering: false,
+    }).request;
+
+    expect(stagePrompt(planner, "/tmp/proposal.json", { skillRoot })).toContain("$admission-plan");
+    expect(stagePrompt(planner, "/tmp/proposal.json", { skillRoot })).toContain('"execution_plan"');
+    expect(stagePrompt(reviewer, "/tmp/proposal.json", { skillRoot })).toContain("$review-admission-plan");
+    expect(stagePrompt(reviewer, "/tmp/proposal.json", { skillRoot })).not.toContain('"execution_plan"');
+  });
+
+  it("applies the same inspection fence and repository-skill provenance to admission overrides", () => {
+    const planner = fixture({
+      capability: "agent/repository-skill@1",
+      stageId: "admission_planner",
+      repositorySkill: "fixture",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    }).request;
+    const reviewer = fixture({
+      capability: "agent/repository-skill@1",
+      stageId: "admission_reviewer",
+      repositorySkill: "fixture",
+      requiredArtifacts: ["stage_result", "standard_receipt"],
+      liveSteering: false,
+    }).request;
+
+    for (const request of [planner, reviewer]) {
+      expect(isAdmissionInspectionStage(request)).toBe(true);
+      expect(resolveContextInvocation(request).readOnly).toBe(true);
+    }
+    const plannerPrompt = stagePrompt(planner, "/tmp/proposal.json");
+    expect(plannerPrompt).toContain(`$${planner.repositorySkill.invocation}`);
+    expect(plannerPrompt).toContain(`"skill":"${planner.repositorySkill.reference}"`);
+    expect(plannerPrompt).toContain(`"skill_package_digest":"${planner.repositorySkill.packageDigest}"`);
+    expect(plannerPrompt).toContain('"execution_plan"');
+    const reviewerPrompt = stagePrompt(reviewer, "/tmp/proposal.json");
+    expect(reviewerPrompt).toContain(`"skill":"${reviewer.repositorySkill.reference}"`);
+    expect(reviewerPrompt).not.toContain('"execution_plan"');
+  });
+
+  it("uses an attempt-scoped home and exposes only the selected model credential to admission engines", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-actions-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const request = fixture({
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["standard_receipt", "execution_plan"],
+      liveSteering: false,
+    }).request;
+    const environment = repositorySkillStageEnvironment(request);
+    expect(environment.env).toContain(`HOME=${join(actionRoot, "attempt-1", "home")}`);
+    expect(environment.env).toContain(`TMPDIR=${join(actionRoot, "attempt-1", "tmp")}`);
+    expect(readFileSync(join(actionRoot, "attempt-1", "codex", "auth.json"), "utf8"))
+      .toBe(STAGE_CREDENTIAL_FIXTURE_ENV.CODEX_AUTH_JSON);
+
+    expect(inspectionProcessEnvironment(request, {
+      PATH: "/bin",
+      CODEX_AUTH_JSON: "model-secret",
+      GITHUB_TOKEN: "repo-secret",
+      OT_CLAUDE_MCP_CONFIG: "/private/mcp.json",
+      LINEAR_API_KEY: "provider-secret",
+    })).toEqual({ PATH: "/bin" });
+    expect(inspectionAgentPolicyArgs("claude")).toEqual([
+      "--permission-mode", "dontAsk",
+      "--allowedTools", "Read,Grep,Glob",
+      "--disallowedTools", "Bash,Write,Edit,WebFetch,WebSearch,Task,NotebookEdit",
+    ]);
+    expect(inspectionAgentPolicyArgs("codex")).toEqual([
+      "--sandbox", "read-only", "-c", "sandbox_workspace_write.network_access=false",
+    ]);
+    expect(inspectionAgentPolicyArgs("opencode")).toEqual([]);
+  });
+
+  it("dispatches admission against a detached exact-subject read-only repository view", () => {
+    const input = fixture({
+      capability: "admission/review@1",
+      stageId: "admission_reviewer",
+      requiredArtifacts: ["stage_result", "standard_receipt"],
+      liveSteering: false,
+    });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-view-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+
+    const view = prepareAdmissionReadOnlyRepository(input.request, input.repoDir);
+    expect(view).not.toBe(input.repoDir);
+    expect(readFileSync(join(view, "file.txt"), "utf8")).toBe("initial\n");
+    expect(statSync(view).mode & 0o777).toBe(0o555);
+    expect(statSync(join(view, "file.txt")).mode & 0o777).toBe(0o444);
+    expect(execFileSync("git", ["config", "--get", "remote.origin.url"], { cwd: view, encoding: "utf8" }).trim())
+      .toBe("DISABLED_BY_OPENTHROTTLE_READONLY_VIEW");
+    expect(readFileSync(join(input.repoDir, "file.txt"), "utf8")).toBe("initial\n");
+  });
+
+  it("extracts and seals the planner receipt and exact execution plan as separate artifacts", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-transport-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const input = fixture({
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+    const output = admissionPlanFixture(input.request);
+    expect(parseAdmissionPlannerOutput(JSON.stringify({ type: "result", result: JSON.stringify(output) })))
+      .toEqual(output);
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        receipt: output.receipt,
+        executionPlan: output.execution_plan,
+      }),
+      now: clock(),
+    });
+    expect(result.artifacts.map((artifact) => artifact.kind)).toEqual([
+      "stage_result", "standard_receipt", "execution_plan",
+    ]);
+    expect(JSON.parse(result.artifacts[2].payload)).toEqual(output.execution_plan);
   });
 
   it("captures provider-neutral native session identifiers from JSONL", () => {

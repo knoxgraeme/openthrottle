@@ -38,6 +38,22 @@ describe("OpenCode config builder", () => {
     expect(JSON.stringify(config)).not.toContain("secret-value");
   });
 
+  it("builds a reusable admission inspection profile with no mutation, shell, network, or MCP tools", () => {
+    const config = buildOpenCodeConfig({
+      model: "kimi-code/kimi-for-coding",
+      mcpServers: { ignored: { url: "https://mcp.example.test" } },
+      inspection: true,
+    });
+    expect(config.permission).toEqual({
+      edit: "deny",
+      bash: "deny",
+      webfetch: "deny",
+      task: "deny",
+      external_directory: "deny",
+    });
+    expect(config.mcp).toEqual({});
+  });
+
   it("fails closed for malformed and unsupported models", () => {
     expect(() => resolveOpenCodeModelProfile("kimi-for-coding")).toThrow("provider/model");
     expect(() => resolveOpenCodeModelProfile("kimi-code/kimi-k3")).toThrow(
