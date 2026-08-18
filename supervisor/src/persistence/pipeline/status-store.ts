@@ -196,6 +196,23 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
         alarm: number;
         integration_subject: string | null;
       }> : [];
+      const structuredActiveAction = latestExecutionGraph ? db.prepare(`
+        SELECT unit_id, action_kind, status, updated_at, checkpoint_status
+        FROM execution_work_attempts
+        WHERE execution_graph_id = ?
+          AND (status IN ('leased', 'dispatched', 'running') OR checkpoint_status = 'pending')
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        LIMIT 1
+      `).get(latestExecutionGraph.id) as {
+        unit_id: string | null;
+        action_kind: string;
+        status: string;
+        updated_at: string;
+        checkpoint_status: "pending" | "acknowledged" | "failed" | null;
+      } | undefined : undefined;
+      const capacityWarning = relevantEffect?.last_error && /(?:disk|quota|capacity)/i.test(relevantEffect.last_error)
+        ? boundedStatusError(relevantEffect.last_error)
+        : null;
       return {
         execution_mode: "pipeline",
         instance_id: instance.id,
@@ -251,6 +268,15 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
         sandbox_event_id: sandboxEvent?.event_id ?? null,
         sandbox_event_attempts: sandboxEvent?.attempts ?? null,
         sandbox_ingestion_error: boundedStatusError(sandboxEvent?.last_error),
+        structured_active_unit_id: structuredActiveAction?.unit_id ?? null,
+        structured_active_action: structuredActiveAction?.action_kind ?? null,
+        structured_active_action_status: structuredActiveAction?.checkpoint_status === "pending"
+          ? "checkpointing"
+          : structuredActiveAction?.status ?? null,
+        structured_heartbeat_at: structuredActiveAction?.updated_at ?? null,
+        structured_checkpoint_status: structuredActiveAction?.checkpoint_status ?? null,
+        sandbox_disk_minimum_gib: 10,
+        sandbox_capacity_warning: capacityWarning,
         structured_units: structuredUnits.map((unit) => ({
           unit_id: unit.unit_id,
           status: unit.status,

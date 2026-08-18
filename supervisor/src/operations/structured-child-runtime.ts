@@ -58,6 +58,7 @@ import type {
   ExecutionUnitStore,
   ExecutionWorkAttempt,
   ExecutionWorkPrivateArtifact,
+  ExecutionCheckpointObject,
 } from "../persistence/pipeline/unit-store.js";
 import type {
   ChildExecutorActionRequest,
@@ -921,6 +922,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     receipt?: string;
     nativeSessionId?: string | null;
     decision?: ReturnType<typeof evaluateUnitAcceptanceGate>;
+    checkpointObject?: ExecutionCheckpointObject;
   } | {
     terminal: true;
     resultHash: string;
@@ -988,13 +990,15 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     const collected = (
       outputSubject: string,
       receipt: StandardReceipt,
-      decision?: ReturnType<typeof evaluateUnitAcceptanceGate>
+      decision?: ReturnType<typeof evaluateUnitAcceptanceGate>,
+      checkpointObject?: ExecutionCheckpointObject
     ) => ({
       resultHash: actionResultHash(result),
       outputSubject,
       receipt: canonicalJson(receipt),
       nativeSessionId,
       ...(decision ? { decision } : {}),
+      ...(checkpointObject ? { checkpointObject } : {}),
     });
     // `result.receipt` is dual-typed by contract, but the outcomes that carry
     // free text instead of receipt JSON differ by executor: a loop action
@@ -1103,11 +1107,17 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           throw new Error(`child action ${action.id} returned ${receipt.type}, expected integration_evidence`);
         }
         const integrationSubject = receipt.subject.post;
+        const checkpointObject = "checkpointObject" in result ? result.checkpointObject : undefined;
+        if (checkpointObject &&
+            (checkpointObject.expectedOldSha !== receipt.subject.pre ||
+             checkpointObject.expectedNewSha !== integrationSubject)) {
+          throw new Error(`child action ${action.id} checkpoint object does not match its integration receipt`);
+        }
         const decision = evaluateIntegrationGate({
           expected: standardFenceFor(instance, action, integrationSubject),
           integration: receipt as IntegrationEvidenceReceipt,
         });
-        return collected(integrationSubject, receipt, decision);
+        return collected(integrationSubject, receipt, decision, checkpointObject);
       }
       // The triggering final-review receipt is bound deterministically via the
       // completion receipt's request_hash fence (asserted below), which was

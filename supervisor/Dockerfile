@@ -43,6 +43,8 @@ RUN npm prune --omit=dev --install-links
 FROM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 LABEL org.opencontainers.image.source="https://github.com/knoxgraeme/openthrottle" \
       org.opencontainers.image.licenses="MIT"
 COPY --from=build /app/package.json ./package.json

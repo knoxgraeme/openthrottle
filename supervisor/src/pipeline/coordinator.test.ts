@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,7 +22,7 @@ import {
 } from "./manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { createRunOutcomeStore } from "../persistence/pipeline/run-outcome-store.js";
-import type { PipelineInstance, PipelineInstanceStage, PipelineStageAttempt } from "./store.js";
+import type { PipelineInstance, PipelineInstanceStage, PipelineStageAttempt, PipelineStore } from "./store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { ExecutionGateDecision } from "./execution-gates.js";
@@ -2216,13 +2217,23 @@ describe("pipeline coordinator", () => {
     // given parent attempt -- mirroring what structured-child-runtime.ts does
     // to the real "implementation" stage attempt in production.
     function driveSingleUnitToAggregate(input: {
-      unitStore: ExecutionUnitStore;
+      unitStore: ExecutionUnitStore & PipelineStore;
       instanceId: string;
       parentAttemptId: string;
       plannedRunId: string;
       subject: string;
     }): void {
       const { unitStore, instanceId, parentAttemptId, plannedRunId, subject } = input;
+      const createBranch = unitStore.claimEffects(
+        "2099-01-01T00:00:00.000Z", "2099-01-01T00:01:00.000Z", 8
+      ).find((effect) => effect.kind === "create_task_branch");
+      if (createBranch) {
+        unitStore.recordEffectAcknowledgement({
+          effectId: createBranch.id,
+          eventId: `ack-${createBranch.id}`,
+          payload: canonicalJson({ sha: "a".repeat(40) }),
+        });
+      }
       unitStore.createGraph({
         pipelineInstanceId: instanceId,
         parentAttemptId,
@@ -2256,9 +2267,27 @@ describe("pipeline coordinator", () => {
         decision: gateDecision({ gateKind: "unit_acceptance", outcome: "success", subject }),
       });
       const integrate = lease();
+      const checkpointPayload = Buffer.from("coordinator-test-checkpoint");
       unitStore.completeGatedAction({
         actionId: integrate.id, resultHash: "r-integrate", outputSubject: subject,
         decision: gateDecision({ gateKind: "integration", outcome: "success", subject }),
+        checkpointObject: {
+          schema: "openthrottle.git-checkpoint-object/v1",
+          expectedOldSha: "a".repeat(40),
+          expectedNewSha: subject,
+          payloadSha256: createHash("sha256").update(checkpointPayload).digest("hex"),
+          payloadBytes: checkpointPayload.byteLength,
+          payload: checkpointPayload,
+        },
+      });
+      const checkpoint = unitStore.claimEffects(
+        "2099-01-01T00:00:00.000Z", "2099-01-01T00:01:00.000Z", 8
+      ).find((effect) => effect.kind === "advance_task_branch");
+      if (!checkpoint) throw new Error("expected structured checkpoint effect");
+      unitStore.recordEffectAcknowledgement({
+        effectId: checkpoint.id,
+        eventId: `ack-${checkpoint.id}`,
+        payload: canonicalJson({ sha: subject }),
       });
       const finalReview = lease();
       unitStore.completeGatedAction({

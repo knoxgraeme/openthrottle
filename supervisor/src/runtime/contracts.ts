@@ -13,6 +13,7 @@ import {
   STAGE_EXECUTOR_PROTOCOL,
   type StageRequestEnvelope,
 } from "../pipeline/stage-request.js";
+import type { GitCheckpointObject } from "../pipeline/checkpoint-object.js";
 import type { RepositorySkillPackage } from "../pipeline/manifest.js";
 import {
   canonicalJson,
@@ -195,6 +196,7 @@ export interface ChildExecutorActionResult {
   subject: string | null;
   receipt: string;
   completedAt: string;
+  checkpointObject?: GitCheckpointObject;
 }
 
 export interface RuntimeResource {

@@ -3249,6 +3249,39 @@ task-branch-contract:write-capable pipeline instances reserve one supervisor-own
 checkpoint-contract:accepted integration, acknowledged remote head, and published status are separate lineage-fenced durable values/v1
 effect-contract:create and compare-and-advance ref operations use the ordered leased pipeline effect queue and never force-update/v1`;
 
+const structuredCheckpointLedgerSchema = `
+ALTER TABLE execution_work_attempts ADD COLUMN checkpoint_expected_old_sha TEXT
+  CHECK(checkpoint_expected_old_sha IS NULL OR (length(checkpoint_expected_old_sha) = 40 AND checkpoint_expected_old_sha NOT GLOB '*[^a-f0-9]*'));
+ALTER TABLE execution_work_attempts ADD COLUMN checkpoint_remote_sha TEXT
+  CHECK(checkpoint_remote_sha IS NULL OR (length(checkpoint_remote_sha) = 40 AND checkpoint_remote_sha NOT GLOB '*[^a-f0-9]*'));
+ALTER TABLE execution_work_attempts ADD COLUMN checkpoint_status TEXT
+  CHECK(checkpoint_status IS NULL OR checkpoint_status IN ('pending', 'acknowledged', 'failed'));
+ALTER TABLE execution_work_attempts ADD COLUMN checkpoint_effect_id TEXT;
+ALTER TABLE execution_work_attempts ADD COLUMN checkpoint_last_error TEXT
+  CHECK(checkpoint_last_error IS NULL OR length(checkpoint_last_error) <= 2000);
+ALTER TABLE execution_work_attempts ADD COLUMN checkpoint_acknowledged_at TEXT;
+CREATE UNIQUE INDEX execution_work_checkpoint_effect_idx
+  ON execution_work_attempts(checkpoint_effect_id) WHERE checkpoint_effect_id IS NOT NULL;
+CREATE INDEX execution_work_checkpoint_status_idx
+  ON execution_work_attempts(parent_attempt_id, checkpoint_status, completed_at);
+CREATE TABLE IF NOT EXISTS execution_checkpoint_objects (
+  action_id TEXT PRIMARY KEY REFERENCES execution_work_attempts(id) ON DELETE CASCADE,
+  effect_id TEXT NOT NULL UNIQUE,
+  expected_old_sha TEXT NOT NULL CHECK(length(expected_old_sha) = 40 AND expected_old_sha NOT GLOB '*[^a-f0-9]*'),
+  expected_new_sha TEXT NOT NULL CHECK(length(expected_new_sha) = 40 AND expected_new_sha NOT GLOB '*[^a-f0-9]*'),
+  payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^a-f0-9]*'),
+  payload_bytes INTEGER NOT NULL CHECK(payload_bytes BETWEEN 1 AND 67108864),
+  payload BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  CHECK(expected_old_sha <> expected_new_sha),
+  CHECK(length(payload) = payload_bytes)
+);
+`;
+
+const structuredCheckpointLedgerMigrationSource = `${structuredCheckpointLedgerSchema}
+structured-checkpoint-contract:each accepted integration records its expected old head, exact integrated commit, effect identity, and acknowledgement on the integration action/v1
+dependency-gate-contract:structured scheduling waits for the current supervisor-owned remote checkpoint acknowledgement before advancing the durable unit frontier/v1`;
+
 const definitions: DatabaseMigrationDefinition[] = [
   {
     version: 1,
@@ -3840,6 +3873,18 @@ const definitions: DatabaseMigrationDefinition[] = [
       } else if (!hasTable(db, "pipeline_task_branches")) {
         const branchTableStart = taskBranchCheckpointSchema.indexOf("CREATE TABLE pipeline_task_branches");
         db.exec(taskBranchCheckpointSchema.slice(branchTableStart));
+      }
+    },
+  },
+  {
+    version: 54,
+    name: "structured-checkpoint-ledger [rollback-compatible:additive/v1]",
+    source: structuredCheckpointLedgerMigrationSource,
+    up(db) {
+      if (!hasTable(db, "execution_work_attempts") ||
+          !hasColumns(db, "execution_work_attempts", ["id", "parent_attempt_id", "completed_at"])) return;
+      if (!hasColumns(db, "execution_work_attempts", ["checkpoint_expected_old_sha"])) {
+        db.exec(structuredCheckpointLedgerSchema);
       }
     },
   },

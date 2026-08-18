@@ -25,6 +25,11 @@ import {
   type StageRequestEnvelope,
 } from "../../pipeline/stage-request.js";
 import { SEALED_STAGE_RESULT_LIMIT_BYTES } from "../../pipeline/evidence-limits.js";
+import {
+  GIT_CHECKPOINT_OBJECT_FILE,
+  GIT_CHECKPOINT_OBJECT_SCHEMA,
+  MAX_GIT_CHECKPOINT_OBJECT_BYTES,
+} from "../../pipeline/checkpoint-object.js";
 import { assertPathSafeActionId } from "../../runtime/action-id.js";
 
 const ACTIVE_SANDBOX_AUTOSTOP_MINUTES = 60;
@@ -407,7 +412,12 @@ function preserveWorkspaceForRecoveryFailure(
 function parseCollectedChildExecutorResult(
   raw: string,
   input: { attemptId: string; actionId: string; requestHash: string }
-): ChildExecutorActionResult {
+): ChildExecutorActionResult & { checkpointDescriptor?: {
+  expectedOldSha: string;
+  expectedNewSha: string;
+  payloadSha256: string;
+  payloadBytes: number;
+} } {
   if (Buffer.byteLength(raw, "utf8") > 256 * 1024) throw new Error("sealed child executor result exceeds 256 KiB");
   const event = JSON.parse(raw) as Record<string, unknown>;
   if (event.kind !== "child_executor_action_result" || event.version !== 1 || event.action_id !== input.actionId ||
@@ -418,6 +428,32 @@ function parseCollectedChildExecutorResult(
       typeof event.receipt !== "string") {
     throw new Error(`sealed child executor result ${input.attemptId}/${input.actionId} has an invalid envelope`);
   }
+  let checkpointDescriptor: {
+    expectedOldSha: string;
+    expectedNewSha: string;
+    payloadSha256: string;
+    payloadBytes: number;
+  } | undefined;
+  if (event.checkpoint_object !== undefined) {
+    const descriptor = event.checkpoint_object as Record<string, unknown>;
+    if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor) ||
+        Object.keys(descriptor).sort().join(",") !== "bytes,expected_new_sha,expected_old_sha,file,schema,sha256" ||
+        descriptor.schema !== GIT_CHECKPOINT_OBJECT_SCHEMA ||
+        descriptor.file !== GIT_CHECKPOINT_OBJECT_FILE ||
+        typeof descriptor.expected_old_sha !== "string" || !/^[a-f0-9]{40}$/.test(descriptor.expected_old_sha) ||
+        typeof descriptor.expected_new_sha !== "string" || descriptor.expected_new_sha !== event.subject ||
+        !Number.isSafeInteger(descriptor.bytes) || Number(descriptor.bytes) < 1 ||
+        Number(descriptor.bytes) > MAX_GIT_CHECKPOINT_OBJECT_BYTES ||
+        typeof descriptor.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(descriptor.sha256)) {
+      throw new Error(`sealed child executor result ${input.attemptId}/${input.actionId} has an invalid checkpoint object`);
+    }
+    checkpointDescriptor = {
+      expectedOldSha: descriptor.expected_old_sha,
+      expectedNewSha: descriptor.expected_new_sha,
+      payloadSha256: descriptor.sha256,
+      payloadBytes: Number(descriptor.bytes),
+    };
+  }
   return {
     actionId: input.actionId,
     attemptId: event.attempt_id as string,
@@ -426,6 +462,7 @@ function parseCollectedChildExecutorResult(
     subject: event.subject as string | null,
     receipt: event.receipt as string,
     completedAt: event.created_at as string,
+    ...(checkpointDescriptor ? { checkpointDescriptor } : {}),
   };
 }
 
@@ -873,7 +910,24 @@ export function createDaytonaSandboxRuntime(
       const sandbox = await getSandbox(resource);
       try {
         const raw = (await sandbox.fs.downloadFile(childExecutorActionPath(input.attemptId, input.actionId, "result.json"))).toString("utf8");
-        return parseCollectedChildExecutorResult(raw, input);
+        const parsed = parseCollectedChildExecutorResult(raw, input);
+        if (!parsed.checkpointDescriptor) return parsed;
+        const payload = await sandbox.fs.downloadFile(
+          childExecutorActionPath(input.attemptId, input.actionId, GIT_CHECKPOINT_OBJECT_FILE)
+        );
+        if (!payload || payload.byteLength !== parsed.checkpointDescriptor.payloadBytes ||
+            createHash("sha256").update(payload).digest("hex") !== parsed.checkpointDescriptor.payloadSha256) {
+          throw new Error(`sealed child executor result ${input.attemptId}/${input.actionId} checkpoint object does not match its fence`);
+        }
+        const { checkpointDescriptor, ...result } = parsed;
+        return {
+          ...result,
+          checkpointObject: {
+            schema: GIT_CHECKPOINT_OBJECT_SCHEMA,
+            ...checkpointDescriptor,
+            payload,
+          },
+        };
       } catch (error) {
         if (String(error).toLowerCase().includes("not found")) return null;
         throw error;

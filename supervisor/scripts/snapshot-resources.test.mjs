@@ -37,12 +37,7 @@ describe("resolveSandboxResources", () => {
     // monorepo builds, so guard the floor explicitly.
     expect(SANDBOX_RESOURCE_DEFAULTS.memory).toBeGreaterThanOrEqual(8);
     expect(SANDBOX_RESOURCE_DEFAULTS.cpu).toBeGreaterThanOrEqual(2);
-    // Daytona enforces a *total* disk quota per org (30 GiB standard tier), and
-    // OpenThrottle retains a stopped sandbox per non-closed ticket, so the disk
-    // default must stay small enough that several concurrent workspaces fit
-    // under that quota — otherwise `daytona.create` fails with "Total disk limit
-    // exceeded". Keep it low enough for ~6 sandboxes under 30 GiB.
-    expect(SANDBOX_RESOURCE_DEFAULTS.disk).toBeLessThanOrEqual(5);
+    expect(SANDBOX_RESOURCE_DEFAULTS.disk).toBeGreaterThanOrEqual(10);
   });
 
   it("reads operator overrides for every dimension", () => {
@@ -79,8 +74,8 @@ describe("sandbox disk default parity across surfaces", () => {
     (surface) => {
       // A contract test, not a unit test: it fails the moment any doc, workflow,
       // or example env file drifts from the executable default above, which is
-      // exactly the failure mode (5 GiB shipped, 10 GiB documented everywhere
-      // else) that let an operator size past the 30 GiB org disk quota.
+      // exactly the failure mode that previously left runtime and onboarding
+      // with different minimums.
       expect(readDocumentedDiskValue(surface)).toBe(SANDBOX_RESOURCE_DEFAULTS.disk);
     }
   );

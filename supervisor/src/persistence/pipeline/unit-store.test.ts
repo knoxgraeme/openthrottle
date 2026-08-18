@@ -1664,6 +1664,65 @@ describe("execution unit store", () => {
     })).toThrow(/already terminated with a different result/);
   });
 
+  it("restarts only the active unit once from an acknowledged checkpoint before stopping on repetition", () => {
+    const store = setup();
+    db!.prepare(`
+      INSERT INTO pipeline_task_branches (
+        pipeline_instance_id, ticket_id, generation, repository, branch,
+        plan_digest, lineage, base_sha, accepted_integration_sha,
+        acknowledged_remote_sha, status, created_at, updated_at
+      ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'checkpointed', ?, ?)
+    `).run(
+      "instance-1", "issue-1", "owner/repo", "ot/ope-1", "1".repeat(64), "2".repeat(64),
+      "a".repeat(40), "b".repeat(40), "b".repeat(40), timestamp, timestamp
+    );
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "active" }, { id: "waiting", dependencies: ["active"] }],
+      unitPhaseBindings: builtinUnitPhaseBindings([]),
+    });
+    const first = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-1",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    store.markActionDispatched(first.id, "request-hash", "native-session");
+
+    expect(store.stopRetryableUnitAction({
+      actionId: first.id,
+      resultHash: "retryable-1",
+      lastError: "no space left on device",
+    })).toMatchObject({ status: "dead", terminal_result_outcome: null });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({ stopped_at: null });
+    expect(store.listUnits("attempt-parent").find((unit) => unit.unitId === "active"))
+      .toMatchObject({ status: "running", terminalLevel: null, activeActionId: null });
+
+    const replacement = store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })!;
+    expect(replacement).toMatchObject({ unit_id: "active", action_kind: first.action_kind });
+    expect(replacement.id).not.toBe(first.id);
+    store.markActionDispatched(replacement.id, "request-hash-2", null);
+    store.stopRetryableUnitAction({
+      actionId: replacement.id,
+      resultHash: "retryable-2",
+      lastError: "no space left on device",
+    });
+    expect(store.getGraphForAttempt("attempt-parent")).toMatchObject({
+      stopped_at: expect.any(String),
+      stop_outcome: "retryable_infrastructure_failure",
+    });
+  });
+
   it("completes a recovered result through the current action pointer before any heal", () => {
     const store = setup();
     store.createGraph({

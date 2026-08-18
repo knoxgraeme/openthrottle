@@ -1027,6 +1027,37 @@ describe("Daytona stage execution", () => {
       subject: "b".repeat(40),
     });
 
+    const checkpointPayload = Buffer.from("bounded checkpoint bundle");
+    remoteFiles.set(
+      "/var/lib/openthrottle/child-executor-actions/attempt-child/child-1/result.json",
+      Buffer.from(JSON.stringify({
+        ...result,
+        checkpoint_object: {
+          schema: "openthrottle.git-checkpoint-object/v1",
+          file: "checkpoint.bundle",
+          expected_old_sha: "a".repeat(40),
+          expected_new_sha: "b".repeat(40),
+          bytes: checkpointPayload.byteLength,
+          sha256: createHash("sha256").update(checkpointPayload).digest("hex"),
+        },
+      }))
+    );
+    remoteFiles.set(
+      "/var/lib/openthrottle/child-executor-actions/attempt-child/child-1/checkpoint.bundle",
+      checkpointPayload
+    );
+    await expect(runtime.collectChildExecutorActionResult(
+      { providerResourceId: "provider-child-collect" },
+      { attemptId: "attempt-child", actionId: "child-1", requestHash: "a".repeat(64) }
+    )).resolves.toMatchObject({
+      checkpointObject: {
+        expectedOldSha: "a".repeat(40),
+        expectedNewSha: "b".repeat(40),
+        payloadBytes: checkpointPayload.byteLength,
+        payload: checkpointPayload,
+      },
+    });
+
     await expect(runtime.collectChildExecutorActionResult(
       { providerResourceId: "provider-child-collect" },
       { attemptId: "attempt-child", actionId: "child-1", requestHash: "c".repeat(64) }

@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -162,6 +163,18 @@ describe("pipeline effect processor", () => {
     return {
       createRef: vi.fn(async (input: { expectedNewSha: string }) => ({ sha: input.expectedNewSha })),
       compareAndAdvanceRef: vi.fn(async (input: { expectedNewSha: string }) => ({ sha: input.expectedNewSha })),
+    };
+  }
+
+  function checkpointObject(expectedOldSha: string, expectedNewSha: string, label: string) {
+    const payload = Buffer.from(`checkpoint-object:${label}`);
+    return {
+      schema: "openthrottle.git-checkpoint-object/v1" as const,
+      expectedOldSha,
+      expectedNewSha,
+      payloadSha256: createHash("sha256").update(payload).digest("hex"),
+      payloadBytes: payload.byteLength,
+      payload,
     };
   }
 
@@ -493,27 +506,7 @@ describe("pipeline effect processor", () => {
     await processor.drain();
     expect(runtime.provision).toHaveBeenCalledTimes(1);
 
-    const branch = pipelines.getTaskBranch(instance.id)!;
-    pipelines.queueTaskBranchAdvance({
-      instanceId: instance.id,
-      generation: instance.generation,
-      lineage: branch.lineage,
-      expectedOldSha: "a".repeat(40),
-      expectedNewSha: "d".repeat(40),
-    });
-    await processor.drain();
-    expect(writer.compareAndAdvanceRef).toHaveBeenCalledWith({
-      repository: "owner/repo",
-      ref: "refs/heads/ot/branch-lineage",
-      expectedOldSha: "a".repeat(40),
-      expectedNewSha: "d".repeat(40),
-      allowAlreadyAdvanced: false,
-    });
-    expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
-      accepted_integration_sha: "d".repeat(40),
-      acknowledged_remote_sha: "d".repeat(40),
-      status: "checkpointed",
-    });
+    expect(writer.compareAndAdvanceRef).not.toHaveBeenCalled();
   });
 
   it("fails a conflicting task ref permanently and never provisions the sandbox", async () => {
@@ -1447,7 +1440,27 @@ describe("pipeline effect processor", () => {
         outputSubject: input.integrated,
         receipt: receiptJson({ instance, action: integrate, type: "integration_evidence", subject: input.integrated }),
         decision: gateDecision({ gateKind: "integration", subject: input.integrated }),
+        checkpointObject: checkpointObject(input.baseSubject, input.integrated, input.unitId),
       });
+      expect(pipelines.listUnits(attempt.id).find((unit) => unit.unitId === input.unitId))
+        .toMatchObject({ terminalLevel: null, integrationSubject: input.integrated });
+      const checkpoint = pipelines.claimEffects(
+        "2099-07-22T12:00:00.000Z", "2099-07-22T12:01:00.000Z", 8
+      ).find((effect) => effect.kind === "advance_task_branch");
+      expect(checkpoint).toBeDefined();
+      expect(pipelines.getCheckpointObject(checkpoint!.id)).toMatchObject({
+        actionId: integrate.id,
+        expectedOldSha: input.baseSubject,
+        expectedNewSha: input.integrated,
+      });
+      pipelines.recordEffectAcknowledgement({
+        effectId: checkpoint!.id,
+        eventId: `checkpoint-ack-${checkpoint!.id}`,
+        payload: canonicalJson({ sha: input.integrated }),
+      });
+      expect(pipelines.listUnits(attempt.id).find((unit) => unit.unitId === input.unitId))
+        .toMatchObject({ terminalLevel: "completed", integrationSubject: input.integrated });
+      expect(pipelines.getCheckpointObject(checkpoint!.id)).toBeUndefined();
       expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({ integration_subject: input.integrated });
     };
 
@@ -1865,6 +1878,16 @@ describe("pipeline effect processor", () => {
         subject: finalIntegratedSubject,
         artifactHashes: [digestNormalized(finalIntegrationReceipt)],
       }),
+      checkpointObject: checkpointObject(integratedSubjectB, finalIntegratedSubject, "final-repair"),
+    });
+    const finalCheckpoint = pipelines.claimEffects(
+      "2099-07-22T12:00:00.000Z", "2099-07-22T12:01:00.000Z", 8
+    ).find((effect) => effect.kind === "advance_task_branch");
+    expect(finalCheckpoint).toBeDefined();
+    pipelines.recordEffectAcknowledgement({
+      effectId: finalCheckpoint!.id,
+      eventId: `checkpoint-ack-${finalCheckpoint!.id}`,
+      payload: canonicalJson({ sha: finalIntegratedSubject }),
     });
     expect(pipelines.getGraphForAttempt(attempt.id)).toMatchObject({ integration_subject: finalIntegratedSubject });
 
@@ -2075,16 +2098,10 @@ describe("pipeline effect processor", () => {
     });
     const dispatchCallsBeforeFreshReplay = runtime.dispatchStage.mock.calls.length;
     await processor.drain();
-    expect(repositoryWriter.compareAndAdvanceRef).toHaveBeenCalledWith({
-      repository: "owner/repo",
-      ref: "refs/heads/ot/child-drain",
-      expectedOldSha: instance.base_commit,
-      expectedNewSha: finalIntegratedTreeSubject,
-      allowAlreadyAdvanced: false,
-    });
+    expect(repositoryWriter.compareAndAdvanceRef).not.toHaveBeenCalled();
     expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
-      accepted_integration_sha: finalIntegratedTreeSubject,
-      acknowledged_remote_sha: finalIntegratedTreeSubject,
+      accepted_integration_sha: finalIntegratedSubject,
+      acknowledged_remote_sha: finalIntegratedSubject,
       status: "checkpointed",
     });
     expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforeFreshReplay + 1);

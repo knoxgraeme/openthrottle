@@ -194,6 +194,7 @@ describe("database migrations", () => {
       "167edf7c177c22c3074446c93e742cf44b47a9dc5da5e338d64f9e06f8549f07",
       "fbf980b3a1190e637d7fd4775eb6e62f079e06dd51adc0e0483b2a1ec742cd62",
       "a6562a44ef61f591360c5cc9e5a270d374a7a3a9a93fd89c9b94e58b432e6b73",
+      "d6cc3e5c5b000c963b4bea1f92123f9ac97ef3abe0a59a9419e92e58b6db8616",
     ]);
   });
 
@@ -616,8 +617,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 53,
-      name: `task-branch-checkpoints${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 54,
+      name: `structured-checkpoint-ledger${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -669,8 +670,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 53,
-      name: `task-branch-checkpoints${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 54,
+      name: `structured-checkpoint-ledger${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 

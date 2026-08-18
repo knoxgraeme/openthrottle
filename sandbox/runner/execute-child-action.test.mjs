@@ -164,6 +164,58 @@ describe("child executor action", () => {
     expect(JSON.parse(readFileSync(outputPath, "utf8"))).toEqual(result);
   });
 
+  it("persists a bounded incremental checkpoint bundle before the integration result", () => {
+    const repoDir = mkdtempSync(join(tmpdir(), "ot-checkpoint-object-repo-"));
+    const resultDir = mkdtempSync(join(tmpdir(), "ot-checkpoint-object-result-"));
+    directories.push(repoDir, resultDir);
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repoDir });
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: repoDir });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir });
+    writeFileSync(join(repoDir, "file.txt"), "base\n");
+    execFileSync("git", ["add", "."], { cwd: repoDir });
+    execFileSync("git", ["commit", "-qm", "base"], { cwd: repoDir });
+    const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    writeFileSync(join(repoDir, "file.txt"), "integrated\n");
+    execFileSync("git", ["commit", "-qam", "integrated"], { cwd: repoDir });
+    const integrated = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
+    const request = childExecutorRequest({
+      actionKind: "integrate",
+      commandName: undefined,
+      worktree: null,
+      baseSubject: base,
+      inputSubject: base,
+      candidateSubject: integrated,
+    });
+    const result = {
+      version: 1,
+      kind: "child_executor_action_result",
+      action_id: request.actionId,
+      attempt_id: request.attemptId,
+      request_hash: request.requestHash,
+      outcome: "success",
+      subject: integrated,
+      receipt: "receipt",
+      created_at: "2099-01-01T00:00:00.000Z",
+    };
+    const outputPath = join(resultDir, "result.json");
+
+    commitChildActionResult(request, result, outputPath, { checkpointRepoDir: repoDir });
+
+    const persisted = JSON.parse(readFileSync(outputPath, "utf8"));
+    const bundlePath = join(resultDir, "checkpoint.bundle");
+    expect(persisted.checkpoint_object).toMatchObject({
+      schema: "openthrottle.git-checkpoint-object/v1",
+      file: "checkpoint.bundle",
+      expected_old_sha: base,
+      expected_new_sha: integrated,
+      bytes: readFileSync(bundlePath).byteLength,
+      sha256: digest(readFileSync(bundlePath)),
+    });
+    expect(execFileSync("git", ["bundle", "list-heads", bundlePath], {
+      cwd: repoDir, encoding: "utf8",
+    })).toContain(integrated);
+  });
+
   it("verifies the exact authorized tune paths and before/after content digests", () => {
     const repoDir = mkdtempSync(join(tmpdir(), "ot-tune-verification-"));
     directories.push(repoDir);

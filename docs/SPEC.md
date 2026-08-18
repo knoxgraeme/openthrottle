@@ -1373,7 +1373,7 @@ Optional/defaulted:
   `SANDBOX_RUNTIME_DESCRIPTOR_PATH` for pinned deployment assets.
 
 Snapshot build automation uses `DAYTONA_SANDBOX_CPU=4`,
-`DAYTONA_SANDBOX_MEMORY=8`, and `DAYTONA_SANDBOX_DISK=5` unless an operator
+`DAYTONA_SANDBOX_MEMORY=8`, and `DAYTONA_SANDBOX_DISK=10` unless an operator
 supplies another positive integer size.
 
 Repository and base-branch routing are not environment configuration; they
