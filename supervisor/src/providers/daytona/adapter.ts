@@ -733,11 +733,6 @@ export function createDaytonaSandboxRuntime(
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
         command: `flock --nonblock ${lockPath} sh -c ` +
           shellSingleQuoted([
-            // A redispatch of an already-completed action must not orphan the
-            // credential envelope this call just uploaded fresh: no later
-            // invocation will ever reach the terminal `rm -f` below to clean
-            // it up, since none will run this script body again.
-            `if test -f ${shellSingleQuoted(resultPath)}; then rm -f ${shellSingleQuoted(stagedCredentialsPath)} ${shellSingleQuoted(stagedRequestPath)}; exit 0; fi`,
             `install -d -o root -g root -m 0711 ${shellSingleQuoted(LOOP_ACTION_DIR)} ${shellSingleQuoted(`${LOOP_ACTION_DIR}/${request.attemptId}`)} ${shellSingleQuoted(actionDirectory)}`,
             `cp ${shellSingleQuoted(stagedRequestPath)} ${shellSingleQuoted(requestPath)}`,
             `cp ${shellSingleQuoted(stagedCredentialsPath)} ${shellSingleQuoted(credentialsPath)}`,
@@ -855,7 +850,6 @@ export function createDaytonaSandboxRuntime(
       const dispatched = await sandbox.process.executeSessionCommand(sessionId, {
         command: `flock --nonblock ${lockPath} sh -c ` +
           shellSingleQuoted([
-            `if test -f ${shellSingleQuoted(resultPath)}; then rm -f ${shellSingleQuoted(stagedRequestPath)}; exit 0; fi`,
             `install -d -o root -g root -m 0711 ${shellSingleQuoted(CHILD_EXECUTOR_DIR)} ${shellSingleQuoted(`${CHILD_EXECUTOR_DIR}/${request.attemptId}`)} ${shellSingleQuoted(actionDirectory)}`,
             `cp ${shellSingleQuoted(stagedRequestPath)} ${shellSingleQuoted(requestPath)}`,
             `chown root:root ${shellSingleQuoted(requestPath)}`,

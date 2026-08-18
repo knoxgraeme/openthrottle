@@ -55,6 +55,7 @@ import {
 } from "./loop-paths.mjs";
 import {
   extractNativeSessionId,
+  retireNativeSessionPackage,
   sealNativeSessionPackage,
 } from "./native-session-package.mjs";
 import { ID, NATIVE_SESSION_ID, SHA256, STAGE_PATH_ID, boundedText, record, string } from "./validate.mjs";
@@ -188,8 +189,6 @@ const MAX_RECEIPT_CORRECTION_STATE_BYTES = 3 * 1024 * 1024;
 const MAX_RECEIPT_CORRECTION_OUTPUT_CHARS = 64 * 1024;
 const ROOT_UID = 0;
 const ROOT_GID = 0;
-const RETAINED_ACTION_EVIDENCE_FILES = 64;
-const RETAINED_ACTION_EVIDENCE_BYTES = 1024 * 1024;
 const RETAINED_ACTION_ENTRIES = ["request.json", "result.json", "outbox", PRIVATE_RECOVERY_DIFF_FILE];
 
 export function loopActionPrincipal(request) {
@@ -505,30 +504,20 @@ function boundRetainedOutbox(actionPath) {
     rmSync(outbox, metadata.isSymbolicLink() ? { force: true } : { recursive: true, force: true });
     return;
   }
-  const files = [];
-  const visit = (directory) => {
-    for (const entry of readdirSync(directory)) {
-      const child = pathInside(directory, entry);
-      const childMetadata = lstatSync(child);
-      if (childMetadata.isSymbolicLink()) {
-        rmSync(child, { force: true });
-      } else if (childMetadata.isDirectory()) {
-        visit(child);
-      } else if (childMetadata.isFile()) {
-        files.push({ path: child, bytes: childMetadata.size, mtimeMs: childMetadata.mtimeMs });
-      } else {
-        rmSync(child, { force: true });
-      }
-    }
-  };
-  visit(outbox);
-  files.sort((left, right) => right.mtimeMs - left.mtimeMs || left.path.localeCompare(right.path));
-  let retainedBytes = 0;
-  for (const [index, file] of files.entries()) {
-    if (index >= RETAINED_ACTION_EVIDENCE_FILES || retainedBytes + file.bytes > RETAINED_ACTION_EVIDENCE_BYTES) {
-      rmSync(file.path, { force: true });
-    } else {
-      retainedBytes += file.bytes;
+  // The poller acknowledges a record by deleting its file. Every remaining
+  // valid top-level JSON file is therefore potentially unacknowledged and may
+  // not be evicted by age/count. Nested trees and non-event entries are never
+  // visible to the poller, so remove them without recursively inventorying or
+  // sorting agent-controlled state.
+  for (const entry of readdirSync(outbox)) {
+    const child = pathInside(outbox, entry);
+    const childMetadata = lstatSync(child);
+    const validPendingEvent = childMetadata.isFile() && !childMetadata.isSymbolicLink() &&
+      /^[A-Za-z0-9._-]+\.json$/.test(entry) && childMetadata.size <= 32 * 1024;
+    if (!validPendingEvent) {
+      rmSync(child, childMetadata.isDirectory() && !childMetadata.isSymbolicLink()
+        ? { recursive: true, force: true }
+        : { force: true });
     }
   }
 }
@@ -557,29 +546,18 @@ export function pruneCompletedLoopAction({ request, result, rootDir = configured
   return { retained: false, ...pruneActionPath(current, rootDir) };
 }
 
-export function sweepCompletedLoopActions(_request, rootDir = configuredActionRoot()) {
-  if (!existsSync(rootDir)) return { pruned: 0, retained: 0 };
-  let pruned = 0;
-  let retained = 0;
-  for (const attempt of readdirSync(rootDir)) {
-    const attemptPath = pathInside(rootDir, attempt);
-    const attemptMetadata = lstatSync(attemptPath);
-    if (attemptMetadata.isSymbolicLink() || !attemptMetadata.isDirectory()) continue;
-    for (const action of readdirSync(attemptPath)) {
-      const actionPath = pathInside(attemptPath, action);
-      const actionMetadata = lstatSync(actionPath);
-      if (actionMetadata.isSymbolicLink() || !actionMetadata.isDirectory() || actionDirectoryIsLive(actionPath)) continue;
-      const result = completedActionResult(actionPath);
-      if (!result) continue;
-      if (result.outcome === "needs_human") {
-        retained += 1;
-        continue;
-      }
-      pruneActionPath(actionPath, rootDir);
-      pruned += 1;
-    }
-  }
-  return { pruned, retained };
+export function sweepCompletedLoopActions(request, rootDir = configuredActionRoot()) {
+  // Redispatch is already keyed by the exact attempt/action fence. Reconcile
+  // only that home: scanning all historical attempts on every action made
+  // total startup work quadratic, while a committed action is independently
+  // replayable and will clean its own home when redispatched.
+  const actionPath = actionDirectory(request, rootDir);
+  if (!existsSync(actionPath) || actionDirectoryIsLive(actionPath)) return { pruned: 0, retained: 0 };
+  const result = completedActionResult(actionPath);
+  if (!result) return { pruned: 0, retained: 0 };
+  if (result.outcome === "needs_human") return { pruned: 0, retained: 1 };
+  pruneActionPath(actionPath, rootDir);
+  return { pruned: 1, retained: 0 };
 }
 
 function preserveUnconfirmedActionClaim(request, rootDir = configuredActionRoot()) {
@@ -1144,6 +1122,7 @@ export function runLoopAgentInPreparedRepository({
   // Tests may inject an explicit restorer when exercising legacy snapshots.
   restorePersistentProfiles = null,
   credentialEnv = {},
+  prepareEnvironment = prepareLoopAgentEnvironment,
 }) {
   let lockedPersistentProfiles = [];
   const cleanupErrors = [];
@@ -1159,7 +1138,7 @@ export function runLoopAgentInPreparedRepository({
       throw error;
     }
     const repoDir = prepareLoopRepository(request, integrationRepoDir);
-    const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir, credentialEnv, principal);
+    const preparedEnvironment = prepareEnvironment(request, repoDir, credentialEnv, principal);
     reassignTreeOwner(actionDirectory(request), "agent", principal);
     // prefer_resume is an optimization, not a semantic round. When a valid
     // retained package cannot be transferred under the shared byte/space
@@ -1198,11 +1177,14 @@ export function runLoopAgentInPreparedRepository({
     // from a prior action) is trustworthy -- never a freshly reported id from
     // a crashed/timed-out engine, which would otherwise poison a later
     // resume attempt into sealing against a session that was never sealed.
-    const nativeSessionId = resumedNativeSessionId ?? (engineExited
-      ? reportedNativeSessionId
-      : preparedEnvironment.nativeSessionTransfer?.transferred === false
-        ? request.nativeSessionId
-        : null);
+    const fellBackToFresh = preparedEnvironment.nativeSessionTransfer?.transferred === false;
+    if (engineExited && fellBackToFresh && !reportedNativeSessionId) {
+      throw retryableInfrastructureError(
+        "fresh native-session fallback completed without reporting a replacement session id",
+        { engineStdout: result.stdout, engineStderr: result.stderr },
+      );
+    }
+    const nativeSessionId = resumedNativeSessionId ?? (engineExited ? reportedNativeSessionId : null);
     try {
       // The profile-root tamper fence is an independent integrity check, not
       // a symptom of how the engine exited, so it always runs.
@@ -1216,7 +1198,6 @@ export function runLoopAgentInPreparedRepository({
           agent: request.agent,
           nativeSessionId,
           profileRoot: preparedEnvironment.nativeSessionProfileRoot,
-          supersededNativeSessionId: effectiveInvocation.mode === "fresh" ? request.nativeSessionId : null,
         });
         if (nativeSessionId && !sealedNativeSessionPackage) {
           throw new Error("native session id was reported without a sealed executor package");
@@ -2254,6 +2235,24 @@ export function fallbackLoopActionResult({ request, error, now = () => new Date(
   };
 }
 
+export function retireSupersededLoopSession(request, result) {
+  if (!request.nativeSessionId || !result?.native_session_id ||
+      result.native_session_id === request.nativeSessionId) return false;
+  return retireNativeSessionPackage({
+    agent: request.agent,
+    nativeSessionId: request.nativeSessionId,
+  });
+}
+
+export function commitLoopActionResult(request, result, outputPath, {
+  retire = retireSupersededLoopSession,
+  prune = pruneCompletedLoopAction,
+} = {}) {
+  writeJsonAtomic(outputPath, result);
+  retire(request, result);
+  return prune({ request, result });
+}
+
 function main() {
   const requestPath = resolve(arg("--request", process.env.OT_LOOP_REQUEST_FILE));
   const rawRequest = JSON.parse(readFileSync(requestPath, "utf8"));
@@ -2264,7 +2263,7 @@ function main() {
     rootDir: configuredActionRoot(),
   })));
   // Re-dispatch after a lost acknowledgement is a pure result replay. Sweep
-  // other completed homes first, then return the exact atomic result without
+  // this completed home first, then return the exact atomic result without
   // consuming credentials or invoking the agent again.
   sweepCompletedLoopActions(request);
   if (existsSync(outputPath)) {
@@ -2275,6 +2274,7 @@ function main() {
         replay.attempt_id !== request.attemptId || replay.request_hash !== request.requestHash) {
       throw new Error("loop result replay does not match the sealed request");
     }
+    retireSupersededLoopSession(request, replay);
     pruneCompletedLoopAction({ request, result: replay });
     return;
   }
@@ -2290,8 +2290,9 @@ function main() {
       credentialEnv: credentialEnvelope ?? {},
       credentialEnvelopeMissing: credentialEnvelope === null,
     });
-    writeJsonAtomic(outputPath, result);
-    pruneCompletedLoopAction({ request, result });
+    // result.json is the commit point for the replacement session identity.
+    // Only now may the prior package become unreachable.
+    commitLoopActionResult(request, result, outputPath);
   } catch (error) {
     // Last-resort fence: the request is validated and the output path is
     // known, so any throw executeLoopAction did not fold into its own result
@@ -2299,6 +2300,9 @@ function main() {
     // corrupt persisted correction state) must still leave a sealed typed
     // result the supervisor can settle as retryable and re-dispatch.
     try {
+      // Retention and session retirement are replayable cleanup. Never
+      // overwrite a semantic result that has already reached its commit point.
+      if (existsSync(outputPath)) throw error;
       const fallback = fallbackLoopActionResult({ request, error });
       writeJsonAtomic(outputPath, fallback);
       pruneCompletedLoopAction({ request, result: fallback });
