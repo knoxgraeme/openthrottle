@@ -127,6 +127,7 @@ export interface EditableSkillsRefreshPlan {
 export interface EditableSkillsResources {
   graphPath?: string;
   skillDirectory?: string;
+  skillDirectories?: Partial<Record<EditableSkillId, string>>;
   release?: string;
 }
 
@@ -166,8 +167,13 @@ interface EditableSkillSourceFile {
 const COMMAND_ALIAS_NAMES = ["test", "build", "lint"] as const;
 const EDITABLE_GRAPH_ID = "simple_editable";
 const EDITABLE_GRAPH_PATH = ".openthrottle/graphs/simple.json";
-const EDITABLE_SKILL_ID = "implement-plan";
-const EDITABLE_SKILL_PATH = `.openthrottle/skills/${EDITABLE_SKILL_ID}`;
+const EDITABLE_SKILL_IDS = ["implement-plan", "admission-plan", "review-admission-plan"] as const;
+type EditableSkillId = (typeof EDITABLE_SKILL_IDS)[number];
+const EDITABLE_SKILLS_ROOT = ".openthrottle/skills";
+const EDITABLE_SKILL_PATHS = new Map<EditableSkillId, string>(
+  EDITABLE_SKILL_IDS.map((id) => [id, `${EDITABLE_SKILLS_ROOT}/${id}`])
+);
+const EDITABLE_IMPLEMENTATION_SKILL_ID: EditableSkillId = "implement-plan";
 const EDITABLE_LOCK_PATH = ".openthrottle/skills.lock.json";
 const REQUIRED_EDITABLE_SKILL_FILES = ["SKILL.md", "agents/openai.yaml"] as const;
 const REPOSITORY_SKILL_MAX_FILES = 64;
@@ -460,11 +466,16 @@ function projectConfigDocument(config: ProjectConfig, editableSkills = false): R
     commands,
     ...aliases,
     ...(editableSkills ? {
-      skills: [{ id: EDITABLE_SKILL_ID, path: EDITABLE_SKILL_PATH }],
+      skills: EDITABLE_SKILL_IDS.map((id) => ({ id, path: EDITABLE_SKILL_PATHS.get(id)! })),
     } : {}),
     intents: {
       implement: editableSkills
-        ? { default_graph: EDITABLE_GRAPH_ID, allowed_graphs: [EDITABLE_GRAPH_ID, "simple", "structured"] }
+        ? {
+            default_graph: EDITABLE_GRAPH_ID,
+            allowed_graphs: [EDITABLE_GRAPH_ID, "simple", "structured"],
+            planner_skill: "repo://admission-plan",
+            reviewer_skill: "repo://review-admission-plan",
+          }
         : { default_graph: "simple", allowed_graphs: ["simple", "structured"] },
       investigate: { default_graph: "simple", allowed_graphs: ["simple"] },
     },
@@ -529,46 +540,54 @@ function readRepositoryFile(directory: string, path: string): string | null {
 }
 
 function localEditableSkillFiles(directory: string): Array<{ path: string; digest: string }> {
-  assertSafeRepositoryPath(directory, EDITABLE_SKILL_PATH);
-  const root = join(directory, EDITABLE_SKILL_PATH);
-  const rootStat = lstatSync(root, { throwIfNoEntry: false });
-  if (!rootStat) return [];
-  if (!rootStat.isDirectory()) {
-    throw new Error(`editable-skills package path is not a directory: ${EDITABLE_SKILL_PATH}`);
-  }
   const files: Array<{ path: string; digest: string }> = [];
-  let totalBytes = 0;
-  const visit = (absolute: string, relative: string): void => {
-    for (const entry of readdirSync(absolute, { withFileTypes: true })) {
-      const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
-      const path = `${EDITABLE_SKILL_PATH}/${entryRelative}`;
-      if (entry.isSymbolicLink()) {
-        throw new Error(`editable-skills package must not contain symlinks: ${path}`);
-      }
-      if (entry.isDirectory()) {
-        visit(join(absolute, entry.name), entryRelative);
-      } else if (entry.isFile()) {
-        if (files.length >= REPOSITORY_SKILL_MAX_FILES) {
-          throw new Error(`editable-skills package exceeds the ${REPOSITORY_SKILL_MAX_FILES} file limit`);
-        }
-        const contents = readFileSync(join(absolute, entry.name), "utf8");
-        totalBytes += Buffer.byteLength(contents, "utf8");
-        if (totalBytes > REPOSITORY_SKILL_MAX_BYTES) {
-          throw new Error("editable-skills package exceeds the 256 KiB snapshot limit");
-        }
-        files.push({ path, digest: digest(contents) });
-      } else {
-        throw new Error(`editable-skills package contains a non-regular entry: ${path}`);
-      }
+  for (const id of EDITABLE_SKILL_IDS) {
+    const packagePath = EDITABLE_SKILL_PATHS.get(id)!;
+    assertSafeRepositoryPath(directory, packagePath);
+    const root = join(directory, packagePath);
+    const rootStat = lstatSync(root, { throwIfNoEntry: false });
+    if (!rootStat) continue;
+    if (!rootStat.isDirectory()) {
+      throw new Error(`editable-skills package path is not a directory: ${packagePath}`);
     }
-  };
-  visit(root, "");
+    let packageFiles = 0;
+    let totalBytes = 0;
+    const visit = (absolute: string, relative: string): void => {
+      for (const entry of readdirSync(absolute, { withFileTypes: true })) {
+        const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
+        const path = `${packagePath}/${entryRelative}`;
+        if (entry.isSymbolicLink()) {
+          throw new Error(`editable-skills package must not contain symlinks: ${path}`);
+        }
+        if (entry.isDirectory()) {
+          visit(join(absolute, entry.name), entryRelative);
+        } else if (entry.isFile()) {
+          if (packageFiles >= REPOSITORY_SKILL_MAX_FILES) {
+            throw new Error(`editable-skills package exceeds the ${REPOSITORY_SKILL_MAX_FILES} file limit`);
+          }
+          const contents = readFileSync(join(absolute, entry.name), "utf8");
+          packageFiles += 1;
+          totalBytes += Buffer.byteLength(contents, "utf8");
+          if (totalBytes > REPOSITORY_SKILL_MAX_BYTES) {
+            throw new Error("editable-skills package exceeds the 256 KiB snapshot limit");
+          }
+          files.push({ path, digest: digest(contents) });
+        } else {
+          throw new Error(`editable-skills package contains a non-regular entry: ${path}`);
+        }
+      }
+    };
+    visit(root, "");
+  }
   return files.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
 }
 
-function defaultEditableResources(resources: EditableSkillsResources = {}): Required<EditableSkillsResources> {
+function defaultEditableResources(resources: EditableSkillsResources = {}): {
+  graphPath: string;
+  skillDirectories: Record<EditableSkillId, string>;
+  release: string;
+} {
   const bundledGraph = join(MODULE_DIRECTORY, "scaffolds/simple-v1.json");
-  const bundledSkill = join(MODULE_DIRECTORY, "skills/tasks/implement-plan");
   const packageJson = JSON.parse(readFileSync(join(MODULE_DIRECTORY, "../package.json"), "utf8")) as {
     version: string;
   };
@@ -576,9 +595,13 @@ function defaultEditableResources(resources: EditableSkillsResources = {}): Requ
     graphPath: resources.graphPath ?? (existsSync(bundledGraph)
       ? bundledGraph
       : resolve(MODULE_DIRECTORY, "../../supervisor/graphs/simple-v1.json")),
-    skillDirectory: resources.skillDirectory ?? (existsSync(bundledSkill)
-      ? bundledSkill
-      : resolve(MODULE_DIRECTORY, "../../skills/tasks/implement-plan")),
+    skillDirectories: Object.fromEntries(EDITABLE_SKILL_IDS.map((id) => {
+      const bundledSkill = join(MODULE_DIRECTORY, `skills/tasks/${id}`);
+      const legacyOverride = id === EDITABLE_IMPLEMENTATION_SKILL_ID ? resources.skillDirectory : undefined;
+      return [id, resources.skillDirectories?.[id] ?? legacyOverride ?? (existsSync(bundledSkill)
+        ? bundledSkill
+        : resolve(MODULE_DIRECTORY, `../../skills/tasks/${id}`))];
+    })) as Record<EditableSkillId, string>,
     release: resources.release ?? packageJson.version,
   };
 }
@@ -588,13 +611,13 @@ function editableGraph(raw: string, repositoryTaskTimeoutSeconds: number): Graph
   graph.id = "repository/simple_editable";
   for (const worker of graph.workers) {
     if (worker.id === "implementer-fresh" || worker.id === "implementer-resume") {
-      worker.skills = [`repo://${EDITABLE_SKILL_ID}`];
+      worker.skills = [`repo://${EDITABLE_IMPLEMENTATION_SKILL_ID}`];
     }
   }
   for (const loop of graph.loops) {
     loop.timeout_seconds = repositoryTaskTimeoutSeconds;
     if (loop.id === "implementation-loop" || loop.id === "repair-implementation-loop") {
-      loop.skill = `repo://${EDITABLE_SKILL_ID}`;
+      loop.skill = `repo://${EDITABLE_IMPLEMENTATION_SKILL_ID}`;
     }
   }
   return graph;
@@ -608,11 +631,14 @@ function isSafePackagePath(path: string): boolean {
     path.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
 }
 
-function readEditableSkillSourcePackage(skillDirectory: string): EditableSkillSourceFile[] {
+function readEditableSkillSourcePackage(
+  skillDirectory: string,
+  skillId: EditableSkillId
+): EditableSkillSourceFile[] {
   const root = resolve(skillDirectory);
   const rootStat = lstatSync(root, { throwIfNoEntry: false });
   if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) {
-    throw new Error("editable implement-plan source must be a real directory");
+    throw new Error(`editable ${skillId} source must be a real directory`);
   }
 
   const files: EditableSkillSourceFile[] = [];
@@ -622,25 +648,25 @@ function readEditableSkillSourcePackage(skillDirectory: string): EditableSkillSo
       const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
       const entryAbsolute = join(absolute, entry.name);
       if (!isSafePackagePath(entryRelative)) {
-        throw new Error(`editable implement-plan source has an unsafe path: ${entryRelative}`);
+        throw new Error(`editable ${skillId} source has an unsafe path: ${entryRelative}`);
       }
       if (entry.isSymbolicLink()) {
-        throw new Error(`editable implement-plan source must not contain symlinks: ${entryRelative}`);
+        throw new Error(`editable ${skillId} source must not contain symlinks: ${entryRelative}`);
       }
       if (entry.isDirectory()) {
         visit(entryAbsolute, entryRelative);
         continue;
       }
       if (!entry.isFile()) {
-        throw new Error(`editable implement-plan source contains a non-regular entry: ${entryRelative}`);
+        throw new Error(`editable ${skillId} source contains a non-regular entry: ${entryRelative}`);
       }
       if (files.length >= REPOSITORY_SKILL_MAX_FILES) {
-        throw new Error(`editable implement-plan source exceeds the ${REPOSITORY_SKILL_MAX_FILES} file limit`);
+        throw new Error(`editable ${skillId} source exceeds the ${REPOSITORY_SKILL_MAX_FILES} file limit`);
       }
       const contents = readFileSync(entryAbsolute, "utf8");
       totalBytes += Buffer.byteLength(contents, "utf8");
       if (totalBytes > REPOSITORY_SKILL_MAX_BYTES) {
-        throw new Error("editable implement-plan source exceeds the 256 KiB snapshot limit");
+        throw new Error(`editable ${skillId} source exceeds the 256 KiB snapshot limit`);
       }
       files.push({ path: entryRelative, contents, digest: digest(contents) });
     }
@@ -649,7 +675,7 @@ function readEditableSkillSourcePackage(skillDirectory: string): EditableSkillSo
   files.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
   for (const required of REQUIRED_EDITABLE_SKILL_FILES) {
     if (!files.some((entry) => entry.path === required)) {
-      throw new Error(`editable implement-plan source is missing ${required}`);
+      throw new Error(`editable ${skillId} source is missing ${required}`);
     }
   }
   return files;
@@ -662,6 +688,22 @@ function editableSkillsLockPayload(lock: EditableSkillsLock): Omit<EditableSkill
 
 function hasUniquePaths(entries: Array<{ path: string }>): boolean {
   return new Set(entries.map((entry) => entry.path)).size === entries.length;
+}
+
+function normalizedUpstreamFiles(
+  entries: Array<{ path: string; digest: string }>
+): { files: Array<{ path: string; digest: string }>; legacy: boolean } | null {
+  const isPrefixed = (path: string) => EDITABLE_SKILL_IDS.some((id) => path.startsWith(`${id}/`));
+  const prefixed = entries.filter((entry) => isPrefixed(entry.path)).length;
+  if (prefixed === entries.length) return { files: entries, legacy: false };
+  if (prefixed !== 0) return null;
+  return {
+    files: entries.map((entry) => ({
+      path: `${EDITABLE_IMPLEMENTATION_SKILL_ID}/${entry.path}`,
+      digest: entry.digest,
+    })),
+    legacy: true,
+  };
 }
 
 function parseEditableSkillsLock(raw: string): EditableSkillsLock | null {
@@ -683,8 +725,8 @@ function parseEditableSkillsLock(raw: string): EditableSkillsLock | null {
         typeof value.scaffold_package_digest !== "string" ||
         !SHA256_DIGEST.test(value.scaffold_package_digest)) return null;
     if (!Array.isArray(value.upstream_files) || !Array.isArray(value.files)) return null;
-    if (value.upstream_files.length > REPOSITORY_SKILL_MAX_FILES ||
-        value.files.length > REPOSITORY_SKILL_MAX_FILES + 2) return null;
+    if (value.upstream_files.length > REPOSITORY_SKILL_MAX_FILES * EDITABLE_SKILL_IDS.length ||
+        value.files.length > REPOSITORY_SKILL_MAX_FILES * EDITABLE_SKILL_IDS.length + 2) return null;
     if (![...value.upstream_files, ...value.files].every((entry) => (
       entry && typeof entry.path === "string" && isSafePackagePath(entry.path) &&
       typeof entry.digest === "string" && SHA256_DIGEST.test(entry.digest)
@@ -694,24 +736,37 @@ function parseEditableSkillsLock(raw: string): EditableSkillsLock | null {
     const lock = value as EditableSkillsLock;
     if (digestCanonicalJson(editableSkillsLockPayload(lock)) !== lock.integrity_digest) return null;
     if (digestCanonicalJson(lock.upstream_files) !== lock.upstream_package_digest) return null;
+    const normalized = normalizedUpstreamFiles(lock.upstream_files);
+    if (!normalized) return null;
     const scaffoldPackage = lock.files
-      .filter((entry) => entry.path.startsWith(`${EDITABLE_SKILL_PATH}/`))
+      .filter((entry) => entry.path.startsWith(`${EDITABLE_SKILLS_ROOT}/`))
       .map((entry) => ({
-        path: entry.path.slice(`${EDITABLE_SKILL_PATH}/`.length),
+        path: entry.path.slice(`${EDITABLE_SKILLS_ROOT}/`.length),
         digest: entry.digest,
       }));
-    if (digestCanonicalJson(scaffoldPackage) !== lock.scaffold_package_digest) return null;
-    if (canonicalJson(scaffoldPackage) !== canonicalJson(lock.upstream_files)) return null;
-    if (!REQUIRED_EDITABLE_SKILL_FILES.every((required) => (
-      lock.upstream_files.some((entry) => entry.path === required)
-    ))) return null;
+    const scaffoldPackageForDigest = normalized.legacy
+      ? scaffoldPackage.map((entry) => ({
+          path: entry.path.slice(`${EDITABLE_IMPLEMENTATION_SKILL_ID}/`.length),
+          digest: entry.digest,
+        }))
+      : scaffoldPackage;
+    if (digestCanonicalJson(scaffoldPackageForDigest) !== lock.scaffold_package_digest) return null;
+    if (canonicalJson(scaffoldPackage) !== canonicalJson(normalized.files)) return null;
+    const packageIds = new Set(normalized.files.map((entry) => entry.path.split("/", 1)[0]));
+    if (![...packageIds].every((id) => EDITABLE_SKILL_IDS.includes(id as EditableSkillId))) return null;
+    if (!packageIds.has(EDITABLE_IMPLEMENTATION_SKILL_ID)) return null;
+    for (const id of packageIds) {
+      if (!REQUIRED_EDITABLE_SKILL_FILES.every((required) => (
+        normalized.files.some((entry) => entry.path === `${id}/${required}`)
+      ))) return null;
+    }
     const graphFile = lock.files.find((entry) => entry.path === EDITABLE_GRAPH_PATH);
     const configFile = lock.files.find((entry) => entry.path === ".openthrottle.yml");
     if (!graphFile || !configFile || graphFile.digest !== lock.upstream_graph.scaffold_digest) return null;
     if (lock.files.some((entry) => (
       entry.path !== ".openthrottle.yml" &&
       entry.path !== EDITABLE_GRAPH_PATH &&
-      !entry.path.startsWith(`${EDITABLE_SKILL_PATH}/`)
+      !EDITABLE_SKILL_IDS.some((id) => entry.path.startsWith(`${EDITABLE_SKILL_PATHS.get(id)!}/`))
     ))) return null;
     return lock;
   } catch {
@@ -745,16 +800,20 @@ function buildEditableSkillsScaffold(
     [".openthrottle.yml", configRaw],
     [EDITABLE_GRAPH_PATH, graphRaw],
   ]);
-  const sourcePackage = readEditableSkillSourcePackage(resolved.skillDirectory);
-  const upstreamFiles = sourcePackage.map(({ path, contents, digest: sourceDigest }) => {
-    files.set(`${EDITABLE_SKILL_PATH}/${path}`, contents);
-    return { path, digest: sourceDigest };
-  });
-  const skillName = files.get(`${EDITABLE_SKILL_PATH}/SKILL.md`)?.match(/^name:\s*implement-plan\s*$/m);
-  if (!skillName) throw new Error("editable implement-plan SKILL.md frontmatter name must be implement-plan");
+  const upstreamFiles: Array<{ path: string; digest: string }> = [];
+  for (const id of EDITABLE_SKILL_IDS) {
+    const packagePath = EDITABLE_SKILL_PATHS.get(id)!;
+    const sourcePackage = readEditableSkillSourcePackage(resolved.skillDirectories[id], id);
+    for (const { path, contents, digest: sourceDigest } of sourcePackage) {
+      files.set(`${packagePath}/${path}`, contents);
+      upstreamFiles.push({ path: `${id}/${path}`, digest: sourceDigest });
+    }
+    const skillName = files.get(`${packagePath}/SKILL.md`)?.match(new RegExp(`^name:\\s*${id}\\s*$`, "m"));
+    if (!skillName) throw new Error(`editable ${id} SKILL.md frontmatter name must be ${id}`);
+  }
 
   const scaffoldFiles = [...files].map(([path, contents]) => ({ path, digest: digest(contents) }));
-  const scaffoldPackageFiles = scaffoldFiles.filter((entry) => entry.path.startsWith(`${EDITABLE_SKILL_PATH}/`));
+  const scaffoldPackageFiles = scaffoldFiles.filter((entry) => entry.path.startsWith(`${EDITABLE_SKILLS_ROOT}/`));
   const lockPayload: Omit<EditableSkillsLock, "integrity_digest"> = {
     schema: "openthrottle.skills.lock/v1",
     openthrottle_release: resolved.release,
@@ -766,7 +825,7 @@ function buildEditableSkillsScaffold(
     upstream_package_digest: digestCanonicalJson(upstreamFiles),
     upstream_files: upstreamFiles,
     scaffold_package_digest: digestCanonicalJson(scaffoldPackageFiles.map((entry) => ({
-      path: entry.path.slice(`${EDITABLE_SKILL_PATH}/`.length),
+      path: entry.path.slice(`${EDITABLE_SKILLS_ROOT}/`.length),
       digest: entry.digest,
     }))),
     files: scaffoldFiles,
@@ -1276,7 +1335,7 @@ export default async function init(args: string[] = [], options: InitCommandOpti
         supervisorTaskTimeoutSeconds,
       });
       p.log.success(editableSkills
-        ? "Wrote .openthrottle.yml and editable simple-pipeline skills"
+        ? "Wrote .openthrottle.yml and editable implementation/admission skills"
         : "Wrote .openthrottle.yml");
     }
   } else {
@@ -1300,7 +1359,7 @@ export default async function init(args: string[] = [], options: InitCommandOpti
       supervisorTaskTimeoutSeconds,
     });
     p.log.success(editableSkills
-      ? "Wrote .openthrottle.yml and editable simple-pipeline skills"
+      ? "Wrote .openthrottle.yml and editable implementation/admission skills"
       : "Wrote .openthrottle.yml");
   }
 

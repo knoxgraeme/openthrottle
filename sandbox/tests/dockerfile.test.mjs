@@ -63,4 +63,16 @@ describe("sandbox Dockerfile", () => {
 
     for (const principal of principals) expect(dockerfile).toContain(principal);
   });
+
+  it("delivers automatic-admission packages through the canonical cross-engine skill tree", () => {
+    const dockerfile = readFileSync(resolve(repoRoot, "sandbox/Dockerfile"), "utf8");
+
+    expect(dockerfile).toContain("COPY skills /opt/openthrottle/skills");
+    expect(dockerfile).toContain("cp -r /opt/openthrottle/skills/tasks/. \"$baseline/claude/skills/\"");
+    expect(dockerfile).toContain("cp -r /opt/openthrottle/skills/tasks/. /etc/codex/skills/");
+    for (const name of ["admission-plan", "review-admission-plan"]) {
+      expect(readFileSync(resolve(repoRoot, "skills/tasks", name, "SKILL.md"), "utf8"))
+        .toContain(`name: ${name}`);
+    }
+  });
 });

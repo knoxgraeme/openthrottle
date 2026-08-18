@@ -53,6 +53,8 @@ SKILL_NAMES=(
   performance
   project-standards
   tune
+  admission-plan
+  review-admission-plan
 )
 
 docker run --rm --entrypoint bash "$IMAGE" -lc '

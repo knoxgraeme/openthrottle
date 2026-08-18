@@ -9,8 +9,9 @@ const target = resolve(here, "../dist/skills/planning");
 const operatorSkillSource = resolve(here, "../../skills/operator");
 const operatorSkillTarget = resolve(here, "../dist/skills/operator");
 const operatorSkillMetadataTarget = resolve(here, "../dist/operator-skill-source.json");
-const editableTaskSource = resolve(here, "../../skills/tasks/implement-plan");
-const editableTaskTarget = resolve(here, "../dist/skills/tasks/implement-plan");
+const editableTaskNames = ["implement-plan", "admission-plan", "review-admission-plan"];
+const editableTasksSource = resolve(here, "../../skills/tasks");
+const editableTasksTarget = resolve(here, "../dist/skills/tasks");
 const editableGraphSource = resolve(here, "../../supervisor/graphs/simple-v1.json");
 const editableGraphTarget = resolve(here, "../dist/scaffolds/simple-v1.json");
 const releaseManifestSource = resolve(here, "../release-manifest.json");
@@ -19,10 +20,10 @@ const requiredEditableTaskFiles = ["SKILL.md", "agents/openai.yaml"];
 const repositorySkillMaxFiles = 64;
 const repositorySkillMaxBytes = 256 * 1024;
 
-function editableTaskFiles(root) {
+function editableTaskFiles(root, name) {
   const rootStat = lstatSync(root, { throwIfNoEntry: false });
   if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) {
-    throw new Error("editable implement-plan source must be a real directory");
+    throw new Error(`editable ${name} source must be a real directory`);
   }
   const files = [];
   let totalBytes = 0;
@@ -31,28 +32,28 @@ function editableTaskFiles(root) {
       const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
       const entryAbsolute = join(absolute, entry.name);
       if (entry.isSymbolicLink()) {
-        throw new Error(`editable implement-plan source must not contain symlinks: ${entryRelative}`);
+        throw new Error(`editable ${name} source must not contain symlinks: ${entryRelative}`);
       }
       if (entry.isDirectory()) {
         visit(entryAbsolute, entryRelative);
       } else if (entry.isFile()) {
         if (files.length >= repositorySkillMaxFiles) {
-          throw new Error(`editable implement-plan source exceeds the ${repositorySkillMaxFiles} file limit`);
+          throw new Error(`editable ${name} source exceeds the ${repositorySkillMaxFiles} file limit`);
         }
         totalBytes += readFileSync(entryAbsolute).byteLength;
         if (totalBytes > repositorySkillMaxBytes) {
-          throw new Error("editable implement-plan source exceeds the 256 KiB snapshot limit");
+          throw new Error(`editable ${name} source exceeds the 256 KiB snapshot limit`);
         }
         files.push(entryRelative);
       } else {
-        throw new Error(`editable implement-plan source contains a non-regular entry: ${entryRelative}`);
+        throw new Error(`editable ${name} source contains a non-regular entry: ${entryRelative}`);
       }
     }
   };
   visit(root, "");
   files.sort();
   for (const required of requiredEditableTaskFiles) {
-    if (!files.includes(required)) throw new Error(`editable implement-plan source is missing ${required}`);
+    if (!files.includes(required)) throw new Error(`editable ${name} source is missing ${required}`);
   }
   return files;
 }
@@ -61,11 +62,15 @@ rmSync(target, { recursive: true, force: true });
 cpSync(source, target, { recursive: true });
 rmSync(operatorSkillTarget, { recursive: true, force: true });
 cpSync(operatorSkillSource, operatorSkillTarget, { recursive: true });
-rmSync(editableTaskTarget, { recursive: true, force: true });
-for (const path of editableTaskFiles(editableTaskSource)) {
-  const destination = resolve(editableTaskTarget, path);
-  mkdirSync(dirname(destination), { recursive: true });
-  cpSync(resolve(editableTaskSource, path), destination);
+rmSync(editableTasksTarget, { recursive: true, force: true });
+for (const name of editableTaskNames) {
+  const sourceRoot = resolve(editableTasksSource, name);
+  const targetRoot = resolve(editableTasksTarget, name);
+  for (const path of editableTaskFiles(sourceRoot, name)) {
+    const destination = resolve(targetRoot, path);
+    mkdirSync(dirname(destination), { recursive: true });
+    cpSync(resolve(sourceRoot, path), destination);
+  }
 }
 mkdirSync(resolve(here, "../dist/scaffolds"), { recursive: true });
 cpSync(editableGraphSource, editableGraphTarget);
@@ -86,6 +91,8 @@ const sourcePaths = [
   "cli/src/operator-skill.test.ts",
   "cli/src/index.ts",
   "cli/scripts/copy-planning-skills.mjs",
+  "skills/tasks/admission-plan",
+  "skills/tasks/review-admission-plan",
   "cli/package.json",
   "cli/package-lock.json",
 ];

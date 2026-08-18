@@ -51,6 +51,23 @@ test suite:
   then emits a separate `tune_proposal` receipt for reviewable config or
   unlocked skill-craft/reference changes under the sealed policy.
 
+Automatic admission adds two read-only task packages through the same canonical
+delivery path:
+
+- `admission-plan` classifies the bounded implementation ticket as `simple`,
+  `structured`, or `needs_human` and emits a complete
+  `openthrottle.execution-plan/v2` only for structured work.
+- `review-admission-plan` runs in a fresh context and independently checks the
+  exact structured candidate for scope coverage, unsupported expansion,
+  dependency coherence, acceptance completeness, path plausibility, and
+  executable verification. It attests to the candidate bytes without rewriting
+  them.
+
+Both packages are safe built-in defaults. A repository may independently bind
+either planning role to a declared, pinned `repo://` package. Ticket text cannot
+select the package or change its digest. Planning actors are read-only and may
+not edit, publish, reroute, activate, or reuse one another's native session.
+
 Structured graphs use five direct loop-path task adapters plus the orchestrated
 whole-change review packages:
 
@@ -144,6 +161,14 @@ Planning skills use the same one-body-per-skill layout, but they are packaged
 for local authoring tools instead of sealed stage execution. A planning skill
 may call local CLI validators; it must not mutate Linear, publish branches, or
 claim runtime gate authority.
+
+`openthrottle init --editable-skills` materializes repository-owned starting
+copies of `implement-plan`, `admission-plan`, and `review-admission-plan` under
+`.openthrottle/skills/`. The generated config declares all three and binds the
+planner and reviewer independently. The provenance lock covers every package
+file, including `agents/openai.yaml` and `references/`; refresh refuses to
+overwrite a local edit or an untracked package file until an operator resolves
+and explicitly accepts the update.
 
 The operator skill under `skills/operator/openthrottle/` is also local-only,
 but it is for an interactive human operator rather than plan authoring. During

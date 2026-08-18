@@ -11,7 +11,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { parseGraphContract, validateRepositoryConfigContract } from "@openthrottle/contracts";
+import {
+  digestCanonicalJson,
+  parseGraphContract,
+  validateRepositoryConfigContract,
+} from "@openthrottle/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parse } from "yaml";
 import init, {
@@ -197,14 +201,24 @@ function recordSupervisorRequests(): Array<{ url: string; authorization: string 
   return requests;
 }
 
-function mutableEditableResources(): { root: string; graphPath: string; skillDirectory: string } {
+function mutableEditableResources(): {
+  root: string;
+  graphPath: string;
+  skillDirectory: string;
+  skillDirectories: Record<string, string>;
+} {
   const root = temporaryProject();
   const graphPath = join(root, "simple-v1.json");
   const skillDirectory = join(root, "implement-plan");
-  mkdirSync(skillDirectory, { recursive: true });
   cpSync(resolve(process.cwd(), "../supervisor/graphs/simple-v1.json"), graphPath);
-  cpSync(resolve(process.cwd(), "../skills/tasks/implement-plan"), skillDirectory, { recursive: true });
-  return { root, graphPath, skillDirectory };
+  const skillDirectories = Object.fromEntries(
+    ["implement-plan", "admission-plan", "review-admission-plan"].map((name) => {
+      const target = join(root, name);
+      cpSync(resolve(process.cwd(), `../skills/tasks/${name}`), target, { recursive: true });
+      return [name, target];
+    })
+  );
+  return { root, graphPath, skillDirectory, skillDirectories };
 }
 
 async function runInitWithSnapshotState(state: string) {
@@ -717,7 +731,7 @@ describe("init project detection", () => {
     expect(outro).toHaveBeenCalledOnce();
   });
 
-  it("scaffolds the exact editable simple-pipeline package under .openthrottle", () => {
+  it("scaffolds the editable implementation and automatic-admission packages under .openthrottle", () => {
     const directory = temporaryProject();
     writeProjectConfig(completeProjectConfig(), directory, { editableSkills: true });
 
@@ -728,11 +742,17 @@ describe("init project detection", () => {
       graphs: expect.arrayContaining([
         { id: "simple_editable", kind: "repository", ref: ".openthrottle/graphs/simple.json" },
       ]),
-      skills: [{ id: "implement-plan", path: ".openthrottle/skills/implement-plan" }],
+      skills: [
+        { id: "implement-plan", path: ".openthrottle/skills/implement-plan" },
+        { id: "admission-plan", path: ".openthrottle/skills/admission-plan" },
+        { id: "review-admission-plan", path: ".openthrottle/skills/review-admission-plan" },
+      ],
       intents: {
         implement: {
           default_graph: "simple_editable",
           allowed_graphs: ["simple_editable", "simple", "structured"],
+          planner_skill: "repo://admission-plan",
+          reviewer_skill: "repo://review-admission-plan",
         },
       },
     });
@@ -746,22 +766,40 @@ describe("init project detection", () => {
     expect(graph.loops.find((loop) => loop.id === "repair-implementation-loop")?.skill).toBe("repo://implement-plan");
     expect(graph.loops.find((loop) => loop.id === "review-loop")?.skill).toBe("builtin://ce/review@1");
 
-    const generatedSkill = readFileSync(
-      join(directory, ".openthrottle/skills/implement-plan/SKILL.md"),
-      "utf8"
-    );
-    expect(generatedSkill).toBe(readFileSync(resolve(process.cwd(), "../skills/tasks/implement-plan/SKILL.md"), "utf8"));
+    for (const name of ["implement-plan", "admission-plan", "review-admission-plan"]) {
+      for (const path of ["SKILL.md", "agents/openai.yaml"]) {
+        expect(readFileSync(join(directory, ".openthrottle/skills", name, path), "utf8")).toBe(
+          readFileSync(resolve(process.cwd(), "../skills/tasks", name, path), "utf8")
+        );
+      }
+    }
     expect(readFileSync(
-      join(directory, ".openthrottle/skills/implement-plan/agents/openai.yaml"),
+      join(directory, ".openthrottle/skills/admission-plan/references/route-rubric.md"),
       "utf8"
-    )).toBe(readFileSync(resolve(process.cwd(), "../skills/tasks/implement-plan/agents/openai.yaml"), "utf8"));
+    )).toBe(readFileSync(
+      resolve(process.cwd(), "../skills/tasks/admission-plan/references/route-rubric.md"),
+      "utf8"
+    ));
+    expect(readFileSync(
+      join(directory, ".openthrottle/skills/review-admission-plan/references/review-checklist.md"),
+      "utf8"
+    )).toBe(readFileSync(
+      resolve(process.cwd(), "../skills/tasks/review-admission-plan/references/review-checklist.md"),
+      "utf8"
+    ));
     expect(() => readFileSync(join(directory, ".agents/skills/implement-plan/SKILL.md"), "utf8")).toThrow();
 
     const lock = JSON.parse(readFileSync(join(directory, ".openthrottle/skills.lock.json"), "utf8"));
     expect(lock).toMatchObject({
       schema: "openthrottle.skills.lock/v1",
       upstream_graph: { ref: "core/simple@1" },
-      upstream_files: [{ path: "SKILL.md" }, { path: "agents/openai.yaml" }],
+      upstream_files: expect.arrayContaining([
+        { path: "implement-plan/SKILL.md", digest: expect.any(String) },
+        { path: "admission-plan/SKILL.md", digest: expect.any(String) },
+        { path: "admission-plan/references/route-rubric.md", digest: expect.any(String) },
+        { path: "review-admission-plan/SKILL.md", digest: expect.any(String) },
+        { path: "review-admission-plan/references/review-checklist.md", digest: expect.any(String) },
+      ]),
     });
     expect(lock).toHaveProperty("upstream_package_digest");
     expect(lock).toHaveProperty("scaffold_package_digest");
@@ -791,8 +829,81 @@ describe("init project detection", () => {
     )).toBe("# Helper\n");
     const lock = JSON.parse(readFileSync(join(directory, ".openthrottle/skills.lock.json"), "utf8"));
     expect(lock.upstream_files).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: "references/helper.md" }),
+      expect.objectContaining({ path: "implement-plan/references/helper.md" }),
     ]));
+  });
+
+  it("preserves independent local planner and reviewer edits during refresh", () => {
+    for (const name of ["admission-plan", "review-admission-plan"]) {
+      const directory = temporaryProject();
+      const config = completeProjectConfig();
+      writeProjectConfig(config, directory, { editableSkills: true });
+      const skillPath = join(directory, ".openthrottle/skills", name, "SKILL.md");
+      writeFileSync(skillPath, `${readFileSync(skillPath, "utf8")}\nOperator-owned edit.\n`);
+
+      const plan = planEditableSkillsRefresh(config, directory);
+      expect(plan).toMatchObject({
+        writable: false,
+        entries: expect.arrayContaining([expect.objectContaining({
+          path: `.openthrottle/skills/${name}/SKILL.md`,
+          status: "local-only",
+        })]),
+      });
+      expect(() => writeProjectConfig(config, directory, { editableSkills: true }))
+        .toThrow(new RegExp(`${name}/SKILL\\.md \\(local-only\\)`));
+      expect(readFileSync(skillPath, "utf8")).toContain("Operator-owned edit");
+    }
+  });
+
+  it("upgrades the legacy one-package provenance lock without overwriting its local edits", () => {
+    const directory = temporaryProject();
+    const config = completeProjectConfig();
+    writeProjectConfig(config, directory, { editableSkills: true });
+    rmSync(join(directory, ".openthrottle/skills/admission-plan"), { recursive: true });
+    rmSync(join(directory, ".openthrottle/skills/review-admission-plan"), { recursive: true });
+
+    const lockPath = join(directory, ".openthrottle/skills.lock.json");
+    const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+    lock.upstream_files = lock.upstream_files
+      .filter((entry: { path: string }) => entry.path.startsWith("implement-plan/"))
+      .map((entry: { path: string; digest: string }) => ({
+        ...entry,
+        path: entry.path.slice("implement-plan/".length),
+      }));
+    lock.files = lock.files.filter((entry: { path: string }) => (
+      entry.path === ".openthrottle.yml" ||
+      entry.path === ".openthrottle/graphs/simple.json" ||
+      entry.path.startsWith(".openthrottle/skills/implement-plan/")
+    ));
+    lock.upstream_package_digest = digestCanonicalJson(lock.upstream_files);
+    lock.scaffold_package_digest = digestCanonicalJson(lock.upstream_files);
+    const { integrity_digest: _oldIntegrity, ...payload } = lock;
+    lock.integrity_digest = digestCanonicalJson(payload);
+    writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+
+    expect(planEditableSkillsRefresh(config, directory)).toMatchObject({
+      writable: true,
+      entries: expect.arrayContaining([
+        expect.objectContaining({
+          path: ".openthrottle/skills/admission-plan/SKILL.md",
+          status: "upstream-only",
+        }),
+        expect.objectContaining({
+          path: ".openthrottle/skills/review-admission-plan/SKILL.md",
+          status: "upstream-only",
+        }),
+      ]),
+    });
+
+    const localSkillPath = join(directory, ".openthrottle/skills/implement-plan/SKILL.md");
+    writeFileSync(localSkillPath, `${readFileSync(localSkillPath, "utf8")}\nLegacy local edit.\n`);
+    expect(planEditableSkillsRefresh(config, directory)).toMatchObject({
+      writable: false,
+      entries: expect.arrayContaining([expect.objectContaining({
+        path: ".openthrottle/skills/implement-plan/SKILL.md",
+        status: "local-only",
+      })]),
+    });
   });
 
   it("rejects source package symlinks and production admission bound overflows", () => {
@@ -968,8 +1079,8 @@ describe("init project detection", () => {
     expect(newLock.scaffold_package_digest).not.toBe(oldLock.scaffold_package_digest);
     expect(newLock.upstream_graph.digest).not.toBe(oldLock.upstream_graph.digest);
     expect(newLock.upstream_graph.scaffold_digest).not.toBe(oldLock.upstream_graph.scaffold_digest);
-    expect(newLock.upstream_files.find((entry: { path: string }) => entry.path === "SKILL.md").digest)
-      .not.toBe(oldLock.upstream_files.find((entry: { path: string }) => entry.path === "SKILL.md").digest);
+    expect(newLock.upstream_files.find((entry: { path: string }) => entry.path === "implement-plan/SKILL.md").digest)
+      .not.toBe(oldLock.upstream_files.find((entry: { path: string }) => entry.path === "implement-plan/SKILL.md").digest);
     expect(newLock.files.find((entry: { path: string }) => entry.path.endsWith("/SKILL.md")).digest)
       .not.toBe(oldLock.files.find((entry: { path: string }) => entry.path.endsWith("/SKILL.md")).digest);
   });

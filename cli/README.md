@@ -64,9 +64,11 @@ Key workflows:
 - `init` is idempotent. Re-run it to change control provider, base branch, or
   repository commands. A partial `OT_SUPERVISOR_URL`/`OT_STATUS_TOKEN` pair
   fails closed.
-- `init --editable-skills` scaffolds a repository-owned implementation adapter
-  for the simple pipeline. `--dry-run` reports refresh classifications without
-  writing or registering.
+- `init --editable-skills` scaffolds repository-owned `implement-plan`,
+  `admission-plan`, and `review-admission-plan` packages. The planner and
+  reviewer may be edited independently; provenance refreshes include their
+  metadata and references and refuse to overwrite local edits. `--dry-run`
+  reports refresh classifications without writing or registering.
 - `plan prepare` uses the configured local engine and canonical planning skill;
   `plan validate` checks the embedded execution-plan contract.
 - `status`, `stop`, `logs`, and `analysis` call authenticated supervisor
