@@ -14,6 +14,7 @@ import type {
 import type { StageRequestEnvelope, StageRequestInputArtifact } from "./stage-request.js";
 import type { ExecutionPublicationSnapshot } from "./execution-publication.js";
 import type { TaskType } from "./types.js";
+import type { GitCheckpointObject } from "./checkpoint-object.js";
 
 export type PipelineInstanceStatus =
   | "pending"
@@ -408,6 +409,12 @@ export interface CoordinatorTransitionWrite {
   publishedCommit?: string | null;
   publishedSubject?: string | null;
   taskBranchPublishedSha?: string;
+  checkpointAdvance?: {
+    generation: number;
+    lineage: string;
+    expectedTreeSha: string;
+    object: GitCheckpointObject;
+  };
   clearPublishedCommit?: boolean;
   /** Increments the target stage's local bounded re-entry counter. */
   reentryIncrement?: number;

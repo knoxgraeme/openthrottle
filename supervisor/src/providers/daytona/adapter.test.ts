@@ -416,6 +416,8 @@ describe("Daytona stage execution", () => {
     });
 
     const artifactPayload = canonicalJson({ result: "success", sealed_tune_corpus: "x".repeat(70 * 1024) });
+    const stageCheckpoint = Buffer.from("ordinary-stage-checkpoint-bundle");
+    remoteFiles.set("/var/lib/openthrottle/stage-results/attempt-1.checkpoint.bundle", stageCheckpoint);
     remoteFiles.set("/var/lib/openthrottle/stage-results/attempt-1.json", Buffer.from(JSON.stringify({
       version: 1,
       kind: "stage_result",
@@ -425,6 +427,14 @@ describe("Daytona stage execution", () => {
       native_session_id: null,
       subject: "c".repeat(40),
       created_at: "2026-07-22T00:00:00.000Z",
+      checkpoint_object: {
+        schema: "openthrottle.git-checkpoint-object/v1",
+        file: "checkpoint.bundle",
+        expected_old_sha: "a".repeat(40),
+        expected_new_sha: "b".repeat(40),
+        bytes: stageCheckpoint.byteLength,
+        sha256: createHash("sha256").update(stageCheckpoint).digest("hex"),
+      },
       artifacts: [{
         kind: "stage_result",
         schema_version: 1,
@@ -438,6 +448,12 @@ describe("Daytona stage execution", () => {
       attemptId: "attempt-1",
       requestHash: request.requestHash,
       outcome: "success",
+      subject: "c".repeat(40),
+      checkpointObject: {
+        expectedOldSha: "a".repeat(40),
+        expectedNewSha: "b".repeat(40),
+        payload: stageCheckpoint,
+      },
     });
     remoteFiles.set(`/var/lib/openthrottle/loop-actions/attempt-child/${REVIEW_PERSONA_ACTION_ID}/result.json`, Buffer.from(JSON.stringify({
       version: 1,

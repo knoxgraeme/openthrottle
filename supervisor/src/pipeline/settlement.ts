@@ -2,6 +2,7 @@ import { evaluateStageGate } from "./gates.js";
 import { coordinatePipelineEvent, type PipelineCoordinatorEvent } from "./coordinator.js";
 import { deriveStageFaultAttribution, type FaultAttribution } from "./fault-attribution.js";
 import type { PipelineInstance, PipelineStore } from "./store.js";
+import type { GitCheckpointObject } from "./checkpoint-object.js";
 
 // The stage settlement composes a persistence-facing run settlement with the
 // deterministic pipeline reduction. It is typed against this narrow interface
@@ -28,7 +29,11 @@ export function completeStageAttemptActor(
   pipelines: PipelineStore,
   tickets: StageSettlementStore,
   event: PipelineCoordinatorEvent,
-  options: { observedSubject?: string; faultAfterWrite?: (writeCount: number) => void } = {}
+  options: {
+    observedSubject?: string;
+    faultAfterWrite?: (writeCount: number) => void;
+    checkpointObject?: GitCheckpointObject;
+  } = {}
 ): PipelineInstance {
   const evaluated = evaluateStageGate(pipelines, event, options);
   if (!event.runId) throw new Error(`pipeline stage event ${event.id} has no run binding`);
@@ -41,6 +46,12 @@ export function completeStageAttemptActor(
       ticketState: "active",
       faultAttribution,
     },
-    () => coordinatePipelineEvent(pipelines, evaluated.event, options.faultAfterWrite, evaluated.receipt)
+    () => coordinatePipelineEvent(
+      pipelines,
+      evaluated.event,
+      options.faultAfterWrite,
+      evaluated.receipt,
+      options.checkpointObject,
+    )
   );
 }

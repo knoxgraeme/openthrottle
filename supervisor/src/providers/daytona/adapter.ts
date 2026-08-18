@@ -229,7 +229,14 @@ function loopActionEnv(request: LoopActionRequest): string {
   ].join(" ");
 }
 
-function parseCollectedStageResult(raw: string, attemptId: string): StageExecutionResult {
+function parseCollectedStageResult(raw: string, attemptId: string): StageExecutionResult & {
+  checkpointDescriptor?: {
+    expectedOldSha: string;
+    expectedNewSha: string;
+    payloadSha256: string;
+    payloadBytes: number;
+  };
+} {
   if (Buffer.byteLength(raw, "utf8") > SEALED_STAGE_RESULT_LIMIT_BYTES) {
     throw new Error("sealed stage result exceeds 4 MiB");
   }
@@ -264,6 +271,33 @@ function parseCollectedStageResult(raw: string, attemptId: string): StageExecuti
       hash: artifact.hash,
     };
   });
+  let checkpointDescriptor: {
+    expectedOldSha: string;
+    expectedNewSha: string;
+    payloadSha256: string;
+    payloadBytes: number;
+  } | undefined;
+  if (event.checkpoint_object !== undefined) {
+    const descriptor = event.checkpoint_object as Record<string, unknown>;
+    if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor) ||
+        Object.keys(descriptor).sort().join(",") !== "bytes,expected_new_sha,expected_old_sha,file,schema,sha256" ||
+        descriptor.schema !== GIT_CHECKPOINT_OBJECT_SCHEMA ||
+        descriptor.file !== GIT_CHECKPOINT_OBJECT_FILE ||
+        typeof descriptor.expected_old_sha !== "string" || !/^[a-f0-9]{40}$/.test(descriptor.expected_old_sha) ||
+        typeof descriptor.expected_new_sha !== "string" || !/^[a-f0-9]{40}$/.test(descriptor.expected_new_sha) ||
+        descriptor.expected_old_sha === descriptor.expected_new_sha ||
+        !Number.isSafeInteger(descriptor.bytes) || Number(descriptor.bytes) < 1 ||
+        Number(descriptor.bytes) > MAX_GIT_CHECKPOINT_OBJECT_BYTES ||
+        typeof descriptor.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(descriptor.sha256)) {
+      throw new Error(`sealed stage result ${attemptId} has an invalid checkpoint object`);
+    }
+    checkpointDescriptor = {
+      expectedOldSha: descriptor.expected_old_sha,
+      expectedNewSha: descriptor.expected_new_sha,
+      payloadSha256: descriptor.sha256,
+      payloadBytes: Number(descriptor.bytes),
+    };
+  }
   return {
     attemptId,
     requestHash: event.request_hash,
@@ -272,6 +306,7 @@ function parseCollectedStageResult(raw: string, attemptId: string): StageExecuti
     subject: event.subject as string | null,
     artifacts,
     completedAt: event.created_at,
+    ...(checkpointDescriptor ? { checkpointDescriptor } : {}),
   };
 }
 
@@ -687,7 +722,24 @@ export function createDaytonaSandboxRuntime(
       const sandbox = await getSandbox(resource);
       try {
         const raw = (await sandbox.fs.downloadFile(`${STAGE_RESULT_DIR}/${attemptId}.json`)).toString("utf8");
-        return parseCollectedStageResult(raw, attemptId);
+        const parsed = parseCollectedStageResult(raw, attemptId);
+        if (!parsed.checkpointDescriptor) return parsed;
+        const payload = await sandbox.fs.downloadFile(
+          `${STAGE_RESULT_DIR}/${attemptId}.${GIT_CHECKPOINT_OBJECT_FILE}`
+        );
+        if (!payload || payload.byteLength !== parsed.checkpointDescriptor.payloadBytes ||
+            createHash("sha256").update(payload).digest("hex") !== parsed.checkpointDescriptor.payloadSha256) {
+          throw new Error(`sealed stage result ${attemptId} checkpoint object does not match its fence`);
+        }
+        const { checkpointDescriptor, ...result } = parsed;
+        return {
+          ...result,
+          checkpointObject: {
+            schema: GIT_CHECKPOINT_OBJECT_SCHEMA,
+            ...checkpointDescriptor,
+            payload,
+          },
+        };
       } catch (error) {
         if (String(error).toLowerCase().includes("not found")) return null;
         throw error;

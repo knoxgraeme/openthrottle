@@ -192,6 +192,52 @@ describe("runtime event contracts", () => {
       .toThrow(/fault_reason/);
   });
 
+  it("parses a bounded ordinary-stage checkpoint descriptor without embedding its bytes", () => {
+    const event = parseSandboxEvent(JSON.stringify({
+      version: 1,
+      kind: "stage_result",
+      event_id: "99999999-9999-4999-8999-999999999999",
+      run_id: "run-1",
+      created_at: "2026-07-18T00:00:00.000Z",
+      pipeline_instance_id: "pipeline-1",
+      generation: 1,
+      stage_id: "implementation",
+      attempt_id: "attempt-1",
+      request_hash: "1".repeat(64),
+      outcome: "success",
+      result_hash: "2".repeat(64),
+      native_session_id: null,
+      subject: "c".repeat(40),
+      checkpoint_object: {
+        schema: "openthrottle.git-checkpoint-object/v1",
+        file: "checkpoint.bundle",
+        expected_old_sha: "a".repeat(40),
+        expected_new_sha: "b".repeat(40),
+        bytes: 123,
+        sha256: "d".repeat(64),
+      },
+      artifacts: [{
+        kind: "stage_result",
+        schema_version: 1,
+        assurance: "semantic_attested",
+        subject: "c".repeat(40),
+        payload: "{}",
+        hash: "2".repeat(64),
+      }],
+    }));
+
+    expect(event).toMatchObject({
+      kind: "stage_result",
+      subject: "c".repeat(40),
+      checkpoint_object: {
+        expected_old_sha: "a".repeat(40),
+        expected_new_sha: "b".repeat(40),
+        bytes: 123,
+      },
+    });
+    expect(JSON.stringify(event)).not.toContain("payload_bytes");
+  });
+
   it("accepts a tune-sized sealed stage artifact while ordinary events remain small", () => {
     const payload = JSON.stringify({ sealed_tune_corpus: "x".repeat(300 * 1024) });
     const event = parseSandboxEvent(JSON.stringify({

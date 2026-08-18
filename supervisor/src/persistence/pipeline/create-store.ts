@@ -10,6 +10,7 @@ import { createRunOutcomeStore } from "./run-outcome-store.js";
 import { createStatusStore } from "./status-store.js";
 import { createTransitionStore } from "./transition-store.js";
 import { createExecutionUnitStore } from "./unit-store.js";
+import { createCheckpointStore } from "./checkpoint-store.js";
 
 export function createPipelineStore(
   db: Database.Database,
@@ -26,5 +27,6 @@ export function createPipelineStore(
     ...createJournalStore(db, now),
     ...createRunOutcomeStore(db),
     ...createExecutionUnitStore(db, now),
+    ...createCheckpointStore(db),
   };
 }

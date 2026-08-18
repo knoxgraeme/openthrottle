@@ -19,6 +19,7 @@ import { digest } from "./artifacts.mjs";
 import {
   computeWorkspaceTreeOid,
   classifyAgentExecutionFailure,
+  commitStageResult,
   createStageRequestHash,
   defaultExecuteCommand,
   defaultRunAgent,
@@ -554,6 +555,51 @@ describe("one-stage executor", () => {
     const runAgent = vi.fn(() => ({ exitCode: 0, proposal: successProposal(), nativeSessionId: "native-1" }));
     executeStage({ ...input, agent: "claude", runAgent, now: clock() });
     expect(runAgent).toHaveBeenCalledWith(expect.objectContaining({ agent: "codex" }));
+  });
+
+  it("persists a deterministic incremental commit bundle for an ordinary write stage", () => {
+    const input = fixture({ credentialScopes: ["model.invoke", "repo.read", "repo.write"] });
+    const parent = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: input.repoDir,
+      encoding: "utf8",
+    }).trim();
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent: () => {
+        writeFileSync(join(input.repoDir, "file.txt"), "accepted workspace\n");
+        return { exitCode: 0, nativeSessionId: "native-1", proposal: successProposal() };
+      },
+    });
+    const resultDir = mkdtempSync(join(tmpdir(), "ot-stage-checkpoint-result-"));
+    directories.push(resultDir);
+    const outputPath = join(resultDir, "attempt-1.json");
+
+    commitStageResult(input.request, result, outputPath, { repoDir: input.repoDir });
+
+    const event = JSON.parse(readFileSync(outputPath, "utf8"));
+    const bundlePath = join(resultDir, "attempt-1.checkpoint.bundle");
+    expect(event.subject).toBe(result.subject);
+    expect(event.checkpoint_object).toMatchObject({
+      schema: "openthrottle.git-checkpoint-object/v1",
+      file: "checkpoint.bundle",
+      expected_old_sha: parent,
+      bytes: readFileSync(bundlePath).byteLength,
+      sha256: digest(readFileSync(bundlePath)),
+    });
+    const checkpoint = event.checkpoint_object.expected_new_sha;
+    expect(execFileSync("git", ["rev-parse", `${checkpoint}^{tree}`], {
+      cwd: input.repoDir,
+      encoding: "utf8",
+    }).trim()).toBe(result.subject);
+    expect(execFileSync("git", ["rev-list", "--parents", "-n", "1", checkpoint], {
+      cwd: input.repoDir,
+      encoding: "utf8",
+    }).trim()).toBe(`${checkpoint} ${parent}`);
+    expect(execFileSync("git", ["bundle", "list-heads", bundlePath], {
+      cwd: input.repoDir,
+      encoding: "utf8",
+    })).toContain(checkpoint);
   });
 
   it("records a missing required native session as explicit failed evidence", () => {

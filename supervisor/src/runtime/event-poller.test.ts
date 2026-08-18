@@ -608,6 +608,69 @@ describe("sandbox event contracts", () => {
     expect(files.size).toBe(0);
   });
 
+  it("downloads and verifies an ordinary checkpoint bundle outside the stored event JSON", async () => {
+    const store = seedRunningTicket();
+    const bundle = Buffer.from("ordinary-stage-checkpoint-bundle");
+    const stageEvent = JSON.parse(stageResultEvent());
+    stageEvent.checkpoint_object = {
+      schema: "openthrottle.git-checkpoint-object/v1",
+      file: "checkpoint.bundle",
+      expected_old_sha: "a".repeat(40),
+      expected_new_sha: "b".repeat(40),
+      bytes: bundle.byteLength,
+      sha256: createHash("sha256").update(bundle).digest("hex"),
+    };
+    const sealedPath = "/var/lib/openthrottle/stage-results/attempt-1.json";
+    const bundlePath = "/var/lib/openthrottle/stage-results/attempt-1.checkpoint.bundle";
+    const files = new Map<string, Buffer>([
+      [sealedPath, Buffer.from(JSON.stringify(stageEvent))],
+      [bundlePath, bundle],
+    ]);
+    const sandbox = {
+      id: "sandbox-1",
+      state: "started",
+      autoStopInterval: 60,
+      process: {
+        executeCommand: vi.fn(async () => ({ exitCode: 0, result: `${"c".repeat(40)}\n` })),
+      },
+      fs: {
+        listFiles: vi.fn(async (directory: string) => [...files.entries()]
+          .filter(([path]) => path.endsWith(".json") && path.startsWith(`${directory}/`))
+          .map(([path, value]) => ({
+            name: path.split("/").at(-1), path, size: value.length, isDir: false,
+          }))),
+        downloadFile: vi.fn(async (path: string) => files.get(path)!),
+        deleteFile: vi.fn(async (path: string) => files.delete(path)),
+      },
+    };
+    const postStageResult = vi.fn(async () => undefined);
+
+    await pollSandboxEvents({
+      runtime: {
+        getWorkspace: vi.fn(async () => sandbox),
+        setActive: vi.fn(async () => undefined),
+        setIdle: vi.fn(async () => undefined),
+      },
+      store,
+      postActivity: vi.fn(async () => undefined),
+      postStageResult,
+    });
+
+    expect(postStageResult).toHaveBeenCalledWith(
+      expect.objectContaining({ subject: "c".repeat(40) }),
+      "c".repeat(40),
+      expect.objectContaining({
+        expectedOldSha: "a".repeat(40),
+        expectedNewSha: "b".repeat(40),
+        payload: bundle,
+      }),
+    );
+    const stored = store.getSandboxEvent("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!;
+    expect(stored.payload).not.toContain("checkpoint");
+    expect(stored.payload).not.toContain(bundle.toString("utf8"));
+    expect(files.size).toBe(0);
+  });
+
   it("surfaces a repeated sealed stage-result ingestion failure once and keeps retrying", async () => {
     const store = seedRunningTicket();
     const raw = Buffer.from(stageResultEvent().replace(

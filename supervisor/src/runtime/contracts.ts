@@ -63,6 +63,7 @@ export interface StageExecutionResult {
     hash: string;
   }>;
   completedAt: string;
+  checkpointObject?: GitCheckpointObject;
 }
 
 export interface RuntimeWorktreeHandle {
