@@ -170,9 +170,11 @@ const EDITABLE_GRAPH_PATH = ".openthrottle/graphs/simple.json";
 const EDITABLE_SKILL_IDS = ["implement-plan", "admission-plan", "review-admission-plan"] as const;
 type EditableSkillId = (typeof EDITABLE_SKILL_IDS)[number];
 const EDITABLE_SKILLS_ROOT = ".openthrottle/skills";
-const EDITABLE_SKILL_PATHS = new Map<EditableSkillId, string>(
-  EDITABLE_SKILL_IDS.map((id) => [id, `${EDITABLE_SKILLS_ROOT}/${id}`])
-);
+const EDITABLE_SKILL_PATHS = {
+  "implement-plan": `${EDITABLE_SKILLS_ROOT}/implement-plan`,
+  "admission-plan": `${EDITABLE_SKILLS_ROOT}/admission-plan`,
+  "review-admission-plan": `${EDITABLE_SKILLS_ROOT}/review-admission-plan`,
+} satisfies Record<EditableSkillId, string>;
 const EDITABLE_IMPLEMENTATION_SKILL_ID: EditableSkillId = "implement-plan";
 const EDITABLE_LOCK_PATH = ".openthrottle/skills.lock.json";
 const REQUIRED_EDITABLE_SKILL_FILES = ["SKILL.md", "agents/openai.yaml"] as const;
@@ -466,7 +468,7 @@ function projectConfigDocument(config: ProjectConfig, editableSkills = false): R
     commands,
     ...aliases,
     ...(editableSkills ? {
-      skills: EDITABLE_SKILL_IDS.map((id) => ({ id, path: EDITABLE_SKILL_PATHS.get(id)! })),
+      skills: EDITABLE_SKILL_IDS.map((id) => ({ id, path: EDITABLE_SKILL_PATHS[id] })),
     } : {}),
     intents: {
       implement: editableSkills
@@ -542,7 +544,7 @@ function readRepositoryFile(directory: string, path: string): string | null {
 function localEditableSkillFiles(directory: string): Array<{ path: string; digest: string }> {
   const files: Array<{ path: string; digest: string }> = [];
   for (const id of EDITABLE_SKILL_IDS) {
-    const packagePath = EDITABLE_SKILL_PATHS.get(id)!;
+    const packagePath = EDITABLE_SKILL_PATHS[id];
     assertSafeRepositoryPath(directory, packagePath);
     const root = join(directory, packagePath);
     const rootStat = lstatSync(root, { throwIfNoEntry: false });
@@ -766,7 +768,7 @@ function parseEditableSkillsLock(raw: string): EditableSkillsLock | null {
     if (lock.files.some((entry) => (
       entry.path !== ".openthrottle.yml" &&
       entry.path !== EDITABLE_GRAPH_PATH &&
-      !EDITABLE_SKILL_IDS.some((id) => entry.path.startsWith(`${EDITABLE_SKILL_PATHS.get(id)!}/`))
+      !EDITABLE_SKILL_IDS.some((id) => entry.path.startsWith(`${EDITABLE_SKILL_PATHS[id]}/`))
     ))) return null;
     return lock;
   } catch {
@@ -802,7 +804,7 @@ function buildEditableSkillsScaffold(
   ]);
   const upstreamFiles: Array<{ path: string; digest: string }> = [];
   for (const id of EDITABLE_SKILL_IDS) {
-    const packagePath = EDITABLE_SKILL_PATHS.get(id)!;
+    const packagePath = EDITABLE_SKILL_PATHS[id];
     const sourcePackage = readEditableSkillSourcePackage(resolved.skillDirectories[id], id);
     for (const { path, contents, digest: sourceDigest } of sourcePackage) {
       files.set(`${packagePath}/${path}`, contents);

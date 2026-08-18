@@ -139,7 +139,7 @@ function write(stageId: string, outcome: CoordinatorTransitionWrite["outcome"], 
 }
 
 describe("automatic admission visibility projection", () => {
-  it("keeps accepted admission stable when later execution gates run", () => {
+  it("does not emit a projection write for later execution gates", () => {
     const decision = {
       schema: "openthrottle.admission-decision/v1",
       route: "simple",
@@ -171,11 +171,12 @@ describe("automatic admission visibility projection", () => {
       write: write("semantic_review", "success"),
     });
 
-    expect(afterExecutionGate).toEqual(expect.objectContaining({
+    expect(accepted).toEqual(expect.objectContaining({
       proposed_route: "simple",
       final_route: "simple",
       terminal_state: "accepted",
     }));
+    expect(afterExecutionGate).toBeUndefined();
   });
 
   it("records semantic and infrastructure retry counts and the exact accepted plan artifact reference", () => {

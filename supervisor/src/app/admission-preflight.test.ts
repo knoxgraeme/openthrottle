@@ -226,6 +226,80 @@ describe("automatic admission authority", () => {
     await expect(resolveAdmissionSkillBindings({ config, readPinnedDirectory }))
       .rejects.toThrow(/repo:\/\/undeclared is not declared in repository config skills/);
   });
+
+  it("resolves distinct repository planning skills concurrently", async () => {
+    const config = admissionConfig("automatic");
+    config.skills = [
+      { id: "planner", path: ".openthrottle/skills/planner" },
+      { id: "reviewer", path: ".openthrottle/skills/reviewer" },
+    ];
+    Object.assign(config.intents!.implement!, {
+      planner_skill: "repo://planner",
+      reviewer_skill: "repo://reviewer",
+    });
+    let releasePlanner!: () => void;
+    const plannerGate = new Promise<void>((resolve) => { releasePlanner = resolve; });
+    let reviewerStarted = false;
+    const readPinnedDirectory = vi.fn(async (path: string) => {
+      const id = path.split("/").at(-1)!;
+      if (id === "planner") await plannerGate;
+      if (id === "reviewer") reviewerStarted = true;
+      const content = `---\nname: ${id}\n---\n\nPinned ${id}.\n`;
+      return {
+        repository: "owner/repo",
+        commit: "a".repeat(40),
+        directory: path,
+        files: [{
+          repository: "owner/repo",
+          commit: "a".repeat(40),
+          path: `${path}/SKILL.md`,
+          blobSha: id === "planner" ? "b".repeat(40) : "c".repeat(40),
+          content,
+          size: Buffer.byteLength(content),
+        }],
+      };
+    });
+
+    const pending = resolveAdmissionSkillBindings({ config, readPinnedDirectory });
+    const startedBeforePlannerCompleted = reviewerStarted;
+    releasePlanner();
+    const bindings = await pending;
+
+    expect(startedBeforePlannerCompleted).toBe(true);
+    expect(readPinnedDirectory).toHaveBeenCalledTimes(2);
+    expect(bindings.planner.invocation).toBe("planner");
+    expect(bindings.reviewer.invocation).toBe("reviewer");
+  });
+
+  it("resolves one repository package when planner and reviewer references match", async () => {
+    const config = admissionConfig("automatic");
+    config.skills = [{ id: "shared", path: ".openthrottle/skills/shared" }];
+    Object.assign(config.intents!.implement!, {
+      planner_skill: "repo://shared",
+      reviewer_skill: "repo://shared",
+    });
+    const readPinnedDirectory = vi.fn(async (path: string) => {
+      const content = "---\nname: shared\n---\n\nPinned shared skill.\n";
+      return {
+        repository: "owner/repo",
+        commit: "a".repeat(40),
+        directory: path,
+        files: [{
+          repository: "owner/repo",
+          commit: "a".repeat(40),
+          path: `${path}/SKILL.md`,
+          blobSha: "b".repeat(40),
+          content,
+          size: Buffer.byteLength(content),
+        }],
+      };
+    });
+
+    const bindings = await resolveAdmissionSkillBindings({ config, readPinnedDirectory });
+
+    expect(readPinnedDirectory).toHaveBeenCalledOnce();
+    expect(bindings.reviewer).toEqual(bindings.planner);
+  });
 });
 
 function readCheckDeps(overrides: Partial<Parameters<typeof runAdmissionPreflight>[0]> = {}) {

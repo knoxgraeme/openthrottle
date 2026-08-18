@@ -225,6 +225,28 @@ export interface PipelineManifest {
   };
 }
 
+export const AUTOMATIC_MANIFEST_ID = "core/automatic";
+export const AUTOMATIC_ADMISSION_STAGE_IDS = {
+  planner: "admission_planner",
+  decisionGate: "admission_decision_gate",
+  reviewer: "admission_reviewer",
+  reviewGate: "admission_review_gate",
+} as const;
+export type AutomaticAdmissionStageId =
+  (typeof AUTOMATIC_ADMISSION_STAGE_IDS)[keyof typeof AUTOMATIC_ADMISSION_STAGE_IDS];
+
+export function isAutomaticManifest(
+  value: string | Pick<PipelineManifest, "id" | "template">
+): boolean {
+  const id = typeof value === "string" ? value : value.id;
+  return (typeof value !== "string" && value.template?.id === AUTOMATIC_MANIFEST_ID) ||
+    id === AUTOMATIC_MANIFEST_ID || id.startsWith(`${AUTOMATIC_MANIFEST_ID}/`);
+}
+
+export function isAutomaticAdmissionStage(stageId: string): stageId is AutomaticAdmissionStageId {
+  return Object.values(AUTOMATIC_ADMISSION_STAGE_IDS).some((candidate) => candidate === stageId);
+}
+
 export interface AutomaticManifestSkillBinding {
   reference: string;
   packageDigest: string | null;
@@ -1036,10 +1058,10 @@ export function validatePipelineManifest(
 
 function parseAutomaticTemplate(value: unknown, path: string): NonNullable<PipelineManifest["template"]> {
   const input = objectAt(value, path, ["id", "version", "digest", "compiler", "identity_digest"]);
-  if (input.id !== "core/automatic") fail(`${path}.id`, "must be core/automatic");
+  if (input.id !== AUTOMATIC_MANIFEST_ID) fail(`${path}.id`, "must be core/automatic");
   if (input.version !== 1) fail(`${path}.version`, "must be 1");
   return {
-    id: "core/automatic",
+    id: AUTOMATIC_MANIFEST_ID,
     version: 1,
     digest: stringAt(input.digest, `${path}.digest`, { pattern: /^[a-f0-9]{64}$/ }),
     compiler: stringAt(input.compiler, `${path}.compiler`, { max: 120, pattern: /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*\/v\d+$/ }),
@@ -1049,7 +1071,7 @@ function parseAutomaticTemplate(value: unknown, path: string): NonNullable<Pipel
 
 function applyAutomaticSkillBinding(
   manifest: PipelineManifest,
-  stageId: "admission_planner" | "admission_reviewer",
+  stageId: typeof AUTOMATIC_ADMISSION_STAGE_IDS.planner | typeof AUTOMATIC_ADMISSION_STAGE_IDS.reviewer,
   binding: AutomaticManifestSkillBinding
 ): void {
   const stage = manifest.stages.find((candidate) => candidate.id === stageId);
@@ -1077,7 +1099,7 @@ function applyAutomaticSkillBinding(
 }
 
 export function compileAutomaticManifest(input: CompileAutomaticManifestInput): ValidatedPipelineManifest {
-  if (input.template.manifest.id !== "core/automatic" || input.template.manifest.version !== 1) {
+  if (input.template.manifest.id !== AUTOMATIC_MANIFEST_ID || input.template.manifest.version !== 1) {
     fail("automatic.template", "must be core/automatic@1");
   }
   const identity = {
@@ -1096,16 +1118,16 @@ export function compileAutomaticManifest(input: CompileAutomaticManifestInput): 
   };
   const identityDigest = digestNormalized(canonicalJson(identity));
   const manifest = structuredClone(input.template.manifest);
-  manifest.id = `core/automatic/${identityDigest}`;
+  manifest.id = `${AUTOMATIC_MANIFEST_ID}/${identityDigest}`;
   manifest.template = {
-    id: "core/automatic",
+    id: AUTOMATIC_MANIFEST_ID,
     version: 1,
     digest: input.template.digest,
     compiler: input.compilerVersion,
     identity_digest: identityDigest,
   };
-  applyAutomaticSkillBinding(manifest, "admission_planner", input.planner);
-  applyAutomaticSkillBinding(manifest, "admission_reviewer", input.reviewer);
+  applyAutomaticSkillBinding(manifest, AUTOMATIC_ADMISSION_STAGE_IDS.planner, input.planner);
+  applyAutomaticSkillBinding(manifest, AUTOMATIC_ADMISSION_STAGE_IDS.reviewer, input.reviewer);
   manifest.requires.capabilities.sort();
   return validatePipelineManifest(manifest, { source: `effective:${manifest.id}` });
 }
@@ -1141,7 +1163,7 @@ export function loadPipelineCatalog(
     const path = resolve(dirname(catalogPath), file);
     const validated = parsePipelineManifest(readFileSync(path, "utf8"), { source: path, runtime });
     for (const stage of validated.manifest.stages) {
-      if (stage.loop && validated.manifest.id !== "core/automatic") {
+      if (stage.loop && validated.manifest.id !== AUTOMATIC_MANIFEST_ID) {
         fail(
           `${path}.stages.${stage.id}.loop`,
           "ordinary loop bindings are supported only in repository-compiled manifests"

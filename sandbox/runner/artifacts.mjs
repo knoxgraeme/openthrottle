@@ -69,8 +69,6 @@ const STANDARD_RECEIPT_STAGE_OUTCOMES = Object.freeze({
   revise: "semantic_repair_required",
   semantic_repair_required: "semantic_repair_required",
   success: "success",
-  simple: "no_change",
-  structured: "success",
 });
 const SEMANTIC_RECEIPTS = new Set([
   "unit_completion",

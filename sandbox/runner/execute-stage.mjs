@@ -64,7 +64,6 @@ import {
   pathInside as containedPath,
   prepareAgentOwnedDirectory,
   prepareAgentOwnedProfileRoot,
-  chmodReadOnlyPreservingExecuteTree,
   restorePersistentAgentPrivateRoots,
 } from "./filesystem-isolation.mjs";
 import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
@@ -83,7 +82,7 @@ import {
   sealNativeSessionPackage,
 } from "./native-session-package.mjs";
 import { writeOpenCodeConfig } from "./build-opencode-config.mjs";
-import { packReachableBaseObjects, runRootGit } from "./loop-paths.mjs";
+import { materializeExactSubjectReadOnlyRepositoryView } from "./loop-paths.mjs";
 import { writeCodexAuthFile } from "./loop-agent-environment.mjs";
 
 export { computeWorkspaceTreeOid } from "./repository-control.mjs";
@@ -687,26 +686,12 @@ export function prepareAdmissionReadOnlyRepository(request, sourceRepoDir) {
   rmSync(actionDirectory, { recursive: true, force: true });
   ensureStageActionParents(request);
   const destination = pathInside(actionDirectory, "repo-view", "admission read-only repository view");
-  mkdirSync(destination, { recursive: true, mode: 0o755 });
-  const subject = runRootGit(sourceRepoDir, ["rev-parse", request.expectedSubject]);
-  const objectType = runRootGit(sourceRepoDir, ["cat-file", "-t", subject]);
-  if (objectType !== "commit" && objectType !== "tree") {
-    throw new Error("admission read-only repository subject must be a commit or tree");
-  }
-  runRootGit(destination, ["init", "--quiet"]);
-  const packDir = pathInside(pathInside(destination, ".git", "admission read-only git directory"), "objects/pack", "admission read-only object pack");
-  mkdirSync(packDir, { recursive: true, mode: 0o755 });
-  packReachableBaseObjects(sourceRepoDir, join(packDir, "authorized"), subject);
-  if (objectType === "commit") {
-    runRootGit(destination, ["switch", "--quiet", "--detach", subject]);
-  } else {
-    runRootGit(destination, ["read-tree", subject]);
-    runRootGit(destination, ["checkout-index", "--all", "--force"]);
-  }
-  runRootGit(destination, ["config", "remote.origin.url", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
-  runRootGit(destination, ["config", "remote.origin.pushurl", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
-  chmodReadOnlyPreservingExecuteTree(destination);
-  return destination;
+  return materializeExactSubjectReadOnlyRepositoryView({
+    sourceRepoDir,
+    sourceSubject: request.expectedSubject,
+    destination,
+    invalidSubjectMessage: "admission read-only repository subject must be a commit or tree",
+  });
 }
 
 function isAdmissionPlannerEnvelope(value) {
@@ -768,6 +753,7 @@ export function defaultRunAgent({
   restorePersistentProfiles = restorePersistentAgentPrivateRoots,
   lockStageHome = lockRepositorySkillStageHome,
   materializeNativeSession = materializeNativeSessionState,
+  removeActionDirectory = rmSync,
 }) {
   const actionProposalPath = repositorySkillProposalPath(request, proposalPath);
   let command;
@@ -965,6 +951,13 @@ export function defaultRunAgent({
       restorePersistentProfiles(lockedPersistentProfiles);
     } catch (error) {
       cleanupErrors.push(error instanceof Error ? error.message : String(error));
+    }
+    if (inspection) {
+      try {
+        removeActionDirectory(stageActionDirectory(request), { recursive: true, force: true });
+      } catch (error) {
+        cleanupErrors.push(error instanceof Error ? error.message : String(error));
+      }
     }
     if (cleanupErrors.length > 0) {
       const prefix = bodyError

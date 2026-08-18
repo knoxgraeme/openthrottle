@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
+  chmodReadOnlyPreservingExecuteTree,
   chmodTree,
   chownTree,
   isRoot,
@@ -122,6 +123,35 @@ export function runRootGit(repoDir, args, env = {}, { safeDirectories = [] } = {
     throw new Error(`git ${args.join(" ")} failed: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-800)}`);
   }
   return result.stdout.trim();
+}
+
+export function materializeExactSubjectReadOnlyRepositoryView({
+  sourceRepoDir,
+  sourceSubject,
+  destination,
+  sourceEnv = {},
+  invalidSubjectMessage = "read-only repository subject must be a commit or tree",
+}) {
+  rmSync(destination, { recursive: true, force: true });
+  const subject = runRootGit(sourceRepoDir, ["rev-parse", sourceSubject], sourceEnv);
+  const objectType = runRootGit(sourceRepoDir, ["cat-file", "-t", subject], sourceEnv);
+  if (objectType !== "commit" && objectType !== "tree") throw new Error(invalidSubjectMessage);
+
+  mkdirSync(destination, { recursive: true, mode: 0o755 });
+  runRootGit(destination, ["init", "--quiet"]);
+  const packDir = pathInside(pathInside(destination, ".git"), "objects/pack");
+  mkdirSync(packDir, { recursive: true, mode: 0o755 });
+  packReachableBaseObjects(sourceRepoDir, join(packDir, "authorized"), subject, sourceEnv);
+  if (objectType === "commit") {
+    runRootGit(destination, ["switch", "--quiet", "--detach", subject]);
+  } else {
+    runRootGit(destination, ["read-tree", subject]);
+    runRootGit(destination, ["checkout-index", "--all", "--force"]);
+  }
+  runRootGit(destination, ["config", "remote.origin.url", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
+  runRootGit(destination, ["config", "remote.origin.pushurl", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
+  chmodReadOnlyPreservingExecuteTree(destination);
+  return destination;
 }
 
 export function prepareRootReadOnlyDirectory(path) {

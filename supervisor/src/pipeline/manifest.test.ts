@@ -4,6 +4,7 @@ import {
   canonicalJson,
   digestNormalized,
   compileAutomaticManifest,
+  isAutomaticManifest,
   loadPipelineCatalog,
   parsePipelineManifest,
   parseRepositoryConfig,
@@ -188,6 +189,19 @@ const CORE_AUTOMATIC_V1_STAGE_IDS = [
 ];
 
 describe("pipeline manifest validation", () => {
+  it("recognizes only the automatic template and its content-addressed derivatives", () => {
+    expect(isAutomaticManifest("core/automatic")).toBe(true);
+    expect(isAutomaticManifest("core/automatic/identity")).toBe(true);
+    expect(isAutomaticManifest("core/automatically")).toBe(false);
+    expect(isAutomaticManifest({ id: "compiled/custom", template: {
+      id: "core/automatic",
+      version: 1,
+      digest: "a".repeat(64),
+      compiler: "automatic/v1",
+      identity_digest: "b".repeat(64),
+    } })).toBe(true);
+  });
+
   it("loads the shipped catalog deterministically against independent runtime evidence", () => {
     const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
     const runtime = buildInstalledRuntimeDescriptor("test-runtime/v1");
