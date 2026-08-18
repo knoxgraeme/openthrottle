@@ -3207,6 +3207,81 @@ describe("execution unit store", () => {
     expect(store.listDownstreamContext("attempt-parent", "b")).toHaveLength(1);
   });
 
+  it("persists downstream context before a structured checkpoint acknowledgement", () => {
+    const store = setup();
+    db!.prepare(`
+      INSERT INTO pipeline_task_branches (
+        pipeline_instance_id, ticket_id, generation, repository, branch,
+        plan_digest, lineage, base_sha, acknowledged_remote_sha,
+        status, created_at, updated_at
+      ) VALUES ('instance-1', 'issue-1', 1, 'owner/repo', 'ot/ope-1', ?, ?, ?, ?, 'reserved', ?, ?)
+    `).run("1".repeat(64), "2".repeat(64), "a".repeat(40), "a".repeat(40), timestamp, timestamp);
+    store.createGraph({
+      pipelineInstanceId: "instance-1",
+      parentAttemptId: "attempt-parent",
+      parentStageId: "units",
+      parentRunId: "run-parent",
+      graphDigest: "graph-digest",
+      planDigest: "plan-digest",
+      units: [{ id: "a" }, { id: "b", dependencies: ["a"] }],
+      unitPhaseBindings: unitPhaseBindings(),
+    });
+    const subject = "3".repeat(40);
+    const implement = lease(store);
+    store.completeUnitAction({
+      actionId: implement.id,
+      resultHash: "r-implement-checkpoint-context",
+      outputSubject: subject,
+      receipt: receiptJson("unit_completion", {
+        payload: { downstream_context: [{ unit_id: "b", summary: "handoff" }] },
+      }),
+    });
+    const candidate = lease(store);
+    store.completeUnitAction({
+      actionId: candidate.id,
+      resultHash: "r-candidate-checkpoint-context",
+      outputSubject: subject,
+      receipt: receiptJson("candidate_evidence"),
+    });
+    const leadAction = lease(store);
+    store.completeGatedAction({
+      actionId: leadAction.id,
+      resultHash: "r-lead-checkpoint-context",
+      outputSubject: subject,
+      receipt: receiptJson("unit_decision"),
+      decision: gateDecision({ gateKind: "unit_acceptance", outcome: "success", subject }),
+    });
+    const integrate = lease(store);
+    const payload = Buffer.from("checkpoint-with-context");
+    store.completeGatedAction({
+      actionId: integrate.id,
+      resultHash: "r-integrate-checkpoint-context",
+      outputSubject: subject,
+      decision: gateDecision({ gateKind: "integration", outcome: "success", subject }),
+      checkpointObject: {
+        schema: "openthrottle.git-checkpoint-object/v1",
+        expectedOldSha: "a".repeat(40),
+        expectedNewSha: subject,
+        payloadSha256: createHash("sha256").update(payload).digest("hex"),
+        payloadBytes: payload.byteLength,
+        payload,
+      },
+    });
+
+    expect(store.listDownstreamContext("attempt-parent", "b")).toHaveLength(1);
+    expect(store.listUnits("attempt-parent")[0]).toMatchObject({
+      unitId: "a",
+      status: "integrated",
+      terminalLevel: null,
+    });
+    expect(store.leaseNextUnitAction({
+      parentAttemptId: "attempt-parent",
+      leaseOwner: "worker-2",
+      nowIso: timestamp,
+      leaseUntilIso: "2026-07-29T00:01:00.000Z",
+    })).toBeUndefined();
+  });
+
   it("fails integration transactionally when receipt-authored downstream targets are invalid", () => {
     for (const [name, target] of [
       ["unknown", "missing"],

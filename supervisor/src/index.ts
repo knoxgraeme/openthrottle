@@ -31,6 +31,7 @@ import {
   compareAndAdvanceRepositoryRef,
   createRepositoryRef,
   listFailedRepositoryWebhookDeliveries,
+  publishRepositoryTaskBranch,
   reconcileRepositoryWebhook,
   redeliverRepositoryWebhookDelivery,
 } from "./providers/github/client.js";
@@ -99,6 +100,9 @@ async function main() {
       compareAndAdvanceRef: (input) => input.checkpointObject
         ? pushRepositoryCheckpoint({ token: cfg.githubToken }, { ...input, checkpointObject: input.checkpointObject })
         : compareAndAdvanceRepositoryRef({ token: cfg.githubToken }, input),
+    },
+    repositoryPublisher: {
+      publishTaskBranch: (input) => publishRepositoryTaskBranch({ token: cfg.githubToken }, input),
     },
     taskTimeoutSeconds: cfg.taskTimeout,
     reviewFanoutConcurrency: cfg.reviewFanoutConcurrency ?? 3,
@@ -223,7 +227,7 @@ async function main() {
             plan: params.plan,
           });
         },
-        postStageResult: async (event, observedSubject) => {
+        postStageResult: async (event, observedSubject, checkpointObject) => {
           completeStageAttemptActor(
             pipelineStore,
             store,
@@ -243,7 +247,7 @@ async function main() {
               ...(event.fault_reason ? { faultReason: event.fault_reason } : {}),
               artifacts: event.artifacts,
             },
-            { observedSubject }
+            { observedSubject, checkpointObject }
           );
           await pipelineEffectProcessor.drain();
         },

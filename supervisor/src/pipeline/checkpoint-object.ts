@@ -15,6 +15,7 @@ export interface GitCheckpointObject {
   schema: typeof GIT_CHECKPOINT_OBJECT_SCHEMA;
   expectedOldSha: string;
   expectedNewSha: string;
+  expectedTreeSha?: string;
   payloadSha256: string;
   payloadBytes: number;
   payload: Uint8Array;
@@ -22,5 +23,5 @@ export interface GitCheckpointObject {
 
 export type GitCheckpointPayload = Pick<
   GitCheckpointObject,
-  "payload" | "payloadBytes" | "payloadSha256"
+  "payload" | "payloadBytes" | "payloadSha256" | "expectedTreeSha"
 >;

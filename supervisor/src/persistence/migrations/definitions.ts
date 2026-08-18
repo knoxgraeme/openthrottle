@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { PipelineInstance } from "../../pipeline/store.js";
+import { canonicalJson, digestNormalized } from "../../pipeline/manifest.js";
 import { persistSelectionPublications } from "../pipeline/helpers.js";
 
 interface DatabaseMigrationDefinition {
@@ -3247,7 +3248,108 @@ CREATE INDEX IF NOT EXISTS pipeline_task_branches_status_idx
 const taskBranchCheckpointMigrationSource = `${taskBranchCheckpointSchema}
 task-branch-contract:write-capable pipeline instances reserve one supervisor-owned remote ref at the exact sealed base before runtime provisioning/v1
 checkpoint-contract:accepted integration, acknowledged remote head, and published status are separate lineage-fenced durable values/v1
-effect-contract:create and compare-and-advance ref operations use the ordered leased pipeline effect queue and never force-update/v1`;
+effect-contract:create and compare-and-advance ref operations use the ordered leased pipeline effect queue and never force-update/v1
+backfill-contract:nonterminal pre-v53 write-capable instances receive a pending exact-base branch or recover their exact durable published commit before continuation/v2
+deployment-policy:deploy-forward-only/operator-authorized/v1`;
+
+function backfillActiveTaskBranches(db: Database.Database): void {
+  if (!hasTable(db, "pipeline_instances") || !hasTable(db, "pipeline_task_branches")) return;
+  const requiredColumns = [
+    "id", "ticket_id", "generation", "repository", "branch", "manifest_digest",
+    "normalized_manifest", "base_commit", "published_commit", "created_at", "updated_at",
+  ];
+  if (!hasColumns(db, "pipeline_instances", requiredColumns)) return;
+  const rows = db.prepare(`
+    SELECT id, ticket_id, generation, repository, branch, manifest_digest,
+           normalized_manifest, base_commit, published_commit, created_at, updated_at
+    FROM pipeline_instances
+    WHERE status NOT IN ('shipped', 'no_change', 'needs_human', 'canceled', 'superseded', 'failed')
+      AND NOT EXISTS (
+        SELECT 1 FROM pipeline_task_branches branch
+        WHERE branch.pipeline_instance_id = pipeline_instances.id
+      )
+  `).all() as Array<{
+    id: string;
+    ticket_id: string;
+    generation: number;
+    repository: string;
+    branch: string | null;
+    manifest_digest: string;
+    normalized_manifest: string;
+    base_commit: string;
+    published_commit: string | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+  for (const row of rows) {
+    const manifest = JSON.parse(row.normalized_manifest) as {
+      stages?: Array<{ credentials?: unknown }>;
+    };
+    const writeCapable = manifest.stages?.some((stage) =>
+      Array.isArray(stage.credentials) && stage.credentials.includes("repo.write")
+    ) ?? false;
+    if (!writeCapable) continue;
+    if (!row.branch || !row.branch.startsWith("ot/") || !/^[a-f0-9]{40}$/.test(row.base_commit) ||
+        !/^[a-f0-9]{64}$/.test(row.manifest_digest)) {
+      throw new Error(`active write-capable pipeline ${row.id} cannot be fenced during task-branch migration`);
+    }
+    const planDigest = row.manifest_digest;
+    const lineage = digestNormalized(canonicalJson({
+      ticketId: row.ticket_id,
+      pipelineInstanceId: row.id,
+      generation: row.generation,
+      planDigest,
+      baseSha: row.base_commit,
+    }));
+    const recoveredPublishedCommit = row.published_commit && /^[a-f0-9]{40}$/.test(row.published_commit)
+      ? row.published_commit
+      : null;
+    db.prepare(`
+      INSERT INTO pipeline_task_branches (
+        pipeline_instance_id, ticket_id, generation, repository, branch,
+        plan_digest, lineage, base_sha, accepted_integration_sha,
+        acknowledged_remote_sha, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      row.id, row.ticket_id, row.generation, row.repository, row.branch,
+      planDigest, lineage, row.base_commit,
+      recoveredPublishedCommit, recoveredPublishedCommit,
+      recoveredPublishedCommit ? "published" : "pending",
+      row.created_at, row.updated_at
+    );
+    // A legacy publication already has durable provider identity and an exact
+    // published commit. Reconstruct that checkpoint directly so provider
+    // evidence can finish the run; creating the branch again at base would
+    // conflict with the already-published remote head forever.
+    if (recoveredPublishedCommit) continue;
+    const payload = canonicalJson({
+      schema: "openthrottle.task-branch-effect/v1",
+      pipelineInstanceId: row.id,
+      ticketId: row.ticket_id,
+      generation: row.generation,
+      repository: row.repository,
+      ref: `refs/heads/${row.branch}`,
+      planDigest,
+      lineage,
+      expectedOldSha: null,
+      expectedNewSha: row.base_commit,
+    });
+    db.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, next_attempt_at, created_at
+      ) VALUES (?, ?, 1, 'create_task_branch', ?, ?, ?, 'pending', ?, ?)
+    `).run(
+      `effect-${digestNormalized(canonicalJson([row.id, 1, "create_task_branch", lineage])).slice(0, 32)}`,
+      row.id,
+      `create-task-branch:${lineage}:${row.base_commit}`,
+      payload,
+      digestNormalized(payload),
+      row.updated_at,
+      row.updated_at
+    );
+  }
+}
 
 const structuredCheckpointLedgerSchema = `
 ALTER TABLE execution_work_attempts ADD COLUMN checkpoint_expected_old_sha TEXT
@@ -3281,6 +3383,25 @@ CREATE TABLE IF NOT EXISTS execution_checkpoint_objects (
 const structuredCheckpointLedgerMigrationSource = `${structuredCheckpointLedgerSchema}
 structured-checkpoint-contract:each accepted integration records its expected old head, exact integrated commit, effect identity, and acknowledgement on the integration action/v1
 dependency-gate-contract:structured scheduling waits for the current supervisor-owned remote checkpoint acknowledgement before advancing the durable unit frontier/v1`;
+
+const ordinaryStageCheckpointObjectSchema = `
+CREATE TABLE IF NOT EXISTS pipeline_stage_checkpoint_objects (
+  attempt_id TEXT PRIMARY KEY REFERENCES pipeline_stage_attempts(id) ON DELETE RESTRICT,
+  effect_id TEXT NOT NULL UNIQUE,
+  expected_tree_sha TEXT NOT NULL CHECK(length(expected_tree_sha) BETWEEN 40 AND 64 AND expected_tree_sha NOT GLOB '*[^a-f0-9]*'),
+  expected_old_sha TEXT NOT NULL CHECK(length(expected_old_sha) = 40 AND expected_old_sha NOT GLOB '*[^a-f0-9]*'),
+  expected_new_sha TEXT NOT NULL CHECK(length(expected_new_sha) = 40 AND expected_new_sha NOT GLOB '*[^a-f0-9]*'),
+  payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^a-f0-9]*'),
+  payload_bytes INTEGER NOT NULL CHECK(payload_bytes BETWEEN 1 AND 67108864),
+  payload BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  CHECK(expected_old_sha <> expected_new_sha),
+  CHECK(length(payload) = payload_bytes)
+);
+`;
+
+const ordinaryStageCheckpointObjectMigrationSource = `${ordinaryStageCheckpointObjectSchema}
+ordinary-stage-checkpoint-contract:the accepted tree remains the stage subject while its deterministic commit bundle is stored outside inbox event JSON and queued atomically with the branch advance/v1`;
 
 const definitions: DatabaseMigrationDefinition[] = [
   {
@@ -3874,6 +3995,7 @@ const definitions: DatabaseMigrationDefinition[] = [
         const branchTableStart = taskBranchCheckpointSchema.indexOf("CREATE TABLE pipeline_task_branches");
         db.exec(taskBranchCheckpointSchema.slice(branchTableStart));
       }
+      backfillActiveTaskBranches(db);
     },
   },
   {
@@ -3885,6 +4007,16 @@ const definitions: DatabaseMigrationDefinition[] = [
           !hasColumns(db, "execution_work_attempts", ["id", "parent_attempt_id", "completed_at"])) return;
       if (!hasColumns(db, "execution_work_attempts", ["checkpoint_expected_old_sha"])) {
         db.exec(structuredCheckpointLedgerSchema);
+      }
+    },
+  },
+  {
+    version: 55,
+    name: "ordinary-stage-checkpoint-objects [rollback-compatible:additive/v1]",
+    source: ordinaryStageCheckpointObjectMigrationSource,
+    up(db) {
+      if (!hasTable(db, "pipeline_stage_checkpoint_objects")) {
+        db.exec(ordinaryStageCheckpointObjectSchema);
       }
     },
   },

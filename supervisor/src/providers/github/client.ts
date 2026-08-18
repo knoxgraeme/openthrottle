@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { RepositoryRefConflictError, type ControlThreadEvent } from "../../app/ports.js";
 import { reduceStream, readStreamUpToByteLimit } from "../../shared/bounded-stream.js";
 import { assertGithubResponseOk, githubApiResponse } from "../../shared/github-request.js";
@@ -23,6 +23,7 @@ export function verifyGithubSignature(
 interface GithubPullRequest {
   number: number;
   html_url: string;
+  body?: string | null;
   merged?: boolean;
   updated_at?: string;
   head: { ref: string; sha?: string; repo: { full_name: string } };
@@ -1079,6 +1080,11 @@ async function getRepositoryRef(
   return sha;
 }
 
+function taskRefOwnershipLock(ref: string): string {
+  const digest = createHash("sha256").update(ref).digest("hex");
+  return `refs/tags/openthrottle-task-branches/${digest}`;
+}
+
 export async function createRepositoryRef(
   client: GithubClient,
   input: {
@@ -1089,12 +1095,27 @@ export async function createRepositoryRef(
   }
 ): Promise<{ sha: string }> {
   assertTaskRefInput(input.ref, input.expectedNewSha);
-  const current = await getRepositoryRef(client, input.repository, input.ref);
-  if (current !== undefined) {
-    if (input.allowExisting && current === input.expectedNewSha) return { sha: current };
-    throw new RepositoryRefConflictError(
-      `repository ref conflict: ${input.ref} already exists at ${current}`
-    );
+  const ownershipRef = taskRefOwnershipLock(input.ref);
+  let ownedBeforeAttempt = false;
+  const lockResponse = await githubApiResponse(client, `/repos/${input.repository}/git/refs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ref: ownershipRef, sha: input.expectedNewSha }),
+  });
+  if (lockResponse.status === 422) {
+    const lockSha = await getRepositoryRef(client, input.repository, ownershipRef);
+    if (!input.allowExisting || lockSha !== input.expectedNewSha) {
+      throw new RepositoryRefConflictError(
+        `repository ref conflict: ownership lock for ${input.ref} is missing or does not match`
+      );
+    }
+    ownedBeforeAttempt = true;
+  } else {
+    await assertGithubResponseOk(lockResponse);
+    const lock = await lockResponse.json() as { object?: { sha?: unknown } };
+    if (lock.object?.sha !== input.expectedNewSha) {
+      throw new Error("GitHub created the task ref ownership lock at an unexpected SHA");
+    }
   }
   const response = await githubApiResponse(client, `/repos/${input.repository}/git/refs`, {
     method: "POST",
@@ -1103,7 +1124,7 @@ export async function createRepositoryRef(
   });
   if (response.status === 422) {
     const raced = await getRepositoryRef(client, input.repository, input.ref);
-    if (input.allowExisting && raced === input.expectedNewSha) return { sha: raced };
+    if (ownedBeforeAttempt && raced === input.expectedNewSha) return { sha: raced };
     throw new RepositoryRefConflictError(`repository ref conflict: ${input.ref} was created concurrently`);
   }
   await assertGithubResponseOk(response);
@@ -1156,6 +1177,92 @@ export async function compareAndAdvanceRepositoryRef(
     throw new Error("GitHub advanced the task ref to an unexpected SHA");
   }
   return { sha: input.expectedNewSha };
+}
+
+export async function publishRepositoryTaskBranch(
+  client: GithubClient,
+  input: {
+    repository: string;
+    branch: string;
+    baseBranch: string;
+    expectedHeadSha: string;
+    title: string;
+    body: string;
+    ownershipMarker: string;
+  }
+): Promise<{ sha: string; url: string }> {
+  assertTaskRefInput(`refs/heads/${input.branch}`, input.expectedHeadSha);
+  assertTaskRefInput(`refs/heads/${input.baseBranch}`, input.expectedHeadSha);
+  if (!/^[a-z0-9:_-]{16,200}$/.test(input.ownershipMarker)) {
+    throw new Error("GitHub publication ownership marker is invalid");
+  }
+  if (input.title.length < 1 || input.title.length > 256 || input.body.length > 32_000) {
+    throw new Error("GitHub publication title or body exceeds its bound");
+  }
+  const remoteHead = await getRepositoryRef(
+    client,
+    input.repository,
+    `refs/heads/${input.branch}`
+  );
+  if (remoteHead !== input.expectedHeadSha) {
+    throw new RepositoryRefConflictError(
+      `repository ref conflict: refs/heads/${input.branch} expected ${input.expectedHeadSha} but found ${remoteHead ?? "missing"}`
+    );
+  }
+  const [owner] = input.repository.split("/");
+  if (!owner) throw new Error("GitHub publication repository is invalid");
+  const query = new URLSearchParams({
+    state: "open",
+    head: `${owner}:${input.branch}`,
+    base: input.baseBranch,
+    per_page: "10",
+  });
+  const listOwned = async (): Promise<GithubPullRequest | undefined> => {
+    const pulls = await githubRequest<GithubPullRequest[]>(
+      client,
+      `/repos/${input.repository}/pulls?${query.toString()}`
+    );
+    const matching = pulls.filter((pull) =>
+      pull.head.ref === input.branch &&
+      pull.head.repo.full_name.toLowerCase() === input.repository.toLowerCase() &&
+      pull.base.ref === input.baseBranch
+    );
+    if (matching.length > 1) {
+      throw new RepositoryRefConflictError("multiple open pull requests target the task branch");
+    }
+    const existing = matching[0];
+    if (!existing) return undefined;
+    if (existing.head.sha !== input.expectedHeadSha || !existing.body?.includes(input.ownershipMarker)) {
+      throw new RepositoryRefConflictError("an unowned or stale pull request already targets the task branch");
+    }
+    return existing;
+  };
+  const existing = await listOwned();
+  if (existing) return { sha: input.expectedHeadSha, url: existing.html_url };
+  const response = await githubApiResponse(client, `/repos/${input.repository}/pulls`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title: input.title,
+      body: `${input.body.trimEnd()}\n\n<!-- ${input.ownershipMarker} -->\n`,
+      head: input.branch,
+      base: input.baseBranch,
+    }),
+  });
+  if (response.status === 422) {
+    const raced = await listOwned();
+    if (raced) return { sha: input.expectedHeadSha, url: raced.html_url };
+    throw new RepositoryRefConflictError("pull request creation conflicted without owned retry evidence");
+  }
+  await assertGithubResponseOk(response);
+  const created = await response.json() as GithubPullRequest;
+  if (created.head.sha !== input.expectedHeadSha || created.head.ref !== input.branch ||
+      created.base.ref !== input.baseBranch ||
+      created.head.repo.full_name.toLowerCase() !== input.repository.toLowerCase() ||
+      !created.body?.includes(input.ownershipMarker)) {
+    throw new Error("GitHub created a pull request with an unexpected publication fence");
+  }
+  return { sha: input.expectedHeadSha, url: created.html_url };
 }
 
 export interface RepositoryConfigAtCommit {

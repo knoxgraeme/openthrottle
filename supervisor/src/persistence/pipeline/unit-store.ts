@@ -1249,8 +1249,13 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
             checkpointObject: input.checkpointObject,
             timestamp,
           });
-          db.prepare(`UPDATE execution_units SET integration_subject = ?, updated_at = ? WHERE id = ?`)
-            .run(input.decision.subject, timestamp, unitRow.id);
+          db.prepare(`
+            UPDATE execution_units
+            SET integration_subject = ?,
+                status = CASE WHEN ? = 1 THEN 'integrated' ELSE status END,
+                updated_at = ?
+            WHERE id = ?
+          `).run(input.decision.subject, checkpointPending ? 1 : 0, timestamp, unitRow.id);
           db.prepare(`UPDATE execution_graphs SET integration_subject = ?, updated_at = ? WHERE parent_attempt_id = ?`)
             .run(input.decision.subject, timestamp, completedAction.parent_attempt_id);
           if (!checkpointPending) {

@@ -1,9 +1,14 @@
 ---
 name: publish
-description: Publishes one already-gated OpenThrottle subject as a branch push and pull request in a single sealed stage.
+description: Compatibility adapter for publishing one already-gated OpenThrottle subject from legacy sealed runtimes.
 ---
 
 # Publish the gated subject
+
+> Compatibility boundary: current supervisors checkpoint the accepted commit,
+> push the task branch, and create or reuse the pull request themselves. They do
+> not dispatch this skill. It remains packaged so a rolling deployment can
+> finish a publication stage admitted by the previous supervisor release.
 
 This is one sealed publication stage with capability `ce/publish@1`.
 Implementation, review, simplification, the repository `test`/`lint`/`build`

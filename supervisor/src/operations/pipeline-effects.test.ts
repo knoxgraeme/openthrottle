@@ -225,7 +225,10 @@ describe("pipeline effect processor", () => {
       now: () => new Date("2099-07-22T12:00:00.000Z"),
     });
     const instance = pipelines.getInstanceForSession("session-branch")!;
-    return { pipelines, tickets, runtime, processor, instance, repositoryWriter };
+    return {
+      pipelines, tickets, runtime, processor, instance, repositoryWriter,
+      manifest, config, runtimeDescriptor,
+    };
   }
 
   function harness(
@@ -530,6 +533,85 @@ describe("pipeline effect processor", () => {
       expect.objectContaining({ kind: "create_task_branch", status: "dead", attempts: 1 }),
       expect.objectContaining({ kind: "provision", status: "pending", attempts: 0 }),
     ]));
+  });
+
+  it("processes checkpoint branch advances serially under the supervisor memory bound", async () => {
+    let active = 0;
+    let maximumActive = 0;
+    const repositoryWriter = {
+      createRef: vi.fn(async (input: { expectedNewSha: string }) => ({ sha: input.expectedNewSha })),
+      compareAndAdvanceRef: vi.fn(async (input: { expectedNewSha: string }) => {
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        await Promise.resolve();
+        active -= 1;
+        return { sha: input.expectedNewSha };
+      }),
+    };
+    const harness = writableHarness(repositoryWriter);
+    const { pipelines, tickets, manifest, config, runtimeDescriptor } = harness;
+    tickets.upsert({
+      ticket_id: "issue-branch-2",
+      ticket_reference: "OT-BRANCH-2",
+      session_id: "session-branch-2",
+      sandbox_id: null,
+      branch: "ot/branch-lineage-2",
+      agent: "codex",
+      repo: "owner/repo",
+      pr_url: null,
+      state: "active",
+      pipeline: {
+        repository: "owner/repo",
+        baseCommit: "a".repeat(40),
+        manifest,
+        repositoryConfig: config,
+        runtime: runtimeDescriptor,
+        authorizedCapabilities: manifest.manifest.requires.capabilities,
+        taskType: "implement",
+        planDigest: "f".repeat(64),
+      },
+    });
+    const instances = [
+      harness.instance,
+      pipelines.getInstanceForSession("session-branch-2")!,
+    ];
+    const creates = pipelines.claimEffects(
+      "2099-07-22T12:00:00.000Z", "2099-07-22T12:01:00.000Z", 8
+    );
+    expect(creates).toHaveLength(2);
+    for (const effect of creates) {
+      pipelines.recordEffectAcknowledgement({
+        effectId: effect.id,
+        eventId: `ack-${effect.id}`,
+        payload: canonicalJson({ sha: "a".repeat(40) }),
+      });
+    }
+    const provisions = pipelines.claimEffects(
+      "2099-07-22T12:02:00.000Z", "2099-07-22T12:03:00.000Z", 8
+    );
+    expect(provisions).toHaveLength(2);
+    for (const effect of provisions) {
+      pipelines.recordEffectAcknowledgement({
+        effectId: effect.id,
+        eventId: `ack-${effect.id}`,
+        payload: canonicalJson({ providerResourceId: `sandbox-${effect.pipeline_instance_id}` }),
+      });
+    }
+    instances.forEach((instance, index) => {
+      const branch = pipelines.getTaskBranch(instance.id)!;
+      pipelines.queueTaskBranchAdvance({
+        instanceId: instance.id,
+        generation: instance.generation,
+        lineage: branch.lineage,
+        expectedOldSha: "a".repeat(40),
+        expectedNewSha: String(index + 1).repeat(40),
+      });
+    });
+
+    await harness.processor.drain();
+
+    expect(repositoryWriter.compareAndAdvanceRef).toHaveBeenCalledTimes(2);
+    expect(maximumActive).toBe(1);
   });
 
   it("provisions, seals, credentials, and dispatches the first stage exactly through the durable intent", async () => {
@@ -1184,11 +1266,18 @@ describe("pipeline effect processor", () => {
     const attempt = pipelines.getActiveAttempt(instance.id)!;
     const runtime = sandboxRuntimeMock({ issueId: "child-drain" });
     const repositoryWriter = repositoryWriterMock();
+    const repositoryPublisher = {
+      publishTaskBranch: vi.fn(async (input: { expectedHeadSha: string }) => ({
+        sha: input.expectedHeadSha,
+        url: "https://github.com/owner/repo/pull/187",
+      })),
+    };
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
       runtime,
       repositoryWriter,
+      repositoryPublisher,
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -1675,6 +1764,7 @@ describe("pipeline effect processor", () => {
       tickets,
       runtime,
       repositoryWriter: repositoryWriterMock(),
+      repositoryPublisher,
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -2169,6 +2259,27 @@ describe("pipeline effect processor", () => {
       capability: "ce/publish@1",
       expectedSubject: finalIntegratedTreeSubject,
       contextPolicy: "resume_required",
+    });
+
+    const dispatchCallsBeforePublish = runtime.dispatchStage.mock.calls.length;
+    await processor.drain();
+    expect(repositoryPublisher.publishTaskBranch).toHaveBeenCalledWith(expect.objectContaining({
+      repository: "owner/repo",
+      branch: "ot/child-drain",
+      baseBranch: "main",
+      expectedHeadSha: finalIntegratedSubject,
+      ownershipMarker: expect.stringMatching(/^openthrottle:publish:[a-f0-9]{64}$/),
+    }));
+    expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforePublish);
+    expect(tickets.getByIssueId(instance.ticket_id)?.pr_url).toBe("https://github.com/owner/repo/pull/187");
+    expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
+      status: "published",
+      acknowledged_remote_sha: finalIntegratedSubject,
+    });
+    expect(pipelines.getInstance(instance.id)).toMatchObject({
+      status: "waiting_provider",
+      published_commit: finalIntegratedSubject,
+      published_subject: finalIntegratedTreeSubject,
     });
   });
 

@@ -10,6 +10,7 @@ interface CheckpointRow {
   effect_id: string;
   expected_old_sha: string;
   expected_new_sha: string;
+  expected_tree_sha: string | null;
   payload_sha256: string;
   payload_bytes: number;
   payload: Buffer;
@@ -22,6 +23,7 @@ function checkpointObject(row: CheckpointRow | undefined): DurableExecutionCheck
     effectId: row.effect_id,
     expectedOldSha: row.expected_old_sha,
     expectedNewSha: row.expected_new_sha,
+    ...(row.expected_tree_sha ? { expectedTreeSha: row.expected_tree_sha } : {}),
     payloadSha256: row.payload_sha256,
     payloadBytes: row.payload_bytes,
     payload: row.payload,
@@ -33,6 +35,7 @@ export function createCheckpointStore(db: Database.Database): Pick<ExecutionUnit
     getCheckpointObject(effectId) {
       const structured = db.prepare(`
         SELECT action_id, effect_id, expected_old_sha, expected_new_sha,
+               NULL AS expected_tree_sha,
                payload_sha256, payload_bytes, payload
         FROM execution_checkpoint_objects
         WHERE effect_id = ?
@@ -40,6 +43,7 @@ export function createCheckpointStore(db: Database.Database): Pick<ExecutionUnit
       if (structured) return checkpointObject(structured);
       const ordinary = db.prepare(`
         SELECT attempt_id AS action_id, effect_id, expected_old_sha, expected_new_sha,
+               expected_tree_sha,
                payload_sha256, payload_bytes, payload
         FROM pipeline_stage_checkpoint_objects
         WHERE effect_id = ?

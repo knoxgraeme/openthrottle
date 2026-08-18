@@ -736,8 +736,13 @@ integration and acknowledged remote SHAs. Neither state creates a pull request,
 enters `waiting_provider`, satisfies review/check/workflow gates, nor populates
 published commit/PR status. `published` is a later, explicit publication state,
 not an alias for successful ref creation or advancement. The publish-stage
-transition atomically promotes only the exact checkpoint it published; entry
-to `waiting_provider` and provider gate receipts require that promoted binding.
+effect verifies the acknowledged remote commit, creates or reuses one
+lineage-marked pull request through the supervisor GitHub credential, and
+atomically promotes only that exact checkpoint. The workspace tree remains the
+gated stage subject while the remote commit is recorded separately as provider
+revision. Git transport rejects the bounded object unless that commit contains
+the exact gate-accepted tree, including on lost-ack replay. Entry to
+`waiting_provider` and provider gate receipts require that promoted binding.
 
 Linear issue workflow state is a side-effect projection of the run lifecycle,
 not coordinator authority. Workflow states are resolved dynamically from the
@@ -908,11 +913,11 @@ SQLite is the authority. Core tables include:
 - fenced execution: `pipeline_stage_attempts`, `pipeline_inbox_events`;
 - evidence/effects: `pipeline_artifacts`, `pipeline_gate_receipts`,
   `pipeline_publication_receipts`, `pipeline_effect_intents`,
-  `pipeline_task_branches`;
+  `pipeline_task_branches`, `pipeline_stage_checkpoint_objects`;
 - structured child execution: `execution_graphs`, `execution_units`,
   `execution_work_attempts`, `execution_review_subaction_dispatches`, `execution_gate_receipts`,
   `execution_downstream_context`, `execution_publication_events`,
-  `execution_work_private_artifacts`;
+  `execution_work_private_artifacts`, `execution_checkpoint_objects`;
 - cross-run orchestration history: `orchestration_journal`;
 - settlement rollup measurement corpus: `run_outcomes`;
 - operations: `repository_registrations`, `supervisor_leases`, `settings`,

@@ -1,5 +1,5 @@
 import type { Ticket, SupervisorStore } from "../persistence/store.js";
-import type { RepositoryRefWritePort } from "../app/ports.js";
+import type { RepositoryPublicationPort, RepositoryRefWritePort } from "../app/ports.js";
 import type { CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import { stageById } from "../pipeline/manifest.js";
@@ -110,6 +110,7 @@ interface PipelineEffectProcessorDeps {
   tickets: SupervisorStore;
   runtime: SandboxRuntime & SandboxAutostopRuntime;
   repositoryWriter: RepositoryRefWritePort;
+  repositoryPublisher?: RepositoryPublicationPort;
   taskTimeoutSeconds: number;
   /** Maximum concurrently active review-persona subactions. Defaults to 1 in test harnesses. */
   reviewFanoutConcurrency?: number;
@@ -511,10 +512,14 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     outcome: "success" | "failure" | "no_change" | "needs_human";
     summary: string;
     details: Record<string, unknown>;
+    kind?: "stage_result" | "publish_subject";
+    assurance?: "executor_verified" | "semantic_attested";
   }) => {
+    const kind = input.kind ?? "stage_result";
+    const assurance = input.assurance ?? "executor_verified";
     const payload = canonicalJson({
-      schema: "openthrottle.artifact/stage_result@1",
-      kind: "stage_result",
+      schema: `openthrottle.artifact/${kind}@1`,
+      kind,
       producer: {
         capability: input.request.capability,
         runtime_release: input.request.runtimeRelease,
@@ -534,7 +539,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         ticket_id: input.instance.ticket_id,
         session_id: input.instance.session_id,
         generation: input.instance.generation,
-        native_session_id: null,
+        native_session_id: input.request.nativeSessionId,
       },
       repository: {
         name: input.instance.repository,
@@ -543,7 +548,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         pre_subject: input.request.expectedSubject ?? input.instance.base_commit,
         post_subject: input.request.expectedSubject ?? input.instance.base_commit,
       },
-      assurance: "executor_verified",
+      assurance,
       result: input.outcome,
       summary: input.summary,
       evidence: [], findings: [], actions: [], uncertainty: [],
@@ -551,13 +556,102 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       details: input.details,
     });
     return {
-      kind: "stage_result",
+      kind,
       schemaVersion: 1,
-      assurance: "executor_verified" as const,
+      assurance,
       subject: input.request.expectedSubject ?? input.instance.base_commit,
       payload,
       hash: digestNormalized(payload),
     };
+  };
+
+  const executeSupervisorPublishStage = async (
+    effect: PipelineEffectIntent,
+    instance: PipelineInstance,
+    request: StageRequestEnvelope
+  ): Promise<void> => {
+    if (!deps.repositoryPublisher) throw new Error("supervisor publication is not configured");
+    assertActiveAttempt(instance, request);
+    const ticket = deps.tickets.getByIssueId(instance.ticket_id);
+    if (!ticket || ticket.session_id !== instance.session_id) {
+      throw new Error(`pipeline instance ${instance.id} has no current ticket binding`);
+    }
+    const branch = deps.store.getTaskBranch(instance.id);
+    if (!branch || branch.status !== "checkpointed" || branch.acknowledged_remote_sha === null ||
+        branch.accepted_integration_sha !== branch.acknowledged_remote_sha) {
+      throw new Error(`pipeline publish stage ${request.attemptId} has no acknowledged task branch checkpoint`);
+    }
+    if (!ticket.run_id) {
+      const started = deps.tickets.beginRun({
+        issueId: instance.ticket_id,
+        runId: request.runId,
+        taskType: instance.task_type,
+        tokenHash: request.requestHash,
+        expiresAt: new Date(now().getTime() + deps.taskTimeoutSeconds * 1_000).toISOString(),
+      });
+      if (!started) throw new Error(`pipeline publish stage ${request.attemptId} could not acquire the ticket actor`);
+    }
+    deps.store.bindStageRun(request.attemptId, request.runId);
+    deps.store.markStageDispatched(request.attemptId);
+    // Provider-repair rounds publish the same task branch through new stage
+    // attempts. Bind PR ownership to the durable branch lineage so those
+    // attempts reuse the existing PR instead of mistaking it for an external
+    // publication.
+    const ownershipMarker = `openthrottle:publish:${branch.lineage}`;
+    const title = `fix: complete ${ticket.ticket_reference}`.slice(0, 72);
+    const publication = await deps.repositoryPublisher.publishTaskBranch({
+      repository: instance.repository,
+      branch: instance.branch,
+      baseBranch: ticket.base_branch,
+      expectedHeadSha: branch.acknowledged_remote_sha,
+      title,
+      body: [
+        `Publishes the exact subject accepted by OpenThrottle for ${ticket.ticket_reference}.`,
+        "",
+        "## OpenThrottle gates",
+        "",
+        "- [x] The sealed pipeline gates completed before publication.",
+      ].join("\n"),
+      ownershipMarker,
+    });
+    if (publication.sha !== branch.acknowledged_remote_sha) {
+      throw new Error(`pipeline publish stage ${request.attemptId} returned an unexpected commit`);
+    }
+    deps.tickets.setPrUrl(instance.ticket_id, publication.url);
+    const shared = {
+      request,
+      instance,
+      outcome: "success" as const,
+      assurance: "semantic_attested" as const,
+      summary: "Supervisor published the exact acknowledged task branch checkpoint.",
+      details: { published_commit: publication.sha, pull_request_url: publication.url },
+    };
+    const stageResult = supervisorArtifact(shared);
+    const publishSubject = supervisorArtifact({ ...shared, kind: "publish_subject" });
+    const event: PipelineCoordinatorEvent = {
+      id: `supervisor-publish-${request.attemptId}-${stageResult.hash.slice(0, 16)}`,
+      kind: "stage_result",
+      instanceId: instance.id,
+      generation: instance.generation,
+      runId: request.runId,
+      stageId: request.stageId,
+      attemptId: request.attemptId,
+      requestHash: request.requestHash,
+      outcome: "success",
+      resultHash: stageResult.hash,
+      subject: stageResult.subject,
+      providerRevision: publication.sha,
+      nativeSessionId: request.nativeSessionId,
+      artifacts: [stageResult, publishSubject],
+    };
+    completeStageAttemptActor(deps.store, deps.tickets, event, {
+      observedSubject: stageResult.subject,
+    });
+    acknowledgeEffect(effect, `${event.id}:effect-ack`, {
+      resultHash: stageResult.hash,
+      publishedCommit: publication.sha,
+      pullRequestUrl: publication.url,
+    });
   };
 
   const executeSupervisorTuneStage = (
@@ -754,6 +848,14 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
         if (!started) throw new Error(`pipeline supervisor stage ${request.attemptId} could not acquire the ticket actor`);
       }
       executeSupervisorTuneStage(effect, instance, request);
+      return;
+    }
+    if (request.capability === "ce/publish@1") {
+      if (effect.kind === "provision") {
+        acknowledgeEffect(effect, eventId, { providerDispatchId: `supervisor:${request.attemptId}` });
+        return;
+      }
+      await executeSupervisorPublishStage(effect, instance, request);
       return;
     }
     const resource = await resourceFor(instance);
@@ -1013,6 +1115,9 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
                 payload: checkpointObject.payload,
                 payloadBytes: checkpointObject.payloadBytes,
                 payloadSha256: checkpointObject.payloadSha256,
+                ...(checkpointObject.expectedTreeSha
+                  ? { expectedTreeSha: checkpointObject.expectedTreeSha }
+                  : {}),
               } } : {}),
             });
           })();
@@ -1185,6 +1290,16 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     }
   };
 
+  const processClaimedBatch = async (effects: PipelineEffectIntent[]): Promise<void> => {
+    if (effects.some((effect) =>
+      effect.kind === "create_task_branch" || effect.kind === "advance_task_branch"
+    )) {
+      for (const effect of effects) await processClaimed(effect);
+      return;
+    }
+    await Promise.all(effects.map(processClaimed));
+  };
+
   return {
     async drain() {
       if (draining) return;
@@ -1195,7 +1310,12 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           current.toISOString(),
           new Date(current.getTime() + EFFECT_LEASE_MS).toISOString()
         );
-        await Promise.all(effects.map(processClaimed));
+        // A checkpoint intent may materialize a 64 MiB SQLite BLOB and start
+        // a Git process. Keep those effects strictly serial under the 512 MiB
+        // supervisor envelope; ordinary effects retain the existing bounded
+        // fan-out. Branch batches are already ordered ahead of downstream
+        // dispatch by the store, so serial execution preserves semantics.
+        await processClaimedBatch(effects);
         // Branch effects are a pre-dispatch fence, not a scheduler tick of
         // latency. Once their durable acknowledgement commits, immediately
         // lease the now-unblocked provision/dispatch batch in this same drain.
@@ -1205,7 +1325,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
             current.toISOString(),
             new Date(current.getTime() + EFFECT_LEASE_MS).toISOString()
           );
-          await Promise.all(nextEffects.map(processClaimed));
+          await processClaimedBatch(nextEffects);
         }
         await drainActiveCompositeGraphs();
       } finally {

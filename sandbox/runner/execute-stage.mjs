@@ -1343,6 +1343,15 @@ export function commitStageResult(request, result, outputPath, { repoDir } = {})
       },
     };
     writeJsonAtomic(outputPath, event);
+    // Keep the long-lived sandbox checkout on the same commit frontier the
+    // supervisor will advance remotely. The tree is unchanged; --mixed moves
+    // only HEAD/the index so the next repo.write stage parents its checkpoint
+    // to this commit instead of forking again from checkpointParent.
+    runGitAsRepositoryOwner(repoDir, ["reset", "--mixed", checkpoint]);
+    if (runGitAsRepositoryOwner(repoDir, ["rev-parse", "HEAD"]) !== checkpoint ||
+        computeWorkspaceTreeOid(repoDir) !== result.subject) {
+      throw new Error("ordinary write checkpoint did not advance the local commit frontier");
+    }
     return event;
   } finally {
     try { runGitAsRepositoryOwner(repoDir, ["update-ref", "-d", checkpointRef]); } catch {}

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { canonicalJson, digestNormalized, type PipelineManifest } from "../../pipeline/manifest.js";
 import { parsePipelinePublication } from "../../pipeline/publication.js";
@@ -16,6 +17,10 @@ import {
 } from "./helpers.js";
 import { createJournalStore } from "./journal-store.js";
 import { createRunOutcomeStore } from "./run-outcome-store.js";
+import {
+  GIT_CHECKPOINT_OBJECT_SCHEMA,
+  MAX_GIT_CHECKPOINT_OBJECT_BYTES,
+} from "../../pipeline/checkpoint-object.js";
 
 const PUBLISH_CAPABILITY = "ce/publish@1";
 
@@ -196,6 +201,7 @@ export function createTransitionStore(db: Database.Database, now: () => string):
       event.payload_hash !== write.eventPayloadHash || event.status !== "pending"
     ) throw new Error(`pipeline inbox event ${write.eventId} fence mismatch`);
     const timestamp = now();
+    const nextVersion = instance.state_version + 1;
     if (write.exhaustedEffectId) {
       const exhausted = db.prepare(`
         UPDATE pipeline_effect_intents
@@ -219,6 +225,102 @@ export function createTransitionStore(db: Database.Database, now: () => string):
       WHERE id = ?
     `).run(attemptStatus, write.outcome, write.resultHash, timestamp, timestamp, attempt.id);
     wrote();
+    if (write.checkpointAdvance) {
+      const checkpoint = write.checkpointAdvance;
+      const object = checkpoint.object;
+      const source = object.payload;
+      const payload = Buffer.isBuffer(source)
+        ? source
+        : Buffer.from(source.buffer, source.byteOffset, source.byteLength);
+      if (checkpoint.generation !== instance.generation ||
+          !/^[a-f0-9]{64}$/.test(checkpoint.lineage) ||
+          !/^[a-f0-9]{40,64}$/.test(checkpoint.expectedTreeSha) ||
+          object.schema !== GIT_CHECKPOINT_OBJECT_SCHEMA ||
+          !/^[a-f0-9]{40}$/.test(object.expectedOldSha) ||
+          !/^[a-f0-9]{40}$/.test(object.expectedNewSha) ||
+          object.expectedOldSha === object.expectedNewSha ||
+          !Number.isSafeInteger(object.payloadBytes) || object.payloadBytes < 1 ||
+          object.payloadBytes > MAX_GIT_CHECKPOINT_OBJECT_BYTES ||
+          payload.byteLength !== object.payloadBytes ||
+          !/^[a-f0-9]{64}$/.test(object.payloadSha256) ||
+          createHash("sha256").update(payload).digest("hex") !== object.payloadSha256) {
+        throw new Error("ordinary stage checkpoint object failed its bounded persistence fence");
+      }
+      const branch = db.prepare(`
+        SELECT * FROM pipeline_task_branches WHERE pipeline_instance_id = ?
+      `).get(instance.id) as PipelineTaskBranch | undefined;
+      if (!branch || branch.generation !== checkpoint.generation ||
+          branch.lineage !== checkpoint.lineage ||
+          branch.acknowledged_remote_sha !== object.expectedOldSha ||
+          !["reserved", "checkpointed", "published"].includes(branch.status) ||
+          (branch.accepted_integration_sha !== null &&
+           branch.accepted_integration_sha !== branch.acknowledged_remote_sha)) {
+        throw new Error("ordinary stage checkpoint task branch has a stale lineage or head");
+      }
+      const accepted = db.prepare(`
+        UPDATE pipeline_task_branches
+        SET accepted_integration_sha = ?, status = 'reserved', last_error = NULL, updated_at = ?
+        WHERE pipeline_instance_id = ? AND generation = ? AND lineage = ?
+          AND acknowledged_remote_sha = ? AND status IN ('reserved', 'checkpointed', 'published')
+      `).run(
+        object.expectedNewSha,
+        timestamp,
+        instance.id,
+        checkpoint.generation,
+        checkpoint.lineage,
+        object.expectedOldSha,
+      );
+      if (accepted.changes !== 1) {
+        throw new Error("ordinary stage checkpoint task branch changed before integration acceptance");
+      }
+      wrote();
+      const effectPayload = canonicalJson({
+        schema: "openthrottle.task-branch-effect/v1",
+        pipelineInstanceId: instance.id,
+        ticketId: branch.ticket_id,
+        generation: checkpoint.generation,
+        repository: branch.repository,
+        ref: `refs/heads/${branch.branch}`,
+        planDigest: branch.plan_digest,
+        lineage: branch.lineage,
+        expectedOldSha: object.expectedOldSha,
+        expectedNewSha: object.expectedNewSha,
+      });
+      const effectId = `task-branch-${digestNormalized(effectPayload).slice(0, 32)}`;
+      db.prepare(`
+        INSERT INTO pipeline_effect_intents (
+          id, pipeline_instance_id, transition_version, kind, idempotency_key,
+          payload, payload_hash, status, next_attempt_at, created_at
+        ) VALUES (?, ?, ?, 'advance_task_branch', ?, ?, ?, 'pending', ?, ?)
+      `).run(
+        effectId,
+        instance.id,
+        nextVersion,
+        `advance-task-branch:${branch.lineage}:${object.expectedOldSha}:${object.expectedNewSha}`,
+        effectPayload,
+        digestNormalized(effectPayload),
+        timestamp,
+        timestamp,
+      );
+      wrote();
+      db.prepare(`
+        INSERT INTO pipeline_stage_checkpoint_objects (
+          attempt_id, effect_id, expected_tree_sha, expected_old_sha, expected_new_sha,
+          payload_sha256, payload_bytes, payload, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        attempt.id,
+        effectId,
+        checkpoint.expectedTreeSha,
+        object.expectedOldSha,
+        object.expectedNewSha,
+        object.payloadSha256,
+        object.payloadBytes,
+        payload,
+        timestamp,
+      );
+      wrote();
+    }
     for (const artifact of write.artifacts ?? []) {
       if (digestNormalized(artifact.payload) !== artifact.hash) throw new Error(`artifact ${artifact.id ?? artifact.kind} hash mismatch`);
       db.prepare(`
@@ -340,16 +442,15 @@ export function createTransitionStore(db: Database.Database, now: () => string):
       const taskBranch = db.prepare(`
         SELECT * FROM pipeline_task_branches WHERE pipeline_instance_id = ?
       `).get(instance.id) as PipelineTaskBranch | undefined;
-      const publishedSubject = write.publishedSubject ?? instance.published_subject;
+      const publishedCommit = write.publishedCommit ?? instance.published_commit;
       if (taskBranch && (
         taskBranch.status !== "published" ||
         taskBranch.accepted_integration_sha !== taskBranch.acknowledged_remote_sha ||
-        taskBranch.acknowledged_remote_sha !== publishedSubject
+        taskBranch.acknowledged_remote_sha !== publishedCommit
       )) {
         throw new Error("pipeline cannot enter provider wait without the exact published task branch checkpoint");
       }
     }
-    const nextVersion = instance.state_version + 1;
     const update = db.prepare(`
       UPDATE pipeline_instances SET
         status = ?, active_stage_id = ?, wait_reason = ?, state_version = ?,

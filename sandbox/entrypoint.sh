@@ -458,6 +458,24 @@ else
   as_agent "git -C '$REPO_DIR' reset --hard --quiet '$STAGE_BASE_COMMIT' && git -C '$REPO_DIR' clean -fdq"
 fi
 
+# A crash after sealing the stage result but before advancing the long-lived
+# checkout can leave local HEAD one checkpoint behind even though the
+# supervisor has acknowledged and pushed the exact commit. Reconcile from the
+# supervisor-owned remote branch before the next stage. The remote commit is
+# accepted only when its tree is exactly the sealed expected subject.
+if [[ -n "$STAGE_EXPECTED_SUBJECT" ]] &&
+   as_agent "git -C '$REPO_DIR' ls-remote --exit-code --heads origin '$BRANCH_NAME'" >/dev/null 2>&1; then
+  as_agent "git -C '$REPO_DIR' fetch --quiet origin '$BRANCH_NAME'"
+  REMOTE_STAGE_HEAD="$(as_agent "git -C '$REPO_DIR' rev-parse 'refs/remotes/origin/${BRANCH_NAME}'")"
+  REMOTE_STAGE_SUBJECT="$(as_agent "git -C '$REPO_DIR' rev-parse '${REMOTE_STAGE_HEAD}^{tree}'")"
+  if [[ "$REMOTE_STAGE_SUBJECT" != "$STAGE_EXPECTED_SUBJECT" ]]; then
+    log "FATAL: remote task branch subject does not match the sealed stage subject"
+    exit 1
+  fi
+  as_agent "git -C '$REPO_DIR' reset --hard --quiet '$REMOTE_STAGE_HEAD' && git -C '$REPO_DIR' clean -fdq"
+  log "reconciled stage branch to acknowledged remote checkpoint ${REMOTE_STAGE_HEAD}"
+fi
+
 # Ignored files are intentionally outside the canonical workspace subject.
 # Dependency state produced by the bake-once bootstrap (phase 5) persists for
 # the sandbox lifetime under the recorded repository-config digest, so it is

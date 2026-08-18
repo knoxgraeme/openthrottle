@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSupervisorStore, type SupervisorStore } from "../persistence/store.js";
@@ -113,18 +114,61 @@ describe("pipeline publication", () => {
     return loadPipelineCatalog(path, runtime.descriptor).manifests.get("core/implement@4")!;
   }
 
-  function acknowledgeTaskBranchCheckpoint(pipelines: PipelineStore, expectedSha: string): void {
+  function acknowledgeTaskBranchCheckpoint(pipelines: PipelineStore, _expectedTree: string): void {
     const claimed = pipelines.claimEffects(
       "2099-01-01T00:00:00.000Z",
       "2099-01-01T00:01:00.000Z"
     );
     const checkpoint = claimed.find((effect) => effect.kind === "advance_task_branch");
     expect(checkpoint).toBeDefined();
+    const control = JSON.parse(checkpoint!.payload) as { expectedNewSha: string };
     pipelines.recordEffectAcknowledgement({
       effectId: checkpoint!.id,
       eventId: `task-branch-checkpoint:${checkpoint!.id}`,
-      payload: canonicalJson({ sha: expectedSha }),
+      payload: canonicalJson({ sha: control.expectedNewSha }),
     });
+  }
+
+  function coordinateTestEvent(
+    pipelines: PipelineStore,
+    input: { event: PipelineCoordinatorEvent; receipt: CoordinatorGateReceiptWrite }
+  ): PipelineInstance {
+    if (pipelines.listEffects(input.event.instanceId).some((effect) =>
+      effect.kind === "advance_task_branch" && effect.status === "pending"
+    )) {
+      acknowledgeTaskBranchCheckpoint(pipelines, input.event.subject ?? "");
+    }
+    const instance = pipelines.getInstance(input.event.instanceId)!;
+    const attempt = pipelines.getAttempt(input.event.attemptId)!;
+    const manifest = JSON.parse(instance.normalized_manifest) as {
+      stages: Array<{ id: string; credentials: string[]; executor: { capability: string } }>;
+    };
+    const stage = manifest.stages.find((candidate) => candidate.id === attempt.stage_id)!;
+    const branch = pipelines.getTaskBranch(instance.id);
+    if (branch?.acknowledged_remote_sha && input.event.outcome === "success" &&
+        stage.credentials.includes("repo.write") &&
+        stage.executor.capability !== "ce/publish@1" &&
+        stage.executor.capability !== "graph/for-each-unit@1") {
+      const payload = Buffer.from(`publication-test-checkpoint:${input.event.id}`);
+      const expectedNewSha = digestNormalized(canonicalJson([
+        input.event.id, branch.acknowledged_remote_sha, input.event.subject,
+      ])).slice(0, 40);
+      return coordinatePipelineEvent(
+        pipelines,
+        input.event,
+        undefined,
+        input.receipt,
+        {
+          schema: "openthrottle.git-checkpoint-object/v1",
+          expectedOldSha: branch.acknowledged_remote_sha,
+          expectedNewSha,
+          payloadSha256: createHash("sha256").update(payload).digest("hex"),
+          payloadBytes: payload.byteLength,
+          payload,
+        }
+      );
+    }
+    return coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
   }
 
   function event(
@@ -1684,7 +1728,7 @@ describe("pipeline publication", () => {
       outcome: "success",
       summary: "fresh implementation completed",
     });
-    const afterFresh = coordinatePipelineEvent(pipelines, fresh.event, undefined, fresh.receipt);
+    const afterFresh = coordinateTestEvent(pipelines, fresh);
     expect(afterFresh.active_stage_id).toBe("resume");
     acknowledgeTaskBranchCheckpoint(pipelines, SUBJECT);
 
@@ -1695,7 +1739,7 @@ describe("pipeline publication", () => {
       outcome: "success",
       summary: "resume implementation completed",
     });
-    const afterResume = coordinatePipelineEvent(pipelines, resume.event, undefined, resume.receipt);
+    const afterResume = coordinateTestEvent(pipelines, resume);
     expect(afterResume.active_stage_id).toBe("review");
 
     const reviewAttempt = pipelines.getActiveAttempt(instance.id)!;
@@ -1710,7 +1754,7 @@ describe("pipeline publication", () => {
       ],
       withReviewArtifact: true,
     });
-    const afterReview = coordinatePipelineEvent(pipelines, review.event, undefined, review.receipt);
+    const afterReview = coordinateTestEvent(pipelines, review);
     expect(afterReview.active_stage_id).toBe("resume");
     const reviewPublication = parsePipelinePublication(pipelines.listPublications(instance.id)
       .find((row) => row.kind === "control_ledger" && row.attempt_id === reviewAttempt.id)!.payload);
@@ -1764,7 +1808,7 @@ describe("pipeline publication", () => {
       subject: repairedSubject,
       actions: ["Fixed provider snapshot bounding and verified coverage."],
     });
-    coordinatePipelineEvent(pipelines, repair.event, undefined, repair.receipt);
+    coordinateTestEvent(pipelines, repair);
     acknowledgeTaskBranchCheckpoint(pipelines, repairedSubject);
     const repairPublication = parsePipelinePublication(pipelines.listPublications(instance.id)
       .find((row) => row.kind === "control_ledger" && row.attempt_id === repairAttempt.id)!.payload);
@@ -1791,7 +1835,7 @@ describe("pipeline publication", () => {
       ],
       withReviewArtifact: true,
     });
-    const terminal = coordinatePipelineEvent(pipelines, finalReview.event, undefined, finalReview.receipt);
+    const terminal = coordinateTestEvent(pipelines, finalReview);
     expect(terminal.terminal_outcome).toBe("shipped");
     const finalPublication = parsePipelinePublication(pipelines.listPublications(instance.id)
       .find((row) => row.kind === "control_ledger" && row.attempt_id === finalAttempt.id)!.payload);
@@ -1945,7 +1989,7 @@ describe("pipeline publication", () => {
     });
 
     const input = event(instance, attempt, "fresh stage accepted");
-    coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+    coordinateTestEvent(pipelines, input);
     expect(listLinearOutbox().filter((row) => row.kind === "pipeline_status")).toHaveLength(1);
     expect(getLinearOutbox(status.id)).toMatchObject({
       status: "pending",
@@ -2158,7 +2202,7 @@ describe("pipeline publication", () => {
     });
 
     const input = event(instance, attempt, "fresh stage accepted");
-    coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+    coordinateTestEvent(pipelines, input);
     expect(getLinearOutbox(status.id)).toMatchObject({
       status: "pending",
       external_id: "status-comment",
@@ -2218,7 +2262,7 @@ describe("pipeline publication", () => {
     });
 
     const input = event(instance, attempt, "fresh stage accepted");
-    coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+    coordinateTestEvent(pipelines, input);
 
     const calls: string[] = [];
     let outage = true;
@@ -2565,7 +2609,7 @@ describe("pipeline publication", () => {
       outcome: "no_change",
       summary: "No further change needed.",
     });
-    coordinatePipelineEvent(pipelines, noChange.event, undefined, noChange.receipt);
+    coordinateTestEvent(pipelines, noChange);
 
     const receipt = pipelines.listPublications(instance.id)
       .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
@@ -2597,7 +2641,7 @@ describe("pipeline publication", () => {
       summary: "Terminal stage changed the workspace subject.",
       subject: unpublishedSubject,
     });
-    const transitioned = coordinatePipelineEvent(pipelines, noChange.event, undefined, noChange.receipt);
+    const transitioned = coordinateTestEvent(pipelines, noChange);
 
     const receipt = pipelines.listPublications(instance.id)
       .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
@@ -2616,7 +2660,7 @@ describe("pipeline publication", () => {
       outcome: "no_change",
       summary: "No further change needed.",
     });
-    coordinatePipelineEvent(pipelines, noChange.event, undefined, noChange.receipt);
+    coordinateTestEvent(pipelines, noChange);
 
     const receipt = pipelines.listPublications(instance.id)
       .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
@@ -2629,7 +2673,7 @@ describe("pipeline publication", () => {
     const { tickets, pipelines, instance, attempt } = setup();
     await acknowledgeSelection(tickets);
     const input = event(instance, attempt);
-    const transitioned = coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+    const transitioned = coordinateTestEvent(pipelines, input);
     expect(transitioned.status).toBe("completion_pending_publication");
     const publication = pipelines.listPublications(instance.id)
       .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
@@ -2666,7 +2710,7 @@ describe("pipeline publication", () => {
     const { tickets, pipelines, instance, attempt } = setup("fixture/agent@1");
     await acknowledgeSelection(tickets);
     const first = event(instance, attempt, "fresh stage accepted");
-    const afterFresh = coordinatePipelineEvent(pipelines, first.event, undefined, first.receipt);
+    const afterFresh = coordinateTestEvent(pipelines, first);
     expect(afterFresh.status).toBe("dispatchable");
     expect(afterFresh.active_stage_id).toBe("resume");
     const firstPublication = pipelines.listPublications(instance.id)
@@ -2688,7 +2732,7 @@ describe("pipeline publication", () => {
 
     const resumeAttempt = pipelines.getActiveAttempt(instance.id)!;
     const second = event(afterFresh, resumeAttempt, "resume stage accepted");
-    const afterResume = coordinatePipelineEvent(pipelines, second.event, undefined, second.receipt);
+    const afterResume = coordinateTestEvent(pipelines, second);
     expect(afterResume.status).toBe("dispatchable");
     expect(afterResume.active_stage_id).toBe("review");
   });
@@ -2697,7 +2741,7 @@ describe("pipeline publication", () => {
     const { tickets, pipelines, instance, attempt } = setup();
     await acknowledgeSelection(tickets);
     const input = event(instance, attempt, "x".repeat(6_000));
-    coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+    coordinateTestEvent(pipelines, input);
     const publication = pipelines.listPublications(instance.id)
       .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
     expect(parsePipelinePublication(publication.payload).attachment?.content.length).toBeGreaterThan(4_000);
@@ -2742,7 +2786,7 @@ describe("pipeline publication", () => {
     const { tickets, pipelines, instance, attempt } = setup();
     await acknowledgeSelection(tickets);
     const input = event(instance, attempt);
-    coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+    coordinateTestEvent(pipelines, input);
     const publication = pipelines.listPublications(instance.id)
       .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
     const denied = createLinearOutboxProcessor({
@@ -2776,7 +2820,7 @@ describe("pipeline publication", () => {
     const { tickets, pipelines, instance, attempt } = setup();
     await acknowledgeSelection(tickets);
     const input = event(instance, attempt);
-    coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+    coordinateTestEvent(pipelines, input);
     const publication = pipelines.listPublications(instance.id)
       .find((row) => row.kind === "control_ledger" && row.attempt_id === attempt.id)!;
 
@@ -3031,7 +3075,7 @@ describe("pipeline publication", () => {
     const instance = pipelines.getInstanceForSession("human-session")!;
     const attempt = pipelines.getActiveAttempt(instance.id)!;
     const input = event(instance, attempt);
-    const waiting = coordinatePipelineEvent(pipelines, input.event, undefined, input.receipt);
+    const waiting = coordinateTestEvent(pipelines, input);
     expect(waiting.status).toBe("completion_pending_publication");
     const humanAttempt = pipelines.getActiveAttempt(instance.id)!;
     expect(() => coordinatePipelineEvent(pipelines, {

@@ -83,6 +83,10 @@ export async function pushRepositoryCheckpoint(
       createHash("sha256").update(payload).digest("hex") !== input.checkpointObject.payloadSha256) {
     throw new Error("GitHub checkpoint push has an invalid bounded object payload");
   }
+  if (input.checkpointObject.expectedTreeSha !== undefined &&
+      !/^[a-f0-9]{40,64}$/.test(input.checkpointObject.expectedTreeSha)) {
+    throw new Error("GitHub checkpoint push has an invalid accepted tree fence");
+  }
   const scratch = mkdtempSync(join(tmpdir(), "openthrottle-checkpoint-"));
   const bundlePath = join(scratch, GIT_CHECKPOINT_OBJECT_FILE);
   const askpassPath = join(scratch, "askpass.sh");
@@ -102,7 +106,18 @@ export async function pushRepositoryCheckpoint(
     await runGit(scratch, ["init", "--bare", "repository.git"], env);
     const repo = join(scratch, "repository.git");
     const remoteHead = (await runGit(repo, ["ls-remote", remote, input.ref], env)).split(/\s+/)[0] ?? "";
-    if (remoteHead === input.expectedNewSha && input.allowAlreadyAdvanced) return { sha: remoteHead };
+    if (remoteHead === input.expectedNewSha && input.allowAlreadyAdvanced) {
+      await runGit(repo, ["fetch", "--no-tags", remote, `${input.ref}:refs/checkpoint/accepted`], env);
+      if (input.checkpointObject.expectedTreeSha) {
+        const remoteTree = await runGit(repo, ["rev-parse", `${input.expectedNewSha}^{tree}`], env);
+        if (remoteTree !== input.checkpointObject.expectedTreeSha) {
+          throw new RepositoryRefConflictError(
+            `repository ref conflict: ${input.expectedNewSha} does not contain the accepted tree`
+          );
+        }
+      }
+      return { sha: remoteHead };
+    }
     if (remoteHead !== input.expectedOldSha) {
       throw new RepositoryRefConflictError(
         `repository ref conflict: ${input.ref} expected ${input.expectedOldSha} but found ${remoteHead || "missing"}`
@@ -118,7 +133,21 @@ export async function pushRepositoryCheckpoint(
     await runGit(repo, ["bundle", "verify", bundlePath], env);
     await runGit(repo, ["fetch", "--no-tags", bundlePath, `${bundleRef}:refs/checkpoint/accepted`], env);
     await runGit(repo, ["cat-file", "-e", `${input.expectedNewSha}^{commit}`], env);
-    await runGit(repo, ["merge-base", "--is-ancestor", input.expectedOldSha, input.expectedNewSha], env);
+    if (input.checkpointObject.expectedTreeSha) {
+      const acceptedTree = await runGit(repo, ["rev-parse", `${input.expectedNewSha}^{tree}`], env);
+      if (acceptedTree !== input.checkpointObject.expectedTreeSha) {
+        throw new RepositoryRefConflictError(
+          `repository ref conflict: ${input.expectedNewSha} does not contain the accepted tree`
+        );
+      }
+    }
+    try {
+      await runGit(repo, ["merge-base", "--is-ancestor", input.expectedOldSha, input.expectedNewSha], env);
+    } catch {
+      throw new RepositoryRefConflictError(
+        `repository ref conflict: ${input.expectedNewSha} is not a descendant of ${input.expectedOldSha}`
+      );
+    }
     await runGit(repo, [
       "push", "--porcelain", `--force-with-lease=${input.ref}:${input.expectedOldSha}`,
       remote, `${input.expectedNewSha}:${input.ref}`,
