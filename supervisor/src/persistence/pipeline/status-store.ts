@@ -147,6 +147,25 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
       const taskBranch = db.prepare(`
         SELECT * FROM pipeline_task_branches WHERE pipeline_instance_id = ?
       `).get(instance.id) as PipelineTaskBranch | undefined;
+      const admission = db.prepare(`
+        SELECT * FROM pipeline_admission_projections WHERE pipeline_instance_id = ?
+      `).get(instance.id) as undefined | {
+        proposed_route: "simple" | "structured" | "needs_human" | null;
+        final_route: "simple" | "structured" | null;
+        semantic_repair_count: number;
+        infrastructure_retry_count: number;
+        terminal_state: string | null;
+        questions: string;
+        reviewer_verdict: "approved" | "rejected" | "needs_human" | null;
+        planner_skill_reference: string;
+        planner_package_digest: string | null;
+        reviewer_skill_reference: string;
+        reviewer_package_digest: string | null;
+        admission_basis_digest: string;
+        effective_manifest_digest: string;
+        generated_plan_digest: string | null;
+        checkpoint_digest: string | null;
+      };
       const effects = db.prepare(`
         SELECT *,
           CASE WHEN status IN ('failed', 'dead') THEN next_attempt_at ELSE created_at END AS status_sort_at
@@ -277,6 +296,35 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
         structured_checkpoint_status: structuredActiveAction?.checkpoint_status ?? null,
         sandbox_disk_minimum_gib: 10,
         sandbox_capacity_warning: capacityWarning,
+        admission: admission ? {
+          generated_content: true,
+          proposed_route: admission.proposed_route,
+          final_route: admission.final_route,
+          semantic_repair_count: admission.semantic_repair_count,
+          infrastructure_retry_count: admission.infrastructure_retry_count,
+          terminal_state: admission.terminal_state,
+          questions: (JSON.parse(admission.questions) as string[])
+            .slice(0, 16).map((question) => sanitizeText(question).slice(0, 1_000)),
+          reviewer_verdict: admission.reviewer_verdict,
+          planner: {
+            reference: admission.planner_skill_reference,
+            package_digest: admission.planner_package_digest,
+          },
+          reviewer: {
+            reference: admission.reviewer_skill_reference,
+            package_digest: admission.reviewer_package_digest,
+          },
+          admission_basis_digest: admission.admission_basis_digest,
+          effective_manifest_digest: admission.effective_manifest_digest,
+          generated_plan_digest: admission.generated_plan_digest,
+          checkpoint_digest: admission.checkpoint_digest,
+          task_branch: {
+            branch: taskBranch?.branch ?? instance.branch,
+            state: taskBranch?.status ?? "none",
+            lineage: taskBranch?.lineage ?? null,
+          },
+          publication_state: publicationState,
+        } : null,
         structured_units: structuredUnits.map((unit) => ({
           unit_id: unit.unit_id,
           status: unit.status,

@@ -1174,6 +1174,19 @@ export function createServer(deps: ServerDeps): Hono {
     return context.json({ error: "logs not found" }, 404);
   });
 
+  app.get("/tickets/:identifier/admission", (context) => {
+    if (!requireStatusAuth(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    const ticket = findTicket(store, context.req.param("identifier"));
+    if (!ticket) return context.json({ error: "ticket not found" }, 404);
+    const status = deps.pipelineCoordinator.store.getStatusForIssue(ticket.ticket_id);
+    if (!status) return context.json({ error: "pipeline not found" }, 404);
+    const detail = deps.pipelineCoordinator.store.getAdmissionDetail(status.instance_id);
+    if (!detail) return context.json({ error: "automatic admission detail not found" }, 404);
+    return context.json(detail);
+  });
+
   app.post("/tickets/:identifier/publications/:publicationId/retry", (context) => {
     if (!requireStatusAuth(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);

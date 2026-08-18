@@ -49,6 +49,24 @@ interface TicketRow {
     structured_checkpoint_status?: string | null;
     sandbox_disk_minimum_gib?: number;
     sandbox_capacity_warning?: string | null;
+    admission?: {
+      generated_content: true;
+      proposed_route: 'simple' | 'structured' | 'needs_human' | null;
+      final_route: 'simple' | 'structured' | null;
+      semantic_repair_count: number;
+      infrastructure_retry_count: number;
+      terminal_state: string | null;
+      questions: string[];
+      reviewer_verdict: 'approved' | 'rejected' | 'needs_human' | null;
+      planner: { reference: string; package_digest: string | null };
+      reviewer: { reference: string; package_digest: string | null };
+      admission_basis_digest: string;
+      effective_manifest_digest: string;
+      generated_plan_digest: string | null;
+      checkpoint_digest: string | null;
+      task_branch: { branch: string; state: string; lineage: string | null };
+      publication_state: string;
+    } | null;
     structured_units?: Array<{
       unit_id: string;
       status: string;
@@ -108,6 +126,19 @@ function renderTicket(ticket: TicketRow): void {
     console.log(`  checkpoint: ${p.structured_checkpoint_status}`);
   }
   if (p.sandbox_capacity_warning) console.log(`  capacity warning: ${p.sandbox_capacity_warning}`);
+  if (p.admission) {
+    const admission = p.admission;
+    console.log('  automatic admission: generated content, verify before relying on it');
+    console.log(`    route: proposed ${value(admission.proposed_route)} final ${value(admission.final_route)}`);
+    console.log(`    terminal: ${value(admission.terminal_state)} reviewer: ${value(admission.reviewer_verdict)}`);
+    console.log(`    retries: semantic ${admission.semantic_repair_count} infrastructure ${admission.infrastructure_retry_count}`);
+    console.log(`    planner: ${admission.planner.reference} (${shortSha(admission.planner.package_digest)})`);
+    console.log(`    reviewer: ${admission.reviewer.reference} (${shortSha(admission.reviewer.package_digest)})`);
+    console.log(`    digests: admission ${shortSha(admission.admission_basis_digest)} manifest ${shortSha(admission.effective_manifest_digest)} plan ${shortSha(admission.generated_plan_digest)} checkpoint ${shortSha(admission.checkpoint_digest)}`);
+    console.log(`    task branch: ${admission.task_branch.branch} ${admission.task_branch.state} ${shortSha(admission.task_branch.lineage)}`);
+    console.log(`    publication: ${admission.publication_state}`);
+    for (const question of admission.questions) console.log(`    question: ${question}`);
+  }
   if (p.structured_units && p.structured_units.length > 0) {
     console.log('  units:');
     for (const unit of p.structured_units) {
@@ -120,7 +151,37 @@ function renderTicket(ticket: TicketRow): void {
   console.log(`  last state change: ${p.last_state_change_at}`);
 }
 
-export default async function status(ticketFilter?: string): Promise<void> {
+export default async function status(input?: string | string[]): Promise<void> {
+  const args = Array.isArray(input) ? input : input ? [input] : [];
+  const admissionDetail = args.includes('--admission');
+  const ticketFilter = args.find((argument) => argument !== '--admission');
+  if (admissionDetail) {
+    if (!ticketFilter) {
+      console.error('Usage: openthrottle status <ticket> --admission');
+      process.exit(1);
+      return;
+    }
+    let detailResponse: Response;
+    try {
+      detailResponse = await supervisorRequest(`/tickets/${encodeURIComponent(ticketFilter)}/admission`);
+    } catch (err: unknown) {
+      console.error(`Could not reach the supervisor: ${getErrorMessage(err)}`);
+      process.exit(1);
+      return;
+    }
+    if (!detailResponse.ok) {
+      console.error(`GET /tickets/:id/admission → HTTP ${detailResponse.status}`);
+      process.exit(1);
+      return;
+    }
+    try {
+      console.log(JSON.stringify(await detailResponse.json(), null, 2));
+    } catch (err: unknown) {
+      console.error(`Could not parse response as JSON: ${getErrorMessage(err)}`);
+      process.exit(1);
+    }
+    return;
+  }
   let res: Response;
   try {
     res = await supervisorRequest('/status');

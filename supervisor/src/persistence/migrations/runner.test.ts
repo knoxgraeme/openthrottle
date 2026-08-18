@@ -203,6 +203,7 @@ describe("database migrations", () => {
       "d6cc3e5c5b000c963b4bea1f92123f9ac97ef3abe0a59a9419e92e58b6db8616",
       "3d9ff6c68452b4f8401989cb930b953e373cb9e27798110f49c09d1ccf707538",
       "2688526a0eb8caae1e9a6514aa6aaeb8e9d695d375c769cb9c2df0b5ab19f992",
+      "f01e2f80313eca7c21b2adc4bcf65971b952f64eaa975a3fb5cfd63af54a1ce1",
     ]);
   });
 
@@ -625,8 +626,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 56,
-      name: `admission-execution-plan-artifact${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 57,
+      name: `automatic-admission-projection${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -678,8 +679,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 56,
-      name: `admission-execution-plan-artifact${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 57,
+      name: `automatic-admission-projection${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 
@@ -1850,6 +1851,30 @@ describe("database migrations", () => {
         1, 'semantic_attested', NULL, '{}', '${"d".repeat(64)}', '${now}'
       )
     `).run()).toThrow(/CHECK constraint failed/);
+  });
+
+  it("adds one empty durable automatic-admission projection surface on v57 upgrade", () => {
+    db = new Database(":memory:");
+    applyBaseSchema(db);
+    applyDatabaseMigrationsForAuthority(db, {
+      migrations: databaseMigrations.filter((migration) => migration.version <= 56),
+      rollbackCompatibleMigrationNameSuffix: ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+    });
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name = 'pipeline_admission_projections'
+    `).get()).toBeUndefined();
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name = 'pipeline_admission_projections'
+    `).get()).toEqual({ name: "pipeline_admission_projections" });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM pipeline_admission_projections").get())
+      .toEqual({ count: 0 });
+    expect(() => databaseMigrations.find((migration) => migration.version === 57)!.up(db!))
+      .not.toThrow();
   });
 
   it(`reopens a v46 database under the v45 migration authority from ${PREDECESSOR_RELEASE_COMMIT.slice(0, 7)}`, () => {

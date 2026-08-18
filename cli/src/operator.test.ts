@@ -87,6 +87,24 @@ describe('operator commands', () => {
               effect_status: 'dead',
               effect_attempts: 8,
               effect_error: 'termination was not confirmed',
+              admission: {
+                generated_content: true,
+                proposed_route: 'structured',
+                final_route: 'structured',
+                semantic_repair_count: 1,
+                infrastructure_retry_count: 2,
+                terminal_state: 'accepted',
+                questions: [],
+                reviewer_verdict: 'approved',
+                planner: { reference: 'builtin://admission-plan@1', package_digest: null },
+                reviewer: { reference: 'repo://reviewer', package_digest: '1'.repeat(64) },
+                admission_basis_digest: '2'.repeat(64),
+                effective_manifest_digest: '3'.repeat(64),
+                generated_plan_digest: '4'.repeat(64),
+                checkpoint_digest: '5'.repeat(64),
+                task_branch: { branch: 'ot/pipe', state: 'checkpointed', lineage: '6'.repeat(64) },
+                publication_state: 'blocked',
+              },
               structured_units: [{
                 unit_id: 'U1',
                 status: 'completed',
@@ -130,7 +148,32 @@ describe('operator commands', () => {
     expect(printed).toContain('U1: completed (no alarm) completed fedcba987654');
     expect(printed).toContain('stop:dead');
     expect(printed).toContain('termination was not confirmed');
+    expect(printed).toContain('automatic admission: generated content, verify before relying on it');
+    expect(printed).toContain('route: proposed structured final structured');
+    expect(printed).toContain('retries: semantic 1 infrastructure 2');
+    expect(printed).toContain('builtin://admission-plan@1');
     expect(printed).not.toContain('legacy=');
+  });
+
+  it('prints exact automatic-admission detail from the authenticated provider-neutral surface', async () => {
+    const detail = {
+      generated_content: true,
+      warning: 'Automatically generated content. Verify before relying on it.',
+      accepted_plan: { schema: 'openthrottle.execution-plan/v2', plan_id: 'accepted' },
+      reviewer_receipt: { type: 'admission_review', result: 'approved', evidence: ['complete'] },
+    };
+    const fetchMock = vi.fn(async () => Response.json(detail));
+    vi.stubGlobal('fetch', fetchMock);
+    const output = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    await status(['linear:issue-1', '--admission']);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://supervisor.test/tickets/linear%3Aissue-1/admission',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(output.mock.calls.flat().join('\n')).toContain('"plan_id": "accepted"');
+    expect(output.mock.calls.flat().join('\n')).toContain('"result": "approved"');
   });
 
   it('filters status output to one ticket', async () => {

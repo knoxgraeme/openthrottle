@@ -702,6 +702,7 @@ export async function handleCreated(
     taskContext: string;
     planDigest: string;
     inputArtifacts?: StageRequestInputArtifact[];
+    admission?: import("../pipeline/store.js").AdmissionProjectionSeed;
   };
   const boundedTaskContext = composeBoundedTaskContext(initialContext, {
     requireLinearSections: hasSuppliedPromptContext,
@@ -891,7 +892,28 @@ export async function handleCreated(
       config: repositoryConfig,
     });
     coordinator.store.acceptManifest(manifest);
-    pinned = { remote, manifest, snapshot, taskContext, planDigest, inputArtifacts };
+    pinned = {
+      remote,
+      manifest,
+      snapshot,
+      taskContext,
+      planDigest,
+      inputArtifacts,
+      ...(automaticBasis ? {
+        admission: {
+          planner: {
+            reference: admissionSkills!.planner.producer_reference,
+            package_digest: admissionSkills!.planner.package_digest,
+          },
+          reviewer: {
+            reference: admissionSkills!.reviewer.producer_reference,
+            package_digest: admissionSkills!.reviewer.package_digest,
+          },
+          admission_basis_digest: automaticBasis.digest,
+          effective_manifest_digest: manifest.digest,
+        },
+      } : {}),
+    };
   } catch (error) {
     await failSelection(error);
     return;
@@ -937,6 +959,7 @@ export async function handleCreated(
         taskType,
         taskContext: pinned.taskContext,
         inputArtifacts: pinned.inputArtifacts,
+        admission: pinned.admission,
       },
     });
   } catch (error) {

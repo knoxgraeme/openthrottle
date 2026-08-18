@@ -233,6 +233,58 @@ describe("pipeline publication", () => {
     };
   }
 
+  it("renders the same bounded automatic-admission summary for Linear and GitHub", () => {
+    const { instance, attempt } = setup();
+    const input = event(instance, attempt, "Automatic planning completed.");
+    const write = {
+      instanceId: instance.id,
+      eventId: input.event.id,
+      eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+      expectedVersion: instance.state_version,
+      expectedStatus: instance.status,
+      attemptId: attempt.id,
+      outcome: "success" as const,
+      resultHash: input.event.resultHash,
+      nextStatus: "dispatchable" as const,
+      effects: [],
+    };
+    const admission = {
+      generated_content: true as const,
+      proposed_route: "needs_human" as const,
+      final_route: null,
+      semantic_repair_count: 1,
+      infrastructure_retry_count: 2,
+      terminal_state: "needs_human",
+      questions: ["Verify <script>alert(1)</script> and github_pat_secret123."],
+      planner: { reference: "builtin://admission-plan@1", package_digest: null },
+      reviewer: { reference: "repo://reviewer", package_digest: "1".repeat(64) },
+      admission_basis_digest: "2".repeat(64),
+      effective_manifest_digest: "3".repeat(64),
+      generated_plan_digest: null,
+      checkpoint_digest: "4".repeat(64),
+      task_branch: { branch: "ot/issue-1", state: "reserved", lineage: "5".repeat(64) },
+    };
+    const publication = buildStagePublication({
+      instance,
+      attempt,
+      event: input.event,
+      write,
+      admission,
+    });
+    const linear = renderLinearStatusComment(publication);
+    const github = renderGithubPipelineSummary(publication);
+
+    for (const expected of [
+      "Automatic admission, generated content to verify",
+      "Route: proposed needs_human; final pending",
+      "Retries: 1 semantic repair; 2 infrastructure",
+      "Question: Verify \\<script\\>alert\\(1\\)\\</script\\> and \\[REDACTED\\].",
+    ]) {
+      expect(linear).toContain(expected);
+      expect(github).toContain(expected);
+    }
+  });
+
   function semanticEvent(input: {
     instance: PipelineInstance;
     attempt: PipelineStageAttempt;

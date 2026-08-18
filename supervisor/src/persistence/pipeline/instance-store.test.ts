@@ -95,6 +95,47 @@ describe("pipeline instance store", () => {
     expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
   });
 
+  it("creates admission visibility only when automatic admission supplies an immutable seed", () => {
+    const setup = setupPipelineStore();
+    db = setup.db;
+    const { tickets, pipelines, catalog, snapshot } = setup;
+    const manifest = catalog.manifests.get("fixture/command@1")!;
+    const pipeline = {
+      repository: "owner/repo",
+      baseCommit: "a".repeat(40),
+      manifest,
+      repositoryConfig: snapshot,
+      runtime,
+      authorizedCapabilities: manifest.manifest.requires.capabilities,
+      taskType: "implement" as const,
+    };
+    tickets.upsert({ ...ticket("legacy-session", "legacy-issue"), pipeline });
+    expect(pipelines.getAdmissionProjection(pipelines.getInstanceForSession("legacy-session")!.id))
+      .toBeUndefined();
+
+    tickets.upsert({
+      ...ticket("automatic-session", "automatic-issue"),
+      pipeline: {
+        ...pipeline,
+        admission: {
+          planner: { reference: "builtin://admission-plan@1", package_digest: null },
+          reviewer: { reference: "repo://reviewer", package_digest: "c".repeat(64) },
+          admission_basis_digest: "d".repeat(64),
+          effective_manifest_digest: manifest.digest,
+        },
+      },
+    });
+    const automatic = pipelines.getInstanceForSession("automatic-session")!;
+    expect(pipelines.getAdmissionProjection(automatic.id)).toMatchObject({
+      proposed_route: null,
+      final_route: null,
+      planner: { reference: "builtin://admission-plan@1", package_digest: null },
+      reviewer: { reference: "repo://reviewer", package_digest: "c".repeat(64) },
+      admission_basis_digest: "d".repeat(64),
+      effective_manifest_digest: manifest.digest,
+    });
+  });
+
   it("atomically fences an older pipeline generation before pinning its replacement", () => {
     const setup = setupPipelineStore();
     db = setup.db;
@@ -355,7 +396,7 @@ describe("pipeline instance store", () => {
     temporaryDirectories.push(directory);
     const path = join(directory, "supervisor.db");
     const baseCommit = "a".repeat(40);
-    const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v13");
+    const shippedRuntime = loadRuntimeCapabilityDescriptor(runtimeDescriptorPath, "openthrottle-snapshot/v14");
     const catalog = loadPipelineCatalog(shippedCatalogPath, shippedRuntime.descriptor);
     const manifest = catalog.manifests.get("core/implement@4")!;
     const config = parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: implement }\n");
@@ -425,7 +466,7 @@ describe("pipeline instance store", () => {
       normalized_manifest: manifest.normalized,
       repository_config_snapshot_id: snapshot.id,
       repository_config_digest: snapshot.digest,
-      runtime_release: "openthrottle-snapshot/v13",
+      runtime_release: "openthrottle-snapshot/v14",
       capability_digest: shippedRuntime.digest,
       status: "dispatchable",
       active_stage_id: manifest.manifest.entry_stage,

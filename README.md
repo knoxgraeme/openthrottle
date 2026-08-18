@@ -84,7 +84,14 @@ plan through Linear control:
 npx openthrottle plan prepare docs/plans/my-change.md
 npx openthrottle ship docs/plans/my-change.md
 npx openthrottle status
+npx openthrottle status <provider-qualified-ticket-id> --admission
 ```
+
+The second status form inspects the exact accepted automatic plan and reviewer
+evidence through the authenticated supervisor. Automatic admission is opt-in;
+this repository and `openthrottle init` remain on legacy routing by default.
+See the [automatic-admission runbook](docs/runbooks/automatic-admission.md) for
+route meanings, explicit/manual bypasses, inspection, and active-run rollback.
 
 With GitHub-Issue control, apply the exact `openthrottle` label to an open Issue
 from an authorized collaborator. OpenThrottle maintains status on that Issue.

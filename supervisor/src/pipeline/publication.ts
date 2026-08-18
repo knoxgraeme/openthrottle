@@ -84,6 +84,22 @@ export interface PipelinePublicationEnvelope {
   };
   links: Array<{ label: string; url: string }>;
   structured_execution?: ExecutionPublicationSnapshot;
+  admission?: {
+    generated_content: true;
+    proposed_route: "simple" | "structured" | "needs_human" | null;
+    final_route: "simple" | "structured" | null;
+    semantic_repair_count: number;
+    infrastructure_retry_count: number;
+    terminal_state: string | null;
+    questions: string[];
+    planner: { reference: string; package_digest: string | null };
+    reviewer: { reference: string; package_digest: string | null };
+    admission_basis_digest: string;
+    effective_manifest_digest: string;
+    generated_plan_digest: string | null;
+    checkpoint_digest: string | null;
+    task_branch: { branch: string; state: string; lineage: string | null };
+  };
   resume_status: PipelineInstanceStatus | null;
   body: string;
   artifact_inline?: string;
@@ -888,6 +904,7 @@ function renderBody(
   const context = renderContext(envelope, normalizedManifest, extras);
   const lines = [
     ...summaryHeaderLines(envelope, context),
+    ...admissionSummaryLines(envelope),
     ...repairBannerLines(envelope, context, extras),
     ...executionLedgerLines(envelope.structured_execution),
     ...findingsSectionLines(envelope),
@@ -901,6 +918,49 @@ function renderBody(
     envelope.links.forEach((link) => lines.push(`- [${link.label}](${link.url})`));
   }
   return boundedSanitized(dedupeLines(lines).join("\n"), PUBLICATION_BODY_LIMIT);
+}
+
+function admissionSummaryLines(envelope: PipelinePublicationBodyInput): string[] {
+  const admission = envelope.admission;
+  if (!admission) return [];
+  const route = admission.final_route ?? admission.proposed_route ?? "pending";
+  const digest = (value: string | null) => value?.slice(0, 12) ?? "-";
+  return [
+    "### Automatic admission, generated content to verify",
+    `Route: proposed ${admission.proposed_route ?? "pending"}; final ${admission.final_route ?? "pending"}; current ${route}.`,
+    `Retries: ${admission.semantic_repair_count} semantic repair; ${admission.infrastructure_retry_count} infrastructure. Terminal: ${boundedPublicationLine(admission.terminal_state ?? "active", 120)}.`,
+    `Planner: ${boundedPublicationLine(admission.planner.reference, 320)} (${digest(admission.planner.package_digest)}). Reviewer: ${boundedPublicationLine(admission.reviewer.reference, 320)} (${digest(admission.reviewer.package_digest)}).`,
+    `Digests: admission ${digest(admission.admission_basis_digest)}; manifest ${digest(admission.effective_manifest_digest)}; plan ${digest(admission.generated_plan_digest)}; checkpoint ${digest(admission.checkpoint_digest)}.`,
+    `Task branch: ${boundedPublicationLine(admission.task_branch.branch, 240)}; ${boundedPublicationLine(admission.task_branch.state, 80)}; lineage ${digest(admission.task_branch.lineage)}.`,
+    ...admission.questions.slice(0, 16).map((question) =>
+      `Question: ${boundedPublicationLine(question, 1_000)}`),
+  ];
+}
+
+function safeAdmissionProjection(
+  admission: NonNullable<PipelinePublicationEnvelope["admission"]>
+): NonNullable<PipelinePublicationEnvelope["admission"]> {
+  return {
+    ...admission,
+    terminal_state: admission.terminal_state === null
+      ? null
+      : boundedSanitized(admission.terminal_state, 120),
+    questions: admission.questions.slice(0, 16)
+      .map((question) => boundedSanitized(question, 1_000)),
+    planner: {
+      ...admission.planner,
+      reference: boundedSanitized(admission.planner.reference, 320),
+    },
+    reviewer: {
+      ...admission.reviewer,
+      reference: boundedSanitized(admission.reviewer.reference, 320),
+    },
+    task_branch: {
+      ...admission.task_branch,
+      branch: boundedSanitized(admission.task_branch.branch, 240),
+      state: boundedSanitized(admission.task_branch.state, 80),
+    },
+  };
 }
 
 export function shouldPostLinearEventComment(envelope: PipelinePublicationEnvelope): boolean {
@@ -1025,6 +1085,7 @@ export function buildStagePublication(input: {
   /** Latest non-repair stage that scheduled the active repair branch. */
   priorRepairSourceStageId?: string;
   structuredExecution?: ExecutionPublicationSnapshot;
+  admission?: PipelinePublicationEnvelope["admission"];
 }): PipelinePublicationEnvelope {
   const resumeStatus = input.resumeStatus ?? input.write.resumeStatus ?? null;
   const evidence = (input.event.artifacts ?? []).map((artifact) => safeEvidence(artifact.payload));
@@ -1102,6 +1163,7 @@ export function buildStagePublication(input: {
     },
     links: githubLinks(input.instance, subject ?? null),
     ...(input.structuredExecution ? { structured_execution: input.structuredExecution } : {}),
+    ...(input.admission ? { admission: safeAdmissionProjection(input.admission) } : {}),
     resume_status: resumeStatus,
   };
   const publishedCommit = input.write.clearPublishedCommit
@@ -1299,6 +1361,16 @@ export function renderPipelineLogHeader(status: {
   effect_status: string | null;
   effect_attempts: number | null;
   effect_error: string | null;
+  admission?: {
+    proposed_route: string | null;
+    final_route: string | null;
+    semantic_repair_count: number;
+    infrastructure_retry_count: number;
+    admission_basis_digest: string;
+    effective_manifest_digest: string;
+    generated_plan_digest: string | null;
+    checkpoint_digest: string | null;
+  } | null;
 }): string {
   return boundedSanitized([
     `[pipeline] ${status.pipeline_id}@${status.pipeline_version} task=${status.task_type} state=${status.status}`,
@@ -1306,5 +1378,9 @@ export function renderPipelineLogHeader(status: {
     `[pipeline] subject=${status.subject ?? "-"} provider=${status.published_commit ?? "-"} gate=${status.gate_result ?? "-"} context=${status.context_policy ?? "-"}`,
     `[pipeline] publication=${status.publication_state} publication_error=${status.publication_error ?? "-"} recovery=${status.recovery_action ?? "-"}`,
     `[pipeline] effect=${status.effect_kind ?? "-"}:${status.effect_status ?? status.effect_state} attempts=${status.effect_attempts ?? "-"} effect_error=${status.effect_error ?? "-"} wait=${status.wait_reason ?? "-"}`,
+    ...(status.admission ? [
+      `[admission:generated] proposed=${status.admission.proposed_route ?? "-"} final=${status.admission.final_route ?? "-"} semantic_repairs=${status.admission.semantic_repair_count} infrastructure_retries=${status.admission.infrastructure_retry_count}`,
+      `[admission:generated] basis=${status.admission.admission_basis_digest} manifest=${status.admission.effective_manifest_digest} plan=${status.admission.generated_plan_digest ?? "-"} checkpoint=${status.admission.checkpoint_digest ?? "-"}`,
+    ] : []),
   ].join("\n"), 4_000);
 }

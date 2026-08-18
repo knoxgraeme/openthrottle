@@ -67,6 +67,10 @@ Both packages are safe built-in defaults. A repository may independently bind
 either planning role to a declared, pinned `repo://` package. Ticket text cannot
 select the package or change its digest. Planning actors are read-only and may
 not edit, publish, reroute, activate, or reuse one another's native session.
+Installing or scaffolding these packages does not enable automatic admission.
+An absent `admission_mode`, including in this repository and initializer
+output, remains legacy; a repository operator must explicitly enable automatic
+mode for a later activation.
 
 Structured graphs use five direct loop-path task adapters plus the orchestrated
 whole-change review packages:

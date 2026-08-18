@@ -29,6 +29,7 @@ import {
   accumulatedPublicationRepairSource,
   buildStagePublication,
 } from "./publication.js";
+import { projectAdmissionTransition } from "./admission-visibility.js";
 import type { LaunchFaultReason } from "./fault-attribution.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "./capability-contracts.js";
 import {
@@ -906,6 +907,13 @@ export function coordinatePipelineEvent(
   write.exhaustedEffectId = event.exhaustedEffectId;
   write.exhaustedEffectError = event.exhaustedEffectError;
   write.gateReceipt = gateReceipt;
+  const currentAdmissionProjection = store.getAdmissionProjection(instance.id);
+  write.admissionProjection = projectAdmissionTransition({
+    current: currentAdmissionProjection,
+    attempt,
+    event,
+    write,
+  });
   const stage = manifest.stages.find((candidate) => candidate.id === attempt.stage_id)!;
   // A structured graph owns its commit checkpoint frontier at each accepted
   // integration. Later stage subjects may be canonical tree IDs, so they
@@ -999,6 +1007,26 @@ export function coordinatePipelineEvent(
     priorFindings,
     priorRepairSourceStageId,
     structuredExecution,
+    admission: write.admissionProjection ? {
+      generated_content: true,
+      proposed_route: write.admissionProjection.proposed_route,
+      final_route: write.admissionProjection.final_route,
+      semantic_repair_count: write.admissionProjection.semantic_repair_count,
+      infrastructure_retry_count: write.admissionProjection.infrastructure_retry_count,
+      terminal_state: write.admissionProjection.terminal_state,
+      questions: write.admissionProjection.questions,
+      planner: write.admissionProjection.planner,
+      reviewer: write.admissionProjection.reviewer,
+      admission_basis_digest: write.admissionProjection.admission_basis_digest,
+      effective_manifest_digest: write.admissionProjection.effective_manifest_digest,
+      generated_plan_digest: write.admissionProjection.generated_plan_digest,
+      checkpoint_digest: write.admissionProjection.checkpoint_digest,
+      task_branch: {
+        branch: taskBranch?.branch ?? instance.branch,
+        state: write.taskBranchPublishedSha ? "published" : taskBranch?.status ?? "none",
+        lineage: taskBranch?.lineage ?? null,
+      },
+    } : undefined,
   }));
   attachPublicationEffects({
     write,

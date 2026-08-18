@@ -55,6 +55,12 @@ revision.
   GitHub-Issue control routes and their runbook (#192, #196–#198); the gated
   `core/tune@1` self-improvement pipeline (#203/#206); and the v12
   admission-drain deployment cutover (#211–#213).
+- OPE-186 automatic-admission visibility: an additive provider-neutral
+  projection preserves planner/reviewer provenance and the accepted route
+  independently of later execution gates; authenticated status/detail and
+  equivalent Linear/GitHub summaries expose the decision without granting
+  control authority. Repository and initializer defaults remain legacy. Live
+  evaluation and enablement remain a separate rollout milestone.
 
 ## Origin U8 (live credentialed dogfood)
 

@@ -34,7 +34,9 @@ Usage:
   openthrottle validate <file.md>   Alias for plan validate.
   openthrottle ship <file.md>      Create a Linear issue from a markdown
                                     file and delegate it to the agent.
-  openthrottle status              Show ticket status from the supervisor.
+  openthrottle status [<ticket>] [--admission]
+                                    Show provider-neutral status, or the exact
+                                    accepted automatic plan and review evidence.
   openthrottle stop <ticket>       Stop a ticket's active run and workspace.
   openthrottle logs <ticket>       Print sanitized sandbox logs.
   openthrottle analysis [flags]    Read-only run_outcomes evidence for
@@ -83,7 +85,7 @@ async function main(): Promise<void> {
     }
     case 'status': {
       const { default: status } = await import('./status.js');
-      await status(rest[0]);
+      await status(rest);
       break;
     }
     case 'stop': {

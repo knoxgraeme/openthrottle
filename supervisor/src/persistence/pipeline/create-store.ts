@@ -11,6 +11,7 @@ import { createStatusStore } from "./status-store.js";
 import { createTransitionStore } from "./transition-store.js";
 import { createExecutionUnitStore } from "./unit-store.js";
 import { createCheckpointStore } from "./checkpoint-store.js";
+import { createAdmissionVisibilityStore } from "./admission-visibility-store.js";
 
 export function createPipelineStore(
   db: Database.Database,
@@ -28,5 +29,6 @@ export function createPipelineStore(
     ...createRunOutcomeStore(db),
     ...createExecutionUnitStore(db, now),
     ...createCheckpointStore(db),
+    ...createAdmissionVisibilityStore(db),
   };
 }

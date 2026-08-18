@@ -536,6 +536,31 @@ export function createInstanceStore(db: Database.Database, now: () => string): P
     }
     const timestamp = now();
     insertInstanceGraph(seed, validated, timestamp);
+    if (seed.admission) {
+      if (seed.admission.effective_manifest_digest !== seed.manifest.digest) {
+        throw new Error("automatic admission projection manifest digest mismatch");
+      }
+      db.prepare(`
+        INSERT INTO pipeline_admission_projections (
+          pipeline_instance_id, proposed_route, final_route,
+          semantic_repair_count, infrastructure_retry_count, terminal_state, questions,
+          reviewer_verdict, planner_skill_reference, planner_package_digest,
+          reviewer_skill_reference, reviewer_package_digest,
+          admission_basis_digest, effective_manifest_digest, generated_plan_digest, checkpoint_digest,
+          accepted_plan_artifact_hash, reviewer_receipt_artifact_hash, created_at, updated_at
+        ) VALUES (?, NULL, NULL, 0, 0, NULL, '[]', NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
+      `).run(
+        validated.instanceId,
+        seed.admission.planner.reference,
+        seed.admission.planner.package_digest,
+        seed.admission.reviewer.reference,
+        seed.admission.reviewer.package_digest,
+        seed.admission.admission_basis_digest,
+        seed.admission.effective_manifest_digest,
+        timestamp,
+        timestamp,
+      );
+    }
     const sealed = sealEntryAttempt(seed, validated, timestamp);
     if (validated.writeCapable) reserveTaskBranch(seed, validated, timestamp);
     enqueueProvision(

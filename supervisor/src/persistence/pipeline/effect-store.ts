@@ -173,6 +173,19 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
         throw new Error(`pipeline task branch effect ${effect.id} checkpoint changed before acknowledgement`);
       }
       if (effect.kind === "advance_task_branch") {
+        const checkpointObject = db.prepare(`
+          SELECT payload_sha256 FROM execution_checkpoint_objects WHERE effect_id = ?
+          UNION ALL
+          SELECT payload_sha256 FROM pipeline_stage_checkpoint_objects WHERE effect_id = ?
+          LIMIT 1
+        `).get(effect.id, effect.id) as { payload_sha256: string } | undefined;
+        if (checkpointObject) {
+          db.prepare(`
+            UPDATE pipeline_admission_projections
+            SET checkpoint_digest = ?, updated_at = ?
+            WHERE pipeline_instance_id = ?
+          `).run(checkpointObject.payload_sha256, timestamp, effect.pipeline_instance_id);
+        }
         const action = db.prepare(`
           SELECT id, parent_attempt_id, execution_unit_id, unit_id
           FROM execution_work_attempts WHERE checkpoint_effect_id = ?
