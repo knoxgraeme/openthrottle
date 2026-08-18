@@ -327,6 +327,7 @@ describe("init project detection", () => {
       },
     });
     expect(contents).not.toContain("base_branch");
+    expect(contents).not.toContain("admission_mode:");
     expect(contents).not.toContain("build:");
   });
 
@@ -756,6 +757,7 @@ describe("init project detection", () => {
         },
       },
     });
+    expect(configRaw).not.toContain("admission_mode:");
 
     const graphRaw = readFileSync(join(directory, ".openthrottle/graphs/simple.json"), "utf8");
     const graph = parseGraphContract(graphRaw, {

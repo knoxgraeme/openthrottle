@@ -361,6 +361,44 @@ export function createTransitionStore(db: Database.Database, now: () => string):
       );
       wrote();
     }
+    if (write.admissionProjection) {
+      const admission = write.admissionProjection;
+      const updated = db.prepare(`
+        UPDATE pipeline_admission_projections SET
+          proposed_route = ?, final_route = ?, semantic_repair_count = ?,
+          infrastructure_retry_count = ?, terminal_state = ?, questions = ?,
+          reviewer_verdict = ?, generated_plan_digest = ?, checkpoint_digest = ?,
+          accepted_plan_artifact_hash = ?, reviewer_receipt_artifact_hash = ?, updated_at = ?
+        WHERE pipeline_instance_id = ?
+          AND planner_skill_reference = ? AND planner_package_digest IS ?
+          AND reviewer_skill_reference = ? AND reviewer_package_digest IS ?
+          AND admission_basis_digest = ? AND effective_manifest_digest = ?
+      `).run(
+        admission.proposed_route,
+        admission.final_route,
+        admission.semantic_repair_count,
+        admission.infrastructure_retry_count,
+        admission.terminal_state,
+        canonicalJson(admission.questions),
+        admission.reviewer_verdict,
+        admission.generated_plan_digest,
+        admission.checkpoint_digest,
+        admission.accepted_plan_artifact_hash,
+        admission.reviewer_receipt_artifact_hash,
+        timestamp,
+        instance.id,
+        admission.planner.reference,
+        admission.planner.package_digest,
+        admission.reviewer.reference,
+        admission.reviewer.package_digest,
+        admission.admission_basis_digest,
+        admission.effective_manifest_digest,
+      );
+      if (updated.changes !== 1) {
+        throw new Error("automatic admission projection identity fence mismatch");
+      }
+      wrote();
+    }
     maybeRecordRunNote(instance, attempt, write);
     wrote();
     db.prepare(`

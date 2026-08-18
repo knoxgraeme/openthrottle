@@ -99,6 +99,12 @@ describe("pipeline effect store", () => {
         authorizedCapabilities: manifest.manifest.requires.capabilities,
         taskType: "implement",
         planDigest: "c".repeat(64),
+        admission: {
+          planner: { reference: "builtin://admission-plan@1", package_digest: null },
+          reviewer: { reference: "builtin://review-admission-plan@1", package_digest: null },
+          admission_basis_digest: "b".repeat(64),
+          effective_manifest_digest: manifest.digest,
+        },
       },
     });
     const instance = pipelines.getInstanceForSession("branch-session")!;
@@ -160,6 +166,24 @@ describe("pipeline effect store", () => {
       acknowledged_remote_sha: "a".repeat(40),
       status: "reserved",
     });
+    const checkpointPayload = Buffer.from("accepted-checkpoint");
+    const checkpointDigest = createHash("sha256").update(checkpointPayload).digest("hex");
+    db.prepare(`
+      INSERT INTO pipeline_stage_checkpoint_objects (
+        attempt_id, effect_id, expected_tree_sha, expected_old_sha, expected_new_sha,
+        payload_sha256, payload_bytes, payload, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      pipelines.getActiveAttempt(instance.id)!.id,
+      advance.id,
+      "e".repeat(40),
+      "a".repeat(40),
+      "d".repeat(40),
+      checkpointDigest,
+      checkpointPayload.byteLength,
+      checkpointPayload,
+      "2099-01-01T00:03:30.000Z"
+    );
     const claimedAdvance = pipelines.claimEffects(
       "2099-01-01T00:04:00.000Z",
       "2099-01-01T00:05:00.000Z"
@@ -186,6 +210,10 @@ describe("pipeline effect store", () => {
       task_branch_remote_sha: "d".repeat(40),
       published_commit: null,
       published_pr_url: null,
+      admission: {
+        checkpoint_digest: checkpointDigest,
+        task_branch: { state: "checkpointed" },
+      },
     });
     expect(pipelines.listPublications(instance.id).some((receipt) => receipt.kind === "pull_request")).toBe(false);
   });

@@ -332,6 +332,7 @@ export interface PipelineStatusProjection {
   structured_checkpoint_status: "pending" | "acknowledged" | "failed" | null;
   sandbox_disk_minimum_gib: 10;
   sandbox_capacity_warning: string | null;
+  admission: AdmissionStatusProjection | null;
   structured_units: Array<{
     unit_id: string;
     status: string;
@@ -339,6 +340,50 @@ export interface PipelineStatusProjection {
     alarm: boolean;
     integration_subject: string | null;
   }>;
+}
+
+export interface AdmissionProjectionSeed {
+  planner: { reference: string; package_digest: string | null };
+  reviewer: { reference: string; package_digest: string | null };
+  admission_basis_digest: string;
+  effective_manifest_digest: string;
+}
+
+export interface AdmissionProjection extends AdmissionProjectionSeed {
+  pipeline_instance_id: string;
+  proposed_route: "simple" | "structured" | "needs_human" | null;
+  final_route: "simple" | "structured" | null;
+  semantic_repair_count: number;
+  infrastructure_retry_count: number;
+  terminal_state: string | null;
+  questions: string[];
+  reviewer_verdict: "approved" | "rejected" | "needs_human" | null;
+  generated_plan_digest: string | null;
+  checkpoint_digest: string | null;
+  accepted_plan_artifact_hash: string | null;
+  reviewer_receipt_artifact_hash: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdmissionStatusProjection extends Omit<
+  AdmissionProjection,
+  "pipeline_instance_id" | "accepted_plan_artifact_hash" | "reviewer_receipt_artifact_hash" | "created_at" | "updated_at"
+> {
+  generated_content: true;
+  task_branch: {
+    branch: string;
+    state: "none" | PipelineTaskBranch["status"];
+    lineage: string | null;
+  };
+  publication_state: PipelineStatusProjection["publication_state"];
+}
+
+export interface AdmissionDetailProjection {
+  generated_content: true;
+  warning: "Automatically generated content. Verify before relying on it.";
+  accepted_plan: unknown | null;
+  reviewer_receipt: unknown | null;
 }
 
 export interface PipelineInstanceSeed {
@@ -358,6 +403,7 @@ export interface PipelineInstanceSeed {
   runtime: ValidatedRuntimeCapabilityDescriptor;
   authorizedCapabilities: string[];
   planDigest?: string;
+  admission?: AdmissionProjectionSeed;
   taskContext?: string;
   inputArtifacts?: StageRequestInputArtifact[];
 }
@@ -422,6 +468,7 @@ export interface CoordinatorTransitionWrite {
   repairRoundIncrement?: number;
   artifacts?: CoordinatorArtifactWrite[];
   gateReceipt?: CoordinatorGateReceiptWrite;
+  admissionProjection?: AdmissionProjection;
   nextAttempt?: {
     id?: string;
     stageId: string;
@@ -531,6 +578,8 @@ export interface PipelineStore extends ChildActionLivenessPort {
   ): boolean;
   retryPublication(id: string): PipelinePublicationReceipt;
   getStatusForIssue(issueId: string): PipelineStatusProjection | undefined;
+  getAdmissionProjection(instanceId: string): AdmissionProjection | undefined;
+  getAdmissionDetail(instanceId: string): AdmissionDetailProjection | undefined;
   claimEffects(nowIso: string, leaseUntilIso: string, limit?: number): PipelineEffectIntent[];
   recordEffectAcknowledgement(input: {
     effectId: string;

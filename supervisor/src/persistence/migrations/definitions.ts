@@ -2061,6 +2061,34 @@ ALTER TABLE pipeline_artifacts_admission_next RENAME TO pipeline_artifacts;
 const admissionExecutionPlanArtifactMigrationSource = `${admissionExecutionPlanArtifactSchema}
 automatic-admission-artifact-contract:execution_plan is a distinct plan-bounded artifact and never aliases execution_graph_result or a standard receipt/v1`;
 
+const admissionProjectionSchema = `
+CREATE TABLE IF NOT EXISTS pipeline_admission_projections (
+  pipeline_instance_id TEXT PRIMARY KEY REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  proposed_route TEXT CHECK(proposed_route IS NULL OR proposed_route IN ('simple', 'structured', 'needs_human')),
+  final_route TEXT CHECK(final_route IS NULL OR final_route IN ('simple', 'structured')),
+  semantic_repair_count INTEGER NOT NULL DEFAULT 0 CHECK(semantic_repair_count >= 0),
+  infrastructure_retry_count INTEGER NOT NULL DEFAULT 0 CHECK(infrastructure_retry_count >= 0),
+  terminal_state TEXT,
+  questions TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(questions) AND json_type(questions) = 'array'),
+  reviewer_verdict TEXT CHECK(reviewer_verdict IS NULL OR reviewer_verdict IN ('approved', 'rejected', 'needs_human')),
+  planner_skill_reference TEXT NOT NULL,
+  planner_package_digest TEXT CHECK(planner_package_digest IS NULL OR (length(planner_package_digest) = 64 AND planner_package_digest NOT GLOB '*[^a-f0-9]*')),
+  reviewer_skill_reference TEXT NOT NULL,
+  reviewer_package_digest TEXT CHECK(reviewer_package_digest IS NULL OR (length(reviewer_package_digest) = 64 AND reviewer_package_digest NOT GLOB '*[^a-f0-9]*')),
+  admission_basis_digest TEXT NOT NULL CHECK(length(admission_basis_digest) = 64 AND admission_basis_digest NOT GLOB '*[^a-f0-9]*'),
+  effective_manifest_digest TEXT NOT NULL CHECK(length(effective_manifest_digest) = 64 AND effective_manifest_digest NOT GLOB '*[^a-f0-9]*'),
+  generated_plan_digest TEXT CHECK(generated_plan_digest IS NULL OR (length(generated_plan_digest) = 64 AND generated_plan_digest NOT GLOB '*[^a-f0-9]*')),
+  checkpoint_digest TEXT CHECK(checkpoint_digest IS NULL OR (length(checkpoint_digest) = 64 AND checkpoint_digest NOT GLOB '*[^a-f0-9]*')),
+  accepted_plan_artifact_hash TEXT CHECK(accepted_plan_artifact_hash IS NULL OR (length(accepted_plan_artifact_hash) = 64 AND accepted_plan_artifact_hash NOT GLOB '*[^a-f0-9]*')),
+  reviewer_receipt_artifact_hash TEXT CHECK(reviewer_receipt_artifact_hash IS NULL OR (length(reviewer_receipt_artifact_hash) = 64 AND reviewer_receipt_artifact_hash NOT GLOB '*[^a-f0-9]*')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`;
+
+const admissionProjectionMigrationSource = `${admissionProjectionSchema}
+automatic-admission-visibility-contract:one durable provider-neutral projection per pipeline instance references canonical plan and review artifacts without duplicating them/v1`;
+
 const tuneTaskTypeSchema = `
 CREATE TABLE pipeline_instances_tune_next (
   id TEXT PRIMARY KEY,
@@ -4068,6 +4096,16 @@ const definitions: DatabaseMigrationDefinition[] = [
       `).get() as { sql: string } | undefined;
       if (artifacts && !artifacts.sql.includes("'execution_plan'")) {
         db.exec(admissionExecutionPlanArtifactSchema);
+      }
+    },
+  },
+  {
+    version: 57,
+    name: "automatic-admission-projection [rollback-compatible:additive/v1]",
+    source: admissionProjectionMigrationSource,
+    up(db) {
+      if (!hasTable(db, "pipeline_admission_projections")) {
+        db.exec(admissionProjectionSchema);
       }
     },
   },

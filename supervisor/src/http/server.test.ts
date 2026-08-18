@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -557,6 +557,115 @@ describe("coordinator-only server", () => {
       },
       pipeline: null,
     });
+  });
+
+  it("serves the durable automatic-admission projection and exact authorized detail", async () => {
+    seedPipelineTicket();
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const plan = JSON.stringify({
+      schema: "openthrottle.execution-plan/v2",
+      graph_id: "structured",
+      plan_id: "visibility-proof",
+      units: [],
+      commands: [],
+    });
+    const review = JSON.stringify({
+      schema: "openthrottle.standard-receipt/v1",
+      type: "admission_review",
+      result: "approved",
+      evidence: ["Every ticket acceptance condition is covered."],
+      payload: { review: { verdict: "approved" } },
+    });
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const planArtifact = JSON.stringify({ execution_plan: JSON.parse(plan) });
+    const reviewArtifact = JSON.stringify({ details: { receipt: JSON.parse(review) } });
+    const planArtifactHash = createHash("sha256").update(planArtifact).digest("hex");
+    const reviewArtifactHash = createHash("sha256").update(reviewArtifact).digest("hex");
+    db.prepare(`
+      INSERT INTO pipeline_artifacts (
+        id, pipeline_instance_id, attempt_id, kind, schema_version,
+        assurance, subject, payload, artifact_hash, created_at
+      ) VALUES
+        ('admission-plan-detail', ?, ?, 'execution_plan', 1, 'executor_verified', NULL, ?, ?, ?),
+        ('admission-review-detail', ?, ?, 'standard_receipt', 1, 'semantic_attested', NULL, ?, ?, ?)
+    `).run(
+      instance.id, attempt.id, planArtifact, planArtifactHash, "2026-08-18T00:00:00.000Z",
+      instance.id, attempt.id, reviewArtifact, reviewArtifactHash, "2026-08-18T00:00:00.000Z",
+    );
+    db.prepare(`
+      INSERT INTO pipeline_admission_projections (
+        pipeline_instance_id, proposed_route, final_route, semantic_repair_count,
+        infrastructure_retry_count, terminal_state, questions,
+        planner_skill_reference, planner_package_digest,
+        reviewer_skill_reference, reviewer_package_digest,
+        admission_basis_digest, effective_manifest_digest, generated_plan_digest,
+        accepted_plan_artifact_hash, reviewer_receipt_artifact_hash, created_at, updated_at
+      ) VALUES (?, 'structured', 'structured', 1, 2, 'accepted', '[]',
+        'builtin://admission-plan@1', NULL, 'repo://owner/repo@base#.openthrottle/skills/reviewer', ?,
+        ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      instance.id,
+      "d".repeat(64),
+      "a".repeat(64),
+      "b".repeat(64),
+      "c".repeat(64),
+      planArtifactHash,
+      reviewArtifactHash,
+      "2026-08-18T00:00:00.000Z",
+      "2026-08-18T00:01:00.000Z",
+    );
+
+    const statusResponse = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    const statusBody = await statusResponse.json() as {
+      tickets: Array<{ pipeline: { admission: Record<string, unknown> } }>;
+    };
+    expect(statusBody.tickets[0]!.pipeline.admission).toEqual(expect.objectContaining({
+      generated_content: true,
+      proposed_route: "structured",
+      final_route: "structured",
+      semantic_repair_count: 1,
+      infrastructure_retry_count: 2,
+      planner: { reference: "builtin://admission-plan@1", package_digest: null },
+      reviewer: {
+        reference: "repo://owner/repo@base#.openthrottle/skills/reviewer",
+        package_digest: "d".repeat(64),
+      },
+      admission_basis_digest: "a".repeat(64),
+      effective_manifest_digest: "b".repeat(64),
+      generated_plan_digest: "c".repeat(64),
+    }));
+    expect(statusBody.tickets[0]!.pipeline.admission).not.toHaveProperty("accepted_plan");
+
+    const unauthorized = await app().request("/tickets/issue-1/admission");
+    expect(unauthorized.status).toBe(401);
+    const detailResponse = await app().request("/tickets/issue-1/admission", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(detailResponse.status).toBe(200);
+    expect(await detailResponse.json()).toEqual({
+      generated_content: true,
+      warning: "Automatically generated content. Verify before relying on it.",
+      accepted_plan: JSON.parse(plan),
+      reviewer_receipt: JSON.parse(review),
+    });
+  });
+
+  it("keeps legacy and explicit direct pipelines free of automatic-admission state", async () => {
+    seedPipelineTicket();
+    const response = await app().request("/status", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    const body = await response.json() as {
+      tickets: Array<{ pipeline: { admission: unknown } }>;
+    };
+    expect(body.tickets[0]!.pipeline.admission).toBeNull();
+
+    const detail = await app().request("/tickets/issue-1/admission", {
+      headers: { Authorization: "Bearer status-token" },
+    });
+    expect(detail.status).toBe(404);
   });
 
   it("serves filterable run_outcomes evidence through the read-only analysis surface", async () => {

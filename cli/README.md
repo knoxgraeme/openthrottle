@@ -49,7 +49,7 @@ openthrottle plan validate <file.md>
 openthrottle plan prepare <file.md> [--graph <id>]
 openthrottle validate <file.md>
 openthrottle ship <file.md>
-openthrottle status
+openthrottle status [<ticket>] [--admission]
 openthrottle stop <ticket>
 openthrottle logs <ticket>
 openthrottle analysis [filters]
@@ -73,6 +73,10 @@ Key workflows:
   `plan validate` checks the embedded execution-plan contract.
 - `status`, `stop`, `logs`, and `analysis` call authenticated supervisor
   endpoints.
+- `status <ticket> --admission` prints the exact accepted automatic plan and
+  reviewer receipt from the same provider-neutral, status-token-protected data
+  used by the list view. Init still leaves admission mode absent and therefore
+  legacy.
 
 Run `npx openthrottle --help` for full flag descriptions.
 

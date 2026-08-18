@@ -92,6 +92,13 @@ self-contained OpenThrottle skills. There is no second execution architecture.
 Supported ticket intents are `implement` and `investigate`. Pipeline selection
 is unconditional for every new generation.
 
+Automatic admission is opt-in per implementation intent with
+`admission_mode: automatic`. An absent value or `legacy` preserves the current
+default-graph selection and missing-plan rejection. A complete explicit simple
+selection or complete structured plan remains authoritative and bypasses the
+automatic planner. Automatic planning cannot be selected by investigate or
+tune tickets, ticket-authored skill paths, or an already-running generation.
+
 ## Manifest and catalog contract
 
 Pipeline YAML is strictly parsed with duplicate keys, aliases, unknown fields,
@@ -824,6 +831,7 @@ sentence, or links rendered after it.
 | `GET` | `/oauth/install` | `OT_INSTALL_SECRET` bearer | begin Linear OAuth |
 | `GET` | `/oauth/callback` | one-time OAuth state | exchange and store installation |
 | `GET` | `/status` | `OT_STATUS_TOKEN` bearer | tickets and pipeline/effect/publication state |
+| `GET` | `/tickets/:id/admission` | `OT_STATUS_TOKEN` bearer | exact accepted automatic plan and reviewer receipt, when present |
 | `GET` | `/capabilities` | `OT_STATUS_TOKEN` bearer | active runtime release, capability digest/IDs, and effective limits |
 | `GET` | `/deployment/cutover-evidence` | `OT_DEPLOY_TOKEN` bearer | bounded, fail-closed admission drain plus runtime, snapshot, and migration rollback-compatibility identity |
 | `POST` | `/deployment/cutover/begin` | `OT_DEPLOY_TOKEN` bearer | open a snapshot cutover record with old runtime/snapshot identity, candidate snapshot, and evidence |
@@ -877,6 +885,18 @@ tickets with a pipeline instance, the nested `pipeline` object includes:
 | `last_error` | newest failed/dead effect or failed gate summary, sanitized and capped at 500 chars |
 | `last_state_change_at` | pipeline instance state-change timestamp |
 
+Automatic instances also include one nested `admission` projection. It is
+read from `pipeline_admission_projections`, never inferred from the newest
+generic gate receipt. It contains proposed/final route, bounded retry counts,
+admission terminal state and actionable questions, exact planner/reviewer
+package identity, admission/effective-manifest/generated-plan/checkpoint
+digests, and the current task-branch/publication state. The list response does
+not inline the plan. `GET /tickets/:id/admission` resolves the projection's
+immutable artifact hashes and returns the exact accepted plan and reviewer
+receipt. Both surfaces use status-token authorization and label their content
+as automatically generated. Legacy and explicit-bypass instances return
+`admission: null`, and the detail route returns `404`.
+
 `GET /capabilities` returns the installed runtime capability descriptor's
 `release`, `capabilityDigest`, and `capabilities` array, read directly off the
 same `ValidatedRuntimeCapabilityDescriptor` admission validates every pipeline
@@ -914,6 +934,9 @@ SQLite is the authority. Core tables include:
 - evidence/effects: `pipeline_artifacts`, `pipeline_gate_receipts`,
   `pipeline_publication_receipts`, `pipeline_effect_intents`,
   `pipeline_task_branches`, `pipeline_stage_checkpoint_objects`;
+- automatic-admission visibility: `pipeline_admission_projections`, one row per
+  automatic instance, with immutable authority/provenance and mutable bounded
+  decision counters plus hashes referencing canonical plan/reviewer artifacts;
 - structured child execution: `execution_graphs`, `execution_units`,
   `execution_work_attempts`, `execution_review_subaction_dispatches`, `execution_gate_receipts`,
   `execution_downstream_context`, `execution_publication_events`,
@@ -1410,6 +1433,11 @@ stage, plus once per structured unit worktree before the first repository
 command executes there — it is the repository's declared way to make any
 fresh checkout runnable, and unit worktrees are fresh checkouts.
 
+An implement intent may set `admission_mode: legacy | automatic` and may bind
+`planner_skill` and `reviewer_skill` through declared `builtin://` or `repo://`
+references. Missing mode is legacy. Neither `openthrottle init` nor this
+repository writes `automatic` by default.
+
 ## CLI contract
 
 `openthrottle setup` loads the CLI's pinned release manifest and drives the
@@ -1472,6 +1500,12 @@ supervisor endpoints. Ticket-targeting commands and `status` filtering use the
 provider-qualified ticket `id`; status output leads with the human-facing
 `reference`. `analysis` filters `GET /analysis/runs` by `--outcome`, `--reason`,
 `--attribution`, `--graph`, `--skill-digest`, `--from`, `--to`, and `--limit`.
+
+`openthrottle status <ticket> --admission` reads the same authenticated
+provider-neutral projection as `/status` and prints the exact accepted plan
+and reviewer receipt from `/tickets/:id/admission`. It never scrapes Linear or
+GitHub prose and grants no activation, routing, publication, or mutation
+authority.
 
 An explicit structured (unit-consuming) graph selection adds one pre-mutation
 step to `ship`: before any Linear call, the CLI calls the configured
