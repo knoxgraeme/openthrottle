@@ -102,6 +102,26 @@ describe("automatic admission rollout evidence", () => {
     }
   });
 
+  it("produces equivalent scores for a large decision set regardless of decision order", () => {
+    const corpus = validateAdmissionEvaluationCorpus(
+      fixture("cases.json"), fixture("labels.json"), fixture("manifest.json"),
+    ).value;
+    const ordered = buildEvidence(corpus);
+    const firstRepeats = ordered.decisions.filter((decision) => decision.repeat === 1);
+    for (let repeat = 4; repeat <= 100; repeat += 1) {
+      for (const decision of firstRepeats) ordered.decisions.push({ ...decision, repeat });
+    }
+    const reversed = clone(ordered);
+    reversed.decisions.reverse();
+
+    const orderedReport = scoreAdmissionRolloutEvidence(corpus, ordered, governingDigests);
+    const reversedReport = scoreAdmissionRolloutEvidence(corpus, reversed, governingDigests);
+
+    expect(orderedReport.total_decisions).toBe(9_000);
+    expect(reversedReport.models).toEqual(orderedReport.models);
+    expect(orderedReport.models.map((model) => model.live_decisions)).toEqual([4_500, 4_500]);
+  });
+
   it("rejects incomplete repeats and per-model threshold failures", () => {
     const corpus = validateAdmissionEvaluationCorpus(
       fixture("cases.json"), fixture("labels.json"), fixture("manifest.json"),

@@ -175,11 +175,15 @@ describe("coordinator-only server", () => {
   function seedPipelineTicket(
     sessionId = "session-1",
     ticketId = "issue-1",
-    ticketReference = "OT-1"
+    ticketReference = "OT-1",
+    automatic = false,
   ): void {
     const runtime = buildInstalledRuntimeDescriptor("server-test/v1");
     const catalog = loadPipelineCatalog(
-      fileURLToPath(new URL("../__fixtures__/pipelines/catalog.yaml", import.meta.url)),
+      fileURLToPath(new URL(
+        automatic ? "../../pipelines/catalog.yaml" : "../__fixtures__/pipelines/catalog.yaml",
+        import.meta.url,
+      )),
       runtime.descriptor
     );
     pipelines.acceptRuntimeDescriptor(runtime);
@@ -190,7 +194,7 @@ describe("coordinator-only server", () => {
       blobSha: "b".repeat(40),
       config: parseRepositoryConfig("schema: openthrottle.config/v1\ndefault_graph: simple\ngraphs: [{ id: simple, kind: builtin, ref: core/simple@1 }]\npipelines: { implement: fixture-command }\n"),
     });
-    const manifest = catalog.manifests.get("fixture/command@1")!;
+    const manifest = catalog.manifests.get(automatic ? "core/automatic@1" : "fixture/command@1")!;
     store.upsert({
       ticket_id: ticketId,
       ticket_reference: ticketReference,
@@ -560,7 +564,7 @@ describe("coordinator-only server", () => {
   });
 
   it("serves the durable automatic-admission projection and exact authorized detail", async () => {
-    seedPipelineTicket();
+    seedPipelineTicket("session-1", "issue-1", "OT-1", true);
     const instance = pipelines.getInstanceForSession("session-1")!;
     const plan = JSON.stringify({
       schema: "openthrottle.execution-plan/v2",

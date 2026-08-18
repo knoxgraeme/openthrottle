@@ -1,4 +1,5 @@
 import { digestCanonicalJson } from "./canonical.js";
+import type { AdmissionRoute } from "./admission-decision.js";
 import {
   SHA256,
   arrayAt,
@@ -37,7 +38,7 @@ const SENSITIVE_MATERIAL = [
   /\bOT_STATUS_TOKEN\s*=/,
 ];
 
-export type AdmissionEvaluationRoute = "simple" | "structured" | "needs_human";
+export type AdmissionEvaluationRoute = AdmissionRoute;
 export type AdmissionEvaluationModelFamily = "sol" | "opus";
 
 export interface AdmissionEvaluationCase {
@@ -371,9 +372,13 @@ export function validateAdmissionRolloutEvidence(value: unknown): ValidatedContr
       cost_usd_micros: integerAt(decision.cost_usd_micros, `${path}.cost_usd_micros`, 0, 1_000_000_000_000),
     };
   }, { min: 1, max: 100_000 });
-  const keys = decisions.map((entry) => `${entry.case_id}:${entry.model_id}:${entry.repeat}`);
-  if (new Set(keys).size !== keys.length) {
-    fail("admission_rollout_evidence.decisions", "must not contain duplicate case, model, and repeat tuples");
+  const keys = new Set<string>();
+  for (const decision of decisions) {
+    const key = `${decision.case_id}:${decision.model_id}:${decision.repeat}`;
+    if (keys.has(key)) {
+      fail("admission_rollout_evidence.decisions", "must not contain duplicate case, model, and repeat tuples");
+    }
+    keys.add(key);
   }
 
   const evidence: AdmissionRolloutEvidence = {
@@ -409,16 +414,51 @@ export function scoreAdmissionRolloutEvidence(
     fail("admission_rollout_evidence.decisions", `must contain at least ${ADMISSION_EVALUATION_MIN_LIVE_DECISIONS} live decisions`);
   }
 
-  const labels = new Map(corpus.labels.map((entry) => [entry.case_id, entry.expected_route]));
-  const models = new Map(evidence.value.models.map((entry) => [entry.model_id, entry]));
+  const labels = new Map<string, AdmissionEvaluationRoute>();
+  for (const label of corpus.labels) labels.set(label.case_id, label.expected_route);
+  const decisionsByModel = new Map<string, {
+    cases: Map<string, { repeats: AdmissionEvaluationDecision[]; count: number }>;
+    latency_ms: number;
+    input_tokens: number;
+    output_tokens: number;
+    cost_usd_micros: number;
+    live_decisions: number;
+  }>();
+  for (const model of evidence.value.models) {
+    decisionsByModel.set(model.model_id, {
+      cases: new Map<string, { repeats: AdmissionEvaluationDecision[]; count: number }>(),
+      latency_ms: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cost_usd_micros: 0,
+      live_decisions: 0,
+    });
+  }
   for (const decision of evidence.value.decisions) {
-    if (!labels.has(decision.case_id)) fail("admission_rollout_evidence.decisions", `references unknown case ${decision.case_id}`);
-    if (!models.has(decision.model_id)) fail("admission_rollout_evidence.decisions", `references unknown model ${decision.model_id}`);
+    if (!labels.has(decision.case_id)) {
+      fail("admission_rollout_evidence.decisions", `references unknown case ${decision.case_id}`);
+    }
+    const model = decisionsByModel.get(decision.model_id);
+    if (!model) {
+      fail("admission_rollout_evidence.decisions", `references unknown model ${decision.model_id}`);
+    }
+    let candidate = model.cases.get(decision.case_id);
+    if (!candidate) {
+      candidate = { repeats: [], count: 0 };
+      model.cases.set(decision.case_id, candidate);
+    }
+    candidate.repeats[decision.repeat - 1] = decision;
+    candidate.count += 1;
+    model.live_decisions += 1;
+    model.latency_ms += decision.latency_ms;
+    model.input_tokens += decision.input_tokens;
+    model.output_tokens += decision.output_tokens;
+    model.cost_usd_micros += decision.cost_usd_micros;
   }
 
   const modelScores: AdmissionEvaluationModelScore[] = [];
   for (const model of evidence.value.models) {
-    const modelDecisions = evidence.value.decisions.filter((entry) => entry.model_id === model.model_id);
+    const indexed = decisionsByModel.get(model.model_id)!;
     let correctWorstCasePairs = 0;
     let unambiguousNeedsHumanPairs = 0;
     let unsafeSimpleDecisions = 0;
@@ -426,14 +466,13 @@ export function scoreAdmissionRolloutEvidence(
     let unapprovedStructuredDecisions = 0;
 
     for (const label of corpus.labels) {
-      const repeats = modelDecisions
-        .filter((entry) => entry.case_id === label.case_id)
-        .sort((left, right) => left.repeat - right.repeat);
-      if (repeats.length < ADMISSION_EVALUATION_MIN_REPEATS) {
+      const candidate = indexed.cases.get(label.case_id);
+      if (!candidate || candidate.count < ADMISSION_EVALUATION_MIN_REPEATS) {
         fail("admission_rollout_evidence.decisions", `${model.model_id}/${label.case_id} must have at least ${ADMISSION_EVALUATION_MIN_REPEATS} repeats`);
       }
+      const repeats = candidate.repeats;
       for (let index = 0; index < repeats.length; index += 1) {
-        if (repeats[index]!.repeat !== index + 1) {
+        if (repeats[index]?.repeat !== index + 1) {
           fail("admission_rollout_evidence.decisions", `${model.model_id}/${label.case_id} repeats must be contiguous from 1`);
         }
       }
@@ -472,7 +511,7 @@ export function scoreAdmissionRolloutEvidence(
       model_id: model.model_id,
       family: model.family,
       case_model_pairs: corpus.labels.length,
-      live_decisions: modelDecisions.length,
+      live_decisions: indexed.live_decisions,
       correct_worst_case_pairs: correctWorstCasePairs,
       routing_accuracy_bps: routingAccuracyBps,
       unambiguous_needs_human_pairs: unambiguousNeedsHumanPairs,
@@ -480,10 +519,10 @@ export function scoreAdmissionRolloutEvidence(
       unsafe_simple_decisions: unsafeSimpleDecisions,
       ambiguous_executable_decisions: ambiguousExecutableDecisions,
       unapproved_structured_decisions: unapprovedStructuredDecisions,
-      latency_ms: modelDecisions.reduce((sum, entry) => sum + entry.latency_ms, 0),
-      input_tokens: modelDecisions.reduce((sum, entry) => sum + entry.input_tokens, 0),
-      output_tokens: modelDecisions.reduce((sum, entry) => sum + entry.output_tokens, 0),
-      cost_usd_micros: modelDecisions.reduce((sum, entry) => sum + entry.cost_usd_micros, 0),
+      latency_ms: indexed.latency_ms,
+      input_tokens: indexed.input_tokens,
+      output_tokens: indexed.output_tokens,
+      cost_usd_micros: indexed.cost_usd_micros,
     });
   }
 

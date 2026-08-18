@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import type {
+  AdmissionProjection,
   PipelineEffectIntent,
   PipelineInstance,
   PipelinePublicationReceipt,
@@ -8,7 +9,23 @@ import type {
   PipelineStore,
   PipelineTaskBranch,
 } from "../../pipeline/store.js";
+import { isAutomaticManifest } from "../../pipeline/manifest.js";
 import { sanitizeText } from "../../shared/sanitize.js";
+import {
+  mapAdmissionProjectionRow,
+  type AdmissionProjectionRow,
+} from "./admission-visibility-store.js";
+
+function admissionForInstance(
+  db: Database.Database,
+  instance: PipelineInstance,
+): AdmissionProjection | undefined {
+  if (!isAutomaticManifest(instance.pipeline_id)) return undefined;
+  const row = db.prepare(`
+    SELECT * FROM pipeline_admission_projections WHERE pipeline_instance_id = ?
+  `).get(instance.id) as AdmissionProjectionRow | undefined;
+  return row ? mapAdmissionProjectionRow(row) : undefined;
+}
 
 function boundedStatusError(value: string | null | undefined): string | null {
   if (!value) return null;
@@ -147,25 +164,7 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
       const taskBranch = db.prepare(`
         SELECT * FROM pipeline_task_branches WHERE pipeline_instance_id = ?
       `).get(instance.id) as PipelineTaskBranch | undefined;
-      const admission = db.prepare(`
-        SELECT * FROM pipeline_admission_projections WHERE pipeline_instance_id = ?
-      `).get(instance.id) as undefined | {
-        proposed_route: "simple" | "structured" | "needs_human" | null;
-        final_route: "simple" | "structured" | null;
-        semantic_repair_count: number;
-        infrastructure_retry_count: number;
-        terminal_state: string | null;
-        questions: string;
-        reviewer_verdict: "approved" | "rejected" | "needs_human" | null;
-        planner_skill_reference: string;
-        planner_package_digest: string | null;
-        reviewer_skill_reference: string;
-        reviewer_package_digest: string | null;
-        admission_basis_digest: string;
-        effective_manifest_digest: string;
-        generated_plan_digest: string | null;
-        checkpoint_digest: string | null;
-      };
+      const admission = admissionForInstance(db, instance);
       const effects = db.prepare(`
         SELECT *,
           CASE WHEN status IN ('failed', 'dead') THEN next_attempt_at ELSE created_at END AS status_sort_at
@@ -303,16 +302,16 @@ export function createStatusStore(db: Database.Database): Pick<PipelineStore, "g
           semantic_repair_count: admission.semantic_repair_count,
           infrastructure_retry_count: admission.infrastructure_retry_count,
           terminal_state: admission.terminal_state,
-          questions: (JSON.parse(admission.questions) as string[])
-            .slice(0, 16).map((question) => sanitizeText(question).slice(0, 1_000)),
+          questions: admission.questions.slice(0, 16)
+            .map((question) => sanitizeText(question).slice(0, 1_000)),
           reviewer_verdict: admission.reviewer_verdict,
           planner: {
-            reference: admission.planner_skill_reference,
-            package_digest: admission.planner_package_digest,
+            reference: admission.planner.reference,
+            package_digest: admission.planner.package_digest,
           },
           reviewer: {
-            reference: admission.reviewer_skill_reference,
-            package_digest: admission.reviewer_package_digest,
+            reference: admission.reviewer.reference,
+            package_digest: admission.reviewer.package_digest,
           },
           admission_basis_digest: admission.admission_basis_digest,
           effective_manifest_digest: admission.effective_manifest_digest,

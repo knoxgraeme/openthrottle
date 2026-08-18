@@ -2,7 +2,7 @@ import type { Ticket, SupervisorStore } from "../persistence/store.js";
 import type { RepositoryPublicationPort, RepositoryRefWritePort } from "../app/ports.js";
 import type { CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
-import { stageById } from "../pipeline/manifest.js";
+import { AUTOMATIC_ADMISSION_STAGE_IDS, stageById } from "../pipeline/manifest.js";
 import { evaluateAdmissionDecisionGate, evaluateAdmissionReviewGate, type AdmissionGateContext } from "../pipeline/admission-gate.js";
 import { extractJsonBlocks } from "../pipeline/markdown.js";
 import { FOR_EACH_UNIT_CAPABILITY } from "../pipeline/capability-contracts.js";
@@ -449,17 +449,24 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
 
   const typedReceiptFromInput = <T extends StandardReceipt["type"]>(
     request: StageRequestEnvelope,
-    type: T
+    type: T,
+    errors: {
+      missing: string;
+      wrongType: string;
+    } = {
+      missing: `supervisor tune stage ${request.stageId} is missing its sealed predecessor receipt`,
+      wrongType: `supervisor tune stage ${request.stageId} requires ${type}`,
+    },
   ): Extract<StandardReceipt, { type: T }> => {
     const artifact = request.inputArtifacts?.find((entry) => entry.kind === "standard_receipt");
     if (!artifact || digestNormalized(artifact.payload) !== artifact.hash) {
-      throw new Error(`supervisor tune stage ${request.stageId} is missing its sealed predecessor receipt`);
+      throw new Error(errors.missing);
     }
     const wrapper = JSON.parse(artifact.payload) as { details?: { receipt?: unknown } };
     const receipt = validateStandardReceipt(wrapper.details?.receipt, {
       source: `stage.${request.stageId}.input_receipt`,
     }).value;
-    if (receipt.type !== type) throw new Error(`supervisor tune stage ${request.stageId} requires ${type}`);
+    if (receipt.type !== type) throw new Error(errors.wrongType);
     return receipt as Extract<StandardReceipt, { type: T }>;
   };
 
@@ -826,8 +833,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       throw new Error("automatic admission sealed effective manifest digest mismatch");
     }
     const manifest = JSON.parse(instance.normalized_manifest) as import("../pipeline/manifest.js").PipelineManifest;
-    const plannerStage = manifest.stages.find((stage) => stage.id === "admission_planner");
-    const reviewerStage = manifest.stages.find((stage) => stage.id === "admission_reviewer");
+    const plannerStage = manifest.stages.find((stage) => stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.planner);
+    const reviewerStage = manifest.stages.find((stage) => stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewer);
     const bindingFor = (stage: typeof plannerStage, name: "planner" | "reviewer") => {
       const configured = sealed.admission_basis?.skills?.[name];
       const skill = stage?.repositorySkill?.reference ?? stage?.loop?.skill;
@@ -850,7 +857,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       throw new Error("automatic admission receipt wrapper is missing its producer request fence");
     }
     let planRequestHash = receiptWrapper.stage.request_hash;
-    if (request.stageId === "admission_review_gate") {
+    if (request.stageId === AUTOMATIC_ADMISSION_STAGE_IDS.reviewGate) {
       const decisionWrapper = inputArtifactPayload(request, "stage_result") as {
         details?: { planner_request_hash?: unknown };
       };
@@ -886,15 +893,6 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     return JSON.parse(artifact.payload) as unknown;
   };
 
-  const inputReceipt = (request: StageRequestEnvelope, expectedType: "admission_decision" | "admission_review") => {
-    const wrapper = inputArtifactPayload(request, "standard_receipt") as { details?: { receipt?: unknown } };
-    const receipt = validateStandardReceipt(wrapper.details?.receipt, {
-      source: `stage.${request.stageId}.input_receipt`,
-    }).value;
-    if (receipt.type !== expectedType) throw new Error(`automatic admission gate requires ${expectedType}`);
-    return receipt;
-  };
-
   const executeSupervisorAdmissionGate = (
     effect: PipelineEffectIntent,
     instance: PipelineInstance,
@@ -923,8 +921,11 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     let details: Record<string, unknown>;
     let executionPlanArtifact: NonNullable<PipelineCoordinatorEvent["artifacts"]>[number] | undefined;
     try {
-      if (request.stageId === "admission_decision_gate") {
-        const receipt = inputReceipt(request, "admission_decision");
+      if (request.stageId === AUTOMATIC_ADMISSION_STAGE_IDS.decisionGate) {
+        const receipt = typedReceiptFromInput(request, "admission_decision", {
+          missing: "automatic admission gate is missing sealed standard_receipt",
+          wrongType: "automatic admission gate requires admission_decision",
+        });
         const rawPlan = request.inputArtifacts?.some((entry) => entry.kind === "execution_plan")
           ? inputArtifactPayload(request, "execution_plan")
           : undefined;
@@ -947,7 +948,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
             hash: digestNormalized(payload),
           };
         }
-      } else if (request.stageId === "admission_review_gate") {
+      } else if (request.stageId === AUTOMATIC_ADMISSION_STAGE_IDS.reviewGate) {
         const decisionWrapper = inputArtifactPayload(request, "stage_result") as {
           details?: { decision?: unknown };
         };
@@ -955,7 +956,10 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           context,
           decision: decisionWrapper.details?.decision,
           executionPlan: inputArtifactPayload(request, "execution_plan"),
-          receipt: inputReceipt(request, "admission_review"),
+          receipt: typedReceiptFromInput(request, "admission_review", {
+            missing: "automatic admission gate is missing sealed standard_receipt",
+            wrongType: "automatic admission gate requires admission_review",
+          }),
         });
         outcome = result.outcome;
         summary = outcome === "success"
@@ -981,8 +985,8 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     } catch (error) {
       outcome = "semantic_repair_required";
       summary = `Automatic admission evidence was rejected: ${sanitizeText(String(error)).slice(0, 800)}`;
-      details = { correction_owner: request.stageId === "admission_decision_gate" ? "planner" : "reviewer" };
-      if (request.stageId === "admission_review_gate") {
+      details = { correction_owner: request.stageId === AUTOMATIC_ADMISSION_STAGE_IDS.decisionGate ? "planner" : "reviewer" };
+      if (request.stageId === AUTOMATIC_ADMISSION_STAGE_IDS.reviewGate) {
         const carried = request.inputArtifacts?.find((entry) => entry.kind === "execution_plan");
         if (carried) executionPlanArtifact = { ...carried };
       }

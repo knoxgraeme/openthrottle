@@ -2,7 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 import { canonicalJson } from "./capabilities.mjs";
@@ -18,7 +18,6 @@ import { runWithUserProcessFence } from "./agent-process-fence.mjs";
 import { deriveCandidateCommit, grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
 import {
   chmodOwnerPrivateTree,
-  chmodReadOnlyPreservingExecuteTree,
   chmodTree,
   chownTree,
   ensureSandboxRootTraversal,
@@ -49,7 +48,7 @@ import {
   PROFILE_ROOT_FENCE_FILE,
   actionDirectory,
   configuredActionRoot,
-  packReachableBaseObjects,
+  materializeExactSubjectReadOnlyRepositoryView,
   pathInside,
   runRootGit,
 } from "./loop-paths.mjs";
@@ -901,31 +900,16 @@ function createReadOnlyRepositoryView(request, sourceRepoDir = "/home/agent/repo
   const actionRoot = configuredActionRoot();
   const currentActionDirectory = ensureCurrentActionTraversal(request, actionRoot);
   const destination = pathInside(currentActionDirectory, "repo-view");
-  rmSync(destination, { recursive: true, force: true });
   lockNonCurrentActionDirectories(request, actionRoot);
   const viewSourceRepoDir = request.receiptCorrectionSourceRepoDir ?? sourceRepoDir;
   const viewSourceEnv = request.receiptCorrectionGitObjectEnv ?? {};
   const sourceSubject = request.receiptCorrectionSubject ?? sealedReadOnlySubject(request) ?? "HEAD";
-  const subject = runRootGit(viewSourceRepoDir, ["rev-parse", sourceSubject], viewSourceEnv);
-  const objectType = runRootGit(viewSourceRepoDir, ["cat-file", "-t", subject], viewSourceEnv);
-  if (objectType !== "commit" && objectType !== "tree") {
-    throw new Error("read-only repository subject must be a commit or tree");
-  }
-  mkdirSync(destination, { recursive: true, mode: 0o755 });
-  runRootGit(destination, ["init", "--quiet"]);
-  const packDir = pathInside(pathInside(destination, ".git"), "objects/pack");
-  mkdirSync(packDir, { recursive: true, mode: 0o755 });
-  packReachableBaseObjects(viewSourceRepoDir, join(packDir, "authorized"), subject, viewSourceEnv);
-  if (objectType === "commit") {
-    runRootGit(destination, ["switch", "--quiet", "--detach", subject]);
-  } else {
-    runRootGit(destination, ["read-tree", subject]);
-    runRootGit(destination, ["checkout-index", "--all", "--force"]);
-  }
-  runRootGit(destination, ["config", "remote.origin.url", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
-  runRootGit(destination, ["config", "remote.origin.pushurl", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
-  chmodReadOnlyPreservingExecuteTree(destination);
-  return destination;
+  return materializeExactSubjectReadOnlyRepositoryView({
+    sourceRepoDir: viewSourceRepoDir,
+    sourceSubject,
+    destination,
+    sourceEnv: viewSourceEnv,
+  });
 }
 
 function prepareLoopRepository(request, integrationRepoDir = INTEGRATION_REPO_DIR) {

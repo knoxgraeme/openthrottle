@@ -5,13 +5,7 @@ import type {
   PipelineStageAttempt,
 } from "./store.js";
 import type { PipelineCoordinatorEvent } from "./coordinator.js";
-
-const ADMISSION_STAGES = new Set([
-  "admission_planner",
-  "admission_decision_gate",
-  "admission_reviewer",
-  "admission_review_gate",
-]);
+import { AUTOMATIC_ADMISSION_STAGE_IDS, isAutomaticAdmissionStage } from "./manifest.js";
 
 function artifactPayload(event: PipelineCoordinatorEvent, kind: string): { hash: string; value: unknown } | undefined {
   const artifact = event.artifacts?.find((candidate) => candidate.kind === kind);
@@ -37,25 +31,25 @@ export function projectAdmissionTransition(input: {
   write: CoordinatorTransitionWrite;
 }): AdmissionProjection | undefined {
   const { current, attempt, event, write } = input;
-  if (!current || !ADMISSION_STAGES.has(attempt.stage_id)) return current;
+  if (!current || !isAutomaticAdmissionStage(attempt.stage_id)) return undefined;
   const next: AdmissionProjection = { ...current, questions: [...current.questions] };
   const receipt = standardReceipt(event);
 
-  if (attempt.stage_id === "admission_planner" && receipt?.receipt.type === "admission_decision") {
+  if (attempt.stage_id === AUTOMATIC_ADMISSION_STAGE_IDS.planner && receipt?.receipt.type === "admission_decision") {
     const decision = receipt.receipt.payload.decision;
     next.proposed_route = decision.route;
     next.questions = [...decision.questions];
     next.generated_plan_digest = decision.generated_plan_digest;
   }
 
-  if (attempt.stage_id === "admission_reviewer" && receipt?.receipt.type === "admission_review") {
+  if (attempt.stage_id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewer && receipt?.receipt.type === "admission_review") {
     const review = receipt.receipt.payload.review;
     next.reviewer_verdict = review.verdict;
     next.reviewer_receipt_artifact_hash = receipt.hash;
     next.questions = [...review.questions];
   }
 
-  if (attempt.stage_id === "admission_decision_gate") {
+  if (attempt.stage_id === AUTOMATIC_ADMISSION_STAGE_IDS.decisionGate) {
     if (write.outcome === "no_change") {
       next.final_route = "simple";
       next.terminal_state = "accepted";
@@ -64,7 +58,7 @@ export function projectAdmissionTransition(input: {
     }
   }
 
-  if (attempt.stage_id === "admission_review_gate") {
+  if (attempt.stage_id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewGate) {
     if (write.outcome === "success") {
       const acceptedPlan = event.artifacts?.find((artifact) =>
         artifact.kind === "execution_plan" && artifact.assurance === "executor_verified"

@@ -742,6 +742,80 @@ describe("one-stage executor", () => {
     expect(readFileSync(join(input.repoDir, "file.txt"), "utf8")).toBe("initial\n");
   });
 
+  it.each([
+    { label: "completed", exitCode: 0 },
+    { label: "failed", exitCode: 47 },
+  ])("removes the entire admission action directory after a $label inspection", ({ exitCode }) => {
+    const input = fixture({
+      capability: "agent/repository-skill@1",
+      stageId: "admission_planner",
+      repositorySkill: "fixture",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-cleanup-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    installFakeGosu(binDir);
+    const event = JSON.stringify({
+      type: "result",
+      result: JSON.stringify(admissionPlanFixture(input.request)),
+    });
+    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+${event}
+JSON
+exit ${exitCode}
+`);
+
+    const result = withPrependedPath(binDir, () => defaultRunAgent({
+      request: input.request,
+      invocation: resolveContextInvocation(input.request),
+      repoDir: input.repoDir,
+      proposalPath: join(actionRoot, "proposal.json"),
+      timeoutMs: 5_000,
+    }));
+
+    expect(result.exitCode).toBe(exitCode);
+    expect(existsSync(join(actionRoot, input.request.attemptId))).toBe(false);
+  });
+
+  it("fails closed when an admission action directory cannot be removed", () => {
+    const input = fixture({
+      capability: "agent/repository-skill@1",
+      stageId: "admission_planner",
+      repositorySkill: "fixture",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-cleanup-failure-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    installFakeGosu(binDir);
+    const event = JSON.stringify({
+      type: "result",
+      result: JSON.stringify(admissionPlanFixture(input.request)),
+    });
+    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+cat <<'JSON'
+${event}
+JSON
+`);
+
+    expect(() => withPrependedPath(binDir, () => defaultRunAgent({
+      request: input.request,
+      invocation: resolveContextInvocation(input.request),
+      repoDir: input.repoDir,
+      proposalPath: join(actionRoot, "proposal.json"),
+      timeoutMs: 5_000,
+      removeActionDirectory: () => { throw new Error("cleanup refused"); },
+    }))).toThrow(/stage agent cleanup failed: cleanup refused/);
+  });
+
   it("extracts and seals the planner receipt and exact execution plan as separate artifacts", () => {
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-transport-"));
     directories.push(actionRoot);

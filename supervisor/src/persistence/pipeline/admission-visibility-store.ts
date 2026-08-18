@@ -5,7 +5,7 @@ import type {
   PipelineStore,
 } from "../../pipeline/store.js";
 
-interface AdmissionProjectionRow {
+export interface AdmissionProjectionRow {
   pipeline_instance_id: string;
   proposed_route: AdmissionProjection["proposed_route"];
   final_route: AdmissionProjection["final_route"];
@@ -28,7 +28,7 @@ interface AdmissionProjectionRow {
   updated_at: string;
 }
 
-function projection(row: AdmissionProjectionRow): AdmissionProjection {
+export function mapAdmissionProjectionRow(row: AdmissionProjectionRow): AdmissionProjection {
   return {
     pipeline_instance_id: row.pipeline_instance_id,
     proposed_route: row.proposed_route,
@@ -75,7 +75,7 @@ export function createAdmissionVisibilityStore(db: Database.Database): Pick<
   const getProjection = (instanceId: string): AdmissionProjection | undefined => {
     const row = db.prepare("SELECT * FROM pipeline_admission_projections WHERE pipeline_instance_id = ?")
       .get(instanceId) as AdmissionProjectionRow | undefined;
-    return row ? projection(row) : undefined;
+    return row ? mapAdmissionProjectionRow(row) : undefined;
   };
   return {
     getAdmissionProjection: getProjection,

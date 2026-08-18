@@ -7,6 +7,7 @@ import {
   type StageOutcome,
 } from "./manifest.js";
 import type {
+  AdmissionProjection,
   CoordinatorGateReceiptWrite,
   CoordinatorTransitionWrite,
   PipelineInstance,
@@ -42,6 +43,29 @@ export interface PipelinePublicationAttachment {
   filename: string;
   contentType: "application/json";
   content: string;
+}
+
+export interface PipelinePublicationAdmissionProjection extends Pick<
+  AdmissionProjection,
+  | "proposed_route"
+  | "final_route"
+  | "semantic_repair_count"
+  | "infrastructure_retry_count"
+  | "terminal_state"
+  | "questions"
+  | "planner"
+  | "reviewer"
+  | "admission_basis_digest"
+  | "effective_manifest_digest"
+  | "generated_plan_digest"
+  | "checkpoint_digest"
+> {
+  generated_content: true;
+  task_branch: {
+    branch: string;
+    state: string;
+    lineage: string | null;
+  };
 }
 
 export interface PipelinePublicationEnvelope {
@@ -84,22 +108,7 @@ export interface PipelinePublicationEnvelope {
   };
   links: Array<{ label: string; url: string }>;
   structured_execution?: ExecutionPublicationSnapshot;
-  admission?: {
-    generated_content: true;
-    proposed_route: "simple" | "structured" | "needs_human" | null;
-    final_route: "simple" | "structured" | null;
-    semantic_repair_count: number;
-    infrastructure_retry_count: number;
-    terminal_state: string | null;
-    questions: string[];
-    planner: { reference: string; package_digest: string | null };
-    reviewer: { reference: string; package_digest: string | null };
-    admission_basis_digest: string;
-    effective_manifest_digest: string;
-    generated_plan_digest: string | null;
-    checkpoint_digest: string | null;
-    task_branch: { branch: string; state: string; lineage: string | null };
-  };
+  admission?: PipelinePublicationAdmissionProjection;
   resume_status: PipelineInstanceStatus | null;
   body: string;
   artifact_inline?: string;

@@ -156,18 +156,16 @@ export async function resolveAdmissionSkillBindings(input: {
   readPinnedDirectory: (path: string) => Promise<RepositoryDirectorySnapshot>;
 }): Promise<{ planner: ResolvedAdmissionSkillBinding; reviewer: ResolvedAdmissionSkillBinding }> {
   const intent = input.config.intents?.implement;
-  return {
-    planner: await resolveAdmissionSkill(
-      intent?.planner_skill ?? DEFAULT_ADMISSION_PLANNER_SKILL,
-      input.config,
-      input.readPinnedDirectory
-    ),
-    reviewer: await resolveAdmissionSkill(
-      intent?.reviewer_skill ?? DEFAULT_ADMISSION_REVIEWER_SKILL,
-      input.config,
-      input.readPinnedDirectory
-    ),
-  };
+  const plannerReference = intent?.planner_skill ?? DEFAULT_ADMISSION_PLANNER_SKILL;
+  const reviewerReference = intent?.reviewer_skill ?? DEFAULT_ADMISSION_REVIEWER_SKILL;
+  const plannerPromise = resolveAdmissionSkill(plannerReference, input.config, input.readPinnedDirectory);
+  const reviewerPromise = reviewerReference === plannerReference
+    ? plannerPromise
+    : resolveAdmissionSkill(reviewerReference, input.config, input.readPinnedDirectory);
+  const [planner, reviewer] = await Promise.allSettled([plannerPromise, reviewerPromise]);
+  if (planner.status === "rejected") throw planner.reason;
+  if (reviewer.status === "rejected") throw reviewer.reason;
+  return { planner: planner.value, reviewer: reviewer.value };
 }
 
 function extractShipSelectionGraphId(context: string): string | undefined {

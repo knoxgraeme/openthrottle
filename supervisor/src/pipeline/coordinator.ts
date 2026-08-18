@@ -4,6 +4,9 @@ import {
   digestNormalized,
 } from "@openthrottle/contracts";
 import {
+  AUTOMATIC_ADMISSION_STAGE_IDS,
+  isAutomaticAdmissionStage,
+  isAutomaticManifest,
   isPipelineReentry,
   type AssuranceClass,
   type PipelineManifest,
@@ -360,7 +363,10 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     if (!stage.produces.some((kind) => kind === artifact.kind)) {
       throw new Error(`stage ${stage.id} did not declare artifact ${artifact.kind}`);
     }
-    const carriesPlannerPlan = ["admission_decision_gate", "admission_review_gate"].includes(stage.id) &&
+    const carriesPlannerPlan = (
+      stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.decisionGate ||
+      stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewGate
+    ) &&
       artifact.kind === "execution_plan" && artifact.assurance === "semantic_attested";
     if (artifact.assurance !== stage.evaluator.assurance && !carriesPlannerPlan) {
       throw new Error(`artifact ${artifact.kind} has unsupported assurance ${artifact.assurance}`);
@@ -433,8 +439,7 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
   // artifacts through the next sealed request. This is the deterministic data
   // channel between isolated sessions; native-session memory and ticket prose
   // are never authority for a tune proposal or mutation.
-  const automaticManifest = input.manifest.template?.id === "core/automatic" ||
-    input.manifest.id === "core/automatic" || input.manifest.id.startsWith("core/automatic/");
+  const automaticManifest = isAutomaticManifest(input.manifest);
   const eventArtifacts = (input.event.artifacts ?? []).map((artifact) => ({
     kind: artifact.kind as import("./manifest.js").ArtifactKind,
     schemaVersion: artifact.schemaVersion,
@@ -442,16 +447,16 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     subject: artifact.subject ?? null,
     payload: artifact.payload,
     hash: artifact.hash,
-  }));
+  })).sort((left, right) => left.kind.localeCompare(right.kind));
   const priorArtifacts = Array.isArray(priorRequest.inputArtifacts) ? priorRequest.inputArtifacts : [];
   const automaticArtifacts = (): StageRequestInputArtifact[] | undefined => {
-    if (stage.id === "admission_decision_gate") {
+    if (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.decisionGate) {
       return eventArtifacts.filter((artifact) => ["standard_receipt", "execution_plan"].includes(artifact.kind));
     }
-    if (stage.id === "admission_reviewer") {
+    if (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewer) {
       return eventArtifacts.filter((artifact) => ["stage_result", "execution_plan"].includes(artifact.kind));
     }
-    if (stage.id === "admission_review_gate") {
+    if (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewGate) {
       return [
         ...priorArtifacts.filter((artifact) => ["stage_result", "execution_plan"].includes(artifact.kind)),
         ...eventArtifacts.filter((artifact) => artifact.kind === "standard_receipt"),
@@ -463,14 +468,7 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     return undefined;
   };
   const inputArtifacts = input.instance.task_type === "tune"
-    ? (input.event.artifacts ?? []).map((artifact) => ({
-      kind: artifact.kind as import("./manifest.js").ArtifactKind,
-      schemaVersion: artifact.schemaVersion,
-      assurance: artifact.assurance,
-      subject: artifact.subject ?? null,
-      payload: artifact.payload,
-      hash: artifact.hash,
-    })).sort((left, right) => left.kind.localeCompare(right.kind))
+    ? eventArtifacts
     : automaticManifest
       ? automaticArtifacts()
     : Array.isArray(priorRequest.inputArtifacts)
@@ -692,15 +690,14 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       throw new Error(`stage ${stage.id} cannot enter provider wait without an exact subject`);
     }
     const isReentry = isPipelineReentry(input.manifest, stage.id, target.id);
-    const isAdmissionCorrection = (
-      input.manifest.template?.id === "core/automatic" ||
-      input.manifest.id === "core/automatic" ||
-      input.manifest.id.startsWith("core/automatic/")
-    ) && (
-      (stage.id === "admission_decision_gate" && target.id === "admission_planner") ||
-      (stage.id === "admission_review_gate" && ["admission_planner", "admission_reviewer"].includes(target.id)) ||
-      (stage.id === "admission_planner" && target.id === "admission_planner") ||
-      (stage.id === "admission_reviewer" && target.id === "admission_reviewer")
+    const isAdmissionCorrection = isAutomaticManifest(input.manifest) && (
+      (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.decisionGate && target.id === AUTOMATIC_ADMISSION_STAGE_IDS.planner) ||
+      (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewGate && (
+        target.id === AUTOMATIC_ADMISSION_STAGE_IDS.planner ||
+        target.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewer
+      )) ||
+      (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.planner && target.id === AUTOMATIC_ADMISSION_STAGE_IDS.planner) ||
+      (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewer && target.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewer)
     );
     // Same-stage retries are governed by that transition's local
     // max_reentries. Only a backward transition into an earlier stage starts
@@ -907,13 +904,13 @@ export function coordinatePipelineEvent(
   write.exhaustedEffectId = event.exhaustedEffectId;
   write.exhaustedEffectError = event.exhaustedEffectError;
   write.gateReceipt = gateReceipt;
-  const currentAdmissionProjection = store.getAdmissionProjection(instance.id);
-  write.admissionProjection = projectAdmissionTransition({
-    current: currentAdmissionProjection,
-    attempt,
-    event,
-    write,
-  });
+  const currentAdmissionProjection = isAutomaticManifest(manifest)
+    ? store.getAdmissionProjection(instance.id)
+    : undefined;
+  write.admissionProjection = isAutomaticAdmissionStage(attempt.stage_id)
+    ? projectAdmissionTransition({ current: currentAdmissionProjection, attempt, event, write })
+    : undefined;
+  const admissionForPublication = write.admissionProjection ?? currentAdmissionProjection;
   const stage = manifest.stages.find((candidate) => candidate.id === attempt.stage_id)!;
   // A structured graph owns its commit checkpoint frontier at each accepted
   // integration. Later stage subjects may be canonical tree IDs, so they
@@ -1007,20 +1004,20 @@ export function coordinatePipelineEvent(
     priorFindings,
     priorRepairSourceStageId,
     structuredExecution,
-    admission: write.admissionProjection ? {
+    admission: admissionForPublication ? {
       generated_content: true,
-      proposed_route: write.admissionProjection.proposed_route,
-      final_route: write.admissionProjection.final_route,
-      semantic_repair_count: write.admissionProjection.semantic_repair_count,
-      infrastructure_retry_count: write.admissionProjection.infrastructure_retry_count,
-      terminal_state: write.admissionProjection.terminal_state,
-      questions: write.admissionProjection.questions,
-      planner: write.admissionProjection.planner,
-      reviewer: write.admissionProjection.reviewer,
-      admission_basis_digest: write.admissionProjection.admission_basis_digest,
-      effective_manifest_digest: write.admissionProjection.effective_manifest_digest,
-      generated_plan_digest: write.admissionProjection.generated_plan_digest,
-      checkpoint_digest: write.admissionProjection.checkpoint_digest,
+      proposed_route: admissionForPublication.proposed_route,
+      final_route: admissionForPublication.final_route,
+      semantic_repair_count: admissionForPublication.semantic_repair_count,
+      infrastructure_retry_count: admissionForPublication.infrastructure_retry_count,
+      terminal_state: admissionForPublication.terminal_state,
+      questions: admissionForPublication.questions,
+      planner: admissionForPublication.planner,
+      reviewer: admissionForPublication.reviewer,
+      admission_basis_digest: admissionForPublication.admission_basis_digest,
+      effective_manifest_digest: admissionForPublication.effective_manifest_digest,
+      generated_plan_digest: admissionForPublication.generated_plan_digest,
+      checkpoint_digest: admissionForPublication.checkpoint_digest,
       task_branch: {
         branch: taskBranch?.branch ?? instance.branch,
         state: write.taskBranchPublishedSha ? "published" : taskBranch?.status ?? "none",
