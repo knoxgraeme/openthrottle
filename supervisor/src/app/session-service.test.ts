@@ -286,8 +286,13 @@ describe("pipeline admission", () => {
     db!.prepare(`
       UPDATE pipeline_instances
       SET status = 'waiting_provider', active_stage_id = 'provider',
-          immutable_subject = ?, published_commit = ?
+          immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
+    `).run(head, head, head, instance.id);
+    db!.prepare(`
+      UPDATE pipeline_task_branches
+      SET accepted_integration_sha = ?, acknowledged_remote_sha = ?, status = 'published'
+      WHERE pipeline_instance_id = ?
     `).run(head, head, instance.id);
     db!.prepare(`
       UPDATE pipeline_instance_stages SET status = 'passed'

@@ -383,6 +383,12 @@ does not unblock provisioning or overwrite the ref. Redelivery accepts an
 already-created/already-advanced exact SHA only after the original leased
 effect has made at least one provider attempt, covering crash-after-provider-
 success without treating a first-observed external ref as owned.
+Successful simple write stages and successful structured aggregate stages feed
+their exact accepted subject through this same store operation. While accepted
+and acknowledged SHAs differ, the advancement effect leases ahead of downstream
+effects and downstream stage dispatch remains blocked. A publish stage is
+dispatchable only for that exact checkpoint; stop and cleanup effects remain
+eligible if advancement fails.
 
 Sandbox setup is split between bake-once and per-run work. `post_bootstrap`
 commands and image-derived engine probes are bake-once: they execute exactly
@@ -729,7 +735,9 @@ have only an exact-base reservation; `checkpointed` records have equal accepted
 integration and acknowledged remote SHAs. Neither state creates a pull request,
 enters `waiting_provider`, satisfies review/check/workflow gates, nor populates
 published commit/PR status. `published` is a later, explicit publication state,
-not an alias for successful ref creation or advancement.
+not an alias for successful ref creation or advancement. The publish-stage
+transition atomically promotes only the exact checkpoint it published; entry
+to `waiting_provider` and provider gate receipts require that promoted binding.
 
 Linear issue workflow state is a side-effect projection of the run lifecycle,
 not coordinator authority. Workflow states are resolved dynamically from the

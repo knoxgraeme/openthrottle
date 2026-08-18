@@ -153,6 +153,11 @@ describe("pipeline effect store", () => {
       expectedOldSha: "a".repeat(40),
       expectedNewSha: "d".repeat(40),
     }).id).toBe(advance.id);
+    expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
+      accepted_integration_sha: "d".repeat(40),
+      acknowledged_remote_sha: "a".repeat(40),
+      status: "reserved",
+    });
     const claimedAdvance = pipelines.claimEffects(
       "2099-01-01T00:04:00.000Z",
       "2099-01-01T00:05:00.000Z"

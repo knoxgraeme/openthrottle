@@ -56,19 +56,31 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
       SELECT current.id FROM pipeline_effect_intents current
       WHERE ((current.status IN ('pending', 'failed') AND current.next_attempt_at <= ?)
         OR (current.status = 'processing' AND current.next_attempt_at <= ?))
-        AND NOT EXISTS (
-          SELECT 1 FROM pipeline_effect_intents earlier
-          WHERE earlier.pipeline_instance_id = current.pipeline_instance_id
-            AND (
-              earlier.status NOT IN ('acknowledged', 'dead') OR
-              (earlier.status = 'dead' AND earlier.kind IN ('create_task_branch', 'advance_task_branch'))
-            )
-            AND (
-              earlier.transition_version < current.transition_version OR
-              (earlier.transition_version = current.transition_version AND earlier.created_at < current.created_at) OR
-              (earlier.transition_version = current.transition_version AND earlier.created_at = current.created_at
-                AND earlier.id < current.id)
-            )
+        AND (
+          current.kind = 'advance_task_branch' OR NOT EXISTS (
+            SELECT 1 FROM pipeline_effect_intents earlier
+            WHERE earlier.pipeline_instance_id = current.pipeline_instance_id
+              AND (
+                earlier.status NOT IN ('acknowledged', 'dead') OR
+                (earlier.status = 'dead' AND earlier.kind IN ('create_task_branch', 'advance_task_branch'))
+              )
+              AND (
+                earlier.transition_version < current.transition_version OR
+                (earlier.transition_version = current.transition_version AND earlier.created_at < current.created_at) OR
+                (earlier.transition_version = current.transition_version AND earlier.created_at = current.created_at
+                  AND earlier.id < current.id)
+              )
+          )
+        )
+        AND (
+          current.kind IN (
+            'create_task_branch', 'advance_task_branch', 'idle', 'stop', 'quarantine', 'cleanup'
+          ) OR NOT EXISTS (
+            SELECT 1 FROM pipeline_task_branches branch
+            WHERE branch.pipeline_instance_id = current.pipeline_instance_id
+              AND branch.accepted_integration_sha IS NOT NULL
+              AND branch.accepted_integration_sha IS NOT branch.acknowledged_remote_sha
+          )
         )
       ORDER BY current.next_attempt_at, current.created_at, current.id LIMIT ?
     `).all(nowIso, nowIso, limit) as Array<{ id: string }>;
@@ -142,7 +154,7 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
         : db.prepare(`
             UPDATE pipeline_task_branches
             SET acknowledged_remote_sha = ?, status = 'checkpointed', last_error = NULL, updated_at = ?
-            WHERE pipeline_instance_id = ? AND status IN ('reserved', 'checkpointed')
+            WHERE pipeline_instance_id = ? AND status IN ('reserved', 'checkpointed', 'published')
               AND accepted_integration_sha = ? AND acknowledged_remote_sha = ?
           `).run(
             control.expectedNewSha,
@@ -202,7 +214,7 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
       }
       return existing;
     }
-    if (!["reserved", "checkpointed"].includes(branch.status) ||
+    if (!["reserved", "checkpointed", "published"].includes(branch.status) ||
         branch.acknowledged_remote_sha !== input.expectedOldSha) {
       throw new Error("pipeline task branch advancement expected head mismatch");
     }
@@ -213,9 +225,9 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
     const timestamp = now();
     const accepted = db.prepare(`
       UPDATE pipeline_task_branches
-      SET accepted_integration_sha = ?, last_error = NULL, updated_at = ?
+      SET accepted_integration_sha = ?, status = 'reserved', last_error = NULL, updated_at = ?
       WHERE pipeline_instance_id = ? AND generation = ? AND lineage = ?
-        AND acknowledged_remote_sha = ? AND status IN ('reserved', 'checkpointed')
+        AND acknowledged_remote_sha = ? AND status IN ('reserved', 'checkpointed', 'published')
     `).run(
       input.expectedNewSha,
       timestamp,

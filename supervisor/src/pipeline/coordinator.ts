@@ -26,8 +26,10 @@ import {
   buildStagePublication,
 } from "./publication.js";
 import type { LaunchFaultReason } from "./fault-attribution.js";
+import { FOR_EACH_UNIT_CAPABILITY } from "./capability-contracts.js";
 
 const PUBLISH_CAPABILITY = ["ce", "publish@1"].join("/");
+const GIT_COMMIT = /^[a-f0-9]{40}$/;
 
 export interface PipelineEventArtifact {
   id?: string;
@@ -164,6 +166,15 @@ function activeStage(input: PipelineReductionInput): PipelineStage {
 function isPublicationStage(stage: PipelineStage): boolean {
   return (stage.executor.kind === "agent" && stage.executor.capability === PUBLISH_CAPABILITY) ||
     stage.executor.kind === "provider_wait";
+}
+
+function isExactCommitSubject(subject: string | null | undefined): subject is string {
+  return typeof subject === "string" && GIT_COMMIT.test(subject);
+}
+
+function acceptsIntegratedSubject(stage: PipelineStage): boolean {
+  return stage.credentials.includes("repo.write") ||
+    stage.executor.capability === FOR_EACH_UNIT_CAPABILITY;
 }
 
 function executionIncludesPublication(
@@ -358,7 +369,7 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     throw new Error("pipeline event result hash does not match stage_result artifact");
   }
   if (event.providerRevision !== undefined) {
-    if (!/^[a-f0-9]{40}$/.test(event.providerRevision)) {
+    if (!GIT_COMMIT.test(event.providerRevision)) {
       throw new Error("pipeline event has an invalid provider revision");
     }
     if (event.kind === "stage_result" && stage.evaluator.kind === "publish_subject") {
@@ -841,6 +852,56 @@ export function coordinatePipelineEvent(
   write.exhaustedEffectId = event.exhaustedEffectId;
   write.exhaustedEffectError = event.exhaustedEffectError;
   write.gateReceipt = gateReceipt;
+  const stage = manifest.stages.find((candidate) => candidate.id === attempt.stage_id)!;
+  let taskBranch = store.getTaskBranch(instance.id);
+  if (
+    taskBranch &&
+    event.kind === "stage_result" &&
+    (write.outcome === "success" || write.outcome === "no_change") &&
+    acceptsIntegratedSubject(stage) &&
+    !isPublicationStage(stage) &&
+    isExactCommitSubject(event.subject) &&
+    taskBranch.acknowledged_remote_sha !== event.subject
+  ) {
+    if (!taskBranch.acknowledged_remote_sha) {
+      throw new Error("pipeline task branch has no acknowledged remote head");
+    }
+    store.queueTaskBranchAdvance({
+      instanceId: instance.id,
+      generation: instance.generation,
+      lineage: taskBranch.lineage,
+      expectedOldSha: taskBranch.acknowledged_remote_sha,
+      expectedNewSha: event.subject,
+    });
+    taskBranch = store.getTaskBranch(instance.id)!;
+  }
+  const nextStage = write.nextStageId
+    ? manifest.stages.find((candidate) => candidate.id === write.nextStageId)
+    : undefined;
+  if (taskBranch && nextStage && isPublicationStage(nextStage)) {
+    if (!isExactCommitSubject(event.subject) || taskBranch.accepted_integration_sha !== event.subject) {
+      throw new Error("pipeline publication requires an accepted task branch integration");
+    }
+    if (taskBranch.status === "pending" || taskBranch.status === "failed") {
+      throw new Error("pipeline publication requires a viable task branch checkpoint");
+    }
+  }
+  if (taskBranch && isPublicationStage(stage) && write.outcome === "success") {
+    if (!isExactCommitSubject(event.subject) ||
+        taskBranch.accepted_integration_sha !== event.subject ||
+        taskBranch.acknowledged_remote_sha !== event.subject ||
+        (taskBranch.status !== "checkpointed" && taskBranch.status !== "published")) {
+      throw new Error("pipeline publish result does not match the acknowledged task branch checkpoint");
+    }
+    write.taskBranchPublishedSha = event.subject;
+  }
+  if (taskBranch && event.kind === "provider_snapshot") {
+    if (taskBranch.status !== "published" ||
+        taskBranch.accepted_integration_sha !== taskBranch.acknowledged_remote_sha ||
+        taskBranch.acknowledged_remote_sha !== instance.published_subject) {
+      throw new Error("provider evidence requires the exact published task branch checkpoint");
+    }
+  }
   // Findings and dispositions accumulate across the run. The single mutable
   // GitHub summary receipt always holds the latest full publication envelope
   // for this instance, so it is the deterministic prior-state source; the

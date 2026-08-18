@@ -7,6 +7,7 @@ import type {
   PipelineInstance,
   PipelineStageAttempt,
   PipelineStore,
+  PipelineTaskBranch,
 } from "../../pipeline/store.js";
 import {
   createPipelinePublicationWriter,
@@ -312,6 +313,41 @@ export function createTransitionStore(db: Database.Database, now: () => string):
         write.nextAttempt.requestPayload, timestamp, timestamp
       );
       wrote();
+    }
+    if (write.taskBranchPublishedSha) {
+      if (!/^[a-f0-9]{40}$/.test(write.taskBranchPublishedSha)) {
+        throw new Error("pipeline task branch published SHA is invalid");
+      }
+      const published = db.prepare(`
+        UPDATE pipeline_task_branches
+        SET status = 'published', last_error = NULL, updated_at = ?
+        WHERE pipeline_instance_id = ?
+          AND status IN ('checkpointed', 'published')
+          AND accepted_integration_sha = ?
+          AND acknowledged_remote_sha = ?
+      `).run(
+        timestamp,
+        instance.id,
+        write.taskBranchPublishedSha,
+        write.taskBranchPublishedSha
+      );
+      if (published.changes !== 1) {
+        throw new Error("pipeline publication does not match the acknowledged task branch checkpoint");
+      }
+      wrote();
+    }
+    if (write.nextStatus === "waiting_provider") {
+      const taskBranch = db.prepare(`
+        SELECT * FROM pipeline_task_branches WHERE pipeline_instance_id = ?
+      `).get(instance.id) as PipelineTaskBranch | undefined;
+      const publishedSubject = write.publishedSubject ?? instance.published_subject;
+      if (taskBranch && (
+        taskBranch.status !== "published" ||
+        taskBranch.accepted_integration_sha !== taskBranch.acknowledged_remote_sha ||
+        taskBranch.acknowledged_remote_sha !== publishedSubject
+      )) {
+        throw new Error("pipeline cannot enter provider wait without the exact published task branch checkpoint");
+      }
     }
     const nextVersion = instance.state_version + 1;
     const update = db.prepare(`
