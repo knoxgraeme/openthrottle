@@ -536,20 +536,24 @@ export function finalizeChildActionRetention(request, result, {
   return remove({ repoDir, rootDir, handle: request.worktree.id });
 }
 
+export function replayChildActionResult(request, outputPath, retention = {}) {
+  if (!existsSync(outputPath)) return null;
+  const metadata = lstatSync(outputPath);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("child result replay path must be a real file");
+  const replay = JSON.parse(readFileSync(outputPath, "utf8"));
+  if (replay?.kind !== "child_executor_action_result" || replay.action_id !== request.actionId ||
+      replay.attempt_id !== request.attemptId || replay.request_hash !== request.requestHash) {
+    throw new Error("child result replay does not match the sealed request");
+  }
+  finalizeChildActionRetention(request, replay, retention);
+  return replay;
+}
+
 function main() {
   const requestPath = resolve(arg("--request", process.env.OT_CHILD_EXECUTOR_REQUEST_FILE));
   const outputPath = resolve(arg("--output", process.env.OT_CHILD_EXECUTOR_RESULT_FILE));
   const request = JSON.parse(readFileSync(requestPath, "utf8"));
-  if (existsSync(outputPath)) {
-    const metadata = lstatSync(outputPath);
-    if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("child result replay path must be a real file");
-    const replay = JSON.parse(readFileSync(outputPath, "utf8"));
-    if (replay?.kind !== "child_executor_action_result" || replay.action_id !== request.actionId ||
-        replay.attempt_id !== request.attemptId || replay.request_hash !== request.requestHash) {
-      throw new Error("child result replay does not match the sealed request");
-    }
-    return;
-  }
+  if (replayChildActionResult(request, outputPath)) return;
   try {
     const result = executeChildAction({ request });
     writeJsonAtomic(outputPath, result);
