@@ -1404,6 +1404,7 @@ describe("pipeline coordinator", () => {
     });
     expect(allowed.nextStageId).toBe("implementation");
     expect(allowed.nextAttempt?.reentryOrdinal).toBe(3);
+    expect(allowed.repairRoundIncrement).toBe(0);
 
     const exhausted = reducePipelineEvent({
       manifest,
@@ -1413,11 +1414,11 @@ describe("pipeline coordinator", () => {
       event: repair,
     });
     expect(exhausted.nextStatus).toBe("completion_pending_publication");
-    expect(exhausted.terminalOutcome).toBe("failed");
+    expect(exhausted.terminalOutcome).toBe("needs_human");
     expect(exhausted.nextAttempt).toBeUndefined();
-    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_control", "stop", "cleanup"]);
-    expect(exhausted.effects[2]).toMatchObject({
-      idempotencyKey: `cleanup:${instance.id}:failed`,
+    expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_control", "cleanup"]);
+    expect(exhausted.effects[1]).toMatchObject({
+      idempotencyKey: `cleanup:${instance.id}:needs_human`,
     });
     const attemptsExhausted = reducePipelineEvent({
       manifest,
@@ -1637,6 +1638,7 @@ describe("pipeline coordinator", () => {
 
     expect(repair.nextStageId).toBe("repair_implementation");
     expect(repair.reentryIncrement).toBe(1);
+    expect(repair.repairRoundIncrement).toBe(1);
     expect(repair.nextAttempt).toMatchObject({
       stageId: "repair_implementation",
       reentryOrdinal: 1,
@@ -1721,6 +1723,60 @@ describe("pipeline coordinator", () => {
     expect(exhausted.waitReason).toBe("pipeline repair round limit 5 exhausted");
     expect(exhausted.nextAttempt).toBeUndefined();
     expect(exhausted.effects.map((effect) => effect.kind)).toEqual(["publish_control", "stop", "cleanup"]);
+  });
+
+  it("keeps implementation self-retries separate from the whole-pipeline repair budget", () => {
+    const { pipelines, manifest, instance, attempt, stages } = setup("core/implement@4");
+    const implementationAttempt = activeAgentAttempt(attempt, "implementation");
+    const implementationStages = stages.map((stage) => stage.stage_id === "implementation"
+      ? { ...stage, status: "running" as const, attempt_count: 1, reentry_count: 0 }
+      : stage
+    );
+
+    const retry = reducePipelineEvent({
+      manifest,
+      instance: {
+        ...instance,
+        active_stage_id: "implementation",
+        reentry_count: manifest.max_repair_rounds!,
+      },
+      attempt: implementationAttempt,
+      stages: implementationStages,
+      event: event(
+        { ...instance, active_stage_id: "implementation" },
+        implementationAttempt,
+        "semantic_repair_required",
+        "implementation-self-retry",
+        ["stage_result"]
+      ),
+    });
+
+    expect(retry.terminalOutcome).toBeUndefined();
+    expect(retry.nextStageId).toBe("implementation");
+    expect(retry.reentryIncrement).toBe(1);
+    expect(retry.repairRoundIncrement).toBe(0);
+    expect(retry.nextAttempt).toMatchObject({
+      stageId: "implementation",
+      reentryOrdinal: 1,
+    });
+
+    db!.prepare("UPDATE pipeline_instances SET reentry_count = ? WHERE id = ?")
+      .run(manifest.max_repair_rounds!, instance.id);
+    const persistedInstance = pipelines.getInstance(instance.id)!;
+    const persisted = coordinatePipelineEvent(
+      pipelines,
+      event(
+        persistedInstance,
+        attempt,
+        "semantic_repair_required",
+        "persisted-implementation-self-retry",
+        ["stage_result"]
+      )
+    );
+
+    expect(persisted.reentry_count).toBe(manifest.max_repair_rounds);
+    expect(pipelines.listStages(instance.id).find((stage) => stage.stage_id === "implementation"))
+      .toMatchObject({ reentry_count: 1 });
   });
 
   it("persists a complete immutable request for a repair attempt", () => {

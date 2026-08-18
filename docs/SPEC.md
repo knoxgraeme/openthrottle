@@ -107,8 +107,10 @@ Each `openthrottle.pipeline/v1` manifest declares:
   and outcome transitions;
 - bounded re-entry and an explicit exhausted outcome where a transition loops.
   New manifests should set `max_repair_rounds` as the primary whole-run repair
-  bound; the coordinator enforces it only when scheduling a backward/self
-  re-entry, so an already-moving repair round can reach command gates,
+  bound; the coordinator enforces it only when scheduling a backward
+  transition into an earlier stage. Same-stage retries consume only their
+  transition's local `max_reentries` budget and never consume semantic repair
+  rounds. An already-moving repair round can therefore reach command gates,
   publication, provider wait, or a terminal boundary. `max_attempts` remains a
   high raw-attempt safety net for genuine runaways. Per-transition
   `max_reentries` still bounds individual loops.
