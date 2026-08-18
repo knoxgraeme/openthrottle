@@ -118,8 +118,8 @@ function labelMatchNames(labels: ResolvedControlLabel[]): string[] {
   return names;
 }
 
-function branchFor(issueIdentifier: string): string {
-  return `ot/${issueIdentifier.toLowerCase()}`;
+function branchFor(issueIdentifier: string, sessionId: string): string {
+  return `ot/${issueIdentifier.toLowerCase()}-${digestNormalized(sessionId).slice(0, 10)}`;
 }
 
 function controlTicketId(provider: ControlThreadEvent["provider"], externalThreadId: string): string {
@@ -774,7 +774,7 @@ export async function handleCreated(
     provider_activated_at: payload.providerActivatedAt,
     provider_activation_id: payload.providerActivationId,
     sandbox_id: null,
-    branch: branchFor(issue.identifier),
+    branch: branchFor(issue.identifier, sessionId),
     agent: selectedAgent,
     repo: selectedRepository.repo,
     base_branch: selectedRepository.baseBranch,
@@ -796,6 +796,7 @@ export async function handleCreated(
     manifest: ValidatedPipelineManifest;
     snapshot: ReturnType<PipelineStore["saveRepositoryConfigSnapshot"]>;
     taskContext: string;
+    planDigest: string;
     inputArtifacts?: StageRequestInputArtifact[];
   };
   const boundedTaskContext = composeBoundedTaskContext(initialContext, {
@@ -885,6 +886,9 @@ export async function handleCreated(
         ),
       })
       : boundedTaskContext.context;
+    const planDigest = requested.executionPlan
+      ? digestCanonicalJson(requested.executionPlan)
+      : digestNormalized(taskContext);
     const snapshot = coordinator.store.saveRepositoryConfigSnapshot({
       repository: selectedRepository.repo,
       baseCommit: remote.baseCommit,
@@ -892,7 +896,7 @@ export async function handleCreated(
       config: repositoryConfig,
     });
     coordinator.store.acceptManifest(manifest);
-    pinned = { remote, manifest, snapshot, taskContext, inputArtifacts };
+    pinned = { remote, manifest, snapshot, taskContext, planDigest, inputArtifacts };
   } catch (error) {
     await failSelection(error);
     return;
@@ -934,6 +938,7 @@ export async function handleCreated(
         repositoryConfig: pinned.snapshot,
         runtime: coordinator.runtime,
         authorizedCapabilities: pinned.manifest.manifest.requires.capabilities,
+        planDigest: pinned.planDigest,
         taskType,
         taskContext: pinned.taskContext,
         inputArtifacts: pinned.inputArtifacts,

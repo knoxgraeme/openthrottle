@@ -383,9 +383,10 @@ export function createCredentialMaterializer(cfg: Config, store: SupervisorStore
     const agent = agentOverride ?? ticket.agent;
     const requested = new Set(scopes);
     const env: Record<string, string> = {};
-    if (requested.has("repo.write")) {
-      env.GITHUB_TOKEN = cfg.githubToken;
-    } else if (requested.has("repo.read") || requested.has("provider.read")) {
+    // repo.write authorizes mutations inside the executor-owned worktree; it
+    // no longer conveys remote GitHub write authority. Remote ref creation,
+    // checkpoints, and publication are supervisor-owned durable effects.
+    if (requested.has("repo.write") || requested.has("repo.read") || requested.has("provider.read")) {
       env.GITHUB_TOKEN = cfg.githubReadToken;
     }
     if (requested.has("model.invoke")) {

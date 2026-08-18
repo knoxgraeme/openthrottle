@@ -112,6 +112,32 @@ export interface RepositoryReadPort {
   ): Promise<RepositoryDirectorySnapshot>;
 }
 
+export class RepositoryRefConflictError extends Error {
+  readonly retryable = false;
+  readonly statusCode = 409;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "RepositoryRefConflictError";
+  }
+}
+
+export interface RepositoryRefWritePort {
+  createRef(input: {
+    repository: string;
+    ref: string;
+    expectedNewSha: string;
+    allowExisting: boolean;
+  }): Promise<{ sha: string }>;
+  compareAndAdvanceRef(input: {
+    repository: string;
+    ref: string;
+    expectedOldSha: string;
+    expectedNewSha: string;
+    allowAlreadyAdvanced: boolean;
+  }): Promise<{ sha: string }>;
+}
+
 export interface PullRequestRef {
   host: string;
   repo: string;

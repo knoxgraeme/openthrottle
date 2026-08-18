@@ -34,7 +34,10 @@ self-contained OpenThrottle skills. There is no second execution architecture.
   assurance class, and optional Git subject.
 - **Gate receipt:** the deterministic evaluator decision for an attempt.
 - **Effect intent:** a persisted external action such as provisioning,
-  dispatch, publication, stop, or cleanup.
+  task-ref creation/advancement, dispatch, publication, stop, or cleanup.
+- **Task branch checkpoint:** the supervisor-owned `refs/heads/ot/*` lineage
+  binding ticket, pipeline instance, generation, plan digest, and exact base
+  SHA to an accepted local integration SHA and an acknowledged remote SHA.
 - **Publication receipt:** a durable Linear or GitHub-facing publication with
   retry state.
 - **Ticket identity:** the stable internal `ticket_id` is provider-qualified
@@ -192,6 +195,14 @@ repair budget.
 Internal whole-change final review and repair bindings do not declare an
 independent timeout, so their sealed action timeout inherits the supervisor
 `TASK_TIMEOUT` hard resource bound.
+Every pipeline whose manifest contains a `repo.write` stage first persists a
+`create_task_branch` effect and a `pipeline_task_branches` row. The effect must
+be acknowledged at the exact sealed base SHA before the ordered provision
+effect may run; this is the same prerequisite for the simple implementation
+stage and the structured composite host. Admission selection, repository reads,
+and capacity preflight remain read-only and create no ref. Task branch names
+include a session-derived suffix so a newer generation receives a distinct
+lineage instead of reusing or overwriting an older generation's ref.
 The composite `graph/for-each-unit@1` capability (structured multi-unit
 execution) is installed only with the composition root that constructs and
 drains the child unit runtime. A composite host stage dispatches no
@@ -356,13 +367,22 @@ fence.
 
 The entrypoint ignores conflicting ambient identity values and derives runtime
 identity from the sealed request. It verifies input ownership/mode and all
-digests before cloning. An initial stage checks out the exact published
-`origin/<branch>` head when the working branch already exists on the remote
-(a retriggered generation reuses the ticket branch), starts from the exact
-sealed base commit only when the remote has no such branch, and fails closed —
-never silently proceeding from the base commit — when the published head
-cannot be queried or fetched; later stages reconstruct the exact expected
-subject. Git safety config is root-sealed.
+digests before cloning. A write-capable initial stage checks out the exact
+supervisor-reserved `origin/<branch>` head, which is already acknowledged at
+the sealed base; a read-only initial stage starts from the sealed base without
+creating a task ref. Missing, inaccessible, or mismatched reserved refs fail
+closed. Later stages reconstruct the exact expected subject. Git safety config
+is root-sealed.
+
+Task branch advancement is a separate `advance_task_branch` effect carrying
+both expected-old and expected-new SHAs. The store accepts one local integration
+SHA before enqueueing it, and acknowledges the remote SHA only after GitHub
+confirms a non-forced update. A wrong head, stale lineage/generation, existing
+unowned ref, or non-fast-forward response is permanent conflict evidence; it
+does not unblock provisioning or overwrite the ref. Redelivery accepts an
+already-created/already-advanced exact SHA only after the original leased
+effect has made at least one provider attempt, covering crash-after-provider-
+success without treating a first-observed external ref as owned.
 
 Sandbox setup is split between bake-once and per-run work. `post_bootstrap`
 commands and image-derived engine probes are bake-once: they execute exactly
@@ -704,6 +724,13 @@ installation when required. Failures retry with bounded backoff. Pipeline
 terminal acknowledgement uses a publication receipt; a failed receipt can be
 reopened only by the authenticated operator retry endpoint.
 
+Task branch state is not publication evidence. `pending`/`reserved` records
+have only an exact-base reservation; `checkpointed` records have equal accepted
+integration and acknowledged remote SHAs. Neither state creates a pull request,
+enters `waiting_provider`, satisfies review/check/workflow gates, nor populates
+published commit/PR status. `published` is a later, explicit publication state,
+not an alias for successful ref creation or advancement.
+
 Linear issue workflow state is a side-effect projection of the run lifecycle,
 not coordinator authority. Workflow states are resolved dynamically from the
 issue team by Linear workflow state `type`; state ids are never hardcoded.
@@ -872,7 +899,8 @@ SQLite is the authority. Core tables include:
   `pipeline_instances`, `pipeline_instance_stages`;
 - fenced execution: `pipeline_stage_attempts`, `pipeline_inbox_events`;
 - evidence/effects: `pipeline_artifacts`, `pipeline_gate_receipts`,
-  `pipeline_publication_receipts`, `pipeline_effect_intents`;
+  `pipeline_publication_receipts`, `pipeline_effect_intents`,
+  `pipeline_task_branches`;
 - structured child execution: `execution_graphs`, `execution_units`,
   `execution_work_attempts`, `execution_review_subaction_dispatches`, `execution_gate_receipts`,
   `execution_downstream_context`, `execution_publication_events`,
@@ -1448,17 +1476,21 @@ The CLI never creates per-project snapshots or configures routing fallbacks.
   untrusted data. Registered repository code itself is execution-trusted.
 - Only credentials declared by the selected stage enter its sandbox. Daytona,
   Fly, Linear app, webhook, installation, and operator secrets remain in Fly.
-- `repo.write` receives the write-capable GitHub token. `repo.read` and
-  `provider.read` receive the separate read-only token unless the same stage
-  explicitly declares `repo.write`.
+- `repo.write` authorizes mutations only inside the executor-owned checkout;
+  it receives the read-only GitHub token, as do `repo.read` and
+  `provider.read`. Sandboxes never receive the supervisor's reusable
+  write-capable GitHub token. Remote task-ref creation, compare-and-advance,
+  and publication are supervisor-owned effects.
 - The same applies per loop action, independent of the whole attempt's stage
   credentials: each action's engine process launches with a cleared
   environment carrying only its own declared, materialized credentials and
   MCP servers (see Action-scoped credentials and MCP servers above).
 - Git credentials use a helper and clean origin URL; `.git/config` and the
   pre-push hook are root-sealed.
-- Pushes to main/master and non-fast-forward updates are rejected in the
-  sandbox and should also be rejected by GitHub branch protection.
+- Sandbox pushes are not authoritative and have no credential capable of
+  updating GitHub. The root-sealed pre-push policy remains defense in depth;
+  supervisor ref advancement always sends `force: false` and compares the
+  observed head to its durable expected-old SHA.
 - Named/nested secrets and known GitHub/OpenAI/Linear/bearer token shapes are
   sanitized before logging or publication, including a Codex auth file rotated
   during the active stage.

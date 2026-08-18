@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import type { ControlThreadEvent } from "../../app/ports.js";
+import { RepositoryRefConflictError, type ControlThreadEvent } from "../../app/ports.js";
 import { reduceStream, readStreamUpToByteLimit } from "../../shared/bounded-stream.js";
 import { assertGithubResponseOk, githubApiResponse } from "../../shared/github-request.js";
 import { sanitizeText } from "../../shared/sanitize.js";
@@ -1049,6 +1049,113 @@ export async function branchExists(
   if (response.status === 404) return false;
   await assertGithubResponseOk(response);
   return true;
+}
+
+function assertTaskRefInput(ref: string, sha: string): void {
+  if (!/^refs\/heads\/(?!.*\.\.)(?!.*\/$)[A-Za-z0-9._/-]{1,200}$/.test(ref)) {
+    throw new Error("GitHub task ref must be a safe refs/heads name");
+  }
+  if (!GITHUB_COMMIT_SHA_PATTERN.test(sha)) {
+    throw new Error("GitHub task ref requires an exact lowercase commit SHA");
+  }
+}
+
+async function getRepositoryRef(
+  client: GithubClient,
+  repository: string,
+  ref: string
+): Promise<string | undefined> {
+  const response = await githubApiResponse(
+    client,
+    `/repos/${repository}/git/ref/${encodeURIComponent(ref.replace(/^refs\//, ""))}`
+  );
+  if (response.status === 404) return undefined;
+  await assertGithubResponseOk(response);
+  const value = await response.json() as { object?: { sha?: unknown } };
+  const sha = value.object?.sha;
+  if (typeof sha !== "string" || !GITHUB_COMMIT_SHA_PATTERN.test(sha)) {
+    throw new Error("GitHub returned an invalid task ref SHA");
+  }
+  return sha;
+}
+
+export async function createRepositoryRef(
+  client: GithubClient,
+  input: {
+    repository: string;
+    ref: string;
+    expectedNewSha: string;
+    allowExisting: boolean;
+  }
+): Promise<{ sha: string }> {
+  assertTaskRefInput(input.ref, input.expectedNewSha);
+  const current = await getRepositoryRef(client, input.repository, input.ref);
+  if (current !== undefined) {
+    if (input.allowExisting && current === input.expectedNewSha) return { sha: current };
+    throw new RepositoryRefConflictError(
+      `repository ref conflict: ${input.ref} already exists at ${current}`
+    );
+  }
+  const response = await githubApiResponse(client, `/repos/${input.repository}/git/refs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ref: input.ref, sha: input.expectedNewSha }),
+  });
+  if (response.status === 422) {
+    const raced = await getRepositoryRef(client, input.repository, input.ref);
+    if (input.allowExisting && raced === input.expectedNewSha) return { sha: raced };
+    throw new RepositoryRefConflictError(`repository ref conflict: ${input.ref} was created concurrently`);
+  }
+  await assertGithubResponseOk(response);
+  const created = await response.json() as { object?: { sha?: unknown } };
+  if (created.object?.sha !== input.expectedNewSha) {
+    throw new Error("GitHub created the task ref at an unexpected SHA");
+  }
+  return { sha: input.expectedNewSha };
+}
+
+export async function compareAndAdvanceRepositoryRef(
+  client: GithubClient,
+  input: {
+    repository: string;
+    ref: string;
+    expectedOldSha: string;
+    expectedNewSha: string;
+    allowAlreadyAdvanced: boolean;
+  }
+): Promise<{ sha: string }> {
+  assertTaskRefInput(input.ref, input.expectedOldSha);
+  assertTaskRefInput(input.ref, input.expectedNewSha);
+  if (input.expectedOldSha === input.expectedNewSha) {
+    throw new Error("GitHub task ref advancement must change the SHA");
+  }
+  const current = await getRepositoryRef(client, input.repository, input.ref);
+  if (current === input.expectedNewSha && input.allowAlreadyAdvanced) return { sha: current };
+  if (current !== input.expectedOldSha) {
+    throw new RepositoryRefConflictError(
+      `repository ref conflict: ${input.ref} expected ${input.expectedOldSha} but found ${current ?? "missing"}`
+    );
+  }
+  const response = await githubApiResponse(
+    client,
+    `/repos/${input.repository}/git/refs/${encodeURIComponent(input.ref.replace(/^refs\//, ""))}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sha: input.expectedNewSha, force: false }),
+    }
+  );
+  if (response.status === 409 || response.status === 422) {
+    throw new RepositoryRefConflictError(
+      `repository ref conflict: ${input.ref} could not advance without a force update`
+    );
+  }
+  await assertGithubResponseOk(response);
+  const advanced = await response.json() as { object?: { sha?: unknown } };
+  if (advanced.object?.sha !== input.expectedNewSha) {
+    throw new Error("GitHub advanced the task ref to an unexpected SHA");
+  }
+  return { sha: input.expectedNewSha };
 }
 
 export interface RepositoryConfigAtCommit {

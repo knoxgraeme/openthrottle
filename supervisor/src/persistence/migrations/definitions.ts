@@ -3184,6 +3184,71 @@ function consolidateActorStateOntoRuns(db: Database.Database): void {
   }
 }
 
+const taskBranchCheckpointSchema = `
+CREATE TABLE pipeline_effect_intents_task_branch_v53 (
+  id TEXT PRIMARY KEY,
+  pipeline_instance_id TEXT NOT NULL,
+  transition_version INTEGER NOT NULL CHECK(transition_version >= 1),
+  kind TEXT NOT NULL CHECK(kind IN (
+    'create_task_branch', 'advance_task_branch',
+    'provision', 'bootstrap', 'dispatch_stage', 'idle', 'stop', 'quarantine', 'cleanup',
+    'publish_control', 'publish_github', 'publish_pr'
+  )),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  payload TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'acknowledged', 'failed', 'dead')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+  next_attempt_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  acknowledged_at TEXT,
+  last_error TEXT,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  UNIQUE(pipeline_instance_id, transition_version, kind, idempotency_key)
+);
+INSERT INTO pipeline_effect_intents_task_branch_v53 (
+  id, pipeline_instance_id, transition_version, kind, idempotency_key,
+  payload, payload_hash, status, attempts, next_attempt_at, created_at,
+  acknowledged_at, last_error
+)
+SELECT
+  id, pipeline_instance_id, transition_version, kind, idempotency_key,
+  payload, payload_hash, status, attempts, next_attempt_at, created_at,
+  acknowledged_at, last_error
+FROM pipeline_effect_intents;
+DROP TABLE pipeline_effect_intents;
+ALTER TABLE pipeline_effect_intents_task_branch_v53 RENAME TO pipeline_effect_intents;
+CREATE INDEX pipeline_effects_pending_idx
+  ON pipeline_effect_intents(status, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS pipeline_task_branches (
+  pipeline_instance_id TEXT PRIMARY KEY,
+  ticket_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK(generation >= 1),
+  repository TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  plan_digest TEXT NOT NULL CHECK(length(plan_digest) = 64 AND plan_digest NOT GLOB '*[^a-f0-9]*'),
+  lineage TEXT NOT NULL UNIQUE CHECK(length(lineage) = 64 AND lineage NOT GLOB '*[^a-f0-9]*'),
+  base_sha TEXT NOT NULL CHECK(length(base_sha) = 40 AND base_sha NOT GLOB '*[^a-f0-9]*'),
+  accepted_integration_sha TEXT CHECK(accepted_integration_sha IS NULL OR (length(accepted_integration_sha) = 40 AND accepted_integration_sha NOT GLOB '*[^a-f0-9]*')),
+  acknowledged_remote_sha TEXT CHECK(acknowledged_remote_sha IS NULL OR (length(acknowledged_remote_sha) = 40 AND acknowledged_remote_sha NOT GLOB '*[^a-f0-9]*')),
+  status TEXT NOT NULL CHECK(status IN ('pending', 'reserved', 'checkpointed', 'published', 'failed')),
+  last_error TEXT CHECK(last_error IS NULL OR length(last_error) <= 2000),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(pipeline_instance_id) REFERENCES pipeline_instances(id) ON DELETE RESTRICT,
+  UNIQUE(repository, branch),
+  UNIQUE(pipeline_instance_id, generation, lineage)
+);
+CREATE INDEX IF NOT EXISTS pipeline_task_branches_status_idx
+  ON pipeline_task_branches(status, updated_at);
+`;
+
+const taskBranchCheckpointMigrationSource = `${taskBranchCheckpointSchema}
+task-branch-contract:write-capable pipeline instances reserve one supervisor-owned remote ref at the exact sealed base before runtime provisioning/v1
+checkpoint-contract:accepted integration, acknowledged remote head, and published status are separate lineage-fenced durable values/v1
+effect-contract:create and compare-and-advance ref operations use the ordered leased pipeline effect queue and never force-update/v1`;
+
 const definitions: DatabaseMigrationDefinition[] = [
   {
     version: 1,
@@ -3758,6 +3823,23 @@ const definitions: DatabaseMigrationDefinition[] = [
       if (hasTable(db, "feedback_snapshots") &&
           !hasIndex(db, "feedback_snapshots_pending_session_idx")) {
         db.exec(feedbackSnapshotsPendingSessionIndexSchema);
+      }
+    },
+  },
+  {
+    version: 53,
+    name: "task-branch-checkpoints [rollback-compatible:additive/v1]",
+    source: taskBranchCheckpointMigrationSource,
+    mode: "foreign-keys-off",
+    up(db) {
+      const effectTable = db.prepare(`
+        SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_effect_intents'
+      `).get() as { sql: string } | undefined;
+      if (effectTable && !effectTable.sql.includes("'create_task_branch'")) {
+        db.exec(taskBranchCheckpointSchema);
+      } else if (!hasTable(db, "pipeline_task_branches")) {
+        const branchTableStart = taskBranchCheckpointSchema.indexOf("CREATE TABLE pipeline_task_branches");
+        db.exec(taskBranchCheckpointSchema.slice(branchTableStart));
       }
     },
   },
