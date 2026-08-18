@@ -688,6 +688,18 @@ function providerGateReceipt(
   };
 }
 
+function assertPublishedTaskBranch(store: PipelineStore, instance: PipelineInstance): void {
+  const taskBranch = store.getTaskBranch(instance.id);
+  if (!taskBranch) return;
+  if (
+    taskBranch.status !== "published" ||
+    taskBranch.accepted_integration_sha !== taskBranch.acknowledged_remote_sha ||
+    taskBranch.acknowledged_remote_sha !== instance.published_subject
+  ) {
+    throw new Error("provider evidence requires the exact published task branch checkpoint");
+  }
+}
+
 export function processProviderEvidence(
   store: PipelineStore,
   input: {
@@ -830,6 +842,7 @@ export function processProviderEvidence(
   if (instance.status !== "waiting_provider" && !recoveringCanceledMerge) {
     throw new Error(`pipeline instance ${input.instanceId} is not waiting for provider evidence`);
   }
+  assertPublishedTaskBranch(store, instance);
   return coordinatePipelineEvent(store, event, undefined, providerGateReceipt(instance, attempt, stage, event));
 }
 

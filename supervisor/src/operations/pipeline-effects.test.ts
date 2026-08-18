@@ -1190,11 +1190,12 @@ describe("pipeline effect processor", () => {
     const instance = pipelines.getInstanceForSession("session-child-drain")!;
     const attempt = pipelines.getActiveAttempt(instance.id)!;
     const runtime = sandboxRuntimeMock({ issueId: "child-drain" });
+    const repositoryWriter = repositoryWriterMock();
     const processor = createPipelineEffectProcessor({
       store: pipelines,
       tickets,
       runtime,
-      repositoryWriter: repositoryWriterMock(),
+      repositoryWriter,
       taskTimeoutSeconds: 300,
       runtimeResourceRetentionMinutes: 60,
       now: () => new Date("2099-07-22T12:00:00.000Z"),
@@ -2072,9 +2073,20 @@ describe("pipeline effect processor", () => {
       status: "dispatchable",
       immutable_subject: finalIntegratedTreeSubject,
     });
-
     const dispatchCallsBeforeFreshReplay = runtime.dispatchStage.mock.calls.length;
     await processor.drain();
+    expect(repositoryWriter.compareAndAdvanceRef).toHaveBeenCalledWith({
+      repository: "owner/repo",
+      ref: "refs/heads/ot/child-drain",
+      expectedOldSha: instance.base_commit,
+      expectedNewSha: finalIntegratedTreeSubject,
+      allowAlreadyAdvanced: false,
+    });
+    expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
+      accepted_integration_sha: finalIntegratedTreeSubject,
+      acknowledged_remote_sha: finalIntegratedTreeSubject,
+      status: "checkpointed",
+    });
     expect(runtime.dispatchStage).toHaveBeenCalledTimes(dispatchCallsBeforeFreshReplay + 1);
     expect(runtime.dispatchStage).toHaveBeenLastCalledWith(
       { providerResourceId: "sandbox-child-drain" },

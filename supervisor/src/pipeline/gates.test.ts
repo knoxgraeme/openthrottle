@@ -198,6 +198,18 @@ describe("deterministic supervisor stage gates", () => {
       },
     });
     const instance = pipelines.getInstanceForSession("session-1")!;
+    if (pipelines.getTaskBranch(instance.id)) {
+      database.prepare(`
+        UPDATE pipeline_task_branches
+        SET status = 'reserved', acknowledged_remote_sha = base_sha
+        WHERE pipeline_instance_id = ?
+      `).run(instance.id);
+      database.prepare(`
+        UPDATE pipeline_effect_intents
+        SET status = 'acknowledged', acknowledged_at = created_at
+        WHERE pipeline_instance_id = ? AND kind IN ('create_task_branch', 'provision')
+      `).run(instance.id);
+    }
     const attempt = pipelines.getActiveAttempt(instance.id)!;
     const request = pipelines.getStageRequest(attempt.id);
     expect(tickets.beginRun({
@@ -240,9 +252,22 @@ describe("deterministic supervisor stage gates", () => {
           immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
     `).run(subject, publishedCommit, subject, fixture.instance.id);
+    setTaskBranchState(fixture, "published", subject);
     fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
     fixture.tickets.setSetting("github-head-source:issue-1", "authoritative");
     fixture.tickets.setSetting("github-head-observed-at:issue-1", "2025-01-01T00:00:00.000Z");
+  }
+
+  function setTaskBranchState(
+    fixture: Fixture,
+    status: "checkpointed" | "published",
+    subject = SUBJECT
+  ): void {
+    fixture.db.prepare(`
+      UPDATE pipeline_task_branches
+      SET accepted_integration_sha = ?, acknowledged_remote_sha = ?, status = ?
+      WHERE pipeline_instance_id = ?
+    `).run(subject, subject, status, fixture.instance.id);
   }
 
   function moveFixtureToStage(fixture: Fixture, stageId: string): Fixture {
@@ -261,6 +286,7 @@ describe("deterministic supervisor stage gates", () => {
       SET active_stage_id = ?
       WHERE id = ?
     `).run(stage.id, fixture.instance.id);
+    if (stage.evaluator.kind === "publish_subject") setTaskBranchState(fixture, "checkpointed");
     return {
       ...fixture,
       stage,
@@ -873,6 +899,25 @@ describe("deterministic supervisor stage gates", () => {
     );
   }
 
+  function acknowledgeTaskBranchCheckpoint(fixture: Fixture, expectedSha: string): void {
+    const claimed = fixture.pipelines.claimEffects(
+      "2099-01-01T00:00:00.000Z",
+      "2099-01-01T00:01:00.000Z"
+    );
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]).toMatchObject({ kind: "advance_task_branch" });
+    fixture.pipelines.recordEffectAcknowledgement({
+      effectId: claimed[0]!.id,
+      eventId: `task-branch-checkpoint:${claimed[0]!.id}`,
+      payload: canonicalJson({ sha: expectedSha }),
+    });
+    expect(fixture.pipelines.getTaskBranch(fixture.instance.id)).toMatchObject({
+      accepted_integration_sha: expectedSha,
+      acknowledged_remote_sha: expectedSha,
+      status: "checkpointed",
+    });
+  }
+
   function settleForwardChainToPublish(
     fixture: Fixture,
     subject: string,
@@ -894,6 +939,7 @@ describe("deterministic supervisor stage gates", () => {
       subject,
       preSubject: previousSubject,
     });
+    acknowledgeTaskBranchCheckpoint(fixture, subject);
     while (instance.active_stage_id !== "publish") {
       const stageId = instance.active_stage_id!;
       instance = settleCurrentStage(fixture, "success", {
@@ -1458,13 +1504,38 @@ describe("deterministic supervisor stage gates", () => {
     });
 
     expect(evaluateStageGate(fixture.pipelines, input).event.providerRevision).toBe(publishedCommit);
+    expect(() => processStageEvidence(fixture.pipelines, input)).toThrow(/task branch/);
+    setTaskBranchState(fixture, "checkpointed");
     expect(processStageEvidence(fixture.pipelines, input)).toMatchObject({
       status: "waiting_provider",
       published_commit: publishedCommit,
     });
+    expect(fixture.pipelines.getTaskBranch(fixture.instance.id)).toMatchObject({
+      status: "published",
+      accepted_integration_sha: SUBJECT,
+      acknowledged_remote_sha: SUBJECT,
+    });
 
     const missing = event(publishFixture, "success");
     expect(() => evaluateStageGate(fixture.pipelines, missing)).toThrow(/provider commit/);
+  });
+
+  it("rejects provider evidence while the task branch is only checkpointed", () => {
+    const fixture = setup("core/implement@4");
+    moveFixtureToProviderWait(fixture);
+    fixture.db.prepare(`
+      UPDATE pipeline_task_branches SET status = 'checkpointed'
+      WHERE pipeline_instance_id = ?
+    `).run(fixture.instance.id);
+
+    expect(() => processProviderEvidence(fixture.pipelines, {
+      id: "provider-before-task-branch-publication",
+      instanceId: fixture.instance.id,
+      outcome: "success",
+      summary: "Provider checks passed.",
+      evidence: ["https://github.com/owner/repo/pull/1"],
+      providerPayload: { kind: "provider_check", head_sha: PUBLISHED_COMMIT },
+    })).toThrow(/published task branch checkpoint/);
   });
 
   it("settles a second publish after provider feedback repair re-entry", async () => {
@@ -1731,6 +1802,7 @@ describe("deterministic supervisor stage gates", () => {
     fixture.db.prepare(`
       UPDATE pipeline_instances SET status = 'running', active_stage_id = 'publish' WHERE id = ?
     `).run(fixture.instance.id);
+    setTaskBranchState(fixture, "checkpointed");
     const publishFixture: Fixture = {
       ...fixture,
       stage,
@@ -1770,6 +1842,7 @@ describe("deterministic supervisor stage gates", () => {
           immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
     `).run(SUBJECT, publishedCommit, SUBJECT, fixture.instance.id);
+    setTaskBranchState(fixture, "published");
 
     const providerInput = {
       id: "provider-success-1",
@@ -1856,6 +1929,7 @@ describe("deterministic supervisor stage gates", () => {
           immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
     `).run(SUBJECT, publishedCommit, SUBJECT, fixture.instance.id);
+    setTaskBranchState(fixture, "published");
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
     expect(await routePipelineProviderEvent({
@@ -1903,6 +1977,7 @@ describe("deterministic supervisor stage gates", () => {
           immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
     `).run(SUBJECT, publishedCommit, SUBJECT, fixture.instance.id);
+    setTaskBranchState(fixture, "published");
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     fixture.tickets.setSetting("github-head:issue-1", publishedCommit);
 
@@ -2832,7 +2907,7 @@ describe("deterministic supervisor stage gates", () => {
     expect(activityPublisher.publishActivity).toHaveBeenCalledTimes(1);
   });
 
-  it("does not bind a delayed predecessor review to a successor generation that reuses the branch", async () => {
+  it("does not bind a delayed predecessor review to a successor generation with its own branch", async () => {
     const fixture = setup("core/implement@4");
     const activityPublisher = {
       publishActivity: vi.fn(async () => undefined),
@@ -2860,7 +2935,7 @@ describe("deterministic supervisor stage gates", () => {
       ticket_reference: "ISSUE-1",
       session_id: "session-2",
       sandbox_id: null,
-      branch: "ot/issue-1",
+      branch: "ot/issue-1-successor",
       agent: "codex",
       repo: "owner/repo",
       pr_url: null,
@@ -2902,9 +2977,7 @@ describe("deterministic supervisor stage gates", () => {
       fixture.pipelines
     );
 
-    await expect(delayedPredecessorReview()).rejects.toThrow(
-      "review arrived before pull-request binding"
-    );
+    await expect(delayedPredecessorReview()).resolves.toBeUndefined();
     expect(fixture.tickets.getByIssueId("issue-1")?.pr_url).toBeNull();
 
     await handleGithubEvent(
@@ -2920,7 +2993,7 @@ describe("deterministic supervisor stage gates", () => {
           html_url: "https://github.com/owner/repo/pull/2",
           merged: false,
           updated_at: "2026-01-01T00:00:00.000Z",
-          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1", sha: PUBLISHED_COMMIT },
+          head: { repo: { full_name: "owner/repo" }, ref: "ot/issue-1-successor", sha: PUBLISHED_COMMIT },
           base: { ref: "main" },
         },
       },
@@ -4034,9 +4107,10 @@ describe("deterministic supervisor stage gates", () => {
     fixture.db.prepare(`
       UPDATE pipeline_instances
       SET status = 'waiting_provider', active_stage_id = 'provider',
-          immutable_subject = ?, published_commit = ?
+          immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
-    `).run(SUBJECT, SUBJECT, fixture.instance.id);
+    `).run(SUBJECT, SUBJECT, SUBJECT, fixture.instance.id);
+    setTaskBranchState(fixture, "published");
     fixture.tickets.setPrUrl("issue-1", "https://github.com/owner/repo/pull/1");
     fixture.tickets.setSetting("github-head:issue-1", observedHead);
 
@@ -4142,6 +4216,7 @@ describe("deterministic supervisor stage gates", () => {
           immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
     `).run(SUBJECT, PUBLISHED_COMMIT, SUBJECT, fixture.instance.id);
+    setTaskBranchState(fixture, "published");
 
     expect(await drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(snapshot.id))
@@ -4326,6 +4401,7 @@ describe("deterministic supervisor stage gates", () => {
           immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
     `).run(SUBJECT, PUBLISHED_COMMIT, SUBJECT, fixture.instance.id);
+    setTaskBranchState(fixture, "published");
 
     // A Linear reply for the same head joins that snapshot as a repair request.
     const instance = fixture.pipelines.getInstance(fixture.instance.id)!;
@@ -5256,7 +5332,7 @@ describe("deterministic supervisor stage gates", () => {
       ticket_reference: "ISSUE-1",
       session_id: "session-2",
       sandbox_id: null,
-      branch: "ot/issue-1",
+      branch: "ot/issue-1-successor",
       agent: "codex",
       repo: "owner/repo",
       pr_url: "https://github.com/owner/repo/pull/1",
@@ -5310,6 +5386,7 @@ describe("deterministic supervisor stage gates", () => {
       attempt: fixture.pipelines.getAttempt(replacementFixture.attempt.id)!,
       stage: fixture.manifest.stages.find((stage) => stage.id === "publish")!,
     };
+    setTaskBranchState(replacementFixture, "checkpointed");
     expect(settleCurrentStage(replacementFixture, "success", {
       id: "successor-current-publication",
       subject: SUBJECT,
@@ -6728,6 +6805,7 @@ describe("deterministic supervisor stage gates", () => {
       subject: firstRepairSubject,
       preSubject: oldSubject,
     });
+    acknowledgeTaskBranchCheckpoint(fixture, firstRepairSubject);
     instance = settleCurrentStage(fixture, "success", {
       id: "repair-semantic-review-f1",
       subject: firstRepairSubject,
@@ -7242,9 +7320,10 @@ describe("deterministic supervisor stage gates", () => {
     fixture.db.prepare(`
       UPDATE pipeline_instances
       SET status = 'waiting_provider', active_stage_id = 'provider',
-          immutable_subject = ?, published_commit = ?
+          immutable_subject = ?, published_commit = ?, published_subject = ?
       WHERE id = ?
-    `).run(SUBJECT, SUBJECT, fixture.instance.id);
+    `).run(SUBJECT, SUBJECT, SUBJECT, fixture.instance.id);
+    setTaskBranchState(fixture, "published");
 
     expect(await drainPipelineFeedbackSnapshots(fixture.pipelines, fixture.tickets)).toBe(1);
     expect(fixture.db.prepare("SELECT status FROM feedback_snapshots WHERE id = ?").get(stale!.id))
@@ -7443,6 +7522,7 @@ describe("deterministic supervisor stage gates", () => {
       subject: priorSubject,
       preSubject: fixture.instance.base_commit,
     });
+    acknowledgeTaskBranchCheckpoint(fixture, priorSubject);
     expect(instance.active_stage_id).toBe("semantic_review");
     instance = settleCurrentStage(fixture, "success", {
       id: "review-1",

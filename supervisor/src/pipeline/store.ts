@@ -400,6 +400,7 @@ export interface CoordinatorTransitionWrite {
   immutableSubject?: string | null;
   publishedCommit?: string | null;
   publishedSubject?: string | null;
+  taskBranchPublishedSha?: string;
   clearPublishedCommit?: boolean;
   /** Increments the target stage's local bounded re-entry counter. */
   reentryIncrement?: number;
