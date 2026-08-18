@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   RuntimeWorkspace,
   RuntimeWorkspaceAccess,
@@ -20,6 +21,11 @@ import {
   type SandboxStageResultEvent,
 } from "./events.js";
 import { SEALED_STAGE_RESULT_LIMIT_BYTES } from "../pipeline/evidence-limits.js";
+import {
+  GIT_CHECKPOINT_OBJECT_FILE,
+  GIT_CHECKPOINT_OBJECT_SCHEMA,
+  type GitCheckpointObject,
+} from "../pipeline/checkpoint-object.js";
 
 const OUTBOX_DIR = "/home/agent/.ot/outbox";
 const LOOP_ACTION_DIR = "/var/lib/openthrottle/loop-actions";
@@ -178,6 +184,34 @@ async function readWorkspaceSubject(sandbox: RuntimeWorkspace): Promise<string> 
   return subject;
 }
 
+function stageCheckpointPath(event: SandboxStageResultEvent): string | null {
+  return event.checkpoint_object
+    ? `${SEALED_STAGE_RESULT_DIR}/${event.attempt_id}.${GIT_CHECKPOINT_OBJECT_FILE}`
+    : null;
+}
+
+async function readStageCheckpointObject(
+  sandbox: RuntimeWorkspace,
+  event: SandboxStageResultEvent
+): Promise<GitCheckpointObject | undefined> {
+  const descriptor = event.checkpoint_object;
+  const path = stageCheckpointPath(event);
+  if (!descriptor || !path) return undefined;
+  const payload = await sandbox.fs.downloadFile!(path);
+  if (!payload || payload.byteLength !== descriptor.bytes ||
+      createHash("sha256").update(payload).digest("hex") !== descriptor.sha256) {
+    throw new Error(`sealed stage result ${event.attempt_id} checkpoint object does not match its fence`);
+  }
+  return {
+    schema: GIT_CHECKPOINT_OBJECT_SCHEMA,
+    expectedOldSha: descriptor.expected_old_sha,
+    expectedNewSha: descriptor.expected_new_sha,
+    payloadSha256: descriptor.sha256,
+    payloadBytes: descriptor.bytes,
+    payload,
+  };
+}
+
 interface SandboxEventPollerParams {
   runtime: RuntimeWorkspaceAccess & SandboxAutostopRuntime;
   store: SupervisorStore;
@@ -194,7 +228,11 @@ interface SandboxEventPollerParams {
     plan: RuntimePlanItem[];
     eventId: string;
   }) => Promise<unknown>;
-  postStageResult?: (event: SandboxStageResultEvent, observedSubject: string) => Promise<unknown>;
+  postStageResult?: (
+    event: SandboxStageResultEvent,
+    observedSubject: string,
+    checkpointObject?: GitCheckpointObject
+  ) => Promise<unknown>;
   childActions?: ChildActionLivenessPort;
 }
 
@@ -297,6 +335,8 @@ async function pollTicketEvents(
     if (event.run_id !== ticket.run_id) {
       console.warn(`[sandbox-events] deleting stale event ${event.event_id} for ${event.run_id}`);
       await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
+      const checkpointPath = event.kind === "stage_result" ? stageCheckpointPath(event) : null;
+      if (checkpointPath) await sandbox.fs.deleteFile!(checkpointPath).catch(() => undefined);
       continue;
     }
 
@@ -318,6 +358,8 @@ async function pollTicketEvents(
     }
     if (existing.status === "processed") {
       await sandbox.fs.deleteFile!(remotePath).catch(() => undefined);
+      const checkpointPath = event.kind === "stage_result" ? stageCheckpointPath(event) : null;
+      if (checkpointPath) await sandbox.fs.deleteFile!(checkpointPath).catch(() => undefined);
       continue;
     }
 
@@ -378,7 +420,10 @@ async function pollTicketEvents(
         }
       } else if (event.kind === "stage_result") {
         if (!params.postStageResult) throw new Error("sealed stage result handler is not configured");
-        await params.postStageResult(event, await readWorkspaceSubject(sandbox));
+        const observedSubject = await readWorkspaceSubject(sandbox);
+        const checkpointObject = await readStageCheckpointObject(sandbox, event);
+        if (checkpointObject) await params.postStageResult(event, observedSubject, checkpointObject);
+        else await params.postStageResult(event, observedSubject);
       }
       params.store.markSandboxEventProcessed(event.event_id);
     } catch (error) {
@@ -424,6 +469,10 @@ async function pollTicketEvents(
     }
     await sandbox.fs.deleteFile!(remotePath).catch((error) =>
       console.warn(`[sandbox-events] processed ${event.event_id} but could not delete its file:`, error)
+    );
+    const checkpointPath = event.kind === "stage_result" ? stageCheckpointPath(event) : null;
+    if (checkpointPath) await sandbox.fs.deleteFile!(checkpointPath).catch((error) =>
+      console.warn(`[sandbox-events] processed ${event.event_id} but could not delete its checkpoint:`, error)
     );
   }
 }

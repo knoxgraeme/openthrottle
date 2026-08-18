@@ -7,6 +7,12 @@ import {
   SEALED_STAGE_RESULT_LIMIT_BYTES,
   TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES,
 } from "../pipeline/evidence-limits.js";
+import {
+  GIT_CHECKPOINT_OBJECT_FILE,
+  GIT_CHECKPOINT_OBJECT_SCHEMA,
+  MAX_GIT_CHECKPOINT_OBJECT_BYTES,
+  type GitCheckpointObjectDescriptor,
+} from "../pipeline/checkpoint-object.js";
 
 const MAX_EVENT_BYTES = 32 * 1024;
 const MAX_BODY_LENGTH = 8_000;
@@ -75,6 +81,7 @@ export interface SandboxStageResultEvent {
   // older runners and on any other terminal outcome; the supervisor treats
   // absence as "attribute unknown", never as an error.
   fault_reason?: LaunchFaultReason;
+  checkpoint_object?: GitCheckpointObjectDescriptor;
   artifacts: PipelineEventArtifact[];
 }
 
@@ -196,6 +203,27 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
     if (value.fault_reason !== undefined && !LAUNCH_FAULT_REASONS.includes(value.fault_reason as never)) {
       throw new Error("stage result has invalid fault_reason");
     }
+    let checkpointObject: GitCheckpointObjectDescriptor | undefined;
+    if (value.checkpoint_object !== undefined) {
+      if (!isRecord(value.checkpoint_object) ||
+          Object.keys(value.checkpoint_object).sort().join(",") !==
+            "bytes,expected_new_sha,expected_old_sha,file,schema,sha256" ||
+          value.checkpoint_object.schema !== GIT_CHECKPOINT_OBJECT_SCHEMA ||
+          value.checkpoint_object.file !== GIT_CHECKPOINT_OBJECT_FILE ||
+          typeof value.checkpoint_object.expected_old_sha !== "string" ||
+          !/^[a-f0-9]{40}$/.test(value.checkpoint_object.expected_old_sha) ||
+          typeof value.checkpoint_object.expected_new_sha !== "string" ||
+          !/^[a-f0-9]{40}$/.test(value.checkpoint_object.expected_new_sha) ||
+          value.checkpoint_object.expected_old_sha === value.checkpoint_object.expected_new_sha ||
+          !Number.isSafeInteger(value.checkpoint_object.bytes) ||
+          Number(value.checkpoint_object.bytes) < 1 ||
+          Number(value.checkpoint_object.bytes) > MAX_GIT_CHECKPOINT_OBJECT_BYTES ||
+          typeof value.checkpoint_object.sha256 !== "string" ||
+          !/^[a-f0-9]{64}$/.test(value.checkpoint_object.sha256)) {
+        throw new Error("stage result has invalid checkpoint_object");
+      }
+      checkpointObject = value.checkpoint_object as unknown as GitCheckpointObjectDescriptor;
+    }
     const artifacts = value.artifacts.map((entry, index): PipelineEventArtifact => {
       if (!isRecord(entry)) throw new Error(`stage result artifact ${index} is invalid`);
       if (typeof entry.kind !== "string" || entry.kind.length > 80 ||
@@ -231,6 +259,7 @@ export function parseSandboxEvent(raw: string): SandboxEvent {
       native_session_id: value.native_session_id as string | null,
       subject: value.subject,
       ...(value.fault_reason ? { fault_reason: value.fault_reason as LaunchFaultReason } : {}),
+      ...(checkpointObject ? { checkpoint_object: checkpointObject } : {}),
       artifacts,
     };
   }

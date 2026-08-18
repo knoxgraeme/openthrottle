@@ -374,6 +374,83 @@ describe("pipeline coordinator", () => {
     expect(pipelines.listEffects(instance.id)).toHaveLength(4);
   });
 
+  it("atomically stores an ordinary stage checkpoint bundle and advances from its commit while fencing the next stage to the tree", () => {
+    const { pipelines, instance, attempt } = setup("fixture/agent@1");
+    const createBranch = pipelines.claimEffects(
+      "2099-01-01T00:00:00.000Z",
+      "2099-01-01T00:01:00.000Z",
+    )[0]!;
+    expect(createBranch.kind).toBe("create_task_branch");
+    pipelines.recordEffectAcknowledgement({
+      effectId: createBranch.id,
+      eventId: "ordinary-branch-created",
+      payload: canonicalJson({ sha: "a".repeat(40) }),
+    });
+    const branch = pipelines.getTaskBranch(instance.id)!;
+    const treeSubject = "c".repeat(40);
+    const checkpointCommit = "d".repeat(40);
+    const payload = Buffer.from("ordinary checkpoint bundle");
+    const checkpointObject = {
+      schema: "openthrottle.git-checkpoint-object/v1" as const,
+      expectedOldSha: "a".repeat(40),
+      expectedNewSha: checkpointCommit,
+      payloadSha256: createHash("sha256").update(payload).digest("hex"),
+      payloadBytes: payload.byteLength,
+      payload,
+    };
+    const input = {
+      ...event(instance, attempt, "success", "ordinary-stage-checkpoint"),
+      subject: treeSubject,
+      artifacts: event(instance, attempt, "success", "ordinary-stage-checkpoint").artifacts
+        ?.map((artifact) => ({ ...artifact, subject: treeSubject })),
+    };
+
+    expect(() => coordinatePipelineEvent(
+      pipelines,
+      input,
+      (writes) => {
+        if (writes === 4) throw new Error("fault after ordinary checkpoint persistence");
+      },
+      undefined,
+      checkpointObject,
+    )).toThrow(/fault after ordinary checkpoint persistence/);
+    expect(pipelines.getInstance(instance.id)?.state_version).toBe(0);
+    expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
+      accepted_integration_sha: null,
+      acknowledged_remote_sha: "a".repeat(40),
+      lineage: branch.lineage,
+    });
+    expect(db!.prepare("SELECT COUNT(*) AS count FROM pipeline_stage_checkpoint_objects").get())
+      .toEqual({ count: 0 });
+
+    const advanced = coordinatePipelineEvent(
+      pipelines,
+      input,
+      undefined,
+      undefined,
+      checkpointObject,
+    );
+    expect(advanced).toMatchObject({ immutable_subject: treeSubject, active_stage_id: "resume" });
+    expect(pipelines.getActiveAttempt(instance.id)).toMatchObject({ expected_subject: treeSubject });
+    expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
+      accepted_integration_sha: checkpointCommit,
+      acknowledged_remote_sha: "a".repeat(40),
+      status: "reserved",
+    });
+    const checkpointEffect = pipelines.listEffects(instance.id)
+      .find((effect) => effect.kind === "advance_task_branch")!;
+    expect(pipelines.getCheckpointObject(checkpointEffect.id)).toMatchObject({
+      actionId: attempt.id,
+      expectedOldSha: "a".repeat(40),
+      expectedNewSha: checkpointCommit,
+      payload,
+    });
+    const inbox = db!.prepare("SELECT payload FROM pipeline_inbox_events WHERE id = ?")
+      .get(input.id) as { payload: string };
+    expect(inbox.payload).not.toContain(payload.toString("utf8"));
+    expect(inbox.payload).not.toContain("checkpointObject");
+  });
+
   it("clears persisted publication evidence when a stage advances the subject after publishing", () => {
     const { pipelines, instance, attempt } = setup();
     const publishedSubject = "b".repeat(40);

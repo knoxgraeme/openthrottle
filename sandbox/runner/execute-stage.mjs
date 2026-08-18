@@ -8,9 +8,12 @@ import {
   lstatSync,
   readFileSync,
   mkdirSync,
+  renameSync,
   rmSync,
+  statSync,
+  unlinkSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import {
@@ -100,6 +103,8 @@ const CONTEXT_POLICIES = new Set([
 ]);
 const COMMAND_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const REMOTE_GIT_TIMEOUT_MS = 15_000;
+const MAX_CHECKPOINT_OBJECT_BYTES = 64 * 1024 * 1024;
+const CHECKPOINT_OBJECT_FILE = "checkpoint.bundle";
 const DEFAULT_STAGE_ACTION_ROOT = "/var/lib/openthrottle/stage-actions";
 const STANDARD_RECEIPT_ARTIFACT = "standard_receipt";
 // Explicit capability -> skill binding for `ce/`-prefixed agent stages.
@@ -1023,6 +1028,8 @@ export function executeStage({
   if (contract.kind === "provider_wait") throw new Error("provider-wait stages execute in the supervisor, not the sandbox");
   if (contract.kind === "supervisor") throw new Error("supervisor stages execute in the supervisor, not the sandbox");
   const startedAt = now();
+  const checkpointParent = runGitAsRepositoryOwner(repoDir, ["rev-parse", "HEAD"]);
+  if (!COMMIT.test(checkpointParent)) throw new Error("workspace HEAD is not an exact commit");
   const preSubject = computeWorkspaceTreeOid(repoDir);
   if (request.expectedSubject && request.expectedSubject !== preSubject) {
     throw new Error("workspace subject does not match the fenced expected subject");
@@ -1231,6 +1238,7 @@ export function executeStage({
     artifacts,
     completedAt: payload.completed_at,
     faultReason,
+    checkpointParent,
   };
 }
 
@@ -1260,6 +1268,86 @@ export function buildStageResultEvent({ request, result }) {
       hash: artifact.hash,
     })),
   };
+}
+
+function ordinaryWriteCheckpointRequired(request, result, repoDir) {
+  if (!request.credentialScopes.includes("repo.write") || request.capability === "ce/publish@1" ||
+      !["success", "no_change"].includes(result.outcome)) return false;
+  if (!COMMIT.test(result.checkpointParent) || !COMMIT.test(result.subject)) {
+    throw new Error("ordinary write checkpoint requires exact SHA-1 Git objects");
+  }
+  const parentTree = runGitAsRepositoryOwner(repoDir, ["rev-parse", `${result.checkpointParent}^{tree}`]);
+  if (result.outcome === "no_change") {
+    if (parentTree !== result.subject) {
+      throw new Error("ordinary write stage reported no_change after changing the accepted tree");
+    }
+    return false;
+  }
+  return true;
+}
+
+export function commitStageResult(request, result, outputPath, { repoDir } = {}) {
+  let event = buildStageResultEvent({ request, result });
+  if (!ordinaryWriteCheckpointRequired(request, result, repoDir)) {
+    writeJsonAtomic(outputPath, event);
+    return event;
+  }
+  if (computeWorkspaceTreeOid(repoDir) !== result.subject) {
+    throw new Error("ordinary write checkpoint workspace changed after stage acceptance");
+  }
+  const commitEnv = {
+    GIT_AUTHOR_NAME: "OpenThrottle",
+    GIT_AUTHOR_EMAIL: "checkpoint@openthrottle.local",
+    GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
+    GIT_COMMITTER_NAME: "OpenThrottle",
+    GIT_COMMITTER_EMAIL: "checkpoint@openthrottle.local",
+    GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+  };
+  const checkpoint = runGitAsRepositoryOwner(
+    repoDir,
+    ["commit-tree", result.subject, "-p", result.checkpointParent, "-m",
+      `OpenThrottle checkpoint ${request.attemptId}\n\nRequest: ${request.requestHash}`],
+    commitEnv,
+  );
+  if (!COMMIT.test(checkpoint) ||
+      runGitAsRepositoryOwner(repoDir, ["rev-parse", `${checkpoint}^{tree}`]) !== result.subject ||
+      runGitAsRepositoryOwner(repoDir, ["rev-list", "--parents", "-n", "1", checkpoint]) !==
+        `${checkpoint} ${result.checkpointParent}`) {
+    throw new Error("ordinary write checkpoint commit does not match its tree and parent fence");
+  }
+
+  const checkpointPath = resolve(dirname(outputPath), `${request.attemptId}.${CHECKPOINT_OBJECT_FILE}`);
+  const stagingPath = `${checkpointPath}.tmp-${process.pid}`;
+  const checkpointRef = `refs/openthrottle/checkpoints/${request.attemptId}`;
+  try {
+    runGitAsRepositoryOwner(repoDir, ["update-ref", checkpointRef, checkpoint]);
+    runGitAsRepositoryOwner(repoDir, [
+      "bundle", "create", stagingPath, checkpointRef, `^${result.checkpointParent}`,
+    ]);
+    runGitAsRepositoryOwner(repoDir, ["bundle", "verify", stagingPath]);
+    const bytes = statSync(stagingPath).size;
+    if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > MAX_CHECKPOINT_OBJECT_BYTES) {
+      throw new Error(`checkpoint object exceeds ${MAX_CHECKPOINT_OBJECT_BYTES} byte platform bound`);
+    }
+    chmodSync(stagingPath, 0o400);
+    renameSync(stagingPath, checkpointPath);
+    event = {
+      ...event,
+      checkpoint_object: {
+        schema: "openthrottle.git-checkpoint-object/v1",
+        file: CHECKPOINT_OBJECT_FILE,
+        expected_old_sha: result.checkpointParent,
+        expected_new_sha: checkpoint,
+        bytes,
+        sha256: digest(readFileSync(checkpointPath)),
+      },
+    };
+    writeJsonAtomic(outputPath, event);
+    return event;
+  } finally {
+    try { runGitAsRepositoryOwner(repoDir, ["update-ref", "-d", checkpointRef]); } catch {}
+    try { unlinkSync(stagingPath); } catch {}
+  }
 }
 
 export function fallbackStageResultEvent({ request, repoDir, error }) {
@@ -1362,7 +1450,7 @@ function main() {
       repoDir,
       timeoutMs: Number(process.env.TASK_TIMEOUT ?? 7_200) * 1_000,
     });
-    writeJsonAtomic(outputPath, buildStageResultEvent({ request: validatedRequest, result }));
+    commitStageResult(validatedRequest, result, outputPath, { repoDir });
   } catch (error) {
     // Last-resort fence: the request is validated and the output path is
     // known, so even an executor crash must leave a sealed typed result the
