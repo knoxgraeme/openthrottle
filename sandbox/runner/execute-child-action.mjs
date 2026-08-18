@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { existsSync, lstatSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { chmodSync, existsSync, lstatSync, readFileSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
 import { commandDiagnosticTail, digest } from "./artifacts.mjs";
@@ -30,6 +30,8 @@ const GIT_OBJECT_ID = /^[a-f0-9]{40,64}$/;
 const GIT_SHA1_OBJECT_ID = /^[a-f0-9]{40}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const TUNE_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
+export const MAX_CHECKPOINT_OBJECT_BYTES = 64 * 1024 * 1024;
+const CHECKPOINT_OBJECT_FILE = "checkpoint.bundle";
 
 function arg(name, fallback) {
   const index = process.argv.indexOf(name);
@@ -551,8 +553,43 @@ export function replayChildActionResult(request, outputPath, retention = {}) {
 }
 
 export function commitChildActionResult(request, result, outputPath, retention = {}) {
-  writeJsonAtomic(outputPath, result);
-  return finalizeChildActionRetention(request, result, retention);
+  let persisted = result;
+  if (request.actionKind === "integrate" && result.outcome === "success" &&
+      result.subject !== request.inputSubject) {
+    const checkpointRepoDir = retention.checkpointRepoDir ?? INTEGRATION_REPO_DIR;
+    const checkpointPath = resolve(dirname(outputPath), CHECKPOINT_OBJECT_FILE);
+    const stagingPath = `${checkpointPath}.tmp-${process.pid}`;
+    const checkpointRef = `refs/openthrottle/checkpoints/${request.actionId}`;
+    try {
+      runGitAsExecutor(checkpointRepoDir, ["update-ref", checkpointRef, result.subject]);
+      runGitAsExecutor(checkpointRepoDir, [
+        "bundle", "create", stagingPath, checkpointRef, `^${request.inputSubject}`,
+      ]);
+      runGitAsExecutor(checkpointRepoDir, ["bundle", "verify", stagingPath]);
+      const bytes = statSync(stagingPath).size;
+      if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > MAX_CHECKPOINT_OBJECT_BYTES) {
+        throw new Error(`checkpoint object exceeds ${MAX_CHECKPOINT_OBJECT_BYTES} byte platform bound`);
+      }
+      chmodSync(stagingPath, 0o400);
+      renameSync(stagingPath, checkpointPath);
+      persisted = {
+        ...result,
+        checkpoint_object: {
+          schema: "openthrottle.git-checkpoint-object/v1",
+          file: CHECKPOINT_OBJECT_FILE,
+          expected_old_sha: request.inputSubject,
+          expected_new_sha: result.subject,
+          bytes,
+          sha256: digest(readFileSync(checkpointPath)),
+        },
+      };
+    } finally {
+      try { runGitAsExecutor(checkpointRepoDir, ["update-ref", "-d", checkpointRef]); } catch {}
+      try { unlinkSync(stagingPath); } catch {}
+    }
+  }
+  writeJsonAtomic(outputPath, persisted);
+  return finalizeChildActionRetention(request, persisted, retention);
 }
 
 function main() {

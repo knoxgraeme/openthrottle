@@ -35,6 +35,7 @@ import {
   redeliverRepositoryWebhookDelivery,
 } from "./providers/github/client.js";
 import { canSteerPipelineRun } from "./pipeline/control.js";
+import { pushRepositoryCheckpoint } from "./providers/github/checkpoint-push.js";
 import {
   createRuntimeResourceReconciler,
   HOT_PATH_RECLAIM_LIMIT,
@@ -95,7 +96,9 @@ async function main() {
     runtime,
     repositoryWriter: {
       createRef: (input) => createRepositoryRef({ token: cfg.githubToken }, input),
-      compareAndAdvanceRef: (input) => compareAndAdvanceRepositoryRef({ token: cfg.githubToken }, input),
+      compareAndAdvanceRef: (input) => input.checkpointObject
+        ? pushRepositoryCheckpoint({ token: cfg.githubToken }, { ...input, checkpointObject: input.checkpointObject })
+        : compareAndAdvanceRepositoryRef({ token: cfg.githubToken }, input),
     },
     taskTimeoutSeconds: cfg.taskTimeout,
     reviewFanoutConcurrency: cfg.reviewFanoutConcurrency ?? 3,

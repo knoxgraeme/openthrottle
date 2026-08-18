@@ -324,6 +324,13 @@ export interface PipelineStatusProjection {
   sandbox_event_id: string | null;
   sandbox_event_attempts: number | null;
   sandbox_ingestion_error: string | null;
+  structured_active_unit_id: string | null;
+  structured_active_action: string | null;
+  structured_active_action_status: string | null;
+  structured_heartbeat_at: string | null;
+  structured_checkpoint_status: "pending" | "acknowledged" | "failed" | null;
+  sandbox_disk_minimum_gib: 10;
+  sandbox_capacity_warning: string | null;
   structured_units: Array<{
     unit_id: string;
     status: string;

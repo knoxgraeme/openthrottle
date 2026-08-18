@@ -102,7 +102,7 @@ resource defaults:
 
 ```bash
 daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context . \
-  --cpu 4 --memory 8 --disk 5
+  --cpu 4 --memory 8 --disk 10
 ```
 
 See the [CLI guide](cli/README.md) for every command and configuration option.

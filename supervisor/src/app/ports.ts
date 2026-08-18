@@ -1,3 +1,5 @@
+import type { GitCheckpointPayload } from "../pipeline/checkpoint-object.js";
+
 export type ActivityPublicationInput =
   | {
       id?: string;
@@ -135,6 +137,7 @@ export interface RepositoryRefWritePort {
     expectedOldSha: string;
     expectedNewSha: string;
     allowAlreadyAdvanced: boolean;
+    checkpointObject?: GitCheckpointPayload;
   }): Promise<{ sha: string }>;
 }
 

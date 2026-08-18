@@ -1,7 +1,8 @@
 import type Database from "better-sqlite3";
 import { canonicalJson, digestNormalized } from "../../pipeline/manifest.js";
 import type { PipelineEffectIntent, PipelineInstance, PipelineStore, PipelineTaskBranch } from "../../pipeline/store.js";
-import { claimLeasable, markQueueFailed } from "./helpers.js";
+import { claimLeasable, deterministicId, insertExecutionPublicationEvent, markQueueFailed } from "./helpers.js";
+import type { ExecutionUnitGraph } from "./unit-store.js";
 import { sanitizeText } from "../../shared/sanitize.js";
 
 interface TaskBranchEffectControl {
@@ -165,6 +166,68 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
           );
       if (branchUpdate.changes !== 1) {
         throw new Error(`pipeline task branch effect ${effect.id} checkpoint changed before acknowledgement`);
+      }
+      if (effect.kind === "advance_task_branch") {
+        const action = db.prepare(`
+          SELECT id, parent_attempt_id, execution_unit_id, unit_id
+          FROM execution_work_attempts WHERE checkpoint_effect_id = ?
+        `).get(effect.id) as {
+          id: string;
+          parent_attempt_id: string;
+          execution_unit_id: string | null;
+          unit_id: string | null;
+        } | undefined;
+        if (action) {
+          const checkpoint = db.prepare(`
+            UPDATE execution_work_attempts
+            SET checkpoint_status = 'acknowledged', checkpoint_acknowledged_at = ?,
+                checkpoint_last_error = NULL, updated_at = ?
+            WHERE id = ? AND checkpoint_status = 'pending'
+              AND checkpoint_expected_old_sha = ? AND checkpoint_remote_sha = ?
+          `).run(timestamp, timestamp, action.id, control.expectedOldSha, control.expectedNewSha);
+          if (checkpoint.changes !== 1) {
+            throw new Error(`pipeline checkpoint effect ${effect.id} action ledger changed before acknowledgement`);
+          }
+          const objectDelete = db.prepare(`
+            DELETE FROM execution_checkpoint_objects
+            WHERE effect_id = ? AND expected_old_sha = ? AND expected_new_sha = ?
+          `).run(effect.id, control.expectedOldSha, control.expectedNewSha);
+          if (objectDelete.changes !== 1) {
+            throw new Error(`pipeline checkpoint effect ${effect.id} durable object is missing`);
+          }
+          if (action.execution_unit_id && action.unit_id) {
+            const settled = db.prepare(`
+              UPDATE execution_units
+              SET status = 'completed', terminal_level = 'completed', alarm = 0,
+                  active_work_attempt_id = NULL, updated_at = ?
+              WHERE id = ? AND terminal_level IS NULL AND integration_subject = ?
+            `).run(timestamp, action.execution_unit_id, control.expectedNewSha);
+            if (settled.changes !== 1) {
+              throw new Error(`pipeline checkpoint effect ${effect.id} unit frontier changed before acknowledgement`);
+            }
+            const graph = db.prepare(`SELECT * FROM execution_graphs WHERE parent_attempt_id = ?`)
+              .get(action.parent_attempt_id) as ExecutionUnitGraph;
+            insertExecutionPublicationEvent({
+              db,
+              id: deterministicId("execution-activity-unit-settled", [action.parent_attempt_id, action.unit_id]),
+              graph,
+              unitId: action.unit_id,
+              kind: "unit_settled",
+              body: `Unit ${action.unit_id} completed: acceptance_passed_checkpointed.`,
+              timestamp,
+            });
+          } else {
+            const graphUpdate = db.prepare(`
+              UPDATE execution_graphs
+              SET final_phase = 'command', final_command_index = 0,
+                  final_cycle = final_cycle + 1, updated_at = ?
+              WHERE parent_attempt_id = ? AND integration_subject = ?
+            `).run(timestamp, action.parent_attempt_id, control.expectedNewSha);
+            if (graphUpdate.changes !== 1) {
+              throw new Error(`pipeline checkpoint effect ${effect.id} final frontier changed before acknowledgement`);
+            }
+          }
+        }
       }
     }
     db.prepare(`
@@ -341,6 +404,24 @@ export function createEffectStore(db: Database.Database, now: () => string): Pic
             last_error = ?, updated_at = ?
         WHERE pipeline_instance_id = ?
       `).run(status, boundedError, timestamp, effect.pipeline_instance_id);
+      if (status === "dead" && effect.kind === "advance_task_branch") {
+        const checkpoint = db.prepare(`
+          SELECT parent_attempt_id FROM execution_work_attempts WHERE checkpoint_effect_id = ?
+        `).get(effectId) as { parent_attempt_id: string } | undefined;
+        db.prepare(`
+          UPDATE execution_work_attempts
+          SET checkpoint_status = 'failed', checkpoint_last_error = ?, updated_at = ?
+          WHERE checkpoint_effect_id = ? AND checkpoint_status = 'pending'
+        `).run(boundedError, timestamp, effectId);
+        if (checkpoint) {
+          db.prepare(`
+            UPDATE execution_graphs
+            SET stopped_at = COALESCE(stopped_at, ?), stop_outcome = COALESCE(stop_outcome, 'needs_human'),
+                stop_reason = COALESCE(stop_reason, ?), updated_at = ?
+            WHERE parent_attempt_id = ?
+          `).run(timestamp, boundedError, timestamp, checkpoint.parent_attempt_id);
+        }
+      }
     }
   });
 

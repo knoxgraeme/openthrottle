@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statfsSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statfsSync, writeFileSync } from "node:fs";
 import { basename, dirname, relative, resolve, sep } from "node:path";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
@@ -12,7 +12,7 @@ const NATIVE_SESSION_PACKAGE_SCHEMA = "openthrottle.native-session-package/v1";
 // Real Claude Code durable transcripts embed full tool outputs, and a
 // multi-stage resumed session appends every stage into one JSONL, so packages
 // legitimately grow far past a few MiB. These bounds exist to keep packages
-// bounded against the 5 GiB sandbox disk, not to police typical size; the
+// bounded against the 10 GiB sandbox disk, not to police typical size; the
 // byte cap applies both per file and to the whole package.
 export const MAX_NATIVE_SESSION_FILES = 1024;
 export const MAX_NATIVE_SESSION_BYTES = 256 * 1024 * 1024;
@@ -167,10 +167,24 @@ function collectNativeSessionPackage(root, nativeSessionId, agent) {
   return { files, bytes: totals.bytes, containsSessionId: files.length > 0 && sessionEvidence.contains };
 }
 
+function measureNativeSessionTree(path, totals = { bytes: 0, files: 0 }) {
+  const metadata = lstatSync(path);
+  if (metadata.isSymbolicLink()) throw new Error("native session package cannot contain symlinks");
+  if (metadata.isDirectory()) {
+    for (const entry of readdirSync(path)) measureNativeSessionTree(resolve(path, entry), totals);
+    return totals;
+  }
+  if (!metadata.isFile()) throw new Error("native session package can contain only regular files");
+  if (totals.files >= MAX_NATIVE_SESSION_FILES) throw new Error("native session package has too many files");
+  if (metadata.size > MAX_NATIVE_SESSION_BYTES) throw new Error("native session package file is too large");
+  totals.files += 1;
+  totals.bytes += metadata.size;
+  if (totals.bytes > MAX_NATIVE_SESSION_BYTES) throw new Error("native session package is too large");
+  return totals;
+}
+
 function preflightNativeSessionSource(sessionsSource) {
-  const totals = { bytes: 0 };
-  collectNativeSessionFiles(sessionsSource, sessionsSource, [], totals);
-  return totals.bytes;
+  return measureNativeSessionTree(sessionsSource).bytes;
 }
 
 function retryableStorageError(message, cause = null) {
@@ -354,12 +368,18 @@ export function sealNativeSessionPackage({
       source: staging,
       request: { agent, nativeSessionId },
     });
+    // Darwin requires the renamed directory itself to be owner-writable even
+    // when its parent is writable. The package parent is executor-private and
+    // every child is already sealed, so temporarily opening only this root
+    // keeps the atomic swap portable without exposing package contents.
+    chmodSync(staging, 0o700);
     if (existsSync(destination)) {
       chmodTree(destination, { fileMode: 0o600, directoryMode: 0o700 });
       renameFile(destination, rollback);
       movedDestination = true;
     }
     renameFile(staging, destination);
+    chmodSync(destination, 0o500);
     movedDestination = false;
     rmSync(rollback, { recursive: true, force: true });
     return destination;

@@ -853,12 +853,17 @@ export function coordinatePipelineEvent(
   write.exhaustedEffectError = event.exhaustedEffectError;
   write.gateReceipt = gateReceipt;
   const stage = manifest.stages.find((candidate) => candidate.id === attempt.stage_id)!;
+  // A structured graph owns its commit checkpoint frontier at each accepted
+  // integration. Later stage subjects may be canonical tree IDs, so they
+  // must never be reinterpreted as commits by the simple-stage branch path.
+  const structuredExecution = store.getStructuredExecutionPublicationForInstance(instance.id);
   let taskBranch = store.getTaskBranch(instance.id);
   if (
     taskBranch &&
     event.kind === "stage_result" &&
     (write.outcome === "success" || write.outcome === "no_change") &&
     acceptsIntegratedSubject(stage) &&
+    !structuredExecution &&
     !isPublicationStage(stage) &&
     isExactCommitSubject(event.subject) &&
     taskBranch.acknowledged_remote_sha !== event.subject
@@ -879,10 +884,21 @@ export function coordinatePipelineEvent(
     ? manifest.stages.find((candidate) => candidate.id === write.nextStageId)
     : undefined;
   if (taskBranch && nextStage && isPublicationStage(nextStage)) {
-    if (!isExactCommitSubject(event.subject) || taskBranch.accepted_integration_sha !== event.subject) {
+    const structuredHandoff = structuredExecution !== undefined;
+    if ((!structuredHandoff &&
+          (!isExactCommitSubject(event.subject) || taskBranch.accepted_integration_sha !== event.subject)) ||
+        (structuredHandoff &&
+          (taskBranch.accepted_integration_sha === null ||
+           taskBranch.accepted_integration_sha !== taskBranch.acknowledged_remote_sha))) {
       throw new Error("pipeline publication requires an accepted task branch integration");
     }
-    if (taskBranch.status === "pending" || taskBranch.status === "failed") {
+    // A simple stage atomically records the accepted commit and queues its
+    // checkpoint effect in this transition. Effect ordering keeps publication
+    // undispatched until that effect acknowledges the remote head. Structured
+    // execution reaches this handoff only after its unit checkpoint settled,
+    // so it must already carry the stronger acknowledged state.
+    if ((!structuredHandoff && (taskBranch.status === "pending" || taskBranch.status === "failed")) ||
+        (structuredHandoff && taskBranch.status !== "checkpointed" && taskBranch.status !== "published")) {
       throw new Error("pipeline publication requires a viable task branch checkpoint");
     }
   }
@@ -917,7 +933,6 @@ export function coordinatePipelineEvent(
   // attempt that is transitioning is no longer the one that owns the
   // execution graph, so this must resolve by instance rather than by the
   // current attempt's id or the terminal receipt would never carry it.
-  const structuredExecution = store.getStructuredExecutionPublicationForInstance(instance.id);
   const publication = canonicalJson(buildStagePublication({
     instance,
     attempt,

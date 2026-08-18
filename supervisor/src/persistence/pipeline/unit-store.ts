@@ -54,6 +54,11 @@ import {
   MAX_DOWNSTREAM_CONTEXT_BYTES as MAX_DOWNSTREAM_CONTEXT_AGGREGATE_BYTES,
   MAX_DOWNSTREAM_CONTEXT_RECORDS,
 } from "../../pipeline/structured-loop-limits.js";
+import {
+  GIT_CHECKPOINT_OBJECT_SCHEMA,
+  MAX_GIT_CHECKPOINT_OBJECT_BYTES,
+  type GitCheckpointObject,
+} from "../../pipeline/checkpoint-object.js";
 
 export type ExecutionGateKind = ChildGateDecision["gateKind"] | "integration" | "final_review";
 
@@ -129,6 +134,12 @@ export interface ExecutionWorkAttempt {
   observation_retry_at: string | null;
   observation_epoch: number;
   output_subject: string | null;
+  checkpoint_expected_old_sha?: string | null;
+  checkpoint_remote_sha?: string | null;
+  checkpoint_status?: "pending" | "acknowledged" | "failed" | null;
+  checkpoint_effect_id?: string | null;
+  checkpoint_last_error?: string | null;
+  checkpoint_acknowledged_at?: string | null;
   payload: string;
   created_at: string;
   updated_at: string;
@@ -142,6 +153,26 @@ export interface ExecutionWorkPrivateArtifact {
   payload: Uint8Array;
   payloadSha256: string;
   payloadBytes: number;
+}
+
+export type ExecutionCheckpointObject = GitCheckpointObject;
+
+export interface DurableExecutionCheckpointObject extends GitCheckpointObject {
+  actionId: string;
+  effectId: string;
+}
+
+interface StructuredTaskBranchRow {
+  pipeline_instance_id: string;
+  ticket_id: string;
+  generation: number;
+  repository: string;
+  branch: string;
+  plan_digest: string;
+  lineage: string;
+  accepted_integration_sha: string | null;
+  acknowledged_remote_sha: string | null;
+  status: "pending" | "reserved" | "checkpointed" | "published" | "failed";
 }
 
 export interface ExecutionGateReceipt {
@@ -247,7 +278,9 @@ export interface ExecutionUnitStore {
     receipt?: string;
     nativeSessionId?: string | null;
     decision: ExecutionGateDecision;
+    checkpointObject?: ExecutionCheckpointObject;
   }): ExecutionWorkAttempt;
+  getCheckpointObject(effectId: string): DurableExecutionCheckpointObject | undefined;
   failUnitAction(input: {
     actionId: string;
     resultHash: string;
@@ -443,6 +476,89 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
   const graphStmt = db.prepare("SELECT * FROM execution_graphs WHERE parent_attempt_id = ?");
   const listUnitRows = (parentAttemptId: string): ExecutionUnitRow[] =>
     listUnitRowsForParentAttempt(db, parentAttemptId);
+
+  function queueAcceptedCheckpoint(input: {
+    action: ExecutionWorkAttempt;
+    subject: string;
+    checkpointObject?: ExecutionCheckpointObject;
+    timestamp: string;
+  }): boolean {
+    const branch = db.prepare(`
+      SELECT * FROM pipeline_task_branches WHERE pipeline_instance_id = ?
+    `).get(input.action.pipeline_instance_id) as StructuredTaskBranchRow | undefined;
+    if (!branch) return false;
+    const expectedOldSha = branch.acknowledged_remote_sha;
+    if (!expectedOldSha) throw new Error("structured checkpoint requires an acknowledged task branch head");
+    if (input.subject === expectedOldSha) return false;
+    const object = input.checkpointObject;
+    const payload = object ? Buffer.from(object.payload) : undefined;
+    if (!object || object.schema !== GIT_CHECKPOINT_OBJECT_SCHEMA ||
+        object.expectedOldSha !== expectedOldSha || object.expectedNewSha !== input.subject ||
+        object.payloadBytes !== payload?.byteLength || object.payloadBytes < 1 ||
+        object.payloadBytes > MAX_GIT_CHECKPOINT_OBJECT_BYTES ||
+        object.payloadSha256 !== createHash("sha256").update(payload).digest("hex")) {
+      throw new Error("accepted integration is missing its exact bounded checkpoint object");
+    }
+    if (!['reserved', 'checkpointed', 'published'].includes(branch.status) ||
+        (branch.accepted_integration_sha !== null &&
+          branch.accepted_integration_sha !== branch.acknowledged_remote_sha)) {
+      throw new Error("structured checkpoint task branch already has an unsettled integration");
+    }
+    const control = canonicalJson({
+      schema: "openthrottle.task-branch-effect/v1",
+      pipelineInstanceId: input.action.pipeline_instance_id,
+      ticketId: branch.ticket_id,
+      generation: branch.generation,
+      repository: branch.repository,
+      ref: `refs/heads/${branch.branch}`,
+      planDigest: branch.plan_digest,
+      lineage: branch.lineage,
+      expectedOldSha,
+      expectedNewSha: input.subject,
+    });
+    const effectId = `task-branch-${digestNormalized(control).slice(0, 32)}`;
+    const transitionVersion = (db.prepare(`
+      SELECT COALESCE(MAX(transition_version), 0) + 1 AS version
+      FROM pipeline_effect_intents WHERE pipeline_instance_id = ?
+    `).get(input.action.pipeline_instance_id) as { version: number }).version;
+    const accepted = db.prepare(`
+      UPDATE pipeline_task_branches
+      SET accepted_integration_sha = ?, status = 'reserved', last_error = NULL, updated_at = ?
+      WHERE pipeline_instance_id = ? AND generation = ? AND lineage = ?
+        AND acknowledged_remote_sha = ? AND status IN ('reserved', 'checkpointed', 'published')
+        AND (accepted_integration_sha IS NULL OR accepted_integration_sha = acknowledged_remote_sha)
+    `).run(
+      input.subject, input.timestamp, input.action.pipeline_instance_id, branch.generation,
+      branch.lineage, expectedOldSha
+    );
+    if (accepted.changes !== 1) throw new Error("task branch changed before structured checkpoint acceptance");
+    db.prepare(`
+      INSERT INTO pipeline_effect_intents (
+        id, pipeline_instance_id, transition_version, kind, idempotency_key,
+        payload, payload_hash, status, next_attempt_at, created_at
+      ) VALUES (?, ?, ?, 'advance_task_branch', ?, ?, ?, 'pending', ?, ?)
+    `).run(
+      effectId, input.action.pipeline_instance_id, transitionVersion,
+      `advance-task-branch:${branch.lineage}:${expectedOldSha}:${input.subject}`,
+      control, digestNormalized(control), input.timestamp, input.timestamp
+    );
+    db.prepare(`
+      INSERT INTO execution_checkpoint_objects (
+        action_id, effect_id, expected_old_sha, expected_new_sha,
+        payload_sha256, payload_bytes, payload, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.action.id, effectId, expectedOldSha, input.subject,
+      object.payloadSha256, object.payloadBytes, payload, input.timestamp
+    );
+    db.prepare(`
+      UPDATE execution_work_attempts
+      SET checkpoint_expected_old_sha = ?, checkpoint_remote_sha = ?, checkpoint_status = 'pending',
+          checkpoint_effect_id = ?, checkpoint_last_error = NULL, updated_at = ?
+      WHERE id = ?
+    `).run(expectedOldSha, input.subject, effectId, input.timestamp, input.action.id);
+    return true;
+  }
 
   function settleUnitRow(input: {
     parentAttemptId: string;
@@ -907,6 +1023,12 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
         AND (lease_until IS NULL OR lease_until > ?)
     `).get(input.parentAttemptId, input.nowIso);
     if (active) return undefined;
+    const checkpointPending = db.prepare(`
+      SELECT 1 FROM execution_work_attempts
+      WHERE parent_attempt_id = ? AND checkpoint_status = 'pending'
+      LIMIT 1
+    `).get(input.parentAttemptId);
+    if (checkpointPending) return undefined;
 
     const rows = listUnitRows(input.parentAttemptId);
     const allSettled = rows.length > 0 && rows.every((row) => row.terminal_level !== null);
@@ -1121,11 +1243,19 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       } else if (input.decision.gateKind === "integration") {
         const routing = routeIntegrationDecision({ outcome: input.decision.outcome, reason: input.decision.reason });
         if (routing.action === "settle_completed") {
+          const checkpointPending = queueAcceptedCheckpoint({
+            action: completedAction,
+            subject: input.decision.subject!,
+            checkpointObject: input.checkpointObject,
+            timestamp,
+          });
           db.prepare(`UPDATE execution_units SET integration_subject = ?, updated_at = ? WHERE id = ?`)
             .run(input.decision.subject, timestamp, unitRow.id);
           db.prepare(`UPDATE execution_graphs SET integration_subject = ?, updated_at = ? WHERE parent_attempt_id = ?`)
             .run(input.decision.subject, timestamp, completedAction.parent_attempt_id);
-          settleUnitRow({ parentAttemptId: completedAction.parent_attempt_id, unitId: unitRow.unit_id, reason: "acceptance_passed", timestamp });
+          if (!checkpointPending) {
+            settleUnitRow({ parentAttemptId: completedAction.parent_attempt_id, unitId: unitRow.unit_id, reason: "acceptance_passed", timestamp });
+          }
           const contextRecords = acceptedDownstreamContextRecords({
             parentAttemptId: completedAction.parent_attempt_id,
             unitId: unitRow.unit_id,
@@ -1149,11 +1279,21 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       if (input.decision.gateKind === "integration") {
         const routing = routeIntegrationDecision({ outcome: input.decision.outcome, reason: input.decision.reason });
         if (routing.action === "settle_completed") {
+          const checkpointPending = queueAcceptedCheckpoint({
+            action: completedAction,
+            subject: input.decision.subject!,
+            checkpointObject: input.checkpointObject,
+            timestamp,
+          });
           db.prepare(`
-            UPDATE execution_graphs SET integration_subject = ?, final_phase = 'command',
-              final_command_index = 0, final_cycle = final_cycle + 1, updated_at = ?
+            UPDATE execution_graphs SET integration_subject = ?,
+              final_phase = CASE WHEN ? = 1 THEN final_phase ELSE 'command' END,
+              final_command_index = CASE WHEN ? = 1 THEN final_command_index ELSE 0 END,
+              final_cycle = CASE WHEN ? = 1 THEN final_cycle ELSE final_cycle + 1 END,
+              updated_at = ?
             WHERE id = ?
-          `).run(input.decision.subject, timestamp, graph.id);
+          `).run(input.decision.subject, checkpointPending ? 1 : 0, checkpointPending ? 1 : 0,
+            checkpointPending ? 1 : 0, timestamp, graph.id);
         } else {
           stopActiveWork({ parentAttemptId: completedAction.parent_attempt_id, reason: routing.reason });
         }
@@ -1342,6 +1482,49 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     );
     if (update.changes !== 1 && observationExhaustion) return loadActiveAction(db, input.actionId);
     if (update.changes !== 1) throw new Error(`execution work attempt ${input.actionId} retryable stop compare-and-set failed`);
+    const priorRecovery = db.prepare(`
+      SELECT 1 AS found FROM execution_work_attempts
+      WHERE parent_attempt_id = ? AND unit_id IS ? AND action_kind = ? AND cycle = ?
+        AND status = 'dead' AND id <> ?
+        AND last_error LIKE 'retryable_infrastructure_failure:%'
+      LIMIT 1
+    `).get(
+      action.parent_attempt_id, action.unit_id, action.action_kind, action.cycle, action.id
+    ) as { found: 1 } | undefined;
+    const recoverableCheckpoint = db.prepare(`
+      SELECT acknowledged_remote_sha FROM pipeline_task_branches
+      WHERE pipeline_instance_id = ? AND status = 'checkpointed'
+        AND accepted_integration_sha = acknowledged_remote_sha
+    `).get(action.pipeline_instance_id) as { acknowledged_remote_sha: string } | undefined;
+    // One deterministic local recovery pass salvages the durable graph from
+    // transient provider/disk faults. The acknowledged task-branch checkpoint
+    // remains the frontier; completed units are untouched and only the active
+    // action is recreated with a fresh ordinal. A repeated fault takes the
+    // existing typed terminal path, preventing an autonomous retry loop.
+    if (!priorRecovery && recoverableCheckpoint) {
+      db.prepare(`
+        UPDATE execution_work_attempts
+        SET terminal_result_outcome = NULL,
+            payload = json_set(payload, '$.recovery', json_object(
+              'schema', 'openthrottle.structured-action-recovery/v1',
+              'checkpoint_sha', (
+                SELECT acknowledged_remote_sha FROM pipeline_task_branches
+                WHERE pipeline_instance_id = execution_work_attempts.pipeline_instance_id
+              ),
+              'restarted_fresh', 1
+            )),
+            updated_at = ?
+        WHERE id = ?
+      `).run(timestamp, action.id);
+      if (action.execution_unit_id) {
+        db.prepare(`
+          UPDATE execution_units
+          SET status = 'running', active_work_attempt_id = NULL, updated_at = ?
+          WHERE id = ? AND terminal_level IS NULL AND active_work_attempt_id = ?
+        `).run(timestamp, action.execution_unit_id, action.id);
+      }
+      return loadActiveAction(db, input.actionId);
+    }
     const graph = graphStmt.get(action.parent_attempt_id) as ExecutionUnitGraph | undefined;
     if (graph && !graph.aggregate_emitted_at && !graph.stopped_at) {
       db.prepare(`
@@ -1800,6 +1983,32 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     }),
     completeUnitAction,
     completeGatedAction,
+    getCheckpointObject(effectId) {
+      const row = db.prepare(`
+        SELECT action_id, effect_id, expected_old_sha, expected_new_sha,
+               payload_sha256, payload_bytes, payload
+        FROM execution_checkpoint_objects
+        WHERE effect_id = ?
+      `).get(effectId) as {
+        action_id: string;
+        effect_id: string;
+        expected_old_sha: string;
+        expected_new_sha: string;
+        payload_sha256: string;
+        payload_bytes: number;
+        payload: Buffer;
+      } | undefined;
+      return row ? {
+          schema: GIT_CHECKPOINT_OBJECT_SCHEMA,
+        actionId: row.action_id,
+        effectId: row.effect_id,
+        expectedOldSha: row.expected_old_sha,
+        expectedNewSha: row.expected_new_sha,
+        payloadSha256: row.payload_sha256,
+        payloadBytes: row.payload_bytes,
+        payload: row.payload,
+      } : undefined;
+    },
     failUnitAction,
     stopRetryableUnitAction,
     emitAggregateOnce,

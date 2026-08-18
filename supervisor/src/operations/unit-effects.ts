@@ -3,6 +3,7 @@ import type {
   ExecutionUnitStore,
   ExecutionWorkAttempt,
   ExecutionWorkPrivateArtifact,
+  ExecutionCheckpointObject,
 } from "../persistence/pipeline/unit-store.js";
 import type { ExecutionGateDecision } from "../pipeline/execution-gates.js";
 import { serializeRuntimeObservationError } from "../runtime/observation-error.js";
@@ -30,6 +31,7 @@ export interface UnitEffectRuntime {
     receipt?: string;
     nativeSessionId?: string | null;
     decision?: ExecutionGateDecision;
+    checkpointObject?: ExecutionCheckpointObject;
   } | {
     terminal: true;
     resultHash: string;
@@ -165,6 +167,7 @@ export function createUnitEffectProcessor(input: {
               receipt: recovered.receipt,
               nativeSessionId: recovered.nativeSessionId,
               decision: recovered.decision,
+              checkpointObject: recovered.checkpointObject,
             });
           } else {
             input.store.completeUnitAction({

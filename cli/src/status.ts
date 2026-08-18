@@ -42,6 +42,13 @@ interface TicketRow {
     effect_status: string | null;
     effect_error: string | null;
     sandbox_ingestion_error: string | null;
+    structured_active_unit_id?: string | null;
+    structured_active_action?: string | null;
+    structured_active_action_status?: string | null;
+    structured_heartbeat_at?: string | null;
+    structured_checkpoint_status?: string | null;
+    sandbox_disk_minimum_gib?: number;
+    sandbox_capacity_warning?: string | null;
     structured_units?: Array<{
       unit_id: string;
       status: string;
@@ -93,6 +100,14 @@ function renderTicket(ticket: TicketRow): void {
   console.log(`  gate: ${value(p.gate_result)} context: ${value(p.context_policy)}`);
   console.log(`  publication: ${p.publication_state}${p.publication_id ? ` (${p.publication_id})` : ''}`);
   console.log(`  effect: ${p.effect_kind ? `${p.effect_kind}:${p.effect_status ?? p.effect_state}` : p.effect_state}`);
+  if (p.structured_active_action) {
+    console.log(`  active unit/action: ${value(p.structured_active_unit_id)}/${p.structured_active_action} ` +
+      `${value(p.structured_active_action_status)} heartbeat ${value(p.structured_heartbeat_at)}`);
+  }
+  if (p.structured_checkpoint_status) {
+    console.log(`  checkpoint: ${p.structured_checkpoint_status}`);
+  }
+  if (p.sandbox_capacity_warning) console.log(`  capacity warning: ${p.sandbox_capacity_warning}`);
   if (p.structured_units && p.structured_units.length > 0) {
     console.log('  units:');
     for (const unit of p.structured_units) {

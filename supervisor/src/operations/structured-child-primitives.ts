@@ -37,6 +37,11 @@ export function privateArtifactForLoopResult(result: LoopActionResult): Executio
 }
 
 export function actionResultHash(result: ChildExecutorActionResult | LoopActionResult): string {
+  if ("checkpointObject" in result && result.checkpointObject) {
+    const { payload: _payload, ...descriptor } = result.checkpointObject;
+    const { checkpointObject: _checkpointObject, ...boundedResult } = result;
+    return digestCanonicalJson({ ...boundedResult, checkpointObject: descriptor });
+  }
   if (!("recoveryPayload" in result) || !result.recoveryPayload) return digestCanonicalJson(result);
   const { recoveryPayload, ...boundedResult } = result;
   const payload = Buffer.from(recoveryPayload);

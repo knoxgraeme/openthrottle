@@ -997,13 +997,25 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
             expectedNewSha: control.expectedNewSha,
             allowExisting: effect.attempts > 1,
           })
-        : await deps.repositoryWriter.compareAndAdvanceRef({
-            repository: control.repository,
-            ref: control.ref,
-            expectedOldSha: control.expectedOldSha!,
-            expectedNewSha: control.expectedNewSha,
-            allowAlreadyAdvanced: effect.attempts > 1,
-          });
+        : await (async () => {
+            const checkpointObject = deps.store.getCheckpointObject(effect.id);
+            if (checkpointObject && (checkpointObject.expectedOldSha !== control.expectedOldSha ||
+                checkpointObject.expectedNewSha !== control.expectedNewSha)) {
+              throw new Error(`pipeline task branch effect ${effect.id} has a mismatched durable checkpoint object`);
+            }
+            return deps.repositoryWriter.compareAndAdvanceRef({
+              repository: control.repository,
+              ref: control.ref,
+              expectedOldSha: control.expectedOldSha!,
+              expectedNewSha: control.expectedNewSha,
+              allowAlreadyAdvanced: effect.attempts > 1,
+              ...(checkpointObject ? { checkpointObject: {
+                payload: checkpointObject.payload,
+                payloadBytes: checkpointObject.payloadBytes,
+                payloadSha256: checkpointObject.payloadSha256,
+              } } : {}),
+            });
+          })();
       if (result.sha !== control.expectedNewSha) {
         throw new Error(`pipeline task branch effect ${effect.id} returned an unexpected SHA`);
       }

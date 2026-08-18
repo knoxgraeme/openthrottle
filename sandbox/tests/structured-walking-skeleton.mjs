@@ -19,7 +19,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { createPipelineEffectProcessor } from "../../supervisor/dist/operations/pipeline-effects.js";
@@ -193,6 +193,23 @@ function dockerWriteRootFile(container, path, content, mode = "0400") {
 
 function dockerReadFile(container, path) {
   return dockerExec(container, ["cat", path]);
+}
+
+function dockerReadBinaryFile(container, path) {
+  const args = dockerExecArgs(container, ["cat", path]);
+  const result = spawnSync("docker", args, {
+    encoding: null,
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: DOCKER_EXEC_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
+  if (result.error?.code === "ETIMEDOUT" || result.signal === "SIGKILL") {
+    throw new Error(`docker ${args.join(" ")} timed out after ${DOCKER_EXEC_TIMEOUT_MS}ms`);
+  }
+  if (result.status !== 0) {
+    throw new Error(`docker ${args.join(" ")} failed (${result.status}): ${String(result.stderr)}`);
+  }
+  return result.stdout;
 }
 
 // ---------------------------------------------------------------------------
@@ -604,8 +621,8 @@ function createDockerSandboxRuntime(container) {
         }
         const actionHome = `${LOOP_ACTION_DIR}/${input.attemptId}/${input.actionId}/home`;
         assert(
-          dockerExecStatus(container, ["test", "-f", `${actionHome}/.claude/ot-stub-agent-startup.json`]).status === 0,
-          `review persona ${input.actionId} did not retain its isolated CLI home state`
+          dockerExecStatus(container, ["test", "-e", actionHome]).status !== 0,
+          `review persona ${input.actionId} retained reconstructible CLI home state after result commit`
         );
       }
       cachedLoopResults.set(key, result);
@@ -646,6 +663,33 @@ function createDockerSandboxRuntime(container) {
       if (result.status !== 0 && event.outcome !== "retryable_infrastructure_failure") {
         throw new Error(`child executor action ${request.actionId} (${request.actionKind}) failed: ${result.stderr}`);
       }
+      let checkpointObject;
+      if (event.checkpoint_object !== undefined) {
+        const descriptor = event.checkpoint_object;
+        assert(descriptor?.schema === "openthrottle.git-checkpoint-object/v1", "checkpoint object schema mismatch");
+        assert(descriptor.file === "checkpoint.bundle", "checkpoint object file mismatch");
+        assert(descriptor.expected_old_sha === request.inputSubject, "checkpoint object old subject mismatch");
+        assert(descriptor.expected_new_sha === event.subject, "checkpoint object new subject mismatch");
+        assert(Number.isSafeInteger(descriptor.bytes) && descriptor.bytes > 0 && descriptor.bytes <= 64 * 1024 * 1024,
+          "checkpoint object byte bound mismatch");
+        assert(typeof descriptor.sha256 === "string" && /^[a-f0-9]{64}$/.test(descriptor.sha256),
+          "checkpoint object digest is invalid");
+        const payload = dockerReadBinaryFile(
+          container,
+          `${CHILD_EXECUTOR_DIR}/${request.attemptId}/${request.actionId}/${descriptor.file}`,
+        );
+        assert(payload.byteLength === descriptor.bytes, "checkpoint object payload length mismatch");
+        assert(createHash("sha256").update(payload).digest("hex") === descriptor.sha256,
+          "checkpoint object payload digest mismatch");
+        checkpointObject = {
+          schema: descriptor.schema,
+          expectedOldSha: descriptor.expected_old_sha,
+          expectedNewSha: descriptor.expected_new_sha,
+          payloadSha256: descriptor.sha256,
+          payloadBytes: descriptor.bytes,
+          payload,
+        };
+      }
       cachedChildResults.set(`${request.attemptId}:${request.actionId}`, {
         actionId: request.actionId,
         attemptId: event.attempt_id,
@@ -654,6 +698,7 @@ function createDockerSandboxRuntime(container) {
         subject: event.subject,
         receipt: event.receipt,
         completedAt: event.created_at,
+        ...(checkpointObject ? { checkpointObject } : {}),
       });
       return { providerDispatchId: `child-executor-${request.actionId}` };
     },
