@@ -79,6 +79,7 @@ function prepareActionHomeEnvironment(request, credentialEnv = {}, workingDirect
   resetAgentOwnedDirectory(home);
   const env = [`HOME=${home}`];
   let nativeSessionProfileRoot = home;
+  let nativeSessionTransfer = null;
   let mcpConfigPath = null;
   const selectedMcpServers = selectAllowedMcpServers(request.allowedMcpServers);
   if (request.agent === "claude") {
@@ -88,7 +89,7 @@ function prepareActionHomeEnvironment(request, credentialEnv = {}, workingDirect
     // runLoopAgentInPreparedRepository hands loopAgentCommand and then spawns
     // the engine with as its cwd, so the restored transcript lands under the
     // project slug the resuming engine will look in (OPE-101).
-    materializeNativeSessionState({ request, profileRoot, workingDirectory });
+    nativeSessionTransfer = materializeNativeSessionState({ request, profileRoot, workingDirectory });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, profileRoot));
     if (Object.keys(selectedMcpServers).length > 0) {
       const mcpDir = pathInside(currentActionDirectory, "mcp");
@@ -108,7 +109,7 @@ function prepareActionHomeEnvironment(request, credentialEnv = {}, workingDirect
     materializeCodexProfileBaseline({ destinationHome: codexHome });
     // Codex keys its rollouts by thread id under sessions/, not by cwd, so
     // its restore needs no working-directory alignment.
-    materializeNativeSessionState({ request, profileRoot: codexHome, workingDirectory });
+    nativeSessionTransfer = materializeNativeSessionState({ request, profileRoot: codexHome, workingDirectory });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, codexHome));
     // MCP config wiring runs before the auth-file write: appendCodexMcpConfig
     // fails closed for a remote-only server, and that check must not leave
@@ -126,6 +127,7 @@ function prepareActionHomeEnvironment(request, credentialEnv = {}, workingDirect
     nativeSessionProfileRoot,
     profileRootFenceNonce: writeProfileRootFence(nativeSessionProfileRoot),
     mcpConfigPath,
+    nativeSessionTransfer,
   };
 }
 
@@ -211,6 +213,7 @@ export function prepareLoopAgentEnvironment(request, repoDir, credentialEnv = {}
     secretEnv,
     gitObjectEnv: gitObjectEnv.values,
     nativeSessionProfileRoot: homeEnv.nativeSessionProfileRoot,
+    nativeSessionTransfer: homeEnv.nativeSessionTransfer,
     profileRootFenceNonce: homeEnv.profileRootFenceNonce,
     sealedSkillTrees: executorSealedSkillTrees(homeEnv.nativeSessionProfileRoot),
     mcpConfigPath: homeEnv.mcpConfigPath,

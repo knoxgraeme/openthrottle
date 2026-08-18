@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalJson } from "./capabilities.mjs";
@@ -18,7 +18,7 @@ import {
 } from "./execute-stage.mjs";
 import { integrateCandidate } from "./integrate-unit.mjs";
 import { restoreIntegrationCheckout } from "./filesystem-isolation.mjs";
-import { deriveCandidateCommit, grantWorktreeToAgent, lockWorktree, worktreePath } from "./worktrees.mjs";
+import { deriveCandidateCommit, grantWorktreeToAgent, lockWorktree, removeWorktree, worktreePath } from "./worktrees.mjs";
 import { ensureWorktreeBootstrap } from "./worktree-bootstrap.mjs";
 
 function configPath() {
@@ -520,12 +520,40 @@ export function childActionFailureResult(rawRequest, error) {
   };
 }
 
+export function finalizeChildActionRetention(request, result, {
+  repoDir = INTEGRATION_REPO_DIR,
+  rootDir = WORKTREE_ROOT,
+  remove = removeWorktree,
+} = {}) {
+  // Candidate derivation is the commit point for a unit workspace: the
+  // object is now durable in the integration repository's common object
+  // store, so the transient linked checkout and its temporary packs are
+  // reconstructible. Earlier command actions deliberately keep it for the
+  // next semantic action, and failures keep it for diagnostics/retry.
+  if (request.actionKind !== "candidate" || result.outcome !== "success" || !request.worktree?.id) {
+    return { removed: false };
+  }
+  return remove({ repoDir, rootDir, handle: request.worktree.id });
+}
+
 function main() {
   const requestPath = resolve(arg("--request", process.env.OT_CHILD_EXECUTOR_REQUEST_FILE));
   const outputPath = resolve(arg("--output", process.env.OT_CHILD_EXECUTOR_RESULT_FILE));
   const request = JSON.parse(readFileSync(requestPath, "utf8"));
+  if (existsSync(outputPath)) {
+    const metadata = lstatSync(outputPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("child result replay path must be a real file");
+    const replay = JSON.parse(readFileSync(outputPath, "utf8"));
+    if (replay?.kind !== "child_executor_action_result" || replay.action_id !== request.actionId ||
+        replay.attempt_id !== request.attemptId || replay.request_hash !== request.requestHash) {
+      throw new Error("child result replay does not match the sealed request");
+    }
+    return;
+  }
   try {
-    writeJsonAtomic(outputPath, executeChildAction({ request }));
+    const result = executeChildAction({ request });
+    writeJsonAtomic(outputPath, result);
+    finalizeChildActionRetention(request, result);
   } catch (error) {
     writeJsonAtomic(outputPath, childActionFailureResult(request, error));
     throw error;

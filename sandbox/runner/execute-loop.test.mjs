@@ -9,6 +9,7 @@ import {
   createLoopRequestHash,
   executeLoopAction,
   gitSafeDirectoryConfigArgs,
+  invocationAfterNativeSessionTransfer,
   lockPersistentAgentPrivateRoots,
   loopAgentCommand,
   loopActionPrincipal,
@@ -18,10 +19,12 @@ import {
   loopResultPath,
   loopWorktreeDirectory,
   parseLoopReceipt,
+  pruneCompletedLoopAction,
   recoveryChangedPathsFromGitQuotedOutput,
   restorePersistentAgentPrivateRoots,
   loopPrompt,
   runLoopAgentInPreparedRepository,
+  sweepCompletedLoopActions,
   resolveLoopInvocation,
   validateLoopRequest,
 } from "./execute-loop.mjs";
@@ -29,9 +32,11 @@ import {
   claudeProjectSlug,
   MAX_NATIVE_SESSION_BYTES,
   MAX_NATIVE_SESSION_FILES,
+  MAX_NATIVE_SESSION_TRANSFER_BYTES,
   materializeNativeSessionState,
   nativeSessionStoragePath,
   sealNativeSessionPackage,
+  sweepNativeSessionScratch,
 } from "./native-session-package.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { identityForUser } from "./filesystem-isolation.mjs";
@@ -1720,6 +1725,52 @@ describe("loop action request validation", () => {
     });
   });
 
+  it("keeps 24 completed action homes bounded to sealed evidence instead of session-sized homes", () => {
+    const valid = validateLoopRequest(request());
+    const actionRoot = process.env.OT_LOOP_ACTION_ROOT;
+    const outside = mkdtempSync(join(tmpdir(), "ot-retention-outside-"));
+    directories.push(outside);
+    writeFileSync(join(outside, "preserve.txt"), "outside\n");
+    for (let index = 0; index < 24; index += 1) {
+      const actionId = `action-${index}`;
+      const actionPath = join(actionRoot, valid.attemptId, actionId);
+      mkdirSync(join(actionPath, "home", ".codex", "sessions"), { recursive: true });
+      mkdirSync(join(actionPath, "git-objects", "base", "pack"), { recursive: true });
+      writeFileSync(join(actionPath, "home", ".codex", "sessions", "duplicate.bin"), Buffer.alloc(64 * 1024, index));
+      writeFileSync(join(actionPath, "git-objects", "base", "pack", "temporary.pack"), "pack\n");
+      writeFileSync(join(actionPath, "request.json"), JSON.stringify({ actionId }));
+      writeFileSync(join(actionPath, "result.json"), JSON.stringify({
+        kind: "loop_action_result",
+        action_id: actionId,
+        attempt_id: valid.attemptId,
+        request_hash: `${index}`,
+        outcome: "success",
+      }));
+    }
+    symlinkSync(outside, join(actionRoot, valid.attemptId, "action-0", "home", "outside-link"));
+
+    expect(sweepCompletedLoopActions(valid, actionRoot)).toEqual({ pruned: 24, retained: 0 });
+
+    for (let index = 0; index < 24; index += 1) {
+      const entries = readdirSync(join(actionRoot, valid.attemptId, `action-${index}`)).sort();
+      expect(entries).toEqual(["request.json", "result.json"]);
+    }
+    expect(readFileSync(join(outside, "preserve.txt"), "utf8")).toBe("outside\n");
+  });
+
+  it("preserves every action-local diagnostic when needs-human explicitly retains the workspace", () => {
+    const valid = validateLoopRequest(request());
+    const actionPath = join(process.env.OT_LOOP_ACTION_ROOT, valid.attemptId, valid.actionId);
+    mkdirSync(join(actionPath, "home", "diagnostics"), { recursive: true });
+    writeFileSync(join(actionPath, "home", "diagnostics", "trace.log"), "preserve\n");
+    const result = { kind: "loop_action_result", outcome: "needs_human" };
+    writeFileSync(join(actionPath, "result.json"), JSON.stringify(result));
+
+    expect(pruneCompletedLoopAction({ request: valid, result })).toEqual({ retained: true, reason: "needs_human" });
+    expect(readFileSync(join(actionPath, "home", "diagnostics", "trace.log"), "utf8")).toBe("preserve\n");
+    expect(existsSync(loopWorktreeDirectory(valid))).toBe(true);
+  });
+
   it("keeps executor locks in place while agent process termination is unconfirmed", () => {
     const valid = validateLoopRequest(request());
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-"));
@@ -2767,6 +2818,99 @@ describe("loop action request validation", () => {
     expect(existsSync(join(sessionRoot, "codex", "too-large"))).toBe(false);
   });
 
+  it("uses one aggregate byte contract for retention and uncompressed transfer", () => {
+    expect(MAX_NATIVE_SESSION_TRANSFER_BYTES).toBe(MAX_NATIVE_SESSION_BYTES);
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    const profileRoot = mkdtempSync(join(tmpdir(), "ot-loop-profile-"));
+    directories.push(sessionRoot, profileRoot);
+    const sessionStore = nativeSessionStoragePath("codex", profileRoot);
+    mkdirSync(sessionStore, { recursive: true });
+    writeFileSync(join(sessionStore, "native-boundary.jsonl"), sessionStorageFixture("codex", "native-boundary"));
+
+    expect(() => sealNativeSessionPackage({
+      agent: "codex",
+      nativeSessionId: "native-boundary",
+      profileRoot,
+      sourceRoot: sessionRoot,
+      availableBytes: 0,
+    })).toThrow(/insufficient space/);
+    expect(existsSync(join(sessionRoot, "codex", "native-boundary"))).toBe(false);
+  });
+
+  it("returns transferred:false for prefer-resume copy failure but keeps resume-required retryable", () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    const sourceProfile = mkdtempSync(join(tmpdir(), "ot-loop-profile-"));
+    const preferredProfile = mkdtempSync(join(tmpdir(), "ot-loop-profile-"));
+    const requiredProfile = mkdtempSync(join(tmpdir(), "ot-loop-profile-"));
+    directories.push(sessionRoot, sourceProfile, preferredProfile, requiredProfile);
+    const sessionStore = nativeSessionStoragePath("codex", sourceProfile);
+    mkdirSync(sessionStore, { recursive: true });
+    writeFileSync(join(sessionStore, "native-recovery.jsonl"), sessionStorageFixture("codex", "native-recovery"));
+    sealNativeSessionPackage({ agent: "codex", nativeSessionId: "native-recovery", profileRoot: sourceProfile, sourceRoot: sessionRoot });
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sessionRoot;
+
+    expect(materializeNativeSessionState({
+      request: { agent: "codex", nativeSessionId: "native-recovery", contextPolicy: "prefer_resume" },
+      profileRoot: preferredProfile,
+      availableBytes: 0,
+    })).toEqual({ transferred: false, reason: "native_session_transfer_unavailable" });
+    expect(existsSync(nativeSessionStoragePath("codex", preferredProfile))).toBe(false);
+
+    expect(() => materializeNativeSessionState({
+      request: { agent: "codex", nativeSessionId: "native-recovery", contextPolicy: "resume_required" },
+      profileRoot: requiredProfile,
+      availableBytes: 0,
+    })).toThrow(/insufficient space/);
+    expect(invocationAfterNativeSessionTransfer(
+      { mode: "resume", nativeSessionId: "native-recovery" },
+      { transferred: false },
+    )).toEqual({ mode: "fresh", nativeSessionId: null });
+  });
+
+  it("rolls back low-space replacement and sweeps inactive scratch without following links", () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    const profileRoot = mkdtempSync(join(tmpdir(), "ot-loop-profile-"));
+    const outside = mkdtempSync(join(tmpdir(), "ot-loop-outside-"));
+    directories.push(sessionRoot, profileRoot, outside);
+    const sessionStore = nativeSessionStoragePath("codex", profileRoot);
+    mkdirSync(sessionStore, { recursive: true });
+    writeFileSync(join(sessionStore, "native-rollback.jsonl"), sessionStorageFixture("codex", "native-rollback"));
+    const packageRoot = sealNativeSessionPackage({
+      agent: "codex",
+      nativeSessionId: "native-rollback",
+      profileRoot,
+      sourceRoot: sessionRoot,
+    });
+    const originalManifest = readFileSync(join(packageRoot, "openthrottle-native-session.json"), "utf8");
+    const agentRoot = join(sessionRoot, "codex");
+    const staleLink = join(agentRoot, ".native-rollback.staging-999999-fixture");
+    writeFileSync(join(outside, "preserve.txt"), "outside\n");
+    symlinkSync(outside, staleLink);
+
+    expect(() => sealNativeSessionPackage({
+      agent: "codex",
+      nativeSessionId: "native-rollback",
+      profileRoot,
+      sourceRoot: sessionRoot,
+      availableBytes: 0,
+    })).toThrow(/insufficient space/);
+    const enospc = Object.assign(new Error("injected copy exhaustion"), { code: "ENOSPC" });
+    expect(() => sealNativeSessionPackage({
+      agent: "codex",
+      nativeSessionId: "native-rollback",
+      profileRoot,
+      sourceRoot: sessionRoot,
+      availableBytes: Number.MAX_SAFE_INTEGER,
+      copyFile: () => { throw enospc; },
+    })).toThrow(/exhausted available space/);
+    sweepNativeSessionScratch({ agent: "codex", nativeSessionId: "native-rollback", sourceRoot: sessionRoot });
+
+    expect(readFileSync(join(packageRoot, "openthrottle-native-session.json"), "utf8")).toBe(originalManifest);
+    expect(existsSync(staleLink)).toBe(false);
+    expect(readFileSync(join(outside, "preserve.txt"), "utf8")).toBe("outside\n");
+    expect(readdirSync(agentRoot).filter((entry) => /\.(?:staging|rollback)-/.test(entry))).toEqual([]);
+  });
+
   it("rejects empty and unrelated native session packages", () => {
     const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
     const emptyProfile = mkdtempSync(join(tmpdir(), "ot-loop-empty-profile-"));
@@ -3046,6 +3190,29 @@ describe("loop action request validation", () => {
     });
     expect(readFileSync(join(nativeSessionStoragePath("codex", destinationProfile), "native-1.jsonl"), "utf8"))
       .toBe(sessionStorageFixture("codex", "native-1"));
+  });
+
+  it("removes a superseded native session only after its replacement is sealed", () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "ot-loop-sessions-"));
+    const oldProfile = mkdtempSync(join(tmpdir(), "ot-old-profile-"));
+    const newProfile = mkdtempSync(join(tmpdir(), "ot-new-profile-"));
+    directories.push(sessionRoot, oldProfile, newProfile);
+    mkdirSync(nativeSessionStoragePath("codex", oldProfile), { recursive: true });
+    mkdirSync(nativeSessionStoragePath("codex", newProfile), { recursive: true });
+    writeFileSync(join(nativeSessionStoragePath("codex", oldProfile), "native-old.jsonl"), sessionStorageFixture("codex", "native-old"));
+    writeFileSync(join(nativeSessionStoragePath("codex", newProfile), "native-new.jsonl"), sessionStorageFixture("codex", "native-new"));
+    sealNativeSessionPackage({ agent: "codex", nativeSessionId: "native-old", profileRoot: oldProfile, sourceRoot: sessionRoot });
+
+    sealNativeSessionPackage({
+      agent: "codex",
+      nativeSessionId: "native-new",
+      supersededNativeSessionId: "native-old",
+      profileRoot: newProfile,
+      sourceRoot: sessionRoot,
+    });
+
+    expect(existsSync(join(sessionRoot, "codex", "native-old"))).toBe(false);
+    expect(existsSync(join(sessionRoot, "codex", "native-new", "openthrottle-native-session.json"))).toBe(true);
   });
 
   // OPE-101: `claude --resume <id>` resolves the id only under the project
@@ -6185,6 +6352,41 @@ describe("executeLoopAction", () => {
   // the stall. main()'s last-resort fence must seal a typed retryable result
   // at the derivable output path before exiting non-zero, mirroring
   // execute-stage.mjs.
+  it("short-circuits replay from result.json after pruning the prior action home", () => {
+    const valid = request();
+    const actionDir = join(process.env.OT_LOOP_ACTION_ROOT, valid.attemptId, valid.actionId);
+    mkdirSync(join(actionDir, "home", ".codex", "sessions"), { recursive: true });
+    writeFileSync(join(actionDir, "home", ".codex", "sessions", "duplicate.bin"), Buffer.alloc(128 * 1024));
+    writeFileSync(join(actionDir, "request.json"), JSON.stringify(valid));
+    writeFileSync(join(actionDir, "credentials.json"), "not valid JSON and must never be read");
+    const replay = {
+      version: 1,
+      kind: "loop_action_result",
+      event_id: "replay-event",
+      action_id: valid.actionId,
+      attempt_id: valid.attemptId,
+      request_hash: valid.requestHash,
+      outcome: "success",
+      native_session_id: "native-current",
+      subject: valid.inputSubject,
+      receipt: "sealed replay",
+      created_at: "2026-08-18T00:00:00.000Z",
+    };
+    const outputPath = join(actionDir, "result.json");
+    writeFileSync(outputPath, JSON.stringify(replay));
+
+    const executed = spawnSync(process.execPath, [
+      fileURLToPath(new URL("./execute-loop.mjs", import.meta.url)),
+      "--request", join(actionDir, "request.json"),
+      "--credentials", join(actionDir, "credentials.json"),
+      "--output", outputPath,
+    ], { encoding: "utf8", timeout: 30_000, env: { ...process.env } });
+
+    expect(executed.status).toBe(0);
+    expect(JSON.parse(readFileSync(outputPath, "utf8"))).toEqual(replay);
+    expect(readdirSync(actionDir).sort()).toEqual(["request.json", "result.json"]);
+  });
+
   it("seals a retryable fallback loop result when the credential envelope is malformed", () => {
     const valid = request();
     const actionDir = join(process.env.OT_LOOP_ACTION_ROOT, valid.attemptId, valid.actionId);
