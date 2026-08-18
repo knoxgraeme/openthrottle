@@ -4,6 +4,33 @@ setup() {
   source "${BATS_TEST_DIRNAME}/../lib/runtime.sh"
 }
 
+@test "bounded action cleanup retains sealed evidence and never follows links" {
+  action_root="${BATS_TEST_TMPDIR}/loop-actions"
+  action_dir="${action_root}/attempt-1/action-1"
+  outside="${BATS_TEST_TMPDIR}/outside"
+  mkdir -p "${action_dir}/home/sessions" "$outside"
+  printf '%s\n' request > "${action_dir}/request.json"
+  printf '%s\n' result > "${action_dir}/result.json"
+  printf '%s\n' duplicate > "${action_dir}/home/sessions/native.jsonl"
+  printf '%s\n' preserve > "${outside}/preserve.txt"
+  ln -s "$outside" "${action_dir}/home/outside-link"
+
+  run node --input-type=module - "$action_root" "$action_dir" "${BATS_TEST_DIRNAME}/../runner/filesystem-isolation.mjs" <<'NODE'
+import { pathToFileURL } from "node:url";
+const { pruneContainedDirectory } = await import(pathToFileURL(process.argv[4]).href);
+process.stdout.write(JSON.stringify(pruneContainedDirectory({
+  root: process.argv[2],
+  target: process.argv[3],
+  retain: ["request.json", "result.json"],
+})));
+NODE
+
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"removed_entries":1,"retained_entries":2}' ]
+  [ "$(find "$action_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" = $'request.json\nresult.json' ]
+  [ "$(< "${outside}/preserve.txt")" = preserve ]
+}
+
 @test "strip_nl removes repeated CRLF suffixes only" {
   run strip_nl $'value\r\n\r\n'
   [ "$status" -eq 0 ]

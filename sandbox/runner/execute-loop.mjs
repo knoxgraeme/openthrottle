@@ -27,6 +27,7 @@ import {
   lockPersistentAgentPrivateRoots,
   lockedPersistentProfilesFrom,
   pathInside as containedPath,
+  pruneContainedDirectory,
   reassignTreeOwner,
   restoreIntegrationCheckout,
   restorePersistentAgentPrivateRoots,
@@ -187,6 +188,9 @@ const MAX_RECEIPT_CORRECTION_STATE_BYTES = 3 * 1024 * 1024;
 const MAX_RECEIPT_CORRECTION_OUTPUT_CHARS = 64 * 1024;
 const ROOT_UID = 0;
 const ROOT_GID = 0;
+const RETAINED_ACTION_EVIDENCE_FILES = 64;
+const RETAINED_ACTION_EVIDENCE_BYTES = 1024 * 1024;
+const RETAINED_ACTION_ENTRIES = ["request.json", "result.json", "outbox", PRIVATE_RECOVERY_DIFF_FILE];
 
 export function loopActionPrincipal(request) {
   if (request.role !== "reviewer" || request.loop !== "review") return "agent";
@@ -493,6 +497,91 @@ function actionDirectoryIsLive(path) {
   }
 }
 
+function boundRetainedOutbox(actionPath) {
+  const outbox = pathInside(actionPath, "outbox");
+  if (!existsSync(outbox)) return;
+  const metadata = lstatSync(outbox);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    rmSync(outbox, metadata.isSymbolicLink() ? { force: true } : { recursive: true, force: true });
+    return;
+  }
+  const files = [];
+  const visit = (directory) => {
+    for (const entry of readdirSync(directory)) {
+      const child = pathInside(directory, entry);
+      const childMetadata = lstatSync(child);
+      if (childMetadata.isSymbolicLink()) {
+        rmSync(child, { force: true });
+      } else if (childMetadata.isDirectory()) {
+        visit(child);
+      } else if (childMetadata.isFile()) {
+        files.push({ path: child, bytes: childMetadata.size, mtimeMs: childMetadata.mtimeMs });
+      } else {
+        rmSync(child, { force: true });
+      }
+    }
+  };
+  visit(outbox);
+  files.sort((left, right) => right.mtimeMs - left.mtimeMs || left.path.localeCompare(right.path));
+  let retainedBytes = 0;
+  for (const [index, file] of files.entries()) {
+    if (index >= RETAINED_ACTION_EVIDENCE_FILES || retainedBytes + file.bytes > RETAINED_ACTION_EVIDENCE_BYTES) {
+      rmSync(file.path, { force: true });
+    } else {
+      retainedBytes += file.bytes;
+    }
+  }
+}
+
+function completedActionResult(actionPath) {
+  const resultPath = pathInside(actionPath, "result.json");
+  try {
+    const metadata = lstatSync(resultPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) return null;
+    const result = JSON.parse(readFileSync(resultPath, "utf8"));
+    return result?.kind === "loop_action_result" ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+function pruneActionPath(actionPath, rootDir) {
+  boundRetainedOutbox(actionPath);
+  return pruneContainedDirectory({ root: rootDir, target: actionPath, retain: RETAINED_ACTION_ENTRIES });
+}
+
+export function pruneCompletedLoopAction({ request, result, rootDir = configuredActionRoot() }) {
+  if (!result || result.outcome === "needs_human") return { retained: true, reason: "needs_human" };
+  const current = actionDirectory(request, rootDir);
+  if (!existsSync(current)) return { retained: false, removed_entries: 0, retained_entries: 0 };
+  return { retained: false, ...pruneActionPath(current, rootDir) };
+}
+
+export function sweepCompletedLoopActions(_request, rootDir = configuredActionRoot()) {
+  if (!existsSync(rootDir)) return { pruned: 0, retained: 0 };
+  let pruned = 0;
+  let retained = 0;
+  for (const attempt of readdirSync(rootDir)) {
+    const attemptPath = pathInside(rootDir, attempt);
+    const attemptMetadata = lstatSync(attemptPath);
+    if (attemptMetadata.isSymbolicLink() || !attemptMetadata.isDirectory()) continue;
+    for (const action of readdirSync(attemptPath)) {
+      const actionPath = pathInside(attemptPath, action);
+      const actionMetadata = lstatSync(actionPath);
+      if (actionMetadata.isSymbolicLink() || !actionMetadata.isDirectory() || actionDirectoryIsLive(actionPath)) continue;
+      const result = completedActionResult(actionPath);
+      if (!result) continue;
+      if (result.outcome === "needs_human") {
+        retained += 1;
+        continue;
+      }
+      pruneActionPath(actionPath, rootDir);
+      pruned += 1;
+    }
+  }
+  return { pruned, retained };
+}
+
 function preserveUnconfirmedActionClaim(request, rootDir = configuredActionRoot()) {
   const fencePath = pathInside(actionDirectory(request, rootDir), ACTIVE_ACTION_FENCE_FILE);
   writeJsonAtomic(fencePath, { process_termination_unconfirmed: true });
@@ -697,6 +786,12 @@ export function resolveLoopInvocation(request) {
   return request.nativeSessionId
     ? { mode: "resume", nativeSessionId: request.nativeSessionId }
     : { mode: "fresh", nativeSessionId: null };
+}
+
+export function invocationAfterNativeSessionTransfer(invocation, transfer) {
+  return transfer?.transferred === false
+    ? { mode: "fresh", nativeSessionId: null }
+    : invocation;
 }
 
 function receiptAuthorityContract(request) {
@@ -1066,7 +1161,12 @@ export function runLoopAgentInPreparedRepository({
     const repoDir = prepareLoopRepository(request, integrationRepoDir);
     const preparedEnvironment = prepareLoopAgentEnvironment(request, repoDir, credentialEnv, principal);
     reassignTreeOwner(actionDirectory(request), "agent", principal);
-    const built = loopAgentCommand({ request, invocation, repoDir, mcpConfigPath: preparedEnvironment.mcpConfigPath });
+    // prefer_resume is an optimization, not a semantic round. When a valid
+    // retained package cannot be transferred under the shared byte/space
+    // contract, restart this same checkpoint fresh and report the new native
+    // session rather than spending a repair cycle on infrastructure state.
+    const effectiveInvocation = invocationAfterNativeSessionTransfer(invocation, preparedEnvironment.nativeSessionTransfer);
+    const built = loopAgentCommand({ request, invocation: effectiveInvocation, repoDir, mcpConfigPath: preparedEnvironment.mcpConfigPath });
     makeCurrentActionDirectoryTraverseOnly(request);
     assertSealedSkillPreflight({ request, profileRoot: preparedEnvironment.nativeSessionProfileRoot, principal, runProcess });
     const runWithProcessFence = processFence ?? ((execute) => runWithUserProcessFence(principal, execute));
@@ -1083,7 +1183,8 @@ export function runLoopAgentInPreparedRepository({
       env: preparedEnvironment.secretEnv,
     }));
     const reportedNativeSessionId = extractNativeSessionId(result.stdout, request.agent);
-    if (request.nativeSessionId && reportedNativeSessionId && reportedNativeSessionId !== request.nativeSessionId) {
+    const resumedNativeSessionId = effectiveInvocation.mode === "resume" ? request.nativeSessionId : null;
+    if (resumedNativeSessionId && reportedNativeSessionId && reportedNativeSessionId !== resumedNativeSessionId) {
       throw new Error("reported native session id does not match the sealed loop request");
     }
     // A genuine engine failure (timeout/signal/non-zero exit) has no complete
@@ -1097,7 +1198,11 @@ export function runLoopAgentInPreparedRepository({
     // from a prior action) is trustworthy -- never a freshly reported id from
     // a crashed/timed-out engine, which would otherwise poison a later
     // resume attempt into sealing against a session that was never sealed.
-    const nativeSessionId = request.nativeSessionId ?? (engineExited ? reportedNativeSessionId : null);
+    const nativeSessionId = resumedNativeSessionId ?? (engineExited
+      ? reportedNativeSessionId
+      : preparedEnvironment.nativeSessionTransfer?.transferred === false
+        ? request.nativeSessionId
+        : null);
     try {
       // The profile-root tamper fence is an independent integrity check, not
       // a symptom of how the engine exited, so it always runs.
@@ -1111,6 +1216,7 @@ export function runLoopAgentInPreparedRepository({
           agent: request.agent,
           nativeSessionId,
           profileRoot: preparedEnvironment.nativeSessionProfileRoot,
+          supersededNativeSessionId: effectiveInvocation.mode === "fresh" ? request.nativeSessionId : null,
         });
         if (nativeSessionId && !sealedNativeSessionPackage) {
           throw new Error("native session id was reported without a sealed executor package");
@@ -2157,6 +2263,21 @@ function main() {
     actionId: request.actionId,
     rootDir: configuredActionRoot(),
   })));
+  // Re-dispatch after a lost acknowledgement is a pure result replay. Sweep
+  // other completed homes first, then return the exact atomic result without
+  // consuming credentials or invoking the agent again.
+  sweepCompletedLoopActions(request);
+  if (existsSync(outputPath)) {
+    const metadata = lstatSync(outputPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("loop result replay path must be a real file");
+    const replay = JSON.parse(readFileSync(outputPath, "utf8"));
+    if (replay?.kind !== "loop_action_result" || replay.action_id !== request.actionId ||
+        replay.attempt_id !== request.attemptId || replay.request_hash !== request.requestHash) {
+      throw new Error("loop result replay does not match the sealed request");
+    }
+    pruneCompletedLoopAction({ request, result: replay });
+    return;
+  }
   try {
     const credentialsPath = resolve(arg("--credentials", process.env.OT_LOOP_CREDENTIALS_FILE ?? loopCredentialsPath({
       attemptId: request.attemptId,
@@ -2164,11 +2285,13 @@ function main() {
       rootDir: configuredActionRoot(),
     })));
     const credentialEnvelope = readLoopActionCredentialEnv(credentialsPath);
-    writeJsonAtomic(outputPath, executeLoopAction({
+    const result = executeLoopAction({
       request,
       credentialEnv: credentialEnvelope ?? {},
       credentialEnvelopeMissing: credentialEnvelope === null,
-    }));
+    });
+    writeJsonAtomic(outputPath, result);
+    pruneCompletedLoopAction({ request, result });
   } catch (error) {
     // Last-resort fence: the request is validated and the output path is
     // known, so any throw executeLoopAction did not fold into its own result
@@ -2176,7 +2299,9 @@ function main() {
     // corrupt persisted correction state) must still leave a sealed typed
     // result the supervisor can settle as retryable and re-dispatch.
     try {
-      writeJsonAtomic(outputPath, fallbackLoopActionResult({ request, error }));
+      const fallback = fallbackLoopActionResult({ request, error });
+      writeJsonAtomic(outputPath, fallback);
+      pruneCompletedLoopAction({ request, result: fallback });
     } catch (fallbackError) {
       console.error(`execute-loop: fallback loop result was not written: ${
         fallbackError instanceof Error ? fallbackError.message : String(fallbackError)

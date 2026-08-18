@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statfsSync, writeFileSync } from "node:fs";
 import { basename, dirname, relative, resolve, sep } from "node:path";
 import { canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
@@ -16,6 +16,11 @@ const NATIVE_SESSION_PACKAGE_SCHEMA = "openthrottle.native-session-package/v1";
 // byte cap applies both per file and to the whole package.
 export const MAX_NATIVE_SESSION_FILES = 1024;
 export const MAX_NATIVE_SESSION_BYTES = 256 * 1024 * 1024;
+// Retention and uncompressed transfer intentionally share one aggregate cap.
+// A package accepted by validateNativeSessionPackage therefore cannot be
+// rejected merely because a second, smaller archive limit exists.
+export const MAX_NATIVE_SESSION_TRANSFER_BYTES = MAX_NATIVE_SESSION_BYTES;
+const NATIVE_SESSION_COPY_MARGIN_BYTES = 16 * 1024 * 1024;
 const ROOT_UID = 0;
 const ROOT_GID = 0;
 const ABSOLUTE_PATH = /^\/[^\u0000]{0,500}$/;
@@ -34,20 +39,37 @@ function nativeSessionPackageDirectory({ sourceRoot = configuredNativeSessionSou
   return pathInside(agentRoot, packageId, "native session package path escapes its root");
 }
 
-function copyTrustedTree(source, destination, { skipManifest = false } = {}) {
+function prepareNativeSessionPackageParent({ sourceRoot, agent }) {
+  mkdirSync(sourceRoot, { recursive: true, mode: 0o700 });
+  const sourceMetadata = lstatSync(sourceRoot);
+  if (!sourceMetadata.isDirectory() || sourceMetadata.isSymbolicLink()) {
+    throw new Error("native session source root must be a real directory");
+  }
+  const agentRoot = pathInside(sourceRoot, string(agent, "agent", PACKAGE_PATH_ID));
+  if (existsSync(agentRoot)) {
+    const metadata = lstatSync(agentRoot);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error("native session package parent must be a real directory");
+    }
+  } else {
+    mkdirSync(agentRoot, { recursive: false, mode: 0o700 });
+  }
+}
+
+function copyTrustedTree(source, destination, { skipManifest = false, copyFile = copyFileSync } = {}) {
   const metadata = lstatSync(source);
   if (metadata.isSymbolicLink()) throw new Error("native session package cannot contain symlinks");
   if (metadata.isDirectory()) {
     mkdirSync(destination, { recursive: true, mode: 0o700 });
     for (const entry of readdirSync(source)) {
       if (skipManifest && entry === NATIVE_SESSION_PACKAGE_MANIFEST) continue;
-      copyTrustedTree(resolve(source, entry), resolve(destination, entry), { skipManifest });
+      copyTrustedTree(resolve(source, entry), resolve(destination, entry), { skipManifest, copyFile });
     }
     return;
   }
   if (!metadata.isFile()) throw new Error("native session package can contain only regular files");
   mkdirSync(resolve(destination, ".."), { recursive: true, mode: 0o700 });
-  copyFileSync(source, destination);
+  copyFile(source, destination);
 }
 
 function relativeContainedPath(root, path, errorMessage) {
@@ -140,12 +162,92 @@ function collectNativeSessionFiles(root, path = root, files = [], totals = { byt
 
 function collectNativeSessionPackage(root, nativeSessionId, agent) {
   const sessionEvidence = { agent, nativeSessionId, contains: false };
-  const files = collectNativeSessionFiles(root, root, [], { bytes: 0 }, sessionEvidence);
-  return { files, containsSessionId: files.length > 0 && sessionEvidence.contains };
+  const totals = { bytes: 0 };
+  const files = collectNativeSessionFiles(root, root, [], totals, sessionEvidence);
+  return { files, bytes: totals.bytes, containsSessionId: files.length > 0 && sessionEvidence.contains };
 }
 
 function preflightNativeSessionSource(sessionsSource) {
-  collectNativeSessionFiles(sessionsSource);
+  const totals = { bytes: 0 };
+  collectNativeSessionFiles(sessionsSource, sessionsSource, [], totals);
+  return totals.bytes;
+}
+
+function retryableStorageError(message, cause = null) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.code = "ENOSPC";
+  error.retryableInfrastructureFailure = true;
+  return error;
+}
+
+function filesystemAvailableBytes(path) {
+  const stats = statfsSync(path, { bigint: true });
+  const available = stats.bavail * stats.bsize;
+  return available > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(available);
+}
+
+function assertCopySpace({ destinationRoot, sourceBytes, replacementBytes = 0, availableBytes = undefined }) {
+  const available = availableBytes ?? filesystemAvailableBytes(destinationRoot);
+  const required = sourceBytes + replacementBytes + NATIVE_SESSION_COPY_MARGIN_BYTES;
+  if (!Number.isSafeInteger(available) || available < required) {
+    throw retryableStorageError(
+      `native session transfer has insufficient space: required=${required} available=${available}`,
+    );
+  }
+}
+
+function scratchPathInfo(entry, nativeSessionId) {
+  const escaped = nativeSessionId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = entry.match(new RegExp(`^\\.${escaped}\\.(staging|rollback)-(\\d+)-`));
+  return match ? { kind: match[1], pid: Number(match[2]) } : null;
+}
+
+function processIsActive(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+// Reconcile only scratch entries owned by this exact agent/session lineage.
+// Directory entries are inspected with lstat and symlinks are unlinked, never
+// traversed. A stale rollback is restored when it is the last valid package.
+export function sweepNativeSessionScratch({
+  agent,
+  nativeSessionId,
+  sourceRoot = configuredNativeSessionSourceRoot(),
+}) {
+  const destination = nativeSessionPackageDirectory({ sourceRoot, agent, nativeSessionId });
+  const parent = dirname(destination);
+  if (!existsSync(parent)) return { removed: 0, restored: false };
+  const parentMetadata = lstatSync(parent);
+  if (!parentMetadata.isDirectory() || parentMetadata.isSymbolicLink()) {
+    throw new Error("native session package parent must be a real directory");
+  }
+  const stale = [];
+  for (const entry of readdirSync(parent)) {
+    const info = scratchPathInfo(entry, nativeSessionId);
+    if (!info || processIsActive(info.pid)) continue;
+    stale.push({ path: pathInside(parent, entry, "native session scratch path escapes its root"), ...info });
+  }
+  let restored = false;
+  if (!existsSync(destination)) {
+    const rollback = stale.find((entry) => entry.kind === "rollback" &&
+      !lstatSync(entry.path).isSymbolicLink() && lstatSync(entry.path).isDirectory());
+    if (rollback) {
+      renameSync(rollback.path, destination);
+      stale.splice(stale.indexOf(rollback), 1);
+      restored = true;
+    }
+  }
+  for (const entry of stale) {
+    const metadata = lstatSync(entry.path);
+    rmSync(entry.path, metadata.isSymbolicLink() ? { force: true } : { recursive: true, force: true });
+  }
+  return { removed: stale.length, restored };
 }
 
 function assertPrivateNativeSessionPackage(path) {
@@ -198,21 +300,34 @@ export function sealNativeSessionPackage({
   nativeSessionId,
   profileRoot,
   sourceRoot = configuredNativeSessionSourceRoot(),
+  availableBytes = undefined,
+  copyFile = copyFileSync,
+  supersededNativeSessionId = null,
 }) {
   if (!nativeSessionId || !profileRoot) return null;
   const sessionsSource = nativeSessionStoragePath(agent, profileRoot);
   if (!existsSync(sessionsSource) || !lstatSync(sessionsSource).isDirectory()) return null;
   const relativeSessionRoot = relativeContainedPath(profileRoot, sessionsSource, "native session storage path escapes its profile root");
-  preflightNativeSessionSource(sessionsSource);
+  const sourceBytes = preflightNativeSessionSource(sessionsSource);
   const destination = nativeSessionPackageDirectory({ sourceRoot, agent, nativeSessionId });
+  prepareNativeSessionPackageParent({ sourceRoot, agent });
+  sweepNativeSessionScratch({ agent, nativeSessionId, sourceRoot });
+  const replacementBytes = existsSync(destination)
+    ? collectNativeSessionFiles(destination).reduce((total, file) => total + file.size, 0)
+    : 0;
+  assertCopySpace({
+    destinationRoot: dirname(destination),
+    sourceBytes,
+    replacementBytes,
+    availableBytes,
+  });
   const staging = resolve(dirname(destination), `.${nativeSessionId}.staging-${process.pid}-${randomUUID()}`);
   const rollback = resolve(dirname(destination), `.${nativeSessionId}.rollback-${process.pid}-${randomUUID()}`);
   let movedDestination = false;
   try {
     rmSync(staging, { recursive: true, force: true });
-    mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
     mkdirSync(staging, { recursive: true, mode: 0o700 });
-    copyTrustedTree(sessionsSource, resolve(staging, relativeSessionRoot));
+    copyTrustedTree(sessionsSource, resolve(staging, relativeSessionRoot), { copyFile });
     const { files, containsSessionId } = collectNativeSessionPackage(staging, nativeSessionId, agent);
     if (!containsSessionId) {
       throw new Error("native session package does not contain the reported native session id");
@@ -241,16 +356,35 @@ export function sealNativeSessionPackage({
     renameSync(staging, destination);
     movedDestination = false;
     rmSync(rollback, { recursive: true, force: true });
+    if (supersededNativeSessionId && supersededNativeSessionId !== nativeSessionId) {
+      const superseded = nativeSessionPackageDirectory({
+        sourceRoot,
+        agent,
+        nativeSessionId: supersededNativeSessionId,
+      });
+      if (existsSync(superseded)) {
+        const metadata = lstatSync(superseded);
+        if (!metadata.isSymbolicLink()) chmodTree(superseded, { fileMode: 0o600, directoryMode: 0o700 });
+        rmSync(superseded, metadata.isSymbolicLink() ? { force: true } : { recursive: true, force: true });
+      }
+    }
     return destination;
   } catch (error) {
     rmSync(staging, { recursive: true, force: true });
     if (movedDestination && existsSync(rollback) && !existsSync(destination)) {
-      renameSync(rollback, destination);
+      try {
+        renameSync(rollback, destination);
+        movedDestination = false;
+      } catch {
+        // Preserve the rollback as the last valid package. Startup
+        // reconciliation restores it before the next transfer attempt.
+      }
     }
+    if (error?.code === "ENOSPC") throw retryableStorageError("native session transfer exhausted available space", error);
     throw error;
   } finally {
     rmSync(staging, { recursive: true, force: true });
-    rmSync(rollback, { recursive: true, force: true });
+    if (!movedDestination || existsSync(destination)) rmSync(rollback, { recursive: true, force: true });
   }
 }
 
@@ -466,7 +600,13 @@ function prepareNativeSessionDestination({ agent, profileRoot }) {
   return destination;
 }
 
-export function materializeNativeSessionState({ request, profileRoot, workingDirectory = null }) {
+export function materializeNativeSessionState({
+  request,
+  profileRoot,
+  workingDirectory = null,
+  availableBytes = undefined,
+  copyFile = copyFileSync,
+}) {
   if (!request.nativeSessionId || request.contextPolicy === "fresh") return null;
   // Claude's restore is only correct relative to the cwd its engine will be
   // launched in (see alignClaudeProjectDirectory). A caller that cannot name
@@ -481,21 +621,41 @@ export function materializeNativeSessionState({ request, profileRoot, workingDir
     agent: request.agent,
     nativeSessionId: request.nativeSessionId,
   });
+  sweepNativeSessionScratch({
+    agent: request.agent,
+    nativeSessionId: request.nativeSessionId,
+    sourceRoot,
+  });
   if (!existsSync(source) || !lstatSync(source).isDirectory()) {
     throw new Error("authorized native session state is unavailable");
   }
-  validateNativeSessionPackage({ source, request });
-  const sessionDestination = prepareNativeSessionDestination({ agent: request.agent, profileRoot });
-  copyTrustedTree(source, profileRoot, { skipManifest: true });
-  if (request.agent === "claude") {
-    alignClaudeProjectDirectory({
-      projectsRoot: sessionDestination,
-      nativeSessionId: request.nativeSessionId,
-      workingDirectory,
-    });
+  try {
+    validateNativeSessionPackage({ source, request });
+    const { bytes: sourceBytes } = collectNativeSessionPackage(source, request.nativeSessionId, request.agent);
+    assertCopySpace({ destinationRoot: profileRoot, sourceBytes, availableBytes });
+    const sessionDestination = prepareNativeSessionDestination({ agent: request.agent, profileRoot });
+    copyTrustedTree(source, profileRoot, { skipManifest: true, copyFile });
+    if (request.agent === "claude") {
+      alignClaudeProjectDirectory({
+        projectsRoot: sessionDestination,
+        nativeSessionId: request.nativeSessionId,
+        workingDirectory,
+      });
+    }
+    prepareAgentOwnedDirectory(sessionDestination);
+    return source;
+  } catch (error) {
+    const sessionDestination = nativeSessionStoragePath(request.agent, profileRoot);
+    rmSync(sessionDestination, { recursive: true, force: true });
+    if (error?.retryableInfrastructureFailure || error?.code === "ENOSPC") {
+      if (request.contextPolicy === "prefer_resume") {
+        return { transferred: false, reason: "native_session_transfer_unavailable" };
+      }
+      if (error?.retryableInfrastructureFailure) throw error;
+      throw retryableStorageError("native session transfer exhausted available space", error);
+    }
+    throw error;
   }
-  prepareAgentOwnedDirectory(sessionDestination);
-  return source;
 }
 
 export function extractNativeSessionId(output, agent) {

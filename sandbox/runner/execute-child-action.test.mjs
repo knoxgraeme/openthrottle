@@ -9,7 +9,7 @@ import {
   digest,
   validateStandardReceipt,
 } from "./artifacts.mjs";
-import { childActionFailureResult, executeChildAction, verifyTuneCandidate } from "./execute-child-action.mjs";
+import { childActionFailureResult, executeChildAction, finalizeChildActionRetention, verifyTuneCandidate } from "./execute-child-action.mjs";
 
 const directories = [];
 
@@ -60,6 +60,22 @@ function useRepositoryConfig(commands, extra = {}) {
 }
 
 describe("child executor action", () => {
+  it("removes a transient worktree only after successful candidate persistence", () => {
+    const request = childExecutorRequest({ actionKind: "candidate", commandName: undefined });
+    const remove = vi.fn(() => ({ id: request.worktree.id, removed: true }));
+
+    expect(finalizeChildActionRetention(request, { outcome: "success" }, {
+      repoDir: "/integration",
+      rootDir: "/worktrees",
+      remove,
+    })).toEqual({ id: request.worktree.id, removed: true });
+    expect(remove).toHaveBeenCalledWith({ repoDir: "/integration", rootDir: "/worktrees", handle: request.worktree.id });
+
+    remove.mockClear();
+    expect(finalizeChildActionRetention(request, { outcome: "failure" }, { remove })).toEqual({ removed: false });
+    expect(remove).not.toHaveBeenCalled();
+  });
+
   it("verifies the exact authorized tune paths and before/after content digests", () => {
     const repoDir = mkdtempSync(join(tmpdir(), "ot-tune-verification-"));
     directories.push(repoDir);

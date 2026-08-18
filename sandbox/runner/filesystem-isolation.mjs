@@ -1,6 +1,6 @@
-import { chmodSync, chownSync, existsSync, lchownSync, lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, lchownSync, lstatSync, mkdirSync, readdirSync, rmdirSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, resolve, sep } from "node:path";
+import { basename, dirname, relative, resolve, sep } from "node:path";
 
 const identities = new Map();
 const ROOT_UID = 0;
@@ -25,6 +25,53 @@ export function pathInside(root, child, errorMessage) {
     throw new Error(errorMessage);
   }
   return childPath;
+}
+
+function removeWithoutFollowingLinks(path) {
+  const metadata = lstatSync(path);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    rmSync(path, { force: true });
+    return;
+  }
+  for (const entry of readdirSync(path)) removeWithoutFollowingLinks(resolve(path, entry));
+  rmdirSync(path);
+}
+
+// Prunes reconstructible children of one executor-owned directory while
+// retaining an explicit, top-level allow-list. Every path is resolved beneath
+// a real sealed root and removal uses lstat at each hop, so an agent-planted
+// symlink is unlinked rather than followed. The returned aggregate counters
+// are intentionally bounded metadata: callers can retain cleanup evidence
+// without retaining a path-sized record per removed cache entry.
+export function pruneContainedDirectory({ root, target, retain = [] }) {
+  const sealedRoot = resolve(root);
+  const directory = pathInside(sealedRoot, resolve(target), "cleanup target escapes its sealed root");
+  if (directory === sealedRoot) throw new Error("cleanup target cannot be the sealed root");
+  const relativeTarget = relative(sealedRoot, directory);
+  const ancestry = [sealedRoot];
+  let current = sealedRoot;
+  for (const part of relativeTarget.split(sep)) {
+    current = resolve(current, part);
+    ancestry.push(current);
+  }
+  for (const [index, path] of ancestry.entries()) {
+    const label = index === 0 ? "cleanup root" : index === ancestry.length - 1 ? "cleanup target" : "cleanup ancestor";
+    const metadata = lstatSync(path);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error(`${label} must be a real directory`);
+  }
+  const retained = new Set(retain);
+  for (const name of retained) {
+    if (typeof name !== "string" || basename(name) !== name || name === "." || name === "..") {
+      throw new Error("cleanup retain entry must be a top-level name");
+    }
+  }
+  let removedEntries = 0;
+  for (const name of readdirSync(directory)) {
+    if (retained.has(name)) continue;
+    removeWithoutFollowingLinks(pathInside(directory, name, "cleanup entry escapes its target"));
+    removedEntries += 1;
+  }
+  return { removed_entries: removedEntries, retained_entries: readdirSync(directory).length };
 }
 
 export function chmodTree(path, { fileMode, directoryMode = fileMode }) {
