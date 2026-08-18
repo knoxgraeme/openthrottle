@@ -96,7 +96,7 @@ jobs:
         run: docker build -f sandbox/Dockerfile -t openthrottle:test .
       - name: Exercise sandbox lifecycle with stub agent
         run: sandbox/tests/smoke.sh openthrottle:test
-      - name: Prove the two-unit Docker walking skeleton
-        run: node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test
+      - name: Prove automatic admission and the reused structured lifecycle
+        run: node sandbox/tests/automatic-walking-skeleton.mjs openthrottle:test
       - name: Prove Claude registers its slash-command skill set
         run: sandbox/tests/skill-registration-probe.sh openthrottle:test

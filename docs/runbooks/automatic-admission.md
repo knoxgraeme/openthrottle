@@ -22,6 +22,61 @@ Repositories may declare pinned `repo://` planner and reviewer packages and
 bind them with `planner_skill` and `reviewer_skill`. The two bindings are
 independent. Ticket text cannot select packages or alter their digests.
 
+## Prove admission before enabling it
+
+The credential-free walking skeleton is the release-blocking mechanical proof:
+
+```bash
+docker build -f sandbox/Dockerfile -t openthrottle:automatic-admission .
+node sandbox/tests/automatic-walking-skeleton.mjs openthrottle:automatic-admission
+```
+
+It proves the `simple`, reviewed `structured`, locked-route, `needs_human`,
+invalid-binding, and repository planner/reviewer override paths. It also invokes
+the existing structured walking skeleton unchanged for crash recovery,
+checkpoint restoration, secret containment, publication fencing, and the full
+unit lifecycle. It uses stub model credentials only, runs its Docker probe with
+networking disabled, scans exported evidence for secret-shaped values, and does
+not call Linear, GitHub, Daytona, Fly, or a live model.
+
+The blinded model evaluation is a separate, credentialed operator ticket. Do
+not run it in CI and do not enable automatic admission as part of collecting
+it. Use these pinned inputs:
+
+- `contracts/fixtures/admission-corpus/v1/cases.json` contains 45 synthetic,
+  redacted cases: 15 cohesive simple, 15 cross-component structured, and 15
+  ambiguous or missing-authority cases. Give evaluators this file only.
+- Keep `labels.json` sealed from both planner and reviewer contexts until all
+  repetitions finish. `manifest.json` pins both files and the combined corpus.
+- Pin one Sol model and one Opus model, including exact model identifier and
+  reasoning level. Run every case three times for every model, producing at
+  least 270 decision records.
+- Record the corpus digest plus runtime, automatic-template, compiler, planner
+  package, reviewer package, and effective-manifest digests. A change to any
+  governing digest invalidates the evidence instead of silently carrying it
+  forward.
+- Record route, generated-plan digest, structured-review approval, latency,
+  input tokens, output tokens, and `cost_usd_micros` for every repetition. Never
+  place prompts, ticket text, environment values, or credentials in the result.
+
+Build and score the evidence with the exported contracts functions
+`validateAdmissionEvaluationCorpus`, `validateAdmissionRolloutEvidence`, and
+`scoreAdmissionRolloutEvidence`. The report applies the worst repetition for each
+case/model pair. Each model must independently achieve at least 90% accuracy,
+at most 10% `needs_human` on unambiguous cases, zero `simple` decisions for
+structured or ambiguous cases, zero executable decisions for ambiguous cases,
+and an approved independent review for every structured output. The report also
+retains repeated-`needs_human` rate and per-model latency, token, and cost totals
+for operator review.
+
+Before a canary, an operator must inspect the blinded report, confirm every
+structured output has an approval receipt, confirm the evidence is current for
+the deployed digests, and attach it to the separate rollout ticket. Rehearse
+the rollback below, then enable one explicitly selected repository, monitor its
+admission details and publication state, and expand only through separate
+configuration changes. This repository change supplies proof machinery only;
+it does not change the default mode or enable a repository.
+
 ## Inspect a decision
 
 Use the provider-neutral status surface instead of interpreting a Linear

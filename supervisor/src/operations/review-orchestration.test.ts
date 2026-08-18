@@ -13,6 +13,7 @@ import {
   createReviewOrchestrator,
   fanoutActionId,
   RetryableReviewRuntimeError,
+  resolveReviewSubactionTiming,
   selectorActionId,
   synthesizeFinalReviewReceipt,
   validatorActionId,
@@ -241,6 +242,35 @@ describe("review subaction identifiers", () => {
       fanoutActionId(action, "security"),
       fanoutActionId(action, "performance"),
     ]).size).toBe(4);
+  });
+});
+
+describe("review subaction timing", () => {
+  it("uses the prepared timestamp when completion wins the launch-ack race for every review role", () => {
+    for (const actionId of [
+      selectorActionId(reviewAction()),
+      fanoutActionId(reviewAction(), "security"),
+      validatorActionId(reviewAction()),
+    ]) {
+      expect(resolveReviewSubactionTiming({
+        actionId,
+        dispatch: {
+          parent_action_id: reviewAction().id,
+          action_id: actionId,
+          request_hash: "1".repeat(64),
+          idempotency_key: `loop:parent-attempt:${actionId}:${"1".repeat(64)}`,
+          prepared_at: "2099-07-22T11:59:59.000Z",
+          dispatched_at: "2099-07-22T12:00:01.000Z",
+          dispatch_time_source: "acknowledged",
+        },
+        completedAt: "2099-07-22T12:00:00.000Z",
+      })).toEqual({
+        actionId,
+        dispatchedAt: "2099-07-22T11:59:59.000Z",
+        dispatchTimeSource: "prepared_fallback",
+        completedAt: "2099-07-22T12:00:00.000Z",
+      });
+    }
   });
 });
 

@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { RUNTIME_DESCRIPTOR, canonicalJson } from "../../sandbox/runner/capabilities.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const ACTIVE_RUNTIME_RELEASE = "openthrottle-snapshot/v13";
+const ACTIVE_RUNTIME_RELEASE = "openthrottle-snapshot/v14";
 const V12_PROOF_FILE = "v12-deploy-proof.json";
 const V12_PROOF_PATH = `supervisor/pipelines/${V12_PROOF_FILE}`;
 const SNAPSHOT_IDENTITY = "openthrottle-ce-${short_head}";
@@ -90,7 +90,7 @@ assert(
     !deployWorkflow.includes("MIGRATION_DIFF_BASE:") &&
     !deployWorkflow.includes("MIGRATION_EVENT_NAME:") &&
     deployWorkflow.indexOf("Validate migration rollback markers") <
-      deployWorkflow.indexOf("superfly/flyctl-actions/setup-flyctl@master") &&
+      deployWorkflow.indexOf("superfly/flyctl-actions/setup-flyctl@") &&
     deployWorkflow.includes("node supervisor/scripts/verify-migration-rollback-markers.mjs") &&
     !deployWorkflow.includes("needs.changes.outputs.database_migrations") &&
     deployWorkflow.includes('requires_migration_contract="true"') &&

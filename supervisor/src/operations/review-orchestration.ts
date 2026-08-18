@@ -34,6 +34,7 @@ import {
 } from "../pipeline/execution-gates.js";
 import type { PipelineInstance, PipelineStore } from "../pipeline/store.js";
 import type {
+  ExecutionReviewSubactionDispatch,
   ExecutionUnitStore,
   ExecutionWorkAttempt,
   ExecutionWorkPrivateArtifact,
@@ -391,6 +392,26 @@ type ReviewSubactionTiming = {
 
 type ReviewFanoutReceiptResult = ReviewSubactionTiming & { receipt: SemanticReviewReceipt };
 
+export function resolveReviewSubactionTiming(input: {
+  actionId: string;
+  dispatch: ExecutionReviewSubactionDispatch;
+  completedAt: string;
+}): ReviewSubactionTiming {
+  if (!input.dispatch.dispatched_at || !input.dispatch.dispatch_time_source) {
+    throw new Error(`review subaction ${input.actionId} has no persisted dispatch timing`);
+  }
+  const completedAt = Date.parse(input.completedAt);
+  const acknowledgedAt = Date.parse(input.dispatch.dispatched_at);
+  const completedDuringAcknowledgement = input.dispatch.dispatch_time_source === "acknowledged" &&
+    Number.isFinite(completedAt) && Number.isFinite(acknowledgedAt) && completedAt < acknowledgedAt;
+  return {
+    actionId: input.actionId,
+    dispatchedAt: completedDuringAcknowledgement ? input.dispatch.prepared_at : input.dispatch.dispatched_at,
+    dispatchTimeSource: completedDuringAcknowledgement ? "prepared_fallback" : input.dispatch.dispatch_time_source,
+    completedAt: input.completedAt,
+  };
+}
+
 type ReviewSubactionTerminal = {
   terminal: true;
   resultHash: string;
@@ -722,23 +743,27 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
           }`,
         };
       }
+      receipts.push(receipt as SemanticReviewReceipt);
       const dispatch = deps.store.getReviewSubactionDispatch(input.action.id, request.actionId);
-      if (!dispatch?.dispatched_at || !dispatch.dispatch_time_source) {
+      if (!dispatch) return {
+        terminal: true,
+        resultHash: actionResultHash(result),
+        outcome: "failure",
+        lastError: `review fanout action ${request.actionId} has no persisted dispatch timing`,
+      };
+      try {
+        receiptResults.push({
+          receipt: receipt as SemanticReviewReceipt,
+          ...resolveReviewSubactionTiming({ actionId: request.actionId, dispatch, completedAt: result.completedAt }),
+        });
+      } catch (error) {
         return {
           terminal: true,
           resultHash: actionResultHash(result),
           outcome: "failure",
-          lastError: `review fanout action ${request.actionId} has no persisted dispatch timing`,
+          lastError: sanitizeText(error instanceof Error ? error.message : String(error)).slice(-500),
         };
       }
-      receipts.push(receipt as SemanticReviewReceipt);
-      receiptResults.push({
-        receipt: receipt as SemanticReviewReceipt,
-        actionId: request.actionId,
-        dispatchedAt: dispatch.dispatched_at,
-        dispatchTimeSource: dispatch.dispatch_time_source,
-        completedAt: result.completedAt,
-      });
     }
     try {
       return { synthesis: synthesizeReviewFanout({ plan: input.plan, receipts }), receiptResults };
@@ -949,9 +974,14 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
         throw new Error("review selector must return success with no review findings");
       }
       const selectorDispatch = deps.store.getReviewSubactionDispatch(action.id, selectorRequest.actionId);
-      if (!selectorDispatch?.dispatched_at || !selectorDispatch.dispatch_time_source) {
+      if (!selectorDispatch) {
         throw new Error("review selector has no persisted dispatch timing");
       }
+      const selectorTiming = resolveReviewSubactionTiming({
+        actionId: selectorRequest.actionId,
+        dispatch: selectorDispatch,
+        completedAt: selector.completedAt,
+      });
       const recommendation = parseReviewSelectorRecommendation(selector.receipt.payload.summary, authority);
       const fanoutPlan = buildReviewFanoutPlan({
         subject: reviewSubject,
@@ -1033,15 +1063,14 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
         if ("terminal" in validator) return { ...validator, nativeSessionId: null };
         validatorReceipt = validator.receipt;
         const validatorDispatch = deps.store.getReviewSubactionDispatch(action.id, validatorRequest.actionId);
-        if (!validatorDispatch?.dispatched_at || !validatorDispatch.dispatch_time_source) {
+        if (!validatorDispatch) {
           throw new Error("review validator has no persisted dispatch timing");
         }
-        validatorTiming = {
+        validatorTiming = resolveReviewSubactionTiming({
           actionId: validatorRequest.actionId,
-          dispatchedAt: validatorDispatch.dispatched_at,
-          dispatchTimeSource: validatorDispatch.dispatch_time_source,
+          dispatch: validatorDispatch,
           completedAt: validator.completedAt,
-        };
+        });
       }
       const validated = validateReviewFanoutBlockers({ synthesis: fanout.synthesis, validator: validatorReceipt });
       const commands = deps.commandAttemptReceiptsFor(action);
@@ -1095,12 +1124,7 @@ export function createReviewOrchestrator(deps: ReviewOrchestrationDeps): ReviewO
         plan: fanoutPlan,
         baseSubject: instance.base_commit,
         receipts: fanout.receiptResults,
-        selectorTiming: {
-          actionId: selectorRequest.actionId,
-          dispatchedAt: selectorDispatch.dispatched_at,
-          dispatchTimeSource: selectorDispatch.dispatch_time_source,
-          completedAt: selector.completedAt,
-        },
+        selectorTiming,
         validatorTiming,
         validation: validated,
         cycle: action.cycle,
