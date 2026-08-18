@@ -202,6 +202,7 @@ describe("database migrations", () => {
       "a3760c217ba409f362bfba2a9b78432ec12e1d23031723674f90492ad797b65a",
       "d6cc3e5c5b000c963b4bea1f92123f9ac97ef3abe0a59a9419e92e58b6db8616",
       "3d9ff6c68452b4f8401989cb930b953e373cb9e27798110f49c09d1ccf707538",
+      "2688526a0eb8caae1e9a6514aa6aaeb8e9d695d375c769cb9c2df0b5ab19f992",
     ]);
   });
 
@@ -624,8 +625,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 55,
-      name: `ordinary-stage-checkpoint-objects${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 56,
+      name: `admission-execution-plan-artifact${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -677,8 +678,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 55,
-      name: `ordinary-stage-checkpoint-objects${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 56,
+      name: `admission-execution-plan-artifact${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 
@@ -1760,8 +1761,13 @@ describe("database migrations", () => {
     ).get()).toEqual({ version: 17, checksum: databaseMigrations[16]!.checksum });
   });
 
-  it("persists execution graph result artifacts after the child reducer migration", () => {
-    db = openDb(":memory:");
+  it("preserves existing artifacts and admits a distinct execution_plan artifact on v56 upgrade", () => {
+    db = new Database(":memory:");
+    applyBaseSchema(db);
+    applyDatabaseMigrationsForAuthority(db, {
+      migrations: databaseMigrations.filter((migration) => migration.version <= 55),
+      rollbackCompatibleMigrationNameSuffix: ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+    });
     const now = "2026-07-29T00:00:00.000Z";
     db.exec(`
       INSERT INTO tickets (
@@ -1821,6 +1827,29 @@ describe("database migrations", () => {
         1, 'executor_verified', '${"a".repeat(40)}', '{}', '${"b".repeat(64)}', '${now}'
       )
     `).run()).not.toThrow();
+
+    applyDatabaseMigrations(db);
+
+    expect(db.prepare("SELECT kind FROM pipeline_artifacts WHERE id = 'artifact-graph-result'").get())
+      .toEqual({ kind: "execution_graph_result" });
+    expect(() => db!.prepare(`
+      INSERT INTO pipeline_artifacts (
+        id, pipeline_instance_id, attempt_id, kind, schema_version,
+        assurance, subject, payload, artifact_hash, created_at
+      ) VALUES (
+        'artifact-execution-plan', 'instance-1', 'attempt-parent', 'execution_plan',
+        1, 'semantic_attested', NULL, '{}', '${"c".repeat(64)}', '${now}'
+      )
+    `).run()).not.toThrow();
+    expect(() => db!.prepare(`
+      INSERT INTO pipeline_artifacts (
+        id, pipeline_instance_id, attempt_id, kind, schema_version,
+        assurance, subject, payload, artifact_hash, created_at
+      ) VALUES (
+        'artifact-invalid-plan-alias', 'instance-1', 'attempt-parent', 'execution_graph_plan',
+        1, 'semantic_attested', NULL, '{}', '${"d".repeat(64)}', '${now}'
+      )
+    `).run()).toThrow(/CHECK constraint failed/);
   });
 
   it(`reopens a v46 database under the v45 migration authority from ${PREDECESSOR_RELEASE_COMMIT.slice(0, 7)}`, () => {

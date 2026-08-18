@@ -26,6 +26,13 @@ import { loadPipelineCatalog } from "../pipeline/manifest.js";
 import { createPipelineStore } from "../persistence/pipeline/create-store.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 import { setupPipelineStore, ticket } from "../__fixtures__/pipeline-store.js";
+import { validateRepositoryConfigContract } from "@openthrottle/contracts";
+import {
+  buildAdmissionBasis,
+  resolveAdmissionAuthority,
+  resolveAdmissionSkillBindings,
+  type AdmissionBasisInput,
+} from "./admission-planning.js";
 import {
   createRuntimeResourceReconciler,
   HOT_PATH_RECLAIM_LIMIT,
@@ -35,6 +42,191 @@ import {
 const shippedCatalogPath = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
 
 const target = { repository: "owner/repo", baseCommit: "a".repeat(40) };
+
+function admissionConfig(mode?: "legacy" | "automatic") {
+  return validateRepositoryConfigContract({
+    schema: "openthrottle.config/v1",
+    default_graph: "simple",
+    graphs: [
+      { id: "simple", kind: "builtin", ref: "core/simple@1" },
+      { id: "structured", kind: "builtin", ref: "core/structured@3" },
+      { id: "repo_structured", kind: "repository", ref: ".openthrottle/graphs/structured.json" },
+    ],
+    intents: {
+      implement: {
+        default_graph: "simple",
+        allowed_graphs: ["simple", "structured", "repo_structured"],
+        ...(mode === undefined ? {} : { admission_mode: mode }),
+      },
+    },
+  }).value;
+}
+
+function selection(graphId: string): string {
+  return [
+    "```json openthrottle.ship-selection/v1",
+    JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: graphId }),
+    "```",
+  ].join("\n");
+}
+
+describe("automatic admission authority", () => {
+  it("offers only the two versioned built-in candidates when automatic mode has no selection", () => {
+    expect(resolveAdmissionAuthority({
+      config: admissionConfig("automatic"),
+      taskType: "implement",
+      context: "Implement the bounded ticket.",
+    })).toEqual({
+      kind: "automatic",
+      lock: null,
+      candidates: [
+        { graph_id: "simple", graph_ref: "core/simple@1" },
+        { graph_id: "structured", graph_ref: "core/structured@3" },
+      ],
+    });
+  });
+
+  it("seals an automatic structured lock but preserves explicit simple and legacy routing", () => {
+    expect(resolveAdmissionAuthority({
+      config: admissionConfig("automatic"),
+      taskType: "implement",
+      context: selection("structured"),
+    })).toMatchObject({
+      kind: "automatic",
+      lock: { graph_id: "structured", graph_ref: "core/structured@3" },
+    });
+    expect(resolveAdmissionAuthority({
+      config: admissionConfig("automatic"),
+      taskType: "implement",
+      context: selection("simple"),
+    })).toMatchObject({ kind: "direct", graph_id: "simple" });
+    expect(resolveAdmissionAuthority({
+      config: admissionConfig(),
+      taskType: "implement",
+      context: "Implement the bounded ticket.",
+    })).toMatchObject({ kind: "direct", graph_id: "simple", explicit: false });
+  });
+
+  it("keeps repository graphs plan-required and rejects simple plans or non-implementation control", () => {
+    expect(resolveAdmissionAuthority({
+      config: admissionConfig("automatic"),
+      taskType: "implement",
+      context: selection("repo_structured"),
+    })).toMatchObject({ kind: "direct", graph_id: "repo_structured" });
+
+    const plan = {
+      schema: "openthrottle.execution-plan/v2",
+      graph_id: "simple",
+      plan_id: "invalid_simple_plan",
+      units: [{
+        id: "one",
+        title: "One",
+        depends_on: [],
+        objective: "Do one thing.",
+        requirements: ["One requirement."],
+        files: ["src/one.ts"],
+        approach: ["Implement it."],
+        tests: ["Test it."],
+        acceptance: ["It works."],
+        verification: ["Run tests."],
+      }],
+      commands: [],
+    };
+    const planContext = [
+      selection("simple"),
+      "```json openthrottle.execution-plan/v2",
+      JSON.stringify(plan),
+      "```",
+    ].join("\n");
+    expect(() => resolveAdmissionAuthority({
+      config: admissionConfig("automatic"),
+      taskType: "implement",
+      context: planContext,
+    })).toThrow(/simple graph selection cannot carry an execution plan/);
+    expect(() => resolveAdmissionAuthority({
+      config: admissionConfig("automatic"),
+      taskType: "investigate",
+      context: selection("simple"),
+    })).toThrow(/graph selection is not supported for investigate tickets/);
+  });
+
+  it("derives a stable admission basis without overloading manifest or generated-plan identity", () => {
+    const input = {
+      schema: "openthrottle.admission-basis/v1" as const,
+      source: {
+        ticket_id: "linear:issue-1",
+        session_id: "session-1",
+        generation: 1,
+        task_type: "implement" as const,
+        context: "Implement one bounded change.",
+      },
+      candidates: [
+        { graph_id: "simple", graph_ref: "core/simple@1", manifest_digest: "1".repeat(64) },
+        { graph_id: "structured", graph_ref: "core/structured@3", manifest_digest: "2".repeat(64) },
+      ],
+      lock: null,
+      skills: {
+        planner: { reference: "builtin://admission-plan@1", package_digest: null },
+        reviewer: { reference: "builtin://review-admission-plan@1", package_digest: null },
+      },
+      repository: {
+        name: "owner/repo",
+        base_commit: "a".repeat(40),
+        config_digest: "3".repeat(64),
+      },
+      runtime: { release: "runtime/v1", capability_digest: "4".repeat(64) },
+      engine: { agent: "codex" as const, model: "gpt-5.6-sol", reasoning_effort: "high" },
+    } satisfies AdmissionBasisInput;
+    const first = buildAdmissionBasis(input);
+    const second = buildAdmissionBasis(structuredClone(input));
+    expect(first).toEqual(second);
+    expect(first.digest).not.toBe(input.candidates[0]!.manifest_digest);
+    expect(first.digest).not.toBe(input.candidates[1]!.manifest_digest);
+  });
+
+  it("pins repository planning skills through the existing config allowlist", async () => {
+    const config = admissionConfig("automatic");
+    config.skills = [
+      { id: "planner", path: ".openthrottle/skills/planner" },
+      { id: "reviewer", path: ".openthrottle/skills/reviewer" },
+    ];
+    Object.assign(config.intents!.implement!, {
+      planner_skill: "repo://planner",
+      reviewer_skill: "repo://reviewer",
+    });
+    const readPinnedDirectory = async (path: string) => {
+      const id = path.split("/").at(-1)!;
+      const content = `---\nname: ${id}\n---\n\nPinned ${id}.\n`;
+      return {
+        repository: "owner/repo",
+        commit: "a".repeat(40),
+        directory: path,
+        files: [{
+          repository: "owner/repo",
+          commit: "a".repeat(40),
+          path: `${path}/SKILL.md`,
+          blobSha: id === "planner" ? "b".repeat(40) : "c".repeat(40),
+          content,
+          size: Buffer.byteLength(content),
+        }],
+      };
+    };
+
+    const bindings = await resolveAdmissionSkillBindings({ config, readPinnedDirectory });
+
+    expect(bindings.planner).toMatchObject({
+      configured_reference: "repo://planner",
+      producer_reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/planner`,
+      invocation: "planner",
+      package_digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(bindings.reviewer.package_digest).not.toBe(bindings.planner.package_digest);
+
+    config.intents!.implement!.planner_skill = "repo://undeclared";
+    await expect(resolveAdmissionSkillBindings({ config, readPinnedDirectory }))
+      .rejects.toThrow(/repo:\/\/undeclared is not declared in repository config skills/);
+  });
+});
 
 function readCheckDeps(overrides: Partial<Parameters<typeof runAdmissionPreflight>[0]> = {}) {
   return { githubReadToken: "read-token", ...overrides };

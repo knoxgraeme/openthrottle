@@ -22,6 +22,9 @@ import {
   validateTuneSealedIntentContract,
   validateTuneTaskContract,
   validateRatchetDecision,
+  validateAdmissionDecision,
+  validateAdmissionReview,
+  validateAdmissionExecutionPlanArtifact,
   validateStandardReceipt,
   type TuneCorpusRow,
   type TuneCorpusRowContent,
@@ -1577,5 +1580,144 @@ describe("Stage C contract fixtures", () => {
     conflicting.test = "npm run different";
     expect(() => parseRepositoryConfigContract(JSON.stringify(conflicting), { source: "config" }))
       .toThrow(/config\.test: must match commands\.test/);
+  });
+
+  it("normalizes opt-in automatic admission and pinned planning skill references", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as Record<string, unknown>;
+    config.skills = [
+      { id: "admission_planner", path: ".openthrottle/skills/admission_planner" },
+      { id: "admission_reviewer", path: ".openthrottle/skills/admission_reviewer" },
+    ];
+    config.intents = {
+      implement: {
+        default_graph: "simple",
+        allowed_graphs: ["simple", "structured"],
+        admission_mode: "automatic",
+        planner_skill: "repo://admission_planner",
+        reviewer_skill: "repo://admission_reviewer",
+      },
+    };
+
+    const parsed = parseRepositoryConfigContract(JSON.stringify(config), { source: "config" });
+
+    expect(parsed.value.intents?.implement).toMatchObject({
+      admission_mode: "automatic",
+      planner_skill: "repo://admission_planner",
+      reviewer_skill: "repo://admission_reviewer",
+    });
+    expect(JSON.parse(parsed.normalized).intents.implement).toMatchObject({ admission_mode: "automatic" });
+  });
+
+  it("keeps admission legacy by absence and rejects planning authority on other intents", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as Record<string, unknown>;
+    expect(parseRepositoryConfigContract(JSON.stringify(config)).value.intents?.implement?.admission_mode)
+      .toBeUndefined();
+
+    config.intents = {
+      investigate: {
+        default_graph: "simple",
+        allowed_graphs: ["simple"],
+        admission_mode: "automatic",
+      },
+    };
+    expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
+      .toThrow(/config\.intents\.investigate\.admission_mode: is valid only for the implement intent/);
+  });
+
+  it("closes automatic admission decision and review outcomes around distinct digests", () => {
+    const admissionBasisDigest = "a".repeat(64);
+    const effectiveManifestDigest = "b".repeat(64);
+    const generatedPlanDigest = "c".repeat(64);
+    const simple = {
+      schema: "openthrottle.admission-decision/v1",
+      route: "simple",
+      rationale: "One cohesive implementation can be verified as a whole.",
+      questions: [],
+      admission_basis_digest: admissionBasisDigest,
+      effective_manifest_digest: effectiveManifestDigest,
+      generated_plan_digest: null,
+    };
+    expect(validateAdmissionDecision(simple).value.route).toBe("simple");
+    expect(validateAdmissionDecision({
+      ...simple,
+      route: "structured",
+      generated_plan_digest: generatedPlanDigest,
+    }).value.generated_plan_digest).toBe(generatedPlanDigest);
+    expect(validateAdmissionDecision({
+      ...simple,
+      route: "needs_human",
+      rationale: "Acceptance authority is incomplete.",
+      questions: ["Which user-visible outcome is required?"],
+    }).value.route).toBe("needs_human");
+    expect(() => validateAdmissionDecision({
+      ...simple,
+      effective_manifest_digest: admissionBasisDigest,
+    }, { source: "decision" })).toThrow(/decision\.effective_manifest_digest: must be distinct/);
+    expect(() => validateAdmissionDecision({
+      ...simple,
+      route: "simple",
+      generated_plan_digest: generatedPlanDigest,
+    }, { source: "decision" })).toThrow(/decision\.generated_plan_digest: must be null for simple/);
+
+    const review = {
+      schema: "openthrottle.admission-review/v1",
+      verdict: "approved",
+      summary: "The plan covers the bounded ticket.",
+      findings: [],
+      questions: [],
+      admission_basis_digest: admissionBasisDigest,
+      effective_manifest_digest: effectiveManifestDigest,
+      generated_plan_digest: generatedPlanDigest,
+    };
+    expect(validateAdmissionReview(review).value.verdict).toBe("approved");
+    expect(() => validateAdmissionReview({
+      ...review,
+      verdict: "needs_human",
+    }, { source: "review" })).toThrow(/review\.questions: must contain between 1 and 16 entries/);
+  });
+
+  it("stores a generated structured plan as a separately bounded, digest-checked artifact", () => {
+    const executionPlan = JSON.parse(readFixture("valid", "execution-plan-v2.json")) as Record<string, unknown>;
+    executionPlan.graph_id = "structured";
+    const generatedPlanDigest = parseExecutionPlanContractV2(JSON.stringify(executionPlan)).digest;
+    const artifact = {
+      schema: "openthrottle.admission-execution-plan-artifact/v1",
+      execution_plan: executionPlan,
+      generated_plan_digest: generatedPlanDigest,
+      producer: {
+        skill: "builtin://admission-plan@1",
+        capability_digest: "d".repeat(64),
+        skill_package_digest: null,
+      },
+      assurance: "semantic_attested",
+      source: {
+        admission_basis_digest: "a".repeat(64),
+        effective_manifest_digest: "b".repeat(64),
+        request_hash: "e".repeat(64),
+      },
+    };
+
+    expect(validateAdmissionExecutionPlanArtifact(artifact).value.execution_plan).toEqual(executionPlan);
+    expect(() => validateAdmissionExecutionPlanArtifact({
+      ...artifact,
+      generated_plan_digest: "f".repeat(64),
+    }, { source: "artifact" })).toThrow(/artifact\.generated_plan_digest: does not match/);
+
+    const receipt = JSON.parse(readFixture("valid", "receipt-unit-decision.json")) as Record<string, unknown>;
+    receipt.type = "admission_decision";
+    receipt.result = "simple";
+    receipt.payload = { decision: {
+      schema: "openthrottle.admission-decision/v1",
+      route: "simple",
+      rationale: "One cohesive implementation can be verified as a whole.",
+      questions: [],
+      admission_basis_digest: "a".repeat(64),
+      effective_manifest_digest: "b".repeat(64),
+      generated_plan_digest: null,
+    } };
+    expect(validateStandardReceipt(receipt).value.type).toBe("admission_decision");
+    receipt.assurance = "executor_verified";
+    expect(() => validateStandardReceipt(receipt, { source: "receipt" }))
+      .toThrow(/receipt\.assurance: semantic receipts cannot claim/);
   });
 });

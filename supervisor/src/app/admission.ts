@@ -6,7 +6,6 @@ import type { Agent, TaskType } from "../pipeline/types.js";
 import {
   canonicalJson,
   EXECUTION_PLAN_SCHEMA_V2,
-  EXECUTION_PLAN_SCHEMAS,
   TUNE_ANALYSIS_INPUT_SCHEMA,
   TUNE_SEALED_INTENT_SCHEMA,
   TUNE_TASK_SCHEMA,
@@ -14,7 +13,6 @@ import {
   deriveTuneCorpusRowDigest,
   digestCanonicalJson,
   digestNormalized,
-  parseAnyExecutionPlanContract,
   parseGraphContract,
   parseTuneTaskContract,
   validateTuneAnalysisInputContract,
@@ -41,7 +39,7 @@ import { FOR_EACH_UNIT_CAPABILITY, parseAndCompileExecutionGraph } from "../pipe
 import { assertStructuredPlanLoopEnvelopeBound } from "../pipeline/structured-loop-envelope.js";
 import type { RepositorySkillPackage } from "../pipeline/manifest.js";
 import type { PipelineStore } from "../pipeline/store.js";
-import { extractJsonBlocks, extractJsonBlocksAny } from "../pipeline/markdown.js";
+import { extractJsonBlocks } from "../pipeline/markdown.js";
 import type { StageRequestInputArtifact } from "../pipeline/stage-request.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
@@ -51,11 +49,15 @@ import {
   ORDINARY_STAGE_TASK_CONTEXT_LIMIT,
 } from "./admission-context.js";
 import type { PipelineCoordinatorContext, SessionServicePorts } from "./session-service.js";
+import {
+  buildAdmissionBasis,
+  resolveAdmissionSkillBindings,
+  resolvePinnedRepositorySkillPackage,
+  resolveAdmissionAuthority,
+  type AdmissionAuthority,
+} from "./admission-planning.js";
 
-const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
-const EXECUTION_PLAN_FENCES = EXECUTION_PLAN_SCHEMAS;
 const EXECUTION_PLAN_ARTIFACT_SCHEMA_VERSION = 2;
-const SHIP_SELECTION_FENCE = "openthrottle.ship-selection/v1";
 const TUNE_TASK_FENCE = TUNE_TASK_SCHEMA;
 const BUILTIN_SIMPLE_GRAPH = fileURLToPath(new URL("../../graphs/simple-v1.json", import.meta.url));
 const BUILTIN_GRAPHS = {
@@ -82,7 +84,6 @@ const BUILTIN_GRAPHS = {
   },
 } as const;
 const SIMPLE_IMPLEMENT_DESCRIPTION = "Staged CE implementation from a pre-approved plan with round-based repair budgeting, scoped repair re-entry, sealed repository gates, exact-tree publication, and bounded provider repair. The initial forward pass may simplify; repair passes re-run semantic review and command gates without re-running simplification.";
-const REPOSITORY_SKILL_PACKAGE_SCHEMA = "openthrottle.repository-skill-package/v1";
 // Repository graph blobs are immutable inputs, but compiler changes can alter
 // their normalized manifest bytes. Bump this identity version whenever that
 // happens so an already-accepted manifest identity is never silently reused.
@@ -212,39 +213,6 @@ function effectiveStructuredWorkerAgents(manifest: ValidatedPipelineManifest, se
   return agents;
 }
 
-function extractShipSelectionGraphId(context: string): string | undefined {
-  const blocks = extractJsonBlocks(context, SHIP_SELECTION_FENCE);
-  if (blocks.length === 0) return undefined;
-  if (blocks.length > 1) throw new Error(`expected at most one ${SHIP_SELECTION_FENCE} block, found ${blocks.length}`);
-  const parsed = JSON.parse(blocks[0]!) as unknown;
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`${SHIP_SELECTION_FENCE}: must be an object`);
-  }
-  const record = parsed as Record<string, unknown>;
-  if (record.schema !== SHIP_SELECTION_FENCE) {
-    throw new Error(`${SHIP_SELECTION_FENCE}.schema: must be ${SHIP_SELECTION_FENCE}`);
-  }
-  if (typeof record.graph_id !== "string" || record.graph_id.length === 0) {
-    throw new Error(`${SHIP_SELECTION_FENCE}.graph_id: must be a non-empty string`);
-  }
-  return record.graph_id;
-}
-
-function assertNoUnfencedControlJson(context: string): void {
-  for (const schema of [SHIP_SELECTION_FENCE, ...EXECUTION_PLAN_FENCES]) {
-    const outsideCanonicalFence = context.replace(
-      /```([^\n`]*)\n[\s\S]*?```/g,
-      (block, marker: string) => marker.trim().split(/\s+/).includes(schema) ? "" : block
-    );
-    const escaped = schema.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    if (new RegExp(`"schema"\\s*:\\s*"${escaped}"`).test(outsideCanonicalFence)) {
-      throw new Error(
-        `found ${schema} control JSON outside its canonical \`\`\`json ${schema} fenced block`
-      );
-    }
-  }
-}
-
 // At structured admission, the plan is parsed and (via
 // assertStructuredPlanLoopEnvelopeBound below) projected through the exact
 // same production function dispatch uses (loopActionPlanContext) before any
@@ -252,19 +220,6 @@ function assertNoUnfencedControlJson(context: string): void {
 // missing required fields, unresolved dependency references, values over
 // bound -- is therefore rejected here, naming the offending unit and field,
 // never inside a provisioned sandbox (OPE-166).
-function extractExecutionPlan(context: string): ExecutionPlanContractV2 | undefined {
-  const blocks = extractJsonBlocksAny(context, EXECUTION_PLAN_FENCES);
-  if (blocks.length === 0) return undefined;
-  if (blocks.length > 1) {
-    throw new Error(`expected at most one execution-plan block, found ${blocks.length}`);
-  }
-  const plan = parseAnyExecutionPlanContract(blocks[0]!, { source: "issue.execution_plan" }).value;
-  if (plan.schema !== EXECUTION_PLAN_SCHEMA_V2) {
-    throw new Error(`fresh structured admission requires ${EXECUTION_PLAN_SCHEMA_V2}; ${EXECUTION_PLAN_FENCE} is replay-only`);
-  }
-  return plan;
-}
-
 function executionPlanInputArtifact(plan: ExecutionPlanContractV2 | undefined): StageRequestInputArtifact[] | undefined {
   if (!plan) return undefined;
   const payload = canonicalJson({
@@ -378,42 +333,11 @@ async function sealTuneTaskContext(input: {
   ].join("\n\n");
 }
 
-function extractRequestedGraph(context: string): {
-  graphId?: string;
-  hasExecutionPlan: boolean;
-  executionPlan?: ExecutionPlanContractV2;
-} {
-  assertNoUnfencedControlJson(context);
-  const selected = extractShipSelectionGraphId(context);
-  const executionPlan = extractExecutionPlan(context);
-  const planned = executionPlan?.graph_id;
-  if (selected && planned && selected !== planned) {
-    throw new Error(`ship selection graph_id ${selected} does not match execution_plan.graph_id ${planned}`);
-  }
-  return { graphId: selected ?? planned, hasExecutionPlan: planned !== undefined, executionPlan };
-}
-
 function repositorySkillIds(rawGraph: string, source: string, config: ValidatedRepositoryConfig["config"]): string[] {
   const graph = parseGraphContract(rawGraph, { source, config }).value;
   return [...new Set(graph.loops.flatMap((loop) => (
     loop.skill.startsWith("repo://") ? [loop.skill.slice("repo://".length)] : []
   )))].sort();
-}
-
-function repositorySkillFrontmatterName(raw: string): string {
-  const lines = raw.replace(/\r\n/g, "\n").split("\n");
-  if (lines[0] !== "---") throw new Error("repository skill SKILL.md is missing frontmatter");
-  const end = lines.indexOf("---", 1);
-  if (end === -1) throw new Error("repository skill SKILL.md frontmatter is unterminated");
-  for (const line of lines.slice(1, end)) {
-    const match = line.match(/^name:\s*["']?([A-Za-z0-9][A-Za-z0-9._-]{0,127})["']?\s*$/);
-    if (match) return match[1];
-  }
-  throw new Error("repository skill SKILL.md frontmatter is missing name");
-}
-
-function repositorySkillNameMatchesInvocation(name: string, invocation: string): boolean {
-  return name === invocation;
 }
 
 async function resolveRepositorySkillPackages(input: {
@@ -423,47 +347,20 @@ async function resolveRepositorySkillPackages(input: {
   readPinnedDirectory: (path: string) => Promise<RepositoryDirectorySnapshot>;
 }): Promise<ReadonlyMap<string, RepositorySkillPackage>> {
   const ids = repositorySkillIds(input.rawGraph, input.source, input.repositoryConfig.config);
-  const configured = new Map((input.repositoryConfig.config.skills ?? []).map((skill) => [skill.id, skill]));
   const packages = new Map<string, RepositorySkillPackage>();
   for (const id of ids) {
-    const declaration = configured.get(id);
-    if (!declaration) throw new Error(`graph skill repo://${id} is not declared in repository config skills`);
-    const snapshot = await input.readPinnedDirectory(declaration.path);
-    if (snapshot.directory !== declaration.path) {
-      throw new Error(`repository skill ${id} resolved to unexpected directory ${snapshot.directory}`);
-    }
-    if (!snapshot.files.some((file) => file.path === `${declaration.path}/SKILL.md`)) {
-      throw new Error(`repository skill ${id} package is missing SKILL.md`);
-    }
-    const skillFile = snapshot.files.find((file) => file.path === `${declaration.path}/SKILL.md`)!;
-    const frontmatterName = repositorySkillFrontmatterName(skillFile.content);
-    if (!repositorySkillNameMatchesInvocation(frontmatterName, id)) {
-      throw new Error(`repository skill ${id} SKILL.md name does not match the configured invocation`);
-    }
-    const files = snapshot.files.map((file) => ({
-      path: file.path,
-      blobSha: file.blobSha,
-      digest: digestNormalized(file.content),
+    packages.set(id, await resolvePinnedRepositorySkillPackage({
+      id,
+      config: input.repositoryConfig.config,
+      readPinnedDirectory: input.readPinnedDirectory,
     }));
-    const unsigned = {
-      schema: REPOSITORY_SKILL_PACKAGE_SCHEMA as "openthrottle.repository-skill-package/v1",
-      reference: `repo://${snapshot.repository}@${snapshot.commit}#${declaration.path}`,
-      invocation: id,
-      directory: declaration.path,
-      commit: snapshot.commit,
-      files,
-    };
-    packages.set(id, {
-      ...unsigned,
-      packageDigest: digestNormalized(canonicalJson(unsigned)),
-    });
   }
   return packages;
 }
 
 async function resolvePipelineSelection(
   repositoryConfig: ValidatedRepositoryConfig,
-  context: string,
+  authority: AdmissionAuthority,
   readPinnedFile: (path: string) => Promise<RepositoryFileSnapshot>,
   readPinnedDirectory: (path: string) => Promise<RepositoryDirectorySnapshot>,
   runtime: PipelineCoordinatorContext["runtime"],
@@ -472,9 +369,14 @@ async function resolvePipelineSelection(
   taskTimeoutSeconds: number,
   acceptedManifestDigest?: (pipelineId: string, version: number) => string | undefined
 ): Promise<ValidatedPipelineManifest> {
+  if (authority.kind === "automatic") {
+    return resolvePipelineReference(
+      catalog,
+      repositoryConfig.config.pipelines?.automatic ?? "automatic"
+    );
+  }
   const intent = repositoryConfig.config.intents?.implement;
-  const requested = extractRequestedGraph(context);
-  const graphId = requested.graphId ?? intent?.default_graph ?? repositoryConfig.config.default_graph;
+  const graphId = authority.graph_id;
   const allowedGraphs = intent?.allowed_graphs ?? [repositoryConfig.config.default_graph];
   if (!allowedGraphs.includes(graphId)) {
     throw new Error(`graph ${graphId} is not allowed for implement; allowed: ${allowedGraphs.join(", ")}`);
@@ -568,11 +470,11 @@ async function resolvePipelineSelection(
       compiled = aggregatePublishCompiled;
     }
   }
-  if (compiled.manifest.manifest.requires.capabilities.includes(FOR_EACH_UNIT_CAPABILITY) && !requested.hasExecutionPlan) {
+  if (compiled.manifest.manifest.requires.capabilities.includes(FOR_EACH_UNIT_CAPABILITY) && !authority.execution_plan) {
     throw new Error(`graph ${graphId} requires a canonical ${EXECUTION_PLAN_SCHEMA_V2} block`);
   }
-  if (compiled.manifest.manifest.requires.capabilities.includes(FOR_EACH_UNIT_CAPABILITY) && requested.executionPlan) {
-    assertStructuredPlanLoopEnvelopeBound(requested.executionPlan, {
+  if (compiled.manifest.manifest.requires.capabilities.includes(FOR_EACH_UNIT_CAPABILITY) && authority.execution_plan) {
+    assertStructuredPlanLoopEnvelopeBound(authority.execution_plan, {
       manifest: compiled.manifest,
       selectedAgent,
     });
@@ -815,14 +717,25 @@ export async function handleCreated(
       remote.content,
       `${selectedRepository.repo}@${remote.baseCommit}:.openthrottle.yml`
     );
-    const requested = extractRequestedGraph(boundedTaskContext.selectionContext);
-    if (taskType !== "implement" && requested.graphId) {
-      throw new Error(`graph selection is not supported for ${taskType} tickets`);
-    }
+    const authority = resolveAdmissionAuthority({
+      config: repositoryConfig.config,
+      taskType,
+      context: boundedTaskContext.selectionContext,
+    });
+    const admissionSkills = authority.kind === "automatic"
+      ? await resolveAdmissionSkillBindings({
+        config: repositoryConfig.config,
+        readPinnedDirectory: (path) => providers.repositoryReader.getRepositoryDirectoryAtCommit(
+          selectedRepository.repo,
+          remote.baseCommit,
+          path
+        ),
+      })
+      : undefined;
     const manifest = taskType === "implement"
       ? await resolvePipelineSelection(
         repositoryConfig,
-        boundedTaskContext.selectionContext,
+        authority,
         (path) =>
           providers.repositoryReader.getRepositoryFileAtCommit(
             selectedRepository.repo,
@@ -865,7 +778,7 @@ export async function handleCreated(
       throw new Error(boundedTaskContext.ordinaryLimitError);
     }
     const inputArtifacts = taskType === "implement"
-      ? executionPlanInputArtifact(requested.executionPlan)
+      ? executionPlanInputArtifact(authority.kind === "direct" ? authority.execution_plan : undefined)
       : undefined;
     const taskContext = taskType === "tune"
       ? await sealTuneTaskContext({
@@ -886,9 +799,49 @@ export async function handleCreated(
         ),
       })
       : boundedTaskContext.context;
-    const planDigest = requested.executionPlan
-      ? digestCanonicalJson(requested.executionPlan)
-      : digestNormalized(taskContext);
+    const planDigest = authority.kind === "direct" && authority.execution_plan
+      ? digestCanonicalJson(authority.execution_plan)
+      : authority.kind === "automatic"
+        ? buildAdmissionBasis({
+          schema: "openthrottle.admission-basis/v1",
+          source: {
+            ticket_id: ticketId,
+            session_id: sessionId,
+            generation: store.getCurrentSession(ticketId)?.generation ?? 1,
+            task_type: "implement",
+            context: boundedTaskContext.selectionContext,
+          },
+          candidates: authority.candidates.map((candidate) => ({
+            ...candidate,
+            manifest_digest: digestCanonicalJson(candidate),
+          })),
+          lock: authority.lock,
+          skills: {
+            planner: {
+              reference: admissionSkills!.planner.producer_reference,
+              package_digest: admissionSkills!.planner.package_digest,
+            },
+            reviewer: {
+              reference: admissionSkills!.reviewer.producer_reference,
+              package_digest: admissionSkills!.reviewer.package_digest,
+            },
+          },
+          repository: {
+            name: selectedRepository.repo,
+            base_commit: remote.baseCommit,
+            config_digest: repositoryConfig.digest,
+          },
+          runtime: {
+            release: coordinator.runtime.descriptor.release,
+            capability_digest: coordinator.runtime.digest,
+          },
+          engine: {
+            agent: selectedAgent,
+            model: repositoryConfig.config.agent_defaults?.[selectedAgent]?.model ?? repositoryConfig.config.model ?? null,
+            reasoning_effort: repositoryConfig.config.agent_defaults?.[selectedAgent]?.reasoning_effort ?? null,
+          },
+        }).digest
+        : digestNormalized(taskContext);
     const snapshot = coordinator.store.saveRepositoryConfigSnapshot({
       repository: selectedRepository.repo,
       baseCommit: remote.baseCommit,

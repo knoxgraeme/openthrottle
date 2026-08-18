@@ -8,6 +8,7 @@ import {
   validateRepositoryConfigContract,
   type ConfigGraphSource,
   type ConfigAgentDefault,
+  type ConfigIntent,
   type ConfigMcpServer,
   type ConfigRepositorySkill,
   type GraphUnitPhaseId,
@@ -78,6 +79,7 @@ export const EVALUATOR_KINDS = [
 export type EvaluatorKind = (typeof EVALUATOR_KINDS)[number];
 export const ARTIFACT_KINDS = [
   "stage_result",
+  "execution_plan",
   "standard_receipt",
   "execution_graph_result",
   "review",
@@ -262,10 +264,7 @@ export interface RepositoryPipelineConfig {
   limits?: { max_turns?: number; task_timeout?: number };
   mcp_servers?: Record<string, ConfigMcpServer>;
   pipelines?: Record<string, string>;
-  intents?: Record<string, {
-    default_graph: string;
-    allowed_graphs: string[];
-  }>;
+  intents?: Record<string, ConfigIntent>;
 }
 
 export interface ValidatedRepositoryConfig {

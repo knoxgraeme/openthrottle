@@ -9,6 +9,7 @@ import {
   normalizedContract,
   objectAt,
   recordAt,
+  SKILL_REFERENCE,
   stringAt,
   unique,
   type ValidatedContract,
@@ -54,6 +55,14 @@ export interface ConfigAgentDefault {
   reasoning_effort?: (typeof REASONING_EFFORTS)[number];
 }
 
+export interface ConfigIntent {
+  default_graph: string;
+  allowed_graphs: string[];
+  admission_mode?: "legacy" | "automatic";
+  planner_skill?: string;
+  reviewer_skill?: string;
+}
+
 export interface RepositoryConfigContract {
   schema: typeof CONFIG_SCHEMA;
   default_graph: string;
@@ -72,10 +81,7 @@ export interface RepositoryConfigContract {
   limits?: ConfigLimits;
   mcp_servers?: Record<string, ConfigMcpServer>;
   pipelines?: Record<string, string>;
-  intents?: Record<string, {
-    default_graph: string;
-    allowed_graphs: string[];
-  }>;
+  intents?: Record<string, ConfigIntent>;
 }
 
 const COMMAND_ALIAS_NAMES = ["test", "lint", "build", "dev", "format"] as const;
@@ -253,13 +259,29 @@ function parseCommandAliases(input: Record<string, unknown>, source: string): {
   };
 }
 
-function parseIntent(value: unknown, path: string): { default_graph: string; allowed_graphs: string[] } {
-  const input = objectAt(value, path, ["default_graph", "allowed_graphs"]);
+function parseIntent(value: unknown, path: string, intentName: string): ConfigIntent {
+  const input = objectAt(value, path, [
+    "default_graph", "allowed_graphs", "admission_mode", "planner_skill", "reviewer_skill",
+  ]);
+  if (intentName !== "implement") {
+    for (const field of ["admission_mode", "planner_skill", "reviewer_skill"] as const) {
+      if (input[field] !== undefined) fail(`${path}.${field}`, "is valid only for the implement intent");
+    }
+  }
   return {
     default_graph: stringAt(input.default_graph, `${path}.default_graph`, { pattern: IDENTIFIER }),
     allowed_graphs: unique(arrayAt(input.allowed_graphs, `${path}.allowed_graphs`, (entry, entryPath) => {
       return stringAt(entry, entryPath, { pattern: IDENTIFIER });
     }, { min: 1, max: 16 }), `${path}.allowed_graphs`),
+    ...(input.admission_mode === undefined ? {} : {
+      admission_mode: enumAt(input.admission_mode, `${path}.admission_mode`, ["legacy", "automatic"] as const),
+    }),
+    ...(input.planner_skill === undefined ? {} : {
+      planner_skill: stringAt(input.planner_skill, `${path}.planner_skill`, { pattern: SKILL_REFERENCE }),
+    }),
+    ...(input.reviewer_skill === undefined ? {} : {
+      reviewer_skill: stringAt(input.reviewer_skill, `${path}.reviewer_skill`, { pattern: SKILL_REFERENCE }),
+    }),
   };
 }
 
