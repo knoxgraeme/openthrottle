@@ -93,12 +93,38 @@ describe("pipeline publication", () => {
       },
     });
     const instance = pipelines.getInstanceForSession("session-1")!;
+    if (pipelines.getTaskBranch(instance.id)) {
+      db.prepare(`
+        UPDATE pipeline_task_branches
+        SET status = 'reserved', acknowledged_remote_sha = base_sha
+        WHERE pipeline_instance_id = ?
+      `).run(instance.id);
+      db.prepare(`
+        UPDATE pipeline_effect_intents
+        SET status = 'acknowledged', acknowledged_at = created_at
+        WHERE pipeline_instance_id = ? AND kind = 'create_task_branch'
+      `).run(instance.id);
+    }
     return { tickets, pipelines, instance, attempt: pipelines.getActiveAttempt(instance.id)! };
   }
 
   function coreImplementManifest() {
     const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
     return loadPipelineCatalog(path, runtime.descriptor).manifests.get("core/implement@4")!;
+  }
+
+  function acknowledgeTaskBranchCheckpoint(pipelines: PipelineStore, expectedSha: string): void {
+    const claimed = pipelines.claimEffects(
+      "2099-01-01T00:00:00.000Z",
+      "2099-01-01T00:01:00.000Z"
+    );
+    const checkpoint = claimed.find((effect) => effect.kind === "advance_task_branch");
+    expect(checkpoint).toBeDefined();
+    pipelines.recordEffectAcknowledgement({
+      effectId: checkpoint!.id,
+      eventId: `task-branch-checkpoint:${checkpoint!.id}`,
+      payload: canonicalJson({ sha: expectedSha }),
+    });
   }
 
   function event(
@@ -1660,6 +1686,7 @@ describe("pipeline publication", () => {
     });
     const afterFresh = coordinatePipelineEvent(pipelines, fresh.event, undefined, fresh.receipt);
     expect(afterFresh.active_stage_id).toBe("resume");
+    acknowledgeTaskBranchCheckpoint(pipelines, SUBJECT);
 
     const resumeAttempt = pipelines.getActiveAttempt(instance.id)!;
     const resume = semanticEvent({
@@ -1738,6 +1765,7 @@ describe("pipeline publication", () => {
       actions: ["Fixed provider snapshot bounding and verified coverage."],
     });
     coordinatePipelineEvent(pipelines, repair.event, undefined, repair.receipt);
+    acknowledgeTaskBranchCheckpoint(pipelines, repairedSubject);
     const repairPublication = parsePipelinePublication(pipelines.listPublications(instance.id)
       .find((row) => row.kind === "control_ledger" && row.attempt_id === repairAttempt.id)!.payload);
     // The repair stage emitted no findings of its own, yet earlier review
