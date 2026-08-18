@@ -326,7 +326,7 @@ export function createTransitionStore(db: Database.Database, now: () => string):
       WHERE id = ? AND state_version = ? AND status = ?
     `).run(
       write.nextStatus, write.nextStageId ?? null, write.waitReason ?? null, nextVersion,
-      write.nextAttempt ? 1 : 0, write.reentryIncrement ?? 0,
+      write.nextAttempt ? 1 : 0, write.repairRoundIncrement ?? write.reentryIncrement ?? 0,
       write.immutableSubject ?? null, write.immutableSubject ?? null,
       write.clearPublishedCommit ? 1 : 0, write.publishedCommit ?? null, write.publishedCommit ?? null,
       write.clearPublishedCommit ? 1 : 0, write.publishedSubject ?? null, write.publishedSubject ?? null,

@@ -942,6 +942,36 @@ describe("pipeline publication", () => {
       .toContain("[P0] provider-snapshot-bounding — snapshot payload unbounded → carried to repair");
   });
 
+  it("does not label a same-stage implementation retry as a semantic repair round", () => {
+    const { instance, attempt } = setup("fixture/agent@1");
+    const input = event(instance, attempt);
+    const publication = buildStagePublication({
+      instance,
+      attempt: { ...attempt, stage_id: "implementation" },
+      event: { ...input.event, outcome: "semantic_repair_required" },
+      write: {
+        instanceId: instance.id,
+        eventId: input.event.id,
+        eventPayloadHash: digestNormalized(canonicalJson(input.event)),
+        expectedVersion: instance.state_version,
+        expectedStatus: instance.status,
+        attemptId: attempt.id,
+        outcome: "semantic_repair_required",
+        resultHash: input.event.resultHash,
+        nextStatus: "dispatchable",
+        reentryIncrement: 1,
+        repairRoundIncrement: 0,
+        nextAttempt: nextAttemptStub("implementation", 1),
+        effects: [],
+      },
+      gateReceipt: input.receipt,
+    });
+
+    expect(publication.template.name).toBe("gate");
+    expect(publication.body).not.toContain("Repair round");
+    expect(publication.body).not.toContain("scheduled repair round");
+  });
+
   it("names the current repair-triggering finding in the repair banner when older findings are carried forward", () => {
     const { instance, attempt } = setup("fixture/agent@1");
     const input = event(instance, attempt);

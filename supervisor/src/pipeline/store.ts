@@ -377,7 +377,10 @@ export interface CoordinatorTransitionWrite {
   publishedCommit?: string | null;
   publishedSubject?: string | null;
   clearPublishedCommit?: boolean;
+  /** Increments the target stage's local bounded re-entry counter. */
   reentryIncrement?: number;
+  /** Increments the pipeline-wide semantic repair-round counter. */
+  repairRoundIncrement?: number;
   artifacts?: CoordinatorArtifactWrite[];
   gateReceipt?: CoordinatorGateReceiptWrite;
   nextAttempt?: {

@@ -230,6 +230,21 @@ function extractShipSelectionGraphId(context: string): string | undefined {
   return record.graph_id;
 }
 
+function assertNoUnfencedControlJson(context: string): void {
+  for (const schema of [SHIP_SELECTION_FENCE, ...EXECUTION_PLAN_FENCES]) {
+    const outsideCanonicalFence = context.replace(
+      /```([^\n`]*)\n[\s\S]*?```/g,
+      (block, marker: string) => marker.trim().split(/\s+/).includes(schema) ? "" : block
+    );
+    const escaped = schema.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`"schema"\\s*:\\s*"${escaped}"`).test(outsideCanonicalFence)) {
+      throw new Error(
+        `found ${schema} control JSON outside its canonical \`\`\`json ${schema} fenced block`
+      );
+    }
+  }
+}
+
 // At structured admission, the plan is parsed and (via
 // assertStructuredPlanLoopEnvelopeBound below) projected through the exact
 // same production function dispatch uses (loopActionPlanContext) before any
@@ -368,6 +383,7 @@ function extractRequestedGraph(context: string): {
   hasExecutionPlan: boolean;
   executionPlan?: ExecutionPlanContractV2;
 } {
+  assertNoUnfencedControlJson(context);
   const selected = extractShipSelectionGraphId(context);
   const executionPlan = extractExecutionPlan(context);
   const planned = executionPlan?.graph_id;

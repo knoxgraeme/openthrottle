@@ -201,7 +201,7 @@ function chooseTemplate(
   if (write.terminalOutcome === "needs_human" || resumeStatus === "waiting_human") return "needs_human";
   if (write.terminalOutcome) return "terminal";
   if (write.nextStatus === "waiting_provider") return "provider_wait";
-  if ((write.reentryIncrement ?? 0) > 0) return "repair_reentry";
+  if ((write.repairRoundIncrement ?? write.reentryIncrement ?? 0) > 0) return "repair_reentry";
   return "gate";
 }
 

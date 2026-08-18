@@ -637,9 +637,13 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       throw new Error(`stage ${stage.id} cannot enter provider wait without an exact subject`);
     }
     const isReentry = isPipelineReentry(input.manifest, stage.id, target.id);
+    // Same-stage retries are governed by that transition's local
+    // max_reentries. Only a backward transition into an earlier stage starts
+    // a new whole-pipeline semantic repair round.
+    const isRepairRound = isReentry && target.id !== stage.id;
     const targetState = input.stages.find((candidate) => candidate.stage_id === target.id);
     if (!targetState) throw new Error(`stage state ${target.id} is absent for pipeline instance ${input.instance.id}`);
-    if (isReentry && input.manifest.max_repair_rounds !== undefined &&
+    if (isRepairRound && input.manifest.max_repair_rounds !== undefined &&
       input.instance.reentry_count >= input.manifest.max_repair_rounds) {
       const clearsPublishedBinding = shouldClearPublishedBinding(input);
       return terminalWrite({
@@ -783,6 +787,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       publishedSubject: publishedSubjectForEvent(input, stage),
       clearPublishedCommit: shouldClearPublishedBinding(input),
       reentryIncrement: isReentry ? 1 : 0,
+      repairRoundIncrement: isRepairRound ? 1 : 0,
       artifacts: artifactsFor(input.event),
       nextAttempt,
       effects: [nextEffect, ...waitEffects],
