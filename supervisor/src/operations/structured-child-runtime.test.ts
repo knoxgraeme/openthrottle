@@ -9,7 +9,111 @@ import { MAX_LOOP_REQUEST_ENVELOPE_BYTES } from "../pipeline/structured-loop-lim
 import {
   aggregateOutcomeFor,
   createStructuredChildRuntime as createProductionStructuredChildRuntime,
+  structuredPlanContextFor,
 } from "./structured-child-runtime.js";
+
+function automaticStructuredPlanFixture() {
+  const manifestDigest = "c".repeat(64);
+  const subject = "a".repeat(40);
+  const executionPlan = {
+    schema: "openthrottle.execution-plan/v2",
+    graph_id: "structured",
+    plan_id: "automatic",
+    units: [{
+      id: "unit_a", title: "Unit A", depends_on: [], objective: "Implement it.",
+      requirements: ["Keep the contract."], files: ["src/a.ts"], approach: ["Follow patterns."],
+      tests: ["Covers success."], acceptance: ["It works."], verification: ["npm test"],
+    }],
+    commands: [{ name: "test" }],
+  };
+  const wrapper = {
+    schema: "openthrottle.admission-execution-plan-artifact/v1",
+    execution_plan: executionPlan,
+    generated_plan_digest: digestNormalized(canonicalJson(executionPlan)),
+    producer: {
+      skill: "builtin://admission-plan@1",
+      capability_digest: "d".repeat(64),
+      skill_package_digest: null,
+    },
+    assurance: "executor_verified",
+    source: {
+      admission_basis_digest: "e".repeat(64),
+      effective_manifest_digest: manifestDigest,
+      request_hash: "f".repeat(64),
+    },
+  };
+  const artifact = {
+    kind: "execution_plan" as const,
+    schemaVersion: 1,
+    assurance: "executor_verified" as const,
+    subject,
+    payload: canonicalJson(wrapper),
+    hash: digestNormalized(canonicalJson(wrapper)),
+  };
+  const instance = {
+    pipeline_id: "core/automatic/identity",
+    manifest_digest: manifestDigest,
+    normalized_manifest: canonicalJson({
+      stages: [{ id: "admission_planner", loop: { skill: "builtin://admission-plan@1" } }],
+    }),
+  };
+  const request = { inputArtifacts: [artifact], expectedSubject: subject, taskContext: "bounded ticket" };
+  return { instance, request, artifact, wrapper, executionPlan };
+}
+
+describe("automatic structured-plan bridge", () => {
+  it("consumes only the immediate executor-verified exact-subject wrapper", () => {
+    const input = automaticStructuredPlanFixture();
+    const context = structuredPlanContextFor(input.instance, input.request, input.wrapper.source.admission_basis_digest);
+    expect(context).toContain("openthrottle.execution-plan/v2");
+    expect(context).toContain('"unit_a"');
+  });
+
+  it("rejects stale, substituted, duplicate, wrong-lineage, and downgraded wrappers", () => {
+    const input = automaticStructuredPlanFixture();
+    expect(() => structuredPlanContextFor(input.instance, {
+      ...input.request,
+      expectedSubject: "b".repeat(40),
+    }, input.wrapper.source.admission_basis_digest)).toThrow(/subject mismatch/);
+    expect(() => structuredPlanContextFor(input.instance, {
+      ...input.request,
+      inputArtifacts: [{ ...input.artifact, hash: "0".repeat(64) }],
+    }, input.wrapper.source.admission_basis_digest)).toThrow(/hash mismatch/);
+    expect(() => structuredPlanContextFor(input.instance, {
+      ...input.request,
+      inputArtifacts: [input.artifact, input.artifact],
+    }, input.wrapper.source.admission_basis_digest)).toThrow(/exactly one/);
+
+    const wrongLineage = {
+      ...input.wrapper,
+      source: { ...input.wrapper.source, effective_manifest_digest: "1".repeat(64) },
+    };
+    expect(() => structuredPlanContextFor(input.instance, {
+      ...input.request,
+      inputArtifacts: [{
+        ...input.artifact,
+        payload: canonicalJson(wrongLineage),
+        hash: digestNormalized(canonicalJson(wrongLineage)),
+      }],
+    }, input.wrapper.source.admission_basis_digest)).toThrow(/manifest lineage mismatch/);
+
+    const downgraded = { ...input.wrapper, assurance: "semantic_attested" };
+    expect(() => structuredPlanContextFor(input.instance, {
+      ...input.request,
+      inputArtifacts: [{
+        ...input.artifact,
+        payload: canonicalJson(downgraded),
+        hash: digestNormalized(canonicalJson(downgraded)),
+      }],
+    }, input.wrapper.source.admission_basis_digest)).toThrow(/wrapper assurance mismatch/);
+
+    expect(() => structuredPlanContextFor(
+      input.instance,
+      input.request,
+      "2".repeat(64),
+    )).toThrow(/admission basis mismatch/);
+  });
+});
 
 function createStructuredChildRuntime(
   deps: Parameters<typeof createProductionStructuredChildRuntime>[0]

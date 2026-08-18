@@ -11,6 +11,7 @@ import {
   validateTuneDecisionContract,
   validateTuneEditAuthorizationContract,
   validateTuneProposalContract,
+  validateAdmissionExecutionPlanArtifact,
   type RepositoryConfigContract,
   type AnyExecutionPlanContract,
   type CandidateEvidenceReceipt,
@@ -454,6 +455,60 @@ function requestContextForStructuredPlan(payload: {
     }
   }
   return typeof payload.taskContext === "string" ? payload.taskContext : "";
+}
+
+export function structuredPlanContextFor(
+  instance: Pick<PipelineInstance, "pipeline_id" | "manifest_digest" | "normalized_manifest">,
+  request: Pick<StageRequestEnvelope, "inputArtifacts" | "expectedSubject" | "taskContext">,
+  persistedAdmissionBasisDigest?: string
+): string {
+  if (typeof instance.pipeline_id !== "string" || !instance.pipeline_id.startsWith("core/automatic/")) {
+    return requestContextForStructuredPlan(request);
+  }
+  if (!Array.isArray(request.inputArtifacts) || request.inputArtifacts.length !== 1) {
+    throw new Error("automatic structured execution requires exactly one immediate execution-plan artifact");
+  }
+  const artifact = request.inputArtifacts[0]!;
+  if (artifact.kind !== "execution_plan" || artifact.schemaVersion !== 1) {
+    throw new Error("automatic structured execution received the wrong artifact contract");
+  }
+  if (artifact.assurance !== "executor_verified") {
+    throw new Error("automatic structured execution plan is not executor verified");
+  }
+  if (request.expectedSubject === null || artifact.subject !== request.expectedSubject) {
+    throw new Error("automatic structured execution plan subject mismatch");
+  }
+  if (digestNormalized(artifact.payload) !== artifact.hash) {
+    throw new Error("automatic structured execution-plan input artifact hash mismatch");
+  }
+  const validated = validateAdmissionExecutionPlanArtifact(JSON.parse(artifact.payload), {
+    source: "automatic.structured_execution_plan",
+  }).value;
+  if (validated.assurance !== "executor_verified") {
+    throw new Error("automatic structured execution wrapper assurance mismatch");
+  }
+  if (validated.source.effective_manifest_digest !== instance.manifest_digest) {
+    throw new Error("automatic structured execution plan manifest lineage mismatch");
+  }
+  if (!persistedAdmissionBasisDigest ||
+      validated.source.admission_basis_digest !== persistedAdmissionBasisDigest) {
+    throw new Error("automatic structured execution plan admission basis mismatch");
+  }
+  const manifest = JSON.parse(instance.normalized_manifest) as {
+    stages?: Array<{
+      id?: unknown;
+      loop?: { skill?: unknown };
+      repositorySkill?: { reference?: unknown; packageDigest?: unknown };
+    }>;
+  };
+  const plannerStage = manifest.stages?.find((stage) => stage.id === "admission_planner");
+  const expectedSkill = plannerStage?.repositorySkill?.reference ?? plannerStage?.loop?.skill;
+  const expectedPackageDigest = plannerStage?.repositorySkill?.packageDigest ?? null;
+  if (typeof expectedSkill !== "string" || validated.producer.skill !== expectedSkill ||
+      validated.producer.skill_package_digest !== expectedPackageDigest) {
+    throw new Error("automatic structured execution plan planner provenance mismatch");
+  }
+  return `\`\`\`json ${EXECUTION_PLAN_SCHEMA_V2}\n${JSON.stringify(validated.execution_plan)}\n\`\`\``;
 }
 
 function parentTaskContextFor(store: PipelineStore, parentAttemptId: string): string {
@@ -1174,7 +1229,11 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
       if (!stage || stage.executor.capability !== FOR_EACH_UNIT_CAPABILITY) {
         throw new Error(`pipeline composite stage ${request.stageId} is not active`);
       }
-      const plan = extractExecutionPlan(requestContextForStructuredPlan(request));
+      const plan = extractExecutionPlan(structuredPlanContextFor(
+        instance,
+        request,
+        deps.store.getTaskBranch?.(instance.id)?.plan_digest,
+      ));
       const commandPlan = commandPlanForUnits({
         plan,
         fallbackCommandNames: stage.unitCommandNames ?? [],

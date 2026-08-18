@@ -60,13 +60,15 @@ export function translateMcpServers(mcpServers = {}) {
   return translated;
 }
 
-export function buildOpenCodeConfig({ model, mcpServers = {} }) {
+export function buildOpenCodeConfig({ model, mcpServers = {}, inspection = false }) {
   const profile = resolveOpenCodeModelProfile(model);
   return {
     $schema: "https://opencode.ai/config.json",
     autoupdate: false,
     share: "disabled",
-    permission: { edit: "allow", bash: "allow", webfetch: "allow" },
+    permission: inspection
+      ? { edit: "deny", bash: "deny", webfetch: "deny", task: "deny", external_directory: "deny" }
+      : { edit: "allow", bash: "allow", webfetch: "allow" },
     provider: {
       [profile.providerId]: {
         npm: "@ai-sdk/openai-compatible",
@@ -83,13 +85,13 @@ export function buildOpenCodeConfig({ model, mcpServers = {} }) {
         },
       },
     },
-    mcp: translateMcpServers(mcpServers),
+    mcp: inspection ? {} : translateMcpServers(mcpServers),
   };
 }
 
-export function writeOpenCodeConfig({ model, mcpServers = {}, configDir }) {
+export function writeOpenCodeConfig({ model, mcpServers = {}, configDir, inspection = false }) {
   if (!configDir) throw new Error("configDir is required");
-  const config = buildOpenCodeConfig({ model, mcpServers });
+  const config = buildOpenCodeConfig({ model, mcpServers, inspection });
   mkdirSync(configDir, { recursive: true, mode: 0o700 });
   const configPath = join(configDir, "opencode.json");
   writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });

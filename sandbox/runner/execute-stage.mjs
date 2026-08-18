@@ -64,6 +64,7 @@ import {
   pathInside as containedPath,
   prepareAgentOwnedDirectory,
   prepareAgentOwnedProfileRoot,
+  chmodReadOnlyPreservingExecuteTree,
   restorePersistentAgentPrivateRoots,
 } from "./filesystem-isolation.mjs";
 import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
@@ -81,6 +82,9 @@ import {
   nativeSessionStoragePath,
   sealNativeSessionPackage,
 } from "./native-session-package.mjs";
+import { writeOpenCodeConfig } from "./build-opencode-config.mjs";
+import { packReachableBaseObjects, runRootGit } from "./loop-paths.mjs";
+import { writeCodexAuthFile } from "./loop-agent-environment.mjs";
 
 export { computeWorkspaceTreeOid } from "./repository-control.mjs";
 export { runCapturedProcess } from "./bounded-process.mjs";
@@ -114,6 +118,8 @@ const STANDARD_RECEIPT_ARTIFACT = "standard_receipt";
 // falling through to implement-plan). An unmapped capability, or a mapped one
 // whose package is missing from disk, fails closed; see stagePrompt.
 const STAGE_CAPABILITY_SKILLS = {
+  "admission/plan@1": "admission-plan",
+  "admission/review@1": "review-admission-plan",
   "ce/implement@1": "implement-plan",
   "ce/review@1": "review-change",
   "ce/simplify@1": "simplify-change",
@@ -128,15 +134,32 @@ const STAGE_CAPABILITY_SKILLS = {
   "ce/plan@1": "implement-plan",
 };
 
+const ADMISSION_INSPECTION_STAGES = new Set(["admission_planner", "admission_reviewer"]);
+const ADMISSION_INSPECTION_CAPABILITIES = new Set([
+  "admission/plan@1",
+  "admission/review@1",
+  REPOSITORY_SKILL_CAPABILITY,
+]);
+
+export function isAdmissionInspectionStage(request) {
+  return ADMISSION_INSPECTION_STAGES.has(request?.stageId) &&
+    ADMISSION_INSPECTION_CAPABILITIES.has(request?.capability);
+}
+
 function standardReceiptAuthority(request, { preSubject, postSubject }) {
   const baseSubject = request.expectedSubject ?? request.baseCommit;
+  const admissionRole = request.stageId === "admission_planner" && isAdmissionInspectionStage(request)
+    ? { workerId: "planner", skill: request.repositorySkill?.reference ?? "builtin://admission-plan@1" }
+    : request.stageId === "admission_reviewer" && isAdmissionInspectionStage(request)
+      ? { workerId: "reviewer", skill: request.repositorySkill?.reference ?? "builtin://review-admission-plan@1" }
+      : null;
   return {
     assurance: "semantic_attested",
     producer: {
-      worker_id: "tuner",
-      skill: "builtin://tune@1",
+      worker_id: admissionRole?.workerId ?? "tuner",
+      skill: admissionRole?.skill ?? "builtin://tune@1",
       capability_digest: request.capabilityDigest,
-      skill_package_digest: null,
+      skill_package_digest: admissionRole ? request.repositorySkill?.packageDigest ?? null : null,
     },
     subject: {
       base: baseSubject,
@@ -146,7 +169,7 @@ function standardReceiptAuthority(request, { preSubject, postSubject }) {
     fence: {
       pipeline_instance_id: request.pipelineInstanceId,
       graph_digest: request.manifestDigest,
-      unit_id: "__tune__",
+      unit_id: admissionRole ? request.stageId : "__tune__",
       attempt_id: request.attemptId,
       parent_run_id: request.runId,
       action_attempt_id: request.attemptId,
@@ -169,7 +192,7 @@ function stageReceiptAuthorityContract(request) {
     assurance: authority.assurance,
     subject: authority.subject,
     producer: authority.producer,
-    evidence: "Bind this receipt to exact output evidence for the requested tune action.",
+    evidence: `Bind this receipt to exact output evidence for the requested ${request.stageId} action.`,
   };
 }
 
@@ -379,6 +402,12 @@ export function resolveCommand(config, commandName) {
 }
 
 export function resolveContextInvocation(request) {
+  if (isAdmissionInspectionStage(request)) {
+    if (request.contextPolicy !== "fresh" || request.nativeSessionId !== null) {
+      throw new Error("admission inspection stages require a fresh native-session fence");
+    }
+    return { mode: "fresh", nativeSessionId: null, reconstructed: false, readOnly: true };
+  }
   if (request.contextPolicy === "none") return { mode: "none", nativeSessionId: null, reconstructed: false, readOnly: false };
   if (request.contextPolicy === "fresh") return { mode: "fresh", nativeSessionId: null, reconstructed: false, readOnly: false };
   if (request.contextPolicy === "resume_required") {
@@ -455,7 +484,8 @@ export function materializeRepositorySkill({ request, repoDir, discoveryRoot }) 
 }
 
 export function repositorySkillStageEnvironment(request) {
-  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) {
+  const isolated = request.capability === REPOSITORY_SKILL_CAPABILITY || isAdmissionInspectionStage(request);
+  if (!isolated) {
     const home = "/home/agent";
     return {
       env: [`HOME=${home}`, "USER=agent"],
@@ -470,12 +500,27 @@ export function repositorySkillStageEnvironment(request) {
   const actionDirectory = ensureStageActionParents(request);
   const home = pathInside(actionDirectory, "home", "stage action home");
   prepareAgentOwnedDirectory(home);
-  const env = [`HOME=${home}`, "USER=agent"];
+  const temp = pathInside(actionDirectory, "tmp", "stage action temp");
+  const cache = pathInside(actionDirectory, "cache", "stage action cache");
+  const config = pathInside(actionDirectory, "config", "stage action config");
+  const data = pathInside(actionDirectory, "data", "stage action data");
+  for (const directory of [temp, cache, config, data]) prepareAgentOwnedDirectory(directory);
+  const env = [
+    `HOME=${home}`,
+    "USER=agent",
+    `TMPDIR=${temp}`,
+    `XDG_CACHE_HOME=${cache}`,
+    `XDG_CONFIG_HOME=${config}`,
+    `XDG_DATA_HOME=${data}`,
+  ];
   if (request.agent === "codex") {
     const codexHome = pathInside(actionDirectory, "codex", "stage action codex home");
     prepareAgentOwnedDirectory(codexHome);
     materializeCodexProfileBaseline({ destinationHome: codexHome });
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, codexHome));
+    if (isAdmissionInspectionStage(request) && process.env.CODEX_AUTH_JSON) {
+      writeCodexAuthFile(codexHome, process.env.CODEX_AUTH_JSON);
+    }
     prepareAgentOwnedProfileRoot(codexHome);
     env.push(`CODEX_HOME=${codexHome}`);
     return {
@@ -508,7 +553,7 @@ export function repositorySkillStageEnvironment(request) {
 }
 
 export function lockRepositorySkillStageHome(request) {
-  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return false;
+  if (request.capability !== REPOSITORY_SKILL_CAPABILITY && !isAdmissionInspectionStage(request)) return false;
   const actionDirectory = stageActionDirectory(request);
   if (!existsSync(actionDirectory)) return false;
   chownTree(actionDirectory, 0, 0);
@@ -517,7 +562,7 @@ export function lockRepositorySkillStageHome(request) {
 }
 
 export function lockRepositorySkillStagePersistentProfiles(request, lockPersistentProfiles = lockPersistentAgentPrivateRoots) {
-  if (request.capability !== REPOSITORY_SKILL_CAPABILITY) return [];
+  if (request.capability !== REPOSITORY_SKILL_CAPABILITY && !isAdmissionInspectionStage(request)) return [];
   return lockPersistentProfiles();
 }
 
@@ -539,7 +584,7 @@ export function stagePrompt(
       const root = repositorySkillRoot ?? join(repositorySkillDiscoveryRoot(agent), request.repositorySkill.invocation);
       entry += `\n\n${skillBody(readFileSync(join(root, "SKILL.md"), "utf8"))}`;
     }
-  } else if (request.capability.startsWith("ce/") || request.capability === "core/tune@1") {
+  } else if (request.capability.startsWith("ce/") || request.capability === "core/tune@1" || isAdmissionInspectionStage(request)) {
     const skillName = STAGE_CAPABILITY_SKILLS[request.capability];
     if (!skillName) throw new Error(`stage capability ${request.capability} has no mapped skill`);
     // Fail closed on a missing package. This used to fall back to
@@ -573,9 +618,14 @@ export function stagePrompt(
     const authorizedInputs = request.inputArtifacts?.length
       ? canonicalJson(request.inputArtifacts)
       : "(no authorized input artifacts)";
+    const outputContract = request.stageId === "admission_planner" && isAdmissionInspectionStage(request)
+      ? `Return exactly one JSON object with keys "receipt" and "execution_plan" as your final answer and nothing else. ` +
+        `The receipt must be openthrottle.receipt/v1. For a structured decision, execution_plan must be the ` +
+        `openthrottle.admission-execution-plan-artifact/v1 object bound to this request; otherwise it must be null. `
+      : `Return exactly one openthrottle.receipt/v1 JSON object as your final answer and nothing else. `;
     return `${entry}\n\nThis is one fenced OpenThrottle stage (${request.stageId}/${request.attemptId}) ` +
-      `for capability ${request.capability}. Do not claim gate authority. Return exactly one ` +
-      `openthrottle.receipt/v1 JSON object as your final answer and nothing else. The executor ` +
+      `for capability ${request.capability}. Do not claim gate authority. ` +
+      `${outputContract}The executor ` +
       `will seal that receipt as the required standard_receipt artifact.\n\n` +
       `## Receipt Authority Contract\n${canonicalJson(stageReceiptAuthorityContract(request))}\n\n` +
       `## Authorized input artifacts\n${authorizedInputs}\n\n` +
@@ -597,12 +647,118 @@ export function stagePrompt(
     `## Transition context\n${request.transitionContext || "(initial stage)"}`;
 }
 
+const INSPECTION_MODEL_CREDENTIAL = Object.freeze({
+  claude: "CLAUDE_CODE_OAUTH_TOKEN",
+  codex: "CODEX_AUTH_JSON",
+  opencode: "KIMI_CODE_API_KEY",
+});
+
+export function inspectionProcessEnvironment(request, env = process.env) {
+  if (!isAdmissionInspectionStage(request)) return env;
+  const credential = INSPECTION_MODEL_CREDENTIAL[request.agent];
+  if (!credential) throw new Error(`unsupported admission inspection agent ${request.agent}`);
+  const result = {};
+  for (const name of ["PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR", credential]) {
+    if (request.agent === "codex" && name === credential) continue;
+    if (typeof env[name] === "string" && env[name]) result[name] = env[name];
+  }
+  return result;
+}
+
+export function inspectionAgentPolicyArgs(agent) {
+  if (agent === "claude") {
+    return [
+      "--permission-mode", "dontAsk",
+      "--allowedTools", "Read,Grep,Glob",
+      "--disallowedTools", "Bash,Write,Edit,WebFetch,WebSearch,Task,NotebookEdit",
+    ];
+  }
+  if (agent === "codex") {
+    return ["--sandbox", "read-only", "-c", "sandbox_workspace_write.network_access=false"];
+  }
+  if (agent === "opencode") return [];
+  throw new Error(`unsupported admission inspection agent ${agent}`);
+}
+
+export function prepareAdmissionReadOnlyRepository(request, sourceRepoDir) {
+  if (!isAdmissionInspectionStage(request)) return sourceRepoDir;
+  if (!request.expectedSubject) throw new Error("admission inspection requires an exact sealed repository subject");
+  const actionDirectory = stageActionDirectory(request);
+  rmSync(actionDirectory, { recursive: true, force: true });
+  ensureStageActionParents(request);
+  const destination = pathInside(actionDirectory, "repo-view", "admission read-only repository view");
+  mkdirSync(destination, { recursive: true, mode: 0o755 });
+  const subject = runRootGit(sourceRepoDir, ["rev-parse", request.expectedSubject]);
+  const objectType = runRootGit(sourceRepoDir, ["cat-file", "-t", subject]);
+  if (objectType !== "commit" && objectType !== "tree") {
+    throw new Error("admission read-only repository subject must be a commit or tree");
+  }
+  runRootGit(destination, ["init", "--quiet"]);
+  const packDir = pathInside(pathInside(destination, ".git", "admission read-only git directory"), "objects/pack", "admission read-only object pack");
+  mkdirSync(packDir, { recursive: true, mode: 0o755 });
+  packReachableBaseObjects(sourceRepoDir, join(packDir, "authorized"), subject);
+  if (objectType === "commit") {
+    runRootGit(destination, ["switch", "--quiet", "--detach", subject]);
+  } else {
+    runRootGit(destination, ["read-tree", subject]);
+    runRootGit(destination, ["checkout-index", "--all", "--force"]);
+  }
+  runRootGit(destination, ["config", "remote.origin.url", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
+  runRootGit(destination, ["config", "remote.origin.pushurl", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
+  chmodReadOnlyPreservingExecuteTree(destination);
+  return destination;
+}
+
+function isAdmissionPlannerEnvelope(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === 2 && keys.includes("receipt") && keys.includes("execution_plan") &&
+    value.receipt && typeof value.receipt === "object" && !Array.isArray(value.receipt) &&
+    value.receipt.schema === "openthrottle.receipt/v1";
+}
+
+export function parseAdmissionPlannerOutput(raw, env = process.env) {
+  const sanitized = sanitizeArtifactText(raw, env).trim();
+  if (!sanitized) throw new Error("admission planner did not emit its final envelope");
+  const sources = [];
+  for (const line of sanitized.split("\n").map((entry) => entry.trim()).filter(Boolean)) {
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event?.type === "result" && event.result !== undefined) sources.push(event.result);
+    if (event?.type === "item.completed" && event.item?.type === "agent_message") sources.push(event.item.text);
+    for (const key of ["output", "content", "message"]) {
+      if (event?.[key] !== undefined) sources.push(event[key]);
+    }
+  }
+  if (sources.length === 0) sources.push(sanitized);
+  const envelopes = [];
+  for (const source of sources) {
+    try {
+      const envelope = typeof source === "string"
+        ? parseAgentJson(source, { qualifies: isAdmissionPlannerEnvelope, label: "admission planner envelope" })
+        : source;
+      if (isAdmissionPlannerEnvelope(envelope)) envelopes.push(envelope);
+    } catch {
+      // Keep scanning bounded engine output for the one terminal envelope.
+    }
+  }
+  if (envelopes.length !== 1) {
+    throw new Error(`admission planner emitted ${envelopes.length} final envelopes; expected exactly one`);
+  }
+  return envelopes[0];
+}
+
 export { extractNativeSessionId } from "./native-session-package.mjs";
 
 export function defaultRunAgent({
   request,
   invocation,
   repoDir,
+  skillSourceRepoDir = repoDir,
   proposalPath,
   timeoutMs,
   model,
@@ -621,6 +777,7 @@ export function defaultRunAgent({
   const cleanupErrors = [];
   let bodyError = null;
   let effectiveInvocation = invocation;
+  const inspection = isAdmissionInspectionStage(request);
   try {
     try {
       lockedPersistentProfiles = lockPersistentProfiles(request);
@@ -631,7 +788,7 @@ export function defaultRunAgent({
     const stageEnvironment = repositorySkillStageEnvironment(request);
     const repositorySkillRoot = materializeRepositorySkill({
       request,
-      repoDir,
+      repoDir: skillSourceRepoDir,
       discoveryRoot: stageEnvironment.repositorySkillDiscoveryRoot,
     });
     if (request.capability === REPOSITORY_SKILL_CAPABILITY) {
@@ -666,8 +823,10 @@ export function defaultRunAgent({
         ...(maxTurns ? ["--max-turns", maxTurns] : []),
         ...(model ? ["--model", model] : []),
         ...(reasoningEffort ? ["--effort", reasoningEffort] : []),
-        "--dangerously-skip-permissions",
-        ...(mcpConfig ? ["--mcp-config", mcpConfig, "--strict-mcp-config"] : []),
+        ...(inspection
+          ? inspectionAgentPolicyArgs("claude")
+          : ["--dangerously-skip-permissions"]),
+        ...(!inspection && mcpConfig ? ["--mcp-config", mcpConfig, "--strict-mcp-config"] : []),
         "--setting-sources", "user",
       ];
       command = "claude";
@@ -679,16 +838,27 @@ export function defaultRunAgent({
       stdin = prompt;
     } else if (agent === "opencode") {
       if (!model) throw new Error("OpenCode stage execution requires a sealed model selection");
+      if (inspection) {
+        const configDir = pathInside(stageActionDirectory(request), "opencode-config", "inspection OpenCode config");
+        writeOpenCodeConfig({ model, configDir, inspection: true });
+        prepareAgentOwnedDirectory(configDir);
+        env.push(`OPENCODE_CONFIG_DIR=${configDir}`);
+      }
       command = "opencode";
       // `opencode run` reads the message from piped stdin when no positional
       // message argument is supplied.
-      args = ["run", "--format", "json", "--model", model, "--dir", repoDir, "--auto", ...(effectiveInvocation.mode === "resume" ? ["--session", effectiveInvocation.nativeSessionId] : [])];
+      args = ["run", "--format", "json", "--model", model, "--dir", repoDir,
+        ...(!inspection ? ["--auto"] : []),
+        ...(effectiveInvocation.mode === "resume" ? ["--session", effectiveInvocation.nativeSessionId] : [])];
       stdin = prompt;
     } else if (agent === "codex") {
       command = "codex";
       // "-" tells Codex to read the prompt from stdin, in resume mode exactly
       // as in a fresh launch.
-      args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
+      args = ["exec", "--json",
+        ...(inspection
+          ? inspectionAgentPolicyArgs("codex")
+          : ["--dangerously-bypass-approvals-and-sandbox"]),
         ...(process.env.OT_CODEX_HOOK_TRUST_FLAG === "1" ? ["--dangerously-bypass-hook-trust"] : []),
         "--skip-git-repo-check", "-C", repoDir, ...(model ? ["-m", model] : []),
         ...(reasoningEffort ? ["-c", `model_reasoning_effort=\"${reasoningEffort}\"`] : []),
@@ -700,6 +870,7 @@ export function defaultRunAgent({
     const result = runWithAgentProcessFence(
       () => runCapturedProcess("gosu", ["agent", "env", ...env, command, ...args], {
         cwd: repoDir,
+        env: inspectionProcessEnvironment(request),
         input: stdin,
         timeout: timeoutMs,
       }),
@@ -731,8 +902,8 @@ export function defaultRunAgent({
     if (engineExited && fellBackToFresh && !reportedNativeSessionId) {
       throw new Error("fresh native-session fallback completed without reporting a replacement session id");
     }
-    const nativeSessionId = resumedNativeSessionId ?? (engineExited ? reportedNativeSessionId : null);
-    if (engineExited) {
+    const nativeSessionId = inspection ? null : resumedNativeSessionId ?? (engineExited ? reportedNativeSessionId : null);
+    if (engineExited && !inspection) {
       let sealedNativeSessionPackage;
       try {
         sealedNativeSessionPackage = sealNativeSessionPackage({
@@ -755,6 +926,9 @@ export function defaultRunAgent({
         throw new Error([message, engineTail && `engine diagnostics: ${engineTail}`].filter(Boolean).join("\n"));
       }
     }
+    const plannerOutput = request.stageId === "admission_planner" && isAdmissionInspectionStage(request) && engineExited
+      ? parseAdmissionPlannerOutput(result.stdout ?? "", process.env)
+      : null;
     return {
       exitCode: result.status,
       signal: result.signal,
@@ -774,8 +948,9 @@ export function defaultRunAgent({
         ? parseAgentJson(proposalRead.stdout, { qualifies: isStageProposalShaped, label: "proposal" })
         : undefined,
       receipt: expectsStandardReceipt && engineExited
-        ? parseLoopReceipt(result.stdout ?? "", process.env)
+        ? plannerOutput?.receipt ?? parseLoopReceipt(result.stdout ?? "", process.env)
         : undefined,
+      executionPlan: plannerOutput?.execution_plan ?? undefined,
     };
   } catch (error) {
     bodyError = error;
@@ -1106,10 +1281,12 @@ export function executeStage({
     if (!execution) {
       try {
         const agentDefault = config.agent_defaults?.[request.agent];
+        const agentRepoDir = prepareAdmissionReadOnlyRepository(request, repoDir);
         execution = runAgent({
           request,
           invocation,
-          repoDir,
+          repoDir: agentRepoDir,
+          skillSourceRepoDir: repoDir,
           proposalPath,
           timeoutMs,
           model: agentDefault?.model ?? (config.agent === request.agent ? config.model : undefined),
@@ -1200,6 +1377,7 @@ export function executeStage({
           postSubject: gatedSubject,
         }),
         requiredArtifacts: request.requiredArtifacts,
+        executionPlan: execution.executionPlan,
         env: redactionEnv,
       });
     }
