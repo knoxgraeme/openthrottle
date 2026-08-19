@@ -20,6 +20,7 @@ import {
 import { validateCitationGateDecision } from "./citation-gate.js";
 import {
   coordinatePipelineEvent,
+  requiredArtifactsForPipelineEvent,
   type PipelineCoordinatorEvent,
   type PipelineEventArtifact,
 } from "./coordinator.js";
@@ -592,7 +593,7 @@ export function evaluateStageGate(
   if (new Set(artifacts.map((artifact) => artifact.kind)).size !== artifacts.length) {
     throw new Error("stage result contains duplicate artifact kinds");
   }
-  for (const required of ["stage_result", ...stage.evaluator.required_artifacts]) {
+  for (const required of requiredArtifactsForPipelineEvent(stage, event)) {
     if (!artifacts.some((artifact) => artifact.kind === required)) {
       throw new Error(`stage result is missing required ${required}`);
     }

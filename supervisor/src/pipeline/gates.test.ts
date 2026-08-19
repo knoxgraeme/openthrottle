@@ -236,6 +236,14 @@ describe("deterministic supervisor stage gates", () => {
         runtime,
         authorizedCapabilities: manifest.manifest.requires.capabilities,
         taskType,
+        ...(manifestKey === "core/automatic@1" ? {
+          admission: {
+            planner: { reference: "builtin://admission-plan@1", package_digest: null },
+            reviewer: { reference: "builtin://review-admission-plan@1", package_digest: null },
+            admission_basis_digest: "d".repeat(64),
+            effective_manifest_digest: manifest.digest,
+          },
+        } : {}),
       },
     });
     const instance = pipelines.getInstanceForSession("session-1")!;
@@ -1182,6 +1190,23 @@ describe("deterministic supervisor stage gates", () => {
     fixture.db.prepare("UPDATE pipeline_stage_attempts SET native_session_id = ? WHERE id = ?")
       .run("native-original", fixture.attempt.id);
     expect(() => evaluateStageGate(fixture.pipelines, input)).toThrow(/native session fence/);
+  });
+
+  it("settles a retryable semantic producer failure without fabricating its missing receipt", () => {
+    const fixture = setup("core/automatic@1");
+    const success = event(fixture, "success");
+    success.artifacts = success.artifacts!.filter((entry) => entry.kind === "stage_result");
+    expect(() => evaluateStageGate(fixture.pipelines, success)).toThrow(/missing required standard_receipt/);
+
+    const retryable = event(fixture, "retryable_infrastructure_failure");
+    retryable.artifacts = retryable.artifacts!.filter((entry) => entry.kind === "stage_result");
+
+    const advanced = processStageEvidence(fixture.pipelines, retryable);
+
+    expect(advanced).toMatchObject({
+      status: "dispatchable",
+      active_stage_id: "admission_planner",
+    });
   });
 
   it("accepts only the sealed legacy Linear ticket identity after v35 qualifies the durable instance", () => {

@@ -280,6 +280,13 @@ Provider and human events cannot enter other stage kinds. Duplicate event ids
 return the previously committed result; a stale generation, request, run, or Git
 subject is rejected.
 
+A semantic stage that fails before its agent emits the evaluator-required
+receipt may settle `retryable_infrastructure_failure` with its executor-sealed
+`stage_result` alone. The event and artifact outcomes must agree, and the
+exception never applies to success, semantic failure/repair, or human-decision
+outcomes. This lets the declared infrastructure retry run without fabricating
+semantic evidence that the failed producer never authored.
+
 The default `core/implement@4` graph starts at implementation, then proceeds
 through semantic review, a simplification stage that may no-op, configured
 command gates, publication, and provider evidence. Semantic repair uses the

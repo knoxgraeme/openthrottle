@@ -90,6 +90,24 @@ export interface PipelineCoordinatorEvent {
   artifacts?: PipelineEventArtifact[];
 }
 
+export function requiredArtifactsForPipelineEvent(
+  stage: PipelineStage,
+  event: Pick<PipelineCoordinatorEvent, "kind" | "outcome">
+): string[] {
+  // A semantic producer that fails before emitting its authoritative receipt
+  // can still seal executor-observed stage_result evidence. Requiring the
+  // missing semantic receipt would make the retry event impossible to ingest
+  // and strand the attempt instead of consuming its infrastructure retry.
+  // Successful, semantic-failure, and human-decision outcomes still require
+  // every artifact declared by the evaluator.
+  const evaluatorArtifacts = event.kind === "stage_result" &&
+      event.outcome === "retryable_infrastructure_failure" &&
+      stage.evaluator.kind === "semantic"
+    ? []
+    : stage.evaluator.required_artifacts;
+  return [...new Set(["stage_result", ...evaluatorArtifacts])];
+}
+
 export interface PipelineReductionInput {
   manifest: PipelineManifest;
   instance: PipelineInstance;
@@ -326,7 +344,7 @@ function verifyInput(input: PipelineReductionInput): PipelineStage {
     }
   }
   if (event.kind !== "stop" && event.kind !== "supersede" && event.kind !== "effect_failed") {
-    for (const required of ["stage_result", ...stage.evaluator.required_artifacts]) {
+    for (const required of requiredArtifactsForPipelineEvent(stage, event)) {
       if (!artifacts.some((artifact) => artifact.kind === required)) {
         throw new Error(`stage ${stage.id} result is missing required ${required} artifact`);
       }
