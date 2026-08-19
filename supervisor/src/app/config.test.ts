@@ -58,7 +58,7 @@ describe("loadConfig", () => {
       deployToken: "deploy",
       port: 8080,
       taskTimeout: 7200,
-      reviewFanoutConcurrency: 3,
+      reviewFanoutConcurrency: 5,
       allowLinearMerge: true,
       defaultAgent: "codex",
       githubReadToken: "github-read-token",

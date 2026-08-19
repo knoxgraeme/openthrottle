@@ -122,7 +122,7 @@ export function loadConfig(): Config {
     kimiCodeApiKey: process.env.KIMI_CODE_API_KEY,
 
     taskTimeout: optionalInt("TASK_TIMEOUT", 7200),
-    reviewFanoutConcurrency: optionalInt("REVIEW_FANOUT_CONCURRENCY", 3),
+    reviewFanoutConcurrency: optionalInt("REVIEW_FANOUT_CONCURRENCY", 5),
     orphanGraceMinutes: optionalInt("ORPHAN_GRACE_MINUTES", 5),
     runtimeResourceRetentionMinutes: optionalInt("RUNTIME_RESOURCE_RETENTION_MINUTES", 60),
     runOutcomeRetentionDays: optionalInt("RUN_OUTCOME_RETENTION_DAYS", 180),

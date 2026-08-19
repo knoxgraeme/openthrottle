@@ -221,8 +221,15 @@ function mutableEditableResources(): {
   return { root, graphPath, skillDirectory, skillDirectories };
 }
 
-async function runInitWithSnapshotState(state: string) {
+async function runInitWithSnapshotState(state: string, options: {
+  args?: string[];
+  existingConfig?: string;
+  confirmations?: boolean[];
+} = {}) {
   const directory = temporaryProject();
+  if (options.existingConfig !== undefined) {
+    writeFileSync(join(directory, ".openthrottle.yml"), options.existingConfig);
+  }
   const originalDirectory = process.cwd();
   const log = {
     info: vi.fn(),
@@ -232,10 +239,29 @@ async function runInitWithSnapshotState(state: string) {
   };
   const spinner = { start: vi.fn(), stop: vi.fn() };
   const outro = vi.fn();
+  const cancel = vi.fn();
+  const confirmations = [...(options.confirmations ?? [])];
+  const confirm = vi.fn(async () => confirmations.shift() ?? true);
+  const promptConfigMock = vi.fn(async () => ({
+    project: completeProjectConfig(),
+    registration: {
+      repo: "acme/widget",
+      baseBranch: "main",
+      controlProvider: "github" as const,
+    },
+  }));
+  const registerTargetRepositoryMock = vi.fn(async () => ({
+    registration: { github_repo: "acme/widget", base_branch: "main" },
+    readiness: {
+      github: "ready" as const,
+      webhook: "created" as const,
+      snapshot: { name: "openthrottle", state },
+    },
+  }));
   vi.resetModules();
   vi.doMock("@clack/prompts", () => ({
-    cancel: vi.fn(),
-    confirm: vi.fn(async () => true),
+    cancel,
+    confirm,
     group: vi.fn(),
     intro: vi.fn(),
     isCancel: vi.fn(() => false),
@@ -249,33 +275,28 @@ async function runInitWithSnapshotState(state: string) {
   try {
     process.chdir(directory);
     const { default: initWithMockPrompts } = await import("./init.js");
-    await initWithMockPrompts([], {
+    await initWithMockPrompts(options.args ?? [], {
       env: configuredSupervisorEnv,
       request: async (path) => Response.json(path === "/capabilities" ? validCapabilities : { ok: true }),
       detectRepository: () => ({ repo: "acme/widget", baseBranch: "main" }),
       detectProject: () => ({ pm: "npm", test: "npm test", build: "npm run build", lint: "npm run lint" }),
-      promptConfig: async () => ({
-        project: completeProjectConfig(),
-        registration: {
-          repo: "acme/widget",
-          baseBranch: "main",
-          controlProvider: "github",
-        },
-      }),
+      promptConfig: promptConfigMock,
       installLocalSkills: () => [],
-      registerTargetRepository: async () => ({
-        registration: { github_repo: "acme/widget", base_branch: "main" },
-        readiness: {
-          github: "ready",
-          webhook: "created",
-          snapshot: { name: "openthrottle", state },
-        },
-      }),
+      registerTargetRepository: registerTargetRepositoryMock,
     });
   } finally {
     process.chdir(originalDirectory);
   }
-  return { log, outro, spinner };
+  return {
+    directory,
+    log,
+    outro,
+    spinner,
+    cancel,
+    confirm,
+    promptConfig: promptConfigMock,
+    registerTargetRepository: registerTargetRepositoryMock,
+  };
 }
 
 describe("init project detection", () => {
@@ -432,11 +453,12 @@ describe("init project detection", () => {
       },
       opencodeDir
     );
-    expect(parse(readFileSync(join(opencodeDir, ".openthrottle.yml"), "utf8"))).toMatchObject({
+    const openCodeRaw = readFileSync(join(opencodeDir, ".openthrottle.yml"), "utf8");
+    expect(parse(openCodeRaw)).toMatchObject({
       agent: "opencode",
       model: "kimi-code/kimi-for-coding",
-      intents: { implement: { admission_mode: "automatic" } },
     });
+    expect(openCodeRaw).not.toContain("admission_mode:");
 
     const editableOpenCodeDir = temporaryProject();
     writeProjectConfig(
@@ -453,10 +475,12 @@ describe("init project detection", () => {
       editableOpenCodeDir,
       { editableSkills: true }
     );
-    expect(parse(readFileSync(join(editableOpenCodeDir, ".openthrottle.yml"), "utf8"))).toMatchObject({
+    const editableOpenCodeRaw = readFileSync(join(editableOpenCodeDir, ".openthrottle.yml"), "utf8");
+    expect(parse(editableOpenCodeRaw)).toMatchObject({
       agent: "opencode",
-      intents: { implement: { admission_mode: "automatic" } },
+      intents: { implement: { default_graph: "simple_editable" } },
     });
+    expect(editableOpenCodeRaw).not.toContain("admission_mode:");
 
     const claudeDir = temporaryProject();
     writeProjectConfig(
@@ -530,13 +554,13 @@ describe("init project detection", () => {
       repo: "acme/widget",
       controlProvider: "linear",
       linearTeamKey: "ENG",
-    }, false)).toBe(
-      "Commit .openthrottle.yml, then delegate an issue from the configured Linear team."
+    })).toBe(
+      "Commit .openthrottle.yml and .openthrottle/, then delegate an issue from the configured Linear team."
     );
     expect(initOutro({
       repo: "acme/widget",
       controlProvider: "github",
-    }, true)).toBe(
+    })).toBe(
       "Commit .openthrottle.yml and .openthrottle/, then open or label a GitHub issue with `openthrottle`."
     );
   });
@@ -748,14 +772,62 @@ describe("init project detection", () => {
   });
 
   it("still completes init when registration reports an active snapshot", async () => {
-    const { log, outro, spinner } = await runInitWithSnapshotState("active");
+    const { directory, log, outro, spinner } = await runInitWithSnapshotState("active");
 
     expect(process.exitCode).toBeUndefined();
     expect(spinner.stop).toHaveBeenCalledWith("Registered acme/widget on main");
     expect(log.success).toHaveBeenCalledWith(
       "GitHub webhook created; Daytona snapshot openthrottle is active."
     );
+    expect(existsSync(join(directory, ".openthrottle/graphs/simple.json"))).toBe(true);
+    expect(existsSync(join(directory, ".openthrottle/skills/implement-plan/SKILL.md"))).toBe(true);
+    expect(parse(readFileSync(join(directory, ".openthrottle.yml"), "utf8"))).toMatchObject({
+      default_graph: "simple_editable",
+      intents: {
+        implement: {
+          admission_mode: "automatic",
+          planner_skill: "repo://admission-plan",
+          reviewer_skill: "repo://review-admission-plan",
+        },
+      },
+    });
     expect(outro).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an existing config and stops before prompts or registration when replacement is declined", async () => {
+    const original = "schema: openthrottle.config/v1\ndefault_graph: existing\n";
+    const result = await runInitWithSnapshotState("active", {
+      existingConfig: original,
+      confirmations: [false],
+    });
+
+    expect(readFileSync(join(result.directory, ".openthrottle.yml"), "utf8")).toBe(original);
+    expect(existsSync(join(result.directory, ".openthrottle"))).toBe(false);
+    expect(result.promptConfig).not.toHaveBeenCalled();
+    expect(result.registerTargetRepository).not.toHaveBeenCalled();
+    expect(result.cancel).toHaveBeenCalledWith(expect.stringContaining("no repository was registered"));
+  });
+
+  it("replaces an existing config only after the explicit replacement and apply confirmations", async () => {
+    const result = await runInitWithSnapshotState("active", {
+      existingConfig: "schema: openthrottle.config/v1\ndefault_graph: existing\n",
+      confirmations: [true, true, true],
+    });
+
+    expect(parse(readFileSync(join(result.directory, ".openthrottle.yml"), "utf8"))).toMatchObject({
+      default_graph: "simple_editable",
+      intents: { implement: { admission_mode: "automatic" } },
+    });
+    expect(result.registerTargetRepository).toHaveBeenCalledOnce();
+  });
+
+  it("previews a fresh editable scaffold without writing files or registering the repository", async () => {
+    const result = await runInitWithSnapshotState("active", { args: ["--dry-run"] });
+
+    expect(existsSync(join(result.directory, ".openthrottle.yml"))).toBe(false);
+    expect(existsSync(join(result.directory, ".openthrottle"))).toBe(false);
+    expect(result.registerTargetRepository).not.toHaveBeenCalled();
+    expect(result.outro).toHaveBeenCalledWith(expect.stringContaining("Dry run only"));
   });
 
   it("scaffolds the editable implementation and automatic-admission packages under .openthrottle", () => {
@@ -1451,12 +1523,12 @@ describe("init project detection", () => {
   });
 
   it("parses init profile selection without weakening existing option validation", () => {
-    expect(parseInitArgs(["--profile", "prod", "--editable-skills", "--dry-run"])).toEqual({
+    expect(parseInitArgs(["--profile", "prod", "--dry-run"])).toEqual({
       profile: "prod",
-      editableSkills: true,
       dryRun: true,
     });
     expect(() => parseInitArgs(["--profile"])).toThrow("--profile requires");
+    expect(() => parseInitArgs(["--editable-skills"])).toThrow("Unknown init option");
     expect(() => parseInitArgs(["--unknown"])).toThrow("Unknown init option");
   });
 

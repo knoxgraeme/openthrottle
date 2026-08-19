@@ -91,7 +91,7 @@ const SIMPLE_IMPLEMENT_DESCRIPTION = "Staged CE implementation from a pre-approv
 // their normalized manifest bytes. Bump this identity version whenever that
 // happens so an already-accepted manifest identity is never silently reused.
 const REPOSITORY_GRAPH_COMPILER_IDENTITY_VERSION = 2;
-const AUTOMATIC_MANIFEST_COMPILER_VERSION = "automatic-manifest-compiler/v1";
+const AUTOMATIC_MANIFEST_COMPILER_VERSION = "automatic-manifest-compiler/v2";
 const DEFAULT_REPOSITORY_TASK_TIMEOUT_SECONDS = 7_200;
 type BuiltinGraphReference = keyof typeof BUILTIN_GRAPHS;
 
@@ -764,6 +764,33 @@ export async function handleCreated(
         coordinator.catalog,
         repositoryConfig.config.pipelines?.[taskType] ?? taskType
       );
+    const automaticSimpleManifest = authority.kind === "automatic" &&
+      authority.candidates[0].graph_ref !== "core/simple@1"
+      ? await resolvePipelineSelection(
+        repositoryConfig,
+        {
+          kind: "direct",
+          graph_id: repositoryConfig.config.intents?.implement?.default_graph ??
+            repositoryConfig.config.default_graph,
+          explicit: false,
+        },
+        (path) => providers.repositoryReader.getRepositoryFileAtCommit(
+          selectedRepository.repo,
+          remote.baseCommit,
+          path
+        ),
+        (path) => providers.repositoryReader.getRepositoryDirectoryAtCommit(
+          selectedRepository.repo,
+          remote.baseCommit,
+          path
+        ),
+        coordinator.runtime,
+        coordinator.catalog,
+        selectedAgent,
+        cfg.taskTimeout,
+        (pipelineId, version) => coordinator.store.getAcceptedManifestDigest(pipelineId, version)
+      )
+      : undefined;
     const automaticBasis = authority.kind === "automatic"
       ? buildAdmissionBasis({
         schema: "openthrottle.admission-basis/v1",
@@ -823,6 +850,7 @@ export async function handleCreated(
           packageDigest: admissionSkills!.reviewer.package_digest,
           ...(admissionSkills!.reviewer.package ? { package: admissionSkills!.reviewer.package } : {}),
         },
+        ...(automaticSimpleManifest ? { simpleCandidateManifest: automaticSimpleManifest } : {}),
       })
       : selectedManifest;
     // Fail closed here, before the repository snapshot, the capacity preflight,

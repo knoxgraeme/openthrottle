@@ -17,14 +17,14 @@ Usage:
                                     read-only readiness report; --yes
                                     pre-approves mutations; --legacy-checklist
                                     prints the manual secrets checklist.
-  openthrottle init [--profile <name>] [--editable-skills] [--dry-run]
+  openthrottle init [--profile <name>] [--dry-run]
                                     Register the current GitHub repository and
                                     control route, install local authoring/operator
                                     skills, verify readiness, and write
-                                    .openthrottle.yml. --profile selects saved
-                                    onboarding state; the optional flag also
-                                    scaffolds the editable simple pipeline;
-                                    --dry-run prints its refresh classifications
+                                    .openthrottle.yml plus the repository-owned
+                                    editable simple pipeline and admission skills.
+                                    --profile selects saved onboarding state;
+                                    --dry-run prints refresh classifications
                                     without writing or registering anything.
   openthrottle plan validate <file.md>
                                     Validate the plan's execution-plan block.

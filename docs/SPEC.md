@@ -94,9 +94,12 @@ is unconditional for every new generation.
 
 Automatic admission is selected per implementation intent with
 `admission_mode: automatic`. `openthrottle init` writes that mode for new
-repository configurations. OpenCode activations use direct default-graph
-routing until the automatic pipeline's structured execution path supports
-OpenCode. An absent value or `legacy` preserves default-graph selection and
+Claude and Codex repository configurations. Its semantic `simple` candidate is
+the configured implement default graph; when that graph is repository-owned,
+the automatic-manifest compiler pins its exact initial and repair implementation
+loop packages into the simple tail. OpenCode initialization omits automatic
+mode and uses direct default-graph routing until the automatic pipeline's
+structured execution path supports OpenCode. An absent value or `legacy` preserves default-graph selection and
 missing-plan rejection for existing or explicitly legacy configurations. A
 complete explicit simple selection or complete structured plan remains
 authoritative and bypasses the automatic planner. Automatic planning cannot be
@@ -1395,7 +1398,7 @@ Optional/defaulted:
   86,400 seconds. A structured composite parent may extend its immutable
   `expires_at` up to the sealed graph phase maximum, also capped at 86,400
   seconds;
-- `REVIEW_FANOUT_CONCURRENCY=3`, bounded from 1 through 8, caps concurrently
+- `REVIEW_FANOUT_CONCURRENCY=5`, bounded from 1 through 8, caps concurrently
   active review-persona subactions within one sandbox. Setting it to 1 restores
   deterministic serial dispatch ordering without a code change;
 - `ORPHAN_GRACE_MINUTES=5`,
@@ -1442,8 +1445,8 @@ fresh checkout runnable, and unit worktrees are fresh checkouts.
 An implement intent may set `admission_mode: legacy | automatic` and may bind
 `planner_skill` and `reviewer_skill` through declared `builtin://` or `repo://`
 references. Missing mode is legacy. `openthrottle init` writes `automatic` for
-new configurations, and this repository explicitly enables it. OpenCode
-activations use direct routing while their configured mode remains automatic.
+new Claude and Codex configurations, and this repository explicitly enables it.
+OpenCode initialization omits the mode and uses direct routing.
 Existing configurations may retain missing-mode or explicit `legacy` behavior.
 
 ## CLI contract
@@ -1482,9 +1485,10 @@ Linear team fields are required only for Linear and rejected for GitHub.
 Re-registering the same repository may switch its future control route
 atomically; already-admitted tickets and sessions retain their pinned provider,
 and a Linear team route may never be transferred to another repository. Its
-explicit `--editable-skills` option transactionally writes
+default initialization transactionally writes
 an editable `simple_editable` repository graph, the exact referenced
-`implement-plan` package closure under `.openthrottle/skills/`, and
+`implement-plan`, `admission-plan`, and `review-admission-plan` package closures
+under `.openthrottle/skills/`, and
 `.openthrottle/skills.lock.json`. The lock pins the OpenThrottle release plus
 the upstream and scaffold graph, package, and file digests and binds those
 fields with a self-integrity digest. The package closure has the same 64-file

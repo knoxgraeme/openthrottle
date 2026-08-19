@@ -11,6 +11,7 @@ import {
   resolvePipelineReference,
   validatePipelineManifest,
   type AutomaticManifestSkillBinding,
+  type RepositorySkillPackage,
 } from "./manifest.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
@@ -351,6 +352,61 @@ describe("pipeline manifest validation", () => {
       });
     expect(dualOverride.manifest.stages.filter((stage) => stage.repositorySkill)).toHaveLength(2);
     expect(dualOverride.manifest.requires.capabilities).not.toContain("agent/repository-skill@1");
+  });
+
+  it("binds the repository implementation package into both automatic simple implementation stages", () => {
+    const path = fileURLToPath(new URL("../../pipelines/catalog.yaml", import.meta.url));
+    const runtime = buildInstalledRuntimeDescriptor("openthrottle-snapshot/v14");
+    const catalog = loadPipelineCatalog(path, runtime.descriptor);
+    const template = resolvePipelineReference(catalog, "automatic");
+    const simpleCandidate = structuredClone(resolvePipelineReference(catalog, "implement"));
+    const implementationPackage = {
+      ...repositorySkillPackage(),
+      reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/implement-plan`,
+      invocation: "implement-plan",
+      directory: ".openthrottle/skills/implement-plan",
+      files: [{
+        path: ".openthrottle/skills/implement-plan/SKILL.md",
+        blobSha: "c".repeat(40),
+        digest: "d".repeat(64),
+      }],
+    } as RepositorySkillPackage;
+    for (const id of ["implementation", "repair_implementation"]) {
+      const stage = simpleCandidate.manifest.stages.find((candidate) => candidate.id === id)!;
+      stage.loop = {
+        id: id === "implementation" ? "implementation-loop" : "repair-implementation-loop",
+        skill: "repo://implement-plan",
+        input_scope: "graph",
+        receipt: "unit_completion",
+        max_parallel: 1,
+        max_rounds: 8,
+        timeout_seconds: 7_200,
+      };
+      stage.executor.capability = "agent/repository-skill@1";
+      stage.repositorySkill = implementationPackage;
+    }
+    simpleCandidate.digest = "9".repeat(64);
+
+    const compiled = compileAutomaticManifest({
+      template,
+      compilerVersion: "automatic-manifest-compiler/v2",
+      pinnedBase: "a".repeat(40),
+      candidatePolicy: [".openthrottle/graphs/simple.json", "core/structured@3"],
+      runtimeRelease: runtime.descriptor.release,
+      capabilityDigest: runtime.digest,
+      planner: { reference: "builtin://admission-plan@1", packageDigest: null },
+      reviewer: { reference: "builtin://review-admission-plan@1", packageDigest: null },
+      simpleCandidateManifest: simpleCandidate,
+    });
+
+    for (const id of ["simple_implementation", "simple_repair_implementation"]) {
+      expect(compiled.manifest.stages.find((stage) => stage.id === id)).toMatchObject({
+        executor: { kind: "agent", capability: "agent/repository-skill@1" },
+        loop: { skill: "repo://implement-plan" },
+        repositorySkill: { invocation: "implement-plan" },
+      });
+    }
+    expect(compiled.manifest.requires.capabilities).toContain("agent/repository-skill@1");
   });
 
   it("rejects ordinary loop bindings in directly loaded catalog manifests", () => {

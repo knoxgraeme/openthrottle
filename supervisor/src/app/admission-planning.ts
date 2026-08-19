@@ -22,7 +22,7 @@ export const DEFAULT_ADMISSION_REVIEWER_SKILL = "builtin://review-admission-plan
 
 export interface AdmissionCandidate {
   graph_id: "simple" | "structured";
-  graph_ref: typeof AUTOMATIC_SIMPLE_REF | typeof AUTOMATIC_STRUCTURED_REF;
+  graph_ref: string;
 }
 
 export type AdmissionAuthority =
@@ -219,20 +219,22 @@ function extractExecutionPlan(context: string): ExecutionPlanContractV2 | undefi
 function automaticCandidates(config: RepositoryConfigContract): [AdmissionCandidate, AdmissionCandidate] {
   const intent = config.intents?.implement;
   const allowed = new Set(intent?.allowed_graphs ?? [config.default_graph]);
-  const simple = config.graphs.find((entry) =>
-    entry.id === "simple" && entry.kind === "builtin" && entry.ref === AUTOMATIC_SIMPLE_REF
-  );
+  const simpleId = intent?.default_graph ?? config.default_graph;
+  const simple = config.graphs.find((entry) => entry.id === simpleId);
   const structured = config.graphs.find((entry) =>
     entry.id === "structured" && entry.kind === "builtin" && entry.ref === AUTOMATIC_STRUCTURED_REF
   );
-  if (!simple || !allowed.has(simple.id)) {
-    throw new Error(`automatic admission requires allowed graph simple backed by ${AUTOMATIC_SIMPLE_REF}`);
+  if (!simple || !allowed.has(simple.id) ||
+      (simple.kind === "builtin" && simple.ref !== AUTOMATIC_SIMPLE_REF)) {
+    throw new Error(
+      `automatic admission requires its allowed default graph to be a repository graph or ${AUTOMATIC_SIMPLE_REF}`
+    );
   }
   if (!structured || !allowed.has(structured.id)) {
     throw new Error(`automatic admission requires allowed graph structured backed by ${AUTOMATIC_STRUCTURED_REF}`);
   }
   return [
-    { graph_id: "simple", graph_ref: AUTOMATIC_SIMPLE_REF },
+    { graph_id: "simple", graph_ref: simple.ref },
     { graph_id: "structured", graph_ref: AUTOMATIC_STRUCTURED_REF },
   ];
 }
