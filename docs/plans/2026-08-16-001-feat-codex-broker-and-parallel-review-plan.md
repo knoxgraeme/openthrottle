@@ -2,16 +2,15 @@
 title: "Codex token broker, then concurrent review fanout - Plan"
 type: feat
 date: 2026-08-16
-status: planned
 origin: docs/plans/2026-07-22-001-feat-repository-configurable-structured-workflows-plan.md
 ---
 
 # Codex token broker, then concurrent review fanout
 
 Phased, individually testable delivery of intra-run parallelism, starting with
-the credential fix that makes Codex an equal citizen. Each phase ends with a
-live dogfood gate before the next begins. Phase 3 (parallel units) is an
-explicit decision point, not a commitment.
+the credential fix that makes Codex an equal citizen. Phases 0 through 2 have
+shipped. Phase 3 is now specified in the dedicated
+[parallel structured units plan](2026-08-19-1232-feat-parallel-structured-units-plan.md).
 
 ## Why now
 
@@ -129,14 +128,14 @@ Tests and gates:
 - Rollback: concurrency config back to 1 restores serial behavior without
   code changes.
 
-## Phase 3 — parallel units (decision point, not scheduled)
+## Phase 3 — parallel structured units
 
-Only after Phase 2's dogfood gate. Scope sketch, per the origin plan's
-deferred list: additive plan-schema fields for conflict groups/resource
-claims; lead-assisted wave selection extending R35 beyond order-only;
-relaxing the one-active-action lease (R14) behind config; sibling worktrees
-concurrent, integration strictly serial always. Requires its own plan
-document with the Phase 1/2 learnings folded in.
+The complete implementation contract now lives in the
+[Phase 3 plan](2026-08-19-1232-feat-parallel-structured-units-plan.md). It first
+delivers deterministic, claim-safe parallel waves with isolated writable
+workers and serial integration. Lead-selected scheduling, safe splits,
+continuation, and budget-aware wind-down follow only after that mechanical
+layer passes its live gate.
 
 ## Dogfooding thread
 
