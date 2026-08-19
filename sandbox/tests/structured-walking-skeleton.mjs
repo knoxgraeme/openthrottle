@@ -17,7 +17,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -1515,7 +1515,23 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`[walking-skeleton] FAILED: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+export {
+  POST_BOOTSTRAP_COMMAND,
+  TEST_COMMAND,
+  buildTwoUnitPlan,
+  createDockerSandboxRuntime,
+  createFixtureRepo,
+  installClaudeStubShadow,
+  pinSandboxRootMode,
+  readRuntimeDescriptor,
+  repositoryWriter,
+  startContainer,
+  stopContainer,
+};
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(`[walking-skeleton] FAILED: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}

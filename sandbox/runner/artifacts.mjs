@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
 import { CAPABILITY_CONTRACTS, canonicalJson } from "./capabilities.mjs";
+import {
+  ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES,
+  validateAdmissionDecision,
+  validateAdmissionExecutionPlanArtifact,
+  validateAdmissionReview,
+} from "./admission-contracts.mjs";
 
 export const STAGE_OUTCOMES = Object.freeze([
   "success",
@@ -86,7 +92,7 @@ const SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+
 const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const MAX_ARTIFACT_PAYLOAD_BYTES = 12 * 1024;
 const MAX_TUNE_ARTIFACT_PAYLOAD_BYTES = 768 * 1024;
-export const ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES = 320 * 1024;
+export { ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES };
 // Kept byte-identical with contracts/src/receipts.ts. Sixteen command receipts
 // can enter one bounded prior-evidence envelope, so these diagnostics are byte
 // bounded independently of the outer artifact limit.
@@ -398,68 +404,17 @@ function receiptPayload(type, value, env) {
   }
   if (type === "admission_decision") {
     const payload = exactPayload(value, "standard receipt payload", new Set(["decision"]), env);
-    const decision = exactObject(payload.decision, "standard receipt payload decision", new Set([
-      "schema", "route", "rationale", "questions", "admission_basis_digest",
-      "effective_manifest_digest", "generated_plan_digest",
-    ]));
-    if (decision.schema !== "openthrottle.admission-decision/v1") {
-      throw new Error("standard receipt payload decision has an invalid schema");
-    }
-    if (!["simple", "structured", "needs_human"].includes(decision.route)) {
-      throw new Error("standard receipt payload decision route is invalid");
-    }
-    const generatedPlanDigest = nullable(decision.generated_plan_digest, (entry) =>
-      patternedText(entry, "standard receipt payload decision generated_plan_digest", SHA256, env, 64));
-    if ((decision.route === "structured") !== (generatedPlanDigest !== null)) {
-      throw new Error("standard receipt payload decision generated_plan_digest is inconsistent with route");
-    }
-    const questions = boundedStrings(decision.questions, "standard receipt payload decision questions", 16, 1_000, env);
-    if ((decision.route === "needs_human") !== (questions.length > 0)) {
-      throw new Error("standard receipt payload decision questions are inconsistent with route");
-    }
-    return { decision: {
-      schema: decision.schema,
-      route: decision.route,
-      rationale: boundedText(decision.rationale, "standard receipt payload decision rationale", 4_000, env),
-      questions,
-      admission_basis_digest: patternedText(decision.admission_basis_digest, "standard receipt payload decision admission_basis_digest", SHA256, env, 64),
-      effective_manifest_digest: patternedText(decision.effective_manifest_digest, "standard receipt payload decision effective_manifest_digest", SHA256, env, 64),
-      generated_plan_digest: generatedPlanDigest,
-    } };
+    return { decision: validateAdmissionDecision(payload.decision, {
+      source: "standard receipt payload decision",
+      sanitize: (entry) => sanitizeArtifactText(entry, env),
+    }).value };
   }
   if (type === "admission_review") {
     const payload = exactPayload(value, "standard receipt payload", new Set(["review"]), env);
-    const review = exactObject(payload.review, "standard receipt payload review", new Set([
-      "schema", "verdict", "summary", "findings", "questions", "admission_basis_digest",
-      "effective_manifest_digest", "generated_plan_digest",
-    ]));
-    if (review.schema !== "openthrottle.admission-review/v1") {
-      throw new Error("standard receipt payload review has an invalid schema");
-    }
-    if (!["approved", "rejected", "needs_human"].includes(review.verdict)) {
-      throw new Error("standard receipt payload review verdict is invalid");
-    }
-    const findings = boundedFindings(review.findings, "standard receipt payload review findings", env);
-    const questions = boundedStrings(review.questions, "standard receipt payload review questions", 16, 1_000, env);
-    if (review.verdict === "approved" && (findings.length > 0 || questions.length > 0)) {
-      throw new Error("approved admission review cannot carry findings or questions");
-    }
-    if (review.verdict === "rejected" && findings.length === 0) {
-      throw new Error("rejected admission review requires findings");
-    }
-    if ((review.verdict === "needs_human") !== (questions.length > 0)) {
-      throw new Error("admission review questions are inconsistent with verdict");
-    }
-    return { review: {
-      schema: review.schema,
-      verdict: review.verdict,
-      summary: boundedText(review.summary, "standard receipt payload review summary", 4_000, env),
-      findings,
-      questions,
-      admission_basis_digest: patternedText(review.admission_basis_digest, "standard receipt payload review admission_basis_digest", SHA256, env, 64),
-      effective_manifest_digest: patternedText(review.effective_manifest_digest, "standard receipt payload review effective_manifest_digest", SHA256, env, 64),
-      generated_plan_digest: patternedText(review.generated_plan_digest, "standard receipt payload review generated_plan_digest", SHA256, env, 64),
-    } };
+    return { review: validateAdmissionReview(payload.review, {
+      source: "standard receipt payload review",
+      sanitize: (entry) => sanitizeArtifactText(entry, env),
+    }).value };
   }
   if (type === "tune_analysis" || type === "tune_proposal") {
     const contractField = type === "tune_analysis" ? "analysis" : "proposal";
@@ -640,12 +595,19 @@ export function validateStandardReceipt(value, env = process.env) {
   const nativeSessionId = nullable(fence.native_session_id, (entry) =>
     patternedText(entry, "standard receipt fence native session", NATIVE_SESSION_ID, env, 200));
   const evidence = boundedStrings(input.evidence, "standard receipt evidence", 32, 1_000, env);
+  if (evidence.length === 0) throw new Error("standard receipt evidence must contain at least one item");
   const issuedAt = boundedText(input.issued_at, "standard receipt issued_at", 64, env);
   if (Number.isNaN(Date.parse(issuedAt))) throw new Error("standard receipt issued_at is invalid");
   const payload = receiptPayload(input.type, input.payload, env);
   if (input.type === "command_result" && input.result !== "failure"
       && (payload.stdout_tail !== undefined || payload.stderr_tail !== undefined)) {
     throw new Error("standard receipt payload diagnostic tails are only valid for failed command receipts");
+  }
+  if (input.type === "admission_decision" && input.result !== payload.decision.route) {
+    throw new Error("standard receipt result must match the typed admission decision route");
+  }
+  if (input.type === "admission_review" && input.result !== payload.review.verdict) {
+    throw new Error("standard receipt result must match the typed admission review verdict");
   }
   return {
     schema: STANDARD_RECEIPT_SCHEMA,
@@ -752,63 +714,20 @@ function sealArtifact(payload) {
 }
 
 function sealAdmissionExecutionPlan(value, fence, env) {
-  const artifact = exactObject(value, "admission execution plan artifact", new Set([
-    "schema", "execution_plan", "generated_plan_digest", "producer", "assurance", "source",
-  ]));
-  if (artifact.schema !== "openthrottle.admission-execution-plan-artifact/v1") {
-    throw new Error("admission execution plan artifact has an invalid schema");
-  }
-  if (artifact.assurance !== "semantic_attested") {
-    throw new Error("admission execution plan artifact has invalid assurance");
-  }
-  if (!artifact.execution_plan || typeof artifact.execution_plan !== "object" || Array.isArray(artifact.execution_plan) ||
-      artifact.execution_plan.schema !== "openthrottle.execution-plan/v2" ||
-      artifact.execution_plan.graph_id !== "structured") {
-    throw new Error("admission execution plan artifact has an invalid structured plan");
-  }
-  const generatedPlanDigest = patternedText(
-    artifact.generated_plan_digest,
-    "admission execution plan artifact generated_plan_digest",
-    SHA256,
-    env,
-    64,
-  );
-  if (digest(canonicalJson(artifact.execution_plan)) !== generatedPlanDigest) {
-    throw new Error("admission execution plan artifact digest does not match canonical plan bytes");
-  }
-  const producer = exactObject(artifact.producer, "admission execution plan artifact producer", new Set([
-    "skill", "capability_digest", "skill_package_digest",
-  ]));
-  const source = exactObject(artifact.source, "admission execution plan artifact source", new Set([
-    "admission_basis_digest", "effective_manifest_digest", "request_hash",
-  ]));
-  const normalized = canonicalJson({
-    schema: artifact.schema,
-    execution_plan: boundedPlainObject(artifact.execution_plan, "admission execution plan", env, 256 * 1024),
-    generated_plan_digest: generatedPlanDigest,
-    producer: {
-      skill: patternedText(producer.skill, "admission execution plan artifact producer skill", SKILL_REFERENCE, env, 320),
-      capability_digest: patternedText(producer.capability_digest, "admission execution plan artifact producer capability_digest", SHA256, env, 64),
-      skill_package_digest: nullable(producer.skill_package_digest, (entry) =>
-        patternedText(entry, "admission execution plan artifact producer skill_package_digest", SHA256, env, 64)),
-    },
-    assurance: artifact.assurance,
-    source: {
-      admission_basis_digest: patternedText(source.admission_basis_digest, "admission execution plan artifact source admission_basis_digest", SHA256, env, 64),
-      effective_manifest_digest: patternedText(source.effective_manifest_digest, "admission execution plan artifact source effective_manifest_digest", SHA256, env, 64),
-      request_hash: patternedText(source.request_hash, "admission execution plan artifact source request_hash", SHA256, env, 64),
-    },
+  const validated = validateAdmissionExecutionPlanArtifact(value, {
+    source: "admission execution plan artifact",
+    sanitize: (entry) => sanitizeArtifactText(entry, env),
   });
-  if (Buffer.byteLength(normalized, "utf8") > ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES) {
-    throw new Error("admission execution plan artifact exceeds the sealed payload limit");
+  if (validated.value.assurance !== "semantic_attested") {
+    throw new Error("admission execution plan artifact has invalid assurance");
   }
   return {
     kind: "execution_plan",
     schemaVersion: 1,
     assurance: "semantic_attested",
     subject: fence.subject,
-    payload: normalized,
-    hash: digest(normalized),
+    payload: validated.normalized,
+    hash: digest(validated.normalized),
   };
 }
 
@@ -967,148 +886,4 @@ export function buildStandardReceiptArtifacts({
     throw new Error("stage requires an admission execution plan artifact");
   }
   return artifacts;
-}
-
-// --- Loop receipt extraction -------------------------------------------------
-// parseLoopReceipt historically lived in execute-loop.mjs, which forced
-// execute-stage.mjs to import the loop runner just to parse a receipt. It
-// belongs here with the other receipt validators.
-
-const CODEX_ITEM_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
-const STANDARD_RECEIPT_TYPES = new Set(Object.keys(STANDARD_RECEIPT_RESULTS));
-
-function receiptCandidatesFromJson(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-  if (value.type === "item.completed") {
-    const codexAgentMessage = codexAgentMessageText(value);
-    return codexAgentMessage === null ? [] : [codexAgentMessage];
-  }
-  const candidates = [];
-  for (const key of ["receipt", "output", "content", "message"]) {
-    if (value[key] !== undefined) candidates.push(value[key]);
-  }
-  if (value.type === "result" && value.result !== undefined) candidates.push(value.result);
-  return candidates;
-}
-
-function codexAgentMessageText(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value) ||
-      value.type !== "item.completed" || Object.keys(value).length !== 2 ||
-      !Object.hasOwn(value, "type") || !Object.hasOwn(value, "item")) return null;
-  const item = value.item;
-  if (!item || typeof item !== "object" || Array.isArray(item) ||
-      item.type !== "agent_message" || !Object.hasOwn(item, "type") ||
-      !Object.hasOwn(item, "text") || typeof item.text !== "string" ||
-      Object.keys(item).some((key) => !["id", "text", "type"].includes(key)) ||
-      (Object.hasOwn(item, "id") && (typeof item.id !== "string" || !CODEX_ITEM_ID.test(item.id)))) return null;
-  return item.text;
-}
-
-function isLoopReceiptCandidateShaped(value) {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value) &&
-    value.schema === STANDARD_RECEIPT_SCHEMA;
-}
-
-function validateStandardReceiptForLoop(value, env, expectedReceiptType) {
-  if (expectedReceiptType !== undefined && isLoopReceiptCandidateShaped(value)) {
-    if (!Object.hasOwn(value, "type")) throw new Error("standard receipt is missing field type");
-    if (!STANDARD_RECEIPT_TYPES.has(value.type)) throw new Error("standard receipt has an invalid type");
-    if (value.type !== expectedReceiptType) {
-      throw new Error(`loop receipt type mismatch: expected ${expectedReceiptType}, received ${value.type}`);
-    }
-  }
-  return validateStandardReceipt(value, env);
-}
-
-function ambiguousCodexReceiptError(jsonl, asReceipt) {
-  let receiptLikeMessages = 0;
-  for (const line of jsonl.split("\n")) {
-    let event;
-    try {
-      event = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const text = codexAgentMessageText(event);
-    if (text === null) continue;
-    try {
-      if (isLoopReceiptCandidateShaped(parseAgentJson(text, asReceipt))) receiptLikeMessages += 1;
-    } catch (error) {
-      if (error?.ambiguousAgentJson) return error;
-    }
-  }
-  if (receiptLikeMessages <= 1) return null;
-  const error = new Error(
-    `${receiptLikeMessages} receipt-like Codex agent messages found; refusing to guess which one is the receipt`,
-  );
-  error.ambiguousAgentJson = true;
-  return error;
-}
-
-export function parseLoopReceipt(raw, env = process.env, expectedReceiptType = undefined) {
-  const sanitized = sanitizeArtifactText(raw, env).trim();
-  if (!sanitized) throw new Error("loop action did not emit a receipt");
-  const candidates = [sanitized, ...sanitized.split("\n").map((line) => line.trim()).filter(Boolean).reverse()];
-  // The validator's rejection message is precise ("standard receipt is missing
-  // field schema"); discarding it made OPE-101 cost a full live reproduction to
-  // learn one sentence. Keep the first error from each layer and report the
-  // decisive one. Layer preference matters: the top-layer candidate is the
-  // engine's own stream-json envelope, whose rejection is always the same
-  // uninformative "unknown field subtype". The nested layer is where the
-  // agent-authored receipt actually lives (the `type: "result"` line's `result`
-  // text), so its error is the one that names the real defect.
-  // Several receipt-shaped blocks in one message is its own situation, and the
-  // most decisive thing we can say about that message: the receipt was found,
-  // more than once, and the executor declined to pick. It outranks either
-  // validator error, which would otherwise describe whichever candidate the
-  // scan happened to reach first.
-  let ambiguityError = null;
-  let nestedError = null;
-  let nestedCandidate = null;
-  let topError = null;
-  let topCandidate = null;
-  const asReceipt = { qualifies: isLoopReceiptCandidateShaped, label: "receipt" };
-  const codexAmbiguity = ambiguousCodexReceiptError(sanitized, asReceipt);
-  if (codexAmbiguity) {
-    throw new Error(`loop action emitted invalid standard receipt: ${codexAmbiguity.message}`);
-  }
-  for (const candidate of candidates) {
-    try {
-      // parseAgentJson, not JSON.parse: both layers carry text the model
-      // typed, so both get the fence peel (OPE-101 generation 6) and the
-      // single-qualifying-block extraction (generation 8). The parsed value is
-      // identical to the unfenced case, so validation below is untouched.
-      const parsed = typeof candidate === "string" ? parseAgentJson(candidate, asReceipt) : candidate;
-      try {
-        return validateStandardReceiptForLoop(parsed, env, expectedReceiptType);
-      } catch (error) {
-        topError ??= error;
-        topCandidate ??= parsed;
-        for (const nested of receiptCandidatesFromJson(parsed)) {
-          try {
-            const normalized = typeof nested === "string" ? parseAgentJson(nested, asReceipt) : nested;
-            return validateStandardReceiptForLoop(normalized, env, expectedReceiptType);
-          } catch (error) {
-            if (error?.ambiguousAgentJson) ambiguityError ??= error;
-            else {
-              nestedError ??= error;
-              try {
-                nestedCandidate ??= typeof nested === "string" ? parseAgentJson(nested, asReceipt) : nested;
-              } catch {
-                // Keep the validator message as the primary diagnostic.
-              }
-            }
-          }
-        }
-      }
-    } catch (error) {
-      // Continue searching bounded agent output for the structured receipt.
-      if (error?.ambiguousAgentJson) ambiguityError ??= error;
-    }
-  }
-  const cause = ambiguityError ?? nestedError ?? topError;
-  const detail = cause instanceof Error ? cause.message : cause ? String(cause) : "";
-  const error = new Error(`loop action emitted invalid standard receipt${detail ? `: ${detail}` : ""}`);
-  error.invalidReceiptCandidate = nestedCandidate ?? topCandidate;
-  throw error;
 }

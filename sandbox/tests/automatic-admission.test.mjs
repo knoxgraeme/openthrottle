@@ -8,12 +8,16 @@ const taskRoot = resolve(repoRoot, "skills/tasks");
 const skill = (name) => readFileSync(resolve(taskRoot, name, "SKILL.md"), "utf8");
 
 describe("automatic-admission task packages", () => {
-  it("runs the automatic proof in CI and reuses the structured lifecycle proof", () => {
+  it("runs the production automatic coordinator and structured runtime in one lifecycle", () => {
     const workflow = readFileSync(resolve(repoRoot, ".github/workflows/ci.yml"), "utf8");
     const proof = readFileSync(resolve(repoRoot, "sandbox/tests/automatic-walking-skeleton.mjs"), "utf8");
     expect(workflow).toContain("node sandbox/tests/automatic-walking-skeleton.mjs openthrottle:test");
     expect(workflow).not.toContain("node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test");
-    expect(proof).toContain('join(repoRoot, "sandbox", "tests", "structured-walking-skeleton.mjs")');
+    expect(proof).toContain("createPipelineEffectProcessor");
+    expect(proof).toContain("completeStageAttemptActor");
+    expect(proof).toContain("createDockerSandboxRuntime");
+    expect(proof).toContain("structured execution did not receive the exact reviewed plan bytes");
+    expect(proof).not.toContain("execFileSync(process.execPath");
     expect(proof).toContain('"none"');
     expect(proof).toContain("evaluateAdmissionDecisionGate");
     expect(proof).toContain("evaluateAdmissionReviewGate");

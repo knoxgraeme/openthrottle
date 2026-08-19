@@ -10,6 +10,7 @@ import {
   parseRepositoryConfig,
   resolvePipelineReference,
   validatePipelineManifest,
+  type AutomaticManifestSkillBinding,
 } from "./manifest.js";
 import { buildInstalledRuntimeDescriptor } from "../__fixtures__/runtime.js";
 
@@ -270,7 +271,7 @@ describe("pipeline manifest validation", () => {
       planner: { reference: "builtin://admission-plan@1", packageDigest: null },
       reviewer: { reference: "builtin://review-admission-plan@1", packageDigest: null },
     });
-    const overridden = compileAutomaticManifest({
+    const plannerOverride = compileAutomaticManifest({
       ...base,
       planner: {
         reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/planner`,
@@ -298,14 +299,58 @@ describe("pipeline manifest validation", () => {
       planner: { reference: "builtin://admission-plan@1", packageDigest: null },
       reviewer: { reference: "builtin://review-admission-plan@1", packageDigest: null },
     })).toEqual(builtin);
-    expect(overridden.digest).not.toBe(builtin.digest);
-    expect(overridden.manifest.id).not.toBe(builtin.manifest.id);
-    expect(overridden.manifest.template).toMatchObject({ id: "core/automatic", version: 1 });
-    expect(overridden.manifest.stages.find((stage) => stage.id === "admission_planner"))
+    const repositoryReviewer: AutomaticManifestSkillBinding = {
+      reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/reviewer`,
+      packageDigest: "2".repeat(64),
+      package: {
+        ...repositorySkillPackage(),
+        schema: "openthrottle.repository-skill-package/v1",
+        reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/reviewer`,
+        invocation: "reviewer",
+        directory: ".openthrottle/skills/reviewer",
+        commit: "a".repeat(40),
+        packageDigest: "2".repeat(64),
+        files: [{
+          path: ".openthrottle/skills/reviewer/SKILL.md",
+          blobSha: "e".repeat(40),
+          digest: "f".repeat(64),
+        }],
+      },
+    };
+    const reviewerOverride = compileAutomaticManifest({
+      ...base,
+      planner: { reference: "builtin://admission-plan@1", packageDigest: null },
+      reviewer: repositoryReviewer,
+    });
+    const dualOverride = compileAutomaticManifest({
+      ...base,
+      planner: plannerOverride.manifest.stages.find((stage) => stage.id === "admission_planner")!.repositorySkill
+        ? { reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/planner`, packageDigest: "1".repeat(64), package: plannerOverride.manifest.stages.find((stage) => stage.id === "admission_planner")!.repositorySkill }
+        : { reference: "builtin://admission-plan@1", packageDigest: null },
+      reviewer: repositoryReviewer,
+    });
+
+    expect(plannerOverride.digest).not.toBe(builtin.digest);
+    expect(plannerOverride.manifest.id).not.toBe(builtin.manifest.id);
+    expect(plannerOverride.manifest.template).toMatchObject({ id: "core/automatic", version: 1 });
+    expect(plannerOverride.manifest.stages.find((stage) => stage.id === "admission_planner"))
       .toMatchObject({
         loop: { skill: expect.stringMatching(/^repo:\/\//) },
-        executor: { capability: "agent/repository-skill@1" },
+        executor: { capability: "admission/plan@1" },
+        context: "fresh",
+        credentials: ["model.invoke", "repo.read"],
+        produces: ["stage_result", "standard_receipt", "execution_plan"],
       });
+    expect(reviewerOverride.manifest.stages.find((stage) => stage.id === "admission_reviewer"))
+      .toMatchObject({
+        loop: { skill: "repo://reviewer", input_scope: "review", receipt: "admission_review" },
+        executor: { capability: "admission/review@1" },
+        context: "fresh",
+        credentials: ["model.invoke", "repo.read"],
+        produces: ["stage_result", "standard_receipt"],
+      });
+    expect(dualOverride.manifest.stages.filter((stage) => stage.repositorySkill)).toHaveLength(2);
+    expect(dualOverride.manifest.requires.capabilities).not.toContain("agent/repository-skill@1");
   });
 
   it("rejects ordinary loop bindings in directly loaded catalog manifests", () => {

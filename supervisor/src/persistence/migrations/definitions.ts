@@ -2089,6 +2089,14 @@ CREATE TABLE IF NOT EXISTS pipeline_admission_projections (
 const admissionProjectionMigrationSource = `${admissionProjectionSchema}
 automatic-admission-visibility-contract:one durable provider-neutral projection per pipeline instance references canonical plan and review artifacts without duplicating them/v1`;
 
+const admissionArtifactLookupIndexSchema = `
+CREATE INDEX IF NOT EXISTS pipeline_artifacts_admission_detail_idx
+ON pipeline_artifacts(pipeline_instance_id, artifact_hash, kind, assurance);
+`;
+
+const admissionArtifactLookupIndexMigrationSource = `${admissionArtifactLookupIndexSchema}
+automatic-admission-artifact-lookup:when pipeline_artifacts exists, detail projection resolves exact instance/hash/kind/assurance through a covering lookup prefix/v1`;
+
 const tuneTaskTypeSchema = `
 CREATE TABLE pipeline_instances_tune_next (
   id TEXT PRIMARY KEY,
@@ -4107,6 +4115,14 @@ const definitions: DatabaseMigrationDefinition[] = [
       if (!hasTable(db, "pipeline_admission_projections")) {
         db.exec(admissionProjectionSchema);
       }
+    },
+  },
+  {
+    version: 58,
+    name: "automatic-admission-artifact-lookup-index [rollback-compatible:additive/v1]",
+    source: admissionArtifactLookupIndexMigrationSource,
+    up(db) {
+      if (hasTable(db, "pipeline_artifacts")) db.exec(admissionArtifactLookupIndexSchema);
     },
   },
 ];

@@ -808,7 +808,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     completeStageAttemptActor(deps.store, deps.tickets, event, {
       observedSubject: artifact.subject,
     });
-    acknowledgeEffect(effect, event.id, { resultHash: artifact.hash, outcome });
+    acknowledgeEffect(effect, `${event.id}:effect-ack`, { resultHash: artifact.hash, outcome });
   };
 
   const automaticAdmissionContext = (
@@ -1008,7 +1008,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
       artifacts: [stageResult, ...(executionPlanArtifact ? [executionPlanArtifact] : [])],
     };
     completeStageAttemptActor(deps.store, deps.tickets, event, { observedSubject: stageResult.subject });
-    acknowledgeEffect(effect, event.id, { resultHash: stageResult.hash, outcome });
+    acknowledgeEffect(effect, `${event.id}:effect-ack`, { resultHash: stageResult.hash, outcome });
   };
 
   const runtimeBindingFor = (instance: PipelineInstance): EffectRuntimeBinding => {

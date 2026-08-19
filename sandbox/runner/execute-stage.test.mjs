@@ -123,25 +123,32 @@ function sealedRepositorySkillPackage(repoDir, {
   invocation = "implement_unit",
   skillName = "implement_unit",
   body = "# Skill\n",
+  references = {},
 } = {}) {
   mkdirSync(join(repoDir, skillDir), { recursive: true });
   writeFileSync(join(repoDir, skillDir, "SKILL.md"), `---\nname: ${skillName}\n---\n${body}`);
+  for (const [name, content] of Object.entries(references)) {
+    const referencePath = join(repoDir, skillDir, "references", name);
+    mkdirSync(join(repoDir, skillDir, "references"), { recursive: true });
+    writeFileSync(referencePath, content);
+  }
   execFileSync("git", ["add", "."], { cwd: repoDir });
   execFileSync("git", ["commit", "-qm", "skill"], { cwd: repoDir });
   const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
   const skillPath = `${skillDir}/SKILL.md`;
-  const file = {
-    path: skillPath,
-    blobSha: execFileSync("git", ["rev-parse", `${commit}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim(),
-    digest: digest(readFileSync(join(repoDir, skillPath))),
-  };
+  const paths = [skillPath, ...Object.keys(references).sort().map((name) => `${skillDir}/references/${name}`)];
+  const files = paths.map((path) => ({
+    path,
+    blobSha: execFileSync("git", ["rev-parse", `${commit}:${path}`], { cwd: repoDir, encoding: "utf8" }).trim(),
+    digest: digest(readFileSync(join(repoDir, path))),
+  }));
   const unsignedPackage = {
     schema: "openthrottle.repository-skill-package/v1",
     reference: `repo://owner/repo@${commit}#${skillDir}`,
     invocation,
     directory: skillDir,
     commit,
-    files: [file],
+    files,
   };
   return {
     repositorySkill: { ...unsignedPackage, packageDigest: digest(canonicalJson(unsignedPackage)) },
@@ -659,17 +666,17 @@ describe("one-stage executor", () => {
 
   it("applies the same inspection fence and repository-skill provenance to admission overrides", () => {
     const planner = fixture({
-      capability: "agent/repository-skill@1",
+      capability: "admission/plan@1",
       stageId: "admission_planner",
       repositorySkill: "fixture",
-      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      requiredArtifacts: ["standard_receipt", "execution_plan"],
       liveSteering: false,
     }).request;
     const reviewer = fixture({
-      capability: "agent/repository-skill@1",
+      capability: "admission/review@1",
       stageId: "admission_reviewer",
       repositorySkill: "fixture",
-      requiredArtifacts: ["stage_result", "standard_receipt"],
+      requiredArtifacts: ["standard_receipt"],
       liveSteering: false,
     }).request;
 
@@ -687,11 +694,12 @@ describe("one-stage executor", () => {
     expect(reviewerPrompt).not.toContain('"execution_plan"');
   });
 
-  it("uses an attempt-scoped home and exposes only the selected model credential to admission engines", () => {
+  it("uses an attempt-scoped home and exposes only the selected model credential to supported admission engines", () => {
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-actions-"));
     directories.push(actionRoot);
     process.env.OT_STAGE_ACTION_ROOT = actionRoot;
     const request = fixture({
+      agent: "claude",
       capability: "admission/plan@1",
       stageId: "admission_planner",
       requiredArtifacts: ["standard_receipt", "execution_plan"],
@@ -700,25 +708,47 @@ describe("one-stage executor", () => {
     const environment = repositorySkillStageEnvironment(request);
     expect(environment.env).toContain(`HOME=${join(actionRoot, "attempt-1", "home")}`);
     expect(environment.env).toContain(`TMPDIR=${join(actionRoot, "attempt-1", "tmp")}`);
-    expect(readFileSync(join(actionRoot, "attempt-1", "codex", "auth.json"), "utf8"))
-      .toBe(STAGE_CREDENTIAL_FIXTURE_ENV.CODEX_AUTH_JSON);
 
     expect(inspectionProcessEnvironment(request, {
       PATH: "/bin",
-      CODEX_AUTH_JSON: "model-secret",
+      CLAUDE_CODE_OAUTH_TOKEN: "model-secret",
       GITHUB_TOKEN: "repo-secret",
       OT_CLAUDE_MCP_CONFIG: "/private/mcp.json",
       LINEAR_API_KEY: "provider-secret",
-    })).toEqual({ PATH: "/bin" });
+    })).toEqual({ PATH: "/bin", CLAUDE_CODE_OAUTH_TOKEN: "model-secret" });
     expect(inspectionAgentPolicyArgs("claude")).toEqual([
       "--permission-mode", "dontAsk",
       "--allowedTools", "Read,Grep,Glob",
       "--disallowedTools", "Bash,Write,Edit,WebFetch,WebSearch,Task,NotebookEdit",
     ]);
-    expect(inspectionAgentPolicyArgs("codex")).toEqual([
-      "--sandbox", "read-only", "-c", "sandbox_workspace_write.network_access=false",
-    ]);
+    expect(() => inspectionAgentPolicyArgs("codex")).toThrow(/contained read broker/);
     expect(inspectionAgentPolicyArgs("opencode")).toEqual([]);
+  });
+
+  it("fails Codex admission before creating credentials or starting a process", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-codex-denied-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-admission-codex-bin-"));
+    directories.push(actionRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const marker = join(actionRoot, "process-started");
+    writeExecutable(join(binDir, "gosu"), `#!/usr/bin/env bash\ntouch '${marker}'\nexit 0\n`);
+    const input = fixture({
+      agent: "codex",
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+
+    expect(() => withPrependedPath(binDir, () => defaultRunAgent({
+      request: input.request,
+      invocation: resolveContextInvocation(input.request),
+      repoDir: input.repoDir,
+      proposalPath: join(actionRoot, "proposal.json"),
+      timeoutMs: 5_000,
+    }))).toThrow(/contained read broker/);
+    expect(existsSync(marker)).toBe(false);
+    expect(existsSync(join(actionRoot, input.request.attemptId, "codex", "auth.json"))).toBe(false);
   });
 
   it("dispatches admission against a detached exact-subject read-only repository view", () => {
@@ -747,6 +777,7 @@ describe("one-stage executor", () => {
     { label: "failed", exitCode: 47 },
   ])("removes the entire admission action directory after a $label inspection", ({ exitCode }) => {
     const input = fixture({
+      agent: "claude",
       capability: "agent/repository-skill@1",
       stageId: "admission_planner",
       repositorySkill: "fixture",
@@ -762,7 +793,7 @@ describe("one-stage executor", () => {
       type: "result",
       result: JSON.stringify(admissionPlanFixture(input.request)),
     });
-    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+    writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
 set -euo pipefail
 cat <<'JSON'
 ${event}
@@ -784,6 +815,7 @@ exit ${exitCode}
 
   it("fails closed when an admission action directory cannot be removed", () => {
     const input = fixture({
+      agent: "claude",
       capability: "agent/repository-skill@1",
       stageId: "admission_planner",
       repositorySkill: "fixture",
@@ -799,7 +831,7 @@ exit ${exitCode}
       type: "result",
       result: JSON.stringify(admissionPlanFixture(input.request)),
     });
-    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+    writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
 set -euo pipefail
 cat <<'JSON'
 ${event}
@@ -1426,6 +1458,69 @@ JSON
           .toContain("Pinned repository package");
       }
     }
+  });
+
+  it("materializes repository admission overrides without changing their admission capability", () => {
+    const repoDir = repository();
+    const { repositorySkill } = sealedRepositorySkillPackage(repoDir, {
+      invocation: "custom_planner",
+      skillName: "custom_planner",
+      body: "# Custom admission planner\n",
+    });
+
+    for (const agent of ["claude", "opencode"]) {
+      const input = fixture({
+        agent,
+        capability: "admission/plan@1",
+        stageId: "admission_planner",
+        repositorySkill,
+        requiredArtifacts: ["standard_receipt", "execution_plan"],
+        liveSteering: false,
+      });
+      const actionRoot = mkdtempSync(join(tmpdir(), `ot-admission-override-${agent}-`));
+      directories.push(actionRoot);
+      process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+      const environment = repositorySkillStageEnvironment(input.request);
+      const materialized = materializeRepositorySkill({
+        request: input.request,
+        repoDir,
+        discoveryRoot: environment.repositorySkillDiscoveryRoot,
+      });
+      const prompt = stagePrompt(input.request, join(actionRoot, "proposal.json"), {
+        agent,
+        repositorySkillRoot: materialized,
+      });
+
+      expect(readFileSync(join(materialized, "SKILL.md"), "utf8")).toContain("Custom admission planner");
+      expect(prompt).toContain(`${agent === "claude" ? "/" : "$"}custom_planner`);
+      expect(prompt).not.toContain(`${agent === "claude" ? "/" : "$"}admission-plan`);
+      if (agent === "opencode") expect(prompt).toContain("Custom admission planner");
+    }
+  });
+
+  it("inlines repository-skill references for OpenCode prompts", () => {
+    const repoDir = repository();
+    const { repositorySkill } = sealedRepositorySkillPackage(repoDir, {
+      body: "# Pinned repository package\n\nRead `references/checklist.md` before acting.\n",
+      references: { "checklist.md": "CHECKLIST_SENTINEL: verify the exact sealed inputs.\n" },
+    });
+    const input = fixture({ agent: "opencode", capability: "agent/repository-skill@1", repositorySkill });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-opencode-repository-skill-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const environment = repositorySkillStageEnvironment(input.request);
+    const materialized = materializeRepositorySkill({
+      request: input.request,
+      repoDir,
+      discoveryRoot: environment.repositorySkillDiscoveryRoot,
+    });
+
+    const prompt = stagePrompt(input.request, join(actionRoot, "proposal.json"), {
+      agent: "opencode",
+      repositorySkillRoot: materialized,
+    });
+    expect(prompt).toContain("## references/checklist.md");
+    expect(prompt).toContain("CHECKLIST_SENTINEL: verify the exact sealed inputs.");
   });
 
   it("locks repository-skill stage homes when setup fails before agent launch", () => {

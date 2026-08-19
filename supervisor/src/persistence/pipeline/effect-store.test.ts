@@ -210,10 +210,7 @@ describe("pipeline effect store", () => {
       task_branch_remote_sha: "d".repeat(40),
       published_commit: null,
       published_pr_url: null,
-      admission: {
-        checkpoint_digest: checkpointDigest,
-        task_branch: { state: "checkpointed" },
-      },
+      admission: null,
     });
     expect(pipelines.listPublications(instance.id).some((receipt) => receipt.kind === "pull_request")).toBe(false);
   });

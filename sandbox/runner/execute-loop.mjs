@@ -8,10 +8,10 @@ import { gzipSync } from "node:zlib";
 import { canonicalJson } from "./capabilities.mjs";
 import {
   digest,
-  parseLoopReceipt,
   sanitizeArtifactText,
   validateStandardReceipt,
 } from "./artifacts.mjs";
+import { parseLoopReceipt } from "./loop-receipts.mjs";
 import { computeWorkspaceTreeOid } from "./repository-control.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import { runWithUserProcessFence } from "./agent-process-fence.mjs";
@@ -74,7 +74,7 @@ export {
   prepareLoopGitObjectEnvironment,
   prepareRootReadOnlyDirectory,
 } from "./loop-paths.mjs";
-export { parseLoopReceipt } from "./artifacts.mjs";
+export { parseLoopReceipt } from "./loop-receipts.mjs";
 
 const GIT_OBJECT_ID = /^[a-f0-9]{40,64}$/;
 const TUNE_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;

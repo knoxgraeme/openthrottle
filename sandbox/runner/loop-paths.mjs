@@ -141,7 +141,7 @@ export function materializeExactSubjectReadOnlyRepositoryView({
   runRootGit(destination, ["init", "--quiet"]);
   const packDir = pathInside(pathInside(destination, ".git"), "objects/pack");
   mkdirSync(packDir, { recursive: true, mode: 0o755 });
-  packReachableBaseObjects(sourceRepoDir, join(packDir, "authorized"), subject, sourceEnv);
+  packExactSubjectObjects(sourceRepoDir, join(packDir, "authorized"), subject, objectType, sourceEnv);
   if (objectType === "commit") {
     runRootGit(destination, ["switch", "--quiet", "--detach", subject]);
   } else {
@@ -152,6 +152,40 @@ export function materializeExactSubjectReadOnlyRepositoryView({
   runRootGit(destination, ["config", "remote.origin.pushurl", "DISABLED_BY_OPENTHROTTLE_READONLY_VIEW"]);
   chmodReadOnlyPreservingExecuteTree(destination);
   return destination;
+}
+
+export function packExactSubjectObjects(repoDir, destinationPackBase, subject, objectType, env = {}) {
+  if (objectType !== "commit" && objectType !== "tree") {
+    throw new Error("exact subject object packing requires a commit or tree");
+  }
+  const tree = objectType === "commit"
+    ? runRootGit(repoDir, ["rev-parse", `${subject}^{tree}`], env)
+    : subject;
+  const entries = runRootGit(repoDir, ["ls-tree", "-r", "-t", "--full-tree", tree], env);
+  const objectIds = new Set([tree]);
+  if (objectType === "commit") objectIds.add(subject);
+  for (const line of entries.split("\n").filter(Boolean)) {
+    const match = line.match(/^\d{6} (blob|tree|commit) ([a-f0-9]{40,64})\t/);
+    if (!match) throw new Error("git ls-tree returned an invalid exact-subject object entry");
+    // A gitlink names a commit in a different repository. It is part of the
+    // current tree bytes but is not an object this repository can or should
+    // disclose through the inspection pack.
+    if (match[1] !== "commit") objectIds.add(match[2]);
+  }
+  const result = runCapturedProcess("git", [...gitSafeDirectoryConfigArgs(repoDir), "pack-objects", destinationPackBase], {
+    cwd: repoDir,
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: "0",
+      ...env,
+    },
+    input: `${[...objectIds].join("\n")}\n`,
+    timeout: 120_000,
+    captureBytes: 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(`git pack-objects failed: ${sanitizeArtifactText(result.stderr || result.error?.message || "").slice(-800)}`);
+  }
 }
 
 export function prepareRootReadOnlyDirectory(path) {
