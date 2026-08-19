@@ -76,4 +76,15 @@ describe("automatic admission artifact routing", () => {
       eventArtifacts: [artifact("execution_plan", "c")],
     })).toThrow(/changed the sealed execution_plan/);
   });
+
+  it("seals reviewer rejection evidence and the rejected plan into planner correction", () => {
+    const rejection = artifact("stage_result", "d");
+    const rejectedPlan = artifact("execution_plan", "e");
+    expect(automaticAdmissionInputArtifacts({
+      sourceStageId: "admission_review_gate",
+      targetStageId: "admission_planner",
+      priorArtifacts: [],
+      eventArtifacts: [rejection, rejectedPlan],
+    })).toEqual([rejectedPlan, rejection]);
+  });
 });

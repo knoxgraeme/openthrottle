@@ -37,6 +37,12 @@ export function projectAdmissionTransition(input: {
 
   if (attempt.stage_id === AUTOMATIC_ADMISSION_STAGE_IDS.planner && receipt?.receipt.type === "admission_decision") {
     const decision = receipt.receipt.payload.decision;
+    // A planner correction supersedes every conclusion derived from its prior plan.
+    next.reviewer_verdict = null;
+    next.reviewer_receipt_artifact_hash = null;
+    next.accepted_plan_artifact_hash = null;
+    next.final_route = null;
+    next.terminal_state = null;
     next.proposed_route = decision.route;
     next.questions = [...decision.questions];
     next.generated_plan_digest = decision.generated_plan_digest;

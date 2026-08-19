@@ -34,7 +34,9 @@ read-only planning actor, not an implementation worker or pipeline controller.
    fence, and package provenance value comes from the sealed input. Copy these
    bindings exactly where the executor result contract requires them.
 2. Reduce the ticket to its required behavior, acceptance boundary, likely
-   paths, and executable verification. Ignore unrelated improvements.
+   paths, and executable verification. Inventory any explicit source
+   requirement or acceptance IDs before decomposing the work. Ignore unrelated
+   improvements.
 3. Apply the normative rubric. A structured lock forbids `simple`; it does not
    authorize invented scope or a weak plan.
 4. For `simple`, return one `openthrottle.admission-decision/v1` and no
@@ -55,6 +57,10 @@ read-only planning actor, not an implementation worker or pipeline controller.
 - Keep the plan within the bounded ticket. Do not add product features,
   architecture rewrites, migrations, dependencies, cleanup, or rollout work
   that the ticket does not require.
+- Preserve explicit source requirement or acceptance IDs verbatim in every
+  structured unit that owns their meaning. Keep the complete obligation beside
+  its ID, never replace source meaning with an ID-only pointer, invent an ID, or
+  reuse one ID for conflicting obligations.
 - Name plausible repository-relative files. A path is a planning prediction,
   not permission to create it. Never include paths outside the repository.
 - Include success, boundary, and failure tests where applicable. Verification

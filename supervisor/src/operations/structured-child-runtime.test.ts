@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
+import { canonicalJson, digestNormalized, type ExecutionPlanContractV2 } from "@openthrottle/contracts";
 import type { ExecutionGateReceipt, ExecutionWorkAttempt } from "../persistence/pipeline/unit-store.js";
 import type { ExecutionUnitState } from "../pipeline/unit-coordinator.js";
 import type { ChildExecutorActionRequest, LoopActionRequest, SandboxRuntime } from "../runtime/contracts.js";
-import { MAX_VALID_DOWNSTREAM_CONTEXT } from "../pipeline/structured-loop-envelope.js";
+import { MAX_VALID_DOWNSTREAM_CONTEXT, structuredPlanLoopEnvelopeBytes } from "../pipeline/structured-loop-envelope.js";
 import { MAX_LOOP_REQUEST_ENVELOPE_BYTES } from "../pipeline/structured-loop-limits.js";
 import {
   aggregateOutcomeFor,
+  assertStructuredPlanEnvelopeBoundForInstance,
   createStructuredChildRuntime as createProductionStructuredChildRuntime,
   structuredPlanContextFor,
 } from "./structured-child-runtime.js";
@@ -54,7 +55,10 @@ function automaticStructuredPlanFixture() {
     pipeline_id: "core/automatic/identity",
     manifest_digest: manifestDigest,
     normalized_manifest: canonicalJson({
-      stages: [{ id: "admission_planner", loop: { skill: "builtin://admission-plan@1" } }],
+      stages: [
+        { id: "admission_planner", loop: { skill: "builtin://admission-plan@1" }, executor: { kind: "agent" } },
+        { id: "structured_edit", executor: { kind: "loop_action", capability: "graph/for-each-unit@1" } },
+      ],
     }),
   };
   const request = { inputArtifacts: [artifact], expectedSubject: subject, taskContext: "bounded ticket" };
@@ -67,6 +71,39 @@ describe("automatic structured-plan bridge", () => {
     const context = structuredPlanContextFor(input.instance, input.request, input.wrapper.source.admission_basis_digest);
     expect(context).toContain("openthrottle.execution-plan/v2");
     expect(context).toContain('"unit_a"');
+  });
+
+  it("accepts the nearest valid automatic plan below the child envelope and rejects the next size", () => {
+    const input = automaticStructuredPlanFixture();
+    const planAt = (scale: number): ExecutionPlanContractV2 => ({
+      schema: "openthrottle.execution-plan/v2",
+      graph_id: "structured",
+      plan_id: "near_limit",
+      units: [{
+        id: "unit_a", title: "Unit A", depends_on: [], objective: "x".repeat(scale),
+        requirements: Array.from({ length: 32 }, () => "x".repeat(scale)),
+        files: ["src/a.ts"],
+        approach: Array.from({ length: 32 }, () => "x".repeat(scale)),
+        tests: Array.from({ length: 32 }, () => "x".repeat(scale)),
+        acceptance: Array.from({ length: 32 }, () => "x".repeat(scale)),
+        verification: Array.from({ length: 32 }, () => "x".repeat(scale)),
+      }],
+      commands: [{ name: "test" }],
+    });
+    let low = 1;
+    let high = 2_000;
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      if (structuredPlanLoopEnvelopeBytes(planAt(mid)) <= MAX_LOOP_REQUEST_ENVELOPE_BYTES) low = mid;
+      else high = mid - 1;
+    }
+    const accepted = planAt(low);
+    const rejected = planAt(low + 1);
+    expect(MAX_LOOP_REQUEST_ENVELOPE_BYTES - structuredPlanLoopEnvelopeBytes(accepted)).toBeLessThan(512);
+    expect(structuredPlanLoopEnvelopeBytes(rejected)).toBeGreaterThan(MAX_LOOP_REQUEST_ENVELOPE_BYTES);
+    expect(() => assertStructuredPlanEnvelopeBoundForInstance({ ...input.instance, agent: "codex" }, accepted)).not.toThrow();
+    expect(() => assertStructuredPlanEnvelopeBoundForInstance({ ...input.instance, agent: "codex" }, rejected))
+      .toThrow(/child loop request/);
   });
 
   it("rejects stale, substituted, duplicate, wrong-lineage, and downgraded wrappers", () => {

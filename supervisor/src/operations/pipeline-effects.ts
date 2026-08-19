@@ -45,7 +45,10 @@ import {
 import { exponentialBackoffDelayMs } from "../shared/backoff.js";
 import { sanitizeText } from "../shared/sanitize.js";
 import { terminateAndSettleActor } from "./actor-settlement.js";
-import { createStructuredChildRuntime } from "./structured-child-runtime.js";
+import {
+  assertStructuredPlanEnvelopeBoundForInstance,
+  createStructuredChildRuntime,
+} from "./structured-child-runtime.js";
 import {
   createRuntimeResourceReconciler,
   HOT_PATH_RECLAIM_LIMIT,
@@ -962,18 +965,48 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
           }),
         });
         outcome = result.outcome;
+        let envelopeFinding: { severity: "P1"; message: string } | undefined;
+        if (outcome === "success") {
+          try {
+            assertStructuredPlanEnvelopeBoundForInstance(instance, result.executionPlan.execution_plan);
+          } catch (error) {
+            outcome = "failure";
+            envelopeFinding = {
+              severity: "P1",
+              message: sanitizeText(String(error)).slice(0, 2_000),
+            };
+          }
+        }
         summary = outcome === "success"
           ? "Automatic admission review approved the exact structured plan."
           : outcome === "needs_human"
             ? "Automatic admission review requires human authority."
-            : "Automatic admission review rejected the candidate plan.";
-        details = { decision: result.decision, correction_owner: result.correctionOwner };
+            : envelopeFinding
+              ? "Automatic admission rejected a plan that exceeds the structured child request envelope."
+              : "Automatic admission review rejected the candidate plan.";
+        details = {
+          decision: result.decision,
+          correction_owner: outcome === "failure" ? "planner" : result.correctionOwner,
+          review: result.review,
+          rejected_plan_digest: outcome === "failure" ? result.executionPlan.generated_plan_digest : null,
+          ...(envelopeFinding ? { gate_findings: [envelopeFinding] } : {}),
+        };
         if (outcome === "success") {
           const payload = canonicalJson(result.executionPlan);
           executionPlanArtifact = {
             kind: "execution_plan",
             schemaVersion: 1,
             assurance: "executor_verified",
+            subject: context.subject,
+            payload,
+            hash: digestNormalized(payload),
+          };
+        } else if (outcome === "failure") {
+          const payload = canonicalJson(result.executionPlan);
+          executionPlanArtifact = {
+            kind: "execution_plan",
+            schemaVersion: 1,
+            assurance: "semantic_attested",
             subject: context.subject,
             payload,
             hash: digestNormalized(payload),

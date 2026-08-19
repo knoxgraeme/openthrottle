@@ -138,6 +138,64 @@ function write(stageId: string, outcome: CoordinatorTransitionWrite["outcome"], 
   };
 }
 
+function decision(route: "simple" | "structured", generatedPlanDigest: string | null) {
+  return {
+    schema: "openthrottle.admission-decision/v1",
+    route,
+    rationale: "The replacement decision is bounded.",
+    questions: [],
+    admission_basis_digest: basisDigest,
+    effective_manifest_digest: manifestDigest,
+    generated_plan_digest: generatedPlanDigest,
+  };
+}
+
+function rejectedStructuredProjection(): AdmissionProjection {
+  const initialPlanDigest = "2".repeat(64);
+  const planned = projectAdmissionTransition({
+    current: projection(),
+    attempt: attempt("admission_planner"),
+    event: event("admission_planner", "success", {
+      kind: "standard_receipt",
+      assurance: "semantic_attested",
+      value: { details: { receipt: receipt("admission_decision", "structured", {
+        decision: decision("structured", initialPlanDigest),
+      }) } },
+    }),
+    write: write("admission_planner", "success"),
+  })!;
+  const reviewed = projectAdmissionTransition({
+    current: planned,
+    attempt: attempt("admission_reviewer"),
+    event: event("admission_reviewer", "failure", {
+      kind: "standard_receipt",
+      assurance: "semantic_attested",
+      value: { details: { receipt: receipt("admission_review", "rejected", {
+        review: {
+          schema: "openthrottle.admission-review/v1",
+          verdict: "rejected",
+          summary: "The plan needs a correction.",
+          findings: [{ severity: "P1", message: "Complete the failure path.", path: "unit_a" }],
+          questions: [],
+          admission_basis_digest: basisDigest,
+          effective_manifest_digest: manifestDigest,
+          generated_plan_digest: initialPlanDigest,
+        },
+      }) } },
+    }),
+    write: write("admission_reviewer", "failure"),
+  })!;
+
+  return {
+    ...reviewed,
+    final_route: "structured",
+    terminal_state: "accepted",
+    accepted_plan_artifact_hash: "3".repeat(64),
+    semantic_repair_count: 2,
+    infrastructure_retry_count: 3,
+  };
+}
+
 describe("automatic admission visibility projection", () => {
   it("does not emit a projection write for later execution gates", () => {
     const decision = {
@@ -210,6 +268,61 @@ describe("automatic admission visibility projection", () => {
       semantic_repair_count: 1,
       infrastructure_retry_count: 1,
       accepted_plan_artifact_hash: acceptedEvent.artifacts![0]!.hash,
+    });
+  });
+
+  it("clears rejected structured-plan review state when the replacement decision remains structured", () => {
+    const replacementPlanDigest = "4".repeat(64);
+    const replacement = projectAdmissionTransition({
+      current: rejectedStructuredProjection(),
+      attempt: attempt("admission_planner"),
+      event: event("admission_planner", "success", {
+        kind: "standard_receipt",
+        assurance: "semantic_attested",
+        value: { details: { receipt: receipt("admission_decision", "structured", {
+          decision: decision("structured", replacementPlanDigest),
+        }) } },
+      }),
+      write: write("admission_planner", "success"),
+    })!;
+
+    expect(replacement).toMatchObject({
+      proposed_route: "structured",
+      generated_plan_digest: replacementPlanDigest,
+      reviewer_verdict: null,
+      reviewer_receipt_artifact_hash: null,
+      accepted_plan_artifact_hash: null,
+      final_route: null,
+      terminal_state: null,
+      semantic_repair_count: 2,
+      infrastructure_retry_count: 3,
+    });
+  });
+
+  it("clears rejected structured-plan review state when the replacement decision becomes simple", () => {
+    const replacement = projectAdmissionTransition({
+      current: rejectedStructuredProjection(),
+      attempt: attempt("admission_planner"),
+      event: event("admission_planner", "no_change", {
+        kind: "standard_receipt",
+        assurance: "semantic_attested",
+        value: { details: { receipt: receipt("admission_decision", "simple", {
+          decision: decision("simple", null),
+        }) } },
+      }),
+      write: write("admission_planner", "no_change"),
+    })!;
+
+    expect(replacement).toMatchObject({
+      proposed_route: "simple",
+      generated_plan_digest: null,
+      reviewer_verdict: null,
+      reviewer_receipt_artifact_hash: null,
+      accepted_plan_artifact_hash: null,
+      final_route: null,
+      terminal_state: null,
+      semantic_repair_count: 2,
+      infrastructure_retry_count: 3,
     });
   });
 });

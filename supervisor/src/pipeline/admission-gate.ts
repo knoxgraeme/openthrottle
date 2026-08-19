@@ -5,6 +5,7 @@ import {
   validateStandardReceipt,
   type AdmissionDecision,
   type AdmissionExecutionPlanArtifact,
+  type AdmissionReview,
   type AdmissionRoute,
 } from "@openthrottle/contracts";
 import type { StageOutcome } from "./manifest.js";
@@ -51,6 +52,7 @@ export interface AdmissionReviewGateResult {
   route: "structured";
   decision: AdmissionDecision;
   executionPlan: AdmissionExecutionPlanArtifact;
+  review: AdmissionReview;
   correctionOwner: "planner" | null;
 }
 
@@ -206,6 +208,7 @@ export function evaluateAdmissionReviewGate(input: {
       route: "structured",
       decision,
       executionPlan: { ...executionPlan, assurance: "executor_verified" },
+      review,
       correctionOwner: null,
     };
   }
@@ -214,6 +217,7 @@ export function evaluateAdmissionReviewGate(input: {
     route: "structured",
     decision,
     executionPlan,
+    review,
     correctionOwner: review.verdict === "rejected" ? "planner" : null,
   };
 }

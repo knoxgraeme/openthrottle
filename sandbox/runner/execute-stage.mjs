@@ -12,6 +12,7 @@ import {
   rmSync,
   statSync,
   unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -58,6 +59,7 @@ import {
 import {
   chmodTree,
   chownTree,
+  identityForUser,
   isRoot,
   lockPersistentAgentPrivateRoots,
   lockedPersistentProfilesFrom,
@@ -524,6 +526,18 @@ export function repositorySkillStageEnvironment(request) {
     const codexHome = pathInside(actionDirectory, "codex", "stage action codex home");
     prepareAgentOwnedDirectory(codexHome);
     materializeCodexProfileBaseline({ destinationHome: codexHome });
+    if (isAdmissionInspectionStage(request)) {
+      const authJson = process.env.CODEX_AUTH_JSON;
+      if (typeof authJson !== "string" || !authJson.trim()) {
+        throw new Error("Codex admission inspection is missing CODEX_AUTH_JSON");
+      }
+      const authPath = pathInside(codexHome, "auth.json", "stage Codex auth file");
+      writeFileSync(authPath, authJson, { mode: 0o600 });
+      if (isRoot()) {
+        const identity = identityForUser("agent");
+        if (identity) chownSync(authPath, identity.uid, identity.gid);
+      }
+    }
     prepareAgentOwnedDirectory(nativeSessionStoragePath(request.agent, codexHome));
     prepareAgentOwnedProfileRoot(codexHome);
     env.push(`CODEX_HOME=${codexHome}`);
@@ -783,7 +797,7 @@ export function defaultRunAgent({
         ...(model ? ["--model", model] : []),
         ...(reasoningEffort ? ["--effort", reasoningEffort] : []),
         ...(inspection
-          ? inspectionAgentPolicyArgs("claude")
+          ? inspectionAgentPolicyArgs("claude", repoDir)
           : ["--dangerously-skip-permissions"]),
         ...(!inspection && mcpConfig ? ["--mcp-config", mcpConfig, "--strict-mcp-config"] : []),
         "--setting-sources", "user",
@@ -814,9 +828,11 @@ export function defaultRunAgent({
       command = "codex";
       // "-" tells Codex to read the prompt from stdin, in resume mode exactly
       // as in a fresh launch.
-      args = ["exec", "--json",
+      args = [
+        ...(inspection ? ["--ask-for-approval", "never"] : []),
+        "exec", "--json",
         ...(inspection
-          ? inspectionAgentPolicyArgs("codex")
+          ? inspectionAgentPolicyArgs("codex", repoDir)
           : ["--dangerously-bypass-approvals-and-sandbox"]),
         ...(process.env.OT_CODEX_HOOK_TRUST_FLAG === "1" ? ["--dangerously-bypass-hook-trust"] : []),
         "--skip-git-repo-check", "-C", repoDir, ...(model ? ["-m", model] : []),
@@ -1164,6 +1180,10 @@ export function executeStage({
   proposalPath = `/home/agent/.ot/stage/proposal.json`,
 }) {
   const request = validateStageRequest(rawRequest);
+  // Admission agents can inspect untrusted repository content. Refuse an
+  // unsupported engine before touching the checkout or materializing its
+  // credential, even when a caller injects a custom runner.
+  assertAdmissionInspectionRuntimeSupported(request);
   const { config, stage } = validateSealedInputs({ request, configRaw, manifestRaw });
   const contract = authorizeCapability(request);
   if (contract.kind === "provider_wait") throw new Error("provider-wait stages execute in the supervisor, not the sandbox");

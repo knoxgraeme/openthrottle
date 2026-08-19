@@ -31,6 +31,19 @@ A structured result has exactly one complete
 A sealed structured lock forces structured-or-needs-human. It never permits
 invented requirements or an incomplete plan.
 
+### Source traceability
+
+When the ticket supplies explicit stable requirement or acceptance IDs, first
+inventory them as source obligations. Copy each ID verbatim into the
+`requirements` or `acceptance` text of every unit that owns it, together with
+the complete applicable meaning. Repeating the same ID consistently across
+owning units or proof fields is allowed. Omitting it, weakening its obligation,
+reusing it for different meaning, or replacing the obligation with an ID-only
+pointer is a planning defect. Do not manufacture IDs for free-form tickets.
+
+This is lightweight traceability within the existing v2 literal fields. It
+does not add plan-level indirection or change the execution-plan schema.
+
 ## Needs human
 
 Choose `needs_human` when the bounded ticket does not authorize a necessary

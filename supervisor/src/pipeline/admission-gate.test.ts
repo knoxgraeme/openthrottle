@@ -196,4 +196,28 @@ describe("automatic admission gates", () => {
     expect(canonicalJson(result.executionPlan.execution_plan)).toBe(canonicalJson(plan));
     expect(result.executionPlan.generated_plan_digest).toBe(planDigest);
   });
+
+  it("returns validated rejection findings for a planner correction", () => {
+    const review = {
+      schema: "openthrottle.admission-review/v1",
+      verdict: "rejected",
+      summary: "Acceptance is incomplete.",
+      findings: [{ severity: "P1", message: "Add the missing failure-path acceptance.", path: "unit_a" }],
+      questions: [],
+      admission_basis_digest: basisDigest,
+      effective_manifest_digest: manifestDigest,
+      generated_plan_digest: planDigest,
+    };
+    const result = evaluateAdmissionReviewGate({
+      context,
+      decision: decision("structured"),
+      executionPlan: planArtifact(),
+      receipt: receipt("admission_review", "rejected", { review }, context.reviewer.skill),
+    });
+    expect(result).toMatchObject({
+      outcome: "failure",
+      correctionOwner: "planner",
+      review: { findings: review.findings, generated_plan_digest: planDigest },
+    });
+  });
 });
