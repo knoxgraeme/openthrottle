@@ -8,6 +8,46 @@ import {
 import type { PipelineStage } from "./manifest.js";
 
 describe("stage request construction", () => {
+  it("keeps a repository planner's admission authority and read-only request fence", () => {
+    const repositorySkill = {
+      schema: "openthrottle.repository-skill-package/v1" as const,
+      reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/planner`,
+      invocation: "planner",
+      directory: ".openthrottle/skills/planner",
+      commit: "a".repeat(40),
+      packageDigest: "b".repeat(64),
+      files: [{ path: ".openthrottle/skills/planner/SKILL.md", blobSha: "c".repeat(40), digest: "d".repeat(64) }],
+    };
+    const stage: PipelineStage = {
+      id: "admission_planner",
+      loop: { id: "planner", skill: "repo://planner", input_scope: "graph", receipt: "admission_decision", max_parallel: 1, max_rounds: 2, timeout_seconds: 60 },
+      executor: { kind: "agent", capability: "admission/plan@1" },
+      repositorySkill,
+      evaluator: { kind: "semantic", assurance: "semantic_attested", required_artifacts: ["standard_receipt"] },
+      context: "fresh",
+      live_steering: false,
+      credentials: ["model.invoke", "repo.read"],
+      produces: ["stage_result", "standard_receipt", "execution_plan"],
+      transitions: {} as PipelineStage["transitions"],
+    };
+    const request = buildStageRequest({
+      instanceId: "pipeline-1", manifestDigest: "a".repeat(64), runtimeRelease: "snapshot/v1",
+      capabilityDigest: "b".repeat(64), repositoryConfigDigest: "d".repeat(64), stage,
+      attemptId: "attempt-1", runId: "run-1", issueId: "issue-1", sessionId: "session-1",
+      generation: 1, taskType: "implement", taskContext: "Plan the ticket.", transitionContext: "",
+      repository: "owner/repo", baseCommit: "c".repeat(40), baseBranch: "main", branch: "ot/issue-1",
+      agent: "codex", contextRevision: 0, expectedSubject: null, nativeSessionId: null,
+    });
+    expect(request).toMatchObject({
+      capability: "admission/plan@1",
+      contextPolicy: "fresh",
+      credentialScopes: ["model.invoke", "repo.read"],
+      requiredArtifacts: ["stage_result", "standard_receipt"],
+      repositorySkill,
+    });
+    expect(request.credentialScopes).not.toContain("repo.write");
+  });
+
   it("hashes the complete immutable stage fence without credential material", () => {
     const request: Omit<StageRequestEnvelope, "requestHash" | "idempotencyKey"> = {
       protocol: STAGE_EXECUTOR_PROTOCOL,

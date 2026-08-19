@@ -24,6 +24,7 @@ import type {
   PipelineInstanceStatus,
   PipelineStageAttempt,
   PipelineStore,
+  AdmissionProjection,
 } from "./store.js";
 import { TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES } from "./evidence-limits.js";
 import { buildStageRequest, plannedStageRunId, type StageRequestInputArtifact } from "./stage-request.js";
@@ -39,6 +40,12 @@ import {
   GIT_CHECKPOINT_OBJECT_SCHEMA,
   type GitCheckpointObject,
 } from "./checkpoint-object.js";
+import {
+  automaticAdmissionInputArtifacts,
+  admissionReentryBudgetCount,
+  isAutomaticAdmissionCorrection,
+} from "./admission-routing.js";
+import { transitionContext } from "./transition-context.js";
 
 const PUBLISH_CAPABILITY = ["ce", "publish@1"].join("/");
 const GIT_COMMIT = /^[a-f0-9]{40}$/;
@@ -90,6 +97,7 @@ export interface PipelineReductionInput {
   attempts?: readonly PipelineStageAttempt[];
   stages: readonly PipelineInstanceStage[];
   event: PipelineCoordinatorEvent;
+  admissionProjection?: AdmissionProjection;
 }
 
 function terminalStatus(_outcome: PipelineOutcome): PipelineInstanceStatus {
@@ -102,64 +110,6 @@ function publishLinearEffect(idempotencyKey: string): CoordinatorEffectWrite {
     idempotencyKey,
     payload: canonicalJson({ publication: "deferred_to_coordinator" }),
   };
-}
-
-function transitionFindings(value: unknown): Array<{ severity: string; code: string | null; summary: string }> {
-  if (!Array.isArray(value)) return [];
-  return value
-    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
-    .slice(0, 20)
-    .map((item) => ({
-      severity: typeof item.severity === "string" ? item.severity.slice(0, 20) : "",
-      code: typeof item.code === "string" ? item.code.slice(0, 100) : null,
-      summary: typeof item.summary === "string" ? item.summary.slice(0, 500) : "",
-    }));
-}
-
-function transitionContext(event: PipelineCoordinatorEvent, fromStage: string): string {
-  const stageResult = event.artifacts?.find((artifact) => artifact.kind === "stage_result");
-  const review = event.artifacts?.find((artifact) => artifact.kind === "review");
-  let summary = "";
-  let evidence: string[] = [];
-  // The resumed native session usually remembers the findings, but that memory
-  // is best-effort (compaction, lost sessions, external feedback). The sealed
-  // request is the deterministic channel, so the structured findings ride it.
-  let findings: ReturnType<typeof transitionFindings> = [];
-  if (stageResult) {
-    try {
-      const payload = JSON.parse(stageResult.payload) as {
-        summary?: unknown;
-        evidence?: unknown;
-        findings?: unknown;
-      };
-      if (typeof payload.summary === "string") summary = payload.summary.slice(0, 2_000);
-      if (Array.isArray(payload.evidence)) {
-        evidence = payload.evidence
-          .filter((item): item is string => typeof item === "string")
-          .slice(0, 20)
-          .map((item) => item.slice(0, 1_000));
-      }
-      findings = transitionFindings(payload.findings);
-    } catch {
-      // The gate already validates typed artifact JSON. A control-event test
-      // may omit it; retain only the deterministic transition metadata then.
-    }
-  }
-  if (findings.length === 0 && review) {
-    try {
-      findings = transitionFindings((JSON.parse(review.payload) as { findings?: unknown }).findings);
-    } catch {
-      // Same rationale as above.
-    }
-  }
-  return canonicalJson({
-    from_stage: fromStage,
-    event_kind: event.kind,
-    outcome: event.outcome,
-    summary,
-    evidence,
-    findings,
-  });
 }
 
 function activeStage(input: PipelineReductionInput): PipelineStage {
@@ -449,28 +399,15 @@ function nextAttemptFor(input: PipelineReductionInput, stage: PipelineStage, ree
     hash: artifact.hash,
   })).sort((left, right) => left.kind.localeCompare(right.kind));
   const priorArtifacts = Array.isArray(priorRequest.inputArtifacts) ? priorRequest.inputArtifacts : [];
-  const automaticArtifacts = (): StageRequestInputArtifact[] | undefined => {
-    if (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.decisionGate) {
-      return eventArtifacts.filter((artifact) => ["standard_receipt", "execution_plan"].includes(artifact.kind));
-    }
-    if (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewer) {
-      return eventArtifacts.filter((artifact) => ["stage_result", "execution_plan"].includes(artifact.kind));
-    }
-    if (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewGate) {
-      return [
-        ...priorArtifacts.filter((artifact) => ["stage_result", "execution_plan"].includes(artifact.kind)),
-        ...eventArtifacts.filter((artifact) => artifact.kind === "standard_receipt"),
-      ].sort((left, right) => left.kind.localeCompare(right.kind));
-    }
-    if (stage.id === "structured_edit") {
-      return eventArtifacts.filter((artifact) => artifact.kind === "execution_plan");
-    }
-    return undefined;
-  };
   const inputArtifacts = input.instance.task_type === "tune"
     ? eventArtifacts
     : automaticManifest
-      ? automaticArtifacts()
+      ? automaticAdmissionInputArtifacts({
+          sourceStageId: input.attempt.stage_id,
+          targetStageId: stage.id,
+          eventArtifacts,
+          priorArtifacts,
+        })
     : Array.isArray(priorRequest.inputArtifacts)
       ? priorRequest.inputArtifacts
       : undefined;
@@ -690,15 +627,8 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       throw new Error(`stage ${stage.id} cannot enter provider wait without an exact subject`);
     }
     const isReentry = isPipelineReentry(input.manifest, stage.id, target.id);
-    const isAdmissionCorrection = isAutomaticManifest(input.manifest) && (
-      (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.decisionGate && target.id === AUTOMATIC_ADMISSION_STAGE_IDS.planner) ||
-      (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewGate && (
-        target.id === AUTOMATIC_ADMISSION_STAGE_IDS.planner ||
-        target.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewer
-      )) ||
-      (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.planner && target.id === AUTOMATIC_ADMISSION_STAGE_IDS.planner) ||
-      (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewer && target.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewer)
-    );
+    const isAdmissionCorrection = isAutomaticManifest(input.manifest) &&
+      isAutomaticAdmissionCorrection(stage.id, target.id);
     // Same-stage retries are governed by that transition's local
     // max_reentries. Only a backward transition into an earlier stage starts
     // a new whole-pipeline semantic repair round.
@@ -726,7 +656,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
       });
     }
     const completedTargetReentries = Math.max(0, targetState.attempt_count - 1);
-    if (target.loop && targetState.attempt_count > 0 &&
+    if (target.loop && targetState.attempt_count > 0 && !isAdmissionCorrection &&
       completedTargetReentries >= target.loop.max_rounds) {
       const exhausted = transition.on_exhausted ?? "needs_human";
       const clearsPublishedBinding = shouldClearPublishedBinding(input);
@@ -748,7 +678,10 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
         })] : [],
       });
     }
-    if (isReentry && transition.max_reentries !== undefined && targetState.reentry_count >= transition.max_reentries) {
+    const admissionBudgetCount = isAdmissionCorrection
+      ? admissionReentryBudgetCount(input.event.outcome, input.admissionProjection)
+      : targetState.reentry_count;
+    if (isReentry && transition.max_reentries !== undefined && admissionBudgetCount >= transition.max_reentries) {
       const exhausted = transition.on_exhausted!;
       const clearsPublishedBinding = shouldClearPublishedBinding(input);
       assertTerminalPublishedBinding(input, stage, exhausted, clearsPublishedBinding);
@@ -756,7 +689,7 @@ export function reducePipelineEvent(input: PipelineReductionInput): CoordinatorT
         ...input,
         eventPayloadHash,
         terminal: exhausted,
-        publishIdempotencyKey: `linear-exhausted:${input.instance.id}:${stage.id}:${targetState.reentry_count}`,
+        publishIdempotencyKey: `linear-exhausted:${input.instance.id}:${stage.id}:${admissionBudgetCount}`,
         waitReason: `re-entry exhausted at ${stage.id}`,
         immutableSubject: input.event.subject ?? null,
         publishedCommit: publishedCommitForEvent(input, stage),
@@ -900,13 +833,21 @@ export function coordinatePipelineEvent(
   const manifest = JSON.parse(instance.normalized_manifest) as PipelineManifest;
   const stages = store.listStages(instance.id);
   const attempts = store.listAttempts(instance.id);
-  const write = reducePipelineEvent({ manifest, instance, attempt, attempts, stages, event });
-  write.exhaustedEffectId = event.exhaustedEffectId;
-  write.exhaustedEffectError = event.exhaustedEffectError;
-  write.gateReceipt = gateReceipt;
   const currentAdmissionProjection = isAutomaticManifest(manifest)
     ? store.getAdmissionProjection(instance.id)
     : undefined;
+  const write = reducePipelineEvent({
+    manifest,
+    instance,
+    attempt,
+    attempts,
+    stages,
+    event,
+    admissionProjection: currentAdmissionProjection,
+  });
+  write.exhaustedEffectId = event.exhaustedEffectId;
+  write.exhaustedEffectError = event.exhaustedEffectError;
+  write.gateReceipt = gateReceipt;
   write.admissionProjection = isAutomaticAdmissionStage(attempt.stage_id)
     ? projectAdmissionTransition({ current: currentAdmissionProjection, attempt, event, write })
     : undefined;

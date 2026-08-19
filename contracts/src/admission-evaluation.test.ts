@@ -139,6 +139,22 @@ describe("automatic admission rollout evidence", () => {
     expect(() => scoreAdmissionRolloutEvidence(corpus, belowThreshold, governingDigests)).toThrow(/sol.*90|90.*sol/i);
   });
 
+  it("rejects four unambiguous needs_human pairs even when routing accuracy stays above 90 percent", () => {
+    const corpus = validateAdmissionEvaluationCorpus(
+      fixture("cases.json"), fixture("labels.json"), fixture("manifest.json"),
+    ).value;
+    const evidence = buildEvidence(corpus);
+    const affectedCases = new Set(["case-001", "case-002", "case-003", "case-004"]);
+    for (const decision of evidence.decisions) {
+      if (decision.model_id === "sol" && affectedCases.has(decision.case_id)) {
+        decision.route = "needs_human";
+      }
+    }
+
+    expect(() => scoreAdmissionRolloutEvidence(corpus, evidence, governingDigests))
+      .toThrow(/sol.*needs_human rate exceeds 10 percent/i);
+  });
+
   it("rejects unsafe routes and any unapproved structured output", () => {
     const corpus = validateAdmissionEvaluationCorpus(
       fixture("cases.json"), fixture("labels.json"), fixture("manifest.json"),

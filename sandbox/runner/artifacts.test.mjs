@@ -359,6 +359,114 @@ describe("normalized stage artifacts", () => {
       requiredArtifacts: ["standard_receipt", "execution_plan"],
       env: {},
     })).toThrow(/requires an admission execution plan|inconsistent execution plan/);
+
+    expect(() => validateStandardReceipt({ ...receipt, result: "simple" }, {}))
+      .toThrow(/must match.*admission decision route/);
+    expect(() => validateStandardReceipt({ ...receipt, evidence: [] }, {}))
+      .toThrow(/evidence.*at least one|evidence.*between 1 and 32/);
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      payload: { decision: {
+        ...receipt.payload.decision,
+        effective_manifest_digest: receipt.payload.decision.admission_basis_digest,
+      } },
+    }, {})).toThrow(/distinct from admission_basis_digest/);
+
+    const artifact = {
+      schema: "openthrottle.admission-execution-plan-artifact/v1",
+      execution_plan: executionPlan,
+      generated_plan_digest: generatedPlanDigest,
+      producer: {
+        skill: authority.producer.skill,
+        capability_digest: authority.producer.capability_digest,
+        skill_package_digest: null,
+      },
+      assurance: "semantic_attested",
+      source: {
+        admission_basis_digest: "e".repeat(64),
+        effective_manifest_digest: "a".repeat(64),
+        request_hash: "c".repeat(64),
+      },
+    };
+    const buildWithArtifact = (executionPlanArtifact) => buildStandardReceiptArtifacts({
+      receipt,
+      fence: { ...fence, capability: "admission/plan@1" },
+      authority,
+      requiredArtifacts: ["standard_receipt", "execution_plan"],
+      executionPlan: executionPlanArtifact,
+      env: {},
+    });
+    expect(() => buildWithArtifact({
+      ...artifact,
+      source: { ...artifact.source, effective_manifest_digest: artifact.source.admission_basis_digest },
+    })).toThrow(/distinct from admission_basis_digest/);
+    expect(() => buildWithArtifact({
+      ...artifact,
+      producer: { ...artifact.producer, skill_package_digest: "f".repeat(64) },
+    })).toThrow(/must be null for builtin skills/);
+
+    const duplicateUnitPlan = {
+      ...executionPlan,
+      units: [executionPlan.units[0], { ...executionPlan.units[0] }],
+    };
+    expect(() => buildWithArtifact({
+      ...artifact,
+      execution_plan: duplicateUnitPlan,
+      generated_plan_digest: digest(canonicalJson(duplicateUnitPlan)),
+    })).toThrow(/duplicate IDs/);
+    const unknownDependencyPlan = {
+      ...executionPlan,
+      units: [{ ...executionPlan.units[0], depends_on: ["missing_unit"] }],
+    };
+    expect(() => buildWithArtifact({
+      ...artifact,
+      execution_plan: unknownDependencyPlan,
+      generated_plan_digest: digest(canonicalJson(unknownDependencyPlan)),
+    })).toThrow(/unknown unit/);
+  });
+
+  it("keeps admission review receipt validation in parity with the shared contract", () => {
+    const receipt = {
+      schema: "openthrottle.receipt/v1",
+      type: "admission_review",
+      assurance: "semantic_attested",
+      result: "approved",
+      producer: {
+        worker_id: "reviewer",
+        skill: "builtin://review-admission-plan@1",
+        capability_digest: "b".repeat(64),
+        skill_package_digest: null,
+      },
+      subject: { base: "d".repeat(40), pre: "d".repeat(40), post: "d".repeat(40) },
+      fence: {
+        pipeline_instance_id: "pipeline-1", graph_digest: "a".repeat(64), unit_id: "admission_reviewer",
+        attempt_id: "attempt-2", parent_run_id: "run-2", action_attempt_id: "attempt-2",
+        generation: 1, native_session_id: null, request_hash: "c".repeat(64),
+      },
+      evidence: ["reviewed the sealed plan"],
+      payload: { review: {
+        schema: "openthrottle.admission-review/v1",
+        verdict: "approved",
+        summary: "The plan is complete and bounded.",
+        findings: [],
+        questions: [],
+        admission_basis_digest: "e".repeat(64),
+        effective_manifest_digest: "a".repeat(64),
+        generated_plan_digest: "f".repeat(64),
+      } },
+      issued_at: "2026-08-18T00:00:00.000Z",
+    };
+
+    expect(validateStandardReceipt(receipt, {}).payload.review.verdict).toBe("approved");
+    expect(() => validateStandardReceipt({ ...receipt, result: "rejected" }, {}))
+      .toThrow(/must match.*admission review verdict/);
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      payload: { review: {
+        ...receipt.payload.review,
+        generated_plan_digest: receipt.payload.review.effective_manifest_digest,
+      } },
+    }, {})).toThrow(/distinct from admission_basis_digest and effective_manifest_digest/);
   });
 
   it("accepts typed tune analysis and proposal receipts without granting gate authority", () => {

@@ -1748,6 +1748,48 @@ describe("GitHub contracts", () => {
     });
   });
 
+  it("loads repository package blobs concurrently and deduplicates identical blob SHAs", async () => {
+    let active = 0;
+    let maximumActive = 0;
+    const blobRequests: string[] = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith(`/git/commits/${"a".repeat(40)}`)) {
+        return Response.json({ tree: { sha: "e".repeat(40) } });
+      }
+      if (url.endsWith(`/git/trees/${"e".repeat(40)}?recursive=1`)) {
+        return Response.json({
+          truncated: false,
+          tree: [
+            { path: ".openthrottle/skills/x/SKILL.md", mode: "100644", type: "blob", sha: "1".repeat(40), size: 1 },
+            { path: ".openthrottle/skills/x/a.md", mode: "100644", type: "blob", sha: "2".repeat(40), size: 1 },
+            { path: ".openthrottle/skills/x/b.md", mode: "100644", type: "blob", sha: "2".repeat(40), size: 1 },
+          ],
+        });
+      }
+      const sha = url.split("/git/blobs/")[1];
+      if (sha) {
+        blobRequests.push(sha);
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        active -= 1;
+        return Response.json({ sha, encoding: "base64", content: Buffer.from("x").toString("base64"), size: 1 });
+      }
+      throw new Error(`unexpected request ${url}`);
+    }) as unknown as typeof fetch;
+
+    const result = await getRepositoryDirectoryAtCommit(
+      { token: "github", fetch: fetchMock },
+      "owner/repo",
+      "a".repeat(40),
+      ".openthrottle/skills/x"
+    );
+    expect(result.files).toHaveLength(3);
+    expect(blobRequests).toHaveLength(2);
+    expect(maximumActive).toBe(2);
+  });
+
   it("rejects repository directory packages with symlinks or traversal", async () => {
     await expect(
       getRepositoryDirectoryAtCommit(

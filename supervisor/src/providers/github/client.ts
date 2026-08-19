@@ -1448,8 +1448,7 @@ export async function getRepositoryDirectoryAtCommit(
   const entries = tree.tree
     .filter((entry) => entry.path === directory || entry.path.startsWith(prefix))
     .sort((left, right) => left.path.localeCompare(right.path));
-  const files: RepositoryPackageFileAtCommit[] = [];
-  let totalBytes = 0;
+  const regularEntries: typeof entries = [];
   for (const entry of entries) {
     if (entry.path === directory || entry.type === "tree") continue;
     assertSafeRepositoryPath(entry.path, "file");
@@ -1457,8 +1456,37 @@ export async function getRepositoryDirectoryAtCommit(
     if (entry.type !== "blob" || (entry.mode !== "100644" && entry.mode !== "100755")) {
       throw new Error(`${entry.path} is not a regular file in repository package ${directory}`);
     }
-    if (files.length >= 64) throw new Error(`${directory} package exceeds the 64 file limit`);
-    const blob = await readRepositoryBlob(client, repository, entry.sha, entry.path, 256 * 1024);
+    regularEntries.push(entry);
+    if (regularEntries.length > 64) throw new Error(`${directory} package exceeds the 64 file limit`);
+  }
+  if (regularEntries.length === 0) throw new Error(`${directory} package contains no regular files`);
+
+  const blobReads = new Map<string, Promise<{ content: string; size: number }>>();
+  const results = new Array<{ content: string; size: number } | Error>(regularEntries.length);
+  let nextIndex = 0;
+  await Promise.all(Array.from({ length: Math.min(8, regularEntries.length) }, async () => {
+    while (nextIndex < regularEntries.length) {
+      const index = nextIndex++;
+      const entry = regularEntries[index]!;
+      const key = entry.sha.toLowerCase();
+      let read = blobReads.get(key);
+      if (!read) {
+        read = readRepositoryBlob(client, repository, entry.sha, entry.path, 256 * 1024);
+        blobReads.set(key, read);
+      }
+      try {
+        results[index] = await read;
+      } catch (error) {
+        results[index] = error instanceof Error ? error : new Error(String(error));
+      }
+    }
+  }));
+
+  const files: RepositoryPackageFileAtCommit[] = [];
+  let totalBytes = 0;
+  for (const [index, entry] of regularEntries.entries()) {
+    const blob = results[index]!;
+    if (blob instanceof Error) throw blob;
     if (entry.size !== undefined && entry.size !== blob.size) {
       throw new Error(`${entry.path} content size does not match GitHub tree metadata`);
     }
@@ -1473,7 +1501,6 @@ export async function getRepositoryDirectoryAtCommit(
       size: blob.size,
     });
   }
-  if (files.length === 0) throw new Error(`${directory} package contains no regular files`);
   return { repository, commit: commit.toLowerCase(), directory, files };
 }
 // Every supervisor-authored comment starts with this prefix. Marker text is a

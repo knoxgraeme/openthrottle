@@ -440,8 +440,8 @@ function requestContextForStructuredPlan(payload: {
           details?: { execution_plan?: unknown };
         };
         const executionPlan = parsed.schema === EXECUTION_PLAN_SCHEMA_V2
-          ? parsed.execution_plan
-          : parsed.details?.execution_plan;
+          ? parsed
+          : parsed.execution_plan ?? parsed.details?.execution_plan;
         if (executionPlan !== undefined) {
           const schema = executionPlan && typeof executionPlan === "object" && !Array.isArray(executionPlan) &&
             typeof (executionPlan as { schema?: unknown }).schema === "string"

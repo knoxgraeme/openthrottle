@@ -81,12 +81,29 @@ interface StatusResponse {
   tickets?: TicketRow[];
 }
 
+const TERMINAL_CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
+const BIDI_CONTROL = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+const TERMINAL_OSC = /(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c)/g;
+const TERMINAL_CSI = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/g;
+const TERMINAL_ESCAPE = /\u001b[@-_]/g;
+
+function terminalSafe(input: unknown): string {
+  return String(input)
+    .replace(TERMINAL_OSC, '')
+    .replace(TERMINAL_CSI, '')
+    .replace(TERMINAL_ESCAPE, '')
+    .replace(TERMINAL_CONTROL, ' ')
+    .replace(BIDI_CONTROL, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function value(input: string | number | null | undefined): string {
-  return input === null || input === undefined || input === '' ? '-' : String(input);
+  return input === null || input === undefined || input === '' ? '-' : terminalSafe(input);
 }
 
 function shortSha(input: string | null | undefined): string {
-  return input ? input.slice(0, 12) : '-';
+  return input ? terminalSafe(input).slice(0, 12) : '-';
 }
 
 function renderTicket(ticket: TicketRow): void {
@@ -132,12 +149,12 @@ function renderTicket(ticket: TicketRow): void {
     console.log(`    route: proposed ${value(admission.proposed_route)} final ${value(admission.final_route)}`);
     console.log(`    terminal: ${value(admission.terminal_state)} reviewer: ${value(admission.reviewer_verdict)}`);
     console.log(`    retries: semantic ${admission.semantic_repair_count} infrastructure ${admission.infrastructure_retry_count}`);
-    console.log(`    planner: ${admission.planner.reference} (${shortSha(admission.planner.package_digest)})`);
-    console.log(`    reviewer: ${admission.reviewer.reference} (${shortSha(admission.reviewer.package_digest)})`);
+    console.log(`    planner: ${terminalSafe(admission.planner.reference)} (${shortSha(admission.planner.package_digest)})`);
+    console.log(`    reviewer: ${terminalSafe(admission.reviewer.reference)} (${shortSha(admission.reviewer.package_digest)})`);
     console.log(`    digests: admission ${shortSha(admission.admission_basis_digest)} manifest ${shortSha(admission.effective_manifest_digest)} plan ${shortSha(admission.generated_plan_digest)} checkpoint ${shortSha(admission.checkpoint_digest)}`);
-    console.log(`    task branch: ${admission.task_branch.branch} ${admission.task_branch.state} ${shortSha(admission.task_branch.lineage)}`);
-    console.log(`    publication: ${admission.publication_state}`);
-    for (const question of admission.questions) console.log(`    question: ${question}`);
+    console.log(`    task branch: ${terminalSafe(admission.task_branch.branch)} ${terminalSafe(admission.task_branch.state)} ${shortSha(admission.task_branch.lineage)}`);
+    console.log(`    publication: ${terminalSafe(admission.publication_state)}`);
+    for (const question of admission.questions) console.log(`    question: ${terminalSafe(question)}`);
   }
   if (p.structured_units && p.structured_units.length > 0) {
     console.log('  units:');
@@ -175,7 +192,8 @@ export default async function status(input?: string | string[]): Promise<void> {
       return;
     }
     try {
-      console.log(JSON.stringify(await detailResponse.json(), null, 2));
+      console.log(JSON.stringify(await detailResponse.json(), (_key, candidate) =>
+        typeof candidate === 'string' ? terminalSafe(candidate) : candidate, 2));
     } catch (err: unknown) {
       console.error(`Could not parse response as JSON: ${getErrorMessage(err)}`);
       process.exit(1);

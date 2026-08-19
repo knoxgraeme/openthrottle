@@ -5,6 +5,7 @@ import {
   evaluateAdmissionReviewGate,
   type AdmissionGateContext,
 } from "./admission-gate.js";
+import { validateExecutionPlanArtifact } from "./gates.js";
 
 const basisDigest = "a".repeat(64);
 const manifestDigest = "b".repeat(64);
@@ -111,6 +112,18 @@ function planArtifact(assurance: "semantic_attested" | "executor_verified" = "se
 }
 
 describe("automatic admission gates", () => {
+  it("accepts the raw admission execution-plan artifact used by planner stage results", () => {
+    const payload = canonicalJson(planArtifact());
+    expect(() => validateExecutionPlanArtifact({
+      kind: "execution_plan",
+      schemaVersion: 1,
+      assurance: "semantic_attested",
+      subject,
+      payload,
+      hash: digestNormalized(payload),
+    })).not.toThrow();
+  });
+
   it("maps simple, structured, and needs_human only to their declared branches", () => {
     expect(evaluateAdmissionDecisionGate({
       context,

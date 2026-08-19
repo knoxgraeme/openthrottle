@@ -204,6 +204,7 @@ describe("database migrations", () => {
       "3d9ff6c68452b4f8401989cb930b953e373cb9e27798110f49c09d1ccf707538",
       "2688526a0eb8caae1e9a6514aa6aaeb8e9d695d375c769cb9c2df0b5ab19f992",
       "f01e2f80313eca7c21b2adc4bcf65971b952f64eaa975a3fb5cfd63af54a1ce1",
+      "89b72b4b3ce71fe5019c444134a5d881ba31c38ba658e98dcc277e50706f8c9e",
     ]);
   });
 
@@ -626,8 +627,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 57,
-      name: `automatic-admission-projection${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 58,
+      name: `automatic-admission-artifact-lookup-index${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -679,8 +680,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 57,
-      name: `automatic-admission-projection${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 58,
+      name: `automatic-admission-artifact-lookup-index${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 
@@ -1875,6 +1876,30 @@ describe("database migrations", () => {
       .toEqual({ count: 0 });
     expect(() => databaseMigrations.find((migration) => migration.version === 57)!.up(db!))
       .not.toThrow();
+  });
+
+  it("uses the admission artifact lookup index and remains reopenable under v55 authority", () => {
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-v55-reopen-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "supervisor.db");
+    db = openDb(path);
+    const plan = db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT payload FROM pipeline_artifacts
+      WHERE pipeline_instance_id = ? AND artifact_hash = ? AND kind = ?
+        AND (? IS NULL OR assurance = ?)
+      LIMIT 1
+    `).all("instance", "a".repeat(64), "execution_plan", "executor_verified", "executor_verified") as Array<{ detail: string }>;
+    expect(plan.some((row) => row.detail.includes("pipeline_artifacts_admission_detail_idx"))).toBe(true);
+    db.close();
+    db = new Database(path);
+    db.pragma("foreign_keys = ON");
+    expect(() => applyDatabaseMigrationsForAuthority(db!, {
+      migrations: databaseMigrations.filter((migration) => migration.version <= 55),
+      rollbackCompatibleMigrationNameSuffix: ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+    })).not.toThrow();
+    expect(db.prepare("SELECT version FROM schema_migrations WHERE version IN (56, 57) ORDER BY version").all())
+      .toEqual([{ version: 56 }, { version: 57 }]);
   });
 
   it(`reopens a v46 database under the v45 migration authority from ${PREDECESSOR_RELEASE_COMMIT.slice(0, 7)}`, () => {

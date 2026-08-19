@@ -491,17 +491,32 @@ function validateUnitPhaseBindingCapabilityContract(
   }
 }
 
-function validateTunePipelineStageCapabilityContract(stage: PipelineStage, path: string): void {
-  if (stage.executor.capability !== "core/tune@1" && !stage.executor.capability.startsWith("supervisor/")) {
+function validatePipelineStageCapabilityContract(stage: PipelineStage, path: string): void {
+  if (stage.executor.capability === REPOSITORY_SKILL_CAPABILITY) return;
+  if (!["core/tune@1", "admission/plan@1", "admission/review@1"].includes(stage.executor.capability) &&
+      !stage.executor.capability.startsWith("supervisor/")) {
     return;
   }
   for (const violation of capabilityCredentialContractViolations({
     capability: stage.executor.capability,
     context: stage.context,
     credentials: stage.credentials,
-    requiredArtifacts: stage.evaluator.required_artifacts,
+    requiredArtifacts: stage.produces,
   })) {
     fail(`${path}.${violation.field}`, violation.message);
+  }
+  const admissionContract = stage.executor.capability === "admission/plan@1"
+    ? { receipt: "admission_decision", produces: ["stage_result", "standard_receipt", "execution_plan"] }
+    : stage.executor.capability === "admission/review@1"
+      ? { receipt: "admission_review", produces: ["stage_result", "standard_receipt"] }
+      : undefined;
+  if (admissionContract) {
+    if (!stage.loop || stage.loop.receipt !== admissionContract.receipt) {
+      fail(`${path}.loop.receipt`, `must be ${admissionContract.receipt} for ${stage.executor.capability}`);
+    }
+    if (canonicalJson([...stage.produces].sort()) !== canonicalJson([...admissionContract.produces].sort())) {
+      fail(`${path}.produces`, `must exactly match ${admissionContract.produces.join(", ")} for ${stage.executor.capability}`);
+    }
   }
 }
 
@@ -726,7 +741,10 @@ function parseStage(
     fail(`${path}.loop`, "is allowed only for agent executors");
   }
   if (stage.loop && stage.executor.kind === "agent") {
-    const expectedCapability = capabilityForLoopSkill(stage.loop, stage.repositorySkill, path);
+    const loopCapability = capabilityForLoopSkill(stage.loop, stage.repositorySkill, path);
+    const repositoryAdmissionCapability = stage.repositorySkill &&
+      (stage.executor.capability === "admission/plan@1" || stage.executor.capability === "admission/review@1");
+    const expectedCapability = repositoryAdmissionCapability ? stage.executor.capability : loopCapability;
     if (stage.executor.capability !== expectedCapability) {
       fail(`${path}.executor.capability`, "must match loop.skill");
     }
@@ -746,8 +764,12 @@ function parseStage(
     fail(`${path}.commandName`, "is allowed only for command executors");
   }
   if (stage.repositorySkill) {
-    if (stage.executor.kind !== "agent" || stage.executor.capability !== REPOSITORY_SKILL_CAPABILITY) {
-      fail(`${path}.repositorySkill`, "is allowed only for agent/repository-skill@1 stages");
+    if (stage.executor.kind !== "agent" || ![
+      REPOSITORY_SKILL_CAPABILITY,
+      "admission/plan@1",
+      "admission/review@1",
+    ].includes(stage.executor.capability)) {
+      fail(`${path}.repositorySkill`, "is allowed only for repository-backed agent stages");
     }
   }
   if (stage.executor.kind === "agent" &&
@@ -779,7 +801,7 @@ function parseStage(
   if (!stage.produces.includes("stage_result")) {
     fail(`${path}.produces`, "must include the typed stage_result artifact");
   }
-  validateTunePipelineStageCapabilityContract(stage, path);
+  validatePipelineStageCapabilityContract(stage, path);
   return stage;
 }
 
@@ -1091,11 +1113,7 @@ function applyAutomaticSkillBinding(
     fail(`automatic.${stageId}.package`, "does not match the configured reference and digest");
   }
   stage.loop.skill = `repo://${binding.package.invocation}`;
-  stage.executor.capability = REPOSITORY_SKILL_CAPABILITY;
   stage.repositorySkill = binding.package;
-  if (!manifest.requires.capabilities.includes(REPOSITORY_SKILL_CAPABILITY)) {
-    manifest.requires.capabilities.push(REPOSITORY_SKILL_CAPABILITY);
-  }
 }
 
 export function compileAutomaticManifest(input: CompileAutomaticManifestInput): ValidatedPipelineManifest {

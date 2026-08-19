@@ -571,7 +571,7 @@ describe("loop action request validation", () => {
       now: () => "2026-07-29T00:00:00.000Z",
     });
 
-    expect(result.outcome).toBe("success");
+    expect(result.outcome, result.receipt).toBe("success");
     expect(JSON.parse(result.receipt).producer.skill).toBe("builtin://ce/implement@1");
   });
 

@@ -176,6 +176,92 @@ describe('operator commands', () => {
     expect(output.mock.calls.flat().join('\n')).toContain('"result": "approved"');
   });
 
+  it('neutralizes terminal controls and bidi overrides in automatic-admission status and detail', async () => {
+    const malicious = '\u001b[2J\u001b]0;owned\u0007hidden\u202Etxt';
+    const statusResponse = {
+      tickets: [{
+        id: 'linear:issue-1',
+        reference: 'OT-1',
+        current_session_id: 'session-1',
+        control_provider: 'linear',
+        external_thread: { provider: 'linear', id: 'issue-1', reference: 'OT-1' },
+        branch: 'ot/issue-1',
+        agent: 'codex',
+        state: 'active',
+        pr_url: null,
+        updated_at: '2026-08-18T00:00:00.000Z',
+        pipeline: {
+          pipeline_id: 'core/automatic/identity',
+          pipeline_version: 1,
+          generation: 1,
+          status: 'waiting_human',
+          terminal_outcome: null,
+          stage_id: 'admission_planner',
+          attempt_ordinal: 1,
+          reentry_ordinal: 0,
+          wait_reason: null,
+          whose_move: 'waiting on you',
+          last_error: null,
+          last_state_change_at: '2026-08-18T00:00:00.000Z',
+          subject: 'a'.repeat(40),
+          published_commit: null,
+          published_pr_url: null,
+          gate_result: null,
+          context_policy: 'fresh',
+          publication_state: 'pending',
+          publication_id: null,
+          publication_error: null,
+          recovery_action: null,
+          effect_state: 'idle',
+          effect_kind: null,
+          effect_status: null,
+          effect_error: null,
+          sandbox_ingestion_error: null,
+          admission: {
+            generated_content: true,
+            proposed_route: 'needs_human',
+            final_route: null,
+            semantic_repair_count: 0,
+            infrastructure_retry_count: 0,
+            terminal_state: malicious,
+            questions: [malicious],
+            reviewer_verdict: null,
+            planner: { reference: malicious, package_digest: malicious },
+            reviewer: { reference: malicious, package_digest: malicious },
+            admission_basis_digest: malicious,
+            effective_manifest_digest: malicious,
+            generated_plan_digest: malicious,
+            checkpoint_digest: malicious,
+            task_branch: { branch: malicious, state: malicious, lineage: malicious },
+            publication_state: malicious,
+          },
+          structured_units: [],
+        },
+      }],
+    };
+    const detailResponse = {
+      generated_content: true,
+      warning: malicious,
+      accepted_plan: { rationale: malicious },
+      reviewer_receipt: { summary: malicious },
+    };
+    const fetchMock = vi.fn(async (input: string | URL | Request) =>
+      Response.json(String(input).endsWith('/admission') ? detailResponse : statusResponse));
+    vi.stubGlobal('fetch', fetchMock);
+    const output = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    await status('linear:issue-1');
+    await status(['linear:issue-1', '--admission']);
+
+    const printed = output.mock.calls.flat().join('\n');
+    expect(printed).not.toContain('\u001b');
+    expect(printed).not.toContain('\u0007');
+    expect(printed).not.toContain('\u202E');
+    expect(printed).not.toContain('[2J');
+    expect(printed).not.toContain(']0;owned');
+    expect(printed).toContain('hidden');
+  });
+
   it('filters status output to one ticket', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({
       tickets: [

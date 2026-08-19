@@ -1,7 +1,9 @@
 import {
   canonicalJson,
   digestNormalized,
+  ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES,
   TUNE_ANALYSIS_INPUT_SCHEMA,
+  validateAdmissionExecutionPlanArtifact,
   validateStandardReceipt,
   validateTuneAnalysisInputContract,
   type StandardReceipt,
@@ -313,6 +315,22 @@ function parseArtifactPayload(artifact: PipelineEventArtifact, limit = ARTIFACT_
   };
 }
 
+export function validateExecutionPlanArtifact(artifact: PipelineEventArtifact): void {
+  if (artifact.schemaVersion !== 1) throw new Error("artifact execution_plan schema version is unsupported");
+  if (Buffer.byteLength(artifact.payload, "utf8") > ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES) {
+    throw new Error("artifact execution_plan exceeds the gate size limit");
+  }
+  if (containsSecretShapedValue(artifact.payload)) {
+    throw new Error("artifact execution_plan contains a secret-shaped value");
+  }
+  if (!SHA256.test(artifact.hash) || digestNormalized(artifact.payload) !== artifact.hash) {
+    throw new Error("artifact execution_plan hash mismatch");
+  }
+  const parsed: unknown = JSON.parse(artifact.payload);
+  if (canonicalJson(parsed) !== artifact.payload) throw new Error("artifact execution_plan is not canonical JSON");
+  validateAdmissionExecutionPlanArtifact(parsed, { source: "artifact execution_plan" });
+}
+
 function tuneReceipt<T extends "tune_analysis" | "tune_proposal">(
   payloads: readonly TypedArtifactPayload[],
   expectedType: T,
@@ -588,7 +606,9 @@ export function evaluateStageGate(
     throw new Error("workspace changed after stage evidence was sealed");
   }
   const artifactLimit = instance.task_type === "tune" ? TUNE_ARTIFACT_PAYLOAD_LIMIT_BYTES : ARTIFACT_LIMIT;
-  const payloads = artifacts.map((artifact) => {
+  const executionPlan = artifacts.find((artifact) => artifact.kind === "execution_plan");
+  if (executionPlan) validateExecutionPlanArtifact(executionPlan);
+  const payloads = artifacts.filter((artifact) => artifact.kind !== "execution_plan").map((artifact) => {
     const payload = parseArtifactPayload(artifact, artifactLimit);
     validateFence(payload, artifact, instance, attempt, stage, event, subject);
     return payload;

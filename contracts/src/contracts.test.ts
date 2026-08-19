@@ -1610,8 +1610,11 @@ describe("Stage C contract fixtures", () => {
 
   it("keeps admission legacy by absence and rejects planning authority on other intents", () => {
     const config = JSON.parse(readFixture("valid", "config-repository.json")) as Record<string, unknown>;
-    expect(parseRepositoryConfigContract(JSON.stringify(config)).value.intents?.implement?.admission_mode)
-      .toBeUndefined();
+    const legacy = parseRepositoryConfigContract(JSON.stringify(config));
+    expect(legacy.value.intents?.implement?.admission_mode).toBeUndefined();
+    expect(legacy.value.intents?.implement?.planner_skill).toBeUndefined();
+    expect(legacy.value.intents?.implement?.reviewer_skill).toBeUndefined();
+    expect(parseRepositoryConfigContract(legacy.normalized).normalized).toBe(legacy.normalized);
 
     config.intents = {
       investigate: {
@@ -1622,6 +1625,16 @@ describe("Stage C contract fixtures", () => {
     };
     expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
       .toThrow(/config\.intents\.investigate\.admission_mode: is valid only for the implement intent/);
+  });
+
+  it("keeps pre-admission receipt payloads byte-stable for external consumers", () => {
+    const raw = readFixture("valid", "receipt-unit-decision.json");
+    const before = parseStandardReceipt(raw, { source: "legacy external receipt" });
+    const after = parseStandardReceipt(before.normalized, { source: "legacy external receipt" });
+
+    expect(after.normalized).toBe(before.normalized);
+    expect(after.value.type).toBe("unit_decision");
+    expect(after.normalized).not.toContain("admission_");
   });
 
   it("closes automatic admission decision and review outcomes around distinct digests", () => {
