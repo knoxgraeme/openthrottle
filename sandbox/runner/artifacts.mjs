@@ -1,5 +1,16 @@
 import { createHash } from "node:crypto";
 import { CAPABILITY_CONTRACTS, canonicalJson } from "./capabilities.mjs";
+import { harnessAgentReport } from "./harness-report.mjs";
+export {
+  HARNESS_REPORT_BOUNDARIES,
+  HARNESS_REPORT_CAUSES,
+  HARNESS_REPORT_COMPONENTS,
+  HARNESS_REPORT_CONFIDENCE,
+  HARNESS_REPORT_FAILURE_CLASSES,
+  HARNESS_REPORT_INVESTIGATIONS,
+  HARNESS_REPORT_REPEATABILITY,
+  HARNESS_REPORT_SIGNALS,
+} from "./harness-report.mjs";
 
 export const STAGE_OUTCOMES = Object.freeze([
   "success",
@@ -372,7 +383,17 @@ function receiptPayload(type, value, env) {
     };
   }
   if (type === "unit_decision") {
-    const payload = exactPayload(value, "standard receipt payload", new Set(["rationale", "revision_request", "context_updates", "accepted_subject"]), env);
+    const payload = exactPayload(value, "standard receipt payload", new Set([
+      "rationale", "revision_request", "context_updates", "accepted_subject", "harness_report",
+    ]), env);
+    let harnessReport;
+    if (payload.harness_report !== undefined) {
+      try {
+        harnessReport = harnessAgentReport(payload.harness_report, "standard receipt payload harness_report");
+      } catch {
+        harnessReport = undefined;
+      }
+    }
     return {
       rationale: boundedText(payload.rationale, "standard receipt payload rationale", 4_000, env),
       ...(payload.revision_request === undefined ? {} : {
@@ -382,6 +403,7 @@ function receiptPayload(type, value, env) {
       ...(payload.accepted_subject === undefined ? {} : {
         accepted_subject: patternedText(payload.accepted_subject, "standard receipt payload accepted_subject", GIT_SUBJECT, env, 64),
       }),
+      ...(harnessReport === undefined ? {} : { harness_report: harnessReport }),
     };
   }
   if (type === "semantic_review") {

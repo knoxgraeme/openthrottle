@@ -22,6 +22,7 @@ import {
   type TuneAnalysis,
   type TuneProposal,
 } from "./tune-contract.js";
+import { parseHarnessAgentReport, type HarnessAgentReport } from "./harness-report.js";
 
 export const RECEIPT_SCHEMA = "openthrottle.receipt/v1" as const;
 // Kept byte-identical with sandbox/runner/artifacts.mjs. A structured repair
@@ -93,6 +94,7 @@ interface UnitDecisionPayload {
   revision_request?: string;
   context_updates: ContextRecord[];
   accepted_subject?: string;
+  harness_report?: HarnessAgentReport;
 }
 
 interface SemanticReviewPayload {
@@ -325,6 +327,15 @@ function parseFindings(value: unknown, path: string): ReviewFinding[] {
   }, { max: 64 });
 }
 
+function parseOptionalHarnessAgentReport(value: unknown, path: string): HarnessAgentReport | undefined {
+  if (value === undefined) return undefined;
+  try {
+    return parseHarnessAgentReport(value, path);
+  } catch {
+    return undefined;
+  }
+}
+
 function parseReceiptPayload(type: "unit_completion", value: unknown, path: string): UnitCompletionPayload;
 function parseReceiptPayload(type: "unit_decision", value: unknown, path: string): UnitDecisionPayload;
 function parseReceiptPayload(type: "semantic_review", value: unknown, path: string): SemanticReviewPayload;
@@ -351,7 +362,10 @@ function parseReceiptPayload(type: StandardReceiptType, value: unknown, path: st
     };
   }
   if (type === "unit_decision") {
-    const input = objectAt(value, path, ["rationale", "revision_request", "context_updates", "accepted_subject"]);
+    const input = objectAt(value, path, [
+      "rationale", "revision_request", "context_updates", "accepted_subject", "harness_report",
+    ]);
+    const harnessReport = parseOptionalHarnessAgentReport(input.harness_report, `${path}.harness_report`);
     return {
       rationale: stringAt(input.rationale, `${path}.rationale`, { max: 4_000 }),
       ...(input.revision_request === undefined ? {} : {
@@ -361,6 +375,7 @@ function parseReceiptPayload(type: StandardReceiptType, value: unknown, path: st
       ...(input.accepted_subject === undefined ? {} : {
         accepted_subject: stringAt(input.accepted_subject, `${path}.accepted_subject`, { pattern: GIT_SUBJECT }),
       }),
+      ...(harnessReport === undefined ? {} : { harness_report: harnessReport }),
     };
   }
   if (type === "semantic_review") {

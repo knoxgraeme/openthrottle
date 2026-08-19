@@ -3,6 +3,7 @@ import type { ActivityPublicationPort } from "../app/ports.js";
 import type { SupervisorStore } from "../persistence/store.js";
 import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
 import type { PipelineStore } from "../pipeline/store.js";
+import type { HarnessReportStore } from "../persistence/harness-report-store.js";
 import type { RuntimeInventory, RuntimeInventoryResource, RuntimeStopper, SandboxRuntime } from "../runtime/contracts.js";
 import { reapExpiredRuns } from "./reaper.js";
 import {
@@ -16,6 +17,8 @@ const MINUTE_MS = 60 * 1000;
 const WEBHOOK_REDELIVERY_PRUNE_LIMIT = 1_000;
 const EXECUTION_PRIVATE_ARTIFACT_RETENTION_DAYS = 30;
 const EXECUTION_PRIVATE_ARTIFACT_PRUNE_LIMIT = 100;
+const HARNESS_REPORT_RETENTION_DAYS = 30;
+const HARNESS_REPORT_PRUNE_LIMIT = 1_000;
 // Monotonic settings key families (one row per external event, never
 // rewritten) that would otherwise grow without bound. Their rows are
 // idempotence/provenance markers for webhook replays, which the 7-day
@@ -49,7 +52,8 @@ export async function runSweep(
   pipelines: PipelineStore & Pick<ExecutionUnitStore, "pruneExecutionWorkPrivateArtifacts">,
   activityPublisher: Pick<ActivityPublicationPort, "publishError">,
   reconcileWebhooks?: () => Promise<void>,
-  reconcileRuntimeResources?: RuntimeResourceReconciler
+  reconcileRuntimeResources?: RuntimeResourceReconciler,
+  harnessReports?: Pick<HarnessReportStore, "prune"> & { reconcile?: () => void }
 ): Promise<void> {
   await reapExpiredRuns({ runtime, store, activityPublisher, pipelines });
   try {
@@ -89,6 +93,12 @@ export async function runSweep(
     daysAgoIso(EXECUTION_PRIVATE_ARTIFACT_RETENTION_DAYS),
     EXECUTION_PRIVATE_ARTIFACT_PRUNE_LIMIT
   );
+  try {
+    harnessReports?.reconcile?.();
+  } catch (error) {
+    console.error("[sweep] harness report reconciliation failed:", error);
+  }
+  harnessReports?.prune(daysAgoIso(HARNESS_REPORT_RETENTION_DAYS), HARNESS_REPORT_PRUNE_LIMIT);
   const monotonicSettingsCutoff = daysAgoIso(MONOTONIC_SETTINGS_RETENTION_DAYS);
   for (const prefix of MONOTONIC_SETTINGS_PREFIXES) {
     store.pruneSettings(prefix, monotonicSettingsCutoff);

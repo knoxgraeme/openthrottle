@@ -51,6 +51,7 @@ const cfg: Config = {
   pipelineCatalogPath: "pipelines",
   sandboxRuntimeRelease: "release",
   sandboxRuntimeDescriptorPath: "runtime.json",
+  harnessReportingMode: "off",
 };
 
 type ServerRuntime = RuntimeInventory & RuntimeLogs & RuntimeSnapshotReadiness;

@@ -82,6 +82,8 @@ describe("runSweep", () => {
       listLabeledResources: async () => [oldOrphan, newOrphan, knownActive],
     };
     const reconcileWebhooks = vi.fn(async () => undefined);
+    const pruneHarnessReports = vi.fn((_beforeIso: string, _limit: number) => 0);
+    const reconcileHarnessReports = vi.fn(() => undefined);
     const sweepStartedAt = Date.now();
 
     await runSweep(
@@ -90,7 +92,9 @@ describe("runSweep", () => {
       { orphanGraceMinutes: 5, runtimeResourceRetentionMinutes: 60, runOutcomeRetentionDays: 180 } as Config,
       pipelines,
       activityPublisherFor(store),
-      reconcileWebhooks
+      reconcileWebhooks,
+      undefined,
+      { prune: pruneHarnessReports, reconcile: reconcileHarnessReports }
     );
 
     expect(reconcileWebhooks).toHaveBeenCalledOnce();
@@ -113,6 +117,12 @@ describe("runSweep", () => {
     expect(privateArtifactLimit).toBe(100);
     expect(Date.parse(privateArtifactCutoff)).toBeGreaterThanOrEqual(sweepStartedAt - thirtyDaysMs);
     expect(Date.parse(privateArtifactCutoff)).toBeLessThanOrEqual(Date.now() - thirtyDaysMs);
+    expect(pruneHarnessReports).toHaveBeenCalledOnce();
+    expect(reconcileHarnessReports).toHaveBeenCalledOnce();
+    const [harnessCutoff, harnessLimit] = pruneHarnessReports.mock.calls[0]!;
+    expect(harnessLimit).toBe(1_000);
+    expect(Date.parse(harnessCutoff)).toBeGreaterThanOrEqual(sweepStartedAt - thirtyDaysMs);
+    expect(Date.parse(harnessCutoff)).toBeLessThanOrEqual(Date.now() - thirtyDaysMs);
   });
 
   it("prunes aged monotonic settings families without touching live head projections", async () => {

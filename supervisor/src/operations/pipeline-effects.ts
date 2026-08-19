@@ -49,6 +49,7 @@ import {
   HOT_PATH_RECLAIM_WAIT_TIMEOUT_MS,
   type RuntimeResourceReconciler,
 } from "./runtime-resource-reclaim.js";
+import type { HarnessReportCapture } from "./harness-reporting.js";
 
 const EFFECT_LEASE_MS = 60_000;
 const RETRY_BASE_MS = 5_000;
@@ -120,6 +121,7 @@ interface PipelineEffectProcessorDeps {
   // structured-child-runtime default. Harnesses that pause a run at an exact
   // mid-flight state set 1 (see structured-walking-skeleton.mjs).
   maxChildDrainsPerTick?: number;
+  harnessReports?: HarnessReportCapture;
 }
 
 interface StopEffectControl {
@@ -291,6 +293,7 @@ export function createPipelineEffectProcessor(deps: PipelineEffectProcessorDeps)
     taskTimeoutSeconds: deps.taskTimeoutSeconds,
     now,
     maxChildDrainsPerTick: deps.maxChildDrainsPerTick,
+    harnessReports: deps.harnessReports,
     completeParentStage(event: PipelineCoordinatorEvent): PipelineInstance {
       if (!event.runId) throw new Error(`pipeline composite event ${event.id} has no run binding`);
       return deps.tickets.finishRunAndThen(

@@ -96,6 +96,7 @@ import {
 } from "./subject-derivation.js";
 import { createReviewOrchestrator, type ReviewOrchestrator } from "./review-orchestration.js";
 import { createUnitEffectProcessor } from "./unit-effects.js";
+import type { HarnessReportCapture } from "./harness-reporting.js";
 
 // Bounds the per-tick child-action walk in drainCompositeChildren so one
 // graph with a deep chain of ready results cannot monopolize a drain tick.
@@ -112,6 +113,7 @@ type StructuredChildRuntimeDeps = {
   // (sandbox/tests/structured-walking-skeleton.mjs) set 1 to restore
   // one-action-per-drain granularity for their setup phase.
   maxChildDrainsPerTick?: number;
+  harnessReports?: HarnessReportCapture;
 };
 
 type LoopDispatchBinding = {
@@ -919,6 +921,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
     receipt?: string;
     nativeSessionId?: string | null;
     decision?: ReturnType<typeof evaluateUnitAcceptanceGate>;
+    afterSettlement?: () => void;
   } | {
     terminal: true;
     resultHash: string;
@@ -1094,6 +1097,12 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
           receipt: canonicalJson(receipt),
           nativeSessionId,
           decision,
+          afterSettlement: () => deps.harnessReports?.capture({
+            instance,
+            action,
+            receipt: receipt as UnitDecisionReceipt,
+            decision,
+          }),
         };
       }
       if (action.action_kind === "integrate") {

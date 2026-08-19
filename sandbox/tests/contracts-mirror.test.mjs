@@ -4,6 +4,14 @@ import { describe, expect, it } from "vitest";
 import { canonicalJson, canonicalValue } from "../runner/capabilities.mjs";
 import {
   COMMAND_DIAGNOSTIC_TAIL_MAX_BYTES,
+  HARNESS_REPORT_BOUNDARIES,
+  HARNESS_REPORT_CAUSES,
+  HARNESS_REPORT_COMPONENTS,
+  HARNESS_REPORT_CONFIDENCE,
+  HARNESS_REPORT_FAILURE_CLASSES,
+  HARNESS_REPORT_INVESTIGATIONS,
+  HARNESS_REPORT_REPEATABILITY,
+  HARNESS_REPORT_SIGNALS,
   STANDARD_RECEIPT_RESULTS,
   digest,
 } from "../runner/artifacts.mjs";
@@ -103,6 +111,19 @@ describe("contracts mirrors carried by the sandbox runner", () => {
     }
     expect(JSON.parse(JSON.stringify(STANDARD_RECEIPT_RESULTS)))
       .toEqual(JSON.parse(JSON.stringify(contractsResults)));
+  });
+
+  it("keeps harness-report vocabularies aligned with the shared contract", async () => {
+    const contract = await importContractsDist("harness-report.js");
+    if (!contract) throw new Error("missing built artifact contracts/dist/harness-report.js");
+    expect([...HARNESS_REPORT_COMPONENTS]).toEqual([...contract.HARNESS_REPORT_COMPONENTS]);
+    expect([...HARNESS_REPORT_BOUNDARIES]).toEqual([...contract.HARNESS_REPORT_BOUNDARIES]);
+    expect([...HARNESS_REPORT_CONFIDENCE]).toEqual([...contract.HARNESS_REPORT_CONFIDENCE]);
+    expect([...HARNESS_REPORT_FAILURE_CLASSES]).toEqual([...contract.HARNESS_REPORT_FAILURE_CLASSES]);
+    expect([...HARNESS_REPORT_SIGNALS]).toEqual([...contract.HARNESS_REPORT_SIGNALS]);
+    expect([...HARNESS_REPORT_CAUSES]).toEqual([...contract.HARNESS_REPORT_CAUSES]);
+    expect([...HARNESS_REPORT_INVESTIGATIONS]).toEqual([...contract.HARNESS_REPORT_INVESTIGATIONS]);
+    expect([...HARNESS_REPORT_REPEATABILITY]).toEqual([...contract.HARNESS_REPORT_REPEATABILITY]);
   });
 
   it("keeps the runner NATIVE_SESSION_ID mirrors byte-identical with contracts validation.ts", () => {

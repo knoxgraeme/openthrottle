@@ -72,6 +72,7 @@ function config(): Config {
     pipelineCatalogPath: shippedCatalogPath,
     sandboxRuntimeRelease: "admission-test/v1",
     sandboxRuntimeDescriptorPath: "pipelines/runtime-capabilities-v1.json",
+    harnessReportingMode: "off",
   };
 }
 

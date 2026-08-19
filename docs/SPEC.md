@@ -832,7 +832,8 @@ SQLite is the authority. Core tables include:
 
 - ticket/run/session projections: `tickets`, `runs`, `agent_sessions`;
 - durable transport: `webhook_deliveries`, `control_outbox`, `session_inbox`,
-  `sandbox_events`, `work_items`, `work_item_sources`, `work_deliveries`;
+  `sandbox_events`, `work_items`, `work_item_sources`, `work_deliveries`,
+  `harness_report_outbox`;
 - provider evidence: `provider_events`, `feedback_snapshots`,
   `feedback_snapshot_events`;
 - immutable selection: `pipeline_catalog_entries`, `pipeline_catalog_aliases`,
@@ -1044,6 +1045,11 @@ proposal worktree. Ordinary structured candidate integration is unchanged and
 does not carry self-improvement evidence; any later proposal producer inherits
 the same pre-mutation call requirement.
 
+`core/tune@1` is explicitly selected at admission by a `tune` routing label and
+a canonical `openthrottle.tune-task/v1` block. The supervisor does not currently
+schedule tune runs from the journal or `run_outcomes`; those stores are the
+evidence corpus, not an autonomous trigger.
+
 An accepted tune change carries bounded exact `after_content` bytes (null only
 for deletion) whose digest is the declared `after_digest`. The differential
 input also carries paired exact `pinned_files`/`proposed_files`; before issuing
@@ -1229,6 +1235,80 @@ instance/parent attempt, carrying a per-attempt sequence, an event `kind`
 its sanitized body, and the id of the `control_outbox` row it produced in the
 same transaction.
 
+## Anonymous harness incident reporting
+
+Harness reporting is operator opt-in and independent of pipeline authority.
+A lead `unit_decision` creates an occurrence when it either reaches the typed
+`needs_human` blocker outcome or includes a validated `payload.harness_report`.
+Ordinary target-repository revision decisions without that field create no
+report. Reporting failure never changes a gate decision, stage result, run
+outcome, or publication.
+
+The three modes are:
+
+- `off` (default): enqueue and network delivery are disabled;
+- `on`: the mechanical receipt plus the lead-authored, closed-vocabulary
+  diagnosis. A deterministic blocker for which the lead supplied no diagnosis
+  is marked `not_provided`;
+- `deterministic`: the agent report is used only as the local occurrence
+  trigger, and the outbound envelope contains a mechanical receipt with the
+  runtime release, protocol/capability, harness boundary, gate outcome/reason,
+  and retry count.
+
+The lead report uses the closed component/boundary vocabularies in
+`openthrottle.harness-report-envelope/v1` and carries an agent-selected failure
+class, one to eight unique observed-signal values normalized into contract
+order, optional suspected-cause and
+suggested-investigation values, repeatability, and confidence. Every value is
+selected from the contract's closed vocabulary. It must not carry repository,
+organization, ticket, PR, branch, commit, path, URL, email, source, log,
+credential, user-authored, or other customer-identifying content. Before
+enqueue, the sandbox and supervisor discard a diagnosis with unknown fields or
+values without changing the unit decision. The outbox therefore stores only
+the validated outbound envelope; its token remains
+supervisor-only and is never materialized in a sandbox.
+
+Delivery is `POST /v1/harness-incidents` to the configured HTTPS endpoint:
+
+```text
+Authorization: Bearer <HARNESS_REPORTING_TOKEN>
+Content-Type: application/json
+Idempotency-Key: <report_id>
+```
+
+The body is one canonical `openthrottle.harness-report-envelope/v1`. Its UUID
+`report_id` is deterministic for the exact pipeline-instance/action/lead-receipt
+occurrence and provides transport idempotency only; the local supervisor does
+not search for similar incidents or semantically deduplicate them. The backend
+owns similarity matching, aggregation, GitHub issue lookup, and any eventual
+publication. It must never post a raw incident payload verbatim to a public tracker.
+
+The backend returns `200` for an exact replay or `202` for a newly queued
+occurrence with:
+
+```json
+{
+  "schema": "openthrottle.harness-report-receipt/v1",
+  "report_id": "40a4dc62-c95e-4e8d-9f15-b5861b0d60a6",
+  "status": "queued"
+}
+```
+
+The supervisor accepts only a matching typed receipt. Network errors, `429`,
+and `5xx` retry with bounded backoff; invalid/auth/conflict/oversize client
+responses go dead. No customer identifier is used as an outbox key or request
+header. Processed and dead envelopes are pruned after 30 days in bounded sweep
+batches; pending and retrying delivery evidence is retained until settlement.
+The supervisor persists the current mode's opt-in start. On boot and during the
+periodic sweep it reconciles qualifying completed lead actions and their
+durable unit-acceptance gate receipts from that boundary, bounded by the same
+30-day retention window. Reconciliation enqueues the deterministic report id
+idempotently, closing a process-exit gap after gate settlement without
+backfilling pre-consent occurrences. A mode change resets the opt-in boundary.
+At startup, `off` discards every unsettled envelope and `deterministic` discards
+unsettled `on` envelopes, so revoking or narrowing consent cannot send queued
+diagnoses later.
+
 ## Supervisor environment
 
 Required:
@@ -1279,6 +1359,10 @@ Optional/defaulted:
   `WEBHOOK_MAX_AGE_SECONDS=60`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`,
   `STALL_TIMEOUT_SECONDS=900`, `ALLOW_LINEAR_MERGE=false`,
   `RUN_OUTCOME_RETENTION_DAYS=180`;
+- `HARNESS_REPORTING_MODE=off`. Setting it to `on` or `deterministic`
+  additionally requires `HARNESS_REPORTING_ENDPOINT` to be an absolute HTTPS
+  URL whose path is `/v1/harness-incidents` and a supervisor-only
+  `HARNESS_REPORTING_TOKEN`;
 - `PIPELINE_CATALOG_PATH`, `SANDBOX_RUNTIME_RELEASE`, and
   `SANDBOX_RUNTIME_DESCRIPTOR_PATH` for pinned deployment assets.
 

@@ -189,6 +189,7 @@ describe("database migrations", () => {
       "ba1a28c92a0e3f84080ce6fe1b329f21855d5e96ebdf3312d22af646d182fff7",
       "0dd5b83a690d982be21f4232daa62ed45eaa66f082c6a100284004305bbde74b",
       "5e755e28e1a6a500c108c9cf3c6c4a66f97dc78309b9be11fe1af204b688d7f2",
+      "1599162f2bca394f82bb4884a3d0a59cbbbdc3ee9582168da82024c93b1dfa28",
     ]);
   });
 
@@ -295,8 +296,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 50,
-      name: `actor-state-single-owner${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 51,
+      name: `harness-report-outbox${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
       count: databaseMigrations.length,
@@ -348,8 +349,8 @@ describe("database migrations", () => {
     expect(db.prepare(`
       SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1
     `).get()).toEqual({
-      version: 50,
-      name: `actor-state-single-owner${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
+      version: 51,
+      name: `harness-report-outbox${ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX}`,
     });
   });
 

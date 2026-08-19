@@ -3,6 +3,7 @@
 // Agent subscription credentials are checked against the selected agent before
 // provisioning so one unavailable agent does not prevent the supervisor booting.
 
+import { HARNESS_REPORTING_MODES, type HarnessReportingMode } from "@openthrottle/contracts";
 import type { Agent } from "../pipeline/types.js";
 import { fileURLToPath } from "node:url";
 
@@ -51,6 +52,14 @@ function optionalAgent(name: string, fallback: Agent): Agent {
   throw new Error(`Env var ${name} must be claude, codex, or opencode, got: ${value}`);
 }
 
+function optionalHarnessReportingMode(name: string): HarnessReportingMode {
+  const value = process.env[name]?.trim().toLowerCase();
+  if (!value) return "off";
+  const mode = HARNESS_REPORTING_MODES.find((candidate) => candidate === value);
+  if (mode) return mode;
+  throw new Error(`Env var ${name} must be off, on, or deterministic, got: ${process.env[name]}`);
+}
+
 export interface Config {
   port: number;
   databasePath: string;
@@ -90,6 +99,9 @@ export interface Config {
   pipelineCatalogPath: string;
   sandboxRuntimeRelease: string;
   sandboxRuntimeDescriptorPath: string;
+  harnessReportingMode: HarnessReportingMode;
+  harnessReportingEndpoint?: string;
+  harnessReportingToken?: string;
 }
 
 export function loadConfig(): Config {
@@ -136,6 +148,9 @@ export function loadConfig(): Config {
       "SANDBOX_RUNTIME_DESCRIPTOR_PATH",
       fileURLToPath(new URL("../../pipelines/runtime-capabilities-v1.json", import.meta.url))
     ),
+    harnessReportingMode: optionalHarnessReportingMode("HARNESS_REPORTING_MODE"),
+    harnessReportingEndpoint: process.env.HARNESS_REPORTING_ENDPOINT?.trim() || undefined,
+    harnessReportingToken: process.env.HARNESS_REPORTING_TOKEN?.trim() || undefined,
   };
 
   if (!cfg.claudeCodeOauthToken) {
@@ -182,6 +197,29 @@ export function loadConfig(): Config {
     if (!/^https?:$/.test(url.protocol)) throw new Error("unsupported protocol");
   } catch {
     throw new Error(`SUPERVISOR_URL must be an absolute HTTP(S) URL, got: ${cfg.supervisorUrl}`);
+  }
+  if (cfg.harnessReportingMode !== "off") {
+    if (!cfg.harnessReportingEndpoint) {
+      throw new Error("HARNESS_REPORTING_ENDPOINT is required when HARNESS_REPORTING_MODE is enabled");
+    }
+    if (!cfg.harnessReportingToken) {
+      throw new Error("HARNESS_REPORTING_TOKEN is required when HARNESS_REPORTING_MODE is enabled");
+    }
+    try {
+      const endpoint = new URL(cfg.harnessReportingEndpoint);
+      if (endpoint.protocol !== "https:") throw new Error("unsupported protocol");
+      if (endpoint.pathname.replace(/\/+$/, "") !== "/v1/harness-incidents") {
+        throw new Error("unsupported path");
+      }
+      if (endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+        throw new Error("endpoint credentials, query, and fragment are forbidden");
+      }
+      cfg.harnessReportingEndpoint = endpoint.toString().replace(/\/+$/, "");
+    } catch {
+      throw new Error(
+        `HARNESS_REPORTING_ENDPOINT must be an absolute HTTPS /v1/harness-incidents URL, got: ${cfg.harnessReportingEndpoint}`
+      );
+    }
   }
 
   return cfg;

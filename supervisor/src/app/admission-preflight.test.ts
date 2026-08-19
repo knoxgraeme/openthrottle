@@ -366,6 +366,7 @@ describe("admission preflight wired into Linear admission", () => {
       pipelineCatalogPath: shippedCatalogPath,
       sandboxRuntimeRelease: "preflight-test/v1",
       sandboxRuntimeDescriptorPath: "pipelines/runtime-capabilities-v1.json",
+      harnessReportingMode: "off",
     };
   }
 

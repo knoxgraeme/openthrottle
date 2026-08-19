@@ -208,6 +208,16 @@ describe("normalized stage artifacts", () => {
         rationale: "Matches the assigned unit scope.",
         context_updates: [],
         accepted_subject: "2".repeat(40),
+        harness_report: {
+          component: "structured_loop",
+          boundary: "gate_evaluation",
+          failure_class: "evidence_binding_mismatch",
+          observed_signals: ["conflicting_evidence"],
+          suspected_cause: "context_binding",
+          suggested_investigation: "inspect_context_binding",
+          repeatability: "repeatable",
+          confidence: "high",
+        },
       },
       issued_at: "2026-07-29T00:00:00.000Z",
     };
@@ -216,6 +226,7 @@ describe("normalized stage artifacts", () => {
       type: "unit_decision",
       assurance: "semantic_attested",
       result: "accept",
+      payload: { harness_report: { failure_class: "evidence_binding_mismatch" } },
     });
     expect(() => validateStandardReceipt({ ...receipt, assurance: "executor_verified" }, {}))
       .toThrow(/semantic standard receipt cannot claim/);
@@ -225,6 +236,33 @@ describe("normalized stage artifacts", () => {
     }, {})).toThrow(/producer skill/);
     expect(() => validateStandardReceipt({ ...receipt, payload: {} }, {}))
       .toThrow(/payload rationale/);
+    expect(validateStandardReceipt({
+      ...receipt,
+      payload: {
+        ...receipt.payload,
+        harness_report: { ...receipt.payload.harness_report, component: "target_repository" },
+      },
+    }, {}).payload).toEqual({
+      rationale: "Matches the assigned unit scope.",
+      context_updates: [],
+      accepted_subject: "2".repeat(40),
+    });
+
+    expect(validateStandardReceipt({
+      ...receipt,
+      payload: {
+        ...receipt.payload,
+        harness_report: {
+          ...receipt.payload.harness_report,
+          observed_behavior: "The runner exposed customer data in a diagnostic.",
+        },
+      },
+    }, {}).payload).not.toHaveProperty("harness_report");
+
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      payload: { ...receipt.payload, accepted_subject: "not-a-git-subject" },
+    }, {})).toThrow(/accepted_subject/);
 
     const commandReceipt = {
       ...receipt,

@@ -1351,7 +1351,21 @@ describe("structured child runtime review fanout", () => {
         request_hash: lead.request_hash,
       },
       evidence: priorEvidenceHashes,
-      payload: { rationale: "Scope matches.", context_updates: [], accepted_subject: subject },
+      payload: {
+        rationale: "Scope matches.",
+        context_updates: [],
+        accepted_subject: subject,
+        harness_report: {
+          component: "structured_loop",
+          boundary: "gate_evaluation",
+          failure_class: "evidence_binding_mismatch",
+          observed_signals: ["conflicting_evidence"],
+          suspected_cause: "context_binding",
+          suggested_investigation: "inspect_context_binding",
+          repeatability: "repeatable",
+          confidence: "high",
+        },
+      },
       issued_at: "2099-07-22T12:00:00.000Z",
     });
     const semanticReviewReceipt = (input: { personaId: string; actionId: string; requestHash: string }) => canonicalJson({
@@ -1388,6 +1402,9 @@ describe("structured child runtime review fanout", () => {
     });
     const completeGatedAction = vi.fn();
     const failUnitAction = vi.fn();
+    const captureHarnessReport = vi.fn(() => {
+      throw new Error("reporting unavailable");
+    });
     const childRuntime = createStructuredChildRuntime({
       now: () => new Date("2099-07-22T12:00:00.000Z"),
       taskTimeoutSeconds: 300,
@@ -1418,6 +1435,7 @@ describe("structured child runtime review fanout", () => {
           };
         }),
       } as any,
+      harnessReports: { capture: captureHarnessReport },
       store: {
         leaseNextUnitAction: () => lead,
         completeGatedAction,
@@ -1493,6 +1511,15 @@ describe("structured child runtime review fanout", () => {
     } as any, "parent-attempt");
 
     expect(failUnitAction).not.toHaveBeenCalled();
+    expect(captureHarnessReport).toHaveBeenCalledWith(expect.objectContaining({
+      action: expect.objectContaining({ id: lead.id }),
+      receipt: expect.objectContaining({
+        payload: expect.objectContaining({
+          harness_report: expect.objectContaining({ failure_class: "evidence_binding_mismatch" }),
+        }),
+      }),
+      decision: expect.objectContaining({ reason: "lead_scope_match_accept" }),
+    }));
     expect(completeGatedAction).toHaveBeenCalledWith(expect.objectContaining({
       actionId: lead.id,
       outputSubject: subject,
@@ -1502,6 +1529,8 @@ describe("structured child runtime review fanout", () => {
         reason: "lead_scope_match_accept",
       }),
     }));
+    expect(completeGatedAction.mock.invocationCallOrder[0])
+      .toBeLessThan(captureHarnessReport.mock.invocationCallOrder[0]!);
     const receipt = JSON.parse(completeGatedAction.mock.calls[0]![0].receipt) as { payload: { revision_request?: string } };
     expect(receipt.payload.revision_request).toBeUndefined();
     const decisionPayload = JSON.parse(completeGatedAction.mock.calls[0]![0].decision.payload) as { review_fanout_synthesis?: unknown };

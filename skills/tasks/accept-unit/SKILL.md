@@ -113,6 +113,48 @@ any other target aborts this unit's integration when the executor replays the
 records. If you cannot verify all three from the plan context, leave
 `context_updates` empty and put the note in `rationale`.
 
+## Harness incident reports
+
+If, while making the decision, you directly observe an OpenThrottle harness
+failure that is distinct from a defect in the target repository, you may add
+`payload.harness_report`. This report is diagnostic only: it must never change
+the acceptance result, create a new requirement, or replace the rationale.
+Omit it when you did not observe a harness failure.
+
+Use exactly these fields:
+
+- `component`: one of `supervisor`, `sandbox_runner`, `structured_loop`,
+  `repository_control`, `publication`, or `provider_integration`.
+- `boundary`: one of `admission`, `stage_dispatch`,
+  `child_action_dispatch`, `result_collection`, `receipt_validation`,
+  `gate_evaluation`, `worktree`, `lifecycle`, or `publication`.
+- `failure_class`: one of `unexpected_exception`, `invalid_receipt`,
+  `missing_receipt`, `state_transition_mismatch`, `evidence_binding_mismatch`,
+  `lease_or_retry_failure`, `timeout_or_stall`, `provider_contract_mismatch`,
+  `worktree_or_git_failure`, `publication_failure`, or `other_harness_failure`.
+- `observed_signals`: one to eight unique values, listed in the contract order
+  shown here: `unexpected_error`, `missing_output`,
+  `malformed_output`, `stale_output`, `conflicting_evidence`, `incorrect_state`,
+  `repeated_retry`, `timeout`, `provider_rejection`, `unsafe_output_blocked`, or
+  `publication_not_confirmed`.
+- optional `suspected_cause`: `contract_validation`, `state_machine`,
+  `lease_or_idempotency`, `context_binding`, `provider_boundary`,
+  `sandbox_runtime`, `repository_control`, or `unknown`.
+- optional `suggested_investigation`: `inspect_receipt_validation`,
+  `inspect_state_transition`, `inspect_lease_history`, `inspect_context_binding`,
+  `inspect_provider_response`, `inspect_runtime_events`,
+  `inspect_repository_control`, or `inspect_publication_receipt`.
+- `repeatability`: `once`, `intermittent`, `repeatable`, or `unknown`.
+- `confidence`: `low`, `medium`, or `high`.
+
+The report may leave the customer's environment. Never include repository or
+organization names, ticket or pull-request identifiers, branches, commit
+hashes, URLs, file-system paths, source code, logs, user-authored text, email
+addresses, credentials, tokens, or other personal/customer data. The closed
+vocabulary is the complete outbound diagnosis: do not encode customer data in
+another field or add prose. A report that needs customer-specific evidence must
+be omitted.
+
 ## The receipt
 
 One `openthrottle.receipt/v1` object, `type: "unit_decision"`.
@@ -134,7 +176,8 @@ One `openthrottle.receipt/v1` object, `type: "unit_decision"`.
   action changes nothing, so `subject.post` is the same value as `subject.pre`.
 - `payload`: `rationale` (required) and `context_updates` (array, possibly
   empty), plus `revision_request` only when revising and `accepted_subject`
-  only when accepting.
+  only when accepting, and optional `harness_report` only under the privacy and
+  harness-specific rules above.
 - `issued_at` is the current time, ISO 8601 UTC.
 - `evidence` begins with the copied prior-evidence hashes.
 

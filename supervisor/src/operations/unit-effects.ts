@@ -30,6 +30,7 @@ export interface UnitEffectRuntime {
     receipt?: string;
     nativeSessionId?: string | null;
     decision?: ExecutionGateDecision;
+    afterSettlement?: () => void;
   } | {
     terminal: true;
     resultHash: string;
@@ -174,6 +175,11 @@ export function createUnitEffectProcessor(input: {
               receipt: recovered.receipt,
               nativeSessionId: recovered.nativeSessionId,
             });
+          }
+          try {
+            recovered.afterSettlement?.();
+          } catch {
+            console.error("[unit-effects] non-authoritative post-settlement hook failed");
           }
           return action;
         }

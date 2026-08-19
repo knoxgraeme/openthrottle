@@ -319,6 +319,38 @@ describe("Stage C contract fixtures", () => {
     }
   });
 
+  it("drops invalid optional harness reports without weakening unit decision validation", () => {
+    const receipt = JSON.parse(readFixture("valid", "receipt-unit-decision.json")) as Record<string, unknown>;
+    const payload = receipt.payload as Record<string, unknown>;
+    const validReport = {
+      component: "structured_loop",
+      boundary: "gate_evaluation",
+      failure_class: "evidence_binding_mismatch",
+      observed_signals: ["conflicting_evidence"],
+      suspected_cause: "context_binding",
+      suggested_investigation: "inspect_context_binding",
+      repeatability: "repeatable",
+      confidence: "high",
+    };
+
+    for (const invalidReport of [
+      { ...validReport, component: "target_repository" },
+      { ...validReport, observed_behavior: "Unbounded diagnostic prose." },
+    ]) {
+      const parsed = validateStandardReceipt({
+        ...receipt,
+        payload: { ...payload, harness_report: invalidReport },
+      }, { source: "unit decision" });
+      expect(parsed.value.result).toBe("accept");
+      expect(parsed.value.payload).not.toHaveProperty("harness_report");
+    }
+
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      payload: { ...payload, accepted_subject: "not-a-git-subject", harness_report: validReport },
+    }, { source: "unit decision" })).toThrow(/accepted_subject/);
+  });
+
   it("keeps the committed repository bootstrap on all four npm projects", () => {
     const config = readFileSync(new URL("../../.openthrottle.yml", import.meta.url), "utf8");
     for (const project of ["contracts", "supervisor", "cli", "sandbox"]) {

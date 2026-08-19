@@ -2406,6 +2406,28 @@ ALTER TABLE runs DROP COLUMN actor_updated_at;
 actor-single-owner-contract:run actor liveness lives on runs only/v1
 migration 14's contraction dual-homed the folded actor lifecycle columns on both runs and pipeline_stage_attempts; every lifecycle transition wrote the pair in one transaction and every reader COALESCEd them, so the attempt-side copy never carried independent state (attempt-less runs already relied on the runs fallback). The 2026-08 repo audit consolidates ownership onto runs: any attempt-side value whose runs-side column is still NULL is merged into the owner first, then the attempt-side actor columns and their index are dropped, along with the written-but-never-read runs.actor_created_at and runs.actor_updated_at stamps. Rollback note: the immediately preceding release still dual-writes and COALESCE-reads the attempt-side actor columns, so this migration is deploy-forward-only per operator decision despite carrying the mandatory additive rollback marker/v1`;
 
+const harnessReportOutboxSchema = `
+CREATE TABLE IF NOT EXISTS harness_report_outbox (
+  id TEXT PRIMARY KEY,
+  payload TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'failed', 'processed', 'dead')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+  next_attempt_at TEXT,
+  processed_at TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS harness_report_outbox_process_idx
+  ON harness_report_outbox(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS harness_report_outbox_retention_idx
+  ON harness_report_outbox(status, updated_at);
+`;
+
+const harnessReportOutboxMigrationSource = `${harnessReportOutboxSchema}
+harness-report-outbox-contract:privacy-validated anonymous harness incident envelopes are durably retried by report id without storing customer identifiers outside the validated envelope/v1`;
+
 type GithubHeadSource =
   | { kind: "authoritative" }
   | { kind: "sequenced"; source: string; sequence: number };
@@ -3653,6 +3675,14 @@ const definitions: DatabaseMigrationDefinition[] = [
     source: actorStateSingleOwnerMigrationSource,
     up(db) {
       consolidateActorStateOntoRuns(db);
+    },
+  },
+  {
+    version: 51,
+    name: "harness-report-outbox [rollback-compatible:additive/v1]",
+    source: harnessReportOutboxMigrationSource,
+    up(db) {
+      db.exec(harnessReportOutboxSchema);
     },
   },
 ];

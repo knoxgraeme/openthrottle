@@ -19,6 +19,7 @@ import { createPipelineStore } from "./persistence/pipeline/create-store.js";
 import { createAnalysisStore } from "./persistence/pipeline/analysis-store.js";
 import { createCitationGateStore } from "./persistence/pipeline/citation-gate-store.js";
 import { createAdmissionDrainStore } from "./persistence/admission-drain-store.js";
+import { createHarnessReportStore } from "./persistence/harness-report-store.js";
 import { loadRuntimeCapabilityDescriptor } from "./runtime/contracts.js";
 import { drainDeferredProviderEvidence } from "./pipeline/gates.js";
 import { completeStageAttemptActor } from "./pipeline/settlement.js";
@@ -38,6 +39,7 @@ import {
   HOT_PATH_RECLAIM_LIMIT,
   HOT_PATH_RECLAIM_WAIT_TIMEOUT_MS,
 } from "./operations/runtime-resource-reclaim.js";
+import { createHarnessReportProcessor } from "./operations/harness-reporting.js";
 
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
 const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
@@ -55,6 +57,28 @@ async function main() {
   const analysisStore = createAnalysisStore(db);
   const citationGateStore = createCitationGateStore(db, () => new Date().toISOString());
   const admissionDrainStore = createAdmissionDrainStore(db);
+  const harnessReportStore = createHarnessReportStore(db);
+  const harnessReportingStartedAt = new Date().toISOString();
+  const harnessReportRecoverySince = harnessReportStore.configureMode(
+    cfg.harnessReportingMode,
+    harnessReportingStartedAt
+  );
+  const discardedHarnessReports = harnessReportStore.discardDisallowed(
+    cfg.harnessReportingMode,
+    harnessReportingStartedAt
+  );
+  if (discardedHarnessReports > 0) {
+    console.warn(`[harness-reporting] discarded ${discardedHarnessReports} queued envelope(s) after mode change`);
+  }
+  const harnessReportProcessor = cfg.harnessReportingMode === "off"
+    ? createHarnessReportProcessor({ mode: "off" })
+    : createHarnessReportProcessor({
+        mode: cfg.harnessReportingMode,
+        endpoint: cfg.harnessReportingEndpoint!,
+        token: cfg.harnessReportingToken!,
+        store: harnessReportStore,
+        recoverySinceIso: harnessReportRecoverySince!,
+      });
   const runtimeCapabilities = loadRuntimeCapabilityDescriptor(
     cfg.sandboxRuntimeDescriptorPath,
     cfg.sandboxRuntimeRelease
@@ -95,6 +119,7 @@ async function main() {
     runtimeResourceRetentionMinutes: cfg.runtimeResourceRetentionMinutes,
     citationGateStore,
     reconcileRuntimeResources,
+    harnessReports: harnessReportProcessor,
   });
   const pipelineCoordinator = {
     catalog: pipelineCatalog,
@@ -264,6 +289,14 @@ async function main() {
   drainLinearAndDeferredProvider().catch((err) => console.error("[linear-outbox] boot drain failed:", err));
   githubPublicationProcessor.drain().catch((err) => console.error("[github-publication] boot drain failed:", err));
   pipelineEffectProcessor.drain().catch((err) => console.error("[pipeline-effects] boot drain failed:", err));
+  if (cfg.harnessReportingMode !== "off") {
+    try {
+      harnessReportProcessor.reconcile();
+    } catch (err) {
+      console.error("[harness-reporting] boot reconciliation failed:", err);
+    }
+    harnessReportProcessor.drain().catch((err) => console.error("[harness-reporting] boot drain failed:", err));
+  }
   pollActiveSandboxes().catch((err) => console.error("[sandbox-events] boot poll failed:", err));
   runSweep(
     runtime,
@@ -272,7 +305,11 @@ async function main() {
     pipelineStore,
     activityPublisher,
     reconcileGithubWebhooks,
-    reconcileRuntimeResources
+    reconcileRuntimeResources,
+    {
+      prune: harnessReportStore.prune,
+      reconcile: harnessReportProcessor.reconcile,
+    }
   )
     .catch((err) => console.error("[sweep] boot sweep failed:", err));
   const reapStalled = () =>
@@ -293,6 +330,11 @@ async function main() {
     pipelineEffectProcessor
       .drain()
       .catch((err) => console.error("[pipeline-effects] interval drain failed:", err));
+    if (cfg.harnessReportingMode !== "off") {
+      harnessReportProcessor
+        .drain()
+        .catch((err) => console.error("[harness-reporting] interval drain failed:", err));
+    }
   }, DELIVERY_DRAIN_INTERVAL_MS).unref();
   setInterval(() => {
     pollActiveSandboxes().catch((err) =>
@@ -307,7 +349,11 @@ async function main() {
       pipelineStore,
       activityPublisher,
       reconcileGithubWebhooks,
-      reconcileRuntimeResources
+      reconcileRuntimeResources,
+      {
+        prune: harnessReportStore.prune,
+        reconcile: harnessReportProcessor.reconcile,
+      }
     )
       .catch((err) => console.error("[sweep] interval sweep failed:", err));
   }, SWEEP_INTERVAL_MS).unref();

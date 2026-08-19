@@ -26,6 +26,9 @@ function setRequiredEnv(): void {
     "PIPELINE_CATALOG_PATH",
     "SANDBOX_RUNTIME_RELEASE",
     "SANDBOX_RUNTIME_DESCRIPTOR_PATH",
+    "HARNESS_REPORTING_MODE",
+    "HARNESS_REPORTING_ENDPOINT",
+    "HARNESS_REPORTING_TOKEN",
   ]) {
     delete process.env[name];
   }
@@ -65,7 +68,47 @@ describe("loadConfig", () => {
       sandboxRuntimeRelease: "openthrottle-snapshot/v13",
       runtimeResourceRetentionMinutes: 60,
       runOutcomeRetentionDays: 180,
+      harnessReportingMode: "off",
     });
+  });
+
+  it("loads explicit harness reporting modes and endpoint credentials", () => {
+    setRequiredEnv();
+    process.env.HARNESS_REPORTING_MODE = "on";
+    process.env.HARNESS_REPORTING_ENDPOINT = "https://reports.openthrottle.test/v1/harness-incidents/";
+    process.env.HARNESS_REPORTING_TOKEN = "report-token";
+
+    expect(loadConfig()).toMatchObject({
+      harnessReportingMode: "on",
+      harnessReportingEndpoint: "https://reports.openthrottle.test/v1/harness-incidents",
+      harnessReportingToken: "report-token",
+    });
+  });
+
+  it("requires a private HTTPS endpoint and token when harness reporting is enabled", () => {
+    setRequiredEnv();
+    process.env.HARNESS_REPORTING_MODE = "deterministic";
+    expect(() => loadConfig()).toThrow("HARNESS_REPORTING_ENDPOINT is required");
+
+    process.env.HARNESS_REPORTING_ENDPOINT = "https://reports.test/v1/harness-incidents";
+    expect(() => loadConfig()).toThrow("HARNESS_REPORTING_TOKEN is required");
+
+    process.env.HARNESS_REPORTING_ENDPOINT = "http://reports.test/v1/harness-incidents";
+    process.env.HARNESS_REPORTING_TOKEN = "report-token";
+    expect(() => loadConfig()).toThrow("absolute HTTPS /v1/harness-incidents URL");
+
+    process.env.HARNESS_REPORTING_ENDPOINT = "https://reports.test/v1/other";
+    expect(() => loadConfig()).toThrow("absolute HTTPS /v1/harness-incidents URL");
+
+    process.env.HARNESS_REPORTING_ENDPOINT =
+      "https://user:password@reports.test/v1/harness-incidents?customer=one";
+    expect(() => loadConfig()).toThrow("absolute HTTPS /v1/harness-incidents URL");
+  });
+
+  it("rejects unknown harness reporting modes", () => {
+    setRequiredEnv();
+    process.env.HARNESS_REPORTING_MODE = "agent-only";
+    expect(() => loadConfig()).toThrow("must be off, on, or deterministic");
   });
 
   it("boots without Linear configuration while preserving GitHub readiness requirements", () => {
