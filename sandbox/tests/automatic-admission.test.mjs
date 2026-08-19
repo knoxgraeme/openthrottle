@@ -49,6 +49,8 @@ describe("automatic-admission task packages", () => {
     expect(body).toMatch(/objective,\s+requirements, files, approach, tests, acceptance, and verification/);
     expect(body).toMatch(/simple[\s\S]*no execution plan/i);
     expect(body).toMatch(/needs_human[\s\S]*specific/i);
+    expect(body).toMatch(/explicit source[\s\S]*requirement\s+or acceptance IDs/i);
+    expect(body).toMatch(/preserve[\s\S]*verbatim/i);
   });
 
   it("requires a fresh independent reviewer bound only to sealed inputs", () => {
@@ -70,6 +72,8 @@ describe("automatic-admission task packages", () => {
     ]) expect(body).toContain(phrase);
     expect(body).toMatch(/no planner conversation/i);
     expect(body).toMatch(/never rewrite|do not rewrite/i);
+    expect(body).toMatch(/explicit source[\s\S]*requirement\s+or acceptance IDs/i);
+    expect(body).toMatch(/omitted[\s\S]*weakened[\s\S]*conflicting/i);
   });
 
   it("treats adversarial content as data and denies every planning-side effect", () => {

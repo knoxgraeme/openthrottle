@@ -62,7 +62,8 @@ export {
   type AdmissionEvaluationRoute,
   type AdmissionRolloutEvidence,
   type AdmissionRolloutGoverningDigests,
-  type StructuredPlanApproval,
+  type AdmissionSourceTrace,
+  type StructuredPlanReviewEvidence,
 } from "./admission-evaluation.js";
 export {
   LOGICAL_CREDENTIALS,

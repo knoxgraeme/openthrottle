@@ -698,57 +698,105 @@ describe("one-stage executor", () => {
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-actions-"));
     directories.push(actionRoot);
     process.env.OT_STAGE_ACTION_ROOT = actionRoot;
-    const request = fixture({
+    const input = fixture({
       agent: "claude",
       capability: "admission/plan@1",
       stageId: "admission_planner",
       requiredArtifacts: ["standard_receipt", "execution_plan"],
       liveSteering: false,
-    }).request;
-    const environment = repositorySkillStageEnvironment(request);
+    });
+    const environment = repositorySkillStageEnvironment(input.request);
     expect(environment.env).toContain(`HOME=${join(actionRoot, "attempt-1", "home")}`);
     expect(environment.env).toContain(`TMPDIR=${join(actionRoot, "attempt-1", "tmp")}`);
 
-    expect(inspectionProcessEnvironment(request, {
+    expect(inspectionProcessEnvironment(input.request, {
       PATH: "/bin",
       CLAUDE_CODE_OAUTH_TOKEN: "model-secret",
       GITHUB_TOKEN: "repo-secret",
       OT_CLAUDE_MCP_CONFIG: "/private/mcp.json",
       LINEAR_API_KEY: "provider-secret",
     })).toEqual({ PATH: "/bin", CLAUDE_CODE_OAUTH_TOKEN: "model-secret" });
-    expect(inspectionAgentPolicyArgs("claude")).toEqual([
+    const repositoryView = join(actionRoot, input.request.attemptId, "repo-view");
+    const policy = inspectionAgentPolicyArgs("claude", repositoryView);
+    expect(policy).toEqual([
       "--permission-mode", "dontAsk",
-      "--allowedTools", "Read,Grep,Glob",
-      "--disallowedTools", "Bash,Write,Edit,WebFetch,WebSearch,Task,NotebookEdit",
+      "--tools", "Read,Grep,Glob",
+      "--allowedTools", `Read(//${repositoryView.slice(1)}/**)`,
+      "--disallowedTools", "mcp__*",
     ]);
-    expect(() => inspectionAgentPolicyArgs("codex")).toThrow(/contained read broker/);
+    expect(policy).not.toContain("Read");
+    const readRule = policy[policy.indexOf("--allowedTools") + 1];
+    const scopedRoot = `/${readRule.slice("Read(//".length, -"/**)".length)}`;
+    const matchesReadScope = (candidate) => candidate === scopedRoot || candidate.startsWith(`${scopedRoot}/`);
+    expect(matchesReadScope("/proc/self/environ")).toBe(false);
+    expect(matchesReadScope(input.repoDir)).toBe(false);
+    expect(matchesReadScope(join(repositoryView, "src", "index.ts"))).toBe(true);
+    expect(inspectionAgentPolicyArgs("codex")).toEqual([
+      "--sandbox", "read-only",
+      "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "-c", 'web_search="disabled"',
+    ]);
     expect(inspectionAgentPolicyArgs("opencode")).toEqual([]);
   });
 
-  it("fails Codex admission before creating credentials or starting a process", () => {
-    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-codex-denied-"));
+  it("launches Codex admission ephemerally with read-only policy and no raw credential environment", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-codex-read-only-"));
     const binDir = mkdtempSync(join(tmpdir(), "ot-admission-codex-bin-"));
     directories.push(actionRoot, binDir);
     process.env.OT_STAGE_ACTION_ROOT = actionRoot;
-    const marker = join(actionRoot, "process-started");
-    writeExecutable(join(binDir, "gosu"), `#!/usr/bin/env bash\ntouch '${marker}'\nexit 0\n`);
+    installFakeGosu(binDir);
+    const argsPath = join(binDir, "codex-args");
+    const evidencePath = join(binDir, "codex-evidence");
     const input = fixture({
       agent: "codex",
       capability: "admission/plan@1",
       stageId: "admission_planner",
+      repositorySkill: "fixture",
       requiredArtifacts: ["standard_receipt", "execution_plan"],
       liveSteering: false,
     });
+    const repositoryView = prepareAdmissionReadOnlyRepository(input.request, input.repoDir);
+    const event = JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: JSON.stringify(admissionPlanFixture(input.request)) },
+    });
+    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" > '${argsPath}'
+test -r "$CODEX_HOME/auth.json"
+test -z "\${CODEX_AUTH_JSON:-}"
+test ! -w "$PWD/file.txt"
+printf 'auth=file;raw_env=absent;repo_view=read_only\n' > '${evidencePath}'
+cat <<'JSON'
+${event}
+JSON
+`);
 
-    expect(() => withPrependedPath(binDir, () => defaultRunAgent({
+    const result = withPrependedPath(binDir, () => defaultRunAgent({
       request: input.request,
       invocation: resolveContextInvocation(input.request),
-      repoDir: input.repoDir,
+      repoDir: repositoryView,
+      skillSourceRepoDir: input.repoDir,
       proposalPath: join(actionRoot, "proposal.json"),
       timeoutMs: 5_000,
-    }))).toThrow(/contained read broker/);
-    expect(existsSync(marker)).toBe(false);
-    expect(existsSync(join(actionRoot, input.request.attemptId, "codex", "auth.json"))).toBe(false);
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect(readFileSync(argsPath, "utf8").trim().split("\n")).toEqual([
+      "--ask-for-approval", "never",
+      "exec", "--json",
+      "--sandbox", "read-only",
+      "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "-c", 'web_search="disabled"',
+      "--skip-git-repo-check", "-C", repositoryView,
+      "-",
+    ]);
+    expect(readFileSync(evidencePath, "utf8")).toBe("auth=file;raw_env=absent;repo_view=read_only\n");
+    expect(existsSync(join(actionRoot, input.request.attemptId))).toBe(false);
   });
 
   it("dispatches admission against a detached exact-subject read-only repository view", () => {
@@ -777,7 +825,7 @@ describe("one-stage executor", () => {
     { label: "failed", exitCode: 47 },
   ])("removes the entire admission action directory after a $label inspection", ({ exitCode }) => {
     const input = fixture({
-      agent: "claude",
+      agent: "opencode",
       capability: "agent/repository-skill@1",
       stageId: "admission_planner",
       repositorySkill: "fixture",
@@ -793,7 +841,7 @@ describe("one-stage executor", () => {
       type: "result",
       result: JSON.stringify(admissionPlanFixture(input.request)),
     });
-    writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
+    writeExecutable(join(binDir, "opencode"), `#!/usr/bin/env bash
 set -euo pipefail
 cat <<'JSON'
 ${event}
@@ -807,6 +855,7 @@ exit ${exitCode}
       repoDir: input.repoDir,
       proposalPath: join(actionRoot, "proposal.json"),
       timeoutMs: 5_000,
+      model: "kimi-code/kimi-for-coding",
     }));
 
     expect(result.exitCode).toBe(exitCode);
@@ -815,7 +864,7 @@ exit ${exitCode}
 
   it("fails closed when an admission action directory cannot be removed", () => {
     const input = fixture({
-      agent: "claude",
+      agent: "opencode",
       capability: "agent/repository-skill@1",
       stageId: "admission_planner",
       repositorySkill: "fixture",
@@ -831,7 +880,7 @@ exit ${exitCode}
       type: "result",
       result: JSON.stringify(admissionPlanFixture(input.request)),
     });
-    writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
+    writeExecutable(join(binDir, "opencode"), `#!/usr/bin/env bash
 set -euo pipefail
 cat <<'JSON'
 ${event}
@@ -844,6 +893,7 @@ JSON
       repoDir: input.repoDir,
       proposalPath: join(actionRoot, "proposal.json"),
       timeoutMs: 5_000,
+      model: "kimi-code/kimi-for-coding",
       removeActionDirectory: () => { throw new Error("cleanup refused"); },
     }))).toThrow(/stage agent cleanup failed: cleanup refused/);
   });
@@ -853,6 +903,7 @@ JSON
     directories.push(actionRoot);
     process.env.OT_STAGE_ACTION_ROOT = actionRoot;
     const input = fixture({
+      agent: "opencode",
       capability: "admission/plan@1",
       stageId: "admission_planner",
       requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],

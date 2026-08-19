@@ -36,6 +36,12 @@ export function automaticAdmissionInputArtifacts(input: {
   if (targetStageId === AUTOMATIC_ADMISSION_STAGE_IDS.decisionGate) {
     return select(eventArtifacts, ["standard_receipt", "execution_plan"]);
   }
+  if (sourceStageId === AUTOMATIC_ADMISSION_STAGE_IDS.reviewGate &&
+      targetStageId === AUTOMATIC_ADMISSION_STAGE_IDS.planner) {
+    const rejection = requireUnique(eventArtifacts, "stage_result", "admission planner correction input");
+    const rejectedPlan = requireUnique(eventArtifacts, "execution_plan", "admission planner correction input");
+    return [rejectedPlan, rejection].sort((left, right) => left.kind.localeCompare(right.kind));
+  }
   if (targetStageId === AUTOMATIC_ADMISSION_STAGE_IDS.reviewer) {
     const source = sourceStageId === AUTOMATIC_ADMISSION_STAGE_IDS.decisionGate
       ? eventArtifacts

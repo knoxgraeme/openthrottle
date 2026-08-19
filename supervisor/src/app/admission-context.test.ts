@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  assertOrdinaryStageTaskContextBound,
+  composeAutomaticAdmissionTaskContext,
   composeBoundedTaskContext,
   ORDINARY_STAGE_TASK_CONTEXT_LIMIT,
 } from "./admission-context.js";
@@ -563,6 +565,35 @@ describe("bounded Linear admission context", () => {
 
     expect(result.ordinaryLimitError).toContain(
       `required content exceeds ${ORDINARY_STAGE_TASK_CONTEXT_LIMIT} bytes`
+    );
+  });
+});
+
+describe("assembled automatic admission context", () => {
+  it("keeps ticket content only inside the supervisor-sealed authority", () => {
+    const ticketContent = "unique automatic admission ticket content";
+    const sealedAuthority = [
+      "```json openthrottle.admission-input/v1",
+      JSON.stringify({ admission_basis: { source: { context: ticketContent } } }),
+      "```",
+    ].join("\n");
+
+    const context = composeAutomaticAdmissionTaskContext(sealedAuthority);
+
+    expect(context.match(new RegExp(ticketContent, "g"))).toHaveLength(1);
+    expect(context).toContain("Supervisor-sealed automatic admission authority follows.");
+  });
+
+  it("accepts exactly the ordinary-stage limit and rejects one byte more after assembly", () => {
+    const empty = composeAutomaticAdmissionTaskContext("");
+    const exact = composeAutomaticAdmissionTaskContext(
+      "x".repeat(ORDINARY_STAGE_TASK_CONTEXT_LIMIT - Buffer.byteLength(empty, "utf8"))
+    );
+
+    expect(Buffer.byteLength(exact, "utf8")).toBe(ORDINARY_STAGE_TASK_CONTEXT_LIMIT);
+    expect(() => assertOrdinaryStageTaskContextBound(exact)).not.toThrow();
+    expect(() => assertOrdinaryStageTaskContextBound(`${exact}x`)).toThrow(
+      `Fully assembled task context exceeds ${ORDINARY_STAGE_TASK_CONTEXT_LIMIT} bytes`
     );
   });
 });

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { canonicalJson, digestNormalized } from "./canonical.js";
 import {
   scoreAdmissionRolloutEvidence,
   validateAdmissionEvaluationCorpus,
@@ -9,6 +10,7 @@ import {
   type AdmissionRolloutEvidence,
   type AdmissionRolloutGoverningDigests,
 } from "./admission-evaluation.js";
+import type { ExecutionPlanContractV2 } from "./execution-plan-v2.js";
 
 const fixtureRoot = fileURLToPath(new URL("../fixtures/admission-corpus/v1/", import.meta.url));
 const fixture = (name: string): unknown => JSON.parse(readFileSync(`${fixtureRoot}${name}`, "utf8")) as unknown;
@@ -26,6 +28,53 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+function reviewedPlan(caseId: string, sourceIds: string[]): {
+  canonical_plan: string;
+  generated_plan_digest: string;
+  structured_plan_review: NonNullable<AdmissionRolloutEvidence["decisions"][number]["structured_plan_review"]>;
+} {
+  const plan: ExecutionPlanContractV2 = {
+    schema: "openthrottle.execution-plan/v2",
+    graph_id: "structured",
+    plan_id: `evaluation-${caseId}`,
+    units: [{
+      id: "u1",
+      title: "Implement the evaluated change",
+      depends_on: [],
+      objective: "Implement the complete evaluated change.",
+      requirements: sourceIds.length === 0
+        ? ["Preserve the complete free-form requirement."]
+        : sourceIds.map((id) => `Preserve source obligation ${id}.`),
+      files: ["src/evaluation.ts"],
+      approach: ["Implement the bounded change."],
+      tests: ["Cover the evaluated behavior."],
+      acceptance: ["The evaluated behavior is complete."],
+      verification: ["Run the focused test suite."],
+    }],
+    commands: [],
+  };
+  const canonicalPlan = canonicalJson(plan);
+  const generatedPlanDigest = digestNormalized(canonicalPlan);
+  return {
+    canonical_plan: canonicalPlan,
+    generated_plan_digest: generatedPlanDigest,
+    structured_plan_review: {
+      reviewer_id: "fixture-reviewer",
+      recorded_at: "2026-08-18T00:00:00.000Z",
+      review: {
+        schema: "openthrottle.admission-review/v1",
+        verdict: "approved",
+        summary: "The canonical generated plan is approved.",
+        findings: [],
+        questions: [],
+        admission_basis_digest: "a".repeat(64),
+        effective_manifest_digest: governingDigests.effective_manifest_digest,
+        generated_plan_digest: generatedPlanDigest,
+      },
+    },
+  };
+}
+
 function buildEvidence(corpus: AdmissionEvaluationCorpus): AdmissionRolloutEvidence {
   const decisions: AdmissionRolloutEvidence["decisions"] = [];
   for (const model of [
@@ -35,16 +84,19 @@ function buildEvidence(corpus: AdmissionEvaluationCorpus): AdmissionRolloutEvide
     for (const label of corpus.labels) {
       for (let repeat = 1; repeat <= 3; repeat += 1) {
         const structured = label.expected_route === "structured";
+        const planEvidence = structured ? reviewedPlan(label.case_id, label.explicit_source_ids) : null;
         decisions.push({
           case_id: label.case_id,
           model_id: model.model_id,
           repeat,
           route: label.expected_route,
-          generated_plan_digest: structured ? "7".repeat(64) : null,
-          structured_plan_approval: structured ? {
-            status: "approved",
-            operator_id: "fixture-operator",
-            recorded_at: "2026-08-18T00:00:00.000Z",
+          canonical_plan: planEvidence?.canonical_plan ?? null,
+          generated_plan_digest: planEvidence?.generated_plan_digest ?? null,
+          structured_plan_review: planEvidence?.structured_plan_review ?? null,
+          source_trace: structured ? {
+            preserved_source_ids: [...label.explicit_source_ids],
+            conflicting_source_ids: [],
+            semantic_coverage_repair_rounds: 0,
           } : null,
           latency_ms: 1_000,
           input_tokens: 1_500,
@@ -98,6 +150,17 @@ describe("automatic admission rollout evidence", () => {
       expect(model.unsafe_simple_decisions).toBe(0);
       expect(model.ambiguous_executable_decisions).toBe(0);
       expect(model.unapproved_structured_decisions).toBe(0);
+      expect(model.explicit_source_id_decisions).toBe(15);
+      expect(model.explicit_source_ids_expected).toBe(18);
+      expect(model.explicit_source_ids_preserved).toBe(18);
+      expect(model.explicit_source_id_coverage_bps).toBe(10_000);
+      expect(model.explicit_source_id_omissions).toBe(0);
+      expect(model.conflicting_source_ids).toBe(0);
+      expect(model.semantic_coverage_repair_decisions).toBe(0);
+      expect(model.semantic_coverage_repair_rate_bps).toBe(0);
+      expect(model.free_form_structured_decisions).toBe(30);
+      expect(model.free_form_semantic_coverage_repair_decisions).toBe(0);
+      expect(model.free_form_semantic_coverage_repair_rate_bps).toBe(0);
       expect(model.cost_usd_micros).toBe(337_500);
     }
   });
@@ -162,24 +225,103 @@ describe("automatic admission rollout evidence", () => {
 
     const unsafeSimple = buildEvidence(corpus);
     unsafeSimple.decisions.find((entry) => entry.case_id === "case-016")!.route = "simple";
+    unsafeSimple.decisions.find((entry) => entry.case_id === "case-016")!.canonical_plan = null;
     unsafeSimple.decisions.find((entry) => entry.case_id === "case-016")!.generated_plan_digest = null;
-    unsafeSimple.decisions.find((entry) => entry.case_id === "case-016")!.structured_plan_approval = null;
+    unsafeSimple.decisions.find((entry) => entry.case_id === "case-016")!.structured_plan_review = null;
+    unsafeSimple.decisions.find((entry) => entry.case_id === "case-016")!.source_trace = null;
     expect(() => scoreAdmissionRolloutEvidence(corpus, unsafeSimple, governingDigests)).toThrow(/unsafe simple/i);
 
     const ambiguousExecution = buildEvidence(corpus);
     const ambiguous = ambiguousExecution.decisions.find((entry) => entry.case_id === "case-031")!;
+    const ambiguousPlan = reviewedPlan("case-031", []);
     ambiguous.route = "structured";
-    ambiguous.generated_plan_digest = "8".repeat(64);
-    ambiguous.structured_plan_approval = {
-      status: "approved",
-      operator_id: "fixture-operator",
-      recorded_at: "2026-08-18T00:00:00.000Z",
+    ambiguous.canonical_plan = ambiguousPlan.canonical_plan;
+    ambiguous.generated_plan_digest = ambiguousPlan.generated_plan_digest;
+    ambiguous.structured_plan_review = ambiguousPlan.structured_plan_review;
+    ambiguous.source_trace = {
+      preserved_source_ids: [],
+      conflicting_source_ids: [],
+      semantic_coverage_repair_rounds: 0,
     };
     expect(() => scoreAdmissionRolloutEvidence(corpus, ambiguousExecution, governingDigests)).toThrow(/ambiguous.*executable/i);
 
     const unapproved = buildEvidence(corpus);
-    unapproved.decisions.find((entry) => entry.route === "structured")!.structured_plan_approval = null;
+    unapproved.decisions.find((entry) => entry.route === "structured")!.structured_plan_review = null;
     expect(() => scoreAdmissionRolloutEvidence(corpus, unapproved, governingDigests)).toThrow(/approval/i);
+  });
+
+  it("requires canonical plan bytes and a reviewer receipt bound to their digest", () => {
+    const corpus = validateAdmissionEvaluationCorpus(
+      fixture("cases.json"), fixture("labels.json"), fixture("manifest.json"),
+    ).value;
+
+    const nonCanonical = buildEvidence(corpus);
+    const nonCanonicalDecision = nonCanonical.decisions.find((entry) => entry.case_id === "case-016")!;
+    nonCanonicalDecision.canonical_plan = ` ${nonCanonicalDecision.canonical_plan!}`;
+    expect(() => scoreAdmissionRolloutEvidence(corpus, nonCanonical, governingDigests))
+      .toThrow(/canonical_plan.*canonical JSON/i);
+
+    const digestMismatch = buildEvidence(corpus);
+    digestMismatch.decisions.find((entry) => entry.case_id === "case-016")!.generated_plan_digest = "8".repeat(64);
+    expect(() => scoreAdmissionRolloutEvidence(corpus, digestMismatch, governingDigests))
+      .toThrow(/generated_plan_digest.*canonical plan/i);
+
+    const reviewMismatch = buildEvidence(corpus);
+    reviewMismatch.decisions.find((entry) => entry.case_id === "case-016")!
+      .structured_plan_review!.review.generated_plan_digest = "8".repeat(64);
+    expect(() => scoreAdmissionRolloutEvidence(corpus, reviewMismatch, governingDigests))
+      .toThrow(/structured_plan_review.*generated_plan_digest.*canonical plan/i);
+  });
+
+  it("fails closed when an approved structured plan loses or conflicts with an explicit source id", () => {
+    const corpus = validateAdmissionEvaluationCorpus(
+      fixture("cases.json"), fixture("labels.json"), fixture("manifest.json"),
+    ).value;
+
+    const omission = buildEvidence(corpus);
+    const traced = omission.decisions.find((entry) => entry.case_id === "case-016")!;
+    traced.source_trace!.preserved_source_ids = traced.source_trace!.preserved_source_ids.slice(1);
+    expect(() => scoreAdmissionRolloutEvidence(corpus, omission, governingDigests))
+      .toThrow(/case-016.*omits explicit source id/i);
+
+    const fabricated = buildEvidence(corpus);
+    const fabricatedDecision = fabricated.decisions.find((entry) => entry.case_id === "case-016")!;
+    fabricatedDecision.canonical_plan = fabricatedDecision.canonical_plan!.replace("AC-1", "omitted-source");
+    fabricatedDecision.generated_plan_digest = digestNormalized(fabricatedDecision.canonical_plan);
+    fabricatedDecision.structured_plan_review!.review.generated_plan_digest = fabricatedDecision.generated_plan_digest;
+    expect(() => scoreAdmissionRolloutEvidence(corpus, fabricated, governingDigests))
+      .toThrow(/case-016.*canonical plan omits explicit source id AC-1/i);
+
+    const unexpected = buildEvidence(corpus);
+    unexpected.decisions.find((entry) => entry.case_id === "case-016")!
+      .source_trace!.preserved_source_ids.push("REQ-999");
+    expect(() => scoreAdmissionRolloutEvidence(corpus, unexpected, governingDigests))
+      .toThrow(/case-016.*unexpected explicit source id REQ-999/i);
+
+    const conflict = buildEvidence(corpus);
+    conflict.decisions.find((entry) => entry.case_id === "case-016")!
+      .source_trace!.conflicting_source_ids = ["R1"];
+    expect(() => scoreAdmissionRolloutEvidence(corpus, conflict, governingDigests))
+      .toThrow(/case-016.*conflicting source id/i);
+  });
+
+  it("reports semantic coverage repair rates for explicit-id and free-form cohorts", () => {
+    const corpus = validateAdmissionEvaluationCorpus(
+      fixture("cases.json"), fixture("labels.json"), fixture("manifest.json"),
+    ).value;
+    const evidence = buildEvidence(corpus);
+    evidence.decisions.find((entry) => entry.model_id === "sol" && entry.case_id === "case-016")!
+      .source_trace!.semantic_coverage_repair_rounds = 2;
+    evidence.decisions.find((entry) => entry.model_id === "sol" && entry.case_id === "case-021")!
+      .source_trace!.semantic_coverage_repair_rounds = 1;
+
+    const sol = scoreAdmissionRolloutEvidence(corpus, evidence, governingDigests).models
+      .find((entry) => entry.model_id === "sol")!;
+    expect(sol.semantic_coverage_repair_decisions).toBe(2);
+    expect(sol.semantic_coverage_repair_rounds).toBe(3);
+    expect(sol.semantic_coverage_repair_rate_bps).toBe(444);
+    expect(sol.free_form_semantic_coverage_repair_decisions).toBe(1);
+    expect(sol.free_form_semantic_coverage_repair_rate_bps).toBe(333);
   });
 
   it("invalidates evidence when a governing digest changes", () => {

@@ -39,6 +39,7 @@ import {
   type UnitActionKind,
 } from "../pipeline/unit-coordinator.js";
 import {
+  assertStructuredPlanLoopEnvelopeBound,
   loopActionPlanContext,
   loopActionTransitionContext,
 } from "../pipeline/structured-loop-envelope.js";
@@ -143,6 +144,21 @@ export interface StructuredChildRuntime {
   seedCompositeGraph(instance: PipelineInstance, request: StageRequestEnvelope, initialSubject: string): void;
   drainCompositeChildren(resource: RuntimeResource, instance: PipelineInstance, parentAttemptId: string): Promise<void>;
   compositeGraphNeedsDrain(parentAttemptId: string): boolean;
+}
+
+export function assertStructuredPlanEnvelopeBoundForInstance(
+  instance: Pick<PipelineInstance, "normalized_manifest" | "manifest_digest" | "agent">,
+  plan: AnyExecutionPlanContract,
+): void {
+  const manifest = JSON.parse(instance.normalized_manifest) as import("../pipeline/manifest.js").PipelineManifest;
+  assertStructuredPlanLoopEnvelopeBound(plan, {
+    manifest: {
+      manifest,
+      normalized: instance.normalized_manifest,
+      digest: instance.manifest_digest,
+    },
+    selectedAgent: instance.agent,
+  });
 }
 
 function terminalAttemptOutcomeFor(
@@ -1234,6 +1250,7 @@ export function createStructuredChildRuntime(deps: StructuredChildRuntimeDeps): 
         request,
         deps.store.getTaskBranch?.(instance.id)?.plan_digest,
       ));
+      assertStructuredPlanEnvelopeBoundForInstance(instance, plan);
       const commandPlan = commandPlanForUnits({
         plan,
         fallbackCommandNames: stage.unitCommandNames ?? [],

@@ -1,3 +1,5 @@
+import { isAbsolute, normalize } from "node:path";
+
 const ADMISSION_INSPECTION_STAGES = new Set(["admission_planner", "admission_reviewer"]);
 const ADMISSION_INSPECTION_CAPABILITIES = new Set([
   "admission/plan@1",
@@ -16,16 +18,24 @@ export function isAdmissionInspectionStage(request) {
 }
 
 export function assertAdmissionInspectionRuntimeSupported(request) {
-  if (isAdmissionInspectionStage(request) && request.agent === "codex") {
-    throw new Error(
-      "Codex automatic admission requires an OS-enforced contained read broker; no supported broker is installed"
-    );
+  if (!isAdmissionInspectionStage(request)) return;
+  if (!Object.hasOwn(INSPECTION_MODEL_CREDENTIAL, request.agent) && request.agent !== "codex") {
+    throw new Error(`unsupported admission inspection agent ${request.agent}`);
   }
 }
 
 export function inspectionProcessEnvironment(request, env = process.env) {
   if (!isAdmissionInspectionStage(request)) return env;
   assertAdmissionInspectionRuntimeSupported(request);
+  // Codex reads its credential from the action-scoped CODEX_HOME/auth.json.
+  // Never expose the raw broker value through the child process environment.
+  if (request.agent === "codex") {
+    const result = {};
+    for (const name of ["PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"]) {
+      if (typeof env[name] === "string" && env[name]) result[name] = env[name];
+    }
+    return result;
+  }
   const credential = INSPECTION_MODEL_CREDENTIAL[request.agent];
   if (!credential) throw new Error(`unsupported admission inspection agent ${request.agent}`);
   const result = {};
@@ -35,18 +45,34 @@ export function inspectionProcessEnvironment(request, env = process.env) {
   return result;
 }
 
-export function inspectionAgentPolicyArgs(agent) {
+function claudeInspectionReadRule(repositoryViewPath) {
+  if (typeof repositoryViewPath !== "string" || !isAbsolute(repositoryViewPath)) {
+    throw new Error("Claude admission inspection requires an absolute repository view path");
+  }
+  const root = normalize(repositoryViewPath);
+  if (root === "/" || /[\0\r\n*?[\]\\()]/u.test(root)) {
+    throw new Error("Claude admission inspection repository view path cannot be safely scoped");
+  }
+  return `Read(//${root.slice(1)}/**)`;
+}
+
+export function inspectionAgentPolicyArgs(agent, repositoryViewPath) {
   if (agent === "claude") {
     return [
       "--permission-mode", "dontAsk",
-      "--allowedTools", "Read,Grep,Glob",
-      "--disallowedTools", "Bash,Write,Edit,WebFetch,WebSearch,Task,NotebookEdit",
+      "--tools", "Read,Grep,Glob",
+      "--allowedTools", claudeInspectionReadRule(repositoryViewPath),
+      "--disallowedTools", "mcp__*",
     ];
   }
   if (agent === "codex") {
-    throw new Error(
-      "Codex automatic admission requires an OS-enforced contained read broker; read-only sandboxing is insufficient"
-    );
+    return [
+      "--sandbox", "read-only",
+      "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "-c", 'web_search="disabled"',
+    ];
   }
   if (agent === "opencode") return [];
   throw new Error(`unsupported admission inspection agent ${agent}`);

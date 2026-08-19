@@ -36,7 +36,8 @@ Run every checklist pass against the complete candidate:
 1. Verify route, structured lock, admission-basis, effective-manifest,
    engine/model, request-fence, producer-package, and generated-plan bindings.
 2. Check scope coverage: every ticket requirement and acceptance condition has
-   an owning unit and executable proof.
+   an owning unit and executable proof. Inventory explicit source requirement
+   or acceptance IDs and reject any omitted, weakened, or conflicting mapping.
 3. Check unsupported expansion: every unit stays within ticket authority.
 4. Check dependency coherence: ids are unique, dependencies exist and are
    acyclic, and ordered cross-component work can integrate.

@@ -9,6 +9,17 @@ Review the exact candidate plan. Do not improve, rewrite, or reserialize it.
 - Reject extra product behavior, architecture, dependencies, migrations,
   cleanup, or rollout work without ticket authority.
 
+## Explicit source IDs
+
+- Inventory every explicit stable requirement or acceptance ID in the bounded
+  ticket before reviewing units.
+- Require each ID to appear verbatim beside its complete meaning in at least
+  one owning unit's `requirements` or `acceptance` text.
+- Reject an omitted ID, weakened obligation, conflicting reuse of one ID, or an
+  ID-only pointer. Consistent repetition across owning units or proof fields is
+  allowed and is not duplication.
+- Do not require generated IDs when the source ticket is free-form.
+
 ## Unit completeness
 
 Every unit contains objective, requirements, files, approach, tests,

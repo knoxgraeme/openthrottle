@@ -5,6 +5,30 @@ sets `intents.implement.admission_mode: automatic` in committed
 `.openthrottle.yml`. Missing mode and `legacy` retain the existing default-graph
 behavior. `openthrottle init`, including `--editable-skills`, does not enable it.
 
+## Current engine support
+
+Claude and Codex can currently complete the compiled automatic-admission
+pipeline. The disposable Daytona sandbox is the outer security boundary, with
+an additional engine-specific read-only tier inside it:
+
+- Claude's planner and reviewer use Claude Code's path-scoped locked-down tool
+  permission broker. Only `Read`, `Grep`, and `Glob` are enabled, permission
+  mode is `dontAsk`, and a project-root-scoped `Read` rule contains repository
+  access.
+- Codex uses `codex exec --sandbox read-only --ask-for-approval never` with a
+  fresh ephemeral home, ignored user configuration, and a minimal environment.
+  Native read-only sandboxing prevents repository mutation, but Codex may inspect
+  other OS-readable paths inside the disposable Daytona sandbox. This weaker
+  isolation tier is accepted because Daytona is the security boundary.
+- OpenCode can run the isolated planner and reviewer inspection stages, but
+  `core/automatic@1` also contains the structured execution path. OpenCode
+  structured loop actions are not supported, so the compiled manifest is
+  rejected even when the planner might eventually select `simple`.
+
+Legacy admission and direct human-selected pipelines keep their existing
+engine support. Automatic-mode canaries must use Claude or Codex and pass the
+proof gates below.
+
 ## Routes and overrides
 
 - `simple` is one cohesive implementation that is verified as a whole.
@@ -55,9 +79,20 @@ it. Use these pinned inputs:
   package, reviewer package, and effective-manifest digests. A change to any
   governing digest invalidates the evidence instead of silently carrying it
   forward.
-- Record route, generated-plan digest, structured-review approval, latency,
-  input tokens, output tokens, and `cost_usd_micros` for every repetition. Never
-  place prompts, ticket text, environment values, or credentials in the result.
+- Record route, canonical generated-plan JSON bytes, generated-plan digest,
+  digest-bound structured-review receipt, latency, input tokens, output tokens,
+  and `cost_usd_micros` for every repetition. The scorer reparses the canonical
+  `openthrottle.execution-plan/v2` bytes, recomputes their digest, and requires
+  the approved `openthrottle.admission-review/v1` receipt to name that digest
+  and the governing effective-manifest digest. Never place prompts, ticket
+  text, environment values, or credentials in the result.
+- For every structured result, record `source_trace` with the explicit source
+  IDs observed in the reviewed plan, any IDs the reviewer found reused with
+  conflicting meaning, and the count of semantic coverage repair rounds. The
+  sealed label lists expected IDs; the scorer independently verifies exact ID
+  presence in the canonical reviewed plan and rejects missing, unexpected, or
+  conflicting trace IDs. An omitted or conflicting ID fails the rollout even
+  if the final review was approved.
 
 Build and score the evidence with the exported contracts functions
 `validateAdmissionEvaluationCorpus`, `validateAdmissionRolloutEvidence`, and
@@ -66,12 +101,16 @@ case/model pair. Each model must independently achieve at least 90% accuracy,
 at most 10% `needs_human` on unambiguous cases, zero `simple` decisions for
 structured or ambiguous cases, zero executable decisions for ambiguous cases,
 and an approved independent review for every structured output. The report also
-retains repeated-`needs_human` rate and per-model latency, token, and cost totals
-for operator review.
+retains explicit-ID coverage, semantic coverage-repair rates for explicit-ID
+and free-form structured cohorts, repeated-`needs_human` rate, and per-model
+latency, token, and cost totals for operator review. Coverage-repair rate is an
+observational tuning metric; zero approved explicit-ID omissions or conflicts
+is the release gate.
 
 Before a canary, an operator must inspect the blinded report, confirm every
-structured output has an approval receipt, confirm the evidence is current for
-the deployed digests, and attach it to the separate rollout ticket. Rehearse
+structured output has canonical plan bytes plus a digest-bound reviewer
+receipt, confirm the evidence is current for the deployed digests, and attach
+it to the separate rollout ticket. Rehearse
 the rollback below, then enable one explicitly selected repository, monitor its
 admission details and publication state, and expand only through separate
 configuration changes. This repository change supplies proof machinery only;

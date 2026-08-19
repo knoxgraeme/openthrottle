@@ -129,6 +129,25 @@ pipelines: ${pipelines}
 ${extra}`;
 }
 
+function automaticRepositoryConfigYaml(): string {
+  return `schema: openthrottle.config/v1
+default_graph: simple
+graphs:
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@3
+pipelines: { automatic: automatic }
+intents:
+  implement:
+    admission_mode: automatic
+    default_graph: simple
+    allowed_graphs: [simple, structured]
+`;
+}
+
 function structuredPlanWithContextExtra(extraBytes: number): ExecutionPlanContractV2 {
   const requirements: string[] = [];
   const approach: string[] = [];
@@ -563,6 +582,67 @@ mcp_servers: {}
     });
     expect(db!.prepare("SELECT COUNT(*) FROM runs").pluck().get()).toBe(0);
     expect(githubFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    {
+      agent: "Claude",
+      overrides: { claudeCodeOauthToken: "claude-token" },
+      labels: [{ name: "claude", parentName: "agent" }],
+    },
+    {
+      agent: "Codex",
+      overrides: { codexAuthJson: "{}" },
+      labels: [{ name: "codex", parentName: "agent" }],
+    },
+  ])("admits $agent automatic admission through its read-only broker", async ({ overrides, labels }) => {
+    const { tickets, pipelines } = await run(
+      automaticRepositoryConfigYaml(),
+      overrides,
+      shippedCatalogPath,
+      payload(),
+      {},
+      {},
+      labels
+    );
+
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
+      state: "active",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM repository_config_snapshots").pluck().get()).toBe(1);
+    expect(pipelines.getInstanceForSession("session-1")?.pipeline_id).toMatch(/^core\/automatic\//);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_task_branches").pluck().get()).toBe(1);
+    expect(pipelines.listEffects(pipelines.getInstanceForSession("session-1")!.id).map((effect) => effect.kind)).toEqual([
+      "create_task_branch",
+      "provision",
+    ]);
+  });
+
+  it("rejects OpenCode automatic admission because the compiled manifest contains structured loop actions", async () => {
+    const { tickets } = await run(
+      automaticRepositoryConfigYaml(),
+      { kimiCodeApiKey: "kimi-token" },
+      shippedCatalogPath,
+      payload(),
+      {},
+      {},
+      [{ name: "opencode", parentName: "agent" }]
+    );
+
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
+      state: "error",
+      sandbox_id: null,
+      run_id: null,
+    });
+    expect(db!.prepare("SELECT COUNT(*) FROM repository_config_snapshots").pluck().get()).toBe(0);
+    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
+    const publications = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(publications.some((entry) =>
+      entry.includes("OpenCode structured loop actions are not supported yet") &&
+      entry.includes("No sandbox was provisioned.")
+    )).toBe(true);
   });
 
   it("fences an admission whose durable maintenance epoch changes before the pipeline transaction", async () => {

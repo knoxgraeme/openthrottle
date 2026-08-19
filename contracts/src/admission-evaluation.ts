@@ -1,5 +1,10 @@
 import { digestCanonicalJson } from "./canonical.js";
-import type { AdmissionRoute } from "./admission-decision.js";
+import {
+  validateAdmissionReview,
+  type AdmissionReview,
+  type AdmissionRoute,
+} from "./admission-decision.js";
+import { parseExecutionPlanContractV2 } from "./execution-plan-v2.js";
 import {
   SHA256,
   arrayAt,
@@ -12,6 +17,7 @@ import {
   objectAt,
   stringAt,
   timestampAt,
+  unique,
   type ValidatedContract,
 } from "./validation.js";
 
@@ -29,6 +35,7 @@ export const ADMISSION_EVALUATION_MAX_UNAMBIGUOUS_NEEDS_HUMAN_BPS = 1_000;
 
 const CASE_ID = /^case-[0-9]{3}$/;
 const MODEL_ID = /^[a-z][a-z0-9_-]{0,63}$/;
+const SOURCE_OBLIGATION_ID = /^[A-Z][A-Z0-9]*(?:[._-][A-Z0-9]+)*$/;
 const SENSITIVE_MATERIAL = [
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
   /github_pat_[A-Za-z0-9_]{20,}/,
@@ -49,6 +56,7 @@ export interface AdmissionEvaluationCase {
 export interface AdmissionEvaluationLabel {
   case_id: string;
   expected_route: AdmissionEvaluationRoute;
+  explicit_source_ids: string[];
 }
 
 export interface AdmissionEvaluationDistribution {
@@ -86,10 +94,16 @@ export interface AdmissionEvaluationModel {
   reasoning_level: string;
 }
 
-export interface StructuredPlanApproval {
-  status: "approved";
-  operator_id: string;
+export interface StructuredPlanReviewEvidence {
+  reviewer_id: string;
   recorded_at: string;
+  review: AdmissionReview;
+}
+
+export interface AdmissionSourceTrace {
+  preserved_source_ids: string[];
+  conflicting_source_ids: string[];
+  semantic_coverage_repair_rounds: number;
 }
 
 export interface AdmissionEvaluationDecision {
@@ -97,8 +111,10 @@ export interface AdmissionEvaluationDecision {
   model_id: string;
   repeat: number;
   route: AdmissionEvaluationRoute;
+  canonical_plan: string | null;
   generated_plan_digest: string | null;
-  structured_plan_approval: StructuredPlanApproval | null;
+  structured_plan_review: StructuredPlanReviewEvidence | null;
+  source_trace: AdmissionSourceTrace | null;
   latency_ms: number;
   input_tokens: number;
   output_tokens: number;
@@ -125,6 +141,18 @@ export interface AdmissionEvaluationModelScore {
   unsafe_simple_decisions: number;
   ambiguous_executable_decisions: number;
   unapproved_structured_decisions: number;
+  explicit_source_id_decisions: number;
+  explicit_source_ids_expected: number;
+  explicit_source_ids_preserved: number;
+  explicit_source_id_coverage_bps: number;
+  explicit_source_id_omissions: number;
+  conflicting_source_ids: number;
+  semantic_coverage_repair_decisions: number;
+  semantic_coverage_repair_rounds: number;
+  semantic_coverage_repair_rate_bps: number;
+  free_form_structured_decisions: number;
+  free_form_semantic_coverage_repair_decisions: number;
+  free_form_semantic_coverage_repair_rate_bps: number;
   latency_ms: number;
   input_tokens: number;
   output_tokens: number;
@@ -149,6 +177,25 @@ function assertNoSensitiveMaterial(value: unknown, path: string): void {
 
 function digestAt(value: unknown, path: string): string {
   return stringAt(value, path, { pattern: SHA256 });
+}
+
+function sourceIdList(value: unknown, path: string): string[] {
+  const ids = arrayAt(value, path, (entry, entryPath) =>
+    stringAt(entry, entryPath, { max: 64, pattern: SOURCE_OBLIGATION_ID }), { max: 128 });
+  return unique(ids, path).sort();
+}
+
+function canonicalPlanAt(value: unknown, path: string): { normalized: string; digest: string } {
+  const raw = stringAt(value, path, { max: 256 * 1024 });
+  const plan = parseExecutionPlanContractV2(raw, { source: path });
+  if (raw !== plan.normalized) fail(path, "must contain canonical JSON bytes");
+  if (plan.value.graph_id !== "structured") fail(`${path}.graph_id`, "must be structured");
+  return plan;
+}
+
+function containsSourceId(canonicalPlan: string, sourceId: string): boolean {
+  const sourceIds: string[] = canonicalPlan.match(/\b[A-Z][A-Z0-9]*(?:[._-][A-Z0-9]+)*\b/g) ?? [];
+  return sourceIds.includes(sourceId);
 }
 
 function parseDistribution(value: unknown, path: string): AdmissionEvaluationDistribution {
@@ -210,10 +257,13 @@ function parseLabels(value: unknown): {
   }
   const version = stringAt(input.version, "admission_evaluation_labels.version", { max: 64 });
   const labels = arrayAt(input.labels, "admission_evaluation_labels.labels", (entry, path) => {
-    const label = objectAt(entry, path, ["case_id", "expected_route"]);
+    const label = objectAt(entry, path, ["case_id", "expected_route", "explicit_source_ids"]);
     return {
       case_id: stringAt(label.case_id, `${path}.case_id`, { pattern: CASE_ID }),
       expected_route: enumAt(label.expected_route, `${path}.expected_route`, ["simple", "structured", "needs_human"] as const),
+      explicit_source_ids: label.explicit_source_ids === undefined
+        ? []
+        : sourceIdList(label.explicit_source_ids, `${path}.explicit_source_ids`),
     };
   }, { min: 45, max: 1_000 });
   if (new Set(labels.map((entry) => entry.case_id)).size !== labels.length) {
@@ -337,35 +387,82 @@ export function validateAdmissionRolloutEvidence(value: unknown): ValidatedContr
     }
   }
 
+  const governingDigests = parseGoverningDigests(
+    input.governing_digests,
+    "admission_rollout_evidence.governing_digests",
+  );
+
   const decisions = arrayAt(input.decisions, "admission_rollout_evidence.decisions", (entry, path) => {
     const decision = objectAt(entry, path, [
-      "case_id", "model_id", "repeat", "route", "generated_plan_digest", "structured_plan_approval",
-      "latency_ms", "input_tokens", "output_tokens", "cost_usd_micros",
+      "case_id", "model_id", "repeat", "route", "canonical_plan", "generated_plan_digest", "structured_plan_review",
+      "source_trace", "latency_ms", "input_tokens", "output_tokens", "cost_usd_micros",
     ]);
     const route = enumAt(decision.route, `${path}.route`, ["simple", "structured", "needs_human"] as const);
+    const canonicalPlan = nullable(decision.canonical_plan, (candidate) => canonicalPlanAt(candidate, `${path}.canonical_plan`));
     const generatedPlanDigest = nullable(decision.generated_plan_digest, (candidate) =>
       digestAt(candidate, `${path}.generated_plan_digest`));
-    const approval = nullable(decision.structured_plan_approval, (candidate): StructuredPlanApproval => {
-      const approvalInput = objectAt(candidate, `${path}.structured_plan_approval`, ["status", "operator_id", "recorded_at"]);
+    const reviewEvidence = nullable(decision.structured_plan_review, (candidate): StructuredPlanReviewEvidence => {
+      const reviewInput = objectAt(candidate, `${path}.structured_plan_review`, ["reviewer_id", "recorded_at", "review"]);
       return {
-        status: enumAt(approvalInput.status, `${path}.structured_plan_approval.status`, ["approved"] as const),
-        operator_id: stringAt(approvalInput.operator_id, `${path}.structured_plan_approval.operator_id`, { max: 160 }),
-        recorded_at: timestampAt(approvalInput.recorded_at, `${path}.structured_plan_approval.recorded_at`),
+        reviewer_id: stringAt(reviewInput.reviewer_id, `${path}.structured_plan_review.reviewer_id`, { max: 160 }),
+        recorded_at: timestampAt(reviewInput.recorded_at, `${path}.structured_plan_review.recorded_at`),
+        review: validateAdmissionReview(reviewInput.review, {
+          source: `${path}.structured_plan_review.review`,
+        }).value,
       };
     });
-    if (route === "structured" && generatedPlanDigest === null) {
-      fail(`${path}.generated_plan_digest`, "must be present for structured output");
+    const sourceTrace: AdmissionSourceTrace | null = decision.source_trace === undefined || decision.source_trace === null
+      ? null
+      : (() => {
+        const trace = objectAt(decision.source_trace, `${path}.source_trace`, [
+          "preserved_source_ids", "conflicting_source_ids", "semantic_coverage_repair_rounds",
+        ]);
+        return {
+          preserved_source_ids: sourceIdList(trace.preserved_source_ids, `${path}.source_trace.preserved_source_ids`),
+          conflicting_source_ids: sourceIdList(trace.conflicting_source_ids, `${path}.source_trace.conflicting_source_ids`),
+          semantic_coverage_repair_rounds: integerAt(
+            trace.semantic_coverage_repair_rounds,
+            `${path}.source_trace.semantic_coverage_repair_rounds`,
+            0,
+            100,
+          ),
+        };
+      })();
+    if (route === "structured" && (canonicalPlan === null || generatedPlanDigest === null)) {
+      fail(path, "must carry canonical plan bytes and their digest for structured output");
     }
-    if (route !== "structured" && (generatedPlanDigest !== null || approval !== null)) {
-      fail(path, `must not carry a structured plan or approval for ${route} output`);
+    if (route === "structured" && canonicalPlan!.digest !== generatedPlanDigest) {
+      fail(`${path}.generated_plan_digest`, "does not match the canonical plan");
+    }
+    if (route === "structured" && reviewEvidence === null) {
+      fail(`${path}.structured_plan_review`, "must carry a digest-bound review approval for structured output");
+    }
+    if (route === "structured" && reviewEvidence !== null) {
+      if (reviewEvidence.review.generated_plan_digest !== generatedPlanDigest) {
+        fail(`${path}.structured_plan_review.review.generated_plan_digest`, "does not match the canonical plan");
+      }
+      if (reviewEvidence.review.effective_manifest_digest !== governingDigests.effective_manifest_digest) {
+        fail(`${path}.structured_plan_review.review.effective_manifest_digest`, "does not match the governing digest");
+      }
+    }
+    if (route !== "structured" && (canonicalPlan !== null || generatedPlanDigest !== null || reviewEvidence !== null)) {
+      fail(path, `must not carry a structured plan or review for ${route} output`);
+    }
+    if (route === "structured" && sourceTrace === null) {
+      fail(`${path}.source_trace`, "must be present for structured output");
+    }
+    if (route !== "structured" && sourceTrace !== null) {
+      fail(`${path}.source_trace`, `must be null for ${route} output`);
     }
     return {
       case_id: stringAt(decision.case_id, `${path}.case_id`, { pattern: CASE_ID }),
       model_id: stringAt(decision.model_id, `${path}.model_id`, { pattern: MODEL_ID }),
       repeat: integerAt(decision.repeat, `${path}.repeat`, 1, 100),
       route,
+      canonical_plan: canonicalPlan?.normalized ?? null,
       generated_plan_digest: generatedPlanDigest,
-      structured_plan_approval: approval,
+      structured_plan_review: reviewEvidence,
+      source_trace: sourceTrace,
       latency_ms: integerAt(decision.latency_ms, `${path}.latency_ms`, 0, 86_400_000),
       input_tokens: integerAt(decision.input_tokens, `${path}.input_tokens`, 0, 10_000_000),
       output_tokens: integerAt(decision.output_tokens, `${path}.output_tokens`, 0, 10_000_000),
@@ -384,7 +481,7 @@ export function validateAdmissionRolloutEvidence(value: unknown): ValidatedContr
   const evidence: AdmissionRolloutEvidence = {
     schema: ADMISSION_ROLLOUT_EVIDENCE_SCHEMA,
     corpus_digest: digestAt(input.corpus_digest, "admission_rollout_evidence.corpus_digest"),
-    governing_digests: parseGoverningDigests(input.governing_digests, "admission_rollout_evidence.governing_digests"),
+    governing_digests: governingDigests,
     models,
     decisions,
   };
@@ -414,8 +511,8 @@ export function scoreAdmissionRolloutEvidence(
     fail("admission_rollout_evidence.decisions", `must contain at least ${ADMISSION_EVALUATION_MIN_LIVE_DECISIONS} live decisions`);
   }
 
-  const labels = new Map<string, AdmissionEvaluationRoute>();
-  for (const label of corpus.labels) labels.set(label.case_id, label.expected_route);
+  const labels = new Map<string, AdmissionEvaluationLabel>();
+  for (const label of corpus.labels) labels.set(label.case_id, label);
   const decisionsByModel = new Map<string, {
     cases: Map<string, { repeats: AdmissionEvaluationDecision[]; count: number }>;
     latency_ms: number;
@@ -464,6 +561,16 @@ export function scoreAdmissionRolloutEvidence(
     let unsafeSimpleDecisions = 0;
     let ambiguousExecutableDecisions = 0;
     let unapprovedStructuredDecisions = 0;
+    let structuredDecisions = 0;
+    let explicitSourceIdDecisions = 0;
+    let explicitSourceIdsExpected = 0;
+    let explicitSourceIdsPreserved = 0;
+    let explicitSourceIdOmissions = 0;
+    let conflictingSourceIds = 0;
+    let semanticCoverageRepairDecisions = 0;
+    let semanticCoverageRepairRounds = 0;
+    let freeFormStructuredDecisions = 0;
+    let freeFormSemanticCoverageRepairDecisions = 0;
 
     for (const label of corpus.labels) {
       const candidate = indexed.cases.get(label.case_id);
@@ -476,16 +583,70 @@ export function scoreAdmissionRolloutEvidence(
           fail("admission_rollout_evidence.decisions", `${model.model_id}/${label.case_id} repeats must be contiguous from 1`);
         }
       }
-      if (repeats.every((entry) => entry.route === label.expected_route)) correctWorstCasePairs += 1;
-      if (label.expected_route !== "needs_human" && repeats.some((entry) => entry.route === "needs_human")) {
-        unambiguousNeedsHumanPairs += 1;
+      const expectedIds = new Set(label.explicit_source_ids);
+      let allRepeatsCorrect = true;
+      let hasUnambiguousNeedsHuman = false;
+      for (const entry of repeats) {
+        if (entry.route !== label.expected_route) allRepeatsCorrect = false;
+        if (label.expected_route !== "needs_human" && entry.route === "needs_human") {
+          hasUnambiguousNeedsHuman = true;
+        }
+        if (label.expected_route !== "simple" && entry.route === "simple") unsafeSimpleDecisions += 1;
+        if (label.expected_route === "needs_human" && entry.route !== "needs_human") {
+          ambiguousExecutableDecisions += 1;
+        }
+        if (entry.route !== "structured") continue;
+        if (entry.structured_plan_review?.review.verdict !== "approved") unapprovedStructuredDecisions += 1;
+
+        structuredDecisions += 1;
+        const trace = entry.source_trace!;
+        const preservedIds = new Set(trace.preserved_source_ids);
+        const missingIds = label.explicit_source_ids.filter((id) => !preservedIds.has(id));
+        const unexpectedIds = trace.preserved_source_ids.filter((id) => !expectedIds.has(id));
+        const planMissingIds = label.explicit_source_ids.filter((id) => !containsSourceId(entry.canonical_plan!, id));
+
+        if (missingIds.length > 0) {
+          fail(
+            `admission_rollout_evidence.models.${model.model_id}.${label.case_id}`,
+            `approved structured plan omits explicit source id ${missingIds.join(", ")}`,
+          );
+        }
+        if (unexpectedIds.length > 0) {
+          fail(
+            `admission_rollout_evidence.models.${model.model_id}.${label.case_id}`,
+            `source trace contains unexpected explicit source id ${unexpectedIds.join(", ")}`,
+          );
+        }
+        if (planMissingIds.length > 0) {
+          fail(
+            `admission_rollout_evidence.models.${model.model_id}.${label.case_id}`,
+            `canonical plan omits explicit source id ${planMissingIds.join(", ")}`,
+          );
+        }
+        if (trace.conflicting_source_ids.length > 0) {
+          fail(
+            `admission_rollout_evidence.models.${model.model_id}.${label.case_id}`,
+            `approved structured plan contains conflicting source id ${trace.conflicting_source_ids.join(", ")}`,
+          );
+        }
+
+        if (label.explicit_source_ids.length > 0) {
+          explicitSourceIdDecisions += 1;
+          explicitSourceIdsExpected += label.explicit_source_ids.length;
+          explicitSourceIdsPreserved += label.explicit_source_ids.length - planMissingIds.length;
+          explicitSourceIdOmissions += missingIds.length;
+          conflictingSourceIds += trace.conflicting_source_ids.length;
+        } else {
+          freeFormStructuredDecisions += 1;
+          if (trace.semantic_coverage_repair_rounds > 0) {
+            freeFormSemanticCoverageRepairDecisions += 1;
+          }
+        }
+        if (trace.semantic_coverage_repair_rounds > 0) semanticCoverageRepairDecisions += 1;
+        semanticCoverageRepairRounds += trace.semantic_coverage_repair_rounds;
       }
-      unsafeSimpleDecisions += repeats.filter((entry) =>
-        label.expected_route !== "simple" && entry.route === "simple").length;
-      ambiguousExecutableDecisions += repeats.filter((entry) =>
-        label.expected_route === "needs_human" && entry.route !== "needs_human").length;
-      unapprovedStructuredDecisions += repeats.filter((entry) =>
-        entry.route === "structured" && entry.structured_plan_approval === null).length;
+      if (allRepeatsCorrect) correctWorstCasePairs += 1;
+      if (hasUnambiguousNeedsHuman) unambiguousNeedsHumanPairs += 1;
     }
 
     const routingAccuracyBps = rateBasisPoints(correctWorstCasePairs, corpus.labels.length);
@@ -519,6 +680,21 @@ export function scoreAdmissionRolloutEvidence(
       unsafe_simple_decisions: unsafeSimpleDecisions,
       ambiguous_executable_decisions: ambiguousExecutableDecisions,
       unapproved_structured_decisions: unapprovedStructuredDecisions,
+      explicit_source_id_decisions: explicitSourceIdDecisions,
+      explicit_source_ids_expected: explicitSourceIdsExpected,
+      explicit_source_ids_preserved: explicitSourceIdsPreserved,
+      explicit_source_id_coverage_bps: rateBasisPoints(explicitSourceIdsPreserved, explicitSourceIdsExpected),
+      explicit_source_id_omissions: explicitSourceIdOmissions,
+      conflicting_source_ids: conflictingSourceIds,
+      semantic_coverage_repair_decisions: semanticCoverageRepairDecisions,
+      semantic_coverage_repair_rounds: semanticCoverageRepairRounds,
+      semantic_coverage_repair_rate_bps: rateBasisPoints(semanticCoverageRepairDecisions, structuredDecisions),
+      free_form_structured_decisions: freeFormStructuredDecisions,
+      free_form_semantic_coverage_repair_decisions: freeFormSemanticCoverageRepairDecisions,
+      free_form_semantic_coverage_repair_rate_bps: rateBasisPoints(
+        freeFormSemanticCoverageRepairDecisions,
+        freeFormStructuredDecisions,
+      ),
       latency_ms: indexed.latency_ms,
       input_tokens: indexed.input_tokens,
       output_tokens: indexed.output_tokens,

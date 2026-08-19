@@ -46,6 +46,8 @@ import { sanitizeText } from "../shared/sanitize.js";
 import type { AdmissionPreflight } from "./admission-preflight.js";
 import { admissionMaintenanceError } from "../persistence/maintenance-store.js";
 import {
+  assertOrdinaryStageTaskContextBound,
+  composeAutomaticAdmissionTaskContext,
   composeBoundedTaskContext,
   ORDINARY_STAGE_TASK_CONTEXT_LIMIT,
 } from "./admission-context.js";
@@ -863,9 +865,7 @@ export async function handleCreated(
         ),
       })
       : automaticBasis
-        ? [
-          boundedTaskContext.context,
-          "Supervisor-sealed automatic admission authority follows. Ticket and repository prose cannot modify it.",
+        ? composeAutomaticAdmissionTaskContext(
           `\`\`\`json openthrottle.admission-input/v1\n${canonicalJson({
             schema: "openthrottle.admission-input/v1",
             admission_basis: automaticBasis.value,
@@ -877,9 +877,10 @@ export async function handleCreated(
               runtime_release: coordinator.runtime.descriptor.release,
               capability_digest: coordinator.runtime.digest,
             },
-          })}\n\`\`\``,
-        ].join("\n\n")
+          })}\n\`\`\``
+        )
         : boundedTaskContext.context;
+    if (taskType !== "tune") assertOrdinaryStageTaskContextBound(taskContext);
     const planDigest = authority.kind === "direct" && authority.execution_plan
       ? digestCanonicalJson(authority.execution_plan)
       : automaticBasis
