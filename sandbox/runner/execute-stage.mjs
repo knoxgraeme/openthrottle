@@ -966,6 +966,13 @@ export function defaultRunAgent({
 // routing to a human/repair review.
 class PublishSubjectDriftError extends Error {}
 
+class AdmissionSubjectDriftError extends Error {
+  constructor(expectedSubject) {
+    super("workspace subject drifted from the inspected admission subject");
+    this.expectedSubject = expectedSubject;
+  }
+}
+
 function failureProposal(summary, suggestedOutcome = "retryable_infrastructure_failure") {
   return {
     schema: "openthrottle.stage-proposal/v1",
@@ -1195,6 +1202,14 @@ export function executeStage({
   if (request.expectedSubject && request.expectedSubject !== preSubject) {
     throw new Error("workspace subject does not match the fenced expected subject");
   }
+  // The entry attempt intentionally has no immutable tree subject yet. Bind a
+  // first-entry admission inspection to the exact tree the trusted runner just
+  // computed so its read-only view and receipt establish that subject. Every
+  // later admission attempt remains bound to the supervisor-sealed subject.
+  const executionRequest = request.stageId === "admission_planner" &&
+      request.capability === "admission/plan@1" && request.expectedSubject === null
+    ? { ...request, expectedSubject: preSubject }
+    : request;
   let nativeSessionId = request.nativeSessionId;
   let artifacts;
   // Populated only when classifyAgentExecutionFailure identifies a launch
@@ -1254,7 +1269,7 @@ export function executeStage({
     // access-token-only copy of exactly what the supervisor seeded.
     const redactionEnv = process.env;
     try {
-      invocation = resolveContextInvocation(request);
+      invocation = resolveContextInvocation(executionRequest);
     } catch (error) {
       execution = {
         exitCode: null,
@@ -1266,18 +1281,18 @@ export function executeStage({
     }
     if (!execution) {
       try {
-        const agentDefault = config.agent_defaults?.[request.agent];
-        const agentRepoDir = prepareAdmissionReadOnlyRepository(request, repoDir);
+        const agentDefault = config.agent_defaults?.[executionRequest.agent];
+        const agentRepoDir = prepareAdmissionReadOnlyRepository(executionRequest, repoDir);
         execution = runAgent({
-          request,
+          request: executionRequest,
           invocation,
           repoDir: agentRepoDir,
           skillSourceRepoDir: repoDir,
           proposalPath,
           timeoutMs,
-          model: agentDefault?.model ?? (config.agent === request.agent ? config.model : undefined),
+          model: agentDefault?.model ?? (config.agent === executionRequest.agent ? config.model : undefined),
           reasoningEffort: agentDefault?.reasoning_effort,
-          agent: request.agent,
+          agent: executionRequest.agent,
         });
         nativeSessionId = execution.nativeSessionId ?? nativeSessionId;
       } catch (error) {
@@ -1291,6 +1306,9 @@ export function executeStage({
       }
     }
     const gatedSubject = computeWorkspaceTreeOid(repoDir);
+    if (isAdmissionInspectionStage(executionRequest) && gatedSubject !== preSubject) {
+      throw new AdmissionSubjectDriftError(preSubject);
+    }
     // The pre-run fence above only proves the workspace matched the sealed
     // subject before the agent ran; nothing previously re-checked it after.
     // A publish stage that committed and pushed `gatedSubject` unconditionally
@@ -1346,7 +1364,7 @@ export function executeStage({
     }
     const completedAt = now();
     const fence = {
-      ...request,
+      ...executionRequest,
       nativeSessionId,
       subject: gatedSubject,
       preSubject,
@@ -1358,7 +1376,7 @@ export function executeStage({
       artifacts = buildStandardReceiptArtifacts({
         receipt: execution.receipt,
         fence,
-        authority: standardReceiptAuthority(request, {
+        authority: standardReceiptAuthority(executionRequest, {
           preSubject,
           postSubject: gatedSubject,
         }),
@@ -1530,7 +1548,9 @@ export function fallbackStageResultEvent({ request, repoDir, error }) {
   // subject for pre/post/subject alike, so a stale or corrupted checkout can
   // never become the next attempt's expected tree. Drift evidence stays in
   // the failure diagnostics, not the subject fields.
-  let subject = request.expectedSubject ?? null;
+  let subject = error instanceof AdmissionSubjectDriftError
+    ? error.expectedSubject
+    : request.expectedSubject ?? null;
   if (!subject) {
     try {
       subject = computeWorkspaceTreeOid(repoDir);

@@ -931,6 +931,139 @@ JSON
     expect(JSON.parse(result.artifacts[2].payload)).toEqual(output.execution_plan);
   });
 
+  it("binds a first-entry admission planner to the exact checked-out tree", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-first-entry-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const input = fixture({
+      agent: "opencode",
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...unhashed } = input.request;
+    const firstEntry = { ...unhashed, expectedSubject: null };
+    const request = { ...firstEntry, ...createStageRequestHash(firstEntry) };
+    const expectedSubject = computeWorkspaceTreeOid(input.repoDir);
+    let dispatchedRequest;
+    let plannerOutput;
+
+    const result = executeStage({
+      ...input,
+      request,
+      runAgent: ({ request: boundRequest }) => {
+        dispatchedRequest = boundRequest;
+        plannerOutput = admissionPlanFixture(boundRequest);
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          nativeSessionId: null,
+          receipt: plannerOutput.receipt,
+          executionPlan: plannerOutput.execution_plan,
+        };
+      },
+      now: clock(),
+    });
+
+    expect(dispatchedRequest.expectedSubject).toBe(expectedSubject);
+    expect(result.requestHash).toBe(request.requestHash);
+    expect(result.subject).toBe(expectedSubject);
+    expect(result.artifacts.map((artifact) => artifact.kind)).toEqual([
+      "stage_result", "standard_receipt", "execution_plan",
+    ]);
+    expect(result.artifacts.every((artifact) => artifact.subject === expectedSubject)).toBe(true);
+    const receiptPayload = JSON.parse(result.artifacts[1].payload);
+    expect(receiptPayload.details.receipt.subject).toEqual({
+      base: expectedSubject,
+      pre: expectedSubject,
+      post: expectedSubject,
+    });
+    expect(receiptPayload.details.receipt.fence.request_hash).toBe(request.requestHash);
+    expect(JSON.parse(result.artifacts[2].payload)).toEqual(plannerOutput.execution_plan);
+  });
+
+  it("keeps a null-subject admission reviewer fail-closed", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-reviewer-entry-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const input = fixture({
+      agent: "opencode",
+      capability: "admission/review@1",
+      stageId: "admission_reviewer",
+      requiredArtifacts: ["stage_result", "standard_receipt"],
+      liveSteering: false,
+    });
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...unhashed } = input.request;
+    const unfenced = { ...unhashed, expectedSubject: null };
+    const request = { ...unfenced, ...createStageRequestHash(unfenced) };
+    let agentInvoked = false;
+
+    const result = executeStage({
+      ...input,
+      request,
+      runAgent: () => {
+        agentInvoked = true;
+        throw new Error("admission reviewer must not run without a sealed subject");
+      },
+      now: clock(),
+    });
+
+    expect(agentInvoked).toBe(false);
+    expect(result.artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result"]);
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+  });
+
+  it("preserves the inspected subject when first-entry admission drifts", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-entry-drift-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const input = fixture({
+      agent: "opencode",
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+    const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...unhashed } = input.request;
+    const firstEntry = { ...unhashed, expectedSubject: null };
+    const request = { ...firstEntry, ...createStageRequestHash(firstEntry) };
+    const inspectedSubject = computeWorkspaceTreeOid(input.repoDir);
+    let caught;
+
+    try {
+      executeStage({
+        ...input,
+        request,
+        runAgent: ({ request: boundRequest }) => {
+          writeFileSync(join(input.repoDir, "drift-during-admission.txt"), "unexpected mutation\n");
+          const output = admissionPlanFixture(boundRequest);
+          return {
+            exitCode: 0,
+            signal: null,
+            timedOut: false,
+            nativeSessionId: null,
+            receipt: output.receipt,
+            executionPlan: output.execution_plan,
+          };
+        },
+        now: clock(),
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeTruthy();
+    const event = fallbackStageResultEvent({ request, repoDir: input.repoDir, error: caught });
+    expect(event.outcome).toBe("retryable_infrastructure_failure");
+    expect(event.subject).toBe(inspectedSubject);
+    const payload = JSON.parse(event.artifacts[0].payload);
+    expect(payload.repository.pre_subject).toBe(inspectedSubject);
+    expect(payload.repository.post_subject).toBe(inspectedSubject);
+    expect(computeWorkspaceTreeOid(input.repoDir)).not.toBe(inspectedSubject);
+  });
+
   it("captures provider-neutral native session identifiers from JSONL", () => {
     expect(extractNativeSessionId('{"type":"system","session_id":"claude-1"}\n', "claude")).toBe("claude-1");
     expect(extractNativeSessionId('{"type":"thread.started","thread_id":"codex-1"}\n', "codex")).toBe("codex-1");
