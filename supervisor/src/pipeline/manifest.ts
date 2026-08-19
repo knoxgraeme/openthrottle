@@ -262,6 +262,7 @@ export interface CompileAutomaticManifestInput {
   capabilityDigest: string;
   planner: AutomaticManifestSkillBinding;
   reviewer: AutomaticManifestSkillBinding;
+  simpleCandidateManifest?: ValidatedPipelineManifest;
 }
 
 interface RetryDeclaration {
@@ -1116,6 +1117,33 @@ function applyAutomaticSkillBinding(
   stage.repositorySkill = binding.package;
 }
 
+function applyAutomaticSimpleCandidate(
+  manifest: PipelineManifest,
+  candidate: ValidatedPipelineManifest
+): void {
+  const bindings = [
+    ["simple_implementation", "implementation"],
+    ["simple_repair_implementation", "repair_implementation"],
+  ] as const;
+  for (const [targetId, sourceId] of bindings) {
+    const target = manifest.stages.find((stage) => stage.id === targetId);
+    const source = candidate.manifest.stages.find((stage) => stage.id === sourceId);
+    if (!target || !source?.loop || source.executor.kind !== "agent") {
+      fail(`automatic.simple_candidate.${sourceId}`, "must be an agent stage with a loop binding");
+    }
+    target.executor = structuredClone(source.executor);
+    target.loop = structuredClone(source.loop);
+    if (source.repositorySkill) {
+      target.repositorySkill = structuredClone(source.repositorySkill);
+    } else {
+      delete target.repositorySkill;
+    }
+    if (!manifest.requires.capabilities.includes(target.executor.capability)) {
+      manifest.requires.capabilities.push(target.executor.capability);
+    }
+  }
+}
+
 export function compileAutomaticManifest(input: CompileAutomaticManifestInput): ValidatedPipelineManifest {
   if (input.template.manifest.id !== AUTOMATIC_MANIFEST_ID || input.template.manifest.version !== 1) {
     fail("automatic.template", "must be core/automatic@1");
@@ -1133,6 +1161,11 @@ export function compileAutomaticManifest(input: CompileAutomaticManifestInput): 
     runtime: { release: input.runtimeRelease, capability_digest: input.capabilityDigest },
     planner: { reference: input.planner.reference, package_digest: input.planner.packageDigest },
     reviewer: { reference: input.reviewer.reference, package_digest: input.reviewer.packageDigest },
+    simple_candidate_manifest: input.simpleCandidateManifest ? {
+      id: input.simpleCandidateManifest.manifest.id,
+      version: input.simpleCandidateManifest.manifest.version,
+      digest: input.simpleCandidateManifest.digest,
+    } : null,
   };
   const identityDigest = digestNormalized(canonicalJson(identity));
   const manifest = structuredClone(input.template.manifest);
@@ -1146,6 +1179,7 @@ export function compileAutomaticManifest(input: CompileAutomaticManifestInput): 
   };
   applyAutomaticSkillBinding(manifest, AUTOMATIC_ADMISSION_STAGE_IDS.planner, input.planner);
   applyAutomaticSkillBinding(manifest, AUTOMATIC_ADMISSION_STAGE_IDS.reviewer, input.reviewer);
+  if (input.simpleCandidateManifest) applyAutomaticSimpleCandidate(manifest, input.simpleCandidateManifest);
   manifest.requires.capabilities.sort();
   return validatePipelineManifest(manifest, { source: `effective:${manifest.id}` });
 }

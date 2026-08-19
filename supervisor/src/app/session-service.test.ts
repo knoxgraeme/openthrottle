@@ -620,6 +620,87 @@ mcp_servers: {}
     ]);
   });
 
+  it("pins the configured repository implementation package into the automatic simple tail", async () => {
+    const graphPath = ".openthrottle/graphs/simple.json";
+    const skillDirectory = ".openthrottle/skills/implement-plan";
+    const skillPath = `${skillDirectory}/SKILL.md`;
+    const graph = JSON.parse(readFileSync(
+      new URL("../../graphs/simple-v1.json", import.meta.url),
+      "utf8"
+    )) as {
+      id: string;
+      workers: Array<{ id: string; skills: string[] }>;
+      loops: Array<{ id: string; skill: string; timeout_seconds: number }>;
+    };
+    graph.id = "repository/simple_editable";
+    for (const worker of graph.workers) {
+      if (worker.id === "implementer-fresh" || worker.id === "implementer-resume") {
+        worker.skills = ["repo://implement-plan"];
+      }
+    }
+    for (const loop of graph.loops) {
+      loop.timeout_seconds = 300;
+      if (loop.id === "implementation-loop" || loop.id === "repair-implementation-loop") {
+        loop.skill = "repo://implement-plan";
+      }
+    }
+
+    const { pipelines, tickets } = await run(
+      `schema: openthrottle.config/v1
+default_graph: simple_editable
+graphs:
+  - id: simple_editable
+    kind: repository
+    ref: ${graphPath}
+  - id: simple
+    kind: builtin
+    ref: core/simple@1
+  - id: structured
+    kind: builtin
+    ref: core/structured@3
+skills:
+  - id: implement-plan
+    path: ${skillDirectory}
+pipelines: { automatic: automatic }
+limits: { task_timeout: 300 }
+commands:
+  test: npm test
+  lint: npm run lint
+  build: npm run build
+intents:
+  implement:
+    admission_mode: automatic
+    default_graph: simple_editable
+    allowed_graphs: [simple_editable, simple, structured]
+`,
+      { codexAuthJson: "{}" },
+      shippedCatalogPath,
+      payload(),
+      {
+        [graphPath]: JSON.stringify(graph),
+        [skillPath]: "---\nname: implement-plan\n---\n# Repository implementation\n",
+      },
+      {},
+      [{ name: "codex", parentName: "agent" }]
+    );
+
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "active", last_error: null });
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const manifest = JSON.parse(instance.normalized_manifest) as {
+      stages: Array<{
+        id: string;
+        loop?: { skill: string };
+        repositorySkill?: { invocation: string; directory: string };
+      }>;
+    };
+    for (const id of ["simple_implementation", "simple_repair_implementation"]) {
+      expect(manifest.stages.find((stage) => stage.id === id)).toMatchObject({
+        loop: { skill: "repo://implement-plan" },
+        repositorySkill: { invocation: "implement-plan", directory: skillDirectory },
+      });
+    }
+  });
+
   it("uses the direct simple pipeline for OpenCode under an automatic repository config", async () => {
     const { tickets, pipelines } = await run(
       automaticRepositoryConfigYaml(),

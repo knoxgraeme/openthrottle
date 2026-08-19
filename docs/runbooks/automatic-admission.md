@@ -1,10 +1,13 @@
 # Automatic admission operator runbook
 
-`openthrottle init`, including `--editable-skills`, enables automatic admission
-for new repository configurations by writing
-`intents.implement.admission_mode: automatic` in committed `.openthrottle.yml`.
-This repository enables it too. OpenCode activations use direct default-graph
-routing until their structured execution path is supported. Existing
+`openthrottle init` enables automatic admission and materializes the editable
+simple graph plus its implementation/planner/reviewer skills for new repository
+configurations by writing
+`intents.implement.admission_mode: automatic` in committed `.openthrottle.yml`
+for Claude and Codex. This repository enables it too. The `simple` decision
+uses the configured editable default graph and pins its implementation package
+into the compiled automatic tail. OpenCode initialization omits automatic mode
+and uses direct default-graph routing until its structured execution path is supported. Existing
 configurations are not rewritten; missing mode and `legacy` retain the legacy
 default-graph behavior.
 
@@ -23,9 +26,9 @@ an additional engine-specific read-only tier inside it:
   Native read-only sandboxing prevents repository mutation, but Codex may inspect
   other OS-readable paths inside the disposable Daytona sandbox. This weaker
   isolation tier is accepted because Daytona is the security boundary.
-- OpenCode activations use direct default-graph routing even when the repository
-  config enables automatic admission. OpenCode structured loop actions are not
-  supported, so the supervisor does not select `core/automatic@1` for them.
+- OpenCode activations use direct default-graph routing. OpenCode structured
+  loop actions are not supported, so generated config does not enable automatic
+  mode and the supervisor does not select `core/automatic@1` for them.
 
 Legacy admission and direct human-selected pipelines keep their existing
 engine support. Automatic-mode canaries must use Claude or Codex and pass the

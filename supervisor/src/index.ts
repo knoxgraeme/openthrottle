@@ -105,7 +105,7 @@ async function main() {
       publishTaskBranch: (input) => publishRepositoryTaskBranch({ token: cfg.githubToken }, input),
     },
     taskTimeoutSeconds: cfg.taskTimeout,
-    reviewFanoutConcurrency: cfg.reviewFanoutConcurrency ?? 3,
+    reviewFanoutConcurrency: cfg.reviewFanoutConcurrency ?? 5,
     runtimeResourceRetentionMinutes: cfg.runtimeResourceRetentionMinutes,
     citationGateStore,
     reconcileRuntimeResources,

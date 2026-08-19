@@ -273,14 +273,12 @@ export function registrationSummary(
 }
 
 export function initOutro(
-  registration: RepositoryRegistrationInput,
-  editableSkills: boolean
+  registration: RepositoryRegistrationInput
 ): string {
-  const files = editableSkills ? ".openthrottle.yml and .openthrottle/" : ".openthrottle.yml";
   const delegation = registration.controlProvider === "linear"
     ? "delegate an issue from the configured Linear team"
     : "open or label a GitHub issue with `openthrottle`";
-  return `Commit ${files}, then ${delegation}.`;
+  return `Commit .openthrottle.yml and .openthrottle/, then ${delegation}.`;
 }
 
 export function installLocalSkills(options: OperatorSkillOptions = {}): LocalSkillInstallResult[] {
@@ -369,9 +367,21 @@ export async function promptConfig(
           },
         });
       },
-      test: () => prompts.text({ message: "Test command (blank to skip)", initialValue: detected.test }),
-      build: () => prompts.text({ message: "Build command (blank to skip)", initialValue: detected.build }),
-      lint: () => prompts.text({ message: "Lint command (blank to skip)", initialValue: detected.lint }),
+      test: () => prompts.text({
+        message: "Test command",
+        initialValue: detected.test,
+        validate: (value) => value.trim() ? undefined : "Enter the command the simple graph should run",
+      }),
+      build: () => prompts.text({
+        message: "Build command",
+        initialValue: detected.build,
+        validate: (value) => value.trim() ? undefined : "Enter the command the simple graph should run",
+      }),
+      lint: () => prompts.text({
+        message: "Lint command",
+        initialValue: detected.lint,
+        validate: (value) => value.trim() ? undefined : "Enter the command the simple graph should run",
+      }),
       post_bootstrap: () =>
         prompts.text({
           message: "Post-bootstrap command (blank to skip)",
@@ -475,14 +485,14 @@ function projectConfigDocument(config: ProjectConfig, editableSkills = false): R
         ? {
             default_graph: EDITABLE_GRAPH_ID,
             allowed_graphs: [EDITABLE_GRAPH_ID, "simple", "structured"],
-            admission_mode: "automatic",
+            ...(config.agent === "opencode" ? {} : { admission_mode: "automatic" }),
             planner_skill: "repo://admission-plan",
             reviewer_skill: "repo://review-admission-plan",
           }
         : {
             default_graph: "simple",
             allowed_graphs: ["simple", "structured"],
-            admission_mode: "automatic",
+            ...(config.agent === "opencode" ? {} : { admission_mode: "automatic" }),
           },
       investigate: { default_graph: "simple", allowed_graphs: ["simple"] },
     },
@@ -788,7 +798,7 @@ function buildEditableSkillsScaffold(
 ): EditableScaffold {
   for (const name of COMMAND_ALIAS_NAMES) {
     if (!(config.commands?.[name] || config[name])) {
-      throw new Error(`--editable-skills requires a ${name} command because the simple graph executes it`);
+      throw new Error(`openthrottle init requires a ${name} command because the editable simple graph executes it`);
     }
   }
 
@@ -1164,14 +1174,12 @@ async function resolveSupervisorEnv(
   };
 }
 
-export function parseInitArgs(args: string[]): { editableSkills: boolean; dryRun: boolean; profile: string } {
+export function parseInitArgs(args: string[]): { dryRun: boolean; profile: string } {
   let profile = "default";
-  let editableSkills = false;
   let dryRun = false;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (arg === "--editable-skills") editableSkills = true;
-    else if (arg === "--dry-run") dryRun = true;
+    if (arg === "--dry-run") dryRun = true;
     else if (arg === "--profile") {
       const value = args[index + 1];
       if (!value || value.startsWith("--")) throw new Error("--profile requires a profile name");
@@ -1182,7 +1190,7 @@ export function parseInitArgs(args: string[]): { editableSkills: boolean; dryRun
       throw new Error(`Unknown init option: ${arg}`);
     }
   }
-  return { editableSkills, dryRun, profile };
+  return { dryRun, profile };
 }
 
 export async function preflightSupervisor(
@@ -1233,10 +1241,7 @@ export function editableSkillsRefreshSummary(plan: EditableSkillsRefreshPlan): s
 }
 
 export default async function init(args: string[] = [], options: InitCommandOptions = {}): Promise<void> {
-  const { editableSkills, dryRun, profile } = parseInitArgs(args);
-  if (dryRun && !editableSkills) {
-    throw new Error("--dry-run is available only with --editable-skills");
-  }
+  const { dryRun, profile } = parseInitArgs(args);
   p.intro("openthrottle init");
   const env = options.env ?? process.env;
   const accessStore = options.supervisorAccessStore ??
@@ -1273,12 +1278,22 @@ export default async function init(args: string[] = [], options: InitCommandOpti
   }
   p.log.info(`Target repository: ${target.repo} (${target.baseBranch ?? "GitHub default branch"})`);
   p.log.info(detected.pm ? `Detected package manager: ${detected.pm}` : "No Node package detected; enter project commands manually.");
+  const configPath = join(process.cwd(), ".openthrottle.yml");
+  let allowConfigOverwrite = false;
+  if (!dryRun && existsSync(configPath)) {
+    const overwrite = await p.confirm({
+      message: ".openthrottle.yml already exists. Replace it with the default editable scaffold?",
+      initialValue: false,
+    });
+    if (p.isCancel(overwrite) || !overwrite) {
+      p.cancel("Cancelled. Existing .openthrottle.yml was kept; no repository was registered and no files were changed.");
+      return;
+    }
+    allowConfigOverwrite = true;
+  }
   const selection = await (options.promptConfig ?? promptConfig)(detected, target);
 
-  let supervisorTaskTimeoutSeconds: number | undefined;
-  if (editableSkills) {
-    supervisorTaskTimeoutSeconds = await getSupervisorTaskTimeoutSeconds(request);
-  }
+  const supervisorTaskTimeoutSeconds = await getSupervisorTaskTimeoutSeconds(request);
   if (dryRun) {
     const { plan, assumesConfigOverwrite } = planEditableSkillsDryRun(selection.project, process.cwd(), {
       supervisorTaskTimeoutSeconds,
@@ -1308,67 +1323,26 @@ export default async function init(args: string[] = [], options: InitCommandOpti
     return;
   }
 
-  const configPath = join(process.cwd(), ".openthrottle.yml");
-  if (existsSync(configPath)) {
-    const overwrite = await p.confirm({
-      message: ".openthrottle.yml already exists. Overwrite?",
-      initialValue: false,
-    });
-    if (p.isCancel(overwrite)) {
-      p.cancel("Cancelled.");
-      return;
-    }
-    if (!overwrite) p.log.warn("Kept existing .openthrottle.yml");
-    else {
-      if (editableSkills) {
-        const plan = planEditableSkillsRefresh(selection.project, process.cwd(), {
-          allowConfigOverwrite: true,
-          supervisorTaskTimeoutSeconds,
-        });
-        for (const line of editableSkillsRefreshSummary(plan)) p.log.info(line);
-        if (!plan.writable) throw new Error("Editable-skill refresh has local edits or conflicts; no files changed");
-        const apply = await p.confirm({
-          message: "Apply the listed editable-skill scaffold and provenance updates?",
-          initialValue: false,
-        });
-        if (p.isCancel(apply) || !apply) {
-          p.cancel("Cancelled. No repository was registered and no files were changed.");
-          return;
-        }
-      }
-      writeProjectConfig(selection.project, process.cwd(), {
-        editableSkills,
-        allowConfigOverwrite: true,
-        supervisorTaskTimeoutSeconds,
-      });
-      p.log.success(editableSkills
-        ? "Wrote .openthrottle.yml and editable implementation/admission skills"
-        : "Wrote .openthrottle.yml");
-    }
-  } else {
-    if (editableSkills) {
-      const plan = planEditableSkillsRefresh(selection.project, process.cwd(), {
-        supervisorTaskTimeoutSeconds,
-      });
-      for (const line of editableSkillsRefreshSummary(plan)) p.log.info(line);
-      if (!plan.writable) throw new Error("Editable-skill refresh has local edits or conflicts; no files changed");
-      const apply = await p.confirm({
-        message: "Apply the listed editable-skill scaffold and provenance updates?",
-        initialValue: false,
-      });
-      if (p.isCancel(apply) || !apply) {
-        p.cancel("Cancelled. No repository was registered and no files were changed.");
-        return;
-      }
-    }
-    writeProjectConfig(selection.project, process.cwd(), {
-      editableSkills,
-      supervisorTaskTimeoutSeconds,
-    });
-    p.log.success(editableSkills
-      ? "Wrote .openthrottle.yml and editable implementation/admission skills"
-      : "Wrote .openthrottle.yml");
+  const plan = planEditableSkillsRefresh(selection.project, process.cwd(), {
+    allowConfigOverwrite,
+    supervisorTaskTimeoutSeconds,
+  });
+  for (const line of editableSkillsRefreshSummary(plan)) p.log.info(line);
+  if (!plan.writable) throw new Error("Editable-skill refresh has local edits or conflicts; no files changed");
+  const apply = await p.confirm({
+    message: "Apply the listed editable-skill scaffold and provenance updates?",
+    initialValue: false,
+  });
+  if (p.isCancel(apply) || !apply) {
+    p.cancel("Cancelled. No repository was registered and no files were changed.");
+    return;
   }
+  writeProjectConfig(selection.project, process.cwd(), {
+    editableSkills: true,
+    allowConfigOverwrite,
+    supervisorTaskTimeoutSeconds,
+  });
+  p.log.success("Wrote .openthrottle.yml and editable implementation/admission skills");
 
   p.log.info("Installing local OpenThrottle skills for detected agents");
   const localSkills = (options.installLocalSkills ?? installLocalSkills)();
@@ -1402,5 +1376,5 @@ export default async function init(args: string[] = [], options: InitCommandOpti
   p.log.success(
     `GitHub webhook ${result.readiness.webhook}; Daytona snapshot ${result.readiness.snapshot.name} is ${result.readiness.snapshot.state}.`
   );
-  p.outro(initOutro(selection.registration, editableSkills));
+  p.outro(initOutro(selection.registration));
 }

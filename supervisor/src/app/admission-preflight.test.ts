@@ -87,6 +87,33 @@ describe("automatic admission authority", () => {
     });
   });
 
+  it("uses the configured repository graph as the automatic simple candidate", () => {
+    const config = admissionConfig("automatic");
+    config.graphs.push({
+      id: "simple_editable",
+      kind: "repository",
+      ref: ".openthrottle/graphs/simple.json",
+    });
+    Object.assign(config.intents!.implement!, {
+      default_graph: "simple_editable",
+      allowed_graphs: ["simple_editable", "simple", "structured"],
+    });
+
+    expect(resolveAdmissionAuthority({
+      config,
+      agent: "codex",
+      taskType: "implement",
+      context: "Implement the bounded ticket.",
+    })).toEqual({
+      kind: "automatic",
+      lock: null,
+      candidates: [
+        { graph_id: "simple", graph_ref: ".openthrottle/graphs/simple.json" },
+        { graph_id: "structured", graph_ref: "core/structured@3" },
+      ],
+    });
+  });
+
   it("seals an automatic structured lock but preserves explicit simple and legacy routing", () => {
     expect(resolveAdmissionAuthority({
       config: admissionConfig("automatic"),
@@ -164,6 +191,23 @@ describe("automatic admission authority", () => {
       taskType: "implement",
       context: "Implement the bounded ticket.",
     })).toMatchObject({ kind: "direct", graph_id: "simple", explicit: false });
+
+    const editable = admissionConfig("automatic");
+    editable.graphs.push({
+      id: "simple_editable",
+      kind: "repository",
+      ref: ".openthrottle/graphs/simple.json",
+    });
+    Object.assign(editable.intents!.implement!, {
+      default_graph: "simple_editable",
+      allowed_graphs: ["simple_editable", "simple", "structured"],
+    });
+    expect(resolveAdmissionAuthority({
+      config: editable,
+      agent: "opencode",
+      taskType: "implement",
+      context: "Implement the bounded ticket.",
+    })).toMatchObject({ kind: "direct", graph_id: "simple_editable", explicit: false });
   });
 
   it("derives a stable admission basis without overloading manifest or generated-plan identity", () => {

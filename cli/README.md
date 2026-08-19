@@ -27,11 +27,11 @@ npx openthrottle init
 
 `init` installs user-global authoring/operator skills for detected local agents,
 writes `.openthrottle.yml`, registers a Linear-team or GitHub-Issue control route,
-creates the GitHub webhook, and verifies the Daytona snapshot. New
-configurations enable automatic implementation admission by default. OpenCode
-activations use direct default-graph routing until their structured execution
-path is supported. Set `intents.implement.admission_mode: legacy` for direct
-routing on every engine.
+creates the GitHub webhook, and verifies the Daytona snapshot. New Claude and
+Codex configurations enable automatic implementation admission by default.
+OpenCode configurations omit that mode and use direct default-graph routing
+until their structured execution path is supported. Set
+`intents.implement.admission_mode: legacy` for direct routing on every engine.
 
 For Linear control, prepare and delegate a plan:
 
@@ -48,7 +48,7 @@ the exact `openthrottle` label to an open Issue.
 
 ```text
 openthrottle setup [--profile <name>] [--check] [--yes] [--legacy-checklist]
-openthrottle init [--profile <name>] [--editable-skills] [--dry-run]
+openthrottle init [--profile <name>] [--dry-run]
 openthrottle plan validate <file.md>
 openthrottle plan prepare <file.md> [--graph <id>]
 openthrottle validate <file.md>
@@ -66,13 +66,13 @@ Key workflows:
 - `setup` provisions and verifies the pinned supervisor and sandbox release.
   `--check` is read-only; `--profile` keeps multiple environments separate.
 - `init` is idempotent. Re-run it to change control provider, base branch, or
-  repository commands. A partial `OT_SUPERVISOR_URL`/`OT_STATUS_TOKEN` pair
-  fails closed.
-- `init --editable-skills` scaffolds repository-owned `implement-plan`,
+  repository commands. It scaffolds repository-owned `implement-plan`,
   `admission-plan`, and `review-admission-plan` packages. The planner and
   reviewer may be edited independently; provenance refreshes include their
   metadata and references and refuse to overwrite local edits. `--dry-run`
-  reports refresh classifications without writing or registering.
+  reports refresh classifications without writing or registering. A partial
+  `OT_SUPERVISOR_URL`/`OT_STATUS_TOKEN` pair fails closed. Test, lint, and build
+  commands are required because the generated simple graph executes all three.
 - `plan prepare` uses the configured local engine and canonical planning skill;
   `plan validate` checks the embedded execution-plan contract.
 - `status`, `stop`, `logs`, and `analysis` call authenticated supervisor
