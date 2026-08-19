@@ -1,107 +1,92 @@
 # OpenThrottle delivery plan
 
-Status: coordinator cutover, Stage C structured remediation (RU1–RU11), and
-the post-RU11 hardening lane are complete; live credentialed dogfood is the
-open milestone.
+OpenThrottle now has one deterministic coordinator architecture, a live
+repository-configurable structured workflow, automatic admission for Claude and
+Codex, acknowledged exact-SHA task-branch checkpoints, and concurrent semantic
+review fanout. The active delivery lane is controlled rollout plus safe
+parallelization of structured implementation units.
 
-The detailed implementation units and acceptance criteria live in
-[`docs/plans/2026-07-21-001-feat-configurable-agentic-pipeline-coordinator-plan.md`](plans/2026-07-21-001-feat-configurable-agentic-pipeline-coordinator-plan.md).
-This file records the active product-level plan after that cutover.
+The normative runtime contract is [`SPEC.md`](SPEC.md). Detailed implementation
+plans live under [`docs/plans/`](plans/).
 
 ## Product boundary
 
-OpenThrottle is a pre-production proof of concept. A Linear delegation selects
-one immutable configurable pipeline; a deterministic Fly supervisor coordinates
-fenced stages in Daytona; self-contained OpenThrottle skills supply agent
-reasoning; and GitHub is the publication/provider surface. The current snapshot
-still carries the Compound Engineering plugin as an unused legacy image input;
-removing that ambient dependency is separate cleanup, not a planning contract.
+OpenThrottle is a pre-production, plan-first coding pipeline. An approved
+Linear ticket or GitHub Issue selects one immutable configurable graph. The Fly
+supervisor owns deterministic admission, scheduling, gates, recovery,
+integration, and publication. Self-contained OpenThrottle skills provide
+semantic judgment inside fenced Daytona actions. GitHub supplies task-branch,
+pull-request, and provider evidence.
 
-There is one execution architecture. New generations never select a direct
-task runner, automatic resume scheduler, callback endpoint, preview revival
-path, or repository environment fallback. Compatibility code is limited to
-idempotent SQLite migrations that can open a database created by an earlier
-revision.
+There is no direct-run fallback coordinator. Compatibility is limited to
+additive/idempotent migrations and explicitly supported older public contracts.
+The sandbox image does not ship Compound Engineering; every runtime skill is an
+agent-neutral OpenThrottle package maintained once and delivered per engine.
 
-## Completed delivery units
+## Completed lanes
 
-- U0–U1: vocabulary, typed manifests, strict validation, immutable catalog and
-  runtime/config snapshots.
-- U2–U5: durable coordinator state, stage attempts, artifacts, gates, work
-  bindings, effects, runtime resources, and recovery semantics.
-- U6–U9: sealed stage executor, context policies, subject fencing, provider
-  evidence, bounded repair, and publication receipts.
-- U10–U13: core implement/investigate pipelines, command/agent fixtures,
-  unconditional admission, operator visibility, and rollout documentation.
-- Cutover cleanup: removed live direct-run scheduling, task adapter registry,
-  standalone resume tasks, completion callback/markers, preview revival,
-  repository routing fallbacks, and their production tests/configuration.
-- Stage C remediation (RU1–RU11): the structured, repository-configurable
-  `for_each_unit` graph is now admission-reachable, fenced, durably reduced,
-  and proven end-to-end by a local two-unit Docker walking skeleton (see
-  [`docs/plans/2026-07-29-001-fix-complete-structured-workflows-u2-u7-plan.md`](plans/2026-07-29-001-fix-complete-structured-workflows-u2-u7-plan.md)).
-  RU11 closes the lane: reportable child transitions durably insert an
-  ordered, sanitized child-publication event and its correlated Linear outbox
-  activity in the same transaction as the reducer write, and every terminal
-  ledger renders directly from those durable event rows -- independent of the
-  correlated outbox activity's own delivery -- so Linear/GitHub converge from
-  restart-safe records instead of a point-in-time snapshot. The repository
-  default graph remains `simple`.
-- Post-RU11 hardening lane (merged since 2026-07-29): self-contained default
-  skills replacing CE delegation (#143/#149); the read-only analysis contract
-  (`GET /analysis/runs`, the citation contract and grading gate, and the
-  bounded differential improvement ratchet — #156/OPE-113/#185); structured
-  review-persona fanout with review-journal evidence (OPE-138, #186);
-  GitHub-Issue control routes and their runbook (#192, #196–#198); the gated
-  `core/tune@1` self-improvement pipeline (#203/#206); and the v12
-  admission-drain deployment cutover (#211–#213).
-- OPE-186 automatic-admission visibility: an additive provider-neutral
-  projection preserves planner/reviewer provenance and the accepted route
-  independently of later execution gates; authenticated status/detail and
-  equivalent Linear/GitHub summaries expose the decision without granting
-  control authority. Repository and initializer defaults remain legacy. Live
-  evaluation and enablement remain a separate rollout milestone.
+- Configurable coordinator cutover, sealed stage execution, durable effects,
+  repair, publication, provider evidence, and runtime cleanup.
+- Repository-configurable structured workflows with durable unit state,
+  executor-owned worktrees, unit acceptance, serial exact-subject integration,
+  whole-change gates, and a Docker walking skeleton.
+- Self-contained skills, analysis/tuning evidence, GitHub-Issue control,
+  automatic admission planning/review, and provider-neutral admission
+  visibility.
+- Codex supervisor-owned token brokerage and concurrent review-persona fanout.
+  The active review window defaults to 5 and can be rolled back to serial by
+  setting `REVIEW_FANOUT_CONCURRENCY=1`.
+- OPE-187 lifecycle hardening: task branches are reserved at the exact base
+  before planning; accepted write work advances through acknowledged exact-SHA
+  checkpoints; replacement sandboxes restore from the acknowledged checkpoint;
+  bounded action artifacts are retained while reconstructible runtime state is
+  pruned.
+- Automatic admission is the initializer and repository default for Claude and
+  Codex. `openthrottle init` also materializes the editable simple graph plus
+  repository-owned implementation, admission-planner, and admission-reviewer
+  skills. OpenCode continues to use direct default-graph routing because its
+  structured loop-action runtime is not implemented.
 
-## Origin U8 (live credentialed dogfood)
+## Active milestones
 
-The Stage C remediation chain is now locally complete. Origin U8 — migrating
-a repository's public config/graph surface to select `structured` and running
-the first live, credentialed Linear → Fly → Daytona → GitHub dogfood
-(OPE-45; earlier revisions of this plan cited OPE-35) — remains explicitly
-out of scope for this plan and is tracked separately. No PR in this lane
-changes the repository default or claims hosted credential/provider
-acceptance.
+1. Run the credentialed automatic-admission evaluation and a plain-text live
+   delegation with current planner/reviewer/runtime digests. Capture the blinded
+   scoring report, accepted route, checkpoint restoration, publication, and
+   cleanup evidence described in
+   [`runbooks/automatic-admission.md`](runbooks/automatic-admission.md).
+2. Deliver Phase 3A from the
+   [parallel structured units plan](plans/2026-08-19-1232-feat-parallel-structured-units-plan.md):
+   deterministic claim-safe waves, concurrent worktree-owned writers using the
+   same durable fanout machinery as reviewers,
+   durable multi-action recovery, a gather barrier, and strictly serial
+   integration. Concurrency 1 must remain behaviorally equivalent to today's
+   structured path and is the rollback switch.
+3. After Phase 3A's live gate, deliver Phase 3B: lead preferences over the
+   supervisor-certified ready set, scope-preserving splits, budget-reserve
+   wind-down, coherent slice publication, and merge-evidence continuation.
+4. Expand repository-owned scaffolding beyond the simple implementation and
+   admission roles so every replaceable structured semantic role can be copied,
+   validated, pinned, refreshed, and edited through the same `repo://` model.
+5. Add OpenCode structured loop actions before claiming automatic structured
+   admission or structured-unit parity for that engine.
 
-## Acceptance gate for this PR
+## Release gates
 
-1. Supervisor and CLI typecheck and build pass.
-2. Supervisor, CLI, and sandbox unit tests pass.
-3. Sandbox shell tests pass where Bats is available.
-4. Sandbox image builds and sealed Claude/Codex/OpenCode plus command-stage
-   smoke passes.
-5. Semantic code review covers the complete branch diff; valid findings are
-   fixed and regression-tested.
-6. GitHub CI and review threads on the PR are green/resolved.
+- Contract, supervisor, CLI, sandbox, Bats, Docker smoke, and structured walking
+  skeleton suites pass.
+- Every externally visible decision is bound to immutable graph, skill,
+  runtime, subject, and request identities.
+- Stop, supersede, crash recovery, checkpoint restoration, retention, and disk
+  pressure converge without losing accepted work or exposing secrets.
+- Semantic review covers the complete branch diff; valid findings are fixed and
+  regression-tested; GitHub CI and review threads are green.
+- Credentialed Linear/GitHub/Daytona/Fly/model proofs run only as explicit
+  operator gates, never as assumed CI coverage.
 
-The credentialed Linear → Fly → Daytona → GitHub exercise is intentionally
-deferred at the user’s direction. It remains a known verification gap, not a
-reason to retain an alternate execution path.
+## Non-goals
 
-## Next proof milestones
-
-- Run one explicitly authorized credentialed pipeline in a registered test
-  repository/team and capture immutable selection, fenced stage results,
-  exact-subject provider evidence, repair, publication, and cleanup.
-- Dogfood implement and investigate manifests against representative target
-  repositories.
-- Revisit destructive database schema contraction only if retaining historical
-  columns becomes an operational burden. Migration scaffolding must never
-  influence admission or execution.
-
-## Non-goals for the POC
-
-- Production cohort rollout, consumer draining, or soak gates.
-- Multi-tenant administration or a separate web UI.
-- GitHub replacement or agent-authored GitHub approvals.
-- Parallel swarms within one ticket.
-- Windows support.
+- Parallel integration or agent-owned Git publication authority.
+- Agent authority to approve the original plan, expand approved scope, merge a
+  PR, bypass dependency/resource fences, or create arbitrary follow-up work.
+- Multi-tenant administration, a separate web UI, or Windows support in this
+  delivery lane.
