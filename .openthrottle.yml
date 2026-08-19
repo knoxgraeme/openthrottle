@@ -43,6 +43,7 @@ intents:
     allowed_graphs:
       - simple
       - structured
+    admission_mode: automatic
   investigate:
     default_graph: simple
     allowed_graphs:

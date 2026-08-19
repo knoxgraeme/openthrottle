@@ -74,6 +74,7 @@ describe("automatic admission authority", () => {
   it("offers only the two versioned built-in candidates when automatic mode has no selection", () => {
     expect(resolveAdmissionAuthority({
       config: admissionConfig("automatic"),
+      agent: "claude",
       taskType: "implement",
       context: "Implement the bounded ticket.",
     })).toEqual({
@@ -89,6 +90,7 @@ describe("automatic admission authority", () => {
   it("seals an automatic structured lock but preserves explicit simple and legacy routing", () => {
     expect(resolveAdmissionAuthority({
       config: admissionConfig("automatic"),
+      agent: "claude",
       taskType: "implement",
       context: selection("structured"),
     })).toMatchObject({
@@ -97,11 +99,13 @@ describe("automatic admission authority", () => {
     });
     expect(resolveAdmissionAuthority({
       config: admissionConfig("automatic"),
+      agent: "claude",
       taskType: "implement",
       context: selection("simple"),
     })).toMatchObject({ kind: "direct", graph_id: "simple" });
     expect(resolveAdmissionAuthority({
       config: admissionConfig(),
+      agent: "claude",
       taskType: "implement",
       context: "Implement the bounded ticket.",
     })).toMatchObject({ kind: "direct", graph_id: "simple", explicit: false });
@@ -110,6 +114,7 @@ describe("automatic admission authority", () => {
   it("keeps repository graphs plan-required and rejects simple plans or non-implementation control", () => {
     expect(resolveAdmissionAuthority({
       config: admissionConfig("automatic"),
+      agent: "claude",
       taskType: "implement",
       context: selection("repo_structured"),
     })).toMatchObject({ kind: "direct", graph_id: "repo_structured" });
@@ -140,14 +145,25 @@ describe("automatic admission authority", () => {
     ].join("\n");
     expect(() => resolveAdmissionAuthority({
       config: admissionConfig("automatic"),
+      agent: "claude",
       taskType: "implement",
       context: planContext,
     })).toThrow(/simple graph selection cannot carry an execution plan/);
     expect(() => resolveAdmissionAuthority({
       config: admissionConfig("automatic"),
+      agent: "claude",
       taskType: "investigate",
       context: selection("simple"),
     })).toThrow(/graph selection is not supported for investigate tickets/);
+  });
+
+  it("uses direct routing for an OpenCode activation under an automatic repository config", () => {
+    expect(resolveAdmissionAuthority({
+      config: admissionConfig("automatic"),
+      agent: "opencode",
+      taskType: "implement",
+      context: "Implement the bounded ticket.",
+    })).toMatchObject({ kind: "direct", graph_id: "simple", explicit: false });
   });
 
   it("derives a stable admission basis without overloading manifest or generated-plan identity", () => {

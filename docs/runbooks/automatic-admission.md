@@ -1,9 +1,12 @@
 # Automatic admission operator runbook
 
-Automatic admission remains disabled unless a repository operator explicitly
-sets `intents.implement.admission_mode: automatic` in committed
-`.openthrottle.yml`. Missing mode and `legacy` retain the existing default-graph
-behavior. `openthrottle init`, including `--editable-skills`, does not enable it.
+`openthrottle init`, including `--editable-skills`, enables automatic admission
+for new repository configurations by writing
+`intents.implement.admission_mode: automatic` in committed `.openthrottle.yml`.
+This repository enables it too. OpenCode activations use direct default-graph
+routing until their structured execution path is supported. Existing
+configurations are not rewritten; missing mode and `legacy` retain the legacy
+default-graph behavior.
 
 ## Current engine support
 
@@ -20,10 +23,9 @@ an additional engine-specific read-only tier inside it:
   Native read-only sandboxing prevents repository mutation, but Codex may inspect
   other OS-readable paths inside the disposable Daytona sandbox. This weaker
   isolation tier is accepted because Daytona is the security boundary.
-- OpenCode can run the isolated planner and reviewer inspection stages, but
-  `core/automatic@1` also contains the structured execution path. OpenCode
-  structured loop actions are not supported, so the compiled manifest is
-  rejected even when the planner might eventually select `simple`.
+- OpenCode activations use direct default-graph routing even when the repository
+  config enables automatic admission. OpenCode structured loop actions are not
+  supported, so the supervisor does not select `core/automatic@1` for them.
 
 Legacy admission and direct human-selected pipelines keep their existing
 engine support. Automatic-mode canaries must use Claude or Codex and pass the
@@ -107,14 +109,13 @@ latency, token, and cost totals for operator review. Coverage-repair rate is an
 observational tuning metric; zero approved explicit-ID omissions or conflicts
 is the release gate.
 
-Before a canary, an operator must inspect the blinded report, confirm every
+Before expanding beyond the initializer default, an operator must inspect the
+blinded report, confirm every
 structured output has canonical plan bytes plus a digest-bound reviewer
 receipt, confirm the evidence is current for the deployed digests, and attach
 it to the separate rollout ticket. Rehearse
-the rollback below, then enable one explicitly selected repository, monitor its
-admission details and publication state, and expand only through separate
-configuration changes. This repository change supplies proof machinery only;
-it does not change the default mode or enable a repository.
+the rollback below, then monitor admission details and publication state for
+newly initialized repositories before wider rollout.
 
 ## Inspect a decision
 

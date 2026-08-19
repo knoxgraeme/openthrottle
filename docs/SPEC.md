@@ -92,12 +92,16 @@ self-contained OpenThrottle skills. There is no second execution architecture.
 Supported ticket intents are `implement` and `investigate`. Pipeline selection
 is unconditional for every new generation.
 
-Automatic admission is opt-in per implementation intent with
-`admission_mode: automatic`. An absent value or `legacy` preserves the current
-default-graph selection and missing-plan rejection. A complete explicit simple
-selection or complete structured plan remains authoritative and bypasses the
-automatic planner. Automatic planning cannot be selected by investigate or
-tune tickets, ticket-authored skill paths, or an already-running generation.
+Automatic admission is selected per implementation intent with
+`admission_mode: automatic`. `openthrottle init` writes that mode for new
+repository configurations. OpenCode activations use direct default-graph
+routing until the automatic pipeline's structured execution path supports
+OpenCode. An absent value or `legacy` preserves default-graph selection and
+missing-plan rejection for existing or explicitly legacy configurations. A
+complete explicit simple selection or complete structured plan remains
+authoritative and bypasses the automatic planner. Automatic planning cannot be
+selected by investigate or tune tickets, OpenCode activations, ticket-authored
+skill paths, or an already-running generation.
 
 ## Manifest and catalog contract
 
@@ -1437,8 +1441,10 @@ fresh checkout runnable, and unit worktrees are fresh checkouts.
 
 An implement intent may set `admission_mode: legacy | automatic` and may bind
 `planner_skill` and `reviewer_skill` through declared `builtin://` or `repo://`
-references. Missing mode is legacy. Neither `openthrottle init` nor this
-repository writes `automatic` by default.
+references. Missing mode is legacy. `openthrottle init` writes `automatic` for
+new configurations, and this repository explicitly enables it. OpenCode
+activations use direct routing while their configured mode remains automatic.
+Existing configurations may retain missing-mode or explicit `legacy` behavior.
 
 ## CLI contract
 

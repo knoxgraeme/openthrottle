@@ -620,8 +620,8 @@ mcp_servers: {}
     ]);
   });
 
-  it("rejects OpenCode automatic admission because the compiled manifest contains structured loop actions", async () => {
-    const { tickets } = await run(
+  it("uses the direct simple pipeline for OpenCode under an automatic repository config", async () => {
+    const { tickets, pipelines } = await run(
       automaticRepositoryConfigYaml(),
       { kimiCodeApiKey: "kimi-token" },
       shippedCatalogPath,
@@ -632,17 +632,16 @@ mcp_servers: {}
     );
 
     expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({
-      state: "error",
+      state: "active",
       sandbox_id: null,
       run_id: null,
     });
-    expect(db!.prepare("SELECT COUNT(*) FROM repository_config_snapshots").pluck().get()).toBe(0);
-    expect(db!.prepare("SELECT COUNT(*) FROM pipeline_instances").pluck().get()).toBe(0);
-    const publications = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
-    expect(publications.some((entry) =>
-      entry.includes("OpenCode structured loop actions are not supported yet") &&
-      entry.includes("No sandbox was provisioned.")
-    )).toBe(true);
+    expect(db!.prepare("SELECT COUNT(*) FROM repository_config_snapshots").pluck().get()).toBe(1);
+    expect(pipelines.getInstanceForSession("session-1")?.pipeline_id).toBe("core/implement");
+    expect(pipelines.listEffects(pipelines.getInstanceForSession("session-1")!.id).map((effect) => effect.kind)).toEqual([
+      "create_task_branch",
+      "provision",
+    ]);
   });
 
   it("fences an admission whose durable maintenance epoch changes before the pipeline transaction", async () => {

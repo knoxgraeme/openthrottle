@@ -27,7 +27,11 @@ npx openthrottle init
 
 `init` installs user-global authoring/operator skills for detected local agents,
 writes `.openthrottle.yml`, registers a Linear-team or GitHub-Issue control route,
-creates the GitHub webhook, and verifies the Daytona snapshot.
+creates the GitHub webhook, and verifies the Daytona snapshot. New
+configurations enable automatic implementation admission by default. OpenCode
+activations use direct default-graph routing until their structured execution
+path is supported. Set `intents.implement.admission_mode: legacy` for direct
+routing on every engine.
 
 For Linear control, prepare and delegate a plan:
 
@@ -75,8 +79,7 @@ Key workflows:
   endpoints.
 - `status <ticket> --admission` prints the exact accepted automatic plan and
   reviewer receipt from the same provider-neutral, status-token-protected data
-  used by the list view. Init still leaves admission mode absent and therefore
-  legacy.
+  used by the list view. Init enables automatic admission by default.
 
 Run `npx openthrottle --help` for full flag descriptions.
 
