@@ -239,6 +239,7 @@ function automaticCandidates(config: RepositoryConfigContract): [AdmissionCandid
 
 export function resolveAdmissionAuthority(input: {
   config: RepositoryConfigContract;
+  agent: Agent;
   taskType: TaskType;
   context: string;
 }): AdmissionAuthority {
@@ -265,7 +266,7 @@ export function resolveAdmissionAuthority(input: {
     throw new Error("simple graph selection cannot carry an execution plan");
   }
 
-  const automatic = intent?.admission_mode === "automatic";
+  const automatic = intent?.admission_mode === "automatic" && input.agent !== "opencode";
   if (automatic && !selected && !executionPlan) {
     return { kind: "automatic", candidates: automaticCandidates(input.config), lock: null };
   }

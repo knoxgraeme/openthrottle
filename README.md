@@ -75,7 +75,11 @@ npx openthrottle init
 
 `init` installs user-global planning/operator skills for detected local agents,
 writes `.openthrottle.yml`, registers either a Linear-team or GitHub-Issue route,
-creates the repository webhook, and verifies the runtime snapshot.
+creates the repository webhook, and verifies the runtime snapshot. New
+configurations enable automatic implementation admission by default. OpenCode
+activations use direct default-graph routing until their structured execution
+path is supported. Set `intents.implement.admission_mode: legacy` to retain
+direct routing for every engine.
 
 With `LINEAR_API_KEY` and `OT_AGENT_APP_ID` exported, prepare and delegate a
 plan through Linear control:
@@ -88,8 +92,8 @@ npx openthrottle status <provider-qualified-ticket-id> --admission
 ```
 
 The second status form inspects the exact accepted automatic plan and reviewer
-evidence through the authenticated supervisor. Automatic admission is opt-in;
-this repository and `openthrottle init` remain on legacy routing by default.
+evidence through the authenticated supervisor. This repository and newly
+initialized repositories enable automatic admission by default.
 See the [automatic-admission runbook](docs/runbooks/automatic-admission.md) for
 route meanings, explicit/manual bypasses, inspection, and active-run rollback.
 

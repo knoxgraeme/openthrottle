@@ -322,12 +322,16 @@ describe("init project detection", () => {
       commands: { test: "npm test" },
       test: "npm test",
       intents: {
-        implement: { default_graph: "simple", allowed_graphs: ["simple", "structured"] },
+        implement: {
+          default_graph: "simple",
+          allowed_graphs: ["simple", "structured"],
+          admission_mode: "automatic",
+        },
         investigate: { default_graph: "simple", allowed_graphs: ["simple"] },
       },
     });
     expect(contents).not.toContain("base_branch");
-    expect(contents).not.toContain("admission_mode:");
+    expect(contents).toContain("admission_mode: automatic");
     expect(contents).not.toContain("build:");
   });
 
@@ -411,6 +415,7 @@ describe("init project detection", () => {
     expect(parse(readFileSync(join(codexDir, ".openthrottle.yml"), "utf8"))).toMatchObject({
       agent: "codex",
       model: "gpt-5-codex",
+      intents: { implement: { admission_mode: "automatic" } },
     });
 
     const opencodeDir = temporaryProject();
@@ -430,6 +435,27 @@ describe("init project detection", () => {
     expect(parse(readFileSync(join(opencodeDir, ".openthrottle.yml"), "utf8"))).toMatchObject({
       agent: "opencode",
       model: "kimi-code/kimi-for-coding",
+      intents: { implement: { admission_mode: "automatic" } },
+    });
+
+    const editableOpenCodeDir = temporaryProject();
+    writeProjectConfig(
+      {
+        agent: "opencode",
+        model: "kimi-code/kimi-for-coding",
+        test: "npm test",
+        build: "npm run build",
+        lint: "npm run lint",
+        post_bootstrap: [],
+        limits: { max_turns: 20, task_timeout: 60 },
+        mcp_servers: {},
+      },
+      editableOpenCodeDir,
+      { editableSkills: true }
+    );
+    expect(parse(readFileSync(join(editableOpenCodeDir, ".openthrottle.yml"), "utf8"))).toMatchObject({
+      agent: "opencode",
+      intents: { implement: { admission_mode: "automatic" } },
     });
 
     const claudeDir = temporaryProject();
@@ -752,12 +778,13 @@ describe("init project detection", () => {
         implement: {
           default_graph: "simple_editable",
           allowed_graphs: ["simple_editable", "simple", "structured"],
+          admission_mode: "automatic",
           planner_skill: "repo://admission-plan",
           reviewer_skill: "repo://review-admission-plan",
         },
       },
     });
-    expect(configRaw).not.toContain("admission_mode:");
+    expect(configRaw).toContain("admission_mode: automatic");
 
     const graphRaw = readFileSync(join(directory, ".openthrottle/graphs/simple.json"), "utf8");
     const graph = parseGraphContract(graphRaw, {

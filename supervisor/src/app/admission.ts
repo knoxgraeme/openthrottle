@@ -724,6 +724,7 @@ export async function handleCreated(
     );
     const authority = resolveAdmissionAuthority({
       config: repositoryConfig.config,
+      agent: selectedAgent,
       taskType,
       context: boundedTaskContext.selectionContext,
     });

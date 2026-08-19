@@ -475,10 +475,15 @@ function projectConfigDocument(config: ProjectConfig, editableSkills = false): R
         ? {
             default_graph: EDITABLE_GRAPH_ID,
             allowed_graphs: [EDITABLE_GRAPH_ID, "simple", "structured"],
+            admission_mode: "automatic",
             planner_skill: "repo://admission-plan",
             reviewer_skill: "repo://review-admission-plan",
           }
-        : { default_graph: "simple", allowed_graphs: ["simple", "structured"] },
+        : {
+            default_graph: "simple",
+            allowed_graphs: ["simple", "structured"],
+            admission_mode: "automatic",
+          },
       investigate: { default_graph: "simple", allowed_graphs: ["simple"] },
     },
   };
