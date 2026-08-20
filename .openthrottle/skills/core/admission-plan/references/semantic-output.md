@@ -13,8 +13,8 @@ Return exactly these four keys and no wrapper:
 
 For `structured`, replace null with one complete
 `openthrottle.execution-plan/v2`. `simple` has no questions. `needs_human` has
-at least one specific question. Do not emit receipt or mechanical authority
-fields; the executor owns those fields and the canonical plan digest.
+at least one specific question. Do not emit mechanical authority fields; the
+executor owns those fields and the canonical plan digest.
 
 In a structured plan, every `commands[].name` is an exact key from the sealed
 repository `command_names` list. It is never a shell command or a prose label.

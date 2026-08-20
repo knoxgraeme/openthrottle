@@ -115,35 +115,37 @@ COPY sandbox/lib /opt/openthrottle/lib
 COPY sandbox/safety /opt/openthrottle/safety
 COPY sandbox/hooks /opt/openthrottle/hooks
 COPY sandbox/bin/ot-activity.mjs /usr/local/bin/ot-activity
+COPY sandbox/bin/ot-result.mjs /opt/openthrottle/bin/ot-result.mjs
 COPY sandbox/bin/ot-stage-result.mjs /opt/openthrottle/bin/ot-stage-result.mjs
 COPY sandbox/bin/ot-subject-post.mjs /opt/openthrottle/bin/ot-subject-post.mjs
 COPY supervisor/pipelines/runtime-capabilities-v1.json /opt/openthrottle/runtime-capabilities.json
 COPY skills /opt/openthrottle/skills
+COPY .openthrottle /opt/openthrottle/definitions
+COPY contracts/generated/runtime /opt/openthrottle/generated/runtime
+COPY contracts/generated/provider-schemas /opt/openthrottle/generated/provider-schemas
+COPY contracts/generated/artifact-set.json /opt/openthrottle/generated/artifact-set.json
 
 RUN set -eux; \
     baseline="/opt/openthrottle/action-home-baseline"; \
-    install -d -m 0755 "$baseline/claude/skills" "$baseline/codex"; \
-    cp -r /opt/openthrottle/skills/tasks/. "$baseline/claude/skills/"; \
+    install -d -m 0755 "$baseline/claude" "$baseline/codex"; \
+    cp /opt/openthrottle/skills/codex/AGENTS-fragment.md "$baseline/codex/AGENTS.md"; \
     chown -R root:root "$baseline"; \
     chmod -R a-w "$baseline"
 
-# The canonical task skills (skills/tasks/<name>/SKILL.md, agents/openai.yaml)
-# are the single source of truth. Claude gets the OpenThrottle adapters copied
-# into its runtime profile from the root-owned baseline. Codex gets the same
-# adapters baked at admin scope (/etc/codex/skills), so mutable user plugin
-# state is never executable across stage credentials. Each adapter's
-# agents/openai.yaml sets policy.allow_implicit_invocation: false so a skill
-# only runs when the entrypoint's prompt names it explicitly via
-# `$<skill-name>`.
-RUN mkdir -p /etc/codex/skills \
-    && cp -r /opt/openthrottle/skills/tasks/. /etc/codex/skills/ \
-    && chown -R root:root /etc/codex/skills \
-    && chmod -R a-w /etc/codex/skills
+# Skills are not installed globally for any engine. Each action reconstructs
+# only its DefinitionBundle allowlist inside an executor-sealed private
+# discovery root. Claude, Codex, and OpenCode therefore see the same catalog,
+# and references remain native progressive-disclosure files rather than prompt
+# text.
+RUN chown -R root:root /opt/openthrottle/definitions /opt/openthrottle/generated \
+    && chmod -R a-w /opt/openthrottle/definitions /opt/openthrottle/generated
 
 RUN chmod 0755 /opt/openthrottle/entrypoint.sh \
     && chmod 0755 /opt/openthrottle/lib/runtime.sh \
     && chmod 0755 /opt/openthrottle/runner/*.mjs \
     && chmod 0755 /usr/local/bin/ot-activity \
+    && chmod 0755 /opt/openthrottle/bin/ot-result.mjs \
+    && ln -s /opt/openthrottle/bin/ot-result.mjs /usr/local/bin/ot-result \
     && chmod 0755 /opt/openthrottle/bin/ot-stage-result.mjs \
     && ln -s /opt/openthrottle/bin/ot-stage-result.mjs /usr/local/bin/ot-stage-result \
     && chmod 0755 /opt/openthrottle/bin/ot-subject-post.mjs \

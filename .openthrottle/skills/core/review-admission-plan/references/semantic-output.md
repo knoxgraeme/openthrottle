@@ -1,44 +1,29 @@
-# Admission reviewer semantic output
+# Writing the admission review
 
-Return exactly these four keys and no wrapper:
+Keep the conclusion compact and semantic. It should contain:
 
-```json
-{
-  "verdict": "approved | rejected | needs_human",
-  "summary": "bounded review summary",
-  "findings": [],
-  "questions": []
-}
-```
+- one clear disposition: approve, reject for correctable defects, or escalate
+  for missing source authority;
+- a short summary explaining the decisive evidence;
+- anchored findings for every correctable defect; and
+- specific questions only when the source request is genuinely incomplete or
+  contradictory.
 
-`approved` has no findings or questions. `rejected` has at least one anchored
-finding and no human question. `needs_human` has at least one specific question.
-Every finding has exactly this shape:
+An approval has no findings or open questions. A correctable rejection has at
+least one finding and does not ask a person to solve work the planner can fix.
+An escalation names the exact missing decision and why repository evidence
+cannot settle it.
 
-```json
-{
-  "severity": "P0 | P1 | P2 | P3",
-  "message": "specific correctable defect",
-  "path": "optional repository path"
-}
-```
+## Findings
 
-For example, a rejected review may return:
+Each finding should state:
 
-```json
-{
-  "verdict": "rejected",
-  "summary": "The plan omits a required failure-path check.",
-  "findings": [
-    {
-      "severity": "P1",
-      "message": "Unit api_change does not test the ticket-required unauthorized response.",
-      "path": "supervisor/src/http/routes.ts"
-    }
-  ],
-  "questions": []
-}
-```
+1. the source requirement, acceptance condition, or plan invariant involved;
+2. the unit, dependency edge, verification command, or repository path where
+   the defect occurs;
+3. the concrete omission, contradiction, unsupported expansion, or
+   implausibility; and
+4. the observable consequence for implementation or acceptance.
 
-Do not emit receipt or mechanical authority fields; the executor owns them and
-binds the review to the sealed candidate plan digest.
+Rank findings by impact. Avoid vague advice, proposed rewrites, duplicated
+claims, and large excerpts of the candidate plan.

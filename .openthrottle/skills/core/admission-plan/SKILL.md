@@ -72,7 +72,7 @@ read-only planning actor, not an implementation worker or pipeline controller.
   `command_names` keys, such as `test`, `lint`, or `build`. Use the key exactly;
   never copy its shell command value or invent a command name. If the sealed
   list is empty, return an empty `commands` array.
-- Use one stable `plan_id`, `graph_id: "structured"`, and the exact v2 fields.
+- Use one stable `plan_id`, `pipeline_id: "core/structured"`, and the exact v2 fields.
   Keep the canonical plan JSON at or below 256 KiB.
 
 ## Final executor result
@@ -82,8 +82,8 @@ Return exactly one compact semantic JSON object with `route`, `rationale`,
 structured route, `execution_plan` is the complete
 `openthrottle.execution-plan/v2`; for `simple` and `needs_human`, it is null.
 
-Do not emit a receipt, artifact wrapper, schema for the decision, digest,
-producer, subject, fence, assurance, evidence envelope, or timestamp. The
+Do not emit an artifact wrapper, schema for the decision, digest, producer,
+subject, fence, assurance, evidence envelope, or timestamp. The
 executor validates the semantic object, computes the canonical plan digest,
 constructs the typed decision and plan artifact, injects all sealed authority,
 and seals the standard artifacts.

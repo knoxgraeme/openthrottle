@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
 
@@ -47,30 +47,6 @@ function trustedBaselineEntry(metadata) {
   return metadata.uid === 0 && (metadata.isDirectory() || metadata.nlink === 1) && (metadata.mode & 0o022) === 0;
 }
 
-function copyTrustedDirectory(source, destination) {
-  const metadata = lstatSync(source);
-  if (metadata.isSymbolicLink()) return false;
-  if (metadata.isFile()) {
-    if (!trustedBaselineEntry(metadata)) return false;
-    removeSymbolicDestination(dirname(destination));
-    mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-    removeSymbolicDestination(destination);
-    copyFileSync(source, destination);
-    return true;
-  }
-  if (!metadata.isDirectory()) return false;
-  if (!trustedBaselineEntry(metadata)) return false;
-  removeSymbolicDestination(destination);
-  mkdirSync(destination, { recursive: true, mode: 0o700 });
-  for (const entry of readdirSync(source)) {
-    if (!copyTrustedDirectory(join(source, entry), join(destination, entry))) {
-      rmSync(destination, { recursive: true, force: true });
-      return false;
-    }
-  }
-  return true;
-}
-
 export function materializeCodexProfileBaseline({
   sourceHome = join(configuredActionHomeBaselineRoot(), "codex"),
   destinationHome,
@@ -85,19 +61,12 @@ export function materializeCodexProfileBaseline({
 }
 
 export function materializeClaudeProfileBaseline({
-  sourceHome = join(configuredActionHomeBaselineRoot(), "claude"),
+  sourceHome: _sourceHome = join(configuredActionHomeBaselineRoot(), "claude"),
   destinationHome,
 }) {
   prepareAgentOwnedDirectory(destinationHome);
-  const copied = [];
-  for (const directory of ["skills"]) {
-    const source = join(sourceHome, directory);
-    if (!existsSync(source) || !lstatSync(source).isDirectory()) continue;
-    // Claude's baked OpenThrottle skills are non-secret runtime discovery
-    // state. Credential files stay outside this RU5 baseline.
-    const destination = join(destinationHome, directory);
-    if (copyTrustedDirectory(source, destination)) copied.push(directory);
-  }
-  prepareAgentOwnedDirectory(destinationHome);
-  return copied;
+  // Skills are action inputs, not profile baseline. The action-profile
+  // materializer installs only the bundle-allowlisted packages after the
+  // engine home has been reset, so no sibling or unrelated skill is ambient.
+  return [];
 }

@@ -59,6 +59,25 @@ const executionPlan = {
   commands: [{ name: "test" }],
 } as unknown as AnyExecutionPlanContract;
 
+const executionPlanV2 = {
+  schema: "openthrottle.execution-plan/v2",
+  pipeline_id: "core/structured",
+  plan_id: "plan-v2",
+  units: [{
+    id: "unit_a",
+    title: "Unit A",
+    depends_on: [],
+    objective: "Implement one.",
+    requirements: ["Preserve the contract."],
+    files: ["src/a.ts"],
+    approach: ["Follow existing patterns."],
+    tests: ["Cover the behavior."],
+    acceptance: ["Done."],
+    verification: ["npm test"],
+  }],
+  commands: [{ name: "test" }],
+} as AnyExecutionPlanContract;
+
 const fanoutPlan = {
   schema: "openthrottle.review-fanout-plan/v1",
   roster_id: "roster-1",
@@ -301,6 +320,18 @@ describe("review subaction requests", () => {
       ...requestInput,
       authority: buildReviewSelectorAuthority({ subject: SUBJECT }),
     }).requestHash).toBe(request.requestHash);
+  });
+
+  it("uses pipeline identity without a graph alias in v2 review subaction context", () => {
+    const request = buildReviewSelectorRequest({
+      ...requestInput,
+      plan: executionPlanV2,
+      authority: buildReviewSelectorAuthority({ subject: SUBJECT }),
+    });
+
+    expect(request.transitionContext).toContain('"schema":"openthrottle.loop-action-plan-context/v2"');
+    expect(request.transitionContext).toContain('"pipeline_id":"core/structured"');
+    expect(request.transitionContext).not.toContain('"graph_id"');
   });
 
   it("builds one fanout request per persona, each fenced to that persona", () => {

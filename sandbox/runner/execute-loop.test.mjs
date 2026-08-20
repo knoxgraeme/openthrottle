@@ -47,6 +47,7 @@ import { digest } from "./artifacts.mjs";
 import { extractJsonBlock } from "./json-block.mjs";
 import { prepareLoopAgentEnvironment } from "./loop-agent-environment.mjs";
 import { subjectPost } from "../bin/ot-subject-post.mjs";
+import { normalizeSubmittedResult } from "./result-submission.mjs";
 
 const directories = [];
 
@@ -89,7 +90,7 @@ function repository() {
   mkdirSync(join(directory, "skills/implement-unit"), { recursive: true });
   writeFileSync(join(directory, "skills/implement-unit/SKILL.md"), [
     "---",
-    "name: implement_unit",
+    "name: implement-unit",
     "description: Test repository skill",
     "---",
     "",
@@ -157,7 +158,7 @@ function leadRequest(overrides = {}) {
   });
 }
 
-function repositorySkillPackage(repoDir, invocation = "implement_unit") {
+function repositorySkillPackage(repoDir, invocation = "implement-unit") {
   const skillPath = "skills/implement-unit/SKILL.md";
   const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim();
   const blobSha = execFileSync("git", ["rev-parse", `${head}:${skillPath}`], { cwd: repoDir, encoding: "utf8" }).trim();
@@ -1199,16 +1200,24 @@ describe("loop action request validation", () => {
 
   it("validates repository skill packages as sealed loop input", () => {
     const valid = validateLoopRequest(repositorySkillRequest());
-    expect(valid.skill).toBe("implement_unit");
-    expect(valid.repositorySkill?.invocation).toBe("implement_unit");
-    expect(loopPrompt(valid).split("\n")[0]).toBe("$implement_unit");
+    expect(valid.skill).toBe("implement-unit");
+    expect(valid.repositorySkill?.invocation).toBe("implement-unit");
+    expect(loopPrompt(valid).split("\n")[0]).toBe("$implement-unit");
     const mismatched = {
       ...valid,
-      skill: "other_skill",
+      skill: "other-skill",
     };
     const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...withoutFence } = mismatched;
     const refencedRequest = { ...withoutFence, ...createLoopRequestHash(withoutFence) };
     expect(() => validateLoopRequest(refencedRequest)).toThrow(/repository skill invocation mismatch/);
+    const underscorePackage = repositorySkillPackage(
+      join(process.env.OT_WORKTREE_ROOT, "unit-1"),
+      "implement_unit",
+    );
+    expect(() => withFreshLoopFence(valid, {
+      skill: "implement_unit",
+      repositorySkill: underscorePackage,
+    })).toThrow(/repositorySkill\.invocation is invalid/);
     const wrongCommit = {
       ...valid,
       repositorySkill: {
@@ -2575,9 +2584,9 @@ describe("loop action request validation", () => {
 
   it("rejects repository skill packages whose frontmatter name does not bind the invocation", () => {
     const baseRequest = repositorySkillRequest();
-    const invalidPackage = repositorySkillPackage(join(process.env.OT_WORKTREE_ROOT, "unit-1"), "different_invocation");
+    const invalidPackage = repositorySkillPackage(join(process.env.OT_WORKTREE_ROOT, "unit-1"), "different-invocation");
     const valid = withFreshLoopFence(baseRequest, {
-      skill: "different_invocation",
+      skill: "different-invocation",
       repositorySkill: invalidPackage,
     });
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-frontmatter-"));
@@ -2597,8 +2606,8 @@ describe("loop action request validation", () => {
   it("rejects repository skill aliases that do not exactly match the frontmatter name", () => {
     const baseRequest = repositorySkillRequest();
     const valid = withFreshLoopFence(baseRequest, {
-      skill: "implement-unit",
-      repositorySkill: repositorySkillPackage(join(process.env.OT_WORKTREE_ROOT, "unit-1"), "implement-unit"),
+      skill: "implementunit",
+      repositorySkill: repositorySkillPackage(join(process.env.OT_WORKTREE_ROOT, "unit-1"), "implementunit"),
     });
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-loop-actions-alias-"));
     directories.push(actionRoot);
@@ -3867,6 +3876,81 @@ describe("loop action request validation", () => {
 });
 
 describe("executeLoopAction", () => {
+  it("settles one semantic unit candidate without entering legacy receipt correction", () => {
+    const valid = request();
+    const semanticSchema = {
+      schema: "openthrottle.semantic-result-schema/v1",
+      id: "core/unit-result",
+      outcomes: ["success", "failure", "needs_human", "exited"],
+      payload: {
+        summary: { type: "string", required: true, max_length: 4_000, normalize: "string-array-to-newlines/v1" },
+        assumptions: { type: "string_list", required: true, max_length: 1_000, max_items: 32 },
+        decisions: { type: "string_list", required: true, max_length: 1_000, max_items: 32 },
+        issues: { type: "string_list", required: true, max_length: 1_000, max_items: 32 },
+        verification: { type: "string_list", required: true, max_length: 1_000, max_items: 32 },
+        downstream_context: { type: "json", required: true },
+        requested_human_input: { type: "string_list", required: true, max_length: 1_000, max_items: 16 },
+      },
+    };
+    const authored = {
+      schema: "openthrottle.result-candidate/v1",
+      outcome: "success",
+      payload: {
+        summary: ["Implemented the unit.", "Targeted tests pass."],
+        assumptions: [],
+        decisions: ["Kept the existing boundary."],
+        issues: [],
+        verification: ["focused test passes"],
+        downstream_context: {},
+        requested_human_input: [],
+      },
+    };
+    const runLoopAgent = vi.fn(() => ({
+      status: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "legacy receipt parsing must stay bypassed",
+      stderr: "",
+      nativeSessionId: "unit-session-1",
+      integrationRepoDir: "/tmp/integration-current",
+      resultCandidate: {
+        status: "valid",
+        staged: normalizeSubmittedResult(authored, semanticSchema),
+      },
+    }));
+
+    const result = executeLoopActionWithIntegration({
+      request: valid,
+      runLoopAgent,
+      lockWorkerWorktree: vi.fn(),
+      lockActionDirectory: vi.fn(),
+      restoreIntegration: vi.fn(),
+      semanticResultSchema: "core/unit-result",
+      now: () => "2026-07-29T00:00:00.000Z",
+    });
+
+    expect(runLoopAgent).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      outcome: "success",
+      native_session_id: "unit-session-1",
+      result_settlement: {
+        state: "work_complete",
+        checkpoint: { output_subject: result.subject, native_session_id: "unit-session-1" },
+        candidate: {
+          candidate: { payload: { summary: "Implemented the unit.\nTargeted tests pass." } },
+          transformations: [{ path: "/payload/summary" }],
+        },
+      },
+    });
+    expect(result.receipt).toContain("openthrottle.semantic-result-settlement/v1");
+    expect(existsSync(join(
+      process.env.OT_LOOP_ACTION_ROOT,
+      valid.attemptId,
+      valid.actionId,
+      "receipt-correction.json",
+    ))).toBe(false);
+  });
+
   it("writes a typed result with worker receipt, native session, and subject", () => {
     const valid = request();
     const receipt = standardReceipt(valid);

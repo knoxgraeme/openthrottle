@@ -10,7 +10,7 @@ import { DIGEST, record, string } from "./validate.mjs";
 export const REPOSITORY_SKILL_CAPABILITY = "agent/repository-skill@1";
 
 const COMMIT = /^[a-f0-9]{40}$/;
-const INVOCATION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const INVOCATION = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const REPOSITORY_SKILL_REFERENCE =
   /^repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._/-]+$/;
 
@@ -48,7 +48,7 @@ function skillFrontmatterName(raw) {
   const end = lines.indexOf("---", 1);
   if (end === -1) throw new Error("repository skill SKILL.md frontmatter is unterminated");
   for (const line of lines.slice(1, end)) {
-    const match = line.match(/^name:\s*["']?([A-Za-z0-9][A-Za-z0-9._-]{0,127})["']?\s*$/);
+    const match = line.match(/^name:\s*["']?([a-z0-9]+(?:-[a-z0-9]+)*)["']?\s*$/);
     if (match) return match[1];
   }
   throw new Error("repository skill SKILL.md frontmatter is missing name");

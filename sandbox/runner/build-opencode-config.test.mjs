@@ -8,6 +8,7 @@ import {
   translateMcpServers,
   writeOpenCodeConfig,
 } from "./build-opencode-config.mjs";
+import { OPENCODE_PROGRESSIVE_SKILLS_CAPABILITY } from "./action-profile.mjs";
 
 const directories = [];
 
@@ -50,6 +51,7 @@ describe("OpenCode config builder", () => {
       webfetch: "deny",
       task: "deny",
       external_directory: "deny",
+      skill: { "*": "deny" },
     });
     expect(config.mcp).toEqual({});
   });
@@ -59,6 +61,26 @@ describe("OpenCode config builder", () => {
     expect(() => resolveOpenCodeModelProfile("kimi-code/kimi-k3")).toThrow(
       "Unsupported OpenCode model"
     );
+  });
+
+  it("exposes only an allowlisted sealed skill root through native progressive disclosure", () => {
+    const config = buildOpenCodeConfig({
+      model: "kimi-code/kimi-for-coding",
+      inspection: true,
+      skillRoot: "/var/lib/openthrottle/actions/a/profile/skills",
+      allowedSkills: ["review-change"],
+      progressiveSkillsCapability: OPENCODE_PROGRESSIVE_SKILLS_CAPABILITY,
+    });
+    expect(config.skills).toEqual(["/var/lib/openthrottle/actions/a/profile/skills"]);
+    expect(config.permission.skill).toEqual({ "*": "deny", "review-change": "allow" });
+  });
+
+  it("fails closed instead of inlining when native progressive skills are unavailable", () => {
+    expect(() => buildOpenCodeConfig({
+      model: "kimi-code/kimi-for-coding",
+      skillRoot: "/sealed/skills",
+      allowedSkills: ["review-change"],
+    })).toThrow("native progressive-skill capability is unavailable");
   });
 
   it("translates local and remote MCP servers", () => {

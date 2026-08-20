@@ -301,7 +301,7 @@ BRANCH_NAME="$(jq -er '.branch' "$OT_STAGE_REQUEST_FILE")"
 STAGE_BASE_COMMIT="$(jq -er '.baseCommit' "$OT_STAGE_REQUEST_FILE")"
 BASE_BRANCH="$(jq -er '.baseBranch' "$OT_STAGE_REQUEST_FILE")"
 STAGE_EXPECTED_SUBJECT="$(jq -r '.expectedSubject // empty' "$OT_STAGE_REQUEST_FILE")"
-AGENT="$(jq -er '.agent' "$OT_STAGE_REQUEST_FILE")"
+AGENT="$(jq -er '.engine // .agent' "$OT_STAGE_REQUEST_FILE")"
 TASK_TYPE="$(jq -er '.taskType' "$OT_STAGE_REQUEST_FILE")"
 STAGE_CONTEXT_POLICY="$(jq -er '.contextPolicy' "$OT_STAGE_REQUEST_FILE")"
 if ! jq -e '.credentialScopes | index("model.invoke") != null' "$OT_STAGE_REQUEST_FILE" >/dev/null; then
@@ -553,7 +553,7 @@ CONFIG_FILE="${OT_STAGE_CONFIG_FILE:-${REPO_DIR}/.openthrottle.yml}"
 # $1 = yq filter (applied with a `// "<default>"` fallback), $2 = default.
 yq_get() { yq_value_or_default "$CONFIG_FILE" "$1" "$2"; }
 
-CFG_AGENT="$(yq_get '.agent' 'codex')"
+CFG_AGENT="$(yq_get '.engine // .agent' 'codex')"
 CFG_MODEL="$(yq_get '.model' '')"
 MAX_TURNS="$(yq_get '.limits.max_turns' "$MAX_TURNS")"
 TASK_TIMEOUT="$(yq_get '.limits.task_timeout' "$TASK_TIMEOUT")"
@@ -721,18 +721,13 @@ rm -rf "${OT_DIR}/stage"
 install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "${OT_DIR}/stage"
 assert_agent_directory "${AGENT_HOME}/.claude"
 assert_agent_directory "${AGENT_HOME}/.codex"
-rm -rf "${AGENT_HOME}/.claude/skills"
-install -d -o root -g root -m 0755 "${AGENT_HOME}/.claude/skills"
 LINEAR_CONTEXT_TEMP="$(mktemp)"
 jq -r '.taskContext' "$OT_STAGE_REQUEST_FILE" > "$LINEAR_CONTEXT_TEMP"
 rm -f "${OT_DIR}/linear-context.md"
 install -o "$AGENT_USER" -g "$AGENT_USER" -m 0600 "$LINEAR_CONTEXT_TEMP" "${OT_DIR}/linear-context.md"
 rm -f "$LINEAR_CONTEXT_TEMP"
-if [[ -d "${OPT_DIR}/skills/tasks" ]]; then
-  cp -r "${OPT_DIR}/skills/tasks/." "${AGENT_HOME}/.claude/skills/"
-fi
-chown -R root:root "${AGENT_HOME}/.claude/skills"
-chmod -R a-w "${AGENT_HOME}/.claude/skills"
+# Skills are materialized later by the action-profile adapter from the sealed
+# action allowlist. No engine receives the whole built-in corpus here.
 
 LIVE_STEERING="$(jq -r '.liveSteering' "$OT_STAGE_REQUEST_FILE")"
 DRAIN_HOOK="${OPT_DIR}/hooks/ot-inbox-drain.sh"

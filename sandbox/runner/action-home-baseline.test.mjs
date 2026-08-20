@@ -115,7 +115,7 @@ describe("action home baseline materialization", () => {
     expect(existsSync(join(destination, "AGENTS.md"))).toBe(false);
   });
 
-  it("copies Claude skill discovery state without credential files", () => {
+  it("never copies skills or credential files from the Claude baseline", () => {
     const source = mkdtempSync(join(tmpdir(), "ot-claude-source-"));
     const destination = mkdtempSync(join(tmpdir(), "ot-claude-destination-"));
     directories.push(source, destination);
@@ -133,21 +133,14 @@ describe("action home baseline materialization", () => {
       chownSync(join(skillDir, "SKILL.md"), 0, 0);
     }
 
-    if (typeof process.getuid === "function" && process.getuid() === 0) {
-      expect(materializeClaudeProfileBaseline({ sourceHome: source, destinationHome: destination }))
-        .toEqual(["skills"]);
-
-      expect(readFileSync(join(destination, "skills", "implement-unit", "SKILL.md"), "utf8")).toContain("skill");
-    } else {
-      expect(materializeClaudeProfileBaseline({ sourceHome: source, destinationHome: destination }))
-        .toEqual([]);
-      expect(existsSync(join(destination, "skills"))).toBe(false);
-    }
+    expect(materializeClaudeProfileBaseline({ sourceHome: source, destinationHome: destination }))
+      .toEqual([]);
+    expect(existsSync(join(destination, "skills"))).toBe(false);
     expect(existsSync(join(destination, "credentials.json"))).toBe(false);
     expect(existsSync(join(destination, "settings.json"))).toBe(false);
   });
 
-  it("does not report partial Claude skill discovery copies", () => {
+  it("does not inspect or report partial Claude skill discovery copies", () => {
     if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
     const source = mkdtempSync(join(tmpdir(), "ot-claude-source-"));
     const destination = mkdtempSync(join(tmpdir(), "ot-claude-destination-"));
@@ -184,7 +177,7 @@ describe("action home baseline materialization", () => {
     expect(existsSync(join(destination, "skills"))).toBe(false);
   });
 
-  it("replaces stale action-home symlinks before Claude skill materialization", () => {
+  it("replaces a stale Claude profile symlink without materializing skills", () => {
     if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
     const source = mkdtempSync(join(tmpdir(), "ot-claude-source-"));
     const destinationParent = mkdtempSync(join(tmpdir(), "ot-claude-destination-"));
@@ -204,10 +197,10 @@ describe("action home baseline materialization", () => {
     symlinkSync(persistentProfile, destination);
 
     expect(materializeClaudeProfileBaseline({ sourceHome: source, destinationHome: destination }))
-      .toEqual(["skills"]);
+      .toEqual([]);
 
     expect(lstatSync(destination).isSymbolicLink()).toBe(false);
-    expect(readFileSync(join(destination, "skills", "implement-unit", "SKILL.md"), "utf8")).toContain("skill");
+    expect(existsSync(join(destination, "skills"))).toBe(false);
     expect(readFileSync(join(persistentProfile, "sentinel.txt"), "utf8")).toBe("do not mutate\n");
   });
 });

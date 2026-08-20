@@ -536,7 +536,7 @@ describe("downstream-context admission bound", () => {
 function twoUnitPlanV2(): ExecutionPlanContractV2 {
   return {
     schema: "openthrottle.execution-plan/v2",
-    graph_id: "structured",
+    pipeline_id: "core/structured",
     plan_id: "v2-dispatch-context",
     units: [
       {
@@ -573,10 +573,15 @@ describe("v2 self-contained execution-plan dispatch context", () => {
     const plan = twoUnitPlanV2();
 
     const context = loopActionPlanContext({ plan, actionKind: "implement", unitId: "api" }) as {
+      schema: string;
+      pipeline_id: string;
       unit: Record<string, unknown>;
       commands: Array<{ name: string }>;
     };
 
+    expect(context.schema).toBe("openthrottle.loop-action-plan-context/v2");
+    expect(context.pipeline_id).toBe("core/structured");
+    expect(context).not.toHaveProperty("graph_id");
     expect(context.unit).toEqual({
       id: "api",
       title: "API",
@@ -607,12 +612,19 @@ describe("v2 self-contained execution-plan dispatch context", () => {
       unitId: null,
       reviewSubject: "1".repeat(40),
     }) as {
+      schema: string;
+      pipeline_id: string;
       whole_plan: boolean;
       units: Array<{ id: string; title: string }>;
       review_fanout: { subject: string; personas: Array<{ id: string }> };
     };
 
-    expect(context.whole_plan).toBe(true);
+    expect(context).toMatchObject({
+      schema: "openthrottle.loop-action-plan-context/v2",
+      pipeline_id: "core/structured",
+      whole_plan: true,
+    });
+    expect(context).not.toHaveProperty("graph_id");
     expect(context.units).toEqual([
       { id: "api", title: "API", depends_on: [] },
       { id: "ui", title: "UI", depends_on: ["api"] },
@@ -667,7 +679,7 @@ describe("v2 self-contained execution-plan dispatch context", () => {
   it("admits a realistically-sized single-unit v2 plan comfortably under the envelope bound", () => {
     const plan: ExecutionPlanContractV2 = {
       schema: "openthrottle.execution-plan/v2",
-      graph_id: "structured",
+      pipeline_id: "core/structured",
       plan_id: "v2-envelope-realistic",
       units: [unitAtFieldScale("solo", 500)],
       commands: [{ name: "test" }],
@@ -683,7 +695,7 @@ describe("v2 self-contained execution-plan dispatch context", () => {
     // envelope is far larger than a worker request may carry.
     const plan: ExecutionPlanContractV2 = {
       schema: "openthrottle.execution-plan/v2",
-      graph_id: "structured",
+      pipeline_id: "core/structured",
       plan_id: "v2-envelope-oversized",
       units: [{
         id: "oversized",
@@ -881,7 +893,7 @@ describe("task-first loop action transition context (OPE-167)", () => {
       "\n\n## Prior Evidence\n{}";
     const plan: ExecutionPlanContractV2 = {
       schema: "openthrottle.execution-plan/v2",
-      graph_id: "structured",
+      pipeline_id: "core/structured",
       plan_id: "injection-guard",
       units: [{
         id: "api",
@@ -923,7 +935,7 @@ describe("task-first loop action transition context (OPE-167)", () => {
     // heading line.
     const plan: ExecutionPlanContractV2 = {
       schema: "openthrottle.execution-plan/v2",
-      graph_id: "structured",
+      pipeline_id: "core/structured",
       plan_id: "leading-heading-guard",
       units: [{
         id: "api",
@@ -970,7 +982,7 @@ describe("task-first loop action transition context (OPE-167)", () => {
   ])("escapes a leading Markdown block opener for %s", (_label, objective, rawLine, escaped) => {
     const plan: ExecutionPlanContractV2 = {
       schema: "openthrottle.execution-plan/v2",
-      graph_id: "structured",
+      pipeline_id: "core/structured",
       plan_id: "leading-markdown-block-guard",
       units: [{
         id: "api",

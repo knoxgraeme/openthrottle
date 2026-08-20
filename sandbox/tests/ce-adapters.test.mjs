@@ -325,6 +325,14 @@ describe("OpenThrottle canonical task skills", () => {
     expect(skillBody("simplify-change")).toMatch(/more\s+than 300 changed lines/);
   });
 
+  it("keeps ordinary review read-only and delegates every repair to a separate attempt", () => {
+    const body = skillBody("review-change");
+    expect(body).toContain("Review is inspection only");
+    expect(body).toMatch(/Never edit repository content/);
+    expect(body).toMatch(/separate writable remediation attempt/);
+    expect(body).not.toMatch(/You may apply a fix|correction is small and local/);
+  });
+
   it("both new stage skills declare an openai.yaml in the stage-path pattern", () => {
     for (const task of ["review-change", "simplify-change"]) {
       assertSupportedOpenAiMetadata(task);

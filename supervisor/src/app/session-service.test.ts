@@ -172,7 +172,7 @@ function structuredPlanWithContextExtra(extraBytes: number): ExecutionPlanContra
   if (remaining > 0) throw new Error("test plan context exceeds per-entry execution plan limits");
   return {
     schema: "openthrottle.execution-plan/v2",
-    graph_id: "structured",
+    pipeline_id: "core/structured",
     plan_id: "structured_envelope_bound",
     units: [{
       id: "unit_a",
@@ -892,7 +892,7 @@ mcp_servers: {}
 
   it("ignores graph-specific pipeline overrides for a unit-consuming selection", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const context = issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -937,7 +937,7 @@ intents:
 
   it("rejects the configured unit-consuming default even with a canonical plan", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const context = issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -1058,7 +1058,7 @@ intents:
 
   it("admits an issue-only assignment-created context with a structured child selection", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const selection = [
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -1146,10 +1146,10 @@ intents:
 
   it("seals the current assignment plan when prior optional history contains a stale plan", async () => {
     const currentPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    currentPlan.graph_id = "structured";
+    currentPlan.pipeline_id = "core/structured";
     currentPlan.plan_id = "current-assignment-plan";
     const stalePlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    stalePlan.graph_id = "structured";
+    stalePlan.pipeline_id = "core/structured";
     stalePlan.plan_id = "stale-history-plan";
     const currentSelection = [
       "```json openthrottle.execution-plan/v2",
@@ -1658,7 +1658,7 @@ intents:
 
   it("rejects structured context when required child content exceeds the bound", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const selection = [
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -1718,7 +1718,7 @@ intents:
 
   it("bounds and journals prompted structured context pruning", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const selection = [
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -1790,7 +1790,7 @@ intents:
 
   it("compiles and pins a structured graph before provisioning when the runtime advertises the composite capability", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const context = issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -1858,13 +1858,13 @@ intents:
   it("admits a new repository aggregate-publish graph with fresh-capable publication", async () => {
     const graphPath = ".openthrottle/graphs/repo-structured.json";
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "repo_structured";
+    executionPlan.pipeline_id = "core/structured";
     const context = issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
       "```",
       "```json openthrottle.ship-selection/v1",
-      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "repo_structured" }, null, 2),
+      JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "structured" }, null, 2),
       "```",
     ].join("\n"), "Repository structured work");
     const graph = JSON.stringify({
@@ -1946,16 +1946,16 @@ intents:
     });
     const { tickets, pipelines } = await run(
       `schema: openthrottle.config/v1
-default_graph: repo_structured
+default_graph: structured
 graphs:
-  - id: repo_structured
+  - id: structured
     kind: repository
     ref: ${graphPath}
 pipelines: { implement: implement }
 intents:
   implement:
-    default_graph: repo_structured
-    allowed_graphs: [repo_structured]
+    default_graph: structured
+    allowed_graphs: [structured]
 `,
       {},
       shippedCatalogPath,
@@ -1982,7 +1982,7 @@ intents:
       stages: Array<{ id: string; context: string }>;
     };
     expect(instance.pipeline_id).toBe(`repository/${digestNormalized(canonicalJson({
-      graphId: "repo_structured",
+      graphId: "structured",
       blobSha: "c".repeat(40),
       path: graphPath,
       compilerVersion: 2,
@@ -2165,7 +2165,7 @@ intents:
     // per child action -- so a stage-scope-only check admitted this pipeline,
     // provisioned a sandbox, and only failed once the engine died inside it.
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const context = issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -2218,7 +2218,7 @@ intents:
 
   it("admits a unit-consuming graph once the selected engine credential is configured", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const context = issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -2266,7 +2266,7 @@ intents:
 
   it("admits a unit-consuming graph from a self-contained v2 execution plan", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanV2FixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const context = issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -2314,7 +2314,7 @@ intents:
 
   it("fails closed before provisioning when a v2 unit is missing a required self-contained field (OPE-156-equivalent pointer-only unit)", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanV2MissingFieldFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const context = issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -2329,7 +2329,7 @@ intents:
 
   it("refuses OpenCode unit-consuming graphs before provisioning even when its credential is configured", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const context = issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -2971,7 +2971,7 @@ intents:
 
   it("fails closed before provisioning for malformed shipped graph selections", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     await expectSelectionFailure(
       issueOnlyPromptContext([
         "```json openthrottle.ship-selection/v1",
@@ -3011,7 +3011,7 @@ intents:
         JSON.stringify({ schema: "openthrottle.ship-selection/v1", graph_id: "simple" }),
         "```",
       ].join("\n")),
-      "ship selection graph_id simple does not match execution_plan.graph_id structured"
+      "ship selection graph_id simple does not match execution_plan.pipeline_id core/structured"
     );
 
     await expectSelectionFailure(
@@ -3029,7 +3029,7 @@ intents:
     ["inside a generic JSON fence", (value: string) => ["```json", value, "```"].join("\n")],
   ])("fails closed when OpenThrottle control JSON is present %s", async (_label, wrap) => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
 
     await expectSelectionFailure(
       issueOnlyPromptContext([
@@ -3042,7 +3042,7 @@ intents:
 
   it("admits a shipped structured graph selection against the production descriptor", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const context = issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -3093,12 +3093,12 @@ intents:
 
   it("seals the decoded v2 plan artifact before retained threads can add plan bytes", async () => {
     const primaryPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    primaryPlan.graph_id = "structured";
+    primaryPlan.pipeline_id = "core/structured";
     (primaryPlan.units as Array<Record<string, unknown>>)[0]!.requirements = [
       "Preserve A & B < C > D exactly.",
     ];
     const retainedPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    retainedPlan.graph_id = "structured";
+    retainedPlan.pipeline_id = "core/structured";
     retainedPlan.plan_id = "retained-plan-must-not-win";
     const selection = { schema: "openthrottle.ship-selection/v1", graph_id: "structured" };
     const directive = [
@@ -3153,7 +3153,7 @@ intents:
 
   it("keeps legacy structured config on v1 until an explicit config upgrade selects v2", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const contextFor = (identifier: string) => issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -3215,9 +3215,9 @@ intents:
     });
   });
 
-  it("preserves legacy structured v1 identity for custom graph ids", async () => {
+  it("rejects custom legacy graph aliases for a fresh v2 plan", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "release";
+    executionPlan.pipeline_id = "core/structured";
     const contextFor = (identifier: string) => issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),
@@ -3242,35 +3242,19 @@ intents:
     allowed_graphs: [simple, release]
 `;
 
-    const { pipelines, invoke, setRepositoryConfig } =
+    const { tickets, pipelines } =
       await run(config, {}, shippedCatalogPath, payload("session-1", "issue-1", "OT-1", contextFor("OT-1")));
-    const legacyInstance = pipelines.getInstanceForSession("session-1")!;
-    const legacyManifest = JSON.parse(legacyInstance.normalized_manifest) as {
-      description: string;
-      stages: Array<{ id: string; transitions: { success: unknown } }>;
-    };
-    expect(legacyInstance).toMatchObject({
-      pipeline_id: "builtin/release",
-      pipeline_version: 1,
-      active_stage_id: "units",
-    });
-    expect(legacyManifest.description).toBe("Compiled execution graph release from builtin core/structured@1.");
-    expect(legacyManifest.stages.map((stage) => stage.id)).toEqual(["units"]);
-    expect(legacyManifest.stages[0]?.transitions.success).toEqual({ terminal: "shipped" });
-
-    setRepositoryConfig(config.replace("ref: core/structured@1", "ref: core/structured@2"));
-    await invoke({}, payload("session-2", "issue-2", "OT-2", contextFor("OT-2")));
-    const upgradedInstance = pipelines.getInstanceForSession("session-2")!;
-    expect(upgradedInstance).toMatchObject({
-      pipeline_id: "builtin/structured",
-      pipeline_version: 2,
-      active_stage_id: "units",
-    });
+    expect(tickets.getByIssueId("linear:issue-1")).toMatchObject({ state: "error" });
+    expect(pipelines.getInstanceForSession("session-1")).toBeUndefined();
+    const payloads = db!.prepare("SELECT payload FROM control_outbox ORDER BY sequence").pluck().all() as string[];
+    expect(payloads.some((entry) => entry.includes(
+      "ship selection graph_id release does not match execution_plan.pipeline_id core/structured"
+    ))).toBe(true);
   });
 
   it("fails closed for unknown built-in structured versions", async () => {
     const executionPlan = JSON.parse(readFileSync(executionPlanFixturePath, "utf8")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const context = issueOnlyPromptContext([
       "```json openthrottle.execution-plan/v2",
       JSON.stringify(executionPlan, null, 2),

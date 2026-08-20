@@ -3,6 +3,7 @@ import {
   digestCanonicalJson,
   digestNormalized,
   deriveReviewSubactionActionId,
+  EXECUTION_PLAN_SCHEMA_V2,
   parseStandardReceipt,
   RECEIPT_SCHEMA,
   validateReviewJournalContract,
@@ -81,6 +82,21 @@ export function validatorActionId(action: ExecutionWorkAttempt): string {
   return deriveReviewSubactionActionId(action.id, "validator");
 }
 
+function executionPlanIdentityContext(plan: AnyExecutionPlanContract): Record<string, string> {
+  if (plan.schema === EXECUTION_PLAN_SCHEMA_V2) {
+    return {
+      schema: "openthrottle.loop-action-plan-context/v2",
+      pipeline_id: plan.pipeline_id,
+      plan_id: plan.plan_id,
+    };
+  }
+  return {
+    schema: "openthrottle.loop-action-plan-context/v1",
+    graph_id: plan.graph_id,
+    plan_id: plan.plan_id,
+  };
+}
+
 // Every review subaction receipt is semantically attested by the worker that
 // ran it, under the instance's sealed capability digest and no skill package.
 function reviewProducer(
@@ -145,10 +161,8 @@ export function buildReviewFanoutRequests(input: {
         review_persona_id: persona.id,
       }),
       planContext: {
-        schema: "openthrottle.loop-action-plan-context/v1",
+        ...executionPlanIdentityContext(input.plan),
         action_kind: input.action.action_kind,
-        graph_id: input.plan.graph_id,
-        plan_id: input.plan.plan_id,
         unit: input.action.unit_id ? input.plan.units.find((unit) => unit.id === input.action.unit_id) ?? null : null,
         review_fanout: input.fanout,
         review_persona: persona,
@@ -209,10 +223,8 @@ export function buildReviewSelectorRequest(input: {
         review_selector: true,
       }),
       planContext: {
-        schema: "openthrottle.loop-action-plan-context/v1",
+        ...executionPlanIdentityContext(input.plan),
         action_kind: input.action.action_kind,
-        graph_id: input.plan.graph_id,
-        plan_id: input.plan.plan_id,
         unit: null,
         review_selector_authority: input.authority,
       },
@@ -273,10 +285,8 @@ export function buildReviewValidatorRequest(input: {
         review_validator: true,
       }),
       planContext: {
-        schema: "openthrottle.loop-action-plan-context/v1",
+        ...executionPlanIdentityContext(input.plan),
         action_kind: input.action.action_kind,
-        graph_id: input.plan.graph_id,
-        plan_id: input.plan.plan_id,
         unit: null,
         review_fanout: input.fanout,
         review_synthesis: input.synthesis,

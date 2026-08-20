@@ -18,7 +18,7 @@ function automaticStructuredPlanFixture() {
   const subject = "a".repeat(40);
   const executionPlan = {
     schema: "openthrottle.execution-plan/v2",
-    graph_id: "structured",
+    pipeline_id: "core/structured",
     plan_id: "automatic",
     units: [{
       id: "unit_a", title: "Unit A", depends_on: [], objective: "Implement it.",
@@ -77,7 +77,7 @@ describe("automatic structured-plan bridge", () => {
     const input = automaticStructuredPlanFixture();
     const planAt = (scale: number): ExecutionPlanContractV2 => ({
       schema: "openthrottle.execution-plan/v2",
-      graph_id: "structured",
+      pipeline_id: "core/structured",
       plan_id: "near_limit",
       units: [{
         id: "unit_a", title: "Unit A", depends_on: [], objective: "x".repeat(scale),

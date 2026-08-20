@@ -148,7 +148,7 @@ describe("automatic admission authority", () => {
 
     const plan = {
       schema: "openthrottle.execution-plan/v2",
-      graph_id: "simple",
+      pipeline_id: "core/structured",
       plan_id: "invalid_simple_plan",
       units: [{
         id: "one",
@@ -175,7 +175,21 @@ describe("automatic admission authority", () => {
       agent: "claude",
       taskType: "implement",
       context: planContext,
-    })).toThrow(/simple graph selection cannot carry an execution plan/);
+    })).toThrow(
+      /ship selection graph_id simple does not match execution_plan\.pipeline_id core\/structured/,
+    );
+
+    const wrongPipelineContext = [
+      "```json openthrottle.execution-plan/v2",
+      JSON.stringify({ ...plan, pipeline_id: "repo/custom" }),
+      "```",
+    ].join("\n");
+    expect(() => resolveAdmissionAuthority({
+      config: admissionConfig("automatic"),
+      agent: "claude",
+      taskType: "implement",
+      context: wrongPipelineContext,
+    })).toThrow(/issue\.execution_plan\.pipeline_id: must be core\/structured/);
     expect(() => resolveAdmissionAuthority({
       config: admissionConfig("automatic"),
       agent: "claude",

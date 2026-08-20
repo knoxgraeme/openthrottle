@@ -1,127 +1,68 @@
 # Acceptance judgment
 
-This action is the only gate that can spend a repair round on judgment rather
-than on a failed command. That makes the default posture, the depth of reading,
-and the shape of a revision request the three things worth getting right.
+Use this guide to keep unit acceptance narrow, evidence-based, and stable
+across revision rounds.
 
-## 1. Reading an acceptance entry
+## Read each obligation by kind
 
-In the current v2 plan format, both `requirements` and `acceptance` entries are
-the contract. `tests` and `verification` are proof expectations: use them to
-judge whether requirements and acceptance are actually demonstrated, but never
-accept a candidate that meets acceptance while violating a requirement. In a
-legacy replay plan, resolved `instructions` are the requirement context and
-resolved `acceptance` entries remain mandatory.
+- **Behavioural:** a value, error, state transition, or side effect must be
+  observable. Judge it from the implementation and executable proof.
+- **Artifact:** a file, migration, export, command, or other concrete construct
+  must exist with the required shape.
+- **Constraint:** a public response, dependency set, data shape, or unrelated
+  area must remain unchanged.
 
-Classify each entry before judging it:
+Requirements and acceptance criteria are both mandatory. Tests and
+verification instructions are proof expectations, not substitutes for the
+obligation itself.
 
-- **Behavioural** — "invalid configuration is rejected", "the retry stops after
-  three attempts". Judged by finding the behaviour in the candidate tree, not a
-  sentence about it in the completion receipt.
-- **Artifact** — "a migration exists for the new column", "the helper is
-  exported from the shared module". Judged by the artifact's presence and shape.
-- **Constraint** — "no change to the public response", "no new dependency".
-  Judged by what the candidate *did not* do; most often skipped, and the ones a
-  scope-match decision exists to enforce.
+Ambiguity resolves narrowly. “Reject invalid input” requires rejection; it does
+not silently require a particular error class, log entry, or metric. An
+obligation that cannot be judged from the available code and evidence must be
+identified as unresolved rather than assumed satisfied.
 
-**Ambiguity resolves narrowly.** When an entry admits two readings, take the one
-its own words support with the least additional work implied. An entry that says
-"rejects invalid input" is met by rejection; it does not silently also require a
-specific error type, a log line, or a metric unless it says so. Reading extra
-requirements into an entry is how a lead invents work the plan never approved.
+## Read only as deeply as needed
 
-**An entry you cannot judge is not an entry you may assume.** If neither the
-evidence nor the tree settles it, that is `needs_human`, not a guess.
+Use three tiers:
 
-## 2. How deep to read
+1. **Visible claim:** the changed code or artifact directly demonstrates the
+   obligation. Inspect it and decide.
+2. **Contested claim:** the summary says an obligation is met but the diff does
+   not make that clear. Read the enclosing symbol, direct callers, and owning
+   tests.
+3. **Deliberate but surprising change:** recover the local reason from nearby
+   patterns, explicit constraints, and upstream facts before treating the
+   change as a scope breach.
 
-Read enough to decide, and no further. Three tiers:
+Read a file once and judge every obligation that touches it together.
 
-- **The claim is visible in the candidate.** The changed files show the
-  behaviour or the artifact the entry names. Read those files and decide.
-- **The claim is contestable.** The completion receipt asserts an entry is met
-  and you cannot see it in the changed files, or the change looks like it does
-  something adjacent. Open the file, read the callers, look for the existing
-  test or guard that would make either side right. This tier is where a
-  confidently-wrong claim gets caught, in both directions.
-- **The change looks deliberate but wrong.** Before treating it as a scope
-  breach, look for the reason: a neighbouring pattern, a constraint in the
-  instructions, a downstream-context note handed to this unit. The worker had
-  context you are reading second-hand; recover it before overriding it.
+## Default to acceptance when the contract is met
 
-Read each file once and judge every entry that touches it together.
+Acceptance is not a chance to raise the quality bar. Revise only for a stated
+obligation, explicit prohibition, or material scope boundary. Do not revise for
+personal preferences about naming, formatting, comments, abstraction, test
+layout, or extra coverage the unit never requested.
 
-## 3. Default to accepting
+An acceptable candidate may still deserve a note about an inherited issue or a
+fact useful to later work. Keep that note separate from revision work.
 
-Most candidates that reach this gate are acceptable. The commands have already
-been graded, a failed candidate never arrives here, and the worker had the same
-sealed instructions you did. Your job is to catch scope mismatch, not to raise
-the quality bar.
+## Write a revision that can close in one round
 
-The tripwires below are what a revision costs a round *for*. If none of them
-trips, accept and move on. "I would have done it differently" is not a tripwire;
-"acceptance entry A3 says X and the tree does not do X" is.
+A strong request names:
 
-**Revise when:**
+- the unmet criterion in its own words;
+- the repository-relative path and stable symbol involved;
+- the current observable behaviour; and
+- the observable behaviour required for acceptance.
 
-- A stated requirement or acceptance entry is unmet at this candidate — behavioural, artifact,
-  or constraint.
-- The change reaches outside the unit's stated scope in a way that must be
-  undone: another unit's files, an unrelated defect fixed in passing, a
-  dependency added, a shared contract the instructions never named.
-- The unit did something it was explicitly told not to do.
-- The candidate cannot satisfy an entry as written because the work was done
-  against a different reading of it, and the correct reading is unambiguous.
+Avoid vague directions such as “improve error handling.” Ask for the smallest
+change that demonstrates the criterion.
 
-**Never revise for:** naming, formatting, layout, structure, comment style, test
-framework or test-layout preference, a refactor you would prefer, additional
-coverage the acceptance entries never asked for, or a defect the unit inherited
-and did not touch.
+## Keep the bar stable across rounds
 
-## 4. Accept with a note
-
-The middle path exists and is usually the right one. When the work satisfies
-every acceptance entry but you saw something worth saying — an imperfect shape,
-a latent issue the unit did not introduce, a decision you would have made
-differently, a fact the next unit will want — accept and put it in `rationale`.
-An observation costs nothing there. As a revision request it costs a round, and
-the round may be the last one the run has.
-
-Two things belong in `rationale` rather than in a revision request:
-
-- **Anything you would not fail the unit over.** If you would accept the
-  candidate on a second look, you would accept it now.
-- **Anything the next unit needs to know but this unit need not change.**
-  Downstream-facing facts go through the context-update path when they have a
-  verifiable target, and into `rationale` when they do not.
-
-## 5. Writing a revision request that closes in one round
-
-The repair worker acts on the text you write and little else. Give it, in one
-sentence each:
-
-1. **Which acceptance entry** is unmet, named as the plan names it.
-2. **Where** — the file, and the symbol or construct.
-3. **What observably differs** — the current and required behaviour, in terms
-   someone can check by running something or reading the tree.
-
-Weak: "Improve error handling in the config loader."
-Strong: "`parseConfig` returns `null` for an empty `limits:` block, so an
-invalid file is accepted silently — acceptance A3 (invalid config is rejected)
-is unmet. It must raise, and the existing `rejects malformed config` test should
-cover the empty-block case."
-
-Ask for one round's worth of work. A revision request listing five unrelated
-improvements produces a wide repair, and a wide repair is how the next round
-arrives with new problems.
-
-## 6. Stability across rounds
-
-- Judge against the sealed acceptance entries only. Do not add a requirement
-  between rounds; the entries did not change, so neither may the bar.
-- When your previous revision request is satisfied, accept. Substituting a fresh
-  objection is the failure mode that exhausts the budget — the one exception is
-  a defect violating a stated entry that you can show was already unmet before.
-- Do not restate a failure the executor already owns. Failed commands and failed
-  candidates are decided before your receipt is read; read them for signal, then
-  spend your decision on scope match.
+- Judge each candidate against the same supplied obligations.
+- Once a previous request is satisfied, do not substitute a new preference.
+- A newly noticed defect justifies another revision only when it demonstrably
+  violated an existing obligation before.
+- Do not restate failures already established by automated checks; use them as
+  evidence and spend the judgment on scope match.

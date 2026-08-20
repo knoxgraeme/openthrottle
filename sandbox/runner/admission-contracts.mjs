@@ -67,10 +67,10 @@ function executionPlanSchema(commandNames) {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["schema", "graph_id", "plan_id", "units", "commands"],
+    required: ["schema", "pipeline_id", "plan_id", "units", "commands"],
     properties: {
       schema: { type: "string", enum: ["openthrottle.execution-plan/v2"] },
-      graph_id: { type: "string" },
+      pipeline_id: { type: "string", enum: ["core/structured"] },
       plan_id: { type: "string" },
       units: { type: "array", items: EXECUTION_PLAN_UNIT_SCHEMA },
       commands,
@@ -341,13 +341,13 @@ function assertAcyclic(units, source) {
 
 export function validateExecutionPlanV2(value, options = {}) {
   const { source = "execution_plan", sanitize } = validatorOptions(options);
-  const input = objectAt(value, source, ["schema", "graph_id", "plan_id", "units", "commands"]);
+  const input = objectAt(value, source, ["schema", "pipeline_id", "plan_id", "units", "commands"]);
   if (input.schema !== "openthrottle.execution-plan/v2") {
     fail(`${source}.schema`, "must be openthrottle.execution-plan/v2");
   }
   const plan = {
     schema: "openthrottle.execution-plan/v2",
-    graph_id: stringAt(input.graph_id, `${source}.graph_id`, { pattern: IDENTIFIER, sanitize }),
+    pipeline_id: stringAt(input.pipeline_id, `${source}.pipeline_id`, { pattern: IDENTIFIER, sanitize }),
     plan_id: stringAt(input.plan_id, `${source}.plan_id`, { pattern: IDENTIFIER, sanitize }),
     units: arrayAt(input.units, `${source}.units`, (entry, entryPath) =>
       parseExecutionPlanUnit(entry, entryPath, sanitize), { min: 1, max: 64 }),
@@ -408,7 +408,9 @@ export function validateAdmissionExecutionPlanArtifact(value, options = {}) {
     source: `${source}.execution_plan`,
     sanitize,
   });
-  if (plan.value.graph_id !== "structured") fail(`${source}.execution_plan.graph_id`, "must be structured");
+  if (plan.value.pipeline_id !== "core/structured") {
+    fail(`${source}.execution_plan.pipeline_id`, "must be core/structured");
+  }
   const sourceInput = objectAt(input.source, `${source}.source`, [
     "admission_basis_digest", "effective_manifest_digest", "request_hash",
   ]);
