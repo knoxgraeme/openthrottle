@@ -1,0 +1,195 @@
+schema: openthrottle.pipeline-definition/v1
+id: core/structured
+version: 1
+entry: implement_unit
+stages:
+  - id: implement_unit
+    kind: agent
+    agent_id: core/unit-worker
+    repository_authority: edit
+    skills: [core/implement-unit]
+    entry_skill: core/implement-unit
+    eval: core/unit-result
+    loop:
+      over: execution_plan.units
+      max_parallel: 4
+      max_rounds: 8
+      file: loops/unit-cycle.yml
+    on:
+      success: {to: simplify_unit}
+      failure: {to: repair_unit, max_reentries: 3, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      exited: {to: repair_unit, max_reentries: 3, on_exhausted: needs_human}
+  - id: simplify_unit
+    kind: agent
+    agent_id: core/unit-worker
+    repository_authority: edit
+    skills: [core/simplify-unit]
+    entry_skill: core/simplify-unit
+    eval: core/unit-result
+    on:
+      success: {to: unit_test}
+      failure: {to: repair_unit, max_reentries: 3, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      exited: {to: repair_unit, max_reentries: 3, on_exhausted: needs_human}
+  - id: unit_test
+    kind: command
+    command: test
+    on:
+      success: {to: unit_lint}
+      no_change: {to: unit_lint}
+      retryable_infrastructure_failure: {to: unit_test, max_reentries: 2, on_exhausted: failed}
+      failure: {to: repair_unit, max_reentries: 3, on_exhausted: needs_human}
+  - id: unit_lint
+    kind: command
+    command: lint
+    on:
+      success: {to: unit_build}
+      no_change: {to: unit_build}
+      retryable_infrastructure_failure: {to: unit_lint, max_reentries: 2, on_exhausted: failed}
+      failure: {to: repair_unit, max_reentries: 3, on_exhausted: needs_human}
+  - id: unit_build
+    kind: command
+    command: build
+    on:
+      success: {to: accept_unit}
+      no_change: {to: accept_unit}
+      retryable_infrastructure_failure: {to: unit_build, max_reentries: 2, on_exhausted: failed}
+      failure: {to: repair_unit, max_reentries: 3, on_exhausted: needs_human}
+  - id: accept_unit
+    kind: agent
+    agent_id: core/unit-lead
+    repository_authority: inspect
+    skills: [core/accept-unit]
+    entry_skill: core/accept-unit
+    eval: core/action-result
+    on:
+      success: {to: integrate_unit}
+      no_change: {to: integrate_unit}
+      semantic_repair_required: {to: repair_unit, max_reentries: 3, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      retryable_infrastructure_failure: {to: accept_unit, max_reentries: 2, on_exhausted: failed}
+      failure: {terminal: failed}
+  - id: repair_unit
+    kind: agent
+    agent_id: core/unit-worker
+    repository_authority: edit
+    skills: [core/repair-unit]
+    entry_skill: core/repair-unit
+    eval: core/unit-result
+    on:
+      success: {to: simplify_unit}
+      failure: {to: repair_unit, max_reentries: 3, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      exited: {terminal: needs_human}
+  - id: integrate_unit
+    kind: effect
+    effect: core/integrate-unit@1
+    on:
+      success: {to: final_test}
+      retryable_infrastructure_failure: {to: integrate_unit, max_reentries: 2, on_exhausted: failed}
+      failure: {terminal: needs_human}
+  - id: final_test
+    kind: command
+    command: test
+    on:
+      success: {to: final_lint}
+      no_change: {to: final_lint}
+      retryable_infrastructure_failure: {to: final_test, max_reentries: 2, on_exhausted: failed}
+      failure: {to: final_repair, max_reentries: 5, on_exhausted: needs_human}
+  - id: final_lint
+    kind: command
+    command: lint
+    on:
+      success: {to: final_build}
+      no_change: {to: final_build}
+      retryable_infrastructure_failure: {to: final_lint, max_reentries: 2, on_exhausted: failed}
+      failure: {to: final_repair, max_reentries: 5, on_exhausted: needs_human}
+  - id: final_build
+    kind: command
+    command: build
+    on:
+      success: {to: select_review_personas}
+      no_change: {to: select_review_personas}
+      retryable_infrastructure_failure: {to: final_build, max_reentries: 2, on_exhausted: failed}
+      failure: {to: final_repair, max_reentries: 5, on_exhausted: needs_human}
+  - id: select_review_personas
+    kind: agent
+    agent_id: core/reviewer
+    repository_authority: inspect
+    skills: [core/select-review-personas]
+    entry_skill: core/select-review-personas
+    eval: core/action-result
+    on:
+      success: {to: persona_review}
+      no_change: {to: persona_review}
+      semantic_repair_required: {terminal: needs_human}
+      needs_human: {terminal: needs_human}
+      retryable_infrastructure_failure: {to: select_review_personas, max_reentries: 2, on_exhausted: failed}
+      failure: {terminal: failed}
+  - id: persona_review
+    kind: agent
+    agent_id: core/reviewer
+    repository_authority: inspect
+    skills:
+      - core/correctness-dataflow
+      - core/tests-contracts
+      - core/reliability-adversarial
+      - core/agent-native-contracts
+      - core/security
+      - core/data-migration
+      - core/performance
+      - core/project-standards
+    eval: core/review-result
+    loop:
+      over: selection.personas
+      max_parallel: 5
+      max_rounds: 1
+      body: [persona_review]
+    on:
+      success: {to: validate_review_findings}
+      no_change: {to: validate_review_findings}
+      semantic_repair_required: {to: validate_review_findings}
+      needs_human: {terminal: needs_human}
+      failure: {terminal: failed}
+  - id: validate_review_findings
+    kind: agent
+    agent_id: core/reviewer
+    repository_authority: inspect
+    skills: [core/validate-review-findings]
+    entry_skill: core/validate-review-findings
+    eval: core/review-result
+    on:
+      success: {to: publish}
+      no_change: {to: publish}
+      semantic_repair_required: {to: final_repair, max_reentries: 5, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      failure: {terminal: failed}
+  - id: final_repair
+    kind: agent
+    agent_id: core/ordinary-worker
+    repository_authority: edit
+    skills: [core/final-repair]
+    entry_skill: core/final-repair
+    eval: core/unit-result
+    on:
+      success: {to: final_test}
+      failure: {to: final_repair, max_reentries: 3, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      exited: {terminal: needs_human}
+  - id: publish
+    kind: effect
+    effect: core/publish@1
+    on:
+      success: {to: provider}
+      no_change: {terminal: no_change}
+      retryable_infrastructure_failure: {to: publish, max_reentries: 2, on_exhausted: failed}
+      failure: {terminal: failed}
+  - id: provider
+    kind: wait
+    wait: core/provider-wait@1
+    on:
+      success: {terminal: completed}
+      no_change: {terminal: no_change}
+      retryable_infrastructure_failure: {to: provider, max_reentries: 2, on_exhausted: failed}
+      failure: {terminal: failed}

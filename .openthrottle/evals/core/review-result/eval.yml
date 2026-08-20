@@ -1,0 +1,21 @@
+schema: openthrottle.eval-definition/v1
+id: core/review-result
+evaluator: core/review-outcome@1
+result:
+  schema: openthrottle.semantic-result-schema/v1
+  id: core/review-result
+  outcomes:
+    - success
+    - no_change
+    - semantic_repair_required
+    - needs_human
+    - failure
+  payload:
+    summary:
+      type: string
+      required: true
+      max_length: 4000
+      normalize: string-array-to-newlines/v1
+    findings:
+      type: json
+      required: true

@@ -1,0 +1,18 @@
+schema: openthrottle.config/v2
+pipeline: core/implement
+engine: codex
+model: gpt-5.6-sol
+reasoning_effort: high
+commands:
+  test: npm run typecheck --prefix contracts && npm run build --prefix contracts && npm run typecheck --prefix supervisor && npm run typecheck --prefix cli && npm run build --prefix supervisor && npm run build --prefix cli && npm test --prefix contracts && npm test --prefix supervisor && npm test --prefix cli && npm test --prefix sandbox
+  lint: npm run typecheck --prefix contracts && npm run build --prefix contracts && npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
+  build: npm run build --prefix contracts && npm run build --prefix supervisor && npm run build --prefix cli
+post_bootstrap:
+  - npm ci --prefix contracts
+  - npm ci --prefix supervisor
+  - npm ci --prefix cli
+  - npm ci --prefix sandbox
+limits:
+  max_turns: 200
+  task_timeout: 7200
+mcp_servers: {}
