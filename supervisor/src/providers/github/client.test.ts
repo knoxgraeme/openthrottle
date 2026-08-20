@@ -1,5 +1,9 @@
 import { createHmac } from "node:crypto";
-import { parseExecutionPlanContract } from "@openthrottle/contracts";
+import {
+  VIRTUAL_DEFINITION_MAX_FILE_BYTES,
+  VIRTUAL_DEFINITION_MAX_FILES,
+  parseExecutionPlanContract,
+} from "@openthrottle/contracts";
 import { describe, expect, it, vi } from "vitest";
 import { createSupervisorStore } from "../../persistence/store.js";
 import { openDb } from "../../persistence/database.js";
@@ -24,6 +28,7 @@ import {
   fetchGithubIssueControlEvents,
   fetchGithubIssueContext,
   getRepositoryConfigAtCommit,
+  getRepositoryDefinitionSourceAtCommit,
   getRepositoryDirectoryAtCommit,
   getRepositoryFileAtCommit,
   getFailingGithubCheckDetails,
@@ -1820,6 +1825,366 @@ describe("GitHub contracts", () => {
       "a".repeat(40),
       ".openthrottle/skills/implement_unit"
     )).rejects.toThrow(/not a regular file/);
+  });
+
+  it("reads raw definition bytes from only the exact commit's .openthrottle subtree", async () => {
+    const commit = "a".repeat(40);
+    const rootTreeSha = "b".repeat(40);
+    const definitionTreeSha = "c".repeat(40);
+    const sharedBlobSha = "d".repeat(40);
+    const coreBlobSha = "e".repeat(40);
+    const sharedBytes = Buffer.from([0xff, 0x00, 0x0a]);
+    const coreBytes = Buffer.from("reader keeps core paths\n");
+    const requested: string[] = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.endsWith(`/git/commits/${commit}`)) {
+        return Response.json({ sha: commit, tree: { sha: rootTreeSha } });
+      }
+      if (url.endsWith(`/git/trees/${rootTreeSha}`)) {
+        return Response.json({
+          sha: rootTreeSha,
+          truncated: false,
+          tree: [
+            { path: "README.md", mode: "100644", type: "blob", sha: "f".repeat(40), size: 5 },
+            { path: ".openthrottle", mode: "040000", type: "tree", sha: definitionTreeSha },
+          ],
+        });
+      }
+      if (url.endsWith(`/git/trees/${definitionTreeSha}?recursive=1`)) {
+        return Response.json({
+          sha: definitionTreeSha,
+          truncated: false,
+          tree: [
+            { path: "skills/core/kept/SKILL.md", mode: "100755", type: "blob", sha: coreBlobSha, size: coreBytes.byteLength },
+            { path: "agents/z-agent", mode: "040000", type: "tree", sha: "1".repeat(40) },
+            { path: "config.yml", mode: "100644", type: "blob", sha: sharedBlobSha, size: sharedBytes.byteLength },
+            { path: "agents/z-agent/instructions.md", mode: "100644", type: "blob", sha: sharedBlobSha, size: sharedBytes.byteLength },
+          ],
+        });
+      }
+      if (url.endsWith(`/git/blobs/${sharedBlobSha}`)) {
+        return Response.json({
+          sha: sharedBlobSha,
+          encoding: "base64",
+          content: `${sharedBytes.toString("base64")}\n`,
+          size: sharedBytes.byteLength,
+        });
+      }
+      if (url.endsWith(`/git/blobs/${coreBlobSha}`)) {
+        return Response.json({
+          sha: coreBlobSha,
+          encoding: "base64",
+          content: coreBytes.toString("base64"),
+          size: coreBytes.byteLength,
+        });
+      }
+      throw new Error(`unexpected request ${url}`);
+    }) as unknown as typeof fetch;
+
+    const source = await getRepositoryDefinitionSourceAtCommit(
+      { token: "github", fetch: fetchMock },
+      "owner/repo",
+      commit,
+    );
+
+    expect(source.source_commit).toBe(commit);
+    expect([...source.files.keys()]).toEqual([
+      ".openthrottle/agents/z-agent/instructions.md",
+      ".openthrottle/config.yml",
+      ".openthrottle/skills/core/kept/SKILL.md",
+    ]);
+    const config = source.files.get(".openthrottle/config.yml");
+    expect(config).toMatchObject({ type: "file", blob_sha: sharedBlobSha });
+    if (!config || config.type !== "file" || typeof config.content === "string") {
+      throw new Error("expected raw config bytes");
+    }
+    expect([...config.content]).toEqual([...sharedBytes]);
+    expect(requested.slice(0, 3)).toEqual([
+      `https://api.github.com/repos/owner/repo/git/commits/${commit}`,
+      `https://api.github.com/repos/owner/repo/git/trees/${rootTreeSha}`,
+      `https://api.github.com/repos/owner/repo/git/trees/${definitionTreeSha}?recursive=1`,
+    ]);
+    expect(requested.filter((url) => url.includes(`/git/blobs/${sharedBlobSha}`))).toHaveLength(1);
+    expect(requested.some((url) => url.includes(`${rootTreeSha}?recursive=1`))).toBe(false);
+  });
+
+  it("returns an empty pinned definition source when .openthrottle is absent", async () => {
+    const commit = "a".repeat(40);
+    const rootTreeSha = "b".repeat(40);
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith(`/git/commits/${commit}`)) {
+        return Response.json({ sha: commit, tree: { sha: rootTreeSha } });
+      }
+      if (url.endsWith(`/git/trees/${rootTreeSha}`)) {
+        return Response.json({
+          sha: rootTreeSha,
+          truncated: false,
+          tree: [{ path: "README.md", mode: "100644", type: "blob", sha: "c".repeat(40), size: 5 }],
+        });
+      }
+      throw new Error(`unexpected request ${url}`);
+    }) as unknown as typeof fetch;
+
+    await expect(getRepositoryDefinitionSourceAtCommit(
+      { token: "github", fetch: fetchMock },
+      "owner/repo",
+      commit,
+    )).resolves.toEqual({ source_commit: commit, files: new Map() });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects ambiguous or invalid definition roots and truncated tree evidence", async () => {
+    const commit = "a".repeat(40);
+    const rootTreeSha = "b".repeat(40);
+    const definitionTreeSha = "c".repeat(40);
+    const cases: Array<{
+      rootEntries: Array<Record<string, unknown>>;
+      error: RegExp;
+      definitionTruncated?: boolean;
+    }> = [
+      {
+        rootEntries: [{ path: ".OpenThrottle", mode: "040000", type: "tree", sha: definitionTreeSha }],
+        error: /exact \.openthrottle casing/,
+      },
+      {
+        rootEntries: [
+          { path: ".openthrottle", mode: "040000", type: "tree", sha: definitionTreeSha },
+          { path: ".OpenThrottle", mode: "040000", type: "tree", sha: "d".repeat(40) },
+        ],
+        error: /case-colliding roots/,
+      },
+      {
+        rootEntries: [{ path: ".openthrottle", mode: "120000", type: "blob", sha: definitionTreeSha }],
+        error: /must be a Git tree/,
+      },
+      {
+        rootEntries: [{ path: ".openthrottle", mode: "040000", type: "tree", sha: definitionTreeSha }],
+        definitionTruncated: true,
+        error: /exceeds the GitHub recursive tree limit/,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith(`/git/commits/${commit}`)) {
+          return Response.json({ sha: commit, tree: { sha: rootTreeSha } });
+        }
+        if (url.endsWith(`/git/trees/${rootTreeSha}`)) {
+          return Response.json({ sha: rootTreeSha, truncated: false, tree: testCase.rootEntries });
+        }
+        if (url.endsWith(`/git/trees/${definitionTreeSha}?recursive=1`)) {
+          return Response.json({
+            sha: definitionTreeSha,
+            truncated: testCase.definitionTruncated,
+            tree: [],
+          });
+        }
+        throw new Error(`unexpected request ${url}`);
+      }) as unknown as typeof fetch;
+
+      await expect(getRepositoryDefinitionSourceAtCommit(
+        { token: "github", fetch: fetchMock },
+        "owner/repo",
+        commit,
+      )).rejects.toThrow(testCase.error);
+    }
+  });
+
+  it("caps definition blob reads at eight and deduplicates shared SHAs", async () => {
+    const commit = "a".repeat(40);
+    const rootTreeSha = "b".repeat(40);
+    const definitionTreeSha = "c".repeat(40);
+    const entries = Array.from({ length: 10 }, (_, index) => ({
+      path: `files/${String(index).padStart(2, "0")}.yml`,
+      mode: "100644",
+      type: "blob",
+      sha: (index + 1).toString(16).repeat(40),
+      size: 1,
+    }));
+    entries.push({ ...entries[0]!, path: "files/shared.yml" });
+    let active = 0;
+    let maximumActive = 0;
+    const blobRequests: string[] = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith(`/git/commits/${commit}`)) {
+        return Response.json({ sha: commit, tree: { sha: rootTreeSha } });
+      }
+      if (url.endsWith(`/git/trees/${rootTreeSha}`)) {
+        return Response.json({
+          sha: rootTreeSha,
+          truncated: false,
+          tree: [{ path: ".openthrottle", mode: "040000", type: "tree", sha: definitionTreeSha }],
+        });
+      }
+      if (url.endsWith(`/git/trees/${definitionTreeSha}?recursive=1`)) {
+        return Response.json({ sha: definitionTreeSha, truncated: false, tree: entries });
+      }
+      const sha = url.split("/git/blobs/")[1];
+      if (sha) {
+        blobRequests.push(sha);
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        active -= 1;
+        return Response.json({
+          sha,
+          encoding: "base64",
+          content: Buffer.from("x").toString("base64"),
+          size: 1,
+        });
+      }
+      throw new Error(`unexpected request ${url}`);
+    }) as unknown as typeof fetch;
+
+    const source = await getRepositoryDefinitionSourceAtCommit(
+      { token: "github", fetch: fetchMock },
+      "owner/repo",
+      commit,
+    );
+    expect(source.files).toHaveLength(11);
+    expect(blobRequests).toHaveLength(10);
+    expect(maximumActive).toBe(8);
+  });
+
+  it("rejects unsafe, non-file, ambiguous, and over-limit definition trees before blob reads", async () => {
+    const commit = "a".repeat(40);
+    const rootTreeSha = "b".repeat(40);
+    const definitionTreeSha = "c".repeat(40);
+    const valid = {
+      path: "config.yml",
+      mode: "100644",
+      type: "blob",
+      sha: "d".repeat(40),
+      size: 1,
+    };
+    const cases: Array<{ entries: Array<Record<string, unknown>>; error: RegExp }> = [
+      { entries: [{ ...valid, mode: "120000" }], error: /regular file/ },
+      { entries: [{ ...valid, path: "../escape.yml" }], error: /safe relative POSIX path/ },
+      {
+        entries: [valid, { ...valid, path: "CONFIG.yml", sha: "e".repeat(40) }],
+        error: /case-colliding paths/,
+      },
+      { entries: [{ ...valid, size: undefined }], error: /valid file size/ },
+      {
+        entries: [{ ...valid, size: VIRTUAL_DEFINITION_MAX_FILE_BYTES + 1 }],
+        error: new RegExp(`exceeds ${VIRTUAL_DEFINITION_MAX_FILE_BYTES}`),
+      },
+      {
+        entries: Array.from({ length: VIRTUAL_DEFINITION_MAX_FILES + 1 }, (_, index) => ({
+          ...valid,
+          path: `files/${String(index).padStart(3, "0")}.yml`,
+        })),
+        error: new RegExp(`file count exceeds ${VIRTUAL_DEFINITION_MAX_FILES}`),
+      },
+      {
+        entries: Array.from({ length: 9 }, (_, index) => ({
+          ...valid,
+          path: `files/${index}.yml`,
+          size: VIRTUAL_DEFINITION_MAX_FILE_BYTES,
+        })),
+        error: /total bytes exceed 4194304/,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith(`/git/commits/${commit}`)) {
+          return Response.json({ sha: commit, tree: { sha: rootTreeSha } });
+        }
+        if (url.endsWith(`/git/trees/${rootTreeSha}`)) {
+          return Response.json({
+            sha: rootTreeSha,
+            truncated: false,
+            tree: [{ path: ".openthrottle", mode: "040000", type: "tree", sha: definitionTreeSha }],
+          });
+        }
+        if (url.endsWith(`/git/trees/${definitionTreeSha}?recursive=1`)) {
+          return Response.json({ sha: definitionTreeSha, truncated: false, tree: testCase.entries });
+        }
+        throw new Error(`blob read escaped definition preflight: ${url}`);
+      }) as unknown as typeof fetch;
+
+      await expect(getRepositoryDefinitionSourceAtCommit(
+        { token: "github", fetch: fetchMock },
+        "owner/repo",
+        commit,
+      )).rejects.toThrow(testCase.error);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    }
+  });
+
+  it("rejects invalid commits, tree evidence, and blob encoding/SHA/size evidence", async () => {
+    const noFetch = vi.fn() as unknown as typeof fetch;
+    await expect(getRepositoryDefinitionSourceAtCommit(
+      { token: "github", fetch: noFetch },
+      "owner/repo",
+      "main",
+    )).rejects.toThrow(/full commit SHA/);
+    expect(noFetch).not.toHaveBeenCalled();
+
+    const commit = "a".repeat(40);
+    const rootTreeSha = "b".repeat(40);
+    const definitionTreeSha = "c".repeat(40);
+    const blobSha = "d".repeat(40);
+    const blobCases: Array<{ response: Record<string, unknown>; error: RegExp }> = [
+      {
+        response: { sha: "e".repeat(40), encoding: "base64", content: "eA==", size: 1 },
+        error: /blob SHA/,
+      },
+      {
+        response: { sha: blobSha, encoding: "utf-8", content: "eA==", size: 1 },
+        error: /base64/,
+      },
+      {
+        response: { sha: blobSha, encoding: "base64", content: "eA=", size: 1 },
+        error: /base64/,
+      },
+      {
+        response: { sha: blobSha, encoding: "base64", content: "eA==", size: 2 },
+        error: /content size/,
+      },
+      {
+        response: { sha: blobSha, encoding: "base64", content: "eHg=", size: 2 },
+        error: /tree metadata/,
+      },
+    ];
+
+    for (const testCase of blobCases) {
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith(`/git/commits/${commit}`)) {
+          return Response.json({ sha: commit, tree: { sha: rootTreeSha } });
+        }
+        if (url.endsWith(`/git/trees/${rootTreeSha}`)) {
+          return Response.json({
+            sha: rootTreeSha,
+            truncated: false,
+            tree: [{ path: ".openthrottle", mode: "040000", type: "tree", sha: definitionTreeSha }],
+          });
+        }
+        if (url.endsWith(`/git/trees/${definitionTreeSha}?recursive=1`)) {
+          return Response.json({
+            sha: definitionTreeSha,
+            truncated: false,
+            tree: [{ path: "config.yml", mode: "100644", type: "blob", sha: blobSha, size: 1 }],
+          });
+        }
+        if (url.endsWith(`/git/blobs/${blobSha}`)) return Response.json(testCase.response);
+        throw new Error(`unexpected request ${url}`);
+      }) as unknown as typeof fetch;
+
+      await expect(getRepositoryDefinitionSourceAtCommit(
+        { token: "github", fetch: fetchMock },
+        "owner/repo",
+        commit,
+      )).rejects.toThrow(testCase.error);
+    }
   });
 
   it("verifies a repository and creates its OpenThrottle webhook", async () => {
