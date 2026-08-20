@@ -89,6 +89,7 @@ export type AttemptLeasePurpose = "work" | "result_correction";
 
 export interface AttemptLease {
   id: string;
+  worker_id: string;
   purpose: AttemptLeasePurpose;
   expires_at: string;
   started: boolean;
@@ -119,6 +120,7 @@ export interface KernelAttempt {
   version: number;
   work_retry_ordinal: number;
   result_correction_count: number;
+  result_correction_deadline: string | null;
   lease: AttemptLease | null;
   checkpoint_id: string | null;
   result_record_id: string | null;
@@ -127,13 +129,6 @@ export interface KernelAttempt {
 
 interface KernelCommandBase {
   command_id: string;
-}
-
-export interface LeaseAttemptCommand extends KernelCommandBase {
-  type: "lease";
-  attempt_id: string;
-  lease_id: string;
-  expires_at: string;
 }
 
 export interface StartAttemptCommand extends KernelCommandBase {
@@ -154,6 +149,7 @@ export interface ResultPendingCommand extends KernelCommandBase {
   attempt_id: string;
   candidate_hash: string | null;
   diagnostics: readonly ResultDiagnostic[];
+  correction_deadline: string;
 }
 
 export interface RecordResultCommand extends KernelCommandBase {
@@ -201,7 +197,6 @@ export interface SupersedeCommand extends TerminalCommandBase {
 }
 
 export type KernelCommand =
-  | LeaseAttemptCommand
   | StartAttemptCommand
   | WorkCompleteCommand
   | ResultPendingCommand

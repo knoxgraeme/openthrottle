@@ -55,6 +55,7 @@ export interface KernelAttemptLeasePort {
   renewAttemptLease(input: {
     attempt_id: string;
     lease_id: string;
+    worker_id: string;
     expires_at: string;
   }): Promise<AttemptLease>;
 }
@@ -63,6 +64,7 @@ export interface LeasedEffectView {
   intent: EffectIntent;
   lease_id: string;
   expires_at: string;
+  execution_mode: "dispatch_or_reconcile" | "reconcile_only";
 }
 
 export interface KernelEffectPort {
@@ -75,6 +77,7 @@ export interface KernelEffectPort {
   completeLeasedEffect(input: {
     effect_id: string;
     lease_id: string;
+    worker_id: string;
     reconciliation: EffectReconciliation;
   }): Promise<void>;
 }
