@@ -57,6 +57,7 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   claude --version | rg -q "^2\.1\.201" &&
   rg -q -- "--setting-sources" /tmp/claude-help.txt &&
   rg -q -- "--strict-mcp-config" /tmp/claude-help.txt &&
+  rg -q -- "--json-schema" /tmp/claude-help.txt &&
   # The Compound Engineering plugin is no longer shipped: no pinned
   # marketplace checkout, no per-profile plugin caches.
   test ! -e /opt/openthrottle/compound-engineering-marketplace &&
@@ -82,6 +83,7 @@ docker run --rm --entrypoint bash "$IMAGE" -lc '
   codex debug models --bundled |
     jq -e '"'"'.models[] | select(.slug == "gpt-5.6-sol" and .supported_in_api == true)'"'"' >/dev/null &&
   codex exec --help | rg -q -- "--json" &&
+  codex exec --help | rg -q -- "--output-schema" &&
   codex exec --help | rg -q -- "--dangerously-bypass-approvals-and-sandbox" &&
   codex exec resume --help | rg -q -- "--skip-git-repo-check" &&
   test ! -e /home/agent/.codex/plugins &&

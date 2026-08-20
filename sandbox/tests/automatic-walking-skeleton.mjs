@@ -175,8 +175,8 @@ async function dockerProbe() {
         const prompt = stagePrompt(request, "/tmp/proposal.json", { agent, repositorySkillRoot: materialized });
         assert(prompt.startsWith(`${agent === "claude" ? "/" : "$"}${invocation}`),
           `${agent} did not invoke the sealed ${invocation} override`);
-        assert(prompt.includes(repositorySkill.reference) && prompt.includes(repositorySkill.packageDigest),
-          `${agent}/${invocation} prompt lost package provenance`);
+        assert(!prompt.includes(repositorySkill.reference) && !prompt.includes(repositorySkill.packageDigest),
+          `${agent}/${invocation} prompt exposed executor-owned package provenance`);
         if (agent === "opencode") assert(prompt.includes(`# ${invocation}`),
           `OpenCode did not inline ${invocation}`);
       }
