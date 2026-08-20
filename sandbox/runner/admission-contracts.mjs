@@ -4,6 +4,121 @@ import { canonicalJson } from "./capabilities.mjs";
 export const ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES = 320 * 1024;
 export const EXECUTION_PLAN_V2_MAX_BYTES = 256 * 1024;
 
+const STRING_ARRAY_SCHEMA = {
+  type: "array",
+  items: { type: "string" },
+};
+
+const EXECUTION_PLAN_UNIT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "id", "title", "depends_on", "objective", "requirements", "files",
+    "approach", "tests", "acceptance", "verification",
+  ],
+  properties: {
+    id: { type: "string" },
+    title: { type: "string" },
+    depends_on: STRING_ARRAY_SCHEMA,
+    objective: { type: "string" },
+    requirements: STRING_ARRAY_SCHEMA,
+    files: STRING_ARRAY_SCHEMA,
+    approach: STRING_ARRAY_SCHEMA,
+    tests: STRING_ARRAY_SCHEMA,
+    acceptance: STRING_ARRAY_SCHEMA,
+    verification: STRING_ARRAY_SCHEMA,
+  },
+};
+
+const EXECUTION_PLAN_COMMAND_SCHEMA = {
+  anyOf: [
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["name"],
+      properties: { name: { type: "string" } },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["name", "unit"],
+      properties: {
+        name: { type: "string" },
+        unit: { type: "string" },
+      },
+    },
+  ],
+};
+
+const EXECUTION_PLAN_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["schema", "graph_id", "plan_id", "units", "commands"],
+  properties: {
+    schema: { type: "string", enum: ["openthrottle.execution-plan/v2"] },
+    graph_id: { type: "string" },
+    plan_id: { type: "string" },
+    units: { type: "array", items: EXECUTION_PLAN_UNIT_SCHEMA },
+    commands: { type: "array", items: EXECUTION_PLAN_COMMAND_SCHEMA },
+  },
+};
+
+// Provider-native structured output only shapes the model response. The
+// executor's validators below remain authoritative for bounds, identifiers,
+// graph integrity, cross-field rules, sanitization, and canonicalization.
+export const ADMISSION_PLANNER_SEMANTIC_OUTPUT_SCHEMA = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  required: ["route", "rationale", "questions", "execution_plan"],
+  properties: {
+    route: { type: "string", enum: ["simple", "structured", "needs_human"] },
+    rationale: { type: "string" },
+    questions: STRING_ARRAY_SCHEMA,
+    execution_plan: { anyOf: [{ type: "null" }, EXECUTION_PLAN_SCHEMA] },
+  },
+});
+
+const REVIEW_FINDING_SCHEMA = {
+  anyOf: [
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["severity", "message"],
+      properties: {
+        severity: { type: "string", enum: ["P0", "P1", "P2", "P3"] },
+        message: { type: "string" },
+      },
+    },
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["severity", "message", "path"],
+      properties: {
+        severity: { type: "string", enum: ["P0", "P1", "P2", "P3"] },
+        message: { type: "string" },
+        path: { type: "string" },
+      },
+    },
+  ],
+};
+
+export const ADMISSION_REVIEWER_SEMANTIC_OUTPUT_SCHEMA = Object.freeze({
+  type: "object",
+  additionalProperties: false,
+  required: ["verdict", "summary", "findings", "questions"],
+  properties: {
+    verdict: { type: "string", enum: ["approved", "rejected", "needs_human"] },
+    summary: { type: "string" },
+    findings: { type: "array", items: REVIEW_FINDING_SCHEMA },
+    questions: STRING_ARRAY_SCHEMA,
+  },
+});
+
+export const ADMISSION_SEMANTIC_OUTPUT_SCHEMAS = Object.freeze({
+  admission_planner: ADMISSION_PLANNER_SEMANTIC_OUTPUT_SCHEMA,
+  admission_reviewer: ADMISSION_REVIEWER_SEMANTIC_OUTPUT_SCHEMA,
+});
+
 const IDENTIFIER = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
 const COMMAND_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const SHA256 = /^[a-f0-9]{64}$/;

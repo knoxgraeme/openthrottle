@@ -730,6 +730,7 @@ describe("one-stage executor", () => {
     installFakeGosu(binDir);
     const argsPath = join(binDir, "codex-args");
     const evidencePath = join(binDir, "codex-evidence");
+    const schemaEvidencePath = join(binDir, "codex-output-schema.json");
     const input = fixture({
       agent: "codex",
       capability: "admission/plan@1",
@@ -746,6 +747,12 @@ describe("one-stage executor", () => {
     writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$@" > '${argsPath}'
+args=("$@")
+for ((index=0; index < \${#args[@]}; index++)); do
+  if [ "\${args[index]}" = "--output-schema" ]; then
+    cp "\${args[index+1]}" '${schemaEvidencePath}'
+  fi
+done
 test -r "$CODEX_HOME/auth.json"
 test -z "\${CODEX_AUTH_JSON:-}"
 test ! -w "$PWD/file.txt"
@@ -768,6 +775,7 @@ JSON
     expect(readFileSync(argsPath, "utf8").trim().split("\n")).toEqual([
       "--ask-for-approval", "never",
       "exec", "--json",
+      "--output-schema", join(actionRoot, input.request.attemptId, "admission_planner.semantic-output.schema.json"),
       "--sandbox", "read-only",
       "--ephemeral",
       "--ignore-user-config",
@@ -776,6 +784,11 @@ JSON
       "--skip-git-repo-check", "-C", repositoryView,
       "-",
     ]);
+    expect(JSON.parse(readFileSync(schemaEvidencePath, "utf8"))).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["route", "rationale", "questions", "execution_plan"],
+    });
     expect(readFileSync(evidencePath, "utf8")).toBe("auth=file;raw_env=absent;repo_view=read_only\n");
     expect(existsSync(join(actionRoot, input.request.attemptId))).toBe(false);
   });
@@ -1001,6 +1014,7 @@ JSON
       requiredArtifacts: ["stage_result", "standard_receipt"],
       liveSteering: false,
     });
+    const schemaEvidencePath = join(binDir, "codex-review-output-schema.json");
     const output = admissionReviewFixture();
     const event = JSON.stringify({
       type: "item.completed",
@@ -1009,6 +1023,12 @@ JSON
     writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
 set -euo pipefail
 cat >/dev/null
+args=("$@")
+for ((index=0; index < \${#args[@]}; index++)); do
+  if [ "\${args[index]}" = "--output-schema" ]; then
+    cp "\${args[index+1]}" '${schemaEvidencePath}'
+  fi
+done
 cat <<'JSON'
 ${event}
 JSON
@@ -1024,6 +1044,110 @@ JSON
     }));
 
     expect(execution.exitCode).toBe(0);
+    expect(execution.admissionOutput).toEqual(output);
+    expect(JSON.parse(readFileSync(schemaEvidencePath, "utf8"))).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["verdict", "summary", "findings", "questions"],
+    });
+  });
+
+  it.each([
+    ["admission_planner", "admission/plan@1", admissionPlanFixture],
+    ["admission_reviewer", "admission/review@1", admissionReviewFixture],
+  ])("passes native Claude structured output for %s while retaining stream events", (stageId, capability, outputFixture) => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-claude-schema-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    installFakeGosu(binDir);
+    const input = fixture({
+      agent: "claude",
+      capability,
+      stageId,
+      repositorySkill: "fixture",
+      requiredArtifacts: stageId === "admission_planner"
+        ? ["stage_result", "standard_receipt", "execution_plan"]
+        : ["stage_result", "standard_receipt"],
+      liveSteering: false,
+    });
+    const output = outputFixture();
+    const argsPath = join(binDir, `${stageId}-claude-args`);
+    const event = JSON.stringify({ type: "result", subtype: "success", structured_output: output });
+    writeExecutable(join(binDir, "claude"), `#!/usr/bin/env bash
+set -euo pipefail
+cat >/dev/null
+printf '%s\\n' "$@" > '${argsPath}'
+cat <<'JSON'
+${event}
+JSON
+`);
+
+    const execution = withPrependedPath(binDir, () => defaultRunAgent({
+      request: input.request,
+      invocation: resolveContextInvocation(input.request),
+      repoDir: input.repoDir,
+      proposalPath: join(actionRoot, "proposal.json"),
+      timeoutMs: 5_000,
+      model: "claude-sonnet-4-5",
+    }));
+
+    const args = readFileSync(argsPath, "utf8").trim().split("\n");
+    const schemaIndex = args.indexOf("--json-schema");
+    expect(args).toEqual(expect.arrayContaining(["--output-format", "stream-json", "--json-schema"]));
+    expect(JSON.parse(args[schemaIndex + 1])).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: stageId === "admission_planner"
+        ? ["route", "rationale", "questions", "execution_plan"]
+        : ["verdict", "summary", "findings", "questions"],
+    });
+    expect(execution.admissionOutput).toEqual(output);
+  });
+
+  it("parses admission semantics from the OpenCode text event without native schema flags", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-opencode-jsonl-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    installFakeGosu(binDir);
+    const input = fixture({
+      agent: "opencode",
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      repositorySkill: "fixture",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+    const output = admissionPlanFixture();
+    const argsPath = join(binDir, "admission-planner-opencode-args");
+    const event = JSON.stringify({
+      type: "text",
+      sessionID: "opencode-admission-session",
+      part: { type: "text", text: JSON.stringify(output) },
+    });
+    writeExecutable(join(binDir, "opencode"), `#!/usr/bin/env bash
+set -euo pipefail
+cat >/dev/null
+printf '%s\\n' "$@" > '${argsPath}'
+cat <<'JSON'
+${event}
+JSON
+`);
+
+    const execution = withPrependedPath(binDir, () => defaultRunAgent({
+      request: input.request,
+      invocation: resolveContextInvocation(input.request),
+      repoDir: input.repoDir,
+      proposalPath: join(actionRoot, "proposal.json"),
+      timeoutMs: 5_000,
+      model: "kimi-code/kimi-for-coding",
+    }));
+
+    const args = readFileSync(argsPath, "utf8").trim().split("\n");
+    expect(args).toEqual(expect.arrayContaining(["run", "--format", "json"]));
+    expect(args).not.toContain("--json-schema");
+    expect(args).not.toContain("--output-schema");
     expect(execution.admissionOutput).toEqual(output);
   });
 

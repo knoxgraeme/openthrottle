@@ -92,6 +92,7 @@ import {
   isAdmissionInspectionStage,
 } from "./admission-inspection-runtime.mjs";
 import {
+  ADMISSION_SEMANTIC_OUTPUT_SCHEMAS,
   validateAdmissionDecision,
   validateAdmissionExecutionPlanArtifact,
   validateAdmissionReview,
@@ -724,8 +725,13 @@ export function parseAdmissionSemanticOutput(raw, stageId, env = process.env) {
     } catch {
       continue;
     }
-    if (event?.type === "result" && event.result !== undefined) sources.push(event.result);
+    if (event?.type === "result" && event.structured_output !== undefined && event.structured_output !== null) {
+      sources.push(event.structured_output);
+    } else if (event?.type === "result" && event.result !== undefined) {
+      sources.push(event.result);
+    }
     if (event?.type === "item.completed" && event.item?.type === "agent_message") sources.push(event.item.text);
+    if (event?.type === "text" && typeof event.part?.text === "string") sources.push(event.part.text);
     for (const key of ["output", "content", "message"]) {
       if (event?.[key] !== undefined) sources.push(event[key]);
     }
@@ -751,6 +757,29 @@ export function parseAdmissionSemanticOutput(raw, stageId, env = process.env) {
     );
   }
   return outputs[0];
+}
+
+function admissionSemanticOutputSchema(stageId) {
+  const schema = ADMISSION_SEMANTIC_OUTPUT_SCHEMAS[stageId];
+  if (!schema) throw new Error(`unsupported admission semantic stage ${stageId}`);
+  return schema;
+}
+
+function materializeAdmissionSemanticOutputSchema(request) {
+  const actionDirectory = ensureStageActionParents(request);
+  const schemaPath = pathInside(
+    actionDirectory,
+    `${request.stageId}.semantic-output.schema.json`,
+    "admission semantic output schema",
+  );
+  writeFileSync(schemaPath, `${canonicalJson(admissionSemanticOutputSchema(request.stageId))}\n`, {
+    encoding: "utf8",
+    mode: 0o444,
+    flag: "wx",
+  });
+  if (isRoot()) chownSync(schemaPath, 0, 0);
+  chmodSync(schemaPath, 0o444);
+  return schemaPath;
 }
 
 export { extractNativeSessionId } from "./native-session-package.mjs";
@@ -823,6 +852,9 @@ export function defaultRunAgent({
       const mcpConfig = process.env.OT_CLAUDE_MCP_CONFIG?.trim();
       const common = [
         "--output-format", "stream-json", "--verbose",
+        ...(inspection
+          ? ["--json-schema", canonicalJson(admissionSemanticOutputSchema(request.stageId))]
+          : []),
         ...(maxTurns ? ["--max-turns", maxTurns] : []),
         ...(model ? ["--model", model] : []),
         ...(reasoningEffort ? ["--effort", reasoningEffort] : []),
@@ -856,11 +888,15 @@ export function defaultRunAgent({
       stdin = prompt;
     } else if (agent === "codex") {
       command = "codex";
+      const outputSchemaPath = inspection
+        ? materializeAdmissionSemanticOutputSchema(request)
+        : null;
       // "-" tells Codex to read the prompt from stdin, in resume mode exactly
       // as in a fresh launch.
       args = [
         ...(inspection ? ["--ask-for-approval", "never"] : []),
         "exec", "--json",
+        ...(outputSchemaPath ? ["--output-schema", outputSchemaPath] : []),
         ...(inspection
           ? inspectionAgentPolicyArgs("codex", repoDir)
           : ["--dangerously-bypass-approvals-and-sandbox"]),
