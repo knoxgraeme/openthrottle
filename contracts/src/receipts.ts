@@ -1,3 +1,8 @@
+/**
+ * @deprecated Legacy agent-authored receipt contract. New actions submit a
+ * semantic ResultCandidate; the executor creates result, decision, and
+ * delivery records. This module is retained only until U8 removes old runtime.
+ */
 import {
   validateAdmissionDecision,
   validateAdmissionReview,
@@ -29,6 +34,7 @@ import {
   type TuneProposal,
 } from "./tune-contract.js";
 
+/** @deprecated Agents now submit semantic ResultCandidate objects. */
 export const RECEIPT_SCHEMA = "openthrottle.receipt/v1" as const;
 // Kept byte-identical with sandbox/runner/artifacts.mjs. A structured repair
 // can carry up to sixteen command receipts inside a 48 KiB prior-evidence
@@ -244,6 +250,7 @@ export type AdmissionReviewReceipt = StandardReceiptBase<
   AdmissionReviewReceiptPayload
 >;
 
+/** @deprecated Use ResultRecord, DecisionRecord, or DeliveryRecord. */
 export type StandardReceipt =
   | UnitCompletionReceipt
   | UnitDecisionReceipt
@@ -474,6 +481,7 @@ function parseReceiptPayload(type: StandardReceiptType, value: unknown, path: st
   };
 }
 
+/** @deprecated Use the action eval plus validateAndNormalizeResultCandidate. */
 export function validateStandardReceipt(
   value: unknown,
   options: { source?: string } = {}
@@ -527,6 +535,7 @@ export function validateStandardReceipt(
   return normalizedContract(receipt);
 }
 
+/** @deprecated Agent-authored receipts are removed in the fresh execution epoch. */
 export function parseStandardReceipt(raw: string, options: { source?: string } = {}): ValidatedContract<StandardReceipt> {
   const source = options.source ?? "receipt";
   const bytes = Buffer.byteLength(raw, "utf8");

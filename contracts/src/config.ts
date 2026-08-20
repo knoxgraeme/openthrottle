@@ -14,8 +14,10 @@ import {
   unique,
   type ValidatedContract,
 } from "./validation.js";
+import { ENGINES, type Engine } from "./pipeline.js";
 
 const CONFIG_SCHEMA = "openthrottle.config/v1" as const;
+export const FILESYSTEM_CONFIG_SCHEMA = "openthrottle.config/v2" as const;
 const GRAPH_SOURCE_KINDS = ["builtin", "repository"] as const;
 const CONFIG_AGENTS = ["claude", "codex", "opencode"] as const;
 const REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
@@ -30,7 +32,7 @@ export interface ConfigGraphSource {
   ref: string;
 }
 
-interface ConfigLimits {
+export interface ConfigLimits {
   max_turns?: number;
   task_timeout?: number;
 }
@@ -53,6 +55,18 @@ export interface ConfigRepositorySkill {
 export interface ConfigAgentDefault {
   model?: string;
   reasoning_effort?: (typeof REASONING_EFFORTS)[number];
+}
+
+export interface FilesystemConfigContract {
+  schema: typeof FILESYSTEM_CONFIG_SCHEMA;
+  pipeline: string;
+  engine: Engine;
+  model?: string;
+  reasoning_effort?: (typeof REASONING_EFFORTS)[number];
+  commands?: Record<string, string>;
+  post_bootstrap?: string[];
+  limits?: ConfigLimits;
+  mcp_servers?: Record<string, ConfigMcpServer>;
 }
 
 export interface ConfigIntent {
@@ -373,4 +387,49 @@ export function parseRepositoryConfigContract(
 ): ValidatedContract<RepositoryConfigContract> {
   if (Buffer.byteLength(raw, "utf8") > 64 * 1024) fail(options.source ?? "config", "JSON exceeds 64 KiB");
   return validateRepositoryConfigContract(JSON.parse(raw) as unknown, options);
+}
+
+export function validateFilesystemConfigContract(
+  value: unknown,
+  options: { source?: string } = {},
+): ValidatedContract<FilesystemConfigContract> {
+  const source = options.source ?? "config";
+  const input = objectAt(value, source, [
+    "schema", "pipeline", "engine", "model", "reasoning_effort", "commands",
+    "post_bootstrap", "limits", "mcp_servers",
+  ]);
+  if (input.schema !== FILESYSTEM_CONFIG_SCHEMA) {
+    fail(`${source}.schema`, `must be ${FILESYSTEM_CONFIG_SCHEMA}`);
+  }
+  const engine = enumAt(input.engine, `${source}.engine`, ENGINES);
+  if (engine === "opencode" && input.reasoning_effort !== undefined) {
+    fail(`${source}.reasoning_effort`, "is not supported for OpenCode");
+  }
+  const config: FilesystemConfigContract = {
+    schema: FILESYSTEM_CONFIG_SCHEMA,
+    pipeline: stringAt(input.pipeline, `${source}.pipeline`, { pattern: IDENTIFIER }),
+    engine,
+    ...(input.model === undefined ? {} : {
+      model: stringAt(input.model, `${source}.model`, { max: 240, pattern: MODEL_REFERENCE }),
+    }),
+    ...(input.reasoning_effort === undefined ? {} : {
+      reasoning_effort: enumAt(
+        input.reasoning_effort,
+        `${source}.reasoning_effort`,
+        REASONING_EFFORTS,
+      ),
+    }),
+    ...(input.commands === undefined ? {} : { commands: parseCommandMap(input.commands, `${source}.commands`) }),
+    ...(input.post_bootstrap === undefined ? {} : {
+      post_bootstrap: parseStringList(input.post_bootstrap, `${source}.post_bootstrap`, 32),
+    }),
+    ...(input.limits === undefined ? {} : { limits: parseLimits(input.limits, `${source}.limits`) }),
+    ...(input.mcp_servers === undefined ? {} : {
+      mcp_servers: recordAt(input.mcp_servers, `${source}.mcp_servers`, parseMcpServer, {
+        max: 32,
+        keyPattern: IDENTIFIER,
+      }),
+    }),
+  };
+  return normalizedContract(config);
 }
