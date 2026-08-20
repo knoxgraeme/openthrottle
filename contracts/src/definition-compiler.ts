@@ -4,6 +4,21 @@ import { posix } from "node:path";
 import type * as Yaml from "yaml";
 import { digestNormalized } from "./canonical.js";
 import {
+  reverifyCompilerEnvironment,
+  type TrustedCompilerEnvironment,
+} from "./compiler-environment.js";
+import {
+  VIRTUAL_DEFINITION_MAX_FILE_BYTES,
+  VIRTUAL_DEFINITION_MAX_FILES,
+  VIRTUAL_DEFINITION_MAX_TOTAL_BYTES,
+  type TrustedRepositoryDefinitionSource,
+  type VirtualDefinitionFileMap,
+} from "./definition-source.js";
+import {
+  reverifyPlatformDefinitionSource,
+  type TrustedPlatformDefinitionSource,
+} from "./platform-definition-catalog.js";
+import {
   DEFINITION_BUNDLE_SCHEMA,
   definitionEntryContentHash,
   definitionEntryIdentity,
@@ -36,40 +51,24 @@ import {
   type ValidatedContract,
 } from "./validation.js";
 
-export const VIRTUAL_DEFINITION_MAX_FILES = 512;
-export const VIRTUAL_DEFINITION_MAX_FILE_BYTES = 512 * 1024;
-export const VIRTUAL_DEFINITION_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 export const DEFINITION_YAML_MAX_BYTES = 256 * 1024;
 
-export type VirtualDefinitionFile =
-  | {
-    readonly type: "file";
-    readonly content: string | Uint8Array;
-    /** Reader evidence only. It is deliberately excluded from compiled output. */
-    readonly blob_sha?: string;
-  }
-  | { readonly type: "symlink"; readonly target: string }
-  | { readonly type: "directory" };
-
-export type VirtualDefinitionFileMap = ReadonlyMap<string, VirtualDefinitionFile>;
-
-export interface TrustedRepositoryDefinitionSource {
-  /** Exact Git commit resolved by the trusted repository reader. */
-  readonly source_commit: string;
-  readonly files: VirtualDefinitionFileMap;
-}
-
-export interface TrustedPlatformDefinitionSource {
-  /** Files supplied by the release-sealed platform catalog channel. */
-  readonly files: VirtualDefinitionFileMap;
-}
+export {
+  VIRTUAL_DEFINITION_MAX_FILE_BYTES,
+  VIRTUAL_DEFINITION_MAX_FILES,
+  VIRTUAL_DEFINITION_MAX_TOTAL_BYTES,
+} from "./definition-source.js";
+export type {
+  TrustedRepositoryDefinitionSource,
+  VirtualDefinitionFile,
+  VirtualDefinitionFileMap,
+} from "./definition-source.js";
+export type { TrustedPlatformDefinitionSource } from "./platform-definition-catalog.js";
 
 export interface DefinitionCompilerInput {
   readonly repository: TrustedRepositoryDefinitionSource;
   readonly platform?: TrustedPlatformDefinitionSource;
-  readonly compiler_version: string;
-  readonly runtime_capability_digest: string;
-  readonly evaluator_primitives: ReadonlySet<string> | readonly string[];
+  readonly compiler_environment: TrustedCompilerEnvironment;
   /** If present, asserts the config-selected pipeline rather than overriding it. */
   readonly selected_pipeline?: string;
 }
@@ -172,6 +171,9 @@ function loadFiles(input: DefinitionCompilerInput): Map<string, LoadedFile> {
   const casePaths = new Map<string, string>();
   let fileCount = 0;
   let totalBytes = 0;
+  const platform = input.platform === undefined
+    ? undefined
+    : reverifyPlatformDefinitionSource(input.platform);
   const channels: Array<{
     origin: DefinitionOrigin;
     sourceCommit: string | null;
@@ -184,9 +186,9 @@ function loadFiles(input: DefinitionCompilerInput): Map<string, LoadedFile> {
       }),
       files: input.repository.files,
     },
-    ...(input.platform === undefined
+    ...(platform === undefined
       ? []
-      : [{ origin: "platform" as const, sourceCommit: null, files: input.platform.files }]),
+      : [{ origin: "platform" as const, sourceCommit: null, files: platform.files }]),
   ];
 
   for (const channel of channels) {
@@ -640,6 +642,7 @@ function compileStages(
 }
 
 export function compileDefinitionBundle(input: DefinitionCompilerInput): DefinitionCompilation {
+  const compilerEnvironment = reverifyCompilerEnvironment(input.compiler_environment);
   const files = loadFiles(input);
   const { definitions, skillFiles } = indexDefinitions(files);
   const configDescriptor = requiredDefinition(definitions, "config", "repository", "config");
@@ -655,9 +658,7 @@ export function compileDefinitionBundle(input: DefinitionCompilerInput): Definit
   }
   const pipelineDescriptor = requiredDefinition(definitions, "pipeline", config.pipeline, "config.pipeline");
   const pipeline = parsePipeline(pipelineDescriptor);
-  const evaluatorPrimitives = input.evaluator_primitives instanceof Set
-    ? input.evaluator_primitives
-    : new Set(input.evaluator_primitives);
+  const evaluatorPrimitives = new Set(compilerEnvironment.evaluator_primitives);
   const selectedEntries = new Map<string, DefinitionBundleEntry>();
   selectedEntries.set(
     definitionEntryIdentity("config", "repository"),
@@ -685,8 +686,8 @@ export function compileDefinitionBundle(input: DefinitionCompilerInput): Definit
   );
   const bundle = validateDefinitionBundle({
     schema: DEFINITION_BUNDLE_SCHEMA,
-    compiler_version: input.compiler_version,
-    runtime_capability_digest: input.runtime_capability_digest,
+    compiler_version: compilerEnvironment.compiler_version,
+    runtime_capability_digest: compilerEnvironment.runtime_capability_digest,
     source_commit: input.repository.source_commit,
     pipeline_id: pipeline.id,
     entries: [...selectedEntries.values()],
@@ -697,8 +698,8 @@ export function compileDefinitionBundle(input: DefinitionCompilerInput): Definit
     pipeline_version: pipeline.version,
     entry_stage: pipeline.entry,
     definition_bundle_hash: bundle.digest,
-    compiler_version: input.compiler_version,
-    runtime_capability_digest: input.runtime_capability_digest,
+    compiler_version: compilerEnvironment.compiler_version,
+    runtime_capability_digest: compilerEnvironment.runtime_capability_digest,
     stages,
   });
   return { bundle, manifest };

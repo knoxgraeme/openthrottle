@@ -17,6 +17,11 @@ COPY contracts/package.json contracts/package-lock.json* ./
 RUN npm ci
 COPY contracts/tsconfig.json contracts/tsconfig.build.json ./
 COPY contracts/src ./src
+COPY contracts/scripts ./scripts
+# The contracts build regenerates and verifies the release-sealed platform
+# catalog and compiler environment from their authoritative repository inputs.
+COPY .openthrottle /.openthrottle
+COPY supervisor/pipelines/runtime-capabilities-v1.json /supervisor/pipelines/runtime-capabilities-v1.json
 RUN npm run build
 
 FROM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS build
