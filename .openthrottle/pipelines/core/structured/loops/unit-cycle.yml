@@ -1,0 +1,11 @@
+schema: openthrottle.pipeline-loop/v1
+id: core/structured/unit-cycle
+body:
+  - implement_unit
+  - simplify_unit
+  - unit_test
+  - unit_lint
+  - unit_build
+  - accept_unit
+  - repair_unit
+  - integrate_unit

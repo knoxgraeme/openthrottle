@@ -1,0 +1,113 @@
+schema: openthrottle.pipeline-definition/v1
+id: core/implement
+version: 1
+entry: implement
+stages:
+  - id: implement
+    kind: agent
+    agent_id: core/ordinary-worker
+    repository_authority: edit
+    skills: [core/implement-plan]
+    entry_skill: core/implement-plan
+    eval: core/action-result
+    on:
+      success: {to: review}
+      no_change: {terminal: no_change}
+      semantic_repair_required: {to: implement, max_reentries: 8, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      retryable_infrastructure_failure: {to: implement, max_reentries: 3, on_exhausted: failed}
+      failure: {terminal: failed}
+  - id: repair
+    kind: agent
+    agent_id: core/ordinary-worker
+    repository_authority: edit
+    skills: [core/implement-plan]
+    entry_skill: core/implement-plan
+    eval: core/action-result
+    on:
+      success: {to: review}
+      no_change: {to: review}
+      semantic_repair_required: {to: repair, max_reentries: 3, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      retryable_infrastructure_failure: {to: repair, max_reentries: 3, on_exhausted: failed}
+      failure: {terminal: failed}
+  - id: review
+    kind: agent
+    agent_id: core/reviewer
+    repository_authority: inspect
+    skills: [core/review-change]
+    entry_skill: core/review-change
+    eval: core/review-result
+    on:
+      success: {to: simplify}
+      no_change: {to: simplify}
+      semantic_repair_required: {to: repair, max_reentries: 5, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      failure: {terminal: failed}
+  - id: simplify
+    kind: agent
+    agent_id: core/ordinary-worker
+    repository_authority: edit
+    skills: [core/simplify-change]
+    entry_skill: core/simplify-change
+    eval: core/action-result
+    on:
+      success: {to: post_simplify_review}
+      no_change: {to: test}
+      semantic_repair_required: {to: repair, max_reentries: 5, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      retryable_infrastructure_failure: {to: simplify, max_reentries: 2, on_exhausted: failed}
+      failure: {terminal: failed}
+  - id: post_simplify_review
+    kind: agent
+    agent_id: core/reviewer
+    repository_authority: inspect
+    skills: [core/review-change]
+    entry_skill: core/review-change
+    eval: core/review-result
+    on:
+      success: {to: test}
+      no_change: {to: test}
+      semantic_repair_required: {to: repair, max_reentries: 5, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      failure: {terminal: failed}
+  - id: test
+    kind: command
+    command: test
+    on:
+      success: {to: lint}
+      no_change: {to: lint}
+      retryable_infrastructure_failure: {to: test, max_reentries: 2, on_exhausted: failed}
+      failure: {to: repair, max_reentries: 5, on_exhausted: needs_human}
+  - id: lint
+    kind: command
+    command: lint
+    on:
+      success: {to: build}
+      no_change: {to: build}
+      retryable_infrastructure_failure: {to: lint, max_reentries: 2, on_exhausted: failed}
+      failure: {to: repair, max_reentries: 5, on_exhausted: needs_human}
+  - id: build
+    kind: command
+    command: build
+    on:
+      success: {to: publish}
+      no_change: {to: publish}
+      retryable_infrastructure_failure: {to: build, max_reentries: 2, on_exhausted: failed}
+      failure: {to: repair, max_reentries: 5, on_exhausted: needs_human}
+  - id: publish
+    kind: effect
+    effect: core/publish@1
+    on:
+      success: {to: provider}
+      no_change: {terminal: no_change}
+      retryable_infrastructure_failure: {to: publish, max_reentries: 2, on_exhausted: failed}
+      failure: {terminal: failed}
+  - id: provider
+    kind: wait
+    wait: core/provider-wait@1
+    on:
+      success: {terminal: completed}
+      no_change: {terminal: no_change}
+      retryable_infrastructure_failure: {to: provider, max_reentries: 2, on_exhausted: failed}
+      failure: {terminal: failed}

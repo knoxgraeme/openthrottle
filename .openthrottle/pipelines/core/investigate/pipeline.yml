@@ -1,0 +1,35 @@
+schema: openthrottle.pipeline-definition/v1
+id: core/investigate
+version: 1
+entry: investigate
+stages:
+  - id: investigate
+    kind: agent
+    agent_id: core/investigator
+    repository_authority: edit
+    skills: [core/investigate]
+    entry_skill: core/investigate
+    eval: core/action-result
+    on:
+      success: {to: publish}
+      no_change: {terminal: no_change}
+      semantic_repair_required: {to: investigate, max_reentries: 3, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      retryable_infrastructure_failure: {to: investigate, max_reentries: 3, on_exhausted: failed}
+      failure: {terminal: failed}
+  - id: publish
+    kind: effect
+    effect: core/publish@1
+    on:
+      success: {to: provider}
+      no_change: {terminal: no_change}
+      retryable_infrastructure_failure: {to: publish, max_reentries: 2, on_exhausted: failed}
+      failure: {terminal: failed}
+  - id: provider
+    kind: wait
+    wait: core/provider-wait@1
+    on:
+      success: {terminal: completed}
+      no_change: {terminal: no_change}
+      retryable_infrastructure_failure: {to: provider, max_reentries: 2, on_exhausted: failed}
+      failure: {terminal: failed}
