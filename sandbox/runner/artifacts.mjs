@@ -45,6 +45,17 @@ const STANDARD_RECEIPT_KEYS = new Set([
   "payload",
   "issued_at",
 ]);
+const STANDARD_RECEIPT_FENCE_KEYS = [
+  "pipeline_instance_id",
+  "graph_digest",
+  "unit_id",
+  "attempt_id",
+  "parent_run_id",
+  "action_attempt_id",
+  "generation",
+  "native_session_id",
+  "request_hash",
+];
 // Mirrors contracts/src/receipts.ts RECEIPT_RESULTS_BY_TYPE; exported so
 // tests/contracts-mirror.test.mjs can pin the two against each other.
 export const STANDARD_RECEIPT_RESULTS = Object.freeze({
@@ -561,6 +572,14 @@ function nullable(value, parse) {
 }
 
 export function validateStandardReceipt(value, env = process.env) {
+  const misplacedFenceFields = value && typeof value === "object" && !Array.isArray(value)
+    ? STANDARD_RECEIPT_FENCE_KEYS.filter((key) => Object.hasOwn(value, key))
+    : [];
+  if (misplacedFenceFields.length > 0) {
+    throw new Error(
+      `standard receipt fence fields must be nested under fence: ${misplacedFenceFields.join(", ")}`,
+    );
+  }
   const input = exactObject(value, "standard receipt", STANDARD_RECEIPT_KEYS);
   if (input.schema !== STANDARD_RECEIPT_SCHEMA) throw new Error("standard receipt has an invalid schema");
   const results = STANDARD_RECEIPT_RESULTS[input.type];
@@ -576,10 +595,7 @@ export function validateStandardReceipt(value, env = process.env) {
     "worker_id", "skill", "capability_digest", "skill_package_digest",
   ]));
   const subject = exactObject(input.subject, "standard receipt subject", new Set(["base", "pre", "post"]));
-  const fence = exactObject(input.fence, "standard receipt fence", new Set([
-    "pipeline_instance_id", "graph_digest", "unit_id", "attempt_id",
-    "parent_run_id", "action_attempt_id", "generation", "native_session_id", "request_hash",
-  ]));
+  const fence = exactObject(input.fence, "standard receipt fence", new Set(STANDARD_RECEIPT_FENCE_KEYS));
   if (!SHA256.test(producer.capability_digest)) throw new Error("standard receipt capability digest is invalid");
   const skillPackageDigest = nullable(producer.skill_package_digest, (entry) => {
     if (typeof entry !== "string" || !SHA256.test(entry)) throw new Error("standard receipt skill package digest is invalid");
