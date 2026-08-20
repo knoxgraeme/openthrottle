@@ -1,16 +1,18 @@
 ---
 name: review-change
-description: Reviews the whole branch change for one fenced OpenThrottle semantic review stage and returns ranked, stable findings.
+description: Use when reviewing a complete software change for ranked, stable, evidence-backed findings.
 ---
 
-# Semantic review stage
+# Review a complete change
 
 Review the complete sealed change and produce ranked, evidence-backed findings.
 
 ## Scope
 
-The subject is the full diff of the working tree against `origin/$BASE_BRANCH`.
-Read the whole diff before judging any part of it.
+The subject is the complete executor-materialized change between the sealed
+base and input subjects named in the action context. Read the supplied diff or
+checkpoint evidence and every affected file before judging any part of it.
+Do not infer ambient branch refs or fetch additional history.
 
 - **`semantic_review`** — review the whole change against the approved plan.
 - **`repair_semantic_review`** — the transition context names the repair. Judge

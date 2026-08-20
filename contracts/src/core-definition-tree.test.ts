@@ -145,7 +145,7 @@ describe("root .openthrottle definition tree", () => {
   it("matches the release-sealed catalog before interpreting any platform definition", () => {
     const trusted = sealedPlatform();
     const actual = new Set([...trusted.files.keys()].map((path) => path.slice(".openthrottle/".length)));
-    expect(trusted.catalog.files).toHaveLength(46);
+    expect(trusted.catalog.files).toHaveLength(45);
     expect([...actual].filter((path) => path.startsWith("agents/") && path.endsWith("/instructions.md")))
       .toEqual(agentIds.map((id) => `agents/core/${id}/instructions.md`));
     expect([...actual].filter((path) => path.endsWith("/pipeline.yml")))
@@ -170,6 +170,11 @@ describe("root .openthrottle definition tree", () => {
       { label: "stage-proposal schema", pattern: /openthrottle\.stage-proposal/i },
       { label: "stage-result tool", pattern: /ot-stage-result/i },
       { label: "stage-proposal output path", pattern: /ot_stage_proposal_file/i },
+      {
+        label: "executor-owned identity field",
+        pattern: /\b(?:request_hash|definition_bundle_hash|native_session_id|assurance|producer)\b/i,
+      },
+      { label: "model-authored output envelope", pattern: /\breturn exactly\b/i },
     ];
     const matches = filesBelow(skillRoot).flatMap((path) => {
       const content = readFileSync(path, "utf8");
