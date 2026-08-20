@@ -46,10 +46,11 @@ function seedRun(db: Database.Database): void {
   db.prepare(`
     INSERT INTO attempts (
       id, pipeline_run_id, scope_kind, stage_id, repository_authority,
-      request_hash, definition_bundle_hash, input_subject, status, version,
+      request_hash, definition_bundle_hash, input_subject,
+      context_record_ids_json, context_checkpoint_ids_json, status, version,
       work_retry_ordinal, result_correction_count, unmet_dependency_count,
       created_at, updated_at
-    ) VALUES ('attempt-1', 'run', 'stage', 'implement', 'edit', ?, ?, ?, 'work_complete', 0, 0, 0, 0, ?, ?)
+    ) VALUES ('attempt-1', 'run', 'stage', 'implement', 'edit', ?, ?, ?, '[]', '[]', 'work_complete', 0, 0, 0, 0, ?, ?)
   `).run(OTHER_HASH, HASH, SHA, NOW, NOW);
 }
 
@@ -110,20 +111,22 @@ describe("fresh epoch schema ownership", () => {
         INSERT INTO attempts (
           id, pipeline_run_id, scope_kind, stage_id, parent_attempt_id,
           repository_authority, request_hash, definition_bundle_hash, input_subject,
+          context_record_ids_json, context_checkpoint_ids_json,
           status, version, work_retry_ordinal, result_correction_count,
           unmet_dependency_count, created_at, updated_at
-        ) VALUES ('bad-scope', 'run', 'stage', 'implement', 'attempt-1', 'inspect', ?, ?, ?,
+        ) VALUES ('bad-scope', 'run', 'stage', 'implement', 'attempt-1', 'inspect', ?, ?, ?, '[]', '[]',
           'pending', 0, 0, 0, 0, ?, ?)
       `).run(OTHER_HASH, HASH, SHA, NOW, NOW)).toThrow(/CHECK constraint/);
       expect(() => db.prepare(`
         INSERT INTO attempts (
           id, pipeline_run_id, scope_kind, stage_id, repository_authority,
           request_hash, definition_bundle_hash, input_subject, native_session_id,
+          context_record_ids_json, context_checkpoint_ids_json,
           status, version, work_retry_ordinal, result_correction_count,
           result_correction_deadline, unmet_dependency_count,
           lease_id, lease_worker_id, lease_purpose, lease_expires_at, lease_started,
           created_at, updated_at
-        ) VALUES ('bad-lease', 'run', 'stage', 'implement', 'inspect', ?, ?, ?, NULL,
+        ) VALUES ('bad-lease', 'run', 'stage', 'implement', 'inspect', ?, ?, ?, NULL, '[]', '[]',
           'pending', 0, 0, 0, ?, 0, 'lease', NULL, 'work', ?, 0, ?, ?)
       `).run(OTHER_HASH, HASH, SHA, NOW, NOW, NOW, NOW)).toThrow(/CHECK constraint/);
     } finally {
@@ -191,10 +194,11 @@ describe("fresh epoch schema ownership", () => {
       db.prepare(`
         INSERT INTO attempts (
           id, pipeline_run_id, scope_kind, stage_id, repository_authority,
-          request_hash, definition_bundle_hash, input_subject, status, version,
+          request_hash, definition_bundle_hash, input_subject,
+          context_record_ids_json, context_checkpoint_ids_json, status, version,
           work_retry_ordinal, result_correction_count, unmet_dependency_count,
           created_at, updated_at
-        ) VALUES ('attempt-2', 'run', 'stage', 'implement', 'inspect', ?, ?, ?,
+        ) VALUES ('attempt-2', 'run', 'stage', 'implement', 'inspect', ?, ?, ?, '[]', '[]',
           'work_complete', 0, 0, 0, 0, ?, ?)
       `).run(HASH, HASH, SHA, NOW, NOW);
       const insert = db.prepare(`

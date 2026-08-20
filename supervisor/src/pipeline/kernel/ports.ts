@@ -1,6 +1,7 @@
 import type {
   AttemptCheckpoint,
   CompiledPipelineManifest,
+  DefinitionBundle,
   EffectIntent,
   ExecutionRecord,
 } from "@openthrottle/contracts";
@@ -74,6 +75,13 @@ export interface KernelEffectPort {
     lease_id: string;
     expires_at: string;
   }): Promise<LeasedEffectView | null>;
+  // This write-ahead fence is required immediately before provider mutation.
+  // Once persisted, lease replay and expiry recovery are reconciliation-only.
+  markLeasedEffectDispatchStarted(input: {
+    effect_id: string;
+    lease_id: string;
+    worker_id: string;
+  }): Promise<LeasedEffectView>;
   completeLeasedEffect(input: {
     effect_id: string;
     lease_id: string;
@@ -85,6 +93,40 @@ export interface KernelEffectPort {
 export interface ResolvedKernelContext {
   records: ReadonlyMap<string, ExecutionRecord>;
   checkpoints: ReadonlyMap<string, AttemptCheckpoint>;
+}
+
+export const KERNEL_WORK_REQUEST_PAYLOAD_SCHEMA =
+  "openthrottle.kernel-work-request/v1" as const;
+
+export interface KernelAttemptRequestInputs {
+  task_prompt: string;
+  context: ResolvedKernelContext;
+}
+
+/**
+ * Reconstructs one sealed request exclusively from immutable work-item bytes
+ * and the exact context IDs persisted on its Attempt. Callers cannot widen
+ * this view by supplying IDs at dispatch time.
+ */
+export interface KernelAttemptRequestPort {
+  loadAttemptRequestInputs(input: {
+    pipeline_run_id: string;
+    attempt_id: string;
+  }): Promise<KernelAttemptRequestInputs>;
+}
+
+export interface KernelDefinitionBundleBytesPort {
+  loadExactDefinitionBundleBytes(input: {
+    pipeline_run_id: string;
+    definition_bundle_hash: string;
+  }): Promise<Uint8Array>;
+}
+
+export interface KernelDefinitionBundlePort {
+  resolveExactDefinitionBundle(input: {
+    pipeline_run_id: string;
+    definition_bundle_hash: string;
+  }): Promise<DefinitionBundle>;
 }
 
 export interface KernelContextPort {

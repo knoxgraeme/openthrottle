@@ -106,6 +106,8 @@ function attempt(input: Partial<KernelAttempt> = {}): KernelAttempt {
     request_hash: input.request_hash ?? sha("a"),
     definition_bundle_hash: input.definition_bundle_hash ?? sha("b"),
     input_subject: input.input_subject ?? subject("1"),
+    context_record_ids: input.context_record_ids ?? [],
+    context_checkpoint_ids: input.context_checkpoint_ids ?? [],
     output_subject: input.output_subject ?? null,
     native_session_id: input.native_session_id ?? null,
     status: input.status ?? "pending",
@@ -139,7 +141,10 @@ function run(initial: readonly KernelAttempt[], bundleHash: string): KernelRun {
   };
 }
 
-function setup(faultInjector?: (point: KernelStoreFaultPoint) => void): {
+function setup(
+  faultInjector?: (point: KernelStoreFaultPoint) => void,
+  now: () => string = () => NOW,
+): {
   db: Database.Database;
   blobs: VolumeBlobStore;
   store: SqliteKernelStore;
@@ -169,7 +174,7 @@ function setup(faultInjector?: (point: KernelStoreFaultPoint) => void): {
     blob_store: blobs,
     release_id: "release-a",
     bootstrap,
-    now: () => NOW,
+    now,
   });
   const definitionBundle = blobs.put({
     bytes: '{"bundle":"test"}',
@@ -185,7 +190,7 @@ function setup(faultInjector?: (point: KernelStoreFaultPoint) => void): {
     blob_store: blobs,
     manifest_resolver: { resolve: () => pipelineManifest },
     payload_schemas: payloadSchemas,
-    now: () => NOW,
+    now,
     fault_injector: faultInjector,
   });
   return {
@@ -485,7 +490,8 @@ describe("SqliteKernelStore", () => {
   });
 
   it("persists result/decision/effect primitives and fences effect lease reconciliation", async () => {
-    const context = setup();
+    let currentTime = NOW;
+    const context = setup(undefined, () => currentTime);
     try {
       context.store.admitPipelineRun(context.admission);
       const started = await claimAndStart(context);
@@ -595,9 +601,49 @@ describe("SqliteKernelStore", () => {
         lease_id: "effect-lease-1",
         expires_at: "2026-08-20T12:05:00.000Z",
       })).toEqual(effectLease);
+      currentTime = "2026-08-20T12:05:01.000Z";
+      const recoveredUnsentLease = await context.store.leaseNextEffect({
+        worker_id: "effect-worker",
+        lease_id: "effect-lease-2",
+        expires_at: "2026-08-20T12:10:00.000Z",
+      });
+      expect(context.db.prepare(`
+        SELECT e.status, e.lease_id, e.lease_execution_mode, e.available_at,
+          r.status AS run_status
+        FROM effects e JOIN pipeline_runs r ON r.id = e.pipeline_run_id
+        WHERE e.id = 'effect-1'
+      `).get()).toEqual({
+        status: "processing",
+        lease_id: "effect-lease-2",
+        lease_execution_mode: "dispatch_or_reconcile",
+        available_at: NOW,
+        run_status: "running",
+      });
+      expect(recoveredUnsentLease?.execution_mode).toBe("dispatch_or_reconcile");
+      await expect(context.store.markLeasedEffectDispatchStarted({
+        effect_id: "effect-1",
+        lease_id: "effect-lease-2",
+        worker_id: "wrong-worker",
+      })).rejects.toThrow(/fence/);
+      const dispatchStarted = await context.store.markLeasedEffectDispatchStarted({
+        effect_id: "effect-1",
+        lease_id: "effect-lease-2",
+        worker_id: "effect-worker",
+      });
+      expect(dispatchStarted.execution_mode).toBe("reconcile_only");
+      expect(await context.store.markLeasedEffectDispatchStarted({
+        effect_id: "effect-1",
+        lease_id: "effect-lease-2",
+        worker_id: "effect-worker",
+      })).toEqual(dispatchStarted);
+      expect(await context.store.leaseNextEffect({
+        worker_id: "effect-worker",
+        lease_id: "effect-lease-2",
+        expires_at: "2026-08-20T12:10:00.000Z",
+      })).toEqual(dispatchStarted);
       await expect(context.store.completeLeasedEffect({
         effect_id: "effect-1",
-        lease_id: "effect-lease-1",
+        lease_id: "effect-lease-2",
         worker_id: "wrong-worker",
         reconciliation: {
           kind: "hold_unknown",
@@ -606,9 +652,16 @@ describe("SqliteKernelStore", () => {
           detail: "provider timed out",
         },
       })).rejects.toThrow(/fence/);
+      currentTime = "2026-08-20T12:10:01.000Z";
+      const reconciliationLease = await context.store.leaseNextEffect({
+        worker_id: "effect-worker",
+        lease_id: "effect-lease-3",
+        expires_at: "2026-08-20T12:15:00.000Z",
+      });
+      expect(reconciliationLease?.execution_mode).toBe("reconcile_only");
       await context.store.completeLeasedEffect({
         effect_id: "effect-1",
-        lease_id: "effect-lease-1",
+        lease_id: "effect-lease-3",
         worker_id: "effect-worker",
         reconciliation: {
           kind: "hold_unknown",
@@ -617,12 +670,12 @@ describe("SqliteKernelStore", () => {
           detail: "provider timed out",
         },
       });
-      const reconciliationLease = await context.store.leaseNextEffect({
+      const heldUnknownLease = await context.store.leaseNextEffect({
         worker_id: "effect-worker",
-        lease_id: "effect-lease-2",
-        expires_at: "2026-08-20T12:06:00.000Z",
+        lease_id: "effect-lease-4",
+        expires_at: "2026-08-20T12:20:00.000Z",
       });
-      expect(reconciliationLease?.execution_mode).toBe("reconcile_only");
+      expect(heldUnknownLease?.execution_mode).toBe("reconcile_only");
       const delivery: DeliveryRecord = {
         schema: EXECUTION_RECORD_SCHEMA,
         id: "delivery-1",
@@ -638,7 +691,7 @@ describe("SqliteKernelStore", () => {
       };
       await context.store.completeLeasedEffect({
         effect_id: "effect-1",
-        lease_id: "effect-lease-2",
+        lease_id: "effect-lease-4",
         worker_id: "effect-worker",
         reconciliation: { kind: "append_delivery", delivery },
       });

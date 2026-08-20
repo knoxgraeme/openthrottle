@@ -49,7 +49,9 @@ const typeOnlyExceptions = new Set([
   // The app and pipeline boundaries use runtime descriptor shapes as durable
   // contracts; concrete runtime services and adapters still flow outward.
   "app->runtime:runtime/contracts.ts",
+  "app->runtime:runtime/kernel-contracts.ts",
   "pipeline->runtime:runtime/contracts.ts",
+  "pipeline->runtime:runtime/kernel-contracts.ts",
 ]);
 
 // OPE-112 read-contract, promoted from SPEC prose to an assertion here:

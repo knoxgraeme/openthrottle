@@ -17,7 +17,10 @@ import {
 import type {
   AttemptLeaseRequest,
   KernelAttemptLeasePort,
+  KernelAttemptRequestPort,
+  KernelAttemptRequestInputs,
   KernelContextPort,
+  KernelDefinitionBundleBytesPort,
   KernelEffectPort,
   KernelProjectionPort,
   KernelReductionPort,
@@ -28,11 +31,13 @@ import type {
   ReductionView,
   ResolvedKernelContext,
 } from "../pipeline/kernel/ports.js";
+import { KERNEL_WORK_REQUEST_PAYLOAD_SCHEMA } from "../pipeline/kernel/ports.js";
 import type { EffectReconciliation } from "../pipeline/kernel/effect-intent.js";
 import { effectIntentContentHash } from "../pipeline/kernel/effect-intent.js";
 import {
   KERNEL_ATTEMPT_SCHEMA,
   KERNEL_RUN_SCHEMA,
+  canonicalAttemptContextIds,
   type AtomicTransitionBundle,
   type AttemptScope,
   type KernelAttempt,
@@ -115,7 +120,12 @@ interface PayloadRow extends PayloadColumns {
 interface RunRow {
   id: string;
   pipeline_id: string;
+  definition_bundle_algorithm: "sha256";
   definition_bundle_hash: string;
+  definition_bundle_bytes: number;
+  definition_bundle_encoding: "utf-8";
+  definition_bundle_media_type: string;
+  definition_bundle_payload_schema: string;
   current_subject: string;
   status: KernelRun["status"];
   terminal_outcome: KernelRun["terminal_outcome"];
@@ -145,6 +155,8 @@ interface AttemptRow {
   request_hash: string;
   definition_bundle_hash: string;
   input_subject: string;
+  context_record_ids_json: string;
+  context_checkpoint_ids_json: string;
   output_subject: string | null;
   native_session_id: string | null;
   status: KernelAttempt["status"];
@@ -215,7 +227,7 @@ interface EffectRow extends PayloadRow {
 
 export interface KernelIntegrityEvidence {
   pipeline_run_id: string;
-  owner_kind: "record" | "checkpoint" | "effect" | "definition_bundle";
+  owner_kind: "record" | "checkpoint" | "effect" | "definition_bundle" | "work_item";
   owner_id: string;
   digest: string;
   classification: "active_blocking" | "settled_history_incident";
@@ -327,6 +339,14 @@ function attemptFromRow(row: AttemptRow): KernelAttempt {
     request_hash: row.request_hash,
     definition_bundle_hash: row.definition_bundle_hash,
     input_subject: row.input_subject,
+    context_record_ids: canonicalAttemptContextIds(
+      parseJson(row.context_record_ids_json, "attempt context record IDs"),
+      "persisted attempt context_record_ids",
+    ),
+    context_checkpoint_ids: canonicalAttemptContextIds(
+      parseJson(row.context_checkpoint_ids_json, "attempt context checkpoint IDs"),
+      "persisted attempt context_checkpoint_ids",
+    ),
     output_subject: row.output_subject,
     native_session_id: row.native_session_id,
     status: row.status,
@@ -349,6 +369,8 @@ function attemptFromRow(row: AttemptRow): KernelAttempt {
 export class SqliteKernelStore implements
   KernelReductionPort,
   KernelAttemptLeasePort,
+  KernelAttemptRequestPort,
+  KernelDefinitionBundleBytesPort,
   KernelEffectPort,
   KernelContextPort,
   KernelProjectionPort {
@@ -578,6 +600,8 @@ export class SqliteKernelStore implements
     expires_at: string;
   }): Promise<LeasedEffectView | null> {
     return this.#db.transaction(() => {
+      const now = this.#now();
+      this.#recoverExpiredEffectLeases(now);
       const replay = this.#db.prepare("SELECT * FROM effects WHERE lease_id = ?")
         .get(input.lease_id) as EffectRow | undefined;
       if (replay) {
@@ -599,7 +623,7 @@ export class SqliteKernelStore implements
           AND e.lease_id IS NULL AND e.available_at <= ?
         ORDER BY e.available_at, e.id
         LIMIT 1
-      `).get(this.#now()) as EffectRow | undefined;
+      `).get(now) as EffectRow | undefined;
       if (!row) return null;
       const executionMode: LeasedEffectView["execution_mode"] = row.status === "unknown"
         ? "reconcile_only"
@@ -610,7 +634,7 @@ export class SqliteKernelStore implements
             lease_execution_mode = ?, unknown_detail = NULL, attempt_count = attempt_count + 1,
             version = version + 1, updated_at = ?
         WHERE id = ? AND version = ? AND lease_id IS NULL AND status IN ('pending', 'unknown')
-      `).run(input.lease_id, input.worker_id, input.expires_at, executionMode, this.#now(), row.id, row.version);
+      `).run(input.lease_id, input.worker_id, input.expires_at, executionMode, now, row.id, row.version);
       if (changed.changes !== 1) throw new Error(`effect ${row.id} lease compare-and-set failed`);
       this.#advanceRunFence(row.pipeline_run_id, `effect-lease:${input.lease_id}`, {
         effect_id: row.id,
@@ -622,6 +646,38 @@ export class SqliteKernelStore implements
         lease_id: input.lease_id,
         expires_at: input.expires_at,
         execution_mode: executionMode,
+      };
+    }).immediate();
+  }
+
+  async markLeasedEffectDispatchStarted(input: {
+    effect_id: string;
+    lease_id: string;
+    worker_id: string;
+  }): Promise<LeasedEffectView> {
+    return this.#db.transaction(() => {
+      const row = this.#db.prepare("SELECT * FROM effects WHERE id = ?")
+        .get(input.effect_id) as EffectRow | undefined;
+      if (
+        !row || row.status !== "processing" || row.lease_id !== input.lease_id ||
+        row.lease_worker_id !== input.worker_id || row.lease_execution_mode === null ||
+        row.lease_expires_at === null
+      ) throw new Error("effect lease fence does not match");
+      if (row.lease_execution_mode === "dispatch_or_reconcile") {
+        const changed = this.#db.prepare(`
+          UPDATE effects
+          SET lease_execution_mode = 'reconcile_only', version = version + 1, updated_at = ?
+          WHERE id = ? AND version = ? AND status = 'processing' AND lease_id = ?
+            AND lease_worker_id = ? AND lease_execution_mode = 'dispatch_or_reconcile'
+        `).run(this.#now(), row.id, row.version, input.lease_id, input.worker_id);
+        if (changed.changes !== 1) throw new Error("effect dispatch-start compare-and-set failed");
+        this.#advanceRunFence(row.pipeline_run_id, `effect-dispatch-started:${input.lease_id}`, input);
+      }
+      return {
+        intent: this.#effectIntentById(row.id),
+        lease_id: input.lease_id,
+        expires_at: row.lease_expires_at,
+        execution_mode: "reconcile_only" as const,
       };
     }).immediate();
   }
@@ -707,6 +763,93 @@ export class SqliteKernelStore implements
         run.status,
       ),
     };
+  }
+
+  async loadAttemptRequestInputs(input: {
+    pipeline_run_id: string;
+    attempt_id: string;
+  }): Promise<KernelAttemptRequestInputs> {
+    const attempt = this.#attemptById(input.attempt_id, input.pipeline_run_id);
+    const row = this.#db.prepare(`
+      SELECT
+        w.id AS work_item_id,
+        w.request_payload_schema AS payload_schema,
+        w.request_inline_json AS inline_payload,
+        w.request_blob_algorithm AS blob_algorithm,
+        w.request_blob_digest AS blob_digest,
+        w.request_blob_bytes AS blob_bytes,
+        w.request_blob_encoding AS blob_encoding,
+        w.request_blob_media_type AS blob_media_type,
+        w.request_blob_payload_schema AS blob_payload_schema
+      FROM attempts a
+      JOIN pipeline_runs r ON r.id = a.pipeline_run_id
+      JOIN work_items w ON w.id = r.work_item_id
+      WHERE a.id = ? AND a.pipeline_run_id = ?
+    `).get(input.attempt_id, input.pipeline_run_id) as (PayloadRow & {
+      work_item_id: string;
+    }) | undefined;
+    if (!row) throw new Error(`attempt ${input.attempt_id} has no immutable work request`);
+    if (row.payload_schema !== KERNEL_WORK_REQUEST_PAYLOAD_SCHEMA) {
+      throw new Error(`work item ${row.work_item_id} does not use the kernel work request schema`);
+    }
+    const pointer = payloadPointer(row);
+    const value = pointer === null
+      ? parseJson<JsonValue>(row.inline_payload!, `work item ${row.work_item_id} payload`)
+      : parseJson<JsonValue>(
+        this.#readBlob(input.pipeline_run_id, "work_item", row.work_item_id, pointer).toString("utf8"),
+        `work item ${row.work_item_id} payload`,
+      );
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`work item ${row.work_item_id} payload must be an object`);
+    }
+    const payload = value as Record<string, JsonValue>;
+    if (
+      Object.keys(payload).sort().join(",") !== "schema,task_prompt" ||
+      payload.schema !== KERNEL_WORK_REQUEST_PAYLOAD_SCHEMA ||
+      typeof payload.task_prompt !== "string" || payload.task_prompt.length === 0
+    ) {
+      throw new Error(`work item ${row.work_item_id} payload is not a sealed kernel request`);
+    }
+    return {
+      task_prompt: payload.task_prompt,
+      context: {
+        records: this.#loadExactRecords(
+          input.pipeline_run_id,
+          attempt.context_record_ids,
+          this.#runFromRow(this.#runRow(input.pipeline_run_id)).status,
+        ),
+        checkpoints: this.#loadExactCheckpoints(
+          input.pipeline_run_id,
+          attempt.context_checkpoint_ids,
+          this.#runFromRow(this.#runRow(input.pipeline_run_id)).status,
+        ),
+      },
+    };
+  }
+
+  async loadExactDefinitionBundleBytes(input: {
+    pipeline_run_id: string;
+    definition_bundle_hash: string;
+  }): Promise<Uint8Array> {
+    const row = this.#runRow(input.pipeline_run_id);
+    if (row.definition_bundle_hash !== input.definition_bundle_hash) {
+      throw new Error("definition bundle read does not match the pipeline run fence");
+    }
+    const pointer: BlobPointer = {
+      algorithm: "sha256",
+      digest: row.definition_bundle_hash,
+      bytes: row.definition_bundle_bytes,
+      encoding: row.definition_bundle_encoding,
+      media_type: row.definition_bundle_media_type,
+      payload_schema: row.definition_bundle_payload_schema,
+    };
+    return new Uint8Array(this.#readBlob(
+      row.id,
+      "definition_bundle",
+      row.definition_bundle_hash,
+      pointer,
+      row.status,
+    ));
   }
 
   async getRunProjection(pipelineRunId: string): Promise<KernelRunProjection | undefined> {
@@ -975,17 +1118,26 @@ export class SqliteKernelStore implements
 
   #insertAttempt(attempt: KernelAttempt, now: string, workerId: string | null): void {
     const [parent, group, item, index] = this.#scopeColumns(attempt.scope);
+    const contextRecordIds = canonicalAttemptContextIds(
+      attempt.context_record_ids,
+      `attempt ${attempt.id} context_record_ids`,
+    );
+    const contextCheckpointIds = canonicalAttemptContextIds(
+      attempt.context_checkpoint_ids,
+      `attempt ${attempt.id} context_checkpoint_ids`,
+    );
     this.#db.prepare(`
       INSERT INTO attempts (
         id, pipeline_run_id, scope_kind, stage_id, parent_attempt_id, scope_group_id,
         scope_item_id, scope_item_index, repository_authority, request_hash,
-        definition_bundle_hash, input_subject, output_subject, native_session_id,
+        definition_bundle_hash, input_subject, context_record_ids_json,
+        context_checkpoint_ids_json, output_subject, native_session_id,
         status, version, work_retry_ordinal, result_correction_count,
         result_correction_deadline, unmet_dependency_count,
         lease_id, lease_worker_id, lease_purpose, lease_expires_at, lease_started,
         checkpoint_id, result_record_id, pending_candidate_hash, pending_diagnostics_json,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       attempt.id,
       attempt.pipeline_run_id,
@@ -999,6 +1151,8 @@ export class SqliteKernelStore implements
       attempt.request_hash,
       attempt.definition_bundle_hash,
       attempt.input_subject,
+      canonicalJson(contextRecordIds),
+      canonicalJson(contextCheckpointIds),
       attempt.output_subject,
       attempt.native_session_id,
       attempt.status,
@@ -1026,6 +1180,18 @@ export class SqliteKernelStore implements
       .get(attempt.id, runId) as AttemptRow | undefined;
     if (!existing) throw new Error(`unknown attempt ${attempt.id}`);
     const [parent, group, item, index] = this.#scopeColumns(attempt.scope);
+    const contextRecordIds = canonicalAttemptContextIds(
+      attempt.context_record_ids,
+      `attempt ${attempt.id} context_record_ids`,
+    );
+    const contextCheckpointIds = canonicalAttemptContextIds(
+      attempt.context_checkpoint_ids,
+      `attempt ${attempt.id} context_checkpoint_ids`,
+    );
+    if (
+      existing.context_record_ids_json !== canonicalJson(contextRecordIds) ||
+      existing.context_checkpoint_ids_json !== canonicalJson(contextCheckpointIds)
+    ) throw new Error(`attempt ${attempt.id} cannot change its context bindings`);
     if (
       attempt.lease && existing.lease_id === attempt.lease.id &&
       existing.lease_worker_id !== attempt.lease.worker_id
@@ -1317,6 +1483,37 @@ export class SqliteKernelStore implements
       WHERE id = ? AND pipeline_run_id = ? AND status IN ('pending', 'processing', 'unknown')
     `).run(this.#now(), effectId, runId);
     if (changed.changes !== 1) throw new Error(`effect ${effectId} cannot be canceled from its current fence`);
+  }
+
+  #recoverExpiredEffectLeases(now: string): void {
+    const expired = this.#db.prepare(`
+      SELECT * FROM effects
+      WHERE status = 'processing' AND lease_id IS NOT NULL AND lease_expires_at <= ?
+      ORDER BY pipeline_run_id, id
+    `).all(now) as EffectRow[];
+    for (const row of expired) {
+      const reconcileOnly = row.lease_execution_mode === "reconcile_only";
+      const changed = this.#db.prepare(`
+        UPDATE effects
+        SET status = ?, lease_id = NULL, lease_worker_id = NULL, lease_expires_at = NULL,
+          lease_execution_mode = NULL, unknown_detail = ?, version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ? AND status = 'processing' AND lease_id = ?
+          AND lease_expires_at <= ?
+      `).run(
+        reconcileOnly ? "unknown" : "pending",
+        reconcileOnly ? "provider dispatch may have started before the effect lease expired" : null,
+        now,
+        row.id,
+        row.version,
+        row.lease_id,
+        now,
+      );
+      if (changed.changes !== 1) throw new Error(`effect ${row.id} expiry recovery compare-and-set failed`);
+      this.#advanceRunFence(row.pipeline_run_id, `effect-expired:${row.lease_id}`, {
+        effect_id: row.id,
+        recovered_status: reconcileOnly ? "unknown" : "pending",
+      });
+    }
   }
 
   #effectIntentById(id: string): EffectIntent {
