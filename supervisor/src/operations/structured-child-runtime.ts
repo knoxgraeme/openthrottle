@@ -345,9 +345,12 @@ function commandPlanForUnits(input: {
   units: Array<{ id: string; dependencies: readonly string[]; commandNames: string[] }>;
 } {
   const planCommandNames = uniqueInOrder(input.plan.commands.map((command) => command.name));
+  const availableFallbackCommandNames = input.fallbackCommandNames.filter((commandName) =>
+    input.configuredCommandNames.has(commandName)
+  );
   const graphCommandNames = planCommandNames.length > 0
     ? planCommandNames
-    : [...input.fallbackCommandNames];
+    : availableFallbackCommandNames;
   for (const commandName of graphCommandNames) {
     if (!input.configuredCommandNames.has(commandName)) {
       throw new Error(`execution plan command ${commandName} is not configured in the sealed repository config`);
@@ -368,7 +371,7 @@ function commandPlanForUnits(input: {
       dependencies: unit.depends_on,
       commandNames: input.plan.commands.length > 0
         ? uniqueInOrder(commandNamesByUnit.get(unit.id) ?? [])
-        : [...input.fallbackCommandNames],
+        : [...availableFallbackCommandNames],
     })),
   };
 }

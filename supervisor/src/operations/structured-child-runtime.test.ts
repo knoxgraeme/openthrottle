@@ -1167,6 +1167,87 @@ describe("structured child runtime command seeding", () => {
     }));
   });
 
+  it("seeds no commands when the plan and sealed repository command inventory are empty", () => {
+    const createGraph = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {} as any,
+      store: {
+        getRepositoryConfigSnapshot: () => ({
+          digest: "config-digest",
+          normalized_config: canonicalJson({ commands: {} }),
+        }),
+        createGraph,
+      } as any,
+    });
+
+    childRuntime.seedCompositeGraph(
+      instance as any,
+      request({ ...executionPlan, commands: [] }) as any,
+      "a".repeat(40)
+    );
+
+    expect(createGraph).toHaveBeenCalledWith(expect.objectContaining({
+      commandNames: [],
+      units: [
+        { id: "unit_a", dependencies: [], commandNames: [] },
+        { id: "unit_b", dependencies: [], commandNames: [] },
+      ],
+    }));
+  });
+
+  it("uses only automatic command fallbacks present in the sealed repository config", () => {
+    const createGraph = vi.fn();
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {} as any,
+      store: {
+        getRepositoryConfigSnapshot: () => ({
+          digest: "config-digest",
+          normalized_config: canonicalJson({ commands: { test: "npm test" } }),
+        }),
+        createGraph,
+      } as any,
+    });
+
+    childRuntime.seedCompositeGraph(
+      instance as any,
+      request({ ...executionPlan, commands: [] }) as any,
+      "a".repeat(40)
+    );
+
+    expect(createGraph).toHaveBeenCalledWith(expect.objectContaining({
+      commandNames: ["test"],
+      units: [
+        { id: "unit_a", dependencies: [], commandNames: ["test"] },
+        { id: "unit_b", dependencies: [], commandNames: ["test"] },
+      ],
+    }));
+  });
+
+  it("rejects an explicit plan command absent from the sealed repository config", () => {
+    const childRuntime = createStructuredChildRuntime({
+      now: () => new Date("2099-07-22T12:00:00.000Z"),
+      taskTimeoutSeconds: 300,
+      runtime: {} as any,
+      store: {
+        getRepositoryConfigSnapshot: () => ({
+          digest: "config-digest",
+          normalized_config: canonicalJson({ commands: { test: "npm test" } }),
+        }),
+        createGraph: vi.fn(),
+      } as any,
+    });
+
+    expect(() => childRuntime.seedCompositeGraph(
+      instance as any,
+      request(executionPlan) as any,
+      "a".repeat(40)
+    )).toThrow("execution plan command docs-check is not configured in the sealed repository config");
+  });
+
   it("seeds the strictest repeated loop-backed phase rounds as the durable unit repair budget", () => {
     const createGraph = vi.fn();
     const childRuntime = createStructuredChildRuntime({
