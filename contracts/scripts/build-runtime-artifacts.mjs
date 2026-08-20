@@ -51,6 +51,9 @@ const compilerEnvironment = await import(
 const platformCatalog = await import(
   pathToFileURL(join(contractsRoot, "dist/platform-definition-catalog.js")).href
 );
+const definitionRelease = await import(
+  pathToFileURL(join(contractsRoot, "dist/definition-release.js")).href
+);
 const artifacts = new Map();
 
 for (const file of ["canonical.js", "validation.js", "result-candidate.js"]) {
@@ -123,6 +126,14 @@ const definitionCatalog = {
   catalog_digest: canonical.digestCanonicalJson(catalogContent),
 };
 platformCatalog.validatePlatformDefinitionCatalog(definitionCatalog);
+if (
+  definitionCatalog.catalog_digest !==
+  definitionRelease.RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST
+) {
+  throw new Error(
+    "source-derived platform catalog differs from the compiled release trust anchor",
+  );
+}
 writeOrCheck(
   "platform-definition-catalog.json",
   Buffer.from(`${canonical.canonicalJson(definitionCatalog)}\n`, "utf8"),
@@ -153,6 +164,14 @@ const environment = {
   environment_digest: canonical.digestCanonicalJson(environmentContent),
 };
 compilerEnvironment.validateCompilerEnvironmentDescriptor(environment);
+if (
+  environment.environment_digest !==
+  definitionRelease.RELEASE_COMPILER_ENVIRONMENT_DIGEST
+) {
+  throw new Error(
+    "source-derived compiler environment differs from the compiled release trust anchor",
+  );
+}
 writeOrCheck(
   "compiler-environment.json",
   Buffer.from(`${canonical.canonicalJson(environment)}\n`, "utf8"),

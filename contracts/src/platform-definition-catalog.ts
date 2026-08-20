@@ -175,21 +175,26 @@ export function verifyPlatformDefinitionSource(
     if (file === undefined) {
       fail("platform.files", `missing catalog file ${catalogFile.path}`);
     }
-    if (file.type !== "file") {
+    const fileType = file.type;
+    if (fileType !== "file") {
       fail(catalogFile.path, "must be a regular file; symlinks and non-files are forbidden");
     }
-    if (!(file.content instanceof Uint8Array)) {
+    const content = file.content;
+    if (!(content instanceof Uint8Array)) {
       fail(catalogFile.path, "platform trust requires raw Uint8Array content");
     }
-    if (file.content.byteLength !== catalogFile.byte_size) {
+    // Snapshot once before checking. Accessor-backed inputs and shared buffers
+    // must not let verification hash one value and retain another.
+    const contentSnapshot = new Uint8Array(content);
+    if (contentSnapshot.byteLength !== catalogFile.byte_size) {
       fail(catalogFile.path, "byte size does not match the platform catalog");
     }
-    if (digestNormalized(file.content) !== catalogFile.sha256) {
+    if (digestNormalized(contentSnapshot) !== catalogFile.sha256) {
       fail(catalogFile.path, "sha256 does not match the platform catalog");
     }
     trustedFiles.set(catalogFile.path, {
       type: "file",
-      content: new Uint8Array(file.content),
+      content: contentSnapshot,
     });
   }
   const catalogSnapshot = (): PlatformDefinitionCatalog => {

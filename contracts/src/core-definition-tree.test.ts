@@ -4,6 +4,8 @@ import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   CORE_SEMANTIC_RESULT_SCHEMAS,
+  RELEASE_COMPILER_ENVIRONMENT_DIGEST,
+  RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
   compileDefinitionBundle,
   verifyCompilerEnvironment,
   verifyPlatformDefinitionSource,
@@ -89,7 +91,11 @@ function definitionFiles(): Map<string, VirtualDefinitionFile> {
 
 function sealedPlatform(files = definitionFiles()): TrustedPlatformDefinitionSource {
   files.delete(".openthrottle/config.yml");
-  return verifyPlatformDefinitionSource(platformCatalog, files, platformCatalog.catalog_digest);
+  return verifyPlatformDefinitionSource(
+    platformCatalog,
+    files,
+    RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
+  );
 }
 
 function compile(pipelineId: (typeof pipelineIds)[number]) {
@@ -111,7 +117,7 @@ function compile(pipelineId: (typeof pipelineIds)[number]) {
     platform: sealedPlatform(files),
     compiler_environment: verifyCompilerEnvironment(
       compilerEnvironmentDescriptor,
-      compilerEnvironmentDescriptor.environment_digest,
+      RELEASE_COMPILER_ENVIRONMENT_DIGEST,
     ),
     selected_pipeline: `core/${pipelineId}`,
   });
