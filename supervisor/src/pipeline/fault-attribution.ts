@@ -27,7 +27,7 @@ const NON_FAULT_OUTCOMES = new Set<StageOutcome>([
   "superseded",
 ]);
 
-// The closed vocabulary for runs.fault_attribution (see migration 28). Grown
+// The closed vocabulary for runs.fault_attribution in the epoch-1 baseline. Grown
 // bottom-up per incident, mirroring the GATE_RECEIPT_REASONS/
 // LAUNCH_FAILURE_REASONS pattern: every value here must already be produced
 // by deriveStageFaultAttribution below or a call site that stamps it directly.

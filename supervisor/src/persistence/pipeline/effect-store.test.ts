@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { digestNormalized } from "../../pipeline/manifest.js";
 import { runtime, setupPipelineStore, shippedCatalogPath, ticket } from "../../__fixtures__/pipeline-store.js";
-import { databaseMigrations } from "../migrations/runner.js";
 
 describe("pipeline effect store", () => {
   let db: Database.Database | undefined;
@@ -333,38 +332,4 @@ describe("pipeline effect store", () => {
     )).toEqual([expect.objectContaining({ id: "cleanup-after-dead-checkpoint", kind: "cleanup" })]);
   });
 
-  it("backfills an active pre-v53 write pipeline before it can continue", () => {
-    const setup = setupPipelineStore(":memory:", shippedCatalogPath);
-    db = setup.db;
-    const { tickets, pipelines, catalog, snapshot } = setup;
-    const manifest = catalog.manifests.get("core/implement@4")!;
-    tickets.upsert({
-      ...ticket("pre-v53-active-session"),
-      pipeline: {
-        repository: "owner/repo",
-        baseCommit: "a".repeat(40),
-        manifest,
-        repositoryConfig: snapshot,
-        runtime,
-        authorizedCapabilities: manifest.manifest.requires.capabilities,
-        taskType: "implement",
-        planDigest: "c".repeat(64),
-      },
-    });
-    const instance = pipelines.getInstanceForSession("pre-v53-active-session")!;
-    db.prepare("DELETE FROM pipeline_effect_intents WHERE pipeline_instance_id = ?").run(instance.id);
-    db.prepare("DELETE FROM pipeline_task_branches WHERE pipeline_instance_id = ?").run(instance.id);
-
-    databaseMigrations.find((migration) => migration.version === 53)!.up(db);
-
-    expect(pipelines.getTaskBranch(instance.id)).toMatchObject({
-      pipeline_instance_id: instance.id,
-      base_sha: instance.base_commit,
-      acknowledged_remote_sha: null,
-      status: "pending",
-    });
-    expect(pipelines.listEffects(instance.id)).toEqual([
-      expect.objectContaining({ kind: "create_task_branch", status: "pending" }),
-    ]);
-  });
 });

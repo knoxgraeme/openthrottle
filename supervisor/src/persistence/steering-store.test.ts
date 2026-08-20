@@ -42,9 +42,6 @@ describe("steering store", () => {
       body: "Please check the edge case.",
     });
     expect(steer).toMatchObject({ id: "steer-1", status: "pending" });
-    expect(db.prepare("SELECT COUNT(*) FROM session_inbox").pluck().get()).toBe(0);
-    expect(db.prepare("SELECT COUNT(*) FROM work_items").pluck().get()).toBe(0);
-    expect(db.prepare("SELECT COUNT(*) FROM work_deliveries").pluck().get()).toBe(0);
     expect(store.listPendingInbox("issue-1")).toHaveLength(1);
     expect(store.cancelPendingInbox("issue-1")).toBe(1);
     expect(store.listPendingInbox("issue-1")).toHaveLength(0);

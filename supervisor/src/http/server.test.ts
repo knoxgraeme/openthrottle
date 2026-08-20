@@ -341,10 +341,12 @@ describe("coordinator-only server", () => {
       snapshot: "snapshot",
       cutover: null,
       database: {
-        migrationRollbackCompatibility: {
-          contract: "schema-migrations-name-additive-rollback-compatible/v1",
-          markerField: "schema_migrations.name",
-          markerSuffix: " [rollback-compatible:additive/v1]",
+        schemaEpoch: {
+          contract: "openthrottle.schema-epoch/v1",
+          current: 1,
+          baselineName: "schema-epoch-1-baseline",
+          baselineChecksum: expect.stringMatching(/^[a-f0-9]{64}$/),
+          applicationSha: "development",
         },
       },
       drain: { clear: true, blockers: [], truncated: false },

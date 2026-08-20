@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
@@ -67,12 +67,13 @@ const analysisSurfaceModules = new Set([
   "persistence/pipeline/analysis-store.ts",
 ]);
 
-// OPE-177 cut steering over to steering_items as its sole owner. The former
-// WorkStore remains only as legacy history exercised by its own migration
-// tests; no production module may resume advancing that retired state machine.
-const legacyHistoryModules = new Set([
-  "persistence/work-store.ts",
-]);
+const retiredPersistenceObjects = [
+  "session_inbox",
+  "work_items",
+  "work_deliveries",
+  "run_stage_bindings",
+  "pipeline_work_bindings",
+] as const;
 
 // Named entry points only -- everything each one pulls in transitively
 // (walked below by decisionSurfaceClosure) is covered automatically, so this
@@ -313,9 +314,6 @@ function findArchitectureViolations(modules: SourceModule[]): string[] {
         if (decisionSurface.has(rel) && analysisSurfaceModules.has(toRel)) {
           violations.push(`${rel}: gate/transition/scheduler/effect-drain code may not import the read-only analysis surface ${toRel}`);
         }
-        if (legacyHistoryModules.has(toRel)) {
-          violations.push(`${rel}: production code may not import legacy history module ${toRel}`);
-        }
         if (boundary === "root" && rel === "index.ts") continue;
         const allowed = allowedEdges.get(boundary)?.has(toBoundary) ?? false;
         const exceptionKey = `${boundary}->${toBoundary}:${toRel}`;
@@ -355,6 +353,14 @@ function findArchitectureViolations(modules: SourceModule[]): string[] {
         }
       }
     }
+
+    for (const literal of collectStringLiterals(module)) {
+      for (const object of retiredPersistenceObjects) {
+        if (new RegExp(`\\b${object}\\b`).test(literal)) {
+          violations.push(`${rel}: retired persistence object ${object} has a production consumer`);
+        }
+      }
+    }
   }
   return violations;
 }
@@ -362,6 +368,7 @@ function findArchitectureViolations(modules: SourceModule[]): string[] {
 describe("supervisor source architecture", () => {
   it("keeps production modules inside their owning boundaries", () => {
     expect(findArchitectureViolations(productionSources())).toEqual([]);
+    expect(existsSync(path.join(sourceRoot, "persistence", "work-store.ts"))).toBe(false);
   });
 
   it("rejects representative forbidden dependencies", () => {
@@ -373,7 +380,7 @@ describe("supervisor source architecture", () => {
       { file: path.join(sourceRoot, "shared", "bad-domain.ts"), source: "import '../pipeline/store.js';" },
       { file: path.join(sourceRoot, "providers", "linear", "bad-sibling.ts"), source: "import '../github/client.js';" },
       { file: path.join(sourceRoot, "operations", "bad-sql.ts"), source: "export const sql = 'SELECT * FROM runs';" },
-      { file: path.join(sourceRoot, "persistence", "bad-legacy-work.ts"), source: "import './work-store.js';" },
+      { file: path.join(sourceRoot, "persistence", "bad-retired-table.ts"), source: "export const sql = 'SELECT * FROM work_items';" },
       { file: path.join(sourceRoot, "__fixtures__", "helper.ts"), source: "export const fixture = true;" },
       { file: path.join(sourceRoot, "app", "bad-fixture.ts"), source: "import '../__fixtures__/helper.js';" },
       // Same paths as two real decision-surface modules, with fake content:
@@ -417,7 +424,7 @@ describe("supervisor source architecture", () => {
         "shared/bad-domain.ts: shared may not import pipeline module pipeline/store.ts",
         "providers/linear/bad-sibling.ts: provider linear may not import provider github module providers/github/client.ts",
         "operations/bad-sql.ts: runs/run_liveness SQL is confined to persistence",
-        "persistence/bad-legacy-work.ts: production code may not import legacy history module persistence/work-store.ts",
+        "persistence/bad-retired-table.ts: retired persistence object work_items has a production consumer",
         "app/bad-fixture.ts: production module imports test fixture __fixtures__/helper.ts",
         "persistence/pipeline/transition-store.ts: gate/transition/scheduler/effect-drain code may not import the read-only analysis surface persistence/pipeline/analysis-store.ts",
         "operations/pipeline-effects.ts: gate/transition/scheduler/effect-drain code may not import the read-only analysis surface persistence/pipeline/analysis-store.ts",

@@ -66,8 +66,11 @@ import type { AnalysisStore } from "../persistence/pipeline/analysis-store.js";
 import type { CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
 import type { AdmissionDrainStore } from "../persistence/admission-drain-store.js";
 import {
-  MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT,
-  ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+  currentApplicationSha,
+  databaseMigrations,
+  SCHEMA_BASELINE_NAME,
+  SCHEMA_EPOCH,
+  SCHEMA_EPOCH_CONTRACT,
 } from "../persistence/migrations/runner.js";
 import type { RuntimeInventory, RuntimeLogs, RuntimeSnapshotReadiness } from "../runtime/contracts.js";
 import { executeRawCitationGate } from "./citation-executor.js";
@@ -628,10 +631,12 @@ export function createServer(deps: ServerDeps): Hono {
       snapshot: cfg.daytonaSnapshot,
       cutover: store.getOpenDeploymentCutover() ?? null,
       database: {
-        migrationRollbackCompatibility: {
-          contract: MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT,
-          markerField: "schema_migrations.name",
-          markerSuffix: ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
+        schemaEpoch: {
+          contract: SCHEMA_EPOCH_CONTRACT,
+          current: SCHEMA_EPOCH,
+          baselineName: SCHEMA_BASELINE_NAME,
+          baselineChecksum: databaseMigrations[0]!.checksum,
+          applicationSha: currentApplicationSha(),
         },
       },
       drain,

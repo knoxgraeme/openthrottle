@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { setupPipelineStore, ticket } from "../__fixtures__/pipeline-store.js";
 import { openDb } from "./database.js";
 import { createSupervisorStore, type SupervisorStore } from "./store.js";
-import { createWorkStore } from "./work-store.js";
 
 describe("run store", () => {
   let db: ReturnType<typeof openDb>;
@@ -127,45 +126,6 @@ describe("run store", () => {
     store.finishRun({ runId: "run-direct-steering", status: "completed" });
 
     expect(store.getInbox("steer-direct")?.status).toBe("canceled");
-  });
-
-  it("leaves retired WorkStore history untouched during run settlement", () => {
-    expect(store.beginRun({
-      issueId: "issue-1",
-      runId: "run-legacy-history",
-      taskType: "implement",
-      tokenHash: "a".repeat(64),
-      expiresAt: "2026-07-23T00:00:00.000Z",
-    })).toBe(true);
-    const legacy = createWorkStore(db);
-    const item = legacy.enqueue({
-      id: "legacy-steer",
-      issueId: "issue-1",
-      sessionId: "session-1",
-      generation: 1,
-      contextRevision: 0,
-      source: "operator",
-      body: "retained migration history",
-    });
-    const binding = {
-      issueId: "issue-1",
-      sessionId: "session-1",
-      runId: "run-legacy-history",
-      nativeSessionId: null,
-      generation: 1,
-      contextRevision: 0,
-    };
-    const delivery = legacy.lease({
-      ...binding,
-      workItemId: item.id,
-      leaseUntil: "2099-01-01T00:00:00.000Z",
-    });
-    legacy.markDispatched(delivery.id, binding);
-
-    store.finishRun({ runId: "run-legacy-history", status: "completed" });
-
-    expect(legacy.get(item.id)?.status).toBe("dispatched");
-    expect(legacy.getDelivery(delivery.id)?.status).toBe("dispatched");
   });
 
   it("settles run-bound steering immediately when a reaper finishes its claim", () => {

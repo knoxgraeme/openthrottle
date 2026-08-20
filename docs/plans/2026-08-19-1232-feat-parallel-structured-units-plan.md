@@ -10,6 +10,33 @@ execution: code
 
 # Parallel Structured Units
 
+## Phase 3A persistence prerequisite: schema epoch 1
+
+Phase 3A starts only after the dogfood supervisor is reset onto the single
+`schema-epoch-1-baseline`. The baseline is valid only for an empty SQLite file;
+epoch-1 code rejects the old file and old code rejects the epoch-1 authority.
+It omits `session_inbox`, `work_items`, `work_deliveries`,
+`run_stage_bindings`, `pipeline_work_bindings`, and the dead WorkStore path.
+Any later table must own a distinct durable lifecycle, an indexed query/CAS
+invariant, or an independent retention boundary; otherwise its state stays on
+the existing owner row.
+
+The cutover is authenticated with `OT_DEPLOY_TOKEN`: pause admission and retain
+the maintenance epoch; drain all actors, leases, effects, webhook work, and
+cleanup; prove no live Daytona resource or writable task-branch transport;
+inventory every retained worktree/task/quarantine ref; stop the sole SQLite
+writer; and seal an immutable database-plus-exact-WAL backup with sha256s and
+the running application SHA. Export/import only the typed inventory of the four
+operator credential settings and `repository_registrations`, or re-onboard.
+No ticket, run, session, transport, effect, or evidence history is copied.
+Webhook and runtime rows carry schema epoch 1, and delayed epoch-0 events are
+rejected before admission resumes.
+
+Rollback before the first epoch-1 operational write pairs only the matching old
+application SHA and sealed old database/WAL bundle. After the first new write,
+the old pair cannot be restored; recovery uses controls or another authenticated,
+drained fresh reset. Old/new code and database generations are never mixed.
+
 ## Goal capsule
 
 | Field | Decision |
@@ -224,16 +251,20 @@ introduce a parallel scheduler beside review fanout or an agent-owned scheduler.
   repair round; the action is leased and dispatched only after the mutex is
   acquired. The blocked phase and mutex owner are visible.
 - **R12 Gather barrier.** Implementation, simplification, command, and candidate
-  production may advance concurrently. In a multi-member wave every produced candidate transitions
-  through `produced -> checkpoint_pending -> checkpointed_unaccepted` before
-  local action cleanup. The quarantine receipt is recovery evidence only. Once
-  every selected member is checkpointed or terminal, each candidate is restored
+  production may advance concurrently. Every member follows the single durable
+  lifecycle `ready -> dispatched -> candidate_ready -> locally_committed_unaccepted
+  -> acceptance_pending -> accepted|rejected|needs_human`, followed by
+  `accepted -> integration_pending -> integrated`. A bounded semantic repair
+  transitions `rejected -> ready`; a bounded integration-conflict repair
+  transitions `integration_pending -> ready` without consuming semantic budget.
+  In a multi-member wave the quarantine receipt durably proves
+  `locally_committed_unaccepted` before local action cleanup. Once every selected
+  member has that proof or is terminal, each candidate is restored
   by exact checkpoint repo/ref/SHA into a fresh fenced read-only acceptance
   action context in the same parent sandbox. The supervisor
   re-verifies its base, tree, claims, and quarantine receipt before unit lead
   acceptance runs serially in persisted wave order. Acceptance and any revision
-  receipt bind the restored checkpoint receipt and exact subject, producing
-  `accepted|rejected|needs_human`. Integration
+  receipt bind the restored checkpoint receipt and exact subject. Integration
   begins only after the wave outcome policy permits it. A same-wave
   downstream-context update targeting an
   already dispatched sibling is rejected with a typed
@@ -242,6 +273,11 @@ introduce a parallel scheduler beside review fanout or an agent-owned scheduler.
   worktree through lead acceptance and the existing accepted task-branch
   checkpoint acknowledgement; it performs no unaccepted-candidate transport or
   pre-acceptance cleanup.
+  Every first dispatch is fenced to the wave's immutable common task-branch
+  base. A semantic repair is fenced to the exact rejected candidate it corrects.
+  An integration-conflict repair is fenced instead to the then-current accepted
+  task-branch head. No restart, sibling completion, or provider branch movement
+  may substitute another base.
 - **R13 Candidate quarantine transport.** One supervisor installation/profile
   eligible for cap-above-1 execution names a private checkpoint repository ID.
   It cannot equal any registered target repo; startup and admission verify
@@ -583,8 +619,8 @@ flowchart TD
   D --> E[Shared durable fanout controller]
   E --> E1[Writer action + worktree U1]
   E --> E2[Writer action + worktree U2]
-  E1 --> F1[Checkpointed unaccepted candidate U1]
-  E2 --> F2[Checkpointed unaccepted candidate U2]
+  E1 --> F1[Locally committed unaccepted candidate U1]
+  E2 --> F2[Locally committed unaccepted candidate U2]
   F1 --> G[Gather barrier]
   F2 --> G
   G --> H[Serial lead acceptance in persisted order]
@@ -598,24 +634,22 @@ flowchart TD
 
 ```mermaid
 stateDiagram-v2
-  [*] --> planned
-  planned --> blocked: phase mutex unavailable; wave slot reserved
-  planned --> dispatched: mutex and action lease acquired
-  blocked --> dispatched: mutex and action lease acquired
+  [*] --> ready
+  ready --> dispatched: fenced action leased
   dispatched --> candidate_ready: executor derives candidate
-  candidate_ready --> checkpointed_unaccepted: quarantine ref acknowledged
-  checkpointed_unaccepted --> accepted: serial lead accepts
-  checkpointed_unaccepted --> failed: lead rejects or needs human
-  dispatched --> exited: stop, supersede, or confirmed absence
-  dispatched --> failed: boundary or exhausted action failure
-  accepted --> integrating: persisted wave order reached
-  integrating --> integrated: replay and task-branch CAS acknowledged
-  integrating --> repair_pending: replay conflict
-  repair_pending --> dispatched: fresh fenced action on current head
-  repair_pending --> failed: repair budget exhausted
+  candidate_ready --> locally_committed_unaccepted: exact local commit recorded
+  locally_committed_unaccepted --> acceptance_pending: quarantine/retained-worktree proof
+  acceptance_pending --> accepted: serial lead accepts
+  acceptance_pending --> rejected: semantic repair requested
+  acceptance_pending --> needs_human: lead cannot decide safely
+  rejected --> ready: semantic repair budget reserved; base is rejected candidate
+  rejected --> [*]: repair not requested or budget exhausted
+  accepted --> integration_pending: persisted wave order reached
+  integration_pending --> integrated: replay and task-branch CAS acknowledged
+  integration_pending --> ready: integration-conflict budget reserved; base is current task head
+  integration_pending --> needs_human: integration-conflict budget exhausted
   integrated --> [*]
-  exited --> [*]
-  failed --> [*]
+  needs_human --> [*]
 ```
 
 ### Dependency strategy

@@ -695,19 +695,6 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
     const requestedUnitPhases = phaseProjection.unitPhases.length > 0 ? phaseProjection.unitPhases : persistedUnitPhases;
     const expectedUnitPhases = canonicalJson(requestedUnitPhases);
     const expectedUnitPhaseBindings = canonicalJson([...phaseProjection.unitPhaseBindings]);
-    const legacyBuiltinUnitPhasesReplay =
-      persistedUnitPhases.length === 0 &&
-      expectedUnitPhases === canonicalJson(phaseSequenceOf(existing));
-    const unitPhaseBindingsMigratedAt = (db.prepare(
-      "SELECT applied_at FROM schema_migrations WHERE version = 21"
-    ).get() as { applied_at: string } | undefined)?.applied_at;
-    const legacyUnboundPhaseReplay =
-      existing.unit_phase_bindings === "[]" &&
-      unitPhaseBindingsMigratedAt !== undefined &&
-      existing.created_at < unitPhaseBindingsMigratedAt &&
-      phaseProjection.unitPhaseBindings.length > 0 &&
-      (existing.unit_phases === expectedUnitPhases || legacyBuiltinUnitPhasesReplay) &&
-      existing.command_names === expectedCommandNames;
     const expectedMaxRepairRounds = input.maxRepairRounds ?? DEFAULT_MAX_REPAIR_ROUNDS;
     if (
       existing.pipeline_instance_id !== input.pipelineInstanceId ||
@@ -717,8 +704,8 @@ export function createExecutionUnitStore(db: Database.Database, now: () => strin
       existing.plan_digest !== input.planDigest ||
       (input.initialSubject !== undefined && existing.initial_subject !== input.initialSubject) ||
       existing.command_names !== expectedCommandNames ||
-      (existing.unit_phases !== expectedUnitPhases && !legacyBuiltinUnitPhasesReplay) ||
-      (existing.unit_phase_bindings !== expectedUnitPhaseBindings && !legacyUnboundPhaseReplay) ||
+      existing.unit_phases !== expectedUnitPhases ||
+      existing.unit_phase_bindings !== expectedUnitPhaseBindings ||
       existing.max_repair_rounds !== expectedMaxRepairRounds
     ) {
       throw new Error(`execution graph ${existing.id} replay fence mismatch`);

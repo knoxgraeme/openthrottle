@@ -22,8 +22,8 @@ export function createSettingsStore(db: Database.Database): SettingsStore {
       for (const entry of entries) setSettingStmt.run(entry.key, entry.value, timestamp);
     }
   );
-  // Rows written before migration 47 (or by a rolled-back predecessor release)
-  // carry a NULL updated_at; they are conservatively retained until rewritten.
+  // A manually restored configuration row may carry a NULL timestamp; retain
+  // it conservatively until a typed write stamps it.
   const pruneSettingsStmt = db.prepare(`
     DELETE FROM settings
     WHERE key >= ? AND key < ?

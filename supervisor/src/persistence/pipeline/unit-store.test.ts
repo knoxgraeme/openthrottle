@@ -360,17 +360,14 @@ describe("execution unit store", () => {
       units: [{ id: "a" }],
       unitPhaseBindings: builtinUnitPhaseBindings([]),
     });
-    const migration = db!.prepare("SELECT applied_at FROM schema_migrations WHERE version = 21").get() as { applied_at: string };
-    const currentSchemaCreatedAt = new Date(Date.parse(migration.applied_at) + 1000).toISOString();
     db!.prepare(`
       UPDATE execution_graphs
-      SET unit_phases = ?, command_names = ?, unit_phase_bindings = ?, created_at = ?
+      SET unit_phases = ?, command_names = ?, unit_phase_bindings = ?
       WHERE parent_attempt_id = ?
     `).run(
       canonicalJson(["implement", "candidate", "lead", "integrate"]),
       canonicalJson([]),
       canonicalJson([]),
-      currentSchemaCreatedAt,
       "attempt-parent"
     );
 

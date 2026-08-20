@@ -974,14 +974,12 @@ SQLite is the authority. Core tables include:
 - cross-run orchestration history: `orchestration_journal`;
 - settlement rollup measurement corpus: `run_outcomes`;
 - operations: `repository_registrations`, `supervisor_leases`, `settings`,
-  `schema_migrations`, `migration_reconciliation`.
+  `schema_authority`, `schema_migrations`.
 
-Migration 51 makes `steering_items` the single owner of steering message,
-session/run fence, and active-delivery state. The legacy `session_inbox`,
-`work_items`, and `work_deliveries` tables remain as additive history and
-backfill inputs but receive no post-cutover steering writes. This cutover is
-deploy-forward-only by operator policy: after new steering is written, a
-pre-migration release cannot recover it from the legacy tables.
+Schema epoch 1 makes `steering_items` the single owner of steering message,
+session/run fence, and active-delivery state. `session_inbox`, `work_items`,
+`work_deliveries`, `run_stage_bindings`, and `pipeline_work_bindings` do not
+exist. The dead `WorkStore` path is not production or migration history.
 
 Each `agent_sessions` generation stores `provider_activated_at`, copied from
 the provider event that activated that generation. GitHub-controlled sessions
@@ -1131,37 +1129,59 @@ read surface) -- closing the gap the first rule alone leaves open, where a
 decision module under the `persistence` boundary could otherwise read the
 corpus with a raw query of its own and no import to catch.
 
-Schema migrations are transactional, checksum-pinned, and idempotent. Migration
-code may recognize historical direct-run rows solely to reconcile an older
-SQLite file conservatively. Such rows never participate in admission,
-selection, routing, scheduling, status summaries, or sandbox execution. New
-databases do not create the retired task-work table. Historical satellite
-tables such as `run_liveness`, `session_executions`,
-`pipeline_runtime_resources`, `run_stage_bindings`, and
-`pipeline_work_bindings` remain in immutable migrations only; live state is
-stored on the owning actor, session, instance, attempt, or work row.
+### Schema epoch 1 and dogfood reset
 
-Rollback-compatible migration cutovers use a two-release sequence. First deploy
-a supervisor that advertises
-`schema-migrations-name-additive-rollback-compatible/v1` in
-`/deployment/cutover-evidence`. Only after that evidence is live may a later
-release apply additive, rollback-compatible future migrations whose
-`schema_migrations.name` deliberately ends with
-` [rollback-compatible:additive/v1]`. Older supervisors that implement this
-contract still validate every known migration name and checksum exactly, and
-they fail closed on any unknown future row without that exact suffix or with a
-malformed suffix.
-The deploy workflow validates the complete current
-`supervisor/src/persistence/migrations/definitions.ts` catalog before every
-supervisor deployment, including `workflow_dispatch` runs. It rejects any
-post-cutover migration definition without one statically verifiable,
-double-quoted literal name carrying the marker suffix, even when that migration
-was introduced by an earlier failed deployment rather than the triggering
-diff; it pauses admission, waits for a clear drain, and requires the live pre-deploy
-supervisor's cutover evidence to expose that database contract. This preserves
-the initial precursor bootstrap while making later migration-bearing releases
-prove rollback compatibility before they open SQLite or write unmarked future
-ledger rows.
+Schema epoch 1 has exactly one checksum-pinned migration ledger row,
+`schema-epoch-1-baseline`. It is a fresh-database baseline, never an upgrade:
+the runner checks `sqlite_master` before creating any object and rejects a file
+that lacks `schema_authority` but contains any application schema. On reopen,
+code requires `schema_authority.schema_epoch = 1`, the exact baseline checksum,
+and the matching single ledger row. Old code treats an epoch-1 authority as a
+newer incompatible database, and epoch-1 code rejects an old database with no
+epoch authority. No old/new code-schema pairing is permitted.
+
+The dogfood cutover is one authenticated, auditable operation under
+`OT_DEPLOY_TOKEN`, in this order:
+
+1. Record the running application SHA and old database identity, pause admission,
+   and retain the resulting maintenance epoch as the event fence.
+2. Drain every actor, lease, webhook delivery, outbox/effect, and cleanup. The
+   drain is not clear while any Daytona resource is live, any task-branch
+   transport is writable, or any supervisor/executor writer can still mutate
+   SQLite. Inventory retained task branches, quarantine refs, and worktrees;
+   each must be deliberately retained or cleaned before proceeding.
+3. Stop the sole SQLite writer. Preserve an immutable backup bundle containing
+   the database file and its exact WAL state (the `-wal` bytes, including an
+   explicit empty-WAL digest when absent, plus the associated SQLite metadata).
+   Seal independent sha256 digests, the backup timestamp, and the exact running
+   application SHA. A plain copy of only the main database file is not a backup.
+4. Export the typed `openthrottle.schema-epoch-rehydration/v1` inventory from
+   the drained old file. Its only setting keys are `codex_auth_json`,
+   `linear_access_token`, `linear_refresh_token`, and
+   `linear_token_expires_at`; its only other rows are
+   `repository_registrations`. Operators may instead re-onboard. Tickets,
+   runs, sessions, deliveries, effects, receipts, settings projections, and all
+   other historical rows are never copied.
+5. Move the old file and WAL bundle out of the configured database path. Start
+   epoch-1 code on a new empty path, audit the schema and absent retired tables,
+   and import the typed inventory only while the new database has no historical
+   or configuration rows.
+6. Keep admission paused until event transports are rebound to epoch 1.
+   `webhook_deliveries` and `sandbox_events` carry the epoch authority; delayed
+   epoch-0 webhook/runtime work is rejected rather than replayed into the reset.
+   Resume only after a second clear drain/audit is sealed.
+
+Rollback before the first epoch-1 operational write uses only the exact old
+application SHA with its sealed old SQLite-plus-WAL backup. The new build never
+opens that file, and the old build never opens the epoch-1 file. Once any
+epoch-1 configuration or operational write is recorded, restoring the old pair
+is forbidden: recovery uses normal controls or another authenticated, drained
+fresh reset. The backup bundle remains immutable for audit in either case.
+
+Any later schema change appends from epoch 1 and must justify a table with at
+least one distinct durable lifecycle, indexed query/compare-and-set invariant,
+or independent retention boundary. Otherwise the state belongs on its existing
+owner row.
 
 Citation-backed proposal flows use a separate provider-neutral citation gate.
 `/analysis/citations/grade` is still the only production path that resolves
@@ -1260,8 +1280,30 @@ command names. If the plan declares no commands, the graph's command phase
 defaults are used for backward-compatible structured runs. A declared command
 missing from the sealed repository config fails closed before child dispatch,
 and a `not_configured` receipt for a declared unit or final command is a failed
-gate. The durable unit
-reducer advances a unit through the persisted graph-declared phase order:
+gate.
+
+The authoritative durable member lifecycle for parallel structured execution
+is:
+
+```text
+ready -> dispatched -> candidate_ready -> locally_committed_unaccepted
+      -> acceptance_pending -> accepted | rejected | needs_human
+accepted -> integration_pending -> integrated
+rejected -- semantic_repair_required with budget --> ready
+integration_pending -- integration_conflict with budget --> ready
+```
+
+`rejected` is terminal unless the persisted semantic-repair transition reserves
+another round; `needs_human` is terminal. An integration-conflict transition is
+mechanical repair, never a semantic round. The first dispatch for every member
+in a wave uses the wave's immutable common task-branch base. A semantic repair
+uses the exact rejected candidate as its base so the requested correction is
+not detached from the reviewed bytes. An integration-conflict repair uses the
+then-current accepted task-branch head, because it must resolve against work
+already integrated serially. Every base is an exact SHA in the action fence;
+restart, sibling timing, or a moving provider branch cannot replace it.
+
+The durable unit reducer advances a unit through the persisted graph-declared phase order:
 implement (or repair on re-entry), optional simplify, declared command slots,
 executor candidate derivation, lead acceptance bound to that exact candidate
 subject and its command receipts, and only then integration. A
@@ -1396,16 +1438,12 @@ after that release is installed, every push that builds a new snapshot must
 pause and drain before deploy, then verify the pinned runtime release, runtime
 digest, and exact snapshot before resuming admission. A manual cutover without
 a snapshot build must supply the exact expected snapshot explicitly.
-Every non-bootstrap cutover or supervisor deployment must also verify the live
-pre-deploy supervisor's `/deployment/cutover-evidence` includes the expected
-`schema-migrations-name-additive-rollback-compatible/v1` database contract
-and reject any post-cutover definition in the complete current catalog that
-lacks one statically verifiable, double-quoted literal name with the exact
-marker suffix before it opens and mutates SQLite. The whole-catalog check runs
-before every supervisor push or `workflow_dispatch` deployment so an unrelated
-retry cannot bypass a migration introduced by an earlier failed deployment;
-the standalone precursor release itself remains a supervisor-only bootstrap
-because its parent cannot yet advertise the contract.
+The epoch-reset deployment additionally requires live
+`/deployment/cutover-evidence` to advertise `openthrottle.schema-epoch/v1`,
+epoch `1`, the pinned baseline name/checksum, and the running application SHA.
+Those values are sealed into the backup/import audit described in "Schema epoch
+1 and dogfood reset"; a mismatch aborts before either database is opened for a
+write.
 
 Optional/defaulted:
 

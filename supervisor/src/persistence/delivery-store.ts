@@ -6,6 +6,8 @@ import {
   failPublicationReceipt,
   markQueueFailed,
 } from "./pipeline/helpers.js";
+import { assertInboundSchemaEpoch } from "./schema-epoch.js";
+import { SCHEMA_EPOCH } from "./schema.js";
 
 export interface DeliveryClaim {
   deliveryId: string;
@@ -14,6 +16,7 @@ export interface DeliveryClaim {
   action: string;
   eventName?: string;
   payload?: string;
+  schemaEpoch?: number;
 }
 
 export interface WebhookDelivery {
@@ -29,6 +32,7 @@ export interface WebhookDelivery {
   processed_at: string | null;
   last_error: string | null;
   redelivered_at: string | null;
+  schema_epoch: number;
   received_at: string;
 }
 
@@ -44,6 +48,7 @@ export interface SandboxEventRecord {
   processed_at: string | null;
   last_error: string | null;
   ingestion_diagnosed_at: string | null;
+  schema_epoch: number;
   created_at: string;
 }
 
@@ -136,6 +141,7 @@ export interface DeliveryStore {
     sandboxId: string;
     kind: "activity" | "plan" | "heartbeat" | "stage_result";
     payload: string;
+    schemaEpoch?: number;
   }): SandboxEventRecord;
   getSandboxEvent(eventId: string): SandboxEventRecord | undefined;
   claimSandboxEvent(eventId: string, nowIso: string, leaseUntilIso: string): SandboxEventRecord | undefined;
@@ -162,8 +168,8 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
   const claimDeliveryStmt = db.prepare(`
     INSERT OR IGNORE INTO webhook_deliveries (
       delivery_id, source, session_id, action, event_name,
-      payload, status, attempts, next_attempt_at, received_at
-    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+      payload, status, attempts, next_attempt_at, schema_epoch, received_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
   `);
   const getDeliveryStmt = db.prepare(
     "SELECT delivery_id AS id, * FROM webhook_deliveries WHERE delivery_id = ?"
@@ -246,8 +252,8 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
   const insertSandboxEventStmt = db.prepare(`
     INSERT OR IGNORE INTO sandbox_events (
       event_id, run_id, sandbox_id, kind, payload, status,
-      attempts, next_attempt_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+      attempts, next_attempt_at, schema_epoch, created_at
+    ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
   `);
   const getSandboxEventStmt = db.prepare("SELECT * FROM sandbox_events WHERE event_id = ?");
   const pruneSandboxEventsStmt = db.prepare(`
@@ -509,6 +515,8 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
     },
     claimDelivery(claim) {
       const receivedAt = now();
+      const schemaEpoch = claim.schemaEpoch ?? SCHEMA_EPOCH;
+      assertInboundSchemaEpoch(schemaEpoch);
       return (
         claimDeliveryStmt.run(
           claim.deliveryId,
@@ -518,6 +526,7 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
           claim.eventName ?? null,
           claim.payload ?? null,
           receivedAt,
+          schemaEpoch,
           receivedAt
         ).changes === 1
       );
@@ -612,6 +621,8 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
     },
     insertSandboxEvent(params) {
       const createdAt = now();
+      const schemaEpoch = params.schemaEpoch ?? SCHEMA_EPOCH;
+      assertInboundSchemaEpoch(schemaEpoch);
       insertSandboxEventStmt.run(
         params.eventId,
         params.runId,
@@ -619,6 +630,7 @@ export function createDeliveryStore(db: Database.Database): DeliveryStore {
         params.kind,
         params.payload,
         createdAt,
+        schemaEpoch,
         createdAt
       );
       return getSandboxEventStmt.get(params.eventId) as SandboxEventRecord;
