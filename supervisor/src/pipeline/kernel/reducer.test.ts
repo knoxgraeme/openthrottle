@@ -130,10 +130,47 @@ function attempt(options: Partial<KernelAttempt> & {
     version: options.version ?? 0,
     work_retry_ordinal: options.work_retry_ordinal ?? 0,
     result_correction_count: options.result_correction_count ?? 0,
+    result_correction_deadline: options.result_correction_deadline ?? null,
     lease: options.lease ?? null,
     checkpoint_id: options.checkpoint_id ?? null,
     result_record_id: options.result_record_id ?? null,
     pending_result: options.pending_result ?? null,
+  };
+}
+
+function claimAttempt(
+  current: KernelAttempt,
+  currentRun: KernelRun,
+  input: {
+    purpose: "work" | "result_correction";
+    leaseId: string;
+    workerId?: string;
+    expiresAt?: string;
+  },
+): { current: KernelAttempt; currentRun: KernelRun } {
+  const next: KernelAttempt = {
+    ...current,
+    version: current.version + 1,
+    result_correction_count: current.result_correction_count +
+      (input.purpose === "result_correction" ? 1 : 0),
+    lease: {
+      id: input.leaseId,
+      worker_id: input.workerId ?? "worker-1",
+      purpose: input.purpose,
+      expires_at: input.expiresAt ?? "2026-08-20T00:05:00.000Z",
+      started: false,
+    },
+  };
+  return {
+    current: next,
+    currentRun: {
+      ...currentRun,
+      version: currentRun.version + 1,
+      active_attempt_versions: {
+        ...currentRun.active_attempt_versions,
+        [next.id]: next.version,
+      },
+    },
   };
 }
 
@@ -316,23 +353,13 @@ describe("shared execution kernel lifecycle", () => {
     let current = attempt();
     let currentRun = run(current);
 
-    let transition = reduce({
-      current,
-      currentRun,
-      currentManifest: manifest({ firstTerminal: true }),
-      command: {
-        type: "lease",
-        command_id: "lease-work",
-        attempt_id: current.id,
-        lease_id: "lease-1",
-        expires_at: "2026-08-20T00:05:00.000Z",
-      },
-    });
-    current = replacedAttempt(transition, current.id);
-    currentRun = transition.run;
+    ({ current, currentRun } = claimAttempt(current, currentRun, {
+      purpose: "work",
+      leaseId: "lease-1",
+    }));
     expect(current).toMatchObject({ status: "pending", lease: { purpose: "work", started: false } });
 
-    transition = reduce({
+    let transition = reduce({
       current,
       currentRun,
       currentManifest: manifest({ firstTerminal: true }),
@@ -372,6 +399,7 @@ describe("shared execution kernel lifecycle", () => {
         attempt_id: current.id,
         candidate_hash: sha("f"),
         diagnostics: [{ path: "/payload/summary", detail: "must be a string" }],
+        correction_deadline: "2026-08-20T00:15:00.000Z",
       },
       checkpoints: [completedCheckpoint],
     });
@@ -385,20 +413,11 @@ describe("shared execution kernel lifecycle", () => {
     });
     expect(currentRun.cursor).toEqual(cursorAtCompletion);
 
-    transition = reduce({
-      current,
-      currentRun,
-      currentManifest: manifest({ firstTerminal: true }),
-      command: {
-        type: "lease",
-        command_id: "lease-correction",
-        attempt_id: current.id,
-        lease_id: "lease-2",
-        expires_at: "2026-08-20T00:10:00.000Z",
-      },
-    });
-    current = replacedAttempt(transition, current.id);
-    currentRun = transition.run;
+    ({ current, currentRun } = claimAttempt(current, currentRun, {
+      purpose: "result_correction",
+      leaseId: "lease-2",
+      expiresAt: "2026-08-20T00:10:00.000Z",
+    }));
     expect(current).toMatchObject({
       status: "result_pending",
       result_correction_count: 1,
@@ -473,10 +492,11 @@ describe("shared execution kernel lifecycle", () => {
         currentRun = transition.run;
         states.push(current.status);
       };
-      apply({
-        type: "lease", command_id: "lease", attempt_id: current.id,
-        lease_id: "lease-1", expires_at: "later",
-      });
+      ({ current, currentRun } = claimAttempt(current, currentRun, {
+        purpose: "work",
+        leaseId: "lease-1",
+      }));
+      states.push(current.status);
       apply({ type: "start", command_id: "start", attempt_id: current.id, lease_id: "lease-1" });
       const completedCheckpoint = checkpoint(current, subject("2"));
       apply({
@@ -505,7 +525,7 @@ describe("shared execution kernel lifecycle", () => {
   it("rejects each lifecycle command from an invalid edge", () => {
     const running = attempt({
       status: "running",
-      lease: { id: "lease", purpose: "work", expires_at: "later", started: true },
+      lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
     });
     const completed = attempt({
       status: "work_complete",
@@ -514,17 +534,6 @@ describe("shared execution kernel lifecycle", () => {
       native_session_id: "session-1",
     });
     const cases: Array<{ name: string; invoke: () => unknown; message: RegExp }> = [
-      {
-        name: "lease running",
-        invoke: () => reduce({
-          current: running,
-          command: {
-            type: "lease", command_id: "bad-lease", attempt_id: running.id,
-            lease_id: "other", expires_at: "later",
-          },
-        }),
-        message: /cannot be leased/,
-      },
       {
         name: "start without lease",
         invoke: () => reduce({
@@ -552,6 +561,7 @@ describe("shared execution kernel lifecycle", () => {
           command: {
             type: "result_pending", command_id: "bad-pending", attempt_id: running.id,
             candidate_hash: null, diagnostics: [{ path: "/", detail: "missing" }],
+            correction_deadline: "2026-08-20T00:15:00.000Z",
           },
         }),
         message: /before work completion/,
@@ -610,7 +620,7 @@ describe("shared execution kernel lifecycle", () => {
   it("requires verified edit subjects and prevents inspect actions from advancing them", () => {
     const edit = attempt({
       status: "running",
-      lease: { id: "lease", purpose: "work", expires_at: "later", started: true },
+      lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
     });
     expect(() => reduce({
       current: edit,
@@ -624,7 +634,7 @@ describe("shared execution kernel lifecycle", () => {
     const inspect = attempt({
       repository_authority: "inspect",
       status: "running",
-      lease: { id: "lease", purpose: "work", expires_at: "later", started: true },
+      lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
     });
     expect(() => reduce({
       current: inspect,
@@ -652,7 +662,7 @@ describe("shared execution kernel lifecycle", () => {
     const current = attempt({
       scope: loopScope(),
       status: "running",
-      lease: { id: "lease", purpose: "work", expires_at: "later", started: true },
+      lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
     });
     const transition = reduce({
       current,
@@ -684,8 +694,10 @@ describe("shared execution kernel lifecycle", () => {
       native_session_id: "session-1",
       checkpoint_id: "checkpoint-1",
       result_correction_count: 1,
+      result_correction_deadline: "2026-08-20T00:15:00.000Z",
       lease: {
         id: "correction-1",
+        worker_id: "worker-1",
         purpose: "result_correction",
         expires_at: "later",
         started: true,
@@ -709,6 +721,7 @@ describe("shared execution kernel lifecycle", () => {
         attempt_id: current.id,
         candidate_hash: sha("9"),
         diagnostics: [{ path: "/payload", detail: "still invalid" }],
+        correction_deadline: "2026-08-20T00:15:00.000Z",
       },
       checkpoints: [completedCheckpoint],
     });
@@ -838,7 +851,7 @@ describe("pipeline topology on the shared kernel", () => {
     })).toThrow(/before the fan-in is complete/);
   });
 
-  it("derives one dependency frontier and refuses to lease blocked siblings", () => {
+  it("derives one dependency frontier and refuses to start blocked siblings", () => {
     const state = recordedAttempt();
     const decision = decisionRecord([state.result.id]);
     const first = attempt({
@@ -868,15 +881,18 @@ describe("pipeline topology on the shared kernel", () => {
       records: [decision, state.result],
     });
 
+    const blocked = claimAttempt(dependent, scheduled.run, {
+      purpose: "work",
+      leaseId: "lease-b",
+    });
     expect(() => reduce({
-      current: dependent,
-      currentRun: scheduled.run,
+      current: blocked.current,
+      currentRun: blocked.currentRun,
       command: {
-        type: "lease",
-        command_id: "lease-too-soon",
+        type: "start",
+        command_id: "start-too-soon",
         attempt_id: dependent.id,
         lease_id: "lease-b",
-        expires_at: "later",
       },
     })).toThrow(/before its dependencies completed/);
 
@@ -906,18 +922,21 @@ describe("pipeline topology on the shared kernel", () => {
       },
       records: [firstDecision, firstResult],
     });
-    const leased = reduce({
-      current: dependent,
-      currentRun: afterFirst.run,
+    const eligible = claimAttempt(dependent, afterFirst.run, {
+      purpose: "work",
+      leaseId: "lease-b",
+    });
+    const started = reduce({
+      current: eligible.current,
+      currentRun: eligible.currentRun,
       command: {
-        type: "lease",
-        command_id: "lease-after-dependency",
+        type: "start",
+        command_id: "start-after-dependency",
         attempt_id: dependent.id,
         lease_id: "lease-b",
-        expires_at: "later",
       },
     });
-    expect(replacedAttempt(leased, dependent.id).lease?.id).toBe("lease-b");
+    expect(replacedAttempt(started, dependent.id).lease).toMatchObject({ id: "lease-b", started: true });
   });
 
   it("enforces reentry exhaustion from manifest state", () => {
@@ -968,7 +987,7 @@ describe("pipeline topology on the shared kernel", () => {
   ] as const)("%s cascades attempts and effects while preserving checkpoints", (type, status) => {
     const current = attempt({
       id: "attempt-a", status: "running", version: 3,
-      lease: { id: "lease", purpose: "work", expires_at: "later", started: true },
+      lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
       checkpoint_id: "checkpoint-a",
     });
     const sibling = attempt({ id: "attempt-b", version: 2, scope: loopScope("unit-b", 1) });
@@ -999,19 +1018,29 @@ describe("pipeline topology on the shared kernel", () => {
 
 describe("atomic transition replay", () => {
   it("accepts exact apply/replay and rejects stale or conflicting transitions", () => {
-    const current = attempt();
+    const current = attempt({
+      version: 1,
+      lease: {
+        id: "lease-1",
+        worker_id: "worker-1",
+        purpose: "work",
+        expires_at: "later",
+        started: false,
+      },
+    });
     const transition = reduce({
       current,
+      currentRun: run(current, { version: 1 }),
       command: {
-        type: "lease", command_id: "transition-1", attempt_id: current.id,
-        lease_id: "lease-1", expires_at: "later",
+        type: "start", command_id: "transition-1", attempt_id: current.id,
+        lease_id: "lease-1",
       },
     });
     const observed: AtomicTransitionObservedState = {
       run_id: "run-1",
-      run_version: 0,
+      run_version: 1,
       cursor_version: 0,
-      attempt_versions: { "attempt-1": 0 },
+      attempt_versions: { "attempt-1": 1 },
     };
     expect(transitionApplicationDisposition({ bundle: transition, observed })).toBe("apply");
     expect(transitionApplicationDisposition({

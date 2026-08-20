@@ -27,6 +27,7 @@ import {
 
 const DIGEST = /^[a-f0-9]{64}$/;
 const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const TERMINAL_ATTEMPT_STATES = new Set([
   "settled", "needs_human", "failed", "canceled", "superseded",
 ]);
@@ -418,7 +419,7 @@ function assertPendingAttempt(
     attempt.status !== "pending" || attempt.version !== 0 || attempt.lease !== null ||
     attempt.output_subject !== null || attempt.checkpoint_id !== null ||
     attempt.result_record_id !== null || attempt.pending_result !== null ||
-    attempt.result_correction_count !== 0
+    attempt.result_correction_count !== 0 || attempt.result_correction_deadline !== null
   ) {
     throw new Error(`new attempt ${attempt.id} is not a pristine pending attempt`);
   }
@@ -545,40 +546,6 @@ function terminalCommand(
   }));
 }
 
-function lease(input: ReducerInput): AtomicTransitionBundle {
-  const command = input.command;
-  if (command.type !== "lease") throw new Error("unreachable lease command");
-  assertAttemptCommandMapsEmpty(input);
-  const attempt = currentAttempt(input, command.attempt_id);
-  if (attempt.status !== "pending" && attempt.status !== "result_pending") {
-    throw new Error(`attempt ${attempt.id} cannot be leased from ${attempt.status}`);
-  }
-  if (attempt.lease) throw new Error(`attempt ${attempt.id} already has a lease`);
-  const purpose = attempt.status === "result_pending" ? "result_correction" : "work";
-  if (
-    purpose === "result_correction" &&
-    attempt.result_correction_count >= input.run.result_correction_limit
-  ) {
-    throw new Error(`attempt ${attempt.id} exhausted result correction`);
-  }
-  if (purpose === "result_correction" && attempt.native_session_id === null) {
-    throw new Error(`attempt ${attempt.id} cannot correct a result without its native session`);
-  }
-  if (!command.lease_id || !command.expires_at) throw new Error("attempt lease identity and expiry are required");
-  const next: KernelAttempt = {
-    ...attempt,
-    version: attempt.version + 1,
-    result_correction_count: attempt.result_correction_count + (purpose === "result_correction" ? 1 : 0),
-    lease: { id: command.lease_id, purpose, expires_at: command.expires_at, started: false },
-  };
-  return bundle(baseContent({
-    command,
-    expected: expectedFor(input.run, { [attempt.id]: attempt.version }),
-    run: replaceAttempt(input.run, next),
-    attemptWrites: [{ kind: "replace", attempt: next }],
-  }));
-}
-
 function start(input: ReducerInput): AtomicTransitionBundle {
   const command = input.command;
   if (command.type !== "start") throw new Error("unreachable start command");
@@ -682,11 +649,28 @@ function resultPending(input: ReducerInput): AtomicTransitionBundle {
   if (command.candidate_hash !== null && !DIGEST.test(command.candidate_hash)) {
     throw new Error("result_pending candidate hash is invalid");
   }
+  if (!attempt.native_session_id) {
+    throw new Error(`attempt ${attempt.id} cannot correct a result without its native session`);
+  }
+  if (
+    !ISO_TIMESTAMP.test(command.correction_deadline) ||
+    !Number.isFinite(Date.parse(command.correction_deadline)) ||
+    new Date(command.correction_deadline).toISOString() !== command.correction_deadline
+  ) {
+    throw new Error("result_pending correction deadline is invalid");
+  }
+  if (
+    attempt.result_correction_deadline !== null &&
+    attempt.result_correction_deadline !== command.correction_deadline
+  ) {
+    throw new Error("result_pending cannot change its correction deadline");
+  }
   const next: KernelAttempt = {
     ...attempt,
     status: "result_pending",
     version: attempt.version + 1,
     lease: null,
+    result_correction_deadline: command.correction_deadline,
     pending_result: {
       candidate_hash: command.candidate_hash,
       diagnostics: normalizedDiagnostics(command.diagnostics),
@@ -944,8 +928,6 @@ function retry(input: ReducerInput): AtomicTransitionBundle {
 export function reduceKernelCommand(input: ReducerInput): AtomicTransitionBundle {
   assertBaseInput(input);
   switch (input.command.type) {
-    case "lease":
-      return lease(input);
     case "start":
       return start(input);
     case "work_complete":
