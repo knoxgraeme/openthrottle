@@ -114,6 +114,8 @@ export interface KernelAttempt {
   request_hash: string;
   definition_bundle_hash: string;
   input_subject: string;
+  context_record_ids: readonly string[];
+  context_checkpoint_ids: readonly string[];
   output_subject: string | null;
   native_session_id: string | null;
   status: AttemptState;
@@ -125,6 +127,32 @@ export interface KernelAttempt {
   checkpoint_id: string | null;
   result_record_id: string | null;
   pending_result: ResultPendingState | null;
+}
+
+const CONTEXT_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
+const MAX_CONTEXT_IDS = 256;
+
+export function canonicalAttemptContextIds(
+  values: readonly string[],
+  label: string,
+): string[] {
+  if (!Array.isArray(values) || values.length > MAX_CONTEXT_IDS) {
+    throw new Error(`${label} must contain at most ${MAX_CONTEXT_IDS} IDs`);
+  }
+  const normalized = values.map((value) => {
+    if (typeof value !== "string" || !CONTEXT_ID.test(value)) {
+      throw new Error(`${label} contains an invalid ID`);
+    }
+    return value;
+  });
+  const sorted = [...normalized].sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+  if (
+    new Set(sorted).size !== sorted.length ||
+    sorted.some((value, index) => value !== normalized[index])
+  ) {
+    throw new Error(`${label} must be strictly sorted without duplicates`);
+  }
+  return sorted;
 }
 
 interface KernelCommandBase {

@@ -23,6 +23,7 @@ import {
   type KernelRun,
   type ReducerInput,
   type ResultDiagnostic,
+  canonicalAttemptContextIds,
 } from "./types.js";
 
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -193,6 +194,11 @@ function assertActiveAttempt(run: KernelRun, attempt: KernelAttempt): void {
   if (TERMINAL_ATTEMPT_STATES.has(attempt.status)) {
     throw new Error(`attempt ${attempt.id} is already terminal`);
   }
+  canonicalAttemptContextIds(attempt.context_record_ids, `attempt ${attempt.id} context_record_ids`);
+  canonicalAttemptContextIds(
+    attempt.context_checkpoint_ids,
+    `attempt ${attempt.id} context_checkpoint_ids`,
+  );
 }
 
 function currentAttempt(input: ReducerInput, attemptId: string): KernelAttempt {
@@ -423,6 +429,11 @@ function assertPendingAttempt(
   ) {
     throw new Error(`new attempt ${attempt.id} is not a pristine pending attempt`);
   }
+  canonicalAttemptContextIds(attempt.context_record_ids, `attempt ${attempt.id} context_record_ids`);
+  canonicalAttemptContextIds(
+    attempt.context_checkpoint_ids,
+    `attempt ${attempt.id} context_checkpoint_ids`,
+  );
   if (attempt.scope.kind !== "stage") {
     if (
       !Number.isSafeInteger(

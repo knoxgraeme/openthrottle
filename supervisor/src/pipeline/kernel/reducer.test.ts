@@ -124,6 +124,8 @@ function attempt(options: Partial<KernelAttempt> & {
     request_hash: options.request_hash ?? sha("a"),
     definition_bundle_hash: sha("b"),
     input_subject: options.input_subject ?? subject("1"),
+    context_record_ids: options.context_record_ids ?? [],
+    context_checkpoint_ids: options.context_checkpoint_ids ?? [],
     output_subject: options.output_subject ?? null,
     native_session_id: options.native_session_id ?? null,
     status: options.status ?? "pending",

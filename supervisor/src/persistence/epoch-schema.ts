@@ -204,6 +204,8 @@ CREATE TABLE attempts (
   request_hash TEXT NOT NULL CHECK (length(request_hash) = 64 AND request_hash NOT GLOB '*[^0-9a-f]*'),
   definition_bundle_hash TEXT NOT NULL CHECK (length(definition_bundle_hash) = 64 AND definition_bundle_hash NOT GLOB '*[^0-9a-f]*'),
   input_subject TEXT NOT NULL CHECK (length(input_subject) IN (40, 64) AND input_subject NOT GLOB '*[^0-9a-f]*'),
+  context_record_ids_json TEXT NOT NULL CHECK (json_valid(context_record_ids_json) AND json_type(context_record_ids_json) = 'array' AND json_array_length(context_record_ids_json) <= 256),
+  context_checkpoint_ids_json TEXT NOT NULL CHECK (json_valid(context_checkpoint_ids_json) AND json_type(context_checkpoint_ids_json) = 'array' AND json_array_length(context_checkpoint_ids_json) <= 256),
   output_subject TEXT CHECK (output_subject IS NULL OR (length(output_subject) IN (40, 64) AND output_subject NOT GLOB '*[^0-9a-f]*')),
   native_session_id TEXT,
   status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'work_complete', 'result_pending', 'recorded', 'settled', 'needs_human', 'failed', 'canceled', 'superseded')),
@@ -382,6 +384,17 @@ BEFORE DELETE ON settings
 WHEN OLD.mutable = 0
 BEGIN
   SELECT RAISE(ABORT, 'immutable setting');
+END;
+
+CREATE TRIGGER work_items_request_immutable_update
+BEFORE UPDATE OF
+  repository_registration_id, source_provider, source_id, source_reference, title,
+  request_payload_schema, request_inline_json, request_blob_algorithm,
+  request_blob_digest, request_blob_bytes, request_blob_encoding,
+  request_blob_media_type, request_blob_payload_schema
+ON work_items
+BEGIN
+  SELECT RAISE(ABORT, 'immutable work request');
 END;
 
 CREATE INDEX leases_expiry_idx ON leases(expires_at, lease_key);
