@@ -1,3 +1,8 @@
+/**
+ * @deprecated Legacy graph authoring contract. New definitions use the public
+ * pipeline contract in pipeline.ts. This module is retained only until the
+ * clean offline epoch replacement removes the old runtime in U8.
+ */
 import {
   COMMAND_NAME_PATTERN,
   IDENTIFIER,
@@ -103,6 +108,7 @@ export interface GraphNode {
   transitions: Partial<Record<GraphOutcome, GraphTransition>>;
 }
 
+/** @deprecated Use PipelineDefinition and CompiledPipelineManifest. */
 export interface GraphContract {
   schema: typeof GRAPH_SCHEMA;
   id: string;
@@ -417,6 +423,7 @@ function validateGraph(graph: GraphContract, source: string, config?: Repository
   }
 }
 
+/** @deprecated Use validatePipelineDefinition or validateCompiledPipelineManifest. */
 export function validateGraphContract(
   value: unknown,
   options: { source?: string; config?: RepositoryConfigContract } = {}
@@ -437,6 +444,7 @@ export function validateGraphContract(
   return normalizedContract(graph);
 }
 
+/** @deprecated Graph authoring is removed in the fresh execution epoch. */
 export function parseGraphContract(
   raw: string,
   options: { source?: string; config?: RepositoryConfigContract } = {}

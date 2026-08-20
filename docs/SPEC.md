@@ -1,7 +1,12 @@
 # OpenThrottle specification
 
-This document is the normative contract for the pre-production OpenThrottle
-proof of concept.
+This document is the normative contract for OpenThrottle. The execution-kernel
+replacement described below is one release unit: intermediate commits are not
+deployable, and the target epoch becomes live only after the offline replacement
+proof succeeds. Existing graph, catalog, stage-receipt, and structured-unit
+passages remain characterization inventory until their owning implementation
+unit removes them. Where that inventory conflicts with the target-epoch
+contract, the target-epoch contract takes precedence for all new code.
 
 ## Concept
 
@@ -10,51 +15,208 @@ immutable, deterministic coding pipeline:
 
 ```text
 Linear delegation or labeled GitHub Issue
-  -> durable repository route + catalog selection
-  -> pinned manifest/config/runtime/base commit/generation
-  -> one fenced Daytona stage at a time
-  -> typed artifacts and deterministic gates
-  -> exact-subject GitHub publication/provider evidence
-  -> durable provider acknowledgement and resource cleanup
+  -> durable repository route + exact Git subject
+  -> dependency-closed DefinitionBundle for one pipeline
+  -> one fenced Attempt at a time
+  -> semantic ResultCandidate + executor-authored ResultRecord
+  -> deterministic DecisionRecord + immutable Effect
+  -> exact-subject DeliveryRecord and resource cleanup
 ```
 
 The Fly supervisor owns state, admission, ordering, retries, effects, and
-publication. Agent reasoning lives only inside stage executors through
-self-contained OpenThrottle skills. There is no second execution architecture.
+publication. Agent reasoning lives only inside sandbox actions composed from
+standing instructions, a sealed task prompt, and progressively disclosed
+OpenThrottle skills. Ordinary and structured pipelines use the same execution
+kernel; there is no second execution architecture.
 
-### Canonical vocabulary
+### Canonical target-epoch vocabulary
 
-- **Pipeline manifest:** a versioned stage graph selected from the catalog.
-- **Pipeline instance:** one generation pinned to normalized manifest,
-  repository config, runtime capability descriptor, repository, branch, and
-  base commit digests.
-- **Stage attempt:** one idempotent invocation fenced by instance, generation,
-  stage, ordinal, request hash, run id, and expected Git subject.
-- **Artifact:** bounded typed evidence with a normalized payload hash,
-  assurance class, and optional Git subject.
-- **Gate receipt:** the deterministic evaluator decision for an attempt.
-- **Effect intent:** a persisted external action such as provisioning,
-  task-ref creation/advancement, dispatch, publication, stop, or cleanup.
-- **Task branch checkpoint:** the supervisor-owned `refs/heads/ot/*` lineage
-  binding ticket, pipeline instance, generation, plan digest, and exact base
-  SHA to an accepted local integration SHA and an acknowledged remote SHA.
-- **Publication receipt:** a durable Linear or GitHub-facing publication with
-  retry state.
+- **Pipeline:** the sole public orchestration concept. A repository authors a
+  pipeline in `.openthrottle/pipelines/<id>/pipeline.yml`; the compiler may
+  expand it into a private manifest, but graph, catalog alias, and manifest
+  identity are not public selection concepts.
+- **DefinitionBundle:** canonical, dependency-closed bytes containing the
+  selected pipeline and only its transitive agent instructions, skills and
+  referenced resources, evals, pipeline-local loops, and behavior-affecting
+  config. A run carries one `definition_bundle_hash` over those exact bytes.
+- **Pipeline run:** one admitted work item executing one selected pipeline and
+  immutable DefinitionBundle.
+- **Attempt:** one fenced invocation of an agent action, command, evaluation,
+  provider wait, or other compiled pipeline scope. Ordinary stages, structured
+  units, review fanout members, and repair actions are all Attempts.
+- **ResultCandidate:** model-authored semantic output containing only the
+  action eval's `outcome` and payload fields. It never contains identity,
+  subject, fence, assurance, producer, evidence binding, hash, or timestamp.
+- **ResultRecord:** an immutable executor-authored fact about an observed
+  Attempt. It binds request, bundle, input subject, verified output subject,
+  candidate hashes, executor-derived evidence, and schema-versioned payload.
+- **DecisionRecord:** an immutable supervisor-authored reducer or deterministic
+  gate choice over explicit input record IDs. It alone authorizes the next
+  Attempt or Effect.
+- **DeliveryRecord:** an immutable supervisor-authored fact recording the
+  confirmed or rejected external outcome of one Effect. It is distinct from
+  webhook/outbox transport delivery.
+- **Effect:** a durable immutable intent for externally visible or runtime
+  mutation, with one idempotency key and deterministic reconciliation identity.
+  Publication, Git ref advancement, provisioning, stop, and cleanup are Effects.
+- **Checkpoint:** an executor-authored recovery fact for an Attempt. It binds
+  exact request, bundle, subject, session, and authorized recovery material.
+  An edit Attempt additionally binds its accepted tree or derived Git subject;
+  an inspect Attempt may have a non-Git checkpoint with a null output subject.
 - **Ticket identity:** the stable internal `ticket_id` is provider-qualified
   (`<control-provider>:<external-thread-id>`). Human-facing ticket references
   are display labels and never command, routing, or persistence identity.
 - **Native session:** a Claude session, Codex thread, or OpenCode session used
-  only when the manifest’s context policy permits continuation.
+  only when the compiled action policy permits continuation.
+
+The words artifact, receipt, stage attempt, graph, catalog, and pipeline
+instance describe only the pre-replacement implementation below. New contracts,
+tables, APIs, and code must not introduce those as target-epoch authorities.
+
+### Identity and lifecycle ownership
+
+An Attempt owns exactly one `request_hash`, one `definition_bundle_hash`, one
+`input_subject`, and at most one executor-verified `output_subject`. The
+canonical request hash covers the sealed action request after defaults are
+compiled; there is no second request or fence hash. The DefinitionBundle hash
+is `sha256(canonical_json(bundle))`. It does not include itself and is distinct
+from both an entry `content_hash` and the runtime artifact-set digest. Bundle
+bytes are rehashed whenever loaded.
+
+An Effect owns exactly one `idempotency_key`. Reusing it is valid only for an
+exact replay of the complete immutable intent, including kind, owner Decision,
+target, subject, and payload. An unknown provider acknowledgement is reconciled
+through provider-native idempotency or the deterministic external identity; it
+is never blindly replayed.
+
+Attempts use this common lifecycle:
+
+```text
+pending -> running -> work_complete -> recorded -> settled
+                    \-> result_pending -> recorded
+                                      \-> needs_human
+running -> pending              (retryable infrastructure failure)
+running -> failed               (terminal work or security failure)
+pending|running -> canceled|superseded
+```
+
+`work_complete` means the engine exited cleanly and the executor durably
+captured the action's checkpoint and observed postconditions. It does not mean
+that model output is authoritative or valid. `result_pending` means work is
+complete but the semantic candidate is missing or invalid. Result correction
+is a separately leased, bounded continuation of the same Attempt and native
+session, not a new work Attempt: repository mutation, MCP, provider access,
+publication, and unrelated tools are disabled, and the checkpoint/output
+subject cannot change. Exhaustion settles `needs_human` with the checkpoint,
+candidate, diagnostics, and session evidence retained.
+
+The executor applies only registered, field-local normalizations before
+validation. `string-array-to-newlines/v1` accepts a bounded array containing
+only bounded, non-empty strings for a schema-declared string field and joins it
+with newline characters. Every application records its identifier, JSON path,
+input hash, and output hash. Unknown outcomes, unknown fields, contradictory
+values, mixed arrays, and transformations absent from the referenced eval
+remain invalid.
+
+### Filesystem definition and compilation contract
+
+Repository-authored runtime definitions exist only at these paths:
+
+```text
+.openthrottle/
+  config.yml
+  agents/<agent-id>/instructions.md
+  pipelines/<pipeline-id>/pipeline.yml
+  pipelines/<pipeline-id>/loops/<loop-id>.yml   # optional
+  skills/<skill-id>/SKILL.md
+  evals/<eval-id>/eval.yml
+```
+
+`config.yml` selects `pipeline` and `engine`; pipeline actions bind `agent_id`,
+`repository_authority`, a skill allowlist, optional entry skill, and an eval.
+`engine` is `claude`, `codex`, or `opencode`. `repository_authority` is
+`inspect` or `edit`. Inspect receives an executor-materialized exact-subject
+read view; edit receives an isolated writable content tree. Both keep Git
+administration, refs, remotes, commit creation, push, and publication under
+executor/supervisor ownership. Provider-native read-only and tool restrictions
+are defense in depth, not the cross-engine security boundary. Every review,
+admission, evaluation, and result-correction action is inspect-only; a blocking
+review schedules a separate edit-authority remediation Attempt.
+
+The shared compiler accepts a bounded virtual file map from either a local
+filesystem or an exact Git subject. It rejects path traversal, symlinks,
+duplicate or ambiguous IDs, unknown fields, invalid skill frontmatter,
+oversized files, cycles, unresolved references, escapes from pipeline-local
+loops, and repository attempts to shadow the reserved `core` namespace. Text
+uses LF line endings and parsed content is canonicalized before hashing.
+Canonical object keys use locale-independent UTF-16 code-unit order. A
+serialized claim of platform origin has no authority: every platform entry's
+kind, ID, path, and content hash must match the release's sealed platform
+catalog, while repository origin is derived from the exact Git reader.
+
+Each bundle entry records `definition_kind`, `definition_id`, explicit
+platform or repository origin, source commit where applicable, canonical
+`normalized_payload`, and its own `content_hash`. The bundle contains the
+selected pipeline closure, compiler version, and runtime-capability digest;
+unreferenced definitions cannot change its bytes. The generated JavaScript
+candidate validator/normalizer and provider JSON Schemas are emitted from the
+same TypeScript source as a closed artifact set. Its artifact-set digest enters
+runtime capability identity but is never substituted for the DefinitionBundle
+hash.
+
+### Record, payload, and persistence boundary
+
+Result, Decision, and Delivery are the only execution record kinds. Their
+payloads are closed, schema-versioned unions with kind-specific ownership.
+`payload_schema` must resolve through the owning eval/reducer/effect registry,
+the registered kind must match the record kind, and inline bytes must pass that
+schema before a record is accepted. Unknown schema IDs are invalid. A blob
+pointer binds the same registered schema and its materialized bytes pass that
+schema before consumption. The registry is extensible through referenced
+definitions and registered deterministic primitives; the base contract does
+not hardcode every future pipeline payload. Operational identity, leases,
+subjects, and indexes remain typed relational
+fields. Canonical inline JSON is limited to 64 KiB. Larger definition bundles,
+checkpoint/session packages, recovery material, and evidence use a
+content-addressed `BlobPointer` containing algorithm, digest, byte size,
+encoding, media type, and payload schema. The supervisor durably publishes and
+verifies blob bytes before committing a pointer.
+
+The fresh epoch contains only `schema_migrations`, `settings`, `leases`,
+`repository_registrations`, `work_items`, `inbox_events`, `definitions`,
+`pipeline_runs`, `attempts`, `records`, `effects`, and `checkpoints`.
+Definitions retain the five application fields `definition_kind`,
+`definition_id`, `source_commit`, `content_hash`, and `normalized_payload`;
+the bundle itself is a verified content-addressed object, not a foreign key to
+a supposedly unique entry hash. U6 must complete the lifecycle/constraint/
+index/port matrix before freezing this DDL and stop for a SPEC amendment if an
+independently leased or queried lifecycle cannot fit without JSON state scans
+or nullable polymorphism.
 
 ## Components
 
-- `supervisor/`: Hono control plane, SQLite state, webhook inbox, coordinator,
-  Daytona effects, GitHub provider handling, `control_outbox`, sweep/recovery.
-- `sandbox/`: sealed single-stage executor and agent runtime boundary.
-- `skills/`: self-contained OpenThrottle planning and execution adapters.
-- `cli/`: target-repository onboarding and operator commands.
-- `supervisor/pipelines/`: immutable manifests, catalog aliases, and runtime
-  capability descriptor.
+- `contracts/`: canonical definition, pipeline, candidate, record, effect,
+  identity, generated-validator, and digest contracts shared byte-for-byte.
+- `supervisor/`: Hono control plane, fresh SQLite epoch, DefinitionBundle and
+  BlobStore ownership, reducer, effects, provider handling, and recovery.
+- `sandbox/`: sealed single-Attempt executor, agent profile, candidate ingress,
+  checkpoint, and generated validation boundary.
+- `.openthrottle/`: runtime pipeline, agent-instruction, skill, eval, and config
+  authoring source used by this repository and scaffolded into target repos.
+- `skills/`: operator/planning distribution assets until runtime task skills
+  move into `.openthrottle/skills/`.
+- `cli/`: target-repository scaffolding, local compilation, validation, and
+  operator commands.
+
+## Deprecated implementation inventory
+
+The following graph/catalog/receipt/table-specific sections characterize the
+old epoch so their owning units can preserve behavior while replacing it. They
+are not compatibility requirements, may not be selected by new code, and are
+deleted with the old runtime in U8. Security rules that do not depend on those
+representations—signature verification, exact-subject fencing, secret
+sanitization, fail-closed routing, and registered-repository trust—remain
+normative throughout the replacement.
 
 ## Admission and routing
 
@@ -122,7 +284,7 @@ both global and unit-scoped commands to that sealed inventory; an empty
 inventory requires an empty plan command list. Executor validation against the
 same sealed inventory remains authoritative after model output.
 
-## Manifest and catalog contract
+## Manifest and catalog contract (deprecated epoch inventory)
 
 Pipeline YAML is strictly parsed with duplicate keys, aliases, unknown fields,
 oversized documents, invalid identifiers, and invalid graph edges rejected.
@@ -279,7 +441,7 @@ Catalog aliases resolve to exact manifest id/version pairs. Repository config
 may override the implement or investigate alias, but cannot supply arbitrary
 manifest bodies. Runtime compatibility is verified before provisioning.
 
-## Coordinator lifecycle
+## Coordinator lifecycle (deprecated epoch inventory)
 
 The coordinator is a pure reducer around a transactional store:
 
@@ -948,7 +1110,7 @@ silently matching nothing. This is the analysis read-contract's only sanctioned
 entry point into the corpus -- see "Persistence contract" for the doctrine and
 its enforcement.
 
-## Persistence contract
+## Persistence contract (deprecated epoch inventory)
 
 SQLite is the authority. Core tables include:
 
@@ -1439,7 +1601,7 @@ supplies another positive integer size.
 Repository and base-branch routing are not environment configuration; they
 must come from authenticated durable registration.
 
-## Repository config
+## Repository config (deprecated epoch inventory)
 
 Committed `.openthrottle.yml` may declare `agent`, the legacy provider-bound
 `model`, provider-specific `agent_defaults`, `test`/`lint`/`build`/`dev`/
@@ -1588,6 +1750,13 @@ all Vitest suites and Bats runtime tests, builds the sandbox image, and executes
 the sealed multi-agent/command-stage Docker smoke. The smoke uses deterministic
 stub agents and a local bare repository; it does not consume operator
 credentials.
+
+The target epoch additionally proves canonical DefinitionBundle bytes and hash
+parity across contracts, CLI, supervisor, and sandbox; generated JavaScript
+validator and provider-schema parity with the TypeScript corpus; strict
+candidate/record owner fields; OPE-188 bounded normalization; conflicting
+effect-intent identity rejection; inspect/edit enforcement; and static absence
+of graph or receipt contracts from the new execution path.
 
 A credentialed Linear/Daytona/GitHub exercise is a separate explicitly
 authorized acceptance step. If skipped, it is reported as a verification gap;

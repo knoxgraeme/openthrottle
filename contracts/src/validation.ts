@@ -6,6 +6,15 @@ export interface ValidatedContract<T> {
   digest: string;
 }
 
+export type JsonValue = null | boolean | string | number | JsonValue[] | { [key: string]: JsonValue };
+
+export interface JsonValueOptions {
+  maxDepth?: number;
+  maxEntries?: number;
+  maxKeyLength?: number;
+  rejectCarriageReturns?: boolean;
+}
+
 export function fail(path: string, message: string): never {
   throw new Error(`${path}: ${message}`);
 }
@@ -92,6 +101,37 @@ export function recordAt<T>(
     output[key] = parse(entry, `${path}.${key}`, key);
   }
   return output;
+}
+
+export function jsonValueAt(
+  value: unknown,
+  path: string,
+  options: JsonValueOptions = {},
+  depth = 0,
+): JsonValue {
+  const maxDepth = options.maxDepth ?? 16;
+  const maxEntries = options.maxEntries ?? 1_024;
+  const maxKeyLength = options.maxKeyLength ?? 200;
+  if (depth > maxDepth) fail(path, `exceeds the maximum JSON depth of ${maxDepth}`);
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    if (options.rejectCarriageReturns && value.includes("\r")) fail(path, "must use LF line endings");
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (Array.isArray(value)) {
+    if (value.length > maxEntries) fail(path, `must contain at most ${maxEntries} entries`);
+    return value.map((entry, index) => jsonValueAt(entry, `${path}[${index}]`, options, depth + 1));
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length > maxEntries) fail(path, `must contain at most ${maxEntries} fields`);
+    return Object.fromEntries(entries.map(([key, entry]) => {
+      if (!key || key.length > maxKeyLength) fail(`${path}.${key}`, "has an invalid key");
+      return [key, jsonValueAt(entry, `${path}.${key}`, options, depth + 1)];
+    }));
+  }
+  fail(path, "must be a JSON value");
 }
 
 export function normalizedContract<T>(value: T): ValidatedContract<T> {

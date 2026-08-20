@@ -11,6 +11,10 @@ describe("canonical JSON utilities", () => {
     expect(canonicalJson(value)).toBe('{"a":[{"b":2,"d":4},{"a":1,"c":3}],"z":1}');
   });
 
+  it("uses locale-independent UTF-16 code-unit key ordering", () => {
+    expect(canonicalJson({ "ä": 2, z: 1 })).toBe('{"z":1,"ä":2}');
+  });
+
   it("digests canonical UTF-8 bytes with sha256", () => {
     const value = { b: 2, a: 1 };
     const canonical = '{"a":1,"b":2}';
