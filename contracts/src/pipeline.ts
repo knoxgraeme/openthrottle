@@ -15,6 +15,7 @@ import {
 } from "./validation.js";
 
 export const PIPELINE_DEFINITION_SCHEMA = "openthrottle.pipeline-definition/v1" as const;
+export const PIPELINE_LOOP_DEFINITION_SCHEMA = "openthrottle.pipeline-loop/v1" as const;
 export const COMPILED_PIPELINE_MANIFEST_SCHEMA = "openthrottle.compiled-pipeline-manifest/v1" as const;
 export const ENGINES = ["claude", "codex", "opencode"] as const;
 export const REPOSITORY_AUTHORITIES = ["inspect", "edit"] as const;
@@ -45,6 +46,12 @@ export interface PipelineLoopBinding {
   max_rounds: number;
   body?: string[];
   file?: string;
+}
+
+export interface PipelineLoopDefinition {
+  schema: typeof PIPELINE_LOOP_DEFINITION_SCHEMA;
+  id: string;
+  body: string[];
 }
 
 interface PipelineStageBase {
@@ -257,7 +264,12 @@ function parseStage(value: unknown, path: string, compiled: boolean): AnyPipelin
   };
 }
 
-function validateStages(stages: AnyPipelineStage[], entry: string, source: string): void {
+function validateStages(
+  stages: AnyPipelineStage[],
+  entry: string,
+  source: string,
+  options: { deferExternalLoopReachability?: boolean } = {},
+): void {
   const ids = stages.map((stage) => stage.id);
   if (new Set(ids).size !== ids.length) fail(`${source}.stages`, "must not contain duplicate IDs");
   const known = new Set(ids);
@@ -288,8 +300,10 @@ function validateStages(stages: AnyPipelineStage[], entry: string, source: strin
       ...(stage.loop?.body ?? []),
     );
   }
-  const unreachable = stages.find((stage) => !reachable.has(stage.id));
-  if (unreachable) fail(`${source}.stages`, `contains unreachable stage ${unreachable.id}`);
+  if (!options.deferExternalLoopReachability) {
+    const unreachable = stages.find((stage) => !reachable.has(stage.id));
+    if (unreachable) fail(`${source}.stages`, `contains unreachable stage ${unreachable.id}`);
+  }
 
   const visiting = new Set<string>();
   const visited = new Set<string>();
@@ -323,13 +337,39 @@ export function validatePipelineDefinition(
     (stage, path) => parseStage(stage, path, false),
     { min: 1, max: 256 },
   );
-  validateStages(stages, entry, source);
+  // File-backed loop edges are unavailable until the definition compiler
+  // resolves the loop. The compiled manifest validates complete reachability
+  // after that body has been inlined.
+  validateStages(stages, entry, source, {
+    deferExternalLoopReachability: stages.some((stage) => stage.loop?.file !== undefined),
+  });
   return normalizedContract({
     schema: PIPELINE_DEFINITION_SCHEMA,
     id: stringAt(input.id, `${source}.id`, { pattern: IDENTIFIER }),
     version: integerAt(input.version, `${source}.version`, 1, 1_000_000),
     entry,
     stages,
+  });
+}
+
+export function validatePipelineLoopDefinition(
+  value: unknown,
+  options: { source?: string } = {},
+): ValidatedContract<PipelineLoopDefinition> {
+  const source = options.source ?? "pipeline_loop";
+  const input = objectAt(value, source, ["schema", "id", "body"]);
+  if (input.schema !== PIPELINE_LOOP_DEFINITION_SCHEMA) {
+    fail(`${source}.schema`, `must be ${PIPELINE_LOOP_DEFINITION_SCHEMA}`);
+  }
+  return normalizedContract({
+    schema: PIPELINE_LOOP_DEFINITION_SCHEMA,
+    id: stringAt(input.id, `${source}.id`, { pattern: IDENTIFIER }),
+    body: unique(arrayAt(
+      input.body,
+      `${source}.body`,
+      (entry, path) => stringAt(entry, path, { pattern: IDENTIFIER }),
+      { min: 1, max: 64 },
+    ), `${source}.body`),
   });
 }
 

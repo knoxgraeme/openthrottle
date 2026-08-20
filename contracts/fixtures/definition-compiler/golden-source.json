@@ -1,0 +1,43 @@
+{
+  "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "repository": {
+    ".openthrottle/config.yml": {
+      "content": "schema: openthrottle.config/v2\npipeline: core/review\nengine: codex\ncommands:\n  test: npm test\n",
+      "blob_sha": "1111111111111111111111111111111111111111"
+    },
+    ".openthrottle/skills/unused/SKILL.md": {
+      "content": "---\nname: unused\ndescription: This unrelated skill is not selected.\n---\n\n# Unused\n",
+      "blob_sha": "2222222222222222222222222222222222222222"
+    },
+    ".openthrottle/evals/unused/eval.yml": {
+      "content": "schema: openthrottle.eval-definition/v1\nid: unused\nevaluator: core/action-outcome@1\nresult:\n  schema: openthrottle.semantic-result-schema/v1\n  id: unused\n  outcomes: [success]\n  payload:\n    summary: {type: string, required: true, max_length: 100}\n",
+      "blob_sha": "3333333333333333333333333333333333333333"
+    }
+  },
+  "platform": {
+    ".openthrottle/agents/core/reviewer/instructions.md": {
+      "content": "Review the sealed subject and report only evidence-backed findings.\n",
+      "blob_sha": "4444444444444444444444444444444444444444"
+    },
+    ".openthrottle/pipelines/core/review/pipeline.yml": {
+      "content": "schema: openthrottle.pipeline-definition/v1\nid: core/review\nversion: 1\nentry: review\nstages:\n  - id: review\n    kind: agent\n    agent_id: core/reviewer\n    repository_authority: inspect\n    skills: [core/review-change]\n    entry_skill: core/review-change\n    eval: core/review-result\n    loop:\n      over: findings\n      max_parallel: 2\n      max_rounds: 2\n      file: loops/review-cycle.yml\n    on:\n      success: {to: finalize}\n      needs_human: {terminal: needs_human}\n  - id: finalize\n    kind: command\n    command: test\n    on:\n      success: {terminal: completed}\n",
+      "blob_sha": "5555555555555555555555555555555555555555"
+    },
+    ".openthrottle/pipelines/core/review/loops/review-cycle.yml": {
+      "content": "schema: openthrottle.pipeline-loop/v1\nid: core/review/review-cycle\nbody: [review]\n",
+      "blob_sha": "6666666666666666666666666666666666666666"
+    },
+    ".openthrottle/skills/core/review-change/SKILL.md": {
+      "content": "---\nname: review-change\ndescription: Review a change and report actionable findings.\nmetadata:\n  audience: coding-agent\n---\n\n# Review change\n\nRead [the rubric](references/rubric.md) when reviewing.\n",
+      "blob_sha": "7777777777777777777777777777777777777777"
+    },
+    ".openthrottle/skills/core/review-change/references/rubric.md": {
+      "content": "# Rubric\n\nPrioritize correctness and security.\n",
+      "blob_sha": "8888888888888888888888888888888888888888"
+    },
+    ".openthrottle/evals/core/review-result/eval.yml": {
+      "content": "schema: openthrottle.eval-definition/v1\nid: core/review-result\nevaluator: core/review-outcome@1\nresult:\n  schema: openthrottle.semantic-result-schema/v1\n  id: core/review-result\n  outcomes: [success, needs_human]\n  payload:\n    summary:\n      type: string\n      required: true\n      max_length: 4000\n      normalize: string-array-to-newlines/v1\n    findings: {type: json, required: true}\n",
+      "blob_sha": "9999999999999999999999999999999999999999"
+    }
+  }
+}
