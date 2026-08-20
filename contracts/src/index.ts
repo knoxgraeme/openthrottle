@@ -127,6 +127,10 @@ export {
   type TrustedPlatformDefinitionSource,
 } from "./platform-definition-catalog.js";
 export {
+  RELEASE_COMPILER_ENVIRONMENT_DIGEST,
+  RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
+} from "./definition-release.js";
+export {
   DEFINITION_YAML_MAX_BYTES,
   VIRTUAL_DEFINITION_MAX_FILE_BYTES,
   VIRTUAL_DEFINITION_MAX_FILES,

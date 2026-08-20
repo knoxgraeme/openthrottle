@@ -39,11 +39,14 @@ sourceFiles.delete(".openthrottle/config.yml");
 const platform = contracts.verifyPlatformDefinitionSource(
   catalog,
   sourceFiles,
-  catalog.catalog_digest,
+  contracts.RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
 );
 const environmentBytes = readFileSync(compilerEnvironmentSource);
 const environment = JSON.parse(environmentBytes.toString("utf8"));
-contracts.verifyCompilerEnvironment(environment, environment.environment_digest);
+contracts.verifyCompilerEnvironment(
+  environment,
+  contracts.RELEASE_COMPILER_ENVIRONMENT_DIGEST,
+);
 
 rmSync(platformDefinitionsTarget, { recursive: true, force: true });
 mkdirSync(platformDefinitionsTarget, { recursive: true });

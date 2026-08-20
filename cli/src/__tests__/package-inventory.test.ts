@@ -2,6 +2,8 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  RELEASE_COMPILER_ENVIRONMENT_DIGEST,
+  RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
   verifyCompilerEnvironment,
   verifyPlatformDefinitionSource,
 } from "@openthrottle/contracts";
@@ -36,11 +38,15 @@ describe("CLI package inventory", () => {
 
     const sourceFiles = new Map(readLocalDefinitionFiles(repositoryRoot));
     sourceFiles.delete(".openthrottle/config.yml");
-    const source = verifyPlatformDefinitionSource(catalog, sourceFiles, catalog.catalog_digest);
+    const source = verifyPlatformDefinitionSource(
+      catalog,
+      sourceFiles,
+      RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
+    );
     const packaged = verifyPlatformDefinitionSource(
       catalog,
       readLocalDefinitionFiles(packagedPlatformRoot),
-      catalog.catalog_digest,
+      RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
     );
 
     expect([...packaged.files.keys()]).toEqual(catalog.files.map(({ path }: { path: string }) => path));
@@ -62,7 +68,7 @@ describe("CLI package inventory", () => {
     ));
     expect(packagedEnvironmentBytes).toEqual(generatedEnvironmentBytes);
     const environment = JSON.parse(packagedEnvironmentBytes.toString("utf8"));
-    expect(verifyCompilerEnvironment(environment, environment.environment_digest).descriptor)
+    expect(verifyCompilerEnvironment(environment, RELEASE_COMPILER_ENVIRONMENT_DIGEST).descriptor)
       .toEqual(environment);
     expect(packagedFiles(packagedPlatformRoot)).toEqual([
       ...catalog.files.map(({ path }: { path: string }) => path),

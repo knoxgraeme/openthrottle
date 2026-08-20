@@ -173,4 +173,36 @@ describe("platform definition catalog", () => {
     expect(() => verifyPlatformDefinitionSource({ ...catalog, catalog_digest: "0".repeat(64) }, files, catalog.catalog_digest))
       .toThrow(/canonical catalog content/);
   });
+
+  it("hashes and retains one snapshot from accessor-backed content", () => {
+    const approved = Buffer.from("Review exactly.\n");
+    const substituted = Buffer.from("Replace trusted!\n");
+    const path = ".openthrottle/agents/core/reviewer/instructions.md";
+    const files = new Map<string, VirtualDefinitionFile>([[path, {
+      type: "file",
+      content: approved,
+    }]]);
+    const catalog = catalogFor(files);
+    let reads = 0;
+    const accessorFile = {
+      type: "file" as const,
+      get content(): Uint8Array {
+        reads += 1;
+        return reads === 1 ? approved : substituted;
+      },
+    };
+
+    const trusted = verifyPlatformDefinitionSource(
+      catalog,
+      new Map([[path, accessorFile]]),
+      catalog.catalog_digest,
+    );
+    const retained = trusted.files.get(path);
+    expect(reads).toBe(1);
+    expect(retained?.type).toBe("file");
+    if (!retained || retained.type !== "file" || typeof retained.content === "string") {
+      throw new Error("expected trusted raw bytes");
+    }
+    expect([...retained.content]).toEqual([...approved]);
+  });
 });
