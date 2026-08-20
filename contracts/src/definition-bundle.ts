@@ -94,8 +94,10 @@ function definitionPath(value: unknown, kind: DefinitionKind, definitionId: stri
     fail(path, `must be exactly ${expected} for ${kind} ${definitionId}`);
   }
   if (kind === "loop") {
-    const [pipelineId, loopId, ...rest] = definitionId.split("/");
-    if (!pipelineId || !loopId || rest.length > 0) {
+    const separator = definitionId.lastIndexOf("/");
+    const pipelineId = definitionId.slice(0, separator);
+    const loopId = definitionId.slice(separator + 1);
+    if (separator <= 0 || !pipelineId || !loopId) {
       fail(path, "loop definition_id must be <pipeline-id>/<loop-id>");
     }
     const loopPrefix = `.openthrottle/pipelines/${pipelineId}/loops/${loopId}.`;
