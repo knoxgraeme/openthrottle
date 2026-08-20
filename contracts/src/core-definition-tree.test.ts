@@ -30,6 +30,14 @@ const compilerEnvironmentDescriptor = JSON.parse(readFileSync(
   join(generatedRoot, "compiler-environment.json"),
   "utf8",
 )) as CompilerEnvironmentDescriptor;
+const parityGolden = JSON.parse(readFileSync(
+  join(repositoryRoot, "contracts/fixtures/definition-compiler/committed-golden.json"),
+  "utf8",
+)) as {
+  source_commit: string;
+  bundle_digest: string;
+  manifest_digest: string;
+};
 
 const agentIds = [
   "admission-planner",
@@ -154,6 +162,24 @@ describe("root .openthrottle definition tree", () => {
     expect(actual.has("pipelines/core/structured/loops/unit-cycle.yml")).toBe(true);
     expect([...actual].some((path) => path.includes("/agents/openai.yaml"))).toBe(false);
     expect(actual.has("config.yml")).toBe(false);
+  });
+
+  it("keeps built-in skill craft free of legacy model-authored result protocols", () => {
+    const skillRoot = join(definitionRoot, "skills/core");
+    const forbidden = [
+      { label: "receipt terminology", pattern: /receipt/i },
+      { label: "stage-proposal schema", pattern: /openthrottle\.stage-proposal/i },
+      { label: "stage-result tool", pattern: /ot-stage-result/i },
+      { label: "stage-proposal output path", pattern: /ot_stage_proposal_file/i },
+    ];
+    const matches = filesBelow(skillRoot).flatMap((path) => {
+      const content = readFileSync(path, "utf8");
+      return forbidden
+        .filter(({ pattern }) => pattern.test(content))
+        .map(({ label }) => `${relative(skillRoot, path)}: ${label}`);
+    });
+
+    expect(matches).toEqual([]);
   });
 
   it("copies every included task package byte-for-byte except provider metadata", () => {
@@ -300,5 +326,26 @@ describe("root .openthrottle definition tree", () => {
       ],
       loop: { over: "selection.personas", body: ["persona_review"] },
     });
+  });
+
+  it("matches the committed cross-environment compiler golden", () => {
+    const config = readFileSync(join(
+      repositoryRoot,
+      "contracts/fixtures/definition-compiler/committed-repository/.openthrottle/config.yml",
+    ));
+    const result = compileDefinitionBundle({
+      repository: {
+        source_commit: parityGolden.source_commit,
+        files: new Map([[".openthrottle/config.yml", { type: "file", content: config }]]),
+      },
+      platform: sealedPlatform(),
+      compiler_environment: verifyCompilerEnvironment(
+        compilerEnvironmentDescriptor,
+        RELEASE_COMPILER_ENVIRONMENT_DIGEST,
+      ),
+    });
+
+    expect(result.bundle.digest).toBe(parityGolden.bundle_digest);
+    expect(result.manifest.digest).toBe(parityGolden.manifest_digest);
   });
 });

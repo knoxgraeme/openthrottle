@@ -1958,7 +1958,7 @@ describe("pipeline coordinator", () => {
   it("carries sealed input artifacts into an implement repair attempt", () => {
     const sealedPlanPayload = canonicalJson({
       schema: "openthrottle.execution-plan/v2",
-      execution_plan: { schema: "openthrottle.execution-plan/v2", graph_id: "structured", plan_id: "sealed" },
+      execution_plan: { schema: "openthrottle.execution-plan/v2", pipeline_id: "core/structured", plan_id: "sealed" },
     });
     const inputArtifacts = [{
       kind: "stage_result" as const,

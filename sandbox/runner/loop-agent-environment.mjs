@@ -11,6 +11,7 @@ import {
   resetAgentOwnedDirectory,
 } from "./filesystem-isolation.mjs";
 import { materializeClaudeProfileBaseline, materializeCodexProfileBaseline } from "./action-home-baseline.mjs";
+import { materializeFilesystemSkillAllowlist } from "./action-profile.mjs";
 import { materializeNativeSessionState, nativeSessionStoragePath } from "./native-session-package.mjs";
 import { materializeRepositorySkillPackage } from "./repository-skills.mjs";
 import { appendCodexMcpConfig, selectAllowedMcpServers, writeClaudeMcpConfigFile } from "./loop-mcp-config.mjs";
@@ -171,11 +172,14 @@ function safeBaseEnv(env = process.env) {
 // (bounded-process-helper.mjs spawns with exactly this object, replacing
 // inheritance rather than appending to it). CODEX_AUTH_JSON is excluded here
 // too -- it is materialized to a file (writeCodexAuthFile) instead.
-function credentialPassthroughEnv(credentialEnv) {
+function credentialPassthroughEnv(credentialEnv, engine) {
   const result = {};
-  for (const [name, value] of Object.entries(credentialEnv)) {
-    if (name !== "CODEX_AUTH_JSON") result[name] = value;
-  }
+  const allowed = engine === "claude"
+    ? new Set(["CLAUDE_CODE_OAUTH_TOKEN"])
+    : engine === "opencode"
+      ? new Set(["KIMI_CODE_API_KEY"])
+      : new Set();
+  for (const [name, value] of Object.entries(credentialEnv)) if (allowed.has(name)) result[name] = value;
   return result;
 }
 
@@ -199,13 +203,18 @@ export function prepareLoopAgentEnvironment(request, repoDir, credentialEnv = {}
   // credential env set for the whole attempt), so this action's engine
   // process sees exactly this fixed baseline plus its own credentials --
   // never a leftover from another role/action, and never via argv.
-  const secretEnv = { ...safeBaseEnv(), ...credentialPassthroughEnv(credentialEnv) };
+  const secretEnv = { ...safeBaseEnv(), ...credentialPassthroughEnv(credentialEnv, request.agent) };
   if (request.repositorySkill) {
     materializeRepositorySkillPackage({
       packageInfo: request.repositorySkill,
       repoDir,
       agent: request.agent,
       discoveryRoot: loopSkillDiscoveryRoot(request),
+    });
+  } else {
+    materializeFilesystemSkillAllowlist({
+      discoveryRoot: loopSkillDiscoveryRoot(request),
+      skillIds: [`core/${request.skill}`],
     });
   }
   return {

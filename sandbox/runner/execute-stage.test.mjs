@@ -38,6 +38,7 @@ import {
   repositoryCommandEnvironment,
   repositorySkillStageEnvironment,
   resolveContextInvocation,
+  resolveStageSemanticResultSchema,
   runCapturedProcess,
   runWithAgentProcessFence,
   runtimeCapabilityDigest,
@@ -45,6 +46,7 @@ import {
   validateStageRequest,
 } from "./execute-stage.mjs";
 import { nativeSessionStoragePath, sealNativeSessionPackage } from "./native-session-package.mjs";
+import { normalizeSubmittedResult } from "./result-submission.mjs";
 
 const STAGE_CREDENTIAL_FIXTURE_ENV = {
   CLAUDE_CODE_OAUTH_TOKEN: "fixture-claude-oauth-credential",
@@ -120,9 +122,9 @@ function repository() {
 }
 
 function sealedRepositorySkillPackage(repoDir, {
-  skillDir = ".openthrottle/skills/implement_unit",
-  invocation = "implement_unit",
-  skillName = "implement_unit",
+  skillDir = ".openthrottle/skills/implement-unit",
+  invocation = "implement-unit",
+  skillName = "implement-unit",
   body = "# Skill\n",
   references = {},
 } = {}) {
@@ -263,6 +265,14 @@ function successProposal() {
   };
 }
 
+function reviewResultCandidate(summary = "Review complete") {
+  return {
+    schema: "openthrottle.result-candidate/v1",
+    outcome: "success",
+    payload: { summary, findings: [] },
+  };
+}
+
 function tuneReceipt(request) {
   return {
     schema: "openthrottle.receipt/v1",
@@ -306,7 +316,7 @@ function tuneReceipt(request) {
 function admissionPlanFixture() {
   const executionPlan = {
     schema: "openthrottle.execution-plan/v2",
-    graph_id: "structured",
+    pipeline_id: "core/structured",
     plan_id: "automatic",
     units: [{
       id: "unit_a",
@@ -416,6 +426,10 @@ describe("one-stage executor", () => {
       .properties.name.enum).toEqual([`a${"b".repeat(79)}`]);
     expect(admissionPlannerSemanticOutputSchema([]).properties.execution_plan.anyOf[1]
       .properties.commands.maxItems).toBe(0);
+    const planSchema = admissionPlannerSemanticOutputSchema([]).properties.execution_plan.anyOf[1];
+    expect(planSchema.required).toContain("pipeline_id");
+    expect(planSchema.required).not.toContain("graph_id");
+    expect(planSchema.properties.pipeline_id.enum).toEqual(["core/structured"]);
   });
 
   it("does not apply admission bindings to an ordinary stage with the planner stage id", () => {
@@ -518,121 +532,66 @@ describe("one-stage executor", () => {
     expect(() => validateStageRequest({ ...slashNativeSessionRequest, ...createStageRequestHash(slashNativeSessionRequest) }))
       .toThrow(/nativeSessionId/);
     expect(stagePrompt(request, "/tmp/proposal.json")).toContain("Implement the approved fixture change.");
-    // The default skillRoot ("/opt/openthrottle/skills/tasks") only exists
-    // inside the baked sandbox image, not a bare CI checkout, and a mapped
-    // skill whose package is missing now fails closed rather than falling
-    // back -- so these assertions need their own hermetic skillRoot to prove
-    // capability-keyed selection rather than depend on ambient filesystem
-    // state that differs between environments.
-    const stageSkillRoot = mkdtempSync(join(tmpdir(), "ot-stage-publish-skill-"));
-    directories.push(stageSkillRoot);
-    for (const name of ["publish", "implement-plan", "tune"]) {
-      mkdirSync(join(stageSkillRoot, name), { recursive: true });
-      writeFileSync(join(stageSkillRoot, name, "SKILL.md"), `---\nname: ${name}\n---\nFixture.\n`);
-    }
-    expect(stagePrompt(
-      { ...request, taskType: "investigate", capability: "ce/publish@1" },
-      "/tmp/proposal.json",
-      { skillRoot: stageSkillRoot },
-    )).toMatch(/^\$publish/);
     expect(stagePrompt(
       { ...request, agent: "claude", capability: "ce/implement@1" },
       "/tmp/proposal.json",
-      { agent: "claude", skillRoot: stageSkillRoot }
+      { agent: "claude" }
     )).toMatch(/^\/implement-plan/);
-    expect(stagePrompt(
+    expect(() => stagePrompt(
+      { ...request, taskType: "investigate", capability: "ce/publish@1" },
+      "/tmp/proposal.json",
+    )).toThrow(/has no mapped skill/);
+    expect(() => stagePrompt(
       { ...request, capability: "core/tune@1", requiredArtifacts: ["stage_result", "standard_receipt"] },
       "/tmp/proposal.json",
-      { skillRoot: stageSkillRoot },
-    )).toMatch(/^\$tune/);
+    )).toThrow(/has no mapped skill/);
   });
 
   it("selects the stage skill from the capability, not the task type", () => {
     const { request } = fixture();
-    const skillRoot = mkdtempSync(join(tmpdir(), "ot-stage-capability-skills-"));
-    directories.push(skillRoot);
-    for (const name of ["implement-plan", "investigate", "publish", "tune"]) {
-      mkdirSync(join(skillRoot, name), { recursive: true });
-      writeFileSync(join(skillRoot, name, "SKILL.md"), `---\nname: ${name}\n---\nFixture.\n`);
-    }
-    const prompt = (capability) => stagePrompt({ ...request, capability }, "/tmp/proposal.json", { skillRoot });
+    const prompt = (capability) => stagePrompt({ ...request, capability }, "/tmp/proposal.json");
 
     expect(prompt("ce/investigate@1")).toMatch(/^\$investigate/);
-    expect(prompt("ce/publish@1")).toMatch(/^\$publish/);
-    expect(prompt("core/tune@1")).toMatch(/^\$tune/);
+    expect(() => prompt("ce/publish@1")).toThrow(/has no mapped skill/);
+    expect(() => prompt("core/tune@1")).toThrow(/has no mapped skill/);
     // ce/plan@1 is a registered capability with no drafted skill of its own;
     // it maps explicitly to implement-plan rather than failing closed like a
     // genuinely unmapped capability.
     expect(prompt("ce/plan@1")).toMatch(/^\$implement-plan/);
     expect(() => prompt("ce/unmapped@1")).toThrow(/has no mapped skill/);
-    expect(prompt("agent/semantic@1")).toContain("Review the requested repository state");
-    expect(() => prompt("accept-unit@1")).toThrow(/has no ordinary stage dispatch adapter/);
-    // A mapped capability whose package is missing fails closed. It must never
-    // silently resolve to implement-plan: that would run an implement-and-
-    // commit skill for a read-only review or simplify stage.
-    expect(() => prompt("ce/review@1")).toThrow(/maps to skill review-change, which is not installed/);
-    expect(() => prompt("ce/simplify@1")).toThrow(/maps to skill simplify-change, which is not installed/);
-
-    mkdirSync(join(skillRoot, "review-change"), { recursive: true });
-    writeFileSync(join(skillRoot, "review-change", "SKILL.md"), "---\nname: review-change\n---\nFixture.\n");
+    expect(prompt("agent/semantic@1")).toContain("## Agent instructions (core/ordinary-worker)");
+    expect(prompt("agent/semantic@1")).toContain("## Available skills\n\n[]");
+    expect(() => prompt("accept-unit@1")).toThrow(/has no mapped skill/);
     expect(prompt("ce/review@1")).toMatch(/^\$review-change/);
+    expect(prompt("ce/simplify@1")).toMatch(/^\$simplify-change/);
   });
 
-  it("renders the canonical adapter body for OpenCode fenced stages", () => {
-    const skillRoot = mkdtempSync(join(tmpdir(), "ot-stage-skills-"));
-    directories.push(skillRoot);
-    mkdirSync(join(skillRoot, "implement-plan"), { recursive: true });
-    writeFileSync(
-      join(skillRoot, "implement-plan", "SKILL.md"),
-      "---\nname: implement-plan\n---\nRestate the sealed plan slice for this fenced stage.\n"
-    );
+  it("activates the native OpenCode skill without inlining its body", () => {
     const prompt = stagePrompt(
       { ...fixture().request, capability: "ce/implement@1" },
       "/tmp/proposal.json",
-      {
-      agent: "opencode",
-      skillRoot,
-      }
+      { agent: "opencode" },
     );
-    expect(prompt).toContain("$implement-plan");
-    expect(prompt).toContain("Restate the sealed plan slice");
-    expect(prompt).not.toContain("name: implement-plan");
+    const body = readFileSync(join(
+      fileURLToPath(new URL("../../.openthrottle/skills/core/implement-plan/SKILL.md", import.meta.url)),
+    ), "utf8").split("---").at(-1).trim();
+    expect(prompt).toContain('Use the native skill tool to load "implement-plan" before acting.');
+    expect(prompt).not.toContain(body);
+    expect(prompt).toContain('"id":"core/implement-plan"');
   });
 
-  it("inlines references/*.md into the OpenCode prompt so a SKILL.md pointer resolves", () => {
-    const skillRoot = mkdtempSync(join(tmpdir(), "ot-stage-skills-refs-"));
-    directories.push(skillRoot);
-    mkdirSync(join(skillRoot, "review-change", "references"), { recursive: true });
-    writeFileSync(
-      join(skillRoot, "review-change", "SKILL.md"),
-      "---\nname: review-change\n---\nFor the full lens checklists, read `references/branch-review-passes.md`.\n"
-    );
-    writeFileSync(
-      join(skillRoot, "review-change", "references", "branch-review-passes.md"),
-      "# Branch review passes\n\nThe full lens checklist content goes here.\n"
-    );
+  it("keeps OpenCode references progressively disclosed instead of copying them into the prompt", () => {
+    const reference = readFileSync(fileURLToPath(new URL(
+      "../../.openthrottle/skills/core/review-change/references/branch-review-passes.md",
+      import.meta.url,
+    )), "utf8").trim();
     const prompt = stagePrompt(
       { ...fixture().request, capability: "ce/review@1" },
       "/tmp/proposal.json",
-      { agent: "opencode", skillRoot }
+      { agent: "opencode" },
     );
-    expect(prompt).toContain("For the full lens checklists, read `references/branch-review-passes.md`");
-    expect(prompt).toContain("# Branch review passes");
-    expect(prompt).toContain("The full lens checklist content goes here.");
-  });
-
-  it("adds nothing for an OpenCode skill with no references directory", () => {
-    const skillRoot = mkdtempSync(join(tmpdir(), "ot-stage-skills-norefs-"));
-    directories.push(skillRoot);
-    mkdirSync(join(skillRoot, "publish"), { recursive: true });
-    writeFileSync(join(skillRoot, "publish", "SKILL.md"), "---\nname: publish\n---\nPublish body.\n");
-    const prompt = stagePrompt(
-      { ...fixture().request, capability: "ce/publish@1" },
-      "/tmp/proposal.json",
-      { agent: "opencode", skillRoot }
-    );
-    expect(prompt).toContain("Publish body.");
-    expect(prompt).not.toContain("## references/");
+    expect(prompt).toContain('Use the native skill tool to load "review-change" before acting.');
+    expect(prompt).not.toContain(reference);
   });
 
   it("rejects wrong sealed config/manifest digests before invocation", () => {
@@ -663,6 +622,18 @@ describe("one-stage executor", () => {
     expect(resolveContextInvocation(planner)).toEqual({
       mode: "fresh",
       nativeSessionId: null,
+      reconstructed: false,
+      readOnly: true,
+    });
+    const resumedReview = fixture({
+      capability: "ce/review@1",
+      stageId: "review",
+      contextPolicy: "resume_required",
+      nativeSessionId: "review-native-1",
+    }).request;
+    expect(resolveContextInvocation(resumedReview)).toEqual({
+      mode: "resume",
+      nativeSessionId: "review-native-1",
       reconstructed: false,
       readOnly: true,
     });
@@ -862,6 +833,262 @@ JSON
     expect(execFileSync("git", ["config", "--get", "remote.origin.url"], { cwd: view, encoding: "utf8" }).trim())
       .toBe("DISABLED_BY_OPENTHROTTLE_READONLY_VIEW");
     expect(readFileSync(join(input.repoDir, "file.txt"), "utf8")).toBe("initial\n");
+  });
+
+  it("dispatches ordinary review against the same detached exact-subject immutable view", () => {
+    const input = fixture({
+      capability: "ce/review@1",
+      stageId: "review",
+      liveSteering: false,
+    });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-review-view-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+
+    writeFileSync(join(input.repoDir, "file.txt"), "unsealed worktree mutation\n");
+    const view = prepareAdmissionReadOnlyRepository(input.request, input.repoDir);
+
+    expect(view).not.toBe(input.repoDir);
+    expect(readFileSync(join(view, "file.txt"), "utf8")).toBe("initial\n");
+    expect(statSync(view).mode & 0o777).toBe(0o555);
+    expect(statSync(join(view, "file.txt")).mode & 0o777).toBe(0o444);
+    expect(readFileSync(join(input.repoDir, "file.txt"), "utf8")).toBe("unsealed worktree mutation\n");
+  });
+
+  it("keeps ordinary Codex review read-only while preserving its sealed session for result correction", () => {
+    const input = fixture({
+      agent: "codex",
+      capability: "ce/review@1",
+      stageId: "review",
+      liveSteering: false,
+    });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-review-codex-"));
+    const sourceRoot = mkdtempSync(join(tmpdir(), "ot-review-sessions-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-review-codex-bin-"));
+    const argsPath = join(binDir, "args");
+    directories.push(actionRoot, sourceRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    process.env.OT_NATIVE_SESSION_SOURCE_ROOT = sourceRoot;
+    const repositoryView = prepareAdmissionReadOnlyRepository(input.request, input.repoDir);
+
+    installFakeGosu(binDir);
+    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" > '${argsPath}'
+test -r "$CODEX_HOME/auth.json"
+test -z "\${CODEX_AUTH_JSON:-}"
+test ! -w "$PWD/file.txt"
+mkdir -p "$CODEX_HOME/sessions"
+printf '%s' '${codexSessionStorageRecord("review-session-1").trim()}' > "$CODEX_HOME/sessions/review-session-1.json"
+cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
+{"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"reviewed","evidence":["immutable subject inspected"],"findings":[],"actions":[],"uncertainty":[]}
+JSON
+printf '{"type":"thread.started","thread_id":"review-session-1"}\n'
+`);
+
+    const result = withPrependedPath(binDir, () => defaultRunAgent({
+      request: input.request,
+      invocation: resolveContextInvocation(input.request),
+      repoDir: repositoryView,
+      skillSourceRepoDir: input.repoDir,
+      proposalPath: join(actionRoot, "proposal.json"),
+      timeoutMs: 5_000,
+    }));
+
+    const args = readFileSync(argsPath, "utf8").trim().split("\n");
+    expect(args).toContain("read-only");
+    expect(args).not.toContain("--ephemeral");
+    expect(result.nativeSessionId).toBe("review-session-1");
+    expect(existsSync(join(sourceRoot, "codex", "review-session-1"))).toBe(true);
+    expect(existsSync(join(actionRoot, input.request.attemptId))).toBe(true);
+  });
+
+  it.each([
+    { agent: "claude", schemaFlag: "--json-schema" },
+    { agent: "codex", schemaFlag: "--output-schema" },
+  ])("passes the sealed semantic result schema through the $agent native flag", ({ agent, schemaFlag }) => {
+    const input = fixture({
+      agent,
+      capability: "ce/review@1",
+      stageId: "review",
+      liveSteering: false,
+    });
+    const actionRoot = mkdtempSync(join(tmpdir(), `ot-${agent}-result-schema-`));
+    const binDir = mkdtempSync(join(tmpdir(), `ot-${agent}-result-bin-`));
+    const argsPath = join(binDir, "args");
+    const promptPath = join(binDir, "prompt");
+    directories.push(actionRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    installFakeGosu(binDir);
+    writeExecutable(join(binDir, agent), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" > '${argsPath}'
+cat > '${promptPath}'
+test -r "$OT_RESULT_SCHEMA_FILE"
+test -n "$OT_RESULT_CANDIDATE_FILE"
+test -n "$OT_RESULT_REJECTION_FILE"
+exit 47
+`);
+
+    const result = withPrependedPath(binDir, () => defaultRunAgent({
+      request: input.request,
+      invocation: resolveContextInvocation(input.request),
+      repoDir: prepareAdmissionReadOnlyRepository(input.request, input.repoDir),
+      skillSourceRepoDir: input.repoDir,
+      proposalPath: join(actionRoot, "proposal.json"),
+      timeoutMs: 5_000,
+      semanticResultSchema: "core/review-result",
+    }));
+
+    const args = readFileSync(argsPath, "utf8").trim().split("\n");
+    const flagIndex = args.indexOf(schemaFlag);
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    const providerSchema = agent === "claude"
+      ? JSON.parse(args[flagIndex + 1])
+      : JSON.parse(readFileSync(args[flagIndex + 1], "utf8"));
+    expect(providerSchema).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      properties: { schema: { const: "openthrottle.result-candidate/v1" } },
+    });
+    expect(readFileSync(promptPath, "utf8")).toContain("openthrottle.result-candidate/v1");
+    expect(readFileSync(promptPath, "utf8")).not.toContain("openthrottle.stage-proposal/v1");
+    expect(result.exitCode).toBe(47);
+    expect(result.resultCandidate).toMatchObject({ status: "missing" });
+  });
+
+  it("post-validates malformed OpenCode semantic output through the shared result channel", () => {
+    const input = fixture({
+      agent: "opencode",
+      capability: "ce/review@1",
+      stageId: "review",
+      liveSteering: false,
+    });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-opencode-result-schema-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-opencode-result-bin-"));
+    directories.push(actionRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    installFakeGosu(binDir);
+    const malformed = {
+      schema: "openthrottle.result-candidate/v1",
+      outcome: "success",
+      payload: { summary: "missing findings" },
+    };
+    writeExecutable(join(binDir, "opencode"), `#!/usr/bin/env bash
+set -euo pipefail
+cat >/dev/null
+printf '%s\n' '${JSON.stringify({ type: "text", part: { text: JSON.stringify(malformed) } })}'
+`);
+
+    const result = withPrependedPath(binDir, () => defaultRunAgent({
+      request: input.request,
+      invocation: resolveContextInvocation(input.request),
+      repoDir: prepareAdmissionReadOnlyRepository(input.request, input.repoDir),
+      skillSourceRepoDir: input.repoDir,
+      proposalPath: join(actionRoot, "proposal.json"),
+      timeoutMs: 5_000,
+      model: "kimi-code/kimi-for-coding",
+      semanticResultSchema: "core/review-result",
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect(result.resultCandidate).toMatchObject({
+      status: "invalid",
+      diagnostics: [{ path: "result_candidate.payload.findings" }],
+    });
+    expect(existsSync(result.resultChannel.rejection_path)).toBe(true);
+  });
+
+  it("settles OPE-188 in one stage invocation and keeps inspect output subject null", () => {
+    const input = fixture({
+      agent: "codex",
+      capability: "ce/review@1",
+      stageId: "review",
+      liveSteering: false,
+    });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-review-settlement-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const schema = resolveStageSemanticResultSchema("core/review-result");
+    const runAgent = vi.fn(() => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      nativeSessionId: "review-session-1",
+      resultCandidate: {
+        status: "valid",
+        staged: normalizeSubmittedResult(reviewResultCandidate(["Reviewed all paths.", "No defects found."]), schema),
+      },
+    }));
+
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent,
+      semanticResultSchema: "core/review-result",
+    });
+
+    expect(runAgent).toHaveBeenCalledOnce();
+    expect(result.resultSettlement).toMatchObject({
+      state: "work_complete",
+      checkpoint: {
+        input_subject: input.request.expectedSubject,
+        output_subject: null,
+        native_session_id: "review-session-1",
+      },
+      candidate: {
+        candidate: { payload: { summary: "Reviewed all paths.\nNo defects found." } },
+        transformations: [{ path: "/payload/summary" }],
+      },
+    });
+    expect(result.outcome).toBe("success");
+  });
+
+  it("preserves completed review work as result_pending when only its candidate is malformed", () => {
+    const input = fixture({
+      agent: "codex",
+      capability: "ce/review@1",
+      stageId: "review",
+      liveSteering: false,
+    });
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-review-pending-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const runAgent = vi.fn(() => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      nativeSessionId: "review-session-1",
+      resultCandidate: {
+        status: "invalid",
+        original_hash: "e".repeat(64),
+        diagnostics: [{
+          path: "result_candidate.payload.summary",
+          detail: "must be a non-empty string",
+        }],
+      },
+    }));
+
+    const result = executeStage({
+      ...input,
+      now: clock(),
+      runAgent,
+      semanticResultSchema: "core/review-result",
+    });
+
+    expect(runAgent).toHaveBeenCalledOnce();
+    expect(result.resultSettlement).toMatchObject({
+      state: "result_pending",
+      reason: "invalid_candidate",
+      checkpoint: { output_subject: null, native_session_id: "review-session-1" },
+      correction: {
+        phase: "result_correction",
+        output_subject: null,
+        native_session_id: "review-session-1",
+        allowed_tools: ["ot-result"],
+      },
+    });
+    expect(result.outcome).toBe("semantic_repair_required");
   });
 
   it.each([
@@ -1355,9 +1582,15 @@ printf '%s\\n' 'transport diagnostic' >&2
   });
 
   it.each([
-    ["a non-structured graph", () => {
+    ["a non-structured pipeline", () => {
       const output = admissionPlanFixture();
-      output.execution_plan.graph_id = "linear";
+      output.execution_plan.pipeline_id = "repo/custom";
+      return output;
+    }],
+    ["a legacy graph identity", () => {
+      const output = admissionPlanFixture();
+      delete output.execution_plan.pipeline_id;
+      output.execution_plan.graph_id = "structured";
       return output;
     }],
     ["an oversized canonical plan", () => {
@@ -2173,13 +2406,13 @@ printf '%s\\n' 'transport diagnostic' >&2
   it("accepts repository skill identity when it matches the sealed manifest", () => {
     const repositorySkill = {
       schema: "openthrottle.repository-skill-package/v1",
-      reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/implement_unit`,
-      invocation: "implement_unit",
-      directory: ".openthrottle/skills/implement_unit",
+      reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/implement-unit`,
+      invocation: "implement-unit",
+      directory: ".openthrottle/skills/implement-unit",
       commit: "a".repeat(40),
       packageDigest: "d".repeat(64),
       files: [{
-        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        path: ".openthrottle/skills/implement-unit/SKILL.md",
         blobSha: "b".repeat(40),
         digest: "c".repeat(64),
       }],
@@ -2201,10 +2434,10 @@ printf '%s\\n' 'transport diagnostic' >&2
 
   it("materializes only the sealed repository skill package into engine discovery", () => {
     const repoDir = repository();
-    const skillDir = ".openthrottle/skills/implement_unit";
+    const skillDir = ".openthrottle/skills/implement-unit";
     mkdirSync(join(repoDir, skillDir), { recursive: true });
     mkdirSync(join(repoDir, ".openthrottle", "skills", "other-skill"), { recursive: true });
-    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement_unit\n---\n# Skill\n");
+    writeFileSync(join(repoDir, skillDir, "SKILL.md"), "---\nname: implement-unit\n---\n# Skill\n");
     writeFileSync(join(repoDir, skillDir, "helper.txt"), "helper\n");
     writeFileSync(join(repoDir, skillDir, "run.sh"), "#!/usr/bin/env sh\nexit 0\n");
     writeFileSync(join(repoDir, ".openthrottle", "skills", "other-skill", "SKILL.md"), "---\nname: other\n---\n");
@@ -2224,7 +2457,7 @@ printf '%s\\n' 'transport diagnostic' >&2
     const unsignedPackage = {
       schema: "openthrottle.repository-skill-package/v1",
       reference: `repo://owner/repo@${commit}#${skillDir}`,
-      invocation: "implement_unit",
+      invocation: "implement-unit",
       directory: skillDir,
       commit,
       files,
@@ -2282,7 +2515,7 @@ printf '%s\\n' 'transport diagnostic' >&2
 
     const materialized = materializeRepositorySkill({ request, repoDir });
 
-    expect(readFileSync(join(materialized, "SKILL.md"), "utf8")).toContain("name: implement_unit");
+    expect(readFileSync(join(materialized, "SKILL.md"), "utf8")).toContain("name: implement-unit");
     expect(readFileSync(join(materialized, "helper.txt"), "utf8")).toBe("helper\n");
     expect(statSync(join(materialized, "SKILL.md")).mode & 0o777).toBe(0o444);
     expect(statSync(join(materialized, "run.sh")).mode & 0o777).toBe(0o555);
@@ -2327,25 +2560,27 @@ printf '%s\\n' 'transport diagnostic' >&2
     expect(scoped.env).toContain(`CODEX_HOME=${join(stageActionRoot, "attempt-1", "codex")}`);
     expect(statSync(stageActionRoot).mode & 0o777).toBe(0o711);
     expect(statSync(join(stageActionRoot, "attempt-1")).mode & 0o777).toBe(0o711);
-    expect(scopedMaterialized).toBe(join(stageActionRoot, "attempt-1", "codex", "skills", "implement_unit"));
-    expect(readFileSync(join(scopedMaterialized, "SKILL.md"), "utf8")).toContain("name: implement_unit");
-    expect(existsSync(join(globalDiscoveryRoot, "implement_unit"))).toBe(false);
-    expect(existsSync(join(stageActionRoot, "attempt-1", "codex", "auth.json"))).toBe(false);
+    expect(scopedMaterialized).toBe(join(stageActionRoot, "attempt-1", "codex", "skills", "implement-unit"));
+    expect(readFileSync(join(scopedMaterialized, "SKILL.md"), "utf8")).toContain("name: implement-unit");
+    expect(existsSync(join(globalDiscoveryRoot, "implement-unit"))).toBe(false);
+    expect(existsSync(join(stageActionRoot, "attempt-1", "codex", "auth.json"))).toBe(true);
+    expect(readFileSync(join(stageActionRoot, "attempt-1", "codex", "auth.json"), "utf8"))
+      .toBe(STAGE_CREDENTIAL_FIXTURE_ENV.CODEX_AUTH_JSON);
     expect(lockRepositorySkillStageHome(request)).toBe(true);
     expect(statSync(join(stageActionRoot, "attempt-1")).mode & 0o777).toBe(0o700);
     expect(statSync(join(stageActionRoot, "attempt-1", "codex")).mode & 0o777).toBe(0o700);
   });
 
-  it("locks persistent agent profiles for repository-skill stages only", () => {
+  it("locks persistent agent profiles after every stage action", () => {
     const repositorySkill = {
       schema: "openthrottle.repository-skill-package/v1",
-      reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/implement_unit`,
-      invocation: "implement_unit",
-      directory: ".openthrottle/skills/implement_unit",
+      reference: `repo://owner/repo@${"a".repeat(40)}#.openthrottle/skills/implement-unit`,
+      invocation: "implement-unit",
+      directory: ".openthrottle/skills/implement-unit",
       commit: "a".repeat(40),
       packageDigest: "d".repeat(64),
       files: [{
-        path: ".openthrottle/skills/implement_unit/SKILL.md",
+        path: ".openthrottle/skills/implement-unit/SKILL.md",
         blobSha: "b".repeat(40),
         digest: "c".repeat(64),
       }],
@@ -2359,8 +2594,8 @@ printf '%s\\n' 'transport diagnostic' >&2
 
     expect(lockRepositorySkillStagePersistentProfiles(repositorySkillRequest, lock)).toEqual(["/home/agent/.codex"]);
     expect(lock).toHaveBeenCalledOnce();
-    expect(lockRepositorySkillStagePersistentProfiles(semanticRequest, lock)).toEqual([]);
-    expect(lock).toHaveBeenCalledOnce();
+    expect(lockRepositorySkillStagePersistentProfiles(semanticRequest, lock)).toEqual(["/home/agent/.codex"]);
+    expect(lock).toHaveBeenCalledTimes(2);
   });
 
   it("materializes repository-skill stages under each engine discovery root", () => {
@@ -2384,17 +2619,18 @@ printf '%s\\n' 'transport diagnostic' >&2
       });
       const actionDirectory = join(actionRoot, "attempt-1");
       const expectedRoot = agent === "claude"
-        ? join(actionDirectory, "home", ".claude", "skills", "implement_unit")
+        ? join(actionDirectory, "home", ".claude", "skills", "implement-unit")
         : agent === "codex"
-          ? join(actionDirectory, "codex", "skills", "implement_unit")
-          : join(actionDirectory, "opencode-skills", "implement_unit");
+          ? join(actionDirectory, "codex", "skills", "implement-unit")
+          : join(actionDirectory, "opencode-skills", "implement-unit");
 
       expect(materialized).toBe(expectedRoot);
       expect(readFileSync(join(materialized, "SKILL.md"), "utf8")).toContain("Pinned repository package");
-      expect(existsSync(join(actionDirectory, "codex", "auth.json"))).toBe(false);
+      expect(existsSync(join(actionDirectory, "codex", "auth.json"))).toBe(agent === "codex");
       if (agent === "opencode") {
-        expect(stagePrompt(input.request, join(actionDirectory, "home", "proposal.json"), { agent, repositorySkillRoot: materialized }))
-          .toContain("Pinned repository package");
+        const prompt = stagePrompt(input.request, join(actionDirectory, "home", "proposal.json"), { agent });
+        expect(prompt).toContain('Use the native skill tool to load "implement-unit" before acting.');
+        expect(prompt).not.toContain("Pinned repository package");
       }
     }
   });
@@ -2402,8 +2638,8 @@ printf '%s\\n' 'transport diagnostic' >&2
   it("materializes repository admission overrides without changing their admission capability", () => {
     const repoDir = repository();
     const { repositorySkill } = sealedRepositorySkillPackage(repoDir, {
-      invocation: "custom_planner",
-      skillName: "custom_planner",
+      invocation: "custom-planner",
+      skillName: "custom-planner",
       body: "# Custom admission planner\n",
     });
 
@@ -2431,13 +2667,15 @@ printf '%s\\n' 'transport diagnostic' >&2
       });
 
       expect(readFileSync(join(materialized, "SKILL.md"), "utf8")).toContain("Custom admission planner");
-      expect(prompt).toContain(`${agent === "claude" ? "/" : "$"}custom_planner`);
-      expect(prompt).not.toContain(`${agent === "claude" ? "/" : "$"}admission-plan`);
-      if (agent === "opencode") expect(prompt).toContain("Custom admission planner");
+      expect(prompt).toContain(agent === "claude"
+        ? "/custom-planner"
+        : 'Use the native skill tool to load "custom-planner" before acting.');
+      expect(prompt).not.toContain('"id":"core/admission-plan"');
+      if (agent === "opencode") expect(prompt).not.toContain("Custom admission planner");
     }
   });
 
-  it("inlines repository-skill references for OpenCode prompts", () => {
+  it("keeps repository-skill references lazy for OpenCode prompts", () => {
     const repoDir = repository();
     const { repositorySkill } = sealedRepositorySkillPackage(repoDir, {
       body: "# Pinned repository package\n\nRead `references/checklist.md` before acting.\n",
@@ -2456,10 +2694,11 @@ printf '%s\\n' 'transport diagnostic' >&2
 
     const prompt = stagePrompt(input.request, join(actionRoot, "proposal.json"), {
       agent: "opencode",
-      repositorySkillRoot: materialized,
     });
-    expect(prompt).toContain("## references/checklist.md");
-    expect(prompt).toContain("CHECKLIST_SENTINEL: verify the exact sealed inputs.");
+    expect(prompt).toContain('Use the native skill tool to load "implement-unit" before acting.');
+    expect(prompt).not.toContain("CHECKLIST_SENTINEL: verify the exact sealed inputs.");
+    expect(readFileSync(join(materialized, "references", "checklist.md"), "utf8"))
+      .toContain("CHECKLIST_SENTINEL: verify the exact sealed inputs.");
   });
 
   it("locks repository-skill stage homes when setup fails before agent launch", () => {
@@ -2521,7 +2760,7 @@ printf '%s\\n' 'transport diagnostic' >&2
     writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
 set -euo pipefail
 test -f "$CODEX_HOME/sessions/native-1.json"
-test "$OT_STAGE_PROPOSAL_FILE" = "$OT_STAGE_ACTION_ROOT/attempt-1/home/proposal.json"
+test "$OT_STAGE_PROPOSAL_FILE" = "${join(actionRoot, "attempt-1", "home", "proposal.json")}"
 cat > "$OT_STAGE_PROPOSAL_FILE" <<'JSON'
 {"schema":"openthrottle.stage-proposal/v1","suggested_outcome":"success","summary":"ok","evidence":["session materialized"],"findings":[],"actions":[],"uncertainty":[]}
 JSON
@@ -2536,7 +2775,7 @@ printf '{"type":"thread.started","thread_id":"native-1"}\\n'
         timeoutMs: 5_000,
       });
 
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode, result.stderr).toBe(0);
       expect(result.proposal).toMatchObject({ suggested_outcome: "success" });
     });
   });
@@ -2798,6 +3037,7 @@ printf '{"type":"system","subtype":"init","session_id":"different-claude-session
         repoDir: input.repoDir,
         proposalPath: join(actionRoot, "proposal.json"),
         timeoutMs: 1000,
+        materializeNativeSession: () => ({ transferred: true }),
       })).toThrow(/reported native session id does not match the sealed stage request/);
     });
   });
@@ -2968,6 +3208,7 @@ exit 47
           repoDir: input.repoDir,
           proposalPath: join(actionRoot, "proposal.json"),
           timeoutMs: 10_000,
+          materializeNativeSession: () => ({ transferred: true }),
           ...(shape.agent === "opencode" ? { model: "kimi-code/kimi-for-coding" } : {}),
         }));
         expect(result.exitCode).toBe(47);

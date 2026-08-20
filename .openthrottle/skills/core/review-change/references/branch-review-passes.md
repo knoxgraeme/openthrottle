@@ -130,11 +130,10 @@ still open, or superseded — and never drop one silently. A resolved finding is
 raised again only when the defect is demonstrably still present here, and then
 with a note on why the previous repair did not close it.
 
-## Fixing versus flagging
+## Findings, not fixes
 
-The fix authority in `SKILL.md` is narrow on purpose. Before editing rather than
-filing, all three must hold: you verified the defect in this diff, the
-correction is small and local, and it preserves the behavior the plan intends.
-Anything touching a contract, a migration, a design disagreement, or a question
-of scope is a finding. Never weaken, skip, substitute, or delete a test to make
-a check pass — a failing check you silenced is a defect you shipped.
+This review action has inspect authority only. Never edit repository content,
+even when a correction appears small and local. File the defect with a stable
+anchor so the supervisor can schedule a separate writable remediation attempt.
+Never weaken, skip, substitute, or delete a test to make a check pass — a
+failing check you silenced is a defect you concealed.

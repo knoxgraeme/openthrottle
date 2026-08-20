@@ -378,8 +378,8 @@ function addReviewFanoutContextV2(
 // FINAL_REVIEW_PLAN_CONTEXT_LIMIT_BYTES.
 function finalReviewPlanContextV2(plan: ExecutionPlanContractV2, actionKind: UnitActionKind): Record<string, unknown> {
   return {
-    schema: "openthrottle.loop-action-plan-context/v1",
-    graph_id: plan.graph_id,
+    schema: "openthrottle.loop-action-plan-context/v2",
+    pipeline_id: plan.pipeline_id,
     plan_id: plan.plan_id,
     action_kind: actionKind,
     unit: null,
@@ -426,8 +426,8 @@ function loopActionPlanContextV2(
     ? plan.commands.filter((command) => command.unit === undefined || command.unit === input.unitId)
     : plan.commands;
   const context = {
-    schema: "openthrottle.loop-action-plan-context/v1",
-    graph_id: plan.graph_id,
+    schema: "openthrottle.loop-action-plan-context/v2",
+    pipeline_id: plan.pipeline_id,
     plan_id: plan.plan_id,
     action_kind: input.actionKind,
     unit: unitPlanContextV2(unit),

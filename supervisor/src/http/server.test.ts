@@ -568,7 +568,7 @@ describe("coordinator-only server", () => {
     const instance = pipelines.getInstanceForSession("session-1")!;
     const plan = JSON.stringify({
       schema: "openthrottle.execution-plan/v2",
-      graph_id: "structured",
+      pipeline_id: "core/structured",
       plan_id: "visibility-proof",
       units: [],
       commands: [],

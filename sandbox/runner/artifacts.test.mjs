@@ -285,7 +285,7 @@ describe("normalized stage artifacts", () => {
   it("seals automatic admission decisions with a separate bounded execution plan artifact", () => {
     const executionPlan = {
       schema: "openthrottle.execution-plan/v2",
-      graph_id: "structured",
+      pipeline_id: "core/structured",
       plan_id: "automatic",
       units: [{
         id: "unit_a", title: "Unit A", depends_on: [], objective: "Implement it.",

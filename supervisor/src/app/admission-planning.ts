@@ -217,6 +217,16 @@ function extractExecutionPlan(context: string): ExecutionPlanContractV2 | undefi
   return plan;
 }
 
+// Execution-plan v2 names the pipeline, while this pre-U7 admission path still
+// resolves a legacy graph. Keep that temporary projection local so the old
+// namespace cannot leak back into the fresh plan contract.
+function legacyGraphIdForExecutionPlan(plan: ExecutionPlanContractV2): string {
+  if (plan.pipeline_id !== "core/structured") {
+    throw new Error("issue.execution_plan.pipeline_id: must be core/structured");
+  }
+  return "structured";
+}
+
 function automaticCandidates(config: RepositoryConfigContract): [AdmissionCandidate, AdmissionCandidate] {
   const intent = config.intents?.implement;
   const allowed = new Set(intent?.allowed_graphs ?? [config.default_graph]);
@@ -249,9 +259,11 @@ export function resolveAdmissionAuthority(input: {
   assertNoUnfencedControlJson(input.context);
   const selected = extractShipSelectionGraphId(input.context);
   const executionPlan = extractExecutionPlan(input.context);
-  const planned = executionPlan?.graph_id;
-  if (selected && planned && selected !== planned) {
-    throw new Error(`ship selection graph_id ${selected} does not match execution_plan.graph_id ${planned}`);
+  const planned = executionPlan === undefined ? undefined : legacyGraphIdForExecutionPlan(executionPlan);
+  if (selected && executionPlan && planned && selected !== planned) {
+    throw new Error(
+      `ship selection graph_id ${selected} does not match execution_plan.pipeline_id ${executionPlan.pipeline_id}`
+    );
   }
   if (input.taskType !== "implement" && (selected || executionPlan)) {
     throw new Error(`graph selection is not supported for ${input.taskType} tickets`);

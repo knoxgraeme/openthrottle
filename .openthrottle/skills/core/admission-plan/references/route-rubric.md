@@ -26,7 +26,7 @@ A structured result has exactly one complete
 `openthrottle.execution-plan/v2`. Each unit carries its full local authority:
 `id`, `title`, `depends_on`, `objective`, `requirements`, `files`, `approach`,
 `tests`, `acceptance`, and `verification`. The plan also carries `schema`,
-`graph_id`, `plan_id`, and `commands`. No unit may depend on unavailable prose.
+`pipeline_id`, `plan_id`, and `commands`. No unit may depend on unavailable prose.
 
 A sealed structured lock forces structured-or-needs-human. It never permits
 invented requirements or an incomplete plan.

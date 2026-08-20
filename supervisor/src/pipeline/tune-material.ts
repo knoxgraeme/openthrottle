@@ -155,7 +155,7 @@ export function assertTuneRatchetMaterialBinding(
 export function executionPlanForTuneProposal(proposal: TuneProposal) {
   return {
     schema: EXECUTION_PLAN_SCHEMA_V2,
-    graph_id: "structured",
+    pipeline_id: "core/structured",
     plan_id: `tune-${proposal.id}`,
     units: [{
       id: "approved_tune_change",

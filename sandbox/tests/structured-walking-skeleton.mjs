@@ -739,7 +739,7 @@ function createDockerSandboxRuntime(container) {
 function buildTwoUnitPlan({ planId, unitBAcceptanceSuffix = "" }) {
   return {
     schema: "openthrottle.execution-plan/v2",
-    graph_id: "structured",
+    pipeline_id: "core/structured",
     plan_id: planId,
     units: [
       {

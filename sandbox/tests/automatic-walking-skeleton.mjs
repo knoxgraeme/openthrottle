@@ -225,7 +225,7 @@ async function gateProof() {
   const gates = await import(pathToFileURL(join(repoRoot, "supervisor", "dist", "pipeline", "admission-gate.js")).href);
   const plan = {
     schema: "openthrottle.execution-plan/v2",
-    graph_id: "structured",
+    pipeline_id: "core/structured",
     plan_id: "automatic-walking-skeleton",
     units: [{
       id: "unit_a",

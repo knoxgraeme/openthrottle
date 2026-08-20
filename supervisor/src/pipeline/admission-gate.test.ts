@@ -15,7 +15,7 @@ const subject = "e".repeat(40);
 
 const plan = {
   schema: "openthrottle.execution-plan/v2" as const,
-  graph_id: "structured" as const,
+  pipeline_id: "core/structured" as const,
   plan_id: "automatic",
   units: [{
     id: "unit_a",
