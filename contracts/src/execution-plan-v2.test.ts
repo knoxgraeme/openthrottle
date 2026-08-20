@@ -9,7 +9,7 @@ import {
 function planAtCanonicalSize(targetBytes: number): ExecutionPlanContractV2 {
   const plan: ExecutionPlanContractV2 = {
     schema: "openthrottle.execution-plan/v2",
-    graph_id: "structured",
+    pipeline_id: "core/structured",
     plan_id: "boundary",
     units: Array.from({ length: 64 }, (_, index) => ({
       id: `unit_${index}`,
@@ -59,5 +59,38 @@ describe("execution plan v2 canonical size", () => {
     expect(() => validateExecutionPlanContractV2(oversized)).toThrow(
       `canonical JSON must contain at most ${EXECUTION_PLAN_V2_MAX_BYTES} UTF-8 bytes`,
     );
+  });
+});
+
+describe("execution plan v2 identity", () => {
+  const validPlan = (): unknown => ({
+    schema: "openthrottle.execution-plan/v2",
+    pipeline_id: "repo/custom",
+    plan_id: "identity",
+    units: [{
+      id: "unit_1",
+      title: "Implement the change",
+      depends_on: [],
+      objective: "Implement the requested change.",
+      requirements: ["Preserve the contract."],
+      files: ["src/a.ts"],
+      approach: ["Follow existing patterns."],
+      tests: ["Cover the behavior."],
+      acceptance: ["The change works."],
+      verification: ["npm test"],
+    }],
+    commands: [{ name: "test" }],
+  });
+
+  it("accepts a generic pipeline identifier", () => {
+    expect(validateExecutionPlanContractV2(validPlan()).value.pipeline_id).toBe("repo/custom");
+  });
+
+  it("rejects the legacy graph_id field without an alias", () => {
+    const plan = validPlan() as Record<string, unknown>;
+    delete plan.pipeline_id;
+    plan.graph_id = "structured";
+
+    expect(() => validateExecutionPlanContractV2(plan)).toThrow("execution_plan.graph_id: unknown field");
   });
 });

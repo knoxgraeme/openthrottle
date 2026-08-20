@@ -39,7 +39,7 @@ export interface ExecutionPlanUnitV2 {
 
 export interface ExecutionPlanContractV2 {
   schema: typeof EXECUTION_PLAN_SCHEMA_V2;
-  graph_id: string;
+  pipeline_id: string;
   plan_id: string;
   units: ExecutionPlanUnitV2[];
   commands: ExecutionPlanCommand[];
@@ -93,11 +93,11 @@ export function validateExecutionPlanContractV2(
   options: { source?: string } = {}
 ): ValidatedContract<ExecutionPlanContractV2> {
   const source = options.source ?? "execution_plan";
-  const input = objectAt(value, source, ["schema", "graph_id", "plan_id", "units", "commands"]);
+  const input = objectAt(value, source, ["schema", "pipeline_id", "plan_id", "units", "commands"]);
   if (input.schema !== EXECUTION_PLAN_SCHEMA_V2) fail(`${source}.schema`, `must be ${EXECUTION_PLAN_SCHEMA_V2}`);
   const plan: ExecutionPlanContractV2 = {
     schema: EXECUTION_PLAN_SCHEMA_V2,
-    graph_id: stringAt(input.graph_id, `${source}.graph_id`, { pattern: IDENTIFIER }),
+    pipeline_id: stringAt(input.pipeline_id, `${source}.pipeline_id`, { pattern: IDENTIFIER }),
     plan_id: stringAt(input.plan_id, `${source}.plan_id`, { pattern: IDENTIFIER }),
     units: arrayAt(input.units, `${source}.units`, parseUnitV2, { min: 1, max: 64 }),
     commands: arrayAt(input.commands, `${source}.commands`, parsePlanCommand, { max: 16 }),

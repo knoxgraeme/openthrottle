@@ -1,0 +1,7 @@
+schema: openthrottle.config/v2
+pipeline: core/implement
+engine: codex
+commands:
+  test: npm test
+  lint: npm run lint
+  build: npm run build

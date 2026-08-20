@@ -1,6 +1,6 @@
 {
   "schema": "openthrottle.execution-plan/v2",
-  "graph_id": "structured",
+  "pipeline_id": "core/structured",
   "plan_id": "stage-c-contracts",
   "units": [
     {

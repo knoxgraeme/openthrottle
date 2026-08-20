@@ -1,26 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import * as p from "@clack/prompts";
 import {
-  canonicalJson,
-  digestCanonicalJson,
-  parseGraphContract,
-  validateRepositoryConfigContract,
-  type GraphContract,
+  validateFilesystemConfigContract,
+  type ConfigMcpServer,
+  type Engine,
+  type FilesystemConfigContract,
 } from "@openthrottle/contracts";
-import { parse, stringify } from "yaml";
+import { stringify } from "yaml";
 import { SUPERVISOR_SECRET_CHECKLIST } from "./setup.js";
 import { assertProfileName } from "./onboarding/profile-store.js";
 import {
@@ -41,7 +29,7 @@ interface PackageJson {
   packageManager?: string;
 }
 
-interface Detected {
+export interface DetectedProject {
   pm: "npm" | "pnpm" | "yarn" | null;
   test: string;
   build: string;
@@ -49,15 +37,14 @@ interface Detected {
 }
 
 export interface ProjectConfig {
-  agent: "claude" | "codex" | "opencode";
+  pipeline?: string;
+  engine: Engine;
   model?: string;
+  reasoning_effort?: FilesystemConfigContract["reasoning_effort"];
   commands?: Record<string, string>;
-  test: string;
-  build: string;
-  lint: string;
-  post_bootstrap: string[];
-  limits: { max_turns: number; task_timeout: number };
-  mcp_servers: Record<string, unknown>;
+  post_bootstrap?: string[];
+  limits?: FilesystemConfigContract["limits"];
+  mcp_servers?: Record<string, ConfigMcpServer>;
 }
 
 export interface RepositoryTarget {
@@ -93,6 +80,7 @@ export interface LocalSkillInstallResult {
 export type SupervisorPreflightResult =
   | { status: "ready" }
   | { status: "not-configured" | "unreachable" | "authentication-failed"; message: string };
+
 type SupervisorPreflightFailure = Extract<SupervisorPreflightResult, { message: string }>;
 
 export interface InitCommandOptions {
@@ -107,86 +95,20 @@ export interface InitCommandOptions {
   installLocalSkills?: () => LocalSkillInstallResult[];
 }
 
+export interface WriteProjectConfigOptions {
+  allowConfigOverwrite?: boolean;
+  createStarterDirectories?: boolean;
+}
+
 type InitPromptApi = Pick<typeof p, "group" | "select" | "text">;
 
-export type EditableRefreshStatus = "unchanged" | "local-only" | "upstream-only" | "conflict";
-
-export interface EditableRefreshEntry {
-  path: string;
-  status: EditableRefreshStatus;
-  provenance_digest: string | null;
-  local_digest: string | null;
-  upstream_digest: string | null;
-}
-
-export interface EditableSkillsRefreshPlan {
-  entries: EditableRefreshEntry[];
-  writable: boolean;
-}
-
-export interface EditableSkillsResources {
-  graphPath?: string;
-  skillDirectory?: string;
-  skillDirectories?: Partial<Record<EditableSkillId, string>>;
-  release?: string;
-}
-
-export interface WriteProjectConfigOptions {
-  editableSkills?: boolean;
-  allowConfigOverwrite?: boolean;
-  supervisorTaskTimeoutSeconds?: number;
-  resources?: EditableSkillsResources;
-}
-
-interface EditableSkillsLock {
-  schema: "openthrottle.skills.lock/v1";
-  integrity_digest: string;
-  openthrottle_release: string;
-  upstream_graph: {
-    ref: "core/simple@1";
-    digest: string;
-    scaffold_digest: string;
-  };
-  upstream_package_digest: string;
-  upstream_files: Array<{ path: string; digest: string }>;
-  scaffold_package_digest: string;
-  files: Array<{ path: string; digest: string }>;
-}
-
-interface EditableScaffold {
-  files: Map<string, string>;
-  lock: EditableSkillsLock;
-}
-
-interface EditableSkillSourceFile {
-  path: string;
-  contents: string;
-  digest: string;
-}
-
-const COMMAND_ALIAS_NAMES = ["test", "build", "lint"] as const;
-const EDITABLE_GRAPH_ID = "simple_editable";
-const EDITABLE_GRAPH_PATH = ".openthrottle/graphs/simple.json";
-const EDITABLE_SKILL_IDS = ["implement-plan", "admission-plan", "review-admission-plan"] as const;
-type EditableSkillId = (typeof EDITABLE_SKILL_IDS)[number];
-const EDITABLE_SKILLS_ROOT = ".openthrottle/skills";
-const EDITABLE_SKILL_PATHS = {
-  "implement-plan": `${EDITABLE_SKILLS_ROOT}/implement-plan`,
-  "admission-plan": `${EDITABLE_SKILLS_ROOT}/admission-plan`,
-  "review-admission-plan": `${EDITABLE_SKILLS_ROOT}/review-admission-plan`,
-} satisfies Record<EditableSkillId, string>;
-const EDITABLE_IMPLEMENTATION_SKILL_ID: EditableSkillId = "implement-plan";
-const EDITABLE_LOCK_PATH = ".openthrottle/skills.lock.json";
-const REQUIRED_EDITABLE_SKILL_FILES = ["SKILL.md", "agents/openai.yaml"] as const;
-const REPOSITORY_SKILL_MAX_FILES = 64;
-const REPOSITORY_SKILL_MAX_BYTES = 256 * 1024;
+const DEFAULT_PIPELINE = "core/implement";
+const DEFINITION_DIRECTORIES = ["agents", "pipelines", "skills", "evals"] as const;
 const SHA256_DIGEST = /^[a-f0-9]{64}$/;
-const DEFAULT_REPOSITORY_TASK_TIMEOUT_SECONDS = 7_200;
-const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 
 export function detectPackageManager(
   pkg: PackageJson,
-  directory = process.cwd()
+  directory = process.cwd(),
 ): "npm" | "pnpm" | "yarn" {
   if (pkg.packageManager?.startsWith("pnpm")) return "pnpm";
   if (pkg.packageManager?.startsWith("yarn")) return "yarn";
@@ -195,21 +117,14 @@ export function detectPackageManager(
   return "npm";
 }
 
-export function detectProject(directory = process.cwd()): Detected {
+export function detectProject(directory = process.cwd()): DetectedProject {
   const packagePath = join(directory, "package.json");
-  if (!existsSync(packagePath)) {
-    return { pm: null, test: "", build: "", lint: "" };
-  }
+  if (!existsSync(packagePath)) return { pm: null, test: "", build: "", lint: "" };
   const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as PackageJson;
   const scripts = pkg.scripts ?? {};
   const pm = detectPackageManager(pkg, directory);
-  const run = (script: string) => (scripts[script] ? `${pm} run ${script}` : "");
-  return {
-    pm,
-    test: run("test"),
-    build: run("build"),
-    lint: run("lint"),
-  };
+  const run = (script: string): string => scripts[script] ? `${pm} run ${script}` : "";
+  return { pm, test: run("test"), build: run("build"), lint: run("lint") };
 }
 
 export function parseGithubRemote(remote: string): string {
@@ -218,9 +133,7 @@ export function parseGithubRemote(remote: string): string {
     value.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)$/i) ??
     value.match(/^git@github\.com:([^/]+)\/([^/]+)$/i) ??
     value.match(/^ssh:\/\/git@github\.com\/([^/]+)\/([^/]+)$/i);
-  if (!match?.[1] || !match[2]) {
-    throw new Error("origin must point to a GitHub repository");
-  }
+  if (!match?.[1] || !match[2]) throw new Error("origin must point to a GitHub repository");
   return `${match[1]}/${match[2]}`;
 }
 
@@ -241,17 +154,16 @@ export function detectRepository(directory = process.cwd()): RepositoryTarget {
   }
   let baseBranch: string | undefined;
   try {
-    const symbolic = git(directory, ["symbolic-ref", "refs/remotes/origin/HEAD"]);
-    baseBranch = symbolic.replace(/^refs\/remotes\/origin\//, "") || undefined;
+    baseBranch = git(directory, ["symbolic-ref", "refs/remotes/origin/HEAD"])
+      .replace(/^refs\/remotes\/origin\//, "") || undefined;
   } catch {
     try {
       git(directory, ["rev-parse", "--verify", "HEAD"]);
     } catch {
-      // For an unborn repository, HEAD still names the explicitly initialized base branch.
       try {
         baseBranch = git(directory, ["branch", "--show-current"]) || undefined;
       } catch {
-        // The supervisor will use GitHub's canonical default branch.
+        // GitHub supplies the canonical default branch when the local checkout cannot.
       }
     }
   }
@@ -260,7 +172,7 @@ export function detectRepository(directory = process.cwd()): RepositoryTarget {
 
 export function registrationSummary(
   registration: RepositoryRegistrationInput,
-  supervisorUrl?: string
+  supervisorUrl?: string,
 ): string {
   const branch = registration.baseBranch
     ? `base branch ${registration.baseBranch}`
@@ -272,13 +184,11 @@ export function registrationSummary(
   return `${control} → ${registration.repo} (${branch})${target}`;
 }
 
-export function initOutro(
-  registration: RepositoryRegistrationInput
-): string {
+export function initOutro(registration: RepositoryRegistrationInput): string {
   const delegation = registration.controlProvider === "linear"
     ? "delegate an issue from the configured Linear team"
     : "open or label a GitHub issue with `openthrottle`";
-  return `Commit .openthrottle.yml and .openthrottle/, then ${delegation}.`;
+  return `Commit .openthrottle/config.yml, then ${delegation}.`;
 }
 
 export function installLocalSkills(options: OperatorSkillOptions = {}): LocalSkillInstallResult[] {
@@ -291,7 +201,7 @@ export function installLocalSkills(options: OperatorSkillOptions = {}): LocalSki
       install.result.recovery.push(
         install.name === "openthrottle"
           ? "openthrottle operator-skill install"
-          : "openthrottle planning-skill install"
+          : "openthrottle planning-skill install",
       );
     }
   }
@@ -311,82 +221,82 @@ export function localSkillInstallSummary(installs: LocalSkillInstallResult[]): s
 }
 
 export async function promptConfig(
-  detected: Detected,
+  detected: DetectedProject,
   target: RepositoryTarget,
-  prompts: InitPromptApi = p
+  prompts: InitPromptApi = p,
 ): Promise<InitSelection> {
   const result = await prompts.group(
     {
-      controlProvider: () =>
-        prompts.select<ControlProvider>({
-          message: "Control provider",
-          options: [
-            { value: "linear", label: "Linear" },
-            { value: "github", label: "GitHub Issues" },
-          ],
-          initialValue: "linear",
-        }),
-      linearTeamKey: ({ results }) =>
-        results.controlProvider === "linear" ? prompts.text({
-          message: "Linear team key routed to this repository",
-          initialValue: readEnv("LINEAR_TEAM_KEY") ?? "",
-          validate: (value) => (/^[A-Za-z0-9_-]+$/.test(value) ? undefined : "Enter a team key"),
-        }) : undefined,
-      linearTeamId: ({ results }) =>
-        results.controlProvider === "linear" ? prompts.text({
-          message: "Linear team ID (optional, but recommended)",
-          initialValue: readEnv("LINEAR_TEAM_ID") ?? "",
-        }) : undefined,
-      baseBranch: () =>
-        prompts.text({
-          message: "Base branch (blank uses GitHub default)",
-          initialValue: target.baseBranch ?? "",
-        }),
-      agent: () =>
-        prompts.select<ProjectConfig["agent"]>({
-          message: "Default agent",
-          options: [
-            { value: "codex", label: "Codex CLI" },
-            { value: "claude", label: "Claude Code" },
-            { value: "opencode", label: "OpenCode (Kimi Code)" },
-          ],
-          initialValue: "codex",
-        }),
+      controlProvider: () => prompts.select<ControlProvider>({
+        message: "Control provider",
+        options: [
+          { value: "linear", label: "Linear" },
+          { value: "github", label: "GitHub Issues" },
+        ],
+        initialValue: "linear",
+      }),
+      linearTeamKey: ({ results }) => results.controlProvider === "linear" ? prompts.text({
+        message: "Linear team key routed to this repository",
+        initialValue: readEnv("LINEAR_TEAM_KEY") ?? "",
+        validate: (value) => /^[A-Za-z0-9_-]+$/.test(value) ? undefined : "Enter a team key",
+      }) : undefined,
+      linearTeamId: ({ results }) => results.controlProvider === "linear" ? prompts.text({
+        message: "Linear team ID (optional, but recommended)",
+        initialValue: readEnv("LINEAR_TEAM_ID") ?? "",
+      }) : undefined,
+      baseBranch: () => prompts.text({
+        message: "Base branch (blank uses GitHub default)",
+        initialValue: target.baseBranch ?? "",
+      }),
+      pipeline: () => prompts.text({
+        message: "Pipeline",
+        initialValue: DEFAULT_PIPELINE,
+        validate: (value) => /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/.test(value)
+          ? undefined
+          : "Enter a pipeline ID",
+      }),
+      engine: () => prompts.select<Engine>({
+        message: "Default engine",
+        options: [
+          { value: "codex", label: "Codex CLI" },
+          { value: "claude", label: "Claude Code" },
+          { value: "opencode", label: "OpenCode (Kimi Code)" },
+        ],
+        initialValue: "codex",
+      }),
       model: ({ results }) => {
-        const agent = results.agent as ProjectConfig["agent"] | undefined;
+        const engine = results.engine as Engine | undefined;
         return prompts.text({
-          message: "Model (blank uses the agent default; required for OpenCode)",
-          initialValue: agent === "opencode" ? "kimi-code/kimi-for-coding" : "",
+          message: "Model (blank uses the engine default; required for OpenCode)",
+          initialValue: engine === "opencode" ? "kimi-code/kimi-for-coding" : "",
           validate: (value) => {
             const trimmed = value.trim();
-            if (agent === "opencode" && !trimmed) return "OpenCode requires a model";
-            if (trimmed && !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(trimmed)) {
-              return "Model may contain letters, digits, and . _ / - only";
-            }
-            return undefined;
+            if (engine === "opencode" && !trimmed) return "OpenCode requires a model";
+            return trimmed && !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(trimmed)
+              ? "Model may contain letters, digits, and . _ / - only"
+              : undefined;
           },
         });
       },
       test: () => prompts.text({
         message: "Test command",
         initialValue: detected.test,
-        validate: (value) => value.trim() ? undefined : "Enter the command the simple graph should run",
+        validate: (value) => value.trim() ? undefined : "Enter the test command",
       }),
       build: () => prompts.text({
         message: "Build command",
         initialValue: detected.build,
-        validate: (value) => value.trim() ? undefined : "Enter the command the simple graph should run",
+        validate: (value) => value.trim() ? undefined : "Enter the build command",
       }),
       lint: () => prompts.text({
         message: "Lint command",
         initialValue: detected.lint,
-        validate: (value) => value.trim() ? undefined : "Enter the command the simple graph should run",
+        validate: (value) => value.trim() ? undefined : "Enter the lint command",
       }),
-      post_bootstrap: () =>
-        prompts.text({
-          message: "Post-bootstrap command (blank to skip)",
-          initialValue: detected.pm ? `${detected.pm} install` : "",
-        }),
+      post_bootstrap: () => prompts.text({
+        message: "Post-bootstrap command (blank to skip)",
+        initialValue: detected.pm ? `${detected.pm} install` : "",
+      }),
       max_turns: () => prompts.text({ message: "Max turns per agent run", initialValue: "200" }),
       task_timeout: () => prompts.text({ message: "Task timeout (seconds)", initialValue: "7200" }),
     },
@@ -395,48 +305,40 @@ export async function promptConfig(
         p.cancel("Cancelled.");
         process.exit(0);
       },
-    }
+    },
   );
+
   if (result.controlProvider !== "linear" && result.controlProvider !== "github") {
     throw new Error("Control provider selection is required");
   }
-  let registration: RepositoryRegistrationInput;
-  if (result.controlProvider === "linear") {
-    if (typeof result.linearTeamKey !== "string") {
-      throw new Error("Linear team key is required");
-    }
-    registration = {
-      repo: target.repo,
-      baseBranch: result.baseBranch || undefined,
-      controlProvider: "linear",
-      linearTeamKey: result.linearTeamKey.toUpperCase(),
-      linearTeamId: typeof result.linearTeamId === "string" && result.linearTeamId
-        ? result.linearTeamId
-        : undefined,
-    };
-  } else {
-    registration = {
-      repo: target.repo,
-      baseBranch: result.baseBranch || undefined,
-      controlProvider: "github",
-    };
-  }
+  const registration: RepositoryRegistrationInput = result.controlProvider === "linear"
+    ? {
+        repo: target.repo,
+        baseBranch: result.baseBranch || undefined,
+        controlProvider: "linear",
+        linearTeamKey: String(result.linearTeamKey).toUpperCase(),
+        ...(result.linearTeamId ? { linearTeamId: String(result.linearTeamId) } : {}),
+      }
+    : {
+        repo: target.repo,
+        baseBranch: result.baseBranch || undefined,
+        controlProvider: "github",
+      };
+  const model = typeof result.model === "string" ? result.model.trim() : "";
   return {
     project: {
-      agent: result.agent as "claude" | "codex" | "opencode",
-      model: typeof result.model === "string" && result.model.trim() ? result.model.trim() : undefined,
+      pipeline: String(result.pipeline || DEFAULT_PIPELINE),
+      engine: result.engine as Engine,
+      ...(model ? { model } : {}),
       commands: {
-        ...(result.test ? { test: result.test } : {}),
-        ...(result.lint ? { lint: result.lint } : {}),
-        ...(result.build ? { build: result.build } : {}),
+        test: String(result.test),
+        lint: String(result.lint),
+        build: String(result.build),
       },
-      test: result.test,
-      build: result.build,
-      lint: result.lint,
-      post_bootstrap: result.post_bootstrap ? [result.post_bootstrap] : [],
+      post_bootstrap: result.post_bootstrap ? [String(result.post_bootstrap)] : [],
       limits: {
         max_turns: Number(result.max_turns) || 200,
-        task_timeout: Number(result.task_timeout) || 7200,
+        task_timeout: Number(result.task_timeout) || 7_200,
       },
       mcp_servers: {},
     },
@@ -444,614 +346,63 @@ export async function promptConfig(
   };
 }
 
-function projectConfigDocument(config: ProjectConfig, editableSkills = false): Record<string, unknown> {
-  const commands = { ...(config.commands ?? {
-    ...(config.test ? { test: config.test } : {}),
-    ...(config.lint ? { lint: config.lint } : {}),
-    ...(config.build ? { build: config.build } : {}),
-  }) };
-  const aliases: Partial<Record<(typeof COMMAND_ALIAS_NAMES)[number], string>> = {};
-  for (const name of COMMAND_ALIAS_NAMES) {
-    const alias = config[name];
-    const command = commands[name];
-    if (alias && command && alias !== command) {
-      throw new Error(`${name} must match commands.${name}`);
-    }
-    const normalized = command || alias;
-    if (normalized) {
-      commands[name] = normalized;
-      aliases[name] = normalized;
-    }
-  }
-  const document: Record<string, unknown> = {
-    schema: "openthrottle.config/v1",
-    default_graph: editableSkills ? EDITABLE_GRAPH_ID : "simple",
-    graphs: [
-      { id: "simple", kind: "builtin", ref: "core/simple@1" },
-      { id: "structured", kind: "builtin", ref: "core/structured@3" },
-      ...(editableSkills
-        ? [{ id: EDITABLE_GRAPH_ID, kind: "repository", ref: EDITABLE_GRAPH_PATH }]
-        : []),
-    ],
-    pipelines: { implement: "implement", investigate: "investigate", tune: "tune" },
-    ...config,
-    commands,
-    ...aliases,
-    ...(editableSkills ? {
-      skills: EDITABLE_SKILL_IDS.map((id) => ({ id, path: EDITABLE_SKILL_PATHS[id] })),
-    } : {}),
-    intents: {
-      implement: editableSkills
-        ? {
-            default_graph: EDITABLE_GRAPH_ID,
-            allowed_graphs: [EDITABLE_GRAPH_ID, "simple", "structured"],
-            ...(config.agent === "opencode" ? {} : { admission_mode: "automatic" }),
-            planner_skill: "repo://admission-plan",
-            reviewer_skill: "repo://review-admission-plan",
-          }
-        : {
-            default_graph: "simple",
-            allowed_graphs: ["simple", "structured"],
-            ...(config.agent === "opencode" ? {} : { admission_mode: "automatic" }),
-          },
-      investigate: { default_graph: "simple", allowed_graphs: ["simple"] },
-    },
-  };
-  for (const key of ["test", "build", "lint", "model"] as const) {
-    if (key === "model") {
-      if (!config.model) delete document.model;
-    } else if (!aliases[key]) {
-      delete document[key];
-    }
-  }
-  if (Object.keys(commands).length === 0) delete document.commands;
-  return document;
+export function projectConfigDocument(config: ProjectConfig): FilesystemConfigContract {
+  return validateFilesystemConfigContract({
+    schema: "openthrottle.config/v2",
+    pipeline: config.pipeline ?? DEFAULT_PIPELINE,
+    engine: config.engine,
+    ...(config.model === undefined ? {} : { model: config.model }),
+    ...(config.reasoning_effort === undefined ? {} : { reasoning_effort: config.reasoning_effort }),
+    ...(config.commands === undefined ? {} : { commands: config.commands }),
+    ...(config.post_bootstrap === undefined ? {} : { post_bootstrap: config.post_bootstrap }),
+    ...(config.limits === undefined ? {} : { limits: config.limits }),
+    ...(config.mcp_servers === undefined ? {} : { mcp_servers: config.mcp_servers }),
+  }, { source: ".openthrottle/config.yml" }).value;
 }
 
-function renderProjectConfig(config: ProjectConfig, editableSkills = false): string {
-  const document = projectConfigDocument(config, editableSkills);
-  const header = [
-    "# .openthrottle.yml — project config for OpenThrottle",
-    "# Generated by `openthrottle init`; commit this file.",
+export function renderProjectConfig(config: ProjectConfig): string {
+  return [
+    "# .openthrottle/config.yml — repository definitions for OpenThrottle",
+    "# Generated by `openthrottle init`; commit this file before validation or shipping.",
+    "",
+    stringify(projectConfigDocument(config)).trimEnd(),
     "",
   ].join("\n");
-  return header + stringify(document);
 }
 
-function digest(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function assertSafeRepositoryPath(directory: string, path: string): void {
-  const root = resolve(directory);
-  const target = resolve(root, path);
-  if (target !== root && !target.startsWith(`${root}${sep}`)) {
-    throw new Error(`editable-skills path escapes the repository: ${path}`);
-  }
-  const rootStat = lstatSync(root, { throwIfNoEntry: false });
+function assertDefinitionRoot(directory: string): string {
+  const repositoryRoot = resolve(directory);
+  const rootStat = lstatSync(repositoryRoot, { throwIfNoEntry: false });
   if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) {
-    throw new Error("editable-skills repository root must be a real directory");
+    throw new Error("repository root must be a real directory");
   }
-  let current = root;
-  const parts = path.split("/").filter(Boolean);
-  for (const [index, part] of parts.entries()) {
-    current = join(current, part);
-    const stat = lstatSync(current, { throwIfNoEntry: false });
-    if (!stat) break;
-    if (stat.isSymbolicLink()) {
-      throw new Error(`editable-skills path must not contain symlinks: ${path}`);
-    }
-    if (index < parts.length - 1 && !stat.isDirectory()) {
-      throw new Error(`editable-skills parent path is not a directory: ${path}`);
-    }
+  const definitionRoot = join(repositoryRoot, ".openthrottle");
+  const definitionStat = lstatSync(definitionRoot, { throwIfNoEntry: false });
+  if (definitionStat?.isSymbolicLink() || (definitionStat && !definitionStat.isDirectory())) {
+    throw new Error(".openthrottle must be a real directory");
   }
-}
-
-function readRepositoryFile(directory: string, path: string): string | null {
-  assertSafeRepositoryPath(directory, path);
-  const absolute = join(directory, path);
-  const stat = lstatSync(absolute, { throwIfNoEntry: false });
-  if (!stat) return null;
-  if (!stat.isFile()) throw new Error(`editable-skills path is not a regular file: ${path}`);
-  return readFileSync(absolute, "utf8");
-}
-
-function localEditableSkillFiles(directory: string): Array<{ path: string; digest: string }> {
-  const files: Array<{ path: string; digest: string }> = [];
-  for (const id of EDITABLE_SKILL_IDS) {
-    const packagePath = EDITABLE_SKILL_PATHS[id];
-    assertSafeRepositoryPath(directory, packagePath);
-    const root = join(directory, packagePath);
-    const rootStat = lstatSync(root, { throwIfNoEntry: false });
-    if (!rootStat) continue;
-    if (!rootStat.isDirectory()) {
-      throw new Error(`editable-skills package path is not a directory: ${packagePath}`);
-    }
-    let packageFiles = 0;
-    let totalBytes = 0;
-    const visit = (absolute: string, relative: string): void => {
-      for (const entry of readdirSync(absolute, { withFileTypes: true })) {
-        const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
-        const path = `${packagePath}/${entryRelative}`;
-        if (entry.isSymbolicLink()) {
-          throw new Error(`editable-skills package must not contain symlinks: ${path}`);
-        }
-        if (entry.isDirectory()) {
-          visit(join(absolute, entry.name), entryRelative);
-        } else if (entry.isFile()) {
-          if (packageFiles >= REPOSITORY_SKILL_MAX_FILES) {
-            throw new Error(`editable-skills package exceeds the ${REPOSITORY_SKILL_MAX_FILES} file limit`);
-          }
-          const contents = readFileSync(join(absolute, entry.name), "utf8");
-          packageFiles += 1;
-          totalBytes += Buffer.byteLength(contents, "utf8");
-          if (totalBytes > REPOSITORY_SKILL_MAX_BYTES) {
-            throw new Error("editable-skills package exceeds the 256 KiB snapshot limit");
-          }
-          files.push({ path, digest: digest(contents) });
-        } else {
-          throw new Error(`editable-skills package contains a non-regular entry: ${path}`);
-        }
-      }
-    };
-    visit(root, "");
-  }
-  return files.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
-}
-
-function defaultEditableResources(resources: EditableSkillsResources = {}): {
-  graphPath: string;
-  skillDirectories: Record<EditableSkillId, string>;
-  release: string;
-} {
-  const bundledGraph = join(MODULE_DIRECTORY, "scaffolds/simple-v1.json");
-  const packageJson = JSON.parse(readFileSync(join(MODULE_DIRECTORY, "../package.json"), "utf8")) as {
-    version: string;
-  };
-  return {
-    graphPath: resources.graphPath ?? (existsSync(bundledGraph)
-      ? bundledGraph
-      : resolve(MODULE_DIRECTORY, "../../supervisor/graphs/simple-v1.json")),
-    skillDirectories: Object.fromEntries(EDITABLE_SKILL_IDS.map((id) => {
-      const bundledSkill = join(MODULE_DIRECTORY, `skills/tasks/${id}`);
-      const legacyOverride = id === EDITABLE_IMPLEMENTATION_SKILL_ID ? resources.skillDirectory : undefined;
-      return [id, resources.skillDirectories?.[id] ?? legacyOverride ?? (existsSync(bundledSkill)
-        ? bundledSkill
-        : resolve(MODULE_DIRECTORY, `../../skills/tasks/${id}`))];
-    })) as Record<EditableSkillId, string>,
-    release: resources.release ?? packageJson.version,
-  };
-}
-
-function editableGraph(raw: string, repositoryTaskTimeoutSeconds: number): GraphContract {
-  const graph = JSON.parse(raw) as GraphContract;
-  graph.id = "repository/simple_editable";
-  for (const worker of graph.workers) {
-    if (worker.id === "implementer-fresh" || worker.id === "implementer-resume") {
-      worker.skills = [`repo://${EDITABLE_IMPLEMENTATION_SKILL_ID}`];
-    }
-  }
-  for (const loop of graph.loops) {
-    loop.timeout_seconds = repositoryTaskTimeoutSeconds;
-    if (loop.id === "implementation-loop" || loop.id === "repair-implementation-loop") {
-      loop.skill = `repo://${EDITABLE_IMPLEMENTATION_SKILL_ID}`;
-    }
-  }
-  return graph;
-}
-
-function isSafePackagePath(path: string): boolean {
-  return path.length > 0 &&
-    !path.startsWith("/") &&
-    !path.includes("\\") &&
-    !path.includes("\0") &&
-    path.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
-}
-
-function readEditableSkillSourcePackage(
-  skillDirectory: string,
-  skillId: EditableSkillId
-): EditableSkillSourceFile[] {
-  const root = resolve(skillDirectory);
-  const rootStat = lstatSync(root, { throwIfNoEntry: false });
-  if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) {
-    throw new Error(`editable ${skillId} source must be a real directory`);
-  }
-
-  const files: EditableSkillSourceFile[] = [];
-  let totalBytes = 0;
-  const visit = (absolute: string, relative: string): void => {
-    for (const entry of readdirSync(absolute, { withFileTypes: true })) {
-      const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
-      const entryAbsolute = join(absolute, entry.name);
-      if (!isSafePackagePath(entryRelative)) {
-        throw new Error(`editable ${skillId} source has an unsafe path: ${entryRelative}`);
-      }
-      if (entry.isSymbolicLink()) {
-        throw new Error(`editable ${skillId} source must not contain symlinks: ${entryRelative}`);
-      }
-      if (entry.isDirectory()) {
-        visit(entryAbsolute, entryRelative);
-        continue;
-      }
-      if (!entry.isFile()) {
-        throw new Error(`editable ${skillId} source contains a non-regular entry: ${entryRelative}`);
-      }
-      if (files.length >= REPOSITORY_SKILL_MAX_FILES) {
-        throw new Error(`editable ${skillId} source exceeds the ${REPOSITORY_SKILL_MAX_FILES} file limit`);
-      }
-      const contents = readFileSync(entryAbsolute, "utf8");
-      totalBytes += Buffer.byteLength(contents, "utf8");
-      if (totalBytes > REPOSITORY_SKILL_MAX_BYTES) {
-        throw new Error(`editable ${skillId} source exceeds the 256 KiB snapshot limit`);
-      }
-      files.push({ path: entryRelative, contents, digest: digest(contents) });
-    }
-  };
-  visit(root, "");
-  files.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
-  for (const required of REQUIRED_EDITABLE_SKILL_FILES) {
-    if (!files.some((entry) => entry.path === required)) {
-      throw new Error(`editable ${skillId} source is missing ${required}`);
-    }
-  }
-  return files;
-}
-
-function editableSkillsLockPayload(lock: EditableSkillsLock): Omit<EditableSkillsLock, "integrity_digest"> {
-  const { integrity_digest: _integrityDigest, ...payload } = lock;
-  return payload;
-}
-
-function hasUniquePaths(entries: Array<{ path: string }>): boolean {
-  return new Set(entries.map((entry) => entry.path)).size === entries.length;
-}
-
-function normalizedUpstreamFiles(
-  entries: Array<{ path: string; digest: string }>
-): { files: Array<{ path: string; digest: string }>; legacy: boolean } | null {
-  const isPrefixed = (path: string) => EDITABLE_SKILL_IDS.some((id) => path.startsWith(`${id}/`));
-  const prefixed = entries.filter((entry) => isPrefixed(entry.path)).length;
-  if (prefixed === entries.length) return { files: entries, legacy: false };
-  if (prefixed !== 0) return null;
-  return {
-    files: entries.map((entry) => ({
-      path: `${EDITABLE_IMPLEMENTATION_SKILL_ID}/${entry.path}`,
-      digest: entry.digest,
-    })),
-    legacy: true,
-  };
-}
-
-function parseEditableSkillsLock(raw: string): EditableSkillsLock | null {
-  try {
-    const value = JSON.parse(raw) as Partial<EditableSkillsLock>;
-    if (value.schema !== "openthrottle.skills.lock/v1" ||
-        typeof value.openthrottle_release !== "string" ||
-        value.openthrottle_release.length === 0 ||
-        value.openthrottle_release.length > 200 ||
-        typeof value.integrity_digest !== "string" ||
-        !SHA256_DIGEST.test(value.integrity_digest)) return null;
-    if (!value.upstream_graph || value.upstream_graph.ref !== "core/simple@1") return null;
-    if (typeof value.upstream_graph.digest !== "string" ||
-        !SHA256_DIGEST.test(value.upstream_graph.digest) ||
-        typeof value.upstream_graph.scaffold_digest !== "string" ||
-        !SHA256_DIGEST.test(value.upstream_graph.scaffold_digest)) return null;
-    if (typeof value.upstream_package_digest !== "string" ||
-        !SHA256_DIGEST.test(value.upstream_package_digest) ||
-        typeof value.scaffold_package_digest !== "string" ||
-        !SHA256_DIGEST.test(value.scaffold_package_digest)) return null;
-    if (!Array.isArray(value.upstream_files) || !Array.isArray(value.files)) return null;
-    if (value.upstream_files.length > REPOSITORY_SKILL_MAX_FILES * EDITABLE_SKILL_IDS.length ||
-        value.files.length > REPOSITORY_SKILL_MAX_FILES * EDITABLE_SKILL_IDS.length + 2) return null;
-    if (![...value.upstream_files, ...value.files].every((entry) => (
-      entry && typeof entry.path === "string" && isSafePackagePath(entry.path) &&
-      typeof entry.digest === "string" && SHA256_DIGEST.test(entry.digest)
-    ))) return null;
-    if (!hasUniquePaths(value.upstream_files) || !hasUniquePaths(value.files)) return null;
-
-    const lock = value as EditableSkillsLock;
-    if (digestCanonicalJson(editableSkillsLockPayload(lock)) !== lock.integrity_digest) return null;
-    if (digestCanonicalJson(lock.upstream_files) !== lock.upstream_package_digest) return null;
-    const normalized = normalizedUpstreamFiles(lock.upstream_files);
-    if (!normalized) return null;
-    const scaffoldPackage = lock.files
-      .filter((entry) => entry.path.startsWith(`${EDITABLE_SKILLS_ROOT}/`))
-      .map((entry) => ({
-        path: entry.path.slice(`${EDITABLE_SKILLS_ROOT}/`.length),
-        digest: entry.digest,
-      }));
-    const scaffoldPackageForDigest = normalized.legacy
-      ? scaffoldPackage.map((entry) => ({
-          path: entry.path.slice(`${EDITABLE_IMPLEMENTATION_SKILL_ID}/`.length),
-          digest: entry.digest,
-        }))
-      : scaffoldPackage;
-    if (digestCanonicalJson(scaffoldPackageForDigest) !== lock.scaffold_package_digest) return null;
-    if (canonicalJson(scaffoldPackage) !== canonicalJson(normalized.files)) return null;
-    const packageIds = new Set(normalized.files.map((entry) => entry.path.split("/", 1)[0]));
-    if (![...packageIds].every((id) => EDITABLE_SKILL_IDS.includes(id as EditableSkillId))) return null;
-    if (!packageIds.has(EDITABLE_IMPLEMENTATION_SKILL_ID)) return null;
-    for (const id of packageIds) {
-      if (!REQUIRED_EDITABLE_SKILL_FILES.every((required) => (
-        normalized.files.some((entry) => entry.path === `${id}/${required}`)
-      ))) return null;
-    }
-    const graphFile = lock.files.find((entry) => entry.path === EDITABLE_GRAPH_PATH);
-    const configFile = lock.files.find((entry) => entry.path === ".openthrottle.yml");
-    if (!graphFile || !configFile || graphFile.digest !== lock.upstream_graph.scaffold_digest) return null;
-    if (lock.files.some((entry) => (
-      entry.path !== ".openthrottle.yml" &&
-      entry.path !== EDITABLE_GRAPH_PATH &&
-      !EDITABLE_SKILL_IDS.some((id) => entry.path.startsWith(`${EDITABLE_SKILL_PATHS[id]}/`))
-    ))) return null;
-    return lock;
-  } catch {
-    return null;
-  }
-}
-
-function buildEditableSkillsScaffold(
-  config: ProjectConfig,
-  resources: EditableSkillsResources = {},
-  supervisorTaskTimeoutSeconds = DEFAULT_REPOSITORY_TASK_TIMEOUT_SECONDS
-): EditableScaffold {
-  for (const name of COMMAND_ALIAS_NAMES) {
-    if (!(config.commands?.[name] || config[name])) {
-      throw new Error(`openthrottle init requires a ${name} command because the editable simple graph executes it`);
-    }
-  }
-
-  const resolved = defaultEditableResources(resources);
-  const upstreamGraphRaw = readFileSync(resolved.graphPath, "utf8");
-  const graph = editableGraph(
-    upstreamGraphRaw,
-    Math.min(config.limits.task_timeout, supervisorTaskTimeoutSeconds)
-  );
-  const graphRaw = `${JSON.stringify(graph, null, 2)}\n`;
-  const configRaw = renderProjectConfig(config, true);
-  const configContract = validateRepositoryConfigContract(parse(configRaw), { source: ".openthrottle.yml" });
-  parseGraphContract(graphRaw, { source: EDITABLE_GRAPH_PATH, config: configContract.value });
-
-  const files = new Map<string, string>([
-    [".openthrottle.yml", configRaw],
-    [EDITABLE_GRAPH_PATH, graphRaw],
-  ]);
-  const upstreamFiles: Array<{ path: string; digest: string }> = [];
-  for (const id of EDITABLE_SKILL_IDS) {
-    const packagePath = EDITABLE_SKILL_PATHS[id];
-    const sourcePackage = readEditableSkillSourcePackage(resolved.skillDirectories[id], id);
-    for (const { path, contents, digest: sourceDigest } of sourcePackage) {
-      files.set(`${packagePath}/${path}`, contents);
-      upstreamFiles.push({ path: `${id}/${path}`, digest: sourceDigest });
-    }
-    const skillName = files.get(`${packagePath}/SKILL.md`)?.match(new RegExp(`^name:\\s*${id}\\s*$`, "m"));
-    if (!skillName) throw new Error(`editable ${id} SKILL.md frontmatter name must be ${id}`);
-  }
-
-  const scaffoldFiles = [...files].map(([path, contents]) => ({ path, digest: digest(contents) }));
-  const scaffoldPackageFiles = scaffoldFiles.filter((entry) => entry.path.startsWith(`${EDITABLE_SKILLS_ROOT}/`));
-  const lockPayload: Omit<EditableSkillsLock, "integrity_digest"> = {
-    schema: "openthrottle.skills.lock/v1",
-    openthrottle_release: resolved.release,
-    upstream_graph: {
-      ref: "core/simple@1",
-      digest: digest(upstreamGraphRaw),
-      scaffold_digest: digest(graphRaw),
-    },
-    upstream_package_digest: digestCanonicalJson(upstreamFiles),
-    upstream_files: upstreamFiles,
-    scaffold_package_digest: digestCanonicalJson(scaffoldPackageFiles.map((entry) => ({
-      path: entry.path.slice(`${EDITABLE_SKILLS_ROOT}/`.length),
-      digest: entry.digest,
-    }))),
-    files: scaffoldFiles,
-  };
-  const lock: EditableSkillsLock = {
-    ...lockPayload,
-    integrity_digest: digestCanonicalJson(lockPayload),
-  };
-  files.set(EDITABLE_LOCK_PATH, `${JSON.stringify(lock, null, 2)}\n`);
-  return { files, lock };
-}
-
-function classifyEditableFile(
-  localDigest: string | null,
-  provenanceDigest: string | null,
-  upstreamDigest: string
-): EditableRefreshStatus {
-  if (localDigest === upstreamDigest) return "unchanged";
-  if (provenanceDigest === null) return localDigest === null ? "upstream-only" : "conflict";
-  if (localDigest === provenanceDigest) return "upstream-only";
-  if (upstreamDigest === provenanceDigest) return "local-only";
-  return "conflict";
-}
-
-function normalizeEditableLockDigestFields(
-  local: EditableSkillsLock,
-  generated: EditableSkillsLock
-): EditableSkillsLock {
-  const normalized = structuredClone(local);
-  normalized.openthrottle_release = generated.openthrottle_release;
-  normalized.upstream_graph.digest = generated.upstream_graph.digest;
-  normalized.upstream_graph.scaffold_digest = generated.upstream_graph.scaffold_digest;
-  normalized.upstream_package_digest = generated.upstream_package_digest;
-  normalized.scaffold_package_digest = generated.scaffold_package_digest;
-  normalized.upstream_files = structuredClone(generated.upstream_files);
-  normalized.files = structuredClone(generated.files);
-  normalized.integrity_digest = generated.integrity_digest;
-  return normalized;
-}
-
-export function planEditableSkillsRefresh(
-  config: ProjectConfig,
-  directory = process.cwd(),
-  options: Pick<
-    WriteProjectConfigOptions,
-    "allowConfigOverwrite" | "resources" | "supervisorTaskTimeoutSeconds"
-  > = {}
-): EditableSkillsRefreshPlan {
-  const scaffold = buildEditableSkillsScaffold(
-    config,
-    options.resources,
-    options.supervisorTaskTimeoutSeconds
-  );
-  const localLockRaw = readRepositoryFile(directory, EDITABLE_LOCK_PATH);
-  const localLock = localLockRaw === null ? null : parseEditableSkillsLock(localLockRaw);
-  const provenance = new Map(localLock?.files.map((entry) => [entry.path, entry.digest]) ?? []);
-  const entries: EditableRefreshEntry[] = [];
-
-  for (const [path, contents] of scaffold.files) {
-    if (path === EDITABLE_LOCK_PATH) continue;
-    const localRaw = readRepositoryFile(directory, path);
-    const localDigest = localRaw === null ? null : digest(localRaw);
-    const upstreamDigest = digest(contents);
-    const provenanceDigest = provenance.get(path) ?? null;
-    let status = classifyEditableFile(localDigest, provenanceDigest, upstreamDigest);
-    if (path === ".openthrottle.yml" && options.allowConfigOverwrite && status !== "unchanged") {
-      status = "upstream-only";
-    }
-    entries.push({
-      path,
-      status,
-      provenance_digest: provenanceDigest,
-      local_digest: localDigest,
-      upstream_digest: upstreamDigest,
-    });
-  }
-
-  const generatedPaths = new Set(scaffold.files.keys());
-  for (const localFile of localEditableSkillFiles(directory)) {
-    if (generatedPaths.has(localFile.path)) continue;
-    const provenanceDigest = provenance.get(localFile.path) ?? null;
-    entries.push({
-      path: localFile.path,
-      status: provenanceDigest === null
-        ? "local-only"
-        : localFile.digest === provenanceDigest ? "upstream-only" : "conflict",
-      provenance_digest: provenanceDigest,
-      local_digest: localFile.digest,
-      upstream_digest: null,
-    });
-  }
-
-  const generatedLockRaw = scaffold.files.get(EDITABLE_LOCK_PATH)!;
-  const invalidLockWithCandidateDrift = localLockRaw !== null && localLock === null && entries.some((entry) => (
-    entry.upstream_digest !== null && entry.local_digest !== entry.upstream_digest
-  ));
-  const upstreamChanged = Boolean(
-    localLock && (
-      localLock.openthrottle_release !== scaffold.lock.openthrottle_release ||
-      localLock.upstream_graph.digest !== scaffold.lock.upstream_graph.digest ||
-      localLock.upstream_package_digest !== scaffold.lock.upstream_package_digest
-    )
-  ) || invalidLockWithCandidateDrift || entries.some((entry) => (
-    entry.status === "upstream-only" ||
-    (entry.upstream_digest !== null && entry.provenance_digest !== null && entry.upstream_digest !== entry.provenance_digest)
-  ));
-  let lockStatus: EditableRefreshStatus;
-  if (localLockRaw === generatedLockRaw) {
-    lockStatus = "unchanged";
-  } else if (localLockRaw === null) {
-    lockStatus = entries.some((entry) => (
-      entry.local_digest !== null &&
-      !(entry.path === ".openthrottle.yml" && options.allowConfigOverwrite)
-    )) ? "conflict" : "upstream-only";
-  } else if (
-    localLock && upstreamChanged &&
-    canonicalJson(normalizeEditableLockDigestFields(localLock, scaffold.lock)) === canonicalJson(scaffold.lock)
-  ) {
-    lockStatus = "upstream-only";
-  } else {
-    lockStatus = upstreamChanged ? "conflict" : "local-only";
-  }
-  entries.push({
-    path: EDITABLE_LOCK_PATH,
-    status: lockStatus,
-    provenance_digest: null,
-    local_digest: localLockRaw === null ? null : digest(localLockRaw),
-    upstream_digest: digest(generatedLockRaw),
-  });
-
-  return {
-    entries,
-    writable: entries.every((entry) => entry.status === "unchanged" || entry.status === "upstream-only"),
-  };
-}
-
-export function planEditableSkillsDryRun(
-  config: ProjectConfig,
-  directory = process.cwd(),
-  options: Pick<WriteProjectConfigOptions, "resources" | "supervisorTaskTimeoutSeconds"> = {}
-): { plan: EditableSkillsRefreshPlan; assumesConfigOverwrite: boolean } {
-  // A real run prompts before overwriting an existing .openthrottle.yml and
-  // then plans with allowConfigOverwrite, so the preview must assume the same.
-  const assumesConfigOverwrite = existsSync(join(directory, ".openthrottle.yml"));
-  const plan = planEditableSkillsRefresh(config, directory, {
-    ...options,
-    allowConfigOverwrite: assumesConfigOverwrite,
-  });
-  return { plan, assumesConfigOverwrite };
-}
-
-function writeEditableSkillsScaffold(
-  config: ProjectConfig,
-  directory: string,
-  options: WriteProjectConfigOptions
-): void {
-  const scaffold = buildEditableSkillsScaffold(
-    config,
-    options.resources,
-    options.supervisorTaskTimeoutSeconds
-  );
-  const plan = planEditableSkillsRefresh(config, directory, options);
-  if (!plan.writable) {
-    const collisions = plan.entries
-      .filter((entry) => entry.status === "local-only" || entry.status === "conflict")
-      .map((entry) => `${entry.path} (${entry.status})`)
-      .join(", ");
-    throw new Error(`editable-skills refresh refused repository edits: ${collisions}`);
-  }
-
-  const writes = plan.entries.filter((entry) => entry.status === "upstream-only");
-  const backups = new Map<string, string | null>();
-  const staged = new Map<string, string>();
-  try {
-    for (const entry of writes) {
-      const target = join(directory, entry.path);
-      backups.set(target, readRepositoryFile(directory, entry.path));
-      const contents = scaffold.files.get(entry.path);
-      if (contents === undefined) continue;
-      mkdirSync(dirname(target), { recursive: true });
-      assertSafeRepositoryPath(directory, entry.path);
-      const temporary = `${target}.tmp-${randomUUID()}`;
-      writeFileSync(temporary, contents, { flag: "wx" });
-      staged.set(target, temporary);
-    }
-    for (const [target, temporary] of staged) renameSync(temporary, target);
-    for (const entry of writes) {
-      if (!scaffold.files.has(entry.path)) rmSync(join(directory, entry.path), { force: true });
-    }
-  } catch (error) {
-    for (const [target, original] of backups) {
-      if (original === null) rmSync(target, { force: true });
-      else writeFileSync(target, original);
-    }
-    for (const temporary of staged.values()) rmSync(temporary, { force: true });
-    throw error;
-  }
+  return definitionRoot;
 }
 
 export function writeProjectConfig(
   config: ProjectConfig,
   directory = process.cwd(),
-  options: WriteProjectConfigOptions = {}
+  options: WriteProjectConfigOptions = {},
 ): void {
-  if (options.editableSkills) {
-    writeEditableSkillsScaffold(config, directory, options);
-    return;
+  const definitionRoot = assertDefinitionRoot(directory);
+  const configPath = join(definitionRoot, "config.yml");
+  const existing = lstatSync(configPath, { throwIfNoEntry: false });
+  if (existing?.isSymbolicLink() || (existing && !existing.isFile())) {
+    throw new Error(".openthrottle/config.yml must be a regular file");
   }
-  writeFileSync(join(directory, ".openthrottle.yml"), renderProjectConfig(config));
+  if (existing && !options.allowConfigOverwrite) {
+    throw new Error(".openthrottle/config.yml already exists");
+  }
+  mkdirSync(definitionRoot, { recursive: true });
+  if (options.createStarterDirectories !== false) {
+    for (const name of DEFINITION_DIRECTORIES) mkdirSync(join(definitionRoot, name), { recursive: true });
+  }
+  writeFileSync(configPath, renderProjectConfig(config));
 }
 
 export type RepositoryWebhookAction = "created" | "updated" | "unchanged";
@@ -1065,9 +416,25 @@ export interface RepositoryRegistrationResult {
   };
 }
 
+function isRepositoryRegistrationResult(value: unknown): value is RepositoryRegistrationResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const input = value as Record<string, unknown>;
+  if (!input.registration || typeof input.registration !== "object" || Array.isArray(input.registration)) return false;
+  if (!input.readiness || typeof input.readiness !== "object" || Array.isArray(input.readiness)) return false;
+  const registration = input.registration as Record<string, unknown>;
+  const readiness = input.readiness as Record<string, unknown>;
+  if (!readiness.snapshot || typeof readiness.snapshot !== "object" || Array.isArray(readiness.snapshot)) return false;
+  const snapshot = readiness.snapshot as Record<string, unknown>;
+  return typeof registration.github_repo === "string" &&
+    typeof registration.base_branch === "string" &&
+    readiness.github === "ready" &&
+    (readiness.webhook === "created" || readiness.webhook === "updated" || readiness.webhook === "unchanged") &&
+    typeof snapshot.name === "string" && typeof snapshot.state === "string";
+}
+
 export async function registerTargetRepository(
   input: RepositoryRegistrationInput,
-  request: typeof supervisorRequest = supervisorRequest
+  request: typeof supervisorRequest = supervisorRequest,
 ): Promise<RepositoryRegistrationResult> {
   const response = await request("/repositories/register", {
     method: "POST",
@@ -1085,39 +452,6 @@ export async function registerTargetRepository(
     throw new Error("Supervisor returned an invalid repository registration response");
   }
   return body;
-}
-
-function isRepositoryRegistrationResult(value: unknown): value is RepositoryRegistrationResult {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const input = value as Record<string, unknown>;
-  if (!input.registration || typeof input.registration !== "object" || Array.isArray(input.registration)) return false;
-  if (!input.readiness || typeof input.readiness !== "object" || Array.isArray(input.readiness)) return false;
-  const registration = input.registration as Record<string, unknown>;
-  const readiness = input.readiness as Record<string, unknown>;
-  if (!readiness.snapshot || typeof readiness.snapshot !== "object" || Array.isArray(readiness.snapshot)) return false;
-  const snapshot = readiness.snapshot as Record<string, unknown>;
-  return typeof registration.github_repo === "string" &&
-    typeof registration.base_branch === "string" &&
-    readiness.github === "ready" &&
-    (readiness.webhook === "created" || readiness.webhook === "updated" || readiness.webhook === "unchanged") &&
-    typeof snapshot.name === "string" &&
-    typeof snapshot.state === "string";
-}
-
-export async function getSupervisorTaskTimeoutSeconds(
-  request: typeof supervisorRequest = supervisorRequest
-): Promise<number> {
-  const response = await request("/capabilities");
-  const body = (await response.json()) as {
-    error?: string;
-    limits?: { taskTimeoutSeconds?: unknown };
-  };
-  if (!response.ok) throw new Error(body.error ?? `Supervisor returned HTTP ${response.status}`);
-  const timeout = body.limits?.taskTimeoutSeconds;
-  if (typeof timeout !== "number" || !Number.isSafeInteger(timeout) || timeout < 1) {
-    throw new Error("Supervisor returned an invalid task timeout capability");
-  }
-  return timeout;
 }
 
 function supervisorCredentialName(checklistName: "SUPERVISOR_URL" | "OT_STATUS_TOKEN"): string {
@@ -1158,20 +492,17 @@ function unreachableSupervisor(message: string): SupervisorPreflightFailure {
 async function resolveSupervisorEnv(
   env: Record<string, string | undefined>,
   accessStore: SupervisorAccessReader,
-  profileName: string
+  profileName: string,
 ): Promise<Record<string, string | undefined>> {
   const supervisorUrl = env.OT_SUPERVISOR_URL?.trim();
   const statusToken = env.OT_STATUS_TOKEN?.trim();
-  // Any explicit value blocks stored fallback, so partial pairs fail closed.
   if (supervisorUrl || statusToken) return env;
-
   const access = await accessStore.load(profileName);
-  if (!access) return env;
-  return {
+  return access ? {
     ...env,
     OT_SUPERVISOR_URL: access.supervisorUrl,
     OT_STATUS_TOKEN: access.statusToken,
-  };
+  } : env;
 }
 
 export function parseInitArgs(args: string[]): { dryRun: boolean; profile: string } {
@@ -1195,7 +526,7 @@ export function parseInitArgs(args: string[]): { dryRun: boolean; profile: strin
 
 export async function preflightSupervisor(
   request: typeof supervisorRequest = supervisorRequest,
-  env: Record<string, string | undefined> = process.env
+  env: Record<string, string | undefined> = process.env,
 ): Promise<SupervisorPreflightResult> {
   const supervisorUrlName = supervisorCredentialName("SUPERVISOR_URL");
   const statusTokenName = supervisorCredentialName("OT_STATUS_TOKEN");
@@ -1204,12 +535,10 @@ export async function preflightSupervisor(
   if (!supervisorUrl || !statusToken) {
     return {
       status: "not-configured",
-      message:
-        "Supervisor access is not configured. Operators should run `openthrottle setup`; " +
+      message: "Supervisor access is not configured. Operators should run `openthrottle setup`; " +
         `to join an existing deployment, export ${supervisorUrlName} and ${statusTokenName}.`,
     };
   }
-
   try {
     for (const { path, label, validate } of SUPERVISOR_PREFLIGHT_CHECKS) {
       const response = await request(path);
@@ -1219,9 +548,7 @@ export async function preflightSupervisor(
           message: `Supervisor authentication failed: ${statusTokenName} does not match the deployed supervisor.`,
         };
       }
-      if (!response.ok) {
-        return unreachableSupervisor(`Supervisor ${label} check failed with HTTP ${response.status}.`);
-      }
+      if (!response.ok) return unreachableSupervisor(`Supervisor ${label} check failed with HTTP ${response.status}.`);
       let body: unknown;
       try {
         body = await response.json();
@@ -1236,10 +563,6 @@ export async function preflightSupervisor(
   }
 }
 
-export function editableSkillsRefreshSummary(plan: EditableSkillsRefreshPlan): string[] {
-  return plan.entries.map((entry) => `${entry.status.padEnd(13)} ${entry.path}`);
-}
-
 export default async function init(args: string[] = [], options: InitCommandOptions = {}): Promise<void> {
   const { dryRun, profile } = parseInitArgs(args);
   p.intro("openthrottle init");
@@ -1250,12 +573,10 @@ export default async function init(args: string[] = [], options: InitCommandOpti
   try {
     resolvedEnv = await resolveSupervisorEnv(env, accessStore, profile);
   } catch (error) {
-    const setupCommand = profile === "default"
-      ? "openthrottle setup"
-      : `openthrottle setup --profile ${profile}`;
+    const setupCommand = profile === "default" ? "openthrottle setup" : `openthrottle setup --profile ${profile}`;
     (options.reportPreflightFailure ?? ((message) => p.log.error(message)))(
       `Stored supervisor access for profile ${profile} is invalid (${getErrorMessage(error)}). ` +
-        `Fix or remove that access document, then run \`${setupCommand}\`.`
+      `Fix or remove that access document, then run \`${setupCommand}\`.`,
     );
     process.exitCode = 1;
     return;
@@ -1267,7 +588,8 @@ export default async function init(args: string[] = [], options: InitCommandOpti
     process.exitCode = 1;
     return;
   }
-  let detected: Detected;
+
+  let detected: DetectedProject;
   let target: RepositoryTarget;
   try {
     target = (options.detectRepository ?? detectRepository)();
@@ -1277,42 +599,38 @@ export default async function init(args: string[] = [], options: InitCommandOpti
     process.exit(1);
   }
   p.log.info(`Target repository: ${target.repo} (${target.baseBranch ?? "GitHub default branch"})`);
-  p.log.info(detected.pm ? `Detected package manager: ${detected.pm}` : "No Node package detected; enter project commands manually.");
-  const configPath = join(process.cwd(), ".openthrottle.yml");
-  let allowConfigOverwrite = false;
-  if (!dryRun && existsSync(configPath)) {
-    const overwrite = await p.confirm({
-      message: ".openthrottle.yml already exists. Replace it with the default editable scaffold?",
-      initialValue: false,
-    });
-    if (p.isCancel(overwrite) || !overwrite) {
-      p.cancel("Cancelled. Existing .openthrottle.yml was kept; no repository was registered and no files were changed.");
-      return;
-    }
-    allowConfigOverwrite = true;
-  }
-  const selection = await (options.promptConfig ?? promptConfig)(detected, target);
+  p.log.info(detected.pm
+    ? `Detected package manager: ${detected.pm}`
+    : "No Node package detected; enter project commands manually.");
 
-  const supervisorTaskTimeoutSeconds = await getSupervisorTaskTimeoutSeconds(request);
-  if (dryRun) {
-    const { plan, assumesConfigOverwrite } = planEditableSkillsDryRun(selection.project, process.cwd(), {
-      supervisorTaskTimeoutSeconds,
-    });
-    if (assumesConfigOverwrite) {
-      p.log.info(
-        ".openthrottle.yml already exists; a real run prompts before overwriting it, so this preview assumes overwrite."
-      );
+  const selection = await (options.promptConfig ?? promptConfig)(detected, target);
+  const configPath = join(process.cwd(), ".openthrottle", "config.yml");
+  let allowConfigOverwrite = false;
+  if (existsSync(configPath)) {
+    if (dryRun) {
+      p.log.info(".openthrottle/config.yml exists; a real run prompts before replacing it.");
+    } else {
+      const overwrite = await p.confirm({
+        message: ".openthrottle/config.yml already exists. Replace it?",
+        initialValue: false,
+      });
+      if (p.isCancel(overwrite) || !overwrite) {
+        p.cancel("Cancelled. Existing definitions were kept; no repository was registered.");
+        return;
+      }
+      allowConfigOverwrite = true;
     }
-    for (const line of editableSkillsRefreshSummary(plan)) p.log.info(line);
-    p.outro(plan.writable
-      ? "Dry run only: the editable-skill refresh can be applied safely; no files or registrations changed."
-      : "Dry run only: local edits or conflicts block refresh; no files or registrations changed.");
+  }
+
+  if (dryRun) {
+    projectConfigDocument(selection.project);
+    p.outro("Dry run only: would write .openthrottle/config.yml; no files or registrations changed.");
     return;
   }
 
   p.log.warn(
     "The target repository was auto-detected from this directory's git origin. " +
-      "If it is wrong, cancel and re-run `openthrottle init` from the correct repository checkout."
+    "If it is wrong, cancel and re-run `openthrottle init` from the correct repository checkout.",
   );
   const proceed = await p.confirm({
     message: `Initialize ${registrationSummary(selection.registration, resolvedEnv.OT_SUPERVISOR_URL)} and install local OpenThrottle skills?`,
@@ -1323,58 +641,40 @@ export default async function init(args: string[] = [], options: InitCommandOpti
     return;
   }
 
-  const plan = planEditableSkillsRefresh(selection.project, process.cwd(), {
-    allowConfigOverwrite,
-    supervisorTaskTimeoutSeconds,
-  });
-  for (const line of editableSkillsRefreshSummary(plan)) p.log.info(line);
-  if (!plan.writable) throw new Error("Editable-skill refresh has local edits or conflicts; no files changed");
-  const apply = await p.confirm({
-    message: "Apply the listed editable-skill scaffold and provenance updates?",
-    initialValue: false,
-  });
-  if (p.isCancel(apply) || !apply) {
-    p.cancel("Cancelled. No repository was registered and no files were changed.");
-    return;
-  }
-  writeProjectConfig(selection.project, process.cwd(), {
-    editableSkills: true,
-    allowConfigOverwrite,
-    supervisorTaskTimeoutSeconds,
-  });
-  p.log.success("Wrote .openthrottle.yml and editable implementation/admission skills");
+  writeProjectConfig(selection.project, process.cwd(), { allowConfigOverwrite });
+  p.log.success("Wrote .openthrottle/config.yml");
 
   p.log.info("Installing local OpenThrottle skills for detected agents");
   const localSkills = (options.installLocalSkills ?? installLocalSkills)();
   for (const line of localSkillInstallSummary(localSkills)) p.log.info(line);
   if (localSkills.some(({ result }) => !result.success)) {
     p.log.error("Local OpenThrottle skill installation needs attention.");
-    p.log.warn("The local .openthrottle.yml is ready, but the repository was not registered. Apply the recovery command above, then rerun init.");
+    p.log.warn("The local definition config is ready, but the repository was not registered. Apply the recovery command above, then rerun init.");
     process.exit(1);
   }
 
   const spinner = p.spinner();
   spinner.start("Registering repository and checking readiness");
-  let result: Awaited<ReturnType<typeof registerTargetRepository>>;
+  let result: RepositoryRegistrationResult;
   try {
     result = await (options.registerTargetRepository ?? registerTargetRepository)(selection.registration, request);
   } catch (error) {
     spinner.stop("Repository registration failed");
     p.log.error(getErrorMessage(error));
-    p.log.warn("The local .openthrottle.yml is ready; rerun init after fixing supervisor access.");
+    p.log.warn("The local definition config is ready; rerun init after fixing supervisor access.");
     process.exit(1);
   }
   if (result.readiness.snapshot.state.toLowerCase() !== "active") {
     spinner.stop("Repository registered, but platform readiness failed");
     p.log.error(
-      `Platform snapshot not ready — run \`openthrottle setup\` (Daytona snapshot ${result.readiness.snapshot.name} is ${result.readiness.snapshot.state}).`
+      `Platform snapshot not ready — run \`openthrottle setup\` (Daytona snapshot ${result.readiness.snapshot.name} is ${result.readiness.snapshot.state}).`,
     );
     process.exitCode = 1;
     return;
   }
   spinner.stop(`Registered ${result.registration.github_repo} on ${result.registration.base_branch}`);
   p.log.success(
-    `GitHub webhook ${result.readiness.webhook}; Daytona snapshot ${result.readiness.snapshot.name} is ${result.readiness.snapshot.state}.`
+    `GitHub webhook ${result.readiness.webhook}; Daytona snapshot ${result.readiness.snapshot.name} is ${result.readiness.snapshot.state}.`,
   );
   p.outro(initOutro(selection.registration));
 }

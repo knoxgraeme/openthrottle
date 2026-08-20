@@ -5,7 +5,10 @@ export {
   digestNormalized,
 } from "./canonical.js";
 export {
+  ContractValidationError,
+  contractValidationIssue,
   jsonValueAt,
+  type ContractValidationIssue,
   type JsonValue,
   type JsonValueOptions,
 } from "./validation.js";
@@ -27,15 +30,18 @@ export {
   type SemanticResultSchemaContract,
 } from "./result-candidate.js";
 export {
+  ATTEMPT_CHECKPOINT_SCHEMA,
   ATTEMPT_IDENTITY_SCHEMA,
   ATTEMPT_STATES,
   BLOB_POINTER_ALGORITHMS,
   EXECUTION_RECORD_KINDS,
   EXECUTION_RECORD_SCHEMA,
   INLINE_RECORD_PAYLOAD_MAX_BYTES,
+  validateAttemptCheckpoint,
   validateAttemptIdentity,
   validateBlobPointer,
   validateExecutionRecord,
+  type AttemptCheckpoint,
   type AttemptIdentity,
   type AttemptState,
   type BlobPointer,

@@ -196,6 +196,57 @@ describe("filesystem definition compiler", () => {
     expect(result.manifest.digest).toBe("8ef4ad94388dc8897cd13c45b1bedc29fec1ff4e272a6f2b1681085ae735addc");
   });
 
+  it("omits exact checked-in core mirrors while preserving platform origin", () => {
+    const mirrored = clone(sourceFixture);
+    for (const [path, file] of Object.entries(mirrored.platform)) {
+      mirrored.repository[path] = { ...file };
+    }
+
+    const baseline = compile();
+    const result = compile(mirrored);
+
+    expect(result.bundle.normalized).toBe(baseline.bundle.normalized);
+    expect(result.manifest.normalized).toBe(baseline.manifest.normalized);
+    expect(result.bundle.value.entries.filter((entry) => entry.definition_kind !== "config")
+      .every((entry) => entry.origin.kind === "platform")).toBe(true);
+  });
+
+  it("does not charge exact core mirrors against the unique compiler budget", () => {
+    const nearLimit = clone(sourceFixture);
+    for (let index = Object.keys(nearLimit.platform).length; index < 260; index += 1) {
+      nearLimit.platform[
+        `.openthrottle/skills/core/review-change/references/padding-${String(index).padStart(3, "0")}.md`
+      ] = { content: `padding ${index}\n`, blob_sha: index.toString(16).padStart(40, "0") };
+    }
+    const mirrored = clone(nearLimit);
+    for (const [path, file] of Object.entries(mirrored.platform)) {
+      mirrored.repository[path] = { ...file };
+    }
+
+    expect(Object.keys(mirrored.repository).length + Object.keys(mirrored.platform).length)
+      .toBeGreaterThan(VIRTUAL_DEFINITION_MAX_FILES);
+    expect(compile(mirrored).bundle.normalized).toBe(compile(nearLimit).bundle.normalized);
+  });
+
+  it("rejects changed or extra repository files in the core namespace", () => {
+    const changed = clone(sourceFixture);
+    for (const [path, file] of Object.entries(changed.platform)) {
+      changed.repository[path] = { ...file };
+    }
+    changed.repository[".openthrottle/agents/core/reviewer/instructions.md"] = {
+      ...changed.repository[".openthrottle/agents/core/reviewer/instructions.md"]!,
+      content: "Changed repository mirror.\n",
+    };
+    expect(() => compile(changed)).toThrow(/cannot change or add files in the reserved core namespace/);
+
+    const extra = clone(sourceFixture);
+    extra.repository[".openthrottle/agents/core/not-released/instructions.md"] = {
+      content: "Not part of the release.\n",
+      blob_sha: "f".repeat(40),
+    };
+    expect(() => compile(extra)).toThrow(/cannot change or add files in the reserved core namespace/);
+  });
+
   it("resolves external loop edges before enforcing final reachability", () => {
     const fixture = replaceFile(
       sourceFixture,

@@ -12,7 +12,7 @@ to fill every field below without guessing.
 ```json
 {
   "schema": "openthrottle.execution-plan/v2",
-  "graph_id": "structured",
+  "pipeline_id": "core/structured",
   "plan_id": "stable_plan_slug",
   "units": [
     {
@@ -88,7 +88,7 @@ English the requirement, step, or check actually needs.
 - A command may name a unit only when the command is unit-scoped.
 - Source headings and planning vocabulary are never parsed as runtime fields;
   only this fenced JSON contract is consumed by the structured pipeline.
-- Keep graph topology and units immutable after validation; proposed splits or
+- Keep pipeline topology and units immutable after validation; proposed splits or
   scope expansion require a human and a new validated plan.
 
 ## Sealed v1 Plans

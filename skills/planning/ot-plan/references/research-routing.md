@@ -24,7 +24,7 @@ Every plan must inspect the smallest useful set of:
 
 1. Active repository instructions and normative specifications.
 2. The product source, ticket, or prior plan supplied by the user.
-3. `.openthrottle.yml` and relevant package/runtime versions.
+3. `.openthrottle/config.yml`, referenced definition files, and relevant package/runtime versions.
 4. Owning modules, boundaries, entry points, and integration seams.
 5. Two or more direct implementation examples when available.
 6. Existing tests and verification conventions for the affected behavior.

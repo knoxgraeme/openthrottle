@@ -21,12 +21,12 @@ OpenThrottle.
 3. Never read, print, or forward raw provider tokens. If authentication is
    missing, surface the CLI error and the relevant environment variable name
    only.
-4. Resolve the repository root before any mutation and require a valid
-   `.openthrottle.yml`. Keep ambiguity resolution and discovery read-only and
+4. Resolve the repository root before any mutation and require a committed,
+   valid `.openthrottle/config.yml`. Keep ambiguity resolution and discovery read-only and
    show their JSON results. Structured preparation is different: explain that
    it mutates the plan file in place, obtain the user's explicit authorization
    for that write, then prepare, validate the written plan, and report the
-   validated digest. Stop on either failure and never fall back to `simple`.
+   validated digest. Stop on either failure and never change the configured pipeline.
 5. For explicit mutation requests, use `--json` only when the selected CLI
    command supports it. Report only CLI-evidenced ticket/run URLs and trigger
    state, then inspect progress with `openthrottle status`.
