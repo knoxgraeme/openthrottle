@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const taskRoot = resolve(repoRoot, "skills/tasks");
 const skill = (name) => readFileSync(resolve(taskRoot, name, "SKILL.md"), "utf8");
+const reference = (name, file) => readFileSync(resolve(taskRoot, name, "references", file), "utf8");
 
 describe("automatic-admission task packages", () => {
   it("runs the production automatic coordinator and structured runtime in one lifecycle", () => {
@@ -24,13 +25,28 @@ describe("automatic-admission task packages", () => {
   });
 
   it("ships one complete canonical package per planning action", () => {
-    for (const [name, reference] of [
-      ["admission-plan", "route-rubric.md"],
-      ["review-admission-plan", "review-checklist.md"],
+    for (const [name, references] of [
+      ["admission-plan", ["route-rubric.md", "receipt-shape.md"]],
+      ["review-admission-plan", ["review-checklist.md", "receipt-shape.md"]],
     ]) {
       expect(skill(name)).toContain(`name: ${name}`);
       expect(existsSync(resolve(taskRoot, name, "agents/openai.yaml"))).toBe(true);
-      expect(existsSync(resolve(taskRoot, name, "references", reference))).toBe(true);
+      for (const file of references) {
+        expect(existsSync(resolve(taskRoot, name, "references", file))).toBe(true);
+      }
+    }
+  });
+
+  it("shows both admission actors the exact standard-receipt nesting", () => {
+    for (const name of ["admission-plan", "review-admission-plan"]) {
+      const body = skill(name);
+      const shape = reference(name, "receipt-shape.md");
+      expect(body).toContain("references/receipt-shape.md");
+      expect(body).toMatch(/nine fence\s+fields[\s\S]*inside `receipt\.fence`/);
+      expect(shape).toContain('"fence": {');
+      expect(shape).toContain('"action_attempt_id": "<contract.action_attempt_id>"');
+      expect(shape).toMatch(/exactly ten top-level fields/);
+      expect(shape).toMatch(/Never place any fence field beside them/);
     }
   });
 

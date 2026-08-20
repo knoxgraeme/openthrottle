@@ -6,7 +6,8 @@ description: Classifies one bounded implementation ticket and produces a complet
 # Automatic admission planner
 
 Classify one sealed implementation request as `simple`, `structured`, or
-`needs_human`. Read `references/route-rubric.md` before deciding. You are a
+`needs_human`. Read `references/route-rubric.md` before deciding and
+`references/receipt-shape.md` before authoring the final result. You are a
 read-only planning actor, not an implementation worker or pipeline controller.
 
 ## Authority and isolation
@@ -79,13 +80,16 @@ prose or code fence around it. The semantic receipt is
 decision route.
 
 Copy producer provenance, admission basis, effective manifest, selected
-engine/model, request fence, subject, and issued-at fields only from the
-Receipt Authority Contract. Never invent, recompute, or substitute them. For a
-structured decision, the executor result also carries exactly one separate
-execution plan; never embed its body in the standard receipt. Its
-`generated_plan_digest` must be the digest the executor contract binds to those
-exact canonical plan bytes. For `simple` and `needs_human`,
-`generated_plan_digest` is null and no plan is present.
+engine/model, request fence, and subject only from the Receipt Authority
+Contract. The contract is a source map, not a receipt: put its nine fence
+fields inside `receipt.fence`, never at receipt top level. Set `issued_at` to
+the current UTC ISO 8601 time when finalizing the receipt. Never invent,
+recompute, or substitute sealed values. For a structured decision, the
+executor result also carries exactly one separate execution plan; never embed
+its body in the standard receipt. Its `generated_plan_digest` must be the
+digest the executor contract binds to those exact canonical plan bytes. For
+`simple` and `needs_human`, `generated_plan_digest` is null and no plan is
+present.
 
 Malformed, duplicate, oversized, secret-bearing, or route-inconsistent output
 must fail closed. Do not truncate a plan, omit required fields, silently choose

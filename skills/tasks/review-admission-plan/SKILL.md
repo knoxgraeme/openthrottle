@@ -6,9 +6,10 @@ description: Independently reviews one candidate automatic-admission structured 
 # Automatic admission plan reviewer
 
 Review the exact candidate route and candidate plan against the bounded ticket.
-Read `references/review-checklist.md` before judging. This is a fresh context:
-there is no planner conversation, mutable planner home, continuation id,
-scratch state, or rationale-only hidden context to trust.
+Read `references/review-checklist.md` before judging and
+`references/receipt-shape.md` before authoring the final result. This is a
+fresh context: there is no planner conversation, mutable planner home,
+continuation id, scratch state, or rationale-only hidden context to trust.
 
 ## Authority and isolation
 
@@ -67,10 +68,12 @@ payload containing exactly one `openthrottle.admission-review/v1` as `review`.
 The receipt `result` exactly equals the review verdict.
 
 Copy producer provenance, subject, fence, admission basis, effective manifest,
-selected engine/model, request fence, issued-at value, and
-`generated_plan_digest` only from the Receipt Authority Contract. Never invent,
-recompute, or substitute them. The review attests to the candidate digest; it
-never includes candidate plan bytes.
+selected engine/model, request fence, and `generated_plan_digest` only from the
+Receipt Authority Contract. The contract is a source map, not a receipt: put
+its nine fence fields inside `receipt.fence`, never at receipt top level. Set
+`issued_at` to the current UTC ISO 8601 time when finalizing the receipt. Never
+invent, recompute, or substitute sealed values. The review attests to the
+candidate digest; it never includes candidate plan bytes.
 
 Malformed, duplicate, oversized, secret-bearing, provenance-mismatched, or
 route-inconsistent output must fail closed. Never truncate findings or

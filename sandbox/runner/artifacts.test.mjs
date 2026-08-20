@@ -225,6 +225,13 @@ describe("normalized stage artifacts", () => {
     }, {})).toThrow(/producer skill/);
     expect(() => validateStandardReceipt({ ...receipt, payload: {} }, {}))
       .toThrow(/payload rationale/);
+    expect(() => validateStandardReceipt({
+      ...receipt,
+      action_attempt_id: receipt.fence.action_attempt_id,
+      parent_run_id: receipt.fence.parent_run_id,
+    }, {})).toThrow(
+      /standard receipt fence fields must be nested under fence: parent_run_id, action_attempt_id/,
+    );
 
     const commandReceipt = {
       ...receipt,
