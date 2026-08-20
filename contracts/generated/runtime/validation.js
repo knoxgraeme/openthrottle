@@ -1,6 +1,19 @@
 import { canonicalJson, digestNormalized } from "./canonical.js";
+export class ContractValidationError extends Error {
+    issue;
+    constructor(path, detail) {
+        super(`${path}: ${detail}`);
+        this.name = "ContractValidationError";
+        this.issue = Object.freeze({ path, detail });
+    }
+}
+export function contractValidationIssue(error) {
+    if (!(error instanceof ContractValidationError))
+        return undefined;
+    return { ...error.issue };
+}
 export function fail(path, message) {
-    throw new Error(`${path}: ${message}`);
+    throw new ContractValidationError(path, message);
 }
 export function objectAt(value, path, allowed) {
     if (!value || typeof value !== "object" || Array.isArray(value))

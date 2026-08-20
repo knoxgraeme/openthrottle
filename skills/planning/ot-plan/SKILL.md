@@ -7,7 +7,7 @@ description: Turn an agreed software change, ticket, specification, or working c
 
 Create a durable local implementation plan. Ground it in the current repository,
 preserve decisions already made with the user, resolve planning-time uncertainty,
-and finish with an OpenThrottle-ready artifact when the selected graph consumes
+and finish with an OpenThrottle-ready artifact when the configured pipeline consumes
 execution units.
 
 Do not implement the change, run the repository's verification suite, create a
@@ -29,7 +29,7 @@ questions still run. Apply steps 3–5 under the deepening contract's fixed-scop
 stable-ID, and approval rules, then continue through review and preparation.
 
 Resolve the repository root and read its active agent instructions. Read
-`.openthrottle.yml` when present. Locate normative specifications, strategy,
+`.openthrottle/config.yml` when present. Locate normative specifications, strategy,
 glossaries, and recent related plans only when they can constrain this change.
 
 If the user named an existing plan, update it in place unless they asked for a
@@ -133,37 +133,39 @@ product decision or more than one defensible unit decomposition.
 
 ### 7. Prepare for OpenThrottle
 
-Resolve the graph from the user's explicit choice, otherwise from the
-repository configuration. Never silently change graphs.
+Use the pipeline selected by the committed repository configuration. Never
+silently change it. An explicit `--pipeline` value is an assertion against that
+config, not an override. Let the CLI compile the definition bundle and determine
+whether the manifest loops over `execution_plan.units`; do not infer this from a
+pipeline name.
 
-A built-in `structured` graph, or a built-in reference containing
-`structured`, consumes units. A repository graph consumes units when it has a
-`for_each_unit` node or a loop whose `input_scope` is `unit`. Other graphs,
-including the built-in `simple` graph, do not consume units. Determine this
-from `.openthrottle.yml` and the declared graph file; do not probe an installed
-CLI merely to classify the graph.
-
-When the selected graph consumes execution units, run:
+Validate the reviewed plan first:
 
 ```text
-openthrottle plan prepare <plan-file> --graph <graph-id> --json
-openthrottle plan validate <plan-file> --graph <graph-id> --json
+openthrottle plan validate <plan-file> --pipeline <pipeline-id> --json
+```
+
+When validation reports that the configured pipeline consumes execution units
+but the block is missing or invalid, run preparation and validate again:
+
+```text
+openthrottle plan prepare <plan-file> --pipeline <pipeline-id> --json
+openthrottle plan validate <plan-file> --pipeline <pipeline-id> --json
 ```
 
 If preparation reports semantic ambiguity, improve the human plan or request
 the missing decision before retrying. If validation reports a structural error,
-repair the generated execution block without changing approved prose.
-
-When the graph does not consume units, leave the plan as reviewed prose and do
-not add an execution-plan block.
+repair the generated execution block without changing approved prose. When the
+compiled pipeline does not consume units, leave the plan as reviewed prose and
+do not add an execution-plan block.
 
 ## Completion
 
 Report:
 
 - the repo-relative plan path;
-- the selected graph;
-- the validation digest for a unit-consuming graph;
+- the configured pipeline;
+- the validation digest for a unit-consuming pipeline;
 - the independent review state for a standard or deep plan;
 - recorded assumptions or deferred implementation questions;
 - any unresolved source-preservation gap;

@@ -26,12 +26,11 @@ npx openthrottle init
 ```
 
 `init` installs user-global authoring/operator skills for detected local agents,
-writes `.openthrottle.yml`, registers a Linear-team or GitHub-Issue control route,
-creates the GitHub webhook, and verifies the Daytona snapshot. New Claude and
-Codex configurations enable automatic implementation admission by default.
-OpenCode configurations omit that mode and use direct default-graph routing
-until their structured execution path is supported. Set
-`intents.implement.admission_mode: legacy` for direct routing on every engine.
+writes `.openthrottle/config.yml`, creates empty starter definition directories,
+registers a Linear-team or GitHub-Issue control route, creates the GitHub webhook,
+and verifies the Daytona snapshot. The config selects one pipeline and one local
+engine. Commit the definition tree before validating or shipping: OpenThrottle
+compiles exact Git bytes and rejects dirty definition paths.
 
 For Linear control, prepare and delegate a plan:
 
@@ -49,10 +48,10 @@ the exact `openthrottle` label to an open Issue.
 ```text
 openthrottle setup [--profile <name>] [--check] [--yes] [--legacy-checklist]
 openthrottle init [--profile <name>] [--dry-run]
-openthrottle plan validate <file.md>
-openthrottle plan prepare <file.md> [--graph <id>]
-openthrottle validate <file.md>
-openthrottle ship <file.md>
+openthrottle plan validate <file.md> [--pipeline <id>] [--json]
+openthrottle plan prepare <file.md> [--pipeline <id>] [--json]
+openthrottle validate <file.md> [--pipeline <id>] [--json]
+openthrottle ship <file.md> [--pipeline <id>]
 openthrottle status [<ticket>] [--admission]
 openthrottle stop <ticket>
 openthrottle logs <ticket>
@@ -65,16 +64,18 @@ Key workflows:
 
 - `setup` provisions and verifies the pinned supervisor and sandbox release.
   `--check` is read-only; `--profile` keeps multiple environments separate.
-- `init` is idempotent. Re-run it to change control provider, base branch, or
-  repository commands. It scaffolds repository-owned `implement-plan`,
-  `admission-plan`, and `review-admission-plan` packages. The planner and
-  reviewer may be edited independently; provenance refreshes include their
-  metadata and references and refuse to overwrite local edits. `--dry-run`
-  reports refresh classifications without writing or registering. A partial
-  `OT_SUPERVISOR_URL`/`OT_STATUS_TOKEN` pair fails closed. Test, lint, and build
-  commands are required because the generated simple graph executes all three.
-- `plan prepare` uses the configured local engine and canonical planning skill;
-  `plan validate` checks the embedded execution-plan contract.
+- `init` writes the small v2 config and starter directories; it does not copy
+  platform agents, pipelines, or skills into the repository. Add repository
+  definitions directly under `.openthrottle/` when needed. `--dry-run` validates
+  the proposed config without writing or registering. A partial
+  `OT_SUPERVISOR_URL`/`OT_STATUS_TOKEN` pair fails closed.
+- `plan prepare` and `plan validate` compile the committed definition bundle.
+  A pipeline whose manifest loops over `execution_plan.units` requires a v2
+  execution-plan block with a matching `pipeline_id`; other pipelines require
+  reviewed prose without that block. `--pipeline` is an assertion against the
+  committed config, never a runtime override.
+- `ship` performs the same committed bundle and plan validation before any
+  Linear credential access or mutation. It does not append selection metadata.
 - `status`, `stop`, `logs`, and `analysis` call authenticated supervisor
   endpoints.
 - `status <ticket> --admission` prints the exact accepted automatic plan and

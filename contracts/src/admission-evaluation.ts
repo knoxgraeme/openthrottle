@@ -189,7 +189,9 @@ function canonicalPlanAt(value: unknown, path: string): { normalized: string; di
   const raw = stringAt(value, path, { max: 256 * 1024 });
   const plan = parseExecutionPlanContractV2(raw, { source: path });
   if (raw !== plan.normalized) fail(path, "must contain canonical JSON bytes");
-  if (plan.value.graph_id !== "structured") fail(`${path}.graph_id`, "must be structured");
+  if (plan.value.pipeline_id !== "core/structured") {
+    fail(`${path}.pipeline_id`, "must be core/structured");
+  }
   return plan;
 }
 

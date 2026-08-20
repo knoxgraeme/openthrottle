@@ -63,7 +63,7 @@ Return a human decision request when any of these are unresolved:
 - required verification commands are unnamed or conflict with repository config;
 - requirements, files, approach, tests, acceptance, or verification content is
   missing for a behavior-bearing unit;
-- the chosen graph requires capabilities the repository graph does not declare.
+- the configured pipeline requires capabilities its compiled manifest does not declare.
 
 ## Completion
 

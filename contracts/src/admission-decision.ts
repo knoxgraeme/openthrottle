@@ -213,8 +213,8 @@ export function validateAdmissionExecutionPlanArtifact(
   const plan = validateExecutionPlanContractV2(input.execution_plan, {
     source: `${source}.execution_plan`,
   });
-  if (plan.value.graph_id !== "structured") {
-    fail(`${source}.execution_plan.graph_id`, "must be structured");
+  if (plan.value.pipeline_id !== "core/structured") {
+    fail(`${source}.execution_plan.pipeline_id`, "must be core/structured");
   }
   const sourceInput = objectAt(input.source, `${source}.source`, [
     "admission_basis_digest", "effective_manifest_digest", "request_hash",

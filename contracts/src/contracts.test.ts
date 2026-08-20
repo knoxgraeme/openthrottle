@@ -1710,7 +1710,7 @@ describe("Stage C contract fixtures", () => {
 
   it("stores a generated structured plan as a separately bounded, digest-checked artifact", () => {
     const executionPlan = JSON.parse(readFixture("valid", "execution-plan-v2.json")) as Record<string, unknown>;
-    executionPlan.graph_id = "structured";
+    executionPlan.pipeline_id = "core/structured";
     const generatedPlanDigest = parseExecutionPlanContractV2(JSON.stringify(executionPlan)).digest;
     const artifact = {
       schema: "openthrottle.admission-execution-plan-artifact/v1",
@@ -1730,6 +1730,14 @@ describe("Stage C contract fixtures", () => {
     };
 
     expect(validateAdmissionExecutionPlanArtifact(artifact).value.execution_plan).toEqual(executionPlan);
+    const wrongPipeline = structuredClone(executionPlan);
+    wrongPipeline.pipeline_id = "repo/custom";
+    expect(() => validateAdmissionExecutionPlanArtifact({
+      ...artifact,
+      execution_plan: wrongPipeline,
+    }, { source: "artifact" })).toThrow(
+      /artifact\.execution_plan\.pipeline_id: must be core\/structured/,
+    );
     expect(() => validateAdmissionExecutionPlanArtifact({
       ...artifact,
       generated_plan_digest: "f".repeat(64),

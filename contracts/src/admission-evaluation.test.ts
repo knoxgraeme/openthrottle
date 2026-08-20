@@ -35,7 +35,7 @@ function reviewedPlan(caseId: string, sourceIds: string[]): {
 } {
   const plan: ExecutionPlanContractV2 = {
     schema: "openthrottle.execution-plan/v2",
-    graph_id: "structured",
+    pipeline_id: "core/structured",
     plan_id: `evaluation-${caseId}`,
     units: [{
       id: "u1",

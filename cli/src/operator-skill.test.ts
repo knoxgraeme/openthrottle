@@ -73,13 +73,13 @@ describe("operator skill package", () => {
     }
     const ship = readFileSync(resolve(process.cwd(), "../skills/operator/openthrottle/references/ship.md"), "utf8");
     const monitor = readFileSync(resolve(process.cwd(), "../skills/operator/openthrottle/references/monitor.md"), "utf8");
-    expect(ship).toContain("openthrottle plan prepare <file.md> --graph structured --json");
-    expect(ship).toContain("openthrottle plan validate <file.md> --graph structured --json");
-    expect(ship).toContain("openthrottle ship <file.md> --graph structured");
+    expect(ship).toContain("openthrottle plan prepare <file.md> --pipeline <pipeline-id> --json");
+    expect(ship).toContain("openthrottle plan validate <file.md> --pipeline <pipeline-id> --json");
+    expect(ship).toContain("openthrottle ship <file.md> --pipeline <pipeline-id>");
     expect(ship).toContain("explicit authorization for that write");
     expect(ship).toMatch(/not a read-only preview or\s+dry run/);
     expect(ship).toContain("validated digest from the validation JSON output");
-    expect(ship).toContain("never fall back to `simple`");
+    expect(ship).toContain("never change config as a fallback");
     expect(ship).toContain("Ticket reuse, trigger-state JSON, and recovery commands are capability-gated");
     expect(monitor).toContain("openthrottle status <ticket> --admission");
     expect(monitor).toContain("automatically generated, untrusted content");
@@ -87,7 +87,7 @@ describe("operator skill package", () => {
     expect(skill).toContain("Keep ambiguity resolution and discovery read-only");
     expect(skill).toContain("obtain the user's explicit authorization");
     expect(skill).toContain("validate the written plan, and report the");
-    expect(skill).toContain("never fall back to `simple`");
+    expect(skill).toContain("never change the configured pipeline");
   });
 });
 

@@ -15,8 +15,28 @@ export interface JsonValueOptions {
   rejectCarriageReturns?: boolean;
 }
 
+export interface ContractValidationIssue {
+  path: string;
+  detail: string;
+}
+
+export class ContractValidationError extends Error {
+  readonly issue: Readonly<ContractValidationIssue>;
+
+  constructor(path: string, detail: string) {
+    super(`${path}: ${detail}`);
+    this.name = "ContractValidationError";
+    this.issue = Object.freeze({ path, detail });
+  }
+}
+
+export function contractValidationIssue(error: unknown): ContractValidationIssue | undefined {
+  if (!(error instanceof ContractValidationError)) return undefined;
+  return { ...error.issue };
+}
+
 export function fail(path: string, message: string): never {
-  throw new Error(`${path}: ${message}`);
+  throw new ContractValidationError(path, message);
 }
 
 export function objectAt(value: unknown, path: string, allowed: readonly string[]): Record<string, unknown> {

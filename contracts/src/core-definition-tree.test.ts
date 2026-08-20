@@ -19,7 +19,6 @@ import {
 
 const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 const definitionRoot = join(repositoryRoot, ".openthrottle");
-const taskSkillRoot = join(repositoryRoot, "skills/tasks");
 const sourceCommit = "a".repeat(40);
 const generatedRoot = join(repositoryRoot, "contracts/generated");
 const platformCatalog = JSON.parse(readFileSync(
@@ -180,21 +179,6 @@ describe("root .openthrottle definition tree", () => {
     });
 
     expect(matches).toEqual([]);
-  });
-
-  it("copies every included task package byte-for-byte except provider metadata", () => {
-    for (const skillId of skillIds) {
-      const sourceDirectory = join(taskSkillRoot, skillId);
-      const sourceFiles = filesBelow(sourceDirectory)
-        .filter((path) => relative(sourceDirectory, path) !== "agents/openai.yaml");
-      const copiedDirectory = join(definitionRoot, "skills/core", skillId);
-      const copiedFiles = filesBelow(copiedDirectory);
-      expect(copiedFiles.map((path) => relative(copiedDirectory, path)))
-        .toEqual(sourceFiles.map((path) => relative(sourceDirectory, path)));
-      for (const [index, sourcePath] of sourceFiles.entries()) {
-        expect(readFileSync(copiedFiles[index]!)).toEqual(readFileSync(sourcePath));
-      }
-    }
   });
 
   it("compiles all three pipeline selections from the actual tree", () => {

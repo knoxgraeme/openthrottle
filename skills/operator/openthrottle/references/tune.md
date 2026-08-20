@@ -3,7 +3,7 @@
 Use this path only when the user explicitly asks to run an OpenThrottle tune for
 the repository.
 
-1. Resolve the repository root and confirm `.openthrottle.yml` exists.
+1. Resolve the repository root and confirm committed `.openthrottle/config.yml` exists.
 2. Use the OPE-145 tune CLI contract with `--json` when available:
 
    ```bash

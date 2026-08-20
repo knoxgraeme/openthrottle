@@ -79,7 +79,7 @@ inventing meaning.
 - For a non-behavioral unit, state why no automated test is appropriate and
   provide another observable verification method.
 - Express verification as observable proof. Use command names declared by
-  `.openthrottle.yml`; do not invent unavailable commands.
+  `.openthrottle/config.yml`; do not invent unavailable commands.
 - Keep dependencies acyclic and explicit.
 - Keep a structured plan within 1–64 units. Each unit may carry 1–32 entries in
   requirements, approach, tests, acceptance, and verification, and 1–64 file

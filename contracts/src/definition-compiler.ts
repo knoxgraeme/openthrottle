@@ -166,6 +166,16 @@ function decodeText(content: string | Uint8Array, path: string): { text: string;
   return { text: text.replace(/\r\n?/g, "\n"), bytes };
 }
 
+function snapshotContent(content: string | Uint8Array): string | Uint8Array {
+  return typeof content === "string" ? content : new Uint8Array(content);
+}
+
+function rawContentEquals(left: string | Uint8Array, right: string | Uint8Array): boolean {
+  const leftBytes = typeof left === "string" ? Buffer.from(left, "utf8") : Buffer.from(left);
+  const rightBytes = typeof right === "string" ? Buffer.from(right, "utf8") : Buffer.from(right);
+  return leftBytes.equals(rightBytes);
+}
+
 function loadFiles(input: DefinitionCompilerInput): Map<string, LoadedFile> {
   const loaded = new Map<string, LoadedFile>();
   const casePaths = new Map<string, string>();
@@ -174,6 +184,7 @@ function loadFiles(input: DefinitionCompilerInput): Map<string, LoadedFile> {
   const platform = input.platform === undefined
     ? undefined
     : reverifyPlatformDefinitionSource(input.platform);
+  const platformFiles = platform?.files;
   const channels: Array<{
     origin: DefinitionOrigin;
     sourceCommit: string | null;
@@ -195,15 +206,56 @@ function loadFiles(input: DefinitionCompilerInput): Map<string, LoadedFile> {
     if (!channel.files || typeof channel.files.entries !== "function") {
       fail(`${channel.origin}.files`, "must be a ReadonlyMap");
     }
+    let channelFileCount = 0;
+    let channelTotalBytes = 0;
     for (const [rawPath, virtualFile] of channel.files.entries()) {
       const pathSource = `${channel.origin}.files`;
       assertSafePath(rawPath, pathSource);
+      channelFileCount += 1;
+      if (channelFileCount > VIRTUAL_DEFINITION_MAX_FILES) {
+        fail(`${channel.origin}.files`, `file count exceeds ${VIRTUAL_DEFINITION_MAX_FILES}`);
+      }
+      if (!virtualFile || virtualFile.type !== "file") {
+        fail(rawPath, "must be a regular file; symlinks and non-files are forbidden");
+      }
+      // Snapshot an accessor-backed or shared-buffer input once. Validation,
+      // core-mirror comparison, and retained compiler bytes must all observe
+      // the same value.
+      const content = snapshotContent(virtualFile.content);
+      const contentBytes = typeof content === "string"
+        ? Buffer.byteLength(content, "utf8")
+        : content.byteLength;
+      if (contentBytes > VIRTUAL_DEFINITION_MAX_FILE_BYTES) {
+        fail(rawPath, `file exceeds ${VIRTUAL_DEFINITION_MAX_FILE_BYTES} UTF-8 bytes`);
+      }
+      channelTotalBytes += contentBytes;
+      if (channelTotalBytes > VIRTUAL_DEFINITION_MAX_TOTAL_BYTES) {
+        fail(`${channel.origin}.files`, `total bytes exceed ${VIRTUAL_DEFINITION_MAX_TOTAL_BYTES}`);
+      }
       if (channel.origin === "repository" && isCoreRepositoryPath(rawPath)) {
-        fail(rawPath, "repository definitions cannot use the reserved core namespace");
+        const released = platformFiles?.get(rawPath);
+        if (
+          released?.type !== "file" ||
+          !rawContentEquals(content, released.content)
+        ) {
+          fail(
+            rawPath,
+            "repository definitions cannot change or add files in the reserved core namespace",
+          );
+        }
+        // OpenThrottle dogfoods the same checked-in core tree used to build the
+        // release catalog. Exact byte mirrors are repository evidence only;
+        // compile the independently verified platform copy so its origin and
+        // release trust remain authoritative.
+        continue;
       }
       fileCount += 1;
       if (fileCount > VIRTUAL_DEFINITION_MAX_FILES) {
-        fail("definition_files", `file count exceeds ${VIRTUAL_DEFINITION_MAX_FILES}`);
+        fail("definition_files", `unique file count exceeds ${VIRTUAL_DEFINITION_MAX_FILES}`);
+      }
+      totalBytes += contentBytes;
+      if (totalBytes > VIRTUAL_DEFINITION_MAX_TOTAL_BYTES) {
+        fail("definition_files", `unique bytes exceed ${VIRTUAL_DEFINITION_MAX_TOTAL_BYTES}`);
       }
       const caseKey = rawPath.toLowerCase();
       const casePath = casePaths.get(caseKey);
@@ -214,14 +266,7 @@ function loadFiles(input: DefinitionCompilerInput): Map<string, LoadedFile> {
       if (loaded.has(rawPath)) {
         fail(rawPath, "implicit override of an existing definition file is forbidden");
       }
-      if (!virtualFile || virtualFile.type !== "file") {
-        fail(rawPath, "must be a regular file; symlinks and non-files are forbidden");
-      }
-      const decoded = decodeText(virtualFile.content, rawPath);
-      totalBytes += decoded.bytes;
-      if (totalBytes > VIRTUAL_DEFINITION_MAX_TOTAL_BYTES) {
-        fail("definition_files", `total bytes exceed ${VIRTUAL_DEFINITION_MAX_TOTAL_BYTES}`);
-      }
+      const decoded = decodeText(content, rawPath);
       loaded.set(rawPath, {
         path: rawPath,
         text: decoded.text,

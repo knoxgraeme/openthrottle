@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ContractValidationError,
   COMPILED_PIPELINE_MANIFEST_SCHEMA,
   DEFINITION_BUNDLE_SCHEMA,
   EFFECT_INTENT_SCHEMA,
@@ -8,9 +9,11 @@ import {
   SEMANTIC_RESULT_SCHEMA,
   assertSameIdempotentEffect,
   canonicalJson,
+  contractValidationIssue,
   digestCanonicalJson,
   providerJsonSchemaForResultCandidate,
   validateAttemptIdentity,
+  validateAttemptCheckpoint,
   validateBlobPointer,
   validateCompiledPipelineManifest,
   validateDefinitionBundle,
@@ -54,6 +57,7 @@ describe("execution-kernel determinism fixture", () => {
     const semanticSchema = validateSemanticResultSchema(fixture.semantic_result_schema).value;
     validateAndNormalizeResultCandidate(fixture.result_candidate, semanticSchema);
     validateAttemptIdentity(fixture.attempt_identity);
+    validateAttemptCheckpoint(fixture.attempt_checkpoint);
     validateExecutionRecord(fixture.result_record, { payloadSchemas: recordPayloadSchemas });
     validateExecutionRecord(fixture.decision_record, { payloadSchemas: recordPayloadSchemas });
     validateExecutionRecord(fixture.delivery_record, { payloadSchemas: recordPayloadSchemas });
@@ -84,6 +88,30 @@ const unitResultSchema = validateSemanticResultSchema({
 }).value;
 
 describe("semantic result candidates", () => {
+  it("exposes stable structured validation diagnostics without changing messages", () => {
+    let failure: unknown;
+    try {
+      validateAndNormalizeResultCandidate({
+        schema: RESULT_CANDIDATE_SCHEMA,
+        outcome: "unknown",
+        payload: { summary: "done", evidence: [] },
+      }, unitResultSchema);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(ContractValidationError);
+    expect(failure).toHaveProperty(
+      "message",
+      "result_candidate.outcome: must be one of: success, failure, needs_human",
+    );
+    expect(contractValidationIssue(failure)).toEqual({
+      path: "result_candidate.outcome",
+      detail: "must be one of: success, failure, needs_human",
+    });
+    expect(contractValidationIssue(new Error("not a contract failure"))).toBeUndefined();
+  });
+
   it("normalizes the OPE-188 summary array without accepting authority fields", () => {
     const result = validateAndNormalizeResultCandidate({
       schema: RESULT_CANDIDATE_SCHEMA,
@@ -194,6 +222,57 @@ describe("semantic result candidates", () => {
 });
 
 describe("execution records", () => {
+  it("binds checkpoints to the complete attempt identity and verified subjects", () => {
+    const checkpoint = validateAttemptCheckpoint({
+      schema: "openthrottle.attempt-checkpoint/v1",
+      id: "checkpoint-1",
+      pipeline_run_id: "run-1",
+      attempt_id: "attempt-1",
+      request_hash: sha("a"),
+      definition_bundle_hash: sha("b"),
+      input_subject: subject("c"),
+      output_subject: subject("d"),
+      native_session_id: "session-1",
+      payload_schema: "checkpoint/v1",
+      payload: { inline: { tree: subject("d") } },
+      captured_at: "2026-08-20T00:00:00.000Z",
+    }).value;
+
+    expect(checkpoint.output_subject).toBe(subject("d"));
+    expect(checkpoint.payload).toEqual({ inline: { tree: subject("d") } });
+    expect(() => validateAttemptCheckpoint({
+      ...checkpoint,
+      payload: {
+        blob: {
+          algorithm: "sha256",
+          digest: sha("e"),
+          bytes: 70_000,
+          encoding: "binary",
+          media_type: "application/octet-stream",
+          payload_schema: "different/v1",
+        },
+      },
+    })).toThrow(/must match the checkpoint payload_schema/);
+  });
+
+  it("allows the explicit empty input set only at the base DecisionRecord boundary", () => {
+    const record = validateExecutionRecord({
+      schema: "openthrottle.record/v1",
+      id: "decision-bootstrap",
+      kind: "decision",
+      pipeline_run_id: "run-1",
+      reducer: "core/run-bootstrap@1",
+      input_record_ids: [],
+      payload_schema: "advance/v1",
+      payload: { inline: { next: "implement" } },
+      created_at: "2026-08-20T00:00:00.000Z",
+    }, { payloadSchemas: recordPayloadSchemas }).value;
+
+    expect(record.kind).toBe("decision");
+    if (record.kind !== "decision") throw new Error("expected DecisionRecord");
+    expect(record.input_record_ids).toEqual([]);
+  });
+
   it("keeps authoritative attempt and output-subject identity on ResultRecord", () => {
     const record = validateExecutionRecord({
       schema: "openthrottle.record/v1",

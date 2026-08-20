@@ -21,19 +21,23 @@ Usage:
                                     Register the current GitHub repository and
                                     control route, install local authoring/operator
                                     skills, verify readiness, and write
-                                    .openthrottle.yml plus the repository-owned
-                                    editable simple pipeline and admission skills.
+                                    .openthrottle/config.yml. Empty definition
+                                    directories are created for repository-owned
+                                    pipelines, agents, skills, and evals.
                                     --profile selects saved onboarding state;
-                                    --dry-run prints refresh classifications
+                                    --dry-run validates the proposed config
                                     without writing or registering anything.
-  openthrottle plan validate <file.md>
-                                    Validate the plan's execution-plan block.
-  openthrottle plan prepare <file.md> [--graph <id>]
-                                    Prepare the execution plan using the configured
-                                    local engine and canonical planning skill.
+  openthrottle plan validate <file.md> [--pipeline <id>] [--json]
+                                    Compile committed definitions and validate
+                                    the plan required by the configured pipeline.
+  openthrottle plan prepare <file.md> [--pipeline <id>] [--json]
+                                    Prepare the execution plan using the committed
+                                    pipeline, configured engine, and planning skill.
   openthrottle validate <file.md>   Alias for plan validate.
-  openthrottle ship <file.md>      Create a Linear issue from a markdown
-                                    file and delegate it to the agent.
+  openthrottle ship <file.md> [--pipeline <id>]
+                                    Validate committed definitions, create a Linear
+                                    issue, and delegate it to the agent. --pipeline
+                                    asserts config; it never overrides it.
   openthrottle status [<ticket>] [--admission]
                                     Show provider-neutral status, or the exact
                                     accepted automatic plan and review evidence.
