@@ -32,7 +32,7 @@ import {
   inspectionProcessEnvironment,
   inspectionAgentPolicyArgs,
   isAdmissionInspectionStage,
-  parseAdmissionPlannerOutput,
+  parseAdmissionSemanticOutput,
   prepareAdmissionReadOnlyRepository,
   repositoryCommandEnvironment,
   repositorySkillStageEnvironment,
@@ -171,6 +171,7 @@ function fixture({
   repositoryConfig,
   transitionContext = "",
   stageId,
+  inputArtifacts,
 } = {}) {
   const repoDir = repository();
   let sealedRepositorySkill = repositorySkill;
@@ -192,6 +193,18 @@ function fixture({
   const manifest = { id: "fixture/test", version: 1, stages: [stage] };
   const configRaw = canonicalJson(config);
   const manifestRaw = canonicalJson(manifest);
+  const admissionBasis = { schema: "openthrottle.test-admission-basis/v1", ticket: "issue-1" };
+  const admissionInput = isAdmissionInspectionStage({ stageId: stage.id, capability })
+    ? {
+        schema: "openthrottle.admission-input/v1",
+        admission_basis: admissionBasis,
+        admission_basis_digest: digest(canonicalJson(admissionBasis)),
+        effective_manifest_digest: digest(manifestRaw),
+      }
+    : null;
+  const taskContext = admissionInput
+    ? `Implement the approved fixture change.\n\n\`\`\`json openthrottle.admission-input/v1\n${canonicalJson(admissionInput)}\n\`\`\``
+    : "Implement the approved fixture change.";
   const base = {
     protocol: "stage-executor@1",
     pipelineInstanceId: "pipeline-1",
@@ -206,7 +219,7 @@ function fixture({
     sessionId: "session-1",
     generation: 1,
     taskType: "implement",
-    taskContext: "Implement the approved fixture change.",
+    taskContext,
     transitionContext,
     repository: "owner/repo",
     baseCommit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, encoding: "utf8" }).trim(),
@@ -221,11 +234,12 @@ function fixture({
     requiredArtifacts,
     credentialScopes,
     liveSteering,
+    ...(inputArtifacts ? { inputArtifacts } : {}),
     ...(commandName ? { commandName } : {}),
     ...(sealedRepositorySkill ? { repositorySkill: sealedRepositorySkill } : {}),
   };
   const request = { ...base, ...createStageRequestHash(base) };
-  return { repoDir, configRaw, manifestRaw, request };
+  return { repoDir, configRaw, manifestRaw, request, admissionInput };
 }
 
 function successProposal() {
@@ -280,7 +294,7 @@ function tuneReceipt(request) {
   };
 }
 
-function admissionPlanFixture(request) {
+function admissionPlanFixture() {
   const executionPlan = {
     schema: "openthrottle.execution-plan/v2",
     graph_id: "structured",
@@ -299,62 +313,27 @@ function admissionPlanFixture(request) {
     }],
     commands: [{ name: "test" }],
   };
-  const generatedPlanDigest = digest(canonicalJson(executionPlan));
-  const producer = {
-    worker_id: "planner",
-    skill: "builtin://admission-plan@1",
-    capability_digest: request.capabilityDigest,
-    skill_package_digest: null,
-  };
-  const receipt = {
-    schema: "openthrottle.receipt/v1",
-    type: "admission_decision",
-    assurance: "semantic_attested",
-    result: "structured",
-    producer,
-    subject: { base: request.expectedSubject, pre: request.expectedSubject, post: request.expectedSubject },
-    fence: {
-      pipeline_instance_id: request.pipelineInstanceId,
-      graph_digest: request.manifestDigest,
-      unit_id: request.stageId,
-      attempt_id: request.attemptId,
-      parent_run_id: request.runId,
-      action_attempt_id: request.attemptId,
-      generation: request.generation,
-      native_session_id: null,
-      request_hash: request.requestHash,
-    },
-    evidence: ["Repository inspection completed."],
-    payload: { decision: {
-      schema: "openthrottle.admission-decision/v1",
-      route: "structured",
-      rationale: "The work has multiple ordered units.",
-      questions: [],
-      admission_basis_digest: "e".repeat(64),
-      effective_manifest_digest: request.manifestDigest,
-      generated_plan_digest: generatedPlanDigest,
-    } },
-    issued_at: "2026-08-18T00:00:00.000Z",
-  };
   return {
-    receipt,
-    execution_plan: {
-      schema: "openthrottle.admission-execution-plan-artifact/v1",
-      execution_plan: executionPlan,
-      generated_plan_digest: generatedPlanDigest,
-      producer: {
-        skill: producer.skill,
-        capability_digest: producer.capability_digest,
-        skill_package_digest: null,
-      },
-      assurance: "semantic_attested",
-      source: {
-        admission_basis_digest: "e".repeat(64),
-        effective_manifest_digest: request.manifestDigest,
-        request_hash: request.requestHash,
-      },
-    },
+    route: "structured",
+    rationale: "The work has multiple ordered units.",
+    questions: [],
+    execution_plan: executionPlan,
   };
+}
+
+function admissionReviewFixture() {
+  return {
+    verdict: "approved",
+    summary: "The structured plan is complete and executable.",
+    findings: [],
+    questions: [],
+  };
+}
+
+function resealRequest(request, changes) {
+  const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...unhashed } = request;
+  const updated = { ...unhashed, ...changes };
+  return { ...updated, ...createStageRequestHash(updated) };
 }
 
 function publishFixture() {
@@ -660,8 +639,10 @@ describe("one-stage executor", () => {
 
     expect(stagePrompt(planner, "/tmp/proposal.json", { skillRoot })).toContain("$admission-plan");
     expect(stagePrompt(planner, "/tmp/proposal.json", { skillRoot })).toContain('"execution_plan"');
+    expect(stagePrompt(planner, "/tmp/proposal.json", { skillRoot })).not.toContain("Receipt Authority Contract");
     expect(stagePrompt(reviewer, "/tmp/proposal.json", { skillRoot })).toContain("$review-admission-plan");
     expect(stagePrompt(reviewer, "/tmp/proposal.json", { skillRoot })).not.toContain('"execution_plan"');
+    expect(stagePrompt(reviewer, "/tmp/proposal.json", { skillRoot })).not.toContain("Receipt Authority Contract");
   });
 
   it("applies the same inspection fence and repository-skill provenance to admission overrides", () => {
@@ -686,11 +667,11 @@ describe("one-stage executor", () => {
     }
     const plannerPrompt = stagePrompt(planner, "/tmp/proposal.json");
     expect(plannerPrompt).toContain(`$${planner.repositorySkill.invocation}`);
-    expect(plannerPrompt).toContain(`"skill":"${planner.repositorySkill.reference}"`);
-    expect(plannerPrompt).toContain(`"skill_package_digest":"${planner.repositorySkill.packageDigest}"`);
+    expect(plannerPrompt).not.toContain(`"skill":"${planner.repositorySkill.reference}"`);
+    expect(plannerPrompt).not.toContain(`"skill_package_digest":"${planner.repositorySkill.packageDigest}"`);
     expect(plannerPrompt).toContain('"execution_plan"');
     const reviewerPrompt = stagePrompt(reviewer, "/tmp/proposal.json");
-    expect(reviewerPrompt).toContain(`"skill":"${reviewer.repositorySkill.reference}"`);
+    expect(reviewerPrompt).not.toContain(`"skill":"${reviewer.repositorySkill.reference}"`);
     expect(reviewerPrompt).not.toContain('"execution_plan"');
   });
 
@@ -760,7 +741,7 @@ describe("one-stage executor", () => {
     const repositoryView = prepareAdmissionReadOnlyRepository(input.request, input.repoDir);
     const event = JSON.stringify({
       type: "item.completed",
-      item: { type: "agent_message", text: JSON.stringify(admissionPlanFixture(input.request)) },
+      item: { type: "agent_message", text: JSON.stringify(admissionPlanFixture()) },
     });
     writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
 set -euo pipefail
@@ -839,7 +820,7 @@ JSON
     installFakeGosu(binDir);
     const event = JSON.stringify({
       type: "result",
-      result: JSON.stringify(admissionPlanFixture(input.request)),
+      result: JSON.stringify(admissionPlanFixture()),
     });
     writeExecutable(join(binDir, "opencode"), `#!/usr/bin/env bash
 set -euo pipefail
@@ -878,7 +859,7 @@ exit ${exitCode}
     installFakeGosu(binDir);
     const event = JSON.stringify({
       type: "result",
-      result: JSON.stringify(admissionPlanFixture(input.request)),
+      result: JSON.stringify(admissionPlanFixture()),
     });
     writeExecutable(join(binDir, "opencode"), `#!/usr/bin/env bash
 set -euo pipefail
@@ -898,7 +879,7 @@ JSON
     }))).toThrow(/stage agent cleanup failed: cleanup refused/);
   });
 
-  it("extracts and seals the planner receipt and exact execution plan as separate artifacts", () => {
+  it("extracts planner semantics and executor-seals the receipt and exact execution plan", () => {
     const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-transport-"));
     directories.push(actionRoot);
     process.env.OT_STAGE_ACTION_ROOT = actionRoot;
@@ -909,9 +890,16 @@ JSON
       requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
       liveSteering: false,
     });
-    const output = admissionPlanFixture(input.request);
-    expect(parseAdmissionPlannerOutput(JSON.stringify({ type: "result", result: JSON.stringify(output) })))
+    const output = admissionPlanFixture();
+    expect(parseAdmissionSemanticOutput(
+      JSON.stringify({ type: "result", result: JSON.stringify(output) }),
+      "admission_planner",
+    ))
       .toEqual(output);
+    expect(() => parseAdmissionSemanticOutput(
+      JSON.stringify({ receipt: { schema: "openthrottle.receipt/v1" }, execution_plan: null }),
+      "admission_planner",
+    )).toThrow(/emitted 0 final semantic outputs/);
 
     const result = executeStage({
       ...input,
@@ -920,15 +908,564 @@ JSON
         signal: null,
         timedOut: false,
         nativeSessionId: null,
-        receipt: output.receipt,
-        executionPlan: output.execution_plan,
+        admissionOutput: output,
       }),
       now: clock(),
     });
     expect(result.artifacts.map((artifact) => artifact.kind)).toEqual([
       "stage_result", "standard_receipt", "execution_plan",
     ]);
-    expect(JSON.parse(result.artifacts[2].payload)).toEqual(output.execution_plan);
+    const sealedReceipt = JSON.parse(result.artifacts[1].payload).details.receipt;
+    const sealedPlan = JSON.parse(result.artifacts[2].payload);
+    const expectedPlanDigest = digest(canonicalJson(output.execution_plan));
+    expect(sealedReceipt).toMatchObject({
+      type: "admission_decision",
+      assurance: "semantic_attested",
+      result: "structured",
+      producer: {
+        worker_id: "planner",
+        skill: "builtin://admission-plan@1",
+        capability_digest: input.request.capabilityDigest,
+      },
+      subject: {
+        base: input.request.expectedSubject,
+        pre: input.request.expectedSubject,
+        post: input.request.expectedSubject,
+      },
+      fence: { request_hash: input.request.requestHash },
+      payload: { decision: {
+        admission_basis_digest: input.admissionInput.admission_basis_digest,
+        effective_manifest_digest: input.request.manifestDigest,
+        generated_plan_digest: expectedPlanDigest,
+      } },
+      issued_at: "2026-07-22T00:00:01.000Z",
+    });
+    expect(sealedPlan.execution_plan).toEqual(output.execution_plan);
+    expect(sealedPlan.generated_plan_digest).toBe(expectedPlanDigest);
+    expect(sealedPlan.producer).toEqual({
+      skill: "builtin://admission-plan@1",
+      capability_digest: input.request.capabilityDigest,
+      skill_package_digest: null,
+    });
+    expect(sealedPlan.source.request_hash).toBe(input.request.requestHash);
+    expect(sealedPlan.source.admission_basis_digest).toBe(input.admissionInput.admission_basis_digest);
+  });
+
+  it("seals a simple admission decision without an execution-plan artifact", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-simple-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const input = fixture({
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["stage_result", "standard_receipt"],
+      liveSteering: false,
+    });
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        admissionOutput: {
+          route: "simple",
+          rationale: "One bounded change needs no structured work graph.",
+          questions: [],
+          execution_plan: null,
+        },
+      }),
+      now: clock(),
+    });
+
+    expect(result.outcome).toBe("success");
+    expect(result.artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result", "standard_receipt"]);
+    expect(JSON.parse(result.artifacts[1].payload).details.receipt).toMatchObject({
+      type: "admission_decision",
+      result: "simple",
+      payload: { decision: { generated_plan_digest: null } },
+    });
+  });
+
+  it("parses reviewer semantics from the Codex transport", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-review-transport-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    installFakeGosu(binDir);
+    const input = fixture({
+      capability: "admission/review@1",
+      stageId: "admission_reviewer",
+      repositorySkill: "fixture",
+      requiredArtifacts: ["stage_result", "standard_receipt"],
+      liveSteering: false,
+    });
+    const output = admissionReviewFixture();
+    const event = JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: JSON.stringify(output) },
+    });
+    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+cat >/dev/null
+cat <<'JSON'
+${event}
+JSON
+`);
+
+    const execution = withPrependedPath(binDir, () => defaultRunAgent({
+      request: input.request,
+      invocation: resolveContextInvocation(input.request),
+      repoDir: input.repoDir,
+      proposalPath: join(actionRoot, "proposal.json"),
+      timeoutMs: 5_000,
+      model: "gpt-5-codex",
+    }));
+
+    expect(execution.exitCode).toBe(0);
+    expect(execution.admissionOutput).toEqual(output);
+  });
+
+  it("preserves clean admission parse diagnostics for launch-failure classification", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-malformed-transport-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ot-fake-bin-"));
+    directories.push(actionRoot, binDir);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    installFakeGosu(binDir);
+    const input = fixture({
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      repositorySkill: "fixture",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+    writeExecutable(join(binDir, "codex"), `#!/usr/bin/env bash
+set -euo pipefail
+cat >/dev/null
+printf '%s\\n' 'ordinary malformed semantic output'
+printf '%s\\n' 'transport diagnostic' >&2
+`);
+
+    const execution = withPrependedPath(binDir, () => defaultRunAgent({
+      request: input.request,
+      invocation: resolveContextInvocation(input.request),
+      repoDir: input.repoDir,
+      proposalPath: join(actionRoot, "proposal.json"),
+      timeoutMs: 5_000,
+      model: "gpt-5-codex",
+    }));
+
+    expect(execution.stdout).toContain("ordinary malformed semantic output");
+    expect(execution.stderr).toContain("transport diagnostic");
+    expect(execution.admissionOutput).toBeUndefined();
+    expect(execution.admissionOutputError).toMatch(/emitted 0 final semantic outputs/);
+  });
+
+  it.each([
+    ["unregistered command", "claude", JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Unknown command: /admission-plan",
+    }), "", "unregistered_command"],
+    ["rejected credential", "codex", "", "401 Unauthorized: invalid oauth token", "credential_rejected"],
+    ["rate limit", "claude", JSON.stringify({
+      type: "system",
+      subtype: "rate_limit_event",
+      rate_limit: { status: "rejected" },
+    }), "", "rate_limited"],
+  ])("keeps a clean admission %s retryable infrastructure", (_label, agent, stdout, stderr, reason) => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-launch-refusal-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const input = fixture({
+      agent,
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        stdout,
+        stderr,
+        admissionOutputError: "admission_planner emitted 0 final semantic outputs; expected exactly one",
+      }),
+      now: clock(),
+    });
+
+    const payload = JSON.parse(result.artifacts[0].payload);
+    expect(result.outcome).toBe("retryable_infrastructure_failure");
+    expect(result.faultReason).toBe(reason);
+    expect(payload.summary).toContain(`reason=${reason}`);
+    expect(result.artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result"]);
+  });
+
+  it("routes ordinary clean malformed admission semantics to bounded repair", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-semantic-repair-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const input = fixture({
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        stdout: "ordinary malformed semantic output",
+        stderr: "transport diagnostic",
+        admissionOutputError: "admission_planner emitted 0 final semantic outputs; expected exactly one",
+      }),
+      now: clock(),
+    });
+
+    const payload = JSON.parse(result.artifacts[0].payload);
+    expect(result.outcome).toBe("semantic_repair_required");
+    expect(result.faultReason).toBeNull();
+    expect(payload.summary).toContain("Admission semantic output was rejected");
+    expect(payload.summary).toContain("emitted 0 final semantic outputs");
+    expect(result.artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result"]);
+  });
+
+  it("rejects agent-authored admission authority as bounded semantic repair", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-invalid-semantic-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const input = fixture({
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+    const output = {
+      ...admissionPlanFixture(),
+      producer: { skill: "builtin://forged@1" },
+      issued_at: "2099-01-01T00:00:00.000Z",
+    };
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 0,
+        signal: null,
+        nativeSessionId: null,
+        admissionOutput: output,
+      }),
+      now: clock(),
+    });
+
+    expect(JSON.parse(result.artifacts[0].payload).summary).toMatch(/Admission semantic output was rejected/);
+    expect(result.outcome).toBe("semantic_repair_required");
+    expect(result.faultReason).toBeNull();
+    expect(result.artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result"]);
+  });
+
+  it.each([
+    ["a non-structured graph", () => {
+      const output = admissionPlanFixture();
+      output.execution_plan.graph_id = "linear";
+      return output;
+    }],
+    ["an oversized canonical plan", () => {
+      const output = admissionPlanFixture();
+      const largeList = Array(32).fill("x".repeat(2_000));
+      output.execution_plan.units[0] = {
+        ...output.execution_plan.units[0],
+        requirements: largeList,
+        files: Array(64).fill("x".repeat(512)),
+        approach: largeList,
+        tests: largeList,
+        acceptance: largeList,
+        verification: largeList,
+      };
+      return output;
+    }],
+  ])("keeps %s attributable to planner semantics", (_label, outputFixture) => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-plan-semantics-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const input = fixture({
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+
+    const result = executeStage({
+      ...input,
+      runAgent: () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        admissionOutput: outputFixture(),
+      }),
+      now: clock(),
+    });
+
+    expect(result.outcome).toBe("semantic_repair_required");
+    expect(result.faultReason).toBeNull();
+    expect(result.artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result"]);
+  });
+
+  it("attributes corrupted sealed admission input to the executor", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-corrupt-input-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const input = fixture({
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+    });
+    const corruptedInput = {
+      ...input.admissionInput,
+      admission_basis_digest: "0".repeat(64),
+    };
+    const request = resealRequest(input.request, {
+      taskContext: `Implement the approved fixture change.\n\n\`\`\`json openthrottle.admission-input/v1\n${canonicalJson(corruptedInput)}\n\`\`\``,
+    });
+    let caught;
+
+    try {
+      executeStage({
+        ...input,
+        request,
+        runAgent: () => ({
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          nativeSessionId: null,
+          admissionOutput: admissionPlanFixture(),
+        }),
+        now: clock(),
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeTruthy();
+    expect(String(caught)).toMatch(/admission basis digest/);
+    const event = fallbackStageResultEvent({ request, repoDir: input.repoDir, error: caught });
+    const payload = JSON.parse(event.artifacts[0].payload);
+    expect(event.outcome).toBe("retryable_infrastructure_failure");
+    expect(payload.summary).toMatch(/failed before sealing evidence/);
+    expect(payload.summary).not.toMatch(/semantic output was rejected/i);
+  });
+
+  it("attributes corrupted authorized reviewer plans to the executor", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-corrupt-plan-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const initial = fixture({
+      capability: "admission/review@1",
+      stageId: "admission_reviewer",
+      requiredArtifacts: ["stage_result", "standard_receipt"],
+      liveSteering: false,
+    });
+    const plan = admissionPlanFixture().execution_plan;
+    const payload = canonicalJson({
+      schema: "openthrottle.admission-execution-plan-artifact/v1",
+      execution_plan: plan,
+      generated_plan_digest: digest(canonicalJson(plan)),
+      producer: {
+        skill: "builtin://admission-plan@1",
+        capability_digest: initial.request.capabilityDigest,
+        skill_package_digest: null,
+      },
+      assurance: "semantic_attested",
+      source: {
+        admission_basis_digest: initial.admissionInput.admission_basis_digest,
+        effective_manifest_digest: initial.request.manifestDigest,
+        request_hash: "a".repeat(64),
+      },
+    });
+    const request = resealRequest(initial.request, {
+      inputArtifacts: [{
+        kind: "execution_plan",
+        schemaVersion: 1,
+        assurance: "semantic_attested",
+        subject: initial.request.expectedSubject,
+        payload,
+        hash: "0".repeat(64),
+      }],
+    });
+    let caught;
+
+    try {
+      executeStage({
+        ...initial,
+        request,
+        runAgent: () => ({
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          nativeSessionId: null,
+          admissionOutput: admissionReviewFixture(),
+        }),
+        now: clock(),
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeTruthy();
+    expect(String(caught)).toMatch(/artifact hash mismatch/);
+    const event = fallbackStageResultEvent({ request, repoDir: initial.repoDir, error: caught });
+    const eventPayload = JSON.parse(event.artifacts[0].payload);
+    expect(event.outcome).toBe("retryable_infrastructure_failure");
+    expect(eventPayload.summary).toMatch(/failed before sealing evidence/);
+    expect(eventPayload.summary).not.toMatch(/semantic output was rejected/i);
+  });
+
+  it("executor-seals reviewer authority and binds its review to the candidate plan digest", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-review-sealing-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const initial = fixture({
+      capability: "admission/review@1",
+      stageId: "admission_reviewer",
+      requiredArtifacts: ["stage_result", "standard_receipt"],
+      liveSteering: false,
+    });
+    const plan = admissionPlanFixture().execution_plan;
+    const generatedPlanDigest = digest(canonicalJson(plan));
+    const payload = canonicalJson({
+      schema: "openthrottle.admission-execution-plan-artifact/v1",
+      execution_plan: plan,
+      generated_plan_digest: generatedPlanDigest,
+      producer: {
+        skill: "builtin://admission-plan@1",
+        capability_digest: initial.request.capabilityDigest,
+        skill_package_digest: null,
+      },
+      assurance: "semantic_attested",
+      source: {
+        admission_basis_digest: initial.admissionInput.admission_basis_digest,
+        effective_manifest_digest: initial.request.manifestDigest,
+        request_hash: "a".repeat(64),
+      },
+    });
+    const request = resealRequest(initial.request, {
+      inputArtifacts: [{
+        kind: "execution_plan",
+        schemaVersion: 1,
+        assurance: "semantic_attested",
+        subject: initial.request.expectedSubject,
+        payload,
+        hash: digest(payload),
+      }],
+    });
+
+    const result = executeStage({
+      ...initial,
+      request,
+      runAgent: () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        admissionOutput: admissionReviewFixture(),
+      }),
+      now: clock(),
+    });
+
+    const sealedReceipt = JSON.parse(result.artifacts[1].payload).details.receipt;
+    expect(sealedReceipt).toMatchObject({
+      type: "admission_review",
+      result: "approved",
+      producer: {
+        worker_id: "reviewer",
+        skill: "builtin://review-admission-plan@1",
+        capability_digest: request.capabilityDigest,
+      },
+      fence: { request_hash: request.requestHash },
+      payload: { review: { generated_plan_digest: generatedPlanDigest } },
+      issued_at: "2026-07-22T00:00:01.000Z",
+    });
+  });
+
+  it("executor-seals an exact rejected reviewer finding", () => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-review-rejected-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const initial = fixture({
+      capability: "admission/review@1",
+      stageId: "admission_reviewer",
+      requiredArtifacts: ["stage_result", "standard_receipt"],
+      liveSteering: false,
+    });
+    const plan = admissionPlanFixture().execution_plan;
+    const generatedPlanDigest = digest(canonicalJson(plan));
+    const payload = canonicalJson({
+      schema: "openthrottle.admission-execution-plan-artifact/v1",
+      execution_plan: plan,
+      generated_plan_digest: generatedPlanDigest,
+      producer: {
+        skill: "builtin://admission-plan@1",
+        capability_digest: initial.request.capabilityDigest,
+        skill_package_digest: null,
+      },
+      assurance: "semantic_attested",
+      source: {
+        admission_basis_digest: initial.admissionInput.admission_basis_digest,
+        effective_manifest_digest: initial.request.manifestDigest,
+        request_hash: "a".repeat(64),
+      },
+    });
+    const request = resealRequest(initial.request, {
+      inputArtifacts: [{
+        kind: "execution_plan",
+        schemaVersion: 1,
+        assurance: "semantic_attested",
+        subject: initial.request.expectedSubject,
+        payload,
+        hash: digest(payload),
+      }],
+    });
+    const finding = {
+      severity: "P1",
+      message: "Unit A omits the ticket-required unauthorized response test.",
+      path: "src/a.ts",
+    };
+
+    const result = executeStage({
+      ...initial,
+      request,
+      runAgent: () => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        admissionOutput: {
+          verdict: "rejected",
+          summary: "The plan has a correctable coverage defect.",
+          findings: [finding],
+          questions: [],
+        },
+      }),
+      now: clock(),
+    });
+
+    expect(result.outcome).toBe("success");
+    const sealedReceipt = JSON.parse(result.artifacts[1].payload).details.receipt;
+    expect(sealedReceipt.result).toBe("rejected");
+    expect(sealedReceipt.payload.review.findings).toEqual([finding]);
+    expect(sealedReceipt.payload.review.generated_plan_digest).toBe(generatedPlanDigest);
   });
 
   it("binds a first-entry admission planner to the exact checked-out tree", () => {
@@ -954,14 +1491,13 @@ JSON
       request,
       runAgent: ({ request: boundRequest }) => {
         dispatchedRequest = boundRequest;
-        plannerOutput = admissionPlanFixture(boundRequest);
+        plannerOutput = admissionPlanFixture();
         return {
           exitCode: 0,
           signal: null,
           timedOut: false,
           nativeSessionId: null,
-          receipt: plannerOutput.receipt,
-          executionPlan: plannerOutput.execution_plan,
+          admissionOutput: plannerOutput,
         };
       },
       now: clock(),
@@ -981,7 +1517,7 @@ JSON
       post: expectedSubject,
     });
     expect(receiptPayload.details.receipt.fence.request_hash).toBe(request.requestHash);
-    expect(JSON.parse(result.artifacts[2].payload)).toEqual(plannerOutput.execution_plan);
+    expect(JSON.parse(result.artifacts[2].payload).execution_plan).toEqual(plannerOutput.execution_plan);
   });
 
   it("keeps a null-subject admission reviewer fail-closed", () => {
@@ -1038,14 +1574,13 @@ JSON
         request,
         runAgent: ({ request: boundRequest }) => {
           writeFileSync(join(input.repoDir, "drift-during-admission.txt"), "unexpected mutation\n");
-          const output = admissionPlanFixture(boundRequest);
+          const output = admissionPlanFixture();
           return {
             exitCode: 0,
             signal: null,
             timedOut: false,
             nativeSessionId: null,
-            receipt: output.receipt,
-            executionPlan: output.execution_plan,
+            admissionOutput: output,
           };
         },
         now: clock(),

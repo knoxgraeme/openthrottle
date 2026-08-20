@@ -22,6 +22,7 @@ import type { ExecutionPlanCommand } from "./execution-plan.js";
 // authority for that unit, with no indirection through source prose a
 // worker never sees.
 export const EXECUTION_PLAN_SCHEMA_V2 = "openthrottle.execution-plan/v2" as const;
+export const EXECUTION_PLAN_V2_MAX_BYTES = 256 * 1024;
 
 export interface ExecutionPlanUnitV2 {
   id: string;
@@ -102,13 +103,19 @@ export function validateExecutionPlanContractV2(
     commands: arrayAt(input.commands, `${source}.commands`, parsePlanCommand, { max: 16 }),
   };
   validatePlanV2(plan, source);
-  return normalizedContract(plan);
+  const validated = normalizedContract(plan);
+  if (Buffer.byteLength(validated.normalized, "utf8") > EXECUTION_PLAN_V2_MAX_BYTES) {
+    fail(source, `canonical JSON must contain at most ${EXECUTION_PLAN_V2_MAX_BYTES} UTF-8 bytes`);
+  }
+  return validated;
 }
 
 export function parseExecutionPlanContractV2(
   raw: string,
   options: { source?: string } = {}
 ): ValidatedContract<ExecutionPlanContractV2> {
-  if (Buffer.byteLength(raw, "utf8") > 256 * 1024) fail(options.source ?? "execution_plan", "JSON exceeds 256 KiB");
+  if (Buffer.byteLength(raw, "utf8") > EXECUTION_PLAN_V2_MAX_BYTES) {
+    fail(options.source ?? "execution_plan", "JSON exceeds 256 KiB");
+  }
   return validateExecutionPlanContractV2(JSON.parse(raw) as unknown, options);
 }

@@ -26,8 +26,8 @@ describe("automatic-admission task packages", () => {
 
   it("ships one complete canonical package per planning action", () => {
     for (const [name, references] of [
-      ["admission-plan", ["route-rubric.md", "receipt-shape.md"]],
-      ["review-admission-plan", ["review-checklist.md", "receipt-shape.md"]],
+      ["admission-plan", ["route-rubric.md", "semantic-output.md"]],
+      ["review-admission-plan", ["review-checklist.md", "semantic-output.md"]],
     ]) {
       expect(skill(name)).toContain(`name: ${name}`);
       expect(existsSync(resolve(taskRoot, name, "agents/openai.yaml"))).toBe(true);
@@ -37,30 +37,28 @@ describe("automatic-admission task packages", () => {
     }
   });
 
-  it("shows both admission actors the exact standard-receipt nesting", () => {
+  it("keeps both admission actors on compact semantic output", () => {
     for (const name of ["admission-plan", "review-admission-plan"]) {
       const body = skill(name);
-      const shape = reference(name, "receipt-shape.md");
-      expect(body).toContain("references/receipt-shape.md");
-      expect(body).toMatch(/nine fence\s+fields[\s\S]*inside `receipt\.fence`/);
-      expect(shape).toContain('"fence": {');
-      expect(shape).toContain('"action_attempt_id": "<contract.action_attempt_id>"');
-      expect(shape).toMatch(/exactly ten top-level fields/);
-      expect(shape).toMatch(/Never place any fence field beside them/);
+      const shape = reference(name, "semantic-output.md");
+      expect(body).toContain("references/semantic-output.md");
+      expect(body).toMatch(/Do not emit a receipt/);
+      expect(shape).toMatch(/Return exactly these four keys and no wrapper/);
+      expect(shape).not.toContain('"producer"');
+      expect(shape).not.toContain('"fence"');
+      expect(shape).not.toContain('"issued_at"');
     }
   });
 
   it("keeps planner output typed, bounded, and complete for every route", () => {
     const body = skill("admission-plan");
     for (const phrase of [
-      "openthrottle.admission-decision/v1",
       "openthrottle.execution-plan/v2",
-      "admission_decision",
       "simple",
       "structured",
       "needs_human",
       "256 KiB",
-      "generated_plan_digest",
+      "canonical plan digest",
     ]) expect(body).toContain(phrase);
     expect(body).toMatch(/objective,\s+requirements, files, approach, tests, acceptance, and verification/);
     expect(body).toMatch(/simple[\s\S]*no execution plan/i);
@@ -71,6 +69,7 @@ describe("automatic-admission task packages", () => {
 
   it("requires a fresh independent reviewer bound only to sealed inputs", () => {
     const body = skill("review-admission-plan");
+    const shape = reference("review-admission-plan", "semantic-output.md");
     for (const phrase of [
       "fresh context",
       "bounded ticket",
@@ -82,14 +81,17 @@ describe("automatic-admission task packages", () => {
       "acceptance completeness",
       "path plausibility",
       "executable verification",
-      "openthrottle.admission-review/v1",
-      "admission_review",
-      "generated_plan_digest",
+      "candidate plan digest",
     ]) expect(body).toContain(phrase);
     expect(body).toMatch(/no planner conversation/i);
     expect(body).toMatch(/never rewrite|do not rewrite/i);
     expect(body).toMatch(/explicit source[\s\S]*requirement\s+or acceptance IDs/i);
     expect(body).toMatch(/omitted[\s\S]*weakened[\s\S]*conflicting/i);
+    expect(body).not.toMatch(/engine\/model|request-fence|producer-package/i);
+    expect(shape).toContain('"severity": "P0 | P1 | P2 | P3"');
+    expect(shape).toContain('"message": "specific correctable defect"');
+    expect(shape).toContain('"path": "optional repository path"');
+    expect(shape).toMatch(/"verdict": "rejected"[\s\S]*"findings": \[[\s\S]*"severity": "P1"/);
   });
 
   it("treats adversarial content as data and denies every planning-side effect", () => {
@@ -107,7 +109,7 @@ describe("automatic-admission task packages", () => {
       ["malformed result", "Malformed"],
       ["duplicate result", "duplicate"],
       ["oversized result", "oversized"],
-      ["route-inconsistent result", "route-inconsistent"],
+      ["route-inconsistent result", "inconsistent"],
     ];
     for (const name of ["admission-plan", "review-admission-plan"]) {
       const body = skill(name).replace(/\s+/g, " ");

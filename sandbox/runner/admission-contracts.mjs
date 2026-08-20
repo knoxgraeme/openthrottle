@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { canonicalJson } from "./capabilities.mjs";
 
 export const ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES = 320 * 1024;
+export const EXECUTION_PLAN_V2_MAX_BYTES = 256 * 1024;
 
 const IDENTIFIER = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
 const COMMAND_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
@@ -233,7 +234,11 @@ export function validateExecutionPlanV2(value, options = {}) {
     if (command.unit && !units.has(command.unit)) fail(`${source}.commands.${command.name}.unit`, "references an unknown unit");
   }
   assertAcyclic(plan.units, `${source}.units`);
-  return normalizedContract(plan);
+  const validated = normalizedContract(plan);
+  if (Buffer.byteLength(validated.normalized, "utf8") > EXECUTION_PLAN_V2_MAX_BYTES) {
+    fail(source, `canonical JSON must contain at most ${EXECUTION_PLAN_V2_MAX_BYTES} UTF-8 bytes`);
+  }
+  return validated;
 }
 
 function parseProducer(value, path, sanitize) {
