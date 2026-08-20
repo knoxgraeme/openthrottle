@@ -233,6 +233,7 @@ describe("automatic admission authority", () => {
         name: "owner/repo",
         base_commit: "a".repeat(40),
         config_digest: "3".repeat(64),
+        command_names: ["build", "test"],
       },
       runtime: { release: "runtime/v1", capability_digest: "4".repeat(64) },
       engine: { agent: "codex" as const, model: "gpt-5.6-sol", reasoning_effort: "high" },

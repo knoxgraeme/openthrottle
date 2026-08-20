@@ -140,6 +140,10 @@ graphs:
     kind: builtin
     ref: core/structured@3
 pipelines: { automatic: automatic }
+commands:
+  test: npm test -- --runInBand
+  lint: npm run lint -- --quiet
+  build: npm run build -- --production
 intents:
   implement:
     admission_mode: automatic
@@ -618,6 +622,18 @@ mcp_servers: {}
       "create_task_branch",
       "provision",
     ]);
+    const instance = pipelines.getInstanceForSession("session-1")!;
+    const attempt = pipelines.getActiveAttempt(instance.id)!;
+    const request = pipelines.getStageRequest(attempt.id);
+    const sealedInput = request.taskContext.match(
+      /```json openthrottle\.admission-input\/v1\n([\s\S]*?)\n```/,
+    );
+    expect(sealedInput).not.toBeNull();
+    expect(JSON.parse(sealedInput![1]!).admission_basis.repository.command_names)
+      .toEqual(["build", "lint", "test"]);
+    expect(request.taskContext).not.toContain("npm test -- --runInBand");
+    expect(request.taskContext).not.toContain("npm run lint -- --quiet");
+    expect(request.taskContext).not.toContain("npm run build -- --production");
   });
 
   it("pins the configured repository implementation package into the automatic simple tail", async () => {

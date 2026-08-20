@@ -621,7 +621,12 @@ async function productionLifecycleProof(image) {
         planner: { reference: "builtin://admission-plan@1", package_digest: null },
         reviewer: { reference: "builtin://review-admission-plan@1", package_digest: null },
       },
-      repository: { name: "owner/walking-skeleton", base_commit: fixture.baseCommit, config_digest: config.digest },
+      repository: {
+        name: "owner/walking-skeleton",
+        base_commit: fixture.baseCommit,
+        config_digest: config.digest,
+        command_names: ["build", "lint", "test"],
+      },
       runtime: { release: runtimeDescriptor.descriptor.release, capability_digest: runtimeDescriptor.digest },
       engine: { agent: "claude", model: null, reasoning_effort: null },
     });

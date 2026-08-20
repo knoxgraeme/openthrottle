@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RUNTIME_DESCRIPTOR, canonicalJson } from "./capabilities.mjs";
 import { digest } from "./artifacts.mjs";
+import { admissionPlannerSemanticOutputSchema } from "./admission-contracts.mjs";
 import {
   computeWorkspaceTreeOid,
   classifyAgentExecutionFailure,
@@ -179,7 +180,11 @@ function fixture({
     sealedRepositorySkill = sealedRepositorySkillPackage(repoDir, { body: "# Fixture Skill\n" }).repositorySkill;
   }
   const config = repositoryConfig
-    ?? (commandName && configuredCommand ? { commands: { [commandName]: "test-command" } } : {});
+    ?? (commandName && configuredCommand
+      ? { commands: { [commandName]: "test-command" } }
+      : capability === "admission/plan@1" || capability === "admission/review@1"
+        ? { commands: { test: "npm test" } }
+        : {});
   const stage = {
     id: stageId ?? (commandName ? "command" : "review"),
     executor: { kind: commandName ? "command" : "agent", capability },
@@ -193,7 +198,11 @@ function fixture({
   const manifest = { id: "fixture/test", version: 1, stages: [stage] };
   const configRaw = canonicalJson(config);
   const manifestRaw = canonicalJson(manifest);
-  const admissionBasis = { schema: "openthrottle.test-admission-basis/v1", ticket: "issue-1" };
+  const admissionBasis = {
+    schema: "openthrottle.test-admission-basis/v1",
+    ticket: "issue-1",
+    repository: { command_names: Object.keys(config.commands ?? {}).sort() },
+  };
   const admissionInput = isAdmissionInspectionStage({ stageId: stage.id, capability })
     ? {
         schema: "openthrottle.admission-input/v1",
@@ -392,6 +401,43 @@ function codexSessionStorageRecord(nativeSessionId) {
 }
 
 describe("one-stage executor", () => {
+  it("constrains planner command names to sorted sealed repository keys", () => {
+    const schema = admissionPlannerSemanticOutputSchema(["test", "build", "test"]);
+    const commandVariants = schema.properties.execution_plan.anyOf[1]
+      .properties.commands.items.anyOf;
+    expect(commandVariants[0].properties.name.enum).toEqual(["build", "test"]);
+    expect(commandVariants[1].properties.name.enum).toEqual(["build", "test"]);
+    expect(() => admissionPlannerSemanticOutputSchema(["npm test"]))
+      .toThrow(/valid configured command keys/);
+    expect(() => admissionPlannerSemanticOutputSchema([`a${"b".repeat(80)}`]))
+      .toThrow(/valid configured command keys/);
+    expect(admissionPlannerSemanticOutputSchema([`a${"b".repeat(79)}`])
+      .properties.execution_plan.anyOf[1].properties.commands.items.anyOf[0]
+      .properties.name.enum).toEqual([`a${"b".repeat(79)}`]);
+    expect(admissionPlannerSemanticOutputSchema([]).properties.execution_plan.anyOf[1]
+      .properties.commands.maxItems).toBe(0);
+  });
+
+  it("does not apply admission bindings to an ordinary stage with the planner stage id", () => {
+    const input = fixture({ stageId: "admission_planner", capability: "agent/semantic@1" });
+    const result = executeStage({
+      ...input,
+      runAgent: ({ repositoryCommandNames }) => {
+        expect(repositoryCommandNames).toEqual([]);
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          nativeSessionId: null,
+          proposal: successProposal(),
+        };
+      },
+      now: clock(),
+    });
+
+    expect(result.outcome).toBe("success");
+  });
+
   it("validates the complete immutable request fence", () => {
     const { request } = fixture();
     expect(validateStageRequest(request)).toEqual(request);
@@ -769,6 +815,7 @@ JSON
       skillSourceRepoDir: input.repoDir,
       proposalPath: join(actionRoot, "proposal.json"),
       timeoutMs: 5_000,
+      repositoryCommandNames: ["test", "lint", "build"],
     }));
 
     expect(result.exitCode).toBe(0);
@@ -784,11 +831,14 @@ JSON
       "--skip-git-repo-check", "-C", repositoryView,
       "-",
     ]);
-    expect(JSON.parse(readFileSync(schemaEvidencePath, "utf8"))).toMatchObject({
+    const outputSchema = JSON.parse(readFileSync(schemaEvidencePath, "utf8"));
+    expect(outputSchema).toMatchObject({
       type: "object",
       additionalProperties: false,
       required: ["route", "rationale", "questions", "execution_plan"],
     });
+    expect(outputSchema.properties.execution_plan.anyOf[1]
+      .properties.commands.items.anyOf[0].properties.name.enum).toEqual(["build", "lint", "test"]);
     expect(readFileSync(evidencePath, "utf8")).toBe("auth=file;raw_env=absent;repo_view=read_only\n");
     expect(existsSync(join(actionRoot, input.request.attemptId))).toBe(false);
   });
@@ -1090,18 +1140,24 @@ JSON
       proposalPath: join(actionRoot, "proposal.json"),
       timeoutMs: 5_000,
       model: "claude-sonnet-4-5",
+      repositoryCommandNames: ["test", "lint", "build"],
     }));
 
     const args = readFileSync(argsPath, "utf8").trim().split("\n");
     const schemaIndex = args.indexOf("--json-schema");
     expect(args).toEqual(expect.arrayContaining(["--output-format", "stream-json", "--json-schema"]));
-    expect(JSON.parse(args[schemaIndex + 1])).toMatchObject({
+    const outputSchema = JSON.parse(args[schemaIndex + 1]);
+    expect(outputSchema).toMatchObject({
       type: "object",
       additionalProperties: false,
       required: stageId === "admission_planner"
         ? ["route", "rationale", "questions", "execution_plan"]
         : ["verdict", "summary", "findings", "questions"],
     });
+    if (stageId === "admission_planner") {
+      expect(outputSchema.properties.execution_plan.anyOf[1]
+        .properties.commands.items.anyOf[0].properties.name.enum).toEqual(["build", "lint", "test"]);
+    }
     expect(execution.admissionOutput).toEqual(output);
   });
 
@@ -1343,6 +1399,44 @@ printf '%s\\n' 'transport diagnostic' >&2
 
     expect(result.outcome).toBe("semantic_repair_required");
     expect(result.faultReason).toBeNull();
+    expect(result.artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result"]);
+  });
+
+  it.each([
+    ["an unconfigured command", { commands: { test: "npm test" } }, "lint", ["test"]],
+    ["any command with an empty inventory", { commands: {} }, "test", []],
+  ])("rejects %s against the sealed repository inventory", (_label, repositoryConfig, commandName, expectedNames) => {
+    const actionRoot = mkdtempSync(join(tmpdir(), "ot-admission-command-inventory-"));
+    directories.push(actionRoot);
+    process.env.OT_STAGE_ACTION_ROOT = actionRoot;
+    const input = fixture({
+      capability: "admission/plan@1",
+      stageId: "admission_planner",
+      requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
+      liveSteering: false,
+      repositoryConfig,
+    });
+    const output = admissionPlanFixture();
+    output.execution_plan.commands = [{ name: commandName }];
+
+    const result = executeStage({
+      ...input,
+      runAgent: ({ repositoryCommandNames }) => {
+        expect(repositoryCommandNames).toEqual(expectedNames);
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          nativeSessionId: null,
+          admissionOutput: output,
+        };
+      },
+      now: clock(),
+    });
+
+    expect(result.outcome).toBe("semantic_repair_required");
+    expect(JSON.parse(result.artifacts[0].payload).summary)
+      .toContain("does not reference a sealed repository command");
     expect(result.artifacts.map((artifact) => artifact.kind)).toEqual(["stage_result"]);
   });
 
@@ -1602,6 +1696,7 @@ printf '%s\\n' 'transport diagnostic' >&2
       stageId: "admission_planner",
       requiredArtifacts: ["stage_result", "standard_receipt", "execution_plan"],
       liveSteering: false,
+      repositoryConfig: { commands: { test: "npm test", lint: "npm run lint", build: "npm run build" } },
     });
     const { requestHash: _requestHash, idempotencyKey: _idempotencyKey, ...unhashed } = input.request;
     const firstEntry = { ...unhashed, expectedSubject: null };
@@ -1613,8 +1708,9 @@ printf '%s\\n' 'transport diagnostic' >&2
     const result = executeStage({
       ...input,
       request,
-      runAgent: ({ request: boundRequest }) => {
+      runAgent: ({ request: boundRequest, repositoryCommandNames }) => {
         dispatchedRequest = boundRequest;
+        expect(repositoryCommandNames).toEqual(["build", "lint", "test"]);
         plannerOutput = admissionPlanFixture();
         return {
           exitCode: 0,
