@@ -96,6 +96,7 @@ export {
   type ExecutionPlanContract,
 } from "./execution-plan.js";
 export {
+  EXECUTION_PLAN_V2_MAX_BYTES,
   EXECUTION_PLAN_SCHEMA_V2,
   parseExecutionPlanContractV2,
   validateExecutionPlanContractV2,

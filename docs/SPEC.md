@@ -106,6 +106,16 @@ authoritative and bypasses the automatic planner. Automatic planning cannot be
 selected by investigate or tune tickets, OpenCode activations, ticket-authored
 skill paths, or an already-running generation.
 
+Automatic admission actors emit semantic output only. The planner returns
+exactly `route`, `rationale`, `questions`, and `execution_plan`; the reviewer
+returns exactly `verdict`, `summary`, `findings`, and `questions`. The executor
+validates those objects and exclusively constructs typed receipts, digests,
+provenance, subjects, fences, assurance, and timestamps. An ordinary malformed
+semantic object consumes the stage's bounded `semantic_repair_required`
+re-entry without a fabricated receipt. A recognized engine launch, credential,
+provider-limit, or other infrastructure failure remains a
+`retryable_infrastructure_failure` and consumes only its infrastructure retry.
+
 ## Manifest and catalog contract
 
 Pipeline YAML is strictly parsed with duplicate keys, aliases, unknown fields,

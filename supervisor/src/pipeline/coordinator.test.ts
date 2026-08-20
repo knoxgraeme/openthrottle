@@ -10,6 +10,7 @@ import { openDb } from "../persistence/database.js";
 import {
   coordinatePipelineEvent,
   reducePipelineEvent,
+  requiredArtifactsForPipelineEvent,
   type PipelineCoordinatorEvent,
 } from "./coordinator.js";
 import { canonicalJson, digestNormalized } from "@openthrottle/contracts";
@@ -127,6 +128,14 @@ describe("pipeline coordinator", () => {
         taskType: "implement",
         taskContext: "Approved ticket plan",
         inputArtifacts: options.inputArtifacts,
+        ...(manifestKey === "core/automatic@1" ? {
+          admission: {
+            planner: { reference: "builtin://admission-plan@1", package_digest: null },
+            reviewer: { reference: "builtin://review-admission-plan@1", package_digest: null },
+            admission_basis_digest: "c".repeat(64),
+            effective_manifest_digest: manifest.digest,
+          },
+        } : {}),
       },
     });
     const instance = pipelines.getInstanceForSession("session-1")!;
@@ -306,6 +315,52 @@ describe("pipeline coordinator", () => {
       event: event(input.instance, attempt, input.outcome, input.id, input.artifacts),
     });
   }
+
+  it("waives only automatic admission inspection receipts for semantic repair", () => {
+    const { manifest } = setup("core/automatic@1");
+    for (const stageId of ["admission_planner", "admission_reviewer"]) {
+      const stage = manifest.stages.find((candidate) => candidate.id === stageId)!;
+      expect(requiredArtifactsForPipelineEvent(stage, {
+        kind: "stage_result",
+        outcome: "semantic_repair_required",
+      })).toEqual(["stage_result"]);
+      expect(requiredArtifactsForPipelineEvent(stage, {
+        kind: "stage_result",
+        outcome: "success",
+      })).toEqual(["stage_result", "standard_receipt"]);
+    }
+    const ordinarySemanticStage = {
+      ...manifest.stages.find((candidate) => candidate.id === "admission_planner")!,
+      id: "ordinary_semantic_review",
+      executor: { kind: "agent" as const, capability: "ce/review@1" },
+    };
+    expect(requiredArtifactsForPipelineEvent(ordinarySemanticStage, {
+      kind: "stage_result",
+      outcome: "semantic_repair_required",
+    })).toEqual(["stage_result", "standard_receipt"]);
+  });
+
+  it("ingests receiptless automatic planner semantic repair and schedules its bounded reentry", () => {
+    const { pipelines, instance, attempt } = setup("core/automatic@1");
+    const repaired = coordinatePipelineEvent(
+      pipelines,
+      event(instance, attempt, "semantic_repair_required", "automatic-planner-semantic-repair"),
+    );
+
+    expect(repaired).toMatchObject({
+      active_stage_id: "admission_planner",
+      status: "dispatchable",
+    });
+    expect(pipelines.getAdmissionProjection(instance.id)).toMatchObject({
+      semantic_repair_count: 1,
+      infrastructure_retry_count: 0,
+    });
+    expect(pipelines.getActiveAttempt(instance.id)).toMatchObject({
+      stage_id: "admission_planner",
+      reentry_ordinal: 1,
+      status: "pending",
+    });
+  });
 
   it("has one deterministic policy for every declared stage outcome", () => {
     const { manifest, instance, attempt, stages } = setup();

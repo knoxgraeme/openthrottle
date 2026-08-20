@@ -90,6 +90,13 @@ export interface PipelineCoordinatorEvent {
   artifacts?: PipelineEventArtifact[];
 }
 
+function isAutomaticAdmissionInspectionStage(stage: PipelineStage): boolean {
+  return (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.planner &&
+      stage.executor.capability === "admission/plan@1") ||
+    (stage.id === AUTOMATIC_ADMISSION_STAGE_IDS.reviewer &&
+      stage.executor.capability === "admission/review@1");
+}
+
 export function requiredArtifactsForPipelineEvent(
   stage: PipelineStage,
   event: Pick<PipelineCoordinatorEvent, "kind" | "outcome">
@@ -98,11 +105,15 @@ export function requiredArtifactsForPipelineEvent(
   // can still seal executor-observed stage_result evidence. Requiring the
   // missing semantic receipt would make the retry event impossible to ingest
   // and strand the attempt instead of consuming its infrastructure retry.
-  // Successful, semantic-failure, and human-decision outcomes still require
-  // every artifact declared by the evaluator.
+  // Automatic admission inspection also emits no receipt when its semantic
+  // JSON is malformed. Only those two bounded self-repair stages waive the
+  // receipt for semantic_repair_required; all other semantic failures still
+  // require their evaluator evidence.
   const evaluatorArtifacts = event.kind === "stage_result" &&
-      event.outcome === "retryable_infrastructure_failure" &&
-      stage.evaluator.kind === "semantic"
+      stage.evaluator.kind === "semantic" && (
+        event.outcome === "retryable_infrastructure_failure" ||
+        (event.outcome === "semantic_repair_required" && isAutomaticAdmissionInspectionStage(stage))
+      )
     ? []
     : stage.evaluator.required_artifacts;
   return [...new Set(["stage_result", ...evaluatorArtifacts])];

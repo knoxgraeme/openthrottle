@@ -9,6 +9,7 @@ import {
   digest,
 } from "../runner/artifacts.mjs";
 import { LOOP_CREDENTIAL_ENV_NAMES } from "../runner/loop-credentials.mjs";
+import { EXECUTION_PLAN_V2_MAX_BYTES } from "../runner/admission-contracts.mjs";
 
 // The sandbox is a separate deployable with no TypeScript build step, so it
 // cannot import @openthrottle/contracts at runtime. Several runner modules
@@ -100,6 +101,17 @@ describe("contracts mirrors carried by the sandbox runner", () => {
       ? dist.ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES
       : Number(sourceMatch[1]) * Number(sourceMatch[2]);
     expect(ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES).toBe(contractsValue);
+  });
+
+  it("keeps the canonical execution-plan semantic bound byte-identical with contracts", async () => {
+    const dist = await importContractsDist("execution-plan-v2.js");
+    const sourceMatch = readContractsSource("execution-plan-v2.ts")
+      .match(/export const EXECUTION_PLAN_V2_MAX_BYTES = (\d+) \* (\d+);/);
+    expect(sourceMatch).not.toBeNull();
+    const contractsValue = dist
+      ? dist.EXECUTION_PLAN_V2_MAX_BYTES
+      : Number(sourceMatch[1]) * Number(sourceMatch[2]);
+    expect(EXECUTION_PLAN_V2_MAX_BYTES).toBe(contractsValue);
   });
 
   it("keeps artifacts.mjs STANDARD_RECEIPT_RESULTS aligned with contracts RECEIPT_RESULTS_BY_TYPE", async () => {
