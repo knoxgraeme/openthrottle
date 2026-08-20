@@ -5,8 +5,13 @@ import { describe, expect, it } from "vitest";
 import {
   CORE_SEMANTIC_RESULT_SCHEMAS,
   compileDefinitionBundle,
+  verifyCompilerEnvironment,
+  verifyPlatformDefinitionSource,
+  type CompilerEnvironmentDescriptor,
   type DefinitionBundleEntry,
   type DefinitionCompilation,
+  type PlatformDefinitionCatalog,
+  type TrustedPlatformDefinitionSource,
   type VirtualDefinitionFile,
 } from "./index.js";
 
@@ -14,12 +19,15 @@ const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 const definitionRoot = join(repositoryRoot, ".openthrottle");
 const taskSkillRoot = join(repositoryRoot, "skills/tasks");
 const sourceCommit = "a".repeat(40);
-const runtimeCapabilityDigest = "b".repeat(64);
-const evaluatorPrimitives = [
-  "core/action-outcome@1",
-  "core/review-outcome@1",
-  "core/unit-outcome@1",
-] as const;
+const generatedRoot = join(repositoryRoot, "contracts/generated");
+const platformCatalog = JSON.parse(readFileSync(
+  join(generatedRoot, "platform-definition-catalog.json"),
+  "utf8",
+)) as PlatformDefinitionCatalog;
+const compilerEnvironmentDescriptor = JSON.parse(readFileSync(
+  join(generatedRoot, "compiler-environment.json"),
+  "utf8",
+)) as CompilerEnvironmentDescriptor;
 
 const agentIds = [
   "admission-planner",
@@ -79,6 +87,11 @@ function definitionFiles(): Map<string, VirtualDefinitionFile> {
   ]));
 }
 
+function sealedPlatform(files = definitionFiles()): TrustedPlatformDefinitionSource {
+  files.delete(".openthrottle/config.yml");
+  return verifyPlatformDefinitionSource(platformCatalog, files, platformCatalog.catalog_digest);
+}
+
 function compile(pipelineId: (typeof pipelineIds)[number]) {
   const files = definitionFiles();
   const configPath = ".openthrottle/config.yml";
@@ -93,14 +106,13 @@ function compile(pipelineId: (typeof pipelineIds)[number]) {
     configPath,
     { type: "file", content: selectedConfig },
   ]]);
-  const platform = new Map(files);
-  platform.delete(configPath);
   return compileDefinitionBundle({
     repository: { source_commit: sourceCommit, files: repository },
-    platform: { files: platform },
-    compiler_version: "definition-compiler/v1",
-    runtime_capability_digest: runtimeCapabilityDigest,
-    evaluator_primitives: evaluatorPrimitives,
+    platform: sealedPlatform(files),
+    compiler_environment: verifyCompilerEnvironment(
+      compilerEnvironmentDescriptor,
+      compilerEnvironmentDescriptor.environment_digest,
+    ),
     selected_pipeline: `core/${pipelineId}`,
   });
 }
@@ -117,8 +129,10 @@ function agentBindings(result: DefinitionCompilation): Array<[string, string, st
 }
 
 describe("root .openthrottle definition tree", () => {
-  it("contains the canonical agents, pipelines, evals, and task skill packages", () => {
-    const actual = new Set(filesBelow(definitionRoot).map((path) => relative(definitionRoot, path)));
+  it("matches the release-sealed catalog before interpreting any platform definition", () => {
+    const trusted = sealedPlatform();
+    const actual = new Set([...trusted.files.keys()].map((path) => path.slice(".openthrottle/".length)));
+    expect(trusted.catalog.files).toHaveLength(46);
     expect([...actual].filter((path) => path.startsWith("agents/") && path.endsWith("/instructions.md")))
       .toEqual(agentIds.map((id) => `agents/core/${id}/instructions.md`));
     expect([...actual].filter((path) => path.endsWith("/pipeline.yml")))
@@ -133,6 +147,7 @@ describe("root .openthrottle definition tree", () => {
       .toEqual(skillIds.map((id) => `skills/core/${id}/SKILL.md`));
     expect(actual.has("pipelines/core/structured/loops/unit-cycle.yml")).toBe(true);
     expect([...actual].some((path) => path.includes("/agents/openai.yaml"))).toBe(false);
+    expect(actual.has("config.yml")).toBe(false);
   });
 
   it("copies every included task package byte-for-byte except provider metadata", () => {

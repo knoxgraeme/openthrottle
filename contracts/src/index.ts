@@ -105,6 +105,28 @@ export {
   type EvalDefinition,
 } from "./eval.js";
 export {
+  COMPILER_ENVIRONMENT_SCHEMA,
+  COMPILER_ENVIRONMENT_VERSION,
+  CORE_EVALUATOR_PRIMITIVES,
+  DEFINITION_COMPILER_VERSION,
+  runtimeCapabilityDigest,
+  validateCompilerEnvironmentDescriptor,
+  verifyCompilerEnvironment,
+  type CompilerEnvironmentDescriptor,
+  type RuntimeCapabilityIdentity,
+  type RuntimeCapabilityInputs,
+  type TrustedCompilerEnvironment,
+} from "./compiler-environment.js";
+export {
+  PLATFORM_DEFINITION_CATALOG_SCHEMA,
+  PLATFORM_DEFINITION_CATALOG_VERSION,
+  validatePlatformDefinitionCatalog,
+  verifyPlatformDefinitionSource,
+  type PlatformDefinitionCatalog,
+  type PlatformDefinitionCatalogFile,
+  type TrustedPlatformDefinitionSource,
+} from "./platform-definition-catalog.js";
+export {
   DEFINITION_YAML_MAX_BYTES,
   VIRTUAL_DEFINITION_MAX_FILE_BYTES,
   VIRTUAL_DEFINITION_MAX_FILES,
@@ -112,7 +134,6 @@ export {
   compileDefinitionBundle,
   type DefinitionCompilation,
   type DefinitionCompilerInput,
-  type TrustedPlatformDefinitionSource,
   type TrustedRepositoryDefinitionSource,
   type VirtualDefinitionFile,
   type VirtualDefinitionFileMap,

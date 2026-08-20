@@ -2,11 +2,24 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  COMPILER_ENVIRONMENT_SCHEMA,
+  COMPILER_ENVIRONMENT_VERSION,
   DEFINITION_YAML_MAX_BYTES,
+  PLATFORM_DEFINITION_CATALOG_SCHEMA,
+  PLATFORM_DEFINITION_CATALOG_VERSION,
   VIRTUAL_DEFINITION_MAX_FILE_BYTES,
   VIRTUAL_DEFINITION_MAX_FILES,
   VIRTUAL_DEFINITION_MAX_TOTAL_BYTES,
   compileDefinitionBundle,
+  digestCanonicalJson,
+  digestNormalized,
+  runtimeCapabilityDigest,
+  verifyCompilerEnvironment,
+  verifyPlatformDefinitionSource,
+  type CompilerEnvironmentDescriptor,
+  type PlatformDefinitionCatalog,
+  type TrustedCompilerEnvironment,
+  type TrustedPlatformDefinitionSource,
   type VirtualDefinitionFile,
   type VirtualDefinitionFileMap,
 } from "./index.js";
@@ -26,12 +39,13 @@ const fixturePath = fileURLToPath(
   new URL("../fixtures/definition-compiler/golden-source.json", import.meta.url),
 );
 const sourceFixture = JSON.parse(readFileSync(fixturePath, "utf8")) as CompilerFixture;
-const runtimeCapabilityDigest = "b".repeat(64);
 const evaluatorPrimitives = new Set([
   "core/action-outcome@1",
   "core/review-outcome@1",
   "core/unit-outcome@1",
 ]);
+const runtimeManifestDigest = "b".repeat(64);
+const validatorArtifactSetDigest = "d".repeat(64);
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -44,19 +58,71 @@ function virtualFiles(files: Record<string, FixtureFile>): VirtualDefinitionFile
   ]));
 }
 
+function compilerEnvironment(options: {
+  compiler_version?: string;
+  runtime_manifest_digest?: string;
+  evaluator_primitives?: readonly string[];
+} = {}): TrustedCompilerEnvironment {
+  const primitives = [...(options.evaluator_primitives ?? evaluatorPrimitives)].sort();
+  const runtimeCapabilityInputs = {
+    runtime_manifest_digest: options.runtime_manifest_digest ?? runtimeManifestDigest,
+    validator_artifact_set_digest: validatorArtifactSetDigest,
+  };
+  const content = {
+    schema: COMPILER_ENVIRONMENT_SCHEMA,
+    version: COMPILER_ENVIRONMENT_VERSION,
+    compiler_version: options.compiler_version ?? "definition-compiler/v1",
+    runtime_capability_inputs: runtimeCapabilityInputs,
+    runtime_capability_digest: runtimeCapabilityDigest({
+      ...runtimeCapabilityInputs,
+      evaluator_primitives: primitives,
+    }),
+    evaluator_primitives: primitives,
+  };
+  const descriptor: CompilerEnvironmentDescriptor = {
+    ...content,
+    environment_digest: digestCanonicalJson(content),
+  };
+  return verifyCompilerEnvironment(descriptor, descriptor.environment_digest);
+}
+
+function trustedPlatform(files: Record<string, FixtureFile>) {
+  const rawFiles = new Map(Object.entries(files).map(([path, file]) => [
+    path,
+    { type: "file" as const, content: Buffer.from(file.content, "utf8"), blob_sha: file.blob_sha },
+  ]));
+  const inventory = [...rawFiles].map(([path, file]) => ({
+    path,
+    byte_size: file.content.byteLength,
+    sha256: digestNormalized(file.content),
+  })).sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+  const content = {
+    schema: PLATFORM_DEFINITION_CATALOG_SCHEMA,
+    version: PLATFORM_DEFINITION_CATALOG_VERSION,
+    files: inventory,
+  };
+  const catalog: PlatformDefinitionCatalog = {
+    ...content,
+    catalog_digest: digestCanonicalJson(content),
+  };
+  return verifyPlatformDefinitionSource(catalog, rawFiles, catalog.catalog_digest);
+}
+
 function compile(
   fixture: CompilerFixture = sourceFixture,
-  overrides: { compiler_version?: string; runtime_capability_digest?: string } = {},
+  overrides: {
+    compiler_version?: string;
+    runtime_manifest_digest?: string;
+    evaluator_primitives?: readonly string[];
+  } = {},
 ) {
   return compileDefinitionBundle({
     repository: {
       source_commit: fixture.source_commit,
       files: virtualFiles(fixture.repository),
     },
-    platform: { files: virtualFiles(fixture.platform) },
-    compiler_version: overrides.compiler_version ?? "definition-compiler/v1",
-    runtime_capability_digest: overrides.runtime_capability_digest ?? runtimeCapabilityDigest,
-    evaluator_primitives: evaluatorPrimitives,
+    ...(Object.keys(fixture.platform).length === 0 ? {} : { platform: trustedPlatform(fixture.platform) }),
+    compiler_environment: compilerEnvironment(overrides),
   });
 }
 
@@ -126,8 +192,8 @@ describe("filesystem definition compiler", () => {
     });
     expect(result.manifest.value.stages[0]?.loop).not.toHaveProperty("file");
     expect(result.manifest.value.definition_bundle_hash).toBe(result.bundle.digest);
-    expect(result.bundle.digest).toBe("e66494b1c061aca0836a1ffcf4409ce2f9749621d6aa3f6cc558d6e9d13f0981");
-    expect(result.manifest.digest).toBe("2e5eb5ba935d5550a8209762b1b2828593236f2e798be0c4fc7a0d6971af07cf");
+    expect(result.bundle.digest).toBe("9bf556163cd02a04aa4a1e16b1d73e9b314a6f7068ff79c7b18c06ef5dcb43c6");
+    expect(result.manifest.digest).toBe("8ef4ad94388dc8897cd13c45b1bedc29fec1ff4e272a6f2b1681085ae735addc");
   });
 
   it("resolves external loop edges before enforcing final reachability", () => {
@@ -243,7 +309,13 @@ stages:
           .replace("max_length: 4000", "max_length: 3999"),
       )).bundle.digest,
       compile(sourceFixture, { compiler_version: "definition-compiler/v2" }).bundle.digest,
-      compile(sourceFixture, { runtime_capability_digest: "c".repeat(64) }).bundle.digest,
+      compile(sourceFixture, { runtime_manifest_digest: "c".repeat(64) }).bundle.digest,
+      compile(sourceFixture, { evaluator_primitives: [
+        "core/action-outcome@1",
+        "core/review-outcome@1",
+        "core/unit-outcome@1",
+        "core/unused-outcome@1",
+      ] }).bundle.digest,
     ];
     expect(otherBehaviorInputs.every((digest) => digest !== baseline.bundle.digest)).toBe(true);
   });
@@ -262,6 +334,50 @@ stages:
       for (const file of Object.values(channel)) file.blob_sha = "f".repeat(40);
     }
     expect(compile(differentBlobShas).bundle.normalized).toBe(baseline.bundle.normalized);
+  });
+
+  it("grants platform and environment authority only to verifier-produced immutable snapshots", () => {
+    const platform = trustedPlatform(sourceFixture.platform);
+    const environment = compilerEnvironment();
+    const publicFiles = platform.files as Map<string, VirtualDefinitionFile>;
+    publicFiles.set(".openthrottle/agents/core/reviewer/instructions.md", {
+      type: "file",
+      content: Buffer.from("mutated after verification\n"),
+    });
+    const result = compileDefinitionBundle({
+      repository: {
+        source_commit: sourceFixture.source_commit,
+        files: virtualFiles(sourceFixture.repository),
+      },
+      platform,
+      compiler_environment: environment,
+    });
+    expect(result.bundle.digest).toBe(compile().bundle.digest);
+
+    const forgedPlatform = {
+      catalog: platform.catalog,
+      files: platform.files,
+    } as unknown as TrustedPlatformDefinitionSource;
+    expect(() => compileDefinitionBundle({
+      repository: {
+        source_commit: sourceFixture.source_commit,
+        files: virtualFiles(sourceFixture.repository),
+      },
+      platform: forgedPlatform,
+      compiler_environment: environment,
+    })).toThrow(/produced by verifyPlatformDefinitionSource/);
+
+    const forgedEnvironment = {
+      descriptor: environment.descriptor,
+    } as unknown as TrustedCompilerEnvironment;
+    expect(() => compileDefinitionBundle({
+      repository: {
+        source_commit: sourceFixture.source_commit,
+        files: virtualFiles(sourceFixture.repository),
+      },
+      platform: trustedPlatform(sourceFixture.platform),
+      compiler_environment: forgedEnvironment,
+    })).toThrow(/produced by verifyCompilerEnvironment/);
   });
 
   it("binds every selected repository definition to the exact source commit", () => {
@@ -301,10 +417,8 @@ stages:
   it("rejects unsafe paths, case collisions, symlinks, non-files, NUL, and input bounds", () => {
     const compileFiles = (files: Map<string, VirtualDefinitionFile>) => compileDefinitionBundle({
       repository: { source_commit: sourceFixture.source_commit, files },
-      platform: { files: virtualFiles(sourceFixture.platform) },
-      compiler_version: "definition-compiler/v1",
-      runtime_capability_digest: runtimeCapabilityDigest,
-      evaluator_primitives: evaluatorPrimitives,
+      platform: trustedPlatform(sourceFixture.platform),
+      compiler_environment: compilerEnvironment(),
     });
     const base = virtualFiles(sourceFixture.repository);
 
@@ -446,7 +560,7 @@ stages:
     expect(() => compile(inheritedCommand)).toThrow(/command constructor is not defined/);
   });
 
-  it("rejects transition cycles, loop escapes, repository core shadowing, and implicit overrides", () => {
+  it("rejects transition cycles, loop escapes, repository core shadowing, and unsealed platform paths", () => {
     const cycle = replaceFile(
       sourceFixture,
       "platform",
@@ -475,7 +589,7 @@ stages:
     override.platform[".openthrottle/skills/unused/SKILL.md"] = {
       ...override.repository[".openthrottle/skills/unused/SKILL.md"]!,
     };
-    expect(() => compile(override)).toThrow(/implicit override|duplicate definition/);
+    expect(() => compile(override)).toThrow(/reserved core namespace/);
 
     const duplicateLoopIdentity = clone(sourceFixture);
     duplicateLoopIdentity.platform[".openthrottle/pipelines/core/review/loops/review-cycle.yaml"] = {
