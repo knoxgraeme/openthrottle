@@ -115,6 +115,12 @@ semantic object consumes the stage's bounded `semantic_repair_required`
 re-entry without a fabricated receipt. A recognized engine launch, credential,
 provider-limit, or other infrastructure failure remains a
 `retryable_infrastructure_failure` and consumes only its infrastructure retry.
+The admission basis carries the repository's sorted, unique command-key
+inventory, never command bodies. Command keys use the execution-plan command
+grammar and an 80-character maximum. Claude and Codex planner schemas constrain
+both global and unit-scoped commands to that sealed inventory; an empty
+inventory requires an empty plan command list. Executor validation against the
+same sealed inventory remains authoritative after model output.
 
 ## Manifest and catalog contract
 

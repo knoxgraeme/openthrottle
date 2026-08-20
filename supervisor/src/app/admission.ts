@@ -820,6 +820,7 @@ export async function handleCreated(
           name: selectedRepository.repo,
           base_commit: remote.baseCommit,
           config_digest: repositoryConfig.digest,
+          command_names: Object.keys(repositoryConfig.config.commands ?? {}).sort(),
         },
         runtime: {
           release: coordinator.runtime.descriptor.release,

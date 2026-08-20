@@ -76,7 +76,7 @@ export function recordAt<T>(
   value: unknown,
   path: string,
   parse: (entry: unknown, path: string, key: string) => T,
-  options: { max: number; keyPattern?: RegExp } = { max: 64 }
+  options: { max: number; keyMax?: number; keyPattern?: RegExp } = { max: 64 }
 ): Record<string, T> {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail(path, "must be an object");
   const input = value as Record<string, unknown>;
@@ -85,6 +85,9 @@ export function recordAt<T>(
   for (const [key, entry] of Object.entries(input)) {
     count += 1;
     if (count > options.max) fail(path, `must contain at most ${options.max} entries`);
+    if (options.keyMax !== undefined && key.length > options.keyMax) {
+      fail(`${path}.${key}`, `key must contain at most ${options.keyMax} characters`);
+    }
     if (options.keyPattern && !options.keyPattern.test(key)) fail(`${path}.${key}`, "has an invalid key");
     output[key] = parse(entry, `${path}.${key}`, key);
   }

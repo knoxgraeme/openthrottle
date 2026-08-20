@@ -57,6 +57,7 @@ export interface AdmissionBasisInput {
     name: string;
     base_commit: string;
     config_digest: string;
+    command_names: string[];
   };
   runtime: {
     release: string;

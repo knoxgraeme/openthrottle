@@ -1528,6 +1528,25 @@ describe("Stage C contract fixtures", () => {
     });
   });
 
+  it("bounds repository command keys to the execution-plan command limit", () => {
+    const config = JSON.parse(readFixture("valid", "config-repository.json")) as {
+      commands: Record<string, string>;
+      test?: string;
+      lint?: string;
+      build?: string;
+    };
+    delete config.test;
+    delete config.lint;
+    delete config.build;
+    config.commands = { [`a${"b".repeat(79)}`]: "npm test" };
+    expect(parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }).value.commands)
+      .toHaveProperty(`a${"b".repeat(79)}`);
+
+    config.commands = { [`a${"b".repeat(80)}`]: "npm test" };
+    expect(() => parseRepositoryConfigContract(JSON.stringify(config), { source: "config" }))
+      .toThrow(/key must contain at most 80 characters/);
+  });
+
   it("normalizes provider-specific model and reasoning defaults", () => {
     const config = JSON.parse(readFixture("valid", "config-repository.json")) as Record<string, unknown>;
     config.agent_defaults = {

@@ -68,6 +68,10 @@ read-only planning actor, not an implementation worker or pipeline controller.
 - Include success, boundary, and failure tests where applicable. Verification
   names runnable commands or focused checks that exist in the repository's
   compiled facts; do not invent commands or claim they ran.
+- Every `execution_plan.commands[].name` must be one of the sealed repository
+  `command_names` keys, such as `test`, `lint`, or `build`. Use the key exactly;
+  never copy its shell command value or invent a command name. If the sealed
+  list is empty, return an empty `commands` array.
 - Use one stable `plan_id`, `graph_id: "structured"`, and the exact v2 fields.
   Keep the canonical plan JSON at or below 256 KiB.
 

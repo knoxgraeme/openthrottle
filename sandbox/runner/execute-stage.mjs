@@ -92,7 +92,7 @@ import {
   isAdmissionInspectionStage,
 } from "./admission-inspection-runtime.mjs";
 import {
-  ADMISSION_SEMANTIC_OUTPUT_SCHEMAS,
+  admissionSemanticOutputSchema,
   validateAdmissionDecision,
   validateAdmissionExecutionPlanArtifact,
   validateAdmissionReview,
@@ -759,20 +759,17 @@ export function parseAdmissionSemanticOutput(raw, stageId, env = process.env) {
   return outputs[0];
 }
 
-function admissionSemanticOutputSchema(stageId) {
-  const schema = ADMISSION_SEMANTIC_OUTPUT_SCHEMAS[stageId];
-  if (!schema) throw new Error(`unsupported admission semantic stage ${stageId}`);
-  return schema;
-}
-
-function materializeAdmissionSemanticOutputSchema(request) {
+function materializeAdmissionSemanticOutputSchema(request, repositoryCommandNames) {
   const actionDirectory = ensureStageActionParents(request);
   const schemaPath = pathInside(
     actionDirectory,
     `${request.stageId}.semantic-output.schema.json`,
     "admission semantic output schema",
   );
-  writeFileSync(schemaPath, `${canonicalJson(admissionSemanticOutputSchema(request.stageId))}\n`, {
+  writeFileSync(schemaPath, `${canonicalJson(admissionSemanticOutputSchema(
+    request.stageId,
+    repositoryCommandNames,
+  ))}\n`, {
     encoding: "utf8",
     mode: 0o444,
     flag: "wx",
@@ -793,6 +790,7 @@ export function defaultRunAgent({
   timeoutMs,
   model,
   reasoningEffort,
+  repositoryCommandNames = [],
   agent = request.agent,
   lockPersistentProfiles = lockRepositorySkillStagePersistentProfiles,
   restorePersistentProfiles = restorePersistentAgentPrivateRoots,
@@ -853,7 +851,10 @@ export function defaultRunAgent({
       const common = [
         "--output-format", "stream-json", "--verbose",
         ...(inspection
-          ? ["--json-schema", canonicalJson(admissionSemanticOutputSchema(request.stageId))]
+          ? ["--json-schema", canonicalJson(admissionSemanticOutputSchema(
+            request.stageId,
+            repositoryCommandNames,
+          ))]
           : []),
         ...(maxTurns ? ["--max-turns", maxTurns] : []),
         ...(model ? ["--model", model] : []),
@@ -889,7 +890,7 @@ export function defaultRunAgent({
     } else if (agent === "codex") {
       command = "codex";
       const outputSchemaPath = inspection
-        ? materializeAdmissionSemanticOutputSchema(request)
+        ? materializeAdmissionSemanticOutputSchema(request, repositoryCommandNames)
         : null;
       // "-" tells Codex to read the prompt from stdin, in resume mode exactly
       // as in a fresh launch.
@@ -1095,10 +1096,29 @@ function admissionInputBindings(request) {
   if (input.effective_manifest_digest !== request.manifestDigest) {
     throw new Error("sealed automatic admission effective manifest digest mismatch");
   }
+  const commandNames = input.admission_basis.repository?.command_names;
+  if (!Array.isArray(commandNames) || commandNames.some((name) =>
+    typeof name !== "string" || name.length > 80 || !COMMAND_NAME.test(name))) {
+    throw new Error("sealed automatic admission basis has invalid repository command names");
+  }
+  if (new Set(commandNames).size !== commandNames.length ||
+      commandNames.some((name, index) => index > 0 && commandNames[index - 1] >= name)) {
+    throw new Error("sealed automatic admission repository command names must be sorted and unique");
+  }
   return {
     admissionBasisDigest: input.admission_basis_digest,
     effectiveManifestDigest: input.effective_manifest_digest,
+    repositoryCommandNames: commandNames,
   };
+}
+
+function assertPlanCommandsAllowed(plan, commandNames, source) {
+  const allowed = new Set(commandNames);
+  for (const [index, command] of plan.commands.entries()) {
+    if (!allowed.has(command.name)) {
+      throw new Error(`${source}.commands[${index}].name: does not reference a sealed repository command`);
+    }
+  }
 }
 
 function reviewerCandidatePlan(request, bindings, env) {
@@ -1180,6 +1200,13 @@ function buildAdmissionArtifacts({ request, semanticOutput, fence, requiredArtif
             sanitize: (entry) => sanitizeArtifactText(entry, env),
           });
       const plan = validatedPlan?.value ?? null;
+      if (plan) {
+        assertPlanCommandsAllowed(
+          plan,
+          bindings.repositoryCommandNames,
+          "admission planner semantic output execution_plan",
+        );
+      }
       const generatedPlanDigest = validatedPlan?.digest ?? null;
       const decision = validateAdmissionDecision({
         schema: "openthrottle.admission-decision/v1",
@@ -1489,6 +1516,9 @@ export function executeStage({
       request.capability === "admission/plan@1" && request.expectedSubject === null
     ? { ...request, expectedSubject: preSubject }
     : request;
+  const admissionBindings = isAdmissionInspectionStage(executionRequest)
+    ? admissionInputBindings(executionRequest)
+    : null;
   let nativeSessionId = request.nativeSessionId;
   let artifacts;
   // Populated only when classifyAgentExecutionFailure identifies a launch
@@ -1572,6 +1602,7 @@ export function executeStage({
           model: agentDefault?.model ?? (config.agent === executionRequest.agent ? config.model : undefined),
           reasoningEffort: agentDefault?.reasoning_effort,
           agent: executionRequest.agent,
+          repositoryCommandNames: admissionBindings?.repositoryCommandNames ?? [],
         });
         nativeSessionId = execution.nativeSessionId ?? nativeSessionId;
       } catch (error) {

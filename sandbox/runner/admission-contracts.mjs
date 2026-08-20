@@ -4,6 +4,9 @@ import { canonicalJson } from "./capabilities.mjs";
 export const ADMISSION_EXECUTION_PLAN_ARTIFACT_MAX_BYTES = 320 * 1024;
 export const EXECUTION_PLAN_V2_MAX_BYTES = 256 * 1024;
 
+const COMMAND_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
+const COMMAND_NAME_MAX_LENGTH = 80;
+
 const STRING_ARRAY_SCHEMA = {
   type: "array",
   items: { type: "string" },
@@ -30,53 +33,73 @@ const EXECUTION_PLAN_UNIT_SCHEMA = {
   },
 };
 
-const EXECUTION_PLAN_COMMAND_SCHEMA = {
-  anyOf: [
-    {
-      type: "object",
-      additionalProperties: false,
-      required: ["name"],
-      properties: { name: { type: "string" } },
-    },
-    {
-      type: "object",
-      additionalProperties: false,
-      required: ["name", "unit"],
-      properties: {
-        name: { type: "string" },
-        unit: { type: "string" },
+function executionPlanCommandSchema(commandNames) {
+  const name = commandNames.length === 0
+    ? { type: "string" }
+    : { type: "string", enum: commandNames };
+  return {
+    anyOf: [
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["name"],
+        properties: { name },
       },
-    },
-  ],
-};
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["name", "unit"],
+        properties: {
+          name,
+          unit: { type: "string" },
+        },
+      },
+    ],
+  };
+}
 
-const EXECUTION_PLAN_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["schema", "graph_id", "plan_id", "units", "commands"],
-  properties: {
-    schema: { type: "string", enum: ["openthrottle.execution-plan/v2"] },
-    graph_id: { type: "string" },
-    plan_id: { type: "string" },
-    units: { type: "array", items: EXECUTION_PLAN_UNIT_SCHEMA },
-    commands: { type: "array", items: EXECUTION_PLAN_COMMAND_SCHEMA },
-  },
-};
+function executionPlanSchema(commandNames) {
+  const commands = {
+    type: "array",
+    items: executionPlanCommandSchema(commandNames),
+    ...(commandNames.length === 0 ? { maxItems: 0 } : {}),
+  };
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["schema", "graph_id", "plan_id", "units", "commands"],
+    properties: {
+      schema: { type: "string", enum: ["openthrottle.execution-plan/v2"] },
+      graph_id: { type: "string" },
+      plan_id: { type: "string" },
+      units: { type: "array", items: EXECUTION_PLAN_UNIT_SCHEMA },
+      commands,
+    },
+  };
+}
 
 // Provider-native structured output only shapes the model response. The
 // executor's validators below remain authoritative for bounds, identifiers,
 // graph integrity, cross-field rules, sanitization, and canonicalization.
-export const ADMISSION_PLANNER_SEMANTIC_OUTPUT_SCHEMA = Object.freeze({
-  type: "object",
-  additionalProperties: false,
-  required: ["route", "rationale", "questions", "execution_plan"],
-  properties: {
-    route: { type: "string", enum: ["simple", "structured", "needs_human"] },
-    rationale: { type: "string" },
-    questions: STRING_ARRAY_SCHEMA,
-    execution_plan: { anyOf: [{ type: "null" }, EXECUTION_PLAN_SCHEMA] },
-  },
-});
+export function admissionPlannerSemanticOutputSchema(commandNames = []) {
+  if (!Array.isArray(commandNames)) throw new Error("admission command names must be an array");
+  const allowedCommandNames = [...new Set(commandNames)].sort();
+  if (allowedCommandNames.some((name) =>
+    typeof name !== "string" || name.length > COMMAND_NAME_MAX_LENGTH || !COMMAND_NAME.test(name))) {
+    throw new Error("admission command names must contain only valid configured command keys");
+  }
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["route", "rationale", "questions", "execution_plan"],
+    properties: {
+      route: { type: "string", enum: ["simple", "structured", "needs_human"] },
+      rationale: { type: "string" },
+      questions: STRING_ARRAY_SCHEMA,
+      execution_plan: { anyOf: [{ type: "null" }, executionPlanSchema(allowedCommandNames)] },
+    },
+  };
+}
 
 const REVIEW_FINDING_SCHEMA = {
   anyOf: [
@@ -114,13 +137,13 @@ export const ADMISSION_REVIEWER_SEMANTIC_OUTPUT_SCHEMA = Object.freeze({
   },
 });
 
-export const ADMISSION_SEMANTIC_OUTPUT_SCHEMAS = Object.freeze({
-  admission_planner: ADMISSION_PLANNER_SEMANTIC_OUTPUT_SCHEMA,
-  admission_reviewer: ADMISSION_REVIEWER_SEMANTIC_OUTPUT_SCHEMA,
-});
+export function admissionSemanticOutputSchema(stageId, commandNames = []) {
+  if (stageId === "admission_planner") return admissionPlannerSemanticOutputSchema(commandNames);
+  if (stageId === "admission_reviewer") return ADMISSION_REVIEWER_SEMANTIC_OUTPUT_SCHEMA;
+  throw new Error(`unsupported admission semantic stage ${stageId}`);
+}
 
 const IDENTIFIER = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
-const COMMAND_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const PRODUCER_SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+|repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?:(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+\/)*(?!\.{1,2}$)[A-Za-z0-9._-]+)$/;
 

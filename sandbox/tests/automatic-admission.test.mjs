@@ -65,6 +65,10 @@ describe("automatic-admission task packages", () => {
     expect(body).toMatch(/needs_human[\s\S]*specific/i);
     expect(body).toMatch(/explicit source[\s\S]*requirement\s+or acceptance IDs/i);
     expect(body).toMatch(/preserve[\s\S]*verbatim/i);
+    expect(body).toMatch(/commands\[\]\.name[\s\S]*sealed repository[\s\S]*command_names/i);
+    expect(body).toMatch(/never copy[\s\S]*shell command value/i);
+    expect(reference("admission-plan", "semantic-output.md"))
+      .toMatch(/commands\[\]\.name[\s\S]*exact key[\s\S]*command_names/i);
   });
 
   it("requires a fresh independent reviewer bound only to sealed inputs", () => {

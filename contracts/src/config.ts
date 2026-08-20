@@ -231,6 +231,7 @@ function parsePipelineMap(value: unknown, path: string): Record<string, string> 
 function parseCommandMap(value: unknown, path: string): Record<string, string> {
   return recordAt(value, path, (entry, entryPath) => stringAt(entry, entryPath, { max: 4_000 }), {
     max: 32,
+    keyMax: 80,
     keyPattern: COMMAND_NAME_PATTERN,
   });
 }
