@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -18,6 +18,7 @@ import {
   canonicalJson,
   compareCodeUnits,
   digestCanonicalJson,
+  digestNormalized,
   jsonValueAt,
   type JsonValue,
 } from "@openthrottle/contracts";
@@ -458,7 +459,7 @@ function unlinkStagingFiles(stagingPath: string): void {
 }
 
 function databaseFileDigest(path: string): string {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
+  return digestNormalized(readFileSync(path));
 }
 
 export function initializeFreshEpochDatabase(input: {

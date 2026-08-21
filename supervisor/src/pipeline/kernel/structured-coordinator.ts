@@ -14,6 +14,7 @@ import {
 } from "@openthrottle/contracts";
 import {
   createPendingKernelAttempt,
+  exactKernelContext,
   type KernelActionInputs,
 } from "./action-request.js";
 import {
@@ -50,6 +51,7 @@ import {
   exactKernelRuntimeResourceDeliveries,
   resolveKernelRuntimeResourceIdentity,
 } from "./runtime-resource.js";
+import { sortedUnique } from "./reducer-support.js";
 import { deriveKernelTerminalCleanupAttempt } from "./successor-attempt.js";
 
 const MAX_STRUCTURED_MEMBERS = 64;
@@ -106,10 +108,6 @@ interface FrontierBase {
   max_parallel: number;
   bundle: DefinitionBundle;
   manifest: CompiledPipelineManifest;
-}
-
-function sortedUnique(values: readonly string[]): string[] {
-  return [...new Set(values)].sort(compareCodeUnits);
 }
 
 function assertIdentifier(value: string, label: string): void {
@@ -182,10 +180,7 @@ function mergedActionInputs(
   }
   return {
     task_prompt: base.task_prompt,
-    context: {
-      records: [...records.values()].sort((left, right) => compareCodeUnits(left.id, right.id)),
-      checkpoints: [...checkpoints.values()].sort((left, right) => compareCodeUnits(left.id, right.id)),
-    },
+    context: exactKernelContext({ records, checkpoints }),
   };
 }
 

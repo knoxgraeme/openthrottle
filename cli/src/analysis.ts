@@ -1,10 +1,6 @@
+import { EXECUTION_RECORD_KINDS, PIPELINE_TERMINAL_OUTCOMES } from '@openthrottle/contracts';
 import { terminalSafe } from './status.js';
 import { getErrorMessage, printTable, supervisorRequest } from './util.js';
-
-const TERMINAL_OUTCOMES = [
-  'completed', 'no_change', 'needs_human', 'failed', 'canceled', 'superseded',
-] as const;
-const RECORD_KINDS = ['result', 'decision', 'delivery'] as const;
 
 type QueryField =
   | 'run'
@@ -45,11 +41,11 @@ function parseFilters(args: string[]): ParsedFilters {
     if (!field) fail(`Unknown flag: ${flag}\n\nSupported flags: ${[...FIELD_BY_FLAG.keys()].join(', ')}`);
     const value = args[index + 1];
     if (value === undefined) fail(`${flag} requires a value`);
-    if (field === 'terminal_outcome' && !TERMINAL_OUTCOMES.includes(value as typeof TERMINAL_OUTCOMES[number])) {
-      fail(`Invalid value for ${flag}: ${value}\n\nAllowed values: ${TERMINAL_OUTCOMES.join(', ')}`);
+    if (field === 'terminal_outcome' && !PIPELINE_TERMINAL_OUTCOMES.includes(value as typeof PIPELINE_TERMINAL_OUTCOMES[number])) {
+      fail(`Invalid value for ${flag}: ${value}\n\nAllowed values: ${PIPELINE_TERMINAL_OUTCOMES.join(', ')}`);
     }
-    if (field === 'record_kind' && !RECORD_KINDS.includes(value as typeof RECORD_KINDS[number])) {
-      fail(`Invalid value for ${flag}: ${value}\n\nAllowed values: ${RECORD_KINDS.join(', ')}`);
+    if (field === 'record_kind' && !EXECUTION_RECORD_KINDS.includes(value as typeof EXECUTION_RECORD_KINDS[number])) {
+      fail(`Invalid value for ${flag}: ${value}\n\nAllowed values: ${EXECUTION_RECORD_KINDS.join(', ')}`);
     }
     if (field === 'limit' && (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 500)) {
       fail('--limit must be an integer between 1 and 500');

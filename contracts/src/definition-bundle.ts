@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { canonicalJson, digestCanonicalJson } from "./canonical.js";
+import { canonicalJson, compareCodeUnits, digestCanonicalJson } from "./canonical.js";
 import {
   GIT_SUBJECT,
   IDENTIFIER,
@@ -147,7 +147,7 @@ function parseEntry(value: unknown, path: string): DefinitionBundleEntry {
 function entryOrder(left: DefinitionBundleEntry, right: DefinitionBundleEntry): number {
   const leftKey = `${left.definition_kind}\0${left.definition_id}\0${left.origin.kind}\0${left.path}`;
   const rightKey = `${right.definition_kind}\0${right.definition_id}\0${right.origin.kind}\0${right.path}`;
-  return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  return compareCodeUnits(leftKey, rightKey);
 }
 
 export function validateDefinitionBundle(

@@ -2,6 +2,7 @@ import type Database from "better-sqlite3";
 import {
   canonicalJson,
   compareCodeUnits,
+  DEFINITION_BUNDLE_SCHEMA,
   digestCanonicalJson,
   validateAttemptCheckpoint,
   validateEffectIntent,
@@ -56,9 +57,6 @@ import {
   type VerifiedBlobToken,
 } from "./blob-store.js";
 import {
-  ACTIVE_ATTEMPT_STATUSES,
-  ACTIVE_EFFECT_STATUSES,
-  ACTIVE_RUN_STATUSES,
   attemptFromRow,
   checkpointFromRow,
   parseJson,
@@ -76,9 +74,13 @@ import {
   type RecordRow,
   type RunRow,
 } from "./kernel-store-codecs.js";
+import {
+  ACTIVE_ATTEMPT_STATUSES,
+  ACTIVE_EFFECT_STATUSES,
+  ACTIVE_RUN_STATUS_SET,
+} from "./kernel-active-statuses.js";
 import { KernelLeaseOperations } from "./kernel-store-leases.js";
 
-const BUNDLE_PAYLOAD_SCHEMA = "openthrottle.definition-bundle/v1";
 const STRUCTURED_PLANNING_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 
 export interface KernelManifestResolver {
@@ -210,7 +212,7 @@ export class SqliteKernelStore implements
     const pointer = this.#blobs.assertToken(input.definition_bundle);
     if (
       pointer.digest !== input.run.definition_bundle_hash ||
-      pointer.payload_schema !== BUNDLE_PAYLOAD_SCHEMA ||
+      pointer.payload_schema !== DEFINITION_BUNDLE_SCHEMA ||
       pointer.encoding !== "utf-8" || pointer.media_type !== "application/json"
     ) throw new Error("pipeline run definition bundle token does not match its pinned bundle hash");
     const expectedAttempts = sortedRecord(input.initial_attempts.map((attempt) => [attempt.id, attempt.version]));
@@ -241,7 +243,7 @@ export class SqliteKernelStore implements
     const pointer = this.#blobs.assertToken(input.definition_bundle);
     if (
       pointer.digest !== input.run.definition_bundle_hash ||
-      pointer.payload_schema !== BUNDLE_PAYLOAD_SCHEMA ||
+      pointer.payload_schema !== DEFINITION_BUNDLE_SCHEMA ||
       pointer.encoding !== "utf-8" || pointer.media_type !== "application/json"
     ) throw new Error("attached pipeline run definition bundle does not match its pinned identity");
     const expectedAttempts = sortedRecord(input.initial_attempts.map((attempt) => [attempt.id, attempt.version]));
@@ -1344,7 +1346,7 @@ export class SqliteKernelStore implements
     if (new Set(ids).size !== ids.length) throw new Error("record allowlist contains duplicate IDs");
     if (ids.length === 0) return new Map();
     const rows = [...ids]
-      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+      .sort(compareCodeUnits)
       .flatMap((id) => {
         const row = availableRows.get(id);
         return row === undefined ? [] : [row];
@@ -1394,7 +1396,7 @@ export class SqliteKernelStore implements
     if (new Set(ids).size !== ids.length) throw new Error("checkpoint allowlist contains duplicate IDs");
     if (ids.length === 0) return new Map();
     const rows = [...ids]
-      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+      .sort(compareCodeUnits)
       .flatMap((id) => {
         const row = availableRows.get(id);
         return row === undefined ? [] : [row];
@@ -1421,7 +1423,7 @@ export class SqliteKernelStore implements
     } catch (error) {
       if (!(error instanceof BlobIntegrityError)) throw error;
       const status = knownStatus ?? this.#runRow(runId).status;
-      const active = ACTIVE_RUN_STATUSES.has(status);
+      const active = ACTIVE_RUN_STATUS_SET.has(status);
       throw new KernelIntegrityError({
         pipeline_run_id: runId,
         owner_kind: ownerKind,

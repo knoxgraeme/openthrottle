@@ -16,6 +16,7 @@ import type {
   SettledStructuredPlanningAttempt,
 } from "../pipeline/kernel/ports.js";
 import { frontierMemberKey } from "../pipeline/kernel/reducer.js";
+import { sortedUnique } from "../pipeline/kernel/reducer-support.js";
 import { structuredDecisionOutcome } from "../pipeline/kernel/structured-coordinator.js";
 import { kernelSuccessorStageId } from "../pipeline/kernel/successor-attempt.js";
 import type {
@@ -42,7 +43,7 @@ export type StructuredLoopStage = Extract<CompiledPipelineStage, { kind: "agent"
 };
 
 export function sortedUniqueStructuredIds(values: readonly string[]): string[] {
-  return [...new Set(values)].sort(compareCodeUnits);
+  return sortedUnique(values);
 }
 
 export function structuredStageFor(

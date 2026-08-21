@@ -1,8 +1,9 @@
 import type { JsonValue } from "@openthrottle/contracts";
 import type { KernelInboxEvent } from "../persistence/kernel-inbox-store.js";
-import type {
-  AuthorizedKernelSteering,
-  KernelSteeringEnvelope,
+import {
+  KERNEL_STEERING_ENVELOPE_SCHEMA,
+  type AuthorizedKernelSteering,
+  type KernelSteeringEnvelope,
 } from "../pipeline/kernel/steering.js";
 import type {
   KernelProviderPromptDisposition,
@@ -83,7 +84,7 @@ function controlRequest(event: KernelInboxEvent): {
 function steeringEnvelope(event: KernelInboxEvent): KernelSteeringEnvelope | null {
   if (event.kind !== "steering/message@1") return null;
   const payload = object(event.payload);
-  if (!payload || payload.schema !== "openthrottle.kernel-steering-envelope/v1") return null;
+  if (!payload || payload.schema !== KERNEL_STEERING_ENVELOPE_SCHEMA) return null;
   return payload as unknown as KernelSteeringEnvelope;
 }
 
