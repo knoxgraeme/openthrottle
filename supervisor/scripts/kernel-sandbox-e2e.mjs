@@ -474,6 +474,7 @@ function createKernelEnvironment(directory, source, pipelineId) {
         trusted_platform_definitions: release.trusted_platform_definitions,
       }),
       payload_schemas: ordinaryKernelPayloadSchemas(),
+      execution_policy: release.execution_policy,
     });
     const planner = new KernelStructuredSettlementPlanner({ store });
     const coordinator = new OrdinaryKernelCoordinator({

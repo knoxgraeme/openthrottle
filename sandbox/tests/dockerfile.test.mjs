@@ -95,5 +95,13 @@ describe("sandbox Dockerfile", () => {
       expect(harness, path).toContain("OT_LEASE_GENERATION_LOCK_FILE=");
       expect(harness, path).toContain("openthrottle.kernel-lease-generation-fence/v1");
     }
+
+    const supervisorHarness = readFileSync(
+      resolve(repoRoot, "supervisor/scripts/kernel-sandbox-e2e.mjs"),
+      "utf8",
+    );
+    expect(supervisorHarness).toMatch(
+      /new SqliteKernelStore\(\{[\s\S]*?execution_policy: release\.execution_policy,[\s\S]*?\}\)/,
+    );
   });
 });
