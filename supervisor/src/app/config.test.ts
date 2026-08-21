@@ -1,43 +1,33 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "./config.js";
 
 const originalEnv = { ...process.env };
+const configKeys = [
+  "PORT", "DATABASE_PATH", "SUPERVISOR_URL", "OT_STATUS_TOKEN", "OT_DEPLOY_TOKEN",
+  "LINEAR_WEBHOOK_SECRET", "GITHUB_WEBHOOK_SECRET", "GITHUB_TOKEN", "GITHUB_READ_TOKEN",
+  "DAYTONA_API_KEY", "DAYTONA_SNAPSHOT", "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_AUTH_JSON",
+  "KIMI_CODE_API_KEY", "TASK_TIMEOUT", "WEBHOOK_MAX_AGE_SECONDS", "OT_BLOB_STORE_PATH",
+  "OT_BLOB_STORE_ID", "OT_EPOCH_RELEASE_ID", "OT_RELEASE_ROOT",
+  "OT_GENERATED_DEFINITION_ROOT", "OT_KERNEL_WORKER_ID", "OT_KERNEL_WORKER_INTERVAL_MS",
+  "OT_KERNEL_LEASE_SECONDS", "OT_KERNEL_CYCLE_LIMIT",
+  // Retired variables are cleared so they cannot influence a clean-epoch test.
+  "OT_INSTALL_SECRET", "LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET", "DEFAULT_AGENT",
+  "REVIEW_FANOUT_CONCURRENCY", "PIPELINE_CATALOG_PATH", "SANDBOX_RUNTIME_RELEASE",
+];
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const key of Object.keys(process.env)) delete process.env[key];
   Object.assign(process.env, originalEnv);
 });
 
 function setRequiredEnv(): void {
-  for (const name of [
-    "PORT",
-    "DATABASE_PATH",
-    "DAYTONA_SNAPSHOT",
-    "DEFAULT_AGENT",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CODEX_AUTH_JSON",
-    "KIMI_CODE_API_KEY",
-    "TASK_TIMEOUT",
-    "REVIEW_FANOUT_CONCURRENCY",
-    "ORPHAN_GRACE_MINUTES",
-    "RUNTIME_RESOURCE_RETENTION_MINUTES",
-    "WEBHOOK_MAX_AGE_SECONDS",
-    "ALLOW_LINEAR_MERGE",
-    "SANDBOX_EVENT_POLL_INTERVAL_MS",
-    "PIPELINE_CATALOG_PATH",
-    "SANDBOX_RUNTIME_RELEASE",
-    "SANDBOX_RUNTIME_DESCRIPTOR_PATH",
-  ]) {
-    delete process.env[name];
-  }
+  for (const name of configKeys) delete process.env[name];
   Object.assign(process.env, {
     SUPERVISOR_URL: "https://openthrottle.test/",
     OT_STATUS_TOKEN: "status",
     OT_DEPLOY_TOKEN: "deploy",
-    OT_INSTALL_SECRET: "install",
     LINEAR_WEBHOOK_SECRET: "linear-webhook",
-    LINEAR_CLIENT_ID: "linear-client",
-    LINEAR_CLIENT_SECRET: "linear-client-secret",
     GITHUB_WEBHOOK_SECRET: "github-webhook",
     GITHUB_TOKEN: "github-token",
     GITHUB_READ_TOKEN: "github-read-token",
@@ -49,153 +39,70 @@ function setRequiredEnv(): void {
 }
 
 describe("loadConfig", () => {
-  it("loads safe coordinator defaults", () => {
+  it("loads only the fresh-kernel settings and defaults", () => {
     setRequiredEnv();
-    process.env.ALLOW_LINEAR_MERGE = "true";
 
-    expect(loadConfig()).toMatchObject({
+    const config = loadConfig();
+    expect(config).toMatchObject({
       supervisorUrl: "https://openthrottle.test",
       deployToken: "deploy",
       port: 8080,
-      taskTimeout: 7200,
-      reviewFanoutConcurrency: 5,
-      allowLinearMerge: true,
-      defaultAgent: "codex",
+      taskTimeout: 7_200,
+      webhookMaxAgeSeconds: 60,
       githubReadToken: "github-read-token",
-      kimiCodeApiKey: "kimi",
-      sandboxEventPollIntervalMs: 5_000,
-      sandboxRuntimeRelease: "openthrottle-snapshot/v14",
-      runtimeResourceRetentionMinutes: 60,
-      runOutcomeRetentionDays: 180,
+      daytonaSnapshot: "openthrottle",
+      kernelWorkerIntervalMs: 1_000,
+      kernelLeaseSeconds: 120,
+      kernelCycleLimit: 16,
     });
+    for (const retired of [
+      "installSecret", "linearClientId", "linearClientSecret", "defaultAgent",
+      "reviewFanoutConcurrency", "pipelineCatalogPath", "sandboxRuntimeRelease",
+    ]) {
+      expect(config).not.toHaveProperty(retired);
+    }
   });
 
-  it("boots without Linear configuration while preserving GitHub readiness requirements", () => {
+  it("allows GitHub-only control while retaining required GitHub authority", () => {
     setRequiredEnv();
     delete process.env.LINEAR_WEBHOOK_SECRET;
-    delete process.env.LINEAR_CLIENT_ID;
-    delete process.env.LINEAR_CLIENT_SECRET;
-
-    expect(loadConfig()).toMatchObject({
-      linearWebhookSecret: undefined,
-      linearClientId: undefined,
-      linearClientSecret: undefined,
-      githubWebhookSecret: "github-webhook",
-      githubToken: "github-token",
-      githubReadToken: "github-read-token",
-    });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(loadConfig().linearWebhookSecret).toBeUndefined();
 
     delete process.env.GITHUB_TOKEN;
     expect(() => loadConfig()).toThrow("Missing required env var: GITHUB_TOKEN");
   });
 
-  it("requires a dedicated deployment token separate from operator status auth", () => {
+  it("requires distinct operator and deployment credentials", () => {
     setRequiredEnv();
     delete process.env.OT_DEPLOY_TOKEN;
     expect(() => loadConfig()).toThrow("Missing required env var: OT_DEPLOY_TOKEN");
 
-    process.env.OT_DEPLOY_TOKEN = "deploy-token";
-    process.env.OT_STATUS_TOKEN = "status-token";
-    expect(loadConfig()).toMatchObject({
-      deployToken: "deploy-token",
-      statusToken: "status-token",
-    });
-
-    process.env.OT_STATUS_TOKEN = "deploy-token";
-    expect(() => loadConfig()).toThrow("OT_DEPLOY_TOKEN must be distinct");
+    process.env.OT_DEPLOY_TOKEN = "status";
+    expect(() => loadConfig()).toThrow("OT_DEPLOY_TOKEN must be distinct from OT_STATUS_TOKEN");
   });
 
-  it("requires the operator status token to be distinct from the install secret", () => {
-    setRequiredEnv();
-    process.env.OT_STATUS_TOKEN = "shared-secret";
-    process.env.OT_INSTALL_SECRET = "shared-secret";
-    expect(() => loadConfig()).toThrow(
-      "OT_STATUS_TOKEN must be distinct from OT_INSTALL_SECRET"
-    );
-  });
-
-  it("loads and validates the runtime resource retention window", () => {
-    setRequiredEnv();
-    process.env.RUNTIME_RESOURCE_RETENTION_MINUTES = "15";
-    expect(loadConfig().runtimeResourceRetentionMinutes).toBe(15);
-
-    process.env.RUNTIME_RESOURCE_RETENTION_MINUTES = "0";
-    expect(loadConfig().runtimeResourceRetentionMinutes).toBe(0);
-
-    process.env.RUNTIME_RESOURCE_RETENTION_MINUTES = "-1";
-    expect(() => loadConfig()).toThrow(
-      "RUNTIME_RESOURCE_RETENTION_MINUTES must be between 0"
-    );
-  });
-
-  it("rejects an out-of-range run outcome retention window", () => {
-    setRequiredEnv();
-    process.env.RUN_OUTCOME_RETENTION_DAYS = "0";
-    expect(() => loadConfig()).toThrow("RUN_OUTCOME_RETENTION_DAYS must be between 1");
-  });
-
-  it("validates explicit runtime settings", () => {
-    setRequiredEnv();
-    process.env.PIPELINE_CATALOG_PATH = "/opt/catalog.yaml";
-    process.env.SANDBOX_RUNTIME_RELEASE = "snapshot/2026-07-22";
-    process.env.SANDBOX_RUNTIME_DESCRIPTOR_PATH = "/opt/runtime.json";
-    expect(loadConfig()).toMatchObject({
-      pipelineCatalogPath: "/opt/catalog.yaml",
-      sandboxRuntimeRelease: "snapshot/2026-07-22",
-      sandboxRuntimeDescriptorPath: "/opt/runtime.json",
-    });
-    process.env.SANDBOX_RUNTIME_RELEASE = "unsafe release";
-    expect(() => loadConfig()).toThrow(/SANDBOX_RUNTIME_RELEASE/);
-  });
-
-  it("rejects malformed integers", () => {
+  it("rejects malformed and out-of-range numeric settings", () => {
     setRequiredEnv();
     process.env.PORT = "8080junk";
     expect(() => loadConfig()).toThrow("PORT must be an integer");
-  });
 
-  it("rejects out-of-range lifecycle limits", () => {
-    setRequiredEnv();
-    process.env.TASK_TIMEOUT = "0";
-    expect(() => loadConfig()).toThrow("TASK_TIMEOUT must be between 1");
-  });
-
-  it("caps the supervisor hard task timeout at the authored graph maximum", () => {
-    setRequiredEnv();
-    process.env.TASK_TIMEOUT = "86400";
-    expect(loadConfig().taskTimeout).toBe(86_400);
-
+    process.env.PORT = "8080";
     process.env.TASK_TIMEOUT = "86401";
     expect(() => loadConfig()).toThrow("TASK_TIMEOUT must be between 1 and 86400");
+
+    process.env.TASK_TIMEOUT = "7200";
+    process.env.OT_KERNEL_LEASE_SECONDS = "29";
+    expect(() => loadConfig()).toThrow("OT_KERNEL_LEASE_SECONDS must be between 30");
   });
 
-  it("accepts a serial review-fanout rollback and rejects an oversized fanout", () => {
+  it("validates stable kernel identities and the public URL", () => {
     setRequiredEnv();
-    process.env.REVIEW_FANOUT_CONCURRENCY = "1";
-    expect(loadConfig().reviewFanoutConcurrency).toBe(1);
+    process.env.OT_BLOB_STORE_ID = "unsafe value";
+    expect(() => loadConfig()).toThrow("OT_BLOB_STORE_ID has an invalid format");
 
-    process.env.REVIEW_FANOUT_CONCURRENCY = "9";
-    expect(() => loadConfig()).toThrow("REVIEW_FANOUT_CONCURRENCY must be between 1 and 8");
-  });
-
-  it("rejects an invalid default agent", () => {
-    setRequiredEnv();
-    process.env.DEFAULT_AGENT = "other";
-    expect(() => loadConfig()).toThrow("DEFAULT_AGENT must be claude, codex, or opencode");
-  });
-
-  it("accepts opencode as the default agent", () => {
-    setRequiredEnv();
-    process.env.DEFAULT_AGENT = "opencode";
-    expect(loadConfig().defaultAgent).toBe("opencode");
-  });
-
-  it("treats an empty or blank DEFAULT_AGENT as unset like every other optional var", () => {
-    setRequiredEnv();
-    process.env.DEFAULT_AGENT = "";
-    expect(loadConfig().defaultAgent).toBe("codex");
-
-    process.env.DEFAULT_AGENT = "   ";
-    expect(loadConfig().defaultAgent).toBe("codex");
+    process.env.OT_BLOB_STORE_ID = "kernel-v1";
+    process.env.SUPERVISOR_URL = "relative/path";
+    expect(() => loadConfig()).toThrow("SUPERVISOR_URL must be an absolute HTTP(S) URL");
   });
 });

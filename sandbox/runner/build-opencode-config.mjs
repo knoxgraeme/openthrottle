@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, normalize } from "node:path";
 import { pathToFileURL } from "node:url";
 import { OPENCODE_PROGRESSIVE_SKILLS_CAPABILITY } from "./action-profile.mjs";
 
@@ -28,39 +28,6 @@ export function resolveOpenCodeModelProfile(model) {
   return profile;
 }
 
-function assertObject(value, label) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${label} must be an object`);
-  }
-  return value;
-}
-
-export function translateMcpServers(mcpServers = {}) {
-  const servers = assertObject(mcpServers, "mcp_servers");
-  const translated = {};
-  for (const [name, raw] of Object.entries(servers)) {
-    const server = assertObject(raw, `mcp_servers.${name}`);
-    if (typeof server.command === "string" && server.command.trim()) {
-      translated[name] = {
-        type: "local",
-        command: [server.command, ...(Array.isArray(server.args) ? server.args : [])],
-        enabled: server.enabled ?? true,
-        environment: assertObject(server.env ?? {}, `mcp_servers.${name}.env`),
-      };
-    } else if (typeof server.url === "string" && server.url.trim()) {
-      translated[name] = {
-        type: "remote",
-        url: server.url,
-        enabled: server.enabled ?? true,
-        headers: assertObject(server.headers ?? {}, `mcp_servers.${name}.headers`),
-      };
-    } else {
-      throw new Error(`mcp_servers.${name} must define command or url`);
-    }
-  }
-  return translated;
-}
-
 function progressiveSkillPolicy(allowedSkills) {
   if (!Array.isArray(allowedSkills) || allowedSkills.some((name) =>
     typeof name !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name))) {
@@ -72,12 +39,34 @@ function progressiveSkillPolicy(allowedSkills) {
   return Object.fromEntries([["*", "deny"], ...allowedSkills.map((name) => [name, "allow"])]);
 }
 
+function externalReadPolicy(readableExternalPaths) {
+  if (!Array.isArray(readableExternalPaths) || readableExternalPaths.length > 8) {
+    throw new Error("OpenCode readableExternalPaths must be a bounded array");
+  }
+  const paths = readableExternalPaths.map((path) => {
+    if (typeof path !== "string" || !isAbsolute(path)) {
+      throw new Error("OpenCode readableExternalPaths must contain absolute paths");
+    }
+    const value = normalize(path);
+    if (value === "/" || /[\0\r\n*?[\]\\]/u.test(value)) {
+      throw new Error("OpenCode readableExternalPaths cannot widen inspection authority");
+    }
+    return value;
+  });
+  if (new Set(paths).size !== paths.length) {
+    throw new Error("OpenCode readableExternalPaths must not contain duplicates");
+  }
+  return paths.length === 0
+    ? "deny"
+    : Object.fromEntries([["*", "deny"], ...paths.map((path) => [path, "allow"])]);
+}
+
 export function buildOpenCodeConfig({
   model,
-  mcpServers = {},
   inspection = false,
   skillRoot,
   allowedSkills = [],
+  readableExternalPaths = [],
   progressiveSkillsCapability,
 }) {
   const profile = resolveOpenCodeModelProfile(model);
@@ -99,7 +88,7 @@ export function buildOpenCodeConfig({
           bash: "deny",
           webfetch: "deny",
           task: "deny",
-          external_directory: "deny",
+          external_directory: externalReadPolicy(readableExternalPaths),
           skill: progressiveSkillPolicy(allowedSkills),
         }
       : {
@@ -124,7 +113,7 @@ export function buildOpenCodeConfig({
         },
       },
     },
-    mcp: inspection ? {} : translateMcpServers(mcpServers),
+    mcp: {},
   };
 }
 
@@ -143,10 +132,10 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--model") args.model = argv[++i];
-    else if (arg === "--mcp-json") args.mcpServers = JSON.parse(argv[++i] || "{}");
     else if (arg === "--config-dir") args.configDir = argv[++i];
     else if (arg === "--skill-root") args.skillRoot = argv[++i];
     else if (arg === "--allowed-skills-json") args.allowedSkills = JSON.parse(argv[++i] || "[]");
+    else if (arg === "--readable-external-paths-json") args.readableExternalPaths = JSON.parse(argv[++i] || "[]");
     else if (arg === "--progressive-skills-capability") args.progressiveSkillsCapability = argv[++i];
     else throw new Error(`Unknown argument: ${arg}`);
   }

@@ -13,6 +13,7 @@ import {
   VIRTUAL_DEFINITION_MAX_FILE_BYTES,
   VIRTUAL_DEFINITION_MAX_FILES,
   VIRTUAL_DEFINITION_MAX_TOTAL_BYTES,
+  compareCodeUnits,
   type VirtualDefinitionFileMap,
 } from "@openthrottle/contracts";
 
@@ -24,10 +25,6 @@ interface LocalDefinitionFile {
   virtualPath: string;
   size: number;
   snapshot: BigIntStats;
-}
-
-function compareCodeUnits(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function assertSafeVirtualPath(path: string): void {

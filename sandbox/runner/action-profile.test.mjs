@@ -2,23 +2,19 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
-  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { canonicalJson } from "./capabilities.mjs";
-import { digest } from "./artifacts.mjs";
+import { canonicalJson, digest } from "./kernel-json.mjs";
 import {
   compileActionProfile,
   materializeActionProfile,
-  materializeFilesystemSkillAllowlist,
 } from "./action-profile.mjs";
 
 const directories = [];
@@ -82,7 +78,12 @@ describe("sealed action profiles", () => {
       taskPrompt: "Inspect exact subject abc123.",
       platformFence: "PLATFORM FENCE",
       definitionEntries: [
-        { definition_kind: "agent", definition_id: "core/reviewer", normalized_payload: "ROLE INSTRUCTIONS" },
+        {
+          definition_kind: "agent",
+          definition_id: "core/reviewer",
+          content_hash: digest(canonicalJson("ROLE INSTRUCTIONS")),
+          normalized_payload: "ROLE INSTRUCTIONS",
+        },
         primary,
         secondary,
       ],
@@ -118,23 +119,5 @@ describe("sealed action profiles", () => {
       platformFence: "Fence.",
       definitionEntries: [],
     })).toThrow("entrySkill must be present in the skill allowlist");
-  });
-
-  it("materializes only filesystem packages named by the allowlist", () => {
-    const definitionRoot = mkdtempSync(join(tmpdir(), "ot-definition-root-"));
-    const discoveryRoot = mkdtempSync(join(tmpdir(), "ot-discovery-root-"));
-    directories.push(definitionRoot, discoveryRoot);
-    for (const name of ["review-change", "publish"]) {
-      const root = join(definitionRoot, "skills", "core", name);
-      mkdirSync(root, { recursive: true });
-      writeFileSync(join(root, "SKILL.md"), `---\nname: ${name}\ndescription: ${name}\n---\n\n${name} body\n`);
-    }
-    materializeFilesystemSkillAllowlist({
-      definitionRoot,
-      discoveryRoot,
-      skillIds: ["core/review-change"],
-    });
-    expect(existsSync(join(discoveryRoot, "review-change", "SKILL.md"))).toBe(true);
-    expect(existsSync(join(discoveryRoot, "publish"))).toBe(false);
   });
 });

@@ -161,19 +161,11 @@ export function normalizedContract<T>(value: T): ValidatedContract<T> {
 
 export const IDENTIFIER = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
 export const COMMAND_NAME_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
-export const SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+|repo:\/\/[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*)$/;
-// Producer evidence binds the exact pinned repository skill (owner/repo@commit#path)
-// admission resolved, not the authoring-time short name graph.ts validates with
-// SKILL_REFERENCE above. Path segments reject "." and ".." to match the
-// traversal-safe pinning contract enforced at admission (manifest.ts) and by the
-// sandbox executor (sandbox/runner/artifacts.mjs).
-export const PRODUCER_SKILL_REFERENCE = /^(?:builtin:\/\/[a-z][a-z0-9]*(?:[._/@-][a-z0-9]+)*@\d+|repo:\/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}#(?:(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+\/)*(?!\.{1,2}$)[A-Za-z0-9._-]+)$/;
 export const SHA256 = /^[a-f0-9]{64}$/;
 export const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
-// Keep evidence-query timestamps byte-compatible with the persistence read
-// surfaces. Date.parse alone accepts ambiguous values such as `0`, `2026`,
-// and locale-shaped dates, while equivalent offset timestamps must normalize
-// to the same bytes before citation results are compared.
+// Date.parse alone accepts ambiguous values such as `0`, `2026`, and
+// locale-shaped dates, so contract timestamps use an explicit grammar and
+// calendar check.
 const ISO_8601_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-](\d{2}):?(\d{2}))$/;
 
 export function normalizeIso8601Timestamp(value: string): string | null {
@@ -198,22 +190,8 @@ export function normalizeIso8601Timestamp(value: string): string | null {
   const timestamp = Date.parse(value);
   return Number.isNaN(timestamp) ? null : new Date(timestamp).toISOString();
 }
-// The one strict timestamp validator for every contract surface. The grammar
-// and calendar checks come from normalizeIso8601Timestamp; whether the
-// validated value is returned normalized or verbatim is a per-contract
-// property:
-//
-// - Normalizing (default): citation-contract query windows and results, whose
-//   stored bytes are the normalized form so equivalent offset spellings
-//   compare equal.
-// - Verbatim ({ normalize: false }): receipts, review journals, and tune
-//   contracts. Their canonical bytes participate in digest chains computed
-//   over the value exactly as the producer emitted it (sandbox
-//   artifacts.mjs receipt hashes are replayed by the supervisor's
-//   execution-gates evidence binding, and tune row/task digests are
-//   recomputed from validated values), and agents legitimately emit
-//   "...T00:00:00Z" without milliseconds -- rewriting those bytes here would
-//   break the chain.
+// Records and checkpoints preserve the producer's valid timestamp spelling
+// because those exact bytes participate in immutable contract digests.
 export function timestampAt(
   value: unknown,
   path: string,
@@ -264,7 +242,5 @@ export function assertAcyclicDependencies(
   for (const unit of units) visit(unit.id);
 }
 
-// Matches sandbox/runner/artifacts.mjs's NATIVE_SESSION_ID and
-// native-session-package.mjs's PACKAGE_PATH_ID, since a native session id
-// is later used to build a filesystem path.
+// Native session IDs become bounded filesystem path components in the sandbox.
 export const NATIVE_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;

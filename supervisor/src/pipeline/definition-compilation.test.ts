@@ -5,11 +5,13 @@ import { describe, expect, it, vi } from "vitest";
 import {
   RELEASE_COMPILER_ENVIRONMENT_DIGEST,
   RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
+  canonicalJson,
   validatePlatformDefinitionCatalog,
   verifyCompilerEnvironment,
   verifyPlatformDefinitionSource,
   type TrustedRepositoryDefinitionSource,
 } from "@openthrottle/contracts";
+import { VerifiedKernelManifestResolver } from "../app/kernel-composition.js";
 import { compileRepositoryDefinitionAtCommit } from "./definition-compilation.js";
 import { getRepositoryDefinitionSourceAtCommit } from "../providers/github/client.js";
 
@@ -78,7 +80,6 @@ describe("repository definition compilation adapter", () => {
     const result = await compileRepositoryDefinitionAtCommit({
       repository: "owner/repository",
       commit,
-      expectedPipeline: "core/implement",
       sourceReader: { read },
       ...release,
     });
@@ -89,6 +90,34 @@ describe("repository definition compilation adapter", () => {
     expect(result.manifest.value.pipeline_id).toBe("core/implement");
     expect(result.bundle.digest).toBe(parityGolden.bundle_digest);
     expect(result.manifest.digest).toBe(parityGolden.manifest_digest);
+  });
+
+  it("cold-reconstructs the admitted manifest from canonical bundle bytes", async () => {
+    const release = releaseInputs();
+    const result = await compileRepositoryDefinitionAtCommit({
+      repository: "owner/repository",
+      commit,
+      sourceReader: { read: async () => repositorySource() },
+      ...release,
+    });
+    const trustedPlatformDefinitions = new Map(result.bundle.value.entries
+      .filter((entry) => entry.origin.kind === "platform")
+      .map((entry) => [
+        `${entry.definition_kind}:${entry.definition_id}`,
+        entry.content_hash,
+      ]));
+    const resolver = new VerifiedKernelManifestResolver({
+      compiler_environment: release.compilerEnvironment,
+      trusted_platform_definitions: trustedPlatformDefinitions,
+    });
+
+    const recovered = resolver.resolve({
+      pipeline_id: result.bundle.value.pipeline_id,
+      definition_bundle_hash: result.bundle.digest,
+      definition_bundle_bytes: new TextEncoder().encode(result.bundle.normalized),
+    });
+
+    expect(canonicalJson(recovered)).toBe(result.manifest.normalized);
   });
 
   it("matches the golden through the production exact-commit GitHub reader", async () => {
@@ -164,14 +193,19 @@ describe("repository definition compilation adapter", () => {
     })).rejects.toThrow(/different commit/);
   });
 
-  it("uses expectedPipeline only as a config assertion", async () => {
+  it("selects an explicit pipeline without rewriting committed config bytes", async () => {
     const release = releaseInputs();
-    await expect(compileRepositoryDefinitionAtCommit({
+    const result = await compileRepositoryDefinitionAtCommit({
       repository: "owner/repository",
       commit,
       expectedPipeline: "core/structured",
       sourceReader: { read: async () => repositorySource() },
       ...release,
-    })).rejects.toThrow(/must match config pipeline core\/implement/);
+    });
+
+    expect(result.bundle.value.pipeline_id).toBe("core/structured");
+    expect(result.bundle.value.pipeline_selection).toBe("explicit");
+    expect(result.bundle.value.entries.find(({ definition_kind }) => definition_kind === "config"))
+      .toMatchObject({ normalized_payload: { pipeline: "core/implement" } });
   });
 });

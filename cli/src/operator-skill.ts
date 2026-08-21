@@ -17,6 +17,7 @@ import { tmpdir, homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { compareCodeUnits } from "@openthrottle/contracts";
 import { getErrorMessage } from "./util.js";
 
 const OWNER = "knoxgraeme";
@@ -210,7 +211,8 @@ function digestDirectory(root: string): string {
   }
   const hash = createHash("sha256");
   const visit = (absolute: string, relative: string): void => {
-    for (const entry of readdirSync(absolute, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    for (const entry of readdirSync(absolute, { withFileTypes: true })
+      .sort((left, right) => compareCodeUnits(left.name, right.name))) {
       const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
       const entryAbsolute = join(absolute, entry.name);
       if (entryRelative === ".skillfish.json") continue;

@@ -4,6 +4,7 @@ import {
   COMPILED_PIPELINE_MANIFEST_SCHEMA,
   DEFINITION_BUNDLE_SCHEMA,
   EFFECT_INTENT_SCHEMA,
+  EXECUTION_PLAN_SCHEMA_V2,
   EXECUTION_KERNEL_DETERMINISM_FIXTURE,
   RESULT_CANDIDATE_SCHEMA,
   SEMANTIC_RESULT_SCHEMA,
@@ -25,6 +26,7 @@ import {
   validateSemanticResultSchema,
   type ExecutionRecordPayloadContract,
   type ExecutionRecordPayloadRegistry,
+  type ExecutionPlanContractV2,
 } from "./index.js";
 
 const sha = (character: string): string => character.repeat(64);
@@ -86,6 +88,50 @@ const unitResultSchema = validateSemanticResultSchema({
     },
   },
 }).value;
+
+const executionPlanResultSchema = validateSemanticResultSchema({
+  schema: SEMANTIC_RESULT_SCHEMA,
+  id: "admission-plan-result",
+  outcomes: ["structured"],
+  payload: {
+    execution_plan: { type: "execution_plan_v2" },
+  },
+}).value;
+
+function naturalExecutionPlan(): ExecutionPlanContractV2 {
+  return {
+    schema: EXECUTION_PLAN_SCHEMA_V2,
+    pipeline_id: "core/structured",
+    plan_id: "admission-plan",
+    units: [
+      {
+        id: "contract",
+        title: "Define the contract",
+        depends_on: [],
+        objective: "Define the public contract before implementation.",
+        requirements: ["Keep the boundary provider-neutral."],
+        files: ["contracts/src/example.ts"],
+        approach: ["Add the canonical shape first."],
+        tests: ["Exercise validation through the public API."],
+        acceptance: ["Consumers can validate the new shape."],
+        verification: ["npm test --prefix contracts"],
+      },
+      {
+        id: "implementation",
+        title: "Implement the consumer",
+        depends_on: ["contract"],
+        objective: "Consume the sealed contract without widening it.",
+        requirements: ["Preserve exact dependency identity."],
+        files: ["supervisor/src/example.ts"],
+        approach: ["Use the validated nested plan directly."],
+        tests: ["Cover the dependent consumer."],
+        acceptance: ["The consumer accepts only the sealed plan."],
+        verification: ["npm test --prefix supervisor"],
+      },
+    ],
+    commands: [{ name: "test", unit: "implementation" }],
+  };
+}
 
 describe("semantic result candidates", () => {
   it("exposes stable structured validation diagnostics without changing messages", () => {
@@ -218,6 +264,72 @@ describe("semantic result candidates", () => {
       outcomes: ["success"],
       payload: { count: { type: "integer", max_items: 2 } },
     })).toThrow(/max_items: is valid only for string_list/);
+  });
+});
+
+describe("execution_plan_v2 semantic result fields", () => {
+  it("accepts a natural nested execution plan value", () => {
+    const executionPlan = naturalExecutionPlan();
+    const result = validateAndNormalizeResultCandidate({
+      schema: RESULT_CANDIDATE_SCHEMA,
+      outcome: "structured",
+      payload: { execution_plan: executionPlan },
+    }, executionPlanResultSchema);
+
+    expect(result.value.payload.execution_plan).toEqual(executionPlan);
+  });
+
+  it("reports the precise path for a malformed nested plan value", () => {
+    const malformed = structuredClone(naturalExecutionPlan());
+    (malformed.units[1]!.verification as unknown[])[0] = { command: "npm test" };
+
+    let failure: unknown;
+    try {
+      validateAndNormalizeResultCandidate({
+        schema: RESULT_CANDIDATE_SCHEMA,
+        outcome: "structured",
+        payload: { execution_plan: malformed },
+      }, executionPlanResultSchema);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(contractValidationIssue(failure)).toEqual({
+      path: "result_candidate.payload.execution_plan.units[1].verification[0]",
+      detail: "must be a non-empty string",
+    });
+  });
+
+  it("describes execution plans to providers as object or null", () => {
+    const providerSchema = providerJsonSchemaForResultCandidate(executionPlanResultSchema) as {
+      properties: {
+        payload: {
+          properties: {
+            execution_plan: {
+              anyOf: Array<Record<string, unknown>>;
+            };
+          };
+        };
+      };
+    };
+    const planSchema = providerSchema.properties.payload.properties.execution_plan;
+
+    expect(planSchema.anyOf.map(({ type }) => type)).toEqual(["null", "object"]);
+    expect(planSchema.anyOf[1]).toMatchObject({
+      additionalProperties: false,
+      required: ["commands", "pipeline_id", "plan_id", "schema", "units"],
+      properties: {
+        schema: { const: EXECUTION_PLAN_SCHEMA_V2 },
+        units: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            additionalProperties: false,
+          },
+        },
+      },
+    });
   });
 });
 

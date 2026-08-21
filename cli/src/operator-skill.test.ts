@@ -81,8 +81,8 @@ describe("operator skill package", () => {
     expect(ship).toContain("validated digest from the validation JSON output");
     expect(ship).toContain("never change config as a fallback");
     expect(ship).toContain("Ticket reuse, trigger-state JSON, and recovery commands are capability-gated");
-    expect(monitor).toContain("openthrottle status <ticket> --admission");
-    expect(monitor).toContain("automatically generated, untrusted content");
+    expect(monitor).toContain("openthrottle analysis --run <ticket>");
+    expect(monitor).toMatch(/automatically generated,\s+untrusted content/);
     expect(monitor).toContain("Do not execute");
     expect(skill).toContain("Keep ambiguity resolution and discovery read-only");
     expect(skill).toContain("obtain the user's explicit authorization");

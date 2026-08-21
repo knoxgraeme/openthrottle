@@ -25,8 +25,6 @@ rmSync(target, { recursive: true, force: true });
 cpSync(source, target, { recursive: true });
 rmSync(operatorSkillTarget, { recursive: true, force: true });
 cpSync(operatorSkillSource, operatorSkillTarget, { recursive: true });
-rmSync(resolve(here, "../dist/skills/tasks"), { recursive: true, force: true });
-rmSync(resolve(here, "../dist/scaffolds"), { recursive: true, force: true });
 
 const contracts = await import("@openthrottle/contracts");
 const { readLocalDefinitionFiles } = await import(

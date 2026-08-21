@@ -46,14 +46,13 @@ import {
 } from "./onboarding/supervisor-access-store.js";
 import { getErrorMessage, printTable } from "./util.js";
 
-// Only orchestrator-generated secrets may land in the legacy local store.
-// Operator third-party credentials (GitHub PATs, the Daytona API key, Linear
-// OAuth credentials) are NEVER written locally — they are set as Fly secrets
-// by the operator and only their names ever appear in evidence.
+// Only orchestrator-generated secrets may land in the profile-local store.
+// Operator third-party credentials (GitHub PATs and the Daytona API key) are
+// NEVER written locally — they are set as Fly secrets by the operator and only
+// their names ever appear in evidence.
 export const LOCAL_SECRET_KEYS = [
   "status_token",
   "deploy_token",
-  "install_secret",
   "linear_webhook_secret",
   "github_webhook_secret",
 ] as const;
@@ -80,12 +79,9 @@ export const SUPERVISOR_SECRET_CHECKLIST: readonly ChecklistEntry[] = [
   {
     name: "OT_DEPLOY_TOKEN",
     owner: "generated",
-    hint: "random deploy bearer token; must differ from the status token and install secret",
+    hint: "random deploy bearer token; must differ from the status token",
   },
-  { name: "OT_INSTALL_SECRET", owner: "generated", hint: "random bearer token for /oauth/install" },
   { name: "LINEAR_WEBHOOK_SECRET", owner: "generated", hint: "Linear webhook signing secret" },
-  { name: "LINEAR_CLIENT_ID", owner: "operator", hint: "Linear OAuth agent app (optional until Linear control is used)" },
-  { name: "LINEAR_CLIENT_SECRET", owner: "operator", hint: "Linear OAuth agent app (optional until Linear control is used)" },
   { name: "GITHUB_WEBHOOK_SECRET", owner: "generated", hint: "shared GitHub webhook signing secret" },
   { name: "GITHUB_TOKEN", owner: "operator", hint: "fine-grained PAT with target-repository access" },
   { name: "GITHUB_READ_TOKEN", owner: "operator", hint: "fine-grained PAT with contents/PRs/checks/actions read only" },
@@ -95,7 +91,6 @@ export const SUPERVISOR_SECRET_CHECKLIST: readonly ChecklistEntry[] = [
     owner: "derived",
     hint: "derivable — `openthrottle setup` pins the release snapshot name; default: openthrottle",
   },
-  { name: "DEFAULT_AGENT", owner: "operator", hint: "codex, claude, or opencode; default: codex" },
   { name: "CLAUDE_CODE_OAUTH_TOKEN", owner: "operator", hint: "Claude subscription setup token" },
   { name: "CODEX_AUTH_JSON", owner: "operator", hint: "raw ~/.codex/auth.json for Codex subscription login" },
   {
@@ -103,11 +98,6 @@ export const SUPERVISOR_SECRET_CHECKLIST: readonly ChecklistEntry[] = [
     owner: "operator",
     hint: "Kimi Code Console subscription API key for OpenCode, not Kimi Open Platform billing",
   },
-  { name: "TASK_TIMEOUT", owner: "operator", hint: "ordinary-stage seconds; default: 7200; max: 86400" },
-  { name: "SANDBOX_EVENT_POLL_INTERVAL_MS", owner: "operator", hint: "default: 5000" },
-  { name: "ORPHAN_GRACE_MINUTES", owner: "operator", hint: "default: 5" },
-  { name: "WEBHOOK_MAX_AGE_SECONDS", owner: "operator", hint: "default: 60" },
-  { name: "ALLOW_LINEAR_MERGE", owner: "operator", hint: "default: false" },
 ];
 
 const OWNER_ANNOTATION: Record<ChecklistOwner, string> = {
@@ -120,27 +110,14 @@ export function checklistLine(entry: ChecklistEntry): string {
   return `  fly secrets set ${entry.name}="<value>"   # [${OWNER_ANNOTATION[entry.owner]}] ${entry.hint}`;
 }
 
-export function renderLegacyChecklist(): string[] {
-  return [
-    "One-time Fly supervisor secrets. The database path and port are owned by the",
-    "deploy's fly.toml [env] and are deliberately not listed here.",
-    "",
-    ...SUPERVISOR_SECRET_CHECKLIST.map(checklistLine),
-    "",
-    "`openthrottle setup` (without --legacy-checklist) generates and sets the",
-    "generatable entries and derives the derivable ones for you.",
-  ];
-}
-
 export interface SetupArgs {
   profile: string;
   check: boolean;
   yes: boolean;
-  legacyChecklist: boolean;
 }
 
 export function parseSetupArgs(argv: string[]): SetupArgs {
-  const args: SetupArgs = { profile: "default", check: false, yes: false, legacyChecklist: false };
+  const args: SetupArgs = { profile: "default", check: false, yes: false };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index]!;
     switch (flag) {
@@ -156,9 +133,6 @@ export function parseSetupArgs(argv: string[]): SetupArgs {
         break;
       case "--yes":
         args.yes = true;
-        break;
-      case "--legacy-checklist":
-        args.legacyChecklist = true;
         break;
       default:
         throw new Error(`Unknown setup option: ${flag}`);
@@ -261,8 +235,7 @@ export function renderMutationPlan(plan: { hosting: ProviderPlan; runtime: Provi
 }
 
 // For every missing operator-owned secret surfaced by evidence, print the
-// exact manual fallback line from the same checklist table the legacy
-// checklist renders.
+// exact manual fallback line from the same credential inventory.
 export function fallbackSecretLines(evidence: Record<string, ProviderEvidence>): string[] {
   const text = Object.values(evidence)
     .filter((entry) => entry.status !== "ready")
@@ -316,11 +289,6 @@ export default async function setup(argv: string[] = [], options: SetupCommandOp
   } catch (error) {
     console.error(getErrorMessage(error));
     process.exitCode = 1;
-    return;
-  }
-
-  if (args.legacyChecklist) {
-    for (const line of renderLegacyChecklist()) console.log(line);
     return;
   }
 
@@ -465,11 +433,7 @@ async function runGuidedSetup(
   prompts.log.info(
     [
       "Next steps:",
-      "  1. Using Linear control? Create the Linear OAuth agent app, then set",
-      "     LINEAR_CLIENT_ID and LINEAR_CLIENT_SECRET as Fly secrets on the app.",
-      `  2. Install the Linear OAuth app via ${supervisorUrl}/oauth/install`,
-      "     (authorized with the install secret from the local store above).",
-      `  3. Run \`${initCommand}\` in each target repository to register it.`,
+      `  1. Run \`${initCommand}\` in each target repository to register its control route.`,
       ...result.actions.map((action) => `  - ${action}`),
     ].join("\n")
   );

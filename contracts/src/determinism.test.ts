@@ -63,10 +63,10 @@ function packedCliResult(tempDir: string): CanonicalDigestFixtureResult {
 }
 
 describe("canonical digest determinism fixture", () => {
-  it("matches contracts source, packed CLI, and built supervisor bytes and digest", async () => {
+  it("matches contracts source, packed CLI, and the sealed sandbox runtime artifact", async () => {
     requireBuiltArtifact(path.join(repoRoot, "contracts", "dist", "index.js"));
     requireBuiltArtifact(path.join(repoRoot, "cli", "dist", "index.js"));
-    requireBuiltArtifact(path.join(repoRoot, "supervisor", "dist", "pipeline", "manifest.js"));
+    requireBuiltArtifact(path.join(repoRoot, "contracts", "generated", "runtime", "canonical.js"));
 
     const expected: CanonicalDigestFixtureResult = {
       environment: "contracts-source",
@@ -78,23 +78,23 @@ describe("canonical digest determinism fixture", () => {
     try {
       const cli = packedCliResult(tempDir);
 
-      const supervisor = await import(
-        pathToFileURL(path.join(repoRoot, "supervisor", "dist", "pipeline", "manifest.js")).href
+      const runtime = await import(
+        pathToFileURL(path.join(repoRoot, "contracts", "generated", "runtime", "canonical.js")).href
       ) as {
         canonicalJson(value: unknown): string;
-        digestNormalized(normalized: string): string;
+        digestCanonicalJson(value: unknown): string;
       };
-      const supervisorCanonical = supervisor.canonicalJson(CANONICAL_DETERMINISM_FIXTURE);
-      const supervisorResult: CanonicalDigestFixtureResult = {
-        environment: "built-supervisor",
-        canonicalJson: supervisorCanonical,
-        digest: supervisor.digestNormalized(supervisorCanonical),
+      const runtimeResult: CanonicalDigestFixtureResult = {
+        environment: "sealed-runtime",
+        canonicalJson: runtime.canonicalJson(CANONICAL_DETERMINISM_FIXTURE),
+        digest: runtime.digestCanonicalJson(CANONICAL_DETERMINISM_FIXTURE),
       };
 
       expect(cli).toEqual({ ...expected, environment: "packed-cli" });
-      expect(supervisorResult).toEqual({ ...expected, environment: "built-supervisor" });
+      expect(runtimeResult).toEqual({ ...expected, environment: "sealed-runtime" });
       expect(Buffer.from(cli.canonicalJson, "utf8")).toEqual(Buffer.from(expected.canonicalJson, "utf8"));
-      expect(Buffer.from(supervisorResult.canonicalJson, "utf8")).toEqual(Buffer.from(expected.canonicalJson, "utf8"));
+      expect(Buffer.from(runtimeResult.canonicalJson, "utf8"))
+        .toEqual(Buffer.from(expected.canonicalJson, "utf8"));
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }

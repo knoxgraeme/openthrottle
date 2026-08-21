@@ -253,7 +253,7 @@ describe("CLI definition compilation", () => {
     )).toThrow(/missing catalog file/);
   });
 
-  it("treats an expected pipeline as an assertion, never an override", () => {
+  it("selects an explicit pipeline without changing committed config", () => {
     const directory = initializeRepository();
 
     const result = compileLocalPipeline({
@@ -262,10 +262,13 @@ describe("CLI definition compilation", () => {
       gitRunner,
     });
     expect(result.manifest.value.pipeline_id).toBe("core/implement");
-    expect(() => compileLocalPipeline({
+    expect(result.bundle.value.pipeline_selection).toBe("explicit");
+    const structured = compileLocalPipeline({
       repositoryRoot: directory,
       expectedPipeline: "core/structured",
       gitRunner,
-    })).toThrow(/must match config pipeline core\/implement/);
+    });
+    expect(structured.manifest.value.pipeline_id).toBe("core/structured");
+    expect(structured.bundle.value.pipeline_selection).toBe("explicit");
   });
 });

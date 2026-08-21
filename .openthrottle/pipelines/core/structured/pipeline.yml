@@ -13,7 +13,7 @@ stages:
     loop:
       over: execution_plan.units
       max_parallel: 4
-      max_rounds: 8
+      max_rounds: 64
       file: loops/unit-cycle.yml
     on:
       success: {to: simplify_unit}
@@ -86,7 +86,9 @@ stages:
     kind: effect
     effect: core/integrate-unit@1
     on:
-      success: {to: final_test}
+      next_integration: {to: integrate_unit, max_reentries: 64, on_exhausted: needs_human}
+      next_unit: {to: implement_unit, max_reentries: 64, on_exhausted: needs_human}
+      all_integrated: {to: final_test}
       retryable_infrastructure_failure: {to: integrate_unit, max_reentries: 2, on_exhausted: failed}
       failure: {terminal: needs_human}
   - id: final_test
@@ -119,7 +121,7 @@ stages:
     repository_authority: inspect
     skills: [core/select-review-personas]
     entry_skill: core/select-review-personas
-    eval: core/action-result
+    eval: core/persona-selection
     on:
       success: {to: persona_review}
       no_change: {to: persona_review}

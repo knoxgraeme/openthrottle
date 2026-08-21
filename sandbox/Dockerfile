@@ -3,8 +3,8 @@
 # Build from the REPO ROOT (build context = repo root), not from sandbox/:
 #   docker build -f sandbox/Dockerfile -t openthrottle .
 #
-# This is required because the image also bakes in `skills/` from the repo
-# root (the Claude + Codex skill bodies), which lives as a sibling of
+# This is required because the image also bakes in the platform fence from the
+# repository-level `skills/` tree, which lives as a sibling of
 # `sandbox/`, not inside it. See sandbox/README.md.
 
 FROM node:22-bookworm@sha256:0557ac14e0d45d02ed563067b82856ca5e7aa3437fa28d98d4350ea9c3d9494a
@@ -13,7 +13,7 @@ LABEL org.opencontainers.image.source="https://github.com/knoxgraeme/openthrottl
       org.opencontainers.image.licenses="MIT"
 
 # ---------------------------------------------------------------------------
-# System packages: git curl jq ripgrep bats gh yq gosu
+# System packages used by the executor and repository command gates.
 # ---------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git \
@@ -25,13 +25,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       procps \
       ripgrep \
       util-linux \
-    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-       -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-       > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
 # gosu — privilege drop from root to the `agent` user (root can't be trusted
@@ -49,22 +42,6 @@ RUN set -eux; \
     echo "${gosu_sha256}  /usr/local/bin/gosu" | sha256sum -c -; \
     chmod +x /usr/local/bin/gosu; \
     gosu nobody true
-
-# yq (mikefarah/yq, Go binary — NOT the python-yq apt package, which has a
-# different, jq-incompatible CLI). entrypoint.sh relies on the mikefarah
-# `-r '.foo // "default"'` jq-style filter syntax.
-ARG YQ_VERSION=v4.44.3
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    case "$arch" in \
-      amd64) yq_sha256="a2c097180dd884a8d50c956ee16a9cec070f30a7947cf4ebf87d5f36213e9ed7" ;; \
-      arm64) yq_sha256="0e7e1524f68d91b3ff9b089872d185940ab0fa020a5a9052046ef10547023156" ;; \
-      *) echo "unsupported yq architecture: $arch" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${arch}"; \
-    echo "${yq_sha256}  /usr/local/bin/yq" | sha256sum -c -; \
-    chmod +x /usr/local/bin/yq; \
-    yq --version
 
 # pnpm + yarn via corepack (bundled with Node 22)
 RUN corepack enable
@@ -87,40 +64,20 @@ RUN npm install -g \
 # ---------------------------------------------------------------------------
 RUN useradd --create-home --home-dir /home/agent --shell /bin/bash --user-group agent \
     && mkdir -p /home/agent/.ot /home/agent/.claude /home/agent/.codex \
-    && chown -R agent:agent /home/agent \
-    && for user in \
-      ot-review-final \
-      ot-review-selector \
-      ot-review-correctness \
-      ot-review-tests \
-      ot-review-reliability \
-      ot-review-agent-native \
-      ot-review-security \
-      ot-review-data \
-      ot-review-performance \
-      ot-review-standards \
-      ot-review-validator; do \
-        useradd --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group "$user"; \
-      done
+    && chown -R agent:agent /home/agent
 
 # ---------------------------------------------------------------------------
 # OpenThrottle payload. Build context is the repo root:
-#   - entrypoint.sh, runner/, safety/ live under sandbox/
-#   - skills/ lives at the repo root (shared with the CLI's snapshot builder)
+#   - entrypoint.sh, runner/, hooks/, and bin/ live under sandbox/
+#   - the platform fence lives under skills/ at the repo root
 # ---------------------------------------------------------------------------
 RUN mkdir -p /opt/openthrottle
 COPY sandbox/entrypoint.sh /opt/openthrottle/entrypoint.sh
 COPY sandbox/runner /opt/openthrottle/runner
-COPY sandbox/lib /opt/openthrottle/lib
-COPY sandbox/safety /opt/openthrottle/safety
 COPY sandbox/hooks /opt/openthrottle/hooks
 COPY sandbox/bin/ot-activity.mjs /usr/local/bin/ot-activity
 COPY sandbox/bin/ot-result.mjs /opt/openthrottle/bin/ot-result.mjs
-COPY sandbox/bin/ot-stage-result.mjs /opt/openthrottle/bin/ot-stage-result.mjs
-COPY sandbox/bin/ot-subject-post.mjs /opt/openthrottle/bin/ot-subject-post.mjs
-COPY supervisor/pipelines/runtime-capabilities-v1.json /opt/openthrottle/runtime-capabilities.json
-COPY skills /opt/openthrottle/skills
-COPY .openthrottle /opt/openthrottle/definitions
+COPY skills/codex/AGENTS-fragment.md /opt/openthrottle/skills/codex/AGENTS-fragment.md
 COPY contracts/generated/runtime /opt/openthrottle/generated/runtime
 COPY contracts/generated/provider-schemas /opt/openthrottle/generated/provider-schemas
 COPY contracts/generated/artifact-set.json /opt/openthrottle/generated/artifact-set.json
@@ -137,29 +94,15 @@ RUN set -eux; \
 # discovery root. Claude, Codex, and OpenCode therefore see the same catalog,
 # and references remain native progressive-disclosure files rather than prompt
 # text.
-RUN chown -R root:root /opt/openthrottle/definitions /opt/openthrottle/generated \
-    && chmod -R a-w /opt/openthrottle/definitions /opt/openthrottle/generated
+RUN chown -R root:root /opt/openthrottle/generated \
+    && chmod -R a-w /opt/openthrottle/generated
 
 RUN chmod 0755 /opt/openthrottle/entrypoint.sh \
-    && chmod 0755 /opt/openthrottle/lib/runtime.sh \
     && chmod 0755 /opt/openthrottle/runner/*.mjs \
     && chmod 0755 /usr/local/bin/ot-activity \
     && chmod 0755 /opt/openthrottle/bin/ot-result.mjs \
     && ln -s /opt/openthrottle/bin/ot-result.mjs /usr/local/bin/ot-result \
-    && chmod 0755 /opt/openthrottle/bin/ot-stage-result.mjs \
-    && ln -s /opt/openthrottle/bin/ot-stage-result.mjs /usr/local/bin/ot-stage-result \
-    && chmod 0755 /opt/openthrottle/bin/ot-subject-post.mjs \
-    && ln -s /opt/openthrottle/bin/ot-subject-post.mjs /usr/local/bin/ot-subject-post \
-    && chmod 0755 /opt/openthrottle/safety/pre-push \
-      /opt/openthrottle/safety/enforce-stage-push-policy \
-      /opt/openthrottle/safety/seal.sh \
-      /opt/openthrottle/hooks/ot-inbox-drain.sh
-
-# The advertised runtime descriptor is generated independently by the
-# supervisor catalog build. Refuse to publish an image whose installed
-# executor registry does not match that pinned evidence exactly.
-RUN node /opt/openthrottle/runner/capabilities.mjs \
-      --verify /opt/openthrottle/runtime-capabilities.json
+    && chmod 0755 /opt/openthrottle/hooks/ot-inbox-drain.sh
 
 WORKDIR /home/agent
 

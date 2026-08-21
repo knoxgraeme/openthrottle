@@ -225,14 +225,15 @@ callers once verified.
 
 ## Phase 5 (gated on product decision) — sandbox debugging access
 
-Only if the agent should debug deployed apps (Fly CLI, observability MCP
-servers). This deliberately amends security invariant 1.
+Only if the agent should debug deployed apps (Fly CLI or a future sealed
+observability capability). This deliberately amends security invariant 1.
 
 1. **Daytona org-level secrets** carry static integration credentials
-   (Fly token, Sentry/MCP keys), injected at sandbox creation. Per-run
+   (Fly token or Sentry keys), injected at sandbox creation. Per-run
    values (`RUN_CALLBACK_TOKEN`, task env, agent auth selection) stay on the
-   supervisor's `updateEnv` path. This also gives `.openthrottle.yml`
-   `mcp_servers` a credential channel (configs reference env var names).
+   supervisor's `updateEnv` path. Any future external-tool channel requires a
+   new sealed least-authority contract; repository configuration does not
+   declare MCP servers.
 2. **Scoped tokens only:** Fly app-scoped read-only tokens
    (`fly tokens create`), never org tokens.
 3. **Housekeeping:** add Fly token shapes (`FlyV1 `, `fm2_`) to both

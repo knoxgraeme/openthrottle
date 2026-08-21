@@ -4,7 +4,6 @@ import { join, resolve } from "node:path";
 import * as p from "@clack/prompts";
 import {
   validateFilesystemConfigContract,
-  type ConfigMcpServer,
   type Engine,
   type FilesystemConfigContract,
 } from "@openthrottle/contracts";
@@ -44,7 +43,6 @@ export interface ProjectConfig {
   commands?: Record<string, string>;
   post_bootstrap?: string[];
   limits?: FilesystemConfigContract["limits"];
-  mcp_servers?: Record<string, ConfigMcpServer>;
 }
 
 export interface RepositoryTarget {
@@ -340,7 +338,6 @@ export async function promptConfig(
         max_turns: Number(result.max_turns) || 200,
         task_timeout: Number(result.task_timeout) || 7_200,
       },
-      mcp_servers: {},
     },
     registration,
   };
@@ -356,7 +353,6 @@ export function projectConfigDocument(config: ProjectConfig): FilesystemConfigCo
     ...(config.commands === undefined ? {} : { commands: config.commands }),
     ...(config.post_bootstrap === undefined ? {} : { post_bootstrap: config.post_bootstrap }),
     ...(config.limits === undefined ? {} : { limits: config.limits }),
-    ...(config.mcp_servers === undefined ? {} : { mcp_servers: config.mcp_servers }),
   }, { source: ".openthrottle/config.yml" }).value;
 }
 

@@ -1,6 +1,10 @@
 import type { Config } from "../../app/config.js";
-import type { SupervisorStore } from "../../persistence/store.js";
-import type { Agent } from "../../pipeline/types.js";
+import type { Engine } from "@openthrottle/contracts";
+
+export interface CodexAuthStore {
+  getSetting(key: string): string | undefined;
+  setSetting(key: string, value: string): void;
+}
 
 /**
  * Durable Codex subscription auth: the supervisor as sole refresh authority.
@@ -11,9 +15,8 @@ import type { Agent } from "../../pipeline/types.js";
  * away — the shared subscription account's live refresh token underneath every
  * concurrent run, and the rotated result would die with the ephemeral sandbox.
  *
- * So the refresh token never leaves this process. Mirroring how
- * `linear-auth.ts` handles Linear's rotating OAuth token, the SQLite `settings`
- * store — not the env var — is the source of truth; `CODEX_AUTH_JSON` is a
+ * So the refresh token never leaves this process. The SQLite `settings` store
+ * — not the env var — is the source of truth; `CODEX_AUTH_JSON` is a
  * one-time bootstrap seed adopted only into an empty store (or when an operator
  * re-logs-in with a strictly newer `last_refresh`).
  *
@@ -97,7 +100,7 @@ function codexLastRefreshMs(blob: string | undefined): number | undefined {
  * operator re-logs-in and supplies a strictly newer `last_refresh` (recovering
  * a lineage that has been fully spent).
  */
-export function resolveStoredCodexAuthJson(cfg: Config, store: SupervisorStore): string | undefined {
+export function resolveStoredCodexAuthJson(cfg: Config, store: CodexAuthStore): string | undefined {
   const stored = store.getSetting(SETTINGS_CODEX_AUTH_JSON);
   const seed = cfg.codexAuthJson;
   if (!stored) {
@@ -268,7 +271,7 @@ export async function refreshCodexAuthJson(
 // One in-flight refresh per store (i.e. per supervisor process, one shared
 // account): concurrent seed requests coalesce onto the same promise so they
 // never spend the same refresh token twice.
-const refreshInFlight = new WeakMap<SupervisorStore, Promise<string>>();
+const refreshInFlight = new WeakMap<object, Promise<string>>();
 
 /**
  * The single boundary between the stored blob and a sandbox. The seeded copy
@@ -314,7 +317,7 @@ function stripRefreshTokenForSeed(blob: string): string {
  */
 export async function getCodexAuthForSeed(
   cfg: Config,
-  store: SupervisorStore,
+  store: CodexAuthStore,
   actionTimeoutMs?: number
 ): Promise<string | undefined> {
   const current = resolveStoredCodexAuthJson(cfg, store);
@@ -367,43 +370,25 @@ export async function getCodexAuthForSeed(
   return stripRefreshTokenForSeed(seedable);
 }
 
-export function createCredentialMaterializer(cfg: Config, store: SupervisorStore) {
+/** Fresh-kernel credential broker: exact engine in, sandbox-safe env out. */
+export function createKernelCredentialMaterializer(
+  cfg: Config,
+  store: CodexAuthStore,
+) {
   return async (
-    resource: { providerResourceId: string },
-    scopes: readonly string[],
-    agentOverride?: Agent,
-    actionTimeoutMs?: number
-  ): Promise<{ env: Record<string, string> }> => {
-    const ticket = store.getBySandboxId(resource.providerResourceId);
-    if (!ticket) throw new Error(`runtime resource ${resource.providerResourceId} has no ticket binding`);
-    // A loop action may declare its own engine independent of the ticket's
-    // default (e.g. a Codex action inside a Claude ticket); the caller passes
-    // that action-scoped agent explicitly so the right concrete secret is
-    // selected instead of always defaulting to the ticket's own agent.
-    const agent = agentOverride ?? ticket.agent;
-    const requested = new Set(scopes);
-    const env: Record<string, string> = {};
-    // repo.write authorizes mutations inside the executor-owned worktree; it
-    // no longer conveys remote GitHub write authority. Remote ref creation,
-    // checkpoints, and publication are supervisor-owned durable effects.
-    if (requested.has("repo.write") || requested.has("repo.read") || requested.has("provider.read")) {
-      env.GITHUB_TOKEN = cfg.githubReadToken;
+    engine: Engine,
+    actionTimeoutMs?: number,
+  ): Promise<Record<string, string>> => {
+    if (engine === "claude") {
+      if (!cfg.claudeCodeOauthToken) throw new Error("model credential for claude is unavailable");
+      return { CLAUDE_CODE_OAUTH_TOKEN: cfg.claudeCodeOauthToken };
     }
-    if (requested.has("model.invoke")) {
-      const claudeCredential = cfg.claudeCodeOauthToken;
-      const openCodeCredential = cfg.kimiCodeApiKey;
-      if (agent === "claude" && claudeCredential) {
-        env.CLAUDE_CODE_OAUTH_TOKEN = claudeCredential;
-      } else if (agent === "codex") {
-        const codexCredential = await getCodexAuthForSeed(cfg, store, actionTimeoutMs);
-        if (!codexCredential) throw new Error("model credential for codex is unavailable");
-        env.CODEX_AUTH_JSON = codexCredential;
-      } else if (agent === "opencode" && openCodeCredential) {
-        env.KIMI_CODE_API_KEY = openCodeCredential;
-      } else {
-        throw new Error(`model credential for ${agent} is unavailable`);
-      }
+    if (engine === "codex") {
+      const credential = await getCodexAuthForSeed(cfg, store, actionTimeoutMs);
+      if (!credential) throw new Error("model credential for codex is unavailable");
+      return { CODEX_AUTH_JSON: credential };
     }
-    return { env };
+    if (!cfg.kimiCodeApiKey) throw new Error("model credential for opencode is unavailable");
+    return { KIMI_CODE_API_KEY: cfg.kimiCodeApiKey };
   };
 }

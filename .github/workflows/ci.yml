@@ -46,16 +46,8 @@ jobs:
         run: |
           npm run build --prefix supervisor
           npm run build --prefix cli
-      - name: Verify pipeline docs are regenerated
-        run: |
-          npm run docs:pipelines --prefix supervisor
-          git add --intent-to-add -- docs/pipelines
-          git diff --exit-code -- docs/pipelines
-      - name: Verify supervisor architecture, catalog, runtime, and adapter parity
-        run: |
-          npm run verify:v12-deploy-proof --prefix supervisor
-          npm test --prefix supervisor -- src/__tests__/architecture.test.ts src/pipeline/manifest.test.ts src/pipeline/stage-request.test.ts src/runtime/contracts.test.ts
-          npm test --prefix sandbox -- runner/capabilities.test.mjs tests/ce-adapters.test.mjs
+      - name: Verify clean execution-kernel architecture
+        run: npm test --prefix supervisor -- src/__tests__/architecture.test.ts
       - name: Test
         run: |
           npm test --prefix contracts
@@ -96,7 +88,7 @@ jobs:
         run: docker build -f sandbox/Dockerfile -t openthrottle:test .
       - name: Exercise sandbox lifecycle with stub agent
         run: sandbox/tests/smoke.sh openthrottle:test
-      - name: Prove automatic admission and the reused structured lifecycle
-        run: node sandbox/tests/automatic-walking-skeleton.mjs openthrottle:test
-      - name: Prove Claude registers its slash-command skill set
-        run: sandbox/tests/skill-registration-probe.sh openthrottle:test
+      - name: Prove supervisor kernel settlement through the sandbox transport
+        run: node supervisor/scripts/kernel-sandbox-e2e.mjs openthrottle:test
+      - name: Prove structured checkpoint integration on the shared kernel
+        run: node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test

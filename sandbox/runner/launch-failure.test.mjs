@@ -7,7 +7,6 @@ import {
   isUnregisteredCommandResult,
   launchDiagnosticTail,
 } from "./launch-failure.mjs";
-import { classifyAgentExecutionFailure } from "./execute-stage.mjs";
 
 // Shaped like a real Claude Code stream-json line. The status is what decides
 // the classification: `allowed` and `allowed_warning` are served requests.
@@ -291,81 +290,5 @@ describe("launch diagnostic tail", () => {
     });
     expect(tail).not.toContain("subtype=init");
     expect(tail).toContain("stderr: engine crashed");
-  });
-});
-
-describe("agent stage failure summaries", () => {
-  it("names the reason, the remediation, and the sanitized diagnostic", () => {
-    const classified = classifyAgentExecutionFailure({
-      agent: "claude",
-      termination: "exit=1",
-      diagnostic: launchDiagnosticTail({
-        stdout: "Invalid API key · Please run /login (token sk-ant-oat01-leaked)",
-        stderr: "",
-        env: { CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-leaked" },
-      }),
-      terminated: false,
-      missingProposal: true,
-      stdout: "Invalid API key · Please run /login",
-      stderr: "",
-      credentialPresent: true,
-    });
-    expect(classified.reason).toBe("credential_rejected");
-    expect(classified.credentialFailure).toBe(true);
-    expect(classified.suggestedOutcome).toBe("retryable_infrastructure_failure");
-    expect(classified.summary).toContain("Agent exited without the required terminal stage proposal");
-    expect(classified.summary).toContain("reason=credential_rejected");
-    expect(classified.summary).toContain("Executor diagnostic: stdout: Invalid API key");
-    expect(classified.summary).not.toContain("sk-ant-oat01-leaked");
-  });
-
-  it("keeps an unclassified crash a plain failure and a terminated one retryable", () => {
-    const crash = {
-      agent: "claude",
-      termination: "exit=1",
-      diagnostic: "stderr: bus error",
-      stdout: "",
-      stderr: "bus error",
-      credentialPresent: true,
-    };
-    expect(classifyAgentExecutionFailure({ ...crash, terminated: false })).toMatchObject({
-      reason: "engine_crash",
-      credentialFailure: false,
-      suggestedOutcome: "failure",
-    });
-    expect(classifyAgentExecutionFailure({ ...crash, terminated: true }).suggestedOutcome)
-      .toBe("retryable_infrastructure_failure");
-  });
-
-  it("keeps a rate-limited stage out of the semantic repair budget", () => {
-    const classified = classifyAgentExecutionFailure({
-      agent: "claude",
-      termination: "exit=1",
-      diagnostic: `stdout: ${claudeRateLimitLine("rejected")}`,
-      terminated: false,
-      missingProposal: true,
-      stdout: claudeRateLimitLine("rejected"),
-      stderr: "",
-      credentialPresent: true,
-    });
-    expect(classified).toMatchObject({
-      reason: "rate_limited",
-      credentialFailure: false,
-      suggestedOutcome: "retryable_infrastructure_failure",
-    });
-  });
-
-  it("still reports the Codex refresh-token remediation for an expired seed", () => {
-    const classified = classifyAgentExecutionFailure({
-      agent: "codex",
-      termination: "exit=1",
-      diagnostic: "stderr: 401 Unauthorized refresh_token_invalidated on /backend-api/codex/responses",
-      terminated: false,
-      missingProposal: true,
-      credentialPresent: true,
-    });
-    expect(classified.reason).toBe("credential_rejected");
-    expect(classified.credentialFailure).toBe(true);
-    expect(classified.summary).toContain("Model credential expired - refresh CODEX_AUTH_JSON");
   });
 });

@@ -1,5 +1,6 @@
 import {
   canonicalJson,
+  compareCodeUnits,
   definitionEntryContentHash,
   digestCanonicalJson,
   validateEvalDefinition,
@@ -11,12 +12,14 @@ import {
   type DefinitionBundleEntry,
   type ExecutionRecord,
 } from "@openthrottle/contracts";
-import type {
-  KernelActionContext,
-  KernelAgentAction,
-  KernelExecutableAction,
-  KernelResultCorrectionRequest,
-  KernelWorkActionRequest,
+import {
+  KERNEL_ACTION_REQUEST_SCHEMA,
+  KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA,
+  type KernelActionContext,
+  type KernelAgentAction,
+  type KernelExecutableAction,
+  type KernelResultCorrectionRequest,
+  type KernelWorkActionRequest,
 } from "../../runtime/kernel-contracts.js";
 import {
   canonicalAttemptContextIds,
@@ -24,11 +27,9 @@ import {
   type KernelAttempt,
   type AttemptScope,
 } from "./types.js";
+import { resolveKernelRuntimeResourceIdentity } from "./runtime-resource.js";
 
 const REQUEST_SEAL_SCHEMA = "openthrottle.kernel-request-seal/v1" as const;
-const KERNEL_ACTION_REQUEST_SCHEMA = "openthrottle.kernel-action-request/v1" as const;
-const KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA =
-  "openthrottle.kernel-result-correction-request/v1" as const;
 const MAX_TASK_PROMPT_BYTES = 512 * 1024;
 
 export interface KernelActionInputs {
@@ -40,10 +41,6 @@ interface ActionSelection {
   stage: CompiledPipelineStage;
   action: KernelExecutableAction;
   definition_hashes: readonly string[];
-}
-
-function compareCodeUnits(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function assertTaskPrompt(value: string): string {
@@ -115,12 +112,26 @@ function stageFor(
 function selectAgentAction(
   bundle: DefinitionBundle,
   stage: Extract<CompiledPipelineStage, { kind: "agent" }>,
+  scope: AttemptScope,
 ): ActionSelection {
+  const config = configEntry(bundle);
+  const parsedConfig = validateFilesystemConfigContract(config.normalized_payload, {
+    source: "definition_bundle.config",
+  }).value;
+  if (parsedConfig.engine !== stage.engine) {
+    throw new Error(`agent stage ${stage.id} engine differs from its sealed config`);
+  }
   const agent = exactEntry(bundle, "agent", stage.agent_id);
   if (typeof agent.normalized_payload !== "string" || agent.normalized_payload.trim().length === 0) {
     throw new Error(`agent ${stage.agent_id} has invalid sealed instructions`);
   }
-  const skills = stage.skills.map((id) => exactEntry(bundle, "skill", id));
+  const selectedSkillIds = scope.kind === "fanout_member"
+    ? [scope.member_id]
+    : [...stage.skills];
+  if (selectedSkillIds.some((id) => !stage.skills.includes(id))) {
+    throw new Error(`fanout member is not a sealed skill of agent stage ${stage.id}`);
+  }
+  const skills = selectedSkillIds.map((id) => exactEntry(bundle, "skill", id));
   const evaluation = exactEntry(bundle, "eval", stage.eval);
   const evalDefinition = validateEvalDefinition(evaluation.normalized_payload, {
     source: `definition_bundle.eval:${stage.eval}`,
@@ -129,9 +140,13 @@ function selectAgentAction(
   const action: KernelAgentAction = {
     kind: "agent",
     engine: stage.engine,
+    model: parsedConfig.model ?? null,
+    reasoning_effort: parsedConfig.reasoning_effort ?? null,
     agent_id: stage.agent_id,
-    skill_ids: [...stage.skills],
-    entry_skill: stage.entry_skill ?? null,
+    skill_ids: selectedSkillIds,
+    entry_skill: scope.kind === "fanout_member"
+      ? scope.member_id
+      : stage.entry_skill ?? null,
     eval_id: stage.eval,
     semantic_result_schema: evalDefinition.result,
     definition_entries: selected,
@@ -139,7 +154,7 @@ function selectAgentAction(
   return {
     stage,
     action,
-    definition_hashes: selected.map(({ definition_kind, definition_id, content_hash }) =>
+    definition_hashes: [config, ...selected].map(({ definition_kind, definition_id, content_hash }) =>
       `${definition_kind}:${definition_id}:${content_hash}`),
   };
 }
@@ -168,7 +183,7 @@ export function selectKernelAction(input: {
 }): ActionSelection {
   assertBundleIdentity(input.bundle, input.manifest, input.attempt);
   const stage = stageFor(input.manifest, input.attempt.scope.stage_id);
-  if (stage.kind === "agent") return selectAgentAction(input.bundle, stage);
+  if (stage.kind === "agent") return selectAgentAction(input.bundle, stage, input.attempt.scope);
   if (stage.kind === "command") return selectCommandAction(input.bundle, stage);
   throw new Error(`stage ${stage.id} is ${stage.kind}; U7 delegates it to the effect/runtime-resource worker`);
 }
@@ -247,6 +262,7 @@ function requestSeal(input: {
     input_subject: input.input_subject,
     context: input.action_inputs.context,
   });
+  const runtimeResource = resolveKernelRuntimeResourceIdentity(input.action_inputs.context.records);
   return {
     schema: REQUEST_SEAL_SCHEMA,
     pipeline_run_id: input.pipeline_run_id,
@@ -260,6 +276,8 @@ function requestSeal(input: {
       ? {
         kind: "agent",
         engine: input.selection.action.engine,
+        model: input.selection.action.model,
+        reasoning_effort: input.selection.action.reasoning_effort,
         agent_id: input.selection.action.agent_id,
         skill_ids: input.selection.action.skill_ids,
         entry_skill: input.selection.action.entry_skill,
@@ -269,6 +287,7 @@ function requestSeal(input: {
     definition_hashes: [...input.selection.definition_hashes].sort(compareCodeUnits),
     task_prompt: assertTaskPrompt(input.action_inputs.task_prompt),
     context: canonicalContext(input.action_inputs.context),
+    runtime_resource: runtimeResource,
     change_boundary: boundary,
     executor_policy: {
       git_administration: "executor_only",
@@ -411,6 +430,7 @@ export function createPendingKernelAttempt(input: {
     lease: null,
     checkpoint_id: null,
     result_record_id: null,
+    decision_record_id: null,
     pending_result: null,
   };
 }
@@ -476,6 +496,7 @@ export function buildKernelWorkActionRequest(input: {
     worker_id: attempt.lease.worker_id,
     task_prompt: assertTaskPrompt(input.action_inputs.task_prompt),
     context: input.action_inputs.context,
+    runtime_resource: resolveKernelRuntimeResourceIdentity(input.action_inputs.context.records),
     change_boundary: changeBoundary({
       stage: selection.stage,
       input_subject: attempt.input_subject,
@@ -522,6 +543,9 @@ export function buildKernelResultCorrectionRequest(input: {
   return {
     schema: KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA,
     phase: "result_correction",
+    engine: selection.action.engine,
+    model: selection.action.model,
+    reasoning_effort: selection.action.reasoning_effort,
     pipeline_run_id: attempt.pipeline_run_id,
     attempt_id: attempt.id,
     stage_id: attempt.scope.stage_id,
@@ -530,6 +554,7 @@ export function buildKernelResultCorrectionRequest(input: {
     definition_bundle_hash: attempt.definition_bundle_hash,
     input_subject: attempt.input_subject,
     locked_subject: lockedSubject,
+    completed_work_authority: attempt.repository_authority,
     checkpoint_id: checkpoint.id,
     native_session_id: attempt.native_session_id,
     lease_id: attempt.lease.id,
@@ -542,10 +567,6 @@ export function buildKernelResultCorrectionRequest(input: {
     mcp: false,
     provider_access: false,
   };
-}
-
-export function canonicalKernelActionRequest(request: KernelWorkActionRequest): string {
-  return canonicalJson(request);
 }
 
 export function exactKernelContext(input: {

@@ -33,7 +33,6 @@ import setup, {
   fallbackSecretLines,
   LOCAL_SECRET_KEYS,
   parseSetupArgs,
-  renderLegacyChecklist,
   SUPERVISOR_SECRET_CHECKLIST,
   type SetupCommandOptions,
   type SetupPromptApi,
@@ -306,14 +305,14 @@ function allOutput(h: { output: string[] }): string {
 
 describe("setup argument parsing", () => {
   it("parses the documented flags and rejects unknown ones", () => {
-    expect(parseSetupArgs([])).toEqual({ profile: "default", check: false, yes: false, legacyChecklist: false });
-    expect(parseSetupArgs(["--profile", "staging", "--check", "--yes", "--legacy-checklist"])).toEqual({
+    expect(parseSetupArgs([])).toEqual({ profile: "default", check: false, yes: false });
+    expect(parseSetupArgs(["--profile", "staging", "--check", "--yes"])).toEqual({
       profile: "staging",
       check: true,
       yes: true,
-      legacyChecklist: true,
     });
     expect(() => parseSetupArgs(["--profile"])).toThrow(/--profile requires/);
+    expect(() => parseSetupArgs(["--legacy-checklist"])).toThrow(/Unknown setup option/);
     expect(() => parseSetupArgs(["--bogus"])).toThrow(/Unknown setup option/);
   });
 
@@ -326,43 +325,20 @@ describe("setup argument parsing", () => {
   });
 });
 
-describe("setup --legacy-checklist", () => {
-  it("prints the corrected checklist from the single source-of-truth table and exits 0", async () => {
-    const h = harness();
-    await setup(["--legacy-checklist"], h.options);
-
-    const text = logged.join("\n");
-    // Corrected v1: OT_DEPLOY_TOKEN present; deploy-owned fly.toml [env] values absent.
-    expect(text).toContain('fly secrets set OT_DEPLOY_TOKEN="<value>"');
-    expect(text).not.toContain("fly secrets set DATABASE_PATH");
-    expect(text).not.toContain("fly secrets set PORT");
-    for (const name of [
-      "SUPERVISOR_URL",
-      "OT_STATUS_TOKEN",
-      "OT_INSTALL_SECRET",
-      "GITHUB_WEBHOOK_SECRET",
-      "GITHUB_TOKEN",
-      "GITHUB_READ_TOKEN",
-      "DAYTONA_API_KEY",
-      "DAYTONA_SNAPSHOT",
-    ]) {
-      expect(text).toContain(`fly secrets set ${name}="<value>"`);
-    }
-    expect(text).toMatch(/SUPERVISOR_URL.*derivable/);
-    expect(text).toMatch(/DAYTONA_SNAPSHOT.*derivable/);
-    expect(text).toMatch(/GITHUB_TOKEN.*operator-owned/);
-    expect(text).toMatch(/OT_STATUS_TOKEN.*generatable/);
-    expect(process.exitCode ?? 0).toBe(0);
-    // The checklist never enters the guided flow.
-    expect(h.catalogDeps).toHaveLength(0);
-    expect(renderLegacyChecklist().join("\n")).toBe(text);
-  });
-
-  it("keeps the checklist table itself free of deploy-owned env vars", () => {
+describe("setup credential inventory", () => {
+  it("contains only current setup credentials, not deploy-owned or retired configuration", () => {
     const names = SUPERVISOR_SECRET_CHECKLIST.map((entry) => entry.name);
     expect(names).toContain("OT_DEPLOY_TOKEN");
+    expect(names).toContain("LINEAR_WEBHOOK_SECRET");
+    expect(names).not.toContain("OT_INSTALL_SECRET");
+    expect(names).not.toContain("LINEAR_CLIENT_ID");
+    expect(names).not.toContain("LINEAR_CLIENT_SECRET");
     expect(names).not.toContain("DATABASE_PATH");
     expect(names).not.toContain("PORT");
+    expect(names).not.toContain("DEFAULT_AGENT");
+    expect(names).not.toContain("SANDBOX_EVENT_POLL_INTERVAL_MS");
+    expect(names).not.toContain("ORPHAN_GRACE_MINUTES");
+    expect(names).not.toContain("ALLOW_LINEAR_MERGE");
   });
 });
 
@@ -448,7 +424,9 @@ describe("setup full run", () => {
 
     const text = allOutput(h);
     expect(text).toContain("Supervisor ready at https://openthrottle-supervisor.fly.dev");
-    expect(text).toContain("/oauth/install");
+    expect(text).not.toContain("/oauth/install");
+    expect(text).not.toContain("LINEAR_CLIENT_ID");
+    expect(text).not.toContain("LINEAR_CLIENT_SECRET");
     expect(text).toContain("openthrottle init");
     expect(text).toContain(h.secretStore.pathFor("default"));
     expect(text).toContain(h.supervisorAccessStore.pathFor("default"));
@@ -496,7 +474,7 @@ describe("setup full run", () => {
       evidence: evidence(
         "needs_action",
         "operator",
-        "secrets: 8/10 set (missing: DAYTONA_API_KEY, GITHUB_TOKEN)",
+        "secrets: 7/9 set (missing: DAYTONA_API_KEY, GITHUB_TOKEN)",
         { recoveryAction: "flyctl secrets set --app openthrottle-supervisor DAYTONA_API_KEY=... GITHUB_TOKEN=..." }
       ),
     };
@@ -556,7 +534,7 @@ describe("setup full run", () => {
     const secretStore = new LocalFileSecretStore({ root: secretRoot, allowedKeys: LOCAL_SECRET_KEYS, env: {} });
     const supervisorAccessStore = new LocalSupervisorAccessStore(accessRoot);
     await secretStore.set("default", "status_token", "SENTINEL_STATUS_TOKEN_VALUE");
-    await secretStore.set("default", "install_secret", "SENTINEL_INSTALL_SECRET_VALUE");
+    await secretStore.set("default", "linear_webhook_secret", "SENTINEL_LINEAR_WEBHOOK_SECRET_VALUE");
     const secretPath = secretStore.pathFor("default");
     const originalSecretDocument = readFileSync(secretPath, "utf8");
     const profileStore = new FileProfileStore(profileRoot);
@@ -566,11 +544,11 @@ describe("setup full run", () => {
     expect(process.exitCode ?? 0).toBe(0);
     const text = allOutput(h);
     expect(text).not.toContain("SENTINEL_STATUS_TOKEN_VALUE");
-    expect(text).not.toContain("SENTINEL_INSTALL_SECRET_VALUE");
+    expect(text).not.toContain("SENTINEL_LINEAR_WEBHOOK_SECRET_VALUE");
     expect(text).toContain(secretPath);
     const profileJson = readFileSync(join(profileRoot, "default.json"), "utf8");
     expect(profileJson).not.toContain("SENTINEL_STATUS_TOKEN_VALUE");
-    expect(profileJson).not.toContain("SENTINEL_INSTALL_SECRET_VALUE");
+    expect(profileJson).not.toContain("SENTINEL_LINEAR_WEBHOOK_SECRET_VALUE");
     expect(profileJson).toContain("daytona_snapshot");
     expect(readFileSync(secretPath, "utf8")).toBe(originalSecretDocument);
     expect(originalSecretDocument).not.toContain("supervisor_url");

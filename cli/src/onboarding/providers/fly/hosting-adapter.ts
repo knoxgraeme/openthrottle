@@ -10,6 +10,7 @@ import { randomBytes } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { compareCodeUnits } from "@openthrottle/contracts";
 import type {
   AdapterContext,
   HostingEnsureResult,
@@ -90,7 +91,6 @@ interface RequiredSecret {
 const REQUIRED_SUPERVISOR_SECRETS: readonly RequiredSecret[] = sortedByKey([
   { key: "OT_STATUS_TOKEN", owner: "cli", refName: "status_token" },
   { key: "OT_DEPLOY_TOKEN", owner: "provisioning", refName: "deploy_token" },
-  { key: "OT_INSTALL_SECRET", owner: "provisioning", refName: "install_secret" },
   { key: "LINEAR_WEBHOOK_SECRET", owner: "provisioning", refName: "linear_webhook_secret" },
   { key: "GITHUB_WEBHOOK_SECRET", owner: "provisioning", refName: "github_webhook_secret" },
   { key: "GITHUB_TOKEN", owner: "operator", refName: "github_token" },
@@ -101,7 +101,7 @@ const REQUIRED_SUPERVISOR_SECRETS: readonly RequiredSecret[] = sortedByKey([
 ]);
 
 function sortedByKey(required: RequiredSecret[]): RequiredSecret[] {
-  return required.sort((left, right) => left.key.localeCompare(right.key));
+  return required.sort((left, right) => compareCodeUnits(left.key, right.key));
 }
 
 function requiredSecretsFromBundle(bundle: SupervisorDeploymentBundle): RequiredSecret[] {

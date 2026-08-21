@@ -157,7 +157,6 @@ describe("setup orchestrator", () => {
       "GITHUB_WEBHOOK_SECRET",
       "LINEAR_WEBHOOK_SECRET",
       "OT_DEPLOY_TOKEN",
-      "OT_INSTALL_SECRET",
       "OT_STATUS_TOKEN",
     ]);
     expect(hosting.bundles.at(-1)?.secrets.OT_DEPLOY_TOKEN).toEqual({ owner: "provisioning", name: "deploy_token" });
@@ -165,7 +164,6 @@ describe("setup orchestrator", () => {
     expect(hosting.bundles.at(-1)?.secrets.GITHUB_READ_TOKEN).toEqual({ owner: "operator", name: "github_read_token" });
     expect(hosting.bundles.at(-1)?.secrets.DAYTONA_API_KEY).toEqual({ owner: "operator", name: "daytona_api_key" });
     expect(JSON.stringify(store.profile)).not.toContain("daytona_api_key");
-    expect(JSON.stringify(store.profile)).not.toContain("install_secret");
     expect(JSON.stringify(store.profile)).not.toContain("deploy_token");
     expect(JSON.stringify(store.profile)).not.toContain("github_token");
     expect(JSON.stringify(store.profile)).not.toContain("github_read_token");

@@ -65,6 +65,34 @@ function insertResult(db: Database.Database, id = "result-1", attemptId = "attem
 }
 
 describe("fresh epoch schema ownership", () => {
+  it("does not let INSERT OR REPLACE bypass immutable settings", () => {
+    const db = database();
+    try {
+      const insert = db.prepare(`
+        INSERT INTO settings (key, value_json, value_type, mutable, version, updated_at)
+        VALUES (?, ?, 'string', ?, 0, ?)
+      `);
+      insert.run("immutable", '"original"', 0, NOW);
+      insert.run("mutable", '"original"', 1, NOW);
+
+      expect(() => db.prepare(`
+        INSERT OR REPLACE INTO settings (key, value_json, value_type, mutable, version, updated_at)
+        VALUES ('immutable', '"replaced"', 'string', 0, 1, ?)
+      `).run(NOW)).toThrow(/immutable setting/);
+      expect(db.prepare("SELECT value_json FROM settings WHERE key = 'immutable'").get())
+        .toEqual({ value_json: '"original"' });
+
+      db.prepare(`
+        INSERT OR REPLACE INTO settings (key, value_json, value_type, mutable, version, updated_at)
+        VALUES ('mutable', '"replaced"', 'string', 1, 1, ?)
+      `).run(NOW);
+      expect(db.prepare("SELECT value_json FROM settings WHERE key = 'mutable'").get())
+        .toEqual({ value_json: '"replaced"' });
+    } finally {
+      db.close();
+    }
+  });
+
   it("owns exactly twelve tables and keeps definitions to the five-field composite identity", () => {
     const db = database();
     try {
@@ -84,6 +112,12 @@ describe("fresh epoch schema ownership", () => {
         SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'definitions_identity_idx'
       `).get() as { sql: string };
       expect(identityIndex.sql).toContain("ifnull(source_commit, '')");
+      const inboxGroupIndex = db.prepare(`
+        SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'inbox_events_group_idx'
+      `).get() as { sql: string };
+      expect(inboxGroupIndex.sql.replace(/\s+/g, " ")).toContain(
+        "source_provider, event_group_key, delivery_attempt, created_at, id",
+      );
 
       const insert = db.prepare(`
         INSERT INTO definitions (
@@ -212,6 +246,65 @@ describe("fresh epoch schema ownership", () => {
       insert.run("checkpoint-2", "attempt-2", OTHER_HASH, HASH, HASH, SHA, NOW);
       expect(db.prepare("SELECT COUNT(*) AS count FROM checkpoints WHERE semantic_key = 'native-session'").get())
         .toEqual({ count: 2 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("binds attempt and effect pointers to the exact record kind and owner", () => {
+    const db = database();
+    try {
+      seedRun(db);
+      db.prepare(`
+        INSERT INTO attempts (
+          id, pipeline_run_id, scope_kind, stage_id, repository_authority,
+          request_hash, definition_bundle_hash, input_subject,
+          context_record_ids_json, context_checkpoint_ids_json, status, version,
+          work_retry_ordinal, result_correction_count, unmet_dependency_count,
+          created_at, updated_at
+        ) VALUES ('attempt-2', 'run', 'stage', 'verify', 'inspect', ?, ?, ?, '[]', '[]',
+          'work_complete', 0, 0, 0, 0, ?, ?)
+      `).run(OTHER_HASH, HASH, SHA, NOW, NOW);
+      insertResult(db, "result-2", "attempt-2");
+      db.prepare(`
+        INSERT INTO records (
+          id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+          inline_payload, reducer, input_record_ids_json, input_record_count, created_at
+        ) VALUES ('decision-1', 'run', 2, ?, 'decision', 'decision/v1', '{}',
+          'kernel', '["result-2"]', 1, ?)
+      `).run(OTHER_HASH, NOW);
+      db.prepare(`
+        INSERT INTO checkpoints (
+          id, pipeline_run_id, attempt_id, ordinal, checkpoint_hash, semantic_key,
+          request_hash, definition_bundle_hash, input_subject, payload_schema,
+          inline_payload, captured_at
+        ) VALUES ('checkpoint-2', 'run', 'attempt-2', 0, ?, 'attempt-2:0', ?, ?, ?,
+          'checkpoint/v1', '{}', ?)
+      `).run(HASH, OTHER_HASH, HASH, SHA, NOW);
+      db.prepare(`
+        INSERT INTO effects (
+          id, pipeline_run_id, decision_record_id, kind, idempotency_key,
+          target, payload_schema, inline_payload, intent_hash,
+          status, version, available_at, created_at, updated_at
+        ) VALUES ('effect-1', 'run', 'decision-1', 'github.publish@1', 'idem-1',
+          'owner/repo#1', 'effect/v1', '{}', ?, 'pending', 0, ?, ?, ?)
+      `).run(HASH, NOW, NOW, NOW);
+
+      expect(() => db.prepare(`
+        UPDATE attempts SET status = 'recorded', result_record_id = 'result-2'
+        WHERE id = 'attempt-1'
+      `).run()).toThrow(/FOREIGN KEY constraint/);
+      expect(() => db.prepare(`
+        UPDATE attempts SET status = 'settled', decision_record_id = 'result-2'
+        WHERE id = 'attempt-1'
+      `).run()).toThrow(/FOREIGN KEY constraint/);
+      expect(() => db.prepare(`
+        UPDATE attempts SET checkpoint_id = 'checkpoint-2' WHERE id = 'attempt-1'
+      `).run()).toThrow(/FOREIGN KEY constraint/);
+      expect(() => db.prepare(`
+        UPDATE effects SET status = 'acknowledged', delivery_record_id = 'result-2'
+        WHERE id = 'effect-1'
+      `).run()).toThrow(/FOREIGN KEY constraint/);
     } finally {
       db.close();
     }

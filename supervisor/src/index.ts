@@ -1,341 +1,329 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { digestCanonicalJson, type ExecutionRecordPayloadRegistry } from "@openthrottle/contracts";
 import { loadConfig } from "./app/config.js";
-import { createSupervisorStore } from "./persistence/store.js";
-import { openDb } from "./persistence/database.js";
+import { openKernelEpoch } from "./app/kernel-bootstrap.js";
+import {
+  VerifiedKernelDefinitionBundleResolver,
+  VerifiedKernelManifestResolver,
+} from "./app/kernel-composition.js";
+import { KernelControlService } from "./app/kernel-control.js";
+import { KernelHttpService, type KernelRepositorySetupPort } from "./app/kernel-http.js";
+import {
+  ADMISSION_PROMOTION_RECORD_PAYLOAD_CONTRACT,
+  ADMISSION_PROMOTION_RECORD_PAYLOAD_SCHEMA,
+  KernelAdmissionSettlementPlanner,
+} from "./app/kernel-admission-promotion.js";
+import { KernelAdmissionInboxHandler } from "./app/kernel-inbox-handler.js";
+import { KernelInboxRouter } from "./app/kernel-inbox-router.js";
+import { KernelProviderPromptHandler } from "./app/kernel-provider-prompt.js";
+import { loadKernelReleaseDefinitions } from "./app/kernel-release.js";
+import { KernelRuntimeSessionService } from "./app/kernel-runtime-session.js";
+import { KernelStructuredSettlementPlanner } from "./app/kernel-structured-planner.js";
 import { listen } from "./http/listener.js";
+import { createServer } from "./http/server.js";
 import {
-  createProviderAwareActivityPublisher,
-  createServer,
-  createServerWebhookDeliveryProcessor,
-} from "./http/server.js";
-import { runSweep } from "./operations/sweep.js";
-import { createLinearClientProvider } from "./providers/linear/auth.js";
-import { createCredentialMaterializer } from "./providers/codex/auth.js";
-import { pollSandboxEvents } from "./runtime/event-poller.js";
-import { deliverPendingInbox } from "./runtime/steering.js";
-import { reapStalledRuns } from "./operations/reaper.js";
-import { createLinearActivityPublisher, createLinearOutboxProcessor, enqueueSessionUpdate } from "./providers/linear/outbox.js";
-import { loadPipelineCatalog } from "./pipeline/manifest.js";
-import { createPipelineStore } from "./persistence/pipeline/create-store.js";
-import { createAnalysisStore } from "./persistence/pipeline/analysis-store.js";
-import { createCitationGateStore } from "./persistence/pipeline/citation-gate-store.js";
-import { createAdmissionDrainStore } from "./persistence/admission-drain-store.js";
-import { loadRuntimeCapabilityDescriptor } from "./runtime/contracts.js";
-import { drainDeferredProviderEvidence } from "./pipeline/gates.js";
-import { completeStageAttemptActor } from "./pipeline/settlement.js";
-import { createGithubPublicationProcessor } from "./providers/github/pipeline-publication.js";
-import { createDaytonaRuntime } from "./providers/daytona/adapter.js";
-import { createPipelineEffectProcessor } from "./operations/pipeline-effects.js";
-import { drainPipelineFeedbackSnapshots } from "./app/provider-feedback.js";
-import { createGithubWebhookReconciler } from "./operations/github-webhook-reconciliation.js";
+  KERNEL_EFFECT_DELIVERY_PAYLOAD_CONTRACT,
+  KERNEL_EFFECT_DELIVERY_PAYLOAD_SCHEMA,
+  createKernelEffectAdapterRegistry,
+  createKernelEffectExecutionService,
+} from "./operations/kernel-effects.js";
 import {
-  compareAndAdvanceRepositoryRef,
-  createRepositoryRef,
-  listFailedRepositoryWebhookDeliveries,
-  publishRepositoryTaskBranch,
-  reconcileRepositoryWebhook,
-  redeliverRepositoryWebhookDelivery,
+  KernelExternalBoundaryCoordinator,
+  externalKernelPayloadSchemas,
+} from "./operations/kernel-external-boundary.js";
+import {
+  createKernelExternalStagePlanRegistry,
+  type KernelExternalStagePlanRegistry,
+} from "./operations/kernel-external-plans.js";
+import { createKernelExternalPlanBindings } from "./operations/kernel-plan-bindings.js";
+import { KernelWorker } from "./operations/kernel-worker.js";
+import { createKernelHistoricalAnalysisStore } from "./persistence/kernel-analysis-store.js";
+import { SqliteKernelCodexAuthStore } from "./persistence/kernel-codex-auth-store.js";
+import { SqliteKernelInboxStore } from "./persistence/kernel-inbox-store.js";
+import { SqliteKernelProjectionStore } from "./persistence/kernel-projection-store.js";
+import { SqliteKernelRegistrationStore } from "./persistence/kernel-registration-store.js";
+import { SqliteKernelRunEnvironmentStore } from "./persistence/kernel-runtime-context-store.js";
+import { SqliteKernelStore } from "./persistence/kernel-store.js";
+import { ordinaryKernelPayloadSchemas } from "./pipeline/kernel/evaluator-registry.js";
+import { OrdinaryKernelCoordinator } from "./pipeline/kernel/ordinary-coordinator.js";
+import { createKernelCredentialMaterializer } from "./providers/codex/auth.js";
+import { createDaytonaKernelAdapter } from "./providers/daytona/kernel-adapter.js";
+import { GithubKernelAdapter } from "./providers/github/kernel-adapter.js";
+import { KernelAdmissionPromotionAdapter } from "./providers/kernel/admission-promotion.js";
+import {
+  ensureRepositoryControlLabel,
+  getRepositoryDefinitionSourceAtCommit,
+  prepareRepository,
 } from "./providers/github/client.js";
-import { canSteerPipelineRun } from "./pipeline/control.js";
-import { pushRepositoryCheckpoint } from "./providers/github/checkpoint-push.js";
-import {
-  createRuntimeResourceReconciler,
-  HOT_PATH_RECLAIM_LIMIT,
-  HOT_PATH_RECLAIM_WAIT_TIMEOUT_MS,
-} from "./operations/runtime-resource-reclaim.js";
+import type { KernelRuntimeCompatibilityPort } from "./runtime/kernel-contracts.js";
 
-const SWEEP_INTERVAL_MS = 15 * 60 * 1000; // run every 15 min while awake; SPEC only requires "on every boot" + periodic while awake
-const DELIVERY_DRAIN_INTERVAL_MS = 30 * 1000;
-const WEBHOOK_RECONCILIATION_CONCURRENCY = 4;
-// Liveness reap runs far more often than the hard-timeout sweep so a stalled
-// run is caught within ~a minute of crossing STALL_TIMEOUT_SECONDS.
-const REAP_INTERVAL_MS = 60 * 1000;
+const WORK_RETRY_LIMIT = 3;
+const RESULT_CORRECTION_LIMIT = 2;
 
-async function main() {
+interface RuntimeCapabilitySource {
+  schema: "openthrottle.runtime-capability-source/v1";
+  protocol: string;
+  engines: string[];
+  executor_primitives: string[];
+}
+
+function payloadSchemas(): ExecutionRecordPayloadRegistry {
+  return new Map([
+    ...ordinaryKernelPayloadSchemas(),
+    ...externalKernelPayloadSchemas(),
+    [KERNEL_EFFECT_DELIVERY_PAYLOAD_SCHEMA, KERNEL_EFFECT_DELIVERY_PAYLOAD_CONTRACT],
+    [ADMISSION_PROMOTION_RECORD_PAYLOAD_SCHEMA, ADMISSION_PROMOTION_RECORD_PAYLOAD_CONTRACT],
+  ]);
+}
+
+function runtimeCapabilitySource(releaseRoot: string): RuntimeCapabilitySource {
+  const value = JSON.parse(readFileSync(join(releaseRoot, "contracts/runtime-capabilities.json"), "utf8")) as RuntimeCapabilitySource;
+  if (
+    value.schema !== "openthrottle.runtime-capability-source/v1" ||
+    !Array.isArray(value.engines) || !Array.isArray(value.executor_primitives)
+  ) throw new Error("release runtime capability source is invalid");
+  return value;
+}
+
+async function main(): Promise<void> {
   const cfg = loadConfig();
-
-  const db = openDb(cfg.databasePath);
-  const pipelineStore = createPipelineStore(db);
-  const store = createSupervisorStore(db, pipelineStore);
-  const analysisStore = createAnalysisStore(db);
-  const citationGateStore = createCitationGateStore(db, () => new Date().toISOString());
-  const admissionDrainStore = createAdmissionDrainStore(db);
-  const runtimeCapabilities = loadRuntimeCapabilityDescriptor(
-    cfg.sandboxRuntimeDescriptorPath,
-    cfg.sandboxRuntimeRelease
-  );
-  // Catalog wishes and runtime evidence are built independently, then checked
-  // against one another before either is accepted into the durable ledger.
-  const pipelineCatalog = loadPipelineCatalog(
-    cfg.pipelineCatalogPath,
-    runtimeCapabilities.descriptor
-  );
-  pipelineStore.acceptRuntimeDescriptor(runtimeCapabilities);
-  pipelineStore.acceptCatalog(pipelineCatalog);
-
-  const getLinearClient = createLinearClientProvider(cfg, store);
-  const linearOutboxProcessor = createLinearOutboxProcessor({ store, getLinearClient });
-  const linearActivityPublisher = createLinearActivityPublisher(store, linearOutboxProcessor);
-  const activityPublisher = createProviderAwareActivityPublisher(
-    cfg,
-    store,
-    linearActivityPublisher
-  );
-  const runtime = createDaytonaRuntime({
-    apiKey: cfg.daytonaApiKey,
-    snapshot: cfg.daytonaSnapshot,
-    taskTimeoutSeconds: cfg.taskTimeout,
-    materializeCredentialEnv: createCredentialMaterializer(cfg, store),
+  const release = loadKernelReleaseDefinitions({
+    release_root: cfg.releaseRoot,
+    generated_root: cfg.generatedDefinitionRoot,
   });
-  const reconcileRuntimeResources = createRuntimeResourceReconciler({
-    store: pipelineStore,
-    tickets: store,
-    runtime,
+  const epoch = openKernelEpoch({
+    database_path: cfg.databasePath,
+    blob_store_path: cfg.blobStorePath,
+    blob_store_id: cfg.blobStoreId,
+    release_id: cfg.epochReleaseId,
   });
-  const pipelineEffectProcessor = createPipelineEffectProcessor({
-    store: pipelineStore,
-    tickets: store,
-    runtime,
-    repositoryWriter: {
-      createRef: (input) => createRepositoryRef({ token: cfg.githubToken }, input),
-      compareAndAdvanceRef: (input) => input.checkpointObject
-        ? pushRepositoryCheckpoint({ token: cfg.githubToken }, { ...input, checkpointObject: input.checkpointObject })
-        : compareAndAdvanceRepositoryRef({ token: cfg.githubToken }, input),
-    },
-    repositoryPublisher: {
-      publishTaskBranch: (input) => publishRepositoryTaskBranch({ token: cfg.githubToken }, input),
-    },
-    taskTimeoutSeconds: cfg.taskTimeout,
-    reviewFanoutConcurrency: cfg.reviewFanoutConcurrency ?? 5,
-    runtimeResourceRetentionMinutes: cfg.runtimeResourceRetentionMinutes,
-    citationGateStore,
-    reconcileRuntimeResources,
+  const manifestResolver = new VerifiedKernelManifestResolver({
+    compiler_environment: release.compiler_environment,
+    trusted_platform_definitions: release.trusted_platform_definitions,
   });
-  const pipelineCoordinator = {
-    catalog: pipelineCatalog,
-    runtime: runtimeCapabilities,
-    store: pipelineStore,
-    drainEffects: () => pipelineEffectProcessor.drain(),
-    tuneCorpus: analysisStore,
+  const kernel = new SqliteKernelStore({
+    db: epoch.db,
+    blob_store: epoch.blobs,
+    manifest_resolver: manifestResolver,
+    payload_schemas: payloadSchemas(),
+  });
+  const bundles = new VerifiedKernelDefinitionBundleResolver({
+    bytes: kernel,
+    trusted_platform_definitions: release.trusted_platform_definitions,
+  });
+  const registrations = new SqliteKernelRegistrationStore({ db: epoch.db });
+  const inbox = new SqliteKernelInboxStore({ db: epoch.db, blob_store: epoch.blobs });
+  const projections = new SqliteKernelProjectionStore({ db: epoch.db });
+  const environments = new SqliteKernelRunEnvironmentStore({ db: epoch.db });
+  const sessions = new KernelRuntimeSessionService({ transitions: kernel });
+  const codexAuth = new SqliteKernelCodexAuthStore({ db: epoch.db });
+  const sourceReader = {
+    read: (repository: string, commit: string) => getRepositoryDefinitionSourceAtCommit(
+      { token: cfg.githubReadToken }, repository, commit,
+    ),
   };
-  const githubPublicationProcessor = createGithubPublicationProcessor({
-    store: pipelineStore,
-    tickets: store,
-    client: { token: cfg.githubToken },
+  const daytona = createDaytonaKernelAdapter({
+    api_key: cfg.daytonaApiKey,
+    snapshot: cfg.daytonaSnapshot,
+    github_read_token: cfg.githubReadToken,
+    task_timeout_seconds: cfg.taskTimeout,
+    runtime_capability_digest: release.compiler_environment.descriptor.runtime_capability_digest,
+    blob_store: epoch.blobs,
+    environments,
+    attempt_inputs: kernel,
+    materialize_model_credentials: createKernelCredentialMaterializer(cfg, codexAuth),
   });
-  const reconcileGithubWebhooks = createGithubWebhookReconciler({
-    store,
-    client: { token: cfg.githubToken },
-    webhookUrl: `${cfg.supervisorUrl}/webhooks/github`,
-    webhookSecret: cfg.githubWebhookSecret,
-    reconcileRepositoryWebhook,
-    listRepositoryWebhookDeliveries: async (client, input) =>
-      (await listFailedRepositoryWebhookDeliveries(
-        client,
-        input.repo,
-        input.webhookId,
-        input.limit
-      )).map((delivery) => ({
-        id: delivery.id,
-        guid: delivery.guid,
-        deliveredAt: delivery.delivered_at,
-        statusCode: delivery.status_code,
-        redelivery: delivery.redelivery,
-      })),
-    redeliverRepositoryWebhookDelivery: (client, input) =>
-      redeliverRepositoryWebhookDelivery(
-        client,
-        input.repo,
-        input.webhookId,
-        input.deliveryId
-      ),
-    concurrency: WEBHOOK_RECONCILIATION_CONCURRENCY,
+  const github = new GithubKernelAdapter({ token: cfg.githubToken, blob_store: epoch.blobs });
+  let externalPlans: KernelExternalStagePlanRegistry | null = null;
+  const runtimeCompatibility: KernelRuntimeCompatibilityPort = {
+    async assertCompatible(input) {
+      daytona.assertCompatible(input);
+      if (externalPlans === null) throw new Error("external plan registry is not initialized");
+      externalPlans.assertCompatible(input.stages);
+    },
+  };
+  const admissionPromotion = new KernelAdmissionPromotionAdapter({
+    source_reader: sourceReader,
+    platform: release.platform,
+    compiler_environment: release.compiler_environment,
+    runtime: runtimeCompatibility,
+    blob_store: epoch.blobs,
+    store: kernel,
+    work_retry_limit: WORK_RETRY_LIMIT,
+    result_correction_limit: RESULT_CORRECTION_LIMIT,
   });
-  const reconcileRuntimeCapacity = () =>
-    reconcileRuntimeResources({
-      cutoffIso: new Date(Date.now() - cfg.runtimeResourceRetentionMinutes * 60_000).toISOString(),
-      limit: HOT_PATH_RECLAIM_LIMIT,
-      trigger: "capacity-constrained admission preflight",
-      waitTimeoutMs: HOT_PATH_RECLAIM_WAIT_TIMEOUT_MS,
-    });
-  const deliveryProcessor = createServerWebhookDeliveryProcessor({
-    cfg,
-    store,
-    runtime,
-    getLinearClient,
-    linearOutbox: linearOutboxProcessor,
-    pipelineCoordinator,
-    reconcileRuntimeCapacity,
+  const effectAdapters = createKernelEffectAdapterRegistry([
+    ...daytona.effectBindings(),
+    ...github.effectBindings(),
+    admissionPromotion.effectBinding(),
+  ]);
+  externalPlans = createKernelExternalStagePlanRegistry({
+    effects: effectAdapters,
+    plans: createKernelExternalPlanBindings({ environments, blob_store: epoch.blobs }),
+  });
+  const admissionSettlement = new KernelAdmissionSettlementPlanner({ store: kernel });
+  const structuredSettlement = new KernelStructuredSettlementPlanner({ store: kernel });
+  const ordinarySettlement = {
+    plan(input: Parameters<KernelAdmissionSettlementPlanner["plan"]>[0]) {
+      return input.view.run.pipeline_id === "core/admission"
+        ? admissionSettlement.plan(input)
+        : structuredSettlement.plan(input);
+    },
+  };
+  const ordinary = new OrdinaryKernelCoordinator({
+    store: kernel,
+    definition_bundles: bundles,
+    runtime: daytona,
+    runtime_sessions: sessions,
+    settlement_planner: ordinarySettlement,
+    attempt_lease_duration_ms: cfg.kernelLeaseSeconds * 1_000,
+  });
+  const external = new KernelExternalBoundaryCoordinator({
+    store: kernel,
+    definition_bundles: bundles,
+    plans: externalPlans,
+    settlement_planner: structuredSettlement,
+  });
+  const effects = createKernelEffectExecutionService({ effects: kernel, adapters: effectAdapters });
+  const inboxHandler = new KernelAdmissionInboxHandler({
+    registrations,
+    github_token: cfg.githubReadToken,
+    source_reader: sourceReader,
+    platform: release.platform,
+    compiler_environment: release.compiler_environment,
+    runtime: runtimeCompatibility,
+    blob_store: epoch.blobs,
+    store: kernel,
+  });
+  const control = new KernelControlService({
+    inbox,
+    maintenance: inbox,
+    runtime_sessions: sessions,
+    active_work: projections,
+    runtime_inventory: daytona,
+  });
+  const providerPrompts = new KernelProviderPromptHandler({
+    runs: registrations,
+    projections,
+    control: {
+      requestRunControl: (input) => ordinary.requestRunControl(input),
+      enqueueSteering: (input) => control.enqueueSteering(input),
+    },
+  });
+  const inboxRouter = new KernelInboxRouter({
+    admission: inboxHandler,
+    run_control: ordinary,
+    steering_authority: control,
+    steering_delivery: daytona,
+    provider_prompts: providerPrompts,
+  });
+  const worker = new KernelWorker({
+    attempts: kernel,
+    ordinary,
+    external,
+    effects,
+    inbox,
+    inbox_handler: inboxRouter,
+    worker_id: cfg.kernelWorkerId,
+    lease_seconds: cfg.kernelLeaseSeconds,
+    cycle_limit: cfg.kernelCycleLimit,
   });
 
+  const service = new KernelHttpService({
+    registrations,
+    projections,
+    analysis: createKernelHistoricalAnalysisStore(epoch.db),
+    control,
+  });
+  const repositorySetup: KernelRepositorySetupPort = {
+    async prepare(input) {
+      const readiness = await prepareRepository(
+        { token: cfg.githubToken },
+        {
+          repo: input.repo,
+          ...(input.baseBranch ? { requestedBaseBranch: input.baseBranch } : {}),
+          webhookUrl: `${cfg.supervisorUrl}/webhooks/github`,
+          webhookSecret: cfg.githubWebhookSecret,
+        },
+      );
+      const label = input.controlProvider === "github"
+        ? await ensureRepositoryControlLabel({ token: cfg.githubToken }, readiness.repo)
+        : undefined;
+      const linearTeamKey = input.controlProvider === "linear" ? input.linearTeamKey ?? null : null;
+      if (input.controlProvider === "linear" && linearTeamKey === null) {
+        throw new Error("Linear registration requires a team key");
+      }
+      return {
+        registration: {
+          id: `registration-${digestCanonicalJson({
+            provider: input.controlProvider,
+            repo: readiness.repo.toLowerCase(),
+            route: input.controlProvider === "linear" ? input.linearTeamId ?? linearTeamKey : readiness.repo,
+          }).slice(0, 48)}`,
+          control_provider: input.controlProvider,
+          linear_team_id: input.controlProvider === "linear"
+            ? input.linearTeamId ?? `key:${linearTeamKey}`
+            : null,
+          linear_team_key: linearTeamKey,
+          github_repo: readiness.repo,
+          github_installation_id: null,
+          base_branch: readiness.baseBranch,
+          webhook_id: readiness.webhookId,
+          runtime_snapshot: cfg.daytonaSnapshot,
+        },
+        readiness: {
+          github: "ready" as const,
+          webhook: readiness.webhookAction,
+          snapshot: { name: cfg.daytonaSnapshot, state: "configured" },
+          ...(label ? { controlLabel: label } : {}),
+        },
+      };
+    },
+  };
+  const capabilitySource = runtimeCapabilitySource(cfg.releaseRoot);
   const app = createServer({
     cfg,
-    store,
-    runtime,
-    analysisStore,
-    citationGateStore,
-    admissionDrainStore,
-    getLinearClient,
-    deliveryProcessor,
-    linearOutboxProcessor,
-    pipelineCoordinator,
+    capabilities: {
+      release: cfg.epochReleaseId,
+      capability_digest: release.compiler_environment.descriptor.runtime_capability_digest,
+      capabilities: [
+        capabilitySource.protocol,
+        ...capabilitySource.engines.map((engine) => `engine:${engine}`),
+        ...capabilitySource.executor_primitives,
+      ],
+      task_timeout_seconds: cfg.taskTimeout,
+    },
+    service,
+    repository_setup: repositorySetup,
   });
-  const drainLinearAndDeferredProvider = async () => {
-    await linearOutboxProcessor.drain();
-    const deferred = drainDeferredProviderEvidence(pipelineStore);
-    const feedback = drainPipelineFeedbackSnapshots(pipelineStore, store);
-    if (deferred + feedback > 0) {
-      await pipelineEffectProcessor.drain();
-    }
-  };
 
-  let sandboxPollRunning = false;
-  const pollActiveSandboxes = async () => {
-    if (sandboxPollRunning) return;
-    sandboxPollRunning = true;
+  let cycleRunning = false;
+  const abort = new AbortController();
+  const runCycle = async () => {
+    if (cycleRunning || abort.signal.aborted) return;
+    cycleRunning = true;
     try {
-      await pollSandboxEvents({
-        runtime,
-        store,
-        childActions: pipelineStore,
-        postActivity: (activity, event) => activityPublisher.publishActivity(
-          { ...activity, id: event.event_id },
-          event.issueId,
-          event.run_id
-        ),
-        postSessionUpdate: (params) => {
-          const ticket = store.getByIssueId(params.issueId);
-          if (ticket?.control_provider === "github") {
-            const plan = params.plan.map((item) => {
-              const marker = item.status === "completed"
-                ? "x"
-                : item.status === "canceled"
-                  ? "-"
-                  : " ";
-              return `- [${marker}] ${item.content} (${item.status})`;
-            }).join("\n");
-            return activityPublisher.publishActivity({
-              id: params.eventId,
-              sessionId: params.sessionId,
-              type: "response",
-              body: `Plan update:\n${plan}`,
-            }, params.issueId);
-          }
-          return enqueueSessionUpdate(store, linearOutboxProcessor, {
-            id: params.eventId,
-            sessionId: params.sessionId,
-            issueId: params.issueId,
-            plan: params.plan,
-          });
-        },
-        postStageResult: async (event, observedSubject, checkpointObject) => {
-          completeStageAttemptActor(
-            pipelineStore,
-            store,
-            {
-              id: event.event_id,
-              kind: "stage_result",
-              instanceId: event.pipeline_instance_id,
-              generation: event.generation,
-              runId: event.run_id,
-              stageId: event.stage_id,
-              attemptId: event.attempt_id,
-              requestHash: event.request_hash,
-              outcome: event.outcome,
-              resultHash: event.result_hash,
-              subject: event.subject,
-              nativeSessionId: event.native_session_id,
-              ...(event.fault_reason ? { faultReason: event.fault_reason } : {}),
-              artifacts: event.artifacts,
-            },
-            { observedSubject, checkpointObject }
-          );
-          await pipelineEffectProcessor.drain();
-        },
-      });
-      // Deliver any queued mid-run steering into running sandboxes on the same
-      // fast cadence, so a steer reaches the agent within one poll interval.
-      await deliverPendingInbox({
-        runtime,
-        store,
-        canReceiveSteering: (ticket) => canSteerPipelineRun({
-          store: pipelineStore,
-          sessionId: ticket.session_id,
-          runId: ticket.run_id,
-          agent: ticket.agent,
-        }),
-      });
+      await worker.runCycle(abort.signal);
+    } catch (error) {
+      console.error("[kernel-worker] cycle failed:", error);
     } finally {
-      sandboxPollRunning = false;
+      cycleRunning = false;
     }
   };
-
-  listen(app, cfg.port, (info) => {
-    console.log(`[supervisor] listening on :${info.port}`);
-  });
-
-  // Run once on boot, then on an interval while the process stays awake.
-  deliveryProcessor.drain().catch((err) => console.error("[webhooks] boot drain failed:", err));
-  drainLinearAndDeferredProvider().catch((err) => console.error("[linear-outbox] boot drain failed:", err));
-  githubPublicationProcessor.drain().catch((err) => console.error("[github-publication] boot drain failed:", err));
-  pipelineEffectProcessor.drain().catch((err) => console.error("[pipeline-effects] boot drain failed:", err));
-  pollActiveSandboxes().catch((err) => console.error("[sandbox-events] boot poll failed:", err));
-  runSweep(
-    runtime,
-    store,
-    cfg,
-    pipelineStore,
-    activityPublisher,
-    reconcileGithubWebhooks,
-    reconcileRuntimeResources
-  )
-    .catch((err) => console.error("[sweep] boot sweep failed:", err));
-  const reapStalled = () =>
-    reapStalledRuns({ runtime, store, activityPublisher, cfg, pipelines: pipelineStore }).catch((err) =>
-      console.error("[reaper] stall reap failed:", err)
-    );
-  reapStalled();
-  setInterval(reapStalled, REAP_INTERVAL_MS).unref();
-  setInterval(() => {
-    deliveryProcessor
-      .drain()
-      .catch((err) => console.error("[webhooks] interval drain failed:", err));
-    drainLinearAndDeferredProvider()
-      .catch((err) => console.error("[linear-outbox] interval drain failed:", err));
-    githubPublicationProcessor
-      .drain()
-      .catch((err) => console.error("[github-publication] interval drain failed:", err));
-    pipelineEffectProcessor
-      .drain()
-      .catch((err) => console.error("[pipeline-effects] interval drain failed:", err));
-  }, DELIVERY_DRAIN_INTERVAL_MS).unref();
-  setInterval(() => {
-    pollActiveSandboxes().catch((err) =>
-      console.error("[sandbox-events] interval poll failed:", err)
-    );
-  }, cfg.sandboxEventPollIntervalMs).unref();
-  setInterval(() => {
-    runSweep(
-      runtime,
-      store,
-      cfg,
-      pipelineStore,
-      activityPublisher,
-      reconcileGithubWebhooks,
-      reconcileRuntimeResources
-    )
-      .catch((err) => console.error("[sweep] interval sweep failed:", err));
-  }, SWEEP_INTERVAL_MS).unref();
-
-  for (const sig of ["SIGINT", "SIGTERM"] as const) {
-    process.on(sig, () => {
-      console.log(`[supervisor] received ${sig}, shutting down`);
-      db.close();
+  listen(app, cfg.port, (info) => console.log(`[supervisor] fresh kernel listening on :${info.port}`));
+  await runCycle();
+  setInterval(() => void runCycle(), cfg.kernelWorkerIntervalMs).unref();
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      abort.abort(new Error(`received ${signal}`));
+      if (epoch.db.open) epoch.db.close();
       process.exit(0);
     });
   }
 }
 
-main().catch((err) => {
-  console.error("[supervisor] fatal boot error:", err);
+main().catch((error: unknown) => {
+  console.error("[supervisor] fatal fresh-kernel boot error:", error);
   process.exit(1);
 });

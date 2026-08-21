@@ -56,11 +56,13 @@ describe("definition bundle contract", () => {
       runtime_capability_digest: sha("b"),
       source_commit: commit("a"),
       pipeline_id: "review",
+      pipeline_selection: "config",
     };
 
     const left = validateDefinitionBundle({ ...base, entries: [pipeline, config, agent] });
     const right = validateDefinitionBundle({
       pipeline_id: "review",
+      pipeline_selection: "config",
       source_commit: commit("a"),
       runtime_capability_digest: sha("b"),
       compiler_version: "definition-compiler/v1",
@@ -99,6 +101,7 @@ describe("definition bundle contract", () => {
       runtime_capability_digest: sha("b"),
       source_commit: commit("a"),
       pipeline_id: "review",
+      pipeline_selection: "config",
       entries: [config, reviewer],
     };
     expect(() => validateDefinitionBundle({
@@ -139,6 +142,7 @@ describe("definition bundle contract", () => {
       runtime_capability_digest: sha("b"),
       source_commit: commit("a"),
       pipeline_id: "core/review",
+      pipeline_selection: "config",
       entries: [config, platformPipeline],
     };
     expect(() => validateDefinitionBundle(bundle)).toThrow(/is not present in the trusted platform catalog/);
@@ -168,6 +172,7 @@ describe("definition bundle contract", () => {
       runtime_capability_digest: sha("b"),
       source_commit: commit("a"),
       pipeline_id: "review",
+      pipeline_selection: "config",
       entries: [config, pipeline],
     };
     expect(() => validateDefinitionBundle({
@@ -222,9 +227,20 @@ describe("filesystem config contract", () => {
     expect(() => validateFilesystemConfigContract({
       schema: FILESYSTEM_CONFIG_SCHEMA,
       pipeline: "structured",
+      engine: "codex",
+      mcp_servers: {},
+    })).toThrow(/mcp_servers: unknown field/);
+    expect(() => validateFilesystemConfigContract({
+      schema: FILESYSTEM_CONFIG_SCHEMA,
+      pipeline: "structured",
       engine: "opencode",
       reasoning_effort: "high",
     })).toThrow(/reasoning_effort: is not supported for OpenCode/);
+    expect(() => validateFilesystemConfigContract({
+      schema: FILESYSTEM_CONFIG_SCHEMA,
+      pipeline: "structured",
+      engine: "opencode",
+    })).toThrow(/model: is required for OpenCode/);
   });
 });
 

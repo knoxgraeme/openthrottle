@@ -11,9 +11,9 @@
 </p>
 
 OpenThrottle connects an approved Linear ticket or labeled GitHub Issue to a
-fenced coding agent, then carries the result through review, tests, publication,
-and provider verification. You keep the supervisor, credentials, policies, and
-execution environment under your control.
+fenced coding agent, then carries the result through review, command gates,
+publication, and provider verification. You keep the supervisor, credentials,
+policies, and execution environment under your control.
 
 > [!IMPORTANT]
 > OpenThrottle is pre-production software. Use it for controlled pilots, keep
@@ -22,16 +22,17 @@ execution environment under your control.
 
 ## Why OpenThrottle
 
-- **Plan first.** Work begins from an explicit task specification, not an
-  open-ended prompt.
-- **Deterministic control plane.** The supervisor owns stage order, retries,
-  gates, and external effects; agents reason only inside fenced stages.
-- **Agent choice.** Run Claude Code, Codex, or OpenCode without changing the
-  pipeline contract.
-- **Evidence before publication.** Typed results, command gates, semantic
-  review, and exact-commit verification decide whether work advances.
-- **Self-hosted boundaries.** Fly, Daytona, SQLite, GitHub, and optional Linear
-  integrations remain in infrastructure you operate.
+- **Plan first.** Work begins from an explicit task specification.
+- **Filesystem-authored behavior.** Pipelines, agent instructions, skills, and
+  eval schemas live under `.openthrottle/` and compile into one immutable
+  DefinitionBundle.
+- **Deterministic control plane.** The supervisor owns attempts, records,
+  checkpoints, retries, and external effects; agents own reasoning only.
+- **Agent choice.** Claude Code, Codex, and OpenCode receive the same standing
+  instructions, task prompt, and progressively disclosed skill packages.
+- **Work survives formatting mistakes.** Agents return small semantic
+  candidates. Deterministic normalization and bounded same-session correction
+  handle repairable output-shape errors without rerunning completed work.
 
 ## How it works
 
@@ -39,116 +40,94 @@ execution environment under your control.
 Linear ticket or GitHub Issue
         |
         v
-Fly supervisor -> sealed Daytona stage -> Claude Code / Codex / OpenCode
-        ^                   |
-        |                   v
-status + evidence <- gates, review, tests -> ot/* branch + GitHub PR
+signed inbox -> admission -> immutable DefinitionBundle
+                                  |
+                                  v
+                    Attempt -> Result -> Decision
+                       |                       |
+                  Checkpoint              next Attempt/Effect
+                                               |
+                                               v
+                                      Delivery -> GitHub PR
 ```
 
-The supervisor pins the pipeline manifest, repository config, runtime
-descriptor, base commit, generation, and expected Git subject. It dispatches
-one stage at a time and persists external effects before execution so retries
-remain bounded and recoverable.
+Every action is pinned to an exact Git subject, request hash, DefinitionBundle
+hash, lease, and repository authority. `inspect` actions receive an immutable
+read-only view plus a bounded executor-authored diff artifact when reviewing an
+accepted edit. `edit` actions receive an isolated writable content tree, while
+Git commits, checkpoint refs, pushes, and publication remain executor-owned.
 
 ## Quick start
 
-### Prerequisites
-
-- Node.js 22
-- Docker
-- The Fly and Daytona CLIs, authenticated to accounts you control
-- A GitHub fine-grained token for the repositories OpenThrottle will manage
-- Optional: a Linear OAuth app when using Linear as the control surface
-
-Run the guided setup from any directory:
+Prerequisites are Node.js 22, Docker, authenticated Fly and Daytona CLIs, and a
+fine-grained GitHub token. Linear is optional when GitHub Issues are the control
+surface.
 
 ```bash
 npx openthrottle setup
-```
-
-Then initialize a target repository:
-
-```bash
 cd your-repository
 npx openthrottle init
 ```
 
-`init` installs user-global planning/operator skills for detected local agents,
-writes `.openthrottle.yml`, registers either a Linear-team or GitHub-Issue route,
-creates the repository webhook, and verifies the runtime snapshot. New
-configurations enable automatic implementation admission by default. OpenCode
-activations use direct default-graph routing until their structured execution
-path is supported. Set `intents.implement.admission_mode: legacy` to retain
-direct routing for every engine.
+`init` writes `.openthrottle/config.yml`, creates starter definition
+directories, installs the global planning/operator skills, registers the
+repository route, and verifies the runtime snapshot. Commit the definition tree
+before validation or shipping; compilation always reads exact Git bytes.
 
-With `LINEAR_API_KEY` and `OT_AGENT_APP_ID` exported, prepare and delegate a
-plan through Linear control:
+For Linear control:
 
 ```bash
 npx openthrottle plan prepare docs/plans/my-change.md
+npx openthrottle plan validate docs/plans/my-change.md
 npx openthrottle ship docs/plans/my-change.md
-npx openthrottle status
-npx openthrottle status <provider-qualified-ticket-id> --admission
+npx openthrottle status OPE-188
+npx openthrottle logs OPE-188
+npx openthrottle analysis --run OPE-188
 ```
 
-The second status form inspects the exact accepted automatic plan and reviewer
-evidence through the authenticated supervisor. This repository and newly
-initialized repositories enable automatic admission by default.
-See the [automatic-admission runbook](docs/runbooks/automatic-admission.md) for
-route meanings, explicit/manual bypasses, inspection, and active-run rollback.
-
-With GitHub-Issue control, apply the exact `openthrottle` label to an open Issue
-from an authorized collaborator. OpenThrottle maintains status on that Issue.
+For GitHub Issue control, an authorized collaborator applies the exact
+`openthrottle` label to an open Issue in a registered repository.
 
 Useful setup variants:
 
 ```bash
-npx openthrottle setup --check          # read-only readiness report
-npx openthrottle setup --profile prod   # named environment
+npx openthrottle setup --check
+npx openthrottle setup --profile prod
 npx openthrottle init --profile prod
 ```
 
-For a manual source install, create the canonical snapshot with the production
-resource defaults:
-
-```bash
-daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context . \
-  --cpu 4 --memory 8 --disk 10
-```
-
-See the [CLI guide](cli/README.md) for every command and configuration option.
+See the [CLI guide](cli/README.md),
+[automatic-admission runbook](docs/runbooks/automatic-admission.md), and
+[normative specification](docs/SPEC.md) for the complete contracts.
 
 ## Repository layout
 
 | Path | Purpose |
 | --- | --- |
-| `contracts/` | Shared canonical JSON, schema, and digest contracts |
+| `.openthrottle/` | Built-in filesystem definitions used by the factory itself |
+| `contracts/` | Canonical contracts, compiler, and generated runtime validators |
 | `supervisor/` | Hono/SQLite control plane deployed on Fly |
-| `sandbox/` | Daytona image, stage executor, and safety boundary |
-| `skills/` | Self-contained planning and execution adapters |
+| `sandbox/` | Daytona action executor and repository authority boundary |
+| `skills/` | Operator and planning distribution assets |
 | `cli/` | Published `openthrottle` npm package |
-| `docs/` | Normative specification, plans, and operator runbooks |
-
-For the complete architecture and contracts, read [docs/SPEC.md](docs/SPEC.md).
-For delivery and acceptance status, read [docs/PLAN.md](docs/PLAN.md).
+| `docs/` | Normative specification, plans, and runbooks |
 
 ## Security model
 
-Only credentials declared by the selected stage enter a sandbox. Daytona,
-Fly, webhook, installation, and operator credentials remain in the supervisor.
-Webhook signatures are verified before persistence; stage requests bind the
-run, generation, attempt, config, runtime, and Git subject; logs and retained
-tails are bounded and sanitized.
+Only the repository and model credentials enter an action sandbox. Daytona,
+Fly, webhook, installation, operator, and publication credentials remain in the
+supervisor. Signed ingress is bounded before parsing; large immutable evidence
+is content-addressed; logs are bounded and sanitized.
 
-These controls complement—not replace—GitHub branch protection, least-privilege
-tokens, review rules, and normal dependency hygiene. See [SECURITY.md](SECURITY.md)
-for the disclosure process and supported versions.
+These controls complement—not replace—GitHub branch protection,
+least-privilege tokens, review rules, and dependency hygiene. See
+[SECURITY.md](SECURITY.md).
 
 ## Development
 
 The repository contains four independent npm projects and intentionally has no
-root `package.json`. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for setup,
-tests, project conventions, and pull-request expectations.
+root `package.json`. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for setup and
+the full verification suite.
 
 ## License
 

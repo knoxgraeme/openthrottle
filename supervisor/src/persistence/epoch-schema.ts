@@ -221,6 +221,9 @@ CREATE TABLE attempts (
   lease_started INTEGER CHECK (lease_started IS NULL OR lease_started IN (0, 1)),
   checkpoint_id TEXT,
   result_record_id TEXT,
+  result_record_kind TEXT NOT NULL DEFAULT 'result' CHECK (result_record_kind = 'result'),
+  decision_record_id TEXT,
+  decision_record_kind TEXT NOT NULL DEFAULT 'decision' CHECK (decision_record_kind = 'decision'),
   pending_candidate_hash TEXT CHECK (pending_candidate_hash IS NULL OR (length(pending_candidate_hash) = 64 AND pending_candidate_hash NOT GLOB '*[^0-9a-f]*')),
   pending_diagnostics_json TEXT CHECK (pending_diagnostics_json IS NULL OR json_valid(pending_diagnostics_json)),
   created_at TEXT NOT NULL CHECK (length(created_at) >= 20),
@@ -237,10 +240,13 @@ CREATE TABLE attempts (
   CHECK (result_correction_deadline IS NULL OR native_session_id IS NOT NULL),
   CHECK (status <> 'result_pending' OR result_correction_deadline IS NOT NULL),
   CHECK (result_record_id IS NULL OR status IN ('recorded', 'settled')),
+  CHECK ((decision_record_id IS NOT NULL) = (status = 'settled')),
   FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id) ON DELETE RESTRICT,
   FOREIGN KEY (parent_attempt_id, pipeline_run_id) REFERENCES attempts(id, pipeline_run_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (checkpoint_id, pipeline_run_id) REFERENCES checkpoints(id, pipeline_run_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (result_record_id, pipeline_run_id) REFERENCES records(id, pipeline_run_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (checkpoint_id, pipeline_run_id, id) REFERENCES checkpoints(id, pipeline_run_id, attempt_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (result_record_id, pipeline_run_id, result_record_kind) REFERENCES records(id, pipeline_run_id, kind) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (result_record_id, pipeline_run_id, id) REFERENCES records(id, pipeline_run_id, attempt_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (decision_record_id, pipeline_run_id, decision_record_kind) REFERENCES records(id, pipeline_run_id, kind) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   UNIQUE (id, pipeline_run_id),
   UNIQUE (id, pipeline_run_id, request_hash, definition_bundle_hash, input_subject)
 ) STRICT, WITHOUT ROWID;
@@ -289,6 +295,8 @@ CREATE TABLE records (
   FOREIGN KEY (effect_id, pipeline_run_id, idempotency_key, external_identity) REFERENCES effects(id, pipeline_run_id, idempotency_key, target) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   UNIQUE (id, pipeline_run_id),
   UNIQUE (id, pipeline_run_id, kind),
+  UNIQUE (id, pipeline_run_id, attempt_id),
+  UNIQUE (id, pipeline_run_id, effect_id),
   UNIQUE (pipeline_run_id, sequence)
 ) STRICT, WITHOUT ROWID;
 
@@ -318,7 +326,10 @@ CREATE TABLE effects (
   lease_worker_id TEXT,
   lease_expires_at TEXT,
   lease_execution_mode TEXT CHECK (lease_execution_mode IS NULL OR lease_execution_mode IN ('dispatch_or_reconcile', 'reconcile_only')),
+  dispatch_lease_id TEXT,
+  dispatch_worker_id TEXT,
   delivery_record_id TEXT,
+  delivery_record_kind TEXT NOT NULL DEFAULT 'delivery' CHECK (delivery_record_kind = 'delivery'),
   unknown_detail TEXT,
   last_error TEXT,
   created_at TEXT NOT NULL CHECK (length(created_at) >= 20),
@@ -332,11 +343,14 @@ CREATE TABLE effects (
     (lease_id IS NOT NULL AND lease_worker_id IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_execution_mode IS NOT NULL)
   ),
   CHECK ((status = 'processing') = (lease_id IS NOT NULL)),
+  CHECK ((dispatch_lease_id IS NULL) = (dispatch_worker_id IS NULL)),
+  CHECK (dispatch_lease_id IS NULL OR lease_execution_mode = 'reconcile_only' OR status IN ('unknown', 'acknowledged', 'rejected', 'failed', 'canceled')),
   CHECK ((status IN ('acknowledged', 'rejected')) = (delivery_record_id IS NOT NULL)),
   CHECK ((status = 'unknown') = (unknown_detail IS NOT NULL)),
   FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id) ON DELETE RESTRICT,
   FOREIGN KEY (decision_record_id, pipeline_run_id, decision_record_kind) REFERENCES records(id, pipeline_run_id, kind) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
-  FOREIGN KEY (delivery_record_id, pipeline_run_id) REFERENCES records(id, pipeline_run_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (delivery_record_id, pipeline_run_id, delivery_record_kind) REFERENCES records(id, pipeline_run_id, kind) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (delivery_record_id, pipeline_run_id, id) REFERENCES records(id, pipeline_run_id, effect_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   UNIQUE (id, pipeline_run_id),
   UNIQUE (id, pipeline_run_id, idempotency_key, target)
 ) STRICT, WITHOUT ROWID;
@@ -369,8 +383,16 @@ CREATE TABLE checkpoints (
   FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id) ON DELETE RESTRICT,
   FOREIGN KEY (attempt_id, pipeline_run_id, request_hash, definition_bundle_hash, input_subject) REFERENCES attempts(id, pipeline_run_id, request_hash, definition_bundle_hash, input_subject) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
   UNIQUE (id, pipeline_run_id),
+  UNIQUE (id, pipeline_run_id, attempt_id),
   UNIQUE (attempt_id, ordinal)
 ) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER settings_immutable_insert
+BEFORE INSERT ON settings
+WHEN EXISTS (SELECT 1 FROM settings WHERE key = NEW.key AND mutable = 0)
+BEGIN
+  SELECT RAISE(ABORT, 'immutable setting');
+END;
 
 CREATE TRIGGER settings_immutable_update
 BEFORE UPDATE ON settings
@@ -402,6 +424,9 @@ CREATE INDEX repository_registrations_route_idx ON repository_registrations(cont
 CREATE UNIQUE INDEX repository_registrations_linear_team_idx ON repository_registrations(linear_team_id) WHERE control_provider = 'linear';
 CREATE INDEX work_items_state_idx ON work_items(state, updated_at, id);
 CREATE INDEX inbox_events_available_idx ON inbox_events(status, available_at, id);
+CREATE INDEX inbox_events_group_idx ON inbox_events(
+  source_provider, event_group_key, delivery_attempt, created_at, id
+);
 CREATE INDEX inbox_events_work_idx ON inbox_events(work_item_id, created_at, id);
 CREATE INDEX inbox_events_attempt_idx ON inbox_events(attempt_id, generation, event_group_key, delivery_attempt);
 CREATE INDEX definitions_lookup_idx ON definitions(definition_kind, definition_id, source_commit);
@@ -415,6 +440,17 @@ CREATE INDEX pipeline_runs_bundle_idx ON pipeline_runs(definition_bundle_hash);
 CREATE INDEX attempts_schedule_idx ON attempts(status, unmet_dependency_count, lease_expires_at, pipeline_run_id, id);
 CREATE INDEX attempts_run_stage_idx ON attempts(pipeline_run_id, stage_id, status, id);
 CREATE INDEX attempts_parent_idx ON attempts(parent_attempt_id, pipeline_run_id);
+CREATE INDEX attempts_structured_planning_idx ON attempts(
+  pipeline_run_id,
+  definition_bundle_hash,
+  scope_kind,
+  parent_attempt_id,
+  scope_group_id,
+  stage_id,
+  scope_item_id,
+  status,
+  id
+);
 CREATE INDEX attempts_request_idx ON attempts(request_hash);
 CREATE UNIQUE INDEX attempts_active_lease_idx ON attempts(lease_id) WHERE lease_id IS NOT NULL;
 CREATE INDEX records_run_idx ON records(pipeline_run_id, created_at, id);
@@ -422,7 +458,7 @@ CREATE INDEX records_attempt_idx ON records(attempt_id, kind, id);
 CREATE INDEX records_effect_idx ON records(effect_id, kind, id);
 CREATE UNIQUE INDEX records_result_owner_idx ON records(attempt_id) WHERE kind = 'result';
 CREATE UNIQUE INDEX records_delivery_owner_idx ON records(effect_id) WHERE kind = 'delivery';
-CREATE INDEX records_decision_semantic_key_idx ON records(pipeline_run_id, semantic_key, sequence) WHERE kind = 'decision' AND semantic_key IS NOT NULL;
+CREATE UNIQUE INDEX records_decision_semantic_key_idx ON records(pipeline_run_id, semantic_key) WHERE kind = 'decision' AND semantic_key IS NOT NULL;
 CREATE INDEX effects_schedule_idx ON effects(status, lease_expires_at, pipeline_run_id, id);
 CREATE INDEX effects_run_idx ON effects(pipeline_run_id, status, id);
 CREATE INDEX effects_decision_idx ON effects(decision_record_id, pipeline_run_id);

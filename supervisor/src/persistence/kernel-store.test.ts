@@ -19,6 +19,7 @@ import {
   type ResultRecord,
 } from "@openthrottle/contracts";
 import { reduceKernelCommand, compileKernelCursor } from "../pipeline/kernel/reducer.js";
+import { KERNEL_WORK_REQUEST_PAYLOAD_SCHEMA } from "../pipeline/kernel/ports.js";
 import {
   KERNEL_ATTEMPT_SCHEMA,
   KERNEL_RUN_SCHEMA,
@@ -100,7 +101,7 @@ function attempt(input: Partial<KernelAttempt> = {}): KernelAttempt {
   return {
     schema: KERNEL_ATTEMPT_SCHEMA,
     id: input.id ?? "attempt-1",
-    pipeline_run_id: "run-1",
+    pipeline_run_id: input.pipeline_run_id ?? "run-1",
     scope: input.scope ?? { kind: "stage", stage_id: "work" },
     repository_authority: input.repository_authority ?? "edit",
     request_hash: input.request_hash ?? sha("a"),
@@ -118,6 +119,7 @@ function attempt(input: Partial<KernelAttempt> = {}): KernelAttempt {
     lease: input.lease ?? null,
     checkpoint_id: input.checkpoint_id ?? null,
     result_record_id: input.result_record_id ?? null,
+    decision_record_id: input.decision_record_id ?? null,
     pending_result: input.pending_result ?? null,
   };
 }
@@ -207,8 +209,13 @@ function setup(
         source_reference: "OPE-1",
         state: "active",
         title: "Test work",
-        payload_schema: "work/v1",
-        payload: { inline: { prompt: "do it" } },
+        payload_schema: KERNEL_WORK_REQUEST_PAYLOAD_SCHEMA,
+        payload: {
+          inline: {
+            schema: KERNEL_WORK_REQUEST_PAYLOAD_SCHEMA,
+            task_prompt: "Do the exact sealed work.",
+          },
+        },
       },
       definitions: [
         {
@@ -273,7 +280,38 @@ async function claimAndStart(setupResult: ReturnType<typeof setup>): Promise<{
     record_ids: [],
     checkpoint_ids: [],
   });
-  return { attempt: started.current_attempt!, run: started.run };
+  const startedAttempt = started.current_attempt!;
+  const lease = startedAttempt.lease;
+  if (!lease) throw new Error("expected started attempt lease");
+  const bound = reduceKernelCommand({
+    ...started,
+    command: {
+      type: "bind_runtime_session",
+      command_id: "bind-session-1",
+      attempt_id: startedAttempt.id,
+      expected_run_version: started.run.version,
+      expected_cursor_version: started.run.cursor.version,
+      expected_attempt_version: startedAttempt.version,
+      request_hash: startedAttempt.request_hash,
+      definition_bundle_hash: startedAttempt.definition_bundle_hash,
+      input_subject: startedAttempt.input_subject,
+      lease_id: lease.id,
+      worker_id: lease.worker_id,
+      lease_purpose: lease.purpose,
+      expected_lease_expires_at: lease.expires_at,
+      expected_work_retry_ordinal: startedAttempt.work_retry_ordinal,
+      expected_result_correction_count: startedAttempt.result_correction_count,
+      native_session_id: "session-1",
+    },
+  });
+  await setupResult.store.applyAtomicTransition(bound);
+  const sessionBound = await setupResult.store.loadExactReductionView({
+    pipeline_run_id: "run-1",
+    attempt_id: "attempt-1",
+    record_ids: [],
+    checkpoint_ids: [],
+  });
+  return { attempt: sessionBound.current_attempt!, run: sessionBound.run };
 }
 
 afterEach(() => {
@@ -290,13 +328,52 @@ describe("SqliteKernelStore", () => {
       expect(context.db.prepare("SELECT COUNT(*) AS count FROM definitions").get()).toEqual({ count: 2 });
       expect(context.db.prepare("SELECT source_commit FROM definitions ORDER BY definition_id").all())
         .toEqual([{ source_commit: subject("9") }, { source_commit: null }]);
-      expect(await context.store.getRunProjection("run-1")).toMatchObject({
-        status: "pending",
-        active_attempt_count: 1,
+      const admitted = await context.store.loadExactReductionView({
+        pipeline_run_id: "run-1",
+        attempt_id: null,
+        record_ids: [],
+        checkpoint_ids: [],
       });
+      expect(admitted.run.status).toBe("pending");
+      expect(Object.keys(admitted.run.active_attempt_versions)).toHaveLength(1);
     } finally {
       context.db.close();
     }
+  });
+
+  it("re-reads exact bundle bytes for manifest reconstruction after a store restart", async () => {
+    const initialized = setup();
+    initialized.store.admitPipelineRun(initialized.admission);
+    const observations: Array<{ pipeline_id: string; hash: string; bytes: string }> = [];
+    const restarted = new SqliteKernelStore({
+      db: initialized.db,
+      blob_store: initialized.blobs,
+      manifest_resolver: {
+        resolve: (input) => {
+          observations.push({
+            pipeline_id: input.pipeline_id,
+            hash: input.definition_bundle_hash,
+            bytes: new TextDecoder().decode(input.definition_bundle_bytes),
+          });
+          return initialized.pipelineManifest;
+        },
+      },
+      payload_schemas: payloadSchemas,
+      now: () => NOW,
+    });
+
+    await restarted.loadExactReductionView({
+      pipeline_run_id: initialized.admission.run.id,
+      attempt_id: initialized.admission.initial_attempts[0]!.id,
+      record_ids: [],
+      checkpoint_ids: [],
+    });
+
+    expect(observations).toEqual([{
+      pipeline_id: "core/test",
+      hash: initialized.admission.run.definition_bundle_hash,
+      bytes: '{"bundle":"test"}',
+    }]);
   });
 
   it("reuses an exact immutable definition snapshot across admissions", () => {
@@ -326,6 +403,63 @@ describe("SqliteKernelStore", () => {
       });
 
       expect(context.db.prepare("SELECT COUNT(*) AS count FROM definitions").get()).toEqual({ count: 2 });
+      expect(context.db.prepare("SELECT COUNT(*) AS count FROM pipeline_runs").get()).toEqual({ count: 2 });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("atomically attaches a promoted run to the same work item with one executor decision", async () => {
+    const context = setup();
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const promotion: DecisionRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "decision-promotion",
+        kind: "decision",
+        pipeline_run_id: "run-target",
+        reducer: "kernel/promote-admission@1",
+        input_record_ids: [],
+        payload_schema: "decision/v1",
+        payload: { inline: { selected_pipeline: "core/test" } },
+        created_at: NOW,
+      };
+      const targetAttempt = attempt({
+        id: "attempt-target",
+        pipeline_run_id: "run-target",
+        definition_bundle_hash: context.admission.run.definition_bundle_hash,
+        context_record_ids: [promotion.id],
+      });
+      const targetRun: KernelRun = {
+        ...run([targetAttempt], context.admission.run.definition_bundle_hash),
+        id: "run-target",
+        active_attempt_versions: { [targetAttempt.id]: targetAttempt.version },
+      };
+
+      context.store.attachPipelineRun({
+        work_item_id: context.admission.work_item.id,
+        source_pipeline_run_id: context.admission.run.id,
+        definitions: context.admission.definitions,
+        run: targetRun,
+        definition_bundle: context.admission.definition_bundle,
+        initial_records: [promotion],
+        initial_attempts: [targetAttempt],
+      });
+
+      expect(context.store.findAttachedPipelineRun(targetRun.id)).toEqual({
+        id: targetRun.id,
+        work_item_id: context.admission.work_item.id,
+        pipeline_id: targetRun.pipeline_id,
+        definition_bundle_hash: targetRun.definition_bundle_hash,
+        current_subject: targetRun.current_subject,
+      });
+      const request = await context.store.loadAttemptRequestInputs({
+        pipeline_run_id: targetRun.id,
+        attempt_id: targetAttempt.id,
+      });
+      expect(request.task_prompt).toBe("Do the exact sealed work.");
+      expect([...request.context.records.values()]).toEqual([promotion]);
+      expect(context.db.prepare("SELECT COUNT(*) AS count FROM work_items").get()).toEqual({ count: 1 });
       expect(context.db.prepare("SELECT COUNT(*) AS count FROM pipeline_runs").get()).toEqual({ count: 2 });
     } finally {
       context.db.close();
@@ -493,6 +627,22 @@ describe("SqliteKernelStore", () => {
     let currentTime = NOW;
     const context = setup(undefined, () => currentTime);
     try {
+      const structuredInitial = attempt({
+        ...context.admission.initial_attempts[0],
+        scope: {
+          kind: "loop_item",
+          stage_id: "work",
+          parent_attempt_id: "attempt-1",
+          loop_id: "execution_plan.units",
+          item_id: "unit-a",
+          item_index: 0,
+        },
+      });
+      context.admission.initial_attempts = [structuredInitial];
+      context.admission.run = run(
+        [structuredInitial],
+        context.admission.run.definition_bundle_hash,
+      );
       context.store.admitPipelineRun(context.admission);
       const started = await claimAndStart(context);
       const checkpoint: AttemptCheckpoint = {
@@ -545,7 +695,8 @@ describe("SqliteKernelStore", () => {
         command: { type: "record", command_id: "record-1", attempt_id: "attempt-1", record_id: "result-1" },
       }));
       const recorded = await context.store.loadExactReductionView({
-        pipeline_run_id: "run-1", attempt_id: "attempt-1", record_ids: ["result-1"], checkpoint_ids: [],
+        pipeline_run_id: "run-1", attempt_id: "attempt-1", record_ids: ["result-1"],
+        checkpoint_ids: ["checkpoint-1"],
       });
       const decision: DecisionRecord = {
         schema: EXECUTION_RECORD_SCHEMA,
@@ -555,7 +706,14 @@ describe("SqliteKernelStore", () => {
         reducer: "core/advance@1",
         input_record_ids: ["result-1"],
         payload_schema: "decision/v1",
-        payload: { inline: { accepted: true, semantic_key: "skill:review" } },
+        payload: {
+          inline: {
+            accepted: true,
+            semantic_key: "external-schedule:attempt-1:publish",
+            attempt_id: "attempt-1",
+            phase: "publish",
+          },
+        },
         created_at: NOW,
       };
       const effect: EffectIntent = {
@@ -566,12 +724,19 @@ describe("SqliteKernelStore", () => {
         kind: "github/publish-branch@1",
         idempotency_key: "run-1:publish",
         target: "github:owner/repo:refs/heads/ot/work",
-        subject: subject("2"),
+        subject: recorded.run.current_subject,
         payload: { branch: "ot/work" },
       };
       const next = attempt({
         id: "attempt-2",
-        scope: { kind: "stage", stage_id: "verify" },
+        scope: {
+          kind: "loop_item",
+          stage_id: "verify",
+          parent_attempt_id: "attempt-1",
+          loop_id: "execution_plan.units",
+          item_id: "unit-a",
+          item_index: 0,
+        },
         repository_authority: "inspect",
         definition_bundle_hash: recorded.run.definition_bundle_hash,
         input_subject: subject("2"),
@@ -589,6 +754,57 @@ describe("SqliteKernelStore", () => {
           effect_intents: [effect],
         },
       }));
+      expect(await context.store.findExternalSchedule({
+        pipeline_run_id: "run-1",
+        attempt_id: "attempt-1",
+        phase: "publish",
+      })).toEqual({
+        semantic_key: "external-schedule:attempt-1:publish",
+        decision,
+        effects: [{ intent: effect, delivery: null }],
+      });
+      const planningRequest = {
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: recorded.run.definition_bundle_hash,
+        scope_kind: "loop_item" as const,
+        parent_attempt_id: "attempt-1",
+        scope_group_id: "execution_plan.units",
+        stage_ids: ["work"],
+        member_ids: ["unit-a"],
+      };
+      const settled = await context.store.listSettledStructuredPlanningAttempts(planningRequest);
+      expect(settled).toHaveLength(1);
+      expect(settled[0]).toMatchObject({
+        attempt: { id: "attempt-1", decision_record_id: "decision-1" },
+        result: { id: "result-1" },
+        decision: { id: "decision-1" },
+        checkpoint: { id: "checkpoint-1" },
+        request_inputs: { task_prompt: "Do the exact sealed work." },
+      });
+      const restarted = new SqliteKernelStore({
+        db: context.db,
+        blob_store: context.blobs,
+        manifest_resolver: { resolve: () => context.pipelineManifest },
+        payload_schemas: payloadSchemas,
+        now: () => currentTime,
+      });
+      expect(await restarted.listSettledStructuredPlanningAttempts(planningRequest)).toEqual(settled);
+      await expect(restarted.listSettledStructuredPlanningAttempts({
+        ...planningRequest,
+        definition_bundle_hash: sha("f"),
+      })).rejects.toThrow(/pinned definition bundle/);
+      expect(await restarted.listSettledStructuredPlanningAttempts({
+        ...planningRequest,
+        scope_group_id: "execution_plan.other",
+      })).toEqual([]);
+      expect(await restarted.listSettledStructuredPlanningAttempts({
+        ...planningRequest,
+        member_ids: ["unit-b"],
+      })).toEqual([]);
+      await expect(restarted.listSettledStructuredPlanningAttempts({
+        ...planningRequest,
+        pipeline_run_id: "run-other",
+      })).rejects.toThrow(/unknown pipeline run/);
       const effectLease = await context.store.leaseNextEffect({
         worker_id: "effect-worker",
         lease_id: "effect-lease-1",
@@ -601,6 +817,57 @@ describe("SqliteKernelStore", () => {
         lease_id: "effect-lease-1",
         expires_at: "2026-08-20T12:05:00.000Z",
       })).toEqual(effectLease);
+
+      const effectTemplate = context.db.prepare("SELECT * FROM effects WHERE id = 'effect-1'")
+        .get() as Record<string, unknown>;
+      const effectColumns = Object.keys(effectTemplate);
+      const insertExpired = context.db.prepare(`
+        INSERT INTO effects (${effectColumns.join(", ")})
+        VALUES (${effectColumns.map(() => "?").join(", ")})
+      `);
+      for (let index = 0; index < 101; index += 1) {
+        const suffix = String(index).padStart(3, "0");
+        const expired: Record<string, unknown> = {
+          ...effectTemplate,
+          id: `zz-expired-${suffix}`,
+          idempotency_key: `expired:${suffix}`,
+          target: `github:owner/repo:expired:${suffix}`,
+          intent_hash: sha(index % 10 === 0 ? "a" : String(index % 10)),
+          status: "processing",
+          version: 0,
+          attempt_count: 1,
+          available_at: "2026-08-21T00:00:00.000Z",
+          lease_id: `expired-lease-${suffix}`,
+          lease_worker_id: "expired-worker",
+          lease_expires_at: NOW,
+          lease_execution_mode: "dispatch_or_reconcile",
+          dispatch_lease_id: null,
+          dispatch_worker_id: null,
+          delivery_record_id: null,
+        };
+        insertExpired.run(...effectColumns.map((column) => expired[column]));
+      }
+      expect(context.db.prepare(`
+        SELECT COUNT(*) AS count FROM effects WHERE id LIKE 'zz-expired-%' AND status = 'processing'
+      `).get()).toEqual({ count: 101 });
+      await context.store.leaseNextEffect({
+        worker_id: "effect-worker",
+        lease_id: "effect-lease-1",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      });
+      expect(context.db.prepare(`
+        SELECT COUNT(*) AS count FROM effects WHERE id LIKE 'zz-expired-%' AND status = 'processing'
+      `).get()).toEqual({ count: 1 });
+      await context.store.leaseNextEffect({
+        worker_id: "effect-worker",
+        lease_id: "effect-lease-1",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      });
+      expect(context.db.prepare(`
+        SELECT COUNT(*) AS count FROM effects WHERE id LIKE 'zz-expired-%' AND status = 'processing'
+      `).get()).toEqual({ count: 0 });
+      context.db.prepare("DELETE FROM effects WHERE id LIKE 'zz-expired-%'").run();
+
       currentTime = "2026-08-20T12:05:01.000Z";
       const recoveredUnsentLease = await context.store.leaseNextEffect({
         worker_id: "effect-worker",
@@ -620,36 +887,59 @@ describe("SqliteKernelStore", () => {
         run_status: "running",
       });
       expect(recoveredUnsentLease?.execution_mode).toBe("dispatch_or_reconcile");
-      await expect(context.store.markLeasedEffectDispatchStarted({
+      await context.store.completeLeasedEffect({
         effect_id: "effect-1",
         lease_id: "effect-lease-2",
+        worker_id: "effect-worker",
+        reconciliation: {
+          kind: "hold_unknown",
+          effect_id: "effect-1",
+          external_identity: effect.target,
+          detail: "provider lookup failed before dispatch",
+          retry_at: "2026-08-20T12:05:02.000Z",
+        },
+      });
+      currentTime = "2026-08-20T12:05:02.000Z";
+      const redispatchLease = await context.store.leaseNextEffect({
+        worker_id: "effect-worker",
+        lease_id: "effect-lease-redispatch",
+        expires_at: "2026-08-20T12:10:00.000Z",
+      });
+      expect(redispatchLease).toMatchObject({
+        execution_mode: "dispatch_or_reconcile",
+        dispatch_fence: null,
+      });
+      await expect(context.store.markLeasedEffectDispatchStarted({
+        effect_id: "effect-1",
+        lease_id: "effect-lease-redispatch",
         worker_id: "wrong-worker",
       })).rejects.toThrow(/fence/);
       const dispatchStarted = await context.store.markLeasedEffectDispatchStarted({
         effect_id: "effect-1",
-        lease_id: "effect-lease-2",
+        lease_id: "effect-lease-redispatch",
         worker_id: "effect-worker",
       });
       expect(dispatchStarted.execution_mode).toBe("reconcile_only");
       expect(await context.store.markLeasedEffectDispatchStarted({
         effect_id: "effect-1",
-        lease_id: "effect-lease-2",
+        lease_id: "effect-lease-redispatch",
         worker_id: "effect-worker",
       })).toEqual(dispatchStarted);
       expect(await context.store.leaseNextEffect({
         worker_id: "effect-worker",
-        lease_id: "effect-lease-2",
+        lease_id: "effect-lease-redispatch",
         expires_at: "2026-08-20T12:10:00.000Z",
       })).toEqual(dispatchStarted);
       await expect(context.store.completeLeasedEffect({
         effect_id: "effect-1",
-        lease_id: "effect-lease-2",
+        lease_id: "effect-lease-redispatch",
         worker_id: "wrong-worker",
         reconciliation: {
           kind: "hold_unknown",
           effect_id: "effect-1",
           external_identity: effect.target,
           detail: "provider timed out",
+          retry_at: "2026-08-20T12:05:06.000Z",
         },
       })).rejects.toThrow(/fence/);
       currentTime = "2026-08-20T12:10:01.000Z";
@@ -668,8 +958,17 @@ describe("SqliteKernelStore", () => {
           effect_id: "effect-1",
           external_identity: effect.target,
           detail: "provider timed out",
+          retry_at: "2026-08-20T12:10:06.000Z",
         },
       });
+      expect(context.db.prepare("SELECT available_at FROM effects WHERE id = 'effect-1'").get())
+        .toEqual({ available_at: "2026-08-20T12:10:06.000Z" });
+      expect(await context.store.leaseNextEffect({
+        worker_id: "effect-worker",
+        lease_id: "effect-lease-too-early",
+        expires_at: "2026-08-20T12:20:00.000Z",
+      })).toBeNull();
+      currentTime = "2026-08-20T12:10:06.000Z";
       const heldUnknownLease = await context.store.leaseNextEffect({
         worker_id: "effect-worker",
         lease_id: "effect-lease-4",
@@ -697,7 +996,35 @@ describe("SqliteKernelStore", () => {
       });
       expect(context.db.prepare("SELECT status, delivery_record_id FROM effects WHERE id = 'effect-1'").get())
         .toEqual({ status: "acknowledged", delivery_record_id: "delivery-1" });
-      expect(await context.store.getRunProjection("run-1")).toMatchObject({ active_effect_count: 0 });
+      expect((await context.store.findExternalSchedule({
+        pipeline_run_id: "run-1",
+        attempt_id: "attempt-1",
+        phase: "publish",
+      }))?.effects).toEqual([{ intent: effect, delivery }]);
+      const finalView = await context.store.loadExactReductionView({
+        pipeline_run_id: "run-1",
+        attempt_id: null,
+        record_ids: [],
+        checkpoint_ids: [],
+      });
+      expect(finalView.run.active_effect_versions).toEqual({});
+
+      // Reads still fail closed if an externally copied or corrupted database
+      // violates the foreign keys that normal writes enforce.
+      context.db.pragma("foreign_keys = OFF");
+      context.db.prepare("UPDATE effects SET delivery_record_id = 'missing-delivery' WHERE id = 'effect-1'").run();
+      await expect(context.store.findExternalSchedule({
+        pipeline_run_id: "run-1",
+        attempt_id: "attempt-1",
+        phase: "publish",
+      })).rejects.toThrow(/missing delivery record/);
+      context.db.prepare("UPDATE effects SET delivery_record_id = 'delivery-1' WHERE id = 'effect-1'").run();
+      context.db.prepare("UPDATE records SET external_identity = 'github:owner/repo:refs/heads/wrong' WHERE id = 'delivery-1'").run();
+      await expect(context.store.findExternalSchedule({
+        pipeline_run_id: "run-1",
+        attempt_id: "attempt-1",
+        phase: "publish",
+      })).rejects.toThrow(/invalid delivery record/);
     } finally {
       context.db.close();
     }

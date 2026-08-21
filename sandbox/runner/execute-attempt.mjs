@@ -1,0 +1,610 @@
+#!/usr/bin/env node
+
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  copyFileSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import {
+  lockActionRepository,
+  materializeActionRepository,
+  materializeInspectChangeArtifact,
+  verifyActionRepository,
+  verifyInspectChangeArtifact,
+} from "./action-repository.mjs";
+import {
+  prepareAgentRuntime,
+  removeProgressiveSkills,
+  runPreparedAgent,
+  runResultCorrection,
+} from "./agent-runtime.mjs";
+import { createAttemptCheckpoint } from "./checkpoint-bundle.mjs";
+import { prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
+import { engineExitedCleanly } from "./launch-failure.mjs";
+import { runCapturedProcess } from "./bounded-process.mjs";
+import {
+  inspectResultSubmissionChannel,
+  materializeResultSubmissionChannel,
+  submitProviderResultCandidate,
+} from "./result-submission.mjs";
+
+export const KERNEL_RUNTIME_RESULT_SCHEMA = "openthrottle.kernel-runtime-result/v1";
+export const KERNEL_SESSION_EVENT_SCHEMA = "openthrottle.kernel-session-event/v1";
+
+const SHA256 = /^[a-f0-9]{64}$/;
+const SUBJECT = /^[a-f0-9]{40,64}$/;
+const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
+const ENGINES = new Set(["claude", "codex", "opencode"]);
+const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/actions";
+const RESULT_CORRECTION_WINDOW_MS = 15 * 60 * 1000;
+const MAX_TRANSPORT_BYTES = 4 * 1024 * 1024;
+
+function exactString(value, label, pattern = ID) {
+  if (typeof value !== "string" || !pattern.test(value)) throw new Error(`${label} is invalid`);
+  return value;
+}
+
+function validateCommonRequest(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error("kernel request must be an object");
+  for (const key of ["pipeline_run_id", "attempt_id", "stage_id", "lease_id", "worker_id"]) {
+    exactString(request[key], `request.${key}`);
+  }
+  exactString(request.request_hash, "request.request_hash", SHA256);
+  exactString(request.definition_bundle_hash, "request.definition_bundle_hash", SHA256);
+  exactString(request.input_subject, "request.input_subject", SUBJECT);
+  return request;
+}
+
+export function validateKernelRequest(request) {
+  validateCommonRequest(request);
+  if (request.schema === "openthrottle.kernel-action-request/v1" && request.phase === "work") {
+    if (!request.action || typeof request.action !== "object" || Array.isArray(request.action)) {
+      throw new Error("work request action is invalid");
+    }
+    if (request.action.kind === "agent") {
+      if (!ENGINES.has(request.action.engine)) throw new Error("work request engine is invalid");
+      if (request.action.engine === "opencode" && !request.action.model) {
+        throw new Error("OpenCode action requires a sealed model");
+      }
+      if (!request.action.semantic_result_schema) throw new Error("agent action semantic schema is missing");
+      if (!Array.isArray(request.action.definition_entries)) throw new Error("agent definition entries are invalid");
+    } else if (request.action.kind === "command") {
+      if (typeof request.action.command_line !== "string" || !request.action.command_line.trim()) {
+        throw new Error("command action is invalid");
+      }
+    } else {
+      throw new Error("work request action kind is unsupported");
+    }
+    if (!new Set(["inspect", "edit"]).has(request.repository_authority)) {
+      throw new Error("work request repository authority is invalid");
+    }
+    if (request.executor_policy?.git_administration !== "executor_only" ||
+        request.executor_policy?.commit !== false || request.executor_policy?.push !== false ||
+        request.executor_policy?.publish !== false) {
+      throw new Error("work request executor policy is invalid");
+    }
+    return request;
+  }
+  if (request.schema === "openthrottle.kernel-result-correction-request/v1" &&
+      request.phase === "result_correction") {
+    if (!ENGINES.has(request.engine)) throw new Error("correction engine is invalid");
+    if (request.engine === "opencode" && !request.model) throw new Error("OpenCode correction requires a sealed model");
+    exactString(request.locked_subject, "request.locked_subject", SUBJECT);
+    exactString(request.checkpoint_id, "request.checkpoint_id");
+    exactString(request.native_session_id, "request.native_session_id", /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/);
+    if (request.repository_authority !== "inspect" || JSON.stringify(request.tools) !== '["ot-result"]' ||
+        request.mcp !== false || request.provider_access !== false) {
+      throw new Error("correction authority is invalid");
+    }
+    if (!Number.isFinite(Date.parse(request.correction_deadline))) throw new Error("correction deadline is invalid");
+    return request;
+  }
+  throw new Error("kernel request schema or phase is unsupported");
+}
+
+function readJson(path, maxBytes = MAX_TRANSPORT_BYTES) {
+  const metadata = statSync(path);
+  if (!metadata.isFile() || metadata.size > maxBytes) throw new Error(`bounded JSON file is invalid: ${path}`);
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
+function syncDirectory(path) {
+  const descriptor = openSync(path, constants.O_RDONLY);
+  try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+}
+
+function writeImmutableJson(path, value, label, mode = 0o400) {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const serialized = `${JSON.stringify(value)}\n`;
+  try {
+    const descriptor = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, mode);
+    try {
+      writeFileSync(descriptor, serialized);
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+    syncDirectory(dirname(path));
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    if (readFileSync(path, "utf8") !== serialized) throw new Error(`${label} conflicts with immutable transport evidence`);
+  }
+  return value;
+}
+
+function requestIdentity(request) {
+  return {
+    pipeline_run_id: request.pipeline_run_id,
+    attempt_id: request.attempt_id,
+    request_hash: request.request_hash,
+    definition_bundle_hash: request.definition_bundle_hash,
+    input_subject: request.input_subject,
+  };
+}
+
+function assertIdentity(actual, request, label, { includeLease = false, includeInput = true } = {}) {
+  for (const [key, value] of Object.entries(requestIdentity(request))) {
+    if (!includeInput && key === "input_subject") continue;
+    if (actual?.[key] !== value) throw new Error(`${label} ${key} mismatch`);
+  }
+  if (includeLease && (actual.lease_id !== request.lease_id || actual.worker_id !== request.worker_id)) {
+    throw new Error(`${label} lease identity mismatch`);
+  }
+}
+
+function runtimeEnvelope(request, outcome) {
+  return {
+    schema: KERNEL_RUNTIME_RESULT_SCHEMA,
+    pipeline_run_id: request.pipeline_run_id,
+    attempt_id: request.attempt_id,
+    request_hash: request.request_hash,
+    definition_bundle_hash: request.definition_bundle_hash,
+    lease_id: request.lease_id,
+    worker_id: request.worker_id,
+    outcome,
+  };
+}
+
+function existingResult(path, request) {
+  if (!existsSync(path)) return null;
+  const result = readJson(path);
+  if (result.schema !== KERNEL_RUNTIME_RESULT_SCHEMA) throw new Error("runtime result schema is invalid");
+  assertIdentity(result, request, "runtime result", { includeLease: true, includeInput: false });
+  return result;
+}
+
+function safeActionDirectory(actionRoot, attemptId) {
+  exactString(attemptId, "attempt id");
+  const root = resolve(actionRoot);
+  const path = resolve(root, attemptId.replaceAll(":", "-"));
+  if (root === "/" || !path.startsWith(`${root}/`)) throw new Error("attempt action directory escapes its root");
+  return path;
+}
+
+function sessionEvent(request, nativeSessionId, observedAt) {
+  return {
+    schema: KERNEL_SESSION_EVENT_SCHEMA,
+    pipeline_run_id: request.pipeline_run_id,
+    attempt_id: request.attempt_id,
+    request_hash: request.request_hash,
+    definition_bundle_hash: request.definition_bundle_hash,
+    lease_id: request.lease_id,
+    worker_id: request.worker_id,
+    native_session_id: nativeSessionId,
+    observed_at: observedAt,
+  };
+}
+
+function stageCheckpointArtifact(checkpoint, sourceDirectory, resultPath) {
+  const targetDirectory = dirname(resultPath);
+  mkdirSync(targetDirectory, { recursive: true, mode: 0o700 });
+  const source = join(sourceDirectory, checkpoint.payload_artifact.file);
+  const target = join(targetDirectory, checkpoint.payload_artifact.file);
+  if (resolve(source) !== resolve(target)) {
+    if (!existsSync(target)) copyFileSync(source, target, constants.COPYFILE_EXCL);
+    if (statSync(target).size !== checkpoint.payload_artifact.bytes) {
+      throw new Error("transport checkpoint artifact size mismatch");
+    }
+  }
+}
+
+function correctionDeadline(now) {
+  return new Date(now.getTime() + RESULT_CORRECTION_WINDOW_MS).toISOString();
+}
+
+function semanticOutcome({ candidate, checkpoint, deadline }) {
+  if (candidate.status === "valid") {
+    return {
+      state: "work_complete",
+      checkpoint,
+      result: { kind: "semantic", candidate: candidate.staged },
+    };
+  }
+  return {
+    state: "result_pending",
+    checkpoint,
+    candidate_hash: candidate.original_hash ?? null,
+    diagnostics: candidate.diagnostics,
+    correction_deadline: deadline,
+  };
+}
+
+function boundedCommandSummary(execution) {
+  const text = [execution.stdout, execution.stderr].filter(Boolean).join("\n").trim();
+  return (text || `command exited ${execution.status ?? "without status"}`).slice(-4_000);
+}
+
+function defaultCommandRunner({ commandLine, repositoryPath }) {
+  const safeEnv = Object.fromEntries(["PATH", "LANG", "LC_ALL", "TZ"].flatMap((name) =>
+    process.env[name] ? [[name, process.env[name]]] : []));
+  if (typeof process.getuid === "function" && process.getuid() === 0 && existsSync("/usr/local/bin/gosu")) {
+    return runCapturedProcess("/usr/local/bin/gosu", [
+      "agent", "env", ...Object.entries(safeEnv).map(([key, value]) => `${key}=${value}`),
+      "/bin/sh", "-lc", commandLine,
+    ], { cwd: repositoryPath, env: safeEnv, timeout: 60 * 60 * 1000 });
+  }
+  return runCapturedProcess("/bin/sh", ["-lc", commandLine], {
+    cwd: repositoryPath,
+    env: safeEnv,
+    timeout: 60 * 60 * 1000,
+  });
+}
+
+async function executeCommandWork(options, actionDirectory) {
+  const { request, sourceRepoDir, resultPath } = options;
+  rmSync(actionDirectory, { recursive: true, force: true });
+  mkdirSync(actionDirectory, { recursive: true, mode: 0o711 });
+  chmodSync(actionDirectory, 0o711);
+  const repository = materializeActionRepository({
+    sourceRepoDir,
+    inputSubject: request.input_subject,
+    repositoryAuthority: "edit",
+    destination: join(actionDirectory, "repository"),
+  });
+  const execution = await (options.runCommand ?? defaultCommandRunner)({
+    commandLine: request.action.command_line,
+    repositoryPath: repository.destination,
+    request,
+  });
+  if (execution.error || execution.timedOut || execution.signal) {
+    return runtimeEnvelope(request, {
+      state: "work_failed",
+      retryable: true,
+      reason: boundedCommandSummary(execution),
+    });
+  }
+  const verification = verifyActionRepository(repository);
+  const inputOnlyVerification = { ...verification, output_subject: repository.input_subject };
+  const artifactDirectory = join(actionDirectory, "artifacts");
+  const checkpoint = createAttemptCheckpoint({
+    request,
+    repository,
+    verification: inputOnlyVerification,
+    outputSubject: null,
+    nativeSessionId: null,
+    artifactDirectory,
+    capturedAt: options.now().toISOString(),
+  });
+  lockActionRepository(repository);
+  stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
+  return runtimeEnvelope(request, {
+    state: "work_complete",
+    checkpoint,
+    result: {
+      kind: "command",
+      outcome: execution.status === 0 ? "success" : "failure",
+      command_id: request.action.command_id,
+      exit_code: execution.status ?? 1,
+      summary: boundedCommandSummary(execution),
+    },
+  });
+}
+
+async function executeAgentWork(options, actionDirectory) {
+  const { request, sourceRepoDir, resultPath, sessionPath } = options;
+  const engineStatePath = join(actionDirectory, "engine-complete.json");
+  const repositoryViewPath = join(actionDirectory, "repository-view.json");
+  const checkpointPath = join(actionDirectory, "checkpoint.json");
+  const artifactDirectory = join(actionDirectory, "artifacts");
+  let execution;
+  let repository;
+  let prepared = null;
+  if (existsSync(engineStatePath)) {
+    execution = readJson(engineStatePath);
+    assertIdentity(execution, request, "completed engine state");
+    repository = readJson(repositoryViewPath);
+  } else {
+    rmSync(actionDirectory, { recursive: true, force: true });
+    mkdirSync(actionDirectory, { recursive: true, mode: 0o711 });
+    chmodSync(actionDirectory, 0o711);
+    repository = materializeActionRepository({
+      sourceRepoDir,
+      inputSubject: request.input_subject,
+      repositoryAuthority: request.repository_authority,
+      destination: join(actionDirectory, "repository"),
+      changeBoundary: request.change_boundary,
+    });
+    const inspectChangeArtifact = request.repository_authority === "inspect" && request.change_boundary !== null
+      ? materializeInspectChangeArtifact({
+        view: repository,
+        destination: join(actionDirectory, "inspect-context", "change.json"),
+      })
+      : null;
+    repository.inspect_change_artifact = inspectChangeArtifact;
+    writeImmutableJson(repositoryViewPath, repository, "repository view");
+    const candidateDirectory = join(actionDirectory, "semantic-result");
+    prepareAgentOwnedDirectory(candidateDirectory);
+    const channel = materializeResultSubmissionChannel({
+      actionDirectory,
+      candidateDirectory,
+      semanticSchema: request.action.semantic_result_schema,
+    });
+    const runtimeRequest = {
+      ...request,
+      repository_path: repository.destination,
+      inspect_change_artifact: inspectChangeArtifact,
+    };
+    const observedSessions = [];
+    const onSession = async (nativeSessionId) => {
+      if (observedSessions.length > 0 && observedSessions[0] !== nativeSessionId) {
+        throw new Error("agent reported conflicting native session identities");
+      }
+      observedSessions.push(nativeSessionId);
+      writeImmutableJson(
+        sessionPath,
+        sessionEvent(request, nativeSessionId, options.now().toISOString()),
+        "native session event",
+      );
+      writeImmutableJson(
+        join(actionDirectory, "session-fence.json"),
+        sessionEvent(request, nativeSessionId, options.now().toISOString()),
+        "action session fence",
+        0o444,
+      );
+    };
+    if (options.runAgent) {
+      execution = await options.runAgent({
+        request: runtimeRequest,
+        phase: "work",
+        repositoryPath: repository.destination,
+        channel,
+        onSession,
+      });
+    } else {
+      prepared = prepareAgentRuntime({ request: runtimeRequest, actionDirectory, channel });
+      execution = await runPreparedAgent({ prepared, request: runtimeRequest, channel, onSession });
+    }
+    if (execution.nativeSessionId && observedSessions.length === 0) await onSession(execution.nativeSessionId);
+    if (inspectChangeArtifact !== null) verifyInspectChangeArtifact(inspectChangeArtifact);
+    if (!engineExitedCleanly(execution)) {
+      return runtimeEnvelope(request, {
+        state: "work_failed",
+        retryable: Boolean(execution.timedOut || execution.error),
+        reason: "agent work did not exit cleanly",
+      });
+    }
+    if (!observedSessions[0]) {
+      return runtimeEnvelope(request, {
+        state: "work_failed",
+        retryable: true,
+        reason: "agent completed without a native session binding",
+      });
+    }
+    execution = {
+      ...requestIdentity(request),
+      status: execution.status,
+      signal: execution.signal ?? null,
+      timedOut: Boolean(execution.timedOut),
+      stdout: String(execution.stdout ?? ""),
+      stderr: String(execution.stderr ?? ""),
+      nativeSessionId: observedSessions[0],
+      home: prepared?.home ?? join(actionDirectory, "home"),
+      profileRoot: prepared?.profileRoot ?? join(actionDirectory, "home", `.${request.action.engine}`),
+    };
+    writeImmutableJson(engineStatePath, execution, "completed engine state");
+  }
+
+  const candidateDirectory = join(actionDirectory, "semantic-result");
+  if (repository.inspect_change_artifact !== null && repository.inspect_change_artifact !== undefined) {
+    verifyInspectChangeArtifact(repository.inspect_change_artifact);
+  }
+  const channel = materializeResultSubmissionChannel({
+    actionDirectory,
+    candidateDirectory,
+    semanticSchema: request.action.semantic_result_schema,
+  });
+  const candidate = submitProviderResultCandidate({
+    raw: execution.stdout,
+    engine: request.action.engine,
+    channel,
+  });
+  let checkpoint;
+  if (existsSync(checkpointPath)) {
+    checkpoint = readJson(checkpointPath);
+    assertIdentity(checkpoint, request, "recovered checkpoint");
+  } else {
+    const verification = verifyActionRepository(repository);
+    const outputSubject = request.repository_authority === "edit" ? verification.output_subject : null;
+    checkpoint = createAttemptCheckpoint({
+      request,
+      repository,
+      verification,
+      outputSubject,
+      nativeSessionId: execution.nativeSessionId,
+      artifactDirectory,
+      capturedAt: options.now().toISOString(),
+    });
+    writeImmutableJson(checkpointPath, checkpoint, "attempt checkpoint");
+    lockActionRepository(repository);
+  }
+  if (prepared) removeProgressiveSkills(prepared);
+  stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
+  return runtimeEnvelope(request, semanticOutcome({
+    candidate,
+    checkpoint,
+    deadline: correctionDeadline(options.now()),
+  }));
+}
+
+function correctionPrompt(request) {
+  return [
+    "The assigned work is complete and its Git subject is locked.",
+    "Do not repeat work, tests, review, or repository inspection.",
+    "Return exactly one openthrottle.result-candidate/v1 JSON object fixing only the diagnosed fields.",
+    `Locked subject: ${request.locked_subject}`,
+    `Diagnostics: ${JSON.stringify(request.diagnostics)}`,
+  ].join("\n\n");
+}
+
+async function executeCorrection(options, actionDirectory) {
+  const { request, resultPath } = options;
+  const checkpointPath = join(actionDirectory, "checkpoint.json");
+  const engineStatePath = join(actionDirectory, "engine-complete.json");
+  const repositoryViewPath = join(actionDirectory, "repository-view.json");
+  const artifactDirectory = join(actionDirectory, "artifacts");
+  if (!existsSync(checkpointPath) || !existsSync(engineStatePath) || !existsSync(repositoryViewPath)) {
+    return runtimeEnvelope(request, {
+      state: "needs_human",
+      reason: "result correction checkpoint is unavailable",
+      checkpoint: null,
+      candidate_hash: null,
+      diagnostics: request.diagnostics,
+    });
+  }
+  const checkpoint = readJson(checkpointPath);
+  const engineState = readJson(engineStatePath);
+  const repository = readJson(repositoryViewPath);
+  assertIdentity(checkpoint, request, "correction checkpoint");
+  if (checkpoint.id !== request.checkpoint_id || checkpoint.native_session_id !== request.native_session_id ||
+      (checkpoint.output_subject ?? checkpoint.input_subject) !== request.locked_subject) {
+    throw new Error("correction request changed the locked checkpoint fence");
+  }
+  if (options.now().getTime() >= Date.parse(request.correction_deadline)) {
+    stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
+    return runtimeEnvelope(request, {
+      state: "needs_human",
+      reason: "result correction deadline exhausted",
+      checkpoint,
+      candidate_hash: null,
+      diagnostics: request.diagnostics,
+    });
+  }
+  lockActionRepository(repository);
+  const candidateDirectory = join(actionDirectory, "semantic-result");
+  const channel = materializeResultSubmissionChannel({
+    actionDirectory,
+    candidateDirectory,
+    semanticSchema: request.semantic_result_schema,
+  });
+  let execution;
+  if (options.runAgent) {
+    execution = await options.runAgent({
+      request,
+      phase: "result_correction",
+      repositoryPath: repository.destination,
+      channel,
+      onSession: async () => { throw new Error("result correction cannot rebind the native session"); },
+    });
+  } else {
+    const cwd = join(actionDirectory, "result-correction-cwd");
+    rmSync(cwd, { recursive: true, force: true });
+    mkdirSync(cwd, { mode: 0o555 });
+    execution = await runResultCorrection({
+      request,
+      actionDirectory,
+      channel,
+      profileRoot: engineState.profileRoot,
+      home: engineState.home,
+      cwd,
+      prompt: correctionPrompt(request),
+    });
+  }
+  if (!engineExitedCleanly(execution)) {
+    stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
+    return runtimeEnvelope(request, {
+      state: "needs_human",
+      reason: "result correction did not exit cleanly",
+      checkpoint,
+      candidate_hash: null,
+      diagnostics: request.diagnostics,
+    });
+  }
+  const candidate = submitProviderResultCandidate({
+    raw: execution.stdout,
+    engine: request.engine,
+    channel,
+  });
+  stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
+  return runtimeEnvelope(request, semanticOutcome({
+    candidate,
+    checkpoint,
+    deadline: request.correction_deadline,
+  }));
+}
+
+export async function executeAttempt({
+  request,
+  sourceRepoDir = "/home/agent/repo",
+  actionRoot = process.env.OT_ACTION_ROOT ?? DEFAULT_ACTION_ROOT,
+  resultPath,
+  sessionPath,
+  runAgent = null,
+  runCommand = null,
+  now = () => new Date(),
+}) {
+  validateKernelRequest(request);
+  if (typeof resultPath !== "string" || !resultPath.startsWith("/")) throw new Error("result path must be absolute");
+  if (typeof sessionPath !== "string" || !sessionPath.startsWith("/")) throw new Error("session path must be absolute");
+  const replay = existingResult(resultPath, request);
+  if (replay) return replay;
+  const actionDirectory = safeActionDirectory(actionRoot, request.attempt_id);
+  let envelope;
+  try {
+    envelope = request.phase === "result_correction"
+      ? await executeCorrection({ request, sourceRepoDir, resultPath, sessionPath, runAgent, now }, actionDirectory)
+      : request.action.kind === "command"
+        ? await executeCommandWork({ request, sourceRepoDir, resultPath, sessionPath, runCommand, now }, actionDirectory)
+        : await executeAgentWork({ request, sourceRepoDir, resultPath, sessionPath, runAgent, now }, actionDirectory);
+  } catch (error) {
+    envelope = runtimeEnvelope(request, request.phase === "result_correction" ? {
+      state: "needs_human",
+      reason: error instanceof Error ? error.message : String(error),
+      checkpoint: existsSync(join(actionDirectory, "checkpoint.json"))
+        ? readJson(join(actionDirectory, "checkpoint.json"))
+        : null,
+      candidate_hash: null,
+      diagnostics: request.diagnostics ?? [],
+    } : {
+      state: "work_failed",
+      retryable: Boolean(error?.retryableInfrastructureFailure),
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  }
+  writeImmutableJson(resultPath, envelope, "kernel runtime result");
+  return envelope;
+}
+
+function inputPath(argv, env) {
+  const index = argv.indexOf("--request");
+  return resolve(index >= 0 ? argv[index + 1] : env.OT_ACTION_REQUEST_FILE);
+}
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (isMain) {
+  const requestPath = inputPath(process.argv.slice(2), process.env);
+  const resultPath = resolve(process.env.OT_ACTION_RESULT_FILE);
+  const sessionPath = resolve(process.env.OT_ACTION_SESSION_FILE);
+  const request = validateKernelRequest(readJson(requestPath));
+  await executeAttempt({ request, resultPath, sessionPath });
+}

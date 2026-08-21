@@ -93,7 +93,7 @@ Check, for both `supervisorImage` and `sandboxImage`:
 - `docker buildx imagetools inspect <ref>` succeeds and reports the same
   digest as the manifest reference;
 - `runtime.descriptorDigest` equals the canonical-JSON sha256 of
-  `supervisor/pipelines/runtime-capabilities-v1.json` at the released commit;
+  `contracts/runtime-capabilities.json` at the released commit;
 - `cliVersion` matches the packed tarball's version.
 
 ## 4. Install the packed CLI

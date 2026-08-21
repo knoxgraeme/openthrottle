@@ -16,6 +16,7 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 import {
   canonicalJson,
+  compareCodeUnits,
   digestCanonicalJson,
   jsonValueAt,
   type JsonValue,
@@ -208,9 +209,9 @@ function normalizeBootstrapContent(content: FreshEpochBootstrapContent): FreshEp
     refuse(`bootstrap repository_registrations must contain at most ${MAX_BOOTSTRAP_REGISTRATIONS} entries`);
   }
   const settings = content.settings.map(normalizedSetting)
-    .sort((left, right) => left.key.localeCompare(right.key));
+    .sort((left, right) => compareCodeUnits(left.key, right.key));
   const registrations = content.repository_registrations.map(normalizedRegistration)
-    .sort((left, right) => left.id.localeCompare(right.id));
+    .sort((left, right) => compareCodeUnits(left.id, right.id));
   for (const [name, values] of [
     ["setting key", settings.map((setting) => setting.key)],
     ["registration id", registrations.map((registration) => registration.id)],
@@ -368,7 +369,7 @@ function insertBootstrap(
     "epoch.blob_store_id": identity.blob_store_id,
     "epoch.blob_marker_checksum": identity.blob_marker_checksum,
     "epoch.bootstrap_checksum": identity.bootstrap_checksum,
-  }).sort(([left], [right]) => left.localeCompare(right))) {
+  }).sort(([left], [right]) => compareCodeUnits(left, right))) {
     insertSetting(db, { key, value, value_type: "string", mutable: false }, timestamp);
   }
   for (const setting of bootstrap.settings) insertSetting(db, setting, timestamp);

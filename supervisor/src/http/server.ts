@@ -1,1215 +1,568 @@
-import { Hono } from "hono";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import {
+  digestCanonicalJson,
+  jsonValueAt,
+  type JsonValue,
+  type PipelineTerminalOutcome,
+} from "@openthrottle/contracts";
+import { Hono, type Context } from "hono";
 import type { Config } from "../app/config.js";
-import type { WebhookDelivery } from "../persistence/delivery-store.js";
-import type { Ticket, SupervisorStore } from "../persistence/store.js";
 import {
-  buildLinearInstallUrl,
-  exchangeLinearOAuthCode,
-  type LinearClient,
-} from "../providers/linear/client.js";
-import {
-  fetchIssueLabels,
-  isRecentLinearWebhook,
-  linearControlEvent,
-  parseLinearWebhook,
-  verifyLinearSignature,
-} from "../providers/linear/events.js";
-import {
-  branchExists,
-  fetchGithubIssueLabels,
-  getRepositoryCollaboratorPermission,
-  getMergeReadiness,
-  getRepositoryConfigAtCommit,
-  getRepositoryDirectoryAtCommit,
-  getRepositoryFileAtCommit,
-  mergePullRequest,
-  parseGithubWebhook,
-  parsePullRequestUrl,
-  prepareRepository,
-  verifyGithubSignature,
-  classifyGithubIssueComment,
-  ensureRepositoryControlLabel,
-  githubIssuesEventCarriesExactControlLabel,
-  isAuthorizedGithubControlPermission,
-  upsertIssueStatusComment,
-  type GithubWebhookEvent,
-} from "../providers/github/client.js";
-import type { ActivityPublicationInput, ActivityPublicationPort } from "../app/ports.js";
+  KernelHttpConflictError,
+  KernelHttpNotFoundError,
+  type KernelHttpService,
+  type KernelProviderWebhookResponse,
+  type KernelRepositorySetupInput,
+  type KernelRepositorySetupPort,
+} from "../app/kernel-http.js";
+import type { KernelHistoricalRunQuery } from "../persistence/kernel-analysis-store.js";
+import { KERNEL_INBOX_MAX_PAYLOAD_BYTES } from "../persistence/kernel-inbox-store.js";
+import type { KernelLogCursor, KernelLogKind } from "../persistence/kernel-projection-store.js";
 import { readStreamUpToByteLimit } from "../shared/bounded-stream.js";
-import { MAX_PRIVATE_LOG_TAIL_CHARS } from "../shared/logs.js";
 import { sanitizeText } from "../shared/sanitize.js";
-import {
-  createLinearClientProvider,
-  createLinearOAuthStateStore,
-  persistLinearToken,
-} from "../providers/linear/auth.js";
-import {
-  createWebhookDeliveryProcessor,
-  type WebhookDeliveryProcessor,
-} from "./webhook-delivery.js";
-import { createLinearActivityPublisher, createLinearOutboxProcessor, tryPostError, type LinearOutboxProcessor } from "../providers/linear/outbox.js";
-import { handleControlEvent, type PipelineCoordinatorContext, type SessionServicePorts } from "../app/session-service.js";
-import { createAdmissionPreflight } from "../app/admission-preflight.js";
-import { buildAdmissionDrainReport } from "../app/admission-drain-report.js";
-import { eventPredatesCurrentSession, handleGithubEvent } from "../providers/github/events.js";
-import {
-  beginGithubSupervisorCommentWrite,
-  settleGithubSupervisorCommentWrite,
-} from "../providers/github/comment-provenance.js";
-import { renderPipelineLogHeader } from "../pipeline/publication.js";
-import { canSteerPipelineRun, requestPipelineStop } from "../pipeline/control.js";
-import { stageById } from "../pipeline/manifest.js";
-import type { PipelineStore } from "../pipeline/store.js";
-import type { ExecutionUnitStore } from "../persistence/pipeline/unit-store.js";
-import type { AnalysisStore } from "../persistence/pipeline/analysis-store.js";
-import type { CitationGateStore } from "../persistence/pipeline/citation-gate-store.js";
-import type { AdmissionDrainStore } from "../persistence/admission-drain-store.js";
-import {
-  MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT,
-  ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
-} from "../persistence/migrations/runner.js";
-import type { RuntimeInventory, RuntimeLogs, RuntimeSnapshotReadiness } from "../runtime/contracts.js";
-import { executeRawCitationGate } from "./citation-executor.js";
 
-const MAX_CITATION_CONTRACT_BYTES = 256 * 1024;
-const MAX_WEBHOOK_BODY_BYTES = 5 * 1024 * 1024;
-const WEBHOOK_BODY_TOO_LARGE = "webhook payload exceeds 5 MiB";
-const MAX_CUTOVER_EVIDENCE_CHARS = 4_000;
-const CUTOVER_PHASES = new Set([
-  "registered",
-  "paused",
-  "drain_clear",
-  "staged",
-  "deployed",
-  "verified",
-  "restored",
-  "recovery_required",
-  "resumed",
-]);
+const CONTROL_BODY_MAX_BYTES = 16 * 1024;
+const REGISTRATION_BODY_MAX_BYTES = 32 * 1024;
+const WEBHOOK_BODY_TOO_LARGE = `webhook payload exceeds ${KERNEL_INBOX_MAX_PAYLOAD_BYTES} bytes`;
+const TERMINAL_OUTCOMES: readonly PipelineTerminalOutcome[] = [
+  "completed", "no_change", "needs_human", "failed", "canceled", "superseded",
+];
+const RECORD_KINDS = ["result", "decision", "delivery"] as const;
+const LOG_KINDS: readonly KernelLogKind[] = [
+  "run", "attempt", "record", "effect", "checkpoint", "inbox",
+];
+const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const TEAM_KEY = /^[A-Za-z0-9_-]+$/;
 
-function boundedString(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(`${field} must be a non-empty string`);
-  }
-  return sanitizeText(value).slice(0, 500);
+type KernelHttpConfig = Pick<
+  Config,
+  | "statusToken"
+  | "deployToken"
+  | "linearWebhookSecret"
+  | "githubWebhookSecret"
+  | "webhookMaxAgeSeconds"
+>;
+
+export interface KernelServerCapabilities {
+  release: string;
+  capability_digest: string;
+  capabilities: readonly string[];
+  task_timeout_seconds: number;
 }
 
-function boundedEvidence(value: unknown): string | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string") throw new Error("evidence must be a string");
-  return sanitizeText(value).slice(0, MAX_CUTOVER_EVIDENCE_CHARS);
+export interface KernelServerDeps {
+  cfg: KernelHttpConfig;
+  capabilities: KernelServerCapabilities;
+  service: KernelHttpService;
+  repository_setup: KernelRepositorySetupPort;
 }
 
-function cutoverPhase(value: unknown) {
-  const phase = boundedString(value, "phase");
-  if (!CUTOVER_PHASES.has(phase)) throw new Error(`unsupported cutover phase: ${phase}`);
-  return phase as Parameters<SupervisorStore["advanceDeploymentCutover"]>[0]["phase"];
-}
-
-export interface ServerDeps {
-  cfg: Config;
-  store: SupervisorStore;
-  runtime: RuntimeLogs & RuntimeSnapshotReadiness & RuntimeInventory;
-  // A plain read-only handle onto run_outcomes/receipt evidence, wired
-  // directly off `db` in index.ts -- deliberately not part of
-  // pipelineCoordinator.store (PipelineStore), which gate/transition/
-  // scheduler/effect-drain code consumes. See analysis-store.ts.
-  analysisStore: AnalysisStore;
-  citationGateStore: CitationGateStore;
-  admissionDrainStore: AdmissionDrainStore;
-  runBackground?: (task: Promise<void>) => void;
-  getLinearClient?: () => Promise<LinearClient | undefined>;
-  deliveryProcessor?: WebhookDeliveryProcessor;
-  linearOutboxProcessor?: LinearOutboxProcessor;
-  pipelineCoordinator: PipelineCoordinatorContext;
-}
-
-function bearerToken(header: string | undefined): string | undefined {
-  const match = header?.match(/^Bearer\s+(.+)$/i);
-  return match?.[1];
+function tokenHash(token: string): Buffer {
+  return createHash("sha256").update(token).digest();
 }
 
 function hasBearer(header: string | undefined, expected: string): boolean {
-  const actual = bearerToken(header);
-  if (!actual) return false;
-  const actualHash = tokenHash(actual);
-  const expectedHash = tokenHash(expected);
-  return hashesMatch(actualHash, expectedHash);
-}
-
-function tokenHash(token: string): string {
-  return createHash("sha256").update(token).digest("hex");
-}
-
-function hashesMatch(left: string, right: string): boolean {
-  if (!/^[a-f\d]{64}$/i.test(left) || !/^[a-f\d]{64}$/i.test(right)) return false;
-  return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
+  const match = header?.match(/^Bearer\s+(.+)$/i);
+  if (!match?.[1]) return false;
+  return timingSafeEqual(tokenHash(match[1]), tokenHash(expected));
 }
 
 async function readBoundedUtf8Body(
   request: Request,
-  maxBytes: number,
-  tooLargeMessage = "citation_contract: JSON exceeds 256 KiB"
+  maximum: number,
+  tooLargeMessage: string,
 ): Promise<string> {
   const contentLength = request.headers.get("content-length");
   if (contentLength !== null) {
-    const declaredBytes = Number(contentLength);
-    if (Number.isSafeInteger(declaredBytes) && declaredBytes > maxBytes) {
-      throw new Error(tooLargeMessage);
-    }
+    const declared = Number(contentLength);
+    if (Number.isSafeInteger(declared) && declared > maximum) throw new Error(tooLargeMessage);
   }
-
   if (request.body === null) return "";
-  // Cancellation rejections are deliberately swallowed here, matching the
-  // previous `reader.cancel().catch(() => undefined)` behavior.
-  const read = await readStreamUpToByteLimit(request.body, maxBytes);
+  const read = await readStreamUpToByteLimit(request.body, maximum);
   if (read.exceeded) throw new Error(tooLargeMessage);
   return new TextDecoder("utf-8", { fatal: true }).decode(read.bytes);
 }
 
-function findTicket(store: SupervisorStore, identifier: string): Ticket | undefined {
-  return store.getByIssueId(identifier);
-}
-
-const LINEAR_TEAM_KEY_PATTERN = /^[A-Za-z0-9_-]+$/;
-
-// Upper bound on an operator steering message. Keeps a single injected file
-// bounded (it is written verbatim into the sandbox and framed as untrusted data
-// for the agent) and roughly aligns with the sandbox event body cap.
-const MAX_STEER_MESSAGE_CHARS = 8_000;
-
-function isGithubRepository(value: string): boolean {
-  const parts = value.split("/");
-  return (
-    parts.length === 2 &&
-    parts.every(
-      (part) =>
-        part !== "." &&
-        part !== ".." &&
-        /^[A-Za-z0-9_.-]+$/.test(part)
-    )
-  );
-}
-
-function isSafeBranchName(value: string): boolean {
-  if (!value || value.length > 255 || value === "@") return false;
-  if (/^[./-]|[/.]$/.test(value)) return false;
-  if (/\.\.|@\{|\/\/|[~^:?*\[\\\s]/.test(value)) return false;
-  return value.split("/").every((part) => part && !part.startsWith(".") && !part.endsWith(".lock"));
-}
-
-function repositoryRegistrationInput(value: unknown): {
-  repo: string;
-  controlProvider: "linear" | "github";
-  linearTeamKey?: string;
-  linearTeamId?: string;
-  baseBranch?: string;
-} {
+function record(value: unknown, name: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("request body must be an object");
+    throw new Error(`${name} must be an object`);
   }
-  const input = value as Record<string, unknown>;
-  if (typeof input.repo !== "string" || !isGithubRepository(input.repo)) {
-    throw new Error("repo must be owner/name");
+  return value as Record<string, unknown>;
+}
+
+function string(value: unknown, name: string, maximum = 500): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > maximum || value.includes("\0")) {
+    throw new Error(`${name} must be a non-empty string of at most ${maximum} characters`);
   }
-  const controlProvider = input.controlProvider ?? "linear";
+  return value;
+}
+
+function jsonPayload(raw: string): { object: Record<string, unknown>; value: JsonValue } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("request body is not valid JSON");
+  }
+  return {
+    object: record(parsed, "request body"),
+    value: jsonValueAt(parsed, "request.body"),
+  };
+}
+
+function positiveInteger(value: string | undefined, name: string, maximum: number): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) {
+    throw new Error(`${name} must be between 1 and ${maximum}`);
+  }
+  return parsed;
+}
+
+function optionalNonnegativeInteger(value: unknown, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new Error(`${name} must be a nonnegative integer`);
+  }
+  return value as number;
+}
+
+function slug(value: unknown, name: string): string {
+  const normalized = string(value, name, 100)
+    .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!normalized) throw new Error(`${name} cannot be normalized`);
+  return normalized;
+}
+
+function deliveryAttempt(request: Request): number {
+  return positiveInteger(
+    request.headers.get("x-openthrottle-delivery-attempt") ?? undefined,
+    "delivery attempt",
+    1_000_000,
+  ) ?? 1;
+}
+
+function verifySignature(raw: string, signature: string | undefined, secret: string, github: boolean): boolean {
+  const digest = createHmac("sha256", secret).update(raw).digest("hex");
+  const expected = github ? `sha256=${digest}` : digest;
+  if (typeof signature !== "string" || signature.length !== expected.length) return false;
+  return timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+}
+
+function nestedObject(parent: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const value = parent[key];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function linearWebhook(raw: string, request: Request, maxAgeSeconds: number) {
+  const { object: payload, value } = jsonPayload(raw);
+  const action = slug(payload.action, "Linear action");
+  const type = slug(payload.type, "Linear event type");
+  const webhookId = string(payload.webhookId, "Linear webhookId");
+  if (typeof payload.webhookTimestamp !== "number" || !Number.isFinite(payload.webhookTimestamp)) {
+    throw new Error("Linear webhookTimestamp must be a number");
+  }
+  if (Math.abs(Date.now() - payload.webhookTimestamp) > maxAgeSeconds * 1_000) {
+    throw new KernelWebhookStaleError();
+  }
+  const session = nestedObject(payload, "agentSession");
+  const issue = session ? nestedObject(session, "issue") : undefined;
+  const team = issue ? nestedObject(issue, "team") : nestedObject(payload, "team");
+  if (!team) throw new Error("Linear webhook does not identify a team route");
+  const teamId = typeof team.id === "string" ? string(team.id, "Linear team ID", 300) : undefined;
+  const teamKey = typeof team.key === "string" ? string(team.key, "Linear team key", 300) : undefined;
+  if (!teamId && !teamKey) throw new Error("Linear webhook does not identify a team route");
+  return {
+    provider: "linear" as const,
+    delivery_id: request.headers.get("linear-delivery") ?? webhookId,
+    kind: `linear/${type}/${action}@1`,
+    event_group_key: `linear:${webhookId}`,
+    delivery_attempt: deliveryAttempt(request),
+    route: {
+      ...(teamId ? { linear_team_id: teamId } : {}),
+      ...(teamKey ? { linear_team_key: teamKey } : {}),
+    },
+    payload_schema: "openthrottle.provider-event/linear/v1",
+    payload: value,
+  };
+}
+
+function githubGroupKey(event: string, action: string, payload: JsonValue): string {
+  // GitHub retries normally retain the delivery ID. Including a canonical
+  // semantic digest also recognizes an identical event delivered under a new
+  // ID without collapsing two legitimate updates to the same Issue or PR.
+  return `github:${event}:${action}:${digestCanonicalJson(payload)}`;
+}
+
+function githubWebhook(raw: string, request: Request) {
+  const { object: payload, value } = jsonPayload(raw);
+  const action = slug(payload.action, "GitHub action");
+  const event = slug(request.headers.get("x-github-event"), "X-GitHub-Event");
+  const deliveryId = string(
+    request.headers.get("x-github-delivery"),
+    "X-GitHub-Delivery",
+  );
+  const repository = nestedObject(payload, "repository");
+  const fullName = string(repository?.full_name, "GitHub repository.full_name", 300);
+  if (!REPOSITORY.test(fullName)) throw new Error("GitHub repository.full_name is invalid");
+  return {
+    provider: "github" as const,
+    delivery_id: deliveryId,
+    kind: `github/${event}/${action}@1`,
+    event_group_key: githubGroupKey(event, action, value),
+    delivery_attempt: deliveryAttempt(request),
+    route: { github_repo: fullName },
+    payload_schema: "openthrottle.provider-event/github/v1",
+    payload: value,
+  };
+}
+
+class KernelWebhookStaleError extends Error {
+  constructor() {
+    super("webhook timestamp is stale");
+    this.name = "KernelWebhookStaleError";
+  }
+}
+
+function registrationInput(value: Record<string, unknown>): KernelRepositorySetupInput {
+  const repo = string(value.repo, "repo", 300);
+  if (!REPOSITORY.test(repo)) throw new Error("repo must be owner/name");
+  const controlProvider = value.controlProvider ?? "linear";
   if (controlProvider !== "linear" && controlProvider !== "github") {
     throw new Error("controlProvider must be linear or github");
   }
-  if (controlProvider === "linear") {
-    if (
-      typeof input.linearTeamKey !== "string" ||
-      !LINEAR_TEAM_KEY_PATTERN.test(input.linearTeamKey)
-    ) {
-      throw new Error("linearTeamKey is required for Linear control");
+  const baseBranch = value.baseBranch === undefined
+    ? undefined
+    : string(value.baseBranch, "baseBranch", 300);
+  if (controlProvider === "github") {
+    if (value.linearTeamKey !== undefined || value.linearTeamId !== undefined) {
+      throw new Error("GitHub control does not accept Linear team fields");
     }
-  } else if (input.linearTeamKey !== undefined || input.linearTeamId !== undefined) {
-    throw new Error("Linear team fields are not accepted for GitHub control");
+    return { repo, controlProvider, ...(baseBranch ? { baseBranch } : {}) };
   }
-  if (
-    input.linearTeamId !== undefined &&
-    (typeof input.linearTeamId !== "string" || !input.linearTeamId.trim())
-  ) {
-    throw new Error("linearTeamId must be a non-empty string");
-  }
-  if (
-    input.baseBranch !== undefined &&
-    (typeof input.baseBranch !== "string" || !isSafeBranchName(input.baseBranch))
-  ) {
-    throw new Error("baseBranch is not a safe Git branch name");
-  }
+  const linearTeamKey = string(value.linearTeamKey, "linearTeamKey", 300).toUpperCase();
+  if (!TEAM_KEY.test(linearTeamKey)) throw new Error("linearTeamKey is invalid");
+  const linearTeamId = value.linearTeamId === undefined
+    ? undefined
+    : string(value.linearTeamId, "linearTeamId", 300);
   return {
-    repo: input.repo,
+    repo,
     controlProvider,
-    linearTeamKey: typeof input.linearTeamKey === "string"
-      ? input.linearTeamKey.toUpperCase()
-      : undefined,
-    linearTeamId: typeof input.linearTeamId === "string" ? input.linearTeamId.trim() : undefined,
-    baseBranch: input.baseBranch || undefined,
+    linearTeamKey,
+    ...(linearTeamId ? { linearTeamId } : {}),
+    ...(baseBranch ? { baseBranch } : {}),
   };
 }
 
-function githubIssueTarget(
-  store: SupervisorStore,
-  sessionId: string | undefined,
-  issueId: string | undefined
-): { repo: string; issueNumber: number; identity: string } | undefined {
-  const ticket = issueId ? store.getByIssueId(issueId) : undefined;
-  const sessionThread = sessionId?.match(/^github:(.+#\d+)(?::.*)?$/)?.[1];
-  const external = ticket?.control_provider === "github"
-    ? ticket.external_thread_id
-    : issueId?.startsWith("github:")
-      ? issueId.slice("github:".length)
-      : sessionThread;
-  const match = external?.match(/^(.+)#(\d+)$/);
-  if (!match) return undefined;
-  const issueNumber = Number(match[2]);
-  if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0 || !isGithubRepository(match[1]!)) {
-    return undefined;
+function analysisQuery(request: Request): KernelHistoricalRunQuery {
+  const url = new URL(request.url);
+  const terminal = url.searchParams.get("terminal_outcome") ?? undefined;
+  if (terminal !== undefined && !TERMINAL_OUTCOMES.includes(terminal as PipelineTerminalOutcome)) {
+    throw new Error(`terminal_outcome must be one of: ${TERMINAL_OUTCOMES.join(", ")}`);
+  }
+  const kind = url.searchParams.get("record_kind") ?? undefined;
+  if (kind !== undefined && !RECORD_KINDS.includes(kind as (typeof RECORD_KINDS)[number])) {
+    throw new Error(`record_kind must be one of: ${RECORD_KINDS.join(", ")}`);
   }
   return {
-    repo: match[1]!,
-    issueNumber,
-    identity: sessionId ?? issueId ?? `github:${external}`,
+    ...(url.searchParams.get("pipeline_id")
+      ? { pipeline_id: url.searchParams.get("pipeline_id")! }
+      : {}),
+    ...(terminal === undefined ? {} : { terminal_outcome: terminal as PipelineTerminalOutcome }),
+    ...(kind === undefined ? {} : { record_kind: kind as (typeof RECORD_KINDS)[number] }),
+    ...(url.searchParams.get("from") ? { from: url.searchParams.get("from")! } : {}),
+    ...(url.searchParams.get("to") ? { to: url.searchParams.get("to")! } : {}),
+    ...(url.searchParams.get("limit")
+      ? { limit: positiveInteger(url.searchParams.get("limit")!, "limit", 500) }
+      : {}),
   };
 }
 
-function githubActivityBody(marker: string, activity: ActivityPublicationInput): string {
-  const content = activity.type === "action"
-    ? [`**${activity.action}:** ${activity.parameter}`, activity.result].filter(Boolean).join("\n\n")
-    : activity.body;
-  return `${marker}\n\n## OpenThrottle control\n\n${sanitizeText(content).slice(0, 8_000)}`;
-}
-
-function createGithubIssueActivityPublisher(
-  cfg: Config,
-  store: SupervisorStore
-): ActivityPublicationPort {
-  const publish = async (
-    activity: ActivityPublicationInput,
-    issueId?: string
-  ): Promise<void> => {
-    const target = githubIssueTarget(store, activity.sessionId, issueId);
-    if (!target) throw new Error("GitHub control activity has no Issue target");
-    const identity = createHash("sha256").update(target.identity).digest("hex").slice(0, 32);
-    const marker = `<!-- openthrottle:control-session:${identity} -->`;
-    const writeIntent = beginGithubSupervisorCommentWrite(
-      store,
-      target.repo,
-      target.issueNumber,
-      marker
-    );
-    const result = await upsertIssueStatusComment(
-      { token: cfg.githubToken },
-      target.repo,
-      target.issueNumber,
-      marker,
-      githubActivityBody(marker, activity)
-    );
-    store.setSetting(`github-supervisor-comment:${result.id}`, "control-session");
-    settleGithubSupervisorCommentWrite(
-      store,
-      writeIntent,
-      result.id
-    );
-  };
-  return {
-    publishActivity: publish,
-    publishError: (sessionId, issueId, message) => publish({
-      sessionId: sessionId ?? issueId ?? "github:unknown",
-      type: "error",
-      body: message,
-    }, issueId),
-  };
-}
-
-export function createProviderAwareActivityPublisher(
-  cfg: Config,
-  store: SupervisorStore,
-  linearActivityPublisher: ActivityPublicationPort
-): ActivityPublicationPort {
-  const githubActivityPublisher = createGithubIssueActivityPublisher(cfg, store);
-  return {
-    publishActivity: (activity, issueId, runId) =>
-      githubIssueTarget(store, activity.sessionId, issueId)
-        ? githubActivityPublisher.publishActivity(activity, issueId, runId)
-        : linearActivityPublisher.publishActivity(activity, issueId, runId),
-    publishError: (sessionId, issueId, message) =>
-      githubIssueTarget(store, sessionId, issueId)
-        ? githubActivityPublisher.publishError(sessionId, issueId, message)
-        : linearActivityPublisher.publishError(sessionId, issueId, message),
-  };
-}
-
-// A dead GitHub delivery carries no session binding the way Linear deliveries
-// do, so its ticket is recovered from the stored webhook payload: the Issue
-// thread first (issues/issue_comment; a PR comment's issue number is its pull
-// number), then the pull-request branch/URL (pull_request, reviews, CI).
-function githubDeliveryTicket(
-  store: SupervisorStore,
-  delivery: WebhookDelivery
-): Ticket | undefined {
-  if (!delivery.payload) return undefined;
-  let payload: {
-    repository?: { full_name?: unknown };
-    issue?: { number?: unknown };
-    pull_request?: { head?: { ref?: unknown }; html_url?: unknown };
-  };
-  try {
-    payload = JSON.parse(delivery.payload) as typeof payload;
-  } catch {
-    return undefined;
+function logCursor(request: Request): KernelLogCursor | undefined {
+  const url = new URL(request.url);
+  const occurredAt = url.searchParams.get("after_at") ?? undefined;
+  const kind = url.searchParams.get("after_kind") ?? undefined;
+  const id = url.searchParams.get("after_id") ?? undefined;
+  if (occurredAt === undefined && kind === undefined && id === undefined) return undefined;
+  if (!occurredAt || !kind || id === undefined || !LOG_KINDS.includes(kind as KernelLogKind)) {
+    throw new Error("log cursor requires valid after_at, after_kind, and after_id");
   }
-  const repo = payload.repository?.full_name;
-  if (typeof repo !== "string" || !isGithubRepository(repo)) return undefined;
-  const issueNumber = payload.issue?.number;
-  if (typeof issueNumber === "number" && Number.isSafeInteger(issueNumber) && issueNumber > 0) {
-    const ticket = store.getByExternalThread("github", `${repo}#${issueNumber}`) ??
-      store.getByPrUrl(repo, `https://github.com/${repo}/pull/${issueNumber}`);
-    if (ticket) return ticket;
+  if (!Number.isFinite(Date.parse(occurredAt))) throw new Error("after_at must be an ISO timestamp");
+  return { occurred_at: occurredAt, kind: kind as KernelLogKind, id };
+}
+
+function webhookResponse(context: Context, result: KernelProviderWebhookResponse) {
+  if (!result.accepted) {
+    if (!result.acknowledge) {
+      context.header("Retry-After", String(result.retry_after_seconds));
+      return context.json(result, 503);
+    }
+    return context.json(result, 202);
   }
-  const headRef = payload.pull_request?.head?.ref;
-  if (typeof headRef === "string" && headRef) {
-    const ticket = store.getByBranch(repo, headRef);
-    if (ticket) return ticket;
-  }
-  const prUrl = payload.pull_request?.html_url;
-  if (typeof prUrl === "string" && prUrl) return store.getByPrUrl(repo, prUrl);
-  return undefined;
+  return context.json({
+    accepted: true,
+    acknowledge: true,
+    retryable: false,
+    event_id: result.event.id,
+    duplicate: result.duplicate,
+  }, result.duplicate ? 200 : 202);
 }
 
-function githubControlEventPredatesCurrentSession(
-  store: SupervisorStore,
-  event: GithubWebhookEvent
-): boolean {
-  const target = event.kind === "issues"
-    ? {
-        externalThreadId: `${event.repository.full_name}#${event.issue.number}`,
-        timestamp: event.action === "closed"
-          ? event.issue.closed_at ?? event.issue.updated_at
-          : event.issue.updated_at ?? event.issue.created_at,
-      }
-    : event.kind === "issue_comment" && classifyGithubIssueComment(event) === "plain_issue_comment"
-      ? {
-          externalThreadId: `${event.repository.full_name}#${event.issue.number}`,
-          timestamp: event.comment.created_at,
-        }
-      : undefined;
-  if (!target?.timestamp || Number.isNaN(Date.parse(target.timestamp))) return false;
-  const ticket = store.getByExternalThread("github", target.externalThreadId);
-  if (!ticket) return false;
-  // The timestamp chooser above is this call site's own; the session
-  // resolution and comparison are shared with providers/github/events.ts.
-  return eventPredatesCurrentSession(store, ticket, target.timestamp);
+function errorStatus(error: unknown): 400 | 404 | 409 {
+  if (error instanceof KernelHttpNotFoundError) return 404;
+  if (error instanceof KernelHttpConflictError) return 409;
+  return 400;
 }
 
-// Linear- and GitHub-controlled sessions use the exact same GitHub-backed
-// repository read and merge ports; build them in one place so the two port
-// sets cannot drift apart.
-function repositoryAndMergePorts(
-  cfg: Config
-): Pick<SessionServicePorts, "repositoryReader" | "merger"> {
-  return {
-    repositoryReader: {
-      branchExists: (repository: string, branch: string) =>
-        branchExists({ token: cfg.githubToken }, repository, branch),
-      getRepositoryConfigAtCommit: (repository: string, branch: string) =>
-        getRepositoryConfigAtCommit({ token: cfg.githubToken }, repository, branch),
-      getRepositoryFileAtCommit: (repository: string, commit: string, path: string) =>
-        getRepositoryFileAtCommit({ token: cfg.githubToken }, repository, commit, path),
-      getRepositoryDirectoryAtCommit: (repository: string, commit: string, path: string) =>
-        getRepositoryDirectoryAtCommit({ token: cfg.githubToken }, repository, commit, path),
-    },
-    merger: {
-      parsePullRequestUrl,
-      getMergeReadiness: (repo: string, pullNumber: number) =>
-        getMergeReadiness({ token: cfg.githubToken }, repo, pullNumber),
-      mergePullRequest: (repo: string, pullNumber: number, expectedHeadSha: string) =>
-        mergePullRequest({ token: cfg.githubToken }, repo, pullNumber, expectedHeadSha),
-    },
-  };
+function safeError(error: unknown): string {
+  return sanitizeText(error instanceof Error ? error.message : String(error)).slice(0, 1_500);
 }
 
-export function createServerWebhookDeliveryProcessor(deps: {
-  cfg: Config;
-  store: SupervisorStore;
-  runtime: RuntimeInventory;
-  getLinearClient: () => Promise<LinearClient | undefined>;
-  linearOutbox?: LinearOutboxProcessor;
-  pipelineCoordinator: PipelineCoordinatorContext;
-  // OPE-75: best-effort reclaim of eligible terminal stopped runtime
-  // resources, wired in index.ts (operations/runtime-resource-reclaim.ts).
-  // The admission preflight runs this once before rejecting a delegation on
-  // capacity. Kept as a generic callback here so http/ stays clear of an
-  // operations/ import (see __tests__/architecture.test.ts boundary map).
-  reconcileRuntimeCapacity?: () => Promise<unknown>;
-}): WebhookDeliveryProcessor {
-  const linearOutbox =
-    deps.linearOutbox ??
-    createLinearOutboxProcessor({ store: deps.store, getLinearClient: deps.getLinearClient });
-  const admissionPreflight = createAdmissionPreflight(deps.cfg, deps.runtime, deps.reconcileRuntimeCapacity);
-  const linearActivityPublisher = createLinearActivityPublisher(deps.store, linearOutbox);
-  const githubActivityPublisher = createGithubIssueActivityPublisher(deps.cfg, deps.store);
-  const activityPublisher = createProviderAwareActivityPublisher(
-    deps.cfg,
-    deps.store,
-    linearActivityPublisher
-  );
-  const createSessionServicePorts = (linear: LinearClient): SessionServicePorts => ({
-    activityPublisher: linearActivityPublisher,
-    labelResolver: {
-      fetchThreadLabels: (issueId: string) => fetchIssueLabels(linear, issueId),
-    },
-    ...repositoryAndMergePorts(deps.cfg),
-  });
-  const githubSessionServicePorts: SessionServicePorts = {
-    activityPublisher: githubActivityPublisher,
-    labelResolver: {
-      fetchThreadLabels: async (threadId: string) => {
-        const match = threadId.match(/^(.+)#(\d+)$/);
-        if (!match) throw new Error("GitHub thread id is not repository#issueNumber");
-        return fetchGithubIssueLabels(
-          { token: deps.cfg.githubReadToken },
-          match[1]!,
-          Number(match[2])
-        );
-      },
-    },
-    ...repositoryAndMergePorts(deps.cfg),
-  };
-  return createWebhookDeliveryProcessor({
-    store: deps.store,
-    maxAttempts: 8,
-    baseDelayMs: 30_000,
-    onDead: async (delivery, error) => {
-      const message =
-        `OpenThrottle could not process this event after ${delivery.attempts} attempts: ` +
-        sanitizeText(String(error)).slice(-4_000);
-      if (delivery.source === "linear") {
-        if (!delivery.session_id) return;
-        await tryPostError(deps.store, linearOutbox, delivery.session_id, undefined, message);
-        return;
-      }
-      // Dead GitHub deliveries must stay operator-visible: events.ts throws
-      // to retry in many places, and exhausting maxAttempts would otherwise
-      // leave nothing but a webhook_deliveries.last_error row.
-      const ticket = githubDeliveryTicket(deps.store, delivery);
-      if (!ticket) return;
-      // Durable journal trace first, so the abandonment survives even when
-      // the provider publication below fails as well.
-      try {
-        deps.pipelineCoordinator.store.recordJournalEntry({
-          id: `github-delivery-dead:${delivery.id}`,
-          issueId: ticket.ticket_id,
-          instanceId:
-            deps.pipelineCoordinator.store.getInstanceForSession(ticket.session_id)?.id ?? null,
-          actor: "supervisor",
-          kind: "run_note",
-          trigger: "GitHub webhook delivery processing",
-          action: `Abandoned GitHub delivery ${delivery.id} (${delivery.action}) after ${delivery.attempts} attempts.`,
-          outcome: "dead",
-          refs: {
-            provider: "github",
-            delivery_id: delivery.id,
-            event: delivery.action,
-            last_error: sanitizeText(String(error)).slice(0, 500),
-          },
-        });
-      } catch (journalError) {
-        console.error(
-          `[webhooks/github] failed to journal dead delivery ${delivery.id}:`,
-          journalError
-        );
-      }
-      await activityPublisher.publishError(ticket.session_id, ticket.ticket_id, message);
-    },
-    handler: async (delivery: WebhookDelivery) => {
-      if (!delivery.payload) throw new Error(`Delivery ${delivery.id} has no stored payload`);
-      if (delivery.source === "linear") {
-        const linear = await deps.getLinearClient();
-        if (!linear) throw new Error("No valid Linear OAuth token is stored");
-        await handleControlEvent(
-          deps.cfg,
-          deps.store,
-          createSessionServicePorts(linear),
-          linearControlEvent(parseLinearWebhook(delivery.payload)),
-          deps.pipelineCoordinator,
-          admissionPreflight,
-          delivery.received_at
-        );
-        return;
-      }
-      await handleGithubEvent(
-        deps.cfg,
-        deps.store,
-        activityPublisher,
-        parseGithubWebhook(delivery.event_name ?? undefined, delivery.payload),
-        deps.pipelineCoordinator.store,
-        {
-          ports: githubSessionServicePorts,
-          coordinator: deps.pipelineCoordinator,
-          preflight: admissionPreflight,
-          deliveryId: delivery.id,
-          receivedAt: delivery.received_at,
-        }
-      );
-      await deps.pipelineCoordinator.drainEffects?.();
-    },
-  });
-}
-
-export function createServer(deps: ServerDeps): Hono {
-  const { cfg, store, runtime } = deps;
-  const getLinearClient = deps.getLinearClient ?? createLinearClientProvider(cfg, store);
-  const linearOutboxProcessor =
-    deps.linearOutboxProcessor ??
-    createLinearOutboxProcessor({ store, getLinearClient });
-  const deliveryProcessor =
-    deps.deliveryProcessor ??
-    createServerWebhookDeliveryProcessor({
-      cfg,
-      store,
-      runtime,
-      getLinearClient,
-      linearOutbox: linearOutboxProcessor,
-      pipelineCoordinator: deps.pipelineCoordinator,
-    });
-  const oauthStates = createLinearOAuthStateStore(() => randomBytes(16).toString("hex"));
-  const schedule =
-    deps.runBackground ??
-    ((task: Promise<void>) => {
-      void task.catch((error) => console.error("[background] unhandled task error:", error));
-    });
+export function createServer(deps: KernelServerDeps): Hono {
   const app = new Hono();
-
-  const requireStatusAuth = (authorization: string | undefined) =>
-    hasBearer(authorization, cfg.statusToken);
-  const requireDeployAuth = (authorization: string | undefined) =>
-    hasBearer(authorization, cfg.deployToken);
+  const statusAuthorized = (header: string | undefined) => hasBearer(header, deps.cfg.statusToken);
+  const deployAuthorized = (header: string | undefined) => hasBearer(header, deps.cfg.deployToken);
 
   app.get("/healthz", (context) => context.json({ ok: true }));
 
-  // Authenticated, bounded evidence of the active runtime release: the CLI's
-  // pre-mutation structured-ship gate (RR5/RR9) reads this before any Linear
-  // access and must never activate structured mutation on an assumed or
-  // cached capability set.
   app.get("/capabilities", (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
+    if (!statusAuthorized(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);
     }
-    const runtime = deps.pipelineCoordinator.runtime;
     return context.json({
-      release: runtime.descriptor.release,
-      capabilityDigest: runtime.digest,
-      capabilities: runtime.descriptor.capabilities,
-      limits: { taskTimeoutSeconds: cfg.taskTimeout },
+      release: deps.capabilities.release,
+      capabilityDigest: deps.capabilities.capability_digest,
+      capabilities: deps.capabilities.capabilities,
+      limits: { taskTimeoutSeconds: deps.capabilities.task_timeout_seconds },
     });
   });
 
-  app.get("/deployment/cutover-evidence", async (context) => {
-    if (!requireDeployAuth(context.req.header("Authorization"))) {
-      return context.json({ error: "unauthorized" }, 401);
-    }
-    const admission = store.getAdmissionMaintenanceState();
-    const drain = await buildAdmissionDrainReport({
-      store: deps.admissionDrainStore,
-      runtime,
-      admissionPaused: admission.paused === 1,
-      epochStartedAtIso: admission.updated_at,
-      nowIso: new Date().toISOString(),
-    });
-    return context.json({
-      admission,
-      runtime: {
-        release: deps.pipelineCoordinator.runtime.descriptor.release,
-        capabilityDigest: deps.pipelineCoordinator.runtime.digest,
-      },
-      snapshot: cfg.daytonaSnapshot,
-      cutover: store.getOpenDeploymentCutover() ?? null,
-      database: {
-        migrationRollbackCompatibility: {
-          contract: MIGRATION_ROLLBACK_COMPATIBILITY_CONTRACT,
-          markerField: "schema_migrations.name",
-          markerSuffix: ROLLBACK_COMPATIBLE_MIGRATION_NAME_SUFFIX,
-        },
-      },
-      drain,
-    });
-  });
-
-  app.post("/deployment/cutover/begin", async (context) => {
-    if (!requireDeployAuth(context.req.header("Authorization"))) {
+  app.get("/runs/:reference/status", (context) => {
+    if (!statusAuthorized(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);
     }
     try {
-      const body = await context.req.json().catch(() => ({})) as Record<string, unknown>;
-      const cutover = store.beginDeploymentCutover({
-        id: typeof body.id === "string" && body.id.trim() !== "" ? sanitizeText(body.id).slice(0, 200) : undefined,
-        oldRuntimeRelease: boundedString(body.oldRuntimeRelease, "oldRuntimeRelease"),
-        oldSnapshot: boundedString(body.oldSnapshot, "oldSnapshot"),
-        candidateSnapshot: boundedString(body.candidateSnapshot, "candidateSnapshot"),
-        evidence: boundedEvidence(body.evidence),
-      });
-      return context.json({ cutover });
+      const limit = positiveInteger(context.req.query("limit"), "limit", 200);
+      return context.json({ run: deps.service.status(context.req.param("reference"), limit) });
     } catch (error) {
-      return context.json({ error: String(error) }, 409);
+      return context.json({ error: safeError(error) }, errorStatus(error));
     }
   });
 
-  app.post("/deployment/cutover/advance", async (context) => {
-    if (!requireDeployAuth(context.req.header("Authorization"))) {
+  app.get("/runs/:reference/logs", (context) => {
+    if (!statusAuthorized(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);
     }
     try {
-      const body = await context.req.json().catch(() => ({})) as Record<string, unknown>;
-      const pauseEpoch = body.pauseEpoch === undefined ? undefined : Number(body.pauseEpoch);
-      const cutover = store.advanceDeploymentCutover({
-        id: boundedString(body.id, "id"),
-        phase: cutoverPhase(body.phase),
-        evidence: boundedEvidence(body.evidence),
-        pauseEpoch: Number.isSafeInteger(pauseEpoch) ? pauseEpoch : undefined,
-        recoveryCommand: body.recoveryCommand === null ? null : boundedEvidence(body.recoveryCommand),
-        status: body.status === "active" || body.status === "completed" || body.status === "recovery_required"
-          ? body.status
-          : undefined,
-      });
-      return context.json({ cutover });
+      return context.json(deps.service.logs({
+        reference: context.req.param("reference"),
+        ...(logCursor(context.req.raw) ? { after: logCursor(context.req.raw)! } : {}),
+        ...(context.req.query("limit")
+          ? { limit: positiveInteger(context.req.query("limit"), "limit", 500) }
+          : {}),
+      }));
     } catch (error) {
-      return context.json({ error: String(error) }, 409);
+      return context.json({ error: safeError(error) }, errorStatus(error));
     }
   });
 
-  app.post("/maintenance/admission/pause", async (context) => {
-    if (!requireDeployAuth(context.req.header("Authorization"))) {
+  app.get("/analysis/runs", (context) => {
+    if (!statusAuthorized(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);
     }
-    const body = await context.req.json().catch(() => ({})) as { reason?: unknown };
-    const reason = typeof body.reason === "string" && body.reason.trim() !== ""
-      ? sanitizeText(body.reason).slice(0, 500)
-      : undefined;
-    return context.json({ admission: store.pauseAdmission(reason) });
+    try {
+      return context.json({ runs: deps.service.analysis(analysisQuery(context.req.raw)) });
+    } catch (error) {
+      return context.json({ error: safeError(error) }, 400);
+    }
   });
 
-  app.post("/maintenance/admission/resume", (context) => {
-    if (!requireDeployAuth(context.req.header("Authorization"))) {
+  app.get("/runs/:reference/analysis", (context) => {
+    if (!statusAuthorized(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);
     }
-    return context.json({ admission: store.resumeAdmission() });
+    try {
+      const kind = context.req.query("kind");
+      if (kind !== undefined && !RECORD_KINDS.includes(kind as (typeof RECORD_KINDS)[number])) {
+        throw new Error(`kind must be one of: ${RECORD_KINDS.join(", ")}`);
+      }
+      return context.json(deps.service.runAnalysis({
+        reference: context.req.param("reference"),
+        ...(kind === undefined ? {} : { kind: kind as (typeof RECORD_KINDS)[number] }),
+        ...(context.req.query("limit")
+          ? { limit: positiveInteger(context.req.query("limit"), "limit", 500) }
+          : {}),
+      }));
+    } catch (error) {
+      return context.json({ error: safeError(error) }, errorStatus(error));
+    }
   });
 
-  app.get("/status", (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
+  app.post("/runs/:reference/control", async (context) => {
+    if (!statusAuthorized(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);
     }
-    return context.json({
-      tickets: store.listAll().map((ticket) => {
-        const pipeline = deps.pipelineCoordinator.store.getStatusForIssue(ticket.ticket_id);
-        return {
-          id: ticket.ticket_id,
-          reference: ticket.ticket_reference,
-          current_session_id: ticket.session_id,
-          control_provider: ticket.control_provider,
-          external_thread: {
-            provider: ticket.control_provider,
-            id: ticket.external_thread_id,
-            reference: ticket.external_thread_reference,
-          },
-          branch: ticket.branch,
-          repo: ticket.repo,
-          base_branch: ticket.base_branch,
-          agent: ticket.agent,
-          state: ticket.state,
-          pr_url: ticket.pr_url,
-          sandbox_id: ticket.sandbox_id,
-          running_since: ticket.running_since,
-          total_cost_usd: ticket.total_cost_usd,
-          last_error: ticket.last_error,
-          created_at: ticket.created_at,
-          updated_at: ticket.updated_at,
-          pipeline: pipeline ?? null,
-        };
-      }),
-    });
+    try {
+      const raw = await readBoundedUtf8Body(
+        context.req.raw,
+        CONTROL_BODY_MAX_BYTES,
+        `control request exceeds ${CONTROL_BODY_MAX_BYTES} bytes`,
+      );
+      const body = jsonPayload(raw).object;
+      const action = body.action;
+      if (action !== "stop" && action !== "supersede") {
+        throw new Error("action must be stop or supersede");
+      }
+      const reason = body.reason === undefined ? undefined : string(body.reason, "reason", 1_500);
+      const result = deps.service.requestRunControl({
+        reference: context.req.param("reference"),
+        action,
+        ...(reason ? { reason } : {}),
+      });
+      if (!result.accepted) {
+        context.header("Retry-After", String(result.retry_after_seconds ?? 30));
+        return context.json(result, 503);
+      }
+      return context.json(result, result.duplicate ? 200 : 202);
+    } catch (error) {
+      return context.json({ error: safeError(error) }, errorStatus(error));
+    }
   });
 
   app.get("/repositories", (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
+    if (!statusAuthorized(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);
     }
-    return context.json({ repositories: store.listRepositoryRegistrations() });
-  });
-
-  // Read-only evidence for improvement proposals: run_outcomes and the
-  // receipt data folded into it (see docs/SPEC.md "Analysis read-contract").
-  // Never consumed by gate, transition, scheduler, or effect-drain code --
-  // enforced by supervisor/src/__tests__/architecture.test.ts.
-  app.get("/analysis/runs", (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
-      return context.json({ error: "unauthorized" }, 401);
-    }
-    const limit = context.req.query("limit");
-    try {
-      return context.json({
-        runs: deps.analysisStore.listRunOutcomes({
-          outcome: context.req.query("outcome"),
-          reason: context.req.query("reason"),
-          attribution: context.req.query("attribution"),
-          graph: context.req.query("graph"),
-          skillDigest: context.req.query("skill_digest"),
-          from: context.req.query("from"),
-          to: context.req.query("to"),
-          limit: limit ? Number(limit) : undefined,
-        }),
-      });
-    } catch (error) {
-      return context.json({ error: sanitizeText(String(error)) }, 400);
-    }
-  });
-
-  app.post("/analysis/citations/grade", async (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
-      return context.json({ error: "unauthorized" }, 401);
-    }
-    try {
-      const execution = executeRawCitationGate({
-        raw: await readBoundedUtf8Body(context.req.raw, MAX_CITATION_CONTRACT_BYTES),
-        analysisStore: deps.analysisStore,
-        citationGateStore: deps.citationGateStore,
-      });
-      return context.json({
-        ...execution.grade,
-        gate: {
-          result: execution.decision.result,
-          outcome: execution.decision.outcome,
-          reason: execution.decision.reason,
-          proposal_hash: execution.decision.proposal_hash,
-          grade_hash: execution.decision.grade_hash,
-          receipt_hash: execution.receipt.receipt_hash,
-        },
-      }, execution.grade.result === "pass" ? 200 : 422);
-    } catch (error) {
-      return context.json({ error: sanitizeText(String(error)) }, 400);
-    }
+    return context.json({ repositories: deps.service.registrations() });
   });
 
   app.post("/repositories/register", async (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
+    if (!statusAuthorized(context.req.header("Authorization"))) {
       return context.json({ error: "unauthorized" }, 401);
     }
-    let input: ReturnType<typeof repositoryRegistrationInput>;
+    let input: KernelRepositorySetupInput;
     try {
-      input = repositoryRegistrationInput(await context.req.json());
+      const raw = await readBoundedUtf8Body(
+        context.req.raw,
+        REGISTRATION_BODY_MAX_BYTES,
+        `registration request exceeds ${REGISTRATION_BODY_MAX_BYTES} bytes`,
+      );
+      input = registrationInput(jsonPayload(raw).object);
     } catch (error) {
-      return context.json({ error: sanitizeText(String(error)) }, 400);
-    }
-    if (
-      input.controlProvider === "linear" &&
-      (!cfg.linearWebhookSecret || !cfg.linearClientId || !cfg.linearClientSecret)
-    ) {
-      return context.json({
-        error: "Linear control provider is unavailable: LINEAR_WEBHOOK_SECRET/LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET are not configured.",
-      }, 503);
+      return context.json({ error: safeError(error) }, 400);
     }
     try {
-      const snapshot = await runtime.getSnapshot(cfg.daytonaSnapshot);
-      if (String(snapshot.state).toLowerCase() !== "active") {
-        throw new Error(
-          `Daytona snapshot ${cfg.daytonaSnapshot} is not active (${String(snapshot.state)})`
-        );
-      }
-      const github = await prepareRepository(
-        { token: cfg.githubToken },
-        {
-          repo: input.repo,
-          requestedBaseBranch: input.baseBranch,
-          webhookUrl: `${cfg.supervisorUrl}/webhooks/github`,
-          webhookSecret: cfg.githubWebhookSecret,
-        }
-      );
-      const controlLabel = input.controlProvider === "github"
-        ? await ensureRepositoryControlLabel({ token: cfg.githubToken }, github.repo)
-        : undefined;
-      const registration = store.registerRepository({
-        controlProvider: input.controlProvider,
-        linearTeamKey: input.linearTeamKey,
-        linearTeamId: input.linearTeamId,
-        githubRepo: github.repo,
-        baseBranch: github.baseBranch,
-        webhookId: github.webhookId,
-        snapshot: cfg.daytonaSnapshot,
-      });
-      return context.json({
-        registration,
-        readiness: {
-          github: "ready",
-          webhook: github.webhookAction,
-          ...(controlLabel ? { controlLabel } : {}),
-          snapshot: { name: snapshot.name, state: snapshot.state },
-        },
-      });
+      const result = deps.service.registerPrepared(await deps.repository_setup.prepare(input));
+      return context.json(result, result.disposition === "unchanged" ? 200 : 201);
     } catch (error) {
-      return context.json(
-        { error: sanitizeText(`Repository setup failed: ${String(error)}`) },
-        502
-      );
+      return context.json({ error: safeError(error) }, 502);
     }
   });
 
-  app.get("/oauth/install", (context) => {
-    if (!hasBearer(context.req.header("Authorization"), cfg.installSecret)) {
-      return context.text("unauthorized", 401);
+  app.get("/maintenance", (context) => {
+    if (!deployAuthorized(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
     }
-    if (!cfg.linearClientId) {
-      return context.text("Linear control provider is unavailable: LINEAR_CLIENT_ID is not configured.", 503);
-    }
-    const state = oauthStates.issue();
-    return context.redirect(
-      buildLinearInstallUrl({
-        clientId: cfg.linearClientId,
-        redirectUri: `${cfg.supervisorUrl}/oauth/callback`,
-        state,
-      }),
-      302
-    );
+    return context.json({ maintenance: deps.service.maintenanceState() });
   });
 
-  app.get("/oauth/callback", async (context) => {
-    const code = context.req.query("code");
-    const state = context.req.query("state");
-    if (!code) return context.text("Missing code", 400);
-    if (!cfg.linearClientId || !cfg.linearClientSecret) {
-      return context.text("Linear control provider is unavailable: LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET are not configured.", 503);
-    }
-    if (!oauthStates.consume(state)) {
-      return context.text("Missing or expired state", 400);
+  const maintenanceMutation = (closed: boolean) => async (context: Context) => {
+    if (!deployAuthorized(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
     }
     try {
-      const token = await exchangeLinearOAuthCode({
-        clientId: cfg.linearClientId,
-        clientSecret: cfg.linearClientSecret,
-        redirectUri: `${cfg.supervisorUrl}/oauth/callback`,
-        code,
-      });
-      persistLinearToken(store, token);
-      return context.text("OpenThrottle Linear app installed successfully. You can close this tab.");
+      const raw = await readBoundedUtf8Body(
+        context.req.raw,
+        CONTROL_BODY_MAX_BYTES,
+        `maintenance request exceeds ${CONTROL_BODY_MAX_BYTES} bytes`,
+      );
+      const expectedVersion = raw === ""
+        ? undefined
+        : optionalNonnegativeInteger(jsonPayload(raw).object.expected_version, "expected_version");
+      const maintenance = closed
+        ? deps.service.closeMaintenance(expectedVersion)
+        : deps.service.openMaintenance(expectedVersion);
+      return context.json({ maintenance });
     } catch (error) {
-      console.error("[oauth] Linear token exchange failed:", error);
-      return context.text("OAuth exchange failed, check supervisor logs.", 500);
+      return context.json({ error: safeError(error) }, 409);
+    }
+  };
+  app.post("/maintenance/close", maintenanceMutation(true));
+  app.post("/maintenance/open", maintenanceMutation(false));
+
+  app.get("/maintenance/active-work", async (context) => {
+    if (!deployAuthorized(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    try {
+      const limit = positiveInteger(context.req.query("limit"), "limit", 2_000);
+      return context.json(await deps.service.activeWork(limit));
+    } catch (error) {
+      return context.json({ error: safeError(error) }, 400);
     }
   });
 
   app.post("/webhooks/linear", async (context) => {
-    if (!cfg.linearWebhookSecret) {
-      return context.text("Linear control provider is unavailable: LINEAR_WEBHOOK_SECRET is not configured.", 503);
+    if (!deps.cfg.linearWebhookSecret) {
+      return context.json({ error: "Linear webhook ingress is unavailable" }, 503);
     }
-    let rawBody: string;
+    let raw: string;
     try {
-      rawBody = await readBoundedUtf8Body(
+      raw = await readBoundedUtf8Body(
         context.req.raw,
-        MAX_WEBHOOK_BODY_BYTES,
-        WEBHOOK_BODY_TOO_LARGE
+        KERNEL_INBOX_MAX_PAYLOAD_BYTES,
+        WEBHOOK_BODY_TOO_LARGE,
       );
     } catch (error) {
-      return error instanceof Error && error.message === WEBHOOK_BODY_TOO_LARGE
-        ? context.text(WEBHOOK_BODY_TOO_LARGE, 413)
-        : context.text("invalid payload", 400);
+      return context.json({ error: safeError(error) },
+        error instanceof Error && error.message === WEBHOOK_BODY_TOO_LARGE ? 413 : 400);
     }
-    if (!verifyLinearSignature(rawBody, context.req.header("Linear-Signature"), cfg.linearWebhookSecret)) {
-      return context.text("invalid signature", 401);
-    }
-    let payload: ReturnType<typeof parseLinearWebhook>;
+    if (!verifySignature(
+      raw,
+      context.req.header("Linear-Signature"),
+      deps.cfg.linearWebhookSecret,
+      false,
+    )) return context.json({ error: "invalid signature" }, 401);
     try {
-      payload = parseLinearWebhook(rawBody);
+      return webhookResponse(
+        context,
+        deps.service.ingestProviderWebhook(linearWebhook(raw, context.req.raw, deps.cfg.webhookMaxAgeSeconds)),
+      );
     } catch (error) {
-      console.warn("[webhooks/linear] invalid payload:", error);
-      return context.text("invalid payload", 400);
+      return context.json(
+        { error: safeError(error) },
+        error instanceof KernelWebhookStaleError ? 401 : 400,
+      );
     }
-    if (!isRecentLinearWebhook(payload.webhookTimestamp, cfg.webhookMaxAgeSeconds)) {
-      return context.text("stale webhook", 401);
-    }
-    const deliveryId = context.req.header("Linear-Delivery") ?? payload.webhookId;
-    if (
-      !store.claimDelivery({
-        deliveryId,
-        source: "linear",
-        sessionId: payload.agentSession.id,
-        action: payload.action,
-        eventName: payload.type,
-        payload: rawBody,
-      })
-    ) {
-      schedule(deliveryProcessor.process(deliveryId));
-      return context.text("ok", 200);
-    }
-    schedule(deliveryProcessor.process(deliveryId));
-    return context.text("ok", 200);
   });
 
   app.post("/webhooks/github", async (context) => {
-    let rawBody: string;
+    let raw: string;
     try {
-      rawBody = await readBoundedUtf8Body(
+      raw = await readBoundedUtf8Body(
         context.req.raw,
-        MAX_WEBHOOK_BODY_BYTES,
-        WEBHOOK_BODY_TOO_LARGE
+        KERNEL_INBOX_MAX_PAYLOAD_BYTES,
+        WEBHOOK_BODY_TOO_LARGE,
       );
     } catch (error) {
-      return error instanceof Error && error.message === WEBHOOK_BODY_TOO_LARGE
-        ? context.text(WEBHOOK_BODY_TOO_LARGE, 413)
-        : context.text("invalid payload", 400);
+      return context.json({ error: safeError(error) },
+        error instanceof Error && error.message === WEBHOOK_BODY_TOO_LARGE ? 413 : 400);
     }
-    if (!verifyGithubSignature(rawBody, context.req.header("X-Hub-Signature-256"), cfg.githubWebhookSecret)) {
-      return context.text("invalid signature", 401);
-    }
-    const eventName = context.req.header("X-GitHub-Event");
-    let event: GithubWebhookEvent;
+    if (!verifySignature(
+      raw,
+      context.req.header("X-Hub-Signature-256"),
+      deps.cfg.githubWebhookSecret,
+      true,
+    )) return context.json({ error: "invalid signature" }, 401);
     try {
-      event = parseGithubWebhook(eventName, rawBody);
+      return webhookResponse(context, deps.service.ingestProviderWebhook(githubWebhook(raw, context.req.raw)));
     } catch (error) {
-      if (String(error).includes("Unsupported GitHub event")) return context.text("ignored", 200);
-      return context.text("invalid payload", 400);
-    }
-    const authorizeGithubWebhookActor = async (repo: string, author: string | undefined) => {
-      if (!author) return false;
-      const permission = await getRepositoryCollaboratorPermission(
-        { token: cfg.githubReadToken },
-        repo,
-        author
-      );
-      return isAuthorizedGithubControlPermission(permission);
-    };
-    if (
-      event.kind === "issues" &&
-      (event.action === "closed" || githubIssuesEventCarriesExactControlLabel(event))
-    ) {
-      // `sender` is the actor for the webhook action. The Issue author may be
-      // a different person and must never lend their permission to a label or
-      // close event whose sender is absent.
-      const author = event.sender?.login;
-      try {
-        if (!await authorizeGithubWebhookActor(event.repository.full_name, author)) {
-          return context.text("ok", 200);
-        }
-      } catch (error) {
-        console.warn("[webhooks/github] collaborator permission lookup failed:", error);
-        return context.text("permission lookup unavailable", 503);
-      }
-    }
-    if (
-      event.kind === "issue_comment" &&
-      classifyGithubIssueComment(event) === "plain_issue_comment" &&
-      event.action === "created"
-    ) {
-      const author = event.comment.user?.login;
-      try {
-        if (!await authorizeGithubWebhookActor(event.repository.full_name, author)) {
-          return context.text("ok", 200);
-        }
-      } catch (error) {
-        console.warn("[webhooks/github] collaborator permission lookup failed:", error);
-        return context.text("permission lookup unavailable", 503);
-      }
-    }
-    if (githubControlEventPredatesCurrentSession(store, event)) {
-      return context.text("ok", 200);
-    }
-    const deliveryId =
-      context.req.header("X-GitHub-Delivery") ?? createHash("sha256").update(rawBody).digest("hex");
-    if (
-      !store.claimDelivery({
-        deliveryId,
-        source: "github",
-        action: `${event.kind}:${event.action}`,
-        eventName,
-        payload: rawBody,
-      })
-    ) {
-      schedule(deliveryProcessor.process(deliveryId));
-      return context.text("ok", 200);
-    }
-    schedule(deliveryProcessor.process(deliveryId));
-    return context.text("ok", 200);
-  });
-
-  app.post("/tickets/:identifier/stop", async (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
-      return context.json({ error: "unauthorized" }, 401);
-    }
-    const ticket = findTicket(store, context.req.param("identifier"));
-    if (!ticket) return context.json({ error: "ticket not found" }, 404);
-    try {
-      const pipeline = deps.pipelineCoordinator.store.getInstanceForSession(ticket.session_id);
-      if (!pipeline) return context.json({ error: "pipeline not found" }, 409);
-      requestPipelineStop({
-        store: deps.pipelineCoordinator.store,
-        sessionId: ticket.session_id,
-        eventId: `operator-stop:${pipeline.id}`,
-        reason: "Stopped by operator.",
-      });
-      await deps.pipelineCoordinator.drainEffects?.();
-      const refreshed = findTicket(store, context.req.param("identifier"));
-      const stopEffect = deps.pipelineCoordinator.store.listEffects(pipeline.id)
-        .filter((effect) => effect.kind === "stop")
-        .at(-1);
-      const stopped = refreshed?.run_id == null && stopEffect?.status === "acknowledged";
-      return context.json({
-        ok: true,
-        status: stopped ? "stopped" : "stop_requested",
-        ...(stopEffect ? { effect: { id: stopEffect.id, status: stopEffect.status } } : {}),
-      }, stopped ? 200 : 202);
-    } catch (error) {
-      const message = sanitizeText(`Failed to stop workspace: ${String(error)}`);
-      await tryPostError(
-        store,
-        linearOutboxProcessor,
-        ticket.session_id,
-        ticket.ticket_id,
-        message
-      );
-      return context.json({ error: message }, 502);
-    }
-  });
-
-  app.post("/tickets/:identifier/steer", async (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
-      return context.json({ error: "unauthorized" }, 401);
-    }
-    const ticket = findTicket(store, context.req.param("identifier"));
-    if (!ticket) return context.json({ error: "ticket not found" }, 404);
-    let body: unknown;
-    try {
-      body = await context.req.json();
-    } catch {
-      return context.json({ error: "invalid JSON" }, 400);
-    }
-    const message = (body as Record<string, unknown> | null)?.message;
-    if (
-      typeof message !== "string" ||
-      !message.trim() ||
-      message.length > MAX_STEER_MESSAGE_CHARS
-    ) {
-      return context.json({ error: "message is required" }, 400);
-    }
-    const pipeline = deps.pipelineCoordinator.store.getInstanceForSession(ticket.session_id);
-    if (!pipeline) return context.json({ error: "pipeline not found" }, 409);
-    const activeAttempt = deps.pipelineCoordinator.store.getActiveAttempt(pipeline.id);
-    const canSteerNow = canSteerPipelineRun({
-      store: deps.pipelineCoordinator.store,
-      sessionId: ticket.session_id,
-      runId: ticket.run_id,
-      agent: ticket.agent,
-      attempt: activeAttempt,
-    });
-    if (!canSteerNow && pipeline.status !== "running") {
-      return context.json({ error: "the current pipeline stage does not accept live steering" }, 409);
-    }
-    // The message is untrusted data and is never executed. When the current
-    // stage accepts steering, fence it to that exact run; otherwise leave it
-    // unbound until a later steerable stage can lease it.
-    const record = store.enqueueInbox({
-      issueId: ticket.ticket_id,
-      sessionId: ticket.session_id,
-      runId: canSteerNow ? ticket.run_id : null,
-      source: "operator",
-      body: message,
-    });
-    // A composite (`for_each_unit`) run has no steerable child-action fence
-    // today, so a reply captured here can never be bound and delivered live
-    // (see docs/SPEC.md "Live steering"). Record that fact durably in the
-    // structured ledger instead of letting it be silently canceled later
-    // with no trace, so the terminal receipt says so.
-    if (!canSteerNow) {
-      const activeStage = activeAttempt
-        ? stageById(pipeline.normalized_manifest, activeAttempt.stage_id)
-        : undefined;
-      if (activeAttempt && activeStage?.executor.kind === "loop_action") {
-        // Best-effort: the message is already durably captured above. A
-        // failure here should not turn an already-captured steer into a
-        // client-visible error or invite a duplicating retry.
-        try {
-          (deps.pipelineCoordinator.store as PipelineStore & ExecutionUnitStore).recordSteeringCaptured({
-            parentAttemptId: activeAttempt.id,
-            id: record.id,
-            body: "Operator steering message captured but not delivered: this run is a structured multi-unit stage, which does not yet support live steering to a specific child action. The message is recorded in Linear session activity only.",
-          });
-        } catch (error) {
-          console.error("[steer] failed to record steering_undelivered ledger note:", error);
-        }
-      }
-    }
-    return context.json({
-      ok: true,
-      id: record.id,
-      status: canSteerNow ? "queued" : "captured",
-      ...(canSteerNow
-        ? {}
-        : { message: "captured — retained for the next implementation or repair stage" }),
-    });
-  });
-
-  app.get("/tickets/:identifier/logs", async (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
-      return context.json({ error: "unauthorized" }, 401);
-    }
-    const ticket = findTicket(store, context.req.param("identifier"));
-    if (!ticket) return context.json({ error: "ticket not found" }, 404);
-    const pipeline = deps.pipelineCoordinator.store.getStatusForIssue(ticket.ticket_id);
-    const prefix = pipeline ? `${renderPipelineLogHeader(pipeline)}\n` : "";
-    const withPipelinePrefix = (logs: string) =>
-      prefix + sanitizeText(logs).slice(-Math.max(0, MAX_PRIVATE_LOG_TAIL_CHARS - prefix.length));
-    if (ticket.sandbox_id) {
-      try {
-        const logs = await runtime.getLogs(ticket.sandbox_id);
-        return context.text(withPipelinePrefix(logs));
-      } catch (error) {
-        console.warn(`[logs] live workspace unavailable for ${ticket.ticket_reference}:`, error);
-      }
-    }
-    const durableLogTail = store.getLatestRunWithLog(ticket.ticket_id)?.log_tail;
-    if (durableLogTail) {
-      return context.text(withPipelinePrefix(durableLogTail));
-    }
-    if (pipeline) return context.text(prefix);
-    return context.json({ error: "logs not found" }, 404);
-  });
-
-  app.get("/tickets/:identifier/admission", (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
-      return context.json({ error: "unauthorized" }, 401);
-    }
-    const ticket = findTicket(store, context.req.param("identifier"));
-    if (!ticket) return context.json({ error: "ticket not found" }, 404);
-    const status = deps.pipelineCoordinator.store.getStatusForIssue(ticket.ticket_id);
-    if (!status) return context.json({ error: "pipeline not found" }, 404);
-    const detail = deps.pipelineCoordinator.store.getAdmissionDetail(status.instance_id);
-    if (!detail) return context.json({ error: "automatic admission detail not found" }, 404);
-    return context.json(detail);
-  });
-
-  app.post("/tickets/:identifier/publications/:publicationId/retry", (context) => {
-    if (!requireStatusAuth(context.req.header("Authorization"))) {
-      return context.json({ error: "unauthorized" }, 401);
-    }
-    const ticket = findTicket(store, context.req.param("identifier"));
-    if (!ticket) return context.json({ error: "ticket not found" }, 404);
-    const pipelineStore = deps.pipelineCoordinator.store;
-    const publication = pipelineStore.getPublication(context.req.param("publicationId"));
-    const instance = publication ? pipelineStore.getInstance(publication.pipeline_instance_id) : undefined;
-    if (!publication || instance?.ticket_id !== ticket.ticket_id) {
-      return context.json({ error: "publication not found" }, 404);
-    }
-    try {
-      const retried = pipelineStore.retryPublication(publication.id);
-      if (retried.kind === "control_ledger") {
-        schedule(linearOutboxProcessor.process(retried.id));
-      }
-      return context.json({
-        ok: true,
-        publication: { id: retried.id, kind: retried.kind, status: retried.status },
-      });
-    } catch (error) {
-      return context.json({ error: sanitizeText(String(error)) }, 409);
+      return context.json({ error: safeError(error) }, 400);
     }
   });
 

@@ -1,1 +1,0 @@
-export const MAX_PRIVATE_LOG_TAIL_CHARS = 100_000;

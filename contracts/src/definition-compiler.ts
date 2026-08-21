@@ -26,6 +26,7 @@ import {
   type DefinitionBundle,
   type DefinitionBundleEntry,
   type DefinitionKind,
+  type TrustedPlatformDefinitionHashes,
 } from "./definition-bundle.js";
 import { validateEvalDefinition, type EvalDefinition } from "./eval.js";
 import {
@@ -38,6 +39,9 @@ import {
   type PipelineDefinition,
   type PipelineLoopDefinition,
 } from "./pipeline.js";
+import {
+  expandCompiledRuntimeLifecycle,
+} from "./runtime-lifecycle.js";
 import { validateFilesystemConfigContract, type FilesystemConfigContract } from "./config.js";
 import {
   GIT_SUBJECT,
@@ -76,6 +80,17 @@ export interface DefinitionCompilerInput {
 export interface DefinitionCompilation {
   readonly bundle: ValidatedContract<DefinitionBundle>;
   readonly manifest: ValidatedContract<CompiledPipelineManifest>;
+}
+
+export interface DefinitionBundleManifestInput {
+  readonly bundle: DefinitionBundle;
+  readonly compiler_environment: TrustedCompilerEnvironment;
+  readonly trusted_platform_definitions: TrustedPlatformDefinitionHashes;
+}
+
+export interface PlatformDefinitionHashesInput {
+  readonly platform: TrustedPlatformDefinitionSource;
+  readonly compiler_environment: TrustedCompilerEnvironment;
 }
 
 type DefinitionOrigin = "platform" | "repository";
@@ -574,6 +589,49 @@ function entry(
   };
 }
 
+/**
+ * Normalizes every release-sealed platform definition into the same identity
+ * and content hash used by DefinitionBundles. Recovery uses this independently
+ * derived map to authenticate stored bundles; trusting hashes copied from the
+ * bundle itself would make the platform-origin fence circular.
+ */
+export function deriveTrustedPlatformDefinitionHashes(
+  input: PlatformDefinitionHashesInput,
+): TrustedPlatformDefinitionHashes {
+  const compilerEnvironment = reverifyCompilerEnvironment(input.compiler_environment);
+  const files = loadFiles({
+    repository: { source_commit: "0".repeat(40), files: new Map() },
+    platform: input.platform,
+    compiler_environment: input.compiler_environment,
+  });
+  const { definitions, skillFiles } = indexDefinitions(files);
+  const evaluatorPrimitives = new Set(compilerEnvironment.evaluator_primitives);
+  const hashes = new Map<string, string>();
+  for (const descriptor of [...definitions.values()].sort((left, right) => {
+    const leftIdentity = definitionEntryIdentity(left.kind, left.id);
+    const rightIdentity = definitionEntryIdentity(right.kind, right.id);
+    return leftIdentity < rightIdentity ? -1 : leftIdentity > rightIdentity ? 1 : 0;
+  })) {
+    if (descriptor.file.origin !== "platform" || descriptor.kind === "config") {
+      fail(descriptor.file.path, "trusted platform source contains a non-platform definition");
+    }
+    const normalizedPayload = descriptor.kind === "agent"
+      ? descriptor.file.text
+      : descriptor.kind === "pipeline"
+        ? parsePipeline(descriptor)
+        : descriptor.kind === "loop"
+          ? parseLoop(descriptor)
+          : descriptor.kind === "skill"
+            ? skillPayload(descriptor, skillFiles.get(descriptor.id) ?? [])
+            : parseEval(descriptor, evaluatorPrimitives);
+    hashes.set(
+      definitionEntryIdentity(descriptor.kind, descriptor.id),
+      definitionEntryContentHash(normalizedPayload),
+    );
+  }
+  return hashes;
+}
+
 function parsePipeline(descriptor: DefinitionDescriptor): PipelineDefinition {
   const pipeline = validatePipelineDefinition(parseStrictYaml(
     descriptor.file.text,
@@ -698,10 +756,13 @@ export function compileDefinitionBundle(input: DefinitionCompilerInput): Definit
     parseStrictYaml(configDescriptor.file.text, configDescriptor.file.path, configDescriptor.file.bytes),
     { source: configDescriptor.file.path },
   ).value;
-  if (input.selected_pipeline !== undefined && input.selected_pipeline !== config.pipeline) {
-    fail("selected_pipeline", `must match config pipeline ${config.pipeline}`);
-  }
-  const pipelineDescriptor = requiredDefinition(definitions, "pipeline", config.pipeline, "config.pipeline");
+  const selectedPipeline = input.selected_pipeline ?? config.pipeline;
+  const pipelineDescriptor = requiredDefinition(
+    definitions,
+    "pipeline",
+    selectedPipeline,
+    input.selected_pipeline === undefined ? "config.pipeline" : "selected_pipeline",
+  );
   const pipeline = parsePipeline(pipelineDescriptor);
   const evaluatorPrimitives = new Set(compilerEnvironment.evaluator_primitives);
   const selectedEntries = new Map<string, DefinitionBundleEntry>();
@@ -735,17 +796,172 @@ export function compileDefinitionBundle(input: DefinitionCompilerInput): Definit
     runtime_capability_digest: compilerEnvironment.runtime_capability_digest,
     source_commit: input.repository.source_commit,
     pipeline_id: pipeline.id,
+    pipeline_selection: input.selected_pipeline === undefined ? "config" : "explicit",
     entries: [...selectedEntries.values()],
   }, { trustedPlatformDefinitions });
+  const runtimeLifecycle = expandCompiledRuntimeLifecycle({
+    entry_stage: pipeline.entry,
+    stages,
+  });
   const manifest = validateCompiledPipelineManifest({
     schema: COMPILED_PIPELINE_MANIFEST_SCHEMA,
     pipeline_id: pipeline.id,
     pipeline_version: pipeline.version,
-    entry_stage: pipeline.entry,
+    entry_stage: runtimeLifecycle.entry_stage,
     definition_bundle_hash: bundle.digest,
     compiler_version: compilerEnvironment.compiler_version,
     runtime_capability_digest: compilerEnvironment.runtime_capability_digest,
-    stages,
+    stages: runtimeLifecycle.stages,
   });
   return { bundle, manifest };
+}
+
+/**
+ * Reconstructs the private runtime protocol from the immutable bundle stored
+ * on the run. This deliberately does not read the repository, platform files,
+ * or a process-local manifest cache: restart recovery has exactly the same
+ * behavior identity as admission.
+ */
+export function compileManifestFromDefinitionBundle(
+  input: DefinitionBundleManifestInput,
+): ValidatedContract<CompiledPipelineManifest> {
+  const compilerEnvironment = reverifyCompilerEnvironment(input.compiler_environment);
+  const bundle = validateDefinitionBundle(input.bundle, {
+    source: "definition_bundle",
+    trustedPlatformDefinitions: input.trusted_platform_definitions,
+  });
+  if (bundle.value.compiler_version !== compilerEnvironment.compiler_version) {
+    fail(
+      "definition_bundle.compiler_version",
+      "does not match the pinned compiler environment",
+    );
+  }
+  if (bundle.value.runtime_capability_digest !== compilerEnvironment.runtime_capability_digest) {
+    fail(
+      "definition_bundle.runtime_capability_digest",
+      "does not match the pinned compiler environment",
+    );
+  }
+
+  const entries = new Map(bundle.value.entries.map((definition) => [
+    definitionEntryIdentity(definition.definition_kind, definition.definition_id),
+    definition,
+  ]));
+  const used = new Set<string>();
+  const requireEntry = (kind: DefinitionKind, id: string, source: string): DefinitionBundleEntry => {
+    const identity = definitionEntryIdentity(kind, id);
+    const definition = entries.get(identity);
+    if (!definition) fail(source, `${kind} ${id} is absent from the pinned DefinitionBundle`);
+    used.add(identity);
+    return definition;
+  };
+
+  const configEntry = requireEntry("config", "repository", "definition_bundle.entries");
+  if (configEntry.origin.kind !== "repository") {
+    fail("definition_bundle.entries.config:repository.origin", "config must be repository-owned");
+  }
+  const config = validateFilesystemConfigContract(configEntry.normalized_payload, {
+    source: configEntry.path,
+  }).value;
+  if (bundle.value.pipeline_selection === "config" && config.pipeline !== bundle.value.pipeline_id) {
+    fail("definition_bundle.pipeline_id", "does not match the bundled config selection");
+  }
+
+  const pipelineEntry = requireEntry(
+    "pipeline",
+    bundle.value.pipeline_id,
+    "definition_bundle.pipeline_id",
+  );
+  const pipeline = validatePipelineDefinition(pipelineEntry.normalized_payload, {
+    source: pipelineEntry.path,
+  }).value;
+  if (pipeline.id !== pipelineEntry.definition_id) {
+    fail(`${pipelineEntry.path}.id`, "does not match its DefinitionBundle identity");
+  }
+
+  const evaluatorPrimitives = new Set(compilerEnvironment.evaluator_primitives);
+  const compiled: CompiledPipelineStage[] = [];
+  for (const [index, stage] of pipeline.stages.entries()) {
+    let loop = stage.loop;
+    if (loop?.file !== undefined) {
+      const expectedPath = `.openthrottle/pipelines/${pipeline.id}/${loop.file}`;
+      const loopEntry = bundle.value.entries.find((candidate) =>
+        candidate.definition_kind === "loop" && candidate.path === expectedPath);
+      if (!loopEntry) {
+        fail(`${pipeline.id}.stages[${index}].loop.file`, `loop file ${loop.file} is absent from the pinned DefinitionBundle`);
+      }
+      requireEntry("loop", loopEntry.definition_id, `${pipeline.id}.stages[${index}].loop.file`);
+      const definition = validatePipelineLoopDefinition(loopEntry.normalized_payload, {
+        source: loopEntry.path,
+      }).value;
+      if (definition.id !== loopEntry.definition_id) {
+        fail(`${loopEntry.path}.id`, "does not match its DefinitionBundle identity");
+      }
+      loop = {
+        over: loop.over,
+        max_parallel: loop.max_parallel,
+        max_rounds: loop.max_rounds,
+        body: definition.body,
+      };
+    }
+    if (stage.kind === "agent") {
+      const agent = requireEntry(
+        "agent",
+        stage.agent_id,
+        `${pipeline.id}.stages[${index}].agent_id`,
+      );
+      if (typeof agent.normalized_payload !== "string" || agent.normalized_payload.trim() === "") {
+        fail(agent.path, "agent instructions must be a non-empty string");
+      }
+      for (const [skillIndex, skillId] of stage.skills.entries()) {
+        requireEntry(
+          "skill",
+          skillId,
+          `${pipeline.id}.stages[${index}].skills[${skillIndex}]`,
+        );
+      }
+      const evaluation = requireEntry(
+        "eval",
+        stage.eval,
+        `${pipeline.id}.stages[${index}].eval`,
+      );
+      const parsedEvaluation = validateEvalDefinition(evaluation.normalized_payload, {
+        source: evaluation.path,
+      }).value;
+      if (parsedEvaluation.id !== evaluation.definition_id) {
+        fail(`${evaluation.path}.id`, "does not match its DefinitionBundle identity");
+      }
+      if (!evaluatorPrimitives.has(parsedEvaluation.evaluator)) {
+        fail(`${evaluation.path}.evaluator`, `evaluator ${parsedEvaluation.evaluator} is not registered`);
+      }
+      compiled.push({ ...stage, ...(loop === undefined ? {} : { loop }), engine: config.engine });
+      continue;
+    }
+    if (stage.kind === "command" && !Object.hasOwn(config.commands ?? {}, stage.command)) {
+      fail(`${pipeline.id}.stages[${index}].command`, `command ${stage.command} is not defined by config`);
+    }
+    compiled.push({ ...stage, ...(loop === undefined ? {} : { loop }) });
+  }
+
+  if (used.size !== entries.size) {
+    const unused = [...entries.keys()].filter((identity) => !used.has(identity)).sort();
+    fail(
+      "definition_bundle.entries",
+      `contains definitions outside the selected transitive closure: ${unused.join(", ")}`,
+    );
+  }
+  const runtimeLifecycle = expandCompiledRuntimeLifecycle({
+    entry_stage: pipeline.entry,
+    stages: compiled,
+  });
+  return validateCompiledPipelineManifest({
+    schema: COMPILED_PIPELINE_MANIFEST_SCHEMA,
+    pipeline_id: pipeline.id,
+    pipeline_version: pipeline.version,
+    entry_stage: runtimeLifecycle.entry_stage,
+    definition_bundle_hash: bundle.digest,
+    compiler_version: compilerEnvironment.compiler_version,
+    runtime_capability_digest: compilerEnvironment.runtime_capability_digest,
+    stages: runtimeLifecycle.stages,
+  });
 }

@@ -50,7 +50,7 @@ describe("CLI package inventory", () => {
     );
 
     expect([...packaged.files.keys()]).toEqual(catalog.files.map(({ path }: { path: string }) => path));
-    expect(packaged.files.size).toBe(46);
+    expect(packaged.files.size).toBe(catalog.files.length);
     for (const [path, packagedFile] of packaged.files) {
       const sourceFile = source.files.get(path);
       expect(packagedFile.type).toBe("file");

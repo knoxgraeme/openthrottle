@@ -146,11 +146,9 @@ export class SetupOrchestrator {
       release: this.options.release,
       runtime,
       // Mirrors the supervisor's boot-fatal env authority (supervisor/src/app/config.ts).
-      // Optional Linear OAuth credentials are deliberately absent from the required bundle.
       secrets: {
         OT_STATUS_TOKEN: { owner: "cli", name: "status_token" },
         OT_DEPLOY_TOKEN: { owner: "provisioning", name: "deploy_token" },
-        OT_INSTALL_SECRET: { owner: "provisioning", name: "install_secret" },
         LINEAR_WEBHOOK_SECRET: { owner: "provisioning", name: "linear_webhook_secret" },
         GITHUB_WEBHOOK_SECRET: { owner: "provisioning", name: "github_webhook_secret" },
         GITHUB_TOKEN: { owner: "operator", name: "github_token" },

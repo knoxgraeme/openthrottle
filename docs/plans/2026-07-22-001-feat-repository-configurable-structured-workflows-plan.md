@@ -122,7 +122,7 @@ The structured release should improve plan-wide control without building a gener
 
 - R16. One unit attempt must reuse one worker native session and one worktree across implement → simplify → command → repair cycles while its unit, graph revision, base, skill digests, and workspace remain current.
 - R17. For every code-writing unit or final-repair attempt, the executor must create the worktree from the exact current integration head, prevent worker publication, derive the diff/tree/changed paths/cleanliness, create the internal candidate commit, and exclusively own any fast-forward of the integration branch.
-- R18. A worker request must contain one immutable unit envelope, the selected loop, typed transition context, exact subjects/digests, allowed skills/MCPs/credentials, and the caller-owned receipt contract.
+- R18. A worker request must contain one immutable unit envelope, the selected loop, typed transition context, exact subjects/digests, allowed skills and logical credentials, and the caller-owned receipt contract.
 - R19. A unit completion receipt must capture outcome, summary, assumptions, decisions, issues, verification performed, downstream context, and requested human input. Executor-derived Git and command facts must remain separate evidence.
 - R20. One graph-scoped lead session must receive the unit envelope, semantic receipt, executor evidence, command receipts, current integration context, and prior accepted context, then return `accept`, `revise`, `context_update`, or `needs_human`.
 
@@ -141,7 +141,7 @@ The structured release should improve plan-wide control without building a gener
 - R28. V1 must not create Linear subissues or auxiliary worker AgentSessions. Human steering enters through the parent session and is routed by the supervisor to the active lead or unit action under exact fences **using the shipped steering buffer** (`session_inbox`, statuses `pending → dispatched → acknowledged → canceled`, fenced by session/generation/native-session/request-hash): steering that arrives while the active stage is non-steerable is buffered and delivered against the exact fenced delivery, never hard-rejected and never carried on a bespoke parent→child path.
 - R29. SQLite remains coordinator authority, but a human must be able to understand unit status, assumptions, revision requests, gate rationale, exact subjects, and evidence links from Linear and GitHub.
 - R30. Workers, lead, reviewer, repair, and publisher processes must receive only their configured logical credentials. Daytona secret names must not appear in graph, loop, or worker schemas.
-- R31. `mcp_servers` must remain a repository-declared, validated inventory. A worker may receive only names in its allowlist; OpenThrottle must not import arbitrary personal Claude/Codex configuration.
+- R31. Repository and worker schemas expose no MCP configuration surface. OpenThrottle must not import arbitrary personal Claude, Codex, or OpenCode configuration; a future MCP capability requires a new sealed least-authority contract.
 - R32. Repository commands must be arbitrary bounded names mapped to exact command strings and execution policy. Graph nodes and execution-plan units reference names rather than hard-coded `test`/`lint`/`build` executor branches.
 - R33. Repository and graph limits must bound units, dependencies, unit attempts, loop reentries, final repair rounds, command output, and wall time. A graph may lower but not raise platform/runtime limits.
 - R34. Token/spend budgets, parallel isolation, **all dynamic graph changes (including the R36 scope-preserving split, which is itself deferred past V1)**, custom gate languages, and per-worker Linear sessions are deferred without weakening existing turn, timeout, credential, branch, subject, or publication fences.
@@ -371,7 +371,6 @@ commands:
   lint: { run: "...", timeout_seconds: 900, mutation: read_only }
   build: { run: "...", timeout_seconds: 1800, mutation: read_only }
 
-mcp_servers: {}
 limits:
   max_turns: 200
   task_timeout_seconds: 7200
@@ -392,31 +391,26 @@ workers:
     engine: inherit
     session: graph
     skills: [builtin://accept-unit@1]
-    mcp_servers: []
     credentials: [model.invoke]
   unit:
     engine: inherit
     session: attempt
     skills: [builtin://implement-unit@1, builtin://simplify-unit@1, builtin://repair-unit@1]
-    mcp_servers: []
     credentials: [model.invoke]
   reviewer:
     engine: inherit
     session: fresh
     skills: [builtin://final-review@1]
-    mcp_servers: []
     credentials: [model.invoke]
   final_repair:
     engine: inherit
     session: attempt
     skills: [builtin://final-repair@1]
-    mcp_servers: []
     credentials: [model.invoke]
   publisher:
     engine: inherit
     session: fresh
     skills: [builtin://publish@1]
-    mcp_servers: []
     credentials: [model.invoke, repo.write, provider.read]
 
 loops:
@@ -881,10 +875,10 @@ The U4a→U4b→U4c chain and U5 may proceed independently only after U1/U3 free
 
 1. Keep one root/executor-controlled integration checkout. Worktrees run **inside the one Daytona sandbox via exec**, not in a sibling sandbox. Serial execution means exactly **one writable worktree at a time**; create it from the exact integration head, expose only the working files the unprivileged agent needs, and **remove it on integration** so retained worktrees cannot accumulate against the 30 GiB org disk cap (the MCP-289 disk-quota outage is the standing constraint here).
 2. Let the worker edit and run tools but not commit or push. After each unit or final-repair cycle, the executor derives status/diff/tree and creates an internal candidate commit.
-3. Add `loop-action@1` requests containing graph/unit/attempt/loop/worker identities, exact digests/subjects, input scope, allowed skills/MCPs/credentials, receipt schema, context records, timeout, and native session id.
+3. Add `loop-action@1` requests containing graph/unit/attempt/loop/worker identities, exact digests/subjects, input scope, allowed skills and logical credentials, receipt schema, context records, timeout, and native session id.
 4. Namespace all logs, result spools, activities, steering, and native-session metadata by child attempt. Atomic result writes prevent cross-attempt confusion.
 5. Reuse a unit or final-repair native session only for its current attempt. Reuse the graph lead session across unit decisions. Force fresh final review sessions.
-6. Invoke only the skill selected by the sealed loop request and treat that as routing policy, not sandbox containment: the pinned image may expose other native CE skill bytes to a shell-capable agent. Materialize per-worker MCP config and logical credentials from the pinned repository inventory and allowlist. Keep provider secret mechanics inside the runtime adapter, then remove action-scoped config/credential files and reconcile any rotated credential state before the next worker can start.
+6. Invoke only the skill selected by the sealed loop request and treat that as routing policy, not sandbox containment: the pinned image may expose other native CE skill bytes to a shell-capable agent. Materialize only sealed logical credentials, keep provider secret mechanics inside the runtime adapter, and remove action-scoped credential files before the next worker can start. Do not import or translate ambient MCP configuration.
 
 **Test Scenarios:**
 
@@ -894,8 +888,8 @@ The U4a→U4b→U4c chain and U5 may proceed independently only after U1/U3 free
 - Implement, simplify, and repair reuse one unit session; a different unit or stale attempt cannot reuse it.
 - A final-repair worker uses a separate exact-base worktree/session, cannot write the integration checkout, and cannot reuse a unit attempt.
 - The lead session persists across two unit decisions, while two final reviews receive fresh sessions.
-- The loop runner enters only the configured skill; other installed skill visibility does not grant extra credentials, Git authority, or valid receipt provenance. Only configured MCP names appear in the generated worker config, and personal local config is absent.
-- A completed/canceled worker leaves no credential or MCP config readable by the next unit, lead, reviewer, or retained failed worktree.
+- The loop runner enters only the configured skill; other installed skill visibility does not grant extra credentials, Git authority, or valid receipt provenance. Generated worker configuration contains no ambient or repository-declared MCP servers, and personal local config is absent.
+- A completed/canceled worker leaves no credential or personal configuration readable by the next unit, lead, reviewer, or retained failed worktree.
 - Cancel and cleanup are idempotent and affect only the exact process/worktree.
 
 **Verification:**

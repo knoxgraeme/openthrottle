@@ -8,15 +8,14 @@
 const USAGE = `openthrottle — plan-first autonomous coding pipeline CLI
 
 Usage:
-  openthrottle setup [--profile <name>] [--check] [--yes] [--legacy-checklist]
+  openthrottle setup [--profile <name>] [--check] [--yes]
                                     Guided one-time platform onboarding from
                                     the CLI's pinned release manifest: verify
                                     credentials, approve mutations, provision
                                     the runtime snapshot and supervisor, and
                                     persist readiness evidence. --check is a
                                     read-only readiness report; --yes
-                                    pre-approves mutations; --legacy-checklist
-                                    prints the manual secrets checklist.
+                                    pre-approves mutations.
   openthrottle init [--profile <name>] [--dry-run]
                                     Register the current GitHub repository and
                                     control route, install local authoring/operator
@@ -38,14 +37,13 @@ Usage:
                                     Validate committed definitions, create a Linear
                                     issue, and delegate it to the agent. --pipeline
                                     asserts config; it never overrides it.
-  openthrottle status [<ticket>] [--admission]
-                                    Show provider-neutral status, or the exact
-                                    accepted automatic plan and review evidence.
+  openthrottle status <run-or-source-reference> [--json]
+                                    Show the shared-kernel run, Attempt, Effect,
+                                    checkpoint, and result-correction status.
   openthrottle stop <ticket>       Stop a ticket's active run and workspace.
   openthrottle logs <ticket>       Print sanitized sandbox logs.
-  openthrottle analysis [flags]    Read-only run_outcomes evidence for
-                                    improvement proposals: --outcome, --reason,
-                                    --attribution, --graph, --skill-digest,
+  openthrottle analysis [flags]    Read-only settled-run and Record metadata:
+                                    --run, --pipeline, --outcome, --record-kind,
                                     --from, --to, --limit.
   openthrottle operator-skill <install|status|refresh|remove> [--json]
                                     Manage the explicit local OpenThrottle

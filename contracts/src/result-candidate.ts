@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { canonicalJson, digestCanonicalJson } from "./canonical.js";
+import { validateExecutionPlanContractV2 } from "./execution-plan-v2.js";
 import {
   IDENTIFIER,
   arrayAt,
@@ -20,8 +21,11 @@ export const RESULT_CANDIDATE_SCHEMA = "openthrottle.result-candidate/v1" as con
 export const SEMANTIC_RESULT_SCHEMA = "openthrottle.semantic-result-schema/v1" as const;
 export const RESULT_NORMALIZATIONS = ["string-array-to-newlines/v1"] as const;
 export const RESULT_CANDIDATE_MAX_BYTES = 64 * 1024;
+export const SEMANTIC_EXECUTION_PLAN_MAX_BYTES = 56 * 1024;
 
-const SEMANTIC_FIELD_TYPES = ["string", "string_list", "boolean", "integer", "json"] as const;
+const SEMANTIC_FIELD_TYPES = [
+  "string", "string_list", "boolean", "integer", "json", "execution_plan_v2",
+] as const;
 const OUTCOME = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
 const FIELD_NAME = /^[a-z][a-z0-9_]*$/;
 const MAX_PAYLOAD_FIELDS = 64;
@@ -46,7 +50,7 @@ export type SemanticFieldContract =
     max_length: number;
     max_items: number;
   })
-  | (SemanticFieldBase & { type: "boolean" | "integer" | "json" });
+  | (SemanticFieldBase & { type: "boolean" | "integer" | "json" | "execution_plan_v2" });
 
 type StringSemanticFieldContract = Extract<SemanticFieldContract, { type: "string" }>;
 
@@ -56,51 +60,6 @@ export interface SemanticResultSchemaContract {
   outcomes: string[];
   payload: Record<string, SemanticFieldContract>;
 }
-
-// Built-in schemas are first-release fixtures for the generated runtime
-// artifact. U2 moves their authored equivalents into .openthrottle/evals/;
-// the generator remains the single compiler path for platform and repository
-// eval definitions.
-export const CORE_SEMANTIC_RESULT_SCHEMAS: readonly SemanticResultSchemaContract[] = [
-  {
-    schema: SEMANTIC_RESULT_SCHEMA,
-    id: "core/action-result",
-    outcomes: [
-      "success", "no_change", "semantic_repair_required", "needs_human",
-      "retryable_infrastructure_failure", "failure",
-    ],
-    payload: {
-      summary: { type: "string", required: true, max_length: 1_000, normalize: "string-array-to-newlines/v1" },
-      evidence: { type: "string_list", required: true, max_length: 1_000, max_items: 50 },
-      findings: { type: "json", required: true },
-      actions: { type: "string_list", required: true, max_length: 300, max_items: 50 },
-      uncertainty: { type: "string_list", required: true, max_length: 300, max_items: 20 },
-    },
-  },
-  {
-    schema: SEMANTIC_RESULT_SCHEMA,
-    id: "core/unit-result",
-    outcomes: ["success", "failure", "needs_human", "exited"],
-    payload: {
-      summary: { type: "string", required: true, max_length: 4_000, normalize: "string-array-to-newlines/v1" },
-      assumptions: { type: "string_list", required: true, max_length: 1_000, max_items: 32 },
-      decisions: { type: "string_list", required: true, max_length: 1_000, max_items: 32 },
-      issues: { type: "string_list", required: true, max_length: 1_000, max_items: 32 },
-      verification: { type: "string_list", required: true, max_length: 1_000, max_items: 32 },
-      downstream_context: { type: "json", required: true },
-      requested_human_input: { type: "string_list", required: true, max_length: 1_000, max_items: 16 },
-    },
-  },
-  {
-    schema: SEMANTIC_RESULT_SCHEMA,
-    id: "core/review-result",
-    outcomes: ["success", "no_change", "semantic_repair_required", "needs_human", "failure"],
-    payload: {
-      summary: { type: "string", required: true, max_length: 4_000, normalize: "string-array-to-newlines/v1" },
-      findings: { type: "json", required: true },
-    },
-  },
-];
 
 export interface ResultCandidate {
   schema: typeof RESULT_CANDIDATE_SCHEMA;
@@ -236,6 +195,14 @@ function validateSemanticValue(
       }
       return parsed;
     }
+    case "execution_plan_v2": {
+      if (value === null) return null;
+      const plan = validateExecutionPlanContractV2(value, { source: path }).value;
+      if (Buffer.byteLength(canonicalJson(plan), "utf8") > SEMANTIC_EXECUTION_PLAN_MAX_BYTES) {
+        fail(path, `must be at most ${SEMANTIC_EXECUTION_PLAN_MAX_BYTES} canonical JSON bytes`);
+      }
+      return plan;
+    }
   }
 }
 
@@ -295,10 +262,23 @@ interface JsonSchema {
   [key: string]: unknown;
 }
 
+function stringArraySchema(minItems: number, maxItems: number, maxLength: number): JsonSchema {
+  return {
+    type: "array",
+    minItems,
+    maxItems,
+    items: { type: "string", minLength: 1, maxLength },
+  };
+}
+
 function providerFieldSchema(field: SemanticFieldContract): JsonSchema {
   switch (field.type) {
     case "string": {
-      const stringSchema = { type: "string", minLength: 1, maxLength: field.max_length };
+      const stringSchema = {
+        type: "string",
+        minLength: 1,
+        maxLength: field.max_length,
+      };
       return field.normalize === "string-array-to-newlines/v1"
         ? {
           anyOf: [
@@ -325,6 +305,63 @@ function providerFieldSchema(field: SemanticFieldContract): JsonSchema {
       return { type: "integer" };
     case "json":
       return {};
+    case "execution_plan_v2":
+      return {
+        anyOf: [
+          { type: "null" },
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["commands", "pipeline_id", "plan_id", "schema", "units"],
+            properties: {
+              schema: { const: "openthrottle.execution-plan/v2" },
+              pipeline_id: { type: "string", minLength: 1, maxLength: 160 },
+              plan_id: { type: "string", minLength: 1, maxLength: 160 },
+              units: {
+                type: "array",
+                minItems: 1,
+                maxItems: 64,
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: [
+                    "acceptance", "approach", "depends_on", "files", "id", "objective",
+                    "requirements", "tests", "title", "verification",
+                  ],
+                  properties: {
+                    id: { type: "string", minLength: 1, maxLength: 160 },
+                    title: { type: "string", minLength: 1, maxLength: 160 },
+                    depends_on: {
+                      type: "array", maxItems: 32, uniqueItems: true,
+                      items: { type: "string", minLength: 1, maxLength: 160 },
+                    },
+                    objective: { type: "string", minLength: 1, maxLength: 2_000 },
+                    requirements: stringArraySchema(1, 32, 2_000),
+                    files: stringArraySchema(1, 64, 512),
+                    approach: stringArraySchema(1, 32, 2_000),
+                    tests: stringArraySchema(1, 32, 2_000),
+                    acceptance: stringArraySchema(1, 32, 2_000),
+                    verification: stringArraySchema(1, 32, 2_000),
+                  },
+                },
+              },
+              commands: {
+                type: "array",
+                maxItems: 16,
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["name"],
+                  properties: {
+                    name: { type: "string", minLength: 1, maxLength: 160 },
+                    unit: { type: "string", minLength: 1, maxLength: 160 },
+                  },
+                },
+              },
+            },
+          },
+        ],
+      };
   }
 }
 

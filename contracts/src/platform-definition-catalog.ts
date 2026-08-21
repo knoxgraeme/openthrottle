@@ -1,4 +1,4 @@
-import { digestCanonicalJson, digestNormalized } from "./canonical.js";
+import { compareCodeUnits, digestCanonicalJson, digestNormalized } from "./canonical.js";
 import {
   SHA256,
   arrayAt,
@@ -48,10 +48,6 @@ export interface TrustedPlatformDefinitionSource {
   readonly catalog: PlatformDefinitionCatalog;
   readonly files: VirtualDefinitionFileMap;
   readonly [trustedPlatformSource]: true;
-}
-
-function compareCodeUnits(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function assertCorePlatformPath(value: unknown, source: string): asserts value is string {

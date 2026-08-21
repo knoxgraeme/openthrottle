@@ -1,12 +1,16 @@
 import {
   canonicalJson,
+  compareCodeUnits,
   digestCanonicalJson,
   type AttemptCheckpoint,
   type CompiledPipelineManifest,
+  type CompiledPipelineStage,
   type DecisionRecord,
   type DefinitionBundle,
+  type DeliveryRecord,
   type ExecutionRecord,
   type ResultRecord,
+  type ExecutionPlanContractV2,
 } from "@openthrottle/contracts";
 import {
   createPendingKernelAttempt,
@@ -16,11 +20,20 @@ import {
   PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA,
   createPipelineDecisionRecord,
 } from "./evaluator-registry.js";
+import {
+  parseStructuredExecutionPlan,
+} from "./structured-plan.js";
+export {
+  parseStructuredExecutionPlan,
+  selectedStructuredReviewPersonas,
+} from "./structured-plan.js";
 import type {
   KernelContextPort,
+  ExternalScheduleView,
   ReductionView,
   ResolvedKernelContext,
 } from "./ports.js";
+import type { EvaluatedKernelResult } from "./evaluator-registry.js";
 import {
   compileKernelCursor,
   frontierMemberKey,
@@ -32,10 +45,15 @@ import type {
   KernelCommand,
   KernelCursor,
 } from "./types.js";
+import {
+  exactKernelRuntimeCleanupDeliveries,
+  exactKernelRuntimeResourceDeliveries,
+  resolveKernelRuntimeResourceIdentity,
+} from "./runtime-resource.js";
+import { deriveKernelTerminalCleanupAttempt } from "./successor-attempt.js";
 
 const MAX_STRUCTURED_MEMBERS = 64;
 const MAX_STRUCTURED_ROUNDS = 100;
-
 export interface StructuredLoopMember {
   id: string;
   depends_on: readonly string[];
@@ -53,6 +71,20 @@ export interface StructuredMemberCompletionEvidence {
   result: ResultRecord;
   decision: DecisionRecord;
   checkpoint: AttemptCheckpoint;
+}
+
+export interface StructuredSettledAttemptEvidence {
+  attempt: KernelAttempt;
+  result: ResultRecord;
+  decision: DecisionRecord;
+  checkpoint: AttemptCheckpoint;
+  action_inputs: KernelActionInputs;
+}
+
+export interface StructuredAcceptedUnitEvidence {
+  member_id: string;
+  acceptance: StructuredSettledAttemptEvidence;
+  candidate_checkpoint: AttemptCheckpoint;
 }
 
 export type StructuredIntegrationEvidence = StructuredMemberCompletionEvidence;
@@ -74,10 +106,6 @@ interface FrontierBase {
   max_parallel: number;
   bundle: DefinitionBundle;
   manifest: CompiledPipelineManifest;
-}
-
-function compareCodeUnits(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function sortedUnique(values: readonly string[]): string[] {
@@ -176,10 +204,19 @@ function decisionPayload(decision: DecisionRecord): Record<string, unknown> {
   return payload;
 }
 
+export function structuredDecisionOutcome(decision: DecisionRecord): string {
+  const outcome = decisionPayload(decision).outcome;
+  if (typeof outcome !== "string") {
+    throw new Error(`DecisionRecord ${decision.id} has no deterministic outcome`);
+  }
+  return outcome;
+}
+
 function assertExactResultIdentity(input: {
   attempt: KernelAttempt;
   result: ResultRecord;
   decision: DecisionRecord;
+  allow_additional_decision_inputs?: boolean;
 }): void {
   const { attempt, result, decision } = input;
   if (
@@ -195,50 +232,19 @@ function assertExactResultIdentity(input: {
   }
   if (
     decision.pipeline_run_id !== attempt.pipeline_run_id ||
-    decision.input_record_ids.length !== 1 ||
-    decision.input_record_ids[0] !== result.id
+    (input.allow_additional_decision_inputs
+      ? !decision.input_record_ids.includes(result.id)
+      : decision.input_record_ids.length !== 1 || decision.input_record_ids[0] !== result.id)
   ) {
-    throw new Error(`DecisionRecord ${decision.id} must cite exactly ResultRecord ${result.id}`);
+    throw new Error(
+      input.allow_additional_decision_inputs
+        ? `DecisionRecord ${decision.id} must cite ResultRecord ${result.id}`
+        : `DecisionRecord ${decision.id} must cite exactly ResultRecord ${result.id}`,
+    );
   }
   const payload = decisionPayload(decision);
   if (payload.stage_id !== attempt.scope.stage_id) {
     throw new Error(`DecisionRecord ${decision.id} targets another stage`);
-  }
-}
-
-function assertMemberCompletionEvidence(
-  evidence: StructuredMemberCompletionEvidence,
-  expectedRunId: string,
-  expectedBundleHash: string,
-): void {
-  const { attempt, checkpoint, result, decision } = evidence;
-  if (
-    attempt.pipeline_run_id !== expectedRunId ||
-    attempt.definition_bundle_hash !== expectedBundleHash ||
-    attempt.scope.kind !== "loop_item" ||
-    attempt.scope.item_id !== evidence.member_id ||
-    attempt.repository_authority !== "edit" ||
-    attempt.status !== "settled" ||
-    attempt.output_subject === null
-  ) {
-    throw new Error(`member evidence for ${evidence.member_id} has no settled loop edit attempt`);
-  }
-  assertExactResultIdentity({ attempt, result, decision });
-  if (
-    checkpoint.pipeline_run_id !== attempt.pipeline_run_id ||
-    checkpoint.attempt_id !== attempt.id ||
-    checkpoint.request_hash !== attempt.request_hash ||
-    checkpoint.definition_bundle_hash !== attempt.definition_bundle_hash ||
-    checkpoint.input_subject !== attempt.input_subject ||
-    checkpoint.output_subject !== attempt.output_subject ||
-    checkpoint.id !== attempt.checkpoint_id ||
-    checkpoint.native_session_id !== attempt.native_session_id
-  ) {
-    throw new Error(`member checkpoint ${checkpoint.id} does not match its exact output identity`);
-  }
-  const payload = decisionPayload(decision);
-  if (payload.outcome !== "success" && payload.outcome !== "no_change") {
-    throw new Error(`member DecisionRecord ${decision.id} did not accept its ResultRecord`);
   }
 }
 
@@ -262,7 +268,17 @@ function assertIntegrationEvidence(
   ) {
     throw new Error(`integration evidence for ${evidence.member_id} has no settled integration effect attempt`);
   }
-  assertExactResultIdentity({ attempt, result, decision });
+  // External effect settlement decisions also cite the phase DeliveryRecords.
+  // The indexed evidence shape intentionally carries only the attempt/result/
+  // decision/checkpoint tuple, so exact delivery-set validation remains at the
+  // external settlement boundary; structured planning can still prove that
+  // the decision cites this attempt's exact ResultRecord.
+  assertExactResultIdentity({
+    attempt,
+    result,
+    decision,
+    allow_additional_decision_inputs: true,
+  });
   if (
     checkpoint.pipeline_run_id !== attempt.pipeline_run_id ||
     checkpoint.attempt_id !== attempt.id ||
@@ -275,13 +291,67 @@ function assertIntegrationEvidence(
   ) {
     throw new Error(`integration checkpoint ${checkpoint.id} does not match its exact output identity`);
   }
-  const payload = decisionPayload(decision);
-  if (payload.outcome !== "success" && payload.outcome !== "no_change") {
+  const outcome = structuredDecisionOutcome(decision);
+  if (!["next_integration", "next_unit", "all_integrated"].includes(outcome)) {
     throw new Error(`integration DecisionRecord ${decision.id} did not accept its ResultRecord`);
   }
 }
 
-function assertDependencyGraph(members: readonly StructuredLoopMember[]): void {
+function exactRuntimeDeliveries(records: readonly ExecutionRecord[]): DeliveryRecord[] {
+  const identity = resolveKernelRuntimeResourceIdentity(records);
+  if (identity === null) return [];
+  const byId = new Map(records.flatMap((record) =>
+    record.kind === "delivery" ? [[record.id, record] as const] : []));
+  return identity.delivery_record_ids.map((id) => byId.get(id)!);
+}
+
+function assertAcceptedUnitEvidence(
+  source: StructuredAcceptedUnitEvidence,
+  expectedRunId: string,
+  expectedBundleHash: string,
+): void {
+  const { attempt, result, decision, checkpoint, action_inputs: actionInputs } = source.acceptance;
+  if (
+    attempt.pipeline_run_id !== expectedRunId ||
+    attempt.definition_bundle_hash !== expectedBundleHash ||
+    attempt.scope.kind !== "loop_item" ||
+    attempt.scope.item_id !== source.member_id ||
+    attempt.repository_authority !== "inspect" ||
+    attempt.status !== "settled" ||
+    attempt.output_subject !== null
+  ) throw new Error(`accepted unit ${source.member_id} has no settled inspect acceptance`);
+  assertExactResultIdentity({ attempt, result, decision });
+  const outcome = structuredDecisionOutcome(decision);
+  if (outcome !== "success" && outcome !== "no_change") {
+    throw new Error(`accepted unit ${source.member_id} has no accepting DecisionRecord`);
+  }
+  if (
+    checkpoint.id !== attempt.checkpoint_id ||
+    checkpoint.attempt_id !== attempt.id ||
+    checkpoint.request_hash !== attempt.request_hash ||
+    checkpoint.definition_bundle_hash !== attempt.definition_bundle_hash ||
+    checkpoint.input_subject !== attempt.input_subject ||
+    checkpoint.output_subject !== null
+  ) throw new Error(`accepted unit ${source.member_id} has an invalid inspect checkpoint`);
+  const contextRecordIds = actionInputs.context.records.map(({ id }) => id).sort(compareCodeUnits);
+  const contextCheckpointIds = actionInputs.context.checkpoints.map(({ id }) => id).sort(compareCodeUnits);
+  if (
+    canonicalJson(contextRecordIds) !== canonicalJson(attempt.context_record_ids) ||
+    canonicalJson(contextCheckpointIds) !== canonicalJson(attempt.context_checkpoint_ids)
+  ) throw new Error(`accepted unit ${source.member_id} action context is not exact`);
+  const candidate = actionInputs.context.checkpoints.filter(
+    (candidateCheckpoint) => candidateCheckpoint.output_subject === attempt.input_subject,
+  );
+  if (
+    candidate.length !== 1 ||
+    canonicalJson(candidate[0]) !== canonicalJson(source.candidate_checkpoint) ||
+    source.candidate_checkpoint.pipeline_run_id !== expectedRunId ||
+    source.candidate_checkpoint.definition_bundle_hash !== expectedBundleHash
+  ) throw new Error(`accepted unit ${source.member_id} must bind one exact edited candidate checkpoint`);
+  exactRuntimeDeliveries(actionInputs.context.records);
+}
+
+function assertDependencyOrdering(members: readonly StructuredLoopMember[]): void {
   const ids = new Set(members.map(({ id }) => id));
   const dependencies = new Map<string, readonly string[]>();
   for (const member of members) {
@@ -341,7 +411,7 @@ export function compileStructuredLoopFrontier(input: FrontierBase & {
   assertIdentifier(input.loop_id, "structured loop ID");
   integrationEffectStage(input.manifest, input.integration_stage_id);
   const members = canonicalMembers(input.members, "structured loop");
-  assertDependencyGraph(members);
+  assertDependencyOrdering(members);
   const byId = new Map(members.map((member) => [member.id, member]));
   for (const [memberId, evidence] of input.completed_integrations) {
     if (!byId.has(memberId) || evidence.member_id !== memberId) {
@@ -401,6 +471,100 @@ export function compileStructuredLoopFrontier(input: FrontierBase & {
     });
   });
   return compileBoundedFrontier({ base: input, attempts });
+}
+
+export interface StructuredProvisionSettlement {
+  decision: DecisionRecord;
+  outcome: string;
+  next_attempts: readonly KernelAttempt[];
+  next_dependencies: Readonly<Record<string, readonly string[]>>;
+}
+
+/** Compiles the first restart-safe unit wave from the durable provision boundary. */
+export function buildStructuredProvisionSettlement(input: {
+  view: ReductionView;
+  stage: Extract<CompiledPipelineStage, { kind: "effect" }>;
+  attempt: KernelAttempt;
+  result: ResultRecord;
+  bundle: DefinitionBundle;
+  schedules: readonly ExternalScheduleView[];
+  evaluated: EvaluatedKernelResult;
+  task_prompt: string;
+  execution_plan?: ExecutionPlanContractV2;
+  planning_context_records?: readonly ExecutionRecord[];
+  created_at: string;
+}): StructuredProvisionSettlement {
+  if (input.stage.effect !== "core/daytona-provision@1") {
+    throw new Error("structured provision planner requires the runtime provision effect");
+  }
+  const deliveries = input.schedules.flatMap((schedule) => schedule.effects.map(({ delivery }) => {
+    if (delivery === null) throw new Error("structured provision schedule is incomplete");
+    return delivery;
+  })).sort((left, right) => compareCodeUnits(left.id, right.id));
+  const runtime = resolveKernelRuntimeResourceIdentity(deliveries);
+  if (
+    runtime === null || deliveries.length !== runtime.delivery_record_ids.length ||
+    canonicalJson(deliveries.map(({ id }) => id)) !== canonicalJson(runtime.delivery_record_ids)
+  ) throw new Error("structured provision requires exactly one confirmed Daytona create/start pair");
+  const plan = input.execution_plan ??
+    parseStructuredExecutionPlan(input.task_prompt, input.view.manifest.pipeline_id);
+  if (plan.pipeline_id !== input.view.manifest.pipeline_id) {
+    throw new Error("structured execution plan names another compiled pipeline");
+  }
+  const transition = input.stage.on[input.evaluated.outcome];
+  const target = transition?.to === undefined
+    ? undefined
+    : input.view.manifest.stages.find(({ id }) => id === transition.to);
+  if (target?.kind !== "agent" || !target.loop) {
+    throw new Error("structured provision does not target a bounded unit loop");
+  }
+  const integrationStages = input.view.manifest.stages.filter(
+    (candidate) => candidate.kind === "effect" && candidate.effect === "core/integrate-unit@1",
+  );
+  if (integrationStages.length !== 1) {
+    throw new Error("structured pipeline must contain one integration effect stage");
+  }
+  const decision = createPipelineDecisionRecord({
+    attempt: input.attempt,
+    result: input.result,
+    additional_input_records: deliveries,
+    evaluated: input.evaluated,
+    created_at: input.created_at,
+  });
+  const frontier = compileStructuredLoopFrontier({
+    pipeline_run_id: input.view.run.id,
+    parent_attempt_id: input.attempt.id,
+    stage_id: target.id,
+    loop_id: target.loop.over,
+    integration_stage_id: integrationStages[0]!.id,
+    round: 0,
+    input_subject: input.view.run.current_subject,
+    cursor_version: input.view.run.cursor.version + 1,
+    completed_scope_keys: input.view.run.cursor.completed_scope_keys,
+    max_parallel: target.loop.max_parallel,
+    members: plan.units.map((unit) => ({
+      id: unit.id,
+      depends_on: unit.depends_on,
+      action_inputs: {
+        task_prompt: input.task_prompt,
+        context: {
+          records: [...deliveries, ...(input.planning_context_records ?? [])]
+            .sort((left, right) => compareCodeUnits(left.id, right.id)),
+          checkpoints: [],
+        },
+      },
+    })),
+    completed_integrations: new Map(),
+    bundle: input.bundle,
+    manifest: input.view.manifest,
+  });
+  if (frontier === null) throw new Error("fresh structured plan produced no initial unit frontier");
+  return {
+    decision,
+    outcome: input.evaluated.outcome,
+    next_attempts: frontier.attempts,
+    next_dependencies: frontier.dependencies,
+  };
 }
 
 export function compileReviewFanoutFrontier(input: FrontierBase & {
@@ -470,7 +634,8 @@ export function createStructuredIntegrationAttempt(input: {
   stage_id: string;
   input_subject: string;
   task_prompt: string;
-  source: StructuredMemberCompletionEvidence;
+  source: StructuredAcceptedUnitEvidence;
+  planning_context_records?: readonly ExecutionRecord[];
   bundle: DefinitionBundle;
   manifest: CompiledPipelineManifest;
 }): KernelAttempt {
@@ -482,20 +647,20 @@ export function createStructuredIntegrationAttempt(input: {
   if (input.source.member_id !== input.member_id) {
     throw new Error("integration source names another structured member");
   }
-  assertMemberCompletionEvidence(
+  assertAcceptedUnitEvidence(
     input.source,
     input.pipeline_run_id,
     input.manifest.definition_bundle_hash,
   );
   integrationEffectStage(input.manifest, input.stage_id);
   if (
-    input.source.attempt.scope.kind !== "loop_item" ||
-    input.source.attempt.scope.parent_attempt_id !== input.parent_attempt_id
+    input.source.acceptance.attempt.scope.kind !== "loop_item" ||
+    input.source.acceptance.attempt.scope.parent_attempt_id !== input.parent_attempt_id
   ) {
     throw new Error("integration source does not retain the expected loop parent identity");
   }
   const scope = {
-    ...input.source.attempt.scope,
+    ...input.source.acceptance.attempt.scope,
     stage_id: input.stage_id,
   };
   const id = deterministicAttemptId("structured-integration", {
@@ -504,9 +669,9 @@ export function createStructuredIntegrationAttempt(input: {
     member_id: input.member_id,
     stage_id: input.stage_id,
     round: input.round,
-    source_result_id: input.source.result.id,
-    source_decision_id: input.source.decision.id,
-    source_checkpoint_id: input.source.checkpoint.id,
+    source_result_id: input.source.acceptance.result.id,
+    source_decision_id: input.source.acceptance.decision.id,
+    source_checkpoint_id: input.source.candidate_checkpoint.id,
     scope,
   });
   return createPendingKernelAttempt({
@@ -519,9 +684,14 @@ export function createStructuredIntegrationAttempt(input: {
     action_inputs: {
       task_prompt: input.task_prompt,
       context: {
-        records: [input.source.decision, input.source.result]
+        records: [
+          input.source.acceptance.decision,
+          input.source.acceptance.result,
+          ...exactRuntimeDeliveries(input.source.acceptance.action_inputs.context.records),
+          ...(input.planning_context_records ?? []),
+        ]
           .sort((left, right) => compareCodeUnits(left.id, right.id)),
-        checkpoints: [input.source.checkpoint],
+        checkpoints: [input.source.candidate_checkpoint],
       },
     },
   });
@@ -537,6 +707,7 @@ export function createBlockingReviewRemediationAttempt(input: {
   result: ResultRecord;
   decision: DecisionRecord;
   checkpoints: readonly AttemptCheckpoint[];
+  runtime_delivery_records: readonly ExecutionRecord[];
   bundle: DefinitionBundle;
   manifest: CompiledPipelineManifest;
 }): KernelAttempt {
@@ -588,6 +759,13 @@ export function createBlockingReviewRemediationAttempt(input: {
   if (acceptedBoundaries.length !== 1) {
     throw new Error("review checkpoint context must contain exactly one boundary for the reviewed input subject");
   }
+  const runtimeDeliveries = exactKernelRuntimeResourceDeliveries(input.runtime_delivery_records);
+  if (
+    runtimeDeliveries === null ||
+    runtimeDeliveries.some(({ id }) => !input.attempt.context_record_ids.includes(id))
+  ) {
+    throw new Error("review remediation requires the exact runtime DeliveryRecords from its sealed context");
+  }
   return createPendingKernelAttempt({
     id: deterministicAttemptId("blocking-review-remediation", {
       pipeline_run_id: input.pipeline_run_id,
@@ -605,7 +783,7 @@ export function createBlockingReviewRemediationAttempt(input: {
     action_inputs: {
       task_prompt: input.task_prompt,
       context: {
-        records: [input.decision, input.result]
+        records: [input.decision, input.result, ...runtimeDeliveries]
           .sort((left, right) => compareCodeUnits(left.id, right.id)),
         checkpoints,
       },
@@ -656,12 +834,20 @@ export function buildStructuredTerminalTransition(input: {
   outcome: "needs_human" | "canceled" | "superseded";
   reason: string;
   created_at: string;
+  bundle: DefinitionBundle;
+  task_prompt: string;
+  runtime_delivery_records: readonly ExecutionRecord[];
 }): AtomicTransitionBundle {
   const attempt = input.view.current_attempt;
   if (!attempt) throw new Error("structured terminal transition requires one exact active attempt");
+  const runtimeDeliveries = exactKernelRuntimeCleanupDeliveries(input.runtime_delivery_records);
+  if (runtimeDeliveries === null) {
+    throw new Error("structured terminal transition requires exact runtime cleanup evidence");
+  }
   const decision = createPipelineDecisionRecord({
     attempt,
     result: null,
+    additional_input_records: runtimeDeliveries,
     evaluated: {
       evaluator: "core/operational-outcome@1",
       outcome: input.outcome,
@@ -681,6 +867,19 @@ export function buildStructuredTerminalTransition(input: {
       attempt_id: attempt.id,
       decision_record_id: decision.id,
       reason: input.reason,
+      resource_disposition: {
+        kind: "cleanup",
+        runtime_delivery_record_ids: runtimeDeliveries.map(({ id }) => id),
+        cleanup_attempt: deriveKernelTerminalCleanupAttempt({
+          view: input.view,
+          current: attempt,
+          decision,
+          bundle: input.bundle,
+          outcome: input.outcome,
+          task_prompt: input.task_prompt,
+          runtime_delivery_records: runtimeDeliveries,
+        }),
+      },
     }
     : input.outcome === "canceled"
       ? {
@@ -688,18 +887,47 @@ export function buildStructuredTerminalTransition(input: {
         command_id: commandId,
         decision_record_id: decision.id,
         reason: input.reason,
+        resource_disposition: {
+          kind: "cleanup",
+          runtime_delivery_record_ids: runtimeDeliveries.map(({ id }) => id),
+          cleanup_attempt: deriveKernelTerminalCleanupAttempt({
+            view: input.view,
+            current: attempt,
+            decision,
+            bundle: input.bundle,
+            outcome: input.outcome,
+            task_prompt: input.task_prompt,
+            runtime_delivery_records: runtimeDeliveries,
+          }),
+        },
       }
       : {
         type: "supersede",
         command_id: commandId,
         decision_record_id: decision.id,
         reason: input.reason,
+        resource_disposition: {
+          kind: "cleanup",
+          runtime_delivery_record_ids: runtimeDeliveries.map(({ id }) => id),
+          cleanup_attempt: deriveKernelTerminalCleanupAttempt({
+            view: input.view,
+            current: attempt,
+            decision,
+            bundle: input.bundle,
+            outcome: input.outcome,
+            task_prompt: input.task_prompt,
+            runtime_delivery_records: runtimeDeliveries,
+          }),
+        },
       };
   return reduceKernelCommand({
     manifest: input.view.manifest,
     run: input.view.run,
     current_attempt: attempt,
-    records: new Map([[decision.id, decision]]),
+    records: new Map<string, ExecutionRecord>([
+      ...runtimeDeliveries.map((record) => [record.id, record] as const),
+      [decision.id, decision] as const,
+    ]),
     checkpoints: new Map(),
     command,
   });

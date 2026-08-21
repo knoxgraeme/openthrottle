@@ -75,6 +75,7 @@ export const EXECUTION_KERNEL_DETERMINISM_FIXTURE = {
     runtime_capability_digest: "9".repeat(64),
     source_commit: "c".repeat(40),
     pipeline_id: "structured",
+    pipeline_selection: "config",
     entries: [
       {
         definition_kind: "config",

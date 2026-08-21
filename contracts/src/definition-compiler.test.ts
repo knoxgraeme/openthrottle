@@ -11,12 +11,15 @@ import {
   VIRTUAL_DEFINITION_MAX_FILES,
   VIRTUAL_DEFINITION_MAX_TOTAL_BYTES,
   compileDefinitionBundle,
+  compileManifestFromDefinitionBundle,
+  definitionEntryContentHash,
   digestCanonicalJson,
   digestNormalized,
   runtimeCapabilityDigest,
   verifyCompilerEnvironment,
   verifyPlatformDefinitionSource,
   type CompilerEnvironmentDescriptor,
+  type DefinitionBundle,
   type PlatformDefinitionCatalog,
   type TrustedCompilerEnvironment,
   type TrustedPlatformDefinitionSource,
@@ -126,6 +129,15 @@ function compile(
   });
 }
 
+function platformHashes(bundle: DefinitionBundle): Map<string, string> {
+  return new Map(bundle.entries
+    .filter((entry) => entry.origin.kind === "platform")
+    .map((entry) => [
+      `${entry.definition_kind}:${entry.definition_id}`,
+      entry.content_hash,
+    ]));
+}
+
 function replaceFile(
   fixture: CompilerFixture,
   channel: "repository" | "platform",
@@ -168,6 +180,49 @@ function repositoryAuthoredFixture(): CompilerFixture {
 }
 
 describe("filesystem definition compiler", () => {
+  it("reconstructs the byte-identical private manifest from only the pinned bundle", () => {
+    const admitted = compile();
+    const recovered = compileManifestFromDefinitionBundle({
+      bundle: structuredClone(admitted.bundle.value),
+      compiler_environment: compilerEnvironment(),
+      trusted_platform_definitions: platformHashes(admitted.bundle.value),
+    });
+
+    expect(recovered.normalized).toBe(admitted.manifest.normalized);
+    expect(recovered.digest).toBe(admitted.manifest.digest);
+  });
+
+  it("fails cold reconstruction on environment drift, missing dependencies, or a widened closure", () => {
+    const admitted = compile();
+    const recover = (bundle: DefinitionBundle, environment = compilerEnvironment()) =>
+      compileManifestFromDefinitionBundle({
+        bundle,
+        compiler_environment: environment,
+        trusted_platform_definitions: platformHashes(admitted.bundle.value),
+      });
+
+    expect(() => recover(admitted.bundle.value, compilerEnvironment({
+      compiler_version: "definition-compiler/v2",
+    }))).toThrow(/compiler_version.*pinned compiler environment/);
+
+    const missingEval = structuredClone(admitted.bundle.value);
+    missingEval.entries = missingEval.entries.filter((entry) => entry.definition_kind !== "eval");
+    expect(() => recover(missingEval)).toThrow(/eval core\/review-result is absent/);
+
+    const widened = structuredClone(admitted.bundle.value);
+    const sourceSkill = widened.entries.find((entry) => entry.definition_kind === "skill")!;
+    const extraPayload = structuredClone(sourceSkill.normalized_payload);
+    widened.entries.push({
+      ...sourceSkill,
+      definition_id: "unused-two",
+      origin: { kind: "repository", source_commit: widened.source_commit },
+      path: ".openthrottle/skills/unused-two/SKILL.md",
+      content_hash: definitionEntryContentHash(extraPayload),
+      normalized_payload: extraPayload,
+    });
+    expect(() => recover(widened)).toThrow(/outside the selected transitive closure.*skill:unused-two/);
+  });
+
   it("emits one golden dependency closure and injects the configured engine", () => {
     const result = compile();
 
@@ -185,15 +240,19 @@ describe("filesystem definition compiler", () => {
       .toEqual({ kind: "repository", source_commit: sourceFixture.source_commit });
     expect(result.bundle.value.entries.filter((entry) => entry.definition_kind !== "config")
       .every((entry) => entry.origin.kind === "platform" && entry.origin.source_commit === null)).toBe(true);
-    expect(result.manifest.value.stages[0]).toMatchObject({
+    expect(result.manifest.value.entry_stage).toBe("ot_runtime_provision");
+    expect(result.manifest.value.stages.find(({ id }) => id === "review")).toMatchObject({
       kind: "agent",
       engine: "codex",
       loop: { body: ["review"] },
     });
-    expect(result.manifest.value.stages[0]?.loop).not.toHaveProperty("file");
+    expect(result.manifest.value.stages.find(({ id }) => id === "review")?.loop)
+      .not.toHaveProperty("file");
+    expect(result.manifest.value.stages.find(({ id }) => id === "ot_runtime_provision"))
+      .toMatchObject({ kind: "effect", effect: "core/daytona-provision@1" });
     expect(result.manifest.value.definition_bundle_hash).toBe(result.bundle.digest);
-    expect(result.bundle.digest).toBe("9bf556163cd02a04aa4a1e16b1d73e9b314a6f7068ff79c7b18c06ef5dcb43c6");
-    expect(result.manifest.digest).toBe("8ef4ad94388dc8897cd13c45b1bedc29fec1ff4e272a6f2b1681085ae735addc");
+    expect(result.bundle.digest).toBe("23d8f16ede33039d029fc9ea65abc4cb364f9eec07f72875b343bceda3f0ab73");
+    expect(result.manifest.digest).toBe("db244873085516c76858650249a77969f9c87cb5b8523da0fb8f29cab883e3be");
   });
 
   it("omits exact checked-in core mirrors while preserving platform origin", () => {
@@ -279,7 +338,7 @@ stages:
 `,
     );
 
-    expect(compile(fixture).manifest.value.stages[0]).toMatchObject({
+    expect(compile(fixture).manifest.value.stages.find(({ id }) => id === "drive")).toMatchObject({
       id: "drive",
       loop: { body: ["review"] },
     });
