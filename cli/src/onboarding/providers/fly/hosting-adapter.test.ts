@@ -303,12 +303,12 @@ describe("fly hosting adapter inspect", () => {
     const evidence = asPending(await adapter.inspect(context));
     expect(evidence.status).toBe("needs_action");
     expect(evidence.summary).toContain("deployed image is not this release");
-    expect(evidence.recoveryAction).toBe(`flyctl deploy --app ${APP} --image ${release.supervisorImage}`);
+    expect(evidence.recoveryAction).toBe(`flyctl deploy --ha=false --app ${APP} --image ${release.supervisorImage}`);
 
     fly.machines = [{ state: "stopped", image: RELEASE_MACHINE_IMAGE }];
     const stopped = asPending(await adapter.inspect(context));
     expect(stopped.summary).toContain("no started machine");
-    expect(stopped.recoveryAction).toBe(`flyctl deploy --app ${APP} --image ${release.supervisorImage}`);
+    expect(stopped.recoveryAction).toBe(`flyctl deploy --ha=false --app ${APP} --image ${release.supervisorImage}`);
   });
 
   it("reports a failing healthz probe as supervisor-owned", async () => {
@@ -364,7 +364,7 @@ describe("fly hosting adapter plan", () => {
       `flyctl apps create ${APP} --org personal`,
       `flyctl volumes create openthrottle_data --app ${APP} --region sjc --size 1`,
       "set 6 supervisor secrets (names: DAYTONA_SNAPSHOT, GITHUB_WEBHOOK_SECRET, LINEAR_WEBHOOK_SECRET, OT_DEPLOY_TOKEN, OT_STATUS_TOKEN, SUPERVISOR_URL)",
-      `flyctl deploy --app ${APP} --image ${release.supervisorImage}`,
+      `flyctl deploy --ha=false --app ${APP} --image ${release.supervisorImage}`,
     ]);
     expect(plan.billable).toBe(true);
     expect(plan.externallyVisible).toBe(true);
@@ -397,7 +397,7 @@ describe("fly hosting adapter plan", () => {
     deployOnly.fly.makeReady();
     deployOnly.fly.machines = [];
     const deployPlan = await deployOnly.adapter.plan(context, bundle);
-    expect(deployPlan.mutations).toEqual([`flyctl deploy --app ${APP} --image ${release.supervisorImage}`]);
+    expect(deployPlan.mutations).toEqual([`flyctl deploy --ha=false --app ${APP} --image ${release.supervisorImage}`]);
     expect(deployPlan.billable).toBe(true);
     expect(deployPlan.externallyVisible).toBe(true);
   });
@@ -428,6 +428,7 @@ describe("fly hosting adapter ensure", () => {
       ],
       [
         "deploy",
+        "--ha=false",
         "--app",
         APP,
         "--config",

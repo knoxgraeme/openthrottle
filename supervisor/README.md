@@ -17,6 +17,13 @@ npm test --prefix supervisor
 npm run dev --prefix supervisor
 ```
 
+The complete release proof also runs both Bats suites, builds the supervisor and
+sandbox images, and runs the sandbox smoke, kernel sandbox E2E, and structured
+walking skeleton listed in [`AGENTS.md`](../AGENTS.md). Those local harnesses use
+stubbed or local boundaries; live publication, trusted provider wait, semantic
+remediation, provider-backed cleanup, and Fly/SQLite epoch acceptance require
+the credentialed replacement canaries.
+
 Export the values from `.env.example`; the process does not load `.env`
 implicitly. `GET /healthz` is public. Operator and deployment endpoints require
 their configured bearer token, while webhooks require provider HMACs.
@@ -32,7 +39,9 @@ their configured bearer token, while webhooks require provider HMACs.
 - `pipeline/kernel/` owns deterministic reduction and the shared action,
   record, effect, checkpoint, steering, and runtime-resource protocols.
 - `persistence/` owns SQLite, the content-addressed BlobStore, and projections.
-- `providers/` owns GitHub, Linear, Codex-auth, and Daytona adapters.
+- `providers/` owns GitHub, Codex-auth, and Daytona adapters. Linear webhook
+  verification and normalization currently live at the HTTP/application ingress
+  boundary; no Linear outbound adapter is in the production composition.
 - `operations/` owns leased, idempotent external-effect execution and
   reconciliation.
 - `runtime/` owns the provider-neutral wire boundary.
@@ -65,6 +74,9 @@ npm run replace:offline --prefix supervisor -- --help
 ```
 
 Follow [the execution-kernel rollout runbook](../docs/runbooks/execution-kernel-rollout.md).
+Its manifest uses strict digest-authenticated command objects, and its ordinary
+and structured smoke hooks are the first credentialed canaries whose accepted
+evidence permits ingress and deployment to reopen.
 
 ## Deploy to Fly
 
@@ -82,13 +94,19 @@ fly secrets set \
   LINEAR_WEBHOOK_SECRET=... GITHUB_WEBHOOK_SECRET=... \
   GITHUB_TOKEN=... DAYTONA_API_KEY=... DAYTONA_SNAPSHOT=openthrottle \
   CODEX_AUTH_JSON='...'
-fly deploy --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
+fly deploy --ha=false --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
 ```
 
 `.github/workflows/deploy.yml` builds a commit-named Daytona snapshot when the
 sandbox, contracts, or definition tree changes, stages that exact snapshot,
-and deploys the supervisor directly. It is a release workflow, not a data
-migration workflow.
+and deploys the supervisor directly. Its deploy job is disabled unless the
+repository variable `FRESH_EPOCH_READY` is exactly `true`; do not bypass that
+gate with a manual deploy during replacement or rollback. After deploying with
+`--ha=false`, the workflow scales to one Machine and verifies the sole data
+volume is attached to it. Keep the variable absent or false before canary
+acceptance and during rollback. Rollback closes and verifies the gate before it
+restores the retained old release/database/blob/snapshot tuple. This is a
+release workflow, not a data-migration workflow.
 
 ## Repository onboarding
 

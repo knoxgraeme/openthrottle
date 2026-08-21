@@ -38,16 +38,27 @@ bats sandbox/tests/runtime.bats
 bats sandbox/tests/inbox-drain.bats
 ```
 
-Docker lifecycle checks are slower but required for sandbox or image changes:
+The complete non-live image and harness proof is slower, but required before a
+release and for changes to sandbox, supervisor-image, or execution boundaries:
 
 ```bash
+docker build -f supervisor/Dockerfile -t openthrottle-supervisor:test .
 docker build -f sandbox/Dockerfile -t openthrottle:test .
 sandbox/tests/smoke.sh openthrottle:test
+node supervisor/scripts/kernel-sandbox-e2e.mjs openthrottle:test
 node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test
 ```
 
-Live Linear, Daytona, and Fly acceptance consumes operator credentials and is
-kept outside the local contract suite.
+These local harnesses use stubbed or local boundaries. They do not prove live
+exact-subject publication, trusted-producer GitHub provider wait, real
+semantic-remediation efficacy, provider-backed terminal cleanup, or acceptance
+of a Fly/SQLite epoch. Those require the credentialed ordinary and structured
+replacement canaries.
+
+When correction or remediation behavior changes, test them separately: result
+correction preserves the same Attempt, checkpoint, subject, and native session;
+semantic remediation starts a distinct edit Attempt with an unbound fresh
+session and exact prior evidence.
 
 ## Pull requests
 

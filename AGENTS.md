@@ -68,13 +68,18 @@ npm run build --prefix supervisor && npm run build --prefix cli
 npm test --prefix contracts && npm test --prefix supervisor
 npm test --prefix cli && npm test --prefix sandbox
 bats sandbox/tests/runtime.bats
+bats sandbox/tests/inbox-drain.bats
+docker build -f supervisor/Dockerfile -t openthrottle-supervisor:test .
 docker build -f sandbox/Dockerfile -t openthrottle:test .
 sandbox/tests/smoke.sh openthrottle:test
+node supervisor/scripts/kernel-sandbox-e2e.mjs openthrottle:test
 node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test
 ```
 
-Credentialed Linear, GitHub, Daytona, and Fly checks are operator gates and are
-never implied by local or CI success.
+These local harnesses use stubbed or local boundaries. They do not prove live
+exact-subject publication, trusted-producer GitHub provider wait, real
+semantic-remediation efficacy, provider-backed terminal cleanup, or acceptance
+of a Fly/SQLite epoch. Those are credentialed operator gates.
 
 ## Authored definitions
 
@@ -140,6 +145,16 @@ candidate is still invalid after normalization, completed work enters
 request with only `ot-result`. Formatting failure must not rerun successful code
 work.
 
+Session continuity is exclusive to result representation correction. A review
+or lead rejection schedules a distinct edit successor with
+`native_session_id: null`, exact prior Record/Checkpoint context, and a fresh
+native session bound only when that remediation Attempt starts.
+
+This release admits at most one live Attempt. Unit work and selected reviewer
+personas retain their complete dependency/frontier rosters, but execute
+serially. The selector may still choose up to its eval-bound five personas;
+execution width one must not truncate that roster.
+
 Ordinary and structured pipelines share four primitives:
 
 - **Attempt** — one leased unit of agent, command, effect, or wait work, fenced
@@ -199,16 +214,20 @@ the object; settled records remain immutable.
 - One registered control route maps to one GitHub repository. Unmatched routes
   fail closed.
 - Native session IDs bind atomically to a live leased Attempt and its exact run,
-  cursor, request, bundle, input subject, retry ordinal, and correction count.
+  cursor, request, bundle, input subject, lease generation, retry ordinal, and
+  correction count.
 - Git remotes and refs are executor-owned. Agents never publish.
 - Mutating ingress returns a retryable non-acknowledgement while maintenance is
   closed, so providers retry into the fresh epoch instead of crossing epochs.
 
 The current dogfood epoch is replaced offline, not migrated in place. Stop all
 writers, archive and hash the old database/blob/release tuple, initialize
-distinct empty paths, run ordinary and structured smoke items, then reopen
-ingress. Do not add compatibility reads, dual writes, or a durable transition
-state machine. See
+distinct empty paths, then use the ordinary and structured smoke hooks as the
+first credentialed canaries. Exactly one Fly Machine may own the SQLite volume.
+Keep `FRESH_EPOCH_READY` absent or false until their evidence is accepted; on
+rollback, close and verify that gate before restoring the retained old tuple.
+Do not add compatibility reads, dual writes, or a durable transition state
+machine. See
 [`docs/runbooks/execution-kernel-rollout.md`](docs/runbooks/execution-kernel-rollout.md).
 
 ## Operator GitHub work
