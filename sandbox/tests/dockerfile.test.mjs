@@ -70,10 +70,11 @@ describe("sandbox Dockerfile", () => {
   });
 
   it("keeps Docker harness work requests aligned with the private v2 wire", () => {
-    for (const path of [
+    const sandboxHarnesses = [
       "sandbox/tests/smoke.sh",
       "sandbox/tests/structured-walking-skeleton.mjs",
-    ]) {
+    ];
+    for (const path of sandboxHarnesses) {
       const harness = readFileSync(resolve(repoRoot, path), "utf8");
       const workRequests = [...harness.matchAll(
         /schema: "openthrottle\.kernel-action-request\/v2",[\s\S]*?executor_policy:/g,
@@ -83,6 +84,16 @@ describe("sandbox Dockerfile", () => {
       for (const request of workRequests) {
         expect(request[0], path).toContain("execution_limits:");
       }
+    }
+
+    for (const path of [
+      ...sandboxHarnesses,
+      "supervisor/scripts/kernel-sandbox-e2e.mjs",
+    ]) {
+      const harness = readFileSync(resolve(repoRoot, path), "utf8");
+      expect(harness, path).toContain("OT_LEASE_GENERATION_FENCE_FILE=");
+      expect(harness, path).toContain("OT_LEASE_GENERATION_LOCK_FILE=");
+      expect(harness, path).toContain("openthrottle.kernel-lease-generation-fence/v1");
     }
   });
 });

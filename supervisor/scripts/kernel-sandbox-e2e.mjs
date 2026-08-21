@@ -300,10 +300,17 @@ class DockerKernelRuntime {
     await callbacks.on_heartbeat();
     const attempt = safePathId(request.attempt_id, "attempt ID");
     const lease = safePathId(request.lease_id, "lease ID");
+    const leaseGeneration = callbacks.lease_generation;
+    assert(
+      Number.isSafeInteger(leaseGeneration) && leaseGeneration >= 0,
+      "runtime callback must carry a non-negative lease generation",
+    );
     const containerDirectory = `/transport/actions/${attempt}/${lease}`;
     const requestPath = `${containerDirectory}/request.json`;
     const resultPath = `${containerDirectory}/result.json`;
     const sessionPath = `${containerDirectory}/session.json`;
+    const leaseGenerationFencePath = `${containerDirectory}/lease-generation.json`;
+    const leaseGenerationLockPath = `${containerDirectory}/lease-generation.lock`;
 
     const collect = async () => {
       if (dockerStatus(this.container, ["test", "-f", resultPath]).status !== 0) return null;
@@ -334,15 +341,32 @@ class DockerKernelRuntime {
     docker(this.container, ["mkdir", "-p", containerDirectory]);
     const localRequest = join(this.directory, `${attempt}-${lease}.request.json`);
     writeFileSync(localRequest, `${canonicalJson(request)}\n`, { mode: 0o400 });
+    const localLeaseGenerationFence = join(
+      this.directory,
+      `${attempt}-${lease}-${leaseGeneration}.lease-generation.json`,
+    );
+    writeFileSync(localLeaseGenerationFence, `${canonicalJson({
+      schema: "openthrottle.kernel-lease-generation-fence/v1",
+      attempt_id: request.attempt_id,
+      lease_generation: leaseGeneration,
+    })}\n`, { mode: 0o400 });
     run("docker", ["cp", localRequest, `${this.container}:${requestPath}`]);
+    run("docker", ["cp", localLeaseGenerationFence, `${this.container}:${leaseGenerationFencePath}`]);
+    docker(this.container, ["touch", leaseGenerationLockPath]);
     docker(this.container, ["chown", "root:root", requestPath]);
+    docker(this.container, [
+      "chown", "root:root", leaseGenerationFencePath, leaseGenerationLockPath,
+    ]);
     docker(this.container, ["chmod", "0400", requestPath]);
+    docker(this.container, ["chmod", "0444", leaseGenerationFencePath, leaseGenerationLockPath]);
     docker(this.container, [
       "env",
       "PATH=/tmp/stub:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
       `OT_ACTION_REQUEST_FILE=${requestPath}`,
       `OT_ACTION_RESULT_FILE=${resultPath}`,
       `OT_ACTION_SESSION_FILE=${sessionPath}`,
+      `OT_LEASE_GENERATION_FENCE_FILE=${leaseGenerationFencePath}`,
+      `OT_LEASE_GENERATION_LOCK_FILE=${leaseGenerationLockPath}`,
       "/opt/openthrottle/entrypoint.sh",
     ], { timeout: 240_000 });
     const outcome = await collect();
