@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import {
+  existsSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -15,7 +16,7 @@ import {
   FreshEpochRefusalError,
   initializeFreshEpochDatabase,
   openFreshEpochDatabase,
-  openOrInitializeFreshEpochDatabase,
+  verifyFreshEpochBootstrapOnly,
   verifyFreshEpochDatabase,
   type FreshEpochBootstrap,
   type FreshEpochIdentity,
@@ -92,7 +93,7 @@ afterEach(() => {
 
 describe("fresh epoch database", () => {
   it("publishes a checksummed bootstrap atomically into exactly twelve tables", () => {
-    const { db, database_path, blob_store, expected_identity } = initialized();
+    const { db, database_path, blob_store, expected_identity, manifest } = initialized();
     try {
       const tables = (db.prepare(`
         SELECT name FROM sqlite_master
@@ -104,6 +105,10 @@ describe("fresh epoch database", () => {
         ...expected_identity,
         integrity: "ok",
       });
+      expect(db.pragma("journal_mode", { simple: true })).toBe("delete");
+      expect(existsSync(`${database_path}-wal`)).toBe(false);
+      expect(existsSync(`${database_path}-shm`)).toBe(false);
+      expect(() => verifyFreshEpochBootstrapOnly(db, manifest)).not.toThrow();
       expect(db.prepare("SELECT key, mutable FROM settings ORDER BY key").all()).toEqual([
         { key: "epoch.blob_marker_checksum", mutable: 0 },
         { key: "epoch.blob_store_id", mutable: 0 },
@@ -184,16 +189,72 @@ describe("fresh epoch database", () => {
     }
   });
 
+  it("compares authored setting keys with the contract's case sensitivity", () => {
+    const directory = temporaryDirectory();
+    const blob_store = VolumeBlobStore.initialize(join(directory, "blobs"), "store-a");
+    const database_path = join(directory, "epoch.sqlite");
+    const manifest = createFreshEpochBootstrap({
+      schema: "openthrottle.fresh-epoch-bootstrap/v1",
+      settings: [
+        { key: "Epoch.operator_note", value: "visible", value_type: "string", mutable: false },
+      ],
+      repository_registrations: [],
+    });
+    const db = initializeFreshEpochDatabase({
+      database_path,
+      blob_store,
+      release_id: "release-a",
+      runtime_capability_digest: RUNTIME_CAPABILITY,
+      bootstrap: manifest,
+      now: () => NOW,
+    });
+    try {
+      expect(() => verifyFreshEpochBootstrapOnly(db, manifest)).not.toThrow();
+      expect(db.prepare("SELECT value_json FROM settings WHERE key = ?")
+        .get("Epoch.operator_note")).toEqual({ value_json: '"visible"' });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("rejects bootstrap-only recovery once execution state exists", () => {
+    const initializedEpoch = initialized();
+    const inbox = new SqliteKernelInboxStore({
+      db: initializedEpoch.db,
+      blob_store: initializedEpoch.blob_store,
+      now: () => NOW,
+    });
+    try {
+      expect(() => verifyFreshEpochBootstrapOnly(initializedEpoch.db, initializedEpoch.manifest)).not.toThrow();
+      expect(inbox.ingest({
+        source_provider: "github",
+        delivery_id: "bootstrap-only-rejection",
+        kind: "github/issues/opened@1",
+        generation: 0,
+        event_group_key: "github:issue:bootstrap-only",
+        delivery_attempt: 1,
+        payload_schema: "github.issue/v1",
+        payload: { action: "opened" },
+      })).toMatchObject({ disposition: "maintenance_closed" });
+      expect(() => verifyFreshEpochBootstrapOnly(initializedEpoch.db, initializedEpoch.manifest))
+        .not.toThrow();
+      expect(inbox.setMaintenanceFence({ closed: false, expected_version: 0 })).toMatchObject({ closed: false });
+      expect(() => verifyFreshEpochBootstrapOnly(initializedEpoch.db, initializedEpoch.manifest))
+        .toThrow(/maintenance ingress fence/);
+    } finally {
+      initializedEpoch.db.close();
+    }
+  });
+
   it("reopens only the recognized release/bootstrap/blob-root tuple", () => {
     const initializedEpoch = initialized();
     initializedEpoch.db.close();
-    const reopened = openOrInitializeFreshEpochDatabase({
+    const reopened = openFreshEpochDatabase({
       database_path: initializedEpoch.database_path,
       blob_store: initializedEpoch.blob_store,
-      release_id: "release-a",
-      runtime_capability_digest: RUNTIME_CAPABILITY,
-      bootstrap: initializedEpoch.manifest,
+      expected_identity: initializedEpoch.expected_identity,
     });
+    expect(reopened.pragma("journal_mode", { simple: true })).toBe("wal");
     reopened.close();
 
     const before = digest(initializedEpoch.database_path);
@@ -241,12 +302,16 @@ describe("fresh epoch database", () => {
     const blob_store = VolumeBlobStore.initialize(join(directory, "blobs"), "store-a");
     create(path);
     const before = digest(path);
-    expect(() => openOrInitializeFreshEpochDatabase({
+    expect(() => openFreshEpochDatabase({
       database_path: path,
       blob_store,
-      release_id: "release-a",
-      runtime_capability_digest: RUNTIME_CAPABILITY,
-      bootstrap: bootstrap(),
+      expected_identity: {
+        release_id: "release-a",
+        runtime_capability_digest: RUNTIME_CAPABILITY,
+        blob_store_id: blob_store.store_id,
+        blob_marker_checksum: blob_store.marker_checksum,
+        bootstrap_checksum: bootstrap().checksum,
+      },
     })).toThrow(FreshEpochRefusalError);
     expect(digest(path)).toBe(before);
   });
@@ -321,6 +386,22 @@ describe("fresh epoch database", () => {
       ],
       repository_registrations: [],
     })).toThrow(/duplicate setting key/);
+    expect(() => readFileSync(path)).toThrow();
+  });
+
+  it.each(["-journal", "-wal", "-shm"])("refuses a dangling %s sidecar before database publication", (suffix) => {
+    const directory = temporaryDirectory();
+    const path = join(directory, "epoch.sqlite");
+    const blob_store = VolumeBlobStore.initialize(join(directory, "blobs"), "store-a");
+    writeFileSync(`${path}${suffix}`, "dangling sidecar");
+
+    expect(() => initializeFreshEpochDatabase({
+      database_path: path,
+      blob_store,
+      release_id: "release-a",
+      runtime_capability_digest: RUNTIME_CAPABILITY,
+      bootstrap: bootstrap(),
+    })).toThrow(/sidecar/);
     expect(() => readFileSync(path)).toThrow();
   });
 });

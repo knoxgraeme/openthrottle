@@ -1,9 +1,10 @@
 # Execution-kernel deletion ledger
 
 This ledger is the clean-cut proof for the filesystem-definition execution
-epoch. The retired code is not a compatibility surface: the old release,
-SQLite database, and blob root remain together only as a checksummed offline
-archive. `docs/SPEC.md` maps every retired table to its new lifecycle owner.
+epoch. Retired state is not a compatibility surface: dogfood starts from
+distinct empty storage, and the runtime never reads or migrates the old
+database or blobs. `docs/SPEC.md` maps every retired table to its new lifecycle
+owner.
 
 | Retired owner | Replacement owner | Preserved invariant | Deletion proof |
 |---|---|---|---|
@@ -17,10 +18,10 @@ archive. `docs/SPEC.md` maps every retired table to its new lifecycle owner.
 | Webhook delivery, steering, feedback, admission-drain, status, and analysis stores | Deduplicated `inbox_events`, exact attempt/session steering, active-work report, bounded projections, and isolated historical-analysis port | No acknowledged-but-uncaptured ingress; stale steering cannot cross attempts; analysis cannot drive live decisions | Maintenance, dedupe, reordering, steering-fence, projection, and import-boundary tests. |
 | `skills/tasks/` runtime mirror and skill-as-role prompts | `.openthrottle/agents/*/instructions.md` plus progressively disclosed `.openthrottle/skills/*` | One maintained instruction identity and one maintained reusable procedure; neither widens executor authority | Catalog inventory has one source tree; agent-profile tests show only allowlisted skill metadata/body disclosure. |
 | `ot-stage-result`, loop receipt parsers, child-action receipt paths, and legacy sandbox stage envelope | `ot-result`, generated semantic validator, action profile, result repair, and executor checkpoint | Valid work is retained across malformed output; correction keeps the same session and locked subject | Sandbox submission/repair/CAS tests and ordinary/structured Docker proofs. |
-| Deployment cutover table/API/workflow and resumable phase protocol | One-shot offline replacement command and checksum-bound report artifact | Writers are stopped, active work is terminal or explicitly abandoned and cleaned, old tuple is restorable, fresh paths are empty | Preflight refusal matrix, archive restore drill, failed-smoke rollback, and absence of a cutover table or API. |
-| Legacy pipeline/runbook sections | Concise normative SPEC, filesystem authoring guide, and offline replacement runbook | Operators and authors see only pipeline, agent, skill, eval, Attempt, Record, Effect, and Checkpoint | Vocabulary scan permits old terms only in this ledger, archive material, and explicit rejection fixtures. |
+| Deployment cutover table/API/workflow and resumable phase protocol | One-shot absent-path initializer, open-only boot, maintenance fence, and single-writer deploy | Old work is abandoned, fresh storage has exact identity and begins closed, and no automatic startup can create a second epoch | Initializer refusal/integration tests, one-Machine volume proof, explicit ingress open, and absence of a cutover table or API. |
+| Legacy pipeline/runbook sections | Concise normative SPEC, filesystem authoring guide, and fresh initialization runbook | Operators and authors see only pipeline, agent, skill, eval, Attempt, Record, Effect, and Checkpoint | Vocabulary scan permits old terms only in this ledger, historical plans, and explicit rejection fixtures. |
 
 The clean-cut check fails when any retired production path is imported, any old
 table is created, a second task-definition tree is packaged, or an old term is
-accepted by public configuration. Historical plans and the archived old tuple
-are evidence, not runtime inputs.
+accepted by public configuration. Historical plans are design evidence, not
+runtime inputs.

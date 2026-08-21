@@ -329,6 +329,7 @@ describe("setup credential inventory", () => {
   it("contains only current setup credentials, not deploy-owned or retired configuration", () => {
     const names = SUPERVISOR_SECRET_CHECKLIST.map((entry) => entry.name);
     expect(names).toContain("OT_DEPLOY_TOKEN");
+    expect(names).toContain("OT_EPOCH_BOOTSTRAP_CHECKSUM");
     expect(names).toContain("LINEAR_WEBHOOK_SECRET");
     expect(names).not.toContain("OT_INSTALL_SECRET");
     expect(names).not.toContain("LINEAR_CLIENT_ID");

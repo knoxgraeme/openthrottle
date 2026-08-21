@@ -53,6 +53,8 @@ describe("loadConfig", () => {
       webhookMaxAgeSeconds: 60,
       githubReadToken: "github-read-token",
       daytonaSnapshot: "openthrottle",
+      databasePath: "/data/openthrottle-kernel-v1.sqlite",
+      blobStorePath: "/data/openthrottle-kernel-v1-blobs",
       kernelWorkerIntervalMs: 1_000,
       kernelLeaseSeconds: 120,
       kernelCycleLimit: 16,

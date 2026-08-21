@@ -100,6 +100,8 @@ describe("sandbox Dockerfile", () => {
       resolve(repoRoot, "supervisor/scripts/kernel-sandbox-e2e.mjs"),
       "utf8",
     );
+    expect(supervisorHarness).toContain("openKernelEpoch");
+    expect(supervisorHarness).not.toContain("openOrInitializeFreshEpochDatabase");
     expect(supervisorHarness).toMatch(
       /new SqliteKernelStore\(\{[\s\S]*?execution_policy: release\.execution_policy,[\s\S]*?\}\)/,
     );

@@ -1,9 +1,8 @@
 name: Deploy
 
-# This is a release workflow, not a data-migration workflow. An existing
-# pre-kernel dogfood installation is replaced once, offline, with
-# `node supervisor/scripts/offline-replace.mjs`; see docs/runbooks/execution-kernel-rollout.md.
-# After that replacement, releases deploy directly against the fresh epoch.
+# Normal startup is open-only. The one-shot initializer must have created the
+# exact fresh storage pair before FRESH_EPOCH_INITIALIZED is set. This workflow
+# owns only serialized, single-writer releases after that storage boundary.
 
 on:
   push:
@@ -95,7 +94,7 @@ jobs:
   deploy:
     needs: [changes, snapshot]
     if: >-
-      vars.FRESH_EPOCH_READY == 'true' &&
+      vars.FRESH_EPOCH_INITIALIZED == 'true' &&
       always() && !cancelled() && needs.snapshot.result != 'failure' &&
       (needs.changes.outputs.supervisor == 'true' ||
        needs.snapshot.result == 'success' ||
@@ -104,22 +103,25 @@ jobs:
     env:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       FLY_APP: ${{ vars.FLY_APP || 'openthrottle-supervisor' }}
-      FLY_ORG: ${{ vars.FLY_ORG || 'personal' }}
-      FLY_REGION: ${{ vars.FLY_REGION || 'sjc' }}
       SNAPSHOT_NAME: ${{ needs.snapshot.outputs.name }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master
-      - name: Ensure the Fly app and data volume exist
+      - name: Assert the initialized Fly app and data volume exist
         run: |
           set -euo pipefail
           if ! flyctl status --app "$FLY_APP" >/dev/null 2>&1; then
-            flyctl apps create "$FLY_APP" --org "$FLY_ORG"
+            echo "Initialized Fly app $FLY_APP is missing; refusing to create storage after the epoch gate" >&2
+            exit 1
           fi
-          if ! flyctl volumes list --app "$FLY_APP" --json |
-            jq -e '.[] | select(.name == "openthrottle_data")' >/dev/null; then
-            flyctl volumes create openthrottle_data \
-              --app "$FLY_APP" --region "$FLY_REGION" --size 1 --yes
+          volumes="$(flyctl volumes list --app "$FLY_APP" --json)"
+          if ! jq -e '
+            type == "array" and
+            ([.[] | select((.name // .Name // "") == "openthrottle_data")] | length == 1)
+          ' <<<"$volumes" >/dev/null; then
+            echo "Expected exactly one initialized openthrottle_data volume; refusing to create replacement storage" >&2
+            jq . <<<"$volumes" >&2 || true
+            exit 1
           fi
       - name: Stage the exact snapshot reference
         if: needs.snapshot.result == 'success'

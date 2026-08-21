@@ -84,6 +84,60 @@ jobs:
         # resolves; guards the Fly deploy build (deploy.yml) which CI would
         # otherwise never exercise.
         run: docker build -f supervisor/Dockerfile -t openthrottle-supervisor:test .
+      - name: Exercise packaged fresh-epoch initializer
+        run: |
+          set -euo pipefail
+          epoch_volume="openthrottle-ci-epoch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker volume create "$epoch_volume" >/dev/null
+          cleanup() {
+            docker volume rm --force "$epoch_volume" >/dev/null
+          }
+          trap cleanup EXIT
+
+          docker run --rm \
+            --mount "type=volume,src=$epoch_volume,dst=/data" \
+            --entrypoint /bin/sh \
+            openthrottle-supervisor:test \
+            -ec 'test -z "$(ls -A /data)"'
+          receipt="$(
+            docker run --rm \
+              --mount "type=volume,src=$epoch_volume,dst=/data" \
+              openthrottle-supervisor:test \
+              node /app/scripts/initialize-epoch.mjs
+          )"
+          retry_receipt="$(
+            docker run --rm \
+              --mount "type=volume,src=$epoch_volume,dst=/data" \
+              openthrottle-supervisor:test \
+              node /app/scripts/initialize-epoch.mjs
+          )"
+          if [ "$retry_receipt" != "$receipt" ]; then
+            echo "initializer retry did not return the identical receipt" >&2
+            exit 1
+          fi
+          RECEIPT="$receipt" node --input-type=module <<'NODE'
+          const receipt = JSON.parse(process.env.RECEIPT ?? "");
+          const sha256 = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+          if (
+            receipt.schema !== "openthrottle.fresh-epoch-initialization/v1" ||
+            receipt.database_path !== "/data/openthrottle-kernel-v1.sqlite" ||
+            receipt.blob_store_path !== "/data/openthrottle-kernel-v1-blobs" ||
+            receipt.blob_store_id !== "openthrottle-execution-kernel-v1" ||
+            receipt.release_id !== "openthrottle-execution-kernel/v1" ||
+            !sha256(receipt.blob_marker_checksum) ||
+            !sha256(receipt.runtime_capability_digest) ||
+            !sha256(receipt.bootstrap_checksum) ||
+            !sha256(receipt.schema_checksum) ||
+            receipt.schema_version !== 1 ||
+            receipt.maintenance_ingress_closed !== true ||
+            receipt.integrity !== "ok"
+          ) throw new Error("packaged initializer returned an invalid receipt");
+          NODE
+          docker run --rm \
+            --mount "type=volume,src=$epoch_volume,dst=/data" \
+            --entrypoint /bin/sh \
+            openthrottle-supervisor:test \
+            -ec 'test -f /data/openthrottle-kernel-v1.sqlite && test -f /data/openthrottle-kernel-v1-blobs/.openthrottle-blob-store.json'
       - name: Build sandbox image
         run: docker build -f sandbox/Dockerfile -t openthrottle:test .
       - name: Exercise sandbox lifecycle with stub agent

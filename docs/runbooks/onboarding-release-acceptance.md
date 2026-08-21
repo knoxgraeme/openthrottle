@@ -142,9 +142,12 @@ openthrottle setup
 Review the mutation plan before approving it. Setup converges the hosting and
 runtime providers against the manifest (acceptance Fly app + `/data` volume,
 generated supervisor secrets, and the release snapshot pinned to the
-manifest's `sandboxImage`), then hands back the remaining operator-owned
-`fly secrets set` steps. Complete those and re-run `openthrottle setup` until
-it reports ready.
+manifest's `sandboxImage`). On a new volume it must stop before deployment and
+report `OT_EPOCH_BOOTSTRAP_CHECKSUM` as missing. Run the exact pinned
+supervisor image's one-shot initializer using the sequence in
+[`execution-kernel-rollout.md`](execution-kernel-rollout.md), set the emitted
+checksum with the remaining operator-owned `fly secrets set` values, then
+re-run `openthrottle setup` until it reports ready.
 
 ## 7. Idempotence
 

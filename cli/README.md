@@ -18,6 +18,12 @@ Install the Fly and Daytona CLIs, authenticate them, then run guided setup:
 npx openthrottle setup
 ```
 
+For an empty Fly volume, the first run prepares the hosting resources but does
+not deploy. Initialize the volume once with the pinned supervisor image, set
+the emitted `OT_EPOCH_BOOTSTRAP_CHECKSUM`, then re-run `setup`. The
+[fresh-epoch runbook](../docs/runbooks/execution-kernel-rollout.md) has the
+exact sequence.
+
 Initialize a target repository:
 
 ```bash
@@ -64,7 +70,8 @@ openthrottle planning-skill <install|status|refresh|remove> [--json]
 Key workflows:
 
 - `setup` provisions and verifies the pinned supervisor and sandbox release.
-  `--check` is read-only; `--profile` keeps multiple environments separate.
+  It refuses the first deploy until the one-shot epoch checksum is present;
+  `--check` is read-only and `--profile` keeps multiple environments separate.
 - `init` writes the small v2 config and starter directories; it does not copy
   platform agents, pipelines, or skills into the repository. Add repository
   definitions directly under `.openthrottle/` when needed. `--dry-run` validates

@@ -69,6 +69,12 @@ cd your-repository
 npx openthrottle init
 ```
 
+On a new Fly volume, `setup` creates the app, volume, and generated secrets,
+then deliberately stops before the first deploy. Run the one-shot initializer
+from the pinned supervisor image, set its emitted
+`OT_EPOCH_BOOTSTRAP_CHECKSUM`, and re-run `setup`; see the
+[fresh-epoch runbook](docs/runbooks/execution-kernel-rollout.md).
+
 `init` writes `.openthrottle/config.yml`, creates starter definition
 directories, installs the global planning/operator skills, registers the
 repository route, and verifies the runtime snapshot. Commit the definition tree

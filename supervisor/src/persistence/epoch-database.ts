@@ -4,7 +4,6 @@ import {
   chmodSync,
   closeSync,
   constants,
-  existsSync,
   fsyncSync,
   lstatSync,
   openSync,
@@ -40,6 +39,7 @@ const MAX_BOOTSTRAP_REGISTRATIONS = 256;
 const MAX_BOOTSTRAP_BYTES = 1024 * 1024;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,299}$/;
 const LOWERCASE_SHA256 = /^[a-f0-9]{64}$/;
+const DATABASE_SIDECAR_SUFFIXES = ["-journal", "-wal", "-shm"] as const;
 
 export type SettingValueType = "string" | "number" | "boolean" | "json";
 
@@ -427,12 +427,55 @@ function insertBootstrap(
   }
 }
 
-function assertBootstrapOnly(db: Database.Database, bootstrap: FreshEpochBootstrap): void {
+export function verifyFreshEpochBootstrapOnly(db: Database.Database, input: FreshEpochBootstrap): void {
+  const bootstrap = validateFreshEpochBootstrap(input);
   const expectedSupportRows = bootstrap.settings.length + 6;
   const settingCount = db.prepare("SELECT COUNT(*) AS count FROM settings").get() as { count: number };
   const registrationCount = db.prepare("SELECT COUNT(*) AS count FROM repository_registrations").get() as { count: number };
   if (settingCount.count !== expectedSupportRows || registrationCount.count !== bootstrap.repository_registrations.length) {
     refuse("fresh epoch bootstrap row counts do not match the manifest");
+  }
+  const maintenance = db.prepare(`
+    SELECT value_json, value_type, mutable, version
+    FROM settings WHERE key = ?
+  `).get(KERNEL_INGRESS_MAINTENANCE_SETTING) as {
+    value_json: string;
+    value_type: string;
+    mutable: number;
+    version: number;
+  } | undefined;
+  if (!maintenance || canonicalJson(maintenance) !== canonicalJson({
+    value_json: "true", value_type: "boolean", mutable: 1, version: 0,
+  })) {
+    refuse("fresh epoch maintenance ingress fence is not closed at version zero");
+  }
+  const actualSettings = db.prepare(`
+    SELECT key, value_json, value_type, mutable, version
+    FROM settings WHERE key NOT GLOB 'epoch.*' ORDER BY key
+  `).all();
+  const expectedSettings = bootstrap.settings.map((setting) => ({
+    key: setting.key,
+    value_json: canonicalJson(setting.value),
+    value_type: setting.value_type,
+    mutable: setting.mutable ? 1 : 0,
+    version: 0,
+  })).sort((left, right) => compareCodeUnits(left.key, right.key));
+  if (canonicalJson(actualSettings) !== canonicalJson(expectedSettings)) {
+    refuse("fresh epoch bootstrap settings do not match the manifest");
+  }
+  const actualRegistrations = db.prepare(`
+    SELECT
+      id, control_provider, route_key, linear_team_id, linear_team_key,
+      github_repo, github_installation_id, base_branch, webhook_id,
+      runtime_snapshot, version
+    FROM repository_registrations ORDER BY id
+  `).all();
+  const expectedRegistrations = bootstrap.repository_registrations.map((registration) => ({
+    ...registration,
+    version: 0,
+  })).sort((left, right) => compareCodeUnits(left.id, right.id));
+  if (canonicalJson(actualRegistrations) !== canonicalJson(expectedRegistrations)) {
+    refuse("fresh epoch bootstrap registrations do not match the manifest");
   }
   for (const table of [
     "leases", "work_items", "inbox_events", "definitions", "pipeline_runs", "attempts",
@@ -440,6 +483,18 @@ function assertBootstrapOnly(db: Database.Database, bootstrap: FreshEpochBootstr
   ]) {
     const row = db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number };
     if (row.count !== 0) refuse(`fresh epoch bootstrap unexpectedly populated ${table}`);
+  }
+}
+
+function pathEntryExists(path: string): boolean {
+  return lstatSync(path, { throwIfNoEntry: false }) !== undefined;
+}
+
+function assertNoDatabaseSidecars(target: string): void {
+  for (const suffix of DATABASE_SIDECAR_SUFFIXES) {
+    if (pathEntryExists(`${target}${suffix}`)) {
+      refuse(`target database sidecar exists: ${target}${suffix}`);
+    }
   }
 }
 
@@ -456,7 +511,7 @@ function unlinkStagingFiles(stagingPath: string): void {
   if (!basename(stagingPath).includes(".epoch-init-")) {
     throw new Error("refusing to remove an unrecognized epoch staging path");
   }
-  for (const suffix of ["", "-journal", "-wal", "-shm"]) {
+  for (const suffix of ["", ...DATABASE_SIDECAR_SUFFIXES]) {
     try {
       unlinkSync(`${stagingPath}${suffix}`);
     } catch (error) {
@@ -480,7 +535,8 @@ export function initializeFreshEpochDatabase(input: {
   const target = resolve(input.database_path);
   const parent = realpathSync(dirname(target));
   const canonicalTarget = join(parent, basename(target));
-  if (existsSync(canonicalTarget)) refuse("target database path is not absent");
+  if (pathEntryExists(canonicalTarget)) refuse("target database path is not absent");
+  assertNoDatabaseSidecars(canonicalTarget);
   input.blob_store.assertSameVolume(canonicalTarget);
   const releaseId = boundedString(input.release_id, "release_id", 200);
   const bootstrap = validateFreshEpochBootstrap(input.bootstrap);
@@ -507,7 +563,7 @@ export function initializeFreshEpochDatabase(input: {
       insertBootstrap(stagingDb!, bootstrap, identity, timestamp);
     }).immediate();
     verifyFreshEpochDatabase(stagingDb, identity);
-    assertBootstrapOnly(stagingDb, bootstrap);
+    verifyFreshEpochBootstrapOnly(stagingDb, bootstrap);
     stagingDb.close();
     stagingDb = undefined;
     chmodSync(stagingPath, 0o600);
@@ -519,11 +575,12 @@ export function initializeFreshEpochDatabase(input: {
       proof.pragma("foreign_keys = ON");
       proof.pragma("query_only = ON");
       verifyFreshEpochDatabase(proof, identity);
-      assertBootstrapOnly(proof, bootstrap);
+      verifyFreshEpochBootstrapOnly(proof, bootstrap);
     } finally {
       proof.close();
     }
-    if (existsSync(canonicalTarget)) refuse("target database appeared during initialization");
+    if (pathEntryExists(canonicalTarget)) refuse("target database appeared during initialization");
+    assertNoDatabaseSidecars(canonicalTarget);
     renameSync(stagingPath, canonicalTarget);
     fsyncPath(parent);
   } catch (error) {
@@ -531,18 +588,18 @@ export function initializeFreshEpochDatabase(input: {
     unlinkStagingFiles(stagingPath);
     throw error;
   }
-  return openFreshEpochDatabase({
+  return openVerifiedFreshEpochDatabase({
     database_path: canonicalTarget,
     blob_store: input.blob_store,
     expected_identity: identity,
-  });
+  }, "DELETE");
 }
 
-export function openFreshEpochDatabase(input: {
+function openVerifiedFreshEpochDatabase(input: {
   database_path: string;
   blob_store: VolumeBlobStore;
   expected_identity: FreshEpochIdentity;
-}): Database.Database {
+}, journalMode: "DELETE" | "WAL"): Database.Database {
   const target = resolve(input.database_path);
   const expectedIdentity: FreshEpochIdentity = {
     ...input.expected_identity,
@@ -570,7 +627,7 @@ export function openFreshEpochDatabase(input: {
   const db = new Database(target, { fileMustExist: true });
   try {
     db.pragma("foreign_keys = ON");
-    db.pragma("journal_mode = WAL");
+    db.pragma(`journal_mode = ${journalMode}`);
     db.pragma("synchronous = FULL");
     db.pragma("busy_timeout = 5000");
     verifyFreshEpochDatabase(db, expectedIdentity);
@@ -581,30 +638,47 @@ export function openFreshEpochDatabase(input: {
   }
 }
 
-export function openOrInitializeFreshEpochDatabase(input: {
+export function openFreshEpochDatabase(input: {
   database_path: string;
   blob_store: VolumeBlobStore;
-  release_id: string;
-  runtime_capability_digest: string;
-  bootstrap: FreshEpochBootstrap;
-  now?: () => string;
+  expected_identity: FreshEpochIdentity;
 }): Database.Database {
-  const bootstrap = validateFreshEpochBootstrap(input.bootstrap);
-  const expected_identity: FreshEpochIdentity = {
-    release_id: boundedString(input.release_id, "release_id", 200),
+  return openVerifiedFreshEpochDatabase(input, "WAL");
+}
+
+/**
+ * Opens an existing epoch for receipt recovery without switching journal mode
+ * or otherwise mutating its bytes. Normal supervisor boot must use
+ * openFreshEpochDatabase() instead.
+ */
+export function inspectFreshEpochDatabase(input: {
+  database_path: string;
+  blob_store: VolumeBlobStore;
+  expected_identity: FreshEpochIdentity;
+}): Database.Database {
+  const target = resolve(input.database_path);
+  const expectedIdentity: FreshEpochIdentity = {
+    ...input.expected_identity,
     runtime_capability_digest: lowercaseSha256(
-      input.runtime_capability_digest,
-      "runtime_capability_digest",
+      input.expected_identity.runtime_capability_digest,
+      "expected runtime_capability_digest",
     ),
-    blob_store_id: input.blob_store.store_id,
-    blob_marker_checksum: input.blob_store.marker_checksum,
-    bootstrap_checksum: bootstrap.checksum,
   };
-  return existsSync(input.database_path)
-    ? openFreshEpochDatabase({
-      database_path: input.database_path,
-      blob_store: input.blob_store,
-      expected_identity,
-    })
-    : initializeFreshEpochDatabase({ ...input, bootstrap });
+  const stats = lstatSync(target);
+  if (!stats.isFile() || stats.isSymbolicLink()) refuse("target database is not a regular file");
+  input.blob_store.assertSameVolume(target);
+  const before = databaseFileDigest(target);
+  const db = new Database(target, { readonly: true, fileMustExist: true });
+  try {
+    db.pragma("foreign_keys = ON");
+    db.pragma("query_only = ON");
+    verifyFreshEpochDatabase(db, expectedIdentity);
+    if (databaseFileDigest(target) !== before) {
+      refuse("read-only epoch verification changed the database bytes");
+    }
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 }

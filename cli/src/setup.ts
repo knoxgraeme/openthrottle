@@ -87,6 +87,11 @@ export const SUPERVISOR_SECRET_CHECKLIST: readonly ChecklistEntry[] = [
   { name: "GITHUB_READ_TOKEN", owner: "operator", hint: "fine-grained PAT with contents/PRs/checks/actions read only" },
   { name: "DAYTONA_API_KEY", owner: "operator", hint: "Daytona API key" },
   {
+    name: "OT_EPOCH_BOOTSTRAP_CHECKSUM",
+    owner: "operator",
+    hint: "exact checksum emitted by the one-shot fresh-epoch initializer; do not invent this value",
+  },
+  {
     name: "DAYTONA_SNAPSHOT",
     owner: "derived",
     hint: "derivable — `openthrottle setup` pins the release snapshot name; default: openthrottle",

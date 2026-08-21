@@ -56,8 +56,12 @@ class ActiveWork implements KernelActiveWorkProjectionPort {
 
 class RuntimeInventory implements KernelRuntimeInventoryPort {
   resources: readonly KernelRuntimeInventoryResource[] = [];
+  failure: Error | null = null;
+  limits: number[] = [];
 
   async listActiveRuntimeResources(limit: number): Promise<readonly KernelRuntimeInventoryResource[]> {
+    this.limits.push(limit);
+    if (this.failure) throw this.failure;
     return this.resources.slice(0, limit);
   }
 }
@@ -231,7 +235,7 @@ describe("KernelControlService", () => {
       .toEqual({ count: 0 });
   });
 
-  it("produces a bounded settle-or-abandon report without treating decisions as cleanup", async () => {
+  it("produces a bounded diagnostic active-work snapshot", async () => {
     const test = setup();
     const durable: KernelActiveWorkItem = {
       key: "run:run-1",
@@ -249,43 +253,71 @@ describe("KernelControlService", () => {
       state: "started",
       pipeline_run_id: "run-1",
     }];
-    const report = await test.control.activeWorkReport({
-      dispositions: [{ key: "run:run-1", action: "settle", reason: "finish normally" }],
-    });
-    expect(report).toMatchObject({
+    const report = await test.control.activeWorkReport();
+    expect(report).toEqual({
+      observed_at: KERNEL_FIXTURE_NOW,
       clear: false,
-      fully_dispositioned: false,
-      replacement_ready: false,
       truncated: false,
-    });
-    expect(report.items.map(({ key }) => key)).toEqual([
-      "run:run-1",
-      "runtime_resource:daytona:workspace-1",
-    ]);
-    const dispositioned = await test.control.activeWorkReport({
-      dispositions: [
-        { key: "run:run-1", action: "abandon", reason: "dogfood run is disposable" },
+      items: [
+        durable,
         {
           key: "runtime_resource:daytona:workspace-1",
-          action: "abandon",
-          reason: "delete workspace before replacement",
+          kind: "runtime_resource",
+          id: "workspace-1",
+          pipeline_run_id: "run-1",
+          status: "started",
+          detail: "provider=daytona",
+          observed_at: KERNEL_FIXTURE_NOW,
         },
       ],
-    });
-    expect(dispositioned.fully_dispositioned).toBe(true);
-    expect(dispositioned.replacement_ready).toBe(false);
-    test.control.assertReportUnchanged({
-      expected_report_hash: dispositioned.report_hash,
-      report: dispositioned,
     });
 
     test.activeWork.snapshot = { items: [], truncated: false };
     test.inventory.resources = [];
-    expect(await test.control.activeWorkReport()).toMatchObject({
+    expect(await test.control.activeWorkReport()).toEqual({
+      observed_at: KERNEL_FIXTURE_NOW,
       clear: true,
-      fully_dispositioned: true,
-      replacement_ready: true,
+      truncated: false,
       items: [],
     });
+  });
+
+  it("marks bounded and unavailable runtime inventories as incomplete", async () => {
+    const bounded = setup();
+    bounded.activeWork.snapshot = {
+      items: [{
+        key: "run:run-1",
+        kind: "run",
+        id: "run-1",
+        pipeline_run_id: "run-1",
+        status: "running",
+        detail: "stage=implement",
+        observed_at: KERNEL_FIXTURE_NOW,
+      }],
+      truncated: false,
+    };
+    expect(await bounded.control.activeWorkReport({ limit: 1 })).toMatchObject({
+      clear: false,
+      truncated: true,
+    });
+    expect(bounded.inventory.limits).toEqual([]);
+
+    const unavailable = setup();
+    unavailable.inventory.failure = new Error("provider timeout");
+    expect(await unavailable.control.activeWorkReport({ limit: 2 })).toEqual({
+      observed_at: KERNEL_FIXTURE_NOW,
+      clear: false,
+      truncated: false,
+      items: [{
+        key: "runtime_resource:unknown:inventory-unavailable",
+        kind: "runtime_resource",
+        id: "inventory-unavailable",
+        pipeline_run_id: null,
+        status: "unknown",
+        detail: "runtime inventory failed: Error: provider timeout",
+        observed_at: KERNEL_FIXTURE_NOW,
+      }],
+    });
+    expect(unavailable.inventory.limits).toEqual([3]);
   });
 });

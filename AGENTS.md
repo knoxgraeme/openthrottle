@@ -79,7 +79,8 @@ node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test
 These local harnesses use stubbed or local boundaries. They do not prove live
 exact-subject publication, trusted-producer GitHub provider wait, real
 semantic-remediation efficacy, provider-backed terminal cleanup, or acceptance
-of a Fly/SQLite epoch. Those are credentialed operator gates.
+of a Fly/SQLite epoch. Live dogfood exercises those boundaries; do not claim
+the local harnesses prove them.
 
 ## Authored definitions
 
@@ -178,8 +179,8 @@ Effect by itself.
   orchestration, and provider-neutral ports.
 - `supervisor/src/pipeline/kernel/` owns the pure reducer, action construction,
   evaluation, structured-frontier logic, and successor derivation.
-- `supervisor/src/persistence/` is the only SQLite boundary. It also owns the
-  storage-safe one-shot offline replacement. The fresh epoch has
+- `supervisor/src/persistence/` is the only SQLite boundary. It also owns
+  retry-safe fresh-epoch initialization and open-only validation. The epoch has
   exactly twelve tables: `schema_migrations`, `settings`, `leases`,
   `repository_registrations`, `work_items`, `inbox_events`, `definitions`,
   `pipeline_runs`, `attempts`, `records`, `effects`, and `checkpoints`.
@@ -220,14 +221,18 @@ the object; settled records remain immutable.
 - Mutating ingress returns a retryable non-acknowledgement while maintenance is
   closed, so providers retry into the fresh epoch instead of crossing epochs.
 
-The current dogfood epoch is replaced offline, not migrated in place. Stop all
-writers, archive and hash the old database/blob/release tuple, initialize
-distinct empty paths, then use the ordinary and structured smoke hooks as the
-first credentialed canaries. Exactly one Fly Machine may own the SQLite volume.
-Keep `FRESH_EPOCH_READY` absent or false until their evidence is accepted; on
-rollback, close and verify that gate before restoring the retained old tuple.
-Do not add compatibility reads, dual writes, or a durable transition state
-machine. See
+Dogfood starts from a new empty epoch; prior runtime state is abandoned, not
+migrated. Stop every old writer and run the exact candidate's one-shot
+initializer against distinct unused database and blob paths. The first publish
+requires both paths to be absent; a retry accepts only its exact empty BlobStore
+partial or exact bootstrap-only closed pair. Initialization pins release,
+runtime, bootstrap, and blob identity and starts ingress closed. Set the
+mechanical `FRESH_EPOCH_INITIALIZED` deploy prerequisite only after that receipt
+exists, deploy exactly one Fly Machine owning the volume, register the
+repository, and explicitly open ingress. Then submit real tickets and fix
+failures forward. There is no archive/restore workflow, prescribed canary pair,
+replacement report, compatibility path, dual write, or durable transition
+state machine. See
 [`docs/runbooks/execution-kernel-rollout.md`](docs/runbooks/execution-kernel-rollout.md).
 
 ## Operator GitHub work

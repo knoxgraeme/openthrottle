@@ -46,11 +46,17 @@ const bundle: SupervisorDeploymentBundle = {
     GITHUB_TOKEN: { owner: "operator", name: "github_token" },
     GITHUB_READ_TOKEN: { owner: "operator", name: "github_read_token" },
     DAYTONA_API_KEY: { owner: "operator", name: "daytona_api_key" },
+    OT_EPOCH_BOOTSTRAP_CHECKSUM: { owner: "operator", name: "epoch_bootstrap_checksum" },
   },
 };
 
 const APP = "openthrottle-supervisor";
-const OPERATOR_NAMES = ["DAYTONA_API_KEY", "GITHUB_READ_TOKEN", "GITHUB_TOKEN"];
+const OPERATOR_NAMES = [
+  "DAYTONA_API_KEY",
+  "GITHUB_READ_TOKEN",
+  "GITHUB_TOKEN",
+  "OT_EPOCH_BOOTSTRAP_CHECKSUM",
+];
 const ALL_SECRET_NAMES = [
   ...OPERATOR_NAMES,
   "DAYTONA_SNAPSHOT",
@@ -62,9 +68,25 @@ const ALL_SECRET_NAMES = [
 ];
 const RELEASE_MACHINE_IMAGE = `registry.fly.io/${APP}@sha256:${"a".repeat(64)}`;
 
+interface FakeVolume {
+  id: string;
+  name: string;
+  region: string;
+  attachedMachineId: string | null;
+}
+
+function fakeVolume(
+  id = "vol_data1",
+  region = "sjc",
+  name = "openthrottle_data",
+  attachedMachineId: string | null = null,
+): FakeVolume {
+  return { id, name, region, attachedMachineId };
+}
+
 class FakeFly {
   apps: string[] = [];
-  volumes: string[] = [];
+  volumes: FakeVolume[] = [];
   secrets: string[] = [];
   machines: { state: string; image?: string }[] = [];
   calls: string[][] = [];
@@ -86,7 +108,7 @@ class FakeFly {
 
   makeReady(): void {
     this.apps = [APP];
-    this.volumes = ["openthrottle_data"];
+    this.volumes = [fakeVolume()];
     this.secrets = [...ALL_SECRET_NAMES];
     this.machines = [{ state: "started", image: RELEASE_MACHINE_IMAGE }];
   }
@@ -120,10 +142,22 @@ class FakeFly {
         return this.ok({});
       }
       case "volumes list":
-        return this.ok(this.volumes.map((name) => ({ name, state: "created" })));
-      case "volumes create":
-        this.volumes.push(args[2] ?? "");
+        return this.ok(this.volumes.map((volume) => ({
+          id: volume.id,
+          name: volume.name,
+          region: volume.region,
+          attached_machine_id: volume.attachedMachineId,
+          state: "created",
+        })));
+      case "volumes create": {
+        const regionIndex = args.indexOf("--region");
+        this.volumes.push(fakeVolume(
+          `vol_created${this.volumes.length + 1}`,
+          args[regionIndex + 1] ?? "sjc",
+          args[2] ?? "",
+        ));
         return this.ok({});
+      }
       case "secrets list":
         return this.ok(this.secrets.map((name) => ({ Name: name, Digest: "digest" })));
       case "secrets set":
@@ -134,6 +168,9 @@ class FakeFly {
             if (!this.secrets.includes(name)) this.secrets.push(name);
           }
         }
+        return this.ok({});
+      case "secrets unset":
+        this.secrets = this.secrets.filter((name) => !args.includes(name));
         return this.ok({});
       case "machines list":
         return this.ok(this.machines.map((machine) => ({ state: machine.state, config: { image: machine.image } })));
@@ -208,7 +245,11 @@ function expectValidEvidence(evidence: ProviderEvidence): void {
 }
 
 const mutationCalls = (fly: FakeFly) =>
-  fly.calls.filter((args) => args[0] === "deploy" || args[1] === "create" || (args[0] === "secrets" && args[1] === "set"));
+  fly.calls.filter((args) =>
+    args[0] === "deploy" ||
+    args[1] === "create" ||
+    (args[0] === "secrets" && (args[1] === "set" || args[1] === "unset"))
+  );
 
 describe("fly hosting adapter preflight", () => {
   it("reports a missing flyctl binary as operator needs_action with install instructions", async () => {
@@ -262,14 +303,50 @@ describe("fly hosting adapter inspect", () => {
     expectValidEvidence(evidence);
   });
 
-  it("reports a missing data volume with the exact create recovery", async () => {
+  it("routes a missing volume with a stale checksum through guarded setup", async () => {
     const { fly, adapter } = createHarness();
     fly.makeReady();
     fly.volumes = [];
     const evidence = asPending(await adapter.inspect(context));
     expect(evidence.status).toBe("needs_action");
+    expect(evidence.owner).toBe("cli");
     expect(evidence.summary).toContain("volume openthrottle_data: missing");
-    expect(evidence.recoveryAction).toBe(`flyctl volumes create openthrottle_data --app ${APP} --region sjc --size 1`);
+    expect(evidence.recoveryAction).toBe("openthrottle setup");
+  });
+
+  it("reports the exact create recovery when both volume and checksum are absent", async () => {
+    const { fly, adapter } = createHarness();
+    fly.makeReady();
+    fly.volumes = [];
+    fly.secrets = fly.secrets.filter((name) => name !== "OT_EPOCH_BOOTSTRAP_CHECKSUM");
+    const evidence = asPending(await adapter.inspect(context));
+    expect(evidence.status).toBe("needs_action");
+    expect(evidence.owner).toBe("hosting_provider");
+    expect(evidence.recoveryAction).toBe(
+      `flyctl volumes create openthrottle_data --app ${APP} --region sjc --size 1`,
+    );
+  });
+
+  it.each([
+    ["duplicate", [fakeVolume("vol_data1"), fakeVolume("vol_data2")]],
+    ["wrong-region", [fakeVolume("vol_data1", "fra")]],
+  ])("refuses %s data-volume inventory without mutations", async (_label, volumes) => {
+    const { fly, adapter } = createHarness();
+    fly.makeReady();
+    fly.volumes = volumes;
+    fly.machines = [];
+
+    const inspection = asPending(await adapter.inspect(context));
+    expect(inspection.status).toBe("needs_action");
+    expect(inspection.owner).toBe("operator");
+    expect(inspection.recoveryAction).toContain("exactly one openthrottle_data volume in region sjc");
+
+    const plan = await adapter.plan(context, bundle);
+    expect(plan.mutations).toEqual([]);
+    const result = await adapter.ensure(context, bundle);
+    expect(result.evidence.status).toBe("needs_action");
+    expect(mutationCalls(fly)).toEqual([]);
+    expect(fly.calls.some((args) => args[0] === "deploy")).toBe(false);
   });
 
   it("attributes missing provisioning secret names to the cli", async () => {
@@ -291,7 +368,7 @@ describe("fly hosting adapter inspect", () => {
     expect(evidence.status).toBe("needs_action");
     expect(evidence.owner).toBe("operator");
     expect(evidence.recoveryAction).toBe(
-      `flyctl secrets set --app ${APP} DAYTONA_API_KEY=... GITHUB_READ_TOKEN=... GITHUB_TOKEN=...`
+      `Initialize the fresh epoch, then flyctl secrets set --stage --app ${APP} DAYTONA_API_KEY=... GITHUB_READ_TOKEN=... GITHUB_TOKEN=... OT_EPOCH_BOOTSTRAP_CHECKSUM=...`
     );
     expectValidEvidence(evidence);
   });
@@ -331,7 +408,7 @@ describe("fly hosting adapter inspect", () => {
     expect(result.evidence.status).toBe("ready");
     expect(result.evidence.releaseId).toBe(release.releaseId);
     expect(result.evidence.summary).toContain(`app ${APP}: ok`);
-    expect(result.evidence.summary).toContain("secrets: 9/9 set");
+    expect(result.evidence.summary).toContain("secrets: 10/10 set");
     expect(result.evidence.summary).toContain("release image: active");
     expect(result.evidence.summary).toContain("healthz: ok");
     expectValidEvidence(result.evidence);
@@ -364,7 +441,6 @@ describe("fly hosting adapter plan", () => {
       `flyctl apps create ${APP} --org personal`,
       `flyctl volumes create openthrottle_data --app ${APP} --region sjc --size 1`,
       "set 6 supervisor secrets (names: DAYTONA_SNAPSHOT, GITHUB_WEBHOOK_SECRET, LINEAR_WEBHOOK_SECRET, OT_DEPLOY_TOKEN, OT_STATUS_TOKEN, SUPERVISOR_URL)",
-      `flyctl deploy --ha=false --app ${APP} --image ${release.supervisorImage}`,
     ]);
     expect(plan.billable).toBe(true);
     expect(plan.externallyVisible).toBe(true);
@@ -384,12 +460,62 @@ describe("fly hosting adapter plan", () => {
     expect(plan.externallyVisible).toBe(false);
   });
 
+  it("does not plan a deploy until fresh storage has been initialized", async () => {
+    const { fly, adapter } = createHarness();
+    fly.makeReady();
+    fly.machines = [];
+    fly.secrets = fly.secrets.filter((name) => name !== "OT_EPOCH_BOOTSTRAP_CHECKSUM");
+
+    const plan = await adapter.plan(context, bundle);
+
+    expect(plan.mutations).not.toContain(
+      `flyctl deploy --ha=false --app ${APP} --image ${release.supervisorImage}`,
+    );
+  });
+
+  it("does not plan a deploy while another operator-owned boot secret is missing", async () => {
+    const { fly, adapter } = createHarness();
+    fly.makeReady();
+    fly.machines = [];
+    fly.secrets = fly.secrets.filter((name) => name !== "GITHUB_TOKEN");
+
+    const plan = await adapter.plan(context, bundle);
+
+    expect(plan.mutations).not.toContain(
+      `flyctl deploy --ha=false --app ${APP} --image ${release.supervisorImage}`,
+    );
+    expect(plan.billable).toBe(false);
+    expect(plan.externallyVisible).toBe(false);
+  });
+
+  it("does not treat a stale checksum as initialization for a missing volume", async () => {
+    const { fly, adapter } = createHarness();
+    fly.makeReady();
+    fly.volumes = [];
+    fly.machines = [];
+
+    const plan = await adapter.plan(context, bundle);
+
+    expect(plan.mutations).toContain(
+      `flyctl volumes create openthrottle_data --app ${APP} --region sjc --size 1`,
+    );
+    expect(plan.mutations).toContain(
+      `flyctl secrets unset --stage --app ${APP} OT_EPOCH_BOOTSTRAP_CHECKSUM`,
+    );
+    expect(plan.mutations).not.toContain(
+      `flyctl deploy --ha=false --app ${APP} --image ${release.supervisorImage}`,
+    );
+  });
+
   it("classifies volume-only and deploy-only plans correctly", async () => {
     const volumeOnly = createHarness();
     volumeOnly.fly.makeReady();
     volumeOnly.fly.volumes = [];
     const volumePlan = await volumeOnly.adapter.plan(context, bundle);
-    expect(volumePlan.mutations).toEqual([`flyctl volumes create openthrottle_data --app ${APP} --region sjc --size 1`]);
+    expect(volumePlan.mutations).toEqual([
+      `flyctl volumes create openthrottle_data --app ${APP} --region sjc --size 1`,
+      `flyctl secrets unset --stage --app ${APP} OT_EPOCH_BOOTSTRAP_CHECKSUM`,
+    ]);
     expect(volumePlan.billable).toBe(true);
     expect(volumePlan.externallyVisible).toBe(false);
 
@@ -404,7 +530,7 @@ describe("fly hosting adapter plan", () => {
 });
 
 describe("fly hosting adapter ensure", () => {
-  it("bootstraps a fresh account with exact argv mutations in order", async () => {
+  it("prepares a fresh account but does not deploy before epoch initialization", async () => {
     const { fly, port, logs, adapter } = createHarness();
     port.values.set("status_token", "PRESET_SENTINEL_STATUS");
 
@@ -426,16 +552,6 @@ describe("fly hosting adapter ensure", () => {
         "OT_STATUS_TOKEN=PRESET_SENTINEL_STATUS",
         `SUPERVISOR_URL=https://${APP}.fly.dev`,
       ],
-      [
-        "deploy",
-        "--ha=false",
-        "--app",
-        APP,
-        "--config",
-        expect.stringMatching(/openthrottle-fly-.*fly\.toml$/) as unknown as string,
-        "--image",
-        release.supervisorImage,
-      ],
     ]);
 
     // Generated secrets are minted through the port (persisted) and only for
@@ -447,17 +563,7 @@ describe("fly hosting adapter ensure", () => {
       expect(port.getCalls).not.toContain(operatorRef);
     }
 
-    // The generated fly config mirrors supervisor/fly.toml.
-    expect(fly.deployConfig).toContain(`app = "${APP}"`);
-    expect(fly.deployConfig).toContain("internal_port = 8080");
-    expect(fly.deployConfig).toContain('source = "openthrottle_data"');
-    expect(fly.deployConfig).toContain('destination = "/data"');
-    expect(fly.deployConfig).toContain('path = "/healthz"');
-
-    // The temp config directory is always removed.
-    const deployCall = fly.calls.find((args) => args[0] === "deploy");
-    const configPath = deployCall?.[deployCall.indexOf("--config") + 1] ?? "";
-    expect(existsSync(dirname(configPath))).toBe(false);
+    expect(fly.deployConfig).toBeUndefined();
 
     // Operator secrets remain unset, so the post-mutation inspection reports
     // exactly that; healthz is not probed while secrets are missing.
@@ -465,8 +571,10 @@ describe("fly hosting adapter ensure", () => {
     expect(result.evidence.status).toBe("needs_action");
     expect(result.evidence.owner).toBe("operator");
     expect(result.evidence.recoveryAction).toBe(
-      `flyctl secrets set --app ${APP} DAYTONA_API_KEY=... GITHUB_READ_TOKEN=... GITHUB_TOKEN=...`
+      "Run the one-shot fresh-epoch initializer against openthrottle_data, " +
+      "set its emitted OT_EPOCH_BOOTSTRAP_CHECKSUM, then re-run openthrottle setup."
     );
+    expect(result.evidence.summary).toContain("fresh epoch initialization required");
     expect(fly.fetches).toEqual([]);
     expectValidEvidence(result.evidence);
 
@@ -476,7 +584,7 @@ describe("fly hosting adapter ensure", () => {
     expect(surfaced).not.toContain("secret-value");
   });
 
-  it("converges to ready when operator secrets already exist", async () => {
+  it("does not let a stale checksum authorize a newly created volume", async () => {
     const { fly, adapter } = createHarness();
     fly.apps = [APP];
     fly.secrets = [...OPERATOR_NAMES];
@@ -484,11 +592,62 @@ describe("fly hosting adapter ensure", () => {
     const result = await adapter.ensure(context, bundle);
 
     const mutations = mutationCalls(fly).map((args) => (args[0] === "deploy" ? "deploy" : `${args[0]} ${args[1]}`));
-    expect(mutations).toEqual(["volumes create", "secrets set", "deploy"]);
+    expect(mutations).toEqual(["volumes create", "secrets unset", "secrets set"]);
+    expect(fly.calls).toContainEqual([
+      "secrets",
+      "unset",
+      "--stage",
+      "--app",
+      APP,
+      "OT_EPOCH_BOOTSTRAP_CHECKSUM",
+    ]);
+    expect(fly.secrets).not.toContain("OT_EPOCH_BOOTSTRAP_CHECKSUM");
+    expect(result.evidence.status).toBe("needs_action");
+    expect(result.evidence.owner).toBe("operator");
+    expect(result.evidence.summary).toContain("fresh epoch initialization required");
+    expect(result.evidence.recoveryAction).toContain("one-shot fresh-epoch initializer");
+    expect(fly.fetches).toEqual([]);
+    expectValidEvidence(result.evidence);
+
+    const mutationCount = mutationCalls(fly).length;
+    const resumed = await adapter.ensure(context, bundle);
+    expect(mutationCalls(fly)).toHaveLength(mutationCount);
+    expect(fly.calls.some((args) => args[0] === "deploy")).toBe(false);
+    expect(resumed.evidence.status).toBe("needs_action");
+    expect(resumed.evidence.recoveryAction).toContain("OT_EPOCH_BOOTSTRAP_CHECKSUM=...");
+  });
+
+  it("converges to ready from an initialized existing volume", async () => {
+    const { fly, adapter } = createHarness();
+    fly.apps = [APP];
+    fly.volumes = [fakeVolume()];
+    fly.secrets = [...OPERATOR_NAMES];
+
+    const result = await adapter.ensure(context, bundle);
+
+    const mutations = mutationCalls(fly).map((args) => (args[0] === "deploy" ? "deploy" : `${args[0]} ${args[1]}`));
+    expect(mutations).toEqual(["secrets set", "deploy"]);
     expect(result.evidence.status).toBe("ready");
     expect(result.supervisorUrl).toBe(`https://${APP}.fly.dev`);
     expect(fly.fetches).toEqual([`https://${APP}.fly.dev/healthz`]);
     expectValidEvidence(result.evidence);
+  });
+
+  it("does not deploy an initialized volume while another operator-owned boot secret is missing", async () => {
+    const { fly, adapter } = createHarness();
+    fly.apps = [APP];
+    fly.volumes = [fakeVolume()];
+    fly.secrets = ALL_SECRET_NAMES.filter((name) => name !== "GITHUB_TOKEN");
+
+    const result = await adapter.ensure(context, bundle);
+
+    expect(fly.calls.some((args) => args[0] === "deploy")).toBe(false);
+    expect(result.supervisorUrl).toBeUndefined();
+    expect(result.evidence.status).toBe("needs_action");
+    expect(result.evidence.owner).toBe("operator");
+    expect(result.evidence.recoveryAction).toBe(
+      `flyctl secrets set --app ${APP} GITHUB_TOKEN=...`,
+    );
   });
 
   it("performs no mutations when everything is already ready", async () => {

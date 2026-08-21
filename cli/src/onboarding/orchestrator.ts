@@ -154,6 +154,10 @@ export class SetupOrchestrator {
         GITHUB_TOKEN: { owner: "operator", name: "github_token" },
         GITHUB_READ_TOKEN: { owner: "operator", name: "github_read_token" },
         DAYTONA_API_KEY: { owner: "operator", name: "daytona_api_key" },
+        OT_EPOCH_BOOTSTRAP_CHECKSUM: {
+          owner: "operator",
+          name: "epoch_bootstrap_checksum",
+        },
       },
     };
   }

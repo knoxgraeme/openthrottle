@@ -52,8 +52,8 @@ node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test
 These local harnesses use stubbed or local boundaries. They do not prove live
 exact-subject publication, trusted-producer GitHub provider wait, real
 semantic-remediation efficacy, provider-backed terminal cleanup, or acceptance
-of a Fly/SQLite epoch. Those require the credentialed ordinary and structured
-replacement canaries.
+of a Fly/SQLite epoch. Those boundaries are exercised by live dogfood and must
+not be claimed from local harness results.
 
 When correction or remediation behavior changes, test them separately: result
 correction preserves the same Attempt, checkpoint, subject, and native session;

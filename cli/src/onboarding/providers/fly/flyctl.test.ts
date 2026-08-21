@@ -81,15 +81,58 @@ describe("flyctl typed helpers", () => {
     expect(calls).toEqual([["apps", "list", "--json"]]);
   });
 
-  it("lists volumes for an app with either field casing", async () => {
+  it("lists bounded volume identity and attachment with defensive field casing", async () => {
     const { client, calls } = clientReturning(
       JSON.stringify([
-        { id: "vol_1", name: "openthrottle_data", state: "created" },
-        { Name: "legacy_volume" },
+        {
+          id: "vol_abc123",
+          name: "openthrottle_data",
+          region: "sjc",
+          attached_machine_id: null,
+          state: "created",
+        },
+        {
+          ID: "vol_def456",
+          Name: "legacy_volume",
+          Region: "fra",
+          AttachedMachineId: "machine-1",
+        },
       ])
     );
-    await expect(client.volumesList("app-1")).resolves.toEqual([{ name: "openthrottle_data" }, { name: "legacy_volume" }]);
+    await expect(client.volumesList("app-1")).resolves.toEqual([
+      {
+        id: "vol_abc123",
+        name: "openthrottle_data",
+        region: "sjc",
+        attachedMachineId: null,
+      },
+      {
+        id: "vol_def456",
+        name: "legacy_volume",
+        region: "fra",
+        attachedMachineId: "machine-1",
+      },
+    ]);
     expect(calls).toEqual([["volumes", "list", "--app", "app-1", "--json"]]);
+  });
+
+  it("rejects incomplete or unbounded volume identity", async () => {
+    const missingRegion = clientReturning(JSON.stringify([
+      { id: "vol_abc123", name: "openthrottle_data" },
+    ]));
+    await expect(missingRegion.client.volumesList("app-1")).rejects.toThrow("omitted volume region");
+
+    const unsafeAttachment = clientReturning(JSON.stringify([
+      {
+        id: "vol_abc123",
+        name: "openthrottle_data",
+        region: "sjc",
+        attached_machine_id: "machine id with spaces",
+      },
+    ]));
+    await expect(unsafeAttachment.client.volumesList("app-1")).rejects.toThrow(
+      "invalid attached Machine ID",
+    );
   });
 
   it("lists secret names and digests only", async () => {
