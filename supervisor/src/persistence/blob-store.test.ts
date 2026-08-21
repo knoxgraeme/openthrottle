@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  existsSync,
   lstatSync,
   mkdtempSync,
   readFileSync,
@@ -80,6 +81,52 @@ describe("VolumeBlobStore", () => {
     expect(() => store.assertToken({} as VerifiedBlobToken)).toThrow();
   });
 
+  it("retries an uncertain shard-parent sync before publishing and syncs it once per store", () => {
+    const root = join(temporaryDirectory(), "objects");
+    const initialized = VolumeBlobStore.initialize(root, "store-a");
+    const shaRoot = join(initialized.root, "objects", "sha256");
+    const directorySyncs: string[] = [];
+    const events: string[] = [];
+    let failFirstShardParentSync = true;
+    const store = VolumeBlobStore.open(root, "store-a", {
+      sync_directory(path) {
+        directorySyncs.push(path);
+        events.push(`sync:${path}`);
+        if (path === shaRoot && failFirstShardParentSync) {
+          failFirstShardParentSync = false;
+          throw new Error("fault:shard-parent-sync");
+        }
+      },
+      fault_injector(step) {
+        events.push(step);
+      },
+    });
+    const firstDigest = createHash("sha256").update("durable evidence").digest("hex");
+    const firstPath = store.objectPath(firstDigest);
+
+    expect(() => store.put(input())).toThrow("fault:shard-parent-sync");
+    expect(lstatSync(dirname(firstPath)).isDirectory()).toBe(true);
+    expect(existsSync(firstPath)).toBe(false);
+    expect(directorySyncs).toEqual([shaRoot]);
+
+    const retryEventStart = events.length;
+    const first = store.put(input());
+    const retryEvents = events.slice(retryEventStart);
+    const secondEventStart = events.length;
+    const second = store.put(input("different evidence 570"));
+    const secondEvents = events.slice(secondEventStart);
+    const shardDirectory = dirname(firstPath);
+
+    expect(first.pointer.digest.startsWith("03")).toBe(true);
+    expect(second.pointer.digest.startsWith("03")).toBe(true);
+    expect(existsSync(firstPath)).toBe(true);
+    expect(directorySyncs).toEqual([shaRoot, shaRoot, shardDirectory, shardDirectory]);
+    expect(retryEvents.indexOf(`sync:${shaRoot}`)).toBeLessThan(retryEvents.indexOf("temporary_opened"));
+    expect(retryEvents.indexOf("shard_parent_synced")).toBeLessThan(retryEvents.indexOf("temporary_opened"));
+    expect(secondEvents).not.toContain(`sync:${shaRoot}`);
+    expect(events.filter((event) => event === "shard_parent_synced")).toHaveLength(1);
+  });
+
   it("rejects a different payload claiming an existing digest without changing the object", () => {
     const root = join(temporaryDirectory(), "objects");
     const store = VolumeBlobStore.initialize(root, "store-a");
@@ -92,6 +139,7 @@ describe("VolumeBlobStore", () => {
   });
 
   it.each<BlobWriteStep>([
+    "shard_parent_synced",
     "temporary_opened",
     "temporary_written",
     "temporary_synced",

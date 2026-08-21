@@ -34,6 +34,7 @@ const STORE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const MAX_MARKER_BYTES = 4 * 1024;
 
 export type BlobWriteStep =
+  | "shard_parent_synced"
   | "temporary_opened"
   | "temporary_written"
   | "temporary_synced"
@@ -52,6 +53,7 @@ export interface BlobWriteInput {
 
 export interface VolumeBlobStoreOptions {
   fault_injector?: (step: BlobWriteStep) => void;
+  sync_directory?: (path: string) => void;
 }
 
 interface RootMarkerContent {
@@ -216,6 +218,8 @@ export class VolumeBlobStore {
   readonly marker_checksum: string;
   readonly #objectsRoot: string;
   readonly #faultInjector: ((step: BlobWriteStep) => void) | undefined;
+  readonly #syncDirectory: (path: string) => void;
+  readonly #syncedShardEntries = new Set<string>();
 
   private constructor(root: string, marker: RootMarker, options: VolumeBlobStoreOptions) {
     this.root = root;
@@ -223,6 +227,7 @@ export class VolumeBlobStore {
     this.marker_checksum = marker.checksum;
     this.#objectsRoot = join(root, "objects", "sha256");
     this.#faultInjector = options.fault_injector;
+    this.#syncDirectory = options.sync_directory ?? fsyncDirectory;
   }
 
   static initialize(
@@ -359,7 +364,13 @@ export class VolumeBlobStore {
     }).value;
     const finalPath = this.objectPath(digest);
     const parent = dirname(finalPath);
+    const shard = digest.slice(0, 2);
     ensureManagedDirectory(parent);
+    if (!this.#syncedShardEntries.has(shard)) {
+      this.#syncDirectory(this.#objectsRoot);
+      this.#syncedShardEntries.add(shard);
+      this.#fault("shard_parent_synced");
+    }
     const temporaryPath = join(parent, `.tmp-${randomUUID()}`);
     let temporaryFd: number | undefined;
     try {
@@ -385,7 +396,7 @@ export class VolumeBlobStore {
       }
       this.#fault("published");
       unlinkSync(temporaryPath);
-      fsyncDirectory(parent);
+      this.#syncDirectory(parent);
       this.#fault("directory_synced");
       const identity = this.#verifyObject(finalPath, pointer);
       this.#fault("final_verified");
