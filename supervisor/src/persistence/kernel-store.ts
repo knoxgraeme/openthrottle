@@ -185,6 +185,7 @@ export class SqliteKernelStore implements
     blob_store: VolumeBlobStore;
     manifest_resolver: KernelManifestResolver;
     payload_schemas: ExecutionRecordPayloadRegistry;
+    execution_policy: { readonly max_concurrent_attempts: number };
     now?: () => string;
     fault_injector?: (point: KernelStoreFaultPoint) => void;
   }) {
@@ -201,6 +202,7 @@ export class SqliteKernelStore implements
       advance_run_fence: (runId, transitionId, content) => this.#advanceRunFence(runId, transitionId, content),
       insert_record: (record) => this.#insertRecord(record),
       read_effect_blob: (runId, ownerId, pointer) => this.#readBlob(runId, "effect", ownerId, pointer),
+      execution_policy: input.execution_policy,
     });
   }
 

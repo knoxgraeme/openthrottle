@@ -65,6 +65,7 @@ const SOURCE = "1".repeat(40);
 const IMPLEMENTED = "2".repeat(40);
 const SIMPLIFIED = "3".repeat(40);
 const CAPABILITY = "c".repeat(64);
+const EXECUTION_POLICY = Object.freeze({ max_concurrent_attempts: 1 });
 const temporaryDirectories: string[] = [];
 
 afterEach(() => {
@@ -444,6 +445,7 @@ async function setup(runtime = new RuntimeFixture()): Promise<ActiveKernelFixtur
     blob_store: blobs,
     manifest_resolver: { resolve: () => fixed.manifest },
     payload_schemas: ordinaryKernelPayloadSchemas(),
+    execution_policy: EXECUTION_POLICY,
     now: () => NOW,
   });
   await admitKernelPipeline({
@@ -482,6 +484,7 @@ async function setup(runtime = new RuntimeFixture()): Promise<ActiveKernelFixtur
         blob_store: blobs,
         manifest_resolver: { resolve: () => fixed.manifest },
         payload_schemas: ordinaryKernelPayloadSchemas(),
+        execution_policy: EXECUTION_POLICY,
         now: () => NOW,
       });
     const activeBundles = database === db

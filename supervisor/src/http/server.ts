@@ -7,6 +7,7 @@ import {
 } from "@openthrottle/contracts";
 import { Hono, type Context } from "hono";
 import type { Config } from "../app/config.js";
+import type { KernelExecutionPolicy } from "../app/kernel-composition.js";
 import {
   KernelHttpConflictError,
   KernelHttpNotFoundError,
@@ -47,6 +48,7 @@ export interface KernelServerCapabilities {
   release: string;
   capability_digest: string;
   capabilities: readonly string[];
+  execution_policy: KernelExecutionPolicy;
   task_timeout_seconds: number;
 }
 
@@ -338,7 +340,10 @@ export function createServer(deps: KernelServerDeps): Hono {
       release: deps.capabilities.release,
       capabilityDigest: deps.capabilities.capability_digest,
       capabilities: deps.capabilities.capabilities,
-      limits: { taskTimeoutSeconds: deps.capabilities.task_timeout_seconds },
+      limits: {
+        maxConcurrentAttempts: deps.capabilities.execution_policy.max_concurrent_attempts,
+        taskTimeoutSeconds: deps.capabilities.task_timeout_seconds,
+      },
     });
   });
 

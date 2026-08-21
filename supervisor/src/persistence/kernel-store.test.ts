@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -42,6 +42,7 @@ import {
 
 const temporaryDirectories: string[] = [];
 const NOW = "2026-08-20T12:00:00.000Z";
+const EXECUTION_POLICY = Object.freeze({ max_concurrent_attempts: 1 });
 const sha = (character: string): string => character.repeat(64);
 const subject = (character: string): string => character.repeat(40);
 
@@ -192,6 +193,7 @@ function setup(
     blob_store: blobs,
     manifest_resolver: { resolve: () => pipelineManifest },
     payload_schemas: payloadSchemas,
+    execution_policy: EXECUTION_POLICY,
     now,
     fault_injector: faultInjector,
   });
@@ -359,6 +361,7 @@ describe("SqliteKernelStore", () => {
         },
       },
       payload_schemas: payloadSchemas,
+      execution_policy: EXECUTION_POLICY,
       now: () => NOW,
     });
 
@@ -514,6 +517,81 @@ describe("SqliteKernelStore", () => {
         expires_at: "2026-08-20T12:06:00.000Z",
       })).toMatchObject({ worker_id: "worker-1", expires_at: "2026-08-20T12:06:00.000Z" });
     } finally {
+      context.db.close();
+    }
+  });
+
+  it("permits only one live Attempt lease across competing stores in one epoch", async () => {
+    const context = setup();
+    let competingDb: Database.Database | undefined;
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const secondAttempt = attempt({
+        id: "attempt-2",
+        pipeline_run_id: "run-2",
+        definition_bundle_hash: context.admission.run.definition_bundle_hash,
+      });
+      context.store.admitPipelineRun({
+        ...context.admission,
+        work_item: {
+          ...context.admission.work_item,
+          id: "work-2",
+          source_id: "issue-2",
+          source_reference: "OPE-2",
+        },
+        run: {
+          ...run([secondAttempt], context.admission.run.definition_bundle_hash),
+          id: "run-2",
+          active_attempt_versions: { [secondAttempt.id]: secondAttempt.version },
+        },
+        initial_attempts: [secondAttempt],
+      });
+      competingDb = new Database(context.db.name, { fileMustExist: true });
+      competingDb.pragma("foreign_keys = ON");
+      competingDb.pragma("journal_mode = WAL");
+      competingDb.pragma("busy_timeout = 5000");
+      const competingStore = new SqliteKernelStore({
+        db: competingDb,
+        blob_store: context.blobs,
+        manifest_resolver: { resolve: () => context.pipelineManifest },
+        payload_schemas: payloadSchemas,
+        execution_policy: EXECUTION_POLICY,
+        now: () => NOW,
+      });
+
+      const firstRequest = {
+        worker_id: "worker-1",
+        lease_id: "lease-1",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      };
+      const secondRequest = {
+        worker_id: "worker-2",
+        lease_id: "lease-2",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      };
+      const leases = await Promise.all([
+        context.store.leaseNextEligibleAttempt(firstRequest),
+        competingStore.leaseNextEligibleAttempt(secondRequest),
+      ]);
+
+      expect(leases.filter((lease) => lease !== null)).toHaveLength(1);
+      expect(leases.filter((lease) => lease === null)).toHaveLength(1);
+      const winner = leases.find((lease) => lease !== null)!;
+      const winningRequest = winner.lease.id === firstRequest.lease_id
+        ? firstRequest
+        : secondRequest;
+      expect(await competingStore.leaseNextEligibleAttempt(winningRequest)).toEqual(winner);
+      await expect(competingStore.leaseNextEligibleAttempt({
+        ...winningRequest,
+        worker_id: "conflicting-worker",
+      })).rejects.toThrow(/immutable replay/);
+      expect(await competingStore.leaseNextEligibleAttempt({
+        worker_id: "worker-3",
+        lease_id: "lease-3",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).toBeNull();
+    } finally {
+      competingDb?.close();
       context.db.close();
     }
   });
@@ -786,6 +864,7 @@ describe("SqliteKernelStore", () => {
         blob_store: context.blobs,
         manifest_resolver: { resolve: () => context.pipelineManifest },
         payload_schemas: payloadSchemas,
+        execution_policy: EXECUTION_POLICY,
         now: () => currentTime,
       });
       expect(await restarted.listSettledStructuredPlanningAttempts(planningRequest)).toEqual(settled);

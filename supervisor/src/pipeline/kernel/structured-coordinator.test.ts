@@ -180,7 +180,9 @@ function definitions(): { bundle: DefinitionBundle; manifest: CompiledPipelineMa
     {
       id: "review", kind: "agent", engine: "codex", agent_id: "core/reviewer",
       repository_authority: "inspect",
-      skills: ["core/correctness", "core/security", "core/performance"],
+      skills: [
+        "core/correctness", "core/performance", "core/reliability", "core/security", "core/tests",
+      ],
       eval: "core/review-result",
       loop: { over: "selection.personas", max_parallel: 5, max_rounds: 1, body: ["review"] },
       on: {
@@ -211,6 +213,8 @@ function definitions(): { bundle: DefinitionBundle; manifest: CompiledPipelineMa
     entry("skill", "core/correctness", { instructions: "Review correctness." }),
     entry("skill", "core/security", { instructions: "Review security." }),
     entry("skill", "core/performance", { instructions: "Review performance." }),
+    entry("skill", "core/reliability", { instructions: "Review reliability." }),
+    entry("skill", "core/tests", { instructions: "Review tests." }),
     entry("skill", "core/remediate", { instructions: "Repair only the blocking finding." }),
     entry("eval", "core/action-result", evaluation("core/action-result", "core/action-outcome@1")),
     entry("eval", "core/review-result", evaluation("core/review-result", "core/review-outcome@1")),
@@ -701,7 +705,7 @@ function personaSelectionFixture(personas: unknown): {
       {
         id: "persona", kind: "agent", engine: "codex", agent_id: "core/reviewer",
         repository_authority: "inspect", skills: roster, eval: "core/review-result",
-        loop: { over: "selection.personas", max_parallel: 5, max_rounds: 1, body: ["persona"] },
+        loop: { over: "selection.personas", max_parallel: 1, max_rounds: 1, body: ["persona"] },
         on: { success: { terminal: "completed" } },
       },
     ],
@@ -876,6 +880,41 @@ describe("structured kernel coordinator", () => {
     expect(fanout.dependencies[frontierMemberKey(fanout.attempts[2]!)]).toEqual([
       frontierMemberKey(fanout.attempts[0]!),
     ]);
+  });
+
+  it("keeps five review personas visible in one stable serial dependency chain", () => {
+    const { bundle, manifest } = definitions();
+    const members = [
+      "core/tests", "core/security", "core/reliability", "core/performance", "core/correctness",
+    ].map((id) => ({ id, action_inputs: reviewActionInputs(id) }));
+    const input = {
+      pipeline_run_id: "run-1",
+      parent_attempt_id: "selector",
+      stage_id: "review",
+      fanout_id: "selected-reviews",
+      round: 0,
+      input_subject: CURRENT_SUBJECT,
+      cursor_version: 3,
+      completed_scope_keys: [],
+      max_parallel: 1,
+      bundle,
+      manifest,
+    };
+    const fanout = compileReviewFanoutFrontier({ ...input, members });
+    const replay = compileReviewFanoutFrontier({ ...input, members: [...members].reverse() });
+
+    expect(replay).toEqual(fanout);
+    expect(fanout.attempts).toHaveLength(5);
+    expect(fanout.attempts.map((attempt) =>
+      attempt.scope.kind === "fanout_member" ? attempt.scope.member_id : "unexpected"))
+      .toEqual([
+        "core/correctness", "core/performance", "core/reliability", "core/security", "core/tests",
+      ]);
+    const keys = fanout.attempts.map(frontierMemberKey);
+    expect(fanout.dependencies[keys[0]!]).toEqual([]);
+    for (let index = 1; index < keys.length; index += 1) {
+      expect(fanout.dependencies[keys[index]!]).toEqual([keys[index - 1]!]);
+    }
   });
 
   it("creates integration only from an exact checkpoint/output/result/decision chain", () => {
@@ -1193,12 +1232,16 @@ describe("structured kernel coordinator", () => {
   });
 
   it("accepts only known, unique, bounded personas and returns sealed roster order", () => {
-    const valid = personaSelectionFixture(["core/security", "core/correctness"]);
+    const valid = personaSelectionFixture([
+      "core/standards", "core/security", "core/reliability", "core/tests", "core/correctness",
+    ]);
     expect(selectedStructuredReviewPersonas({
       ...valid,
       selector_stage_id: "selector",
       fanout_stage_id: "persona",
-    })).toEqual(["core/correctness", "core/security"]);
+    })).toEqual([
+      "core/correctness", "core/tests", "core/reliability", "core/security", "core/standards",
+    ]);
 
     for (const [personas, message] of [
       ["core/security", /must contain reviewer IDs/],

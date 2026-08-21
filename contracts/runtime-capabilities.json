@@ -8,6 +8,7 @@
   "record_kinds": ["decision", "delivery", "result"],
   "result_candidate_schema": "openthrottle.result-candidate/v1",
   "checkpoint_protocol": "git-bundle@1",
+  "max_concurrent_attempts": 1,
   "executor_primitives": [
     "core/daytona-cleanup@1",
     "core/daytona-provision@1",

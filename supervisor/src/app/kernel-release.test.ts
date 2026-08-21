@@ -14,6 +14,9 @@ describe("loadKernelReleaseDefinitions", () => {
 
     expect(release.compiler_environment.descriptor.compiler_version)
       .toBe("definition-compiler/v1");
+    expect(release.execution_policy.max_concurrent_attempts).toBe(1);
+    expect(release.execution_policy.runtime_capability_digest)
+      .toBe(release.compiler_environment.descriptor.runtime_capability_digest);
     expect(release.trusted_platform_definitions.get(
       definitionEntryIdentity("pipeline", "core/implement"),
     )).toMatch(/^[a-f0-9]{64}$/);

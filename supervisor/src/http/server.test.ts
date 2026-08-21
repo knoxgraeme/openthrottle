@@ -93,6 +93,10 @@ function setup() {
         release: "release-1",
         capability_digest: "c".repeat(64),
         capabilities: ["kernel/v1"],
+        execution_policy: Object.freeze({
+          max_concurrent_attempts: 1,
+          runtime_capability_digest: "c".repeat(64),
+        }),
         task_timeout_seconds: 3_600,
       },
       service,
@@ -113,6 +117,8 @@ describe("kernel-native HTTP surface", () => {
   it("serves health plus authenticated status, logs, analysis, and run control", async () => {
     const { app } = setup();
     expect(await (await app.request("/healthz")).json()).toEqual({ ok: true });
+    expect(await (await app.request("/capabilities", { headers: STATUS_HEADERS })).json())
+      .toMatchObject({ limits: { maxConcurrentAttempts: 1 } });
     expect((await app.request("/runs/run-active/status")).status).toBe(401);
 
     const status = await app.request("/runs/OPE-run-active/status", { headers: STATUS_HEADERS });

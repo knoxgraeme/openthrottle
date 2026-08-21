@@ -35,7 +35,7 @@ function bootstrap(): FreshEpochBootstrap {
   return createFreshEpochBootstrap({
     schema: "openthrottle.fresh-epoch-bootstrap/v1",
     settings: [
-      { key: "operator.max_parallel", value: 4, value_type: "number", mutable: true },
+      { key: "operator.poll_batch_size", value: 4, value_type: "number", mutable: true },
       { key: "operator.mode", value: "dogfood", value_type: "string", mutable: false },
     ],
     repository_registrations: [
@@ -105,8 +105,8 @@ describe("fresh epoch database", () => {
         { key: "epoch.blob_store_id", mutable: 0 },
         { key: "epoch.bootstrap_checksum", mutable: 0 },
         { key: "epoch.release_id", mutable: 0 },
-        { key: "operator.max_parallel", mutable: 1 },
         { key: "operator.mode", mutable: 0 },
+        { key: "operator.poll_batch_size", mutable: 1 },
       ]);
       expect(() => db.prepare("UPDATE settings SET value_json = '\"changed\"' WHERE key = 'epoch.release_id'").run())
         .toThrow(/immutable setting/);
@@ -114,9 +114,9 @@ describe("fresh epoch database", () => {
         .toThrow(/immutable setting/);
       db.prepare(`
         UPDATE settings SET value_json = '5', version = version + 1, updated_at = ?
-        WHERE key = 'operator.max_parallel'
+        WHERE key = 'operator.poll_batch_size'
       `).run(NOW);
-      expect(db.prepare("SELECT value_json, version FROM settings WHERE key = 'operator.max_parallel'").get())
+      expect(db.prepare("SELECT value_json, version FROM settings WHERE key = 'operator.poll_batch_size'").get())
         .toEqual({ value_json: "5", version: 1 });
     } finally {
       db.close();

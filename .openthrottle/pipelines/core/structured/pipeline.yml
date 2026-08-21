@@ -12,7 +12,7 @@ stages:
     eval: core/unit-result
     loop:
       over: execution_plan.units
-      max_parallel: 4
+      max_parallel: 1
       max_rounds: 64
       file: loops/unit-cycle.yml
     on:
@@ -145,7 +145,7 @@ stages:
     eval: core/review-result
     loop:
       over: selection.personas
-      max_parallel: 5
+      max_parallel: 1
       max_rounds: 1
       body: [persona_review]
     on:
