@@ -23,6 +23,13 @@ control event -> DefinitionBundle -> PipelineRun -> Attempt
 states the shipped acceptance boundary. Read the spec first when a change
 touches a contract.
 
+[`docs/solutions/`](docs/solutions/) contains searchable learnings from past
+bugs, architecture decisions, and workflow improvements. Entries are organized
+by category and indexed by YAML frontmatter such as `module`, `tags`, and
+`problem_type`; they are relevant when implementing or debugging in a
+documented area. [`CONCEPTS.md`](CONCEPTS.md) defines the shared domain
+vocabulary used across plans, tickets, documentation, and code.
+
 ## Four npm projects, no root package
 
 `contracts/`, `supervisor/`, `cli/`, and `sandbox/` are independent projects.
