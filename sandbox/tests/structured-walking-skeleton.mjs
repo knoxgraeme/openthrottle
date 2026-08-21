@@ -114,6 +114,7 @@ function actionRequest({ name, inputSubject, requestHash }) {
       entry_skill: "core/implement-plan",
       eval_id: semanticSchema.id,
       semantic_result_schema: semanticSchema,
+      execution_limits: { max_turns: 12, task_timeout_seconds: 600 },
       definition_entries: definitionEntries,
     },
     executor_policy: { git_administration: "executor_only", commit: false, push: false, publish: false },

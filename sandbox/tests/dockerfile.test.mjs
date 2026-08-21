@@ -68,4 +68,21 @@ describe("sandbox Dockerfile", () => {
     expect(dockerfile).not.toContain("skills/tasks/.");
     expect(dockerfile).toContain("only its DefinitionBundle allowlist");
   });
+
+  it("keeps Docker harness work requests aligned with the private v2 wire", () => {
+    for (const path of [
+      "sandbox/tests/smoke.sh",
+      "sandbox/tests/structured-walking-skeleton.mjs",
+    ]) {
+      const harness = readFileSync(resolve(repoRoot, path), "utf8");
+      const workRequests = [...harness.matchAll(
+        /schema: "openthrottle\.kernel-action-request\/v2",[\s\S]*?executor_policy:/g,
+      )];
+
+      expect(workRequests.length, path).toBeGreaterThan(0);
+      for (const request of workRequests) {
+        expect(request[0], path).toContain("execution_limits:");
+      }
+    }
+  });
 });

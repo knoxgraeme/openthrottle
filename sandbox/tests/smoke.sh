@@ -88,6 +88,7 @@ const request = (attempt, authority, requestHash) => ({
     entry_skill: "core/implement-plan",
     eval_id: semantic.id,
     semantic_result_schema: semantic,
+    execution_limits: { max_turns: 12, task_timeout_seconds: 600 },
     definition_entries: [
       { definition_kind: "agent", definition_id: "core/smoke-agent", content_hash: digest(instructions), normalized_payload: instructions },
       { definition_kind: "skill", definition_id: "core/implement-plan", content_hash: digest(skill), normalized_payload: skill },
