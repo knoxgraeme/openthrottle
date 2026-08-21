@@ -1,15 +1,16 @@
 import type Database from "better-sqlite3";
-import type { PipelineTerminalOutcome } from "@openthrottle/contracts";
-
-const TERMINAL_OUTCOMES: readonly PipelineTerminalOutcome[] = [
-  "completed", "no_change", "needs_human", "failed", "canceled", "superseded",
-];
-const RECORD_KINDS = ["result", "decision", "delivery"] as const;
+import {
+  EXECUTION_RECORD_KINDS,
+  PIPELINE_TERMINAL_OUTCOMES,
+  type ExecutionRecordKind,
+  type PipelineTerminalOutcome,
+} from "@openthrottle/contracts";
+import { ACTIVE_RUN_STATUS_SET } from "./kernel-active-statuses.js";
 
 export interface KernelHistoricalRunQuery {
   pipeline_id?: string;
   terminal_outcome?: PipelineTerminalOutcome;
-  record_kind?: (typeof RECORD_KINDS)[number];
+  record_kind?: ExecutionRecordKind;
   from?: string;
   to?: string;
   limit?: number;
@@ -37,7 +38,7 @@ export interface KernelHistoricalRun {
 export interface KernelHistoricalRecordMetadata {
   id: string;
   sequence: number;
-  kind: (typeof RECORD_KINDS)[number];
+  kind: ExecutionRecordKind;
   payload_schema: string;
   attempt_id: string | null;
   effect_id: string | null;
@@ -49,7 +50,7 @@ export interface KernelHistoricalAnalysisPort {
   listSettledRuns(query?: KernelHistoricalRunQuery): readonly KernelHistoricalRun[];
   listSettledRecordMetadata(input: {
     pipeline_run_id: string;
-    kind?: (typeof RECORD_KINDS)[number];
+    kind?: ExecutionRecordKind;
     limit?: number;
   }): readonly KernelHistoricalRecordMetadata[];
 }
@@ -70,12 +71,12 @@ function timestamp(value: string | undefined, name: string): string | undefined 
   return value;
 }
 
-function recordKind(value: string | undefined): (typeof RECORD_KINDS)[number] | undefined {
+function recordKind(value: string | undefined): ExecutionRecordKind | undefined {
   if (value === undefined) return undefined;
-  if (!RECORD_KINDS.includes(value as (typeof RECORD_KINDS)[number])) {
-    throw new Error(`record_kind must be one of: ${RECORD_KINDS.join(", ")}`);
+  if (!EXECUTION_RECORD_KINDS.includes(value as ExecutionRecordKind)) {
+    throw new Error(`record_kind must be one of: ${EXECUTION_RECORD_KINDS.join(", ")}`);
   }
-  return value as (typeof RECORD_KINDS)[number];
+  return value as ExecutionRecordKind;
 }
 
 export function createKernelHistoricalAnalysisStore(
@@ -85,7 +86,7 @@ export function createKernelHistoricalAnalysisStore(
     listSettledRuns(query = {}) {
       if (
         query.terminal_outcome !== undefined &&
-        !TERMINAL_OUTCOMES.includes(query.terminal_outcome)
+        !PIPELINE_TERMINAL_OUTCOMES.includes(query.terminal_outcome)
       ) throw new Error("historical terminal_outcome is invalid");
       const filters = ["r.status NOT IN ('pending', 'running')"];
       const args: unknown[] = [];
@@ -140,7 +141,7 @@ export function createKernelHistoricalAnalysisStore(
       const run = db.prepare(`
         SELECT status FROM pipeline_runs WHERE id = ?
       `).get(input.pipeline_run_id) as { status: string } | undefined;
-      if (!run || run.status === "pending" || run.status === "running") {
+      if (!run || ACTIVE_RUN_STATUS_SET.has(run.status)) {
         throw new Error("historical analysis may read only a settled pipeline run");
       }
       return db.prepare(`

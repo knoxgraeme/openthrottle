@@ -40,13 +40,16 @@ function fail(detail) {
   throw new Error(`offline replacement manifest: ${detail}`);
 }
 
-function exactKeys(value, expected, source) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) fail(`${source} must be an object`);
+function hasExactKeys(value, expected) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const actual = Object.keys(value).sort();
   const keys = [...expected].sort();
-  if (actual.length !== keys.length || actual.some((key, index) => key !== keys[index])) {
-    fail(`${source} has unknown or missing fields`);
-  }
+  return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
+}
+
+function exactKeys(value, expected, source) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail(`${source} must be an object`);
+  if (!hasExactKeys(value, expected)) fail(`${source} has unknown or missing fields`);
 }
 
 function boundedString(value, source, max) {
@@ -264,7 +267,7 @@ async function main() {
   };
   const generic = async (name, reason) => {
     const result = await invoke(name, reason);
-    if (Object.keys(result).sort().join(",") !== "evidence" || typeof result.evidence !== "string") {
+    if (!hasExactKeys(result, ["evidence"]) || typeof result.evidence !== "string") {
       throw new Error(`${name} output must contain only evidence`);
     }
     return result.evidence;
@@ -284,7 +287,7 @@ async function main() {
       "workers_stopped",
     ];
     if (
-      Object.keys(result).sort().join(",") !== expectedKeys.sort().join(",") ||
+      !hasExactKeys(result, expectedKeys) ||
       typeof result.old_release_id !== "string" ||
       typeof result.old_runtime_capability_digest !== "string" ||
       !/^[a-f0-9]{64}$/.test(result.old_runtime_capability_digest) ||
@@ -314,7 +317,7 @@ async function main() {
       "old_runtime_capability_digest",
     ];
     if (
-      Object.keys(result).sort().join(",") !== expectedKeys.sort().join(",") ||
+      !hasExactKeys(result, expectedKeys) ||
       typeof result.old_release_id !== "string" ||
       typeof result.old_runtime_capability_digest !== "string" ||
       !/^[a-f0-9]{64}$/.test(result.old_runtime_capability_digest) ||
@@ -335,7 +338,7 @@ async function main() {
     runSmoke: async (kind) => {
       const result = await invoke(`smoke_${kind}`);
       if (
-        Object.keys(result).sort().join(",") !== "evidence,id,status" ||
+        !hasExactKeys(result, ["evidence", "id", "status"]) ||
         typeof result.id !== "string" || result.status !== "passed" ||
         typeof result.evidence !== "string"
       ) throw new Error(`smoke_${kind} output must be {id,status:"passed",evidence}`);

@@ -1,3 +1,4 @@
+import { compareCodeUnits } from "./canonical.js";
 import {
   COMMAND_NAME_PATTERN,
   IDENTIFIER,
@@ -114,7 +115,7 @@ function parseGithubProviderEvidence(value: unknown, path: string): GithubProvid
     required_observations: [...observations].sort((left, right) => {
       const leftKey = githubObservationKey(left);
       const rightKey = githubObservationKey(right);
-      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+      return compareCodeUnits(leftKey, rightKey);
     }),
   };
 }

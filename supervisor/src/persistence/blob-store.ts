@@ -16,10 +16,11 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   canonicalJson,
+  digestNormalized,
   validateBlobPointer,
   type BlobPointer,
 } from "@openthrottle/contracts";
@@ -108,7 +109,7 @@ export class VerifiedBlobToken {
 }
 
 function sha256(bytes: Uint8Array | string): string {
-  return createHash("sha256").update(bytes).digest("hex");
+  return digestNormalized(bytes);
 }
 
 function markerFor(storeId: string): RootMarker {

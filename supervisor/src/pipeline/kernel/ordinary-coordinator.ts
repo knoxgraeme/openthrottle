@@ -60,6 +60,7 @@ import {
   kernelSuccessorStageId,
 } from "./successor-attempt.js";
 import { exactKernelRuntimeCleanupDeliveries } from "./runtime-resource.js";
+import { stageFor } from "./reducer-support.js";
 
 export interface OrdinaryKernelStore extends
   KernelReductionPort,
@@ -111,12 +112,6 @@ export interface OrdinaryKernelRunControlResult {
 
 function transitionId(kind: string, identity: unknown): string {
   return `${kind}-${digestCanonicalJson(identity).slice(0, 48)}`;
-}
-
-function stageFor(view: ReductionView, stageId: string): CompiledPipelineStage {
-  const stage = view.manifest.stages.find((candidate) => candidate.id === stageId);
-  if (!stage) throw new Error(`compiled manifest does not contain stage ${stageId}`);
-  return stage;
 }
 
 function mapWith<T extends { id: string }>(
@@ -299,7 +294,7 @@ export class OrdinaryKernelCoordinator {
     const claim = captureAttemptLeaseClaim(leased);
     let view = await this.#load(leased.run_id, leased.attempt.id);
     assertAttemptLeaseClaim(view, claim);
-    const stage = stageFor(view, leased.attempt.scope.stage_id);
+    const stage = stageFor(view.manifest, leased.attempt.scope.stage_id);
     if (stage.kind === "effect" || stage.kind === "wait") {
       // External stages return the untouched lease to the boundary worker;
       // publication and provider waits never masquerade as executable work.
@@ -596,7 +591,7 @@ export class OrdinaryKernelCoordinator {
   }): Promise<OrdinaryKernelStep> {
     const attempt = input.view.current_attempt!;
     if (!attempt.checkpoint_id) throw new Error("authoritative result requires a verified checkpoint");
-    const stage = stageFor(input.view, attempt.scope.stage_id);
+    const stage = stageFor(input.view.manifest, attempt.scope.stage_id);
     const selected = selectKernelAction({
       bundle: input.bundle,
       manifest: input.view.manifest,
@@ -736,10 +731,10 @@ export class OrdinaryKernelCoordinator {
       !plan.decision.input_record_ids.includes(currentResult.id)
     ) throw new Error("ordinary settlement planner returned an unauthorized transition");
     const records = [...plan.input_records]
-      .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+      .sort((left, right) => compareCodeUnits(left.id, right.id));
     const recordIds = records.map(({ id }) => id);
     const decisionInputs = [...plan.decision.input_record_ids]
-      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+      .sort(compareCodeUnits);
     if (
       new Set(recordIds).size !== recordIds.length ||
       canonicalJson(recordIds) !== canonicalJson(decisionInputs) ||
@@ -762,7 +757,7 @@ export class OrdinaryKernelCoordinator {
     bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
     target_stage_id: string;
   }): Promise<KernelAttempt> {
-    const target = stageFor(input.view, input.target_stage_id);
+    const target = stageFor(input.view.manifest, input.target_stage_id);
     const workInputs = await this.#store.loadAttemptRequestInputs({
       pipeline_run_id: input.view.run.id,
       attempt_id: input.current.id,

@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -20,7 +20,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { canonicalJson, digestCanonicalJson } from "@openthrottle/contracts";
+import {
+  PIPELINE_TERMINAL_OUTCOMES,
+  canonicalJson,
+  compareCodeUnits,
+  digestCanonicalJson,
+  digestNormalized,
+} from "@openthrottle/contracts";
 import {
   initializeFreshEpochDatabase,
   validateFreshEpochBootstrap,
@@ -34,9 +40,7 @@ export const OFFLINE_REPLACEMENT_SCHEMA = "openthrottle.offline-replacement/v1" 
 export const OFFLINE_REPLACEMENT_REPORT_SCHEMA =
   "openthrottle.offline-replacement-report/v1" as const;
 
-const TERMINAL_WORK_STATES = new Set([
-  "completed", "no_change", "needs_human", "failed", "canceled", "superseded",
-]);
+const TERMINAL_WORK_STATES: ReadonlySet<string> = new Set(PIPELINE_TERMINAL_OUTCOMES);
 
 export interface OfflineActiveWorkDisposition {
   id: string;
@@ -165,7 +169,7 @@ export interface OfflineReplacementReport {
 }
 
 function sha256(bytes: string | Uint8Array): string {
-  return createHash("sha256").update(bytes).digest("hex");
+  return digestNormalized(bytes);
 }
 
 function lowercaseSha256Digest(value: unknown, name: string): string {
@@ -452,7 +456,7 @@ function copyRegularTree(source: string, target: string, prefix = ""): ArchiveFi
   mkdirSync(target, { mode: 0o700 });
   const files: ArchiveFile[] = [];
   for (const entry of readdirSync(source, { withFileTypes: true }).sort((left, right) =>
-    left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
+    compareCodeUnits(left.name, right.name))) {
     const sourcePath = join(source, entry.name);
     const targetPath = join(target, entry.name);
     const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;

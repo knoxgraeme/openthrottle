@@ -1,7 +1,10 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import {
+  EXECUTION_RECORD_KINDS,
+  PIPELINE_TERMINAL_OUTCOMES,
   digestCanonicalJson,
   jsonValueAt,
+  type ExecutionRecordKind,
   type JsonValue,
   type PipelineTerminalOutcome,
 } from "@openthrottle/contracts";
@@ -25,10 +28,6 @@ import { sanitizeText } from "../shared/sanitize.js";
 const CONTROL_BODY_MAX_BYTES = 16 * 1024;
 const REGISTRATION_BODY_MAX_BYTES = 32 * 1024;
 const WEBHOOK_BODY_TOO_LARGE = `webhook payload exceeds ${KERNEL_INBOX_MAX_PAYLOAD_BYTES} bytes`;
-const TERMINAL_OUTCOMES: readonly PipelineTerminalOutcome[] = [
-  "completed", "no_change", "needs_human", "failed", "canceled", "superseded",
-];
-const RECORD_KINDS = ["result", "decision", "delivery"] as const;
 const LOG_KINDS: readonly KernelLogKind[] = [
   "run", "attempt", "record", "effect", "checkpoint", "inbox",
 ];
@@ -264,19 +263,19 @@ function registrationInput(value: Record<string, unknown>): KernelRepositorySetu
 function analysisQuery(request: Request): KernelHistoricalRunQuery {
   const url = new URL(request.url);
   const terminal = url.searchParams.get("terminal_outcome") ?? undefined;
-  if (terminal !== undefined && !TERMINAL_OUTCOMES.includes(terminal as PipelineTerminalOutcome)) {
-    throw new Error(`terminal_outcome must be one of: ${TERMINAL_OUTCOMES.join(", ")}`);
+  if (terminal !== undefined && !PIPELINE_TERMINAL_OUTCOMES.includes(terminal as PipelineTerminalOutcome)) {
+    throw new Error(`terminal_outcome must be one of: ${PIPELINE_TERMINAL_OUTCOMES.join(", ")}`);
   }
   const kind = url.searchParams.get("record_kind") ?? undefined;
-  if (kind !== undefined && !RECORD_KINDS.includes(kind as (typeof RECORD_KINDS)[number])) {
-    throw new Error(`record_kind must be one of: ${RECORD_KINDS.join(", ")}`);
+  if (kind !== undefined && !EXECUTION_RECORD_KINDS.includes(kind as ExecutionRecordKind)) {
+    throw new Error(`record_kind must be one of: ${EXECUTION_RECORD_KINDS.join(", ")}`);
   }
   return {
     ...(url.searchParams.get("pipeline_id")
       ? { pipeline_id: url.searchParams.get("pipeline_id")! }
       : {}),
     ...(terminal === undefined ? {} : { terminal_outcome: terminal as PipelineTerminalOutcome }),
-    ...(kind === undefined ? {} : { record_kind: kind as (typeof RECORD_KINDS)[number] }),
+    ...(kind === undefined ? {} : { record_kind: kind as ExecutionRecordKind }),
     ...(url.searchParams.get("from") ? { from: url.searchParams.get("from")! } : {}),
     ...(url.searchParams.get("to") ? { to: url.searchParams.get("to")! } : {}),
     ...(url.searchParams.get("limit")
@@ -393,12 +392,12 @@ export function createServer(deps: KernelServerDeps): Hono {
     }
     try {
       const kind = context.req.query("kind");
-      if (kind !== undefined && !RECORD_KINDS.includes(kind as (typeof RECORD_KINDS)[number])) {
-        throw new Error(`kind must be one of: ${RECORD_KINDS.join(", ")}`);
+      if (kind !== undefined && !EXECUTION_RECORD_KINDS.includes(kind as ExecutionRecordKind)) {
+        throw new Error(`kind must be one of: ${EXECUTION_RECORD_KINDS.join(", ")}`);
       }
       return context.json(deps.service.runAnalysis({
         reference: context.req.param("reference"),
-        ...(kind === undefined ? {} : { kind: kind as (typeof RECORD_KINDS)[number] }),
+        ...(kind === undefined ? {} : { kind: kind as ExecutionRecordKind }),
         ...(context.req.query("limit")
           ? { limit: positiveInteger(context.req.query("limit"), "limit", 500) }
           : {}),

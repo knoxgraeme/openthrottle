@@ -17,10 +17,6 @@ import {
   type KernelRun,
 } from "../pipeline/kernel/types.js";
 
-export const ACTIVE_RUN_STATUSES = new Set(["pending", "running"]);
-export const ACTIVE_ATTEMPT_STATUSES = ["pending", "running", "work_complete", "result_pending", "recorded"];
-export const ACTIVE_EFFECT_STATUSES = ["pending", "processing", "unknown"];
-
 export interface PayloadColumns {
   inline_payload: string | null;
   blob_algorithm: "sha256" | null;

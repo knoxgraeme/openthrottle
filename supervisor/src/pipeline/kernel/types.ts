@@ -1,12 +1,13 @@
-import type {
-  AttemptCheckpoint,
-  AttemptState,
-  CompiledPipelineManifest,
-  DecisionRecord,
-  EffectIntent,
-  ExecutionRecord,
-  PipelineTerminalOutcome,
-  RepositoryAuthority,
+import {
+  compareCodeUnits,
+  type AttemptCheckpoint,
+  type AttemptState,
+  type CompiledPipelineManifest,
+  type DecisionRecord,
+  type EffectIntent,
+  type ExecutionRecord,
+  type PipelineTerminalOutcome,
+  type RepositoryAuthority,
 } from "@openthrottle/contracts";
 
 export const KERNEL_RUN_SCHEMA = "openthrottle.kernel-run/v1" as const;
@@ -151,7 +152,7 @@ export function canonicalAttemptContextIds(
     }
     return value;
   });
-  const sorted = [...normalized].sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+  const sorted = [...normalized].sort(compareCodeUnits);
   if (
     new Set(sorted).size !== sorted.length ||
     sorted.some((value, index) => value !== normalized[index])

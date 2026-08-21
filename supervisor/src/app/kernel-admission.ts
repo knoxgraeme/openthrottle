@@ -1,5 +1,6 @@
 import {
   canonicalJson,
+  DEFINITION_BUNDLE_SCHEMA,
   digestCanonicalJson,
   jsonValueAt,
   type DefinitionCompilation,
@@ -61,6 +62,8 @@ export interface KernelAdmissionResult {
 
 export type KernelDefinitionCompiler = typeof compileRepositoryDefinitionAtCommit;
 
+type DefinitionBundleBlobStore = Pick<VolumeBlobStore, "put" | "read" | "assertToken">;
+
 function definitionSnapshots(compilation: DefinitionCompilation): DefinitionSnapshotInput[] {
   return compilation.bundle.value.entries.map((entry) => ({
     definition_kind: entry.definition_kind,
@@ -107,6 +110,69 @@ function prewriteWorkItem(input: {
   };
 }
 
+function prewriteVerifiedDefinitionBundle(input: {
+  compilation: DefinitionCompilation;
+  blob_store: DefinitionBundleBlobStore;
+  verification_error: string;
+}): VerifiedBlobToken {
+  const token = input.blob_store.put({
+    bytes: input.compilation.bundle.normalized,
+    encoding: "utf-8",
+    media_type: "application/json",
+    payload_schema: DEFINITION_BUNDLE_SCHEMA,
+    expected_digest: input.compilation.bundle.digest,
+  });
+  const verifiedPointer = input.blob_store.assertToken(token);
+  const reread = input.blob_store.read(verifiedPointer).toString("utf8");
+  if (
+    reread !== input.compilation.bundle.normalized ||
+    digestCanonicalJson(JSON.parse(reread)) !== input.compilation.bundle.digest
+  ) throw new Error(input.verification_error);
+  return token;
+}
+
+function createInitialAttemptAndRun(input: {
+  compilation: DefinitionCompilation;
+  source_commit: string;
+  identity: KernelAdmissionIdentity;
+  action_inputs: KernelActionInputs;
+  work_retry_limit: number;
+  result_correction_limit: number;
+}): { initialAttempt: KernelAttempt; run: KernelRun } {
+  const initialAttempt = createPendingStageAttempt({
+    id: input.identity.initial_attempt_id,
+    pipeline_run_id: input.identity.pipeline_run_id,
+    stage_id: input.compilation.manifest.value.entry_stage,
+    input_subject: input.source_commit,
+    bundle: input.compilation.bundle.value,
+    manifest: input.compilation.manifest.value,
+    action_inputs: input.action_inputs,
+  });
+  return {
+    initialAttempt,
+    run: {
+      schema: KERNEL_RUN_SCHEMA,
+      id: input.identity.pipeline_run_id,
+      pipeline_id: input.compilation.manifest.value.pipeline_id,
+      definition_bundle_hash: input.compilation.bundle.digest,
+      current_subject: input.source_commit,
+      status: "pending",
+      terminal_outcome: null,
+      cursor: compileKernelCursor({
+        stage_id: input.compilation.manifest.value.entry_stage,
+        version: 0,
+        attempts: [initialAttempt],
+      }),
+      version: 0,
+      work_retry_limit: input.work_retry_limit,
+      result_correction_limit: input.result_correction_limit,
+      active_attempt_versions: { [initialAttempt.id]: initialAttempt.version },
+      active_effect_versions: {},
+      checkpoint_ids: {},
+    },
+  };
+}
+
 /**
  * Admits one exact Git subject. All fallible compilation and runtime
  * capability checks happen before durable pointers, then bundle/work bytes are
@@ -148,55 +214,24 @@ export async function admitKernelPipeline(input: {
     definition_entries: compilation.bundle.value.entries,
   });
 
-  const definitionBundleToken = input.blob_store.put({
-    bytes: compilation.bundle.normalized,
-    encoding: "utf-8",
-    media_type: "application/json",
-    payload_schema: "openthrottle.definition-bundle/v1",
-    expected_digest: compilation.bundle.digest,
+  const definitionBundleToken = prewriteVerifiedDefinitionBundle({
+    compilation,
+    blob_store: input.blob_store,
+    verification_error: "prewritten DefinitionBundle failed exact re-read verification",
   });
-  const verifiedPointer = input.blob_store.assertToken(definitionBundleToken);
-  const reread = input.blob_store.read(verifiedPointer).toString("utf8");
-  if (
-    reread !== compilation.bundle.normalized ||
-    digestCanonicalJson(JSON.parse(reread)) !== compilation.bundle.digest
-  ) {
-    throw new Error("prewritten DefinitionBundle failed exact re-read verification");
-  }
 
   const actionInputs: KernelActionInputs = {
     task_prompt: input.work_item.task_prompt,
     context: { records: [], checkpoints: [] },
   };
-  const initialAttempt = createPendingStageAttempt({
-    id: input.identity.initial_attempt_id,
-    pipeline_run_id: input.identity.pipeline_run_id,
-    stage_id: compilation.manifest.value.entry_stage,
-    input_subject: input.source_commit,
-    bundle: compilation.bundle.value,
-    manifest: compilation.manifest.value,
+  const { initialAttempt, run } = createInitialAttemptAndRun({
+    compilation,
+    source_commit: input.source_commit,
+    identity: input.identity,
     action_inputs: actionInputs,
-  });
-  const run: KernelRun = {
-    schema: KERNEL_RUN_SCHEMA,
-    id: input.identity.pipeline_run_id,
-    pipeline_id: compilation.manifest.value.pipeline_id,
-    definition_bundle_hash: compilation.bundle.digest,
-    current_subject: input.source_commit,
-    status: "pending",
-    terminal_outcome: null,
-    cursor: compileKernelCursor({
-      stage_id: compilation.manifest.value.entry_stage,
-      version: 0,
-      attempts: [initialAttempt],
-    }),
-    version: 0,
     work_retry_limit: input.work_retry_limit,
     result_correction_limit: input.result_correction_limit,
-    active_attempt_versions: { [initialAttempt.id]: initialAttempt.version },
-    active_effect_versions: {},
-    checkpoint_ids: {},
-  };
+  });
   const admission: PipelineAdmissionInput = {
     work_item: prewriteWorkItem({ blob_store: input.blob_store, work_item: input.work_item }),
     definitions: definitionSnapshots(compilation),
@@ -256,52 +291,22 @@ export async function promoteKernelPipeline(input: {
     stages: compilation.manifest.value.stages,
     definition_entries: compilation.bundle.value.entries,
   });
-  const definitionBundleToken = input.blob_store.put({
-    bytes: compilation.bundle.normalized,
-    encoding: "utf-8",
-    media_type: "application/json",
-    payload_schema: "openthrottle.definition-bundle/v1",
-    expected_digest: compilation.bundle.digest,
+  const definitionBundleToken = prewriteVerifiedDefinitionBundle({
+    compilation,
+    blob_store: input.blob_store,
+    verification_error: "prewritten promoted DefinitionBundle failed exact re-read verification",
   });
-  const verifiedPointer = input.blob_store.assertToken(definitionBundleToken);
-  const reread = input.blob_store.read(verifiedPointer).toString("utf8");
-  if (
-    reread !== compilation.bundle.normalized ||
-    digestCanonicalJson(JSON.parse(reread)) !== compilation.bundle.digest
-  ) throw new Error("prewritten promoted DefinitionBundle failed exact re-read verification");
-
-  const initialAttempt = createPendingStageAttempt({
-    id: input.identity.initial_attempt_id,
-    pipeline_run_id: input.identity.pipeline_run_id,
-    stage_id: compilation.manifest.value.entry_stage,
-    input_subject: input.source_commit,
-    bundle: compilation.bundle.value,
-    manifest: compilation.manifest.value,
+  const { initialAttempt, run } = createInitialAttemptAndRun({
+    compilation,
+    source_commit: input.source_commit,
+    identity: input.identity,
     action_inputs: {
       task_prompt: input.task_prompt,
       context: { records: [input.promotion_record], checkpoints: [] },
     },
-  });
-  const run: KernelRun = {
-    schema: KERNEL_RUN_SCHEMA,
-    id: input.identity.pipeline_run_id,
-    pipeline_id: compilation.manifest.value.pipeline_id,
-    definition_bundle_hash: compilation.bundle.digest,
-    current_subject: input.source_commit,
-    status: "pending",
-    terminal_outcome: null,
-    cursor: compileKernelCursor({
-      stage_id: compilation.manifest.value.entry_stage,
-      version: 0,
-      attempts: [initialAttempt],
-    }),
-    version: 0,
     work_retry_limit: input.work_retry_limit,
     result_correction_limit: input.result_correction_limit,
-    active_attempt_versions: { [initialAttempt.id]: initialAttempt.version },
-    active_effect_versions: {},
-    checkpoint_ids: {},
-  };
+  });
   const attachment: PipelineRunAttachmentInput = {
     work_item_id: input.work_item_id,
     source_pipeline_run_id: input.source_pipeline_run_id,

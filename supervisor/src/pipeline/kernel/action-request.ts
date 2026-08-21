@@ -27,6 +27,7 @@ import {
   type KernelAttempt,
   type AttemptScope,
 } from "./types.js";
+import { authorityForStage, stageFor } from "./reducer-support.js";
 import { resolveKernelRuntimeResourceIdentity } from "./runtime-resource.js";
 
 const REQUEST_SEAL_SCHEMA = "openthrottle.kernel-request-seal/v1" as const;
@@ -98,15 +99,6 @@ function exactEntry(
 
 function configEntry(bundle: DefinitionBundle): DefinitionBundleEntry {
   return exactEntry(bundle, "config", "repository");
-}
-
-function stageFor(
-  manifest: CompiledPipelineManifest,
-  stageId: string,
-): CompiledPipelineStage {
-  const stage = manifest.stages.find((candidate) => candidate.id === stageId);
-  if (!stage) throw new Error(`compiled manifest does not contain stage ${stageId}`);
-  return stage;
 }
 
 function selectAgentAction(
@@ -396,7 +388,7 @@ export function createPendingKernelAttempt(input: {
   action_inputs: KernelActionInputs;
 }): KernelAttempt {
   const stage = stageFor(input.manifest, input.scope.stage_id);
-  const repositoryAuthority = stage.kind === "agent" ? stage.repository_authority : "inspect";
+  const repositoryAuthority = authorityForStage(stage);
   const requestHash = kernelAttemptRequestHash({
     pipeline_run_id: input.pipeline_run_id,
     attempt_id: input.id,

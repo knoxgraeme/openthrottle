@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer";
 import { createRequire } from "node:module";
 import { posix } from "node:path";
 import type * as Yaml from "yaml";
-import { digestNormalized } from "./canonical.js";
+import { compareCodeUnits, digestNormalized } from "./canonical.js";
 import {
   reverifyCompilerEnvironment,
   type TrustedCompilerEnvironment,
@@ -425,7 +425,7 @@ function indexDefinitions(files: ReadonlyMap<string, LoadedFile>): {
     skillFiles.get(owner.id)!.push(file);
   }
   for (const packageFiles of skillFiles.values()) {
-    packageFiles.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+    packageFiles.sort((left, right) => compareCodeUnits(left.path, right.path));
   }
   return { definitions, skillFiles };
 }
@@ -610,7 +610,7 @@ export function deriveTrustedPlatformDefinitionHashes(
   for (const descriptor of [...definitions.values()].sort((left, right) => {
     const leftIdentity = definitionEntryIdentity(left.kind, left.id);
     const rightIdentity = definitionEntryIdentity(right.kind, right.id);
-    return leftIdentity < rightIdentity ? -1 : leftIdentity > rightIdentity ? 1 : 0;
+    return compareCodeUnits(leftIdentity, rightIdentity);
   })) {
     if (descriptor.file.origin !== "platform" || descriptor.kind === "config") {
       fail(descriptor.file.path, "trusted platform source contains a non-platform definition");

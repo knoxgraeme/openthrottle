@@ -1,6 +1,11 @@
 import type Database from "better-sqlite3";
 import type { AttemptState, PipelineTerminalOutcome } from "@openthrottle/contracts";
 import { sanitizeText } from "../shared/sanitize.js";
+import {
+  ACTIVE_ATTEMPT_STATUSES,
+  ACTIVE_EFFECT_STATUSES,
+  ACTIVE_RUN_STATUSES,
+} from "./kernel-active-statuses.js";
 
 const ATTEMPT_STATUSES: readonly AttemptState[] = [
   "pending", "running", "work_complete", "result_pending", "recorded", "settled",
@@ -9,11 +14,6 @@ const ATTEMPT_STATUSES: readonly AttemptState[] = [
 const EFFECT_STATUSES = [
   "pending", "processing", "unknown", "acknowledged", "rejected", "canceled", "failed",
 ] as const;
-const ACTIVE_RUN_STATUSES = ["pending", "running"] as const;
-const ACTIVE_ATTEMPT_STATUSES = [
-  "pending", "running", "work_complete", "result_pending", "recorded",
-] as const;
-const ACTIVE_EFFECT_STATUSES = ["pending", "processing", "unknown"] as const;
 const RUNTIME_RESOURCE_EFFECT_KINDS = [
   "daytona/create-sandbox@1",
   "daytona/start-sandbox@1",
