@@ -11,6 +11,62 @@ const runbook = readFileSync(
 );
 const ci = readFileSync(resolve(repoRoot, ".github/workflows/ci.yml"), "utf8");
 
+function extractDelimited(source, prefix, suffix) {
+  const start = source.indexOf(prefix);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const bodyStart = start + prefix.length;
+  const end = source.indexOf(suffix, bodyStart);
+  expect(end).toBeGreaterThan(bodyStart);
+  return source.slice(bodyStart, end);
+}
+
+const receiptExtractionProgram = extractDelimited(
+  runbook,
+  "  jq -s '\n",
+  "\n  ' \"$FLY_LOGS\" >\"$RECEIPT_CANDIDATES\"",
+);
+const receiptValidationProgram = extractDelimited(
+  runbook,
+  "jq -e '\n  def sha256",
+  "\n' \"$RECEIPT_CANDIDATES\" >epoch-initialization-receipt.json",
+);
+
+const validReceipt = {
+  schema: "openthrottle.fresh-epoch-initialization/v1",
+  database_path: "/data/openthrottle-kernel-v1.sqlite",
+  blob_store_path: "/data/openthrottle-kernel-v1-blobs",
+  blob_store_id: "openthrottle-execution-kernel-v1",
+  release_id: "openthrottle-execution-kernel/v1",
+  blob_marker_checksum: "a".repeat(64),
+  runtime_capability_digest: "b".repeat(64),
+  bootstrap_checksum: "c".repeat(64),
+  schema_checksum: "d".repeat(64),
+  schema_version: 1,
+  maintenance_ingress_closed: true,
+  integrity: "ok",
+};
+
+function receiptLog(receipt, field = "message") {
+  return {
+    timestamp: "2026-08-21T22:59:00.000Z",
+    [field]: JSON.stringify(receipt),
+  };
+}
+
+function extractReceiptCandidates(logs) {
+  return spawnSync("jq", ["-s", receiptExtractionProgram], {
+    input: logs,
+    encoding: "utf8",
+  });
+}
+
+function validateReceiptCandidates(candidates) {
+  return spawnSync("jq", ["-e", `def sha256${receiptValidationProgram}`], {
+    input: candidates,
+    encoding: "utf8",
+  });
+}
+
 describe("fresh-epoch rollout runbook", () => {
   it("runs the accepted digest-pinned image without rebuilding a checkout", () => {
     const manifestGuardIndex = runbook.indexOf('if [ ! -f "$RELEASE_MANIFEST" ]');
@@ -87,6 +143,55 @@ describe("fresh-epoch rollout runbook", () => {
     expect(exactReceiptIndex).toBeGreaterThan(waitIndex);
     expect(retainedReceiptIndex).toBeGreaterThan(exactReceiptIndex);
     expect(destroyIndex).toBeGreaterThan(retainedReceiptIndex);
+  });
+
+  it("extracts one receipt from JSONL and concatenated pretty Fly log objects", () => {
+    const logObjects = [
+      { timestamp: "2026-08-21T22:58:59.000Z", message: "initializer starting" },
+      receiptLog(validReceipt, "Message"),
+    ];
+    const shapes = [
+      logObjects.map((entry) => JSON.stringify(entry)).join("\n"),
+      logObjects.map((entry) => JSON.stringify(entry, null, 2)).join("\n"),
+    ];
+
+    for (const logs of shapes) {
+      const extracted = extractReceiptCandidates(logs);
+      expect(extracted.status, extracted.stderr).toBe(0);
+      expect(JSON.parse(extracted.stdout)).toEqual([validReceipt]);
+
+      const validated = validateReceiptCandidates(extracted.stdout);
+      expect(validated.status, validated.stderr).toBe(0);
+      expect(JSON.parse(validated.stdout)).toEqual(validReceipt);
+    }
+  });
+
+  it("rejects invalid and duplicate initializer receipts after extraction", () => {
+    const invalidReceipt = {
+      ...validReceipt,
+      release_id: "unexpected-release",
+    };
+    const invalid = extractReceiptCandidates(
+      JSON.stringify(receiptLog(invalidReceipt), null, 2),
+    );
+    expect(invalid.status, invalid.stderr).toBe(0);
+    const invalidValidation = validateReceiptCandidates(invalid.stdout);
+    expect(invalidValidation.status).not.toBe(0);
+    expect(invalidValidation.stderr).toContain(
+      "initializer receipt identity is invalid",
+    );
+
+    const duplicate = extractReceiptCandidates(
+      [receiptLog(validReceipt), receiptLog(validReceipt)]
+        .map((entry) => JSON.stringify(entry, null, 2))
+        .join("\n"),
+    );
+    expect(duplicate.status, duplicate.stderr).toBe(0);
+    const duplicateValidation = validateReceiptCandidates(duplicate.stdout);
+    expect(duplicateValidation.status).not.toBe(0);
+    expect(duplicateValidation.stderr).toContain(
+      "expected exactly one initializer receipt",
+    );
   });
 });
 
