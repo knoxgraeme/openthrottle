@@ -124,7 +124,9 @@ flyctl machine wait "$INIT_MACHINE_ID" \
 
 Capture only this Machine's logs and require exactly one valid initializer
 receipt before deleting it. Re-running `logs --no-tail` replaces the local
-snapshot rather than appending duplicates:
+snapshot rather than appending duplicates. `jq --slurp` accepts both JSONL and
+the whitespace-delimited, pretty-printed JSON values emitted by current Fly
+CLI versions:
 
 ```bash
 FLY_LOGS="$(mktemp)"
@@ -133,8 +135,8 @@ RECEIPT_CANDIDATES="$(mktemp)"
 for attempt in $(seq 1 15); do
   flyctl logs --app "$FLY_APP" --machine "$INIT_MACHINE_ID" \
     --no-tail --json >"$FLY_LOGS"
-  jq -Rsc '
-    [split("\n")[] | fromjson? | (.message // .Message // empty) | fromjson?
+  jq -s '
+    [.[] | (.message // .Message // empty) | fromjson?
       | select(.schema == "openthrottle.fresh-epoch-initialization/v1")]
   ' "$FLY_LOGS" >"$RECEIPT_CANDIDATES"
   [ "$(jq 'length' "$RECEIPT_CANDIDATES")" -eq 1 ] && break

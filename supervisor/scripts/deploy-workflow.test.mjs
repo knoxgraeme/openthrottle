@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +21,26 @@ function namedStep(job, name) {
   const step = workflow().jobs[job].steps.find((candidate) => candidate.name === name);
   if (!step) throw new Error(`missing workflow step ${job}/${name}`);
   return step;
+}
+
+function healthCheckJqProgram() {
+  const health = namedStep("deploy", "Verify the deployed health check").run;
+  const match = health.match(/if jq -e '([\s\S]*?)' <<<"\$checks"/);
+  if (!match) throw new Error("missing embedded Fly health-check jq program");
+  return match[1];
+}
+
+function healthCheckResult(input) {
+  const result = spawnSync("jq", ["-e", healthCheckJqProgram()], {
+    encoding: "utf8",
+    input,
+  });
+  if (result.error) throw result.error;
+  return result.status === 0;
+}
+
+function acceptsHealthChecks(value) {
+  return healthCheckResult(JSON.stringify(value));
 }
 
 describe("clean-epoch deploy workflow", () => {
@@ -111,10 +132,38 @@ describe("clean-epoch deploy workflow", () => {
     const health = namedStep("deploy", "Verify the deployed health check").run;
     expect(health).toContain("flyctl checks list");
     expect(health).toContain("--json");
-    expect(health).toContain("length > 0");
-    expect(health).toContain("all(.[];");
+    expect(health).toContain("normalized_checks");
+    expect(health).toContain("($checks | length) > 0");
+    expect(health).toContain("all($checks[];");
     expect(health).toContain('== "passing"');
     expect(health).toContain("exit 1");
+  });
+
+  it("accepts both flat and Machine-keyed passing Fly health-check responses", () => {
+    expect(acceptsHealthChecks([
+      { name: "healthz", status: "passing" },
+      { Name: "service", Status: "PASSING" },
+    ])).toBe(true);
+    expect(acceptsHealthChecks({
+      "machine-1": [
+        { name: "healthz", status: "passing" },
+        { Name: "service", Status: "PASSING" },
+      ],
+    })).toBe(true);
+  });
+
+  it.each([
+    ["an empty flat response", []],
+    ["an empty keyed response", {}],
+    ["a keyed response with a malformed value", { "machine-1": { status: "passing" } }],
+    ["a response containing a malformed check", [{ status: 200 }]],
+    ["a response containing a pending check", [{ status: "passing" }, { status: "pending" }]],
+  ])("rejects %s", (_description, value) => {
+    expect(acceptsHealthChecks(value)).toBe(false);
+  });
+
+  it("rejects malformed Fly health-check JSON", () => {
+    expect(healthCheckResult('{"machine-1":')).toBe(false);
   });
 
   it("converges and verifies one Machine owns the SQLite volume", () => {

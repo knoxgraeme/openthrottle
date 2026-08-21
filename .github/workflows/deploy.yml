@@ -162,8 +162,20 @@ jobs:
             if checks="$(flyctl checks list --app "$FLY_APP" --json)"; then
               last_checks="$checks"
               if jq -e '
-                type == "array" and length > 0 and
-                all(.[]; ((.status // .Status // "") | ascii_downcase) == "passing")
+                def normalized_checks:
+                  if type == "array" then .
+                  elif type == "object" and all(.[]; type == "array") then
+                    [.[] | .[]]
+                  else
+                    []
+                  end;
+                normalized_checks as $checks |
+                ($checks | length) > 0 and
+                all($checks[];
+                  type == "object" and
+                  ((.status // .Status // null) |
+                    type == "string" and ascii_downcase == "passing")
+                )
               ' <<<"$checks" >/dev/null; then
                 jq . <<<"$checks"
                 exit 0
