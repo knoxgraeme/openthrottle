@@ -9,6 +9,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -165,7 +166,14 @@ function ensureManagedDirectory(path: string): void {
 
 function readMarker(root: string): RootMarker {
   const markerPath = join(root, ROOT_MARKER);
-  assertRegularFile(markerPath);
+  try {
+    assertRegularFile(markerPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error("blob root marker is missing");
+    }
+    throw error;
+  }
   const stats = statSync(markerPath);
   if (stats.size <= 0 || stats.size > MAX_MARKER_BYTES) {
     throw new Error("blob root marker has an invalid size");
@@ -300,6 +308,24 @@ export class VolumeBlobStore {
     const rootStats = statSync(this.root, { bigint: true });
     if (targetStats.dev !== rootStats.dev) {
       throw new Error("database and blob store must be on the same volume");
+    }
+  }
+
+  /**
+   * Confirms this is the exact empty root published by initialize(), rather
+   * than merely a valid BlobStore with no currently referenced objects.
+   */
+  assertEmpty(): void {
+    const exactEntries = (path: string, expected: readonly string[], detail: string): void => {
+      const actual = readdirSync(path).sort();
+      if (actual.length !== expected.length || actual.some((entry, index) => entry !== expected[index])) {
+        throw new Error(`blob store is not empty: ${detail}`);
+      }
+    };
+    exactEntries(this.root, [ROOT_MARKER, "objects"], "root has unexpected entries");
+    exactEntries(dirname(this.#objectsRoot), ["sha256"], "objects directory has unexpected entries");
+    if (readdirSync(this.#objectsRoot).length > 0) {
+      throw new Error("blob store is not empty: object directory contains data");
     }
   }
 

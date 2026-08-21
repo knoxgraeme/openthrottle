@@ -10,7 +10,7 @@ primary_region = "sjc"
 
 [env]
   PORT = "8080"
-  DATABASE_PATH = "/data/openthrottle.db"
+  DATABASE_PATH = "/data/openthrottle-kernel-v1.sqlite"
 
 [http_service]
   internal_port = 8080

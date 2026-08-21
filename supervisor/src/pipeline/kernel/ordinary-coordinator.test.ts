@@ -30,7 +30,7 @@ import { VolumeBlobStore } from "../../persistence/blob-store.js";
 import {
   createFreshEpochBootstrap,
   initializeFreshEpochDatabase,
-  openOrInitializeFreshEpochDatabase,
+  openFreshEpochDatabase,
 } from "../../persistence/epoch-database.js";
 import { SqliteKernelStore } from "../../persistence/kernel-store.js";
 import type {
@@ -514,13 +514,16 @@ async function setup(runtime = new RuntimeFixture()): Promise<ActiveKernelFixtur
       }),
       runtime,
       run_id: "run-1",
-      restart: () => activate(openOrInitializeFreshEpochDatabase({
+      restart: () => activate(openFreshEpochDatabase({
         database_path: databasePath,
         blob_store: blobs,
-        release_id: "ordinary-release",
-        runtime_capability_digest: CAPABILITY,
-        bootstrap,
-        now: () => NOW,
+        expected_identity: {
+          release_id: "ordinary-release",
+          runtime_capability_digest: CAPABILITY,
+          blob_store_id: blobs.store_id,
+          blob_marker_checksum: blobs.marker_checksum,
+          bootstrap_checksum: bootstrap.checksum,
+        },
       })),
     };
   };

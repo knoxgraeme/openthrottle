@@ -11,7 +11,7 @@ import type {
 } from "../persistence/kernel-analysis-store.js";
 import type {
   KernelIngressResponse,
-  KernelSettleOrAbandonReport,
+  KernelActiveWorkReport,
 } from "./kernel-control.js";
 import type {
   KernelInboxEventInput,
@@ -49,7 +49,7 @@ export interface KernelHttpControlPort {
   closeMutatingIngress(expectedVersion?: number): KernelMaintenanceFence;
   openMutatingIngress(expectedVersion?: number): KernelMaintenanceFence;
   maintenanceState(): KernelMaintenanceFence;
-  activeWorkReport(input?: { limit?: number }): Promise<KernelSettleOrAbandonReport>;
+  activeWorkReport(input?: { limit?: number }): Promise<KernelActiveWorkReport>;
 }
 
 export interface KernelRepositorySetupInput {
@@ -313,7 +313,7 @@ export class KernelHttpService {
     return this.#control.openMutatingIngress(expectedVersion);
   }
 
-  activeWork(limit?: number): Promise<KernelSettleOrAbandonReport> {
+  activeWork(limit?: number): Promise<KernelActiveWorkReport> {
     return this.#control.activeWorkReport(limit === undefined ? {} : { limit });
   }
 

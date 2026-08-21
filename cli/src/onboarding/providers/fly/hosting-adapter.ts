@@ -28,6 +28,7 @@ import {
   FlyctlCommandError,
   FlyctlNotFoundError,
   FlyctlParseError,
+  type FlyVolume,
   type FlyctlRunner,
 } from "./flyctl.js";
 
@@ -36,6 +37,7 @@ export const DEFAULT_FLY_ORG = "personal";
 export const DEFAULT_FLY_REGION = "sjc";
 export const FLY_VOLUME_NAME = "openthrottle_data";
 export const FLY_INSTALL_RECOVERY = "Install flyctl: curl -L https://fly.io/install.sh | sh (see https://fly.io/docs/flyctl/install/)";
+const EPOCH_BOOTSTRAP_CHECKSUM = "OT_EPOCH_BOOTSTRAP_CHECKSUM";
 
 const HEALTHZ_TIMEOUT_MS = 10_000;
 
@@ -96,6 +98,7 @@ const REQUIRED_SUPERVISOR_SECRETS: readonly RequiredSecret[] = sortedByKey([
   { key: "GITHUB_TOKEN", owner: "operator", refName: "github_token" },
   { key: "GITHUB_READ_TOKEN", owner: "operator", refName: "github_read_token" },
   { key: "DAYTONA_API_KEY", owner: "operator", refName: "daytona_api_key" },
+  { key: EPOCH_BOOTSTRAP_CHECKSUM, owner: "operator", refName: "epoch_bootstrap_checksum" },
   { key: "SUPERVISOR_URL", owner: "derived" },
   { key: "DAYTONA_SNAPSHOT", owner: "derived" },
 ]);
@@ -117,12 +120,31 @@ function requiredSecretsFromBundle(bundle: SupervisorDeploymentBundle): Required
 interface FlyInspection {
   appExists: boolean;
   volumeExists: boolean;
+  volumeIssue?: string;
   presentSecretCount: number;
   missingSecrets: RequiredSecret[];
   startedMachineCount: number;
   releaseImageActive: boolean;
   /** undefined when earlier tiers failed and the probe was skipped. */
   healthy?: boolean;
+}
+
+function selectDataVolume(volumes: readonly FlyVolume[], region: string): {
+  volume?: FlyVolume;
+  issue?: string;
+} {
+  const named = volumes.filter((volume) => volume.name === FLY_VOLUME_NAME);
+  if (named.length === 0) return {};
+  if (named.length !== 1) {
+    return { issue: `found ${named.length} ${FLY_VOLUME_NAME} volumes; expected exactly one` };
+  }
+  const [volume] = named;
+  if (!volume || volume.region !== region) {
+    return {
+      issue: `${FLY_VOLUME_NAME} is in region ${volume?.region ?? "unknown"}; expected ${region}`,
+    };
+  }
+  return { volume };
 }
 
 function imageDigest(image: string): string {
@@ -153,6 +175,8 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
 
   const appsCreateCommand = `flyctl apps create ${app} --org ${org}`;
   const volumesCreateCommand = `flyctl volumes create ${FLY_VOLUME_NAME} --app ${app} --region ${region} --size 1`;
+  const unsetEpochChecksumCommand =
+    `flyctl secrets unset --stage --app ${app} ${EPOCH_BOOTSTRAP_CHECKSUM}`;
   const deployCommand = (image: string) => `flyctl deploy --ha=false --app ${app} --image ${image}`;
 
   function operatorRecovery(missing: RequiredSecret[]): string {
@@ -160,7 +184,14 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
       .filter((secret) => secret.owner === "operator")
       .map((secret) => `${secret.key}=...`)
       .join(" ");
-    return `flyctl secrets set --app ${app} ${names}`;
+    const needsEpochInitialization = missing.some(
+      (secret) => secret.key === EPOCH_BOOTSTRAP_CHECKSUM,
+    );
+    const prefix = needsEpochInitialization
+      ? "Initialize the fresh epoch, then "
+      : "";
+    const stage = needsEpochInitialization ? " --stage" : "";
+    return `${prefix}flyctl secrets set${stage} --app ${app} ${names}`;
   }
 
   async function checkHealthz(): Promise<boolean> {
@@ -187,7 +218,8 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
       };
     }
     const volumes = await client.volumesList(app);
-    const volumeExists = volumes.some((volume) => volume.name === FLY_VOLUME_NAME);
+    const volumeSelection = selectDataVolume(volumes, region);
+    const volumeExists = volumeSelection.volume !== undefined;
     const secretNames = new Set((await client.secretsList(app)).map((secret) => secret.name));
     const missingSecrets = required.filter((secret) => !secretNames.has(secret.key));
     const machines = await client.machinesList(app);
@@ -197,6 +229,7 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
     const inspection: FlyInspection = {
       appExists: true,
       volumeExists,
+      ...(volumeSelection.issue ? { volumeIssue: volumeSelection.issue } : {}),
       presentSecretCount: required.length - missingSecrets.length,
       missingSecrets,
       startedMachineCount: started.length,
@@ -219,7 +252,11 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
     if (!inspection.appExists) {
       failure = { owner: "hosting_provider", recoveryAction: appsCreateCommand };
     } else {
-      parts.push(`volume ${FLY_VOLUME_NAME}: ${inspection.volumeExists ? "ok" : "missing"}`);
+      parts.push(
+        `volume ${FLY_VOLUME_NAME}: ${
+          inspection.volumeIssue ?? (inspection.volumeExists ? `ok in ${region}` : "missing")
+        }`,
+      );
       const missing = inspection.missingSecrets;
       parts.push(
         missing.length === 0
@@ -236,8 +273,18 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
       parts.push(
         inspection.healthy === undefined ? "healthz: unchecked" : inspection.healthy ? "healthz: ok" : "healthz: failing"
       );
-      if (!inspection.volumeExists) {
-        failure = { owner: "hosting_provider", recoveryAction: volumesCreateCommand };
+      if (inspection.volumeIssue) {
+        failure = {
+          owner: "operator",
+          recoveryAction:
+            `Resolve Fly volume inventory so app ${app} has exactly one ${FLY_VOLUME_NAME} volume ` +
+            `in region ${region}, then run openthrottle setup.`,
+        };
+      } else if (!inspection.volumeExists) {
+        const checksumPresent = !missing.some((secret) => secret.key === EPOCH_BOOTSTRAP_CHECKSUM);
+        failure = checksumPresent
+          ? { owner: "cli", recoveryAction: "openthrottle setup" }
+          : { owner: "hosting_provider", recoveryAction: volumesCreateCommand };
       } else if (missing.length > 0) {
         failure = missing.some((secret) => secret.owner === "operator")
           ? { owner: "operator", recoveryAction: operatorRecovery(missing) }
@@ -379,6 +426,9 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
       const inspection = await inspectState(context, required);
       const mutations: string[] = [];
       if (!inspection.appExists) mutations.push(appsCreateCommand);
+      if (inspection.volumeIssue) {
+        return { mutations, billable: false, externallyVisible: !inspection.appExists };
+      }
       if (!inspection.volumeExists) mutations.push(volumesCreateCommand);
       const settable = inspection.missingSecrets.filter((secret) => secret.owner !== "operator");
       if (settable.length > 0) {
@@ -386,12 +436,25 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
           `set ${settable.length} supervisor secrets (names: ${settable.map((secret) => secret.key).join(", ")})`
         );
       }
+      const checksumPresent = !inspection.missingSecrets.some(
+        (secret) => secret.key === EPOCH_BOOTSTRAP_CHECKSUM,
+      );
+      if (!inspection.volumeExists && checksumPresent) {
+        mutations.push(unsetEpochChecksumCommand);
+      }
       const deployPlanned = !inspection.releaseImageActive;
-      if (deployPlanned) mutations.push(deployCommand(bundle.release.supervisorImage));
+      const epochInitialized = inspection.volumeExists && checksumPresent;
+      const operatorPrerequisitesPresent = !inspection.missingSecrets.some(
+        (secret) => secret.owner === "operator",
+      );
+      const deployReady = epochInitialized && operatorPrerequisitesPresent;
+      if (deployPlanned && deployReady) {
+        mutations.push(deployCommand(bundle.release.supervisorImage));
+      }
       return {
         mutations,
-        billable: !inspection.volumeExists || deployPlanned,
-        externallyVisible: !inspection.appExists || deployPlanned,
+        billable: !inspection.volumeExists || (deployPlanned && deployReady),
+        externallyVisible: !inspection.appExists || (deployPlanned && deployReady),
       };
     },
 
@@ -406,7 +469,13 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
         await runMutation(["apps", "create", app, "--org", org], "apps create", true);
       }
       const volumes = await client.volumesList(app);
-      if (!volumes.some((volume) => volume.name === FLY_VOLUME_NAME)) {
+      const volumeSelection = selectDataVolume(volumes, region);
+      if (volumeSelection.issue) {
+        const inspection = await inspectState(context, required);
+        return { evidence: evidenceFor(context, required, inspection).evidence };
+      }
+      const volumeExisted = volumeSelection.volume !== undefined;
+      if (!volumeExisted) {
         log(`fly: creating volume ${FLY_VOLUME_NAME} in ${region}`);
         await runMutation(
           ["volumes", "create", FLY_VOLUME_NAME, "--app", app, "--region", region, "--size", "1", "--yes"],
@@ -416,12 +485,29 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
       }
 
       const secretNames = new Set((await client.secretsList(app)).map((secret) => secret.name));
+      const staleEpochChecksum = !volumeExisted && secretNames.has(EPOCH_BOOTSTRAP_CHECKSUM);
       const missing = required.filter((secret) => !secretNames.has(secret.key));
       const machines = await client.machinesList(app);
       const digest = imageDigest(bundle.release.supervisorImage);
       const deployNeeded = !machines.some(
         (machine) => machine.state === "started" && (machine.image ?? "").includes(digest)
       );
+      const epochInitialized = volumeExisted && !missing.some(
+        (secret) => secret.key === EPOCH_BOOTSTRAP_CHECKSUM,
+      );
+      const operatorPrerequisitesPresent = !missing.some(
+        (secret) => secret.owner === "operator",
+      );
+
+      if (staleEpochChecksum) {
+        log(`fly: staging removal of stale ${EPOCH_BOOTSTRAP_CHECKSUM}`);
+        await runMutation(
+          ["secrets", "unset", "--stage", "--app", app, EPOCH_BOOTSTRAP_CHECKSUM],
+          "secrets unset",
+          false,
+        );
+        secretNames.delete(EPOCH_BOOTSTRAP_CHECKSUM);
+      }
 
       // Operator-owned secrets are never generated; the post-mutation
       // inspection reports them with the exact recovery command instead.
@@ -433,15 +519,44 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
         }
         // Values ride the argv: they are short tokens (32-byte generated hex /
         // operator API keys), orders of magnitude under ARG_MAX, so `secrets
-        // import` over stdin is not needed. --stage defers the release when a
-        // deploy immediately follows (mirrors deploy.yml); without a pending
-        // deploy the set applies immediately.
+        // import` over stdin is not needed. --stage defers the release while
+        // fresh storage is not initialized or when this call will deploy next;
+        // otherwise the set applies immediately.
         log(`fly: setting ${settable.length} supervisor secrets (names: ${settable.map((secret) => secret.key).join(", ")})`);
         await runMutation(
-          ["secrets", "set", "--app", app, ...(deployNeeded ? ["--stage"] : []), ...pairs],
+          [
+            "secrets",
+            "set",
+            "--app",
+            app,
+            ...(deployNeeded || !epochInitialized ? ["--stage"] : []),
+            ...pairs,
+          ],
           "secrets set",
           false
         );
+      }
+
+      if (!epochInitialized || !operatorPrerequisitesPresent) {
+        const inspection = await inspectState(context, required);
+        const evidence = evidenceFor(context, required, inspection).evidence;
+        if (!volumeExisted) {
+          return {
+            evidence: {
+              ...evidence,
+              status: "needs_action",
+              owner: "operator",
+              summary: (
+                `fresh epoch initialization required for newly created volume ${FLY_VOLUME_NAME}; ` +
+                evidence.summary
+              ).slice(0, 500),
+              recoveryAction:
+                `Run the one-shot fresh-epoch initializer against ${FLY_VOLUME_NAME}, ` +
+                `set its emitted ${EPOCH_BOOTSTRAP_CHECKSUM}, then re-run openthrottle setup.`,
+            },
+          };
+        }
+        return { evidence };
       }
 
       if (deployNeeded) {
@@ -479,7 +594,7 @@ primary_region = "${region}"
 
 [env]
   PORT = "8080"
-  DATABASE_PATH = "/data/openthrottle.db"
+  DATABASE_PATH = "/data/openthrottle-kernel-v1.sqlite"
 
 [http_service]
   internal_port = 8080

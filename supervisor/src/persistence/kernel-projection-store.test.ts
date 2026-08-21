@@ -181,7 +181,7 @@ describe("SqliteKernelProjectionStore", () => {
     });
   });
 
-  it("names every durable live lifecycle for settle-or-abandon review", () => {
+  it("names every durable live lifecycle for operator diagnosis", () => {
     const { fixture, projection } = setup();
     seedKernelAttempt({
       db: fixture.db,

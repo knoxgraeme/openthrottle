@@ -66,10 +66,12 @@ describe("VolumeBlobStore", () => {
   it("publishes, verifies, reads, and deduplicates immutable objects", () => {
     const root = join(temporaryDirectory(), "objects");
     const store = VolumeBlobStore.initialize(root, "store-a");
+    expect(() => store.assertEmpty()).not.toThrow();
     const first = store.put(input());
     const second = store.put(input());
 
     expect(second.pointer).toEqual(first.pointer);
+    expect(() => store.assertEmpty()).toThrow(/not empty/);
     expect(store.read(first.pointer).toString("utf8")).toBe("durable evidence");
     expect(lstatSync(store.objectPath(first.pointer.digest)).isFile()).toBe(true);
     expect(readdirSync(dirname(store.objectPath(first.pointer.digest))).filter((name) => !name.startsWith(".tmp-")))

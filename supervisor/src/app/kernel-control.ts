@@ -1,7 +1,5 @@
 import {
-  canonicalJson,
   compareCodeUnits,
-  digestCanonicalJson,
   type JsonValue,
 } from "@openthrottle/contracts";
 import type {
@@ -14,6 +12,7 @@ import type {
 } from "../persistence/kernel-inbox-store.js";
 import type {
   KernelActiveWorkItem,
+  KernelActiveWorkSnapshot,
   KernelActiveWorkProjectionPort,
 } from "../persistence/kernel-projection-store.js";
 import {
@@ -59,29 +58,9 @@ export interface KernelRuntimeInventoryPort {
   listActiveRuntimeResources(limit: number): Promise<readonly KernelRuntimeInventoryResource[]>;
 }
 
-export interface KernelActiveWorkDisposition {
-  key: string;
-  action: "settle" | "abandon";
-  reason: string;
-}
-
-export interface KernelDispositionedActiveWorkItem extends KernelActiveWorkItem {
-  disposition: KernelActiveWorkDisposition | null;
-}
-
-export interface KernelSettleOrAbandonReport {
-  report_hash: string;
+export interface KernelActiveWorkReport extends KernelActiveWorkSnapshot {
   observed_at: string;
-  items: readonly KernelDispositionedActiveWorkItem[];
-  truncated: boolean;
   clear: boolean;
-  fully_dispositioned: boolean;
-  /**
-   * True only after active rows/resources are gone. Dispositions document the
-   * operator's intended settle/abandon action; they do not pretend to perform
-   * cleanup or turn this report into an online drain protocol.
-   */
-  replacement_ready: boolean;
 }
 
 const DEFAULT_RETRY_AFTER_SECONDS = 30;
@@ -118,38 +97,6 @@ function steeringEnvelope(value: JsonValue): KernelSteeringEnvelope {
     throw new Error("steering inbox payload schema is unsupported");
   }
   return envelope;
-}
-
-function normalizedDispositions(
-  dispositions: readonly KernelActiveWorkDisposition[],
-): ReadonlyMap<string, KernelActiveWorkDisposition> {
-  const result = new Map<string, KernelActiveWorkDisposition>();
-  for (const disposition of dispositions) {
-    if (result.has(disposition.key)) {
-      throw new Error(`active-work disposition ${disposition.key} is duplicated`);
-    }
-    if (
-      (disposition.action !== "settle" && disposition.action !== "abandon") ||
-      typeof disposition.reason !== "string" || disposition.reason.trim().length === 0 ||
-      disposition.reason.length > 1_500
-    ) throw new Error(`active-work disposition ${disposition.key} is invalid`);
-    result.set(disposition.key, {
-      key: disposition.key,
-      action: disposition.action,
-      reason: disposition.reason.trim(),
-    });
-  }
-  return result;
-}
-
-function reportHash(items: readonly KernelActiveWorkItem[], truncated: boolean): string {
-  return digestCanonicalJson({
-    schema: "openthrottle.active-work-snapshot/v1",
-    items: items.map(({ key, kind, id, pipeline_run_id, status, detail, observed_at }) => ({
-      key, kind, id, pipeline_run_id, status, detail, observed_at,
-    })),
-    truncated,
-  });
 }
 
 export class KernelControlService {
@@ -265,10 +212,7 @@ export class KernelControlService {
     return authorizeKernelSteeringDelivery({ envelope, current_binding: current });
   }
 
-  async activeWorkReport(input: {
-    limit?: number;
-    dispositions?: readonly KernelActiveWorkDisposition[];
-  } = {}): Promise<KernelSettleOrAbandonReport> {
+  async activeWorkReport(input: { limit?: number } = {}): Promise<KernelActiveWorkReport> {
     const requestedLimit = input.limit ?? DEFAULT_ACTIVE_WORK_LIMIT;
     if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 2_000) {
       throw new Error("active-work limit must be between 1 and 2000");
@@ -307,41 +251,12 @@ export class KernelControlService {
     const items = [...durable.items, ...externalItems]
       .sort((left, right) => compareCodeUnits(left.key, right.key));
     const truncated = durable.truncated || inventoryTruncated;
-    const dispositions = normalizedDispositions(input.dispositions ?? []);
-    const known = new Set(items.map(({ key }) => key));
-    const unknown = [...dispositions.keys()].find((key) => !known.has(key));
-    if (unknown) throw new Error(`active-work disposition ${unknown} is stale or unknown`);
-    const dispositioned = items.map((item) => ({
-      ...item,
-      disposition: dispositions.get(item.key) ?? null,
-    }));
-    const fullyDispositioned = !truncated && dispositioned.every(({ disposition }) => disposition !== null);
     const clear = items.length === 0 && !truncated;
     return {
-      report_hash: reportHash(items, truncated),
       observed_at: observedAt,
-      items: dispositioned,
+      items,
       truncated,
       clear,
-      fully_dispositioned: fullyDispositioned,
-      replacement_ready: clear,
     };
-  }
-
-  assertReportUnchanged(input: {
-    expected_report_hash: string;
-    report: KernelSettleOrAbandonReport;
-  }): void {
-    const items = input.report.items.map(({ disposition: _disposition, ...item }) => item);
-    const recomputed = reportHash(items, input.report.truncated);
-    if (
-      input.expected_report_hash !== input.report.report_hash ||
-      input.report.report_hash !== recomputed
-    ) {
-      throw new Error("active-work report changed; collect and disposition a fresh report");
-    }
-    // Canonicalization also rejects accidental non-JSON report additions at
-    // this one-shot operator boundary.
-    canonicalJson(input.report);
   }
 }

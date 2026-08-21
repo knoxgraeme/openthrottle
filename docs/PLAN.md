@@ -54,8 +54,8 @@ subject, OpenThrottle can:
   bound use verified content-addressed blobs.
 - Provider ingress is durably deduplicated. During maintenance it returns a
   retryable non-acknowledgement and persists nothing.
-- The old dogfood installation is replaced once, offline. The runtime has no
-  old-epoch read path, dual-write path, or durable replacement phase model.
+- Dogfood starts from an explicitly initialized empty epoch. Old state is
+  abandoned and is never read, migrated, or dual-written by the runtime.
 
 ## Acceptance gates
 
@@ -84,18 +84,18 @@ The release is accepted only when all of the following hold:
   normalization, immutable checkpoint/integration transport, kernel
   settlement/restart, and structured frontier progression with stubs. Live
   publication, trusted provider evidence, semantic-remediation efficacy,
-  terminal cleanup, and epoch acceptance remain credentialed canary gates.
-- The offline replacement proof rejects live writers, unresolved resources,
-  corrupt archives, nonempty fresh paths, and mixed release/storage identity;
-  ordinary and structured smoke items pass before ingress reopens.
-- The ordinary and structured smoke hooks are the first credentialed canaries.
-  Each begins from a scoped real work item, produces an operator-accepted
-  change, passes configured commands and inspect review, publishes the exact
-  subject, satisfies the sealed trusted-producer policy, records interventions,
-  and proves admission/promoted-run cleanup in the ready report.
-- `FRESH_EPOCH_READY` is default closed and opens only after canary evidence is
-  accepted. One Fly Machine owns the SQLite volume. Rollback closes and verifies
-  the gate before restoring the retained old release/storage tuple.
+  terminal cleanup, and Fly/SQLite behavior are exercised during dogfood.
+- The one-shot initializer creates the exact empty twelve-table epoch only at
+  distinct absent database/blob paths. A retry may resume only its exact empty
+  BlobStore partial or re-emit the receipt for the exact bootstrap-only closed
+  pair. It binds release/runtime/bootstrap/blob identity, and normal boot
+  remains open-only.
+- `FRESH_EPOCH_INITIALIZED` is a mechanical storage prerequisite, not an
+  acceptance gate. Once initialized, one Fly Machine owns the volume and
+  ingress opens only through the authenticated compare-and-set endpoint.
+- Real ordinary and structured items are diagnostic dogfood. Failures become
+  normal bug-fix work; no archive, restore hook, prescribed canary pair, or
+  replacement report is required.
 
 ## Verification
 
@@ -116,8 +116,8 @@ node supervisor/scripts/kernel-sandbox-e2e.mjs openthrottle:test
 node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test
 ```
 
-Live Linear, GitHub, Daytona, Fly, and model checks require operator credentials
-and remain an explicit post-CI gate.
+Live Linear, GitHub, Daytona, Fly, and model behavior requires operator
+credentials and is exercised during dogfood after local and CI proof.
 
 ## Deferred work
 

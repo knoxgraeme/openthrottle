@@ -96,7 +96,10 @@ export interface FlyApp {
 }
 
 export interface FlyVolume {
+  id: string;
   name: string;
+  region: string;
+  attachedMachineId: string | null;
 }
 
 /** flyctl never returns secret values; the list endpoint exposes names + digests only. */
@@ -120,6 +123,34 @@ function pickString(value: Record<string, unknown>, keys: readonly string[]): st
     if (typeof entry === "string" && entry.trim() !== "") return entry;
   }
   return undefined;
+}
+
+function boundedExactString(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+  label: string,
+  pattern: RegExp,
+): string {
+  for (const key of keys) {
+    if (!(key in value)) continue;
+    const entry = value[key];
+    if (typeof entry === "string" && pattern.test(entry)) return entry;
+    throw new FlyctlParseError(`flyctl volumes list reported an invalid ${label}`);
+  }
+  throw new FlyctlParseError(`flyctl volumes list omitted ${label}`);
+}
+
+function boundedAttachment(value: Record<string, unknown>): string | null {
+  for (const key of ["attached_machine_id", "attachedMachineId", "AttachedMachineId"]) {
+    if (!(key in value)) continue;
+    const entry = value[key];
+    if (entry === null || entry === "") return null;
+    if (typeof entry === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(entry)) {
+      return entry;
+    }
+    throw new FlyctlParseError("flyctl volumes list reported an invalid attached Machine ID");
+  }
+  return null;
 }
 
 function parseJson(stdout: string, label: string): unknown {
@@ -201,8 +232,17 @@ export class FlyctlClient {
     const result = await this.runJson(["volumes", "list", "--app", app, "--json"], "volumes list");
     const volumes: FlyVolume[] = [];
     for (const entry of parseJsonArray(result.stdout, "volumes list")) {
-      const name = pickString(entry, ["name", "Name"]);
-      if (name) volumes.push({ name });
+      volumes.push({
+        id: boundedExactString(entry, ["id", "ID"], "volume ID", /^vol_[a-z0-9]{1,64}$/),
+        name: boundedExactString(
+          entry,
+          ["name", "Name"],
+          "volume name",
+          /^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/,
+        ),
+        region: boundedExactString(entry, ["region", "Region"], "volume region", /^[a-z]{3}$/),
+        attachedMachineId: boundedAttachment(entry),
+      });
     }
     return volumes;
   }

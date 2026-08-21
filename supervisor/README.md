@@ -21,8 +21,8 @@ The complete release proof also runs both Bats suites, builds the supervisor and
 sandbox images, and runs the sandbox smoke, kernel sandbox E2E, and structured
 walking skeleton listed in [`AGENTS.md`](../AGENTS.md). Those local harnesses use
 stubbed or local boundaries; live publication, trusted provider wait, semantic
-remediation, provider-backed cleanup, and Fly/SQLite epoch acceptance require
-the credentialed replacement canaries.
+remediation, provider-backed cleanup, and Fly/SQLite behavior are exercised by
+real dogfood rather than claimed by those harnesses.
 
 Export the values from `.env.example`; the process does not load `.env`
 implicitly. `GET /healthz` is public. Operator and deployment endpoints require
@@ -66,47 +66,54 @@ written to the content-addressed blob root before SQLite commits their verified
 hash pointer. There are no compatibility reads, dual writes, graph tables,
 receipt tables, or online cutover state machine.
 
-For the one-time dogfood replacement, stop every old writer and run:
+For the one-time empty dogfood epoch, build and inspect the packaged initializer:
 
 ```bash
 npm run build --prefix supervisor
-npm run replace:offline --prefix supervisor -- --help
+npm run epoch:initialize --prefix supervisor -- --help
 ```
 
 Follow [the execution-kernel rollout runbook](../docs/runbooks/execution-kernel-rollout.md).
-Its manifest uses strict digest-authenticated command objects, and its ordinary
-and structured smoke hooks are the first credentialed canaries whose accepted
-evidence permits ingress and deployment to reopen.
+The initializer first publishes only to absent database/blob paths, seals an
+empty bootstrap to the exact release, and starts ingress closed. A retry accepts
+only the exact empty BlobStore partial or exact bootstrap-only closed pair.
+Normal startup only opens and verifies an existing epoch.
 
 ## Deploy to Fly
 
 `fly.toml` mounts the single-writer SQLite/blob volume at `/data`.
-`openthrottle setup` provisions and verifies a pinned release; `setup --check`
-is read-only. A manual installation needs the supervisor/operator tokens,
-provider webhook secrets, GitHub and Daytona credentials, a Daytona snapshot,
-and at least one supported model credential.
+`openthrottle setup` provisions and verifies a pinned release but refuses the
+first deploy until the one-shot initializer receipt has supplied
+`OT_EPOCH_BOOTSTRAP_CHECKSUM`; `setup --check` is read-only. A manual
+installation needs the supervisor/operator tokens, provider webhook secrets,
+GitHub and Daytona credentials, a Daytona snapshot, and at least one supported
+model credential.
 
 ```bash
 fly volumes create openthrottle_data --region sjc --size 1
 fly secrets set \
   SUPERVISOR_URL=https://<app>.fly.dev \
   OT_STATUS_TOKEN=<random> OT_DEPLOY_TOKEN=<random> \
+  OT_EPOCH_BOOTSTRAP_CHECKSUM=<initializer-receipt-checksum> \
   LINEAR_WEBHOOK_SECRET=... GITHUB_WEBHOOK_SECRET=... \
   GITHUB_TOKEN=... DAYTONA_API_KEY=... DAYTONA_SNAPSHOT=openthrottle \
   CODEX_AUTH_JSON='...'
-fly deploy --ha=false --config supervisor/fly.toml --dockerfile supervisor/Dockerfile
 ```
+
+Before the first deploy, run the exact candidate image's initializer against
+the stopped volume, stage its emitted `OT_EPOCH_BOOTSTRAP_CHECKSUM`, and set the
+repository variable `FRESH_EPOCH_INITIALIZED=true`. The [runbook](../docs/runbooks/execution-kernel-rollout.md)
+contains the complete one-time sequence. After deployment, register the
+repository while maintenance is closed and explicitly open ingress.
 
 `.github/workflows/deploy.yml` builds a commit-named Daytona snapshot when the
 sandbox, contracts, or definition tree changes, stages that exact snapshot,
-and deploys the supervisor directly. Its deploy job is disabled unless the
-repository variable `FRESH_EPOCH_READY` is exactly `true`; do not bypass that
-gate with a manual deploy during replacement or rollback. After deploying with
-`--ha=false`, the workflow scales to one Machine and verifies the sole data
-volume is attached to it. Keep the variable absent or false before canary
-acceptance and during rollback. Rollback closes and verifies the gate before it
-restores the retained old release/database/blob/snapshot tuple. This is a
-release workflow, not a data-migration workflow.
+and deploys the supervisor directly. Its deploy job is disabled until the
+mechanical `FRESH_EPOCH_INITIALIZED` storage prerequisite is true. This flag is
+not an acceptance gate and remains true after the one-time initialization.
+After deploying with `--ha=false`, the workflow scales to one Machine and
+verifies the sole data volume is attached to it. Later releases deploy directly
+against the same exact open-only epoch.
 
 ## Repository onboarding
 

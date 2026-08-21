@@ -23,18 +23,28 @@ function namedStep(job, name) {
 }
 
 describe("clean-epoch deploy workflow", () => {
-  it("keeps the normal deploy job closed until the fresh epoch is explicitly ready", () => {
+  it("deploys only after the one-shot fresh epoch initialization", () => {
     const gate = workflow().jobs.deploy.if;
-    expect(gate).toContain("vars.FRESH_EPOCH_READY == 'true'");
-    expect(gate.indexOf("vars.FRESH_EPOCH_READY == 'true'")).toBeLessThan(gate.indexOf("always()"));
-    expect(workflow().jobs.deploy.steps.every((step) => !String(step.if ?? "").includes("FRESH_EPOCH_READY"))).toBe(true);
+    expect(gate).toContain("vars.FRESH_EPOCH_INITIALIZED == 'true'");
+    expect(gate).not.toContain("FRESH_EPOCH_READY");
+    expect(gate.indexOf("vars.FRESH_EPOCH_INITIALIZED == 'true'")).toBeLessThan(gate.indexOf("always()"));
+  });
+
+  it("fails closed instead of creating post-gate app or volume state", () => {
+    const assertion = namedStep("deploy", "Assert the initialized Fly app and data volume exist").run;
+    expect(assertion).toContain("flyctl status");
+    expect(assertion).toContain("flyctl volumes list");
+    expect(assertion).toContain("length == 1");
+    expect(assertion).toContain("exit 1");
+    expect(assertion).not.toContain("apps create");
+    expect(assertion).not.toContain("volumes create");
   });
 
   it("is a serialized direct release workflow, not an online schema transition", () => {
     const parsed = workflow();
     expect(parsed.concurrency).toEqual({ group: "deploy-main", "cancel-in-progress": false });
     expect(namedStep("deploy", "Deploy the supervisor directly").run).toContain("flyctl deploy --ha=false");
-    expect(source()).toContain("supervisor/scripts/offline-replace.mjs");
+    expect(source()).not.toContain("offline-replace");
 
     for (const retired of [
       "prepare_v12_cutover",
@@ -45,17 +55,17 @@ describe("clean-epoch deploy workflow", () => {
     ]) expect(source()).not.toContain(retired);
   });
 
-  it("packages the authenticated offline replacement entrypoint in the supervisor image", () => {
+  it("packages the one-shot fresh epoch initializer in the supervisor image", () => {
     expect(readFileSync(supervisorDockerfilePath, "utf8")).toContain(
-      "COPY supervisor/scripts/offline-replace.mjs ./scripts/offline-replace.mjs",
+      "COPY supervisor/scripts/initialize-epoch.mjs ./scripts/initialize-epoch.mjs",
     );
   });
 
   it("does not claim an online process can prove that every old writer is stopped", () => {
     const deploySteps = workflow().jobs.deploy.steps;
-    expect(deploySteps.some((step) => /offline-replace/.test(step.run ?? ""))).toBe(false);
+    expect(deploySteps.some((step) => /initialize-epoch/.test(step.run ?? ""))).toBe(false);
     expect(deploySteps.some((step) => /ssh console/.test(step.run ?? ""))).toBe(false);
-    expect(source()).toContain("replaced once, offline");
+    expect(source()).toContain("open-only");
   });
 
   it("rebuilds both runtime artifacts when sealed filesystem definitions change", () => {

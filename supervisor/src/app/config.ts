@@ -60,7 +60,7 @@ export function loadConfig(): Config {
   const releaseRoot = resolve(optional("OT_RELEASE_ROOT", process.cwd()));
   const cfg: Config = {
     port: optionalInt("PORT", 8080),
-    databasePath: optional("DATABASE_PATH", "/data/openthrottle.db"),
+    databasePath: optional("DATABASE_PATH", "/data/openthrottle-kernel-v1.sqlite"),
     supervisorUrl: required("SUPERVISOR_URL").replace(/\/+$/, ""),
     statusToken: required("OT_STATUS_TOKEN"),
     deployToken: required("OT_DEPLOY_TOKEN"),
@@ -75,7 +75,7 @@ export function loadConfig(): Config {
     kimiCodeApiKey: process.env.KIMI_CODE_API_KEY,
     taskTimeout: optionalInt("TASK_TIMEOUT", 7_200),
     webhookMaxAgeSeconds: optionalInt("WEBHOOK_MAX_AGE_SECONDS", 60),
-    blobStorePath: resolve(optional("OT_BLOB_STORE_PATH", "/data/openthrottle-blobs")),
+    blobStorePath: resolve(optional("OT_BLOB_STORE_PATH", "/data/openthrottle-kernel-v1-blobs")),
     blobStoreId: optional("OT_BLOB_STORE_ID", "openthrottle-execution-kernel-v1"),
     epochReleaseId: optional("OT_EPOCH_RELEASE_ID", "openthrottle-execution-kernel/v1"),
     epochBootstrapChecksum: required("OT_EPOCH_BOOTSTRAP_CHECKSUM"),

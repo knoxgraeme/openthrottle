@@ -549,7 +549,7 @@ Webhook endpoints verify provider HMAC before ingestion.
 | `GET /maintenance` | deploy bearer | maintenance fence/version |
 | `POST /maintenance/close` | deploy bearer | compare-and-set close |
 | `POST /maintenance/open` | deploy bearer | compare-and-set open |
-| `GET /maintenance/active-work` | deploy bearer | named settle-or-abandon preflight |
+| `GET /maintenance/active-work` | deploy bearer | bounded diagnostic snapshot of live work/resources |
 | `POST /webhooks/linear` | Linear HMAC | bounded deduplicated event |
 | `POST /webhooks/github` | GitHub HMAC | bounded deduplicated event |
 
@@ -584,79 +584,65 @@ definition rows directly.
 - Only deterministic registered primitives may evaluate candidates, integrate
   checkpoints, publish, wait on providers, or mutate runtime resources.
 
-## 12. Offline epoch replacement
+## 12. Fresh epoch initialization and first dogfood
 
-There is no compatibility runtime and no online epoch transition protocol.
-Because this installation is dogfood-only, replacement is one explicit
-maintenance operation using:
+There is no compatibility runtime, online migration, archive/restore workflow,
+or durable epoch-transition protocol. Because this installation is
+dogfood-only, prior runtime state is explicitly abandoned and the execution
+kernel starts from distinct empty storage.
+
+Normal supervisor boot remains open-only as defined in §9.1. Storage creation
+is a separate, one-shot command packaged in the exact candidate image:
 
 ```bash
 npm run build --prefix contracts
 npm run build --prefix supervisor
-node supervisor/scripts/offline-replace.mjs /absolute/path/to/manifest.json
+node supervisor/scripts/initialize-epoch.mjs
 ```
 
-The manifest is bounded. Each of its seven maintenance hooks is a strict command
-object containing an absolute normalized `executable`, its expected lowercase
-SHA-256 digest, bounded `args`, and an explicit `inherit_env` allowlist. Before
-any replacement action and again immediately before each shell-free spawn, the
-loader verifies that the executable is the same nonsymlink regular executable
-and that its bytes still match the digest. The child receives only allowlisted
-parent values plus executor-owned `OT_OFFLINE_REPLACEMENT_OPERATION` and, for
-rollback, `OT_OFFLINE_REPLACEMENT_REASON`.
+The initializer reads only the candidate's authenticated release artifacts and
+its bounded storage/identity environment. It uses a code-sealed empty
+`openthrottle.fresh-epoch-bootstrap/v1`: no old settings, registrations, work,
+records, effects, or blobs are imported. Before mutation it requires:
 
-Every hook has an executor-owned bounded deadline outside the authenticated
-manifest. Hooks run in detached process groups; on expiry the executor sends
-`SIGTERM`, follows with bounded `SIGKILL` when required, and waits for process
-closure before entering rollback or reporting failure. The manifest declares:
+- every old supervisor and worker to be stopped;
+- absolute, normalized, non-root, non-nested database and BlobStore paths with
+  real parents on the same volume;
+- both target paths to be absent for first publication, or the storage to be
+  only an exact empty BlobStore partial or exact bootstrap-only closed pair for
+  receipt recovery;
+- bounded valid BlobStore and epoch-release identities; and
+- an exact trusted compiler environment and runtime-capability digest from the
+  packaged release.
 
-- proof that ingress is closed, supervisors/workers are stopped, and no storage
-  lock exists;
-- every active Attempt, correction, Effect, lease, and runtime resource, each
-  terminal or explicitly abandoned with cleanup proof;
-- exact old release, runtime-capability digest, database, blob root, and unused
-  archive root;
-- exact fresh release, runtime-capability digest, distinct absent database/blob
-  paths, BlobStore identity, and checksummed bootstrap containing only settings
-  and repository registrations;
-- one unused report path;
-- commands to start/stop the candidate, run named ordinary/structured smoke
-  work, reopen ingress, and restore the old tuple.
+BlobStore and database creation use their existing staged, exclusive,
+fsynced, and verified publication primitives. The database contains exactly the
+twelve declared tables, immutable release/runtime/blob/bootstrap identity,
+empty execution tables, and `epoch.maintenance_ingress_closed=true@v0`. The
+command prints one bounded JSON receipt containing those identities and the
+bootstrap checksum required by normal startup. It never overwrites, deletes,
+or migrates storage. A retry refuses every existing state except the exact
+empty partial or completed bootstrap pair above.
 
-The command refuses relative, root, nested, symlinked, existing fresh, or
-overlapping paths. It makes a SQLite backup, runs integrity and foreign-key
-checks, records schema and table counts, copies and hashes every blob, and
-atomically publishes the archive manifest. It initializes and verifies the
-fresh twelve-table database and BlobStore before starting the candidate.
+`FRESH_EPOCH_INITIALIZED` is the sole deployment prerequisite for this
+one-time ordering boundary. It may be set to the exact string `true` only after
+the initializer receipt exists and the emitted bootstrap checksum has been
+staged as `OT_EPOCH_BOOTSTRAP_CHECKSUM`. It is not a canary, readiness, or
+approval signal. Later releases leave it true.
 
-The observed precondition binds the old release/runtime-capability/database/blob
-tuple. Restore evidence binds that same tuple and the archive-manifest digest;
-a mismatch is `rollback_failed`, never a claimed restore.
+Deployment is serialized, uses `--ha=false`, converges to one Fly Machine, and
+verifies that the sole Machine owns the SQLite volume. Startup independently
+reopens and verifies the exact schema, integrity, release, runtime, bootstrap,
+and blob identities before listening or starting work. Missing or mismatched
+storage fails the deployment rather than creating a new epoch.
 
-The ordinary and structured smoke hooks are the first credentialed canaries and
-must return distinct IDs, `status:"passed"`, and bounded evidence. Each begins
-from a scoped real work item, produces an operator-accepted change, passes
-configured commands and inspect review, publishes the exact subject, satisfies
-the sealed trusted-producer policy, records every manual intervention, and
-proves cleanup of admission and promoted-run resources. The structured canary
-uses at least two dependency-independent units and multiple selected personas,
-all executed serially. Across the pair, one result correction and one
-fresh-session semantic remediation are exercised. Those facts enter the smoke
-evidence copied into the checksum-bound `ready_to_reopen` report before ingress
-opens.
-
-On any failure, the command stops the candidate and invokes restoration of the
-matching old release/database/blob tuple. It writes a checksum-bound rollback
-report and exits nonzero. New-epoch rows are never imported into the old
-database. The archived old tuple is retained until the operator accepts the new
-epoch.
-
-The normal deployment job is default closed unless `FRESH_EPOCH_READY` is
-exactly `true`. The maintenance Machine exclusively owns the stopped volume;
-after acceptance, normal deployment uses `--ha=false`, converges to one Fly
-Machine, and verifies that Machine owns the SQLite volume. Rollback first closes
-and verifies the deploy gate, then restores the retained old tuple. The workflow
-does not reproduce maintenance phases or storage authority in CI YAML. See
+Repository registration may occur while maintenance is closed. Mutating
+provider ingress opens only through the deploy-token-protected compare-and-set
+endpoint after the operator observes the closed fence and the deployed release
+identity. The first real scoped item is diagnostic dogfood, not a prescribed
+acceptance canary. Failures are fixed forward through ordinary tickets. There
+is no replacement report, smoke-hook pair, rollback hook, old-tuple restore,
+dual-write path, or compatibility read. See
 [`runbooks/execution-kernel-rollout.md`](runbooks/execution-kernel-rollout.md).
 
 ## 13. Verification contract
@@ -672,19 +658,16 @@ Every release must pass:
 - ordinary and structured coordinator tests on the shared kernel;
 - Effect reconciliation, acknowledgement-loss, unknown-outcome, and runtime
   cleanup tests;
-- fresh epoch, blob fault-injection, maintenance ingress, HTTP, CLI projection,
-  and offline replacement/rollback tests;
+- fresh epoch initialization/refusal, open-only boot, blob fault-injection,
+  maintenance ingress, HTTP, and CLI projection tests;
 - TypeScript build/typecheck and all four project test suites;
 - both Bats suites (`runtime.bats` and `inbox-drain.bats`);
 - both Docker image builds (supervisor and sandbox);
 - sandbox action-profile smoke, kernel sandbox E2E, and structured walking
   skeleton.
 
-Credentialed live proof additionally runs one named disposable ordinary item
-and one structured item, records their IDs and replacement report digest, and
-verifies no runtime resource remains before the epoch is accepted.
-
 Local harnesses use stubbed or local boundaries. They do not prove live
 exact-subject publication, trusted-producer GitHub provider wait, real
 semantic-remediation efficacy, provider-backed terminal cleanup, or acceptance
-of a Fly/SQLite epoch; those claims require the credentialed canaries.
+of a Fly/SQLite epoch. Real dogfood items exercise those credentialed
+boundaries, and their failures become normal repair work.

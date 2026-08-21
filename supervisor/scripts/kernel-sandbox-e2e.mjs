@@ -21,6 +21,7 @@ import {
   VerifiedKernelDefinitionBundleResolver,
   VerifiedKernelManifestResolver,
 } from "../dist/app/kernel-composition.js";
+import { openKernelEpoch } from "../dist/app/kernel-bootstrap.js";
 import { loadKernelReleaseDefinitions } from "../dist/app/kernel-release.js";
 import { KernelRuntimeSessionService } from "../dist/app/kernel-runtime-session.js";
 import { KernelStructuredSettlementPlanner } from "../dist/app/kernel-structured-planner.js";
@@ -28,7 +29,6 @@ import { VolumeBlobStore } from "../dist/persistence/blob-store.js";
 import {
   createFreshEpochBootstrap,
   initializeFreshEpochDatabase,
-  openOrInitializeFreshEpochDatabase,
 } from "../dist/persistence/epoch-database.js";
 import { SqliteKernelStore } from "../dist/persistence/kernel-store.js";
 import {
@@ -490,13 +490,14 @@ function createKernelEnvironment(directory, source, pipelineId) {
     });
     return { db, store, coordinator };
   };
-  const reopen = () => openOrInitializeFreshEpochDatabase({
+  const reopen = () => openKernelEpoch({
     database_path: databasePath,
-    blob_store: blobs,
+    blob_store_path: blobs.root,
+    blob_store_id: blobs.store_id,
     release_id: releaseId,
     runtime_capability_digest: release.execution_policy.runtime_capability_digest,
-    bootstrap,
-  });
+    bootstrap_checksum: bootstrap.checksum,
+  }).db;
   return { compilation, blobs, registrationId, initialDb, activate, reopen };
 }
 

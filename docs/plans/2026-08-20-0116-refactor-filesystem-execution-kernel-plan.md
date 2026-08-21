@@ -9,6 +9,12 @@ execution: code
 deepened: 2026-08-20
 ---
 
+> **Operational supersession (2026-08-21):** The archive/restore hooks,
+> prescribed canaries, replacement report, and readiness gate in this design
+> history were removed before first dogfood. The current contract is the
+> absent-path initializer, open-only boot, one writer, explicit ingress open,
+> and fix-forward dogfood in [`docs/SPEC.md`](../SPEC.md) §12.
+
 # Filesystem Definitions and Execution Kernel - Plan
 
 ## Goal Capsule
