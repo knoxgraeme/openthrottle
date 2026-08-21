@@ -22,10 +22,17 @@ function namedStep(job, name) {
 }
 
 describe("clean-epoch deploy workflow", () => {
+  it("keeps the normal deploy job closed until the fresh epoch is explicitly ready", () => {
+    const gate = workflow().jobs.deploy.if;
+    expect(gate).toContain("vars.FRESH_EPOCH_READY == 'true'");
+    expect(gate.indexOf("vars.FRESH_EPOCH_READY == 'true'")).toBeLessThan(gate.indexOf("always()"));
+    expect(workflow().jobs.deploy.steps.every((step) => !String(step.if ?? "").includes("FRESH_EPOCH_READY"))).toBe(true);
+  });
+
   it("is a serialized direct release workflow, not an online schema transition", () => {
     const parsed = workflow();
     expect(parsed.concurrency).toEqual({ group: "deploy-main", "cancel-in-progress": false });
-    expect(namedStep("deploy", "Deploy the supervisor directly").run).toContain("flyctl deploy");
+    expect(namedStep("deploy", "Deploy the supervisor directly").run).toContain("flyctl deploy --ha=false");
     expect(source()).toContain("supervisor/scripts/offline-replace.mjs");
 
     for (const retired of [
@@ -91,5 +98,16 @@ describe("clean-epoch deploy workflow", () => {
     expect(health).toContain("all(.[];");
     expect(health).toContain('== "passing"');
     expect(health).toContain("exit 1");
+  });
+
+  it("converges and verifies one Machine owns the SQLite volume", () => {
+    expect(namedStep("deploy", "Converge to one SQLite writer Machine").run)
+      .toBe('flyctl scale count 1 --app "$FLY_APP" --yes');
+    const topology = namedStep("deploy", "Verify the single-writer Machine topology").run;
+    expect(topology).toContain("flyctl machines list");
+    expect(topology).toContain("length == 1");
+    expect(topology).toContain("attached_machine_id");
+    expect(topology).toContain("openthrottle_data");
+    expect(topology).toContain("$machine_id");
   });
 });

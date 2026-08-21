@@ -153,7 +153,7 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
 
   const appsCreateCommand = `flyctl apps create ${app} --org ${org}`;
   const volumesCreateCommand = `flyctl volumes create ${FLY_VOLUME_NAME} --app ${app} --region ${region} --size 1`;
-  const deployCommand = (image: string) => `flyctl deploy --app ${app} --image ${image}`;
+  const deployCommand = (image: string) => `flyctl deploy --ha=false --app ${app} --image ${image}`;
 
   function operatorRecovery(missing: RequiredSecret[]): string {
     const names = missing
@@ -454,7 +454,7 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
           await writeFile(configPath, renderFlyConfig(app, region), { mode: 0o600 });
           log(`fly: deploying ${bundle.release.supervisorImage}`);
           await runMutation(
-            ["deploy", "--app", app, "--config", configPath, "--image", bundle.release.supervisorImage],
+            ["deploy", "--ha=false", "--app", app, "--config", configPath, "--image", bundle.release.supervisorImage],
             "deploy",
             false
           );

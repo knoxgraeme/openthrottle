@@ -46,8 +46,10 @@ signed provider event / operator command
                                                        DeliveryRecord
 ```
 
-At most one reducer transition owns a run cursor version. Concurrent work is a
-bounded frontier of independent Attempts; it is not concurrent cursor mutation.
+At most one reducer transition owns a run cursor version. The protocol retains
+bounded frontiers of independent Attempts, but this release admits at most one
+live Attempt and executes every frontier serially. Future overlap must not
+become concurrent cursor mutation.
 
 ## 3. Filesystem definitions
 
@@ -343,8 +345,11 @@ checkpoint before this bind. Command actions are sessionless.
 
 A work retry clears the session. Result correction retains the session because
 it repairs only the representation of already completed work. Any session/run,
-Attempt, request, bundle, subject, lease, retry, or correction mismatch fails
-closed.
+Attempt, request, bundle, subject, lease ID/generation, retry, or correction
+mismatch fails closed. Session continuity is exclusive to representation
+correction: every semantic-remediation successor has edit authority, exact
+prior evidence/Checkpoint context, and `native_session_id: null` until its own
+execution binds a fresh session.
 
 ### 6.4 Semantic candidates and normalization
 
@@ -410,8 +415,10 @@ publication.
 
 Structured execution parses the exact validated execution plan from the sealed
 task prompt. It compiles a bounded dependency frontier with stable Attempt IDs.
-Ready units may execute concurrently up to the pipeline limit; deterministic
-dependency evidence is merged into each action context.
+Dependencies determine eligibility, but this release executes eligible unit
+Attempts serially. The complete frontier remains durable and visible; width one
+changes overlap, not plan cardinality. Deterministic dependency evidence is
+merged into each action context.
 
 Each unit cycles through edit implementation/simplification, commands,
 inspect-only lead acceptance, optional edit repair, and an integration Effect.
@@ -419,11 +426,13 @@ Only accepted checkpoints integrate. Integration is serial against the current
 exact subject; a unit whose base is stale must be reconciled explicitly.
 
 After all units integrate, whole-change commands run. An inspect selector
-chooses a bounded roster from the sealed reviewer-skill allowlist. Each persona
-is an independent inspect fanout Attempt. An inspect validation action confirms
-blocking findings. Confirmed blockers schedule a separate edit final-repair
-Attempt and repeat the bounded assurance cycle; advisory findings do not gain
-transition authority.
+chooses up to `core/persona-selection.payload.personas.max_items` entries from
+the sealed reviewer-skill allowlist (currently five). Each selected persona is
+an independent scoped inspect Attempt; a width-one dependency chain executes
+the complete roster serially against the same subject. An inspect validation
+action confirms blocking findings. Confirmed blockers schedule a separate edit
+final-repair Attempt and repeat the bounded assurance cycle; advisory findings
+do not gain transition authority.
 
 Structured planning and recovery query Attempts by exact run, bundle, parent,
 scope group, stage, member, and settled status. They do not infer state by
@@ -449,8 +458,10 @@ An unknown external outcome is never blindly replayed. Conflicting external
 identity, target, subject, or payload fails closed.
 
 Built-in plans cover Daytona provision/stop/cleanup, accepted structured-unit
-integration, exact-subject GitHub publication, Linear/GitHub status delivery,
-and provider waiting. Multi-phase operations checkpoint each confirmed phase.
+integration, exact-subject GitHub publication, and trusted GitHub provider
+waiting. Linear/GitHub status-delivery kinds remain typed registry contracts but
+are not wired into the production composition in this acceptance boundary.
+Multi-phase operations checkpoint each confirmed phase.
 
 Provisioning expands privately into provision, stop, and cleanup lifecycle
 ownership. Every terminal path—success, failure, human intervention, stop,
@@ -581,16 +592,24 @@ npm run build --prefix supervisor
 node supervisor/scripts/offline-replace.mjs /absolute/path/to/manifest.json
 ```
 
-The manifest is bounded and uses argv arrays, never shell strings. It declares:
+The manifest is bounded. Each of its seven maintenance hooks is a strict command
+object containing an absolute normalized `executable`, its expected lowercase
+SHA-256 digest, bounded `args`, and an explicit `inherit_env` allowlist. Before
+any replacement action and again immediately before each shell-free spawn, the
+loader verifies that the executable is the same nonsymlink regular executable
+and that its bytes still match the digest. The child receives only allowlisted
+parent values plus executor-owned `OT_OFFLINE_REPLACEMENT_OPERATION` and, for
+rollback, `OT_OFFLINE_REPLACEMENT_REASON`. It declares:
 
 - proof that ingress is closed, supervisors/workers are stopped, and no storage
   lock exists;
 - every active Attempt, correction, Effect, lease, and runtime resource, each
   terminal or explicitly abandoned with cleanup proof;
-- exact old release, database, blob root, and unused archive root;
-- exact fresh release, distinct absent database/blob paths, BlobStore identity,
-  and checksummed bootstrap containing only settings and repository
-  registrations;
+- exact old release, runtime-capability digest, database, blob root, and unused
+  archive root;
+- exact fresh release, runtime-capability digest, distinct absent database/blob
+  paths, BlobStore identity, and checksummed bootstrap containing only settings
+  and repository registrations;
 - one unused report path;
 - commands to start/stop the candidate, run named ordinary/structured smoke
   work, reopen ingress, and restore the old tuple.
@@ -601,9 +620,21 @@ checks, records schema and table counts, copies and hashes every blob, and
 atomically publishes the archive manifest. It initializes and verifies the
 fresh twelve-table database and BlobStore before starting the candidate.
 
-Both smoke commands must return distinct IDs, `status:"passed"`, and bounded
-evidence. They exercise ordinary and structured pipelines before ingress
-reopens. Success writes one checksum-bound completion report.
+The observed precondition binds the old release/runtime-capability/database/blob
+tuple. Restore evidence binds that same tuple and the archive-manifest digest;
+a mismatch is `rollback_failed`, never a claimed restore.
+
+The ordinary and structured smoke hooks are the first credentialed canaries and
+must return distinct IDs, `status:"passed"`, and bounded evidence. Each begins
+from a scoped real work item, produces an operator-accepted change, passes
+configured commands and inspect review, publishes the exact subject, satisfies
+the sealed trusted-producer policy, records every manual intervention, and
+proves cleanup of admission and promoted-run resources. The structured canary
+uses at least two dependency-independent units and multiple selected personas,
+all executed serially. Across the pair, one result correction and one
+fresh-session semantic remediation are exercised. Those facts enter the smoke
+evidence copied into the checksum-bound `ready_to_reopen` report before ingress
+opens.
 
 On any failure, the command stops the candidate and invokes restoration of the
 matching old release/database/blob tuple. It writes a checksum-bound rollback
@@ -611,9 +642,12 @@ report and exits nonzero. New-epoch rows are never imported into the old
 database. The archived old tuple is retained until the operator accepts the new
 epoch.
 
-The normal deployment workflow performs direct releases only after this
-one-time replacement. It does not reproduce maintenance phases or storage
-authority in CI YAML. See
+The normal deployment job is default closed unless `FRESH_EPOCH_READY` is
+exactly `true`. The maintenance Machine exclusively owns the stopped volume;
+after acceptance, normal deployment uses `--ha=false`, converges to one Fly
+Machine, and verifies that Machine owns the SQLite volume. Rollback first closes
+and verifies the deploy gate, then restores the retained old tuple. The workflow
+does not reproduce maintenance phases or storage authority in CI YAML. See
 [`runbooks/execution-kernel-rollout.md`](runbooks/execution-kernel-rollout.md).
 
 ## 13. Verification contract
@@ -631,9 +665,17 @@ Every release must pass:
   cleanup tests;
 - fresh epoch, blob fault-injection, maintenance ingress, HTTP, CLI projection,
   and offline replacement/rollback tests;
-- TypeScript build/typecheck, all project test suites, Bats runtime tests,
-  Docker ordinary smoke, and structured walking skeleton.
+- TypeScript build/typecheck and all four project test suites;
+- both Bats suites (`runtime.bats` and `inbox-drain.bats`);
+- both Docker image builds (supervisor and sandbox);
+- sandbox action-profile smoke, kernel sandbox E2E, and structured walking
+  skeleton.
 
 Credentialed live proof additionally runs one named disposable ordinary item
 and one structured item, records their IDs and replacement report digest, and
 verifies no runtime resource remains before the epoch is accepted.
+
+Local harnesses use stubbed or local boundaries. They do not prove live
+exact-subject publication, trusted-producer GitHub provider wait, real
+semantic-remediation efficacy, provider-backed terminal cleanup, or acceptance
+of a Fly/SQLite epoch; those claims require the credentialed canaries.

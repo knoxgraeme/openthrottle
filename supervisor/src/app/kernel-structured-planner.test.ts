@@ -881,7 +881,9 @@ describe("KernelStructuredSettlementPlanner", () => {
       view: view({ attempts: [completed.attempt], current: completed.attempt, current_subject: INTEGRATED }),
     }));
 
-    expect(settlement.next_attempts.map(({ scope }) => scope)).toMatchObject(personas.map((memberId) => ({
+    const canonicalPersonas = [...personas].sort((left, right) =>
+      left < right ? -1 : left > right ? 1 : 0);
+    expect(settlement.next_attempts.map(({ scope }) => scope)).toMatchObject(canonicalPersonas.map((memberId) => ({
       kind: "fanout_member",
       stage_id: "persona_review",
       member_id: memberId,

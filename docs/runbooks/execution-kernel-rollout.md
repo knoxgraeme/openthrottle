@@ -20,7 +20,8 @@ Prepare and pin:
   settings and repository registrations;
 - operator hook programs for observed-precondition verification, candidate
   start, ordinary smoke, structured smoke, ingress reopen, candidate stop, and
-  old-tuple restore.
+  old-tuple restore, including each exact executable SHA-256 and required parent
+  environment allowlist.
 
 Keep the old image, snapshot, database, and blobs until the candidate is
 accepted. Do not reuse the old paths for the fresh epoch.
@@ -33,12 +34,26 @@ npm run typecheck --prefix contracts && npm run build --prefix contracts
 npm run typecheck --prefix supervisor && npm run build --prefix supervisor
 npm test --prefix supervisor -- \
   src/persistence/offline-replacement.test.ts \
-  src/persistence/epoch-database.test.ts \
-  src/persistence/blob-store.test.ts
+  src/persistence/fresh-epoch.test.ts \
+  src/persistence/blob-store.test.ts \
+  scripts/offline-replace.test.mjs \
+  scripts/deploy-workflow.test.mjs
+node supervisor/scripts/offline-replace.mjs --help
 ```
 
-Run the full repository gate as described in `AGENTS.md` before touching the
-live volume.
+Run the full repository gate in `AGENTS.md` before touching the live volume:
+both Bats suites, both image builds, the sandbox smoke, kernel sandbox E2E, and
+structured walking skeleton. These local/stubbed proofs do not prove live
+publication, trusted provider wait, semantic-remediation efficacy,
+provider-backed cleanup, or epoch acceptance. The canaries below own those
+claims.
+
+## 0. Close normal deployment
+
+Set the GitHub repository variable `FRESH_EPOCH_READY` to `false` (or remove it)
+and verify the `deploy` job is skipped. The workflow accepts only the exact
+string `true`. Keep this gate closed throughout replacement and evidence review;
+snapshot builds may run, but no normal supervisor deploy may start.
 
 ## 1. Close ingress
 
@@ -91,8 +106,10 @@ make its own no-writer assertion false.
 ## 4. Create the one-shot manifest
 
 `supervisor/scripts/offline-replace.mjs` accepts one absolute path to a bounded
-JSON file. The root has exactly `replacement` and `commands`. Commands are argv
-arrays, not shell strings, and each helper writes one JSON object to stdout.
+JSON file. The root has exactly `replacement` and `commands`. Each of the seven
+commands is an exact object with an absolute executable, lowercase SHA-256,
+bounded arguments, and an explicit parent-environment allowlist. It is never a
+shell string. Each helper writes one JSON object to stdout.
 
 ```json
 {
@@ -127,12 +144,14 @@ arrays, not shell strings, and each helper writes one JSON object to stdout.
     ],
     "old": {
       "release_id": "old-release-id",
+      "runtime_capability_digest": "<old-lowercase-sha256>",
       "database_path": "/data/openthrottle.db",
       "blob_root": "/data/openthrottle-blobs",
       "archive_root": "/data/archive/old-release-id"
     },
     "fresh": {
       "release_id": "openthrottle-execution-kernel/v1",
+      "runtime_capability_digest": "<fresh-lowercase-sha256>",
       "database_path": "/data/epochs/kernel-v1.sqlite",
       "blob_root": "/data/epochs/kernel-v1-blobs",
       "blob_store_id": "openthrottle-execution-kernel-v1",
@@ -146,13 +165,48 @@ arrays, not shell strings, and each helper writes one JSON object to stdout.
     "report_path": "/data/reports/kernel-v1-replacement.json"
   },
   "commands": {
-    "verify_preconditions": ["/data/maintenance/verify-preconditions"],
-    "start_candidate": ["/data/maintenance/start-candidate"],
-    "smoke_ordinary": ["/data/maintenance/smoke-ordinary"],
-    "smoke_structured": ["/data/maintenance/smoke-structured"],
-    "reopen_ingress": ["/data/maintenance/reopen-ingress"],
-    "stop_candidate": ["/data/maintenance/stop-candidate"],
-    "restore_old": ["/data/maintenance/restore-old"]
+    "verify_preconditions": {
+      "executable": "/data/maintenance/verify-preconditions",
+      "sha256": "<lowercase-sha256>",
+      "args": [],
+      "inherit_env": ["FLY_APP"]
+    },
+    "start_candidate": {
+      "executable": "/data/maintenance/start-candidate",
+      "sha256": "<lowercase-sha256>",
+      "args": [],
+      "inherit_env": ["FLY_APP"]
+    },
+    "smoke_ordinary": {
+      "executable": "/data/maintenance/smoke-ordinary",
+      "sha256": "<lowercase-sha256>",
+      "args": [],
+      "inherit_env": ["FLY_APP"]
+    },
+    "smoke_structured": {
+      "executable": "/data/maintenance/smoke-structured",
+      "sha256": "<lowercase-sha256>",
+      "args": [],
+      "inherit_env": ["FLY_APP"]
+    },
+    "reopen_ingress": {
+      "executable": "/data/maintenance/reopen-ingress",
+      "sha256": "<lowercase-sha256>",
+      "args": [],
+      "inherit_env": ["FLY_APP"]
+    },
+    "stop_candidate": {
+      "executable": "/data/maintenance/stop-candidate",
+      "sha256": "<lowercase-sha256>",
+      "args": [],
+      "inherit_env": ["FLY_APP"]
+    },
+    "restore_old": {
+      "executable": "/data/maintenance/restore-old",
+      "sha256": "<lowercase-sha256>",
+      "args": [],
+      "inherit_env": ["FLY_APP"]
+    }
   }
 }
 ```
@@ -168,6 +222,7 @@ stopped and bind that observation to the exact old tuple:
 ```json
 {
   "old_release_id": "old-release-id",
+  "old_runtime_capability_digest": "<old-lowercase-sha256>",
   "database_path": "/data/openthrottle.db",
   "blob_root": "/data/openthrottle-blobs",
   "ingress_closed": true,
@@ -182,7 +237,7 @@ The command also acquires an exclusive SQLite lock before archiving. Manifest
 booleans are declarations; neither they nor a stale active-work report replace
 this observed precondition.
 
-All other non-smoke hook output contracts are:
+Candidate start/stop and ingress-reopen hook output contracts are:
 
 ```json
 {"evidence":"bounded exact evidence"}
@@ -194,9 +249,27 @@ The two smoke hooks instead return:
 {"id":"disposable-work-id","status":"passed","evidence":"bounded exact evidence"}
 ```
 
-Hooks inherit `OT_OFFLINE_REPLACEMENT_OPERATION`; rollback hooks also receive
-`OT_OFFLINE_REPLACEMENT_REASON`. They must not accept untrusted manifest values
-through a shell parser.
+`restore_old` returns the exact restored tuple and archive identity:
+
+```json
+{
+  "old_release_id": "old-release-id",
+  "old_runtime_capability_digest": "<old-lowercase-sha256>",
+  "database_path": "/data/openthrottle.db",
+  "blob_root": "/data/openthrottle-blobs",
+  "archive_manifest_digest": "<archive-manifest-sha256>",
+  "evidence": "bounded exact evidence"
+}
+```
+
+Before any hook runs, the loader verifies every executable is a normalized
+absolute nonsymlink regular executable and that its bytes match `sha256`; it
+repeats that verification immediately before each spawn. A hook receives only
+parent values named in `inherit_env`, plus executor-owned
+`OT_OFFLINE_REPLACEMENT_OPERATION`; rollback hooks also receive
+`OT_OFFLINE_REPLACEMENT_REASON`. Reserved names cannot appear in `inherit_env`,
+and no other parent secret or variable is copied. Hooks never pass through a
+shell parser.
 
 ## 5. Run from a maintenance Machine
 
@@ -231,11 +304,26 @@ The replacement command will:
 12. reopen ingress, then atomically replace it with a `completed` report whose
     `ready_report_digest` binds the pre-reopen report.
 
-The candidate start hook should launch the supervisor against the fresh paths
-with public admission still closed. Smoke hooks must exercise real kernel paths,
-including edit and inspect authority, semantic normalization/result correction,
-Records, Effects, Checkpoints/blobs, publication/provider evidence, and runtime
-cleanup.
+The candidate start hook launches the supervisor against the fresh paths with
+public admission still closed. The ordinary and structured hooks are the first
+and only canary pair for this replacement; do not create an ambiguous second
+pair after `ready_to_reopen`.
+
+Each canary starts from a scoped real Linear/GitHub work item and must:
+
+- produce an operator-accepted change;
+- pass the configured commands and an inspect-only review;
+- publish the exact accepted subject and satisfy every sealed GitHub
+  trusted-producer observation;
+- record every manual intervention;
+- prove cleanup of both admission and promoted-run runtime resources; and
+- return bounded evidence that binds those facts into the ready report.
+
+Give the structured item at least two dependency-independent units and select
+multiple review personas. The complete frontiers execute serially in this
+release. Across the pair, deliberately exercise one result-shape correction
+that retains its exact Attempt/session and one semantic rejection that creates
+a distinct edit remediation Attempt with a fresh native session.
 
 ## 6. Promote the fresh paths
 
@@ -243,12 +331,17 @@ After the command returns `status:"completed"`:
 
 1. verify the report digest independently;
 2. destroy the one-off maintenance Machine;
-3. configure `DATABASE_PATH`, `OT_BLOB_STORE_PATH`, `OT_BLOB_STORE_ID`,
+3. inspect and accept the canary deliverables, trusted-provider observations,
+   interventions, and cleanup evidence bound by the ready-report digest;
+4. configure `DATABASE_PATH`, `OT_BLOB_STORE_PATH`, `OT_BLOB_STORE_ID`,
    `OT_EPOCH_RELEASE_ID`, and `DAYTONA_SNAPSHOT` for the exact candidate tuple;
-4. deploy the pinned candidate directly;
-5. verify `/healthz`, `/capabilities`, both smoke run projections, and zero live
+5. set `FRESH_EPOCH_READY` to the exact string `true` and run the normal deploy
+   workflow, which uses `--ha=false` and converges to one Machine;
+6. verify exactly one normal app Machine exists and the sole
+   `openthrottle_data` volume is attached to it;
+7. verify `/healthz`, `/capabilities`, both smoke run projections, and zero live
    runtime resources;
-6. retain the old archive and image for diagnosis and explicit rollback.
+8. retain the old archive and image for diagnosis and explicit rollback.
 
 Subsequent commits use the normal direct deployment workflow.
 
@@ -267,14 +360,17 @@ report, then complete or explicitly roll back the exact tuple.
 
 Then:
 
-1. verify every candidate writer is stopped;
-2. archive candidate storage separately for diagnosis;
-3. destroy the maintenance Machine;
-4. reattach the volume to the exact old release configured for the old database,
+1. set `FRESH_EPOCH_READY` to `false` (or remove it) and verify the normal deploy
+   job cannot start;
+2. verify every candidate writer is stopped;
+3. archive candidate storage separately for diagnosis;
+4. destroy the maintenance Machine;
+5. reattach the volume to the exact old release configured for the old database,
    blob root, and Daytona snapshot;
-5. verify the old archive manifest and restored health;
-6. reopen old ingress only after the release/storage tuple matches;
-7. manually close disposable smoke branches, issues, or pull requests.
+6. verify the old archive manifest, runtime-capability digest, and restored
+   health;
+7. reopen old ingress only after the release/storage tuple matches;
+8. manually close disposable smoke branches, issues, or pull requests.
 
 Never import a fresh-epoch row into old storage and never point the old release
 at the new database. A rollback restores the tuple; it does not translate it.

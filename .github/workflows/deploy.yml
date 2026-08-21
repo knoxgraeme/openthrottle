@@ -95,6 +95,7 @@ jobs:
   deploy:
     needs: [changes, snapshot]
     if: >-
+      vars.FRESH_EPOCH_READY == 'true' &&
       always() && !cancelled() && needs.snapshot.result != 'failure' &&
       (needs.changes.outputs.supervisor == 'true' ||
        needs.snapshot.result == 'success' ||
@@ -125,9 +126,32 @@ jobs:
         run: flyctl secrets set --stage --app "$FLY_APP" DAYTONA_SNAPSHOT="$SNAPSHOT_NAME"
       - name: Deploy the supervisor directly
         run: >-
-          flyctl deploy --remote-only --app "$FLY_APP"
+          flyctl deploy --ha=false --remote-only --app "$FLY_APP"
           --config supervisor/fly.toml
           --dockerfile supervisor/Dockerfile
+      - name: Converge to one SQLite writer Machine
+        run: flyctl scale count 1 --app "$FLY_APP" --yes
+      - name: Verify the single-writer Machine topology
+        run: |
+          set -euo pipefail
+          machines="$(flyctl machines list --app "$FLY_APP" --json)"
+          volumes="$(flyctl volumes list --app "$FLY_APP" --json)"
+          machine_id="$(jq -er '
+            if type == "array" and length == 1
+            then (.[0].id // .[0].ID // empty)
+            else empty
+            end
+          ' <<<"$machines")"
+          jq -e --arg machine_id "$machine_id" '
+            [ .[] |
+              select(
+                (.name // .Name // "") == "openthrottle_data" and
+                (.attached_machine_id // .attachedMachineId // "") == $machine_id
+              )
+            ] | length == 1
+          ' <<<"$volumes" >/dev/null
+          jq . <<<"$machines"
+          jq . <<<"$volumes"
       - name: Verify the deployed health check
         run: |
           set -euo pipefail

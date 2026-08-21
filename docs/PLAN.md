@@ -37,9 +37,16 @@ subject, OpenThrottle can:
 - Agent output is a bounded ResultCandidate. Declared normalizations are
   recorded; unresolved schema errors enter `result_pending` and use the same
   native session for result-only correction.
+- Session continuity is exclusive to representation correction. Review or lead
+  rejection creates a distinct edit successor with exact prior evidence,
+  `native_session_id: null`, and a fresh session bound when it starts.
 - Ordinary and structured coordinators use the same kernel reducer and durable
   store. Structured work adds bounded frontier, dependency, acceptance, serial
   integration, and reviewer-persona planning over those primitives.
+- This release admits one live Attempt at a time. Unit and reviewer frontiers
+  remain complete and dependency-aware but execute serially. The reviewer eval
+  may still select all five allowed personas; width one does not truncate the
+  roster.
 - External writes are write-ahead Effects with one idempotency key. The worker
   reconciles before writing and records confirmed or rejected delivery
   evidence.
@@ -73,11 +80,22 @@ The release is accepted only when all of the following hold:
   Attempt or native session.
 - Effect retries reconcile known external state before writing and never replay
   an unknown mutation blindly.
-- Ordinary and structured Docker proofs cover edit, inspect, commands,
-  publication, provider wait, cleanup, restart, and large-blob verification.
+- Local image and harness proof covers sandbox authority profiles, result
+  normalization, immutable checkpoint/integration transport, kernel
+  settlement/restart, and structured frontier progression with stubs. Live
+  publication, trusted provider evidence, semantic-remediation efficacy,
+  terminal cleanup, and epoch acceptance remain credentialed canary gates.
 - The offline replacement proof rejects live writers, unresolved resources,
   corrupt archives, nonempty fresh paths, and mixed release/storage identity;
   ordinary and structured smoke items pass before ingress reopens.
+- The ordinary and structured smoke hooks are the first credentialed canaries.
+  Each begins from a scoped real work item, produces an operator-accepted
+  change, passes configured commands and inspect review, publishes the exact
+  subject, satisfies the sealed trusted-producer policy, records interventions,
+  and proves admission/promoted-run cleanup in the ready report.
+- `FRESH_EPOCH_READY` is default closed and opens only after canary evidence is
+  accepted. One Fly Machine owns the SQLite volume. Rollback closes and verifies
+  the gate before restoring the retained old release/storage tuple.
 
 ## Verification
 
@@ -90,8 +108,11 @@ npm test --prefix supervisor
 npm test --prefix cli
 npm test --prefix sandbox
 bats sandbox/tests/runtime.bats
+bats sandbox/tests/inbox-drain.bats
+docker build -f supervisor/Dockerfile -t openthrottle-supervisor:test .
 docker build -f sandbox/Dockerfile -t openthrottle:test .
 sandbox/tests/smoke.sh openthrottle:test
+node supervisor/scripts/kernel-sandbox-e2e.mjs openthrottle:test
 node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test
 ```
 
@@ -104,6 +125,9 @@ and remain an explicit post-CI gate.
 - automatic mutation of definitions from historical analysis;
 - offline evaluation and longitudinal skill-quality scoring;
 - a remote blob backend if one Fly volume stops being sufficient;
+- concurrent Attempt execution, including overlapping units and review personas;
 - parallel Git integration of structured units;
+- outbound Linear status delivery and provider review/comment feedback mapped to
+  bounded remediation;
 - agent-owned commit, publication, merge, or scope-expansion authority;
 - online epoch migration or preservation of abandoned dogfood work.
