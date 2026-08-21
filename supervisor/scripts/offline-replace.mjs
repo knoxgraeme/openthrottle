@@ -18,9 +18,14 @@ const MAX_COMMAND_ARGS = 64;
 const MAX_INHERITED_ENV = 64;
 const MAX_ARGUMENT_BYTES = 4_000;
 const MAX_ENV_NAME_BYTES = 128;
+const DEFAULT_HOOK_TIMEOUT_MS = 7_200_000;
+const MIN_HOOK_TIMEOUT_MS = 100;
+const MAX_HOOK_TIMEOUT_MS = 86_400_000;
+const PROCESS_GROUP_QUIESCENCE_POLL_MS = 25;
 const HELP = `Usage: offline-replace.mjs /absolute/path/to/manifest.json
 
 Runs one authenticated, offline fresh-epoch replacement. Use --help to show this text.
+OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS sets the executor-owned per-hook deadline.
 `;
 const COMMAND_NAMES = [
   "verify_preconditions",
@@ -34,6 +39,7 @@ const COMMAND_NAMES = [
 const RESERVED_ENV = new Set([
   "OT_OFFLINE_REPLACEMENT_OPERATION",
   "OT_OFFLINE_REPLACEMENT_REASON",
+  "OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS",
 ]);
 
 function fail(detail) {
@@ -197,6 +203,48 @@ function childEnvironment(commandValue, label, reason) {
   return environment;
 }
 
+function hookTimeoutMs() {
+  const raw = process.env.OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_HOOK_TIMEOUT_MS;
+  const value = Number(raw);
+  if (
+    !/^\d+$/.test(raw) ||
+    !Number.isSafeInteger(value) ||
+    value < MIN_HOOK_TIMEOUT_MS ||
+    value > MAX_HOOK_TIMEOUT_MS
+  ) {
+    throw new Error(
+      `OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS must be an integer between ${MIN_HOOK_TIMEOUT_MS} and ${MAX_HOOK_TIMEOUT_MS}`,
+    );
+  }
+  return value;
+}
+
+function signalProcessGroup(child, signal) {
+  if (!Number.isSafeInteger(child.pid)) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch (error) {
+    if (error?.code === "ESRCH") return;
+    try {
+      child.kill(signal);
+    } catch (fallbackError) {
+      if (fallbackError?.code !== "ESRCH") throw fallbackError;
+    }
+  }
+}
+
+function processGroupIsQuiescent(child) {
+  if (!Number.isSafeInteger(child.pid)) return true;
+  try {
+    process.kill(-child.pid, 0);
+    return false;
+  } catch (error) {
+    if (error?.code === "ESRCH") return true;
+    throw error;
+  }
+}
+
 function readManifest() {
   const parsed = JSON.parse(readFileSync(manifestPath(), "utf8"));
   exactKeys(parsed, ["replacement", "commands"], "root");
@@ -210,7 +258,7 @@ function readManifest() {
   };
 }
 
-function run(commandValue, identity, label, reason) {
+function run(commandValue, identity, label, timeoutMs, reason) {
   return new Promise((resolvePromise, reject) => {
     const environment = childEnvironment(commandValue, label, reason);
     inspectExecutable(commandValue, `commands.${label}`, identity);
@@ -218,50 +266,125 @@ function run(commandValue, identity, label, reason) {
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       env: environment,
+      detached: true,
     });
     const stdout = [];
     const stderr = [];
     let bytes = 0;
+    let settled = false;
+    let terminalError;
+    let forceKillTimer;
+    let quiescenceTimer;
+    let leaderExited = false;
+    let killPhaseComplete = false;
+    const terminationGraceMs = Math.min(5_000, Math.max(100, Math.floor(timeoutMs / 10)));
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+      if (quiescenceTimer !== undefined) clearTimeout(quiescenceTimer);
+      if (error) reject(error);
+      else resolvePromise(result);
+    };
+    const maybeFinishTermination = () => {
+      if (terminalError === undefined || !leaderExited || !killPhaseComplete) return;
+      child.stdout.destroy();
+      child.stderr.destroy();
+      finish(terminalError);
+    };
+    const awaitGroupQuiescence = () => {
+      try {
+        if (processGroupIsQuiescent(child)) {
+          killPhaseComplete = true;
+          maybeFinishTermination();
+          return;
+        }
+        signalProcessGroup(child, "SIGKILL");
+      } catch (signalError) {
+        terminalError = new Error(
+          `${terminalError.message}; failed to verify ${label} process-group quiescence: ${signalError instanceof Error ? signalError.message : String(signalError)}`,
+        );
+      }
+      quiescenceTimer = setTimeout(awaitGroupQuiescence, PROCESS_GROUP_QUIESCENCE_POLL_MS);
+    };
+    const terminate = (error) => {
+      if (terminalError !== undefined) return;
+      terminalError = error;
+      try {
+        signalProcessGroup(child, "SIGTERM");
+      } catch (signalError) {
+        terminalError = new Error(
+          `${error.message}; failed to terminate ${label}: ${signalError instanceof Error ? signalError.message : String(signalError)}`,
+        );
+      }
+      forceKillTimer = setTimeout(() => {
+        forceKillTimer = undefined;
+        try {
+          signalProcessGroup(child, "SIGKILL");
+        } catch (signalError) {
+          terminalError = new Error(
+            `${terminalError.message}; failed to kill ${label}: ${signalError instanceof Error ? signalError.message : String(signalError)}`,
+          );
+        }
+        awaitGroupQuiescence();
+      }, terminationGraceMs);
+    };
+    const timeoutTimer = setTimeout(() => {
+      terminate(new Error(`${label} exceeded executor-owned timeout of ${timeoutMs}ms`));
+    }, timeoutMs);
     const collect = (target) => (chunk) => {
+      if (terminalError !== undefined) return;
       bytes += chunk.length;
       if (bytes > MAX_OUTPUT_BYTES) {
-        child.kill("SIGKILL");
-        reject(new Error(`${label} output exceeded ${MAX_OUTPUT_BYTES} bytes`));
+        terminate(new Error(`${label} output exceeded ${MAX_OUTPUT_BYTES} bytes`));
         return;
       }
       target.push(chunk);
     };
     child.stdout.on("data", collect(stdout));
     child.stderr.on("data", collect(stderr));
-    child.once("error", reject);
+    child.once("error", (error) => {
+      if (child.pid === undefined) finish(error);
+      else terminate(error);
+    });
+    child.once("exit", () => {
+      leaderExited = true;
+      maybeFinishTermination();
+    });
     child.once("close", (status, signal) => {
+      if (terminalError !== undefined) {
+        maybeFinishTermination();
+        return;
+      }
       const errorText = Buffer.concat(stderr).toString("utf8").trim();
       if (status !== 0) {
-        reject(new Error(`${label} failed (${signal ?? status}): ${errorText.slice(0, 1_000)}`));
+        finish(new Error(`${label} failed (${signal ?? status}): ${errorText.slice(0, 1_000)}`));
         return;
       }
       let result;
       try {
         result = JSON.parse(Buffer.concat(stdout).toString("utf8"));
       } catch {
-        reject(new Error(`${label} did not return one JSON object`));
+        finish(new Error(`${label} did not return one JSON object`));
         return;
       }
       if (!result || typeof result !== "object" || Array.isArray(result)) {
-        reject(new Error(`${label} did not return one JSON object`));
+        finish(new Error(`${label} did not return one JSON object`));
         return;
       }
-      resolvePromise(result);
+      finish(undefined, result);
     });
   });
 }
 
 async function main() {
+  const timeoutMs = hookTimeoutMs();
   const manifest = readManifest();
   const identities = preflightCommands(manifest.commands);
   const { runOfflineReplacement } = await import("../dist/persistence/offline-replacement.js");
   const invoke = async (name, reason) => {
-    const result = await run(manifest.commands[name], identities[name], name, reason);
+    const result = await run(manifest.commands[name], identities[name], name, timeoutMs, reason);
     revalidateCommands(manifest.commands, identities);
     return result;
   };

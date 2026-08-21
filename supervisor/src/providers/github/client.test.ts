@@ -7,7 +7,9 @@ import * as appPortsModule from "../../app/ports.js";
 import * as githubClientModule from "./client.js";
 import {
   ensureRepositoryControlLabel,
+  getRepositoryCollaboratorPermission,
   getRepositoryDefinitionSourceAtCommit,
+  isAuthorizedGithubControlPermission,
   prepareRepository,
   publishRepositoryTaskBranch,
   type GithubClient,
@@ -26,7 +28,9 @@ describe("GitHub kernel client", () => {
   it("exports only the production kernel surface", () => {
     expect(Object.keys(githubClientModule).sort()).toEqual([
       "ensureRepositoryControlLabel",
+      "getRepositoryCollaboratorPermission",
       "getRepositoryDefinitionSourceAtCommit",
+      "isAuthorizedGithubControlPermission",
       "prepareRepository",
       "publishRepositoryTaskBranch",
     ]);
@@ -162,6 +166,54 @@ describe("GitHub kernel client", () => {
       "acme/widget",
     )).resolves.toBe("created");
   });
+
+  it("maps current GitHub collaborator permissions and authorizes triage or stronger", async () => {
+    const requests: string[] = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      requests.push(String(input));
+      return Response.json({
+        permission: "read",
+        role_name: requests.length === 1 ? "triage" : "pull",
+      });
+    }) as unknown as typeof fetch;
+
+    await expect(getRepositoryCollaboratorPermission(
+      { token: "read-token", fetch: fetchMock },
+      "owner/repo",
+      "octocat",
+    )).resolves.toBe("triage");
+    await expect(getRepositoryCollaboratorPermission(
+      { token: "read-token", fetch: fetchMock },
+      "owner/repo",
+      "octocat",
+    )).resolves.toBe("read");
+    expect(isAuthorizedGithubControlPermission("triage")).toBe(true);
+    expect(isAuthorizedGithubControlPermission("read")).toBe(false);
+    expect(requests[0]).toBe(
+      "https://api.github.com/repos/owner/repo/collaborators/octocat/permission",
+    );
+  });
+
+  it.each([
+    ["custom-write", "write", "write", true],
+    ["custom-read", "read", "read", false],
+  ] as const)(
+    "falls back from GitHub role %s to its %s base permission",
+    async (roleName, basePermission, expected, authorized) => {
+      const fetchMock = vi.fn(async () => Response.json({
+        permission: basePermission,
+        role_name: roleName,
+      })) as unknown as typeof fetch;
+
+      const permission = await getRepositoryCollaboratorPermission(
+        { token: "read-token", fetch: fetchMock },
+        "owner/repo",
+        "octocat",
+      );
+      expect(permission).toBe(expected);
+      expect(isAuthorizedGithubControlPermission(permission)).toBe(authorized);
+    },
+  );
 
   it("publishes only the exact task branch and then reuses its owned pull request", async () => {
     const sha = "b".repeat(40);

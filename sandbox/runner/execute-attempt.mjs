@@ -49,6 +49,30 @@ const ENGINES = new Set(["claude", "codex", "opencode"]);
 const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/actions";
 const RESULT_CORRECTION_WINDOW_MS = 15 * 60 * 1000;
 const MAX_TRANSPORT_BYTES = 4 * 1024 * 1024;
+const DEFAULT_COMMAND_TIMEOUT_MS = 60 * 60 * 1_000;
+
+function validateExecutionLimits(value, label, engine = null) {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      Object.keys(value).sort().join("\0") !== "max_turns\0task_timeout_seconds") {
+    throw new Error(`${label} is invalid`);
+  }
+  const { max_turns: maxTurns, task_timeout_seconds: taskTimeout } = value;
+  if (maxTurns !== null && (!Number.isSafeInteger(maxTurns) || maxTurns < 1 || maxTurns > 10_000)) {
+    throw new Error(`${label}.max_turns is invalid`);
+  }
+  if (taskTimeout !== null &&
+      (!Number.isSafeInteger(taskTimeout) || taskTimeout < 1 || taskTimeout > 86_400)) {
+    throw new Error(`${label}.task_timeout_seconds is invalid`);
+  }
+  if (maxTurns !== null && engine !== null && engine !== "claude") {
+    throw new Error(`${label}.max_turns is not enforceable by ${engine}`);
+  }
+  return value;
+}
+
+function timeoutMilliseconds(limits) {
+  return limits.task_timeout_seconds === null ? undefined : limits.task_timeout_seconds * 1_000;
+}
 
 function exactString(value, label, pattern = ID) {
   if (typeof value !== "string" || !pattern.test(value)) throw new Error(`${label} is invalid`);
@@ -68,7 +92,7 @@ function validateCommonRequest(request) {
 
 export function validateKernelRequest(request) {
   validateCommonRequest(request);
-  if (request.schema === "openthrottle.kernel-action-request/v1" && request.phase === "work") {
+  if (request.schema === "openthrottle.kernel-action-request/v2" && request.phase === "work") {
     if (!request.action || typeof request.action !== "object" || Array.isArray(request.action)) {
       throw new Error("work request action is invalid");
     }
@@ -77,12 +101,23 @@ export function validateKernelRequest(request) {
       if (request.action.engine === "opencode" && !request.action.model) {
         throw new Error("OpenCode action requires a sealed model");
       }
+      validateExecutionLimits(
+        request.action.execution_limits,
+        "work request action.execution_limits",
+        request.action.engine,
+      );
       if (!request.action.semantic_result_schema) throw new Error("agent action semantic schema is missing");
       if (!Array.isArray(request.action.definition_entries)) throw new Error("agent definition entries are invalid");
     } else if (request.action.kind === "command") {
       if (typeof request.action.command_line !== "string" || !request.action.command_line.trim()) {
         throw new Error("command action is invalid");
       }
+      if (!Array.isArray(request.action.post_bootstrap) || request.action.post_bootstrap.length > 32 ||
+          request.action.post_bootstrap.some((command) =>
+            typeof command !== "string" || !command.trim() || command.length > 1_000 || command.includes("\0"))) {
+        throw new Error("command action post_bootstrap is invalid");
+      }
+      validateExecutionLimits(request.action.execution_limits, "command action.execution_limits");
     } else {
       throw new Error("work request action kind is unsupported");
     }
@@ -96,13 +131,14 @@ export function validateKernelRequest(request) {
     }
     return request;
   }
-  if (request.schema === "openthrottle.kernel-result-correction-request/v1" &&
+  if (request.schema === "openthrottle.kernel-result-correction-request/v2" &&
       request.phase === "result_correction") {
     if (!ENGINES.has(request.engine)) throw new Error("correction engine is invalid");
     if (request.engine === "opencode" && !request.model) throw new Error("OpenCode correction requires a sealed model");
     exactString(request.locked_subject, "request.locked_subject", SUBJECT);
     exactString(request.checkpoint_id, "request.checkpoint_id");
     exactString(request.native_session_id, "request.native_session_id", /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/);
+    validateExecutionLimits(request.execution_limits, "correction execution_limits", request.engine);
     if (request.repository_authority !== "inspect" || JSON.stringify(request.tools) !== '["ot-result"]' ||
         request.mcp !== false || request.provider_access !== false) {
       throw new Error("correction authority is invalid");
@@ -245,19 +281,19 @@ function boundedCommandSummary(execution) {
   return (text || `command exited ${execution.status ?? "without status"}`).slice(-4_000);
 }
 
-function defaultCommandRunner({ commandLine, repositoryPath }) {
+function defaultCommandRunner({ commandLine, repositoryPath, timeoutMs }) {
   const safeEnv = Object.fromEntries(["PATH", "LANG", "LC_ALL", "TZ"].flatMap((name) =>
     process.env[name] ? [[name, process.env[name]]] : []));
   if (typeof process.getuid === "function" && process.getuid() === 0 && existsSync("/usr/local/bin/gosu")) {
     return runCapturedProcess("/usr/local/bin/gosu", [
       "agent", "env", ...Object.entries(safeEnv).map(([key, value]) => `${key}=${value}`),
       "/bin/sh", "-lc", commandLine,
-    ], { cwd: repositoryPath, env: safeEnv, timeout: 60 * 60 * 1000 });
+    ], { cwd: repositoryPath, env: safeEnv, timeout: timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS });
   }
   return runCapturedProcess("/bin/sh", ["-lc", commandLine], {
     cwd: repositoryPath,
     env: safeEnv,
-    timeout: 60 * 60 * 1000,
+    timeout: timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
   });
 }
 
@@ -272,11 +308,55 @@ async function executeCommandWork(options, actionDirectory) {
     repositoryAuthority: "edit",
     destination: join(actionDirectory, "repository"),
   });
-  const execution = await (options.runCommand ?? defaultCommandRunner)({
-    commandLine: request.action.command_line,
-    repositoryPath: repository.destination,
-    request,
-  });
+  const taskTimeoutMs = timeoutMilliseconds(request.action.execution_limits);
+  const deadline = taskTimeoutMs === undefined ? null : options.now().getTime() + taskTimeoutMs;
+  const run = async (commandLine, phase, index = null) => {
+    const remaining = deadline === null ? undefined : deadline - options.now().getTime();
+    if (remaining !== undefined && remaining <= 0) {
+      return {
+        status: null,
+        signal: null,
+        timedOut: true,
+        stdout: "",
+        stderr: "sealed task timeout exhausted before command launch",
+      };
+    }
+    return await (options.runCommand ?? defaultCommandRunner)({
+      commandLine,
+      repositoryPath: repository.destination,
+      request,
+      phase,
+      postBootstrapIndex: index,
+      timeoutMs: remaining,
+    });
+  };
+  for (const [index, commandLine] of request.action.post_bootstrap.entries()) {
+    const bootstrap = await run(commandLine, "post_bootstrap", index);
+    if (bootstrap.error || bootstrap.timedOut || bootstrap.signal) {
+      return runtimeEnvelope(request, {
+        state: "work_failed",
+        retryable: true,
+        reason: `post_bootstrap[${index}] failed: ${boundedCommandSummary(bootstrap)}`,
+      });
+    }
+    if (bootstrap.status !== 0) {
+      return await completeCommandWork({
+        options,
+        actionDirectory,
+        repository,
+        execution: bootstrap,
+        summary: `post_bootstrap[${index}] failed: ${boundedCommandSummary(bootstrap)}`,
+      });
+    }
+    if (deadline !== null && options.now().getTime() >= deadline) {
+      return runtimeEnvelope(request, {
+        state: "work_failed",
+        retryable: true,
+        reason: "post_bootstrap exhausted the sealed task timeout",
+      });
+    }
+  }
+  const execution = await run(request.action.command_line, "command");
   if (execution.error || execution.timedOut || execution.signal) {
     return runtimeEnvelope(request, {
       state: "work_failed",
@@ -284,6 +364,11 @@ async function executeCommandWork(options, actionDirectory) {
       reason: boundedCommandSummary(execution),
     });
   }
+  return await completeCommandWork({ options, actionDirectory, repository, execution });
+}
+
+async function completeCommandWork({ options, actionDirectory, repository, execution, summary = null }) {
+  const { request, resultPath } = options;
   const verification = verifyActionRepository(repository);
   const inputOnlyVerification = { ...verification, output_subject: repository.input_subject };
   const artifactDirectory = join(actionDirectory, "artifacts");
@@ -306,7 +391,7 @@ async function executeCommandWork(options, actionDirectory) {
       outcome: execution.status === 0 ? "success" : "failure",
       command_id: request.action.command_id,
       exit_code: execution.status ?? 1,
-      summary: boundedCommandSummary(execution),
+      summary: summary ?? boundedCommandSummary(execution),
     },
   });
 }
@@ -380,10 +465,17 @@ async function executeAgentWork(options, actionDirectory) {
         repositoryPath: repository.destination,
         channel,
         onSession,
+        timeoutMs: timeoutMilliseconds(request.action.execution_limits),
       });
     } else {
       prepared = prepareAgentRuntime({ request: runtimeRequest, actionDirectory, channel });
-      execution = await runPreparedAgent({ prepared, request: runtimeRequest, channel, onSession });
+      execution = await runPreparedAgent({
+        prepared,
+        request: runtimeRequest,
+        channel,
+        onSession,
+        timeoutMs: timeoutMilliseconds(request.action.execution_limits),
+      });
     }
     if (execution.nativeSessionId && observedSessions.length === 0) await onSession(execution.nativeSessionId);
     if (inspectChangeArtifact !== null) verifyInspectChangeArtifact(inspectChangeArtifact);
@@ -490,7 +582,8 @@ async function executeCorrection(options, actionDirectory) {
       (checkpoint.output_subject ?? checkpoint.input_subject) !== request.locked_subject) {
     throw new Error("correction request changed the locked checkpoint fence");
   }
-  if (options.now().getTime() >= Date.parse(request.correction_deadline)) {
+  const deadline = Date.parse(request.correction_deadline);
+  if (options.now().getTime() >= deadline) {
     stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
     return runtimeEnvelope(request, {
       state: "needs_human",
@@ -507,6 +600,24 @@ async function executeCorrection(options, actionDirectory) {
     candidateDirectory,
     semanticSchema: request.semantic_result_schema,
   });
+  const remainingCorrectionMs = deadline - options.now().getTime();
+  if (remainingCorrectionMs <= 0) {
+    stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
+    return runtimeEnvelope(request, {
+      state: "needs_human",
+      reason: "result correction deadline exhausted",
+      checkpoint,
+      candidate_hash: null,
+      diagnostics: request.diagnostics,
+    });
+  }
+  const taskTimeoutMs = timeoutMilliseconds(request.execution_limits);
+  const timeoutMs = Math.max(
+    1,
+    taskTimeoutMs === undefined
+      ? remainingCorrectionMs
+      : Math.min(remainingCorrectionMs, taskTimeoutMs),
+  );
   let execution;
   if (options.runAgent) {
     execution = await options.runAgent({
@@ -515,6 +626,7 @@ async function executeCorrection(options, actionDirectory) {
       repositoryPath: repository.destination,
       channel,
       onSession: async () => { throw new Error("result correction cannot rebind the native session"); },
+      timeoutMs,
     });
   } else {
     const cwd = join(actionDirectory, "result-correction-cwd");
@@ -528,6 +640,17 @@ async function executeCorrection(options, actionDirectory) {
       home: engineState.home,
       cwd,
       prompt: correctionPrompt(request),
+      timeoutMs,
+    });
+  }
+  if (options.now().getTime() >= deadline) {
+    stageCheckpointArtifact(checkpoint, artifactDirectory, resultPath);
+    return runtimeEnvelope(request, {
+      state: "needs_human",
+      reason: "result correction deadline exhausted",
+      checkpoint,
+      candidate_hash: null,
+      diagnostics: request.diagnostics,
     });
   }
   if (!engineExitedCleanly(execution)) {

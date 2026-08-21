@@ -295,7 +295,9 @@ export async function promptConfig(
         message: "Post-bootstrap command (blank to skip)",
         initialValue: detected.pm ? `${detected.pm} install` : "",
       }),
-      max_turns: () => prompts.text({ message: "Max turns per agent run", initialValue: "200" }),
+      max_turns: ({ results }) => results.engine === "claude"
+        ? prompts.text({ message: "Max turns per agent run", initialValue: "200" })
+        : undefined,
       task_timeout: () => prompts.text({ message: "Task timeout (seconds)", initialValue: "7200" }),
     },
     {
@@ -323,10 +325,11 @@ export async function promptConfig(
         controlProvider: "github",
       };
   const model = typeof result.model === "string" ? result.model.trim() : "";
+  const engine = result.engine as Engine;
   return {
     project: {
       pipeline: String(result.pipeline || DEFAULT_PIPELINE),
-      engine: result.engine as Engine,
+      engine,
       ...(model ? { model } : {}),
       commands: {
         test: String(result.test),
@@ -335,7 +338,7 @@ export async function promptConfig(
       },
       post_bootstrap: result.post_bootstrap ? [String(result.post_bootstrap)] : [],
       limits: {
-        max_turns: Number(result.max_turns) || 200,
+        ...(engine === "claude" ? { max_turns: Number(result.max_turns) || 200 } : {}),
         task_timeout: Number(result.task_timeout) || 7_200,
       },
     },

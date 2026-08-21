@@ -37,11 +37,14 @@ import {
 import {
   assertAttemptLeaseClaim,
   captureAttemptLeaseClaim,
+  firstSuccessfulKernelContinuation,
   type AttemptLeaseClaim,
   type AttemptLeaseRequest,
   type KernelAttemptLeasePort,
+  type KernelAttemptRecoveryQuarantinePort,
   type KernelAttemptRequestPort,
   type KernelDefinitionBundlePort,
+  type KernelOrdinaryContinuationPort,
   type KernelReductionPort,
   type LeasedAttemptView,
   type ReductionView,
@@ -65,7 +68,11 @@ import { stageFor } from "./reducer-support.js";
 export interface OrdinaryKernelStore extends
   KernelReductionPort,
   KernelAttemptLeasePort,
-  KernelAttemptRequestPort {}
+  KernelAttemptRecoveryQuarantinePort,
+  KernelAttemptRequestPort,
+  KernelOrdinaryContinuationPort {}
+
+const ORDINARY_CONTINUATION_SCAN_LIMIT = 100;
 
 export interface OrdinaryKernelSettlementPlan {
   decision: DecisionRecord;
@@ -205,6 +212,114 @@ export class OrdinaryKernelCoordinator {
     const leased = await this.#store.leaseNextEligibleAttempt(request);
     if (!leased) return { disposition: "idle" };
     return this.executeLeasedAttempt(leased);
+  }
+
+  async resumeReadyAttempt(): Promise<OrdinaryKernelStep> {
+    const resumed = await firstSuccessfulKernelContinuation({
+      page_size: ORDINARY_CONTINUATION_SCAN_LIMIT,
+      list: (request) => this.#store.listReadyOrdinaryAttempts(request),
+      resume: (candidate) => this.#resumeReadyCandidate(candidate),
+    });
+    return resumed ?? { disposition: "idle" };
+  }
+
+  async #resumeReadyCandidate(candidate: {
+    pipeline_run_id: string;
+    attempt_id: string;
+  }): Promise<OrdinaryKernelStep> {
+    let view = await this.#load(candidate.pipeline_run_id, candidate.attempt_id);
+    const attempt = view.current_attempt;
+    if (
+      !attempt || (attempt.status !== "work_complete" && attempt.status !== "recorded") ||
+      attempt.checkpoint_id === null || attempt.result_record_id === null
+    ) throw new Error("ordinary continuation candidate is incomplete");
+    view = await this.#load(
+      view.run.id,
+      attempt.id,
+      [attempt.result_record_id],
+      [attempt.checkpoint_id],
+    );
+    const result = view.records.get(attempt.result_record_id);
+    if (!result || result.kind !== "result") {
+      throw new Error(`ordinary continuation ${attempt.id} has no exact ResultRecord`);
+    }
+    const bundle = await this.#bundles.resolveExactDefinitionBundle({
+      pipeline_run_id: view.run.id,
+      definition_bundle_hash: view.run.definition_bundle_hash,
+    });
+    const { stage, evaluated } = this.#evaluateResultRecord({ view, bundle, record: result });
+    if (attempt.status === "work_complete") {
+      await this.#apply(view, {
+        type: "record",
+        command_id: transitionId("record", { attempt: attempt.id, record: result.id }),
+        attempt_id: attempt.id,
+        record_id: result.id,
+      });
+      view = await this.#load(
+        view.run.id,
+        attempt.id,
+        [result.id],
+        [attempt.checkpoint_id],
+      );
+    }
+    return this.#settleRecorded({ view, bundle, record: result, stage, evaluated });
+  }
+
+  async terminalizeExhaustedRecovery(
+    leased: LeasedAttemptView,
+    error: unknown,
+  ): Promise<OrdinaryKernelStep | null> {
+    const claim = captureAttemptLeaseClaim(leased);
+    const detail = error instanceof Error ? error.message : String(error);
+    const reason = `attempt_recovery_exhausted: ${detail}`.slice(0, 1_500);
+    try {
+      const view = await this.#load(leased.run_id, leased.attempt.id);
+      assertAttemptLeaseClaim(view, claim);
+      if (leased.lease.generation < view.run.work_retry_limit) return null;
+      try {
+        return await this.#terminal(view, "needs_human", reason, claim);
+      } catch (terminalError) {
+        return this.#quarantineExhaustedRecovery(leased, claim, reason, terminalError);
+      }
+    } catch (preparationError) {
+      return this.#quarantineExhaustedRecovery(leased, claim, reason, preparationError);
+    }
+  }
+
+  async #quarantineExhaustedRecovery(
+    leased: LeasedAttemptView,
+    claim: AttemptLeaseClaim,
+    recoveryReason: string,
+    preparationError: unknown,
+  ): Promise<OrdinaryKernelStep | null> {
+    const preparationDetail = preparationError instanceof Error
+      ? preparationError.message
+      : String(preparationError);
+    const reason = `${recoveryReason}; terminal_preparation_failed: ${preparationDetail}`.slice(0, 1_500);
+    const diagnostic = createPipelineDecisionRecord({
+      attempt: leased.attempt,
+      result: null,
+      evaluated: {
+        evaluator: "core/executor-recovery-quarantine@1",
+        outcome: "needs_human",
+        reason,
+      },
+      created_at: this.#now(),
+    });
+    const quarantined = await this.#store.quarantineExhaustedAttemptRecovery({
+      claim,
+      diagnostic,
+      reason,
+    });
+    if (!quarantined) return null;
+    return {
+      disposition: "terminal",
+      pipeline_run_id: leased.run_id,
+      attempt_id: leased.attempt.id,
+      stage_id: leased.attempt.scope.stage_id,
+      run_status: "needs_human",
+      next_stage_id: null,
+    };
   }
 
   async requestRunControl(input: {
@@ -410,6 +525,7 @@ export class OrdinaryKernelCoordinator {
     const lease = attempt.lease;
     if (!lease?.started) throw new Error("ordinary execution lost its started lease");
     return {
+      lease_generation: lease.generation,
       heartbeat_interval_ms: Math.max(1, Math.floor(this.#attemptLeaseDurationMs / 3)),
       on_heartbeat: async () => {
         const now = Date.parse(this.#now());
@@ -458,7 +574,33 @@ export class OrdinaryKernelCoordinator {
       return this.#terminal(input.view, "failed", input.outcome.reason, input.claim);
     }
 
-    if (input.outcome.checkpoint !== null) {
+    let completedResult: {
+      record: ResultRecord;
+      stage: Exclude<CompiledPipelineStage, { kind: "effect" | "wait" }>;
+      evaluated: EvaluatedKernelResult;
+    } | null = null;
+    if (input.outcome.state === "work_complete") {
+      const projected: KernelAttempt = {
+        ...attempt,
+        status: "work_complete",
+        version: attempt.version + 1,
+        lease: null,
+        output_subject: input.outcome.checkpoint.output_subject,
+        native_session_id: input.outcome.checkpoint.native_session_id,
+        checkpoint_id: input.outcome.checkpoint.id,
+      };
+      completedResult = this.#createResultRecord({
+        view: { ...input.view, current_attempt: projected },
+        bundle: input.bundle,
+        result: input.outcome.result,
+      });
+      await this.#completeWork(
+        input.view,
+        input.outcome.checkpoint,
+        input.claim,
+        completedResult.record,
+      );
+    } else if (input.outcome.checkpoint !== null) {
       await this.#completeWork(input.view, input.outcome.checkpoint, input.claim);
     }
     let completed = await this.#load(input.view.run.id, attempt.id);
@@ -496,10 +638,11 @@ export class OrdinaryKernelCoordinator {
       completed = await this.#load(completed.run.id, attempt.id);
       return this.#step("result_pending", completed);
     }
-    return this.#recordEvaluateAndSettle({
+    if (completedResult === null) throw new Error("completed work has no verified result evidence");
+    return this.#recordAndSettle({
       view: completed,
       bundle: input.bundle,
-      result: input.outcome.result,
+      ...completedResult,
     });
   }
 
@@ -565,10 +708,12 @@ export class OrdinaryKernelCoordinator {
     view: ReductionView,
     checkpoint: AttemptCheckpoint,
     claim: AttemptLeaseClaim,
+    record?: ResultRecord,
   ): Promise<void> {
     const attempt = view.current_attempt!;
     const checkpointView: ReductionView = {
       ...view,
+      records: record === undefined ? view.records : mapWith(view.records, record),
       checkpoints: mapWith(view.checkpoints, checkpoint),
     };
     await this.#apply(checkpointView, {
@@ -580,6 +725,7 @@ export class OrdinaryKernelCoordinator {
       attempt_id: attempt.id,
       checkpoint_id: checkpoint.id,
       verified_output_subject: checkpoint.output_subject,
+      result_record_id: record?.id ?? null,
     }, claim);
   }
 
@@ -589,6 +735,23 @@ export class OrdinaryKernelCoordinator {
     result: KernelVerifiedActionResult;
     claim?: AttemptLeaseClaim;
   }): Promise<OrdinaryKernelStep> {
+    return this.#recordAndSettle({
+      view: input.view,
+      bundle: input.bundle,
+      ...this.#createResultRecord(input),
+      ...(input.claim ? { claim: input.claim } : {}),
+    });
+  }
+
+  #createResultRecord(input: {
+    view: ReductionView;
+    bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
+    result: KernelVerifiedActionResult;
+  }): {
+    record: ResultRecord;
+    stage: Exclude<CompiledPipelineStage, { kind: "effect" | "wait" }>;
+    evaluated: EvaluatedKernelResult;
+  } {
     const attempt = input.view.current_attempt!;
     if (!attempt.checkpoint_id) throw new Error("authoritative result requires a verified checkpoint");
     const stage = stageFor(input.view.manifest, attempt.scope.stage_id);
@@ -631,47 +794,127 @@ export class OrdinaryKernelCoordinator {
     } else {
       throw new Error(`stage ${stage.id} is not an ordinary executable action`);
     }
+    return { record, stage, evaluated };
+  }
 
-    const recordView = await this.#load(
+  #evaluateResultRecord(input: {
+    view: ReductionView;
+    bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
+    record: ResultRecord;
+  }): {
+    stage: Exclude<CompiledPipelineStage, { kind: "effect" | "wait" }>;
+    evaluated: EvaluatedKernelResult;
+  } {
+    const attempt = input.view.current_attempt!;
+    const stage = stageFor(input.view.manifest, attempt.scope.stage_id);
+    const selected = selectKernelAction({
+      bundle: input.bundle,
+      manifest: input.view.manifest,
+      attempt,
+    });
+    if (stage.kind === "agent") {
+      if (selected.action.kind !== "agent") {
+        throw new Error(`agent stage ${stage.id} selected another action kind`);
+      }
+      const evalEntry = selected.action.definition_entries.find(
+        (entry) => entry.definition_kind === "eval" && entry.definition_id === stage.eval,
+      );
+      if (!evalEntry) throw new Error(`sealed action omitted eval ${stage.eval}`);
+      const evaluation = validateEvalDefinition(evalEntry.normalized_payload, {
+        source: `definition_bundle.eval:${stage.eval}`,
+      }).value;
+      return { stage, evaluated: this.#evaluators.evaluateSemantic({ stage, evaluation, result: input.record }) };
+    }
+    if (stage.kind === "command") {
+      return { stage, evaluated: this.#evaluators.evaluateCommand({ stage, result: input.record }) };
+    }
+    throw new Error(`stage ${stage.id} is not an ordinary executable action`);
+  }
+
+  async #recordAndSettle(input: {
+    view: ReductionView;
+    bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
+    record: ResultRecord;
+    stage: Exclude<CompiledPipelineStage, { kind: "effect" | "wait" }>;
+    evaluated: EvaluatedKernelResult;
+    claim?: AttemptLeaseClaim;
+  }): Promise<OrdinaryKernelStep> {
+    const attempt = input.view.current_attempt!;
+    const checkpointId = attempt.checkpoint_id;
+    if (checkpointId === null) throw new Error(`attempt ${attempt.id} has no verified checkpoint`);
+
+    const persistedRecord = attempt.result_record_id === input.record.id;
+    const baseRecordView = await this.#load(
       input.view.run.id,
       attempt.id,
-      [],
-      [attempt.checkpoint_id],
+      persistedRecord ? [input.record.id] : [],
+      [checkpointId],
     );
-    await this.#apply({ ...recordView, records: mapWith(recordView.records, record) }, {
+    const recordView = persistedRecord
+      ? baseRecordView
+      : { ...baseRecordView, records: mapWith(baseRecordView.records, input.record) };
+    await this.#apply(recordView, {
       type: "record",
-      command_id: transitionId("record", { attempt: attempt.id, record: record.id }),
+      command_id: transitionId("record", { attempt: attempt.id, record: input.record.id }),
       attempt_id: attempt.id,
-      record_id: record.id,
+      record_id: input.record.id,
     }, input.claim);
 
-    const checkpoint = recordView.checkpoints.get(attempt.checkpoint_id)!;
-    const recorded = await this.#load(input.view.run.id, attempt.id, [record.id]);
+    const checkpoint = recordView.checkpoints.get(checkpointId)!;
+    const recorded = await this.#load(input.view.run.id, attempt.id, [input.record.id], [checkpointId]);
+    return this.#settleRecorded({
+      view: recorded,
+      bundle: input.bundle,
+      record: input.record,
+      stage: input.stage,
+      evaluated: input.evaluated,
+      checkpoint,
+    });
+  }
+
+  async #settleRecorded(input: {
+    view: ReductionView;
+    bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
+    record: ResultRecord;
+    stage: Exclude<CompiledPipelineStage, { kind: "effect" | "wait" }>;
+    evaluated: EvaluatedKernelResult;
+    checkpoint?: AttemptCheckpoint;
+  }): Promise<OrdinaryKernelStep> {
+    const recorded = input.view;
     const recordedAttempt = recorded.current_attempt!;
+    if (recordedAttempt.status !== "recorded" || recordedAttempt.result_record_id !== input.record.id) {
+      throw new Error(`attempt ${recordedAttempt.id} is not ready for deterministic settlement`);
+    }
+    const checkpoint = input.checkpoint ?? recorded.checkpoints.get(recordedAttempt.checkpoint_id!);
+    if (!checkpoint) throw new Error(`attempt ${recordedAttempt.id} has no exact settlement checkpoint`);
     let defaultPlan: Promise<OrdinaryKernelSettlementPlan> | null = null;
     const deriveDefaultPlan = (): Promise<OrdinaryKernelSettlementPlan> => {
       defaultPlan ??= (async () => {
         const decision = createPipelineDecisionRecord({
           attempt: recordedAttempt,
-          result: record,
-          evaluated,
+          result: input.record,
+          evaluated: input.evaluated,
           created_at: this.#now(),
         });
-        const targetStageId = nextStageId({ view: recorded, stage, outcome: evaluated.outcome });
+        const targetStageId = nextStageId({
+          view: recorded,
+          stage: input.stage,
+          outcome: input.evaluated.outcome,
+        });
         const nextAttempts = targetStageId === null
           ? []
           : [await this.#nextAttempt({
             view: recorded,
             current: recordedAttempt,
-            current_result: record,
+            current_result: input.record,
             decision,
             bundle: input.bundle,
             target_stage_id: targetStageId,
           })];
         return {
           decision,
-          outcome: evaluated.outcome,
-          input_records: [record],
+          outcome: input.evaluated.outcome,
+          input_records: [input.record],
           checkpoints: [],
           next_attempts: nextAttempts,
         };
@@ -682,15 +925,15 @@ export class OrdinaryKernelCoordinator {
       ? await deriveDefaultPlan()
       : await this.#settlementPlanner.plan({
         view: recorded,
-        stage,
+        stage: input.stage,
         attempt: recordedAttempt,
-        result: record,
+        result: input.record,
         checkpoint,
         bundle: input.bundle,
-        evaluated,
+        evaluated: input.evaluated,
         default_plan: deriveDefaultPlan,
       });
-    this.#assertSettlementPlan(recorded, stage, recordedAttempt, record, settlement);
+    this.#assertSettlementPlan(recorded, input.stage, recordedAttempt, input.record, settlement);
     const settleRecords = new Map<string, ExecutionRecord>(settlement.input_records
       .map((candidate) => [candidate.id, candidate]));
     settleRecords.set(settlement.decision.id, settlement.decision);
@@ -715,7 +958,7 @@ export class OrdinaryKernelCoordinator {
         : { next_dependencies: settlement.next_dependencies }),
     });
     const finalView = await this.#load(recorded.run.id, null);
-    return this.#step("settled", finalView, recordedAttempt.id, stage.id);
+    return this.#step("settled", finalView, recordedAttempt.id, input.stage.id);
   }
 
   #assertSettlementPlan(

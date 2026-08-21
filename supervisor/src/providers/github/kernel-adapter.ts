@@ -12,6 +12,7 @@ import type {
   KernelEffectAdapterBinding,
   KernelEffectProviderObservation,
 } from "../../app/kernel-effect-ports.js";
+import { githubApiResponse } from "../../shared/github-request.js";
 import { pushRepositoryCheckpoint } from "./checkpoint-push.js";
 import { publishRepositoryTaskBranch, type GithubClient } from "./client.js";
 
@@ -145,13 +146,8 @@ function waitPayload(intent: Readonly<EffectIntent>): ProviderWaitPayload {
 }
 
 async function githubJson<T>(client: GithubClient, path: string): Promise<{ status: number; value: T | null }> {
-  const response = await (client.fetch ?? fetch)(`${client.apiBaseUrl ?? "https://api.github.com"}${path}`, {
-    headers: {
-      Authorization: `Bearer ${client.token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "openthrottle",
-    },
+  const response = await githubApiResponse(client, path, {
+    headers: { "User-Agent": "openthrottle" },
   });
   const raw = await response.text();
   if (!response.ok && response.status !== 404) {

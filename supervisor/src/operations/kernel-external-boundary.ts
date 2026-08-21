@@ -22,6 +22,7 @@ import {
 import {
   assertAttemptLeaseClaim,
   captureAttemptLeaseClaim,
+  firstSuccessfulKernelContinuation,
   type AttemptLeaseClaim,
   type ExternalScheduleView,
   type KernelAttemptRequestPort,
@@ -57,6 +58,7 @@ export const EXTERNAL_RESULT_RECORD_PAYLOAD_SCHEMA =
 
 const OUTCOME = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
 const MAX_SUMMARY_LENGTH = 4_000;
+const EXTERNAL_CONTINUATION_SCAN_LIMIT = 100;
 
 export interface KernelExternalBoundaryStore extends
   KernelReductionPort,
@@ -355,9 +357,14 @@ export class KernelExternalBoundaryCoordinator {
   }
 
   async resumeReadyAttempt(): Promise<KernelExternalBoundaryStep> {
-    const [ready] = await this.#store.listReadyExternalAttempts({ limit: 1 });
-    if (!ready) return { disposition: "idle" };
-    return this.#advance(await this.#load(ready.pipeline_run_id, ready.attempt_id));
+    const resumed = await firstSuccessfulKernelContinuation({
+      page_size: EXTERNAL_CONTINUATION_SCAN_LIMIT,
+      list: (request) => this.#store.listReadyExternalAttempts(request),
+      resume: async (ready) => {
+        return this.#advance(await this.#load(ready.pipeline_run_id, ready.attempt_id));
+      },
+    });
+    return resumed ?? { disposition: "idle" };
   }
 
   async resumeAttempt(input: {

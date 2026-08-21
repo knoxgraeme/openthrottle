@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { canonicalJson, digestCanonicalJson } from "./generated-result-contracts.mjs";
-import { executeAttempt } from "./execute-attempt.mjs";
+import { executeAttempt, validateKernelRequest } from "./execute-attempt.mjs";
 
 const semanticSchema = {
   schema: "openthrottle.semantic-result-schema/v1",
@@ -57,7 +57,7 @@ function skillEntry() {
 
 function workRequest(subject, overrides = {}) {
   return {
-    schema: "openthrottle.kernel-action-request/v1",
+    schema: "openthrottle.kernel-action-request/v2",
     phase: "work",
     pipeline_run_id: "run-1",
     attempt_id: "attempt-1",
@@ -83,6 +83,7 @@ function workRequest(subject, overrides = {}) {
       entry_skill: "core/implement-plan",
       eval_id: "core/unit-result",
       semantic_result_schema: semanticSchema,
+      execution_limits: { max_turns: 12, task_timeout_seconds: 600 },
       definition_entries: [
         {
           definition_kind: "agent",
@@ -111,6 +112,20 @@ function claudeOutput(sessionId, candidate) {
 }
 
 describe("kernel attempt executor", () => {
+  it("rejects legacy v1 work and correction envelopes before execution", () => {
+    const request = workRequest("a".repeat(40));
+
+    expect(() => validateKernelRequest({
+      ...request,
+      schema: "openthrottle.kernel-action-request/v1",
+    })).toThrow(/schema or phase is unsupported/);
+    expect(() => validateKernelRequest({
+      ...request,
+      schema: "openthrottle.kernel-result-correction-request/v1",
+      phase: "result_correction",
+    })).toThrow(/schema or phase is unsupported/);
+  });
+
   it("normalizes OPE-188 and replays the immutable result without redispatch", async () => {
     const source = sourceRepository();
     const root = mkdtempSync(join(tmpdir(), "ot-attempt-"));
@@ -118,8 +133,9 @@ describe("kernel attempt executor", () => {
     const sessionPath = join(root, "transport", "session.json");
     let launches = 0;
     const request = workRequest(source.subject);
-    const runAgent = async ({ repositoryPath, onSession }) => {
+    const runAgent = async ({ repositoryPath, onSession, timeoutMs }) => {
       launches += 1;
+      expect(timeoutMs).toBe(600_000);
       writeFileSync(join(repositoryPath, "work.txt"), "implemented\n");
       await onSession("session-1");
       expect(existsSync(sessionPath)).toBe(true);
@@ -266,7 +282,7 @@ describe("kernel attempt executor", () => {
     expect(workLaunches).toBe(1);
     const checkpoint = pending.outcome.checkpoint;
     const correction = {
-      schema: "openthrottle.kernel-result-correction-request/v1",
+      schema: "openthrottle.kernel-result-correction-request/v2",
       phase: "result_correction",
       engine: "claude",
       model: null,
@@ -286,6 +302,7 @@ describe("kernel attempt executor", () => {
       correction_deadline: "2026-08-20T00:15:00.000Z",
       diagnostics: pending.outcome.diagnostics,
       semantic_result_schema: semanticSchema,
+      execution_limits: { max_turns: 12, task_timeout_seconds: 600 },
       repository_authority: "inspect",
       tools: ["ot-result"],
       mcp: false,
@@ -297,8 +314,9 @@ describe("kernel attempt executor", () => {
       actionRoot: join(root, "actions"),
       resultPath: join(root, "transport-correction", "result.json"),
       sessionPath: join(root, "transport-correction", "session.json"),
-      runAgent: async ({ repositoryPath, phase }) => {
+      runAgent: async ({ repositoryPath, phase, timeoutMs }) => {
         expect(phase).toBe("result_correction");
+        expect(timeoutMs).toBe(600_000);
         expect(() => writeFileSync(join(repositoryPath, "work.txt"), "rerun\n")).toThrow();
         return {
           status: 0, signal: null, timedOut: false, nativeSessionId: "session-2", stderr: "",
@@ -321,5 +339,130 @@ describe("kernel attempt executor", () => {
       },
     });
     expect(canonicalJson(corrected.outcome.checkpoint)).toBe(canonicalJson(checkpoint));
+  });
+
+  it("runs sealed post_bootstrap commands serially before the command within its task timeout", async () => {
+    const source = sourceRepository();
+    const root = mkdtempSync(join(tmpdir(), "ot-attempt-command-"));
+    const request = workRequest(source.subject, {
+      action: {
+        kind: "command",
+        command_id: "test",
+        command_line: "npm test",
+        post_bootstrap: ["npm ci", "npm run prepare"],
+        execution_limits: { max_turns: null, task_timeout_seconds: 120 },
+      },
+    });
+    const calls = [];
+    const result = await executeAttempt({
+      request,
+      sourceRepoDir: source.repo,
+      actionRoot: join(root, "actions"),
+      resultPath: join(root, "transport", "result.json"),
+      sessionPath: join(root, "transport", "session.json"),
+      runCommand: async (input) => {
+        calls.push(input);
+        return { status: 0, signal: null, timedOut: false, stdout: `${input.phase} ok`, stderr: "" };
+      },
+      now: () => new Date("2026-08-20T00:00:00.000Z"),
+    });
+
+    expect(calls.map(({ commandLine, phase, postBootstrapIndex }) => ({
+      commandLine, phase, postBootstrapIndex,
+    }))).toEqual([
+      { commandLine: "npm ci", phase: "post_bootstrap", postBootstrapIndex: 0 },
+      { commandLine: "npm run prepare", phase: "post_bootstrap", postBootstrapIndex: 1 },
+      { commandLine: "npm test", phase: "command", postBootstrapIndex: null },
+    ]);
+    expect(calls.every(({ timeoutMs }) => timeoutMs === 120_000)).toBe(true);
+    expect(result.outcome).toMatchObject({
+      state: "work_complete",
+      result: { kind: "command", outcome: "success", command_id: "test" },
+    });
+  });
+
+  it("rejects a correction result returned after its sealed deadline", async () => {
+    const source = sourceRepository();
+    const root = mkdtempSync(join(tmpdir(), "ot-attempt-correction-deadline-"));
+    const request = workRequest(source.subject);
+    const pending = await executeAttempt({
+      request,
+      sourceRepoDir: source.repo,
+      actionRoot: join(root, "actions"),
+      resultPath: join(root, "transport-work", "result.json"),
+      sessionPath: join(root, "transport-work", "session.json"),
+      runAgent: async ({ onSession }) => {
+        await onSession("session-deadline");
+        return {
+          status: 0, signal: null, timedOut: false, nativeSessionId: "session-deadline", stderr: "",
+          stdout: claudeOutput("session-deadline", {
+            schema: "openthrottle.result-candidate/v1",
+            outcome: "success",
+            payload: { summary: ["invalid", 7], verification: ["tests pass"] },
+          }),
+        };
+      },
+      now: () => new Date("2026-08-20T00:00:00.000Z"),
+    });
+    const checkpoint = pending.outcome.checkpoint;
+    const deadline = "2026-08-20T00:15:00.000Z";
+    const correction = {
+      schema: "openthrottle.kernel-result-correction-request/v2",
+      phase: "result_correction",
+      engine: "claude",
+      model: null,
+      reasoning_effort: null,
+      pipeline_run_id: request.pipeline_run_id,
+      attempt_id: request.attempt_id,
+      stage_id: request.stage_id,
+      scope: request.scope,
+      request_hash: request.request_hash,
+      definition_bundle_hash: request.definition_bundle_hash,
+      input_subject: request.input_subject,
+      locked_subject: checkpoint.output_subject,
+      completed_work_authority: "edit",
+      checkpoint_id: checkpoint.id,
+      native_session_id: "session-deadline",
+      lease_id: "lease-correction",
+      worker_id: "worker-1",
+      correction_deadline: deadline,
+      diagnostics: pending.outcome.diagnostics,
+      semantic_result_schema: semanticSchema,
+      execution_limits: { max_turns: 12, task_timeout_seconds: 900 },
+      repository_authority: "inspect",
+      tools: ["ot-result"],
+      mcp: false,
+      provider_access: false,
+    };
+    const times = [
+      new Date("2026-08-20T00:01:00.000Z"),
+      new Date("2026-08-20T00:01:00.000Z"),
+      new Date(deadline),
+    ];
+    const corrected = await executeAttempt({
+      request: correction,
+      sourceRepoDir: source.repo,
+      actionRoot: join(root, "actions"),
+      resultPath: join(root, "transport-correction", "result.json"),
+      sessionPath: join(root, "transport-correction", "session.json"),
+      runAgent: async ({ timeoutMs }) => {
+        expect(timeoutMs).toBe(840_000);
+        return {
+          status: 0, signal: null, timedOut: false, nativeSessionId: "session-deadline", stderr: "",
+          stdout: claudeOutput("session-deadline", {
+            schema: "openthrottle.result-candidate/v1",
+            outcome: "success",
+            payload: { summary: "too late", verification: ["tests pass"] },
+          }),
+        };
+      },
+      now: () => times.shift() ?? new Date(deadline),
+    });
+
+    expect(corrected.outcome).toMatchObject({
+      state: "needs_human",
+      reason: "result correction deadline exhausted",
+      checkpoint: { id: checkpoint.id },
+    });
   });
 });

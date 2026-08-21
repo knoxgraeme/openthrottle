@@ -251,6 +251,33 @@ describe("GithubKernelAdapter provider wait", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
+  it("bounds provider reconciliation with the shared request abort signal", async () => {
+    const fetch = vi.fn(async (_request: string | URL | Request, init?: RequestInit) => {
+      if (!(init?.signal instanceof AbortSignal)) throw new Error("missing bounded signal");
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+    }) as unknown as typeof globalThis.fetch;
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+      const controller = new AbortController();
+      queueMicrotask(() => controller.abort(new DOMException("timed out", "TimeoutError")));
+      return controller.signal;
+    });
+
+    try {
+      await expect(reconciliation(fetch, providerWait([
+        { kind: "check_run", name: "quality", app_slug: "github-actions" },
+      ]))).resolves.toMatchObject({
+        kind: "unknown",
+        detail: expect.stringMatching(/observation failed.*timed out/i),
+      });
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(timeout).toHaveBeenCalledWith(15_000);
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
   it("rejects missing or extra sealed wait payload fields before provider access", async () => {
     const fetch = endpointFetch({ checks: { check_runs: [] } });
     const missing = providerWait();

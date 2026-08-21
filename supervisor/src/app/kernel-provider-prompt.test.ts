@@ -84,7 +84,10 @@ function status(overrides: Partial<KernelStatusProjection> = {}): KernelStatusPr
   };
 }
 
-function handler(input: { projected?: KernelStatusProjection } = {}) {
+function handler(input: {
+  projected?: KernelStatusProjection;
+  authorizeGithubComment?: (input: { repository: string; username: string }) => Promise<boolean>;
+} = {}) {
   const requestRunControl = vi.fn(async () => ({ disposition: "consumed" as const }));
   const enqueueSteering = vi.fn(async () => ({
     accepted: true as const,
@@ -104,6 +107,9 @@ function handler(input: { projected?: KernelStatusProjection } = {}) {
       projections: {
         getStatus: () => input.projected ?? status(),
         listLog: () => ({ entries: [], next_cursor: null, truncated: false }),
+      },
+      github_authorization: {
+        authorizeComment: input.authorizeGithubComment ?? (async () => true),
       },
       control: { requestRunControl, enqueueSteering },
     }),
@@ -150,20 +156,83 @@ describe("KernelProviderPromptHandler", () => {
   });
 
   it("routes GitHub issue comments to the same steering primitive", async () => {
-    const test = handler();
+    const authorizeGithubComment = vi.fn(async () => true);
+    const test = handler({ authorizeGithubComment });
     await expect(test.value.handle(event({
       source_provider: "github",
       kind: "github/issue-comment/created@1",
       payload: {
         repository: { full_name: "Owner/Repo" },
         issue: { number: 188 },
-        comment: { id: 991, body: "Please rerun the focused test." },
+        comment: {
+          id: 991,
+          body: "Please rerun the focused test.",
+          user: { login: "maintainer" },
+        },
       },
     }))).resolves.toBe("consumed");
+    expect(authorizeGithubComment).toHaveBeenCalledWith({
+      repository: "Owner/Repo",
+      username: "maintainer",
+    });
     expect(test.enqueueSteering).toHaveBeenCalledWith(expect.objectContaining({
       message_id: "991",
       source_provider: "github",
       body: "Please rerun the focused test.",
     }));
+  });
+
+  it.each([
+    ["steering", "Please rerun the focused test."],
+    ["stop", "/stop"],
+  ])("ignores an outsider GitHub comment instead of accepting %s", async (_kind, body) => {
+    const test = handler({ authorizeGithubComment: async () => false });
+
+    await expect(test.value.handle(event({
+      source_provider: "github",
+      kind: "github/issue-comment/created@1",
+      payload: {
+        repository: { full_name: "Owner/Repo" },
+        issue: { number: 188 },
+        comment: { id: 991, body, user: { login: "outsider" } },
+      },
+    }))).resolves.toBe("stale");
+    expect(test.requestRunControl).not.toHaveBeenCalled();
+    expect(test.enqueueSteering).not.toHaveBeenCalled();
+  });
+
+  it("keeps GitHub comments retryable when collaborator permission lookup fails", async () => {
+    const test = handler({
+      authorizeGithubComment: async () => {
+        throw new Error("GitHub permission lookup unavailable");
+      },
+    });
+
+    await expect(test.value.handle(event({
+      source_provider: "github",
+      kind: "github/issue-comment/created@1",
+      payload: {
+        repository: { full_name: "Owner/Repo" },
+        issue: { number: 188 },
+        comment: { id: 991, body: "/stop", user: { login: "maintainer" } },
+      },
+    }))).rejects.toThrow("GitHub permission lookup unavailable");
+    expect(test.requestRunControl).not.toHaveBeenCalled();
+  });
+
+  it("treats a GitHub comment without a trusted actor identity as stale", async () => {
+    const authorizeGithubComment = vi.fn(async () => true);
+    const test = handler({ authorizeGithubComment });
+
+    await expect(test.value.handle(event({
+      source_provider: "github",
+      kind: "github/issue-comment/created@1",
+      payload: {
+        repository: { full_name: "Owner/Repo" },
+        issue: { number: 188 },
+        comment: { id: 991, body: "/stop" },
+      },
+    }))).resolves.toBe("stale");
+    expect(authorizeGithubComment).not.toHaveBeenCalled();
   });
 });

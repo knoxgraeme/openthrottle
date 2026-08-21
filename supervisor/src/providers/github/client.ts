@@ -62,6 +62,14 @@ export interface RepositoryReadiness {
   webhookAction: "created" | "updated";
 }
 
+export type GithubRepositoryPermission =
+  | "none"
+  | "read"
+  | "triage"
+  | "write"
+  | "maintain"
+  | "admin";
+
 async function githubRequest<T>(
   client: GithubClient,
   path: string,
@@ -72,6 +80,40 @@ async function githubRequest<T>(
   const body = await response.text();
   if (!body) return undefined as T;
   return JSON.parse(body) as T;
+}
+
+export function isAuthorizedGithubControlPermission(
+  permission: GithubRepositoryPermission,
+): boolean {
+  return ["triage", "write", "maintain", "admin"].includes(permission);
+}
+
+export async function getRepositoryCollaboratorPermission(
+  client: GithubClient,
+  repo: string,
+  username: string,
+): Promise<GithubRepositoryPermission> {
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(username)) {
+    throw new Error("GitHub collaborator permission lookup requires a safe username");
+  }
+  const permission = await githubRequest<{
+    permission?: string;
+    role_name?: string;
+  }>(
+    client,
+    `/repos/${repo}/collaborators/${encodeURIComponent(username)}/permission`,
+  );
+  const role = String(permission.role_name ?? "").toLowerCase();
+  if (role === "admin") return "admin";
+  if (role === "maintain") return "maintain";
+  if (role === "write" || role === "push") return "write";
+  if (role === "triage") return "triage";
+  if (role === "read" || role === "pull") return "read";
+  const basePermission = String(permission.permission ?? "none").toLowerCase();
+  if (basePermission === "admin") return "admin";
+  if (basePermission === "write" || basePermission === "push") return "write";
+  if (basePermission === "read" || basePermission === "pull") return "read";
+  return "none";
 }
 
 function githubWebhookConfiguration(input: {

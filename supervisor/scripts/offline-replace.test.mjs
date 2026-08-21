@@ -47,12 +47,28 @@ function fixture(mode) {
   const hookLog = join(root, "hook.log");
   const hookPath = join(root, "hook.mjs");
   writeFileSync(hookPath, `#!${process.execPath}
+import { spawn } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const [mode, oldReleaseId, oldRuntimeCapabilityDigest, databasePath, blobRoot, archiveRoot, logPath] = process.argv.slice(2);
 const operation = process.env.OT_OFFLINE_REPLACEMENT_OPERATION;
 appendFileSync(logPath, \`${"${operation}"}\\n\`);
+const hungChildPidPath = join(archiveRoot, "..", "hung-child.pid");
+const hungHookPidPath = join(archiveRoot, "..", "hung-hook.pid");
+const escapedChildPath = join(archiveRoot, "..", "hung-child-escaped");
+function hangWithDescendant({ leaderIgnoresTerm = true, inheritOutput = true } = {}) {
+  const child = spawn(process.execPath, ["-e", \`
+    const { writeFileSync } = require("node:fs");
+    process.on("SIGTERM", () => {});
+    setTimeout(() => writeFileSync(${"${JSON.stringify(escapedChildPath)}"}, "escaped"), 1500);
+    setInterval(() => {}, 1000);
+  \`], { stdio: inheritOutput ? ["ignore", "inherit", "inherit"] : "ignore" });
+  appendFileSync(hungChildPidPath, String(child.pid));
+  appendFileSync(hungHookPidPath, String(process.pid));
+  if (leaderIgnoresTerm) process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
+}
 
 if (mode === "environment-check") {
   if (process.env.OT_TEST_ALLOWED !== "explicitly inherited") {
@@ -68,10 +84,15 @@ if (mode === "mutate-after-preflight" && operation === "verify_preconditions") {
   appendFileSync(process.argv[1], "\\n// modified by precondition hook\\n");
 }
 
-if (mode === "fail-start" && operation === "start_candidate") {
+if ((mode === "fail-start" || mode === "hang-restore") && operation === "start_candidate") {
   process.stderr.write("candidate refused to start\\n");
   process.exit(23);
 }
+if (mode === "hang-ordinary" && operation === "smoke_ordinary") hangWithDescendant();
+if (mode === "hang-ordinary-leader-exits" && operation === "smoke_ordinary") {
+  hangWithDescendant({ leaderIgnoresTerm: false, inheritOutput: false });
+}
+if (mode === "hang-restore" && operation === "restore_old") hangWithDescendant();
 if (mode === "malformed-precondition" && operation === "verify_preconditions") {
   process.stdout.write('{"evidence":"missing observed state"}\\n');
 } else if (operation === "verify_preconditions") {
@@ -169,10 +190,20 @@ if (mode === "malformed-precondition" && operation === "verify_preconditions") {
   };
   const manifestPath = join(root, "manifest.json");
   writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
-  return { hookLog, hookPath: realpathSync(hookPath), manifest, manifestPath, replacement, root };
+  return {
+    escapedChildPath: join(root, "hung-child-escaped"),
+    hookLog,
+    hookPath: realpathSync(hookPath),
+    hungChildPidPath: join(root, "hung-child.pid"),
+    hungHookPidPath: join(root, "hung-hook.pid"),
+    manifest,
+    manifestPath,
+    replacement,
+    root,
+  };
 }
 
-function runCli(manifestPath, environment = {}) {
+function runCli(manifestPath, environment = {}, timeout = 20_000) {
   if (!existsSync(builtReplacementPath)) {
     throw new Error("offline replacement process test requires `npm run build --prefix supervisor`");
   }
@@ -180,8 +211,30 @@ function runCli(manifestPath, environment = {}) {
     cwd: supervisorRoot,
     encoding: "utf8",
     env: { ...process.env, ...environment },
-    timeout: 20_000,
+    timeout,
   });
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+function cleanupTimedOutHarness(value, result) {
+  if (result.error?.code !== "ETIMEDOUT") return;
+  for (const path of [value.hungChildPidPath, value.hungHookPidPath]) {
+    if (!existsSync(path)) continue;
+    try {
+      process.kill(Number(readFileSync(path, "utf8")), "SIGKILL");
+    } catch (error) {
+      if (error?.code !== "ESRCH") throw error;
+    }
+  }
 }
 
 function writeManifest(manifestPath, manifest) {
@@ -275,6 +328,80 @@ describe("offline-replace process boundary", () => {
         },
       ],
     });
+  });
+
+  it("times out a hung smoke process group and rolls back once", async () => {
+    const value = fixture("hang-ordinary");
+    const result = runCli(value.manifestPath, {
+      OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS: "1000",
+    }, 5_000);
+    cleanupTimedOutHarness(value, result);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("smoke_ordinary exceeded executor-owned timeout of 1000ms");
+    expect(readFileSync(value.hookLog, "utf8").trim().split("\n")).toEqual([
+      "verify_preconditions",
+      "start_candidate",
+      "smoke_ordinary",
+      "stop_candidate",
+      "restore_old",
+    ]);
+    expect(JSON.parse(readFileSync(value.replacement.report_path, "utf8"))).toMatchObject({
+      status: "rolled_back",
+    });
+    const descendantPid = Number(readFileSync(value.hungChildPidPath, "utf8"));
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(processExists(descendantPid)).toBe(false);
+    expect(existsSync(value.escapedChildPath)).toBe(false);
+  });
+
+  it("finishes SIGKILL and group quiescence when the hook leader exits on SIGTERM", async () => {
+    const value = fixture("hang-ordinary-leader-exits");
+    const result = runCli(value.manifestPath, {
+      OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS: "1000",
+    }, 5_000);
+    cleanupTimedOutHarness(value, result);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("smoke_ordinary exceeded executor-owned timeout of 1000ms");
+    expect(readFileSync(value.hookLog, "utf8").trim().split("\n")).toEqual([
+      "verify_preconditions",
+      "start_candidate",
+      "smoke_ordinary",
+      "stop_candidate",
+      "restore_old",
+    ]);
+    expect(JSON.parse(readFileSync(value.replacement.report_path, "utf8"))).toMatchObject({
+      status: "rolled_back",
+    });
+    const descendantPid = Number(readFileSync(value.hungChildPidPath, "utf8"));
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(processExists(descendantPid)).toBe(false);
+    expect(existsSync(value.escapedChildPath)).toBe(false);
+  });
+
+  it("bounds a hung restore process group and reports rollback failure once", async () => {
+    const value = fixture("hang-restore");
+    const result = runCli(value.manifestPath, {
+      OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS: "1000",
+    }, 5_000);
+    cleanupTimedOutHarness(value, result);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("restore_old exceeded executor-owned timeout of 1000ms");
+    expect(readFileSync(value.hookLog, "utf8").trim().split("\n")).toEqual([
+      "verify_preconditions",
+      "start_candidate",
+      "stop_candidate",
+      "restore_old",
+    ]);
+    expect(JSON.parse(readFileSync(value.replacement.report_path, "utf8"))).toMatchObject({
+      status: "rollback_failed",
+    });
+    const descendantPid = Number(readFileSync(value.hungChildPidPath, "utf8"));
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(processExists(descendantPid)).toBe(false);
+    expect(existsSync(value.escapedChildPath)).toBe(false);
   });
 
   it("rejects manifests that omit either runtime capability digest before invoking hooks", () => {
@@ -435,6 +562,21 @@ describe("offline-replace process boundary", () => {
     });
   });
 
+  it("rejects an invalid executor-owned hook timeout before invoking hooks", () => {
+    for (const timeout of ["99", "86400001", "not-a-timeout"]) {
+      const value = fixture("success");
+      const result = runCli(value.manifestPath, {
+        OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS: timeout,
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        "OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS must be an integer between 100 and 86400000",
+      );
+      expect(existsSync(value.hookLog)).toBe(false);
+    }
+  });
+
   it("rejects invalid, duplicate, and executor-owned environment allowlist names", () => {
     const cases = [
       { names: ["BAD-NAME"], error: "is not a valid environment name" },
@@ -446,6 +588,10 @@ describe("offline-replace process boundary", () => {
       {
         names: ["OT_OFFLINE_REPLACEMENT_REASON"],
         error: "may not claim executor-owned OT_OFFLINE_REPLACEMENT_REASON",
+      },
+      {
+        names: ["OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS"],
+        error: "may not claim executor-owned OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS",
       },
     ];
     for (const testCase of cases) {

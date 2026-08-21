@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { KernelInboxDeliveryPort, KernelInboxEvent } from "../persistence/kernel-inbox-store.js";
-import type { KernelAttemptLeasePort } from "../pipeline/kernel/ports.js";
+import type { KernelAttemptLeasePort, LeasedAttemptView } from "../pipeline/kernel/ports.js";
 import type { OrdinaryKernelCoordinator, OrdinaryKernelStep } from "../pipeline/kernel/ordinary-coordinator.js";
 import type { KernelExternalBoundaryCoordinator } from "./kernel-external-boundary.js";
 import type { KernelEffectExecutionService } from "./kernel-effects.js";
@@ -71,6 +71,18 @@ export class KernelWorker {
     return true;
   }
 
+  async #executeLeasedAttempt(leased: LeasedAttemptView): Promise<boolean> {
+    try {
+      return await this.#executeAttempt(this.#ordinary.executeLeasedAttempt(leased));
+    } catch (error) {
+      try {
+        return await this.#ordinary.terminalizeExhaustedRecovery(leased, error) !== null;
+      } catch {
+        return false;
+      }
+    }
+  }
+
   /** Performs a bounded fair pass. Every durable queue gets progress opportunity. */
   async runCycle(signal?: AbortSignal): Promise<number> {
     if (signal?.aborted) return 0;
@@ -83,19 +95,54 @@ export class KernelWorker {
     });
     for (const leased of recovered) {
       if (signal?.aborted) return progressed;
-      if (await this.#executeAttempt(this.#ordinary.executeLeasedAttempt(leased))) progressed += 1;
+      if (await this.#executeLeasedAttempt(leased)) progressed += 1;
+    }
+
+    for (let index = 0; index < this.#cycleLimit && !signal?.aborted; index += 1) {
+      let result: OrdinaryKernelStep;
+      try {
+        result = await this.#ordinary.resumeReadyAttempt();
+      } catch {
+        break;
+      }
+      if (result.disposition === "idle") break;
+      if (result.disposition === "external_boundary") {
+        throw new Error("ordinary restart continuation crossed into an external boundary");
+      }
+      progressed += 1;
     }
 
     for (let index = 0; index < this.#cycleLimit && !signal?.aborted; index += 1) {
       const inboxFence = this.#fence("inbox");
-      const event = this.#inbox.leaseNext({
-        owner_id: this.#workerId,
-        lease_id: inboxFence.lease_id,
-        expires_at: inboxFence.expires_at,
-      });
-      if (!event) break;
+      let event: KernelInboxEvent | null;
       try {
-        const outcome = await this.#inboxHandler.handle(event);
+        event = this.#inbox.leaseNext({
+          owner_id: this.#workerId,
+          lease_id: inboxFence.lease_id,
+          expires_at: inboxFence.expires_at,
+        });
+      } catch {
+        break;
+      }
+      if (!event) break;
+      let outcome: "consumed" | "stale" | "dead";
+      try {
+        outcome = await this.#inboxHandler.handle(event);
+      } catch {
+        try {
+          this.#inbox.retry({
+            event_id: event.id,
+            owner_id: this.#workerId,
+            lease_id: inboxFence.lease_id,
+            available_at: this.#inboxRetryAt(event.version),
+          });
+        } catch {
+          // The expired processing lease remains recoverable; one bad queue must not starve others.
+        }
+        progressed += 1;
+        continue;
+      }
+      try {
         this.#inbox.complete({
           event_id: event.id,
           owner_id: this.#workerId,
@@ -103,25 +150,25 @@ export class KernelWorker {
           outcome,
         });
       } catch {
-        this.#inbox.retry({
-          event_id: event.id,
-          owner_id: this.#workerId,
-          lease_id: inboxFence.lease_id,
-          available_at: this.#inboxRetryAt(event.version),
-        });
+        // Handler success and completion bookkeeping have distinct retry contracts.
       }
       progressed += 1;
     }
 
     for (let index = 0; index < this.#cycleLimit && !signal?.aborted; index += 1) {
       const attemptFence = this.#fence("attempt");
-      const didWork = await this.#executeAttempt(this.#ordinary.leaseAndExecuteNext({
-        worker_id: this.#workerId,
-        lease_id: attemptFence.lease_id,
-        expires_at: attemptFence.expires_at,
-      }));
-      if (!didWork) break;
-      progressed += 1;
+      let leased: Awaited<ReturnType<KernelAttemptLeasePort["leaseNextEligibleAttempt"]>>;
+      try {
+        leased = await this.#attempts.leaseNextEligibleAttempt({
+          worker_id: this.#workerId,
+          lease_id: attemptFence.lease_id,
+          expires_at: attemptFence.expires_at,
+        });
+      } catch {
+        break;
+      }
+      if (!leased) break;
+      if (await this.#executeLeasedAttempt(leased)) progressed += 1;
     }
 
     for (let index = 0; index < this.#cycleLimit && !signal?.aborted; index += 1) {

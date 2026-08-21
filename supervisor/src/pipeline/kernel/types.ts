@@ -195,6 +195,8 @@ export interface WorkCompleteCommand extends KernelCommandBase {
   attempt_id: string;
   checkpoint_id: string;
   verified_output_subject: string | null;
+  /** Verified runtime evidence persisted in the same transition as successful work. */
+  result_record_id: string | null;
 }
 
 export interface ResultPendingCommand extends KernelCommandBase {
@@ -250,6 +252,23 @@ export interface RetryAttemptCommand extends KernelCommandBase {
   attempt_id: string;
 }
 
+/**
+ * Executor-owned last resort for a repeatedly unrecoverable leased Attempt.
+ * Unlike an authored terminal transition, this command deliberately does not
+ * claim that runtime cleanup completed: unresolved Effect and DeliveryRecord
+ * evidence remains durable for operator recovery.
+ */
+export interface QuarantineAttemptRecoveryCommand extends KernelCommandBase {
+  type: "quarantine_attempt_recovery";
+  attempt_id: string;
+  decision_record_id: string;
+  reason: string;
+  lease_id: string;
+  lease_generation: number;
+  worker_id: string;
+  lease_purpose: AttemptLeasePurpose;
+}
+
 interface TerminalCommandBase extends KernelCommandBase {
   decision_record_id: string;
   reason: string;
@@ -296,6 +315,7 @@ export type KernelCommand =
   | RecordResultCommand
   | SettleAttemptCommand
   | RetryAttemptCommand
+  | QuarantineAttemptRecoveryCommand
   | NeedsHumanCommand
   | FailCommand
   | StopCommand

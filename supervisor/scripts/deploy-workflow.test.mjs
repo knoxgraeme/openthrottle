@@ -6,6 +6,7 @@ import YAML from "yaml";
 
 const repoRoot = join(fileURLToPath(new URL("../..", import.meta.url)));
 const workflowPath = join(repoRoot, ".github/workflows/deploy.yml");
+const supervisorDockerfilePath = join(repoRoot, "supervisor/Dockerfile");
 
 function source() {
   return readFileSync(workflowPath, "utf8");
@@ -42,6 +43,12 @@ describe("clean-epoch deploy workflow", () => {
       "verify-migration-rollback-markers.mjs",
       "deployment_cutovers",
     ]) expect(source()).not.toContain(retired);
+  });
+
+  it("packages the authenticated offline replacement entrypoint in the supervisor image", () => {
+    expect(readFileSync(supervisorDockerfilePath, "utf8")).toContain(
+      "COPY supervisor/scripts/offline-replace.mjs ./scripts/offline-replace.mjs",
+    );
   });
 
   it("does not claim an online process can prove that every old writer is stopped", () => {

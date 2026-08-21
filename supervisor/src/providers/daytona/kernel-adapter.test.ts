@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import {
   KERNEL_ACTION_REQUEST_SCHEMA,
@@ -47,6 +48,8 @@ function workRequest(overrides: Record<string, unknown> = {}): KernelWorkActionR
       kind: "command",
       command_id: "command-1",
       command_line: "true",
+      post_bootstrap: [],
+      execution_limits: { max_turns: null, task_timeout_seconds: 60 },
     },
     executor_policy: {
       git_administration: "executor_only",
@@ -59,22 +62,61 @@ function workRequest(overrides: Record<string, unknown> = {}): KernelWorkActionR
 }
 
 function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
+  const files = new Map<string, Buffer>();
+  const defaultExecuteCommand = async (command: string) => {
+    const lockInitialization = /touch -- '([^']*lease-generation\.lock)'/.exec(command);
+    if (lockInitialization) {
+      if (!files.has(lockInitialization[1]!)) files.set(lockInitialization[1]!, Buffer.alloc(0));
+      return { exitCode: 0, result: "" };
+    }
+    if (command.startsWith("flock --exclusive ")) {
+      const stagedPath = [...files.keys()].find((path) =>
+        path.endsWith(".part") && path.includes("lease-generation-") && command.includes(`'${path}'`),
+      );
+      if (!stagedPath) return { exitCode: 41, result: "" };
+      const finalPath = stagedPath.replace(/lease-generation-[^/]+\.part$/, "lease-generation.json");
+      const staged = files.get(stagedPath)!;
+      const stagedGeneration = JSON.parse(staged.toString("utf8")).lease_generation;
+      const current = files.get(finalPath);
+      const currentGeneration = current ? JSON.parse(current.toString("utf8")).lease_generation : -1;
+      if (currentGeneration > stagedGeneration) return { exitCode: 42, result: "" };
+      if (currentGeneration < stagedGeneration) {
+        files.set(finalPath, Buffer.from(staged));
+        files.delete(stagedPath);
+      }
+      return { exitCode: 0, result: "" };
+    }
+    return { exitCode: 0, result: "" };
+  };
   return {
     id: "sandbox-1",
     state: "started",
     autoStopInterval: 60,
     fs: {
-      downloadFile: vi.fn(downloadFile),
+      downloadFile: vi.fn(async (path: string) => {
+        const value = files.get(path);
+        if (value) return Buffer.from(value);
+        if (path.startsWith("/var/lib/openthrottle/action-fences/")) {
+          throw new Error("404 not found");
+        }
+        return downloadFile(path);
+      }),
       createFolder: vi.fn().mockResolvedValue(undefined),
       setFilePermissions: vi.fn().mockResolvedValue(undefined),
-      uploadFile: vi.fn().mockResolvedValue(undefined),
+      uploadFile: vi.fn(async (bytes: Buffer, path: string) => {
+        files.set(path, Buffer.from(bytes));
+      }),
     },
     process: {
       createSession: vi.fn().mockResolvedValue(undefined),
       executeSessionCommand: vi.fn().mockResolvedValue(undefined),
-      executeCommand: vi.fn().mockResolvedValue({ exitCode: 0, result: "" }),
+      executeCommand: vi.fn(defaultExecuteCommand),
+      deleteSession: vi.fn().mockResolvedValue(undefined),
+      getSession: vi.fn().mockRejectedValue(new Error("404 not found")),
     },
     updateEnv: vi.fn().mockResolvedValue(undefined),
+    files,
+    defaultExecuteCommand,
   };
 }
 
@@ -82,6 +124,7 @@ function adapterFor(
   sandbox: ReturnType<typeof sandboxWith>,
   blobStore: object = {},
   attemptInputs: object = {},
+  optionOverrides: object = {},
 ) {
   return new DaytonaKernelAdapter({
     get: vi.fn().mockResolvedValue(sandbox),
@@ -100,6 +143,7 @@ function adapterFor(
     attempt_inputs: attemptInputs,
     materialize_model_credentials: vi.fn().mockResolvedValue({}),
     poll_interval_ms: 1,
+    ...optionOverrides,
   } as never);
 }
 
@@ -135,6 +179,42 @@ function sessionEvent(request: KernelWorkActionRequest): Buffer {
 }
 
 describe("DaytonaKernelAdapter", () => {
+  it("emits a POSIX-valid exact lease-generation refresh command", async () => {
+    const request = workRequest();
+    const resultPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/result.json";
+    let resultReads = 0;
+    const sandbox = sandboxWith(async (path) => {
+      if (path === resultPath && ++resultReads > 1) return runtimeResult(request);
+      throw new Error("404 not found");
+    });
+    sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (!command.startsWith("flock --exclusive ")) return sandbox.defaultExecuteCommand(command);
+      const parsed = spawnSync("/bin/sh", ["-c", [
+        "flock() {",
+        "  shift 2",
+        "  test \"$1\" = sh && test \"$2\" = -c || exit 99",
+        "  /bin/sh -n -c \"$3\"",
+        "}",
+        command,
+      ].join("\n")], { encoding: "utf8" });
+      expect(parsed.status, parsed.stderr).toBe(0);
+      return sandbox.defaultExecuteCommand(command);
+    });
+
+    await expect(adapterFor(sandbox).executeWork(request, {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    })).resolves.toMatchObject({ state: "work_failed" });
+    expect(sandbox.updateEnv).toHaveBeenCalledWith(expect.objectContaining({
+      OT_LEASE_GENERATION_FENCE_FILE:
+        "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.json",
+      OT_LEASE_GENERATION_LOCK_FILE:
+        "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.lock",
+    }), expect.any(Object));
+  });
+
   it("polls the independent session and result files together and binds before acceptance", async () => {
     const request = workRequest({
       action: {
@@ -147,6 +227,7 @@ describe("DaytonaKernelAdapter", () => {
         entry_skill: null,
         eval_id: "eval-1",
         semantic_result_schema: { id: "result-schema", schema: {} },
+        execution_limits: { max_turns: null, task_timeout_seconds: 60 },
         definition_entries: [],
       },
     });
@@ -162,6 +243,7 @@ describe("DaytonaKernelAdapter", () => {
     const onSession = vi.fn().mockResolvedValue(undefined);
     const onHeartbeat = vi.fn().mockResolvedValue(undefined);
     const execution = adapterFor(sandbox).executeWork(request, {
+      lease_generation: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: onHeartbeat,
       on_session: onSession,
@@ -169,7 +251,8 @@ describe("DaytonaKernelAdapter", () => {
 
     await new Promise<void>((resolve) => setImmediate(resolve));
     const downloadsBeforeEitherCompleted = sandbox.fs.downloadFile.mock.calls
-      .map(([path]) => path);
+      .map(([path]) => path)
+      .filter((path) => path === sessionPath || path === resultPath);
     session.resolve(sessionEvent(request));
     result.resolve(runtimeResult(request));
 
@@ -214,15 +297,19 @@ describe("DaytonaKernelAdapter", () => {
       if (path.endsWith("/request.json")) throw stop;
       throw new Error(`unexpected download ${path}`);
     });
-    sandbox.process.executeCommand.mockImplementation(async (command: string) => ({
-      exitCode: 0,
-      result: command.startsWith("git bundle list-heads")
-        ? `${request.input_subject} refs/openthrottle/checkpoints/${digest}\n`
-        : "",
-    }));
+    sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (command.includes("lease-generation.lock")) return sandbox.defaultExecuteCommand(command);
+      return {
+        exitCode: 0,
+        result: command.startsWith("git bundle list-heads")
+          ? `${request.input_subject} refs/openthrottle/checkpoints/${digest}\n`
+          : "",
+      };
+    });
     const blobStore = { read: vi.fn().mockReturnValue(bytes) };
 
     await expect(adapterFor(sandbox, blobStore).executeWork(request, {
+      lease_generation: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -243,11 +330,13 @@ describe("DaytonaKernelAdapter", () => {
     const lost = new Error("attempt lease heartbeat lost its exact worker fence");
 
     await expect(adapterFor(sandbox).executeWork(request, {
+      lease_generation: 0,
       heartbeat_interval_ms: 1,
       on_heartbeat: vi.fn().mockRejectedValue(lost),
       on_session: vi.fn(),
     })).rejects.toBe(lost);
-    expect(sandbox.fs.downloadFile).not.toHaveBeenCalled();
+    expect(sandbox.fs.downloadFile.mock.calls.some(([path]) =>
+      path.endsWith("/session.json") || path.endsWith("/result.json"))).toBe(false);
   });
 
   it("publishes one exact idempotent steering envelope through a staged agent-owned file", async () => {
@@ -360,5 +449,143 @@ describe("DaytonaKernelAdapter", () => {
       stagedPath,
       { owner: "agent", group: "agent", mode: "600" },
     );
+  });
+
+  it("atomically advances the private lease-generation fence on recovery and rejects stale refreshes", async () => {
+    const first = workRequest();
+    const recovered = workRequest({ lease_id: "lease-2" });
+    const sandbox = sandboxWith(async (path) => {
+      if (path.endsWith("/work-lease-1/result.json")) return runtimeResult(first);
+      if (path.endsWith("/work-lease-2/result.json")) return runtimeResult(recovered);
+      throw new Error("404 not found");
+    });
+    const adapter = adapterFor(sandbox);
+    const callbacks = (lease_generation: number) => ({
+      lease_generation,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    });
+
+    await expect(adapter.executeWork(first, callbacks(0))).resolves.toMatchObject({ state: "work_failed" });
+    await expect(adapter.executeWork(recovered, callbacks(1))).resolves.toMatchObject({ state: "work_failed" });
+    const fencePath = "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.json";
+    expect(JSON.parse(sandbox.files.get(fencePath)!.toString("utf8"))).toEqual({
+      schema: "openthrottle.kernel-lease-generation-fence/v1",
+      attempt_id: "attempt-1",
+      lease_generation: 1,
+    });
+    await expect(adapter.executeWork(first, callbacks(0))).rejects.toThrow(/newer lease-generation fence/);
+  });
+
+  it("does not publish a crashed generation's staged fence when the same lease recovers", async () => {
+    const request = workRequest();
+    const resultPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/result.json";
+    const sandbox = sandboxWith(async (path) => {
+      if (path === resultPath) return runtimeResult(request);
+      throw new Error("404 not found");
+    });
+    let crashBeforeFirstPublish = true;
+    sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (command.startsWith("flock --exclusive ") && crashBeforeFirstPublish) {
+        crashBeforeFirstPublish = false;
+        throw new Error("simulated process loss after staged upload");
+      }
+      return sandbox.defaultExecuteCommand(command);
+    });
+    const adapter = adapterFor(sandbox);
+    const callbacks = (lease_generation: number) => ({
+      lease_generation,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    });
+
+    await expect(adapter.executeWork(request, callbacks(0)))
+      .rejects.toThrow("simulated process loss after staged upload");
+    const staleStage = "/var/lib/openthrottle/action-fences/attempt-1/lease-generation-lease-1-0.part";
+    expect(JSON.parse(sandbox.files.get(staleStage)!.toString("utf8"))).toMatchObject({
+      lease_generation: 0,
+    });
+
+    await expect(adapter.executeWork(request, callbacks(1))).resolves.toMatchObject({ state: "work_failed" });
+    const fencePath = "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.json";
+    expect(JSON.parse(sandbox.files.get(fencePath)!.toString("utf8"))).toEqual({
+      schema: "openthrottle.kernel-lease-generation-fence/v1",
+      attempt_id: "attempt-1",
+      lease_generation: 1,
+    });
+    expect(sandbox.files.get(staleStage)).toBeDefined();
+  });
+
+  it("final-collects and verifies Daytona session termination before allowing a deadline retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const request = workRequest({
+        action: {
+          kind: "command",
+          command_id: "command-1",
+          command_line: "true",
+          post_bootstrap: [],
+          execution_limits: { max_turns: null, task_timeout_seconds: 1 },
+        },
+      });
+      const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+      const adapter = adapterFor(sandbox, {}, {}, { task_timeout_seconds: 60 });
+      const execution = adapter.executeWork(request, {
+        lease_generation: 0,
+        heartbeat_interval_ms: 10_000,
+        on_heartbeat: vi.fn().mockResolvedValue(undefined),
+        on_session: vi.fn(),
+      });
+      await vi.advanceTimersByTimeAsync(1_100);
+
+      await expect(execution).resolves.toMatchObject({
+        state: "work_failed",
+        retryable: true,
+        reason: expect.stringMatching(/termination was verified/),
+      });
+      expect(sandbox.process.deleteSession).toHaveBeenCalledWith("kernel-attempt-1");
+      expect(sandbox.process.getSession).toHaveBeenCalledWith("kernel-attempt-1");
+      expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
+        "kernel-attempt-1",
+        expect.any(Object),
+        1,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails closed when Daytona cannot prove the timed-out session is absent", async () => {
+    vi.useFakeTimers();
+    try {
+      const request = workRequest({
+        action: {
+          kind: "command",
+          command_id: "command-1",
+          command_line: "true",
+          post_bootstrap: [],
+          execution_limits: { max_turns: null, task_timeout_seconds: 1 },
+        },
+      });
+      const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+      sandbox.process.getSession.mockResolvedValue({ sessionId: "kernel-attempt-1", commands: [] });
+      const execution = adapterFor(sandbox).executeWork(request, {
+        lease_generation: 0,
+        heartbeat_interval_ms: 10_000,
+        on_heartbeat: vi.fn().mockResolvedValue(undefined),
+        on_session: vi.fn(),
+      });
+      await vi.advanceTimersByTimeAsync(1_100);
+
+      await expect(execution).resolves.toEqual({
+        state: "work_failed",
+        retryable: false,
+        reason: "Daytona action deadline expired and session termination could not be verified",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

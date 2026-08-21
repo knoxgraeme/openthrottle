@@ -4,6 +4,8 @@ import type Database from "better-sqlite3";
 export const FRESH_EPOCH_VERSION = 1;
 export const FRESH_EPOCH_APPLICATION_ID = 0x4f545632; // "OTV2"
 export const FRESH_EPOCH_MIGRATION_NAME = "fresh execution kernel";
+export const KERNEL_INGRESS_MAINTENANCE_SETTING =
+  "epoch.maintenance_ingress_closed" as const;
 
 export const FRESH_EPOCH_TABLES = [
   "schema_migrations",
@@ -240,7 +242,7 @@ CREATE TABLE attempts (
   CHECK ((pending_diagnostics_json IS NULL) = (status <> 'result_pending')),
   CHECK (result_correction_deadline IS NULL OR native_session_id IS NOT NULL),
   CHECK (status <> 'result_pending' OR result_correction_deadline IS NOT NULL),
-  CHECK (result_record_id IS NULL OR status IN ('recorded', 'settled')),
+  CHECK (result_record_id IS NULL OR status IN ('work_complete', 'recorded', 'settled')),
   CHECK ((decision_record_id IS NOT NULL) = (status = 'settled')),
   FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id) ON DELETE RESTRICT,
   FOREIGN KEY (parent_attempt_id, pipeline_run_id) REFERENCES attempts(id, pipeline_run_id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,

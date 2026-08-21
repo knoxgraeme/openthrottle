@@ -243,6 +243,26 @@ describe("filesystem config contract", () => {
     })).toThrow(/model: is required for OpenCode/);
   });
 
+  it("accepts max_turns only when the pinned engine can enforce it natively", () => {
+    expect(validateFilesystemConfigContract({
+      schema: FILESYSTEM_CONFIG_SCHEMA,
+      pipeline: "structured",
+      engine: "claude",
+      limits: { max_turns: 40, task_timeout: 900 },
+    }).value.limits).toEqual({ max_turns: 40, task_timeout: 900 });
+    for (const config of [
+      { engine: "codex" },
+      { engine: "opencode", model: "kimi-code/kimi-for-coding" },
+    ] as const) {
+      expect(() => validateFilesystemConfigContract({
+        schema: FILESYSTEM_CONFIG_SCHEMA,
+        pipeline: "structured",
+        ...config,
+        limits: { max_turns: 40 },
+      })).toThrow(/limits\.max_turns: is not enforceable/);
+    }
+  });
+
   it("normalizes a bounded exact GitHub provider-evidence policy", () => {
     expect(validateFilesystemConfigContract({
       schema: FILESYSTEM_CONFIG_SCHEMA,

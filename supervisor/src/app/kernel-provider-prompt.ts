@@ -26,6 +26,13 @@ export interface KernelProviderPromptControlPort {
   }): Promise<KernelIngressResponse>;
 }
 
+export interface KernelProviderPromptGithubAuthorizationPort {
+  authorizeComment(input: {
+    repository: string;
+    username: string;
+  }): Promise<boolean>;
+}
+
 export type KernelProviderPromptDisposition = "consumed" | "stale" | "dead";
 
 interface ProviderPrompt {
@@ -33,6 +40,7 @@ interface ProviderPrompt {
   message_id: string;
   body: string;
   stop: boolean;
+  github_authorization: { repository: string; username: string } | null;
 }
 
 function object(value: JsonValue | undefined): Record<string, JsonValue> | null {
@@ -73,7 +81,13 @@ function linearPrompt(event: KernelInboxEvent): ProviderPrompt | null {
     ? content.body
     : typeof activity?.body === "string" ? activity.body : "";
   const stop = signal(activity?.signal) === "stop";
-  return { reference: identifier, message_id: messageId, body: rawBody, stop };
+  return {
+    reference: identifier,
+    message_id: messageId,
+    body: rawBody,
+    stop,
+    github_authorization: null,
+  };
 }
 
 function githubPrompt(event: KernelInboxEvent): ProviderPrompt | null {
@@ -86,6 +100,8 @@ function githubPrompt(event: KernelInboxEvent): ProviderPrompt | null {
   const number = issue?.number;
   const messageId = comment?.id;
   const rawBody = comment?.body;
+  const user = nested(comment, "user");
+  const username = user?.login;
   if (
     typeof repo !== "string" || !Number.isSafeInteger(number) || (number as number) < 1 ||
     (typeof messageId !== "string" && !Number.isSafeInteger(messageId)) ||
@@ -97,6 +113,9 @@ function githubPrompt(event: KernelInboxEvent): ProviderPrompt | null {
     message_id: String(messageId),
     body: rawBody,
     stop: /^(?:\/)?stop$/i.test(body),
+    github_authorization: typeof username === "string"
+      ? { repository: repo, username }
+      : null,
   };
 }
 
@@ -111,15 +130,18 @@ export class KernelProviderPromptHandler {
   readonly #runs: KernelRunReferencePort;
   readonly #projections: KernelProjectionPort;
   readonly #control: KernelProviderPromptControlPort;
+  readonly #githubAuthorization: KernelProviderPromptGithubAuthorizationPort;
 
   constructor(input: {
     runs: KernelRunReferencePort;
     projections: KernelProjectionPort;
     control: KernelProviderPromptControlPort;
+    github_authorization: KernelProviderPromptGithubAuthorizationPort;
   }) {
     this.#runs = input.runs;
     this.#projections = input.projections;
     this.#control = input.control;
+    this.#githubAuthorization = input.github_authorization;
   }
 
   /** Null means this is not a provider follow-up and admission should inspect it. */
@@ -135,6 +157,12 @@ export class KernelProviderPromptHandler {
 
     const run = this.#runs.resolveRun(prompt.reference);
     if (!run) return null;
+    if (event.source_provider === "github") {
+      if (!prompt.github_authorization) return "stale";
+      if (!await this.#githubAuthorization.authorizeComment(prompt.github_authorization)) {
+        return "stale";
+      }
+    }
     const status = this.#projections.getStatus(run.pipeline_run_id, 200);
     if (!status) return "stale";
     if (status.status !== "pending" && status.status !== "running") return "stale";

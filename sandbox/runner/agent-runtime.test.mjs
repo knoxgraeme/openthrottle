@@ -6,6 +6,16 @@ import { canonicalJson, digest } from "./kernel-json.mjs";
 import { prepareAgentRuntime, prepareResultCorrectionRuntime } from "./agent-runtime.mjs";
 
 const directories = [];
+const LEASE_GENERATION_FENCE = "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.json";
+const LEASE_GENERATION_LOCK = "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.lock";
+
+function runtimeEnv() {
+  return {
+    PATH: process.env.PATH,
+    OT_LEASE_GENERATION_FENCE_FILE: LEASE_GENERATION_FENCE,
+    OT_LEASE_GENERATION_LOCK_FILE: LEASE_GENERATION_LOCK,
+  };
+}
 
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
@@ -22,6 +32,7 @@ function correctionRequest(engine) {
     definition_bundle_hash: "b".repeat(64),
     lease_id: "correction-lease-1",
     native_session_id: "native-1",
+    execution_limits: { max_turns: engine === "claude" ? 7 : null, task_timeout_seconds: 900 },
   };
 }
 
@@ -72,6 +83,7 @@ function inspectRequest(engine, actionDirectory, artifactPath) {
         normalized_payload: instructions,
         content_hash: digest(canonicalJson(instructions)),
       }],
+      execution_limits: { max_turns: engine === "claude" ? 11 : null, task_timeout_seconds: 900 },
     },
   };
 }
@@ -90,7 +102,7 @@ describe("result correction runtime", () => {
         profileRoot,
         home: join(actionDirectory, "home"),
         cwd: join(actionDirectory, "repository"),
-        env: { PATH: process.env.PATH },
+        env: runtimeEnv(),
       });
 
       expect(prepared.childEnv).toMatchObject({
@@ -100,6 +112,8 @@ describe("result correction runtime", () => {
         OT_DEFINITION_BUNDLE_HASH: "b".repeat(64),
         OT_LEASE_ID: "correction-lease-1",
         OT_SESSION_FENCE_FILE: join(actionDirectory, "session-fence.json"),
+        OT_LEASE_GENERATION_FENCE_FILE: LEASE_GENERATION_FENCE,
+        OT_LEASE_GENERATION_LOCK_FILE: LEASE_GENERATION_LOCK,
       });
       expect(prepared.hookPath).toBe(join(
         profileRoot,
@@ -120,7 +134,7 @@ describe("result correction runtime", () => {
       profileRoot: join(actionDirectory, ".claude"),
       home: join(actionDirectory, "home"),
       cwd: join(actionDirectory, "repository"),
-      env: { PATH: process.env.PATH },
+      env: runtimeEnv(),
     });
 
     expect(prepared.args).toEqual(expect.arrayContaining([
@@ -129,6 +143,32 @@ describe("result correction runtime", () => {
       "--allowedTools", "Bash(ot-result:*)",
       "--disallowedTools", "Read,Edit,Write,Grep,Glob,WebFetch,WebSearch,Task,mcp__*",
       "--strict-mcp-config",
+      "--max-turns", "7",
+    ]));
+  });
+
+  it("keeps Codex correction result-only while retaining its output schema", () => {
+    const actionDirectory = mkdtempSync(join(tmpdir(), "ot-correction-codex-authority-"));
+    directories.push(actionDirectory);
+    const prepared = prepareResultCorrectionRuntime({
+      request: correctionRequest("codex"),
+      actionDirectory,
+      channel: channel(actionDirectory),
+      profileRoot: join(actionDirectory, ".codex"),
+      home: join(actionDirectory, "home"),
+      cwd: join(actionDirectory, "repository"),
+      env: runtimeEnv(),
+    });
+
+    expect(prepared.args).toEqual(expect.arrayContaining([
+      "--output-schema", join(actionDirectory, "provider-schema.json"),
+      "--disable", "shell_tool",
+      "--disable", "unified_exec",
+      "--disable", "shell_snapshot",
+      "--disable", "apps",
+      "--disable", "browser_use",
+      "--disable", "in_app_browser",
+      "--disable", "multi_agent",
     ]));
   });
 });
@@ -148,7 +188,7 @@ describe("inspect change context runtime", () => {
         request: inspectRequest(engine, actionDirectory, artifactPath),
         actionDirectory,
         channel: channel(actionDirectory),
-        env: { PATH: process.env.PATH },
+        env: runtimeEnv(),
       });
       expect(prepared.prompt).toContain(`Read the bounded, read-only change artifact at ${artifactPath}.`);
       expect(prepared.prompt).toContain("do not expand repository, tool, network, provider, or MCP authority");
@@ -160,6 +200,7 @@ describe("inspect change context runtime", () => {
 
     const claude = preparedByEngine.get("claude");
     expect(claude.prepared.args.join("\n")).toContain(`Read(//${claude.artifactPath.slice(1)})`);
+    expect(claude.prepared.args).toEqual(expect.arrayContaining(["--max-turns", "11"]));
     expect(preparedByEngine.get("codex").prepared.args).toEqual(expect.arrayContaining([
       "--sandbox", "read-only", "--ignore-user-config",
     ]));

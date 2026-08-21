@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { VolumeBlobStore } from "./blob-store.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { BlobAvailabilityError, VolumeBlobStore } from "./blob-store.js";
 import {
   KERNEL_INBOX_MAX_PAYLOAD_BYTES,
   SqliteKernelInboxStore,
@@ -71,12 +71,16 @@ describe("SqliteKernelInboxStore", () => {
       lease_id: "lease-1",
       expires_at: "2026-08-20T12:05:00.000Z",
     })).toEqual(leased);
-    expect(store.complete({
+    store.complete({
       event_id: leased!.id,
       owner_id: "worker-1",
       lease_id: "lease-1",
       outcome: "consumed",
-    })).toMatchObject({ status: "consumed", consumed_at: KERNEL_FIXTURE_NOW });
+    });
+    expect(store.get(leased!.id)).toMatchObject({
+      status: "consumed",
+      consumed_at: KERNEL_FIXTURE_NOW,
+    });
     expect(store.leaseNext({
       owner_id: "worker-2",
       lease_id: "lease-2",
@@ -86,9 +90,13 @@ describe("SqliteKernelInboxStore", () => {
 
   it("closes ingress atomically and returns retryable non-acknowledgement", () => {
     const { fixture, store } = setup();
-    expect(store.getMaintenanceFence()).toEqual({ closed: false, version: 0, updated_at: null });
-    const closed = store.setMaintenanceFence({ closed: true, expected_version: 0 });
-    expect(closed).toEqual({ closed: true, version: 1, updated_at: KERNEL_FIXTURE_NOW });
+    expect(store.getMaintenanceFence()).toEqual({
+      closed: false,
+      version: 1,
+      updated_at: KERNEL_FIXTURE_NOW,
+    });
+    const closed = store.setMaintenanceFence({ closed: true, expected_version: 1 });
+    expect(closed).toEqual({ closed: true, version: 2, updated_at: KERNEL_FIXTURE_NOW });
     expect(store.ingest(event("during-maintenance"))).toEqual({
       disposition: "maintenance_closed",
       retryable: true,
@@ -96,9 +104,9 @@ describe("SqliteKernelInboxStore", () => {
     });
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM inbox_events").get())
       .toEqual({ count: 0 });
-    expect(() => store.setMaintenanceFence({ closed: false, expected_version: 0 }))
+    expect(() => store.setMaintenanceFence({ closed: false, expected_version: 1 }))
       .toThrow(/compare-and-set/);
-    store.setMaintenanceFence({ closed: false, expected_version: 1 });
+    store.setMaintenanceFence({ closed: false, expected_version: 2 });
     expect(store.ingest(event("during-maintenance"))).toMatchObject({ disposition: "inserted" });
   });
 
@@ -116,12 +124,13 @@ describe("SqliteKernelInboxStore", () => {
     });
     expect(leased).toMatchObject({ id: ingested.event.id, status: "processing", version: 1 });
 
-    expect(store.retry({
+    store.retry({
       event_id: leased!.id,
       owner_id: "worker-1",
       lease_id: "lease-retry",
       available_at: "2026-08-20T12:00:01.000Z",
-    })).toMatchObject({
+    });
+    expect(store.get(leased!.id)).toMatchObject({
       status: "pending",
       available_at: "2026-08-20T12:00:01.000Z",
       lease_id: null,
@@ -165,6 +174,119 @@ describe("SqliteKernelInboxStore", () => {
     expect(row.blob_bytes).toBeGreaterThan(64 * 1024);
     expect(store.get(result.disposition === "inserted" ? result.event.id : "missing")?.payload)
       .toEqual(payload);
+  });
+
+  it("dead-letters an unreadable head and leases the next valid event", () => {
+    const { fixture, store } = setup();
+    const poison = store.ingest({
+      ...event("poison"),
+      event_group_key: "poison-event",
+      payload: { evidence: "x".repeat(70_000) },
+    });
+    const valid = store.ingest({
+      ...event("valid"),
+      event_group_key: "valid-event",
+    });
+    if (poison.disposition !== "inserted" || valid.disposition !== "inserted") {
+      throw new Error("fixture events were not inserted");
+    }
+    fixture.db.prepare(`
+      UPDATE inbox_events SET available_at = '2026-08-20T11:59:59.000Z', blob_algorithm = NULL
+      WHERE id = ?
+    `).run(poison.event.id);
+
+    expect(store.leaseNext({
+      owner_id: "worker-1",
+      lease_id: "lease-valid",
+      expires_at: "2026-08-20T12:05:00.000Z",
+    })).toMatchObject({ id: valid.event.id, status: "processing" });
+    expect(fixture.db.prepare("SELECT status, consumed_at FROM inbox_events WHERE id = ?")
+      .get(poison.event.id)).toEqual({ status: "dead", consumed_at: KERNEL_FIXTURE_NOW });
+  });
+
+  it("dead-letters a complete but contract-invalid blob pointer before leasing the next event", () => {
+    const { fixture, store } = setup();
+    const poison = store.ingest({
+      ...event("invalid-pointer"),
+      event_group_key: "invalid-pointer-event",
+      payload: { evidence: "x".repeat(70_000) },
+    });
+    const valid = store.ingest({
+      ...event("valid-after-invalid-pointer"),
+      event_group_key: "valid-after-invalid-pointer-event",
+    });
+    if (poison.disposition !== "inserted" || valid.disposition !== "inserted") {
+      throw new Error("fixture events were not inserted");
+    }
+    fixture.db.prepare(`
+      UPDATE inbox_events
+      SET available_at = '2026-08-20T11:59:59.000Z', blob_media_type = 'invalid'
+      WHERE id = ?
+    `).run(poison.event.id);
+
+    expect(store.leaseNext({
+      owner_id: "worker-1",
+      lease_id: "lease-valid-after-invalid-pointer",
+      expires_at: "2026-08-20T12:05:00.000Z",
+    })).toMatchObject({ id: valid.event.id, status: "processing" });
+    expect(fixture.db.prepare("SELECT status, consumed_at FROM inbox_events WHERE id = ?")
+      .get(poison.event.id)).toEqual({ status: "dead", consumed_at: KERNEL_FIXTURE_NOW });
+  });
+
+  it("rolls back a transient blob read failure and leases the same event after recovery", () => {
+    const { fixture, store } = setup();
+    const result = store.ingest({
+      ...event("transient-read"),
+      event_group_key: "transient-read-event",
+      payload: { evidence: "x".repeat(70_000) },
+    });
+    if (result.disposition !== "inserted") throw new Error("fixture event was not inserted");
+    const pointer = fixture.db.prepare(`
+      SELECT blob_digest FROM inbox_events WHERE id = ?
+    `).get(result.event.id) as { blob_digest: string };
+    vi.spyOn(fixture.blobs, "read").mockImplementationOnce(() => {
+      throw new BlobAvailabilityError(pointer.blob_digest, "EIO");
+    });
+
+    expect(() => store.leaseNext({
+      owner_id: "worker-1",
+      lease_id: "lease-transient",
+      expires_at: "2026-08-20T12:05:00.000Z",
+    })).toThrow(BlobAvailabilityError);
+    expect(fixture.db.prepare("SELECT status, lease_id, version FROM inbox_events WHERE id = ?")
+      .get(result.event.id)).toEqual({ status: "pending", lease_id: null, version: 0 });
+
+    expect(store.leaseNext({
+      owner_id: "worker-2",
+      lease_id: "lease-recovered",
+      expires_at: "2026-08-20T12:05:00.000Z",
+    })).toMatchObject({ id: result.event.id, status: "processing", payload: result.event.payload });
+  });
+
+  it("completes bookkeeping without re-reading a payload that was already handled", () => {
+    const { fixture, store } = setup();
+    const result = store.ingest({
+      ...event("handled-large"),
+      event_group_key: "handled-large-event",
+      payload: { evidence: "x".repeat(70_000) },
+    });
+    if (result.disposition !== "inserted") throw new Error("fixture event was not inserted");
+    const leased = store.leaseNext({
+      owner_id: "worker-1",
+      lease_id: "lease-handled",
+      expires_at: "2026-08-20T12:05:00.000Z",
+    })!;
+    fixture.db.prepare("UPDATE inbox_events SET blob_algorithm = NULL WHERE id = ?")
+      .run(leased.id);
+
+    expect(() => store.complete({
+      event_id: leased.id,
+      owner_id: "worker-1",
+      lease_id: "lease-handled",
+      outcome: "consumed",
+    })).not.toThrow();
+    expect(fixture.db.prepare("SELECT status, consumed_at FROM inbox_events WHERE id = ?")
+      .get(leased.id)).toEqual({ status: "consumed", consumed_at: KERNEL_FIXTURE_NOW });
   });
 
   it("never commits a blob pointer when durable publication fails", () => {

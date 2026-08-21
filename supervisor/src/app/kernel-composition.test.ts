@@ -13,11 +13,14 @@ import {
   authenticateKernelRuntimeCapabilities,
 } from "./kernel-composition.js";
 
-function runtimeSource(maxConcurrentAttempts: unknown = 1): Record<string, unknown> {
+function runtimeSource(
+  maxConcurrentAttempts: unknown = 1,
+  protocol = "attempt-executor@2",
+): Record<string, unknown> {
   return {
     schema: "openthrottle.runtime-capability-source/v1",
     release: "openthrottle-execution-kernel/v1",
-    protocol: "attempt-executor@1",
+    protocol,
     engines: ["claude", "codex", "opencode"],
     repository_authorities: ["edit", "inspect"],
     stage_kinds: ["agent", "command", "effect", "wait"],
@@ -147,5 +150,29 @@ describe("kernel release execution policy", () => {
       manifest_runtime_capability_digest: "f".repeat(64),
     })).rejects.toThrow(/runtime capability digest.*release execution policy/);
     expect(downstream.assertCompatible).toHaveBeenCalledOnce();
+  });
+
+  it("rejects the previous attempt-executor capability identity", async () => {
+    const source = runtimeSource();
+    const authenticated = authenticateKernelRuntimeCapabilities({
+      source,
+      compiler_environment: compilerEnvironment(source),
+    });
+    const compatibility = new PolicyEnforcedKernelRuntimeCompatibility({
+      execution_policy: authenticated.execution_policy,
+      downstream: { assertCompatible: vi.fn() },
+    });
+    const legacySource = runtimeSource(1, "attempt-executor@1");
+    const legacyEnvironment = compilerEnvironment(legacySource);
+
+    await expect(compatibility.assertCompatible({
+      manifest_runtime_capability_digest:
+        legacyEnvironment.descriptor.runtime_capability_digest,
+      stages: [{ id: "implement", kind: "agent" }] as never,
+      definition_entries: [{
+        definition_kind: "pipeline",
+        definition_id: "core/implement",
+      }] as never,
+    })).rejects.toThrow(/runtime capability digest.*release execution policy/);
   });
 });

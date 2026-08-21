@@ -53,6 +53,7 @@ LABEL org.opencontainers.image.source="https://github.com/knoxgraeme/openthrottl
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY supervisor/scripts/offline-replace.mjs ./scripts/offline-replace.mjs
 COPY .openthrottle ./.openthrottle
 COPY --from=contracts /contracts/generated ./contracts/generated
 COPY contracts/runtime-capabilities.json ./contracts/runtime-capabilities.json

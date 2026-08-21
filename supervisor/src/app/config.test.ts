@@ -8,6 +8,7 @@ const configKeys = [
   "DAYTONA_API_KEY", "DAYTONA_SNAPSHOT", "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_AUTH_JSON",
   "KIMI_CODE_API_KEY", "TASK_TIMEOUT", "WEBHOOK_MAX_AGE_SECONDS", "OT_BLOB_STORE_PATH",
   "OT_BLOB_STORE_ID", "OT_EPOCH_RELEASE_ID", "OT_RELEASE_ROOT",
+  "OT_EPOCH_BOOTSTRAP_CHECKSUM",
   "OT_GENERATED_DEFINITION_ROOT", "OT_KERNEL_WORKER_ID", "OT_KERNEL_WORKER_INTERVAL_MS",
   "OT_KERNEL_LEASE_SECONDS", "OT_KERNEL_CYCLE_LIMIT",
   // Retired variables are cleared so they cannot influence a clean-epoch test.
@@ -35,6 +36,7 @@ function setRequiredEnv(): void {
     CLAUDE_CODE_OAUTH_TOKEN: "claude",
     CODEX_AUTH_JSON: "{}",
     KIMI_CODE_API_KEY: "kimi",
+    OT_EPOCH_BOOTSTRAP_CHECKSUM: "b".repeat(64),
   });
 }
 
@@ -54,6 +56,7 @@ describe("loadConfig", () => {
       kernelWorkerIntervalMs: 1_000,
       kernelLeaseSeconds: 120,
       kernelCycleLimit: 16,
+      epochBootstrapChecksum: "b".repeat(64),
     });
     for (const retired of [
       "installSecret", "linearClientId", "linearClientSecret", "defaultAgent",
@@ -102,7 +105,18 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow("OT_BLOB_STORE_ID has an invalid format");
 
     process.env.OT_BLOB_STORE_ID = "kernel-v1";
+    process.env.OT_EPOCH_BOOTSTRAP_CHECKSUM = "B".repeat(64);
+    expect(() => loadConfig()).toThrow("OT_EPOCH_BOOTSTRAP_CHECKSUM must be a lowercase SHA-256 digest");
+
+    process.env.OT_EPOCH_BOOTSTRAP_CHECKSUM = "b".repeat(64);
     process.env.SUPERVISOR_URL = "relative/path";
     expect(() => loadConfig()).toThrow("SUPERVISOR_URL must be an absolute HTTP(S) URL");
+  });
+
+  it("requires the exact offline-bootstrap checksum", () => {
+    setRequiredEnv();
+    delete process.env.OT_EPOCH_BOOTSTRAP_CHECKSUM;
+
+    expect(() => loadConfig()).toThrow("Missing required env var: OT_EPOCH_BOOTSTRAP_CHECKSUM");
   });
 });

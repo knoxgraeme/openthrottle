@@ -88,7 +88,7 @@ const definitionEntries = [
 
 function actionRequest({ name, inputSubject, requestHash }) {
   return {
-    schema: "openthrottle.kernel-action-request/v1",
+    schema: "openthrottle.kernel-action-request/v2",
     phase: "work",
     pipeline_run_id: "structured-proof",
     attempt_id: `attempt-${name}`,

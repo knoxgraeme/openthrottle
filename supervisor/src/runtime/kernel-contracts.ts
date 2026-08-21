@@ -11,9 +11,9 @@ import type {
 import type { KernelAttempt } from "../pipeline/kernel/types.js";
 import type { KernelRuntimeResourceIdentity } from "../pipeline/kernel/runtime-resource.js";
 
-export const KERNEL_ACTION_REQUEST_SCHEMA = "openthrottle.kernel-action-request/v1" as const;
+export const KERNEL_ACTION_REQUEST_SCHEMA = "openthrottle.kernel-action-request/v2" as const;
 export const KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA =
-  "openthrottle.kernel-result-correction-request/v1" as const;
+  "openthrottle.kernel-result-correction-request/v2" as const;
 export const STAGED_SEMANTIC_CANDIDATE_SCHEMA =
   "openthrottle.staged-result-candidate/v1" as const;
 
@@ -28,6 +28,13 @@ export interface KernelChangeBoundary {
   output_subject: string;
 }
 
+export interface KernelExecutionLimits {
+  /** Repository-authored wall-clock limit. The provider may enforce a tighter platform cap. */
+  task_timeout_seconds: number | null;
+  /** Native agent-turn cap; null means the selected engine has no repository-authored cap. */
+  max_turns: number | null;
+}
+
 export interface KernelAgentAction {
   kind: "agent";
   engine: Extract<CompiledPipelineStage, { kind: "agent" }>["engine"];
@@ -38,6 +45,7 @@ export interface KernelAgentAction {
   entry_skill: string | null;
   eval_id: string;
   semantic_result_schema: SemanticResultSchemaContract;
+  execution_limits: KernelExecutionLimits;
   /**
    * Exact entries from the pinned DefinitionBundle. The sandbox passes these
    * to compileActionProfile/materializeActionProfile; it must never reread the
@@ -50,6 +58,9 @@ export interface KernelCommandAction {
   kind: "command";
   command_id: string;
   command_line: string;
+  /** Exact normalized repository bootstrap commands, executed serially before the command. */
+  post_bootstrap: readonly string[];
+  execution_limits: KernelExecutionLimits;
 }
 
 export type KernelExecutableAction = KernelAgentAction | KernelCommandAction;
@@ -104,6 +115,7 @@ export interface KernelResultCorrectionRequest {
   correction_deadline: string;
   diagnostics: readonly { path: string; detail: string }[];
   semantic_result_schema: SemanticResultSchemaContract;
+  execution_limits: KernelExecutionLimits;
   /** Correction is result-only even when the completed work attempt was edit. */
   repository_authority: "inspect";
   tools: readonly ["ot-result"];
@@ -160,6 +172,8 @@ export type KernelRuntimeOutcome =
   };
 
 export interface KernelRuntimeLeaseCallbacks {
+  /** Private live lease fence; this is deliberately absent from the public action request wire. */
+  lease_generation: number;
   /**
    * The adapter throttles renewal to this interval while provider work is
    * outstanding. A rejected renewal is an exact-fence loss and must abort

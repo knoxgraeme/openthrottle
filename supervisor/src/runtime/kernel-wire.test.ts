@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  KERNEL_ACTION_REQUEST_SCHEMA,
   KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA,
   type KernelResultCorrectionRequest,
 } from "./kernel-contracts.js";
@@ -45,6 +46,7 @@ function correctionRequest(
       outcomes: ["success"],
       payload: {},
     },
+    execution_limits: { max_turns: null, task_timeout_seconds: 900 },
     repository_authority: "inspect",
     tools: ["ot-result"],
     mcp: false,
@@ -111,6 +113,12 @@ function artifacts() {
 }
 
 describe("kernel correction checkpoint wire fencing", () => {
+  it("uses the versioned executor protocol that requires sealed limits and bootstrap commands", () => {
+    expect(KERNEL_ACTION_REQUEST_SCHEMA).toBe("openthrottle.kernel-action-request/v2");
+    expect(KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA)
+      .toBe("openthrottle.kernel-result-correction-request/v2");
+  });
+
   it("retains a null output subject for inspect work while locking the artifact commit", async () => {
     const request = correctionRequest("inspect");
 

@@ -25,6 +25,7 @@ import {
   compileKernelCursor,
   frontierMemberKey,
   reduceKernelCommand,
+  reduceKernelRecoveryQuarantine,
 } from "./reducer.js";
 import {
   transitionApplicationDisposition,
@@ -474,6 +475,75 @@ function recordedAttempt(scope: AttemptScope = stageScope()): {
 }
 
 describe("shared execution kernel lifecycle", () => {
+  it("quarantines an exhausted lease while retaining unresolved Effect evidence", () => {
+    const current = attempt({
+      status: "running",
+      version: 4,
+      lease: {
+        id: "lease-poison",
+        generation: 2,
+        worker_id: "worker-1",
+        purpose: "work",
+        expires_at: "2026-08-20T00:05:00.000Z",
+        started: true,
+      },
+    });
+    const currentRun = run(current, {
+      status: "running",
+      version: 6,
+      work_retry_limit: 2,
+      active_effect_versions: { "effect-unknown": 3 },
+    });
+    const reason = "attempt_recovery_exhausted: runtime failed; terminal_preparation_failed: context unreadable";
+    const diagnostic: DecisionRecord = {
+      schema: EXECUTION_RECORD_SCHEMA,
+      id: "decision-quarantine",
+      kind: "decision",
+      pipeline_run_id: currentRun.id,
+      reducer: "core/executor-recovery-quarantine@1",
+      input_record_ids: [],
+      payload_schema: "openthrottle.pipeline-decision-record/v1",
+      payload: { inline: {
+        schema: "openthrottle.pipeline-decision-record/v1",
+        stage_id: current.scope.stage_id,
+        evaluator: "core/executor-recovery-quarantine@1",
+        outcome: "needs_human",
+        reason,
+      } },
+      created_at: "2026-08-20T00:06:00.000Z",
+    };
+
+    const transition = reduceKernelRecoveryQuarantine({
+      run: currentRun,
+      current_attempt: current,
+      diagnostic,
+      command: {
+        type: "quarantine_attempt_recovery",
+        command_id: "quarantine-poison",
+        attempt_id: current.id,
+        decision_record_id: diagnostic.id,
+        reason,
+        lease_id: current.lease!.id,
+        lease_generation: current.lease!.generation,
+        worker_id: current.lease!.worker_id,
+        lease_purpose: current.lease!.purpose,
+      },
+    });
+
+    expect(transition.run).toMatchObject({
+      status: "needs_human",
+      terminal_outcome: "needs_human",
+      active_attempt_versions: {},
+      active_effect_versions: { "effect-unknown": 3 },
+      cursor: { stage_id: null, frontier: [], barrier: null },
+    });
+    expect(transition.cancel_effect_ids).toEqual([]);
+    expect(transition.attempt_writes).toEqual([
+      expect.objectContaining({ kind: "terminal", attempt_id: current.id, status: "needs_human" }),
+    ]);
+    expect(transition.append_records).toEqual([diagnostic]);
+  });
+
   it("preserves completed work through result_pending and same-session correction", () => {
     let current = attempt();
     let currentRun = run(current);
@@ -515,6 +585,7 @@ describe("shared execution kernel lifecycle", () => {
         attempt_id: current.id,
         checkpoint_id: completedCheckpoint.id,
         verified_output_subject: subject("2"),
+        result_record_id: null,
       },
       checkpoints: [completedCheckpoint],
     });
@@ -645,6 +716,7 @@ describe("shared execution kernel lifecycle", () => {
       apply({
         type: "work_complete", command_id: "complete", attempt_id: current.id,
         checkpoint_id: completedCheckpoint.id, verified_output_subject: subject("2"),
+        result_record_id: null,
       }, { checkpoints: [completedCheckpoint] });
       const result = resultRecord(current);
       apply(
@@ -698,6 +770,7 @@ describe("shared execution kernel lifecycle", () => {
           command: {
             type: "work_complete", command_id: "bad-complete", attempt_id: "attempt-1",
             checkpoint_id: "checkpoint-1", verified_output_subject: subject("2"),
+            result_record_id: null,
           },
           checkpoints: [checkpoint(attempt(), subject("2"))],
         }),
@@ -838,6 +911,7 @@ describe("shared execution kernel lifecycle", () => {
         attempt_id: unbound.id,
         checkpoint_id: firstBindingCheckpoint.id,
         verified_output_subject: subject("2"),
+        result_record_id: null,
       },
       checkpoints: [firstBindingCheckpoint],
     })).toThrow(/bind its native session before checkpointing/);
@@ -851,6 +925,7 @@ describe("shared execution kernel lifecycle", () => {
         attempt_id: bound.id,
         checkpoint_id: "checkpoint-1",
         verified_output_subject: subject("2"),
+        result_record_id: null,
       },
       checkpoints: [{
         ...checkpoint(bound, subject("2")),
@@ -883,6 +958,7 @@ describe("shared execution kernel lifecycle", () => {
         attempt_id: commandAttempt.id,
         checkpoint_id: invalidCommandCheckpoint.id,
         verified_output_subject: null,
+        result_record_id: null,
       },
       checkpoints: [invalidCommandCheckpoint],
     })).toThrow(/command checkpoints cannot bind/);
@@ -901,6 +977,7 @@ describe("shared execution kernel lifecycle", () => {
         attempt_id: commandAttempt.id,
         checkpoint_id: validCommandCheckpoint.id,
         verified_output_subject: null,
+        result_record_id: null,
       },
       checkpoints: [validCommandCheckpoint],
     }), commandAttempt.id).native_session_id).toBeNull();
@@ -917,6 +994,7 @@ describe("shared execution kernel lifecycle", () => {
       command: {
         type: "work_complete", command_id: "edit-null", attempt_id: edit.id,
         checkpoint_id: "checkpoint-1", verified_output_subject: null,
+        result_record_id: null,
       },
       checkpoints: [checkpoint(edit, null)],
     })).toThrow(/matching verified output subject/);
@@ -933,6 +1011,7 @@ describe("shared execution kernel lifecycle", () => {
       command: {
         type: "work_complete", command_id: "inspect-edit", attempt_id: inspect.id,
         checkpoint_id: "checkpoint-1", verified_output_subject: subject("2"),
+        result_record_id: null,
       },
       checkpoints: [checkpoint(inspect, subject("2"))],
     })).toThrow(/inspect completion cannot advance/);
@@ -943,6 +1022,7 @@ describe("shared execution kernel lifecycle", () => {
       command: {
         type: "work_complete", command_id: "inspect-complete", attempt_id: inspect.id,
         checkpoint_id: "checkpoint-1", verified_output_subject: null,
+        result_record_id: null,
       },
       checkpoints: [checkpoint(inspect, null)],
     });
