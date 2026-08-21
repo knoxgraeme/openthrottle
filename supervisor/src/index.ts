@@ -1,9 +1,8 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { digestCanonicalJson, type ExecutionRecordPayloadRegistry } from "@openthrottle/contracts";
 import { loadConfig } from "./app/config.js";
 import { openKernelEpoch } from "./app/kernel-bootstrap.js";
 import {
+  PolicyEnforcedKernelRuntimeCompatibility,
   VerifiedKernelDefinitionBundleResolver,
   VerifiedKernelManifestResolver,
 } from "./app/kernel-composition.js";
@@ -61,13 +60,6 @@ import type { KernelRuntimeCompatibilityPort } from "./runtime/kernel-contracts.
 const WORK_RETRY_LIMIT = 3;
 const RESULT_CORRECTION_LIMIT = 2;
 
-interface RuntimeCapabilitySource {
-  schema: "openthrottle.runtime-capability-source/v1";
-  protocol: string;
-  engines: string[];
-  executor_primitives: string[];
-}
-
 function payloadSchemas(): ExecutionRecordPayloadRegistry {
   return new Map([
     ...ordinaryKernelPayloadSchemas(),
@@ -75,15 +67,6 @@ function payloadSchemas(): ExecutionRecordPayloadRegistry {
     [KERNEL_EFFECT_DELIVERY_PAYLOAD_SCHEMA, KERNEL_EFFECT_DELIVERY_PAYLOAD_CONTRACT],
     [ADMISSION_PROMOTION_RECORD_PAYLOAD_SCHEMA, ADMISSION_PROMOTION_RECORD_PAYLOAD_CONTRACT],
   ]);
-}
-
-function runtimeCapabilitySource(releaseRoot: string): RuntimeCapabilitySource {
-  const value = JSON.parse(readFileSync(join(releaseRoot, "contracts/runtime-capabilities.json"), "utf8")) as RuntimeCapabilitySource;
-  if (
-    value.schema !== "openthrottle.runtime-capability-source/v1" ||
-    !Array.isArray(value.engines) || !Array.isArray(value.executor_primitives)
-  ) throw new Error("release runtime capability source is invalid");
-  return value;
 }
 
 async function main(): Promise<void> {
@@ -107,6 +90,7 @@ async function main(): Promise<void> {
     blob_store: epoch.blobs,
     manifest_resolver: manifestResolver,
     payload_schemas: payloadSchemas(),
+    execution_policy: release.execution_policy,
   });
   const bundles = new VerifiedKernelDefinitionBundleResolver({
     bytes: kernel,
@@ -136,13 +120,17 @@ async function main(): Promise<void> {
   });
   const github = new GithubKernelAdapter({ token: cfg.githubToken, blob_store: epoch.blobs });
   let externalPlans: KernelExternalStagePlanRegistry | null = null;
-  const runtimeCompatibility: KernelRuntimeCompatibilityPort = {
+  const providerRuntimeCompatibility: KernelRuntimeCompatibilityPort = {
     async assertCompatible(input) {
       daytona.assertCompatible(input);
       if (externalPlans === null) throw new Error("external plan registry is not initialized");
       externalPlans.assertCompatible(input.stages);
     },
   };
+  const runtimeCompatibility = new PolicyEnforcedKernelRuntimeCompatibility({
+    execution_policy: release.execution_policy,
+    downstream: providerRuntimeCompatibility,
+  });
   const admissionPromotion = new KernelAdmissionPromotionAdapter({
     source_reader: sourceReader,
     platform: release.platform,
@@ -281,17 +269,17 @@ async function main(): Promise<void> {
       };
     },
   };
-  const capabilitySource = runtimeCapabilitySource(cfg.releaseRoot);
   const app = createServer({
     cfg,
     capabilities: {
       release: cfg.epochReleaseId,
-      capability_digest: release.compiler_environment.descriptor.runtime_capability_digest,
+      capability_digest: release.execution_policy.runtime_capability_digest,
       capabilities: [
-        capabilitySource.protocol,
-        ...capabilitySource.engines.map((engine) => `engine:${engine}`),
-        ...capabilitySource.executor_primitives,
+        release.runtime_capabilities.protocol,
+        ...release.runtime_capabilities.engines.map((engine) => `engine:${engine}`),
+        ...release.runtime_capabilities.executor_primitives,
       ],
+      execution_policy: release.execution_policy,
       task_timeout_seconds: cfg.taskTimeout,
     },
     service,

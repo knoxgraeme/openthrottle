@@ -29,6 +29,7 @@ export class KernelLeaseOperations {
   readonly #advanceRunFence: (runId: string, transitionId: string, content: unknown) => KernelRun;
   readonly #insertRecord: (record: ExecutionRecord) => void;
   readonly #readEffectBlob: (runId: string, ownerId: string, pointer: BlobPointer) => Buffer;
+  readonly #maxConcurrentAttempts: number;
 
   constructor(input: {
     db: Database.Database;
@@ -37,6 +38,7 @@ export class KernelLeaseOperations {
     advance_run_fence: (runId: string, transitionId: string, content: unknown) => KernelRun;
     insert_record: (record: ExecutionRecord) => void;
     read_effect_blob: (runId: string, ownerId: string, pointer: BlobPointer) => Buffer;
+    execution_policy: { readonly max_concurrent_attempts: number };
   }) {
     this.#db = input.db;
     this.#now = input.now;
@@ -44,6 +46,12 @@ export class KernelLeaseOperations {
     this.#advanceRunFence = input.advance_run_fence;
     this.#insertRecord = input.insert_record;
     this.#readEffectBlob = input.read_effect_blob;
+    if (
+      !Object.isFrozen(input.execution_policy) ||
+      !Number.isSafeInteger(input.execution_policy.max_concurrent_attempts) ||
+      input.execution_policy.max_concurrent_attempts < 1
+    ) throw new Error("Attempt lease policy must be frozen with a positive integer limit");
+    this.#maxConcurrentAttempts = input.execution_policy.max_concurrent_attempts;
   }
 
   async leaseNextEligibleAttempt(request: AttemptLeaseRequest): Promise<LeasedAttemptView | null> {
@@ -71,6 +79,10 @@ export class KernelLeaseOperations {
           lease: attempt.lease!,
         };
       }
+      const leased = this.#db.prepare(`
+        SELECT COUNT(*) AS count FROM attempts WHERE lease_id IS NOT NULL
+      `).get() as { count: number };
+      if (leased.count >= this.#maxConcurrentAttempts) return null;
       const row = this.#db.prepare(`
         SELECT a.* FROM attempts a
         JOIN pipeline_runs r ON r.id = a.pipeline_run_id
@@ -156,6 +168,15 @@ export class KernelLeaseOperations {
       throw new Error("attempt lease recovery limit must be between 1 and 100");
     }
     return this.#db.transaction(() => {
+      const leased = this.#db.prepare(`
+        SELECT COUNT(*) AS count FROM attempts WHERE lease_id IS NOT NULL
+      `).get() as { count: number };
+      if (leased.count > this.#maxConcurrentAttempts) {
+        throw new Error(
+          `Attempt lease recovery found ${leased.count} leases above the release limit ` +
+          `${this.#maxConcurrentAttempts}`,
+        );
+      }
       const rows = this.#db.prepare(`
         SELECT * FROM attempts
         WHERE lease_id IS NOT NULL AND lease_expires_at <= ?

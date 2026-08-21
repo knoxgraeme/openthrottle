@@ -752,7 +752,7 @@ describe("KernelStructuredSettlementPlanner", () => {
     expect(settlement.next_attempts[0]!.context_record_ids).toContain(promotion.id);
   });
 
-  it("compiles the selected reviewer roster into a bounded inspect fanout", async () => {
+  it("compiles five selected reviewers into a stable serial inspect frontier", async () => {
     const store = new PlanningStore();
     const boundary: AttemptCheckpoint = {
       schema: ATTEMPT_CHECKPOINT_SCHEMA,
@@ -781,7 +781,7 @@ describe("KernelStructuredSettlementPlanner", () => {
     const completed = completedAttempt({ pending, output_subject: null, request });
     const personaStage = stage("persona_review");
     if (personaStage.kind !== "agent") throw new Error("persona review test stage is not an agent");
-    const personas = [personaStage.skills[0]!, personaStage.skills[2]!];
+    const personas = personaStage.skills.slice(0, 5);
     const selectorResult: ResultRecord = {
       ...completed.result,
       payload_schema: "openthrottle.semantic-result-record/v1",
@@ -810,6 +810,13 @@ describe("KernelStructuredSettlementPlanner", () => {
       stage_id: "persona_review",
       member_id: memberId,
     })));
+    const scopeKeys = settlement.next_attempts.map(frontierMemberKey);
+    const dependencies = settlement.next_dependencies;
+    if (!dependencies) throw new Error("persona settlement omitted serial dependencies");
+    expect(dependencies[scopeKeys[0]!]).toEqual([]);
+    for (let index = 1; index < scopeKeys.length; index += 1) {
+      expect(dependencies[scopeKeys[index]!]).toEqual([scopeKeys[index - 1]!]);
+    }
     expect(settlement.next_attempts.every((attempt) =>
       attempt.context_checkpoint_ids.includes(boundary.id))).toBe(true);
   });

@@ -11,6 +11,7 @@ import { SqliteKernelStore } from "./kernel-store.js";
 const OBSERVED = "2026-08-20T12:10:00.000Z";
 const RENEWED = "2026-08-20T12:20:00.000Z";
 const EXPIRED = "2026-08-20T12:05:00.000Z";
+const EXECUTION_POLICY = Object.freeze({ max_concurrent_attempts: 1 });
 let fixture: FreshKernelFixture | undefined;
 
 afterEach(() => {
@@ -19,102 +20,125 @@ afterEach(() => {
 });
 
 describe("expired kernel Attempt lease recovery", () => {
-  it("recovers unstarted work, started work, and correction under their original fence", async () => {
+  it.each([
+    ["unstarted", "pending", "work", false, null, 0],
+    ["started", "running", "work", true, "session-started", 0],
+    ["correction", "result_pending", "result_correction", true, "session-correction", 1],
+  ] as const)("recovers %s work under its original single lease fence", async (
+    runId,
+    status,
+    purpose,
+    started,
+    nativeSession,
+    resultCorrectionCount,
+  ) => {
     fixture = freshKernelFixture();
-    for (const [runId, status, purpose, started, nativeSession] of [
-      ["run-unstarted", "pending", "work", false, null],
-      ["run-started", "running", "work", true, "session-started"],
-      ["run-correction", "result_pending", "result_correction", true, "session-correction"],
-    ] as const) {
-      seedKernelRun({ db: fixture.db, run_id: runId });
-      seedKernelAttempt({
-        db: fixture.db,
-        run_id: runId,
-        id: `attempt-${runId}`,
-        status,
-        native_session_id: nativeSession,
-        lease: {
-          id: `lease-${runId}`,
-          worker_id: `worker-${runId}`,
-          purpose,
-          expires_at: EXPIRED,
-          started,
-        },
-      });
-    }
+    seedKernelRun({ db: fixture.db, run_id: runId });
+    seedKernelAttempt({
+      db: fixture.db,
+      run_id: runId,
+      id: `attempt-${runId}`,
+      status,
+      native_session_id: nativeSession,
+      lease: {
+        id: `lease-${runId}`,
+        worker_id: `worker-${runId}`,
+        purpose,
+        expires_at: EXPIRED,
+        started,
+      },
+    });
     const store = new SqliteKernelStore({
       db: fixture.db,
       blob_store: fixture.blobs,
       manifest_resolver: { resolve: () => { throw new Error("not used"); } },
       payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
+      execution_policy: EXECUTION_POLICY,
       now: () => OBSERVED,
     });
 
     const recovered = await store.recoverExpiredAttemptLeases({
       observed_at: OBSERVED,
       expires_at: RENEWED,
-      limit: 3,
+      limit: 1,
     });
 
-    expect(recovered).toHaveLength(3);
-    expect(recovered.map(({ attempt }) => ({
-      id: attempt.id,
-      status: attempt.status,
-      request_hash: attempt.request_hash,
-      native_session_id: attempt.native_session_id,
-      work_retry_ordinal: attempt.work_retry_ordinal,
-      result_correction_count: attempt.result_correction_count,
-      checkpoint_id: attempt.checkpoint_id,
-      lease: attempt.lease,
-    }))).toEqual([
-      expect.objectContaining({
-        id: "attempt-run-correction",
-        status: "result_pending",
-        native_session_id: "session-correction",
-        work_retry_ordinal: 0,
-        result_correction_count: 1,
-        checkpoint_id: null,
-        lease: expect.objectContaining({
-          id: "lease-run-correction",
-          worker_id: "worker-run-correction",
-          purpose: "result_correction",
-          expires_at: RENEWED,
-          started: true,
-        }),
-      }),
-      expect.objectContaining({
-        id: "attempt-run-started",
-        status: "running",
-        native_session_id: "session-started",
-        work_retry_ordinal: 0,
-        result_correction_count: 0,
-        lease: expect.objectContaining({
-          id: "lease-run-started",
-          worker_id: "worker-run-started",
-          expires_at: RENEWED,
-          started: true,
-        }),
-      }),
-      expect.objectContaining({
-        id: "attempt-run-unstarted",
-        status: "pending",
-        native_session_id: null,
-        lease: expect.objectContaining({
-          id: "lease-run-unstarted",
-          worker_id: "worker-run-unstarted",
-          expires_at: RENEWED,
-          started: false,
-        }),
-      }),
-    ]);
-    expect(new Set(recovered.map(({ attempt }) => attempt.request_hash))).toEqual(
-      new Set(["a".repeat(64)]),
-    );
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]!.attempt).toMatchObject({
+      id: `attempt-${runId}`,
+      status,
+      request_hash: "a".repeat(64),
+      native_session_id: nativeSession,
+      work_retry_ordinal: 0,
+      result_correction_count: resultCorrectionCount,
+      checkpoint_id: null,
+      lease: {
+        id: `lease-${runId}`,
+        worker_id: `worker-${runId}`,
+        purpose,
+        expires_at: RENEWED,
+        started,
+      },
+    });
     expect(await store.recoverExpiredAttemptLeases({
       observed_at: OBSERVED,
       expires_at: RENEWED,
-      limit: 3,
+      limit: 1,
     })).toEqual([]);
+  });
+
+  it("blocks a new lease until one expired lease is recovered and never creates a second", async () => {
+    fixture = freshKernelFixture();
+    seedKernelRun({ db: fixture.db, run_id: "run-expired" });
+    seedKernelAttempt({
+      db: fixture.db,
+      run_id: "run-expired",
+      id: "attempt-expired",
+      status: "pending",
+      lease: {
+        id: "lease-expired",
+        worker_id: "worker-expired",
+        purpose: "work",
+        expires_at: EXPIRED,
+        started: false,
+      },
+    });
+    seedKernelRun({ db: fixture.db, run_id: "run-waiting" });
+    seedKernelAttempt({
+      db: fixture.db,
+      run_id: "run-waiting",
+      id: "attempt-waiting",
+      status: "pending",
+    });
+    const store = new SqliteKernelStore({
+      db: fixture.db,
+      blob_store: fixture.blobs,
+      manifest_resolver: { resolve: () => { throw new Error("not used"); } },
+      payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
+      execution_policy: EXECUTION_POLICY,
+      now: () => OBSERVED,
+    });
+
+    expect(await store.leaseNextEligibleAttempt({
+      worker_id: "worker-new",
+      lease_id: "lease-new",
+      expires_at: RENEWED,
+    })).toBeNull();
+    const recovered = await store.recoverExpiredAttemptLeases({
+      observed_at: OBSERVED,
+      expires_at: RENEWED,
+      limit: 1,
+    });
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]!.lease.id).toBe("lease-expired");
+    expect(await store.leaseNextEligibleAttempt({
+      worker_id: "worker-new",
+      lease_id: "lease-new",
+      expires_at: RENEWED,
+    })).toBeNull();
+    expect(fixture.db.prepare(
+      "SELECT COUNT(*) AS count FROM attempts WHERE lease_id IS NOT NULL",
+    ).get()).toEqual({ count: 1 });
   });
 
   it("bounds recovery and refuses non-forward lease timestamps", async () => {
@@ -124,6 +148,7 @@ describe("expired kernel Attempt lease recovery", () => {
       blob_store: fixture.blobs,
       manifest_resolver: { resolve: () => { throw new Error("not used"); } },
       payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
+      execution_policy: EXECUTION_POLICY,
     });
     await expect(store.recoverExpiredAttemptLeases({
       observed_at: OBSERVED,

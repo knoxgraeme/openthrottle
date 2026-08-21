@@ -12,6 +12,166 @@ import type {
   KernelDefinitionBundleBytesPort,
   KernelDefinitionBundlePort,
 } from "../pipeline/kernel/ports.js";
+import type { KernelRuntimeCompatibilityPort } from "../runtime/kernel-contracts.js";
+
+const RUNTIME_CAPABILITY_SOURCE_SCHEMA = "openthrottle.runtime-capability-source/v1" as const;
+const authenticatedExecutionPolicies = new WeakSet<object>();
+
+export interface KernelExecutionPolicy {
+  readonly max_concurrent_attempts: 1;
+  readonly runtime_capability_digest: string;
+}
+
+export interface KernelRuntimeCapabilitySource {
+  readonly schema: typeof RUNTIME_CAPABILITY_SOURCE_SCHEMA;
+  readonly protocol: string;
+  readonly engines: readonly string[];
+  readonly executor_primitives: readonly string[];
+  readonly max_concurrent_attempts: number;
+}
+
+export interface AuthenticatedKernelRuntimeCapabilities {
+  readonly source: KernelRuntimeCapabilitySource;
+  readonly execution_policy: KernelExecutionPolicy;
+}
+
+function exactObject(value: unknown, path: string, keys: readonly string[]): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${path} must be an object`);
+  }
+  const input = value as Record<string, unknown>;
+  const actual = Object.keys(input).sort();
+  const expected = [...keys].sort();
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    throw new Error(`${path} has unknown or missing fields`);
+  }
+  return input;
+}
+
+function capabilityString(value: unknown, path: string): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 200 || value.includes("\0")) {
+    throw new Error(`${path} must be a non-empty bounded string`);
+  }
+  return value;
+}
+
+function capabilityStrings(value: unknown, path: string): readonly string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 128) {
+    throw new Error(`${path} must be a non-empty bounded string array`);
+  }
+  const entries = value.map((entry, index) => capabilityString(entry, `${path}[${index}]`));
+  for (let index = 1; index < entries.length; index += 1) {
+    if (entries[index - 1]! >= entries[index]!) {
+      throw new Error(`${path} must be strictly sorted without duplicates`);
+    }
+  }
+  return Object.freeze(entries);
+}
+
+function assertAuthenticatedExecutionPolicy(policy: KernelExecutionPolicy): void {
+  if (!policy || typeof policy !== "object" || !authenticatedExecutionPolicies.has(policy)) {
+    throw new Error("kernel execution policy is not authenticated release policy");
+  }
+}
+
+/**
+ * Authenticates the canonical runtime manifest before extracting any policy.
+ * The returned policy is the sole provider-neutral serial-execution value.
+ */
+export function authenticateKernelRuntimeCapabilities(input: {
+  source: unknown;
+  compiler_environment: TrustedCompilerEnvironment;
+}): AuthenticatedKernelRuntimeCapabilities {
+  const compilerEnvironment = input.compiler_environment.descriptor;
+  const manifestDigest = digestCanonicalJson(input.source);
+  if (
+    manifestDigest !== compilerEnvironment.runtime_capability_inputs.runtime_manifest_digest
+  ) {
+    throw new Error(
+      "release runtime manifest digest does not match the trusted compiler environment",
+    );
+  }
+  const source = exactObject(input.source, "runtime_capabilities", [
+    "schema", "release", "protocol", "engines", "repository_authorities", "stage_kinds",
+    "record_kinds", "result_candidate_schema", "checkpoint_protocol", "executor_primitives",
+    "max_concurrent_attempts",
+  ]);
+  if (source.schema !== RUNTIME_CAPABILITY_SOURCE_SCHEMA) {
+    throw new Error(`runtime_capabilities.schema must be ${RUNTIME_CAPABILITY_SOURCE_SCHEMA}`);
+  }
+  if (
+    !Number.isSafeInteger(source.max_concurrent_attempts) ||
+    (source.max_concurrent_attempts as number) < 1
+  ) {
+    throw new Error("runtime_capabilities.max_concurrent_attempts must be a positive integer");
+  }
+  if (source.max_concurrent_attempts !== 1) {
+    throw new Error(
+      "runtime_capabilities.max_concurrent_attempts must be the supported release value 1",
+    );
+  }
+  const normalized: KernelRuntimeCapabilitySource = Object.freeze({
+    schema: RUNTIME_CAPABILITY_SOURCE_SCHEMA,
+    protocol: capabilityString(source.protocol, "runtime_capabilities.protocol"),
+    engines: capabilityStrings(source.engines, "runtime_capabilities.engines"),
+    executor_primitives: capabilityStrings(
+      source.executor_primitives,
+      "runtime_capabilities.executor_primitives",
+    ),
+    max_concurrent_attempts: source.max_concurrent_attempts as number,
+  });
+  const executionPolicy: KernelExecutionPolicy = Object.freeze({
+    max_concurrent_attempts: 1,
+    runtime_capability_digest: compilerEnvironment.runtime_capability_digest,
+  });
+  authenticatedExecutionPolicies.add(executionPolicy);
+  return Object.freeze({ source: normalized, execution_policy: executionPolicy });
+}
+
+/** Release policy executes before any provider/runtime compatibility checks. */
+export class PolicyEnforcedKernelRuntimeCompatibility implements KernelRuntimeCompatibilityPort {
+  readonly #executionPolicy: KernelExecutionPolicy;
+  readonly #downstream: KernelRuntimeCompatibilityPort;
+
+  constructor(input: {
+    execution_policy: KernelExecutionPolicy;
+    downstream: KernelRuntimeCompatibilityPort;
+  }) {
+    assertAuthenticatedExecutionPolicy(input.execution_policy);
+    this.#executionPolicy = input.execution_policy;
+    this.#downstream = input.downstream;
+  }
+
+  async assertCompatible(
+    input: Parameters<KernelRuntimeCompatibilityPort["assertCompatible"]>[0],
+  ): Promise<void> {
+    if (
+      input.manifest_runtime_capability_digest !==
+      this.#executionPolicy.runtime_capability_digest
+    ) {
+      throw new Error(
+        "compiled pipeline runtime capability digest does not match the release execution policy",
+      );
+    }
+    const pipelines = input.definition_entries.filter(
+      (entry) => entry.definition_kind === "pipeline",
+    );
+    if (pipelines.length !== 1) {
+      throw new Error("compiled DefinitionBundle must contain exactly one selected pipeline");
+    }
+    const pipelineId = pipelines[0]!.definition_id;
+    for (const stage of input.stages) {
+      if (!stage.loop || stage.loop.max_parallel <= this.#executionPolicy.max_concurrent_attempts) {
+        continue;
+      }
+      throw new Error(
+        `pipeline ${pipelineId} loop ${stage.id} (${stage.loop.over}) offered width ` +
+        `${stage.loop.max_parallel}; supported limit ${this.#executionPolicy.max_concurrent_attempts}`,
+      );
+    }
+    await this.#downstream.assertCompatible(input);
+  }
+}
 
 function validatedDefinitionBundleBytes(input: {
   bytes: Uint8Array;

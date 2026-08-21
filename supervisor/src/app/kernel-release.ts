@@ -17,11 +17,18 @@ import {
   type TrustedPlatformDefinitionSource,
   type VirtualDefinitionFile,
 } from "@openthrottle/contracts";
+import {
+  authenticateKernelRuntimeCapabilities,
+  type KernelExecutionPolicy,
+  type KernelRuntimeCapabilitySource,
+} from "./kernel-composition.js";
 
 export interface KernelReleaseDefinitions {
   platform: TrustedPlatformDefinitionSource;
   compiler_environment: TrustedCompilerEnvironment;
   trusted_platform_definitions: TrustedPlatformDefinitionHashes;
+  runtime_capabilities: KernelRuntimeCapabilitySource;
+  execution_policy: KernelExecutionPolicy;
 }
 
 function regularFile(path: string, label: string): Buffer {
@@ -74,6 +81,10 @@ export function loadKernelReleaseDefinitions(input: {
     join(generatedRoot, "compiler-environment.json"),
     "compiler environment",
   );
+  const runtimeCapabilityBytes = regularFile(
+    join(releaseRoot, "contracts/runtime-capabilities.json"),
+    "runtime capability source",
+  );
   const catalog = json(catalogBytes, "platform definition catalog") as PlatformDefinitionCatalog;
   const files = new Map<string, VirtualDefinitionFile>();
   for (const entry of catalog.files ?? []) {
@@ -92,6 +103,10 @@ export function loadKernelReleaseDefinitions(input: {
     json(environmentBytes, "compiler environment") as CompilerEnvironmentDescriptor,
     RELEASE_COMPILER_ENVIRONMENT_DIGEST,
   );
+  const runtimeCapabilities = authenticateKernelRuntimeCapabilities({
+    source: json(runtimeCapabilityBytes, "runtime capability source"),
+    compiler_environment: compilerEnvironment,
+  });
   return {
     platform,
     compiler_environment: compilerEnvironment,
@@ -99,5 +114,7 @@ export function loadKernelReleaseDefinitions(input: {
       platform,
       compiler_environment: compilerEnvironment,
     }),
+    runtime_capabilities: runtimeCapabilities.source,
+    execution_policy: runtimeCapabilities.execution_policy,
   };
 }

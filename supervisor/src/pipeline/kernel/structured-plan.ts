@@ -98,7 +98,7 @@ export function selectedStructuredReviewPersonas(input: {
   if (new Set(selected).size !== selected.length) {
     throw new Error("structured persona selection contains duplicate reviewer IDs");
   }
-  const maximum = Math.min(personaField.max_items, fanout.loop.max_parallel);
+  const maximum = personaField.max_items;
   if (selected.length > maximum) {
     throw new Error(`structured persona selection exceeds its sealed bound of ${maximum}`);
   }
