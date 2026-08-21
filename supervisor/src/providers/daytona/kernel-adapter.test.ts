@@ -308,6 +308,7 @@ describe("DaytonaKernelAdapter", () => {
       attempt_status: "running",
       repository_authority: "edit",
       lease_id: "lease-1",
+      lease_generation: 0,
       lease_worker_id: "worker-1",
       lease_purpose: "work",
       lease_expires_at: "2026-08-20T12:05:00.000Z",
@@ -352,6 +353,7 @@ describe("DaytonaKernelAdapter", () => {
       native_session_id: "session-1",
       generation: 0,
       lease_id: "lease-1",
+      lease_generation: 0,
       lease_purpose: "work",
     });
     expect(sandbox.fs.setFilePermissions).toHaveBeenCalledWith(

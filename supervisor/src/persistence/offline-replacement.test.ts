@@ -15,6 +15,8 @@ import {
 } from "./offline-replacement.js";
 
 const directories: string[] = [];
+const OLD_RUNTIME_CAPABILITY = "a".repeat(64);
+const FRESH_RUNTIME_CAPABILITY = "b".repeat(64);
 
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
@@ -67,12 +69,14 @@ function fixture(): { root: string; input: OfflineReplacementInput } {
       }],
       old: {
         release_id: "release-v1",
+        runtime_capability_digest: OLD_RUNTIME_CAPABILITY,
         database_path: oldDatabase,
         blob_root: oldBlobs,
         archive_root: join(root, "archive-v1"),
       },
       fresh: {
         release_id: "release-v2",
+        runtime_capability_digest: FRESH_RUNTIME_CAPABILITY,
         database_path: join(root, "fresh.sqlite"),
         blob_root: join(root, "fresh-blobs"),
         blob_store_id: "fresh-v2",
@@ -87,6 +91,7 @@ function hooks(overrides: Partial<OfflineReplacementHooks> = {}): OfflineReplace
   return {
     observePreconditions: async (input) => ({
       old_release_id: input.old.release_id,
+      old_runtime_capability_digest: input.old.runtime_capability_digest,
       database_path: input.old.database_path,
       blob_root: input.old.blob_root,
       ingress_closed: true,
@@ -99,7 +104,32 @@ function hooks(overrides: Partial<OfflineReplacementHooks> = {}): OfflineReplace
     runSmoke: async (kind) => ({ id: `${kind}-smoke`, status: "passed", evidence: `${kind} passed` }),
     reopenIngress: async () => "fresh ingress opened",
     stopCandidate: async () => "candidate stopped",
-    restoreOld: async () => "old release/storage tuple restored",
+    restoreOld: async () => {
+      throw new Error("test must provide observed restore evidence");
+    },
+    ...overrides,
+  };
+}
+
+function restoreEvidence(input: OfflineReplacementInput, overrides: Partial<{
+  old_release_id: string;
+  old_runtime_capability_digest: string;
+  database_path: string;
+  blob_root: string;
+  archive_manifest_digest: string;
+  evidence: string;
+}> = {}) {
+  const manifest = JSON.parse(readFileSync(
+    join(input.old.archive_root, "archive-manifest.json"),
+    "utf8",
+  )) as { manifest_digest: string };
+  return {
+    old_release_id: input.old.release_id,
+    old_runtime_capability_digest: input.old.runtime_capability_digest,
+    database_path: input.old.database_path,
+    blob_root: input.old.blob_root,
+    archive_manifest_digest: manifest.manifest_digest,
+    evidence: "old release/storage tuple restored and observed",
     ...overrides,
   };
 }
@@ -139,7 +169,8 @@ describe("one-shot offline epoch replacement", () => {
     const { input } = fixture();
     await expect(runOfflineReplacement(input, hooks({
       observePreconditions: async () => ({
-        old_release_id: "different-release",
+        old_release_id: input.old.release_id,
+        old_runtime_capability_digest: "f".repeat(64),
         database_path: input.old.database_path,
         blob_root: input.old.blob_root,
         ingress_closed: true,
@@ -177,16 +208,24 @@ describe("one-shot offline epoch replacement", () => {
       schema: OFFLINE_REPLACEMENT_REPORT_SCHEMA,
       status: "completed",
       old_release_id: "release-v1",
+      old_runtime_capability_digest: OLD_RUNTIME_CAPABILITY,
       fresh_release_id: "release-v2",
+      fresh_runtime_capability_digest: FRESH_RUNTIME_CAPABILITY,
       smoke: {
         ordinary: { id: "ordinary-smoke", status: "passed" },
         structured: { id: "structured-smoke", status: "passed" },
       },
-      fresh_epoch: { release_id: "release-v2", integrity: "ok" },
+      fresh_epoch: {
+        release_id: "release-v2",
+        runtime_capability_digest: FRESH_RUNTIME_CAPABILITY,
+        integrity: "ok",
+      },
       observed_preconditions: {
         old_release_id: "release-v1",
+        old_runtime_capability_digest: OLD_RUNTIME_CAPABILITY,
         exclusive_database_lock: "acquired",
       },
+      archive: { old_runtime_capability_digest: OLD_RUNTIME_CAPABILITY },
     });
     expect(report.ready_report_digest).toMatch(/^[0-9a-f]{64}$/);
     const { report_digest: digest, ...content } = report;
@@ -205,8 +244,15 @@ describe("one-shot offline epoch replacement", () => {
     const archiveManifest = JSON.parse(readFileSync(
       join(input.old.archive_root, "archive-manifest.json"),
       "utf8",
-    )) as { old_release_id: string; blobs: Array<{ path: string }> };
-    expect(archiveManifest).toMatchObject({ old_release_id: "release-v1" });
+    )) as {
+      old_release_id: string;
+      old_runtime_capability_digest: string;
+      blobs: Array<{ path: string }>;
+    };
+    expect(archiveManifest).toMatchObject({
+      old_release_id: "release-v1",
+      old_runtime_capability_digest: OLD_RUNTIME_CAPABILITY,
+    });
     expect(archiveManifest.blobs.map(({ path }) => path)).toEqual(["evidence.bin"]);
 
     const db = new Database(input.fresh.database_path, { readonly: true });
@@ -217,6 +263,9 @@ describe("one-shot offline epoch replacement", () => {
       `).all() as Array<{ name: string }>;
       expect(tables).toHaveLength(12);
       expect(db.prepare("SELECT COUNT(*) AS count FROM pipeline_runs").get()).toEqual({ count: 0 });
+      expect(db.prepare(`
+        SELECT value_json, mutable FROM settings WHERE key = 'epoch.runtime_capability_digest'
+      `).get()).toEqual({ value_json: JSON.stringify(FRESH_RUNTIME_CAPABILITY), mutable: 0 });
     } finally {
       db.close();
     }
@@ -257,7 +306,7 @@ describe("one-shot offline epoch replacement", () => {
       },
       restoreOld: async () => {
         calls.push("restore");
-        return "old tuple restored";
+        return restoreEvidence(input);
       },
     }))).rejects.toThrow(/smoke IDs must be distinct/);
 
@@ -280,7 +329,7 @@ describe("one-shot offline epoch replacement", () => {
       },
       restoreOld: async (reason) => {
         calls.push(`restore:${reason}`);
-        return "release-v1 with old paths restored";
+        return restoreEvidence(input, { evidence: "release-v1 with old paths restored" });
       },
     }))).rejects.toThrow(/rolled back: structured smoke failed/);
 
@@ -295,8 +344,18 @@ describe("one-shot offline epoch replacement", () => {
       status: "rolled_back",
       failure: "structured smoke failed",
       rollback_evidence: [
-        "candidate_stopped:candidate stopped",
-        "old_tuple_restored:release-v1 with old paths restored",
+        { kind: "candidate_stopped", evidence: "candidate stopped" },
+        {
+          kind: "old_tuple_restored",
+          restore: {
+            old_release_id: "release-v1",
+            old_runtime_capability_digest: OLD_RUNTIME_CAPABILITY,
+            database_path: input.old.database_path,
+            blob_root: input.old.blob_root,
+            archive_manifest_digest: expect.stringMatching(/^[0-9a-f]{64}$/),
+            evidence: "release-v1 with old paths restored",
+          },
+        },
       ],
     });
   });
@@ -314,14 +373,14 @@ describe("one-shot offline epoch replacement", () => {
       },
       restoreOld: async () => {
         calls.push("restore");
-        return "must not be called";
+        return restoreEvidence(input);
       },
     }))).rejects.toThrow(/rollback failed/);
 
     expect(calls).toEqual(["stop"]);
     expect(JSON.parse(readFileSync(input.report_path, "utf8"))).toMatchObject({
       status: "rollback_failed",
-      rollback_evidence: ["candidate_stop_failed:candidate still running"],
+      rollback_evidence: [{ kind: "candidate_stop_failed", error: "candidate still running" }],
       rollback_failure: "candidate still running",
     });
   });
@@ -340,10 +399,34 @@ describe("one-shot offline epoch replacement", () => {
     expect(JSON.parse(readFileSync(input.report_path, "utf8"))).toMatchObject({
       status: "rollback_failed",
       rollback_evidence: [
-        "candidate_stopped:candidate stopped",
-        "old_tuple_restore_failed:restore command failed",
+        { kind: "candidate_stopped", evidence: "candidate stopped" },
+        { kind: "old_tuple_restore_failed", error: "restore command failed" },
       ],
       rollback_failure: "restore command failed",
+    });
+  });
+
+  it("reports rollback_failed when restore evidence does not bind the exact archive manifest", async () => {
+    const { input } = fixture();
+    await expect(runOfflineReplacement(input, hooks({
+      runSmoke: async () => {
+        throw new Error("smoke failed");
+      },
+      restoreOld: async () => restoreEvidence(input, {
+        archive_manifest_digest: "f".repeat(64),
+      }),
+    }))).rejects.toThrow(/rollback failed.*does not match the exact archived tuple/);
+
+    expect(JSON.parse(readFileSync(input.report_path, "utf8"))).toMatchObject({
+      status: "rollback_failed",
+      rollback_evidence: [
+        { kind: "candidate_stopped", evidence: "candidate stopped" },
+        {
+          kind: "old_tuple_restore_failed",
+          error: "old tuple restore evidence does not match the exact archived tuple",
+        },
+      ],
+      rollback_failure: "old tuple restore evidence does not match the exact archived tuple",
     });
   });
 
@@ -361,7 +444,7 @@ describe("one-shot offline epoch replacement", () => {
       },
       restoreOld: async () => {
         calls.push("restore");
-        return "old tuple restored";
+        return restoreEvidence(input);
       },
     }))).rejects.toThrow(/operator resolution.*reopen outcome unknown/);
 
@@ -388,7 +471,7 @@ describe("one-shot offline epoch replacement", () => {
       },
       restoreOld: async () => {
         calls.push("restore");
-        return "old tuple restored";
+        return restoreEvidence(input);
       },
     }), {
       now: () => {

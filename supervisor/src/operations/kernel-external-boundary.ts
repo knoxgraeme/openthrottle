@@ -19,16 +19,19 @@ import {
   createPipelineDecisionRecord,
   type EvaluatedKernelResult,
 } from "../pipeline/kernel/evaluator-registry.js";
-import type {
-  ExternalScheduleView,
-  KernelAttemptRequestPort,
-  KernelDefinitionBundlePort,
-  KernelExternalSchedulePort,
-  KernelExternalSettlementPlan,
-  KernelExternalSettlementPlanner,
-  KernelReductionPort,
-  LeasedAttemptView,
-  ReductionView,
+import {
+  assertAttemptLeaseClaim,
+  captureAttemptLeaseClaim,
+  type AttemptLeaseClaim,
+  type ExternalScheduleView,
+  type KernelAttemptRequestPort,
+  type KernelDefinitionBundlePort,
+  type KernelExternalSchedulePort,
+  type KernelExternalSettlementPlan,
+  type KernelExternalSettlementPlanner,
+  type KernelReductionPort,
+  type LeasedAttemptView,
+  type ReductionView,
 } from "../pipeline/kernel/ports.js";
 import { reduceKernelCommand } from "../pipeline/kernel/reducer.js";
 import {
@@ -328,26 +331,27 @@ export class KernelExternalBoundaryCoordinator {
   }
 
   async executeLeasedAttempt(leased: LeasedAttemptView): Promise<KernelExternalBoundaryStep> {
+    const claim = captureAttemptLeaseClaim(leased);
     let view = await this.#load(leased.run_id, leased.attempt.id);
     const attempt = view.current_attempt;
-    if (
-      !attempt || !attempt.lease || attempt.lease.id !== leased.lease.id ||
-      attempt.lease.worker_id !== leased.lease.worker_id
-    ) throw new Error("external Attempt lease fence does not match");
+    assertAttemptLeaseClaim(view, claim);
+    const lease = attempt?.lease;
+    if (!attempt || !lease) throw new Error("external Attempt lease fence does not match");
     this.#plans.bindingFor(stageFor(view));
-    if (!attempt.lease.started) {
+    if (!lease.started) {
       await this.#apply(view, {
         type: "start",
         command_id: transitionId("external-start", {
           attempt_id: attempt.id,
-          lease_id: attempt.lease.id,
+          lease_id: lease.id,
         }),
         attempt_id: attempt.id,
-        lease_id: attempt.lease.id,
-      });
+        lease_id: lease.id,
+      }, claim);
       view = await this.#load(view.run.id, attempt.id);
+      assertAttemptLeaseClaim(view, claim);
     }
-    return this.#advance(view);
+    return this.#advance(view, claim);
   }
 
   async resumeReadyAttempt(): Promise<KernelExternalBoundaryStep> {
@@ -363,10 +367,18 @@ export class KernelExternalBoundaryCoordinator {
     return this.#advance(await this.#load(input.pipeline_run_id, input.attempt_id));
   }
 
-  async #advance(initialView: ReductionView): Promise<KernelExternalBoundaryStep> {
+  async #advance(
+    initialView: ReductionView,
+    claim?: AttemptLeaseClaim,
+  ): Promise<KernelExternalBoundaryStep> {
     let view = initialView;
     let attempt = view.current_attempt;
     if (!attempt) throw new Error("external continuation requires its exact Attempt");
+    if (claim) {
+      assertAttemptLeaseClaim(view, claim);
+    } else if (attempt.lease !== null) {
+      throw new Error("external continuation cannot adopt a live Attempt lease");
+    }
     const stage = stageFor(view);
     const binding = this.#plans.bindingFor(stage);
     const context = await this.#store.loadAttemptRequestInputs({
@@ -384,6 +396,10 @@ export class KernelExternalBoundaryCoordinator {
       context: context.context,
       bundle,
     });
+    if (claim) {
+      view = await this.#load(view.run.id, attempt.id);
+      attempt = assertAttemptLeaseClaim(view, claim);
+    }
     if (
       binding.subject_policy === "preserve" && attempt.status !== "running" &&
       attempt.output_subject !== prepared.verified_output_subject
@@ -397,6 +413,10 @@ export class KernelExternalBoundaryCoordinator {
         attempt_id: attempt.id,
         phase: phase.id,
       });
+      if (claim) {
+        view = await this.#load(view.run.id, attempt.id);
+        attempt = assertAttemptLeaseClaim(view, claim);
+      }
       if (existing === null) {
         const priorDeliveries = phaseIndex === 0 ? [] : exactDeliveries([schedules[phaseIndex - 1]!]);
         const decision = scheduleDecision({
@@ -441,7 +461,7 @@ export class KernelExternalBoundaryCoordinator {
           phase: phase.id,
           verified_output_subject: prepared.verified_output_subject,
           effect_intents: effects,
-        });
+        }, claim);
         return {
           disposition: "scheduled",
           pipeline_run_id: view.run.id,
@@ -483,6 +503,10 @@ export class KernelExternalBoundaryCoordinator {
           prepared,
           schedules,
         });
+        if (claim) {
+          view = await this.#load(view.run.id, attempt.id);
+          attempt = assertAttemptLeaseClaim(view, claim);
+        }
         if (
           promotion.prepared.verified_output_subject === null ||
           canonicalJson(promotion.prepared.phases.slice(0, phaseIndex + 1)) !==
@@ -515,7 +539,7 @@ export class KernelExternalBoundaryCoordinator {
             checkpoint_id: promotion.checkpoint.id,
             delivery_record_id: delivery.id,
             verified_output_subject: promotion.prepared.verified_output_subject,
-          });
+          }, claim);
           view = await this.#load(view.run.id, attempt.id);
           attempt = view.current_attempt!;
         } else if (
@@ -539,6 +563,10 @@ export class KernelExternalBoundaryCoordinator {
 
     const deliveries = exactDeliveries(schedules);
     const evaluatedValue = await binding.evaluate({ run: view.run, attempt, stage, prepared, schedules });
+    if (claim) {
+      view = await this.#load(view.run.id, attempt.id);
+      attempt = assertAttemptLeaseClaim(view, claim);
+    }
     if (
       !evaluatedValue || typeof evaluatedValue.outcome !== "string" ||
       typeof evaluatedValue.summary !== "string" ||
@@ -564,7 +592,7 @@ export class KernelExternalBoundaryCoordinator {
         command_id: transitionId("external-record", { attempt_id: attempt.id, result_id: result.id }),
         attempt_id: attempt.id,
         record_id: result.id,
-      });
+      }, claim);
       view = await this.#load(view.run.id, attempt.id, [result.id]);
       attempt = view.current_attempt!;
     }
@@ -635,6 +663,9 @@ export class KernelExternalBoundaryCoordinator {
         evaluated,
         default_plan: defaultPlan,
       });
+    if (claim) {
+      assertAttemptLeaseClaim(await this.#load(recorded.run.id, attempt.id), claim);
+    }
     if (
       settlement.decision.pipeline_run_id !== recorded.run.id ||
       !settlement.decision.input_record_ids.includes(result.id) ||
@@ -661,7 +692,7 @@ export class KernelExternalBoundaryCoordinator {
       outcome: settlement.outcome,
       next_attempts: settlement.next_attempts,
       next_dependencies: settlement.next_dependencies,
-    });
+    }, claim);
     const final = await this.#load(recorded.run.id, null);
     return {
       disposition: "settled",
@@ -686,7 +717,12 @@ export class KernelExternalBoundaryCoordinator {
     });
   }
 
-  async #apply(view: ReductionView, command: Parameters<typeof reduceKernelCommand>[0]["command"]): Promise<void> {
+  async #apply(
+    view: ReductionView,
+    command: Parameters<typeof reduceKernelCommand>[0]["command"],
+    claim?: AttemptLeaseClaim,
+  ): Promise<void> {
+    if (claim) assertAttemptLeaseClaim(view, claim);
     const transition = reduceKernelCommand({
       manifest: view.manifest,
       run: view.run,

@@ -30,6 +30,7 @@ write_message() {
       request_hash:$request,
       definition_bundle_hash:$bundle,
       lease_id:$lease,
+      lease_generation:0,
       native_session_id:"native-1",
       body:$body
     }' > "$path"

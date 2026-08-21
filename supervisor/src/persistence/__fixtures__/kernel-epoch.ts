@@ -28,6 +28,7 @@ export function freshKernelFixture(): FreshKernelFixture {
     database_path: join(directory, "epoch.sqlite"),
     blob_store: blobs,
     release_id: "kernel-u11-release",
+    runtime_capability_digest: "c".repeat(64),
     bootstrap: createFreshEpochBootstrap({
       schema: "openthrottle.fresh-epoch-bootstrap/v1",
       settings: [],
@@ -129,6 +130,7 @@ export function seedKernelAttempt(input: {
   native_session_id?: string | null;
   lease?: {
     id: string;
+    generation?: number;
     worker_id: string;
     purpose: "work" | "result_correction";
     expires_at: string;
@@ -166,11 +168,11 @@ export function seedKernelAttempt(input: {
       definition_bundle_hash, input_subject, context_record_ids_json,
       context_checkpoint_ids_json, native_session_id, status, version,
       work_retry_ordinal, result_correction_count, result_correction_deadline,
-      unmet_dependency_count, lease_id, lease_worker_id, lease_purpose,
+      unmet_dependency_count, lease_id, lease_generation, lease_worker_id, lease_purpose,
       lease_expires_at, lease_started, pending_candidate_hash,
       pending_diagnostics_json, decision_record_id, created_at, updated_at
     ) VALUES (?, ?, 'stage', ?, 'inspect', ?, ?, ?, '[]', '[]', ?, ?, ?, 0, ?, ?,
-      0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.id,
     runId,
@@ -184,6 +186,7 @@ export function seedKernelAttempt(input: {
     resultPending ? 1 : 0,
     resultPending ? "2026-08-20T13:00:00.000Z" : null,
     lease?.id ?? null,
+    lease ? (lease.generation ?? 0) : null,
     lease?.worker_id ?? null,
     lease?.purpose ?? null,
     lease?.expires_at ?? null,

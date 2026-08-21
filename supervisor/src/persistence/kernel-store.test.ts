@@ -176,6 +176,7 @@ function setup(
     database_path: join(directory, "epoch.sqlite"),
     blob_store: blobs,
     release_id: "release-a",
+    runtime_capability_digest: "c".repeat(64),
     bootstrap,
     now,
   });
@@ -501,21 +502,65 @@ describe("SqliteKernelStore", () => {
       const first = await context.store.leaseNextEligibleAttempt(request);
       const replay = await context.store.leaseNextEligibleAttempt(request);
       expect(first?.attempt).toEqual(replay?.attempt);
-      expect(first?.attempt.lease?.worker_id).toBe("worker-1");
+      expect(first?.attempt.lease).toMatchObject({ generation: 0, worker_id: "worker-1" });
       await expect(context.store.leaseNextEligibleAttempt({ ...request, worker_id: "worker-2" }))
         .rejects.toThrow(/immutable replay/);
       await expect(context.store.renewAttemptLease({
         attempt_id: "attempt-1",
         lease_id: "lease-1",
+        lease_generation: 0,
         worker_id: "worker-2",
         expires_at: "2026-08-20T12:06:00.000Z",
       })).rejects.toThrow(/fence/);
       expect(await context.store.renewAttemptLease({
         attempt_id: "attempt-1",
         lease_id: "lease-1",
+        lease_generation: 0,
         worker_id: "worker-1",
         expires_at: "2026-08-20T12:06:00.000Z",
       })).toMatchObject({ worker_id: "worker-1", expires_at: "2026-08-20T12:06:00.000Z" });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("snapshots one frozen single-Attempt policy value at the persistence boundary", async () => {
+    const context = setup();
+    const base = {
+      db: context.db,
+      blob_store: context.blobs,
+      manifest_resolver: { resolve: () => context.pipelineManifest },
+      payload_schemas: payloadSchemas,
+      now: () => NOW,
+    };
+    try {
+      const forcedWidthTwo = Object.freeze({ max_concurrent_attempts: 2 }) as unknown as {
+        readonly max_concurrent_attempts: 1;
+      };
+      expect(() => new SqliteKernelStore({
+        ...base,
+        execution_policy: forcedWidthTwo,
+      })).toThrow(/supported release limit 1/);
+
+      let reads = 0;
+      const statefulGetter = Object.freeze({
+        get max_concurrent_attempts() {
+          reads += 1;
+          return reads === 1 ? 1 : 2;
+        },
+      }) as unknown as { readonly max_concurrent_attempts: 1 };
+      const store = new SqliteKernelStore({
+        ...base,
+        execution_policy: statefulGetter,
+      });
+      expect(reads).toBe(1);
+      store.admitPipelineRun(context.admission);
+      await expect(store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-1",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.not.toBeNull();
+      expect(reads).toBe(1);
     } finally {
       context.db.close();
     }
@@ -617,6 +662,25 @@ describe("SqliteKernelStore", () => {
         ...view,
         command: { type: "start", command_id: "start-delayed", attempt_id: "attempt-1", lease_id: "lease-1" },
       });
+      const startWrite = start.attempt_writes[0];
+      if (!startWrite || startWrite.kind !== "replace" || !startWrite.attempt.lease) {
+        throw new Error("expected the start transition to preserve its live lease");
+      }
+      const { content_hash: _contentHash, ...startContent } = start;
+      const forgedContent: AtomicTransitionBundleContent = {
+        ...startContent,
+        attempt_writes: [{
+          kind: "replace",
+          attempt: {
+            ...startWrite.attempt,
+            lease: { ...startWrite.attempt.lease, generation: 1 },
+          },
+        }],
+      };
+      await expect(context.store.applyAtomicTransition({
+        ...forgedContent,
+        content_hash: digestCanonicalJson(forgedContent),
+      })).rejects.toThrow(/lease claim cannot change/);
       expect(await context.store.applyAtomicTransition(start)).toEqual({ disposition: "applied", run_version: 2 });
       expect(await context.store.applyAtomicTransition(start)).toEqual({ disposition: "replayed", run_version: 2 });
       await expect(context.store.applyAtomicTransition(conflictingReplay(start))).rejects.toThrow(/conflicts/);

@@ -66,6 +66,7 @@ function binding(input: {
   status?: "running" | "result_pending";
   purpose?: "work" | "result_correction";
   generation?: number;
+  lease_generation?: number;
 } = {}): KernelRuntimeSessionBinding {
   return {
     pipeline_run_id: "run-1",
@@ -78,6 +79,7 @@ function binding(input: {
     attempt_status: input.status ?? "running",
     repository_authority: "edit",
     lease_id: "lease-live",
+    lease_generation: input.lease_generation ?? 0,
     lease_worker_id: "worker-live",
     lease_purpose: input.purpose ?? "work",
     lease_expires_at: "2026-08-20T13:00:00.000Z",
@@ -166,6 +168,10 @@ describe("KernelControlService", () => {
     test.sessions.current = binding({ generation: 1 });
     await expect(test.control.authorizeLeasedSteering(leased))
       .rejects.toThrow(/generation.*stale or mismatched/);
+
+    test.sessions.current = binding({ lease_generation: 1 });
+    await expect(test.control.authorizeLeasedSteering(leased))
+      .rejects.toThrow(/lease_generation.*stale or mismatched/);
   });
 
   it("cannot widen result-only correction through steering", async () => {

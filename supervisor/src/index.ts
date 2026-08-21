@@ -80,6 +80,7 @@ async function main(): Promise<void> {
     blob_store_path: cfg.blobStorePath,
     blob_store_id: cfg.blobStoreId,
     release_id: cfg.epochReleaseId,
+    runtime_capability_digest: release.execution_policy.runtime_capability_digest,
   });
   const manifestResolver = new VerifiedKernelManifestResolver({
     compiler_environment: release.compiler_environment,

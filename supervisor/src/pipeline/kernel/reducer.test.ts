@@ -197,6 +197,7 @@ function claimAttempt(
       (input.purpose === "result_correction" ? 1 : 0),
     lease: {
       id: input.leaseId,
+      generation: 0,
       worker_id: input.workerId ?? "worker-1",
       purpose: input.purpose,
       expires_at: input.expiresAt ?? "2026-08-20T00:05:00.000Z",
@@ -673,7 +674,7 @@ describe("shared execution kernel lifecycle", () => {
   it("rejects each lifecycle command from an invalid edge", () => {
     const running = attempt({
       status: "running",
-      lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
+      lease: { id: "lease", generation: 0, worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
     });
     const completed = attempt({
       status: "work_complete",
@@ -772,6 +773,7 @@ describe("shared execution kernel lifecycle", () => {
       version: 4,
       lease: {
         id: "lease-1",
+        generation: 0,
         worker_id: "worker-1",
         purpose: "work",
         expires_at: "2026-08-20T00:05:00.000Z",
@@ -820,6 +822,7 @@ describe("shared execution kernel lifecycle", () => {
       status: "running",
       lease: {
         id: "lease-1",
+        generation: 0,
         worker_id: "worker-1",
         purpose: "work",
         expires_at: "later",
@@ -861,6 +864,7 @@ describe("shared execution kernel lifecycle", () => {
       status: "running",
       lease: {
         id: "command-lease",
+        generation: 0,
         worker_id: "command-worker",
         purpose: "work",
         expires_at: "later",
@@ -906,7 +910,7 @@ describe("shared execution kernel lifecycle", () => {
     const edit = attempt({
       status: "running",
       native_session_id: "session-1",
-      lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
+      lease: { id: "lease", generation: 0, worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
     });
     expect(() => reduce({
       current: edit,
@@ -921,7 +925,7 @@ describe("shared execution kernel lifecycle", () => {
       repository_authority: "inspect",
       status: "running",
       native_session_id: "session-1",
-      lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
+      lease: { id: "lease", generation: 0, worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
     });
     expect(() => reduce({
       current: inspect,
@@ -950,7 +954,7 @@ describe("shared execution kernel lifecycle", () => {
       scope: loopScope(),
       status: "running",
       native_session_id: "session-1",
-      lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
+      lease: { id: "lease", generation: 0, worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
     });
     const transition = reduce({
       current,
@@ -986,6 +990,7 @@ describe("shared execution kernel lifecycle", () => {
       result_correction_deadline: "2026-08-20T00:15:00.000Z",
       lease: {
         id: "correction-1",
+        generation: 0,
         worker_id: "worker-1",
         purpose: "result_correction",
         expires_at: "later",
@@ -1417,7 +1422,7 @@ describe("pipeline topology on the shared kernel", () => {
   ] as const)("%s preserves its outcome while routing through runtime cleanup", (type, status) => {
     const current = attempt({
       id: "attempt-a", status: "running", version: 3,
-      lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
+      lease: { id: "lease", generation: 0, worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
       checkpoint_id: "checkpoint-a",
     });
     const sibling = attempt({ id: "attempt-b", version: 2, scope: loopScope("unit-b", 1) });
@@ -1519,6 +1524,7 @@ describe("atomic transition replay", () => {
       version: 1,
       lease: {
         id: "lease-1",
+        generation: 0,
         worker_id: "worker-1",
         purpose: "work",
         expires_at: "later",
@@ -1571,6 +1577,7 @@ describe("effect ownership and reconciliation", () => {
       version: 2,
       lease: {
         id: "lease-external",
+        generation: 0,
         worker_id: "external-worker",
         purpose: "work",
         expires_at: "2026-08-20T00:05:00.000Z",
@@ -1691,6 +1698,7 @@ describe("effect ownership and reconciliation", () => {
       version: 2,
       lease: {
         id: "lease-1",
+        generation: 0,
         worker_id: "worker-1",
         purpose: "work",
         expires_at: "2026-08-20T00:05:00.000Z",

@@ -185,7 +185,7 @@ export class SqliteKernelStore implements
     blob_store: VolumeBlobStore;
     manifest_resolver: KernelManifestResolver;
     payload_schemas: ExecutionRecordPayloadRegistry;
-    execution_policy: { readonly max_concurrent_attempts: number };
+    execution_policy: { readonly max_concurrent_attempts: 1 };
     now?: () => string;
     fault_injector?: (point: KernelStoreFaultPoint) => void;
   }) {
@@ -361,6 +361,7 @@ export class SqliteKernelStore implements
   async renewAttemptLease(input: {
     attempt_id: string;
     lease_id: string;
+    lease_generation: number;
     worker_id: string;
     expires_at: string;
   }): Promise<NonNullable<KernelAttempt["lease"]>> {
@@ -982,11 +983,11 @@ export class SqliteKernelStore implements
         context_checkpoint_ids_json, output_subject, native_session_id,
         status, version, work_retry_ordinal, result_correction_count,
         result_correction_deadline, unmet_dependency_count,
-        lease_id, lease_worker_id, lease_purpose, lease_expires_at, lease_started,
+        lease_id, lease_generation, lease_worker_id, lease_purpose, lease_expires_at, lease_started,
         checkpoint_id, result_record_id, decision_record_id,
         pending_candidate_hash, pending_diagnostics_json,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       attempt.id,
       attempt.pipeline_run_id,
@@ -1010,6 +1011,7 @@ export class SqliteKernelStore implements
       attempt.result_correction_count,
       attempt.result_correction_deadline,
       attempt.lease?.id ?? null,
+      attempt.lease?.generation ?? null,
       attempt.lease ? (workerId ?? attempt.lease.worker_id) : null,
       attempt.lease?.purpose ?? null,
       attempt.lease?.expires_at ?? null,
@@ -1044,8 +1046,12 @@ export class SqliteKernelStore implements
     ) throw new Error(`attempt ${attempt.id} cannot change its context bindings`);
     if (
       attempt.lease && existing.lease_id === attempt.lease.id &&
-      existing.lease_worker_id !== attempt.lease.worker_id
-    ) throw new Error(`attempt ${attempt.id} lease worker cannot change inside its fence`);
+      (
+        existing.lease_generation !== attempt.lease.generation ||
+        existing.lease_worker_id !== attempt.lease.worker_id ||
+        existing.lease_purpose !== attempt.lease.purpose
+      )
+    ) throw new Error(`attempt ${attempt.id} lease claim cannot change inside its fence`);
     const worker = attempt.lease?.worker_id ?? null;
     const changed = this.#db.prepare(`
       UPDATE attempts SET
@@ -1053,7 +1059,8 @@ export class SqliteKernelStore implements
         scope_item_id = ?, scope_item_index = ?, repository_authority = ?, request_hash = ?,
         definition_bundle_hash = ?, input_subject = ?, output_subject = ?, native_session_id = ?,
         status = ?, version = ?, work_retry_ordinal = ?, result_correction_count = ?,
-        result_correction_deadline = ?, lease_id = ?, lease_worker_id = ?, lease_purpose = ?,
+        result_correction_deadline = ?, lease_id = ?, lease_generation = ?,
+        lease_worker_id = ?, lease_purpose = ?,
         lease_expires_at = ?, lease_started = ?, checkpoint_id = ?, result_record_id = ?,
         decision_record_id = ?,
         pending_candidate_hash = ?, pending_diagnostics_json = ?, updated_at = ?
@@ -1077,6 +1084,7 @@ export class SqliteKernelStore implements
       attempt.result_correction_count,
       attempt.result_correction_deadline,
       attempt.lease?.id ?? null,
+      attempt.lease?.generation ?? null,
       worker,
       attempt.lease?.purpose ?? null,
       attempt.lease?.expires_at ?? null,
@@ -1099,7 +1107,8 @@ export class SqliteKernelStore implements
     runId: string,
   ): void {
     const changed = this.#db.prepare(`
-      UPDATE attempts SET status = ?, version = ?, lease_id = NULL, lease_worker_id = NULL,
+      UPDATE attempts SET status = ?, version = ?, lease_id = NULL, lease_generation = NULL,
+        lease_worker_id = NULL,
         lease_purpose = NULL, lease_expires_at = NULL, lease_started = NULL, updated_at = ?
       WHERE id = ? AND pipeline_run_id = ? AND version = ?
     `).run(write.status, write.next_version, this.#now(), write.attempt_id, runId, write.expected_version);

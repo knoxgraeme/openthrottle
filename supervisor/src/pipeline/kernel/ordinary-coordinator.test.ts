@@ -300,6 +300,8 @@ class RuntimeFixture implements KernelRuntimePort {
   readonly correctionRequests: KernelResultCorrectionRequest[] = [];
   pendingOnce = false;
   blockingReview = false;
+  workOutcome: (() => Promise<KernelRuntimeOutcome>) | null = null;
+  correctionOutcome: (() => Promise<KernelRuntimeOutcome>) | null = null;
 
   async executeWork(
     request: KernelWorkActionRequest,
@@ -334,6 +336,7 @@ class RuntimeFixture implements KernelRuntimePort {
       },
       captured_at: NOW,
     };
+    if (this.workOutcome) return this.workOutcome();
     if (this.pendingOnce && request.stage_id === "implement") {
       this.pendingOnce = false;
       return {
@@ -375,6 +378,7 @@ class RuntimeFixture implements KernelRuntimePort {
   ): Promise<KernelRuntimeOutcome> {
     this.correctionRequests.push(request);
     await callbacks.on_heartbeat();
+    if (this.correctionOutcome) return this.correctionOutcome();
     return {
       state: "work_complete",
       checkpoint: {
@@ -436,6 +440,7 @@ async function setup(runtime = new RuntimeFixture()): Promise<ActiveKernelFixtur
     database_path: databasePath,
     blob_store: blobs,
     release_id: "ordinary-release",
+    runtime_capability_digest: CAPABILITY,
     bootstrap,
     now: () => NOW,
   });
@@ -513,6 +518,7 @@ async function setup(runtime = new RuntimeFixture()): Promise<ActiveKernelFixtur
         database_path: databasePath,
         blob_store: blobs,
         release_id: "ordinary-release",
+        runtime_capability_digest: CAPABILITY,
         bootstrap,
         now: () => NOW,
       })),
@@ -730,6 +736,7 @@ describe("ordinary kernel activation", () => {
           status: "running",
           lease: {
             id: "lease-hash-proof",
+            generation: 0,
             worker_id: "worker-hash-proof",
             purpose: "work",
             expires_at: "2026-08-20T13:00:00.000Z",
@@ -851,6 +858,87 @@ describe("ordinary kernel activation", () => {
       expect(test.db.prepare(`
         SELECT COUNT(*) AS count FROM attempts WHERE stage_id = 'implement'
       `).get()).toEqual({ count: 1 });
+    } finally {
+      test.db.close();
+    }
+  });
+
+  it("rejects a stale work timeout after recovery and reconciles the same sealed request", async () => {
+    const runtime = new RuntimeFixture();
+    const test = await setup(runtime);
+    let recovered: Awaited<ReturnType<SqliteKernelStore["recoverExpiredAttemptLeases"]>>[number] | undefined;
+    runtime.workOutcome = async () => {
+      [recovered] = await test.store.recoverExpiredAttemptLeases({
+        observed_at: "2026-08-20T12:06:00.000Z",
+        expires_at: "2026-08-20T12:11:00.000Z",
+        limit: 1,
+      });
+      return { state: "work_failed", retryable: true, reason: "provider timeout" };
+    };
+    try {
+      await expect(execute(test.coordinator, 1)).rejects.toThrow(/claim generation/);
+      expect(recovered?.lease).toMatchObject({ generation: 1, id: "lease-1", started: true });
+      expect(test.db.prepare(`
+        SELECT status, work_retry_ordinal, lease_id, lease_generation, native_session_id
+        FROM attempts WHERE id = 'attempt-initial'
+      `).get()).toEqual({
+        status: "running",
+        work_retry_ordinal: 0,
+        lease_id: "lease-1",
+        lease_generation: 1,
+        native_session_id: "session-attempt-initial",
+      });
+
+      runtime.workOutcome = null;
+      await expect(test.coordinator.executeLeasedAttempt(recovered!))
+        .resolves.toMatchObject({ disposition: "settled" });
+      expect(runtime.workRequests).toHaveLength(2);
+      expect(runtime.workRequests[1]).toEqual(runtime.workRequests[0]);
+      expect(runtime.workRequests[0]).not.toHaveProperty("lease_generation");
+    } finally {
+      test.db.close();
+    }
+  });
+
+  it("rejects a stale correction timeout after recovery instead of escalating needs-human", async () => {
+    const runtime = new RuntimeFixture();
+    runtime.pendingOnce = true;
+    const test = await setup(runtime);
+    let recovered: Awaited<ReturnType<SqliteKernelStore["recoverExpiredAttemptLeases"]>>[number] | undefined;
+    try {
+      expect((await execute(test.coordinator, 1)).disposition).toBe("result_pending");
+      runtime.correctionOutcome = async () => {
+        [recovered] = await test.store.recoverExpiredAttemptLeases({
+          observed_at: "2026-08-20T12:06:00.000Z",
+          expires_at: "2026-08-20T12:11:00.000Z",
+          limit: 1,
+        });
+        return {
+          state: "needs_human",
+          reason: "correction timed out",
+          checkpoint: null,
+          candidate_hash: null,
+          diagnostics: [],
+        };
+      };
+
+      await expect(execute(test.coordinator, 2)).rejects.toThrow(/claim generation/);
+      expect(test.db.prepare(`
+        SELECT status, result_correction_count, lease_id, lease_generation
+        FROM attempts WHERE id = 'attempt-initial'
+      `).get()).toEqual({
+        status: "result_pending",
+        result_correction_count: 1,
+        lease_id: "lease-2",
+        lease_generation: 1,
+      });
+
+      runtime.correctionOutcome = null;
+      await expect(test.coordinator.executeLeasedAttempt(recovered!))
+        .resolves.toMatchObject({ disposition: "settled" });
+      expect(runtime.correctionRequests).toHaveLength(2);
+      expect(runtime.correctionRequests[1]).toEqual(runtime.correctionRequests[0]);
+      expect(runtime.correctionRequests[0]).not.toHaveProperty("lease_generation");
     } finally {
       test.db.close();
     }

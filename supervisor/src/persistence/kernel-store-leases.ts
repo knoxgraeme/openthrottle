@@ -29,7 +29,7 @@ export class KernelLeaseOperations {
   readonly #advanceRunFence: (runId: string, transitionId: string, content: unknown) => KernelRun;
   readonly #insertRecord: (record: ExecutionRecord) => void;
   readonly #readEffectBlob: (runId: string, ownerId: string, pointer: BlobPointer) => Buffer;
-  readonly #maxConcurrentAttempts: number;
+  readonly #maxConcurrentAttempts: 1;
 
   constructor(input: {
     db: Database.Database;
@@ -38,7 +38,7 @@ export class KernelLeaseOperations {
     advance_run_fence: (runId: string, transitionId: string, content: unknown) => KernelRun;
     insert_record: (record: ExecutionRecord) => void;
     read_effect_blob: (runId: string, ownerId: string, pointer: BlobPointer) => Buffer;
-    execution_policy: { readonly max_concurrent_attempts: number };
+    execution_policy: { readonly max_concurrent_attempts: 1 };
   }) {
     this.#db = input.db;
     this.#now = input.now;
@@ -46,12 +46,11 @@ export class KernelLeaseOperations {
     this.#advanceRunFence = input.advance_run_fence;
     this.#insertRecord = input.insert_record;
     this.#readEffectBlob = input.read_effect_blob;
-    if (
-      !Object.isFrozen(input.execution_policy) ||
-      !Number.isSafeInteger(input.execution_policy.max_concurrent_attempts) ||
-      input.execution_policy.max_concurrent_attempts < 1
-    ) throw new Error("Attempt lease policy must be frozen with a positive integer limit");
-    this.#maxConcurrentAttempts = input.execution_policy.max_concurrent_attempts;
+    const maxConcurrentAttempts = input.execution_policy.max_concurrent_attempts;
+    if (!Object.isFrozen(input.execution_policy) || maxConcurrentAttempts !== 1) {
+      throw new Error("Attempt lease policy must be frozen at the supported release limit 1");
+    }
+    this.#maxConcurrentAttempts = maxConcurrentAttempts;
   }
 
   async leaseNextEligibleAttempt(request: AttemptLeaseRequest): Promise<LeasedAttemptView | null> {
@@ -98,7 +97,7 @@ export class KernelLeaseOperations {
       const changed = this.#db.prepare(`
         UPDATE attempts
         SET lease_id = ?, lease_worker_id = ?, lease_purpose = ?, lease_expires_at = ?,
-            lease_started = 0, version = version + 1,
+            lease_generation = 0, lease_started = 0, version = version + 1,
             result_correction_count = result_correction_count + ?, updated_at = ?
         WHERE id = ? AND pipeline_run_id = ? AND version = ? AND lease_id IS NULL
           AND unmet_dependency_count = 0
@@ -116,6 +115,8 @@ export class KernelLeaseOperations {
       if (changed.changes !== 1) throw new Error(`attempt ${row.id} lease compare-and-set failed`);
       const run = this.#advanceRunFence(row.pipeline_run_id, `attempt-lease:${request.lease_id}`, {
         attempt_id: row.id,
+        lease_id: request.lease_id,
+        generation: 0,
         worker_id: request.worker_id,
         expires_at: request.expires_at,
       });
@@ -133,6 +134,7 @@ export class KernelLeaseOperations {
   async renewAttemptLease(input: {
     attempt_id: string;
     lease_id: string;
+    lease_generation: number;
     worker_id: string;
     expires_at: string;
   }): Promise<NonNullable<KernelAttempt["lease"]>> {
@@ -140,12 +142,23 @@ export class KernelLeaseOperations {
       const row = this.#db.prepare("SELECT * FROM attempts WHERE id = ?")
         .get(input.attempt_id) as AttemptRow | undefined;
       if (
-        !row || row.lease_id !== input.lease_id || row.lease_worker_id !== input.worker_id
+        !row || row.lease_id !== input.lease_id ||
+        row.lease_generation !== input.lease_generation ||
+        row.lease_worker_id !== input.worker_id
       ) throw new Error("attempt lease fence does not match");
       const changed = this.#db.prepare(`
         UPDATE attempts SET lease_expires_at = ?, version = version + 1, updated_at = ?
-        WHERE id = ? AND lease_id = ? AND lease_worker_id = ? AND version = ?
-      `).run(input.expires_at, this.#now(), row.id, input.lease_id, input.worker_id, row.version);
+        WHERE id = ? AND lease_id = ? AND lease_generation = ?
+          AND lease_worker_id = ? AND version = ?
+      `).run(
+        input.expires_at,
+        this.#now(),
+        row.id,
+        input.lease_id,
+        input.lease_generation,
+        input.worker_id,
+        row.version,
+      );
       if (changed.changes !== 1) throw new Error("attempt lease renewal compare-and-set failed");
       this.#advanceRunFence(row.pipeline_run_id, `attempt-renew:${input.lease_id}:${row.version + 1}`, input);
       return this.#attemptById(row.id, row.pipeline_run_id).lease!;
@@ -187,9 +200,11 @@ export class KernelLeaseOperations {
       const recovered: LeasedAttemptView[] = [];
       for (const row of rows) {
         const changed = this.#db.prepare(`
-          UPDATE attempts SET lease_expires_at = ?, version = version + 1, updated_at = ?
+          UPDATE attempts SET lease_expires_at = ?, lease_generation = lease_generation + 1,
+            version = version + 1, updated_at = ?
           WHERE id = ? AND pipeline_run_id = ? AND version = ?
-            AND lease_id = ? AND lease_worker_id = ? AND lease_expires_at = ?
+            AND lease_id = ? AND lease_generation = ?
+            AND lease_worker_id = ? AND lease_expires_at = ?
         `).run(
           input.expires_at,
           input.observed_at,
@@ -197,6 +212,7 @@ export class KernelLeaseOperations {
           row.pipeline_run_id,
           row.version,
           row.lease_id,
+          row.lease_generation,
           row.lease_worker_id,
           row.lease_expires_at,
         );
@@ -209,6 +225,8 @@ export class KernelLeaseOperations {
           {
             attempt_id: row.id,
             lease_id: row.lease_id,
+            prior_generation: row.lease_generation,
+            generation: row.lease_generation! + 1,
             worker_id: row.lease_worker_id,
             prior_expires_at: row.lease_expires_at,
             expires_at: input.expires_at,

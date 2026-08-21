@@ -215,6 +215,7 @@ CREATE TABLE attempts (
   result_correction_deadline TEXT,
   unmet_dependency_count INTEGER NOT NULL DEFAULT 0 CHECK (unmet_dependency_count >= 0),
   lease_id TEXT,
+  lease_generation INTEGER CHECK (lease_generation IS NULL OR lease_generation >= 0),
   lease_worker_id TEXT,
   lease_purpose TEXT CHECK (lease_purpose IS NULL OR lease_purpose IN ('work', 'result_correction')),
   lease_expires_at TEXT,
@@ -233,8 +234,8 @@ CREATE TABLE attempts (
     (scope_kind IN ('loop_item', 'fanout_member') AND parent_attempt_id IS NOT NULL AND scope_group_id IS NOT NULL AND scope_item_id IS NOT NULL AND scope_item_index >= 0)
   ),
   CHECK (
-    (lease_id IS NULL AND lease_worker_id IS NULL AND lease_purpose IS NULL AND lease_expires_at IS NULL AND lease_started IS NULL) OR
-    (lease_id IS NOT NULL AND lease_worker_id IS NOT NULL AND lease_purpose IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_started IS NOT NULL)
+    (lease_id IS NULL AND lease_generation IS NULL AND lease_worker_id IS NULL AND lease_purpose IS NULL AND lease_expires_at IS NULL AND lease_started IS NULL) OR
+    (lease_id IS NOT NULL AND lease_generation IS NOT NULL AND lease_worker_id IS NOT NULL AND lease_purpose IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_started IS NOT NULL)
   ),
   CHECK ((pending_diagnostics_json IS NULL) = (status <> 'result_pending')),
   CHECK (result_correction_deadline IS NULL OR native_session_id IS NOT NULL),

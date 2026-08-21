@@ -77,6 +77,7 @@ function attempt(overrides: Partial<KernelAttempt> = {}): KernelAttempt {
     result_correction_deadline: null,
     lease: {
       id: "lease-1",
+      generation: 0,
       worker_id: "worker-1",
       purpose: "work",
       expires_at: LEASE_EXPIRY,
@@ -200,6 +201,29 @@ class MemoryReductionPort implements KernelReductionPort {
     };
     this.#lastTransition = undefined;
   }
+
+  recover(expiresAt = "2026-08-20T12:10:00.000Z"): void {
+    const current = this.view.current_attempt!;
+    const next = {
+      ...current,
+      version: current.version + 1,
+      lease: current.lease && {
+        ...current.lease,
+        generation: current.lease.generation + 1,
+        expires_at: expiresAt,
+      },
+    };
+    this.view = {
+      ...this.view,
+      run: {
+        ...this.view.run,
+        version: this.view.run.version + 1,
+        active_attempt_versions: { [next.id]: next.version },
+      },
+      current_attempt: next,
+    };
+    this.#lastTransition = undefined;
+  }
 }
 
 function bindRequest(
@@ -214,6 +238,7 @@ function bindRequest(
     definition_bundle_hash: current.definition_bundle_hash,
     input_subject: current.input_subject,
     lease_id: current.lease!.id,
+    lease_generation: current.lease!.generation,
     worker_id: current.lease!.worker_id,
     lease_purpose: current.lease!.purpose,
     work_retry_ordinal: current.work_retry_ordinal,
@@ -242,6 +267,7 @@ describe("KernelRuntimeSessionService", () => {
       attempt_id: "attempt-1",
       native_session_id: "session-1",
       generation: 0,
+      lease_generation: 0,
       attempt_status: "running",
       lease_id: "lease-1",
       lease_worker_id: "worker-1",
@@ -265,6 +291,7 @@ describe("KernelRuntimeSessionService", () => {
   it("rejects every stale launch fence before binding", async () => {
     const cases: Array<[string, Partial<KernelRuntimeSessionBindRequest>]> = [
       ["lease", { lease_id: "lease-stale" }],
+      ["lease generation", { lease_generation: 1 }],
       ["worker", { worker_id: "worker-stale" }],
       ["purpose", { lease_purpose: "result_correction" }],
       ["work retry", { work_retry_ordinal: 1 }],
@@ -311,12 +338,40 @@ describe("KernelRuntimeSessionService", () => {
     expect(renewed).toMatchObject({
       native_session_id: "session-1",
       generation: bound.generation,
+      lease_generation: bound.lease_generation,
       lease_expires_at: "2026-08-20T12:07:00.000Z",
     });
     expect(() => authorizeKernelSteeringDelivery({
       envelope,
       current_binding: renewed,
     })).not.toThrow();
+  });
+
+  it("invalidates pre-recovery steering without changing its phase generation", async () => {
+    const port = new MemoryReductionPort();
+    const sessions = service(port);
+    const bound = await sessions.bindRuntimeSession(bindRequest(port));
+    const envelope = createKernelSteeringEnvelope({
+      message_id: "message-before-recovery",
+      source: "operator",
+      body: "Only the current lease owner may receive this.",
+      binding: bound,
+    });
+
+    port.recover();
+    const recovered = await sessions.loadCurrentRuntimeSession({
+      pipeline_run_id: "run-1",
+      attempt_id: "attempt-1",
+    });
+    expect(recovered).toMatchObject({
+      generation: bound.generation,
+      lease_generation: bound.lease_generation + 1,
+      native_session_id: bound.native_session_id,
+    });
+    expect(() => authorizeKernelSteeringDelivery({
+      envelope,
+      current_binding: recovered,
+    })).toThrow(/lease_generation.*stale or mismatched/);
   });
 
   it("verifies and retains the work session for result correction", async () => {
@@ -334,6 +389,7 @@ describe("KernelRuntimeSessionService", () => {
       },
       lease: {
         id: "correction-lease",
+        generation: 0,
         worker_id: "correction-worker",
         purpose: "result_correction",
         expires_at: LEASE_EXPIRY,
@@ -361,6 +417,7 @@ describe("KernelRuntimeSessionService", () => {
     const unstartedPort = new MemoryReductionPort(attempt({
       lease: {
         id: "lease-1",
+        generation: 0,
         worker_id: "worker-1",
         purpose: "work",
         expires_at: LEASE_EXPIRY,
@@ -373,6 +430,7 @@ describe("KernelRuntimeSessionService", () => {
     const expiredPort = new MemoryReductionPort(attempt({
       lease: {
         id: "lease-1",
+        generation: 0,
         worker_id: "worker-1",
         purpose: "work",
         expires_at: "2026-08-20T11:59:00.000Z",
@@ -432,5 +490,16 @@ describe("KernelRuntimeSessionService", () => {
     await expect(service(racedPort).bindRuntimeSession(bindRequest(racedPort)))
       .resolves.toMatchObject({ native_session_id: "session-1" });
     expect(racedPort.apply_count).toBe(2);
+
+    const recoveredPort = new MemoryReductionPort();
+    const staleLaunch = bindRequest(recoveredPort);
+    recoveredPort.before_apply = () => recoveredPort.recover();
+    await expect(service(recoveredPort).bindRuntimeSession(staleLaunch))
+      .rejects.toThrow(/lease fence/);
+    expect(recoveredPort.apply_count).toBe(1);
+    expect(recoveredPort.view.current_attempt).toMatchObject({
+      native_session_id: null,
+      lease: { id: "lease-1", generation: 1 },
+    });
   });
 });

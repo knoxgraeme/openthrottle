@@ -34,14 +34,17 @@ import {
   createSemanticResultRecord,
   type EvaluatedKernelResult,
 } from "./evaluator-registry.js";
-import type {
-  AttemptLeaseRequest,
-  KernelAttemptLeasePort,
-  KernelAttemptRequestPort,
-  KernelDefinitionBundlePort,
-  KernelReductionPort,
-  LeasedAttemptView,
-  ReductionView,
+import {
+  assertAttemptLeaseClaim,
+  captureAttemptLeaseClaim,
+  type AttemptLeaseClaim,
+  type AttemptLeaseRequest,
+  type KernelAttemptLeasePort,
+  type KernelAttemptRequestPort,
+  type KernelDefinitionBundlePort,
+  type KernelReductionPort,
+  type LeasedAttemptView,
+  type ReductionView,
 } from "./ports.js";
 import { reduceKernelCommand } from "./reducer.js";
 import type {
@@ -293,7 +296,9 @@ export class OrdinaryKernelCoordinator {
   }
 
   async executeLeasedAttempt(leased: LeasedAttemptView): Promise<OrdinaryKernelStep> {
+    const claim = captureAttemptLeaseClaim(leased);
     let view = await this.#load(leased.run_id, leased.attempt.id);
+    assertAttemptLeaseClaim(view, claim);
     const stage = stageFor(view, leased.attempt.scope.stage_id);
     if (stage.kind === "effect" || stage.kind === "wait") {
       // External stages return the untouched lease to the boundary worker;
@@ -308,8 +313,9 @@ export class OrdinaryKernelCoordinator {
         attempt_id: leased.attempt.id,
         lease_id: leased.lease.id,
       };
-      await this.#apply(view, start);
+      await this.#apply(view, start, claim);
       view = await this.#load(leased.run_id, leased.attempt.id);
+      assertAttemptLeaseClaim(view, claim);
     }
     const attempt = view.current_attempt!;
     if (attempt.lease?.purpose === "result_correction" && (
@@ -318,7 +324,12 @@ export class OrdinaryKernelCoordinator {
       attempt.result_correction_deadline === null ||
       attempt.result_correction_deadline <= this.#now()
     )) {
-      return this.#terminal(view, "needs_human", "result_correction_unavailable_or_exhausted");
+      return this.#terminal(
+        view,
+        "needs_human",
+        "result_correction_unavailable_or_exhausted",
+        claim,
+      );
     }
     const bundle = await this.#bundles.resolveExactDefinitionBundle({
       pipeline_run_id: view.run.id,
@@ -349,6 +360,7 @@ export class OrdinaryKernelCoordinator {
         bundle,
         checkpoint,
         outcome,
+        claim,
       });
     }
 
@@ -379,6 +391,7 @@ export class OrdinaryKernelCoordinator {
             definition_bundle_hash: attempt.definition_bundle_hash,
             input_subject: attempt.input_subject,
             lease_id: lease.id,
+            lease_generation: lease.generation,
             worker_id: lease.worker_id,
             lease_purpose: lease.purpose,
             work_retry_ordinal: attempt.work_retry_ordinal,
@@ -394,6 +407,7 @@ export class OrdinaryKernelCoordinator {
       view: await this.#load(view.run.id, attempt.id),
       bundle,
       outcome,
+      claim,
     });
   }
 
@@ -409,11 +423,13 @@ export class OrdinaryKernelCoordinator {
         const renewed = await this.#store.renewAttemptLease({
           attempt_id: attempt.id,
           lease_id: lease.id,
+          lease_generation: lease.generation,
           worker_id: lease.worker_id,
           expires_at: expiresAt,
         });
         if (
           renewed.id !== lease.id || renewed.worker_id !== lease.worker_id ||
+          renewed.generation !== lease.generation ||
           renewed.purpose !== lease.purpose || renewed.started !== true ||
           renewed.expires_at !== expiresAt
         ) throw new Error("attempt lease heartbeat returned a mismatched fence");
@@ -425,7 +441,9 @@ export class OrdinaryKernelCoordinator {
     view: ReductionView;
     bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
     outcome: KernelRuntimeOutcome;
+    claim: AttemptLeaseClaim;
   }): Promise<OrdinaryKernelStep> {
+    assertAttemptLeaseClaim(input.view, input.claim);
     const attempt = input.view.current_attempt!;
     if (input.outcome.state === "work_failed") {
       if (
@@ -439,18 +457,23 @@ export class OrdinaryKernelCoordinator {
             ordinal: attempt.work_retry_ordinal + 1,
           }),
           attempt_id: attempt.id,
-        });
+        }, input.claim);
         return this.#step("retried", await this.#load(input.view.run.id, attempt.id));
       }
-      return this.#terminal(input.view, "failed", input.outcome.reason);
+      return this.#terminal(input.view, "failed", input.outcome.reason, input.claim);
     }
 
     if (input.outcome.checkpoint !== null) {
-      await this.#completeWork(input.view, input.outcome.checkpoint);
+      await this.#completeWork(input.view, input.outcome.checkpoint, input.claim);
     }
     let completed = await this.#load(input.view.run.id, attempt.id);
     if (input.outcome.state === "needs_human") {
-      return this.#terminal(completed, "needs_human", input.outcome.reason);
+      return this.#terminal(
+        completed,
+        "needs_human",
+        input.outcome.reason,
+        completed.current_attempt?.lease === null ? undefined : input.claim,
+      );
     }
     if (input.outcome.state === "result_pending") {
       if (completed.current_attempt?.status !== "work_complete") {
@@ -490,7 +513,9 @@ export class OrdinaryKernelCoordinator {
     bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
     checkpoint: AttemptCheckpoint;
     outcome: KernelRuntimeOutcome;
+    claim: AttemptLeaseClaim;
   }): Promise<OrdinaryKernelStep> {
+    assertAttemptLeaseClaim(input.view, input.claim);
     const attempt = input.view.current_attempt!;
     if (input.outcome.state === "work_complete") {
       if (!sameCheckpoint(input.checkpoint, input.outcome.checkpoint)) {
@@ -500,6 +525,7 @@ export class OrdinaryKernelCoordinator {
         view: input.view,
         bundle: input.bundle,
         result: input.outcome.result,
+        claim: input.claim,
       });
     }
     if (input.outcome.state === "result_pending") {
@@ -511,6 +537,7 @@ export class OrdinaryKernelCoordinator {
           input.view,
           "needs_human",
           "result_correction_budget_exhausted",
+          input.claim,
         );
       }
       await this.#apply(
@@ -527,6 +554,7 @@ export class OrdinaryKernelCoordinator {
           diagnostics: input.outcome.diagnostics,
           correction_deadline: input.outcome.correction_deadline,
         },
+        input.claim,
       );
       return this.#step("result_pending", await this.#load(input.view.run.id, attempt.id));
     }
@@ -535,10 +563,14 @@ export class OrdinaryKernelCoordinator {
       : input.outcome.state === "work_failed"
         ? input.outcome.reason
         : "result_correction_did_not_produce_a_semantic_candidate";
-    return this.#terminal(input.view, "needs_human", reason);
+    return this.#terminal(input.view, "needs_human", reason, input.claim);
   }
 
-  async #completeWork(view: ReductionView, checkpoint: AttemptCheckpoint): Promise<void> {
+  async #completeWork(
+    view: ReductionView,
+    checkpoint: AttemptCheckpoint,
+    claim: AttemptLeaseClaim,
+  ): Promise<void> {
     const attempt = view.current_attempt!;
     const checkpointView: ReductionView = {
       ...view,
@@ -553,13 +585,14 @@ export class OrdinaryKernelCoordinator {
       attempt_id: attempt.id,
       checkpoint_id: checkpoint.id,
       verified_output_subject: checkpoint.output_subject,
-    });
+    }, claim);
   }
 
   async #recordEvaluateAndSettle(input: {
     view: ReductionView;
     bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
     result: KernelVerifiedActionResult;
+    claim?: AttemptLeaseClaim;
   }): Promise<OrdinaryKernelStep> {
     const attempt = input.view.current_attempt!;
     if (!attempt.checkpoint_id) throw new Error("authoritative result requires a verified checkpoint");
@@ -615,7 +648,7 @@ export class OrdinaryKernelCoordinator {
       command_id: transitionId("record", { attempt: attempt.id, record: record.id }),
       attempt_id: attempt.id,
       record_id: record.id,
-    });
+    }, input.claim);
 
     const checkpoint = recordView.checkpoints.get(attempt.checkpoint_id)!;
     const recorded = await this.#load(input.view.run.id, attempt.id, [record.id]);
@@ -767,6 +800,7 @@ export class OrdinaryKernelCoordinator {
     view: ReductionView,
     outcome: "needs_human" | "failed",
     reason: string,
+    claim?: AttemptLeaseClaim,
   ): Promise<OrdinaryKernelStep> {
     const attempt = view.current_attempt;
     if (!attempt) throw new Error("attempt terminal transition requires its exact aggregate");
@@ -782,7 +816,7 @@ export class OrdinaryKernelCoordinator {
       decision_record_id: prepared.decision.id,
       reason,
       resource_disposition: prepared.resource_disposition,
-    });
+    }, claim);
     return this.#step("terminal", await this.#load(view.run.id, null), attempt.id, attempt.scope.stage_id);
   }
 
@@ -871,7 +905,12 @@ export class OrdinaryKernelCoordinator {
     });
   }
 
-  async #apply(view: ReductionView, command: KernelCommand): Promise<AtomicTransitionBundle> {
+  async #apply(
+    view: ReductionView,
+    command: KernelCommand,
+    claim?: AttemptLeaseClaim,
+  ): Promise<AtomicTransitionBundle> {
+    if (claim) assertAttemptLeaseClaim(view, claim);
     const transition = reduceKernelCommand({
       manifest: view.manifest,
       run: view.run,

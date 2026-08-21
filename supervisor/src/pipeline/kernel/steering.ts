@@ -29,6 +29,8 @@ export interface KernelRuntimeSessionBinding {
   attempt_status: KernelAttempt["status"];
   repository_authority: KernelAttempt["repository_authority"];
   lease_id: string;
+  /** Recovery epoch for the otherwise stable lease identity. */
+  lease_generation: number;
   lease_worker_id: string;
   lease_purpose: AttemptLeasePurpose;
   lease_expires_at: string;
@@ -42,6 +44,7 @@ export interface KernelRuntimeSessionBindRequest {
   definition_bundle_hash: string;
   input_subject: string;
   lease_id: string;
+  lease_generation: number;
   worker_id: string;
   lease_purpose: AttemptLeasePurpose;
   work_retry_ordinal: number;
@@ -112,6 +115,7 @@ export interface KernelSteeringEnvelope {
     native_session_id: string;
     generation: number;
     lease_id: string;
+    lease_generation: number;
     lease_purpose: AttemptLeasePurpose;
   };
 }
@@ -128,6 +132,7 @@ export interface AuthorizedKernelSteering {
   native_session_id: string;
   generation: number;
   lease_id: string;
+  lease_generation: number;
   lease_purpose: AttemptLeasePurpose;
   policy: {
     phase: "work" | "result_correction";
@@ -158,6 +163,9 @@ function assertBinding(binding: KernelRuntimeSessionBinding): void {
   }
   if (!Number.isSafeInteger(binding.generation) || binding.generation < 0) {
     throw new Error("steering generation is invalid");
+  }
+  if (!Number.isSafeInteger(binding.lease_generation) || binding.lease_generation < 0) {
+    throw new Error("steering lease_generation is invalid");
   }
   if (
     !Number.isFinite(Date.parse(binding.lease_expires_at)) ||
@@ -203,6 +211,7 @@ export function createKernelSteeringEnvelope(input: {
       native_session_id: input.binding.native_session_id,
       generation: input.binding.generation,
       lease_id: input.binding.lease_id,
+      lease_generation: input.binding.lease_generation,
       lease_purpose: input.binding.lease_purpose,
     },
   };
@@ -235,7 +244,8 @@ export function authorizeKernelSteeringDelivery(input: {
   });
   const fields = [
     "pipeline_run_id", "attempt_id", "request_hash", "definition_bundle_hash",
-    "input_subject", "native_session_id", "generation", "lease_id", "lease_purpose",
+    "input_subject", "native_session_id", "generation", "lease_id", "lease_generation",
+    "lease_purpose",
   ] as const;
   const mismatch = fields.find((field) => envelope.binding[field] !== expected.binding[field]);
   if (mismatch) throw new Error(`steering ${mismatch} binding is stale or mismatched`);
@@ -253,6 +263,7 @@ export function authorizeKernelSteeringDelivery(input: {
     native_session_id: current.native_session_id,
     generation: current.generation,
     lease_id: current.lease_id,
+    lease_generation: current.lease_generation,
     lease_purpose: current.lease_purpose,
     policy: correction
       ? {

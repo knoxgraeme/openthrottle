@@ -58,12 +58,14 @@ export interface OfflineReplacementInput {
   active_work: readonly OfflineActiveWorkDisposition[];
   old: {
     release_id: string;
+    runtime_capability_digest: string;
     database_path: string;
     blob_root: string;
     archive_root: string;
   };
   fresh: {
     release_id: string;
+    runtime_capability_digest: string;
     database_path: string;
     blob_root: string;
     blob_store_id: string;
@@ -80,6 +82,7 @@ export interface OfflineSmokeResult {
 
 export interface OfflinePreconditionObservation {
   old_release_id: string;
+  old_runtime_capability_digest: string;
   database_path: string;
   blob_root: string;
   ingress_closed: true;
@@ -93,13 +96,28 @@ export interface OfflineObservedPreconditions extends OfflinePreconditionObserva
   exclusive_database_lock: "acquired";
 }
 
+export interface OfflineRestoreEvidence {
+  old_release_id: string;
+  old_runtime_capability_digest: string;
+  database_path: string;
+  blob_root: string;
+  archive_manifest_digest: string;
+  evidence: string;
+}
+
+export type OfflineRollbackEvidence =
+  | { kind: "candidate_stopped"; evidence: string }
+  | { kind: "candidate_stop_failed"; error: string }
+  | { kind: "old_tuple_restored"; restore: OfflineRestoreEvidence }
+  | { kind: "old_tuple_restore_failed"; error: string };
+
 export interface OfflineReplacementHooks {
   observePreconditions(input: OfflineReplacementInput): Promise<OfflinePreconditionObservation>;
   startCandidate(input: OfflineReplacementInput): Promise<string>;
   runSmoke(kind: "ordinary" | "structured"): Promise<OfflineSmokeResult>;
   reopenIngress(): Promise<string>;
   stopCandidate(reason: string): Promise<string>;
-  restoreOld(reason: string): Promise<string>;
+  restoreOld(reason: string): Promise<OfflineRestoreEvidence>;
 }
 
 interface ArchiveFile {
@@ -110,6 +128,7 @@ interface ArchiveFile {
 
 interface OldArchiveEvidence {
   root: string;
+  old_runtime_capability_digest: string;
   database_sha256: string;
   blob_tree_digest: string;
   manifest_digest: string;
@@ -126,7 +145,9 @@ export interface OfflineReplacementReport {
   ready_at: string | null;
   finished_at: string;
   old_release_id: string;
+  old_runtime_capability_digest: string;
   fresh_release_id: string;
+  fresh_runtime_capability_digest: string;
   archive: OldArchiveEvidence | null;
   bootstrap_checksum: string;
   fresh_epoch: FreshEpochVerification | null;
@@ -137,7 +158,7 @@ export interface OfflineReplacementReport {
   smoke: { ordinary: OfflineSmokeResult; structured: OfflineSmokeResult } | null;
   reopen_evidence: string | null;
   ready_report_digest: string | null;
-  rollback_evidence: readonly string[];
+  rollback_evidence: readonly OfflineRollbackEvidence[];
   rollback_failure: string | null;
   failure: string | null;
   report_digest: string;
@@ -145,6 +166,13 @@ export interface OfflineReplacementReport {
 
 function sha256(bytes: string | Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function lowercaseSha256Digest(value: unknown, name: string): string {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error(`${name} must be a lowercase SHA-256 digest`);
+  }
+  return value;
 }
 
 function bounded(value: unknown, name: string, max = 500): string {
@@ -311,12 +339,20 @@ function normalizedInput(input: OfflineReplacementInput): OfflineReplacementInpu
     active_work: activeWork,
     old: {
       release_id: bounded(input.old.release_id, "old.release_id", 200),
+      runtime_capability_digest: lowercaseSha256Digest(
+        input.old.runtime_capability_digest,
+        "old.runtime_capability_digest",
+      ),
       database_path: paths.old_database,
       blob_root: paths.old_blobs,
       archive_root: paths.archive,
     },
     fresh: {
       release_id: bounded(input.fresh.release_id, "fresh.release_id", 200),
+      runtime_capability_digest: lowercaseSha256Digest(
+        input.fresh.runtime_capability_digest,
+        "fresh.runtime_capability_digest",
+      ),
       database_path: paths.fresh_database,
       blob_root: paths.fresh_blobs,
       blob_store_id: bounded(input.fresh.blob_store_id, "fresh.blob_store_id", 200),
@@ -332,6 +368,7 @@ function normalizedPreconditionObservation(
 ): OfflinePreconditionObservation {
   const observation = objectWithExactKeys(value, [
     "old_release_id",
+    "old_runtime_capability_digest",
     "database_path",
     "blob_root",
     "ingress_closed",
@@ -341,10 +378,15 @@ function normalizedPreconditionObservation(
     "evidence",
   ], "observed preconditions");
   const oldReleaseId = bounded(observation.old_release_id, "observed old_release_id", 200);
+  const oldRuntimeCapabilityDigest = lowercaseSha256Digest(
+    observation.old_runtime_capability_digest,
+    "observed old_runtime_capability_digest",
+  );
   const databasePath = absolutePath(observation.database_path, "observed database_path");
   const blobRoot = absolutePath(observation.blob_root, "observed blob_root");
   if (
     oldReleaseId !== input.old.release_id ||
+    oldRuntimeCapabilityDigest !== input.old.runtime_capability_digest ||
     databasePath !== input.old.database_path ||
     blobRoot !== input.old.blob_root
   ) {
@@ -360,6 +402,7 @@ function normalizedPreconditionObservation(
   }
   return {
     old_release_id: oldReleaseId,
+    old_runtime_capability_digest: oldRuntimeCapabilityDigest,
     database_path: databasePath,
     blob_root: blobRoot,
     ingress_closed: true,
@@ -432,7 +475,10 @@ function copyRegularTree(source: string, target: string, prefix = ""): ArchiveFi
   return files;
 }
 
-function databaseEvidence(path: string): Omit<OldArchiveEvidence, "root" | "database_sha256" | "blob_tree_digest" | "manifest_digest"> {
+function databaseEvidence(path: string): Omit<
+  OldArchiveEvidence,
+  "root" | "old_runtime_capability_digest" | "database_sha256" | "blob_tree_digest" | "manifest_digest"
+> {
   const db = new Database(path, { readonly: true, fileMustExist: true });
   try {
     db.pragma("query_only = ON");
@@ -492,6 +538,7 @@ async function archiveOld(input: OfflineReplacementInput): Promise<OldArchiveEvi
     const content = {
       schema: "openthrottle.offline-archive/v1",
       old_release_id: input.old.release_id,
+      old_runtime_capability_digest: input.old.runtime_capability_digest,
       database: {
         path: "database.sqlite",
         bytes: statSync(databasePath).size,
@@ -510,6 +557,7 @@ async function archiveOld(input: OfflineReplacementInput): Promise<OldArchiveEvi
     fsyncPath(parent);
     return {
       root: input.old.archive_root,
+      old_runtime_capability_digest: input.old.runtime_capability_digest,
       database_sha256: content.database.sha256,
       blob_tree_digest: content.blob_tree_digest,
       manifest_digest: manifest.manifest_digest,
@@ -530,11 +578,13 @@ function initializeFresh(input: OfflineReplacementInput): FreshEpochVerification
     database_path: input.fresh.database_path,
     blob_store: blobs,
     release_id: input.fresh.release_id,
+    runtime_capability_digest: input.fresh.runtime_capability_digest,
     bootstrap: input.fresh.bootstrap,
   });
   try {
     return verifyFreshEpochDatabase(db, {
       release_id: input.fresh.release_id,
+      runtime_capability_digest: input.fresh.runtime_capability_digest,
       blob_store_id: blobs.store_id,
       blob_marker_checksum: blobs.marker_checksum,
       bootstrap_checksum: input.fresh.bootstrap.checksum,
@@ -552,6 +602,48 @@ function normalizedSmokeResult(kind: "ordinary" | "structured", value: unknown):
     status: "passed",
     evidence: bounded(result.evidence, `${kind} smoke evidence`, 4_000),
   };
+}
+
+function normalizedRestoreEvidence(
+  value: unknown,
+  input: OfflineReplacementInput,
+  archive: OldArchiveEvidence | null,
+): OfflineRestoreEvidence {
+  if (archive === null) {
+    throw new Error("old tuple restore cannot be verified without a sealed archive manifest");
+  }
+  const result = objectWithExactKeys(value, [
+    "old_release_id",
+    "old_runtime_capability_digest",
+    "database_path",
+    "blob_root",
+    "archive_manifest_digest",
+    "evidence",
+  ], "old tuple restore evidence");
+  const normalized: OfflineRestoreEvidence = {
+    old_release_id: bounded(result.old_release_id, "restored old_release_id", 200),
+    old_runtime_capability_digest: lowercaseSha256Digest(
+      result.old_runtime_capability_digest,
+      "restored old_runtime_capability_digest",
+    ),
+    database_path: absolutePath(result.database_path, "restored database_path"),
+    blob_root: absolutePath(result.blob_root, "restored blob_root"),
+    archive_manifest_digest: lowercaseSha256Digest(
+      result.archive_manifest_digest,
+      "restored archive_manifest_digest",
+    ),
+    evidence: bounded(result.evidence, "old tuple restore evidence", 4_000),
+  };
+  if (
+    normalized.old_release_id !== input.old.release_id ||
+    normalized.old_runtime_capability_digest !== input.old.runtime_capability_digest ||
+    normalized.database_path !== input.old.database_path ||
+    normalized.blob_root !== input.old.blob_root ||
+    normalized.archive_manifest_digest !== archive.manifest_digest
+  ) {
+    throw new Error("old tuple restore evidence does not match the exact archived tuple");
+  }
+  return normalized;
 }
 
 function reportWithDigest(content: Omit<OfflineReplacementReport, "report_digest">): OfflineReplacementReport {
@@ -623,7 +715,7 @@ export async function runOfflineReplacement(inputValue: OfflineReplacementInput,
     finishedAt?: string;
     reopenEvidence?: string | null;
     readyReportDigest?: string | null;
-    rollbackEvidence?: readonly string[];
+    rollbackEvidence?: readonly OfflineRollbackEvidence[];
     rollbackFailure?: string | null;
     failure?: string | null;
   }): OfflineReplacementReport => reportWithDigest({
@@ -633,7 +725,9 @@ export async function runOfflineReplacement(inputValue: OfflineReplacementInput,
     ready_at: readyAt,
     finished_at: values.finishedAt ?? now(),
     old_release_id: input.old.release_id,
+    old_runtime_capability_digest: input.old.runtime_capability_digest,
     fresh_release_id: input.fresh.release_id,
+    fresh_runtime_capability_digest: input.fresh.runtime_capability_digest,
     archive,
     bootstrap_checksum: input.fresh.bootstrap.checksum,
     fresh_epoch: freshEpoch,
@@ -663,24 +757,26 @@ export async function runOfflineReplacement(inputValue: OfflineReplacementInput,
     writeReport(input.report_path, readyReport);
   } catch (error) {
     const reason = errorMessage(error);
-    const rollbackEvidence: string[] = [];
+    const rollbackEvidence: OfflineRollbackEvidence[] = [];
     let rollbackFailure: string | null = null;
     try {
-      rollbackEvidence.push(
-        `candidate_stopped:${bounded(await hooks.stopCandidate(reason), "candidate stop evidence", 4_000)}`,
-      );
+      rollbackEvidence.push({
+        kind: "candidate_stopped",
+        evidence: bounded(await hooks.stopCandidate(reason), "candidate stop evidence", 4_000),
+      });
     } catch (rollbackError) {
       rollbackFailure = errorMessage(rollbackError);
-      rollbackEvidence.push(`candidate_stop_failed:${rollbackFailure}`);
+      rollbackEvidence.push({ kind: "candidate_stop_failed", error: rollbackFailure });
     }
     if (rollbackFailure === null) {
       try {
-        rollbackEvidence.push(
-          `old_tuple_restored:${bounded(await hooks.restoreOld(reason), "old tuple restore evidence", 4_000)}`,
-        );
+        rollbackEvidence.push({
+          kind: "old_tuple_restored",
+          restore: normalizedRestoreEvidence(await hooks.restoreOld(reason), input, archive),
+        });
       } catch (rollbackError) {
         rollbackFailure = errorMessage(rollbackError);
-        rollbackEvidence.push(`old_tuple_restore_failed:${rollbackFailure}`);
+        rollbackEvidence.push({ kind: "old_tuple_restore_failed", error: rollbackFailure });
       }
     }
     const status = rollbackFailure === null ? "rolled_back" : "rollback_failed";
