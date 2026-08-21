@@ -24,6 +24,7 @@ import { FRESH_EPOCH_TABLES } from "./epoch-schema.js";
 
 const temporaryDirectories: string[] = [];
 const NOW = "2026-08-20T12:00:00.000Z";
+const RUNTIME_CAPABILITY = "c".repeat(64);
 
 function temporaryDirectory(): string {
   const path = mkdtempSync(join(tmpdir(), "openthrottle-fresh-epoch-"));
@@ -64,11 +65,13 @@ function initialized() {
     database_path,
     blob_store,
     release_id: "release-a",
+    runtime_capability_digest: RUNTIME_CAPABILITY,
     bootstrap: manifest,
     now: () => NOW,
   });
   const expected_identity: FreshEpochIdentity = {
     release_id: "release-a",
+    runtime_capability_digest: RUNTIME_CAPABILITY,
     blob_store_id: blob_store.store_id,
     blob_marker_checksum: blob_store.marker_checksum,
     bootstrap_checksum: manifest.checksum,
@@ -105,11 +108,16 @@ describe("fresh epoch database", () => {
         { key: "epoch.blob_store_id", mutable: 0 },
         { key: "epoch.bootstrap_checksum", mutable: 0 },
         { key: "epoch.release_id", mutable: 0 },
+        { key: "epoch.runtime_capability_digest", mutable: 0 },
         { key: "operator.mode", mutable: 0 },
         { key: "operator.poll_batch_size", mutable: 1 },
       ]);
       expect(() => db.prepare("UPDATE settings SET value_json = '\"changed\"' WHERE key = 'epoch.release_id'").run())
         .toThrow(/immutable setting/);
+      expect(() => db.prepare(`
+        UPDATE settings SET value_json = '"${"d".repeat(64)}"'
+        WHERE key = 'epoch.runtime_capability_digest'
+      `).run()).toThrow(/immutable setting/);
       expect(() => db.prepare("DELETE FROM settings WHERE key = 'operator.mode'").run())
         .toThrow(/immutable setting/);
       db.prepare(`
@@ -131,6 +139,7 @@ describe("fresh epoch database", () => {
       database_path: initializedEpoch.database_path,
       blob_store: initializedEpoch.blob_store,
       release_id: "release-a",
+      runtime_capability_digest: RUNTIME_CAPABILITY,
       bootstrap: initializedEpoch.manifest,
     });
     reopened.close();
@@ -140,6 +149,16 @@ describe("fresh epoch database", () => {
       database_path: initializedEpoch.database_path,
       blob_store: initializedEpoch.blob_store,
       expected_identity: { ...initializedEpoch.expected_identity, release_id: "release-b" },
+    })).toThrow(/identity mismatch/);
+    expect(digest(initializedEpoch.database_path)).toBe(before);
+
+    expect(() => openFreshEpochDatabase({
+      database_path: initializedEpoch.database_path,
+      blob_store: initializedEpoch.blob_store,
+      expected_identity: {
+        ...initializedEpoch.expected_identity,
+        runtime_capability_digest: "d".repeat(64),
+      },
     })).toThrow(/identity mismatch/);
     expect(digest(initializedEpoch.database_path)).toBe(before);
 
@@ -174,6 +193,7 @@ describe("fresh epoch database", () => {
       database_path: path,
       blob_store,
       release_id: "release-a",
+      runtime_capability_digest: RUNTIME_CAPABILITY,
       bootstrap: bootstrap(),
     })).toThrow(FreshEpochRefusalError);
     expect(digest(path)).toBe(before);
@@ -227,8 +247,18 @@ describe("fresh epoch database", () => {
       database_path: path,
       blob_store,
       release_id: "release-a",
+      runtime_capability_digest: RUNTIME_CAPABILITY,
       bootstrap: tampered,
     })).toThrow(/checksum mismatch/);
+    expect(() => readFileSync(path)).toThrow();
+
+    expect(() => initializeFreshEpochDatabase({
+      database_path: path,
+      blob_store,
+      release_id: "release-a",
+      runtime_capability_digest: "C".repeat(64),
+      bootstrap: valid,
+    })).toThrow(/lowercase SHA-256/);
     expect(() => readFileSync(path)).toThrow();
 
     expect(() => createFreshEpochBootstrap({

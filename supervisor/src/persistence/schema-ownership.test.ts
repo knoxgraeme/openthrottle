@@ -158,10 +158,10 @@ describe("fresh epoch schema ownership", () => {
           context_record_ids_json, context_checkpoint_ids_json,
           status, version, work_retry_ordinal, result_correction_count,
           result_correction_deadline, unmet_dependency_count,
-          lease_id, lease_worker_id, lease_purpose, lease_expires_at, lease_started,
+          lease_id, lease_generation, lease_worker_id, lease_purpose, lease_expires_at, lease_started,
           created_at, updated_at
         ) VALUES ('bad-lease', 'run', 'stage', 'implement', 'inspect', ?, ?, ?, NULL, '[]', '[]',
-          'pending', 0, 0, 0, ?, 0, 'lease', NULL, 'work', ?, 0, ?, ?)
+          'pending', 0, 0, 0, ?, 0, 'lease', 0, NULL, 'work', ?, 0, ?, ?)
       `).run(OTHER_HASH, HASH, SHA, NOW, NOW, NOW, NOW)).toThrow(/CHECK constraint/);
     } finally {
       db.close();

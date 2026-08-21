@@ -84,6 +84,7 @@ export interface AttemptRow {
   result_correction_deadline: string | null;
   unmet_dependency_count: number;
   lease_id: string | null;
+  lease_generation: number | null;
   lease_worker_id: string | null;
   lease_purpose: "work" | "result_correction" | null;
   lease_expires_at: string | null;
@@ -225,10 +226,16 @@ function scopeFromRow(row: AttemptRow): AttemptScope {
 }
 
 export function attemptFromRow(row: AttemptRow): KernelAttempt {
+  if (row.lease_id !== null && (
+    !Number.isSafeInteger(row.lease_generation) || row.lease_generation! < 0
+  )) {
+    throw new Error("persisted attempt lease generation is invalid");
+  }
   const lease = row.lease_id === null
     ? null
     : {
       id: row.lease_id,
+      generation: row.lease_generation!,
       worker_id: row.lease_worker_id!,
       purpose: row.lease_purpose!,
       expires_at: row.lease_expires_at!,

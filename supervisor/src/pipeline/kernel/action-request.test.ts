@@ -110,6 +110,7 @@ describe("buildKernelResultCorrectionRequest", () => {
       result_correction_deadline: "2026-08-20T13:00:00.000Z",
       lease: {
         id: "lease-correction",
+        generation: 0,
         worker_id: "worker-1",
         purpose: "result_correction",
         expires_at: "2026-08-20T12:05:00.000Z",

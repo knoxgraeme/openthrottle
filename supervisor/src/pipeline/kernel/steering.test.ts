@@ -20,6 +20,7 @@ function binding(
     attempt_status: "running",
     repository_authority: "edit",
     lease_id: "lease-1",
+    lease_generation: 0,
     lease_worker_id: "worker-1",
     lease_purpose: "work",
     lease_expires_at: "2026-08-20T12:05:00.000Z",
@@ -42,6 +43,7 @@ describe("kernel steering", () => {
       attempt_id: "attempt-1",
       native_session_id: "session-1",
       generation: 0,
+      lease_generation: 0,
       policy: {
         phase: "work",
         repository_authority: "edit",
@@ -57,6 +59,7 @@ describe("kernel steering", () => {
       binding({ generation: 1 }),
       binding({ request_hash: "c".repeat(64) }),
       binding({ lease_id: "lease-2" }),
+      binding({ lease_generation: 1 }),
     ]) {
       expect(() => authorizeKernelSteeringDelivery({ envelope, current_binding: stale }))
         .toThrow(/stale or mismatched/);
@@ -112,6 +115,21 @@ describe("kernel steering", () => {
       lease_purpose: "result_correction",
     });
     expect(secondCorrection).not.toBe(firstCorrection);
+  });
+
+  it("invalidates a queued envelope when recovery advances only the lease generation", () => {
+    const beforeRecovery = binding({ generation: 0, lease_generation: 0 });
+    const envelope = createKernelSteeringEnvelope({
+      message_id: "message-before-recovery",
+      source: "operator",
+      body: "This belongs only to the original lease owner.",
+      binding: beforeRecovery,
+    });
+
+    expect(() => authorizeKernelSteeringDelivery({
+      envelope,
+      current_binding: binding({ generation: 0, lease_generation: 1 }),
+    })).toThrow(/lease_generation.*stale or mismatched/);
   });
 
   it("fails closed before the runtime session is durably bound", () => {

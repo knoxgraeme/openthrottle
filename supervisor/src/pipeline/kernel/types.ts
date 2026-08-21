@@ -93,6 +93,7 @@ export type AttemptLeasePurpose = "work" | "result_correction";
 
 export interface AttemptLease {
   id: string;
+  generation: number;
   worker_id: string;
   purpose: AttemptLeasePurpose;
   expires_at: string;

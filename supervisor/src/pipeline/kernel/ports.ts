@@ -53,6 +53,49 @@ export interface LeasedAttemptView {
   lease: AttemptLease;
 }
 
+export interface AttemptLeaseClaim {
+  run_id: string;
+  attempt_id: string;
+  lease_id: string;
+  lease_generation: number;
+  worker_id: string;
+  purpose: AttemptLease["purpose"];
+}
+
+/** Captures the supervisor-private ownership claim without renewable fields. */
+export function captureAttemptLeaseClaim(leased: LeasedAttemptView): AttemptLeaseClaim {
+  const persisted = leased.attempt.lease;
+  if (
+    !persisted || persisted.id !== leased.lease.id ||
+    persisted.generation !== leased.lease.generation ||
+    persisted.worker_id !== leased.lease.worker_id ||
+    persisted.purpose !== leased.lease.purpose
+  ) throw new Error("leased Attempt view contains a mismatched lease claim");
+  return Object.freeze({
+    run_id: leased.run_id,
+    attempt_id: leased.attempt.id,
+    lease_id: leased.lease.id,
+    lease_generation: leased.lease.generation,
+    worker_id: leased.lease.worker_id,
+    purpose: leased.lease.purpose,
+  });
+}
+
+export function assertAttemptLeaseClaim(
+  view: ReductionView,
+  claim: AttemptLeaseClaim,
+): KernelAttempt {
+  const attempt = view.current_attempt;
+  const lease = attempt?.lease;
+  if (
+    view.run.id !== claim.run_id || attempt?.id !== claim.attempt_id ||
+    !lease || lease.id !== claim.lease_id ||
+    lease.generation !== claim.lease_generation ||
+    lease.worker_id !== claim.worker_id || lease.purpose !== claim.purpose
+  ) throw new Error("Attempt lease claim generation is stale or mismatched");
+  return attempt;
+}
+
 export interface KernelAttemptLeasePort {
   // Implementations materialize dependency eligibility from KernelCursor as
   // indexed attempt state; this operation must not discover work by scanning
@@ -61,6 +104,7 @@ export interface KernelAttemptLeasePort {
   renewAttemptLease(input: {
     attempt_id: string;
     lease_id: string;
+    lease_generation: number;
     worker_id: string;
     expires_at: string;
   }): Promise<AttemptLease>;

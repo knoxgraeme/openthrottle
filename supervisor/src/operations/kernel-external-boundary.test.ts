@@ -54,6 +54,16 @@ const INTEGRATION_BLOB = {
   payload_schema: "openthrottle.git-checkpoint-bundle/v1",
 };
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function bundle(pipelineId = "core/test"): DefinitionBundle {
   return {
     schema: "openthrottle.definition-bundle/v1",
@@ -182,6 +192,7 @@ function initialAttempt(currentManifest: CompiledPipelineManifest): KernelAttemp
     result_correction_deadline: null,
     lease: {
       id: "attempt-lease-1",
+      generation: 0,
       worker_id: "external-worker",
       purpose: "work",
       expires_at: "2026-08-20T12:05:00.000Z",
@@ -553,6 +564,140 @@ describe("kernel external boundary bridge", () => {
     await expect(bridge.executeLeasedAttempt(store.leased()))
       .rejects.toThrow(/sealed GitHub provider-evidence policy/);
     expect(store.schedules.size).toBe(0);
+  });
+
+  it("rejects a stale external claim after recovery before scheduling any effect", async () => {
+    const definitionBundle = bundle();
+    const currentManifest = manifest({ bundle_hash: digestCanonicalJson(definitionBundle) });
+    const store = new MemoryExternalStore(currentManifest);
+    const stale = store.leased();
+    const publish = binding("core/publish@1");
+    const recovering: KernelExternalStagePlanBinding = {
+      ...publish,
+      async prepare(request) {
+        const current = store.attempts.get(request.attempt.id)!;
+        const recovered = {
+          ...current,
+          version: current.version + 1,
+          lease: {
+            ...current.lease!,
+            generation: current.lease!.generation + 1,
+            expires_at: "2026-08-20T12:10:00.000Z",
+          },
+        };
+        store.attempts.set(recovered.id, recovered);
+        store.run = {
+          ...store.run,
+          version: store.run.version + 1,
+          active_attempt_versions: {
+            ...store.run.active_attempt_versions,
+            [recovered.id]: recovered.version,
+          },
+        };
+        return publish.prepare(request);
+      },
+    };
+    const bridge = coordinator({
+      store,
+      definition_bundle: definitionBundle,
+      plans: [recovering],
+    });
+
+    await expect(bridge.executeLeasedAttempt(stale)).rejects.toThrow(/claim generation/);
+    expect(store.schedules.size).toBe(0);
+    expect(store.attempts.get("attempt-1")?.lease).toMatchObject({
+      id: stale.lease.id,
+      worker_id: stale.lease.worker_id,
+      generation: 1,
+      started: true,
+    });
+  });
+
+  it("rejects a paused stale generation after the recovered generation schedules and delivers", async () => {
+    const definitionBundle = bundle();
+    const currentManifest = manifest({
+      bundle_hash: digestCanonicalJson(definitionBundle),
+      external_kind: "core/provider-wait@1",
+      stage_kind: "wait",
+    });
+    const store = new MemoryExternalStore(currentManifest);
+    const wait = binding("core/provider-wait@1");
+    const stalePrepareEntered = deferred();
+    const resumeStalePrepare = deferred();
+    let evaluationCount = 0;
+    const racing: KernelExternalStagePlanBinding = {
+      ...wait,
+      async prepare(request) {
+        if (request.attempt.lease?.generation === 0) {
+          stalePrepareEntered.resolve();
+          await resumeStalePrepare.promise;
+        }
+        return wait.prepare(request);
+      },
+      async evaluate(request) {
+        evaluationCount += 1;
+        return wait.evaluate(request);
+      },
+    };
+    const bridge = coordinator({
+      store,
+      definition_bundle: definitionBundle,
+      plans: [racing],
+    });
+
+    const staleExecution = bridge.executeLeasedAttempt(store.leased());
+    await stalePrepareEntered.promise;
+
+    const current = store.attempts.get("attempt-1")!;
+    const recovered = {
+      ...current,
+      version: current.version + 1,
+      lease: {
+        ...current.lease!,
+        generation: current.lease!.generation + 1,
+        expires_at: "2026-08-20T12:10:00.000Z",
+      },
+    };
+    store.attempts.set(recovered.id, recovered);
+    store.run = {
+      ...store.run,
+      version: store.run.version + 1,
+      active_attempt_versions: {
+        ...store.run.active_attempt_versions,
+        [recovered.id]: recovered.version,
+      },
+    };
+
+    await expect(bridge.executeLeasedAttempt(store.leased())).resolves.toMatchObject({
+      disposition: "scheduled",
+      phase: "observe",
+    });
+    store.acknowledgePhase("observe");
+    resumeStalePrepare.resolve();
+
+    await expect(staleExecution).rejects.toThrow(/claim generation/);
+    expect(evaluationCount).toBe(0);
+    expect(store.attempts.get("attempt-1")).toMatchObject({
+      status: "work_complete",
+      lease: null,
+    });
+    expect(store.schedules.get("external-schedule:attempt-1:observe")?.effects[0]?.delivery)
+      .toMatchObject({ status: "confirmed" });
+  });
+
+  it("does not let an unleased continuation adopt a live external lease", async () => {
+    const definitionBundle = bundle();
+    const currentManifest = manifest({ bundle_hash: digestCanonicalJson(definitionBundle) });
+    const store = new MemoryExternalStore(currentManifest);
+    const bridge = coordinator({
+      store,
+      definition_bundle: definitionBundle,
+      plans: [binding("core/publish@1")],
+    });
+
+    await expect(bridge.resumeAttempt({ pipeline_run_id: "run-1", attempt_id: "attempt-1" }))
+      .rejects.toThrow(/cannot adopt a live Attempt lease/);
+    expect(store.applied).toHaveLength(0);
   });
 
   it("walks ordered publish phases and settles from executor-authored result bytes", async () => {

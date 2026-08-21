@@ -37,6 +37,7 @@ const MAX_BOOTSTRAP_SETTINGS = 128;
 const MAX_BOOTSTRAP_REGISTRATIONS = 256;
 const MAX_BOOTSTRAP_BYTES = 1024 * 1024;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,299}$/;
+const LOWERCASE_SHA256 = /^[a-f0-9]{64}$/;
 
 export type SettingValueType = "string" | "number" | "boolean" | "json";
 
@@ -72,6 +73,7 @@ export interface FreshEpochBootstrap extends FreshEpochBootstrapContent {
 
 export interface FreshEpochIdentity {
   release_id: string;
+  runtime_capability_digest: string;
   blob_store_id: string;
   blob_marker_checksum: string;
   bootstrap_checksum: string;
@@ -107,6 +109,13 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[], path
 function boundedString(value: unknown, path: string, max = 300): string {
   if (typeof value !== "string" || value.length < 1 || value.length > max) {
     refuse(`${path} must be a non-empty string of at most ${max} characters`);
+  }
+  return value;
+}
+
+function lowercaseSha256(value: unknown, path: string): string {
+  if (typeof value !== "string" || !LOWERCASE_SHA256.test(value)) {
+    refuse(`${path} must be a lowercase SHA-256 digest`);
   }
   return value;
 }
@@ -297,6 +306,10 @@ export function verifyFreshEpochDatabase(
   db: Database.Database,
   expected: FreshEpochIdentity,
 ): FreshEpochVerification {
+  const expectedRuntimeCapabilityDigest = lowercaseSha256(
+    expected.runtime_capability_digest,
+    "expected runtime_capability_digest",
+  );
   if (db.pragma("foreign_keys", { simple: true }) !== 1) refuse("foreign keys are disabled");
   if (db.pragma("application_id", { simple: true }) !== FRESH_EPOCH_APPLICATION_ID) {
     refuse("database application identity is unknown");
@@ -328,11 +341,18 @@ export function verifyFreshEpochDatabase(
 
   const actual: FreshEpochIdentity = {
     release_id: readIdentitySetting(db, "epoch.release_id"),
+    runtime_capability_digest: lowercaseSha256(
+      readIdentitySetting(db, "epoch.runtime_capability_digest"),
+      "epoch.runtime_capability_digest",
+    ),
     blob_store_id: readIdentitySetting(db, "epoch.blob_store_id"),
     blob_marker_checksum: readIdentitySetting(db, "epoch.blob_marker_checksum"),
     bootstrap_checksum: readIdentitySetting(db, "epoch.bootstrap_checksum"),
   };
-  if (canonicalJson(actual) !== canonicalJson(expected)) refuse("release, bootstrap, or blob-root identity mismatch");
+  if (canonicalJson(actual) !== canonicalJson({
+    ...expected,
+    runtime_capability_digest: expectedRuntimeCapabilityDigest,
+  })) refuse("release, runtime capability, bootstrap, or blob-root identity mismatch");
   return {
     ...actual,
     schema_version: FRESH_EPOCH_VERSION,
@@ -366,6 +386,7 @@ function insertBootstrap(
 ): void {
   for (const [key, value] of Object.entries({
     "epoch.release_id": identity.release_id,
+    "epoch.runtime_capability_digest": identity.runtime_capability_digest,
     "epoch.blob_store_id": identity.blob_store_id,
     "epoch.blob_marker_checksum": identity.blob_marker_checksum,
     "epoch.bootstrap_checksum": identity.bootstrap_checksum,
@@ -399,7 +420,7 @@ function insertBootstrap(
 }
 
 function assertBootstrapOnly(db: Database.Database, bootstrap: FreshEpochBootstrap): void {
-  const expectedSupportRows = bootstrap.settings.length + 4;
+  const expectedSupportRows = bootstrap.settings.length + 5;
   const settingCount = db.prepare("SELECT COUNT(*) AS count FROM settings").get() as { count: number };
   const registrationCount = db.prepare("SELECT COUNT(*) AS count FROM repository_registrations").get() as { count: number };
   if (settingCount.count !== expectedSupportRows || registrationCount.count !== bootstrap.repository_registrations.length) {
@@ -444,6 +465,7 @@ export function initializeFreshEpochDatabase(input: {
   database_path: string;
   blob_store: VolumeBlobStore;
   release_id: string;
+  runtime_capability_digest: string;
   bootstrap: FreshEpochBootstrap;
   now?: () => string;
 }): Database.Database {
@@ -456,6 +478,10 @@ export function initializeFreshEpochDatabase(input: {
   const bootstrap = validateFreshEpochBootstrap(input.bootstrap);
   const identity: FreshEpochIdentity = {
     release_id: releaseId,
+    runtime_capability_digest: lowercaseSha256(
+      input.runtime_capability_digest,
+      "runtime_capability_digest",
+    ),
     blob_store_id: input.blob_store.store_id,
     blob_marker_checksum: input.blob_store.marker_checksum,
     bootstrap_checksum: bootstrap.checksum,
@@ -510,6 +536,13 @@ export function openFreshEpochDatabase(input: {
   expected_identity: FreshEpochIdentity;
 }): Database.Database {
   const target = resolve(input.database_path);
+  const expectedIdentity: FreshEpochIdentity = {
+    ...input.expected_identity,
+    runtime_capability_digest: lowercaseSha256(
+      input.expected_identity.runtime_capability_digest,
+      "expected runtime_capability_digest",
+    ),
+  };
   const stats = lstatSync(target);
   if (!stats.isFile() || stats.isSymbolicLink()) refuse("target database is not a regular file");
   input.blob_store.assertSameVolume(target);
@@ -518,7 +551,7 @@ export function openFreshEpochDatabase(input: {
   try {
     proof.pragma("foreign_keys = ON");
     proof.pragma("query_only = ON");
-    verifyFreshEpochDatabase(proof, input.expected_identity);
+    verifyFreshEpochDatabase(proof, expectedIdentity);
   } finally {
     proof.close();
   }
@@ -532,7 +565,7 @@ export function openFreshEpochDatabase(input: {
     db.pragma("journal_mode = WAL");
     db.pragma("synchronous = FULL");
     db.pragma("busy_timeout = 5000");
-    verifyFreshEpochDatabase(db, input.expected_identity);
+    verifyFreshEpochDatabase(db, expectedIdentity);
     return db;
   } catch (error) {
     db.close();
@@ -544,12 +577,17 @@ export function openOrInitializeFreshEpochDatabase(input: {
   database_path: string;
   blob_store: VolumeBlobStore;
   release_id: string;
+  runtime_capability_digest: string;
   bootstrap: FreshEpochBootstrap;
   now?: () => string;
 }): Database.Database {
   const bootstrap = validateFreshEpochBootstrap(input.bootstrap);
   const expected_identity: FreshEpochIdentity = {
     release_id: boundedString(input.release_id, "release_id", 200),
+    runtime_capability_digest: lowercaseSha256(
+      input.runtime_capability_digest,
+      "runtime_capability_digest",
+    ),
     blob_store_id: input.blob_store.store_id,
     blob_marker_checksum: input.blob_store.marker_checksum,
     bootstrap_checksum: bootstrap.checksum,

@@ -131,6 +131,7 @@ describe("KernelInboxRouter", () => {
           native_session_id: "session-1",
           generation: 0,
           lease_id: "lease-1",
+          lease_generation: 0,
           lease_purpose: "work",
         },
       },

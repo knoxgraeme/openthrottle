@@ -44,6 +44,7 @@ function assertRequestShape(request: KernelRuntimeSessionBindRequest): void {
   validId(request.attempt_id, "attempt_id");
   validId(request.lease_id, "lease_id");
   validId(request.worker_id, "worker_id");
+  validOrdinal(request.lease_generation, "lease generation");
   if (!NATIVE_SESSION_ID.test(request.native_session_id)) {
     throw new Error("runtime session native_session_id is invalid");
   }
@@ -91,7 +92,8 @@ function assertBindFences(input: {
 
   const lease = attempt.lease;
   if (
-    !lease || lease.id !== request.lease_id || lease.worker_id !== request.worker_id ||
+    !lease || lease.id !== request.lease_id || lease.generation !== request.lease_generation ||
+    lease.worker_id !== request.worker_id ||
     lease.purpose !== request.lease_purpose
   ) throw new Error("runtime session lease fence does not match");
   if (!lease.started) throw new Error("runtime session requires a started lease");
@@ -143,6 +145,7 @@ function liveBinding(input: {
     attempt_status: attempt.status,
     repository_authority: attempt.repository_authority,
     lease_id: lease.id,
+    lease_generation: lease.generation,
     lease_worker_id: lease.worker_id,
     lease_purpose: lease.purpose,
     lease_expires_at: lease.expires_at,

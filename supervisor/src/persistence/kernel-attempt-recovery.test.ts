@@ -74,17 +74,52 @@ describe("expired kernel Attempt lease recovery", () => {
       checkpoint_id: null,
       lease: {
         id: `lease-${runId}`,
+        generation: 1,
         worker_id: `worker-${runId}`,
         purpose,
         expires_at: RENEWED,
         started,
       },
     });
+    await expect(store.renewAttemptLease({
+      attempt_id: `attempt-${runId}`,
+      lease_id: `lease-${runId}`,
+      lease_generation: 0,
+      worker_id: `worker-${runId}`,
+      expires_at: "2026-08-20T12:30:00.000Z",
+    })).rejects.toThrow(/generation|fence/);
+    await expect(store.renewAttemptLease({
+      attempt_id: `attempt-${runId}`,
+      lease_id: `lease-${runId}`,
+      lease_generation: 1,
+      worker_id: `worker-${runId}`,
+      expires_at: "2026-08-20T12:30:00.000Z",
+    })).resolves.toMatchObject({
+      id: `lease-${runId}`,
+      generation: 1,
+      worker_id: `worker-${runId}`,
+      expires_at: "2026-08-20T12:30:00.000Z",
+    });
     expect(await store.recoverExpiredAttemptLeases({
       observed_at: OBSERVED,
       expires_at: RENEWED,
       limit: 1,
     })).toEqual([]);
+    await expect(store.recoverExpiredAttemptLeases({
+      observed_at: "2026-08-20T12:31:00.000Z",
+      expires_at: "2026-08-20T12:40:00.000Z",
+      limit: 1,
+    })).resolves.toEqual([
+      expect.objectContaining({
+        lease: expect.objectContaining({
+          id: `lease-${runId}`,
+          generation: 2,
+          worker_id: `worker-${runId}`,
+          purpose,
+          started,
+        }),
+      }),
+    ]);
   });
 
   it("blocks a new lease until one expired lease is recovered and never creates a second", async () => {

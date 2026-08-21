@@ -36,6 +36,7 @@ for file in "${files[@]}"; do
      .pipeline_run_id == $run and .attempt_id == $attempt and
      .request_hash == $request and .definition_bundle_hash == $bundle and
      .lease_id == $lease and .native_session_id == $session and
+     (.lease_generation | type == "number" and . >= 0 and floor == .) and
      (.delivery_id | type == "string" and length > 0 and length <= 200) and
      (.body | type == "string" and length > 0 and length <= 32000)' >/dev/null 2>&1; then
     continue

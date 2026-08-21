@@ -408,6 +408,7 @@ export class DaytonaKernelAdapter implements
       native_session_id: authorized.native_session_id,
       generation: authorized.generation,
       lease_id: authorized.lease_id,
+      lease_generation: authorized.lease_generation,
       lease_purpose: authorized.lease_purpose,
     };
     if (
@@ -419,6 +420,7 @@ export class DaytonaKernelAdapter implements
       !/^[a-f0-9]{64}$/.test(authorized.definition_bundle_hash) ||
       !/^[a-f0-9]{40,64}$/.test(authorized.input_subject) ||
       !Number.isSafeInteger(authorized.generation) || authorized.generation < 0 ||
+      !Number.isSafeInteger(authorized.lease_generation) || authorized.lease_generation < 0 ||
       !["work", "result_correction"].includes(authorized.lease_purpose)
     ) throw new Error("steering delivery has invalid authorized binding fields");
     const delivery = {

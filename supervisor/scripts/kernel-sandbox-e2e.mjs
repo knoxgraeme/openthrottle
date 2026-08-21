@@ -438,6 +438,7 @@ function createKernelEnvironment(directory, source, pipelineId) {
     database_path: databasePath,
     blob_store: blobs,
     release_id: releaseId,
+    runtime_capability_digest: release.execution_policy.runtime_capability_digest,
     bootstrap,
   });
   const activate = (db, runtime) => {
@@ -468,6 +469,7 @@ function createKernelEnvironment(directory, source, pipelineId) {
     database_path: databasePath,
     blob_store: blobs,
     release_id: releaseId,
+    runtime_capability_digest: release.execution_policy.runtime_capability_digest,
     bootstrap,
   });
   return { compilation, blobs, registrationId, initialDb, activate, reopen };
