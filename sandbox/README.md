@@ -1,99 +1,105 @@
 # OpenThrottle sandbox
 
-The Daytona snapshot is built from the repository root because it embeds the
-shared `skills/` directory:
+The Daytona image is built from the repository root because it contains the
+platform fence and generated runtime schemas:
 
 ```bash
 docker build -f sandbox/Dockerfile -t openthrottle .
 daytona snapshot create openthrottle --dockerfile sandbox/Dockerfile --context .
 ```
 
-It contains Node 22, git/curl/jq/yq/ripgrep/GitHub CLI, Claude Code, Codex,
-OpenCode, and an unprivileged `agent` user. Its image entrypoint is inert; the supervisor uploads
-sealed stage inputs and explicitly launches `/opt/openthrottle/entrypoint.sh`.
+The image contains Node 22, Git, jq, ripgrep, Claude Code, Codex, OpenCode, and
+one unprivileged `agent` user. Its image entrypoint is intentionally inert. The
+supervisor uploads one root-owned, read-only request and explicitly launches
+`/opt/openthrottle/entrypoint.sh`.
 
-## Fenced stage lifecycle
+## Execution kernel
 
-Every invocation executes exactly one coordinator-selected stage:
+The entrypoint accepts exactly two request families:
 
-1. Require the sealed stage request, repository config snapshot, and immutable
-   pipeline manifest.
-2. Verify hashes, runtime capability compatibility, request identity, and file
-   ownership/mode.
-3. Materialize only the credentials declared by the stage.
-4. Clone the registered repository and reconstruct the branch from the sealed
-   base commit or expected subject.
-5. Seal the pre-push hook and Git configuration.
-6. Apply the validated repository config, then run the bake-once bootstrap:
-   `post_bootstrap` commands and engine probes execute only on the first stage
-   of a sandbox and seal a root-owned marker recording the repository-config
-   digest they ran under. Later stages verify the marker and skip the
-   bootstrap; a missing-but-started, torn, or digest-mismatched marker fails
-   the stage closed so the supervisor reprovisions the sandbox.
-7. Invoke the command or agent executor with the manifest’s context policy.
-8. Write one normalized, typed stage result to the supervisor-owned spool.
+- `OT_ACTION_REQUEST_FILE`, `OT_ACTION_RESULT_FILE`, and
+  `OT_ACTION_SESSION_FILE` execute or replay one work/result-correction
+  attempt.
+- `OT_INTEGRATION_REQUEST_FILE` and `OT_INTEGRATION_RESULT_FILE` integrate or
+  replay one accepted checkpoint effect.
 
-Credential materialization, `gh` credential-helper setup, commit identity,
-branch reconstruction, fence validation, and the scrub of ignored
-agent-executable config surfaces (`.claude`, `.codex`, `.agents`, and similar)
-stay per-stage. Ignored dependency state installed by `post_bootstrap`
-persists for the sandbox lifetime under the recorded config digest.
+An action materializes the exact requested Git subject into a fresh repository
+with no usable remote. Git administration stays executor-owned. An `inspect`
+action also makes the complete checkout read-only and applies the engine's
+native read-only tool policy. An `edit` action grants the agent write access to
+repository content, while commits, refs, pushes, and publication remain outside
+the model's authority. Before any action or integration, the shared source
+checkout is recursively root-owned and non-writable without following symlinks.
+Deterministic command gates run in the same isolated repository and never
+contribute their incidental filesystem mutations.
 
-`TASK_TYPE` is ticket intent (`implement` or `investigate`), not an execution
-mode. Native Claude/Codex/OpenCode continuation is controlled by the stage
-request’s context policy and `nativeSessionId`; there is no standalone resume
-task, task adapter registry, callback endpoint, or completion marker.
+An inspect action with an accepted-edit boundary also receives one bounded
+executor-owned change artifact in a dedicated read-only directory outside the
+checkout. It names the exact base/input subjects and trees, includes changed
+paths and textual diff within fixed bounds, and records explicit omission
+diagnostics otherwise. Claude, Codex, and OpenCode are all prompted with the
+same path; native policy allows that file without adding shell, network, edit,
+provider, MCP, or Git-administration authority.
 
-Agent stages write semantic proposals through `OT_STAGE_PROPOSAL_FILE`.
-Command stages execute a configured gate directly. The runner verifies declared
-artifact kinds and assurance, bounds output, records the Git subject, and emits
-`stage_result` for the coordinator. Publication stages are additionally fenced
-to the exact subject accepted by the publish evaluator.
+For an agent action, the sealed DefinitionBundle supplies:
 
-Configured `limits.max_turns`, `limits.task_timeout`, and `mcp_servers` are
-materialized for the selected engine. Claude uses slash-command skill entry;
-Codex uses native `$skill` discovery and its sandbox-owned instructions;
-OpenCode receives the canonical adapter body in its fenced prompt. Eligible
-Claude/Codex stages install only the sandbox-owned live-steering hooks.
+- one agent instruction document;
+- the task prompt;
+- only the allowed skill packages; and
+- model, reasoning, repository authority, and semantic-result contracts.
 
-`~/.ot` holds private logs, native session metadata, task context, activities,
-and live-steering inbox files. `/var/lib/openthrottle/stage-results` is the
-root-owned result boundary read by the supervisor. Activities and heartbeat
-events are bound to the current run before they enter the Linear outbox.
+The executor installs those skills into the selected engine's private discovery
+root for that attempt. `SKILL.md` references, scripts, and assets therefore use
+the engine's native progressive disclosure instead of being flattened into the
+initial prompt. Nothing is installed globally per engine.
 
-## Agent configuration
+The agent submits `openthrottle.result-candidate/v1`. The executor validates it
+against the sealed semantic schema and applies only declared deterministic
+normalizers. For example, `string-array-to-newlines/v1` converts the OPE-188
+`payload.summary` array into a string without rerunning completed work. If the
+candidate still fails validation, a bounded same-session correction can call
+only `ot-result`; it receives no skills, MCP, provider access, or writable
+repository. Claude and Codex keep the sealed steering hook and exact correction
+lease/session bindings, but injected guidance cannot expand that result-only
+tool policy.
 
-Codex receives OpenThrottle standing instructions outside the checkout. OpenCode receives a root-owned runtime
-config outside the repository, with repository and compatibility config loading
-disabled. Only validated `.openthrottle.yml` MCP declarations and the
-allowlisted Kimi profile enter its config.
+Every completed attempt creates an executor-authored Git commit and a bounded,
+content-addressed bundle at
+`refs/openthrottle/checkpoints/<request_hash>`. The checkpoint separately binds
+the commit and accepted content tree. The supervisor can then request an
+idempotent fast-forward or deterministic three-way integration. Integrated
+output is another exact commit/bundle under a hash-derived integration ref;
+conflicts become `needs_human` evidence rather than agent-authored Git state.
 
-The target repository’s own agent instructions remain available as untrusted
-project context. Registered repositories are trusted for code execution because
-`post_bootstrap` can run arbitrary commands. Linear, Fly, Daytona, webhook,
-install, and operator credentials never enter the sandbox.
+Runtime results and native-session observations are immutable, identity-bound
+files. A repeated launch with the same request and output path returns that
+evidence without redispatching the agent or command.
 
-## Safety and sanitization
+## Steering and credentials
 
-The pre-push hook blocks main/master and non-fast-forward pushes, with
-`core.hooksPath` root-sealed. Git uses the authenticated `gh` credential helper
-against a clean origin URL so the token never appears in `.git/config`.
+Only model credentials needed by the selected engine enter its minimal child
+environment. Linear, Daytona, Fly, webhook, install, and operator credentials
+never enter the agent process.
 
-Shell and Node sanitizers redact named secret values, nested values from
-`CODEX_AUTH_JSON`, and known GitHub/OpenAI/Linear/bearer token shapes before
-logs or activities leave the sandbox.
+Claude and Codex work and result-correction attempts may receive guidance through
+`~/.ot/inbox`. The hook injects only envelopes matching the live pipeline run,
+attempt, request hash, definition-bundle hash, lease, and native session.
+Malformed or mismatched envelopes remain untouched. OpenCode does not install
+this hook.
 
 ## Verification
 
 ```bash
 npm ci --prefix sandbox
 npm test --prefix sandbox
-bats sandbox/tests/runtime.bats
+bats sandbox/tests/runtime.bats sandbox/tests/inbox-drain.bats
 docker build -f sandbox/Dockerfile -t openthrottle:test .
 sandbox/tests/smoke.sh openthrottle:test
+node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test
 ```
 
-The Docker smoke verifies pinned agent CLIs and skill delivery, then runs
-sealed agent stages for Claude, Codex, and OpenCode plus a command stage against
-a local bare repository. It checks stage-result assurance, branch fencing,
-environment-tamper resistance, and absence of old completion events.
+The ordinary Docker smoke proves an editable action, deterministic result
+normalization, immutable replay, a hard read-only inspect action, progressive
+skill delivery, and exact checkpoint restoration. The structured proof runs two
+dependent attempts through the same action and integration primitives and
+verifies their final integrated Git subject.

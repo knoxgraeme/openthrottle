@@ -1,24 +1,34 @@
 import { getErrorMessage, supervisorRequest } from './util.js';
 
-export default async function stop(ticket: string | undefined): Promise<void> {
-  if (!ticket) {
-    console.error('Usage: openthrottle stop <ticket>');
+export default async function stop(reference: string | undefined): Promise<void> {
+  if (!reference) {
+    console.error('Usage: openthrottle stop <run-or-source-reference>');
     process.exit(1);
+    return;
   }
   try {
     const response = await supervisorRequest(
-      `/tickets/${encodeURIComponent(ticket)}/stop`,
-      { method: 'POST' }
+      `/runs/${encodeURIComponent(reference)}/control`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'stop', reason: 'operator CLI request' }),
+      },
     );
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${await response.text()}`);
-    }
-    const body = await response.json() as { status?: string };
-    console.log(body.status === 'stop_requested' || response.status === 202
-      ? `Stop requested for ${ticket}.`
-      : `Stopped ${ticket}.`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    const body = await response.json() as {
+      accepted?: boolean;
+      duplicate?: boolean;
+      pipeline_run_id?: string;
+    };
+    if (body.accepted !== true) throw new Error('supervisor did not accept the stop request');
+    console.log(
+      body.duplicate
+        ? `Stop was already requested for ${reference}.`
+        : `Stop requested for ${reference}.`,
+    );
   } catch (error) {
-    console.error(`Could not stop ${ticket}: ${getErrorMessage(error)}`);
+    console.error(`Could not stop ${reference}: ${getErrorMessage(error)}`);
     process.exit(1);
   }
 }

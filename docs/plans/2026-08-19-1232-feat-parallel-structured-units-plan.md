@@ -63,7 +63,7 @@ introduce a parallel scheduler beside review fanout or an agent-owned scheduler.
    adds atomic requirement/acceptance IDs and machine-checkable claims.
    Graph v1 and execution-plan v2 remain accepted and force serial execution.
 3. **Unknown authoritative safety means serial.** Missing claims, free-form v2
-   `files`, graph-scoped sessions, stateful MCP servers, and supervisor-owned
+   `files`, graph-scoped sessions, unknown shared runtime services, and supervisor-owned
    command gates without proven parallel-safety metadata acquire conservative
    mutexes. Agent-internal exploratory commands are non-authoritative and run
    with slot-local home/temp/cache state; any non-namespaced shared capability
@@ -155,10 +155,10 @@ introduce a parallel scheduler beside review fanout or an agent-owned scheduler.
   the other. Resource names use a closed-length identifier grammar and conflict
   on exact equality.
 - **R5 Conservative compiled claims.** Admission adds deterministic mutexes for
-  graph-scoped native sessions, configured MCP servers, supervisor-owned command
+  graph-scoped native sessions, unknown shared runtime services, supervisor-owned command
   phases, shared package-manager locks/caches, and any runtime capability not
   declared read-only and parallel-safe by the pinned platform capability
-  catalog. A configured MCP or shared runtime resource reachable throughout an
+  catalog. A shared runtime resource reachable throughout an
   agent action becomes a full-action exclusive claim; a phase-local gate becomes
   a phase mutex. Agent-internal exploratory command output is never acceptance
   evidence: it runs with slot-local home, temp, and cache paths, while the
@@ -201,7 +201,7 @@ introduce a parallel scheduler beside review fanout or an agent-owned scheduler.
   fanout slot and one of eight image-baked unprivileged worker principals
   (`ot-worker-1` through `ot-worker-8`), plus a dedicated Git worktree/index,
   agent home, native session,
-  MCP config/process, process group, action directory, temp/cache namespace,
+  process group, action directory, temp/cache namespace,
   logs, and recovery package. Reviewer and worker children use the same sealed
   dispatch, recollection, active-window, timeout, and gather contracts. Workers
   may inspect sibling work because they are collaborators in the same sandbox;
@@ -460,7 +460,7 @@ introduce a parallel scheduler beside review fanout or an agent-owned scheduler.
 - **AE2 Conflict.** U1 claims `supervisor/src/pipeline/`; U2 claims
   `supervisor/src/pipeline/store.ts`. U2 is excluded with a path-overlap reason
   even when capacity is available.
-- **AE3 Unknown claim.** A v2 unit or a v3 unit with an unsafe MCP server remains
+- **AE3 Unknown claim.** A v2 unit or a v3 unit with an unsafe shared runtime capability remains
   valid but runs alone. It is never silently treated as conflict-free.
 - **AE4 Completion race.** U2 finishes before U1, but replay still follows the
   persisted U1, U2 order and yields the same aggregate as the inverse timing.
@@ -766,7 +766,7 @@ using a pure deterministic policy.
 4. Materialize the persisted wave as the shared fanout controller's ordered
    roster and use its same active-window slot accounting; do not add a worker-
    specific dispatch loop.
-5. Add phase-level mutex acquisition for graph sessions, commands, MCP servers,
+5. Add phase-level mutex acquisition for graph sessions, commands, shared runtime services,
    and unknown capabilities without charging repair budget while blocked.
    Compile a resource reachable for the entire agent action as a full-action
    exclusive claim instead; do not pretend a later command-stage mutex covers

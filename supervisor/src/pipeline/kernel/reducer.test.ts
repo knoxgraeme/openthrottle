@@ -4,7 +4,10 @@ import {
   COMPILED_PIPELINE_MANIFEST_SCHEMA,
   EFFECT_INTENT_SCHEMA,
   EXECUTION_RECORD_SCHEMA,
+  RUNTIME_PROVISION_STAGE_ID,
   canonicalJson,
+  expandCompiledRuntimeLifecycle,
+  runtimeStopStageId,
   type AttemptCheckpoint,
   type CompiledPipelineManifest,
   type DecisionRecord,
@@ -85,14 +88,50 @@ function manifest(options: {
   };
 }
 
+function externalManifest(kind: "effect" | "wait" = "effect"): CompiledPipelineManifest {
+  return {
+    ...manifest(),
+    entry_stage: "external",
+    stages: [
+      (kind === "effect"
+        ? {
+          id: "external",
+          kind: "effect",
+          effect: "core/publish@1",
+          on: { success: { to: "verify" }, failure: { terminal: "failed" } },
+        }
+        : {
+          id: "external",
+          kind: "wait",
+          wait: "core/provider-wait@1",
+          on: { success: { to: "verify" }, failure: { terminal: "failed" } },
+        }),
+      manifest().stages[1]!,
+    ],
+  };
+}
+
+function commandManifest(): CompiledPipelineManifest {
+  return {
+    ...manifest(),
+    entry_stage: "command",
+    stages: [{
+      id: "command",
+      kind: "command",
+      command: "test",
+      on: { success: { terminal: "completed" }, failure: { terminal: "failed" } },
+    }],
+  };
+}
+
 function stageScope(stageId = "work"): AttemptScope {
   return { kind: "stage", stage_id: stageId };
 }
 
-function loopScope(itemId = "unit-a", itemIndex = 0): AttemptScope {
+function loopScope(itemId = "unit-a", itemIndex = 0, stageId = "work"): AttemptScope {
   return {
     kind: "loop_item",
-    stage_id: "work",
+    stage_id: stageId,
     parent_attempt_id: "parent",
     loop_id: "units",
     item_id: itemId,
@@ -136,6 +175,7 @@ function attempt(options: Partial<KernelAttempt> & {
     lease: options.lease ?? null,
     checkpoint_id: options.checkpoint_id ?? null,
     result_record_id: options.result_record_id ?? null,
+    decision_record_id: options.decision_record_id ?? null,
     pending_result: options.pending_result ?? null,
   };
 }
@@ -264,6 +304,28 @@ function decisionRecord(
   };
 }
 
+function externalScheduleDecision(input: {
+  attempt_id: string;
+  phase: string;
+  input_record_ids?: readonly string[];
+  id?: string;
+}): DecisionRecord {
+  const semanticKey = `external-schedule:${input.attempt_id}:${input.phase}`;
+  return {
+    ...decisionRecord(input.input_record_ids ?? [], input.id ?? `decision-${input.phase}`),
+    reducer: "core/external-schedule@1",
+    payload_schema: "openthrottle.external-schedule/v1",
+    payload: {
+      inline: {
+        schema: "openthrottle.external-schedule/v1",
+        semantic_key: semanticKey,
+        attempt_id: input.attempt_id,
+        phase: input.phase,
+      },
+    },
+  };
+}
+
 function deliveryRecord(effect: EffectIntent): DeliveryRecord {
   return {
     schema: EXECUTION_RECORD_SCHEMA,
@@ -277,6 +339,40 @@ function deliveryRecord(effect: EffectIntent): DeliveryRecord {
     payload_schema: "delivery/v1",
     payload: { inline: { accepted: true } },
     created_at: "2026-08-20T00:00:03.000Z",
+  };
+}
+
+function runtimeDelivery(kind: "create" | "start" | "cleanup"): DeliveryRecord {
+  return {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: `delivery-runtime-${kind}`,
+    kind: "delivery",
+    pipeline_run_id: "run-1",
+    effect_id: `effect-runtime-${kind}`,
+    idempotency_key: `run-1:runtime:${kind}`,
+    external_identity: "daytona:sandbox-1",
+    status: "confirmed",
+    payload_schema: "openthrottle.effect-delivery/v1",
+    payload: { inline: {
+      effect_kind: `daytona/${kind === "cleanup" ? "cleanup" : kind}-sandbox@1`,
+      provider: "daytona",
+      observed_via: "reconciliation",
+      result: { sandbox_id: "sandbox-1" },
+    } },
+    created_at: "2026-08-20T00:00:03.000Z",
+  };
+}
+
+function manifestWithRuntimeStages(options: { firstTerminal?: boolean } = {}): CompiledPipelineManifest {
+  const authored = manifest(options);
+  const runtime = expandCompiledRuntimeLifecycle({
+    entry_stage: authored.entry_stage,
+    stages: authored.stages,
+  });
+  return {
+    ...authored,
+    entry_stage: authored.entry_stage,
+    stages: runtime.stages,
   };
 }
 
@@ -322,6 +418,32 @@ function replacedAttempt(bundle: AtomicTransitionBundle, attemptId: string): Ker
   );
   if (!write || write.kind !== "replace") throw new Error(`missing attempt write for ${attemptId}`);
   return write.attempt;
+}
+
+function bindSessionCommand(
+  current: KernelAttempt,
+  currentRun: KernelRun,
+  nativeSessionId = "session-1",
+): Extract<KernelCommand, { type: "bind_runtime_session" }> {
+  if (!current.lease) throw new Error("test attempt has no lease to bind");
+  return {
+    type: "bind_runtime_session",
+    command_id: `bind-${current.id}-${current.work_retry_ordinal}`,
+    attempt_id: current.id,
+    expected_run_version: currentRun.version,
+    expected_cursor_version: currentRun.cursor.version,
+    expected_attempt_version: current.version,
+    request_hash: current.request_hash,
+    definition_bundle_hash: current.definition_bundle_hash,
+    input_subject: current.input_subject,
+    lease_id: current.lease.id,
+    worker_id: current.lease.worker_id,
+    lease_purpose: current.lease.purpose,
+    expected_lease_expires_at: current.lease.expires_at,
+    expected_work_retry_ordinal: current.work_retry_ordinal,
+    expected_result_correction_count: current.result_correction_count,
+    native_session_id: nativeSessionId,
+  };
 }
 
 function recordedAttempt(scope: AttemptScope = stageScope()): {
@@ -370,6 +492,16 @@ describe("shared execution kernel lifecycle", () => {
     current = replacedAttempt(transition, current.id);
     currentRun = transition.run;
     expect(current.status).toBe("running");
+
+    transition = reduce({
+      current,
+      currentRun,
+      currentManifest: manifest({ firstTerminal: true }),
+      command: bindSessionCommand(current, currentRun),
+    });
+    current = replacedAttempt(transition, current.id);
+    currentRun = transition.run;
+    expect(current.native_session_id).toBe("session-1");
 
     const completedCheckpoint = checkpoint(current, subject("2"));
     transition = reduce({
@@ -450,25 +582,32 @@ describe("shared execution kernel lifecycle", () => {
     expect(current).toMatchObject({ status: "recorded", pending_result: null, result_record_id: result.id });
 
     const decision = decisionRecord([result.id]);
+    const cleanupAttempt = attempt({
+      id: "attempt-cleanup-completed",
+      scope: stageScope(runtimeStopStageId("completed")),
+      repository_authority: "inspect",
+      input_subject: subject("2"),
+    });
     transition = reduce({
       current,
       currentRun,
-      currentManifest: manifest({ firstTerminal: true }),
+      currentManifest: manifestWithRuntimeStages({ firstTerminal: true }),
       command: {
         type: "settle",
         command_id: "settle",
         attempt_id: current.id,
         decision_record_id: decision.id,
         outcome: "success",
-        next_attempts: [],
+        next_attempts: [cleanupAttempt],
       },
       records: [decision, result],
     });
     expect(transition.run).toMatchObject({
-      status: "completed",
-      terminal_outcome: "completed",
+      status: "running",
+      terminal_outcome: null,
       current_subject: subject("2"),
-      active_attempt_versions: {},
+      active_attempt_versions: { [cleanupAttempt.id]: 0 },
+      cursor: { stage_id: runtimeStopStageId("completed") },
     });
     expect(replacedAttempt(transition, current.id).status).toBe("settled");
   });
@@ -485,7 +624,7 @@ describe("shared execution kernel lifecycle", () => {
         const transition = reduce({
           current,
           currentRun,
-          currentManifest: manifest({ firstTerminal: true }),
+          currentManifest: manifestWithRuntimeStages({ firstTerminal: true }),
           command,
           checkpoints: options.checkpoints,
           records: options.records,
@@ -500,6 +639,7 @@ describe("shared execution kernel lifecycle", () => {
       }));
       states.push(current.status);
       apply({ type: "start", command_id: "start", attempt_id: current.id, lease_id: "lease-1" });
+      apply(bindSessionCommand(current, currentRun));
       const completedCheckpoint = checkpoint(current, subject("2"));
       apply({
         type: "work_complete", command_id: "complete", attempt_id: current.id,
@@ -511,16 +651,22 @@ describe("shared execution kernel lifecycle", () => {
         { checkpoints: [completedCheckpoint], records: [result] },
       );
       const decision = decisionRecord([result.id]);
+      const cleanupAttempt = attempt({
+        id: "attempt-cleanup-completed",
+        scope: stageScope(runtimeStopStageId("completed")),
+        repository_authority: "inspect",
+        input_subject: scope.kind === "stage" ? subject("2") : subject("1"),
+      });
       apply({
         type: "settle", command_id: "settle", attempt_id: current.id,
-        decision_record_id: decision.id, outcome: "success", next_attempts: [],
+        decision_record_id: decision.id, outcome: "success", next_attempts: [cleanupAttempt],
       }, { records: [decision, result] });
       return states;
     };
 
     expect(lifecycle(stageScope())).toEqual(lifecycle(loopScope()));
     expect(lifecycle(stageScope())).toEqual([
-      "pending", "pending", "running", "work_complete", "recorded", "settled",
+      "pending", "pending", "running", "running", "work_complete", "recorded", "settled",
     ]);
   });
 
@@ -608,6 +754,7 @@ describe("shared execution kernel lifecycle", () => {
           command: {
             type: "fail", command_id: "bad-fail", attempt_id: completed.id,
             decision_record_id: "decision-1", reason: "generic failure",
+            resource_disposition: { kind: "pre_provision" },
           },
           records: [decisionRecord([])],
         }),
@@ -619,9 +766,146 @@ describe("shared execution kernel lifecycle", () => {
     }
   });
 
+  it("binds an agent session only through the exact live attempt CAS", () => {
+    const current = attempt({
+      status: "running",
+      version: 4,
+      lease: {
+        id: "lease-1",
+        worker_id: "worker-1",
+        purpose: "work",
+        expires_at: "2026-08-20T00:05:00.000Z",
+        started: true,
+      },
+    });
+    const currentRun = run(current, { version: 7 });
+    const command = bindSessionCommand(current, currentRun);
+    const transition = reduce({ current, currentRun, command });
+    expect(replacedAttempt(transition, current.id)).toMatchObject({
+      native_session_id: "session-1",
+      version: 5,
+      status: "running",
+      lease: current.lease,
+    });
+    expect(transition.run).toMatchObject({ version: 8 });
+    expect(transition.run.cursor).toEqual(currentRun.cursor);
+    expect(transition.append_records).toEqual([]);
+    expect(transition.append_checkpoints).toEqual([]);
+
+    const staleCases: Array<[
+      string,
+      Partial<Extract<KernelCommand, { type: "bind_runtime_session" }>>,
+      RegExp,
+    ]> = [
+      ["run version", { expected_run_version: 6 }, /run version fence/],
+      ["attempt version", { expected_attempt_version: 3 }, /attempt version fence/],
+      ["lease", { lease_id: "lease-stale" }, /lease fence/],
+      ["worker", { worker_id: "worker-stale" }, /lease fence/],
+      ["lease expiry", { expected_lease_expires_at: "2026-08-20T00:06:00.000Z" }, /lease fence/],
+      ["retry ordinal", { expected_work_retry_ordinal: 1 }, /retry ordinal fence/],
+      ["request", { request_hash: sha("d") }, /action identity fence/],
+      ["session", { native_session_id: "contains whitespace" }, /session identity/],
+    ];
+    for (const [name, overrides, message] of staleCases) {
+      expect(() => reduce({
+        current,
+        currentRun,
+        command: { ...command, ...overrides },
+      }), name).toThrow(message);
+    }
+  });
+
+  it("requires a pre-bound agent session and keeps non-agent checkpoints sessionless", () => {
+    const unbound = attempt({
+      status: "running",
+      lease: {
+        id: "lease-1",
+        worker_id: "worker-1",
+        purpose: "work",
+        expires_at: "later",
+        started: true,
+      },
+    });
+    const firstBindingCheckpoint = checkpoint(unbound, subject("2"));
+    expect(() => reduce({
+      current: unbound,
+      command: {
+        type: "work_complete",
+        command_id: "checkpoint-first-bind",
+        attempt_id: unbound.id,
+        checkpoint_id: firstBindingCheckpoint.id,
+        verified_output_subject: subject("2"),
+      },
+      checkpoints: [firstBindingCheckpoint],
+    })).toThrow(/bind its native session before checkpointing/);
+
+    const bound = { ...unbound, native_session_id: "session-1" };
+    expect(() => reduce({
+      current: bound,
+      command: {
+        type: "work_complete",
+        command_id: "checkpoint-session-change",
+        attempt_id: bound.id,
+        checkpoint_id: "checkpoint-1",
+        verified_output_subject: subject("2"),
+      },
+      checkpoints: [{
+        ...checkpoint(bound, subject("2")),
+        native_session_id: "session-2",
+      }],
+    })).toThrow(/changes the pinned native session/);
+
+    const commandAttempt = attempt({
+      scope: stageScope("command"),
+      repository_authority: "inspect",
+      status: "running",
+      lease: {
+        id: "command-lease",
+        worker_id: "command-worker",
+        purpose: "work",
+        expires_at: "later",
+        started: true,
+      },
+    });
+    const commandRun = run(commandAttempt);
+    const invalidCommandCheckpoint = checkpoint(commandAttempt, null);
+    expect(() => reduce({
+      current: commandAttempt,
+      currentRun: commandRun,
+      currentManifest: commandManifest(),
+      command: {
+        type: "work_complete",
+        command_id: "command-session",
+        attempt_id: commandAttempt.id,
+        checkpoint_id: invalidCommandCheckpoint.id,
+        verified_output_subject: null,
+      },
+      checkpoints: [invalidCommandCheckpoint],
+    })).toThrow(/command checkpoints cannot bind/);
+
+    const validCommandCheckpoint = {
+      ...invalidCommandCheckpoint,
+      native_session_id: null,
+    };
+    expect(replacedAttempt(reduce({
+      current: commandAttempt,
+      currentRun: commandRun,
+      currentManifest: commandManifest(),
+      command: {
+        type: "work_complete",
+        command_id: "command-sessionless",
+        attempt_id: commandAttempt.id,
+        checkpoint_id: validCommandCheckpoint.id,
+        verified_output_subject: null,
+      },
+      checkpoints: [validCommandCheckpoint],
+    }), commandAttempt.id).native_session_id).toBeNull();
+  });
+
   it("requires verified edit subjects and prevents inspect actions from advancing them", () => {
     const edit = attempt({
       status: "running",
+      native_session_id: "session-1",
       lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
     });
     expect(() => reduce({
@@ -636,6 +920,7 @@ describe("shared execution kernel lifecycle", () => {
     const inspect = attempt({
       repository_authority: "inspect",
       status: "running",
+      native_session_id: "session-1",
       lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
     });
     expect(() => reduce({
@@ -664,6 +949,7 @@ describe("shared execution kernel lifecycle", () => {
     const current = attempt({
       scope: loopScope(),
       status: "running",
+      native_session_id: "session-1",
       lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
     });
     const transition = reduce({
@@ -675,6 +961,7 @@ describe("shared execution kernel lifecycle", () => {
       request_hash: current.request_hash,
       status: "pending",
       work_retry_ordinal: 1,
+      native_session_id: null,
     });
     expect(transition.create_attempts).toEqual([]);
     expect(transition.run.cursor).toEqual(run(current).cursor);
@@ -853,6 +1140,136 @@ describe("pipeline topology on the shared kernel", () => {
     })).toThrow(/before the fan-in is complete/);
   });
 
+  it("chains divergent loop siblings through their exact predecessor checkpoints", () => {
+    const globalSubject = subject("1");
+    const unitASubject = subject("2");
+    const unitBSubject = subject("3");
+    const settledA = attempt({
+      id: "unit-a-work",
+      scope: loopScope("unit-a", 0),
+      status: "settled",
+      version: 6,
+      output_subject: unitASubject,
+      checkpoint_id: "checkpoint-unit-a",
+      result_record_id: "result-unit-a",
+    });
+    const currentB = attempt({
+      id: "unit-b-work",
+      scope: loopScope("unit-b", 1),
+      status: "recorded",
+      version: 5,
+      output_subject: unitBSubject,
+      checkpoint_id: "checkpoint-unit-b",
+      result_record_id: "result-unit-b",
+    });
+    const checkpointA = checkpoint(settledA, unitASubject, "checkpoint-unit-a");
+    const checkpointB = checkpoint(currentB, unitBSubject, "checkpoint-unit-b");
+    const resultB = resultRecord(currentB, "result-unit-b");
+    const decisionB = decisionRecord([resultB.id], "decision-unit-b");
+    const currentRun = run(currentB, {
+      current_subject: globalSubject,
+      status: "running",
+      version: 11,
+      cursor: compileKernelCursor({
+        stage_id: "work",
+        version: 4,
+        attempts: [settledA, currentB],
+        completed_scope_keys: [frontierMemberKey(settledA)],
+      }),
+      active_attempt_versions: { [currentB.id]: currentB.version },
+      checkpoint_ids: {
+        [settledA.id]: checkpointA.id,
+        [currentB.id]: checkpointB.id,
+      },
+    }, [settledA, currentB]);
+    const nextA = attempt({
+      id: "unit-a-verify",
+      scope: loopScope("unit-a", 0, "verify"),
+      repository_authority: "inspect",
+      input_subject: unitASubject,
+    });
+    const nextB = attempt({
+      id: "unit-b-verify",
+      scope: loopScope("unit-b", 1, "verify"),
+      repository_authority: "inspect",
+      input_subject: unitBSubject,
+    });
+    const command: KernelCommand = {
+      type: "settle",
+      command_id: "advance-loop-body",
+      attempt_id: currentB.id,
+      decision_record_id: decisionB.id,
+      outcome: "success",
+      next_attempts: [nextB, nextA],
+    };
+
+    const transition = reduce({
+      current: currentB,
+      currentRun,
+      command,
+      records: [resultB, decisionB],
+      checkpoints: [checkpointB, checkpointA],
+    });
+    expect(transition.run.current_subject).toBe(globalSubject);
+    expect(transition.create_attempts.map((candidate) => ({
+      item: candidate.scope.kind === "loop_item" ? candidate.scope.item_id : "unexpected",
+      subject: candidate.input_subject,
+    }))).toEqual([
+      { item: "unit-a", subject: unitASubject },
+      { item: "unit-b", subject: unitBSubject },
+    ]);
+
+    const claimedA = claimAttempt(nextA, transition.run, {
+      purpose: "work",
+      leaseId: "lease-unit-a-verify",
+    });
+    const startedA = reduce({
+      current: claimedA.current,
+      currentRun: claimedA.currentRun,
+      command: {
+        type: "start",
+        command_id: "start-unit-a-verify",
+        attempt_id: nextA.id,
+        lease_id: "lease-unit-a-verify",
+      },
+    });
+    expect(replacedAttempt(startedA, nextA.id).status).toBe("running");
+
+    expect(() => reduce({
+      current: currentB,
+      currentRun,
+      command,
+      records: [resultB, decisionB],
+      checkpoints: [checkpointB],
+    })).toThrow(/missing exact structured predecessor checkpoint/);
+
+    const swappedRun: KernelRun = {
+      ...currentRun,
+      checkpoint_ids: {
+        [settledA.id]: checkpointB.id,
+        [currentB.id]: checkpointA.id,
+      },
+    };
+    expect(() => reduce({
+      current: currentB,
+      currentRun: swappedRun,
+      command,
+      records: [resultB, decisionB],
+      checkpoints: [checkpointA, checkpointB],
+    })).toThrow(/does not match item/);
+
+    expect(() => reduce({
+      current: currentB,
+      currentRun,
+      command: {
+        ...command,
+        next_attempts: [{ ...nextA, input_subject: unitBSubject }, nextB],
+      },
+      records: [resultB, decisionB],
+      checkpoints: [checkpointA, checkpointB],
+    })).toThrow(/does not use the run's verified subject/);
+  });
+
   it("derives one dependency frontier and refuses to start blocked siblings", () => {
     const state = recordedAttempt();
     const decision = decisionRecord([state.result.id]);
@@ -941,7 +1358,7 @@ describe("pipeline topology on the shared kernel", () => {
     expect(replacedAttempt(started, dependent.id).lease).toMatchObject({ id: "lease-b", started: true });
   });
 
-  it("enforces reentry exhaustion from manifest state", () => {
+  it("routes authored reentry exhaustion through runtime cleanup", () => {
     const state = recordedAttempt();
     const decision = decisionRecord([state.result.id]);
     const firstRetry = attempt({ id: "attempt-2", input_subject: subject("2") });
@@ -966,6 +1383,12 @@ describe("pipeline topology on the shared kernel", () => {
     });
     const retryResult = resultRecord(retried, "result-2");
     const retryDecision = decisionRecord([retryResult.id], "decision-2");
+    const cleanupAttempt = attempt({
+      id: "attempt-cleanup-needs-human",
+      scope: stageScope(runtimeStopStageId("needs_human")),
+      repository_authority: "inspect",
+      input_subject: subject("3"),
+    });
     const exhausted = reduce({
       current: retried,
       currentRun: {
@@ -976,17 +1399,22 @@ describe("pipeline topology on the shared kernel", () => {
       },
       command: {
         type: "settle", command_id: "repair-2", attempt_id: retried.id,
-        decision_record_id: retryDecision.id, outcome: "repair", next_attempts: [],
+        decision_record_id: retryDecision.id, outcome: "repair", next_attempts: [cleanupAttempt],
       },
       records: [retryDecision, retryResult],
+      currentManifest: manifestWithRuntimeStages(),
     });
-    expect(exhausted.run.status).toBe("needs_human");
+    expect(exhausted.run).toMatchObject({
+      status: "running",
+      terminal_outcome: null,
+      cursor: { stage_id: runtimeStopStageId("needs_human") },
+    });
   });
 
   it.each([
     ["stop", "canceled"],
     ["supersede", "superseded"],
-  ] as const)("%s cascades attempts and effects while preserving checkpoints", (type, status) => {
+  ] as const)("%s preserves its outcome while routing through runtime cleanup", (type, status) => {
     const current = attempt({
       id: "attempt-a", status: "running", version: 3,
       lease: { id: "lease", worker_id: "worker-1", purpose: "work", expires_at: "later", started: true },
@@ -997,24 +1425,91 @@ describe("pipeline topology on the shared kernel", () => {
       status: "running",
       version: 8,
       active_attempt_versions: { "attempt-b": 2, "attempt-a": 3 },
-      active_effect_versions: { "effect-b": 1, "effect-a": 0 },
+      active_effect_versions: {},
       checkpoint_ids: { "attempt-a": "checkpoint-a", "attempt-old": "checkpoint-old" },
     }, [current, sibling]);
-    const decision = decisionRecord([]);
+    const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const decision = decisionRecord(runtime.map(({ id }) => id));
+    const cleanupAttempt = attempt({
+      id: `attempt-cleanup-${type}`,
+      scope: stageScope(runtimeStopStageId(status)),
+      repository_authority: "inspect",
+      input_subject: currentRun.current_subject,
+      context_record_ids: [decision.id, ...runtime.map(({ id }) => id)].sort(),
+    });
+    const resource_disposition = {
+      kind: "cleanup" as const,
+      runtime_delivery_record_ids: runtime.map(({ id }) => id).sort(),
+      cleanup_attempt: cleanupAttempt,
+    };
     const command: KernelCommand = type === "stop"
-      ? { type, command_id: type, decision_record_id: decision.id, reason: "operator stop" }
-      : { type, command_id: type, decision_record_id: decision.id, reason: "new generation" };
-    const transition = reduce({ current, currentRun, command, records: [decision] });
+      ? { type, command_id: type, decision_record_id: decision.id, reason: "operator stop", resource_disposition }
+      : { type, command_id: type, decision_record_id: decision.id, reason: "new generation", resource_disposition };
+    const transition = reduce({
+      current,
+      currentRun,
+      currentManifest: manifestWithRuntimeStages(),
+      command,
+      records: [decision, ...runtime],
+    });
     expect(transition.run).toMatchObject({
-      status,
-      terminal_outcome: status,
-      active_attempt_versions: {},
+      status: "running",
+      terminal_outcome: null,
+      active_attempt_versions: { [cleanupAttempt.id]: 0 },
       active_effect_versions: {},
       checkpoint_ids: currentRun.checkpoint_ids,
+      cursor: { stage_id: runtimeStopStageId(status) },
     });
     expect(transition.expected.attempt_versions).toEqual({ "attempt-a": 3, "attempt-b": 2 });
-    expect(transition.cancel_effect_ids).toEqual(["effect-a", "effect-b"]);
+    expect(transition.cancel_effect_ids).toEqual([]);
     expect(transition.attempt_writes).toHaveLength(2);
+    expect(transition.create_attempts).toEqual([cleanupAttempt]);
+  });
+
+  it("never terminalizes or starts cleanup while a create outcome is unknown", () => {
+    const current = attempt({ status: "running" });
+    const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const decision = decisionRecord(runtime.map(({ id }) => id));
+    const cleanupAttempt = attempt({
+      id: "attempt-cleanup",
+      scope: stageScope(runtimeStopStageId("canceled")),
+      repository_authority: "inspect",
+      context_record_ids: [decision.id, ...runtime.map(({ id }) => id)].sort(),
+    });
+    expect(() => reduce({
+      current,
+      currentRun: run(current, { active_effect_versions: { "effect-create-unknown": 2 } }),
+      currentManifest: manifestWithRuntimeStages(),
+      command: {
+        type: "stop", command_id: "stop-unknown", decision_record_id: decision.id,
+        reason: "operator stop", resource_disposition: {
+          kind: "cleanup",
+          runtime_delivery_record_ids: runtime.map(({ id }) => id).sort(),
+          cleanup_attempt: cleanupAttempt,
+        },
+      },
+      records: [decision, ...runtime],
+    })).toThrow(/outcome is unresolved/);
+  });
+
+  it("allows direct terminalization only before the provision schedule commits", () => {
+    const current = attempt({
+      scope: stageScope(RUNTIME_PROVISION_STAGE_ID),
+      repository_authority: "inspect",
+      status: "running",
+    });
+    const decision = decisionRecord([]);
+    const transition = reduce({
+      current,
+      currentRun: run(current),
+      currentManifest: manifestWithRuntimeStages(),
+      command: {
+        type: "stop", command_id: "stop-before-create", decision_record_id: decision.id,
+        reason: "operator stop", resource_disposition: { kind: "pre_provision" },
+      },
+      records: [decision],
+    });
+    expect(transition.run).toMatchObject({ status: "canceled", terminal_outcome: "canceled" });
   });
 });
 
@@ -1068,6 +1563,193 @@ describe("atomic transition replay", () => {
 });
 
 describe("effect ownership and reconciliation", () => {
+  it("atomically completes a started external Attempt and schedules its first bounded phase", () => {
+    const initial = attempt({
+      scope: stageScope("external"),
+      repository_authority: "inspect",
+      status: "running",
+      version: 2,
+      lease: {
+        id: "lease-external",
+        worker_id: "external-worker",
+        purpose: "work",
+        expires_at: "2026-08-20T00:05:00.000Z",
+        started: true,
+      },
+    });
+    const currentRun = run(initial, { status: "running", version: 2 });
+    const boundary = {
+      ...checkpoint(initial, null, "checkpoint-external"),
+      native_session_id: null,
+    };
+    const decision = externalScheduleDecision({ attempt_id: initial.id, phase: "checkpoint" });
+    const intent = {
+      ...effectIntent(decision.id),
+      subject: initial.input_subject,
+    };
+
+    const transition = reduce({
+      current: initial,
+      currentRun,
+      currentManifest: externalManifest(),
+      command: {
+        type: "schedule_external",
+        command_id: "schedule-external-checkpoint",
+        attempt_id: initial.id,
+        checkpoint_id: boundary.id,
+        decision_record_id: decision.id,
+        phase: "checkpoint",
+        verified_output_subject: null,
+        effect_intents: [intent],
+      },
+      records: [decision],
+      checkpoints: [boundary],
+    });
+
+    expect(replacedAttempt(transition, initial.id)).toMatchObject({
+      status: "work_complete",
+      lease: null,
+      checkpoint_id: boundary.id,
+      output_subject: null,
+    });
+    expect(transition.append_checkpoints).toEqual([boundary]);
+    expect(transition.append_records).toEqual([decision]);
+    expect(transition.put_effects).toEqual([intent]);
+    expect(transition.run.active_effect_versions).toEqual({ [intent.id]: 0 });
+    expect(transition.run.cursor).toEqual(currentRun.cursor);
+  });
+
+  it("schedules a later external phase only from confirmed cited deliveries", () => {
+    const current = attempt({
+      scope: stageScope("external"),
+      repository_authority: "inspect",
+      status: "work_complete",
+      version: 3,
+      checkpoint_id: "checkpoint-external",
+    });
+    const currentRun = run(current, {
+      status: "running",
+      version: 3,
+      checkpoint_ids: { [current.id]: "checkpoint-external" },
+    });
+    const boundary = {
+      ...checkpoint(current, null, "checkpoint-external"),
+      native_session_id: null,
+    };
+    const priorIntent = effectIntent("prior-decision");
+    const priorDelivery = deliveryRecord(priorIntent);
+    const decision = externalScheduleDecision({
+      attempt_id: current.id,
+      phase: "publication",
+      input_record_ids: [priorDelivery.id],
+    });
+    const intent = {
+      ...effectIntent(decision.id),
+      id: "effect-2",
+      idempotency_key: "run-1:publication",
+      subject: current.input_subject,
+    };
+    const command: KernelCommand = {
+      type: "schedule_external",
+      command_id: "schedule-external-publication",
+      attempt_id: current.id,
+      checkpoint_id: boundary.id,
+      decision_record_id: decision.id,
+      phase: "publication",
+      verified_output_subject: null,
+      effect_intents: [intent],
+    };
+
+    const transition = reduce({
+      current,
+      currentRun,
+      currentManifest: externalManifest(),
+      command,
+      records: [decision, priorDelivery],
+      checkpoints: [boundary],
+    });
+    expect(transition.append_checkpoints).toEqual([]);
+    expect(replacedAttempt(transition, current.id)).toMatchObject({
+      status: "work_complete",
+      version: current.version + 1,
+      checkpoint_id: boundary.id,
+    });
+
+    expect(() => reduce({
+      current,
+      currentRun,
+      currentManifest: externalManifest(),
+      command,
+      records: [decision, { ...priorDelivery, status: "rejected" }],
+      checkpoints: [boundary],
+    })).toThrow(/confirmed DeliveryRecords/);
+  });
+
+  it("rejects external scheduling on agent stages, malformed phase identity, or oversized batches", () => {
+    const current = attempt({
+      status: "running",
+      version: 2,
+      lease: {
+        id: "lease-1",
+        worker_id: "worker-1",
+        purpose: "work",
+        expires_at: "2026-08-20T00:05:00.000Z",
+        started: true,
+      },
+    });
+    const currentRun = run(current, { status: "running", version: 2 });
+    const boundary = checkpoint(current, subject("2"));
+    const decision = externalScheduleDecision({ attempt_id: current.id, phase: "checkpoint" });
+    const intent = effectIntent(decision.id);
+    const command: KernelCommand = {
+      type: "schedule_external",
+      command_id: "schedule-on-agent",
+      attempt_id: current.id,
+      checkpoint_id: boundary.id,
+      decision_record_id: decision.id,
+      phase: "checkpoint",
+      verified_output_subject: null,
+      effect_intents: [intent],
+    };
+    expect(() => reduce({
+      current,
+      currentRun,
+      command,
+      records: [decision],
+      checkpoints: [boundary],
+    })).toThrow(/effect or wait stage/);
+
+    const external = {
+      ...current,
+      scope: stageScope("external"),
+      repository_authority: "inspect" as const,
+    };
+    const externalRun = run(external, { status: "running", version: 2 });
+    const externalCheckpoint = { ...checkpoint(external, null), native_session_id: null };
+    expect(() => reduce({
+      current: external,
+      currentRun: externalRun,
+      currentManifest: externalManifest(),
+      command: { ...command, attempt_id: external.id, checkpoint_id: externalCheckpoint.id, phase: "other" },
+      records: [decision],
+      checkpoints: [externalCheckpoint],
+    })).toThrow(/semantic key/);
+
+    const tooMany = Array.from({ length: 17 }, (_, index) => ({
+      ...intent,
+      id: `effect-${index + 1}`,
+      idempotency_key: `run-1:effect:${index + 1}`,
+    }));
+    expect(() => reduce({
+      current: external,
+      currentRun: externalRun,
+      currentManifest: externalManifest(),
+      command: { ...command, attempt_id: external.id, checkpoint_id: externalCheckpoint.id, effect_intents: tooMany },
+      records: [decision],
+      checkpoints: [externalCheckpoint],
+    })).toThrow(/between 1 and 16/);
+  });
+
   it("allows deterministically ordered DecisionRecord-owned effects in a nonterminal transition", () => {
     const state = recordedAttempt();
     const decision = decisionRecord([state.result.id]);
@@ -1140,11 +1822,13 @@ describe("effect ownership and reconciliation", () => {
       intent,
       decision,
       observation: { kind: "unknown", external_identity: intent.target, detail: "provider timeout" },
+      retry_at: "2026-08-20T00:00:05.000Z",
     })).toEqual({
       kind: "hold_unknown",
       effect_id: intent.id,
       external_identity: intent.target,
       detail: "provider timeout",
+      retry_at: "2026-08-20T00:00:05.000Z",
     });
   });
 

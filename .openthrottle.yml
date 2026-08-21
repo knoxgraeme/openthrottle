@@ -32,7 +32,6 @@ post_bootstrap:
 limits:
   max_turns: 200
   task_timeout: 7200
-mcp_servers: {}
 pipelines:
   implement: implement
   investigate: investigate

@@ -1,12 +1,14 @@
 import {
   EXECUTION_RECORD_SCHEMA,
   canonicalJson,
+  compareCodeUnits,
   digestCanonicalJson,
   jsonValueAt,
   validateAndNormalizeResultCandidate,
   type CompiledPipelineStage,
   type DecisionRecord,
   type EvalDefinition,
+  type ExecutionRecord,
   type ExecutionRecordPayloadContract,
   type ExecutionRecordPayloadRegistry,
   type JsonValue,
@@ -272,6 +274,50 @@ function hasBlockingFinding(value: JsonValue): boolean {
   return Object.values(record).some(hasBlockingFinding);
 }
 
+function semanticObject(value: JsonValue, label: string): Record<string, JsonValue> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  return value as Record<string, JsonValue>;
+}
+
+function admissionOutcome(payload: SemanticResultRecordPayload): EvaluatedKernelResult {
+  const value = semanticObject(payload.payload, "admission result payload");
+  const plan = value.execution_plan;
+  const questions = value.questions;
+  const exact = (
+    (payload.outcome === "simple" && plan === null && Array.isArray(questions) && questions.length === 0) ||
+    (payload.outcome === "structured" && plan !== null && typeof plan === "object" &&
+      !Array.isArray(plan) && plan.pipeline_id === "core/structured" &&
+      Array.isArray(questions) && questions.length === 0) ||
+    (payload.outcome === "needs_human" && plan === null &&
+      Array.isArray(questions) && questions.length > 0)
+  );
+  return {
+    evaluator: "core/admission-outcome@1",
+    outcome: exact ? payload.outcome : "semantic_repair_required",
+    reason: exact ? "validated_admission_route" : "admission_route_payload_mismatch",
+  };
+}
+
+function admissionReviewOutcome(payload: SemanticResultRecordPayload): EvaluatedKernelResult {
+  const value = semanticObject(payload.payload, "admission review result payload");
+  const findings = value.findings;
+  const questions = value.questions;
+  const exact = (
+    (payload.outcome === "approved" && Array.isArray(findings) && findings.length === 0 &&
+      Array.isArray(questions) && questions.length === 0) ||
+    (payload.outcome === "rejected" && Array.isArray(findings) && findings.length > 0 &&
+      Array.isArray(questions) && questions.length === 0) ||
+    (payload.outcome === "needs_human" && Array.isArray(questions) && questions.length > 0)
+  );
+  return {
+    evaluator: "core/admission-review-outcome@1",
+    outcome: exact ? payload.outcome : "semantic_repair_required",
+    reason: exact ? "validated_admission_review" : "admission_review_payload_mismatch",
+  };
+}
+
 function inlineResultPayload(record: ResultRecord): SemanticResultRecordPayload | CommandResultRecordPayload {
   if (!("inline" in record.payload)) {
     throw new Error(`result ${record.id} must be materialized before live evaluation`);
@@ -304,10 +350,16 @@ export class KernelEvaluatorRegistry {
     ) {
       throw new Error(`result ${input.result.id} does not satisfy eval ${input.evaluation.id}`);
     }
-    if (!["core/action-outcome@1", "core/review-outcome@1", "core/unit-outcome@1"].includes(
+    if (!["core/action-outcome@1", "core/admission-outcome@1", "core/admission-review-outcome@1", "core/review-outcome@1", "core/unit-outcome@1"].includes(
       input.evaluation.evaluator,
     )) {
       throw new Error(`evaluator primitive ${input.evaluation.evaluator} is not registered`);
+    }
+    if (input.evaluation.evaluator === "core/admission-outcome@1") {
+      return admissionOutcome(payload);
+    }
+    if (input.evaluation.evaluator === "core/admission-review-outcome@1") {
+      return admissionReviewOutcome(payload);
     }
     const blocking = input.evaluation.evaluator === "core/review-outcome@1" &&
       hasBlockingFinding(payload.payload);
@@ -340,6 +392,7 @@ export class KernelEvaluatorRegistry {
 export function createPipelineDecisionRecord(input: {
   attempt: KernelAttempt;
   result: ResultRecord | null;
+  additional_input_records?: readonly ExecutionRecord[];
   evaluated: EvaluatedKernelResult;
   created_at: string;
 }): DecisionRecord {
@@ -350,12 +403,15 @@ export function createPipelineDecisionRecord(input: {
     outcome: input.evaluated.outcome,
     reason: input.evaluated.reason,
   };
-  const inputRecordIds = input.result === null ? [] : [input.result.id];
+  const inputRecordIds = [...new Set([
+    ...(input.result === null ? [] : [input.result.id]),
+    ...(input.additional_input_records ?? []).map(({ id }) => id),
+  ])].sort(compareCodeUnits);
   return {
     schema: EXECUTION_RECORD_SCHEMA,
     id: recordId("decision", {
       attempt_id: input.attempt.id,
-      result_id: input.result?.id ?? null,
+      input_record_ids: inputRecordIds,
       payload,
     }),
     kind: "decision",

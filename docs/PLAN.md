@@ -1,92 +1,109 @@
 # OpenThrottle delivery plan
 
-OpenThrottle now has one deterministic coordinator architecture, a live
-repository-configurable structured workflow, automatic admission for Claude and
-Codex, acknowledged exact-SHA task-branch checkpoints, and concurrent semantic
-review fanout. The active delivery lane is controlled rollout plus safe
-parallelization of structured implementation units.
+OpenThrottle's current delivery boundary is a filesystem-authored software
+factory running on one durable execution kernel. The normative contracts are in
+[`SPEC.md`](SPEC.md); detailed design history remains under [`plans/`](plans/).
 
-The normative runtime contract is [`SPEC.md`](SPEC.md). Detailed implementation
-plans live under [`docs/plans/`](plans/).
+## Product outcome
 
-## Product boundary
+Given a registered Linear ticket or GitHub Issue and an exact repository
+subject, OpenThrottle can:
 
-OpenThrottle is a pre-production, plan-first coding pipeline. An approved
-Linear ticket or GitHub Issue selects one immutable configurable graph. The Fly
-supervisor owns deterministic admission, scheduling, gates, recovery,
-integration, and publication. Self-contained OpenThrottle skills provide
-semantic judgment inside fenced Daytona actions. GitHub supplies task-branch,
-pull-request, and provider evidence.
+1. choose and compile a pipeline plus its transitive definitions into one
+   immutable DefinitionBundle;
+2. compose each agent action from stable instructions, a sealed task prompt,
+   and a selectively disclosed skill set;
+3. execute ordinary or structured work through the same Attempt, Record,
+   Effect, and Checkpoint primitives;
+4. preserve completed code work when semantic output needs deterministic
+   normalization or bounded result-only correction;
+5. review exact accepted edits without making the review checkout writable;
+6. run configured commands, integrate accepted structured units, publish the
+   exact subject, reconcile provider evidence, and clean runtime resources;
+7. expose status, logs, historical record metadata, stop/supersede control, and
+   maintenance fencing through one bounded operator surface.
 
-There is no direct-run fallback coordinator. Compatibility is limited to
-additive/idempotent migrations and explicitly supported older public contracts.
-The sandbox image does not ship Compound Engineering; every runtime skill is an
-agent-neutral OpenThrottle package maintained once and delivered per engine.
+## Shipped architecture
 
-## Completed lanes
+- `.openthrottle/` is the authoring surface for config, instructions,
+  pipelines, optional pipeline-local loops, skills, and evals.
+- Pipeline is the only public orchestration concept. A compiled manifest is a
+  private runtime artifact reconstructed from immutable bundle bytes.
+- Agent instructions, task prompts, and skills have separate lifecycles.
+  Skills retain native progressive disclosure for Claude, Codex, and OpenCode.
+- `inspect` and `edit` are the only repository authorities. Review and planning
+  receive an immutable exact-subject view; implementation and remediation
+  receive an isolated writable content tree. The executor owns Git throughout.
+- Agent output is a bounded ResultCandidate. Declared normalizations are
+  recorded; unresolved schema errors enter `result_pending` and use the same
+  native session for result-only correction.
+- Ordinary and structured coordinators use the same kernel reducer and durable
+  store. Structured work adds bounded frontier, dependency, acceptance, serial
+  integration, and reviewer-persona planning over those primitives.
+- External writes are write-ahead Effects with one idempotency key. The worker
+  reconciles before writing and records confirmed or rejected delivery
+  evidence.
+- SQLite has one fresh twelve-table epoch. Immutable payloads above the inline
+  bound use verified content-addressed blobs.
+- Provider ingress is durably deduplicated. During maintenance it returns a
+  retryable non-acknowledgement and persists nothing.
+- The old dogfood installation is replaced once, offline. The runtime has no
+  old-epoch read path, dual-write path, or durable replacement phase model.
 
-- Configurable coordinator cutover, sealed stage execution, durable effects,
-  repair, publication, provider evidence, and runtime cleanup.
-- Repository-configurable structured workflows with durable unit state,
-  executor-owned worktrees, unit acceptance, serial exact-subject integration,
-  whole-change gates, and a Docker walking skeleton.
-- Self-contained skills, analysis/tuning evidence, GitHub-Issue control,
-  automatic admission planning/review, and provider-neutral admission
-  visibility.
-- Codex supervisor-owned token brokerage and concurrent review-persona fanout.
-  The active review window defaults to 5 and can be rolled back to serial by
-  setting `REVIEW_FANOUT_CONCURRENCY=1`.
-- OPE-187 lifecycle hardening: task branches are reserved at the exact base
-  before planning; accepted write work advances through acknowledged exact-SHA
-  checkpoints; replacement sandboxes restore from the acknowledged checkpoint;
-  bounded action artifacts are retained while reconstructible runtime state is
-  pruned.
-- Automatic admission is the initializer and repository default for Claude and
-  Codex. `openthrottle init` also materializes the editable simple graph plus
-  repository-owned implementation, admission-planner, and admission-reviewer
-  skills. OpenCode continues to use direct default-graph routing because its
-  structured loop-action runtime is not implemented.
+## Acceptance gates
 
-## Active milestones
+The release is accepted only when all of the following hold:
 
-1. Run the credentialed automatic-admission evaluation and a plain-text live
-   delegation with current planner/reviewer/runtime digests. Capture the blinded
-   scoring report, accepted route, checkpoint restoration, publication, and
-   cleanup evidence described in
-   [`runbooks/automatic-admission.md`](runbooks/automatic-admission.md).
-2. Deliver Phase 3A from the
-   [parallel structured units plan](plans/2026-08-19-1232-feat-parallel-structured-units-plan.md):
-   deterministic claim-safe waves, concurrent worktree-owned writers using the
-   same durable fanout machinery as reviewers,
-   durable multi-action recovery, a gather barrier, and strictly serial
-   integration. Concurrency 1 must remain behaviorally equivalent to today's
-   structured path and is the rollback switch.
-3. After Phase 3A's live gate, deliver Phase 3B: lead preferences over the
-   supervisor-certified ready set, scope-preserving splits, budget-reserve
-   wind-down, coherent slice publication, and merge-evidence continuation.
-4. Expand repository-owned scaffolding beyond the simple implementation and
-   admission roles so every replaceable structured semantic role can be copied,
-   validated, pinned, refreshed, and edited through the same `repo://` model.
-5. Add OpenCode structured loop actions before claiming automatic structured
-   admission or structured-unit parity for that engine.
+- Filesystem and exact-Git readers compile the same definition tree to the same
+  canonical bytes and SHA-256 hash.
+- A restarted supervisor reconstructs the same private manifest solely from the
+  DefinitionBundle blob and release-sealed platform authority.
+- An action cannot widen its skill set, eval, engine, repository authority,
+  tools, MCP access, credentials, session policy, or exact input subject.
+- Inspect actions cannot modify repository content, Git state, or remotes.
+  Blocking findings create separate edit remediation Attempts.
+- Edit actions cannot commit, push, publish, or supply authoritative checkpoint
+  identity.
+- An array-valued `payload.summary` normalizes deterministically; any remaining
+  candidate error preserves the work checkpoint and enters bounded correction
+  instead of rerunning work.
+- Attempt transitions, records, checkpoints, cursor movement, and Effect
+  scheduling commit atomically and remain deterministic after restart.
+- Lost leases recover safely. Stale or conflicting events cannot settle another
+  Attempt or native session.
+- Effect retries reconcile known external state before writing and never replay
+  an unknown mutation blindly.
+- Ordinary and structured Docker proofs cover edit, inspect, commands,
+  publication, provider wait, cleanup, restart, and large-blob verification.
+- The offline replacement proof rejects live writers, unresolved resources,
+  corrupt archives, nonempty fresh paths, and mixed release/storage identity;
+  ordinary and structured smoke items pass before ingress reopens.
 
-## Release gates
+## Verification
 
-- Contract, supervisor, CLI, sandbox, Bats, Docker smoke, and structured walking
-  skeleton suites pass.
-- Every externally visible decision is bound to immutable graph, skill,
-  runtime, subject, and request identities.
-- Stop, supersede, crash recovery, checkpoint restoration, retention, and disk
-  pressure converge without losing accepted work or exposing secrets.
-- Semantic review covers the complete branch diff; valid findings are fixed and
-  regression-tested; GitHub CI and review threads are green.
-- Credentialed Linear/GitHub/Daytona/Fly/model proofs run only as explicit
-  operator gates, never as assumed CI coverage.
+```bash
+npm run typecheck --prefix contracts && npm run build --prefix contracts
+npm run typecheck --prefix supervisor && npm run typecheck --prefix cli
+npm run build --prefix supervisor && npm run build --prefix cli
+npm test --prefix contracts
+npm test --prefix supervisor
+npm test --prefix cli
+npm test --prefix sandbox
+bats sandbox/tests/runtime.bats
+docker build -f sandbox/Dockerfile -t openthrottle:test .
+sandbox/tests/smoke.sh openthrottle:test
+node sandbox/tests/structured-walking-skeleton.mjs openthrottle:test
+```
 
-## Non-goals
+Live Linear, GitHub, Daytona, Fly, and model checks require operator credentials
+and remain an explicit post-CI gate.
 
-- Parallel integration or agent-owned Git publication authority.
-- Agent authority to approve the original plan, expand approved scope, merge a
-  PR, bypass dependency/resource fences, or create arbitrary follow-up work.
-- Multi-tenant administration, a separate web UI, or Windows support in this
-  delivery lane.
+## Deferred work
+
+- multi-tenant administration or a separate web UI;
+- automatic mutation of definitions from historical analysis;
+- offline evaluation and longitudinal skill-quality scoring;
+- a remote blob backend if one Fly volume stops being sufficient;
+- parallel Git integration of structured units;
+- agent-owned commit, publication, merge, or scope-expansion authority;
+- online epoch migration or preservation of abandoned dogfood work.

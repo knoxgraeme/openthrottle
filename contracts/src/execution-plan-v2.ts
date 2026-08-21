@@ -10,19 +10,14 @@ import {
   stringAt,
   type ValidatedContract,
 } from "./validation.js";
-import type { ExecutionPlanCommand } from "./execution-plan.js";
 
-// Successor to openthrottle.execution-plan/v1. A v1 unit only carries IDs
-// that index into a plan-level instructions/acceptance map, which the
-// planning guidance described as an index over human-authoritative source
-// prose -- so a planning agent could legally emit a pointer like "follow the
-// requirements above" that resolves to nothing once the source prose is
-// unavailable to a dispatched unit worker (OPE-166). A v2 unit instead
-// carries every applicable value directly: it is the complete runtime
-// authority for that unit, with no indirection through source prose a
-// worker never sees.
 export const EXECUTION_PLAN_SCHEMA_V2 = "openthrottle.execution-plan/v2" as const;
 export const EXECUTION_PLAN_V2_MAX_BYTES = 256 * 1024;
+
+export interface ExecutionPlanCommand {
+  name: string;
+  unit?: string;
+}
 
 export interface ExecutionPlanUnitV2 {
   id: string;

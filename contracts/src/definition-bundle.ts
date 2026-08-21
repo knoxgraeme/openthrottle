@@ -46,6 +46,7 @@ export interface DefinitionBundle {
   runtime_capability_digest: string;
   source_commit: string;
   pipeline_id: string;
+  pipeline_selection: "config" | "explicit";
   entries: DefinitionBundleEntry[];
 }
 
@@ -155,7 +156,8 @@ export function validateDefinitionBundle(
 ): ValidatedContract<DefinitionBundle> {
   const source = options.source ?? "definition_bundle";
   const input = objectAt(value, source, [
-    "schema", "compiler_version", "runtime_capability_digest", "source_commit", "pipeline_id", "entries",
+    "schema", "compiler_version", "runtime_capability_digest", "source_commit", "pipeline_id",
+    "pipeline_selection", "entries",
   ]);
   if (input.schema !== DEFINITION_BUNDLE_SCHEMA) {
     fail(`${source}.schema`, `must be ${DEFINITION_BUNDLE_SCHEMA}`);
@@ -205,6 +207,11 @@ export function validateDefinitionBundle(
     ),
     source_commit: sourceCommit,
     pipeline_id: pipelineId,
+    pipeline_selection: enumAt(
+      input.pipeline_selection,
+      `${source}.pipeline_selection`,
+      ["config", "explicit"] as const,
+    ),
     entries: [...entries].sort(entryOrder),
   });
 }

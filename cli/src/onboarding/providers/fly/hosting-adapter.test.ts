@@ -41,7 +41,6 @@ const bundle: SupervisorDeploymentBundle = {
   secrets: {
     OT_STATUS_TOKEN: { owner: "cli", name: "status_token" },
     OT_DEPLOY_TOKEN: { owner: "provisioning", name: "deploy_token" },
-    OT_INSTALL_SECRET: { owner: "provisioning", name: "install_secret" },
     LINEAR_WEBHOOK_SECRET: { owner: "provisioning", name: "linear_webhook_secret" },
     GITHUB_WEBHOOK_SECRET: { owner: "provisioning", name: "github_webhook_secret" },
     GITHUB_TOKEN: { owner: "operator", name: "github_token" },
@@ -58,7 +57,6 @@ const ALL_SECRET_NAMES = [
   "GITHUB_WEBHOOK_SECRET",
   "LINEAR_WEBHOOK_SECRET",
   "OT_DEPLOY_TOKEN",
-  "OT_INSTALL_SECRET",
   "OT_STATUS_TOKEN",
   "SUPERVISOR_URL",
 ];
@@ -333,7 +331,7 @@ describe("fly hosting adapter inspect", () => {
     expect(result.evidence.status).toBe("ready");
     expect(result.evidence.releaseId).toBe(release.releaseId);
     expect(result.evidence.summary).toContain(`app ${APP}: ok`);
-    expect(result.evidence.summary).toContain("secrets: 10/10 set");
+    expect(result.evidence.summary).toContain("secrets: 9/9 set");
     expect(result.evidence.summary).toContain("release image: active");
     expect(result.evidence.summary).toContain("healthz: ok");
     expectValidEvidence(result.evidence);
@@ -365,7 +363,7 @@ describe("fly hosting adapter plan", () => {
     expect(plan.mutations).toEqual([
       `flyctl apps create ${APP} --org personal`,
       `flyctl volumes create openthrottle_data --app ${APP} --region sjc --size 1`,
-      "set 7 supervisor secrets (names: DAYTONA_SNAPSHOT, GITHUB_WEBHOOK_SECRET, LINEAR_WEBHOOK_SECRET, OT_DEPLOY_TOKEN, OT_INSTALL_SECRET, OT_STATUS_TOKEN, SUPERVISOR_URL)",
+      "set 6 supervisor secrets (names: DAYTONA_SNAPSHOT, GITHUB_WEBHOOK_SECRET, LINEAR_WEBHOOK_SECRET, OT_DEPLOY_TOKEN, OT_STATUS_TOKEN, SUPERVISOR_URL)",
       `flyctl deploy --app ${APP} --image ${release.supervisorImage}`,
     ]);
     expect(plan.billable).toBe(true);
@@ -380,7 +378,7 @@ describe("fly hosting adapter plan", () => {
     fly.secrets = [...OPERATOR_NAMES];
     const plan = await adapter.plan(context, bundle);
     expect(plan.mutations).toEqual([
-      "set 7 supervisor secrets (names: DAYTONA_SNAPSHOT, GITHUB_WEBHOOK_SECRET, LINEAR_WEBHOOK_SECRET, OT_DEPLOY_TOKEN, OT_INSTALL_SECRET, OT_STATUS_TOKEN, SUPERVISOR_URL)",
+      "set 6 supervisor secrets (names: DAYTONA_SNAPSHOT, GITHUB_WEBHOOK_SECRET, LINEAR_WEBHOOK_SECRET, OT_DEPLOY_TOKEN, OT_STATUS_TOKEN, SUPERVISOR_URL)",
     ]);
     expect(plan.billable).toBe(false);
     expect(plan.externallyVisible).toBe(false);
@@ -425,7 +423,6 @@ describe("fly hosting adapter ensure", () => {
         "GITHUB_WEBHOOK_SECRET=generated-github_webhook_secret-secret-value",
         "LINEAR_WEBHOOK_SECRET=generated-linear_webhook_secret-secret-value",
         "OT_DEPLOY_TOKEN=generated-deploy_token-secret-value",
-        "OT_INSTALL_SECRET=generated-install_secret-secret-value",
         "OT_STATUS_TOKEN=PRESET_SENTINEL_STATUS",
         `SUPERVISOR_URL=https://${APP}.fly.dev`,
       ],
@@ -442,7 +439,7 @@ describe("fly hosting adapter ensure", () => {
 
     // Generated secrets are minted through the port (persisted) and only for
     // absent cli/provisioning refs; operator refs are never generated.
-    expect(port.generated).toEqual(["github_webhook_secret", "linear_webhook_secret", "deploy_token", "install_secret"]);
+    expect(port.generated).toEqual(["github_webhook_secret", "linear_webhook_secret", "deploy_token"]);
     expect(port.getCalls).toContain("status_token");
     for (const operatorRef of ["github_token", "github_read_token", "daytona_api_key"]) {
       expect(port.generated).not.toContain(operatorRef);

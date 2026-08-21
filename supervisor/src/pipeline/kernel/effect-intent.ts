@@ -37,6 +37,7 @@ export type EffectReconciliation =
     effect_id: string;
     external_identity: string;
     detail: string;
+    retry_at: string;
   };
 
 export function authorizeEffectIntent(
@@ -73,6 +74,7 @@ export function reconcileEffectIntent(input: {
   intent: EffectIntent;
   decision: DecisionRecord;
   observation: EffectObservation;
+  retry_at?: string;
 }): EffectReconciliation {
   const intent = authorizeEffectIntent(
     input.intent,
@@ -83,11 +85,15 @@ export function reconcileEffectIntent(input: {
     throw new Error("effect observation does not match the deterministic external identity");
   }
   if (input.observation.kind === "unknown") {
+    if (input.retry_at === undefined) {
+      throw new Error("unknown effect reconciliation requires an executor retry_at");
+    }
     return {
       kind: "hold_unknown",
       effect_id: intent.id,
       external_identity: input.observation.external_identity,
       detail: input.observation.detail,
+      retry_at: input.retry_at,
     };
   }
   if (input.observation.kind === "not_found") {

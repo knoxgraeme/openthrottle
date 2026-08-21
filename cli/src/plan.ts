@@ -4,19 +4,17 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  parseAnyExecutionPlanContract,
+  parseExecutionPlanContractV2,
   validateFilesystemConfigContract,
-  type AnyExecutionPlanContract,
   type DefinitionCompilation,
+  type ExecutionPlanContractV2,
   type FilesystemConfigContract,
   type ValidatedContract,
 } from "@openthrottle/contracts";
 import { compileLocalPipeline } from "./definition-compilation.js";
 import { getErrorMessage } from "./util.js";
 
-export const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v1";
-export const EXECUTION_PLAN_FENCE_V2 = "openthrottle.execution-plan/v2";
-const EXECUTION_PLAN_FENCES = [EXECUTION_PLAN_FENCE, EXECUTION_PLAN_FENCE_V2];
+export const EXECUTION_PLAN_FENCE = "openthrottle.execution-plan/v2";
 
 export interface ExecutionPlanBlock {
   json: string;
@@ -26,21 +24,17 @@ export interface ExecutionPlanBlock {
 }
 
 export interface ValidationResult {
-  plan: ValidatedContract<AnyExecutionPlanContract>;
+  plan: ValidatedContract<ExecutionPlanContractV2>;
   coverage: {
     units: number;
     commands: string[];
-  } & (
-    | { schema: typeof EXECUTION_PLAN_FENCE; instruction_refs: number; acceptance_refs: number }
-    | {
-        schema: typeof EXECUTION_PLAN_FENCE_V2;
-        requirement_count: number;
-        file_count: number;
-        test_count: number;
-        acceptance_count: number;
-        verification_count: number;
-      }
-  );
+    schema: typeof EXECUTION_PLAN_FENCE;
+    requirement_count: number;
+    file_count: number;
+    test_count: number;
+    acceptance_count: number;
+    verification_count: number;
+  };
 }
 
 export interface LocalPipelineSelection {
@@ -97,27 +91,23 @@ export function extractExecutionPlanBlocks(markdown: string): ExecutionPlanBlock
   const blocks: ExecutionPlanBlock[] = [];
   for (const match of markdown.matchAll(FENCE_PATTERN)) {
     const marker = match[1]?.trim().split(/\s+/) ?? [];
-    const markerSchemas = EXECUTION_PLAN_FENCES.filter((fence) => marker.includes(fence));
-    if (markerSchemas.length === 0) continue;
-    if (markerSchemas.length > 1) {
-      throw new Error(`execution-plan fence declares multiple schemas: ${markerSchemas.join(", ")}`);
-    }
+    if (!marker.includes(EXECUTION_PLAN_FENCE)) continue;
     const json = match[2]?.trim() ?? "";
     let parsed: unknown;
     try {
       parsed = JSON.parse(json) as unknown;
     } catch {
-      throw new Error(`${markerSchemas[0]} block must contain valid JSON`);
+      throw new Error(`${EXECUTION_PLAN_FENCE} block must contain valid JSON`);
     }
     const payloadSchema = parsed && typeof parsed === "object" && !Array.isArray(parsed)
       ? (parsed as { schema?: unknown }).schema
       : undefined;
-    if (payloadSchema !== markerSchemas[0]) {
-      throw new Error(`${markerSchemas[0]} block payload schema must be ${markerSchemas[0]}`);
+    if (payloadSchema !== EXECUTION_PLAN_FENCE) {
+      throw new Error(`${EXECUTION_PLAN_FENCE} block payload schema must be ${EXECUTION_PLAN_FENCE}`);
     }
     blocks.push({
       json,
-      schema: markerSchemas[0]!,
+      schema: EXECUTION_PLAN_FENCE,
       start: match.index ?? 0,
       end: (match.index ?? 0) + match[0].length,
     });
@@ -125,26 +115,16 @@ export function extractExecutionPlanBlocks(markdown: string): ExecutionPlanBlock
   return blocks;
 }
 
-function coverageFor(plan: AnyExecutionPlanContract): ValidationResult["coverage"] {
-  const commands = plan.commands.map((command) => command.name);
-  if (plan.schema === EXECUTION_PLAN_FENCE_V2) {
-    return {
-      schema: EXECUTION_PLAN_FENCE_V2,
-      units: plan.units.length,
-      requirement_count: plan.units.reduce((count, unit) => count + unit.requirements.length, 0),
-      file_count: plan.units.reduce((count, unit) => count + unit.files.length, 0),
-      test_count: plan.units.reduce((count, unit) => count + unit.tests.length, 0),
-      acceptance_count: plan.units.reduce((count, unit) => count + unit.acceptance.length, 0),
-      verification_count: plan.units.reduce((count, unit) => count + unit.verification.length, 0),
-      commands,
-    };
-  }
+function coverageFor(plan: ExecutionPlanContractV2): ValidationResult["coverage"] {
   return {
     schema: EXECUTION_PLAN_FENCE,
     units: plan.units.length,
-    instruction_refs: Object.keys(plan.instructions).length,
-    acceptance_refs: Object.keys(plan.acceptance).length,
-    commands,
+    requirement_count: plan.units.reduce((count, unit) => count + unit.requirements.length, 0),
+    file_count: plan.units.reduce((count, unit) => count + unit.files.length, 0),
+    test_count: plan.units.reduce((count, unit) => count + unit.tests.length, 0),
+    acceptance_count: plan.units.reduce((count, unit) => count + unit.acceptance.length, 0),
+    verification_count: plan.units.reduce((count, unit) => count + unit.verification.length, 0),
+    commands: plan.commands.map((command) => command.name),
   };
 }
 
@@ -156,12 +136,7 @@ export function readExecutionPlanFromMarkdown(
   if (blocks.length !== 1) {
     throw new Error(`${source}: expected exactly one execution-plan block, found ${blocks.length}`);
   }
-  if (blocks[0]!.schema === EXECUTION_PLAN_FENCE) {
-    throw new Error(
-      `${source}: fresh execution plans must use ${EXECUTION_PLAN_FENCE_V2}; ${EXECUTION_PLAN_FENCE} is replay-only`,
-    );
-  }
-  const plan = parseAnyExecutionPlanContract(blocks[0]!.json, {
+  const plan = parseExecutionPlanContractV2(blocks[0]!.json, {
     source: `${source}.execution_plan`,
   });
   return { plan, coverage: coverageFor(plan.value) };
@@ -220,9 +195,6 @@ export function validatePlanContentForPipeline(
     return undefined;
   }
   const plan = readExecutionPlanFromMarkdown(markdown, source);
-  if (plan.plan.value.schema !== EXECUTION_PLAN_FENCE_V2) {
-    throw new Error(`${source}: fresh execution plans must use ${EXECUTION_PLAN_FENCE_V2}`);
-  }
   if (plan.plan.value.pipeline_id !== pipeline.pipelineId) {
     throw new Error(
       `${source}: execution_plan.pipeline_id must match configured pipeline ${pipeline.pipelineId}`,
@@ -533,9 +505,6 @@ export function prepareExecutionPlanFile(
       throw new Error(`${file}: prepare modified content outside the execution-plan block`);
     }
     const result = readExecutionPlanFromMarkdown(prepared, file);
-    if (result.plan.value.schema !== EXECUTION_PLAN_FENCE_V2) {
-      throw new Error(`${file}: prepare must produce a ${EXECUTION_PLAN_FENCE_V2} block`);
-    }
     if (result.plan.value.pipeline_id !== pipeline.pipelineId) {
       throw new Error(
         `${file}: execution_plan.pipeline_id must match configured pipeline ${pipeline.pipelineId}`,
@@ -572,9 +541,7 @@ function printValidation(
   }
   console.log(`schema ${plan.plan.value.schema}`);
   console.log(`digest ${plan.plan.digest}`);
-  const coverage = plan.coverage.schema === EXECUTION_PLAN_FENCE_V2
-    ? `coverage units=${plan.coverage.units} requirements=${plan.coverage.requirement_count} files=${plan.coverage.file_count} tests=${plan.coverage.test_count} acceptance=${plan.coverage.acceptance_count} verification=${plan.coverage.verification_count}`
-    : `coverage units=${plan.coverage.units} instructions=${plan.coverage.instruction_refs} acceptance=${plan.coverage.acceptance_refs}`;
+  const coverage = `coverage units=${plan.coverage.units} requirements=${plan.coverage.requirement_count} files=${plan.coverage.file_count} tests=${plan.coverage.test_count} acceptance=${plan.coverage.acceptance_count} verification=${plan.coverage.verification_count}`;
   console.log(coverage);
 }
 
@@ -619,9 +586,7 @@ export async function plan(args: string[]): Promise<void> {
       const prepared = prepareExecutionPlanFile(parsed.file, {
         ...(parsed.pipelineId === undefined ? {} : { pipelineId: parsed.pipelineId }),
       });
-      printValidation({ pipelineId: prepared.plan.value.schema === EXECUTION_PLAN_FENCE_V2
-        ? prepared.plan.value.pipeline_id
-        : "unknown", plan: prepared }, parsed.json);
+      printValidation({ pipelineId: prepared.plan.value.pipeline_id, plan: prepared }, parsed.json);
     } else {
       const validated = validatePlanFileForPipeline(parsed.file, {
         ...(parsed.pipelineId === undefined ? {} : { pipelineId: parsed.pipelineId }),

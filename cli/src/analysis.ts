@@ -1,121 +1,157 @@
-import {
-  ANALYSIS_QUERY_ATTRIBUTIONS,
-  ANALYSIS_QUERY_OUTCOMES,
-  ANALYSIS_QUERY_REASONS,
-  type AnalysisRunQuery,
-  type AnalysisRunResult,
-} from '@openthrottle/contracts';
+import { terminalSafe } from './status.js';
 import { getErrorMessage, printTable, supervisorRequest } from './util.js';
 
-/**
- * A /analysis/runs row: the contract's read shape plus the three operator-facing
- * columns the supervisor also returns but the read contract does not model.
- */
-type AnalysisRunRow = AnalysisRunResult & {
-  ticket_id: string;
-  engine: string;
-  token_cost_usd: number | null;
-};
+const TERMINAL_OUTCOMES = [
+  'completed', 'no_change', 'needs_human', 'failed', 'canceled', 'superseded',
+] as const;
+const RECORD_KINDS = ['result', 'decision', 'delivery'] as const;
 
-interface AnalysisRunsResponse {
-  runs?: AnalysisRunRow[];
+type QueryField =
+  | 'run'
+  | 'pipeline_id'
+  | 'terminal_outcome'
+  | 'record_kind'
+  | 'from'
+  | 'to'
+  | 'limit';
+
+const FIELD_BY_FLAG = new Map<string, QueryField>([
+  ['--run', 'run'],
+  ['--pipeline', 'pipeline_id'],
+  ['--outcome', 'terminal_outcome'],
+  ['--record-kind', 'record_kind'],
+  ['--from', 'from'],
+  ['--to', 'to'],
+  ['--limit', 'limit'],
+]);
+
+interface ParsedFilters {
+  run?: string;
+  params: URLSearchParams;
 }
 
-/**
- * Allowed values per query field, keyed by the contract's own query shape —
- * `satisfies` makes this table fail typecheck if @openthrottle/contracts adds or
- * drops a filter. `null` means "any string"; the supervisor validates the value.
- */
-const QUERY_FIELDS = {
-  outcome: ANALYSIS_QUERY_OUTCOMES,
-  reason: ANALYSIS_QUERY_REASONS,
-  attribution: ANALYSIS_QUERY_ATTRIBUTIONS,
-  graph: null,
-  skill_digest: null,
-  from: null,
-  to: null,
-  limit: null,
-} satisfies Record<keyof AnalysisRunQuery, readonly string[] | null>;
+function fail(message: string): never {
+  console.error(message);
+  process.exit(1);
+  throw new Error(message);
+}
 
-type QueryField = keyof typeof QUERY_FIELDS;
-
-/** `skill_digest` is spelled `--skill-digest` on the command line. */
-const FIELD_BY_FLAG = new Map<string, QueryField>(
-  (Object.keys(QUERY_FIELDS) as QueryField[]).map((field) => [`--${field.replace(/_/g, '-')}`, field])
-);
-
-function parseFilters(args: string[]): URLSearchParams {
+function parseFilters(args: string[]): ParsedFilters {
   const params = new URLSearchParams();
-  for (let i = 0; i < args.length; i += 1) {
-    const flag = args[i] ?? '';
+  let run: string | undefined;
+  for (let index = 0; index < args.length; index += 2) {
+    const flag = args[index] ?? '';
     const field = FIELD_BY_FLAG.get(flag);
-    if (!field) {
-      console.error(`Unknown flag: ${flag}\n`);
-      console.error(`Supported flags: ${[...FIELD_BY_FLAG.keys()].join(', ')}`);
-      process.exit(1);
+    if (!field) fail(`Unknown flag: ${flag}\n\nSupported flags: ${[...FIELD_BY_FLAG.keys()].join(', ')}`);
+    const value = args[index + 1];
+    if (value === undefined) fail(`${flag} requires a value`);
+    if (field === 'terminal_outcome' && !TERMINAL_OUTCOMES.includes(value as typeof TERMINAL_OUTCOMES[number])) {
+      fail(`Invalid value for ${flag}: ${value}\n\nAllowed values: ${TERMINAL_OUTCOMES.join(', ')}`);
     }
-    const value = args[i + 1];
-    if (value === undefined) {
-      console.error(`${flag} requires a value`);
-      process.exit(1);
+    if (field === 'record_kind' && !RECORD_KINDS.includes(value as typeof RECORD_KINDS[number])) {
+      fail(`Invalid value for ${flag}: ${value}\n\nAllowed values: ${RECORD_KINDS.join(', ')}`);
     }
-    // Vocabulary-backed filters are checked here so a typo fails locally rather
-    // than as an HTTP 400 from the supervisor.
-    const allowed: readonly string[] | null = QUERY_FIELDS[field];
-    if (allowed && !allowed.includes(value)) {
-      console.error(`Invalid value for ${flag}: ${value}\n`);
-      console.error(`Allowed values: ${allowed.join(', ')}`);
-      process.exit(1);
+    if (field === 'limit' && (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 500)) {
+      fail('--limit must be an integer between 1 and 500');
     }
-    params.set(field, value);
-    i += 1;
+    if (field === 'run') {
+      if (run !== undefined) fail('--run may be supplied only once');
+      run = value;
+    } else {
+      params.set(field, value);
+    }
   }
-  return params;
+  if (run !== undefined) {
+    for (const field of ['pipeline_id', 'terminal_outcome', 'from', 'to'] as const) {
+      if (params.has(field)) fail(`--run cannot be combined with --${field.replaceAll('_', '-')}`);
+    }
+  }
+  return { ...(run === undefined ? {} : { run }), params };
+}
+
+function safeRows(rows: Array<Record<string, string | number | null | undefined>>) {
+  return rows.map((row) => Object.fromEntries(
+    Object.entries(row).map(([key, value]) => [
+      key,
+      typeof value === 'string' ? terminalSafe(value) : value,
+    ]),
+  ));
 }
 
 export default async function analysis(args: string[]): Promise<void> {
-  const params = parseFilters(args);
+  const filters = parseFilters(args);
+  const params = filters.run === undefined
+    ? new URLSearchParams(filters.params)
+    : new URLSearchParams([
+      ...(filters.params.has('record_kind')
+        ? [['kind', filters.params.get('record_kind')!] as [string, string]]
+        : []),
+      ...(filters.params.has('limit')
+        ? [['limit', filters.params.get('limit')!] as [string, string]]
+        : []),
+    ]);
   const query = params.toString();
+  const path = filters.run === undefined
+    ? `/analysis/runs${query ? `?${query}` : ''}`
+    : `/runs/${encodeURIComponent(filters.run)}/analysis${query ? `?${query}` : ''}`;
 
-  let res: Response;
+  let response: Response;
   try {
-    res = await supervisorRequest(`/analysis/runs${query ? `?${query}` : ''}`);
-  } catch (err: unknown) {
-    console.error(`Could not reach the supervisor: ${getErrorMessage(err)}`);
+    response = await supervisorRequest(path);
+  } catch (error) {
+    console.error(`Could not reach the supervisor: ${getErrorMessage(error)}`);
     process.exit(1);
+    return;
   }
-
-  if (!res.ok) {
-    console.error(`GET /analysis/runs → HTTP ${res.status}`);
+  if (!response.ok) {
+    console.error(`GET ${filters.run === undefined ? '/analysis/runs' : '/runs/:reference/analysis'} → HTTP ${response.status}`);
     try {
-      console.error(await res.text());
+      console.error(terminalSafe(await response.text()));
     } catch {
-      // ignore
+      // Ignore a secondary response-body failure.
     }
     process.exit(1);
+    return;
   }
-
-  let data: AnalysisRunsResponse;
+  let body: {
+    runs?: Array<Record<string, string | number | null>>;
+    pipeline_run_id?: string;
+    records?: Array<Record<string, string | number | null>>;
+  };
   try {
-    data = (await res.json()) as AnalysisRunsResponse;
-  } catch (err: unknown) {
-    console.error(`Could not parse response as JSON: ${getErrorMessage(err)}`);
+    body = await response.json() as typeof body;
+  } catch (error) {
+    console.error(`Could not parse response as JSON: ${getErrorMessage(error)}`);
     process.exit(1);
+    return;
   }
 
-  const runs = data.runs ?? [];
-  printTable(
-    runs.map((run) => ({
-      instance: run.pipeline_instance_id,
-      ticket: run.ticket_id,
-      outcome: run.outcome,
-      reason: run.closed_reason,
-      attribution: run.fault_attribution,
-      graph: run.execution_graph_id,
-      engine: run.engine,
-      cost_usd: run.token_cost_usd,
-      created_at: run.created_at,
-    })),
-    ['instance', 'ticket', 'outcome', 'reason', 'attribution', 'graph', 'engine', 'cost_usd', 'created_at']
-  );
+  if (filters.run !== undefined) {
+    printTable(safeRows((body.records ?? []).map((record) => ({
+      sequence: record.sequence,
+      kind: record.kind,
+      schema: record.payload_schema,
+      attempt: record.attempt_id,
+      effect: record.effect_id,
+      created_at: record.created_at,
+    }))), ['sequence', 'kind', 'schema', 'attempt', 'effect', 'created_at']);
+    return;
+  }
+  printTable(safeRows((body.runs ?? []).map((run) => ({
+    run: run.pipeline_run_id,
+    source: run.source_reference,
+    pipeline: run.pipeline_id,
+    outcome: run.terminal_outcome,
+    attempts: run.attempt_count,
+    results: run.result_count,
+    decisions: run.decision_count,
+    deliveries: run.delivery_count,
+    normalized: run.normalized_result_count,
+    checkpoints: run.checkpoint_count,
+    effects: run.effect_count,
+    settled_at: run.settled_at,
+  }))), [
+    'run', 'source', 'pipeline', 'outcome', 'attempts', 'results', 'decisions',
+    'deliveries', 'normalized', 'checkpoints', 'effects', 'settled_at',
+  ]);
 }

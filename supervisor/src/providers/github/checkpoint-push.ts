@@ -66,6 +66,8 @@ export async function pushRepositoryCheckpoint(
     expectedOldSha: string;
     expectedNewSha: string;
     allowAlreadyAdvanced: boolean;
+    /** Allows first publication to create the deterministic task ref, still race-fenced as absent. */
+    allowCreate?: boolean;
     checkpointObject: GitCheckpointPayload;
   }
 ): Promise<{ sha: string }> {
@@ -118,16 +120,22 @@ export async function pushRepositoryCheckpoint(
       }
       return { sha: remoteHead };
     }
-    if (remoteHead !== input.expectedOldSha) {
+    const creating = remoteHead === "" && input.allowCreate === true;
+    if (!creating && remoteHead !== input.expectedOldSha) {
       throw new RepositoryRefConflictError(
         `repository ref conflict: ${input.ref} expected ${input.expectedOldSha} but found ${remoteHead || "missing"}`
       );
     }
-    await runGit(repo, ["fetch", "--no-tags", remote, `${input.ref}:refs/checkpoint/remote`], env);
+    if (!creating) {
+      await runGit(repo, ["fetch", "--no-tags", remote, `${input.ref}:refs/checkpoint/remote`], env);
+    }
     const heads = (await runGit(repo, ["bundle", "list-heads", bundlePath], env)).split("\n").filter(Boolean);
     if (heads.length !== 1) throw new Error("git checkpoint bundle must advertise exactly one head");
     const [bundleHead, bundleRef] = heads[0]!.trim().split(/\s+/, 2);
-    if (bundleHead !== input.expectedNewSha || !bundleRef?.startsWith("refs/openthrottle/checkpoints/")) {
+    if (
+      bundleHead !== input.expectedNewSha ||
+      !/^refs\/openthrottle\/(?:checkpoints|integrations)\/[a-f0-9]{64}$/.test(bundleRef ?? "")
+    ) {
       throw new Error("git checkpoint bundle does not advertise the accepted integration");
     }
     await runGit(repo, ["bundle", "verify", bundlePath], env);
@@ -141,15 +149,17 @@ export async function pushRepositoryCheckpoint(
         );
       }
     }
-    try {
-      await runGit(repo, ["merge-base", "--is-ancestor", input.expectedOldSha, input.expectedNewSha], env);
-    } catch {
-      throw new RepositoryRefConflictError(
-        `repository ref conflict: ${input.expectedNewSha} is not a descendant of ${input.expectedOldSha}`
-      );
+    if (!creating) {
+      try {
+        await runGit(repo, ["merge-base", "--is-ancestor", input.expectedOldSha, input.expectedNewSha], env);
+      } catch {
+        throw new RepositoryRefConflictError(
+          `repository ref conflict: ${input.expectedNewSha} is not a descendant of ${input.expectedOldSha}`
+        );
+      }
     }
     await runGit(repo, [
-      "push", "--porcelain", `--force-with-lease=${input.ref}:${input.expectedOldSha}`,
+      "push", "--porcelain", `--force-with-lease=${input.ref}:${creating ? "" : input.expectedOldSha}`,
       remote, `${input.expectedNewSha}:${input.ref}`,
     ], env);
     const verified = (await runGit(repo, ["ls-remote", remote, input.ref], env)).split(/\s+/)[0] ?? "";

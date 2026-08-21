@@ -10,6 +10,7 @@ import {
   EVAL_DEFINITION_SCHEMA,
   PIPELINE_DEFINITION_SCHEMA,
   RESULT_CANDIDATE_SCHEMA,
+  RUNTIME_PROVISION_STAGE_ID,
   SEMANTIC_RESULT_SCHEMA,
   definitionEntryContentHash,
   validateAndNormalizeResultCandidate,
@@ -24,6 +25,7 @@ import {
 } from "@openthrottle/contracts";
 import { VerifiedKernelDefinitionBundleResolver } from "../../app/kernel-composition.js";
 import { admitKernelPipeline } from "../../app/kernel-admission.js";
+import { KernelRuntimeSessionService } from "../../app/kernel-runtime-session.js";
 import { VolumeBlobStore } from "../../persistence/blob-store.js";
 import {
   createFreshEpochBootstrap,
@@ -33,8 +35,10 @@ import {
 import { SqliteKernelStore } from "../../persistence/kernel-store.js";
 import type {
   KernelResultCorrectionRequest,
+  KernelRuntimeLeaseCallbacks,
   KernelRuntimeOutcome,
   KernelRuntimePort,
+  KernelRuntimeWorkCallbacks,
   KernelWorkActionRequest,
   StagedSemanticCandidate,
 } from "../../runtime/kernel-contracts.js";
@@ -47,6 +51,14 @@ import {
   ordinaryKernelPayloadSchemas,
 } from "./evaluator-registry.js";
 import { OrdinaryKernelCoordinator } from "./ordinary-coordinator.js";
+import { compileKernelCursor } from "./reducer.js";
+import {
+  KERNEL_ATTEMPT_SCHEMA,
+  KERNEL_RUN_SCHEMA,
+  type AtomicTransitionBundle,
+  type KernelAttempt,
+  type KernelRun,
+} from "./types.js";
 
 const NOW = "2026-08-20T12:00:00.000Z";
 const SOURCE = "1".repeat(40);
@@ -227,6 +239,7 @@ function fixture(): {
     runtime_capability_digest: CAPABILITY,
     source_commit: SOURCE,
     pipeline_id: "core/implement",
+    pipeline_selection: "explicit",
     entries,
   }, { trustedPlatformDefinitions: trusted });
   const manifest: CompiledPipelineManifest = {
@@ -287,8 +300,16 @@ class RuntimeFixture implements KernelRuntimePort {
   pendingOnce = false;
   blockingReview = false;
 
-  async executeWork(request: KernelWorkActionRequest): Promise<KernelRuntimeOutcome> {
+  async executeWork(
+    request: KernelWorkActionRequest,
+    callbacks: KernelRuntimeWorkCallbacks,
+  ): Promise<KernelRuntimeOutcome> {
     this.workRequests.push(request);
+    await callbacks.on_heartbeat();
+    const nativeSessionId = request.action.kind === "agent"
+      ? `session-${request.attempt_id}`
+      : null;
+    if (nativeSessionId !== null) await callbacks.on_session(nativeSessionId);
     const output = request.repository_authority === "edit"
       ? request.stage_id === "implement" || request.stage_id === "repair" ? IMPLEMENTED : SIMPLIFIED
       : null;
@@ -301,7 +322,7 @@ class RuntimeFixture implements KernelRuntimePort {
       definition_bundle_hash: request.definition_bundle_hash,
       input_subject: request.input_subject,
       output_subject: output,
-      native_session_id: `session-${request.attempt_id}`,
+      native_session_id: nativeSessionId,
       payload_schema: "openthrottle.executor-checkpoint/v1",
       payload: {
         inline: {
@@ -347,8 +368,12 @@ class RuntimeFixture implements KernelRuntimePort {
     };
   }
 
-  async correctResult(request: KernelResultCorrectionRequest): Promise<KernelRuntimeOutcome> {
+  async correctResult(
+    request: KernelResultCorrectionRequest,
+    callbacks: KernelRuntimeLeaseCallbacks,
+  ): Promise<KernelRuntimeOutcome> {
     this.correctionRequests.push(request);
+    await callbacks.on_heartbeat();
     return {
       state: "work_complete",
       checkpoint: {
@@ -472,6 +497,11 @@ async function setup(runtime = new RuntimeFixture()): Promise<ActiveKernelFixtur
         store: activeStore,
         definition_bundles: activeBundles,
         runtime,
+        runtime_sessions: new KernelRuntimeSessionService({
+          transitions: activeStore,
+          now: () => NOW,
+        }),
+        attempt_lease_duration_ms: 5 * 60 * 1_000,
         now: () => NOW,
       }),
       runtime,
@@ -497,6 +527,138 @@ async function execute(coordinator: OrdinaryKernelCoordinator, ordinal: number) 
 }
 
 describe("ordinary kernel activation", () => {
+  it.each([
+    ["stop", "canceled"],
+    ["supersede", "superseded"],
+  ] as const)(
+    "uses one deterministic active Attempt to %s an ordinary or structured run",
+    async (action, terminalOutcome) => {
+      const fixed = fixture();
+      const manifest: CompiledPipelineManifest = {
+        ...fixed.manifest,
+        entry_stage: RUNTIME_PROVISION_STAGE_ID,
+        stages: [{
+          id: RUNTIME_PROVISION_STAGE_ID,
+          kind: "effect",
+          effect: "core/daytona-provision@1",
+          on: { success: { to: "implement" } },
+        }, ...fixed.manifest.stages],
+      };
+      const activeAttempt = (id: string, index: number): KernelAttempt => ({
+        schema: KERNEL_ATTEMPT_SCHEMA,
+        id,
+        pipeline_run_id: "run-control",
+        scope: {
+          kind: "loop_item",
+          stage_id: RUNTIME_PROVISION_STAGE_ID,
+          parent_attempt_id: "parent",
+          loop_id: "units",
+          item_id: id,
+          item_index: index,
+        },
+        repository_authority: "inspect",
+        request_hash: id === "attempt-a" ? "a".repeat(64) : "b".repeat(64),
+        definition_bundle_hash: manifest.definition_bundle_hash,
+        input_subject: SOURCE,
+        context_record_ids: [],
+        context_checkpoint_ids: [],
+        output_subject: null,
+        native_session_id: null,
+        status: "pending",
+        version: 0,
+        work_retry_ordinal: 0,
+        result_correction_count: 0,
+        result_correction_deadline: null,
+        lease: null,
+        checkpoint_id: null,
+        result_record_id: null,
+        decision_record_id: null,
+        pending_result: null,
+      });
+      const attempts = new Map([
+        ["attempt-z", activeAttempt("attempt-z", 1)],
+        ["attempt-a", activeAttempt("attempt-a", 0)],
+      ]);
+      let run: KernelRun = {
+        schema: KERNEL_RUN_SCHEMA,
+        id: "run-control",
+        pipeline_id: manifest.pipeline_id,
+        definition_bundle_hash: manifest.definition_bundle_hash,
+        current_subject: SOURCE,
+        status: "pending",
+        terminal_outcome: null,
+        cursor: compileKernelCursor({
+          stage_id: RUNTIME_PROVISION_STAGE_ID,
+          version: 0,
+          attempts: [...attempts.values()],
+        }),
+        version: 0,
+        work_retry_limit: 2,
+        result_correction_limit: 2,
+        active_attempt_versions: { "attempt-z": 0, "attempt-a": 0 },
+        active_effect_versions: {},
+        checkpoint_ids: {},
+      };
+      let applied: AtomicTransitionBundle | null = null;
+      const store = {
+        async loadExactReductionView(input: { attempt_id: string | null }) {
+          return {
+            manifest,
+            run,
+            current_attempt: input.attempt_id === null ? null : attempts.get(input.attempt_id) ?? null,
+            records: new Map(),
+            checkpoints: new Map(),
+          };
+        },
+        async loadAttemptRequestInputs() {
+          return {
+            task_prompt: "Stop the exact active run.",
+            context: { records: new Map(), checkpoints: new Map() },
+          };
+        },
+        async applyAtomicTransition(transition: AtomicTransitionBundle) {
+          applied = transition;
+          run = transition.run;
+          return { disposition: "applied" as const, run_version: run.version };
+        },
+      };
+      const coordinator = new OrdinaryKernelCoordinator({
+        store: store as never,
+        definition_bundles: {} as never,
+        runtime: {} as never,
+        runtime_sessions: {} as never,
+        attempt_lease_duration_ms: 60_000,
+        now: () => NOW,
+      });
+
+      await expect(coordinator.requestRunControl({
+        pipeline_run_id: "run-control",
+        action,
+        reason: "operator request",
+      })).resolves.toMatchObject({
+        disposition: "consumed",
+        run: { status: terminalOutcome, terminal_outcome: terminalOutcome },
+      });
+      expect(applied).not.toBeNull();
+      expect(applied!.attempt_writes).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: "replace",
+          attempt: expect.objectContaining({ id: "attempt-a", status: terminalOutcome }),
+        }),
+        expect.objectContaining({
+          kind: "terminal",
+          attempt_id: "attempt-z",
+          status: terminalOutcome,
+        }),
+      ]));
+      await expect(coordinator.requestRunControl({
+        pipeline_run_id: "run-control",
+        action,
+        reason: "operator request",
+      })).resolves.toMatchObject({ disposition: "stale", run: { status: terminalOutcome } });
+    },
+  );
+
   it("regenerates the exact prompt, context, bundle, and request hash after restart", async () => {
     const initial = await setup();
     let active = initial;
@@ -592,14 +754,19 @@ describe("ordinary kernel activation", () => {
       for (let ordinal = 1; ordinal <= 7; ordinal += 1) {
         expect((await execute(test.coordinator, ordinal)).disposition).toBe("settled");
       }
-      const projection = await test.store.getRunProjection(test.run_id);
-      expect(projection).toMatchObject({
-        stage_id: "publish",
+      const aggregate = await test.store.loadExactReductionView({
+        pipeline_run_id: test.run_id,
+        attempt_id: null,
+        record_ids: [],
+        checkpoint_ids: [],
+      });
+      expect(aggregate.run).toMatchObject({
+        cursor: expect.objectContaining({ stage_id: "publish" }),
         current_subject: SIMPLIFIED,
         status: "running",
-        active_attempt_count: 1,
-        active_effect_count: 0,
       });
+      expect(Object.keys(aggregate.run.active_attempt_versions)).toHaveLength(1);
+      expect(aggregate.run.active_effect_versions).toEqual({});
       expect(test.runtime.workRequests.map(({ stage_id, repository_authority }) => [
         stage_id, repository_authority,
       ])).toEqual([
@@ -655,15 +822,23 @@ describe("ordinary kernel activation", () => {
       expect(runtime.workRequests).toHaveLength(1);
       expect(runtime.correctionRequests).toHaveLength(1);
       expect(runtime.correctionRequests[0]).toMatchObject({
+        engine: "codex",
         attempt_id: "attempt-initial",
         native_session_id: "session-attempt-initial",
         locked_subject: IMPLEMENTED,
+        completed_work_authority: "edit",
         repository_authority: "inspect",
         tools: ["ot-result"],
         mcp: false,
         provider_access: false,
       });
-      expect((await test.store.getRunProjection(test.run_id))?.stage_id).toBe("review");
+      const aggregate = await test.store.loadExactReductionView({
+        pipeline_run_id: test.run_id,
+        attempt_id: null,
+        record_ids: [],
+        checkpoint_ids: [],
+      });
+      expect(aggregate.run.cursor.stage_id).toBe("review");
       expect(test.db.prepare(`
         SELECT COUNT(*) AS count FROM attempts WHERE stage_id = 'implement'
       `).get()).toEqual({ count: 1 });
@@ -679,8 +854,16 @@ describe("ordinary kernel activation", () => {
     try {
       await execute(test.coordinator, 1);
       await execute(test.coordinator, 2);
-      const projection = await test.store.getRunProjection(test.run_id);
-      expect(projection).toMatchObject({ stage_id: "repair", current_subject: IMPLEMENTED });
+      const aggregate = await test.store.loadExactReductionView({
+        pipeline_run_id: test.run_id,
+        attempt_id: null,
+        record_ids: [],
+        checkpoint_ids: [],
+      });
+      expect(aggregate.run).toMatchObject({
+        cursor: expect.objectContaining({ stage_id: "repair" }),
+        current_subject: IMPLEMENTED,
+      });
       const repair = test.db.prepare(`
         SELECT repository_authority, input_subject, context_checkpoint_ids_json
         FROM attempts WHERE stage_id = 'repair'
@@ -692,7 +875,7 @@ describe("ordinary kernel activation", () => {
       expect(repair).toEqual({
         repository_authority: "edit",
         input_subject: IMPLEMENTED,
-        context_checkpoint_ids_json: "[]",
+        context_checkpoint_ids_json: '["checkpoint-attempt-initial"]',
       });
       const review = test.runtime.workRequests[1]!;
       expect(review.repository_authority).toBe("inspect");

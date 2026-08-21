@@ -21,7 +21,7 @@ COPY contracts/scripts ./scripts
 # The contracts build regenerates and verifies the release-sealed platform
 # catalog and compiler environment from their authoritative repository inputs.
 COPY .openthrottle /.openthrottle
-COPY supervisor/pipelines/runtime-capabilities-v1.json /supervisor/pipelines/runtime-capabilities-v1.json
+COPY contracts/runtime-capabilities.json ./runtime-capabilities.json
 RUN npm run build
 
 FROM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS build
@@ -38,8 +38,6 @@ COPY supervisor/package.json supervisor/package-lock.json* ./
 RUN npm ci --install-links
 COPY supervisor/tsconfig.json supervisor/tsconfig.build.json ./
 COPY supervisor/src ./src
-COPY supervisor/graphs ./graphs
-COPY supervisor/pipelines ./pipelines
 RUN npm run build
 # Strip devDependencies (typescript, tsx, @types/*) from node_modules,
 # leaving the built better-sqlite3 native binary and the vendored contracts copy intact.
@@ -55,9 +53,9 @@ LABEL org.opencontainers.image.source="https://github.com/knoxgraeme/openthrottl
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
-COPY --from=build /app/graphs ./graphs
-COPY --from=build /app/pipelines ./pipelines
-COPY supervisor/scripts/cutover-control.mjs ./scripts/cutover-control.mjs
+COPY .openthrottle ./.openthrottle
+COPY --from=contracts /contracts/generated ./contracts/generated
+COPY contracts/runtime-capabilities.json ./contracts/runtime-capabilities.json
 
 # /data is where the SQLite DB lives (see fly.toml [mounts] and DATABASE_PATH default).
 RUN mkdir -p /data

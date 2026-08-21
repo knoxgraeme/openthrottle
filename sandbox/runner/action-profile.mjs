@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   chownSync,
@@ -10,11 +10,15 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, posix, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { canonicalJson } from "./capabilities.mjs";
-import { digest } from "./artifacts.mjs";
-import { chownTree, isRoot, pathInside } from "./filesystem-isolation.mjs";
+import { canonicalJson, digest } from "./kernel-json.mjs";
+import {
+  chmodReadOnlyPreservingExecuteTree,
+  chownTree,
+  isRoot,
+  pathInside,
+} from "./filesystem-isolation.mjs";
 
 export const ACTION_PROFILE_SCHEMA = "openthrottle.action-profile/v1";
 export const OPENCODE_PROGRESSIVE_SKILLS_CAPABILITY = "opencode/native-progressive-skills@1";
@@ -29,7 +33,6 @@ const MAX_SKILL_FILE_BYTES = 512 * 1024;
 const MAX_PROFILE_BYTES = 2 * 1024 * 1024;
 const ROOT_UID = 0;
 const ROOT_GID = 0;
-const LOCAL_DEFINITION_ROOT = fileURLToPath(new URL("../../.openthrottle", import.meta.url));
 const LOCAL_PLATFORM_FENCE = fileURLToPath(new URL("../../skills/codex/AGENTS-fragment.md", import.meta.url));
 
 function boundedText(value, label, max = 128 * 1024) {
@@ -74,12 +77,6 @@ function resolvedDefault(primary, fallback) {
   return existsSync(primary) ? primary : fallback;
 }
 
-export function configuredDefinitionRoot(env = process.env) {
-  const root = env.OT_DEFINITION_ROOT ?? resolvedDefault("/opt/openthrottle/definitions", LOCAL_DEFINITION_ROOT);
-  if (typeof root !== "string" || !root.startsWith("/")) throw new Error("definition root is invalid");
-  return resolve(root);
-}
-
 export function configuredPlatformFencePath(env = process.env) {
   const path = env.OT_PLATFORM_FENCE_FILE ?? resolvedDefault(
     "/opt/openthrottle/skills/codex/AGENTS-fragment.md",
@@ -87,42 +84,6 @@ export function configuredPlatformFencePath(env = process.env) {
   );
   if (typeof path !== "string" || !path.startsWith("/")) throw new Error("platform fence path is invalid");
   return resolve(path);
-}
-
-function trustedSourceEntry(metadata) {
-  if (metadata.isSymbolicLink() || (metadata.mode & 0o022) !== 0) return false;
-  if (metadata.isFile() && metadata.nlink !== 1) return false;
-  return !isRoot() || metadata.uid === ROOT_UID;
-}
-
-function collectSkillFiles(sourceDirectory, current = sourceDirectory, files = []) {
-  const directoryMetadata = lstatSync(current);
-  if (!directoryMetadata.isDirectory() || !trustedSourceEntry(directoryMetadata)) {
-    throw new Error("sealed skill source contains an untrusted directory");
-  }
-  for (const entry of readdirSync(current, { withFileTypes: true }).sort((left, right) => (
-    left.name < right.name ? -1 : left.name > right.name ? 1 : 0
-  ))) {
-    const source = resolve(current, entry.name);
-    const relative = posix.normalize(source.slice(resolve(sourceDirectory).length + 1).split("\\").join("/"));
-    if (!relative || relative === "." || relative === ".." || relative.startsWith("../")) {
-      throw new Error("sealed skill source path escapes its package");
-    }
-    const metadata = lstatSync(source);
-    if (!trustedSourceEntry(metadata)) throw new Error(`sealed skill source ${relative} is not trusted`);
-    if (metadata.isDirectory()) {
-      collectSkillFiles(sourceDirectory, source, files);
-      continue;
-    }
-    if (!metadata.isFile()) throw new Error(`sealed skill source ${relative} is not a regular file`);
-    if (relative !== "SKILL.md" && !SUPPORT_PATH.test(relative)) {
-      throw new Error(`sealed skill source ${relative} is outside the Agent Skills package contract`);
-    }
-    if (metadata.size > MAX_SKILL_FILE_BYTES) throw new Error(`sealed skill source ${relative} exceeds the file bound`);
-    files.push({ path: relative, bytes: readFileSync(source), mode: metadata.mode & 0o111 ? 0o555 : 0o444 });
-    if (files.length > MAX_SKILL_FILES) throw new Error("sealed skill package exceeds the file-count bound");
-  }
-  return files;
 }
 
 function frontmatterName(raw) {
@@ -135,50 +96,6 @@ function frontmatterName(raw) {
     if (match) return match[1];
   }
   throw new Error("sealed skill SKILL.md frontmatter is missing name");
-}
-
-function copyFilesystemSkillPackage({ sourceDirectory, discoveryRoot, definitionId: id }) {
-  const invocation = skillInvocation(id);
-  const files = collectSkillFiles(sourceDirectory);
-  const skillMarkdown = files.find((file) => file.path === "SKILL.md");
-  if (!skillMarkdown) throw new Error(`skill ${id} is missing SKILL.md`);
-  if (frontmatterName(skillMarkdown.bytes.toString("utf8")) !== invocation) {
-    throw new Error(`skill ${id} frontmatter name does not match its native invocation`);
-  }
-  const destinationRoot = pathInside(resolve(discoveryRoot), invocation, "skill destination escapes discovery root");
-  mkdirSync(destinationRoot, { recursive: true, mode: 0o755 });
-  for (const file of files) {
-    const destination = pathInside(destinationRoot, file.path, "skill file escapes destination root");
-    mkdirSync(dirname(destination), { recursive: true, mode: 0o755 });
-    writeFileSync(destination, file.bytes, { mode: file.mode, flag: "wx" });
-  }
-  const packageHash = digest(canonicalJson(files.map((file) => ({
-    path: file.path,
-    content_hash: digest(file.bytes),
-    executable: file.mode === 0o555,
-  }))));
-  return { id, invocation, content_hash: packageHash, destination: destinationRoot };
-}
-
-export function materializeFilesystemSkillAllowlist({
-  definitionRoot = configuredDefinitionRoot(),
-  discoveryRoot,
-  skillIds,
-}) {
-  const allowed = uniqueDefinitionIds(skillIds, "skillIds");
-  rmSync(discoveryRoot, { recursive: true, force: true });
-  mkdirSync(discoveryRoot, { recursive: true, mode: 0o755 });
-  const materialized = allowed.map((id) => copyFilesystemSkillPackage({
-    sourceDirectory: pathInside(definitionRoot, join("skills", id), "skill source escapes definition root"),
-    discoveryRoot,
-    definitionId: id,
-  }));
-  if (isRoot()) chownTree(discoveryRoot, ROOT_UID, ROOT_GID);
-  for (const entry of materialized) {
-    chmodSync(entry.destination, 0o555);
-  }
-  chmodSync(discoveryRoot, 0o555);
-  return materialized;
 }
 
 function yamlScalar(value) {
@@ -294,6 +211,9 @@ export function compileActionProfile({
   if (!Array.isArray(definitionEntries)) throw new Error("definitionEntries must be an array");
   const agent = definitionEntries.find((entry) => entry.definition_kind === "agent" && entry.definition_id === selectedAgentId);
   if (!agent || typeof agent.normalized_payload !== "string") throw new Error(`agent ${selectedAgentId} is absent from the sealed bundle`);
+  if (digest(canonicalJson(agent.normalized_payload)) !== agent.content_hash) {
+    throw new Error(`agent ${selectedAgentId} content hash does not match its normalized payload`);
+  }
   const skills = selectedSkillIds.map((id) => {
     const entry = definitionEntries.find((candidate) => candidate.definition_kind === "skill" && candidate.definition_id === id);
     if (!entry) throw new Error(`skill ${id} is absent from the sealed bundle`);
@@ -319,7 +239,7 @@ export function materializeActionProfile({ profile, profileRoot }) {
   mkdirSync(discoveryRoot, { recursive: true, mode: 0o755 });
   const skills = profile.skill_entries.map((entry) => materializeBundledSkill({ entry, discoveryRoot }));
   if (isRoot()) chownTree(discoveryRoot, ROOT_UID, ROOT_GID);
-  chmodSync(discoveryRoot, 0o555);
+  chmodReadOnlyPreservingExecuteTree(discoveryRoot);
   const sealed = {
     schema: ACTION_PROFILE_SCHEMA,
     engine: profile.engine,
@@ -343,48 +263,47 @@ export function materializeActionProfile({ profile, profileRoot }) {
   };
 }
 
-export function filesystemAgentInstructions(agentId, definitionRoot = configuredDefinitionRoot()) {
-  const id = definitionId(agentId, "agentId");
-  const path = pathInside(definitionRoot, join("agents", id, "instructions.md"), "agent instructions escape definition root");
-  return boundedText(readFileSync(path, "utf8"), `agent ${id} instructions`);
+function sealedEntry(path) {
+  const metadata = lstatSync(path);
+  if (metadata.isSymbolicLink()) throw new Error("action profile seal contains a symbolic link");
+  if ((metadata.mode & 0o222) !== 0) throw new Error("action profile seal contains a writable entry");
+  const entry = {
+    path,
+    dev: metadata.dev,
+    ino: metadata.ino,
+    uid: metadata.uid,
+    gid: metadata.gid,
+    mode: metadata.mode & 0o7777,
+    type: metadata.isDirectory() ? "directory" : metadata.isFile() ? "file" : "unsupported",
+  };
+  if (entry.type === "unsupported") throw new Error("action profile seal contains an unsupported entry");
+  if (entry.type === "file") {
+    entry.bytes = metadata.size;
+    entry.sha256 = createHash("sha256").update(readFileSync(path)).digest("hex");
+  }
+  return entry;
 }
 
-export function filesystemPlatformFence(path = configuredPlatformFencePath()) {
-  return boundedText(readFileSync(path, "utf8"), "platform fence");
+function sealedTree(path, entries = []) {
+  const entry = sealedEntry(path);
+  entries.push(entry);
+  if (entry.type === "directory") {
+    for (const child of readdirSync(path).sort()) sealedTree(resolve(path, child), entries);
+  }
+  return entries;
 }
 
-export function filesystemSkillCatalog({ skillIds, definitionRoot = configuredDefinitionRoot() }) {
-  return uniqueDefinitionIds(skillIds, "skillIds").map((id) => {
-    const invocation = skillInvocation(id);
-    const skillPath = pathInside(definitionRoot, join("skills", id, "SKILL.md"), "skill source escapes definition root");
-    const bytes = readFileSync(skillPath);
-    if (frontmatterName(bytes.toString("utf8")) !== invocation) throw new Error(`skill ${id} frontmatter name mismatch`);
-    return { id, invocation, content_hash: digest(bytes) };
-  });
+export function captureActionProfileSeal(materialized) {
+  return [
+    ...sealedTree(materialized.discoveryRoot),
+    sealedEntry(materialized.manifestPath),
+    ...(materialized.controlFiles ?? []).map(sealedEntry),
+  ];
 }
 
-export function composeFilesystemActionPrompt({
-  engine,
-  agentId,
-  repositoryAuthority,
-  skillIds,
-  entrySkill = null,
-  taskPrompt,
-  definitionRoot = configuredDefinitionRoot(),
-  platformFencePath = configuredPlatformFencePath(),
-}) {
-  if (!ENGINES.has(engine)) throw new Error("action profile engine is invalid");
-  if (!REPOSITORY_AUTHORITIES.has(repositoryAuthority)) throw new Error("repositoryAuthority is invalid");
-  const selectedSkills = uniqueDefinitionIds(skillIds, "skillIds");
-  if (entrySkill !== null && !selectedSkills.includes(entrySkill)) throw new Error("entrySkill must be present in the skill allowlist");
-  return composeActionProfilePrompt({
-    engine,
-    agent_id: definitionId(agentId, "agentId"),
-    repository_authority: repositoryAuthority,
-    entry_skill: entrySkill,
-    instructions: filesystemAgentInstructions(agentId, definitionRoot),
-    platform_fence: filesystemPlatformFence(platformFencePath),
-    task_prompt: boundedText(taskPrompt, "task prompt", 512 * 1024),
-    skills: filesystemSkillCatalog({ skillIds: selectedSkills, definitionRoot }),
-  });
+export function assertActionProfileSeal(materialized, expected) {
+  const actual = captureActionProfileSeal(materialized);
+  if (canonicalJson(actual) !== canonicalJson(expected)) {
+    throw new Error("agent changed the executor-sealed action profile");
+  }
 }

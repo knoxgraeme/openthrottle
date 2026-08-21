@@ -1,4 +1,4 @@
-import { digestCanonicalJson } from "./canonical.js";
+import { compareCodeUnits, digestCanonicalJson } from "./canonical.js";
 import {
   SHA256,
   arrayAt,
@@ -15,6 +15,8 @@ export const COMPILER_ENVIRONMENT_VERSION = 1 as const;
 export const DEFINITION_COMPILER_VERSION = "definition-compiler/v1" as const;
 export const CORE_EVALUATOR_PRIMITIVES = Object.freeze([
   "core/action-outcome@1",
+  "core/admission-outcome@1",
+  "core/admission-review-outcome@1",
   "core/review-outcome@1",
   "core/unit-outcome@1",
 ] as const);
@@ -46,10 +48,6 @@ export interface CompilerEnvironmentDescriptor {
 export interface TrustedCompilerEnvironment {
   readonly descriptor: CompilerEnvironmentDescriptor;
   readonly [trustedCompilerEnvironment]: true;
-}
-
-function compareCodeUnits(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 export function runtimeCapabilityDigest(identity: RuntimeCapabilityIdentity): string {

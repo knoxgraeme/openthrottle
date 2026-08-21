@@ -3,10 +3,10 @@ import { fileURLToPath } from "node:url";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  CORE_SEMANTIC_RESULT_SCHEMAS,
   RELEASE_COMPILER_ENVIRONMENT_DIGEST,
   RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
   compileDefinitionBundle,
+  deriveTrustedPlatformDefinitionHashes,
   verifyCompilerEnvironment,
   verifyPlatformDefinitionSource,
   type CompilerEnvironmentDescriptor,
@@ -48,7 +48,7 @@ const agentIds = [
   "unit-worker",
 ] as const;
 
-const pipelineIds = ["implement", "investigate", "structured"] as const;
+const pipelineIds = ["implement", "investigate", "structured", "admission"] as const;
 
 const skillIds = [
   "accept-unit",
@@ -145,14 +145,17 @@ describe("root .openthrottle definition tree", () => {
   it("matches the release-sealed catalog before interpreting any platform definition", () => {
     const trusted = sealedPlatform();
     const actual = new Set([...trusted.files.keys()].map((path) => path.slice(".openthrottle/".length)));
-    expect(trusted.catalog.files).toHaveLength(45);
+    expect(trusted.catalog.files).toHaveLength(49);
     expect([...actual].filter((path) => path.startsWith("agents/") && path.endsWith("/instructions.md")))
       .toEqual(agentIds.map((id) => `agents/core/${id}/instructions.md`));
     expect([...actual].filter((path) => path.endsWith("/pipeline.yml")))
-      .toEqual(pipelineIds.map((id) => `pipelines/core/${id}/pipeline.yml`));
+      .toEqual([...pipelineIds].sort().map((id) => `pipelines/core/${id}/pipeline.yml`));
     expect([...actual].filter((path) => path.endsWith("/eval.yml")))
       .toEqual([
         "evals/core/action-result/eval.yml",
+        "evals/core/admission-result/eval.yml",
+        "evals/core/admission-review-result/eval.yml",
+        "evals/core/persona-selection/eval.yml",
         "evals/core/review-result/eval.yml",
         "evals/core/unit-result/eval.yml",
       ]);
@@ -161,6 +164,26 @@ describe("root .openthrottle definition tree", () => {
     expect(actual.has("pipelines/core/structured/loops/unit-cycle.yml")).toBe(true);
     expect([...actual].some((path) => path.includes("/agents/openai.yaml"))).toBe(false);
     expect(actual.has("config.yml")).toBe(false);
+  });
+
+  it("derives recovery trust from every normalized release definition", () => {
+    const trusted = sealedPlatform();
+    const hashes = deriveTrustedPlatformDefinitionHashes({
+      platform: trusted,
+      compiler_environment: verifyCompilerEnvironment(
+        compilerEnvironmentDescriptor,
+        RELEASE_COMPILER_ENVIRONMENT_DIGEST,
+      ),
+    });
+
+    expect(hashes.size).toBe(39);
+    for (const result of pipelineIds.map((id) => compile(id))) {
+      for (const definition of result.bundle.value.entries) {
+        if (definition.origin.kind !== "platform") continue;
+        expect(hashes.get(`${definition.definition_kind}:${definition.definition_id}`))
+          .toBe(definition.content_hash);
+      }
+    }
   });
 
   it("keeps built-in skill craft free of legacy model-authored result protocols", () => {
@@ -186,12 +209,13 @@ describe("root .openthrottle definition tree", () => {
     expect(matches).toEqual([]);
   });
 
-  it("compiles all three pipeline selections from the actual tree", () => {
+  it("compiles all four pipeline selections from the actual tree", () => {
     const results = pipelineIds.map((id) => compile(id));
     expect(results.map((result) => result.bundle.value.pipeline_id)).toEqual([
       "core/implement",
       "core/investigate",
       "core/structured",
+      "core/admission",
     ]);
     for (const result of results) {
       const config = result.bundle.value.entries.find((entry) => entry.definition_kind === "config");
@@ -228,14 +252,14 @@ describe("root .openthrottle definition tree", () => {
       }
     }
 
-    // Admission roles are catalog entries for the later admission switch, not
-    // ambient dependencies of any task pipeline.
+    // Admission definitions are selected only by the admission pipeline, not
+    // ambient dependencies of an executable task pipeline.
     const selectedIdentities = new Set(results.flatMap((result) => result.bundle.value.entries)
       .map((entry) => `${entry.definition_kind}:${entry.definition_id}`));
-    expect(selectedIdentities.has("agent:core/admission-planner")).toBe(false);
-    expect(selectedIdentities.has("agent:core/admission-reviewer")).toBe(false);
-    expect(selectedIdentities.has("skill:core/admission-plan")).toBe(false);
-    expect(selectedIdentities.has("skill:core/review-admission-plan")).toBe(false);
+    expect(selectedIdentities.has("agent:core/admission-planner")).toBe(true);
+    expect(selectedIdentities.has("agent:core/admission-reviewer")).toBe(true);
+    expect(selectedIdentities.has("skill:core/admission-plan")).toBe(true);
+    expect(selectedIdentities.has("skill:core/review-admission-plan")).toBe(true);
 
     const evals = new Map(results.flatMap((result) => result.bundle.value.entries)
       .filter((entry) => entry.definition_kind === "eval")
@@ -243,12 +267,12 @@ describe("root .openthrottle definition tree", () => {
         evaluator: string;
         result: unknown;
       }]));
-    for (const schema of CORE_SEMANTIC_RESULT_SCHEMAS) {
-      expect(evals.get(schema.id)?.result).toEqual(schema);
-    }
     expect([...evals].map(([id, evaluation]) => [id, evaluation.evaluator]).sort())
       .toEqual([
         ["core/action-result", "core/action-outcome@1"],
+        ["core/admission-result", "core/admission-outcome@1"],
+        ["core/admission-review-result", "core/admission-review-outcome@1"],
+        ["core/persona-selection", "core/action-outcome@1"],
         ["core/review-result", "core/review-outcome@1"],
         ["core/unit-result", "core/unit-outcome@1"],
       ]);
@@ -273,18 +297,34 @@ describe("root .openthrottle definition tree", () => {
       ["validate_review_findings", "core/reviewer", "inspect"],
       ["final_repair", "core/ordinary-worker", "edit"],
     ]);
+    expect(agentBindings(results[3]!)).toEqual([
+      ["plan", "core/admission-planner", "inspect"],
+      ["review", "core/admission-reviewer", "inspect"],
+    ]);
     const structured = results[2]!;
     expect(structured.manifest.value.stages.find((stage) => stage.id === "accept_unit"))
       .toMatchObject({ eval: "core/action-result" });
     expect(structured.manifest.value.stages.find((stage) => stage.id === "select_review_personas"))
-      .toMatchObject({ eval: "core/action-result" });
-    expect(results.map((result) => result.manifest.value.stages.flatMap((stage) =>
+      .toMatchObject({ eval: "core/persona-selection" });
+    expect(results.map((result) => result.manifest.value.stages
+      .filter((stage) => !stage.id.startsWith("ot_runtime_"))
+      .flatMap((stage) =>
       stage.kind === "effect" ? [stage.effect] : stage.kind === "wait" ? [stage.wait] : [])))
       .toEqual([
         ["core/publish@1", "core/provider-wait@1"],
         ["core/publish@1", "core/provider-wait@1"],
         ["core/integrate-unit@1", "core/publish@1", "core/provider-wait@1"],
+        ["kernel/promote-admission@1"],
       ]);
+    for (const result of results) {
+      expect(result.manifest.value.entry_stage).toBe("ot_runtime_provision");
+      expect(result.manifest.value.stages.find(({ id }) => id === "ot_runtime_provision"))
+        .toMatchObject({ kind: "effect", effect: "core/daytona-provision@1" });
+      expect(result.manifest.value.stages.some((stage) =>
+        stage.kind === "effect" && stage.effect === "core/daytona-stop@1")).toBe(true);
+      expect(result.manifest.value.stages.some((stage) =>
+        stage.kind === "effect" && stage.effect === "core/daytona-cleanup@1")).toBe(true);
+    }
     expect(structured.manifest.value.stages.find((stage) => stage.id === "implement_unit")?.loop)
       .toMatchObject({
         over: "execution_plan.units",

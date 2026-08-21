@@ -5,7 +5,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DefinitionCompilation } from "@openthrottle/contracts";
 import {
   EXECUTION_PLAN_FENCE,
-  EXECUTION_PLAN_FENCE_V2,
   extractExecutionPlanBlocks,
   parsePlanArgs,
   prepareExecutionPlanFile,
@@ -105,15 +104,12 @@ function executionPlanBlock(pipelineId = "core/structured"): string {
     readFileSync(new URL("../../contracts/fixtures/valid/execution-plan-v2.json", import.meta.url), "utf8"),
   ) as Record<string, unknown>;
   contract.pipeline_id = pipelineId;
-  return `\`\`\`json ${EXECUTION_PLAN_FENCE_V2}\n${JSON.stringify(contract, null, 2)}\n\`\`\``;
+  return `\`\`\`json ${EXECUTION_PLAN_FENCE}\n${JSON.stringify(contract, null, 2)}\n\`\`\``;
 }
 
 function legacyExecutionPlanBlock(): string {
-  const contract = readFileSync(
-    new URL("../../contracts/fixtures/valid/execution-plan.json", import.meta.url),
-    "utf8",
-  );
-  return `\`\`\`json ${EXECUTION_PLAN_FENCE}\n${contract}\n\`\`\``;
+  const contract = JSON.stringify({ schema: "openthrottle.execution-plan/v1" });
+  return `\`\`\`json openthrottle.execution-plan/v1\n${contract}\n\`\`\``;
 }
 
 const prose = `# Stage C Contracts
@@ -130,7 +126,7 @@ describe("execution-plan parsing", () => {
 
     expect(extractExecutionPlanBlocks(markdown)).toHaveLength(1);
     expect(result.plan.value).toMatchObject({
-      schema: EXECUTION_PLAN_FENCE_V2,
+      schema: EXECUTION_PLAN_FENCE,
       pipeline_id: "core/structured",
     });
     expect(result.coverage).toMatchObject({
@@ -140,17 +136,17 @@ describe("execution-plan parsing", () => {
     });
   });
 
-  it("keeps v1 replay-only and rejects multiple, missing, malformed, and mismatched fences", () => {
+  it("rejects removed v1, multiple, missing, malformed, and mismatched fences", () => {
     expect(() => readExecutionPlanFromMarkdown(`${prose}\n${legacyExecutionPlanBlock()}`, "v1.md"))
-      .toThrow(/v1 is replay-only/);
+      .toThrow(/found 0/);
     expect(() => readExecutionPlanFromMarkdown(prose, "missing.md")).toThrow(/found 0/);
     const block = executionPlanBlock();
     expect(() => readExecutionPlanFromMarkdown(`${block}\n${block}`, "duplicate.md")).toThrow(/found 2/);
     expect(() => extractExecutionPlanBlocks(
-      `\`\`\`json ${EXECUTION_PLAN_FENCE_V2}\nnot-json\n\`\`\``,
+      `\`\`\`json ${EXECUTION_PLAN_FENCE}\nnot-json\n\`\`\``,
     )).toThrow(/valid JSON/);
     expect(() => extractExecutionPlanBlocks(
-      `\`\`\`json ${EXECUTION_PLAN_FENCE_V2}\n{"schema":"${EXECUTION_PLAN_FENCE}"}\n\`\`\``,
+      `\`\`\`json ${EXECUTION_PLAN_FENCE}\n{"schema":"openthrottle.execution-plan/v1"}\n\`\`\``,
     )).toThrow(/payload schema/);
   });
 });
@@ -260,7 +256,7 @@ describe("plan preparation", () => {
     });
 
     expect(result.plan.value).toMatchObject({ pipeline_id: "core/structured" });
-    expect(readFileSync(file, "utf8")).toContain(EXECUTION_PLAN_FENCE_V2);
+    expect(readFileSync(file, "utf8")).toContain(EXECUTION_PLAN_FENCE);
     expect(runner).toHaveBeenCalledOnce();
   });
 

@@ -35,9 +35,10 @@ describe("GitHub checkpoint push", () => {
       cwd: work,
       encoding: "utf8",
     }).trim();
-    execFileSync("git", ["update-ref", "refs/openthrottle/checkpoints/test", integrated], { cwd: work });
+    const checkpointRef = `refs/openthrottle/checkpoints/${"a".repeat(64)}`;
+    execFileSync("git", ["update-ref", checkpointRef, integrated], { cwd: work });
     execFileSync("git", [
-      "bundle", "create", bundle, "refs/openthrottle/checkpoints/test", `^${base}`,
+      "bundle", "create", bundle, checkpointRef, `^${base}`,
     ], { cwd: work });
     const payload = readFileSync(bundle);
     const input = {
@@ -93,8 +94,9 @@ describe("GitHub checkpoint push", () => {
     execFileSync("git", ["add", "."], { cwd: work });
     execFileSync("git", ["commit", "-qm", "unrelated"], { cwd: work });
     const unrelated = execFileSync("git", ["rev-parse", "HEAD"], { cwd: work, encoding: "utf8" }).trim();
-    execFileSync("git", ["update-ref", "refs/openthrottle/checkpoints/test", unrelated], { cwd: work });
-    execFileSync("git", ["bundle", "create", bundle, "refs/openthrottle/checkpoints/test"], { cwd: work });
+    const checkpointRef = `refs/openthrottle/checkpoints/${"b".repeat(64)}`;
+    execFileSync("git", ["update-ref", checkpointRef, unrelated], { cwd: work });
+    execFileSync("git", ["bundle", "create", bundle, checkpointRef], { cwd: work });
     const payload = readFileSync(bundle);
 
     await expect(pushRepositoryCheckpoint({ token: "test-token", remoteUrl: remote }, {

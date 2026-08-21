@@ -45,34 +45,27 @@ describe("sandbox Dockerfile", () => {
     expect(dockerfile).toContain("ARG CODEX_VERSION=0.144.0");
   });
 
-  it("pre-creates every isolated review-action principal", () => {
+  it("ships one kernel executor and one unprivileged agent principal", () => {
     const dockerfile = readFileSync(resolve(repoRoot, "sandbox/Dockerfile"), "utf8");
-    const principals = [
-      "ot-review-final",
-      "ot-review-selector",
-      "ot-review-correctness",
-      "ot-review-tests",
-      "ot-review-reliability",
-      "ot-review-agent-native",
-      "ot-review-security",
-      "ot-review-data",
-      "ot-review-performance",
-      "ot-review-standards",
-      "ot-review-validator",
-    ];
 
-    for (const principal of principals) expect(dockerfile).toContain(principal);
+    expect(dockerfile).toContain("useradd --create-home --home-dir /home/agent");
+    expect(dockerfile).not.toContain("ot-review-");
+    expect(dockerfile).toContain("COPY sandbox/runner /opt/openthrottle/runner");
+    expect(dockerfile).toContain("COPY sandbox/bin/ot-result.mjs /opt/openthrottle/bin/ot-result.mjs");
+    expect(dockerfile).not.toContain("ot-stage-result");
+    expect(dockerfile).not.toContain("ot-subject-post");
+    expect(dockerfile).not.toContain("runtime-capabilities.json");
   });
 
-  it("delivers automatic-admission packages through the canonical cross-engine skill tree", () => {
+  it("bakes only the platform fence and installs skills per sealed attempt", () => {
     const dockerfile = readFileSync(resolve(repoRoot, "sandbox/Dockerfile"), "utf8");
 
-    expect(dockerfile).toContain("COPY skills /opt/openthrottle/skills");
-    expect(dockerfile).toContain("cp -r /opt/openthrottle/skills/tasks/. \"$baseline/claude/skills/\"");
-    expect(dockerfile).toContain("cp -r /opt/openthrottle/skills/tasks/. /etc/codex/skills/");
-    for (const name of ["admission-plan", "review-admission-plan"]) {
-      expect(readFileSync(resolve(repoRoot, "skills/tasks", name, "SKILL.md"), "utf8"))
-        .toContain(`name: ${name}`);
-    }
+    expect(dockerfile).toContain(
+      "COPY skills/codex/AGENTS-fragment.md /opt/openthrottle/skills/codex/AGENTS-fragment.md",
+    );
+    expect(dockerfile).not.toContain("COPY skills /opt/openthrottle/skills");
+    expect(dockerfile).not.toContain("/etc/codex/skills");
+    expect(dockerfile).not.toContain("skills/tasks/.");
+    expect(dockerfile).toContain("only its DefinitionBundle allowlist");
   });
 });

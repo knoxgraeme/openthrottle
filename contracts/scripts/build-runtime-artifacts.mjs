@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { parseDocument } from "yaml";
 
 const contractsRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(contractsRoot, "..");
@@ -44,6 +45,7 @@ function generatedFiles(directory = generatedRoot, prefix = "") {
 }
 
 const runtime = await import(pathToFileURL(join(contractsRoot, "dist/result-candidate.js")).href);
+const evalContract = await import(pathToFileURL(join(contractsRoot, "dist/eval.js")).href);
 const canonical = await import(pathToFileURL(join(contractsRoot, "dist/canonical.js")).href);
 const compilerEnvironment = await import(
   pathToFileURL(join(contractsRoot, "dist/compiler-environment.js")).href
@@ -56,7 +58,12 @@ const definitionRelease = await import(
 );
 const artifacts = new Map();
 
-for (const file of ["canonical.js", "validation.js", "result-candidate.js"]) {
+for (const file of [
+  "canonical.js",
+  "validation.js",
+  "execution-plan-v2.js",
+  "result-candidate.js",
+]) {
   artifacts.set(`runtime/${file}`, readFileSync(join(contractsRoot, "dist", file)));
 }
 artifacts.set(
@@ -64,8 +71,56 @@ artifacts.set(
   Buffer.from('export * from "./result-candidate.js";\n', "utf8"),
 );
 
-for (const rawSchema of runtime.CORE_SEMANTIC_RESULT_SCHEMAS) {
-  const semanticSchema = runtime.validateSemanticResultSchema(rawSchema).value;
+function authoredEvalDefinitions() {
+  const root = join(repositoryRoot, ".openthrottle/evals/core");
+  const paths = [];
+  const visit = (directory) => {
+    const stat = lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`eval definition source must be a real directory: ${relative(repositoryRoot, directory)}`);
+    }
+    for (const entry of readdirSync(directory, { withFileTypes: true })
+      .sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
+      const absolute = join(directory, entry.name);
+      if (entry.isSymbolicLink()) {
+        throw new Error(`eval definition source contains a symlink: ${relative(repositoryRoot, absolute)}`);
+      }
+      if (entry.isDirectory()) visit(absolute);
+      else if (entry.isFile() && entry.name === "eval.yml") paths.push(absolute);
+      else if (!entry.isFile()) {
+        throw new Error(`eval definition source contains a non-file: ${relative(repositoryRoot, absolute)}`);
+      }
+    }
+  };
+  visit(root);
+  const definitions = paths.map((path) => {
+    const source = relative(repositoryRoot, path).replaceAll("\\", "/");
+    const document = parseDocument(readFileSync(path, "utf8"), {
+      prettyErrors: false,
+      schema: "core",
+      strict: true,
+      stringKeys: true,
+      uniqueKeys: true,
+      version: "1.2",
+    });
+    if (document.errors.length > 0 || document.warnings.length > 0) {
+      throw new Error(`${source}: invalid strict YAML`);
+    }
+    let value;
+    try {
+      value = document.toJS({ maxAliasCount: 0 });
+    } catch {
+      throw new Error(`${source}: YAML aliases are disabled`);
+    }
+    return evalContract.validateEvalDefinition(value, { source }).value;
+  }).sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+  if (new Set(definitions.map(({ id }) => id)).size !== definitions.length) {
+    throw new Error("authored eval definition ids must be unique");
+  }
+  return definitions;
+}
+
+for (const { result: semanticSchema } of authoredEvalDefinitions()) {
   const providerSchema = runtime.providerJsonSchemaForResultCandidate(semanticSchema);
   const safeId = semanticSchema.id.replaceAll("/", "--");
   artifacts.set(
@@ -140,7 +195,7 @@ writeOrCheck(
 );
 
 const runtimeManifest = JSON.parse(readFileSync(
-  join(repositoryRoot, "supervisor/pipelines/runtime-capabilities-v1.json"),
+  join(contractsRoot, "runtime-capabilities.json"),
   "utf8",
 ));
 const evaluatorPrimitives = [...compilerEnvironment.CORE_EVALUATOR_PRIMITIVES];

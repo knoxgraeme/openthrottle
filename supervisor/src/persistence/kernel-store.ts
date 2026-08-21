@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import {
   canonicalJson,
+  compareCodeUnits,
   digestCanonicalJson,
   validateAttemptCheckpoint,
   validateEffectIntent,
@@ -22,24 +23,25 @@ import type {
   KernelContextPort,
   KernelDefinitionBundleBytesPort,
   KernelEffectPort,
-  KernelProjectionPort,
+  KernelExternalSchedulePort,
   KernelReductionPort,
-  KernelRunProjection,
+  KernelStructuredPlanningReadPort,
   LeasedAttemptView,
   LeasedEffectView,
   ReductionReadRequest,
   ReductionView,
   ResolvedKernelContext,
+  SettledStructuredPlanningAttempt,
+  StructuredPlanningReadRequest,
+  ExternalScheduleView,
 } from "../pipeline/kernel/ports.js";
 import { KERNEL_WORK_REQUEST_PAYLOAD_SCHEMA } from "../pipeline/kernel/ports.js";
 import type { EffectReconciliation } from "../pipeline/kernel/effect-intent.js";
 import { effectIntentContentHash } from "../pipeline/kernel/effect-intent.js";
 import {
-  KERNEL_ATTEMPT_SCHEMA,
   KERNEL_RUN_SCHEMA,
   canonicalAttemptContextIds,
   type AtomicTransitionBundle,
-  type AttemptScope,
   type KernelAttempt,
   type KernelCursor,
   type KernelRun,
@@ -53,16 +55,37 @@ import {
   VolumeBlobStore,
   type VerifiedBlobToken,
 } from "./blob-store.js";
+import {
+  ACTIVE_ATTEMPT_STATUSES,
+  ACTIVE_EFFECT_STATUSES,
+  ACTIVE_RUN_STATUSES,
+  attemptFromRow,
+  checkpointFromRow,
+  parseJson,
+  payloadPointer,
+  placeholders,
+  recordFromRow,
+  scopeColumns,
+  semanticKey,
+  sortedRecord,
+  type AttemptRow,
+  type CheckpointRow,
+  type EffectRow,
+  type PayloadColumns,
+  type PayloadRow,
+  type RecordRow,
+  type RunRow,
+} from "./kernel-store-codecs.js";
+import { KernelLeaseOperations } from "./kernel-store-leases.js";
 
-const ACTIVE_RUN_STATUSES = new Set(["pending", "running"]);
-const ACTIVE_ATTEMPT_STATUSES = ["pending", "running", "work_complete", "result_pending", "recorded"];
-const ACTIVE_EFFECT_STATUSES = ["pending", "processing", "unknown"];
 const BUNDLE_PAYLOAD_SCHEMA = "openthrottle.definition-bundle/v1";
+const STRUCTURED_PLANNING_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 
 export interface KernelManifestResolver {
   resolve(input: {
     pipeline_id: string;
     definition_bundle_hash: string;
+    definition_bundle_bytes: Uint8Array;
   }): CompiledPipelineManifest | Promise<CompiledPipelineManifest>;
 }
 
@@ -97,133 +120,29 @@ export interface PipelineAdmissionInput {
   initial_attempts: readonly KernelAttempt[];
 }
 
+export interface PipelineRunAttachmentInput {
+  work_item_id: string;
+  source_pipeline_run_id: string;
+  definitions: readonly DefinitionSnapshotInput[];
+  run: KernelRun;
+  definition_bundle: VerifiedBlobToken;
+  initial_records: readonly ExecutionRecord[];
+  initial_attempts: readonly KernelAttempt[];
+}
+
+export interface AttachedPipelineRunIdentity {
+  id: string;
+  work_item_id: string;
+  pipeline_id: string;
+  definition_bundle_hash: string;
+  current_subject: string;
+}
+
 export type KernelStoreFaultPoint =
   | "admission_definitions_written"
   | "admission_work_item_written"
   | "admission_run_written"
   | "admission_attempts_written";
-
-interface PayloadColumns {
-  inline_payload: string | null;
-  blob_algorithm: "sha256" | null;
-  blob_digest: string | null;
-  blob_bytes: number | null;
-  blob_encoding: "utf-8" | "binary" | null;
-  blob_media_type: string | null;
-  blob_payload_schema: string | null;
-}
-
-interface PayloadRow extends PayloadColumns {
-  payload_schema: string;
-}
-
-interface RunRow {
-  id: string;
-  pipeline_id: string;
-  definition_bundle_algorithm: "sha256";
-  definition_bundle_hash: string;
-  definition_bundle_bytes: number;
-  definition_bundle_encoding: "utf-8";
-  definition_bundle_media_type: string;
-  definition_bundle_payload_schema: string;
-  current_subject: string;
-  status: KernelRun["status"];
-  terminal_outcome: KernelRun["terminal_outcome"];
-  cursor_stage_id: string | null;
-  cursor_version: number;
-  cursor_reentries_json: string;
-  cursor_frontier_json: string;
-  cursor_completed_scope_keys_json: string;
-  cursor_barrier_json: string | null;
-  version: number;
-  work_retry_limit: number;
-  result_correction_limit: number;
-  last_transition_id: string | null;
-  last_transition_hash: string | null;
-}
-
-interface AttemptRow {
-  id: string;
-  pipeline_run_id: string;
-  scope_kind: AttemptScope["kind"];
-  stage_id: string;
-  parent_attempt_id: string | null;
-  scope_group_id: string | null;
-  scope_item_id: string | null;
-  scope_item_index: number | null;
-  repository_authority: KernelAttempt["repository_authority"];
-  request_hash: string;
-  definition_bundle_hash: string;
-  input_subject: string;
-  context_record_ids_json: string;
-  context_checkpoint_ids_json: string;
-  output_subject: string | null;
-  native_session_id: string | null;
-  status: KernelAttempt["status"];
-  version: number;
-  work_retry_ordinal: number;
-  result_correction_count: number;
-  result_correction_deadline: string | null;
-  unmet_dependency_count: number;
-  lease_id: string | null;
-  lease_worker_id: string | null;
-  lease_purpose: "work" | "result_correction" | null;
-  lease_expires_at: string | null;
-  lease_started: number | null;
-  checkpoint_id: string | null;
-  result_record_id: string | null;
-  pending_candidate_hash: string | null;
-  pending_diagnostics_json: string | null;
-}
-
-interface RecordRow extends PayloadRow {
-  id: string;
-  pipeline_run_id: string;
-  sequence: number;
-  kind: ExecutionRecord["kind"];
-  attempt_id: string | null;
-  request_hash: string | null;
-  definition_bundle_hash: string | null;
-  input_subject: string | null;
-  output_subject: string | null;
-  original_candidate_hash: string | null;
-  normalized_candidate_hash: string | null;
-  reducer: string | null;
-  input_record_ids_json: string | null;
-  effect_id: string | null;
-  idempotency_key: string | null;
-  external_identity: string | null;
-  delivery_status: "confirmed" | "rejected" | null;
-  created_at: string;
-}
-
-interface CheckpointRow extends PayloadRow {
-  id: string;
-  pipeline_run_id: string;
-  attempt_id: string;
-  request_hash: string;
-  definition_bundle_hash: string;
-  input_subject: string;
-  output_subject: string | null;
-  native_session_id: string | null;
-  captured_at: string;
-}
-
-interface EffectRow extends PayloadRow {
-  id: string;
-  pipeline_run_id: string;
-  decision_record_id: string;
-  kind: string;
-  idempotency_key: string;
-  target: string;
-  subject: string | null;
-  status: string;
-  version: number;
-  lease_id: string | null;
-  lease_worker_id: string | null;
-  lease_expires_at: string | null;
-  lease_execution_mode: "dispatch_or_reconcile" | "reconcile_only" | null;
-}
 
 export interface KernelIntegrityEvidence {
   pipeline_run_id: string;
@@ -244,128 +163,6 @@ export class KernelIntegrityError extends Error {
   }
 }
 
-function placeholders(length: number): string {
-  return Array.from({ length }, () => "?").join(", ");
-}
-
-function parseJson<T>(value: string, name: string): T {
-  try {
-    return JSON.parse(value) as T;
-  } catch {
-    throw new Error(`persisted ${name} is not valid JSON`);
-  }
-}
-
-function sortedRecord(entries: ReadonlyArray<readonly [string, number]>): Record<string, number> {
-  return Object.fromEntries([...entries].sort(([left], [right]) => left.localeCompare(right)));
-}
-
-function payloadPointer(row: PayloadRow): BlobPointer | null {
-  if (row.blob_digest === null) return null;
-  if (
-    row.blob_algorithm !== "sha256" || row.blob_bytes === null || row.blob_encoding === null ||
-    row.blob_media_type === null || row.blob_payload_schema === null
-  ) {
-    throw new Error("persisted blob pointer is incomplete");
-  }
-  return {
-    algorithm: "sha256",
-    digest: row.blob_digest,
-    bytes: row.blob_bytes,
-    encoding: row.blob_encoding,
-    media_type: row.blob_media_type,
-    payload_schema: row.blob_payload_schema,
-  };
-}
-
-function recordPayload(row: PayloadRow): RecordPayload {
-  const pointer = payloadPointer(row);
-  if (pointer) return { blob: pointer };
-  if (row.inline_payload === null) throw new Error("persisted inline payload is missing");
-  return { inline: parseJson<JsonValue>(row.inline_payload, "inline payload") };
-}
-
-function semanticKey(record: ExecutionRecord): string | null {
-  if (record.kind !== "decision" || !("inline" in record.payload)) return null;
-  const payload = record.payload.inline;
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
-  const candidate = (payload as Record<string, JsonValue>).semantic_key;
-  return typeof candidate === "string" && candidate.length > 0 && candidate.length <= 500
-    ? candidate
-    : null;
-}
-
-function scopeFromRow(row: AttemptRow): AttemptScope {
-  if (row.scope_kind === "stage") return { kind: "stage", stage_id: row.stage_id };
-  if (
-    row.parent_attempt_id === null || row.scope_group_id === null ||
-    row.scope_item_id === null || row.scope_item_index === null
-  ) throw new Error(`persisted ${row.scope_kind} scope is incomplete`);
-  return row.scope_kind === "loop_item"
-    ? {
-      kind: "loop_item",
-      stage_id: row.stage_id,
-      parent_attempt_id: row.parent_attempt_id,
-      loop_id: row.scope_group_id,
-      item_id: row.scope_item_id,
-      item_index: row.scope_item_index,
-    }
-    : {
-      kind: "fanout_member",
-      stage_id: row.stage_id,
-      parent_attempt_id: row.parent_attempt_id,
-      fanout_id: row.scope_group_id,
-      member_id: row.scope_item_id,
-      member_index: row.scope_item_index,
-    };
-}
-
-function attemptFromRow(row: AttemptRow): KernelAttempt {
-  const lease = row.lease_id === null
-    ? null
-    : {
-      id: row.lease_id,
-      worker_id: row.lease_worker_id!,
-      purpose: row.lease_purpose!,
-      expires_at: row.lease_expires_at!,
-      started: row.lease_started === 1,
-    };
-  return {
-    schema: KERNEL_ATTEMPT_SCHEMA,
-    id: row.id,
-    pipeline_run_id: row.pipeline_run_id,
-    scope: scopeFromRow(row),
-    repository_authority: row.repository_authority,
-    request_hash: row.request_hash,
-    definition_bundle_hash: row.definition_bundle_hash,
-    input_subject: row.input_subject,
-    context_record_ids: canonicalAttemptContextIds(
-      parseJson(row.context_record_ids_json, "attempt context record IDs"),
-      "persisted attempt context_record_ids",
-    ),
-    context_checkpoint_ids: canonicalAttemptContextIds(
-      parseJson(row.context_checkpoint_ids_json, "attempt context checkpoint IDs"),
-      "persisted attempt context_checkpoint_ids",
-    ),
-    output_subject: row.output_subject,
-    native_session_id: row.native_session_id,
-    status: row.status,
-    version: row.version,
-    work_retry_ordinal: row.work_retry_ordinal,
-    result_correction_count: row.result_correction_count,
-    result_correction_deadline: row.result_correction_deadline,
-    lease,
-    checkpoint_id: row.checkpoint_id,
-    result_record_id: row.result_record_id,
-    pending_result: row.status === "result_pending"
-      ? {
-        candidate_hash: row.pending_candidate_hash,
-        diagnostics: parseJson(row.pending_diagnostics_json!, "result diagnostics"),
-      }
-      : null,
-  };
-}
-
 export class SqliteKernelStore implements
   KernelReductionPort,
   KernelAttemptLeasePort,
@@ -373,13 +170,15 @@ export class SqliteKernelStore implements
   KernelDefinitionBundleBytesPort,
   KernelEffectPort,
   KernelContextPort,
-  KernelProjectionPort {
+  KernelExternalSchedulePort,
+  KernelStructuredPlanningReadPort {
   readonly #db: Database.Database;
   readonly #blobs: VolumeBlobStore;
   readonly #manifests: KernelManifestResolver;
   readonly #payloadSchemas: ExecutionRecordPayloadRegistry;
   readonly #now: () => string;
   readonly #faultInjector: ((point: KernelStoreFaultPoint) => void) | undefined;
+  readonly #leases: KernelLeaseOperations;
 
   constructor(input: {
     db: Database.Database;
@@ -395,6 +194,14 @@ export class SqliteKernelStore implements
     this.#payloadSchemas = input.payload_schemas;
     this.#now = input.now ?? (() => new Date().toISOString());
     this.#faultInjector = input.fault_injector;
+    this.#leases = new KernelLeaseOperations({
+      db: this.#db,
+      now: this.#now,
+      attempt_by_id: (id, runId) => this.#attemptById(id, runId),
+      advance_run_fence: (runId, transitionId, content) => this.#advanceRunFence(runId, transitionId, content),
+      insert_record: (record) => this.#insertRecord(record),
+      read_effect_blob: (runId, ownerId, pointer) => this.#readBlob(runId, "effect", ownerId, pointer),
+    });
   }
 
   admitPipelineRun(input: PipelineAdmissionInput): void {
@@ -428,6 +235,52 @@ export class SqliteKernelStore implements
     }).immediate();
   }
 
+  attachPipelineRun(input: PipelineRunAttachmentInput): void {
+    const pointer = this.#blobs.assertToken(input.definition_bundle);
+    if (
+      pointer.digest !== input.run.definition_bundle_hash ||
+      pointer.payload_schema !== BUNDLE_PAYLOAD_SCHEMA ||
+      pointer.encoding !== "utf-8" || pointer.media_type !== "application/json"
+    ) throw new Error("attached pipeline run definition bundle does not match its pinned identity");
+    const expectedAttempts = sortedRecord(input.initial_attempts.map((attempt) => [attempt.id, attempt.version]));
+    if (canonicalJson(expectedAttempts) !== canonicalJson(input.run.active_attempt_versions)) {
+      throw new Error("attached initial attempts do not match the run projection");
+    }
+    if (
+      Object.keys(input.run.active_effect_versions).length > 0 ||
+      Object.keys(input.run.checkpoint_ids).length > 0
+    ) throw new Error("an attached fresh run cannot contain effects or checkpoints");
+    if (
+      input.initial_records.some((record) =>
+        record.pipeline_run_id !== input.run.id ||
+        record.kind !== "decision" || record.input_record_ids.length !== 0)
+    ) throw new Error("attached run seed records must be input-free executor decisions in the target run");
+    const now = this.#now();
+    this.#db.transaction(() => {
+      const source = this.#db.prepare("SELECT work_item_id FROM pipeline_runs WHERE id = ?")
+        .get(input.source_pipeline_run_id) as { work_item_id: string } | undefined;
+      if (!source || source.work_item_id !== input.work_item_id) {
+        throw new Error("attached pipeline run does not share its source work item");
+      }
+      this.#insertDefinitions(input.definitions);
+      this.#insertRun(input.work_item_id, input.run, pointer, now);
+      for (const record of input.initial_records) this.#insertRecord(record);
+      for (const attempt of input.initial_attempts) this.#insertAttempt(attempt, now, null);
+      this.#materializeDependencyReadiness(input.run.cursor);
+      this.#assertRunProjections(input.run);
+    }).immediate();
+  }
+
+  findAttachedPipelineRun(id: string): AttachedPipelineRunIdentity | undefined {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(id)) {
+      throw new Error("attached pipeline run ID is invalid");
+    }
+    return this.#db.prepare(`
+      SELECT id, work_item_id, pipeline_id, definition_bundle_hash, current_subject
+      FROM pipeline_runs WHERE id = ?
+    `).get(id) as AttachedPipelineRunIdentity | undefined;
+  }
+
   async loadExactReductionView(request: ReductionReadRequest): Promise<ReductionView> {
     const row = this.#runRow(request.pipeline_run_id);
     const run = this.#runFromRow(row);
@@ -436,9 +289,14 @@ export class SqliteKernelStore implements
       : this.#attemptById(request.attempt_id, request.pipeline_run_id);
     const records = this.#loadExactRecords(request.pipeline_run_id, request.record_ids, run.status);
     const checkpoints = this.#loadExactCheckpoints(request.pipeline_run_id, request.checkpoint_ids, run.status);
+    const definitionBundleBytes = await this.loadExactDefinitionBundleBytes({
+      pipeline_run_id: run.id,
+      definition_bundle_hash: run.definition_bundle_hash,
+    });
     const manifest = await this.#manifests.resolve({
       pipeline_id: run.pipeline_id,
       definition_bundle_hash: run.definition_bundle_hash,
+      definition_bundle_bytes: definitionBundleBytes,
     });
     if (
       manifest.pipeline_id !== run.pipeline_id ||
@@ -495,81 +353,7 @@ export class SqliteKernelStore implements
   }
 
   async leaseNextEligibleAttempt(request: AttemptLeaseRequest): Promise<LeasedAttemptView | null> {
-    return this.#db.transaction(() => {
-      const now = this.#now();
-      const replay = this.#db.prepare(`
-        SELECT a.*, r.version AS run_version, r.cursor_version
-        FROM attempts a JOIN pipeline_runs r ON r.id = a.pipeline_run_id
-        WHERE a.lease_id = ?
-      `).get(request.lease_id) as (AttemptRow & {
-        run_version: number;
-        cursor_version: number;
-      }) | undefined;
-      if (replay) {
-        if (
-          replay.lease_worker_id !== request.worker_id ||
-          replay.lease_expires_at !== request.expires_at
-        ) throw new Error(`attempt lease ${request.lease_id} conflicts with its immutable replay`);
-        const attempt = attemptFromRow(replay);
-        return {
-          run_id: replay.pipeline_run_id,
-          run_version: replay.run_version,
-          cursor_version: replay.cursor_version,
-          attempt,
-          lease: attempt.lease!,
-        };
-      }
-      const row = this.#db.prepare(`
-        SELECT a.* FROM attempts a
-        JOIN pipeline_runs r ON r.id = a.pipeline_run_id
-        WHERE r.status IN ('pending', 'running')
-          AND a.status IN ('pending', 'result_pending')
-          AND a.unmet_dependency_count = 0
-          AND a.lease_id IS NULL
-          AND (a.status <> 'result_pending' OR (
-            a.native_session_id IS NOT NULL
-            AND a.result_correction_count < r.result_correction_limit
-            AND a.result_correction_deadline IS NOT NULL
-            AND a.result_correction_deadline > ?
-          ))
-        ORDER BY a.created_at, a.id
-        LIMIT 1
-      `).get(now) as AttemptRow | undefined;
-      if (!row) return null;
-      const purpose = row.status === "result_pending" ? "result_correction" : "work";
-      const changed = this.#db.prepare(`
-        UPDATE attempts
-        SET lease_id = ?, lease_worker_id = ?, lease_purpose = ?, lease_expires_at = ?,
-            lease_started = 0, version = version + 1,
-            result_correction_count = result_correction_count + ?, updated_at = ?
-        WHERE id = ? AND pipeline_run_id = ? AND version = ? AND lease_id IS NULL
-          AND unmet_dependency_count = 0
-      `).run(
-        request.lease_id,
-        request.worker_id,
-        purpose,
-        request.expires_at,
-        purpose === "result_correction" ? 1 : 0,
-        now,
-        row.id,
-        row.pipeline_run_id,
-        row.version,
-      );
-      if (changed.changes !== 1) throw new Error(`attempt ${row.id} lease compare-and-set failed`);
-      const run = this.#advanceRunFence(row.pipeline_run_id, `attempt-lease:${request.lease_id}`, {
-        attempt_id: row.id,
-        worker_id: request.worker_id,
-        expires_at: request.expires_at,
-      });
-      const attempt = this.#attemptById(row.id, row.pipeline_run_id);
-      return {
-        run_id: run.id,
-        run_version: run.version,
-        cursor_version: run.cursor.version,
-        attempt,
-        lease: attempt.lease!,
-      };
-    }).immediate();
+    return this.#leases.leaseNextEligibleAttempt(request);
   }
 
   async renewAttemptLease(input: {
@@ -578,20 +362,15 @@ export class SqliteKernelStore implements
     worker_id: string;
     expires_at: string;
   }): Promise<NonNullable<KernelAttempt["lease"]>> {
-    return this.#db.transaction(() => {
-      const row = this.#db.prepare("SELECT * FROM attempts WHERE id = ?")
-        .get(input.attempt_id) as AttemptRow | undefined;
-      if (
-        !row || row.lease_id !== input.lease_id || row.lease_worker_id !== input.worker_id
-      ) throw new Error("attempt lease fence does not match");
-      const changed = this.#db.prepare(`
-        UPDATE attempts SET lease_expires_at = ?, version = version + 1, updated_at = ?
-        WHERE id = ? AND lease_id = ? AND lease_worker_id = ? AND version = ?
-      `).run(input.expires_at, this.#now(), row.id, input.lease_id, input.worker_id, row.version);
-      if (changed.changes !== 1) throw new Error("attempt lease renewal compare-and-set failed");
-      this.#advanceRunFence(row.pipeline_run_id, `attempt-renew:${input.lease_id}:${row.version + 1}`, input);
-      return this.#attemptById(row.id, row.pipeline_run_id).lease!;
-    }).immediate();
+    return this.#leases.renewAttemptLease(input);
+  }
+
+  async recoverExpiredAttemptLeases(input: {
+    observed_at: string;
+    expires_at: string;
+    limit: number;
+  }): Promise<readonly LeasedAttemptView[]> {
+    return this.#leases.recoverExpiredAttemptLeases(input);
   }
 
   async leaseNextEffect(input: {
@@ -599,55 +378,7 @@ export class SqliteKernelStore implements
     lease_id: string;
     expires_at: string;
   }): Promise<LeasedEffectView | null> {
-    return this.#db.transaction(() => {
-      const now = this.#now();
-      this.#recoverExpiredEffectLeases(now);
-      const replay = this.#db.prepare("SELECT * FROM effects WHERE lease_id = ?")
-        .get(input.lease_id) as EffectRow | undefined;
-      if (replay) {
-        if (
-          replay.lease_worker_id !== input.worker_id || replay.lease_expires_at !== input.expires_at
-        ) throw new Error(`effect lease ${input.lease_id} conflicts with its immutable replay`);
-        return {
-          intent: this.#effectIntentById(replay.id),
-          lease_id: input.lease_id,
-          expires_at: input.expires_at,
-          execution_mode: replay.lease_execution_mode!,
-        };
-      }
-      const row = this.#db.prepare(`
-        SELECT e.* FROM effects e
-        JOIN pipeline_runs r ON r.id = e.pipeline_run_id
-        WHERE r.status IN ('pending', 'running')
-          AND e.status IN ('pending', 'unknown')
-          AND e.lease_id IS NULL AND e.available_at <= ?
-        ORDER BY e.available_at, e.id
-        LIMIT 1
-      `).get(now) as EffectRow | undefined;
-      if (!row) return null;
-      const executionMode: LeasedEffectView["execution_mode"] = row.status === "unknown"
-        ? "reconcile_only"
-        : "dispatch_or_reconcile";
-      const changed = this.#db.prepare(`
-        UPDATE effects
-        SET status = 'processing', lease_id = ?, lease_worker_id = ?, lease_expires_at = ?,
-            lease_execution_mode = ?, unknown_detail = NULL, attempt_count = attempt_count + 1,
-            version = version + 1, updated_at = ?
-        WHERE id = ? AND version = ? AND lease_id IS NULL AND status IN ('pending', 'unknown')
-      `).run(input.lease_id, input.worker_id, input.expires_at, executionMode, now, row.id, row.version);
-      if (changed.changes !== 1) throw new Error(`effect ${row.id} lease compare-and-set failed`);
-      this.#advanceRunFence(row.pipeline_run_id, `effect-lease:${input.lease_id}`, {
-        effect_id: row.id,
-        worker_id: input.worker_id,
-        expires_at: input.expires_at,
-      });
-      return {
-        intent: this.#effectIntentById(row.id),
-        lease_id: input.lease_id,
-        expires_at: input.expires_at,
-        execution_mode: executionMode,
-      };
-    }).immediate();
+    return this.#leases.leaseNextEffect(input);
   }
 
   async markLeasedEffectDispatchStarted(input: {
@@ -655,31 +386,7 @@ export class SqliteKernelStore implements
     lease_id: string;
     worker_id: string;
   }): Promise<LeasedEffectView> {
-    return this.#db.transaction(() => {
-      const row = this.#db.prepare("SELECT * FROM effects WHERE id = ?")
-        .get(input.effect_id) as EffectRow | undefined;
-      if (
-        !row || row.status !== "processing" || row.lease_id !== input.lease_id ||
-        row.lease_worker_id !== input.worker_id || row.lease_execution_mode === null ||
-        row.lease_expires_at === null
-      ) throw new Error("effect lease fence does not match");
-      if (row.lease_execution_mode === "dispatch_or_reconcile") {
-        const changed = this.#db.prepare(`
-          UPDATE effects
-          SET lease_execution_mode = 'reconcile_only', version = version + 1, updated_at = ?
-          WHERE id = ? AND version = ? AND status = 'processing' AND lease_id = ?
-            AND lease_worker_id = ? AND lease_execution_mode = 'dispatch_or_reconcile'
-        `).run(this.#now(), row.id, row.version, input.lease_id, input.worker_id);
-        if (changed.changes !== 1) throw new Error("effect dispatch-start compare-and-set failed");
-        this.#advanceRunFence(row.pipeline_run_id, `effect-dispatch-started:${input.lease_id}`, input);
-      }
-      return {
-        intent: this.#effectIntentById(row.id),
-        lease_id: input.lease_id,
-        expires_at: row.lease_expires_at,
-        execution_mode: "reconcile_only" as const,
-      };
-    }).immediate();
+    return this.#leases.markLeasedEffectDispatchStarted(input);
   }
 
   async completeLeasedEffect(input: {
@@ -688,63 +395,112 @@ export class SqliteKernelStore implements
     worker_id: string;
     reconciliation: EffectReconciliation;
   }): Promise<void> {
-    this.#db.transaction(() => {
-      const row = this.#db.prepare("SELECT * FROM effects WHERE id = ?").get(input.effect_id) as EffectRow | undefined;
-      if (
-        !row || row.status !== "processing" || row.lease_id !== input.lease_id ||
-        row.lease_worker_id !== input.worker_id
-      ) {
-        throw new Error("effect lease fence does not match");
-      }
-      if (input.reconciliation.kind === "execute") {
-        throw new Error("an execute reconciliation is an instruction, not a completed effect");
-      }
-      if (input.reconciliation.kind === "hold_unknown") {
-        if (
-          input.reconciliation.effect_id !== row.id ||
-          input.reconciliation.external_identity !== row.target
-        ) throw new Error("unknown effect reconciliation identity does not match");
-        const changed = this.#db.prepare(`
-          UPDATE effects
-          SET status = 'unknown', lease_id = NULL, lease_worker_id = NULL,
-              lease_expires_at = NULL, lease_execution_mode = NULL, unknown_detail = ?,
-              version = version + 1, updated_at = ?
-          WHERE id = ? AND version = ? AND lease_id = ? AND lease_worker_id = ? AND status = 'processing'
-        `).run(
-          input.reconciliation.detail,
-          this.#now(),
-          row.id,
-          row.version,
-          input.lease_id,
-          input.worker_id,
-        );
-        if (changed.changes !== 1) throw new Error("effect unknown-outcome compare-and-set failed");
-      } else {
-        const delivery = input.reconciliation.delivery;
-        if (
-          delivery.effect_id !== row.id || delivery.pipeline_run_id !== row.pipeline_run_id ||
-          delivery.idempotency_key !== row.idempotency_key || delivery.external_identity !== row.target
-        ) throw new Error("DeliveryRecord does not match its leased effect");
-        this.#insertRecord(delivery);
-        const changed = this.#db.prepare(`
-          UPDATE effects
-          SET status = ?, lease_id = NULL, lease_worker_id = NULL, lease_expires_at = NULL,
-              lease_execution_mode = NULL, delivery_record_id = ?, unknown_detail = NULL,
-              version = version + 1, updated_at = ?
-          WHERE id = ? AND version = ? AND lease_id = ? AND lease_worker_id = ? AND status = 'processing'
-        `).run(
-          delivery.status === "confirmed" ? "acknowledged" : "rejected",
-          delivery.id,
-          this.#now(),
-          row.id,
-          row.version,
-          input.lease_id,
-          input.worker_id,
-        );
-        if (changed.changes !== 1) throw new Error("effect completion compare-and-set failed");
-      }
-      this.#advanceRunFence(row.pipeline_run_id, `effect-complete:${input.lease_id}`, input.reconciliation);
-    }).immediate();
+    return this.#leases.completeLeasedEffect(input);
+  }
+
+  async findExternalSchedule(input: {
+    pipeline_run_id: string;
+    attempt_id: string;
+    phase: string;
+  }): Promise<ExternalScheduleView | null> {
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(input.attempt_id) ||
+      !/^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/.test(input.phase) ||
+      input.phase.length > 100
+    ) throw new Error("external schedule lookup identity is invalid");
+    this.#attemptById(input.attempt_id, input.pipeline_run_id);
+    const semanticKey = `external-schedule:${input.attempt_id}:${input.phase}`;
+    const row = this.#db.prepare(`
+      SELECT * FROM records
+      WHERE pipeline_run_id = ? AND kind = 'decision' AND semantic_key = ?
+    `).get(input.pipeline_run_id, semanticKey) as RecordRow | undefined;
+    if (!row) return null;
+    const decision = recordFromRow(row, this.#payloadSchemas);
+    if (decision.kind !== "decision" || !("inline" in decision.payload)) {
+      throw new Error(`external schedule ${semanticKey} is not a materialized DecisionRecord`);
+    }
+    const payload = decision.payload.inline;
+    if (
+      !payload || typeof payload !== "object" || Array.isArray(payload) ||
+      payload.semantic_key !== semanticKey || payload.attempt_id !== input.attempt_id ||
+      payload.phase !== input.phase
+    ) throw new Error(`external schedule ${semanticKey} failed its indexed identity`);
+    const effectRows = this.#db.prepare(`
+      SELECT * FROM effects
+      WHERE pipeline_run_id = ? AND decision_record_id = ?
+      ORDER BY id
+    `).all(input.pipeline_run_id, decision.id) as EffectRow[];
+    if (effectRows.length === 0) {
+      throw new Error(`external schedule ${semanticKey} has no bounded effect batch`);
+    }
+    const deliveryRecordIds = [...new Set(effectRows.flatMap((effect) =>
+      effect.delivery_record_id === null ? [] : [effect.delivery_record_id]
+    ))];
+    const deliveryRows = deliveryRecordIds.length === 0
+      ? []
+      : this.#db.prepare(`
+        SELECT * FROM records
+        WHERE pipeline_run_id = ? AND id IN (${placeholders(deliveryRecordIds.length)})
+        ORDER BY id
+      `).all(input.pipeline_run_id, ...deliveryRecordIds) as RecordRow[];
+    const deliveriesById = new Map(deliveryRows.map((delivery) => [delivery.id, delivery]));
+    return {
+      semantic_key: semanticKey,
+      decision,
+      effects: effectRows.map((effect) => {
+        const deliveryRow = effect.delivery_record_id === null
+          ? undefined
+          : deliveriesById.get(effect.delivery_record_id);
+        if (effect.delivery_record_id !== null && deliveryRow === undefined) {
+          throw new Error(`effect ${effect.id} references a missing delivery record`);
+        }
+        const delivery = deliveryRow === undefined ? null : recordFromRow(deliveryRow, this.#payloadSchemas);
+        if (delivery !== null && (
+          delivery.kind !== "delivery" ||
+          delivery.effect_id !== effect.id ||
+          delivery.idempotency_key !== effect.idempotency_key ||
+          delivery.external_identity !== effect.target
+        )) {
+          throw new Error(`effect ${effect.id} references an invalid delivery record`);
+        }
+        return {
+          intent: this.#leases.effectIntentFromRow(effect),
+          delivery,
+        };
+      }),
+    };
+  }
+
+  async listReadyExternalAttempts(input: {
+    limit: number;
+  }): Promise<readonly { pipeline_run_id: string; attempt_id: string }[]> {
+    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100) {
+      throw new Error("external continuation limit must be between 1 and 100");
+    }
+    return this.#db.prepare(`
+      SELECT a.pipeline_run_id, a.id AS attempt_id
+      FROM attempts a
+      JOIN pipeline_runs r ON r.id = a.pipeline_run_id
+      JOIN checkpoints c ON c.id = a.checkpoint_id AND c.pipeline_run_id = a.pipeline_run_id
+      WHERE r.status IN ('pending', 'running')
+        AND a.status IN ('work_complete', 'recorded')
+        AND a.lease_id IS NULL
+        AND c.payload_schema = 'openthrottle.external-boundary-checkpoint/v1'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM records d
+          JOIN effects e ON e.decision_record_id = d.id AND e.pipeline_run_id = d.pipeline_run_id
+          WHERE d.pipeline_run_id = a.pipeline_run_id AND d.kind = 'decision'
+            AND substr(
+              d.semantic_key,
+              1,
+              length('external-schedule:' || a.id || ':')
+            ) = 'external-schedule:' || a.id || ':'
+            AND e.status IN ('pending', 'processing', 'unknown')
+        )
+      ORDER BY a.updated_at, a.pipeline_run_id, a.id
+      LIMIT ?
+    `).all(input.limit) as Array<{ pipeline_run_id: string; attempt_id: string }>;
   }
 
   async resolveExactContext(input: {
@@ -770,6 +526,29 @@ export class SqliteKernelStore implements
     attempt_id: string;
   }): Promise<KernelAttemptRequestInputs> {
     const attempt = this.#attemptById(input.attempt_id, input.pipeline_run_id);
+    const taskPrompt = this.#loadTaskPrompt(input);
+    const runStatus = this.#runFromRow(this.#runRow(input.pipeline_run_id)).status;
+    return {
+      task_prompt: taskPrompt,
+      context: {
+        records: this.#loadExactRecords(
+          input.pipeline_run_id,
+          attempt.context_record_ids,
+          runStatus,
+        ),
+        checkpoints: this.#loadExactCheckpoints(
+          input.pipeline_run_id,
+          attempt.context_checkpoint_ids,
+          runStatus,
+        ),
+      },
+    };
+  }
+
+  #loadTaskPrompt(input: {
+    pipeline_run_id: string;
+    attempt_id: string;
+  }): string {
     const row = this.#db.prepare(`
       SELECT
         w.id AS work_item_id,
@@ -810,21 +589,169 @@ export class SqliteKernelStore implements
     ) {
       throw new Error(`work item ${row.work_item_id} payload is not a sealed kernel request`);
     }
-    return {
-      task_prompt: payload.task_prompt,
-      context: {
-        records: this.#loadExactRecords(
-          input.pipeline_run_id,
-          attempt.context_record_ids,
-          this.#runFromRow(this.#runRow(input.pipeline_run_id)).status,
-        ),
-        checkpoints: this.#loadExactCheckpoints(
-          input.pipeline_run_id,
-          attempt.context_checkpoint_ids,
-          this.#runFromRow(this.#runRow(input.pipeline_run_id)).status,
-        ),
-      },
+    return payload.task_prompt;
+  }
+
+  async listSettledStructuredPlanningAttempts(
+    request: StructuredPlanningReadRequest,
+  ): Promise<readonly SettledStructuredPlanningAttempt[]> {
+    const runRow = this.#runRow(request.pipeline_run_id);
+    if (runRow.definition_bundle_hash !== request.definition_bundle_hash) {
+      throw new Error("structured planning read does not match the pinned definition bundle");
+    }
+    for (const [name, value] of [
+      ["parent_attempt_id", request.parent_attempt_id],
+      ["scope_group_id", request.scope_group_id],
+    ] as const) {
+      if (!STRUCTURED_PLANNING_ID.test(value)) {
+        throw new Error(`structured planning ${name} is invalid`);
+      }
+    }
+    const exactIds = (
+      values: readonly string[],
+      name: string,
+      maximum: number,
+    ): string[] => {
+      if (values.length < 1 || values.length > maximum) {
+        throw new Error(`structured planning ${name} must contain between 1 and ${maximum} IDs`);
+      }
+      if (values.some((value) => !STRUCTURED_PLANNING_ID.test(value))) {
+        throw new Error(`structured planning ${name} contains an invalid ID`);
+      }
+      const canonical = [...new Set(values)].sort(compareCodeUnits);
+      if (canonical.length !== values.length) {
+        throw new Error(`structured planning ${name} must not contain duplicate IDs`);
+      }
+      return canonical;
     };
+    const stageIds = exactIds(request.stage_ids, "stage_ids", 32);
+    const memberIds = exactIds(request.member_ids, "member_ids", 64);
+    const selectionSql = `
+      SELECT * FROM attempts INDEXED BY attempts_structured_planning_idx
+      WHERE pipeline_run_id = ? AND definition_bundle_hash = ?
+        AND scope_kind = ? AND parent_attempt_id = ? AND scope_group_id = ?
+        AND stage_id IN (${placeholders(stageIds.length)})
+        AND scope_item_id IN (${placeholders(memberIds.length)})
+        AND status = 'settled'
+    `;
+    const selectionArguments = [
+      request.pipeline_run_id,
+      request.definition_bundle_hash,
+      request.scope_kind,
+      request.parent_attempt_id,
+      request.scope_group_id,
+      ...stageIds,
+      ...memberIds,
+    ];
+    const rows = this.#db.prepare(`
+      ${selectionSql}
+      ORDER BY scope_item_index, stage_id, id
+    `).all(...selectionArguments) as AttemptRow[];
+    const recordRows = rows.length === 0
+      ? []
+      : this.#db.prepare(`
+        WITH selected_attempts AS (${selectionSql}),
+        referenced_ids(id) AS (
+          SELECT result_record_id FROM selected_attempts WHERE result_record_id IS NOT NULL
+          UNION
+          SELECT decision_record_id FROM selected_attempts WHERE decision_record_id IS NOT NULL
+          UNION
+          SELECT context.value
+          FROM selected_attempts, json_each(selected_attempts.context_record_ids_json) AS context
+          WHERE context.type = 'text'
+        )
+        SELECT records.* FROM records
+        JOIN referenced_ids ON referenced_ids.id = records.id
+        WHERE records.pipeline_run_id = ?
+        ORDER BY records.id
+      `).all(...selectionArguments, request.pipeline_run_id) as RecordRow[];
+    const checkpointRows = rows.length === 0
+      ? []
+      : this.#db.prepare(`
+        WITH selected_attempts AS (${selectionSql}),
+        referenced_ids(id) AS (
+          SELECT checkpoint_id FROM selected_attempts WHERE checkpoint_id IS NOT NULL
+          UNION
+          SELECT context.value
+          FROM selected_attempts, json_each(selected_attempts.context_checkpoint_ids_json) AS context
+          WHERE context.type = 'text'
+        )
+        SELECT checkpoints.* FROM checkpoints
+        JOIN referenced_ids ON referenced_ids.id = checkpoints.id
+        WHERE checkpoints.pipeline_run_id = ?
+        ORDER BY checkpoints.id
+      `).all(...selectionArguments, request.pipeline_run_id) as CheckpointRow[];
+    const recordsById = new Map(recordRows.map((row) => [row.id, row]));
+    const checkpointsById = new Map(checkpointRows.map((row) => [row.id, row]));
+    const run = this.#runFromRow(runRow);
+    const settled: SettledStructuredPlanningAttempt[] = [];
+    let taskPrompt: string | undefined;
+    for (const row of rows) {
+      const attempt = attemptFromRow(row);
+      if (
+        attempt.result_record_id === null || attempt.decision_record_id === null ||
+        attempt.checkpoint_id === null
+      ) throw new Error(`settled structured attempt ${attempt.id} has incomplete evidence relations`);
+      const records = this.#materializeExactRecords(
+        request.pipeline_run_id,
+        [attempt.result_record_id, attempt.decision_record_id],
+        run.status,
+        recordsById,
+      );
+      const result = records.get(attempt.result_record_id);
+      const decision = records.get(attempt.decision_record_id);
+      if (!result || result.kind !== "result" || !decision || decision.kind !== "decision") {
+        throw new Error(`settled structured attempt ${attempt.id} has invalid evidence kinds`);
+      }
+      if (
+        result.attempt_id !== attempt.id || result.request_hash !== attempt.request_hash ||
+        result.definition_bundle_hash !== attempt.definition_bundle_hash ||
+        result.input_subject !== attempt.input_subject || result.output_subject !== attempt.output_subject ||
+        !decision.input_record_ids.includes(result.id)
+      ) throw new Error(`settled structured attempt ${attempt.id} has a cross-attempt decision relation`);
+      const checkpoint = this.#materializeExactCheckpoints(
+        request.pipeline_run_id,
+        [attempt.checkpoint_id],
+        run.status,
+        checkpointsById,
+      ).get(attempt.checkpoint_id)!;
+      if (
+        checkpoint.attempt_id !== attempt.id || checkpoint.request_hash !== attempt.request_hash ||
+        checkpoint.definition_bundle_hash !== attempt.definition_bundle_hash ||
+        checkpoint.input_subject !== attempt.input_subject ||
+        checkpoint.output_subject !== attempt.output_subject
+      ) throw new Error(`settled structured attempt ${attempt.id} has a cross-attempt checkpoint relation`);
+      if (taskPrompt === undefined) {
+        taskPrompt = this.#loadTaskPrompt({
+          pipeline_run_id: request.pipeline_run_id,
+          attempt_id: attempt.id,
+        });
+      }
+      settled.push({
+        attempt,
+        result,
+        decision,
+        checkpoint,
+        request_inputs: {
+          task_prompt: taskPrompt,
+          context: {
+            records: this.#materializeExactRecords(
+              request.pipeline_run_id,
+              attempt.context_record_ids,
+              run.status,
+              recordsById,
+            ),
+            checkpoints: this.#materializeExactCheckpoints(
+              request.pipeline_run_id,
+              attempt.context_checkpoint_ids,
+              run.status,
+              checkpointsById,
+            ),
+          },
+        },
+      });
+    }
+    return settled;
   }
 
   async loadExactDefinitionBundleBytes(input: {
@@ -850,80 +777,6 @@ export class SqliteKernelStore implements
       pointer,
       row.status,
     ));
-  }
-
-  async getRunProjection(pipelineRunId: string): Promise<KernelRunProjection | undefined> {
-    const row = this.#db.prepare("SELECT * FROM pipeline_runs WHERE id = ?").get(pipelineRunId) as RunRow | undefined;
-    if (!row) return undefined;
-    const activeAttempts = this.#db.prepare(`
-      SELECT COUNT(*) AS count FROM attempts WHERE pipeline_run_id = ?
-        AND status IN (${placeholders(ACTIVE_ATTEMPT_STATUSES.length)})
-    `).get(pipelineRunId, ...ACTIVE_ATTEMPT_STATUSES) as { count: number };
-    const activeEffects = this.#db.prepare(`
-      SELECT COUNT(*) AS count FROM effects WHERE pipeline_run_id = ?
-        AND status IN (${placeholders(ACTIVE_EFFECT_STATUSES.length)})
-    `).get(pipelineRunId, ...ACTIVE_EFFECT_STATUSES) as { count: number };
-    return {
-      pipeline_run_id: row.id,
-      pipeline_id: row.pipeline_id,
-      status: row.status,
-      stage_id: row.cursor_stage_id,
-      current_subject: row.current_subject,
-      active_attempt_count: activeAttempts.count,
-      active_effect_count: activeEffects.count,
-      version: row.version,
-    };
-  }
-
-  async listRunLog(input: {
-    pipeline_run_id: string;
-    after_sequence?: number;
-    limit: number;
-  }): Promise<readonly {
-    sequence: number;
-    kind: "attempt" | "record" | "effect" | "checkpoint" | "transition";
-    identity: string;
-    summary: string;
-  }[]> {
-    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1_000) {
-      throw new Error("kernel log limit must be between 1 and 1000");
-    }
-    const events: Array<{
-      at: string;
-      kind: "attempt" | "record" | "effect" | "checkpoint" | "transition";
-      identity: string;
-      summary: string;
-    }> = [];
-    for (const row of this.#db.prepare(`
-      SELECT id, status, created_at AS at FROM attempts WHERE pipeline_run_id = ?
-    `).all(input.pipeline_run_id) as Array<{ id: string; status: string; at: string }>) {
-      events.push({ at: row.at, kind: "attempt", identity: row.id, summary: row.status });
-    }
-    for (const row of this.#db.prepare(`
-      SELECT id, kind, created_at AS at FROM records WHERE pipeline_run_id = ?
-    `).all(input.pipeline_run_id) as Array<{ id: string; kind: string; at: string }>) {
-      events.push({ at: row.at, kind: "record", identity: row.id, summary: row.kind });
-    }
-    for (const row of this.#db.prepare(`
-      SELECT id, status, created_at AS at FROM effects WHERE pipeline_run_id = ?
-    `).all(input.pipeline_run_id) as Array<{ id: string; status: string; at: string }>) {
-      events.push({ at: row.at, kind: "effect", identity: row.id, summary: row.status });
-    }
-    for (const row of this.#db.prepare(`
-      SELECT id, payload_schema, captured_at AS at FROM checkpoints WHERE pipeline_run_id = ?
-    `).all(input.pipeline_run_id) as Array<{ id: string; payload_schema: string; at: string }>) {
-      events.push({ at: row.at, kind: "checkpoint", identity: row.id, summary: row.payload_schema });
-    }
-    const run = this.#db.prepare(`
-      SELECT updated_at AS at, last_transition_id AS id FROM pipeline_runs WHERE id = ?
-    `).get(input.pipeline_run_id) as { at: string; id: string | null } | undefined;
-    if (run?.id) events.push({ at: run.at, kind: "transition", identity: run.id, summary: "applied" });
-    return events
-      .sort((left, right) => left.at.localeCompare(right.at) || left.kind.localeCompare(right.kind) || left.identity.localeCompare(right.identity))
-      .map((event, index) => ({ ...event, sequence: index + 1 }))
-      .filter((event) => event.sequence > (input.after_sequence ?? 0))
-      .slice(0, input.limit)
-      .map(({ at: _at, ...event }) => event);
   }
 
   #insertDefinitions(definitions: readonly DefinitionSnapshotInput[]): void {
@@ -1109,15 +962,8 @@ export class SqliteKernelStore implements
     return attemptFromRow(row);
   }
 
-  #scopeColumns(scope: AttemptScope): [string | null, string | null, string | null, number | null] {
-    if (scope.kind === "stage") return [null, null, null, null];
-    return scope.kind === "loop_item"
-      ? [scope.parent_attempt_id, scope.loop_id, scope.item_id, scope.item_index]
-      : [scope.parent_attempt_id, scope.fanout_id, scope.member_id, scope.member_index];
-  }
-
   #insertAttempt(attempt: KernelAttempt, now: string, workerId: string | null): void {
-    const [parent, group, item, index] = this.#scopeColumns(attempt.scope);
+    const [parent, group, item, index] = scopeColumns(attempt.scope);
     const contextRecordIds = canonicalAttemptContextIds(
       attempt.context_record_ids,
       `attempt ${attempt.id} context_record_ids`,
@@ -1135,9 +981,10 @@ export class SqliteKernelStore implements
         status, version, work_retry_ordinal, result_correction_count,
         result_correction_deadline, unmet_dependency_count,
         lease_id, lease_worker_id, lease_purpose, lease_expires_at, lease_started,
-        checkpoint_id, result_record_id, pending_candidate_hash, pending_diagnostics_json,
+        checkpoint_id, result_record_id, decision_record_id,
+        pending_candidate_hash, pending_diagnostics_json,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       attempt.id,
       attempt.pipeline_run_id,
@@ -1167,6 +1014,7 @@ export class SqliteKernelStore implements
       attempt.lease ? (attempt.lease.started ? 1 : 0) : null,
       attempt.checkpoint_id,
       attempt.result_record_id,
+      attempt.decision_record_id,
       attempt.pending_result?.candidate_hash ?? null,
       attempt.pending_result === null ? null : canonicalJson(attempt.pending_result.diagnostics),
       now,
@@ -1179,7 +1027,7 @@ export class SqliteKernelStore implements
     const existing = this.#db.prepare("SELECT * FROM attempts WHERE id = ? AND pipeline_run_id = ?")
       .get(attempt.id, runId) as AttemptRow | undefined;
     if (!existing) throw new Error(`unknown attempt ${attempt.id}`);
-    const [parent, group, item, index] = this.#scopeColumns(attempt.scope);
+    const [parent, group, item, index] = scopeColumns(attempt.scope);
     const contextRecordIds = canonicalAttemptContextIds(
       attempt.context_record_ids,
       `attempt ${attempt.id} context_record_ids`,
@@ -1205,6 +1053,7 @@ export class SqliteKernelStore implements
         status = ?, version = ?, work_retry_ordinal = ?, result_correction_count = ?,
         result_correction_deadline = ?, lease_id = ?, lease_worker_id = ?, lease_purpose = ?,
         lease_expires_at = ?, lease_started = ?, checkpoint_id = ?, result_record_id = ?,
+        decision_record_id = ?,
         pending_candidate_hash = ?, pending_diagnostics_json = ?, updated_at = ?
       WHERE id = ? AND pipeline_run_id = ? AND version = ?
     `).run(
@@ -1232,6 +1081,7 @@ export class SqliteKernelStore implements
       attempt.lease ? (attempt.lease.started ? 1 : 0) : null,
       attempt.checkpoint_id,
       attempt.result_record_id,
+      attempt.decision_record_id,
       attempt.pending_result?.candidate_hash ?? null,
       attempt.pending_result === null ? null : canonicalJson(attempt.pending_result.diagnostics),
       this.#now(),
@@ -1252,62 +1102,6 @@ export class SqliteKernelStore implements
       WHERE id = ? AND pipeline_run_id = ? AND version = ?
     `).run(write.status, write.next_version, this.#now(), write.attempt_id, runId, write.expected_version);
     if (changed.changes !== 1) throw new Error(`attempt ${write.attempt_id} terminal compare-and-set failed`);
-  }
-
-  #recordFromRow(row: RecordRow): ExecutionRecord {
-    const base = {
-      schema: "openthrottle.record/v1" as const,
-      id: row.id,
-      pipeline_run_id: row.pipeline_run_id,
-      payload_schema: row.payload_schema,
-      payload: recordPayload(row),
-      created_at: row.created_at,
-    };
-    const candidate: ExecutionRecord = row.kind === "result"
-      ? {
-        ...base,
-        kind: "result",
-        attempt_id: row.attempt_id!,
-        request_hash: row.request_hash!,
-        definition_bundle_hash: row.definition_bundle_hash!,
-        input_subject: row.input_subject!,
-        output_subject: row.output_subject,
-        original_candidate_hash: row.original_candidate_hash!,
-        normalized_candidate_hash: row.normalized_candidate_hash!,
-      }
-      : row.kind === "decision"
-        ? {
-          ...base,
-          kind: "decision",
-          reducer: row.reducer!,
-          input_record_ids: parseJson(row.input_record_ids_json!, "DecisionRecord inputs"),
-        }
-        : {
-          ...base,
-          kind: "delivery",
-          effect_id: row.effect_id!,
-          idempotency_key: row.idempotency_key!,
-          external_identity: row.external_identity!,
-          status: row.delivery_status!,
-        };
-    return validateExecutionRecord(candidate, { payloadSchemas: this.#payloadSchemas }).value;
-  }
-
-  #checkpointFromRow(row: CheckpointRow): AttemptCheckpoint {
-    return validateAttemptCheckpoint({
-      schema: "openthrottle.attempt-checkpoint/v1",
-      id: row.id,
-      pipeline_run_id: row.pipeline_run_id,
-      attempt_id: row.attempt_id,
-      request_hash: row.request_hash,
-      definition_bundle_hash: row.definition_bundle_hash,
-      input_subject: row.input_subject,
-      output_subject: row.output_subject,
-      native_session_id: row.native_session_id,
-      payload_schema: row.payload_schema,
-      payload: recordPayload(row),
-      captured_at: row.captured_at,
-    }).value;
   }
 
   #insertRecord(recordInput: ExecutionRecord): void {
@@ -1395,6 +1189,21 @@ export class SqliteKernelStore implements
     const ordinal = this.#db.prepare(`
       SELECT COALESCE(MAX(ordinal), -1) + 1 AS ordinal FROM checkpoints WHERE attempt_id = ?
     `).get(checkpoint.attempt_id) as { ordinal: number };
+    if (ordinal.ordinal > 1) {
+      throw new Error(`attempt ${checkpoint.attempt_id} cannot append more than one promoted checkpoint`);
+    }
+    if (ordinal.ordinal === 1) {
+      const prior = this.#db.prepare(`
+        SELECT id, output_subject FROM checkpoints WHERE attempt_id = ? AND ordinal = 0
+      `).get(checkpoint.attempt_id) as { id: string; output_subject: string | null } | undefined;
+      if (
+        !prior || attempt.checkpoint_id !== prior.id || attempt.output_subject !== null ||
+        prior.output_subject !== null || checkpoint.output_subject === null ||
+        checkpoint.payload_schema !== "openthrottle.git-checkpoint-bundle/v1"
+      ) {
+        throw new Error(`attempt ${checkpoint.attempt_id} has an invalid external integration promotion`);
+      }
+    }
     this.#db.prepare(`
       INSERT INTO checkpoints (
         id, pipeline_run_id, attempt_id, ordinal, checkpoint_hash, semantic_key,
@@ -1485,62 +1294,6 @@ export class SqliteKernelStore implements
     if (changed.changes !== 1) throw new Error(`effect ${effectId} cannot be canceled from its current fence`);
   }
 
-  #recoverExpiredEffectLeases(now: string): void {
-    const expired = this.#db.prepare(`
-      SELECT * FROM effects
-      WHERE status = 'processing' AND lease_id IS NOT NULL AND lease_expires_at <= ?
-      ORDER BY pipeline_run_id, id
-    `).all(now) as EffectRow[];
-    for (const row of expired) {
-      const reconcileOnly = row.lease_execution_mode === "reconcile_only";
-      const changed = this.#db.prepare(`
-        UPDATE effects
-        SET status = ?, lease_id = NULL, lease_worker_id = NULL, lease_expires_at = NULL,
-          lease_execution_mode = NULL, unknown_detail = ?, version = version + 1, updated_at = ?
-        WHERE id = ? AND version = ? AND status = 'processing' AND lease_id = ?
-          AND lease_expires_at <= ?
-      `).run(
-        reconcileOnly ? "unknown" : "pending",
-        reconcileOnly ? "provider dispatch may have started before the effect lease expired" : null,
-        now,
-        row.id,
-        row.version,
-        row.lease_id,
-        now,
-      );
-      if (changed.changes !== 1) throw new Error(`effect ${row.id} expiry recovery compare-and-set failed`);
-      this.#advanceRunFence(row.pipeline_run_id, `effect-expired:${row.lease_id}`, {
-        effect_id: row.id,
-        recovered_status: reconcileOnly ? "unknown" : "pending",
-      });
-    }
-  }
-
-  #effectIntentById(id: string): EffectIntent {
-    const row = this.#db.prepare("SELECT * FROM effects WHERE id = ?").get(id) as EffectRow | undefined;
-    if (!row) throw new Error(`unknown effect ${id}`);
-    let payload: unknown;
-    const pointer = payloadPointer(row);
-    if (pointer) {
-      const bytes = this.#readBlob(row.pipeline_run_id, "effect", row.id, pointer);
-      if (pointer.encoding !== "utf-8") throw new Error(`effect ${row.id} payload is not JSON text`);
-      payload = parseJson(bytes.toString("utf8"), `effect ${row.id} payload`);
-    } else {
-      payload = parseJson(row.inline_payload!, `effect ${row.id} payload`);
-    }
-    return validateEffectIntent({
-      schema: "openthrottle.effect-intent/v1",
-      id: row.id,
-      pipeline_run_id: row.pipeline_run_id,
-      decision_record_id: row.decision_record_id,
-      kind: row.kind,
-      idempotency_key: row.idempotency_key,
-      target: row.target,
-      subject: row.subject,
-      payload,
-    }).value;
-  }
-
   #preverifyTransitionBlobs(bundle: AtomicTransitionBundle): void {
     for (const record of bundle.append_records) {
       if ("blob" in record.payload) this.#blobs.assertToken(this.#blobs.verify(record.payload.blob), record.payload.blob);
@@ -1558,10 +1311,33 @@ export class SqliteKernelStore implements
     runStatus: KernelRun["status"],
   ): ReadonlyMap<string, ExecutionRecord> {
     if (new Set(ids).size !== ids.length) throw new Error("record allowlist contains duplicate IDs");
+    const rows = ids.length === 0
+      ? []
+      : this.#db.prepare(`
+        SELECT * FROM records WHERE pipeline_run_id = ? AND id IN (${placeholders(ids.length)}) ORDER BY id
+      `).all(runId, ...ids) as RecordRow[];
+    return this.#materializeExactRecords(
+      runId,
+      ids,
+      runStatus,
+      new Map(rows.map((row) => [row.id, row])),
+    );
+  }
+
+  #materializeExactRecords(
+    runId: string,
+    ids: readonly string[],
+    runStatus: KernelRun["status"],
+    availableRows: ReadonlyMap<string, RecordRow>,
+  ): ReadonlyMap<string, ExecutionRecord> {
+    if (new Set(ids).size !== ids.length) throw new Error("record allowlist contains duplicate IDs");
     if (ids.length === 0) return new Map();
-    const rows = this.#db.prepare(`
-      SELECT * FROM records WHERE pipeline_run_id = ? AND id IN (${placeholders(ids.length)}) ORDER BY id
-    `).all(runId, ...ids) as RecordRow[];
+    const rows = [...ids]
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+      .flatMap((id) => {
+        const row = availableRows.get(id);
+        return row === undefined ? [] : [row];
+      });
     if (rows.length !== ids.length) throw new Error("exact record context is missing an authorized record");
     const records = new Map<string, ExecutionRecord>();
     for (const row of rows) {
@@ -1574,7 +1350,7 @@ export class SqliteKernelStore implements
           contract.parseInline(parseJson(bytes.toString("utf8"), `record ${row.id} blob`), `record.${row.id}.payload`);
         }
       }
-      records.set(row.id, this.#recordFromRow(row));
+      records.set(row.id, recordFromRow(row, this.#payloadSchemas));
     }
     return records;
   }
@@ -1585,16 +1361,39 @@ export class SqliteKernelStore implements
     runStatus: KernelRun["status"],
   ): ReadonlyMap<string, AttemptCheckpoint> {
     if (new Set(ids).size !== ids.length) throw new Error("checkpoint allowlist contains duplicate IDs");
+    const rows = ids.length === 0
+      ? []
+      : this.#db.prepare(`
+        SELECT * FROM checkpoints WHERE pipeline_run_id = ? AND id IN (${placeholders(ids.length)}) ORDER BY id
+      `).all(runId, ...ids) as CheckpointRow[];
+    return this.#materializeExactCheckpoints(
+      runId,
+      ids,
+      runStatus,
+      new Map(rows.map((row) => [row.id, row])),
+    );
+  }
+
+  #materializeExactCheckpoints(
+    runId: string,
+    ids: readonly string[],
+    runStatus: KernelRun["status"],
+    availableRows: ReadonlyMap<string, CheckpointRow>,
+  ): ReadonlyMap<string, AttemptCheckpoint> {
+    if (new Set(ids).size !== ids.length) throw new Error("checkpoint allowlist contains duplicate IDs");
     if (ids.length === 0) return new Map();
-    const rows = this.#db.prepare(`
-      SELECT * FROM checkpoints WHERE pipeline_run_id = ? AND id IN (${placeholders(ids.length)}) ORDER BY id
-    `).all(runId, ...ids) as CheckpointRow[];
+    const rows = [...ids]
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+      .flatMap((id) => {
+        const row = availableRows.get(id);
+        return row === undefined ? [] : [row];
+      });
     if (rows.length !== ids.length) throw new Error("exact checkpoint context is missing an authorized checkpoint");
     const checkpoints = new Map<string, AttemptCheckpoint>();
     for (const row of rows) {
       const pointer = payloadPointer(row);
       if (pointer) this.#readBlob(runId, "checkpoint", row.id, pointer, runStatus);
-      checkpoints.set(row.id, this.#checkpointFromRow(row));
+      checkpoints.set(row.id, checkpointFromRow(row));
     }
     return checkpoints;
   }

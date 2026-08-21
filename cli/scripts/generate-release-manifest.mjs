@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const packagePath = resolve(here, "../package.json");
-const descriptorPath = resolve(here, "../../supervisor/pipelines/runtime-capabilities-v1.json");
+const descriptorPath = resolve(here, "../../contracts/runtime-capabilities.json");
 const outputPath = resolve(here, "../release-manifest.json");
 
 // Matches the supervisor's admission defaults (DAYTONA_SANDBOX_MEMORY_GIB=8 in
@@ -49,9 +49,7 @@ function parseArgs(argv) {
 }
 
 // Key-sorted canonical JSON, byte-identical to contracts/src/canonical.ts, so
-// the digest equals the supervisor's own descriptor digest
-// (digestNormalized(canonicalJson(descriptor)); the same value is recorded as
-// bare hex under runtime.digest in supervisor/pipelines/v12-deploy-proof.json).
+// the digest equals the capability source sealed into the compiler environment.
 // Inlined so this script runs before any npm ci, like copy-planning-skills.mjs.
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;

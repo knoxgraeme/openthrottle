@@ -1,0 +1,40 @@
+schema: openthrottle.pipeline-definition/v1
+id: core/admission
+version: 1
+entry: plan
+stages:
+  - id: plan
+    kind: agent
+    agent_id: core/admission-planner
+    repository_authority: inspect
+    skills: [core/admission-plan]
+    entry_skill: core/admission-plan
+    eval: core/admission-result
+    on:
+      simple: {to: review}
+      structured: {to: review}
+      needs_human: {terminal: needs_human}
+      semantic_repair_required: {to: plan, max_reentries: 3, on_exhausted: needs_human}
+      retryable_infrastructure_failure: {to: plan, max_reentries: 3, on_exhausted: failed}
+      failure: {terminal: failed}
+  - id: review
+    kind: agent
+    agent_id: core/admission-reviewer
+    repository_authority: inspect
+    skills: [core/review-admission-plan]
+    entry_skill: core/review-admission-plan
+    eval: core/admission-review-result
+    on:
+      approved: {to: promote}
+      rejected: {to: plan, max_reentries: 3, on_exhausted: needs_human}
+      needs_human: {terminal: needs_human}
+      semantic_repair_required: {to: review, max_reentries: 3, on_exhausted: needs_human}
+      retryable_infrastructure_failure: {to: review, max_reentries: 3, on_exhausted: failed}
+      failure: {terminal: failed}
+  - id: promote
+    kind: effect
+    effect: kernel/promote-admission@1
+    on:
+      success: {terminal: completed}
+      retryable_infrastructure_failure: {to: promote, max_reentries: 3, on_exhausted: failed}
+      failure: {terminal: failed}

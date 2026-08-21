@@ -23,6 +23,23 @@ for the classification boundary.
 4. Keep decomposition within the request. Adjacent cleanup and speculative
    architecture are observations, not plan units.
 
+## Semantic result
+
+Return one `openthrottle.result-candidate/v1` value for the sealed
+`core/admission-result` schema. The candidate `outcome` is the route:
+`simple`, `structured`, or `needs_human`. Use `semantic_repair_required`,
+`retryable_infrastructure_failure`, or `failure` only when those conditions
+actually apply.
+
+- `simple`: `payload.execution_plan` is `null` and `payload.questions` is empty.
+- `structured`: `payload.execution_plan` is the natural JSON object described
+  below (never a JSON-escaped string), and `payload.questions` is empty.
+- `needs_human`: `payload.execution_plan` is `null` and
+  `payload.questions` names each missing source decision.
+
+Always provide a concise `payload.summary`. Do not add fields outside the
+sealed result schema.
+
 ## Structured-plan craft
 
 - Keep units independently implementable or explicitly ordered with

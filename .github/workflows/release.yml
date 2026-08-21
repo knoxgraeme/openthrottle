@@ -9,7 +9,8 @@ name: Release
 #     baked into the CLI's dist/ (and therefore into the npm package)
 #
 # Both images build from the REPO ROOT context: the supervisor for its
-# file:../contracts dependency, the sandbox for the root-level skills/ payload.
+# file:../contracts dependency, and the sandbox for release-sealed definitions,
+# generated result validators, and its Codex safety context.
 #
 # A push to main publishes a package version that is not already on npm. Tag
 # pushes still produce release artifacts and publish an unpublished version;

@@ -79,7 +79,7 @@ excluded by decision or deferred when that history matters.
   rejected, superseded, or deferred delta.
 - Treat any execution-plan block as generated output. Never deepen or hand-edit
   it independently of the human plan; revise approved prose first, then
-  regenerate and revalidate the block using the selected graph.
+  regenerate and revalidate the block using the selected pipeline.
 
 ## Finish the pass
 

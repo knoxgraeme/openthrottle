@@ -44,3 +44,18 @@ author could not resolve without inventing a requirement.
 Do not improve, normalize, or copy the candidate into the review. Keep each
 finding tied to a source obligation, unit, path, dependency edge, or proof gap,
 and ask questions that are specific enough to unblock a revised plan.
+
+## Semantic result
+
+Return one `openthrottle.result-candidate/v1` value for the sealed
+`core/admission-review-result` schema. The candidate `outcome` is the verdict:
+`approved`, `rejected`, or `needs_human`. The executor already binds the exact
+planner ResultRecord; do not echo its route or execution-plan bytes.
+
+- `approved`: `payload.findings` and `payload.questions` are both empty.
+- `rejected`: `payload.findings` contains one concise anchored string per
+  correctable defect and `payload.questions` is empty.
+- `needs_human`: `payload.questions` names the missing source decisions.
+
+Always provide `payload.summary`. Do not add fields outside the sealed result
+schema.

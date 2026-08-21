@@ -46,16 +46,17 @@ the exact `openthrottle` label to an open Issue.
 ## Commands
 
 ```text
-openthrottle setup [--profile <name>] [--check] [--yes] [--legacy-checklist]
+openthrottle setup [--profile <name>] [--check] [--yes]
 openthrottle init [--profile <name>] [--dry-run]
 openthrottle plan validate <file.md> [--pipeline <id>] [--json]
 openthrottle plan prepare <file.md> [--pipeline <id>] [--json]
 openthrottle validate <file.md> [--pipeline <id>] [--json]
 openthrottle ship <file.md> [--pipeline <id>]
-openthrottle status [<ticket>] [--admission]
-openthrottle stop <ticket>
-openthrottle logs <ticket>
-openthrottle analysis [filters]
+openthrottle status <run-or-source-reference> [--json]
+openthrottle stop <run-or-source-reference>
+openthrottle logs <run-or-source-reference>
+openthrottle analysis [--run <reference>] [--pipeline <id>] [--outcome <outcome>]
+                      [--record-kind <kind>] [--from <iso>] [--to <iso>] [--limit <n>]
 openthrottle operator-skill <install|status|refresh|remove> [--json]
 openthrottle planning-skill <install|status|refresh|remove> [--json]
 ```
@@ -78,9 +79,9 @@ Key workflows:
   Linear credential access or mutation. It does not append selection metadata.
 - `status`, `stop`, `logs`, and `analysis` call authenticated supervisor
   endpoints.
-- `status <ticket> --admission` prints the exact accepted automatic plan and
-  reviewer receipt from the same provider-neutral, status-token-protected data
-  used by the list view. Init enables automatic admission by default.
+- `status`, `logs`, and `analysis --run` expose bounded projections from the
+  shared Attempt/Record/Effect/Checkpoint kernel. Semantic agent output remains
+  untrusted until it is normalized and wrapped in an executor-authored record.
 
 Run `npx openthrottle --help` for full flag descriptions.
 

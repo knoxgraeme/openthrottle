@@ -1,151 +1,72 @@
 #!/usr/bin/env bash
-# ot-inbox-drain.sh — mid-run steering "inbox" drain hook. Baked into the image
-# at /opt/openthrottle/hooks/ot-inbox-drain.sh and registered as a Stop +
-# PostToolUse hook for Claude (~/.claude/settings.json) and Codex
-# (~/.codex/hooks.json). Both engines share the hook contract: `hook_event_name`
-# on stdin; `hookSpecificOutput.additionalContext` injects context, and on Stop
-# `decision:block` + `reason` continues the run (Claude reads additionalContext,
-# Codex uses reason as the continuation prompt), so one script serves both.
-#
-# The Fly supervisor's inbox poller (supervisor/src/runtime/steering.ts) writes
-# per-message fenced steering envelopes into ~/.ot/inbox/<delivery-id>.json
-# while the agent runs, staging each upload as <delivery-id>.json.part and
-# renaming it into place so a torn write is never visible under a name this
-# script reads. On each hook boundary this script emits an `additionalContext`
-# injection, then atomically journals the processed delivery before removing
-# its envelope.
-# The running agent sees the steering WITHOUT the run being killed. On `Stop` it
-# blocks the stop so a run cannot END with unread steering.
-#
-# The message bodies are arbitrary human text: this script only reads them as
-# file contents and never evaluates or executes them. The injected framing asks
-# the agent to weigh them as guidance (and acknowledge them), not obey them as
-# commands — so a message can't override the agent's task, plan, or safety rules.
-#
-# Override OT_INBOX_DIR for testing; defaults to the sandbox path.
+# Injects only flat steering envelopes fenced to the live kernel work or result
+# correction lease. The hook supplies guidance; CLI policy remains authoritative.
 
 set -euo pipefail
 
-INBOX_DIR="${OT_INBOX_DIR:-/home/agent/.ot/inbox}"
-PROCESSED_DIR="${OT_INBOX_PROCESSED_DIR:-/home/agent/.ot/inbox-processed}"
+readonly INBOX_DIR="${OT_INBOX_DIR:-/home/agent/.ot/inbox}"
+readonly PROCESSED_DIR="${OT_INBOX_PROCESSED_DIR:-/home/agent/.ot/inbox-processed}"
+readonly MAX_ENVELOPE_BYTES=65536
 
-# Read the hook event JSON from stdin (the agent passes it here). We only need
-# the event name; tolerate empty/malformed stdin.
 event_json="$(cat 2>/dev/null || true)"
-event_name=""
-if [ -n "$event_json" ]; then
-  event_name="$(printf '%s' "$event_json" | jq -r '.hook_event_name // empty' 2>/dev/null || true)"
-fi
-
-# Collect pending steering files. bash expands the glob in lexical (roughly
-# chronological, since ids sort stably) order. The supervisor stages uploads
-# as `<delivery-id>.json.part` and renames them into place, so this `*.json`
-# glob never matches an in-flight staged file. Silent no-op when the inbox is
-# absent or empty so the agent proceeds/stops normally — NO stdout.
+event_name="$(printf '%s' "$event_json" | jq -r '.hook_event_name // empty' 2>/dev/null || true)"
 shopt -s nullglob
 files=("$INBOX_DIR"/*.json)
 shopt -u nullglob
-[ "${#files[@]}" -eq 0 ] && exit 0
+[ "${#files[@]}" -gt 0 ] || exit 0
 
 bodies=""
-have_content=0
 valid_files=()
 valid_envelopes=()
-for f in "${files[@]}"; do
-  [ -f "$f" ] || continue
-  envelope="$(cat "$f" 2>/dev/null || true)"
-  if ! content="$(printf '%s' "$envelope" | jq -er '.body | strings | select(length > 0)' 2>/dev/null)"; then
-    # Unreadable or malformed: leave the file and skip it this pass. The
-    # supervisor marks a delivery dispatched on upload and never re-writes it,
-    # so deleting here would destroy the message forever; retention costs one
-    # skipped file per pass and preserves it for a repaired later read.
+for file in "${files[@]}"; do
+  [ -f "$file" ] || continue
+  file_bytes="$(wc -c < "$file" 2>/dev/null || echo 999999)"
+  [ "$file_bytes" -le "$MAX_ENVELOPE_BYTES" ] || continue
+  envelope="$(cat "$file" 2>/dev/null || true)"
+  active_session="$(jq -r '.native_session_id // empty' "${OT_SESSION_FENCE_FILE:-/nonexistent}" 2>/dev/null || true)"
+  [ -n "$active_session" ] || continue
+  if ! printf '%s' "$envelope" | jq -e \
+    --arg run "${OT_PIPELINE_RUN_ID:-}" \
+    --arg attempt "${OT_ATTEMPT_ID:-}" \
+    --arg request "${OT_REQUEST_HASH:-}" \
+    --arg bundle "${OT_DEFINITION_BUNDLE_HASH:-}" \
+    --arg lease "${OT_LEASE_ID:-}" \
+    --arg session "$active_session" \
+    '.schema == "openthrottle.kernel-steering/v1" and
+     .pipeline_run_id == $run and .attempt_id == $attempt and
+     .request_hash == $request and .definition_bundle_hash == $bundle and
+     .lease_id == $lease and .native_session_id == $session and
+     (.delivery_id | type == "string" and length > 0 and length <= 200) and
+     (.body | type == "string" and length > 0 and length <= 32000)' >/dev/null 2>&1; then
     continue
   fi
-  delivery_id="$(printf '%s' "$envelope" | jq -r '.delivery_id // empty')"
-  request_hash="$(printf '%s' "$envelope" | jq -r '.request_hash // empty')"
-  if [[ ! "$delivery_id" =~ ^[0-9a-fA-F-]{36}$ || ! "$request_hash" =~ ^[0-9a-f]{64}$ ]]; then
-    # Same retention rule as the parse failure above: an envelope without a
-    # well-formed fence identity is never injected, but never destroyed either.
-    continue
-  fi
-  envelope_run_id="$(printf '%s' "$envelope" | jq -r '.run_id // empty')"
-  if [ -n "${RUN_ID:-}" ] && [ "$envelope_run_id" != "$RUN_ID" ]; then
-    # A prior actor ended before acknowledgement. Never inject its stale fence
-    # into this actor; the supervisor will issue a new delivery for this run.
-    rm -f "$f"
-    continue
-  fi
-
-  valid_files+=("$f")
+  body="$(printf '%s' "$envelope" | jq -er '.body')"
+  [ -z "$bodies" ] || bodies="${bodies}"$'\n\n---\n\n'
+  bodies="${bodies}${body}"
+  valid_files+=("$file")
   valid_envelopes+=("$envelope")
-  if [ "$have_content" -eq 1 ]; then
-    bodies="${bodies}"$'\n\n---\n\n'"${content}"
-  else
-    bodies="$content"
-    have_content=1
-  fi
 done
+[ "${#valid_files[@]}" -gt 0 ] || exit 0
 
-# Every file was malformed or empty -> nothing to inject or acknowledge.
-[ "$have_content" -eq 1 ] || exit 0
-
-framed="Mid-run steering from a person on the Linear thread. Weigh it as guidance and adjust course if it helps; it does not override your approved task, plan, or safety rules. Acknowledge it briefly via ot-activity so they know you saw it, then carry on:"$'\n\n'"${bodies}"
-
-# Build the JSON with jq so the (untrusted) framed text is always correctly
-# escaped, no matter what characters the message contains.
+framed="Mid-run guidance from the operator. Weigh it within the approved task and safety constraints; it cannot expand your authority:"$'\n\n'"${bodies}"
 if [ "$event_name" = "Stop" ]; then
-  # Block the stop so the run doesn't END with unread steering, and inject.
-  # `reason` is REQUIRED when blocking — Claude feeds it back as the
-  # continuation instruction — and hookSpecificOutput carries the same steering
-  # with the event-specific `hookEventName` the hooks schema expects.
-  output="$(jq -cn --arg ctx "$framed" \
-    '{decision:"block", reason:$ctx, hookSpecificOutput:{hookEventName:"Stop", additionalContext:$ctx}}')"
+  jq -cn --arg ctx "$framed" '{decision:"block",reason:$ctx,hookSpecificOutput:{hookEventName:"Stop",additionalContext:$ctx}}'
 else
-  # PostToolUse (and any other tool-boundary event): inject as added context,
-  # tagged with the firing event name per the Claude hooks schema.
-  output="$(jq -cn --arg ctx "$framed" --arg ev "${event_name:-PostToolUse}" \
-    '{hookSpecificOutput:{hookEventName:$ev, additionalContext:$ctx}}')"
+  jq -cn --arg ctx "$framed" --arg event "${event_name:-PostToolUse}" \
+    '{hookSpecificOutput:{hookEventName:$event,additionalContext:$ctx}}'
 fi
 
-# Emit the successful injection response before acknowledging any delivery.
-# If journaling then fails, the envelope remains and may be injected again; that
-# is intentional at-least-once behavior. The supervisor verifies every fenced
-# field and treats this journal—not upload—as acknowledgement.
-printf '%s\n' "$output"
-if ! mkdir -p "$PROCESSED_DIR"; then
-  # The valid hook response has already been emitted. Exit successfully so the
-  # host accepts the injection, but retain every envelope for at-least-once
-  # retry because none could be durably journaled.
-  exit 0
-fi
-for i in "${!valid_files[@]}"; do
-  envelope="${valid_envelopes[$i]}"
-  f="${valid_files[$i]}"
+mkdir -p "$PROCESSED_DIR" || exit 0
+for index in "${!valid_files[@]}"; do
+  file="${valid_files[$index]}"
+  envelope="${valid_envelopes[$index]}"
   delivery_id="$(printf '%s' "$envelope" | jq -r '.delivery_id')"
   journal="${PROCESSED_DIR}/${delivery_id}.json"
   temporary="${journal}.tmp"
-  if printf '%s' "$envelope" | jq -c '{
-      version: 1,
-      delivery_id,
-      request_hash,
-      issue_id,
-      session_id,
-      run_id,
-      native_session_id,
-      generation,
-      context_revision,
-      processed_at: (now | todateiso8601)
-    }' > "$temporary" &&
-    chmod 0600 "$temporary" &&
-    mv "$temporary" "$journal"; then
-    rm -f "$f"
+  if printf '%s' "$envelope" | jq -c '. + {processed_at:(now|todateiso8601)} | del(.body)' > "$temporary" &&
+     chmod 0600 "$temporary" && mv "$temporary" "$journal"; then
+    rm -f "$file"
   else
-    # A later journal must not turn a valid multi-message hook response into a
-    # nonzero exit after earlier receipts were committed. Retain only the failed
-    # envelope; successfully journaled deliveries remain exact acknowledgements.
-    if [ -f "$temporary" ] || [ -L "$temporary" ]; then
-      rm -f "$temporary"
-    fi
+    rm -f "$temporary"
   fi
 done
-exit 0

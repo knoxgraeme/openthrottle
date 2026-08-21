@@ -60,7 +60,7 @@ The repair chain must therefore close activation, authority, state-machine, and 
 #### Sandbox and evidence authority
 
 - RR11. Executor-created worktrees must be usable by the unprivileged agent in the built image and start at the exact integration head. Executor-private paths must be action-attempt namespaced and unreadable and unwritable by the agent, including through absolute paths, symlinks, Git alternates, hooks, process-visible descriptors, or sibling action state.
-- RR12. Each loop action must materialize only its declared logical credentials and MCP servers from a clean trusted baseline, without importing personal configuration or exposing provider secret identifiers. Cleanup must remove files, caches, sockets, subprocess environment, and rotated state before any subsequent worker, lead, reviewer, or retained worktree can read them.
+- RR12. Each loop action must materialize only its declared logical credentials from a clean trusted baseline, without importing personal or MCP configuration or exposing provider secret identifiers. Cleanup must remove files, caches, sockets, subprocess environment, and rotated state before any subsequent worker, lead, reviewer, or retained worktree can read them.
 - RR13. Every standard receipt must bind the exact graph, parent attempt/run/request, unit/action attempt, generation, native session, producer and skill digest, input subject, output subject, artifact hashes, and assurance class required for its gate.
 - RR14. The final review skill must be report-only. All edits after whole-change review must occur through the dedicated final-repair action and invalidate the prior review receipt.
 

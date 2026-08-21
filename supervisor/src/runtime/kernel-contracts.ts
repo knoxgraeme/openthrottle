@@ -3,11 +3,13 @@ import type {
   CompiledPipelineStage,
   DefinitionBundleEntry,
   ExecutionRecord,
+  FilesystemConfigContract,
   ResultCandidate,
   ResultNormalizationDiagnostic,
   SemanticResultSchemaContract,
 } from "@openthrottle/contracts";
 import type { KernelAttempt } from "../pipeline/kernel/types.js";
+import type { KernelRuntimeResourceIdentity } from "../pipeline/kernel/runtime-resource.js";
 
 export const KERNEL_ACTION_REQUEST_SCHEMA = "openthrottle.kernel-action-request/v1" as const;
 export const KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA =
@@ -29,6 +31,8 @@ export interface KernelChangeBoundary {
 export interface KernelAgentAction {
   kind: "agent";
   engine: Extract<CompiledPipelineStage, { kind: "agent" }>["engine"];
+  model: string | null;
+  reasoning_effort: Exclude<FilesystemConfigContract["reasoning_effort"], undefined> | null;
   agent_id: string;
   skill_ids: readonly string[];
   entry_skill: string | null;
@@ -65,6 +69,7 @@ export interface KernelWorkActionRequest {
   worker_id: string;
   task_prompt: string;
   context: KernelActionContext;
+  runtime_resource: KernelRuntimeResourceIdentity | null;
   change_boundary: KernelChangeBoundary | null;
   action: KernelExecutableAction;
   executor_policy: {
@@ -78,6 +83,9 @@ export interface KernelWorkActionRequest {
 export interface KernelResultCorrectionRequest {
   schema: typeof KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA;
   phase: "result_correction";
+  engine: Extract<CompiledPipelineStage, { kind: "agent" }>["engine"];
+  model: string | null;
+  reasoning_effort: Exclude<FilesystemConfigContract["reasoning_effort"], undefined> | null;
   pipeline_run_id: string;
   attempt_id: string;
   stage_id: string;
@@ -87,6 +95,8 @@ export interface KernelResultCorrectionRequest {
   input_subject: string;
   /** The immutable subject produced by work, or the inspected input subject. */
   locked_subject: string;
+  /** Original work authority; correction itself remains inspect-only. */
+  completed_work_authority: KernelAttempt["repository_authority"];
   checkpoint_id: string;
   native_session_id: string;
   lease_id: string;
@@ -149,9 +159,35 @@ export type KernelRuntimeOutcome =
     diagnostics: readonly { path: string; detail: string }[];
   };
 
+export interface KernelRuntimeLeaseCallbacks {
+  /**
+   * The adapter throttles renewal to this interval while provider work is
+   * outstanding. A rejected renewal is an exact-fence loss and must abort
+   * result acceptance.
+   */
+  heartbeat_interval_ms: number;
+  on_heartbeat(): Promise<void>;
+}
+
+export interface KernelRuntimeWorkCallbacks extends KernelRuntimeLeaseCallbacks {
+  /**
+   * Agent executors must await this exactly once as soon as the provider-native
+   * conversation exists, before work can finish or emit a checkpoint. Command
+   * executors never call it. The callback durably binds the session while the
+   * attempt's started work lease is still live.
+   */
+  on_session(nativeSessionId: string): Promise<void>;
+}
+
 export interface KernelRuntimePort {
-  executeWork(request: KernelWorkActionRequest): Promise<KernelRuntimeOutcome>;
-  correctResult(request: KernelResultCorrectionRequest): Promise<KernelRuntimeOutcome>;
+  executeWork(
+    request: KernelWorkActionRequest,
+    callbacks: KernelRuntimeWorkCallbacks,
+  ): Promise<KernelRuntimeOutcome>;
+  correctResult(
+    request: KernelResultCorrectionRequest,
+    callbacks: KernelRuntimeLeaseCallbacks,
+  ): Promise<KernelRuntimeOutcome>;
 }
 
 export interface KernelRuntimeCompatibilityPort {

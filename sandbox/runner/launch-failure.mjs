@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { sanitizeArtifactText } from "./artifacts.mjs";
+import { sanitizeArtifactText } from "./kernel-json.mjs";
 
 // Bounded launch diagnostics. Every agent-launch failure used to reach the
 // operator as one indistinguishable line with an empty `Executor diagnostic:`
@@ -245,7 +245,7 @@ function decisiveEngineFieldsFromFinalResultLine(stdout) {
 // True when the engine's own final answer is an unregistered-command
 // refusal -- a clean-looking (often exit 0) response that is nonetheless not
 // a real completion: the requested skill was never discoverable, so nothing
-// downstream (a receipt, a proposal, real work) was ever produced. Read from
+// downstream (a result candidate or real work) was ever produced. Read from
 // the engine's own final `result` text rather than scanning raw stdout: a
 // legitimate transcript can otherwise quote or discuss that exact phrase
 // without it being the engine's own terminal answer.

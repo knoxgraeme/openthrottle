@@ -51,7 +51,6 @@ function completeProjectConfig(overrides: Partial<ProjectConfig> = {}): ProjectC
     },
     post_bootstrap: ["npm install"],
     limits: { max_turns: 200, task_timeout: 7_200 },
-    mcp_servers: {},
     ...overrides,
   };
 }
@@ -108,7 +107,6 @@ describe("filesystem config scaffolding", () => {
       },
       post_bootstrap: ["npm install"],
       limits: { max_turns: 200, task_timeout: 7_200 },
-      mcp_servers: {},
     });
     expect(existsSync(join(directory, ".openthrottle.yml"))).toBe(false);
     expect(existsSync(join(directory, ".openthrottle", "skills.lock.json"))).toBe(false);
@@ -117,7 +115,7 @@ describe("filesystem config scaffolding", () => {
     }
   });
 
-  it("preserves engine, model, commands, bootstrap, limits, and MCP configuration", () => {
+  it("preserves engine, model, commands, bootstrap, and limits", () => {
     const document = projectConfigDocument(completeProjectConfig({
       pipeline: "repo/custom",
       engine: "claude",
@@ -125,9 +123,6 @@ describe("filesystem config scaffolding", () => {
       reasoning_effort: "high",
       post_bootstrap: ["pnpm install", "pnpm db:prepare"],
       limits: { max_turns: 40, task_timeout: 900 },
-      mcp_servers: {
-        docs: { command: "docs-mcp", args: ["serve"], env: { MODE: "local" } },
-      },
     }));
 
     expect(document).toMatchObject({
@@ -138,7 +133,6 @@ describe("filesystem config scaffolding", () => {
       reasoning_effort: "high",
       post_bootstrap: ["pnpm install", "pnpm db:prepare"],
       limits: { max_turns: 40, task_timeout: 900 },
-      mcp_servers: { docs: { command: "docs-mcp", args: ["serve"], env: { MODE: "local" } } },
     });
     expect(renderProjectConfig(completeProjectConfig())).not.toMatch(/\bagent:/);
     expect(renderProjectConfig(completeProjectConfig())).not.toMatch(/default_graph|graphs:|skills\.lock/);
@@ -160,9 +154,6 @@ describe("filesystem config scaffolding", () => {
   });
 
   it("uses the strict shared config contract before writing", () => {
-    expect(() => projectConfigDocument(completeProjectConfig({
-      mcp_servers: { dangerous: { command: "server", env: { GITHUB_TOKEN: "secret" } } },
-    }))).toThrow(/provider-secret/);
     expect(() => projectConfigDocument(completeProjectConfig({
       engine: "opencode",
       reasoning_effort: "high",

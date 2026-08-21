@@ -103,5 +103,5 @@ The plan is ready only when:
 - each structured unit can execute without surrounding plan prose;
 - planning-owned questions are resolved;
 - implementation-owned unknowns are explicitly deferred;
-- the chosen graph and verification posture are known;
+- the chosen pipeline, unit dependency order, and verification posture are known;
 - no research limitation is being concealed.

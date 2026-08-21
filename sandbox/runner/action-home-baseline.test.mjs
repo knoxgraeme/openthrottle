@@ -99,7 +99,7 @@ describe("action home baseline materialization", () => {
     const source = mkdtempSync(join(tmpdir(), "ot-codex-source-"));
     const destination = mkdtempSync(join(tmpdir(), "ot-codex-destination-"));
     directories.push(source, destination);
-    writeFileSync(join(source, "config.toml"), "mcp_servers = { leaked = {} }\n");
+    writeFileSync(join(source, "config.toml"), "model = \"ambient-model\"\n");
     writeFileSync(join(source, "AGENTS.md"), "mutable instructions\n");
     chmodSync(join(source, "config.toml"), 0o600);
     chmodSync(join(source, "AGENTS.md"), 0o600);

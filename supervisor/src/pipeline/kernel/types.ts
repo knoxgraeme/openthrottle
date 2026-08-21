@@ -12,6 +12,10 @@ import type {
 export const KERNEL_RUN_SCHEMA = "openthrottle.kernel-run/v1" as const;
 export const KERNEL_ATTEMPT_SCHEMA = "openthrottle.kernel-attempt/v1" as const;
 export const ATOMIC_TRANSITION_SCHEMA = "openthrottle.atomic-transition/v1" as const;
+export const EXTERNAL_SCHEDULE_REDUCER = "core/external-schedule@1" as const;
+export const EXTERNAL_SCHEDULE_PAYLOAD_SCHEMA =
+  "openthrottle.external-schedule/v1" as const;
+export const MAX_EXTERNAL_EFFECTS_PER_PHASE = 16;
 
 export type KernelRunStatus =
   | "pending"
@@ -126,6 +130,7 @@ export interface KernelAttempt {
   lease: AttemptLease | null;
   checkpoint_id: string | null;
   result_record_id: string | null;
+  decision_record_id: string | null;
   pending_result: ResultPendingState | null;
 }
 
@@ -165,6 +170,24 @@ export interface StartAttemptCommand extends KernelCommandBase {
   lease_id: string;
 }
 
+export interface BindRuntimeSessionCommand extends KernelCommandBase {
+  type: "bind_runtime_session";
+  attempt_id: string;
+  expected_run_version: number;
+  expected_cursor_version: number;
+  expected_attempt_version: number;
+  request_hash: string;
+  definition_bundle_hash: string;
+  input_subject: string;
+  lease_id: string;
+  worker_id: string;
+  lease_purpose: AttemptLeasePurpose;
+  expected_lease_expires_at: string;
+  expected_work_retry_ordinal: number;
+  expected_result_correction_count: number;
+  native_session_id: string;
+}
+
 export interface WorkCompleteCommand extends KernelCommandBase {
   type: "work_complete";
   attempt_id: string;
@@ -186,6 +209,30 @@ export interface RecordResultCommand extends KernelCommandBase {
   record_id: string;
 }
 
+export interface ScheduleExternalCommand extends KernelCommandBase {
+  type: "schedule_external";
+  attempt_id: string;
+  checkpoint_id: string;
+  decision_record_id: string;
+  phase: string;
+  verified_output_subject: string | null;
+  effect_intents: readonly EffectIntent[];
+}
+
+/**
+ * The sole post-effect repository advance. It is intentionally specific to
+ * core/integrate-unit@1: a confirmed Daytona integration DeliveryRecord
+ * promotes ordinal-0 planning evidence to one verified ordinal-1 Git bundle.
+ */
+export interface AdvanceExternalIntegrationCommand extends KernelCommandBase {
+  type: "advance_external_integration";
+  attempt_id: string;
+  prior_checkpoint_id: string;
+  checkpoint_id: string;
+  delivery_record_id: string;
+  verified_output_subject: string;
+}
+
 export interface SettleAttemptCommand extends KernelCommandBase {
   type: "settle";
   attempt_id: string;
@@ -204,7 +251,20 @@ export interface RetryAttemptCommand extends KernelCommandBase {
 interface TerminalCommandBase extends KernelCommandBase {
   decision_record_id: string;
   reason: string;
+  resource_disposition: KernelTerminalResourceDisposition;
 }
+
+export type KernelTerminalResourceDisposition =
+  | {
+    /** Reducer independently proves the provision schedule never committed. */
+    kind: "pre_provision";
+  }
+  | {
+    /** Exact confirmed Daytona create evidence authorizes stop + cleanup. */
+    kind: "cleanup";
+    runtime_delivery_record_ids: readonly string[];
+    cleanup_attempt: KernelAttempt;
+  };
 
 export interface NeedsHumanCommand extends TerminalCommandBase {
   type: "needs_human";
@@ -226,8 +286,11 @@ export interface SupersedeCommand extends TerminalCommandBase {
 
 export type KernelCommand =
   | StartAttemptCommand
+  | BindRuntimeSessionCommand
   | WorkCompleteCommand
   | ResultPendingCommand
+  | ScheduleExternalCommand
+  | AdvanceExternalIntegrationCommand
   | RecordResultCommand
   | SettleAttemptCommand
   | RetryAttemptCommand

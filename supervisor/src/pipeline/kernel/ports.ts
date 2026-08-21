@@ -1,10 +1,15 @@
 import type {
   AttemptCheckpoint,
   CompiledPipelineManifest,
+  CompiledPipelineStage,
   DefinitionBundle,
+  DeliveryRecord,
+  DecisionRecord,
   EffectIntent,
   ExecutionRecord,
+  ResultRecord,
 } from "@openthrottle/contracts";
+import type { EvaluatedKernelResult } from "./evaluator-registry.js";
 import type { EffectReconciliation } from "./effect-intent.js";
 import type {
   AtomicTransitionBundle,
@@ -59,6 +64,16 @@ export interface KernelAttemptLeasePort {
     worker_id: string;
     expires_at: string;
   }): Promise<AttemptLease>;
+  /**
+   * Reclaims expired leases without inventing a new attempt, retry ordinal,
+   * lease identity, or worker identity. Returning the original fence lets the
+   * runtime reconcile an already-written result/session before relaunch.
+   */
+  recoverExpiredAttemptLeases(input: {
+    observed_at: string;
+    expires_at: string;
+    limit: number;
+  }): Promise<readonly LeasedAttemptView[]>;
 }
 
 export interface LeasedEffectView {
@@ -66,6 +81,12 @@ export interface LeasedEffectView {
   lease_id: string;
   expires_at: string;
   execution_mode: "dispatch_or_reconcile" | "reconcile_only";
+  reconciliation_ordinal: number;
+  /** Immutable identity of the one executor dispatch, retained across reconciliation leases. */
+  dispatch_fence: {
+    lease_id: string;
+    worker_id: string;
+  } | null;
 }
 
 export interface KernelEffectPort {
@@ -88,6 +109,50 @@ export interface KernelEffectPort {
     worker_id: string;
     reconciliation: EffectReconciliation;
   }): Promise<void>;
+}
+
+export interface ExternalScheduleEffectView {
+  intent: EffectIntent;
+  delivery: DeliveryRecord | null;
+}
+
+export interface ExternalScheduleView {
+  semantic_key: string;
+  decision: DecisionRecord;
+  effects: readonly ExternalScheduleEffectView[];
+}
+
+export interface KernelExternalSettlementPlan {
+  decision: DecisionRecord;
+  outcome: string;
+  next_attempts: readonly KernelAttempt[];
+  next_dependencies?: Readonly<Record<string, readonly string[]>>;
+}
+
+export interface KernelExternalSettlementPlanner {
+  plan(input: {
+    view: ReductionView;
+    stage: Extract<CompiledPipelineStage, { kind: "effect" | "wait" }>;
+    attempt: KernelAttempt;
+    result: ResultRecord;
+    checkpoint: AttemptCheckpoint;
+    bundle: DefinitionBundle;
+    schedules: readonly ExternalScheduleView[];
+    evaluated: EvaluatedKernelResult;
+    default_plan: () => Promise<KernelExternalSettlementPlan>;
+  }): Promise<KernelExternalSettlementPlan>;
+}
+
+export interface KernelExternalSchedulePort {
+  /** Indexed, exact semantic-key lookup; never scans an arbitrary run corpus. */
+  findExternalSchedule(input: {
+    pipeline_run_id: string;
+    attempt_id: string;
+    phase: string;
+  }): Promise<ExternalScheduleView | null>;
+  listReadyExternalAttempts(input: {
+    limit: number;
+  }): Promise<readonly { pipeline_run_id: string; attempt_id: string }[]>;
 }
 
 export interface ResolvedKernelContext {
@@ -115,6 +180,35 @@ export interface KernelAttemptRequestPort {
   }): Promise<KernelAttemptRequestInputs>;
 }
 
+export interface StructuredPlanningReadRequest {
+  pipeline_run_id: string;
+  definition_bundle_hash: string;
+  scope_kind: "loop_item" | "fanout_member";
+  parent_attempt_id: string;
+  scope_group_id: string;
+  stage_ids: readonly string[];
+  member_ids: readonly string[];
+}
+
+/**
+ * One fully settled structured Attempt reconstructed through explicit indexed
+ * scope selectors. The Decision relation is persisted on the Attempt; readers
+ * never discover it by scanning Decision payload JSON.
+ */
+export interface SettledStructuredPlanningAttempt {
+  attempt: KernelAttempt;
+  result: Extract<ExecutionRecord, { kind: "result" }>;
+  decision: DecisionRecord;
+  checkpoint: AttemptCheckpoint;
+  request_inputs: KernelAttemptRequestInputs;
+}
+
+export interface KernelStructuredPlanningReadPort {
+  listSettledStructuredPlanningAttempts(
+    request: StructuredPlanningReadRequest,
+  ): Promise<readonly SettledStructuredPlanningAttempt[]>;
+}
+
 export interface KernelDefinitionBundleBytesPort {
   loadExactDefinitionBundleBytes(input: {
     pipeline_run_id: string;
@@ -136,31 +230,4 @@ export interface KernelContextPort {
     allowed_record_ids: readonly string[];
     allowed_checkpoint_ids: readonly string[];
   }): Promise<ResolvedKernelContext>;
-}
-
-export interface KernelRunProjection {
-  pipeline_run_id: string;
-  pipeline_id: string;
-  status: KernelRun["status"];
-  stage_id: string | null;
-  current_subject: string;
-  active_attempt_count: number;
-  active_effect_count: number;
-  version: number;
-}
-
-export interface KernelLogProjection {
-  sequence: number;
-  kind: "attempt" | "record" | "effect" | "checkpoint" | "transition";
-  identity: string;
-  summary: string;
-}
-
-export interface KernelProjectionPort {
-  getRunProjection(pipelineRunId: string): Promise<KernelRunProjection | undefined>;
-  listRunLog(input: {
-    pipeline_run_id: string;
-    after_sequence?: number;
-    limit: number;
-  }): Promise<readonly KernelLogProjection[]>;
 }

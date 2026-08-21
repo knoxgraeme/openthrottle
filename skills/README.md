@@ -1,315 +1,184 @@
-# Skills
+# OpenThrottle skills and agent instructions
 
-Task skills (`skills/tasks/`) are self-contained stage and loop adapters: each
-one carries its own craft — implementation discipline, review lenses,
-simplification heuristics, diagnostic method — instead of delegating to a
-second-hop toolkit. The supervisor selects a versioned pipeline manifest; each
-agent stage or structured-loop action invokes one canonical adapter for the
-capability named in its sealed request. Local planning uses two adapters:
-`skills/planning/ot-plan` researches and authors the human implementation plan
-and supports focused deepening and independent document review, while
-`skills/planning/prepare-execution-plan` normalizes a completed plan or task
-specification into the structured execution contract without adding scope,
-acceptance criteria, or verification commands.
+OpenThrottle separates stable role identity from reusable procedure.
+
+- `.openthrottle/agents/<id>/instructions.md` defines how an agent should think
+  and the limits of its role.
+- `.openthrottle/skills/<id>/SKILL.md` defines a procedure that a pipeline may
+  disclose for one action.
+- The sealed action prompt supplies the task, exact subject, selected context,
+  and output contract.
+
+An agent therefore starts with **instructions + task prompt + an allowlist of
+progressively disclosed skills**. A `SKILL.md` is not the agent's standing
+system prompt, and an agent file does not enumerate all procedures it might ever
+use.
+
+## Layout
 
 ```text
+.openthrottle/
+  agents/<namespace>/<name>/instructions.md
+  skills/<namespace>/<name>/SKILL.md
+  skills/<namespace>/<name>/references/<file>.md
+  pipelines/<namespace>/<name>/pipeline.yml
+  evals/<namespace>/<name>/eval.yml
+
 skills/
-  planning/<name>/SKILL.md          # planning-time authoring skills
-  planning/<name>/agents/openai.yaml
-  operator/openthrottle/SKILL.md    # explicit local operator skill
-  operator/openthrottle/agents/openai.yaml
-  tasks/<name>/SKILL.md             # canonical adapter, single source of truth
-  tasks/<name>/agents/openai.yaml   # Codex admin-scope policy
-  codex/AGENTS-fragment.md          # standing Codex runtime instructions
+  planning/<name>/SKILL.md       # local plan authoring
+  operator/<name>/SKILL.md       # local interactive operation
+  codex/AGENTS-fragment.md       # sandbox-wide Codex safety context
 ```
 
-Task skills run inside a sealed sandbox stage or structured-loop action. There
-is no task-name registry and no shell-owned end-to-end task loop. Pipeline
-manifests in `supervisor/pipelines/` own stage order, retries, gates, and
-terminal outcomes. `sandbox/runner/execute-stage.mjs` executes exactly one
-sealed stage and `sandbox/runner/execute-loop.mjs` executes exactly one sealed
-loop action; each writes exactly one typed result.
+Core runtime definitions are maintained under `.openthrottle/` and released as
+a sealed platform catalog. A repository can use those platform definitions or
+provide repository-owned definitions in the same layout. The `core/` namespace
+is reserved for the platform.
 
-Six stage-path skills adapt one agent stage each, keyed off the sealed
-request's `capability` (`sandbox/runner/execute-stage.mjs`'s
-capability→skill map, not task type). Five of them share the byte-identical
-standing-rules canon; `tune` follows the same single-stage shape but sits
-outside that five-skill canon and is tracked separately by the sandbox skill
-test suite:
+Files under `skills/planning/` and `skills/operator/` are not pipeline runtime
+definitions. The CLI installs them for a human's local agent. They may help
+author a plan, prepare a structured execution plan, trigger a run, or monitor a
+run, but they do not gain supervisor transition authority.
 
-- `implement-plan` (`ce/implement@1`) implements or repairs the approved plan.
-- `review-change` (`ce/review@1`) reviews the whole branch diff and returns
-  ranked, stable findings.
-- `simplify-change` (`ce/simplify@1`) simplifies the branch diff above an
-  entry-gate size/complexity threshold, preserving behavior.
-- `publish` (`ce/publish@1`) is the rolling-deployment compatibility adapter
-  for supervisors that still dispatch publication. Current supervisors own the
-  exact-SHA branch push and pull-request creation directly.
-- `investigate` (`ce/investigate@1`) diagnoses a reported defect and applies a
-  convergent fix only.
-- `tune` (`core/tune@1`) packages a sealed corpus as a `tune_analysis` receipt,
-  then emits a separate `tune_proposal` receipt for reviewable config or
-  unlocked skill-craft/reference changes under the sealed policy.
+## Agent instructions
 
-Automatic admission adds two read-only task packages through the same canonical
-delivery path:
+An instruction file is plain Markdown without skill frontmatter. Keep it short
+and stable. It should state:
 
-- `admission-plan` classifies the bounded implementation ticket as `simple`,
-  `structured`, or `needs_human` and emits a complete
-  `openthrottle.execution-plan/v2` only for structured work.
-- `review-admission-plan` runs in a fresh context and independently checks the
-  exact structured candidate for scope coverage, unsupported expansion,
-  dependency coherence, acceptance completeness, path plausibility, and
-  executable verification. It attests to the candidate bytes without rewriting
-  them.
+- the role's judgment boundary;
+- whether it reasons about a whole change, one unit, or one admission decision;
+- what it must not decide;
+- the fact that the executor owns Git, identity, state, and external effects.
 
-Both packages are safe built-in defaults. A repository may independently bind
-either planning role to a declared, pinned `repo://` package. Ticket text cannot
-select the package or change its digest. Planning actors are read-only and may
-not edit, publish, reroute, activate, or reuse one another's native session.
-Installing or scaffolding these packages alone does not enable automatic
-admission. The initializer sets `admission_mode: automatic` for Claude and
-Codex, and this repository enables it. OpenCode initialization omits that mode
-and uses direct routing until its structured execution path is supported. An
-absent value remains legacy for older or manually authored configurations.
+Repository authority is compiled from the pipeline, not inferred from prose.
+Writing “do not edit” in instructions is useful guidance but is not the
+security boundary.
 
-Structured graphs use five direct loop-path task adapters plus the orchestrated
-whole-change review packages:
+Current core roles are:
 
-- `implement-unit`, `simplify-unit`, and `repair-unit` implement, simplify, or
-  repair one execution-plan unit in its own worktree and return
-  `unit_completion` receipts.
-- `accept-unit` is the minimal lead scope-match decision and returns
-  `unit_decision`; it is explicitly not a code review.
-- `final-review` defines the canonical report-only producer contract used by
-  the supervisor's synthesized whole-change review receipt; the structured
-  path does not dispatch it as a second independent reviewer.
-- `final-repair` repairs exactly the validated findings the synthesized review raised, in an
-  executor-owned exact-base worktree, and returns `unit_completion`.
+- `ordinary-worker` — whole-change implementation, simplification, and repair;
+- `investigator` — evidence-led diagnosis and a scoped convergent fix;
+- `unit-worker` — implementation, simplification, or repair of one structured
+  unit;
+- `unit-lead` — narrow read-only unit acceptance;
+- `reviewer` — read-only whole-change or persona review;
+- `admission-planner` and `admission-reviewer` — independent read-only route and
+  plan judgments.
 
-Review fanout uses baseline and optional report-only persona packages. They
-install with the same task-skill baseline for every supported engine and emit
-independent `semantic_review` receipts:
+Do not create one agent per review lens. The reviewer role is stable; security,
+correctness, reliability, performance, project standards, and other lenses are
+skills selected per action.
 
-- `select-review-personas` chooses the deterministic roster from the sealed
-  review policy, always including the mandatory baseline personas when present.
-- `validate-review-findings` independently re-inspects proposed P0/P1 blockers
-  and returns only byte-exact findings that survive validation.
-- `correctness-dataflow` reviews changed value flow, state transitions,
-  ordering, and failure paths.
-- `tests-contracts` reviews executable proof and cross-boundary contracts.
-- `reliability-adversarial` optionally reviews retry, ordering, idempotency,
-  and silent-pass risks where changed code crosses durable or asynchronous
-  execution.
-- `agent-native-contracts` optionally reviews native session continuation,
-  prompt-boundary handling, receipt provenance, and tool-contract authority
-  where changed code crosses agent execution boundaries.
-- `security` optionally reviews authority, untrusted-input, injection, and
-  secret-handling risks where changed code crosses trust boundaries.
-- `data-migration` optionally reviews schema, backfill, persisted-record, and
-  serialized-contract compatibility risks.
-- `performance` optionally reviews hot-path queries, bounded work, resource
-  defaults, artifact retention, and scaling risks.
-- `project-standards` optionally reviews committed OpenThrottle standards such
-  as task packaging, manifests, architecture boundaries, and normative docs.
+## Runtime skills
 
-A repository-scoped skill may replace any of these when it emits the same
-`openthrottle.receipt/v1` or `openthrottle.stage-proposal/v1` contract. The
-coordinator evaluates the receipt and executor-derived Git/command evidence,
-not implementation details internal to the skill.
+Every runtime skill is self-contained and agent-neutral. Its YAML frontmatter
+declares only skill metadata; its body and referenced files carry the procedure.
+The compiler includes the exact selected package bytes in the DefinitionBundle.
+The sandbox materializes only that allowlist.
 
-The unit lead remains a minimal scope-match gate and never runs review personas.
-After all units integrate and final commands pass, the structured supervisor
-first dispatches `select-review-personas` with the exact subject and a sealed
-allowlist. It validates the selector's subject, policy digest, budget, ordered
-persona ids, and evidence rationales, then adds mandatory and deterministic
-risk-triggered lenses. Every selected persona runs as its own fresh, read-only
-loop action; personas never spawn other personas. Missing, duplicate,
-unexpected, or wrong-subject receipts fail closed. P0/P1 findings cannot reach
-the final gate until the separate `validate-review-findings` action reproduces
-and returns them byte-for-byte. Each persona is bounded by the sealed
-`max_findings` value (eight in the current policy); overflow must be disclosed
-as `needs_human`, never silently truncated. P2/P3 findings remain advisory
-journal entries and are excluded from the final-repair-authoritative receipt.
-The supervisor synthesizes the final receipt only after those fences settle,
-binding selector, persona, validator, and command hashes into its evidence.
-After repair, selector authority requires the exact prior ordered roster and
-the roster digest must match before a rereview can settle.
+A skill should contain:
 
-Review journal contracts keep this assurance measurable without granting the
-persisted history transition authority. Before the live gate settles, the
-supervisor validates and appends one complete `openthrottle.review-journal/v1`
-record through `orchestration_journal`. It digests the sealed selection, per-persona receipt
-evidence, synthesis, validation, repair disposition, finding resolution, and
-aggregate measurements. Cross-references bind persona receipts to the reviewed
-subject and selected roster; finding ids to exact/semantic dedup membership,
-validator outcome, corroboration, repair disposition, convergence cycle, and
-resolution state; and aggregate finding, latency, and measured-cost totals back
-to those typed records. Semantic groups preserve the existing canonical finding
-and record every cross-lens member id and reporting persona without inventing a
-new finding. Rereview reads the newest bounded history window; missing or corrupt
-history is recorded as an audit gap and cannot fail or authorize the live gate.
-Later self-learning stages may analyze that corpus, but cannot mutate a live
-roster or gate from journal data.
+1. when and how to apply the procedure;
+2. a bounded sequence or rubric;
+3. evidence expectations;
+4. uncertainty and escalation rules;
+5. references used only when the procedure needs deeper detail.
 
-## Delivery per agent
+Keep role language in `instructions.md`. Keep action-specific task facts in the
+sealed prompt. Keep deterministic validation in an eval or executor primitive.
+Do not ask the model to reproduce request hashes, subjects, bundle hashes,
+timestamps, session IDs, or other executor-owned identity.
 
-The canonical `SKILL.md` is maintained once:
+References provide native progressive disclosure. A `SKILL.md` may point to its
+own `references/` files; the runtime must make those files available without
+inlining every reference into the initial prompt. A skill cannot discover an
+unlisted sibling package or widen tools, MCP servers, credentials, repository
+scope, or repository authority.
 
-| Agent | Delivery |
+Core procedures currently cover:
+
+- ordinary implementation, review, simplification, and investigation;
+- structured unit implementation, simplification, acceptance, and repair;
+- whole-change repair;
+- reviewer-persona selection, focused review lenses, and finding validation;
+- automatic admission planning and independent plan review.
+
+Pipeline files own ordering, loops, bounds, retries, remediation, commands,
+publication, and provider waits. Skills never call another orchestration system
+or run an end-to-end pipeline themselves.
+
+## Evals and semantic output
+
+Every agent stage names one `.openthrottle/evals/<id>/eval.yml`. The eval binds:
+
+- the allowed semantic outcomes;
+- the bounded payload fields and types;
+- a registered deterministic evaluator;
+- any explicitly allowed normalization.
+
+The agent submits only `openthrottle.result-candidate/v1`. The executor validates
+and normalizes it, then authors the authoritative ResultRecord. For example,
+core result schemas allow `string-array-to-newlines/v1` on `payload.summary`;
+an array is joined with newlines and the transformation hashes are recorded.
+
+If output remains invalid, successful work is retained at its checkpoint and
+the same native session receives one bounded result-correction action. That
+action has inspect authority, no provider access or MCP, and only the
+`ot-result` tool. A formatting correction never reruns implementation.
+
+## Inspect and edit actions
+
+Skills do not own repository authority:
+
+| Authority | Repository view | Typical skills |
+|---|---|---|
+| `inspect` | immutable exact-subject checkout, disabled remotes, native read-only tools | planning, review, selection, acceptance, validation, result correction |
+| `edit` | isolated writable content tree, executor-owned Git metadata | implementation, simplification, investigation fix, remediation |
+
+Inspect actions may use native read/search CLI features. They may not make the
+repository writable. Tests or builds that create artifacts execute as separate
+deterministic command Attempts. A blocking reviewer result schedules an edit
+Attempt rather than applying a small fix in the review context.
+
+No action may commit, push, publish, open a pull request, or claim an external
+mutation. The executor captures changed content, computes the exact output
+subject, integrates accepted checkpoints, and drains Effects.
+
+## Delivery by engine
+
+The same selected instruction and skill bytes are delivered to every supported
+engine:
+
+| Engine | Delivery |
 |---|---|
-| Claude | `sandbox/entrypoint.sh` copies the canonical task skills to `~/.claude/skills/`; the stage prompt invokes `/<skill-name>`. |
-| Codex | `sandbox/Dockerfile` bakes the same directories into `/etc/codex/skills/`; `agents/openai.yaml` disables implicit invocation and the prompt explicitly invokes `$<skill-name>`. |
-| OpenCode | The entrypoint strips YAML frontmatter from the same canonical file, inlines every `references/*.md` file the skill carries, and renders the result into the stage prompt — because the pinned CLI cannot safely discover only sandbox-owned external skills, a `references/` pointer would otherwise be unresolvable. |
+| Claude | materialize the sealed packages in the action's private Claude skill root and invoke the entry skill explicitly |
+| Codex | materialize the sealed packages in the action's admin-owned Codex skill root and invoke the entry skill explicitly |
+| OpenCode | materialize a sealed native skill root; capability admission fails if selective disclosure cannot be enforced |
 
-Planning skills use the same one-body-per-skill layout, but they are packaged
-for local authoring tools instead of sealed stage execution. A planning skill
-may call local CLI validators; it must not mutate Linear, publish branches, or
-claim runtime gate authority.
+Engine adapters may change delivery mechanics only. They must not maintain a
+second copy of instructions or skill bodies and must not inline the full
+allowlist as a fallback.
 
-`openthrottle init` materializes repository-owned starting
-copies of `implement-plan`, `admission-plan`, and `review-admission-plan` under
-`.openthrottle/skills/`. The generated config declares all three and binds the
-planner and reviewer independently. The provenance lock covers every package
-file, including `agents/openai.yaml` and `references/`; refresh refuses to
-overwrite a local edit or an untracked package file until an operator resolves
-and explicitly accepts the update.
+Native session continuation is action context. The executor binds the provider
+session ID to the live Attempt before work can finish. Result correction uses
+that same session; retries clear it unless the pipeline explicitly requests a
+correction of completed work.
 
-The operator skill under `skills/operator/openthrottle/` is also local-only,
-but it is for an interactive human operator rather than plan authoring. During
-`openthrottle init`, the CLI installs it and `skills/planning/ot-plan/` through
-pinned Skillfish into detected user-global agent skill directories. The
-explicit `operator-skill` and `planning-skill` commands manage their separate
-lifecycles. Neither may be copied into `.openthrottle/skills` or treated as a
-sealed Daytona task adapter.
+## Authoring checklist
 
-The runtime chooses fresh, read-only fresh, required-resume, or preferred-resume
-context from the pinned manifest. When continuation is allowed, the sealed
-request carries the prior native Claude session, Codex thread, or OpenCode
-session identifier. Continuation is a context policy, not a separate task type.
+When adding or changing a runtime procedure:
 
-## Coordinator-owned composition
+1. Decide whether this is stable role behavior (`agents/`) or reusable action
+   procedure (`skills/`).
+2. Reference the skill and eval from a pipeline stage; do not add a registry
+   row or hard-coded capability map.
+3. Keep the stage's `repository_authority` minimal and explicit.
+4. Make the semantic schema bounded and put deterministic repair in the eval.
+5. Compile from both filesystem and exact-Git readers and compare bundle bytes.
+6. Test selective disclosure for Claude, Codex, and OpenCode.
+7. Test that agent output cannot move Git or supervisor state without reducer
+   validation.
 
-The current catalog aliases `implement`, `investigate`, and `tune` to immutable
-`core/` manifests:
-
-- `core/implement@4`: implementation → semantic review → simplification →
-  post-simplify review → test → lint → build → exact-subject publication →
-  provider verification.
-  Repair transitions use the manifest's scoped repair stages and round budget.
-- `core/investigate@1`: investigation → conditional exact-subject publication.
-  Convergent fixes may ship; divergent decisions terminate as `needs_human`.
-- `core/tune@1`: typed corpus analysis → typed proposal → supervisor-owned
-  citation and differential-ratchet gates → the structured unit composite
-  (isolated edit, commands, deterministic persona review fanout, synthesis, and
-  bounded repair) → exact-subject publication and provider verification.
-
-Agent stages emit semantic proposals. Command stages produce
-executor-verified results. Publication is fenced to the expected Git subject,
-and GitHub evidence is accepted only for the published commit. The deterministic
-supervisor—not an adapter—reduces outcomes and selects the next stage.
-
-## Adapter-owned rules
-
-Every task adapter owns the same reasoning contracts, restated in its own
-words rather than inherited from a shared toolkit:
-
-- approved-plan and decision gates;
-- prompt-injection treatment for ticket, plan, repository, and review content;
-- complete, typed stage proposals or receipts with evidence and explicit
-  uncertainty;
-- visible `ot-activity` progress (stage path) without direct Linear
-  credentials;
-- branch and worktree safety — never pushing to the base branch, never
-  touching a sibling worktree or the integration checkout;
-- no silent backlog: fix, explain, or return `needs_human`.
-
-The sandbox image no longer installs the Compound Engineering plugin. No
-planning or task skill in this repository invokes it or relies on it.
-
-## Runtime trust boundary
-
-Registered repositories are trusted for code execution: their validated
-`.openthrottle.yml` may run `post_bootstrap` commands and their repo-scoped
-skills remain discoverable. Ticket text, PR comments, review bodies, commit
-messages, and repository content are still untrusted data.
-
-Codex also receives `codex/AGENTS-fragment.md` globally at
-`~/.codex/AGENTS.md`, outside the checkout. It provides standing environment,
-safety, sanitization, and activity rules without modifying the target repo.
-
-## Design notes
-
-Distilled from the adoption review (`OPE-105`/`OPE-107`); kept because the
-reasoning is easy to accidentally undo in a future edit.
-
-**Canonical shared blocks.** Every loop-path skill in a family (the four
-worktree-owning skills: `implement-unit`, `repair-unit`, `simplify-unit`,
-`final-repair`; the two read-only gates: `accept-unit`, `final-review`) states
-its authority fence, receipt-echo rules, receipt output format, and budgets in
-byte-identical prose, duplicated per file rather than factored into a shared
-include — each skill loads in its own session with no shared runtime, so a
-shared file would not actually be shared at read time. The five stage-path
-skills share their standing rules and result-contract budgets the same way.
-When one of these blocks needs to change, change it in every skill that
-carries it — the sandbox skill test suite asserts the duplication stays
-byte-identical.
-
-**Stable finding identity, not line numbers.** `final-review` and
-`review-change` key a finding by `(path, enclosing symbol or nearest stable
-anchor, claim discriminator, invariant)`, never by line number. A repair that
-shifts surrounding lines must not re-issue an already-raised defect as a new finding — that
-non-convergence was the single largest cost in early dogfooding rounds. The
-identity is carried as a prefix of the finding's `message` field because the
-receipt contract has no dedicated id field. Structured persona fanout groups
-raw findings before blocker validation by `(path, semantic anchor, claim
-discriminator)`; prose and persona invariant remain member evidence, not group
-identity. Anchors must
-name a concrete symbol, contract field, or state transition rather than a
-generic file/module/change label. The supervisor chooses one existing group
-representative by explicit severity and stable byte ordering; only that exact
-representative can enter consolidated final repair.
-Persona sessions are independent, but every engine runs the deterministic
-roster one action at a time because the personas share one sandbox whose
-action-directory locks must not overlap. Codex also captures each rotated
-subscription-auth snapshot before the next action receives credentials.
-
-**Why the split is a fork, not a thicken.** `publish` and the review/simplify
-stages could have wrapped a shared external toolkit instead of restating its
-logic. The fork was chosen because delegation's failure modes were structural,
-not cosmetic: an unenforced second hop (nothing verified the delegated skill
-actually ran before the fence checked only `producer.skill`), a commit
-authority collision (a delegated implementation skill's own shipping tail
-tried to commit inside an executor-owned worktree), and unbounded elicitation
-in a headless session with no user to answer a blocking question. A thin
-wrapper cannot hold any of those back; each self-contained skill states its
-own authority fence and receipt contract directly.
-
-**`ot-subject-post` and the negative-hash rule.** The four worktree-owning
-skills copy `subject.post` from the `ot-subject-post` helper rather than
-hand-deriving it with `git` — the executor recomputes the same value
-independently and rejects a mismatch, so a hand-derived value is redundant at
-best and silently wrong at worst. The same four skills are told, explicitly,
-never to copy a prior receipt's hash into their own `evidence` array, but the
-reason splits in two: `implement-unit` and `simplify-unit` receive no prior
-evidence at all — a first implement or simplify attempt has nothing to
-receive — so the instinct to echo something from the prompt is always wrong
-for them. `repair-unit` and `final-repair` do receive prior evidence (the
-triggering lead decision and failing command receipts, or the triggering
-review, respectively — `PRIOR_EVIDENCE_ROLES` covers `lead`, `repair`,
-`final_review`, `final_repair`), but the link back to what triggered the
-repair is bound deterministically by the executor through
-`fence.request_hash`, not by the agent copying a hash, so echoing it would be
-redundant at best. `accept-unit` remains the read-only gate that must echo its
-prior-evidence hashes verbatim. Structured final review instead binds command,
-selector, persona, and validator evidence in the supervisor-synthesized
-receipt, so no review persona can claim that gate authority.
-
-**Bounded selection, deterministic rereview.** The initial structured review
-combines a mandatory baseline, a selector recommendation constrained to the
-sealed allowlist, and deterministic plan/command risk triggers. The supervisor
-owns ordering and the bound. Once a repair cycle begins, the prior ordered
-persona ids become required selector authority; changed rationales cannot add,
-drop, or reorder lenses. This preserves relevant depth on the first pass and a
-stable comparison surface on every rereview. Stage-path `review-change` and
-both simplification adapters retain their own fixed ordered lenses.
+Runtime definitions must not depend on Compound Engineering or another
+second-hop toolkit. If a procedure is important to an OpenThrottle action, keep
+its necessary craft in the selected OpenThrottle skill package.

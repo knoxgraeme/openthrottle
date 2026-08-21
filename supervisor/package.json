@@ -11,8 +11,7 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
-    "docs:pipelines": "tsx scripts/render-pipelines.mjs",
-    "verify:v12-deploy-proof": "node scripts/verify-v12-deploy-proof.mjs",
+    "replace:offline": "node scripts/offline-replace.mjs",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage"
   },

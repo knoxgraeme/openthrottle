@@ -1,1831 +1,639 @@
 # OpenThrottle specification
 
-This document is the normative contract for OpenThrottle. The execution-kernel
-replacement described below is one release unit: intermediate commits are not
-deployable, and the target epoch becomes live only after the offline replacement
-proof succeeds. Existing graph, catalog, stage-receipt, and structured-unit
-passages remain characterization inventory until their owning implementation
-unit removes them. Where that inventory conflicts with the target-epoch
-contract, the target-epoch contract takes precedence for all new code.
+Status: normative for the filesystem-definition and execution-kernel release.
+Executable validators and the fresh epoch SQL are the byte-level authority for
+their respective formats; this document defines how those contracts compose.
 
-## Concept
+## 1. Product boundary
 
-OpenThrottle turns an approved Linear delegation or GitHub Issue into an
-immutable, deterministic coding pipeline:
+OpenThrottle turns an approved work item into tested, reviewed, published code.
+It deliberately separates:
+
+- deterministic coordination in the Fly supervisor;
+- agent reasoning in a sealed Daytona action;
+- repository and publication evidence in Git/GitHub;
+- control events from Linear, GitHub, or an operator.
+
+Pipeline is the only public orchestration abstraction. The supervisor may
+compile a pipeline into a private manifest, but users do not author or select a
+second runtime model.
+
+The supervisor owns every authoritative identity and transition. Agents may
+reason, inspect, edit an allowed content tree, run tools exposed by the action,
+and submit semantic candidates. They do not own Git administration, commits,
+publication, durable state, timestamps, provenance, or external-effect claims.
+
+## 2. System flow
 
 ```text
-Linear delegation or labeled GitHub Issue
-  -> durable repository route + exact Git subject
-  -> dependency-closed DefinitionBundle for one pipeline
-  -> one fenced Attempt at a time
-  -> semantic ResultCandidate + executor-authored ResultRecord
-  -> deterministic DecisionRecord + immutable Effect
-  -> exact-subject DeliveryRecord and resource cleanup
+signed provider event / operator command
+                 |
+                 v
+       registered route + exact Git subject
+                 |
+                 v
+ filesystem definitions --compile--> immutable DefinitionBundle
+                                         |
+                                         v
+                           PipelineRun + first Attempt
+                                         |
+                     +-------------------+------------------+
+                     |                   |                  |
+                 Checkpoint          Record            Effect intent
+                                                             |
+                                                      reconcile / write
+                                                             |
+                                                       DeliveryRecord
 ```
 
-The Fly supervisor owns state, admission, ordering, retries, effects, and
-publication. Agent reasoning lives only inside sandbox actions composed from
-standing instructions, a sealed task prompt, and progressively disclosed
-OpenThrottle skills. Ordinary and structured pipelines use the same execution
-kernel; there is no second execution architecture.
+At most one reducer transition owns a run cursor version. Concurrent work is a
+bounded frontier of independent Attempts; it is not concurrent cursor mutation.
 
-### Canonical target-epoch vocabulary
+## 3. Filesystem definitions
 
-- **Pipeline:** the sole public orchestration concept. A repository authors a
-  pipeline in `.openthrottle/pipelines/<id>/pipeline.yml`; the compiler may
-  expand it into a private manifest, but graph, catalog alias, and manifest
-  identity are not public selection concepts.
-- **DefinitionBundle:** canonical, dependency-closed bytes containing the
-  selected pipeline and only its transitive agent instructions, skills and
-  referenced resources, evals, pipeline-local loops, and behavior-affecting
-  config. A run carries one `definition_bundle_hash` over those exact bytes.
-- **Pipeline run:** one admitted work item executing one selected pipeline and
-  immutable DefinitionBundle.
-- **Attempt:** one fenced invocation of an agent action, command, evaluation,
-  provider wait, or other compiled pipeline scope. Ordinary stages, structured
-  units, review fanout members, and repair actions are all Attempts.
-- **ResultCandidate:** model-authored semantic output containing only the
-  action eval's `outcome` and payload fields. It never contains identity,
-  subject, fence, assurance, producer, evidence binding, hash, or timestamp.
-- **ResultRecord:** an immutable executor-authored fact about an observed
-  Attempt. It binds request, bundle, input subject, verified output subject,
-  candidate hashes, executor-derived evidence, and schema-versioned payload.
-- **DecisionRecord:** an immutable supervisor-authored reducer or deterministic
-  gate choice over explicit input record IDs. It alone authorizes the next
-  Attempt or Effect.
-- **DeliveryRecord:** an immutable supervisor-authored fact recording the
-  confirmed or rejected external outcome of one Effect. It is distinct from
-  webhook/outbox transport delivery.
-- **Effect:** a durable immutable intent for externally visible or runtime
-  mutation, with one idempotency key and deterministic reconciliation identity.
-  Publication, Git ref advancement, provisioning, stop, and cleanup are Effects.
-- **Checkpoint:** an executor-authored recovery fact for an Attempt. It binds
-  exact request, bundle, subject, session, and authorized recovery material.
-  An edit Attempt additionally binds its accepted tree or derived Git subject;
-  an inspect Attempt may have a non-Git checkpoint with a null output subject.
-- **Ticket identity:** the stable internal `ticket_id` is provider-qualified
-  (`<control-provider>:<external-thread-id>`). Human-facing ticket references
-  are display labels and never command, routing, or persistence identity.
-- **Native session:** a Claude session, Codex thread, or OpenCode session used
-  only when the compiled action policy permits continuation.
+### 3.1 Layout
 
-The words artifact, receipt, stage attempt, graph, catalog, and pipeline
-instance describe only the pre-replacement implementation below. New contracts,
-tables, APIs, and code must not introduce those as target-epoch authorities.
+Definitions live at fixed paths:
 
-### Identity and lifecycle ownership
+```text
+.openthrottle/config.yml
+.openthrottle/agents/<id>/instructions.md
+.openthrottle/pipelines/<id>/pipeline.yml
+.openthrottle/pipelines/<id>/loops/<loop>.yml
+.openthrottle/skills/<id>/SKILL.md
+.openthrottle/evals/<id>/eval.yml
+```
 
-An Attempt owns exactly one `request_hash`, one `definition_bundle_hash`, one
-`input_subject`, and at most one executor-verified `output_subject`. The
-canonical request hash covers the sealed action request after defaults are
-compiled; there is no second request or fence hash. The DefinitionBundle hash
-is `sha256(canonical_json(bundle))`. It does not include itself and is distinct
-from both an entry `content_hash` and the runtime artifact-set digest. Bundle
-bytes are rehashed whenever loaded.
+IDs include their namespace. The platform reserves `core/`; repositories may
+define other namespaces. Paths are normalized, bounded, free of symlinks and
+parent traversal, and unique by definition identity and path.
 
-An Effect owns exactly one `idempotency_key`. Reusing it is valid only for an
-exact replay of the complete immutable intent, including kind, owner Decision,
-target, subject, and payload. An unknown provider acknowledgement is reconciled
-through provider-native idempotency or the deterministic external identity; it
-is never blindly replayed.
+The platform tree and repository tree use the same validators. Platform files
+are trusted only when their normalized content hash is present in the
+release-sealed catalog. Repository files are bound to the admitted exact Git
+subject.
 
-Attempts use this common lifecycle:
+### 3.2 Config
+
+`openthrottle.config/v2` selects one pipeline and one engine and may set model,
+reasoning effort, named commands, bootstrap commands, and limits. Commands are
+strings executed only by deterministic command actions. Repository config
+cannot widen supervisor credentials or platform authority and has no MCP
+configuration surface.
+
+### 3.3 Agents
+
+`agents/<id>/instructions.md` is nonempty plain Markdown containing stable role
+instructions. It has no runtime YAML wrapper and is not a skill package. The
+compiler normalizes line endings and hashes the resulting string.
+
+An action profile is layered in this order:
+
+1. platform safety and executor fence;
+2. the selected agent instructions;
+3. the sealed task/action prompt;
+4. references to only the selected skills and result tool.
+
+Later layers cannot widen engine, model, tools, MCP access, credentials,
+repository authority, subject, session policy, or selected definitions.
+
+### 3.4 Skills
+
+A skill is one `SKILL.md` plus its package-local references. It is a reusable
+procedure, not a delegation wrapper or an agent's whole prompt. Selected skill
+bytes are included in the DefinitionBundle. The runtime exposes only those
+packages through the engine's native progressive-disclosure mechanism.
+
+The stage may name an `entry_skill`; it must be in the stage's skill allowlist.
+No skill may discover an unselected sibling package. If an engine cannot
+enforce selective disclosure, capability admission fails.
+
+### 3.5 Pipelines and loops
+
+`openthrottle.pipeline-definition/v1` contains:
+
+- a stable `id`, integer `version`, and `entry` stage;
+- agent, command, effect, or wait stages;
+- an outcome-to-next-stage or outcome-to-terminal map;
+- optional bounded re-entry with an explicit exhausted outcome;
+- an optional bounded loop over sealed data.
+
+Agent stages name one agent, `inspect` or `edit` authority, a skill allowlist,
+an optional entry skill, and one eval. Command stages name a configured command.
+Effect and wait stages name runtime-registered deterministic primitives.
+
+A loop body is inline by default. A complex loop may reference exactly one
+pipeline-local file under `pipelines/<pipeline>/loops/`. A loop declares its
+data selector, maximum parallel members, and maximum rounds. Compiled closure
+and runtime bounds may only narrow these values.
+
+Every referenced stage, agent, skill, eval, loop file, and command must exist.
+Every stage must be reachable. Every transition and terminal outcome must be
+closed and validated before admission.
+
+### 3.6 Evals
+
+`openthrottle.eval-definition/v1` binds an agent stage to:
+
+- a runtime-registered deterministic evaluator;
+- one `openthrottle.semantic-result-schema/v1`;
+- a closed outcome set;
+- at most 64 bounded payload fields of type `string`, `string_list`, `boolean`,
+  `integer`, or `json`;
+- explicitly allowed normalizations.
+
+Eval files are declarative. They do not load executable code from a repository.
+The release must already implement the named evaluator and normalization.
+
+### 3.7 Compilation and DefinitionBundle
+
+The compiler reads a bounded virtual file map from either the local filesystem
+or an exact Git subject. Both readers must emit identical canonical bytes.
+
+Compilation:
+
+1. validates the repository config and selected pipeline;
+2. applies repository-over-platform selection without allowing repository
+   definitions in `core/`;
+3. computes the exact transitive closure;
+4. normalizes and hashes each definition;
+5. binds compiler version and runtime-capability digest;
+6. emits `openthrottle.definition-bundle/v1` and its canonical SHA-256;
+7. compiles the private runtime manifest from those same bytes.
+
+Each bundle entry contains only `definition_kind`, `definition_id`, `origin`,
+`path`, `content_hash`, and `normalized_payload`. The bundle also binds source
+commit and selected pipeline. Dependencies not in the exact closure are
+rejected; the compiler cannot silently add a broader skill or evaluator set.
+
+The canonical bundle is written to the content-addressed store and verified
+before a run row commits. A restart reconstructs the private manifest from that
+blob, the release-sealed compiler environment, and trusted platform hashes. It
+must not reread `.openthrottle/` from a mutable checkout.
+
+## 4. Admission and routing
+
+One repository registration binds either:
+
+- a Linear team ID/key to one GitHub repository; or
+- a GitHub repository to itself as the Issue control route.
+
+It also binds base branch, installation/webhook identities where applicable,
+and the runtime snapshot. Duplicate routes or repositories are rejected.
+Unregistered webhook routes are acknowledged and ignored; they do not create
+work.
+
+Admission resolves the exact base subject before compilation. Automatic
+admission may run independent read-only planner and reviewer actions to choose
+`simple`, `structured`, or `needs_human`. `simple` selects `core/implement`;
+`structured` selects `core/structured`. An explicitly requested investigation
+may select `core/investigate` outside this implementation-routing decision.
+Untrusted ticket text cannot name a platform definition, widen scope, select
+credentials, or approve its own plan.
+
+For structured work, the sealed task prompt contains exactly one validated
+`openthrottle.execution-plan/v2` block whose `pipeline_id` is the selected
+pipeline. Units have stable IDs, bounded dependencies, file/scope hints,
+acceptance criteria, and verification obligations. Cycles, missing
+dependencies, another pipeline ID, or more than the runtime bound are rejected.
+
+All fallible source reading, compilation, bundle verification, and runtime
+compatibility checks happen before the atomic admission transaction. Admission
+then creates one work item, one pipeline run, the immutable definition
+snapshots, the bundle pointer, and the first pending Attempt.
+
+## 5. Execution kernel
+
+### 5.1 Run
+
+A PipelineRun binds:
+
+- work item and selected pipeline;
+- immutable DefinitionBundle hash and pointer;
+- current exact Git subject;
+- status and optional terminal outcome;
+- cursor stage, version, re-entry counters, structured frontier, completed
+  scope keys, and optional barrier;
+- work-retry and result-correction limits;
+- the last transition identity/hash.
+
+Live states are `pending` and `running`. Terminal outcomes are `completed`,
+`no_change`, `needs_human`, `failed`, `canceled`, and `superseded`.
+
+### 5.2 Attempt
+
+An Attempt is one leased unit of work. It binds run, scope, stage, authority,
+request hash, DefinitionBundle hash, exact input subject, selected context
+record/checkpoint IDs, retry/correction ordinals, and optional native session.
+
+Scopes are a pipeline stage, loop item, or fanout member. Non-stage scopes bind
+their parent, group, member ID, and stable index. Dependency counts determine
+lease eligibility; scheduling order is deterministic.
+
+Attempt states are:
 
 ```text
 pending -> running -> work_complete -> recorded -> settled
-                    \-> result_pending -> recorded
-                                      \-> needs_human
-running -> pending              (retryable infrastructure failure)
-running -> failed               (terminal work or security failure)
-pending|running -> canceled|superseded
+                  \-> result_pending -> recorded -> settled
+                  \-> needs_human | failed | canceled | superseded
 ```
 
-`work_complete` means the engine exited cleanly and the executor durably
-captured the action's checkpoint and observed postconditions. It does not mean
-that model output is authoritative or valid. `result_pending` means work is
-complete but the semantic candidate is missing or invalid. Result correction
-is a separately leased, bounded continuation of the same Attempt and native
-session, not a new work Attempt: repository mutation, MCP, provider access,
-publication, and unrelated tools are disabled, and the checkpoint/output
-subject cannot change. Exhaustion settles `needs_human` with the checkpoint,
-candidate, diagnostics, and session evidence retained.
+`result_pending` is not failed work. It means an executor-captured checkpoint
+exists but the semantic candidate still needs bounded result correction.
 
-The executor applies only registered, field-local normalizations before
-validation. `string-array-to-newlines/v1` accepts a bounded array containing
-only bounded, non-empty strings for a schema-declared string field and joins it
-with newline characters. Every application records its identifier, JSON path,
-input hash, and output hash. Unknown outcomes, unknown fields, contradictory
-values, mixed arrays, and transformations absent from the referenced eval
-remain invalid.
+Leases use compare-and-set versions, owner, purpose, expiry, and started flag.
+Starting work, binding a session, finishing work, recording a result, and
+settling each validate the exact current run/cursor/Attempt fence. Expired work
+may be retried only through the reducer; stale completions cannot mutate state.
 
-### Filesystem definition and compilation contract
+### 5.3 Request identity
 
-Repository-authored runtime definitions exist only at these paths:
+One request hash covers run and Attempt IDs, stage/scope, exact input subject,
+DefinitionBundle hash, repository authority, selected action definition hashes,
+task prompt, context record/checkpoint hashes, accepted-edit boundary, runtime
+resource identity, and executor policy.
 
-```text
-.openthrottle/
-  config.yml
-  agents/<agent-id>/instructions.md
-  pipelines/<pipeline-id>/pipeline.yml
-  pipelines/<pipeline-id>/loops/<loop-id>.yml   # optional
-  skills/<skill-id>/SKILL.md
-  evals/<eval-id>/eval.yml
+The action request carries that hash plus the exact bundle entries needed by
+the action. The sandbox recomputes and verifies the seal. A mismatch fails
+before invoking an engine or command.
+
+### 5.4 Checkpoint
+
+The executor creates `openthrottle.attempt-checkpoint/v1`. It binds Attempt
+identity, input subject, verified output subject (or null), native session,
+payload schema/content, and capture time.
+
+The agent cannot author the output subject. For edit actions the executor
+captures the resulting tree, constructs the subject, and verifies it. For
+inspect actions output subject is unchanged. An inspect action reviewing edits
+receives the preceding accepted checkpoint whose output equals its exact input
+subject.
+
+### 5.5 Records
+
+All durable evidence uses `openthrottle.record/v1` and one of three kinds:
+
+- **ResultRecord** — the executor-materialized semantic or command result for
+  one exact Attempt, including original and normalized candidate hashes.
+- **DecisionRecord** — one deterministic reducer/evaluator judgment over an
+  ordered set of input record IDs.
+- **DeliveryRecord** — confirmed or rejected evidence for one exact Effect,
+  idempotency key, target, and external identity.
+
+Records are immutable and sequenced within a run. At most one ResultRecord owns
+an Attempt and at most one DeliveryRecord owns an Effect. A settled Attempt has
+an explicit DecisionRecord; pointer presence, not historical scanning, proves
+ownership.
+
+### 5.6 Atomic reduction
+
+The reducer is a pure function of the compiled manifest, run, current Attempts,
+selected records/checkpoints, and confirmed Effect evidence. It emits one
+atomic transition bundle. Persistence validates expected versions and commits
+the new run cursor, changed Attempts, new Records, Checkpoints, and Effect
+intents in one SQLite transaction.
+
+Replay of the same command is byte-identical and idempotent. A command ID or
+semantic key that collides with different bytes is corruption and fails closed.
+No agent candidate alone advances a cursor.
+
+## 6. Action execution
+
+### 6.1 Inspect authority
+
+An inspect action receives a packed clone/materialized checkout at the exact
+input subject. Repository content is root-owned and read-only, Git remotes are
+disabled, and provider-native tool policy permits only reading/searching plus
+the action result tool. It cannot edit content, administer Git, commit, push,
+publish, or invoke mutating MCP/provider operations.
+
+When an inspect action reviews an accepted edit, the executor also writes one
+root-owned, read-only, bounded change artifact outside the checkout. It binds
+the exact accepted base/input subjects and trees, a changed-path manifest, and
+the textual diff. Oversized sections are omitted with explicit diagnostics.
+Every engine receives the same named artifact through native file-read access;
+it grants no shell, network, edit, Git-administration, provider, or MCP authority.
+
+Read-only authority is intentional even though agents do not own commits. It
+prevents review contamination and proves that a finding describes the sealed
+subject. Native read/search CLI features remain available. Commands such as
+tests or builds that need writable caches run as separate command Attempts.
+
+Planning, admission review, unit acceptance, whole-change review, persona
+selection/review, finding validation, and result correction use inspect.
+
+### 6.2 Edit authority
+
+An edit action receives an isolated writable content worktree whose Git
+administration directory, refs, remotes, hooks, and publication credentials are
+executor-owned. It may change only repository content within the sealed scope.
+It cannot commit, push, publish, open/update a pull request, integrate a sibling
+unit, or claim external success.
+
+Implementation, simplification, investigation-with-fix, unit repair, and final
+repair use edit. After work exits, the executor verifies the content tree and
+creates the checkpoint before accepting any semantic candidate.
+
+### 6.3 Native session binding
+
+An agent executor reports the native provider session as soon as the
+conversation exists. The supervisor atomically binds it while the started work
+lease and exact launch fence remain live. Agent work cannot complete or emit a
+checkpoint before this bind. Command actions are sessionless.
+
+A work retry clears the session. Result correction retains the session because
+it repairs only the representation of already completed work. Any session/run,
+Attempt, request, bundle, subject, lease, retry, or correction mismatch fails
+closed.
+
+### 6.4 Semantic candidates and normalization
+
+An agent submits only:
+
+```json
+{
+  "schema": "openthrottle.result-candidate/v1",
+  "outcome": "success",
+  "payload": {}
+}
 ```
 
-`config.yml` selects `pipeline` and `engine`; pipeline actions bind `agent_id`,
-`repository_authority`, a skill allowlist, optional entry skill, and an eval.
-`engine` is `claude`, `codex`, or `opencode`. `repository_authority` is
-`inspect` or `edit`. Inspect receives an executor-materialized exact-subject
-read view; edit receives an isolated writable content tree. Both keep Git
-administration, refs, remotes, commit creation, push, and publication under
-executor/supervisor ownership. Provider-native read-only and tool restrictions
-are defense in depth, not the cross-engine security boundary. Every review,
-admission, evaluation, and result-correction action is inspect-only; a blocking
-review schedules a separate edit-authority remediation Attempt.
+The candidate and any JSON field are bounded to 64 KiB canonical bytes. The
+outcome and payload fields must exactly match the sealed eval. Unknown fields,
+types, outcomes, or oversized values are diagnostics, not partial success.
+
+The only initial normalization is `string-array-to-newlines/v1`. When declared
+for a string field, a nonempty bounded array of strings is joined with `\n`.
+The transformation records its ID, JSON path, input hash, and output hash. This
+repairs the common case where `payload.summary` is returned as an array without
+discarding successfully completed code or tests.
 
-The shared compiler accepts a bounded virtual file map from either a local
-filesystem or an exact Git subject. It rejects path traversal, symlinks,
-duplicate or ambiguous IDs, unknown fields, invalid skill frontmatter,
-oversized files, cycles, unresolved references, escapes from pipeline-local
-loops, and repository attempts to shadow the reserved `core` namespace. Text
-uses LF line endings and parsed content is canonicalized before hashing.
-Canonical object keys use locale-independent UTF-16 code-unit order. A
-serialized claim of platform origin has no authority: every platform entry's
-kind, ID, path, and content hash must match the release's sealed platform
-catalog, while repository origin is derived from the exact Git reader.
+If validation then succeeds, the executor creates a ResultRecord with original
+and normalized hashes. If it fails after work completed, the Attempt enters
+`result_pending` with diagnostics, deadline, and correction count.
 
-Each bundle entry records `definition_kind`, `definition_id`, explicit
-platform or repository origin, source commit where applicable, canonical
-`normalized_payload`, and its own `content_hash`. The bundle contains the
-selected pipeline closure, compiler version, and runtime-capability digest;
-unreferenced definitions cannot change its bytes. The generated JavaScript
-candidate validator/normalizer and provider JSON Schemas are emitted from the
-same TypeScript source as a closed artifact set. Its artifact-set digest enters
-runtime capability identity but is never substituted for the DefinitionBundle
-hash.
+### 6.5 Result correction
 
-### Record, payload, and persistence boundary
+Correction resumes the same native session against the locked subject and
+checkpoint. It always has inspect authority, no MCP or provider access, and
+exactly one `ot-result` tool. It receives the semantic schema and diagnostics,
+not a new implementation task. Claude and Codex retain the same sealed steering
+hook and exact run/attempt/request/bundle/lease/session bindings; injected
+guidance cannot widen the result-only authority frame.
 
-Result, Decision, and Delivery are the only execution record kinds. Their
-payloads are closed, schema-versioned unions with kind-specific ownership.
-`payload_schema` must resolve through the owning eval/reducer/effect registry,
-the registered kind must match the record kind, and inline bytes must pass that
-schema before a record is accepted. Unknown schema IDs are invalid. A blob
-pointer binds the same registered schema and its materialized bytes pass that
-schema before consumption. The registry is extensible through referenced
-definitions and registered deterministic primitives; the base contract does
-not hardcode every future pipeline payload. Operational identity, leases,
-subjects, and indexes remain typed relational
-fields. Canonical inline JSON is limited to 64 KiB. Larger definition bundles,
-checkpoint/session packages, recovery material, and evidence use a
-content-addressed `BlobPointer` containing algorithm, digest, byte size,
-encoding, media type, and payload schema. The supervisor durably publishes and
-verifies blob bytes before committing a pointer.
+Correction has its own lease, deadline, and finite budget. A valid candidate
+records normally. Exhaustion or loss of the exact session becomes
+`needs_human`; it never reruns or discards the checkpoint implicitly.
 
-The fresh epoch contains only `schema_migrations`, `settings`, `leases`,
-`repository_registrations`, `work_items`, `inbox_events`, `definitions`,
-`pipeline_runs`, `attempts`, `records`, `effects`, and `checkpoints`.
-Definitions retain the five application fields `definition_kind`,
-`definition_id`, `source_commit`, `content_hash`, and `normalized_payload`;
-the bundle itself is a verified content-addressed object, not a foreign key to
-a supposedly unique entry hash. U6 must complete the lifecycle/constraint/
-index/port matrix before freezing this DDL and stop for a SPEC amendment if an
-independently leased or queried lifecycle cannot fit without JSON state scans
-or nullable polymorphism.
+### 6.6 Commands
 
-### Fresh-epoch lifecycle, constraint, index, and port matrix
+A command action resolves one named command from the sealed config. The sandbox
+executes it against the checkpoint tree with bounded output and time. Exit code,
+command ID, and summary are executor-authored. Commands may write build/cache
+artifacts inside their disposable command environment but cannot change the
+accepted Git subject or publish.
 
-This matrix freezes the twelve-table baseline. It maps lifecycle ownership,
-not old rows: the offline replacement archives the old database and starts the
-new epoch from the checksummed settings/registration bootstrap. No item below
-authorizes a compatibility read, backfill, dual write, or thirteenth table.
+## 7. Pipeline behavior
 
-| Owner | Typed columns and cardinality | Integrity and delete rules | Lease/CAS and required indexes | Payload and blob rule | Authorized port and characterization |
-|---|---|---|---|---|---|
-| `schema_migrations` | One immutable row for baseline version, name, checksum, and application timestamp. | Positive version PK; exact checksum/name; no update/delete path. The SQLite application ID, user version, and complete `sqlite_master` fingerprint must match the release. | No lease. Exact singleton-ledger read during open. | No payload. | Fresh-epoch initializer/verifier only; `fresh-epoch.test.ts` rejects old, partial, drifted, foreign-key-disabled, and undeclared-object databases before a writer opens. |
-| `settings` | Typed JSON scalar/document, declared value type, mutability bit, version, timestamp. Reserved `epoch.*` identities are immutable. | Key PK; JSON/type CHECK; immutable update/delete triggers; mutable settings use version CAS. | Lookup by PK; no JSON discovery. | Bounded inline JSON only. Definition content is forbidden here. | Bootstrap/operator settings capability; schema ownership and fresh-epoch tests cover type, immutable, and mutable-CAS behavior. |
-| `leases` | One supervisor-wide lease per `lease_key`: purpose, owner, lease ID, expiry, version, bounded metadata. Attempt/effect/inbox leases do not live here. | PK `lease_key`, unique lease ID, all-or-nothing owner fields, no cascade deletes. | Version and lease-ID CAS; expiry index. | Bounded inline metadata only. | Maintenance/singleton lease capability, never reducer/history analysis; lease-concurrency characterization. |
-| `repository_registrations` | One trusted route per Linear team or GitHub repository, with explicit provider discriminator, route fields, GitHub identity, branch, webhook, snapshot, version, timestamps. | PK ID; provider-specific CHECK requires Linear team fields only for Linear and `route_key = github_repo` for GitHub; unique provider route, Linear team, and repo; delete restricted while work exists. | Version CAS; provider/route and repo indexes. | No arbitrary definition payload. | Admission routing capability; bootstrap and schema-ownership tests cover cross-provider invalid combinations and duplicates. |
-| `work_items` | One admitted external request: registration, provider/source identity, reference, state, title, request schema and exact inline/blob union, version/timestamps. | PK ID; unique provider/source; registration FK `RESTRICT`; checked state and exact payload XOR. | Version CAS; state/time index. | Canonical inline JSON at most 64 KiB or complete typed verified pointer. | Atomic admission writer and work projection; admission fault tests prove no work item survives a failed run admission. |
-| `inbox_events` | One deduplicated provider/webhook/command/steering event with optional work/run/attempt owners, generation, event group, delivery attempt, subject, hash, status, availability, lease union, version/timestamps. | PK ID; unique provider/delivery; owner FKs `RESTRICT`; exact lease and inline/blob unions. | Version + lease ID/owner CAS; availability, work, and attempt/generation/group/delivery-attempt indexes. | Canonical inline JSON at most 64 KiB or complete typed verified pointer. | Bounded ingress/steering capability only; intake dedupe, stale generation, lease concurrency, and retry characterization. |
-| `definitions` | Exactly five application columns. Platform entries use `source_commit = NULL`; repository entries use the exact 40/64-hex Git commit. Identical content across IDs or commits is valid. | CHECKed kind/hash/JSON. The five-field logical identity is a unique expression index over kind, ID, `ifnull(source_commit,'')`, content hash, and normalized payload; no synthetic platform commit and no content-hash uniqueness. | Lookup by kind/ID/commit and content hash. Immutable inserts only. | Normalized definition JSON remains relational; canonical DefinitionBundle bytes are a prewritten blob. | Atomic admission writer and definition provenance reader; schema tests cover platform-null, repository-commit, repeated content, and exact five-column ownership. |
-| `pipeline_runs` | One run: work owner, pipeline ID, full typed bundle pointer, current subject, status/outcome, version, retry limits, canonical cursor stage/version/reentries/frontier/completed scopes/all-member barrier, and last reducer transition ID/hash. Active attempt/effect/checkpoint maps are reconstructed from owner tables. | PK ID; work FK `RESTRICT`; bundle pointer CHECK; terminal status/outcome/cursor union; last-transition exact pair. Bundle hash is verified by an opaque BlobStore prewrite token, never an unsafe definition FK. | Run + cursor version CAS; last-transition exact replay/conflict fence; work/status/bundle indexes. | Bundle is always a typed verified blob pointer. Cursor JSON is a bounded aggregate loaded by run PK and is never used to discover leasable work. | Reduction/projection ports; admission, transition replay/stale/conflict, and projection tests. |
-| `attempts` | One ordinary stage, loop item, or fanout member. Typed scope discriminator owns parent/collection/member/index columns; request/bundle/input/output identity, authority, session, status/version, retry and correction counts/deadline, relational unmet-dependency count, worker-bound lease, checkpoint/result owners, and pending diagnostics. | PK ID; run/parent/checkpoint/result and complete identity FKs `RESTRICT`/deferred; scope CHECK permits no nullable polymorphic combination; exact lease union; `result_pending` requires session, deadline, and diagnostics. | Storage-owned claim CAS increments run and attempt versions; lease ID+worker+expiry is exact replay identity; renewal fences lease and worker. Eligibility uses status plus indexed `unmet_dependency_count = 0`, never `json_each`. | Diagnostics remain bounded inline. Recovery/session bytes belong in checkpoints/blobs. | Eligible-attempt lease port, exact reduction view, and atomic transition writer; kernel tests cover dependency eligibility, worker fencing, replay, renewal, stale transition, and correction budget/deadline. |
-| `records` | Immutable Result, Decision, or Delivery row with run-local sequence, record hash, kind, optional indexed Decision semantic key, payload schema/XOR, and a CHECKed owner union. Result owns exact attempt/request/bundle/subjects/candidate hashes; Decision owns reducer/input IDs/count; Delivery owns effect/idempotency/external identity/status. | PK ID; unique run/sequence; deferred typed owner FKs; one Result per attempt and one Delivery per effect; kind CHECK makes every other owner column NULL. No record update/delete path. | Append only. Decision semantic-key, run, attempt, and effect indexes; reducer reads exact supplied IDs, not payload scans. | Canonical inline JSON at most 64 KiB or complete typed verified pointer; materialized bytes validate against the registered payload schema. | Exact reduction/context/projection ports; record-owner/XOR, skill semantic-key, immutable replay, and active/history blob-integrity tests. |
-| `effects` | One durable provider/runtime mutation: Decision owner, effect kind, unique idempotency key, deterministic target/external identity, subject, typed payload XOR, immutable intent hash, status/version/attempt count/availability, worker lease, delivery owner, unknown/error evidence. | PK ID; typed Decision and Delivery FKs; unique idempotency identity; exact lease/status/delivery/unknown unions; no cascade deletion. | Indexed availability/status lease; worker+lease+version CAS. Provider-native idempotency or deterministic target read-before-write reconciliation is mandatory; unknown never blindly retries. | Canonical inline JSON at most 64 KiB or complete typed verified pointer. | Effect lease/reconciliation port sees one leased view; kernel tests cover sibling-safe exact lease replay, worker fencing, unknown outcome, and one DeliveryRecord. |
-| `checkpoints` | Immutable attempt checkpoint with ordinal, checkpoint hash, semantic key, complete attempt/request/bundle/subject/session identity, typed payload XOR, capture time. Repeated semantic keys are history, not uniqueness. | PK ID; attempt identity FK; unique attempt/ordinal; no update/delete. | Attempt/ordinal, semantic-key, and blob indexes. Attempt row points to its current checkpoint while older ordinals remain immutable. | Canonical inline JSON at most 64 KiB or complete typed verified pointer. Checkpoint, recovery, and native-session packages normally use blobs. | Exact context/reduction ports; blob-before-pointer, restart, repeated-semantic-key, and corruption-blocking tests. |
+### 7.1 Ordinary work
 
-The `pipeline_runs` cursor is the canonical bounded reducer snapshot. On every
-transition, the store computes each frontier Attempt's relational
-`unmet_dependency_count` directly from the newly supplied cursor and updates it
-inside the same CAS transaction. The eligible-lease query reads only typed,
-indexed Attempt columns. Active attempt/effect versions and checkpoint IDs are
-likewise projections of their owner rows, so there is no second mutable JSON
-index to reconcile.
+The core implementation pipeline performs edit implementation, inspect review,
+separate edit remediation when required, simplification, a second inspect
+review, configured test/lint/build commands, publication Effect, and provider
+wait. All steps use kernel primitives; there is no alternate ordinary runner.
 
-### Deprecated-table and store-operation ownership map
+The investigation pipeline performs an evidence-led edit/diagnosis action,
+then publishes only a convergent changed subject. `no_change` terminates without
+publication.
 
-Every table present after the final old-epoch migration appears exactly once
-below. “Archive” means its old bytes remain only in the checksum-bound offline
-archive; the named target owns equivalent *new* lifecycle facts where that
-lifecycle still exists.
+### 7.2 Structured work
 
-| Deprecated tables | Fresh owner and operation mapping | Constraint/port characterization |
-|---|---|---|
-| `schema_migrations` | `schema_migrations`; replacement writes the one fresh baseline, never old migration rows. | Exact migration/schema fingerprint through the initializer only. |
-| `settings` | `settings`; bounded checksummed bootstrap recreates operator values with explicit type/mutability. | Bootstrap + mutable settings CAS. |
-| `supervisor_leases`, `supervisor_maintenance`, `deployment_cutovers` | Global runtime exclusion uses `leases`; release/storage identity uses immutable `settings`. The one-shot replacement report is an operator artifact, not a live cutover row. | Maintenance/singleton lease port; no deployment-cutover state machine. |
-| `repository_registrations`, `repository_config_snapshots` | Trusted routing stays in `repository_registrations`; behavior-affecting config is a `definitions` snapshot and bundle entry. | Registration bootstrap/read port; definition compiler/admission port. |
-| `pipeline_catalog_entries`, `pipeline_catalog_aliases`, `runtime_capability_descriptors` | Filesystem compiler plus immutable `definitions`; selected closure and runtime capability digest are in the verified bundle pinned by `pipeline_runs`. Aliases are not a public/runtime authority. | Exact-subject compiler and atomic admission; no catalog store. |
-| `tickets`, `work_items`, `pipeline_work_bindings`, `run_stage_bindings` | User request/source lineage becomes one `work_items` row; its selected execution is `pipeline_runs` plus typed `attempts`. | Atomic `admitPipelineRun`; work/run projections. |
-| `provider_events`, `webhook_deliveries`, `github_webhook_redelivery_requests`, `control_outbox` | Deduplicated input becomes `inbox_events`; requested/observed external work becomes `effects` and Delivery `records`. | Ingress dedupe/lease port and effect reconciliation port. |
-| `session_inbox`, `steering_items`, `pipeline_inbox_events` | `inbox_events` with work/run/attempt, generation, group, delivery-attempt, and subject fences. | Exact intake and context allowlists; stale-generation characterization. |
-| `runs`, `agent_sessions`, `sandbox_events` | One sealed action is an `attempts` lifecycle; native session/recovery evidence is a `checkpoints` blob; runtime launch/cleanup is an `effects` lifecycle; facts are Result/Delivery `records`. | Attempt lease/reduction, checkpoint, and effect ports. |
-| `pipeline_instances`, `pipeline_instance_stages`, `pipeline_stage_attempts`, `pipeline_admission_projections` | `pipeline_runs` canonical cursor plus ordinary `attempts`; admission visibility is a projection, not stored duplicate state. | Shared reducer/store and status projection characterization. |
-| `pipeline_artifacts`, `pipeline_gate_receipts`, `citation_gate_receipts`, `pipeline_publication_receipts` | Result/Decision/Delivery `records`; large evidence is a verified blob. Publication requests and acknowledgements are `effects` plus Delivery records. | Registered payload unions, exact reducer inputs, effect reconciliation. |
-| `pipeline_effect_intents`, `pipeline_stage_checkpoint_objects`, `pipeline_task_branches` | `effects` owns external/runtime intent; `checkpoints` owns Git/session package bytes and output subject; task-branch lineage is typed attempt/checkpoint/effect identity. | Idempotency/reconciliation and blob-before-pointer tests. |
-| `execution_graphs`, `execution_units`, `execution_work_attempts` | Structured work uses the same `pipeline_runs` cursor and scoped `attempts` rows as ordinary work. | Scope CHECK, frontier/dependency materialization, and shared transition tests. |
-| `execution_downstream_context`, `execution_work_private_artifacts` | Authorized exact record/checkpoint IDs resolve through the context port; large private evidence is a checkpoint/record blob and never a discoverable context table. | Explicit allowlist context tests and blob integrity fence. |
-| `execution_review_subaction_dispatches` | Review members are fanout-member `attempts`; dependencies/barrier live in the canonical cursor and indexed readiness projection. | Fanout scope and barrier/restart characterization. |
-| `execution_gate_receipts`, `execution_publication_events`, `execution_checkpoint_objects` | Gate facts are Result/Decision records; publication observation is Delivery records; packages are `checkpoints` blobs and publication `effects`. | Shared record/effect/checkpoint contracts. |
-| `feedback_snapshots`, `feedback_snapshot_events`, `orchestration_journal`, `run_outcomes`, `tune_state` | New provider/human observations enter `inbox_events`; immutable useful facts become schema-versioned `records`. Historical analysis reads a separately wired projection. Automatic corpus tuning remains deferred and authors future filesystem definitions rather than mutable live rows. | Projection/analysis capability cannot be imported by reducers; old history remains in the archive. |
+Structured execution parses the exact validated execution plan from the sealed
+task prompt. It compiles a bounded dependency frontier with stable Attempt IDs.
+Ready units may execute concurrently up to the pipeline limit; deterministic
+dependency evidence is merged into each action context.
 
-The old `AdmissionStore`, `RunStore`, `DeliveryStore`, `SteeringStore`,
-`FeedbackStore`, `TuneStore`, `MaintenanceStore`, `DeploymentCutoverStore`,
-pipeline catalog/create/instance/transition/unit/gate/publication/checkpoint/effect
-stores, status/journal/analysis stores, and their migration runner therefore do
-not receive adapters. New admission is one transaction over definition
-snapshots, work item, verified bundle, run, and initial attempts. Reduction is
-one `AtomicTransitionBundle` transaction. Attempt claims and effect claims are
-their respective indexed, worker-fenced lease capabilities. Context and status
-are restricted projections. Historical analysis is separately wired and cannot
-become a reducer input.
+Each unit cycles through edit implementation/simplification, commands,
+inspect-only lead acceptance, optional edit repair, and an integration Effect.
+Only accepted checkpoints integrate. Integration is serial against the current
+exact subject; a unit whose base is stale must be reconciled explicitly.
 
-## Components
+After all units integrate, whole-change commands run. An inspect selector
+chooses a bounded roster from the sealed reviewer-skill allowlist. Each persona
+is an independent inspect fanout Attempt. An inspect validation action confirms
+blocking findings. Confirmed blockers schedule a separate edit final-repair
+Attempt and repeat the bounded assurance cycle; advisory findings do not gain
+transition authority.
 
-- `contracts/`: canonical definition, pipeline, candidate, record, effect,
-  identity, generated-validator, and digest contracts shared byte-for-byte.
-- `supervisor/`: Hono control plane, fresh SQLite epoch, DefinitionBundle and
-  BlobStore ownership, reducer, effects, provider handling, and recovery.
-- `sandbox/`: sealed single-Attempt executor, agent profile, candidate ingress,
-  checkpoint, and generated validation boundary.
-- `.openthrottle/`: runtime pipeline, agent-instruction, skill, eval, and config
-  authoring source used by this repository and scaffolded into target repos.
-- `skills/`: operator/planning distribution assets until runtime task skills
-  move into `.openthrottle/skills/`.
-- `cli/`: target-repository scaffolding, local compilation, validation, and
-  operator commands.
+Structured planning and recovery query Attempts by exact run, bundle, parent,
+scope group, stage, member, and settled status. They do not infer state by
+scanning arbitrary historical text.
 
-## Deprecated implementation inventory
+## 8. Effects and runtime resources
 
-The following graph/catalog/receipt/table-specific sections characterize the
-old epoch so their owning units can preserve behavior while replacing it. They
-are not compatibility requirements, may not be selected by new code, and are
-deleted with the old runtime in U8. Security rules that do not depend on those
-representations—signature verification, exact-subject fencing, secret
-sanitization, fail-closed routing, and registered-repository trust—remain
-normative throughout the replacement.
+An Effect is a write-ahead intent derived from a DecisionRecord. It binds kind,
+target, optional exact subject, canonical payload, intent hash, and one globally
+unique idempotency key. Scheduling the intent and its authorizing decision is
+atomic.
 
-## Admission and routing
+The worker follows this order:
 
-1. Linear and GitHub webhook bodies are capped at 5 MiB before signature
-   verification. Linear HMAC and timestamp freshness, or GitHub webhook HMAC,
-   are then verified before persistence.
-2. A Linear `created` agent-session event must contain an issue, session, and a
-   durable `repository_registrations` match by team id or key. A GitHub Issue
-   admission event must come from the registered repository and carry the exact
-   lowercase `openthrottle` label. Routing is fail-closed; no environment or
-   unregistered Issue may choose an arbitrary repo.
-3. The branch label may override the registration’s base branch for this
-   delegation. Agent labels select Claude, Codex, or OpenCode; `investigate`
-   selects the investigate intent, otherwise the intent is implement.
-4. The supervisor accepts exactly two created-session prompt-context shapes.
-   Both start with one well-formed outer child `<issue>` and may end with only
-   the allowlisted optional parent issue and other-thread context. Assignment-
-   created delegations have no `<primary-directive-thread>`; comment-prompted
-   delegations carry exactly one immediately after the child issue. Pipeline
-   selection authority is limited to the sanitized child issue for assignment
-   shape, and to the sanitized child issue plus the one primary directive for
-   prompted shape. Nested parent/history material, parent descriptions,
-   sibling metadata, old threads, and wrapper residue never select a graph or
-   execution plan; malformed, duplicate, out-of-order, unclosed, or injected
-   structural delimiters fail closed before provisioning.
-5. The supervisor fetches the exact base commit and target `.openthrottle.yml`,
-   validates both, resolves the repository’s pipeline alias against the catalog,
-   validates runtime capabilities and credential scopes, then atomically pins
-   the instance.
-6. Re-delivery of the same session/generation is idempotent. A newer Linear
-   generation supersedes the prior instance through a typed coordinator event
-   and durable stop/cleanup effects. Failed selection does not replace the
-   previous generation.
+1. lease the Effect;
+2. reconcile the target using its idempotency key and expected identity;
+3. if already committed, verify exact evidence and write a DeliveryRecord;
+4. if absent, perform at most one dispatch for the leased attempt;
+5. reconcile again and record confirmed/rejected evidence;
+6. if outcome is unknown, release with backoff in reconcile-only mode.
 
-Supported ticket intents are `implement` and `investigate`. Pipeline selection
-is unconditional for every new generation.
+An unknown external outcome is never blindly replayed. Conflicting external
+identity, target, subject, or payload fails closed.
 
-Automatic admission is selected per implementation intent with
-`admission_mode: automatic`. `openthrottle init` writes that mode for new
-Claude and Codex repository configurations. Its semantic `simple` candidate is
-the configured implement default graph; when that graph is repository-owned,
-the automatic-manifest compiler pins its exact initial and repair implementation
-loop packages into the simple tail. OpenCode initialization omits automatic
-mode and uses direct default-graph routing until the automatic pipeline's
-structured execution path supports OpenCode. An absent value or `legacy` preserves default-graph selection and
-missing-plan rejection for existing or explicitly legacy configurations. A
-complete explicit simple selection or complete structured plan remains
-authoritative and bypasses the automatic planner. Automatic planning cannot be
-selected by investigate or tune tickets, OpenCode activations, ticket-authored
-skill paths, or an already-running generation.
+Built-in plans cover Daytona provision/stop/cleanup, accepted structured-unit
+integration, exact-subject GitHub publication, Linear/GitHub status delivery,
+and provider waiting. Multi-phase operations checkpoint each confirmed phase.
 
-Automatic admission actors emit semantic output only. The planner returns
-exactly `route`, `rationale`, `questions`, and `execution_plan`; the reviewer
-returns exactly `verdict`, `summary`, `findings`, and `questions`. The executor
-validates those objects and exclusively constructs typed receipts, digests,
-provenance, subjects, fences, assurance, and timestamps. An ordinary malformed
-semantic object consumes the stage's bounded `semantic_repair_required`
-re-entry without a fabricated receipt. A recognized engine launch, credential,
-provider-limit, or other infrastructure failure remains a
-`retryable_infrastructure_failure` and consumes only its infrastructure retry.
-The admission basis carries the repository's sorted, unique command-key
-inventory, never command bodies. Command keys use the execution-plan command
-grammar and an 80-character maximum. Claude and Codex planner schemas constrain
-both global and unit-scoped commands to that sealed inventory; an empty
-inventory requires an empty plan command list. Executor validation against the
-same sealed inventory remains authoritative after model output.
+Provisioning expands privately into provision, stop, and cleanup lifecycle
+ownership. Every terminal path—success, failure, human intervention, stop,
+supersede, retry exhaustion—must either independently prove provisioning never
+committed or schedule cleanup from exact confirmed create evidence. A runtime
+resource cannot be considered clean from an agent statement.
 
-## Manifest and catalog contract (deprecated epoch inventory)
+## 9. Persistence and blobs
 
-Pipeline YAML is strictly parsed with duplicate keys, aliases, unknown fields,
-oversized documents, invalid identifiers, and invalid graph edges rejected.
-Normalized JSON and SHA-256 digests are stored before execution.
+### 9.1 Fresh SQLite epoch
 
-Each `openthrottle.pipeline/v1` manifest declares:
+The live database is created from the one immutable SQL artifact in
+`supervisor/src/persistence/epoch-schema.ts`. It has exactly twelve tables:
 
-- immutable `id`, integer `version`, `entry_stage`, `max_attempts`, and
-  optional `max_repair_rounds`;
-- required executor protocol and capabilities;
-- optional `defaults.transitions` and `defaults.retry` authoring shortcuts that
-  expand before normalization and digesting;
-- ordered stages with executor/evaluator kind, assurance, required artifacts,
-  context policy, live-steering flag, credential scopes, produced artifacts,
-  and outcome transitions;
-- bounded re-entry and an explicit exhausted outcome where a transition loops.
-  New manifests should set `max_repair_rounds` as the primary whole-run repair
-  bound; the coordinator enforces it only when scheduling a backward
-  transition into an earlier stage. Same-stage retries consume only their
-  transition's local `max_reentries` budget and never consume semantic repair
-  rounds. An already-moving repair round can therefore reach command gates,
-  publication, provider wait, or a terminal boundary. `max_attempts` remains a
-  high raw-attempt safety net for genuine runaways. Per-transition
-  `max_reentries` still bounds individual loops.
-
-Allowed outcomes are `success`, `no_change`,
-`semantic_repair_required`, `retryable_infrastructure_failure`, `needs_human`,
-`canceled`, `superseded`, and `failure`. Terminal pipeline outcomes are
-`shipped`, `no_change`, `needs_human`, `canceled`, `superseded`, and `failed`.
-Every normalized stage has an explicit transition for every stage outcome. A
-manifest-level `defaults.transitions` map may supply shared outcome
-transitions, and a stage-level transition for the same outcome wins. Unknown
-default outcome keys are rejected. The key `same_as` is reserved and rejected.
-`defaults.retry: { max_reentries, on_exhausted }` and stage-level `retry`
-expand to `retryable_infrastructure_failure` self-loops for the declaring
-stage; the target is implied and cannot be authored.
-
-Context policies are `none`, `fresh`, `resume_required`, and `prefer_resume`.
-Assurance classes are `semantic_attested`,
-`semantic_corroborated`, `executor_verified`, `provider_verified`, and
-`human_approved`. An evaluator may accept only its declared assurance class.
-
-Platform-authored pipeline manifests use the `core/` namespace (for example
-`core/implement@4`). The `ce/` prefix survives only as a historical
-capability-id namespace (`ce/implement@1`, `ce/review@1`, `ce/publish@1`, and
-peers in the runtime capability descriptor); it implies no Compound
-Engineering dependency — the skills behind those capabilities are
-self-contained OpenThrottle adapters.
-
-Repository-authored graphs may reference committed repository skills only
-through `repo://<skill-id>`. The repository config owns the allowlist that maps
-each skill id exactly to `.openthrottle/skills/<skill-id>`, a committed
-directory containing `SKILL.md`; ticket text cannot choose a skill path and a
-second `.agents/skills` copy is never generated. Admission resolves that
-directory at the exact pinned base
-commit, fetches the bounded package closure as regular files, rejects traversal,
-path escape, symlinks, oversized or undeclared entries, and pins every accepted
-blob plus the package digest. Repository skill identity is separate from runtime
-execution authority: compiled stages use the platform-owned
-`agent/repository-skill@1` capability while carrying the canonical repository
-skill reference, invocation name, pinned package files, and package digest in
-the manifest and sealed request. Production advertises `agent/repository-skill@1`
-in its installed runtime capability descriptor, so a `run` node backed by a
-repository skill is reachable through the existing whole-attempt dispatch path.
-Compiler-produced repository manifest identity includes an explicit compiler
-identity version in addition to the pinned graph id, path, and blob. Any
-compiler change that alters normalized manifest bytes bumps that identity
-version instead of reusing an already-accepted immutable catalog key. Builtin
-graph compilation is a parity check against the canonical catalog manifest and
-does not publish repository-only ordinary loop bindings.
-Builtin `run` skills must name an installed whole-stage dispatch adapter (or
-the intentional generic `agent/semantic@1` executor). Structured builtin phase
-skills are exact: `implement` uses `ce/implement@1`, `simplify` uses
-`ce/simplify@1`, and `lead` uses `accept-unit@1`; pinned repository skills are
-the only configurable alternative. A repository graph's ordinary `run` loop
-is accepted only when its `timeout_seconds` equals the effective existing hard
-deadline—the lesser
-of supervisor `TASK_TIMEOUT` and repository `limits.task_timeout` (default
-7,200 seconds)—because per-loop ordinary-stage deadlines are not yet carried
-through the sealed stage protocol. Admission rejects any mismatch. Repository
-ordinary `run` loop scope is fixed by its dispatch adapter: semantic,
-implementation, planning, publication, investigation, and pinned repository
-skills use `graph`, while review and simplification use `diff`. The `review`
-scope and every adapter/scope mismatch are rejected until a sealed request
-projection can enforce them.
-For ordinary stages, `max_rounds` bounds repeat entries into the stage
-independently of the graph transition and manifest-wide retry/repair safety
-limits; the first forward entry is not a repeat round, and the first exhausted
-bound wins.
-Directly loaded `PIPELINE_CATALOG_PATH` manifests reject ordinary stage loop
-bindings because their repository-specific effective timeout cannot be proven
-at catalog load time; ordinary loop bindings are admitted only through
-repository graph compilation and its timeout-equality check.
-Structured unit repair cycles rerun each declared loop-backed phase in the
-repair sequence (`implement`, optional `simplify`, and `lead`), so their durable
-repair budget is the minimum of those phases' authored `max_rounds`; the first
-repeated-phase bound exhausted wins. Whole-change final-review repair is a
-distinct internal loop with its own one-round bound; it never borrows the unit
-repair budget.
-Internal whole-change final review and repair bindings do not declare an
-independent timeout, so their sealed action timeout inherits the supervisor
-`TASK_TIMEOUT` hard resource bound.
-Every pipeline whose manifest contains a `repo.write` stage first persists a
-`create_task_branch` effect and a `pipeline_task_branches` row. The effect must
-be acknowledged at the exact sealed base SHA before the ordered provision
-effect may run; this is the same prerequisite for the simple implementation
-stage and the structured composite host. Admission selection, repository reads,
-and capacity preflight remain read-only and create no ref. Task branch names
-include a session-derived suffix so a newer generation receives a distinct
-lineage instead of reusing or overwriting an older generation's ref.
-The composite `graph/for-each-unit@1` capability (structured multi-unit
-execution) is installed only with the composition root that constructs and
-drains the child unit runtime. A composite host stage dispatches no
-whole-stage sandbox request; entering it provisions/bootstrap the runtime,
-binds the parent actor, prepares the ticket branch, returns its exact checked-out
-Git subject to the supervisor, seeds one child execution graph from the sealed
-execution-plan block and graph-declared phase sequence, and drains child work
-actions through the provider-neutral unit effect port. The prepared subject may
-be the head published by an earlier generation rather than the repository
-base-branch commit. It is persisted as the graph's immutable initial subject and
-also initializes the advancing integration subject, so every first-unit request
-and worktree is fenced to the checkout the sandbox actually prepared.
-Composite parent actor hard expiry is derived at binding time from the sealed
-manifest stage: `expires_at` is `started_at` plus the maximum of supervisor
-`TASK_TIMEOUT` and every loop-backed unit phase `timeout_seconds` declared for
-that `graph/for-each-unit@1` stage. The value is not a sum of phase budgets and
-must never exceed 86,400 seconds. Ordinary pipeline stages continue to persist
-`expires_at = started_at + TASK_TIMEOUT`; repository `limits.task_timeout`
-does not extend the supervisor parent deadline.
-For a `for_each_unit` node, the repository graph owns the ordered `phases`
-array. The platform owns the closed mechanism vocabulary and the security
-contract behind each mechanism:
-
-- `agent`: one sealed `loop-action@3` invocation in the unit worktree, using a
-  declared unit loop and its pinned worker/skill/MCP/credential/session scope.
-- `command`: one or more repository-configured command names, run by the
-  executor without model credentials.
-- `evidence`: executor-derived typed evidence such as candidate evidence.
-- `gate`: a read-only decision phase evaluated against required receipts by
-  the supervisor gate code; graph configuration cannot waive receipt checks.
-- `integrate`: executor-only Git integration authority; this phase is never
-  agent-writable.
-
-The phase list is non-empty, bounded, and limited to the platform vocabulary.
-Agent and gate phases reference declared loops; command phases name configured
-repository commands. `implement`, `candidate`, `lead`, and `integrate` are
-required, `lead` immediately precedes `integrate`, `candidate` precedes `lead`,
-and `integrate` is the last unit phase. Repositories may remove optional phases
-such as `simplify` or move command phases earlier, but they cannot configure
-their way around candidate evidence, lead acceptance, or executor-only
-integration.
-
-Catalog aliases resolve to exact manifest id/version pairs. Repository config
-may override the implement or investigate alias, but cannot supply arbitrary
-manifest bodies. Runtime compatibility is verified before provisioning.
-
-## Coordinator lifecycle (deprecated epoch inventory)
-
-The coordinator is a pure reducer around a transactional store:
-
-1. Load the pinned instance, active stage/attempt, and normalized manifest.
-2. Verify instance, generation, attempt id, request hash, result hash, event
-   kind, subject fence, artifact declarations, artifact hashes/assurance, and
-   stage-specific requirements.
-3. Persist artifacts, one gate receipt, transition history, next attempt or
-   terminal outcome, and resulting effect intents in one transaction.
-4. Drain effects outside the reducer. Effects are idempotent and retryable.
-
-A stage result cannot advance a provider-wait or human-evaluated stage.
-Provider and human events cannot enter other stage kinds. Duplicate event ids
-return the previously committed result; a stale generation, request, run, or Git
-subject is rejected.
-
-A semantic stage that fails before its agent emits the evaluator-required
-receipt may settle `retryable_infrastructure_failure` with its executor-sealed
-`stage_result` alone. The event and artifact outcomes must agree, and the
-exception never applies to success, semantic failure/repair, or human-decision
-outcomes. This lets the declared infrastructure retry run without fabricating
-semantic evidence that the failed producer never authored.
-
-The default `core/implement@4` graph starts at implementation, then proceeds
-through semantic review, a simplification stage that may no-op, configured
-command gates, publication, and provider evidence. Semantic repair uses the
-manifest's round-based repair budget and scoped repair re-entry. The default
-`core/investigate@1` graph runs investigation, then conditionally publishes an
-exact-subject result.
-
-Provider feedback excludes supervisor-authored GitHub summary comments and
-Linear bridge linkback comments; those are publication/linkage artifacts, not
-human repair requests. A linkback is recognized only by the exact bridge bot
-identity (`linear[bot]`, `linear-code[bot]`) or by a bot comment whose body
-starts with the explicit `<!-- linear-linkback -->` marker — never by keyword
-heuristics over untrusted comment bodies, so substantive automated review
-feedback is still recorded as provider evidence. Authored PR comments,
-reviews requesting changes, Linear replies during provider waits, and failed
-workflow/check-suite completions for the exact published commit remain
-provider evidence and may start a bounded repair round. Feedback filed against a
-superseded commit from the same pipeline instance, Linear session, and generation
-may be carried forward only when that commit appears in acknowledged publication
-history for the instance; unrelated heads and cross-instance or cross-generation
-feedback remain stale and must produce an operator-visible activity instead of
-being dropped silently.
-
-## Effect and runtime-resource contract
-
-External actions are persisted before execution. Provisioning creates one
-Daytona resource for the instance, uploads sealed request/config/manifest
-inputs, and records the resource binding. Dispatch atomically binds the planned
-run id to the stage attempt and starts the sandbox entrypoint. When a transition
-enters a non-dispatched wait such as provider evidence or human approval, an
-`idle` effect may lower the bound sandbox to the idle autostop window while
-leaving the instance runtime resource status as `active`; it is a best-effort
-runtime side effect, not gate authority, and stale or failed idle work must not
-block provider evidence, terminal controls, or repair dispatch. Stop must be
-confirmed before cleanup; failed termination quarantines the resource rather
-than pretending cleanup succeeded.
-
-Runtime resource states and effect attempts are durable so process restart can
-resume unfinished work. A new instance must not reuse another instance’s
-resource. Ticket `sandbox_id` and `run_id` are projections used for operator
-visibility and event polling, not coordinator authority.
-
-Ordinary-stage hard expiry uses `TASK_TIMEOUT`; structured composite parent
-hard expiry uses the bounded graph-aware deadline described above. Heartbeats
-renew only actor liveness and leases; they never slide or rewrite
-`runs.expires_at`, so a pulsing but wedged actor still hits its absolute
-deadline. Stalled actors are detected from actor state
-on `runs` and `pipeline_stage_attempts` plus `STALL_TIMEOUT_SECONDS`. The sweep also resumes pending effects,
-reaps expired runs, releases or quarantines resources safely, and removes
-unbound Daytona orphans after `ORPHAN_GRACE_MINUTES`. "Unbound" means no
-`pipeline_instances` row still owns the resource (by `runtime_provider_
-resource_id`, not by the ticket's possibly-stale `sandbox_id` projection,
-which a newer generation's delegation overwrites); a resource still owned by
-some generation is left entirely to the reclaim path below regardless of
-`ORPHAN_GRACE_MINUTES`.
-
-A terminal instance's `stopped` runtime resource (e.g. the needs_human
-cleanup effect's `preserve` path, which stops rather than deletes so the
-workspace stays inspectable) is otherwise kept indefinitely and still counts
-against the Daytona memory quota. `operations/runtime-resource-reclaim.ts`
-deletes it once `RUNTIME_RESOURCE_RETENTION_MINUTES` has elapsed and the
-instance has no active stage attempt or unsettled effect intent (`pending`,
-`processing`, or retryable `failed`); a resource
-is deleted only when its exact provider binding is still `stopped` on the
-owning (single-generation) `pipeline_instances` row and its stopped timestamp
-is still at or before the retention cutoff immediately before deletion. The
-DB only records `cleaned` after provider deletion is confirmed (provider "not
-found" and duplicate cleanup both converge for free — see `cleanup()` in
-`providers/daytona/adapter.ts`). The periodic sweep runs this on the configured
-retention window; capacity-constrained provisioning
-(`app/admission-preflight.ts`'s `checkDaytonaCapacity`, and a provision/
-dispatch effect that fails with a capacity error in
-`operations/pipeline-effects.ts`) runs a one-candidate, five-second-wait pass
-with the same eligibility rule before rejecting or retrying. Reclaim triggers
-share one local single-flight; a slow provider deletion may finish after the
-hot caller's wait budget, while remaining candidates stay queued for the
-periodic bulk sweep. Capacity pressure never bypasses the
-retention window, since doing so could destroy
-another operator's still-fresh diagnostic workspace.
-
-## Sandbox stage contract
-
-The supervisor launches `/opt/openthrottle/entrypoint.sh` with paths to three
-root-owned, read-only inputs:
-
-- `OT_STAGE_REQUEST_FILE` — canonical `stage-executor@1` request;
-- `OT_STAGE_CONFIG_FILE` — normalized repository config snapshot;
-- `OT_STAGE_MANIFEST_FILE` — normalized pinned manifest.
-
-The request includes pipeline/manifest/runtime/config identities; stage,
-attempt, run, issue, session, and generation identities; ticket intent and
-bounded task/transition context; repository, exact base commit, base branch,
-working branch, and expected subject; agent and context policy; native session
-id where allowed;
-capability, required artifacts, credential scopes, and live
-steering permission; repository-skill package identity where the capability is
-`agent/repository-skill@1`; and a request hash/idempotency key covering the
-fence.
-
-The entrypoint ignores conflicting ambient identity values and derives runtime
-identity from the sealed request. It verifies input ownership/mode and all
-digests before cloning. A write-capable initial stage checks out the exact
-supervisor-reserved `origin/<branch>` head, which is already acknowledged at
-the sealed base; a read-only initial stage starts from the sealed base without
-creating a task ref. Missing, inaccessible, or mismatched reserved refs fail
-closed. Later stages reconstruct the exact expected subject. Git safety config
-is root-sealed.
-
-Task branch advancement is a separate `advance_task_branch` effect carrying
-both expected-old and expected-new SHAs. The store accepts one local integration
-SHA before enqueueing it, and acknowledges the remote SHA only after GitHub
-confirms a non-forced update. A wrong head, stale lineage/generation, existing
-unowned ref, or non-fast-forward response is permanent conflict evidence; it
-does not unblock provisioning or overwrite the ref. Redelivery accepts an
-already-created/already-advanced exact SHA only after the original leased
-effect has made at least one provider attempt, covering crash-after-provider-
-success without treating a first-observed external ref as owned.
-Successful simple write stages and successful structured aggregate stages feed
-their exact accepted subject through this same store operation. While accepted
-and acknowledged SHAs differ, the advancement effect leases ahead of downstream
-effects and downstream stage dispatch remains blocked. A publish stage is
-dispatchable only for that exact checkpoint; stop and cleanup effects remain
-eligible if advancement fails.
-
-Sandbox setup is split between bake-once and per-run work. `post_bootstrap`
-commands and image-derived engine probes are bake-once: they execute exactly
-once per sandbox lifetime and seal a root-owned completion marker recording
-the repository-config digest they ran under. Every stage verifies that marker
-before executing; a digest-mismatched, torn (started but never completed), or
-otherwise inconsistent marker fails the stage closed — the sandbox no longer
-matches its sealed config and the supervisor must reprovision it. There is no
-silent re-bootstrap and no silent skip. Credential materialization, `gh`
-credential-helper setup, commit identity, branch reconstruction, fence
-validation, and the per-stage scrub of ignored agent-executable config
-surfaces remain per-run; ignored dependency state installed by the bake-once
-bootstrap persists for the sandbox lifetime under the recorded digest.
-
-That bake-once dependency state covers only the integration checkout.
-Structured unit and final-repair worktrees are created bare (`git worktree
-add --detach`) and inherit none of it, so before the first repository command
-executes in a unit worktree the child executor re-runs the sealed config's
-`post_bootstrap` commands inside that worktree, as the agent user under the
-same process fence and bounded output/timeout as the command itself. The
-re-run happens once per worktree under a root-owned marker recording the
-sealed repository-config digest; a digest-mismatched or unreadable marker
-fails closed. A started-but-incomplete marker also fails closed so replay
-cannot repeat arbitrary bootstrap side effects in-place; removing or freshly
-recreating a worktree clears its marker and permits one new attempt. A
-worktree bootstrap failure is a retryable infrastructure failure
-for that child action — never a command receipt — so it cannot consume a
-semantic repair round. Graph-scoped final commands carry no worktree and run
-in the bake-once-bootstrapped integration checkout.
-
-Executor-owned repository command receipts retain sha256 digests of the bounded
-process captures for stdout and stderr. Failed receipts also carry independently
-optional,
-secret-sanitized diagnostic tails of at most 512 UTF-8 bytes per stream. The
-canonical receipt, including those tails, is passed unchanged in the bounded
-prior-evidence envelope to unit repair and final review actions; it remains
-subject to the standard-receipt schema and the 48 KiB aggregate prior-evidence
-limit.
-
-The executor runs exactly one stage:
-
-- agent capabilities invoke the appropriate self-contained OpenThrottle adapter
-  under the manifest context policy;
-- command capabilities invoke one validated `.openthrottle.yml` command;
-- provider-wait stages run in the supervisor and do not launch a sandbox actor.
-
-Agent proposals are strict JSON written to `OT_STAGE_PROPOSAL_FILE`. The runner
-normalizes output, verifies produced artifact declarations and Git subject, and
-writes one `stage_result` event to the supervisor-owned stage-result spool. It
-does not call a completion HTTP endpoint or emit a task completion marker.
-
-### Loop action runtime isolation
-
-Structured loop actions are executor-owned filesystem operations. The
-integration checkout, sealed inputs, Git hooks, executor Git metadata, stage
-spools, sibling action directories, prior action directories, and native-session
-packages are root-owned and not readable or writable by the agent UID. The only
-agent-writable repository path for a worker action is that action's selected
-unit or final-repair worktree. Lead and reviewer actions receive a detached
-read-only repository view: lead views are built from the sealed candidate
-subject, reviewer views are built from the current integration `HEAD`, tracked
-executable bits are preserved, and the view must remain Git-clean while being
-unwritable by the agent.
-
-Loop action inputs, logs, outbox, inbox, processed steering, native-session
-transport, repository-skill discovery, and action home/profile directories are
-namespaced by child action attempt. Before an action executes and after it
-finishes, executor cleanup must converge the agent-writable surfaces back to an
-empty/private state or return retryable infrastructure failure for quarantine;
-a live current action directory must not be made traversable without first
-holding that exact action's dispatch/replay lock. Exact replay removes any
-action-local repository-skill proposal before invoking the engine, so stale
-agent output cannot satisfy the receipt/proposal fence.
-
-A clean engine exit that contains exactly one parsed standard-receipt candidate
-may receive one deterministic envelope correction. Correction is executor code,
-not another model invocation: it may delete only validator-diagnosed unknown
-fields, set the top-level receipt schema, replace the top-level receipt type
-from the sealed expected receipt type, and replace exact fence, subject, or
-producer leaves for which the sealed request is authoritative. The expected
-receipt type is part of the hash-bound loop-action request and is echoed in the
-Receipt Authority Contract; it is derived by the compiled phase binding/action
-kind, not by agent output or action-name prefixes. It validates the complete
-corrected receipt, reapplies every action fence including receipt-type equality,
-and requires all non-diagnosed content to remain byte-equivalent under canonical
-JSON. It never changes assurance, result, evidence, semantic payload values, or
-repository content, and it refuses missing semantic values or an unparsed
-candidate. A schema-valid cross-role receipt can be accepted only if correcting
-`/type` to the sealed expected type leaves its existing result and payload
-independently valid for that expected type; semantic content is never rewritten.
-Before correction, the executor atomically writes a root-owned
-`openthrottle.loop-receipt-correction/v1` state file bound to the attempt,
-action, and request hash. The diagnostic engine-output tail is capped at 64 KiB
-and the complete serialized state at 3 MiB; the Daytona collector enforces the
-same state-file ceiling. If the process stops before `result.json`, collection
-redispatches the same executor under the original action lock; the persisted
-state suppresses the original agent launch, making correction restart-safe and
-idempotent without repeating a provider request.
-
-When correction cannot safely produce a receipt, the executor emits an
-`openthrottle.loop-receipt-recovery/v1` artifact. Diffs through 48 KiB remain
-inline. Larger diffs through 8 MiB are gzip-compressed into the root-owned
-action directory and downloaded and hash/size/gzip verified before cleanup.
-The supervisor stores those compressed bytes atomically with terminal action
-settlement in `execution_work_private_artifacts`; the hot
-`execution_work_attempts.payload` row contains only the bounded manifest and
-private-payload digest/size pointer, never base64-expanded recovery bytes. The
-manifest schema and its inline, sandbox-external, and supervisor-persisted
-payload phases are closed shared contracts in `contracts/`. Changed paths use
-Git's reversible ASCII C-style quoting, so embedded newlines and non-UTF-8
-pathname bytes are never lossily decoded. The display array is unique and
-bounded to 256 entries/16 KiB of canonical JSON, with full count, digest, and
-truncation metadata. If a diff exceeds the platform bound or export,
-compression, download, or verification cannot produce portable evidence, the
-result is `needs_human`; normal terminal cleanup therefore stops and preserves
-the Daytona workspace instead of deleting the only recovery source.
-
-Native session continuation is materialized only from the exact sealed
-executor-owned package selected by the request. Claude and Codex packages must
-contain engine-native durable records for the selected session id, must be
-bounded regular files with normalized digests, and are replaced through a
-validated sibling staging directory plus atomic swap so the last resumable
-package survives any failed replacement. OpenCode loop actions are not
-supported: OpenCode's database-backed session store and built-in adapter body
-delivery are deferred to a later slice, and both the supervisor loop dispatch
-and the sandbox loop validator reject `agent: opencode` fail-closed. OpenCode
-stage execution is unaffected.
-
-Repository skills remain sourced from committed repository paths selected by
-admission, not from ticket text. The sandbox materializes only the sealed
-package bytes into the current action's engine discovery directory, requires the
-`SKILL.md` frontmatter `name` to match the sealed invocation, invokes that
-invocation from the isolated action view, and removes the ephemeral copy before
-another action can observe sibling or prior packages.
-
-### Action-scoped credentials and MCP servers
-
-Each loop action materializes its own declared logical credentials
-(`model.invoke`, `provider.read`, `repo.read`, `repo.write`, `mcp`) and MCP
-servers from a clean trusted baseline, independent of whatever the whole
-attempt's stage-level credentials are. The Daytona adapter maps the action's
-exact declared scopes to the same minimal, closed sandbox credential-name
-allowlist as stage dispatch (`GITHUB_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
-`CODEX_AUTH_JSON`, `KIMI_CODE_API_KEY`) and rejects any operator-only Daytona,
-Fly, webhook, install, deployment, or supervisor credential the materializer might
-mistakenly return; provider secret identifiers never appear in repository
-schemas or sealed loop requests. The resulting envelope is uploaded to a
-root-owned, action-attempt-namespaced file next to the sealed request and
-named on the dispatch command line; it is never written into the persistent
-sandbox process environment.
-
-The sandbox reads, applies, and immediately deletes that envelope before
-invoking the engine: the agent process is launched with a cleared
-environment (not one inherited from the sandbox's own process, which could
-still carry the whole attempt's stage credentials) containing only the
-image's own fixed `PATH`/locale baseline plus the action's materialized
-credentials, passed as an explicit child-process environment rather than as
-command-line arguments (an argv vector is visible to any co-resident process
-via `/proc/<pid>/cmdline`, unlike an explicit env map). `CODEX_AUTH_JSON` is
-written to the action's isolated Codex home as `auth.json` rather than
-exported as a raw variable, so whatever the engine writes over that seeded
-credential stays confined to and is wiped with that action's directory.
-Cleanup is idempotent after a restart: a missing envelope (already consumed,
-or a role with no declared credential scopes) yields no credentials rather
-than an error, a retried dispatch re-uploads a fresh envelope regardless of
-what an earlier failed attempt already consumed, and a redispatch against an
-already-completed action removes its freshly re-uploaded envelope immediately
-rather than leaving it to be cleaned up by a script body that will never run
-again.
-
-MCP configuration is built the same way, scoped to the action's declared
-`allowedMcpServers` and filtered from the sealed repository config uploaded at
-bootstrap (never a real operator's personal MCP configuration or the whole
-attempt's unfiltered server list). Claude receives a private, read-only
-`--mcp-config` file when servers are declared, and `--strict-mcp-config` is
-always present so a zero-server action cannot fall back to a repo-committed
-`.mcp.json` or other ambient discovery outside its declared scope. Codex
-receives the equivalent `[mcp_servers.*]` blocks appended to its
-action-scoped `config.toml`; because the installed Codex CLI supports only
-local (stdio) servers, a remote-only server assigned to a codex-agent worker
-fails the action closed rather than silently granting Codex a smaller tool
-surface than an identically-scoped Claude worker. A subsequent action, a
-retained failed worktree, and lead/reviewer/publisher roles (which receive no
-worktree at all) cannot read a prior action's credential envelope, MCP
-config, or rotated Codex auth state: the same per-action-attempt namespacing,
-deletion, and tree relock that isolate worktrees and native sessions (above)
-cover this material too.
-
-The supervisor also accepts run-bound `activity`, `plan`, and `heartbeat`
-events. Every event is checked against the current ticket run and pipeline
-attempt before processing; late events from older actors are discarded.
-
-### Live steering
-
-Exact Linear prompt text that is not `/stop` or `/merge` is retained while a
-pipeline is running. When the active manifest stage declares `live_steering`, the
-active run is fenced to that attempt, and the selected agent supports injection,
-the retained message is leased and delivered as live steering. Messages captured
-during a running non-steerable stage remain pending and unbound until a later
-steerable stage can lease them, or until terminal cleanup cancels them.
-Deliveries use the durable work store, bind to the pipeline
-instance/attempt/run/context revision, and require an exact sandbox
-acknowledgement before consumption. Actor exit expires and cancels
-unacknowledged deliveries. Once steering has been leased to a run, it is sealed
-to that owning run and attempt and never crosses that boundary into a later
-actor.
-
-The structured `for_each_unit` composite stage does not support live steering
-yet. It always compiles with `live_steering: false` -- the manifest forbids
-`live_steering: true` for any executor other than a plain `agent` stage, and
-the composite stage's executor is `loop_action` -- so `canSteerPipelineRun`
-never treats a running composite stage as steerable, no matter which child
-action (unit-scoped or whole-change) is currently live underneath it. A reply
-sent while a structured run is active is always captured unbound (never fenced
-to a run) and stays pending until that run ends, at which point terminal
-cleanup cancels it; it is never delivered into any child action's sandbox.
-Capture still records the reply durably in the structured ledger's activity
-log (`steering_undelivered`) so the terminal receipt says so, rather than
-losing the fact silently, and the reply remains visible as ordinary Linear
-session activity throughout. Live steering to a specific in-progress child
-action -- fenced to that action's own attempt/request so a stale or
-cross-action reply is rejected fail-closed -- is a tracked follow-up, not
-current behavior.
-
-Outside the structured composite stage, stale session/request/subject replies
-remain audit-only under the same generation/context-revision/run fence used
-for the top-level pipeline.
-
-Native session continuation is not steering and is not a task type. It is
-selected solely by the next stage’s context policy and sealed native session id.
-
-## GitHub provider contract
-
-GitHub webhook HMAC is verified before durable delivery. PR open/reopen and
-synchronize events establish the authoritative head for the ticket branch.
-Reviews, PR comments, workflow runs, and check suites are stored as typed
-provider evidence for the pipeline generation.
-
-GitHub collaborator authorization intentionally differs between the Issue
-control surface and the PR feedback surface. Plain Issue comments and Issue
-lifecycle controls require an actor with `triage`, `write`, `maintain`, or
-`admin` permission. By contrast, PR-linked Issue comments and submitted
-`changes_requested` or `commented` PR reviews require an attested author but no
-collaborator-permission lookup before routing `semantic_repair_required`. This
-permits requested external reviewers and substantive automated reviewers to
-contribute feedback. A review must match the ticket's exact stored PR URL before
-it can reconcile head state, publish activity, or route provider feedback;
-branch-name correlation alone grants no ticket-scoped authority.
-The stored PR URL itself is bound only from a pull-request event whose head
-repository exactly matches the registered repository. A same-branch PR opened
-from an external fork cannot establish or replace that binding.
-The accepted blast radius is bounded: the manifest's `max_repair_rounds` caps
-repair re-entry for the pipeline, each snapshot drain materializes at most 20
-provider events and fails closed to `needs_human` when more are present, and
-provider routing returns before head-history scans or activity publication for
-a terminal pipeline instance, so PR feedback cannot revive terminal work or
-consume unbounded synchronous work after settlement. This asymmetry is
-deliberate and must not be inferred to grant PR actors authority over Issue
-admission, steering, closure, or generation lifecycle controls.
-
-For a repository registered with `control_provider=github`, `openthrottle init`
-creates or normalizes the exact lowercase `openthrottle` label. An authorized
-collaborator with `triage`, `write`, `maintain`, or `admin` permission starts a
-generation by applying that label to an open Issue; opening or reopening an
-already-labeled Issue is equivalent. A plain Issue comment from an authorized
-collaborator is steering for the current generation. Closing the Issue stops
-every nonterminal stage, including provider wait; reopening it or reapplying the
-label after a terminal generation creates a new session. Webhook timestamps and
-a live Issue lookup immediately before admission prevent stale or close-racing
-events from starting or stopping the wrong generation. The final admission
-preflight also re-reads the bounded Issue Events stream and requires the exact
-authorized activation cursor selected by the delivery to remain current; a
-newer close/reopen/relabel epoch supersedes the slow admission before any
-ticket or pipeline instance is created. When reverse delivery reconciliation
-applies historical closes while handling a later reopen, it scans the bounded
-history after the current activation cursor from newest to oldest and stops at
-the first independently authorized close. Actor permission lookups are cached
-per reconciliation and capped at 32 distinct historical actors; an exhausted
-cap or lookup outage fails retryably before session mutation. A signed close
-also retries until its exact actor and timestamp appear in Issue Events.
-Confirmed insufficient permission is acknowledged without admission.
-
-Issue Events remain the body-free source of activation ordering. When an Issue
-comment and the current activation have equal second-precision timestamps, the
-supervisor resolves only that rare ambiguity through a bounded, byte-capped
-Issue timeline scan. It immediately projects the response to event identity,
-kind, timestamp, and actor, discards comment bodies, and compares API sequence
-rather than numeric ids. A comment is deferred or routed to a successor only
-when that sequence proves activation-before-comment; comment-before-activation
-falls through to terminal guidance before admission and is not delivered after
-admission. An incomplete bounded proof fails closed, with resend guidance for
-an otherwise active generation.
-
-The supervisor publishes one upserted, pinned Issue status comment containing
-the current lifecycle, structured activity, PR link, and revision marker. Its
-persisted GitHub comment id, not body markup supplied by a user, establishes
-machine provenance. A durable, expiring pre-network write intent defers a
-matching webhook until that exact id can be recorded; it never treats copied
-marker text as provenance. Concurrent writers use compare-and-swap plus a
-durable requeue so a stale network response cannot overwrite a newer desired
-revision.
-
-Provider evidence advances only an active provider-wait stage and only when its
-head SHA equals the executor-verified published commit. The one same-run
-exception is feedback captured against an earlier acknowledged publication from
-the same pipeline instance, Linear session, generation, and pipeline-feedback
-work item lineage; before claim, the snapshot is retargeted to the current
-executor-verified published commit and then drained normally. Mismatched heads
-outside that exception require human attention and enqueue a visible operator
-activity before the snapshot is marked stale; evidence for a future stage remains
-pending. A feedback snapshot is immutable once claimed and is consumed only after
-the coordinator commits the provider event. The coordinator transition and
-snapshot consumption commit in one database transaction, so interruption
-cannot leave terminal provider evidence next to a permanently claimed snapshot.
-Snapshot-event reads use the same 20-event materialization bound and an indexed
-snapshot/receive-order path. Carry-forward copies at most the 20-event bound
-plus one overflow sentinel; overflow is sealed as bounded human-required
-provider evidence rather than allocating, sorting, copying, or embedding the
-full event set.
-
-Linear replies sent while the current pipeline instance is in `waiting_provider`
-are recorded on the same provider-feedback channel as GitHub evidence, with
-provider `linear`, an idempotency identity derived from the Linear agent
-activity id, and the executor-verified published commit as the head fence. The
-sanitized, bounded reply body is carried in the provider event evidence/payload
-so a repair stage receives it through sealed transition context rather than
-session memory.
-
-PR close is authoritative for ticket closure. If a stage actor is live, a typed
-stop event schedules termination/cleanup; ticket/session/inbox closure does not
-depend on a live attempt still existing. Optional merge-from-Linear is guarded
-by `ALLOW_LINEAR_MERGE` and GitHub mergeability/check validation.
-
-## Linear publication contract
-
-Activities and terminal responses are persisted before network delivery and
-ordered per Linear session. OAuth access tokens are refreshed using the stored
-installation when required. Failures retry with bounded backoff. Pipeline
-terminal acknowledgement uses a publication receipt; a failed receipt can be
-reopened only by the authenticated operator retry endpoint.
-
-Task branch state is not publication evidence. `pending`/`reserved` records
-have only an exact-base reservation; `checkpointed` records have equal accepted
-integration and acknowledged remote SHAs. Neither state creates a pull request,
-enters `waiting_provider`, satisfies review/check/workflow gates, nor populates
-published commit/PR status. `published` is a later, explicit publication state,
-not an alias for successful ref creation or advancement. The publish-stage
-effect verifies the acknowledged remote commit, creates or reuses one
-lineage-marked pull request through the supervisor GitHub credential, and
-atomically promotes only that exact checkpoint. The workspace tree remains the
-gated stage subject while the remote commit is recorded separately as provider
-revision. Git transport rejects the bounded object unless that commit contains
-the exact gate-accepted tree, including on lost-ack replay. Entry to
-`waiting_provider` and provider gate receipts require that promoted binding.
-
-Linear issue workflow state is a side-effect projection of the run lifecycle,
-not coordinator authority. Workflow states are resolved dynamically from the
-issue team by Linear workflow state `type`; state ids are never hardcoded.
-Selection/dispatch projects the issue to the first `started` state only when
-the current state is `triage`, `backlog`, or `unstarted`. Provider wait after PR
-publication projects to the `started` state named `In Review` when present,
-falling back to the first `started` state. A shipped terminal outcome or PR
-merge webhook projects to the team's `completed` state. Failed and
-needs-human terminal outcomes do not advance the issue to completed. Projection
-delivery is idempotent and forward-only: issues already at or beyond the target,
-or manually moved to `completed` or `canceled`, are skipped. Projection delivery
-failures are logged and retried by `control_outbox` but never block the run,
-publication, provider evidence handling, or terminal acknowledgement. A
-`control_outbox` row's retry is bounded (`MAX_LINEAR_OUTBOX_ATTEMPTS`): once a row keeps
-failing without its error matching a recognized dead-token pattern, it goes
-`dead` after the attempt cap rather than retrying forever, so it stops
-head-of-line-blocking later same-session rows -- including a session's own
-terminal receipt -- behind it.
-
-Published content is sanitized and bounded. Raw task logs, secret values, and
-untrusted webhook bodies are never automatically attached to Linear or a PR.
-
-### Structured child publication
-
-Each reportable child transition -- a unit repair round, a unit settling to
-`completed`/`exited`/`failed`, the whole-change final review passing or
-requesting a repair, the graph stopping, and aggregate emission -- inserts one
-row into `execution_publication_events` and its correlated `control_outbox`
-activity row in the same SQL transaction as the durable reducer transition
-that produced it (`supervisor/src/persistence/pipeline/unit-store.ts`). Both
-rows are addressed by a deterministic id derived from the parent attempt, unit,
-and transition, so a retried transaction is a pure no-op rather than a
-duplicate or re-sanitized insert. `execution_publication_events` carries its
-own strictly increasing `sequence` per parent attempt, independent of the
-`control_outbox` session-wide sequence, giving a restart-safe, gap-free replay
-order for the structured graph specifically.
-
-The event body is sanitized and bounded (`bounded()` in
-`supervisor/src/pipeline/execution-publication.ts`, reusing the same
-`sanitizeText` redaction used elsewhere) before either row is inserted, so
-sanitization cannot be bypassed by replaying the same transition: a replay
-either no-ops against the existing row or re-derives the identical sanitized
-body from the same inputs. Only the bounded transition summary is durably
-recorded; raw prompts, logs, and command output are never captured here.
-
-The correlated `control_outbox` row projects and is acknowledged through the
-existing outbox processor and delivery ordering, but that delivery is an
-independent, separate concern from reading the ledger back: the structured
-ledger's restart-safe "Structured Activity Log" section (appended after the
-live per-unit status breakdown in both the Linear and GitHub publication
-bodies) renders directly from the `execution_publication_events` rows
-themselves (`listExecutionPublicationEvents`), ordered by that per-attempt
-sequence, without waiting on the correlated `control_outbox` activity to reach
-`processed`. Because each event row is inserted in the same transaction as the
-reportable transition it reports, this converges immediately from durable
-state -- including on the very same pass that emits an event (e.g. the
-aggregate emitted alongside the terminal transition) and after a
-crash-and-restart replay -- rather than depending on a second, independent
-delivery to finish first. Every attempt whose terminal receipt is built after
-the structured stage hands off to a later stage (e.g. `publish`) still carries
-this ledger: it is resolved by `pipeline_instance_id`
-(`getStructuredExecutionPublicationForInstance`), not by whichever attempt id
-happens to be transitioning, since a later attempt in the same generation owns
-no execution graph of its own. The rendered log is capped both by count (the
-most recent 32 events) and by an explicit byte budget
-(`MAX_ACTIVITY_LOG_BYTES`), dropping the oldest entries first with an
-omitted-count note, so a long-running or repair-heavy graph's history can
-never itself consume the whole publication body and evict the findings, event
-sentence, or links rendered after it.
-
-## Supervisor HTTP contract
-
-| Method | Path | Authentication | Purpose |
-|---|---|---|---|
-| `GET` | `/healthz` | public | process liveness |
-| `POST` | `/webhooks/linear` | Linear HMAC + freshness | durable agent events |
-| `POST` | `/webhooks/github` | GitHub `sha256=` HMAC | durable PR/review/check events |
-| `GET` | `/oauth/install` | `OT_INSTALL_SECRET` bearer | begin Linear OAuth |
-| `GET` | `/oauth/callback` | one-time OAuth state | exchange and store installation |
-| `GET` | `/status` | `OT_STATUS_TOKEN` bearer | tickets and pipeline/effect/publication state |
-| `GET` | `/tickets/:id/admission` | `OT_STATUS_TOKEN` bearer | exact accepted automatic plan and reviewer receipt, when present |
-| `GET` | `/capabilities` | `OT_STATUS_TOKEN` bearer | active runtime release, capability digest/IDs, and effective limits |
-| `GET` | `/deployment/cutover-evidence` | `OT_DEPLOY_TOKEN` bearer | bounded, fail-closed admission drain plus runtime, snapshot, and migration rollback-compatibility identity |
-| `POST` | `/deployment/cutover/begin` | `OT_DEPLOY_TOKEN` bearer | open a snapshot cutover record with old runtime/snapshot identity, candidate snapshot, and evidence |
-| `POST` | `/deployment/cutover/advance` | `OT_DEPLOY_TOKEN` bearer | advance, complete, or mark recovery on the open cutover with phase evidence and pause-epoch checks |
-| `POST` | `/maintenance/admission/pause` | `OT_DEPLOY_TOKEN` bearer | pause new admission and advance the maintenance epoch before deploy drain |
-| `POST` | `/maintenance/admission/resume` | `OT_DEPLOY_TOKEN` bearer | resume new admission after cutover evidence is clear |
-| `GET` | `/analysis/runs` | `OT_STATUS_TOKEN` bearer | read-only, filterable `run_outcomes` evidence for improvement proposals |
-| `POST` | `/analysis/citations/grade` | `OT_STATUS_TOKEN` bearer | reproduce proposal citations and deterministically grade their evidence graph |
-| `GET` | `/repositories` | `OT_STATUS_TOKEN` bearer | registered routes |
-| `POST` | `/repositories/register` | `OT_STATUS_TOKEN` bearer | verify and upsert route/webhook |
-| `POST` | `/tickets/:id/stop` | `OT_STATUS_TOKEN` bearer | coordinator stop |
-| `POST` | `/tickets/:id/steer` | `OT_STATUS_TOKEN` bearer | capture or queue steering |
-| `GET` | `/tickets/:id/logs` | `OT_STATUS_TOKEN` bearer | sanitized live or durable bounded logs |
-| `POST` | `/tickets/:id/publications/:publicationId/retry` | `OT_STATUS_TOKEN` bearer | reopen a failed receipt |
-
-Bearer tokens are compared by hashed value with timing-safe equality. Webhook
-deliveries are acknowledged after durable claim and processed asynchronously
-through leases so restart does not lose accepted work.
-
-After a registered webhook is reconciled successfully, the supervisor requeues
-dead local GitHub deliveries only for that repository and inspects the hook's
-recent failed provider deliveries. Each exact provider delivery is claimed in
-`github_webhook_redelivery_requests` before requesting GitHub redelivery; an
-accepted request requeues only the matching local delivery, and failures remain
-lease- and backoff-retryable. This prevents a global dead-letter replay or a
-reconciliation failure from crossing repository boundaries. The ordinary
-seven-day webhook retention sweep prunes bounded batches of old accepted
-redelivery requests while preserving pending, claimed, and retryable failed
-requests.
-
-`GET /status` returns one provider-neutral block per ticket. Its identity fields
-are `id` (the provider-qualified command and persistence identity), `reference`
-(the human-facing display label), `current_session_id`, `control_provider`, and
-`external_thread` (`provider`, provider-native `id`, and display `reference`).
-Operator commands and status filtering accept `id`, never `reference`. For
-tickets with a pipeline instance, the nested `pipeline` object includes:
-
-| Field | Meaning |
+| Table | Responsibility |
 |---|---|
-| `pipeline_id` | pinned pipeline manifest id |
-| `pipeline_version` | pinned pipeline manifest version |
-| `generation` | control-session generation bound to the instance |
-| `status` | current pipeline instance status |
-| `terminal_outcome` | terminal pipeline outcome, or `null` while active |
-| `stage_id` | active stage id, falling back to the latest attempt stage |
-| `attempt_ordinal` | latest stage attempt ordinal |
-| `reentry_ordinal` | latest stage re-entry ordinal |
-| `wait_reason` | reason the pipeline is waiting, or `null` |
-| `whose_move` | honest-ledger owner: `waiting on you`, `waiting on GitHub`, `working`, or `finished` |
-| `published_pr_url` | published pull request URL when known |
-| `last_error` | newest failed/dead effect or failed gate summary, sanitized and capped at 500 chars |
-| `last_state_change_at` | pipeline instance state-change timestamp |
+| `schema_migrations` | one baseline version/name/checksum |
+| `settings` | bounded typed settings and maintenance fence |
+| `leases` | process-wide exclusive work |
+| `repository_registrations` | provider route to repository/runtime binding |
+| `work_items` | immutable admitted request plus lifecycle |
+| `inbox_events` | deduplicated, leased provider/operator input |
+| `definitions` | normalized definition identity/provenance snapshots |
+| `pipeline_runs` | bundle pointer, exact subject, status, cursor |
+| `attempts` | shared work/correction scope and lease state |
+| `records` | immutable result, decision, and delivery evidence |
+| `effects` | write-ahead external intent and reconciliation state |
+| `checkpoints` | executor-captured work/subject evidence |
 
-Automatic instances also include one nested `admission` projection. It is
-read from `pipeline_admission_projections`, never inferred from the newest
-generic gate receipt. It contains proposed/final route, bounded retry counts,
-admission terminal state and actionable questions, exact planner/reviewer
-package identity, admission/effective-manifest/generated-plan/checkpoint
-digests, and the current task-branch/publication state. The list response does
-not inline the plan. `GET /tickets/:id/admission` resolves the projection's
-immutable artifact hashes and returns the exact accepted plan and reviewer
-receipt. Both surfaces use status-token authorization and label their content
-as automatically generated. Legacy and explicit-bypass instances return
-`admission: null`, and the detail route returns `404`.
+`definitions` is intentionally narrow: its only columns are
+`definition_kind`, `definition_id`, `source_commit`, `content_hash`, and
+`normalized_payload`. Runtime behavior comes from the immutable DefinitionBundle
+blob; the table is provenance/query support, not another authoring registry.
 
-`GET /capabilities` returns the installed runtime capability descriptor's
-`release`, `capabilityDigest`, and `capabilities` array, read directly off the
-same `ValidatedRuntimeCapabilityDescriptor` admission validates every pipeline
-against. Its `limits.taskTimeoutSeconds` field reports the same configured hard
-deadline repository-graph admission enforces. The CLI's structured `ship`
-command queries this endpoint as a
-pre-mutation activation check (see "CLI contract" below): explicit structured
-selection never proceeds to any Linear call, let alone mutation, when the
-endpoint is unreachable, unauthenticated, or its response is missing,
-malformed, or does not list the exact structured capability.
+All tables are `STRICT`; identity tables use `WITHOUT ROWID` where applicable.
+Foreign keys are on. The live connection uses WAL, `synchronous=FULL`, and a
+bounded busy timeout. Boot verifies application ID, user version, baseline
+checksum, required tables/indices/triggers, foreign keys, integrity, immutable
+epoch identity, BlobStore identity, and bootstrap checksum. An old, partial,
+unknown, or mismatched database is refused rather than upgraded in place.
 
-`GET /analysis/runs` returns `run_outcomes` rows (see "Persistence contract"
-below), filterable by `outcome`, `reason` (`closed_reason`), `attribution`
-(`fault_attribution`), `graph` (`execution_graph_id`), `skill_digest` (matches
-an entry in `skill_digests`), and an inclusive `from`/`to` range over
-`created_at`; `limit` is clamped to a 200-row cap. An unrecognized filter
-value or a malformed timestamp fails the request with `400` rather than
-silently matching nothing. This is the analysis read-contract's only sanctioned
-entry point into the corpus -- see "Persistence contract" for the doctrine and
-its enforcement.
+Only `supervisor/src/persistence/` imports `better-sqlite3` or issues SQL.
+Production callers depend on explicit ports.
 
-## Persistence contract (deprecated epoch inventory)
+### 9.2 Content-addressed payloads
 
-SQLite is the authority. Core tables include:
+Inline JSON is at most 64 KiB. Larger immutable payloads are stored under a
+volume BlobStore keyed by SHA-256. A pointer carries algorithm, digest, bytes,
+encoding, media type, and payload schema. Database and BlobStore must be on the
+same volume but the database path must be outside the blob root.
 
-- ticket/run/session projections: `tickets`, `runs`, `agent_sessions`;
-- durable transport: `webhook_deliveries`, `control_outbox`,
-  `steering_items`, `sandbox_events`;
-- provider evidence: `provider_events`, `feedback_snapshots`,
-  `feedback_snapshot_events`;
-- immutable selection: `pipeline_catalog_entries`, `pipeline_catalog_aliases`,
-  `runtime_capability_descriptors`, `repository_config_snapshots`,
-  `pipeline_instances`, `pipeline_instance_stages`;
-- fenced execution: `pipeline_stage_attempts`, `pipeline_inbox_events`;
-- evidence/effects: `pipeline_artifacts`, `pipeline_gate_receipts`,
-  `pipeline_publication_receipts`, `pipeline_effect_intents`,
-  `pipeline_task_branches`, `pipeline_stage_checkpoint_objects`;
-- automatic-admission visibility: `pipeline_admission_projections`, one row per
-  automatic instance, with immutable authority/provenance and mutable bounded
-  decision counters plus hashes referencing canonical plan/reviewer artifacts;
-- structured child execution: `execution_graphs`, `execution_units`,
-  `execution_work_attempts`, `execution_review_subaction_dispatches`, `execution_gate_receipts`,
-  `execution_downstream_context`, `execution_publication_events`,
-  `execution_work_private_artifacts`, `execution_checkpoint_objects`;
-- cross-run orchestration history: `orchestration_journal`;
-- settlement rollup measurement corpus: `run_outcomes`;
-- operations: `repository_registrations`, `supervisor_leases`, `settings`,
-  `schema_migrations`, `migration_reconciliation`.
+Blob creation uses an exclusive temporary regular file, writes and fsyncs
+bytes, verifies digest and length, publishes without replacing an existing
+different object, fsyncs directories, and returns an unforgeable verified
+token. Relational stores accept that token, not a caller-authored pointer.
 
-Migration 51 makes `steering_items` the single owner of steering message,
-session/run fence, and active-delivery state. The legacy `session_inbox`,
-`work_items`, and `work_deliveries` tables remain as additive history and
-backfill inputs but receive no post-cutover steering writes. This cutover is
-deploy-forward-only by operator policy: after new steering is written, a
-pre-migration release cannot recover it from the legacy tables.
+Reads reject symlinks, non-files, wrong size, wrong digest, wrong store marker,
+or inode substitution. Active corruption blocks the lifecycle and requires
+operator action. Settled Records and Checkpoints are never rewritten.
 
-Each `agent_sessions` generation stores `provider_activated_at`, copied from
-the provider event that activated that generation. GitHub-controlled sessions
-also store `provider_activation_id`, the opaque id of the correlated,
-authorized Issue Event that owns the activation epoch. The supervisor compares
-that cursor by its position in a bounded, body-free Issue Events stream, never
-by numeric id arithmetic; exact lowercase `unlabeled` events are deactivation
-boundaries for admission reconciliation, and an incomplete bounded scan fails closed. Provider
-event timestamps remain the compatibility fence preserving native precision,
-while the cursor distinguishes same-second close/reopen/relabel ordering. The
-supervisor's later local `created_at` is not an activation watermark. Legacy
-sessions backfill only the timestamp from `created_at` conservatively.
+Provider ingress is bounded to 1 MiB; payloads above 64 KiB use the same blob
+contract. The immutable DefinitionBundle always uses a verified blob pointer.
 
-`orchestration_journal` is append-only data capture, keyed by team,
-repository, issue, and recorded time. Supervisor-owned orchestration decisions
-use `actor = 'supervisor'` with null notes; notable agent proposal projections
-use `actor = 'stage_agent'` with sanitized, bounded notes and structured
-evidence references. The journal is queryable for operator or future
-orchestrator inspection, but no coordinator transition, gate, or effect
-scheduling logic may consume it as authority.
+## 10. HTTP and CLI surface
 
-Each settled structured final-review cycle appends one complete
-`openthrottle.review-journal/v1` object as `structured` journal data before its
-gate decision is persisted. The object cross-binds the exact base/pre/post
-subject, policy and sealed roster, selector recommendation, per-persona receipt
-digests and finding ids, deterministic synthesis, independent blocker
-validation, repair dispositions, convergence cycle and resolution state, plus
-bounded selector/persona/validator dispatch-to-completion timing evidence and
-latency/count measurements (`cost_microusd = null` when unavailable). Total
-latency is the sum of those model-service intervals; critical-path latency is
-the wall interval from selector dispatch through the final persona or validator
-completion, so serialized Codex offsets are not counted more than once.
-Acknowledged launches use supervisor acknowledgement time. A result recovered
-from the launch-ack crash window, or one that completes while the provider
-launch acknowledgement is still returning, uses the persisted pre-launch
-timestamp and the separately labeled conservative `prepared_fallback`. Timing
-action ids must be the exact deterministic selector,
-persona, and validator ids under one parent review prefix, and persona ids are
-also checked against their fenced receipt action ids. The live
-gate consumes the in-memory exact-fenced receipts and validated synthesis, not
-this history row; the row is durable audit and future self-learning input.
-Raw persona findings are grouped before independent blocker validation by
-repository-relative path plus a sufficiently specific stable semantic anchor and
-lowercase kebab-case claim discriminator; diagnostic prose and persona invariant
-are not group identity. Each group keeps
-one existing representative, selected deterministically by explicit severity
-order (`P0`, `P1`, `P2`, `P3`), stable finding id, then canonical finding bytes.
-Only that exact representative may be validator-accepted and enter final repair,
-once. Journal evidence retains every member finding id and reporting persona,
-but advisory and non-representative members cannot alter the representative's
-validator disposition or resolution state. Only `accepted` and `rejected`
-repair dispositions carry those validator results; `deferred`, `fixed`, and
-`superseded` dispositions carry explicit `not_validated` and are excluded from
-validator acceptance and rejection counts. Rereview correlates unresolved work
-by stable semantic group and finding/member ids before treating absence as
-fixed, so diagnostic rewording cannot duplicate or prematurely resolve a
-finding. Rereview searches the newest bounded history window. A
-missing or malformed prior journal is appended as a separate audit-gap note and
-cannot block, pass, or otherwise authorize the live receipt/gate decision.
-Persona actions remain independent sessions. Each fixed review role runs under
-a distinct pre-created OS principal and gets a distinct action directory,
-transport state, `HOME`, engine profile (`~/.claude`, `CODEX_HOME`, or OpenCode
-state), and root-owned live-process fence. Per-principal process cleanup cannot
-signal a concurrently live sibling, and owner-private sibling homes cannot be
-read or changed across principals. Completed or stale sibling directories are
-sealed; a concurrently live sibling is never relocked by another action. All
-siblings read exact-subject, action-scoped
-read-only repository views derived from the one shared integration checkout;
-no persona receives a worktree. The supervisor dispatches the deterministic
-roster through the `REVIEW_FANOUT_CONCURRENCY` active window, gathers every
-receipt, and only then runs deterministic synthesis and any blocker validator
-serially. Codex's
-shared subscription credential has a rotating one-time refresh token, so the
-supervisor is its sole refresh authority: it refreshes a near-expiry token
-behind a single in-flight exchange, so concurrent runs coalesce instead of
-racing to spend the same one-time token, and seeds each sandbox an
-access-token-only copy whose `tokens.refresh_token` is the empty string --
-present because Codex expects the key, useless because it cannot rotate the
-shared account's live token away from another run. A seeded access token must
-have a readable JWT `exp` and cover the exact sealed child-action timeout (or
-the configured stage timeout when no child action exists) plus a safety margin;
-seeding fails closed instead of handing out one that could expire mid-action.
-The stored `last_refresh` and `tokens.account_id` are preserved byte-for-byte in
-the seed. Pinned Codex 0.144.0 gives a readable access-token `exp` precedence
-over its legacy eight-day `last_refresh` fallback, so that preserved timestamp
-cannot provoke proactive in-sandbox refresh. Its 401 recovery ladder can still
-attempt the deliberately empty refresh token, but that is a terminal signal
-that the supervisor-proven access token was rejected, never a rotation path.
-The seed therefore always wins when a resumed sandbox already holds an
-`auth.json`, and nothing is ever read back out of a sandbox: no per-action auth
-snapshot is captured, and the durable store is reloaded from the bootstrap env
-seed only when that seed carries a strictly newer `last_refresh`. Selector,
-persona, and validator dispatch intent is persisted before provider launch and
-marked launched after acknowledgement.
-Repeated drains concurrently collect every durably launched sibling before
-filling free active slots; a prepared-only crash window reuses the same
-provider idempotency fence. Lowering the configured window never redispatches
-or cancels already-launched siblings, and setting it to one restores ordered
-one-at-a-time dispatch for new fanouts.
+All bodies and text are bounded and sanitized before logging or returning an
+error. Status/operator endpoints use constant-time bearer-token comparison.
+Webhook endpoints verify provider HMAC before ingestion.
 
-`run_outcomes` holds one deterministic row per pipeline instance, written
-exactly once at its terminal transition -- either applyTransition's normal
-settlement or supersedeOtherInstances' fencing of a superseded generation.
-Supervisor-derived facts only, no agent-authored free text: join keys
-(ticket, instance, generation, execution graph id, plan digest, base
-commit), outcome and closed reason, fault attribution, generations
-consumed, per-unit repair rounds, per-phase durations, token cost (`NULL`
-means unmeasured -- no production path stamps a cost yet), engine, and the
-deduped skill digests that ran (from receipt producers). Retained under the
-separate, longer `RUN_OUTCOME_RETENTION_DAYS` cutoff rather than the other
-operational-data retention windows, since it is safe to keep for
-skill-tuning measurement.
+| Method and path | Auth | Contract |
+|---|---|---|
+| `GET /healthz` | public | `{ok:true}` process liveness |
+| `GET /capabilities` | status bearer | release, capability digest, capabilities, limits |
+| `GET /runs/:reference/status` | status bearer | run/cursor/Attempt/Effect projection |
+| `GET /runs/:reference/logs` | status bearer | stable cursor page across run, Attempt, Record, Effect, Checkpoint, inbox events |
+| `GET /analysis/runs` | status bearer | bounded settled-run metadata query |
+| `GET /runs/:reference/analysis` | status bearer | bounded result/decision/delivery metadata |
+| `POST /runs/:reference/control` | status bearer | durable deduplicated `stop` or `supersede` request |
+| `GET /repositories` | status bearer | registrations |
+| `POST /repositories/register` | status bearer | prepared Linear or GitHub route registration |
+| `GET /maintenance` | deploy bearer | maintenance fence/version |
+| `POST /maintenance/close` | deploy bearer | compare-and-set close |
+| `POST /maintenance/open` | deploy bearer | compare-and-set open |
+| `GET /maintenance/active-work` | deploy bearer | named settle-or-abandon preflight |
+| `POST /webhooks/linear` | Linear HMAC | bounded deduplicated event |
+| `POST /webhooks/github` | GitHub HMAC | bounded deduplicated event |
 
-### Analysis read-contract
+During maintenance every mutating provider event returns `503`, `Retry-After`,
+`acknowledge:false`, and persists nothing. After reopening, a provider retry
+enters the normal inbox and deduplicates by provider delivery/semantic group.
 
-`run_outcomes` and the receipt tables it is derived from are exposed
-read-only through `GET /analysis/runs` and `openthrottle analysis` (see
-"Supervisor HTTP contract" above). This generalizes the `orchestration_journal`
-doctrine above: the corpus is evidence for improvement proposals, never an
-input to a pipeline decision -- no gate, transition, scheduler, or
-effect-drain module may import or query it.
-`supervisor/src/persistence/pipeline/analysis-store.ts` is the corpus's only
-read surface and is wired into the HTTP layer from a plain `db` handle in
-`index.ts`, deliberately separate from `PipelineStore` (which
-gate/transition/scheduler/effect-drain code consumes). `PipelineStore`
-exposes no `run_outcomes` read method of its own for exactly that reason: a
-method on that interface would be reachable by any decision code already
-holding the store, without importing `analysis-store.ts` at all -- the
-single-row lookup a settlement write wants to verify still exists on
-`RunOutcomeStore` itself (`persistence/pipeline/run-outcome-store.ts`), not
-on `PipelineStore`.
+The CLI maps `status`, `logs`, `analysis`, and `stop` to these kernel-native
+projections. It presents pipeline, Attempt, Record, Effect, and Checkpoint
+vocabulary only. `init` scaffolds `.openthrottle/`, registers the repository,
+and installs local planning/operator skills; it does not create runtime
+definition rows directly.
 
-`supervisor/src/__tests__/architecture.test.ts` enforces the contract with
-two rules. The first names the gate (`pipeline/gates.ts`,
-`pipeline/execution-gates.ts`, `persistence/pipeline/unit-store-phase-reducer.ts`),
-transition (`persistence/pipeline/transition-store.ts`,
-`persistence/pipeline/instance-store.ts`), scheduler (`pipeline/coordinator.ts`,
-`pipeline/unit-coordinator.ts`), and effect-drain (`operations/pipeline-effects.ts`,
-`operations/unit-effects.ts`, `operations/structured-child-runtime.ts`,
-`pipeline/control.ts`, `pipeline/settlement.ts`) modules as roots and walks
-the import graph forward from them, transitively, so it fails if any of them
--- or anything they come to depend on, at any depth -- imports the analysis
-surface, not just a direct import from a listed file itself. The second
-confines every `run_outcomes` SQL literal, anywhere in the source tree, to
-exactly `run-outcome-store.ts` (the write path) and `analysis-store.ts` (the
-read surface) -- closing the gap the first rule alone leaves open, where a
-decision module under the `persistence` boundary could otherwise read the
-corpus with a raw query of its own and no import to catch.
+## 11. Security and trust boundaries
 
-Schema migrations are transactional, checksum-pinned, and idempotent. Migration
-code may recognize historical direct-run rows solely to reconcile an older
-SQLite file conservatively. Such rows never participate in admission,
-selection, routing, scheduling, status summaries, or sandbox execution. New
-databases do not create the retired task-work table. Historical satellite
-tables such as `run_liveness`, `session_executions`,
-`pipeline_runtime_resources`, `run_stage_bindings`, and
-`pipeline_work_bindings` remain in immutable migrations only; live state is
-stored on the owning actor, session, instance, attempt, or work row.
+- Registered repositories are trusted for code execution because config may
+  contain bootstrap and command strings. Registration is an operator trust
+  decision.
+- Ticket, issue, plan, comment, review, commit-message, and repository prose is
+  untrusted data and cannot override system/action fences.
+- Sandbox credentials are minimal: scoped repository/provider access needed by
+  the action and one model credential. Fly, Daytona administration, webhooks,
+  installation, and operator tokens never enter the action.
+- Origin URLs are clean; a credential helper supplies GitHub credentials.
+- Exact Git subjects are full lowercase hexadecimal object IDs. Branch names
+  are routing hints, never evidence authority.
+- Logs and activities redact tokens, credentials, auth headers, URL user-info,
+  and bounded secret-like values. Raw model/provider output is not emitted to
+  public logs.
+- All native session and provider callbacks are treated as untrusted until
+  bound to the exact live fence.
+- Only deterministic registered primitives may evaluate candidates, integrate
+  checkpoints, publish, wait on providers, or mutate runtime resources.
 
-Rollback-compatible migration cutovers use a two-release sequence. First deploy
-a supervisor that advertises
-`schema-migrations-name-additive-rollback-compatible/v1` in
-`/deployment/cutover-evidence`. Only after that evidence is live may a later
-release apply additive, rollback-compatible future migrations whose
-`schema_migrations.name` deliberately ends with
-` [rollback-compatible:additive/v1]`. Older supervisors that implement this
-contract still validate every known migration name and checksum exactly, and
-they fail closed on any unknown future row without that exact suffix or with a
-malformed suffix.
-The deploy workflow validates the complete current
-`supervisor/src/persistence/migrations/definitions.ts` catalog before every
-supervisor deployment, including `workflow_dispatch` runs. It rejects any
-post-cutover migration definition without one statically verifiable,
-double-quoted literal name carrying the marker suffix, even when that migration
-was introduced by an earlier failed deployment rather than the triggering
-diff; it pauses admission, waits for a clear drain, and requires the live pre-deploy
-supervisor's cutover evidence to expose that database contract. This preserves
-the initial precursor bootstrap while making later migration-bearing releases
-prove rollback compatibility before they open SQLite or write unmarked future
-ledger rows.
+## 12. Offline epoch replacement
 
-Citation-backed proposal flows use a separate provider-neutral citation gate.
-`/analysis/citations/grade` is still the only production path that resolves
-analysis queries against `run_outcomes`; after resolution it calls the
-pipeline-level citation gate with plain proposal bytes plus resolved result
-rows. The gate emits canonical `openthrottle.citation-gate/v1` decisions with
-bounded reason codes (`all_citations_reproduced`,
-`partial_claim_survival`, `no_claims_survived`, `stale_evidence`) and persists
-them in `citation_gate_receipts` by proposal
-hash. Exact replay returns the original receipt; the same proposal hash paired
-with different resolved evidence is rejected as conflicting replay. Scheduler,
-transition, reducer, and effect-drain code must not import the analysis store
-to recreate this evidence, and must not treat citation receipts as authority to
-advance pipeline execution.
+There is no compatibility runtime and no online epoch transition protocol.
+Because this installation is dogfood-only, replacement is one explicit
+maintenance operation using:
 
-The provider-neutral improvement-proposal gate composes an exact successful
-citation decision and its matching persisted OPE-113 receipt with one validated
-pinned-versus-proposed differential input. It rejects self-sealed decision
-objects that lack the store-derived receipt, binds both citation `proposal_id`
-and `proposal_hash` to the ratchet identity and `tuner_authority.proposal_digest`,
-recomputes the ratchet itself, and seals a combined binding digest over the
-citation decision, receipt, and exact ratchet input digest. Its journal retains
-the exact validated inputs, repairable reasons, binding digest, and deterministic
-policy digest. `core/tune@1` is the first
-mutation-path caller: it must pass this gate before creating or mutating its
-proposal worktree. Ordinary structured candidate integration is unchanged and
-does not carry self-improvement evidence; any later proposal producer inherits
-the same pre-mutation call requirement.
+```bash
+npm run build --prefix contracts
+npm run build --prefix supervisor
+node supervisor/scripts/offline-replace.mjs /absolute/path/to/manifest.json
+```
 
-An accepted tune change carries bounded exact `after_content` bytes (null only
-for deletion) whose digest is the declared `after_digest`. The differential
-input also carries paired exact `pinned_files`/`proposed_files`; before issuing
-edit authority, the supervisor derives the complete file diff from those bytes
-and requires exact equality with the proposal change set. Config, graph, or
-repository-skill policy structures must parse from those same bytes; pipeline
-and runtime mutation targets fail closed until they have an equivalent
-deterministic policy comparator. Structured workers receive the exact content
-in a separately hash-bound `openthrottle.tune-change-material/v1` request field
-(execution-plan instructions remain compact and identify its entries),
-with a separate canonical-JSON bound that reserves space inside the fixed child
-request envelope even when replacement text contains JSON-escaped characters,
-and the root-owned child executor independently checks the original pinned base,
-path set, operations, content bytes, and digests both before candidate acceptance
-and again before integration. Authorization remains valid for the bounded
-structured composite-stage deadline, not merely the ordinary single-stage
-timeout.
+The manifest is bounded and uses argv arrays, never shell strings. It declares:
 
-For config comparison, absent repository limits resolve to the runtime defaults
-(`max_turns=200`, `task_timeout=7200`) before monotonic comparison. Repository
-skill package tunability is bound to the matching exact config entry, where an
-absent `tunable` value means `true`; a config lock cannot be overridden by a
-caller-authored package wrapper. Frontmatter, canonical contract fences, and
-whole command/tool-allowlist subsections are immutable, including annotated
-JSON fences and nested allowlist entries. Agent policy files and all non-craft
-package files outside `references/` are byte-immutable. These sealed config,
-graph, policy, and allowlist fields are the capability-authority boundary;
-craft and reference prose is behavioral guidance and remains subject to the
-required human merge authority. Markdown executable surfaces in references
-(fenced or indented command blocks and inline code) are preserved exactly, and
-a conservative deterministic lint rejects obvious new command/tool invocation
-text. That lint is defense in depth, not a claim that arbitrary natural-language
-guidance can prove the absence of an invocation; only the sealed runtime
-capability boundary provides that guarantee.
-Human authority and tuner authority
-must have distinct actor identities. `human_authority.approval_digest` names a
-human authority/lock record, not the tuner proposal subject; OPE-115 binds that
-record to its human-merge workflow, while the composed gate binds the tuner
-proposal to citation evidence.
+- proof that ingress is closed, supervisors/workers are stopped, and no storage
+  lock exists;
+- every active Attempt, correction, Effect, lease, and runtime resource, each
+  terminal or explicitly abandoned with cleanup proof;
+- exact old release, database, blob root, and unused archive root;
+- exact fresh release, distinct absent database/blob paths, BlobStore identity,
+  and checksummed bootstrap containing only settings and repository
+  registrations;
+- one unused report path;
+- commands to start/stop the candidate, run named ordinary/structured smoke
+  work, reopen ingress, and restore the old tuple.
 
-Stage C child-unit work must add any needed live binding state to the owning
-unit/work records rather than reviving empty historical binding tables.
-For the serial `for_each_unit` composite stage, `execution_graphs` binds one
-parent pipeline attempt/run to an immutable execution graph and plan digest,
-the exact prepared initial Git subject independently of the mutable current
-integration subject,
-plus the graph-declared unit phase sequence, the pinned configured command
-names, the bounded max repair rounds, and the whole-change final phase
-(`command`/`review`/`repair`/`done`, `NULL` before the first unit integrates);
-`execution_units` stores the immutable unit projection, dependency list,
-authored order, canonical execution-plan command sequence for that unit,
-active work pointer, current phase
-(`implement`/`simplify`/`command`/`candidate`/`lead`/`integrate`), current
-repair cycle, repair round count, command index, accepted/integration subjects,
-and terminal level/alarm fields; and `execution_work_attempts` stores each
-child action attempt with parent instance/attempt/run/unit fences, unit id
-(`NULL` for a whole-change final action), action kind, repair cycle, command
-name, idempotency key, runtime request/session hashes, lease owner/window,
-payload, result hash, output subject, receipt, and terminal/error state.
-Composite foreign keys bind every unit, action, receipt, and downstream
-context record to the same execution graph and parent attempt so cross-instance
-or mixed-attempt child identities are rejected durably. When an execution plan
-declares commands, those commands are the authoritative command sequence:
-unit-scoped commands run only for their named unit, unscoped commands run for
-every unit, and the whole-change final command sequence uses the canonical plan
-command names. If the plan declares no commands, the graph's command phase
-defaults are used for backward-compatible structured runs. A declared command
-missing from the sealed repository config fails closed before child dispatch,
-and a `not_configured` receipt for a declared unit or final command is a failed
-gate. The durable unit
-reducer advances a unit through the persisted graph-declared phase order:
-implement (or repair on re-entry), optional simplify, declared command slots,
-executor candidate derivation, lead acceptance bound to that exact candidate
-subject and its command receipts, and only then integration. A
-`semantic_repair_required` lead decision returns the unit to a fresh implement
-cycle with command index reset, bounded by the graph's max repair rounds, after
-which the unit settles as `failed`. Once every unit has settled,
-and at least one unit reached `completed`, the same fenced-action mechanics
-rerun the full configured commands and one fresh, report-only final review
-against the final integrated subject; either a nonzero final-command decision
-(`failure` / `command_exit_nonzero`) or a `semantic_repair_required` final
-review routes through a dedicated final-repair action and a fresh command/review
-cycle, invalidating the prior review's authority. Final review is a sealed
-supervisor orchestration, not one reviewer's opinion: the supervisor first
-dispatches `select-review-personas` against the exact subject and a bounded
-policy allowlist; validates its subject, policy digest, ordered recommendation,
-and evidence rationale; adds mandatory baseline and deterministic plan/command
-risk lenses; and dispatches each selected persona as an independent fresh,
-read-only loop action. Missing, duplicate, unexpected, stale-subject, or
-wrong-producer receipts fail closed. P0/P1 findings cannot enter the final gate
-until a separate `validate-review-findings` action returns each accepted blocker
-byte-for-byte. Every persona receipt is bounded by the sealed `max_findings`
-value (eight in the current policy) before validator or journal synthesis.
-Rejected blockers and P2/P3 advisories remain gate/journal telemetry but are
-excluded from the final-repair-authoritative receipt. The supervisor alone
-synthesizes the final review receipt and gate input, with exact selector,
-persona, validator, and command receipt hashes as provenance. Transient persona
-or validator dispatch/collection exceptions leave the parent review active and
-replay the same deterministic subaction ids on the next drain. On a repair
-cycle, selector authority requires the
-prior ordered persona ids and the prior roster digest must match, so rereview
-cannot silently add, drop, or reorder a lens. Unit leads never dispatch review
-personas and cannot promote persona findings. The reducer may lease at most
-one active action -- unit-scoped or whole-change -- per parent attempt at a
-time. It expires only pre-dispatch claims by lease time. Dispatched or running
-child actions remain the active action while their parent-run-fenced child
-liveness is fresh, and are recovered/collected by idempotency rather than
-duplicated. Structured review selector/persona/validator heartbeat ids renew
-the persisted parent final-review lease only through their exact durable
-subaction mapping; unknown ids, wrong runs, and inactive parents are rejected.
-When a dispatched or running child action misses its heartbeat
-fence, the supervisor first identifies that exact expired current action and
-invokes idempotent runtime result collection outside the SQLite transaction. A
-recovered result completes only through a compare-and-set against the unit's
-(or graph's) current active action pointer. Only confirmed no-result collection
-may then mark the work attempt dead, level the unit to `exited` with
-`alarm = 0` (or stop the whole graph for a lost whole-change final action),
-clear the active action pointer through a separate compare-and-set, and allow
-serial dispatch to continue with the next ready unit. Collection errors do not
-prove absence; they retain the active action for bounded retry. A stopped
-child graph records `stopped_at` and `stop_reason` on `execution_graphs`,
-levels unfinished units to `exited`, and makes leasing fail closed while that
-stop fence is present, including when stop was requested before any child
-action was active. A gate decision (`unit_acceptance`, `integration`, or
-`final_review`) is supplied by the caller already evaluated against the pinned
-receipt fence and producer bindings; the reducer only persists it once and
-applies its routing exactly once, so a replayed identical decision is a no-op
-rather than a duplicate repair round.
+The command refuses relative, root, nested, symlinked, existing fresh, or
+overlapping paths. It makes a SQLite backup, runs integrity and foreign-key
+checks, records schema and table counts, copies and hashes every blob, and
+atomically publishes the archive manifest. It initializes and verifies the
+fresh twelve-table database and BlobStore before starting the candidate.
 
-`execution_work_private_artifacts` contains at most one bounded, digest-fenced
-recovery BLOB per `execution_work_attempts` row. Insertion and terminal action
-settlement share one SQLite transaction; replay must match the exact schema,
-manifest, byte count, and sha256 or fail closed. Ordinary work listings do not
-read the BLOB column. The periodic sweep deletes at most 100 BLOBs per pass once
-they are older than 30 days and their owning action and pipeline have both been
-terminal for that retention window; active pipelines and recent `needs_human`
-recovery remain available.
+Both smoke commands must return distinct IDs, `status:"passed"`, and bounded
+evidence. They exercise ordinary and structured pipelines before ingress
+reopens. Success writes one checksum-bound completion report.
 
-`execution_gate_receipts` records deterministic child gate decisions by work
-attempt and gate kind. A receipt is accepted only after the typed child evidence
-matches the expected producer, parent attempt/run/request, unit/action,
-generation/native-session, input subject, and current output subject fences;
-exact replay is idempotent and conflicting replay is rejected. The receipt
-stores the shared gate result/outcome/reason, sorted artifact hashes, canonical
-payload, and receipt hash.
+On any failure, the command stops the candidate and invokes restoration of the
+matching old release/database/blob tuple. It writes a checksum-bound rollback
+report and exits nonzero. New-epoch rows are never imported into the old
+database. The archived old tuple is retained until the operator accepts the new
+epoch.
 
-`execution_downstream_context` records immutable context emitted by an already
-integrated/completed unit for existing pending units in the same execution
-graph. Context records are addressed by source unit, target unit, and payload
-hash; duplicate exact records are idempotent, unknown targets, non-pending
-targets, non-integrated sources, and topology changes are rejected rather than
-mutating the graph.
+The normal deployment workflow performs direct releases only after this
+one-time replacement. It does not reproduce maintenance phases or storage
+authority in CI YAML. See
+[`runbooks/execution-kernel-rollout.md`](runbooks/execution-kernel-rollout.md).
 
-Once every unit has settled and, when at least one unit completed, the
-whole-change final review has passed (`execution_graphs.final_phase = 'done'`),
-the reducer emits one `execution_graph_result` artifact and one aggregate
-`stage_result` for the parent attempt; the aggregate hash is compare-and-set on
-`execution_graphs` so the parent can settle once through the ordinary
-stage-result path. Structured success requires every authored unit to have a
-`completed` terminal level plus accepted integration evidence for that unit's
-exact integration subject. The graph's integration subject and whole-change
-final review remain bound to the exact final integrated commit after all unit
-and whole-change integration phases complete. At the successful aggregate
-boundary, the parent `stage_result`, `execution_graph_result` aggregate
-artifact, persisted immutable subject, and downstream publish request are
-instead bound to the canonical workspace tree from the accepted
-executor-verified integration receipt for that exact commit. The supervisor
-keeps the independent observed-workspace equality fence fail-closed; commit
-subjects are not accepted as aliases for tree subjects at publication time. A
-stopped, exited, failed, or partially integrated graph never claims structured
-success.
+## 13. Verification contract
 
-`pipeline_artifacts.kind` includes `execution_graph_result` for the child
-aggregate artifact in addition to the existing stage, review, command,
-provider, human, and publish artifacts.
+Every release must pass:
 
-`execution_publication_events` records the ordered, durable child-publication
-event described in "Structured child publication" above: one row per
-reportable transition, fenced to its exact execution graph/pipeline
-instance/parent attempt, carrying a per-attempt sequence, an event `kind`
-(`unit_repair`, `unit_settled`, `graph_stopped`, `final_review`, `aggregate`,
-`steering_undelivered`),
-its sanitized body, and the id of the `control_outbox` row it produced in the
-same transaction.
+- contract validation and cross-reader/cross-process canonical-byte fixtures;
+- compiler closure, platform trust, and cold-manifest reconstruction tests;
+- pure reducer, transition idempotency, persistence restart, and corruption
+  tests;
+- inspect/edit action-profile and native-session fencing tests for every engine;
+- semantic normalization, result-pending correction, and exhaustion tests;
+- ordinary and structured coordinator tests on the shared kernel;
+- Effect reconciliation, acknowledgement-loss, unknown-outcome, and runtime
+  cleanup tests;
+- fresh epoch, blob fault-injection, maintenance ingress, HTTP, CLI projection,
+  and offline replacement/rollback tests;
+- TypeScript build/typecheck, all project test suites, Bats runtime tests,
+  Docker ordinary smoke, and structured walking skeleton.
 
-## Supervisor environment
-
-Required:
-
-- HTTP/storage: `SUPERVISOR_URL`, `OT_STATUS_TOKEN`, `OT_DEPLOY_TOKEN`,
-  `OT_INSTALL_SECRET`;
-- GitHub: `GITHUB_WEBHOOK_SECRET`, write-capable `GITHUB_TOKEN`, and
-  read-only `GITHUB_READ_TOKEN`;
-- Daytona: `DAYTONA_API_KEY`.
-
-`OT_DEPLOY_TOKEN` is the only bearer authority allowed to mutate supervisor
-maintenance or read deployment cutover evidence. It is held only by the Fly
-supervisor and is outside the sandbox and GitHub Actions credential allowlists.
-The deploy workflow uses its existing Fly deploy authority to run the bounded
-cutover client inside that supervisor; the token never leaves the machine.
-The supervisor-only fence release bootstraps on the unchanged v12 snapshot;
-after that release is installed, every push that builds a new snapshot must
-pause and drain before deploy, then verify the pinned runtime release, runtime
-digest, and exact snapshot before resuming admission. A manual cutover without
-a snapshot build must supply the exact expected snapshot explicitly.
-Every non-bootstrap cutover or supervisor deployment must also verify the live
-pre-deploy supervisor's `/deployment/cutover-evidence` includes the expected
-`schema-migrations-name-additive-rollback-compatible/v1` database contract
-and reject any post-cutover definition in the complete current catalog that
-lacks one statically verifiable, double-quoted literal name with the exact
-marker suffix before it opens and mutates SQLite. The whole-catalog check runs
-before every supervisor push or `workflow_dispatch` deployment so an unrelated
-retry cannot bypass a migration introduced by an earlier failed deployment;
-the standalone precursor release itself remains a supervisor-only bootstrap
-because its parent cannot yet advertise the contract.
-
-Optional/defaulted:
-
-- Linear control-provider readiness: `LINEAR_WEBHOOK_SECRET`,
-  `LINEAR_CLIENT_ID`, and `LINEAR_CLIENT_SECRET`. The supervisor may boot
-  without them; Linear registration, installation, and webhook endpoints then
-  report the provider as unavailable;
-- `PORT=8080`, `DATABASE_PATH=/data/openthrottle.db`,
-  `DAYTONA_SNAPSHOT=openthrottle`;
-- `DEFAULT_AGENT=codex`, plus the selected agent credential:
-  `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_AUTH_JSON`, or `KIMI_CODE_API_KEY`;
-- `TASK_TIMEOUT=7200` for ordinary stage hard expiry; must be between 1 and
-  86,400 seconds. A structured composite parent may extend its immutable
-  `expires_at` up to the sealed graph phase maximum, also capped at 86,400
-  seconds;
-- `REVIEW_FANOUT_CONCURRENCY=5`, bounded from 1 through 8, caps concurrently
-  active review-persona subactions within one sandbox. Setting it to 1 restores
-  deterministic serial dispatch ordering without a code change;
-- `ORPHAN_GRACE_MINUTES=5`,
-  `RUNTIME_RESOURCE_RETENTION_MINUTES=60`,
-  `WEBHOOK_MAX_AGE_SECONDS=60`, `SANDBOX_EVENT_POLL_INTERVAL_MS=5000`,
-  `STALL_TIMEOUT_SECONDS=900`, `ALLOW_LINEAR_MERGE=false`,
-  `RUN_OUTCOME_RETENTION_DAYS=180`;
-- `PIPELINE_CATALOG_PATH`, `SANDBOX_RUNTIME_RELEASE`, and
-  `SANDBOX_RUNTIME_DESCRIPTOR_PATH` for pinned deployment assets.
-
-Snapshot build automation uses `DAYTONA_SANDBOX_CPU=4`,
-`DAYTONA_SANDBOX_MEMORY=8`, and `DAYTONA_SANDBOX_DISK=10` unless an operator
-supplies another positive integer size.
-
-Repository and base-branch routing are not environment configuration; they
-must come from authenticated durable registration.
-
-## Repository config (deprecated epoch inventory)
-
-Committed `.openthrottle.yml` may declare `agent`, the legacy provider-bound
-`model`, provider-specific `agent_defaults`, `test`/`lint`/`build`/`dev`/
-`format` commands, `post_bootstrap`, limits, `mcp_servers`, and implement/
-investigate pipeline aliases. `agent_defaults` accepts `claude`, `codex`, and
-`opencode` entries with an optional `model`; Claude and Codex entries may also
-set `reasoning_effort` to `low`, `medium`, `high`, `xhigh`, or `max`. OpenCode
-reasoning effort is rejected because its CLI has no equivalent sealed option.
-The selected worker's provider default applies to ordinary and structured
-agent actions; an explicit structured worker model wins, followed by the
-provider default, while the legacy top-level model applies only when the
-selected worker matches the top-level `agent`. Effective model and reasoning
-effort for ordinary stages are derived from the exact sealed repository config
-identified by the hash-bound config digest. Structured child actions copy the
-effective values directly into their hash-bound action request. Both paths
-render provider CLI flags rather than inheriting ambient user configuration.
-The config is fetched from the exact base commit, strictly validated,
-normalized, hashed, and uploaded as a sealed snapshot. Registered repositories
-are trusted for code execution because
-`post_bootstrap` is arbitrary code. `post_bootstrap` runs once per sandbox
-lifetime under the bake-once marker (see Sandbox stage contract), not once per
-stage, plus once per structured unit worktree before the first repository
-command executes there — it is the repository's declared way to make any
-fresh checkout runnable, and unit worktrees are fresh checkouts.
-
-An implement intent may set `admission_mode: legacy | automatic` and may bind
-`planner_skill` and `reviewer_skill` through declared `builtin://` or `repo://`
-references. Missing mode is legacy. `openthrottle init` writes `automatic` for
-new Claude and Codex configurations, and this repository explicitly enables it.
-OpenCode initialization omits the mode and uses direct routing.
-Existing configurations may retain missing-mode or explicit `legacy` behavior.
-
-## CLI contract
-
-`openthrottle setup` loads the CLI's pinned release manifest and drives the
-provider-neutral onboarding orchestrator over the registered hosting and
-runtime adapters: it preflights operator credentials, inspects live provider
-state, requires approval of every planned mutation (billable and externally
-visible mutations are badged; `--yes` pre-approves), provisions the runtime
-snapshot and the supervisor deployment, and persists readiness evidence plus
-resource pins in the local onboarding profile. Generated supervisor secrets
-live in the local secret store and their values are never printed. Setup writes
-the supervisor URL plus status token to a separate owner-only
-`openthrottle.supervisor-access/v1` document; the profile and
-`openthrottle.local-secrets/v1` schemas remain unchanged for downgrade
-compatibility;
-operator-owned third-party credentials are never stored locally. `--check`
-renders the same preflight/inspect evidence strictly read-only,
-`--profile <name>` selects the onboarding profile, and `--legacy-checklist`
-prints the manual `fly secrets set` checklist generated from the same table
-that mirrors the supervisor env authority (deploy-owned `PORT` and
-`DATABASE_PATH` excluded). `openthrottle init --profile <name>` selects that
-profile's supervisor-access document (defaulting to the `default` profile)
-when both explicit environment values are absent. A complete
-`OT_SUPERVISOR_URL` and `OT_STATUS_TOKEN` pair takes precedence; a partial pair
-fails closed and is never combined with stored access. Init then detects the GitHub
-origin/default branch,
-writes `.openthrottle.yml`, installs the pinned global `openthrottle` operator
-and `ot-plan` authoring skills through Skillfish for every detected supported
-local agent, and idempotently registers either a Linear-team or GitHub-Issue
-control route plus the GitHub webhook. Matching skill installs are skipped. A
-skill conflict or installation failure stops before external registration and
-prints the lifecycle recovery command. The registration body uses
-`controlProvider: "linear" | "github"` (default `linear` for existing clients);
-Linear team fields are required only for Linear and rejected for GitHub.
-Re-registering the same repository may switch its future control route
-atomically; already-admitted tickets and sessions retain their pinned provider,
-and a Linear team route may never be transferred to another repository. Its
-default initialization transactionally writes
-an editable `simple_editable` repository graph, the exact referenced
-`implement-plan`, `admission-plan`, and `review-admission-plan` package closures
-under `.openthrottle/skills/`, and
-`.openthrottle/skills.lock.json`. The lock pins the OpenThrottle release plus
-the upstream and scaffold graph, package, and file digests and binds those
-fields with a self-integrity digest. The package closure has the same 64-file
-and 256-KiB limits as supervisor admission and rejects symlinks and non-regular
-entries. Generated loop timeouts use the authenticated supervisor's advertised
-effective task-timeout limit. Preflight validates the complete candidate config
-and graph, compares local/upstream/provenance digests, and permits only
-`unchanged` and `upstream-only`; `local-only` and `conflict` refuse all writes.
-The CLI prints every classification and requires a separate confirmation before
-applying; `--dry-run` exits after the read-only plan without files or
-registration changes. This scaffold rewires only the simple graph's
-initial and repair implementation loops. Review, simplification, publication,
-and structured-unit bindings stay platform-owned and are not advertised as
-editable because current repository-skill dispatch cannot faithfully replace
-their scopes. `openthrottle ship <plan.md>` creates a Linear issue and, when
-`OT_AGENT_APP_ID` is set, delegates it with `IssueUpdateInput.delegateId`;
-Linear emits that first delegation as an issue-only assignment-created agent
-session, so any graph selection or execution plan must be present in the child
-issue description. `status`, `stop`, `logs`, and `analysis` call authenticated
-supervisor endpoints. Ticket-targeting commands and `status` filtering use the
-provider-qualified ticket `id`; status output leads with the human-facing
-`reference`. `analysis` filters `GET /analysis/runs` by `--outcome`, `--reason`,
-`--attribution`, `--graph`, `--skill-digest`, `--from`, `--to`, and `--limit`.
-
-`openthrottle status <ticket> --admission` reads the same authenticated
-provider-neutral projection as `/status` and prints the exact accepted plan
-and reviewer receipt from `/tickets/:id/admission`. It never scrapes Linear or
-GitHub prose and grants no activation, routing, publication, or mutation
-authority.
-
-An explicit structured (unit-consuming) graph selection adds one pre-mutation
-step to `ship`: before any Linear call, the CLI calls the configured
-supervisor's `GET /capabilities` and requires the exact `graph/for-each-unit@1`
-capability in the response. Unreachable, unauthenticated, missing, or
-malformed/stale evidence fails closed with a stable error and never falls back
-to `simple`; only a matching, well-formed response permits the ship to
-proceed to team resolution and issue creation.
-
-The CLI never creates per-project snapshots or configures routing fallbacks.
-
-## Security invariants
-
-- Ticket text, PR comments, reviews, commit messages, and repository content are
-  untrusted data. Registered repository code itself is execution-trusted.
-- Only credentials declared by the selected stage enter its sandbox. Daytona,
-  Fly, Linear app, webhook, installation, and operator secrets remain in Fly.
-- `repo.write` authorizes mutations only inside the executor-owned checkout;
-  it receives the read-only GitHub token, as do `repo.read` and
-  `provider.read`. Sandboxes never receive the supervisor's reusable
-  write-capable GitHub token. Remote task-ref creation, compare-and-advance,
-  and publication are supervisor-owned effects.
-- The same applies per loop action, independent of the whole attempt's stage
-  credentials: each action's engine process launches with a cleared
-  environment carrying only its own declared, materialized credentials and
-  MCP servers (see Action-scoped credentials and MCP servers above).
-- Git credentials use a helper and clean origin URL; `.git/config` and the
-  pre-push hook are root-sealed.
-- Sandbox pushes are not authoritative and have no credential capable of
-  updating GitHub. The root-sealed pre-push policy remains defense in depth;
-  supervisor ref advancement always sends `force: false` and compares the
-  observed head to its durable expected-old SHA.
-- Named/nested secrets and known GitHub/OpenAI/Linear/bearer token shapes are
-  sanitized before logging or publication, including a Codex auth file rotated
-  during the active stage.
-- All external events are signature checked, durably deduplicated, and fenced
-  to the current generation and subject before they can affect state; the only
-  subject retargeting allowed is provider feedback from the same instance/session
-  and generation against an acknowledged prior publication head.
-
-## Verification contract
-
-CI installs all four npm projects, typechecks/builds contracts, supervisor, and CLI, runs
-all Vitest suites and Bats runtime tests, builds the sandbox image, and executes
-the sealed multi-agent/command-stage Docker smoke. The smoke uses deterministic
-stub agents and a local bare repository; it does not consume operator
-credentials.
-
-The target epoch additionally proves canonical DefinitionBundle bytes and hash
-parity across contracts, CLI, supervisor, and sandbox; generated JavaScript
-validator and provider-schema parity with the TypeScript corpus; strict
-candidate/record owner fields; OPE-188 bounded normalization; conflicting
-effect-intent identity rejection; inspect/edit enforcement; and static absence
-of graph or receipt contracts from the new execution path.
-
-A credentialed Linear/Daytona/GitHub exercise is a separate explicitly
-authorized acceptance step. If skipped, it is reported as a verification gap;
-it does not activate or justify an alternate execution path.
+Credentialed live proof additionally runs one named disposable ordinary item
+and one structured item, records their IDs and replacement report digest, and
+verifies no runtime resource remains before the epoch is accepted.

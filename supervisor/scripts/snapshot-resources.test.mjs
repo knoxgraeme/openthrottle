@@ -6,20 +6,12 @@ import { resolveSandboxResources, SANDBOX_RESOURCE_DEFAULTS } from "./snapshot-r
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
-// Every other surface that documents or configures the sandbox disk default
-// in prose/YAML/env form, alongside the regex that pulls the number it states.
-// SANDBOX_RESOURCE_DEFAULTS.disk above is the one executable source of truth
-// (it is what actually sizes the snapshot); everything below must restate the
-// same quota-safe value or CI catches the drift.
-const DISK_DOCUMENTATION_SURFACES = [
-  { file: "supervisor/.env.example", pattern: /DAYTONA_SANDBOX_DISK=(\d+)/ },
-  { file: "docs/SPEC.md", pattern: /DAYTONA_SANDBOX_DISK=(\d+)/ },
-  { file: "README.md", pattern: /--cpu \d+ --memory \d+ --disk (\d+)/ },
-  {
-    file: ".github/workflows/deploy.yml",
-    pattern: /\d+ vCPU \/ \d+ GiB \/ (\d+) GiB\)/,
-  },
-];
+// The executable default is authoritative. Only the operator env template
+// restates it; prose and workflow comments intentionally do not duplicate it.
+const DISK_ENV_SURFACE = {
+  file: "supervisor/.env.example",
+  pattern: /DAYTONA_SANDBOX_DISK=(\d+)/,
+};
 
 function readDocumentedDiskValue({ file, pattern }) {
   const contents = readFileSync(path.join(repoRoot, file), "utf8");
@@ -68,15 +60,8 @@ describe("resolveSandboxResources", () => {
   });
 });
 
-describe("sandbox disk default parity across surfaces", () => {
-  it.each(DISK_DOCUMENTATION_SURFACES)(
-    "matches SANDBOX_RESOURCE_DEFAULTS.disk in $file",
-    (surface) => {
-      // A contract test, not a unit test: it fails the moment any doc, workflow,
-      // or example env file drifts from the executable default above, which is
-      // exactly the failure mode that previously left runtime and onboarding
-      // with different minimums.
-      expect(readDocumentedDiskValue(surface)).toBe(SANDBOX_RESOURCE_DEFAULTS.disk);
-    }
-  );
+describe("sandbox disk operator default", () => {
+  it("matches the executable default in supervisor/.env.example", () => {
+    expect(readDocumentedDiskValue(DISK_ENV_SURFACE)).toBe(SANDBOX_RESOURCE_DEFAULTS.disk);
+  });
 });

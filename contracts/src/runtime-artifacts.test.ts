@@ -1,21 +1,43 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
+import { parseDocument } from "yaml";
 import {
-  CORE_SEMANTIC_RESULT_SCHEMAS,
   RESULT_CANDIDATE_SCHEMA,
   canonicalJson,
   digestCanonicalJson,
   providerJsonSchemaForResultCandidate,
   validateAndNormalizeResultCandidate,
+  validateEvalDefinition,
   validateSemanticResultSchema,
 } from "./index.js";
 
 const contractsRoot = new URL("..", import.meta.url).pathname;
+const repositoryRoot = join(contractsRoot, "..");
 const generatedRoot = join(contractsRoot, "generated");
+
+function authoredSemanticSchemas() {
+  const root = join(repositoryRoot, ".openthrottle/evals/core");
+  return readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => join(root, entry.name, "eval.yml"))
+    .map((path) => {
+      const document = parseDocument(readFileSync(path, "utf8"), {
+        schema: "core",
+        strict: true,
+        stringKeys: true,
+        uniqueKeys: true,
+        version: "1.2",
+      });
+      expect(document.errors).toEqual([]);
+      expect(document.warnings).toEqual([]);
+      return validateEvalDefinition(document.toJS({ maxAliasCount: 0 }), { source: path }).value.result;
+    })
+    .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+}
 
 describe("generated runtime artifacts", () => {
   it("matches every source schema and its checksum manifest", () => {
@@ -27,7 +49,7 @@ describe("generated runtime artifacts", () => {
       expect(bytes.length).toBe(artifact.bytes);
       expect(createHash("sha256").update(bytes).digest("hex")).toBe(artifact.sha256);
     }
-    for (const rawSchema of CORE_SEMANTIC_RESULT_SCHEMAS) {
+    for (const rawSchema of authoredSemanticSchemas()) {
       const semanticSchema = validateSemanticResultSchema(rawSchema).value;
       const generated = readFileSync(
         join(generatedRoot, "provider-schemas", `${semanticSchema.id.replaceAll("/", "--")}.schema.json`),
@@ -39,7 +61,9 @@ describe("generated runtime artifacts", () => {
 
   it("runs the same normalizer from the sealed JavaScript artifact", async () => {
     const runtime = await import(pathToFileURL(join(generatedRoot, "runtime/index.js")).href);
-    const semanticSchema = validateSemanticResultSchema(CORE_SEMANTIC_RESULT_SCHEMAS[1]).value;
+    const semanticSchema = validateSemanticResultSchema(
+      authoredSemanticSchemas().find(({ id }) => id === "core/unit-result"),
+    ).value;
     const candidate = {
       schema: RESULT_CANDIDATE_SCHEMA,
       outcome: "success",
@@ -61,6 +85,6 @@ describe("generated runtime artifacts", () => {
     expect(execFileSync(process.execPath, [
       join(contractsRoot, "scripts/build-runtime-artifacts.mjs"),
       "--check",
-    ], { encoding: "utf8" })).toContain("verified 7 sealed runtime artifacts");
+    ], { encoding: "utf8" })).toContain("verified 11 sealed runtime artifacts");
   });
 });
