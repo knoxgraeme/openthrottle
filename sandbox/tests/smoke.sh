@@ -111,6 +111,17 @@ prompt="$(cat)"
 test -f "$HOME/.claude/skills/implement-plan/SKILL.md"
 test -f "$HOME/.claude/skills/implement-plan/references/checklist.md"
 test ! -e "$HOME/.claude/skills/review-change"
+test -f "$OT_LEASE_GENERATION_FENCE_FILE"
+test -f "$OT_LEASE_GENERATION_LOCK_FILE"
+[ "$(stat -c %U "$OT_LEASE_GENERATION_FENCE_FILE")" = "root" ]
+[ "$(stat -c %a "$OT_LEASE_GENERATION_FENCE_FILE")" = "444" ]
+[ "$(stat -c %U "$OT_LEASE_GENERATION_LOCK_FILE")" = "root" ]
+[ "$(stat -c %a "$OT_LEASE_GENERATION_LOCK_FILE")" = "444" ]
+[ ! -s "$OT_LEASE_GENERATION_LOCK_FILE" ]
+jq -e --arg attempt "$OT_ATTEMPT_ID" '
+  .schema == "openthrottle.kernel-lease-generation-fence/v1" and
+  .attempt_id == $attempt and .lease_generation == 0
+' "$OT_LEASE_GENERATION_FENCE_FILE" >/dev/null
 mkdir -p /tmp/openthrottle-smoke-launches
 printf 'launch\n' >> "/tmp/openthrottle-smoke-launches/${OT_ATTEMPT_ID}"
 if [ "$OT_ATTEMPT_ID" = "attempt-edit" ]; then
@@ -148,13 +159,21 @@ POISON
 chmod 0755 "$SMOKE_DIR/poison/claude"
 
 CONTAINER="$(docker run -d --entrypoint tail "$IMAGE" -f /dev/null)"
-docker exec "$CONTAINER" mkdir -p /home/agent/repo /requests /transport/edit /transport/inspect /tmp/stub /tmp/poison
+docker exec "$CONTAINER" mkdir -p /home/agent/repo /requests /transport/edit /transport/inspect /runtime/fences /tmp/stub /tmp/poison
 docker cp "$SOURCE_REPO/." "$CONTAINER:/home/agent/repo/"
 docker cp "$REQUESTS/." "$CONTAINER:/requests/"
 docker cp "$SMOKE_DIR/stub/." "$CONTAINER:/tmp/stub/"
 docker cp "$SMOKE_DIR/poison/." "$CONTAINER:/tmp/poison/"
 docker exec "$CONTAINER" sh -c 'touch /tmp/source-link-target && chown agent:agent /tmp/source-link-target && chmod 0660 /tmp/source-link-target && ln -s /tmp/source-link-target /home/agent/repo/source-link'
 docker exec "$CONTAINER" sh -c 'chown -R agent:agent /home/agent/repo && chmod -R u+w /home/agent/repo && chown -R root:root /requests /tmp/stub /tmp/poison && chmod 0400 /requests/*.json && chmod 0755 /tmp/stub/claude /tmp/poison/claude'
+for name in edit inspect; do
+  docker exec "$CONTAINER" sh -c '
+    printf '\''{"schema":"openthrottle.kernel-lease-generation-fence/v1","attempt_id":"%s","lease_generation":0}\n'\'' "$1" > "$2"
+    : > "$3"
+    chown root:root "$2" "$3"
+    chmod 0444 "$2" "$3"
+  ' _ "attempt-${name}" "/runtime/fences/${name}.json" "/runtime/fences/${name}.lock"
+done
 
 run_action() {
   local name="$1" stub_path="${2:-/tmp/stub}"
@@ -163,6 +182,8 @@ run_action() {
     -e "OT_ACTION_REQUEST_FILE=/requests/${name}.json" \
     -e "OT_ACTION_RESULT_FILE=/transport/${name}/result.json" \
     -e "OT_ACTION_SESSION_FILE=/transport/${name}/session.json" \
+    -e "OT_LEASE_GENERATION_FENCE_FILE=/runtime/fences/${name}.json" \
+    -e "OT_LEASE_GENERATION_LOCK_FILE=/runtime/fences/${name}.lock" \
     "$CONTAINER" /opt/openthrottle/entrypoint.sh
 }
 

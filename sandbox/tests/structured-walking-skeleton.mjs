@@ -130,6 +130,8 @@ function runAction(name, request) {
     `OT_ACTION_REQUEST_FILE=${requestPath}`,
     `OT_ACTION_RESULT_FILE=/transport/actions/${name}/result.json`,
     `OT_ACTION_SESSION_FILE=/transport/actions/${name}/session.json`,
+    `OT_LEASE_GENERATION_FENCE_FILE=/runtime/fences/${name}.json`,
+    `OT_LEASE_GENERATION_LOCK_FILE=/runtime/fences/${name}.lock`,
     "/opt/openthrottle/entrypoint.sh",
   ], { timeout: 180_000 });
   const result = JSON.parse(dockerExec(["cat", `/transport/actions/${name}/result.json`]));
@@ -228,11 +230,18 @@ printf '{"type":"result","subtype":"success","structured_output":{"schema":"open
   chmodSync(stub, 0o755);
 
   container = docker(["run", "-d", "--entrypoint", "tail", image, "-f", "/dev/null"]);
-  dockerExec(["mkdir", "-p", "/home/agent/repo", "/requests", "/transport", "/tmp/stub"]);
+  dockerExec(["mkdir", "-p", "/home/agent/repo", "/requests", "/transport", "/runtime/fences", "/tmp/stub"]);
   docker(["cp", `${source}/.`, `${container}:/home/agent/repo/`]);
   docker(["cp", stub, `${container}:/tmp/stub/claude`]);
   dockerExec(["chown", "-R", "root:root", "/home/agent/repo", "/tmp/stub"]);
   dockerExec(["chmod", "0755", "/tmp/stub/claude"]);
+  for (const name of ["a", "b"]) {
+    dockerExec([
+      "sh", "-c",
+      'printf \'{"schema":"openthrottle.kernel-lease-generation-fence/v1","attempt_id":"%s","lease_generation":0}\\n\' "$1" > "$2"; : > "$3"; chown root:root "$2" "$3"; chmod 0444 "$2" "$3"',
+      "_", `attempt-${name}`, `/runtime/fences/${name}.json`, `/runtime/fences/${name}.lock`,
+    ]);
+  }
 
   const actionA = actionRequest({ name: "a", inputSubject: base, requestHash: "1".repeat(64) });
   const resultA = runAction("a", actionA);
