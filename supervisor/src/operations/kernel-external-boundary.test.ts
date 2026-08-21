@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   EXECUTION_RECORD_SCHEMA,
+  definitionEntryContentHash,
   digestCanonicalJson,
   expandCompiledRuntimeLifecycle,
   type AttemptCheckpoint,
@@ -34,6 +35,9 @@ import {
   type KernelPreparedExternalPlan,
 } from "./kernel-external-plans.js";
 import {
+  createKernelExternalPlanBindings,
+} from "./kernel-plan-bindings.js";
+import {
   createKernelEffectAdapterRegistry,
   type KernelEffectAdapterBinding,
 } from "./kernel-effects.js";
@@ -60,6 +64,56 @@ function bundle(pipelineId = "core/test"): DefinitionBundle {
     pipeline_selection: "config",
     entries: [],
   };
+}
+
+function providerBundle(includePolicy = true): DefinitionBundle {
+  const normalized_payload = {
+    schema: "openthrottle.config/v2",
+    pipeline: "core/test",
+    engine: "codex",
+    ...(includePolicy ? { provider_evidence: {
+      github: {
+        required_observations: [
+          { kind: "check_run", name: "quality", app_slug: "github-actions" },
+          { kind: "check_run", name: "docker-smoke", app_slug: "github-actions" },
+        ],
+      },
+    } } : {}),
+  };
+  return {
+    ...bundle(),
+    entries: [{
+      definition_kind: "config",
+      definition_id: "repository",
+      origin: { kind: "repository", source_commit: SUBJECT },
+      path: ".openthrottle/config.yml",
+      content_hash: definitionEntryContentHash(normalized_payload),
+      normalized_payload,
+    }],
+  };
+}
+
+function realWaitBinding(): KernelExternalStagePlanBinding {
+  const bindings = createKernelExternalPlanBindings({
+    environments: {
+      loadExactRunEnvironment: () => ({
+        pipeline_run_id: "run-1",
+        work_item_id: "work-1",
+        repository_registration_id: "repo-1",
+        repository: "owner/repo",
+        base_branch: "main",
+        runtime_snapshot: "snapshot-1",
+        control_provider: "github",
+        source_provider: "github",
+        source_id: "issue-1",
+        source_reference: "owner/repo#1",
+        title: "Provider wait proof",
+        current_subject: SUBJECT,
+      }),
+    },
+    blob_store: {} as never,
+  });
+  return bindings.find(({ external_kind }) => external_kind === "core/provider-wait@1")!;
 }
 
 function manifest(input: {
@@ -437,6 +491,70 @@ function coordinator(input: {
 }
 
 describe("kernel external boundary bridge", () => {
+  it("passes the exact resolved bundle into preparation and seals its provider policy in the Effect", async () => {
+    const definitionBundle = providerBundle();
+    const currentManifest = manifest({
+      bundle_hash: digestCanonicalJson(definitionBundle),
+      external_kind: "core/provider-wait@1",
+      stage_kind: "wait",
+    });
+    const store = new MemoryExternalStore(currentManifest);
+    const wait = realWaitBinding();
+    let preparedBundle: DefinitionBundle | undefined;
+    const tracked: KernelExternalStagePlanBinding = {
+      ...wait,
+      async prepare(request) {
+        preparedBundle = request.bundle;
+        return wait.prepare(request);
+      },
+    };
+    const bridge = coordinator({ store, definition_bundle: definitionBundle, plans: [tracked] });
+
+    await expect(bridge.executeLeasedAttempt(store.leased())).resolves.toMatchObject({
+      disposition: "scheduled",
+      phase: "observe",
+    });
+    expect(preparedBundle).toBe(definitionBundle);
+    const scheduled = store.schedules.get("external-schedule:attempt-1:observe")!;
+    expect(scheduled.effects[0]!.intent).toMatchObject({
+      subject: SUBJECT,
+      payload: {
+        schema: "openthrottle.github-provider-wait/v1",
+        repository: "owner/repo",
+        subject: SUBJECT,
+        policy: {
+          required_observations: [
+            { kind: "check_run", name: "docker-smoke", app_slug: "github-actions" },
+            { kind: "check_run", name: "quality", app_slug: "github-actions" },
+          ],
+        },
+      },
+    });
+    await expect(bridge.resumeAttempt({ pipeline_run_id: "run-1", attempt_id: "attempt-1" }))
+      .resolves.toMatchObject({ disposition: "waiting", phase: "observe" });
+    expect(store.schedules.get("external-schedule:attempt-1:observe")!.effects[0]!.intent)
+      .toEqual(scheduled.effects[0]!.intent);
+  });
+
+  it("fails closed before scheduling when a provider-wait bundle lacks sealed policy", async () => {
+    const definitionBundle = providerBundle(false);
+    const currentManifest = manifest({
+      bundle_hash: digestCanonicalJson(definitionBundle),
+      external_kind: "core/provider-wait@1",
+      stage_kind: "wait",
+    });
+    const store = new MemoryExternalStore(currentManifest);
+    const bridge = coordinator({
+      store,
+      definition_bundle: definitionBundle,
+      plans: [realWaitBinding()],
+    });
+
+    await expect(bridge.executeLeasedAttempt(store.leased()))
+      .rejects.toThrow(/sealed GitHub provider-evidence policy/);
+    expect(store.schedules.size).toBe(0);
+  });
+
   it("walks ordered publish phases and settles from executor-authored result bytes", async () => {
     const definitionBundle = bundle();
     const currentManifest = manifest({ bundle_hash: digestCanonicalJson(definitionBundle) });

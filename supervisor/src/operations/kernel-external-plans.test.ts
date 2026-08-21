@@ -134,6 +134,15 @@ function preparationRequest(stage: CompiledPipelineStage) {
     },
     stage: stage as Extract<CompiledPipelineStage, { kind: "effect" | "wait" }>,
     context: { records: new Map(), checkpoints: new Map() },
+    bundle: {
+      schema: "openthrottle.definition-bundle/v1" as const,
+      compiler_version: "definition-compiler/v1" as const,
+      runtime_capability_digest: "e".repeat(64),
+      source_commit: SUBJECT,
+      pipeline_id: "core/test",
+      pipeline_selection: "explicit" as const,
+      entries: [],
+    },
   };
 }
 

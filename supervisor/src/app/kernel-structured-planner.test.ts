@@ -648,6 +648,82 @@ describe("KernelStructuredSettlementPlanner", () => {
     expect(settlement.next_attempts[0]!.context_record_ids).toContain(promotion.id);
   });
 
+  it("turns a lead rejection into a distinct unbound edit Attempt with exact prior evidence", async () => {
+    const store = new PlanningStore();
+    const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const promotion = promotionDecision();
+    const candidate: AttemptCheckpoint = {
+      schema: ATTEMPT_CHECKPOINT_SCHEMA,
+      id: "checkpoint-candidate-a",
+      pipeline_run_id: "run-1",
+      attempt_id: "attempt-edit-a",
+      request_hash: "c".repeat(64),
+      definition_bundle_hash: DEFINITIONS.manifest.definition_bundle_hash,
+      input_subject: SOURCE,
+      output_subject: UNIT_A,
+      native_session_id: "session-edit-a",
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+      payload: { inline: { exact: true } },
+      captured_at: NOW,
+    };
+    const request = requestInputs({ records: [...runtime, promotion], checkpoints: [candidate] });
+    const pending = pendingAttempt({
+      id: "attempt-accept-a",
+      stage_id: "accept_unit",
+      scope: {
+        kind: "loop_item", stage_id: "accept_unit", parent_attempt_id: "attempt-provision",
+        loop_id: "execution_plan.units", item_id: "unit-a", item_index: 0,
+      },
+      input_subject: UNIT_A,
+      request,
+    });
+    const completed = completedAttempt({
+      pending,
+      output_subject: null,
+      request,
+      evaluated: {
+        evaluator: "core/action-outcome@1",
+        outcome: "semantic_repair_required",
+        reason: "blocking_unit_finding",
+      },
+    });
+    const leadAttempt = { ...completed.attempt, native_session_id: "session-unit-lead" };
+    const leadCheckpoint = { ...completed.checkpoint, native_session_id: "session-unit-lead" };
+    store.requests.set(pending.id, request);
+    const planner = new KernelStructuredSettlementPlanner({ store, now: () => NOW });
+
+    const settlement = await planner.plan(ordinaryInput({
+      attempt: leadAttempt,
+      checkpoint: leadCheckpoint,
+      result: completed.result,
+      view: view({ attempts: [leadAttempt], current: leadAttempt }),
+      evaluator: "core/action-outcome@1",
+      outcome: "semantic_repair_required",
+      reason: "blocking_unit_finding",
+    }));
+
+    const repair = settlement.next_attempts[0]!;
+    expect(repair.id).not.toBe(leadAttempt.id);
+    expect(repair).toMatchObject({
+      repository_authority: "edit",
+      native_session_id: null,
+      input_subject: UNIT_A,
+      scope: {
+        kind: "loop_item",
+        stage_id: "repair_unit",
+        item_id: "unit-a",
+      },
+      context_checkpoint_ids: [candidate.id],
+    });
+    expect(repair.native_session_id).not.toBe(leadAttempt.native_session_id);
+    expect(repair.context_record_ids).toEqual([
+      ...runtime.map(({ id }) => id),
+      promotion.id,
+      completed.result.id,
+      settlement.decision.id,
+    ].sort());
+  });
+
   it("uses external delivery-citing integration evidence to unlock the next unit", async () => {
     const store = new PlanningStore();
     const promotion = promotionDecision();
@@ -952,8 +1028,16 @@ describe("KernelStructuredSettlementPlanner", () => {
       reason: "blocking_review_finding",
     }));
     expect(remediation.next_attempts[0]!.scope).toEqual({ kind: "stage", stage_id: "final_repair" });
-    expect(remediation.next_attempts[0]!.context_record_ids).toEqual(expect.arrayContaining(
-      runtime.map(({ id }) => id),
-    ));
+    expect(remediation.next_attempts[0]).toMatchObject({
+      repository_authority: "edit",
+      native_session_id: null,
+      input_subject: INTEGRATED,
+      context_checkpoint_ids: [boundary.id],
+    });
+    expect(remediation.next_attempts[0]!.context_record_ids).toEqual([
+      ...runtime.map(({ id }) => id),
+      validation.result.id,
+      remediation.decision.id,
+    ].sort());
   });
 });
