@@ -171,8 +171,14 @@ export {
 export {
   FILESYSTEM_CONFIG_SCHEMA,
   validateFilesystemConfigContract,
+  validateGithubProviderEvidencePolicy,
   type ConfigLimits,
   type FilesystemConfigContract,
+  type GithubCheckRunObservationRequirement,
+  type GithubCommitStatusObservationRequirement,
+  type GithubObservationRequirement,
+  type GithubProviderEvidencePolicy,
+  type ProviderEvidencePolicy,
 } from "./config.js";
 export {
   EXECUTION_PLAN_SCHEMA_V2,

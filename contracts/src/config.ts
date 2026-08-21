@@ -23,6 +23,30 @@ export interface ConfigLimits {
   task_timeout?: number;
 }
 
+export interface GithubCheckRunObservationRequirement {
+  kind: "check_run";
+  name: string;
+  app_slug: string;
+}
+
+export interface GithubCommitStatusObservationRequirement {
+  kind: "commit_status";
+  context: string;
+  creator_login: string;
+}
+
+export type GithubObservationRequirement =
+  | GithubCheckRunObservationRequirement
+  | GithubCommitStatusObservationRequirement;
+
+export interface GithubProviderEvidencePolicy {
+  required_observations: GithubObservationRequirement[];
+}
+
+export interface ProviderEvidencePolicy {
+  github: GithubProviderEvidencePolicy;
+}
+
 export interface FilesystemConfigContract {
   schema: typeof FILESYSTEM_CONFIG_SCHEMA;
   pipeline: string;
@@ -32,6 +56,86 @@ export interface FilesystemConfigContract {
   commands?: Record<string, string>;
   post_bootstrap?: string[];
   limits?: ConfigLimits;
+  provider_evidence?: ProviderEvidencePolicy;
+}
+
+const PROVIDER_EVIDENCE_TEXT_MAX = 200;
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/u;
+
+function providerEvidenceText(value: unknown, path: string): string {
+  const parsed = stringAt(value, path, { max: PROVIDER_EVIDENCE_TEXT_MAX });
+  if (parsed.trim().length === 0) fail(path, "must contain a non-whitespace value");
+  if (CONTROL_CHARACTER.test(parsed)) fail(path, "must not contain control characters");
+  return parsed;
+}
+
+function parseGithubObservation(value: unknown, path: string): GithubObservationRequirement {
+  const candidate = objectAt(value, path, [
+    "kind", "name", "app_slug", "context", "creator_login",
+  ]);
+  if (candidate.kind === "check_run") {
+    const input = objectAt(value, path, ["kind", "name", "app_slug"]);
+    return {
+      kind: "check_run",
+      name: providerEvidenceText(input.name, `${path}.name`),
+      app_slug: providerEvidenceText(input.app_slug, `${path}.app_slug`),
+    };
+  }
+  if (candidate.kind === "commit_status") {
+    const input = objectAt(value, path, ["kind", "context", "creator_login"]);
+    return {
+      kind: "commit_status",
+      context: providerEvidenceText(input.context, `${path}.context`),
+      creator_login: providerEvidenceText(input.creator_login, `${path}.creator_login`),
+    };
+  }
+  fail(`${path}.kind`, "must be one of: check_run, commit_status");
+}
+
+function githubObservationKey(observation: GithubObservationRequirement): string {
+  return observation.kind === "check_run"
+    ? `${observation.kind}\0${observation.name}\0${observation.app_slug}`
+    : `${observation.kind}\0${observation.context}\0${observation.creator_login}`;
+}
+
+function parseGithubProviderEvidence(value: unknown, path: string): GithubProviderEvidencePolicy {
+  const input = objectAt(value, path, ["required_observations"]);
+  const observations = arrayAt(
+    input.required_observations,
+    `${path}.required_observations`,
+    parseGithubObservation,
+    { min: 1, max: 32 },
+  );
+  const keys = observations.map(githubObservationKey);
+  if (new Set(keys).size !== keys.length) {
+    fail(`${path}.required_observations`, "must not contain duplicate exact observations");
+  }
+  return {
+    required_observations: [...observations].sort((left, right) => {
+      const leftKey = githubObservationKey(left);
+      const rightKey = githubObservationKey(right);
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    }),
+  };
+}
+
+export function validateGithubProviderEvidencePolicy(
+  value: unknown,
+  options: { source?: string } = {},
+): ValidatedContract<GithubProviderEvidencePolicy> {
+  return normalizedContract(parseGithubProviderEvidence(
+    value,
+    options.source ?? "github_provider_evidence",
+  ));
+}
+
+function parseProviderEvidence(value: unknown, path: string): ProviderEvidencePolicy {
+  const input = objectAt(value, path, ["github"]);
+  return {
+    github: validateGithubProviderEvidencePolicy(input.github, {
+      source: `${path}.github`,
+    }).value,
+  };
 }
 
 function parseStringList(value: unknown, path: string, max: number, entryMax = 1_000): string[] {
@@ -71,7 +175,7 @@ export function validateFilesystemConfigContract(
   const source = options.source ?? "config";
   const input = objectAt(value, source, [
     "schema", "pipeline", "engine", "model", "reasoning_effort", "commands",
-    "post_bootstrap", "limits",
+    "post_bootstrap", "limits", "provider_evidence",
   ]);
   if (input.schema !== FILESYSTEM_CONFIG_SCHEMA) {
     fail(`${source}.schema`, `must be ${FILESYSTEM_CONFIG_SCHEMA}`);
@@ -106,6 +210,9 @@ export function validateFilesystemConfigContract(
     }),
     ...(input.limits === undefined ? {} : {
       limits: parseLimits(input.limits, `${source}.limits`),
+    }),
+    ...(input.provider_evidence === undefined ? {} : {
+      provider_evidence: parseProviderEvidence(input.provider_evidence, `${source}.provider_evidence`),
     }),
   });
 }

@@ -392,6 +392,47 @@ describe("kernel effect execution", () => {
     expect(port.dispatchStarts).toHaveLength(0);
   });
 
+  it("retains matched provider context and producer identities in the durable DeliveryRecord", async () => {
+    const matched = [{
+      kind: "check_run",
+      id: 17,
+      name: "quality",
+      app_slug: "github-actions",
+      status: "completed",
+      conclusion: "success",
+    }];
+    const adapter = scriptedAdapter({ observations: [{
+      kind: "found",
+      status: "confirmed",
+      payload: {
+        schema: "openthrottle.github-provider-observation/v1",
+        subject: SUBJECT,
+        reason: "all_required_observations_succeeded",
+        matched_observations: matched,
+      },
+    }] });
+    const intent = effect({ kind: "github/provider-wait@1" });
+    const port = new FakeEffectPort([lease(intent)]);
+
+    await expect(service({
+      port,
+      binding: binding(adapter, { effect_kind: intent.kind, operation: "observation" }),
+    }).drainOne({
+      worker_id: "worker-1",
+      lease_id: "lease-1",
+      expires_at: "2026-08-20T12:01:00.000Z",
+    })).resolves.toMatchObject({ kind: "delivered", status: "confirmed" });
+
+    expect(port.completions[0]!.reconciliation).toMatchObject({
+      kind: "append_delivery",
+      delivery: {
+        kind: "delivery",
+        status: "confirmed",
+        payload: { inline: { result: { matched_observations: matched } } },
+      },
+    });
+  });
+
   it("holds instead of replaying when post-dispatch reconciliation is still absent", async () => {
     const events: string[] = [];
     const adapter = scriptedAdapter({

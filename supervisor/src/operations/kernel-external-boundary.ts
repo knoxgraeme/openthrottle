@@ -373,11 +373,16 @@ export class KernelExternalBoundaryCoordinator {
       pipeline_run_id: view.run.id,
       attempt_id: attempt.id,
     });
+    const bundle = await this.#bundles.resolveExactDefinitionBundle({
+      pipeline_run_id: view.run.id,
+      definition_bundle_hash: view.run.definition_bundle_hash,
+    });
     let prepared = await binding.prepare({
       run: view.run,
       attempt,
       stage,
       context: context.context,
+      bundle,
     });
     if (
       binding.subject_policy === "preserve" && attempt.status !== "running" &&
@@ -576,10 +581,6 @@ export class KernelExternalBoundaryCoordinator {
     if (!result || result.kind !== "result") throw new Error("external Attempt lost its ResultRecord");
     const checkpoint = recorded.checkpoints.get(attempt.checkpoint_id!);
     if (!checkpoint) throw new Error("external Attempt lost its executor checkpoint");
-    const bundle = await this.#bundles.resolveExactDefinitionBundle({
-      pipeline_run_id: view.run.id,
-      definition_bundle_hash: view.run.definition_bundle_hash,
-    });
     const defaultPlan = async (): Promise<KernelExternalSettlementPlan> => {
       const decision = createPipelineDecisionRecord({
         attempt,

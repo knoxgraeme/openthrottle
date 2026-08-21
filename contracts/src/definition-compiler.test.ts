@@ -192,6 +192,84 @@ describe("filesystem definition compiler", () => {
     expect(recovered.digest).toBe(admitted.manifest.digest);
   });
 
+  it("seals normalized GitHub provider evidence into compilation and cold recovery", () => {
+    const configWith = (observations: string) => `${sourceFixture.repository[".openthrottle/config.yml"]!.content}provider_evidence:\n  github:\n    required_observations:\n${observations}`;
+    const first = compile(replaceFile(
+      sourceFixture,
+      "repository",
+      ".openthrottle/config.yml",
+      configWith([
+        "      - kind: commit_status",
+        "        context: coverage",
+        "        creator_login: coverage-bot",
+        "      - kind: check_run",
+        "        name: quality",
+        "        app_slug: github-actions",
+      ].join("\n") + "\n"),
+    ));
+    const reordered = compile(replaceFile(
+      sourceFixture,
+      "repository",
+      ".openthrottle/config.yml",
+      configWith([
+        "      - app_slug: github-actions",
+        "        name: quality",
+        "        kind: check_run",
+        "      - creator_login: coverage-bot",
+        "        context: coverage",
+        "        kind: commit_status",
+      ].join("\n") + "\n"),
+    ));
+    const configEntry = first.bundle.value.entries.find((entry) =>
+      entry.definition_kind === "config" && entry.definition_id === "repository")!;
+
+    expect(configEntry.normalized_payload).toMatchObject({
+      provider_evidence: {
+        github: {
+          required_observations: [
+            { kind: "check_run", name: "quality", app_slug: "github-actions" },
+            { kind: "commit_status", context: "coverage", creator_login: "coverage-bot" },
+          ],
+        },
+      },
+    });
+    expect(reordered.bundle.digest).toBe(first.bundle.digest);
+    expect(reordered.manifest.digest).toBe(first.manifest.digest);
+
+    const changed = compile(replaceFile(
+      sourceFixture,
+      "repository",
+      ".openthrottle/config.yml",
+      configWith([
+        "      - kind: check_run",
+        "        name: quality",
+        "        app_slug: another-trusted-app",
+        "      - kind: commit_status",
+        "        context: coverage",
+        "        creator_login: coverage-bot",
+      ].join("\n") + "\n"),
+    ));
+    const changedConfig = changed.bundle.value.entries.find((entry) =>
+      entry.definition_kind === "config" && entry.definition_id === "repository")!;
+    expect(changedConfig.content_hash).not.toBe(configEntry.content_hash);
+    expect(changed.bundle.digest).not.toBe(first.bundle.digest);
+    expect(changed.manifest.value.definition_bundle_hash).toBe(changed.bundle.digest);
+
+    const forged = structuredClone(first.bundle.value);
+    const forgedConfig = forged.entries.find((entry) => entry.definition_kind === "config")!;
+    const forgedPayload = structuredClone(forgedConfig.normalized_payload) as {
+      provider_evidence: { github: { required_observations: unknown[] } };
+    };
+    forgedPayload.provider_evidence.github.required_observations = [];
+    forgedConfig.normalized_payload = forgedPayload;
+    forgedConfig.content_hash = definitionEntryContentHash(forgedPayload);
+    expect(() => compileManifestFromDefinitionBundle({
+      bundle: forged,
+      compiler_environment: compilerEnvironment(),
+      trusted_platform_definitions: platformHashes(first.bundle.value),
+    })).toThrow(/required_observations.*between 1 and 32/);
+  });
+
   it("fails cold reconstruction on environment drift, missing dependencies, or a widened closure", () => {
     const admitted = compile();
     const recover = (bundle: DefinitionBundle, environment = compilerEnvironment()) =>

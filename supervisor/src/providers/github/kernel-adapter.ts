@@ -1,7 +1,10 @@
 import {
+  canonicalJson,
   validateBlobPointer,
+  validateGithubProviderEvidencePolicy,
   type BlobPointer,
   type EffectIntent,
+  type FilesystemConfigContract,
   type JsonValue,
 } from "@openthrottle/contracts";
 import type { VolumeBlobStore } from "../../persistence/blob-store.js";
@@ -41,7 +44,29 @@ interface ProviderWaitPayload {
   schema: "openthrottle.github-provider-wait/v1";
   repository: string;
   subject: string;
+  policy: GithubProviderEvidencePolicy;
 }
+
+type GithubProviderEvidencePolicy = NonNullable<
+  FilesystemConfigContract["provider_evidence"]
+>["github"];
+type GithubObservationRequirement = GithubProviderEvidencePolicy["required_observations"][number];
+
+type PageCollection =
+  | { kind: "ok"; entries: unknown[] }
+  | { kind: "not_found" }
+  | { kind: "unknown"; detail: string };
+
+type RequiredObservationResolution =
+  | { state: "missing" }
+  | { state: "unknown"; detail: string }
+  | {
+    state: "success" | "pending" | "failure";
+    observation: JsonValue;
+  };
+
+const PROVIDER_PAGE_SIZE = 100;
+const PROVIDER_MAX_PAGES = 10;
 
 function object(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -102,13 +127,21 @@ function pullRequestPayload(intent: Readonly<EffectIntent>): PullRequestPayload 
 
 function waitPayload(intent: Readonly<EffectIntent>): ProviderWaitPayload {
   const value = object(intent.payload, `effect ${intent.id} payload`);
-  exactKeys(value, ["schema", "repository", "subject"], "GitHub provider wait payload");
+  exactKeys(value, ["schema", "repository", "subject", "policy"], "GitHub provider wait payload");
   if (
     value.schema !== "openthrottle.github-provider-wait/v1" ||
     typeof value.repository !== "string" || !REPOSITORY.test(value.repository) ||
     typeof value.subject !== "string" || !SUBJECT.test(value.subject) || value.subject !== intent.subject
   ) throw new Error(`effect ${intent.id} has invalid GitHub provider wait authority`);
-  return value as unknown as ProviderWaitPayload;
+  const parsed = validateGithubProviderEvidencePolicy(value.policy, {
+    source: `effect ${intent.id} payload.policy`,
+  }).value;
+  return {
+    schema: "openthrottle.github-provider-wait/v1",
+    repository: value.repository,
+    subject: value.subject,
+    policy: parsed,
+  };
 }
 
 async function githubJson<T>(client: GithubClient, path: string): Promise<{ status: number; value: T | null }> {
@@ -125,6 +158,209 @@ async function githubJson<T>(client: GithubClient, path: string): Promise<{ stat
     throw new Error(`GitHub reconciliation failed (${response.status}): ${raw.slice(-1_000)}`);
   }
   return { status: response.status, value: raw ? JSON.parse(raw) as T : null };
+}
+
+async function githubPage(
+  client: GithubClient,
+  path: string,
+  field: "check_runs" | "statuses",
+  page: number,
+): Promise<PageCollection> {
+  const query = new URLSearchParams({
+    per_page: String(PROVIDER_PAGE_SIZE),
+    page: String(page),
+  });
+  if (field === "check_runs") query.set("filter", "latest");
+  const response = await githubJson<unknown>(client, `${path}?${query.toString()}`);
+  if (response.status === 404) return { kind: "not_found" };
+  let value: Record<string, unknown>;
+  try {
+    value = object(response.value, `GitHub ${field} page ${page}`);
+  } catch (error) {
+    return { kind: "unknown", detail: error instanceof Error ? error.message : String(error) };
+  }
+  const entries = value[field];
+  if (!Array.isArray(entries) || entries.length > PROVIDER_PAGE_SIZE) {
+    return { kind: "unknown", detail: `GitHub ${field} page ${page} is malformed` };
+  }
+  return { kind: "ok", entries };
+}
+
+async function githubPages(
+  client: GithubClient,
+  path: string,
+  field: "check_runs" | "statuses",
+): Promise<PageCollection> {
+  const entries: unknown[] = [];
+  let firstPageDigest: string | null = null;
+  let complete = false;
+  for (let page = 1; page <= PROVIDER_MAX_PAGES; page += 1) {
+    const result = await githubPage(client, path, field, page);
+    if (result.kind !== "ok") return result;
+    if (page === 1) firstPageDigest = canonicalJson(result.entries as JsonValue);
+    entries.push(...result.entries);
+    if (result.entries.length < PROVIDER_PAGE_SIZE) {
+      complete = true;
+      break;
+    }
+  }
+  if (!complete) {
+    return {
+      kind: "unknown",
+      detail: `GitHub ${field} pagination bound of ${PROVIDER_MAX_PAGES} pages was exhausted`,
+    };
+  }
+  const verification = await githubPage(client, path, field, 1);
+  if (verification.kind !== "ok") return verification;
+  if (canonicalJson(verification.entries as JsonValue) !== firstPageDigest) {
+    return {
+      kind: "unknown",
+      detail: `GitHub ${field} pagination window changed while evidence was collected`,
+    };
+  }
+  return { kind: "ok", entries };
+}
+
+async function collectGithubPages(
+  client: GithubClient,
+  path: string,
+  field: "check_runs" | "statuses",
+): Promise<PageCollection> {
+  try {
+    return await githubPages(client, path, field);
+  } catch (error) {
+    return {
+      kind: "unknown",
+      detail: `GitHub ${field} observation failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+function positiveId(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function checkRunIdentity(
+  entry: Record<string, unknown>,
+  requirement: Extract<GithubObservationRequirement, { kind: "check_run" }>,
+): boolean {
+  if (entry.name !== requirement.name) return false;
+  const app = entry.app;
+  return Boolean(app && typeof app === "object" && !Array.isArray(app) &&
+    (app as Record<string, unknown>).slug === requirement.app_slug);
+}
+
+function commitStatusIdentity(
+  entry: Record<string, unknown>,
+  requirement: Extract<GithubObservationRequirement, { kind: "commit_status" }>,
+): boolean {
+  if (entry.context !== requirement.context) return false;
+  const creator = entry.creator;
+  return Boolean(creator && typeof creator === "object" && !Array.isArray(creator) &&
+    (creator as Record<string, unknown>).login === requirement.creator_login);
+}
+
+function checkRunResolution(
+  requirement: Extract<GithubObservationRequirement, { kind: "check_run" }>,
+  id: number,
+  entry: Record<string, unknown>,
+): RequiredObservationResolution {
+  const status = entry.status;
+  const conclusion = entry.conclusion;
+  if (typeof status !== "string") {
+    return { state: "unknown", detail: `required check run ${requirement.name} has malformed status` };
+  }
+  if (status === "completed") {
+    if (typeof conclusion !== "string") {
+      return { state: "unknown", detail: `completed required check run ${requirement.name} has malformed conclusion` };
+    }
+    return {
+      state: conclusion === "success" ? "success" : "failure",
+      observation: {
+        kind: "check_run", id, name: requirement.name, app_slug: requirement.app_slug,
+        status, conclusion,
+      },
+    };
+  }
+  if (!["queued", "in_progress", "pending", "requested", "waiting"].includes(status)) {
+    return { state: "unknown", detail: `required check run ${requirement.name} has unknown status ${status}` };
+  }
+  if (conclusion !== null && typeof conclusion !== "string") {
+    return { state: "unknown", detail: `pending required check run ${requirement.name} has malformed conclusion` };
+  }
+  return {
+    state: "pending",
+    observation: {
+      kind: "check_run", id, name: requirement.name, app_slug: requirement.app_slug,
+      status, conclusion,
+    },
+  };
+}
+
+function commitStatusResolution(
+  requirement: Extract<GithubObservationRequirement, { kind: "commit_status" }>,
+  id: number,
+  entry: Record<string, unknown>,
+): RequiredObservationResolution {
+  const state = entry.state;
+  if (typeof state !== "string") {
+    return { state: "unknown", detail: `required commit status ${requirement.context} has malformed state` };
+  }
+  if (!["success", "pending", "failure", "error"].includes(state)) {
+    return { state: "unknown", detail: `required commit status ${requirement.context} has unknown state ${state}` };
+  }
+  return {
+    state: state === "success" ? "success" : state === "pending" ? "pending" : "failure",
+    observation: {
+      kind: "commit_status", id, context: requirement.context,
+      creator_login: requirement.creator_login, state,
+    },
+  };
+}
+
+function resolveRequiredObservation(
+  requirement: GithubObservationRequirement,
+  entries: readonly unknown[],
+): RequiredObservationResolution {
+  const exact: Record<string, unknown>[] = [];
+  for (const candidate of entries) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const entry = candidate as Record<string, unknown>;
+    const matches = requirement.kind === "check_run"
+      ? checkRunIdentity(entry, requirement)
+      : commitStatusIdentity(entry, requirement);
+    if (matches) exact.push(entry);
+  }
+  if (exact.length === 0) return { state: "missing" };
+
+  if (exact.length !== 1) {
+    return {
+      state: "unknown",
+      detail: `required ${requirement.kind} observation has multiple exact matches`,
+    };
+  }
+  const entry = exact[0]!;
+  const id = positiveId(entry.id);
+  if (id === null) {
+    return { state: "unknown", detail: `required ${requirement.kind} observation has malformed id` };
+  }
+  return requirement.kind === "check_run"
+    ? checkRunResolution(requirement, id, entry)
+    : commitStatusResolution(requirement, id, entry);
+}
+
+function providerObservationPayload(
+  payload: ProviderWaitPayload,
+  reason: "required_observation_failed" | "all_required_observations_succeeded",
+  resolutions: readonly RequiredObservationResolution[],
+): JsonValue {
+  return {
+    schema: "openthrottle.github-provider-observation/v1",
+    subject: payload.subject,
+    reason,
+    matched_observations: resolutions.flatMap((resolution) =>
+      "observation" in resolution ? [resolution.observation] : []),
+  };
 }
 
 export class GithubKernelAdapter {
@@ -241,27 +477,51 @@ export class GithubKernelAdapter {
 
   async #reconcileProvider(intent: Readonly<EffectIntent>): Promise<KernelEffectProviderObservation> {
     const payload = waitPayload(intent);
-    const [checks, status] = await Promise.all([
-      githubJson<{ check_runs?: Array<{ status?: string; conclusion?: string | null; html_url?: string }> }>(
-        this.#client, `/repos/${payload.repository}/commits/${payload.subject}/check-runs?per_page=100`,
-      ),
-      githubJson<{ state?: string; statuses?: Array<{ state?: string; target_url?: string }> }>(
-        this.#client, `/repos/${payload.repository}/commits/${payload.subject}/status`,
-      ),
+    const needsChecks = payload.policy.required_observations.some(({ kind }) => kind === "check_run");
+    const needsStatuses = payload.policy.required_observations.some(({ kind }) => kind === "commit_status");
+    const [checks, statuses] = await Promise.all([
+      needsChecks
+        ? collectGithubPages(
+          this.#client,
+          `/repos/${payload.repository}/commits/${payload.subject}/check-runs`,
+          "check_runs",
+        )
+        : Promise.resolve({ kind: "ok", entries: [] } satisfies PageCollection),
+      needsStatuses
+        ? collectGithubPages(
+          this.#client,
+          `/repos/${payload.repository}/commits/${payload.subject}/status`,
+          "statuses",
+        )
+        : Promise.resolve({ kind: "ok", entries: [] } satisfies PageCollection),
     ]);
-    if (checks.status === 404 || status.status === 404) return { kind: "not_found" };
-    const runs = checks.value?.check_runs ?? [];
-    const statuses = status.value?.statuses ?? [];
-    if (runs.some((run) => run.status !== "completed")) return { kind: "not_found" };
-    const failedRun = runs.find((run) => !["success", "neutral", "skipped"].includes(run.conclusion ?? ""));
-    const failedStatus = statuses.find((entry) => ["error", "failure"].includes(entry.state ?? ""));
-    if (failedRun || failedStatus) {
-      return { kind: "found", status: "rejected", payload: { reason: "provider_checks_failed" } };
+
+    const resolutions = payload.policy.required_observations.map((requirement) => {
+      const collection = requirement.kind === "check_run" ? checks : statuses;
+      if (collection.kind === "not_found") return { state: "missing" } as const;
+      if (collection.kind === "unknown") {
+        return { state: "unknown", detail: collection.detail } as const;
+      }
+      return resolveRequiredObservation(requirement, collection.entries);
+    });
+    if (resolutions.some(({ state }) => state === "failure")) {
+      return {
+        kind: "found",
+        status: "rejected",
+        payload: providerObservationPayload(payload, "required_observation_failed", resolutions),
+      };
     }
-    if (status.value?.state === "pending") return { kind: "not_found" };
+    const indeterminate = resolutions.find(({ state }) => state === "unknown");
+    if (indeterminate?.state === "unknown") {
+      return { kind: "unknown", detail: indeterminate.detail };
+    }
+    if (resolutions.some(({ state }) => state === "missing" || state === "pending")) {
+      return { kind: "not_found" };
+    }
     return {
-      kind: "found", status: "confirmed",
-      payload: { subject: payload.subject, check_run_count: runs.length, status_count: statuses.length },
+      kind: "found",
+      status: "confirmed",
+      payload: providerObservationPayload(payload, "all_required_observations_succeeded", resolutions),
     };
   }
 }

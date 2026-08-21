@@ -1,6 +1,7 @@
 import {
   ATTEMPT_CHECKPOINT_SCHEMA,
   digestCanonicalJson,
+  validateFilesystemConfigContract,
   type AttemptCheckpoint,
   type BlobPointer,
   type DeliveryRecord,
@@ -20,6 +21,23 @@ import {
 } from "../app/kernel-admission-promotion.js";
 
 const GIT_BUNDLE_SCHEMA = "openthrottle.git-checkpoint-bundle/v1" as const;
+
+function githubProviderEvidencePolicy(
+  bundle: Parameters<KernelExternalStagePlanBinding["prepare"]>[0]["bundle"],
+) {
+  const matches = bundle.entries.filter((entry) =>
+    entry.definition_kind === "config" && entry.definition_id === "repository" &&
+    entry.origin.kind === "repository" && entry.path === ".openthrottle/config.yml");
+  if (matches.length !== 1) {
+    throw new Error("provider wait requires one exact repository config in its DefinitionBundle");
+  }
+  const config = validateFilesystemConfigContract(matches[0]!.normalized_payload, {
+    source: "definition_bundle.config:repository",
+  }).value;
+  const policy = config.provider_evidence?.github;
+  if (!policy) throw new Error("provider wait requires a sealed GitHub provider-evidence policy");
+  return policy;
+}
 
 function runtimeIdentity(input: {
   pipeline_run_id: string;
@@ -331,8 +349,9 @@ export function createKernelExternalPlanBindings(input: {
     stage_kind: "wait",
     subject_policy: "preserve",
     phases: waitShape.phases,
-    async prepare({ run }) {
+    async prepare({ run, bundle }) {
       const environment = input.environments.loadExactRunEnvironment(run.id);
+      const policy = githubProviderEvidencePolicy(bundle);
       return {
         verified_output_subject: null,
         checkpoint_payload: { subject: run.current_subject },
@@ -345,6 +364,7 @@ export function createKernelExternalPlanBindings(input: {
             schema: "openthrottle.github-provider-wait/v1",
             repository: environment.repository,
             subject: run.current_subject,
+            policy: policy as unknown as JsonValue,
           },
         }] }],
       };

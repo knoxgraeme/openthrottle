@@ -3,6 +3,7 @@ import {
   jsonValueAt,
   type AttemptCheckpoint,
   type CompiledPipelineStage,
+  type DefinitionBundle,
   type EffectIntent,
   type JsonValue,
 } from "@openthrottle/contracts";
@@ -70,6 +71,7 @@ export interface KernelExternalStagePlanBinding {
     attempt: Readonly<KernelAttempt>;
     stage: Extract<CompiledPipelineStage, { kind: "effect" | "wait" }>;
     context: ResolvedKernelContext;
+    bundle: Readonly<DefinitionBundle>;
   }): Promise<KernelPreparedExternalPlan>;
   /**
    * Only subject-advancing executor effects implement this hook. It derives

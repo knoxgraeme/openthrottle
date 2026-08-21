@@ -242,6 +242,66 @@ describe("filesystem config contract", () => {
       engine: "opencode",
     })).toThrow(/model: is required for OpenCode/);
   });
+
+  it("normalizes a bounded exact GitHub provider-evidence policy", () => {
+    expect(validateFilesystemConfigContract({
+      schema: FILESYSTEM_CONFIG_SCHEMA,
+      pipeline: "structured",
+      engine: "codex",
+      provider_evidence: {
+        github: {
+          required_observations: [
+            { kind: "commit_status", context: "coverage", creator_login: "coverage-bot" },
+            { kind: "check_run", name: "quality", app_slug: "github-actions" },
+            { kind: "check_run", name: "quality", app_slug: "trusted-quality-app" },
+          ],
+        },
+      },
+    }).value.provider_evidence).toEqual({
+      github: {
+        required_observations: [
+          { kind: "check_run", name: "quality", app_slug: "github-actions" },
+          { kind: "check_run", name: "quality", app_slug: "trusted-quality-app" },
+          { kind: "commit_status", context: "coverage", creator_login: "coverage-bot" },
+        ],
+      },
+    });
+  });
+
+  it("rejects empty, duplicate, over-bound, control-containing, and inexact provider observations", () => {
+    const config = (required_observations: unknown) => ({
+      schema: FILESYSTEM_CONFIG_SCHEMA,
+      pipeline: "structured",
+      engine: "codex",
+      provider_evidence: { github: { required_observations } },
+    });
+    const check = { kind: "check_run", name: "quality", app_slug: "github-actions" };
+
+    expect(() => validateFilesystemConfigContract(config([])))
+      .toThrow(/required_observations.*between 1 and 32/);
+    expect(() => validateFilesystemConfigContract(config(Array.from({ length: 33 }, (_, index) => ({
+      kind: "check_run", name: `quality-${index}`, app_slug: "github-actions",
+    })))))
+      .toThrow(/required_observations.*between 1 and 32/);
+    expect(() => validateFilesystemConfigContract(config([check, check])))
+      .toThrow(/required_observations.*duplicate exact observations/);
+    expect(() => validateFilesystemConfigContract(config([
+      { ...check, name: "quality\nforged" },
+    ]))).toThrow(/name.*control characters/);
+    expect(() => validateFilesystemConfigContract(config([
+      { ...check, creator_login: "wrong-producer-field" },
+    ]))).toThrow(/creator_login: unknown field/);
+    expect(() => validateFilesystemConfigContract(config([{
+      kind: "commit_status",
+      context: "coverage",
+      creator_login: "coverage-bot",
+      app_slug: "wrong-producer-field",
+    }]))).toThrow(/app_slug: unknown field/);
+    expect(() => validateFilesystemConfigContract({
+      ...config([check]),
+      provider_evidence: { github: { required_observations: [check], unexpected: true } },
+    })).toThrow(/unexpected: unknown field/);
+  });
 });
 
 describe("authored pipeline contract", () => {

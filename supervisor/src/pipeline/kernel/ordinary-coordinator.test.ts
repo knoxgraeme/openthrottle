@@ -312,7 +312,7 @@ class RuntimeFixture implements KernelRuntimePort {
       : null;
     if (nativeSessionId !== null) await callbacks.on_session(nativeSessionId);
     const output = request.repository_authority === "edit"
-      ? request.stage_id === "implement" || request.stage_id === "repair" ? IMPLEMENTED : SIMPLIFIED
+      ? request.stage_id === "implement" ? IMPLEMENTED : SIMPLIFIED
       : null;
     const checkpoint: AttemptCheckpoint = {
       schema: ATTEMPT_CHECKPOINT_SCHEMA,
@@ -824,10 +824,16 @@ describe("ordinary kernel activation", () => {
       expect((await execute(test.coordinator, 2)).disposition).toBe("settled");
       expect(runtime.workRequests).toHaveLength(1);
       expect(runtime.correctionRequests).toHaveLength(1);
+      const work = runtime.workRequests[0]!;
       expect(runtime.correctionRequests[0]).toMatchObject({
         engine: "codex",
-        attempt_id: "attempt-initial",
-        native_session_id: "session-attempt-initial",
+        pipeline_run_id: work.pipeline_run_id,
+        attempt_id: work.attempt_id,
+        request_hash: work.request_hash,
+        definition_bundle_hash: work.definition_bundle_hash,
+        input_subject: work.input_subject,
+        checkpoint_id: "checkpoint-attempt-initial",
+        native_session_id: `session-${work.attempt_id}`,
         locked_subject: IMPLEMENTED,
         completed_work_authority: "edit",
         repository_authority: "inspect",
@@ -868,21 +874,59 @@ describe("ordinary kernel activation", () => {
         current_subject: IMPLEMENTED,
       });
       const repair = test.db.prepare(`
-        SELECT repository_authority, input_subject, context_checkpoint_ids_json
+        SELECT id, repository_authority, input_subject, native_session_id,
+          context_record_ids_json, context_checkpoint_ids_json
         FROM attempts WHERE stage_id = 'repair'
       `).get() as {
+        id: string;
         repository_authority: string;
         input_subject: string;
+        native_session_id: string | null;
+        context_record_ids_json: string;
         context_checkpoint_ids_json: string;
       };
-      expect(repair).toEqual({
+      const reviewAttempt = test.db.prepare(`
+        SELECT id, native_session_id, result_record_id, decision_record_id
+        FROM attempts WHERE stage_id = 'review'
+      `).get() as {
+        id: string;
+        native_session_id: string;
+        result_record_id: string;
+        decision_record_id: string;
+      };
+      expect(repair).toMatchObject({
         repository_authority: "edit",
         input_subject: IMPLEMENTED,
+        native_session_id: null,
         context_checkpoint_ids_json: '["checkpoint-attempt-initial"]',
       });
+      expect(repair.id).not.toBe(reviewAttempt.id);
+      expect(JSON.parse(repair.context_record_ids_json)).toEqual([
+        reviewAttempt.decision_record_id,
+        reviewAttempt.result_record_id,
+      ].sort());
       const review = test.runtime.workRequests[1]!;
       expect(review.repository_authority).toBe("inspect");
       expect(review.change_boundary?.output_subject).toBe(IMPLEMENTED);
+
+      expect((await execute(test.coordinator, 3)).disposition).toBe("settled");
+      const repairRequest = test.runtime.workRequests[2]!;
+      expect(repairRequest).toMatchObject({
+        attempt_id: repair.id,
+        repository_authority: "edit",
+        input_subject: IMPLEMENTED,
+      });
+      expect(repairRequest.context.records.map(({ id }) => id)).toEqual([
+        reviewAttempt.decision_record_id,
+        reviewAttempt.result_record_id,
+      ].sort());
+      expect(repairRequest.context.checkpoints.map(({ id }) => id))
+        .toEqual(["checkpoint-attempt-initial"]);
+      const boundRepair = test.db.prepare(`
+        SELECT native_session_id FROM attempts WHERE id = ?
+      `).get(repair.id) as { native_session_id: string };
+      expect(boundRepair.native_session_id).toBe(`session-${repair.id}`);
+      expect(boundRepair.native_session_id).not.toBe(reviewAttempt.native_session_id);
     } finally {
       test.db.close();
     }
