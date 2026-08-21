@@ -19,7 +19,14 @@ import {
   type ResultRecord,
 } from "@openthrottle/contracts";
 import { reduceKernelCommand, compileKernelCursor } from "../pipeline/kernel/reducer.js";
-import { KERNEL_WORK_REQUEST_PAYLOAD_SCHEMA } from "../pipeline/kernel/ports.js";
+import {
+  KERNEL_WORK_REQUEST_PAYLOAD_SCHEMA,
+  captureAttemptLeaseClaim,
+} from "../pipeline/kernel/ports.js";
+import {
+  createPipelineDecisionRecord,
+  ordinaryKernelPayloadSchemas,
+} from "../pipeline/kernel/evaluator-registry.js";
 import {
   KERNEL_ATTEMPT_SCHEMA,
   KERNEL_RUN_SCHEMA,
@@ -47,6 +54,7 @@ const sha = (character: string): string => character.repeat(64);
 const subject = (character: string): string => character.repeat(40);
 
 const payloadSchemas: ExecutionRecordPayloadRegistry = new Map<string, ExecutionRecordPayloadContract>([
+  ...ordinaryKernelPayloadSchemas(),
   ["result/v1", { kind: "result", parseInline: (value: unknown): unknown => value }],
   ["decision/v1", { kind: "decision", parseInline: (value: unknown): unknown => value }],
   ["delivery/v1", { kind: "delivery", parseInline: (value: unknown): unknown => value }],
@@ -339,6 +347,92 @@ describe("SqliteKernelStore", () => {
       });
       expect(admitted.run.status).toBe("pending");
       expect(Object.keys(admitted.run.active_attempt_versions)).toHaveLength(1);
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("classifies promoted and recorded external continuations by their durable schedule identity", async () => {
+    const context = setup();
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const externalSemanticKey = "external-schedule:attempt-1:integrate-checkpoint";
+      context.db.transaction(() => {
+        context.db.prepare(`
+          INSERT INTO checkpoints (
+            id, pipeline_run_id, attempt_id, ordinal, checkpoint_hash, semantic_key,
+            request_hash, definition_bundle_hash, input_subject, output_subject,
+            native_session_id, payload_schema, inline_payload, captured_at
+          ) VALUES (?, 'run-1', 'attempt-1', 0, ?, ?, ?, ?, ?, ?, NULL,
+            'openthrottle.git-checkpoint-bundle/v1', '{}', ?)
+        `).run(
+          "checkpoint-promoted",
+          sha("4"),
+          "attempt:attempt-1:checkpoint:0",
+          sha("a"),
+          context.admission.run.definition_bundle_hash,
+          subject("1"),
+          subject("2"),
+          NOW,
+        );
+        context.db.prepare(`
+          INSERT INTO records (
+            id, pipeline_run_id, sequence, record_hash, kind, semantic_key,
+            payload_schema, inline_payload, reducer, input_record_ids_json,
+            input_record_count, created_at
+          ) VALUES ('decision-external', 'run-1', 1, ?, 'decision', ?,
+            'decision/v1', ?, 'core/external-schedule@1', '[]', 0, ?)
+        `).run(
+          sha("5"),
+          externalSemanticKey,
+          JSON.stringify({ semantic_key: externalSemanticKey }),
+          NOW,
+        );
+        context.db.prepare(`
+          UPDATE attempts SET status = 'work_complete', output_subject = ?,
+            checkpoint_id = 'checkpoint-promoted', version = version + 1
+          WHERE id = 'attempt-1'
+        `).run(subject("2"));
+      }).immediate();
+
+      await expect(context.store.listReadyExternalAttempts({ limit: 10 })).resolves.toEqual([
+        { updated_at: NOW, pipeline_run_id: "run-1", attempt_id: "attempt-1" },
+      ]);
+      await expect(context.store.listReadyExternalAttempts({
+        limit: 10,
+        after: { updated_at: NOW, pipeline_run_id: "run-1", attempt_id: "attempt-1" },
+      })).resolves.toEqual([]);
+      await expect(context.store.listReadyOrdinaryAttempts({ limit: 10 })).resolves.toEqual([]);
+
+      context.db.transaction(() => {
+        context.db.prepare(`
+          INSERT INTO records (
+            id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+            inline_payload, attempt_id, request_hash, definition_bundle_hash,
+            input_subject, output_subject, original_candidate_hash,
+            normalized_candidate_hash, created_at
+          ) VALUES ('result-external', 'run-1', 2, ?, 'result', 'result/v1', '{}',
+            'attempt-1', ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          sha("6"),
+          sha("a"),
+          context.admission.run.definition_bundle_hash,
+          subject("1"),
+          subject("2"),
+          sha("7"),
+          sha("7"),
+          NOW,
+        );
+        context.db.prepare(`
+          UPDATE attempts SET status = 'recorded', result_record_id = 'result-external',
+            version = version + 1 WHERE id = 'attempt-1'
+        `).run();
+      }).immediate();
+
+      await expect(context.store.listReadyExternalAttempts({ limit: 10 })).resolves.toEqual([
+        { updated_at: NOW, pipeline_run_id: "run-1", attempt_id: "attempt-1" },
+      ]);
+      await expect(context.store.listReadyOrdinaryAttempts({ limit: 10 })).resolves.toEqual([]);
     } finally {
       context.db.close();
     }
@@ -641,6 +735,85 @@ describe("SqliteKernelStore", () => {
     }
   });
 
+  it("atomically quarantines an exhausted unreadable run and releases the global Attempt slot", async () => {
+    const context = setup();
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const secondAttempt = attempt({
+        id: "attempt-2",
+        pipeline_run_id: "run-2",
+        definition_bundle_hash: context.admission.run.definition_bundle_hash,
+      });
+      context.store.admitPipelineRun({
+        ...context.admission,
+        work_item: {
+          ...context.admission.work_item,
+          id: "work-2",
+          source_id: "issue-2",
+          source_reference: "OPE-2",
+        },
+        run: {
+          ...run([secondAttempt], context.admission.run.definition_bundle_hash),
+          id: "run-2",
+          active_attempt_versions: { [secondAttempt.id]: secondAttempt.version },
+        },
+        initial_attempts: [secondAttempt],
+      });
+      const leased = await context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-poison",
+        expires_at: "2026-08-20T12:01:00.000Z",
+      });
+      expect(leased?.attempt.id).toBe("attempt-1");
+      await context.store.recoverExpiredAttemptLeases({
+        observed_at: "2026-08-20T12:01:00.000Z",
+        expires_at: "2026-08-20T12:02:00.000Z",
+        limit: 1,
+      });
+      const [exhausted] = await context.store.recoverExpiredAttemptLeases({
+        observed_at: "2026-08-20T12:02:00.000Z",
+        expires_at: "2026-08-20T12:03:00.000Z",
+        limit: 1,
+      });
+      if (!exhausted) throw new Error("expected exhausted recovery lease");
+      writeFileSync(
+        context.blobs.objectPath(context.admission.run.definition_bundle_hash),
+        "corrupt definition bundle",
+        "utf8",
+      );
+      const reason = "attempt_recovery_exhausted: runtime failed; terminal_preparation_failed: bundle unreadable";
+      const diagnostic = createPipelineDecisionRecord({
+        attempt: exhausted.attempt,
+        result: null,
+        evaluated: {
+          evaluator: "core/executor-recovery-quarantine@1",
+          outcome: "needs_human",
+          reason,
+        },
+        created_at: NOW,
+      });
+
+      await expect(context.store.quarantineExhaustedAttemptRecovery({
+        claim: captureAttemptLeaseClaim(exhausted),
+        diagnostic,
+        reason,
+      })).resolves.toBe(true);
+      expect(context.db.prepare("SELECT status, terminal_outcome FROM pipeline_runs WHERE id = 'run-1'").get())
+        .toEqual({ status: "needs_human", terminal_outcome: "needs_human" });
+      expect(context.db.prepare("SELECT status, lease_id FROM attempts WHERE id = 'attempt-1'").get())
+        .toEqual({ status: "needs_human", lease_id: null });
+      expect(context.db.prepare("SELECT kind, reducer FROM records WHERE id = ?").get(diagnostic.id))
+        .toEqual({ kind: "decision", reducer: "core/executor-recovery-quarantine@1" });
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-2",
+        lease_id: "lease-next",
+        expires_at: "2026-08-20T12:04:00.000Z",
+      })).resolves.toMatchObject({ run_id: "run-2", attempt: { id: "attempt-2" } });
+    } finally {
+      context.db.close();
+    }
+  });
+
   it("applies a reducer bundle atomically and distinguishes replay, conflict, and stale commands", async () => {
     const context = setup();
     try {
@@ -727,6 +900,7 @@ describe("SqliteKernelStore", () => {
           attempt_id: "attempt-1",
           checkpoint_id: "checkpoint-1",
           verified_output_subject: subject("2"),
+          result_record_id: null,
         },
       });
       await context.store.applyAtomicTransition(transition);
@@ -810,6 +984,7 @@ describe("SqliteKernelStore", () => {
         command: {
           type: "work_complete", command_id: "work-complete-1", attempt_id: "attempt-1",
           checkpoint_id: "checkpoint-1", verified_output_subject: subject("2"),
+          result_record_id: null,
         },
       }));
       const completed = await context.store.loadExactReductionView({

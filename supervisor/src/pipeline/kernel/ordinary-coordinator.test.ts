@@ -536,6 +536,138 @@ async function execute(coordinator: OrdinaryKernelCoordinator, ordinal: number) 
 }
 
 describe("ordinary kernel activation", () => {
+  it("quarantines an exhausted recovery lease when terminal preparation is unreadable", async () => {
+    const fixed = fixture();
+    const manifest: CompiledPipelineManifest = {
+      ...fixed.manifest,
+      entry_stage: RUNTIME_PROVISION_STAGE_ID,
+      stages: [{
+        id: RUNTIME_PROVISION_STAGE_ID,
+        kind: "effect",
+        effect: "core/daytona-provision@1",
+        on: { success: { terminal: "completed" } },
+      }],
+    };
+    const attempt: KernelAttempt = {
+      schema: KERNEL_ATTEMPT_SCHEMA,
+      id: "attempt-poison",
+      pipeline_run_id: "run-poison",
+      scope: { kind: "stage", stage_id: RUNTIME_PROVISION_STAGE_ID },
+      repository_authority: "inspect",
+      request_hash: "a".repeat(64),
+      definition_bundle_hash: manifest.definition_bundle_hash,
+      input_subject: SOURCE,
+      context_record_ids: [],
+      context_checkpoint_ids: [],
+      output_subject: null,
+      native_session_id: null,
+      status: "running",
+      version: 4,
+      work_retry_ordinal: 0,
+      result_correction_count: 0,
+      result_correction_deadline: null,
+      lease: {
+        id: "lease-poison",
+        generation: 2,
+        worker_id: "worker-poison",
+        purpose: "work",
+        expires_at: "2026-08-20T12:05:00.000Z",
+        started: true,
+      },
+      checkpoint_id: null,
+      result_record_id: null,
+      decision_record_id: null,
+      pending_result: null,
+    };
+    let run: KernelRun = {
+      schema: KERNEL_RUN_SCHEMA,
+      id: "run-poison",
+      pipeline_id: manifest.pipeline_id,
+      definition_bundle_hash: manifest.definition_bundle_hash,
+      current_subject: SOURCE,
+      status: "running",
+      terminal_outcome: null,
+      cursor: compileKernelCursor({
+        stage_id: RUNTIME_PROVISION_STAGE_ID,
+        version: 4,
+        attempts: [attempt],
+      }),
+      version: 4,
+      work_retry_limit: 2,
+      result_correction_limit: 2,
+      active_attempt_versions: { [attempt.id]: attempt.version },
+      active_effect_versions: {},
+      checkpoint_ids: {},
+    };
+    let transition: AtomicTransitionBundle | null = null;
+    let quarantineDiagnostic: unknown = null;
+    let currentAttempt = attempt;
+    const store = {
+      async loadExactReductionView(input: { attempt_id: string | null }) {
+        return {
+          manifest,
+          run,
+          current_attempt: input.attempt_id === null ? null : currentAttempt,
+          records: new Map(),
+          checkpoints: new Map(),
+        };
+      },
+      async loadAttemptRequestInputs() {
+        throw new Error("sealed work request blob is unreadable");
+      },
+      async applyAtomicTransition(next: AtomicTransitionBundle) {
+        transition = next;
+        run = next.run;
+        return { disposition: "applied" as const, run_version: run.version };
+      },
+      async quarantineExhaustedAttemptRecovery(input: { diagnostic: unknown }) {
+        quarantineDiagnostic = input.diagnostic;
+        return true;
+      },
+    };
+    const coordinator = new OrdinaryKernelCoordinator({
+      store: store as never,
+      definition_bundles: {} as never,
+      runtime: {} as never,
+      runtime_sessions: {} as never,
+      attempt_lease_duration_ms: 60_000,
+      now: () => NOW,
+    });
+    const leased = {
+      run_id: run.id,
+      run_version: run.version,
+      cursor_version: run.cursor.version,
+      attempt,
+      lease: attempt.lease!,
+    };
+
+    currentAttempt = {
+      ...attempt,
+      lease: { ...attempt.lease!, generation: 1 },
+    };
+    await expect(coordinator.terminalizeExhaustedRecovery({
+      ...leased,
+      attempt: currentAttempt,
+      lease: currentAttempt.lease!,
+    }, new Error("first recovery failed"))).resolves.toBeNull();
+    expect(transition).toBeNull();
+    currentAttempt = attempt;
+
+    await expect(coordinator.terminalizeExhaustedRecovery(
+      leased,
+      new Error("runtime reconciliation failed"),
+    )).resolves.toMatchObject({ disposition: "terminal", run_status: "needs_human" });
+    expect(transition).toBeNull();
+    expect(quarantineDiagnostic).toEqual(expect.objectContaining({
+      kind: "decision",
+      reducer: "core/executor-recovery-quarantine@1",
+      payload: { inline: expect.objectContaining({
+        outcome: "needs_human",
+        reason: expect.stringContaining("terminal_preparation_failed: sealed work request blob is unreadable"),
+      }) },
+    }));
+  });
+
   it.each([
     ["stop", "canceled"],
     ["supersede", "superseded"],
@@ -755,6 +887,125 @@ describe("ordinary kernel activation", () => {
       });
     } finally {
       if (active.db.open) active.db.close();
+    }
+  });
+
+  it.each([
+    ["work_complete", "work-complete-"],
+    ["recorded", "record-"],
+  ] as const)(
+    "continues idempotently after a restart from %s without rerunning work",
+    async (expectedStatus, transitionPrefix) => {
+      const runtime = new RuntimeFixture();
+      let active = await setup(runtime);
+      try {
+        const apply = active.store.applyAtomicTransition.bind(active.store);
+        let crashPending = true;
+        active.store.applyAtomicTransition = async (transition: AtomicTransitionBundle) => {
+          const result = await apply(transition);
+          if (crashPending && transition.transition_id.startsWith(transitionPrefix)) {
+            crashPending = false;
+            throw new Error(`injected crash after ${expectedStatus}`);
+          }
+          return result;
+        };
+
+        await expect(execute(active.coordinator, 1)).rejects.toThrow(
+          `injected crash after ${expectedStatus}`,
+        );
+        expect(active.db.prepare(`
+          SELECT status, lease_id, checkpoint_id, result_record_id
+          FROM attempts WHERE id = 'attempt-initial'
+        `).get()).toMatchObject({
+          status: expectedStatus,
+          lease_id: null,
+          checkpoint_id: "checkpoint-attempt-initial",
+          result_record_id: expect.stringMatching(/^result-/),
+        });
+        expect(runtime.workRequests).toHaveLength(1);
+
+        active.db.close();
+        active = active.restart();
+        await expect(active.coordinator.resumeReadyAttempt()).resolves.toMatchObject({
+          disposition: "settled",
+          attempt_id: "attempt-initial",
+          next_stage_id: "review",
+        });
+        expect(runtime.workRequests).toHaveLength(1);
+        expect(active.db.prepare(`
+          SELECT status, result_record_id, decision_record_id
+          FROM attempts WHERE id = 'attempt-initial'
+        `).get()).toMatchObject({
+          status: "settled",
+          result_record_id: expect.stringMatching(/^result-/),
+          decision_record_id: expect.stringMatching(/^decision-/),
+        });
+      } finally {
+        if (active.db.open) active.db.close();
+      }
+    },
+  );
+
+  it("paginates past 100 malformed continuations without rerunning completed ordinary work", async () => {
+    const runtime = new RuntimeFixture();
+    const active = await setup(runtime);
+    try {
+      const apply = active.store.applyAtomicTransition.bind(active.store);
+      let crashPending = true;
+      active.store.applyAtomicTransition = async (transition: AtomicTransitionBundle) => {
+        const result = await apply(transition);
+        if (crashPending && transition.transition_id.startsWith("work-complete-")) {
+          crashPending = false;
+          throw new Error("injected crash after ordinary work completion");
+        }
+        return result;
+      };
+      await expect(execute(active.coordinator, 1))
+        .rejects.toThrow("injected crash after ordinary work completion");
+      active.store.applyAtomicTransition = apply;
+
+      const load = active.store.loadExactReductionView.bind(active.store);
+      active.store.loadExactReductionView = async (request) => {
+        if (request.pipeline_run_id.startsWith("run-corrupt-")) {
+          throw new Error("corrupt ordinary continuation");
+        }
+        return load(request);
+      };
+      const list = active.store.listReadyOrdinaryAttempts.bind(active.store);
+      const malformed = Array.from({ length: 125 }, (_, index) => ({
+        updated_at: "2026-08-20T11:59:00.000Z",
+        pipeline_run_id: `run-corrupt-${String(index).padStart(3, "0")}`,
+        attempt_id: `attempt-corrupt-${String(index).padStart(3, "0")}`,
+      }));
+      active.store.listReadyOrdinaryAttempts = async (input: {
+        limit: number;
+        after?: { updated_at: string; pipeline_run_id: string; attempt_id: string };
+      }) => {
+        const start = input.after === undefined
+          ? 0
+          : malformed.findIndex((candidate) =>
+            candidate.updated_at === input.after!.updated_at &&
+            candidate.pipeline_run_id === input.after!.pipeline_run_id &&
+            candidate.attempt_id === input.after!.attempt_id) + 1;
+        if (input.after !== undefined && start === 0) return list(input);
+        const page = malformed.slice(start, start + input.limit);
+        if (page.length === input.limit) return page;
+        const after = page.at(-1) ?? input.after;
+        const durable = await list({
+          limit: input.limit - page.length,
+          ...(after === undefined ? {} : { after }),
+        });
+        return [...page, ...durable];
+      };
+
+      await expect(active.coordinator.resumeReadyAttempt()).resolves.toMatchObject({
+        disposition: "settled",
+        attempt_id: "attempt-initial",
+        next_stage_id: "review",
+      });
+      expect(runtime.workRequests).toHaveLength(1);
+    } finally {
+      active.db.close();
     }
   });
 

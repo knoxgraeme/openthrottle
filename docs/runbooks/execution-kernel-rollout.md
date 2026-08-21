@@ -17,7 +17,8 @@ Prepare and pin:
 - distinct, absent fresh database and blob-root paths on the same Fly volume;
 - an absent archive directory and absent report path;
 - a checksummed `openthrottle.fresh-epoch-bootstrap/v1` containing only desired
-  settings and repository registrations;
+  settings and repository registrations, with its exact checksum pinned for
+  candidate and normal startup;
 - operator hook programs for observed-precondition verification, candidate
   start, ordinary smoke, structured smoke, ingress reopen, candidate stop, and
   old-tuple restore, including each exact executable SHA-256 and required parent
@@ -269,7 +270,12 @@ parent values named in `inherit_env`, plus executor-owned
 `OT_OFFLINE_REPLACEMENT_OPERATION`; rollback hooks also receive
 `OT_OFFLINE_REPLACEMENT_REASON`. Reserved names cannot appear in `inherit_env`,
 and no other parent secret or variable is copied. Hooks never pass through a
-shell parser.
+shell parser. The executor applies a two-hour per-hook deadline by default;
+`OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS` may pin another value from 100 through
+86400000 milliseconds without changing the authenticated manifest. A timed-out
+hook is terminated as one detached process group with `SIGTERM`, then always
+completes a `SIGKILL` and process-group-quiescence phase before rollback
+proceeds, even when the hook leader exits during the grace period.
 
 ## 5. Run from a maintenance Machine
 
@@ -278,9 +284,13 @@ stopped volume. Override the image command so the supervisor service does not
 start automatically. The command is conceptually:
 
 ```bash
-node /app/scripts/offline-replace.mjs \
-  /data/maintenance/offline-replacement.json
+OT_OFFLINE_REPLACEMENT_HOOK_TIMEOUT_MS=7200000 \
+  node /app/scripts/offline-replace.mjs \
+    /data/maintenance/offline-replacement.json
 ```
+
+The supervisor image includes this exact `/app/scripts/offline-replace.mjs`
+entrypoint and its sibling `/app/dist` implementation.
 
 Fly's one-off Machine must have restart policy `no` and must be destroyed after
 the command exits so the volume can attach to the normal app Machine. Verify the
@@ -296,18 +306,22 @@ The replacement command will:
 4. run `integrity_check` and `foreign_key_check`;
 5. copy and hash the old blob tree;
 6. atomically publish a checksum-bound archive manifest;
-7. initialize the fresh twelve-table database and BlobStore at absent paths;
+7. initialize the fresh twelve-table database and BlobStore at absent paths,
+   including the executor-owned mutable maintenance fence set to `true`;
 8. verify release, schema, store, and bootstrap identities;
 9. start the candidate in the maintenance context;
 10. run distinct named ordinary and structured smokes;
 11. durably write a checksum-bound `ready_to_reopen` report;
-12. reopen ingress, then atomically replace it with a `completed` report whose
-    `ready_report_digest` binds the pre-reopen report.
+12. have the reopen hook compare-and-set that exact maintenance fence from
+    `true` to `false`, then atomically replace the ready report with a
+    `completed` report whose `ready_report_digest` binds the pre-reopen report.
 
 The candidate start hook launches the supervisor against the fresh paths with
-public admission still closed. The ordinary and structured hooks are the first
-and only canary pair for this replacement; do not create an ambiguous second
-pair after `ready_to_reopen`.
+`OT_EPOCH_BOOTSTRAP_CHECKSUM` set to the exact manifest bootstrap checksum and
+the initialized maintenance fence still closed. It must observe that fence
+before reporting the candidate started. The ordinary and structured hooks are
+the first and only canary pair for this replacement; do not create an ambiguous
+second pair after `ready_to_reopen`.
 
 Each canary starts from a scoped real Linear/GitHub work item and must:
 
@@ -334,7 +348,8 @@ After the command returns `status:"completed"`:
 3. inspect and accept the canary deliverables, trusted-provider observations,
    interventions, and cleanup evidence bound by the ready-report digest;
 4. configure `DATABASE_PATH`, `OT_BLOB_STORE_PATH`, `OT_BLOB_STORE_ID`,
-   `OT_EPOCH_RELEASE_ID`, and `DAYTONA_SNAPSHOT` for the exact candidate tuple;
+   `OT_EPOCH_RELEASE_ID`, `OT_EPOCH_BOOTSTRAP_CHECKSUM`, and
+   `DAYTONA_SNAPSHOT` for the exact candidate tuple;
 5. set `FRESH_EPOCH_READY` to the exact string `true` and run the normal deploy
    workflow, which uses `--ha=false` and converges to one Machine;
 6. verify exactly one normal app Machine exists and the sole

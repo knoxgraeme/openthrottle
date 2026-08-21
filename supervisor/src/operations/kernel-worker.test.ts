@@ -40,22 +40,26 @@ function inboxEvent(): KernelInboxEvent {
 
 function workerFixture(handler: () => Promise<"consumed" | "stale" | "dead">) {
   let next: KernelInboxEvent | null = inboxEvent();
+  const leaseNext = vi.fn(() => {
+    const leased = next;
+    next = null;
+    return leased;
+  });
   const complete = vi.fn();
   const retry = vi.fn();
   const inbox: KernelInboxDeliveryPort = {
-    leaseNext: () => {
-      const leased = next;
-      next = null;
-      return leased;
-    },
+    leaseNext,
     complete,
     retry,
     get: () => undefined,
   };
   const attempts = {
     recoverExpiredAttemptLeases: vi.fn(async () => []),
+    leaseNextEligibleAttempt: vi.fn(async () => null),
   } as unknown as KernelAttemptLeasePort;
   const ordinary = {
+    resumeReadyAttempt: vi.fn(async () => ({ disposition: "idle" as const })),
+    terminalizeExhaustedRecovery: vi.fn(async () => null),
     leaseAndExecuteNext: vi.fn(async () => ({ disposition: "idle" as const })),
     executeLeasedAttempt: vi.fn(),
   } as unknown as OrdinaryKernelCoordinator;
@@ -80,6 +84,8 @@ function workerFixture(handler: () => Promise<"consumed" | "stale" | "dead">) {
     }),
     complete,
     retry,
+    leaseNext,
+    attempts,
     ordinary,
     external,
     effects,
@@ -98,7 +104,7 @@ describe("KernelWorker", () => {
       lease_id: expect.stringMatching(/^inbox-/),
       available_at: "2026-08-20T12:00:01.000Z",
     });
-    expect(fixture.ordinary.leaseAndExecuteNext).toHaveBeenCalledOnce();
+    expect(fixture.attempts.leaseNextEligibleAttempt).toHaveBeenCalledOnce();
     expect(fixture.effects.drainOne).toHaveBeenCalledOnce();
     expect(fixture.external.resumeReadyAttempt).toHaveBeenCalledOnce();
   });
@@ -114,5 +120,64 @@ describe("KernelWorker", () => {
       lease_id: expect.stringMatching(/^inbox-/),
       outcome: "dead",
     });
+  });
+
+  it("does not redeliver a handled event when completion bookkeeping fails", async () => {
+    const fixture = workerFixture(async () => "consumed");
+    fixture.complete.mockImplementation(() => { throw new Error("completion database unavailable"); });
+
+    await expect(fixture.worker.runCycle()).resolves.toBe(1);
+    expect(fixture.retry).not.toHaveBeenCalled();
+    expect(fixture.attempts.leaseNextEligibleAttempt).toHaveBeenCalledOnce();
+    expect(fixture.effects.drainOne).toHaveBeenCalledOnce();
+    expect(fixture.external.resumeReadyAttempt).toHaveBeenCalledOnce();
+  });
+
+  it("keeps other durable queues live when inbox leasing fails", async () => {
+    const fixture = workerFixture(async () => "consumed");
+    fixture.leaseNext.mockImplementation(() => { throw new Error("unreadable inbox head"); });
+
+    await expect(fixture.worker.runCycle()).resolves.toBe(0);
+    expect(fixture.attempts.leaseNextEligibleAttempt).toHaveBeenCalledOnce();
+    expect(fixture.effects.drainOne).toHaveBeenCalledOnce();
+    expect(fixture.external.resumeReadyAttempt).toHaveBeenCalledOnce();
+  });
+
+  it("keeps other durable queues live when retry bookkeeping fails", async () => {
+    const fixture = workerFixture(async () => { throw new Error("handler failed"); });
+    fixture.retry.mockImplementation(() => { throw new Error("retry database unavailable"); });
+
+    await expect(fixture.worker.runCycle()).resolves.toBe(1);
+    expect(fixture.attempts.leaseNextEligibleAttempt).toHaveBeenCalledOnce();
+    expect(fixture.effects.drainOne).toHaveBeenCalledOnce();
+    expect(fixture.external.resumeReadyAttempt).toHaveBeenCalledOnce();
+  });
+
+  it("bounds a repeatedly failing recovered Attempt without redispatching it", async () => {
+    const fixture = workerFixture(async () => "consumed");
+    const leased = {
+      run_id: "run-poison",
+      attempt: { id: "attempt-poison" },
+      lease: { id: "lease-poison", generation: 2 },
+    } as never;
+    vi.mocked(fixture.attempts.recoverExpiredAttemptLeases).mockResolvedValue([leased]);
+    vi.mocked(fixture.ordinary.executeLeasedAttempt)
+      .mockRejectedValue(new Error("runtime reconciliation failed"));
+    vi.mocked(fixture.ordinary.terminalizeExhaustedRecovery).mockResolvedValue({
+      disposition: "terminal",
+      pipeline_run_id: "run-poison",
+      attempt_id: "attempt-poison",
+      stage_id: "implement",
+      run_status: "needs_human",
+      next_stage_id: null,
+    });
+
+    await expect(fixture.worker.runCycle()).resolves.toBe(2);
+    expect(fixture.ordinary.executeLeasedAttempt).toHaveBeenCalledOnce();
+    expect(fixture.ordinary.terminalizeExhaustedRecovery).toHaveBeenCalledWith(
+      leased,
+      expect.objectContaining({ message: "runtime reconciliation failed" }),
+    );
+    expect(fixture.attempts.leaseNextEligibleAttempt).toHaveBeenCalledOnce();
   });
 });

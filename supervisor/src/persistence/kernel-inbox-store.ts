@@ -4,18 +4,21 @@ import {
   canonicalJson,
   digestCanonicalJson,
   jsonValueAt,
+  validateBlobPointer,
   type BlobPointer,
   type JsonValue,
 } from "@openthrottle/contracts";
 import {
+  BlobIntegrityError,
   VolumeBlobStore,
   type VerifiedBlobToken,
 } from "./blob-store.js";
+import { KERNEL_INGRESS_MAINTENANCE_SETTING } from "./epoch-schema.js";
 
-export const KERNEL_INGRESS_MAINTENANCE_SETTING =
-  "epoch.maintenance_ingress_closed" as const;
+export { KERNEL_INGRESS_MAINTENANCE_SETTING } from "./epoch-schema.js";
 export const KERNEL_INBOX_INLINE_PAYLOAD_MAX_BYTES = 64 * 1024;
 export const KERNEL_INBOX_MAX_PAYLOAD_BYTES = 1024 * 1024;
+const KERNEL_INBOX_UNREADABLE_HEAD_LIMIT = 100;
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const PROVIDER = /^[a-z][a-z0-9._/-]{0,99}$/;
@@ -108,13 +111,13 @@ export interface KernelInboxDeliveryPort {
     owner_id: string;
     lease_id: string;
     outcome: "consumed" | "stale" | "dead";
-  }): KernelInboxEvent;
+  }): void;
   retry(input: {
     event_id: string;
     owner_id: string;
     lease_id: string;
     available_at: string;
-  }): KernelInboxEvent;
+  }): void;
   get(eventId: string): KernelInboxEvent | undefined;
 }
 
@@ -156,6 +159,13 @@ interface PreparedPayload {
   token: VerifiedBlobToken | null;
 }
 
+class InboxPayloadCorruptionError extends Error {
+  constructor(eventId: string, detail: string) {
+    super(`inbox event ${eventId} is deterministically unreadable: ${detail}`);
+    this.name = "InboxPayloadCorruptionError";
+  }
+}
+
 function bounded(value: string, name: string, max: number, pattern?: RegExp): string {
   if (
     typeof value !== "string" || value.length < 1 || value.length > max ||
@@ -177,14 +187,14 @@ function pointer(row: InboxRow): BlobPointer | null {
     row.blob_algorithm !== "sha256" || row.blob_bytes === null || row.blob_encoding === null ||
     row.blob_media_type === null || row.blob_payload_schema === null
   ) throw new Error(`inbox event ${row.id} has a partial blob pointer`);
-  return {
+  return validateBlobPointer({
     algorithm: row.blob_algorithm,
     digest: row.blob_digest,
     bytes: row.blob_bytes,
     encoding: row.blob_encoding,
     media_type: row.blob_media_type,
     payload_schema: row.blob_payload_schema,
-  };
+  }, { source: `inbox_event.${row.id}.blob` }).value;
 }
 
 function immutableProjection(row: InboxRow): Record<string, unknown> {
@@ -405,29 +415,44 @@ export class SqliteKernelInboxStore implements
             lease_expires_at = NULL, version = version + 1
         WHERE status = 'processing' AND lease_expires_at <= ?
       `).run(now);
-      const replay = this.#db.prepare(`
-        SELECT * FROM inbox_events WHERE lease_id = ?
-      `).get(input.lease_id) as InboxRow | undefined;
-      if (replay) {
-        if (
-          replay.lease_owner_id !== input.owner_id || replay.lease_expires_at !== input.expires_at
-        ) throw new Error(`inbox lease ${input.lease_id} conflicts with its replay`);
-        return this.#event(replay);
+      for (let skipped = 0; skipped < KERNEL_INBOX_UNREADABLE_HEAD_LIMIT; skipped += 1) {
+        const replay = this.#db.prepare(`
+          SELECT * FROM inbox_events WHERE lease_id = ?
+        `).get(input.lease_id) as InboxRow | undefined;
+        if (replay) {
+          if (
+            replay.lease_owner_id !== input.owner_id || replay.lease_expires_at !== input.expires_at
+          ) throw new Error(`inbox lease ${input.lease_id} conflicts with its replay`);
+          try {
+            return this.#event(replay);
+          } catch (error) {
+            if (!(error instanceof InboxPayloadCorruptionError)) throw error;
+            this.#deadLetterUnreadable(replay, now);
+            continue;
+          }
+        }
+        const row = this.#db.prepare(`
+          SELECT * FROM inbox_events
+          WHERE status = 'pending' AND lease_id IS NULL AND available_at <= ?
+          ORDER BY available_at, created_at, id LIMIT 1
+        `).get(now) as InboxRow | undefined;
+        if (!row) return null;
+        const changed = this.#db.prepare(`
+          UPDATE inbox_events
+          SET status = 'processing', lease_id = ?, lease_owner_id = ?,
+              lease_expires_at = ?, version = version + 1
+          WHERE id = ? AND version = ? AND status = 'pending' AND lease_id IS NULL
+        `).run(input.lease_id, input.owner_id, input.expires_at, row.id, row.version);
+        if (changed.changes !== 1) throw new Error(`inbox event ${row.id} lease race`);
+        const leased = this.#row(row.id)!;
+        try {
+          return this.#event(leased);
+        } catch (error) {
+          if (!(error instanceof InboxPayloadCorruptionError)) throw error;
+          this.#deadLetterUnreadable(leased, now);
+        }
       }
-      const row = this.#db.prepare(`
-        SELECT * FROM inbox_events
-        WHERE status = 'pending' AND lease_id IS NULL AND available_at <= ?
-        ORDER BY available_at, created_at, id LIMIT 1
-      `).get(now) as InboxRow | undefined;
-      if (!row) return null;
-      const changed = this.#db.prepare(`
-        UPDATE inbox_events
-        SET status = 'processing', lease_id = ?, lease_owner_id = ?,
-            lease_expires_at = ?, version = version + 1
-        WHERE id = ? AND version = ? AND status = 'pending' AND lease_id IS NULL
-      `).run(input.lease_id, input.owner_id, input.expires_at, row.id, row.version);
-      if (changed.changes !== 1) throw new Error(`inbox event ${row.id} lease race`);
-      return this.#event(this.#row(row.id)!);
+      return null;
     }).immediate();
   }
 
@@ -436,8 +461,10 @@ export class SqliteKernelInboxStore implements
     owner_id: string;
     lease_id: string;
     outcome: "consumed" | "stale" | "dead";
-  }): KernelInboxEvent {
+  }): void {
     bounded(input.event_id, "inbox event ID", 200, ID);
+    bounded(input.owner_id, "inbox completion owner", 200, ID);
+    bounded(input.lease_id, "inbox completion lease ID", 200, ID);
     const timestamp = iso(this.#now(), "inbox completion timestamp");
     const changed = this.#db.prepare(`
       UPDATE inbox_events
@@ -446,7 +473,6 @@ export class SqliteKernelInboxStore implements
       WHERE id = ? AND status = 'processing' AND lease_id = ? AND lease_owner_id = ?
     `).run(input.outcome, timestamp, input.event_id, input.lease_id, input.owner_id);
     if (changed.changes !== 1) throw new Error("inbox completion lease fence does not match");
-    return this.#event(this.#row(input.event_id)!);
   }
 
   retry(input: {
@@ -454,7 +480,7 @@ export class SqliteKernelInboxStore implements
     owner_id: string;
     lease_id: string;
     available_at: string;
-  }): KernelInboxEvent {
+  }): void {
     bounded(input.event_id, "inbox event ID", 200, ID);
     bounded(input.owner_id, "inbox retry owner", 200, ID);
     bounded(input.lease_id, "inbox retry lease ID", 200, ID);
@@ -471,7 +497,6 @@ export class SqliteKernelInboxStore implements
       WHERE id = ? AND status = 'processing' AND lease_id = ? AND lease_owner_id = ?
     `).run(availableAt, input.event_id, input.lease_id, input.owner_id);
     if (changed.changes !== 1) throw new Error("inbox retry lease fence does not match");
-    return this.#event(this.#row(input.event_id)!);
   }
 
   get(eventId: string): KernelInboxEvent | undefined {
@@ -571,18 +596,43 @@ export class SqliteKernelInboxStore implements
       | undefined;
   }
 
+  #deadLetterUnreadable(row: InboxRow, consumedAt: string): void {
+    const changed = this.#db.prepare(`
+      UPDATE inbox_events
+      SET status = 'dead', lease_id = NULL, lease_owner_id = NULL,
+          lease_expires_at = NULL, version = version + 1, consumed_at = ?
+      WHERE id = ? AND version = ? AND status = 'processing'
+    `).run(consumedAt, row.id, row.version);
+    if (changed.changes !== 1) {
+      throw new Error(`unreadable inbox event ${row.id} dead-letter compare-and-set failed`);
+    }
+  }
+
   #event(row: InboxRow): KernelInboxEvent {
-    const blob = pointer(row);
-    const raw = blob === null ? row.inline_payload : this.#blobs.read(blob).toString("utf8");
-    if (raw === null) throw new Error(`inbox event ${row.id} has no payload`);
+    let blob: BlobPointer | null;
+    try {
+      blob = pointer(row);
+    } catch (error) {
+      throw new InboxPayloadCorruptionError(row.id, error instanceof Error ? error.message : String(error));
+    }
+    let raw: string | null;
+    try {
+      raw = blob === null ? row.inline_payload : this.#blobs.read(blob).toString("utf8");
+    } catch (error) {
+      if (error instanceof BlobIntegrityError) {
+        throw new InboxPayloadCorruptionError(row.id, error.message);
+      }
+      throw error;
+    }
+    if (raw === null) throw new InboxPayloadCorruptionError(row.id, "payload is missing");
     let payload: JsonValue;
     try {
       payload = jsonValueAt(JSON.parse(raw), `inbox_event.${row.id}.payload`);
     } catch {
-      throw new Error(`inbox event ${row.id} payload is not valid JSON`);
+      throw new InboxPayloadCorruptionError(row.id, "payload is not valid JSON");
     }
     if (digestCanonicalJson(payload) !== row.payload_hash || canonicalJson(payload) !== raw) {
-      throw new Error(`inbox event ${row.id} payload hash or canonical bytes mismatch`);
+      throw new InboxPayloadCorruptionError(row.id, "payload hash or canonical bytes mismatch");
     }
     return {
       id: row.id,

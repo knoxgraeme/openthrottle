@@ -188,6 +188,15 @@ export function validateFilesystemConfigContract(
   if (engine === "opencode" && input.model === undefined) {
     fail(`${source}.model`, "is required for OpenCode because no ambient model default is allowed");
   }
+  const limits = input.limits === undefined
+    ? undefined
+    : parseLimits(input.limits, `${source}.limits`);
+  if (limits?.max_turns !== undefined && engine !== "claude") {
+    fail(
+      `${source}.limits.max_turns`,
+      `is not enforceable by the pinned ${engine} runtime; only Claude supports a native turn cap`,
+    );
+  }
 
   return normalizedContract({
     schema: FILESYSTEM_CONFIG_SCHEMA,
@@ -209,9 +218,7 @@ export function validateFilesystemConfigContract(
     ...(input.post_bootstrap === undefined ? {} : {
       post_bootstrap: parseStringList(input.post_bootstrap, `${source}.post_bootstrap`, 32),
     }),
-    ...(input.limits === undefined ? {} : {
-      limits: parseLimits(input.limits, `${source}.limits`),
-    }),
+    ...(limits === undefined ? {} : { limits }),
     ...(input.provider_evidence === undefined ? {} : {
       provider_evidence: parseProviderEvidence(input.provider_evidence, `${source}.provider_evidence`),
     }),

@@ -7,12 +7,14 @@ import {
   type AttemptCheckpoint,
   type CompiledPipelineManifest,
   type CompiledPipelineStage,
+  type DecisionRecord,
   type EffectIntent,
   type ExecutionRecord,
   type PipelineTerminalOutcome,
   type ResultRecord,
 } from "@openthrottle/contracts";
 import { authorizeEffectIntent } from "./effect-intent.js";
+import { PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA } from "./evaluator-registry.js";
 import {
   exactKernelRuntimeAbsenceDelivery,
   exactKernelRuntimeCleanupDeliveries,
@@ -47,6 +49,7 @@ import {
   type DecisionAuthorization,
   type KernelAttempt,
   type KernelCommand,
+  type QuarantineAttemptRecoveryCommand,
   type KernelRun,
   type ReducerInput,
   type ResultDiagnostic,
@@ -428,6 +431,78 @@ function terminalRun(
   };
 }
 
+export function reduceKernelRecoveryQuarantine(input: {
+  run: KernelRun;
+  current_attempt: KernelAttempt;
+  diagnostic: DecisionRecord;
+  command: QuarantineAttemptRecoveryCommand;
+}): AtomicTransitionBundle {
+  const { run, current_attempt: attempt, diagnostic, command } = input;
+  const lease = attempt.lease;
+  if (
+    (run.status !== "pending" && run.status !== "running") || run.terminal_outcome !== null ||
+    run.cursor.stage_id === null || run.active_attempt_versions[attempt.id] !== attempt.version ||
+    attempt.pipeline_run_id !== run.id || attempt.scope.stage_id !== run.cursor.stage_id ||
+    (attempt.status !== "pending" && attempt.status !== "running" && attempt.status !== "result_pending") ||
+    !lease || lease.id !== command.lease_id || lease.generation !== command.lease_generation ||
+    lease.worker_id !== command.worker_id || lease.purpose !== command.lease_purpose ||
+    command.attempt_id !== attempt.id
+  ) throw new Error("recovery quarantine does not own the exact active Attempt lease");
+  if (lease.generation < run.work_retry_limit) {
+    throw new Error(`attempt ${attempt.id} has not exhausted recovery retries`);
+  }
+  if (
+    command.reason.length < 1 || command.reason.length > 1_500 || command.reason.includes("\0") ||
+    command.decision_record_id !== diagnostic.id || diagnostic.kind !== "decision" ||
+    diagnostic.pipeline_run_id !== run.id || diagnostic.reducer !== "core/executor-recovery-quarantine@1" ||
+    diagnostic.input_record_ids.length !== 0 ||
+    diagnostic.payload_schema !== PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA ||
+    !("inline" in diagnostic.payload) || !diagnostic.payload.inline ||
+    typeof diagnostic.payload.inline !== "object" || Array.isArray(diagnostic.payload.inline)
+  ) throw new Error("recovery quarantine diagnostic is invalid");
+  const payload = diagnostic.payload.inline as Record<string, unknown>;
+  if (
+    canonicalJsonValue(Object.keys(payload).sort()) !==
+      canonicalJsonValue(["evaluator", "outcome", "reason", "schema", "stage_id"]) ||
+    payload.schema !== PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA ||
+    payload.stage_id !== attempt.scope.stage_id ||
+    payload.evaluator !== diagnostic.reducer || payload.outcome !== "needs_human" ||
+    payload.reason !== command.reason
+  ) throw new Error("recovery quarantine diagnostic changed its executor evidence");
+
+  const nextRun: KernelRun = {
+    ...run,
+    status: "needs_human",
+    terminal_outcome: "needs_human",
+    version: run.version + 1,
+    cursor: {
+      ...run.cursor,
+      stage_id: null,
+      version: run.cursor.version + 1,
+      frontier: [],
+      barrier: null,
+    },
+    active_attempt_versions: {},
+    // A quarantine is not cleanup evidence. Keep unresolved Effect versions
+    // visible and non-dispatchable under the terminal run for operator repair.
+    active_effect_versions: run.active_effect_versions,
+  };
+  const attemptWrites = Object.entries(run.active_attempt_versions).map(([attemptId, version]) => ({
+    kind: "terminal" as const,
+    attempt_id: attemptId,
+    expected_version: version,
+    next_version: version + 1,
+    status: "needs_human" as const,
+  })).sort(attemptWriteOrder);
+  return bundle(baseContent({
+    command,
+    expected: expectedFor(run, run.active_attempt_versions),
+    run: nextRun,
+    attemptWrites,
+    appendRecords: [diagnostic],
+  }));
+}
+
 function terminalCommand(
   input: ReducerInput,
   outcome: "needs_human" | "failed" | "canceled" | "superseded",
@@ -558,7 +633,8 @@ function start(input: ReducerInput): AtomicTransitionBundle {
 function workComplete(input: ReducerInput): AtomicTransitionBundle {
   const command = input.command;
   if (command.type !== "work_complete") throw new Error("unreachable work_complete command");
-  assertExactMap(input.records, [], "record map");
+  const resultRecordId = command.result_record_id;
+  assertExactMap(input.records, resultRecordId === null ? [] : [resultRecordId], "record map");
   const attempt = currentAttempt(input, command.attempt_id);
   if (attempt.status !== "running" || attempt.lease?.purpose !== "work" || !attempt.lease.started) {
     throw new Error(`attempt ${attempt.id} has not completed a started work lease`);
@@ -589,7 +665,9 @@ function workComplete(input: ReducerInput): AtomicTransitionBundle {
     output_subject: command.verified_output_subject,
     native_session_id: checkpoint.native_session_id,
     checkpoint_id: checkpoint.id,
+    result_record_id: resultRecordId,
   };
+  const result = resultRecordId === null ? null : recordForAttempt(input, next, resultRecordId);
   const nextRun = replaceAttempt(input.run, next);
   const withCheckpoint: KernelRun = {
     ...nextRun,
@@ -603,6 +681,7 @@ function workComplete(input: ReducerInput): AtomicTransitionBundle {
     expected: expectedFor(input.run, { [attempt.id]: attempt.version }),
     run: withCheckpoint,
     attemptWrites: [{ kind: "replace", attempt: next }],
+    appendRecords: result === null ? [] : [result],
     appendCheckpoints: [checkpoint],
   }));
 }
@@ -910,6 +989,9 @@ function record(input: ReducerInput): AtomicTransitionBundle {
   const checkpoint = exactCheckpoint(input, attempt.checkpoint_id);
   assertCheckpointIdentity(checkpoint, attempt, stage);
   const result = recordForAttempt(input, attempt, command.record_id);
+  if (attempt.result_record_id !== null && attempt.result_record_id !== result.id) {
+    throw new Error(`attempt ${attempt.id} already persists another authoritative result`);
+  }
   if (attempt.repository_authority === "edit" && result.output_subject === null) {
     throw new Error("edit ResultRecord must retain its verified output subject");
   }
@@ -935,7 +1017,7 @@ function record(input: ReducerInput): AtomicTransitionBundle {
     expected: expectedFor(input.run, { [attempt.id]: attempt.version }),
     run: replaceAttempt(input.run, next),
     attemptWrites: [{ kind: "replace", attempt: next }],
-    appendRecords: [result],
+    appendRecords: attempt.result_record_id === null ? [result] : [],
   }));
 }
 
@@ -1220,6 +1302,20 @@ export function reduceKernelCommand(input: ReducerInput): AtomicTransitionBundle
       return settle(input);
     case "retry":
       return retry(input);
+    case "quarantine_attempt_recovery": {
+      assertExactMap(input.records, [input.command.decision_record_id], "record map");
+      assertExactMap(input.checkpoints, [], "checkpoint map");
+      const diagnostic = input.records.get(input.command.decision_record_id);
+      if (!diagnostic || diagnostic.kind !== "decision") {
+        throw new Error("recovery quarantine requires its exact DecisionRecord");
+      }
+      return reduceKernelRecoveryQuarantine({
+        run: input.run,
+        current_attempt: currentAttempt(input, input.command.attempt_id),
+        diagnostic,
+        command: input.command,
+      });
+    }
     case "needs_human":
       return terminalCommand(
         input,

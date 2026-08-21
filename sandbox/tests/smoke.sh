@@ -62,7 +62,7 @@ const semantic = {
   },
 };
 const request = (attempt, authority, requestHash) => ({
-  schema: "openthrottle.kernel-action-request/v1",
+  schema: "openthrottle.kernel-action-request/v2",
   phase: "work",
   pipeline_run_id: "smoke-run",
   attempt_id: attempt,

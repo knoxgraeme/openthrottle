@@ -1,7 +1,7 @@
 {
   "schema": "openthrottle.runtime-capability-source/v1",
   "release": "openthrottle-execution-kernel/v1",
-  "protocol": "attempt-executor@1",
+  "protocol": "attempt-executor@2",
   "engines": ["claude", "codex", "opencode"],
   "repository_authorities": ["edit", "inspect"],
   "stage_kinds": ["agent", "command", "effect", "wait"],

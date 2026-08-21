@@ -207,7 +207,7 @@ describe("KernelControlService", () => {
 
   it("does not consult session state or persist while maintenance is closed", async () => {
     const test = setup();
-    const closed = test.control.closeMutatingIngress(0);
+    const closed = test.control.closeMutatingIngress(1);
     expect(closed.closed).toBe(true);
     expect(await test.control.enqueueSteering({
       message_id: "during-maintenance",

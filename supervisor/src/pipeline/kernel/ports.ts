@@ -1,13 +1,14 @@
-import type {
-  AttemptCheckpoint,
-  CompiledPipelineManifest,
-  CompiledPipelineStage,
-  DefinitionBundle,
-  DeliveryRecord,
-  DecisionRecord,
-  EffectIntent,
-  ExecutionRecord,
-  ResultRecord,
+import {
+  compareCodeUnits,
+  type AttemptCheckpoint,
+  type CompiledPipelineManifest,
+  type CompiledPipelineStage,
+  type DefinitionBundle,
+  type DeliveryRecord,
+  type DecisionRecord,
+  type EffectIntent,
+  type ExecutionRecord,
+  type ResultRecord,
 } from "@openthrottle/contracts";
 import type { EvaluatedKernelResult } from "./evaluator-registry.js";
 import type { EffectReconciliation } from "./effect-intent.js";
@@ -120,6 +121,14 @@ export interface KernelAttemptLeasePort {
   }): Promise<readonly LeasedAttemptView[]>;
 }
 
+export interface KernelAttemptRecoveryQuarantinePort {
+  quarantineExhaustedAttemptRecovery(input: {
+    claim: AttemptLeaseClaim;
+    diagnostic: DecisionRecord;
+    reason: string;
+  }): Promise<boolean>;
+}
+
 export interface LeasedEffectView {
   intent: EffectIntent;
   lease_id: string;
@@ -194,9 +203,69 @@ export interface KernelExternalSchedulePort {
     attempt_id: string;
     phase: string;
   }): Promise<ExternalScheduleView | null>;
-  listReadyExternalAttempts(input: {
-    limit: number;
-  }): Promise<readonly { pipeline_run_id: string; attempt_id: string }[]>;
+  listReadyExternalAttempts(
+    input: KernelContinuationPageRequest,
+  ): Promise<readonly KernelContinuationCandidate[]>;
+}
+
+export interface KernelOrdinaryContinuationPort {
+  listReadyOrdinaryAttempts(
+    input: KernelContinuationPageRequest,
+  ): Promise<readonly KernelContinuationCandidate[]>;
+}
+
+export interface KernelContinuationCandidate {
+  updated_at: string;
+  pipeline_run_id: string;
+  attempt_id: string;
+}
+
+export interface KernelContinuationPageRequest {
+  limit: number;
+  after?: KernelContinuationCandidate;
+}
+
+function compareContinuationCandidates(
+  left: KernelContinuationCandidate,
+  right: KernelContinuationCandidate,
+): number {
+  return compareCodeUnits(left.updated_at, right.updated_at) ||
+    compareCodeUnits(left.pipeline_run_id, right.pipeline_run_id) ||
+    compareCodeUnits(left.attempt_id, right.attempt_id);
+}
+
+export async function firstSuccessfulKernelContinuation<T>(input: {
+  page_size: number;
+  list: (
+    request: KernelContinuationPageRequest,
+  ) => Promise<readonly KernelContinuationCandidate[]>;
+  resume: (candidate: KernelContinuationCandidate) => Promise<T>;
+}): Promise<T | undefined> {
+  let after: KernelContinuationCandidate | undefined;
+  let firstError: unknown;
+  for (;;) {
+    const candidates = await input.list({
+      limit: input.page_size,
+      ...(after === undefined ? {} : { after }),
+    });
+    if (candidates.length > input.page_size) {
+      throw new Error("kernel continuation selector returned an oversized page");
+    }
+    for (const candidate of candidates) {
+      if (after !== undefined && compareContinuationCandidates(candidate, after) <= 0) {
+        throw new Error("kernel continuation selector returned a non-advancing page");
+      }
+      after = candidate;
+      try {
+        return await input.resume(candidate);
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+    if (candidates.length < input.page_size) break;
+  }
+  if (firstError !== undefined) throw firstError;
+  return undefined;
 }
 
 export interface ResolvedKernelContext {

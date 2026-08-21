@@ -30,6 +30,7 @@ import {
   FRESH_EPOCH_SCHEMA_CHECKSUM,
   FRESH_EPOCH_TABLES,
   FRESH_EPOCH_VERSION,
+  KERNEL_INGRESS_MAINTENANCE_SETTING,
 } from "./epoch-schema.js";
 
 export const FRESH_EPOCH_BOOTSTRAP_SCHEMA = "openthrottle.fresh-epoch-bootstrap/v1" as const;
@@ -394,6 +395,12 @@ function insertBootstrap(
   }).sort(([left], [right]) => compareCodeUnits(left, right))) {
     insertSetting(db, { key, value, value_type: "string", mutable: false }, timestamp);
   }
+  insertSetting(db, {
+    key: KERNEL_INGRESS_MAINTENANCE_SETTING,
+    value: true,
+    value_type: "boolean",
+    mutable: true,
+  }, timestamp);
   for (const setting of bootstrap.settings) insertSetting(db, setting, timestamp);
   const statement = db.prepare(`
     INSERT INTO repository_registrations (
@@ -421,7 +428,7 @@ function insertBootstrap(
 }
 
 function assertBootstrapOnly(db: Database.Database, bootstrap: FreshEpochBootstrap): void {
-  const expectedSupportRows = bootstrap.settings.length + 5;
+  const expectedSupportRows = bootstrap.settings.length + 6;
   const settingCount = db.prepare("SELECT COUNT(*) AS count FROM settings").get() as { count: number };
   const registrationCount = db.prepare("SELECT COUNT(*) AS count FROM repository_registrations").get() as { count: number };
   if (settingCount.count !== expectedSupportRows || registrationCount.count !== bootstrap.repository_registrations.length) {

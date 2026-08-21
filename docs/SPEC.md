@@ -502,6 +502,10 @@ bounded busy timeout. Boot verifies application ID, user version, baseline
 checksum, required tables/indices/triggers, foreign keys, integrity, immutable
 epoch identity, BlobStore identity, and bootstrap checksum. An old, partial,
 unknown, or mismatched database is refused rather than upgraded in place.
+Normal supervisor boot is open-only: the database and BlobStore paths must
+already exist, and the release, runtime-capability, BlobStore, and bootstrap
+identities are operator-pinned. Missing paths are refused without creating
+directories, a BlobStore, or an empty database.
 
 Only `supervisor/src/persistence/` imports `better-sqlite3` or issues SQL.
 Production callers depend on explicit ports.
@@ -599,7 +603,12 @@ any replacement action and again immediately before each shell-free spawn, the
 loader verifies that the executable is the same nonsymlink regular executable
 and that its bytes still match the digest. The child receives only allowlisted
 parent values plus executor-owned `OT_OFFLINE_REPLACEMENT_OPERATION` and, for
-rollback, `OT_OFFLINE_REPLACEMENT_REASON`. It declares:
+rollback, `OT_OFFLINE_REPLACEMENT_REASON`.
+
+Every hook has an executor-owned bounded deadline outside the authenticated
+manifest. Hooks run in detached process groups; on expiry the executor sends
+`SIGTERM`, follows with bounded `SIGKILL` when required, and waits for process
+closure before entering rollback or reporting failure. The manifest declares:
 
 - proof that ingress is closed, supervisors/workers are stopped, and no storage
   lock exists;

@@ -45,6 +45,7 @@ import { inspectKernelCheckpointBundle } from "../../runtime/kernel-checkpoint-b
 
 const ACTION_INPUT_DIR = "/var/lib/openthrottle/action-input";
 const ACTION_RESULT_DIR = "/var/lib/openthrottle/action-results";
+const ACTION_FENCE_DIR = "/var/lib/openthrottle/action-fences";
 const INTEGRATION_INPUT_DIR = "/var/lib/openthrottle/integration-input";
 const INTEGRATION_RESULT_DIR = "/var/lib/openthrottle/integration-results";
 const OPENTHROTTLE_ROOT = "/var/lib/openthrottle";
@@ -137,7 +138,10 @@ function safeTransportId(value: string, label: string): string {
   return value;
 }
 
-function launchPaths(request: KernelWorkActionRequest | KernelResultCorrectionRequest) {
+function launchPaths(
+  request: KernelWorkActionRequest | KernelResultCorrectionRequest,
+  leaseGeneration: number,
+) {
   const attempt = safeAttemptId(request.attempt_id);
   const lease = safeTransportId(request.lease_id, "kernel lease ID");
   const phase = request.schema === KERNEL_ACTION_REQUEST_SCHEMA ? "work" : "correction";
@@ -150,8 +154,30 @@ function launchPaths(request: KernelWorkActionRequest | KernelResultCorrectionRe
     result_directory: `${ACTION_RESULT_DIR}/${attempt}/${launch}`,
     result: `${ACTION_RESULT_DIR}/${attempt}/${launch}/result.json`,
     session: `${ACTION_RESULT_DIR}/${attempt}/${launch}/session.json`,
-    lock: `${ACTION_RESULT_DIR}/${attempt}/${launch}/dispatch.lock`,
+    lock: `${ACTION_RESULT_DIR}/${attempt}/dispatch.lock`,
+    fence_attempt_directory: `${ACTION_FENCE_DIR}/${attempt}`,
+    lease_generation_fence: `${ACTION_FENCE_DIR}/${attempt}/lease-generation.json`,
+    // A recovered Attempt keeps its lease ID while its lease generation advances.
+    // A crash after upload but before the locked mv must therefore leave a staging
+    // file that a later generation can never mistake for its own sealed fence.
+    lease_generation_stage: `${ACTION_FENCE_DIR}/${attempt}/lease-generation-${lease}-${leaseGeneration}.part`,
+    lease_generation_lock: `${ACTION_FENCE_DIR}/${attempt}/lease-generation.lock`,
   };
+}
+
+function sealedActionTimeoutMs(
+  request: KernelWorkActionRequest | KernelResultCorrectionRequest,
+  platformTimeoutSeconds: number,
+): number {
+  const repositorySeconds = request.schema === KERNEL_ACTION_REQUEST_SCHEMA
+    ? request.action.execution_limits.task_timeout_seconds
+    : request.execution_limits.task_timeout_seconds;
+  let timeoutMs = platformTimeoutSeconds * 1_000;
+  if (repositorySeconds !== null) timeoutMs = Math.min(timeoutMs, repositorySeconds * 1_000);
+  if (request.schema !== KERNEL_ACTION_REQUEST_SCHEMA) {
+    timeoutMs = Math.min(timeoutMs, Math.max(1, Date.parse(request.correction_deadline) - Date.now()));
+  }
+  return timeoutMs;
 }
 
 function notFound(error: unknown): boolean {
@@ -513,9 +539,14 @@ export class DaytonaKernelAdapter implements
     if (!Number.isSafeInteger(callbacks.heartbeat_interval_ms) || callbacks.heartbeat_interval_ms < 1) {
       throw new Error("kernel runtime heartbeat interval must be a positive integer");
     }
+    if (!Number.isSafeInteger(callbacks.lease_generation) || callbacks.lease_generation < 0) {
+      throw new Error("kernel runtime lease generation must be a non-negative integer");
+    }
+    const actionTimeoutMs = sealedActionTimeoutMs(request, this.#options.task_timeout_seconds);
+    const actionDeadline = Date.now() + actionTimeoutMs;
     await ensureActive(sandbox);
     const environment = this.#options.environments.loadExactRunEnvironment(request.pipeline_run_id);
-    const paths = launchPaths(request);
+    const paths = launchPaths(request, callbacks.lease_generation);
     const requestPath = paths.input;
     const resultPath = paths.result;
     const sessionPath = paths.session;
@@ -557,6 +588,7 @@ export class DaytonaKernelAdapter implements
         },
       });
     };
+    await this.#refreshLeaseGenerationFence(sandbox, request, paths, callbacks.lease_generation);
     await heartbeat();
     const replay = await collect();
     if (replay !== null) return replay;
@@ -566,6 +598,14 @@ export class DaytonaKernelAdapter implements
       await this.#materializeInputSubject(sandbox, request, paths.input_directory);
     }
     await this.#putImmutableRequest(sandbox, requestPath, canonicalJson(request));
+    const remainingBeforeCredentials = actionDeadline - Date.now();
+    if (remainingBeforeCredentials <= 0) {
+      return {
+        state: "work_failed",
+        retryable: request.schema === KERNEL_ACTION_REQUEST_SCHEMA,
+        reason: "Daytona action deadline expired before provider dispatch",
+      };
+    }
     const engine = request.schema === KERNEL_ACTION_REQUEST_SCHEMA
       ? request.action.kind === "agent" ? request.action.engine : null
       : request.engine;
@@ -573,7 +613,7 @@ export class DaytonaKernelAdapter implements
       ? {}
       : await this.#options.materialize_model_credentials(
         engine,
-        this.#options.task_timeout_seconds * 1_000,
+        remainingBeforeCredentials,
       );
     const unset = MODEL_CREDENTIALS.filter((name) => !(name in modelCredentials));
     await sandbox.updateEnv({
@@ -586,7 +626,18 @@ export class DaytonaKernelAdapter implements
       OT_ACTION_REQUEST_FILE: requestPath,
       OT_ACTION_RESULT_FILE: resultPath,
       OT_ACTION_SESSION_FILE: sessionPath,
+      OT_LEASE_GENERATION_FENCE_FILE: paths.lease_generation_fence,
+      OT_LEASE_GENERATION_LOCK_FILE: paths.lease_generation_lock,
     }, { unset });
+    const remainingBeforeLaunch = actionDeadline - Date.now();
+    if (remainingBeforeLaunch <= 0) {
+      return {
+        state: "work_failed",
+        retryable: request.schema === KERNEL_ACTION_REQUEST_SCHEMA,
+        reason: "Daytona action deadline expired before provider dispatch",
+      };
+    }
+    const actionTimeoutSeconds = Math.max(1, Math.ceil(remainingBeforeLaunch / 1_000));
     const sessionId = `kernel-${safeAttemptId(request.attempt_id)}`;
     await sandbox.process.createSession(sessionId).catch(() => undefined);
     await sandbox.process.executeSessionCommand(sessionId, {
@@ -594,20 +645,115 @@ export class DaytonaKernelAdapter implements
         shellQuote(`test -f ${shellQuote(resultPath)} || exec /opt/openthrottle/entrypoint.sh`),
       runAsync: true,
       suppressInputEcho: true,
-    }, this.#options.task_timeout_seconds);
+    }, actionTimeoutSeconds);
 
-    const deadline = Date.now() + this.#options.task_timeout_seconds * 1_000;
-    while (Date.now() < deadline) {
+    while (Date.now() < actionDeadline) {
       await heartbeat();
       const outcome = await collect();
       if (outcome !== null) return outcome;
       await new Promise((resolve) => setTimeout(resolve, this.#options.poll_interval_ms ?? 500));
     }
+    await heartbeat();
+    const finalOutcome = await collect();
+    if (finalOutcome !== null) return finalOutcome;
+    const terminated = await this.#terminateAndVerifySession(sandbox, sessionId);
+    if (!terminated) {
+      return {
+        state: "work_failed",
+        retryable: false,
+        reason: "Daytona action deadline expired and session termination could not be verified",
+      };
+    }
+    const terminatedOutcome = await collect();
+    if (terminatedOutcome !== null) return terminatedOutcome;
     return {
       state: "work_failed",
       retryable: true,
-      reason: `Daytona action did not produce a sealed result within ${this.#options.task_timeout_seconds}s`,
+      reason: `Daytona action did not produce a sealed result within ${actionTimeoutSeconds}s; session termination was verified`,
     };
+  }
+
+  async #refreshLeaseGenerationFence(
+    sandbox: Sandbox,
+    request: KernelWorkActionRequest | KernelResultCorrectionRequest,
+    paths: ReturnType<typeof launchPaths>,
+    leaseGeneration: number,
+  ): Promise<void> {
+    await sandbox.fs.createFolder(OPENTHROTTLE_ROOT, "711").catch(() => undefined);
+    await sandbox.fs.setFilePermissions(OPENTHROTTLE_ROOT, { owner: "root", group: "root", mode: "711" });
+    for (const path of [ACTION_FENCE_DIR, paths.fence_attempt_directory]) {
+      await sandbox.fs.createFolder(path, "711").catch(() => undefined);
+      await sandbox.fs.setFilePermissions(path, { owner: "root", group: "root", mode: "711" });
+    }
+    const initializedLock = await sandbox.process.executeCommand(
+      `umask 022; touch -- ${shellQuote(paths.lease_generation_lock)} && ` +
+        `chown root:root ${shellQuote(paths.lease_generation_lock)} && ` +
+        `chmod 0444 ${shellQuote(paths.lease_generation_lock)}`,
+      OPENTHROTTLE_ROOT,
+      {},
+      30,
+    );
+    if (initializedLock.exitCode !== undefined && initializedLock.exitCode !== 0) {
+      throw new Error("Daytona could not initialize the lease-generation lock");
+    }
+    const verifiedLock = await downloadBytes(sandbox, paths.lease_generation_lock);
+    if (verifiedLock === null || verifiedLock.byteLength !== 0) {
+      throw new Error("Daytona lease-generation lock failed exact verification");
+    }
+    const content = canonicalJson({
+      schema: "openthrottle.kernel-lease-generation-fence/v1",
+      attempt_id: request.attempt_id,
+      lease_generation: leaseGeneration,
+    });
+    const staged = await downloadUtf8(sandbox, paths.lease_generation_stage);
+    if (staged === null) {
+      await sandbox.fs.uploadFile(Buffer.from(content), paths.lease_generation_stage);
+    } else if (staged !== content) {
+      throw new Error("Daytona lease-generation staging path contains different sealed bytes");
+    }
+    await sandbox.fs.setFilePermissions(paths.lease_generation_stage, {
+      owner: "root", group: "root", mode: "400",
+    });
+    const command = [
+      `current=-1`,
+      `if test -f ${shellQuote(paths.lease_generation_fence)}`,
+      `then`,
+      `  current=$(jq -er '.lease_generation | select(type == \"number\" and floor == . and . >= 0)' ${shellQuote(paths.lease_generation_fence)}) || exit 41`,
+      `fi`,
+      `test "$current" -le ${leaseGeneration} || exit 42`,
+      `if test "$current" -lt ${leaseGeneration}; then mv -f -- ${shellQuote(paths.lease_generation_stage)} ${shellQuote(paths.lease_generation_fence)}; fi`,
+      `if test "$current" -eq ${leaseGeneration} && test ! -f ${shellQuote(paths.lease_generation_fence)}; then exit 43; fi`,
+    ].join("\n");
+    const refreshed = await sandbox.process.executeCommand(
+      `flock --exclusive ${shellQuote(paths.lease_generation_lock)} sh -c ${shellQuote(command)}`,
+      "/var/lib/openthrottle",
+      {},
+      30,
+    );
+    if (refreshed.exitCode !== undefined && refreshed.exitCode !== 0) {
+      throw new Error(refreshed.exitCode === 42
+        ? "Daytona refused to replace a newer lease-generation fence"
+        : "Daytona could not atomically refresh the lease-generation fence");
+    }
+    const verified = await downloadUtf8(sandbox, paths.lease_generation_fence);
+    if (verified !== content) throw new Error("Daytona lease-generation fence failed exact verification");
+    await sandbox.fs.setFilePermissions(paths.lease_generation_fence, {
+      owner: "root", group: "root", mode: "444",
+    });
+  }
+
+  async #terminateAndVerifySession(sandbox: Sandbox, sessionId: string): Promise<boolean> {
+    try {
+      await sandbox.process.deleteSession(sessionId);
+    } catch (error) {
+      if (!notFound(error)) return false;
+    }
+    try {
+      await sandbox.process.getSession(sessionId);
+      return false;
+    } catch (error) {
+      return notFound(error);
+    }
   }
 
   async #prepareDirectories(

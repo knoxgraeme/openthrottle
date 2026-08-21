@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { digestCanonicalJson } from "@openthrottle/contracts";
+import { openKernelEpoch } from "../app/kernel-bootstrap.js";
 import { createFreshEpochBootstrap } from "./epoch-database.js";
+import { SqliteKernelInboxStore } from "./kernel-inbox-store.js";
 import {
   OFFLINE_REPLACEMENT_REPORT_SCHEMA,
   OFFLINE_REPLACEMENT_SCHEMA,
@@ -200,7 +202,37 @@ describe("one-shot offline epoch replacement", () => {
 
   it("archives the old tuple, initializes exactly one fresh epoch, smokes both modes, and seals a report", async () => {
     const { input } = fixture();
-    const report = await runOfflineReplacement(input, hooks(), {
+    const report = await runOfflineReplacement(input, hooks({
+      reopenIngress: async () => {
+        const candidate = openKernelEpoch({
+          database_path: input.fresh.database_path,
+          blob_store_path: input.fresh.blob_root,
+          blob_store_id: input.fresh.blob_store_id,
+          release_id: input.fresh.release_id,
+          runtime_capability_digest: input.fresh.runtime_capability_digest,
+          bootstrap_checksum: input.fresh.bootstrap.checksum,
+        });
+        try {
+          const ingress = new SqliteKernelInboxStore({
+            db: candidate.db,
+            blob_store: candidate.blobs,
+            now: () => "2026-08-20T15:00:01.000Z",
+          });
+          expect(ingress.getMaintenanceFence()).toMatchObject({
+            closed: true,
+            version: 0,
+          });
+          expect(ingress.setMaintenanceFence({ closed: false, expected_version: 0 })).toEqual({
+            closed: false,
+            version: 1,
+            updated_at: "2026-08-20T15:00:01.000Z",
+          });
+          return "fresh ingress opened at exact epoch fence version 1";
+        } finally {
+          candidate.db.close();
+        }
+      },
+    }), {
       now: () => "2026-08-20T15:00:00.000Z",
     });
 
@@ -268,6 +300,31 @@ describe("one-shot offline epoch replacement", () => {
       `).get()).toEqual({ value_json: JSON.stringify(FRESH_RUNTIME_CAPABILITY), mutable: 0 });
     } finally {
       db.close();
+    }
+
+    const production = openKernelEpoch({
+      database_path: input.fresh.database_path,
+      blob_store_path: input.fresh.blob_root,
+      blob_store_id: input.fresh.blob_store_id,
+      release_id: input.fresh.release_id,
+      runtime_capability_digest: input.fresh.runtime_capability_digest,
+      bootstrap_checksum: input.fresh.bootstrap.checksum,
+    });
+    try {
+      const ingress = new SqliteKernelInboxStore({
+        db: production.db,
+        blob_store: production.blobs,
+      });
+      expect(ingress.getMaintenanceFence()).toEqual({
+        closed: false,
+        version: 1,
+        updated_at: "2026-08-20T15:00:01.000Z",
+      });
+      expect(production.db.prepare(`
+        SELECT github_repo FROM repository_registrations WHERE id = 'repo'
+      `).get()).toEqual({ github_repo: "owner/repo" });
+    } finally {
+      production.db.close();
     }
   });
 

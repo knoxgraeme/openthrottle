@@ -187,7 +187,7 @@ describe("kernel-native HTTP surface", () => {
     const closed = await app.request("/maintenance/close", {
       method: "POST",
       headers: { ...DEPLOY_HEADERS, "Content-Type": "application/json" },
-      body: JSON.stringify({ expected_version: 0 }),
+      body: JSON.stringify({ expected_version: 1 }),
     });
     expect(closed.status).toBe(200);
     const raw = JSON.stringify({

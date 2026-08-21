@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -142,6 +142,18 @@ function agentBindings(result: DefinitionCompilation): Array<[string, string, st
 }
 
 describe("root .openthrottle definition tree", () => {
+  it("contains exactly the canonical filesystem inventory and no retired root config", () => {
+    const actual = filesBelow(definitionRoot)
+      .map((path) => relative(definitionRoot, path));
+    const expected = [
+      "config.yml",
+      ...platformCatalog.files.map(({ path }) => path.slice(".openthrottle/".length)),
+    ].sort();
+
+    expect(actual).toEqual(expected);
+    expect(existsSync(join(repositoryRoot, ".openthrottle.yml"))).toBe(false);
+  });
+
   it("matches the release-sealed catalog before interpreting any platform definition", () => {
     const trusted = sealedPlatform();
     const actual = new Set([...trusted.files.keys()].map((path) => path.slice(".openthrottle/".length)));

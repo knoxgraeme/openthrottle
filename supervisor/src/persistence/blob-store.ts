@@ -79,6 +79,18 @@ export class BlobIntegrityError extends Error {
   }
 }
 
+export class BlobAvailabilityError extends Error {
+  readonly code = "BLOB_UNAVAILABLE";
+
+  constructor(
+    readonly digest: string,
+    readonly system_code: string,
+  ) {
+    super(`blob ${digest} is temporarily unavailable (${system_code})`);
+    this.name = "BlobAvailabilityError";
+  }
+}
+
 /**
  * An unforgeable proof that one exact pointer was present and verified in one
  * store. Database writers accept this token, never a caller-authored digest.
@@ -402,7 +414,11 @@ export class VolumeBlobStore {
       fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      throw new BlobIntegrityError(pointer.digest, code === "ENOENT" ? "object is missing" : `cannot open object (${code ?? "unknown error"})`);
+      if (code === "ENOENT") throw new BlobIntegrityError(pointer.digest, "object is missing");
+      if (code === "ELOOP" || code === "ENOTDIR") {
+        throw new BlobIntegrityError(pointer.digest, `object path is unsafe (${code})`);
+      }
+      throw new BlobAvailabilityError(pointer.digest, code ?? "unknown error");
     }
     try {
       const stats = fstatSync(fd, { bigint: true });

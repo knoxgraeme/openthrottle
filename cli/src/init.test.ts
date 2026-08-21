@@ -50,7 +50,7 @@ function completeProjectConfig(overrides: Partial<ProjectConfig> = {}): ProjectC
       build: "npm run build",
     },
     post_bootstrap: ["npm install"],
-    limits: { max_turns: 200, task_timeout: 7_200 },
+    limits: { task_timeout: 7_200 },
     ...overrides,
   };
 }
@@ -106,7 +106,7 @@ describe("filesystem config scaffolding", () => {
         test: "npm test",
       },
       post_bootstrap: ["npm install"],
-      limits: { max_turns: 200, task_timeout: 7_200 },
+      limits: { task_timeout: 7_200 },
     });
     expect(existsSync(join(directory, ".openthrottle.yml"))).toBe(false);
     expect(existsSync(join(directory, ".openthrottle", "skills.lock.json"))).toBe(false);
@@ -193,7 +193,9 @@ describe("interactive selection", () => {
       pipeline: "core/structured",
       engine: "codex",
       model: "gpt-test",
+      limits: { task_timeout: 3_600 },
     });
+    expect(selection.project.limits).not.toHaveProperty("max_turns");
     expect(selection.project).not.toHaveProperty("agent");
     expect(selection.registration).toEqual({
       repo: "acme/repo",

@@ -7,7 +7,7 @@ import {
   type DefinitionBundle,
   type DefinitionBundleEntry,
 } from "@openthrottle/contracts";
-import { buildKernelResultCorrectionRequest } from "./action-request.js";
+import { buildKernelResultCorrectionRequest, selectKernelAction } from "./action-request.js";
 import type { KernelAttempt } from "./types.js";
 
 const SOURCE = "a".repeat(40);
@@ -56,6 +56,9 @@ function definitions(): { bundle: DefinitionBundle; manifest: CompiledPipelineMa
         schema: "openthrottle.config/v2",
         pipeline: "core/test",
         engine: "codex",
+        commands: { test: "npm test" },
+        post_bootstrap: ["npm ci", "npm run prepare"],
+        limits: { task_timeout: 900 },
       }, "repository"),
       entry("agent", "core/worker", ".openthrottle/agents/core/worker/instructions.md", "Work."),
       entry("skill", "core/work", ".openthrottle/skills/core/work/SKILL.md", {
@@ -155,6 +158,38 @@ describe("buildKernelResultCorrectionRequest", () => {
         tools: ["ot-result"],
         mcp: false,
         provider_access: false,
+        execution_limits: { max_turns: null, task_timeout_seconds: 900 },
       });
+  });
+});
+
+describe("selectKernelAction", () => {
+  it("seals normalized post_bootstrap and repository limits into command actions", () => {
+    const { bundle, manifest } = definitions();
+    const commandManifest: CompiledPipelineManifest = {
+      ...manifest,
+      entry_stage: "test",
+      stages: [{
+        id: "test",
+        kind: "command",
+        command: "test",
+        on: { success: { terminal: "completed" } },
+      }],
+    };
+
+    expect(selectKernelAction({
+      bundle,
+      manifest: commandManifest,
+      attempt: {
+        definition_bundle_hash: commandManifest.definition_bundle_hash,
+        scope: { kind: "stage", stage_id: "test" },
+      },
+    }).action).toEqual({
+      kind: "command",
+      command_id: "test",
+      command_line: "npm test",
+      post_bootstrap: ["npm ci", "npm run prepare"],
+      execution_limits: { max_turns: null, task_timeout_seconds: 900 },
+    });
   });
 });

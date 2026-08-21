@@ -8,6 +8,7 @@ import {
   createFreshEpochBootstrap,
   initializeFreshEpochDatabase,
 } from "../epoch-database.js";
+import { KERNEL_INGRESS_MAINTENANCE_SETTING } from "../epoch-schema.js";
 
 export const KERNEL_FIXTURE_NOW = "2026-08-20T12:00:00.000Z";
 export const KERNEL_FIXTURE_SUBJECT = "1".repeat(40);
@@ -47,6 +48,12 @@ export function freshKernelFixture(): FreshKernelFixture {
     }),
     now: () => KERNEL_FIXTURE_NOW,
   });
+  const opened = db.prepare(`
+    UPDATE settings
+    SET value_json = 'false', version = version + 1, updated_at = ?
+    WHERE key = ? AND value_json = 'true' AND mutable = 1 AND version = 0
+  `).run(KERNEL_FIXTURE_NOW, KERNEL_INGRESS_MAINTENANCE_SETTING);
+  if (opened.changes !== 1) throw new Error("fresh kernel fixture could not open ingress");
   return {
     directory,
     db,

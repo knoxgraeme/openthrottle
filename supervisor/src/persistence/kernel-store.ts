@@ -10,6 +10,7 @@ import {
   type AttemptCheckpoint,
   type BlobPointer,
   type CompiledPipelineManifest,
+  type DecisionRecord,
   type EffectIntent,
   type ExecutionRecord,
   type ExecutionRecordPayloadRegistry,
@@ -18,10 +19,14 @@ import {
 } from "@openthrottle/contracts";
 import type {
   AttemptLeaseRequest,
+  AttemptLeaseClaim,
   KernelAttemptLeasePort,
+  KernelAttemptRecoveryQuarantinePort,
   KernelAttemptRequestPort,
   KernelAttemptRequestInputs,
   KernelContextPort,
+  KernelContinuationCandidate,
+  KernelContinuationPageRequest,
   KernelDefinitionBundleBytesPort,
   KernelEffectPort,
   KernelExternalSchedulePort,
@@ -46,7 +51,9 @@ import {
   type KernelAttempt,
   type KernelCursor,
   type KernelRun,
+  type QuarantineAttemptRecoveryCommand,
 } from "../pipeline/kernel/types.js";
+import { reduceKernelRecoveryQuarantine } from "../pipeline/kernel/reducer.js";
 import {
   transitionApplicationDisposition,
   type AtomicTransitionApplyResult,
@@ -168,6 +175,7 @@ export class KernelIntegrityError extends Error {
 export class SqliteKernelStore implements
   KernelReductionPort,
   KernelAttemptLeasePort,
+  KernelAttemptRecoveryQuarantinePort,
   KernelAttemptRequestPort,
   KernelDefinitionBundleBytesPort,
   KernelEffectPort,
@@ -339,7 +347,14 @@ export class SqliteKernelStore implements
         bundle.run.definition_bundle_hash !== row.definition_bundle_hash
       ) throw new Error("atomic transition cannot change the pinned pipeline or definition bundle");
 
-      for (const record of bundle.append_records) this.#insertRecord(record);
+      const replacementAttempts = new Map(bundle.attempt_writes.flatMap((write) =>
+        write.kind === "replace" ? [[write.attempt.id, write.attempt] as const] : []));
+      for (const record of bundle.append_records) {
+        this.#insertRecord(
+          record,
+          record.kind === "result" ? replacementAttempts.get(record.attempt_id) : undefined,
+        );
+      }
       for (const checkpoint of bundle.append_checkpoints) this.#insertCheckpoint(checkpoint);
       for (const write of bundle.attempt_writes) {
         if (write.kind === "terminal") this.#terminalAttempt(write, row.id);
@@ -376,6 +391,46 @@ export class SqliteKernelStore implements
     limit: number;
   }): Promise<readonly LeasedAttemptView[]> {
     return this.#leases.recoverExpiredAttemptLeases(input);
+  }
+
+  async quarantineExhaustedAttemptRecovery(input: {
+    claim: AttemptLeaseClaim;
+    diagnostic: DecisionRecord;
+    reason: string;
+  }): Promise<boolean> {
+    const run = this.#runFromRow(this.#runRow(input.claim.run_id));
+    const attempt = this.#attemptById(input.claim.attempt_id, input.claim.run_id);
+    const lease = attempt.lease;
+    if (
+      !lease || lease.id !== input.claim.lease_id ||
+      lease.generation !== input.claim.lease_generation ||
+      lease.worker_id !== input.claim.worker_id || lease.purpose !== input.claim.purpose
+    ) throw new Error("Attempt recovery quarantine lease claim is stale or mismatched");
+    if (lease.generation < run.work_retry_limit) return false;
+    const command: QuarantineAttemptRecoveryCommand = {
+      type: "quarantine_attempt_recovery",
+      command_id: `recovery-quarantine-${digestCanonicalJson({
+        attempt_id: attempt.id,
+        lease_id: lease.id,
+        lease_generation: lease.generation,
+        diagnostic_id: input.diagnostic.id,
+      }).slice(0, 48)}`,
+      attempt_id: attempt.id,
+      decision_record_id: input.diagnostic.id,
+      reason: input.reason,
+      lease_id: lease.id,
+      lease_generation: lease.generation,
+      worker_id: lease.worker_id,
+      lease_purpose: lease.purpose,
+    };
+    const transition = reduceKernelRecoveryQuarantine({
+      run,
+      current_attempt: attempt,
+      diagnostic: input.diagnostic,
+      command,
+    });
+    await this.applyAtomicTransition(transition);
+    return true;
   }
 
   async leaseNextEffect(input: {
@@ -476,21 +531,32 @@ export class SqliteKernelStore implements
     };
   }
 
-  async listReadyExternalAttempts(input: {
-    limit: number;
-  }): Promise<readonly { pipeline_run_id: string; attempt_id: string }[]> {
+  async listReadyExternalAttempts(
+    input: KernelContinuationPageRequest,
+  ): Promise<readonly KernelContinuationCandidate[]> {
     if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100) {
       throw new Error("external continuation limit must be between 1 and 100");
     }
-    return this.#db.prepare(`
-      SELECT a.pipeline_run_id, a.id AS attempt_id
+    const after = input.after;
+    const rows = this.#db.prepare(`
+      SELECT a.updated_at, a.pipeline_run_id, a.id AS attempt_id
       FROM attempts a
       JOIN pipeline_runs r ON r.id = a.pipeline_run_id
-      JOIN checkpoints c ON c.id = a.checkpoint_id AND c.pipeline_run_id = a.pipeline_run_id
       WHERE r.status IN ('pending', 'running')
         AND a.status IN ('work_complete', 'recorded')
         AND a.lease_id IS NULL
-        AND c.payload_schema = 'openthrottle.external-boundary-checkpoint/v1'
+        AND a.checkpoint_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM records marker
+          WHERE marker.pipeline_run_id = a.pipeline_run_id
+            AND marker.kind = 'decision'
+            AND marker.reducer = 'core/external-schedule@1'
+            AND substr(
+              marker.semantic_key,
+              1,
+              length('external-schedule:' || a.id || ':')
+            ) = 'external-schedule:' || a.id || ':'
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM records d
@@ -503,9 +569,77 @@ export class SqliteKernelStore implements
             ) = 'external-schedule:' || a.id || ':'
             AND e.status IN ('pending', 'processing', 'unknown')
         )
+        ${after === undefined ? "" : `AND (
+          a.updated_at > ?
+          OR (a.updated_at = ? AND a.pipeline_run_id > ?)
+          OR (a.updated_at = ? AND a.pipeline_run_id = ? AND a.id > ?)
+        )`}
       ORDER BY a.updated_at, a.pipeline_run_id, a.id
       LIMIT ?
-    `).all(input.limit) as Array<{ pipeline_run_id: string; attempt_id: string }>;
+    `).all(
+      ...(after === undefined
+        ? [input.limit]
+        : [
+          after.updated_at,
+          after.updated_at,
+          after.pipeline_run_id,
+          after.updated_at,
+          after.pipeline_run_id,
+          after.attempt_id,
+          input.limit,
+        ]),
+    ) as KernelContinuationCandidate[];
+    return rows;
+  }
+
+  async listReadyOrdinaryAttempts(
+    input: KernelContinuationPageRequest,
+  ): Promise<readonly KernelContinuationCandidate[]> {
+    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100) {
+      throw new Error("ordinary continuation limit must be between 1 and 100");
+    }
+    const after = input.after;
+    const rows = this.#db.prepare(`
+      SELECT a.updated_at, a.pipeline_run_id, a.id AS attempt_id
+      FROM attempts a
+      JOIN pipeline_runs r ON r.id = a.pipeline_run_id
+      WHERE r.status IN ('pending', 'running')
+        AND a.status IN ('work_complete', 'recorded')
+        AND a.lease_id IS NULL
+        AND a.checkpoint_id IS NOT NULL
+        AND a.result_record_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM records marker
+          WHERE marker.pipeline_run_id = a.pipeline_run_id
+            AND marker.kind = 'decision'
+            AND marker.reducer = 'core/external-schedule@1'
+            AND substr(
+              marker.semantic_key,
+              1,
+              length('external-schedule:' || a.id || ':')
+            ) = 'external-schedule:' || a.id || ':'
+        )
+        ${after === undefined ? "" : `AND (
+          a.updated_at > ?
+          OR (a.updated_at = ? AND a.pipeline_run_id > ?)
+          OR (a.updated_at = ? AND a.pipeline_run_id = ? AND a.id > ?)
+        )`}
+      ORDER BY a.updated_at, a.pipeline_run_id, a.id
+      LIMIT ?
+    `).all(
+      ...(after === undefined
+        ? [input.limit]
+        : [
+          after.updated_at,
+          after.updated_at,
+          after.pipeline_run_id,
+          after.updated_at,
+          after.pipeline_run_id,
+          after.attempt_id,
+          input.limit,
+        ]),
+    ) as KernelContinuationCandidate[];
+    return rows;
   }
 
   async resolveExactContext(input: {
@@ -1111,18 +1245,21 @@ export class SqliteKernelStore implements
     const changed = this.#db.prepare(`
       UPDATE attempts SET status = ?, version = ?, lease_id = NULL, lease_generation = NULL,
         lease_worker_id = NULL,
-        lease_purpose = NULL, lease_expires_at = NULL, lease_started = NULL, updated_at = ?
+        lease_purpose = NULL, lease_expires_at = NULL, lease_started = NULL,
+        result_record_id = NULL, decision_record_id = NULL, result_correction_deadline = NULL,
+        pending_candidate_hash = NULL, pending_diagnostics_json = NULL, updated_at = ?
       WHERE id = ? AND pipeline_run_id = ? AND version = ?
     `).run(write.status, write.next_version, this.#now(), write.attempt_id, runId, write.expected_version);
     if (changed.changes !== 1) throw new Error(`attempt ${write.attempt_id} terminal compare-and-set failed`);
   }
 
-  #insertRecord(recordInput: ExecutionRecord): void {
+  #insertRecord(recordInput: ExecutionRecord, replacementOwner?: KernelAttempt): void {
     const record = validateExecutionRecord(recordInput, { payloadSchemas: this.#payloadSchemas }).value;
     const payload = this.#recordPayloadColumns(record.payload, record.payload_schema);
     if (record.kind === "result") {
-      const owner = this.#attemptById(record.attempt_id, record.pipeline_run_id);
+      const owner = replacementOwner ?? this.#attemptById(record.attempt_id, record.pipeline_run_id);
       if (
+        owner.id !== record.attempt_id || owner.pipeline_run_id !== record.pipeline_run_id ||
         owner.request_hash !== record.request_hash || owner.definition_bundle_hash !== record.definition_bundle_hash ||
         owner.input_subject !== record.input_subject || owner.output_subject !== record.output_subject
       ) throw new Error(`ResultRecord ${record.id} does not match its attempt identity`);

@@ -21,6 +21,7 @@ import {
   type FreshEpochIdentity,
 } from "./epoch-database.js";
 import { FRESH_EPOCH_TABLES } from "./epoch-schema.js";
+import { SqliteKernelInboxStore } from "./kernel-inbox-store.js";
 
 const temporaryDirectories: string[] = [];
 const NOW = "2026-08-20T12:00:00.000Z";
@@ -107,6 +108,7 @@ describe("fresh epoch database", () => {
         { key: "epoch.blob_marker_checksum", mutable: 0 },
         { key: "epoch.blob_store_id", mutable: 0 },
         { key: "epoch.bootstrap_checksum", mutable: 0 },
+        { key: "epoch.maintenance_ingress_closed", mutable: 1 },
         { key: "epoch.release_id", mutable: 0 },
         { key: "epoch.runtime_capability_digest", mutable: 0 },
         { key: "operator.mode", mutable: 0 },
@@ -130,6 +132,56 @@ describe("fresh epoch database", () => {
       db.close();
     }
     expect(() => blob_store.assertSameVolume(database_path)).not.toThrow();
+  });
+
+  it("starts fresh ingress closed and reopens through one exact maintenance transition", () => {
+    const initializedEpoch = initialized();
+    const inbox = new SqliteKernelInboxStore({
+      db: initializedEpoch.db,
+      blob_store: initializedEpoch.blob_store,
+      now: () => NOW,
+    });
+    try {
+      expect(inbox.getMaintenanceFence()).toEqual({
+        closed: true,
+        version: 0,
+        updated_at: NOW,
+      });
+      expect(inbox.ingest({
+        source_provider: "github",
+        delivery_id: "fresh-epoch-closed",
+        kind: "github/issues/opened@1",
+        generation: 0,
+        event_group_key: "github:issue:1",
+        delivery_attempt: 1,
+        payload_schema: "github.issue/v1",
+        payload: { action: "opened" },
+      })).toEqual({
+        disposition: "maintenance_closed",
+        retryable: true,
+        acknowledge: false,
+      });
+
+      expect(inbox.setMaintenanceFence({ closed: false, expected_version: 0 })).toEqual({
+        closed: false,
+        version: 1,
+        updated_at: NOW,
+      });
+      expect(() => inbox.setMaintenanceFence({ closed: false, expected_version: 0 }))
+        .toThrow(/compare-and-set/);
+      expect(inbox.ingest({
+        source_provider: "github",
+        delivery_id: "fresh-epoch-open",
+        kind: "github/issues/opened@1",
+        generation: 0,
+        event_group_key: "github:issue:2",
+        delivery_attempt: 1,
+        payload_schema: "github.issue/v1",
+        payload: { action: "opened" },
+      })).toMatchObject({ disposition: "inserted", acknowledge: true });
+    } finally {
+      initializedEpoch.db.close();
+    }
   });
 
   it("reopens only the recognized release/bootstrap/blob-root tuple", () => {

@@ -52,7 +52,9 @@ import { GithubKernelAdapter } from "./providers/github/kernel-adapter.js";
 import { KernelAdmissionPromotionAdapter } from "./providers/kernel/admission-promotion.js";
 import {
   ensureRepositoryControlLabel,
+  getRepositoryCollaboratorPermission,
   getRepositoryDefinitionSourceAtCommit,
+  isAuthorizedGithubControlPermission,
   prepareRepository,
 } from "./providers/github/client.js";
 import type { KernelRuntimeCompatibilityPort } from "./runtime/kernel-contracts.js";
@@ -81,6 +83,7 @@ async function main(): Promise<void> {
     blob_store_id: cfg.blobStoreId,
     release_id: cfg.epochReleaseId,
     runtime_capability_digest: release.execution_policy.runtime_capability_digest,
+    bootstrap_checksum: cfg.epochBootstrapChecksum,
   });
   const manifestResolver = new VerifiedKernelManifestResolver({
     compiler_environment: release.compiler_environment,
@@ -195,6 +198,16 @@ async function main(): Promise<void> {
   const providerPrompts = new KernelProviderPromptHandler({
     runs: registrations,
     projections,
+    github_authorization: {
+      async authorizeComment(input) {
+        const permission = await getRepositoryCollaboratorPermission(
+          { token: cfg.githubReadToken },
+          input.repository,
+          input.username,
+        );
+        return isAuthorizedGithubControlPermission(permission);
+      },
+    },
     control: {
       requestRunControl: (input) => ordinary.requestRunControl(input),
       enqueueSteering: (input) => control.enqueueSteering(input),

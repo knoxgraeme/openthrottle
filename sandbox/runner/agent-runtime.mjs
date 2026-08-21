@@ -10,7 +10,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import {
   assertActionProfileSeal,
   captureActionProfileSeal,
@@ -32,6 +32,42 @@ const CAPTURE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 const STEERING_HOOK = "/opt/openthrottle/hooks/ot-inbox-drain.sh";
 const INSPECT_CHANGE_CONTEXT_SCHEMA = "openthrottle.inspect-change-context/v1";
+
+function absoluteRuntimeControlFile(env, name, label) {
+  const path = env[name];
+  if (typeof path !== "string" || !isAbsolute(path)) {
+    throw new Error(`${label} must be an absolute path`);
+  }
+  return path;
+}
+
+function leaseGenerationFenceFile(env) {
+  return absoluteRuntimeControlFile(
+    env,
+    "OT_LEASE_GENERATION_FENCE_FILE",
+    "live lease-generation fence file",
+  );
+}
+
+function leaseGenerationLockFile(env) {
+  return absoluteRuntimeControlFile(
+    env,
+    "OT_LEASE_GENERATION_LOCK_FILE",
+    "live lease-generation lock file",
+  );
+}
+
+function nativeMaxTurnsArgs(engine, executionLimits) {
+  const maxTurns = executionLimits?.max_turns ?? null;
+  if (maxTurns === null) return [];
+  if (!Number.isSafeInteger(maxTurns) || maxTurns < 1) {
+    throw new Error("sealed max_turns must be a positive integer");
+  }
+  if (engine !== "claude") {
+    throw new Error(`pinned ${engine} runtime cannot enforce sealed max_turns`);
+  }
+  return ["--max-turns", String(maxTurns)];
+}
 
 function taskPromptWithInspectContext(request) {
   const descriptor = request.inspect_change_artifact;
@@ -236,6 +272,8 @@ export function prepareAgentRuntime({ request, actionDirectory, channel, env = p
     OT_DEFINITION_BUNDLE_HASH: request.definition_bundle_hash,
     OT_LEASE_ID: request.lease_id,
     OT_SESSION_FENCE_FILE: join(actionDirectory, "session-fence.json"),
+    OT_LEASE_GENERATION_FENCE_FILE: leaseGenerationFenceFile(env),
+    OT_LEASE_GENERATION_LOCK_FILE: leaseGenerationLockFile(env),
     ...(request.repository_authority === "inspect"
       ? inspectGitEnvironment(request.repository_path)
       : {}),
@@ -252,6 +290,7 @@ export function prepareAgentRuntime({ request, actionDirectory, channel, env = p
       "--json-schema", readFileSync(channel.provider_schema_path, "utf8").trim(),
       ...(request.action.model ? ["--model", request.action.model] : []),
       ...(request.action.reasoning_effort ? ["--effort", request.action.reasoning_effort] : []),
+      ...nativeMaxTurnsArgs(engine, request.action.execution_limits),
       ...(request.repository_authority === "inspect"
         ? inspectPolicyArgs("claude", request.repository_path, {
           readablePaths: request.inspect_change_artifact ? [request.inspect_change_artifact.path] : [],
@@ -351,6 +390,8 @@ export function prepareResultCorrectionRuntime({
     OT_DEFINITION_BUNDLE_HASH: request.definition_bundle_hash,
     OT_LEASE_ID: request.lease_id,
     OT_SESSION_FENCE_FILE: join(actionDirectory, "session-fence.json"),
+    OT_LEASE_GENERATION_FENCE_FILE: leaseGenerationFenceFile(env),
+    OT_LEASE_GENERATION_LOCK_FILE: leaseGenerationLockFile(env),
     ...Object.fromEntries(resultSubmissionEnvironment(channel).map((entry) => {
       const index = entry.indexOf("=");
       return [entry.slice(0, index), entry.slice(index + 1)];
@@ -365,6 +406,7 @@ export function prepareResultCorrectionRuntime({
       "--json-schema", readFileSync(channel.provider_schema_path, "utf8").trim(),
       ...(request.model ? ["--model", request.model] : []),
       ...(request.reasoning_effort ? ["--effort", request.reasoning_effort] : []),
+      ...nativeMaxTurnsArgs(request.engine, request.execution_limits),
       "--permission-mode", "dontAsk",
       "--tools", "Bash",
       "--allowedTools", "Bash(ot-result:*)",
@@ -376,6 +418,9 @@ export function prepareResultCorrectionRuntime({
     args = [
       "--ask-for-approval", "never",
       "exec", "--json", "--output-schema", channel.provider_schema_path,
+      "--disable", "shell_tool", "--disable", "unified_exec", "--disable", "shell_snapshot",
+      "--disable", "apps", "--disable", "browser_use", "--disable", "in_app_browser",
+      "--disable", "multi_agent",
       ...inspectPolicyArgs("codex", cwd, { ephemeral: false }),
       "--skip-git-repo-check", "-C", cwd,
       ...(request.model ? ["-m", request.model] : []),

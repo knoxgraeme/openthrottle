@@ -47,6 +47,7 @@ export interface Config {
   blobStorePath: string;
   blobStoreId: string;
   epochReleaseId: string;
+  epochBootstrapChecksum: string;
   releaseRoot: string;
   generatedDefinitionRoot: string;
   kernelWorkerId: string;
@@ -77,6 +78,7 @@ export function loadConfig(): Config {
     blobStorePath: resolve(optional("OT_BLOB_STORE_PATH", "/data/openthrottle-blobs")),
     blobStoreId: optional("OT_BLOB_STORE_ID", "openthrottle-execution-kernel-v1"),
     epochReleaseId: optional("OT_EPOCH_RELEASE_ID", "openthrottle-execution-kernel/v1"),
+    epochBootstrapChecksum: required("OT_EPOCH_BOOTSTRAP_CHECKSUM"),
     releaseRoot,
     generatedDefinitionRoot: resolve(optional(
       "OT_GENERATED_DEFINITION_ROOT",
@@ -113,6 +115,9 @@ export function loadConfig(): Config {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(value)) {
       throw new Error(`${name} has an invalid format: ${value}`);
     }
+  }
+  if (!/^[a-f0-9]{64}$/.test(cfg.epochBootstrapChecksum)) {
+    throw new Error("OT_EPOCH_BOOTSTRAP_CHECKSUM must be a lowercase SHA-256 digest");
   }
   if (cfg.deployToken === cfg.statusToken) {
     throw new Error("OT_DEPLOY_TOKEN must be distinct from OT_STATUS_TOKEN");

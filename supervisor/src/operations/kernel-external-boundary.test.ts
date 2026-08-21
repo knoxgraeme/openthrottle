@@ -329,7 +329,7 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
     const attempt = this.attempts.get("attempt-1")!;
     const active = Object.keys(this.run.active_effect_versions).length > 0;
     return !active && (attempt.status === "work_complete" || attempt.status === "recorded")
-      ? [{ pipeline_run_id: this.run.id, attempt_id: attempt.id }]
+      ? [{ updated_at: NOW, pipeline_run_id: this.run.id, attempt_id: attempt.id }]
       : [];
   }
 
@@ -486,7 +486,7 @@ function binding(
 }
 
 function coordinator(input: {
-  store: MemoryExternalStore;
+  store: KernelExternalBoundaryStore;
   definition_bundle: DefinitionBundle;
   plans: readonly KernelExternalStagePlanBinding[];
 }) {
@@ -773,6 +773,66 @@ describe("kernel external boundary bridge", () => {
     expect([...store.records.values()].filter(({ kind }) => kind === "result")).toHaveLength(1);
   });
 
+  it("paginates past 100 malformed continuations without starving the next ready external Attempt", async () => {
+    const definitionBundle = bundle();
+    const currentManifest = manifest({
+      bundle_hash: digestCanonicalJson(definitionBundle),
+      external_kind: "core/provider-wait@1",
+      stage_kind: "wait",
+    });
+    const store = new MemoryExternalStore(currentManifest);
+    const initial = coordinator({
+      store,
+      definition_bundle: definitionBundle,
+      plans: [binding("core/provider-wait@1")],
+    });
+    await initial.executeLeasedAttempt(store.leased());
+    store.acknowledgePhase("observe");
+    const malformed = Array.from({ length: 125 }, (_, index) => ({
+      updated_at: "2026-08-20T11:59:00.000Z",
+      pipeline_run_id: `run-corrupt-${String(index).padStart(3, "0")}`,
+      attempt_id: `attempt-corrupt-${String(index).padStart(3, "0")}`,
+    }));
+    const ordered = [
+      ...malformed,
+      { updated_at: NOW, pipeline_run_id: "run-1", attempt_id: "attempt-1" },
+    ];
+    const fairStore: KernelExternalBoundaryStore = {
+      loadExactReductionView: (request) => {
+        if (request.pipeline_run_id.startsWith("run-corrupt-")) {
+          throw new Error("corrupt external continuation");
+        }
+        return store.loadExactReductionView(request);
+      },
+      applyAtomicTransition: (transition) => store.applyAtomicTransition(transition),
+      loadAttemptRequestInputs: (request) => store.loadAttemptRequestInputs(request),
+      findExternalSchedule: (request) => store.findExternalSchedule(request),
+      listReadyExternalAttempts: async (input: {
+        limit: number;
+        after?: { updated_at: string; pipeline_run_id: string; attempt_id: string };
+      }) => {
+        const start = input.after === undefined
+          ? 0
+          : ordered.findIndex((candidate) =>
+            candidate.updated_at === input.after!.updated_at &&
+            candidate.pipeline_run_id === input.after!.pipeline_run_id &&
+            candidate.attempt_id === input.after!.attempt_id) + 1;
+        if (input.after !== undefined && start === 0) throw new Error("unknown continuation cursor");
+        return ordered.slice(start, start + input.limit);
+      },
+    };
+    const resumed = coordinator({
+      store: fairStore,
+      definition_bundle: definitionBundle,
+      plans: [binding("core/provider-wait@1")],
+    });
+
+    await expect(resumed.resumeReadyAttempt()).resolves.toMatchObject({
+      disposition: "settled",
+      outcome: "success",
+    });
+  });
+
   it("advances integration subject while keeping the effect Attempt inspect-only", async () => {
     const definitionBundle = bundle();
     const currentManifest = manifest({
@@ -799,6 +859,51 @@ describe("kernel external boundary bridge", () => {
     store.acknowledgePhase("push-checkpoint");
     await bridge.resumeReadyAttempt();
     expect(store.run.current_subject).toBe(OUTPUT);
+  });
+
+  it("resumes integration after crashes immediately after promotion and external recording", async () => {
+    const definitionBundle = bundle();
+    const currentManifest = manifest({
+      bundle_hash: digestCanonicalJson(definitionBundle),
+      external_kind: "core/integrate-unit@1",
+    });
+    const store = new MemoryExternalStore(currentManifest);
+    const bridge = coordinator({
+      store,
+      definition_bundle: definitionBundle,
+      plans: [binding("core/integrate-unit@1")],
+    });
+    await bridge.executeLeasedAttempt(store.leased());
+    store.acknowledgePhase("integrate-checkpoint");
+    store.throwAfterApply = (transition) =>
+      transition.transition_id.startsWith("external-integration-advance-");
+
+    await expect(bridge.resumeReadyAttempt()).rejects.toThrow(/lost after durable transition/);
+    expect(store.attempts.get("attempt-1")).toMatchObject({
+      status: "work_complete",
+      checkpoint_id: "checkpoint-integration",
+      output_subject: OUTPUT,
+      result_record_id: null,
+    });
+    await expect(bridge.resumeReadyAttempt()).resolves.toMatchObject({
+      disposition: "scheduled",
+      phase: "push-checkpoint",
+    });
+
+    store.acknowledgePhase("push-checkpoint");
+    store.throwAfterApply = (transition) =>
+      transition.transition_id.startsWith("external-record-");
+    await expect(bridge.resumeReadyAttempt()).rejects.toThrow(/lost after durable transition/);
+    expect(store.attempts.get("attempt-1")).toMatchObject({
+      status: "recorded",
+      checkpoint_id: "checkpoint-integration",
+      output_subject: OUTPUT,
+      result_record_id: expect.stringMatching(/^result-/),
+    });
+    await expect(bridge.resumeReadyAttempt()).resolves.toMatchObject({
+      disposition: "settled",
+      outcome: "success",
+    });
   });
 
   it("seals a reconciled Daytona sandbox DeliveryRecord into the successor Attempt context", async () => {

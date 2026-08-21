@@ -18,6 +18,7 @@ import {
   type KernelActionContext,
   type KernelAgentAction,
   type KernelExecutableAction,
+  type KernelExecutionLimits,
   type KernelResultCorrectionRequest,
   type KernelWorkActionRequest,
 } from "../../runtime/kernel-contracts.js";
@@ -101,6 +102,15 @@ function configEntry(bundle: DefinitionBundle): DefinitionBundleEntry {
   return exactEntry(bundle, "config", "repository");
 }
 
+function executionLimits(
+  config: ReturnType<typeof validateFilesystemConfigContract>["value"],
+): KernelExecutionLimits {
+  return {
+    task_timeout_seconds: config.limits?.task_timeout ?? null,
+    max_turns: config.limits?.max_turns ?? null,
+  };
+}
+
 function selectAgentAction(
   bundle: DefinitionBundle,
   stage: Extract<CompiledPipelineStage, { kind: "agent" }>,
@@ -141,6 +151,7 @@ function selectAgentAction(
       : stage.entry_skill ?? null,
     eval_id: stage.eval,
     semantic_result_schema: evalDefinition.result,
+    execution_limits: executionLimits(parsedConfig),
     definition_entries: selected,
   };
   return {
@@ -163,7 +174,13 @@ function selectCommandAction(
   if (!commandLine) throw new Error(`command ${stage.command} is absent from the sealed config`);
   return {
     stage,
-    action: { kind: "command", command_id: stage.command, command_line: commandLine },
+    action: {
+      kind: "command",
+      command_id: stage.command,
+      command_line: commandLine,
+      post_bootstrap: parsed.post_bootstrap ?? [],
+      execution_limits: executionLimits(parsed),
+    },
     definition_hashes: [`config:repository:${config.content_hash}`],
   };
 }
@@ -274,6 +291,7 @@ function requestSeal(input: {
         skill_ids: input.selection.action.skill_ids,
         entry_skill: input.selection.action.entry_skill,
         eval_id: input.selection.action.eval_id,
+        execution_limits: input.selection.action.execution_limits,
       }
       : input.selection.action,
     definition_hashes: [...input.selection.definition_hashes].sort(compareCodeUnits),
@@ -554,6 +572,7 @@ export function buildKernelResultCorrectionRequest(input: {
     correction_deadline: attempt.result_correction_deadline,
     diagnostics: attempt.pending_result.diagnostics,
     semantic_result_schema: selection.action.semantic_result_schema,
+    execution_limits: selection.action.execution_limits,
     repository_authority: "inspect",
     tools: ["ot-result"],
     mcp: false,
