@@ -11,6 +11,11 @@ function optional(name: string, fallback: string): string {
   return value && value.trim() !== "" ? value : fallback;
 }
 
+function optionalValue(name: string): string | undefined {
+  const value = process.env[name];
+  return value && value.trim() !== "" ? value : undefined;
+}
+
 function optionalInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw || raw.trim() === "") return fallback;
@@ -34,6 +39,8 @@ export interface Config {
   statusToken: string;
   deployToken: string;
   linearWebhookSecret: string | undefined;
+  linearClientId: string | undefined;
+  linearClientSecret: string | undefined;
   githubWebhookSecret: string;
   githubToken: string;
   githubReadToken: string;
@@ -64,7 +71,9 @@ export function loadConfig(): Config {
     supervisorUrl: required("SUPERVISOR_URL").replace(/\/+$/, ""),
     statusToken: required("OT_STATUS_TOKEN"),
     deployToken: required("OT_DEPLOY_TOKEN"),
-    linearWebhookSecret: process.env.LINEAR_WEBHOOK_SECRET,
+    linearWebhookSecret: optionalValue("LINEAR_WEBHOOK_SECRET"),
+    linearClientId: optionalValue("LINEAR_CLIENT_ID"),
+    linearClientSecret: optionalValue("LINEAR_CLIENT_SECRET"),
     githubWebhookSecret: required("GITHUB_WEBHOOK_SECRET"),
     githubToken: required("GITHUB_TOKEN"),
     githubReadToken: required("GITHUB_READ_TOKEN"),
@@ -97,8 +106,26 @@ export function loadConfig(): Config {
   ] as const) {
     if (!credential) console.warn(`[config] model credential is not set — ${engine} will not be usable`);
   }
-  if (!cfg.linearWebhookSecret) {
-    console.warn("[config] LINEAR_WEBHOOK_SECRET is not set — Linear control webhooks are disabled");
+
+  const linearConfiguration = [
+    ["LINEAR_WEBHOOK_SECRET", cfg.linearWebhookSecret],
+    ["LINEAR_CLIENT_ID", cfg.linearClientId],
+    ["LINEAR_CLIENT_SECRET", cfg.linearClientSecret],
+  ] as const;
+  const configuredLinearValues = linearConfiguration.filter(([, value]) => value !== undefined);
+  if (configuredLinearValues.length > 0 && configuredLinearValues.length < linearConfiguration.length) {
+    const missing = linearConfiguration
+      .filter(([, value]) => value === undefined)
+      .map(([name]) => name);
+    throw new Error(
+      "Linear control requires LINEAR_WEBHOOK_SECRET, LINEAR_CLIENT_ID, and " +
+        `LINEAR_CLIENT_SECRET together (missing: ${missing.join(", ")})`
+    );
+  }
+  if (configuredLinearValues.length === 0) {
+    console.warn(
+      "[config] Linear credentials are not set — Linear control webhooks and agent-session activity are disabled"
+    );
   }
 
   requireRange("PORT", cfg.port, 1, 65_535);

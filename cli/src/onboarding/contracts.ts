@@ -47,10 +47,20 @@ export interface RuntimeDeploymentFragment {
   secrets: Record<string, SecretRef>;
 }
 
-export interface SupervisorDeploymentBundle {
+export interface OptionalAllOrNoneSecretGroup {
+  id: string;
+  /** The group is disabled when every member is absent and required once any member is present. */
+  members: readonly string[];
+}
+
+export interface SupervisorSecretPolicy {
+  secrets: Record<string, SecretRef>;
+  optionalSecretGroups: readonly OptionalAllOrNoneSecretGroup[];
+}
+
+export interface SupervisorDeploymentBundle extends SupervisorSecretPolicy {
   release: ReleaseManifest;
   runtime: RuntimeDeploymentFragment;
-  secrets: Record<string, SecretRef>;
 }
 
 export interface ProviderPlan {
@@ -86,7 +96,10 @@ export interface RuntimeSetupAdapter {
 export interface HostingSetupAdapter {
   readonly id: ProviderId;
   preflight(context: AdapterContext): Promise<ProviderEvidence>;
-  inspect(context: AdapterContext): Promise<HostingEnsureResult | ProviderPendingEvidence>;
+  inspect(
+    context: AdapterContext,
+    secretPolicy: SupervisorSecretPolicy
+  ): Promise<HostingEnsureResult | ProviderPendingEvidence>;
   plan(context: AdapterContext, bundle: SupervisorDeploymentBundle): Promise<ProviderPlan>;
   ensure(context: AdapterContext, bundle: SupervisorDeploymentBundle): Promise<HostingEnsureResult>;
 }

@@ -127,7 +127,8 @@ credentials and is exercised during dogfood after local and CI proof.
 - a remote blob backend if one Fly volume stops being sufficient;
 - concurrent Attempt execution, including overlapping units and review personas;
 - parallel Git integration of structured units;
-- outbound Linear status delivery and provider review/comment feedback mapped to
-  bounded remediation;
+- outbound Linear status delivery beyond the mandatory AgentSession start
+  acknowledgement, and provider review/comment feedback mapped to bounded
+  remediation;
 - agent-owned commit, publication, merge, or scope-expansion authority;
 - online epoch migration or preservation of abandoned dogfood work.

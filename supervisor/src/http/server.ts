@@ -11,6 +11,7 @@ import {
 import { Hono, type Context } from "hono";
 import type { Config } from "../app/config.js";
 import type { KernelExecutionPolicy } from "../app/kernel-composition.js";
+import type { KernelLinearSessionStartWakePort } from "../app/kernel-linear-session.js";
 import {
   KernelHttpConflictError,
   KernelHttpNotFoundError,
@@ -56,6 +57,7 @@ export interface KernelServerDeps {
   capabilities: KernelServerCapabilities;
   service: KernelHttpService;
   repository_setup: KernelRepositorySetupPort;
+  linear_session_start?: KernelLinearSessionStartWakePort;
 }
 
 function tokenHash(token: string): Buffer {
@@ -297,13 +299,17 @@ function logCursor(request: Request): KernelLogCursor | undefined {
   return { occurred_at: occurredAt, kind: kind as KernelLogKind, id };
 }
 
-function webhookResponse(context: Context, result: KernelProviderWebhookResponse) {
+function webhookResponse(
+  context: Context,
+  result: KernelProviderWebhookResponse,
+  provider: "linear" | "github",
+) {
   if (!result.accepted) {
     if (!result.acknowledge) {
       context.header("Retry-After", String(result.retry_after_seconds));
       return context.json(result, 503);
     }
-    return context.json(result, 202);
+    return context.json(result, provider === "linear" ? 200 : 202);
   }
   return context.json({
     accepted: true,
@@ -311,7 +317,7 @@ function webhookResponse(context: Context, result: KernelProviderWebhookResponse
     retryable: false,
     event_id: result.event.id,
     duplicate: result.duplicate,
-  }, result.duplicate ? 200 : 202);
+  }, provider === "linear" || result.duplicate ? 200 : 202);
 }
 
 function errorStatus(error: unknown): 400 | 404 | 409 {
@@ -533,10 +539,20 @@ export function createServer(deps: KernelServerDeps): Hono {
       false,
     )) return context.json({ error: "invalid signature" }, 401);
     try {
-      return webhookResponse(
-        context,
-        deps.service.ingestProviderWebhook(linearWebhook(raw, context.req.raw, deps.cfg.webhookMaxAgeSeconds)),
+      const result = deps.service.ingestProviderWebhook(
+        linearWebhook(raw, context.req.raw, deps.cfg.webhookMaxAgeSeconds),
       );
+      if (
+        result.accepted &&
+        (result.event.status === "pending" || result.event.status === "processing")
+      ) {
+        try {
+          deps.linear_session_start?.wake(result.event);
+        } catch {
+          // The durable inbox event remains the retry authority.
+        }
+      }
+      return webhookResponse(context, result, "linear");
     } catch (error) {
       return context.json(
         { error: safeError(error) },
@@ -564,7 +580,11 @@ export function createServer(deps: KernelServerDeps): Hono {
       true,
     )) return context.json({ error: "invalid signature" }, 401);
     try {
-      return webhookResponse(context, deps.service.ingestProviderWebhook(githubWebhook(raw, context.req.raw)));
+      return webhookResponse(
+        context,
+        deps.service.ingestProviderWebhook(githubWebhook(raw, context.req.raw)),
+        "github",
+      );
     } catch (error) {
       return context.json({ error: safeError(error) }, 400);
     }

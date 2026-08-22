@@ -8,6 +8,7 @@ import type {
   RuntimeDeploymentFragment,
   RuntimeEnsureResult,
   SupervisorDeploymentBundle,
+  SupervisorSecretPolicy,
 } from "./contracts.js";
 import { assertDigestPinnedImage, assertSnapshotName, isReadyEvidence } from "./contracts.js";
 import type { ProviderCatalogs } from "./provider-catalog.js";
@@ -32,6 +33,33 @@ export interface SetupOrchestratorOptions {
   profileStore: ProfileStore;
   confirmMutations(plan: { hosting: ProviderPlan; runtime: ProviderPlan }): Promise<boolean>;
   now?: () => Date;
+}
+
+export function createSupervisorSecretPolicy(): SupervisorSecretPolicy {
+  return {
+    // Mirrors the supervisor's boot-fatal env authority (supervisor/src/app/config.ts).
+    secrets: {
+      OT_STATUS_TOKEN: { owner: "cli", name: "status_token" },
+      OT_DEPLOY_TOKEN: { owner: "provisioning", name: "deploy_token" },
+      LINEAR_WEBHOOK_SECRET: { owner: "provisioning", name: "linear_webhook_secret" },
+      LINEAR_CLIENT_ID: { owner: "operator", name: "linear_client_id" },
+      LINEAR_CLIENT_SECRET: { owner: "operator", name: "linear_client_secret" },
+      GITHUB_WEBHOOK_SECRET: { owner: "provisioning", name: "github_webhook_secret" },
+      GITHUB_TOKEN: { owner: "operator", name: "github_token" },
+      GITHUB_READ_TOKEN: { owner: "operator", name: "github_read_token" },
+      DAYTONA_API_KEY: { owner: "operator", name: "daytona_api_key" },
+      OT_EPOCH_BOOTSTRAP_CHECKSUM: {
+        owner: "operator",
+        name: "epoch_bootstrap_checksum",
+      },
+    },
+    optionalSecretGroups: [
+      {
+        id: "linear-control",
+        members: ["LINEAR_WEBHOOK_SECRET", "LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET"],
+      },
+    ],
+  };
 }
 
 export class SetupOrchestrator {
@@ -106,7 +134,7 @@ export class SetupOrchestrator {
       throw new Error("runtime inspection did not provide a deployment fragment");
     }
     const deploymentBundle = this.bundle(runtimeInspection.fragment);
-    const hostingInspection = await hosting.inspect(context);
+    const hostingInspection = await hosting.inspect(context, deploymentBundle);
     const hostingReady = isHostingEnsureResult(hostingInspection) && isReadyEvidence(hostingInspection.evidence);
     evidence.hosting = isHostingEnsureResult(hostingInspection) ? hostingInspection.evidence : hostingInspection;
     if (!hostingReady && evidence.hosting.status === "error") {
@@ -145,20 +173,7 @@ export class SetupOrchestrator {
     return {
       release: this.options.release,
       runtime,
-      // Mirrors the supervisor's boot-fatal env authority (supervisor/src/app/config.ts).
-      secrets: {
-        OT_STATUS_TOKEN: { owner: "cli", name: "status_token" },
-        OT_DEPLOY_TOKEN: { owner: "provisioning", name: "deploy_token" },
-        LINEAR_WEBHOOK_SECRET: { owner: "provisioning", name: "linear_webhook_secret" },
-        GITHUB_WEBHOOK_SECRET: { owner: "provisioning", name: "github_webhook_secret" },
-        GITHUB_TOKEN: { owner: "operator", name: "github_token" },
-        GITHUB_READ_TOKEN: { owner: "operator", name: "github_read_token" },
-        DAYTONA_API_KEY: { owner: "operator", name: "daytona_api_key" },
-        OT_EPOCH_BOOTSTRAP_CHECKSUM: {
-          owner: "operator",
-          name: "epoch_bootstrap_checksum",
-        },
-      },
+      ...createSupervisorSecretPolicy(),
     };
   }
 

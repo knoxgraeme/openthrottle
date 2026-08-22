@@ -9,6 +9,7 @@ import type {
   RuntimeDeploymentFragment,
   RuntimeSetupAdapter,
   SupervisorDeploymentBundle,
+  SupervisorSecretPolicy,
 } from "./contracts.js";
 import { SetupOrchestrator } from "./orchestrator.js";
 import { createProviderCatalogs } from "./provider-catalog.js";
@@ -94,6 +95,7 @@ class FakeHosting implements HostingSetupAdapter {
   ensureCalls = 0;
   planCalls = 0;
   bundles: SupervisorDeploymentBundle[] = [];
+  inspectedPolicies: SupervisorSecretPolicy[] = [];
   inspectResult: ProviderPendingEvidence | { evidence: ProviderEvidence; supervisorUrl?: string } = pendingEvidence(
     "needs_action",
     "hosting_provider",
@@ -108,7 +110,11 @@ class FakeHosting implements HostingSetupAdapter {
     return evidence("ready", "hosting_provider", "hosting logged in");
   }
 
-  async inspect(): Promise<ProviderPendingEvidence | { evidence: ProviderEvidence; supervisorUrl?: string }> {
+  async inspect(
+    _context: AdapterContext,
+    secretPolicy: SupervisorSecretPolicy,
+  ): Promise<ProviderPendingEvidence | { evidence: ProviderEvidence; supervisorUrl?: string }> {
+    this.inspectedPolicies.push(secretPolicy);
     return this.inspectResult;
   }
 
@@ -150,11 +156,19 @@ describe("setup orchestrator", () => {
       providerId: "fake-runtime-a",
       configuration: { snapshot: "fake-runtime-a-snapshot" },
     });
+    expect(hosting.inspectedPolicies.at(-1)?.optionalSecretGroups).toEqual([
+      {
+        id: "linear-control",
+        members: ["LINEAR_WEBHOOK_SECRET", "LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET"],
+      },
+    ]);
     expect(Object.keys(hosting.bundles.at(-1)?.secrets ?? {}).sort()).toEqual([
       "DAYTONA_API_KEY",
       "GITHUB_READ_TOKEN",
       "GITHUB_TOKEN",
       "GITHUB_WEBHOOK_SECRET",
+      "LINEAR_CLIENT_ID",
+      "LINEAR_CLIENT_SECRET",
       "LINEAR_WEBHOOK_SECRET",
       "OT_DEPLOY_TOKEN",
       "OT_EPOCH_BOOTSTRAP_CHECKSUM",
@@ -163,6 +177,14 @@ describe("setup orchestrator", () => {
     expect(hosting.bundles.at(-1)?.secrets.OT_DEPLOY_TOKEN).toEqual({ owner: "provisioning", name: "deploy_token" });
     expect(hosting.bundles.at(-1)?.secrets.GITHUB_TOKEN).toEqual({ owner: "operator", name: "github_token" });
     expect(hosting.bundles.at(-1)?.secrets.GITHUB_READ_TOKEN).toEqual({ owner: "operator", name: "github_read_token" });
+    expect(hosting.bundles.at(-1)?.secrets.LINEAR_CLIENT_ID).toEqual({
+      owner: "operator",
+      name: "linear_client_id",
+    });
+    expect(hosting.bundles.at(-1)?.secrets.LINEAR_CLIENT_SECRET).toEqual({
+      owner: "operator",
+      name: "linear_client_secret",
+    });
     expect(hosting.bundles.at(-1)?.secrets.DAYTONA_API_KEY).toEqual({ owner: "operator", name: "daytona_api_key" });
     expect(hosting.bundles.at(-1)?.secrets.OT_EPOCH_BOOTSTRAP_CHECKSUM).toEqual({
       owner: "operator",
@@ -172,6 +194,8 @@ describe("setup orchestrator", () => {
     expect(JSON.stringify(store.profile)).not.toContain("deploy_token");
     expect(JSON.stringify(store.profile)).not.toContain("github_token");
     expect(JSON.stringify(store.profile)).not.toContain("github_read_token");
+    expect(JSON.stringify(store.profile)).not.toContain("linear_client_id");
+    expect(JSON.stringify(store.profile)).not.toContain("linear_client_secret");
     expect(JSON.stringify(store.profile)).not.toContain("linear_webhook_secret");
     expect(JSON.stringify(store.profile)).not.toContain("github_webhook_secret");
   });

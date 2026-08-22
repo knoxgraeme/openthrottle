@@ -14,6 +14,7 @@ import {
   KernelAdmissionSettlementPlanner,
 } from "./app/kernel-admission-promotion.js";
 import { KernelAdmissionInboxHandler } from "./app/kernel-inbox-handler.js";
+import { KernelLinearSessionStartDispatcher } from "./app/kernel-linear-session.js";
 import { KernelInboxRouter } from "./app/kernel-inbox-router.js";
 import { KernelProviderPromptHandler } from "./app/kernel-provider-prompt.js";
 import { loadKernelReleaseDefinitions } from "./app/kernel-release.js";
@@ -50,6 +51,7 @@ import { createKernelCredentialMaterializer } from "./providers/codex/auth.js";
 import { createDaytonaKernelAdapter } from "./providers/daytona/kernel-adapter.js";
 import { GithubKernelAdapter } from "./providers/github/kernel-adapter.js";
 import { KernelAdmissionPromotionAdapter } from "./providers/kernel/admission-promotion.js";
+import { createLinearSessionStartProvider } from "./providers/linear/session-start.js";
 import {
   ensureRepositoryControlLabel,
   getRepositoryCollaboratorPermission,
@@ -178,6 +180,14 @@ async function main(): Promise<void> {
     settlement_planner: structuredSettlement,
   });
   const effects = createKernelEffectExecutionService({ effects: kernel, adapters: effectAdapters });
+  const linearSessionStart = cfg.linearClientId && cfg.linearClientSecret
+    ? new KernelLinearSessionStartDispatcher({
+      downstream: createLinearSessionStartProvider({
+        clientId: cfg.linearClientId,
+        clientSecret: cfg.linearClientSecret,
+      }),
+    })
+    : undefined;
   const inboxHandler = new KernelAdmissionInboxHandler({
     registrations,
     github_token: cfg.githubReadToken,
@@ -187,6 +197,7 @@ async function main(): Promise<void> {
     runtime: runtimeCompatibility,
     blob_store: epoch.blobs,
     store: kernel,
+    ...(linearSessionStart ? { linear_session_start: linearSessionStart } : {}),
   });
   const control = new KernelControlService({
     inbox,
@@ -240,6 +251,9 @@ async function main(): Promise<void> {
   });
   const repositorySetup: KernelRepositorySetupPort = {
     async prepare(input) {
+      if (input.controlProvider === "linear" && !linearSessionStart) {
+        throw new Error("Linear control requires configured webhook and client credentials");
+      }
       const readiness = await prepareRepository(
         { token: cfg.githubToken },
         {
@@ -298,6 +312,7 @@ async function main(): Promise<void> {
     },
     service,
     repository_setup: repositorySetup,
+    ...(linearSessionStart ? { linear_session_start: linearSessionStart } : {}),
   });
 
   let cycleRunning = false;
