@@ -88,7 +88,7 @@ const definitionEntries = [
   },
 ];
 
-function actionRequest({ name, inputSubject, requestHash }) {
+function actionRequest({ name, inputSubject, checkpointBaseSubject, requestHash }) {
   return {
     schema: "openthrottle.kernel-action-request/v2",
     phase: "work",
@@ -99,6 +99,7 @@ function actionRequest({ name, inputSubject, requestHash }) {
     request_hash: requestHash,
     definition_bundle_hash: "d".repeat(64),
     input_subject: inputSubject,
+    checkpoint_base_subject: checkpointBaseSubject,
     repository_authority: "edit",
     lease_id: `lease-${name}`,
     worker_id: "structured-worker",
@@ -154,6 +155,7 @@ function integrate(name, action, actionResult, currentSubject) {
     lease_id: `integration-lease-${name}`,
     worker_id: "integration-worker",
     definition_bundle_hash: action.definition_bundle_hash,
+    checkpoint_base_subject: action.checkpoint_base_subject,
     current_subject: currentSubject,
     candidate_checkpoint_id: checkpoint.id,
     candidate_input_subject: action.input_subject,
@@ -249,13 +251,23 @@ printf '{"type":"result","subtype":"success","structured_output":{"schema":"open
     ]);
   }
 
-  const actionA = actionRequest({ name: "a", inputSubject: base, requestHash: "1".repeat(64) });
+  const actionA = actionRequest({
+    name: "a",
+    inputSubject: base,
+    checkpointBaseSubject: base,
+    requestHash: "1".repeat(64),
+  });
   const resultA = runAction("a", actionA);
   const acceptedA = integrate("a", actionA, resultA, base);
 
   // The second attempt can only materialize if the first exact accepted commit
   // was imported into the source object database.
-  const actionB = actionRequest({ name: "b", inputSubject: acceptedA.output_subject, requestHash: "2".repeat(64) });
+  const actionB = actionRequest({
+    name: "b",
+    inputSubject: acceptedA.output_subject,
+    checkpointBaseSubject: base,
+    requestHash: "2".repeat(64),
+  });
   const resultB = runAction("b", actionB);
   const acceptedB = integrate("b", actionB, resultB, acceptedA.output_subject);
 

@@ -261,6 +261,7 @@ function requestSeal(input: {
   attempt_id: string;
   input_subject: string;
   definition_bundle_hash: string;
+  bundle: DefinitionBundle;
   repository_authority: KernelAttempt["repository_authority"];
   scope: AttemptScope;
   selection: ActionSelection;
@@ -280,6 +281,7 @@ function requestSeal(input: {
     scope: input.scope,
     input_subject: input.input_subject,
     definition_bundle_hash: input.definition_bundle_hash,
+    checkpoint_base_subject: input.bundle.source_commit,
     repository_authority: input.repository_authority,
     action: input.selection.action.kind === "agent"
       ? {
@@ -335,6 +337,7 @@ function executorOnlyRequestSeal(input: {
     scope: input.scope,
     input_subject: input.input_subject,
     definition_bundle_hash: input.definition_bundle_hash,
+    checkpoint_base_subject: input.bundle.source_commit,
     repository_authority: input.repository_authority,
     executor: stage.kind === "effect"
       ? { kind: "effect", effect_kind: stage.effect }
@@ -483,6 +486,7 @@ export function buildKernelWorkActionRequest(input: {
     attempt_id: attempt.id,
     input_subject: attempt.input_subject,
     definition_bundle_hash: attempt.definition_bundle_hash,
+    bundle: input.bundle,
     repository_authority: attempt.repository_authority,
     scope: attempt.scope,
     selection,
@@ -500,6 +504,7 @@ export function buildKernelWorkActionRequest(input: {
     scope: attempt.scope,
     request_hash: attempt.request_hash,
     definition_bundle_hash: attempt.definition_bundle_hash,
+    checkpoint_base_subject: input.bundle.source_commit,
     input_subject: attempt.input_subject,
     repository_authority: attempt.repository_authority,
     lease_id: attempt.lease.id,
@@ -562,6 +567,7 @@ export function buildKernelResultCorrectionRequest(input: {
     scope: attempt.scope,
     request_hash: attempt.request_hash,
     definition_bundle_hash: attempt.definition_bundle_hash,
+    checkpoint_base_subject: input.bundle.source_commit,
     input_subject: attempt.input_subject,
     locked_subject: lockedSubject,
     completed_work_authority: attempt.repository_authority,

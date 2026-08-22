@@ -22,10 +22,12 @@ const TASK_REF = /^refs\/heads\/ot\/[A-Za-z0-9._/-]{1,180}$/;
 
 interface PushPayload {
   schema: "openthrottle.github-push-checkpoint/v1";
+  ref_mode: "create" | "update";
   repository: string;
   ref: string;
   expected_old_subject: string;
   expected_new_subject: string;
+  checkpoint_base_subject: string;
   checkpoint_blob: BlobPointer;
   checkpoint_tree: string;
 }
@@ -58,6 +60,10 @@ type PageCollection =
   | { kind: "not_found" }
   | { kind: "unknown"; detail: string };
 
+type PullRequestCollection =
+  | { kind: "ok"; entries: unknown[] }
+  | { kind: "unknown"; detail: string };
+
 type RequiredObservationResolution =
   | { state: "missing" }
   | { state: "unknown"; detail: string }
@@ -68,6 +74,8 @@ type RequiredObservationResolution =
 
 const PROVIDER_PAGE_SIZE = 100;
 const PROVIDER_MAX_PAGES = 10;
+const PULL_REQUEST_PAGE_SIZE = 100;
+const PULL_REQUEST_MAX_PAGES = 10;
 
 function object(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -85,20 +93,22 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[], labe
 function pushPayload(intent: Readonly<EffectIntent>): PushPayload {
   const value = object(intent.payload, `effect ${intent.id} payload`);
   exactKeys(value, [
-    "schema", "repository", "ref", "expected_old_subject", "expected_new_subject",
-    "checkpoint_blob", "checkpoint_tree",
+    "schema", "ref_mode", "repository", "ref", "expected_old_subject", "expected_new_subject",
+    "checkpoint_base_subject", "checkpoint_blob", "checkpoint_tree",
   ], "GitHub checkpoint push payload");
   const blob = validateBlobPointer(value.checkpoint_blob, {
     source: "github_push.checkpoint_blob",
   }).value;
   if (
     value.schema !== "openthrottle.github-push-checkpoint/v1" ||
+    (value.ref_mode !== "create" && value.ref_mode !== "update") ||
     typeof value.repository !== "string" || !REPOSITORY.test(value.repository) ||
     typeof value.ref !== "string" || !TASK_REF.test(value.ref) ||
     typeof value.expected_old_subject !== "string" || !SUBJECT.test(value.expected_old_subject) ||
     typeof value.expected_new_subject !== "string" || !SUBJECT.test(value.expected_new_subject) ||
+    typeof value.checkpoint_base_subject !== "string" || !SUBJECT.test(value.checkpoint_base_subject) ||
+    value.expected_old_subject !== value.checkpoint_base_subject ||
     value.expected_new_subject !== intent.subject ||
-    value.expected_old_subject === value.expected_new_subject ||
     typeof value.checkpoint_tree !== "string" || !SUBJECT.test(value.checkpoint_tree) ||
     blob.encoding !== "binary" || blob.media_type !== "application/x-git-bundle" ||
     blob.payload_schema !== "openthrottle.git-checkpoint-bundle/v1"
@@ -154,6 +164,92 @@ async function githubJson<T>(client: GithubClient, path: string): Promise<{ stat
     throw new Error(`GitHub reconciliation failed (${response.status}): ${raw.slice(-1_000)}`);
   }
   return { status: response.status, value: raw ? JSON.parse(raw) as T : null };
+}
+
+async function collectPullRequests(
+  client: GithubClient,
+  payload: PullRequestPayload,
+): Promise<PullRequestCollection> {
+  const owner = payload.repository.split("/")[0]!;
+  const entries: unknown[] = [];
+  for (let page = 1; page <= PULL_REQUEST_MAX_PAGES; page += 1) {
+    const query = new URLSearchParams({
+      state: "all",
+      head: `${owner}:${payload.branch}`,
+      base: payload.base_branch,
+      per_page: String(PULL_REQUEST_PAGE_SIZE),
+      page: String(page),
+    });
+    const response = await githubJson<unknown>(
+      client,
+      `/repos/${payload.repository}/pulls?${query.toString()}`,
+    );
+    if (response.status === 404) return { kind: "ok", entries: [] };
+    if (!Array.isArray(response.value) || response.value.length > PULL_REQUEST_PAGE_SIZE) {
+      return { kind: "unknown", detail: `GitHub pull request page ${page} is malformed` };
+    }
+    entries.push(...response.value);
+    if (response.value.length < PULL_REQUEST_PAGE_SIZE) return { kind: "ok", entries };
+  }
+  return {
+    kind: "unknown",
+    detail: `GitHub pull request pagination bound of ${PULL_REQUEST_MAX_PAGES} pages was exhausted`,
+  };
+}
+
+function exactOwnedPullRequests(
+  entries: readonly unknown[],
+  payload: PullRequestPayload,
+): Record<string, unknown>[] {
+  const canonicalBody = `${payload.body.trimEnd()}\n\n<!-- ${payload.ownership_marker} -->\n`;
+  return entries.filter((candidate): candidate is Record<string, unknown> => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const pull = candidate as Record<string, unknown>;
+    const head = pull.head;
+    const base = pull.base;
+    if (
+      !head || typeof head !== "object" || Array.isArray(head) ||
+      !base || typeof base !== "object" || Array.isArray(base)
+    ) return false;
+    const headValue = head as Record<string, unknown>;
+    const baseValue = base as Record<string, unknown>;
+    const headRepository = headValue.repo;
+    return (
+      headValue.sha === payload.expected_head_subject &&
+      headValue.ref === payload.branch &&
+      headRepository !== null && typeof headRepository === "object" && !Array.isArray(headRepository) &&
+      typeof (headRepository as Record<string, unknown>).full_name === "string" &&
+      ((headRepository as Record<string, unknown>).full_name as string).toLowerCase() ===
+        payload.repository.toLowerCase() &&
+      baseValue.ref === payload.base_branch &&
+      pull.title === payload.title &&
+      pull.body === canonicalBody
+    );
+  });
+}
+
+function exactPullRequestCoordinates(
+  entries: readonly unknown[],
+  payload: PullRequestPayload,
+): Record<string, unknown>[] {
+  return entries.filter((candidate): candidate is Record<string, unknown> => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const pull = candidate as Record<string, unknown>;
+    const head = pull.head;
+    const base = pull.base;
+    if (
+      !head || typeof head !== "object" || Array.isArray(head) ||
+      !base || typeof base !== "object" || Array.isArray(base)
+    ) return false;
+    const headValue = head as Record<string, unknown>;
+    const headRepository = headValue.repo;
+    return headValue.sha === payload.expected_head_subject && headValue.ref === payload.branch &&
+      headRepository !== null && typeof headRepository === "object" && !Array.isArray(headRepository) &&
+      typeof (headRepository as Record<string, unknown>).full_name === "string" &&
+      ((headRepository as Record<string, unknown>).full_name as string).toLowerCase() ===
+        payload.repository.toLowerCase() &&
+      (base as Record<string, unknown>).ref === payload.base_branch;
+  });
 }
 
 async function githubPage(
@@ -412,12 +508,62 @@ export class GithubKernelAdapter {
     const payload = pushPayload(intent);
     const current = await this.#ref(payload.repository, payload.ref);
     if (current === payload.expected_new_subject) {
-      return { kind: "found", status: "confirmed", payload: { ref: payload.ref, sha: current } };
+      return {
+        kind: "found",
+        status: "confirmed",
+        payload: {
+          schema: "openthrottle.github-push-delivery/v1",
+          repository: payload.repository,
+          ref: payload.ref,
+          sha: current,
+          ref_mode: payload.ref_mode,
+        },
+      };
     }
-    if (current === null || current === payload.expected_old_subject) return { kind: "not_found" };
+    if (payload.ref_mode === "create" && current === null) {
+      const parent = await githubJson<unknown>(
+        this.#client,
+        `/repos/${payload.repository}/git/commits/${payload.expected_old_subject}`,
+      );
+      if (parent.status === 404) {
+        return {
+          kind: "found",
+          status: "rejected",
+          payload: {
+            schema: "openthrottle.github-push-delivery/v1",
+            repository: payload.repository,
+            ref: payload.ref,
+            sha: payload.expected_new_subject,
+            ref_mode: payload.ref_mode,
+            expected_old_subject: payload.expected_old_subject,
+            actual: null,
+            reason: "publication_parent_missing",
+          },
+        };
+      }
+      if (
+        !parent.value || typeof parent.value !== "object" || Array.isArray(parent.value) ||
+        (parent.value as Record<string, unknown>).sha !== payload.expected_old_subject
+      ) {
+        return { kind: "unknown", detail: "GitHub returned invalid publication parent evidence" };
+      }
+      return { kind: "not_found" };
+    }
+    if (payload.ref_mode === "update" && current === payload.expected_old_subject) {
+      return { kind: "not_found" };
+    }
     return {
       kind: "found", status: "rejected",
-      payload: { ref: payload.ref, expected: payload.expected_new_subject, actual: current, reason: "ref_conflict" },
+      payload: {
+        schema: "openthrottle.github-push-delivery/v1",
+        repository: payload.repository,
+        ref: payload.ref,
+        sha: payload.expected_new_subject,
+        ref_mode: payload.ref_mode,
+        expected_old_subject: payload.expected_old_subject,
+        actual: current,
+        reason: current === null ? "ref_missing" : "ref_conflict",
+      },
     };
   }
 
@@ -427,10 +573,11 @@ export class GithubKernelAdapter {
     await pushRepositoryCheckpoint(this.#client, {
       repository: payload.repository,
       ref: payload.ref,
+      mode: payload.ref_mode,
       expectedOldSha: payload.expected_old_subject,
       expectedNewSha: payload.expected_new_subject,
+      checkpointBaseSha: payload.checkpoint_base_subject,
       allowAlreadyAdvanced: true,
-      allowCreate: true,
       checkpointObject: {
         payload: bytes,
         payloadBytes: payload.checkpoint_blob.bytes,
@@ -442,20 +589,161 @@ export class GithubKernelAdapter {
 
   async #reconcilePullRequest(intent: Readonly<EffectIntent>): Promise<KernelEffectProviderObservation> {
     const payload = pullRequestPayload(intent);
-    const owner = payload.repository.split("/")[0]!;
-    const query = new URLSearchParams({
-      state: "open", head: `${owner}:${payload.branch}`, base: payload.base_branch, per_page: "10",
-    });
-    const response = await githubJson<Array<{
-      html_url?: unknown; body?: unknown; head?: { sha?: unknown }; base?: { ref?: unknown };
-    }>>(this.#client, `/repos/${payload.repository}/pulls?${query.toString()}`);
-    const matches = (response.value ?? []).filter((candidate) =>
-      candidate.head?.sha === payload.expected_head_subject && candidate.base?.ref === payload.base_branch &&
-      typeof candidate.body === "string" && candidate.body.includes(payload.ownership_marker));
-    if (matches.length > 1) return { kind: "unknown", detail: "multiple owned pull requests match one publication" };
+    const history = await collectPullRequests(this.#client, payload);
+    if (history.kind === "unknown") return history;
+    const matches = exactOwnedPullRequests(history.entries, payload);
+    if (matches.length > 1) {
+      return { kind: "unknown", detail: "multiple owned pull requests match one publication" };
+    }
     const match = matches[0];
-    if (!match) return { kind: "not_found" };
-    return { kind: "found", status: "confirmed", payload: { url: match.html_url as JsonValue } };
+    if (match) {
+      if (typeof match.html_url !== "string" || match.html_url.length === 0) {
+        return { kind: "unknown", detail: "owned pull request has an invalid URL" };
+      }
+      if (match.state === "open" && match.merged_at === null) {
+        return { kind: "found", status: "confirmed", payload: { url: match.html_url } };
+      }
+      if (match.state === "closed" && typeof match.merged_at === "string" && match.merged_at.length > 0) {
+        return { kind: "found", status: "confirmed", payload: { url: match.html_url } };
+      }
+      if (match.state === "closed" && match.merged_at === null) {
+        return {
+          kind: "found",
+          status: "rejected",
+          payload: {
+            repository: payload.repository,
+            branch: payload.branch,
+            base_branch: payload.base_branch,
+            expected_head_subject: payload.expected_head_subject,
+            url: match.html_url,
+            reason: "pull_request_closed_unmerged",
+          },
+        };
+      }
+      return { kind: "unknown", detail: "owned pull request has invalid state evidence" };
+    }
+    if (exactPullRequestCoordinates(history.entries, payload).length > 0) {
+      return {
+        kind: "found",
+        status: "rejected",
+        payload: {
+          repository: payload.repository,
+          branch: payload.branch,
+          base_branch: payload.base_branch,
+          expected_head_subject: payload.expected_head_subject,
+          reason: "pull_request_immutable_payload_conflict",
+        },
+      };
+    }
+
+    const currentHead = await this.#ref(payload.repository, `refs/heads/${payload.branch}`);
+    if (currentHead === null) {
+      return {
+        kind: "found",
+        status: "rejected",
+        payload: {
+          repository: payload.repository,
+          branch: payload.branch,
+          base_branch: payload.base_branch,
+          expected_head_subject: payload.expected_head_subject,
+          reason: "task_ref_missing",
+        },
+      };
+    }
+    if (currentHead !== payload.expected_head_subject) {
+      return {
+        kind: "found",
+        status: "rejected",
+        payload: {
+          repository: payload.repository,
+          branch: payload.branch,
+          expected_head_subject: payload.expected_head_subject,
+          actual_head_subject: currentHead,
+          reason: "ref_conflict",
+        },
+      };
+    }
+    const baseHead = await this.#ref(payload.repository, `refs/heads/${payload.base_branch}`);
+    if (baseHead === null) {
+      return {
+        kind: "found",
+        status: "rejected",
+        payload: {
+          repository: payload.repository,
+          branch: payload.branch,
+          base_branch: payload.base_branch,
+          expected_head_subject: payload.expected_head_subject,
+          reason: "base_ref_missing",
+        },
+      };
+    }
+    const comparison = await githubJson<{
+      merge_base_commit?: { sha?: unknown };
+      status?: unknown;
+      ahead_by?: unknown;
+    }>(
+      this.#client,
+      `/repos/${payload.repository}/compare/${baseHead}...${payload.expected_head_subject}`,
+    );
+    if (comparison.status === 404) {
+      const [baseCommit, headCommit] = await Promise.all([
+        githubJson<{ sha?: unknown }>(
+          this.#client,
+          `/repos/${payload.repository}/git/commits/${baseHead}`,
+        ),
+        githubJson<{ sha?: unknown }>(
+          this.#client,
+          `/repos/${payload.repository}/git/commits/${payload.expected_head_subject}`,
+        ),
+      ]);
+      if (
+        baseCommit.status !== 200 || baseCommit.value?.sha !== baseHead ||
+        headCommit.status !== 200 || headCommit.value?.sha !== payload.expected_head_subject
+      ) {
+        return {
+          kind: "unknown",
+          detail: "GitHub comparison 404 lacked exact base and head commit evidence",
+        };
+      }
+      return {
+        kind: "found",
+        status: "rejected",
+        payload: {
+          repository: payload.repository,
+          branch: payload.branch,
+          base_branch: payload.base_branch,
+          expected_head_subject: payload.expected_head_subject,
+          reason: "no_common_ancestor",
+        },
+      };
+    }
+    const mergeBase = comparison.value?.merge_base_commit?.sha;
+    if (typeof mergeBase !== "string" || !SUBJECT.test(mergeBase)) {
+      return { kind: "unknown", detail: "GitHub comparison returned invalid merge-base evidence" };
+    }
+    const comparisonStatus = comparison.value?.status;
+    const aheadBy = comparison.value?.ahead_by;
+    if (
+      !["ahead", "behind", "diverged", "identical"].includes(String(comparisonStatus)) ||
+      !Number.isSafeInteger(aheadBy) || (aheadBy as number) < 0
+    ) return { kind: "unknown", detail: "GitHub comparison returned invalid containment evidence" };
+    if (aheadBy === 0 && (comparisonStatus === "behind" || comparisonStatus === "identical")) {
+      return {
+        kind: "found",
+        status: "rejected",
+        payload: {
+          repository: payload.repository,
+          branch: payload.branch,
+          base_branch: payload.base_branch,
+          expected_head_subject: payload.expected_head_subject,
+          reason: "expected_head_already_in_base",
+        },
+      };
+    }
+    if (aheadBy === 0 || (comparisonStatus !== "ahead" && comparisonStatus !== "diverged")) {
+      return { kind: "unknown", detail: "GitHub comparison returned inconsistent containment evidence" };
+    }
+    return { kind: "not_found" };
   }
 
   async #dispatchPullRequest(intent: Readonly<EffectIntent>): Promise<void> {

@@ -253,8 +253,8 @@ describe("result correction runtime", () => {
       "--disable", "browser_use",
       "--disable", "in_app_browser",
       "--disable", "multi_agent",
-      "-c", "use_legacy_landlock=true",
     ]));
+    expect(prepared.args).not.toContain("use_legacy_landlock=true");
   });
 });
 
@@ -295,8 +295,14 @@ describe("inspect change context runtime", () => {
     expect(claude.prepared.args.join("\n")).toContain(`Read(//${claude.actionContextPath.slice(1)})`);
     expect(claude.prepared.args).toEqual(expect.arrayContaining(["--max-turns", "11"]));
     expect(preparedByEngine.get("codex").prepared.args).toEqual(expect.arrayContaining([
-      "--sandbox", "read-only", "--ignore-user-config", "-c", "use_legacy_landlock=true",
+      "--sandbox", "read-only", "--ignore-user-config",
+      "--disable", "apps", "--disable", "browser_use",
+      "--disable", "in_app_browser", "--disable", "multi_agent",
+      "--disable", "plugins", "--disable", "remote_plugin",
+      "--disable", "image_generation",
     ]));
+    expect(preparedByEngine.get("codex").prepared.args)
+      .not.toContain("use_legacy_landlock=true");
     const opencode = preparedByEngine.get("opencode");
     const config = JSON.parse(readFileSync(
       join(opencode.actionDirectory, "opencode-config", "opencode.json"),

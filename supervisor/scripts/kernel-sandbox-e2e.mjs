@@ -387,13 +387,18 @@ class DockerKernelRuntime {
       (checkpoint) => checkpoint.output_subject === request.input_subject,
     );
     assert.equal(candidates.length, 1, "successor must carry one exact checkpoint for its input subject");
-    const pointer = candidates[0].payload?.blob;
+    const boundary = candidates[0];
+    const pointer = boundary.payload?.blob;
     assert(pointer, "successor checkpoint must be content-addressed");
     const bytes = this.blobs.read(pointer);
     const inspected = inspectKernelCheckpointBundle({
       bytes,
       expected_commit: request.input_subject,
-      allowed_ref: /^refs\/openthrottle\/checkpoints\/[a-f0-9]{64}$/,
+      shallow_boundary: boundary.input_subject,
+      ...(request.input_subject === boundary.input_subject
+        ? {}
+        : { expected_parent: boundary.input_subject }),
+      allowed_ref: /^refs\/openthrottle\/(?:checkpoints|integrations)\/[a-f0-9]{64}$/,
     });
     const localBundle = join(this.directory, `${pointer.digest}.input.bundle`);
     const containerBundle = `/transport/${pointer.digest}.input.bundle`;
@@ -419,13 +424,24 @@ class DockerKernelRuntime {
     const inspected = inspectKernelCheckpointBundle({
       bytes,
       expected_commit: descriptor.commit,
+      expected_tree: descriptor.tree,
+      ...(request.repository_authority === "edit"
+        ? {
+            shallow_boundary: request.checkpoint_base_subject,
+            ...(descriptor.commit === request.input_subject
+              ? {}
+              : { expected_parent: request.input_subject }),
+          }
+        : {}),
       allowed_ref: /^refs\/openthrottle\/checkpoints\/[a-f0-9]{64}$/,
     });
-    assert.deepEqual(inspected, {
-      ref: descriptor.ref,
-      commit: descriptor.commit,
-      tree: descriptor.tree,
-    });
+    assert.equal(inspected.ref, descriptor.ref);
+    assert.equal(inspected.commit, descriptor.commit);
+    assert.equal(inspected.tree, descriptor.tree);
+    if (
+      descriptor.ref.startsWith("refs/openthrottle/checkpoints/") &&
+      descriptor.ref !== `refs/openthrottle/checkpoints/${request.request_hash}`
+    ) throw new Error("checkpoint artifact changed its exact request ref");
     const token = this.blobs.put({
       bytes,
       encoding: "binary",

@@ -212,6 +212,36 @@ function phaseDelivery(id: string): DeliveryRecord {
   };
 }
 
+function githubPushDelivery(id: string, sha: string, refMode: "create" | "update"): DeliveryRecord {
+  const repository = "owner/repo";
+  const ref = "refs/heads/ot/run-1";
+  return {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id,
+    kind: "delivery",
+    pipeline_run_id: "run-1",
+    effect_id: `effect-${id}`,
+    idempotency_key: `run-1:${id}`,
+    external_identity: `github:${repository}:${ref}`,
+    status: "confirmed",
+    payload_schema: "openthrottle.effect-delivery/v1",
+    payload: {
+      inline: {
+        effect_kind: "github/push-checkpoint@1",
+        provider: "github",
+        result: {
+          schema: "openthrottle.github-push-delivery/v1",
+          repository,
+          ref,
+          sha,
+          ref_mode: refMode,
+        },
+      },
+    },
+    created_at: NOW,
+  };
+}
+
 function requestInputs(input: {
   task_prompt?: string;
   records?: readonly ExecutionRecord[];
@@ -648,6 +678,180 @@ describe("KernelStructuredSettlementPlanner", () => {
     expect(settlement.next_attempts[0]!.context_record_ids).toContain(promotion.id);
   });
 
+  it("carries the complete two-link settled integration chain into a third serial integration", async () => {
+    const unit = (id: string) => ({
+      id,
+      title: `Unit ${id}`,
+      depends_on: [],
+      objective: `Implement ${id}.`,
+      requirements: ["Meet the contract."],
+      files: [`src/${id}.ts`],
+      approach: ["Implement directly."],
+      tests: ["Run the focused test."],
+      acceptance: ["The focused test passes."],
+      verification: ["Inspect the exact result."],
+    });
+    const executionPlan: ExecutionPlanContractV2 = {
+      ...plan(),
+      units: [unit("unit-a"), unit("unit-b"), unit("unit-c")],
+    };
+    const taskPrompt = `Task\n\n\`\`\`json ${EXECUTION_PLAN_SCHEMA_V2}\n${JSON.stringify(executionPlan)}\n\`\`\``;
+    const basePromotion = promotionDecision();
+    const promotionInline = (basePromotion.payload as { inline: Record<string, unknown> }).inline;
+    const promotion: DecisionRecord = {
+      ...basePromotion,
+      payload: { inline: { ...promotionInline, execution_plan: executionPlan } as never },
+    };
+    const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const accepted = (memberId: string, index: number, outputSubject: string) => {
+      const candidate: AttemptCheckpoint = {
+        schema: ATTEMPT_CHECKPOINT_SCHEMA,
+        id: `checkpoint-candidate-${memberId}`,
+        pipeline_run_id: "run-1",
+        attempt_id: `attempt-edit-${memberId}`,
+        request_hash: String(index + 5).repeat(64),
+        definition_bundle_hash: DEFINITIONS.manifest.definition_bundle_hash,
+        input_subject: SOURCE,
+        output_subject: outputSubject,
+        native_session_id: `session-edit-${memberId}`,
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+        payload: { inline: { exact: true } },
+        captured_at: NOW,
+      };
+      const request = requestInputs({
+        task_prompt: taskPrompt,
+        records: [...runtime, promotion],
+        checkpoints: [candidate],
+      });
+      const pending = pendingAttempt({
+        id: `attempt-accept-${memberId}`,
+        stage_id: "accept_unit",
+        scope: {
+          kind: "loop_item",
+          stage_id: "accept_unit",
+          parent_attempt_id: "attempt-provision",
+          loop_id: "execution_plan.units",
+          item_id: memberId,
+          item_index: index,
+        },
+        input_subject: outputSubject,
+        request,
+      });
+      return { candidate, ...completedAttempt({ pending, output_subject: null, request, settled: true }) };
+    };
+    const acceptedA = accepted("unit-a", 0, UNIT_A);
+    const acceptedB = accepted("unit-b", 1, UNIT_B);
+    const acceptedC = accepted("unit-c", 2, "6".repeat(40));
+    const integratedA = "4".repeat(40);
+    const integratedB = "5".repeat(40);
+    const integration = (input: {
+      memberId: string;
+      index: number;
+      inputSubject: string;
+      outputSubject: string;
+      accepted: typeof acceptedA;
+      proof: readonly AttemptCheckpoint[];
+      settled: boolean;
+    }) => {
+      const request = requestInputs({
+        task_prompt: taskPrompt,
+        records: [
+          ...runtime,
+          promotion,
+          input.accepted.result,
+          input.accepted.decision,
+        ],
+        checkpoints: [input.accepted.candidate, ...input.proof],
+      });
+      const pending = pendingAttempt({
+        id: `attempt-integrate-${input.memberId}`,
+        stage_id: "integrate_unit",
+        scope: {
+          kind: "loop_item",
+          stage_id: "integrate_unit",
+          parent_attempt_id: "attempt-provision",
+          loop_id: "execution_plan.units",
+          item_id: input.memberId,
+          item_index: input.index,
+        },
+        input_subject: input.inputSubject,
+        request,
+      });
+      return {
+        request,
+        ...completedAttempt({
+          pending,
+          output_subject: input.outputSubject,
+          request,
+          settled: input.settled,
+          evaluated: {
+            evaluator: "external/core/integrate-unit@1",
+            outcome: "all_integrated",
+            reason: "integrated",
+          },
+        }),
+      };
+    };
+    const first = integration({
+      memberId: "unit-a",
+      index: 0,
+      inputSubject: SOURCE,
+      outputSubject: integratedA,
+      accepted: acceptedA,
+      proof: [],
+      settled: true,
+    });
+    const second = integration({
+      memberId: "unit-b",
+      index: 1,
+      inputSubject: integratedA,
+      outputSubject: integratedB,
+      accepted: acceptedB,
+      proof: [first.checkpoint],
+      settled: false,
+    });
+    const store = new PlanningStore();
+    store.requests.set(second.attempt.id, second.request);
+    store.settled = [acceptedC.evidence, first.evidence, acceptedB.evidence, acceptedA.evidence];
+    const selected = stage("integrate_unit");
+    if (selected.kind !== "effect") throw new Error("integration test stage is not an effect");
+    const integrateDelivery = phaseDelivery("delivery-integrate-b");
+    const push = githubPushDelivery("delivery-push-b", integratedB, "update");
+    const planner = new KernelStructuredSettlementPlanner({ store, now: () => NOW });
+
+    const settlement = await planner.plan({
+      view: view({
+        attempts: [second.attempt],
+        current: second.attempt,
+        current_subject: integratedA,
+      }),
+      stage: selected,
+      attempt: second.attempt,
+      checkpoint: second.checkpoint,
+      result: second.result,
+      bundle: DEFINITIONS.bundle,
+      schedules: externalSchedules([integrateDelivery, push]),
+      evaluated: {
+        evaluator: "external/core/integrate-unit@1",
+        outcome: "all_integrated",
+        reason: "integrated",
+      },
+      default_plan: vi.fn(async () => { throw new Error("unexpected default plan"); }),
+    });
+
+    expect(settlement.outcome).toBe("next_integration");
+    expect(settlement.next_attempts[0]!.scope).toMatchObject({
+      kind: "loop_item",
+      stage_id: "integrate_unit",
+      item_id: "unit-c",
+    });
+    expect(settlement.next_attempts[0]!.context_checkpoint_ids).toEqual([
+      acceptedC.candidate.id,
+      first.checkpoint.id,
+      second.checkpoint.id,
+    ].sort());
+  });
+
   it("turns a lead rejection into a distinct unbound edit Attempt with exact prior evidence", async () => {
     const store = new PlanningStore();
     const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
@@ -727,6 +931,7 @@ describe("KernelStructuredSettlementPlanner", () => {
   it("uses external delivery-citing integration evidence to unlock the next unit", async () => {
     const store = new PlanningStore();
     const promotion = promotionDecision();
+    const inheritedPush = githubPushDelivery("delivery-push-d1", "1".repeat(40), "create");
     const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
     const candidate: AttemptCheckpoint = {
       schema: ATTEMPT_CHECKPOINT_SCHEMA,
@@ -758,7 +963,7 @@ describe("KernelStructuredSettlementPlanner", () => {
     });
     const integrationRequest = requestInputs({
       task_prompt: "Original immutable issue prompt.",
-      records: [...runtime, promotion, acceptance.result, acceptance.decision],
+      records: [...runtime, promotion, inheritedPush, acceptance.result, acceptance.decision],
       checkpoints: [candidate],
     });
     const integrationPending = pendingAttempt({
@@ -785,7 +990,7 @@ describe("KernelStructuredSettlementPlanner", () => {
     const selected = stage("integrate_unit");
     if (selected.kind !== "effect") throw new Error("integration test stage is not an effect");
     const firstPhase = phaseDelivery("delivery-integrate");
-    const secondPhase = phaseDelivery("delivery-push");
+    const secondPhase = githubPushDelivery("delivery-push-d2", "2".repeat(40), "update");
     const planner = new KernelStructuredSettlementPlanner({ store, now: () => NOW });
     const input: ExternalInput = {
       view: view({
@@ -827,10 +1032,13 @@ describe("KernelStructuredSettlementPlanner", () => {
     expect(settlement.next_attempts[0]!.context_checkpoint_ids).toContain(integration.checkpoint.id);
     expect(settlement.next_attempts[0]!.context_record_ids).toContain(settlement.decision.id);
     expect(settlement.next_attempts[0]!.context_record_ids).toContain(promotion.id);
+    expect(settlement.next_attempts[0]!.context_record_ids).toContain(secondPhase.id);
+    expect(settlement.next_attempts[0]!.context_record_ids).not.toContain(inheritedPush.id);
   });
 
   it("compiles five selected reviewers into a stable serial inspect frontier", async () => {
     const store = new PlanningStore();
+    const push = githubPushDelivery("delivery-push-d1", "1".repeat(40), "create");
     const boundary: AttemptCheckpoint = {
       schema: ATTEMPT_CHECKPOINT_SCHEMA,
       id: "checkpoint-integrated-boundary",
@@ -846,7 +1054,7 @@ describe("KernelStructuredSettlementPlanner", () => {
       captured_at: NOW,
     };
     const request = requestInputs({
-      records: [runtimeDelivery("create"), runtimeDelivery("start")],
+      records: [runtimeDelivery("create"), runtimeDelivery("start"), push],
       checkpoints: [boundary],
     });
     const pending = pendingAttempt({
@@ -898,11 +1106,14 @@ describe("KernelStructuredSettlementPlanner", () => {
     }
     expect(settlement.next_attempts.every((attempt) =>
       attempt.context_checkpoint_ids.includes(boundary.id))).toBe(true);
+    expect(settlement.next_attempts.every((attempt) =>
+      attempt.context_record_ids.includes(push.id))).toBe(true);
   });
 
   it("fans review evidence into validation and preserves runtime identity for edit remediation", async () => {
     const store = new PlanningStore();
-    const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const push = githubPushDelivery("delivery-push-d1", "1".repeat(40), "create");
+    const runtime = [runtimeDelivery("create"), runtimeDelivery("start"), push];
     const boundary: AttemptCheckpoint = {
       schema: ATTEMPT_CHECKPOINT_SCHEMA,
       id: "checkpoint-integrated-boundary",

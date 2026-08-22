@@ -71,6 +71,7 @@ const request = (attempt, authority, requestHash) => ({
   request_hash: requestHash,
   definition_bundle_hash: "b".repeat(64),
   input_subject: subject,
+  checkpoint_base_subject: subject,
   repository_authority: authority,
   lease_id: `lease-${attempt}`,
   worker_id: "smoke-worker",
@@ -196,6 +197,34 @@ POISON
 chmod 0755 "$SMOKE_DIR/poison/claude"
 
 CONTAINER="$(docker run -d --entrypoint tail "$IMAGE" -f /dev/null)"
+docker exec "$CONTAINER" sh -c '
+  set -eu
+  test "$(codex --version)" = "codex-cli 0.149.0"
+  test "$(command -v bwrap)" = /usr/bin/bwrap
+
+  probe=/tmp/codex-sandbox-smoke
+  mkdir -p "$probe"
+  printf "read-ok\n" > "$probe/read.txt"
+  chown -R agent:agent "$probe"
+
+  node -e "require(\"node:http\").createServer((_request, response) => response.end(\"reachable\\n\")).listen(43117, \"127.0.0.1\")" &
+  server_pid=$!
+  trap "kill $server_pid >/dev/null 2>&1 || true" EXIT
+  for attempt in 1 2 3 4 5; do
+    if curl -fsS --max-time 1 http://127.0.0.1:43117/ >/dev/null; then break; fi
+    sleep 0.1
+  done
+  test "$(curl -fsS --max-time 1 http://127.0.0.1:43117/)" = reachable
+
+  gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex \
+    codex sandbox -P :read-only -C "$probe" sh -ec "
+      grep -qx read-ok read.txt
+      if touch forbidden 2>/dev/null; then exit 71; fi
+      if curl -fsS --max-time 1 http://127.0.0.1:43117/ >/dev/null 2>&1; then exit 72; fi
+      test ! -e forbidden
+    "
+  test ! -e "$probe/forbidden"
+'
 docker exec "$CONTAINER" mkdir -p /var/lib/openthrottle/repository-source/repo /requests /transport/edit /transport/inspect /transport/command /runtime/fences /tmp/stub /tmp/poison
 docker cp "$SOURCE_REPO/." "$CONTAINER:/var/lib/openthrottle/repository-source/repo/"
 docker cp "$REQUESTS/." "$CONTAINER:/requests/"

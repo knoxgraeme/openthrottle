@@ -33,6 +33,13 @@ checkout is recursively root-owned and non-writable without following symlinks.
 Deterministic command gates run in the same isolated repository and never
 contribute their incidental filesystem mutations.
 
+Codex inspect and result-correction actions use Codex's standard
+`--sandbox read-only` policy. The image supplies system Bubblewrap for that
+native Linux sandbox; it does not select a legacy sandbox backend or weaken the
+outer Daytona repository fence. Inspect policy also disables Codex Apps,
+browser, plugin, image-generation, and multi-agent features because those
+provider-hosted capabilities sit outside the Linux namespace.
+
 An inspect action with an accepted-edit boundary also receives one bounded
 executor-owned change artifact in a dedicated read-only directory outside the
 checkout. It names the exact base/input subjects and trees, includes changed

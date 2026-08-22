@@ -1845,6 +1845,129 @@ describe("effect ownership and reconciliation", () => {
     })).toThrow(/confirmed DeliveryRecords/);
   });
 
+  it("advances publish immediately from the sealed safe parent and rejects forged delivery input", () => {
+    const parent = subject("8");
+    const output = subject("2");
+    const current = attempt({
+      scope: stageScope("external"),
+      repository_authority: "inspect",
+      status: "work_complete",
+      version: 3,
+      checkpoint_id: "checkpoint-publication-plan",
+      input_subject: subject("1"),
+    });
+    const currentRun = run(current, {
+      status: "running",
+      current_subject: current.input_subject,
+      version: 3,
+      checkpoint_ids: { [current.id]: "checkpoint-publication-plan" },
+      active_effect_versions: {},
+    });
+    const prior: AttemptCheckpoint = {
+      ...checkpoint(current, null, "checkpoint-publication-plan"),
+      native_session_id: null,
+      payload_schema: "openthrottle.external-boundary-checkpoint/v1",
+      payload: { inline: {
+        schema: "openthrottle.external-boundary-checkpoint/v1",
+        external_kind: "core/publish@1",
+        subject_policy: "advance",
+        plan_digest: sha("9"),
+        evidence: { publication_parent_subject: parent },
+      } },
+    };
+    const blob = {
+      algorithm: "sha256" as const,
+      digest: sha("e"),
+      bytes: 123,
+      encoding: "binary" as const,
+      media_type: "application/x-git-bundle",
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+    };
+    const promoted: AttemptCheckpoint = {
+      ...checkpoint(current, output, "checkpoint-publication-output"),
+      input_subject: parent,
+      native_session_id: null,
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+      payload: { blob },
+    };
+    const integrationEffect = {
+      ...effectIntent("decision-integrate"),
+      id: "effect-integrate",
+      kind: "daytona/integrate-checkpoint@1",
+      idempotency_key: "run-1:publication-integrate",
+      target: "daytona:publication",
+      subject: null,
+    };
+    const delivery: DeliveryRecord = {
+      ...deliveryRecord(integrationEffect),
+      id: "delivery-publication-integrate",
+      effect_id: integrationEffect.id,
+      idempotency_key: integrationEffect.idempotency_key,
+      external_identity: integrationEffect.target,
+      payload_schema: "openthrottle.effect-delivery/v1",
+      payload: { inline: {
+        effect_kind: "daytona/integrate-checkpoint@1",
+        provider: "daytona",
+        result: {
+          schema: "openthrottle.daytona-integration-delivery/v1",
+          state: "integrated",
+          pipeline_run_id: current.pipeline_run_id,
+          attempt_id: current.id,
+          effect_id: integrationEffect.id,
+          idempotency_key: integrationEffect.idempotency_key,
+          input_subject: parent,
+          output_subject: output,
+          checkpoint_id: promoted.id,
+          checkpoint_payload_schema: promoted.payload_schema,
+          checkpoint_blob: blob,
+        },
+      } },
+    };
+    const command: KernelCommand = {
+      type: "advance_external_subject",
+      command_id: "advance-publication-subject",
+      attempt_id: current.id,
+      prior_checkpoint_id: prior.id,
+      checkpoint_id: promoted.id,
+      delivery_record_id: delivery.id,
+      verified_output_subject: output,
+    };
+
+    const transition = reduce({
+      current,
+      currentRun,
+      currentManifest: externalManifest(),
+      command,
+      records: [delivery],
+      checkpoints: [prior, promoted],
+    });
+    expect(transition.run.current_subject).toBe(output);
+    expect(replacedAttempt(transition, current.id)).toMatchObject({
+      input_subject: current.input_subject,
+      output_subject: output,
+      checkpoint_id: promoted.id,
+    });
+
+    const forged = {
+      ...delivery,
+      payload: { inline: {
+        ...(delivery.payload as { inline: Record<string, unknown> }).inline,
+        result: {
+          ...((delivery.payload as { inline: { result: Record<string, unknown> } }).inline.result),
+          input_subject: current.input_subject,
+        },
+      } },
+    } as DeliveryRecord;
+    expect(() => reduce({
+      current,
+      currentRun,
+      currentManifest: externalManifest(),
+      command,
+      records: [forged],
+      checkpoints: [prior, promoted],
+    })).toThrow(/changed its exact attempt or blob identity/);
+  });
+
   it("rejects external scheduling on agent stages, malformed phase identity, or oversized batches", () => {
     const current = attempt({
       status: "running",

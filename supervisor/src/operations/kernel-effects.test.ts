@@ -299,6 +299,40 @@ describe("kernel effect execution", () => {
     expect(port.completions[0]?.reconciliation.kind).toBe("append_delivery");
   });
 
+  it.each([
+    ["base-contained pull-request race", "github/upsert-pull-request@1", "expected_head_already_in_base"],
+    ["pruned create-mode publication parent", "github/push-checkpoint@1", "publication_parent_missing"],
+  ] as const)("settles a %s as rejected without dispatching", async (_label, kind, reason) => {
+    const events: string[] = [];
+    const adapter = scriptedAdapter({
+      events,
+      observations: [{
+        kind: "found",
+        status: "rejected",
+        payload: { reason },
+      }],
+    });
+    const intent = effect({ kind });
+    const port = new FakeEffectPort([lease(intent)]);
+
+    await expect(service({
+      port,
+      binding: binding(adapter, { effect_kind: kind }),
+    }).drainOne({
+      worker_id: "worker-1",
+      lease_id: "lease-1",
+      expires_at: "2026-08-20T12:01:00.000Z",
+    })).resolves.toMatchObject({ kind: "delivered", status: "rejected", path: "reconciled" });
+    expect(events).toEqual([`reconcile:${intent.target}`]);
+    expect(port.dispatchStarts).toHaveLength(0);
+    expect(port.completions[0]?.reconciliation).toMatchObject({
+      kind: "append_delivery",
+      delivery: { status: "rejected", payload: { inline: { result: {
+        reason,
+      } } } },
+    });
+  });
+
   it("holds an unknown observation and sanitizes diagnostics without dispatching", async () => {
     const events: string[] = [];
     const adapter = scriptedAdapter({

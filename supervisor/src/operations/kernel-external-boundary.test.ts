@@ -44,6 +44,7 @@ import {
 
 const NOW = "2026-08-20T12:00:00.000Z";
 const SUBJECT = "a".repeat(40);
+const PRIVATE_CANDIDATE = "f".repeat(40);
 const OUTPUT = "b".repeat(40);
 const INTEGRATION_BLOB = {
   algorithm: "sha256" as const,
@@ -171,7 +172,10 @@ function manifest(input: {
   };
 }
 
-function initialAttempt(currentManifest: CompiledPipelineManifest): KernelAttempt {
+function initialAttempt(
+  currentManifest: CompiledPipelineManifest,
+  inputSubject = SUBJECT,
+): KernelAttempt {
   return {
     schema: "openthrottle.kernel-attempt/v1",
     id: "attempt-1",
@@ -180,7 +184,7 @@ function initialAttempt(currentManifest: CompiledPipelineManifest): KernelAttemp
     repository_authority: "inspect",
     request_hash: "d".repeat(64),
     definition_bundle_hash: currentManifest.definition_bundle_hash,
-    input_subject: SUBJECT,
+    input_subject: inputSubject,
     context_record_ids: [],
     context_checkpoint_ids: [],
     output_subject: null,
@@ -216,16 +220,17 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
 
   constructor(
     readonly currentManifest: CompiledPipelineManifest,
+    inputSubject = SUBJECT,
     readonly taskPrompt = "Execute the plan.",
   ) {
-    const attempt = initialAttempt(currentManifest);
+    const attempt = initialAttempt(currentManifest, inputSubject);
     this.attempts.set(attempt.id, attempt);
     this.run = {
       schema: "openthrottle.kernel-run/v1",
       id: "run-1",
       pipeline_id: currentManifest.pipeline_id,
       definition_bundle_hash: currentManifest.definition_bundle_hash,
-      current_subject: SUBJECT,
+      current_subject: inputSubject,
       status: "running",
       terminal_outcome: null,
       cursor: compileKernelCursor({ stage_id: "external", version: 0, attempts: [attempt] }),
@@ -411,7 +416,12 @@ function prepared(
     : outputSubject ?? SUBJECT;
   return {
     verified_output_subject: outputSubject,
-    checkpoint_payload: { external_kind: externalKind },
+    checkpoint_payload: {
+      external_kind: externalKind,
+      ...(externalKind === "core/publish@1"
+        ? { publication_parent_subject: SUBJECT }
+        : {}),
+    },
     phases: shape.phases.map((phase) => ({
       id: phase.id,
       effects: phase.effects.map((effect, index) => ({
@@ -446,6 +456,9 @@ function binding(
     ...(shape.subject_policy === "advance" ? {
       async promote({ attempt, prepared: current, schedules }) {
         const delivery = schedules[0]!.effects[0]!.delivery!;
+        if (delivery.status !== "confirmed") {
+          throw new Error(`${externalKind} promotion requires a confirmed delivery`);
+        }
         return {
           delivery_record_id: delivery.id,
           checkpoint: {
@@ -455,7 +468,7 @@ function binding(
             attempt_id: attempt.id,
             request_hash: attempt.request_hash,
             definition_bundle_hash: attempt.definition_bundle_hash,
-            input_subject: attempt.input_subject,
+            input_subject: externalKind === "core/publish@1" ? SUBJECT : attempt.input_subject,
             output_subject: OUTPUT,
             native_session_id: null,
             payload_schema: "openthrottle.git-checkpoint-bundle/v1",
@@ -465,23 +478,31 @@ function binding(
           prepared: {
             ...current,
             verified_output_subject: OUTPUT,
-            phases: [current.phases[0]!, {
-              ...current.phases[1]!,
-              effects: current.phases[1]!.effects.map((effect) => ({
-                ...effect,
-                idempotency_key: `${effect.idempotency_key}:promoted`,
-                target: `${effect.target}:promoted`,
-                subject: OUTPUT,
-              })),
-            }],
+            phases: current.phases.map((phase, phaseIndex) => phaseIndex === 0
+              ? phase
+              : {
+                ...phase,
+                effects: phase.effects.map((effect) => ({
+                  ...effect,
+                  idempotency_key: `${effect.idempotency_key}:promoted`,
+                  target: `${effect.target}:promoted`,
+                  subject: OUTPUT,
+                })),
+              }),
           },
         };
       },
     } : {}),
-    evaluate: () => ({
-      outcome: options.outcome ?? "success",
-      summary: `${externalKind} completed with executor-owned evidence.`,
-    }),
+    evaluate: ({ schedules }) => schedules.every((schedule) =>
+      schedule.effects.every(({ delivery }) => delivery?.status === "confirmed"))
+      ? {
+        outcome: options.outcome ?? "success",
+        summary: `${externalKind} completed with executor-owned evidence.`,
+      }
+      : {
+        outcome: "failure",
+        summary: `${externalKind} was rejected with executor-owned evidence.`,
+      },
   };
 }
 
@@ -700,10 +721,10 @@ describe("kernel external boundary bridge", () => {
     expect(store.applied).toHaveLength(0);
   });
 
-  it("walks ordered publish phases and settles from executor-authored result bytes", async () => {
+  it("walks a private candidate through compacted publish and settlement", async () => {
     const definitionBundle = bundle();
     const currentManifest = manifest({ bundle_hash: digestCanonicalJson(definitionBundle) });
-    const store = new MemoryExternalStore(currentManifest);
+    const store = new MemoryExternalStore(currentManifest, PRIVATE_CANDIDATE);
     const bridge = coordinator({ store, definition_bundle: definitionBundle, plans: [binding("core/publish@1")] });
     const phaseIds = CORE_EXTERNAL_PLAN_SHAPES["core/publish@1"].phases.map(({ id }) => id);
 
@@ -719,6 +740,15 @@ describe("kernel external boundary bridge", () => {
       next_stage_id: "ot_runtime_stop_completed",
     });
     expect(store.run).toMatchObject({ status: "running", terminal_outcome: null });
+    expect(store.attempts.get("attempt-1")).toMatchObject({
+      input_subject: PRIVATE_CANDIDATE,
+      output_subject: OUTPUT,
+      status: "settled",
+    });
+    expect(store.checkpoints.get("checkpoint-integration")).toMatchObject({
+      input_subject: SUBJECT,
+      output_subject: OUTPUT,
+    });
     const result = [...store.records.values()].find((record) => record.kind === "result")!;
     expect(result.payload).toMatchObject({
       inline: {
@@ -728,6 +758,43 @@ describe("kernel external boundary bridge", () => {
       },
     });
     expect(typeof (result.payload as { inline: { summary: unknown } }).inline.summary).toBe("string");
+  });
+
+  it("carries the compacted publication subject into its provider wait successor", async () => {
+    const definitionBundle = providerBundle();
+    const currentManifest = manifest({
+      bundle_hash: digestCanonicalJson(definitionBundle),
+      external_kind: "core/publish@1",
+      terminal: false,
+    });
+    const store = new MemoryExternalStore(currentManifest);
+    const bridge = coordinator({
+      store,
+      definition_bundle: definitionBundle,
+      plans: [binding("core/publish@1")],
+    });
+    let step = await bridge.executeLeasedAttempt(store.leased());
+    for (const phase of CORE_EXTERNAL_PLAN_SHAPES["core/publish@1"].phases) {
+      expect(step).toMatchObject({ disposition: "scheduled", phase: phase.id });
+      store.acknowledgePhase(phase.id);
+      step = await bridge.resumeReadyAttempt();
+    }
+    expect(step).toMatchObject({ disposition: "settled", next_stage_id: "next" });
+    expect(store.run.current_subject).toBe(OUTPUT);
+    const successor = [...store.attempts.values()].find(({ id }) => id !== "attempt-1")!;
+    expect(successor).toMatchObject({ input_subject: OUTPUT, scope: { stage_id: "next" } });
+
+    const waitPrepared = await realWaitBinding().prepare({
+      run: store.run,
+      attempt: successor,
+      stage: currentManifest.stages.find(({ id }) => id === "next")! as never,
+      context: { records: new Map(), checkpoints: new Map() },
+      bundle: definitionBundle,
+    });
+    expect(waitPrepared.phases[0]!.effects[0]).toMatchObject({
+      subject: OUTPUT,
+      payload: { subject: OUTPUT },
+    });
   });
 
   it("recovers a committed phase whose acknowledgement was lost without duplicating effects", async () => {
@@ -745,6 +812,128 @@ describe("kernel external boundary bridge", () => {
       .resolves.toMatchObject({ disposition: "waiting", phase: first.id });
     expect(store.schedules.get(`external-schedule:attempt-1:${first.id}`)?.effects)
       .toHaveLength(first.effects.length);
+  });
+
+  it("recovers a rejected publication integration into failure cleanup without promotion or replay", async () => {
+    const definitionBundle = bundle();
+    const currentManifest = manifest({
+      bundle_hash: digestCanonicalJson(definitionBundle),
+      external_kind: "core/publish@1",
+    });
+    const store = new MemoryExternalStore(currentManifest, PRIVATE_CANDIDATE);
+    const bridge = coordinator({
+      store,
+      definition_bundle: definitionBundle,
+      plans: [binding("core/publish@1")],
+    });
+
+    await expect(bridge.executeLeasedAttempt(store.leased())).resolves.toMatchObject({
+      disposition: "scheduled",
+      phase: "integrate-checkpoint",
+    });
+    store.acknowledgePhase("integrate-checkpoint", "rejected");
+    const rejected = store.schedules
+      .get("external-schedule:attempt-1:integrate-checkpoint")!.effects[0]!.delivery!;
+    store.throwAfterApply = (transition) =>
+      transition.transition_id.startsWith("external-record-");
+
+    await expect(bridge.resumeReadyAttempt()).rejects.toThrow(/lost after durable transition/);
+    expect(store.attempts.get("attempt-1")).toMatchObject({
+      status: "recorded",
+      input_subject: PRIVATE_CANDIDATE,
+      output_subject: null,
+    });
+    expect([...store.schedules.keys()]).toEqual([
+      "external-schedule:attempt-1:integrate-checkpoint",
+    ]);
+    const result = [...store.records.values()].find((record) => record.kind === "result")!;
+    expect(result.payload).toMatchObject({
+      inline: {
+        outcome: "failure",
+        delivery_record_ids: [rejected.id],
+      },
+    });
+
+    await expect(bridge.resumeReadyAttempt()).resolves.toMatchObject({
+      disposition: "settled",
+      outcome: "failure",
+      next_stage_id: "ot_runtime_stop_failed",
+    });
+    expect([...store.records.values()].filter(({ kind }) => kind === "result")).toHaveLength(1);
+    expect([...store.schedules.keys()]).toEqual([
+      "external-schedule:attempt-1:integrate-checkpoint",
+    ]);
+    const successor = [...store.attempts.values()].find(({ id }) => id !== "attempt-1")!;
+    expect(successor).toMatchObject({
+      input_subject: PRIVATE_CANDIDATE,
+      scope: { stage_id: "ot_runtime_stop_failed" },
+    });
+    const decision = store.records.get(store.attempts.get("attempt-1")!.decision_record_id!)!;
+    expect(decision.kind).toBe("decision");
+    if (decision.kind !== "decision") throw new Error("missing external settlement decision");
+    expect(decision.input_record_ids).toEqual([result.id, rejected.id].sort());
+  });
+
+  it("recovers a rejected update push into failure cleanup without scheduling a pull request", async () => {
+    const definitionBundle = bundle();
+    const currentManifest = manifest({
+      bundle_hash: digestCanonicalJson(definitionBundle),
+      external_kind: "core/publish@1",
+    });
+    const store = new MemoryExternalStore(currentManifest);
+    const bridge = coordinator({
+      store,
+      definition_bundle: definitionBundle,
+      plans: [binding("core/publish@1")],
+    });
+
+    await bridge.executeLeasedAttempt(store.leased());
+    store.acknowledgePhase("integrate-checkpoint");
+    await expect(bridge.resumeReadyAttempt()).resolves.toMatchObject({
+      disposition: "scheduled",
+      phase: "push-checkpoint",
+    });
+    store.acknowledgePhase("push-checkpoint", "rejected");
+    const rejected = store.schedules
+      .get("external-schedule:attempt-1:push-checkpoint")!.effects[0]!.delivery!;
+    store.throwAfterApply = (transition) =>
+      transition.transition_id.startsWith("external-record-");
+
+    await expect(bridge.resumeReadyAttempt()).rejects.toThrow(/lost after durable transition/);
+    expect(store.attempts.get("attempt-1")).toMatchObject({
+      status: "recorded",
+      output_subject: OUTPUT,
+    });
+    expect(store.schedules.has("external-schedule:attempt-1:pull-request")).toBe(false);
+    const result = [...store.records.values()].find((record) => record.kind === "result")!;
+    expect(result.payload).toMatchObject({
+      inline: {
+        outcome: "failure",
+        delivery_record_ids: expect.arrayContaining([rejected.id]),
+      },
+    });
+
+    await expect(bridge.resumeReadyAttempt()).resolves.toMatchObject({
+      disposition: "settled",
+      outcome: "failure",
+      next_stage_id: "ot_runtime_stop_failed",
+    });
+    expect([...store.records.values()].filter(({ kind }) => kind === "result")).toHaveLength(1);
+    expect(store.schedules.has("external-schedule:attempt-1:pull-request")).toBe(false);
+    const successor = [...store.attempts.values()].find(({ id }) => id !== "attempt-1")!;
+    expect(successor).toMatchObject({
+      input_subject: OUTPUT,
+      scope: { stage_id: "ot_runtime_stop_failed" },
+    });
+    const decision = store.records.get(store.attempts.get("attempt-1")!.decision_record_id!)!;
+    expect(decision.kind).toBe("decision");
+    if (decision.kind !== "decision") throw new Error("missing external settlement decision");
+    const deliveryIds = [...store.schedules.values()]
+      .flatMap((schedule) => schedule.effects.map(({ delivery }) => delivery!.id));
+    expect(decision.input_record_ids).toEqual([
+      result.id,
+      ...deliveryIds,
+    ].sort());
   });
 
   it("resumes after the ResultRecord commit and settles without repeating completed work", async () => {
@@ -904,6 +1093,41 @@ describe("kernel external boundary bridge", () => {
       disposition: "settled",
       outcome: "success",
     });
+  });
+
+  it("recovers publish after durable compaction promotion before phase one scheduling", async () => {
+    const definitionBundle = bundle();
+    const currentManifest = manifest({
+      bundle_hash: digestCanonicalJson(definitionBundle),
+      external_kind: "core/publish@1",
+    });
+    const store = new MemoryExternalStore(currentManifest);
+    const bridge = coordinator({
+      store,
+      definition_bundle: definitionBundle,
+      plans: [binding("core/publish@1")],
+    });
+    await bridge.executeLeasedAttempt(store.leased());
+    store.acknowledgePhase("integrate-checkpoint");
+    store.throwAfterApply = (transition) =>
+      transition.transition_id.startsWith("external-integration-advance-");
+
+    await expect(bridge.resumeReadyAttempt()).rejects.toThrow(/lost after durable transition/);
+    expect(store.run.current_subject).toBe(OUTPUT);
+    expect(store.attempts.get("attempt-1")).toMatchObject({
+      input_subject: SUBJECT,
+      output_subject: OUTPUT,
+      checkpoint_id: "checkpoint-integration",
+      status: "work_complete",
+    });
+
+    await expect(bridge.resumeReadyAttempt()).resolves.toMatchObject({
+      disposition: "scheduled",
+      phase: "push-checkpoint",
+    });
+    expect(store.run.current_subject).toBe(OUTPUT);
+    expect(store.schedules.get("external-schedule:attempt-1:push-checkpoint")?.effects[0]?.intent)
+      .toMatchObject({ subject: OUTPUT });
   });
 
   it("seals a reconciled Daytona sandbox DeliveryRecord into the successor Attempt context", async () => {

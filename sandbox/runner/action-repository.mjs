@@ -21,6 +21,7 @@ import {
   isRoot,
 } from "./filesystem-isolation.mjs";
 import {
+  executorGitEnvironment,
   runGitAsExecutor,
   stageCanonicalWorkspaceIndex,
 } from "./repository-control.mjs";
@@ -47,20 +48,32 @@ function requireSubject(value, label) {
   return value;
 }
 
-function treeForSubject(repoDir, subject) {
+function commitForSubject(repoDir, subject, label) {
   const resolved = requireSubject(
     runGitAsExecutor(repoDir, ["rev-parse", subject]),
-    "repository subject",
+    label,
   );
   const type = runGitAsExecutor(repoDir, ["cat-file", "-t", resolved]);
-  if (type === "tree") return resolved;
-  if (type === "commit") {
-    return requireSubject(
-      runGitAsExecutor(repoDir, ["rev-parse", `${resolved}^{tree}`]),
-      "repository tree",
-    );
+  if (type !== "commit") {
+    throw new Error(`${label} must name a commit`);
   }
-  throw new Error("repository subject must name a commit or tree");
+  return {
+    commit: resolved,
+    tree: requireSubject(
+      runGitAsExecutor(repoDir, ["rev-parse", `${resolved}^{tree}`]),
+      `${label} tree`,
+    ),
+  };
+}
+
+function sourceObjectDirectory(repoDir) {
+  const commonGitDirectory = runGitAsExecutor(repoDir, ["rev-parse", "--git-common-dir"]);
+  const objectDirectory = resolve(repoDir, commonGitDirectory, "objects");
+  const metadata = lstatSync(objectDirectory);
+  if (!metadata.isDirectory()) {
+    throw new Error("executor source Git object store must be a directory");
+  }
+  return objectDirectory;
 }
 
 function packTree(repoDir, tree, destinationPackBase) {
@@ -80,7 +93,7 @@ function packTree(repoDir, tree, destinationPackBase) {
     "pack-objects", destinationPackBase,
   ], {
     cwd: repoDir,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    env: executorGitEnvironment(),
     input: `${[...objectIds].join("\n")}\n`,
     timeout: 120_000,
     captureBytes: 1024 * 1024,
@@ -104,14 +117,10 @@ function boundedGitEvidence(repoDir, args, captureBytes) {
     ...args,
   ], {
     cwd: repoDir,
-    env: {
-      ...process.env,
-      GIT_CONFIG_GLOBAL: "/dev/null",
-      GIT_CONFIG_NOSYSTEM: "1",
+    env: executorGitEnvironment({
       GIT_EXTERNAL_DIFF: "",
       GIT_OPTIONAL_LOCKS: "0",
-      GIT_TERMINAL_PROMPT: "0",
-    },
+    }),
     timeout: 120_000,
     captureBytes,
   });
@@ -276,19 +285,31 @@ export function materializeActionRepository({
     throw new Error("repository authority must be inspect or edit");
   }
   const requestedInputSubject = requireSubject(inputSubject, "action input subject");
-  const inputTree = treeForSubject(sourceRepoDir, requestedInputSubject);
+  const input = commitForSubject(sourceRepoDir, requestedInputSubject, "action input subject");
+  const inputTree = input.tree;
+  const executorSourceObjectDir = sourceObjectDirectory(sourceRepoDir);
+  let boundaryInputTree = null;
   if (changeBoundary !== null) {
     if (repositoryAuthority !== "inspect") {
       throw new Error("only inspect actions may receive a change boundary");
     }
-    requireSubject(changeBoundary.input_subject, "change boundary input subject");
-    requireSubject(changeBoundary.output_subject, "change boundary output subject");
+    const boundaryInput = commitForSubject(
+      sourceRepoDir,
+      changeBoundary.input_subject,
+      "change boundary input subject",
+    );
+    const boundaryOutput = commitForSubject(
+      sourceRepoDir,
+      changeBoundary.output_subject,
+      "change boundary output subject",
+    );
     if (changeBoundary.output_subject !== requestedInputSubject) {
       throw new Error("change boundary output must equal the exact action input subject");
     }
-    if (treeForSubject(sourceRepoDir, changeBoundary.output_subject) !== inputTree) {
+    if (boundaryOutput.commit !== input.commit || boundaryOutput.tree !== inputTree) {
       throw new Error("change boundary output must equal the action input subject");
     }
+    boundaryInputTree = boundaryInput.tree;
   }
 
   rmSync(destination, { recursive: true, force: true });
@@ -298,9 +319,8 @@ export function materializeActionRepository({
   mkdirSync(packDir, { recursive: true, mode: 0o755 });
   packTree(sourceRepoDir, inputTree, join(packDir, "input"));
 
-  let baseTree = inputTree;
-  if (changeBoundary !== null) {
-    baseTree = treeForSubject(sourceRepoDir, changeBoundary.input_subject);
+  const baseTree = boundaryInputTree ?? inputTree;
+  if (boundaryInputTree !== null) {
     packTree(sourceRepoDir, baseTree, join(packDir, "boundary"));
   }
   const baseCommit = syntheticCommit(destination, baseTree, "OpenThrottle action boundary");
@@ -331,6 +351,7 @@ export function materializeActionRepository({
     base_commit: baseCommit,
     head_commit: headCommit,
     executor_object_dir: join(dirname(destination), "executor-objects"),
+    executor_source_object_dir: executorSourceObjectDir,
   };
   view.git_control = captureGitControl(destination);
   return view;

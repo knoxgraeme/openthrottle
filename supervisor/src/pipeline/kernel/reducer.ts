@@ -136,12 +136,13 @@ function assertCheckpointIdentity(
   checkpoint: AttemptCheckpoint,
   attempt: KernelAttempt,
   stage: CompiledPipelineStage,
+  expectedInputSubject = attempt.input_subject,
 ): void {
   if (
     checkpoint.attempt_id !== attempt.id ||
     checkpoint.request_hash !== attempt.request_hash ||
     checkpoint.definition_bundle_hash !== attempt.definition_bundle_hash ||
-    checkpoint.input_subject !== attempt.input_subject
+    checkpoint.input_subject !== expectedInputSubject
   ) {
     throw new Error(`checkpoint ${checkpoint.id} does not match the complete attempt identity`);
   }
@@ -155,6 +156,36 @@ function assertCheckpointIdentity(
   } else if (attempt.native_session_id !== null || checkpoint.native_session_id !== null) {
     throw new Error(`${stage.kind} checkpoints cannot bind an agent native session`);
   }
+}
+
+function assertCurrentCheckpointIdentity(
+  checkpoint: AttemptCheckpoint,
+  attempt: KernelAttempt,
+  stage: CompiledPipelineStage,
+  run: KernelRun,
+): void {
+  if (checkpoint.input_subject === attempt.input_subject) {
+    assertCheckpointIdentity(checkpoint, attempt, stage);
+    return;
+  }
+  const promotedPublication =
+    stage.kind === "effect" && stage.effect === "core/publish@1" &&
+    attempt.output_subject !== null && attempt.checkpoint_id === checkpoint.id &&
+    run.checkpoint_ids[attempt.id] === checkpoint.id &&
+    run.current_subject === attempt.output_subject &&
+    checkpoint.output_subject === attempt.output_subject &&
+    GIT_SUBJECT.test(checkpoint.input_subject) &&
+    checkpoint.payload_schema === "openthrottle.git-checkpoint-bundle/v1" &&
+    "blob" in checkpoint.payload &&
+    checkpoint.payload.blob.encoding === "binary" &&
+    checkpoint.payload.blob.media_type === "application/x-git-bundle";
+  if (!promotedPublication) {
+    throw new Error(`checkpoint ${checkpoint.id} does not match the complete attempt identity`);
+  }
+  // advanceExternalSubject is the only transition that can establish these
+  // durable ownership fences after validating the input against sealed planning
+  // evidence. The Attempt input remains the immutable private candidate.
+  assertCheckpointIdentity(checkpoint, attempt, stage, checkpoint.input_subject);
 }
 
 function assertSessionBindVersion(value: number, expected: number, name: string): void {
@@ -756,7 +787,7 @@ function scheduleExternal(input: ReducerInput): AtomicTransitionBundle {
   }
 
   const checkpoint = exactCheckpoint(input, command.checkpoint_id);
-  assertCheckpointIdentity(checkpoint, attempt, stage);
+  assertCurrentCheckpointIdentity(checkpoint, attempt, stage, input.run);
   if (stage.kind === "wait" && command.verified_output_subject !== null) {
     throw new Error("wait stages must preserve the repository subject");
   }
@@ -835,15 +866,37 @@ function scheduleExternal(input: ReducerInput): AtomicTransitionBundle {
   }));
 }
 
-function advanceExternalIntegration(input: ReducerInput): AtomicTransitionBundle {
+function publicationParentFromPlanningCheckpoint(checkpoint: AttemptCheckpoint): string {
+  if (
+    checkpoint.payload_schema !== "openthrottle.external-boundary-checkpoint/v1" ||
+    !("inline" in checkpoint.payload) || !checkpoint.payload.inline ||
+    typeof checkpoint.payload.inline !== "object" || Array.isArray(checkpoint.payload.inline)
+  ) throw new Error("publication advance requires exact ordinal-0 planning evidence");
+  const payload = checkpoint.payload.inline as Record<string, unknown>;
+  const evidence = payload.evidence;
+  if (
+    payload.schema !== "openthrottle.external-boundary-checkpoint/v1" ||
+    payload.external_kind !== "core/publish@1" || payload.subject_policy !== "advance" ||
+    !evidence || typeof evidence !== "object" || Array.isArray(evidence)
+  ) throw new Error("publication advance requires exact ordinal-0 planning evidence");
+  const parent = (evidence as Record<string, unknown>).publication_parent_subject;
+  if (typeof parent !== "string" || !GIT_SUBJECT.test(parent)) {
+    throw new Error("publication planning evidence has no sealed publication parent");
+  }
+  return parent;
+}
+
+function advanceExternalSubject(input: ReducerInput): AtomicTransitionBundle {
   const command = input.command;
-  if (command.type !== "advance_external_integration") {
-    throw new Error("unreachable advance_external_integration command");
+  if (command.type !== "advance_external_subject") {
+    throw new Error("unreachable advance_external_subject command");
   }
   const attempt = currentAttempt(input, command.attempt_id);
   const stage = stageFor(input.manifest, attempt.scope.stage_id);
+  const integration = stage.kind === "effect" && stage.effect === "core/integrate-unit@1";
+  const publication = stage.kind === "effect" && stage.effect === "core/publish@1";
   if (
-    stage.kind !== "effect" || stage.effect !== "core/integrate-unit@1" ||
+    (!integration && !publication) ||
     attempt.status !== "work_complete" || attempt.lease !== null ||
     attempt.output_subject !== null || attempt.checkpoint_id !== command.prior_checkpoint_id ||
     Object.keys(input.run.active_effect_versions).length !== 0
@@ -856,7 +909,10 @@ function advanceExternalIntegration(input: ReducerInput): AtomicTransitionBundle
   const prior = input.checkpoints.get(command.prior_checkpoint_id)!;
   const checkpoint = input.checkpoints.get(command.checkpoint_id)!;
   assertCheckpointIdentity(prior, attempt, stage);
-  assertCheckpointIdentity(checkpoint, attempt, stage);
+  const expectedDeliveryInput = publication
+    ? publicationParentFromPlanningCheckpoint(prior)
+    : attempt.input_subject;
+  assertCheckpointIdentity(checkpoint, attempt, stage, expectedDeliveryInput);
   if (
     prior.output_subject !== null || checkpoint.output_subject !== command.verified_output_subject ||
     !GIT_SUBJECT.test(command.verified_output_subject) ||
@@ -887,7 +943,7 @@ function advanceExternalIntegration(input: ReducerInput): AtomicTransitionBundle
     evidence.state !== "integrated" || evidence.pipeline_run_id !== input.run.id ||
     evidence.attempt_id !== attempt.id || evidence.effect_id !== delivery.effect_id ||
     evidence.idempotency_key !== delivery.idempotency_key ||
-    evidence.input_subject !== attempt.input_subject ||
+    evidence.input_subject !== expectedDeliveryInput ||
     evidence.output_subject !== command.verified_output_subject ||
     evidence.checkpoint_id !== checkpoint.id ||
     evidence.checkpoint_payload_schema !== checkpoint.payload_schema ||
@@ -901,11 +957,14 @@ function advanceExternalIntegration(input: ReducerInput): AtomicTransitionBundle
     checkpoint_id: checkpoint.id,
   };
   const nextRun = replaceAttempt(input.run, next);
+  const runAtPromotedSubject = publication
+    ? { ...nextRun, current_subject: command.verified_output_subject }
+    : nextRun;
   return bundle(baseContent({
     command,
     expected: expectedFor(input.run, { [attempt.id]: attempt.version }),
     run: {
-      ...nextRun,
+      ...runAtPromotedSubject,
       checkpoint_ids: sortedRecord({
         ...input.run.checkpoint_ids,
         [attempt.id]: checkpoint.id,
@@ -991,7 +1050,7 @@ function record(input: ReducerInput): AtomicTransitionBundle {
   if (!attempt.checkpoint_id) throw new Error(`attempt ${attempt.id} has no verified checkpoint`);
   const stage = stageFor(input.manifest, attempt.scope.stage_id);
   const checkpoint = exactCheckpoint(input, attempt.checkpoint_id);
-  assertCheckpointIdentity(checkpoint, attempt, stage);
+  assertCurrentCheckpointIdentity(checkpoint, attempt, stage, input.run);
   const result = recordForAttempt(input, attempt, command.record_id);
   if (attempt.result_record_id !== null && attempt.result_record_id !== result.id) {
     throw new Error(`attempt ${attempt.id} already persists another authoritative result`);
@@ -1296,8 +1355,8 @@ export function reduceKernelCommand(input: ReducerInput): AtomicTransitionBundle
       return workComplete(input);
     case "schedule_external":
       return scheduleExternal(input);
-    case "advance_external_integration":
-      return advanceExternalIntegration(input);
+    case "advance_external_subject":
+      return advanceExternalSubject(input);
     case "result_pending":
       return resultPending(input);
     case "record":

@@ -1,5 +1,15 @@
 import { dirname, isAbsolute, normalize } from "node:path";
 
+const CODEX_INSPECT_DISABLED_FEATURES = [
+  "apps",
+  "browser_use",
+  "in_app_browser",
+  "multi_agent",
+  "plugins",
+  "remote_plugin",
+  "image_generation",
+];
+
 function claudeReadRule(repositoryPath) {
   if (typeof repositoryPath !== "string" || !isAbsolute(repositoryPath)) {
     throw new Error("Claude inspect authority requires an absolute repository path");
@@ -75,9 +85,7 @@ export function inspectPolicyArgs(engine, repositoryPath, {
       "--ignore-user-config",
       "--ignore-rules",
       "-c", 'web_search="disabled"',
-      // Daytona's action runtime rejects Codex's bubblewrap loopback setup; the
-      // pinned legacy backend keeps the native read-only and network-denial boundary.
-      "-c", "use_legacy_landlock=true",
+      ...CODEX_INSPECT_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]),
     ];
   }
   if (engine === "opencode") return [];

@@ -99,6 +99,7 @@ function validateCommonRequest(request) {
   }
   exactString(request.request_hash, "request.request_hash", SHA256);
   exactString(request.definition_bundle_hash, "request.definition_bundle_hash", SHA256);
+  exactString(request.checkpoint_base_subject, "request.checkpoint_base_subject", SUBJECT);
   exactString(request.input_subject, "request.input_subject", SUBJECT);
   return request;
 }

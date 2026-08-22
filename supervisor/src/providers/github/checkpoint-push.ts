@@ -12,6 +12,21 @@ import {
 
 const SHA = /^[a-f0-9]{40}$/;
 const REF = /^refs\/heads\/(?!.*\.\.)(?!.*\/$)[A-Za-z0-9._/-]{1,200}$/;
+function isolatedGitEnvironment(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const environment = { ...process.env };
+  for (const key of Object.keys(environment)) {
+    if (key.startsWith("GIT_")) delete environment[key];
+  }
+  return {
+    ...environment,
+    ...extra,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_COUNT: "0",
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
 
 function runGit(cwd: string, args: string[], env: NodeJS.ProcessEnv): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -63,17 +78,20 @@ export async function pushRepositoryCheckpoint(
   input: {
     repository: string;
     ref: string;
+    mode: "create" | "update";
     expectedOldSha: string;
     expectedNewSha: string;
+    /** Exact publication parent and bundle shallow cutoff. */
+    checkpointBaseSha: string;
     allowAlreadyAdvanced: boolean;
-    /** Allows first publication to create the deterministic task ref, still race-fenced as absent. */
-    allowCreate?: boolean;
-    checkpointObject: GitCheckpointPayload;
+    checkpointObject: GitCheckpointPayload & { expectedTreeSha: string };
   }
 ): Promise<{ sha: string }> {
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(input.repository) || !REF.test(input.ref) ||
       !SHA.test(input.expectedOldSha) || !SHA.test(input.expectedNewSha) ||
-      input.expectedOldSha === input.expectedNewSha) {
+      !SHA.test(input.checkpointBaseSha) ||
+      (input.mode !== "create" && input.mode !== "update") ||
+      input.expectedOldSha !== input.checkpointBaseSha) {
     throw new Error("GitHub checkpoint push has an invalid repository or ref fence");
   }
   const source = input.checkpointObject.payload;
@@ -85,20 +103,18 @@ export async function pushRepositoryCheckpoint(
       createHash("sha256").update(payload).digest("hex") !== input.checkpointObject.payloadSha256) {
     throw new Error("GitHub checkpoint push has an invalid bounded object payload");
   }
-  if (input.checkpointObject.expectedTreeSha !== undefined &&
-      !/^[a-f0-9]{40,64}$/.test(input.checkpointObject.expectedTreeSha)) {
+  if (!/^[a-f0-9]{40,64}$/.test(input.checkpointObject.expectedTreeSha)) {
     throw new Error("GitHub checkpoint push has an invalid accepted tree fence");
   }
   const scratch = mkdtempSync(join(tmpdir(), "openthrottle-checkpoint-"));
   const bundlePath = join(scratch, GIT_CHECKPOINT_OBJECT_FILE);
   const askpassPath = join(scratch, "askpass.sh");
   const remote = client.remoteUrl ?? `https://github.com/${input.repository}.git`;
-  const env = {
-    ...process.env,
+  const env = isolatedGitEnvironment({
     OT_GITHUB_TOKEN: client.token,
     GIT_ASKPASS: askpassPath,
     GIT_TERMINAL_PROMPT: "0",
-  };
+  });
   try {
     writeFileSync(bundlePath, payload, { mode: 0o400 });
     writeFileSync(askpassPath,
@@ -108,31 +124,25 @@ export async function pushRepositoryCheckpoint(
     await runGit(scratch, ["init", "--bare", "repository.git"], env);
     const repo = join(scratch, "repository.git");
     const remoteHead = (await runGit(repo, ["ls-remote", remote, input.ref], env)).split(/\s+/)[0] ?? "";
-    if (remoteHead === input.expectedNewSha && input.allowAlreadyAdvanced) {
-      await runGit(repo, ["fetch", "--no-tags", remote, `${input.ref}:refs/checkpoint/accepted`], env);
-      if (input.checkpointObject.expectedTreeSha) {
-        const remoteTree = await runGit(repo, ["rev-parse", `${input.expectedNewSha}^{tree}`], env);
-        if (remoteTree !== input.checkpointObject.expectedTreeSha) {
-          throw new RepositoryRefConflictError(
-            `repository ref conflict: ${input.expectedNewSha} does not contain the accepted tree`
-          );
-        }
-      }
-      return { sha: remoteHead };
-    }
-    const creating = remoteHead === "" && input.allowCreate === true;
-    if (!creating && remoteHead !== input.expectedOldSha) {
+    const identity = input.expectedOldSha === input.expectedNewSha;
+    const alreadyAdvanced = remoteHead === input.expectedNewSha &&
+      (input.allowAlreadyAdvanced || identity);
+    const creating = input.mode === "create" && remoteHead === "";
+    const updating = input.mode === "update" && remoteHead === input.expectedOldSha;
+    if (!alreadyAdvanced && !creating && !updating) {
       throw new RepositoryRefConflictError(
         `repository ref conflict: ${input.ref} expected ${input.expectedOldSha} but found ${remoteHead || "missing"}`
       );
     }
-    if (!creating) {
+    if (updating || alreadyAdvanced && input.mode === "update") {
       await runGit(repo, ["fetch", "--no-tags", remote, `${input.ref}:refs/checkpoint/remote`], env);
     }
+    writeFileSync(join(repo, "shallow"), `${input.checkpointBaseSha}\n`, { mode: 0o600 });
     const heads = (await runGit(repo, ["bundle", "list-heads", bundlePath], env)).split("\n").filter(Boolean);
     if (heads.length !== 1) throw new Error("git checkpoint bundle must advertise exactly one head");
-    const [bundleHead, bundleRef] = heads[0]!.trim().split(/\s+/, 2);
+    const [bundleHead, bundleRef, ...extra] = heads[0]!.trim().split(/\s+/);
     if (
+      extra.length !== 0 ||
       bundleHead !== input.expectedNewSha ||
       !/^refs\/openthrottle\/(?:checkpoints|integrations)\/[a-f0-9]{64}$/.test(bundleRef ?? "")
     ) {
@@ -141,23 +151,26 @@ export async function pushRepositoryCheckpoint(
     await runGit(repo, ["bundle", "verify", bundlePath], env);
     await runGit(repo, ["fetch", "--no-tags", bundlePath, `${bundleRef}:refs/checkpoint/accepted`], env);
     await runGit(repo, ["cat-file", "-e", `${input.expectedNewSha}^{commit}`], env);
-    if (input.checkpointObject.expectedTreeSha) {
-      const acceptedTree = await runGit(repo, ["rev-parse", `${input.expectedNewSha}^{tree}`], env);
-      if (acceptedTree !== input.checkpointObject.expectedTreeSha) {
+    const acceptedTree = await runGit(repo, ["rev-parse", `${input.expectedNewSha}^{tree}`], env);
+    if (acceptedTree !== input.checkpointObject.expectedTreeSha) {
+      throw new RepositoryRefConflictError(
+        `repository ref conflict: ${input.expectedNewSha} does not contain the accepted tree`
+      );
+    }
+    if (!identity) {
+      const revision = (await runGit(repo, ["rev-list", "--parents", "-n", "1", input.expectedNewSha], env))
+        .split(/\s+/).filter(Boolean);
+      const commit = revision.shift();
+      if (
+        commit !== input.expectedNewSha || revision.length !== 1 ||
+        revision[0] !== input.expectedOldSha
+      ) {
         throw new RepositoryRefConflictError(
-          `repository ref conflict: ${input.expectedNewSha} does not contain the accepted tree`
+          `repository ref conflict: ${input.expectedNewSha} does not have ${input.expectedOldSha} as its exact sole parent`
         );
       }
     }
-    if (!creating) {
-      try {
-        await runGit(repo, ["merge-base", "--is-ancestor", input.expectedOldSha, input.expectedNewSha], env);
-      } catch {
-        throw new RepositoryRefConflictError(
-          `repository ref conflict: ${input.expectedNewSha} is not a descendant of ${input.expectedOldSha}`
-        );
-      }
-    }
+    if (alreadyAdvanced) return { sha: remoteHead };
     await runGit(repo, [
       "push", "--porcelain", `--force-with-lease=${input.ref}:${creating ? "" : input.expectedOldSha}`,
       remote, `${input.expectedNewSha}:${input.ref}`,

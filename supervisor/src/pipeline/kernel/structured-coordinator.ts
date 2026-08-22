@@ -52,10 +52,14 @@ import {
   resolveKernelRuntimeResourceIdentity,
 } from "./runtime-resource.js";
 import { sortedUnique } from "./reducer-support.js";
-import { deriveKernelTerminalCleanupAttempt } from "./successor-attempt.js";
+import {
+  deriveKernelTerminalCleanupAttempt,
+  mergeCausalGithubPushContext,
+} from "./successor-attempt.js";
 
 const MAX_STRUCTURED_MEMBERS = 64;
 const MAX_STRUCTURED_ROUNDS = 100;
+const GIT_SUBJECT = /^[a-f0-9]{40,64}$/;
 export interface StructuredLoopMember {
   id: string;
   depends_on: readonly string[];
@@ -114,6 +118,61 @@ function assertIdentifier(value: string, label: string): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(value)) {
     throw new Error(`${label} is invalid`);
   }
+}
+
+function assertGitSubject(value: string, label: string): void {
+  if (!GIT_SUBJECT.test(value)) throw new Error(`${label} is invalid`);
+}
+
+export function structuredIntegrationCheckpointChain(input: {
+  completed_integrations: ReadonlyMap<string, StructuredIntegrationEvidence>;
+  checkpoint_base_subject: string;
+  current_subject: string;
+}): AttemptCheckpoint[] {
+  assertGitSubject(input.checkpoint_base_subject, "structured integration checkpoint base subject");
+  assertGitSubject(input.current_subject, "structured integration current subject");
+  if (input.completed_integrations.size > MAX_STRUCTURED_MEMBERS) {
+    throw new Error(`structured integration ancestry exceeds ${MAX_STRUCTURED_MEMBERS} checkpoints`);
+  }
+  const checkpoints = [...input.completed_integrations.values()].map(({ checkpoint }) => checkpoint);
+  const byInput = new Map<string, AttemptCheckpoint>();
+  const byOutput = new Map<string, AttemptCheckpoint>();
+  const checkpointIds = new Set<string>();
+  for (const checkpoint of checkpoints) {
+    if (
+      checkpoint.output_subject === null ||
+      checkpoint.output_subject === checkpoint.input_subject
+    ) throw new Error("structured integration ancestry contains a non-advancing checkpoint edge");
+    assertGitSubject(checkpoint.input_subject, "structured integration ancestry input subject");
+    assertGitSubject(checkpoint.output_subject, "structured integration ancestry output subject");
+    if (
+      checkpointIds.has(checkpoint.id) ||
+      byInput.has(checkpoint.input_subject) ||
+      byOutput.has(checkpoint.output_subject)
+    ) throw new Error("structured integration ancestry contains a fork or duplicate checkpoint edge");
+    checkpointIds.add(checkpoint.id);
+    byInput.set(checkpoint.input_subject, checkpoint);
+    byOutput.set(checkpoint.output_subject, checkpoint);
+  }
+  const reversed: AttemptCheckpoint[] = [];
+  const consumed = new Set<string>();
+  let cursor = input.current_subject;
+  while (cursor !== input.checkpoint_base_subject) {
+    const checkpoint = byOutput.get(cursor);
+    if (!checkpoint) {
+      throw new Error("structured integration ancestry contains a gap before the current subject");
+    }
+    if (consumed.has(checkpoint.id)) {
+      throw new Error("structured integration ancestry contains a cycle");
+    }
+    consumed.add(checkpoint.id);
+    reversed.push(checkpoint);
+    cursor = checkpoint.input_subject;
+  }
+  if (consumed.size !== checkpoints.length) {
+    throw new Error("structured integration ancestry contains disconnected extra checkpoints");
+  }
+  return reversed.reverse();
 }
 
 function assertFrontierBounds(input: FrontierBase, memberCount: number): void {
@@ -426,6 +485,13 @@ export function compileStructuredLoopFrontier(input: FrontierBase & {
       throw new Error(`completed member ${member.id} is missing integration dependency ${missing}`);
     }
   }
+  if (input.completed_integrations.size > 0) {
+    structuredIntegrationCheckpointChain({
+      completed_integrations: input.completed_integrations,
+      checkpoint_base_subject: input.bundle.source_commit,
+      current_subject: input.input_subject,
+    });
+  }
   if (input.completed_integrations.size === members.length) return null;
   const ready = members.filter((member) =>
     !input.completed_integrations.has(member.id) &&
@@ -630,6 +696,7 @@ export function createStructuredIntegrationAttempt(input: {
   input_subject: string;
   task_prompt: string;
   source: StructuredAcceptedUnitEvidence;
+  current_ancestry_checkpoints: readonly AttemptCheckpoint[];
   planning_context_records?: readonly ExecutionRecord[];
   bundle: DefinitionBundle;
   manifest: CompiledPipelineManifest;
@@ -654,6 +721,28 @@ export function createStructuredIntegrationAttempt(input: {
   ) {
     throw new Error("integration source does not retain the expected loop parent identity");
   }
+  const currentAncestry = [...input.current_ancestry_checkpoints];
+  if (currentAncestry.length > MAX_STRUCTURED_MEMBERS) {
+    throw new Error(`integration current ancestry exceeds ${MAX_STRUCTURED_MEMBERS} checkpoints`);
+  }
+  const ancestryIds = new Set<string>();
+  let ancestrySubject = input.source.candidate_checkpoint.input_subject;
+  for (const checkpoint of currentAncestry) {
+    if (
+      checkpoint.pipeline_run_id !== input.pipeline_run_id ||
+      checkpoint.definition_bundle_hash !== input.manifest.definition_bundle_hash ||
+      checkpoint.output_subject === null ||
+      checkpoint.output_subject === checkpoint.input_subject ||
+      checkpoint.input_subject !== ancestrySubject ||
+      checkpoint.id === input.source.candidate_checkpoint.id ||
+      ancestryIds.has(checkpoint.id)
+    ) throw new Error("integration current ancestry contains a gap, fork, or foreign checkpoint");
+    ancestryIds.add(checkpoint.id);
+    ancestrySubject = checkpoint.output_subject;
+  }
+  if (currentAncestry.length > 0 && ancestrySubject !== input.input_subject) {
+    throw new Error("integration current ancestry does not end at the integration input subject");
+  }
   const scope = {
     ...input.source.acceptance.attempt.scope,
     stage_id: input.stage_id,
@@ -667,6 +756,7 @@ export function createStructuredIntegrationAttempt(input: {
     source_result_id: input.source.acceptance.result.id,
     source_decision_id: input.source.acceptance.decision.id,
     source_checkpoint_id: input.source.candidate_checkpoint.id,
+    current_ancestry_checkpoint_ids: currentAncestry.map(({ id: checkpointId }) => checkpointId),
     scope,
   });
   return createPendingKernelAttempt({
@@ -679,14 +769,17 @@ export function createStructuredIntegrationAttempt(input: {
     action_inputs: {
       task_prompt: input.task_prompt,
       context: {
-        records: [
-          input.source.acceptance.decision,
-          input.source.acceptance.result,
-          ...exactRuntimeDeliveries(input.source.acceptance.action_inputs.context.records),
-          ...(input.planning_context_records ?? []),
-        ]
-          .sort((left, right) => compareCodeUnits(left.id, right.id)),
-        checkpoints: [input.source.candidate_checkpoint],
+        records: mergeCausalGithubPushContext({
+          pipeline_run_id: input.pipeline_run_id,
+          base_records: [
+            input.source.acceptance.decision,
+            input.source.acceptance.result,
+            ...exactRuntimeDeliveries(input.source.acceptance.action_inputs.context.records),
+          ],
+          inherited_records: input.source.acceptance.action_inputs.context.records,
+          additional_records: input.planning_context_records,
+        }),
+        checkpoints: [input.source.candidate_checkpoint, ...currentAncestry],
       },
     },
   });
@@ -778,8 +871,11 @@ export function createBlockingReviewRemediationAttempt(input: {
     action_inputs: {
       task_prompt: input.task_prompt,
       context: {
-        records: [input.decision, input.result, ...runtimeDeliveries]
-          .sort((left, right) => compareCodeUnits(left.id, right.id)),
+        records: mergeCausalGithubPushContext({
+          pipeline_run_id: input.pipeline_run_id,
+          base_records: [input.decision, input.result, ...runtimeDeliveries],
+          inherited_records: input.runtime_delivery_records,
+        }),
         checkpoints,
       },
     },

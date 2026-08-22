@@ -511,6 +511,7 @@ function acceptedIntegrationEvidence(memberId = "unit-a", index = 0): Structured
     input_subject: SOURCE,
     task_prompt: `Integrate ${memberId}.`,
     source,
+    current_ancestry_checkpoints: [],
     bundle,
     manifest,
   });
@@ -698,6 +699,36 @@ function runtimeStartDelivery(): DeliveryRecord {
         result: { sandbox_id: "sandbox-1", resource_state: "started" },
       },
     },
+  };
+}
+
+function githubPushDelivery(id: string, sha: string, refMode: "create" | "update"): DeliveryRecord {
+  const repository = "owner/repo";
+  const ref = "refs/heads/ot/run-1";
+  return {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id,
+    kind: "delivery",
+    pipeline_run_id: "run-1",
+    effect_id: `effect-${id}`,
+    idempotency_key: `run-1:${id}`,
+    external_identity: `github:${repository}:${ref}`,
+    status: "confirmed",
+    payload_schema: "openthrottle.effect-delivery/v1",
+    payload: {
+      inline: {
+        effect_kind: "github/push-checkpoint@1",
+        provider: "github",
+        result: {
+          schema: "openthrottle.github-push-delivery/v1",
+          repository,
+          ref,
+          sha,
+          ref_mode: refMode,
+        },
+      },
+    },
+    created_at: NOW,
   };
 }
 
@@ -947,6 +978,7 @@ describe("structured kernel coordinator", () => {
       input_subject: CURRENT_SUBJECT,
       task_prompt: "Integrate unit A.",
       source,
+      current_ancestry_checkpoints: [],
       bundle,
       manifest,
     });
@@ -971,8 +1003,107 @@ describe("structured kernel coordinator", () => {
         ...source,
         candidate_checkpoint: { ...source.candidate_checkpoint, output_subject: CURRENT_SUBJECT },
       },
+      current_ancestry_checkpoints: [],
       bundle, manifest,
     })).toThrow(/exact edited candidate checkpoint/i);
+  });
+
+  it("carries one exact gap-free current ancestry chain beside the candidate checkpoint", () => {
+    const { bundle, manifest } = definitions();
+    const accepted = acceptedUnitEvidence();
+    const candidate = { ...accepted.candidate_checkpoint, input_subject: SOURCE };
+    const source: StructuredAcceptedUnitEvidence = {
+      ...accepted,
+      candidate_checkpoint: candidate,
+      acceptance: {
+        ...accepted.acceptance,
+        action_inputs: {
+          ...accepted.acceptance.action_inputs,
+          context: {
+            ...accepted.acceptance.action_inputs.context,
+            checkpoints: [candidate],
+          },
+        },
+      },
+    };
+    const first = acceptedIntegrationEvidence("unit-b", 1).checkpoint;
+    const finalSubject = "4".repeat(40);
+    const second: AttemptCheckpoint = {
+      ...first,
+      id: "checkpoint-integration-unit-c",
+      attempt_id: "attempt-integration-unit-c",
+      request_hash: "e".repeat(64),
+      input_subject: CURRENT_SUBJECT,
+      output_subject: finalSubject,
+    };
+    const create = (currentAncestryCheckpoints: readonly AttemptCheckpoint[]) =>
+      createStructuredIntegrationAttempt({
+        pipeline_run_id: "run-1",
+        parent_attempt_id: "parent",
+        member_id: "unit-a",
+        round: 2,
+        stage_id: "integration",
+        input_subject: finalSubject,
+        task_prompt: "Integrate stale unit A.",
+        source,
+        current_ancestry_checkpoints: currentAncestryCheckpoints,
+        bundle,
+        manifest,
+      });
+
+    expect(create([first, second]).context_checkpoint_ids).toEqual([
+      candidate.id,
+      first.id,
+      second.id,
+    ].sort());
+    expect(() => create([second])).toThrow(/ancestry.*gap|gap.*ancestry/i);
+    expect(() => create([first, { ...second, id: "checkpoint-extra", input_subject: SOURCE }]))
+      .toThrow(/ancestry.*gap|gap.*ancestry|fork/i);
+  });
+
+  it("preserves or replaces exactly one causal task-ref push when creating integration", () => {
+    const { bundle, manifest } = definitions();
+    const inherited = githubPushDelivery("delivery-push-d1", "1".repeat(40), "create");
+    const additional = githubPushDelivery("delivery-push-d2", "2".repeat(40), "update");
+    const source = acceptedUnitEvidence();
+    const records = [...source.acceptance.action_inputs.context.records, inherited]
+      .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+    const sourceWithPush: StructuredAcceptedUnitEvidence = {
+      ...source,
+      acceptance: {
+        ...source.acceptance,
+        attempt: {
+          ...source.acceptance.attempt,
+          context_record_ids: records.map(({ id }) => id),
+        },
+        action_inputs: {
+          ...source.acceptance.action_inputs,
+          context: {
+            ...source.acceptance.action_inputs.context,
+            records,
+          },
+        },
+      },
+    };
+    const create = (planningContextRecords?: readonly ExecutionRecord[]) =>
+      createStructuredIntegrationAttempt({
+        pipeline_run_id: "run-1",
+        parent_attempt_id: "parent",
+        member_id: "unit-a",
+        round: 0,
+        stage_id: "integration",
+        input_subject: CURRENT_SUBJECT,
+        task_prompt: "Integrate unit A.",
+        source: sourceWithPush,
+        current_ancestry_checkpoints: [],
+        planning_context_records: planningContextRecords,
+        bundle,
+        manifest,
+      });
+
+    expect(create().context_record_ids).toContain(inherited.id);
+    expect(create([additional]).context_record_ids).toEqual(expect.arrayContaining([additional.id]));
+    expect(create([additional]).context_record_ids).not.toContain(inherited.id);
   });
 
   it("creates a durable loop-scoped integration effect from the shipped structured bundle", () => {
@@ -992,6 +1123,7 @@ describe("structured kernel coordinator", () => {
       input_subject: CURRENT_SUBJECT,
       task_prompt: "Integrate unit A through the executor-owned effect adapter.",
       source,
+      current_ancestry_checkpoints: [],
       bundle,
       manifest,
     });
@@ -1079,13 +1211,37 @@ describe("structured kernel coordinator", () => {
     })).toThrow(/blocking review DecisionRecord/);
   });
 
+  it("preserves the causal task-ref push in blocking review remediation", () => {
+    const { bundle, manifest } = definitions();
+    const push = githubPushDelivery("delivery-push-d1", "1".repeat(40), "create");
+    const review = reviewEvidence();
+    const runtimeDeliveryRecords = [runtimeCreateDelivery(), runtimeStartDelivery(), push];
+    const remediation = createBlockingReviewRemediationAttempt({
+      pipeline_run_id: "run-1",
+      stage_id: "remediation",
+      round: 0,
+      input_subject: CURRENT_SUBJECT,
+      task_prompt: "Resolve the blocking finding without losing publication ancestry.",
+      ...review,
+      attempt: {
+        ...review.attempt,
+        context_record_ids: runtimeDeliveryRecords.map(({ id }) => id).sort(),
+      },
+      runtime_delivery_records: runtimeDeliveryRecords,
+      bundle,
+      manifest,
+    });
+
+    expect(remediation.context_record_ids).toContain(push.id);
+  });
+
   it("resolves exactly the context IDs persisted on the attempt and rejects widening", async () => {
     const { bundle, manifest } = definitions();
     const source = acceptedUnitEvidence();
     const attempt = createStructuredIntegrationAttempt({
       pipeline_run_id: "run-1", parent_attempt_id: "parent", member_id: "unit-a", round: 0,
       stage_id: "integration", input_subject: CURRENT_SUBJECT, task_prompt: "Integrate.",
-      source, bundle, manifest,
+      source, current_ancestry_checkpoints: [], bundle, manifest,
     });
     const calls: unknown[] = [];
     const exact: KernelContextPort = {

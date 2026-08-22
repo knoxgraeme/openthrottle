@@ -23,6 +23,45 @@ import {
   runtimeCleanupOutcome,
   runtimeExhaustionDestination,
 } from "./runtime-lifecycle.js";
+import {
+  exactConfirmedGithubPushDelivery,
+  isGithubPushDelivery,
+} from "./github-push-delivery.js";
+
+export function mergeCausalGithubPushContext(input: {
+  pipeline_run_id: string;
+  base_records: readonly ExecutionRecord[];
+  inherited_records: readonly ExecutionRecord[];
+  additional_records?: readonly ExecutionRecord[];
+}): ExecutionRecord[] {
+  const additional = input.additional_records ?? [];
+  const override = exactConfirmedGithubPushDelivery({
+    // A rejected publication is causal failure evidence, not a reusable
+    // publication anchor. The settlement DecisionRecord already cites it;
+    // successor context retains only the last exact confirmed push.
+    records: additional.filter((record) =>
+      isGithubPushDelivery(record) && record.status === "confirmed"
+    ),
+    label: "additional context",
+    pipeline_run_id: input.pipeline_run_id,
+  });
+  const inherited = override === null
+    ? exactConfirmedGithubPushDelivery({
+      records: input.inherited_records.filter((record) =>
+        isGithubPushDelivery(record) && record.status === "confirmed"
+      ),
+      label: "inherited context",
+      pipeline_run_id: input.pipeline_run_id,
+    })
+    : null;
+  const selected = override ?? inherited;
+  return [...new Map([
+    ...input.base_records.filter((record) => !isGithubPushDelivery(record)),
+    ...additional.filter((record) => !isGithubPushDelivery(record)),
+    ...(selected === null ? [] : [selected.record]),
+  ].map((record) => [record.id, record])).values()]
+    .sort((left, right) => compareCodeUnits(left.id, right.id));
+}
 
 export function kernelSuccessorStageId(input: {
   manifest: CompiledPipelineManifest;
@@ -67,14 +106,12 @@ export function deriveKernelSuccessorAttempt(input: {
   const runtimeResourceRecords = exactKernelRuntimeResourceDeliveries(
     [...input.request_inputs.context.records.values()],
   ) ?? [];
-  const records: ExecutionRecord[] = [
-    input.result,
-    input.decision,
-    ...runtimeResourceRecords,
-    ...(input.additional_context_records ?? []),
-  ];
-  const uniqueRecords = [...new Map(records.map((record) => [record.id, record])).values()]
-    .sort((left, right) => compareCodeUnits(left.id, right.id));
+  const uniqueRecords = mergeCausalGithubPushContext({
+    pipeline_run_id: input.view.run.id,
+    base_records: [input.result, input.decision, ...runtimeResourceRecords],
+    inherited_records: [...input.request_inputs.context.records.values()],
+    additional_records: input.additional_context_records,
+  });
   const checkpoints = [
     ...(input.checkpoint_override ?? input.request_inputs.context.checkpoints.values()),
   ]

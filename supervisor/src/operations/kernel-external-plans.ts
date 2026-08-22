@@ -104,8 +104,11 @@ export interface KernelExternalStagePlanRegistry {
 export const CORE_EXTERNAL_PLAN_SHAPES = Object.freeze({
   "core/publish@1": {
     stage_kind: "effect",
-    subject_policy: "preserve",
+    subject_policy: "advance",
     phases: [
+      { id: "integrate-checkpoint", effects: [
+        { effect_kind: "daytona/integrate-checkpoint@1", operation: "mutation" },
+      ] },
       { id: "push-checkpoint", effects: [
         { effect_kind: "github/push-checkpoint@1", operation: "mutation" },
       ] },

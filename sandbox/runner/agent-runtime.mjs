@@ -464,8 +464,6 @@ export function prepareResultCorrectionRuntime({
       "--ask-for-approval", "never",
       "exec", "--json", "--output-schema", channel.provider_schema_path,
       "--disable", "shell_tool", "--disable", "unified_exec", "--disable", "shell_snapshot",
-      "--disable", "apps", "--disable", "browser_use", "--disable", "in_app_browser",
-      "--disable", "multi_agent",
       ...inspectPolicyArgs("codex", cwd, { ephemeral: false }),
       "--skip-git-repo-check", "-C", cwd,
       ...(request.model ? ["-m", request.model] : []),

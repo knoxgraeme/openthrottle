@@ -26,6 +26,7 @@ const DEFINITION_BLOB_CONCURRENCY = 8;
 interface GithubPullRequest {
   number: number;
   html_url: string;
+  title: string;
   body?: string | null;
   head: { ref: string; sha?: string; repo: { full_name: string } };
   base: { ref: string };
@@ -288,6 +289,7 @@ export async function publishRepositoryTaskBranch(
   }
   const [owner] = input.repository.split("/");
   if (!owner) throw new Error("GitHub publication repository is invalid");
+  const canonicalBody = `${input.body.trimEnd()}\n\n<!-- ${input.ownershipMarker} -->\n`;
   const query = new URLSearchParams({
     state: "open",
     head: `${owner}:${input.branch}`,
@@ -311,7 +313,8 @@ export async function publishRepositoryTaskBranch(
     if (!existing) return undefined;
     if (
       existing.head.sha !== input.expectedHeadSha ||
-      !existing.body?.includes(input.ownershipMarker)
+      existing.title !== input.title ||
+      existing.body !== canonicalBody
     ) {
       throw new RepositoryRefConflictError(
         "an unowned or stale pull request already targets the task branch",
@@ -327,7 +330,7 @@ export async function publishRepositoryTaskBranch(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       title: input.title,
-      body: `${input.body.trimEnd()}\n\n<!-- ${input.ownershipMarker} -->\n`,
+      body: canonicalBody,
       head: input.branch,
       base: input.baseBranch,
     }),
@@ -346,7 +349,7 @@ export async function publishRepositoryTaskBranch(
     created.head.ref !== input.branch ||
     created.base.ref !== input.baseBranch ||
     created.head.repo.full_name.toLowerCase() !== input.repository.toLowerCase() ||
-    !created.body?.includes(input.ownershipMarker)
+    created.title !== input.title || created.body !== canonicalBody
   ) {
     throw new Error("GitHub created a pull request with an unexpected publication fence");
   }

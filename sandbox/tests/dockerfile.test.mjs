@@ -31,18 +31,23 @@ describe("sandbox Dockerfile", () => {
     expect(dockerfile).toContain('org.opencontainers.image.licenses="MIT"');
   });
 
-  it("installs Bats for local shell runtime gates", () => {
+  it("installs Bats and the standard Linux sandbox runtime", () => {
     const dockerfile = readFileSync(resolve(repoRoot, "sandbox/Dockerfile"), "utf8");
 
     expect(dockerfile).toMatch(
       /apt-get install -y --no-install-recommends[\s\S]*?\bbats\b[\s\S]*?rm -rf \/var\/lib\/apt\/lists\/\*/,
+    );
+    expect(dockerfile).toMatch(
+      /apt-get install -y --no-install-recommends[\s\S]*?\bbubblewrap\b[\s\S]*?rm -rf \/var\/lib\/apt\/lists\/\*/,
     );
   });
 
   it("pins the Codex CLI release that supports the production model", () => {
     const dockerfile = readFileSync(resolve(repoRoot, "sandbox/Dockerfile"), "utf8");
 
-    expect(dockerfile).toContain("ARG CODEX_VERSION=0.144.0");
+    expect(dockerfile).toContain("ARG CODEX_VERSION=0.149.0");
+    expect(dockerfile).toContain('"@openai/codex@${CODEX_VERSION}"');
+    expect(dockerfile).toContain('test "$(codex --version)" = "codex-cli ${CODEX_VERSION}"');
   });
 
   it("ships one kernel executor and one unprivileged agent principal", () => {

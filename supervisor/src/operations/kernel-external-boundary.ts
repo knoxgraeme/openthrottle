@@ -413,6 +413,7 @@ export class KernelExternalBoundaryCoordinator {
     ) throw new Error("prepared external plan changed its durable subject boundary");
 
     const schedules: ExternalScheduleView[] = [];
+    let stoppedOnRejectedDelivery = false;
     for (let phaseIndex = 0; phaseIndex < prepared.phases.length; phaseIndex += 1) {
       const phase = prepared.phases[phaseIndex]!;
       const existing = await this.#store.findExternalSchedule({
@@ -498,6 +499,10 @@ export class KernelExternalBoundaryCoordinator {
           phase: phase.id,
         };
       }
+      if (existing.effects.some(({ delivery }) => delivery?.status === "rejected")) {
+        stoppedOnRejectedDelivery = true;
+        break;
+      }
       if (binding.subject_policy === "advance" && prepared.verified_output_subject === null) {
         if (!binding.promote) {
           throw new Error(`advancing external plan ${binding.external_kind} has no promotion hook`);
@@ -535,7 +540,7 @@ export class KernelExternalBoundaryCoordinator {
             ...exact,
             checkpoints: mapWith(exact.checkpoints, [promotion.checkpoint]),
           }, {
-            type: "advance_external_integration",
+            type: "advance_external_subject",
             command_id: transitionId("external-integration-advance", {
               attempt_id: attempt.id,
               delivery_record_id: delivery.id,
@@ -564,7 +569,10 @@ export class KernelExternalBoundaryCoordinator {
       }
     }
 
-    if (binding.subject_policy === "advance" && prepared.verified_output_subject === null) {
+    if (
+      !stoppedOnRejectedDelivery &&
+      binding.subject_policy === "advance" && prepared.verified_output_subject === null
+    ) {
       throw new Error(`advancing external plan ${binding.external_kind} produced no verified subject`);
     }
 
