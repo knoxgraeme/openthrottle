@@ -12,34 +12,29 @@ result:
   payload:
     summary:
       type: string
-      required: true
       max_length: 4000
       normalize: string-array-to-newlines/v1
     assumptions:
       type: string_list
-      required: true
       max_length: 1000
       max_items: 32
     decisions:
       type: string_list
-      required: true
       max_length: 1000
       max_items: 32
     issues:
       type: string_list
-      required: true
       max_length: 1000
       max_items: 32
     verification:
       type: string_list
-      required: true
       max_length: 1000
       max_items: 32
     downstream_context:
-      type: json
-      required: true
+      type: string_list
+      max_length: 1000
+      max_items: 32
     requested_human_input:
       type: string_list
-      required: true
       max_length: 1000
       max_items: 16

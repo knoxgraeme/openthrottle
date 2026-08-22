@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalJson, digest } from "./kernel-json.mjs";
 import {
+  ACTION_EXECUTOR_CONTEXT_MAX_BYTES,
+  ACTION_TASK_PROMPT_MAX_BYTES,
   compileActionProfile,
   materializeActionProfile,
 } from "./action-profile.mjs";
@@ -166,6 +168,37 @@ describe("sealed action profiles", () => {
       platformFence: "Fence.",
       definitionEntries: [],
     }), /entrySkill must be present in the skill allowlist/);
+  });
+
+  it("bounds executor context separately from a maximum-sized sealed task", () => {
+    const profileRoot = mkdtempSync(join(tmpdir(), "ot-action-profile-boundary-"));
+    directories.push(profileRoot);
+    const taskPrompt = "x".repeat(ACTION_TASK_PROMPT_MAX_BYTES);
+    const executorContext = "Read the exact executor-owned action context artifact.";
+    const profile = compileActionProfile({
+      engine: "codex",
+      agentId: "core/reviewer",
+      repositoryAuthority: "inspect",
+      skillIds: [],
+      taskPrompt,
+      executorContext,
+      platformFence: "PLATFORM FENCE",
+      definitionEntries: [agentEntry("core/reviewer", "ROLE INSTRUCTIONS")],
+    });
+    const materialized = materializeActionProfile({ profile, profileRoot });
+
+    assert.equal(profile.task_prompt.length, ACTION_TASK_PROMPT_MAX_BYTES);
+    assert.match(materialized.prompt, /Read the exact executor-owned action context artifact\.$/);
+    assert.throws(() => compileActionProfile({
+      engine: "codex",
+      agentId: "core/reviewer",
+      repositoryAuthority: "inspect",
+      skillIds: [],
+      taskPrompt: "Task.",
+      executorContext: "y".repeat(ACTION_EXECUTOR_CONTEXT_MAX_BYTES + 1),
+      platformFence: "PLATFORM FENCE",
+      definitionEntries: [agentEntry("core/reviewer", "ROLE INSTRUCTIONS")],
+    }), /executor context is invalid/);
   });
 });
 

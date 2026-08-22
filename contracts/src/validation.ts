@@ -213,11 +213,14 @@ export function parseIdentifierList(
   }, options), path);
 }
 
-export function parsePlanCommand(value: unknown, path: string): { name: string; unit?: string } {
+export function parsePlanCommand(value: unknown, path: string): { name: string; unit: string | null } {
   const input = objectAt(value, path, ["name", "unit"]);
+  if (input.unit === undefined) fail(`${path}.unit`, "is required");
   return {
     name: stringAt(input.name, `${path}.name`, { max: 80, pattern: COMMAND_NAME_PATTERN }),
-    ...(input.unit === undefined ? {} : { unit: stringAt(input.unit, `${path}.unit`, { pattern: IDENTIFIER }) }),
+    unit: input.unit === null
+      ? null
+      : stringAt(input.unit, `${path}.unit`, { pattern: IDENTIFIER }),
   };
 }
 

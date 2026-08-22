@@ -140,9 +140,19 @@ closed and validated before admission.
 - a runtime-registered deterministic evaluator;
 - one `openthrottle.semantic-result-schema/v1`;
 - a closed outcome set;
-- at most 64 bounded payload fields of type `string`, `string_list`, `boolean`,
-  `integer`, or `json`;
+- at most 64 required bounded payload fields of type `string`, `string_list`,
+  `review_finding_list_v1`, `boolean`, `integer`, or `execution_plan_v2`;
 - explicitly allowed normalizations.
+
+`review_finding_list_v1` has an eval-declared `max_items` and closed items with
+exactly `severity`, `path`, `anchor`, `title`, and `evidence`. Severity is one
+of `P0`, `P1`, `P2`, or `P3`; every string is nonempty and bounded. Generic
+untyped JSON is not a semantic field type.
+
+`core/review-result` does not expose `semantic_repair_required` as an
+agent-selectable outcome. `core/review-outcome@1` alone derives that pipeline
+transition when at least one `P0` or `P1` finding is present. `P2` and `P3`
+findings cannot authorize remediation.
 
 Eval files are declarative. They do not load executable code from a repository.
 The release must already implement the named evaluator and normalization.
@@ -198,6 +208,8 @@ For structured work, the sealed task prompt contains exactly one validated
 pipeline. Units have stable IDs, bounded dependencies, file/scope hints,
 acceptance criteria, and verification obligations. Cycles, missing
 dependencies, another pipeline ID, or more than the runtime bound are rejected.
+Each command has a required name and nullable unit scope; `null` denotes a
+whole-plan command.
 
 All fallible source reading, compilation, bundle verification, and runtime
 compatibility checks happen before the atomic admission transaction. Admission
@@ -363,9 +375,10 @@ An agent submits only:
 }
 ```
 
-The candidate and any JSON field are bounded to 64 KiB canonical bytes. The
-outcome and payload fields must exactly match the sealed eval. Unknown fields,
-types, outcomes, or oversized values are diagnostics, not partial success.
+The complete candidate is bounded to 64 KiB canonical bytes. Every payload
+field named by the sealed eval is required, and the outcome and payload must
+exactly match that eval. Unknown or absent fields, invalid types or outcomes,
+and oversized values are diagnostics, not partial success.
 
 The only initial normalization is `string-array-to-newlines/v1`. When declared
 for a string field, a nonempty bounded array of strings is joined with `\n`.

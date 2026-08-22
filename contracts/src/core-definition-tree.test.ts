@@ -248,6 +248,9 @@ describe("root .openthrottle definition tree", () => {
         const evaluation = evalEntries.get(stage.eval);
         expect(evaluation, `${stage.id} eval ${stage.eval}`).toBeDefined();
         const outcomes = new Set((evaluation!.result as { outcomes: string[] }).outcomes);
+        if (evaluation!.evaluator === "core/review-outcome@1") {
+          outcomes.add("semantic_repair_required");
+        }
         expect([...Object.keys(stage.on)].sort(), `${stage.id} outcomes`)
           .toEqual([...outcomes].sort());
       }
@@ -288,6 +291,15 @@ describe("root .openthrottle definition tree", () => {
         ["core/review-result", "core/review-outcome@1"],
         ["core/unit-result", "core/unit-outcome@1"],
       ]);
+    expect((evals.get("core/review-result")!.result as { outcomes: string[] }).outcomes)
+      .not.toContain("semantic_repair_required");
+    for (const result of results) {
+      for (const stage of result.manifest.value.stages) {
+        if (stage.kind === "agent" && stage.eval === "core/review-result") {
+          expect(stage.on).toHaveProperty("semantic_repair_required");
+        }
+      }
+    }
 
     expect(agentBindings(results[0]!)).toEqual([
       ["implement", "core/ordinary-worker", "edit"],

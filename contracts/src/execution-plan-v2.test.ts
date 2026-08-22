@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { canonicalJson } from "./canonical.js";
 import {
@@ -23,7 +24,7 @@ function planAtCanonicalSize(targetBytes: number): ExecutionPlanContractV2 {
       acceptance: ["It works."],
       verification: ["npm test"],
     })),
-    commands: [{ name: "test" }],
+    commands: [{ name: "test", unit: null }],
   };
 
   let unit = 0;
@@ -79,11 +80,22 @@ describe("execution plan v2 identity", () => {
       acceptance: ["The change works."],
       verification: ["npm test"],
     }],
-    commands: [{ name: "test" }],
+    commands: [{ name: "test", unit: null }],
   });
 
   it("accepts a generic pipeline identifier", () => {
-    expect(validateExecutionPlanContractV2(validPlan()).value.pipeline_id).toBe("repo/custom");
+    const plan = validateExecutionPlanContractV2(validPlan()).value;
+    expect(plan.pipeline_id).toBe("repo/custom");
+    expect(plan.commands).toEqual([{ name: "test", unit: null }]);
+  });
+
+  it("requires every command to declare its nullable unit scope", () => {
+    const plan = validPlan() as { commands: Array<Record<string, unknown>> };
+    delete plan.commands[0]!.unit;
+
+    expect(() => validateExecutionPlanContractV2(plan)).toThrow(
+      "execution_plan.commands[0].unit: is required",
+    );
   });
 
   it("rejects the legacy graph_id field without an alias", () => {
@@ -92,5 +104,19 @@ describe("execution plan v2 identity", () => {
     plan.graph_id = "structured";
 
     expect(() => validateExecutionPlanContractV2(plan)).toThrow("execution_plan.graph_id: unknown field");
+  });
+});
+
+describe("planning skill execution plan reference", () => {
+  it("keeps its embedded JSON example valid against the canonical contract", () => {
+    const reference = readFileSync(new URL(
+      "../../skills/planning/prepare-execution-plan/references/execution-plan.md",
+      import.meta.url,
+    ), "utf8");
+    const block = /```json\n([\s\S]*?)\n```/.exec(reference);
+    expect(block, "execution plan reference must contain a JSON example").not.toBeNull();
+
+    const plan = validateExecutionPlanContractV2(JSON.parse(block![1]!)).value;
+    expect(plan.commands.at(-1)).toEqual({ name: "build", unit: null });
   });
 });

@@ -7,15 +7,13 @@ result:
   outcomes:
     - success
     - no_change
-    - semantic_repair_required
     - needs_human
     - failure
   payload:
     summary:
       type: string
-      required: true
       max_length: 4000
       normalize: string-array-to-newlines/v1
     findings:
-      type: json
-      required: true
+      type: review_finding_list_v1
+      max_items: 64

@@ -59,7 +59,7 @@
     }
   ],
   "commands": [
-    { "name": "docs-check" },
+    { "name": "docs-check", "unit": null },
     { "name": "build", "unit": "contracts" }
   ]
 }

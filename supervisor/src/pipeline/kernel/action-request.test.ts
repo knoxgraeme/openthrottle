@@ -40,7 +40,7 @@ function definitions(): { bundle: DefinitionBundle; manifest: CompiledPipelineMa
       id: "core/action-result",
       outcomes: ["success"],
       payload: {
-        summary: { type: "string", required: true, max_length: 1_000 },
+        summary: { type: "string", max_length: 1_000 },
       },
     },
   };

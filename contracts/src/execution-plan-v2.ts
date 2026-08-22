@@ -16,7 +16,7 @@ export const EXECUTION_PLAN_V2_MAX_BYTES = 256 * 1024;
 
 export interface ExecutionPlanCommand {
   name: string;
-  unit?: string;
+  unit: string | null;
 }
 
 export interface ExecutionPlanUnitV2 {
@@ -78,7 +78,9 @@ function validatePlanV2(plan: ExecutionPlanContractV2, source: string): void {
     }
   }
   for (const command of plan.commands) {
-    if (command.unit && !units.has(command.unit)) fail(`${source}.commands.${command.name}.unit`, "references an unknown unit");
+    if (command.unit !== null && !units.has(command.unit)) {
+      fail(`${source}.commands.${command.name}.unit`, "references an unknown unit");
+    }
   }
   assertAcyclicDependencies(plan.units, `${source}.units`);
 }

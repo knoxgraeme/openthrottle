@@ -14,14 +14,11 @@ result:
   payload:
     summary:
       type: string
-      required: true
       max_length: 2000
       normalize: string-array-to-newlines/v1
     execution_plan:
       type: execution_plan_v2
-      required: true
     questions:
       type: string_list
-      required: true
       max_length: 1000
       max_items: 16

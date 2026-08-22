@@ -35,8 +35,9 @@ function validatePlanV2(plan, source) {
         }
     }
     for (const command of plan.commands) {
-        if (command.unit && !units.has(command.unit))
+        if (command.unit !== null && !units.has(command.unit)) {
             fail(`${source}.commands.${command.name}.unit`, "references an unknown unit");
+        }
     }
     assertAcyclicDependencies(plan.units, `${source}.units`);
 }

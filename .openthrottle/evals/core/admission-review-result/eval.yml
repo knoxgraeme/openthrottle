@@ -14,16 +14,13 @@ result:
   payload:
     summary:
       type: string
-      required: true
       max_length: 4000
       normalize: string-array-to-newlines/v1
     findings:
       type: string_list
-      required: true
       max_length: 2000
       max_items: 64
     questions:
       type: string_list
-      required: true
       max_length: 1000
       max_items: 16

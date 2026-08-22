@@ -57,3 +57,22 @@ For the full lens checklists, read `references/branch-review-passes.md`.
 - Severity: `P0` breaks the ticket's intent, loses data, or opens a security
   hole; `P1` must be fixed before merge; `P2` should be fixed; `P3` is
   advisory. Rank blocking findings first.
+
+## Semantic output
+
+Return `payload.findings` as an array of finding objects. Each object must have
+exactly these fields:
+
+- `severity`: `P0`, `P1`, `P2`, or `P3`;
+- `path`: the repository-relative file path;
+- `anchor`: the enclosing symbol or nearest stable anchor, never a line number;
+- `title`: a concise normalized defect title;
+- `evidence`: the concrete trigger, violated invariant, and observable impact.
+
+Use an empty array when there are no findings. Do not add `blocking`, `status`,
+fix instructions, or other fields; deterministic evaluation derives transition
+authority from the closed finding shape and severity.
+
+Never return `semantic_repair_required` yourself. Report `P0` and `P1` defects
+through the finding objects; the deterministic review evaluator alone derives
+the repair transition. `P2` and `P3` findings do not authorize remediation.

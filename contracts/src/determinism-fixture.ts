@@ -102,7 +102,6 @@ export const EXECUTION_KERNEL_DETERMINISM_FIXTURE = {
     payload: {
       summary: {
         type: "string",
-        required: true,
         max_length: 4_000,
         normalize: "string-array-to-newlines/v1",
       },

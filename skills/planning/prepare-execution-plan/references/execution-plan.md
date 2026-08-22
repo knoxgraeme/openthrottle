@@ -46,7 +46,7 @@ to fill every field below without guessing.
   ],
   "commands": [
     { "name": "test", "unit": "contracts" },
-    { "name": "build" }
+    { "name": "build", "unit": null }
   ]
 }
 ```
@@ -85,7 +85,8 @@ English the requirement, step, or check actually needs.
   `acceptance`, and `verification` arrays must be non-empty; each holds
   applicable text copied from the source, not a placeholder.
 - Command names must reference repository command names, not shell strings.
-- A command may name a unit only when the command is unit-scoped.
+- Every command must include `unit`. Use a unit ID for a unit-scoped command and
+  the explicit JSON value `null` for a whole-plan command; never omit the field.
 - Source headings and planning vocabulary are never parsed as runtime fields;
   only this fenced JSON contract is consumed by the structured pipeline.
 - Keep pipeline topology and units immutable after validation; proposed splits or

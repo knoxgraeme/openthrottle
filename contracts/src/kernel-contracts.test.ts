@@ -27,6 +27,7 @@ import {
   type ExecutionRecordPayloadContract,
   type ExecutionRecordPayloadRegistry,
   type ExecutionPlanContractV2,
+  type ReviewFindingV1,
 } from "./index.js";
 
 const sha = (character: string): string => character.repeat(64);
@@ -98,6 +99,24 @@ const executionPlanResultSchema = validateSemanticResultSchema({
   },
 }).value;
 
+const reviewResultSchema = validateSemanticResultSchema({
+  schema: SEMANTIC_RESULT_SCHEMA,
+  id: "review-result",
+  outcomes: ["success", "needs_human"],
+  payload: {
+    summary: { type: "string", max_length: 4_000 },
+    findings: { type: "review_finding_list_v1", max_items: 64 },
+  },
+}).value;
+
+const concreteReviewFinding = {
+  severity: "P1",
+  path: "contracts/src/result-candidate.ts",
+  anchor: "providerFieldSchema",
+  title: "Provider schema leaves a payload field unconstrained",
+  evidence: "The generated schema emits an empty object for the field.",
+} satisfies ReviewFindingV1;
+
 function naturalExecutionPlan(): ExecutionPlanContractV2 {
   return {
     schema: EXECUTION_PLAN_SCHEMA_V2,
@@ -131,6 +150,49 @@ function naturalExecutionPlan(): ExecutionPlanContractV2 {
     ],
     commands: [{ name: "test", unit: "implementation" }],
   };
+}
+
+function assertProviderSchemaCompatibility(value: unknown, path = "$"): void {
+  expect(value, `${path} must be a schema object`).toBeTypeOf("object");
+  expect(value, `${path} must be a schema object`).not.toBeNull();
+  expect(Array.isArray(value), `${path} must be a schema object`).toBe(false);
+  const schema = value as Record<string, unknown>;
+  expect(
+    typeof schema.type === "string" || Array.isArray(schema.anyOf) || typeof schema.$ref === "string",
+    `${path} must declare type, anyOf, or $ref`,
+  ).toBe(true);
+  expect(schema, `${path} uses unsupported uniqueItems`).not.toHaveProperty("uniqueItems");
+  if (Object.hasOwn(schema, "const")) {
+    const expectedType = schema.const === null
+      ? "null"
+      : Array.isArray(schema.const)
+        ? "array"
+        : typeof schema.const;
+    expect(schema.type, `${path}.type for const`).toBe(expectedType);
+  }
+  if (schema.type === "object") {
+    expect(schema.additionalProperties, `${path}.additionalProperties`).toBe(false);
+    expect(schema.properties, `${path}.properties`).toBeTypeOf("object");
+    expect(schema.required, `${path}.required`).toEqual(
+      Object.keys(schema.properties as Record<string, unknown>).sort(),
+    );
+  }
+  if (Array.isArray(schema.anyOf)) {
+    schema.anyOf.forEach((entry, index) => assertProviderSchemaCompatibility(entry, `${path}.anyOf[${index}]`));
+  }
+  if (schema.items !== undefined) {
+    assertProviderSchemaCompatibility(schema.items, `${path}.items`);
+  }
+  if (schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)) {
+    for (const [key, entry] of Object.entries(schema.properties)) {
+      assertProviderSchemaCompatibility(entry, `${path}.properties.${key}`);
+    }
+  }
+  if (schema.$defs && typeof schema.$defs === "object" && !Array.isArray(schema.$defs)) {
+    for (const [key, entry] of Object.entries(schema.$defs)) {
+      assertProviderSchemaCompatibility(entry, `${path}.$defs.${key}`);
+    }
+  }
 }
 
 describe("semantic result candidates", () => {
@@ -227,6 +289,7 @@ describe("semantic result candidates", () => {
 
   it("emits a closed provider schema from the same semantic contract", () => {
     const providerSchema = providerJsonSchemaForResultCandidate(unitResultSchema);
+    assertProviderSchemaCompatibility(providerSchema);
     expect(providerSchema).toMatchObject({
       additionalProperties: false,
       properties: {
@@ -251,6 +314,93 @@ describe("semantic result candidates", () => {
     });
   });
 
+  it("validates a closed bounded review-finding list", () => {
+    const result = validateAndNormalizeResultCandidate({
+      schema: RESULT_CANDIDATE_SCHEMA,
+      outcome: "success",
+      payload: {
+        summary: "One blocking finding.",
+        findings: [concreteReviewFinding],
+      },
+    }, reviewResultSchema);
+
+    expect(result.value.payload.findings).toEqual([concreteReviewFinding]);
+    expect(() => validateAndNormalizeResultCandidate({
+      schema: RESULT_CANDIDATE_SCHEMA,
+      outcome: "success",
+      payload: {
+        summary: "Malformed finding.",
+        findings: [{ ...concreteReviewFinding, blocking: true }],
+      },
+    }, reviewResultSchema)).toThrow(/payload\.findings\[0\]\.blocking: unknown field/);
+    expect(() => validateAndNormalizeResultCandidate({
+      schema: RESULT_CANDIDATE_SCHEMA,
+      outcome: "success",
+      payload: {
+        summary: "Malformed finding.",
+        findings: [{ ...concreteReviewFinding, severity: "critical" }],
+      },
+    }, reviewResultSchema)).toThrow(/severity: must be one of: P0, P1, P2, P3/);
+  });
+
+  it.each([
+    ["path", 513, 512],
+    ["anchor", 513, 512],
+    ["title", 301, 300],
+    ["evidence", 2_001, 2_000],
+  ] as const)("bounds review finding %s", (field, length, maximum) => {
+    expect(() => validateAndNormalizeResultCandidate({
+      schema: RESULT_CANDIDATE_SCHEMA,
+      outcome: "success",
+      payload: {
+        summary: "Oversized finding field.",
+        findings: [{ ...concreteReviewFinding, [field]: "x".repeat(length) }],
+      },
+    }, reviewResultSchema)).toThrow(
+      new RegExp(`payload\\.findings\\[0\\]\\.${field}: must be at most ${maximum} characters`),
+    );
+  });
+
+  it("enforces the eval-declared review finding count", () => {
+    expect(() => validateAndNormalizeResultCandidate({
+      schema: RESULT_CANDIDATE_SCHEMA,
+      outcome: "success",
+      payload: {
+        summary: "Too many findings.",
+        findings: Array.from({ length: 65 }, () => concreteReviewFinding),
+      },
+    }, reviewResultSchema)).toThrow(/payload\.findings: must contain between 0 and 64 entries/);
+  });
+
+  it("emits a typed closed provider schema for review findings", () => {
+    const providerSchema = providerJsonSchemaForResultCandidate(reviewResultSchema);
+    assertProviderSchemaCompatibility(providerSchema);
+    expect(providerSchema).toMatchObject({
+      properties: {
+        payload: {
+          properties: {
+            findings: {
+              type: "array",
+              maxItems: 64,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["anchor", "evidence", "path", "severity", "title"],
+                properties: {
+                  severity: { type: "string", enum: ["P0", "P1", "P2", "P3"] },
+                  path: { type: "string", maxLength: 512 },
+                  anchor: { type: "string", maxLength: 512 },
+                  title: { type: "string", maxLength: 300 },
+                  evidence: { type: "string", maxLength: 2_000 },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+  });
+
   it("rejects field options that have no meaning for their semantic type", () => {
     expect(() => validateSemanticResultSchema({
       schema: SEMANTIC_RESULT_SCHEMA,
@@ -264,6 +414,24 @@ describe("semantic result candidates", () => {
       outcomes: ["success"],
       payload: { count: { type: "integer", max_items: 2 } },
     })).toThrow(/max_items: is valid only for string_list/);
+    expect(() => validateSemanticResultSchema({
+      schema: SEMANTIC_RESULT_SCHEMA,
+      id: "invalid",
+      outcomes: ["success"],
+      payload: { summary: { type: "string", required: false, max_length: 100 } },
+    })).toThrow(/payload\.summary\.required: unknown field/);
+    expect(() => validateSemanticResultSchema({
+      schema: SEMANTIC_RESULT_SCHEMA,
+      id: "invalid",
+      outcomes: ["success"],
+      payload: { findings: { type: "review_finding_list_v1" } },
+    })).toThrow(/payload\.findings\.max_items: must be an integer/);
+    expect(() => validateSemanticResultSchema({
+      schema: SEMANTIC_RESULT_SCHEMA,
+      id: "invalid",
+      outcomes: ["success"],
+      payload: { data: { type: "json" } },
+    })).toThrow(/payload\.data\.type: must be one of/);
   });
 });
 
@@ -277,6 +445,35 @@ describe("execution_plan_v2 semantic result fields", () => {
     }, executionPlanResultSchema);
 
     expect(result.value.payload.execution_plan).toEqual(executionPlan);
+  });
+
+  it("preserves a provider-null command unit without recording a transformation", () => {
+    const executionPlan = naturalExecutionPlan() as unknown as Record<string, unknown>;
+    executionPlan.commands = [{ name: "test", unit: null }];
+    const result = validateAndNormalizeResultCandidate({
+      schema: RESULT_CANDIDATE_SCHEMA,
+      outcome: "structured",
+      payload: { execution_plan: executionPlan },
+    }, executionPlanResultSchema);
+
+    expect(result.value.payload.execution_plan).toMatchObject({
+      commands: [{ name: "test", unit: null }],
+    });
+    expect(result.original_hash).toBe(result.normalized_hash);
+    expect(result.transformations).toEqual([]);
+  });
+
+  it("retains semantic duplicate dependency rejection outside the provider schema", () => {
+    const executionPlan = naturalExecutionPlan();
+    executionPlan.units[1]!.depends_on = ["contract", "contract"];
+
+    expect(() => validateAndNormalizeResultCandidate({
+      schema: RESULT_CANDIDATE_SCHEMA,
+      outcome: "structured",
+      payload: { execution_plan: executionPlan },
+    }, executionPlanResultSchema)).toThrow(
+      /payload\.execution_plan\.units\[1\]\.depends_on: must not contain duplicates/,
+    );
   });
 
   it("reports the precise path for a malformed nested plan value", () => {
@@ -313,6 +510,8 @@ describe("execution_plan_v2 semantic result fields", () => {
       };
     };
     const planSchema = providerSchema.properties.payload.properties.execution_plan;
+
+    assertProviderSchemaCompatibility(providerSchema);
 
     expect(planSchema.anyOf.map(({ type }) => type)).toEqual(["null", "object"]);
     expect(planSchema.anyOf[1]).toMatchObject({

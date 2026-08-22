@@ -24,14 +24,24 @@ import {
   verifyInspectChangeArtifact,
 } from "./action-repository.mjs";
 import {
+  materializeActionContextArtifact,
+  verifyActionContextArtifact,
+} from "./action-context.mjs";
+import {
   prepareAgentRuntime,
   removeProgressiveSkills,
-  runPreparedAgent,
+  runPreparedAgent as runPreparedAgentRuntime,
   runResultCorrection,
 } from "./agent-runtime.mjs";
 import { createAttemptCheckpoint } from "./checkpoint-bundle.mjs";
 import { prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
-import { engineExitedCleanly } from "./launch-failure.mjs";
+import {
+  classifyLaunchFailure,
+  engineCredentialPresent,
+  engineExitedCleanly,
+  isUnregisteredCommandResult,
+  launchDiagnosticTail,
+} from "./launch-failure.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
 import {
   inspectResultSubmissionChannel,
@@ -50,6 +60,8 @@ const DEFAULT_ACTION_ROOT = "/var/lib/openthrottle/actions";
 const RESULT_CORRECTION_WINDOW_MS = 15 * 60 * 1000;
 const MAX_TRANSPORT_BYTES = 4 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS = 60 * 60 * 1_000;
+const MAX_WORK_FAILURE_REASON_CHARS = 1_500;
+const MAX_LAUNCH_DIAGNOSTIC_STREAM_LABEL_CHARS = "stderr: ".length + "stdout: ".length;
 
 function validateExecutionLimits(value, label, engine = null) {
   if (!value || typeof value !== "object" || Array.isArray(value) ||
@@ -281,6 +293,94 @@ function boundedCommandSummary(execution) {
   return (text || `command exited ${execution.status ?? "without status"}`).slice(-4_000);
 }
 
+function boundedAgentFailureReason(prefix, { stdout = "", stderr = "", env }) {
+  const diagnosticLabel = " Executor diagnostic: ";
+  // launchDiagnosticTail's max budgets stream content and separators; reserve
+  // the two stream labels it may add so the useful tail is not sliced later.
+  const diagnosticBudget = Math.max(
+    0,
+    MAX_WORK_FAILURE_REASON_CHARS - prefix.length - diagnosticLabel.length -
+      MAX_LAUNCH_DIAGNOSTIC_STREAM_LABEL_CHARS,
+  );
+  const diagnostic = launchDiagnosticTail({
+    stdout,
+    stderr,
+    env,
+    max: diagnosticBudget,
+  });
+  return `${prefix}${diagnostic ? `${diagnosticLabel}${diagnostic}` : ""}`
+    .slice(0, MAX_WORK_FAILURE_REASON_CHARS);
+}
+
+function agentLaunchFailure(request, execution, env) {
+  const classified = classifyLaunchFailure({
+    agent: request.action.engine,
+    stdout: execution.stdout,
+    stderr: execution.stderr,
+    credentialPresent: engineCredentialPresent(request.action.engine, env),
+  });
+  const termination = [
+    `status=${execution.status ?? "none"}`,
+    `signal=${execution.signal ?? "none"}`,
+    `timed_out=${Boolean(execution.timedOut)}`,
+  ].join(", ");
+  const prefix = [
+    `agent work failed (${termination}, reason=${classified.reason}).`,
+    classified.remediation,
+  ].filter(Boolean).join(" ");
+  return {
+    state: "work_failed",
+    retryable: Boolean(
+      classified.retryable || execution.timedOut || execution.signal || execution.error || execution.status === 137
+    ),
+    reason: boundedAgentFailureReason(prefix, {
+      stdout: execution.stdout,
+      stderr: [
+        execution.stderr,
+        execution.error instanceof Error ? execution.error.message : execution.error,
+      ].filter(Boolean).join("\n"),
+      env,
+    }),
+  };
+}
+
+function agentExecutorException(error, env, phase, retryable) {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    state: "work_failed",
+    retryable,
+    reason: boundedAgentFailureReason(
+      `agent work ${phase} failed (reason=executor_${phase}_failure).`,
+      {
+        stdout: typeof error?.engineStdout === "string" ? error.engineStdout : "",
+        stderr: [
+          typeof error?.engineStderr === "string" ? error.engineStderr : "",
+          message,
+        ].filter(Boolean).join("\n"),
+        env,
+      },
+    ),
+  };
+}
+
+function agentPreparationException(error, env) {
+  return agentExecutorException(
+    error,
+    env,
+    "preparation",
+    Boolean(error?.retryableInfrastructureFailure),
+  );
+}
+
+function agentLaunchException(error, env) {
+  return agentExecutorException(error, env, "launch", true);
+}
+
+function agentPreparedRuntimeException(error, env) {
+  const retryable = Boolean(error?.retryableInfrastructureFailure);
+  return agentExecutorException(error, env, retryable ? "launch" : "runtime", retryable);
+}
+
 function defaultCommandRunner({ commandLine, repositoryPath, timeoutMs }) {
   const safeEnv = Object.fromEntries(["PATH", "LANG", "LC_ALL", "TZ"].flatMap((name) =>
     process.env[name] ? [[name, process.env[name]]] : []));
@@ -426,7 +526,27 @@ async function executeAgentWork(options, actionDirectory) {
         destination: join(actionDirectory, "inspect-context", "change.json"),
       })
       : null;
+    let actionContextArtifact;
+    try {
+      actionContextArtifact = materializeActionContextArtifact({
+        request,
+        actionDirectory,
+        destination: join(actionDirectory, "action-context", "context.json"),
+      });
+    } catch (error) {
+      return runtimeEnvelope(request, {
+        state: "needs_human",
+        reason: "required semantic action context could not be materialized",
+        checkpoint: null,
+        candidate_hash: null,
+        diagnostics: [{
+          path: "context",
+          detail: error instanceof Error ? error.message : String(error),
+        }],
+      });
+    }
     repository.inspect_change_artifact = inspectChangeArtifact;
+    repository.action_context_artifact = actionContextArtifact;
     writeImmutableJson(repositoryViewPath, repository, "repository view");
     const candidateDirectory = join(actionDirectory, "semantic-result");
     prepareAgentOwnedDirectory(candidateDirectory);
@@ -439,6 +559,7 @@ async function executeAgentWork(options, actionDirectory) {
       ...request,
       repository_path: repository.destination,
       inspect_change_artifact: inspectChangeArtifact,
+      action_context_artifact: actionContextArtifact,
     };
     const observedSessions = [];
     const onSession = async (nativeSessionId) => {
@@ -459,32 +580,42 @@ async function executeAgentWork(options, actionDirectory) {
       );
     };
     if (options.runAgent) {
-      execution = await options.runAgent({
-        request: runtimeRequest,
-        phase: "work",
-        repositoryPath: repository.destination,
-        channel,
-        onSession,
-        timeoutMs: timeoutMilliseconds(request.action.execution_limits),
-      });
+      try {
+        execution = await options.runAgent({
+          request: runtimeRequest,
+          phase: "work",
+          repositoryPath: repository.destination,
+          channel,
+          onSession,
+          timeoutMs: timeoutMilliseconds(request.action.execution_limits),
+          env: options.env,
+        });
+      } catch (error) {
+        return runtimeEnvelope(request, agentLaunchException(error, options.env));
+      }
     } else {
-      prepared = prepareAgentRuntime({ request: runtimeRequest, actionDirectory, channel });
-      execution = await runPreparedAgent({
-        prepared,
-        request: runtimeRequest,
-        channel,
-        onSession,
-        timeoutMs: timeoutMilliseconds(request.action.execution_limits),
-      });
+      try {
+        prepared = prepareAgentRuntime({ request: runtimeRequest, actionDirectory, channel, env: options.env });
+      } catch (error) {
+        return runtimeEnvelope(request, agentPreparationException(error, options.env));
+      }
+      try {
+        execution = await options.runPreparedAgent({
+          prepared,
+          request: runtimeRequest,
+          channel,
+          onSession,
+          timeoutMs: timeoutMilliseconds(request.action.execution_limits),
+        });
+      } catch (error) {
+        return runtimeEnvelope(request, agentPreparedRuntimeException(error, options.env));
+      }
     }
     if (execution.nativeSessionId && observedSessions.length === 0) await onSession(execution.nativeSessionId);
     if (inspectChangeArtifact !== null) verifyInspectChangeArtifact(inspectChangeArtifact);
-    if (!engineExitedCleanly(execution)) {
-      return runtimeEnvelope(request, {
-        state: "work_failed",
-        retryable: Boolean(execution.timedOut || execution.error),
-        reason: "agent work did not exit cleanly",
-      });
+    verifyActionContextArtifact(actionContextArtifact);
+    if (!engineExitedCleanly(execution) || execution.error || isUnregisteredCommandResult(execution.stdout)) {
+      return runtimeEnvelope(request, agentLaunchFailure(request, execution, options.env));
     }
     if (!observedSessions[0]) {
       return runtimeEnvelope(request, {
@@ -511,6 +642,7 @@ async function executeAgentWork(options, actionDirectory) {
   if (repository.inspect_change_artifact !== null && repository.inspect_change_artifact !== undefined) {
     verifyInspectChangeArtifact(repository.inspect_change_artifact);
   }
+  verifyActionContextArtifact(repository.action_context_artifact);
   const channel = materializeResultSubmissionChannel({
     actionDirectory,
     candidateDirectory,
@@ -683,8 +815,10 @@ export async function executeAttempt({
   resultPath,
   sessionPath,
   runAgent = null,
+  runPreparedAgent: runPreparedAgentOverride = runPreparedAgentRuntime,
   runCommand = null,
   now = () => new Date(),
+  env = process.env,
 }) {
   validateKernelRequest(request);
   if (typeof resultPath !== "string" || !resultPath.startsWith("/")) throw new Error("result path must be absolute");
@@ -698,7 +832,16 @@ export async function executeAttempt({
       ? await executeCorrection({ request, sourceRepoDir, resultPath, sessionPath, runAgent, now }, actionDirectory)
       : request.action.kind === "command"
         ? await executeCommandWork({ request, sourceRepoDir, resultPath, sessionPath, runCommand, now }, actionDirectory)
-        : await executeAgentWork({ request, sourceRepoDir, resultPath, sessionPath, runAgent, now }, actionDirectory);
+        : await executeAgentWork({
+          request,
+          sourceRepoDir,
+          resultPath,
+          sessionPath,
+          runAgent,
+          runPreparedAgent: runPreparedAgentOverride,
+          now,
+          env,
+        }, actionDirectory);
   } catch (error) {
     envelope = runtimeEnvelope(request, request.phase === "result_correction" ? {
       state: "needs_human",
