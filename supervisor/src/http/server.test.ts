@@ -248,7 +248,7 @@ describe("kernel-native HTTP surface", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-20T13:00:00.000Z"));
     try {
-      const { app } = setup();
+      const { app, fixture } = setup();
       const raw = JSON.stringify({
         type: "AgentSessionEvent",
         action: "created",
@@ -267,6 +267,18 @@ describe("kernel-native HTTP surface", () => {
       expect((await app.request("/webhooks/linear", {
         method: "POST", headers: { ...headers, "Linear-Signature": "bad" }, body: raw,
       })).status).toBe(401);
+
+      const missingDelivery = await app.request("/webhooks/linear", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Linear-Signature": linearSignature(raw),
+        },
+        body: raw,
+      });
+      expect(missingDelivery.status).toBe(400);
+      expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM inbox_events").get())
+        .toEqual({ count: 0 });
 
       await app.request("/maintenance/close", {
         method: "POST",
@@ -408,5 +420,39 @@ describe("kernel-native HTTP surface", () => {
       "SELECT status FROM inbox_events WHERE delivery_id = ?",
     ).get("linear-delivery-fast-start-reordered")).toEqual({ status: "stale" });
     expect(ensureStarted).toHaveBeenCalledTimes(2);
+
+    const secondSessionRaw = JSON.stringify({
+      type: "AgentSessionEvent",
+      action: "created",
+      webhookId: "linear-event-fast-start",
+      webhookTimestamp: Date.now(),
+      agentSession: {
+        id: "session-second",
+        issue: {
+          id: "issue-second",
+          identifier: "OPE-3",
+          team: { id: "team", key: "OPE" },
+        },
+      },
+    });
+    const secondSession = await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Linear-Delivery": "linear-delivery-second-session",
+        "Linear-Signature": linearSignature(secondSessionRaw),
+      },
+      body: secondSessionRaw,
+    });
+
+    expect(secondSession.status).toBe(200);
+    expect(await secondSession.json()).toMatchObject({ accepted: true, duplicate: false });
+    expect(fixture.db.prepare(
+      "SELECT status FROM inbox_events WHERE delivery_id = ?",
+    ).get("linear-delivery-second-session")).toEqual({ status: "pending" });
+    expect(fixture.db.prepare(
+      "SELECT COUNT(DISTINCT event_group_key) AS count FROM inbox_events",
+    ).get()).toEqual({ count: 2 });
+    expect(ensureStarted).toHaveBeenCalledTimes(3);
   });
 });
