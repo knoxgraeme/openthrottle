@@ -162,11 +162,23 @@ function nestedObject(parent: Record<string, unknown>, key: string): Record<stri
     : undefined;
 }
 
+function linearGroupKey(type: string, action: string, payload: JsonValue): string {
+  // webhookId identifies the configured Linear webhook, not one emitted event.
+  // The canonical payload recognizes an exact semantic redelivery under a new
+  // Linear-Delivery without collapsing distinct events from that webhook.
+  return `linear:${type}:${action}:${digestCanonicalJson(payload)}`;
+}
+
 function linearWebhook(raw: string, request: Request, maxAgeSeconds: number) {
   const { object: payload, value } = jsonPayload(raw);
   const action = slug(payload.action, "Linear action");
   const type = slug(payload.type, "Linear event type");
-  const webhookId = string(payload.webhookId, "Linear webhookId");
+  string(payload.webhookId, "Linear webhookId");
+  const deliveryId = string(
+    request.headers.get("linear-delivery"),
+    "Linear-Delivery",
+    300,
+  );
   if (typeof payload.webhookTimestamp !== "number" || !Number.isFinite(payload.webhookTimestamp)) {
     throw new Error("Linear webhookTimestamp must be a number");
   }
@@ -182,9 +194,9 @@ function linearWebhook(raw: string, request: Request, maxAgeSeconds: number) {
   if (!teamId && !teamKey) throw new Error("Linear webhook does not identify a team route");
   return {
     provider: "linear" as const,
-    delivery_id: request.headers.get("linear-delivery") ?? webhookId,
+    delivery_id: deliveryId,
     kind: `linear/${type}/${action}@1`,
-    event_group_key: `linear:${webhookId}`,
+    event_group_key: linearGroupKey(type, action, value),
     delivery_attempt: deliveryAttempt(request),
     route: {
       ...(teamId ? { linear_team_id: teamId } : {}),

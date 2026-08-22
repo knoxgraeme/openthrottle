@@ -165,7 +165,9 @@ describe("Linear AgentSession start provider", () => {
     expect(new URLSearchParams(String(tokenRequest.init?.body)).get("grant_type")).toBe(
       "client_credentials",
     );
-    expect(new URLSearchParams(String(tokenRequest.init?.body)).get("scope")).toBe("read,write");
+    expect(new URLSearchParams(String(tokenRequest.init?.body)).get("scope")).toBe(
+      "read,write,app:assignable,app:mentionable",
+    );
 
     const firstQuery = requests[1]!;
     const mutation = requests[2]!;
@@ -385,6 +387,7 @@ describe("Linear AgentSession start provider", () => {
     let queryCalls = 0;
     let mutationCalls = 0;
     let activityId = "";
+    const observedTokenRequests: Array<Record<string, string>> = [];
     const observedQueries: Array<{
       request: Extract<LinearApiRequest, { operation: "AgentActivityById" }>;
       authorization: string | null;
@@ -392,6 +395,9 @@ describe("Linear AgentSession start provider", () => {
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       if (String(url) === LINEAR_TOKEN_URL) {
         tokenCalls += 1;
+        observedTokenRequests.push(
+          Object.fromEntries(new URLSearchParams(String(init?.body)).entries()),
+        );
         return tokenResponse(`access-token-${tokenCalls}`);
       }
       const request = linearApiRequest(url, init);
@@ -439,6 +445,16 @@ describe("Linear AgentSession start provider", () => {
     await provider.ensureStarted(input);
 
     expect(tokenCalls).toBe(2);
+    expect(observedTokenRequests).toEqual([
+      {
+        grant_type: "client_credentials",
+        scope: "read,write,app:assignable,app:mentionable",
+      },
+      {
+        grant_type: "client_credentials",
+        scope: "read,write,app:assignable,app:mentionable",
+      },
+    ]);
     expect(queryCalls).toBe(3);
     expect(mutationCalls).toBe(1);
     expect(observedQueries.map(({ authorization }) => authorization)).toEqual([

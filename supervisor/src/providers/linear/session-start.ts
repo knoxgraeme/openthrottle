@@ -170,7 +170,7 @@ export function createLinearSessionStartProvider(
     }
     const body = new URLSearchParams({
       grant_type: "client_credentials",
-      scope: "read,write",
+      scope: "read,write,app:assignable,app:mentionable",
     });
     const response = await fetchImpl(oauthTokenUrl, {
       method: "POST",
