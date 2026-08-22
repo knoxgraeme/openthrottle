@@ -25,8 +25,14 @@ describe("inspect repository authority", () => {
       "/var/lib/openthrottle/actions/a/inspect-context",
       "Read(//var/lib/openthrottle/actions/a/repository/**),Read(//var/lib/openthrottle/actions/a/inspect-context/change.json)",
     ]));
-    expect(inspectPolicyArgs("codex", "/var/lib/openthrottle/actions/a/repository"))
-      .toEqual(expect.arrayContaining(["--sandbox", "read-only", "--ignore-user-config"]));
+    expect(inspectPolicyArgs("codex", "/var/lib/openthrottle/actions/a/repository")).toEqual([
+      "--sandbox", "read-only",
+      "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "-c", 'web_search="disabled"',
+      "-c", "use_legacy_landlock=true",
+    ]);
     expect(() => inspectPolicyArgs("claude", "/sealed/repository", {
       readablePaths: ["/"],
     })).toThrow("cannot be safely scoped");

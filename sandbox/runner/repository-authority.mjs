@@ -74,6 +74,9 @@ export function inspectPolicyArgs(engine, repositoryPath, {
       "--ignore-user-config",
       "--ignore-rules",
       "-c", 'web_search="disabled"',
+      // Daytona's action runtime rejects Codex's bubblewrap loopback setup; the
+      // pinned legacy backend keeps the native read-only and network-denial boundary.
+      "-c", "use_legacy_landlock=true",
     ];
   }
   if (engine === "opencode") return [];
