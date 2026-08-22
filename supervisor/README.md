@@ -39,9 +39,9 @@ their configured bearer token, while webhooks require provider HMACs.
 - `pipeline/kernel/` owns deterministic reduction and the shared action,
   record, effect, checkpoint, steering, and runtime-resource protocols.
 - `persistence/` owns SQLite, the content-addressed BlobStore, and projections.
-- `providers/` owns GitHub, Codex-auth, and Daytona adapters. Linear webhook
-  verification and normalization currently live at the HTTP/application ingress
-  boundary; no Linear outbound adapter is in the production composition.
+- `providers/` owns GitHub, Linear session-start, Codex-auth, and Daytona
+  adapters. Linear webhook verification and normalization remain at the
+  HTTP/application ingress boundary; later Linear status delivery is deferred.
 - `operations/` owns leased, idempotent external-effect execution and
   reconciliation.
 - `runtime/` owns the provider-neutral wire boundary.
@@ -95,8 +95,9 @@ fly secrets set \
   SUPERVISOR_URL=https://<app>.fly.dev \
   OT_STATUS_TOKEN=<random> OT_DEPLOY_TOKEN=<random> \
   OT_EPOCH_BOOTSTRAP_CHECKSUM=<initializer-receipt-checksum> \
-  LINEAR_WEBHOOK_SECRET=... GITHUB_WEBHOOK_SECRET=... \
-  GITHUB_TOKEN=... DAYTONA_API_KEY=... DAYTONA_SNAPSHOT=openthrottle \
+  LINEAR_WEBHOOK_SECRET=... LINEAR_CLIENT_ID=... LINEAR_CLIENT_SECRET=... \
+  GITHUB_WEBHOOK_SECRET=... GITHUB_TOKEN=... GITHUB_READ_TOKEN=... \
+  DAYTONA_API_KEY=... DAYTONA_SNAPSHOT=openthrottle \
   CODEX_AUTH_JSON='...'
 ```
 

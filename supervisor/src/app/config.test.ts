@@ -4,7 +4,8 @@ import { loadConfig } from "./config.js";
 const originalEnv = { ...process.env };
 const configKeys = [
   "PORT", "DATABASE_PATH", "SUPERVISOR_URL", "OT_STATUS_TOKEN", "OT_DEPLOY_TOKEN",
-  "LINEAR_WEBHOOK_SECRET", "GITHUB_WEBHOOK_SECRET", "GITHUB_TOKEN", "GITHUB_READ_TOKEN",
+  "LINEAR_WEBHOOK_SECRET", "LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET",
+  "GITHUB_WEBHOOK_SECRET", "GITHUB_TOKEN", "GITHUB_READ_TOKEN",
   "DAYTONA_API_KEY", "DAYTONA_SNAPSHOT", "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_AUTH_JSON",
   "KIMI_CODE_API_KEY", "TASK_TIMEOUT", "WEBHOOK_MAX_AGE_SECONDS", "OT_BLOB_STORE_PATH",
   "OT_BLOB_STORE_ID", "OT_EPOCH_RELEASE_ID", "OT_RELEASE_ROOT",
@@ -12,7 +13,7 @@ const configKeys = [
   "OT_GENERATED_DEFINITION_ROOT", "OT_KERNEL_WORKER_ID", "OT_KERNEL_WORKER_INTERVAL_MS",
   "OT_KERNEL_LEASE_SECONDS", "OT_KERNEL_CYCLE_LIMIT",
   // Retired variables are cleared so they cannot influence a clean-epoch test.
-  "OT_INSTALL_SECRET", "LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET", "DEFAULT_AGENT",
+  "OT_INSTALL_SECRET", "DEFAULT_AGENT",
   "REVIEW_FANOUT_CONCURRENCY", "PIPELINE_CATALOG_PATH", "SANDBOX_RUNTIME_RELEASE",
 ];
 
@@ -29,6 +30,8 @@ function setRequiredEnv(): void {
     OT_STATUS_TOKEN: "status",
     OT_DEPLOY_TOKEN: "deploy",
     LINEAR_WEBHOOK_SECRET: "linear-webhook",
+    LINEAR_CLIENT_ID: "linear-client-id",
+    LINEAR_CLIENT_SECRET: "linear-client-secret",
     GITHUB_WEBHOOK_SECRET: "github-webhook",
     GITHUB_TOKEN: "github-token",
     GITHUB_READ_TOKEN: "github-read-token",
@@ -51,6 +54,9 @@ describe("loadConfig", () => {
       port: 8080,
       taskTimeout: 7_200,
       webhookMaxAgeSeconds: 60,
+      linearWebhookSecret: "linear-webhook",
+      linearClientId: "linear-client-id",
+      linearClientSecret: "linear-client-secret",
       githubReadToken: "github-read-token",
       daytonaSnapshot: "openthrottle",
       databasePath: "/data/openthrottle-kernel-v1.sqlite",
@@ -61,7 +67,7 @@ describe("loadConfig", () => {
       epochBootstrapChecksum: "b".repeat(64),
     });
     for (const retired of [
-      "installSecret", "linearClientId", "linearClientSecret", "defaultAgent",
+      "installSecret", "defaultAgent",
       "reviewFanoutConcurrency", "pipelineCatalogPath", "sandboxRuntimeRelease",
     ]) {
       expect(config).not.toHaveProperty(retired);
@@ -71,11 +77,32 @@ describe("loadConfig", () => {
   it("allows GitHub-only control while retaining required GitHub authority", () => {
     setRequiredEnv();
     delete process.env.LINEAR_WEBHOOK_SECRET;
+    delete process.env.LINEAR_CLIENT_ID;
+    delete process.env.LINEAR_CLIENT_SECRET;
     vi.spyOn(console, "warn").mockImplementation(() => {});
-    expect(loadConfig().linearWebhookSecret).toBeUndefined();
+    expect(loadConfig()).toMatchObject({
+      linearWebhookSecret: undefined,
+      linearClientId: undefined,
+      linearClientSecret: undefined,
+    });
 
     delete process.env.GITHUB_TOKEN;
     expect(() => loadConfig()).toThrow("Missing required env var: GITHUB_TOKEN");
+  });
+
+  it.each([
+    ["LINEAR_WEBHOOK_SECRET", ["LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET"]],
+    ["LINEAR_CLIENT_ID", ["LINEAR_WEBHOOK_SECRET", "LINEAR_CLIENT_SECRET"]],
+    ["LINEAR_CLIENT_SECRET", ["LINEAR_WEBHOOK_SECRET", "LINEAR_CLIENT_ID"]],
+  ] as const)("rejects partial Linear control configuration when only %s is set", (present, missing) => {
+    setRequiredEnv();
+    for (const name of ["LINEAR_WEBHOOK_SECRET", "LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET"] as const) {
+      if (name !== present) delete process.env[name];
+    }
+
+    expect(() => loadConfig()).toThrow(
+      `Linear control requires LINEAR_WEBHOOK_SECRET, LINEAR_CLIENT_ID, and LINEAR_CLIENT_SECRET together (missing: ${missing.join(", ")})`
+    );
   });
 
   it("requires distinct operator and deployment credentials", () => {

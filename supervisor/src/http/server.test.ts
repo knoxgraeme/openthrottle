@@ -6,6 +6,10 @@ import {
   type KernelRepositorySetupPort,
 } from "../app/kernel-http.js";
 import {
+  KernelLinearSessionStartDispatcher,
+  type KernelLinearSessionStartWakePort,
+} from "../app/kernel-linear-session.js";
+import {
   freshKernelFixture,
   seedKernelAttempt,
   seedKernelRun,
@@ -26,7 +30,7 @@ afterEach(() => {
   for (const fixture of fixtures.splice(0)) fixture.cleanup();
 });
 
-function setup() {
+function setup(input: { linear_session_start?: KernelLinearSessionStartWakePort } = {}) {
   const fixture = freshKernelFixture();
   fixtures.push(fixture);
   seedKernelRun({ db: fixture.db, run_id: "run-active" });
@@ -101,6 +105,9 @@ function setup() {
       },
       service,
       repository_setup: repositorySetup,
+      ...(input.linear_session_start
+        ? { linear_session_start: input.linear_session_start }
+        : {}),
     }),
   };
 }
@@ -111,6 +118,16 @@ function githubSignature(raw: string): string {
 
 function linearSignature(raw: string): string {
   return createHmac("sha256", "linear-secret").update(raw).digest("hex");
+}
+
+function deferred() {
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<void>((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve, reject };
 }
 
 describe("kernel-native HTTP surface", () => {
@@ -227,7 +244,7 @@ describe("kernel-native HTTP surface", () => {
       .toEqual({ count: 1 });
   });
 
-  it("verifies Linear signatures and freshness before durable ingestion", async () => {
+  it("acknowledges valid Linear deliveries with exact HTTP 200", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-20T13:00:00.000Z"));
     try {
@@ -250,11 +267,146 @@ describe("kernel-native HTTP surface", () => {
       expect((await app.request("/webhooks/linear", {
         method: "POST", headers: { ...headers, "Linear-Signature": "bad" }, body: raw,
       })).status).toBe(401);
-      expect((await app.request("/webhooks/linear", {
+
+      await app.request("/maintenance/close", {
+        method: "POST",
+        headers: { ...DEPLOY_HEADERS, "Content-Type": "application/json" },
+        body: JSON.stringify({ expected_version: 1 }),
+      });
+      const blocked = await app.request("/webhooks/linear", {
         method: "POST", headers, body: raw,
-      })).status).toBe(202);
+      });
+      expect(blocked.status).toBe(503);
+      expect(blocked.headers.get("Retry-After")).toBe("30");
+      expect(await blocked.json()).toMatchObject({ acknowledge: false, retryable: true });
+      await app.request("/maintenance/open", { method: "POST", headers: DEPLOY_HEADERS });
+
+      const inserted = await app.request("/webhooks/linear", {
+        method: "POST", headers, body: raw,
+      });
+      expect(inserted.status).toBe(200);
+      expect(await inserted.json()).toMatchObject({ accepted: true, duplicate: false });
+
+      const duplicate = await app.request("/webhooks/linear", {
+        method: "POST", headers, body: raw,
+      });
+      expect(duplicate.status).toBe(200);
+      expect(await duplicate.json()).toMatchObject({ accepted: true, duplicate: true });
+
+      const unregisteredRaw = JSON.stringify({
+        type: "AgentSessionEvent",
+        action: "created",
+        webhookId: "linear-event-unregistered",
+        webhookTimestamp: Date.now(),
+        agentSession: {
+          id: "session-unregistered",
+          issue: {
+            id: "issue-unregistered",
+            identifier: "OTHER-1",
+            team: { id: "unregistered-team", key: "OTHER" },
+          },
+        },
+      });
+      const ignored = await app.request("/webhooks/linear", {
+        method: "POST",
+        headers: {
+          ...headers,
+          "Linear-Delivery": "linear-delivery-unregistered",
+          "Linear-Signature": linearSignature(unregisteredRaw),
+        },
+        body: unregisteredRaw,
+      });
+      expect(ignored.status).toBe(200);
+      expect(await ignored.json()).toEqual({
+        accepted: false,
+        acknowledge: true,
+        retryable: false,
+        ignored: "unregistered_route",
+      });
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("starts a durable Linear session without blocking and preserves inbox retry", async () => {
+    const gate = deferred();
+    let persistedEventsAtStart = 0;
+    let fixtureAtStart: FreshKernelFixture | undefined;
+    const ensureStarted = vi.fn()
+      .mockImplementationOnce(() => {
+        const row = fixtureAtStart?.db.prepare(
+          "SELECT COUNT(*) AS count FROM inbox_events",
+        ).get() as { count: number } | undefined;
+        persistedEventsAtStart = row?.count ?? 0;
+        return gate.promise;
+      })
+      .mockResolvedValueOnce(undefined);
+    const dispatcher = new KernelLinearSessionStartDispatcher({
+      downstream: { ensureStarted },
+      max_concurrency: 1,
+    });
+    const { app, fixture } = setup({ linear_session_start: dispatcher });
+    fixtureAtStart = fixture;
+    const raw = JSON.stringify({
+      type: "AgentSessionEvent",
+      action: "created",
+      webhookId: "linear-event-fast-start",
+      webhookTimestamp: Date.now(),
+      agentSession: {
+        id: "session-fast-start",
+        issue: {
+          id: "issue-fast-start",
+          identifier: "OPE-2",
+          team: { id: "team", key: "OPE" },
+        },
+      },
+    });
+
+    const response = await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Linear-Delivery": "linear-delivery-fast-start",
+        "Linear-Signature": linearSignature(raw),
+      },
+      body: raw,
+    });
+    const body = await response.json() as { event_id: string };
+
+    expect(response.status).toBe(200);
+    expect(persistedEventsAtStart).toBe(1);
+    expect(ensureStarted).toHaveBeenCalledWith({
+      inbox_event_id: body.event_id,
+      webhook_id: "linear-event-fast-start",
+      session_id: "session-fast-start",
+    });
+
+    gate.reject(new Error("background provider failure"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fixture.db.prepare(
+      "SELECT status FROM inbox_events WHERE id = ?",
+    ).get(body.event_id)).toEqual({ status: "pending" });
+    await expect(dispatcher.ensureStarted({
+      inbox_event_id: body.event_id,
+      webhook_id: "linear-event-fast-start",
+      session_id: "session-fast-start",
+    })).resolves.toBeUndefined();
+    expect(ensureStarted).toHaveBeenCalledTimes(2);
+
+    const reordered = await app.request("/webhooks/linear", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Linear-Delivery": "linear-delivery-fast-start-reordered",
+        "Linear-Signature": linearSignature(raw),
+      },
+      body: raw,
+    });
+    expect(reordered.status).toBe(200);
+    expect(await reordered.json()).toMatchObject({ accepted: true, duplicate: true });
+    expect(fixture.db.prepare(
+      "SELECT status FROM inbox_events WHERE delivery_id = ?",
+    ).get("linear-delivery-fast-start-reordered")).toEqual({ status: "stale" });
+    expect(ensureStarted).toHaveBeenCalledTimes(2);
   });
 });

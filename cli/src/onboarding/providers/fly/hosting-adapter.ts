@@ -21,6 +21,7 @@ import type {
   ProviderPlan,
   SecretRef,
   SupervisorDeploymentBundle,
+  SupervisorSecretPolicy,
 } from "../../contracts.js";
 import {
   createFlyctlRunner,
@@ -86,41 +87,48 @@ interface RequiredSecret {
   refName?: string;
 }
 
-// Mirror of the orchestrator's SupervisorDeploymentBundle secrets map plus the
-// two values this adapter derives itself (supervisor/src/app/config.ts is the
-// env authority). inspect() has no bundle parameter, so it checks this static
-// set; plan()/ensure() recompute the same list from the live bundle.
-const REQUIRED_SUPERVISOR_SECRETS: readonly RequiredSecret[] = sortedByKey([
-  { key: "OT_STATUS_TOKEN", owner: "cli", refName: "status_token" },
-  { key: "OT_DEPLOY_TOKEN", owner: "provisioning", refName: "deploy_token" },
-  { key: "LINEAR_WEBHOOK_SECRET", owner: "provisioning", refName: "linear_webhook_secret" },
-  { key: "GITHUB_WEBHOOK_SECRET", owner: "provisioning", refName: "github_webhook_secret" },
-  { key: "GITHUB_TOKEN", owner: "operator", refName: "github_token" },
-  { key: "GITHUB_READ_TOKEN", owner: "operator", refName: "github_read_token" },
-  { key: "DAYTONA_API_KEY", owner: "operator", refName: "daytona_api_key" },
-  { key: EPOCH_BOOTSTRAP_CHECKSUM, owner: "operator", refName: "epoch_bootstrap_checksum" },
+const DERIVED_SUPERVISOR_SECRETS: readonly RequiredSecret[] = [
   { key: "SUPERVISOR_URL", owner: "derived" },
   { key: "DAYTONA_SNAPSHOT", owner: "derived" },
-]);
+];
 
 function sortedByKey(required: RequiredSecret[]): RequiredSecret[] {
   return required.sort((left, right) => compareCodeUnits(left.key, right.key));
 }
 
-function requiredSecretsFromBundle(bundle: SupervisorDeploymentBundle): RequiredSecret[] {
-  const required: RequiredSecret[] = Object.entries(bundle.secrets).map(([key, ref]) => ({
-    key,
-    owner: ref.owner,
-    refName: ref.name,
-  }));
-  required.push({ key: "SUPERVISOR_URL", owner: "derived" }, { key: "DAYTONA_SNAPSHOT", owner: "derived" });
-  return sortedByKey(required);
+function requiredSecretsForPresent(
+  policy: SupervisorSecretPolicy,
+  presentKeys: ReadonlySet<string>,
+): RequiredSecret[] {
+  const required = new Map<string, RequiredSecret>(
+    Object.entries(policy.secrets).map(([key, ref]) => [
+      key,
+      { key, owner: ref.owner, refName: ref.name },
+    ]),
+  );
+  const groupedKeys = new Set<string>();
+  for (const group of policy.optionalSecretGroups) {
+    if (group.members.length === 0) throw new Error(`optional secret group ${group.id} has no members`);
+    const enabled = group.members.some((key) => presentKeys.has(key));
+    for (const key of group.members) {
+      if (!required.has(key)) throw new Error(`optional secret group ${group.id} references unknown secret ${key}`);
+      if (groupedKeys.has(key)) throw new Error(`secret ${key} belongs to more than one optional group`);
+      groupedKeys.add(key);
+      if (!enabled) required.delete(key);
+    }
+  }
+  for (const secret of DERIVED_SUPERVISOR_SECRETS) {
+    if (required.has(secret.key)) throw new Error(`deployment bundle duplicates derived secret ${secret.key}`);
+    required.set(secret.key, secret);
+  }
+  return sortedByKey([...required.values()]);
 }
 
 interface FlyInspection {
   appExists: boolean;
   volumeExists: boolean;
   volumeIssue?: string;
+  requiredSecretCount: number;
   presentSecretCount: number;
   missingSecrets: RequiredSecret[];
   startedMachineCount: number;
@@ -205,12 +213,14 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
     }
   }
 
-  async function inspectState(context: AdapterContext, required: readonly RequiredSecret[]): Promise<FlyInspection> {
+  async function inspectState(context: AdapterContext, policy: SupervisorSecretPolicy): Promise<FlyInspection> {
     const apps = await client.appsList();
     if (!apps.some((entry) => entry.name === app)) {
+      const required = requiredSecretsForPresent(policy, new Set());
       return {
         appExists: false,
         volumeExists: false,
+        requiredSecretCount: required.length,
         presentSecretCount: 0,
         missingSecrets: [...required],
         startedMachineCount: 0,
@@ -221,6 +231,7 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
     const volumeSelection = selectDataVolume(volumes, region);
     const volumeExists = volumeSelection.volume !== undefined;
     const secretNames = new Set((await client.secretsList(app)).map((secret) => secret.name));
+    const required = requiredSecretsForPresent(policy, secretNames);
     const missingSecrets = required.filter((secret) => !secretNames.has(secret.key));
     const machines = await client.machinesList(app);
     const digest = imageDigest(context.release.supervisorImage);
@@ -230,6 +241,7 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
       appExists: true,
       volumeExists,
       ...(volumeSelection.issue ? { volumeIssue: volumeSelection.issue } : {}),
+      requiredSecretCount: required.length,
       presentSecretCount: required.length - missingSecrets.length,
       missingSecrets,
       startedMachineCount: started.length,
@@ -243,7 +255,6 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
 
   function evidenceFor(
     context: AdapterContext,
-    required: readonly RequiredSecret[],
     inspection: FlyInspection
   ): { evidence: ProviderEvidence; ready: boolean } {
     const observedAt = context.now().toISOString();
@@ -260,8 +271,8 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
       const missing = inspection.missingSecrets;
       parts.push(
         missing.length === 0
-          ? `secrets: ${inspection.presentSecretCount}/${required.length} set`
-          : `secrets: ${inspection.presentSecretCount}/${required.length} set (missing: ${missing.map((secret) => secret.key).join(", ")})`
+          ? `secrets: ${inspection.presentSecretCount}/${inspection.requiredSecretCount} set`
+          : `secrets: ${inspection.presentSecretCount}/${inspection.requiredSecretCount} set (missing: ${missing.map((secret) => secret.key).join(", ")})`
       );
       parts.push(
         inspection.releaseImageActive
@@ -409,21 +420,23 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
       }
     },
 
-    async inspect(context: AdapterContext): Promise<HostingEnsureResult | ProviderPendingEvidence> {
+    async inspect(
+      context: AdapterContext,
+      secretPolicy: SupervisorSecretPolicy,
+    ): Promise<HostingEnsureResult | ProviderPendingEvidence> {
       let inspection: FlyInspection;
       try {
-        inspection = await inspectState(context, REQUIRED_SUPERVISOR_SECRETS);
+        inspection = await inspectState(context, secretPolicy);
       } catch (error) {
         return flyctlFailureEvidence(context, error);
       }
-      const { evidence, ready } = evidenceFor(context, REQUIRED_SUPERVISOR_SECRETS, inspection);
+      const { evidence, ready } = evidenceFor(context, inspection);
       if (ready) return { evidence, supervisorUrl };
       return evidence as ProviderPendingEvidence;
     },
 
     async plan(context: AdapterContext, bundle: SupervisorDeploymentBundle): Promise<ProviderPlan> {
-      const required = requiredSecretsFromBundle(bundle);
-      const inspection = await inspectState(context, required);
+      const inspection = await inspectState(context, bundle);
       const mutations: string[] = [];
       if (!inspection.appExists) mutations.push(appsCreateCommand);
       if (inspection.volumeIssue) {
@@ -459,8 +472,6 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
     },
 
     async ensure(context: AdapterContext, bundle: SupervisorDeploymentBundle): Promise<HostingEnsureResult> {
-      const required = requiredSecretsFromBundle(bundle);
-
       // Execute only what is currently missing, re-reading live state so a
       // stale plan can never repeat a mutation.
       const apps = await client.appsList();
@@ -471,8 +482,8 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
       const volumes = await client.volumesList(app);
       const volumeSelection = selectDataVolume(volumes, region);
       if (volumeSelection.issue) {
-        const inspection = await inspectState(context, required);
-        return { evidence: evidenceFor(context, required, inspection).evidence };
+        const inspection = await inspectState(context, bundle);
+        return { evidence: evidenceFor(context, inspection).evidence };
       }
       const volumeExisted = volumeSelection.volume !== undefined;
       if (!volumeExisted) {
@@ -485,6 +496,7 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
       }
 
       const secretNames = new Set((await client.secretsList(app)).map((secret) => secret.name));
+      const required = requiredSecretsForPresent(bundle, secretNames);
       const staleEpochChecksum = !volumeExisted && secretNames.has(EPOCH_BOOTSTRAP_CHECKSUM);
       const missing = required.filter((secret) => !secretNames.has(secret.key));
       const machines = await client.machinesList(app);
@@ -538,8 +550,8 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
       }
 
       if (!epochInitialized || !operatorPrerequisitesPresent) {
-        const inspection = await inspectState(context, required);
-        const evidence = evidenceFor(context, required, inspection).evidence;
+        const inspection = await inspectState(context, bundle);
+        const evidence = evidenceFor(context, inspection).evidence;
         if (!volumeExisted) {
           return {
             evidence: {
@@ -578,8 +590,8 @@ export function createFlyHostingAdapter(options: FlyHostingAdapterOptions): Host
         }
       }
 
-      const inspection = await inspectState(context, required);
-      const { evidence, ready } = evidenceFor(context, required, inspection);
+      const inspection = await inspectState(context, bundle);
+      const { evidence, ready } = evidenceFor(context, inspection);
       return ready ? { evidence, supervisorUrl } : { evidence };
     },
   };

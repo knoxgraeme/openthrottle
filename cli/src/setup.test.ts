@@ -12,6 +12,7 @@ import type {
   RuntimeEnsureResult,
   RuntimeSetupAdapter,
   SupervisorDeploymentBundle,
+  SupervisorSecretPolicy,
 } from "./onboarding/contracts.js";
 import { createProviderCatalogs } from "./onboarding/provider-catalog.js";
 import {
@@ -178,7 +179,10 @@ class FakeHosting implements HostingSetupAdapter {
     return this.preflightResult;
   }
 
-  async inspect(): Promise<HostingEnsureResult | ProviderPendingEvidence> {
+  async inspect(
+    _context: unknown,
+    _secretPolicy: SupervisorSecretPolicy,
+  ): Promise<HostingEnsureResult | ProviderPendingEvidence> {
     this.inspectCalls += 1;
     return this.inspectResult;
   }
@@ -331,15 +335,20 @@ describe("setup credential inventory", () => {
     expect(names).toContain("OT_DEPLOY_TOKEN");
     expect(names).toContain("OT_EPOCH_BOOTSTRAP_CHECKSUM");
     expect(names).toContain("LINEAR_WEBHOOK_SECRET");
+    expect(names).toContain("LINEAR_CLIENT_ID");
+    expect(names).toContain("LINEAR_CLIENT_SECRET");
     expect(names).not.toContain("OT_INSTALL_SECRET");
-    expect(names).not.toContain("LINEAR_CLIENT_ID");
-    expect(names).not.toContain("LINEAR_CLIENT_SECRET");
     expect(names).not.toContain("DATABASE_PATH");
     expect(names).not.toContain("PORT");
     expect(names).not.toContain("DEFAULT_AGENT");
     expect(names).not.toContain("SANDBOX_EVENT_POLL_INTERVAL_MS");
     expect(names).not.toContain("ORPHAN_GRACE_MINUTES");
     expect(names).not.toContain("ALLOW_LINEAR_MERGE");
+    expect(LOCAL_SECRET_KEYS).not.toContain("linear_client_id");
+    expect(LOCAL_SECRET_KEYS).not.toContain("linear_client_secret");
+    for (const name of ["LINEAR_WEBHOOK_SECRET", "LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET"]) {
+      expect(SUPERVISOR_SECRET_CHECKLIST.find((entry) => entry.name === name)?.hint).toContain("optional");
+    }
   });
 });
 
@@ -426,8 +435,6 @@ describe("setup full run", () => {
     const text = allOutput(h);
     expect(text).toContain("Supervisor ready at https://openthrottle-supervisor.fly.dev");
     expect(text).not.toContain("/oauth/install");
-    expect(text).not.toContain("LINEAR_CLIENT_ID");
-    expect(text).not.toContain("LINEAR_CLIENT_SECRET");
     expect(text).toContain("openthrottle init");
     expect(text).toContain(h.secretStore.pathFor("default"));
     expect(text).toContain(h.supervisorAccessStore.pathFor("default"));
@@ -600,5 +607,17 @@ describe("setup fallback line derivation", () => {
     });
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('fly secrets set GITHUB_READ_TOKEN="<value>"');
+  });
+
+  it("treats Linear client credentials as operator-owned prerequisites", () => {
+    const lines = fallbackSecretLines({
+      hosting: evidence("needs_action", "operator", "missing: LINEAR_CLIENT_ID, LINEAR_CLIENT_SECRET", {
+        recoveryAction: "Set LINEAR_CLIENT_ID and LINEAR_CLIENT_SECRET before enabling Linear control.",
+      }),
+    });
+
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('fly secrets set LINEAR_CLIENT_ID="<value>"');
+    expect(lines[1]).toContain('fly secrets set LINEAR_CLIENT_SECRET="<value>"');
   });
 });

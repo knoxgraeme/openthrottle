@@ -10,6 +10,7 @@ import type {
   ReleaseManifest,
   SupervisorDeploymentBundle,
 } from "../../contracts.js";
+import { createSupervisorSecretPolicy } from "../../orchestrator.js";
 import { validateProfile } from "../../profile-store.js";
 import { LocalFileSecretStore } from "../../secret-store.js";
 import { FlyctlCommandError, FlyctlNotFoundError, type FlyctlResult, type FlyctlRunner } from "./flyctl.js";
@@ -38,16 +39,7 @@ const bundle: SupervisorDeploymentBundle = {
     configuration: { snapshot: "openthrottle-ce-abc1234" },
     secrets: {},
   },
-  secrets: {
-    OT_STATUS_TOKEN: { owner: "cli", name: "status_token" },
-    OT_DEPLOY_TOKEN: { owner: "provisioning", name: "deploy_token" },
-    LINEAR_WEBHOOK_SECRET: { owner: "provisioning", name: "linear_webhook_secret" },
-    GITHUB_WEBHOOK_SECRET: { owner: "provisioning", name: "github_webhook_secret" },
-    GITHUB_TOKEN: { owner: "operator", name: "github_token" },
-    GITHUB_READ_TOKEN: { owner: "operator", name: "github_read_token" },
-    DAYTONA_API_KEY: { owner: "operator", name: "daytona_api_key" },
-    OT_EPOCH_BOOTSTRAP_CHECKSUM: { owner: "operator", name: "epoch_bootstrap_checksum" },
-  },
+  ...createSupervisorSecretPolicy(),
 };
 
 const APP = "openthrottle-supervisor";
@@ -55,8 +47,11 @@ const OPERATOR_NAMES = [
   "DAYTONA_API_KEY",
   "GITHUB_READ_TOKEN",
   "GITHUB_TOKEN",
+  "LINEAR_CLIENT_ID",
+  "LINEAR_CLIENT_SECRET",
   "OT_EPOCH_BOOTSTRAP_CHECKSUM",
 ];
+const LINEAR_SECRET_NAMES = ["LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET", "LINEAR_WEBHOOK_SECRET"];
 const ALL_SECRET_NAMES = [
   ...OPERATOR_NAMES,
   "DAYTONA_SNAPSHOT",
@@ -295,7 +290,7 @@ describe("fly hosting adapter preflight", () => {
 describe("fly hosting adapter inspect", () => {
   it("reports a missing app with the exact create recovery", async () => {
     const { adapter } = createHarness();
-    const evidence = asPending(await adapter.inspect(context));
+    const evidence = asPending(await adapter.inspect(context, bundle));
     expect(evidence.status).toBe("needs_action");
     expect(evidence.owner).toBe("hosting_provider");
     expect(evidence.summary).toContain(`app ${APP}: missing`);
@@ -307,7 +302,7 @@ describe("fly hosting adapter inspect", () => {
     const { fly, adapter } = createHarness();
     fly.makeReady();
     fly.volumes = [];
-    const evidence = asPending(await adapter.inspect(context));
+    const evidence = asPending(await adapter.inspect(context, bundle));
     expect(evidence.status).toBe("needs_action");
     expect(evidence.owner).toBe("cli");
     expect(evidence.summary).toContain("volume openthrottle_data: missing");
@@ -319,7 +314,7 @@ describe("fly hosting adapter inspect", () => {
     fly.makeReady();
     fly.volumes = [];
     fly.secrets = fly.secrets.filter((name) => name !== "OT_EPOCH_BOOTSTRAP_CHECKSUM");
-    const evidence = asPending(await adapter.inspect(context));
+    const evidence = asPending(await adapter.inspect(context, bundle));
     expect(evidence.status).toBe("needs_action");
     expect(evidence.owner).toBe("hosting_provider");
     expect(evidence.recoveryAction).toBe(
@@ -336,7 +331,7 @@ describe("fly hosting adapter inspect", () => {
     fly.volumes = volumes;
     fly.machines = [];
 
-    const inspection = asPending(await adapter.inspect(context));
+    const inspection = asPending(await adapter.inspect(context, bundle));
     expect(inspection.status).toBe("needs_action");
     expect(inspection.owner).toBe("operator");
     expect(inspection.recoveryAction).toContain("exactly one openthrottle_data volume in region sjc");
@@ -353,7 +348,7 @@ describe("fly hosting adapter inspect", () => {
     const { fly, adapter } = createHarness();
     fly.makeReady();
     fly.secrets = fly.secrets.filter((name) => name !== "OT_DEPLOY_TOKEN" && name !== "LINEAR_WEBHOOK_SECRET");
-    const evidence = asPending(await adapter.inspect(context));
+    const evidence = asPending(await adapter.inspect(context, bundle));
     expect(evidence.status).toBe("needs_action");
     expect(evidence.owner).toBe("cli");
     expect(evidence.summary).toContain("missing: LINEAR_WEBHOOK_SECRET, OT_DEPLOY_TOKEN");
@@ -364,11 +359,11 @@ describe("fly hosting adapter inspect", () => {
     const { fly, adapter } = createHarness();
     fly.makeReady();
     fly.secrets = fly.secrets.filter((name) => !OPERATOR_NAMES.includes(name));
-    const evidence = asPending(await adapter.inspect(context));
+    const evidence = asPending(await adapter.inspect(context, bundle));
     expect(evidence.status).toBe("needs_action");
     expect(evidence.owner).toBe("operator");
     expect(evidence.recoveryAction).toBe(
-      `Initialize the fresh epoch, then flyctl secrets set --stage --app ${APP} DAYTONA_API_KEY=... GITHUB_READ_TOKEN=... GITHUB_TOKEN=... OT_EPOCH_BOOTSTRAP_CHECKSUM=...`
+      `Initialize the fresh epoch, then flyctl secrets set --stage --app ${APP} DAYTONA_API_KEY=... GITHUB_READ_TOKEN=... GITHUB_TOKEN=... LINEAR_CLIENT_ID=... LINEAR_CLIENT_SECRET=... OT_EPOCH_BOOTSTRAP_CHECKSUM=...`
     );
     expectValidEvidence(evidence);
   });
@@ -377,13 +372,13 @@ describe("fly hosting adapter inspect", () => {
     const { fly, adapter } = createHarness();
     fly.makeReady();
     fly.machines = [{ state: "started", image: `registry.fly.io/${APP}@sha256:${"f".repeat(64)}` }];
-    const evidence = asPending(await adapter.inspect(context));
+    const evidence = asPending(await adapter.inspect(context, bundle));
     expect(evidence.status).toBe("needs_action");
     expect(evidence.summary).toContain("deployed image is not this release");
     expect(evidence.recoveryAction).toBe(`flyctl deploy --ha=false --app ${APP} --image ${release.supervisorImage}`);
 
     fly.machines = [{ state: "stopped", image: RELEASE_MACHINE_IMAGE }];
-    const stopped = asPending(await adapter.inspect(context));
+    const stopped = asPending(await adapter.inspect(context, bundle));
     expect(stopped.summary).toContain("no started machine");
     expect(stopped.recoveryAction).toBe(`flyctl deploy --ha=false --app ${APP} --image ${release.supervisorImage}`);
   });
@@ -392,7 +387,7 @@ describe("fly hosting adapter inspect", () => {
     const { fly, adapter } = createHarness();
     fly.makeReady();
     fly.healthzStatus = 503;
-    const evidence = asPending(await adapter.inspect(context));
+    const evidence = asPending(await adapter.inspect(context, bundle));
     expect(evidence.status).toBe("needs_action");
     expect(evidence.owner).toBe("supervisor");
     expect(evidence.summary).toContain("healthz: failing");
@@ -403,22 +398,54 @@ describe("fly hosting adapter inspect", () => {
   it("returns the supervisor URL with composite ready evidence when every tier passes", async () => {
     const { fly, adapter } = createHarness();
     fly.makeReady();
-    const result = asReady(await adapter.inspect(context));
+    const result = asReady(await adapter.inspect(context, bundle));
     expect(result.supervisorUrl).toBe(`https://${APP}.fly.dev`);
     expect(result.evidence.status).toBe("ready");
     expect(result.evidence.releaseId).toBe(release.releaseId);
     expect(result.evidence.summary).toContain(`app ${APP}: ok`);
-    expect(result.evidence.summary).toContain("secrets: 10/10 set");
+    expect(result.evidence.summary).toContain("secrets: 12/12 set");
     expect(result.evidence.summary).toContain("release image: active");
     expect(result.evidence.summary).toContain("healthz: ok");
     expectValidEvidence(result.evidence);
+  });
+
+  it("treats a completely absent Linear secret group as disabled", async () => {
+    const { fly, adapter } = createHarness();
+    fly.makeReady();
+    fly.secrets = fly.secrets.filter((name) => !LINEAR_SECRET_NAMES.includes(name));
+
+    const result = asReady(await adapter.inspect(context, bundle));
+
+    expect(result.evidence.status).toBe("ready");
+    expect(result.evidence.summary).toContain("secrets: 9/9 set");
+    expect(result.evidence.summary).not.toContain("LINEAR_");
+  });
+
+  it.each([
+    ["webhook only", ["LINEAR_WEBHOOK_SECRET"], ["LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET"]],
+    ["client ID only", ["LINEAR_CLIENT_ID"], ["LINEAR_CLIENT_SECRET", "LINEAR_WEBHOOK_SECRET"]],
+    ["client secret only", ["LINEAR_CLIENT_SECRET"], ["LINEAR_CLIENT_ID", "LINEAR_WEBHOOK_SECRET"]],
+    ["webhook and client ID", ["LINEAR_WEBHOOK_SECRET", "LINEAR_CLIENT_ID"], ["LINEAR_CLIENT_SECRET"]],
+    ["webhook and client secret", ["LINEAR_WEBHOOK_SECRET", "LINEAR_CLIENT_SECRET"], ["LINEAR_CLIENT_ID"]],
+    ["both OAuth credentials", ["LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET"], ["LINEAR_WEBHOOK_SECRET"]],
+  ])("fails closed and names every missing Linear member for %s", async (_label, present, missing) => {
+    const { fly, adapter } = createHarness();
+    fly.makeReady();
+    fly.secrets = fly.secrets.filter(
+      (name) => !LINEAR_SECRET_NAMES.includes(name) || present.includes(name),
+    );
+
+    const evidence = asPending(await adapter.inspect(context, bundle));
+
+    expect(evidence.status).toBe("needs_action");
+    expect(evidence.summary).toContain(`missing: ${missing.join(", ")}`);
   });
 
   it("degrades flyctl command failures into error evidence", async () => {
     const { fly, adapter } = createHarness();
     fly.makeReady();
     fly.failures.set("volumes list", { code: 1, stderr: "api unavailable" });
-    const evidence = asPending(await adapter.inspect(context));
+    const evidence = asPending(await adapter.inspect(context, bundle));
     expect(evidence.status).toBe("error");
     expect(evidence.owner).toBe("hosting_provider");
     expectValidEvidence(evidence);
@@ -426,7 +453,7 @@ describe("fly hosting adapter inspect", () => {
 
   it("honors custom app, org, and region options and rejects unsafe names", async () => {
     const { adapter } = createHarness({ app: "my-sup", org: "acme", region: "fra" });
-    const evidence = asPending(await adapter.inspect(context));
+    const evidence = asPending(await adapter.inspect(context, bundle));
     expect(evidence.recoveryAction).toBe("flyctl apps create my-sup --org acme");
     expect(() => createFlyHostingAdapter({ secrets: new FakeSecretsPort(), app: "Bad App!" })).toThrow("app name");
     expect(() => createFlyHostingAdapter({ secrets: new FakeSecretsPort(), region: "sjc; rm" })).toThrow("region");
@@ -440,7 +467,7 @@ describe("fly hosting adapter plan", () => {
     expect(plan.mutations).toEqual([
       `flyctl apps create ${APP} --org personal`,
       `flyctl volumes create openthrottle_data --app ${APP} --region sjc --size 1`,
-      "set 6 supervisor secrets (names: DAYTONA_SNAPSHOT, GITHUB_WEBHOOK_SECRET, LINEAR_WEBHOOK_SECRET, OT_DEPLOY_TOKEN, OT_STATUS_TOKEN, SUPERVISOR_URL)",
+      "set 5 supervisor secrets (names: DAYTONA_SNAPSHOT, GITHUB_WEBHOOK_SECRET, OT_DEPLOY_TOKEN, OT_STATUS_TOKEN, SUPERVISOR_URL)",
     ]);
     expect(plan.billable).toBe(true);
     expect(plan.externallyVisible).toBe(true);
@@ -486,6 +513,36 @@ describe("fly hosting adapter plan", () => {
     );
     expect(plan.billable).toBe(false);
     expect(plan.externallyVisible).toBe(false);
+  });
+
+  it("does not plan a deploy with partial Linear control credentials", async () => {
+    const { fly, adapter } = createHarness();
+    fly.makeReady();
+    fly.machines = [];
+    fly.secrets = fly.secrets.filter((name) => name !== "LINEAR_CLIENT_SECRET");
+
+    const plan = await adapter.plan(context, bundle);
+
+    expect(plan.mutations).not.toContain(
+      `flyctl deploy --ha=false --app ${APP} --image ${release.supervisorImage}`,
+    );
+    expect(plan.billable).toBe(false);
+    expect(plan.externallyVisible).toBe(false);
+  });
+
+  it("plans a deploy when the optional Linear secret group is completely absent", async () => {
+    const { fly, adapter } = createHarness();
+    fly.makeReady();
+    fly.secrets = fly.secrets.filter((name) => !LINEAR_SECRET_NAMES.includes(name));
+    fly.machines = [];
+
+    const plan = await adapter.plan(context, bundle);
+
+    expect(plan.mutations).toContain(
+      `flyctl deploy --ha=false --app ${APP} --image ${release.supervisorImage}`,
+    );
+    expect(plan.billable).toBe(true);
+    expect(plan.externallyVisible).toBe(true);
   });
 
   it("does not treat a stale checksum as initialization for a missing volume", async () => {
@@ -547,7 +604,6 @@ describe("fly hosting adapter ensure", () => {
         "--stage",
         "DAYTONA_SNAPSHOT=openthrottle-ce-abc1234",
         "GITHUB_WEBHOOK_SECRET=generated-github_webhook_secret-secret-value",
-        "LINEAR_WEBHOOK_SECRET=generated-linear_webhook_secret-secret-value",
         "OT_DEPLOY_TOKEN=generated-deploy_token-secret-value",
         "OT_STATUS_TOKEN=PRESET_SENTINEL_STATUS",
         `SUPERVISOR_URL=https://${APP}.fly.dev`,
@@ -556,9 +612,15 @@ describe("fly hosting adapter ensure", () => {
 
     // Generated secrets are minted through the port (persisted) and only for
     // absent cli/provisioning refs; operator refs are never generated.
-    expect(port.generated).toEqual(["github_webhook_secret", "linear_webhook_secret", "deploy_token"]);
+    expect(port.generated).toEqual(["github_webhook_secret", "deploy_token"]);
     expect(port.getCalls).toContain("status_token");
-    for (const operatorRef of ["github_token", "github_read_token", "daytona_api_key"]) {
+    for (const operatorRef of [
+      "github_token",
+      "github_read_token",
+      "linear_client_id",
+      "linear_client_secret",
+      "daytona_api_key",
+    ]) {
       expect(port.generated).not.toContain(operatorRef);
       expect(port.getCalls).not.toContain(operatorRef);
     }
@@ -618,7 +680,7 @@ describe("fly hosting adapter ensure", () => {
   });
 
   it("converges to ready from an initialized existing volume", async () => {
-    const { fly, adapter } = createHarness();
+    const { fly, port, adapter } = createHarness();
     fly.apps = [APP];
     fly.volumes = [fakeVolume()];
     fly.secrets = [...OPERATOR_NAMES];
@@ -627,6 +689,7 @@ describe("fly hosting adapter ensure", () => {
 
     const mutations = mutationCalls(fly).map((args) => (args[0] === "deploy" ? "deploy" : `${args[0]} ${args[1]}`));
     expect(mutations).toEqual(["secrets set", "deploy"]);
+    expect(port.generated).toContain("linear_webhook_secret");
     expect(result.evidence.status).toBe("ready");
     expect(result.supervisorUrl).toBe(`https://${APP}.fly.dev`);
     expect(fly.fetches).toEqual([`https://${APP}.fly.dev/healthz`]);
@@ -648,6 +711,43 @@ describe("fly hosting adapter ensure", () => {
     expect(result.evidence.recoveryAction).toBe(
       `flyctl secrets set --app ${APP} GITHUB_TOKEN=...`,
     );
+  });
+
+  it("does not deploy or resolve operator credentials with partial Linear control configuration", async () => {
+    const { fly, port, adapter } = createHarness();
+    fly.apps = [APP];
+    fly.volumes = [fakeVolume()];
+    fly.secrets = ALL_SECRET_NAMES.filter((name) => name !== "LINEAR_CLIENT_SECRET");
+    fly.machines = [];
+
+    const result = await adapter.ensure(context, bundle);
+
+    expect(fly.calls.some((args) => args[0] === "deploy")).toBe(false);
+    expect(port.generated).not.toContain("linear_client_secret");
+    expect(port.getCalls).not.toContain("linear_client_secret");
+    expect(result.supervisorUrl).toBeUndefined();
+    expect(result.evidence.status).toBe("needs_action");
+    expect(result.evidence.owner).toBe("operator");
+    expect(result.evidence.summary).toContain("missing: LINEAR_CLIENT_SECRET");
+    expect(result.evidence.recoveryAction).toBe(
+      `flyctl secrets set --app ${APP} LINEAR_CLIENT_SECRET=...`,
+    );
+  });
+
+  it("deploys GitHub-only control without resolving or generating any Linear secret", async () => {
+    const { fly, port, logs, adapter } = createHarness();
+    fly.makeReady();
+    fly.secrets = fly.secrets.filter((name) => !LINEAR_SECRET_NAMES.includes(name));
+    fly.machines = [];
+
+    const result = await adapter.ensure(context, bundle);
+
+    expect(fly.calls.some((args) => args[0] === "deploy")).toBe(true);
+    expect(result.evidence.status).toBe("ready");
+    expect(result.supervisorUrl).toBe(`https://${APP}.fly.dev`);
+    expect(port.generated).toEqual([]);
+    expect(port.getCalls).toEqual([]);
+    expect(JSON.stringify(result) + JSON.stringify(logs)).not.toContain("LINEAR_");
   });
 
   it("performs no mutations when everything is already ready", async () => {

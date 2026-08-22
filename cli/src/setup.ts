@@ -18,7 +18,7 @@ import type {
   ReleaseManifest,
 } from "./onboarding/contracts.js";
 import { isReadyEvidence } from "./onboarding/contracts.js";
-import { SetupOrchestrator } from "./onboarding/orchestrator.js";
+import { createSupervisorSecretPolicy, SetupOrchestrator } from "./onboarding/orchestrator.js";
 import type { ProviderCatalogs } from "./onboarding/provider-catalog.js";
 import {
   FileProfileStore,
@@ -47,9 +47,9 @@ import {
 import { getErrorMessage, printTable } from "./util.js";
 
 // Only orchestrator-generated secrets may land in the profile-local store.
-// Operator third-party credentials (GitHub PATs and the Daytona API key) are
-// NEVER written locally — they are set as Fly secrets by the operator and only
-// their names ever appear in evidence.
+// Operator third-party credentials (Linear OAuth credentials, GitHub PATs, and
+// the Daytona API key) are NEVER written locally — they are set as Fly secrets
+// by the operator and only their names ever appear in evidence.
 export const LOCAL_SECRET_KEYS = [
   "status_token",
   "deploy_token",
@@ -81,7 +81,21 @@ export const SUPERVISOR_SECRET_CHECKLIST: readonly ChecklistEntry[] = [
     owner: "generated",
     hint: "random deploy bearer token; must differ from the status token",
   },
-  { name: "LINEAR_WEBHOOK_SECRET", owner: "generated", hint: "Linear webhook signing secret" },
+  {
+    name: "LINEAR_WEBHOOK_SECRET",
+    owner: "generated",
+    hint: "optional; generated only when Linear control is enabled with its OAuth credentials",
+  },
+  {
+    name: "LINEAR_CLIENT_ID",
+    owner: "operator",
+    hint: "optional; set with LINEAR_CLIENT_SECRET to enable Linear control",
+  },
+  {
+    name: "LINEAR_CLIENT_SECRET",
+    owner: "operator",
+    hint: "optional; set with LINEAR_CLIENT_ID to enable Linear control",
+  },
   { name: "GITHUB_WEBHOOK_SECRET", owner: "generated", hint: "shared GitHub webhook signing secret" },
   { name: "GITHUB_TOKEN", owner: "operator", hint: "fine-grained PAT with target-repository access" },
   { name: "GITHUB_READ_TOKEN", owner: "operator", hint: "fine-grained PAT with contents/PRs/checks/actions read only" },
@@ -354,7 +368,7 @@ async function runGuidedSetup(
     evidence.hostingPreflight = await hosting.preflight(context);
     const runtimeInspection = await runtime.inspect(context);
     evidence.runtime = "fragment" in runtimeInspection ? runtimeInspection.evidence : runtimeInspection;
-    const hostingInspection = await hosting.inspect(context);
+    const hostingInspection = await hosting.inspect(context, createSupervisorSecretPolicy());
     evidence.hosting = "evidence" in hostingInspection ? hostingInspection.evidence : hostingInspection;
     renderEvidenceTable(evidence);
     if (Object.values(evidence).every(isReadyEvidence)) {

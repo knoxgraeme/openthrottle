@@ -459,8 +459,14 @@ identity, target, subject, or payload fails closed.
 
 Built-in plans cover Daytona provision/stop/cleanup, accepted structured-unit
 integration, exact-subject GitHub publication, and trusted GitHub provider
-waiting. Linear/GitHub status-delivery kinds remain typed registry contracts but
-are not wired into the production composition in this acceptance boundary.
+waiting. A created Linear AgentSession is acknowledged before admission through
+an inbox-bound, deterministic provider-native activity: the durable inbox event
+is written first, the activity is reconciled by its stable identity before any
+Git or compilation work, and handler failure leaves the event retryable. This
+timing-critical provider handshake exists before a PipelineRun or DecisionRecord
+can authorize an ordinary Effect. Linear/GitHub status-delivery kinds beyond
+that mandatory handshake remain typed registry contracts but are not wired into
+the production composition in this acceptance boundary.
 Multi-phase operations checkpoint each confirmed phase.
 
 Provisioning expands privately into provision, stop, and cleanup lifecycle

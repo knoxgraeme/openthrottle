@@ -7,6 +7,10 @@ import type { ExactDefinitionSourceReader } from "../pipeline/definition-compila
 import { parseStructuredExecutionPlan } from "../pipeline/kernel/structured-coordinator.js";
 import type { KernelRuntimeCompatibilityPort } from "../runtime/kernel-contracts.js";
 import { admitKernelPipeline } from "./kernel-admission.js";
+import {
+  kernelLinearSessionStartRequest,
+  type KernelLinearSessionStartPort,
+} from "./kernel-linear-session.js";
 
 const SUBJECT = /^[a-f0-9]{40,64}$/;
 const DEFAULT_GITHUB_SUBJECT_TIMEOUT_MS = 15_000;
@@ -49,6 +53,7 @@ export class KernelAdmissionInboxHandler {
   readonly #runtime: KernelRuntimeCompatibilityPort;
   readonly #blobs: VolumeBlobStore;
   readonly #store: SqliteKernelStore;
+  readonly #linearSessionStart: KernelLinearSessionStartPort | undefined;
   readonly #fetch: typeof fetch;
   readonly #githubSubjectTimeoutMs: number;
 
@@ -61,6 +66,7 @@ export class KernelAdmissionInboxHandler {
     runtime: KernelRuntimeCompatibilityPort;
     blob_store: VolumeBlobStore;
     store: SqliteKernelStore;
+    linear_session_start?: KernelLinearSessionStartPort;
     fetch?: typeof fetch;
     github_subject_timeout_ms?: number;
   }) {
@@ -72,6 +78,7 @@ export class KernelAdmissionInboxHandler {
     this.#runtime = input.runtime;
     this.#blobs = input.blob_store;
     this.#store = input.store;
+    this.#linearSessionStart = input.linear_session_start;
     this.#fetch = input.fetch ?? fetch;
     this.#githubSubjectTimeoutMs = input.github_subject_timeout_ms ??
       DEFAULT_GITHUB_SUBJECT_TIMEOUT_MS;
@@ -85,6 +92,13 @@ export class KernelAdmissionInboxHandler {
     if (event.source_provider !== "linear" && event.source_provider !== "github") return "stale";
     const admission = this.#admission(event);
     if (!admission) return "stale";
+    const linearSessionStart = kernelLinearSessionStartRequest(event);
+    if (linearSessionStart) {
+      if (!this.#linearSessionStart) {
+        throw new Error("Linear session-start acknowledgement is unavailable");
+      }
+      await this.#linearSessionStart.ensureStarted(linearSessionStart);
+    }
     const existing = this.#registrations.resolveRun(admission.source_reference);
     if (existing) return "consumed";
     const sourceCommit = event.subject && SUBJECT.test(event.subject)
