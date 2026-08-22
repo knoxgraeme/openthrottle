@@ -8,6 +8,8 @@ import {
   COMPILED_PIPELINE_MANIFEST_SCHEMA,
   EFFECT_INTENT_SCHEMA,
   EXECUTION_RECORD_SCHEMA,
+  expandCompiledRuntimeLifecycle,
+  runtimeStopStageId,
   digestCanonicalJson,
   type AttemptCheckpoint,
   type CompiledPipelineManifest,
@@ -58,6 +60,7 @@ const payloadSchemas: ExecutionRecordPayloadRegistry = new Map<string, Execution
   ["result/v1", { kind: "result", parseInline: (value: unknown): unknown => value }],
   ["decision/v1", { kind: "decision", parseInline: (value: unknown): unknown => value }],
   ["delivery/v1", { kind: "delivery", parseInline: (value: unknown): unknown => value }],
+  ["openthrottle.effect-delivery/v1", { kind: "delivery", parseInline: (value: unknown): unknown => value }],
 ]);
 
 function temporaryDirectory(): string {
@@ -155,6 +158,7 @@ function run(initial: readonly KernelAttempt[], bundleHash: string): KernelRun {
 function setup(
   faultInjector?: (point: KernelStoreFaultPoint) => void,
   now: () => string = () => NOW,
+  withRuntimeLifecycle = false,
 ): {
   db: Database.Database;
   blobs: VolumeBlobStore;
@@ -194,7 +198,16 @@ function setup(
     media_type: "application/json",
     payload_schema: "openthrottle.definition-bundle/v1",
   });
-  const pipelineManifest = manifest(definitionBundle.pointer.digest);
+  const authoredManifest = manifest(definitionBundle.pointer.digest);
+  const pipelineManifest = withRuntimeLifecycle
+    ? {
+      ...authoredManifest,
+      stages: expandCompiledRuntimeLifecycle({
+        entry_stage: authoredManifest.entry_stage,
+        stages: authoredManifest.stages,
+      }).stages,
+    }
+    : authoredManifest;
   const initialAttempt = attempt({ definition_bundle_hash: definitionBundle.pointer.digest });
   const initialRun = run([initialAttempt], definitionBundle.pointer.digest);
   const store = new SqliteKernelStore({
@@ -858,6 +871,158 @@ describe("SqliteKernelStore", () => {
       expect(await context.store.applyAtomicTransition(start)).toEqual({ disposition: "replayed", run_version: 2 });
       await expect(context.store.applyAtomicTransition(conflictingReplay(start))).rejects.toThrow(/conflicts/);
       await expect(context.store.applyAtomicTransition(delayed)).rejects.toThrow(/stale/);
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("atomically persists result_pending terminal cleanup without discarding completed-work evidence", async () => {
+    const context = setup(undefined, () => NOW, true);
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const deliveryPayload = {
+        effect_kind: "daytona/create-sandbox@1",
+        provider: "daytona",
+        observed_via: "reconciliation",
+        result: { sandbox_id: "sandbox-1" },
+      };
+      const delivery: DeliveryRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "delivery-runtime-create",
+        kind: "delivery",
+        pipeline_run_id: "run-1",
+        effect_id: "effect-runtime-create",
+        idempotency_key: "run-1:runtime:create",
+        external_identity: "daytona:sandbox-1",
+        status: "confirmed",
+        payload_schema: "openthrottle.effect-delivery/v1",
+        payload: { inline: deliveryPayload },
+        created_at: NOW,
+      };
+      context.db.transaction(() => {
+        context.db.prepare(`
+          INSERT INTO checkpoints (
+            id, pipeline_run_id, attempt_id, ordinal, checkpoint_hash, semantic_key,
+            request_hash, definition_bundle_hash, input_subject, output_subject,
+            native_session_id, payload_schema, inline_payload, captured_at
+          ) VALUES ('checkpoint-1', 'run-1', 'attempt-1', 0, ?, 'checkpoint/v1',
+            ?, ?, ?, ?, 'session-1', 'checkpoint/v1', '{}', ?)
+        `).run(sha("4"), sha("a"), context.admission.run.definition_bundle_hash, subject("1"), subject("2"), NOW);
+        context.db.prepare(`
+          UPDATE attempts SET status = 'result_pending', version = 1, output_subject = ?,
+            native_session_id = 'session-1', checkpoint_id = 'checkpoint-1',
+            result_correction_count = 2, result_correction_deadline = ?,
+            pending_candidate_hash = ?, pending_diagnostics_json = ?
+          WHERE id = 'attempt-1'
+        `).run(subject("2"), "2026-08-20T12:15:00.000Z", sha("5"), JSON.stringify([{ path: "/payload", detail: "invalid" }]));
+        context.db.prepare("UPDATE pipeline_runs SET status = 'running' WHERE id = 'run-1'").run();
+        context.db.prepare(`
+          INSERT INTO records (
+            id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+            inline_payload, reducer, input_record_ids_json, input_record_count, created_at
+          ) VALUES ('decision-runtime-create', 'run-1', 1, ?, 'decision',
+            'decision/v1', '{}', 'core/runtime-create@1', '[]', 0, ?)
+        `).run(sha("6"), NOW);
+        context.db.prepare(`
+          INSERT INTO effects (
+            id, pipeline_run_id, decision_record_id, kind, idempotency_key, target,
+            payload_schema, inline_payload, intent_hash, status, version, attempt_count,
+            available_at, delivery_record_id, created_at, updated_at
+          ) VALUES ('effect-runtime-create', 'run-1', 'decision-runtime-create',
+            'daytona/create-sandbox@1', ?, ?, 'daytona/create-sandbox@1', '{}', ?,
+            'acknowledged', 1, 1, ?, ?, ?, ?)
+        `).run(delivery.idempotency_key, delivery.external_identity, sha("7"), NOW, delivery.id, NOW, NOW);
+        context.db.prepare(`
+          INSERT INTO records (
+            id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+            inline_payload, effect_id, idempotency_key, external_identity,
+            delivery_status, created_at
+          ) VALUES (?, 'run-1', 2, ?, 'delivery', ?, ?, ?, ?, ?, 'confirmed', ?)
+        `).run(
+          delivery.id,
+          digestCanonicalJson(delivery),
+          delivery.payload_schema,
+          JSON.stringify(deliveryPayload),
+          delivery.effect_id,
+          delivery.idempotency_key,
+          delivery.external_identity,
+          NOW,
+        );
+      }).immediate();
+
+      const pending = await context.store.loadExactReductionView({
+        pipeline_run_id: "run-1",
+        attempt_id: "attempt-1",
+        record_ids: [delivery.id],
+        checkpoint_ids: [],
+      });
+      const decision: DecisionRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "decision-result-correction-exhausted",
+        kind: "decision",
+        pipeline_run_id: "run-1",
+        reducer: "core/result-correction-terminal@1",
+        input_record_ids: [delivery.id],
+        payload_schema: "decision/v1",
+        payload: { inline: { outcome: "needs_human" } },
+        created_at: NOW,
+      };
+      const cleanupAttempt = attempt({
+        id: "attempt-cleanup-needs-human",
+        scope: { kind: "stage", stage_id: runtimeStopStageId("needs_human") },
+        repository_authority: "inspect",
+        request_hash: sha("8"),
+        definition_bundle_hash: pending.run.definition_bundle_hash,
+        input_subject: pending.run.current_subject,
+        context_record_ids: [decision.id, delivery.id].sort(),
+      });
+      const transition = reduceKernelCommand({
+        ...pending,
+        records: new Map<string, DecisionRecord | DeliveryRecord>([
+          [decision.id, decision],
+          [delivery.id, delivery],
+        ]),
+        command: {
+          type: "needs_human",
+          command_id: "terminal-result-correction",
+          attempt_id: "attempt-1",
+          decision_record_id: decision.id,
+          reason: "result_correction_budget_exhausted",
+          resource_disposition: {
+            kind: "cleanup",
+            runtime_delivery_record_ids: [delivery.id],
+            cleanup_attempt: cleanupAttempt,
+          },
+        },
+      });
+
+      await expect(context.store.applyAtomicTransition(transition)).resolves.toEqual({
+        disposition: "applied",
+        run_version: pending.run.version + 1,
+      });
+      expect(context.db.prepare(`
+        SELECT status, output_subject, native_session_id, checkpoint_id,
+          result_correction_count, result_correction_deadline, lease_id,
+          result_record_id, decision_record_id, pending_candidate_hash,
+          pending_diagnostics_json
+        FROM attempts WHERE id = 'attempt-1'
+      `).get()).toEqual({
+        status: "needs_human",
+        output_subject: subject("2"),
+        native_session_id: "session-1",
+        checkpoint_id: "checkpoint-1",
+        result_correction_count: 2,
+        result_correction_deadline: null,
+        lease_id: null,
+        result_record_id: null,
+        decision_record_id: null,
+        pending_candidate_hash: null,
+        pending_diagnostics_json: null,
+      });
+      expect(context.db.prepare("SELECT status FROM attempts WHERE id = ?").get(cleanupAttempt.id))
+        .toEqual({ status: "pending" });
+      expect(context.db.prepare("SELECT status, cursor_stage_id FROM pipeline_runs WHERE id = 'run-1'").get())
+        .toEqual({ status: "running", cursor_stage_id: runtimeStopStageId("needs_human") });
     } finally {
       context.db.close();
     }

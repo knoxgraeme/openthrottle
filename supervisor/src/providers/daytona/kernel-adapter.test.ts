@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import type { DeliveryRecord } from "@openthrottle/contracts";
 import { describe, expect, it, vi } from "vitest";
 import {
   KERNEL_ACTION_REQUEST_SCHEMA,
+  KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA,
+  type KernelResultCorrectionRequest,
   type KernelWorkActionRequest,
 } from "../../runtime/kernel-contracts.js";
 import {
@@ -59,6 +62,64 @@ function workRequest(overrides: Record<string, unknown> = {}): KernelWorkActionR
     },
     ...overrides,
   } as unknown as KernelWorkActionRequest;
+}
+
+function correctionRequest(overrides: Record<string, unknown> = {}): KernelResultCorrectionRequest {
+  return {
+    schema: KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA,
+    phase: "result_correction",
+    engine: "codex",
+    model: null,
+    reasoning_effort: null,
+    pipeline_run_id: "run-1",
+    attempt_id: "attempt-1",
+    stage_id: "stage-1",
+    scope: { kind: "stage", stage_id: "stage-1" },
+    request_hash: "a".repeat(64),
+    definition_bundle_hash: "b".repeat(64),
+    input_subject: "c".repeat(40),
+    locked_subject: "c".repeat(40),
+    completed_work_authority: "inspect",
+    checkpoint_id: "checkpoint-1",
+    native_session_id: "native-session-1",
+    lease_id: "lease-2",
+    worker_id: "worker-1",
+    correction_deadline: "2099-08-20T13:00:00.000Z",
+    diagnostics: [{ path: "/payload", detail: "provider emitted conflicting final result candidates" }],
+    semantic_result_schema: {
+      schema: "openthrottle.semantic-result-schema/v1",
+      id: "result-schema-1",
+      outcomes: ["success"],
+      payload: {},
+    },
+    execution_limits: { max_turns: null, task_timeout_seconds: 60 },
+    repository_authority: "inspect",
+    tools: ["ot-result"],
+    mcp: false,
+    provider_access: false,
+    ...overrides,
+  } as KernelResultCorrectionRequest;
+}
+
+function runtimeDelivery(kind: "create" | "start"): DeliveryRecord {
+  return {
+    schema: "openthrottle.record/v1",
+    id: `delivery-${kind}`,
+    kind: "delivery",
+    pipeline_run_id: "run-1",
+    effect_id: `effect-${kind}`,
+    idempotency_key: `run-1:${kind}`,
+    external_identity: "daytona:sandbox-1",
+    status: "confirmed",
+    payload_schema: "openthrottle.effect-delivery/v1",
+    payload: { inline: {
+      effect_kind: `daytona/${kind}-sandbox@1`,
+      provider: "daytona",
+      observed_via: "reconciliation",
+      result: { sandbox_id: "sandbox-1" },
+    } },
+    created_at: "2026-08-20T12:00:00.000Z",
+  };
 }
 
 function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
@@ -123,6 +184,15 @@ function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
     files,
     defaultExecuteCommand,
   };
+}
+
+function createdSessionId(
+  sandbox: ReturnType<typeof sandboxWith>,
+  index = 0,
+): string {
+  const value = sandbox.process.createSession.mock.calls[index]?.[0];
+  if (typeof value !== "string") throw new Error(`missing created Daytona session ${index}`);
+  return value;
 }
 
 function emulateRepositoryBinding(sandbox: ReturnType<typeof sandboxWith>) {
@@ -705,15 +775,51 @@ describe("DaytonaKernelAdapter", () => {
         reason: "Daytona action command exited with code 1 without producing a sealed result; session termination was verified",
       });
       expect(settledPromptly).toBe(true);
+      const sessionId = createdSessionId(sandbox);
       expect(sandbox.process.getSessionCommand).toHaveBeenCalledWith(
-        "kernel-attempt-1",
+        sessionId,
         "command-1",
       );
-      expect(sandbox.process.deleteSession).toHaveBeenCalledWith("kernel-attempt-1");
-      expect(sandbox.process.getSession).toHaveBeenCalledWith("kernel-attempt-1");
+      expect(sandbox.process.deleteSession).toHaveBeenCalledWith(sessionId);
+      expect(sandbox.process.getSession).toHaveBeenCalledWith(sessionId);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("creates a fresh Daytona process session for correction and reuses it only on recovery", async () => {
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.process.getSessionCommand.mockResolvedValue({ cmdId: "command-1", exitCode: 1 });
+    const records = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const adapter = adapterFor(sandbox, {}, {
+      loadAttemptRequestInputs: vi.fn().mockResolvedValue({
+        task_prompt: "execute the sealed task",
+        context: {
+          records: new Map(records.map((record) => [record.id, record])),
+          checkpoints: new Map(),
+        },
+      }),
+    }, { task_timeout_seconds: 60 });
+    const callbacks = (leaseGeneration: number) => ({
+      lease_generation: leaseGeneration,
+      heartbeat_interval_ms: 10_000,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    });
+
+    await adapter.executeWork(workRequest(), callbacks(0));
+    await adapter.correctResult(correctionRequest(), callbacks(0));
+    await adapter.correctResult(correctionRequest(), callbacks(1));
+
+    const sessionIds = sandbox.process.createSession.mock.calls.map(([sessionId]) => sessionId);
+    expect(sessionIds).toHaveLength(3);
+    expect(sessionIds[0]).toMatch(/^kernel-action-[a-f0-9]{48}$/);
+    expect(sessionIds[1]).not.toBe(sessionIds[0]);
+    expect(sessionIds[2]).toBe(sessionIds[1]);
+    expect(sandbox.process.executeSessionCommand.mock.calls.map(([sessionId]) => sessionId))
+      .toEqual(sessionIds);
+    expect(sandbox.process.deleteSession.mock.calls.map(([sessionId]) => sessionId))
+      .toEqual(sessionIds);
   });
 
   it("adopts an existing Attempt command when the asynchronous launch lock is contended", async () => {
@@ -737,15 +843,16 @@ describe("DaytonaKernelAdapter", () => {
       reason: "runtime failed",
     });
     expect(resultReads).toBe(4);
+    const sessionId = createdSessionId(sandbox);
     expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
-      "kernel-attempt-1",
+      sessionId,
       expect.objectContaining({
         command: expect.stringContaining("flock --nonblock --conflict-exit-code 75 "),
       }),
       expect.any(Number),
     );
     expect(sandbox.process.getSessionCommand).toHaveBeenCalledWith(
-      "kernel-attempt-1",
+      sessionId,
       "command-1",
     );
     expect(sandbox.process.deleteSession).not.toHaveBeenCalled();
@@ -766,8 +873,9 @@ describe("DaytonaKernelAdapter", () => {
       retryable: true,
       reason: "Daytona action launch omitted its command identity; session termination was verified",
     });
-    expect(sandbox.process.deleteSession).toHaveBeenCalledWith("kernel-attempt-1");
-    expect(sandbox.process.getSession).toHaveBeenCalledWith("kernel-attempt-1");
+    const sessionId = createdSessionId(sandbox);
+    expect(sandbox.process.deleteSession).toHaveBeenCalledWith(sessionId);
+    expect(sandbox.process.getSession).toHaveBeenCalledWith(sessionId);
     expect(sandbox.process.getSessionCommand).not.toHaveBeenCalled();
   });
 
@@ -787,7 +895,7 @@ describe("DaytonaKernelAdapter", () => {
       retryable: false,
       reason: "Daytona action launch omitted its command identity and session termination could not be verified",
     });
-    expect(sandbox.process.deleteSession).toHaveBeenCalledWith("kernel-attempt-1");
+    expect(sandbox.process.deleteSession).toHaveBeenCalledWith(createdSessionId(sandbox));
     expect(sandbox.process.getSessionCommand).not.toHaveBeenCalled();
   });
 
@@ -842,10 +950,11 @@ describe("DaytonaKernelAdapter", () => {
         retryable: true,
         reason: expect.stringMatching(/termination was verified/),
       });
-      expect(sandbox.process.deleteSession).toHaveBeenCalledWith("kernel-attempt-1");
-      expect(sandbox.process.getSession).toHaveBeenCalledWith("kernel-attempt-1");
+      const sessionId = createdSessionId(sandbox);
+      expect(sandbox.process.deleteSession).toHaveBeenCalledWith(sessionId);
+      expect(sandbox.process.getSession).toHaveBeenCalledWith(sessionId);
       expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
-        "kernel-attempt-1",
+        sessionId,
         expect.any(Object),
         1,
       );
