@@ -125,12 +125,23 @@ jq -e --arg attempt "$OT_ATTEMPT_ID" '
 mkdir -p /tmp/openthrottle-smoke-launches
 printf 'launch\n' >> "/tmp/openthrottle-smoke-launches/${OT_ATTEMPT_ID}"
 if [ "$OT_ATTEMPT_ID" = "attempt-edit" ]; then
-  if printf 'poisoned shared source\n' > /home/agent/repo/work.txt 2>/dev/null; then
+  source_parent=/var/lib/openthrottle/repository-source
+  source_repository="$source_parent/repo"
+  if printf 'poisoned shared source\n' > "$source_repository/work.txt" 2>/dev/null; then
     echo "edit agent mutated the shared source checkout" >&2
     exit 40
   fi
-  grep -qx base /home/agent/repo/work.txt
-  test -x /home/agent/repo/tool.sh
+  if mv "$source_repository" /tmp/repository-source-renamed 2>/dev/null; then
+    echo "edit agent renamed the shared source checkout" >&2
+    exit 41
+  fi
+  mkdir -p /tmp/repository-source-replacement
+  if mv /tmp/repository-source-replacement "$source_parent/replacement" 2>/dev/null; then
+    echo "edit agent introduced a replacement source checkout" >&2
+    exit 42
+  fi
+  grep -qx base work.txt
+  test -x tool.sh
   printf 'implemented\n' > work.txt
   summary='["Edited repository.","Verification passed."]'
 else
@@ -159,13 +170,21 @@ POISON
 chmod 0755 "$SMOKE_DIR/poison/claude"
 
 CONTAINER="$(docker run -d --entrypoint tail "$IMAGE" -f /dev/null)"
-docker exec "$CONTAINER" mkdir -p /home/agent/repo /requests /transport/edit /transport/inspect /runtime/fences /tmp/stub /tmp/poison
-docker cp "$SOURCE_REPO/." "$CONTAINER:/home/agent/repo/"
+docker exec "$CONTAINER" mkdir -p /var/lib/openthrottle/repository-source/repo /requests /transport/edit /transport/inspect /runtime/fences /tmp/stub /tmp/poison
+docker cp "$SOURCE_REPO/." "$CONTAINER:/var/lib/openthrottle/repository-source/repo/"
 docker cp "$REQUESTS/." "$CONTAINER:/requests/"
 docker cp "$SMOKE_DIR/stub/." "$CONTAINER:/tmp/stub/"
 docker cp "$SMOKE_DIR/poison/." "$CONTAINER:/tmp/poison/"
-docker exec "$CONTAINER" sh -c 'touch /tmp/source-link-target && chown agent:agent /tmp/source-link-target && chmod 0660 /tmp/source-link-target && ln -s /tmp/source-link-target /home/agent/repo/source-link'
-docker exec "$CONTAINER" sh -c 'chown -R agent:agent /home/agent/repo && chmod -R u+w /home/agent/repo && chown -R root:root /requests /tmp/stub /tmp/poison && chmod 0400 /requests/*.json && chmod 0755 /tmp/stub/claude /tmp/poison/claude'
+docker exec "$CONTAINER" sh -c 'touch /tmp/source-link-target && chown agent:agent /tmp/source-link-target && chmod 0660 /tmp/source-link-target && ln -s /tmp/source-link-target /var/lib/openthrottle/repository-source/repo/source-link'
+docker exec "$CONTAINER" sh -c '
+  find -P /var/lib/openthrottle/repository-source/repo -exec chown -h root:root -- {} +
+  find -P /var/lib/openthrottle/repository-source/repo ! -type l -exec chmod go-w -- {} +
+  chown root:root /var/lib/openthrottle/repository-source
+  chmod 0700 /var/lib/openthrottle/repository-source
+  chown -R root:root /requests /tmp/stub /tmp/poison
+  chmod 0400 /requests/*.json
+  chmod 0755 /tmp/stub/claude /tmp/poison/claude
+'
 for name in edit inspect; do
   docker exec "$CONTAINER" sh -c '
     printf '\''{"schema":"openthrottle.kernel-lease-generation-fence/v1","attempt_id":"%s","lease_generation":0}\n'\'' "$1" > "$2"
@@ -187,13 +206,34 @@ run_action() {
     "$CONTAINER" /opt/openthrottle/entrypoint.sh
 }
 
+# A traversable executor-source parent must fail before the runner can create
+# any session or result evidence. Use otherwise-valid sealed inputs so the
+# physical repository fence is the only failing precondition.
+docker exec "$CONTAINER" sh -c '
+  cp /requests/edit.json /requests/invalid-source.json
+  cp /runtime/fences/edit.json /runtime/fences/invalid-source.json
+  cp /runtime/fences/edit.lock /runtime/fences/invalid-source.lock
+  mkdir -p /transport/invalid-source
+  chmod 0755 /var/lib/openthrottle/repository-source
+'
+INVALID_SOURCE_LOG="$SMOKE_DIR/invalid-source.log"
+if run_action invalid-source >"$INVALID_SOURCE_LOG" 2>&1; then
+  echo "entrypoint accepted a traversable repository-source parent" >&2
+  exit 42
+fi
+grep -F 'repository source parent must be root:root mode 0700' "$INVALID_SOURCE_LOG" >/dev/null
+docker exec "$CONTAINER" test ! -e /transport/invalid-source/session.json
+docker exec "$CONTAINER" test ! -e /transport/invalid-source/result.json
+docker exec "$CONTAINER" chmod 0700 /var/lib/openthrottle/repository-source
+
 run_action edit
-[ -z "$(docker exec "$CONTAINER" find -P /home/agent/repo ! -user root -print -quit)" ]
-[ -z "$(docker exec "$CONTAINER" find -P /home/agent/repo ! -type l -perm /0222 -print -quit)" ]
-docker exec "$CONTAINER" test -x /home/agent/repo/tool.sh
+[ "$(docker exec "$CONTAINER" stat -c %U:%G:%a /var/lib/openthrottle/repository-source)" = "root:root:700" ]
+[ -z "$(docker exec "$CONTAINER" find -P /var/lib/openthrottle/repository-source/repo \( ! -user root -o ! -group root \) -print -quit)" ]
+[ -z "$(docker exec "$CONTAINER" find -P /var/lib/openthrottle/repository-source/repo ! -type l -perm /0222 -print -quit)" ]
+docker exec "$CONTAINER" test -x /var/lib/openthrottle/repository-source/repo/tool.sh
 [ "$(docker exec "$CONTAINER" stat -c %U /tmp/source-link-target)" = "agent" ]
 [ "$(docker exec "$CONTAINER" stat -c %a /tmp/source-link-target)" = "660" ]
-[ "$(docker exec "$CONTAINER" cat /home/agent/repo/work.txt)" = "base" ]
+[ "$(docker exec "$CONTAINER" cat /var/lib/openthrottle/repository-source/repo/work.txt)" = "base" ]
 EDIT_RESULT="$(docker exec "$CONTAINER" cat /transport/edit/result.json)"
 printf '%s' "$EDIT_RESULT" | jq -e '
   .schema == "openthrottle.kernel-runtime-result/v1" and
@@ -212,7 +252,7 @@ EDIT_FILE="$(printf '%s' "$EDIT_RESULT" | jq -r '.outcome.checkpoint.payload_art
 EDIT_REF="$(printf '%s' "$EDIT_RESULT" | jq -r '.outcome.checkpoint.payload_artifact.ref')"
 EDIT_COMMIT="$(printf '%s' "$EDIT_RESULT" | jq -r '.outcome.checkpoint.payload_artifact.commit')"
 EDIT_TREE="$(printf '%s' "$EDIT_RESULT" | jq -r '.outcome.checkpoint.payload_artifact.tree')"
-docker exec "$CONTAINER" git -C /home/agent/repo bundle verify "/transport/edit/$EDIT_FILE" >/dev/null
+docker exec "$CONTAINER" git -C /var/lib/openthrottle/repository-source/repo bundle verify "/transport/edit/$EDIT_FILE" >/dev/null
 docker exec "$CONTAINER" git init -q --bare /tmp/restored-checkpoint.git
 docker exec "$CONTAINER" git -C /tmp/restored-checkpoint.git fetch -q "/transport/edit/$EDIT_FILE" "$EDIT_REF:refs/checkpoint"
 [ "$(docker exec "$CONTAINER" git -C /tmp/restored-checkpoint.git rev-parse refs/checkpoint)" = "$EDIT_COMMIT" ]

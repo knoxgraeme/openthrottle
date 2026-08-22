@@ -102,6 +102,7 @@ function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
         return downloadFile(path);
       }),
       createFolder: vi.fn().mockResolvedValue(undefined),
+      deleteFile: vi.fn().mockRejectedValue(new Error("404 not found")),
       setFilePermissions: vi.fn().mockResolvedValue(undefined),
       uploadFile: vi.fn(async (bytes: Buffer, path: string) => {
         files.set(path, Buffer.from(bytes));
@@ -109,15 +110,38 @@ function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
     },
     process: {
       createSession: vi.fn().mockResolvedValue(undefined),
-      executeSessionCommand: vi.fn().mockResolvedValue(undefined),
+      executeSessionCommand: vi.fn().mockResolvedValue({ cmdId: "command-1" }),
       executeCommand: vi.fn(defaultExecuteCommand),
       deleteSession: vi.fn().mockResolvedValue(undefined),
       getSession: vi.fn().mockRejectedValue(new Error("404 not found")),
+      getSessionCommand: vi.fn().mockResolvedValue({ cmdId: "command-1", exitCode: undefined }),
+    },
+    git: {
+      clone: vi.fn().mockResolvedValue(undefined),
     },
     updateEnv: vi.fn().mockResolvedValue(undefined),
     files,
     defaultExecuteCommand,
   };
+}
+
+function emulateRepositoryBinding(sandbox: ReturnType<typeof sandboxWith>) {
+  let ready = false;
+  sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+    if (command.includes("lease-generation.lock")) return sandbox.defaultExecuteCommand(command);
+    if (command.includes("install -d") && command.includes("repository-source")) {
+      return { exitCode: 0, result: "" };
+    }
+    if (command.includes("mv --") && command.includes("repository-source")) {
+      ready = true;
+      return { exitCode: 0, result: "" };
+    }
+    if (command.includes("repository-source")) {
+      return { exitCode: ready ? 0 : 44, result: "" };
+    }
+    return sandbox.defaultExecuteCommand(command);
+  });
+  return { isReady: () => ready };
 }
 
 function adapterFor(
@@ -179,6 +203,95 @@ function sessionEvent(request: KernelWorkActionRequest): Buffer {
 }
 
 describe("DaytonaKernelAdapter", () => {
+  it("materializes and verifies the exact initial Git subject before launching work", async () => {
+    const request = workRequest();
+    const stop = new Error("stop after repository materialization");
+    const sandbox = sandboxWith(async (path) => {
+      if (path.endsWith("/request.json")) throw stop;
+      throw new Error("404 not found");
+    });
+    const repositoryBinding = emulateRepositoryBinding(sandbox);
+
+    await expect(adapterFor(sandbox).executeWork(request, {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    })).rejects.toBe(stop);
+
+    expect(sandbox.git.clone).toHaveBeenCalledWith(
+      "https://github.com/owner/repository.git",
+      "/var/lib/openthrottle/repository-source/repo.part",
+      "main",
+      request.input_subject,
+      "x-access-token",
+      "github-token",
+      false,
+    );
+    const publish = sandbox.process.executeCommand.mock.calls.find(
+      ([command]) => String(command).includes("mv --") && String(command).includes("repository-source"),
+    );
+    expect(publish).toBeDefined();
+    expect(String(publish![0])).not.toContain("github-token");
+    expect(spawnSync("/bin/sh", ["-n", "-c", String(publish![0])]).status).toBe(0);
+    expect(repositoryBinding.isReady()).toBe(true);
+    expect(sandbox.process.executeSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it("replaces a partial owned clone on recovered exact-subject setup", async () => {
+    const request = workRequest();
+    const stop = new Error("stop after recovered repository materialization");
+    const sandbox = sandboxWith(async (path) => {
+      if (path.endsWith("/request.json")) throw stop;
+      throw new Error("404 not found");
+    });
+    const repositoryBinding = emulateRepositoryBinding(sandbox);
+    sandbox.git.clone
+      .mockRejectedValueOnce(new Error("provider connection lost during clone"))
+      .mockResolvedValueOnce(undefined);
+    const adapter = adapterFor(sandbox);
+    const callbacks = (lease_generation: number) => ({
+      lease_generation,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    });
+
+    await expect(adapter.executeWork(request, callbacks(0)))
+      .rejects.toThrow("provider connection lost during clone");
+    await expect(adapter.executeWork(request, callbacks(1))).rejects.toBe(stop);
+
+    expect(sandbox.git.clone).toHaveBeenCalledTimes(2);
+    expect(sandbox.fs.deleteFile).toHaveBeenCalledTimes(2);
+    expect(sandbox.fs.deleteFile).toHaveBeenCalledWith(
+      "/var/lib/openthrottle/repository-source/repo.part",
+      true,
+    );
+    expect(repositoryBinding.isReady()).toBe(true);
+  });
+
+  it("fails closed when the final repository conflicts with the sealed input subject", async () => {
+    const request = workRequest();
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (command.includes("lease-generation.lock")) return sandbox.defaultExecuteCommand(command);
+      if (command.includes("install -d") && command.includes("repository-source")) {
+        return { exitCode: 0, result: "" };
+      }
+      if (command.includes("repository-source")) return { exitCode: 45, result: "" };
+      return sandbox.defaultExecuteCommand(command);
+    });
+
+    await expect(adapterFor(sandbox).executeWork(request, {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    })).rejects.toThrow("repository source conflicts with the exact run binding");
+    expect(sandbox.git.clone).not.toHaveBeenCalled();
+    expect(sandbox.process.executeSessionCommand).not.toHaveBeenCalled();
+  });
+
   it("emits a POSIX-valid exact lease-generation refresh command", async () => {
     const request = workRequest();
     const resultPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/result.json";
@@ -318,6 +431,55 @@ describe("DaytonaKernelAdapter", () => {
     expect(sandbox.fs.downloadFile.mock.calls.filter(([path]) => path === bundlePath))
       .toHaveLength(1);
     expect(sandbox.fs.uploadFile).not.toHaveBeenCalledWith(bytes, bundlePath);
+  });
+
+  it("rejects a replaced source checkout before importing a checkpoint as executor", async () => {
+    const bytes = Buffer.from("checkpoint bytes");
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const request = workRequest({
+      context: {
+        records: [],
+        checkpoints: [{
+          output_subject: "c".repeat(40),
+          payload: { blob: {
+            algorithm: "sha256",
+            digest,
+            bytes: bytes.byteLength,
+            encoding: "binary",
+            media_type: "application/x-git-bundle",
+            payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+          } },
+        }],
+      },
+    });
+    const stop = new Error("checkpoint import reached the replaced repository");
+    const sandbox = sandboxWith(async (path) => {
+      if (path.endsWith("/request.json")) throw stop;
+      throw new Error("404 not found");
+    });
+    sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (command.includes("lease-generation.lock")) return sandbox.defaultExecuteCommand(command);
+      if (command.includes("/var/lib/openthrottle/repository-source")) {
+        return { exitCode: 45, result: "" };
+      }
+      if (command.startsWith("git bundle list-heads")) {
+        return {
+          exitCode: 0,
+          result: `${request.input_subject} refs/openthrottle/checkpoints/${digest}\n`,
+        };
+      }
+      return { exitCode: 0, result: "" };
+    });
+
+    await expect(adapterFor(sandbox, { read: vi.fn().mockReturnValue(bytes) }).executeWork(request, {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    })).rejects.toThrow("repository source physical fence is invalid");
+    expect(sandbox.process.executeCommand.mock.calls.some(
+      ([command]) => String(command).startsWith("git bundle list-heads"),
+    )).toBe(false);
   });
 
   it("fails closed before accepting a replay when the exact lease heartbeat is lost", async () => {
@@ -516,6 +678,141 @@ describe("DaytonaKernelAdapter", () => {
       lease_generation: 1,
     });
     expect(sandbox.files.get(staleStage)).toBeDefined();
+  });
+
+  it("settles promptly when the asynchronous entrypoint exits without a sealed result", async () => {
+    vi.useFakeTimers();
+    try {
+      const request = workRequest();
+      const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+      sandbox.process.getSessionCommand.mockResolvedValue({ cmdId: "command-1", exitCode: 1 });
+      const execution = adapterFor(sandbox, {}, {}, { task_timeout_seconds: 60 }).executeWork(request, {
+        lease_generation: 0,
+        heartbeat_interval_ms: 10_000,
+        on_heartbeat: vi.fn().mockResolvedValue(undefined),
+        on_session: vi.fn(),
+      });
+      let settled = false;
+      void execution.then(() => { settled = true; });
+
+      await vi.advanceTimersByTimeAsync(5);
+      const settledPromptly = settled;
+      await vi.advanceTimersByTimeAsync(60_100);
+
+      await expect(execution).resolves.toEqual({
+        state: "work_failed",
+        retryable: true,
+        reason: "Daytona action command exited with code 1 without producing a sealed result; session termination was verified",
+      });
+      expect(settledPromptly).toBe(true);
+      expect(sandbox.process.getSessionCommand).toHaveBeenCalledWith(
+        "kernel-attempt-1",
+        "command-1",
+      );
+      expect(sandbox.process.deleteSession).toHaveBeenCalledWith("kernel-attempt-1");
+      expect(sandbox.process.getSession).toHaveBeenCalledWith("kernel-attempt-1");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("adopts an existing Attempt command when the asynchronous launch lock is contended", async () => {
+    const request = workRequest();
+    const resultPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/result.json";
+    let resultReads = 0;
+    const sandbox = sandboxWith(async (path) => {
+      if (path === resultPath && ++resultReads === 4) return runtimeResult(request);
+      throw new Error("404 not found");
+    });
+    sandbox.process.getSessionCommand.mockResolvedValue({ cmdId: "command-1", exitCode: 75 });
+
+    await expect(adapterFor(sandbox).executeWork(request, {
+      lease_generation: 1,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    })).resolves.toEqual({
+      state: "work_failed",
+      retryable: true,
+      reason: "runtime failed",
+    });
+    expect(resultReads).toBe(4);
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledWith(
+      "kernel-attempt-1",
+      expect.objectContaining({
+        command: expect.stringContaining("flock --nonblock --conflict-exit-code 75 "),
+      }),
+      expect.any(Number),
+    );
+    expect(sandbox.process.getSessionCommand).toHaveBeenCalledWith(
+      "kernel-attempt-1",
+      "command-1",
+    );
+    expect(sandbox.process.deleteSession).not.toHaveBeenCalled();
+  });
+
+  it("terminates an asynchronously launched session when Daytona omits its launch response", async () => {
+    const request = workRequest();
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.process.executeSessionCommand.mockResolvedValue(undefined);
+
+    await expect(adapterFor(sandbox).executeWork(request, {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    })).resolves.toEqual({
+      state: "work_failed",
+      retryable: true,
+      reason: "Daytona action launch omitted its command identity; session termination was verified",
+    });
+    expect(sandbox.process.deleteSession).toHaveBeenCalledWith("kernel-attempt-1");
+    expect(sandbox.process.getSession).toHaveBeenCalledWith("kernel-attempt-1");
+    expect(sandbox.process.getSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a command-less Daytona launch cannot be proven terminated", async () => {
+    const request = workRequest();
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.process.executeSessionCommand.mockResolvedValue({ cmdId: undefined });
+    sandbox.process.getSession.mockResolvedValue({ id: "kernel-attempt-1" });
+
+    await expect(adapterFor(sandbox).executeWork(request, {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    })).resolves.toEqual({
+      state: "work_failed",
+      retryable: false,
+      reason: "Daytona action launch omitted its command identity and session termination could not be verified",
+    });
+    expect(sandbox.process.deleteSession).toHaveBeenCalledWith("kernel-attempt-1");
+    expect(sandbox.process.getSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it("accepts a sealed result that races asynchronous command completion", async () => {
+    const request = workRequest();
+    const resultPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/result.json";
+    let resultReads = 0;
+    const sandbox = sandboxWith(async (path) => {
+      if (path === resultPath && ++resultReads === 3) return runtimeResult(request);
+      throw new Error("404 not found");
+    });
+    sandbox.process.getSessionCommand.mockResolvedValue({ cmdId: "command-1", exitCode: 0 });
+
+    await expect(adapterFor(sandbox).executeWork(request, {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    })).resolves.toEqual({
+      state: "work_failed",
+      retryable: true,
+      reason: "runtime failed",
+    });
+    expect(resultReads).toBe(3);
+    expect(sandbox.process.deleteSession).not.toHaveBeenCalled();
   });
 
   it("final-collects and verifies Daytona session termination before allowing a deadline retry", async () => {

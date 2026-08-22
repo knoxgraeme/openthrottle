@@ -126,7 +126,7 @@ export function integrateCheckpoint({
   request,
   requestDirectory,
   resultPath,
-  sourceRepoDir = "/home/agent/repo",
+  sourceRepoDir = "/var/lib/openthrottle/repository-source/repo",
 }) {
   validateRequest(request);
   if (existsSync(resultPath)) {

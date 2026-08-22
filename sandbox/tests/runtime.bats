@@ -38,14 +38,18 @@ setup() {
   [ ! -e "$SANDBOX_DIR/bin/ot-subject-post.mjs" ]
 }
 
-@test "entrypoint seals the shared source without following symlinks" {
+@test "entrypoint validates the executor-owned source fence before sealing" {
   entrypoint="$SANDBOX_DIR/entrypoint.sh"
 
+  run grep -F 'readonly REPO_PARENT="/var/lib/openthrottle/repository-source"' "$entrypoint"
+  [ "$status" -eq 0 ]
+  run grep -F 'validate_repository_source' "$entrypoint"
+  [ "$status" -eq 0 ]
+  run grep -F 'root:root:700' "$entrypoint"
+  [ "$status" -eq 0 ]
   run grep -F 'seal_repository_source' "$entrypoint"
   [ "$status" -eq 0 ]
   run grep -F -- 'find -P "$REPO_DIR"' "$entrypoint"
-  [ "$status" -eq 0 ]
-  run grep -F -- 'chown -h root:root' "$entrypoint"
   [ "$status" -eq 0 ]
   run grep -F -- 'chmod a-w' "$entrypoint"
   [ "$status" -eq 0 ]

@@ -91,6 +91,8 @@ describe("sandbox Dockerfile", () => {
       "supervisor/scripts/kernel-sandbox-e2e.mjs",
     ]) {
       const harness = readFileSync(resolve(repoRoot, path), "utf8");
+      expect(harness, path).toContain("/var/lib/openthrottle/repository-source/repo");
+      expect(harness, path).not.toContain("/home/agent/repo");
       expect(harness, path).toContain("OT_LEASE_GENERATION_FENCE_FILE=");
       expect(harness, path).toContain("OT_LEASE_GENERATION_LOCK_FILE=");
       expect(harness, path).toContain("openthrottle.kernel-lease-generation-fence/v1");

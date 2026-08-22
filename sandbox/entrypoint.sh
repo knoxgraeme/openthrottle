@@ -5,7 +5,8 @@
 set -euo pipefail
 
 readonly AGENT_USER="agent"
-readonly REPO_DIR="/home/agent/repo"
+readonly REPO_PARENT="/var/lib/openthrottle/repository-source"
+readonly REPO_DIR="${REPO_PARENT}/repo"
 readonly RUNNER_DIR="/opt/openthrottle/runner"
 
 log() {
@@ -37,11 +38,49 @@ sealed_input() {
     || { log "${label} must not be writable"; return 1; }
 }
 
+validate_repository_source() {
+  local ownership_violation write_violation
+
+  # The enclosing 0700 directory is the replacement fence: the agent cannot
+  # traverse it, rename the checkout, or swap a new tree into its place.
+  [[ -d "$REPO_PARENT" && ! -L "$REPO_PARENT" ]] \
+    || { log "repository source parent is unavailable"; return 1; }
+  [[ "$(readlink -f -- "$REPO_PARENT")" = "$REPO_PARENT" ]] \
+    || { log "repository source parent must be a physical directory"; return 1; }
+  [[ "$(stat -c '%U:%G:%a' "$REPO_PARENT")" = "root:root:700" ]] \
+    || { log "repository source parent must be root:root mode 0700"; return 1; }
+
+  for path in "$REPO_DIR" "$REPO_DIR/.git"; do
+    [[ -d "$path" && ! -L "$path" ]] \
+      || { log "repository source component is not a physical directory: ${path}"; return 1; }
+    [[ "$(readlink -f -- "$path")" = "$path" ]] \
+      || { log "repository source component escapes its physical path: ${path}"; return 1; }
+    [[ "$(stat -c '%U:%G' "$path")" = "root:root" ]] \
+      || { log "repository source component must be root-owned: ${path}"; return 1; }
+    [[ $(( 8#$(stat -c '%a' "$path") & 0022 )) -eq 0 ]] \
+      || { log "repository source component must not be agent-writable: ${path}"; return 1; }
+  done
+
+  ownership_violation="$(find -P "$REPO_DIR" \( ! -user root -o ! -group root \) -print -quit)" \
+    || { log "repository source ownership validation failed"; return 1; }
+  [[ -z "$ownership_violation" ]] \
+    || { log "repository source tree must be root-owned"; return 1; }
+  write_violation="$(find -P "$REPO_DIR" ! -type l -perm /022 -print -quit)" \
+    || { log "repository source writeability validation failed"; return 1; }
+  [[ -z "$write_violation" ]] \
+    || { log "repository source tree must not be agent-writable"; return 1; }
+}
+
 seal_repository_source() {
-  # The bound checkout is executor input, never an agent workspace. Physical
-  # traversal keeps repository symlinks intact and never changes their targets.
-  find -P "$REPO_DIR" -exec chown -h root:root -- {} +
+  local write_violation
+
+  # Root-owned Git imports may leave owner-write bits behind. Remove them before
+  # constructing any action view; physical traversal preserves symlink targets.
   find -P "$REPO_DIR" ! -type l -exec chmod a-w -- {} +
+  write_violation="$(find -P "$REPO_DIR" ! -type l -perm /0222 -print -quit)" \
+    || { log "repository source seal verification failed"; return 1; }
+  [[ -z "$write_violation" ]] \
+    || { log "repository source tree could not be sealed read-only"; return 1; }
 }
 
 handle_exit() {
@@ -50,10 +89,8 @@ handle_exit() {
 trap handle_exit EXIT INT TERM
 
 [[ "$(id -u)" -eq 0 ]] || { log "entrypoint must run as root"; exit 1; }
-[[ -d "$REPO_DIR" && ! -L "$REPO_DIR" ]] \
-  || { log "bound repository is unavailable at ${REPO_DIR}"; exit 1; }
-
 terminate_agent_processes
+validate_repository_source
 seal_repository_source
 
 if [[ -n "${OT_INTEGRATION_REQUEST_FILE:-}" || -n "${OT_INTEGRATION_RESULT_FILE:-}" ]]; then
