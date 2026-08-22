@@ -1,18 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { inspectGitEnvironment, inspectPolicyArgs } from "./repository-authority.mjs";
+import {
+  inspectPolicyArgs,
+  repositoryGitEnvironment,
+} from "./repository-authority.mjs";
 
-describe("inspect repository authority", () => {
-  it("allows Git to trust exactly the sealed action repository", () => {
-    expect(inspectGitEnvironment("/var/lib/openthrottle/actions/a/repository")).toEqual({
+describe("repository authority", () => {
+  it("allows Git to trust exactly one sealed action repository", () => {
+    const environment = repositoryGitEnvironment("/var/lib/openthrottle/actions/a/repository");
+    expect(environment).toEqual({
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: "safe.directory",
       GIT_CONFIG_VALUE_0: "/var/lib/openthrottle/actions/a/repository",
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_OPTIONAL_LOCKS: "0",
+      GIT_TERMINAL_PROMPT: "0",
     });
-    expect(() => inspectGitEnvironment("relative/repository")).toThrow("absolute repository path");
-    expect(() => inspectGitEnvironment("/")).toThrow("cannot be safely scoped");
+    expect(() => repositoryGitEnvironment("relative/repository"))
+      .toThrow("absolute repository path");
+    expect(() => repositoryGitEnvironment("/"))
+      .toThrow("cannot be safely scoped");
+    expect(() => repositoryGitEnvironment("/var/lib/openthrottle/actions/*/repository"))
+      .toThrow("cannot be safely scoped");
   });
 
   it("keeps native CLI inspection non-mutating", () => {

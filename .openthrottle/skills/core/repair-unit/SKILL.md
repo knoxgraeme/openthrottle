@@ -1,13 +1,13 @@
 ---
 name: repair-unit
-description: Use when diagnosing and repairing a failed plan unit without widening its original scope.
+description: Use when diagnosing and repairing a failed scoped change without widening its original scope.
 ---
 
-# Repair one plan unit
+# Repair one scoped change
 
-Repair the supplied unit from concrete failure evidence. The original unit
+Repair the supplied change from concrete failure evidence. Its original
 requirements remain the scope; failures and revision requests identify what is
-wrong, not permission to redesign the unit.
+wrong, not permission to redesign the change.
 
 ## Establish the failure
 
@@ -18,7 +18,7 @@ wrong, not permission to redesign the unit.
 4. State a causal hypothesis and the observation that would falsify it.
 
 If the evidence does not identify a concrete failure, stop and identify the
-missing information instead of rewriting the unit speculatively.
+missing information instead of rewriting the change speculatively.
 
 ## Repair
 

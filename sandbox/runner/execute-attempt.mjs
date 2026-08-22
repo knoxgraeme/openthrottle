@@ -43,6 +43,7 @@ import {
   launchDiagnosticTail,
 } from "./launch-failure.mjs";
 import { runCapturedProcess } from "./bounded-process.mjs";
+import { repositoryGitEnvironment } from "./repository-authority.mjs";
 import {
   inspectResultSubmissionChannel,
   materializeResultSubmissionChannel,
@@ -382,8 +383,11 @@ function agentPreparedRuntimeException(error, env) {
 }
 
 function defaultCommandRunner({ commandLine, repositoryPath, timeoutMs }) {
-  const safeEnv = Object.fromEntries(["PATH", "LANG", "LC_ALL", "TZ"].flatMap((name) =>
-    process.env[name] ? [[name, process.env[name]]] : []));
+  const safeEnv = {
+    ...Object.fromEntries(["PATH", "LANG", "LC_ALL", "TZ"].flatMap((name) =>
+      process.env[name] ? [[name, process.env[name]]] : [])),
+    ...repositoryGitEnvironment(repositoryPath),
+  };
   if (typeof process.getuid === "function" && process.getuid() === 0 && existsSync("/usr/local/bin/gosu")) {
     return runCapturedProcess("/usr/local/bin/gosu", [
       "agent", "env", ...Object.entries(safeEnv).map(([key, value]) => `${key}=${value}`),

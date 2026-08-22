@@ -21,8 +21,8 @@ stages:
     kind: agent
     agent_id: core/ordinary-worker
     repository_authority: edit
-    skills: [core/implement-plan]
-    entry_skill: core/implement-plan
+    skills: [core/repair-unit]
+    entry_skill: core/repair-unit
     eval: core/action-result
     on:
       success: {to: review}

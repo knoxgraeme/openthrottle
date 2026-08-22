@@ -155,9 +155,12 @@ export class KernelWorker {
       progressed += 1;
     }
 
-    for (let index = 0; index < this.#cycleLimit && !signal?.aborted; index += 1) {
+    // A fresh Attempt may run long enough for a control event to arrive. Yield
+    // after one lease so the next cycle traverses the durable inbox before any
+    // newly eligible successor can start.
+    if (this.#cycleLimit > 0 && !signal?.aborted) {
       const attemptFence = this.#fence("attempt");
-      let leased: Awaited<ReturnType<KernelAttemptLeasePort["leaseNextEligibleAttempt"]>>;
+      let leased: Awaited<ReturnType<KernelAttemptLeasePort["leaseNextEligibleAttempt"]>> = null;
       try {
         leased = await this.#attempts.leaseNextEligibleAttempt({
           worker_id: this.#workerId,
@@ -165,10 +168,9 @@ export class KernelWorker {
           expires_at: attemptFence.expires_at,
         });
       } catch {
-        break;
+        leased = null;
       }
-      if (!leased) break;
-      if (await this.#executeLeasedAttempt(leased)) progressed += 1;
+      if (leased && await this.#executeLeasedAttempt(leased)) progressed += 1;
     }
 
     for (let index = 0; index < this.#cycleLimit && !signal?.aborted; index += 1) {

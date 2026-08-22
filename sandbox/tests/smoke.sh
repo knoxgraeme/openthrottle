@@ -98,6 +98,32 @@ const request = (attempt, authority, requestHash) => ({
 });
 writeFileSync(join(output, "edit.json"), `${JSON.stringify(request("attempt-edit", "edit", "a".repeat(64)))}\n`);
 writeFileSync(join(output, "inspect.json"), `${JSON.stringify(request("attempt-inspect", "inspect", "c".repeat(64)))}\n`);
+writeFileSync(join(output, "command.json"), `${JSON.stringify({
+  ...request("attempt-command", "edit", "e".repeat(64)),
+  action: {
+    kind: "command",
+    command_id: "git-metadata",
+    command_line: [
+      'test "$(id -un)" = agent',
+      'test "$(stat -c %U .)" = agent',
+      'test "$(stat -c %U .git)" = root',
+      'test ! -w .git',
+      'test ! -w .git/config',
+      'test "$GIT_CONFIG_COUNT" = 1',
+      'test "$GIT_CONFIG_KEY_0" = safe.directory',
+      'test "$GIT_CONFIG_VALUE_0" = "$PWD"',
+      'test "$GIT_CONFIG_NOSYSTEM" = 1',
+      'test "$GIT_CONFIG_GLOBAL" = /dev/null',
+      'test "$GIT_OPTIONAL_LOCKS" = 0',
+      'test "$GIT_TERMINAL_PROMPT" = 0',
+      'test "$(git config --get-all safe.directory)" = "$PWD"',
+      'test "$(git rev-parse --show-toplevel)" = "$PWD"',
+      'test "$(git show --no-patch --format=%s HEAD)" = "OpenThrottle action boundary"',
+    ].join(" && "),
+    post_bootstrap: [],
+    execution_limits: { max_turns: null, task_timeout_seconds: 120 },
+  },
+})}\n`);
 NODE
 
 mkdir -p "$SMOKE_DIR/stub"
@@ -170,7 +196,7 @@ POISON
 chmod 0755 "$SMOKE_DIR/poison/claude"
 
 CONTAINER="$(docker run -d --entrypoint tail "$IMAGE" -f /dev/null)"
-docker exec "$CONTAINER" mkdir -p /var/lib/openthrottle/repository-source/repo /requests /transport/edit /transport/inspect /runtime/fences /tmp/stub /tmp/poison
+docker exec "$CONTAINER" mkdir -p /var/lib/openthrottle/repository-source/repo /requests /transport/edit /transport/inspect /transport/command /runtime/fences /tmp/stub /tmp/poison
 docker cp "$SOURCE_REPO/." "$CONTAINER:/var/lib/openthrottle/repository-source/repo/"
 docker cp "$REQUESTS/." "$CONTAINER:/requests/"
 docker cp "$SMOKE_DIR/stub/." "$CONTAINER:/tmp/stub/"
@@ -185,7 +211,7 @@ docker exec "$CONTAINER" sh -c '
   chmod 0400 /requests/*.json
   chmod 0755 /tmp/stub/claude /tmp/poison/claude
 '
-for name in edit inspect; do
+for name in edit inspect command; do
   docker exec "$CONTAINER" sh -c '
     printf '\''{"schema":"openthrottle.kernel-lease-generation-fence/v1","attempt_id":"%s","lease_generation":0}\n'\'' "$1" > "$2"
     : > "$3"
@@ -272,6 +298,16 @@ printf '%s' "$INSPECT_RESULT" | jq -e '
   .outcome.checkpoint.output_subject == null
 ' >/dev/null
 [ "$(git -C "$SOURCE_REPO" show HEAD:work.txt)" = "base" ]
+
+run_action command
+COMMAND_RESULT="$(docker exec "$CONTAINER" cat /transport/command/result.json)"
+printf '%s' "$COMMAND_RESULT" | jq -e '
+  .outcome.state == "work_complete" and
+  .outcome.result.kind == "command" and
+  .outcome.result.outcome == "success" and
+  .outcome.result.command_id == "git-metadata" and
+  .outcome.checkpoint.output_subject == null
+' >/dev/null
 
 for removed in execute-stage.mjs execute-loop.mjs execute-child-action.mjs; do
   docker exec "$CONTAINER" test ! -e "/opt/openthrottle/runner/$removed"
