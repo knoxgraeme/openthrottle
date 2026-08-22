@@ -65,6 +65,7 @@ export interface KernelActiveWorkReport extends KernelActiveWorkSnapshot {
 
 const DEFAULT_RETRY_AFTER_SECONDS = 30;
 const DEFAULT_ACTIVE_WORK_LIMIT = 500;
+const MAX_ACTIVE_WORK_LIMIT = 2_000;
 
 function ingressResponse(
   result: ReturnType<KernelInboxIngressPort["ingest"]>,
@@ -214,7 +215,7 @@ export class KernelControlService {
 
   async activeWorkReport(input: { limit?: number } = {}): Promise<KernelActiveWorkReport> {
     const requestedLimit = input.limit ?? DEFAULT_ACTIVE_WORK_LIMIT;
-    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 2_000) {
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > MAX_ACTIVE_WORK_LIMIT) {
       throw new Error("active-work limit must be between 1 and 2000");
     }
     const durable = this.#activeWork.collectActiveWork(requestedLimit);
@@ -223,9 +224,10 @@ export class KernelControlService {
     let inventoryTruncated = false;
     if (remaining > 0) {
       try {
-        const observed = await this.#runtimeInventory.listActiveRuntimeResources(remaining + 1);
+        const inventoryLimit = Math.min(remaining + 1, MAX_ACTIVE_WORK_LIMIT);
+        const observed = await this.#runtimeInventory.listActiveRuntimeResources(inventoryLimit);
         runtime = observed.slice(0, remaining);
-        inventoryTruncated = observed.length > remaining;
+        inventoryTruncated = observed.length >= inventoryLimit;
       } catch (error) {
         runtime = [{
           id: "inventory-unavailable",
