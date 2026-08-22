@@ -1109,6 +1109,79 @@ describe("shared execution kernel lifecycle", () => {
     });
     expect(pendingAgain.run.cursor).toEqual(currentRun.cursor);
   });
+
+  it("clears correction-only state when result_pending becomes needs_human cleanup", () => {
+    const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const current = attempt({
+      status: "result_pending",
+      version: 4,
+      output_subject: subject("2"),
+      native_session_id: "session-1",
+      checkpoint_id: "checkpoint-1",
+      result_correction_count: 2,
+      result_correction_deadline: "2026-08-20T00:15:00.000Z",
+      lease: {
+        id: "correction-2",
+        generation: 2,
+        worker_id: "worker-1",
+        purpose: "result_correction",
+        expires_at: "later",
+        started: true,
+      },
+      pending_result: {
+        candidate_hash: sha("f"),
+        diagnostics: [{ path: "/payload", detail: "still invalid" }],
+      },
+      context_record_ids: runtime.map(({ id }) => id),
+    });
+    const currentRun = run(current, {
+      current_subject: subject("1"),
+      status: "running",
+      version: 6,
+      checkpoint_ids: { [current.id]: current.checkpoint_id! },
+    });
+    const decision = decisionRecord(runtime.map(({ id }) => id));
+    const cleanupAttempt = attempt({
+      id: "attempt-cleanup-needs-human",
+      scope: stageScope(runtimeStopStageId("needs_human")),
+      repository_authority: "inspect",
+      input_subject: currentRun.current_subject,
+      context_record_ids: [decision.id, ...runtime.map(({ id }) => id)].sort(),
+    });
+
+    const transition = reduce({
+      current,
+      currentRun,
+      currentManifest: manifestWithRuntimeStages(),
+      command: {
+        type: "needs_human",
+        command_id: "terminal-result-correction",
+        attempt_id: current.id,
+        decision_record_id: decision.id,
+        reason: "result_correction_budget_exhausted",
+        resource_disposition: {
+          kind: "cleanup",
+          runtime_delivery_record_ids: runtime.map(({ id }) => id).sort(),
+          cleanup_attempt: cleanupAttempt,
+        },
+      },
+      records: [decision, ...runtime],
+    });
+
+    expect(replacedAttempt(transition, current.id)).toMatchObject({
+      status: "needs_human",
+      output_subject: subject("2"),
+      native_session_id: "session-1",
+      checkpoint_id: "checkpoint-1",
+      result_correction_count: 2,
+      result_correction_deadline: null,
+      lease: null,
+      result_record_id: null,
+      decision_record_id: null,
+      pending_result: null,
+    });
+    expect(transition.create_attempts).toEqual([cleanupAttempt]);
+  });
 });
 
 describe("pipeline topology on the shared kernel", () => {
