@@ -140,6 +140,50 @@ function integrationDelivery(input: {
   };
 }
 
+function rejectedDelivery(input: {
+  id: string;
+  effectKind: string;
+  provider: string;
+  result: Record<string, string>;
+}): DeliveryRecord {
+  return {
+    schema: "openthrottle.record/v1",
+    id: input.id,
+    kind: "delivery",
+    pipeline_run_id: "run-1",
+    effect_id: `effect-${input.id}`,
+    idempotency_key: `run-1:${input.id}`,
+    external_identity: `${input.provider}:rejected`,
+    status: "rejected",
+    payload_schema: "openthrottle.effect-delivery/v1",
+    payload: { inline: {
+      effect_kind: input.effectKind,
+      provider: input.provider,
+      result: input.result,
+    } },
+    created_at: NOW,
+  };
+}
+
+async function evaluateRejected(
+  externalKind: "core/publish@1" | "core/integrate-unit@1",
+  delivery: DeliveryRecord,
+  intentKind = "daytona/integrate-checkpoint@1",
+) {
+  const bindings = createKernelExternalPlanBindings({
+    environments: {} as never,
+    blob_store: {} as never,
+  });
+  const binding = bindings.find(({ external_kind }) => external_kind === externalKind)!;
+  return binding.evaluate({
+    run: {} as never,
+    attempt: {} as never,
+    stage: {} as never,
+    prepared: {} as never,
+    schedules: [{ effects: [{ intent: { kind: intentKind }, delivery }] }] as never,
+  });
+}
+
 function integrationBudgetFixture() {
   const root = mkdtempSync(join(tmpdir(), "ot-kernel-integration-budget-"));
   directories.push(root);
@@ -272,6 +316,54 @@ afterEach(() => {
 });
 
 describe("kernel publication plan binding", () => {
+  it("preserves retryable Daytona integration failures for publish and unit integration", async () => {
+    const delivery = rejectedDelivery({
+      id: "delivery-retryable-integration",
+      effectKind: "daytona/integrate-checkpoint@1",
+      provider: "daytona",
+      result: {
+        schema: "openthrottle.daytona-integration-delivery/v1",
+        state: "retryable_failure",
+      },
+    });
+
+    await expect(evaluateRejected("core/publish@1", delivery)).resolves.toMatchObject({
+      outcome: "retryable_infrastructure_failure",
+    });
+    await expect(evaluateRejected("core/integrate-unit@1", delivery)).resolves.toMatchObject({
+      outcome: "retryable_infrastructure_failure",
+    });
+  });
+
+  it("keeps needs-human and non-integration rejections permanent", async () => {
+    const needsHuman = rejectedDelivery({
+      id: "delivery-needs-human-integration",
+      effectKind: "daytona/integrate-checkpoint@1",
+      provider: "daytona",
+      result: {
+        schema: "openthrottle.daytona-integration-delivery/v1",
+        state: "needs_human",
+      },
+    });
+    const githubRejection = rejectedDelivery({
+      id: "delivery-rejected-push",
+      effectKind: "github/push-checkpoint@1",
+      provider: "github",
+      result: { schema: "openthrottle.github-push-delivery/v1" },
+    });
+
+    await expect(evaluateRejected("core/publish@1", needsHuman)).resolves.toMatchObject({
+      outcome: "failure",
+    });
+    await expect(evaluateRejected(
+      "core/integrate-unit@1",
+      githubRejection,
+      "github/push-checkpoint@1",
+    )).resolves.toMatchObject({
+      outcome: "failure",
+    });
+  });
+
   it("rejects an aggregate integration bundle over budget before reads or effect scheduling", async () => {
     const fixture = integrationBudgetFixture();
     let reads = 0;

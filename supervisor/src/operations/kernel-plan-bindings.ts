@@ -314,6 +314,20 @@ function deliveryResult(delivery: DeliveryRecord): Record<string, unknown> {
   return result as Record<string, unknown>;
 }
 
+function hasRetryableIntegrationFailure(
+  schedules: Parameters<KernelExternalStagePlanBinding["evaluate"]>[0]["schedules"],
+): boolean {
+  return schedules.some((schedule) => schedule.effects.some(({ intent, delivery }) => {
+    if (
+      intent.kind !== "daytona/integrate-checkpoint@1" ||
+      delivery?.status !== "rejected"
+    ) return false;
+    const evidence = deliveryResult(delivery);
+    return evidence.schema === "openthrottle.daytona-integration-delivery/v1" &&
+      evidence.state === "retryable_failure";
+  }));
+}
+
 function persistedRuntimeIdentity(records: ReadonlyMap<string, import("@openthrottle/contracts").ExecutionRecord>): string {
   const identities = [...records.values()].flatMap((record) => {
     if (
@@ -560,7 +574,12 @@ export function createKernelExternalPlanBindings(input: {
     },
     evaluate: ({ schedules }) => allConfirmed(schedules)
       ? { outcome: "success", summary: "checkpoint and pull request published" }
-      : { outcome: "failure", summary: "publication was rejected" },
+      : hasRetryableIntegrationFailure(schedules)
+        ? {
+          outcome: "retryable_infrastructure_failure",
+          summary: "publication integration hit a retryable infrastructure failure",
+        }
+        : { outcome: "failure", summary: "publication was rejected" },
   };
 
   const integrate: KernelExternalStagePlanBinding = {
@@ -700,7 +719,12 @@ export function createKernelExternalPlanBindings(input: {
     },
     evaluate: ({ schedules }) => allConfirmed(schedules)
       ? { outcome: "all_integrated", summary: "unit checkpoint integrated and durably pushed" }
-      : { outcome: "failure", summary: "unit integration was rejected" },
+      : hasRetryableIntegrationFailure(schedules)
+        ? {
+          outcome: "retryable_infrastructure_failure",
+          summary: "unit integration hit a retryable infrastructure failure",
+        }
+        : { outcome: "failure", summary: "unit integration was rejected" },
   };
 
   const wait: KernelExternalStagePlanBinding = {
