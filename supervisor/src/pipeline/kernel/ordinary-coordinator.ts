@@ -1006,19 +1006,36 @@ export class OrdinaryKernelCoordinator {
       attempt_id: input.current.id,
     });
     const successorSubject = input.current.output_subject ?? input.current.input_subject;
-    const candidates = [...workInputs.context.checkpoints.values()]
+    const inheritedCheckpoints = [...workInputs.context.checkpoints.values()]
       .filter((checkpoint) => checkpoint.output_subject === successorSubject);
-    if (input.current.checkpoint_id && input.current.output_subject === successorSubject) {
+    const loadCurrentCheckpoint = async (): Promise<AttemptCheckpoint> => {
+      if (input.current.checkpoint_id === null) {
+        throw new Error(`attempt ${input.current.id} has no exact successor checkpoint`);
+      }
       const exact = await this.#load(
         input.view.run.id,
         input.current.id,
         [],
         [input.current.checkpoint_id],
       );
-      candidates.unshift(exact.checkpoints.get(input.current.checkpoint_id)!);
+      const checkpoint = exact.checkpoints.get(input.current.checkpoint_id);
+      if (!checkpoint) {
+        throw new Error(`attempt ${input.current.id} has no exact successor checkpoint`);
+      }
+      return checkpoint;
+    };
+    let checkpoints: AttemptCheckpoint[];
+    if (
+      input.current.output_subject !== null &&
+      input.current.output_subject !== input.current.input_subject
+    ) {
+      checkpoints = [await loadCurrentCheckpoint()];
+    } else if (input.current.output_subject === input.current.input_subject) {
+      checkpoints = inheritedCheckpoints;
+      if (checkpoints.length === 0) checkpoints = [await loadCurrentCheckpoint()];
+    } else {
+      checkpoints = inheritedCheckpoints;
     }
-    const byId = new Map(candidates.map((checkpoint) => [checkpoint.id, checkpoint]));
-    const checkpoints = [...byId.values()];
     if (checkpoints.length > 1) {
       throw new Error(`successor ${target.id} has ambiguous checkpoint materialization for ${successorSubject}`);
     }
