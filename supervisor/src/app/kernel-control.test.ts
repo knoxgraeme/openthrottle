@@ -302,6 +302,25 @@ describe("KernelControlService", () => {
     });
     expect(bounded.inventory.limits).toEqual([]);
 
+    const maximal = setup();
+    expect(await maximal.control.activeWorkReport({ limit: 2_000 })).toMatchObject({
+      clear: true,
+      truncated: false,
+      items: [],
+    });
+    expect(maximal.inventory.limits).toEqual([2_000]);
+
+    maximal.inventory.resources = Array.from({ length: 2_000 }, (_, index) => ({
+      id: `workspace-${String(index).padStart(4, "0")}`,
+      provider: "daytona",
+      state: "started",
+      pipeline_run_id: null,
+    }));
+    const saturated = await maximal.control.activeWorkReport({ limit: 2_000 });
+    expect(saturated).toMatchObject({ clear: false, truncated: true });
+    expect(saturated.items).toHaveLength(2_000);
+    expect(maximal.inventory.limits).toEqual([2_000, 2_000]);
+
     const unavailable = setup();
     unavailable.inventory.failure = new Error("provider timeout");
     expect(await unavailable.control.activeWorkReport({ limit: 2 })).toEqual({
