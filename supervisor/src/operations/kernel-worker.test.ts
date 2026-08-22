@@ -38,8 +38,13 @@ function inboxEvent(): KernelInboxEvent {
   };
 }
 
-function workerFixture(handler: () => Promise<"consumed" | "stale" | "dead">) {
-  let next: KernelInboxEvent | null = inboxEvent();
+function workerFixture(
+  handler: (event: KernelInboxEvent) => Promise<"consumed" | "stale" | "dead">,
+  options: { initial_inbox_event?: KernelInboxEvent | null } = {},
+) {
+  let next: KernelInboxEvent | null = options.initial_inbox_event === undefined
+    ? inboxEvent()
+    : options.initial_inbox_event;
   const leaseNext = vi.fn(() => {
     const leased = next;
     next = null;
@@ -89,6 +94,7 @@ function workerFixture(handler: () => Promise<"consumed" | "stale" | "dead">) {
     ordinary,
     external,
     effects,
+    enqueueInboxEvent: (event: KernelInboxEvent) => { next = event; },
   };
 }
 
@@ -179,5 +185,73 @@ describe("KernelWorker", () => {
       expect.objectContaining({ message: "runtime reconciliation failed" }),
     );
     expect(fixture.attempts.leaseNextEligibleAttempt).toHaveBeenCalledOnce();
+  });
+
+  it("gives a stop event arriving during work the next cycle before leasing a successor", async () => {
+    let stopped = false;
+    const stopEvent: KernelInboxEvent = {
+      ...inboxEvent(),
+      source_provider: "operator",
+      kind: "control/stop@1",
+      pipeline_run_id: "run-active",
+      generation: 4,
+      event_group_key: "control:run-active:stop:4",
+      payload_schema: "openthrottle.operator-control/v1",
+      payload: {
+        schema: "openthrottle.operator-control/v1",
+        pipeline_run_id: "run-active",
+        action: "stop",
+        cursor_version: 4,
+        reason: "operator requested stop",
+      },
+    };
+    const handle = vi.fn(async (event: KernelInboxEvent) => {
+      expect(event).toBe(stopEvent);
+      stopped = true;
+      return "consumed" as const;
+    });
+    const fixture = workerFixture(handle, { initial_inbox_event: null });
+    const first = {
+      run_id: "run-active",
+      attempt: { id: "attempt-first" },
+      lease: { id: "lease-first", generation: 1 },
+    } as never;
+    const successor = {
+      run_id: "run-active",
+      attempt: { id: "attempt-successor" },
+      lease: { id: "lease-successor", generation: 1 },
+    } as never;
+    const available = [first, successor];
+    vi.mocked(fixture.attempts.leaseNextEligibleAttempt).mockImplementation(async () => {
+      if (stopped) return null;
+      return available.shift() ?? null;
+    });
+    vi.mocked(fixture.ordinary.executeLeasedAttempt).mockImplementation(async (leased) => {
+      if (leased === first) {
+        fixture.enqueueInboxEvent(stopEvent);
+      }
+      return {
+        disposition: "settled" as const,
+        pipeline_run_id: "run-active",
+        attempt_id: leased.attempt.id,
+        stage_id: "implement",
+        run_status: "running" as const,
+        next_stage_id: "review",
+      };
+    });
+
+    await expect(fixture.worker.runCycle()).resolves.toBe(1);
+    expect(fixture.attempts.leaseNextEligibleAttempt).toHaveBeenCalledOnce();
+    expect(fixture.ordinary.executeLeasedAttempt).toHaveBeenCalledTimes(1);
+    expect(fixture.ordinary.executeLeasedAttempt).toHaveBeenCalledWith(first);
+
+    await expect(fixture.worker.runCycle()).resolves.toBe(1);
+    expect(handle).toHaveBeenCalledOnce();
+    expect(handle.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(fixture.attempts.leaseNextEligibleAttempt).mock.invocationCallOrder[1]!,
+    );
+    expect(fixture.attempts.leaseNextEligibleAttempt).toHaveBeenCalledTimes(2);
+    expect(fixture.ordinary.executeLeasedAttempt).toHaveBeenCalledTimes(1);
+    expect(available).toEqual([successor]);
   });
 });

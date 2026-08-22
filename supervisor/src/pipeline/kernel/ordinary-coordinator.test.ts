@@ -182,8 +182,8 @@ function fixture(): {
     },
     {
       id: "repair", kind: "agent", engine: "codex", agent_id: "core/ordinary-worker",
-      repository_authority: "edit", skills: ["core/implement-plan"],
-      entry_skill: "core/implement-plan", eval: "core/action-result",
+      repository_authority: "edit", skills: ["core/repair-unit"],
+      entry_skill: "core/repair-unit", eval: "core/action-result",
       on: { success: { to: "review" }, failure: { terminal: "failed" } },
     },
     {
@@ -223,6 +223,7 @@ function fixture(): {
     entry("agent", "core/ordinary-worker", "Implement or simplify only the sealed task."),
     entry("agent", "core/reviewer", "Inspect the sealed change boundary and report findings."),
     entry("skill", "core/implement-plan", skill("core/implement-plan")),
+    entry("skill", "core/repair-unit", skill("core/repair-unit")),
     entry("skill", "core/review-change", skill("core/review-change")),
     entry("skill", "core/simplify-change", skill("core/simplify-change")),
     entry("eval", "core/action-result", evaluation(
@@ -1270,6 +1271,15 @@ describe("ordinary kernel activation", () => {
         repository_authority: "edit",
         input_subject: IMPLEMENTED,
       });
+      expect(repairRequest.action.kind).toBe("agent");
+      if (repairRequest.action.kind === "agent") {
+        expect(repairRequest.action).toMatchObject({
+          skill_ids: ["core/repair-unit"],
+          entry_skill: "core/repair-unit",
+        });
+        expect(repairRequest.action.definition_entries.map(({ definition_id }) => definition_id))
+          .toEqual(["core/ordinary-worker", "core/repair-unit", "core/action-result"]);
+      }
       expect(repairRequest.context.records.map(({ id }) => id)).toEqual([
         reviewAttempt.decision_record_id,
         reviewAttempt.result_record_id,

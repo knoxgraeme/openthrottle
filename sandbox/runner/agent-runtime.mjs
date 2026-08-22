@@ -32,7 +32,7 @@ import {
   INSPECT_CHANGE_CONTEXT_SCHEMA,
 } from "./action-repository.mjs";
 import { identityForUser, isRoot, prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
-import { inspectGitEnvironment, inspectPolicyArgs } from "./repository-authority.mjs";
+import { inspectPolicyArgs, repositoryGitEnvironment } from "./repository-authority.mjs";
 import { extractNativeSessionId } from "./native-session-id.mjs";
 import { resultSubmissionEnvironment } from "./result-submission.mjs";
 
@@ -320,7 +320,7 @@ export function prepareAgentRuntime({ request, actionDirectory, channel, env = p
     OT_LEASE_GENERATION_FENCE_FILE: leaseGenerationFenceFile(env),
     OT_LEASE_GENERATION_LOCK_FILE: leaseGenerationLockFile(env),
     ...(request.repository_authority === "inspect"
-      ? inspectGitEnvironment(request.repository_path)
+      ? repositoryGitEnvironment(request.repository_path)
       : {}),
     ...Object.fromEntries(resultSubmissionEnvironment(channel).map((entry) => {
       const index = entry.indexOf("=");

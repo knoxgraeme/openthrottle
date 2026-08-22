@@ -22,7 +22,7 @@ implement(edit)
 |---|---|---|---|
 | `implement` | `edit` | ordinary worker + `core/implement-plan` | implement the sealed request and leave a verified content tree |
 | `review` | `inspect` | reviewer + `core/review-change` | inspect the exact accepted implementation subject |
-| `repair` | `edit` | ordinary worker + `core/implement-plan` | remediate only validated blocking findings or command failures |
+| `repair` | `edit` | ordinary worker + `core/repair-unit` | diagnose supplied concrete failure evidence, then remediate only validated blocking findings or command failures |
 | `simplify` | `edit` | ordinary worker + `core/simplify-change` | reduce avoidable complexity without changing behavior |
 | `post_simplify_review` | `inspect` | reviewer + `core/review-change` | verify the exact simplified subject |
 | `test`, `lint`, `build` | command | named repository config commands | produce executor-authored deterministic command results |
@@ -30,8 +30,10 @@ implement(edit)
 | `provider` | wait | `core/provider-wait@1` | settle from exact GitHub/provider evidence |
 
 Reviewers never apply small fixes. A blocking review DecisionRecord schedules
-the separate `repair` Attempt. The review action receives the accepted edit
-Checkpoint boundary and cannot make the repository writable.
+the separate `repair` Attempt. That Attempt must enumerate the supplied failure
+evidence, establish its cause, and rerun the exact failing check before focused
+neighbouring checks. The review action receives the accepted edit Checkpoint
+boundary and cannot make the repository writable.
 
 Each edit action may return `no_change`, a semantic repair request, a human
 block, a retryable infrastructure outcome, or failure as allowed by its eval.

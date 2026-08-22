@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -77,7 +77,7 @@ describe("attempt checkpoint bundle", () => {
     });
     const bundlePath = join(actionDirectory, checkpoint.payload_artifact.file);
     expect(statSync(bundlePath).size).toBe(checkpoint.payload_artifact.bytes);
-    expect(spawnSync("git", ["bundle", "verify", bundlePath], { encoding: "utf8" }).status).toBe(0);
+    expect(() => git(source.repo, "bundle", "verify", bundlePath)).not.toThrow();
 
     expect(checkpoint.output_subject).toBe(checkpoint.payload_artifact.commit);
     const restored = mkdtempSync(join(tmpdir(), "ot-checkpoint-restored-"));

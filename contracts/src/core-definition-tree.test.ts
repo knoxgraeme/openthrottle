@@ -381,6 +381,37 @@ describe("root .openthrottle definition tree", () => {
     });
   });
 
+  it("gives ordinary repair the failure-oriented skill without changing its stage contract", () => {
+    const repair = compile("implement").manifest.value.stages.find((stage) => stage.id === "repair");
+
+    expect(repair).toEqual({
+      id: "repair",
+      kind: "agent",
+      agent_id: "core/ordinary-worker",
+      repository_authority: "edit",
+      skills: ["core/repair-unit"],
+      entry_skill: "core/repair-unit",
+      eval: "core/action-result",
+      engine: "codex",
+      on: {
+        success: { to: "review" },
+        no_change: { to: "review" },
+        semantic_repair_required: {
+          to: "repair",
+          max_reentries: 3,
+          on_exhausted: "needs_human",
+        },
+        needs_human: { to: "ot_runtime_stop_needs_human" },
+        retryable_infrastructure_failure: {
+          to: "repair",
+          max_reentries: 3,
+          on_exhausted: "failed",
+        },
+        failure: { to: "ot_runtime_stop_failed" },
+      },
+    });
+  });
+
   it("matches the committed cross-environment compiler golden", () => {
     const config = readFileSync(join(
       repositoryRoot,

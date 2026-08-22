@@ -864,6 +864,49 @@ describe("kernel attempt executor", () => {
     });
   });
 
+  it("lets a sealed command read Git metadata from only its exact action repository", async () => {
+    const source = sourceRepository();
+    const root = mkdtempSync(join(tmpdir(), "ot-attempt-command-git-"));
+    const request = workRequest(source.subject, {
+      action: {
+        kind: "command",
+        command_id: "git-metadata",
+        command_line: [
+          'test "$GIT_CONFIG_COUNT" = 1',
+          'test "$GIT_CONFIG_KEY_0" = safe.directory',
+          'test -n "$GIT_CONFIG_VALUE_0"',
+          'test "$GIT_CONFIG_NOSYSTEM" = 1',
+          'test "$GIT_CONFIG_GLOBAL" = /dev/null',
+          'test "$GIT_OPTIONAL_LOCKS" = 0',
+          'test "$GIT_TERMINAL_PROMPT" = 0',
+          'test "$(git config --get-all safe.directory)" = "$GIT_CONFIG_VALUE_0"',
+          'git rev-parse --verify HEAD >/dev/null',
+        ].join(" && "),
+        post_bootstrap: [],
+        execution_limits: { max_turns: null, task_timeout_seconds: 120 },
+      },
+    });
+
+    const result = await executeAttempt({
+      request,
+      sourceRepoDir: source.repo,
+      actionRoot: join(root, "actions"),
+      resultPath: join(root, "transport", "result.json"),
+      sessionPath: join(root, "transport", "session.json"),
+      now: () => new Date("2026-08-20T00:00:00.000Z"),
+    });
+
+    expect(result.outcome).toMatchObject({
+      state: "work_complete",
+      result: {
+        kind: "command",
+        outcome: "success",
+        command_id: "git-metadata",
+        exit_code: 0,
+      },
+    });
+  });
+
   it("rejects a correction result returned after its sealed deadline", async () => {
     const source = sourceRepository();
     const root = mkdtempSync(join(tmpdir(), "ot-attempt-correction-deadline-"));

@@ -31,13 +31,13 @@ function readableExecutorPaths(paths) {
   return normalized;
 }
 
-export function inspectGitEnvironment(repositoryPath) {
+export function repositoryGitEnvironment(repositoryPath) {
   if (typeof repositoryPath !== "string" || !isAbsolute(repositoryPath)) {
-    throw new Error("inspect Git authority requires an absolute repository path");
+    throw new Error("repository Git authority requires an absolute repository path");
   }
   const root = normalize(repositoryPath);
-  if (root === "/" || /[\0\r\n]/u.test(root)) {
-    throw new Error("inspect Git repository path cannot be safely scoped");
+  if (root === "/" || /[\0\r\n*]/u.test(root)) {
+    throw new Error("repository Git path cannot be safely scoped");
   }
   return {
     GIT_CONFIG_COUNT: "1",
@@ -46,6 +46,7 @@ export function inspectGitEnvironment(repositoryPath) {
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_OPTIONAL_LOCKS: "0",
+    GIT_TERMINAL_PROMPT: "0",
   };
 }
 
