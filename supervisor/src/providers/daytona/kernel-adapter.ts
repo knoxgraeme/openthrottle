@@ -172,6 +172,18 @@ function launchPaths(
   };
 }
 
+function actionSessionId(
+  request: KernelWorkActionRequest | KernelResultCorrectionRequest,
+): string {
+  return `kernel-action-${digestCanonicalJson({
+    schema: "openthrottle.daytona-action-session/v1",
+    pipeline_run_id: request.pipeline_run_id,
+    attempt_id: request.attempt_id,
+    phase: request.phase,
+    lease_id: request.lease_id,
+  }).slice(0, 48)}`;
+}
+
 function sealedActionTimeoutMs(
   request: KernelWorkActionRequest | KernelResultCorrectionRequest,
   platformTimeoutSeconds: number,
@@ -647,7 +659,10 @@ export class DaytonaKernelAdapter implements
       };
     }
     const actionTimeoutSeconds = Math.max(1, Math.ceil(remainingBeforeLaunch / 1_000));
-    const sessionId = `kernel-${safeAttemptId(request.attempt_id)}`;
+    // Daytona sessions snapshot sandbox environment at creation. A recovered
+    // lease must adopt its original command, while a new work/correction lease
+    // must inherit its newly sealed request and result paths.
+    const sessionId = actionSessionId(request);
     await sandbox.process.createSession(sessionId).catch(() => undefined);
     const launch = await sandbox.process.executeSessionCommand(sessionId, {
       command: `flock --nonblock --conflict-exit-code ${DISPATCH_LOCK_CONTENTION_EXIT_CODE} ` +
