@@ -303,6 +303,7 @@ class RuntimeFixture implements KernelRuntimePort {
   readonly correctionRequests: KernelResultCorrectionRequest[] = [];
   pendingOnce = false;
   blockingReview = false;
+  readonly identityOutputStages = new Set<string>();
   workOutcome: (() => Promise<KernelRuntimeOutcome>) | null = null;
   correctionOutcome: (() => Promise<KernelRuntimeOutcome>) | null = null;
 
@@ -317,7 +318,9 @@ class RuntimeFixture implements KernelRuntimePort {
       : null;
     if (nativeSessionId !== null) await callbacks.on_session(nativeSessionId);
     const output = request.repository_authority === "edit"
-      ? request.stage_id === "implement" ? IMPLEMENTED : SIMPLIFIED
+      ? this.identityOutputStages.has(request.stage_id)
+        ? request.input_subject
+        : request.stage_id === "implement" ? IMPLEMENTED : SIMPLIFIED
       : null;
     const checkpoint: AttemptCheckpoint = {
       schema: ATTEMPT_CHECKPOINT_SCHEMA,
@@ -1278,6 +1281,110 @@ describe("ordinary kernel activation", () => {
       `).get(repair.id) as { native_session_id: string };
       expect(boundRepair.native_session_id).toBe(`session-${repair.id}`);
       expect(boundRepair.native_session_id).not.toBe(reviewAttempt.native_session_id);
+    } finally {
+      test.db.close();
+    }
+  });
+
+  it("resumes a recorded no-op repair with its prior cumulative checkpoint", async () => {
+    const runtime = new RuntimeFixture();
+    runtime.blockingReview = true;
+    runtime.identityOutputStages.add("repair");
+    let active = await setup(runtime);
+    try {
+      await execute(active.coordinator, 1);
+      await execute(active.coordinator, 2);
+      const repair = active.db.prepare(`
+        SELECT id FROM attempts WHERE stage_id = 'repair'
+      `).get() as { id: string };
+
+      const apply = active.store.applyAtomicTransition.bind(active.store);
+      let crashPending = true;
+      active.store.applyAtomicTransition = async (transition: AtomicTransitionBundle) => {
+        const result = await apply(transition);
+        if (crashPending && transition.transition_id.startsWith("record-")) {
+          crashPending = false;
+          throw new Error("injected crash after no-op repair record");
+        }
+        return result;
+      };
+
+      await expect(execute(active.coordinator, 3))
+        .rejects.toThrow("injected crash after no-op repair record");
+      expect(active.db.prepare(`
+        SELECT status, input_subject, output_subject, checkpoint_id, result_record_id, lease_id
+        FROM attempts WHERE id = ?
+      `).get(repair.id)).toMatchObject({
+        status: "recorded",
+        input_subject: IMPLEMENTED,
+        output_subject: IMPLEMENTED,
+        checkpoint_id: `checkpoint-${repair.id}`,
+        result_record_id: expect.stringMatching(/^result-/),
+        lease_id: null,
+      });
+
+      active.db.close();
+      active = active.restart();
+      await expect(active.coordinator.resumeReadyAttempt()).resolves.toMatchObject({
+        disposition: "settled",
+        attempt_id: repair.id,
+        next_stage_id: "review",
+      });
+
+      const successor = active.db.prepare(`
+        SELECT id, context_checkpoint_ids_json
+        FROM attempts WHERE stage_id = 'review' AND status = 'pending'
+      `).get() as { id: string; context_checkpoint_ids_json: string };
+      expect(JSON.parse(successor.context_checkpoint_ids_json)).toEqual([
+        "checkpoint-attempt-initial",
+      ]);
+      const inputs = await active.store.loadAttemptRequestInputs({
+        pipeline_run_id: active.run_id,
+        attempt_id: successor.id,
+      });
+      expect([...inputs.context.checkpoints.values()]).toEqual([
+        expect.objectContaining({
+          id: "checkpoint-attempt-initial",
+          attempt_id: "attempt-initial",
+          input_subject: SOURCE,
+          output_subject: IMPLEMENTED,
+        }),
+      ]);
+    } finally {
+      if (active.db.open) active.db.close();
+    }
+  });
+
+  it("falls back to an exact identity checkpoint without an inherited boundary", async () => {
+    const runtime = new RuntimeFixture();
+    runtime.identityOutputStages.add("implement");
+    const test = await setup(runtime);
+    try {
+      await expect(execute(test.coordinator, 1)).resolves.toMatchObject({
+        disposition: "settled",
+        attempt_id: "attempt-initial",
+        next_stage_id: "review",
+      });
+
+      const review = test.db.prepare(`
+        SELECT id, context_checkpoint_ids_json
+        FROM attempts WHERE stage_id = 'review' AND status = 'pending'
+      `).get() as { id: string; context_checkpoint_ids_json: string };
+      expect(JSON.parse(review.context_checkpoint_ids_json)).toEqual([
+        "checkpoint-attempt-initial",
+      ]);
+      const inputs = await test.store.loadAttemptRequestInputs({
+        pipeline_run_id: test.run_id,
+        attempt_id: review.id,
+      });
+      expect([...inputs.context.checkpoints.values()]).toEqual([
+        expect.objectContaining({
+          id: "checkpoint-attempt-initial",
+          attempt_id: "attempt-initial",
+          input_subject: SOURCE,
+          output_subject: SOURCE,
+        }),
+      ]);
     } finally {
       test.db.close();
     }
