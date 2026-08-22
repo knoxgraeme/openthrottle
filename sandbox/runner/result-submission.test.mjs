@@ -26,13 +26,11 @@ const semanticSchema = {
   payload: {
     summary: {
       type: "string",
-      required: true,
       max_length: 4_000,
       normalize: "string-array-to-newlines/v1",
     },
     verification: {
       type: "string_list",
-      required: true,
       max_length: 1_000,
       max_items: 32,
     },

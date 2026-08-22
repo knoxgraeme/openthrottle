@@ -56,9 +56,11 @@ sealed result schema.
 - Include success, boundary, and failure tests where applicable. Verification
   names runnable commands or focused checks that exist in the repository's
   compiled facts; do not invent commands or claim they ran.
-- Every `execution_plan.commands[].name` must be one of the sealed repository
-  `command_names` keys, such as `test`, `lint`, or `build`. Use the key exactly;
-  never copy its shell command value or invent a command name. If the sealed
-  list is empty, return an empty `commands` array.
+- Every `execution_plan.commands[]` entry has exactly `name` and `unit`. `name`
+  must be one of the sealed repository `command_names` keys, such as `test`,
+  `lint`, or `build`; never copy its shell command value or invent a name. Set
+  `unit` to the target unit id for a unit-scoped command, or `null` for a
+  whole-plan command. If the sealed list is empty, return an empty `commands`
+  array.
 - Use one stable `plan_id`, `pipeline_id: "core/structured"`, and the exact v2 fields.
   Keep the canonical plan JSON at or below 256 KiB.

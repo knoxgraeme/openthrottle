@@ -24,33 +24,47 @@ export const RESULT_CANDIDATE_MAX_BYTES = 64 * 1024;
 export const SEMANTIC_EXECUTION_PLAN_MAX_BYTES = 56 * 1024;
 
 const SEMANTIC_FIELD_TYPES = [
-  "string", "string_list", "boolean", "integer", "json", "execution_plan_v2",
+  "string", "string_list", "review_finding_list_v1", "boolean", "integer", "execution_plan_v2",
 ] as const;
+export const REVIEW_FINDING_SEVERITIES = ["P0", "P1", "P2", "P3"] as const;
 const OUTCOME = /^[a-z][a-z0-9]*(?:[._/-][a-z0-9]+)*$/;
 const FIELD_NAME = /^[a-z][a-z0-9_]*$/;
 const MAX_PAYLOAD_FIELDS = 64;
-const MAX_JSON_BYTES = 64 * 1024;
 const MAX_NORMALIZED_STRING_ITEMS = 32;
+const REVIEW_FINDING_FIELDS = ["anchor", "evidence", "path", "severity", "title"] as const;
+const REVIEW_FINDING_PATH_MAX_LENGTH = 512;
+const REVIEW_FINDING_ANCHOR_MAX_LENGTH = 512;
+const REVIEW_FINDING_TITLE_MAX_LENGTH = 300;
+const REVIEW_FINDING_EVIDENCE_MAX_LENGTH = 2_000;
 
 export type ResultNormalizationId = (typeof RESULT_NORMALIZATIONS)[number];
 export type SemanticFieldType = (typeof SEMANTIC_FIELD_TYPES)[number];
+export type ReviewFindingSeverity = (typeof REVIEW_FINDING_SEVERITIES)[number];
 
-interface SemanticFieldBase {
-  required: boolean;
+export interface ReviewFindingV1 {
+  severity: ReviewFindingSeverity;
+  path: string;
+  anchor: string;
+  title: string;
+  evidence: string;
 }
 
 export type SemanticFieldContract =
-  | (SemanticFieldBase & {
+  | {
     type: "string";
     max_length: number;
     normalize?: ResultNormalizationId;
-  })
-  | (SemanticFieldBase & {
+  }
+  | {
     type: "string_list";
     max_length: number;
     max_items: number;
-  })
-  | (SemanticFieldBase & { type: "boolean" | "integer" | "json" | "execution_plan_v2" });
+  }
+  | {
+    type: "review_finding_list_v1";
+    max_items: number;
+  }
+  | { type: "boolean" | "integer" | "execution_plan_v2" };
 
 type StringSemanticFieldContract = Extract<SemanticFieldContract, { type: "string" }>;
 
@@ -81,14 +95,14 @@ export interface NormalizedResultCandidate extends ValidatedContract<ResultCandi
 }
 
 function parseSemanticField(value: unknown, path: string): SemanticFieldContract {
-  const input = objectAt(value, path, ["type", "required", "max_length", "max_items", "normalize"]);
+  const input = objectAt(value, path, ["type", "max_length", "max_items", "normalize"]);
   const type = enumAt(input.type, `${path}.type`, SEMANTIC_FIELD_TYPES);
-  const required = input.required === undefined ? true : booleanAt(input.required, `${path}.required`);
   if (type === "string") {
-    if (input.max_items !== undefined) fail(`${path}.max_items`, "is valid only for string_list");
+    if (input.max_items !== undefined) {
+      fail(`${path}.max_items`, "is valid only for string_list or review_finding_list_v1");
+    }
     return {
       type,
-      required,
       max_length: integerAt(input.max_length, `${path}.max_length`, 1, 64 * 1024),
       ...(input.normalize === undefined ? {} : {
         normalize: enumAt(input.normalize, `${path}.normalize`, RESULT_NORMALIZATIONS),
@@ -99,15 +113,35 @@ function parseSemanticField(value: unknown, path: string): SemanticFieldContract
     if (input.normalize !== undefined) fail(`${path}.normalize`, "is valid only for string fields");
     return {
       type,
-      required,
       max_length: integerAt(input.max_length, `${path}.max_length`, 1, 64 * 1024),
       max_items: integerAt(input.max_items, `${path}.max_items`, 0, 1_024),
     };
   }
+  if (type === "review_finding_list_v1") {
+    if (input.max_length !== undefined) fail(`${path}.max_length`, "is valid only for string fields");
+    if (input.normalize !== undefined) fail(`${path}.normalize`, "is valid only for string fields");
+    return {
+      type,
+      max_items: integerAt(input.max_items, `${path}.max_items`, 0, 1_024),
+    };
+  }
   if (input.max_length !== undefined) fail(`${path}.max_length`, "is valid only for string fields");
-  if (input.max_items !== undefined) fail(`${path}.max_items`, "is valid only for string_list");
+  if (input.max_items !== undefined) {
+    fail(`${path}.max_items`, "is valid only for string_list or review_finding_list_v1");
+  }
   if (input.normalize !== undefined) fail(`${path}.normalize`, "is valid only for string fields");
-  return { type, required };
+  return { type };
+}
+
+function parseReviewFinding(value: unknown, path: string): ReviewFindingV1 {
+  const input = objectAt(value, path, REVIEW_FINDING_FIELDS);
+  return {
+    severity: enumAt(input.severity, `${path}.severity`, REVIEW_FINDING_SEVERITIES),
+    path: stringAt(input.path, `${path}.path`, { max: REVIEW_FINDING_PATH_MAX_LENGTH }),
+    anchor: stringAt(input.anchor, `${path}.anchor`, { max: REVIEW_FINDING_ANCHOR_MAX_LENGTH }),
+    title: stringAt(input.title, `${path}.title`, { max: REVIEW_FINDING_TITLE_MAX_LENGTH }),
+    evidence: stringAt(input.evidence, `${path}.evidence`, { max: REVIEW_FINDING_EVIDENCE_MAX_LENGTH }),
+  };
 }
 
 export function validateSemanticResultSchema(
@@ -145,7 +179,7 @@ function normalizeString(
   diagnosticPath: string,
   transformations: ResultNormalizationDiagnostic[],
 ): string {
-  const maxLength = field.max_length!;
+  const maxLength = field.max_length;
   if (typeof value === "string") return stringAt(value, path, { max: maxLength });
   if (field.normalize !== "string-array-to-newlines/v1" || !Array.isArray(value)) {
     return stringAt(value, path, { max: maxLength });
@@ -182,19 +216,14 @@ function validateSemanticValue(
         value,
         path,
         (entry, itemPath) => stringAt(entry, itemPath, { max: field.max_length }),
-        { max: field.max_items! },
+        { max: field.max_items },
       );
+    case "review_finding_list_v1":
+      return arrayAt(value, path, parseReviewFinding, { max: field.max_items });
     case "boolean":
       return booleanAt(value, path);
     case "integer":
       return integerAt(value, path, Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
-    case "json": {
-      const parsed = jsonValueAt(value, path);
-      if (Buffer.byteLength(canonicalJson(parsed), "utf8") > MAX_JSON_BYTES) {
-        fail(path, `must be at most ${MAX_JSON_BYTES} canonical JSON bytes`);
-      }
-      return parsed;
-    }
     case "execution_plan_v2": {
       if (value === null) return null;
       const plan = validateExecutionPlanContractV2(value, { source: path }).value;
@@ -233,8 +262,7 @@ export function validateAndNormalizeResultCandidate(
   for (const [name, field] of Object.entries(schema.payload)) {
     const raw = payloadInput[name];
     if (raw === undefined) {
-      if (field.required) fail(`${source}.payload.${name}`, "is required");
-      continue;
+      fail(`${source}.payload.${name}`, "is required");
     }
     payload[name] = validateSemanticValue(
       raw,
@@ -299,12 +327,27 @@ function providerFieldSchema(field: SemanticFieldContract): JsonSchema {
         maxItems: field.max_items,
         items: { type: "string", minLength: 1, maxLength: field.max_length },
       };
+    case "review_finding_list_v1":
+      return {
+        type: "array",
+        maxItems: field.max_items,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: [...REVIEW_FINDING_FIELDS],
+          properties: {
+            severity: { type: "string", enum: REVIEW_FINDING_SEVERITIES },
+            path: { type: "string", minLength: 1, maxLength: REVIEW_FINDING_PATH_MAX_LENGTH },
+            anchor: { type: "string", minLength: 1, maxLength: REVIEW_FINDING_ANCHOR_MAX_LENGTH },
+            title: { type: "string", minLength: 1, maxLength: REVIEW_FINDING_TITLE_MAX_LENGTH },
+            evidence: { type: "string", minLength: 1, maxLength: REVIEW_FINDING_EVIDENCE_MAX_LENGTH },
+          },
+        },
+      };
     case "boolean":
       return { type: "boolean" };
     case "integer":
       return { type: "integer" };
-    case "json":
-      return {};
     case "execution_plan_v2":
       return {
         anyOf: [
@@ -314,7 +357,7 @@ function providerFieldSchema(field: SemanticFieldContract): JsonSchema {
             additionalProperties: false,
             required: ["commands", "pipeline_id", "plan_id", "schema", "units"],
             properties: {
-              schema: { const: "openthrottle.execution-plan/v2" },
+              schema: { type: "string", const: "openthrottle.execution-plan/v2" },
               pipeline_id: { type: "string", minLength: 1, maxLength: 160 },
               plan_id: { type: "string", minLength: 1, maxLength: 160 },
               units: {
@@ -332,7 +375,7 @@ function providerFieldSchema(field: SemanticFieldContract): JsonSchema {
                     id: { type: "string", minLength: 1, maxLength: 160 },
                     title: { type: "string", minLength: 1, maxLength: 160 },
                     depends_on: {
-                      type: "array", maxItems: 32, uniqueItems: true,
+                      type: "array", maxItems: 32,
                       items: { type: "string", minLength: 1, maxLength: 160 },
                     },
                     objective: { type: "string", minLength: 1, maxLength: 2_000 },
@@ -351,10 +394,15 @@ function providerFieldSchema(field: SemanticFieldContract): JsonSchema {
                 items: {
                   type: "object",
                   additionalProperties: false,
-                  required: ["name"],
+                  required: ["name", "unit"],
                   properties: {
                     name: { type: "string", minLength: 1, maxLength: 160 },
-                    unit: { type: "string", minLength: 1, maxLength: 160 },
+                    unit: {
+                      anyOf: [
+                        { type: "null" },
+                        { type: "string", minLength: 1, maxLength: 160 },
+                      ],
+                    },
                   },
                 },
               },
@@ -376,12 +424,12 @@ export function providerJsonSchemaForResultCandidate(
     additionalProperties: false,
     required: ["outcome", "payload", "schema"],
     properties: {
-      schema: { const: RESULT_CANDIDATE_SCHEMA },
+      schema: { type: "string", const: RESULT_CANDIDATE_SCHEMA },
       outcome: { type: "string", enum: schema.outcomes },
       payload: {
         type: "object",
         additionalProperties: false,
-        required: names.filter((name) => schema.payload[name]!.required),
+        required: names,
         properties: Object.fromEntries(names.map((name) => [name, providerFieldSchema(schema.payload[name]!)])),
       },
     },

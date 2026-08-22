@@ -143,6 +143,13 @@ function entry(
 }
 
 function evaluation(id: string, evaluator: string): unknown {
+  const findings = evaluator === "core/review-outcome@1"
+    ? { type: "review_finding_list_v1", max_items: 64 }
+    : {
+      type: "string_list",
+      max_length: 2_000,
+      max_items: 50,
+    };
   return {
     schema: EVAL_DEFINITION_SCHEMA,
     id,
@@ -152,8 +159,8 @@ function evaluation(id: string, evaluator: string): unknown {
       id,
       outcomes: ["success", "no_change", "semantic_repair_required", "needs_human", "failure"],
       payload: {
-        summary: { type: "string", required: true, max_length: 1_000 },
-        findings: { type: "json", required: true },
+        summary: { type: "string", max_length: 1_000 },
+        findings,
       },
     },
   };
@@ -608,7 +615,18 @@ function reviewEvidence(blocking = true): {
     original_candidate_hash: "6".repeat(64),
     normalized_candidate_hash: "7".repeat(64),
     payload_schema: "openthrottle.semantic-result-record/v1",
-    payload: { inline: { outcome: "success", findings: blocking ? [{ blocking: true }] : [] } },
+    payload: {
+      inline: {
+        outcome: "success",
+        findings: blocking ? [{
+          severity: "P1",
+          path: "src/security.ts",
+          anchor: "authorizeRequest",
+          title: "Authorization can be bypassed",
+          evidence: "The sealed review subject reaches the mutation without an authorization check.",
+        }] : [],
+      },
+    },
     created_at: NOW,
   };
   const decision: DecisionRecord = {
@@ -723,8 +741,8 @@ function personaSelectionFixture(personas: unknown): {
           id: "core/persona-selection",
           outcomes: ["success", "failure"],
           payload: {
-            summary: { type: "string", required: true, max_length: 1_000 },
-            personas: { type: "string_list", required: true, max_length: 200, max_items: 5 },
+            summary: { type: "string", max_length: 1_000 },
+            personas: { type: "string_list", max_length: 200, max_items: 5 },
           },
         },
       }),

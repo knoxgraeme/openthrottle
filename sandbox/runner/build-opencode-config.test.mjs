@@ -75,6 +75,21 @@ describe("OpenCode config builder", () => {
     })).toThrow("cannot widen inspection authority");
   });
 
+  it("allows only named executor context artifacts for edit actions", () => {
+    const artifact = "/var/lib/openthrottle/actions/a/action-context/context.json";
+    const config = buildOpenCodeConfig({
+      model: "kimi-code/kimi-for-coding",
+      readableExternalPaths: [artifact],
+    });
+
+    expect(config.permission).toMatchObject({
+      edit: "allow",
+      bash: "allow",
+      webfetch: "allow",
+      external_directory: { "*": "deny", [artifact]: "allow" },
+    });
+  });
+
   it("fails closed for malformed and unsupported models", () => {
     expect(() => resolveOpenCodeModelProfile("kimi-for-coding")).toThrow("provider/model");
     expect(() => resolveOpenCodeModelProfile("kimi-code/kimi-k3")).toThrow(

@@ -22,6 +22,8 @@ import {
 
 export const ACTION_PROFILE_SCHEMA = "openthrottle.action-profile/v1";
 export const OPENCODE_PROGRESSIVE_SKILLS_CAPABILITY = "opencode/native-progressive-skills@1";
+export const ACTION_TASK_PROMPT_MAX_BYTES = 512 * 1024;
+export const ACTION_EXECUTOR_CONTEXT_MAX_BYTES = 8 * 1024;
 
 const ENGINES = new Set(["claude", "codex", "opencode"]);
 const REPOSITORY_AUTHORITIES = new Set(["inspect", "edit"]);
@@ -47,6 +49,11 @@ function boundedFileText(value, label, max = MAX_SKILL_FILE_BYTES) {
     throw new Error(`${label} is invalid`);
   }
   return value.replace(/\r\n?/g, "\n");
+}
+
+function boundedOptionalText(value, label, max) {
+  if (value === undefined || value === null || value === "") return "";
+  return boundedText(value, label, max);
 }
 
 function definitionId(value, label) {
@@ -186,6 +193,7 @@ export function composeActionProfilePrompt(profile) {
       : "The executor supplied one isolated writable content tree. Edit only that tree; Git administration remains executor-owned.",
     "## Sealed task prompt",
     profile.task_prompt,
+    profile.executor_context,
   ];
   return [activation, ...common].filter(Boolean).join("\n\n");
 }
@@ -197,6 +205,7 @@ export function compileActionProfile({
   skillIds,
   entrySkill = null,
   taskPrompt,
+  executorContext = "",
   definitionEntries,
   platformFence = readFileSync(configuredPlatformFencePath(), "utf8"),
 }) {
@@ -227,7 +236,12 @@ export function compileActionProfile({
     entry_skill: selectedEntrySkill,
     instructions: boundedText(agent.normalized_payload, "agent instructions"),
     platform_fence: boundedText(platformFence, "platform fence"),
-    task_prompt: boundedText(taskPrompt, "task prompt", 512 * 1024),
+    task_prompt: boundedText(taskPrompt, "task prompt", ACTION_TASK_PROMPT_MAX_BYTES),
+    executor_context: boundedOptionalText(
+      executorContext,
+      "executor context",
+      ACTION_EXECUTOR_CONTEXT_MAX_BYTES,
+    ),
     skill_entries: skills,
   };
 }

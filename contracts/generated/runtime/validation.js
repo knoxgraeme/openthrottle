@@ -172,9 +172,13 @@ export function parseIdentifierList(value, path, options) {
 }
 export function parsePlanCommand(value, path) {
     const input = objectAt(value, path, ["name", "unit"]);
+    if (input.unit === undefined)
+        fail(`${path}.unit`, "is required");
     return {
         name: stringAt(input.name, `${path}.name`, { max: 80, pattern: COMMAND_NAME_PATTERN }),
-        ...(input.unit === undefined ? {} : { unit: stringAt(input.unit, `${path}.unit`, { pattern: IDENTIFIER }) }),
+        unit: input.unit === null
+            ? null
+            : stringAt(input.unit, `${path}.unit`, { pattern: IDENTIFIER }),
     };
 }
 // Depth-first cycle detection over a dependency graph whose nodes carry

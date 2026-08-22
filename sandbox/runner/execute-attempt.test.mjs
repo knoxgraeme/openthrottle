@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -13,13 +13,11 @@ const semanticSchema = {
   payload: {
     summary: {
       type: "string",
-      required: true,
       max_length: 4_000,
       normalize: "string-array-to-newlines/v1",
     },
     verification: {
       type: "string_list",
-      required: true,
       max_length: 1_000,
       max_items: 32,
     },
@@ -111,6 +109,33 @@ function claudeOutput(sessionId, candidate) {
   ].join("\n");
 }
 
+async function executeAgentResult({ execution, env, runAgent, runPreparedAgent, engine = "claude" }) {
+  const source = sourceRepository();
+  const root = mkdtempSync(join(tmpdir(), "ot-attempt-agent-result-"));
+  const resultPath = join(root, "transport", "result.json");
+  const request = workRequest(source.subject);
+  request.action = {
+    ...request.action,
+    engine,
+    execution_limits: {
+      ...request.action.execution_limits,
+      max_turns: engine === "claude" ? request.action.execution_limits.max_turns : null,
+    },
+  };
+  const result = await executeAttempt({
+    request,
+    sourceRepoDir: source.repo,
+    actionRoot: join(root, "actions"),
+    resultPath,
+    sessionPath: join(root, "transport", "session.json"),
+    runAgent: runAgent ?? (execution === undefined ? null : async () => execution),
+    runPreparedAgent,
+    env,
+    now: () => new Date("2026-08-20T00:00:00.000Z"),
+  });
+  return { result, persisted: readFileSync(resultPath, "utf8") };
+}
+
 describe("kernel attempt executor", () => {
   it("rejects legacy v1 work and correction envelopes before execution", () => {
     const request = workRequest("a".repeat(40));
@@ -124,6 +149,208 @@ describe("kernel attempt executor", () => {
       schema: "openthrottle.kernel-result-correction-request/v1",
       phase: "result_correction",
     })).toThrow(/schema or phase is unsupported/);
+  });
+
+  it("persists bounded provider metadata without raw launch transcript content", async () => {
+    const secret = "fixture-claude-oauth-secret";
+    const rateLimit = JSON.stringify({
+      type: "system",
+      subtype: "rate_limit_event",
+      rate_limit: { status: "rejected" },
+    });
+    const { result, persisted } = await executeAgentResult({
+      env: { CLAUDE_CODE_OAUTH_TOKEN: secret },
+      execution: {
+        status: 1,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        stdout: `${"x".repeat(4_000)}\n${rateLimit}\nusage limit reached for ${secret}`,
+        stderr: "",
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: true });
+    expect(result.outcome.reason).toContain("reason=rate_limited");
+    expect(result.outcome.reason).toContain("status=1, signal=none, timed_out=false");
+    expect(result.outcome.reason).toContain("provider_event=system");
+    expect(result.outcome.reason).toContain("rate_limit_status=rejected");
+    expect(result.outcome.reason).not.toContain("stdout:");
+    expect(result.outcome.reason).not.toContain("usage limit reached");
+    expect(result.outcome.reason.length).toBeLessThanOrEqual(1_500);
+    expect(persisted).not.toContain(secret);
+    expect(persisted).not.toContain("[REDACTED]");
+  });
+
+  it("persists a bounded sanitized retryable failure when agent launch throws", async () => {
+    const secret = "fixture-thrown-launch-secret";
+    const { result, persisted } = await executeAgentResult({
+      env: { CLAUDE_CODE_OAUTH_TOKEN: secret },
+      runAgent: async () => {
+        throw new Error(`spawn failed ${"x".repeat(3_000)} executor launch tail ${secret}`);
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: true });
+    expect(result.outcome.reason).toContain("agent work launch failed");
+    expect(result.outcome.reason).toContain("reason=executor_launch_failure");
+    expect(result.outcome.reason).toContain("Executor diagnostic: runtime_error=spawn_failure");
+    expect(result.outcome.reason).not.toContain("executor launch tail");
+    expect(result.outcome.reason.length).toBeLessThanOrEqual(1_500);
+    expect(persisted).not.toContain(secret);
+    expect(persisted).not.toContain("[REDACTED]");
+  });
+
+  it("keeps deterministic prepared-runtime failures non-retryable", async () => {
+    const secret = "fixture-profile-seal-secret";
+    const { result, persisted } = await executeAgentResult({
+      env: {
+        PATH: process.env.PATH,
+        CLAUDE_CODE_OAUTH_TOKEN: secret,
+        OT_LEASE_GENERATION_FENCE_FILE: "/tmp/fixture-lease-generation.json",
+        OT_LEASE_GENERATION_LOCK_FILE: "/tmp/fixture-lease-generation.lock",
+      },
+      runPreparedAgent: async () => {
+        throw new Error(`agent changed the executor-sealed action profile: ${secret}`);
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: false });
+    expect(result.outcome.reason).toContain("reason=executor_runtime_failure");
+    expect(result.outcome.reason.length).toBeLessThanOrEqual(1_500);
+    expect(persisted).not.toContain(secret);
+    expect(persisted).not.toContain("[REDACTED]");
+  });
+
+  it("retries only marked prepared-runtime launch failures", async () => {
+    const launchFailure = new Error("child process transport failed");
+    Object.defineProperty(launchFailure, "retryableInfrastructureFailure", { value: true });
+    const { result } = await executeAgentResult({
+      env: {
+        PATH: process.env.PATH,
+        CLAUDE_CODE_OAUTH_TOKEN: "fixture-present-token",
+        OT_LEASE_GENERATION_FENCE_FILE: "/tmp/fixture-lease-generation.json",
+        OT_LEASE_GENERATION_LOCK_FILE: "/tmp/fixture-lease-generation.lock",
+      },
+      runPreparedAgent: async () => {
+        throw launchFailure;
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: true });
+    expect(result.outcome.reason).toContain("reason=executor_launch_failure");
+  });
+
+  it("redacts nested Codex tokens when agent launch throws", async () => {
+    const accessToken = "nested-codex-access-token";
+    const idToken = "nested-codex-id-token";
+    const authJson = JSON.stringify({ tokens: { access_token: accessToken, id_token: idToken } });
+    const { result, persisted } = await executeAgentResult({
+      engine: "codex",
+      env: { CODEX_AUTH_JSON: authJson },
+      runAgent: async () => {
+        throw new Error(`child launch exposed ${accessToken} and ${idToken}`);
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: true });
+    expect(result.outcome.reason).toContain("reason=executor_launch_failure");
+    expect(persisted).not.toContain(accessToken);
+    expect(persisted).not.toContain(idToken);
+    expect(persisted).not.toContain("[REDACTED]");
+  });
+
+  it("keeps deterministic Codex preparation errors non-retryable", async () => {
+    const { result } = await executeAgentResult({
+      engine: "codex",
+      env: { CODEX_AUTH_JSON: "{malformed-json" },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: false });
+    expect(result.outcome.reason).toContain("reason=executor_preparation_failure");
+    expect(result.outcome.reason.length).toBeLessThanOrEqual(1_500);
+  });
+
+  it("classifies a missing engine credential by variable name only", async () => {
+    const { result } = await executeAgentResult({
+      env: {},
+      execution: {
+        status: 1,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        stdout: "",
+        stderr: "",
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: true });
+    expect(result.outcome.reason).toContain("reason=credential_missing");
+    expect(result.outcome.reason).toContain("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(result.outcome.reason).toContain("status=1, signal=none, timed_out=false");
+  });
+
+  it("keeps an ordinary engine crash diagnostic non-retryable", async () => {
+    const { result } = await executeAgentResult({
+      env: { CLAUDE_CODE_OAUTH_TOKEN: "fixture-present-token" },
+      execution: {
+        status: 1,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        stdout: "",
+        stderr: "Bus error: 10",
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: false });
+    expect(result.outcome.reason).toContain("reason=engine_crash");
+    expect(result.outcome.reason).toContain("status=1, signal=none, timed_out=false");
+    expect(result.outcome.reason).toContain("runtime_error=process_crash");
+    expect(result.outcome.reason).not.toContain("Bus error: 10");
+  });
+
+  it("treats a clean unregistered-command answer as retryable failed work", async () => {
+    const { result } = await executeAgentResult({
+      env: { CLAUDE_CODE_OAUTH_TOKEN: "fixture-present-token" },
+      execution: {
+        status: 0,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: "session-unregistered",
+        stdout: JSON.stringify({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          result: "Unknown command: /implement-plan",
+        }),
+        stderr: "",
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: true });
+    expect(result.outcome.reason).toContain("reason=unregistered_command");
+    expect(result.outcome.reason).toContain("status=0, signal=none, timed_out=false");
+  });
+
+  it("keeps a clean exit without a native session retryable", async () => {
+    const { result } = await executeAgentResult({
+      env: { CLAUDE_CODE_OAUTH_TOKEN: "fixture-present-token" },
+      execution: {
+        status: 0,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        stdout: "completed without a session event",
+        stderr: "",
+      },
+    });
+
+    expect(result.outcome).toEqual({
+      state: "work_failed",
+      retryable: true,
+      reason: "agent completed without a native session binding",
+    });
   });
 
   it("normalizes OPE-188 and replays the immutable result without redispatch", async () => {
@@ -250,6 +477,262 @@ describe("kernel attempt executor", () => {
       checkpoint: { input_subject: after, output_subject: null },
     });
     expect(readFileSync(join(source.repo, "work.txt"), "utf8")).toBe("accepted edit\n");
+  });
+
+  it("launches a dependent structured unit with exact integration evidence", async () => {
+    const source = sourceRepository();
+    const root = mkdtempSync(join(tmpdir(), "ot-attempt-action-context-"));
+    const request = workRequest(source.subject, {
+      stage_id: "implement_unit",
+      scope: {
+        kind: "loop_item",
+        stage_id: "implement_unit",
+        parent_attempt_id: "attempt-parent-private",
+        loop_id: "execution_plan.units",
+        item_id: "unit-b",
+        item_index: 1,
+      },
+      context: {
+        records: [{
+          schema: "openthrottle.record/v1",
+          id: "result-integration-unit-a",
+          kind: "result",
+          pipeline_run_id: "run-1",
+          attempt_id: "attempt-integration-private",
+          request_hash: "c".repeat(64),
+          definition_bundle_hash: "b".repeat(64),
+          input_subject: "a".repeat(40),
+          output_subject: source.subject,
+          original_candidate_hash: "d".repeat(64),
+          normalized_candidate_hash: "d".repeat(64),
+          payload_schema: "openthrottle.external-result-record/v1",
+          payload: { inline: {
+            schema: "openthrottle.external-result-record/v1",
+            external_kind: "core/integrate-unit@1",
+            outcome: "all_integrated",
+            summary: "unit checkpoint integrated and durably pushed",
+            delivery_record_ids: [
+              "delivery-integrate-private",
+              "delivery-push-private",
+            ],
+          } },
+          created_at: "2026-08-20T00:00:00.000Z",
+        }, {
+          schema: "openthrottle.record/v1",
+          id: "decision-integration-unit-a",
+          kind: "decision",
+          pipeline_run_id: "run-1",
+          reducer: "external/core/integrate-unit@1",
+          input_record_ids: [
+            "delivery-integrate-private",
+            "delivery-push-private",
+            "result-integration-unit-a",
+          ],
+          payload_schema: "openthrottle.pipeline-decision-record/v1",
+          payload: { inline: {
+            schema: "openthrottle.pipeline-decision-record/v1",
+            stage_id: "integrate_unit",
+            evaluator: "external/core/integrate-unit@1",
+            outcome: "all_integrated",
+            reason: "unit checkpoint integrated and durably pushed",
+          } },
+          created_at: "2026-08-20T00:00:00.000Z",
+        }],
+        checkpoints: [{
+          schema: "openthrottle.attempt-checkpoint/v1",
+          id: "checkpoint-integration-unit-a",
+          pipeline_run_id: "run-1",
+          attempt_id: "attempt-integration-private",
+          request_hash: "c".repeat(64),
+          definition_bundle_hash: "b".repeat(64),
+          input_subject: "a".repeat(40),
+          output_subject: source.subject,
+          native_session_id: null,
+          payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+          payload: { blob: {
+            algorithm: "sha256",
+            digest: "e".repeat(64),
+            bytes: 123,
+            encoding: "binary",
+            media_type: "application/x-git-bundle",
+            payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+          } },
+          captured_at: "2026-08-20T00:00:00.000Z",
+        }],
+      },
+    });
+    let descriptor;
+    const result = await executeAttempt({
+      request,
+      sourceRepoDir: source.repo,
+      actionRoot: join(root, "actions"),
+      resultPath: join(root, "transport", "result.json"),
+      sessionPath: join(root, "transport", "session.json"),
+      runAgent: async ({ request: runtimeRequest, onSession }) => {
+        descriptor = runtimeRequest.action_context_artifact;
+        const artifact = JSON.parse(readFileSync(descriptor.path, "utf8"));
+        expect(artifact.scope).toEqual({
+          kind: "loop_item",
+          loop_id: "execution_plan.units",
+          item_id: "unit-b",
+          item_index: 1,
+        });
+        expect(artifact.records).toContainEqual({
+          record_id: "result-integration-unit-a",
+          kind: "external_result",
+          external_kind: "core/integrate-unit@1",
+          outcome: "all_integrated",
+          summary: "unit checkpoint integrated and durably pushed",
+        });
+        expect(artifact.records).toContainEqual({
+          record_id: "decision-integration-unit-a",
+          kind: "pipeline_decision",
+          stage_id: "integrate_unit",
+          evaluator: "external/core/integrate-unit@1",
+          outcome: "all_integrated",
+          reason: "unit checkpoint integrated and durably pushed",
+        });
+        expect(artifact.checkpoints).toEqual([{
+          checkpoint_id: "checkpoint-integration-unit-a",
+          input_subject: "a".repeat(40),
+          output_subject: source.subject,
+        }]);
+        const serialized = readFileSync(descriptor.path, "utf8");
+        expect(serialized).not.toContain("attempt-parent-private");
+        expect(serialized).not.toContain("attempt-integration-private");
+        expect(serialized).not.toContain("delivery-integrate-private");
+        expect(serialized).not.toContain("delivery-push-private");
+        expect(serialized).not.toContain("e".repeat(64));
+        await onSession("session-action-context");
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          nativeSessionId: "session-action-context",
+          stderr: "",
+          stdout: claudeOutput("session-action-context", {
+            schema: "openthrottle.result-candidate/v1",
+            outcome: "success",
+            payload: {
+              summary: "Used the supplied dependency context.",
+              verification: ["action context inspected"],
+            },
+          }),
+        };
+      },
+      now: () => new Date("2026-08-20T00:00:00.000Z"),
+    });
+
+    expect(result.outcome.state).toBe("work_complete");
+    expect(descriptor).toMatchObject({
+      schema: "openthrottle.agent-action-context/v1",
+      bytes: expect.any(Number),
+      sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+  });
+
+  it("stops for human review instead of launching with silently truncated semantic context", async () => {
+    const source = sourceRepository();
+    const root = mkdtempSync(join(tmpdir(), "ot-attempt-oversized-context-"));
+    const records = Array.from({ length: 10 }, (_, index) => ({
+      schema: "openthrottle.record/v1",
+      id: `result-upstream-${index}`,
+      kind: "result",
+      pipeline_run_id: "run-1",
+      attempt_id: `attempt-upstream-${index}`,
+      request_hash: "c".repeat(64),
+      definition_bundle_hash: "b".repeat(64),
+      input_subject: source.subject,
+      output_subject: source.subject,
+      original_candidate_hash: "d".repeat(64),
+      normalized_candidate_hash: "d".repeat(64),
+      payload_schema: "openthrottle.semantic-result-record/v1",
+      payload: { inline: {
+        schema: "openthrottle.semantic-result-record/v1",
+        semantic_schema_id: "core/unit-result",
+        outcome: "success",
+        payload: { summary: `${index}:${"x".repeat(60 * 1024)}` },
+        transformations: [],
+      } },
+      created_at: "2026-08-20T00:00:00.000Z",
+    }));
+    let launches = 0;
+
+    const result = await executeAttempt({
+      request: workRequest(source.subject, {
+        context: { records, checkpoints: [] },
+      }),
+      sourceRepoDir: source.repo,
+      actionRoot: join(root, "actions"),
+      resultPath: join(root, "transport", "result.json"),
+      sessionPath: join(root, "transport", "session.json"),
+      runAgent: async () => { launches += 1; },
+      now: () => new Date("2026-08-20T00:00:00.000Z"),
+    });
+
+    expect(launches).toBe(0);
+    expect(result.outcome).toMatchObject({
+      state: "needs_human",
+      reason: "required semantic action context could not be materialized",
+      checkpoint: null,
+      diagnostics: [{
+        path: "context",
+        detail: expect.stringContaining("action context artifact exceeds 524288 bytes"),
+      }],
+    });
+  });
+
+  it("reverifies the action context seal when recovering completed engine state", async () => {
+    const source = sourceRepository();
+    const root = mkdtempSync(join(tmpdir(), "ot-attempt-context-recovery-"));
+    const resultPath = join(root, "transport", "result.json");
+    const options = {
+      request: workRequest(source.subject),
+      sourceRepoDir: source.repo,
+      actionRoot: join(root, "actions"),
+      resultPath,
+      sessionPath: join(root, "transport", "session.json"),
+      now: () => new Date("2026-08-20T00:00:00.000Z"),
+    };
+    let launches = 0;
+    let descriptor;
+    const runAgent = async ({ request: runtimeRequest, onSession }) => {
+      launches += 1;
+      descriptor = runtimeRequest.action_context_artifact;
+      await onSession("session-context-recovery");
+      return {
+        status: 0,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: "session-context-recovery",
+        stderr: "",
+        stdout: claudeOutput("session-context-recovery", {
+          schema: "openthrottle.result-candidate/v1",
+          outcome: "success",
+          payload: {
+            summary: "Completed before transport interruption.",
+            verification: ["focused proof passed"],
+          },
+        }),
+      };
+    };
+    expect((await executeAttempt({ ...options, runAgent })).outcome.state).toBe("work_complete");
+    rmSync(resultPath);
+    chmodSync(descriptor.path, 0o644);
+    writeFileSync(descriptor.path, "{}\n");
+    chmodSync(descriptor.path, 0o444);
+
+    const recovered = await executeAttempt({
+      ...options,
+      runAgent: async () => { launches += 1; throw new Error("must not relaunch"); },
+    });
+
+    expect(launches).toBe(1);
+    expect(recovered.outcome).toMatchObject({
+      state: "work_failed",
+      retryable: false,
+      reason: expect.stringMatching(/action context artifact (lost its executor-owned read-only seal|content changed)/),
+    });
   });
 
   it("repairs only the result against the locked checkpoint without rerunning work", async () => {

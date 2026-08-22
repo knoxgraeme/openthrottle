@@ -95,6 +95,7 @@ export function buildOpenCodeConfig({
           edit: "allow",
           bash: "allow",
           webfetch: "allow",
+          external_directory: externalReadPolicy(readableExternalPaths),
           skill: progressiveSkillPolicy(allowedSkills),
         },
     provider: {

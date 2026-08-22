@@ -329,8 +329,8 @@ describe("filesystem definition compiler", () => {
     expect(result.manifest.value.stages.find(({ id }) => id === "ot_runtime_provision"))
       .toMatchObject({ kind: "effect", effect: "core/daytona-provision@1" });
     expect(result.manifest.value.definition_bundle_hash).toBe(result.bundle.digest);
-    expect(result.bundle.digest).toBe("23d8f16ede33039d029fc9ea65abc4cb364f9eec07f72875b343bceda3f0ab73");
-    expect(result.manifest.digest).toBe("db244873085516c76858650249a77969f9c87cb5b8523da0fb8f29cab883e3be");
+    expect(result.bundle.digest).toBe("651f57b5a98994e3fb8fdeae1b40c6bf0d18087c59032446aaa936f7b7d0fdc4");
+    expect(result.manifest.digest).toBe("fcebbb60d602ee21f21444cab2b7094afa52b17b42efff8add7037d53b5ea175");
   });
 
   it("omits exact checked-in core mirrors while preserving platform origin", () => {

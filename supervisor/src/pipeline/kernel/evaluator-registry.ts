@@ -12,6 +12,7 @@ import {
   type ExecutionRecordPayloadContract,
   type ExecutionRecordPayloadRegistry,
   type JsonValue,
+  type ReviewFindingV1,
   type ResultRecord,
 } from "@openthrottle/contracts";
 import type {
@@ -260,18 +261,8 @@ export function createCommandResultRecord(input: {
   });
 }
 
-function hasBlockingFinding(value: JsonValue): boolean {
-  if (Array.isArray(value)) return value.some(hasBlockingFinding);
-  if (!value || typeof value !== "object") return false;
-  const record = value as Record<string, JsonValue>;
-  if (record.blocking === true) return true;
-  const markers = [record.severity, record.verdict, record.disposition]
-    .filter((candidate): candidate is string => typeof candidate === "string")
-    .map((candidate) => candidate.toLowerCase());
-  if (markers.some((candidate) => [
-    "blocker", "blocking", "critical", "changes_required", "changes-required",
-  ].includes(candidate))) return true;
-  return Object.values(record).some(hasBlockingFinding);
+function hasBlockingReviewFinding(findings: readonly ReviewFindingV1[]): boolean {
+  return findings.some(({ severity }) => severity === "P0" || severity === "P1");
 }
 
 function semanticObject(value: JsonValue, label: string): Record<string, JsonValue> {
@@ -361,8 +352,15 @@ export class KernelEvaluatorRegistry {
     if (input.evaluation.evaluator === "core/admission-review-outcome@1") {
       return admissionReviewOutcome(payload);
     }
-    const blocking = input.evaluation.evaluator === "core/review-outcome@1" &&
-      hasBlockingFinding(payload.payload);
+    const reviewFindings = input.evaluation.evaluator === "core/review-outcome@1"
+      ? semanticObject(payload.payload, "review result payload").findings
+      : null;
+    if (reviewFindings !== null && !Array.isArray(reviewFindings)) {
+      throw new Error("review result payload findings must be an array");
+    }
+    const blocking = reviewFindings !== null && hasBlockingReviewFinding(
+      reviewFindings as unknown as readonly ReviewFindingV1[],
+    );
     return {
       evaluator: input.evaluation.evaluator,
       outcome: blocking ? "semantic_repair_required" : payload.outcome,

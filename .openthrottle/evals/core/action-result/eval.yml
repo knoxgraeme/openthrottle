@@ -14,24 +14,21 @@ result:
   payload:
     summary:
       type: string
-      required: true
       max_length: 1000
       normalize: string-array-to-newlines/v1
     evidence:
       type: string_list
-      required: true
       max_length: 1000
       max_items: 50
     findings:
-      type: json
-      required: true
+      type: string_list
+      max_length: 2000
+      max_items: 50
     actions:
       type: string_list
-      required: true
       max_length: 300
       max_items: 50
     uncertainty:
       type: string_list
-      required: true
       max_length: 300
       max_items: 20

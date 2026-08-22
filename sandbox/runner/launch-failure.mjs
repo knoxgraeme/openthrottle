@@ -2,12 +2,11 @@
 
 import { sanitizeArtifactText } from "./kernel-json.mjs";
 
-// Bounded launch diagnostics. Every agent-launch failure used to reach the
-// operator as one indistinguishable line with an empty `Executor diagnostic:`
-// because only stderr was captured and the engines report launch refusals on
-// stdout (Claude writes stream-json to stdout; Codex prints its refusal there
-// too). The tail below is the operator-visible evidence, so it stays small and
-// always passes through the artifact sanitizer.
+// Bounded launch diagnostics. Classification may inspect the complete in-memory
+// engine transcript, but durable evidence receives only this allowlisted
+// provider-metadata projection. Assistant text, tool output, final-result prose,
+// and raw stdout/stderr are secret-bearing untrusted data and never cross into a
+// persisted failure reason.
 export const MAX_LAUNCH_DIAGNOSTIC_CHARS = 2_000;
 
 // The single concrete credential each engine authenticates with. Only the
@@ -81,57 +80,95 @@ function matchesAny(patterns, text) {
   return patterns.some((pattern) => pattern.test(text));
 }
 
-// A rate-limit refusal can appear either as `{"rate_limit":{"status":...}}` or
-// as a flat `{"subtype":"rate_limit_event","status":...}` line, so the scan
-// walks bounded JSON looking for a status reached under a rate-limit key.
-function rejectedRateLimitStatus(node, underRateLimit, depth) {
-  if (!node || typeof node !== "object" || depth > 8) return false;
-  if (Array.isArray(node)) {
-    return node.some((child) => rejectedRateLimitStatus(child, underRateLimit, depth + 1));
+function jsonObjectFromLine(line) {
+  const trimmed = String(line ?? "").trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
   }
-  const selfIsRateLimit = underRateLimit ||
-    /rate[ _-]?limit/i.test(String(node.type ?? "")) ||
-    /rate[ _-]?limit/i.test(String(node.subtype ?? ""));
-  if (selfIsRateLimit && typeof node.status === "string" &&
-      !SERVED_RATE_LIMIT_STATUSES.has(node.status.trim().toLowerCase())) {
-    return true;
+}
+
+// A real Claude rate-limit event is either explicitly named by type/subtype,
+// or is a system/root event carrying the documented `rate_limit` object. Do
+// not recursively inspect arbitrary event payloads: assistant and tool output
+// are untrusted task content and may legitimately discuss the same vocabulary.
+function rateLimitStatusFromEvent(event) {
+  const type = typeof event.type === "string" ? event.type.trim().toLowerCase() : "";
+  const subtype = typeof event.subtype === "string" ? event.subtype.trim().toLowerCase() : "";
+  if (["assistant", "user", "tool", "item.completed", "item.updated", "item.started"].includes(type)) {
+    return null;
   }
-  return Object.entries(node).some(([key, value]) =>
-    rejectedRateLimitStatus(value, selfIsRateLimit || /rate[ _-]?limit/i.test(key), depth + 1));
+  const explicitlyRateLimit = /rate[ _-]?limit/.test(type) || /rate[ _-]?limit/.test(subtype);
+  const nested = event.rate_limit && typeof event.rate_limit === "object" && !Array.isArray(event.rate_limit)
+    ? event.rate_limit
+    : null;
+  const isRootOrSystemEvent = type === "" || type === "system";
+  if (!explicitlyRateLimit && !(isRootOrSystemEvent && nested)) return null;
+  const status = nested?.status ?? event.status;
+  return typeof status === "string" ? status.trim().toLowerCase() : null;
 }
 
 export function hasRejectedRateLimitEvent(text) {
   const raw = String(text ?? "");
   if (!/rate[ _-]?limit/i.test(raw)) return false;
   for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("{") || !/rate[ _-]?limit/i.test(trimmed)) continue;
-    let parsed;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    if (rejectedRateLimitStatus(parsed, false, 0)) return true;
+    const event = jsonObjectFromLine(line);
+    if (!event) continue;
+    const status = rateLimitStatusFromEvent(event);
+    if (status && !SERVED_RATE_LIMIT_STATUSES.has(status)) return true;
   }
   return false;
 }
 
-// Claude emits a `rate_limit_event` line on healthy runs too (including the
-// high-utilization `allowed_warning`). Those lines must not make the generic
-// rate-limit text patterns fire, so they are dropped before pattern matching;
-// a genuinely rejected event is detected structurally above instead.
-function withoutServedRateLimitLines(text) {
-  return text.split("\n").filter((line) => {
+function claudeFinalResultFailureEvidence(stdout) {
+  const fields = decisiveEngineFieldsFromFinalResultLine(stdout);
+  if (!fields) return "";
+  const status = Number(fields.api_error_status);
+  const errorBearing = fields.is_error === true ||
+    (Number.isFinite(status) && status >= 400) ||
+    /(?:error|fail|refus|reject)/i.test(String(fields.subtype ?? ""));
+  return errorBearing ? formatDecisiveEngineFields(fields) : "";
+}
+
+function codexFailureEvidence(event) {
+  if (event.type === "turn.failed") {
+    return typeof event.error === "string" ? event.error : JSON.stringify(event.error ?? {});
+  }
+  if (event.type !== "error") return "";
+  const fields = {};
+  for (const key of ["message", "error", "code", "status", "status_code"]) {
+    if (event[key] !== undefined) fields[key] = event[key];
+  }
+  return JSON.stringify(fields);
+}
+
+// stdout is a provider JSONL transcript. Only provider-owned terminal error
+// events are classification evidence; assistant/tool events are task content.
+// Plain non-JSON stdout remains eligible because both CLIs can reject a launch
+// before their structured event stream starts.
+function stdoutFailureEvidence(agent, stdout) {
+  const evidence = [];
+  for (const line of String(stdout ?? "").split(/\r?\n/)) {
     const trimmed = line.trim();
-    if (!trimmed.startsWith("{") || !/rate[ _-]?limit/i.test(trimmed)) return true;
-    try {
-      JSON.parse(trimmed);
-    } catch {
-      return true;
+    if (!trimmed) continue;
+    const event = jsonObjectFromLine(trimmed);
+    if (!event) {
+      evidence.push(trimmed);
+      continue;
     }
-    return false;
-  }).join("\n");
+    if (agent === "codex") {
+      const codexEvidence = codexFailureEvidence(event);
+      if (codexEvidence) evidence.push(codexEvidence);
+    }
+  }
+  if (agent === "claude") {
+    const finalResult = claudeFinalResultFailureEvidence(stdout);
+    if (finalResult) evidence.push(finalResult);
+  }
+  return evidence.join("\n");
 }
 
 export function engineCredentialVariable(agent) {
@@ -184,18 +221,17 @@ export function classifyLaunchFailure({
   stderr = "",
   credentialPresent,
 }) {
-  const text = `${String(stderr ?? "")}\n${String(stdout ?? "")}`;
-  const prose = withoutServedRateLimitLines(text);
+  const evidence = `${String(stderr ?? "")}\n${stdoutFailureEvidence(agent, stdout)}`;
   let reason = "engine_crash";
   if (isUnregisteredCommandResult(stdout)) {
     reason = "unregistered_command";
   } else if (credentialPresent === false) {
     reason = "credential_missing";
-  } else if (hasRejectedRateLimitEvent(text) || matchesAny(RATE_LIMIT_PATTERNS, prose)) {
+  } else if (hasRejectedRateLimitEvent(stdout) || matchesAny(RATE_LIMIT_PATTERNS, evidence)) {
     reason = "rate_limited";
-  } else if (matchesAny(CREDENTIAL_REJECTED_PATTERNS, prose)) {
+  } else if (matchesAny(CREDENTIAL_REJECTED_PATTERNS, evidence)) {
     reason = "credential_rejected";
-  } else if (matchesAny(CREDENTIAL_MISSING_PATTERNS, prose)) {
+  } else if (matchesAny(CREDENTIAL_MISSING_PATTERNS, evidence)) {
     reason = "credential_missing";
   }
   return {
@@ -209,17 +245,13 @@ export function classifyLaunchFailure({
   };
 }
 
-// The fields that ARE the diagnosis on Claude's final stream-json `result`
-// line. They sit at the head of that line, ahead of the (often long)
-// `result` text itself, so a byte-level tail of the whole stdout stream
-// reliably keeps only the trailing fragment of `result` and drops the rest --
-// on a long transcript that is every bit of information that matters.
+// These fields are inspected in-memory to classify Claude's final stream-json
+// `result` line. `result` is intentionally excluded from durable diagnostics;
+// it is assistant-authored prose and may contain credential material.
 const DECISIVE_ENGINE_RESULT_FIELDS = ["subtype", "is_error", "api_error_status", "result"];
 
-// Extracted here unsanitized and untruncated -- launchDiagnosticTail sanitizes
-// the formatted prefix before ever slicing it, so a credential value never
-// gets cut in half ahead of the substring-match redaction that would
-// otherwise fail to recognize the truncated fragment.
+// Extracted here only for in-memory classification. Callers must not persist
+// the returned object or its `result` field.
 function decisiveEngineFieldsFromFinalResultLine(stdout) {
   const lines = String(stdout ?? "").split(/\r?\n/);
   for (let index = lines.length - 1; index >= 0; index -= 1) {
@@ -261,13 +293,163 @@ function formatDecisiveEngineFields(fields) {
     .join(" ");
 }
 
+const SAFE_PROVIDER_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,119}$/;
+const SAFE_SCHEMA_SEGMENT = /^[A-Za-z0-9_-]{1,80}$/;
+const SAFE_RUNTIME_ERROR_CODES = [
+  "EACCES", "ECONNREFUSED", "ECONNRESET", "EHOSTUNREACH", "EIO", "EMFILE",
+  "ENOENT", "ENOMEM", "ENOSPC", "ENOTFOUND", "EPIPE", "ETIMEDOUT",
+];
+
+function addMetadata(output, key, value) {
+  let normalized;
+  if (typeof value === "boolean") normalized = String(value);
+  else if (typeof value === "number" && Number.isSafeInteger(value)) normalized = String(value);
+  else if (typeof value === "string" && SAFE_PROVIDER_TOKEN.test(value.trim())) {
+    normalized = value.trim();
+  } else {
+    return;
+  }
+  const entry = `${key}=${normalized}`;
+  if (!output.includes(entry)) output.push(entry);
+}
+
+function addProviderStatus(output, value) {
+  const normalized = typeof value === "string" && /^\d{3}$/.test(value.trim())
+    ? Number(value.trim())
+    : value;
+  if (Number.isSafeInteger(normalized) && normalized >= 100 && normalized <= 599) {
+    addMetadata(output, "provider_status", normalized);
+  }
+}
+
+function schemaPathFromMessage(text) {
+  const tuple = /\bIn context=\(([^)\r\n]{1,1024})\)/i.exec(text);
+  if (tuple) {
+    const values = [...tuple[1].matchAll(/["']([A-Za-z0-9_-]{1,80})["']/g)]
+      .map((match) => match[1]);
+    const residue = tuple[1].replace(/["'][A-Za-z0-9_-]{1,80}["']/g, "");
+    if (values.length > 0 && values.length <= 24 && /^[,\s]*$/.test(residue)) {
+      return values.join(".");
+    }
+  }
+  const dotted = /\bproperties(?:\.[A-Za-z0-9_-]{1,80}){1,23}\b/.exec(text)?.[0];
+  return dotted && dotted.split(".").every((segment) => SAFE_SCHEMA_SEGMENT.test(segment))
+    ? dotted
+    : null;
+}
+
+function addInvalidSchemaMetadata(output, text, allowDetails) {
+  if (!/(?:invalid[ _-]json[ _-]schema|invalid schema for response_format)/i.test(text)) return;
+  addMetadata(output, "provider_error", "invalid_json_schema");
+  if (!allowDetails) return;
+  const path = schemaPathFromMessage(text);
+  if (path) addMetadata(output, "schema_path", path);
+  if (/(?:must|does not) have (?:a )?["']?type\b|["']type["'] is required/i.test(text)) {
+    addMetadata(output, "schema_issue", "missing_type");
+  } else if (/["']required["'] is required to be supplied|array including every key in properties/i.test(text)) {
+    addMetadata(output, "schema_issue", "incomplete_required_keys");
+  } else if (/additionalProperties[^\r\n]{0,80}(?:false|required)/i.test(text)) {
+    addMetadata(output, "schema_issue", "additional_properties_not_closed");
+  }
+  const missing = /\bMissing ["']([A-Za-z0-9_-]{1,80})["']/i.exec(text)?.[1];
+  if (missing) addMetadata(output, "missing_key", missing);
+  if (/\buniqueItems\b/.test(text)) addMetadata(output, "unsupported_keyword", "uniqueItems");
+}
+
+function addSafeTextMetadata(output, value, { allowSchemaDetails = false } = {}) {
+  if (typeof value !== "string" || value.length === 0) return;
+  addInvalidSchemaMetadata(output, value, allowSchemaDetails);
+  if (matchesAny(RATE_LIMIT_PATTERNS, value)) {
+    addMetadata(output, "provider_error", "rate_limited");
+  }
+  if (matchesAny(CREDENTIAL_REJECTED_PATTERNS, value)) {
+    addMetadata(output, "provider_error", "credential_rejected");
+  } else if (matchesAny(CREDENTIAL_MISSING_PATTERNS, value)) {
+    addMetadata(output, "provider_error", "credential_missing");
+  }
+  if (/\b(?:Bus error|Segmentation fault|core dumped)\b/i.test(value)) {
+    addMetadata(output, "runtime_error", "process_crash");
+  }
+  if (/\bspawn\b[^\r\n]{0,80}\b(?:fail(?:ed|ure)?|error)\b/i.test(value)) {
+    addMetadata(output, "runtime_error", "spawn_failure");
+  }
+  if (/executor-sealed action profile|action profile seal/i.test(value)) {
+    addMetadata(output, "runtime_error", "profile_seal_changed");
+  }
+  for (const code of SAFE_RUNTIME_ERROR_CODES) {
+    if (new RegExp(`\\b${code}\\b`).test(value)) addMetadata(output, "runtime_error", code);
+  }
+  const status = /\b(?:http|status|api error)\D{0,16}([1-5]\d{2})\b/i.exec(value)?.[1];
+  if (status) addProviderStatus(output, status);
+}
+
+function providerErrorObjects(event) {
+  const result = [];
+  let current = event?.error;
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) break;
+    result.push(current);
+    current = current.error;
+  }
+  return result;
+}
+
+function providerEventMetadata(event) {
+  const type = typeof event?.type === "string" ? event.type.trim() : "";
+  const output = [];
+  if (type === "result") {
+    addMetadata(output, "provider_event", type);
+    addMetadata(output, "subtype", event.subtype);
+    if (typeof event.is_error === "boolean") addMetadata(output, "is_error", event.is_error);
+    addProviderStatus(output, event.api_error_status);
+    return output;
+  }
+  const rateLimitStatus = rateLimitStatusFromEvent(event);
+  if (rateLimitStatus !== null) {
+    addMetadata(output, "provider_event", type || "rate_limit");
+    addMetadata(output, "subtype", event.subtype);
+    addMetadata(output, "rate_limit_status", rateLimitStatus);
+    return output;
+  }
+  if (type !== "error" && type !== "turn.failed") return output;
+  addMetadata(output, "provider_event", type);
+  const errorObjects = providerErrorObjects(event);
+  for (const error of errorObjects) {
+    addMetadata(output, "error_type", error.type);
+    addMetadata(output, "error_code", error.code);
+    addProviderStatus(output, error.status ?? error.status_code);
+    addMetadata(output, "error_param", error.param);
+  }
+  addMetadata(output, "error_code", event.code);
+  addProviderStatus(output, event.status ?? event.status_code);
+  addMetadata(output, "error_param", event.param);
+  const messages = [
+    event.message,
+    typeof event.error === "string" ? event.error : null,
+    ...errorObjects.flatMap((error) => [
+      error.message,
+      typeof error.error === "string" ? error.error : null,
+    ]),
+  ];
+  for (const message of messages) {
+    addSafeTextMetadata(output, message, { allowSchemaDetails: true });
+  }
+  return output;
+}
+
+function boundedMetadata(fields, budget, env) {
+  const output = [];
+  for (const field of fields) {
+    const next = [...output, field].join(" ");
+    if (next.length > budget) break;
+    output.push(field);
+  }
+  return sanitizeArtifactText(output.join(" "), env);
+}
+
 /**
- * Bounded, sanitized tail of both engine streams. stderr leads (it is where a
- * crash lands) but stdout always keeps at least half the budget, because that
- * is where every engine writes its launch refusal. The decisive fields from
- * Claude's final stream-json `result` line (subtype, is_error,
- * api_error_status, result) are extracted and prepended first, so they
- * survive even when the tail budget alone would cut them off.
+ * Project allowlisted provider-owned metadata from engine output. Full streams
+ * remain available in-memory for classification only and are never returned.
  */
 export function launchDiagnosticTail({
   stdout = "",
@@ -276,33 +458,18 @@ export function launchDiagnosticTail({
   max = MAX_LAUNCH_DIAGNOSTIC_CHARS,
 } = {}) {
   const budget = Math.max(0, max);
-  const cleanStderr = sanitizeArtifactText(stderr ?? "", env).trim();
-  const cleanStdout = sanitizeArtifactText(stdout ?? "", env).trim();
-  if (!cleanStderr && !cleanStdout) return "";
-  const decisiveFields = decisiveEngineFieldsFromFinalResultLine(stdout);
-  // Sanitize the whole formatted prefix before ever slicing it (never
-  // truncate a raw field first -- that can cut a credential value in half
-  // and defeat the sanitizer's exact substring match), then cap it to at
-  // most half the budget so an oversized/malformed engine field can never
-  // exhaust the remaining budget down to zero.
-  const decisivePrefix = decisiveFields
-    ? sanitizeArtifactText(formatDecisiveEngineFields(decisiveFields), env).trim().slice(0, Math.floor(budget / 2))
-    : "";
-  const separator = " | ";
-  const remainingBudget = Math.max(0, budget - decisivePrefix.length - (decisivePrefix ? separator.length : 0));
-  const stderrBudget = cleanStdout
-    ? Math.max(Math.floor(remainingBudget / 2), remainingBudget - cleanStdout.length - separator.length)
-    : remainingBudget;
-  // A zero-or-negative budget must yield an empty tail: `slice(-0)` is
-  // equivalent to `slice(0)` in JavaScript and returns the entire string,
-  // not an empty one, so `-Math.max(0, n)` cannot be used to represent "no
-  // characters" -- it must short-circuit instead.
-  const stderrTail = stderrBudget > 0 ? cleanStderr.slice(-stderrBudget) : "";
-  const stdoutBudget = remainingBudget - stderrTail.length - (stderrTail && cleanStdout ? separator.length : 0);
-  const stdoutTail = stdoutBudget > 0 ? cleanStdout.slice(-stdoutBudget) : "";
-  return [
-    decisivePrefix,
-    stderrTail ? `stderr: ${stderrTail}` : "",
-    stdoutTail ? `stdout: ${stdoutTail}` : "",
-  ].filter(Boolean).join(separator);
+  if (budget === 0) return "";
+  const fields = [];
+  for (const line of String(stdout ?? "").split(/\r?\n/)) {
+    const event = jsonObjectFromLine(line);
+    if (event) {
+      for (const field of providerEventMetadata(event)) {
+        if (!fields.includes(field)) fields.push(field);
+      }
+    } else {
+      addSafeTextMetadata(fields, line);
+    }
+  }
+  addSafeTextMetadata(fields, String(stderr ?? ""));
+  return boundedMetadata(fields, budget, env);
 }

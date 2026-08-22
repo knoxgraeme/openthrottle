@@ -11,7 +11,6 @@ const schema = {
   payload: {
     summary: {
       type: "string",
-      required: true,
       max_length: 1_000,
       normalize: "string-array-to-newlines/v1",
     },

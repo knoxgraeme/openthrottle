@@ -35,3 +35,16 @@ that defeats it.
 When evidence is insufficient, reject the blocker as unproven and explain what
 would be needed to establish it. Validation is not a vote and not an invitation
 to broaden the original review.
+
+## Semantic output
+
+Return only retained defects in `payload.findings`. Preserve each retained
+finding's exact `severity`, `path`, `anchor`, and normalized `title`, and replace
+or tighten `evidence` only when the independent check establishes something
+more precise. Every finding object has exactly those five fields. Use an empty
+array when no proposed blocker survives validation; describe rejected claims in
+the summary without returning them as findings.
+
+Never return `semantic_repair_required` directly. Preserve a retained `P0` or
+`P1` finding and let the deterministic evaluator derive that transition; `P2`
+and `P3` findings cannot authorize repair.

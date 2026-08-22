@@ -161,7 +161,7 @@ const payload = kind === "unit"
       decisions: [],
       issues: [],
       verification: ["stub assertions passed"],
-      downstream_context: {},
+      downstream_context: [],
       requested_human_input: [],
     }
   : kind === "review"

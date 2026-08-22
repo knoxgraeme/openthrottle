@@ -62,6 +62,83 @@ describe("launch failure classification", () => {
     });
   });
 
+  it("ignores authentication language in a Claude assistant message", () => {
+    const event = {
+      type: "assistant",
+      message: {
+        content: [{
+          type: "text",
+          text: "The endpoint correctly returns 401 Unauthorized for missing credentials.",
+        }],
+        rate_limit: { status: "rejected" },
+      },
+    };
+    const stdout = JSON.stringify(event);
+    expect(hasRejectedRateLimitEvent(stdout)).toBe(false);
+    expect(classifyLaunchFailure({
+      agent: "claude",
+      stdout,
+      stderr: "Bus error: 10",
+      credentialPresent: true,
+    })).toMatchObject({
+      reason: "engine_crash",
+      credentialFailure: false,
+      retryable: false,
+    });
+  });
+
+  it("ignores authentication language in a Codex agent message", () => {
+    const stdout = JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "item_1",
+        type: "agent_message",
+        text: "The endpoint correctly returns 401 Unauthorized for missing credentials.",
+      },
+    });
+    expect(classifyLaunchFailure({
+      agent: "codex",
+      stdout,
+      stderr: "Bus error: 10",
+      credentialPresent: true,
+    })).toMatchObject({
+      reason: "engine_crash",
+      credentialFailure: false,
+      retryable: false,
+    });
+  });
+
+  it("ignores provider-like language in structured tool output", () => {
+    const stdout = JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "item_2",
+        type: "command_execution",
+        command: "npm test",
+        aggregated_output: "fixture response: 429 Too Many Requests; invalid API key",
+        exit_code: 1,
+      },
+    });
+    expect(classifyLaunchFailure({
+      agent: "codex",
+      stdout,
+      stderr: "Segmentation fault",
+      credentialPresent: true,
+    }).reason).toBe("engine_crash");
+  });
+
+  it("reports a rejected credential from Claude's error-bearing final result", () => {
+    const stdout = JSON.stringify({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      api_error_status: 401,
+      result: "API Error: authentication_error: invalid oauth token",
+    });
+    expect(classifyLaunchFailure({ agent: "claude", stdout, stderr: "", credentialPresent: true }))
+      .toMatchObject({ reason: "credential_rejected", credentialFailure: true, retryable: true });
+  });
+
   it("reports a rate limit from a rejected Claude rate_limit_event", () => {
     const stdout = [
       JSON.stringify({ type: "system", subtype: "init", session_id: "s" }),
@@ -93,6 +170,25 @@ describe("launch failure classification", () => {
       expect(classifyLaunchFailure({ agent: "codex", stdout: output, stderr: "", credentialPresent: true }))
         .toMatchObject({ reason: "rate_limited", credentialFailure: false, retryable: true });
     }
+  });
+
+  it("reports Codex error and turn.failed provider refusals", () => {
+    for (const stdout of [
+      JSON.stringify({ type: "error", message: "stream error: 429 Too Many Requests" }),
+      JSON.stringify({ type: "turn.failed", error: { message: "You've run out of credits." } }),
+    ]) {
+      expect(classifyLaunchFailure({ agent: "codex", stdout, stderr: "", credentialPresent: true }))
+        .toMatchObject({ reason: "rate_limited", credentialFailure: false, retryable: true });
+    }
+  });
+
+  it("reports a Codex turn.failed authentication refusal", () => {
+    const stdout = JSON.stringify({
+      type: "turn.failed",
+      error: { message: "401 Unauthorized: token is invalid" },
+    });
+    expect(classifyLaunchFailure({ agent: "codex", stdout, stderr: "", credentialPresent: true }))
+      .toMatchObject({ reason: "credential_rejected", credentialFailure: true, retryable: true });
   });
 
   it("falls back to an engine crash for anything else", () => {
@@ -170,41 +266,53 @@ describe("isUnregisteredCommandResult", () => {
 });
 
 describe("launch diagnostic tail", () => {
-  it("captures stdout when the engine wrote nothing to stderr", () => {
+  it("reduces plain launch refusals to static categories without persisting prose", () => {
     const tail = launchDiagnosticTail({
       stdout: "Invalid API key - please run /login",
       stderr: "",
       env: {},
     });
-    expect(tail).toBe("stdout: Invalid API key - please run /login");
+    expect(tail).toBe("provider_error=credential_rejected");
+    expect(tail).not.toContain("Invalid API key");
+    expect(tail).not.toContain("/login");
   });
 
-  it("keeps both streams and stays inside the bound", () => {
+  it("drops arbitrary stdout and stderr instead of persisting transcript tails", () => {
     const tail = launchDiagnosticTail({
       stdout: "o".repeat(10_000),
       stderr: "e".repeat(10_000),
       env: {},
     });
-    expect(tail).toContain("stderr: ");
-    expect(tail).toContain("stdout: ");
-    expect(tail.length).toBeLessThanOrEqual(MAX_LAUNCH_DIAGNOSTIC_CHARS + 32);
+    expect(tail).toBe("");
   });
 
-  it("redacts credential material through the artifact sanitizer", () => {
+  it("never persists literal or transformed credential material from agent-controlled text", () => {
+    const secret = "sk-ant-oat01-supersecret-value";
+    const transformed = [...secret].join("-");
     const tail = launchDiagnosticTail({
-      stdout: "sent Authorization: Bearer sk-ant-oat01-supersecret-value",
-      stderr: "token=sk-ant-oat01-supersecret-value rejected",
-      env: { CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-supersecret-value" },
+      stdout: JSON.stringify({
+        type: "result",
+        subtype: "error_during_execution",
+        is_error: true,
+        api_error_status: 500,
+        result: `credential=${secret}; transformed=${transformed}`,
+      }),
+      stderr: `tool emitted ${secret} and ${transformed}`,
+      env: { CLAUDE_CODE_OAUTH_TOKEN: secret },
     });
-    expect(tail).not.toContain("supersecret");
-    expect(tail).toContain("[REDACTED]");
+    expect(tail).toBe(
+      "provider_event=result subtype=error_during_execution is_error=true provider_status=500",
+    );
+    expect(tail).not.toContain(secret);
+    expect(tail).not.toContain(transformed);
+    expect(tail).not.toContain("credential=");
   });
 
   it("returns an empty tail when both streams are empty", () => {
     expect(launchDiagnosticTail({ stdout: "", stderr: "   ", env: {} })).toBe("");
   });
 
-  it("preserves subtype, is_error, api_error_status, and result from Claude's final stream-json line even when the tail would otherwise cut them off", () => {
+  it("preserves only allowlisted Claude terminal metadata", () => {
     const finalLine = JSON.stringify({
       type: "result",
       subtype: "error_during_execution",
@@ -225,12 +333,13 @@ describe("launch diagnostic tail", () => {
 
     expect(tail).toContain("subtype=error_during_execution");
     expect(tail).toContain("is_error=true");
-    expect(tail).toContain("api_error_status=529");
-    expect(tail).toContain("result=the assistant's long trailing text");
-    expect(tail.length).toBeLessThanOrEqual(MAX_LAUNCH_DIAGNOSTIC_CHARS + 64);
+    expect(tail).toContain("provider_status=529");
+    expect(tail).not.toContain("assistant's long trailing text");
+    expect(tail).not.toContain("session_id");
+    expect(tail.length).toBeLessThanOrEqual(MAX_LAUNCH_DIAGNOSTIC_CHARS);
   });
 
-  it("truncates an overlong decisive result field instead of letting it crowd out the rest of the budget", () => {
+  it("drops an overlong result field and arbitrary stderr", () => {
     const finalLine = JSON.stringify({
       type: "result",
       subtype: "error_during_execution",
@@ -239,9 +348,9 @@ describe("launch diagnostic tail", () => {
     });
     const tail = launchDiagnosticTail({ stdout: finalLine, stderr: "s".repeat(500), env: {} });
 
-    expect(tail).toContain("subtype=error_during_execution");
-    expect(tail).toContain("stderr: ");
-    expect(tail.length).toBeLessThanOrEqual(MAX_LAUNCH_DIAGNOSTIC_CHARS + 64);
+    expect(tail).toBe("provider_event=result subtype=error_during_execution is_error=true");
+    expect(tail).not.toContain("r".repeat(100));
+    expect(tail).not.toContain("s".repeat(100));
   });
 
   it("stays bounded even when an uncapped decisive field (subtype) alone exceeds the budget", () => {
@@ -256,10 +365,11 @@ describe("launch diagnostic tail", () => {
     // fall back to returning the entire (unbounded) stderr/stdout -- that
     // was a `slice(-0)` bug: a zero-or-negative remaining budget slices to
     // "no characters", not "the whole string".
-    expect(tail.length).toBeLessThanOrEqual(MAX_LAUNCH_DIAGNOSTIC_CHARS + 64);
+    expect(tail).toBe("provider_event=result is_error=true");
+    expect(tail.length).toBeLessThanOrEqual(MAX_LAUNCH_DIAGNOSTIC_CHARS);
   });
 
-  it("never lets a credential value survive redaction by truncating a decisive field before sanitizing it", () => {
+  it("does not rely on literal redaction for secret-bearing result text", () => {
     const secret = "sk-ant-oat01-" + "s".repeat(600);
     const finalLine = JSON.stringify({
       type: "result",
@@ -272,23 +382,50 @@ describe("launch diagnostic tail", () => {
       env: { CLAUDE_CODE_OAUTH_TOKEN: secret },
     });
 
-    // Truncating the raw `result` field to a fixed character budget before
-    // sanitizeArtifactText runs would cut the credential in half, so its
-    // exact-substring redaction match would silently fail on the remaining
-    // fragment. Sanitizing before truncating keeps the whole value visible
-    // to the matcher regardless of where the eventual cap falls.
     expect(tail).not.toContain(secret);
     expect(tail).not.toContain("sk-ant-oat01-");
-    expect(tail).toContain("[REDACTED]");
+    expect(tail).toBe("provider_event=result subtype=error_during_execution");
   });
 
-  it("ignores a served (non-final, non-result) stream-json line when looking for decisive fields", () => {
+  it("ignores arbitrary non-error stream events and plain stderr", () => {
     const tail = launchDiagnosticTail({
       stdout: `{"type":"system","subtype":"init","session_id":"x"}`,
       stderr: "engine crashed",
       env: {},
     });
-    expect(tail).not.toContain("subtype=init");
-    expect(tail).toContain("stderr: engine crashed");
+    expect(tail).toBe("");
+  });
+
+  it("retains bounded provider-owned invalid-schema metadata without the raw message", () => {
+    const message = [
+      "Invalid schema for response_format 'openthrottle':",
+      "In context=('properties', 'payload', 'properties', 'findings'),",
+      "schema node must have a type.",
+    ].join(" ");
+    const tail = launchDiagnosticTail({
+      stdout: JSON.stringify({
+        type: "turn.failed",
+        error: {
+          type: "invalid_request_error",
+          code: "invalid_json_schema",
+          status: 400,
+          message,
+        },
+      }),
+      stderr: "",
+      env: {},
+    });
+
+    expect(tail).toBe([
+      "provider_event=turn.failed",
+      "error_type=invalid_request_error",
+      "error_code=invalid_json_schema",
+      "provider_status=400",
+      "provider_error=invalid_json_schema",
+      "schema_path=properties.payload.properties.findings",
+      "schema_issue=missing_type",
+    ].join(" "));
+    expect(tail).not.toContain("response_format");
+    expect(tail).not.toContain("schema node must have a type");
   });
 });

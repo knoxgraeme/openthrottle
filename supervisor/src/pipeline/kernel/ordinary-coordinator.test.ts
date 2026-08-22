@@ -19,6 +19,7 @@ import {
   type AttemptCheckpoint,
   type DefinitionBundleEntry,
   type EvalDefinition,
+  type ReviewFindingV1,
   type ResultCandidate,
   type SemanticResultSchemaContract,
   type TrustedPlatformDefinitionHashes,
@@ -118,14 +119,17 @@ const actionSchema: SemanticResultSchemaContract = {
   payload: {
     summary: {
       type: "string",
-      required: true,
       max_length: 1_000,
       normalize: "string-array-to-newlines/v1",
     },
-    evidence: { type: "string_list", required: true, max_length: 1_000, max_items: 50 },
-    findings: { type: "json", required: true },
-    actions: { type: "string_list", required: true, max_length: 300, max_items: 50 },
-    uncertainty: { type: "string_list", required: true, max_length: 300, max_items: 20 },
+    evidence: { type: "string_list", max_length: 1_000, max_items: 50 },
+    findings: {
+      type: "string_list",
+      max_length: 2_000,
+      max_items: 50,
+    },
+    actions: { type: "string_list", max_length: 300, max_items: 50 },
+    uncertainty: { type: "string_list", max_length: 300, max_items: 20 },
   },
 };
 
@@ -136,11 +140,10 @@ const reviewSchema: SemanticResultSchemaContract = {
   payload: {
     summary: {
       type: "string",
-      required: true,
       max_length: 4_000,
       normalize: "string-array-to-newlines/v1",
     },
-    findings: { type: "json", required: true },
+    findings: { type: "review_finding_list_v1", max_items: 64 },
   },
 };
 
@@ -287,7 +290,7 @@ function actionCandidate(summary: string | string[] = "done"): StagedSemanticCan
   });
 }
 
-function reviewCandidate(findings: unknown = []): StagedSemanticCandidate {
+function reviewCandidate(findings: readonly ReviewFindingV1[] = []): StagedSemanticCandidate {
   return candidateFor(reviewSchema, {
     schema: RESULT_CANDIDATE_SCHEMA,
     outcome: "success",
@@ -366,7 +369,13 @@ class RuntimeFixture implements KernelRuntimePort {
       result: {
         kind: "semantic",
         candidate: request.stage_id.includes("review")
-          ? reviewCandidate(this.blockingReview ? [{ severity: "blocker", summary: "repair" }] : [])
+          ? reviewCandidate(this.blockingReview ? [{
+            severity: "P1",
+            path: "src/security.ts",
+            anchor: "authorizeRequest",
+            title: "Authorization can be bypassed",
+            evidence: "The sealed review subject reaches the mutation without an authorization check.",
+          }] : [])
           : actionCandidate(request.stage_id === "implement" ? ["implemented", "tested"] : "simplified"),
       },
     };
