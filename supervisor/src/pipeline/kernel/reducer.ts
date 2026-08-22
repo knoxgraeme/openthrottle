@@ -397,6 +397,10 @@ function terminalAttemptWrites(
           status,
           version: current.version + 1,
           lease: null,
+          result_record_id: null,
+          decision_record_id: null,
+          result_correction_deadline: null,
+          pending_result: null,
         },
       };
     }

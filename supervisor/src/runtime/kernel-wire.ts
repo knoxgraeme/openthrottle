@@ -254,7 +254,8 @@ async function checkpoint(
     ? request.locked_subject
     : null;
   if (
-    (lockedCorrection && descriptor.commit !== request.locked_subject) ||
+    (lockedCorrection && request.completed_work_authority === "edit" &&
+      descriptor.commit !== request.locked_subject) ||
     (lockedCorrection && input.output_subject !== correctionOutput) ||
     (mutatingWork && input.output_subject !== descriptor.commit) ||
     (!mutatingWork && !lockedCorrection && input.output_subject !== null)

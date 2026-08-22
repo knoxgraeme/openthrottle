@@ -12,6 +12,7 @@ import {
 
 const INPUT_SUBJECT = "1".repeat(40);
 const EDITED_SUBJECT = "2".repeat(40);
+const INSPECT_CHECKPOINT_COMMIT = "3".repeat(40);
 const REQUEST_HASH = "a".repeat(64);
 const BUNDLE_HASH = "b".repeat(64);
 const ARTIFACT_DIGEST = "c".repeat(64);
@@ -119,11 +120,15 @@ describe("kernel correction checkpoint wire fencing", () => {
       .toBe("openthrottle.kernel-result-correction-request/v2");
   });
 
-  it("retains a null output subject for inspect work while locking the artifact commit", async () => {
+  it("retains a null output subject when an inspect checkpoint uses a synthetic bundle commit", async () => {
     const request = correctionRequest("inspect");
 
     await expect(parseKernelRuntimeResult({
-      raw: rawCorrectionResult({ request, outputSubject: null }),
+      raw: rawCorrectionResult({
+        request,
+        outputSubject: null,
+        artifactCommit: INSPECT_CHECKPOINT_COMMIT,
+      }),
       request,
       artifacts: artifacts(),
     })).resolves.toMatchObject({
@@ -137,8 +142,8 @@ describe("kernel correction checkpoint wire fencing", () => {
     await expect(parseKernelRuntimeResult({
       raw: rawCorrectionResult({
         request,
-        outputSubject: null,
-        artifactCommit: EDITED_SUBJECT,
+        outputSubject: INSPECT_CHECKPOINT_COMMIT,
+        artifactCommit: INSPECT_CHECKPOINT_COMMIT,
       }),
       request,
       artifacts: artifacts(),
@@ -159,6 +164,16 @@ describe("kernel correction checkpoint wire fencing", () => {
 
     await expect(parseKernelRuntimeResult({
       raw: rawCorrectionResult({ request, outputSubject: null }),
+      request,
+      artifacts: artifacts(),
+    })).rejects.toThrow(/repository authority/);
+
+    await expect(parseKernelRuntimeResult({
+      raw: rawCorrectionResult({
+        request,
+        outputSubject: EDITED_SUBJECT,
+        artifactCommit: INSPECT_CHECKPOINT_COMMIT,
+      }),
       request,
       artifacts: artifacts(),
     })).rejects.toThrow(/repository authority/);
