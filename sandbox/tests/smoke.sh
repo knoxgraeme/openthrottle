@@ -57,8 +57,8 @@ const semantic = {
   id: "core/smoke-result",
   outcomes: ["success", "failure", "needs_human"],
   payload: {
-    summary: { type: "string", required: true, max_length: 4000, normalize: "string-array-to-newlines/v1" },
-    verification: { type: "string_list", required: true, max_length: 1000, max_items: 32 },
+    summary: { type: "string", max_length: 4000, normalize: "string-array-to-newlines/v1" },
+    verification: { type: "string_list", max_length: 1000, max_items: 32 },
   },
 };
 const request = (attempt, authority, requestHash) => ({
