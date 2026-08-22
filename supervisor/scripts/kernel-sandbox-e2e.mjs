@@ -46,7 +46,8 @@ import {
 
 const IMAGE = process.argv[2] ?? "openthrottle:test";
 const REPOSITORY_ROOT = fileURLToPath(new URL("../../", import.meta.url));
-const SOURCE_REPOSITORY = "/home/agent/repo";
+const SOURCE_REPOSITORY = "/var/lib/openthrottle/repository-source/repo";
+const SOURCE_REPOSITORY_PARENT = "/var/lib/openthrottle/repository-source";
 const WORK_REQUEST_SCHEMA = "openthrottle.kernel-work-request/v1";
 const RUN_SCHEMA = "openthrottle.kernel-run/v1";
 const root = mkdtempSync(join(tmpdir(), "ot-kernel-sandbox-e2e-"));
@@ -198,7 +199,11 @@ function startContainer(directory, sourceRepository) {
   docker(container, ["mkdir", "-p", SOURCE_REPOSITORY, "/transport", "/tmp/stub"]);
   run("docker", ["cp", `${sourceRepository}/.`, `${container}:${SOURCE_REPOSITORY}/`]);
   run("docker", ["cp", stub, `${container}:/tmp/stub/codex`]);
-  docker(container, ["chown", "-R", "root:root", SOURCE_REPOSITORY, "/tmp/stub"]);
+  docker(container, ["sh", "-c", `find -P ${SOURCE_REPOSITORY} -exec chown -h root:root -- {} +`]);
+  docker(container, ["sh", "-c", `find -P ${SOURCE_REPOSITORY} ! -type l -exec chmod go-w -- {} +`]);
+  docker(container, ["chown", "-R", "root:root", "/tmp/stub"]);
+  docker(container, ["chown", "root:root", SOURCE_REPOSITORY_PARENT]);
+  docker(container, ["chmod", "0700", SOURCE_REPOSITORY_PARENT]);
   docker(container, ["chmod", "0755", "/tmp/stub/codex"]);
   return container;
 }

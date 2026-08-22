@@ -19,6 +19,8 @@ const root = mkdtempSync(join(tmpdir(), "ot-kernel-structured-"));
 const source = join(root, "source");
 const requests = join(root, "requests");
 const stub = join(root, "claude");
+const sourceRepositoryParent = "/var/lib/openthrottle/repository-source";
+const sourceRepository = "/var/lib/openthrottle/repository-source/repo";
 let container = null;
 
 function run(command, args, options = {}) {
@@ -184,12 +186,12 @@ function integrate(name, action, actionResult, currentSubject) {
     result,
   );
   dockerExec([
-    "git", "-C", "/home/agent/repo", "fetch", "--quiet",
+    "git", "-C", sourceRepository, "fetch", "--quiet",
     `/transport/integrations/${name}/${result.payload_artifact.file}`,
     `${result.payload_artifact.ref}:refs/openthrottle/accepted/${name}`,
   ]);
   assert.equal(
-    dockerExec(["git", "-C", "/home/agent/repo", "rev-parse", `refs/openthrottle/accepted/${name}`]),
+    dockerExec(["git", "-C", sourceRepository, "rev-parse", `refs/openthrottle/accepted/${name}`]),
     result.output_subject,
   );
   return result;
@@ -230,10 +232,14 @@ printf '{"type":"result","subtype":"success","structured_output":{"schema":"open
   chmodSync(stub, 0o755);
 
   container = docker(["run", "-d", "--entrypoint", "tail", image, "-f", "/dev/null"]);
-  dockerExec(["mkdir", "-p", "/home/agent/repo", "/requests", "/transport", "/runtime/fences", "/tmp/stub"]);
-  docker(["cp", `${source}/.`, `${container}:/home/agent/repo/`]);
+  dockerExec(["mkdir", "-p", sourceRepository, "/requests", "/transport", "/runtime/fences", "/tmp/stub"]);
+  docker(["cp", `${source}/.`, `${container}:${sourceRepository}/`]);
   docker(["cp", stub, `${container}:/tmp/stub/claude`]);
-  dockerExec(["chown", "-R", "root:root", "/home/agent/repo", "/tmp/stub"]);
+  dockerExec(["sh", "-c", `find -P ${sourceRepository} -exec chown -h root:root -- {} +`]);
+  dockerExec(["chown", "-R", "root:root", "/tmp/stub"]);
+  dockerExec(["sh", "-c", `find -P ${sourceRepository} ! -type l -exec chmod go-w -- {} +`]);
+  dockerExec(["chown", "root:root", sourceRepositoryParent]);
+  dockerExec(["chmod", "0700", sourceRepositoryParent]);
   dockerExec(["chmod", "0755", "/tmp/stub/claude"]);
   for (const name of ["a", "b"]) {
     dockerExec([
@@ -254,7 +260,7 @@ printf '{"type":"result","subtype":"success","structured_output":{"schema":"open
   const acceptedB = integrate("b", actionB, resultB, acceptedA.output_subject);
 
   assert.equal(
-    dockerExec(["git", "-C", "/home/agent/repo", "show", `${acceptedB.output_subject}:WORK.md`]),
+    dockerExec(["git", "-C", sourceRepository, "show", `${acceptedB.output_subject}:WORK.md`]),
     "base\nstep-a\nstep-b",
   );
   assert.equal(dockerExec(["wc", "-l", "/tmp/kernel-launch-count/attempt-a"]).split(/\s+/)[0], "1");

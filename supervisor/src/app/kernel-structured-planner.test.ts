@@ -824,6 +824,7 @@ describe("KernelStructuredSettlementPlanner", () => {
       item_id: "unit-b",
     });
     expect(settlement.next_attempts[0]!.input_subject).toBe(INTEGRATED);
+    expect(settlement.next_attempts[0]!.context_checkpoint_ids).toContain(integration.checkpoint.id);
     expect(settlement.next_attempts[0]!.context_record_ids).toContain(settlement.decision.id);
     expect(settlement.next_attempts[0]!.context_record_ids).toContain(promotion.id);
   });

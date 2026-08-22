@@ -678,7 +678,7 @@ async function executeCorrection(options, actionDirectory) {
 
 export async function executeAttempt({
   request,
-  sourceRepoDir = "/home/agent/repo",
+  sourceRepoDir = "/var/lib/openthrottle/repository-source/repo",
   actionRoot = process.env.OT_ACTION_ROOT ?? DEFAULT_ACTION_ROOT,
   resultPath,
   sessionPath,

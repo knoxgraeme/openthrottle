@@ -517,7 +517,7 @@ export class KernelStructuredSettlementPlanner implements
                 ...exactStructuredRuntimeRecords(request),
                 ...(resolvedPlan.promotion === null ? [] : [resolvedPlan.promotion]),
               ],
-              checkpoints: [],
+              checkpoints: [input.checkpoint],
             },
           },
         })),

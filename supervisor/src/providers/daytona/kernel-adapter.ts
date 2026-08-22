@@ -42,6 +42,12 @@ import {
   type KernelCheckpointArtifactDescriptor,
 } from "../../runtime/kernel-wire.js";
 import { inspectKernelCheckpointBundle } from "../../runtime/kernel-checkpoint-bundle.js";
+import {
+  assertDaytonaRepositorySourceFence,
+  DAYTONA_REPOSITORY_ROOT,
+  materializeDaytonaRepositorySource,
+} from "./kernel-repository-source.js";
+import { shellQuote } from "./shell.js";
 
 const ACTION_INPUT_DIR = "/var/lib/openthrottle/action-input";
 const ACTION_RESULT_DIR = "/var/lib/openthrottle/action-results";
@@ -54,6 +60,7 @@ const STEERING_INBOX_DIR = `${AGENT_STATE_ROOT}/inbox`;
 const KERNEL_STEERING_DELIVERY_SCHEMA = "openthrottle.kernel-steering/v1" as const;
 const KERNEL_STEERING_DELIVERY_MAX_BYTES = 64 * 1024;
 const ACTIVE_AUTOSTOP_MINUTES = 60;
+const DISPATCH_LOCK_CONTENTION_EXIT_CODE = 75;
 const MODEL_CREDENTIALS = [
   "CLAUDE_CODE_OAUTH_TOKEN",
   "CODEX_AUTH_JSON",
@@ -182,10 +189,6 @@ function sealedActionTimeoutMs(
 
 function notFound(error: unknown): boolean {
   return /not[ -]?found|404/i.test(error instanceof Error ? error.message : String(error));
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 function inspectCheckpointBundle(
@@ -595,7 +598,13 @@ export class DaytonaKernelAdapter implements
 
     await this.#prepareDirectories(sandbox, paths);
     if (request.schema === KERNEL_ACTION_REQUEST_SCHEMA) {
-      await this.#materializeInputSubject(sandbox, request, paths.input_directory);
+      await this.#materializeInputSubject(
+        sandbox,
+        request,
+        paths.input_directory,
+        environment.repository,
+        environment.base_branch,
+      );
     }
     await this.#putImmutableRequest(sandbox, requestPath, canonicalJson(request));
     const remainingBeforeCredentials = actionDeadline - Date.now();
@@ -640,32 +649,80 @@ export class DaytonaKernelAdapter implements
     const actionTimeoutSeconds = Math.max(1, Math.ceil(remainingBeforeLaunch / 1_000));
     const sessionId = `kernel-${safeAttemptId(request.attempt_id)}`;
     await sandbox.process.createSession(sessionId).catch(() => undefined);
-    await sandbox.process.executeSessionCommand(sessionId, {
-      command: `flock --nonblock ${shellQuote(paths.lock)} sh -c ` +
+    const launch = await sandbox.process.executeSessionCommand(sessionId, {
+      command: `flock --nonblock --conflict-exit-code ${DISPATCH_LOCK_CONTENTION_EXIT_CODE} ` +
+        `${shellQuote(paths.lock)} sh -c ` +
         shellQuote(`test -f ${shellQuote(resultPath)} || exec /opt/openthrottle/entrypoint.sh`),
       runAsync: true,
       suppressInputEcho: true,
     }, actionTimeoutSeconds);
+    const launchCommandId = launch?.cmdId;
+    if (typeof launchCommandId !== "string" || launchCommandId.length < 1) {
+      const completedOutcome = await collect();
+      if (completedOutcome !== null) return completedOutcome;
+      const termination = await this.#terminateSessionAndCollect(sandbox, sessionId, collect);
+      if (termination.outcome !== null) return termination.outcome;
+      return {
+        state: "work_failed",
+        retryable: termination.verified,
+        reason: termination.verified
+          ? "Daytona action launch omitted its command identity; session termination was verified"
+          : "Daytona action launch omitted its command identity and session termination could not be verified",
+      };
+    }
 
+    let adoptedExistingCommand = false;
     while (Date.now() < actionDeadline) {
       await heartbeat();
       const outcome = await collect();
       if (outcome !== null) return outcome;
+      if (adoptedExistingCommand) {
+        await new Promise((resolve) => setTimeout(resolve, this.#options.poll_interval_ms ?? 500));
+        continue;
+      }
+      let command;
+      try {
+        command = await sandbox.process.getSessionCommand(sessionId, launchCommandId);
+      } catch (error) {
+        if (!notFound(error)) throw error;
+      }
+      if (typeof command?.exitCode === "number") {
+        if (command.exitCode === DISPATCH_LOCK_CONTENTION_EXIT_CODE) {
+          adoptedExistingCommand = true;
+          await new Promise((resolve) => setTimeout(resolve, this.#options.poll_interval_ms ?? 500));
+          continue;
+        }
+        const completedOutcome = await collect();
+        if (completedOutcome !== null) return completedOutcome;
+        const termination = await this.#terminateSessionAndCollect(sandbox, sessionId, collect);
+        if (!termination.verified) {
+          return {
+            state: "work_failed",
+            retryable: false,
+            reason: `Daytona action command exited with code ${command.exitCode} and session termination could not be verified`,
+          };
+        }
+        if (termination.outcome !== null) return termination.outcome;
+        return {
+          state: "work_failed",
+          retryable: true,
+          reason: `Daytona action command exited with code ${command.exitCode} without producing a sealed result; session termination was verified`,
+        };
+      }
       await new Promise((resolve) => setTimeout(resolve, this.#options.poll_interval_ms ?? 500));
     }
     await heartbeat();
     const finalOutcome = await collect();
     if (finalOutcome !== null) return finalOutcome;
-    const terminated = await this.#terminateAndVerifySession(sandbox, sessionId);
-    if (!terminated) {
+    const termination = await this.#terminateSessionAndCollect(sandbox, sessionId, collect);
+    if (!termination.verified) {
       return {
         state: "work_failed",
         retryable: false,
         reason: "Daytona action deadline expired and session termination could not be verified",
       };
     }
-    const terminatedOutcome = await collect();
-    if (terminatedOutcome !== null) return terminatedOutcome;
+    if (termination.outcome !== null) return termination.outcome;
     return {
       state: "work_failed",
       retryable: true,
@@ -756,6 +813,18 @@ export class DaytonaKernelAdapter implements
     }
   }
 
+  async #terminateSessionAndCollect(
+    sandbox: Sandbox,
+    sessionId: string,
+    collect: () => Promise<KernelRuntimeOutcome | null>,
+  ): Promise<{ verified: boolean; outcome: KernelRuntimeOutcome | null }> {
+    const verified = await this.#terminateAndVerifySession(sandbox, sessionId);
+    return {
+      verified,
+      outcome: verified ? await collect() : null,
+    };
+  }
+
   async #prepareDirectories(
     sandbox: Sandbox,
     paths: ReturnType<typeof launchPaths>,
@@ -791,6 +860,8 @@ export class DaytonaKernelAdapter implements
     sandbox: Sandbox,
     request: KernelWorkActionRequest,
     inputDirectory: string,
+    repository: string,
+    baseBranch: string,
   ): Promise<void> {
     const boundaries = request.context.checkpoints.filter(
       (checkpoint) => checkpoint.output_subject === request.input_subject,
@@ -799,11 +870,21 @@ export class DaytonaKernelAdapter implements
       throw new Error("kernel action has ambiguous checkpoint materialization for its input subject");
     }
     const boundary = boundaries[0];
-    if (!boundary) return;
+    if (!boundary) {
+      await materializeDaytonaRepositorySource({
+        sandbox,
+        repository,
+        base_branch: baseBranch,
+        subject: request.input_subject,
+        github_read_token: this.#options.github_read_token,
+      });
+      return;
+    }
     if (!("blob" in boundary.payload) || boundary.payload.blob.encoding !== "binary" ||
         boundary.payload.blob.media_type !== "application/x-git-bundle") {
       throw new Error("kernel action input checkpoint is not a materializable Git bundle");
     }
+    await assertDaytonaRepositorySourceFence(sandbox);
     const pointer = boundary.payload.blob;
     const bytes = this.#options.blob_store.read(pointer);
     const bundlePath = `${inputDirectory}/context-${pointer.digest}.bundle`;
@@ -819,11 +900,11 @@ export class DaytonaKernelAdapter implements
     }
     const listed = await sandbox.process.executeCommand(
       `git bundle list-heads ${shellQuote(bundlePath)}`,
-      "/home/agent/repo",
+      DAYTONA_REPOSITORY_ROOT,
       { GIT_TERMINAL_PROMPT: "0" },
       120,
     );
-    if (listed.exitCode !== undefined && listed.exitCode !== 0) {
+    if (listed.exitCode !== 0) {
       throw new Error("Daytona could not inspect the input checkpoint bundle");
     }
     const heads = listed.result.trim().split("\n").filter(Boolean);
@@ -835,20 +916,20 @@ export class DaytonaKernelAdapter implements
     ) throw new Error("input checkpoint bundle does not bind the exact successor subject");
     const imported = await sandbox.process.executeCommand(
       `git fetch --quiet --no-tags ${shellQuote(bundlePath)} ${shellQuote(ref)}`,
-      "/home/agent/repo",
+      DAYTONA_REPOSITORY_ROOT,
       { GIT_TERMINAL_PROMPT: "0" },
       120,
     );
-    if (imported.exitCode !== undefined && imported.exitCode !== 0) {
+    if (imported.exitCode !== 0) {
       throw new Error("Daytona could not import the exact successor checkpoint");
     }
     const verified = await sandbox.process.executeCommand(
       `git cat-file -e ${shellQuote(`${request.input_subject}^{commit}`)}`,
-      "/home/agent/repo",
+      DAYTONA_REPOSITORY_ROOT,
       { GIT_TERMINAL_PROMPT: "0" },
       120,
     );
-    if (verified.exitCode !== undefined && verified.exitCode !== 0) {
+    if (verified.exitCode !== 0) {
       throw new Error("Daytona input checkpoint did not materialize its exact commit");
     }
   }
