@@ -196,8 +196,10 @@ exit 99
 POISON
 chmod 0755 "$SMOKE_DIR/poison/claude"
 
-CONTAINER="$(docker run -d --entrypoint tail "$IMAGE" -f /dev/null)"
-docker exec "$CONTAINER" sh -c '
+# GitHub's nested Docker seccomp profile blocks the user namespace that
+# Bubblewrap needs. Relax only this short-lived probe container; the ordinary
+# lifecycle container below keeps Docker's default profile.
+docker run --rm --security-opt seccomp=unconfined --entrypoint sh "$IMAGE" -c '
   set -eu
   test "$(codex --version)" = "codex-cli 0.149.0"
   test "$(command -v bwrap)" = /usr/bin/bwrap
@@ -225,6 +227,7 @@ docker exec "$CONTAINER" sh -c '
     "
   test ! -e "$probe/forbidden"
 '
+CONTAINER="$(docker run -d --entrypoint tail "$IMAGE" -f /dev/null)"
 docker exec "$CONTAINER" mkdir -p /var/lib/openthrottle/repository-source/repo /requests /transport/edit /transport/inspect /transport/command /runtime/fences /tmp/stub /tmp/poison
 docker cp "$SOURCE_REPO/." "$CONTAINER:/var/lib/openthrottle/repository-source/repo/"
 docker cp "$REQUESTS/." "$CONTAINER:/requests/"
