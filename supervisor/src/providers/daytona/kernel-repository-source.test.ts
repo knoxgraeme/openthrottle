@@ -12,11 +12,16 @@ const SUBJECT = "c".repeat(40);
 const URL = "https://github.com/owner/repository.git";
 const TOKEN = "github-read-token";
 
-function repositorySandbox(initiallyReady: boolean) {
+function repositorySandbox(
+  initiallyReady: boolean,
+  deleteError = new Error(
+    "stat /var/lib/openthrottle/repository-source/repo.part: no such file or directory",
+  ),
+) {
   let ready = initiallyReady;
   let cloned = false;
   const commands: string[] = [];
-  const deleteFile = vi.fn().mockRejectedValue(new Error("404 not found"));
+  const deleteFile = vi.fn().mockRejectedValue(deleteError);
   const clone = vi.fn(async () => {
     cloned = true;
   });
@@ -100,6 +105,20 @@ describe("Daytona repository source materialization", () => {
     expect(findLines).not.toHaveLength(0);
     expect(findLines.every((line) => !/(?:^|\s)\((?:\s|$)/.test(line))).toBe(true);
     expectValidShell(fake.commands);
+  });
+
+  it("rejects non-absence staging deletion failures", async () => {
+    const fake = repositorySandbox(false, new Error("permission denied"));
+
+    await expect(materializeDaytonaRepositorySource({
+      sandbox: fake.sandbox,
+      repository: "owner/repository",
+      base_branch: "main",
+      subject: SUBJECT,
+      github_read_token: TOKEN,
+    })).rejects.toThrow("permission denied");
+
+    expect(fake.clone).not.toHaveBeenCalled();
   });
 
   it("accepts an already-ready exact source without touching staging", async () => {

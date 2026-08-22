@@ -10,7 +10,9 @@ const REPOSITORY_CONFLICT_EXIT = 45;
 const REPOSITORY_STAGING_INVALID_EXIT = 46;
 
 function notFound(error: unknown): boolean {
-  return /not[ -]?found|404/i.test(error instanceof Error ? error.message : String(error));
+  return /not[ -]?found|404|no such file or directory/i.test(
+    error instanceof Error ? error.message : String(error),
+  );
 }
 
 function repositoryParentChecks(exitCode: number): string[] {
