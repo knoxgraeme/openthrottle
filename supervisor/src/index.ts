@@ -248,6 +248,7 @@ async function main(): Promise<void> {
     projections,
     analysis: createKernelHistoricalAnalysisStore(epoch.db),
     control,
+    effect_rejections: kernel,
   });
   const repositorySetup: KernelRepositorySetupPort = {
     async prepare(input) {

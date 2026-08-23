@@ -133,6 +133,7 @@ export interface EffectRow extends PayloadRow {
   idempotency_key: string;
   target: string;
   subject: string | null;
+  intent_hash: string;
   status: string;
   version: number;
   attempt_count: number;
@@ -143,6 +144,7 @@ export interface EffectRow extends PayloadRow {
   dispatch_lease_id: string | null;
   dispatch_worker_id: string | null;
   delivery_record_id: string | null;
+  unknown_detail: string | null;
 }
 
 export function placeholders(length: number): string {

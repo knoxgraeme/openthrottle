@@ -19,6 +19,13 @@ import { createKernelHistoricalAnalysisStore } from "../persistence/kernel-analy
 import { SqliteKernelInboxStore } from "../persistence/kernel-inbox-store.js";
 import { SqliteKernelProjectionStore } from "../persistence/kernel-projection-store.js";
 import { SqliteKernelRegistrationStore } from "../persistence/kernel-registration-store.js";
+import {
+  KernelOperatorEffectRejectionConflictError,
+} from "../pipeline/kernel/operator-effect-rejection.js";
+import type {
+  KernelOperatorEffectRejectionRequest,
+  KernelOperatorEffectRejectionResult,
+} from "../pipeline/kernel/ports.js";
 import { createServer } from "./server.js";
 
 const fixtures: FreshKernelFixture[] = [];
@@ -56,11 +63,35 @@ function setup(input: { linear_session_start?: KernelLinearSessionStartWakePort 
     runtime_inventory: { listActiveRuntimeResources: async () => [] },
     now: () => "2026-08-20T13:00:00.000Z",
   });
+  const effectRejections = {
+    rejectDispatchFencedUnknownEffect: vi.fn(async (
+      request: KernelOperatorEffectRejectionRequest,
+    ): Promise<KernelOperatorEffectRejectionResult> => {
+      const maintenance = control.maintenanceState();
+      if (
+        !maintenance.closed ||
+        maintenance.version !== request.expected_maintenance_version
+      ) {
+        throw new KernelOperatorEffectRejectionConflictError(
+          "operator Effect rejection requires the exact closed maintenance fence",
+        );
+      }
+      return {
+        disposition: "rejected",
+        pipeline_run_id: request.pipeline_run_id,
+        effect_id: request.effect_id,
+        delivery_record_id: "delivery-operator-rejection",
+        effect_version: 4,
+        run_version: 8,
+      };
+    }),
+  };
   const service = new KernelHttpService({
     registrations,
     projections,
     analysis: createKernelHistoricalAnalysisStore(fixture.db),
     control,
+    effect_rejections: effectRejections,
   });
   const repositorySetup: KernelRepositorySetupPort = {
     prepare: vi.fn(async () => ({
@@ -84,6 +115,7 @@ function setup(input: { linear_session_start?: KernelLinearSessionStartWakePort 
   };
   return {
     fixture,
+    effectRejections,
     repositorySetup,
     app: createServer({
       cfg: {
@@ -242,6 +274,126 @@ describe("kernel-native HTTP surface", () => {
     expect(await duplicate.json()).toMatchObject({ accepted: true, duplicate: true });
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM inbox_events").get())
       .toEqual({ count: 1 });
+  });
+
+  it("rejects an exact unknown Effect through the deploy-only maintenance surface", async () => {
+    const { app, effectRejections } = setup();
+    const path = "/maintenance/runs/OPE-run-active/effects/effect-integration/reject";
+    const body = {
+      expected_maintenance_version: 2,
+      resolution_id: "resolution-legacy-idempotency-validation",
+      reason_code: "legacy_integration_idempotency_key_rejected_before_mutation",
+      reason: "sandbox rejected the sealed request before repository mutation",
+    };
+
+    expect((await app.request(path, {
+      method: "POST",
+      headers: { ...STATUS_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })).status).toBe(401);
+    expect((await app.request(path, {
+      method: "POST",
+      headers: { ...DEPLOY_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, expected_maintenance_version: 1 }),
+    })).status).toBe(409);
+
+    const closed = await app.request("/maintenance/close", {
+      method: "POST",
+      headers: { ...DEPLOY_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({ expected_version: 1 }),
+    });
+    expect(closed.status).toBe(200);
+
+    const response = await app.request(path, {
+      method: "POST",
+      headers: { ...DEPLOY_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      resolution: {
+        disposition: "rejected",
+        pipeline_run_id: "run-active",
+        effect_id: "effect-integration",
+        delivery_record_id: "delivery-operator-rejection",
+        effect_version: 4,
+        run_version: 8,
+      },
+    });
+    expect(effectRejections.rejectDispatchFencedUnknownEffect).toHaveBeenCalledWith({
+      pipeline_run_id: "run-active",
+      effect_id: "effect-integration",
+      ...body,
+    });
+
+    effectRejections.rejectDispatchFencedUnknownEffect.mockResolvedValueOnce({
+      disposition: "unchanged",
+      pipeline_run_id: "run-active",
+      effect_id: "effect-integration",
+      delivery_record_id: "delivery-operator-rejection",
+      effect_version: 4,
+      run_version: 8,
+    });
+    const replay = await app.request(path, {
+      method: "POST",
+      headers: { ...DEPLOY_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({
+      resolution: { disposition: "unchanged" },
+    });
+  });
+
+  it("strictly validates operator Effect rejection and maps not-found and conflict", async () => {
+    const { app, effectRejections } = setup();
+    await app.request("/maintenance/close", {
+      method: "POST",
+      headers: { ...DEPLOY_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({ expected_version: 1 }),
+    });
+    const path = "/maintenance/runs/OPE-run-active/effects/effect-integration/reject";
+    const valid = {
+      expected_maintenance_version: 2,
+      resolution_id: "resolution-legacy-idempotency-validation",
+      reason_code: "legacy_integration_idempotency_key_rejected_before_mutation",
+      reason: "sandbox rejected the sealed request before repository mutation",
+    };
+    const post = (body: unknown, target = path) => app.request(target, {
+      method: "POST",
+      headers: { ...DEPLOY_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    expect((await post({ ...valid, unexpected: true })).status).toBe(400);
+    expect((await post({
+      expected_maintenance_version: 2,
+      resolution_id: valid.resolution_id,
+      reason_code: valid.reason_code,
+    })).status).toBe(400);
+    expect((await post({ ...valid, reason_code: "operator_guess" })).status).toBe(400);
+    expect((await post({ ...valid, resolution_id: "bad id" })).status).toBe(400);
+    expect((await post({ ...valid, reason: "x".repeat(1_501) })).status).toBe(400);
+    expect((await post(valid,
+      "/maintenance/runs/OPE-run-active/effects/bad%20effect/reject")).status).toBe(400);
+    expect((await post(valid,
+      "/maintenance/runs/missing/effects/effect-integration/reject")).status).toBe(404);
+    expect((await post({ ...valid, expected_maintenance_version: 1 })).status).toBe(409);
+
+    effectRejections.rejectDispatchFencedUnknownEffect.mockRejectedValueOnce(
+      new KernelOperatorEffectRejectionConflictError("effect is currently leased"),
+    );
+    const conflict = await post(valid);
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toEqual({ error: "effect is currently leased" });
+
+    const oversized = await app.request(path, {
+      method: "POST",
+      headers: { ...DEPLOY_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({ ...valid, reason: "x".repeat(17_000) }),
+    });
+    expect(oversized.status).toBe(400);
+    expect(effectRejections.rejectDispatchFencedUnknownEffect).toHaveBeenCalledTimes(2);
   });
 
   it("acknowledges valid Linear deliveries with exact HTTP 200", async () => {

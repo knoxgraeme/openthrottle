@@ -164,6 +164,30 @@ export interface KernelEffectPort {
   }): Promise<void>;
 }
 
+export interface KernelOperatorEffectRejectionRequest {
+  pipeline_run_id: string;
+  effect_id: string;
+  expected_maintenance_version: number;
+  resolution_id: string;
+  reason_code: "legacy_integration_idempotency_key_rejected_before_mutation";
+  reason: string;
+}
+
+export interface KernelOperatorEffectRejectionResult {
+  disposition: "rejected" | "unchanged";
+  pipeline_run_id: string;
+  effect_id: string;
+  delivery_record_id: string;
+  effect_version: number;
+  run_version: number;
+}
+
+export interface KernelOperatorEffectRejectionPort {
+  rejectDispatchFencedUnknownEffect(
+    input: KernelOperatorEffectRejectionRequest,
+  ): Promise<KernelOperatorEffectRejectionResult>;
+}
+
 export interface ExternalScheduleEffectView {
   intent: EffectIntent;
   delivery: DeliveryRecord | null;

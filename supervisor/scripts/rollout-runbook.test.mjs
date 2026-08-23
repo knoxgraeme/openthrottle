@@ -68,6 +68,24 @@ function validateReceiptCandidates(candidates) {
 }
 
 describe("fresh-epoch rollout runbook", () => {
+  it("keeps maintenance closed until exceptional recovery cleanup is clear", () => {
+    const section = runbook.slice(runbook.indexOf("## 6. Reject a proven pre-mutation sandbox failure"));
+    const activeWorkIndex = section.indexOf('ACTIVE_WORK="$(');
+    const clearGuardIndex = section.indexOf("jq -e '.clear == true'");
+    const openIndex = section.indexOf('"https://$FLY_APP.fly.dev/maintenance/open"');
+
+    expect(activeWorkIndex).toBeGreaterThanOrEqual(0);
+    expect(clearGuardIndex).toBeGreaterThan(activeWorkIndex);
+    expect(openIndex).toBeGreaterThan(clearGuardIndex);
+    for (const [clear, expectedStatus] of [[true, 0], [false, 1]]) {
+      const guarded = spawnSync("bash", ["-c", `
+        ACTIVE_WORK='${JSON.stringify({ clear })}'
+        jq -e '.clear == true' <<<"$ACTIVE_WORK" >/dev/null || exit 1
+      `]);
+      expect(guarded.status).toBe(expectedStatus);
+    }
+  });
+
   it("runs the accepted digest-pinned image without rebuilding a checkout", () => {
     const manifestGuardIndex = runbook.indexOf('if [ ! -f "$RELEASE_MANIFEST" ]');
     const volumeGuardIndex = runbook.indexOf(

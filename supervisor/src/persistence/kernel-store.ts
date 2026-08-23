@@ -11,6 +11,7 @@ import {
   type BlobPointer,
   type CompiledPipelineManifest,
   type DecisionRecord,
+  type DeliveryRecord,
   type EffectIntent,
   type ExecutionRecord,
   type ExecutionRecordPayloadRegistry,
@@ -30,6 +31,9 @@ import type {
   KernelDefinitionBundleBytesPort,
   KernelEffectPort,
   KernelExternalSchedulePort,
+  KernelOperatorEffectRejectionPort,
+  KernelOperatorEffectRejectionRequest,
+  KernelOperatorEffectRejectionResult,
   KernelReductionPort,
   KernelStructuredPlanningReadPort,
   LeasedAttemptView,
@@ -42,8 +46,17 @@ import type {
   ExternalScheduleView,
 } from "../pipeline/kernel/ports.js";
 import { KERNEL_WORK_REQUEST_PAYLOAD_SCHEMA } from "../pipeline/kernel/ports.js";
-import type { EffectReconciliation } from "../pipeline/kernel/effect-intent.js";
-import { effectIntentContentHash } from "../pipeline/kernel/effect-intent.js";
+import {
+  effectIntentContentHash,
+  type EffectReconciliation,
+} from "../pipeline/kernel/effect-intent.js";
+import {
+  KernelOperatorEffectRejectionConflictError,
+  KernelOperatorEffectRejectionNotFoundError,
+  assertExactOperatorEffectRejectionReplay,
+  createOperatorEffectRejectionDelivery,
+  operatorEffectRejectionResolutionDigest,
+} from "../pipeline/kernel/operator-effect-rejection.js";
 import {
   KERNEL_RUN_SCHEMA,
   canonicalAttemptContextIds,
@@ -87,6 +100,7 @@ import {
   ACTIVE_RUN_STATUS_SET,
 } from "./kernel-active-statuses.js";
 import { KernelLeaseOperations } from "./kernel-store-leases.js";
+import { KERNEL_INGRESS_MAINTENANCE_SETTING } from "./epoch-schema.js";
 
 const STRUCTURED_PLANNING_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 
@@ -179,6 +193,7 @@ export class SqliteKernelStore implements
   KernelAttemptRequestPort,
   KernelDefinitionBundleBytesPort,
   KernelEffectPort,
+  KernelOperatorEffectRejectionPort,
   KernelContextPort,
   KernelExternalSchedulePort,
   KernelStructuredPlanningReadPort {
@@ -456,6 +471,232 @@ export class SqliteKernelStore implements
     reconciliation: EffectReconciliation;
   }): Promise<void> {
     return this.#leases.completeLeasedEffect(input);
+  }
+
+  async rejectDispatchFencedUnknownEffect(
+    input: KernelOperatorEffectRejectionRequest,
+  ): Promise<KernelOperatorEffectRejectionResult> {
+    return this.#db.transaction((): KernelOperatorEffectRejectionResult => {
+      const maintenance = this.#db.prepare(`
+        SELECT value_json, value_type, mutable, version
+        FROM settings WHERE key = ?
+      `).get(KERNEL_INGRESS_MAINTENANCE_SETTING) as {
+        value_json: string;
+        value_type: string;
+        mutable: number;
+        version: number;
+      } | undefined;
+      if (
+        !maintenance || maintenance.value_json !== "true" ||
+        maintenance.value_type !== "boolean" || maintenance.mutable !== 1 ||
+        maintenance.version !== input.expected_maintenance_version
+      ) {
+        throw new KernelOperatorEffectRejectionConflictError(
+          "operator Effect rejection requires the exact closed maintenance fence",
+        );
+      }
+
+      const row = this.#db.prepare(`
+        SELECT e.*, r.status AS run_status, r.version AS run_version
+        FROM effects e
+        JOIN pipeline_runs r ON r.id = e.pipeline_run_id
+        WHERE e.id = ? AND e.pipeline_run_id = ?
+      `).get(input.effect_id, input.pipeline_run_id) as (EffectRow & {
+        run_status: KernelRun["status"];
+        run_version: number;
+      }) | undefined;
+      if (!row) {
+        throw new KernelOperatorEffectRejectionNotFoundError(
+          "operator Effect rejection does not match an exact pipeline run and Effect",
+        );
+      }
+      const intent = this.#leases.effectIntentFromRow(row);
+      const deliveryRow = this.#db.prepare(`
+        SELECT * FROM records
+        WHERE pipeline_run_id = ? AND effect_id = ? AND kind = 'delivery'
+      `).get(row.pipeline_run_id, row.id) as RecordRow | undefined;
+      const runtimeCreateRows = this.#db.prepare(`
+        SELECT runtime_effect.*
+        FROM effects runtime_effect
+        JOIN records delivery
+          ON delivery.id = runtime_effect.delivery_record_id
+          AND delivery.pipeline_run_id = runtime_effect.pipeline_run_id
+          AND delivery.effect_id = runtime_effect.id
+        WHERE runtime_effect.pipeline_run_id = ?
+          AND runtime_effect.kind = 'daytona/create-sandbox@1'
+          AND runtime_effect.status = 'acknowledged'
+          AND delivery.kind = 'delivery'
+          AND delivery.delivery_status = 'confirmed'
+        ORDER BY runtime_effect.id
+        LIMIT 2
+      `).all(row.pipeline_run_id) as EffectRow[];
+      if (runtimeCreateRows.length !== 1) {
+        throw new KernelOperatorEffectRejectionConflictError(
+          "operator Effect rejection requires one exact confirmed runtime creation",
+        );
+      }
+      const runtimeCreateIntent = this.#leases.effectIntentFromRow(runtimeCreateRows[0]!);
+      if (effectIntentContentHash(runtimeCreateIntent) !== runtimeCreateRows[0]!.intent_hash) {
+        throw new KernelOperatorEffectRejectionConflictError(
+          "operator Effect rejection runtime creation failed its exact intent hash",
+        );
+      }
+
+      if (row.status === "rejected") {
+        if (
+          row.delivery_record_id === null || deliveryRow === undefined ||
+          deliveryRow.id !== row.delivery_record_id ||
+          row.lease_id !== null || row.lease_worker_id !== null ||
+          row.lease_expires_at !== null || row.lease_execution_mode !== null ||
+          row.dispatch_lease_id === null || row.dispatch_worker_id === null
+        ) {
+          throw new KernelOperatorEffectRejectionConflictError(
+            "settled Effect does not contain an exact operator rejection fence",
+          );
+        }
+        const existing = recordFromRow(deliveryRow, this.#payloadSchemas);
+        if (existing.kind !== "delivery") {
+          throw new KernelOperatorEffectRejectionConflictError(
+            "settled Effect does not reference a DeliveryRecord",
+          );
+        }
+        assertExactOperatorEffectRejectionReplay({
+          request: input,
+          intent,
+          delivery: existing,
+          current_run_version: row.run_version,
+          current_effect_version: row.version,
+          current_intent_hash: row.intent_hash,
+          current_dispatch_fence: {
+            lease_id: row.dispatch_lease_id,
+            worker_id: row.dispatch_worker_id,
+          },
+          reconciliation_ordinal: row.attempt_count,
+          runtime_create_intent: runtimeCreateIntent,
+        });
+        return {
+          disposition: "unchanged",
+          pipeline_run_id: row.pipeline_run_id,
+          effect_id: row.id,
+          delivery_record_id: existing.id,
+          effect_version: row.version,
+          run_version: row.run_version,
+        };
+      }
+
+      if (
+        !ACTIVE_RUN_STATUS_SET.has(row.run_status) || row.status !== "unknown" ||
+        row.kind !== "daytona/integrate-checkpoint@1" ||
+        row.lease_id !== null || row.lease_worker_id !== null ||
+        row.lease_expires_at !== null || row.lease_execution_mode !== null ||
+        row.dispatch_lease_id === null || row.dispatch_worker_id === null ||
+        row.delivery_record_id !== null || deliveryRow !== undefined ||
+        row.unknown_detail === null || row.attempt_count < 1
+      ) {
+        throw new KernelOperatorEffectRejectionConflictError(
+          "Effect is not an active, unleased, dispatch-fenced unknown Daytona integration",
+        );
+      }
+      const activeScheduleOwners = this.#db.prepare(`
+        SELECT a.id AS attempt_id
+        FROM records d
+        JOIN pipeline_runs r ON r.id = d.pipeline_run_id
+        JOIN attempts a ON a.pipeline_run_id = d.pipeline_run_id
+        WHERE d.id = ? AND d.pipeline_run_id = ? AND d.kind = 'decision'
+          AND d.reducer = 'core/external-schedule@1'
+          AND d.semantic_key IS NOT NULL
+          AND substr(
+            d.semantic_key,
+            1,
+            length('external-schedule:' || a.id || ':')
+          ) = 'external-schedule:' || a.id || ':'
+          AND a.status IN ('work_complete', 'recorded')
+          AND a.lease_id IS NULL
+          AND a.checkpoint_id IS NOT NULL
+          AND a.stage_id = r.cursor_stage_id
+        ORDER BY a.id
+        LIMIT 2
+      `).all(row.decision_record_id, row.pipeline_run_id) as Array<{ attempt_id: string }>;
+      if (activeScheduleOwners.length !== 1) {
+        throw new KernelOperatorEffectRejectionConflictError(
+          "Effect is not owned by exactly one current ready external schedule",
+        );
+      }
+
+      const capturedEffectVersion = row.version;
+      const capturedRunVersion = row.run_version;
+      const dispatchFence = {
+        lease_id: row.dispatch_lease_id,
+        worker_id: row.dispatch_worker_id,
+      };
+      const delivery: DeliveryRecord = createOperatorEffectRejectionDelivery({
+        request: input,
+        intent,
+        captured_run_version: capturedRunVersion,
+        captured_effect_version: capturedEffectVersion,
+        intent_hash: row.intent_hash,
+        dispatch_fence: dispatchFence,
+        reconciliation_ordinal: row.attempt_count,
+        prior_unknown_detail: row.unknown_detail,
+        runtime_create_intent: runtimeCreateIntent,
+        created_at: this.#now(),
+      });
+      this.#insertRecord(delivery);
+      const changed = this.#db.prepare(`
+        UPDATE effects
+        SET status = 'rejected', delivery_record_id = ?, unknown_detail = NULL,
+          version = version + 1, updated_at = ?
+        WHERE id = ? AND pipeline_run_id = ? AND version = ? AND status = 'unknown'
+          AND lease_id IS NULL AND lease_worker_id IS NULL
+          AND lease_expires_at IS NULL AND lease_execution_mode IS NULL
+          AND dispatch_lease_id = ? AND dispatch_worker_id = ?
+          AND delivery_record_id IS NULL AND intent_hash = ?
+          AND attempt_count = ? AND unknown_detail = ?
+      `).run(
+        delivery.id,
+        this.#now(),
+        row.id,
+        row.pipeline_run_id,
+        capturedEffectVersion,
+        dispatchFence.lease_id,
+        dispatchFence.worker_id,
+        row.intent_hash,
+        row.attempt_count,
+        row.unknown_detail,
+      );
+      if (changed.changes !== 1) {
+        throw new KernelOperatorEffectRejectionConflictError(
+          "operator Effect rejection compare-and-set failed",
+        );
+      }
+      const resolutionDigest = operatorEffectRejectionResolutionDigest(input);
+      const run = this.#advanceRunFence(
+        row.pipeline_run_id,
+        `effect-operator-reject:${delivery.id}`,
+        {
+          schema: "openthrottle.operator-effect-rejection-transition/v1",
+          effect_id: row.id,
+          delivery_record_id: delivery.id,
+          resolution_digest: resolutionDigest,
+          captured_run_version: capturedRunVersion,
+          captured_effect_version: capturedEffectVersion,
+          dispatch_fence: dispatchFence,
+        },
+      );
+      if (run.version !== capturedRunVersion + 1) {
+        throw new KernelOperatorEffectRejectionConflictError(
+          "operator Effect rejection did not advance the exact pipeline run fence",
+        );
+      }
+      return {
+        disposition: "rejected",
+        pipeline_run_id: row.pipeline_run_id,
+        effect_id: row.id,
+        delivery_record_id: delivery.id,
+        effect_version: capturedEffectVersion + 1,
+        run_version: run.version,
+      };
+    }).immediate();
   }
 
   async findExternalSchedule(input: {
