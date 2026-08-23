@@ -542,7 +542,7 @@ function binding(
             attempt_id: attempt.id,
             request_hash: attempt.request_hash,
             definition_bundle_hash: attempt.definition_bundle_hash,
-            input_subject: externalKind === "core/publish@1" ? SUBJECT : attempt.input_subject,
+            input_subject: attempt.input_subject,
             output_subject: OUTPUT,
             native_session_id: null,
             payload_schema: "openthrottle.git-checkpoint-bundle/v1",
@@ -820,7 +820,7 @@ describe("kernel external boundary bridge", () => {
       status: "settled",
     });
     expect(store.checkpoints.get("checkpoint-integration")).toMatchObject({
-      input_subject: SUBJECT,
+      input_subject: PRIVATE_CANDIDATE,
       output_subject: OUTPUT,
     });
     const result = [...store.records.values()].find((record) => record.kind === "result")!;
@@ -1182,7 +1182,7 @@ describe("kernel external boundary bridge", () => {
       bundle_hash: digestCanonicalJson(definitionBundle),
       external_kind: "core/publish@1",
     });
-    const store = new MemoryExternalStore(currentManifest);
+    const store = new MemoryExternalStore(currentManifest, PRIVATE_CANDIDATE);
     const bridge = coordinator({
       store,
       definition_bundle: definitionBundle,
@@ -1196,11 +1196,19 @@ describe("kernel external boundary bridge", () => {
     await expect(bridge.resumeReadyAttempt()).rejects.toThrow(/lost after durable transition/);
     expect(store.run.current_subject).toBe(OUTPUT);
     expect(store.attempts.get("attempt-1")).toMatchObject({
-      input_subject: SUBJECT,
+      input_subject: PRIVATE_CANDIDATE,
       output_subject: OUTPUT,
       checkpoint_id: "checkpoint-integration",
       status: "work_complete",
     });
+    expect(store.checkpoints.get("checkpoint-integration")).toMatchObject({
+      input_subject: PRIVATE_CANDIDATE,
+      output_subject: OUTPUT,
+    });
+    expect(store.schedules.get("external-schedule:attempt-1:integrate-checkpoint")
+      ?.effects[0]?.delivery?.payload).toMatchObject({
+        inline: { result: { input_subject: SUBJECT, output_subject: OUTPUT } },
+      });
 
     await expect(bridge.resumeReadyAttempt()).resolves.toMatchObject({
       disposition: "scheduled",

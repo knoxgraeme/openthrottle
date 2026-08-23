@@ -571,7 +571,7 @@ describe("kernel publication plan binding", () => {
       schedules: [{ effects: [{ delivery: firstDelivery }] }] as never,
     });
     expect(firstPromoted.checkpoint).toMatchObject({
-      input_subject: source,
+      input_subject: candidateSubject,
       output_subject: firstPublication,
       payload: { blob: firstBundle.pointer },
     });
@@ -760,6 +760,21 @@ describe("kernel publication plan binding", () => {
       },
       bundle: { source_commit: source } as never,
     })).rejects.toThrow(/fork/i);
+    const forgedParentDelivery = integrationDelivery({
+      id: "delivery-forged-identity-publication",
+      parent: firstPublication,
+      output: firstPublication,
+      checkpointId: "checkpoint-forged-identity-publication",
+      checkpointPointer: firstBundle.pointer,
+    });
+    await expect(publish.promote!({
+      run,
+      attempt,
+      stage: {} as never,
+      context: updateContext,
+      prepared: updatePrepared,
+      schedules: [{ effects: [{ delivery: forgedParentDelivery }] }] as never,
+    })).rejects.toThrow(/exact sole parent/i);
     const secondDelivery = integrationDelivery({
       id: "delivery-second-compaction",
       parent: firstPublication,
@@ -780,6 +795,11 @@ describe("kernel publication plan binding", () => {
       expected_old_subject: firstPublication,
       expected_new_subject: secondPublication,
       checkpoint_base_subject: firstPublication,
+    });
+    expect(updatePromoted.checkpoint).toMatchObject({
+      input_subject: candidateSubject,
+      output_subject: secondPublication,
+      payload: { blob: secondBundle.pointer },
     });
 
     const secondPriorPush = pushDelivery("delivery-push-p2", secondPublication, "update");

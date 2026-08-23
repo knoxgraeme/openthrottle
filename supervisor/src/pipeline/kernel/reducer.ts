@@ -136,13 +136,12 @@ function assertCheckpointIdentity(
   checkpoint: AttemptCheckpoint,
   attempt: KernelAttempt,
   stage: CompiledPipelineStage,
-  expectedInputSubject = attempt.input_subject,
 ): void {
   if (
     checkpoint.attempt_id !== attempt.id ||
     checkpoint.request_hash !== attempt.request_hash ||
     checkpoint.definition_bundle_hash !== attempt.definition_bundle_hash ||
-    checkpoint.input_subject !== expectedInputSubject
+    checkpoint.input_subject !== attempt.input_subject
   ) {
     throw new Error(`checkpoint ${checkpoint.id} does not match the complete attempt identity`);
   }
@@ -156,36 +155,6 @@ function assertCheckpointIdentity(
   } else if (attempt.native_session_id !== null || checkpoint.native_session_id !== null) {
     throw new Error(`${stage.kind} checkpoints cannot bind an agent native session`);
   }
-}
-
-function assertCurrentCheckpointIdentity(
-  checkpoint: AttemptCheckpoint,
-  attempt: KernelAttempt,
-  stage: CompiledPipelineStage,
-  run: KernelRun,
-): void {
-  if (checkpoint.input_subject === attempt.input_subject) {
-    assertCheckpointIdentity(checkpoint, attempt, stage);
-    return;
-  }
-  const promotedPublication =
-    stage.kind === "effect" && stage.effect === "core/publish@1" &&
-    attempt.output_subject !== null && attempt.checkpoint_id === checkpoint.id &&
-    run.checkpoint_ids[attempt.id] === checkpoint.id &&
-    run.current_subject === attempt.output_subject &&
-    checkpoint.output_subject === attempt.output_subject &&
-    GIT_SUBJECT.test(checkpoint.input_subject) &&
-    checkpoint.payload_schema === "openthrottle.git-checkpoint-bundle/v1" &&
-    "blob" in checkpoint.payload &&
-    checkpoint.payload.blob.encoding === "binary" &&
-    checkpoint.payload.blob.media_type === "application/x-git-bundle";
-  if (!promotedPublication) {
-    throw new Error(`checkpoint ${checkpoint.id} does not match the complete attempt identity`);
-  }
-  // advanceExternalSubject is the only transition that can establish these
-  // durable ownership fences after validating the input against sealed planning
-  // evidence. The Attempt input remains the immutable private candidate.
-  assertCheckpointIdentity(checkpoint, attempt, stage, checkpoint.input_subject);
 }
 
 function assertSessionBindVersion(value: number, expected: number, name: string): void {
@@ -787,7 +756,7 @@ function scheduleExternal(input: ReducerInput): AtomicTransitionBundle {
   }
 
   const checkpoint = exactCheckpoint(input, command.checkpoint_id);
-  assertCurrentCheckpointIdentity(checkpoint, attempt, stage, input.run);
+  assertCheckpointIdentity(checkpoint, attempt, stage);
   if (stage.kind === "wait" && command.verified_output_subject !== null) {
     throw new Error("wait stages must preserve the repository subject");
   }
@@ -912,7 +881,7 @@ function advanceExternalSubject(input: ReducerInput): AtomicTransitionBundle {
   const expectedDeliveryInput = publication
     ? publicationParentFromPlanningCheckpoint(prior)
     : attempt.input_subject;
-  assertCheckpointIdentity(checkpoint, attempt, stage, expectedDeliveryInput);
+  assertCheckpointIdentity(checkpoint, attempt, stage);
   if (
     prior.output_subject !== null || checkpoint.output_subject !== command.verified_output_subject ||
     !GIT_SUBJECT.test(command.verified_output_subject) ||
@@ -1050,7 +1019,7 @@ function record(input: ReducerInput): AtomicTransitionBundle {
   if (!attempt.checkpoint_id) throw new Error(`attempt ${attempt.id} has no verified checkpoint`);
   const stage = stageFor(input.manifest, attempt.scope.stage_id);
   const checkpoint = exactCheckpoint(input, attempt.checkpoint_id);
-  assertCurrentCheckpointIdentity(checkpoint, attempt, stage, input.run);
+  assertCheckpointIdentity(checkpoint, attempt, stage);
   const result = recordForAttempt(input, attempt, command.record_id);
   if (attempt.result_record_id !== null && attempt.result_record_id !== result.id) {
     throw new Error(`attempt ${attempt.id} already persists another authoritative result`);

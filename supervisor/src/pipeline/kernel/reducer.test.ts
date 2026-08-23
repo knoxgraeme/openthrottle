@@ -1885,7 +1885,7 @@ describe("effect ownership and reconciliation", () => {
     };
     const promoted: AttemptCheckpoint = {
       ...checkpoint(current, output, "checkpoint-publication-output"),
-      input_subject: parent,
+      input_subject: current.input_subject,
       native_session_id: null,
       payload_schema: "openthrottle.git-checkpoint-bundle/v1",
       payload: { blob },
@@ -1942,6 +1942,7 @@ describe("effect ownership and reconciliation", () => {
       checkpoints: [prior, promoted],
     });
     expect(transition.run.current_subject).toBe(output);
+    expect(transition.append_checkpoints).toEqual([promoted]);
     expect(replacedAttempt(transition, current.id)).toMatchObject({
       input_subject: current.input_subject,
       output_subject: output,
