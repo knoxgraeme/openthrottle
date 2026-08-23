@@ -50,6 +50,25 @@ describe("sandbox Dockerfile", () => {
     expect(dockerfile).toContain('test "$(codex --version)" = "codex-cli ${CODEX_VERSION}"');
   });
 
+  it("scopes hosted Linux Bubblewrap permissions to the Codex behavior probe", () => {
+    const workflow = readFileSync(resolve(repoRoot, ".github/workflows/ci.yml"), "utf8");
+    const smoke = readFileSync(resolve(repoRoot, "sandbox/tests/smoke.sh"), "utf8");
+
+    expect(workflow).toContain("Enable Linux user namespaces for Bubblewrap");
+    expect(workflow).toContain("sysctl -n kernel.unprivileged_userns_clone");
+    expect(workflow).toContain("sudo sysctl -w kernel.unprivileged_userns_clone=1");
+    expect(workflow).toContain("sysctl -n kernel.apparmor_restrict_unprivileged_userns");
+    expect(workflow).toContain("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0");
+    expect(smoke).toContain(
+      "docker run --rm \\\n  --security-opt seccomp=unconfined \\\n  --security-opt apparmor=unconfined",
+    );
+    expect(smoke).toContain(
+      'CONTAINER="$(docker run -d --entrypoint tail "$IMAGE" -f /dev/null)"',
+    );
+    expect(smoke).not.toContain("--privileged");
+    expect(smoke).not.toContain("--cap-add");
+  });
+
   it("ships one kernel executor and one unprivileged agent principal", () => {
     const dockerfile = readFileSync(resolve(repoRoot, "sandbox/Dockerfile"), "utf8");
 

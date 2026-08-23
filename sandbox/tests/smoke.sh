@@ -196,10 +196,14 @@ exit 99
 POISON
 chmod 0755 "$SMOKE_DIR/poison/claude"
 
-# GitHub's nested Docker seccomp profile blocks the user namespace that
-# Bubblewrap needs. Relax only this short-lived probe container; the ordinary
-# lifecycle container below keeps Docker's default profile.
-docker run --rm --security-opt seccomp=unconfined --entrypoint sh "$IMAGE" -c '
+# Nested Docker's seccomp profile blocks Bubblewrap's user namespace, while its
+# default AppArmor profile denies Bubblewrap's mount setup. Relax only this
+# short-lived probe container; the ordinary lifecycle container below keeps
+# Docker's default profiles.
+docker run --rm \
+  --security-opt seccomp=unconfined \
+  --security-opt apparmor=unconfined \
+  --entrypoint sh "$IMAGE" -c '
   set -eu
   test "$(codex --version)" = "codex-cli 0.149.0"
   test "$(command -v bwrap)" = /usr/bin/bwrap
