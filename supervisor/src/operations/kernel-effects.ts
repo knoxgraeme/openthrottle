@@ -15,6 +15,10 @@ import type {
   KernelEffectPort,
   LeasedEffectView,
 } from "../pipeline/kernel/ports.js";
+import {
+  OPERATOR_EFFECT_REJECTION_EFFECT_KIND,
+  parseOperatorEffectRejectionEvidence,
+} from "../pipeline/kernel/operator-effect-rejection.js";
 import type {
   KernelEffectAdapterBinding,
   KernelEffectAdapterRegistry,
@@ -109,16 +113,29 @@ function kernelEffectDeliveryPayload(value: unknown, path: string): JsonValue {
   }
   if (
     input.observed_via !== "reconciliation" &&
-    input.observed_via !== "post_dispatch_reconciliation"
+    input.observed_via !== "post_dispatch_reconciliation" &&
+    input.observed_via !== "operator_resolution"
   ) {
     throw new Error(`${path}.observed_via: has an invalid value`);
   }
   if (!("result" in input)) throw new Error(`${path}.result: is required`);
+  if (input.observed_via === "operator_resolution") {
+    if (input.provider !== "operator") {
+      throw new Error(`${path}.provider: operator resolution requires the operator provider`);
+    }
+    if (input.effect_kind !== OPERATOR_EFFECT_REJECTION_EFFECT_KIND) {
+      throw new Error(`${path}.effect_kind: operator resolution is not allowed for this effect kind`);
+    }
+  } else if (input.provider === "operator") {
+    throw new Error(`${path}.provider: operator is reserved for operator resolution`);
+  }
   return {
     effect_kind: input.effect_kind,
     provider: input.provider,
     observed_via: input.observed_via,
-    result: jsonValueAt(input.result, `${path}.result`),
+    result: input.observed_via === "operator_resolution"
+      ? parseOperatorEffectRejectionEvidence(input.result, `${path}.result`) as JsonValue
+      : jsonValueAt(input.result, `${path}.result`),
   };
 }
 

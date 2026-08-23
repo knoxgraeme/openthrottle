@@ -23,6 +23,15 @@ import type {
   KernelProjectionPort,
   KernelStatusProjection,
 } from "../persistence/kernel-projection-store.js";
+import {
+  KernelOperatorEffectRejectionConflictError,
+  KernelOperatorEffectRejectionNotFoundError,
+} from "../pipeline/kernel/operator-effect-rejection.js";
+import type {
+  KernelOperatorEffectRejectionPort,
+  KernelOperatorEffectRejectionRequest,
+  KernelOperatorEffectRejectionResult,
+} from "../pipeline/kernel/ports.js";
 import type {
   KernelRepositoryRegistration,
   KernelRepositoryRegistrationInput,
@@ -32,7 +41,7 @@ import { sanitizeText } from "../shared/sanitize.js";
 
 export class KernelHttpNotFoundError extends Error {
   constructor(reference: string) {
-    super(`pipeline run or source reference ${reference} was not found`);
+    super(`kernel resource ${reference} was not found`);
     this.name = "KernelHttpNotFoundError";
   }
 }
@@ -129,22 +138,33 @@ function boundedReason(reason: string | undefined): string {
   return value;
 }
 
+function boundedEffectRejectionReason(reason: string): string {
+  const value = sanitizeText(reason).trim();
+  if (value.length < 1 || value.length > 1_500) {
+    throw new Error("effect rejection reason must contain between 1 and 1500 characters");
+  }
+  return value;
+}
+
 export class KernelHttpService {
   readonly #registrations: KernelRepositoryRegistrationPort;
   readonly #projections: KernelProjectionPort;
   readonly #analysis: KernelHistoricalAnalysisPort;
   readonly #control: KernelHttpControlPort;
+  readonly #effectRejections: KernelOperatorEffectRejectionPort;
 
   constructor(input: {
     registrations: KernelRepositoryRegistrationPort;
     projections: KernelProjectionPort;
     analysis: KernelHistoricalAnalysisPort;
     control: KernelHttpControlPort;
+    effect_rejections: KernelOperatorEffectRejectionPort;
   }) {
     this.#registrations = input.registrations;
     this.#projections = input.projections;
     this.#analysis = input.analysis;
     this.#control = input.control;
+    this.#effectRejections = input.effect_rejections;
   }
 
   status(reference: string, detailLimit?: number): KernelStatusProjection {
@@ -315,6 +335,38 @@ export class KernelHttpService {
 
   activeWork(limit?: number): Promise<KernelActiveWorkReport> {
     return this.#control.activeWorkReport(limit === undefined ? {} : { limit });
+  }
+
+  async rejectUnknownEffect(input: {
+    reference: string;
+    effect_id: string;
+    expected_maintenance_version: number;
+    resolution_id: string;
+    reason_code: KernelOperatorEffectRejectionRequest["reason_code"];
+    reason: string;
+  }): Promise<KernelOperatorEffectRejectionResult> {
+    const run = this.#run(input.reference);
+    if (input.reason_code !== "legacy_integration_idempotency_key_rejected_before_mutation") {
+      throw new Error("effect rejection reason_code is unsupported");
+    }
+    try {
+      return await this.#effectRejections.rejectDispatchFencedUnknownEffect({
+        pipeline_run_id: run.pipeline_run_id,
+        effect_id: input.effect_id,
+        expected_maintenance_version: input.expected_maintenance_version,
+        resolution_id: input.resolution_id,
+        reason_code: input.reason_code,
+        reason: boundedEffectRejectionReason(input.reason),
+      });
+    } catch (error) {
+      if (error instanceof KernelOperatorEffectRejectionConflictError) {
+        throw new KernelHttpConflictError(error.message);
+      }
+      if (error instanceof KernelOperatorEffectRejectionNotFoundError) {
+        throw new KernelHttpNotFoundError(input.effect_id);
+      }
+      throw error;
+    }
   }
 
   #run(reference: string) {

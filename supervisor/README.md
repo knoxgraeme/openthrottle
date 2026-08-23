@@ -137,6 +137,9 @@ data.
 - `GET /analysis/runs`
 - `GET /maintenance`, `POST /maintenance/close`,
   `POST /maintenance/open`, and `GET /maintenance/active-work`
+- `POST /maintenance/runs/:reference/effects/:effect_id/reject` for the
+  maintenance-fenced, deploy-authorized rejection of the sealed legacy
+  integration idempotency-key failure proven to precede provider mutation
 - `POST /webhooks/linear` and `POST /webhooks/github`
 
 Full request, response, persistence, and recovery contracts live in

@@ -8,6 +8,7 @@ import {
   COMPILED_PIPELINE_MANIFEST_SCHEMA,
   EFFECT_INTENT_SCHEMA,
   EXECUTION_RECORD_SCHEMA,
+  canonicalJson,
   expandCompiledRuntimeLifecycle,
   runtimeStopStageId,
   digestCanonicalJson,
@@ -24,7 +25,14 @@ import { reduceKernelCommand, compileKernelCursor } from "../pipeline/kernel/red
 import {
   KERNEL_WORK_REQUEST_PAYLOAD_SCHEMA,
   captureAttemptLeaseClaim,
+  type KernelOperatorEffectRejectionRequest,
 } from "../pipeline/kernel/ports.js";
+import {
+  KernelOperatorEffectRejectionConflictError,
+  KernelOperatorEffectRejectionNotFoundError,
+  OPERATOR_EFFECT_REJECTION_RUNTIME_SNAPSHOT,
+} from "../pipeline/kernel/operator-effect-rejection.js";
+import { effectIntentContentHash } from "../pipeline/kernel/effect-intent.js";
 import {
   createPipelineDecisionRecord,
   ordinaryKernelPayloadSchemas,
@@ -181,7 +189,7 @@ function setup(
       github_installation_id: 1,
       base_branch: "main",
       webhook_id: 1,
-      runtime_snapshot: "snapshot",
+      runtime_snapshot: OPERATOR_EFFECT_REJECTION_RUNTIME_SNAPSHOT,
     }],
   });
   const db = initializeFreshEpochDatabase({
@@ -266,6 +274,256 @@ function setup(
 
 function exactMap<T extends { id: string }>(...values: T[]): ReadonlyMap<string, T> {
   return new Map(values.map((value) => [value.id, value]));
+}
+
+const OPERATOR_REJECTION_REASON_CODE =
+  "legacy_integration_idempotency_key_rejected_before_mutation" as const;
+const UNKNOWN_INTEGRATION_DETAIL =
+  "sandbox request exited before it could author an integration result";
+const LEGACY_LONG_INTEGRATION_IDEMPOTENCY_KEY = `run-1:integration:${"a".repeat(201)}`;
+const RUNTIME_IDENTITY = "f".repeat(64);
+
+function operatorEffectRejectionRequest(
+  overrides: Partial<KernelOperatorEffectRejectionRequest> = {},
+): KernelOperatorEffectRejectionRequest {
+  return {
+    pipeline_run_id: "run-1",
+    effect_id: "effect-operator-rejection",
+    expected_maintenance_version: 0,
+    resolution_id: "resolution-sandbox-rejection",
+    reason_code: OPERATOR_REJECTION_REASON_CODE,
+    reason: "The sealed sandbox request failed validation before repository mutation.",
+    ...overrides,
+  };
+}
+
+function seedDispatchFencedUnknownIntegration(
+  context: ReturnType<typeof setup>,
+  input: {
+    kind?: string;
+    dispatch_fence?: { lease_id: string; worker_id: string } | null;
+    idempotency_key?: string;
+    runtime_snapshot?: string;
+  } = {},
+): EffectIntent {
+  context.store.admitPipelineRun(context.admission);
+  const runtimeDecision: DecisionRecord = {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: "decision-runtime-create",
+    kind: "decision",
+    pipeline_run_id: "run-1",
+    reducer: "core/external-schedule@1",
+    input_record_ids: [],
+    payload_schema: "decision/v1",
+    payload: { inline: { phase: "create", attempt_id: "attempt-runtime" } },
+    created_at: NOW,
+  };
+  const runtimeEffect: EffectIntent = {
+    schema: EFFECT_INTENT_SCHEMA,
+    id: "effect-runtime-create",
+    pipeline_run_id: "run-1",
+    decision_record_id: runtimeDecision.id,
+    kind: "daytona/create-sandbox@1",
+    idempotency_key: `run-1:daytona/create-sandbox@1:${RUNTIME_IDENTITY}`,
+    target: `daytona:${RUNTIME_IDENTITY}`,
+    subject: null,
+    payload: {
+      schema: "openthrottle.daytona-create/v1",
+      identity: RUNTIME_IDENTITY,
+      pipeline_run_id: "run-1",
+      repository: "owner/repo",
+      base_branch: "main",
+      base_commit: subject("1"),
+      snapshot: input.runtime_snapshot ?? OPERATOR_EFFECT_REJECTION_RUNTIME_SNAPSHOT,
+    },
+  };
+  const runtimeDelivery: DeliveryRecord = {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: "delivery-runtime-create",
+    kind: "delivery",
+    pipeline_run_id: "run-1",
+    effect_id: runtimeEffect.id,
+    idempotency_key: runtimeEffect.idempotency_key,
+    external_identity: runtimeEffect.target,
+    status: "confirmed",
+    payload_schema: "delivery/v1",
+    payload: { inline: { sandbox_id: "sandbox-operator-rejection", identity: RUNTIME_IDENTITY } },
+    created_at: NOW,
+  };
+  const semanticKey = "external-schedule:attempt-1:integrate-checkpoint";
+  const decision: DecisionRecord = {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: "decision-operator-rejection",
+    kind: "decision",
+    pipeline_run_id: "run-1",
+    reducer: "core/external-schedule@1",
+    input_record_ids: [],
+    payload_schema: "decision/v1",
+    payload: {
+      inline: {
+        accepted: true,
+        semantic_key: semanticKey,
+        attempt_id: "attempt-1",
+        phase: "integrate-checkpoint",
+      },
+    },
+    created_at: NOW,
+  };
+  const effect: EffectIntent = {
+    schema: EFFECT_INTENT_SCHEMA,
+    id: "effect-operator-rejection",
+    pipeline_run_id: "run-1",
+    decision_record_id: decision.id,
+    kind: input.kind ?? "daytona/integrate-checkpoint@1",
+    idempotency_key: input.idempotency_key ?? LEGACY_LONG_INTEGRATION_IDEMPOTENCY_KEY,
+    target: `daytona:${RUNTIME_IDENTITY}:publication:checkpoint-204`,
+    subject: subject("1"),
+    payload: {
+      schema: "openthrottle.daytona-integration/v1",
+      identity: RUNTIME_IDENTITY,
+      pipeline_run_id: "run-1",
+      attempt_id: "attempt-1",
+      definition_bundle_hash: context.admission.run.definition_bundle_hash,
+      checkpoint_base_subject: subject("1"),
+      current_subject: subject("1"),
+      candidate_checkpoint_id: "checkpoint-204",
+      candidate_input_subject: subject("1"),
+      candidate_output_subject: subject("1"),
+      candidate_blob: { digest: sha("5") },
+      candidate_artifact: { commit: subject("1") },
+      current_ancestry: [],
+    },
+  };
+  const dispatchFence = input.dispatch_fence === undefined
+    ? { lease_id: "effect-dispatch-204", worker_id: "effect-worker-204" }
+    : input.dispatch_fence;
+  if (!("inline" in decision.payload)) throw new Error("test DecisionRecord must be inline");
+  const decisionPayload = decision.payload.inline;
+  if (!("inline" in runtimeDecision.payload) || !("inline" in runtimeDelivery.payload)) {
+    throw new Error("test runtime evidence must be inline");
+  }
+  const runtimeDecisionPayload = runtimeDecision.payload.inline;
+  const runtimeDeliveryPayload = runtimeDelivery.payload.inline;
+  context.db.transaction(() => {
+    context.db.prepare(`
+      INSERT INTO checkpoints (
+        id, pipeline_run_id, attempt_id, ordinal, checkpoint_hash, semantic_key,
+        request_hash, definition_bundle_hash, input_subject, output_subject,
+        native_session_id, payload_schema, inline_payload, captured_at
+      ) VALUES ('checkpoint-operator-rejection', 'run-1', 'attempt-1', 0, ?, ?,
+        ?, ?, ?, ?, NULL, 'openthrottle.git-checkpoint-bundle/v1', '{}', ?)
+    `).run(
+      sha("4"),
+      "attempt:attempt-1:checkpoint:0",
+      sha("a"),
+      context.admission.run.definition_bundle_hash,
+      subject("1"),
+      subject("1"),
+      NOW,
+    );
+    context.db.prepare(`
+      UPDATE attempts SET status = 'work_complete',
+        output_subject = ?, checkpoint_id = 'checkpoint-operator-rejection', updated_at = ?
+      WHERE id = 'attempt-1' AND pipeline_run_id = 'run-1'
+    `).run(subject("1"), NOW);
+    context.db.prepare(`
+      INSERT INTO records (
+        id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+        inline_payload, reducer, input_record_ids_json, input_record_count, created_at
+      ) VALUES (?, ?, 1, ?, 'decision', ?, ?, ?, '[]', 0, ?)
+    `).run(
+      runtimeDecision.id,
+      runtimeDecision.pipeline_run_id,
+      digestCanonicalJson(runtimeDecision),
+      runtimeDecision.payload_schema,
+      canonicalJson(runtimeDecisionPayload),
+      runtimeDecision.reducer,
+      runtimeDecision.created_at,
+    );
+    context.db.prepare(`
+      INSERT INTO effects (
+        id, pipeline_run_id, decision_record_id, kind, idempotency_key, target,
+        subject, payload_schema, inline_payload, intent_hash, status, version,
+        attempt_count, available_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'pending', 0, 1, ?, ?, ?)
+    `).run(
+      runtimeEffect.id,
+      runtimeEffect.pipeline_run_id,
+      runtimeEffect.decision_record_id,
+      runtimeEffect.kind,
+      runtimeEffect.idempotency_key,
+      runtimeEffect.target,
+      runtimeEffect.kind,
+      canonicalJson(runtimeEffect.payload),
+      effectIntentContentHash(runtimeEffect),
+      NOW,
+      NOW,
+      NOW,
+    );
+    context.db.prepare(`
+      INSERT INTO records (
+        id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+        inline_payload, effect_id, idempotency_key, external_identity,
+        delivery_status, created_at
+      ) VALUES (?, ?, 2, ?, 'delivery', ?, ?, ?, ?, ?, 'confirmed', ?)
+    `).run(
+      runtimeDelivery.id,
+      runtimeDelivery.pipeline_run_id,
+      digestCanonicalJson(runtimeDelivery),
+      runtimeDelivery.payload_schema,
+      canonicalJson(runtimeDeliveryPayload),
+      runtimeDelivery.effect_id,
+      runtimeDelivery.idempotency_key,
+      runtimeDelivery.external_identity,
+      runtimeDelivery.created_at,
+    );
+    context.db.prepare(`
+      UPDATE effects SET status = 'acknowledged', delivery_record_id = ?, version = 1
+      WHERE id = ? AND pipeline_run_id = ?
+    `).run(runtimeDelivery.id, runtimeEffect.id, runtimeEffect.pipeline_run_id);
+    context.db.prepare(`
+      INSERT INTO records (
+        id, pipeline_run_id, sequence, record_hash, kind, semantic_key,
+        payload_schema, inline_payload, reducer, input_record_ids_json,
+        input_record_count, created_at
+      ) VALUES (?, ?, 3, ?, 'decision', ?, ?, ?, ?, '[]', 0, ?)
+    `).run(
+      decision.id,
+      decision.pipeline_run_id,
+      digestCanonicalJson(decision),
+      semanticKey,
+      decision.payload_schema,
+      canonicalJson(decisionPayload),
+      decision.reducer,
+      decision.created_at,
+    );
+    context.db.prepare(`
+      INSERT INTO effects (
+        id, pipeline_run_id, decision_record_id, kind, idempotency_key, target,
+        subject, payload_schema, inline_payload, intent_hash, status, version,
+        attempt_count, available_at, dispatch_lease_id, dispatch_worker_id,
+        unknown_detail, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', 7, 4, ?, ?, ?, ?, ?, ?)
+    `).run(
+      effect.id,
+      effect.pipeline_run_id,
+      effect.decision_record_id,
+      effect.kind,
+      effect.idempotency_key,
+      effect.target,
+      effect.subject,
+      effect.kind,
+      canonicalJson(effect.payload),
+      effectIntentContentHash(effect),
+      NOW,
+      dispatchFence?.lease_id ?? null,
+      dispatchFence?.worker_id ?? null,
+      UNKNOWN_INTEGRATION_DETAIL,
+      NOW,
+      NOW,
+    );
+  }).immediate();
+  return effect;
 }
 
 function conflictingReplay(bundle: AtomicTransitionBundle): AtomicTransitionBundle {
@@ -1508,6 +1766,379 @@ describe("SqliteKernelStore", () => {
         attempt_id: "attempt-1",
         phase: "publish",
       })).rejects.toThrow(/invalid delivery record/);
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("atomically rejects one exact dispatch-fenced unknown integration and replays unchanged", async () => {
+    const context = setup();
+    try {
+      const effect = seedDispatchFencedUnknownIntegration(context);
+      const request = operatorEffectRejectionRequest();
+
+      const first = await context.store.rejectDispatchFencedUnknownEffect(request);
+      expect(first).toMatchObject({
+        disposition: "rejected",
+        pipeline_run_id: "run-1",
+        effect_id: effect.id,
+        effect_version: 8,
+        run_version: 1,
+      });
+      expect(context.db.prepare(`
+        SELECT status, version, lease_id, dispatch_lease_id, dispatch_worker_id,
+          delivery_record_id, unknown_detail
+        FROM effects WHERE id = ?
+      `).get(effect.id)).toEqual({
+        status: "rejected",
+        version: 8,
+        lease_id: null,
+        dispatch_lease_id: "effect-dispatch-204",
+        dispatch_worker_id: "effect-worker-204",
+        delivery_record_id: first.delivery_record_id,
+        unknown_detail: null,
+      });
+      expect(context.db.prepare(`
+        SELECT kind, delivery_status, idempotency_key, external_identity
+        FROM records WHERE id = ?
+      `).get(first.delivery_record_id)).toEqual({
+        kind: "delivery",
+        delivery_status: "rejected",
+        idempotency_key: effect.idempotency_key,
+        external_identity: effect.target,
+      });
+      const schedule = await context.store.findExternalSchedule({
+        pipeline_run_id: "run-1",
+        attempt_id: "attempt-1",
+        phase: "integrate-checkpoint",
+      });
+      const delivery = schedule?.effects[0]?.delivery;
+      expect(delivery).toMatchObject({
+        id: first.delivery_record_id,
+        status: "rejected",
+        payload_schema: "openthrottle.effect-delivery/v1",
+        payload: {
+          inline: {
+            effect_kind: "daytona/integrate-checkpoint@1",
+            provider: "operator",
+            observed_via: "operator_resolution",
+            result: {
+              schema: "openthrottle.operator-effect-rejection/v1",
+              resolution_id: request.resolution_id,
+              reason_code: request.reason_code,
+              reason: request.reason,
+              authorized_via: "deploy_token",
+              maintenance_version: 0,
+              captured_run_version: 0,
+              captured_effect_version: 7,
+              intent_hash: effectIntentContentHash(effect),
+              dispatch_fence: {
+                lease_id: "effect-dispatch-204",
+                worker_id: "effect-worker-204",
+              },
+              reconciliation_ordinal: 4,
+              prior_unknown_detail: UNKNOWN_INTEGRATION_DETAIL,
+              prior_unknown_detail_hash: digestCanonicalJson(UNKNOWN_INTEGRATION_DETAIL),
+              runtime_snapshot: OPERATOR_EFFECT_REJECTION_RUNTIME_SNAPSHOT,
+              runtime_identity: RUNTIME_IDENTITY,
+              runtime_create_effect_id: "effect-runtime-create",
+              idempotency_key_length: LEGACY_LONG_INTEGRATION_IDEMPOTENCY_KEY.length,
+              resolution_digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+            },
+          },
+        },
+      });
+      expect((await context.store.loadExactReductionView({
+        pipeline_run_id: "run-1",
+        attempt_id: null,
+        record_ids: [],
+        checkpoint_ids: [],
+      })).run.active_effect_versions).toEqual({});
+
+      const restarted = new SqliteKernelStore({
+        db: context.db,
+        blob_store: context.blobs,
+        manifest_resolver: { resolve: () => context.pipelineManifest },
+        payload_schemas: payloadSchemas,
+        execution_policy: EXECUTION_POLICY,
+        now: () => NOW,
+      });
+      expect(await restarted.rejectDispatchFencedUnknownEffect(request)).toEqual({
+        ...first,
+        disposition: "unchanged",
+      });
+      expect(context.db.prepare("SELECT version FROM pipeline_runs WHERE id = 'run-1'").get())
+        .toEqual({ version: 1 });
+      context.db.prepare(`
+        UPDATE pipeline_runs SET version = 5, updated_at = ? WHERE id = 'run-1'
+      `).run(NOW);
+      expect(await restarted.rejectDispatchFencedUnknownEffect(request)).toEqual({
+        ...first,
+        disposition: "unchanged",
+        run_version: 5,
+      });
+      expect(context.db.prepare("SELECT version FROM pipeline_runs WHERE id = 'run-1'").get())
+        .toEqual({ version: 5 });
+      expect(context.db.prepare("SELECT COUNT(*) AS count FROM records WHERE effect_id = 'effect-operator-rejection'").get())
+        .toEqual({ count: 1 });
+      await expect(context.store.rejectDispatchFencedUnknownEffect({
+        ...request,
+        reason: "A different operator claim must not reuse the settled Effect.",
+      })).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+      await expect(context.store.rejectDispatchFencedUnknownEffect({
+        ...request,
+        resolution_id: "different-resolution",
+      })).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("fails closed unless maintenance and the exact Effect fence authorize rejection", async () => {
+    const staleMaintenance = setup();
+    const missingDispatch = setup();
+    const wrongKind = setup();
+    const activeLease = setup();
+    const leasedScheduleOwner = setup();
+    const checkpointlessScheduleOwner = setup();
+    const unsupportedSnapshot = setup();
+    const shortIdempotencyKey = setup();
+    const corruptedRuntimeIntent = setup();
+    try {
+      seedDispatchFencedUnknownIntegration(staleMaintenance);
+      await expect(staleMaintenance.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest({ expected_maintenance_version: 1 }),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+
+      seedDispatchFencedUnknownIntegration(missingDispatch, { dispatch_fence: null });
+      await expect(missingDispatch.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+
+      seedDispatchFencedUnknownIntegration(wrongKind, { kind: "github/push-checkpoint@1" });
+      await expect(wrongKind.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+
+      seedDispatchFencedUnknownIntegration(activeLease);
+      await expect(activeLease.store.leaseNextEffect({
+        worker_id: "effect-worker-active",
+        lease_id: "effect-lease-active",
+        expires_at: "2026-08-23T08:05:00.000Z",
+      })).resolves.toMatchObject({ intent: { id: "effect-operator-rejection" } });
+      await expect(activeLease.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+
+      seedDispatchFencedUnknownIntegration(leasedScheduleOwner);
+      leasedScheduleOwner.db.prepare(`
+        UPDATE attempts SET lease_id = 'attempt-lease', lease_generation = 1,
+          lease_worker_id = 'attempt-worker', lease_purpose = 'work',
+          lease_expires_at = '2026-08-23T08:05:00.000Z', lease_started = 1
+        WHERE id = 'attempt-1' AND pipeline_run_id = 'run-1'
+      `).run();
+      await expect(leasedScheduleOwner.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+
+      seedDispatchFencedUnknownIntegration(checkpointlessScheduleOwner);
+      checkpointlessScheduleOwner.db.prepare(`
+        UPDATE attempts SET checkpoint_id = NULL
+        WHERE id = 'attempt-1' AND pipeline_run_id = 'run-1'
+      `).run();
+      await expect(checkpointlessScheduleOwner.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+
+      seedDispatchFencedUnknownIntegration(unsupportedSnapshot, {
+        runtime_snapshot: "openthrottle-newer-snapshot",
+      });
+      await expect(unsupportedSnapshot.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+
+      seedDispatchFencedUnknownIntegration(shortIdempotencyKey, {
+        idempotency_key: "run-1:integration:short",
+      });
+      await expect(shortIdempotencyKey.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+
+      seedDispatchFencedUnknownIntegration(corruptedRuntimeIntent);
+      corruptedRuntimeIntent.db.prepare(`
+        UPDATE effects SET intent_hash = ?
+        WHERE id = 'effect-runtime-create' AND pipeline_run_id = 'run-1'
+      `).run(sha("0"));
+      await expect(corruptedRuntimeIntent.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+
+      for (const context of [
+        staleMaintenance,
+        missingDispatch,
+        wrongKind,
+        activeLease,
+        leasedScheduleOwner,
+        checkpointlessScheduleOwner,
+        unsupportedSnapshot,
+        shortIdempotencyKey,
+        corruptedRuntimeIntent,
+      ]) {
+        expect(context.db.prepare("SELECT COUNT(*) AS count FROM records WHERE effect_id = 'effect-operator-rejection'").get())
+          .toEqual({ count: 0 });
+      }
+    } finally {
+      for (const context of [
+        staleMaintenance,
+        missingDispatch,
+        wrongKind,
+        activeLease,
+        leasedScheduleOwner,
+        checkpointlessScheduleOwner,
+        unsupportedSnapshot,
+        shortIdempotencyKey,
+        corruptedRuntimeIntent,
+      ]) {
+        context.db.close();
+      }
+    }
+  });
+
+  it("returns not found when the exact run and Effect identity do not exist", async () => {
+    const context = setup();
+    try {
+      seedDispatchFencedUnknownIntegration(context);
+      await expect(context.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest({ effect_id: "missing-effect" }),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionNotFoundError);
+      await expect(context.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest({ pipeline_run_id: "another-run" }),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionNotFoundError);
+      expect(context.db.prepare("SELECT COUNT(*) AS count FROM records WHERE effect_id = 'effect-operator-rejection'").get())
+        .toEqual({ count: 0 });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("rejects a historical external schedule that is not at the active run cursor", async () => {
+    const context = setup();
+    try {
+      seedDispatchFencedUnknownIntegration(context);
+      context.db.prepare(`
+        UPDATE pipeline_runs SET cursor_stage_id = 'verify', updated_at = ?
+        WHERE id = 'run-1'
+      `).run(NOW);
+
+      await expect(context.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+      expect(context.db.prepare("SELECT status, version FROM effects WHERE id = ?")
+        .get("effect-operator-rejection")).toEqual({ status: "unknown", version: 7 });
+      expect(context.db.prepare("SELECT COUNT(*) AS count FROM records WHERE effect_id = 'effect-operator-rejection'").get())
+        .toEqual({ count: 0 });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("rejects open maintenance, an inactive run, or any pre-existing delivery", async () => {
+    const openMaintenance = setup();
+    const inactiveRun = setup();
+    const existingDelivery = setup();
+    try {
+      seedDispatchFencedUnknownIntegration(openMaintenance);
+      openMaintenance.db.prepare(`
+        UPDATE settings SET value_json = 'false', version = 1, updated_at = ?
+        WHERE key = 'epoch.maintenance_ingress_closed'
+      `).run(NOW);
+      await expect(openMaintenance.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest({ expected_maintenance_version: 1 }),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+
+      seedDispatchFencedUnknownIntegration(inactiveRun);
+      inactiveRun.db.prepare(`
+        UPDATE pipeline_runs
+        SET status = 'failed', terminal_outcome = 'failed', cursor_stage_id = NULL,
+          updated_at = ?
+        WHERE id = 'run-1'
+      `).run(NOW);
+      await expect(inactiveRun.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+
+      const effect = seedDispatchFencedUnknownIntegration(existingDelivery);
+      const orphanDelivery: DeliveryRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "delivery-already-present",
+        kind: "delivery",
+        pipeline_run_id: effect.pipeline_run_id,
+        effect_id: effect.id,
+        idempotency_key: effect.idempotency_key,
+        external_identity: effect.target,
+        status: "rejected",
+        payload_schema: "delivery/v1",
+        payload: { inline: { reason: "pre-existing outcome" } },
+        created_at: NOW,
+      };
+      if (!("inline" in orphanDelivery.payload)) throw new Error("test DeliveryRecord must be inline");
+      const orphanDeliveryPayload = orphanDelivery.payload.inline;
+      existingDelivery.db.prepare(`
+        INSERT INTO records (
+          id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+          inline_payload, effect_id, idempotency_key, external_identity,
+          delivery_status, created_at
+        ) VALUES (?, ?, 4, ?, 'delivery', ?, ?, ?, ?, ?, 'rejected', ?)
+      `).run(
+        orphanDelivery.id,
+        orphanDelivery.pipeline_run_id,
+        digestCanonicalJson(orphanDelivery),
+        orphanDelivery.payload_schema,
+        canonicalJson(orphanDeliveryPayload),
+        orphanDelivery.effect_id,
+        orphanDelivery.idempotency_key,
+        orphanDelivery.external_identity,
+        orphanDelivery.created_at,
+      );
+      await expect(existingDelivery.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      )).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+
+      for (const context of [openMaintenance, inactiveRun, existingDelivery]) {
+        expect(context.db.prepare(`
+          SELECT status, version, delivery_record_id FROM effects
+          WHERE id = 'effect-operator-rejection'
+        `).get()).toEqual({ status: "unknown", version: 7, delivery_record_id: null });
+      }
+    } finally {
+      for (const context of [openMaintenance, inactiveRun, existingDelivery]) {
+        context.db.close();
+      }
+    }
+  });
+
+  it("rolls the operator DeliveryRecord back when the Effect settlement CAS aborts", async () => {
+    const context = setup();
+    try {
+      seedDispatchFencedUnknownIntegration(context);
+      context.db.exec(`
+        CREATE TRIGGER reject_operator_effect_settlement
+        BEFORE UPDATE OF status ON effects
+        WHEN NEW.status = 'rejected'
+        BEGIN
+          SELECT RAISE(ABORT, 'injected effect settlement fault');
+        END;
+      `);
+
+      await expect(context.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      )).rejects.toThrow(/injected effect settlement fault/);
+      expect(context.db.prepare("SELECT status, version FROM effects WHERE id = ?")
+        .get("effect-operator-rejection")).toEqual({ status: "unknown", version: 7 });
+      expect(context.db.prepare("SELECT COUNT(*) AS count FROM records WHERE effect_id = 'effect-operator-rejection'").get())
+        .toEqual({ count: 0 });
+      expect(context.db.prepare("SELECT version FROM pipeline_runs WHERE id = 'run-1'").get())
+        .toEqual({ version: 0 });
     } finally {
       context.db.close();
     }

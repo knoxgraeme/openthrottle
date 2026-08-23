@@ -1,6 +1,10 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { KernelControlService } from "./kernel-control.js";
-import { KernelHttpNotFoundError, KernelHttpService } from "./kernel-http.js";
+import {
+  KernelHttpConflictError,
+  KernelHttpNotFoundError,
+  KernelHttpService,
+} from "./kernel-http.js";
 import {
   freshKernelFixture,
   seedKernelAttempt,
@@ -11,6 +15,11 @@ import { createKernelHistoricalAnalysisStore } from "../persistence/kernel-analy
 import { SqliteKernelInboxStore } from "../persistence/kernel-inbox-store.js";
 import { SqliteKernelProjectionStore } from "../persistence/kernel-projection-store.js";
 import { SqliteKernelRegistrationStore } from "../persistence/kernel-registration-store.js";
+import {
+  KernelOperatorEffectRejectionConflictError,
+  KernelOperatorEffectRejectionNotFoundError,
+} from "../pipeline/kernel/operator-effect-rejection.js";
+import type { KernelOperatorEffectRejectionRequest } from "../pipeline/kernel/ports.js";
 
 const fixtures: FreshKernelFixture[] = [];
 
@@ -44,13 +53,25 @@ function setup() {
     runtime_inventory: { listActiveRuntimeResources: async () => [] },
     now: () => "2026-08-20T13:00:00.000Z",
   });
+  const effectRejections = {
+    rejectDispatchFencedUnknownEffect: vi.fn(async (input: KernelOperatorEffectRejectionRequest) => ({
+      disposition: "rejected" as const,
+      pipeline_run_id: input.pipeline_run_id,
+      effect_id: input.effect_id,
+      delivery_record_id: "delivery-operator-rejection",
+      effect_version: 4,
+      run_version: 8,
+    })),
+  };
   return {
     fixture,
+    effectRejections,
     service: new KernelHttpService({
       registrations,
       projections,
       analysis: createKernelHistoricalAnalysisStore(fixture.db),
       control,
+      effect_rejections: effectRejections,
     }),
   };
 }
@@ -153,5 +174,94 @@ describe("KernelHttpService", () => {
       retryable: false,
       ignored: "unregistered_route",
     });
+  });
+
+  it("rejects one exact dispatch-fenced unknown Effect only inside the observed maintenance fence", async () => {
+    const { effectRejections, service } = setup();
+    const maintenance = service.closeMaintenance(1);
+
+    await expect(service.rejectUnknownEffect({
+      reference: "OPE-run-active",
+      effect_id: "effect-integration",
+      expected_maintenance_version: maintenance.version,
+      resolution_id: "resolution-legacy-idempotency-validation",
+      reason_code: "legacy_integration_idempotency_key_rejected_before_mutation",
+      reason: "  sandbox failed with ghp_this_should_be_redacted before mutation  ",
+    })).resolves.toMatchObject({
+      disposition: "rejected",
+      pipeline_run_id: "run-active",
+      effect_id: "effect-integration",
+      delivery_record_id: "delivery-operator-rejection",
+    });
+    expect(effectRejections.rejectDispatchFencedUnknownEffect).toHaveBeenCalledWith({
+      pipeline_run_id: "run-active",
+      effect_id: "effect-integration",
+      expected_maintenance_version: maintenance.version,
+      resolution_id: "resolution-legacy-idempotency-validation",
+      reason_code: "legacy_integration_idempotency_key_rejected_before_mutation",
+      reason: "sandbox failed with [REDACTED] before mutation",
+    });
+  });
+
+  it("delegates the transactional maintenance fence and fails before it for a missing run", async () => {
+    const { effectRejections, service } = setup();
+    const request = {
+      reference: "run-active",
+      effect_id: "effect-integration",
+      expected_maintenance_version: 1,
+      resolution_id: "resolution-legacy-idempotency-validation",
+      reason_code: "legacy_integration_idempotency_key_rejected_before_mutation" as const,
+      reason: "sandbox request validation failed before mutation",
+    };
+
+    effectRejections.rejectDispatchFencedUnknownEffect.mockRejectedValue(
+      new KernelOperatorEffectRejectionConflictError("exact closed maintenance fence required"),
+    );
+    await expect(service.rejectUnknownEffect(request)).rejects.toThrow(KernelHttpConflictError);
+    const maintenance = service.closeMaintenance(1);
+    await expect(service.rejectUnknownEffect({
+      ...request,
+      expected_maintenance_version: maintenance.version - 1,
+    })).rejects.toThrow(/maintenance fence/i);
+    await expect(service.rejectUnknownEffect({
+      ...request,
+      reference: "missing",
+      expected_maintenance_version: maintenance.version,
+    })).rejects.toThrow(KernelHttpNotFoundError);
+    expect(effectRejections.rejectDispatchFencedUnknownEffect).toHaveBeenCalledTimes(2);
+  });
+
+  it("maps a fenced persistence conflict into an HTTP conflict", async () => {
+    const { effectRejections, service } = setup();
+    const maintenance = service.closeMaintenance(1);
+    effectRejections.rejectDispatchFencedUnknownEffect.mockRejectedValueOnce(
+      new KernelOperatorEffectRejectionConflictError("effect is currently leased"),
+    );
+
+    await expect(service.rejectUnknownEffect({
+      reference: "run-active",
+      effect_id: "effect-integration",
+      expected_maintenance_version: maintenance.version,
+      resolution_id: "resolution-legacy-idempotency-validation",
+      reason_code: "legacy_integration_idempotency_key_rejected_before_mutation",
+      reason: "sandbox request validation failed before mutation",
+    })).rejects.toThrow(KernelHttpConflictError);
+  });
+
+  it("maps a missing exact Effect into an HTTP not-found response", async () => {
+    const { effectRejections, service } = setup();
+    const maintenance = service.closeMaintenance(1);
+    effectRejections.rejectDispatchFencedUnknownEffect.mockRejectedValueOnce(
+      new KernelOperatorEffectRejectionNotFoundError("exact Effect was not found"),
+    );
+
+    await expect(service.rejectUnknownEffect({
+      reference: "run-active",
+      effect_id: "effect-missing",
+      expected_maintenance_version: maintenance.version,
+      resolution_id: "resolution-legacy-idempotency-validation",
+      reason_code: "legacy_integration_idempotency_key_rejected_before_mutation",
+      reason: "sandbox request validation failed before mutation",
+    })).rejects.toThrow(KernelHttpNotFoundError);
   });
 });

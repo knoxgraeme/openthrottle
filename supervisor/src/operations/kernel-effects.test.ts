@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  digestCanonicalJson,
   validateExecutionRecord,
   type EffectIntent,
 } from "@openthrottle/contracts";
@@ -7,6 +8,10 @@ import type {
   KernelEffectPort,
   LeasedEffectView,
 } from "../pipeline/kernel/ports.js";
+import {
+  OPERATOR_EFFECT_REJECTION_RESULT_SCHEMA,
+  OPERATOR_EFFECT_REJECTION_RUNTIME_SNAPSHOT,
+} from "../pipeline/kernel/operator-effect-rejection.js";
 import type { EffectReconciliation } from "../pipeline/kernel/effect-intent.js";
 import {
   createKernelEffectAdapterRegistry,
@@ -34,6 +39,56 @@ function effect(overrides: Partial<EffectIntent> = {}): EffectIntent {
     payload: { repository: "owner/repo", ref: "refs/heads/ot/work" },
     ...overrides,
   };
+}
+
+function operatorRejectionPayload(overrides: Record<string, unknown> = {}) {
+  const priorUnknownDetail = "reconcile-only effect target remains absent";
+  return {
+    effect_kind: "daytona/integrate-checkpoint@1",
+    provider: "operator",
+    observed_via: "operator_resolution",
+    result: {
+      schema: OPERATOR_EFFECT_REJECTION_RESULT_SCHEMA,
+      resolution_id: "resolution-integration-validation",
+      reason_code: "legacy_integration_idempotency_key_rejected_before_mutation",
+      reason: "The sealed sandbox request was rejected before repository mutation.",
+      authorized_via: "deploy_token",
+      maintenance_version: 2,
+      captured_run_version: 17,
+      captured_effect_version: 31,
+      intent_hash: "b".repeat(64),
+      dispatch_fence: { lease_id: "dispatch-lease-1", worker_id: "worker-1" },
+      reconciliation_ordinal: 32,
+      prior_unknown_detail: priorUnknownDetail,
+      prior_unknown_detail_hash: digestCanonicalJson(priorUnknownDetail),
+      runtime_snapshot: OPERATOR_EFFECT_REJECTION_RUNTIME_SNAPSHOT,
+      runtime_identity: "f".repeat(64),
+      runtime_create_effect_id: "effect-runtime-create",
+      idempotency_key_length: 212,
+      resolution_digest: "d".repeat(64),
+    },
+    ...overrides,
+  };
+}
+
+function validateOperatorPayload(payload: unknown) {
+  return validateExecutionRecord({
+    schema: "openthrottle.record/v1",
+    id: "delivery-operator-1",
+    kind: "delivery",
+    pipeline_run_id: "run-1",
+    effect_id: "effect-1",
+    idempotency_key: "run-1:integrate",
+    external_identity: "daytona:integration:run-1",
+    status: "rejected",
+    payload_schema: KERNEL_EFFECT_DELIVERY_PAYLOAD_SCHEMA,
+    payload: { inline: payload as never },
+    created_at: NOW,
+  }, {
+    payloadSchemas: new Map([
+      [KERNEL_EFFECT_DELIVERY_PAYLOAD_SCHEMA, KERNEL_EFFECT_DELIVERY_PAYLOAD_CONTRACT],
+    ]),
+  }).value;
 }
 
 function lease(
@@ -199,6 +254,46 @@ describe("kernel effect adapter registry", () => {
     expect(() => createKernelEffectAdapterRegistry([
       binding(adapter, { effect_kind: "github/*" }),
     ])).toThrow(/invalid effect kind/i);
+  });
+});
+
+describe("operator effect rejection evidence", () => {
+  it("accepts the exact bounded operator-resolution envelope used for a definitive rejection", () => {
+    expect(validateOperatorPayload(operatorRejectionPayload())).toMatchObject({
+      kind: "delivery",
+      status: "rejected",
+      payload: { inline: {
+        effect_kind: "daytona/integrate-checkpoint@1",
+        provider: "operator",
+        observed_via: "operator_resolution",
+        result: {
+          schema: OPERATOR_EFFECT_REJECTION_RESULT_SCHEMA,
+          resolution_id: "resolution-integration-validation",
+          authorized_via: "deploy_token",
+        },
+      } },
+    });
+  });
+
+  it.each([
+    ["non-operator provider", operatorRejectionPayload({ provider: "daytona" })],
+    ["non-integration effect", operatorRejectionPayload({ effect_kind: "github/push-checkpoint@1" })],
+    ["operator provider outside resolution", operatorRejectionPayload({ observed_via: "reconciliation" })],
+    ["unknown outer field", operatorRejectionPayload({ actor: "operator@example.com" })],
+    ["oversized reason", operatorRejectionPayload({
+      result: { ...operatorRejectionPayload().result, reason: "x".repeat(1_501) },
+    })],
+    ["spoofed authorization", operatorRejectionPayload({
+      result: { ...operatorRejectionPayload().result, authorized_via: "status_token" },
+    })],
+    ["zero reconciliation ordinal", operatorRejectionPayload({
+      result: { ...operatorRejectionPayload().result, reconciliation_ordinal: 0 },
+    })],
+    ["mismatched prior detail hash", operatorRejectionPayload({
+      result: { ...operatorRejectionPayload().result, prior_unknown_detail_hash: "c".repeat(64) },
+    })],
+  ] as const)("rejects %s", (_label, payload) => {
+    expect(() => validateOperatorPayload(payload)).toThrow();
   });
 });
 

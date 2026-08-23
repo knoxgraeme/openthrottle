@@ -8,6 +8,7 @@ import {
   type CompiledPipelineManifest,
   type DefinitionBundle,
   type DeliveryRecord,
+  type EffectIntent,
   type ExecutionRecord,
   type JsonValue,
 } from "@openthrottle/contracts";
@@ -41,11 +42,17 @@ import {
   createKernelEffectAdapterRegistry,
   type KernelEffectAdapterBinding,
 } from "./kernel-effects.js";
+import { effectIntentContentHash } from "../pipeline/kernel/effect-intent.js";
+import {
+  OPERATOR_EFFECT_REJECTION_RUNTIME_SNAPSHOT,
+  createOperatorEffectRejectionDelivery,
+} from "../pipeline/kernel/operator-effect-rejection.js";
 
 const NOW = "2026-08-20T12:00:00.000Z";
 const SUBJECT = "a".repeat(40);
 const PRIVATE_CANDIDATE = "f".repeat(40);
 const OUTPUT = "b".repeat(40);
+const RUNTIME_IDENTITY = "f".repeat(64);
 const INTEGRATION_BLOB = {
   algorithm: "sha256" as const,
   digest: "e".repeat(64),
@@ -63,6 +70,28 @@ function deferred<T = void>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function runtimeCreateIntent(pipelineRunId: string): EffectIntent {
+  return {
+    schema: "openthrottle.effect-intent/v1",
+    id: "effect-runtime-create",
+    pipeline_run_id: pipelineRunId,
+    decision_record_id: "decision-runtime-create",
+    kind: "daytona/create-sandbox@1",
+    idempotency_key: `${pipelineRunId}:runtime:create:${RUNTIME_IDENTITY}`,
+    target: `daytona:${RUNTIME_IDENTITY}`,
+    subject: null,
+    payload: {
+      schema: "openthrottle.daytona-create/v1",
+      identity: RUNTIME_IDENTITY,
+      pipeline_run_id: pipelineRunId,
+      repository: "owner/repo",
+      base_branch: "main",
+      base_commit: SUBJECT,
+      snapshot: OPERATOR_EFFECT_REJECTION_RUNTIME_SNAPSHOT,
+    },
+  };
 }
 
 function bundle(pipelineId = "core/test"): DefinitionBundle {
@@ -338,12 +367,39 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
       : [];
   }
 
-  acknowledgePhase(phase: string, status: "confirmed" | "rejected" = "confirmed"): void {
+  acknowledgePhase(
+    phase: string,
+    status: "confirmed" | "rejected" = "confirmed",
+    observedVia: "provider" | "operator_resolution" = "provider",
+  ): void {
     const key = `external-schedule:attempt-1:${phase}`;
     const schedule = this.schedules.get(key);
     if (!schedule) throw new Error(`missing phase ${phase}`);
     const effects = schedule.effects.map(({ intent }, index) => {
       const integration = intent.kind === "daytona/integrate-checkpoint@1";
+      if (integration && observedVia === "operator_resolution") {
+        const delivery = createOperatorEffectRejectionDelivery({
+          request: {
+            pipeline_run_id: intent.pipeline_run_id,
+            effect_id: intent.id,
+            expected_maintenance_version: 2,
+            resolution_id: "resolution-sandbox-rejection",
+            reason_code: "legacy_integration_idempotency_key_rejected_before_mutation",
+            reason: "The sandbox request was rejected before repository mutation.",
+          },
+          intent,
+          captured_run_version: 17,
+          captured_effect_version: 31,
+          intent_hash: effectIntentContentHash(intent),
+          dispatch_fence: { lease_id: "dispatch-lease", worker_id: "worker-1" },
+          reconciliation_ordinal: 32,
+          prior_unknown_detail: "reconcile-only target remained absent",
+          runtime_create_intent: runtimeCreateIntent(intent.pipeline_run_id),
+          created_at: NOW,
+        });
+        this.records.set(delivery.id, delivery);
+        return { intent, delivery };
+      }
       const delivery: DeliveryRecord = {
         schema: EXECUTION_RECORD_SCHEMA,
         id: `delivery-${phase}-${index}`,
@@ -426,10 +482,28 @@ function prepared(
       id: phase.id,
       effects: phase.effects.map((effect, index) => ({
         kind: effect.effect_kind,
-        idempotency_key: `run-1:${phase.id}:${index}`,
+        idempotency_key: effect.effect_kind === "daytona/integrate-checkpoint@1"
+          ? `run-1:${phase.id}:${index}:${"a".repeat(201)}`
+          : `run-1:${phase.id}:${index}`,
         target: `${effect.effect_kind}:target:${index}`,
         subject,
-        payload: { phase: phase.id },
+        payload: (effect.effect_kind === "daytona/integrate-checkpoint@1"
+          ? {
+            schema: "openthrottle.daytona-integration/v1",
+            identity: RUNTIME_IDENTITY,
+            pipeline_run_id: "run-1",
+            attempt_id: "attempt-1",
+            definition_bundle_hash: "c".repeat(64),
+            checkpoint_base_subject: SUBJECT,
+            current_subject: SUBJECT,
+            candidate_checkpoint_id: "checkpoint-private-candidate",
+            candidate_input_subject: SUBJECT,
+            candidate_output_subject: PRIVATE_CANDIDATE,
+            candidate_blob: INTEGRATION_BLOB,
+            candidate_artifact: { commit: PRIVATE_CANDIDATE },
+            current_ancestry: [],
+          }
+          : { phase: phase.id }) as JsonValue,
       })),
     })),
   };
@@ -831,7 +905,7 @@ describe("kernel external boundary bridge", () => {
       disposition: "scheduled",
       phase: "integrate-checkpoint",
     });
-    store.acknowledgePhase("integrate-checkpoint", "rejected");
+    store.acknowledgePhase("integrate-checkpoint", "rejected", "operator_resolution");
     const rejected = store.schedules
       .get("external-schedule:attempt-1:integrate-checkpoint")!.effects[0]!.delivery!;
     store.throwAfterApply = (transition) =>
@@ -846,6 +920,13 @@ describe("kernel external boundary bridge", () => {
     expect([...store.schedules.keys()]).toEqual([
       "external-schedule:attempt-1:integrate-checkpoint",
     ]);
+    expect(rejected.payload).toMatchObject({
+      inline: {
+        provider: "operator",
+        observed_via: "operator_resolution",
+        result: { schema: "openthrottle.operator-effect-rejection/v1" },
+      },
+    });
     const result = [...store.records.values()].find((record) => record.kind === "result")!;
     expect(result.payload).toMatchObject({
       inline: {

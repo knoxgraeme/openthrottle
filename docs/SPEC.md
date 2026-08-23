@@ -498,6 +498,31 @@ The worker follows this order:
 An unknown external outcome is never blindly replayed. Conflicting external
 identity, target, subject, or payload fails closed.
 
+A deploy-authorized operator may turn one exact dispatch-fenced unknown Effect
+into rejected evidence only while mutating ingress is closed at an exact
+maintenance version. The request is limited to the fixed
+`legacy_integration_idempotency_key_rejected_before_mutation` reason code, one
+stable resolution ID, and a bounded sanitized reason. This release accepts only
+an integration Effect whose immutable idempotency key exceeds the legacy
+200-character validator and whose confirmed runtime-creation Effect names the
+same runtime identity and affected `openthrottle-2eb524571c32` snapshot. Those
+sealed facts prove that the old runner rejected the request during validation,
+before repository mutation.
+Persistence rechecks that proof, the maintenance fence, active run, ready
+checkpoint-backed schedule owner, unleased unknown status, and retained
+dispatch fence atomically.
+The caller selects one exact run and Effect, but cannot author the persisted
+Effect identity, delivery status, or evidence fields.
+The resulting immutable DeliveryRecord retains the prior unknown detail and
+dispatch fence, never invokes the provider, and lets the normal failure and
+runtime-cleanup path continue. A worker race or mismatched replay fails closed.
+`POST /maintenance/runs/:reference/effects/:effect_id/reject` accepts exactly
+`expected_maintenance_version`, `resolution_id`, `reason_code`, and `reason` in
+a body of at most 16 KiB. First application and an exact replay both return
+`200`; the response disposition distinguishes `rejected` from `unchanged`.
+Missing identity returns `404`, while an open or stale maintenance fence and
+every Effect-state or replay conflict return `409`.
+
 Git task-ref publication distinguishes creation from update in the immutable
 Effect payload. Creation requires the deterministic task ref to be absent.
 Update requires it to equal the exact last confirmed published head; a missing
@@ -605,6 +630,7 @@ Webhook endpoints verify provider HMAC before ingestion.
 | `POST /maintenance/close` | deploy bearer | compare-and-set close |
 | `POST /maintenance/open` | deploy bearer | compare-and-set open |
 | `GET /maintenance/active-work` | deploy bearer | bounded diagnostic snapshot of live work/resources |
+| `POST /maintenance/runs/:reference/effects/:effect_id/reject` | deploy bearer | exact maintenance-fenced rejection of one dispatch-fenced unknown Effect |
 | `POST /webhooks/linear` | Linear HMAC | bounded deduplicated event |
 | `POST /webhooks/github` | GitHub HMAC | bounded deduplicated event |
 

@@ -228,3 +228,110 @@ If deployment fails before ingress opens, keep maintenance closed, inspect the
 exact receipt/storage identity, and repair or redeploy. There is no archive,
 restore hook, replacement report, prescribed canary pair, dual-write path, or
 durable cutover state machine.
+
+## 6. Reject a proven pre-mutation sandbox failure
+
+Use this exceptional path only for the legacy integration-request defect it
+encodes: the run's confirmed runtime-creation Effect selected snapshot
+`openthrottle-2eb524571c32`, and the immutable integration idempotency key
+exceeded that runner's 200-character validator. The transaction verifies the
+same runtime identity and both facts, which prove validation failed before any
+repository mutation. First preserve the run status and logs and
+verify the deterministic provider target is absent. This endpoint cannot
+confirm, cancel, or arbitrarily dismiss another Effect; it authors one permanent
+rejected DeliveryRecord and sends this known failure through its normal failure
+and runtime-cleanup path.
+
+Use the exact pipeline-run ID rather than a provider source reference. Observe
+the current maintenance version, close ingress with compare-and-set, and retain
+the returned closed version:
+
+```bash
+export RUN_REFERENCE=REPLACE_WITH_EXACT_PIPELINE_RUN_ID
+export EFFECT_ID=REPLACE_WITH_EFFECT_ID
+export RESOLUTION_ID=REPLACE_WITH_STABLE_RESOLUTION_ID
+export REJECTION_REASON='Sandbox request validation failed before repository mutation.'
+
+for value in "$RUN_REFERENCE" "$EFFECT_ID" "$RESOLUTION_ID"; do
+  case "$value" in
+    REPLACE_WITH_*) echo "replace every operator-rejection placeholder" >&2; exit 1 ;;
+  esac
+done
+
+MAINTENANCE="$(
+  curl -fsS -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+    "https://$FLY_APP.fly.dev/maintenance"
+)"
+MAINTENANCE_VERSION="$(jq -er '.maintenance.version' <<<"$MAINTENANCE")"
+CLOSED="$(
+  jq -n --argjson expected_version "$MAINTENANCE_VERSION" '{expected_version:$expected_version}' |
+    curl -fsS -X POST \
+      -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data-binary @- \
+      "https://$FLY_APP.fly.dev/maintenance/close"
+)"
+CLOSED_VERSION="$(jq -er '.maintenance | select(.closed == true) | .version' <<<"$CLOSED")"
+```
+
+Closing maintenance fences new provider ingress but does not pause the worker.
+Confirm the exact Effect is back in `unknown` rather than holding a processing
+lease, then submit the stable resolution identity and fixed reason code. A
+worker race or stale maintenance version returns `409`; re-read status and the
+maintenance fence instead of changing the resolution identity or editing
+SQLite.
+
+```bash
+curl -fsS -X POST \
+  -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary "$(
+    jq -n \
+      --argjson expected_maintenance_version "$CLOSED_VERSION" \
+      --arg resolution_id "$RESOLUTION_ID" \
+      --arg reason "$REJECTION_REASON" \
+      '{
+        expected_maintenance_version:$expected_maintenance_version,
+        resolution_id:$resolution_id,
+        reason_code:"legacy_integration_idempotency_key_rejected_before_mutation",
+        reason:$reason
+      }'
+  )" \
+  "https://$FLY_APP.fly.dev/maintenance/runs/$RUN_REFERENCE/effects/$EFFECT_ID/reject"
+```
+
+Monitor the run status and logs until the rejected delivery drives the normal
+failed-run stop and cleanup stages. Require `GET /maintenance/active-work` to
+report `clear:true`, including no provider-backed runtime resource, before
+reopening ingress at the latest observed maintenance version:
+
+```bash
+curl -fsS -H "Authorization: Bearer $OT_STATUS_TOKEN" \
+  "https://$FLY_APP.fly.dev/runs/$RUN_REFERENCE/status"
+ACTIVE_WORK="$(
+  curl -fsS -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+    "https://$FLY_APP.fly.dev/maintenance/active-work"
+)"
+if ! jq -e '.clear == true' <<<"$ACTIVE_WORK" >/dev/null; then
+  echo "runtime cleanup is not complete; keep maintenance closed" >&2
+  exit 1
+fi
+
+MAINTENANCE="$(
+  curl -fsS -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+    "https://$FLY_APP.fly.dev/maintenance"
+)"
+MAINTENANCE_VERSION="$(
+  jq -er '.maintenance | select(.closed == true) | .version' <<<"$MAINTENANCE"
+)"
+jq -n --argjson expected_version "$MAINTENANCE_VERSION" \
+  '{expected_version:$expected_version}' |
+  curl -fsS -X POST \
+    -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data-binary @- \
+    "https://$FLY_APP.fly.dev/maintenance/open"
+```
+
+Never clear the dispatch fence, replay the provider call, or update the
+database by hand.

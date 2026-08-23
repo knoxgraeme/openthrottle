@@ -34,6 +34,13 @@ const LOG_KINDS: readonly KernelLogKind[] = [
 ];
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const TEAM_KEY = /^[A-Za-z0-9_-]+$/;
+const KERNEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
+const EFFECT_REJECTION_FIELDS = [
+  "expected_maintenance_version",
+  "resolution_id",
+  "reason_code",
+  "reason",
+] as const;
 
 type KernelHttpConfig = Pick<
   Config,
@@ -91,6 +98,19 @@ function record(value: unknown, name: string): Record<string, unknown> {
     throw new Error(`${name} must be an object`);
   }
   return value as Record<string, unknown>;
+}
+
+function exactRecord(
+  value: unknown,
+  name: string,
+  fields: readonly string[],
+): Record<string, unknown> {
+  const input = record(value, name);
+  const unknown = Object.keys(input).find((key) => !fields.includes(key));
+  if (unknown) throw new Error(`${name}.${unknown} is an unknown field`);
+  const missing = fields.find((key) => !(key in input));
+  if (missing) throw new Error(`${name}.${missing} is required`);
+  return input;
 }
 
 function string(value: unknown, name: string, maximum = 500): string {
@@ -526,6 +546,51 @@ export function createServer(deps: KernelServerDeps): Hono {
       return context.json(await deps.service.activeWork(limit));
     } catch (error) {
       return context.json({ error: safeError(error) }, 400);
+    }
+  });
+
+  app.post("/maintenance/runs/:reference/effects/:effect_id/reject", async (context) => {
+    if (!deployAuthorized(context.req.header("Authorization"))) {
+      return context.json({ error: "unauthorized" }, 401);
+    }
+    try {
+      const raw = await readBoundedUtf8Body(
+        context.req.raw,
+        CONTROL_BODY_MAX_BYTES,
+        `effect rejection request exceeds ${CONTROL_BODY_MAX_BYTES} bytes`,
+      );
+      const body = exactRecord(
+        jsonPayload(raw).object,
+        "request body",
+        EFFECT_REJECTION_FIELDS,
+      );
+      const expectedMaintenanceVersion = optionalNonnegativeInteger(
+        body.expected_maintenance_version,
+        "expected_maintenance_version",
+      );
+      if (expectedMaintenanceVersion === undefined) {
+        throw new Error("expected_maintenance_version is required");
+      }
+      const effectId = string(context.req.param("effect_id"), "effect_id", 200);
+      if (!KERNEL_ID.test(effectId)) throw new Error("effect_id is invalid");
+      const resolutionId = string(body.resolution_id, "resolution_id", 200);
+      if (!KERNEL_ID.test(resolutionId)) throw new Error("resolution_id is invalid");
+      if (body.reason_code !== "legacy_integration_idempotency_key_rejected_before_mutation") {
+        throw new Error(
+          "reason_code must be legacy_integration_idempotency_key_rejected_before_mutation",
+        );
+      }
+      const resolution = await deps.service.rejectUnknownEffect({
+        reference: context.req.param("reference"),
+        effect_id: effectId,
+        expected_maintenance_version: expectedMaintenanceVersion,
+        resolution_id: resolutionId,
+        reason_code: body.reason_code,
+        reason: string(body.reason, "reason", 1_500),
+      });
+      return context.json({ resolution }, 200);
+    } catch (error) {
+      return context.json({ error: safeError(error) }, errorStatus(error));
     }
   });
 
