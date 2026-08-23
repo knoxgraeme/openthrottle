@@ -42,13 +42,21 @@ function required(value, label, pattern) {
   return value;
 }
 
+function requiredBoundedString(value, label, maximum) {
+  if (typeof value !== "string" || value.length === 0 || value.length > maximum) {
+    throw new Error(`${label} is invalid`);
+  }
+  return value;
+}
+
 function validateRequest(request) {
   if (!request || typeof request !== "object" || Array.isArray(request) || request.schema !== INTEGRATION_REQUEST_SCHEMA) {
     throw new Error("integration request schema is invalid");
   }
-  for (const key of ["pipeline_run_id", "effect_id", "idempotency_key", "lease_id", "worker_id", "candidate_checkpoint_id"]) {
+  for (const key of ["pipeline_run_id", "effect_id", "lease_id", "worker_id", "candidate_checkpoint_id"]) {
     required(request[key], `request.${key}`, ID);
   }
+  requiredBoundedString(request.idempotency_key, "request.idempotency_key", 500);
   required(request.definition_bundle_hash, "request.definition_bundle_hash", SHA256);
   for (const key of [
     "checkpoint_base_subject", "current_subject", "candidate_input_subject", "candidate_output_subject",

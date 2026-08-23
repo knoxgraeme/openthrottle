@@ -91,11 +91,19 @@ function integrationFixture(value, suffix = "1") {
   const transport = mkdtempSync(join(tmpdir(), "ot-integrate-transport-"));
   const artifact = value.checkpoint.payload_artifact;
   copyFileSync(join(value.action, artifact.file), join(transport, artifact.file));
+  const idempotencyKey = [
+    `run-${"a".repeat(48)}`,
+    `attempt-${"b".repeat(48)}`,
+    "publish-integrate",
+    "c".repeat(40),
+    `checkpoint:${"d".repeat(32)}`,
+    suffix,
+  ].join(":");
   const request = {
     schema: "openthrottle.kernel-integration-request/v1",
     pipeline_run_id: "run-1",
     effect_id: `effect-${suffix}`,
-    idempotency_key: `integrate:run-1:attempt-${suffix}`,
+    idempotency_key: idempotencyKey,
     lease_id: `lease-integration-${suffix}`,
     worker_id: "worker-1",
     definition_bundle_hash: "b".repeat(64),
@@ -158,6 +166,8 @@ describe("executor checkpoint integration", () => {
     const execution = integrate(value);
     const { artifact, request, result } = execution;
 
+    expect(request.idempotency_key.length).toBeGreaterThan(200);
+    expect(request.idempotency_key.length).toBeLessThanOrEqual(500);
     expect(result.state, result.reason).toBe("integrated");
     expect(result).toMatchObject({
       schema: "openthrottle.kernel-integration-result/v1",
@@ -192,6 +202,28 @@ describe("executor checkpoint integration", () => {
       resultPath: execution.resultPath,
       sourceRepoDir: value.repo,
     })).toThrow("integration replay worker_id mismatch");
+  });
+
+  it("executes at the exact idempotency-key length boundary", () => {
+    const value = fixture();
+    const maximum = integrationFixture(value, "maximum-idempotency-key");
+    maximum.request.idempotency_key = "x".repeat(500);
+    const result = integrateCheckpoint({
+      request: maximum.request,
+      requestDirectory: maximum.transport,
+      resultPath: maximum.resultPath,
+      sourceRepoDir: value.repo,
+    });
+    expect(result.state, result.reason).toBe("integrated");
+    restoreIntegrated({ ...maximum, result });
+
+    const overMaximum = integrationFixture(value, "over-maximum-idempotency-key");
+    expect(() => integrateCheckpoint({
+      request: { ...overMaximum.request, idempotency_key: "x".repeat(501) },
+      requestDirectory: overMaximum.transport,
+      resultPath: overMaximum.resultPath,
+      sourceRepoDir: value.repo,
+    })).toThrow("request.idempotency_key is invalid");
   });
 
   it("authors a merge descendant when current has the candidate input tree at a different commit", () => {
@@ -452,6 +484,8 @@ describe("executor checkpoint integration", () => {
       checkpoint,
     }, "back-to-back-second");
     expect(second.result.state, second.result.reason).toBe("integrated");
+    expect(second.request.idempotency_key).not.toBe(firstExecution.request.idempotency_key);
+    expect(second.result.payload_artifact.ref).not.toBe(firstExecution.result.payload_artifact.ref);
     const restored = restoreIntegrated(second);
     expect(git(restored, "rev-list", "--parents", "-n", "1", second.result.output_subject).split(" "))
       .toEqual([second.result.output_subject, firstExecution.result.output_subject]);
