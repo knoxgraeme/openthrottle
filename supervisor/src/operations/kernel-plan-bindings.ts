@@ -124,23 +124,26 @@ function descriptor(
   blobs: VolumeBlobStore,
   checkpoint: AttemptCheckpoint,
   checkpointBaseSubject: string,
-  requiredAncestry?: { ancestor: string; descendant: string },
-  sealedBytes?: Uint8Array,
+  options: {
+    expected_parent?: string;
+    required_ancestry?: { ancestor: string; descendant: string };
+    sealed_bytes?: Uint8Array;
+  } = {},
 ) {
   if (!("blob" in checkpoint.payload) || checkpoint.output_subject === null) {
     throw new Error("external Git checkpoint has no materializable output");
   }
   const pointer = checkpoint.payload.blob;
+  const expectedParent = options.expected_parent ??
+    (checkpoint.output_subject === checkpoint.input_subject ? undefined : checkpoint.input_subject);
   const inspected = inspectKernelCheckpointBundle({
-    bytes: sealedBytes ?? blobs.read(pointer),
+    bytes: options.sealed_bytes ?? blobs.read(pointer),
     expected_commit: checkpoint.output_subject,
     shallow_boundary: checkpointBaseSubject,
-    expected_parent: checkpoint.output_subject === checkpoint.input_subject
-      ? undefined
-      : checkpoint.input_subject,
-    ...(requiredAncestry === undefined ? {} : {
-      required_ancestor: requiredAncestry.ancestor,
-      required_descendant: requiredAncestry.descendant,
+    expected_parent: expectedParent,
+    ...(options.required_ancestry === undefined ? {} : {
+      required_ancestor: options.required_ancestry.ancestor,
+      required_descendant: options.required_ancestry.descendant,
     }),
     allowed_ref: /^refs\/openthrottle\/(?:checkpoints|integrations)\/[a-f0-9]{64}$/,
   });
@@ -234,12 +237,14 @@ function exactIntegrationCheckpointContext(input: {
     input.blobs,
     candidate,
     input.checkpoint_base_subject,
-    proofCheckpoints.length === 0 &&
-      candidate.input_subject !== input.current_subject &&
-      candidate.output_subject !== input.current_subject
-      ? { ancestor: input.current_subject, descendant: candidate.input_subject }
-      : undefined,
-    candidates[0]!.bytes,
+    {
+      ...(proofCheckpoints.length === 0 &&
+          candidate.input_subject !== input.current_subject &&
+          candidate.output_subject !== input.current_subject
+        ? { required_ancestry: { ancestor: input.current_subject, descendant: candidate.input_subject } }
+        : {}),
+      sealed_bytes: candidates[0]!.bytes,
+    },
   );
   if (!candidateArtifact.ref.startsWith("refs/openthrottle/checkpoints/")) {
     throw new Error("unit integration candidate is not an ordinary checkpoint ref");
@@ -249,8 +254,7 @@ function exactIntegrationCheckpointContext(input: {
       input.blobs,
       checkpoint,
       checkpoint.input_subject,
-      undefined,
-      bytes,
+      { sealed_bytes: bytes },
     );
     if (!checkpointArtifact.ref.startsWith("refs/openthrottle/integrations/")) {
       throw new Error("unit integration ancestry is not an integration checkpoint ref");
@@ -515,7 +519,7 @@ export function createKernelExternalPlanBindings(input: {
         attempt_id: attempt.id,
         request_hash: attempt.request_hash,
         definition_bundle_hash: attempt.definition_bundle_hash,
-        input_subject: publicationParent,
+        input_subject: attempt.input_subject,
         output_subject: output,
         native_session_id: null,
         payload_schema: GIT_BUNDLE_SCHEMA,
@@ -527,7 +531,9 @@ export function createKernelExternalPlanBindings(input: {
       if (taskRef !== `refs/heads/${taskBranch}`) {
         throw new Error("publication compaction changed its deterministic task ref");
       }
-      const artifact = descriptor(input.blob_store, checkpoint, publicationParent);
+      const artifact = descriptor(input.blob_store, checkpoint, publicationParent, {
+        expected_parent: publicationParent,
+      });
       const promoted: KernelPreparedExternalPlan = {
         ...prepared,
         verified_output_subject: output,

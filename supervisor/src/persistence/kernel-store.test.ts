@@ -19,6 +19,7 @@ import {
   type EffectIntent,
   type ExecutionRecordPayloadContract,
   type ExecutionRecordPayloadRegistry,
+  type JsonValue,
   type ResultRecord,
 } from "@openthrottle/contracts";
 import { reduceKernelCommand, compileKernelCursor } from "../pipeline/kernel/reducer.js";
@@ -1129,6 +1130,182 @@ describe("SqliteKernelStore", () => {
       expect(await context.store.applyAtomicTransition(start)).toEqual({ disposition: "replayed", run_version: 2 });
       await expect(context.store.applyAtomicTransition(conflictingReplay(start))).rejects.toThrow(/conflicts/);
       await expect(context.store.applyAtomicTransition(delayed)).rejects.toThrow(/stale/);
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("persists a core/publish promotion whose sealed parent differs from its Attempt input", async () => {
+    const context = setup();
+    try {
+      const privateCandidate = subject("1");
+      const publicationParent = subject("8");
+      const publishedSubject = subject("2");
+      Object.assign(context.pipelineManifest, {
+        entry_stage: "publish",
+        stages: [{
+          id: "publish",
+          kind: "effect",
+          effect: "core/publish@1",
+          on: { success: { terminal: "completed" }, failure: { terminal: "failed" } },
+        }],
+      } satisfies Partial<CompiledPipelineManifest>);
+      const publicationAttempt = attempt({
+        ...context.admission.initial_attempts[0],
+        scope: { kind: "stage", stage_id: "publish" },
+        repository_authority: "inspect",
+        input_subject: privateCandidate,
+      });
+      context.admission.initial_attempts = [publicationAttempt];
+      context.admission.run = {
+        ...context.admission.run,
+        current_subject: privateCandidate,
+        cursor: compileKernelCursor({
+          stage_id: "publish",
+          version: 0,
+          attempts: [publicationAttempt],
+        }),
+        active_attempt_versions: { [publicationAttempt.id]: publicationAttempt.version },
+      };
+      context.store.admitPipelineRun(context.admission);
+
+      const planningCheckpoint: AttemptCheckpoint = {
+        schema: ATTEMPT_CHECKPOINT_SCHEMA,
+        id: "checkpoint-publication-plan",
+        pipeline_run_id: publicationAttempt.pipeline_run_id,
+        attempt_id: publicationAttempt.id,
+        request_hash: publicationAttempt.request_hash,
+        definition_bundle_hash: publicationAttempt.definition_bundle_hash,
+        input_subject: privateCandidate,
+        output_subject: null,
+        native_session_id: null,
+        payload_schema: "openthrottle.external-boundary-checkpoint/v1",
+        payload: { inline: {
+          schema: "openthrottle.external-boundary-checkpoint/v1",
+          external_kind: "core/publish@1",
+          subject_policy: "advance",
+          plan_digest: sha("9"),
+          evidence: { publication_parent_subject: publicationParent },
+        } },
+        captured_at: NOW,
+      };
+      context.db.transaction(() => {
+        context.db.prepare(`
+          INSERT INTO checkpoints (
+            id, pipeline_run_id, attempt_id, ordinal, checkpoint_hash, semantic_key,
+            request_hash, definition_bundle_hash, input_subject, output_subject,
+            native_session_id, payload_schema, inline_payload, captured_at
+          ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+        `).run(
+          planningCheckpoint.id,
+          planningCheckpoint.pipeline_run_id,
+          planningCheckpoint.attempt_id,
+          digestCanonicalJson(planningCheckpoint),
+          planningCheckpoint.payload_schema,
+          planningCheckpoint.request_hash,
+          planningCheckpoint.definition_bundle_hash,
+          planningCheckpoint.input_subject,
+          planningCheckpoint.payload_schema,
+          canonicalJson((planningCheckpoint.payload as { inline: unknown }).inline),
+          planningCheckpoint.captured_at,
+        );
+        context.db.prepare(`
+          UPDATE attempts SET status = 'work_complete', version = 1,
+            checkpoint_id = ?, output_subject = NULL, updated_at = ?
+          WHERE id = ?
+        `).run(planningCheckpoint.id, NOW, publicationAttempt.id);
+        context.db.prepare(`
+          UPDATE pipeline_runs SET status = 'running', version = 1, updated_at = ?
+          WHERE id = ?
+        `).run(NOW, publicationAttempt.pipeline_run_id);
+      }).immediate();
+
+      const promotedBlob = context.blobs.put({
+        bytes: new TextEncoder().encode("sealed publication bundle"),
+        encoding: "binary",
+        media_type: "application/x-git-bundle",
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+      }).pointer;
+      const promotedCheckpoint: AttemptCheckpoint = {
+        ...planningCheckpoint,
+        id: "checkpoint-publication-output",
+        input_subject: privateCandidate,
+        output_subject: publishedSubject,
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+        payload: { blob: promotedBlob },
+      };
+      const integrationEffect: EffectIntent = {
+        schema: EFFECT_INTENT_SCHEMA,
+        id: "effect-publication-integrate",
+        pipeline_run_id: publicationAttempt.pipeline_run_id,
+        decision_record_id: "decision-publication-integrate",
+        kind: "daytona/integrate-checkpoint@1",
+        idempotency_key: "run-1:publication-integrate",
+        target: "daytona:publication",
+        subject: null,
+        payload: { schema: "openthrottle.daytona-integration/v1" },
+      };
+      const delivery: DeliveryRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "delivery-publication-integrate",
+        kind: "delivery",
+        pipeline_run_id: publicationAttempt.pipeline_run_id,
+        effect_id: integrationEffect.id,
+        idempotency_key: integrationEffect.idempotency_key,
+        external_identity: integrationEffect.target,
+        status: "confirmed",
+        payload_schema: "openthrottle.effect-delivery/v1",
+        payload: { inline: {
+          effect_kind: "daytona/integrate-checkpoint@1",
+          provider: "daytona",
+          result: {
+            schema: "openthrottle.daytona-integration-delivery/v1",
+            state: "integrated",
+            pipeline_run_id: publicationAttempt.pipeline_run_id,
+            attempt_id: publicationAttempt.id,
+            effect_id: integrationEffect.id,
+            idempotency_key: integrationEffect.idempotency_key,
+            input_subject: publicationParent,
+            output_subject: publishedSubject,
+            checkpoint_id: promotedCheckpoint.id,
+            checkpoint_payload_schema: promotedCheckpoint.payload_schema,
+            checkpoint_blob: promotedBlob as unknown as JsonValue,
+          },
+        } },
+        created_at: NOW,
+      };
+      const view = await context.store.loadExactReductionView({
+        pipeline_run_id: publicationAttempt.pipeline_run_id,
+        attempt_id: publicationAttempt.id,
+        record_ids: [],
+        checkpoint_ids: [planningCheckpoint.id],
+      });
+      const transition = reduceKernelCommand({
+        ...view,
+        records: exactMap(delivery),
+        checkpoints: exactMap(planningCheckpoint, promotedCheckpoint),
+        command: {
+          type: "advance_external_subject",
+          command_id: "advance-publication-subject",
+          attempt_id: publicationAttempt.id,
+          prior_checkpoint_id: planningCheckpoint.id,
+          checkpoint_id: promotedCheckpoint.id,
+          delivery_record_id: delivery.id,
+          verified_output_subject: publishedSubject,
+        },
+      });
+
+      await expect(context.store.applyAtomicTransition(transition)).resolves.toEqual({
+        disposition: "applied",
+        run_version: view.run.version + 1,
+      });
+      expect(context.db.prepare(`
+        SELECT ordinal, input_subject, output_subject FROM checkpoints WHERE id = ?
+      `).get(promotedCheckpoint.id)).toEqual({
+        ordinal: 1,
+        input_subject: privateCandidate,
+        output_subject: publishedSubject,
+      });
     } finally {
       context.db.close();
     }
