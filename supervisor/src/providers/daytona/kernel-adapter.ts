@@ -95,6 +95,7 @@ const MODEL_CREDENTIALS = [
   "KIMI_CODE_API_KEY",
 ] as const;
 const SAFE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/;
+const KERNEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 
 interface DaytonaKernelOptions {
   snapshot: string;
@@ -283,7 +284,7 @@ function integrationPayload(intent: Readonly<EffectIntent>): DaytonaIntegrationP
     typeof value.definition_bundle_hash !== "string" || !/^[a-f0-9]{64}$/.test(value.definition_bundle_hash) ||
     typeof value.checkpoint_base_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(value.checkpoint_base_subject) ||
     typeof value.current_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(value.current_subject) ||
-    typeof value.candidate_checkpoint_id !== "string" || !SAFE_PATH_ID.test(value.candidate_checkpoint_id) ||
+    typeof value.candidate_checkpoint_id !== "string" || !KERNEL_ID.test(value.candidate_checkpoint_id) ||
     typeof value.candidate_input_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(value.candidate_input_subject) ||
     typeof value.candidate_output_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(value.candidate_output_subject) ||
     artifact.media_type !== "application/x-git-bundle" ||
@@ -326,7 +327,7 @@ function integrationPayload(intent: Readonly<EffectIntent>): DaytonaIntegrationP
     if (
       Object.keys(edge).sort().join("\0") !== edgeKeys.join("\0") ||
       Object.keys(edgeArtifact).sort().join("\0") !== artifactKeys.join("\0") ||
-      typeof edge.checkpoint_id !== "string" || !SAFE_PATH_ID.test(edge.checkpoint_id) ||
+      typeof edge.checkpoint_id !== "string" || !KERNEL_ID.test(edge.checkpoint_id) ||
       typeof edge.input_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(edge.input_subject) ||
       typeof edge.output_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(edge.output_subject) ||
       edge.input_subject !== ancestrySubject || edge.output_subject === edge.input_subject ||

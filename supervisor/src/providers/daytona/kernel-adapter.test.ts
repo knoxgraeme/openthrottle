@@ -454,7 +454,7 @@ function integrationIntentWithSealedBundleSizes(input: {
       definition_bundle_hash: "b".repeat(64),
       checkpoint_base_subject: candidateInput,
       current_subject: ancestryOutput,
-      candidate_checkpoint_id: "checkpoint-candidate",
+      candidate_checkpoint_id: `checkpoint:${"c".repeat(32)}`,
       candidate_input_subject: candidateInput,
       candidate_output_subject: candidateInput,
       candidate_blob: candidatePointer,
@@ -469,7 +469,7 @@ function integrationIntentWithSealedBundleSizes(input: {
         tree: "5".repeat(40),
       },
       current_ancestry: [{
-        checkpoint_id: "checkpoint-ancestry",
+        checkpoint_id: `checkpoint:${"a".repeat(32)}`,
         input_subject: candidateInput,
         output_subject: ancestryOutput,
         checkpoint_blob: ancestryPointer,
