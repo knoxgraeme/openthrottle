@@ -36,7 +36,7 @@ function sourceRepository() {
   writeFileSync(join(repo, "work.txt"), "base\n");
   git(repo, "add", ".");
   git(repo, "commit", "--quiet", "-m", "base");
-  return { repo, subject: git(repo, "rev-parse", "HEAD^{tree}") };
+  return { repo, subject: git(repo, "rev-parse", "HEAD") };
 }
 
 function skillEntry() {
@@ -63,6 +63,7 @@ function workRequest(subject, overrides = {}) {
     scope: { kind: "stage", stage_id: "implement" },
     request_hash: "a".repeat(64),
     definition_bundle_hash: "b".repeat(64),
+    checkpoint_base_subject: subject,
     input_subject: subject,
     repository_authority: "edit",
     lease_id: "lease-work",
@@ -422,7 +423,8 @@ describe("kernel attempt executor", () => {
     writeFileSync(join(source.repo, "work.txt"), "accepted edit\n");
     writeFileSync(join(source.repo, "added.txt"), "added\n");
     git(source.repo, "add", ".");
-    const after = git(source.repo, "write-tree");
+    git(source.repo, "commit", "--quiet", "-m", "accepted edit");
+    const after = git(source.repo, "rev-parse", "HEAD");
     const root = mkdtempSync(join(tmpdir(), "ot-attempt-inspect-"));
     const request = workRequest(after, {
       repository_authority: "inspect",
@@ -776,6 +778,7 @@ describe("kernel attempt executor", () => {
       scope: request.scope,
       request_hash: request.request_hash,
       definition_bundle_hash: request.definition_bundle_hash,
+      checkpoint_base_subject: request.checkpoint_base_subject,
       input_subject: request.input_subject,
       locked_subject: checkpoint.output_subject,
       checkpoint_id: checkpoint.id,
@@ -944,6 +947,7 @@ describe("kernel attempt executor", () => {
       scope: request.scope,
       request_hash: request.request_hash,
       definition_bundle_hash: request.definition_bundle_hash,
+      checkpoint_base_subject: request.checkpoint_base_subject,
       input_subject: request.input_subject,
       locked_subject: checkpoint.output_subject,
       completed_work_authority: "edit",

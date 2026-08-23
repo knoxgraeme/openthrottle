@@ -224,12 +224,12 @@ export interface ScheduleExternalCommand extends KernelCommandBase {
 }
 
 /**
- * The sole post-effect repository advance. It is intentionally specific to
- * core/integrate-unit@1: a confirmed Daytona integration DeliveryRecord
- * promotes ordinal-0 planning evidence to one verified ordinal-1 Git bundle.
+ * The sole post-effect repository advance. A confirmed Daytona integration
+ * DeliveryRecord promotes ordinal-0 planning evidence to one verified
+ * ordinal-1 Git bundle. Only core/integrate-unit@1 and core/publish@1 use it.
  */
-export interface AdvanceExternalIntegrationCommand extends KernelCommandBase {
-  type: "advance_external_integration";
+export interface AdvanceExternalSubjectCommand extends KernelCommandBase {
+  type: "advance_external_subject";
   attempt_id: string;
   prior_checkpoint_id: string;
   checkpoint_id: string;
@@ -311,7 +311,7 @@ export type KernelCommand =
   | WorkCompleteCommand
   | ResultPendingCommand
   | ScheduleExternalCommand
-  | AdvanceExternalIntegrationCommand
+  | AdvanceExternalSubjectCommand
   | RecordResultCommand
   | SettleAttemptCommand
   | RetryAttemptCommand

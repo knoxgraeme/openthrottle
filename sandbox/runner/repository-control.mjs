@@ -6,6 +6,29 @@ import { sanitizeArtifactText } from "./kernel-json.mjs";
 const GIT_TIMEOUT_MS = 120_000;
 const MAX_UNTRACKED_PATH_BYTES = 8 * 1024 * 1024;
 
+/**
+ * Builds the environment for executor-owned Git operations. Repository
+ * actions are not allowed to redirect Git through ambient object stores,
+ * namespaces, config injection, hooks, or replacement objects. Callers may
+ * supply the small set of executor-selected GIT_* paths they own; the locked
+ * configuration below always wins.
+ */
+export function executorGitEnvironment(extra = {}) {
+  const environment = { ...process.env };
+  for (const key of Object.keys(environment)) {
+    if (key.startsWith("GIT_")) delete environment[key];
+  }
+  return {
+    ...environment,
+    ...extra,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_COUNT: "0",
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
 function gitResult(result, args) {
   if (result.error?.code === "ETIMEDOUT") throw new Error(`git ${args.join(" ")} timed out`);
   if (result.error || result.status !== 0) {
@@ -16,7 +39,7 @@ function gitResult(result, args) {
 export function runGitAsExecutor(repoDir, args, env = {}, { timeoutMs = GIT_TIMEOUT_MS } = {}) {
   const result = runCapturedProcess("git", ["-c", `safe.directory=${repoDir}`, ...args], {
     cwd: repoDir,
-    env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: "0" },
+    env: executorGitEnvironment(env),
     timeout: timeoutMs,
     captureBytes: 8 * 1024 * 1024,
   });

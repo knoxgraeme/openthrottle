@@ -24,10 +24,14 @@ import {
   createStructuredIntegrationAttempt,
   selectedStructuredReviewPersonas,
   structuredDecisionOutcome,
+  structuredIntegrationCheckpointChain,
   type StructuredAcceptedUnitEvidence,
   type StructuredIntegrationEvidence,
 } from "../pipeline/kernel/structured-coordinator.js";
-import { deriveKernelSuccessorAttempt } from "../pipeline/kernel/successor-attempt.js";
+import {
+  deriveKernelSuccessorAttempt,
+  mergeCausalGithubPushContext,
+} from "../pipeline/kernel/successor-attempt.js";
 import type { KernelAttempt } from "../pipeline/kernel/types.js";
 import {
   assertStructuredRequestContextExact,
@@ -277,6 +281,7 @@ export class KernelStructuredSettlementPlanner implements
           input_subject: input.view.run.current_subject,
           task_prompt: source.request_inputs.task_prompt,
           source: accepted,
+          current_ancestry_checkpoints: [],
           planning_context_records: (() => {
             const promotion = exactStructuredPromotionDecision(
               source.request_inputs,
@@ -471,26 +476,41 @@ export class KernelStructuredSettlementPlanner implements
       decision: current.decision,
       checkpoint: current.checkpoint,
     });
+    const integratedSubject = input.attempt.output_subject!;
+    const completedIntegrationChain = structuredIntegrationCheckpointChain({
+      completed_integrations: integrations,
+      checkpoint_base_subject: input.bundle.source_commit,
+      current_subject: integratedSubject,
+    });
 
     let nextAttempts: readonly KernelAttempt[];
     let nextDependencies: Readonly<Record<string, readonly string[]>> | undefined;
     if (outcome === "next_integration") {
       const source = waitingAccepted[0]!;
+      const ancestryStart = source.candidate_checkpoint.input_subject === integratedSubject
+        ? completedIntegrationChain.length
+        : completedIntegrationChain.findIndex(
+          ({ input_subject: subject }) => subject === source.candidate_checkpoint.input_subject,
+        );
+      if (ancestryStart < 0) {
+        throw new Error("structured integration ancestry has no gap-free path from the candidate input");
+      }
       nextAttempts = [createStructuredIntegrationAttempt({
         pipeline_run_id: input.view.run.id,
         parent_attempt_id: integrationScope.parent_attempt_id,
         member_id: source.member_id,
         round: integrations.size,
         stage_id: integrationStage.id,
-        input_subject: input.attempt.output_subject!,
+        input_subject: integratedSubject,
         task_prompt: request.task_prompt,
         source,
+        current_ancestry_checkpoints: completedIntegrationChain.slice(ancestryStart),
         planning_context_records: (() => {
           const promotion = structuredPromotionFromActionEvidence(
             source,
             input.view.manifest.pipeline_id,
           );
-          return promotion === null ? [] : [promotion];
+          return [...deliveries, ...(promotion === null ? [] : [promotion])];
         })(),
         bundle: input.bundle,
         manifest: input.view.manifest,
@@ -503,7 +523,7 @@ export class KernelStructuredSettlementPlanner implements
         loop_id: integrationScope.loop_id,
         integration_stage_id: integrationStage.id,
         round: integrations.size,
-        input_subject: input.attempt.output_subject!,
+        input_subject: integratedSubject,
         cursor_version: input.view.run.cursor.version + 1,
         completed_scope_keys: input.view.run.cursor.completed_scope_keys,
         max_parallel: root.loop.max_parallel,
@@ -513,10 +533,15 @@ export class KernelStructuredSettlementPlanner implements
           action_inputs: {
             task_prompt: request.task_prompt,
             context: {
-              records: [
-                ...exactStructuredRuntimeRecords(request),
-                ...(resolvedPlan.promotion === null ? [] : [resolvedPlan.promotion]),
-              ],
+              records: mergeCausalGithubPushContext({
+                pipeline_run_id: input.view.run.id,
+                base_records: [
+                  ...exactStructuredRuntimeRecords(request),
+                  ...(resolvedPlan.promotion === null ? [] : [resolvedPlan.promotion]),
+                ],
+                inherited_records: [...request.context.records.values()],
+                additional_records: deliveries,
+              }),
               checkpoints: [input.checkpoint],
             },
           },
@@ -585,8 +610,11 @@ export class KernelStructuredSettlementPlanner implements
       input.attempt.input_subject,
       "structured review selector",
     );
-    const records = [input.result, decision, ...exactStructuredRuntimeRecords(request)]
-      .sort((left, right) => compareCodeUnits(left.id, right.id));
+    const records = mergeCausalGithubPushContext({
+      pipeline_run_id: input.view.run.id,
+      base_records: [input.result, decision, ...exactStructuredRuntimeRecords(request)],
+      inherited_records: [...request.context.records.values()],
+    });
     const frontier = compileReviewFanoutFrontier({
       pipeline_run_id: input.view.run.id,
       parent_attempt_id: input.attempt.id,
@@ -754,7 +782,7 @@ export class KernelStructuredSettlementPlanner implements
         result: input.result,
         decision,
         checkpoints: [...request.context.checkpoints.values()],
-        runtime_delivery_records: exactStructuredRuntimeRecords(request),
+        runtime_delivery_records: [...request.context.records.values()],
         bundle: input.bundle,
         manifest: input.view.manifest,
       })],

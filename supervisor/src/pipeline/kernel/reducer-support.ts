@@ -181,7 +181,14 @@ export function assertBaseInput(input: ReducerInput): void {
     }
     const scopedSubject = input.current_attempt.scope.kind !== "stage" &&
       activeStage.kind !== "effect" && activeStage.kind !== "wait";
-    if (!scopedSubject && input.current_attempt.input_subject !== run.current_subject) {
+    const promotedPublication = activeStage.kind === "effect" &&
+      activeStage.effect === "core/publish@1" &&
+      input.current_attempt.output_subject !== null &&
+      input.current_attempt.output_subject === run.current_subject;
+    if (
+      !scopedSubject && !promotedPublication &&
+      input.current_attempt.input_subject !== run.current_subject
+    ) {
       throw new Error(`attempt ${input.current_attempt.id} does not use the current run subject`);
     }
   }

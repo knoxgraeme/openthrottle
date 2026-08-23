@@ -228,7 +228,8 @@ describe("GitHub kernel client", () => {
         return Response.json(created ? [{
           number: 7,
           html_url: "https://github.com/o/r/pull/7",
-          body: `<!-- ${marker} -->`,
+          title: "fix: complete OPE-187",
+          body: `Implements the approved task.\n\n<!-- ${marker} -->\n`,
           head: { ref: "ot/issue-1", sha, repo: { full_name: "o/r" } },
           base: { ref: "main" },
         }] : []);
@@ -245,6 +246,7 @@ describe("GitHub kernel client", () => {
         return Response.json({
           number: 7,
           html_url: "https://github.com/o/r/pull/7",
+          title: body.title,
           body: body.body,
           head: { ref: "ot/issue-1", sha, repo: { full_name: "o/r" } },
           base: { ref: "main" },
@@ -293,6 +295,7 @@ describe("GitHub kernel client", () => {
       return Response.json([{
         number: 7,
         html_url: "https://github.com/o/r/pull/7",
+        title: "human-created",
         body: "human-created",
         head: { ref: "ot/issue-1", sha, repo: { full_name: "o/r" } },
         base: { ref: "main" },
@@ -318,7 +321,8 @@ describe("GitHub kernel client", () => {
         return Response.json(listed === 1 ? [] : [{
           number: 7,
           html_url: "https://github.com/o/r/pull/7",
-          body: `<!-- ${marker} -->`,
+          title: "fix: complete OPE-187",
+          body: `Implements the approved task.\n\n<!-- ${marker} -->\n`,
           head: { ref: "ot/issue-1", sha, repo: { full_name: "o/r" } },
           base: { ref: "main" },
         }]);
@@ -341,6 +345,44 @@ describe("GitHub kernel client", () => {
         ownershipMarker: marker,
       },
     )).resolves.toEqual({ sha, url: "https://github.com/o/r/pull/7" });
+  });
+
+  it.each([
+    ["title", { title: "changed", body: null }],
+    ["body", { title: null, body: "changed" }],
+    ["marker-only body", { title: null, body: "marker" }],
+  ])("does not adopt a task-branch pull request with changed immutable %s", async (_label, drift) => {
+    const sha = "b".repeat(40);
+    const marker = "openthrottle:publish:pipeline-1:attempt-1";
+    const fetchMock = vi.fn(async (request: string | URL | Request) => {
+      const url = String(request);
+      if (url.endsWith("/git/ref/heads%2Fot%2Fissue-1")) {
+        return Response.json({ object: { sha } });
+      }
+      return Response.json([{
+        number: 7,
+        html_url: "https://github.com/o/r/pull/7",
+        title: drift.title ?? "fix: complete OPE-187",
+        body: drift.body === "marker"
+          ? `<!-- ${marker} -->`
+          : drift.body ?? `Implements the approved task.\n\n<!-- ${marker} -->\n`,
+        head: { ref: "ot/issue-1", sha, repo: { full_name: "o/r" } },
+        base: { ref: "main" },
+      }]);
+    }) as unknown as typeof fetch;
+
+    await expect(publishRepositoryTaskBranch(
+      { token: "github", fetch: fetchMock },
+      {
+        repository: "o/r",
+        branch: "ot/issue-1",
+        baseBranch: "main",
+        expectedHeadSha: sha,
+        title: "fix: complete OPE-187",
+        body: "Implements the approved task.",
+        ownershipMarker: marker,
+      },
+    )).rejects.toMatchObject({ name: "RepositoryRefConflictError", retryable: false });
   });
 
   it("reads raw definition bytes only from the exact commit's .openthrottle tree", async () => {

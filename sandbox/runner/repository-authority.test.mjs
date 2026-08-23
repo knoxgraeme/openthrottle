@@ -40,8 +40,16 @@ describe("repository authority", () => {
       "--ignore-user-config",
       "--ignore-rules",
       "-c", 'web_search="disabled"',
-      "-c", "use_legacy_landlock=true",
+      "--disable", "apps",
+      "--disable", "browser_use",
+      "--disable", "in_app_browser",
+      "--disable", "multi_agent",
+      "--disable", "plugins",
+      "--disable", "remote_plugin",
+      "--disable", "image_generation",
     ]);
+    expect(inspectPolicyArgs("codex", "/var/lib/openthrottle/actions/a/repository"))
+      .not.toContain("use_legacy_landlock=true");
     expect(() => inspectPolicyArgs("claude", "/sealed/repository", {
       readablePaths: ["/"],
     })).toThrow("cannot be safely scoped");

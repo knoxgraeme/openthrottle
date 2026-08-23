@@ -41,7 +41,11 @@ import {
   parseKernelSessionEvent,
   type KernelCheckpointArtifactDescriptor,
 } from "../../runtime/kernel-wire.js";
-import { inspectKernelCheckpointBundle } from "../../runtime/kernel-checkpoint-bundle.js";
+import {
+  KERNEL_INTEGRATION_ANCESTRY_MAX_ENTRIES,
+  inspectKernelCheckpointBundle,
+  inspectKernelIntegrationBundle,
+} from "../../runtime/kernel-checkpoint-bundle.js";
 import {
   assertDaytonaRepositorySourceFence,
   DAYTONA_REPOSITORY_ROOT,
@@ -59,8 +63,32 @@ const AGENT_STATE_ROOT = "/home/agent/.ot";
 const STEERING_INBOX_DIR = `${AGENT_STATE_ROOT}/inbox`;
 const KERNEL_STEERING_DELIVERY_SCHEMA = "openthrottle.kernel-steering/v1" as const;
 const KERNEL_STEERING_DELIVERY_MAX_BYTES = 64 * 1024;
+const KERNEL_INTEGRATION_SEALED_BUNDLES_MAX_BYTES = KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES;
 const ACTIVE_AUTOSTOP_MINUTES = 60;
 const DISPATCH_LOCK_CONTENTION_EXIT_CODE = 75;
+const DAYTONA_EXECUTOR_GIT = [
+  "env",
+  ...[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_WORK_TREE",
+  ].flatMap((name) => ["-u", name]),
+  "GIT_CONFIG_GLOBAL=/dev/null",
+  "GIT_CONFIG_NOSYSTEM=1",
+  "GIT_CONFIG_COUNT=0",
+  "GIT_NO_REPLACE_OBJECTS=1",
+  "GIT_TERMINAL_PROMPT=0",
+  "git",
+].join(" ");
 const MODEL_CREDENTIALS = [
   "CLAUDE_CODE_OAUTH_TOKEN",
   "CODEX_AUTH_JSON",
@@ -103,12 +131,22 @@ interface DaytonaIntegrationPayload {
   pipeline_run_id: string;
   attempt_id: string;
   definition_bundle_hash: string;
+  checkpoint_base_subject: string;
   current_subject: string;
   candidate_checkpoint_id: string;
   candidate_input_subject: string;
   candidate_output_subject: string;
   candidate_blob: BlobPointer;
   candidate_artifact: KernelCheckpointArtifactDescriptor;
+  current_ancestry: readonly DaytonaIntegrationAncestryEntry[];
+}
+
+interface DaytonaIntegrationAncestryEntry {
+  checkpoint_id: string;
+  input_subject: string;
+  output_subject: string;
+  checkpoint_blob: BlobPointer;
+  checkpoint_artifact: KernelCheckpointArtifactDescriptor;
 }
 
 interface DaytonaIntegrationResult {
@@ -206,13 +244,20 @@ function notFound(error: unknown): boolean {
 function inspectCheckpointBundle(
   bytes: Uint8Array,
   descriptor: KernelCheckpointArtifactDescriptor,
+  shallowBoundary: string | null,
+  expectedParent: string | null,
 ): { ref: string; commit: string; tree: string } {
   const inspected = inspectKernelCheckpointBundle({
     bytes,
     expected_commit: descriptor.commit,
+    expected_tree: descriptor.tree,
+    ...(shallowBoundary === null ? {} : { shallow_boundary: shallowBoundary }),
+    ...(expectedParent === null || descriptor.commit === expectedParent
+      ? {}
+      : { expected_parent: expectedParent }),
     allowed_ref: /^refs\/openthrottle\/(?:checkpoints|integrations)\/[a-f0-9]{64}$/,
   });
-  if (inspected.ref !== descriptor.ref || inspected.tree !== descriptor.tree) {
+  if (inspected.ref !== descriptor.ref) {
     throw new Error("checkpoint bundle commit does not contain its sealed ref or accepted tree");
   }
   return inspected;
@@ -226,8 +271,8 @@ function integrationPayload(intent: Readonly<EffectIntent>): DaytonaIntegrationP
   }).value;
   const expectedKeys = [
     "candidate_artifact", "candidate_blob", "candidate_checkpoint_id",
-    "candidate_input_subject", "candidate_output_subject", "current_subject",
-    "definition_bundle_hash", "identity", "pipeline_run_id", "schema", "attempt_id",
+    "candidate_input_subject", "candidate_output_subject", "checkpoint_base_subject", "current_subject",
+    "current_ancestry", "definition_bundle_hash", "identity", "pipeline_run_id", "schema", "attempt_id",
   ].sort();
   if (
     Object.keys(value).sort().join("\0") !== expectedKeys.join("\0") ||
@@ -236,6 +281,7 @@ function integrationPayload(intent: Readonly<EffectIntent>): DaytonaIntegrationP
     value.pipeline_run_id !== intent.pipeline_run_id ||
     typeof value.attempt_id !== "string" || !SAFE_PATH_ID.test(value.attempt_id) ||
     typeof value.definition_bundle_hash !== "string" || !/^[a-f0-9]{64}$/.test(value.definition_bundle_hash) ||
+    typeof value.checkpoint_base_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(value.checkpoint_base_subject) ||
     typeof value.current_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(value.current_subject) ||
     typeof value.candidate_checkpoint_id !== "string" || !SAFE_PATH_ID.test(value.candidate_checkpoint_id) ||
     typeof value.candidate_input_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(value.candidate_input_subject) ||
@@ -243,17 +289,85 @@ function integrationPayload(intent: Readonly<EffectIntent>): DaytonaIntegrationP
     artifact.media_type !== "application/x-git-bundle" ||
     artifact.payload_schema !== "openthrottle.git-checkpoint-bundle/v1" ||
     artifact.sha256 !== pointer.digest || artifact.bytes !== pointer.bytes ||
+    pointer.bytes > KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES ||
     artifact.commit !== value.candidate_output_subject ||
     typeof artifact.file !== "string" || !SAFE_PATH_ID.test(artifact.file) ||
-    typeof artifact.ref !== "string" || !/^refs\/openthrottle\/checkpoints\/[a-f0-9]{64}$/.test(artifact.ref) ||
+    typeof artifact.ref !== "string" ||
+    !/^refs\/openthrottle\/(?:checkpoints|integrations)\/[a-f0-9]{64}$/.test(artifact.ref) ||
     typeof artifact.tree !== "string" || !/^[a-f0-9]{40,64}$/.test(artifact.tree) ||
     pointer.encoding !== "binary" || pointer.media_type !== "application/x-git-bundle" ||
     pointer.payload_schema !== "openthrottle.git-checkpoint-bundle/v1"
   ) throw new Error(`effect ${intent.id} has invalid Daytona integration authority`);
+  if (
+    !Array.isArray(value.current_ancestry) ||
+    value.current_ancestry.length > KERNEL_INTEGRATION_ANCESTRY_MAX_ENTRIES
+  ) throw new Error(`effect ${intent.id} has invalid bounded current ancestry authority`);
+  const currentAncestry: DaytonaIntegrationAncestryEntry[] = [];
+  const checkpointIds = new Set<string>();
+  const refs = new Set<string>();
+  const commits = new Set<string>();
+  let aggregateBundleBytes = pointer.bytes;
+  let ancestrySubject = value.candidate_input_subject as string;
+  for (const [index, candidate] of value.current_ancestry.entries()) {
+    const edge = object(candidate, `integration current_ancestry[${index}]`);
+    const edgeKeys = [
+      "checkpoint_artifact", "checkpoint_blob", "checkpoint_id", "input_subject", "output_subject",
+    ].sort();
+    const edgeArtifact = object(
+      edge.checkpoint_artifact,
+      `integration current_ancestry[${index}].checkpoint_artifact`,
+    );
+    const artifactKeys = [
+      "bytes", "commit", "file", "media_type", "payload_schema", "ref", "sha256", "tree",
+    ].sort();
+    const edgePointer = validateBlobPointer(edge.checkpoint_blob, {
+      source: `integration.current_ancestry[${index}].checkpoint_blob`,
+    }).value;
+    if (
+      Object.keys(edge).sort().join("\0") !== edgeKeys.join("\0") ||
+      Object.keys(edgeArtifact).sort().join("\0") !== artifactKeys.join("\0") ||
+      typeof edge.checkpoint_id !== "string" || !SAFE_PATH_ID.test(edge.checkpoint_id) ||
+      typeof edge.input_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(edge.input_subject) ||
+      typeof edge.output_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(edge.output_subject) ||
+      edge.input_subject !== ancestrySubject || edge.output_subject === edge.input_subject ||
+      edgeArtifact.media_type !== "application/x-git-bundle" ||
+      edgeArtifact.payload_schema !== "openthrottle.git-checkpoint-bundle/v1" ||
+      edgeArtifact.sha256 !== edgePointer.digest || edgeArtifact.bytes !== edgePointer.bytes ||
+      edgePointer.bytes > KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES ||
+      edgeArtifact.commit !== edge.output_subject ||
+      typeof edgeArtifact.file !== "string" || !SAFE_PATH_ID.test(edgeArtifact.file) ||
+      typeof edgeArtifact.ref !== "string" ||
+      !/^refs\/openthrottle\/integrations\/[a-f0-9]{64}$/.test(edgeArtifact.ref) ||
+      typeof edgeArtifact.tree !== "string" || !/^[a-f0-9]{40,64}$/.test(edgeArtifact.tree) ||
+      edgePointer.encoding !== "binary" ||
+      edgePointer.media_type !== "application/x-git-bundle" ||
+      edgePointer.payload_schema !== "openthrottle.git-checkpoint-bundle/v1" ||
+      checkpointIds.has(edge.checkpoint_id) || refs.has(edgeArtifact.ref) || commits.has(edgeArtifact.commit)
+    ) throw new Error(`effect ${intent.id} has invalid exact current ancestry entry`);
+    if (aggregateBundleBytes > KERNEL_INTEGRATION_SEALED_BUNDLES_MAX_BYTES - edgePointer.bytes) {
+      throw new Error(`effect ${intent.id} exceeds the aggregate sealed bundle byte ceiling`);
+    }
+    aggregateBundleBytes += edgePointer.bytes;
+    checkpointIds.add(edge.checkpoint_id);
+    refs.add(edgeArtifact.ref);
+    commits.add(edgeArtifact.commit as string);
+    ancestrySubject = edge.output_subject;
+    currentAncestry.push({
+      checkpoint_id: edge.checkpoint_id,
+      input_subject: edge.input_subject,
+      output_subject: edge.output_subject,
+      checkpoint_blob: edgePointer,
+      checkpoint_artifact: edgeArtifact as unknown as KernelCheckpointArtifactDescriptor,
+    });
+  }
+  if (currentAncestry.length > 0 && ancestrySubject !== value.current_subject) {
+    throw new Error(`effect ${intent.id} current ancestry does not end at its sealed current subject`);
+  }
   return {
     ...(value as unknown as DaytonaIntegrationPayload),
     candidate_blob: pointer,
     candidate_artifact: artifact as unknown as KernelCheckpointArtifactDescriptor,
+    current_ancestry: currentAncestry,
   };
 }
 
@@ -903,6 +1017,11 @@ export class DaytonaKernelAdapter implements
     const pointer = boundary.payload.blob;
     const bytes = this.#options.blob_store.read(pointer);
     const bundlePath = `${inputDirectory}/context-${pointer.digest}.bundle`;
+    if (typeof boundary.input_subject !== "string" || !/^[a-f0-9]{40,64}$/.test(boundary.input_subject)) {
+      throw new Error("Daytona input checkpoint has no exact shallow boundary");
+    }
+    const shallowPath = `${inputDirectory}/context-${pointer.digest}.shallow`;
+    const shallowBytes = Buffer.from(`${boundary.input_subject}\n`);
     const existing = await downloadBytes(sandbox, bundlePath);
     if (existing === null) {
       await sandbox.fs.uploadFile(bytes, bundlePath);
@@ -913,10 +1032,21 @@ export class DaytonaKernelAdapter implements
     ) {
       throw new Error("Daytona input checkpoint path contains different immutable bytes");
     }
+    const existingShallow = await downloadBytes(sandbox, shallowPath);
+    if (existingShallow === null) {
+      await sandbox.fs.uploadFile(shallowBytes, shallowPath);
+      await sandbox.fs.setFilePermissions(shallowPath, { owner: "root", group: "root", mode: "400" });
+    } else if (!existingShallow.equals(shallowBytes)) {
+      throw new Error("Daytona input checkpoint shallow path contains different immutable bytes");
+    }
+    const gitEnvironment = {
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_SHALLOW_FILE: shallowPath,
+    };
     const listed = await sandbox.process.executeCommand(
-      `git bundle list-heads ${shellQuote(bundlePath)}`,
+      `${DAYTONA_EXECUTOR_GIT} bundle list-heads ${shellQuote(bundlePath)}`,
       DAYTONA_REPOSITORY_ROOT,
-      { GIT_TERMINAL_PROMPT: "0" },
+      gitEnvironment,
       120,
     );
     if (listed.exitCode !== 0) {
@@ -929,19 +1059,28 @@ export class DaytonaKernelAdapter implements
       extra.length !== 0 || commit !== request.input_subject || !ref ||
       !/^refs\/openthrottle\/(?:checkpoints|integrations)\/[a-f0-9]{64}$/.test(ref)
     ) throw new Error("input checkpoint bundle does not bind the exact successor subject");
-    const imported = await sandbox.process.executeCommand(
-      `git fetch --quiet --no-tags ${shellQuote(bundlePath)} ${shellQuote(ref)}`,
+    const bundleVerified = await sandbox.process.executeCommand(
+      `${DAYTONA_EXECUTOR_GIT} bundle verify ${shellQuote(bundlePath)}`,
       DAYTONA_REPOSITORY_ROOT,
-      { GIT_TERMINAL_PROMPT: "0" },
+      gitEnvironment,
+      120,
+    );
+    if (bundleVerified.exitCode !== 0) {
+      throw new Error("Daytona could not verify the bounded input checkpoint bundle");
+    }
+    const imported = await sandbox.process.executeCommand(
+      `${DAYTONA_EXECUTOR_GIT} fetch --quiet --no-tags ${shellQuote(bundlePath)} ${shellQuote(ref)}`,
+      DAYTONA_REPOSITORY_ROOT,
+      gitEnvironment,
       120,
     );
     if (imported.exitCode !== 0) {
       throw new Error("Daytona could not import the exact successor checkpoint");
     }
     const verified = await sandbox.process.executeCommand(
-      `git cat-file -e ${shellQuote(`${request.input_subject}^{commit}`)}`,
+      `${DAYTONA_EXECUTOR_GIT} cat-file -e ${shellQuote(`${request.input_subject}^{commit}`)}`,
       DAYTONA_REPOSITORY_ROOT,
-      { GIT_TERMINAL_PROMPT: "0" },
+      gitEnvironment,
       120,
     );
     if (verified.exitCode !== 0) {
@@ -961,7 +1100,16 @@ export class DaytonaKernelAdapter implements
       bytes.byteLength > KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES ||
       createHash("sha256").update(bytes).digest("hex") !== descriptor.sha256
     ) throw new Error(`checkpoint artifact for ${request.attempt_id} failed its sealed descriptor`);
-    inspectCheckpointBundle(bytes, descriptor);
+    inspectCheckpointBundle(
+      bytes,
+      descriptor,
+      request.repository_authority === "edit" ? request.checkpoint_base_subject : null,
+      request.repository_authority === "edit" ? request.input_subject : null,
+    );
+    if (
+      descriptor.ref.startsWith("refs/openthrottle/checkpoints/") &&
+      descriptor.ref !== `refs/openthrottle/checkpoints/${request.request_hash}`
+    ) throw new Error(`checkpoint artifact for ${request.attempt_id} changed its exact request ref`);
     return this.#options.blob_store.put({
       bytes,
       encoding: "binary",
@@ -1028,7 +1176,25 @@ export class DaytonaKernelAdapter implements
       bytes.byteLength !== descriptor.bytes ||
       createHash("sha256").update(bytes).digest("hex") !== descriptor.sha256
     ) throw new Error("integrated checkpoint artifact failed its exact sealed descriptor");
-    inspectCheckpointBundle(bytes, descriptor);
+    const candidateBytes = this.#options.blob_store.read(authority.candidate_blob);
+    const currentAncestry = authority.current_ancestry.map((edge) => ({
+      checkpoint_id: edge.checkpoint_id,
+      bytes: this.#options.blob_store.read(edge.checkpoint_blob),
+      descriptor: edge.checkpoint_artifact,
+      input_subject: edge.input_subject,
+      output_subject: edge.output_subject,
+    }));
+    inspectKernelIntegrationBundle({
+      bytes,
+      descriptor,
+      checkpoint_base_subject: authority.checkpoint_base_subject,
+      current_subject: authority.current_subject,
+      candidate_bytes: candidateBytes,
+      candidate_descriptor: authority.candidate_artifact,
+      candidate_input_subject: authority.candidate_input_subject,
+      candidate_output_subject: authority.candidate_output_subject,
+      current_ancestry: currentAncestry,
+    });
     const checkpointBlob = this.#options.blob_store.put({
       bytes,
       encoding: "binary",
@@ -1088,7 +1254,12 @@ export class DaytonaKernelAdapter implements
       });
     }
     const candidateBytes = this.#options.blob_store.read(authority.candidate_blob);
-    inspectCheckpointBundle(candidateBytes, authority.candidate_artifact);
+    inspectCheckpointBundle(
+      candidateBytes,
+      authority.candidate_artifact,
+      authority.checkpoint_base_subject,
+      authority.candidate_input_subject,
+    );
     const artifactPath = `${paths.input_directory}/${authority.candidate_artifact.file}`;
     const existingArtifact = await downloadBytes(sandbox, artifactPath);
     if (existingArtifact === null) {
@@ -1107,6 +1278,7 @@ export class DaytonaKernelAdapter implements
       lease_id: dispatchFence.lease_id,
       worker_id: dispatchFence.worker_id,
       definition_bundle_hash: authority.definition_bundle_hash,
+      checkpoint_base_subject: authority.checkpoint_base_subject,
       current_subject: authority.current_subject,
       candidate_checkpoint_id: authority.candidate_checkpoint_id,
       candidate_input_subject: authority.candidate_input_subject,

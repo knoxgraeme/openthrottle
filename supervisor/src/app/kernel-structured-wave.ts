@@ -221,9 +221,19 @@ export function structuredSuccessorCheckpoints(
   evidence: StructuredWaveEvidence,
 ): AttemptCheckpoint[] {
   const successorSubject = evidence.attempt.output_subject ?? evidence.attempt.input_subject;
-  const candidates = [...evidence.request_inputs.context.checkpoints.values()]
+  const inherited = [...evidence.request_inputs.context.checkpoints.values()]
     .filter((checkpoint) => checkpoint.output_subject === successorSubject);
-  if (evidence.attempt.output_subject !== null) candidates.unshift(evidence.checkpoint);
+  let candidates: AttemptCheckpoint[];
+  if (
+    evidence.attempt.output_subject !== null &&
+    evidence.attempt.output_subject !== evidence.attempt.input_subject
+  ) {
+    candidates = [evidence.checkpoint];
+  } else if (evidence.attempt.output_subject === evidence.attempt.input_subject) {
+    candidates = inherited.length === 0 ? [evidence.checkpoint] : inherited;
+  } else {
+    candidates = inherited;
+  }
   const exact = [...new Map(candidates.map((checkpoint) => [checkpoint.id, checkpoint])).values()];
   if (exact.length > 1) {
     throw new Error(

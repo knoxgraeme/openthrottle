@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       git \
       curl \
       bats \
+      bubblewrap \
       ca-certificates \
       gnupg \
       jq \
@@ -49,12 +50,13 @@ RUN corepack enable
 # Coding agent CLIs. Pin the versions whose flags and stage contracts are
 # covered by the smoke and runner tests; upgrade deliberately with those tests.
 ARG CLAUDE_CODE_VERSION=2.1.201
-ARG CODEX_VERSION=0.144.0
+ARG CODEX_VERSION=0.149.0
 ARG OPENCODE_VERSION=1.18.3
 RUN npm install -g \
       "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
       "@openai/codex@${CODEX_VERSION}" \
       "opencode-ai@${OPENCODE_VERSION}" \
+    && test "$(codex --version)" = "codex-cli ${CODEX_VERSION}" \
     && npm cache clean --force
 
 # ---------------------------------------------------------------------------

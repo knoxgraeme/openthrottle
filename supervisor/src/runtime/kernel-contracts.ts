@@ -74,6 +74,8 @@ export interface KernelWorkActionRequest {
   scope: KernelAttempt["scope"];
   request_hash: string;
   definition_bundle_hash: string;
+  /** Stable remotely-known run base; checkpoint bundles exclude only history before this subject. */
+  checkpoint_base_subject: string;
   input_subject: string;
   repository_authority: KernelAttempt["repository_authority"];
   lease_id: string;
@@ -103,6 +105,7 @@ export interface KernelResultCorrectionRequest {
   scope: KernelAttempt["scope"];
   request_hash: string;
   definition_bundle_hash: string;
+  checkpoint_base_subject: string;
   input_subject: string;
   /** The immutable subject produced by work, or the inspected input subject. */
   locked_subject: string;

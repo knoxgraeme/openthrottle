@@ -158,7 +158,7 @@ describe("kernel external stage plan registry", () => {
       "core/integrate-unit@1", "core/provider-wait@1", "core/publish@1",
     ]);
     expect(registry.bindingFor(externalStages[0]!).phases.map(({ id }) => id)).toEqual([
-      "push-checkpoint", "pull-request",
+      "integrate-checkpoint", "push-checkpoint", "pull-request",
     ]);
     expect(registry.bindingFor(externalStages[1]!).subject_policy).toBe("advance");
     expect(registry.bindingFor(externalStages[2]!).phases).toEqual([
@@ -193,7 +193,7 @@ describe("kernel external stage plan registry", () => {
   it("rejects prepared subject-policy and phase-shape drift", async () => {
     const publish = plan("core/publish@1", async () => preparedFor({
       external_kind: "core/publish@1",
-      output_subject: OUTPUT,
+      output_subject: SUBJECT,
     }));
     const registry = createKernelExternalStagePlanRegistry({
       effects: primitiveRegistry(),

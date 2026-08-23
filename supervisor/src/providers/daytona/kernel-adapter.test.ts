@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
-import type { DeliveryRecord } from "@openthrottle/contracts";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { DeliveryRecord, EffectIntent } from "@openthrottle/contracts";
 import { describe, expect, it, vi } from "vitest";
 import {
   KERNEL_ACTION_REQUEST_SCHEMA,
@@ -8,6 +11,7 @@ import {
   type KernelResultCorrectionRequest,
   type KernelWorkActionRequest,
 } from "../../runtime/kernel-contracts.js";
+import { KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES } from "../../runtime/kernel-wire.js";
 import {
   authorizeKernelSteeringDelivery,
   createKernelSteeringEnvelope,
@@ -35,6 +39,7 @@ function workRequest(overrides: Record<string, unknown> = {}): KernelWorkActionR
     scope: { kind: "stage", stage_id: "stage-1" },
     request_hash: "a".repeat(64),
     definition_bundle_hash: "b".repeat(64),
+    checkpoint_base_subject: "c".repeat(40),
     input_subject: "c".repeat(40),
     repository_authority: "inspect",
     lease_id: "lease-1",
@@ -77,6 +82,7 @@ function correctionRequest(overrides: Record<string, unknown> = {}): KernelResul
     scope: { kind: "stage", stage_id: "stage-1" },
     request_hash: "a".repeat(64),
     definition_bundle_hash: "b".repeat(64),
+    checkpoint_base_subject: "c".repeat(40),
     input_subject: "c".repeat(40),
     locked_subject: "c".repeat(40),
     completed_work_authority: "inspect",
@@ -222,6 +228,7 @@ function adapterFor(
 ) {
   return new DaytonaKernelAdapter({
     get: vi.fn().mockResolvedValue(sandbox),
+    list: vi.fn(() => (async function* () { yield sandbox; })()),
   } as never, {
     snapshot: "snapshot-1",
     github_read_token: "github-token",
@@ -258,6 +265,221 @@ function runtimeResult(request: KernelWorkActionRequest): Buffer {
   }));
 }
 
+function selfContainedCheckpointBundle(requestHash: string) {
+  const root = mkdtempSync(join(tmpdir(), "ot-daytona-inspect-checkpoint-"));
+  const repository = join(root, "repository");
+  const bundle = join(root, "checkpoint.bundle");
+  try {
+    execFileSync("git", ["init", "--quiet", "--initial-branch=main", repository]);
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: repository });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repository });
+    writeFileSync(join(repository, "evidence.txt"), "self-contained evidence\n");
+    execFileSync("git", ["add", "."], { cwd: repository });
+    execFileSync("git", ["commit", "--quiet", "-m", "synthetic evidence"], { cwd: repository });
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+    const tree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+    const ref = `refs/openthrottle/checkpoints/${requestHash}`;
+    execFileSync("git", ["update-ref", ref, commit], { cwd: repository });
+    execFileSync("git", ["bundle", "create", bundle, ref], { cwd: repository });
+    const bytes = readFileSync(bundle);
+    return {
+      bytes,
+      descriptor: {
+        file: "checkpoint.bundle",
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        bytes: bytes.byteLength,
+        media_type: "application/x-git-bundle",
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+        ref,
+        commit,
+        tree,
+      },
+    } as const;
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function integrationProofFromIdentity(
+  candidate: ReturnType<typeof selfContainedCheckpointBundle>,
+) {
+  const root = mkdtempSync(join(tmpdir(), "ot-daytona-integration-proof-"));
+  const repository = join(root, "repository");
+  const candidatePath = join(root, "candidate.bundle");
+  const proofPath = join(root, "proof.bundle");
+  try {
+    execFileSync("git", ["init", "--quiet", "--initial-branch=main", repository]);
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: repository });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repository });
+    writeFileSync(candidatePath, candidate.bytes);
+    execFileSync("git", ["fetch", "--quiet", candidatePath, candidate.descriptor.ref], {
+      cwd: repository,
+    });
+    const commit = execFileSync("git", [
+      "commit-tree", candidate.descriptor.tree,
+      "-p", candidate.descriptor.commit,
+      "-m", "current integration proof",
+    ], { cwd: repository, encoding: "utf8" }).trim();
+    const ref = `refs/openthrottle/integrations/${"9".repeat(64)}`;
+    execFileSync("git", ["update-ref", ref, commit], { cwd: repository });
+    writeFileSync(join(repository, ".git", "shallow"), `${candidate.descriptor.commit}\n`);
+    execFileSync("git", ["bundle", "create", proofPath, ref], { cwd: repository });
+    const bytes = readFileSync(proofPath);
+    return {
+      bytes,
+      pointer: {
+        algorithm: "sha256",
+        digest: createHash("sha256").update(bytes).digest("hex"),
+        bytes: bytes.byteLength,
+        encoding: "binary",
+        media_type: "application/x-git-bundle",
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+      } as const,
+      descriptor: {
+        file: "proof.bundle",
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        bytes: bytes.byteLength,
+        media_type: "application/x-git-bundle",
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+        ref,
+        commit,
+        tree: candidate.descriptor.tree,
+      } as const,
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function integrationIntentWithSealedBundleSizes(input: {
+  candidate_bytes: number;
+  ancestry_bytes: number;
+}): EffectIntent {
+  const candidateInput = "1".repeat(40);
+  const ancestryOutput = "2".repeat(40);
+  const candidateDigest = "3".repeat(64);
+  const ancestryDigest = "4".repeat(64);
+  const pointer = (digest: string, bytes: number) => ({
+    algorithm: "sha256",
+    digest,
+    bytes,
+    encoding: "binary",
+    media_type: "application/x-git-bundle",
+    payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+  } as const);
+  const candidatePointer = pointer(candidateDigest, input.candidate_bytes);
+  const ancestryPointer = pointer(ancestryDigest, input.ancestry_bytes);
+  return {
+    schema: "openthrottle.effect-intent/v1",
+    id: "effect-integration-budget",
+    pipeline_run_id: "run-1",
+    decision_record_id: "decision-integration-budget",
+    kind: "daytona/integrate-checkpoint@1",
+    idempotency_key: "run-1:integrate:checkpoint-budget",
+    target: `daytona:${"d".repeat(64)}:integration:checkpoint-budget`,
+    subject: null,
+    payload: {
+      schema: "openthrottle.daytona-integration/v1",
+      identity: "d".repeat(64),
+      pipeline_run_id: "run-1",
+      attempt_id: "attempt-integration-budget",
+      definition_bundle_hash: "b".repeat(64),
+      checkpoint_base_subject: candidateInput,
+      current_subject: ancestryOutput,
+      candidate_checkpoint_id: "checkpoint-candidate",
+      candidate_input_subject: candidateInput,
+      candidate_output_subject: candidateInput,
+      candidate_blob: candidatePointer,
+      candidate_artifact: {
+        file: "candidate.bundle",
+        sha256: candidateDigest,
+        bytes: input.candidate_bytes,
+        media_type: "application/x-git-bundle",
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+        ref: `refs/openthrottle/checkpoints/${candidateDigest}`,
+        commit: candidateInput,
+        tree: "5".repeat(40),
+      },
+      current_ancestry: [{
+        checkpoint_id: "checkpoint-ancestry",
+        input_subject: candidateInput,
+        output_subject: ancestryOutput,
+        checkpoint_blob: ancestryPointer,
+        checkpoint_artifact: {
+          file: "ancestry.bundle",
+          sha256: ancestryDigest,
+          bytes: input.ancestry_bytes,
+          media_type: "application/x-git-bundle",
+          payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+          ref: `refs/openthrottle/integrations/${ancestryDigest}`,
+          commit: ancestryOutput,
+          tree: "6".repeat(40),
+        },
+      }],
+    },
+  };
+}
+
+function checkpointWire(
+  request: KernelWorkActionRequest,
+  descriptor: ReturnType<typeof selfContainedCheckpointBundle>["descriptor"],
+  nativeSessionId: string | null,
+) {
+  return {
+    schema: "openthrottle.attempt-checkpoint-wire/v1",
+    id: `checkpoint:${request.request_hash.slice(0, 32)}`,
+    pipeline_run_id: request.pipeline_run_id,
+    attempt_id: request.attempt_id,
+    request_hash: request.request_hash,
+    definition_bundle_hash: request.definition_bundle_hash,
+    input_subject: request.input_subject,
+    output_subject: null,
+    native_session_id: nativeSessionId,
+    payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+    payload_artifact: descriptor,
+    captured_at: "2026-08-20T12:00:00.000Z",
+  };
+}
+
+function checkpointRuntimeResult(
+  request: KernelWorkActionRequest,
+  checkpoint: ReturnType<typeof checkpointWire>,
+  state: "command" | "inspect",
+): Buffer {
+  return Buffer.from(JSON.stringify({
+    schema: "openthrottle.kernel-runtime-result/v1",
+    pipeline_run_id: request.pipeline_run_id,
+    attempt_id: request.attempt_id,
+    request_hash: request.request_hash,
+    definition_bundle_hash: request.definition_bundle_hash,
+    lease_id: request.lease_id,
+    worker_id: request.worker_id,
+    outcome: state === "command" ? {
+      state: "work_complete",
+      checkpoint,
+      result: {
+        kind: "command",
+        outcome: "success",
+        command_id: "command-1",
+        exit_code: 0,
+        summary: "command completed",
+      },
+    } : {
+      state: "result_pending",
+      checkpoint,
+      candidate_hash: null,
+      diagnostics: [{ path: "/payload", detail: "result needs correction" }],
+      correction_deadline: "2099-08-20T12:15:00.000Z",
+    },
+  }));
+}
+
 function sessionEvent(request: KernelWorkActionRequest): Buffer {
   return Buffer.from(JSON.stringify({
     schema: "openthrottle.kernel-session-event/v1",
@@ -273,6 +495,59 @@ function sessionEvent(request: KernelWorkActionRequest): Buffer {
 }
 
 describe("DaytonaKernelAdapter", () => {
+  it.each(["command", "inspect"] as const)(
+    "ingests a self-contained output-null %s checkpoint without imposing the request input as its parent",
+    async (kind) => {
+      const request = workRequest(kind === "inspect" ? {
+        action: {
+          kind: "agent",
+          engine: "codex",
+          model: null,
+          reasoning_effort: null,
+          agent_id: "agent-1",
+          skill_ids: [],
+          entry_skill: null,
+          eval_id: "eval-1",
+          semantic_result_schema: { id: "result-schema", schema: {} },
+          execution_limits: { max_turns: null, task_timeout_seconds: 60 },
+          definition_entries: [],
+        },
+      } : {});
+      const artifact = selfContainedCheckpointBundle(request.request_hash);
+      const nativeSessionId = kind === "inspect" ? "native-session-1" : null;
+      const checkpoint = checkpointWire(request, artifact.descriptor, nativeSessionId);
+      const resultPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/result.json";
+      const sessionPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/session.json";
+      const artifactPath = `/var/lib/openthrottle/action-results/attempt-1/work-lease-1/${artifact.descriptor.file}`;
+      const sandbox = sandboxWith(async (path) => {
+        if (path === resultPath) return checkpointRuntimeResult(request, checkpoint, kind);
+        if (path === sessionPath && kind === "inspect") return sessionEvent(request);
+        if (path === artifactPath) return artifact.bytes;
+        throw new Error("404 not found");
+      });
+      const pointer = {
+        algorithm: "sha256",
+        digest: artifact.descriptor.sha256,
+        bytes: artifact.descriptor.bytes,
+        encoding: "binary",
+        media_type: "application/x-git-bundle",
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+      } as const;
+      const put = vi.fn().mockReturnValue({ pointer });
+
+      await expect(adapterFor(sandbox, { put }).executeWork(request, {
+        lease_generation: 0,
+        heartbeat_interval_ms: 10,
+        on_heartbeat: vi.fn().mockResolvedValue(undefined),
+        on_session: vi.fn().mockResolvedValue(undefined),
+      })).resolves.toMatchObject({
+        state: kind === "command" ? "work_complete" : "result_pending",
+        checkpoint: { input_subject: request.input_subject, output_subject: null },
+      });
+      expect(put).toHaveBeenCalledOnce();
+    },
+  );
+
   it("materializes and verifies the exact initial Git subject before launching work", async () => {
     const request = workRequest();
     const stop = new Error("stop after repository materialization");
@@ -450,7 +725,7 @@ describe("DaytonaKernelAdapter", () => {
     expect(onHeartbeat).toHaveBeenCalledOnce();
   });
 
-  it("verifies a replayed input checkpoint from one binary download", async () => {
+  it("materializes a later integration checkpoint at its exact immediate parent", async () => {
     const bytes = Buffer.from("existing checkpoint bytes");
     const digest = createHash("sha256").update(bytes).digest("hex");
     const pointer = {
@@ -462,21 +737,25 @@ describe("DaytonaKernelAdapter", () => {
       payload_schema: "openthrottle.git-checkpoint-bundle/v1",
     } as const;
     const request = workRequest({
+      checkpoint_base_subject: "a".repeat(40),
       context: {
         records: [],
         checkpoints: [{
+          input_subject: "b".repeat(40),
           output_subject: "c".repeat(40),
           payload: { blob: pointer },
         }],
       },
     });
     const bundlePath = `/var/lib/openthrottle/action-input/attempt-1/work-lease-1/context-${digest}.bundle`;
+    const shallowPath = `/var/lib/openthrottle/action-input/attempt-1/work-lease-1/context-${digest}.shallow`;
     const stop = new Error("stop after checkpoint materialization");
     const sandbox = sandboxWith(async (path) => {
       if (path.endsWith("/session.json") || path.endsWith("/result.json")) {
         throw new Error("404 not found");
       }
       if (path === bundlePath) return bytes;
+      if (path.endsWith(".shallow")) throw new Error("404 not found");
       if (path.endsWith("/request.json")) throw stop;
       throw new Error(`unexpected download ${path}`);
     });
@@ -484,7 +763,7 @@ describe("DaytonaKernelAdapter", () => {
       if (command.includes("lease-generation.lock")) return sandbox.defaultExecuteCommand(command);
       return {
         exitCode: 0,
-        result: command.startsWith("git bundle list-heads")
+        result: command.includes("git bundle list-heads")
           ? `${request.input_subject} refs/openthrottle/checkpoints/${digest}\n`
           : "",
       };
@@ -501,6 +780,20 @@ describe("DaytonaKernelAdapter", () => {
     expect(sandbox.fs.downloadFile.mock.calls.filter(([path]) => path === bundlePath))
       .toHaveLength(1);
     expect(sandbox.fs.uploadFile).not.toHaveBeenCalledWith(bytes, bundlePath);
+    expect(sandbox.files.get(shallowPath)?.toString("utf8")).toBe(`${"b".repeat(40)}\n`);
+    const gitCommands = sandbox.process.executeCommand.mock.calls as unknown as Array<[
+      string,
+      string?,
+      Record<string, string>?,
+    ]>;
+    expect(gitCommands.filter(
+      ([command, , environment]) =>
+        String(command).includes("git bundle verify") &&
+        String(command).startsWith("env -u GIT_ALTERNATE_OBJECT_DIRECTORIES") &&
+        String(command).includes("-u GIT_DIR") &&
+        String(command).includes("GIT_CONFIG_COUNT=0") &&
+        typeof environment?.GIT_SHALLOW_FILE === "string",
+    )).toHaveLength(1);
   });
 
   it("rejects a replaced source checkout before importing a checkpoint as executor", async () => {
@@ -510,6 +803,7 @@ describe("DaytonaKernelAdapter", () => {
       context: {
         records: [],
         checkpoints: [{
+          input_subject: "b".repeat(40),
           output_subject: "c".repeat(40),
           payload: { blob: {
             algorithm: "sha256",
@@ -532,7 +826,7 @@ describe("DaytonaKernelAdapter", () => {
       if (command.includes("/var/lib/openthrottle/repository-source")) {
         return { exitCode: 45, result: "" };
       }
-      if (command.startsWith("git bundle list-heads")) {
+      if (command.includes("git bundle list-heads")) {
         return {
           exitCode: 0,
           result: `${request.input_subject} refs/openthrottle/checkpoints/${digest}\n`,
@@ -548,8 +842,255 @@ describe("DaytonaKernelAdapter", () => {
       on_session: vi.fn(),
     })).rejects.toThrow("repository source physical fence is invalid");
     expect(sandbox.process.executeCommand.mock.calls.some(
-      ([command]) => String(command).startsWith("git bundle list-heads"),
+      ([command]) => String(command).includes("git bundle list-heads"),
     )).toBe(false);
+  });
+
+  it.each([
+    {
+      label: "candidate bundle above its individual ceiling",
+      candidate_bytes: KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES + 1,
+      ancestry_bytes: 1,
+      expected: /invalid Daytona integration authority/i,
+    },
+    {
+      label: "ancestry bundle above its individual ceiling",
+      candidate_bytes: 1,
+      ancestry_bytes: KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES + 1,
+      expected: /invalid exact current ancestry entry/i,
+    },
+    {
+      label: "aggregate sealed proof above its total ceiling",
+      candidate_bytes: KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES / 2,
+      ancestry_bytes: KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES / 2 + 1,
+      expected: /aggregate.*bundle.*byte ceiling/i,
+    },
+  ])("rejects a $label before BlobStore or provider access", async ({
+    candidate_bytes,
+    ancestry_bytes,
+    expected,
+  }) => {
+    const intent = integrationIntentWithSealedBundleSizes({ candidate_bytes, ancestry_bytes });
+    const sandbox = sandboxWith(async () => {
+      throw new Error("provider access must not happen for an oversized sealed integration proof");
+    });
+    const read = vi.fn(() => {
+      throw new Error("BlobStore access must not happen for an oversized sealed integration proof");
+    });
+    const adapter = adapterFor(sandbox, { read });
+    const binding = adapter.effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+
+    await expect(binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: null,
+    })).rejects.toThrow(expected);
+    expect(read).not.toHaveBeenCalled();
+    expect(sandbox.fs.downloadFile).not.toHaveBeenCalled();
+  });
+
+  it("accepts a normal sealed candidate and ancestry bundle budget", async () => {
+    const intent = integrationIntentWithSealedBundleSizes({
+      candidate_bytes: 1,
+      ancestry_bytes: KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES - 1,
+    });
+    const read = vi.fn();
+    const sandbox = sandboxWith(async () => {
+      throw new Error("provider access is not expected without a dispatch fence");
+    });
+    const adapter = adapterFor(sandbox, { read });
+    const binding = adapter.effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+
+    await expect(binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: null,
+    })).resolves.toEqual({ kind: "not_found" });
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("keeps current ancestry supervisor-only and rejects a forged integration before BlobStore put", async () => {
+    const candidate = selfContainedCheckpointBundle("a".repeat(64));
+    const proof = integrationProofFromIdentity(candidate);
+    const candidatePointer = {
+      algorithm: "sha256",
+      digest: candidate.descriptor.sha256,
+      bytes: candidate.descriptor.bytes,
+      encoding: "binary",
+      media_type: "application/x-git-bundle",
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+    } as const;
+    const effectId = "effect-integration";
+    const idempotencyKey = "run-1:integrate:checkpoint-candidate";
+    const forgedBytes = Buffer.from("forged integration bundle bytes");
+    const forgedCommit = "f".repeat(40);
+    const forgedDescriptor = {
+      file: "forged.bundle",
+      sha256: createHash("sha256").update(forgedBytes).digest("hex"),
+      bytes: forgedBytes.byteLength,
+      media_type: "application/x-git-bundle",
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+      ref: `refs/openthrottle/integrations/${createHash("sha256").update(idempotencyKey).digest("hex")}`,
+      commit: forgedCommit,
+      tree: "e".repeat(40),
+    } as const;
+    const intent: EffectIntent = {
+      schema: "openthrottle.effect-intent/v1",
+      id: effectId,
+      pipeline_run_id: "run-1",
+      decision_record_id: "decision-integration",
+      kind: "daytona/integrate-checkpoint@1",
+      idempotency_key: idempotencyKey,
+      target: `daytona:${"d".repeat(64)}:integration:checkpoint-candidate`,
+      subject: null,
+      payload: {
+        schema: "openthrottle.daytona-integration/v1",
+        identity: "d".repeat(64),
+        pipeline_run_id: "run-1",
+        attempt_id: "attempt-integration",
+        definition_bundle_hash: "b".repeat(64),
+        checkpoint_base_subject: candidate.descriptor.commit,
+        current_subject: proof.descriptor.commit,
+        candidate_checkpoint_id: "checkpoint-candidate",
+        candidate_input_subject: candidate.descriptor.commit,
+        candidate_output_subject: candidate.descriptor.commit,
+        candidate_blob: candidatePointer,
+        candidate_artifact: candidate.descriptor,
+        current_ancestry: [{
+          checkpoint_id: "checkpoint-proof",
+          input_subject: candidate.descriptor.commit,
+          output_subject: proof.descriptor.commit,
+          checkpoint_blob: proof.pointer,
+          checkpoint_artifact: proof.descriptor,
+        }],
+      },
+    };
+    const resultPath = `/var/lib/openthrottle/integration-results/${effectId}/lease-integration/result.json`;
+    const artifactPath = `/var/lib/openthrottle/integration-results/${effectId}/lease-integration/${forgedDescriptor.file}`;
+    const sandbox = sandboxWith(async (path) => {
+      if (path === resultPath) return Buffer.from(JSON.stringify({
+        schema: "openthrottle.kernel-integration-result/v1",
+        pipeline_run_id: "run-1",
+        effect_id: effectId,
+        idempotency_key: idempotencyKey,
+        lease_id: "lease-integration",
+        worker_id: "worker-integration",
+        definition_bundle_hash: "b".repeat(64),
+        state: "integrated",
+        input_subject: proof.descriptor.commit,
+        candidate_checkpoint_id: "checkpoint-candidate",
+        output_subject: forgedCommit,
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+        payload_artifact: forgedDescriptor,
+        reason: null,
+      }));
+      if (path === artifactPath) return forgedBytes;
+      throw new Error("404 not found");
+    });
+    const put = vi.fn();
+    const read = vi.fn((value: { digest: string }) =>
+      value.digest === candidatePointer.digest ? candidate.bytes : proof.bytes);
+    const adapter = adapterFor(sandbox, {
+      read,
+      put,
+    });
+    const binding = adapter.effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+    const dispatchFence = { lease_id: "lease-integration", worker_id: "worker-integration" };
+
+    await binding.adapter.dispatch({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: dispatchFence,
+      deduplication: {
+        strategy: "deterministic_target",
+        key: intent.idempotency_key,
+        target: intent.target,
+      },
+    });
+    const requestPath = `/var/lib/openthrottle/integration-input/${effectId}/lease-integration/request.json`;
+    const sandboxRequest = JSON.parse(sandbox.files.get(requestPath)!.toString("utf8"));
+    expect(sandboxRequest).not.toHaveProperty("current_ancestry");
+
+    await expect(binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: dispatchFence,
+    })).rejects.toThrow(/bundle|integration/i);
+    expect(read).toHaveBeenCalledWith(candidatePointer);
+    expect(read).toHaveBeenCalledWith(proof.pointer);
+    expect(put).not.toHaveBeenCalled();
+
+    await expect(binding.adapter.reconcile({
+      intent: {
+        ...intent,
+        payload: {
+          ...(intent.payload as Record<string, unknown>),
+          current_ancestry: Array.from({ length: 65 }, () => ({})),
+        } as never,
+      },
+      external_identity: intent.target,
+      dispatch_fence: dispatchFence,
+    })).rejects.toThrow(/bounded current ancestry/i);
+
+    const proofBytes = Buffer.from("proof bytes are read only after a dispatched result exists");
+    const proofPointer = {
+      algorithm: "sha256",
+      digest: createHash("sha256").update(proofBytes).digest("hex"),
+      bytes: proofBytes.byteLength,
+      encoding: "binary",
+      media_type: "application/x-git-bundle",
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+    } as const;
+    const proofInput = "1".repeat(40);
+    const proofOutput = "2".repeat(40);
+    const exactProof = {
+      checkpoint_id: "checkpoint-proof",
+      input_subject: proofInput,
+      output_subject: proofOutput,
+      checkpoint_blob: proofPointer,
+      checkpoint_artifact: {
+        file: "proof.bundle",
+        sha256: proofPointer.digest,
+        bytes: proofPointer.bytes,
+        media_type: "application/x-git-bundle",
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+        ref: `refs/openthrottle/integrations/${"9".repeat(64)}`,
+        commit: proofOutput,
+        tree: "3".repeat(40),
+      },
+    };
+    const proofIntent: EffectIntent = {
+      ...intent,
+      payload: {
+        ...(intent.payload as Record<string, unknown>),
+        checkpoint_base_subject: proofInput,
+        candidate_input_subject: proofInput,
+        current_subject: proofOutput,
+        current_ancestry: [exactProof],
+      } as never,
+    };
+    await expect(binding.adapter.reconcile({
+      intent: proofIntent,
+      external_identity: proofIntent.target,
+      dispatch_fence: null,
+    })).resolves.toEqual({ kind: "not_found" });
+    await expect(binding.adapter.reconcile({
+      intent: {
+        ...proofIntent,
+        payload: {
+          ...(proofIntent.payload as Record<string, unknown>),
+          current_ancestry: [{ ...exactProof, unexpected: true }],
+        } as never,
+      },
+      external_identity: proofIntent.target,
+      dispatch_fence: null,
+    })).rejects.toThrow(/exact current ancestry entry/i);
   });
 
   it("fails closed before accepting a replay when the exact lease heartbeat is lost", async () => {

@@ -283,6 +283,16 @@ inspect actions output subject is unchanged. An inspect action reviewing edits
 receives the preceding accepted checkpoint whose output equals its exact input
 subject.
 
+Action checkpoints are private execution evidence. Their intermediate commit
+ancestry may preserve rejected or superseded work needed for deterministic
+review, correction, and integration, so those commits and bundles are never
+published directly. Publication first projects only the final accepted tree
+onto one executor-owned commit whose sole parent is the exact safe publication
+anchor: the sealed source commit for a first publication, or the last confirmed
+task-ref head for an update. The resulting bounded bundle is independently
+verified and promoted as the run's exact subject before any GitHub push or pull
+request Effect is authorized.
+
 ### 5.5 Records
 
 All durable evidence uses `openthrottle.record/v1` and one of three kinds:
@@ -469,6 +479,14 @@ The worker follows this order:
 
 An unknown external outcome is never blindly replayed. Conflicting external
 identity, target, subject, or payload fails closed.
+
+Git task-ref publication distinguishes creation from update in the immutable
+Effect payload. Creation requires the deterministic task ref to be absent.
+Update requires it to equal the exact last confirmed published head; a missing
+or moved ref is rejected rather than recreated. Pull-request reconciliation
+matches the exact repository, branch, head, base, title, canonical body, and
+ownership marker. A base that already contains the proposed head resolves
+deterministically instead of remaining an absent, replay-ineligible mutation.
 
 Built-in plans cover Daytona provision/stop/cleanup, accepted structured-unit
 integration, exact-subject GitHub publication, and trusted GitHub provider

@@ -32,6 +32,7 @@ function correctionRequest(
     scope: { kind: "stage", stage_id: "stage-1" },
     request_hash: REQUEST_HASH,
     definition_bundle_hash: BUNDLE_HASH,
+    checkpoint_base_subject: INPUT_SUBJECT,
     input_subject: INPUT_SUBJECT,
     locked_subject: completedWorkAuthority === "edit" ? EDITED_SUBJECT : INPUT_SUBJECT,
     completed_work_authority: completedWorkAuthority,

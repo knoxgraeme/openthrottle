@@ -31,18 +31,42 @@ describe("sandbox Dockerfile", () => {
     expect(dockerfile).toContain('org.opencontainers.image.licenses="MIT"');
   });
 
-  it("installs Bats for local shell runtime gates", () => {
+  it("installs Bats and the standard Linux sandbox runtime", () => {
     const dockerfile = readFileSync(resolve(repoRoot, "sandbox/Dockerfile"), "utf8");
 
     expect(dockerfile).toMatch(
       /apt-get install -y --no-install-recommends[\s\S]*?\bbats\b[\s\S]*?rm -rf \/var\/lib\/apt\/lists\/\*/,
+    );
+    expect(dockerfile).toMatch(
+      /apt-get install -y --no-install-recommends[\s\S]*?\bbubblewrap\b[\s\S]*?rm -rf \/var\/lib\/apt\/lists\/\*/,
     );
   });
 
   it("pins the Codex CLI release that supports the production model", () => {
     const dockerfile = readFileSync(resolve(repoRoot, "sandbox/Dockerfile"), "utf8");
 
-    expect(dockerfile).toContain("ARG CODEX_VERSION=0.144.0");
+    expect(dockerfile).toContain("ARG CODEX_VERSION=0.149.0");
+    expect(dockerfile).toContain('"@openai/codex@${CODEX_VERSION}"');
+    expect(dockerfile).toContain('test "$(codex --version)" = "codex-cli ${CODEX_VERSION}"');
+  });
+
+  it("scopes hosted Linux Bubblewrap permissions to the Codex behavior probe", () => {
+    const workflow = readFileSync(resolve(repoRoot, ".github/workflows/ci.yml"), "utf8");
+    const smoke = readFileSync(resolve(repoRoot, "sandbox/tests/smoke.sh"), "utf8");
+
+    expect(workflow).toContain("Enable Linux user namespaces for Bubblewrap");
+    expect(workflow).toContain("sysctl -n kernel.unprivileged_userns_clone");
+    expect(workflow).toContain("sudo sysctl -w kernel.unprivileged_userns_clone=1");
+    expect(workflow).toContain("sysctl -n kernel.apparmor_restrict_unprivileged_userns");
+    expect(workflow).toContain("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0");
+    expect(smoke).toContain(
+      "docker run --rm \\\n  --security-opt seccomp=unconfined \\\n  --security-opt apparmor=unconfined",
+    );
+    expect(smoke).toContain(
+      'CONTAINER="$(docker run -d --entrypoint tail "$IMAGE" -f /dev/null)"',
+    );
+    expect(smoke).not.toContain("--privileged");
+    expect(smoke).not.toContain("--cap-add");
   });
 
   it("ships one kernel executor and one unprivileged agent principal", () => {
