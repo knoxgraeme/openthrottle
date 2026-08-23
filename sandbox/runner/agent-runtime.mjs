@@ -32,7 +32,11 @@ import {
   INSPECT_CHANGE_CONTEXT_SCHEMA,
 } from "./action-repository.mjs";
 import { identityForUser, isRoot, prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
-import { inspectPolicyArgs, repositoryGitEnvironment } from "./repository-authority.mjs";
+import {
+  codexResultCorrectionPolicyArgs,
+  inspectPolicyArgs,
+  repositoryGitEnvironment,
+} from "./repository-authority.mjs";
 import { extractNativeSessionId } from "./native-session-id.mjs";
 import { resultSubmissionEnvironment } from "./result-submission.mjs";
 
@@ -464,7 +468,7 @@ export function prepareResultCorrectionRuntime({
       "--ask-for-approval", "never",
       "exec", "--json", "--output-schema", channel.provider_schema_path,
       "--disable", "shell_tool", "--disable", "unified_exec", "--disable", "shell_snapshot",
-      ...inspectPolicyArgs("codex", cwd, { ephemeral: false }),
+      ...codexResultCorrectionPolicyArgs(),
       "--skip-git-repo-check", "-C", cwd,
       ...(request.model ? ["-m", request.model] : []),
       ...(request.reasoning_effort ? ["-c", `model_reasoning_effort=${JSON.stringify(request.reasoning_effort)}`] : []),

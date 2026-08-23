@@ -140,21 +140,6 @@ jobs:
             -ec 'test -f /data/openthrottle-kernel-v1.sqlite && test -f /data/openthrottle-kernel-v1-blobs/.openthrottle-blob-store.json'
       - name: Build sandbox image
         run: docker build -f sandbox/Dockerfile -t openthrottle:test .
-      - name: Enable Linux user namespaces for Bubblewrap
-        run: |
-          set -euo pipefail
-
-          # Match the official Codex action's setup on disposable GitHub-hosted
-          # Linux runners before exercising Codex's Bubblewrap sandbox.
-          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
-          if [ -n "$current_userns" ] && [ "$current_userns" != "1" ]; then
-            sudo sysctl -w kernel.unprivileged_userns_clone=1
-          fi
-
-          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
-          if [ -n "$current_apparmor" ] && [ "$current_apparmor" != "0" ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
       - name: Exercise sandbox lifecycle with stub agent
         run: sandbox/tests/smoke.sh openthrottle:test
       - name: Prove supervisor kernel settlement through the sandbox transport

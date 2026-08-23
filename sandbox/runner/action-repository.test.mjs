@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -96,6 +96,23 @@ describe("kernel action repository", () => {
     expect(git(destination, "rev-list", "--parents", "-n", "1", "HEAD").split(" "))
       .toHaveLength(2);
     expect(gitSucceeds(destination, "cat-file", "-e", `${source.after}^{commit}`)).toBe(false);
+  });
+
+  it("rejects inspect content mutation even if the permission fence is bypassed", () => {
+    const source = sourceRepository();
+    const destination = join(mkdtempSync(join(tmpdir(), "ot-kernel-inspect-tamper-")), "repository");
+    const view = materializeActionRepository({
+      sourceRepoDir: source.repo,
+      inputSubject: source.after,
+      repositoryAuthority: "inspect",
+      destination,
+    });
+
+    chmodSync(join(destination, "value.txt"), 0o644);
+    writeFileSync(join(destination, "value.txt"), "tampered\n");
+
+    expect(() => verifyActionRepository(view))
+      .toThrow("inspect action changed the exact repository subject");
   });
 
   it("writes a bounded executor-owned artifact for the exact accepted-edit boundary", () => {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  codexResultCorrectionPolicyArgs,
   inspectPolicyArgs,
   repositoryGitEnvironment,
 } from "./repository-authority.mjs";
@@ -24,7 +25,7 @@ describe("repository authority", () => {
       .toThrow("cannot be safely scoped");
   });
 
-  it("keeps native CLI inspection non-mutating", () => {
+  it("keeps inspection authority at the executor boundary", () => {
     const artifact = "/var/lib/openthrottle/actions/a/inspect-context/change.json";
     expect(inspectPolicyArgs("claude", "/var/lib/openthrottle/actions/a/repository", {
       readablePaths: [artifact],
@@ -35,7 +36,7 @@ describe("repository authority", () => {
       "Read(//var/lib/openthrottle/actions/a/repository/**),Read(//var/lib/openthrottle/actions/a/inspect-context/change.json)",
     ]));
     expect(inspectPolicyArgs("codex", "/var/lib/openthrottle/actions/a/repository")).toEqual([
-      "--sandbox", "read-only",
+      "--sandbox", "danger-full-access",
       "--ephemeral",
       "--ignore-user-config",
       "--ignore-rules",
@@ -50,6 +51,19 @@ describe("repository authority", () => {
     ]);
     expect(inspectPolicyArgs("codex", "/var/lib/openthrottle/actions/a/repository"))
       .not.toContain("use_legacy_landlock=true");
+    expect(codexResultCorrectionPolicyArgs()).toEqual([
+      "--sandbox", "read-only",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "-c", 'web_search="disabled"',
+      "--disable", "apps",
+      "--disable", "browser_use",
+      "--disable", "in_app_browser",
+      "--disable", "multi_agent",
+      "--disable", "plugins",
+      "--disable", "remote_plugin",
+      "--disable", "image_generation",
+    ]);
     expect(() => inspectPolicyArgs("claude", "/sealed/repository", {
       readablePaths: ["/"],
     })).toThrow("cannot be safely scoped");

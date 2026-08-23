@@ -326,17 +326,31 @@ No agent candidate alone advances a cursor.
 ### 6.1 Inspect authority
 
 An inspect action receives a packed clone/materialized checkout at the exact
-input subject. Repository content is root-owned and read-only, Git remotes are
-disabled, and provider-native tool policy permits only reading/searching plus
-the action result tool. It cannot edit content, administer Git, commit, push,
-publish, or invoke mutating MCP/provider operations.
+input subject. Repository content is root-owned and read-only, Git remotes and
+credential helpers are disabled, ambient provider credentials are removed from
+the child environment, and exact Git control and tree state are verified after
+execution. Those executor-owned controls are the authoritative inspect
+boundary. Provider-native sandboxing and read-only tool policy are optional
+defense in depth and may be bypassed inside the isolated executor when nested
+sandboxing is incompatible with that runtime. Inspect authority therefore does
+not imply that an engine's shell has no network access; it does mean the action
+cannot change the accepted repository subject, administer Git, commit, push,
+publish, or invoke credentialed mutating MCP/provider operations.
+
+When native sandboxing is bypassed, shell egress is not a confidentiality
+boundary. The Codex CLI can read the attempt-scoped access-token seed required
+for model access, although the supervisor strips the durable refresh token
+before materialization. Until an outer egress policy is present, this mode is
+limited to the registered public dogfood repository; private-source
+confidentiality is not claimed by the executor's repository-integrity fence.
 
 When an inspect action reviews an accepted edit, the executor also writes one
 root-owned, read-only, bounded change artifact outside the checkout. It binds
 the exact accepted base/input subjects and trees, a changed-path manifest, and
 the textual diff. Oversized sections are omitted with explicit diagnostics.
 Every engine receives the same named artifact through native file-read access;
-it grants no shell, network, edit, Git-administration, provider, or MCP authority.
+the artifact itself grants no additional shell, network, edit,
+Git-administration, provider, or MCP authority.
 
 Read-only authority is intentional even though agents do not own commits. It
 prevents review contamination and proves that a finding describes the sealed
@@ -408,6 +422,10 @@ exactly one `ot-result` tool. It receives the semantic schema and diagnostics,
 not a new implementation task. Claude and Codex retain the same sealed steering
 hook and exact run/attempt/request/bundle/lease/session bindings; injected
 guidance cannot widen the result-only authority frame.
+
+Codex correction also retains its provider-native read-only sandbox while its
+shell features are disabled. This is a least-privilege correction detail, not
+the repository authority boundary defined in section 6.1.
 
 Correction has its own lease, deadline, and finite budget. A valid candidate
 records normally. Exhaustion or loss of the exact session becomes
