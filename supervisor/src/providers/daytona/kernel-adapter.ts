@@ -1100,11 +1100,14 @@ export class DaytonaKernelAdapter implements
       bytes.byteLength > KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES ||
       createHash("sha256").update(bytes).digest("hex") !== descriptor.sha256
     ) throw new Error(`checkpoint artifact for ${request.attempt_id} failed its sealed descriptor`);
+    const completedWorkAuthority = request.schema === KERNEL_ACTION_REQUEST_SCHEMA
+      ? request.repository_authority
+      : request.completed_work_authority;
     inspectCheckpointBundle(
       bytes,
       descriptor,
-      request.repository_authority === "edit" ? request.checkpoint_base_subject : null,
-      request.repository_authority === "edit" ? request.input_subject : null,
+      completedWorkAuthority === "edit" ? request.checkpoint_base_subject : null,
+      completedWorkAuthority === "edit" ? request.input_subject : null,
     );
     if (
       descriptor.ref.startsWith("refs/openthrottle/checkpoints/") &&

@@ -306,6 +306,68 @@ function selfContainedCheckpointBundle(requestHash: string) {
   }
 }
 
+function boundedEditCheckpointBundle(requestHash: string) {
+  const root = mkdtempSync(join(tmpdir(), "ot-daytona-edit-checkpoint-"));
+  const repository = join(root, "repository");
+  const bundle = join(root, "checkpoint.bundle");
+  try {
+    execFileSync("git", ["init", "--quiet", "--initial-branch=main", repository]);
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: repository });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repository });
+    writeFileSync(join(repository, "base.txt"), "base\n");
+    execFileSync("git", ["add", "."], { cwd: repository });
+    execFileSync("git", ["commit", "--quiet", "-m", "base"], { cwd: repository });
+    execFileSync("git", ["switch", "--quiet", "--create", "topic"], { cwd: repository });
+    writeFileSync(join(repository, "topic.txt"), "topic\n");
+    execFileSync("git", ["add", "."], { cwd: repository });
+    execFileSync("git", ["commit", "--quiet", "-m", "topic"], { cwd: repository });
+    execFileSync("git", ["switch", "--quiet", "main"], { cwd: repository });
+    writeFileSync(join(repository, "main.txt"), "main\n");
+    execFileSync("git", ["add", "."], { cwd: repository });
+    execFileSync("git", ["commit", "--quiet", "-m", "main"], { cwd: repository });
+    execFileSync("git", ["merge", "--quiet", "--no-ff", "topic", "-m", "merge input"], {
+      cwd: repository,
+    });
+    const input = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(repository, "edit.txt"), "edited\n");
+    execFileSync("git", ["add", "."], { cwd: repository });
+    execFileSync("git", ["commit", "--quiet", "-m", "edit output"], { cwd: repository });
+    const output = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+    const tree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+    const ref = `refs/openthrottle/checkpoints/${requestHash}`;
+    execFileSync("git", ["update-ref", ref, output], { cwd: repository });
+    writeFileSync(join(repository, ".git", "shallow"), `${input}\n`);
+    execFileSync("git", ["bundle", "create", bundle, ref], { cwd: repository });
+    const bytes = readFileSync(bundle);
+    return {
+      bytes,
+      input,
+      output,
+      descriptor: {
+        file: "checkpoint.bundle",
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        bytes: bytes.byteLength,
+        media_type: "application/x-git-bundle",
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+        ref,
+        commit: output,
+        tree,
+      },
+    } as const;
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function integrationProofFromIdentity(
   candidate: ReturnType<typeof selfContainedCheckpointBundle>,
 ) {
@@ -494,7 +556,117 @@ function sessionEvent(request: KernelWorkActionRequest): Buffer {
   }));
 }
 
+function correctionCheckpointRuntimeResult(
+  request: KernelResultCorrectionRequest,
+  descriptor: ReturnType<typeof selfContainedCheckpointBundle>["descriptor"],
+  outputSubject: string | null,
+): Buffer {
+  return Buffer.from(JSON.stringify({
+    schema: "openthrottle.kernel-runtime-result/v1",
+    pipeline_run_id: request.pipeline_run_id,
+    attempt_id: request.attempt_id,
+    request_hash: request.request_hash,
+    definition_bundle_hash: request.definition_bundle_hash,
+    lease_id: request.lease_id,
+    worker_id: request.worker_id,
+    outcome: {
+      state: "needs_human",
+      reason: "correction remains invalid",
+      checkpoint: {
+        schema: "openthrottle.attempt-checkpoint-wire/v1",
+        id: request.checkpoint_id,
+        pipeline_run_id: request.pipeline_run_id,
+        attempt_id: request.attempt_id,
+        request_hash: request.request_hash,
+        definition_bundle_hash: request.definition_bundle_hash,
+        input_subject: request.input_subject,
+        output_subject: outputSubject,
+        native_session_id: request.native_session_id,
+        payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+        payload_artifact: descriptor,
+        captured_at: "2026-08-20T12:00:00.000Z",
+      },
+      candidate_hash: null,
+      diagnostics: request.diagnostics,
+    },
+  }));
+}
+
+function correctionCheckpointExecution(
+  request: KernelResultCorrectionRequest,
+  artifact: ReturnType<typeof selfContainedCheckpointBundle>,
+  outputSubject: string | null,
+) {
+  const resultDirectory = "/var/lib/openthrottle/action-results/attempt-1/correction-lease-2";
+  const sandbox = sandboxWith(async (path) => {
+    if (path === `${resultDirectory}/result.json`) {
+      return correctionCheckpointRuntimeResult(request, artifact.descriptor, outputSubject);
+    }
+    if (path === `${resultDirectory}/${artifact.descriptor.file}`) return artifact.bytes;
+    throw new Error("404 not found");
+  });
+  const pointer = {
+    algorithm: "sha256",
+    digest: artifact.descriptor.sha256,
+    bytes: artifact.descriptor.bytes,
+    encoding: "binary",
+    media_type: "application/x-git-bundle",
+    payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+  } as const;
+  const put = vi.fn().mockReturnValue({ pointer });
+  const records = [runtimeDelivery("create"), runtimeDelivery("start")];
+  const execution = adapterFor(sandbox, { put }, {
+    loadAttemptRequestInputs: vi.fn().mockResolvedValue({
+      task_prompt: "execute the sealed task",
+      context: {
+        records: new Map(records.map((record) => [record.id, record])),
+        checkpoints: new Map(),
+      },
+    }),
+  }).correctResult(request, {
+    lease_generation: 0,
+    heartbeat_interval_ms: 10,
+    on_heartbeat: vi.fn().mockResolvedValue(undefined),
+  });
+  return { execution, put };
+}
+
 describe("DaytonaKernelAdapter", () => {
+  it("replays a bounded edit checkpoint during result correction from a non-root merge input", async () => {
+    const artifact = boundedEditCheckpointBundle("a".repeat(64));
+    const request = correctionRequest({
+      checkpoint_base_subject: artifact.input,
+      input_subject: artifact.input,
+      locked_subject: artifact.output,
+      completed_work_authority: "edit",
+    });
+    const { execution, put } = correctionCheckpointExecution(request, artifact, artifact.output);
+
+    await expect(execution).resolves.toMatchObject({
+      state: "needs_human",
+      checkpoint: {
+        input_subject: artifact.input,
+        output_subject: artifact.output,
+      },
+    });
+    expect(put).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an inspect checkpoint self-contained during result correction", async () => {
+    const request = correctionRequest();
+    const artifact = selfContainedCheckpointBundle(request.request_hash);
+    const { execution, put } = correctionCheckpointExecution(request, artifact, null);
+
+    await expect(execution).resolves.toMatchObject({
+      state: "needs_human",
+      checkpoint: {
+        input_subject: request.input_subject,
+        output_subject: null,
+      },
+    });
+    expect(put).toHaveBeenCalledOnce();
+  });
+
   it.each(["command", "inspect"] as const)(
     "ingests a self-contained output-null %s checkpoint without imposing the request input as its parent",
     async (kind) => {
