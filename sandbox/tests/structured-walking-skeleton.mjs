@@ -147,11 +147,19 @@ function runAction(name, request) {
 
 function integrate(name, action, actionResult, currentSubject) {
   const checkpoint = actionResult.outcome.checkpoint;
+  const idempotencyKey = [
+    `run-${"a".repeat(48)}`,
+    `attempt-${"b".repeat(48)}`,
+    "publish-integrate",
+    currentSubject,
+    checkpoint.id,
+  ].join(":");
+  assert(idempotencyKey.length > 200 && idempotencyKey.length <= 500);
   const integration = {
     schema: "openthrottle.kernel-integration-request/v1",
     pipeline_run_id: action.pipeline_run_id,
     effect_id: `effect-${name}`,
-    idempotency_key: `structured-proof:${name}`,
+    idempotency_key: idempotencyKey,
     lease_id: `integration-lease-${name}`,
     worker_id: "integration-worker",
     definition_bundle_hash: action.definition_bundle_hash,

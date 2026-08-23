@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import {
   canonicalJson,
   compileDefinitionBundle,
+  validateEffectIntent,
 } from "@openthrottle/contracts";
 import {
   VerifiedKernelDefinitionBundleResolver,
@@ -30,7 +31,10 @@ import {
   createFreshEpochBootstrap,
   initializeFreshEpochDatabase,
 } from "../dist/persistence/epoch-database.js";
+import { SqliteKernelRunEnvironmentStore } from "../dist/persistence/kernel-runtime-context-store.js";
 import { SqliteKernelStore } from "../dist/persistence/kernel-store.js";
+import { materializeExternalEffectIntents } from "../dist/operations/kernel-external-plans.js";
+import { createKernelExternalPlanBindings } from "../dist/operations/kernel-plan-bindings.js";
 import {
   createPendingStageAttempt,
 } from "../dist/pipeline/kernel/action-request.js";
@@ -38,6 +42,7 @@ import { ordinaryKernelPayloadSchemas } from "../dist/pipeline/kernel/evaluator-
 import { OrdinaryKernelCoordinator } from "../dist/pipeline/kernel/ordinary-coordinator.js";
 import { compileKernelCursor } from "../dist/pipeline/kernel/reducer.js";
 import { compileStructuredLoopFrontier } from "../dist/pipeline/kernel/structured-coordinator.js";
+import { DaytonaKernelAdapter } from "../dist/providers/daytona/kernel-adapter.js";
 import { inspectKernelCheckpointBundle } from "../dist/runtime/kernel-checkpoint-bundle.js";
 import {
   parseKernelRuntimeResult,
@@ -282,6 +287,145 @@ function seedRun({ store, blobs, registrationId, compilation, run, attempts, tas
     definition_bundle: bundle,
     initial_attempts: attempts,
   });
+}
+
+function runtimeProvisionDelivery(runId, identity) {
+  return {
+    schema: "openthrottle.record/v1",
+    kind: "delivery",
+    id: `delivery-${runId}-runtime`,
+    pipeline_run_id: runId,
+    effect_id: `effect-${runId}-runtime`,
+    idempotency_key: `${runId}:runtime`,
+    external_identity: `daytona:${identity}`,
+    status: "confirmed",
+    payload_schema: "openthrottle.effect-delivery/v1",
+    payload: { inline: {
+      effect_kind: "daytona/create-sandbox@1",
+      provider: "daytona",
+      result: { identity },
+    } },
+    created_at: "2026-08-22T00:00:00.000Z",
+  };
+}
+
+async function assertPublicationPreflight({
+  active,
+  compilation,
+  blobs,
+  taskPrompt,
+  implementation,
+  runId,
+  implementationAttemptId,
+}) {
+  const view = await active.store.loadExactReductionView({
+    pipeline_run_id: runId,
+    attempt_id: implementationAttemptId,
+    record_ids: [],
+    checkpoint_ids: [implementation.checkpoint_id],
+  });
+  const candidate = view.checkpoints.get(implementation.checkpoint_id);
+  assert(candidate, "ordinary implementation must persist its exact checkpoint");
+  assert.equal(
+    candidate.id,
+    `checkpoint:${implementation.request_hash.slice(0, 32)}`,
+  );
+  assert.equal(candidate.output_subject, implementation.output_subject);
+
+  const runtimeIdentity = "d".repeat(64);
+  const runtimeDelivery = runtimeProvisionDelivery(view.run.id, runtimeIdentity);
+  const context = {
+    records: new Map([[runtimeDelivery.id, runtimeDelivery]]),
+    checkpoints: view.checkpoints,
+  };
+  const publishAttempt = createPendingStageAttempt({
+    id: `attempt-${"c".repeat(48)}`,
+    pipeline_run_id: view.run.id,
+    stage_id: "publish",
+    input_subject: implementation.output_subject,
+    bundle: compilation.bundle.value,
+    manifest: compilation.manifest.value,
+    action_inputs: {
+      task_prompt: taskPrompt,
+      context: { records: [runtimeDelivery], checkpoints: [candidate] },
+    },
+  });
+  const publishStage = view.manifest.stages.find(({ id }) => id === "publish");
+  assert.equal(publishStage?.kind, "effect");
+  assert.equal(publishStage.effect, "core/publish@1");
+
+  const environments = new SqliteKernelRunEnvironmentStore({ db: active.db });
+  const plans = createKernelExternalPlanBindings({ environments, blob_store: blobs });
+  const publish = plans.find(({ external_kind }) => external_kind === "core/publish@1");
+  assert(publish, "kernel plan registry must expose core/publish@1");
+  const prepared = await publish.prepare({
+    run: view.run,
+    attempt: publishAttempt,
+    stage: publishStage,
+    context,
+    bundle: compilation.bundle.value,
+  });
+  assert.equal(prepared.checkpoint_payload.candidate_checkpoint_id, candidate.id);
+  const integrationPhase = prepared.phases[0];
+  assert.equal(integrationPhase?.id, "integrate-checkpoint");
+  assert.equal(integrationPhase.effects.length, 1);
+  assert.equal(
+    integrationPhase.effects[0]?.payload.candidate_checkpoint_id,
+    candidate.id,
+  );
+
+  const intents = materializeExternalEffectIntents({
+    run_id: view.run.id,
+    attempt_id: publishAttempt.id,
+    decision_record_id: "decision-ordinary-publication-preflight",
+    phase_id: integrationPhase.id,
+    candidates: integrationPhase.effects,
+  });
+  assert.equal(intents.length, 1);
+  const intent = intents[0];
+  assert(intent, "publication preflight must materialize its integration EffectIntent");
+  assert.deepEqual(
+    validateEffectIntent(intent, { source: "publication_preflight_intent" }).value,
+    intent,
+  );
+  assert.equal(intent.kind, "daytona/integrate-checkpoint@1");
+  assert.equal(intent.payload.candidate_checkpoint_id, candidate.id);
+  assert(intent.idempotency_key.length > 200 && intent.idempotency_key.length <= 500);
+
+  let providerTouches = 0;
+  const daytona = new Proxy({}, {
+    get() {
+      providerTouches += 1;
+      throw new Error("pre-dispatch integration reconciliation touched Daytona");
+    },
+  });
+  const adapter = new DaytonaKernelAdapter(daytona, {
+    snapshot: "kernel-e2e",
+    github_read_token: "unused",
+    task_timeout_seconds: 1,
+    runtime_capability_digest: compilation.manifest.value.runtime_capability_digest,
+    blob_store: blobs,
+    environments,
+    attempt_inputs: {
+      loadAttemptRequestInputs() {
+        throw new Error("publication preflight does not load Attempt inputs");
+      },
+    },
+    materialize_model_credentials() {
+      throw new Error("publication preflight does not materialize model credentials");
+    },
+    poll_interval_ms: 1,
+  });
+  const integration = adapter.effectBindings().find(
+    ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+  );
+  assert(integration, "Daytona adapter must expose integration reconciliation");
+  assert.deepEqual(await integration.adapter.reconcile({
+    intent,
+    external_identity: intent.target,
+    dispatch_fence: null,
+  }), { kind: "not_found" });
+  assert.equal(providerTouches, 0);
 }
 
 class DockerKernelRuntime {
@@ -545,9 +689,11 @@ async function ordinaryScenario() {
   const container = startContainer(directory, fixture.repository);
   const environment = createKernelEnvironment(directory, fixture.source, "core/implement");
   const taskPrompt = "Implement the OPE-188 fixture, then review the accepted checkpoint.";
+  const runId = `run-${"a".repeat(48)}`;
+  const implementationAttemptId = `attempt-${"b".repeat(48)}`;
   const initialAttempt = createPendingStageAttempt({
-    id: "ordinary-implement",
-    pipeline_run_id: "ordinary-run",
+    id: implementationAttemptId,
+    pipeline_run_id: runId,
     stage_id: "implement",
     input_subject: fixture.source,
     bundle: environment.compilation.bundle.value,
@@ -560,7 +706,7 @@ async function ordinaryScenario() {
     attempts: [initialAttempt],
   });
   const runValue = createRun({
-    id: "ordinary-run",
+    id: runId,
     compilation: environment.compilation,
     source: fixture.source,
     cursor,
@@ -585,14 +731,14 @@ async function ordinaryScenario() {
   const first = await executeNext(active.coordinator, "ordinary", 1);
   assert.deepEqual(first, {
     disposition: "settled",
-    pipeline_run_id: "ordinary-run",
+    pipeline_run_id: runId,
     attempt_id: initialAttempt.id,
     stage_id: "implement",
     run_status: "running",
     next_stage_id: "review",
   });
   const implementation = active.db.prepare(`
-    SELECT request_hash, output_subject, result_record_id FROM attempts WHERE id = ?
+    SELECT request_hash, output_subject, checkpoint_id, result_record_id FROM attempts WHERE id = ?
   `).get(initialAttempt.id);
   const persisted = active.db.prepare(`
     SELECT original_candidate_hash, normalized_candidate_hash, inline_payload
@@ -604,6 +750,15 @@ async function ordinaryScenario() {
   assert.notEqual(persisted.original_candidate_hash, persisted.normalized_candidate_hash);
   assert.match(implementation.output_subject, /^[a-f0-9]{40,64}$/);
   assertOneLaunch(container, initialAttempt.id);
+  await assertPublicationPreflight({
+    active,
+    compilation: environment.compilation,
+    blobs: environment.blobs,
+    taskPrompt,
+    implementation,
+    runId,
+    implementationAttemptId,
+  });
 
   active.db.close();
   const restartedRuntime = new DockerKernelRuntime({
@@ -613,7 +768,7 @@ async function ordinaryScenario() {
   });
   active = environment.activate(environment.reopen(), restartedRuntime);
   const recovered = await active.store.loadExactReductionView({
-    pipeline_run_id: "ordinary-run",
+    pipeline_run_id: runId,
     attempt_id: initialAttempt.id,
     record_ids: [],
     checkpoint_ids: [],
@@ -635,7 +790,9 @@ async function ordinaryScenario() {
   assertOneLaunch(container, initialAttempt.id);
   assertOneLaunch(container, restartedRuntime.requests[0].attempt_id);
   active.db.close();
-  process.stdout.write("ordinary supervisor/sandbox normalization + restart proof passed\n");
+  process.stdout.write(
+    "ordinary supervisor/sandbox normalization + restart + publication preflight proof passed\n",
+  );
 }
 
 async function structuredScenario() {
