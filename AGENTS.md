@@ -119,8 +119,15 @@ reread mutable source files.
 Every agent action has exactly one repository authority:
 
 - `inspect` receives an immutable exact-subject checkout. The executor disables
-  remotes and mutation, and also applies provider-native read-only tool policy.
-  Review, planning, acceptance, and result correction use this authority.
+  remotes and mutation, filters ambient credentials, and verifies the exact tree
+  after execution. Provider-native sandboxing is defense in depth and may be
+  bypassed inside the isolated executor when nested sandboxing is incompatible;
+  it is not the repository authority boundary. Review, planning, acceptance,
+  and result correction use inspect authority. Codex result correction remains
+  provider-native read-only because its shell tools are disabled. Native-sandbox
+  bypass permits shell egress and is therefore limited to the registered public
+  dogfood repository until an outer egress policy exists; it is not a private
+  source-confidentiality boundary.
 - `edit` receives an isolated writable content tree. The agent may change files
   but still cannot administer Git, commit, push, publish, or claim an external
   effect. The executor captures the resulting tree as a checkpoint.

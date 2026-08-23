@@ -246,6 +246,7 @@ describe("result correction runtime", () => {
 
     expect(prepared.args).toEqual(expect.arrayContaining([
       "--output-schema", join(actionDirectory, "provider-schema.json"),
+      "--sandbox", "read-only",
       "--disable", "shell_tool",
       "--disable", "unified_exec",
       "--disable", "shell_snapshot",
@@ -254,6 +255,7 @@ describe("result correction runtime", () => {
       "--disable", "in_app_browser",
       "--disable", "multi_agent",
     ]));
+    expect(prepared.args).not.toContain("danger-full-access");
     expect(prepared.args).not.toContain("use_legacy_landlock=true");
   });
 });
@@ -295,7 +297,8 @@ describe("inspect change context runtime", () => {
     expect(claude.prepared.args.join("\n")).toContain(`Read(//${claude.actionContextPath.slice(1)})`);
     expect(claude.prepared.args).toEqual(expect.arrayContaining(["--max-turns", "11"]));
     expect(preparedByEngine.get("codex").prepared.args).toEqual(expect.arrayContaining([
-      "--sandbox", "read-only", "--ignore-user-config",
+      "--ask-for-approval", "never",
+      "--sandbox", "danger-full-access", "--ignore-user-config",
       "--disable", "apps", "--disable", "browser_use",
       "--disable", "in_app_browser", "--disable", "multi_agent",
       "--disable", "plugins", "--disable", "remote_plugin",
@@ -318,6 +321,65 @@ describe("inspect change context runtime", () => {
         [opencode.actionContextPath]: "allow",
         [opencode.artifactPath]: "allow",
       },
+    });
+  });
+
+  it("strips ambient provider and Git credentials from a Codex inspect child", () => {
+    const actionDirectory = mkdtempSync(join(tmpdir(), "ot-inspect-runtime-credentials-"));
+    directories.push(actionDirectory);
+    const artifactDirectory = join(actionDirectory, "inspect-context");
+    const contextDirectory = join(actionDirectory, "action-context");
+    const artifactPath = join(artifactDirectory, "change.json");
+    const actionContextPath = join(contextDirectory, "context.json");
+    mkdirSync(artifactDirectory);
+    mkdirSync(contextDirectory);
+    writeFileSync(artifactPath, "{}\n", { mode: 0o444 });
+    writeFileSync(actionContextPath, "{}\n", { mode: 0o444 });
+
+    const prepared = prepareAgentRuntime({
+      request: inspectRequest("codex", actionDirectory, artifactPath, actionContextPath),
+      actionDirectory,
+      channel: channel(actionDirectory),
+      env: {
+        ...runtimeEnv(),
+        CODEX_AUTH_JSON: JSON.stringify({
+          tokens: { access_token: "temporary-codex-access-token" },
+        }),
+        GITHUB_TOKEN: "github-secret",
+        GH_TOKEN: "gh-secret",
+        LINEAR_API_KEY: "linear-secret",
+        DAYTONA_API_KEY: "daytona-secret",
+        FLY_API_TOKEN: "fly-secret",
+        GIT_ASKPASS: "/tmp/hostile-askpass",
+        GIT_SSH_COMMAND: "ssh -i /tmp/hostile-key",
+        SSH_ASKPASS: "/tmp/hostile-ssh-askpass",
+      },
+    });
+
+    for (const name of [
+      "CODEX_AUTH_JSON",
+      "GITHUB_TOKEN",
+      "GH_TOKEN",
+      "LINEAR_API_KEY",
+      "DAYTONA_API_KEY",
+      "FLY_API_TOKEN",
+      "GIT_ASKPASS",
+      "GIT_SSH_COMMAND",
+      "SSH_ASKPASS",
+    ]) {
+      expect(prepared.childEnv).not.toHaveProperty(name);
+    }
+    expect(readFileSync(join(prepared.profileRoot, "auth.json"), "utf8")).toBe(
+      `${JSON.stringify({ tokens: { access_token: "temporary-codex-access-token" } })}\n`,
+    );
+    expect(statSync(join(prepared.profileRoot, "auth.json")).mode & 0o777).toBe(0o600);
+    expect(prepared.childEnv).toMatchObject({
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "safe.directory",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_TERMINAL_PROMPT: "0",
     });
   });
 

@@ -25,28 +25,39 @@ The entrypoint accepts exactly two request families:
 
 An action materializes the exact requested Git subject into a fresh repository
 with no usable remote. Git administration stays executor-owned. An `inspect`
-action also makes the complete checkout read-only and applies the engine's
-native read-only tool policy. An `edit` action grants the agent write access to
-repository content, while commits, refs, pushes, and publication remain outside
-the model's authority. Before any action or integration, the shared source
-checkout is recursively root-owned and non-writable without following symlinks.
-Deterministic command gates run in the same isolated repository and never
-contribute their incidental filesystem mutations.
+action also makes the complete checkout root-owned and read-only, filters the
+child environment, and verifies the exact Git control and tree after execution.
+Those executor controls are the authoritative inspect boundary. An `edit`
+action grants the agent write access to repository content, while commits, refs,
+pushes, and publication remain outside the model's authority. Before any action
+or integration, the shared source checkout is recursively root-owned and
+non-writable without following symlinks. Deterministic command gates run in the
+same isolated repository and never contribute their incidental filesystem
+mutations.
 
-Codex inspect and result-correction actions use Codex's standard
-`--sandbox read-only` policy. The image supplies system Bubblewrap for that
-native Linux sandbox; it does not select a legacy sandbox backend or weaken the
-outer Daytona repository fence. Inspect policy also disables Codex Apps,
-browser, plugin, image-generation, and multi-agent features because those
-provider-hosted capabilities sit outside the Linux namespace.
+Normal Codex inspect work uses explicit `--sandbox danger-full-access` inside
+the isolated Daytona executor. This avoids nesting Codex's Linux sandbox where
+the provider runtime does not permit its network-namespace setup; it does not
+change `repository_authority: inspect` or any executor-owned safeguard. Codex
+shell commands may have network access, so the minimal child environment and
+absence of GitHub or provider-mutation credentials are part of the boundary.
+The CLI can still read its attempt-scoped Codex access-token seed; the
+supervisor strips the durable refresh token before materializing that seed.
+Until an outer egress policy exists, this mode is appropriate only for the
+registered public dogfood repository and must not be described as a
+confidentiality boundary for private source. Codex result correction keeps
+`--sandbox read-only` because its shell features are disabled and that
+least-privilege path does not invoke repository commands. Both paths ignore
+user configuration and rules and disable Codex Apps, browser, plugin,
+image-generation, and multi-agent features.
 
 An inspect action with an accepted-edit boundary also receives one bounded
 executor-owned change artifact in a dedicated read-only directory outside the
 checkout. It names the exact base/input subjects and trees, includes changed
 paths and textual diff within fixed bounds, and records explicit omission
 diagnostics otherwise. Claude, Codex, and OpenCode are all prompted with the
-same path; native policy allows that file without adding shell, network, edit,
-provider, MCP, or Git-administration authority.
+same path; the artifact itself adds no shell, network, edit, provider, MCP, or
+Git-administration authority.
 
 For an agent action, the sealed DefinitionBundle supplies:
 

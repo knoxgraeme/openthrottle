@@ -1,6 +1,6 @@
 import { dirname, isAbsolute, normalize } from "node:path";
 
-const CODEX_INSPECT_DISABLED_FEATURES = [
+const CODEX_DISABLED_HOSTED_FEATURES = [
   "apps",
   "browser_use",
   "in_app_browser",
@@ -9,6 +9,21 @@ const CODEX_INSPECT_DISABLED_FEATURES = [
   "remote_plugin",
   "image_generation",
 ];
+
+function codexPolicyArgs(sandbox, { ephemeral = true } = {}) {
+  return [
+    "--sandbox", sandbox,
+    ...(ephemeral ? ["--ephemeral"] : []),
+    "--ignore-user-config",
+    "--ignore-rules",
+    "-c", 'web_search="disabled"',
+    ...CODEX_DISABLED_HOSTED_FEATURES.flatMap((feature) => ["--disable", feature]),
+  ];
+}
+
+export function codexResultCorrectionPolicyArgs({ ephemeral = false } = {}) {
+  return codexPolicyArgs("read-only", { ephemeral });
+}
 
 function claudeReadRule(repositoryPath) {
   if (typeof repositoryPath !== "string" || !isAbsolute(repositoryPath)) {
@@ -79,14 +94,7 @@ export function inspectPolicyArgs(engine, repositoryPath, {
     ];
   }
   if (engine === "codex") {
-    return [
-      "--sandbox", "read-only",
-      ...(ephemeral ? ["--ephemeral"] : []),
-      "--ignore-user-config",
-      "--ignore-rules",
-      "-c", 'web_search="disabled"',
-      ...CODEX_INSPECT_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]),
-    ];
+    return codexPolicyArgs("danger-full-access", { ephemeral });
   }
   if (engine === "opencode") return [];
   throw new Error(`unsupported inspect engine ${engine}`);

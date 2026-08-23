@@ -31,15 +31,13 @@ describe("sandbox Dockerfile", () => {
     expect(dockerfile).toContain('org.opencontainers.image.licenses="MIT"');
   });
 
-  it("installs Bats and the standard Linux sandbox runtime", () => {
+  it("installs Bats without a redundant nested Linux sandbox runtime", () => {
     const dockerfile = readFileSync(resolve(repoRoot, "sandbox/Dockerfile"), "utf8");
 
     expect(dockerfile).toMatch(
       /apt-get install -y --no-install-recommends[\s\S]*?\bbats\b[\s\S]*?rm -rf \/var\/lib\/apt\/lists\/\*/,
     );
-    expect(dockerfile).toMatch(
-      /apt-get install -y --no-install-recommends[\s\S]*?\bbubblewrap\b[\s\S]*?rm -rf \/var\/lib\/apt\/lists\/\*/,
-    );
+    expect(dockerfile).not.toMatch(/\bbubblewrap\b/);
   });
 
   it("pins the Codex CLI release that supports the production model", () => {
@@ -50,18 +48,12 @@ describe("sandbox Dockerfile", () => {
     expect(dockerfile).toContain('test "$(codex --version)" = "codex-cli ${CODEX_VERSION}"');
   });
 
-  it("scopes hosted Linux Bubblewrap permissions to the Codex behavior probe", () => {
+  it("keeps the sandbox smoke on default container security profiles", () => {
     const workflow = readFileSync(resolve(repoRoot, ".github/workflows/ci.yml"), "utf8");
     const smoke = readFileSync(resolve(repoRoot, "sandbox/tests/smoke.sh"), "utf8");
 
-    expect(workflow).toContain("Enable Linux user namespaces for Bubblewrap");
-    expect(workflow).toContain("sysctl -n kernel.unprivileged_userns_clone");
-    expect(workflow).toContain("sudo sysctl -w kernel.unprivileged_userns_clone=1");
-    expect(workflow).toContain("sysctl -n kernel.apparmor_restrict_unprivileged_userns");
-    expect(workflow).toContain("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0");
-    expect(smoke).toContain(
-      "docker run --rm \\\n  --security-opt seccomp=unconfined \\\n  --security-opt apparmor=unconfined",
-    );
+    expect(workflow).not.toMatch(/Bubblewrap|unprivileged_userns|apparmor_restrict/);
+    expect(smoke).not.toMatch(/--security-opt|\bbwrap\b|codex sandbox/);
     expect(smoke).toContain(
       'CONTAINER="$(docker run -d --entrypoint tail "$IMAGE" -f /dev/null)"',
     );

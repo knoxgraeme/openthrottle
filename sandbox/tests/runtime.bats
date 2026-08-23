@@ -55,13 +55,15 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
-@test "inspect authority uses native CLI restrictions and edit authority stays explicit" {
+@test "inspect authority uses the executor fence and edit authority stays explicit" {
   authority="$SANDBOX_DIR/runner/repository-authority.mjs"
   runtime="$SANDBOX_DIR/runner/agent-runtime.mjs"
 
   run grep -F -- '"--tools", "Read,Grep,Glob"' "$authority"
   [ "$status" -eq 0 ]
-  run grep -F -- '"--sandbox", "read-only"' "$authority"
+  run grep -F -- 'return codexPolicyArgs("danger-full-access"' "$authority"
+  [ "$status" -eq 0 ]
+  run grep -F -- 'return codexPolicyArgs("read-only"' "$authority"
   [ "$status" -eq 0 ]
   run grep -F -- '"--dangerously-skip-permissions"' "$runtime"
   [ "$status" -eq 0 ]

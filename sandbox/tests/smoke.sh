@@ -61,7 +61,7 @@ const semantic = {
     verification: { type: "string_list", max_length: 1000, max_items: 32 },
   },
 };
-const request = (attempt, authority, requestHash) => ({
+const request = (attempt, authority, requestHash, engine = "claude") => ({
   schema: "openthrottle.kernel-action-request/v2",
   phase: "work",
   pipeline_run_id: "smoke-run",
@@ -81,7 +81,7 @@ const request = (attempt, authority, requestHash) => ({
   change_boundary: null,
   action: {
     kind: "agent",
-    engine: "claude",
+    engine,
     model: null,
     reasoning_effort: null,
     agent_id: "core/smoke-agent",
@@ -89,7 +89,10 @@ const request = (attempt, authority, requestHash) => ({
     entry_skill: "core/implement-plan",
     eval_id: semantic.id,
     semantic_result_schema: semantic,
-    execution_limits: { max_turns: 12, task_timeout_seconds: 600 },
+    execution_limits: {
+      max_turns: engine === "claude" ? 12 : null,
+      task_timeout_seconds: 600,
+    },
     definition_entries: [
       { definition_kind: "agent", definition_id: "core/smoke-agent", content_hash: digest(instructions), normalized_payload: instructions },
       { definition_kind: "skill", definition_id: "core/implement-plan", content_hash: digest(skill), normalized_payload: skill },
@@ -99,6 +102,12 @@ const request = (attempt, authority, requestHash) => ({
 });
 writeFileSync(join(output, "edit.json"), `${JSON.stringify(request("attempt-edit", "edit", "a".repeat(64)))}\n`);
 writeFileSync(join(output, "inspect.json"), `${JSON.stringify(request("attempt-inspect", "inspect", "c".repeat(64)))}\n`);
+writeFileSync(join(output, "inspect-codex.json"), `${JSON.stringify(request(
+  "attempt-inspect-codex",
+  "inspect",
+  "d".repeat(64),
+  "codex",
+))}\n`);
 writeFileSync(join(output, "command.json"), `${JSON.stringify({
   ...request("attempt-command", "edit", "e".repeat(64)),
   action: {
@@ -188,6 +197,116 @@ printf '{"type":"result","subtype":"success","structured_output":{"schema":"open
 STUB
 chmod 0755 "$SMOKE_DIR/stub/claude"
 
+cat > "$SMOKE_DIR/stub/codex" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+
+contains_pair() {
+  local expected_key="$1" expected_value="$2" previous=""
+  shift 2
+  for argument in "$@"; do
+    if [ "$previous" = "$expected_key" ] && [ "$argument" = "$expected_value" ]; then
+      return 0
+    fi
+    previous="$argument"
+  done
+  return 1
+}
+
+contains_pair --ask-for-approval never "$@"
+contains_pair --sandbox danger-full-access "$@"
+contains_pair --disable apps "$@"
+contains_pair --disable browser_use "$@"
+contains_pair --disable plugins "$@"
+for argument in "$@"; do
+  [ "$argument" != "read-only" ]
+done
+
+prompt="$(cat)"
+[[ "$prompt" == *"## Agent instructions (core/smoke-agent)"* ]]
+[[ "$prompt" == *"## Available skills"* ]]
+[[ "$prompt" == *"## Sealed task prompt"* ]]
+test -f "$CODEX_HOME/skills/implement-plan/SKILL.md"
+test -f "$CODEX_HOME/skills/implement-plan/references/checklist.md"
+
+for name in GITHUB_TOKEN GH_TOKEN LINEAR_API_KEY DAYTONA_API_KEY FLY_API_TOKEN GIT_ASKPASS GIT_SSH_COMMAND SSH_ASKPASS; do
+  if env | grep -q "^${name}="; then
+    echo "ambient credential reached Codex child: ${name}" >&2
+    exit 43
+  fi
+done
+
+test "$(stat -c %U:%G .)" = root:root
+test "$(stat -c %U:%G .git)" = root:root
+test ! -w .
+test ! -w .git
+test ! -w work.txt
+test "$(git config --get remote.origin.url)" = DISABLED_BY_OPENTHROTTLE_INSPECT
+test "$(git config --get remote.origin.pushurl)" = DISABLED_BY_OPENTHROTTLE_INSPECT
+grep -qx base work.txt
+test ! -e source-link
+git status --short >/dev/null
+git show --no-patch --format=%s HEAD >/dev/null
+git diff --quiet
+if printf 'forbidden\n' > work.txt 2>/dev/null; then
+  echo "Codex inspect repository was writable" >&2
+  exit 44
+fi
+if git config remote.origin.url https://example.invalid/repository 2>/dev/null; then
+  echo "Codex inspect changed executor-owned Git configuration" >&2
+  exit 45
+fi
+if git update-ref refs/heads/forbidden HEAD 2>/dev/null; then
+  echo "Codex inspect changed executor-owned Git refs" >&2
+  exit 46
+fi
+temporary="/tmp/openthrottle-codex-inspect-${OT_ATTEMPT_ID}"
+printf 'writable\n' > "$temporary"
+grep -qx writable "$temporary"
+
+mkdir -p /tmp/openthrottle-smoke-launches
+printf 'launch\n' >> "/tmp/openthrottle-smoke-launches/${OT_ATTEMPT_ID}"
+node --input-type=module - "$OT_ATTEMPT_ID" <<'NODE'
+const [attemptId] = process.argv.slice(2);
+const candidate = {
+  schema: "openthrottle.result-candidate/v1",
+  outcome: "success",
+  payload: {
+    summary: ["Inspected repository.", "No mutation was possible."],
+    verification: ["Codex argv and executor boundary assertions passed"],
+  },
+};
+process.stdout.write(`${JSON.stringify({
+  type: "thread.started",
+  thread_id: `session-${attemptId}`,
+})}\n`);
+process.stdout.write(`${JSON.stringify({
+  type: "item.completed",
+  item: { type: "agent_message", text: JSON.stringify(candidate) },
+})}\n`);
+NODE
+STUB
+chmod 0755 "$SMOKE_DIR/stub/codex"
+
+docker run --rm --entrypoint sh "$IMAGE" -ec '
+  test "$(codex --version)" = "codex-cli 0.149.0"
+  gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex \
+    codex --ask-for-approval never exec \
+      --sandbox danger-full-access \
+      --ephemeral \
+      --ignore-user-config \
+      --ignore-rules \
+      -c '\''web_search="disabled"'\'' \
+      --disable apps \
+      --disable browser_use \
+      --disable in_app_browser \
+      --disable multi_agent \
+      --disable plugins \
+      --disable remote_plugin \
+      --disable image_generation \
+      --help >/dev/null
+'
+
 mkdir -p "$SMOKE_DIR/poison"
 cat > "$SMOKE_DIR/poison/claude" <<'POISON'
 #!/usr/bin/env bash
@@ -196,43 +315,8 @@ exit 99
 POISON
 chmod 0755 "$SMOKE_DIR/poison/claude"
 
-# Nested Docker's seccomp profile blocks Bubblewrap's user namespace, while its
-# default AppArmor profile denies Bubblewrap's mount setup. Relax only this
-# short-lived probe container; the ordinary lifecycle container below keeps
-# Docker's default profiles.
-docker run --rm \
-  --security-opt seccomp=unconfined \
-  --security-opt apparmor=unconfined \
-  --entrypoint sh "$IMAGE" -c '
-  set -eu
-  test "$(codex --version)" = "codex-cli 0.149.0"
-  test "$(command -v bwrap)" = /usr/bin/bwrap
-
-  probe=/tmp/codex-sandbox-smoke
-  mkdir -p "$probe"
-  printf "read-ok\n" > "$probe/read.txt"
-  chown -R agent:agent "$probe"
-
-  node -e "require(\"node:http\").createServer((_request, response) => response.end(\"reachable\\n\")).listen(43117, \"127.0.0.1\")" &
-  server_pid=$!
-  trap "kill $server_pid >/dev/null 2>&1 || true" EXIT
-  for attempt in 1 2 3 4 5; do
-    if curl -fsS --max-time 1 http://127.0.0.1:43117/ >/dev/null; then break; fi
-    sleep 0.1
-  done
-  test "$(curl -fsS --max-time 1 http://127.0.0.1:43117/)" = reachable
-
-  gosu agent env HOME=/home/agent CODEX_HOME=/home/agent/.codex \
-    codex sandbox -P :read-only -C "$probe" sh -ec "
-      grep -qx read-ok read.txt
-      if touch forbidden 2>/dev/null; then exit 71; fi
-      if curl -fsS --max-time 1 http://127.0.0.1:43117/ >/dev/null 2>&1; then exit 72; fi
-      test ! -e forbidden
-    "
-  test ! -e "$probe/forbidden"
-'
 CONTAINER="$(docker run -d --entrypoint tail "$IMAGE" -f /dev/null)"
-docker exec "$CONTAINER" mkdir -p /var/lib/openthrottle/repository-source/repo /requests /transport/edit /transport/inspect /transport/command /runtime/fences /tmp/stub /tmp/poison
+docker exec "$CONTAINER" mkdir -p /var/lib/openthrottle/repository-source/repo /requests /transport/edit /transport/inspect /transport/inspect-codex /transport/command /runtime/fences /tmp/stub /tmp/poison
 docker cp "$SOURCE_REPO/." "$CONTAINER:/var/lib/openthrottle/repository-source/repo/"
 docker cp "$REQUESTS/." "$CONTAINER:/requests/"
 docker cp "$SMOKE_DIR/stub/." "$CONTAINER:/tmp/stub/"
@@ -245,9 +329,9 @@ docker exec "$CONTAINER" sh -c '
   chmod 0700 /var/lib/openthrottle/repository-source
   chown -R root:root /requests /tmp/stub /tmp/poison
   chmod 0400 /requests/*.json
-  chmod 0755 /tmp/stub/claude /tmp/poison/claude
+  chmod 0755 /tmp/stub/claude /tmp/stub/codex /tmp/poison/claude
 '
-for name in edit inspect command; do
+for name in edit inspect inspect-codex command; do
   docker exec "$CONTAINER" sh -c '
     printf '\''{"schema":"openthrottle.kernel-lease-generation-fence/v1","attempt_id":"%s","lease_generation":0}\n'\'' "$1" > "$2"
     : > "$3"
@@ -265,6 +349,14 @@ run_action() {
     -e "OT_ACTION_SESSION_FILE=/transport/${name}/session.json" \
     -e "OT_LEASE_GENERATION_FENCE_FILE=/runtime/fences/${name}.json" \
     -e "OT_LEASE_GENERATION_LOCK_FILE=/runtime/fences/${name}.lock" \
+    -e "GITHUB_TOKEN=ambient-github-token" \
+    -e "GH_TOKEN=ambient-gh-token" \
+    -e "LINEAR_API_KEY=ambient-linear-key" \
+    -e "DAYTONA_API_KEY=ambient-daytona-key" \
+    -e "FLY_API_TOKEN=ambient-fly-token" \
+    -e "GIT_ASKPASS=/tmp/ambient-git-askpass" \
+    -e "GIT_SSH_COMMAND=ssh -i /tmp/ambient-git-key" \
+    -e "SSH_ASKPASS=/tmp/ambient-ssh-askpass" \
     "$CONTAINER" /opt/openthrottle/entrypoint.sh
 }
 
@@ -329,6 +421,15 @@ docker exec "$CONTAINER" test ! -e /tmp/openthrottle-smoke-redispatched
 run_action inspect
 INSPECT_RESULT="$(docker exec "$CONTAINER" cat /transport/inspect/result.json)"
 printf '%s' "$INSPECT_RESULT" | jq -e '
+  .outcome.state == "work_complete" and
+  .outcome.result.candidate.candidate.payload.summary == "Inspected repository.\nNo mutation was possible." and
+  .outcome.checkpoint.output_subject == null
+' >/dev/null
+[ "$(git -C "$SOURCE_REPO" show HEAD:work.txt)" = "base" ]
+
+run_action inspect-codex
+CODEX_INSPECT_RESULT="$(docker exec "$CONTAINER" cat /transport/inspect-codex/result.json)"
+printf '%s' "$CODEX_INSPECT_RESULT" | jq -e '
   .outcome.state == "work_complete" and
   .outcome.result.candidate.candidate.payload.summary == "Inspected repository.\nNo mutation was possible." and
   .outcome.checkpoint.output_subject == null
