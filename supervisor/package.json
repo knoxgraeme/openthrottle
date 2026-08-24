@@ -20,8 +20,7 @@
     "@hono/node-server": "^2.0.10",
     "@openthrottle/contracts": "file:../contracts",
     "better-sqlite3": "^12.11.1",
-    "hono": "^4.12.30",
-    "yaml": "^2.9.0"
+    "hono": "^4.12.30"
   },
   "overrides": {
     "@opentelemetry/propagator-jaeger": "2.9.0"
@@ -32,6 +31,7 @@
     "@vitest/coverage-v8": "^3.2.4",
     "tsx": "^4.23.1",
     "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "yaml": "^2.9.0"
   }
 }
