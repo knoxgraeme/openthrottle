@@ -32,7 +32,8 @@ Usage:
   openthrottle plan prepare <file.md> [--pipeline <id>] [--json]
                                     Prepare the execution plan using the committed
                                     pipeline, configured engine, and planning skill.
-  openthrottle validate <file.md>   Alias for plan validate.
+  openthrottle validate <file.md> [--pipeline <id>] [--json]
+                                    Alias for plan validate.
   openthrottle ship <file.md> [--pipeline <id>]
                                     Validate committed definitions, create a Linear
                                     issue, and delegate it to the agent. --pipeline
@@ -40,8 +41,10 @@ Usage:
   openthrottle status <run-or-source-reference> [--json]
                                     Show the shared-kernel run, Attempt, Effect,
                                     checkpoint, and result-correction status.
-  openthrottle stop <ticket>       Stop a ticket's active run and workspace.
-  openthrottle logs <ticket>       Print sanitized sandbox logs.
+  openthrottle stop <run-or-source-reference>
+                                    Request that the supervisor stop the active run.
+  openthrottle logs <run-or-source-reference>
+                                    Print the run evidence timeline.
   openthrottle analysis [flags]    Read-only settled-run and Record metadata:
                                     --run, --pipeline, --outcome, --record-kind,
                                     --from, --to, --limit.
