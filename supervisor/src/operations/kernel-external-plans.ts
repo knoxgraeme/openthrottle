@@ -61,10 +61,11 @@ export interface KernelExternalStagePlanBinding {
   subject_policy: KernelExternalSubjectPolicy;
   phases: readonly KernelExternalPhaseShape[];
   /**
-   * Preparation is executor-owned. Advancing plans reconcile/apply local Git
-   * work here and return the verified resulting subject; preserving plans
-   * return null. It must be idempotent because a worker may die before the
-   * atomic schedule transition is acknowledged.
+   * Preparation is executor-owned and always leaves the verified output
+   * subject null. Subject-advancing plans verify and set that subject in
+   * promote(); preserving plans keep it null. Preparation must be idempotent
+   * because a worker may die before the atomic schedule transition is
+   * acknowledged.
    */
   prepare(input: {
     run: Readonly<KernelRun>;

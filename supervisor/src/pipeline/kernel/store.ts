@@ -22,10 +22,6 @@ export type AtomicTransitionApplyResult =
   | { disposition: "applied"; run_version: number }
   | { disposition: "replayed"; run_version: number };
 
-export interface AtomicTransitionStore {
-  applyTransition(bundle: AtomicTransitionBundle): Promise<AtomicTransitionApplyResult>;
-}
-
 export function atomicTransitionContent(
   bundle: AtomicTransitionBundle,
 ): AtomicTransitionBundleContent {

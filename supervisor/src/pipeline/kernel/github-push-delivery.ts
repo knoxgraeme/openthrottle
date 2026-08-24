@@ -21,7 +21,7 @@ export function isGithubPushDelivery(record: ExecutionRecord): record is Deliver
     record.payload.inline.effect_kind === "github/push-checkpoint@1";
 }
 
-export function parseConfirmedGithubPushDelivery(input: {
+function parseConfirmedGithubPushDelivery(input: {
   record: ExecutionRecord;
   label: string;
   pipeline_run_id: string;
