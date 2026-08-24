@@ -93,6 +93,10 @@ export function unique<T extends string>(values: readonly T[], path: string): T[
   return [...values];
 }
 
+export function optional<T>(value: unknown, parse: (entry: unknown) => T): T | undefined {
+  return value === undefined ? undefined : parse(value);
+}
+
 export function nullable<T>(value: unknown, parse: (entry: unknown) => T): T | null {
   return value === null ? null : parse(value);
 }
