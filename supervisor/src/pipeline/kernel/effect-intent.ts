@@ -63,7 +63,10 @@ export function effectIntentContentHash(intent: EffectIntent): string {
   return digestCanonicalJson(validateEffectIntent(intent).value);
 }
 
-export function assertImmutableEffectReplay(existing: EffectIntent, replay: EffectIntent): void {
+export function assertImmutableEffectReplay(
+  existing: Readonly<EffectIntent>,
+  replay: Readonly<EffectIntent>,
+): void {
   assertSameIdempotentEffect(
     validateEffectIntent(existing, { source: "existing_effect_intent" }),
     validateEffectIntent(replay, { source: "replay_effect_intent" }),
@@ -71,16 +74,11 @@ export function assertImmutableEffectReplay(existing: EffectIntent, replay: Effe
 }
 
 export function reconcileEffectIntent(input: {
-  intent: EffectIntent;
-  decision: DecisionRecord;
+  intent: Readonly<EffectIntent>;
   observation: EffectObservation;
   retry_at?: string;
 }): EffectReconciliation {
-  const intent = authorizeEffectIntent(
-    input.intent,
-    input.decision,
-    input.decision.pipeline_run_id,
-  );
+  const intent = validateEffectIntent(input.intent, { source: "effect_reconciliation.intent" }).value;
   if (input.observation.external_identity !== intent.target) {
     throw new Error("effect observation does not match the deterministic external identity");
   }

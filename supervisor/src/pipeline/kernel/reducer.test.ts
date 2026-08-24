@@ -2095,17 +2095,14 @@ describe("effect ownership and reconciliation", () => {
     const delivery = deliveryRecord(intent);
     expect(reconcileEffectIntent({
       intent,
-      decision,
       observation: { kind: "found", external_identity: intent.target, delivery },
     })).toEqual({ kind: "append_delivery", delivery });
     expect(reconcileEffectIntent({
       intent,
-      decision,
       observation: { kind: "not_found", external_identity: intent.target },
     })).toEqual({ kind: "execute", intent });
     expect(reconcileEffectIntent({
       intent,
-      decision,
       observation: { kind: "unknown", external_identity: intent.target, detail: "provider timeout" },
       retry_at: "2026-08-20T00:00:05.000Z",
     })).toEqual({
@@ -2126,7 +2123,6 @@ describe("effect ownership and reconciliation", () => {
     })).toThrow(/conflicts with an existing immutable effect intent/);
     expect(() => reconcileEffectIntent({
       intent,
-      decision,
       observation: { kind: "not_found", external_identity: "github:other" },
     })).toThrow(/deterministic external identity/);
   });
