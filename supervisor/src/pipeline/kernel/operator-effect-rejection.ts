@@ -27,7 +27,7 @@ const INTEGRATION_IDEMPOTENCY_KEY_MAX_LENGTH = 500;
 const LEGACY_INTEGRATION_IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:/-]+$/;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
-const EVIDENCE_TEXT_MAX_LENGTH = 1_500;
+export const EVIDENCE_TEXT_MAX_LENGTH = 1_500;
 
 export class KernelOperatorEffectRejectionConflictError extends Error {
   constructor(message: string) {

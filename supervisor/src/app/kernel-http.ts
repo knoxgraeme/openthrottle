@@ -24,8 +24,10 @@ import type {
   KernelStatusProjection,
 } from "../persistence/kernel-projection-store.js";
 import {
+  EVIDENCE_TEXT_MAX_LENGTH,
   KernelOperatorEffectRejectionConflictError,
   KernelOperatorEffectRejectionNotFoundError,
+  OPERATOR_EFFECT_REJECTION_REASON_CODE,
 } from "../pipeline/kernel/operator-effect-rejection.js";
 import type {
   KernelOperatorEffectRejectionPort,
@@ -140,8 +142,10 @@ function boundedReason(reason: string | undefined): string {
 
 function boundedEffectRejectionReason(reason: string): string {
   const value = sanitizeText(reason).trim();
-  if (value.length < 1 || value.length > 1_500) {
-    throw new Error("effect rejection reason must contain between 1 and 1500 characters");
+  if (value.length < 1 || value.length > EVIDENCE_TEXT_MAX_LENGTH) {
+    throw new Error(
+      `effect rejection reason must contain between 1 and ${EVIDENCE_TEXT_MAX_LENGTH} characters`,
+    );
   }
   return value;
 }
@@ -346,7 +350,7 @@ export class KernelHttpService {
     reason: string;
   }): Promise<KernelOperatorEffectRejectionResult> {
     const run = this.#run(input.reference);
-    if (input.reason_code !== "legacy_integration_idempotency_key_rejected_before_mutation") {
+    if (input.reason_code !== OPERATOR_EFFECT_REJECTION_REASON_CODE) {
       throw new Error("effect rejection reason_code is unsupported");
     }
     try {
