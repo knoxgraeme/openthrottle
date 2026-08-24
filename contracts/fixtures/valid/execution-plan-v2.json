@@ -17,44 +17,44 @@
         "contracts/src/index.ts"
       ],
       "approach": [
-        "Define ExecutionPlanUnitV2 and ExecutionPlanContractV2 alongside the existing v1 types without modifying v1.",
+        "Define ExecutionPlanUnitV2 and ExecutionPlanContractV2 as the canonical self-contained execution-plan types.",
         "Export parse and validate entry points from the package barrel."
       ],
       "tests": [
         "A valid fixture parses and normalizes to a stable digest.",
-        "An invalid fixture with a missing required field is rejected and names the unit and field."
+        "A malformed plan with a missing required field is rejected and names the unit and field."
       ],
       "acceptance": [
         "The contracts package exports parseExecutionPlanContractV2 and validateExecutionPlanContractV2.",
         "Every behavior-bearing unit carries objective, requirements, files, approach, tests, acceptance, and verification directly."
       ],
       "verification": [
-        "Run the contracts package test suite and confirm the new fixtures pass."
+        "Run the contracts package test suite and confirm the execution-plan contract tests pass."
       ]
     },
     {
-      "id": "corpora",
-      "title": "Add corpora",
+      "id": "validation",
+      "title": "Verify validation",
       "depends_on": ["contracts"],
-      "objective": "Add valid and invalid fixture corpora that exercise the v2 contract's structural validation deterministically.",
+      "objective": "Exercise the v2 contract's structural validation deterministically with focused contract tests.",
       "requirements": [
         "Cover duplicate unit IDs, dependency cycles, unresolved dependency references, invalid command names, unknown fields, and a missing required unit field."
       ],
       "files": [
         "contracts/fixtures/valid/execution-plan-v2.json",
-        "contracts/fixtures/invalid/execution-plan-v2-missing-field.json"
+        "contracts/src/execution-plan-v2.test.ts"
       ],
       "approach": [
-        "Mirror the existing v1 fixture corpus shape with v2-specific field content."
+        "Cover v2-specific validation boundaries directly in the contracts test suite."
       ],
       "tests": [
-        "Each invalid fixture rejects with a stable diagnostic path routed through the shared contracts fixture test."
+        "Invalid plans reject with stable diagnostic paths naming the offending field."
       ],
       "acceptance": [
-        "Invalid corpora reject with stable diagnostic paths naming the offending field."
+        "Contract validation rejects malformed v2 plans with stable diagnostic paths naming the offending field."
       ],
       "verification": [
-        "Run the contracts package test suite and confirm every fixture in the corpus is exercised."
+        "Run the contracts package test suite and confirm the v2 validation boundaries pass."
       ]
     }
   ],

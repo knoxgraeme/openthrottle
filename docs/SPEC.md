@@ -362,7 +362,7 @@ selection/review, finding validation, and result correction use inspect.
 
 ### 6.2 Edit authority
 
-An edit action receives an isolated writable content worktree whose Git
+An edit action receives an isolated writable content tree whose Git
 administration directory, refs, remotes, hooks, and publication credentials are
 executor-owned. It may change only repository content within the sealed scope.
 It cannot commit, push, publish, open/update a pull request, integrate a sibling
