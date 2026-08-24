@@ -459,6 +459,6 @@ export function inspectKernelIntegrationBundle(input: {
     }
     return output;
   } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
