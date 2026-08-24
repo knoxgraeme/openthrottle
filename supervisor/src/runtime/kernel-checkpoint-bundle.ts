@@ -59,30 +59,45 @@ const AUTHOR_ENV = {
   GIT_COMMITTER_EMAIL: "executor@openthrottle.local",
   GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
 };
+const SCRATCH_GIT_CONFIG = [
+  ["maintenance.auto", "false"],
+  ["gc.auto", "0"],
+  ["gc.autodetach", "false"],
+  ["core.fsmonitor", "false"],
+] as const;
 function gitEnvironment(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const environment = { ...process.env };
   for (const key of Object.keys(environment)) {
     if (key.startsWith("GIT_")) delete environment[key];
   }
-  return {
+  const isolated: NodeJS.ProcessEnv = {
     ...environment,
     ...extra,
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_COUNT: "0",
+    GIT_CONFIG_COUNT: String(SCRATCH_GIT_CONFIG.length),
     GIT_NO_REPLACE_OBJECTS: "1",
     GIT_TERMINAL_PROMPT: "0",
   };
+  for (const [index, [key, value]] of SCRATCH_GIT_CONFIG.entries()) {
+    isolated[`GIT_CONFIG_KEY_${index}`] = key;
+    isolated[`GIT_CONFIG_VALUE_${index}`] = value;
+  }
+  return isolated;
 }
 
-function git(cwd: string, args: readonly string[], extraEnv: NodeJS.ProcessEnv = {}): string {
-  const result = spawnSync("git", [...args], {
+function spawnGit(cwd: string, args: readonly string[], extraEnv: NodeJS.ProcessEnv = {}) {
+  return spawnSync("git", [...args], {
     cwd,
     encoding: "utf8",
     timeout: 120_000,
     maxBuffer: 2 * 1024 * 1024,
     env: gitEnvironment(extraEnv),
   });
+}
+
+function git(cwd: string, args: readonly string[], extraEnv: NodeJS.ProcessEnv = {}): string {
+  const result = spawnGit(cwd, args, extraEnv);
   if (result.error || result.status !== 0) {
     const detail = String(result.stderr || result.error?.message || "git command failed").slice(-1_000);
     throw new Error(`checkpoint bundle verification failed: ${detail}`);
@@ -107,26 +122,14 @@ function exactAdvertisedBundleHead(input: {
 }
 
 function isAncestor(repository: string, ancestor: string, descendant: string): boolean {
-  const result = spawnSync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
-    cwd: repository,
-    encoding: "utf8",
-    timeout: 120_000,
-    maxBuffer: 2 * 1024 * 1024,
-    env: gitEnvironment(),
-  });
+  const result = spawnGit(repository, ["merge-base", "--is-ancestor", ancestor, descendant]);
   if (!result.error && (result.status === 0 || result.status === 1)) return result.status === 0;
   const detail = String(result.stderr || result.error?.message || "git command failed").slice(-1_000);
   throw new Error(`checkpoint bundle verification failed: ${detail}`);
 }
 
 function hasCommit(repository: string, commit: string): boolean {
-  const result = spawnSync("git", ["cat-file", "-e", `${commit}^{commit}`], {
-    cwd: repository,
-    encoding: "utf8",
-    timeout: 120_000,
-    maxBuffer: 2 * 1024 * 1024,
-    env: gitEnvironment(),
-  });
+  const result = spawnGit(repository, ["cat-file", "-e", `${commit}^{commit}`]);
   if (!result.error && result.status === 0) return true;
   if (!result.error && result.status !== null && result.status > 0) return false;
   const detail = String(result.stderr || result.error?.message || "git command failed").slice(-1_000);
