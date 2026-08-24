@@ -90,6 +90,13 @@ trap handle_exit EXIT INT TERM
 
 [[ "$(id -u)" -eq 0 ]] || { log "entrypoint must run as root"; exit 1; }
 terminate_agent_processes
+
+if [[ -n "${OT_ACTION_REQUEST_FILE:-}${OT_ACTION_RESULT_FILE:-}${OT_ACTION_SESSION_FILE:-}" &&
+      -n "${OT_INTEGRATION_REQUEST_FILE:-}${OT_INTEGRATION_RESULT_FILE:-}" ]]; then
+  log "action and integration request families are mutually exclusive"
+  exit 1
+fi
+
 validate_repository_source
 seal_repository_source
 

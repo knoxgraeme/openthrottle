@@ -94,6 +94,18 @@ const MODEL_CREDENTIALS = [
   "CODEX_AUTH_JSON",
   "KIMI_CODE_API_KEY",
 ] as const;
+const INTEGRATION_CREDENTIAL_SCRUB = [...MODEL_CREDENTIALS, "GITHUB_TOKEN"] as const;
+const ACTION_ENV_FAMILY = [
+  "OT_ACTION_REQUEST_FILE",
+  "OT_ACTION_RESULT_FILE",
+  "OT_ACTION_SESSION_FILE",
+  "OT_LEASE_GENERATION_FENCE_FILE",
+  "OT_LEASE_GENERATION_LOCK_FILE",
+] as const;
+const INTEGRATION_ENV_FAMILY = [
+  "OT_INTEGRATION_REQUEST_FILE",
+  "OT_INTEGRATION_RESULT_FILE",
+] as const;
 const SAFE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/;
 const KERNEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 
@@ -751,7 +763,10 @@ export class DaytonaKernelAdapter implements
         engine,
         remainingBeforeCredentials,
       );
-    const unset = MODEL_CREDENTIALS.filter((name) => !(name in modelCredentials));
+    const unset = [
+      ...MODEL_CREDENTIALS.filter((name) => !(name in modelCredentials)),
+      ...INTEGRATION_ENV_FAMILY,
+    ];
     await sandbox.updateEnv({
       ...modelCredentials,
       GITHUB_TOKEN: this.#options.github_read_token,
@@ -1293,7 +1308,7 @@ export class DaytonaKernelAdapter implements
     await sandbox.updateEnv({
       OT_INTEGRATION_REQUEST_FILE: paths.input,
       OT_INTEGRATION_RESULT_FILE: paths.result,
-    });
+    }, { unset: [...INTEGRATION_CREDENTIAL_SCRUB, ...ACTION_ENV_FAMILY] });
     const sessionId = `kernel-effect-${safeTransportId(intent.id, "kernel effect ID")}`;
     await sandbox.process.createSession(sessionId).catch(() => undefined);
     await sandbox.process.executeSessionCommand(sessionId, {
