@@ -130,6 +130,8 @@ function runtimeDelivery(kind: "create" | "start"): DeliveryRecord {
 
 function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
   const files = new Map<string, Buffer>();
+  const daemonEnvironment = new Map<string, string>();
+  const sessionEnvironments = new Map<string, Record<string, string>>();
   const defaultExecuteCommand = async (command: string) => {
     const lockInitialization = /touch -- '([^']*lease-generation\.lock)'/.exec(command);
     if (lockInitialization) {
@@ -176,7 +178,11 @@ function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
       }),
     },
     process: {
-      createSession: vi.fn().mockResolvedValue(undefined),
+      createSession: vi.fn(async (sessionId: string) => {
+        if (!sessionEnvironments.has(sessionId)) {
+          sessionEnvironments.set(sessionId, Object.fromEntries(daemonEnvironment));
+        }
+      }),
       executeSessionCommand: vi.fn().mockResolvedValue({ cmdId: "command-1" }),
       executeCommand: vi.fn(defaultExecuteCommand),
       deleteSession: vi.fn().mockResolvedValue(undefined),
@@ -186,8 +192,15 @@ function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
     git: {
       clone: vi.fn().mockResolvedValue(undefined),
     },
-    updateEnv: vi.fn().mockResolvedValue(undefined),
+    updateEnv: vi.fn(async (
+      env: Record<string, string>,
+      options?: { unset?: readonly string[] },
+    ) => {
+      for (const name of options?.unset ?? []) daemonEnvironment.delete(name);
+      for (const [name, value] of Object.entries(env)) daemonEnvironment.set(name, value);
+    }),
     files,
+    sessionEnvironments,
     defaultExecuteCommand,
   };
 }
@@ -484,6 +497,45 @@ function integrationIntentWithSealedBundleSizes(input: {
           tree: "6".repeat(40),
         },
       }],
+    },
+  };
+}
+
+function integrationIntentFor(
+  candidate: ReturnType<typeof selfContainedCheckpointBundle>,
+  effectId: string,
+): EffectIntent {
+  const candidatePointer = {
+    algorithm: "sha256",
+    digest: candidate.descriptor.sha256,
+    bytes: candidate.descriptor.bytes,
+    encoding: "binary",
+    media_type: "application/x-git-bundle",
+    payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+  } as const;
+  return {
+    schema: "openthrottle.effect-intent/v1",
+    id: effectId,
+    pipeline_run_id: "run-1",
+    decision_record_id: `decision-${effectId}`,
+    kind: "daytona/integrate-checkpoint@1",
+    idempotency_key: `run-1:integrate:${effectId}`,
+    target: `daytona:${"d".repeat(64)}:integration:${effectId}`,
+    subject: null,
+    payload: {
+      schema: "openthrottle.daytona-integration/v1",
+      identity: "d".repeat(64),
+      pipeline_run_id: "run-1",
+      attempt_id: "attempt-integration",
+      definition_bundle_hash: "b".repeat(64),
+      checkpoint_base_subject: candidate.descriptor.commit,
+      current_subject: candidate.descriptor.commit,
+      candidate_checkpoint_id: "checkpoint-candidate",
+      candidate_input_subject: candidate.descriptor.commit,
+      candidate_output_subject: candidate.descriptor.commit,
+      candidate_blob: candidatePointer,
+      candidate_artifact: candidate.descriptor,
+      current_ancestry: [],
     },
   };
 }
@@ -843,6 +895,107 @@ describe("DaytonaKernelAdapter", () => {
       OT_LEASE_GENERATION_LOCK_FILE:
         "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.lock",
     }), expect.any(Object));
+  });
+
+  it("clears the opposite request family before Daytona sessions snapshot daemon env", async () => {
+    const request = workRequest({
+      action: {
+        kind: "agent",
+        engine: "codex",
+        model: null,
+        reasoning_effort: null,
+        agent_id: "agent-1",
+        skill_ids: [],
+        entry_skill: null,
+        eval_id: "eval-1",
+        semantic_result_schema: { id: "result-schema", schema: {} },
+        execution_limits: { max_turns: null, task_timeout_seconds: 60 },
+        definition_entries: [],
+      },
+    });
+    const candidate = selfContainedCheckpointBundle(request.request_hash);
+    const beforeAction = integrationIntentFor(candidate, "effect-before-action");
+    const afterAction = integrationIntentFor(candidate, "effect-after-action");
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    emulateRepositoryBinding(sandbox);
+    sandbox.process.executeSessionCommand.mockImplementation(async (sessionId: string) => {
+      const environment = sandbox.sessionEnvironments.get(sessionId);
+      if (!environment) throw new Error(`missing Daytona session environment for ${sessionId}`);
+      if (
+        sessionId.startsWith("kernel-action-") &&
+        !environment.OT_INTEGRATION_REQUEST_FILE &&
+        !environment.OT_INTEGRATION_RESULT_FILE
+      ) {
+        sandbox.files.set(environment.OT_ACTION_SESSION_FILE!, sessionEvent(request));
+        sandbox.files.set(environment.OT_ACTION_RESULT_FILE!, runtimeResult(request));
+      }
+      return { cmdId: `command-${sessionId}` };
+    });
+    sandbox.process.getSessionCommand.mockResolvedValue({
+      cmdId: "command-action",
+      exitCode: 0,
+    });
+    const adapter = adapterFor(sandbox, {
+      read: vi.fn().mockReturnValue(candidate.bytes),
+    }, {}, {
+      materialize_model_credentials: vi.fn().mockResolvedValue({
+        CODEX_AUTH_JSON: "sealed-codex-credentials",
+      }),
+    });
+    const integration = adapter.effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+    const dispatchIntegration = (intent: EffectIntent) => integration.adapter.dispatch({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: {
+        lease_id: `lease-${intent.id}`,
+        worker_id: "worker-integration",
+      },
+      deduplication: {
+        strategy: "deterministic_target",
+        key: intent.idempotency_key,
+        target: intent.target,
+      },
+    });
+
+    await dispatchIntegration(beforeAction);
+    const outcome = await adapter.executeWork(request, {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn().mockResolvedValue(undefined),
+    });
+    await dispatchIntegration(afterAction);
+
+    const actionEnvironment = [...sandbox.sessionEnvironments]
+      .find(([sessionId]) => sessionId.startsWith("kernel-action-"))?.[1];
+    const integrationEnvironments = [...sandbox.sessionEnvironments]
+      .filter(([sessionId]) => sessionId.startsWith("kernel-effect-"))
+      .map(([, environment]) => environment);
+    expect(actionEnvironment).toBeDefined();
+    expect(integrationEnvironments).toHaveLength(2);
+    expect.soft(Object.keys(actionEnvironment!).filter(
+      (name) => name.startsWith("OT_INTEGRATION_"),
+    )).toEqual([]);
+    expect.soft(Object.keys(integrationEnvironments[1]!).filter((name) => [
+      "OT_ACTION_REQUEST_FILE",
+      "OT_ACTION_RESULT_FILE",
+      "OT_ACTION_SESSION_FILE",
+      "OT_LEASE_GENERATION_FENCE_FILE",
+      "OT_LEASE_GENERATION_LOCK_FILE",
+    ].includes(name))).toEqual([]);
+    expect.soft(Object.keys(integrationEnvironments[1]!).filter((name) => [
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "CODEX_AUTH_JSON",
+      "GITHUB_TOKEN",
+      "KIMI_CODE_API_KEY",
+    ].includes(name))).toEqual([]);
+    expect(outcome).toEqual({
+      state: "work_failed",
+      retryable: true,
+      reason: "runtime failed",
+    });
   });
 
   it("polls the independent session and result files together and binds before acceptance", async () => {

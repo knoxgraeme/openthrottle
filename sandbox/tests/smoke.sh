@@ -380,6 +380,23 @@ docker exec "$CONTAINER" test ! -e /transport/invalid-source/session.json
 docker exec "$CONTAINER" test ! -e /transport/invalid-source/result.json
 docker exec "$CONTAINER" chmod 0700 /var/lib/openthrottle/repository-source
 
+# Daytona sessions inherit persistent sandbox environment; reject mixed
+# request families instead of selecting an executor.
+MIXED_REQUEST_LOG="$SMOKE_DIR/mixed-request-family.log"
+if docker exec \
+  -e "OT_ACTION_REQUEST_FILE=/requests/edit.json" \
+  -e "OT_ACTION_RESULT_FILE=/transport/edit/result.json" \
+  -e "OT_ACTION_SESSION_FILE=/transport/edit/session.json" \
+  -e "OT_INTEGRATION_REQUEST_FILE=/requests/stale-integration.json" \
+  -e "OT_INTEGRATION_RESULT_FILE=/transport/stale-integration/result.json" \
+  "$CONTAINER" /opt/openthrottle/entrypoint.sh >"$MIXED_REQUEST_LOG" 2>&1; then
+  echo "entrypoint accepted mixed action and integration request families" >&2
+  exit 47
+fi
+grep -F 'action and integration request families are mutually exclusive' "$MIXED_REQUEST_LOG" >/dev/null
+docker exec "$CONTAINER" test ! -e /transport/edit/result.json
+docker exec "$CONTAINER" test ! -e /transport/edit/session.json
+
 run_action edit
 [ "$(docker exec "$CONTAINER" stat -c %U:%G:%a /var/lib/openthrottle/repository-source)" = "root:root:700" ]
 [ -z "$(docker exec "$CONTAINER" find -P /var/lib/openthrottle/repository-source/repo \( ! -user root -o ! -group root \) -print -quit)" ]
