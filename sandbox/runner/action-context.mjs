@@ -249,7 +249,7 @@ function projectedCheckpoints(checkpoints) {
   }));
 }
 
-export function projectActionContext(request) {
+function projectActionContext(request) {
   const input = object(request, "action context request");
   const stageId = identifier(input.stage_id, "action context stage ID");
   const context = object(input.context, "action context");

@@ -62,7 +62,6 @@ const RESULT_CORRECTION_WINDOW_MS = 15 * 60 * 1000;
 const MAX_TRANSPORT_BYTES = 4 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_WORK_FAILURE_REASON_CHARS = 1_500;
-const MAX_LAUNCH_DIAGNOSTIC_STREAM_LABEL_CHARS = "stderr: ".length + "stdout: ".length;
 
 function validateExecutionLimits(value, label, engine = null) {
   if (!value || typeof value !== "object" || Array.isArray(value) ||
@@ -297,12 +296,10 @@ function boundedCommandSummary(execution) {
 
 function boundedAgentFailureReason(prefix, { stdout = "", stderr = "", env }) {
   const diagnosticLabel = " Executor diagnostic: ";
-  // launchDiagnosticTail's max budgets stream content and separators; reserve
-  // the two stream labels it may add so the useful tail is not sliced later.
+  // Give the label-free key=value diagnostic all remaining failure-reason space.
   const diagnosticBudget = Math.max(
     0,
-    MAX_WORK_FAILURE_REASON_CHARS - prefix.length - diagnosticLabel.length -
-      MAX_LAUNCH_DIAGNOSTIC_STREAM_LABEL_CHARS,
+    MAX_WORK_FAILURE_REASON_CHARS - prefix.length - diagnosticLabel.length,
   );
   const diagnostic = launchDiagnosticTail({
     stdout,

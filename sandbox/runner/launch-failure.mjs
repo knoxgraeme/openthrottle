@@ -17,14 +17,6 @@ export const ENGINE_CREDENTIAL_ENV = Object.freeze({
   opencode: "KIMI_CODE_API_KEY",
 });
 
-export const LAUNCH_FAILURE_REASONS = Object.freeze([
-  "credential_missing",
-  "credential_rejected",
-  "rate_limited",
-  "unregistered_command",
-  "engine_crash",
-]);
-
 // OPE-104: an untraversable sandbox root let Claude launch without ever
 // resolving its own skill discovery root, so it silently registered zero
 // user skills, answered this exact prefix for the requested slash command,
