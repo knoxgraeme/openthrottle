@@ -68,6 +68,7 @@ describe("sandbox Dockerfile", () => {
     expect(dockerfile).not.toContain("ot-review-");
     expect(dockerfile).toContain("COPY sandbox/runner /opt/openthrottle/runner");
     expect(dockerfile).toContain("COPY sandbox/bin/ot-result.mjs /opt/openthrottle/bin/ot-result.mjs");
+    expect(dockerfile).not.toContain("ot-activity");
     expect(dockerfile).not.toContain("ot-stage-result");
     expect(dockerfile).not.toContain("ot-subject-post");
     expect(dockerfile).not.toContain("runtime-capabilities.json");
