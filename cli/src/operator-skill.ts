@@ -233,14 +233,6 @@ function digestDirectory(root: string): string {
   return hash.digest("hex");
 }
 
-export function operatorSkillBundleDigest(): string {
-  return digestDirectory(resolveOperatorSkillBundlePath());
-}
-
-export function planningSkillBundleDigest(): string {
-  return digestDirectory(resolvePlanningSkillBundlePath());
-}
-
 function resolveSkillfishBin(): string {
   const require = createRequire(import.meta.url);
   const packagePath = require.resolve("skillfish/package.json");
