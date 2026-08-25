@@ -176,6 +176,44 @@ describe("expired kernel Attempt lease recovery", () => {
     ).get()).toEqual({ count: 1 });
   });
 
+  it("drains expired leases admitted before execution width was lowered", async () => {
+    fixture = freshKernelFixture();
+    for (const ordinal of [1, 2]) {
+      seedKernelRun({ db: fixture.db, run_id: `run-${ordinal}` });
+      seedKernelAttempt({
+        db: fixture.db,
+        run_id: `run-${ordinal}`,
+        id: `attempt-${ordinal}`,
+        status: "pending",
+        lease: {
+          id: `lease-${ordinal}`,
+          worker_id: "worker-before-rollback",
+          purpose: "work",
+          expires_at: EXPIRED,
+          started: false,
+        },
+      });
+    }
+    const store = new SqliteKernelStore({
+      db: fixture.db,
+      blob_store: fixture.blobs,
+      manifest_resolver: { resolve: () => { throw new Error("not used"); } },
+      payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
+      execution_policy: EXECUTION_POLICY,
+      execution_width: 1,
+      now: () => OBSERVED,
+    });
+
+    await expect(store.recoverExpiredAttemptLeases({
+      observed_at: OBSERVED,
+      expires_at: RENEWED,
+      limit: 2,
+    })).resolves.toMatchObject([
+      { run_id: "run-1", lease: { id: "lease-1", generation: 1 } },
+      { run_id: "run-2", lease: { id: "lease-2", generation: 1 } },
+    ]);
+  });
+
   it("bounds recovery and refuses non-forward lease timestamps", async () => {
     fixture = freshKernelFixture();
     const store = new SqliteKernelStore({

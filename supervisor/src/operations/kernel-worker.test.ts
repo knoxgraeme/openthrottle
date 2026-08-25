@@ -40,7 +40,7 @@ function inboxEvent(): KernelInboxEvent {
 
 function workerFixture(
   handler: (event: KernelInboxEvent) => Promise<"consumed" | "stale" | "dead">,
-  options: { initial_inbox_event?: KernelInboxEvent | null } = {},
+  options: { initial_inbox_event?: KernelInboxEvent | null; execution_width?: number } = {},
 ) {
   let next: KernelInboxEvent | null = options.initial_inbox_event === undefined
     ? inboxEvent()
@@ -65,7 +65,6 @@ function workerFixture(
   const ordinary = {
     resumeReadyAttempt: vi.fn(async () => ({ disposition: "idle" as const })),
     terminalizeExhaustedRecovery: vi.fn(async () => null),
-    leaseAndExecuteNext: vi.fn(async () => ({ disposition: "idle" as const })),
     executeLeasedAttempt: vi.fn(),
   } as unknown as OrdinaryKernelCoordinator;
   const external = {
@@ -85,6 +84,7 @@ function workerFixture(
       worker_id: "worker-1",
       lease_seconds: 120,
       cycle_limit: 2,
+      execution_width: options.execution_width ?? 1,
       now: () => new Date(NOW),
     }),
     complete,
@@ -253,5 +253,49 @@ describe("KernelWorker", () => {
     expect(fixture.attempts.leaseNextEligibleAttempt).toHaveBeenCalledTimes(2);
     expect(fixture.ordinary.executeLeasedAttempt).toHaveBeenCalledTimes(1);
     expect(available).toEqual([successor]);
+  });
+
+  it("executes a width-two cross-run batch concurrently and counts interleaved settlements", async () => {
+    const fixture = workerFixture(async () => "consumed", {
+      initial_inbox_event: null,
+      execution_width: 2,
+    });
+    const first = {
+      run_id: "run-1",
+      attempt: { id: "attempt-1" },
+      lease: { id: "lease-1", generation: 0 },
+    } as never;
+    const second = {
+      run_id: "run-2",
+      attempt: { id: "attempt-2" },
+      lease: { id: "lease-2", generation: 0 },
+    } as never;
+    const available = [first, second];
+    vi.mocked(fixture.attempts.leaseNextEligibleAttempt)
+      .mockImplementation(async () => available.shift() ?? null);
+    const releases = new Map<string, () => void>();
+    const settlementOrder: string[] = [];
+    vi.mocked(fixture.ordinary.executeLeasedAttempt).mockImplementation(async (leased) => {
+      await new Promise<void>((resolve) => releases.set(leased.attempt.id, resolve));
+      settlementOrder.push(leased.attempt.id);
+      return {
+        disposition: "settled" as const,
+        pipeline_run_id: leased.run_id,
+        attempt_id: leased.attempt.id,
+        stage_id: "implement",
+        run_status: "completed" as const,
+        next_stage_id: null,
+      };
+    });
+
+    const cycle = fixture.worker.runCycle();
+    await vi.waitFor(() => expect(fixture.ordinary.executeLeasedAttempt).toHaveBeenCalledTimes(2));
+    releases.get("attempt-2")!();
+    await vi.waitFor(() => expect(settlementOrder).toEqual(["attempt-2"]));
+    releases.get("attempt-1")!();
+
+    await expect(cycle).resolves.toBe(2);
+    expect(settlementOrder).toEqual(["attempt-2", "attempt-1"]);
+    expect(fixture.attempts.leaseNextEligibleAttempt).toHaveBeenCalledTimes(2);
   });
 });

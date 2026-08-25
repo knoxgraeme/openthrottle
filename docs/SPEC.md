@@ -47,9 +47,10 @@ signed provider event / operator command
 ```
 
 At most one reducer transition owns a run cursor version. The protocol retains
-bounded frontiers of independent Attempts, but this release admits at most one
-live Attempt and executes every frontier serially. Future overlap must not
-become concurrent cursor mutation.
+bounded frontiers of independent Attempts. The kernel admits up to a configured
+number of live Attempts across distinct runs (default one), with at most one
+live Attempt per run in this release. Cross-run overlap must not become
+concurrent mutation of any one run cursor.
 
 ## 3. Filesystem definitions
 
@@ -456,10 +457,12 @@ publication.
 
 Structured execution parses the exact validated execution plan from the sealed
 task prompt. It compiles a bounded dependency frontier with stable Attempt IDs.
-Dependencies determine eligibility, but this release executes eligible unit
-Attempts serially. The complete frontier remains durable and visible; width one
-changes overlap, not plan cardinality. Deterministic dependency evidence is
-merged into each action context.
+Dependencies determine eligibility. The kernel may execute eligible Attempts
+concurrently only across distinct runs, up to the configured execution width
+(default one); this release admits at most one live Attempt per run. The
+complete frontier remains durable and visible, so execution width changes
+overlap, not plan cardinality. Deterministic dependency evidence is merged into
+each action context.
 
 Each unit cycles through edit implementation/simplification, commands,
 inspect-only lead acceptance, optional edit repair, and an integration Effect.
@@ -469,7 +472,7 @@ exact subject; a unit whose base is stale must be reconciled explicitly.
 After all units integrate, whole-change commands run. An inspect selector
 chooses up to `core/persona-selection.payload.personas.max_items` entries from
 the sealed reviewer-skill allowlist (currently five). Each selected persona is
-an independent scoped inspect Attempt; a width-one dependency chain executes
+an independent scoped inspect Attempt; the per-run dependency chain executes
 the complete roster serially against the same subject. An inspect validation
 action confirms blocking findings. Confirmed blockers schedule a separate edit
 final-repair Attempt and repeat the bounded assurance cycle; advisory findings

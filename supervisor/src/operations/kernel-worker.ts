@@ -19,6 +19,7 @@ export class KernelWorker {
   readonly #workerId: string;
   readonly #leaseMs: number;
   readonly #cycleLimit: number;
+  readonly #executionWidth: number;
   readonly #now: () => Date;
 
   constructor(input: {
@@ -31,6 +32,7 @@ export class KernelWorker {
     worker_id: string;
     lease_seconds: number;
     cycle_limit: number;
+    execution_width: number;
     now?: () => Date;
   }) {
     this.#attempts = input.attempts;
@@ -42,6 +44,10 @@ export class KernelWorker {
     this.#workerId = input.worker_id;
     this.#leaseMs = input.lease_seconds * 1_000;
     this.#cycleLimit = input.cycle_limit;
+    if (!Number.isSafeInteger(input.execution_width) || input.execution_width < 1) {
+      throw new Error("execution_width must be a positive integer");
+    }
+    this.#executionWidth = input.execution_width;
     this.#now = input.now ?? (() => new Date());
   }
 
@@ -62,18 +68,14 @@ export class KernelWorker {
     return new Date(this.#now().getTime() + delayMs).toISOString();
   }
 
-  async #executeAttempt(step: Promise<OrdinaryKernelStep>): Promise<boolean> {
-    const result = await step;
-    if (result.disposition === "idle") return false;
-    if (result.disposition === "external_boundary") {
-      await this.#external.executeLeasedAttempt(result.leased);
-    }
-    return true;
-  }
-
   async #executeLeasedAttempt(leased: LeasedAttemptView): Promise<boolean> {
     try {
-      return await this.#executeAttempt(this.#ordinary.executeLeasedAttempt(leased));
+      const result = await this.#ordinary.executeLeasedAttempt(leased);
+      if (result.disposition === "idle") return false;
+      if (result.disposition === "external_boundary") {
+        await this.#external.executeLeasedAttempt(result.leased);
+      }
+      return true;
     } catch (error) {
       try {
         return await this.#ordinary.terminalizeExhaustedRecovery(leased, error) !== null;
@@ -155,22 +157,30 @@ export class KernelWorker {
       progressed += 1;
     }
 
-    // A fresh Attempt may run long enough for a control event to arrive. Yield
-    // after one lease so the next cycle traverses the durable inbox before any
-    // newly eligible successor can start.
+    // Fresh Attempts may run long enough for a control event to arrive. Lease
+    // one fixed cross-run batch, then yield so the next cycle traverses the
+    // durable inbox before any newly eligible successor can start.
     if (this.#cycleLimit > 0 && !signal?.aborted) {
-      const attemptFence = this.#fence("attempt");
-      let leased: Awaited<ReturnType<KernelAttemptLeasePort["leaseNextEligibleAttempt"]>> = null;
-      try {
-        leased = await this.#attempts.leaseNextEligibleAttempt({
-          worker_id: this.#workerId,
-          lease_id: attemptFence.lease_id,
-          expires_at: attemptFence.expires_at,
-        });
-      } catch {
-        leased = null;
+      const leasedAttempts: LeasedAttemptView[] = [];
+      for (let index = 0; index < this.#executionWidth && !signal?.aborted; index += 1) {
+        const attemptFence = this.#fence("attempt");
+        let leased: Awaited<ReturnType<KernelAttemptLeasePort["leaseNextEligibleAttempt"]>>;
+        try {
+          leased = await this.#attempts.leaseNextEligibleAttempt({
+            worker_id: this.#workerId,
+            lease_id: attemptFence.lease_id,
+            expires_at: attemptFence.expires_at,
+          });
+        } catch {
+          break;
+        }
+        if (!leased) break;
+        leasedAttempts.push(leased);
       }
-      if (leased && await this.#executeLeasedAttempt(leased)) progressed += 1;
+      const executions = await Promise.all(
+        leasedAttempts.map((leased) => this.#executeLeasedAttempt(leased)),
+      );
+      progressed += executions.filter(Boolean).length;
     }
 
     for (let index = 0; index < this.#cycleLimit && !signal?.aborted; index += 1) {

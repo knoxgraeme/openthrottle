@@ -167,6 +167,7 @@ function setup(
   faultInjector?: (point: KernelStoreFaultPoint) => void,
   now: () => string = () => NOW,
   withRuntimeLifecycle = false,
+  executionWidth = 1,
 ): {
   db: Database.Database;
   blobs: VolumeBlobStore;
@@ -224,6 +225,7 @@ function setup(
     manifest_resolver: { resolve: () => pipelineManifest },
     payload_schemas: payloadSchemas,
     execution_policy: EXECUTION_POLICY,
+    execution_width: executionWidth,
     now,
     fault_injector: faultInjector,
   });
@@ -270,6 +272,99 @@ function setup(
       initial_attempts: [initialAttempt],
     },
   };
+}
+
+function admitAdditionalRun(
+  context: ReturnType<typeof setup>,
+  runId: string,
+  ordinal: number,
+  initialAttempts: readonly KernelAttempt[],
+): void {
+  const bundleHash = context.admission.run.definition_bundle_hash;
+  context.store.admitPipelineRun({
+    ...context.admission,
+    work_item: {
+      ...context.admission.work_item,
+      id: `work-${ordinal}`,
+      source_id: `issue-${ordinal}`,
+      source_reference: `OPE-${ordinal}`,
+    },
+    run: {
+      ...run(initialAttempts, bundleHash),
+      id: runId,
+      active_attempt_versions: Object.fromEntries(
+        initialAttempts.map((candidate) => [candidate.id, candidate.version]),
+      ),
+    },
+    initial_attempts: [...initialAttempts],
+  });
+}
+
+function seedConfirmedRuntimeEffect(
+  context: ReturnType<typeof setup>,
+  input: {
+    run_id: string;
+    kind: "daytona/create-sandbox@1" | "daytona/cleanup-sandbox@1";
+    sequence: number;
+  },
+): void {
+  const suffix = `${input.run_id}-${input.kind.includes("cleanup") ? "cleanup" : "create"}`;
+  const decisionId = `decision-${suffix}`;
+  const effectId = `effect-${suffix}`;
+  const deliveryId = `delivery-${suffix}`;
+  const idempotencyKey = `${input.run_id}:${input.kind}`;
+  const deliveryPayload = {
+    effect_kind: input.kind,
+    provider: "daytona",
+    result: { sandbox_id: `sandbox-${input.run_id}` },
+  };
+  context.db.transaction(() => {
+    context.db.prepare(`
+      INSERT INTO records (
+        id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+        inline_payload, reducer, input_record_ids_json, input_record_count, created_at
+      ) VALUES (?, ?, ?, ?, 'decision', 'decision/v1', '{}',
+        'core/runtime-lifecycle-test@1', '[]', 0, ?)
+    `).run(decisionId, input.run_id, input.sequence, sha("6"), NOW);
+    context.db.prepare(`
+      INSERT INTO effects (
+        id, pipeline_run_id, decision_record_id, kind, idempotency_key, target,
+        payload_schema, inline_payload, intent_hash, status, version, attempt_count,
+        available_at, delivery_record_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}', ?, 'acknowledged', 1, 1, ?, ?, ?, ?)
+    `).run(
+      effectId,
+      input.run_id,
+      decisionId,
+      input.kind,
+      idempotencyKey,
+      `daytona:sandbox-${input.run_id}`,
+      input.kind,
+      sha("7"),
+      NOW,
+      deliveryId,
+      NOW,
+      NOW,
+    );
+    context.db.prepare(`
+      INSERT INTO records (
+        id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+        inline_payload, effect_id, idempotency_key, external_identity,
+        delivery_status, created_at
+      ) VALUES (?, ?, ?, ?, 'delivery', 'openthrottle.effect-delivery/v1',
+        ?, ?, ?, ?, 'confirmed', ?)
+    `).run(
+      deliveryId,
+      input.run_id,
+      input.sequence + 1,
+      sha("8"),
+      JSON.stringify(deliveryPayload),
+      effectId,
+      idempotencyKey,
+      `daytona:sandbox-${input.run_id}`,
+      NOW,
+    );
+  }).immediate();
 }
 
 function exactMap<T extends { id: string }>(...values: T[]): ReadonlyMap<string, T> {
@@ -1002,6 +1097,463 @@ describe("SqliteKernelStore", () => {
       })).toBeNull();
     } finally {
       competingDb?.close();
+      context.db.close();
+    }
+  });
+
+  it("leases up to width from distinct runs without admitting two Attempts from one run", async () => {
+    const context = setup(undefined, () => NOW, false, 2);
+    try {
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const first = context.admission.initial_attempts[0]!;
+      const sameRun = attempt({
+        id: "attempt-1b",
+        pipeline_run_id: "run-1",
+        scope: {
+          kind: "loop_item",
+          stage_id: "work",
+          parent_attempt_id: "attempt-1",
+          loop_id: "units",
+          item_id: "unit-b",
+          item_index: 1,
+        },
+        definition_bundle_hash: bundleHash,
+      });
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: run([first, sameRun], bundleHash),
+        initial_attempts: [first, sameRun],
+      });
+      const otherRun = attempt({
+        id: "attempt-2",
+        pipeline_run_id: "run-2",
+        definition_bundle_hash: bundleHash,
+      });
+      admitAdditionalRun(context, "run-2", 2, [otherRun]);
+
+      const firstLease = await context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-1",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      });
+      const secondLease = await context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-2",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      });
+
+      expect([firstLease?.run_id, secondLease?.run_id]).toEqual(["run-1", "run-2"]);
+      expect(firstLease?.attempt.id).toBe("attempt-1");
+      expect(secondLease?.attempt.id).toBe("attempt-2");
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-3",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
+      expect(context.db.prepare(
+        "SELECT lease_id FROM attempts WHERE id = 'attempt-1b'",
+      ).get()).toEqual({ lease_id: null });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("keeps confirmed sandboxes inside the width budget until cleanup is confirmed", async () => {
+    const context = setup(undefined, () => NOW, false, 2);
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const second = attempt({
+        id: "attempt-2",
+        pipeline_run_id: "run-2",
+        definition_bundle_hash: bundleHash,
+      });
+      const third = attempt({
+        id: "attempt-3",
+        pipeline_run_id: "run-3",
+        definition_bundle_hash: bundleHash,
+      });
+      admitAdditionalRun(context, "run-2", 2, [second]);
+      admitAdditionalRun(context, "run-3", 3, [third]);
+      seedConfirmedRuntimeEffect(context, {
+        run_id: "run-1",
+        kind: "daytona/create-sandbox@1",
+        sequence: 1,
+      });
+      seedConfirmedRuntimeEffect(context, {
+        run_id: "run-2",
+        kind: "daytona/create-sandbox@1",
+        sequence: 1,
+      });
+
+      const reservedRunLease = await context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-reserved-run",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      });
+      expect(reservedRunLease).toMatchObject({ run_id: "run-1" });
+      context.db.prepare(`
+        UPDATE attempts SET status = 'failed', version = version + 1,
+          lease_id = NULL, lease_generation = NULL, lease_worker_id = NULL,
+          lease_purpose = NULL, lease_expires_at = NULL, lease_started = NULL,
+          updated_at = ?
+        WHERE id = 'attempt-1'
+      `).run(NOW);
+      context.db.prepare(
+        "UPDATE attempts SET unmet_dependency_count = 1 WHERE id = 'attempt-2'",
+      ).run();
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-over-sandbox-budget",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
+      expect(context.db.prepare(
+        "SELECT status, lease_id FROM attempts WHERE id = 'attempt-3'",
+      ).get()).toEqual({ status: "pending", lease_id: null });
+
+      seedConfirmedRuntimeEffect(context, {
+        run_id: "run-1",
+        kind: "daytona/cleanup-sandbox@1",
+        sequence: 3,
+      });
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-after-cleanup",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ run_id: "run-3", attempt: { id: "attempt-3" } });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("leaves a newly ready Attempt queued while width is saturated and leases it after a slot settles", async () => {
+    const context = setup(undefined, () => NOW, false, 2);
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const second = attempt({
+        id: "attempt-2",
+        pipeline_run_id: "run-2",
+        definition_bundle_hash: bundleHash,
+      });
+      const third = attempt({
+        id: "attempt-3",
+        pipeline_run_id: "run-3",
+        definition_bundle_hash: bundleHash,
+      });
+      admitAdditionalRun(context, "run-2", 2, [second]);
+      admitAdditionalRun(context, "run-3", 3, [third]);
+      context.db.prepare(
+        "UPDATE attempts SET unmet_dependency_count = 1 WHERE id = 'attempt-3'",
+      ).run();
+
+      for (const ordinal of [1, 2]) {
+        await expect(context.store.leaseNextEligibleAttempt({
+          worker_id: "worker-1",
+          lease_id: `lease-${ordinal}`,
+          expires_at: "2026-08-20T12:05:00.000Z",
+        })).resolves.not.toBeNull();
+      }
+      context.db.prepare(
+        "UPDATE attempts SET unmet_dependency_count = 0 WHERE id = 'attempt-3'",
+      ).run();
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-saturated",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
+      expect(context.db.prepare(
+        "SELECT status, lease_id FROM attempts WHERE id = 'attempt-3'",
+      ).get()).toEqual({ status: "pending", lease_id: null });
+
+      context.db.prepare(`
+        UPDATE attempts SET status = 'failed', version = version + 1,
+          lease_id = NULL, lease_generation = NULL, lease_worker_id = NULL,
+          lease_purpose = NULL, lease_expires_at = NULL, lease_started = NULL,
+          updated_at = ?
+        WHERE id = 'attempt-1'
+      `).run(NOW);
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-next-cycle",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ run_id: "run-3", attempt: { id: "attempt-3" } });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("settles two cross-run leases through real persistence in reverse completion order", async () => {
+    const context = setup(undefined, () => NOW, false, 2);
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const second = attempt({
+        id: "attempt-2",
+        pipeline_run_id: "run-2",
+        definition_bundle_hash: bundleHash,
+      });
+      admitAdditionalRun(context, "run-2", 2, [second]);
+      const leases = await Promise.all([
+        context.store.leaseNextEligibleAttempt({
+          worker_id: "worker-1",
+          lease_id: "lease-1",
+          expires_at: "2026-08-20T12:05:00.000Z",
+        }),
+        context.store.leaseNextEligibleAttempt({
+          worker_id: "worker-1",
+          lease_id: "lease-2",
+          expires_at: "2026-08-20T12:05:00.000Z",
+        }),
+      ]);
+      if (!leases[0] || !leases[1]) throw new Error("expected two cross-run leases");
+
+      const prepareSettlement = async (
+        leased: NonNullable<(typeof leases)[number]>,
+        ordinal: number,
+      ): Promise<AtomicTransitionBundle> => {
+        let view = await context.store.loadExactReductionView({
+          pipeline_run_id: leased.run_id,
+          attempt_id: leased.attempt.id,
+          record_ids: [],
+          checkpoint_ids: [],
+        });
+        await context.store.applyAtomicTransition(reduceKernelCommand({
+          ...view,
+          command: {
+            type: "start",
+            command_id: `start-${ordinal}`,
+            attempt_id: leased.attempt.id,
+            lease_id: leased.lease.id,
+          },
+        }));
+        view = await context.store.loadExactReductionView({
+          pipeline_run_id: leased.run_id,
+          attempt_id: leased.attempt.id,
+          record_ids: [],
+          checkpoint_ids: [],
+        });
+        const running = view.current_attempt!;
+        const lease = running.lease!;
+        await context.store.applyAtomicTransition(reduceKernelCommand({
+          ...view,
+          command: {
+            type: "bind_runtime_session",
+            command_id: `bind-${ordinal}`,
+            attempt_id: running.id,
+            expected_run_version: view.run.version,
+            expected_cursor_version: view.run.cursor.version,
+            expected_attempt_version: running.version,
+            request_hash: running.request_hash,
+            definition_bundle_hash: running.definition_bundle_hash,
+            input_subject: running.input_subject,
+            lease_id: lease.id,
+            worker_id: lease.worker_id,
+            lease_purpose: lease.purpose,
+            expected_lease_expires_at: lease.expires_at,
+            expected_work_retry_ordinal: running.work_retry_ordinal,
+            expected_result_correction_count: running.result_correction_count,
+            native_session_id: `session-${ordinal}`,
+          },
+        }));
+        view = await context.store.loadExactReductionView({
+          pipeline_run_id: leased.run_id,
+          attempt_id: leased.attempt.id,
+          record_ids: [],
+          checkpoint_ids: [],
+        });
+        const bound = view.current_attempt!;
+        const outputSubject = subject(String(ordinal + 1));
+        const checkpoint: AttemptCheckpoint = {
+          schema: ATTEMPT_CHECKPOINT_SCHEMA,
+          id: `checkpoint-${ordinal}`,
+          pipeline_run_id: leased.run_id,
+          attempt_id: bound.id,
+          request_hash: bound.request_hash,
+          definition_bundle_hash: bound.definition_bundle_hash,
+          input_subject: bound.input_subject,
+          output_subject: outputSubject,
+          native_session_id: `session-${ordinal}`,
+          payload_schema: "checkpoint/v1",
+          payload: { inline: { complete: true } },
+          captured_at: NOW,
+        };
+        await context.store.applyAtomicTransition(reduceKernelCommand({
+          ...view,
+          checkpoints: exactMap(checkpoint),
+          command: {
+            type: "work_complete",
+            command_id: `work-complete-${ordinal}`,
+            attempt_id: bound.id,
+            checkpoint_id: checkpoint.id,
+            verified_output_subject: outputSubject,
+            result_record_id: null,
+          },
+        }));
+        view = await context.store.loadExactReductionView({
+          pipeline_run_id: leased.run_id,
+          attempt_id: leased.attempt.id,
+          record_ids: [],
+          checkpoint_ids: [checkpoint.id],
+        });
+        const completed = view.current_attempt!;
+        const result: ResultRecord = {
+          schema: EXECUTION_RECORD_SCHEMA,
+          id: `result-${ordinal}`,
+          kind: "result",
+          pipeline_run_id: leased.run_id,
+          attempt_id: completed.id,
+          request_hash: completed.request_hash,
+          definition_bundle_hash: completed.definition_bundle_hash,
+          input_subject: completed.input_subject,
+          output_subject: outputSubject,
+          original_candidate_hash: sha(String(ordinal + 2)),
+          normalized_candidate_hash: sha(String(ordinal + 3)),
+          payload_schema: "result/v1",
+          payload: { inline: { outcome: "success" } },
+          created_at: NOW,
+        };
+        await context.store.applyAtomicTransition(reduceKernelCommand({
+          ...view,
+          records: exactMap(result),
+          command: {
+            type: "record",
+            command_id: `record-${ordinal}`,
+            attempt_id: completed.id,
+            record_id: result.id,
+          },
+        }));
+        const recorded = await context.store.loadExactReductionView({
+          pipeline_run_id: leased.run_id,
+          attempt_id: leased.attempt.id,
+          record_ids: [result.id],
+          checkpoint_ids: [],
+        });
+        const decision: DecisionRecord = {
+          schema: EXECUTION_RECORD_SCHEMA,
+          id: `decision-${ordinal}`,
+          kind: "decision",
+          pipeline_run_id: leased.run_id,
+          reducer: "core/advance@1",
+          input_record_ids: [result.id],
+          payload_schema: "decision/v1",
+          payload: { inline: { outcome: "success" } },
+          created_at: NOW,
+        };
+        const next = attempt({
+          id: `attempt-${ordinal}-verify`,
+          pipeline_run_id: leased.run_id,
+          scope: { kind: "stage", stage_id: "verify" },
+          repository_authority: "inspect",
+          request_hash: sha(String(ordinal + 4)),
+          definition_bundle_hash: bundleHash,
+          input_subject: outputSubject,
+        });
+        return reduceKernelCommand({
+          ...recorded,
+          records: exactMap<ResultRecord | DecisionRecord>(result, decision),
+          command: {
+            type: "settle",
+            command_id: `settle-${ordinal}`,
+            attempt_id: recorded.current_attempt!.id,
+            decision_record_id: decision.id,
+            outcome: "success",
+            next_attempts: [next],
+          },
+        });
+      };
+
+      const [firstSettlement, secondSettlement] = await Promise.all([
+        prepareSettlement(leases[0], 1),
+        prepareSettlement(leases[1], 2),
+      ]);
+      let releaseFirst!: () => void;
+      const firstMayCommit = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const commitOrder: string[] = [];
+      const firstCommit = firstMayCommit.then(async () => {
+        const applied = await context.store.applyAtomicTransition(firstSettlement);
+        commitOrder.push("run-1");
+        return applied;
+      });
+      const secondCommit = context.store.applyAtomicTransition(secondSettlement).then((applied) => {
+        commitOrder.push("run-2");
+        return applied;
+      });
+      await expect(secondCommit).resolves.toMatchObject({ disposition: "applied" });
+      releaseFirst();
+      await expect(firstCommit).resolves.toMatchObject({ disposition: "applied" });
+
+      expect(commitOrder).toEqual(["run-2", "run-1"]);
+      expect(context.db.prepare(`
+        SELECT pipeline_run_id, status, lease_id FROM attempts
+        WHERE id IN ('attempt-1', 'attempt-2') ORDER BY pipeline_run_id
+      `).all()).toEqual([
+        { pipeline_run_id: "run-1", status: "settled", lease_id: null },
+        { pipeline_run_id: "run-2", status: "settled", lease_id: null },
+      ]);
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("keeps lease-generation fences isolated during concurrent cross-run settlement", async () => {
+    const context = setup(undefined, () => NOW, false, 2);
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const second = attempt({
+        id: "attempt-2",
+        pipeline_run_id: "run-2",
+        definition_bundle_hash: bundleHash,
+      });
+      admitAdditionalRun(context, "run-2", 2, [second]);
+      const firstLease = await context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-1",
+        expires_at: "2026-08-20T12:01:00.000Z",
+      });
+      const secondLease = await context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-2",
+        expires_at: "2026-08-20T12:01:00.000Z",
+      });
+      if (!firstLease || !secondLease) throw new Error("expected two cross-run leases");
+      const firstView = await context.store.loadExactReductionView({
+        pipeline_run_id: "run-1", attempt_id: "attempt-1", record_ids: [], checkpoint_ids: [],
+      });
+      const secondView = await context.store.loadExactReductionView({
+        pipeline_run_id: "run-2", attempt_id: "attempt-2", record_ids: [], checkpoint_ids: [],
+      });
+      const firstStart = reduceKernelCommand({
+        ...firstView,
+        command: { type: "start", command_id: "start-1", attempt_id: "attempt-1", lease_id: "lease-1" },
+      });
+      const secondStart = reduceKernelCommand({
+        ...secondView,
+        command: { type: "start", command_id: "start-2", attempt_id: "attempt-2", lease_id: "lease-2" },
+      });
+
+      await context.store.recoverExpiredAttemptLeases({
+        observed_at: "2026-08-20T12:01:00.000Z",
+        expires_at: "2026-08-20T12:02:00.000Z",
+        limit: 1,
+      });
+      const settlements = await Promise.allSettled([
+        context.store.applyAtomicTransition(firstStart),
+        context.store.applyAtomicTransition(secondStart),
+      ]);
+
+      expect(settlements[0]).toMatchObject({ status: "rejected" });
+      expect(settlements[1]).toMatchObject({ status: "fulfilled", value: { disposition: "applied" } });
+      expect(context.db.prepare(`
+        SELECT id, lease_id, lease_generation, lease_started FROM attempts
+        WHERE id IN ('attempt-1', 'attempt-2') ORDER BY id
+      `).all()).toEqual([
+        { id: "attempt-1", lease_id: "lease-1", lease_generation: 1, lease_started: 0 },
+        { id: "attempt-2", lease_id: "lease-2", lease_generation: 0, lease_started: 1 },
+      ]);
+    } finally {
       context.db.close();
     }
   });

@@ -97,6 +97,7 @@ async function main(): Promise<void> {
     manifest_resolver: manifestResolver,
     payload_schemas: payloadSchemas(),
     execution_policy: release.execution_policy,
+    execution_width: cfg.executionWidth,
   });
   const bundles = new VerifiedKernelDefinitionBundleResolver({
     bytes: kernel,
@@ -241,6 +242,7 @@ async function main(): Promise<void> {
     worker_id: cfg.kernelWorkerId,
     lease_seconds: cfg.kernelLeaseSeconds,
     cycle_limit: cfg.kernelCycleLimit,
+    execution_width: cfg.executionWidth,
   });
 
   const service = new KernelHttpService({
