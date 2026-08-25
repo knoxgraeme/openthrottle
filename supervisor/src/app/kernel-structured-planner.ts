@@ -3,6 +3,7 @@ import {
   canonicalJson,
   compareCodeUnits,
   type AttemptCheckpoint,
+  type ExecutionRecord,
 } from "@openthrottle/contracts";
 import type {
   OrdinaryKernelSettlementPlan,
@@ -56,6 +57,7 @@ import {
   structuredStageFor,
   structuredSuccessorCheckpoints,
   type StructuredLoopStage,
+  type StructuredWaveEvidence,
 } from "./kernel-structured-wave.js";
 
 const STRUCTURED_PIPELINE_ID = "core/structured";
@@ -78,6 +80,48 @@ export interface KernelStructuredSettlementStore extends
 function isExternalInput(input: StructuredInput): input is ExternalInput {
   return "schedules" in input;
 }
+
+function settledStructuredSiblingRecords(
+  evidence: readonly StructuredWaveEvidence[],
+  currentAttemptId: string,
+): ExecutionRecord[] {
+  // A divergent wave replaces the current member's transient decision with
+  // one aggregate decision. Only sibling decisions already exist durably.
+  return evidence.flatMap((source) =>
+    source.attempt.id === currentAttemptId ? [] : [source.result, source.decision]
+  );
+}
+
+function structuredWaveTerminalSettlement(input: {
+  ordinary: OrdinaryInput;
+  current_attempt: KernelAttempt;
+  settlement: ReturnType<typeof settleStructuredWaveDecision>;
+  target_stage_id: string;
+  request_inputs: KernelAttemptRequestInputs;
+  evidence: readonly StructuredWaveEvidence[];
+}): OrdinaryKernelSettlementPlan {
+  return {
+    decision: input.settlement.decision,
+    outcome: input.settlement.outcome,
+    input_records: input.settlement.input_records,
+    checkpoints: [],
+    next_attempts: [deriveKernelSuccessorAttempt({
+      view: input.ordinary.view,
+      current: input.current_attempt,
+      result: input.ordinary.result,
+      decision: input.settlement.decision,
+      bundle: input.ordinary.bundle,
+      target_scope: { kind: "stage", stage_id: input.target_stage_id },
+      request_inputs: input.request_inputs,
+      checkpoint_override: [],
+      additional_context_records: settledStructuredSiblingRecords(
+        input.evidence,
+        input.ordinary.attempt.id,
+      ),
+    })],
+  };
+}
+
 /**
  * Production settlement planner for the sealed `core/structured` pipeline.
  * All other pipelines and ordinary stage-scoped transitions retain the stock
@@ -328,27 +372,18 @@ export class KernelStructuredSettlementPlanner implements
     if (!target.id.startsWith("ot_runtime_stop_")) {
       throw new Error(`structured loop cannot fan in directly to unsupported stage ${target.id}`);
     }
-    return {
-      decision: settlement.decision,
-      outcome: settlement.outcome,
-      input_records: settlement.input_records,
-      checkpoints: [],
-      next_attempts: [deriveKernelSuccessorAttempt({
-        view: input.view,
-        current: {
-          ...input.attempt,
-          input_subject: input.view.run.current_subject,
-          output_subject: null,
-        },
-        result: input.result,
-        decision: settlement.decision,
-        bundle: input.bundle,
-        target_scope: { kind: "stage", stage_id: target.id },
-        request_inputs: currentRequest,
-        checkpoint_override: [],
-        additional_context_records: evidence.flatMap((source) => [source.result, source.decision]),
-      })],
-    };
+    return structuredWaveTerminalSettlement({
+      ordinary: input,
+      current_attempt: {
+        ...input.attempt,
+        input_subject: input.view.run.current_subject,
+        output_subject: null,
+      },
+      settlement,
+      target_stage_id: target.id,
+      request_inputs: currentRequest,
+      evidence,
+    });
   }
 
   async #planIntegration(input: ExternalInput): Promise<KernelExternalSettlementPlan> {
@@ -685,23 +720,14 @@ export class KernelStructuredSettlementPlanner implements
     }
     const target = structuredStageFor(input, settlement.target_stage_id);
     if (target.id.startsWith("ot_runtime_stop_")) {
-      return {
-        decision: settlement.decision,
-        outcome: settlement.outcome,
-        input_records: settlement.input_records,
-        checkpoints: [],
-        next_attempts: [deriveKernelSuccessorAttempt({
-          view: input.view,
-          current: input.attempt,
-          result: input.result,
-          decision: settlement.decision,
-          bundle: input.bundle,
-          target_scope: { kind: "stage", stage_id: target.id },
-          request_inputs: currentRequest,
-          checkpoint_override: [],
-          additional_context_records: evidence.flatMap((source) => [source.result, source.decision]),
-        })],
-      };
+      return structuredWaveTerminalSettlement({
+        ordinary: input,
+        current_attempt: input.attempt,
+        settlement,
+        target_stage_id: target.id,
+        request_inputs: currentRequest,
+        evidence,
+      });
     }
     if (target.id !== REVIEW_VALIDATION_STAGE_ID || target.kind !== "agent" ||
         target.repository_authority !== "inspect") {
