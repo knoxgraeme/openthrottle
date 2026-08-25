@@ -1,6 +1,7 @@
 import {
   ATTEMPT_CHECKPOINT_SCHEMA,
   EXECUTION_RECORD_SCHEMA,
+  RUNTIME_PROVISION_STAGE_ID,
   canonicalJson,
   compareCodeUnits,
   digestCanonicalJson,
@@ -15,6 +16,7 @@ import {
   type JsonValue,
   type ResultRecord,
 } from "@openthrottle/contracts";
+import { createPendingKernelAttempt } from "../pipeline/kernel/action-request.js";
 import {
   createPipelineDecisionRecord,
   type EvaluatedKernelResult,
@@ -34,11 +36,18 @@ import {
   type LeasedAttemptView,
   type ReductionView,
 } from "../pipeline/kernel/ports.js";
-import { reduceKernelCommand } from "../pipeline/kernel/reducer.js";
+import { frontierMemberKey, reduceKernelCommand } from "../pipeline/kernel/reducer.js";
 import {
   deriveKernelSuccessorAttempt,
   kernelSuccessorStageId,
 } from "../pipeline/kernel/successor-attempt.js";
+import { runtimeCleanupOutcome } from "../pipeline/kernel/runtime-lifecycle.js";
+import {
+  exactSandboxRecoveryFrontier,
+  exactSandboxRecoveryRecord,
+  isDaytonaRuntimeDelivery,
+  sandboxRecoveryAttemptId,
+} from "../pipeline/kernel/sandbox-recovery.js";
 import {
   EXTERNAL_SCHEDULE_PAYLOAD_SCHEMA,
   EXTERNAL_SCHEDULE_REDUCER,
@@ -625,20 +634,110 @@ export class KernelExternalBoundaryCoordinator {
     const checkpoint = recorded.checkpoints.get(attempt.checkpoint_id!);
     if (!checkpoint) throw new Error("external Attempt lost its executor checkpoint");
     const defaultPlan = async (): Promise<KernelExternalSettlementPlan> => {
+      const contextRecords = [...context.context.records.values()];
+      const recoveryRecord = exactSandboxRecoveryRecord(contextRecords);
+      const recoveryFrontier = exactSandboxRecoveryFrontier(contextRecords);
+      const cleanupRecovery = recoveryRecord !== null && runtimeCleanupOutcome(stage) !== null &&
+        (evaluated.outcome === "success" || evaluated.outcome === "no_change");
+      const provisionRecovery = recoveryRecord !== null && stage.id === RUNTIME_PROVISION_STAGE_ID &&
+        stage.kind === "effect" && stage.effect === "core/daytona-provision@1" &&
+        (evaluated.outcome === "success" || evaluated.outcome === "no_change");
       const decision = createPipelineDecisionRecord({
         attempt,
         result,
-        additional_input_records: deliveries,
+        additional_input_records: [
+          ...deliveries,
+          ...((cleanupRecovery || provisionRecovery) ? [recoveryRecord!] : []),
+        ],
         evaluated,
         created_at: this.#now(),
       });
-      const targetStageId = kernelSuccessorStageId({
+      let targetStageId = cleanupRecovery
+        ? RUNTIME_PROVISION_STAGE_ID
+        : kernelSuccessorStageId({
         manifest: recorded.manifest,
         run: recorded.run,
         stage,
         outcome: evaluated.outcome,
       });
       const nextAttempts: KernelAttempt[] = [];
+      const nextDependencies: Record<string, readonly string[]> = {};
+      if (provisionRecovery) {
+        const failedAttemptId = sandboxRecoveryAttemptId(recoveryRecord!);
+        if (failedAttemptId === null) throw new Error("sandbox recovery lost its failed Attempt identity");
+        const members = recoveryFrontier.length === 0
+          ? [{ attempt_id: failedAttemptId, depends_on: [] as readonly string[], record: recoveryRecord! }]
+          : recoveryFrontier;
+        if (!members.some(({ attempt_id }) => attempt_id === failedAttemptId)) {
+          throw new Error("sandbox recovery frontier omits its failed Attempt");
+        }
+        const restored: Array<{
+          original: KernelAttempt;
+          retried: KernelAttempt;
+          depends_on: readonly string[];
+        }> = [];
+        for (const member of members) {
+          const failedView = await this.#load(recorded.run.id, member.attempt_id);
+          const failedAttempt = failedView.current_attempt;
+          if (!failedAttempt || failedAttempt.status !== "failed") {
+            throw new Error(`sandbox recovery frontier Attempt ${member.attempt_id} is not durably failed`);
+          }
+          if (
+            failedAttempt.id === failedAttemptId &&
+            failedAttempt.work_retry_ordinal >= recorded.run.work_retry_limit
+          ) throw new Error("sandbox recovery attempted to exceed the work retry limit");
+          const failedInputs = await this.#store.loadAttemptRequestInputs({
+            pipeline_run_id: recorded.run.id,
+            attempt_id: failedAttempt.id,
+          });
+          const retryRecords = [...new Map([
+            ...[...failedInputs.context.records.values()]
+              .filter((candidate) => !isDaytonaRuntimeDelivery(candidate)),
+            recoveryRecord!,
+            result,
+            decision,
+            ...deliveries,
+          ].map((candidate) => [candidate.id, candidate])).values()]
+            .sort((left, right) => compareCodeUnits(left.id, right.id));
+          const retried = createPendingKernelAttempt({
+            id: `attempt-${digestCanonicalJson({
+              schema: "openthrottle.kernel-sandbox-retry-attempt/v1",
+              failed_attempt_id: failedAttempt.id,
+              recovery_record_id: recoveryRecord!.id,
+              provision_attempt_id: attempt.id,
+            }).slice(0, 48)}`,
+            pipeline_run_id: recorded.run.id,
+            scope: failedAttempt.scope,
+            input_subject: failedAttempt.input_subject,
+            bundle,
+            manifest: recorded.manifest,
+            action_inputs: {
+              task_prompt: failedInputs.task_prompt,
+              context: {
+                records: retryRecords,
+                checkpoints: [...failedInputs.context.checkpoints.values()],
+              },
+            },
+          });
+          retried.work_retry_ordinal = failedAttempt.work_retry_ordinal +
+            (failedAttempt.id === failedAttemptId ? 1 : 0);
+          restored.push({ original: failedAttempt, retried, depends_on: member.depends_on });
+          nextAttempts.push(retried);
+        }
+        const restoredKeys = new Map(restored.map(({ original, retried }) => [
+          frontierMemberKey(original),
+          frontierMemberKey(retried),
+        ]));
+        for (const { retried, depends_on: dependencies } of restored) {
+          nextDependencies[frontierMemberKey(retried)] = dependencies.map(
+            (dependency) => restoredKeys.get(dependency) ?? dependency,
+          );
+        }
+        targetStageId = restored[0]!.original.scope.stage_id;
+        if (restored.some(({ original }) => original.scope.stage_id !== targetStageId)) {
+          throw new Error("sandbox recovery frontier crosses stage boundaries");
+        }
+      }
       if (targetStageId !== null) {
         const successorSubject = attempt.output_subject ?? attempt.input_subject;
         const candidates = [...context.context.checkpoints.values()]
@@ -651,19 +750,65 @@ export class KernelExternalBoundaryCoordinator {
         if (checkpointContext.length > 1) {
           throw new Error(`external successor has ambiguous checkpoint materialization for ${successorSubject}`);
         }
-        nextAttempts.push(deriveKernelSuccessorAttempt({
-          view: recorded,
-          current: attempt,
-          result,
-          decision,
-          bundle,
-          target_scope: { kind: "stage", stage_id: targetStageId },
-          request_inputs: context,
-          checkpoint_override: checkpointContext,
-          additional_context_records: deliveries,
-        }));
+        if (!provisionRecovery) {
+          if (cleanupRecovery) {
+            const recoveryRecords = [
+              result,
+              decision,
+              recoveryRecord!,
+              ...recoveryFrontier.map(({ record }) => record),
+              ...deliveries,
+            ]
+              .sort((left, right) => compareCodeUnits(left.id, right.id));
+            nextAttempts.push(createPendingKernelAttempt({
+              id: `attempt-${digestCanonicalJson({
+                schema: "openthrottle.kernel-sandbox-reprovision-attempt/v1",
+                cleanup_attempt_id: attempt.id,
+                recovery_record_id: recoveryRecord!.id,
+              }).slice(0, 48)}`,
+              pipeline_run_id: recorded.run.id,
+              scope: { kind: "stage", stage_id: RUNTIME_PROVISION_STAGE_ID },
+              input_subject: recorded.run.current_subject,
+              bundle,
+              manifest: recorded.manifest,
+              action_inputs: {
+                task_prompt: context.task_prompt,
+                context: { records: recoveryRecords, checkpoints: [] },
+              },
+            }));
+          } else {
+            nextAttempts.push(deriveKernelSuccessorAttempt({
+              view: recorded,
+              current: attempt,
+              result,
+              decision,
+              bundle,
+              target_scope: { kind: "stage", stage_id: targetStageId },
+              request_inputs: context,
+              checkpoint_override: checkpointContext,
+              additional_context_records: deliveries,
+            }));
+          }
+        }
       }
-      return { decision, outcome: evaluated.outcome, next_attempts: nextAttempts };
+      return {
+        decision,
+        outcome: evaluated.outcome,
+        next_attempts: nextAttempts,
+        ...(Object.keys(nextDependencies).length === 0 ? {} : {
+          next_dependencies: nextDependencies,
+        }),
+        ...((cleanupRecovery || provisionRecovery) ? {
+          sandbox_recovery: {
+            recovery_record_id: recoveryRecord!.id,
+            target_stage_id: targetStageId!,
+            input_subjects: Object.fromEntries(nextAttempts.map((candidate) => [
+              candidate.id,
+              candidate.input_subject,
+            ])),
+          },
+        } : {}),
+      };
     };
     const settlement = this.#settlementPlanner === null
       ? await defaultPlan()
@@ -686,15 +831,25 @@ export class KernelExternalBoundaryCoordinator {
       !settlement.decision.input_record_ids.includes(result.id) ||
       !stage.on[settlement.outcome]
     ) throw new Error("external settlement planner returned an unauthorized transition");
-    const expectedDecisionInputs = [result.id, ...deliveries.map(({ id }) => id)]
+    const expectedDecisionInputs = [
+      result.id,
+      ...deliveries.map(({ id }) => id),
+      ...(settlement.sandbox_recovery ? [settlement.sandbox_recovery.recovery_record_id] : []),
+    ]
       .sort(compareCodeUnits);
     if (
       canonicalJson([...settlement.decision.input_record_ids].sort(compareCodeUnits)) !==
       canonicalJson(expectedDecisionInputs)
     ) throw new Error("external settlement decision must cite its ResultRecord and exact DeliveryRecords");
+    const recoveryEvidence = settlement.sandbox_recovery === undefined
+      ? []
+      : [context.context.records.get(settlement.sandbox_recovery.recovery_record_id)];
+    if (recoveryEvidence.some((record) => record === undefined)) {
+      throw new Error("sandbox recovery settlement lost its exact recovery evidence");
+    }
     const settleRecords = mapWith<ExecutionRecord>(
       recorded.records,
-      [...deliveries, settlement.decision],
+      [...deliveries, ...recoveryEvidence as ExecutionRecord[], settlement.decision],
     );
     await this.#apply({ ...recorded, records: settleRecords, checkpoints: new Map() }, {
       type: "settle",
@@ -707,6 +862,7 @@ export class KernelExternalBoundaryCoordinator {
       outcome: settlement.outcome,
       next_attempts: settlement.next_attempts,
       next_dependencies: settlement.next_dependencies,
+      sandbox_recovery: settlement.sandbox_recovery,
     }, claim);
     const final = await this.#load(recorded.run.id, null);
     return {

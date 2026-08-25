@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   EXECUTION_RECORD_SCHEMA,
+  RUNTIME_PROVISION_STAGE_ID,
   definitionEntryContentHash,
   digestCanonicalJson,
   expandCompiledRuntimeLifecycle,
+  runtimeCleanupStageId,
   type AttemptCheckpoint,
   type CompiledPipelineManifest,
   type DefinitionBundle,
@@ -12,6 +14,12 @@ import {
   type ExecutionRecord,
   type JsonValue,
 } from "@openthrottle/contracts";
+import { createPipelineDecisionRecord } from "../pipeline/kernel/evaluator-registry.js";
+import {
+  sandboxRecoveryEvaluator,
+  sandboxRecoveryFrontierEvaluator,
+  sandboxRecoveryFrontierReason,
+} from "../pipeline/kernel/sandbox-recovery.js";
 import type {
   ExternalScheduleView,
   KernelAttemptRequestInputs,
@@ -19,7 +27,7 @@ import type {
   ReductionReadRequest,
   ReductionView,
 } from "../pipeline/kernel/ports.js";
-import { compileKernelCursor } from "../pipeline/kernel/reducer.js";
+import { compileKernelCursor, frontierMemberKey } from "../pipeline/kernel/reducer.js";
 import type {
   AtomicTransitionBundle,
   KernelAttempt,
@@ -272,8 +280,8 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
     };
   }
 
-  leased(): LeasedAttemptView {
-    const attempt = this.attempts.get("attempt-1")!;
+  leased(attemptId = "attempt-1"): LeasedAttemptView {
+    const attempt = this.attempts.get(attemptId)!;
     return {
       run_id: this.run.id,
       run_version: this.run.version,
@@ -309,6 +317,15 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
     for (const checkpoint of transition.append_checkpoints) this.checkpoints.set(checkpoint.id, checkpoint);
     for (const write of transition.attempt_writes) {
       if (write.kind === "replace") this.attempts.set(write.attempt.id, write.attempt);
+      else {
+        const prior = this.attempts.get(write.attempt_id)!;
+        this.attempts.set(write.attempt_id, {
+          ...prior,
+          status: write.status,
+          version: write.next_version,
+          lease: null,
+        });
+      }
     }
     for (const attempt of transition.create_attempts) this.attempts.set(attempt.id, attempt);
     for (const intent of transition.put_effects) {
@@ -371,8 +388,9 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
     phase: string,
     status: "confirmed" | "rejected" = "confirmed",
     observedVia: "provider" | "operator_resolution" = "provider",
+    attemptId = "attempt-1",
   ): void {
-    const key = `external-schedule:attempt-1:${phase}`;
+    const key = `external-schedule:${attemptId}:${phase}`;
     const schedule = this.schedules.get(key);
     if (!schedule) throw new Error(`missing phase ${phase}`);
     const effects = schedule.effects.map(({ intent }, index) => {
@@ -418,7 +436,7 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
             schema: "openthrottle.daytona-integration-delivery/v1",
             state: "integrated",
             pipeline_run_id: intent.pipeline_run_id,
-            attempt_id: "attempt-1",
+            attempt_id: attemptId,
             effect_id: intent.id,
             idempotency_key: intent.idempotency_key,
             input_subject: SUBJECT,
@@ -1281,5 +1299,249 @@ describe("kernel external boundary bridge", () => {
       .filter((record): record is DeliveryRecord => record?.kind === "delivery");
     expect(resourceDeliveries).toHaveLength(2);
     expect(resourceDeliveries[0]?.payload).toMatchObject({ inline: { result: { sandbox_id: "sandbox-1" } } });
+  });
+
+  it("cleans a poisoned sandbox, provisions a distinct runtime, and retries the exact input subject", async () => {
+    const definitionBundle = bundle();
+    const currentManifest = manifest({
+      bundle_hash: digestCanonicalJson(definitionBundle),
+      external_kind: "core/publish@1",
+    });
+    const store = new MemoryExternalStore(currentManifest, PRIVATE_CANDIDATE);
+    const runtimeDelivery = (
+      id: string,
+      effectKind: "daytona/create-sandbox@1" | "daytona/start-sandbox@1",
+      sandboxId: string,
+    ): DeliveryRecord => ({
+      schema: EXECUTION_RECORD_SCHEMA,
+      id,
+      kind: "delivery",
+      pipeline_run_id: store.run.id,
+      effect_id: `effect-${id}`,
+      idempotency_key: `key-${id}`,
+      external_identity: `daytona:${RUNTIME_IDENTITY}`,
+      status: "confirmed",
+      payload_schema: "openthrottle.effect-delivery/v1",
+      payload: { inline: {
+        effect_kind: effectKind,
+        provider: "daytona",
+        result: { identity: RUNTIME_IDENTITY, sandbox_id: sandboxId, resource_state: "started" },
+      } },
+      created_at: NOW,
+    });
+    const oldCreate = runtimeDelivery("delivery-old-create", "daytona/create-sandbox@1", "sandbox-poisoned");
+    const oldStart = runtimeDelivery("delivery-old-start", "daytona/start-sandbox@1", "sandbox-poisoned");
+    const failedAttempt: KernelAttempt = {
+      ...initialAttempt(currentManifest, PRIVATE_CANDIDATE),
+      id: "attempt-failed",
+      scope: {
+        kind: "loop_item",
+        stage_id: "external",
+        parent_attempt_id: "attempt-wave",
+        loop_id: "units",
+        item_id: "unit-a",
+        item_index: 0,
+      },
+      context_record_ids: [oldCreate.id, oldStart.id].sort(),
+      status: "failed",
+      version: 2,
+      lease: null,
+    };
+    const siblingAttempt: KernelAttempt = {
+      ...initialAttempt(currentManifest, SUBJECT),
+      id: "attempt-sibling",
+      scope: {
+        kind: "loop_item",
+        stage_id: "external",
+        parent_attempt_id: "attempt-wave",
+        loop_id: "units",
+        item_id: "unit-b",
+        item_index: 1,
+      },
+      context_record_ids: [oldCreate.id, oldStart.id].sort(),
+      status: "failed",
+      version: 1,
+      lease: null,
+    };
+    const failedFrontier = createPipelineDecisionRecord({
+      attempt: failedAttempt,
+      result: null,
+      evaluated: {
+        evaluator: sandboxRecoveryFrontierEvaluator(failedAttempt.id),
+        outcome: "retryable_infrastructure_failure",
+        reason: sandboxRecoveryFrontierReason([]),
+      },
+      created_at: NOW,
+    });
+    const siblingFrontier = createPipelineDecisionRecord({
+      attempt: siblingAttempt,
+      result: null,
+      evaluated: {
+        evaluator: sandboxRecoveryFrontierEvaluator(siblingAttempt.id),
+        outcome: "retryable_infrastructure_failure",
+        reason: sandboxRecoveryFrontierReason([frontierMemberKey(failedAttempt)]),
+      },
+      created_at: NOW,
+    });
+    const recovery = createPipelineDecisionRecord({
+      attempt: failedAttempt,
+      result: null,
+      additional_input_records: [oldCreate, oldStart, failedFrontier, siblingFrontier],
+      evaluated: {
+        evaluator: sandboxRecoveryEvaluator(failedAttempt.id),
+        outcome: "retryable_infrastructure_failure",
+        reason: "sandbox_fatal_enospc: no space left on device",
+      },
+      created_at: NOW,
+    });
+    const cleanupAttempt: KernelAttempt = {
+      ...initialAttempt(currentManifest, PRIVATE_CANDIDATE),
+      scope: { kind: "stage", stage_id: runtimeCleanupStageId("failed") },
+      context_record_ids: [
+        oldCreate.id,
+        oldStart.id,
+        recovery.id,
+        failedFrontier.id,
+        siblingFrontier.id,
+      ].sort(),
+    };
+    store.attempts.clear();
+    store.attempts.set(failedAttempt.id, failedAttempt);
+    store.attempts.set(siblingAttempt.id, siblingAttempt);
+    store.attempts.set(cleanupAttempt.id, cleanupAttempt);
+    for (const record of [
+      oldCreate,
+      oldStart,
+      recovery,
+      failedFrontier,
+      siblingFrontier,
+    ]) store.records.set(record.id, record);
+    store.run = {
+      ...store.run,
+      cursor: compileKernelCursor({
+        stage_id: runtimeCleanupStageId("failed"),
+        version: 3,
+        attempts: [cleanupAttempt],
+      }),
+      version: 4,
+      active_attempt_versions: { [cleanupAttempt.id]: cleanupAttempt.version },
+    };
+    const lifecyclePlans = createKernelExternalPlanBindings({
+      environments: {
+        loadExactRunEnvironment: () => ({
+          pipeline_run_id: store.run.id,
+          work_item_id: "work-1",
+          repository_registration_id: "repo-1",
+          repository: "owner/repo",
+          base_branch: "main",
+          runtime_snapshot: "snapshot-1",
+          control_provider: "github",
+          source_provider: "github",
+          source_id: "issue-1",
+          source_reference: "owner/repo#1",
+          title: "Sandbox recovery proof",
+          current_subject: PRIVATE_CANDIDATE,
+        }),
+      },
+      blob_store: {} as never,
+    }).filter(({ external_kind }) => [
+      "core/daytona-cleanup@1", "core/daytona-provision@1",
+    ].includes(external_kind));
+    const bridge = new KernelExternalBoundaryCoordinator({
+      store,
+      definition_bundles: { resolveExactDefinitionBundle: async () => definitionBundle },
+      plans: createKernelExternalStagePlanRegistry({
+        effects: primitiveRegistry(),
+        plans: lifecyclePlans,
+      }),
+      now: () => NOW,
+    });
+    const confirmLifecyclePhase = (
+      attemptId: string,
+      phase: string,
+      sandboxId: string | null,
+    ) => {
+      store.acknowledgePhase(phase, "confirmed", "provider", attemptId);
+      const key = `external-schedule:${attemptId}:${phase}`;
+      const schedule = store.schedules.get(key)!;
+      const effects = schedule.effects.map(({ intent, delivery }) => {
+        const authority = intent.payload as Record<string, JsonValue>;
+        const exact: DeliveryRecord = {
+          ...delivery!,
+          payload_schema: "openthrottle.effect-delivery/v1",
+          payload: { inline: {
+            effect_kind: intent.kind,
+            provider: "daytona",
+            result: {
+              identity: authority.identity,
+              sandbox_id: sandboxId,
+              resource_state: sandboxId === null ? "absent" : "started",
+            },
+          } },
+        };
+        store.records.set(exact.id, exact);
+        return { intent, delivery: exact };
+      });
+      store.schedules.set(key, { ...schedule, effects });
+    };
+
+    await bridge.executeLeasedAttempt(store.leased());
+    confirmLifecyclePhase(cleanupAttempt.id, "cleanup", null);
+    await bridge.resumeAttempt({ pipeline_run_id: store.run.id, attempt_id: cleanupAttempt.id });
+
+    const provision = [...store.attempts.values()].find(
+      ({ scope, status }) => scope.stage_id === RUNTIME_PROVISION_STAGE_ID && status === "pending",
+    )!;
+    expect(provision).toBeDefined();
+    store.attempts.set(provision.id, {
+      ...provision,
+      lease: {
+        id: "lease-reprovision",
+        generation: 0,
+        worker_id: "external-worker",
+        purpose: "work",
+        expires_at: "2026-08-20T12:10:00.000Z",
+        started: false,
+      },
+    });
+    await bridge.executeLeasedAttempt(store.leased(provision.id));
+    const createSchedule = store.schedules.get(`external-schedule:${provision.id}:create`)!;
+    expect(createSchedule.effects[0]!.intent.target).not.toBe(`daytona:${RUNTIME_IDENTITY}`);
+    confirmLifecyclePhase(provision.id, "create", "sandbox-fresh");
+    await bridge.resumeAttempt({ pipeline_run_id: store.run.id, attempt_id: provision.id });
+    confirmLifecyclePhase(provision.id, "start", "sandbox-fresh");
+    await bridge.resumeAttempt({ pipeline_run_id: store.run.id, attempt_id: provision.id });
+
+    const retries = [...store.attempts.values()].filter(
+      ({ id, scope, status }) =>
+        id !== failedAttempt.id && id !== siblingAttempt.id &&
+        scope.stage_id === "external" && status === "pending",
+    );
+    expect(retries).toHaveLength(2);
+    const retry = retries.find(({ scope }) =>
+      scope.kind === "loop_item" && scope.item_id === "unit-a")!;
+    const siblingRetry = retries.find(({ scope }) =>
+      scope.kind === "loop_item" && scope.item_id === "unit-b")!;
+    expect(retry).toMatchObject({
+      input_subject: PRIVATE_CANDIDATE,
+      work_retry_ordinal: 1,
+      native_session_id: null,
+    });
+    expect(siblingRetry).toMatchObject({
+      input_subject: SUBJECT,
+      work_retry_ordinal: 0,
+      native_session_id: null,
+    });
+    expect(store.run.cursor.frontier.find(({ attempt_id }) => attempt_id === siblingRetry.id))
+      .toMatchObject({ depends_on: [frontierMemberKey(retry)] });
+    const retryRecords = retry.context_record_ids.map((id) => store.records.get(id)!);
+    expect(retryRecords.filter((record) => record.id === oldCreate.id || record.id === oldStart.id)).toEqual([]);
+    expect(retryRecords.filter((record) => record.kind === "delivery" &&
+      "inline" in record.payload && (record.payload.inline as Record<string, unknown>).provider === "daytona"))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ payload: { inline: expect.objectContaining({
+          result: expect.objectContaining({ sandbox_id: "sandbox-fresh" }),
+        }) } }),
+      ]));
   });
 });

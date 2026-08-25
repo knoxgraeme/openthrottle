@@ -8,11 +8,14 @@ import {
   COMPILED_PIPELINE_MANIFEST_SCHEMA,
   DEFINITION_BUNDLE_SCHEMA,
   EVAL_DEFINITION_SCHEMA,
+  EXECUTION_RECORD_SCHEMA,
   PIPELINE_DEFINITION_SCHEMA,
   RESULT_CANDIDATE_SCHEMA,
   RUNTIME_PROVISION_STAGE_ID,
   SEMANTIC_RESULT_SCHEMA,
   definitionEntryContentHash,
+  expandCompiledRuntimeLifecycle,
+  runtimeStopStageId,
   validateAndNormalizeResultCandidate,
   validateDefinitionBundle,
   type CompiledPipelineManifest,
@@ -45,6 +48,7 @@ import type {
 } from "../../runtime/kernel-contracts.js";
 import {
   buildKernelWorkActionRequest,
+  createPendingKernelAttempt,
   exactKernelContext,
   kernelAttemptRequestHash,
 } from "./action-request.js";
@@ -52,7 +56,7 @@ import {
   ordinaryKernelPayloadSchemas,
 } from "./evaluator-registry.js";
 import { OrdinaryKernelCoordinator } from "./ordinary-coordinator.js";
-import { compileKernelCursor } from "./reducer.js";
+import { compileKernelCursor, frontierMemberKey } from "./reducer.js";
 import {
   KERNEL_ATTEMPT_SCHEMA,
   KERNEL_RUN_SCHEMA,
@@ -552,6 +556,264 @@ async function execute(coordinator: OrdinaryKernelCoordinator, ordinal: number) 
 }
 
 describe("ordinary kernel activation", () => {
+  async function sandboxFailureTransition(error: Error | null, structuredSibling = false) {
+    const fixed = fixture();
+    const expanded = expandCompiledRuntimeLifecycle({
+      entry_stage: "test",
+      stages: fixed.manifest.stages,
+    });
+    const manifest: CompiledPipelineManifest = {
+      ...fixed.manifest,
+      entry_stage: expanded.entry_stage,
+      stages: expanded.stages,
+    };
+    const runtimeDelivery = (
+      id: string,
+      effectKind: "daytona/create-sandbox@1" | "daytona/start-sandbox@1",
+    ) => ({
+      schema: EXECUTION_RECORD_SCHEMA,
+      id,
+      kind: "delivery" as const,
+      pipeline_run_id: "run-sandbox-failure",
+      effect_id: `effect-${id}`,
+      idempotency_key: `key-${id}`,
+      external_identity: "daytona:runtime",
+      status: "confirmed" as const,
+      payload_schema: "openthrottle.effect-delivery/v1",
+      payload: { inline: {
+        effect_kind: effectKind,
+        provider: "daytona",
+        result: { sandbox_id: "sandbox-poisoned", resource_state: "started" },
+      } },
+      created_at: NOW,
+    });
+    const deliveries = [
+      runtimeDelivery("delivery-create", "daytona/create-sandbox@1"),
+      runtimeDelivery("delivery-start", "daytona/start-sandbox@1"),
+    ];
+    const inputs = {
+      task_prompt: "Run the exact command.",
+      context: { records: deliveries, checkpoints: [] },
+    };
+    let currentAttempt = createPendingKernelAttempt({
+      id: "attempt-command",
+      pipeline_run_id: "run-sandbox-failure",
+      scope: structuredSibling
+        ? {
+          kind: "loop_item",
+          stage_id: "test",
+          parent_attempt_id: "attempt-wave",
+          loop_id: "units",
+          item_id: "unit-a",
+          item_index: 0,
+        }
+        : { kind: "stage", stage_id: "test" },
+      input_subject: SOURCE,
+      bundle: fixed.compilation.bundle.value,
+      manifest,
+      action_inputs: inputs,
+    });
+    currentAttempt = {
+      ...currentAttempt,
+      status: "running",
+      version: 2,
+      lease: {
+        id: "lease-command",
+        generation: 2,
+        worker_id: "worker-command",
+        purpose: "work",
+        expires_at: "2026-08-20T12:10:00.000Z",
+        started: true,
+      },
+    };
+    const siblingAttempt = structuredSibling
+      ? createPendingKernelAttempt({
+        id: "attempt-command-sibling",
+        pipeline_run_id: "run-sandbox-failure",
+        scope: {
+          kind: "loop_item",
+          stage_id: "test",
+          parent_attempt_id: "attempt-wave",
+          loop_id: "units",
+          item_id: "unit-b",
+          item_index: 1,
+        },
+        input_subject: SIMPLIFIED,
+        bundle: fixed.compilation.bundle.value,
+        manifest,
+        action_inputs: inputs,
+      })
+      : null;
+    const frontierAttempts = [currentAttempt, ...(siblingAttempt === null ? [] : [siblingAttempt])];
+    const dependencies = siblingAttempt === null ? undefined : {
+      [frontierMemberKey(siblingAttempt)]: [frontierMemberKey(currentAttempt)],
+    };
+    let run: KernelRun = {
+      schema: KERNEL_RUN_SCHEMA,
+      id: "run-sandbox-failure",
+      pipeline_id: manifest.pipeline_id,
+      definition_bundle_hash: manifest.definition_bundle_hash,
+      current_subject: SOURCE,
+      status: "running",
+      terminal_outcome: null,
+      cursor: compileKernelCursor({
+        stage_id: "test",
+        version: 2,
+        attempts: frontierAttempts,
+        dependencies,
+      }),
+      version: 2,
+      work_retry_limit: 3,
+      result_correction_limit: 2,
+      active_attempt_versions: Object.fromEntries(frontierAttempts.map(({ id, version }) => [id, version])),
+      active_effect_versions: {},
+      checkpoint_ids: {},
+    };
+    const attempts = new Map(frontierAttempts.map((candidate) => [candidate.id, candidate]));
+    const records = new Map(deliveries.map((record) => [record.id, record]));
+    let applied: AtomicTransitionBundle | null = null;
+    const store = {
+      async loadExactReductionView(request: {
+        attempt_id: string | null;
+        record_ids: readonly string[];
+        checkpoint_ids: readonly string[];
+      }) {
+        return {
+          manifest,
+          run,
+          current_attempt: request.attempt_id === null ? null : attempts.get(request.attempt_id)!,
+          records: new Map(request.record_ids.map((id) => [id, records.get(id)!])),
+          checkpoints: new Map(),
+        };
+      },
+      async loadAttemptRequestInputs() {
+        return {
+          task_prompt: inputs.task_prompt,
+          context: { records, checkpoints: new Map() },
+        };
+      },
+      async renewAttemptLease() { return currentAttempt.lease!; },
+      async applyAtomicTransition(transition: AtomicTransitionBundle) {
+        applied = transition;
+        run = transition.run;
+        for (const record of transition.append_records) {
+          if (record.kind === "decision") {
+            for (const inputId of record.input_record_ids) {
+              if (!records.has(inputId)) {
+                throw new Error(`DecisionRecord ${record.id} references unavailable input ${inputId}`);
+              }
+            }
+          }
+          records.set(record.id, record as never);
+        }
+        for (const write of transition.attempt_writes) {
+          if (write.kind === "replace") {
+            attempts.set(write.attempt.id, write.attempt);
+            if (write.attempt.id === currentAttempt.id) currentAttempt = write.attempt;
+          } else {
+            const prior = attempts.get(write.attempt_id)!;
+            attempts.set(write.attempt_id, {
+              ...prior,
+              status: write.status,
+              version: write.next_version,
+              lease: null,
+            });
+          }
+        }
+        return { disposition: "applied" as const, run_version: run.version };
+      },
+      async quarantineExhaustedAttemptRecovery() { return true; },
+    };
+    const runtime: KernelRuntimePort = {
+      async executeWork() {
+        return error === null
+          ? { state: "work_failed", retryable: true, reason: "provider timeout" }
+          : {
+            state: "work_failed", retryable: true, sandbox_fatal: true,
+            reason: error.message,
+          };
+      },
+      async correctResult() { throw new Error("not used"); },
+    };
+    const coordinator = new OrdinaryKernelCoordinator({
+      store: store as never,
+      definition_bundles: { resolveExactDefinitionBundle: async () => fixed.compilation.bundle.value },
+      runtime,
+      runtime_sessions: {} as never,
+      attempt_lease_duration_ms: 60_000,
+      now: () => NOW,
+    });
+    const leased = {
+      run_id: run.id,
+      run_version: run.version,
+      cursor_version: run.cursor.version,
+      attempt: currentAttempt,
+      lease: currentAttempt.lease!,
+    };
+    if (error?.message.includes(".part: create: open")) {
+      await coordinator.terminalizeExhaustedRecovery(leased, error);
+    } else {
+      await coordinator.executeLeasedAttempt(leased);
+    }
+    return { transition: applied!, records };
+  }
+
+  it("routes command ENOSPC through runtime stop instead of same-sandbox retry", async () => {
+    const { transition, records } = await sandboxFailureTransition(
+      Object.assign(new Error("write failed: no space left on device"), { code: "ENOSPC" }),
+    );
+    expect(transition.run.cursor.stage_id).toBe(runtimeStopStageId("failed"));
+    expect(transition.create_attempts).toEqual([
+      expect.objectContaining({
+        scope: { kind: "stage", stage_id: runtimeStopStageId("failed") },
+        context_record_ids: expect.arrayContaining(["delivery-create", "delivery-start"]),
+      }),
+    ]);
+    expect([...records.values()]).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "decision",
+        reducer: expect.stringMatching(/^core\/sandbox-fatal-recovery@1:/),
+      }),
+    ]));
+  });
+
+  it("captures every active structured frontier member before sandbox recovery", async () => {
+    const { transition } = await sandboxFailureTransition(
+      Object.assign(new Error("write failed: no space left on device"), { code: "ENOSPC" }),
+      true,
+    );
+    const frontierRecords = transition.append_records.filter((record) =>
+      record.kind === "decision" && record.reducer.startsWith("core/sandbox-fatal-frontier@1:"));
+    expect(frontierRecords).toHaveLength(2);
+    expect(transition.attempt_writes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "replace", attempt: expect.objectContaining({ status: "failed" }) }),
+      expect.objectContaining({ kind: "terminal", attempt_id: "attempt-command-sibling", status: "failed" }),
+    ]));
+    expect(transition.create_attempts[0]?.context_record_ids).toEqual(expect.arrayContaining(
+      frontierRecords.map(({ id }) => id),
+    ));
+  });
+
+  it("keeps ordinary infrastructure failures on the same-sandbox retry ladder", async () => {
+    const { transition } = await sandboxFailureTransition(null);
+    expect(transition.transition_id).toMatch(/^retry-/);
+    expect(transition.run.cursor.stage_id).toBe("test");
+    expect(transition.attempt_writes).toEqual([
+      expect.objectContaining({
+        kind: "replace",
+        attempt: expect.objectContaining({ work_retry_ordinal: 1, status: "pending" }),
+      }),
+    ]);
+  });
+
+  it("routes recovery-exhaustion fence ENOSPC through runtime stop instead of quarantine", async () => {
+    const { transition } = await sandboxFailureTransition(
+      new Error("lease-generation.part: create: open /var/lib/openthrottle/action-fences/lease-generation.part"),
+    );
+    expect(transition.run.cursor.stage_id).toBe(runtimeStopStageId("failed"));
+    expect(transition.transition_id).toMatch(/^sandbox-fatal-recovery-/);
+  });
+
   it("quarantines an exhausted recovery lease when terminal preparation is unreadable", async () => {
     const fixed = fixture();
     const manifest: CompiledPipelineManifest = {

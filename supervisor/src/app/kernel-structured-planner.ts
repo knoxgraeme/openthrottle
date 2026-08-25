@@ -46,6 +46,7 @@ import {
   settledStructuredActionEvidence,
   structuredPromotionFromActionEvidence,
 } from "./kernel-structured-evidence.js";
+import { exactSandboxRecoveryRecord } from "../pipeline/kernel/sandbox-recovery.js";
 import {
   boundedStructuredDependencies,
   loadCompletedStructuredWave,
@@ -169,6 +170,13 @@ export class KernelStructuredSettlementPlanner implements
   }
 
   async #planExternal(input: ExternalInput): Promise<KernelExternalSettlementPlan> {
+    const requestContext = await this.#store.loadAttemptRequestInputs({
+      pipeline_run_id: input.attempt.pipeline_run_id,
+      attempt_id: input.attempt.id,
+    });
+    if (exactSandboxRecoveryRecord([...requestContext.context.records.values()]) !== null) {
+      return input.default_plan();
+    }
     if (
       input.attempt.scope.kind === "stage" &&
       input.stage.kind === "effect" &&

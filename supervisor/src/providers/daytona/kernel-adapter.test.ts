@@ -1576,6 +1576,27 @@ describe("DaytonaKernelAdapter", () => {
     await expect(adapter.executeWork(first, callbacks(0))).rejects.toThrow(/newer lease-generation fence/);
   });
 
+  it("classifies an ENOSPC fence write as sandbox-fatal instead of relaunching in place", async () => {
+    const request = workRequest();
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.fs.setFilePermissions.mockRejectedValueOnce(
+      Object.assign(new Error("no space left on device"), { code: "ENOSPC", errno: -28 }),
+    );
+
+    await expect(adapterFor(sandbox).executeWork(request, {
+      lease_generation: 0,
+      heartbeat_interval_ms: 10,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    })).resolves.toMatchObject({
+      state: "work_failed",
+      retryable: true,
+      sandbox_fatal: true,
+      reason: expect.stringMatching(/no space left on device/i),
+    });
+    expect(sandbox.process.executeSessionCommand).not.toHaveBeenCalled();
+  });
+
   it("does not publish a crashed generation's staged fence when the same lease recovers", async () => {
     const request = workRequest();
     const resultPath = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1/result.json";

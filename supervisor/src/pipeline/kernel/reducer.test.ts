@@ -32,6 +32,11 @@ import {
   type AtomicTransitionObservedState,
 } from "./store.js";
 import {
+  sandboxRecoveryEvaluator,
+  sandboxRecoveryFrontierEvaluator,
+  sandboxRecoveryFrontierReason,
+} from "./sandbox-recovery.js";
+import {
   KERNEL_ATTEMPT_SCHEMA,
   KERNEL_RUN_SCHEMA,
   type AtomicTransitionBundle,
@@ -1622,6 +1627,66 @@ describe("pipeline topology on the shared kernel", () => {
     expect(transition.cancel_effect_ids).toEqual([]);
     expect(transition.attempt_writes).toHaveLength(2);
     expect(transition.create_attempts).toEqual([cleanupAttempt]);
+  });
+
+  it("orders newly appended sandbox recovery evidence before the decision that cites it", () => {
+    const current = attempt({ id: "attempt-a", status: "running", version: 3 });
+    const currentRun = run(current, { status: "running", version: 8 });
+    const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const frontierEvaluator = sandboxRecoveryFrontierEvaluator(current.id);
+    const frontier = {
+      ...decisionRecord([], "decision-z-frontier"),
+      reducer: frontierEvaluator,
+      payload_schema: "openthrottle.pipeline-decision-record/v1",
+      payload: { inline: {
+        schema: "openthrottle.pipeline-decision-record/v1",
+        evaluator: frontierEvaluator,
+        outcome: "retryable_infrastructure_failure",
+        reason: sandboxRecoveryFrontierReason([]),
+        stage_id: current.scope.stage_id,
+      } },
+    } satisfies DecisionRecord;
+    const recoveryEvaluator = sandboxRecoveryEvaluator(current.id);
+    const recovery = {
+      ...decisionRecord([...runtime.map(({ id }) => id), frontier.id], "decision-a-recovery"),
+      reducer: recoveryEvaluator,
+      payload_schema: "openthrottle.pipeline-decision-record/v1",
+      payload: { inline: {
+        schema: "openthrottle.pipeline-decision-record/v1",
+        evaluator: recoveryEvaluator,
+        outcome: "retryable_infrastructure_failure",
+        reason: "sandbox_fatal_enospc: no space left on device",
+        stage_id: current.scope.stage_id,
+      } },
+    } satisfies DecisionRecord;
+    const cleanupAttempt = attempt({
+      id: "attempt-cleanup-failed",
+      scope: stageScope(runtimeStopStageId("failed")),
+      repository_authority: "inspect",
+      input_subject: currentRun.current_subject,
+      context_record_ids: [recovery.id, frontier.id, ...runtime.map(({ id }) => id)].sort(),
+    });
+
+    const transition = reduce({
+      current,
+      currentRun,
+      currentManifest: manifestWithRuntimeStages(),
+      command: {
+        type: "fail",
+        command_id: "sandbox-fatal-recovery",
+        attempt_id: current.id,
+        decision_record_id: recovery.id,
+        reason: "sandbox_fatal_enospc: no space left on device",
+        resource_disposition: {
+          kind: "cleanup",
+          runtime_delivery_record_ids: runtime.map(({ id }) => id).sort(),
+          cleanup_attempt: cleanupAttempt,
+        },
+      },
+      records: [recovery, frontier, ...runtime],
+    });
+
+    expect(transition.append_records.map(({ id }) => id)).toEqual([frontier.id, recovery.id]);
   });
 
   it("never terminalizes or starts cleanup while a create outcome is unknown", () => {

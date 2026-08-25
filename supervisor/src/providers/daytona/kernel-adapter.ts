@@ -30,6 +30,10 @@ import {
   type KernelRuntimeWorkCallbacks,
   type KernelWorkActionRequest,
 } from "../../runtime/kernel-contracts.js";
+import {
+  isSandboxFatalEnospc,
+  sandboxFailureReason,
+} from "../../pipeline/kernel/sandbox-recovery.js";
 import type {
   AuthorizedKernelSteering,
   KernelSteeringEnvelope,
@@ -537,11 +541,14 @@ export class DaytonaKernelAdapter implements
     request: KernelWorkActionRequest,
     callbacks: KernelRuntimeWorkCallbacks,
   ): Promise<KernelRuntimeOutcome> {
-    if (!request.runtime_resource || request.runtime_resource.provider !== "daytona") {
+    const resource = request.runtime_resource;
+    if (!resource || resource.provider !== "daytona") {
       throw new Error("kernel action has no exact Daytona runtime resource");
     }
-    const sandbox = await this.#daytona.get(request.runtime_resource.provider_resource_id);
-    return this.#execute(sandbox, request, callbacks);
+    return this.#executeWithSandboxFailure(async () => {
+      const sandbox = await this.#daytona.get(resource.provider_resource_id);
+      return this.#execute(sandbox, request, callbacks);
+    });
   }
 
   async correctResult(
@@ -554,7 +561,30 @@ export class DaytonaKernelAdapter implements
     });
     const resource = resolveKernelRuntimeResourceIdentity([...inputs.context.records.values()]);
     if (!resource) throw new Error("result correction has no exact Daytona runtime resource");
-    return this.#execute(await this.#daytona.get(resource.provider_resource_id), request, callbacks);
+    return this.#executeWithSandboxFailure(async () =>
+      this.#execute(
+        await this.#daytona.get(resource.provider_resource_id),
+        request,
+        callbacks,
+      )
+    );
+  }
+
+  async #executeWithSandboxFailure(
+    execute: () => Promise<KernelRuntimeOutcome>,
+  ): Promise<KernelRuntimeOutcome> {
+    try {
+      return this.#sandboxFailure(await execute());
+    } catch (error) {
+      if (!isSandboxFatalEnospc(error)) throw error;
+      return { state: "work_failed", retryable: true, sandbox_fatal: true, reason: sandboxFailureReason(error) };
+    }
+  }
+
+  #sandboxFailure(outcome: KernelRuntimeOutcome): KernelRuntimeOutcome {
+    return outcome.state === "work_failed" && isSandboxFatalEnospc(outcome.reason)
+      ? { ...outcome, retryable: true, sandbox_fatal: true }
+      : outcome;
   }
 
   async deliverSteering(input: {
