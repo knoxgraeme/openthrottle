@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -415,6 +415,69 @@ describe("kernel attempt executor", () => {
       },
     });
     expect(JSON.parse(readFileSync(resultPath, "utf8"))).toEqual(first);
+  });
+
+  it("reclaims settled sibling scratch before dispatching the next action", async () => {
+    const source = sourceRepository();
+    const root = mkdtempSync(join(tmpdir(), "ot-attempt-reclaim-start-"));
+    const request = workRequest(source.subject, {
+      attempt_id: "attempt-current",
+      request_hash: "c".repeat(64),
+    });
+    const actionRoot = join(root, "actions");
+    const requestPath = join(root, "action-input", request.attempt_id, "work-lease", "request.json");
+    const resultPath = join(root, "action-results", request.attempt_id, "work-lease", "result.json");
+    const sessionPath = join(root, "action-results", request.attempt_id, "work-lease", "session.json");
+    const fencePath = join(root, "action-fences", request.attempt_id, "lease-generation.json");
+    const priorPaths = [
+      join(actionRoot, "attempt-prior", "home", ".npm", "cache.bin"),
+      join(root, "action-input", "attempt-prior", "work-lease", "request.json"),
+      join(root, "action-results", "attempt-prior", "work-lease", "result.json"),
+      join(root, "action-fences", "attempt-prior", "lease-generation.json"),
+    ];
+    for (const path of [...priorPaths, requestPath, fencePath]) {
+      mkdirSync(join(path, ".."), { recursive: true });
+      writeFileSync(path, "scratch");
+    }
+    const summaries = [];
+
+    await executeAttempt({
+      request,
+      sourceRepoDir: source.repo,
+      actionRoot,
+      requestPath,
+      resultPath,
+      sessionPath,
+      env: { OT_LEASE_GENERATION_FENCE_FILE: fencePath },
+      reclamationLog: (summary) => summaries.push(summary),
+      runAgent: async ({ onSession }) => {
+        expect(priorPaths.every((path) => !existsSync(path))).toBe(true);
+        expect(readFileSync(requestPath, "utf8")).toBe("scratch");
+        expect(readFileSync(fencePath, "utf8")).toBe("scratch");
+        expect(readFileSync(join(source.repo, "work.txt"), "utf8")).toBe("base\n");
+        await onSession("session-reclaimed");
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          nativeSessionId: "session-reclaimed",
+          stderr: "",
+          stdout: claudeOutput("session-reclaimed", {
+            schema: "openthrottle.result-candidate/v1",
+            outcome: "success",
+            payload: { summary: "Reclaimed prior scratch.", verification: ["scratch bounded"] },
+          }),
+        };
+      },
+      now: () => new Date("2026-08-20T00:00:00.000Z"),
+    });
+
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]).toMatch(/from 4 settled-attempt directories$/);
+    expect(readFileSync(requestPath, "utf8")).toBe("scratch");
+    expect(readFileSync(fencePath, "utf8")).toBe("scratch");
+    expect(existsSync(resultPath)).toBe(true);
+    expect(existsSync(sessionPath)).toBe(true);
   });
 
   it("supplies inspect agents the bounded exact-boundary artifact without repository mutation", async () => {

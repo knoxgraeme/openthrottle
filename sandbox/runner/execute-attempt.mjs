@@ -49,6 +49,7 @@ import {
   materializeResultSubmissionChannel,
   submitProviderResultCandidate,
 } from "./result-submission.mjs";
+import { reclaimSettledAttemptScratch } from "./scratch-reclamation.mjs";
 
 export const KERNEL_RUNTIME_RESULT_SCHEMA = "openthrottle.kernel-runtime-result/v1";
 export const KERNEL_SESSION_EVENT_SCHEMA = "openthrottle.kernel-session-event/v1";
@@ -814,6 +815,7 @@ export async function executeAttempt({
   request,
   sourceRepoDir = "/var/lib/openthrottle/repository-source/repo",
   actionRoot = process.env.OT_ACTION_ROOT ?? DEFAULT_ACTION_ROOT,
+  requestPath = null,
   resultPath,
   sessionPath,
   runAgent = null,
@@ -821,13 +823,26 @@ export async function executeAttempt({
   runCommand = null,
   now = () => new Date(),
   env = process.env,
+  reclamationLog = null,
 }) {
   validateKernelRequest(request);
   if (typeof resultPath !== "string" || !resultPath.startsWith("/")) throw new Error("result path must be absolute");
   if (typeof sessionPath !== "string" || !sessionPath.startsWith("/")) throw new Error("session path must be absolute");
+  const actionDirectory = safeActionDirectory(actionRoot, request.attempt_id);
+  // Execution width is one: once this action starts, every differently named
+  // attempt subtree in these executor-owned roots belongs to settled work.
+  reclaimSettledAttemptScratch({
+    attemptId: request.attempt_id,
+    sourceRepoDir,
+    actionRoot,
+    actionDirectory,
+    requestPath,
+    resultPath,
+    leaseGenerationFencePath: env.OT_LEASE_GENERATION_FENCE_FILE,
+    log: reclamationLog,
+  });
   const replay = existingResult(resultPath, request);
   if (replay) return replay;
-  const actionDirectory = safeActionDirectory(actionRoot, request.attempt_id);
   let envelope;
   try {
     envelope = request.phase === "result_correction"
@@ -874,5 +889,11 @@ if (isMain) {
   const resultPath = resolve(process.env.OT_ACTION_RESULT_FILE);
   const sessionPath = resolve(process.env.OT_ACTION_SESSION_FILE);
   const request = validateKernelRequest(readJson(requestPath));
-  await executeAttempt({ request, resultPath, sessionPath });
+  await executeAttempt({
+    request,
+    requestPath,
+    resultPath,
+    sessionPath,
+    reclamationLog: (summary) => process.stdout.write(`${summary}\n`),
+  });
 }
