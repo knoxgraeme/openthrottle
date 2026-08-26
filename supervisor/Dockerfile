@@ -11,7 +11,7 @@
 # can't find a match for the target platform and falls back to node-gyp.
 
 # Build the shared contracts package first so file:../contracts resolves.
-FROM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS contracts
+FROM node:25-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370 AS contracts
 WORKDIR /contracts
 COPY contracts/package.json contracts/package-lock.json* ./
 RUN npm ci
@@ -24,7 +24,7 @@ COPY .openthrottle /.openthrottle
 COPY contracts/runtime-capabilities.json ./runtime-capabilities.json
 RUN npm run build
 
-FROM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS build
+FROM node:25-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370 AS build
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 make g++ \
@@ -43,7 +43,7 @@ RUN npm run build
 # leaving the built better-sqlite3 native binary and the vendored contracts copy intact.
 RUN npm prune --omit=dev --install-links
 
-FROM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS runtime
+FROM node:25-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370 AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
