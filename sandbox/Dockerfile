@@ -7,7 +7,7 @@
 # repository-level `skills/` tree, which lives as a sibling of
 # `sandbox/`, not inside it. See sandbox/README.md.
 
-FROM node:22-bookworm@sha256:0557ac14e0d45d02ed563067b82856ca5e7aa3437fa28d98d4350ea9c3d9494a
+FROM node:26-bookworm@sha256:0353e48e0e8a993db87b720c242f54b207059d1bcc0106534896e8a11054c837
 
 LABEL org.opencontainers.image.source="https://github.com/knoxgraeme/openthrottle" \
       org.opencontainers.image.licenses="MIT"
