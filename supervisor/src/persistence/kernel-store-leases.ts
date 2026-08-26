@@ -88,7 +88,9 @@ export class KernelLeaseOperations {
         ), sandbox_reservations AS (
           SELECT DISTINCT runtime_create.pipeline_run_id
           FROM effects runtime_create
-          WHERE runtime_create.kind = 'daytona/create-sandbox@1'
+          JOIN pipeline_runs r ON r.id = runtime_create.pipeline_run_id
+          WHERE r.status IN ('pending', 'running')
+            AND runtime_create.kind = 'daytona/create-sandbox@1'
             AND runtime_create.status IN ('pending', 'processing', 'unknown', 'acknowledged')
             AND NOT EXISTS (
               SELECT 1 FROM effects runtime_cleanup

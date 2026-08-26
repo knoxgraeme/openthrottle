@@ -1227,6 +1227,58 @@ describe("SqliteKernelStore", () => {
     }
   });
 
+  it("excludes terminal sandbox reservations from width while live reservations still count", async () => {
+    const context = setup(undefined, () => NOW, false, 2);
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      for (const ordinal of [2, 3, 4, 5]) {
+        const candidate = attempt({
+          id: `attempt-${ordinal}`,
+          pipeline_run_id: `run-${ordinal}`,
+          definition_bundle_hash: bundleHash,
+        });
+        admitAdditionalRun(context, `run-${ordinal}`, ordinal, [candidate]);
+      }
+      for (const runId of ["run-1", "run-2", "run-3"]) {
+        seedConfirmedRuntimeEffect(context, {
+          run_id: runId,
+          kind: "daytona/create-sandbox@1",
+          sequence: 1,
+        });
+      }
+      context.db.prepare(`
+        UPDATE pipeline_runs SET status = 'needs_human', terminal_outcome = 'needs_human',
+          cursor_stage_id = NULL, updated_at = ?
+        WHERE id IN ('run-1', 'run-2')
+      `).run(NOW);
+      context.db.prepare(`
+        UPDATE attempts SET status = 'needs_human', version = version + 1, updated_at = ?
+        WHERE pipeline_run_id IN ('run-1', 'run-2')
+      `).run(NOW);
+      context.db.prepare(
+        "UPDATE attempts SET unmet_dependency_count = 1 WHERE id = 'attempt-3'",
+      ).run();
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-with-terminal-reservations",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ run_id: "run-4", attempt: { id: "attempt-4" } });
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-over-live-reservation-budget",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
+      expect(context.db.prepare(
+        "SELECT status, lease_id FROM attempts WHERE id = 'attempt-5'",
+      ).get()).toEqual({ status: "pending", lease_id: null });
+    } finally {
+      context.db.close();
+    }
+  });
+
   it("leaves a newly ready Attempt queued while width is saturated and leases it after a slot settles", async () => {
     const context = setup(undefined, () => NOW, false, 2);
     try {
