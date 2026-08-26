@@ -38,15 +38,21 @@ import {
 } from "../pipeline/kernel/ports.js";
 import { frontierMemberKey, reduceKernelCommand } from "../pipeline/kernel/reducer.js";
 import {
+  deriveKernelTerminalCleanupAttempt,
   deriveKernelSuccessorAttempt,
   kernelSuccessorStageId,
 } from "../pipeline/kernel/successor-attempt.js";
+import { exactKernelRuntimeCleanupDeliveries } from "../pipeline/kernel/runtime-resource.js";
 import { runtimeCleanupOutcome } from "../pipeline/kernel/runtime-lifecycle.js";
 import {
+  exactSandboxFatalAbsenceDelivery,
   exactSandboxRecoveryFrontier,
   exactSandboxRecoveryRecord,
   isDaytonaRuntimeDelivery,
+  sandboxRecoveryFrontierEvaluator,
+  sandboxRecoveryFrontierReason,
   sandboxRecoveryAttemptId,
+  sandboxRecoveryEvaluator,
 } from "../pipeline/kernel/sandbox-recovery.js";
 import {
   EXTERNAL_SCHEDULE_PAYLOAD_SCHEMA,
@@ -596,11 +602,30 @@ export class KernelExternalBoundaryCoordinator {
       typeof evaluatedValue.summary !== "string" ||
       (this.#settlementPlanner === null && !stage.on[evaluatedValue.outcome])
     ) throw new Error(`external plan ${binding.external_kind} returned an unsupported stage outcome`);
-    const evaluated: EvaluatedKernelResult = {
+    let evaluated: EvaluatedKernelResult = {
       evaluator: `external/${binding.external_kind}`,
       outcome: evaluatedValue.outcome,
       reason: evaluatedValue.summary,
     };
+
+    const fatalAbsence = exactSandboxFatalAbsenceDelivery(deliveries);
+    if (fatalAbsence !== null && evaluated.outcome === "retryable_infrastructure_failure") {
+      if (attempt.work_retry_ordinal < view.run.work_retry_limit) {
+        return this.#recoverSandboxFatalAbsence({
+          view,
+          attempt,
+          bundle,
+          context,
+          delivery: fatalAbsence,
+          claim,
+        });
+      }
+      evaluated = {
+        ...evaluated,
+        outcome: "failure",
+        reason: "sandbox-fatal integration absence exhausted the work retry limit",
+      };
+    }
 
     if (attempt.status === "work_complete") {
       const result = externalResult({
@@ -870,6 +895,106 @@ export class KernelExternalBoundaryCoordinator {
       pipeline_run_id: final.run.id,
       attempt_id: attempt.id,
       outcome: settlement.outcome,
+      next_stage_id: final.run.cursor.stage_id,
+    };
+  }
+
+  async #recoverSandboxFatalAbsence(input: {
+    view: ReductionView;
+    attempt: KernelAttempt;
+    bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
+    context: Awaited<ReturnType<KernelAttemptRequestPort["loadAttemptRequestInputs"]>>;
+    delivery: DeliveryRecord;
+    claim?: AttemptLeaseClaim;
+  }): Promise<KernelExternalBoundaryStep> {
+    if (input.claim) assertAttemptLeaseClaim(input.view, input.claim);
+    const runtimeDeliveries = exactKernelRuntimeCleanupDeliveries(
+      [...input.context.context.records.values()],
+    );
+    if (runtimeDeliveries === null) {
+      throw new Error("sandbox-fatal integration absence has no exact runtime cleanup evidence");
+    }
+    const result = (input.delivery.payload as { inline: {
+      result: { reason: string };
+    } }).inline.result;
+    const reason = result.reason.slice(0, 1_500);
+    const recoveryFrontier = await Promise.all(input.view.run.cursor.frontier
+      .filter(({ attempt_id }) => input.view.run.active_attempt_versions[attempt_id] !== undefined)
+      .map(async (member) => {
+        const memberAttempt = member.attempt_id === input.attempt.id
+          ? input.attempt
+          : (await this.#load(input.view.run.id, member.attempt_id)).current_attempt;
+        if (
+          !memberAttempt ||
+          input.view.run.active_attempt_versions[memberAttempt.id] !== memberAttempt.version
+        ) throw new Error(`sandbox recovery lost active frontier Attempt ${member.attempt_id}`);
+        return createPipelineDecisionRecord({
+          attempt: memberAttempt,
+          result: null,
+          evaluated: {
+            evaluator: sandboxRecoveryFrontierEvaluator(memberAttempt.id),
+            outcome: "retryable_infrastructure_failure",
+            reason: sandboxRecoveryFrontierReason(member.depends_on),
+          },
+          created_at: this.#now(),
+        });
+      }));
+    const decision = createPipelineDecisionRecord({
+      attempt: input.attempt,
+      result: null,
+      additional_input_records: [
+        ...runtimeDeliveries,
+        input.delivery,
+        ...recoveryFrontier,
+      ],
+      evaluated: {
+        evaluator: sandboxRecoveryEvaluator(input.attempt.id),
+        outcome: "retryable_infrastructure_failure",
+        reason,
+      },
+      created_at: this.#now(),
+    });
+    const cleanupAttempt = deriveKernelTerminalCleanupAttempt({
+      view: input.view,
+      current: input.attempt,
+      decision,
+      bundle: input.bundle,
+      outcome: "failed",
+      task_prompt: input.context.task_prompt,
+      runtime_delivery_records: runtimeDeliveries,
+      recovery_frontier_records: recoveryFrontier,
+      recovery_trigger_records: [input.delivery],
+    });
+    const exact = await this.#load(
+      input.view.run.id,
+      input.attempt.id,
+      [...runtimeDeliveries, input.delivery].map(({ id }) => id),
+    );
+    await this.#apply({
+      ...exact,
+      records: mapWith(exact.records, [...recoveryFrontier, decision]),
+      checkpoints: new Map(),
+    }, {
+      type: "fail",
+      command_id: transitionId("sandbox-fatal-recovery", {
+        attempt: input.attempt.id,
+        decision: decision.id,
+      }),
+      attempt_id: input.attempt.id,
+      decision_record_id: decision.id,
+      reason,
+      resource_disposition: {
+        kind: "cleanup",
+        runtime_delivery_record_ids: runtimeDeliveries.map(({ id }) => id).sort(),
+        cleanup_attempt: cleanupAttempt,
+      },
+    }, input.claim);
+    const final = await this.#load(input.view.run.id, null);
+    return {
+      disposition: "settled",
+      pipeline_run_id: final.run.id,
+      attempt_id: input.attempt.id,
+      outcome: "retryable_infrastructure_failure",
       next_stage_id: final.run.cursor.stage_id,
     };
   }

@@ -24,6 +24,7 @@ import {
   runtimeExhaustionDestination,
 } from "./runtime-lifecycle.js";
 import {
+  exactSandboxFatalAbsenceDelivery,
   exactSandboxRecoveryFrontier,
   sandboxRecoveryAttemptId,
 } from "./sandbox-recovery.js";
@@ -604,8 +605,11 @@ function terminalCommand(
   }
   const evidenceIds = sortedUnique(disposition.runtime_delivery_record_ids);
   const frontierRecordIds = recoveryFrontier.map(({ record }) => record.id).sort(compareCodeUnits);
+  const recoveryTrigger = sandboxRecovery
+    ? exactSandboxFatalAbsenceDelivery(authorization.exact_records)
+    : null;
   const decisionRuntimeEvidenceIds = authorization.decision.input_record_ids
-    .filter((id) => !frontierRecordIds.includes(id))
+    .filter((id) => !frontierRecordIds.includes(id) && id !== recoveryTrigger?.id)
     .sort(compareCodeUnits);
   if (
     evidenceIds.length !== disposition.runtime_delivery_record_ids.length ||
