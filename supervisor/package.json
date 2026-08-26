@@ -12,6 +12,7 @@
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "epoch:initialize": "node scripts/initialize-epoch.mjs",
+    "epoch:accept-release": "node scripts/accept-release.mjs",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage"
   },

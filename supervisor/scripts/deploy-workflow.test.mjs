@@ -76,9 +76,13 @@ describe("clean-epoch deploy workflow", () => {
     ]) expect(source()).not.toContain(retired);
   });
 
-  it("packages the one-shot fresh epoch initializer in the supervisor image", () => {
-    expect(readFileSync(supervisorDockerfilePath, "utf8")).toContain(
+  it("packages both one-shot epoch operations in the supervisor image", () => {
+    const dockerfile = readFileSync(supervisorDockerfilePath, "utf8");
+    expect(dockerfile).toContain(
       "COPY supervisor/scripts/initialize-epoch.mjs ./scripts/initialize-epoch.mjs",
+    );
+    expect(dockerfile).toContain(
+      "COPY supervisor/scripts/accept-release.mjs ./scripts/accept-release.mjs",
     );
   });
 

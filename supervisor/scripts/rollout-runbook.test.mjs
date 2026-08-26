@@ -69,7 +69,7 @@ function validateReceiptCandidates(candidates) {
 
 describe("fresh-epoch rollout runbook", () => {
   it("keeps maintenance closed until exceptional recovery cleanup is clear", () => {
-    const section = runbook.slice(runbook.indexOf("## 6. Reject a proven pre-mutation sandbox failure"));
+    const section = runbook.slice(runbook.indexOf("## 7. Reject a proven pre-mutation sandbox failure"));
     const activeWorkIndex = section.indexOf('ACTIVE_WORK="$(');
     const clearGuardIndex = section.indexOf("jq -e '.clear == true'");
     const openIndex = section.indexOf('"https://$FLY_APP.fly.dev/maintenance/open"');
@@ -84,6 +84,43 @@ describe("fresh-epoch rollout runbook", () => {
       `]);
       expect(guarded.status).toBe(expectedStatus);
     }
+  });
+
+  it("fences a later release acceptance before matching deployment and reopen", () => {
+    const section = runbook.slice(
+      runbook.indexOf("## 6. Accept a later release identity"),
+      runbook.indexOf("## 7. Reject a proven pre-mutation sandbox failure"),
+    );
+    const closeIndex = section.indexOf('"https://$FLY_APP.fly.dev/maintenance/close"');
+    const activeWorkIndex = section.indexOf('"https://$FLY_APP.fly.dev/maintenance/active-work"');
+    const acceptIndex = section.indexOf("OT_ACCEPT_RELEASE_ID=$TARGET_RELEASE_ID");
+    const receiptIndex = section.indexOf(">epoch-release-acceptance-receipt.json");
+    const deployIndex = section.indexOf('flyctl deploy --ha=false --app "$FLY_APP"');
+    const checksIndex = section.indexOf('flyctl checks list --app "$FLY_APP"');
+    const openIndex = section.indexOf('"https://$FLY_APP.fly.dev/maintenance/open"');
+
+    expect(section).toContain("node /app/scripts/accept-release.mjs --print-identity");
+    expect(section).toContain("any queued or processing inbox event");
+    expect(section).toContain('.schema_checksum == $schema_checksum');
+    expect(section).toContain('.accepted_identity.release_id == $release_id');
+    expect(section).toContain("OT_EPOCH_RELEASE_ID=\"$TARGET_RELEASE_ID\"");
+    expect(closeIndex).toBeGreaterThanOrEqual(0);
+    expect(activeWorkIndex).toBeGreaterThan(closeIndex);
+    expect(acceptIndex).toBeGreaterThan(activeWorkIndex);
+    expect(receiptIndex).toBeGreaterThan(acceptIndex);
+    expect(deployIndex).toBeGreaterThan(receiptIndex);
+    expect(checksIndex).toBeGreaterThan(deployIndex);
+    expect(openIndex).toBeGreaterThan(checksIndex);
+
+    const blocks = [...section.matchAll(/```bash\n([\s\S]*?)```/g)].map(
+      ([, source]) => source,
+    );
+    const parsed = spawnSync("bash", ["-n"], {
+      input: blocks.join("\n"),
+      encoding: "utf8",
+    });
+    expect(blocks).toHaveLength(4);
+    expect(parsed.status, parsed.stderr).toBe(0);
   });
 
   it("runs the accepted digest-pinned image without rebuilding a checkout", () => {

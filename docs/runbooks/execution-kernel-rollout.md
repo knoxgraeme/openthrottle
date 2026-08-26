@@ -23,6 +23,7 @@ npm test --prefix supervisor -- \
   src/persistence/blob-store.test.ts \
   src/app/kernel-bootstrap.test.ts \
   scripts/initialize-epoch.test.mjs \
+  scripts/accept-release.test.mjs \
   scripts/rollout-runbook.test.mjs \
   scripts/deploy-workflow.test.mjs
 node supervisor/scripts/initialize-epoch.mjs --help
@@ -229,7 +230,150 @@ exact receipt/storage identity, and repair or redeploy. There is no archive,
 restore hook, replacement report, prescribed canary pair, dual-write path, or
 durable cutover state machine.
 
-## 6. Reject a proven pre-mutation sandbox failure
+## 6. Accept a later release identity
+
+Use this fenced operation only when an accepted supervisor image has a release
+or runtime-capability identity different from the epoch pins and its SQLite
+schema is unchanged. A schema change is not eligible: initialize a fresh epoch
+instead. The operation has no compatibility window; after acceptance, the old
+supervisor identity cannot open the database.
+
+First resolve the accepted digest-pinned image and ask that exact image for its
+sealed candidate identity without attaching storage:
+
+```bash
+set -euo pipefail
+umask 077
+
+export RELEASE_MANIFEST=/absolute/path/to/accepted-release-manifest.json
+export FLY_APP=openthrottle-supervisor
+export SUPERVISOR_IMAGE="$(
+  jq -er '
+    .supervisorImage
+    | select(type == "string" and test("^[^@\\s]+@sha256:[a-f0-9]{64}$"))
+  ' "$RELEASE_MANIFEST"
+)"
+export TARGET_RELEASE_ID="${SUPERVISOR_IMAGE##*@}"
+export CANDIDATE_IDENTITY="$(
+  docker run --rm \
+    -e OT_EPOCH_RELEASE_ID="$TARGET_RELEASE_ID" \
+    "$SUPERVISOR_IMAGE" \
+    node /app/scripts/accept-release.mjs --print-identity
+)"
+
+jq -e --arg release_id "$TARGET_RELEASE_ID" '
+  def sha256: type == "string" and test("^[a-f0-9]{64}$");
+  .schema == "openthrottle.epoch-release-candidate/v1" and
+  .release_id == $release_id and
+  (.runtime_capability_digest | sha256) and
+  (.schema_checksum | sha256)
+' <<<"$CANDIDATE_IDENTITY" >/dev/null
+```
+
+Close ingress with compare-and-set, then wait for the worker to drain. The
+active-work proof complements the database operation's atomic inbox, lease,
+and Attempt fences and also excludes active runs, effects, and provider-backed
+runtime resources:
+
+```bash
+MAINTENANCE="$(
+  curl -fsS -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+    "https://$FLY_APP.fly.dev/maintenance"
+)"
+MAINTENANCE_VERSION="$(jq -er '.maintenance.version' <<<"$MAINTENANCE")"
+CLOSED="$(
+  jq -n --argjson expected_version "$MAINTENANCE_VERSION" \
+    '{expected_version:$expected_version}' |
+    curl -fsS -X POST \
+      -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data-binary @- \
+      "https://$FLY_APP.fly.dev/maintenance/close"
+)"
+CLOSED_VERSION="$(jq -er '.maintenance | select(.closed == true) | .version' <<<"$CLOSED")"
+
+for attempt in $(seq 1 60); do
+  ACTIVE_WORK="$(
+    curl -fsS -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+      "https://$FLY_APP.fly.dev/maintenance/active-work"
+  )"
+  jq -e '.clear == true' <<<"$ACTIVE_WORK" >/dev/null && break
+  [ "$attempt" -lt 60 ] || {
+    echo "epoch did not quiesce; keep maintenance closed" >&2
+    exit 1
+  }
+  sleep 5
+done
+```
+
+Run the installed one-shot script on the sole volume-owning Machine, supplying
+the candidate's exact identity. The transaction refuses open ingress, any live
+lease, any queued or processing inbox event, any non-terminal Attempt, an
+identical identity, or a schema checksum different from the epoch ledger. It
+updates both pins and the durable receipt atomically:
+
+```bash
+TARGET_RUNTIME_CAPABILITY_DIGEST="$(
+  jq -er '.runtime_capability_digest' <<<"$CANDIDATE_IDENTITY"
+)"
+TARGET_SCHEMA_CHECKSUM="$(jq -er '.schema_checksum' <<<"$CANDIDATE_IDENTITY")"
+ACCEPT_OUTPUT="$(
+  flyctl ssh console --app "$FLY_APP" --command \
+    "OT_ACCEPT_RELEASE_ID=$TARGET_RELEASE_ID OT_ACCEPT_RUNTIME_CAPABILITY_DIGEST=$TARGET_RUNTIME_CAPABILITY_DIGEST OT_ACCEPT_SCHEMA_CHECKSUM=$TARGET_SCHEMA_CHECKSUM node /app/scripts/accept-release.mjs"
+)"
+ACCEPT_RECEIPT="$(tail -n 1 <<<"$ACCEPT_OUTPUT")"
+
+jq -e \
+  --arg release_id "$TARGET_RELEASE_ID" \
+  --arg runtime_digest "$TARGET_RUNTIME_CAPABILITY_DIGEST" \
+  --arg schema_checksum "$TARGET_SCHEMA_CHECKSUM" '
+    .schema == "openthrottle.epoch-release-acceptance/v1" and
+    .maintenance_ingress_closed == true and
+    .accepted_identity.release_id == $release_id and
+    .accepted_identity.runtime_capability_digest == $runtime_digest and
+    .schema_checksum == $schema_checksum and
+    .previous_identity != .accepted_identity and
+    (.accepted_at | type == "string" and length >= 20)
+  ' <<<"$ACCEPT_RECEIPT" >epoch-release-acceptance-receipt.json
+```
+
+Stage the matching boot pin, deploy that exact accepted image, and verify that
+it boots while maintenance and the receipt remain closed-fence evidence. Do not
+deploy the old image after acceptance; its strict open-only validation now
+refuses the advanced pins.
+
+```bash
+flyctl secrets set --stage --app "$FLY_APP" \
+  OT_EPOCH_RELEASE_ID="$TARGET_RELEASE_ID"
+flyctl deploy --ha=false --app "$FLY_APP" \
+  --config supervisor/fly.toml --image "$SUPERVISOR_IMAGE"
+flyctl scale count 1 --app "$FLY_APP" --yes
+flyctl checks list --app "$FLY_APP" --json
+
+MAINTENANCE="$(
+  curl -fsS -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+    "https://$FLY_APP.fly.dev/maintenance"
+)"
+LATEST_CLOSED_VERSION="$(
+  jq -er '.maintenance | select(.closed == true) | .version' <<<"$MAINTENANCE"
+)"
+jq -e '.schema == "openthrottle.epoch-release-acceptance/v1"' \
+  epoch-release-acceptance-receipt.json >/dev/null
+
+jq -n --argjson expected_version "$LATEST_CLOSED_VERSION" \
+  '{expected_version:$expected_version}' |
+  curl -fsS -X POST \
+    -H "Authorization: Bearer $OT_DEPLOY_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data-binary @- \
+    "https://$FLY_APP.fly.dev/maintenance/open"
+```
+
+Retain `epoch-release-acceptance-receipt.json` with the release artifacts. If
+acceptance or matching deployment fails, keep ingress closed and fix forward;
+never edit either pin or the receipt directly.
+
+## 7. Reject a proven pre-mutation sandbox failure
 
 Use this exceptional path only for the legacy integration-request defect it
 encodes: the run's confirmed runtime-creation Effect selected snapshot

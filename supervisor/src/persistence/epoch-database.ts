@@ -31,8 +31,13 @@ import {
   FRESH_EPOCH_VERSION,
   KERNEL_INGRESS_MAINTENANCE_SETTING,
 } from "./epoch-schema.js";
+import { ACTIVE_ATTEMPT_STATUSES } from "./kernel-active-statuses.js";
 
 export const FRESH_EPOCH_BOOTSTRAP_SCHEMA = "openthrottle.fresh-epoch-bootstrap/v1" as const;
+export const EPOCH_RELEASE_ACCEPTANCE_SCHEMA =
+  "openthrottle.epoch-release-acceptance/v1" as const;
+export const EPOCH_RELEASE_ACCEPTANCE_EVIDENCE_SETTING =
+  "epoch.release_acceptance_evidence" as const;
 const RESERVED_SETTING_PREFIX = "epoch.";
 const MAX_BOOTSTRAP_SETTINGS = 128;
 const MAX_BOOTSTRAP_REGISTRATIONS = 256;
@@ -40,6 +45,7 @@ const MAX_BOOTSTRAP_BYTES = 1024 * 1024;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,299}$/;
 const LOWERCASE_SHA256 = /^[a-f0-9]{64}$/;
 const DATABASE_SIDECAR_SUFFIXES = ["-journal", "-wal", "-shm"] as const;
+const ACTIVE_ATTEMPT_STATUS_PLACEHOLDERS = ACTIVE_ATTEMPT_STATUSES.map(() => "?").join(", ");
 
 export type SettingValueType = "string" | "number" | "boolean" | "json";
 
@@ -85,6 +91,21 @@ export interface FreshEpochVerification extends FreshEpochIdentity {
   schema_version: number;
   schema_checksum: string;
   integrity: "ok";
+}
+
+export interface EpochReleaseIdentity {
+  release_id: string;
+  runtime_capability_digest: string;
+}
+
+export interface EpochReleaseAcceptanceEvidence {
+  schema: typeof EPOCH_RELEASE_ACCEPTANCE_SCHEMA;
+  previous_identity: EpochReleaseIdentity;
+  accepted_identity: EpochReleaseIdentity;
+  accepted_at: string;
+  schema_version: number;
+  schema_checksum: string;
+  maintenance_ingress_closed: true;
 }
 
 export class FreshEpochRefusalError extends Error {
@@ -304,28 +325,13 @@ function readIdentitySetting(db: Database.Database, key: string): string {
   return value;
 }
 
-export function verifyFreshEpochDatabase(
-  db: Database.Database,
-  expected: FreshEpochIdentity,
-): FreshEpochVerification {
-  const expectedRuntimeCapabilityDigest = lowercaseSha256(
-    expected.runtime_capability_digest,
-    "expected runtime_capability_digest",
-  );
+function verifyFreshEpochStructure(db: Database.Database): FreshEpochVerification {
   if (db.pragma("foreign_keys", { simple: true }) !== 1) refuse("foreign keys are disabled");
   if (db.pragma("application_id", { simple: true }) !== FRESH_EPOCH_APPLICATION_ID) {
     refuse("database application identity is unknown");
   }
   if (db.pragma("user_version", { simple: true }) !== FRESH_EPOCH_VERSION) {
     refuse("database schema version is unknown");
-  }
-  const actualObjects = schemaObjects(db);
-  if (canonicalJson(actualObjects) !== canonicalJson(baselineSchemaObjects())) {
-    refuse("database schema objects are partial, drifted, or undeclared");
-  }
-  const tables = actualObjects.filter((object) => object.type === "table").map((object) => object.name).sort();
-  if (canonicalJson(tables) !== canonicalJson([...FRESH_EPOCH_TABLES].sort())) {
-    refuse("database does not contain the exact twelve-table epoch");
   }
   const migrations = db.prepare("SELECT version, name, checksum FROM schema_migrations ORDER BY version")
     .all() as Array<{ version: number; name: string; checksum: string }>;
@@ -336,12 +342,20 @@ export function verifyFreshEpochDatabase(
   }])) {
     refuse("schema migration checksum ledger is unknown or drifted");
   }
+  const actualObjects = schemaObjects(db);
+  if (canonicalJson(actualObjects) !== canonicalJson(baselineSchemaObjects())) {
+    refuse("database schema objects are partial, drifted, or undeclared");
+  }
+  const tables = actualObjects.filter((object) => object.type === "table").map((object) => object.name).sort();
+  if (canonicalJson(tables) !== canonicalJson([...FRESH_EPOCH_TABLES].sort())) {
+    refuse("database does not contain the exact twelve-table epoch");
+  }
   const foreignKeyFailures = db.pragma("foreign_key_check") as unknown[];
   if (foreignKeyFailures.length > 0) refuse("database foreign-key integrity check failed");
   const integrity = db.pragma("integrity_check", { simple: true });
   if (integrity !== "ok") refuse(`database integrity check failed: ${String(integrity)}`);
 
-  const actual: FreshEpochIdentity = {
+  return {
     release_id: readIdentitySetting(db, "epoch.release_id"),
     runtime_capability_digest: lowercaseSha256(
       readIdentitySetting(db, "epoch.runtime_capability_digest"),
@@ -350,17 +364,33 @@ export function verifyFreshEpochDatabase(
     blob_store_id: readIdentitySetting(db, "epoch.blob_store_id"),
     blob_marker_checksum: readIdentitySetting(db, "epoch.blob_marker_checksum"),
     bootstrap_checksum: readIdentitySetting(db, "epoch.bootstrap_checksum"),
-  };
-  if (canonicalJson(actual) !== canonicalJson({
-    ...expected,
-    runtime_capability_digest: expectedRuntimeCapabilityDigest,
-  })) refuse("release, runtime capability, bootstrap, or blob-root identity mismatch");
-  return {
-    ...actual,
     schema_version: FRESH_EPOCH_VERSION,
     schema_checksum: FRESH_EPOCH_SCHEMA_CHECKSUM,
     integrity: "ok",
   };
+}
+
+export function verifyFreshEpochDatabase(
+  db: Database.Database,
+  expected: FreshEpochIdentity,
+): FreshEpochVerification {
+  const expectedRuntimeCapabilityDigest = lowercaseSha256(
+    expected.runtime_capability_digest,
+    "expected runtime_capability_digest",
+  );
+  const actual = verifyFreshEpochStructure(db);
+  const actualIdentity: FreshEpochIdentity = {
+    release_id: actual.release_id,
+    runtime_capability_digest: actual.runtime_capability_digest,
+    blob_store_id: actual.blob_store_id,
+    blob_marker_checksum: actual.blob_marker_checksum,
+    bootstrap_checksum: actual.bootstrap_checksum,
+  };
+  if (canonicalJson(actualIdentity) !== canonicalJson({
+    ...expected,
+    runtime_capability_digest: expectedRuntimeCapabilityDigest,
+  })) refuse("release, runtime capability, bootstrap, or blob-root identity mismatch");
+  return actual;
 }
 
 function insertSetting(
@@ -522,6 +552,179 @@ function unlinkStagingFiles(stagingPath: string): void {
 
 function databaseFileDigest(path: string): string {
   return digestNormalized(readFileSync(path));
+}
+
+const RESTORE_IMMUTABLE_SETTING_UPDATE_TRIGGER = String.raw`
+CREATE TRIGGER settings_immutable_update
+BEFORE UPDATE ON settings
+WHEN OLD.mutable = 0
+BEGIN
+  SELECT RAISE(ABORT, 'immutable setting');
+END;
+`;
+
+function acceptanceTimestamp(now: () => string): string {
+  const value = now();
+  if (typeof value !== "string" || value.length < 20) {
+    refuse("release acceptance timestamp is invalid");
+  }
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) {
+    refuse("release acceptance timestamp is invalid");
+  }
+  return value;
+}
+
+/**
+ * Advances only the two release-owned identity pins on an already initialized,
+ * quiesced epoch. The immutable-setting trigger is removed and restored inside
+ * the same immediate transaction so no ordinary writer can mutate those pins.
+ */
+export function acceptFreshEpochRelease(input: {
+  database_path: string;
+  blob_store: VolumeBlobStore;
+  release_id: string;
+  runtime_capability_digest: string;
+  schema_checksum: string;
+  now?: () => string;
+}): EpochReleaseAcceptanceEvidence {
+  const target = resolve(input.database_path);
+  const stats = lstatSync(target);
+  if (!stats.isFile() || stats.isSymbolicLink()) refuse("target database is not a regular file");
+  input.blob_store.assertSameVolume(target);
+  const acceptedIdentity: EpochReleaseIdentity = {
+    release_id: boundedString(input.release_id, "release_id", 200),
+    runtime_capability_digest: lowercaseSha256(
+      input.runtime_capability_digest,
+      "runtime_capability_digest",
+    ),
+  };
+  const expectedSchemaChecksum = lowercaseSha256(input.schema_checksum, "schema_checksum");
+  if (expectedSchemaChecksum !== FRESH_EPOCH_SCHEMA_CHECKSUM) {
+    refuse("release schema checksum differs from the epoch schema checksum");
+  }
+  const acceptedAt = acceptanceTimestamp(input.now ?? (() => new Date().toISOString()));
+  const db = new Database(target, { fileMustExist: true });
+  try {
+    db.pragma("foreign_keys = ON");
+    db.pragma("synchronous = FULL");
+    db.pragma("busy_timeout = 5000");
+    return db.transaction(() => {
+      const current = verifyFreshEpochStructure(db);
+      if (
+        current.blob_store_id !== input.blob_store.store_id ||
+        current.blob_marker_checksum !== input.blob_store.marker_checksum
+      ) {
+        refuse("release acceptance BlobStore identity mismatch");
+      }
+      const maintenance = db.prepare(`
+        SELECT value_json, value_type, mutable
+        FROM settings WHERE key = ?
+      `).get(KERNEL_INGRESS_MAINTENANCE_SETTING) as {
+        value_json: string;
+        value_type: string;
+        mutable: number;
+      } | undefined;
+      if (
+        !maintenance ||
+        maintenance.value_json !== "true" ||
+        maintenance.value_type !== "boolean" ||
+        maintenance.mutable !== 1
+      ) {
+        refuse("release acceptance requires maintenance ingress to be closed");
+      }
+      const leaseCounts = db.prepare(`
+        SELECT
+          (SELECT COUNT(*) FROM leases) +
+          (SELECT COUNT(*) FROM inbox_events WHERE lease_id IS NOT NULL) +
+          (SELECT COUNT(*) FROM attempts WHERE lease_id IS NOT NULL) +
+          (SELECT COUNT(*) FROM effects WHERE lease_id IS NOT NULL) AS count
+      `).get() as { count: number };
+      if (leaseCounts.count !== 0) refuse("release acceptance requires zero live leases");
+      const activeInboxEvents = db.prepare(`
+        SELECT COUNT(*) AS count FROM inbox_events
+        WHERE status IN ('pending', 'processing')
+      `).get() as { count: number };
+      if (activeInboxEvents.count !== 0) {
+        refuse("release acceptance requires zero pending or processing inbox events");
+      }
+      const activeAttempts = db.prepare(`
+        SELECT COUNT(*) AS count FROM attempts
+        WHERE status IN (${ACTIVE_ATTEMPT_STATUS_PLACEHOLDERS})
+      `).get(...ACTIVE_ATTEMPT_STATUSES) as { count: number };
+      if (activeAttempts.count !== 0) {
+        refuse("release acceptance requires zero non-terminal attempts");
+      }
+      const previousIdentity: EpochReleaseIdentity = {
+        release_id: current.release_id,
+        runtime_capability_digest: current.runtime_capability_digest,
+      };
+      if (
+        previousIdentity.release_id === acceptedIdentity.release_id &&
+        previousIdentity.runtime_capability_digest === acceptedIdentity.runtime_capability_digest
+      ) {
+        refuse("release acceptance identity is already pinned");
+      }
+      const evidence: EpochReleaseAcceptanceEvidence = {
+        schema: EPOCH_RELEASE_ACCEPTANCE_SCHEMA,
+        previous_identity: previousIdentity,
+        accepted_identity: acceptedIdentity,
+        accepted_at: acceptedAt,
+        schema_version: current.schema_version,
+        schema_checksum: current.schema_checksum,
+        maintenance_ingress_closed: true,
+      };
+
+      db.exec("DROP TRIGGER settings_immutable_update");
+      const updateIdentitySetting = db.prepare(`
+        UPDATE settings
+        SET value_json = ?, version = version + 1, updated_at = ?
+        WHERE key = ? AND value_type = 'string' AND mutable = 0
+      `);
+      for (const [key, value] of [
+        ["epoch.release_id", acceptedIdentity.release_id],
+        ["epoch.runtime_capability_digest", acceptedIdentity.runtime_capability_digest],
+      ] as const) {
+        const updated = updateIdentitySetting.run(canonicalJson(value), acceptedAt, key);
+        if (updated.changes !== 1) refuse(`release acceptance could not update ${key}`);
+      }
+      const existingEvidence = db.prepare(`
+        SELECT value_type, mutable FROM settings WHERE key = ?
+      `).get(EPOCH_RELEASE_ACCEPTANCE_EVIDENCE_SETTING) as {
+        value_type: string;
+        mutable: number;
+      } | undefined;
+      if (existingEvidence) {
+        if (existingEvidence.value_type !== "json" || existingEvidence.mutable !== 0) {
+          refuse("release acceptance evidence setting has an invalid shape");
+        }
+        db.prepare(`
+          UPDATE settings
+          SET value_json = ?, version = version + 1, updated_at = ?
+          WHERE key = ?
+        `).run(canonicalJson(evidence), acceptedAt, EPOCH_RELEASE_ACCEPTANCE_EVIDENCE_SETTING);
+      } else {
+        db.prepare(`
+          INSERT INTO settings (key, value_json, value_type, mutable, version, updated_at)
+          VALUES (?, ?, 'json', 0, 0, ?)
+        `).run(
+          EPOCH_RELEASE_ACCEPTANCE_EVIDENCE_SETTING,
+          canonicalJson(evidence),
+          acceptedAt,
+        );
+      }
+      db.exec(RESTORE_IMMUTABLE_SETTING_UPDATE_TRIGGER);
+      verifyFreshEpochDatabase(db, {
+        ...acceptedIdentity,
+        blob_store_id: current.blob_store_id,
+        blob_marker_checksum: current.blob_marker_checksum,
+        bootstrap_checksum: current.bootstrap_checksum,
+      });
+      return evidence;
+    }).immediate();
+  } finally {
+    db.close();
+  }
 }
 
 export function initializeFreshEpochDatabase(input: {
