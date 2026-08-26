@@ -1328,6 +1328,126 @@ describe("DaytonaKernelAdapter", () => {
     expect(read).not.toHaveBeenCalled();
   });
 
+  it("starts a stopped integration sandbox and completes reconciliation in the same read", async () => {
+    const candidate = selfContainedCheckpointBundle("6".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-stopped-integration");
+    const dispatchFence = { lease_id: "lease-stopped", worker_id: "worker-stopped" };
+    const resultPath =
+      `/var/lib/openthrottle/integration-results/${intent.id}/${dispatchFence.lease_id}/result.json`;
+    const sandbox = sandboxWith(async (path) => {
+      if (path !== resultPath) throw new Error("404 not found");
+      return Buffer.from(JSON.stringify({
+        schema: "openthrottle.kernel-integration-result/v1",
+        pipeline_run_id: intent.pipeline_run_id,
+        effect_id: intent.id,
+        idempotency_key: intent.idempotency_key,
+        lease_id: dispatchFence.lease_id,
+        worker_id: dispatchFence.worker_id,
+        definition_bundle_hash: "b".repeat(64),
+        state: "needs_human",
+        input_subject: candidate.descriptor.commit,
+        candidate_checkpoint_id: "checkpoint-candidate",
+        output_subject: null,
+        payload_schema: null,
+        payload_artifact: null,
+        reason: "candidate conflicts with the current subject",
+      }));
+    });
+    sandbox.state = "stopped";
+    const start = vi.fn(async () => { sandbox.state = "started"; });
+    Object.assign(sandbox, { start });
+    const adapter = adapterFor(sandbox);
+    const binding = adapter.effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+
+    await expect(binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: dispatchFence,
+    })).resolves.toMatchObject({
+      kind: "found",
+      status: "rejected",
+      payload: { state: "needs_human", reason: "candidate conflicts with the current subject" },
+    });
+    expect(start).toHaveBeenCalledWith(60);
+    expect(sandbox.fs.downloadFile).toHaveBeenCalledWith(resultPath);
+  });
+
+  it("holds a stopped integration sandbox with state-naming evidence when recovery start fails", async () => {
+    const candidate = selfContainedCheckpointBundle("5".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-stopped-start-failure");
+    const sandbox = sandboxWith(async () => { throw new Error("provider read must not run"); });
+    sandbox.state = "stopped";
+    const startFailure = new Error("[object Object]");
+    Object.assign(startFailure, { code: "quota_enforced", retryable: true });
+    const start = vi.fn().mockRejectedValue(startFailure);
+    Object.assign(sandbox, { start });
+    const adapter = adapterFor(sandbox);
+    const binding = adapter.effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+
+    await expect(binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: { lease_id: "lease-start-failure", worker_id: "worker-start-failure" },
+    })).resolves.toEqual({
+      kind: "retry",
+      detail: "integration runtime sandbox sandbox-1 is stopped; recovery start failed: " +
+        '{"code":"quota_enforced","retryable":true}',
+      continuation: {
+        schema: "openthrottle.daytona-integration-absence-continuation/v1",
+        consecutive_absences: 0,
+      },
+    });
+    expect(sandbox.fs.downloadFile).not.toHaveBeenCalled();
+  });
+
+  it.each(["stopped", "archived"] as const)(
+    "starts a %s sandbox while reconciling its lifecycle start effect",
+    async (inactiveState) => {
+      const sandbox = sandboxWith(async () => { throw new Error("provider read is not expected"); });
+      sandbox.state = inactiveState;
+      const start = vi.fn(async () => { sandbox.state = "started"; });
+      Object.assign(sandbox, { start });
+      const adapter = adapterFor(sandbox);
+      const binding = adapter.effectBindings().find(
+        ({ effect_kind }) => effect_kind === "daytona/start-sandbox@1",
+      )!;
+      const intent: EffectIntent = {
+        schema: "openthrottle.effect-intent/v1",
+        id: "effect-start-stopped",
+        pipeline_run_id: "run-1",
+        decision_record_id: "decision-start-stopped",
+        kind: "daytona/start-sandbox@1",
+        idempotency_key: "run-1:start:sandbox-1",
+        target: `daytona:${"d".repeat(64)}`,
+        subject: null,
+        payload: {
+          schema: "openthrottle.daytona-start/v1",
+          identity: "d".repeat(64),
+          pipeline_run_id: "run-1",
+          repository: "owner/repository",
+          base_branch: "main",
+          base_commit: "c".repeat(40),
+          snapshot: "snapshot-1",
+        },
+      };
+
+      await expect(binding.adapter.reconcile({
+        intent,
+        external_identity: intent.target,
+        dispatch_fence: null,
+      })).resolves.toEqual({
+        kind: "found",
+        status: "confirmed",
+        payload: { sandbox_id: "sandbox-1", resource_state: "started", identity: "d".repeat(64) },
+      });
+      expect(start).toHaveBeenCalledWith(60);
+    },
+  );
+
   it("classifies two consecutive authoritative integration sandbox absences as sandbox-fatal", async () => {
     const candidate = selfContainedCheckpointBundle("7".repeat(64));
     const intent = integrationIntentFor(candidate, "effect-absent-integration");
