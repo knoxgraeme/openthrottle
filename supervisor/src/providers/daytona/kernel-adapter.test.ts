@@ -3,8 +3,30 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { DeliveryRecord, EffectIntent } from "@openthrottle/contracts";
+import {
+  canonicalJson,
+  type DeliveryRecord,
+  type EffectIntent,
+  type ExecutionRecordPayloadRegistry,
+} from "@openthrottle/contracts";
 import { describe, expect, it, vi } from "vitest";
+import type {
+  KernelEffectPort,
+  LeasedEffectView,
+} from "../../pipeline/kernel/ports.js";
+import type { EffectReconciliation } from "../../pipeline/kernel/effect-intent.js";
+import {
+  KERNEL_EFFECT_DELIVERY_PAYLOAD_CONTRACT,
+  KERNEL_EFFECT_DELIVERY_PAYLOAD_SCHEMA,
+  createKernelEffectAdapterRegistry,
+  createKernelEffectExecutionService,
+} from "../../operations/kernel-effects.js";
+import { effectIntentContentHash } from "../../pipeline/kernel/effect-intent.js";
+import {
+  freshKernelFixture,
+  seedKernelRun,
+} from "../../persistence/__fixtures__/kernel-epoch.js";
+import { SqliteKernelStore } from "../../persistence/kernel-store.js";
 import {
   KERNEL_ACTION_REQUEST_SCHEMA,
   KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA,
@@ -261,6 +283,72 @@ function adapterFor(
     poll_interval_ms: 1,
     ...optionOverrides,
   } as never);
+}
+
+class DurableIntegrationEffectPort implements KernelEffectPort {
+  prior_unknown_detail: string | null = null;
+  delivery: DeliveryRecord | null = null;
+  #reconciliationOrdinal = 0;
+
+  constructor(readonly intent: EffectIntent) {}
+
+  async leaseNextEffect(input: {
+    worker_id: string;
+    lease_id: string;
+    expires_at: string;
+  }): Promise<LeasedEffectView | null> {
+    if (this.delivery !== null) return null;
+    this.#reconciliationOrdinal += 1;
+    return {
+      intent: this.intent,
+      lease_id: input.lease_id,
+      expires_at: input.expires_at,
+      execution_mode: "reconcile_only",
+      reconciliation_ordinal: this.#reconciliationOrdinal,
+      prior_unknown_detail: this.prior_unknown_detail,
+      dispatch_fence: {
+        lease_id: "integration-dispatch-lease",
+        worker_id: "integration-dispatch-worker",
+      },
+    };
+  }
+
+  async markLeasedEffectDispatchStarted(): Promise<LeasedEffectView> {
+    throw new Error("reconcile-only integration must not dispatch");
+  }
+
+  async completeLeasedEffect(input: {
+    effect_id: string;
+    lease_id: string;
+    worker_id: string;
+    reconciliation: EffectReconciliation;
+  }): Promise<void> {
+    if (input.reconciliation.kind === "execute") {
+      throw new Error("integration reconciliation must settle or remain unknown");
+    }
+    if (input.reconciliation.kind === "hold_unknown") {
+      this.prior_unknown_detail = input.reconciliation.detail;
+      return;
+    }
+    this.delivery = input.reconciliation.delivery;
+    this.prior_unknown_detail = null;
+  }
+}
+
+function integrationEffectService(
+  adapter: DaytonaKernelAdapter,
+  port: KernelEffectPort,
+  now: () => string = () => "2026-08-20T12:00:00.000Z",
+) {
+  const binding = adapter.effectBindings().find(
+    ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+  );
+  if (!binding) throw new Error("missing Daytona integration binding");
+  return createKernelEffectExecutionService({
+    effects: port,
+    adapters: createKernelEffectAdapterRegistry([binding]),
+    now,
+  });
 }
 
 function runtimeResult(request: KernelWorkActionRequest): Buffer {
@@ -1279,6 +1367,119 @@ describe("DaytonaKernelAdapter", () => {
     });
   });
 
+  it("settles two consecutive integration absences after expired SQLite lease recovery", async () => {
+    const candidate = selfContainedCheckpointBundle("a".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-drained-absent-integration");
+    const sandbox = sandboxWith(async () => { throw new Error("provider access is not expected"); });
+    const adapter = adapterFor(sandbox, {}, {}, {}, {
+      list: vi.fn(() => (async function* () {})()),
+    });
+    const fixture = freshKernelFixture();
+    let currentTime = "2026-08-20T12:00:00.000Z";
+    try {
+      seedKernelRun({ db: fixture.db, run_id: intent.pipeline_run_id });
+      fixture.db.transaction(() => {
+        fixture.db.prepare(`
+          INSERT INTO records (
+            id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+            inline_payload, reducer, input_record_ids_json, input_record_count, created_at
+          ) VALUES (?, ?, 1, ?, 'decision', 'test/integration-decision@1', '{}',
+            'test/integration-decision@1', '[]', 0, ?)
+        `).run(
+          intent.decision_record_id,
+          intent.pipeline_run_id,
+          "e".repeat(64),
+          currentTime,
+        );
+        fixture.db.prepare(`
+          INSERT INTO effects (
+            id, pipeline_run_id, decision_record_id, kind, idempotency_key, target,
+            subject, payload_schema, inline_payload, intent_hash, status, version,
+            attempt_count, available_at, dispatch_lease_id, dispatch_worker_id,
+            unknown_detail, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', 0, 0, ?, ?, ?, ?, ?, ?)
+        `).run(
+          intent.id,
+          intent.pipeline_run_id,
+          intent.decision_record_id,
+          intent.kind,
+          intent.idempotency_key,
+          intent.target,
+          intent.subject,
+          intent.kind,
+          canonicalJson(intent.payload),
+          effectIntentContentHash(intent),
+          currentTime,
+          "integration-dispatch-lease",
+          "integration-dispatch-worker",
+          "integration runtime sandbox outcome is unresolved",
+          currentTime,
+          currentTime,
+        );
+      }).immediate();
+      const store = new SqliteKernelStore({
+        db: fixture.db,
+        blob_store: fixture.blobs,
+        manifest_resolver: { resolve: () => { throw new Error("not used"); } },
+        payload_schemas: new Map([
+          [KERNEL_EFFECT_DELIVERY_PAYLOAD_SCHEMA, KERNEL_EFFECT_DELIVERY_PAYLOAD_CONTRACT],
+        ]) as ExecutionRecordPayloadRegistry,
+        execution_policy: Object.freeze({ max_concurrent_attempts: 1 }),
+        now: () => currentTime,
+      });
+      const service = integrationEffectService(adapter, store, () => currentTime);
+
+      await expect(service.drainOne({
+        worker_id: "effect-worker-1",
+        lease_id: "reconcile-lease-1",
+        expires_at: "2026-08-20T12:00:01.000Z",
+      })).resolves.toMatchObject({
+        kind: "held_unknown",
+        detail: expect.stringMatching(/confirming authoritative absence/i),
+      });
+      const firstDetail = fixture.db.prepare(
+        "SELECT unknown_detail FROM effects WHERE id = ?",
+      ).get(intent.id) as { unknown_detail: string };
+      expect(JSON.parse(firstDetail.unknown_detail)).toMatchObject({
+        schema: "openthrottle.effect-retry-continuation/v1",
+        continuation: { consecutive_absences: 1 },
+      });
+
+      currentTime = "2026-08-20T12:00:05.000Z";
+      await expect(store.leaseNextEffect({
+        worker_id: "interrupted-worker",
+        lease_id: "interrupted-reconcile-lease",
+        expires_at: "2026-08-20T12:00:06.000Z",
+      })).resolves.toMatchObject({
+        intent: { id: intent.id },
+        execution_mode: "reconcile_only",
+        prior_unknown_detail: firstDetail.unknown_detail,
+      });
+
+      currentTime = "2026-08-20T12:00:07.000Z";
+      await expect(service.drainOne({
+        worker_id: "effect-worker-2",
+        lease_id: "reconcile-lease-2",
+        expires_at: "2026-08-20T12:01:00.000Z",
+      })).resolves.toMatchObject({
+        kind: "delivered",
+        status: "rejected",
+        path: "reconciled",
+      });
+      expect(fixture.db.prepare(`
+        SELECT e.status, e.unknown_detail, r.inline_payload
+        FROM effects e JOIN records r ON r.id = e.delivery_record_id
+        WHERE e.id = ?
+      `).get(intent.id)).toMatchObject({
+        status: "rejected",
+        unknown_detail: null,
+        inline_payload: expect.stringContaining("sandbox_fatal_absent:"),
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   it("resets consecutive absence evidence across a transient Daytona lookup error", async () => {
     const candidate = selfContainedCheckpointBundle("8".repeat(64));
     const intent = integrationIntentFor(candidate, "effect-transient-integration");
@@ -1321,6 +1522,51 @@ describe("DaytonaKernelAdapter", () => {
     })).resolves.toMatchObject({
       kind: "retry",
       continuation: { consecutive_absences: 1 },
+    });
+  });
+
+  it("resets drained integration absence evidence across a transient provider object failure", async () => {
+    const candidate = selfContainedCheckpointBundle("b".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-drained-transient-integration");
+    const sandbox = sandboxWith(async () => { throw new Error("provider access is not expected"); });
+    const observations: Array<"absent" | "error"> = ["absent", "error", "absent", "absent"];
+    const list = vi.fn(() => (async function* () {
+      if (observations.shift() === "error") {
+        throw { code: "temporarily_unavailable", retryable: true };
+      }
+    })());
+    const adapter = adapterFor(sandbox, {}, {}, {}, { list });
+    const port = new DurableIntegrationEffectPort(intent);
+    const service = integrationEffectService(adapter, port);
+    const drain = (ordinal: number) => service.drainOne({
+      worker_id: "effect-worker",
+      lease_id: `transient-reconcile-lease-${ordinal}`,
+      expires_at: "2026-08-20T12:01:00.000Z",
+    });
+
+    await expect(drain(1)).resolves.toMatchObject({ kind: "held_unknown" });
+    await expect(drain(2)).resolves.toMatchObject({
+      kind: "held_unknown",
+      detail: '{"code":"temporarily_unavailable","retryable":true}',
+    });
+    expect(port.prior_unknown_detail).not.toContain("[object Object]");
+    expect(JSON.parse(port.prior_unknown_detail!)).toMatchObject({
+      continuation: { consecutive_absences: 0 },
+    });
+
+    await expect(drain(3)).resolves.toMatchObject({ kind: "held_unknown" });
+    expect(port.delivery).toBeNull();
+    expect(JSON.parse(port.prior_unknown_detail!)).toMatchObject({
+      continuation: { consecutive_absences: 1 },
+    });
+    await expect(drain(4)).resolves.toMatchObject({
+      kind: "delivered",
+      status: "rejected",
+    });
+    expect(port.delivery).toMatchObject({
+      payload: { inline: { result: {
+        reason: expect.stringMatching(/^sandbox_fatal_absent:/),
+      } } },
     });
   });
 

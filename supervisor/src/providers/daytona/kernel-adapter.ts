@@ -3,6 +3,7 @@ import { Daytona, type Sandbox } from "@daytona/sdk";
 import {
   canonicalJson,
   digestCanonicalJson,
+  jsonValueAt,
   validateBlobPointer,
   type BlobPointer,
   type EffectIntent,
@@ -188,6 +189,22 @@ interface DaytonaIntegrationResult {
 const DAYTONA_INTEGRATION_ABSENCE_CONTINUATION_SCHEMA =
   "openthrottle.daytona-integration-absence-continuation/v1" as const;
 const DAYTONA_INTEGRATION_FATAL_ABSENCE_THRESHOLD = 2;
+
+function providerErrorDetail(error: unknown, fallback: string): string {
+  let detail: string;
+  if (error instanceof Error) {
+    detail = error.message;
+  } else if (typeof error === "string") {
+    detail = error;
+  } else {
+    try {
+      detail = canonicalJson(jsonValueAt(error, "daytona_provider_error"));
+    } catch {
+      detail = fallback;
+    }
+  }
+  return detail.trim().length > 0 ? detail : fallback;
+}
 
 function integrationAbsenceCount(value: JsonValue | null | undefined): number {
   if (value === null || value === undefined) return 0;
@@ -1226,10 +1243,9 @@ export class DaytonaKernelAdapter implements
     try {
       sandbox = await this.#integrationSandbox(authority);
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
       return {
         kind: "retry",
-        detail: detail || "integration runtime sandbox lookup failed",
+        detail: providerErrorDetail(error, "integration runtime sandbox lookup failed"),
         continuation: integrationAbsenceContinuation(0),
       };
     }
@@ -1345,10 +1361,9 @@ export class DaytonaKernelAdapter implements
       };
     } catch (error) {
       if (priorAbsences === 0) throw error;
-      const detail = error instanceof Error ? error.message : String(error);
       return {
         kind: "retry",
-        detail: detail || "integration runtime sandbox reconciliation failed",
+        detail: providerErrorDetail(error, "integration runtime sandbox reconciliation failed"),
         continuation: integrationAbsenceContinuation(0),
       };
     }
