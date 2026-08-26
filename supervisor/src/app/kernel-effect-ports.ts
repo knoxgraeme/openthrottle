@@ -5,6 +5,7 @@ export type KernelEffectIdempotencyStrategy = "provider_native" | "deterministic
 export type KernelEffectProviderObservation =
   | { kind: "found"; status: "confirmed" | "rejected"; payload: JsonValue }
   | { kind: "not_found" }
+  | { kind: "retry"; detail: string; continuation: JsonValue }
   | { kind: "unknown"; detail: string };
 
 export interface KernelEffectDispatchFence {
@@ -16,6 +17,8 @@ export interface KernelEffectReconciliationRequest {
   intent: Readonly<EffectIntent>;
   external_identity: string;
   dispatch_fence: KernelEffectDispatchFence | null;
+  observed_at?: string;
+  continuation?: JsonValue | null;
 }
 
 export interface KernelEffectDispatchRequest extends KernelEffectReconciliationRequest {

@@ -73,10 +73,34 @@ type RequiredObservationResolution =
     observation: JsonValue;
   };
 
+interface ConsumedCheckRunObservation {
+  observed_at: string;
+  observation: JsonValue;
+}
+
+interface FailedCheckRunState {
+  name: string;
+  app_slug: string;
+  first_failed_at: string;
+  failed_observations: ConsumedCheckRunObservation[];
+  success_observation?: ConsumedCheckRunObservation;
+}
+
+interface ProviderWaitContinuation {
+  schema: "openthrottle.github-provider-wait-continuation/v1";
+  subject: string;
+  check_runs: FailedCheckRunState[];
+}
+
+type CheckRunRejectionCause = "failure_budget_exhausted" | "window_expired";
+
 const PROVIDER_PAGE_SIZE = 100;
 const PROVIDER_MAX_PAGES = 10;
 const PULL_REQUEST_PAGE_SIZE = 100;
 const PULL_REQUEST_MAX_PAGES = 10;
+const CHECK_RUN_REOBSERVATION_WINDOW_MS = 30 * 60_000;
+const CHECK_RUN_REOBSERVATION_WINDOW_MINUTES = 30;
+const CHECK_RUN_FAILURE_LIMIT = 3;
 
 function object(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -343,6 +367,113 @@ function checkRunIdentity(
     (app as Record<string, unknown>).slug === requirement.app_slug);
 }
 
+function canonicalTimestamp(value: unknown, label: string): string {
+  if (typeof value !== "string") throw new Error(`${label} must be a timestamp`);
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) {
+    throw new Error(`${label} must be a canonical timestamp`);
+  }
+  return value;
+}
+
+function checkRunKey(value: { name: string; app_slug: string }): string {
+  return `${value.name}\0${value.app_slug}`;
+}
+
+function parseConsumedCheckRun(
+  value: unknown,
+  state: { name: string; app_slug: string },
+  label: string,
+): ConsumedCheckRunObservation {
+  const input = object(value, label);
+  exactKeys(input, ["observed_at", "observation"], label);
+  const observation = object(input.observation, `${label}.observation`);
+  exactKeys(observation, ["kind", "id", "name", "app_slug", "status", "conclusion"], `${label}.observation`);
+  if (
+    observation.kind !== "check_run" || positiveId(observation.id) === null ||
+    observation.name !== state.name || observation.app_slug !== state.app_slug ||
+    observation.status !== "completed" || typeof observation.conclusion !== "string"
+  ) throw new Error(`${label} is not an exact completed check-run observation`);
+  return {
+    observed_at: canonicalTimestamp(input.observed_at, `${label}.observed_at`),
+    observation: observation as JsonValue,
+  };
+}
+
+function providerWaitContinuation(
+  value: JsonValue | null | undefined,
+  payload: ProviderWaitPayload,
+): ProviderWaitContinuation {
+  if (value === null || value === undefined) {
+    return {
+      schema: "openthrottle.github-provider-wait-continuation/v1",
+      subject: payload.subject,
+      check_runs: [],
+    };
+  }
+  const input = object(value, "GitHub provider wait continuation");
+  exactKeys(input, ["schema", "subject", "check_runs"], "GitHub provider wait continuation");
+  if (
+    input.schema !== "openthrottle.github-provider-wait-continuation/v1" ||
+    input.subject !== payload.subject || !Array.isArray(input.check_runs) ||
+    input.check_runs.length > payload.policy.required_observations.length
+  ) throw new Error("GitHub provider wait continuation does not match the sealed wait");
+  const required = new Set(payload.policy.required_observations.flatMap((requirement) =>
+    requirement.kind === "check_run" ? [checkRunKey(requirement)] : []));
+  const checkRuns = input.check_runs.map((candidate, index): FailedCheckRunState => {
+    const label = `GitHub provider wait continuation.check_runs[${index}]`;
+    const state = object(candidate, label);
+    exactKeys(
+      state,
+      [
+        "name", "app_slug", "first_failed_at", "failed_observations",
+        ...(state.success_observation === undefined ? [] : ["success_observation"]),
+      ],
+      label,
+    );
+    if (
+      typeof state.name !== "string" || typeof state.app_slug !== "string" ||
+      !required.has(checkRunKey({ name: state.name, app_slug: state.app_slug })) ||
+      !Array.isArray(state.failed_observations) || state.failed_observations.length < 1 ||
+      state.failed_observations.length >= CHECK_RUN_FAILURE_LIMIT
+    ) throw new Error(`${label} is not bounded exact required-check evidence`);
+    const identity = { name: state.name, app_slug: state.app_slug };
+    const failures = state.failed_observations.map((observation, observationIndex) =>
+      parseConsumedCheckRun(observation, identity, `${label}.failed_observations[${observationIndex}]`));
+    if (failures.some(({ observation }) =>
+      (observation as Record<string, JsonValue>).conclusion === "success")) {
+      throw new Error(`${label} contains a successful failed observation`);
+    }
+    const firstFailedAt = canonicalTimestamp(state.first_failed_at, `${label}.first_failed_at`);
+    if (firstFailedAt !== failures[0]!.observed_at) {
+      throw new Error(`${label}.first_failed_at does not match its first observation`);
+    }
+    const ids = failures.map(({ observation }) => (observation as Record<string, JsonValue>).id);
+    if (new Set(ids).size !== ids.length) throw new Error(`${label} contains duplicate failed observations`);
+    const success = state.success_observation === undefined
+      ? undefined
+      : parseConsumedCheckRun(state.success_observation, identity, `${label}.success_observation`);
+    if (
+      success && (success.observation as Record<string, JsonValue>).conclusion !== "success"
+    ) throw new Error(`${label}.success_observation is not successful`);
+    return {
+      name: identity.name,
+      app_slug: identity.app_slug,
+      first_failed_at: firstFailedAt,
+      failed_observations: failures,
+      ...(success ? { success_observation: success } : {}),
+    };
+  });
+  if (new Set(checkRuns.map(checkRunKey)).size !== checkRuns.length) {
+    throw new Error("GitHub provider wait continuation contains duplicate required checks");
+  }
+  return {
+    schema: "openthrottle.github-provider-wait-continuation/v1",
+    subject: payload.subject,
+    check_runs: checkRuns,
+  };
+}
+
 function commitStatusIdentity(
   entry: Record<string, unknown>,
   requirement: Extract<GithubObservationRequirement, { kind: "commit_status" }>,
@@ -414,6 +545,7 @@ function commitStatusResolution(
 function resolveRequiredObservation(
   requirement: GithubObservationRequirement,
   entries: readonly unknown[],
+  subject: string,
 ): RequiredObservationResolution {
   const exact: Record<string, unknown>[] = [];
   for (const candidate of entries) {
@@ -422,7 +554,14 @@ function resolveRequiredObservation(
     const matches = requirement.kind === "check_run"
       ? checkRunIdentity(entry, requirement)
       : commitStatusIdentity(entry, requirement);
-    if (matches) exact.push(entry);
+    if (!matches) continue;
+    if (requirement.kind === "check_run") {
+      if (typeof entry.head_sha !== "string" || !SUBJECT.test(entry.head_sha)) {
+        return { state: "unknown", detail: `required check run ${requirement.name} has malformed head SHA` };
+      }
+      if (entry.head_sha !== subject) continue;
+    }
+    exact.push(entry);
   }
   if (exact.length === 0) return { state: "missing" };
 
@@ -444,15 +583,87 @@ function resolveRequiredObservation(
 
 function providerObservationPayload(
   payload: ProviderWaitPayload,
-  reason: "required_observation_failed" | "all_required_observations_succeeded",
-  resolutions: readonly RequiredObservationResolution[],
+  reason: string,
+  observations: readonly JsonValue[],
+  rejection?: {
+    check_name: string;
+    failed_observation_count: number;
+    window_minutes: number;
+    cause: CheckRunRejectionCause;
+  },
 ): JsonValue {
   return {
     schema: "openthrottle.github-provider-observation/v1",
     subject: payload.subject,
     reason,
-    matched_observations: resolutions.flatMap((resolution) =>
-      "observation" in resolution ? [resolution.observation] : []),
+    matched_observations: [...observations],
+    ...(rejection ? { rejection } : {}),
+  };
+}
+
+function resolutionObservations(resolutions: readonly RequiredObservationResolution[]): JsonValue[] {
+  return resolutions.flatMap((resolution) =>
+    "observation" in resolution ? [resolution.observation] : []);
+}
+
+function consumedObservations(continuation: ProviderWaitContinuation): JsonValue[] {
+  return continuation.check_runs.flatMap((state) => [
+    ...state.failed_observations.map(({ observation }) => observation),
+    ...(state.success_observation ? [state.success_observation.observation] : []),
+  ]);
+}
+
+function distinctObservations(observations: readonly JsonValue[]): JsonValue[] {
+  const seen = new Set<string>();
+  return observations.filter((observation) => {
+    const input = observation as Record<string, JsonValue>;
+    const key = `${String(input.kind)}\0${String(input.id)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function failedCheckRunSummary(
+  continuation: ProviderWaitContinuation,
+  checkName: string,
+): { firstFailedAt: number; failedObservationCount: number } {
+  let firstFailedAt = Number.POSITIVE_INFINITY;
+  let failedObservationCount = 0;
+  for (const state of continuation.check_runs) {
+    if (state.name !== checkName) continue;
+    firstFailedAt = Math.min(firstFailedAt, Date.parse(state.first_failed_at));
+    failedObservationCount += state.failed_observations.length;
+  }
+  return { firstFailedAt, failedObservationCount };
+}
+
+function rejectedCheckRunObservation(
+  input: {
+    payload: ProviderWaitPayload;
+    checkName: string;
+    failedObservationCount: number;
+    cause: CheckRunRejectionCause;
+    observations: readonly JsonValue[];
+  },
+): Extract<KernelEffectProviderObservation, { kind: "found" }> {
+  return {
+    kind: "found",
+    status: "rejected",
+    payload: providerObservationPayload(
+      input.payload,
+      `required check run ${JSON.stringify(input.checkName)} rejected after ` +
+        `${input.failedObservationCount} failed observation${input.failedObservationCount === 1 ? "" : "s"} in the ` +
+        `${CHECK_RUN_REOBSERVATION_WINDOW_MINUTES}-minute re-observation window ` +
+        `(${input.cause === "failure_budget_exhausted" ? "failure budget exhausted" : "window expired"})`,
+      input.observations,
+      {
+        check_name: input.checkName,
+        failed_observation_count: input.failedObservationCount,
+        window_minutes: CHECK_RUN_REOBSERVATION_WINDOW_MINUTES,
+        cause: input.cause,
+      },
+    ),
   };
 }
 
@@ -487,7 +698,8 @@ export class GithubKernelAdapter {
         effect_kind: "github/provider-wait@1", provider: "github", operation: "observation",
         idempotency_strategy: "deterministic_target",
         adapter: {
-          reconcile: ({ intent }) => this.#reconcileProvider(intent),
+          reconcile: ({ intent, observed_at, continuation }) =>
+            this.#reconcileProvider(intent, observed_at, continuation),
           dispatch: async () => { throw new Error("provider wait is observation-only"); },
         },
       },
@@ -760,8 +972,33 @@ export class GithubKernelAdapter {
     });
   }
 
-  async #reconcileProvider(intent: Readonly<EffectIntent>): Promise<KernelEffectProviderObservation> {
+  async #reconcileProvider(
+    intent: Readonly<EffectIntent>,
+    observedAtInput?: string,
+    continuationInput?: JsonValue | null,
+  ): Promise<KernelEffectProviderObservation> {
     const payload = waitPayload(intent);
+    const observedAt = canonicalTimestamp(
+      observedAtInput ?? new Date().toISOString(),
+      "GitHub provider observation time",
+    );
+    const observedAtMs = Date.parse(observedAt);
+    const continuation = providerWaitContinuation(continuationInput, payload);
+    const expired = continuation.check_runs.find((state) => {
+      if (state.success_observation !== undefined) return false;
+      const { firstFailedAt } = failedCheckRunSummary(continuation, state.name);
+      return observedAtMs >= firstFailedAt + CHECK_RUN_REOBSERVATION_WINDOW_MS;
+    });
+    if (expired) {
+      const { failedObservationCount } = failedCheckRunSummary(continuation, expired.name);
+      return rejectedCheckRunObservation({
+        payload,
+        checkName: expired.name,
+        failedObservationCount,
+        cause: "window_expired",
+        observations: consumedObservations(continuation),
+      });
+    }
     const needsChecks = payload.policy.required_observations.some(({ kind }) => kind === "check_run");
     const needsStatuses = payload.policy.required_observations.some(({ kind }) => kind === "commit_status");
     const [checks, statuses] = await Promise.all([
@@ -787,26 +1024,118 @@ export class GithubKernelAdapter {
       if (collection.kind === "unknown") {
         return { state: "unknown", detail: collection.detail } as const;
       }
-      return resolveRequiredObservation(requirement, collection.entries);
+      return resolveRequiredObservation(requirement, collection.entries, payload.subject);
     });
-    if (resolutions.some(({ state }) => state === "failure")) {
+    const commitFailure = resolutions.find((resolution, index) =>
+      payload.policy.required_observations[index]?.kind === "commit_status" &&
+      resolution.state === "failure");
+    if (commitFailure) {
       return {
         kind: "found",
         status: "rejected",
-        payload: providerObservationPayload(payload, "required_observation_failed", resolutions),
+        payload: providerObservationPayload(
+          payload,
+          "required_observation_failed",
+          distinctObservations([
+            ...consumedObservations(continuation),
+            ...resolutionObservations(resolutions),
+          ]),
+        ),
+      };
+    }
+    for (let index = 0; index < payload.policy.required_observations.length; index += 1) {
+      const requirement = payload.policy.required_observations[index]!;
+      if (requirement.kind !== "check_run") continue;
+      const resolution = resolutions[index]!;
+      let state = continuation.check_runs.find((candidate) =>
+        checkRunKey(candidate) === checkRunKey(requirement));
+      if (resolution.state === "failure") {
+        if (!state) {
+          state = {
+            name: requirement.name,
+            app_slug: requirement.app_slug,
+            first_failed_at: observedAt,
+            failed_observations: [],
+          };
+          continuation.check_runs.push(state);
+        }
+        const observationId = (resolution.observation as Record<string, JsonValue>).id;
+        if (!state.failed_observations.some(({ observation }) =>
+          (observation as Record<string, JsonValue>).id === observationId)) {
+          state.failed_observations.push({ observed_at: observedAt, observation: resolution.observation });
+        }
+      }
+      if (!state) continue;
+
+      if (state.success_observation) continue;
+
+      const { firstFailedAt, failedObservationCount } =
+        failedCheckRunSummary(continuation, requirement.name);
+      const windowExpired = observedAtMs >= firstFailedAt + CHECK_RUN_REOBSERVATION_WINDOW_MS;
+      const budgetExhausted = failedObservationCount >= CHECK_RUN_FAILURE_LIMIT;
+      if (budgetExhausted || windowExpired) {
+        const cause = budgetExhausted ? "failure_budget_exhausted" : "window_expired";
+        return rejectedCheckRunObservation({
+          payload,
+          checkName: requirement.name,
+          failedObservationCount,
+          cause,
+          observations: distinctObservations([
+            ...consumedObservations(continuation),
+            ...resolutionObservations(resolutions),
+          ]),
+        });
+      }
+      if (resolution.state === "success") {
+        state.success_observation = { observed_at: observedAt, observation: resolution.observation };
+      }
+    }
+
+    const awaitingSuccessfulRerun = continuation.check_runs.find((state) =>
+      state.success_observation === undefined);
+    if (awaitingSuccessfulRerun) {
+      return {
+        kind: "retry",
+        detail: `required check run ${JSON.stringify(awaitingSuccessfulRerun.name)} has ` +
+          `${awaitingSuccessfulRerun.failed_observations.length} failed observation` +
+          `${awaitingSuccessfulRerun.failed_observations.length === 1 ? "" : "s"}; waiting up to ` +
+          `${CHECK_RUN_REOBSERVATION_WINDOW_MINUTES} minutes for a same-head successful re-run`,
+        continuation: continuation as unknown as JsonValue,
       };
     }
     const indeterminate = resolutions.find(({ state }) => state === "unknown");
     if (indeterminate?.state === "unknown") {
       return { kind: "unknown", detail: indeterminate.detail };
     }
-    if (resolutions.some(({ state }) => state === "missing" || state === "pending")) {
-      return { kind: "not_found" };
+    const incomplete = resolutions.some((resolution, index) => {
+      if (
+        resolution.state !== "missing" && resolution.state !== "pending" &&
+        resolution.state !== "failure"
+      ) return false;
+      const requirement = payload.policy.required_observations[index]!;
+      return requirement.kind !== "check_run" || !continuation.check_runs.some((state) =>
+        checkRunKey(state) === checkRunKey(requirement) && state.success_observation !== undefined);
+    });
+    if (incomplete) {
+      return continuation.check_runs.length === 0
+        ? { kind: "not_found" }
+        : {
+          kind: "retry",
+          detail: "required provider observations remain pending after a successful check re-run",
+          continuation: continuation as unknown as JsonValue,
+        };
     }
     return {
       kind: "found",
       status: "confirmed",
-      payload: providerObservationPayload(payload, "all_required_observations_succeeded", resolutions),
+      payload: providerObservationPayload(
+        payload,
+        "all_required_observations_succeeded",
+        distinctObservations([
+          ...consumedObservations(continuation),
+          ...resolutionObservations(resolutions),
+        ]),
+      ),
     };
   }
 }

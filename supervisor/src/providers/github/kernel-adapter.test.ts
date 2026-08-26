@@ -17,6 +17,7 @@ const TASK_BRANCH = "ot/ope-201-deadbeef";
 const OWNERSHIP_MARKER = "openthrottle:run:0123456789abcdef";
 const PULL_REQUEST_TITLE = "Dogfood repair";
 const PULL_REQUEST_BODY = "Publish the accepted repair.";
+const OBSERVED_AT = "2026-08-20T12:00:00.000Z";
 const CANONICAL_PULL_REQUEST_BODY = buildGithubPullRequestBody(
   PULL_REQUEST_BODY,
   OWNERSHIP_MARKER,
@@ -110,6 +111,7 @@ function check(input: {
   app_slug: string;
   status?: string;
   conclusion?: string | null;
+  head_sha?: string;
 }) {
   return {
     id: input.id,
@@ -117,6 +119,7 @@ function check(input: {
     app: { slug: input.app_slug },
     status: input.status ?? "completed",
     conclusion: input.conclusion === undefined ? "success" : input.conclusion,
+    head_sha: input.head_sha ?? SUBJECT,
   };
 }
 
@@ -134,7 +137,11 @@ function status(input: {
   };
 }
 
-function reconciliation(fetch: typeof globalThis.fetch, intent = providerWait()) {
+function reconciliation(
+  fetch: typeof globalThis.fetch,
+  intent = providerWait(),
+  observation: { observed_at?: string; continuation?: import("@openthrottle/contracts").JsonValue | null } = {},
+) {
   const adapter = new GithubKernelAdapter({ token: "token", blob_store: {} as never, fetch });
   const binding = adapter.effectBindings().find(
     ({ effect_kind }) => effect_kind === "github/provider-wait@1",
@@ -143,6 +150,8 @@ function reconciliation(fetch: typeof globalThis.fetch, intent = providerWait())
     intent,
     external_identity: intent.target,
     dispatch_fence: null,
+    observed_at: observation.observed_at ?? OBSERVED_AT,
+    continuation: observation.continuation ?? null,
   });
 }
 
@@ -781,27 +790,168 @@ describe("GithubKernelAdapter provider wait", () => {
     await expect(reconciliation(fetch)).resolves.toEqual({ kind: "not_found" });
   });
 
-  it("rejects a failed required observation even when another requirement is missing", async () => {
+  it("holds a failed check run, then confirms a same-name same-head successful re-run within the window", async () => {
+    const required = [{ kind: "check_run", name: "quality", app_slug: "github-actions" }] as const;
     const fetch = endpointFetch({ checks: { check_runs: [
       check({ id: 7, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
     ] } });
+    const failed = await reconciliation(fetch, providerWait([...required]));
+    expect(failed).toMatchObject({
+      kind: "retry",
+      detail: expect.stringMatching(/quality.*1 failed observation.*same-head successful re-run/i),
+    });
+    if (failed.kind !== "retry") throw new Error("expected retry continuation");
 
-    await expect(reconciliation(fetch)).resolves.toEqual({
+    const rerun = endpointFetch({ checks: { check_runs: [
+      check({ id: 8, name: "quality", app_slug: "github-actions" }),
+    ] } });
+    await expect(reconciliation(rerun, providerWait([...required]), {
+      observed_at: "2026-08-20T12:10:00.000Z",
+      continuation: failed.continuation,
+    })).resolves.toEqual({
       kind: "found",
-      status: "rejected",
+      status: "confirmed",
       payload: {
         schema: "openthrottle.github-provider-observation/v1",
         subject: SUBJECT,
-        reason: "required_observation_failed",
-        matched_observations: [{
-          kind: "check_run",
-          id: 7,
-          name: "quality",
-          app_slug: "github-actions",
-          status: "completed",
-          conclusion: "failure",
-        }],
+        reason: "all_required_observations_succeeded",
+        matched_observations: [
+          {
+            kind: "check_run", id: 7, name: "quality", app_slug: "github-actions",
+            status: "completed", conclusion: "failure",
+          },
+          {
+            kind: "check_run", id: 8, name: "quality", app_slug: "github-actions",
+            status: "completed", conclusion: "success",
+          },
+        ],
       },
+    });
+  });
+
+  it("persists a failed check run while another required observation is indeterminate", async () => {
+    const failed = await reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id: 7, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
+      check({
+        id: 8,
+        name: "docker-smoke",
+        app_slug: "github-actions",
+        status: "unexpected",
+        conclusion: null,
+      }),
+    ] } }));
+    expect(failed).toMatchObject({ kind: "retry" });
+    if (failed.kind !== "retry") throw new Error("expected retry continuation");
+
+    await expect(reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id: 9, name: "quality", app_slug: "github-actions" }),
+      check({ id: 10, name: "docker-smoke", app_slug: "github-actions" }),
+    ] } }), providerWait(), {
+      observed_at: "2026-08-20T12:10:00.000Z",
+      continuation: failed.continuation,
+    })).resolves.toMatchObject({
+      kind: "found",
+      status: "confirmed",
+      payload: {
+        matched_observations: [
+          expect.objectContaining({ id: 7, conclusion: "failure" }),
+          expect.objectContaining({ id: 9, conclusion: "success" }),
+          expect.objectContaining({ id: 10, conclusion: "success" }),
+        ],
+      },
+    });
+  });
+
+  it("rejects the third distinct failed observation for one required check inside the window", async () => {
+    const required = [{ kind: "check_run", name: "quality", app_slug: "github-actions" }] as const;
+    let continuation: import("@openthrottle/contracts").JsonValue | null = null;
+    for (const [id, observed_at] of [[1, OBSERVED_AT], [2, "2026-08-20T12:05:00.000Z"]] as const) {
+      const result = await reconciliation(endpointFetch({ checks: { check_runs: [
+        check({ id, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
+      ] } }), providerWait([...required]), { observed_at, continuation });
+      expect(result).toMatchObject({ kind: "retry" });
+      if (result.kind !== "retry") throw new Error("expected retry continuation");
+      continuation = result.continuation;
+    }
+
+    await expect(reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id: 3, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
+    ] } }), providerWait([...required]), {
+      observed_at: "2026-08-20T12:10:00.000Z",
+      continuation,
+    })).resolves.toMatchObject({
+      kind: "found",
+      status: "rejected",
+      payload: {
+        reason: expect.stringMatching(/quality.*3 failed observations.*30-minute.*budget exhausted/i),
+        rejection: {
+          check_name: "quality",
+          failed_observation_count: 3,
+          window_minutes: 30,
+          cause: "failure_budget_exhausted",
+        },
+        matched_observations: [
+          expect.objectContaining({ id: 1, conclusion: "failure" }),
+          expect.objectContaining({ id: 2, conclusion: "failure" }),
+          expect.objectContaining({ id: 3, conclusion: "failure" }),
+        ],
+      },
+    });
+  });
+
+  it("rejects when the 30-minute re-observation window expires without a success", async () => {
+    const required = [{ kind: "check_run", name: "quality", app_slug: "github-actions" }] as const;
+    const fetch = endpointFetch({ checks: { check_runs: [
+      check({ id: 1, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
+    ] } });
+    const failed = await reconciliation(fetch, providerWait([...required]));
+    if (failed.kind !== "retry") throw new Error("expected retry continuation");
+
+    await expect(reconciliation(fetch, providerWait([...required]), {
+      observed_at: "2026-08-20T12:30:00.000Z",
+      continuation: failed.continuation,
+    })).resolves.toMatchObject({
+      kind: "found",
+      status: "rejected",
+      payload: {
+        reason: expect.stringMatching(/quality.*1 failed observation.*30-minute.*window expired/i),
+        rejection: {
+          check_name: "quality",
+          failed_observation_count: 1,
+          window_minutes: 30,
+          cause: "window_expired",
+        },
+      },
+    });
+  });
+
+  it("never lets a different-head success satisfy a held failed check run", async () => {
+    const required = [{ kind: "check_run", name: "quality", app_slug: "github-actions" }] as const;
+    const failed = await reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id: 1, name: "quality", app_slug: "github-actions", conclusion: "failure" }),
+    ] } }), providerWait([...required]));
+    if (failed.kind !== "retry") throw new Error("expected retry continuation");
+
+    await expect(reconciliation(endpointFetch({ checks: { check_runs: [
+      check({ id: 2, name: "quality", app_slug: "github-actions", head_sha: BASE_SUBJECT }),
+    ] } }), providerWait([...required]), {
+      observed_at: "2026-08-20T12:10:00.000Z",
+      continuation: failed.continuation,
+    })).resolves.toMatchObject({ kind: "retry", continuation: failed.continuation });
+  });
+
+  it("rejects a failed required commit status immediately without re-observation", async () => {
+    const required: RequiredObservation[] = [
+      { kind: "commit_status", context: "coverage", creator_login: "coverage-bot" },
+    ];
+    const fetch = endpointFetch({ statuses: { statuses: [
+      status({ id: 21, context: "coverage", creator_login: "coverage-bot", state: "failure" }),
+    ] } });
+
+    await expect(reconciliation(fetch, providerWait(required))).resolves.toMatchObject({
+      kind: "found",
+      status: "rejected",
+      payload: { reason: "required_observation_failed" },
     });
   });
 
@@ -866,6 +1016,7 @@ describe("GithubKernelAdapter provider wait", () => {
 
     const malformed = endpointFetch({ checks: { check_runs: [{
       name: "quality", app: { slug: "github-actions" }, status: "completed", conclusion: "success",
+      head_sha: SUBJECT,
     }] } });
     await expect(reconciliation(malformed, providerWait([...required]))).resolves.toMatchObject({
       kind: "unknown",

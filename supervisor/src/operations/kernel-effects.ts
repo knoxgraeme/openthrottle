@@ -44,6 +44,7 @@ const PROVIDER = /^[a-z][a-z0-9_-]{0,63}$/;
 const UNKNOWN_DETAIL_MAX_LENGTH = 1_500;
 const UNKNOWN_RETRY_BASE_MS = 5_000;
 const UNKNOWN_RETRY_MAX_MS = 5 * 60_000;
+const EFFECT_RETRY_CONTINUATION_SCHEMA = "openthrottle.effect-retry-continuation/v1";
 
 export const KERNEL_EFFECT_DELIVERY_PAYLOAD_SCHEMA =
   "openthrottle.effect-delivery/v1" as const;
@@ -210,6 +211,16 @@ function normalizeObservation(value: KernelEffectProviderObservation): KernelEff
     }
     return { kind: "unknown", detail: diagnostic(value.detail) };
   }
+  if (value.kind === "retry") {
+    if (typeof value.detail !== "string" || value.detail.trim().length === 0) {
+      throw new Error("retryable provider reconciliation requires detail");
+    }
+    return {
+      kind: "retry",
+      detail: diagnostic(value.detail),
+      continuation: jsonValueAt(value.continuation, "effect_observation.continuation"),
+    };
+  }
   if (value.kind === "found") {
     if (value.status !== "confirmed" && value.status !== "rejected") {
       throw new Error("found provider reconciliation has an invalid delivery status");
@@ -223,10 +234,42 @@ function normalizeObservation(value: KernelEffectProviderObservation): KernelEff
   throw new Error("provider reconciliation returned an unknown observation kind");
 }
 
+function retryContinuation(detail: string | null): JsonValue | null {
+  if (detail === null) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(detail);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const input = value as Record<string, unknown>;
+  if (
+    Object.keys(input).sort().join("\0") !== ["continuation", "detail", "schema"].sort().join("\0") ||
+    input.schema !== EFFECT_RETRY_CONTINUATION_SCHEMA ||
+    typeof input.detail !== "string"
+  ) return null;
+  try {
+    return jsonValueAt(input.continuation, "effect_retry.continuation");
+  } catch {
+    return null;
+  }
+}
+
+function retryDetail(detail: string, continuation: JsonValue): string {
+  return canonicalJson({
+    schema: EFFECT_RETRY_CONTINUATION_SCHEMA,
+    detail,
+    continuation,
+  });
+}
+
 async function observe(input: {
   binding: KernelEffectAdapterBinding;
   intent: Readonly<EffectIntent>;
   dispatch_fence: LeasedEffectView["dispatch_fence"];
+  observed_at: string;
+  continuation: JsonValue | null;
   signal?: AbortSignal;
 }): Promise<KernelEffectProviderObservation> {
   abortIfRequested(input.signal);
@@ -235,6 +278,8 @@ async function observe(input: {
       intent: input.intent,
       external_identity: input.intent.target,
       dispatch_fence: input.dispatch_fence,
+      observed_at: input.observed_at,
+      continuation: input.continuation,
     });
     abortIfRequested(input.signal);
     return normalizeObservation(result);
@@ -305,15 +350,17 @@ export function createKernelEffectExecutionService(input: {
     leased: LeasedEffectView,
     workerId: string,
     detailInput: string,
+    continuation: JsonValue | null = null,
   ): Promise<Extract<KernelEffectExecutionResult, { kind: "held_unknown" }>> {
     const detail = diagnostic(detailInput);
+    const persistedDetail = continuation === null ? detail : retryDetail(detail, continuation);
     const retry_at = retryAt(leased.reconciliation_ordinal);
     const reconciliation = reconcileEffectIntent({
       intent: leased.intent,
       observation: {
         kind: "unknown",
         external_identity: leased.intent.target,
-        detail,
+        detail: persistedDetail,
       },
       retry_at,
     });
@@ -330,7 +377,7 @@ export function createKernelEffectExecutionService(input: {
       kind: "held_unknown",
       effect_id: reconciliation.effect_id,
       external_identity: reconciliation.external_identity,
-      detail: reconciliation.detail,
+      detail,
       retry_at: reconciliation.retry_at,
     };
   }
@@ -394,6 +441,7 @@ export function createKernelEffectExecutionService(input: {
         throw new Error("effect store returned a lease outside the requested fence");
       }
       const intent = immutableIntent(leased.intent);
+      const continuation = retryContinuation(leased.prior_unknown_detail);
       let binding: KernelEffectAdapterBinding;
       try {
         binding = input.adapters.bindingFor(intent.kind);
@@ -405,6 +453,8 @@ export function createKernelEffectExecutionService(input: {
         binding,
         intent,
         dispatch_fence: leased.dispatch_fence,
+        observed_at: now(),
+        continuation,
         signal: request.signal,
       });
       if (initial.kind === "found") {
@@ -418,7 +468,10 @@ export function createKernelEffectExecutionService(input: {
         );
       }
       if (initial.kind === "unknown") {
-        return holdUnknown(leased, request.worker_id, initial.detail);
+        return holdUnknown(leased, request.worker_id, initial.detail, continuation);
+      }
+      if (initial.kind === "retry") {
+        return holdUnknown(leased, request.worker_id, initial.detail, initial.continuation);
       }
       if (binding.operation === "observation") {
         return holdUnknown(
@@ -484,6 +537,8 @@ export function createKernelEffectExecutionService(input: {
         binding,
         intent,
         dispatch_fence: dispatchLease.dispatch_fence,
+        observed_at: now(),
+        continuation,
         signal: request.signal,
       });
       if (afterDispatch.kind === "found") {
@@ -501,6 +556,14 @@ export function createKernelEffectExecutionService(input: {
           dispatchFailure ? `dispatch returned an error: ${dispatchFailure}` : null,
           afterDispatch.detail,
         ].filter((entry): entry is string => entry !== null).join("; "));
+      }
+      if (afterDispatch.kind === "retry") {
+        return holdUnknown(
+          leased,
+          request.worker_id,
+          afterDispatch.detail,
+          afterDispatch.continuation,
+        );
       }
       return holdUnknown(leased, request.worker_id, [
         dispatchFailure ? `dispatch returned an error: ${dispatchFailure}` : null,

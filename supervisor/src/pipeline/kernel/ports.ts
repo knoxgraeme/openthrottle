@@ -135,6 +135,8 @@ export interface LeasedEffectView {
   expires_at: string;
   execution_mode: "dispatch_or_reconcile" | "reconcile_only";
   reconciliation_ordinal: number;
+  /** Prior held reconciliation evidence, retained across lease replay. */
+  prior_unknown_detail: string | null;
   /** Immutable identity of the one executor dispatch, retained across reconciliation leases. */
   dispatch_fence: {
     lease_id: string;

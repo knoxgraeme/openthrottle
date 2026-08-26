@@ -300,6 +300,7 @@ export class KernelLeaseOperations {
           expires_at: input.expires_at,
           execution_mode: replay.lease_execution_mode!,
           reconciliation_ordinal: replay.attempt_count,
+          prior_unknown_detail: replay.last_error,
           dispatch_fence: replay.dispatch_lease_id === null ? null : {
             lease_id: replay.dispatch_lease_id,
             worker_id: replay.dispatch_worker_id!,
@@ -322,7 +323,8 @@ export class KernelLeaseOperations {
       const changed = this.#db.prepare(`
         UPDATE effects
         SET status = 'processing', lease_id = ?, lease_worker_id = ?, lease_expires_at = ?,
-            lease_execution_mode = ?, unknown_detail = NULL, attempt_count = attempt_count + 1,
+            lease_execution_mode = ?, last_error = unknown_detail, unknown_detail = NULL,
+            attempt_count = attempt_count + 1,
             version = version + 1, updated_at = ?
         WHERE id = ? AND version = ? AND lease_id IS NULL AND status IN ('pending', 'unknown')
       `).run(input.lease_id, input.worker_id, input.expires_at, executionMode, now, row.id, row.version);
@@ -338,6 +340,7 @@ export class KernelLeaseOperations {
         expires_at: input.expires_at,
         execution_mode: executionMode,
         reconciliation_ordinal: row.attempt_count + 1,
+        prior_unknown_detail: row.unknown_detail,
         dispatch_fence: row.dispatch_lease_id === null ? null : {
           lease_id: row.dispatch_lease_id,
           worker_id: row.dispatch_worker_id!,
@@ -376,6 +379,7 @@ export class KernelLeaseOperations {
         expires_at: row.lease_expires_at,
         execution_mode: "reconcile_only" as const,
         reconciliation_ordinal: row.attempt_count,
+        prior_unknown_detail: row.last_error,
         dispatch_fence: row.dispatch_lease_id === null ? {
           lease_id: input.lease_id,
           worker_id: input.worker_id,
@@ -420,7 +424,7 @@ export class KernelLeaseOperations {
           UPDATE effects
           SET status = 'unknown', lease_id = NULL, lease_worker_id = NULL,
               lease_expires_at = NULL, lease_execution_mode = NULL, unknown_detail = ?,
-              available_at = ?, version = version + 1, updated_at = ?
+              last_error = NULL, available_at = ?, version = version + 1, updated_at = ?
           WHERE id = ? AND version = ? AND lease_id = ? AND lease_worker_id = ? AND status = 'processing'
         `).run(
           input.reconciliation.detail,
@@ -443,7 +447,7 @@ export class KernelLeaseOperations {
           UPDATE effects
           SET status = ?, lease_id = NULL, lease_worker_id = NULL, lease_expires_at = NULL,
               lease_execution_mode = NULL, delivery_record_id = ?, unknown_detail = NULL,
-              version = version + 1, updated_at = ?
+              last_error = NULL, version = version + 1, updated_at = ?
           WHERE id = ? AND version = ? AND lease_id = ? AND lease_worker_id = ? AND status = 'processing'
         `).run(
           delivery.status === "confirmed" ? "acknowledged" : "rejected",
@@ -469,15 +473,20 @@ export class KernelLeaseOperations {
     `).all(now, EXPIRED_EFFECT_RECOVERY_BATCH_SIZE) as EffectRow[];
     for (const row of expired) {
       const reconcileOnly = row.dispatch_lease_id !== null;
+      const retainedPrior = row.kind === "github/provider-wait@1" ? row.last_error : null;
+      const recoveredUnknown = retainedPrior !== null || reconcileOnly;
       const changed = this.#db.prepare(`
         UPDATE effects
         SET status = ?, lease_id = NULL, lease_worker_id = NULL, lease_expires_at = NULL,
-          lease_execution_mode = NULL, unknown_detail = ?, version = version + 1, updated_at = ?
+          lease_execution_mode = NULL, unknown_detail = ?, last_error = NULL,
+          version = version + 1, updated_at = ?
         WHERE id = ? AND version = ? AND status = 'processing' AND lease_id = ?
           AND lease_expires_at <= ?
       `).run(
-        reconcileOnly ? "unknown" : "pending",
-        reconcileOnly ? "provider dispatch may have started before the effect lease expired" : null,
+        recoveredUnknown ? "unknown" : "pending",
+        retainedPrior ?? (reconcileOnly
+          ? "provider dispatch may have started before the effect lease expired"
+          : null),
         now,
         row.id,
         row.version,
@@ -487,7 +496,7 @@ export class KernelLeaseOperations {
       if (changed.changes !== 1) throw new Error(`effect ${row.id} expiry recovery compare-and-set failed`);
       this.#advanceRunFence(row.pipeline_run_id, `effect-expired:${row.lease_id}`, {
         effect_id: row.id,
-        recovered_status: reconcileOnly ? "unknown" : "pending",
+        recovered_status: recoveredUnknown ? "unknown" : "pending",
       });
     }
   }

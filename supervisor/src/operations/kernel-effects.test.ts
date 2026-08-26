@@ -102,6 +102,7 @@ function lease(
     expires_at: "2026-08-20T12:01:00.000Z",
     execution_mode: executionMode,
     reconciliation_ordinal: reconciliationOrdinal,
+    prior_unknown_detail: null,
     dispatch_fence: executionMode === "reconcile_only" ? {
       lease_id: "dispatch-lease-1",
       worker_id: "worker-1",
@@ -458,6 +459,54 @@ describe("kernel effect execution", () => {
       retry_at: "2026-08-20T12:00:05.000Z",
     });
     expect(result).toMatchObject({ retry_at: "2026-08-20T12:00:05.000Z" });
+  });
+
+  it("round-trips a provider retry continuation through durable unknown detail", async () => {
+    const priorContinuation = { schema: "provider-state/v1", failures: [17] };
+    const nextContinuation = { schema: "provider-state/v1", failures: [17, 18] };
+    const priorDetail = JSON.stringify({
+      schema: "openthrottle.effect-retry-continuation/v1",
+      detail: "waiting for a successful re-run",
+      continuation: priorContinuation,
+    });
+    const intent = effect({ kind: "github/provider-wait@1" });
+    const leased = { ...lease(intent), prior_unknown_detail: priorDetail };
+    const adapter: KernelEffectRuntimeAdapter = {
+      async reconcile(request) {
+        expect(request.observed_at).toBe(NOW);
+        expect(request.continuation).toEqual(priorContinuation);
+        return {
+          kind: "retry",
+          detail: "a second failed observation was consumed",
+          continuation: nextContinuation,
+        };
+      },
+      async dispatch() {
+        throw new Error("provider wait must not dispatch");
+      },
+    };
+    const port = new FakeEffectPort([leased]);
+
+    await expect(service({
+      port,
+      binding: binding(adapter, { effect_kind: intent.kind, operation: "observation" }),
+    }).drainOne({
+      worker_id: "worker-1",
+      lease_id: "lease-1",
+      expires_at: "2026-08-20T12:01:00.000Z",
+    })).resolves.toMatchObject({
+      kind: "held_unknown",
+      detail: "a second failed observation was consumed",
+    });
+
+    const reconciliation = port.completions[0]?.reconciliation;
+    expect(reconciliation).toMatchObject({ kind: "hold_unknown" });
+    if (reconciliation?.kind !== "hold_unknown") throw new Error("expected held retry continuation");
+    expect(JSON.parse(reconciliation.detail)).toEqual({
+      schema: "openthrottle.effect-retry-continuation/v1",
+      detail: "a second failed observation was consumed",
+      continuation: nextContinuation,
+    });
   });
 
   it("does not let a provider adapter mutate the leased immutable intent", async () => {
