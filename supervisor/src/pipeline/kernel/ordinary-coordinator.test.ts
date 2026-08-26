@@ -556,6 +556,28 @@ async function execute(coordinator: OrdinaryKernelCoordinator, ordinal: number) 
 }
 
 describe("ordinary kernel activation", () => {
+  it("reports worker activity after a successful runtime lease heartbeat", async () => {
+    const test = await setup();
+    try {
+      const leased = await test.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-activity",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      });
+      expect(leased).not.toBeNull();
+      let activityCount = 0;
+
+      await expect(test.coordinator.executeLeasedAttempt(
+        leased!,
+        () => { activityCount += 1; },
+      )).resolves.toMatchObject({ disposition: "settled" });
+
+      expect(activityCount).toBe(1);
+    } finally {
+      test.db.close();
+    }
+  });
+
   async function sandboxFailureTransition(error: Error | null, structuredSibling = false) {
     const fixed = fixture();
     const expanded = expandCompiledRuntimeLifecycle({
