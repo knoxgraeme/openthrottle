@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,7 +17,7 @@ import {
   type EffectIntent,
   type ExecutionRecordPayloadRegistry,
 } from "@openthrottle/contracts";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import type {
   KernelEffectPort,
   LeasedEffectView,
@@ -161,7 +169,16 @@ function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
   const files = new Map<string, Buffer>();
   const daemonEnvironment = new Map<string, string>();
   const sessionEnvironments = new Map<string, Record<string, string>>();
+  const integrationRunnerLaunches: string[] = [];
   const defaultExecuteCommand = async (command: string) => {
+    const immutableLink = /^ln -- '([^']+)' '([^']+)'$/.exec(command);
+    if (immutableLink) {
+      const staged = files.get(immutableLink[1]!);
+      if (!staged) return { exitCode: 1, result: "" };
+      if (files.has(immutableLink[2]!)) return { exitCode: 1, result: "" };
+      files.set(immutableLink[2]!, Buffer.from(staged));
+      return { exitCode: 0, result: "" };
+    }
     const lockInitialization = /touch -- '([^']*lease-generation\.lock)'/.exec(command);
     if (lockInitialization) {
       if (!files.has(lockInitialization[1]!)) files.set(lockInitialization[1]!, Buffer.alloc(0));
@@ -186,6 +203,23 @@ function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
     }
     return { exitCode: 0, result: "" };
   };
+  const defaultExecuteSessionCommand = async (
+    _sessionId: string,
+    request: { command: string },
+  ): Promise<{ cmdId?: string } | undefined> => {
+    const stagedLaunch = request.command.match(
+      /\/var\/lib\/openthrottle\/integration-results\/[^/'" ]+\/[^/'" ]+\/launch\.sealed/,
+    )?.[0];
+    if (stagedLaunch) {
+      const launch = stagedLaunch.replace(/launch\.sealed$/, "launch.json");
+      const stagedBytes = files.get(stagedLaunch);
+      if (stagedBytes && !files.has(launch)) {
+        files.set(launch, Buffer.from(stagedBytes));
+        integrationRunnerLaunches.push(launch);
+      }
+    }
+    return { cmdId: "command-1" };
+  };
   return {
     id: "sandbox-1",
     state: "started",
@@ -200,7 +234,21 @@ function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
         return downloadFile(path);
       }),
       createFolder: vi.fn().mockResolvedValue(undefined),
-      deleteFile: vi.fn().mockRejectedValue(new Error("404 not found")),
+      deleteFile: vi.fn(async (path: string, recursive?: boolean) => {
+        if (recursive) {
+          let deleted = false;
+          for (const candidate of [...files.keys()]) {
+            if (candidate === path || candidate.startsWith(`${path}/`)) {
+              files.delete(candidate);
+              deleted = true;
+            }
+          }
+          if (deleted) return;
+        } else if (files.delete(path)) {
+          return;
+        }
+        throw new Error("404 not found");
+      }),
       setFilePermissions: vi.fn().mockResolvedValue(undefined),
       uploadFile: vi.fn(async (bytes: Buffer, path: string) => {
         files.set(path, Buffer.from(bytes));
@@ -212,7 +260,7 @@ function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
           sessionEnvironments.set(sessionId, Object.fromEntries(daemonEnvironment));
         }
       }),
-      executeSessionCommand: vi.fn().mockResolvedValue({ cmdId: "command-1" }),
+      executeSessionCommand: vi.fn(defaultExecuteSessionCommand),
       executeCommand: vi.fn(defaultExecuteCommand),
       deleteSession: vi.fn().mockResolvedValue(undefined),
       getSession: vi.fn().mockRejectedValue(new Error("404 not found")),
@@ -230,7 +278,9 @@ function sandboxWith(downloadFile: (path: string) => Promise<Buffer>) {
     }),
     files,
     sessionEnvironments,
+    integrationRunnerLaunches,
     defaultExecuteCommand,
+    defaultExecuteSessionCommand,
   };
 }
 
@@ -545,6 +595,162 @@ function integrationProofFromIdentity(
   }
 }
 
+function siblingIntegrationProof() {
+  const root = mkdtempSync(join(tmpdir(), "ot-daytona-sibling-integration-"));
+  const repository = join(root, "repository");
+  const candidatePath = join(root, "candidate.bundle");
+  const currentOnePath = join(root, "current-one.bundle");
+  const currentTwoPath = join(root, "current-two.bundle");
+  let retained = false;
+  try {
+    execFileSync("git", ["init", "--quiet", "--initial-branch=main", repository]);
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: repository });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repository });
+    writeFileSync(join(repository, "base.txt"), "base\n");
+    execFileSync("git", ["add", "."], { cwd: repository });
+    execFileSync("git", ["commit", "--quiet", "-m", "base"], { cwd: repository });
+    const base = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+
+    execFileSync("git", ["switch", "--quiet", "--create", "candidate"], { cwd: repository });
+    writeFileSync(join(repository, "candidate-input.txt"), "candidate input\n");
+    execFileSync("git", ["add", "."], { cwd: repository });
+    execFileSync("git", ["commit", "--quiet", "-m", "candidate input"], { cwd: repository });
+    const candidateInput = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(repository, "candidate-output.txt"), "candidate output\n");
+    execFileSync("git", ["add", "."], { cwd: repository });
+    execFileSync("git", ["commit", "--quiet", "-m", "candidate output"], { cwd: repository });
+    const candidateOutput = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+    const candidateTree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+
+    execFileSync("git", ["switch", "--quiet", "main"], { cwd: repository });
+    writeFileSync(join(repository, "current-one.txt"), "first current integration\n");
+    execFileSync("git", ["add", "."], { cwd: repository });
+    execFileSync("git", ["commit", "--quiet", "-m", "first current integration"], {
+      cwd: repository,
+    });
+    const currentOne = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+    const currentOneTree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+    writeFileSync(join(repository, "current-two.txt"), "second current integration\n");
+    execFileSync("git", ["add", "."], { cwd: repository });
+    execFileSync("git", ["commit", "--quiet", "-m", "second current integration"], {
+      cwd: repository,
+    });
+    const currentTwo = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+    const currentTwoTree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], {
+      cwd: repository,
+      encoding: "utf8",
+    }).trim();
+
+    const candidateRef = `refs/openthrottle/checkpoints/${"7".repeat(64)}`;
+    const currentOneRef = `refs/openthrottle/integrations/${"8".repeat(64)}`;
+    const currentTwoRef = `refs/openthrottle/integrations/${"9".repeat(64)}`;
+    execFileSync("git", ["update-ref", candidateRef, candidateOutput], { cwd: repository });
+    execFileSync("git", ["update-ref", currentOneRef, currentOne], { cwd: repository });
+    execFileSync("git", ["update-ref", currentTwoRef, currentTwo], { cwd: repository });
+    writeFileSync(join(repository, ".git", "shallow"), `${base}\n`);
+    execFileSync("git", ["bundle", "create", candidatePath, candidateRef], { cwd: repository });
+    execFileSync("git", ["bundle", "create", currentOnePath, currentOneRef], { cwd: repository });
+    writeFileSync(join(repository, ".git", "shallow"), `${currentOne}\n`);
+    execFileSync("git", ["bundle", "create", currentTwoPath, currentTwoRef], { cwd: repository });
+    const candidateBytes = readFileSync(candidatePath);
+    const currentOneBytes = readFileSync(currentOnePath);
+    const currentTwoBytes = readFileSync(currentTwoPath);
+    const descriptor = (
+      file: string,
+      ref: string,
+      commit: string,
+      tree: string,
+      bytes: Buffer,
+    ) => ({
+      file,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      bytes: bytes.byteLength,
+      media_type: "application/x-git-bundle",
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+      ref,
+      commit,
+      tree,
+    } as const);
+    const pointer = (bytes: Buffer) => ({
+      algorithm: "sha256",
+      digest: createHash("sha256").update(bytes).digest("hex"),
+      bytes: bytes.byteLength,
+      encoding: "binary",
+      media_type: "application/x-git-bundle",
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+    } as const);
+    retained = true;
+    return {
+      root,
+      repository,
+      cleanup: () => rmSync(root, { recursive: true, force: true }),
+      base,
+      candidate_input: candidateInput,
+      candidate_output: candidateOutput,
+      current: currentTwo,
+      candidate: {
+        bytes: candidateBytes,
+        pointer: pointer(candidateBytes),
+        descriptor: descriptor(
+          "candidate.bundle",
+          candidateRef,
+          candidateOutput,
+          candidateTree,
+          candidateBytes,
+        ),
+      },
+      ancestry: [{
+        input: base,
+        output: currentOne,
+        bytes: currentOneBytes,
+        pointer: pointer(currentOneBytes),
+        descriptor: descriptor(
+          "current-one.bundle",
+          currentOneRef,
+          currentOne,
+          currentOneTree,
+          currentOneBytes,
+        ),
+      }, {
+        input: currentOne,
+        output: currentTwo,
+        bytes: currentTwoBytes,
+        pointer: pointer(currentTwoBytes),
+        descriptor: descriptor(
+          "current-two.bundle",
+          currentTwoRef,
+          currentTwo,
+          currentTwoTree,
+          currentTwoBytes,
+        ),
+      }],
+    };
+  } finally {
+    if (!retained) rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function integrationIntentWithSealedBundleSizes(input: {
   candidate_bytes: number;
   ancestry_bytes: number;
@@ -649,6 +855,59 @@ function integrationIntentFor(
       candidate_blob: candidatePointer,
       candidate_artifact: candidate.descriptor,
       current_ancestry: [],
+    },
+  };
+}
+
+function integrationDispatchRequest(
+  intent: EffectIntent,
+  dispatchFence = { lease_id: "lease-integration", worker_id: "worker-integration" },
+) {
+  return {
+    intent,
+    external_identity: intent.target,
+    dispatch_fence: dispatchFence,
+    deduplication: {
+      strategy: "deterministic_target" as const,
+      key: intent.idempotency_key,
+      target: intent.target,
+    },
+  };
+}
+
+function siblingIntegrationIntent(
+  proof: ReturnType<typeof siblingIntegrationProof>,
+  effectId: string,
+): EffectIntent {
+  return {
+    schema: "openthrottle.effect-intent/v1",
+    id: effectId,
+    pipeline_run_id: "run-1",
+    decision_record_id: `decision-${effectId}`,
+    kind: "daytona/integrate-checkpoint@1",
+    idempotency_key: `run-1:integrate:${effectId}`,
+    target: `daytona:${"d".repeat(64)}:integration:${effectId}`,
+    subject: null,
+    payload: {
+      schema: "openthrottle.daytona-integration/v1",
+      identity: "d".repeat(64),
+      pipeline_run_id: "run-1",
+      attempt_id: `attempt-${effectId}`,
+      definition_bundle_hash: "b".repeat(64),
+      checkpoint_base_subject: proof.base,
+      current_subject: proof.current,
+      candidate_checkpoint_id: `checkpoint-${effectId}`,
+      candidate_input_subject: proof.candidate_input,
+      candidate_output_subject: proof.candidate_output,
+      candidate_blob: proof.candidate.pointer,
+      candidate_artifact: proof.candidate.descriptor,
+      current_ancestry: proof.ancestry.map((edge, index) => ({
+        checkpoint_id: `checkpoint-prior-integration-${index}`,
+        input_subject: edge.input,
+        output_subject: edge.output,
+        checkpoint_blob: edge.pointer,
+        checkpoint_artifact: edge.descriptor,
+      })),
     },
   };
 }
@@ -1274,19 +1533,23 @@ describe("DaytonaKernelAdapter", () => {
     const integration = adapter.effectBindings().find(
       ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
     )!;
-    const dispatchIntegration = (intent: EffectIntent) => integration.adapter.dispatch({
-      intent,
-      external_identity: intent.target,
-      dispatch_fence: {
+    const dispatchIntegration = async (intent: EffectIntent) => {
+      const input = {
+        intent,
+        external_identity: intent.target,
+        dispatch_fence: {
         lease_id: `lease-${intent.id}`,
         worker_id: "worker-integration",
-      },
-      deduplication: {
-        strategy: "deterministic_target",
-        key: intent.idempotency_key,
-        target: intent.target,
-      },
-    });
+        },
+        deduplication: {
+          strategy: "deterministic_target" as const,
+          key: intent.idempotency_key,
+          target: intent.target,
+        },
+      };
+      await integration.adapter.prepareDispatch!(input);
+      await integration.adapter.dispatch(input);
+    };
 
     await dispatchIntegration(beforeAction);
     const outcome = await adapter.executeWork(request, {
@@ -1569,6 +1832,551 @@ describe("DaytonaKernelAdapter", () => {
       dispatch_fence: null,
     })).resolves.toEqual({ kind: "not_found" });
     expect(read).not.toHaveBeenCalled();
+  });
+
+  it("publishes PREPARED only after exact integration preparation completes", async () => {
+    const candidate = selfContainedCheckpointBundle("1".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-preparation-failure");
+    const request = integrationDispatchRequest(intent);
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.updateEnv.mockRejectedValueOnce(new Error("environment update interrupted"));
+    const binding = adapterFor(sandbox, {
+      read: vi.fn().mockReturnValue(candidate.bytes),
+    }).effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+    const preparedPath =
+      `/var/lib/openthrottle/integration-input/${intent.id}/lease-integration/prepared.json`;
+
+    await expect(binding.adapter.prepareDispatch!(request))
+      .rejects.toThrow("environment update interrupted");
+    expect(sandbox.files.has(preparedPath)).toBe(false);
+    await expect(binding.adapter.reconcile(request)).resolves.toEqual({ kind: "not_found" });
+    expect(sandbox.process.createSession).not.toHaveBeenCalled();
+    expect(sandbox.process.executeSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it("recovers immutable publication after an interrupted truncated staging upload", async () => {
+    const candidate = selfContainedCheckpointBundle("f".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-truncated-immutable-staging");
+    const request = integrationDispatchRequest(intent);
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.fs.uploadFile.mockImplementationOnce(async (bytes: Buffer, path: string) => {
+      sandbox.files.set(path, Buffer.from(bytes.subarray(0, 1)));
+      throw new Error("provider upload was interrupted");
+    });
+    const binding = adapterFor(sandbox, {
+      read: vi.fn().mockReturnValue(candidate.bytes),
+    }).effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+    const cachedCandidatePath =
+      `/var/lib/openthrottle/integration-artifacts/${candidate.descriptor.sha256}.bundle`;
+
+    await expect(binding.adapter.prepareDispatch!(request))
+      .rejects.toThrow("provider upload was interrupted");
+    expect(sandbox.files.has(cachedCandidatePath)).toBe(false);
+
+    await expect(binding.adapter.prepareDispatch!(request)).resolves.toBeUndefined();
+    expect(sandbox.files.get(cachedCandidatePath)).toEqual(candidate.bytes);
+    expect([...sandbox.files.keys()].filter((path) => path.includes(".stage-"))).toEqual([]);
+    expect(sandbox.fs.uploadFile.mock.calls.some(([, path]) => path === cachedCandidatePath))
+      .toBe(false);
+  });
+
+  it("reconciles exact PREPARED without LAUNCH as dispatch-not-started", async () => {
+    const candidate = selfContainedCheckpointBundle("2".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-prepared-not-launched");
+    const request = integrationDispatchRequest(intent);
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    const binding = adapterFor(sandbox, {
+      read: vi.fn().mockReturnValue(candidate.bytes),
+    }).effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+
+    await binding.adapter.prepareDispatch!(request);
+
+    const preparedPath =
+      `/var/lib/openthrottle/integration-input/${intent.id}/lease-integration/prepared.json`;
+    const prepared = JSON.parse(sandbox.files.get(preparedPath)!.toString("utf8"));
+    expect(prepared).toEqual({
+      schema: "openthrottle.daytona-integration-prepared-fence/v1",
+      pipeline_run_id: intent.pipeline_run_id,
+      effect_id: intent.id,
+      idempotency_key: intent.idempotency_key,
+      runtime_identity: "d".repeat(64),
+      lease_id: "lease-integration",
+      worker_id: "worker-integration",
+      request_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    await expect(binding.adapter.reconcile(request)).resolves.toEqual({
+      kind: "dispatch_not_started",
+    });
+    expect(sandbox.process.createSession).not.toHaveBeenCalled();
+    expect(sandbox.process.executeSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it("never invokes an integration command twice after publishing exact LAUNCH", async () => {
+    const candidate = selfContainedCheckpointBundle("3".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-launch-acknowledgement-loss");
+    const request = integrationDispatchRequest(intent);
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.process.executeSessionCommand.mockImplementationOnce(async (...args) => {
+      await sandbox.defaultExecuteSessionCommand(...args);
+      throw new Error("provider acknowledgement was lost");
+    });
+    const binding = adapterFor(sandbox, {
+      read: vi.fn().mockReturnValue(candidate.bytes),
+    }).effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+
+    await binding.adapter.prepareDispatch!(request);
+    await expect(binding.adapter.dispatch(request))
+      .rejects.toThrow("provider acknowledgement was lost");
+
+    const launchPath =
+      `/var/lib/openthrottle/integration-results/${intent.id}/lease-integration/launch.json`;
+    expect(JSON.parse(sandbox.files.get(launchPath)!.toString("utf8"))).toMatchObject({
+      schema: "openthrottle.daytona-integration-launch-fence/v1",
+      effect_id: intent.id,
+      lease_id: "lease-integration",
+      worker_id: "worker-integration",
+      session_id: `kernel-effect-${intent.id}`,
+    });
+    await expect(binding.adapter.reconcile(request)).resolves.toEqual({ kind: "not_found" });
+    await expect(binding.adapter.dispatch(request)).resolves.toBeUndefined();
+    expect(sandbox.process.createSession).toHaveBeenCalledTimes(1);
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledTimes(1);
+    expect(sandbox.integrationRunnerLaunches).toEqual([launchPath]);
+  });
+
+  it("recovers when command submission fails before command-side LAUNCH election", async () => {
+    const candidate = selfContainedCheckpointBundle("e".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-integration-submit-crash");
+    const request = integrationDispatchRequest(intent);
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.process.executeSessionCommand.mockRejectedValueOnce(
+      new Error("supervisor crashed before command submission"),
+    );
+    const binding = adapterFor(sandbox, {
+      read: vi.fn().mockReturnValue(candidate.bytes),
+    }).effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+
+    await binding.adapter.prepareDispatch!(request);
+    await expect(binding.adapter.dispatch(request))
+      .rejects.toThrow("supervisor crashed before command submission");
+
+    const launchPath =
+      `/var/lib/openthrottle/integration-results/${intent.id}/lease-integration/launch.json`;
+    expect(sandbox.files.has(launchPath)).toBe(false);
+    await expect(binding.adapter.reconcile(request)).resolves.toEqual({
+      kind: "dispatch_not_started",
+    });
+
+    await expect(binding.adapter.dispatch(request)).resolves.toBeUndefined();
+    expect(sandbox.files.has(launchPath)).toBe(true);
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledTimes(2);
+    expect(sandbox.integrationRunnerLaunches).toEqual([launchPath]);
+  });
+
+  it("atomically grants one integration launch across concurrent exact-fence recovery", async () => {
+    const candidate = selfContainedCheckpointBundle("a".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-concurrent-integration-launch");
+    const request = integrationDispatchRequest(intent);
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    const binding = adapterFor(sandbox, {
+      read: vi.fn().mockReturnValue(candidate.bytes),
+    }).effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+
+    await binding.adapter.prepareDispatch!(request);
+    await expect(Promise.all([
+      binding.adapter.dispatch(request),
+      binding.adapter.dispatch(request),
+    ])).resolves.toEqual([undefined, undefined]);
+
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledTimes(2);
+    expect(sandbox.integrationRunnerLaunches).toHaveLength(1);
+    expect(sandbox.files.has(
+      `/var/lib/openthrottle/integration-results/${intent.id}/lease-integration/launch.json`,
+    )).toBe(true);
+  });
+
+  it("fails closed on conflicting integration preparation and launch fences", async () => {
+    const candidate = selfContainedCheckpointBundle("4".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-conflicting-integration-fence");
+    const request = integrationDispatchRequest(intent);
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    const binding = adapterFor(sandbox, {
+      read: vi.fn().mockReturnValue(candidate.bytes),
+    }).effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+    const preparedPath =
+      `/var/lib/openthrottle/integration-input/${intent.id}/lease-integration/prepared.json`;
+    const launchPath =
+      `/var/lib/openthrottle/integration-results/${intent.id}/lease-integration/launch.json`;
+
+    await binding.adapter.prepareDispatch!(request);
+    const exactPrepared = sandbox.files.get(preparedPath)!;
+    sandbox.files.set(preparedPath, Buffer.from('{"forged":true}\n'));
+    await expect(binding.adapter.reconcile(request)).rejects.toThrow(/prepared fence changed/i);
+    await expect(binding.adapter.dispatch(request)).rejects.toThrow(/prepared fence changed/i);
+
+    sandbox.files.set(preparedPath, exactPrepared);
+    sandbox.files.set(launchPath, Buffer.from('{"forged":true}\n'));
+    await expect(binding.adapter.reconcile(request)).rejects.toThrow(/launch fence changed/i);
+    await expect(binding.adapter.dispatch(request)).rejects.toThrow(/launch fence changed/i);
+    expect(sandbox.process.executeSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it("allows a new proposed fence to replace abandoned preparation before launch", async () => {
+    const candidate = selfContainedCheckpointBundle("5".repeat(64));
+    const intent = integrationIntentFor(candidate, "effect-reprepared-integration");
+    const original = integrationDispatchRequest(intent, {
+      lease_id: "proposed-lease-one",
+      worker_id: "proposed-worker-one",
+    });
+    const replacement = integrationDispatchRequest(intent, {
+      lease_id: "proposed-lease-two",
+      worker_id: "proposed-worker-two",
+    });
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    const binding = adapterFor(sandbox, {
+      read: vi.fn().mockReturnValue(candidate.bytes),
+    }).effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+
+    await binding.adapter.prepareDispatch!(original);
+    await expect(binding.adapter.dispatch(replacement)).rejects.toThrow(/no exact PREPARED fence/);
+    await expect(binding.adapter.reconcile({
+      intent,
+      external_identity: intent.target,
+      dispatch_fence: null,
+    })).resolves.toEqual({ kind: "not_found" });
+    await binding.adapter.prepareDispatch!(replacement);
+    const cachedCandidatePath =
+      `/var/lib/openthrottle/integration-artifacts/${candidate.descriptor.sha256}.bundle`;
+    expect(sandbox.fs.uploadFile.mock.calls.filter(([, path]) =>
+      String(path).startsWith(`${cachedCandidatePath}.stage-`)
+    ))
+      .toHaveLength(1);
+    expect(sandbox.process.executeCommand.mock.calls.filter(([command]) =>
+      String(command).startsWith(`ln -- '${cachedCandidatePath}'`)
+    )).toHaveLength(2);
+    await expect(binding.adapter.reconcile(original)).resolves.toEqual({
+      kind: "dispatch_not_started",
+    });
+    await expect(binding.adapter.reconcile(replacement)).resolves.toEqual({
+      kind: "dispatch_not_started",
+    });
+    await binding.adapter.dispatch(replacement);
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledTimes(1);
+    expect(sandbox.files.has(
+      `/var/lib/openthrottle/integration-results/${intent.id}/proposed-lease-one/launch.json`,
+    )).toBe(false);
+  });
+
+  it("imports source-rooted current ancestry before dispatching a sibling integration", async () => {
+    const proof = siblingIntegrationProof();
+    const effectId = "effect-sibling-integration";
+    const intent = siblingIntegrationIntent(proof, effectId);
+    const sourceRepository = join(proof.root, "selected-slot-source");
+    onTestFinished(() => {
+      if (existsSync(sourceRepository)) chmodSync(sourceRepository, 0o755);
+      proof.cleanup();
+    });
+    execFileSync("git", ["init", "--quiet", "--initial-branch=main", sourceRepository]);
+    execFileSync("git", [
+      "fetch", "--quiet", "--depth=1", `file://${proof.repository}`, proof.base,
+    ], { cwd: sourceRepository });
+    execFileSync("git", ["update-ref", "refs/heads/main", "FETCH_HEAD"], {
+      cwd: sourceRepository,
+    });
+    chmodSync(sourceRepository, 0o555);
+    expect(() => execFileSync("git", ["cat-file", "-e", `${proof.current}^{commit}`], {
+      cwd: sourceRepository,
+      stdio: "ignore",
+    })).toThrow();
+    const sandbox = sandboxWith(async () => {
+      throw new Error("404 not found");
+    });
+    const physicalInputs = new Map<string, string>();
+    sandbox.process.executeCommand.mockImplementation(async (
+      command: string,
+      _cwd?: string,
+      environment: Record<string, string> = {},
+    ) => {
+      if (command.startsWith("ln -- ")) return sandbox.defaultExecuteCommand(command);
+      if (command.includes("repository-source") && !command.includes("git bundle")) {
+        return { exitCode: 0, result: "" };
+      }
+      let localCommand = command;
+      const localEnvironment = { ...environment };
+      for (const [remotePath, bytes] of sandbox.files) {
+        const commandUsesPath = command.includes(remotePath) ||
+          Object.values(environment).includes(remotePath);
+        const isSealedGitInput = remotePath.endsWith(".bundle") ||
+          remotePath.endsWith(".shallow");
+        if (!commandUsesPath || !isSealedGitInput) continue;
+        let physicalPath = physicalInputs.get(remotePath);
+        if (!physicalPath) {
+          physicalPath = join(proof.root, `sealed-${physicalInputs.size}`);
+          writeFileSync(physicalPath, bytes);
+          chmodSync(physicalPath, 0o400);
+          physicalInputs.set(remotePath, physicalPath);
+        }
+        localCommand = localCommand.replaceAll(remotePath, physicalPath);
+        for (const [name, value] of Object.entries(localEnvironment)) {
+          if (value === remotePath) localEnvironment[name] = physicalPath;
+        }
+      }
+      const executed = spawnSync("sh", ["-c", localCommand], {
+        cwd: sourceRepository,
+        env: { ...process.env, ...localEnvironment },
+        encoding: "utf8",
+      });
+      return {
+        exitCode: executed.status ?? 1,
+        result: executed.stdout ?? "",
+      };
+    });
+    sandbox.process.executeSessionCommand.mockImplementation(async (sessionId, request) => {
+      expect(execFileSync("git", ["rev-parse", `${proof.current}^{commit}`], {
+        cwd: sourceRepository,
+        encoding: "utf8",
+      }).trim()).toBe(proof.current);
+      for (const edge of proof.ancestry) {
+        expect(sandbox.files.get(
+          `/var/lib/openthrottle/integration-artifacts/${edge.pointer.digest}.bundle`,
+        )).toEqual(edge.bytes);
+      }
+      return sandbox.defaultExecuteSessionCommand(sessionId, request);
+    });
+    const read = vi.fn((pointer: { digest: string }) => {
+      if (pointer.digest === proof.candidate.pointer.digest) return proof.candidate.bytes;
+      const edge = proof.ancestry.find((candidate) => candidate.pointer.digest === pointer.digest);
+      if (edge) return edge.bytes;
+      throw new Error(`unexpected BlobStore pointer ${pointer.digest}`);
+    });
+    const adapter = adapterFor(sandbox, { read });
+    const binding = adapter.effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+    const dispatchFence = { lease_id: "lease-sibling", worker_id: "worker-sibling" };
+    const dispatchRequest = integrationDispatchRequest(intent, dispatchFence);
+
+    expect(statSync(sourceRepository).mode & 0o777).toBe(0o555);
+    await expect(binding.adapter.prepareDispatch!(dispatchRequest)).resolves.toBeUndefined();
+    await expect(binding.adapter.dispatch(dispatchRequest)).resolves.toBeUndefined();
+
+    const requestPath =
+      `/var/lib/openthrottle/integration-input/${effectId}/${dispatchFence.lease_id}/request.json`;
+    const sandboxRequest = JSON.parse(sandbox.files.get(requestPath)!.toString("utf8"));
+    expect(sandboxRequest).not.toHaveProperty("current_ancestry");
+    expect(read).toHaveBeenNthCalledWith(1, proof.candidate.pointer);
+    for (const [index, edge] of proof.ancestry.entries()) {
+      expect(read).toHaveBeenNthCalledWith(index + 2, edge.pointer);
+      expect(sandbox.process.executeCommand.mock.calls.some(([command]) =>
+        String(command).includes("git bundle verify") &&
+        String(command).includes(edge.pointer.digest),
+      )).toBe(true);
+      expect(sandbox.process.executeCommand.mock.calls.some(([command]) =>
+        String(command).includes("git fetch --quiet --no-tags") &&
+        String(command).includes(edge.descriptor.ref),
+      )).toBe(true);
+    }
+    expect(sandbox.process.executeCommand.mock.calls.some(([command]) =>
+      String(command).includes("env -u GIT_ALTERNATE_OBJECT_DIRECTORIES") &&
+      String(command).includes("GIT_CONFIG_GLOBAL=/dev/null") &&
+      String(command).includes("GIT_NO_REPLACE_OBJECTS=1") &&
+      String(command).includes("git fetch --quiet --no-tags"),
+    )).toBe(true);
+    expect(sandbox.process.executeCommand.mock.calls.some(([command]) =>
+      String(command).includes("git rev-parse") && String(command).includes(proof.current),
+    )).toBe(true);
+
+    const uploadsAfterFirstDispatch = sandbox.fs.uploadFile.mock.calls.length;
+    const fetchesAfterFirstDispatch = sandbox.process.executeCommand.mock.calls.filter(([command]) =>
+      String(command).includes("git fetch --quiet --no-tags")
+    ).length;
+    const readsAfterFirstDispatch = read.mock.calls.length;
+    const shallowSnapshots = [...physicalInputs]
+      .filter(([remotePath]) => remotePath.endsWith(".shallow"))
+      .map(([, physicalPath]) => ({
+        physicalPath,
+        bytes: readFileSync(physicalPath),
+        mode: statSync(physicalPath).mode & 0o777,
+      }));
+    expect(shallowSnapshots).toHaveLength(2);
+    expect(shallowSnapshots.every(({ mode }) => mode === 0o400)).toBe(true);
+    await expect(binding.adapter.prepareDispatch!(dispatchRequest)).resolves.toBeUndefined();
+    await expect(binding.adapter.dispatch(dispatchRequest)).resolves.toBeUndefined();
+    expect(sandbox.fs.uploadFile).toHaveBeenCalledTimes(uploadsAfterFirstDispatch);
+    expect(sandbox.process.executeCommand.mock.calls.filter(([command]) =>
+      String(command).includes("git fetch --quiet --no-tags")
+    )).toHaveLength(fetchesAfterFirstDispatch);
+    expect(read).toHaveBeenCalledTimes(readsAfterFirstDispatch);
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledTimes(1);
+    for (const snapshot of shallowSnapshots) {
+      expect(existsSync(snapshot.physicalPath)).toBe(true);
+      expect(statSync(snapshot.physicalPath).mode & 0o777).toBe(snapshot.mode);
+      expect(readFileSync(snapshot.physicalPath)).toEqual(snapshot.bytes);
+    }
+
+    await expect(binding.adapter.reconcile({
+      intent: {
+        ...intent,
+        payload: {
+          ...(intent.payload as Record<string, unknown>),
+          current_ancestry: [
+            {
+              ...((intent.payload as { current_ancestry: readonly Record<string, unknown>[] })
+                .current_ancestry[0]!),
+              input_subject: "f".repeat(40),
+            },
+            ...((intent.payload as { current_ancestry: readonly Record<string, unknown>[] })
+              .current_ancestry.slice(1)),
+          ],
+        } as never,
+      },
+      external_identity: intent.target,
+      dispatch_fence: null,
+    })).rejects.toThrow(/current ancestry/i);
+  });
+
+  it("does not launch when an ancestry bundle is missing its exact source input", async () => {
+    const proof = siblingIntegrationProof();
+    onTestFinished(proof.cleanup);
+    const intent = siblingIntegrationIntent(proof, "effect-missing-ancestry-input");
+    const request = integrationDispatchRequest(intent);
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (command.includes("repository-source")) return { exitCode: 0, result: "" };
+      if (command.includes("git bundle list-heads")) {
+        const edge = proof.ancestry.find(({ pointer }) => command.includes(pointer.digest))!;
+        return { exitCode: 0, result: `${edge.output} ${edge.descriptor.ref}\n` };
+      }
+      if (command.includes("git bundle verify")) return { exitCode: 0, result: "" };
+      if (command.includes("git rev-parse")) return { exitCode: 128, result: "" };
+      return sandbox.defaultExecuteCommand(command);
+    });
+    const read = vi.fn((pointer: { digest: string }) => {
+      if (pointer.digest === proof.candidate.pointer.digest) return proof.candidate.bytes;
+      return proof.ancestry.find((edge) => edge.pointer.digest === pointer.digest)!.bytes;
+    });
+    const binding = adapterFor(sandbox, { read }).effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+
+    await expect(binding.adapter.prepareDispatch!(request))
+      .rejects.toThrow(/missing its exact input commit/);
+    expect(sandbox.process.executeSessionCommand).not.toHaveBeenCalled();
+    expect(sandbox.files.has(
+      `/var/lib/openthrottle/integration-input/${intent.id}/lease-integration/prepared.json`,
+    )).toBe(false);
+  });
+
+  it("does not launch when an ancestry fetch omits its exact output commit", async () => {
+    const proof = siblingIntegrationProof();
+    onTestFinished(proof.cleanup);
+    const intent = siblingIntegrationIntent(proof, "effect-missing-ancestry-output");
+    const request = integrationDispatchRequest(intent);
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (command.includes("repository-source")) return { exitCode: 0, result: "" };
+      if (command.includes("git bundle list-heads")) {
+        const edge = proof.ancestry.find(({ pointer }) => command.includes(pointer.digest))!;
+        return { exitCode: 0, result: `${edge.output} ${edge.descriptor.ref}\n` };
+      }
+      if (command.includes("git bundle verify") || command.includes("git fetch --quiet --no-tags")) {
+        return { exitCode: 0, result: "" };
+      }
+      if (command.includes("git rev-parse")) {
+        return command.includes(proof.base)
+          ? { exitCode: 0, result: `${proof.base}\n` }
+          : { exitCode: 128, result: "" };
+      }
+      return sandbox.defaultExecuteCommand(command);
+    });
+    const read = vi.fn((pointer: { digest: string }) => {
+      if (pointer.digest === proof.candidate.pointer.digest) return proof.candidate.bytes;
+      return proof.ancestry.find((edge) => edge.pointer.digest === pointer.digest)!.bytes;
+    });
+    const binding = adapterFor(sandbox, { read }).effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+
+    await expect(binding.adapter.prepareDispatch!(request))
+      .rejects.toThrow(/did not materialize its exact commit/);
+    expect(sandbox.process.executeSessionCommand).not.toHaveBeenCalled();
+    expect(sandbox.files.has(
+      `/var/lib/openthrottle/integration-input/${intent.id}/lease-integration/prepared.json`,
+    )).toBe(false);
+  });
+
+  it("resumes partial ancestry preparation without rereading an imported edge", async () => {
+    const proof = siblingIntegrationProof();
+    onTestFinished(proof.cleanup);
+    const intent = siblingIntegrationIntent(proof, "effect-partial-ancestry-recovery");
+    const request = integrationDispatchRequest(intent);
+    const sourceCommits = new Set([proof.base]);
+    let interruptSecondFetch = true;
+    const sandbox = sandboxWith(async () => { throw new Error("404 not found"); });
+    sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (command.includes("repository-source")) return { exitCode: 0, result: "" };
+      if (command.includes("git bundle list-heads")) {
+        const edge = proof.ancestry.find(({ pointer }) => command.includes(pointer.digest))!;
+        return { exitCode: 0, result: `${edge.output} ${edge.descriptor.ref}\n` };
+      }
+      if (command.includes("git bundle verify")) return { exitCode: 0, result: "" };
+      if (command.includes("git fetch --quiet --no-tags")) {
+        const edge = proof.ancestry.find(({ pointer }) => command.includes(pointer.digest))!;
+        if (edge === proof.ancestry[1] && interruptSecondFetch) {
+          interruptSecondFetch = false;
+          return { exitCode: 128, result: "" };
+        }
+        sourceCommits.add(edge.output);
+        return { exitCode: 0, result: "" };
+      }
+      if (command.includes("git rev-parse")) {
+        const subject = [...sourceCommits].find((commit) => command.includes(commit));
+        return subject
+          ? { exitCode: 0, result: `${subject}\n` }
+          : { exitCode: 128, result: "" };
+      }
+      return sandbox.defaultExecuteCommand(command);
+    });
+    const read = vi.fn((pointer: { digest: string }) => {
+      if (pointer.digest === proof.candidate.pointer.digest) return proof.candidate.bytes;
+      return proof.ancestry.find((edge) => edge.pointer.digest === pointer.digest)!.bytes;
+    });
+    const binding = adapterFor(sandbox, { read }).effectBindings().find(
+      ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
+    )!;
+
+    await expect(binding.adapter.prepareDispatch!(request))
+      .rejects.toThrow(/could not import integration current ancestry\[1\]/);
+    expect(sourceCommits.has(proof.ancestry[0]!.output)).toBe(true);
+    expect(sourceCommits.has(proof.current)).toBe(false);
+    expect(sandbox.process.executeSessionCommand).not.toHaveBeenCalled();
+
+    await expect(binding.adapter.prepareDispatch!(request)).resolves.toBeUndefined();
+    expect(sourceCommits.has(proof.current)).toBe(true);
+    expect(read.mock.calls.filter(([pointer]) =>
+      pointer.digest === proof.ancestry[0]!.pointer.digest,
+    )).toHaveLength(1);
+    expect(read.mock.calls.filter(([pointer]) =>
+      pointer.digest === proof.ancestry[1]!.pointer.digest,
+    )).toHaveLength(2);
+    await binding.adapter.dispatch(request);
+    expect(sandbox.process.executeSessionCommand).toHaveBeenCalledTimes(1);
   });
 
   it("starts a stopped integration sandbox and completes reconciliation in the same read", async () => {
@@ -2057,6 +2865,25 @@ describe("DaytonaKernelAdapter", () => {
       if (path === artifactPath) return forgedBytes;
       throw new Error("404 not found");
     });
+    sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+      if (command.includes("repository-source") && !command.includes("git bundle")) {
+        return { exitCode: 0, result: "" };
+      }
+      if (command.includes("git bundle list-heads")) {
+        return {
+          exitCode: 0,
+          result: `${proof.descriptor.commit} ${proof.descriptor.ref}\n`,
+        };
+      }
+      if (command.includes("git rev-parse")) {
+        const subject = [candidate.descriptor.commit, proof.descriptor.commit]
+          .find((commit) => command.includes(commit));
+        return subject
+          ? { exitCode: 0, result: `${subject}\n` }
+          : { exitCode: 128, result: "" };
+      }
+      return sandbox.defaultExecuteCommand(command);
+    });
     const put = vi.fn();
     const read = vi.fn((value: { digest: string }) =>
       value.digest === candidatePointer.digest ? candidate.bytes : proof.bytes);
@@ -2068,17 +2895,19 @@ describe("DaytonaKernelAdapter", () => {
       ({ effect_kind }) => effect_kind === "daytona/integrate-checkpoint@1",
     )!;
     const dispatchFence = { lease_id: "lease-integration", worker_id: "worker-integration" };
-
-    await binding.adapter.dispatch({
+    const dispatchRequest = {
       intent,
       external_identity: intent.target,
       dispatch_fence: dispatchFence,
       deduplication: {
-        strategy: "deterministic_target",
+        strategy: "deterministic_target" as const,
         key: intent.idempotency_key,
         target: intent.target,
       },
-    });
+    };
+
+    await binding.adapter.prepareDispatch!(dispatchRequest);
+    await binding.adapter.dispatch(dispatchRequest);
     const requestPath = `/var/lib/openthrottle/integration-input/${effectId}/lease-integration/request.json`;
     const sandboxRequest = JSON.parse(sandbox.files.get(requestPath)!.toString("utf8"));
     expect(sandboxRequest).not.toHaveProperty("current_ancestry");

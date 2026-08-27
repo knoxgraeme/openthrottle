@@ -1135,6 +1135,156 @@ describe("kernel publication plan binding", () => {
     })).rejects.toThrow(/multiple task-ref push deliveries/);
   }, 15_000);
 
+  it("prepares a sibling candidate from base ancestry and independently rejects a foreign private parent", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ot-kernel-sibling-integration-"));
+    directories.push(root);
+    const work = join(root, "work");
+    execFileSync("git", ["init", "-q", "-b", "main", work]);
+    git(work, ["config", "user.name", "Test"]);
+    git(work, ["config", "user.email", "test@example.com"]);
+    writeFileSync(join(work, "file.txt"), "source\n");
+    git(work, ["add", "."]);
+    git(work, ["commit", "-qm", "source"]);
+    const source = git(work, ["rev-parse", "HEAD"]);
+    const sourceTree = git(work, ["rev-parse", "HEAD^{tree}"]);
+    const privateInput = git(work, [
+      "commit-tree", sourceTree, "-p", source, "-m", "private unit input",
+    ]);
+    const candidateOutput = git(work, [
+      "commit-tree", sourceTree, "-p", privateInput, "-m", "accepted unit candidate",
+    ]);
+    const current = git(work, [
+      "commit-tree", sourceTree, "-p", source, "-m", "integrated sibling",
+    ]);
+    const foreignInput = git(work, ["commit-tree", sourceTree, "-m", "foreign private input"]);
+    const foreignOutput = git(work, [
+      "commit-tree", sourceTree, "-p", foreignInput, "-m", "foreign candidate",
+    ]);
+    const candidateRequestHash = "6".repeat(64);
+    const foreignRequestHash = "7".repeat(64);
+    const candidateBundle = writeBundle({
+      repository: work,
+      root,
+      ref: `refs/openthrottle/checkpoints/${candidateRequestHash}`,
+      commit: candidateOutput,
+      boundary: source,
+      name: "sibling-candidate.bundle",
+    });
+    const proofBundle = writeBundle({
+      repository: work,
+      root,
+      ref: `refs/openthrottle/integrations/${"8".repeat(64)}`,
+      commit: current,
+      boundary: source,
+      name: "sibling-current.bundle",
+    });
+    const foreignBundle = writeBundle({
+      repository: work,
+      root,
+      ref: `refs/openthrottle/checkpoints/${foreignRequestHash}`,
+      commit: foreignOutput,
+      boundary: source,
+      name: "foreign-candidate.bundle",
+    });
+    const checkpoint = (
+      id: string,
+      requestHash: string,
+      inputSubject: string,
+      outputSubject: string,
+      bundlePointer: ReturnType<typeof pointer>,
+    ): AttemptCheckpoint => ({
+      schema: "openthrottle.attempt-checkpoint/v1",
+      id,
+      pipeline_run_id: "run-1",
+      attempt_id: `attempt-${id}`,
+      request_hash: requestHash,
+      definition_bundle_hash: "b".repeat(64),
+      input_subject: inputSubject,
+      output_subject: outputSubject,
+      native_session_id: null,
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+      payload: { blob: bundlePointer },
+      captured_at: NOW,
+    });
+    const candidate = checkpoint(
+      "checkpoint-sibling-candidate",
+      candidateRequestHash,
+      privateInput,
+      candidateOutput,
+      candidateBundle.pointer,
+    );
+    const proof = checkpoint(
+      "checkpoint-sibling-proof",
+      "8".repeat(64),
+      source,
+      current,
+      proofBundle.pointer,
+    );
+    const foreign = checkpoint(
+      "checkpoint-foreign-candidate",
+      foreignRequestHash,
+      foreignInput,
+      foreignOutput,
+      foreignBundle.pointer,
+    );
+    const blobs = new Map([
+      [candidateBundle.pointer.digest, candidateBundle.bytes],
+      [proofBundle.pointer.digest, proofBundle.bytes],
+      [foreignBundle.pointer.digest, foreignBundle.bytes],
+    ]);
+    const bindings = createKernelExternalPlanBindings({
+      environments: {
+        loadExactRunEnvironment: () => ({
+          repository: "owner/repo",
+          base_branch: "main",
+          source_reference: "OPE-201",
+          runtime_snapshot: "snapshot-1",
+          title: "Sibling integration",
+        }),
+      } as never,
+      blob_store: { read: (value: { digest: string }) => blobs.get(value.digest)! } as never,
+    });
+    const integrate = bindings.find(({ external_kind }) => external_kind === "core/integrate-unit@1")!;
+    const anchor = pushDelivery("delivery-sibling-anchor", current, "create");
+    const prepare = (selectedCandidate: AttemptCheckpoint) => integrate.prepare({
+      run: {
+        id: "run-1",
+        current_subject: current,
+        definition_bundle_hash: "b".repeat(64),
+      } as never,
+      attempt: {
+        id: "attempt-integrate-sibling",
+        input_subject: current,
+        request_hash: "9".repeat(64),
+        definition_bundle_hash: "b".repeat(64),
+      } as never,
+      stage: {} as never,
+      context: {
+        records: new Map<string, ExecutionRecord>([
+          ...runtimeDeliveryEntries(),
+          [anchor.id, anchor],
+        ]),
+        checkpoints: new Map([
+          [selectedCandidate.id, selectedCandidate],
+          [proof.id, proof],
+        ]),
+      },
+      bundle: { source_commit: source } as never,
+      manifest: lifecycleManifest(1),
+    });
+
+    const prepared = await prepare(candidate);
+    expect(prepared.phases[0]!.effects[0]!.payload).toMatchObject({
+      candidate_input_subject: privateInput,
+      current_subject: current,
+      current_ancestry: [{
+        input_subject: source,
+        output_subject: current,
+      }],
+    });
+    await expect(prepare(foreign)).rejects.toThrow(/required exact ancestry/i);
+  }, 15_000);
+
   it("selects a legitimate identity checkpoint for structured no-content integration", async () => {
     const root = mkdtempSync(join(tmpdir(), "ot-kernel-plan-identity-test-"));
     directories.push(root);

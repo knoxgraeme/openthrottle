@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Daytona, type Sandbox } from "@daytona/sdk";
 import {
   ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
@@ -6,6 +6,7 @@ import {
   INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
   canonicalJson,
   digestCanonicalJson,
+  digestNormalized,
   jsonValueAt,
   validateAttemptForensicsPayload,
   validateBlobPointer,
@@ -47,6 +48,7 @@ import type {
   KernelSteeringEnvelope,
 } from "../../pipeline/kernel/steering.js";
 import {
+  addKernelIntegrationEvidenceBytes,
   KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES,
   parseKernelRuntimeResult,
   parseKernelSessionEvent,
@@ -73,12 +75,12 @@ const ACTION_RESULT_DIR = "/var/lib/openthrottle/action-results";
 const ACTION_FENCE_DIR = "/var/lib/openthrottle/action-fences";
 const INTEGRATION_INPUT_DIR = "/var/lib/openthrottle/integration-input";
 const INTEGRATION_RESULT_DIR = "/var/lib/openthrottle/integration-results";
+const INTEGRATION_ARTIFACT_DIR = "/var/lib/openthrottle/integration-artifacts";
 const OPENTHROTTLE_ROOT = "/var/lib/openthrottle";
 const AGENT_STATE_ROOT = "/home/agent/.ot";
 const STEERING_INBOX_DIR = `${AGENT_STATE_ROOT}/inbox`;
 const KERNEL_STEERING_DELIVERY_SCHEMA = "openthrottle.kernel-steering/v1" as const;
 const KERNEL_STEERING_DELIVERY_MAX_BYTES = 64 * 1024;
-const KERNEL_INTEGRATION_SEALED_BUNDLES_MAX_BYTES = KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES;
 const ACTIVE_AUTOSTOP_MINUTES = 60;
 const EVIDENCE_CLOCK_FUTURE_SKEW_MS = 5 * 60 * 1_000;
 const DISPATCH_LOCK_CONTENTION_EXIT_CODE = 75;
@@ -207,6 +209,10 @@ interface DaytonaIntegrationResult {
 
 const DAYTONA_INTEGRATION_ABSENCE_CONTINUATION_SCHEMA =
   "openthrottle.daytona-integration-absence-continuation/v1" as const;
+const DAYTONA_INTEGRATION_PREPARED_FENCE_SCHEMA =
+  "openthrottle.daytona-integration-prepared-fence/v1" as const;
+const DAYTONA_INTEGRATION_LAUNCH_FENCE_SCHEMA =
+  "openthrottle.daytona-integration-launch-fence/v1" as const;
 const DAYTONA_INTEGRATION_FATAL_ABSENCE_THRESHOLD = 2;
 
 function canonicalProviderErrorDetail(error: unknown, fallback: string): string {
@@ -358,6 +364,87 @@ function inspectCheckpointBundle(
   return inspected;
 }
 
+async function putImmutableBytes(
+  sandbox: Sandbox,
+  path: string,
+  bytes: Uint8Array,
+  label: string,
+): Promise<"created" | "existing"> {
+  const exact = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  const existing = await downloadBytes(sandbox, path);
+  if (existing !== null) {
+    if (!existing.equals(exact)) throw new Error(`${label} path contains different immutable bytes`);
+    await sandbox.fs.setFilePermissions(path, { owner: "root", group: "root", mode: "400" });
+    const resealed = await downloadBytes(sandbox, path);
+    if (resealed === null || !resealed.equals(exact)) {
+      throw new Error(`${label} failed exact reseal verification`);
+    }
+    return "existing";
+  }
+  const stagingPath = `${path}.stage-${randomUUID()}`;
+  try {
+    await sandbox.fs.uploadFile(exact, stagingPath);
+    await sandbox.fs.setFilePermissions(stagingPath, { owner: "root", group: "root", mode: "400" });
+    const staged = await downloadBytes(sandbox, stagingPath);
+    if (staged === null || !staged.equals(exact)) {
+      throw new Error(`${label} failed exact staging verification`);
+    }
+    const publication = await sandbox.process.executeCommand(
+      `ln -- ${shellQuote(stagingPath)} ${shellQuote(path)}`,
+      OPENTHROTTLE_ROOT,
+      {},
+      30,
+    );
+    const published = await downloadBytes(sandbox, path);
+    if (published === null || !published.equals(exact)) {
+      if (publication.exitCode !== 0 && published !== null) {
+        throw new Error(`${label} path contains different immutable bytes`);
+      }
+      throw new Error(`${label} failed atomic publication verification`);
+    }
+    await sandbox.fs.setFilePermissions(path, { owner: "root", group: "root", mode: "400" });
+    const resealed = await downloadBytes(sandbox, path);
+    if (resealed === null || !resealed.equals(exact)) {
+      throw new Error(`${label} failed exact publication verification`);
+    }
+    return publication.exitCode === 0 ? "created" : "existing";
+  } finally {
+    await sandbox.fs.deleteFile(stagingPath).catch(() => undefined);
+  }
+}
+
+async function linkImmutableBytes(
+  sandbox: Sandbox,
+  sourcePath: string,
+  targetPath: string,
+  bytes: Uint8Array,
+  label: string,
+): Promise<void> {
+  const exact = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  const existing = await downloadBytes(sandbox, targetPath);
+  if (existing === null) {
+    const linked = await sandbox.process.executeCommand(
+      `ln -- ${shellQuote(sourcePath)} ${shellQuote(targetPath)}`,
+      OPENTHROTTLE_ROOT,
+      {},
+      30,
+    );
+    if (linked.exitCode !== 0) {
+      const concurrent = await downloadBytes(sandbox, targetPath);
+      if (concurrent === null || !concurrent.equals(exact)) {
+        throw new Error(`${label} could not publish its immutable link`);
+      }
+    }
+  } else if (!existing.equals(exact)) {
+    throw new Error(`${label} path contains different immutable bytes`);
+  }
+  await sandbox.fs.setFilePermissions(targetPath, { owner: "root", group: "root", mode: "400" });
+  const reread = await downloadBytes(sandbox, targetPath);
+  if (reread === null || !reread.equals(exact)) {
+    throw new Error(`${label} failed exact link verification`);
+  }
+}
+
 function integrationPayload(intent: Readonly<EffectIntent>): DaytonaIntegrationPayload {
   const value = object(intent.payload, `effect ${intent.id} payload`);
   const artifact = object(value.candidate_artifact, "integration candidate_artifact");
@@ -436,10 +523,14 @@ function integrationPayload(intent: Readonly<EffectIntent>): DaytonaIntegrationP
       edgePointer.payload_schema !== "openthrottle.git-checkpoint-bundle/v1" ||
       refs.has(edgeArtifact.ref) || commits.has(edgeArtifact.commit)
     ) throw new Error(`effect ${intent.id} has invalid exact current ancestry entry`);
-    if (aggregateBundleBytes > KERNEL_INTEGRATION_SEALED_BUNDLES_MAX_BYTES - edgePointer.bytes) {
+    const nextAggregateBytes = addKernelIntegrationEvidenceBytes(
+      aggregateBundleBytes,
+      edgePointer.bytes,
+    );
+    if (nextAggregateBytes === null) {
       throw new Error(`effect ${intent.id} exceeds the aggregate sealed bundle byte ceiling`);
     }
-    aggregateBundleBytes += edgePointer.bytes;
+    aggregateBundleBytes = nextAggregateBytes;
     refs.add(edgeArtifact.ref);
     commits.add(edgeArtifact.commit as string);
     currentAncestry.push({
@@ -450,14 +541,28 @@ function integrationPayload(intent: Readonly<EffectIntent>): DaytonaIntegrationP
       checkpoint_artifact: edgeArtifact as unknown as KernelCheckpointArtifactDescriptor,
     });
   }
-  const orderedCurrentAncestry = currentAncestry.length === 0
-    ? []
-    : validateKernelCheckpointAncestryChain({
+  let orderedCurrentAncestry: DaytonaIntegrationAncestryEntry[] = [];
+  if (currentAncestry.length > 0) {
+    const outputSubjects = new Set(currentAncestry.map((edge) => edge.output_subject));
+    const roots = [...new Set(currentAncestry
+      .map((edge) => edge.input_subject)
+      .filter((subject) => !outputSubjects.has(subject)))];
+    const allowedRoots = new Set([
+      value.candidate_input_subject as string,
+      value.checkpoint_base_subject as string,
+    ]);
+    if (roots.length !== 1 || !allowedRoots.has(roots[0]!)) {
+      throw new Error(
+        `effect ${intent.id} current ancestry must begin at its candidate input or checkpoint base`,
+      );
+    }
+    orderedCurrentAncestry = validateKernelCheckpointAncestryChain({
       entries: currentAncestry,
-      start_subject: value.candidate_input_subject as string,
+      start_subject: roots[0]!,
       end_subject: value.current_subject as string,
       label: `effect ${intent.id} current ancestry`,
     });
+  }
   return {
     ...(value as unknown as DaytonaIntegrationPayload),
     candidate_blob: pointer,
@@ -473,11 +578,85 @@ function integrationPaths(effectId: string, dispatchLeaseId: string) {
     input_effect_directory: `${INTEGRATION_INPUT_DIR}/${effect}`,
     input_directory: `${INTEGRATION_INPUT_DIR}/${effect}/${lease}`,
     input: `${INTEGRATION_INPUT_DIR}/${effect}/${lease}/request.json`,
+    prepared: `${INTEGRATION_INPUT_DIR}/${effect}/${lease}/prepared.json`,
     result_effect_directory: `${INTEGRATION_RESULT_DIR}/${effect}`,
     result_directory: `${INTEGRATION_RESULT_DIR}/${effect}/${lease}`,
     result: `${INTEGRATION_RESULT_DIR}/${effect}/${lease}/result.json`,
+    launch: `${INTEGRATION_RESULT_DIR}/${effect}/${lease}/launch.json`,
+    launch_stage: `${INTEGRATION_RESULT_DIR}/${effect}/${lease}/launch.sealed`,
     lock: `${INTEGRATION_RESULT_DIR}/${effect}/${lease}/dispatch.lock`,
   };
+}
+
+function integrationRequest(
+  intent: Readonly<EffectIntent>,
+  authority: DaytonaIntegrationPayload,
+  dispatchFence: { lease_id: string; worker_id: string },
+) {
+  return {
+    schema: "openthrottle.kernel-integration-request/v1",
+    pipeline_run_id: intent.pipeline_run_id,
+    effect_id: intent.id,
+    idempotency_key: intent.idempotency_key,
+    lease_id: dispatchFence.lease_id,
+    worker_id: dispatchFence.worker_id,
+    definition_bundle_hash: authority.definition_bundle_hash,
+    checkpoint_base_subject: authority.checkpoint_base_subject,
+    current_subject: authority.current_subject,
+    candidate_checkpoint_id: authority.candidate_checkpoint_id,
+    candidate_input_subject: authority.candidate_input_subject,
+    candidate_output_subject: authority.candidate_output_subject,
+    candidate_artifact: authority.candidate_artifact,
+  } as const;
+}
+
+function integrationRequestBytes(
+  intent: Readonly<EffectIntent>,
+  authority: DaytonaIntegrationPayload,
+  dispatchFence: { lease_id: string; worker_id: string },
+): Buffer {
+  return Buffer.from(`${canonicalJson(integrationRequest(intent, authority, dispatchFence))}\n`);
+}
+
+function integrationFenceIdentity(
+  intent: Readonly<EffectIntent>,
+  authority: DaytonaIntegrationPayload,
+  dispatchFence: { lease_id: string; worker_id: string },
+) {
+  const requestBytes = integrationRequestBytes(intent, authority, dispatchFence);
+  return {
+    pipeline_run_id: intent.pipeline_run_id,
+    effect_id: intent.id,
+    idempotency_key: intent.idempotency_key,
+    runtime_identity: authority.identity,
+    lease_id: dispatchFence.lease_id,
+    worker_id: dispatchFence.worker_id,
+    request_sha256: digestNormalized(requestBytes),
+  } as const;
+}
+
+function integrationPreparedFenceBytes(
+  intent: Readonly<EffectIntent>,
+  authority: DaytonaIntegrationPayload,
+  dispatchFence: { lease_id: string; worker_id: string },
+): Buffer {
+  return Buffer.from(`${canonicalJson({
+    schema: DAYTONA_INTEGRATION_PREPARED_FENCE_SCHEMA,
+    ...integrationFenceIdentity(intent, authority, dispatchFence),
+  })}\n`);
+}
+
+function integrationLaunchFenceBytes(
+  intent: Readonly<EffectIntent>,
+  authority: DaytonaIntegrationPayload,
+  dispatchFence: { lease_id: string; worker_id: string },
+  sessionId: string,
+): Buffer {
+  return Buffer.from(`${canonicalJson({
+    schema: DAYTONA_INTEGRATION_LAUNCH_FENCE_SCHEMA,
+    ...integrationFenceIdentity(intent, authority, dispatchFence),
+    session_id: sessionId,
+  })}\n`);
 }
 
 function parseIntegrationResult(input: {
@@ -608,6 +787,8 @@ export class DaytonaKernelAdapter implements
         adapter: {
           reconcile: ({ intent, dispatch_fence, continuation }) =>
             this.#reconcileIntegration(intent, dispatch_fence, continuation),
+          prepareDispatch: ({ intent, dispatch_fence }) =>
+            this.#prepareIntegrationDispatch(intent, dispatch_fence),
           dispatch: ({ intent, dispatch_fence }) => this.#dispatchIntegration(intent, dispatch_fence),
         },
       },
@@ -895,7 +1076,12 @@ export class DaytonaKernelAdapter implements
         environment.base_branch,
       );
     }
-    await this.#putImmutableRequest(sandbox, requestPath, canonicalJson(request));
+    await putImmutableBytes(
+      sandbox,
+      requestPath,
+      Buffer.from(canonicalJson(request)),
+      "Daytona action request",
+    );
     const remainingBeforeCredentials = actionDeadline - Date.now();
     if (remainingBeforeCredentials <= 0) {
       return {
@@ -1151,18 +1337,6 @@ export class DaytonaKernelAdapter implements
       await sandbox.fs.createFolder(path, "700").catch(() => undefined);
       await sandbox.fs.setFilePermissions(path, { owner: "root", group: "root", mode: "700" });
     }
-  }
-
-  async #putImmutableRequest(sandbox: Sandbox, path: string, content: string): Promise<void> {
-    const existing = await downloadUtf8(sandbox, path);
-    if (existing !== null) {
-      if (existing !== content) throw new Error("Daytona action request path contains different sealed bytes");
-      return;
-    }
-    await sandbox.fs.uploadFile(Buffer.from(content), path);
-    await sandbox.fs.setFilePermissions(path, { owner: "root", group: "root", mode: "400" });
-    const reread = await downloadUtf8(sandbox, path);
-    if (reread !== content) throw new Error("Daytona action request failed exact upload verification");
   }
 
   async #materializeInputSubject(
@@ -1454,7 +1628,23 @@ export class DaytonaKernelAdapter implements
     try {
       const paths = integrationPaths(intent.id, dispatchFence.lease_id);
       const raw = await downloadUtf8(sandbox, paths.result);
-      if (raw === null) return { kind: "not_found" };
+      if (raw === null) {
+        const prepared = await this.#readExactIntegrationFence(
+          sandbox,
+          paths.prepared,
+          integrationPreparedFenceBytes(intent, authority, dispatchFence),
+          "prepared",
+        );
+        if (prepared === "missing") return { kind: "not_found" };
+        const sessionId = `kernel-effect-${safeTransportId(intent.id, "kernel effect ID")}`;
+        const launch = await this.#readExactIntegrationFence(
+          sandbox,
+          paths.launch,
+          integrationLaunchFenceBytes(intent, authority, dispatchFence, sessionId),
+          "launch",
+        );
+        return launch === "missing" ? { kind: "dispatch_not_started" } : { kind: "not_found" };
+      }
       const result = parseIntegrationResult({ raw, intent, authority, dispatch_fence: dispatchFence });
       if (result.state !== "integrated") {
         return {
@@ -1543,20 +1733,42 @@ export class DaytonaKernelAdapter implements
     }
   }
 
-  async #dispatchIntegration(
+  async #readExactIntegrationFence(
+    sandbox: Sandbox,
+    path: string,
+    expected: Buffer,
+    label: "prepared" | "launch",
+  ): Promise<"exact" | "missing"> {
+    const observed = await downloadBytes(sandbox, path);
+    if (observed === null) return "missing";
+    if (!observed.equals(expected)) {
+      throw new Error(`Daytona integration ${label} fence changed its exact sealed identity`);
+    }
+    return "exact";
+  }
+
+  async #prepareIntegrationDispatch(
     intent: Readonly<EffectIntent>,
     dispatchFence: { lease_id: string; worker_id: string } | null,
   ): Promise<void> {
-    if (dispatchFence === null) throw new Error("integration dispatch has no durable executor fence");
+    if (dispatchFence === null) throw new Error("integration preparation has no proposed executor fence");
     const authority = integrationPayload(intent);
     const sandbox = await this.#integrationSandbox(authority);
     if (!sandbox) throw new Error("integration runtime sandbox is absent");
     await ensureActive(sandbox);
     const paths = integrationPaths(intent.id, dispatchFence.lease_id);
+    const preparedBytes = integrationPreparedFenceBytes(intent, authority, dispatchFence);
+    if (await this.#readExactIntegrationFence(
+      sandbox,
+      paths.prepared,
+      preparedBytes,
+      "prepared",
+    ) === "exact") return;
     for (const path of [
       OPENTHROTTLE_ROOT,
       INTEGRATION_INPUT_DIR,
       INTEGRATION_RESULT_DIR,
+      INTEGRATION_ARTIFACT_DIR,
       paths.input_effect_directory,
       paths.input_directory,
       paths.result_effect_directory,
@@ -1574,44 +1786,196 @@ export class DaytonaKernelAdapter implements
       authority.checkpoint_base_subject,
       authority.candidate_input_subject,
     );
-    const artifactPath = `${paths.input_directory}/${authority.candidate_artifact.file}`;
-    const existingArtifact = await downloadBytes(sandbox, artifactPath);
-    if (existingArtifact === null) {
-      await sandbox.fs.uploadFile(candidateBytes, artifactPath);
-      await sandbox.fs.setFilePermissions(artifactPath, { owner: "root", group: "root", mode: "400" });
-    } else if (
-      createHash("sha256").update(existingArtifact).digest("hex") !== authority.candidate_blob.digest
-    ) {
-      throw new Error("integration candidate path contains different immutable bytes");
-    }
-    const request = {
-      schema: "openthrottle.kernel-integration-request/v1",
-      pipeline_run_id: intent.pipeline_run_id,
-      effect_id: intent.id,
-      idempotency_key: intent.idempotency_key,
-      lease_id: dispatchFence.lease_id,
-      worker_id: dispatchFence.worker_id,
-      definition_bundle_hash: authority.definition_bundle_hash,
-      checkpoint_base_subject: authority.checkpoint_base_subject,
-      current_subject: authority.current_subject,
-      candidate_checkpoint_id: authority.candidate_checkpoint_id,
-      candidate_input_subject: authority.candidate_input_subject,
-      candidate_output_subject: authority.candidate_output_subject,
-      candidate_artifact: authority.candidate_artifact,
-    } as const;
-    await this.#putImmutableRequest(sandbox, paths.input, `${JSON.stringify(request)}\n`);
+    const cachedArtifactPath = `${INTEGRATION_ARTIFACT_DIR}/${authority.candidate_blob.digest}.bundle`;
+    await putImmutableBytes(sandbox, cachedArtifactPath, candidateBytes, "integration candidate cache");
+    await linkImmutableBytes(
+      sandbox,
+      cachedArtifactPath,
+      `${paths.input_directory}/${authority.candidate_artifact.file}`,
+      candidateBytes,
+      "integration candidate",
+    );
+    await this.#materializeIntegrationCurrentAncestry(sandbox, authority);
+    const requestBytes = integrationRequestBytes(intent, authority, dispatchFence);
+    await putImmutableBytes(sandbox, paths.input, requestBytes, "Daytona action request");
     await sandbox.updateEnv({
       OT_INTEGRATION_REQUEST_FILE: paths.input,
       OT_INTEGRATION_RESULT_FILE: paths.result,
     }, { unset: [...INTEGRATION_CREDENTIAL_SCRUB, ...ACTION_ENV_FAMILY] });
+    await putImmutableBytes(
+      sandbox,
+      paths.prepared,
+      preparedBytes,
+      "integration prepared fence",
+    );
+  }
+
+  async #dispatchIntegration(
+    intent: Readonly<EffectIntent>,
+    dispatchFence: { lease_id: string; worker_id: string } | null,
+  ): Promise<void> {
+    if (dispatchFence === null) throw new Error("integration dispatch has no durable executor fence");
+    const authority = integrationPayload(intent);
+    const sandbox = await this.#integrationSandbox(authority);
+    if (!sandbox) throw new Error("integration runtime sandbox is absent");
+    await ensureActive(sandbox);
+    const paths = integrationPaths(intent.id, dispatchFence.lease_id);
+    const prepared = await this.#readExactIntegrationFence(
+      sandbox,
+      paths.prepared,
+      integrationPreparedFenceBytes(intent, authority, dispatchFence),
+      "prepared",
+    );
+    if (prepared === "missing") {
+      throw new Error("Daytona integration dispatch has no exact PREPARED fence");
+    }
     const sessionId = `kernel-effect-${safeTransportId(intent.id, "kernel effect ID")}`;
-    await sandbox.process.createSession(sessionId).catch(() => undefined);
+    const launchBytes = integrationLaunchFenceBytes(intent, authority, dispatchFence, sessionId);
+    const launch = await this.#readExactIntegrationFence(
+      sandbox,
+      paths.launch,
+      launchBytes,
+      "launch",
+    );
+    if (launch === "exact") return;
+    await putImmutableBytes(
+      sandbox,
+      paths.launch_stage,
+      launchBytes,
+      "integration staged launch fence",
+    );
+    try {
+      await sandbox.process.createSession(sessionId);
+    } catch (createError) {
+      try {
+        await sandbox.process.getSession(sessionId);
+      } catch {
+        throw createError;
+      }
+    }
     await sandbox.process.executeSessionCommand(sessionId, {
-      command: `flock --nonblock ${shellQuote(paths.lock)} sh -c ` +
-        shellQuote(`test -f ${shellQuote(paths.result)} || exec /opt/openthrottle/entrypoint.sh`),
+      command: `sh -c ${shellQuote([
+        "if ln -- \"$1\" \"$2\"; then",
+        "  test -f \"$3\" || exec /opt/openthrottle/entrypoint.sh",
+        "  exit 0",
+        "fi",
+        "cmp -s -- \"$1\" \"$2\"",
+      ].join("\n"))} integration-launch ${shellQuote(paths.launch_stage)} ` +
+        `${shellQuote(paths.launch)} ${shellQuote(paths.result)}`,
       runAsync: true,
       suppressInputEcho: true,
     }, this.#options.task_timeout_seconds);
+  }
+
+  async #materializeIntegrationCurrentAncestry(
+    sandbox: Sandbox,
+    authority: DaytonaIntegrationPayload,
+  ): Promise<void> {
+    if (authority.current_ancestry.length === 0) return;
+    await assertDaytonaRepositorySourceFence(sandbox);
+    for (const [index, edge] of authority.current_ancestry.entries()) {
+      const alreadyMaterialized = await sandbox.process.executeCommand(
+        `${DAYTONA_EXECUTOR_GIT} rev-parse ${shellQuote(`${edge.output_subject}^{commit}`)}`,
+        DAYTONA_REPOSITORY_ROOT,
+        { GIT_TERMINAL_PROMPT: "0" },
+        120,
+      );
+      if (alreadyMaterialized.exitCode === 0) {
+        if (alreadyMaterialized.result.trim() !== edge.output_subject) {
+          throw new Error(
+            `Daytona integration current ancestry[${index}] resolved a conflicting output commit`,
+          );
+        }
+        continue;
+      }
+      const bytes = this.#options.blob_store.read(edge.checkpoint_blob);
+      inspectCheckpointBundle(
+        bytes,
+        edge.checkpoint_artifact,
+        edge.input_subject,
+        edge.input_subject,
+      );
+      const bundlePath = `${INTEGRATION_ARTIFACT_DIR}/${edge.checkpoint_blob.digest}.bundle`;
+      const shallowPath =
+        `${INTEGRATION_ARTIFACT_DIR}/${edge.checkpoint_blob.digest}-${edge.input_subject}.shallow`;
+      await putImmutableBytes(
+        sandbox,
+        bundlePath,
+        bytes,
+        `integration current ancestry[${index}]`,
+      );
+      await putImmutableBytes(
+        sandbox,
+        shallowPath,
+        Buffer.from(`${edge.input_subject}\n`),
+        `integration current ancestry[${index}] shallow boundary`,
+      );
+      const gitEnvironment = {
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_SHALLOW_FILE: shallowPath,
+      };
+      const exactInput = await sandbox.process.executeCommand(
+        `${DAYTONA_EXECUTOR_GIT} rev-parse ${shellQuote(`${edge.input_subject}^{commit}`)}`,
+        DAYTONA_REPOSITORY_ROOT,
+        gitEnvironment,
+        120,
+      );
+      if (exactInput.exitCode !== 0 || exactInput.result.trim() !== edge.input_subject) {
+        throw new Error(
+          `Daytona integration current ancestry[${index}] is missing its exact input commit`,
+        );
+      }
+      const listed = await sandbox.process.executeCommand(
+        `${DAYTONA_EXECUTOR_GIT} bundle list-heads ${shellQuote(bundlePath)}`,
+        DAYTONA_REPOSITORY_ROOT,
+        gitEnvironment,
+        120,
+      );
+      if (listed.exitCode !== 0) {
+        throw new Error(`Daytona could not inspect integration current ancestry[${index}]`);
+      }
+      const heads = listed.result.trim().split("\n").filter(Boolean);
+      if (heads.length !== 1) {
+        throw new Error("integration current ancestry bundle must advertise exactly one head");
+      }
+      const [commit, ref, ...extra] = heads[0]!.trim().split(/\s+/);
+      if (
+        extra.length !== 0 || commit !== edge.output_subject ||
+        ref !== edge.checkpoint_artifact.ref
+      ) {
+        throw new Error("integration current ancestry bundle changed its exact sealed ref");
+      }
+      const verified = await sandbox.process.executeCommand(
+        `${DAYTONA_EXECUTOR_GIT} bundle verify ${shellQuote(bundlePath)}`,
+        DAYTONA_REPOSITORY_ROOT,
+        gitEnvironment,
+        120,
+      );
+      if (verified.exitCode !== 0) {
+        throw new Error(`Daytona could not verify integration current ancestry[${index}]`);
+      }
+      const imported = await sandbox.process.executeCommand(
+        `${DAYTONA_EXECUTOR_GIT} fetch --quiet --no-tags ${shellQuote(bundlePath)} ` +
+          shellQuote(edge.checkpoint_artifact.ref),
+        DAYTONA_REPOSITORY_ROOT,
+        gitEnvironment,
+        120,
+      );
+      if (imported.exitCode !== 0) {
+        throw new Error(`Daytona could not import integration current ancestry[${index}]`);
+      }
+      const materialized = await sandbox.process.executeCommand(
+        `${DAYTONA_EXECUTOR_GIT} rev-parse ${shellQuote(`${edge.output_subject}^{commit}`)}`,
+        DAYTONA_REPOSITORY_ROOT,
+        gitEnvironment,
+        120,
+      );
+      if (materialized.exitCode !== 0 || materialized.result.trim() !== edge.output_subject) {
+        throw new Error(
+          `Daytona integration current ancestry[${index}] did not materialize its exact commit`,
+        );
+      }
+    }
   }
 
   async #matchingSandboxes(identity: string): Promise<Sandbox[]> {

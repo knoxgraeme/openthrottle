@@ -41,6 +41,7 @@ import {
   type KernelAttempt,
   type KernelRun,
 } from "../pipeline/kernel/types.js";
+import { KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES } from "../runtime/kernel-wire.js";
 import type { OrdinaryKernelSettlementPlanner } from "../pipeline/kernel/ordinary-coordinator.js";
 import {
   KernelStructuredSettlementPlanner,
@@ -744,6 +745,7 @@ describe("KernelStructuredSettlementPlanner", () => {
       index: number,
       outputSubject: string,
       additionalInputRecords: readonly ExecutionRecord[] = [],
+      candidateInputSubject = SOURCE,
     ) => {
       const candidate: AttemptCheckpoint = {
         schema: ATTEMPT_CHECKPOINT_SCHEMA,
@@ -752,7 +754,7 @@ describe("KernelStructuredSettlementPlanner", () => {
         attempt_id: `attempt-edit-${memberId}`,
         request_hash: String(index + 5).repeat(64),
         definition_bundle_hash: DEFINITIONS.manifest.definition_bundle_hash,
-        input_subject: SOURCE,
+        input_subject: candidateInputSubject,
         output_subject: outputSubject,
         native_session_id: `session-edit-${memberId}`,
         payload_schema: "openthrottle.git-checkpoint-bundle/v1",
@@ -797,6 +799,7 @@ describe("KernelStructuredSettlementPlanner", () => {
       2,
       "6".repeat(40),
       [earlierSiblingCorrection],
+      "7".repeat(40),
     );
     const integratedA = "4".repeat(40);
     const integratedB = "5".repeat(40);
@@ -908,6 +911,64 @@ describe("KernelStructuredSettlementPlanner", () => {
     ].sort());
     expect(settlement.next_attempts[0]!.context_record_ids)
       .toContain(earlierSiblingCorrection.id);
+
+    const oversizedBytes = KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES / 2 + 1;
+    const blobPayload = (digest: string) => ({ blob: {
+      algorithm: "sha256" as const,
+      digest,
+      bytes: oversizedBytes,
+      encoding: "binary" as const,
+      media_type: "application/x-git-bundle",
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+    } });
+    const oversizedCandidate = {
+      ...acceptedC.candidate,
+      payload: blobPayload("a".repeat(64)),
+    };
+    const oversizedAcceptedEvidence = {
+      ...acceptedC.evidence,
+      request_inputs: {
+        ...acceptedC.evidence.request_inputs,
+        context: {
+          ...acceptedC.evidence.request_inputs.context,
+          checkpoints: new Map([[oversizedCandidate.id, oversizedCandidate]]),
+        },
+      },
+    };
+    const oversizedCurrentCheckpoint = {
+      ...second.checkpoint,
+      payload: blobPayload("b".repeat(64)),
+    };
+    store.settled = [
+      oversizedAcceptedEvidence,
+      first.evidence,
+      acceptedB.evidence,
+      acceptedA.evidence,
+    ];
+
+    const bounded = await planner.plan({
+      view: view({
+        attempts: [second.attempt],
+        current: second.attempt,
+        current_subject: integratedA,
+      }),
+      stage: selected,
+      attempt: second.attempt,
+      checkpoint: oversizedCurrentCheckpoint,
+      result: second.result,
+      bundle: DEFINITIONS.bundle,
+      schedules: externalSchedules([integrateDelivery, push]),
+      evaluated: {
+        evaluator: "external/core/integrate-unit@1",
+        outcome: "all_integrated",
+        reason: "integrated",
+      },
+      default_plan: vi.fn(async () => { throw new Error("unexpected default plan"); }),
+    });
+
+    expect(bounded).toMatchObject({ outcome: "failure", next_attempts: [] });
+    expect((bounded.decision.payload as { inline: { reason: string } }).inline.reason)
+      .toMatch(/ancestry evidence byte budget/i);
   });
 
   it("turns a lead rejection into a distinct unbound edit Attempt with exact prior evidence", async () => {

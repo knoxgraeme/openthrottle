@@ -381,11 +381,29 @@ export function inspectKernelIntegrationBundle(input: {
       ancestryRefs.add(edge.descriptor.ref);
       ancestryCommits.add(edge.descriptor.commit);
     }
-    const currentAncestry = input.current_ancestry.length === 0
+    const currentAncestryStarts = [...new Set(
+      input.current_ancestry
+        .filter((edge) => !ancestryCommits.has(edge.input_subject))
+        .map((edge) => edge.input_subject),
+    )];
+    if (input.current_ancestry.length > 0 && currentAncestryStarts.length !== 1) {
+      throw new Error("integration current ancestry proof must contain one connected start");
+    }
+    const currentAncestryStart = currentAncestryStarts[0];
+    if (
+      currentAncestryStart !== undefined &&
+      currentAncestryStart !== input.candidate_input_subject &&
+      currentAncestryStart !== input.checkpoint_base_subject
+    ) {
+      throw new Error(
+        "integration current ancestry proof must start at the candidate input or checkpoint base",
+      );
+    }
+    const currentAncestry = currentAncestryStart === undefined
       ? []
       : validateKernelCheckpointAncestryChain({
         entries: input.current_ancestry,
-        start_subject: input.candidate_input_subject,
+        start_subject: currentAncestryStart,
         end_subject: input.current_subject,
         label: "integration current ancestry proof",
       });
@@ -413,6 +431,11 @@ export function inspectKernelIntegrationBundle(input: {
       input.current_subject,
       input.candidate_input_subject,
     );
+    const candidateInputIsCurrentAncestor = !currentIsDirect && currentExists && isAncestor(
+      repository,
+      input.candidate_input_subject,
+      input.current_subject,
+    );
     const currentIsDirectOrCandidateAncestor = currentIsDirect || currentIsCandidateAncestor;
     if (currentIsDirectOrCandidateAncestor && currentAncestry.length > 0) {
       throw new Error("integration current ancestry proof contains unnecessary extra edges");
@@ -422,6 +445,23 @@ export function inspectKernelIntegrationBundle(input: {
     }
     if (!currentExists) {
       throw new Error("integration current ancestry proof did not materialize its sealed current subject");
+    }
+    if (!isAncestor(repository, input.checkpoint_base_subject, input.current_subject)) {
+      throw new Error("integration current does not descend from its sealed checkpoint base");
+    }
+    if (
+      currentAncestry.length > 0 &&
+      candidateInputIsCurrentAncestor &&
+      currentAncestryStart !== input.candidate_input_subject
+    ) {
+      throw new Error("integration current ancestry suffix must start at the candidate input");
+    }
+    if (
+      currentAncestry.length > 0 &&
+      !candidateInputIsCurrentAncestor &&
+      currentAncestryStart !== input.checkpoint_base_subject
+    ) {
+      throw new Error("integration sibling current ancestry proof must start at the checkpoint base");
     }
 
     seedShallowBoundaries(repository, [
@@ -469,10 +509,13 @@ export function inspectKernelIntegrationBundle(input: {
     } else {
       // The output bundle is shallow at current_subject, so it intentionally
       // cannot re-prove ancestry behind that safe parent. Recompute the exact
-      // three-tree merge from the sealed candidate input/current/candidate
-      // trees; the runtime source fence separately proved source ancestry
-      // before authoring these bytes.
-      const baseTree = git(repository, ["rev-parse", `${input.candidate_input_subject}^{tree}`]);
+      // three-tree merge from the sealed current and candidate trees. A
+      // candidate-input suffix retains that exact merge base; divergent unit
+      // branches meet only at the stable checkpoint base.
+      const mergeBaseSubject = candidateInputIsCurrentAncestor
+        ? input.candidate_input_subject
+        : input.checkpoint_base_subject;
+      const baseTree = git(repository, ["rev-parse", `${mergeBaseSubject}^{tree}`]);
       expectedTree = recomputeMergeTree(repository, baseTree, currentTree, candidate.tree);
       expectedCommit = syntheticCommit(
         repository,

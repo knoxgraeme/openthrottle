@@ -121,6 +121,78 @@ function staleIntegrationFixture(linkCount = 1) {
   };
 }
 
+function branchedIntegrationFixture(currentStartsAtCandidateInput = false) {
+  const work = repository();
+  const base = commit(work, "base\n", "base");
+  execFileSync("git", ["switch", "-q", "-c", "candidate"], { cwd: work });
+  writeFileSync(join(work, "candidate-private.txt"), "private stage\n");
+  execFileSync("git", ["add", "candidate-private.txt"], { cwd: work });
+  execFileSync("git", ["commit", "-qm", "candidate private stage"], { cwd: work });
+  const candidateInput = git(work, ["rev-parse", "HEAD"]);
+  writeFileSync(join(work, "candidate-final.txt"), "final stage\n");
+  execFileSync("git", ["add", "candidate-final.txt"], { cwd: work });
+  execFileSync("git", ["commit", "-qm", "candidate final stage"], { cwd: work });
+  const candidate = git(work, ["rev-parse", "HEAD"]);
+  const candidateTree = git(work, ["rev-parse", "HEAD^{tree}"]);
+
+  if (currentStartsAtCandidateInput) {
+    execFileSync("git", ["switch", "-q", "-c", "current", candidateInput], { cwd: work });
+  } else {
+    execFileSync("git", ["switch", "-q", "main"], { cwd: work });
+  }
+  const currentStart = currentStartsAtCandidateInput ? candidateInput : base;
+  const currentSubjects: string[] = [];
+  const currentTrees: string[] = [];
+  for (let index = 0; index < 2; index += 1) {
+    const path = `current-${index + 1}.txt`;
+    writeFileSync(join(work, path), `current stage ${index + 1}\n`);
+    execFileSync("git", ["add", path], { cwd: work });
+    execFileSync("git", ["commit", "-qm", `current stage ${index + 1}`], { cwd: work });
+    currentSubjects.push(git(work, ["rev-parse", "HEAD"]));
+    currentTrees.push(git(work, ["rev-parse", "HEAD^{tree}"]));
+  }
+  const current = currentSubjects.at(-1)!;
+  const mergedTree = git(work, ["merge-tree", "--write-tree", current, candidate])
+    .split(/\s+/)[0]!;
+  const output = commitTree(work, mergedTree, [current]);
+  const candidateRef = `refs/openthrottle/checkpoints/${"a".repeat(64)}`;
+  const outputRef = `refs/openthrottle/integrations/${"b".repeat(64)}`;
+  execFileSync("git", ["update-ref", candidateRef, candidate], { cwd: work });
+  execFileSync("git", ["update-ref", outputRef, output], { cwd: work });
+  const candidateBytes = bundle(work, candidateRef, base, "sibling-candidate");
+  const currentAncestry = currentSubjects.map((subject, index) => {
+    const ref = `refs/openthrottle/integrations/${String(index + 6).repeat(64)}`;
+    execFileSync("git", ["update-ref", ref, subject], { cwd: work });
+    return {
+      checkpoint_id: `checkpoint-sibling-current-${index + 1}`,
+      bytes: bundle(
+        work,
+        ref,
+        index === 0 ? currentStart : currentSubjects[index - 1]!,
+        `sibling-current-${index + 1}`,
+      ),
+      descriptor: { ref, commit: subject, tree: currentTrees[index]! },
+      input_subject: index === 0 ? currentStart : currentSubjects[index - 1]!,
+      output_subject: subject,
+    };
+  });
+  return {
+    work,
+    base,
+    current,
+    candidateInput,
+    candidate,
+    candidateTree,
+    candidateRef,
+    output,
+    mergedTree,
+    outputRef,
+    candidateBytes,
+    currentAncestry,
+    outputBytes: bundle(work, outputRef, current, "sibling-output"),
+  };
+}
+
 function unprovenCurrentFixture(kind: "divergent" | "orphan") {
   const work = repository();
   const source = commit(work, "source\n", "source");
@@ -322,6 +394,95 @@ exec ${JSON.stringify(realGit)} "$@"
       candidate_output_subject: value.candidate,
       current_ancestry: value.currentAncestry,
     })).toMatchObject({ commit: value.output, tree: value.mergedTree, parents: [value.current] });
+  });
+
+  it("recomputes sibling integration from the sealed checkpoint base and full current proof", () => {
+    const value = branchedIntegrationFixture();
+    expect(git(value.work, ["ls-tree", "-r", "--name-only", value.mergedTree]).split("\n"))
+      .toEqual(expect.arrayContaining([
+        "candidate-private.txt",
+        "candidate-final.txt",
+        "current-1.txt",
+        "current-2.txt",
+      ]));
+
+    expect(inspectKernelIntegrationBundle({
+      bytes: value.outputBytes,
+      descriptor: { ref: value.outputRef, commit: value.output, tree: value.mergedTree },
+      checkpoint_base_subject: value.base,
+      current_subject: value.current,
+      candidate_bytes: value.candidateBytes,
+      candidate_descriptor: {
+        ref: value.candidateRef,
+        commit: value.candidate,
+        tree: value.candidateTree,
+      },
+      candidate_input_subject: value.candidateInput,
+      candidate_output_subject: value.candidate,
+      current_ancestry: value.currentAncestry,
+    })).toMatchObject({ commit: value.output, tree: value.mergedTree, parents: [value.current] });
+  });
+
+  it("retains the candidate input as merge base when current descends from it", () => {
+    const value = branchedIntegrationFixture(true);
+    expect(value.currentAncestry[0]!.input_subject).toBe(value.candidateInput);
+
+    expect(inspectKernelIntegrationBundle({
+      bytes: value.outputBytes,
+      descriptor: { ref: value.outputRef, commit: value.output, tree: value.mergedTree },
+      checkpoint_base_subject: value.base,
+      current_subject: value.current,
+      candidate_bytes: value.candidateBytes,
+      candidate_descriptor: {
+        ref: value.candidateRef,
+        commit: value.candidate,
+        tree: value.candidateTree,
+      },
+      candidate_input_subject: value.candidateInput,
+      candidate_output_subject: value.candidate,
+      current_ancestry: value.currentAncestry,
+    })).toMatchObject({ commit: value.output, tree: value.mergedTree, parents: [value.current] });
+  });
+
+  it("rejects a sibling current ancestry suffix that starts after the checkpoint base", () => {
+    const value = branchedIntegrationFixture();
+    expect(() => inspectKernelIntegrationBundle({
+      bytes: value.outputBytes,
+      descriptor: { ref: value.outputRef, commit: value.output, tree: value.mergedTree },
+      checkpoint_base_subject: value.base,
+      current_subject: value.current,
+      candidate_bytes: value.candidateBytes,
+      candidate_descriptor: {
+        ref: value.candidateRef,
+        commit: value.candidate,
+        tree: value.candidateTree,
+      },
+      candidate_input_subject: value.candidateInput,
+      candidate_output_subject: value.candidate,
+      current_ancestry: value.currentAncestry.slice(1),
+    })).toThrow(/ancestry|start/i);
+  });
+
+  it("rejects a forked sibling current ancestry proof", () => {
+    const value = branchedIntegrationFixture();
+    expect(() => inspectKernelIntegrationBundle({
+      bytes: value.outputBytes,
+      descriptor: { ref: value.outputRef, commit: value.output, tree: value.mergedTree },
+      checkpoint_base_subject: value.base,
+      current_subject: value.current,
+      candidate_bytes: value.candidateBytes,
+      candidate_descriptor: {
+        ref: value.candidateRef,
+        commit: value.candidate,
+        tree: value.candidateTree,
+      },
+      candidate_input_subject: value.candidateInput,
+      candidate_output_subject: value.candidate,
+      current_ancestry: [
+        value.currentAncestry[0]!,
+        { ...value.currentAncestry[1]!, input_subject: value.base },
+      ],
+    })).toThrow(/fork/i);
   });
 
   it("accepts a later-run identity candidate with its real ancestry intact", () => {

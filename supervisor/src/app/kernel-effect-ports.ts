@@ -5,6 +5,7 @@ export type KernelEffectIdempotencyStrategy = "provider_native" | "deterministic
 export type KernelEffectProviderObservation =
   | { kind: "found"; status: "confirmed" | "rejected"; payload: JsonValue }
   | { kind: "not_found" }
+  | { kind: "dispatch_not_started" }
   | { kind: "retry"; detail: string; continuation: JsonValue }
   | { kind: "unknown"; detail: string };
 
@@ -31,6 +32,12 @@ export interface KernelEffectDispatchRequest extends KernelEffectReconciliationR
 
 export interface KernelEffectRuntimeAdapter {
   reconcile(input: KernelEffectReconciliationRequest): Promise<KernelEffectProviderObservation>;
+  /**
+   * Performs idempotent provider preparation without crossing the external
+   * mutation entrypoint. Preparation completes before the durable dispatch
+   * fence is written, so a failure remains safe to retry under a new lease.
+   */
+  prepareDispatch?(input: KernelEffectDispatchRequest): Promise<void>;
   dispatch(input: KernelEffectDispatchRequest): Promise<void>;
 }
 

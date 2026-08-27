@@ -21,7 +21,7 @@ import {
   inspectKernelCheckpointBundleAdvertisement,
   isCompatibleOrdinaryCheckpointRef,
 } from "../runtime/kernel-checkpoint-bundle.js";
-import { KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES } from "../runtime/kernel-wire.js";
+import { addKernelIntegrationEvidenceBytes } from "../runtime/kernel-wire.js";
 import {
   admissionPlannerEvidence,
   approvedAdmissionReviewEvidence,
@@ -251,10 +251,11 @@ function exactIntegrationCheckpointContext(input: {
   });
   let aggregateBundleBytes = 0;
   for (const { pointer } of sealedCheckpoints) {
-    if (pointer.bytes > KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES - aggregateBundleBytes) {
+    const next = addKernelIntegrationEvidenceBytes(aggregateBundleBytes, pointer.bytes);
+    if (next === null) {
       throw new Error("unit integration exceeds the aggregate sealed bundle byte ceiling");
     }
-    aggregateBundleBytes += pointer.bytes;
+    aggregateBundleBytes = next;
   }
   const candidates: { checkpoint: AttemptCheckpoint; bytes: Uint8Array }[] = [];
   const proofCheckpoints: { checkpoint: AttemptCheckpoint; bytes: Uint8Array }[] = [];
@@ -281,14 +282,26 @@ function exactIntegrationCheckpointContext(input: {
     candidate,
     input.checkpoint_base_subject,
     {
-      ...(proofCheckpoints.length === 0 &&
-          candidate.input_subject !== input.current_subject &&
-          candidate.output_subject !== input.current_subject
-        ? { required_ancestry: { ancestor: input.current_subject, descendant: candidate.input_subject } }
-        : {}),
+      required_ancestry: {
+        ancestor: input.checkpoint_base_subject,
+        descendant: candidate.input_subject,
+      },
       sealed_bytes: candidates[0]!.bytes,
     },
   );
+  if (
+    proofCheckpoints.length === 0 &&
+    candidate.input_subject !== input.current_subject &&
+    candidate.output_subject !== input.current_subject
+  ) {
+    descriptor(input.blobs, candidate, input.checkpoint_base_subject, {
+      required_ancestry: {
+        ancestor: input.current_subject,
+        descendant: candidate.input_subject,
+      },
+      sealed_bytes: candidates[0]!.bytes,
+    });
+  }
   if (!candidateArtifact.ref.startsWith("refs/openthrottle/checkpoints/")) {
     throw new Error("unit integration candidate is not an ordinary checkpoint ref");
   }
@@ -310,11 +323,17 @@ function exactIntegrationCheckpointContext(input: {
       checkpoint_artifact: checkpointArtifact,
     };
   });
+  const candidateInputIsOnCurrentAncestry =
+    candidate.input_subject === input.current_subject ||
+    proof.some(({ input_subject: subject }) => subject === candidate.input_subject);
+  const currentAncestryStartSubject = candidateInputIsOnCurrentAncestry
+    ? candidate.input_subject
+    : input.checkpoint_base_subject;
   const ordered = proof.length === 0
     ? []
     : validateKernelCheckpointAncestryChain({
       entries: proof,
-      start_subject: candidate.input_subject,
+      start_subject: currentAncestryStartSubject,
       end_subject: input.current_subject,
       label: "unit integration current ancestry",
     });

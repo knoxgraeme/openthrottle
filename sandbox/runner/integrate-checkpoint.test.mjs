@@ -204,6 +204,63 @@ describe("executor checkpoint integration", () => {
     })).toThrow("integration replay worker_id mismatch");
   });
 
+  it("integrates every stage of a candidate whose input and current are sibling branches", () => {
+    const first = fixture({
+      advanceCurrent: null,
+      editCandidate(destination) {
+        writeFileSync(join(destination, "candidate-private.txt"), "private stage\n");
+      },
+    });
+    shallowGit(
+      first.repo,
+      first.base,
+      "fetch", "--quiet",
+      join(first.action, first.checkpoint.payload_artifact.file),
+      first.checkpoint.payload_artifact.ref,
+    );
+
+    const action = mkdtempSync(join(tmpdir(), "ot-integrate-sibling-candidate-"));
+    const view = materializeActionRepository({
+      sourceRepoDir: first.repo,
+      inputSubject: first.checkpoint.output_subject,
+      repositoryAuthority: "edit",
+      destination: join(action, "repository"),
+    });
+    writeFileSync(join(view.destination, "candidate-final.txt"), "final stage\n");
+    const verification = verifyActionRepository(view);
+    const checkpoint = createAttemptCheckpoint({
+      request: {
+        pipeline_run_id: "run-1", attempt_id: "attempt-sibling", lease_id: "lease-sibling",
+        request_hash: "9".repeat(64), definition_bundle_hash: "b".repeat(64),
+        checkpoint_base_subject: first.base,
+        input_subject: first.checkpoint.output_subject,
+      },
+      repository: view,
+      verification,
+      outputSubject: verification.output_subject,
+      nativeSessionId: "session-sibling",
+      artifactDirectory: action,
+    });
+
+    writeFileSync(join(first.repo, "current.txt"), "current branch\n");
+    commitAll(first.repo, "advance sibling current");
+    const value = {
+      ...first,
+      current: git(first.repo, "rev-parse", "HEAD"),
+      action,
+      checkpoint,
+    };
+
+    const execution = integrate(value, "sibling");
+    expect(execution.result.state, execution.result.reason).toBe("integrated");
+    const restored = restoreIntegrated(execution);
+    expect(git(restored, "rev-list", "--parents", "-n", "1", execution.result.output_subject).split(" "))
+      .toEqual([execution.result.output_subject, value.current]);
+    expect(readFileSync(join(restored, "candidate-private.txt"), "utf8")).toBe("private stage\n");
+    expect(readFileSync(join(restored, "candidate-final.txt"), "utf8")).toBe("final stage\n");
+    expect(readFileSync(join(restored, "current.txt"), "utf8")).toBe("current branch\n");
+  }, 15_000);
+
   it("executes at the exact idempotency-key length boundary", () => {
     const value = fixture();
     const maximum = integrationFixture(value, "maximum-idempotency-key");
