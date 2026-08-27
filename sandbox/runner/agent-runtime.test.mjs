@@ -161,6 +161,30 @@ describe("streaming agent launch", () => {
     expect(Object.keys(thrown)).not.toContain("retryableInfrastructureFailure");
   });
 
+  it("does not leak an unhandled EPIPE when a provider closes stdin after completing", async () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = new EventEmitter();
+    child.stdin.end = () => {
+      queueMicrotask(() => {
+        child.stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+        child.emit("close", 0, null);
+      });
+    };
+    child.pid = 12_345;
+
+    await expect(runStreamingAgent({
+      engine: "fixture-engine",
+      args: [],
+      cwd: tmpdir(),
+      prompt: "fixture prompt",
+      environment: {},
+      timeoutMs: 100,
+      spawnProcess: () => child,
+    })).resolves.toMatchObject({ status: 0, signal: null, timedOut: false });
+  });
+
   it("does not mark deterministic session callback failures retryable", async () => {
     const failure = new Error("native session evidence conflict");
     const child = new EventEmitter();

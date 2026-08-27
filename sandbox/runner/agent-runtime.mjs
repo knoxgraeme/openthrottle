@@ -376,6 +376,10 @@ export async function runStreamingAgent({
           : { providerFinalOutputFallback: providerFinalCapture.end() }),
       });
     });
+    // A provider may finish and close its input before Node flushes the prompt.
+    // Its exit status and sealed output channels still determine the result;
+    // prevent the resulting EPIPE from escaping as an unhandled stream error.
+    child.stdin.on?.("error", () => {});
     child.stdin.end(prompt);
   });
 }
