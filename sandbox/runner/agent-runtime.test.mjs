@@ -1,5 +1,14 @@
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,8 +16,14 @@ import { canonicalJson, digest } from "./kernel-json.mjs";
 import {
   prepareAgentRuntime,
   prepareResultCorrectionRuntime,
+  runPreparedAgent,
+  runResultCorrection,
   runStreamingAgent,
 } from "./agent-runtime.mjs";
+import {
+  extractProviderFinalOutput,
+  extractProviderResultCandidate,
+} from "./result-submission.mjs";
 
 const directories = [];
 const LEASE_GENERATION_FENCE = "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.json";
@@ -27,6 +42,89 @@ afterEach(() => {
 });
 
 describe("streaming agent launch", () => {
+  it("keeps truncated stdout within the provider fallback extraction limit", async () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { end() {} };
+    child.pid = 12_345;
+    const final = canonicalJson({
+      schema: "openthrottle.result-candidate/v1",
+      outcome: "success",
+      payload: { summary: "current action", verification: ["current proof"] },
+    });
+    const event = JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: final },
+    });
+    const spawnProcess = () => {
+      queueMicrotask(() => {
+        child.stdout.emit("data", Buffer.from(`${"🙂".repeat(600_000)}\n${event}\n`));
+        child.emit("close", 0, null);
+      });
+      return child;
+    };
+
+    const result = await runStreamingAgent({
+      engine: "codex",
+      args: [],
+      cwd: tmpdir(),
+      prompt: "fixture prompt",
+      environment: {},
+      timeoutMs: 100,
+      spawnProcess,
+    });
+
+    expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThanOrEqual(2 * 1024 * 1024);
+    expect(extractProviderFinalOutput(result.stdout, "codex")).toBe(final);
+    expect(result.providerFinalOutputFallback).toBe(final);
+  });
+
+  it("does not resurrect an earlier Codex result when a split oversized final event is truncated", async () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { end() {} };
+    child.pid = 12_345;
+    const prior = canonicalJson({
+      schema: "openthrottle.result-candidate/v1",
+      outcome: "success",
+      payload: { summary: "prior action", verification: ["prior proof"] },
+    });
+    const priorEvent = JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: prior },
+    });
+    const oversizedCurrentEvent = JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: "x".repeat(2 * 1024 * 1024) },
+    });
+    const transcript = `${priorEvent}\n${oversizedCurrentEvent}\n`;
+    const splitAt = priorEvent.length + 1 + Math.floor(oversizedCurrentEvent.length / 2);
+    const spawnProcess = () => {
+      queueMicrotask(() => {
+        child.stdout.emit("data", Buffer.from(transcript.slice(0, splitAt)));
+        child.stdout.emit("data", Buffer.from(transcript.slice(splitAt)));
+        child.emit("close", 0, null);
+      });
+      return child;
+    };
+
+    const result = await runStreamingAgent({
+      engine: "codex",
+      args: [],
+      cwd: tmpdir(),
+      prompt: "fixture prompt",
+      environment: {},
+      timeoutMs: 100,
+      spawnProcess,
+    });
+
+    expect(result.stdout).toContain("...[agent output omitted]...");
+    expect(extractProviderFinalOutput(result.stdout, "codex")).toBe(prior);
+    expect(result.providerFinalOutputFallback).toBe("");
+  });
+
   it("marks only child-process transport errors as retryable infrastructure failures", async () => {
     const failure = new Error("spawn transport failed");
     const child = new EventEmitter();
@@ -61,6 +159,30 @@ describe("streaming agent launch", () => {
     expect(thrown).toMatchObject({ retryableInfrastructureFailure: true });
     expect(thrown.message).toBe("spawn transport failed");
     expect(Object.keys(thrown)).not.toContain("retryableInfrastructureFailure");
+  });
+
+  it("does not leak an unhandled EPIPE when a provider closes stdin after completing", async () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = new EventEmitter();
+    child.stdin.end = () => {
+      queueMicrotask(() => {
+        child.stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+        child.emit("close", 0, null);
+      });
+    };
+    child.pid = 12_345;
+
+    await expect(runStreamingAgent({
+      engine: "fixture-engine",
+      args: [],
+      cwd: tmpdir(),
+      prompt: "fixture prompt",
+      environment: {},
+      timeoutMs: 100,
+      spawnProcess: () => child,
+    })).resolves.toMatchObject({ status: 0, signal: null, timedOut: false });
   });
 
   it("does not mark deterministic session callback failures retryable", async () => {
@@ -121,6 +243,7 @@ function channel(root) {
     provider_schema_path: join(root, "provider-schema.json"),
     candidate_path: join(root, "candidate.json"),
     rejection_path: join(root, "rejected.json"),
+    provider_final_path: join(root, "provider-final.json"),
   };
   writeFileSync(value.provider_schema_path, "{}\n");
   return value;
@@ -246,6 +369,7 @@ describe("result correction runtime", () => {
 
     expect(prepared.args).toEqual(expect.arrayContaining([
       "--output-schema", join(actionDirectory, "provider-schema.json"),
+      "--output-last-message", join(actionDirectory, "provider-final.json"),
       "--sandbox", "read-only",
       "--disable", "shell_tool",
       "--disable", "unified_exec",
@@ -258,9 +382,140 @@ describe("result correction runtime", () => {
     expect(prepared.args).not.toContain("danger-full-access");
     expect(prepared.args).not.toContain("use_legacy_landlock=true");
   });
+
+  it("removes a stale Codex final before correction and falls back to this invocation's last message", async () => {
+    const actionDirectory = mkdtempSync(join(tmpdir(), "ot-correction-codex-fallback-"));
+    directories.push(actionDirectory);
+    chmodSync(actionDirectory, 0o755);
+    const submissionChannel = channel(actionDirectory);
+    const stale = canonicalJson({
+      schema: "openthrottle.result-candidate/v1",
+      outcome: "success",
+      payload: { summary: "stale work result", verification: ["stale proof"] },
+    });
+    const current = canonicalJson({
+      schema: "openthrottle.result-candidate/v1",
+      outcome: "success",
+      payload: { summary: "corrected current result", verification: ["current proof"] },
+    });
+    writeFileSync(submissionChannel.provider_final_path, stale);
+
+    const fixtureBin = join(actionDirectory, "bin");
+    const cwd = join(actionDirectory, "result-correction-cwd");
+    mkdirSync(fixtureBin, { mode: 0o755 });
+    mkdirSync(cwd, { mode: 0o755 });
+    const fixtureCodex = join(fixtureBin, "codex");
+    const events = [
+      JSON.stringify({ type: "thread.started", thread_id: "native-1" }),
+      JSON.stringify({
+        type: "item.completed",
+        item: { type: "agent_message", text: "Preparing the corrected result." },
+      }),
+      JSON.stringify({
+        type: "item.completed",
+        item: { type: "agent_message", text: current },
+      }),
+    ];
+    writeFileSync(
+      fixtureCodex,
+      `#!/bin/sh\nprintf '%s\\n' '${events.join("' '")}'\n`,
+      { mode: 0o755 },
+    );
+
+    const result = await runResultCorrection({
+      request: correctionRequest("codex"),
+      actionDirectory,
+      channel: submissionChannel,
+      profileRoot: join(actionDirectory, ".codex"),
+      home: join(actionDirectory, "home"),
+      cwd,
+      prompt: "Return the corrected result.",
+      env: {
+        ...runtimeEnv(),
+        PATH: [fixtureBin, process.env.PATH].filter(Boolean).join(":"),
+      },
+      timeoutMs: 1_000,
+    });
+
+    expect(existsSync(submissionChannel.provider_final_path)).toBe(false);
+    expect(result.providerFinalOutputFallback).toBe(current);
+    expect(result.providerFinalOutput).toBe(current);
+    expect(extractProviderResultCandidate(result.providerFinalOutput, "codex")).toMatchObject({
+      status: "candidate",
+      value: { payload: { summary: "corrected current result" } },
+    });
+  });
 });
 
 describe("inspect change context runtime", () => {
+  it.each(["conflicting", "malformed"])(
+    "treats the Codex provider-final file as authoritative over %s stdout",
+    async (stdoutShape) => {
+      const actionDirectory = mkdtempSync(join(tmpdir(), "ot-inspect-runtime-provider-final-"));
+      directories.push(actionDirectory);
+      const artifactDirectory = join(actionDirectory, "inspect-context");
+      const contextDirectory = join(actionDirectory, "action-context");
+      const artifactPath = join(artifactDirectory, "change.json");
+      const actionContextPath = join(contextDirectory, "context.json");
+      mkdirSync(artifactDirectory);
+      mkdirSync(contextDirectory);
+      writeFileSync(artifactPath, "{}\n", { mode: 0o444 });
+      writeFileSync(actionContextPath, "{}\n", { mode: 0o444 });
+      const request = inspectRequest("codex", actionDirectory, artifactPath, actionContextPath);
+      const submissionChannel = channel(actionDirectory);
+      const prepared = prepareAgentRuntime({
+        request,
+        actionDirectory,
+        channel: submissionChannel,
+        env: runtimeEnv(),
+      });
+      const authoritative = {
+        schema: "openthrottle.result-candidate/v1",
+        outcome: "success",
+        payload: { summary: "authoritative final", verification: ["authoritative proof"] },
+      };
+      const conflicting = {
+        schema: "openthrottle.result-candidate/v1",
+        outcome: "success",
+        payload: { summary: "conflicting stdout", verification: ["wrong proof"] },
+      };
+      const event = (text) => JSON.stringify({
+        type: "item.completed",
+        item: { type: "agent_message", text },
+      });
+      const stdout = stdoutShape === "conflicting"
+        ? [event(canonicalJson(authoritative)), event(canonicalJson(conflicting))].join("\n")
+        : event("not a result-candidate JSON object");
+      writeFileSync(prepared.providerFinalPath, canonicalJson(authoritative));
+
+      expect(extractProviderResultCandidate(stdout, "codex").status).toBe("invalid");
+      const result = await runPreparedAgent({
+        prepared,
+        request,
+        channel: submissionChannel,
+        onSession: async () => {},
+        timeoutMs: 100,
+        runStreaming: async () => ({
+          status: 0,
+          signal: null,
+          timedOut: false,
+          nativeSessionId: "native-1",
+          stderr: "",
+          stdout,
+          providerFinalOutputFallback: stdoutShape === "conflicting"
+            ? canonicalJson(conflicting)
+            : "not a result-candidate JSON object",
+        }),
+      });
+
+      expect(result.providerFinalOutput).toBe(canonicalJson(authoritative));
+      expect(extractProviderResultCandidate(result.providerFinalOutput, "codex")).toMatchObject({
+        status: "candidate",
+        value: { payload: { summary: "authoritative final" } },
+      });
+    },
+  );
+
   it("names both executor artifacts in every engine prompt without widening authority", () => {
     const preparedByEngine = new Map();
     const contextRoot = mkdtempSync(join(tmpdir(), "ot-inspect-runtime-context-"));
@@ -298,6 +553,10 @@ describe("inspect change context runtime", () => {
     expect(claude.prepared.args).toEqual(expect.arrayContaining(["--max-turns", "11"]));
     expect(preparedByEngine.get("codex").prepared.args).toEqual(expect.arrayContaining([
       "--ask-for-approval", "never",
+      "--output-last-message", join(
+        preparedByEngine.get("codex").actionDirectory,
+        "provider-final.json",
+      ),
       "--sandbox", "danger-full-access", "--ignore-user-config",
       "--disable", "apps", "--disable", "browser_use",
       "--disable", "in_app_browser", "--disable", "multi_agent",
