@@ -197,7 +197,7 @@ describe("KernelProviderPromptHandler", () => {
       kind: "github/issue-comment/created@1",
       payload: {
         repository: { full_name: "Owner/Repo" },
-        issue: { number: 188 },
+        issue: { number: 188, labels: [{ name: "openthrottle" }] },
         comment: { id: 991, body: "/stop", user: { login: "maintainer" } },
       },
     }))).rejects.toThrow(/before owner\/repo#188 is admitted/i);
@@ -205,6 +205,32 @@ describe("KernelProviderPromptHandler", () => {
       repository: "Owner/Repo",
       username: "maintainer",
     });
+    expect(test.requestRunControl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an issue without the control label", { number: 188 }],
+    [
+      "a pull request",
+      {
+        number: 188,
+        labels: [{ name: "openthrottle" }],
+        pull_request: { url: "https://api.github.com/repos/Owner/Repo/pulls/188" },
+      },
+    ],
+  ])("settles an authorized GitHub stop on %s when no run exists", async (_label, issue) => {
+    const authorizeGithubComment = vi.fn(async () => true);
+    const test = handler({ resolveRun: () => undefined, authorizeGithubComment });
+    await expect(test.value.handle(event({
+      source_provider: "github",
+      kind: "github/issue-comment/created@1",
+      payload: {
+        repository: { full_name: "Owner/Repo" },
+        issue,
+        comment: { id: 991, body: "/stop", user: { login: "maintainer" } },
+      },
+    }))).resolves.toBe("stale");
+    expect(authorizeGithubComment).not.toHaveBeenCalled();
     expect(test.requestRunControl).not.toHaveBeenCalled();
   });
 
@@ -219,7 +245,7 @@ describe("KernelProviderPromptHandler", () => {
       kind: "github/issue-comment/created@1",
       payload: {
         repository: { full_name: "Owner/Repo" },
-        issue: { number: 188 },
+        issue: { number: 188, labels: [{ name: "openthrottle" }] },
         comment,
       },
     }))).resolves.toBe("stale");

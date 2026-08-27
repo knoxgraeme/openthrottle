@@ -40,6 +40,7 @@ interface ProviderPrompt {
   message_id: string;
   body: string;
   stop: boolean;
+  retry_stop_before_admission: boolean;
   github_authorization: { repository: string; username: string } | null;
 }
 
@@ -51,6 +52,15 @@ function object(value: JsonValue | undefined): Record<string, JsonValue> | null 
 
 function nested(value: Record<string, JsonValue> | null, key: string): Record<string, JsonValue> | null {
   return object(value?.[key]);
+}
+
+function strings(value: JsonValue | undefined): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (typeof entry === "string") return [entry];
+    const item = object(entry);
+    return typeof item?.name === "string" ? [item.name] : [];
+  });
 }
 
 function signal(value: JsonValue | undefined): string | null {
@@ -91,6 +101,7 @@ function linearPrompt(event: KernelInboxEvent): ProviderPrompt | null {
     message_id: messageId,
     body: rawBody,
     stop,
+    retry_stop_before_admission: true,
     github_authorization: null,
   };
 }
@@ -113,11 +124,14 @@ function githubPrompt(event: KernelInboxEvent): ProviderPrompt | null {
     typeof rawBody !== "string"
   ) throw new Error("GitHub issue comment is missing its repository, issue, or comment identity");
   const body = rawBody.trim();
+  const admissionEligible = issue?.pull_request === undefined &&
+    strings(issue?.labels).some((label) => label.toLowerCase() === "openthrottle");
   return {
     reference: `${repo.toLowerCase()}#${number as number}`,
     message_id: String(messageId),
     body: rawBody,
     stop: /^(?:\/)?stop$/i.test(body),
+    retry_stop_before_admission: admissionEligible,
     github_authorization: typeof username === "string"
       ? { repository: repo, username }
       : null,
@@ -160,21 +174,21 @@ export class KernelProviderPromptHandler {
     if (!prompt) return null;
     if (!ID.test(prompt.message_id)) return "dead";
 
-    if (event.source_provider === "github" && prompt.stop) {
-      if (!prompt.github_authorization) return "stale";
-      if (!await this.#githubAuthorization.authorizeComment(prompt.github_authorization)) {
-        return "stale";
-      }
-    }
-
     const run = this.#runs.resolveRun(prompt.reference);
     if (!run) {
       if (prompt.stop) {
+        if (!prompt.retry_stop_before_admission) return "stale";
+        if (event.source_provider === "github") {
+          if (!prompt.github_authorization) return "stale";
+          if (!await this.#githubAuthorization.authorizeComment(prompt.github_authorization)) {
+            return "stale";
+          }
+        }
         throw new Error(`cannot apply provider stop before ${prompt.reference} is admitted`);
       }
       return null;
     }
-    if (event.source_provider === "github" && !prompt.stop) {
+    if (event.source_provider === "github") {
       if (!prompt.github_authorization) return "stale";
       if (!await this.#githubAuthorization.authorizeComment(prompt.github_authorization)) {
         return "stale";
