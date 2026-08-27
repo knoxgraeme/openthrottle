@@ -13,7 +13,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { canonicalJson, digestCanonicalJson } from "./generated-result-contracts.mjs";
+import {
+  canonicalJson,
+  digestCanonicalJson,
+  RESULT_CANDIDATE_MAX_BYTES,
+} from "./generated-result-contracts.mjs";
 import { runPreparedAgent as runPreparedAgentRuntime } from "./agent-runtime.mjs";
 import { executeAttempt, validateKernelRequest } from "./execute-attempt.mjs";
 import { extractProviderResultCandidate } from "./result-submission.mjs";
@@ -539,6 +543,71 @@ describe("kernel attempt executor", () => {
       }),
     ]);
   });
+
+  it.each(["oversized", "non-regular"])(
+    "preserves completed Codex work when its provider-final file is %s",
+    async (unsafeFile) => {
+      const source = sourceRepository();
+      const root = mkdtempSync(join(tmpdir(), "ot-attempt-unsafe-provider-final-"));
+      const candidate = {
+        schema: "openthrottle.result-candidate/v1",
+        outcome: "success",
+        payload: { summary: "completed work", verification: ["focused proof"] },
+      };
+      const request = workRequest(source.subject, {
+        action: {
+          ...workRequest(source.subject).action,
+          engine: "codex",
+          execution_limits: { max_turns: null, task_timeout_seconds: 600 },
+        },
+      });
+      const result = await executeAttempt({
+        request,
+        sourceRepoDir: source.repo,
+        actionRoot: join(root, "actions"),
+        resultPath: join(root, "action-results", "result.json"),
+        sessionPath: join(root, "action-results", "session.json"),
+        env: {
+          OT_LEASE_GENERATION_FENCE_FILE: join(root, "lease-generation.json"),
+          OT_LEASE_GENERATION_LOCK_FILE: join(root, "lease-generation.lock"),
+        },
+        runPreparedAgent: async (runtime) => runPreparedAgentRuntime({
+          ...runtime,
+          runStreaming: async ({ onSession }) => {
+            if (unsafeFile === "oversized") {
+              writeFileSync(
+                runtime.prepared.providerFinalPath,
+                Buffer.alloc(RESULT_CANDIDATE_MAX_BYTES + 1, "x"),
+              );
+            } else {
+              mkdirSync(runtime.prepared.providerFinalPath);
+            }
+            await onSession("session-unsafe-provider-final");
+            return {
+              status: 0,
+              signal: null,
+              timedOut: false,
+              nativeSessionId: "session-unsafe-provider-final",
+              stderr: "",
+              stdout: JSON.stringify({
+                type: "item.completed",
+                item: { type: "agent_message", text: canonicalJson(candidate) },
+              }),
+              providerFinalOutputFallback: canonicalJson(candidate),
+            };
+          },
+        }),
+        now: () => new Date("2026-08-20T00:00:00.000Z"),
+      });
+
+      expect(result.outcome).toMatchObject({
+        state: "result_pending",
+        checkpoint: expect.objectContaining({ native_session_id: "session-unsafe-provider-final" }),
+        candidate_hash: null,
+        diagnostics: [{ detail: "provider did not emit a final result candidate" }],
+      });
+    },
+  );
 
   it("reclaims settled sibling scratch before dispatching the next action", async () => {
     const source = sourceRepository();

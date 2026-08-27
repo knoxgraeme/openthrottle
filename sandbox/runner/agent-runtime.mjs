@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import {
   chmodSync,
   chownSync,
@@ -38,6 +39,7 @@ import {
   repositoryGitEnvironment,
 } from "./repository-authority.mjs";
 import { extractNativeSessionId } from "./native-session-id.mjs";
+import { RESULT_CANDIDATE_MAX_BYTES } from "./generated-result-contracts.mjs";
 import {
   extractProviderFinalOutput,
   readBoundedResultFileSync,
@@ -163,6 +165,83 @@ function appendBounded(current, chunk) {
   ]).toString("utf8");
 }
 
+function codexFinalOutputCapture(engine) {
+  if (engine !== "codex") return null;
+  const decoder = new StringDecoder("utf8");
+  let pending = "";
+  let discardingOversizedLine = false;
+  let unsafeAfterFinal = false;
+  let finalOutput = "";
+
+  const appendFragment = (fragment) => {
+    if (discardingOversizedLine || fragment === "") return;
+    if (Buffer.byteLength(pending, "utf8") + Buffer.byteLength(fragment, "utf8") > CAPTURE_BYTES) {
+      pending = "";
+      discardingOversizedLine = true;
+      unsafeAfterFinal = true;
+      return;
+    }
+    pending += fragment;
+  };
+  const finishLine = () => {
+    if (discardingOversizedLine) {
+      discardingOversizedLine = false;
+      pending = "";
+      return;
+    }
+    const line = pending.trim();
+    pending = "";
+    if (!line) return;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      unsafeAfterFinal = true;
+      return;
+    }
+    if (event?.type === "thread.started") {
+      finalOutput = "";
+      unsafeAfterFinal = false;
+      return;
+    }
+    if (event?.type !== "item.completed" || event.item?.type !== "agent_message") return;
+    if (
+      typeof event.item.text !== "string" ||
+      Buffer.byteLength(event.item.text, "utf8") > RESULT_CANDIDATE_MAX_BYTES
+    ) {
+      finalOutput = "";
+      unsafeAfterFinal = true;
+      return;
+    }
+    finalOutput = event.item.text;
+    unsafeAfterFinal = false;
+  };
+  const consumeText = (text) => {
+    let start = 0;
+    for (;;) {
+      const newline = text.indexOf("\n", start);
+      if (newline === -1) {
+        appendFragment(text.slice(start));
+        return;
+      }
+      appendFragment(text.slice(start, newline));
+      finishLine();
+      start = newline + 1;
+    }
+  };
+
+  return {
+    write(chunk) {
+      consumeText(decoder.write(chunk));
+    },
+    end() {
+      consumeText(decoder.end());
+      if (pending !== "" || discardingOversizedLine) finishLine();
+      return unsafeAfterFinal ? "" : finalOutput;
+    },
+  };
+}
+
 function childCommand(engine, environment, args) {
   if (typeof process.getuid === "function" && process.getuid() === 0 && existsSync("/usr/local/bin/gosu")) {
     return {
@@ -188,15 +267,40 @@ function prepareProviderFinalOutput(engine, channel) {
 
 function withProviderFinalOutput(result, providerFinalPath) {
   if (providerFinalPath === null) return result;
+  let providerFinalOutput = result.providerFinalOutputFallback ?? "";
+  if (existsSync(providerFinalPath)) {
+    try {
+      providerFinalOutput = readBoundedResultFileSync(
+        providerFinalPath,
+        RESULT_CANDIDATE_MAX_BYTES,
+      );
+    } catch {
+      // The provider process has already completed. Treat an unsafe, oversized,
+      // or racy final-message file as missing semantic output so the locked
+      // checkpoint enters result correction instead of discarding completed work.
+      providerFinalOutput = "";
+    }
+  } else if (result.providerFinalOutputFallback === undefined) {
+    // Test and alternate launch adapters may not provide the streaming capture.
+    // A complete, untruncated invocation transcript is still safe to reduce to
+    // its last message; a bounded head/tail diagnostic transcript is not.
+    const omission = CAPTURE_OMISSION.toString("utf8");
+    const extracted = typeof result.stdout === "string" &&
+        Buffer.byteLength(result.stdout, "utf8") <= CAPTURE_BYTES &&
+        !result.stdout.includes(omission)
+      ? extractProviderFinalOutput(result.stdout, "codex")
+      : "";
+    providerFinalOutput = Buffer.byteLength(extracted, "utf8") <= RESULT_CANDIDATE_MAX_BYTES
+      ? extracted
+      : "";
+  }
   return {
     ...result,
     // Codex's action-scoped final-message channel is authoritative. Some
     // successful launches do not materialize it, so reproduce that channel's
     // last-message semantics from this invocation instead of submitting every
     // agent message in the JSONL stream as a separate final candidate.
-    providerFinalOutput: existsSync(providerFinalPath)
-      ? readBoundedResultFileSync(providerFinalPath, CAPTURE_BYTES)
-      : extractProviderFinalOutput(result.stdout, "codex"),
+    providerFinalOutput,
   };
 }
 
@@ -223,6 +327,7 @@ export async function runStreamingAgent({
     let sessionId = null;
     let timedOut = false;
     let callbackFailure = null;
+    const providerFinalCapture = codexFinalOutputCapture(engine);
     const observeSession = (chunk) => {
       if (sessionId) return;
       const candidate = extractNativeSessionId(chunk, engine) ?? extractNativeSessionId(stdout, engine);
@@ -234,6 +339,7 @@ export async function runStreamingAgent({
       });
     };
     child.stdout.on("data", (chunk) => {
+      providerFinalCapture?.write(chunk);
       const text = chunk.toString("utf8");
       stdout = appendBounded(stdout, text);
       observeSession(text);
@@ -258,7 +364,17 @@ export async function runStreamingAgent({
     child.on("close", (status, signal) => {
       clearTimeout(timer);
       if (callbackFailure) return reject(callbackFailure);
-      resolve({ status, signal, timedOut, stdout, stderr, nativeSessionId: sessionId });
+      resolve({
+        status,
+        signal,
+        timedOut,
+        stdout,
+        stderr,
+        nativeSessionId: sessionId,
+        ...(providerFinalCapture === null
+          ? {}
+          : { providerFinalOutputFallback: providerFinalCapture.end() }),
+      });
     });
     child.stdin.end(prompt);
   });
