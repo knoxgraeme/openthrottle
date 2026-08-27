@@ -343,6 +343,42 @@ function boundedAgentFailureReason(prefix, { stdout = "", stderr = "", env }) {
     .slice(0, MAX_WORK_FAILURE_REASON_CHARS);
 }
 
+// The supervisor supplies this executor-only fence for every production
+// launch. Direct/local callers written before the fence existed remain first
+// launches; a present malformed value is never widened into another retry.
+function trustedWorkRetryOrdinal(env) {
+  const raw = env?.OT_ACTION_WORK_RETRY_ORDINAL;
+  if (raw === undefined) return 0;
+  if (typeof raw !== "string" || !/^(?:0|[1-9]\d*)$/.test(raw)) return null;
+  const ordinal = Number(raw);
+  return Number.isSafeInteger(ordinal) ? ordinal : null;
+}
+
+function agentLaunchRetryable(classified, execution, env) {
+  const infrastructureRetryable = Boolean(
+    execution.timedOut || execution.signal || execution.error || execution.status === 137
+  );
+  if (!classified.credentialFailure) {
+    return Boolean(classified.retryable || infrastructureRetryable);
+  }
+  if (classified.credentialFailureProvenance === "environment") return false;
+
+  const retryOrdinal = trustedWorkRetryOrdinal(env);
+  if (retryOrdinal === null) return false;
+  if (classified.credentialFailureProvenance === "heuristic" && infrastructureRetryable) {
+    // Untrusted text can narrow a clean engine failure, but it cannot turn a
+    // timeout, signal, transport error, or OOM-style exit into terminal work.
+    return true;
+  }
+  if (classified.credentialFailureProvenance !== "provider_event" &&
+      classified.credentialFailureProvenance !== "heuristic") {
+    return false;
+  }
+  // A fresh materialization gets one opportunity to replace or refresh a
+  // rejected credential. The next clean/provider-confirmed refusal is final.
+  return retryOrdinal === 0;
+}
+
 function agentLaunchFailure(request, execution, env) {
   const classified = classifyLaunchFailure({
     agent: request.action.engine,
@@ -361,9 +397,7 @@ function agentLaunchFailure(request, execution, env) {
   ].filter(Boolean).join(" ");
   return {
     state: "work_failed",
-    retryable: Boolean(
-      classified.retryable || execution.timedOut || execution.signal || execution.error || execution.status === 137
-    ),
+    retryable: agentLaunchRetryable(classified, execution, env),
     reason: boundedAgentFailureReason(prefix, {
       stdout: execution.stdout,
       stderr: [

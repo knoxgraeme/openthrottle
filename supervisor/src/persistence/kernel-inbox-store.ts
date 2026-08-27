@@ -121,6 +121,15 @@ export interface KernelInboxDeliveryPort {
   get(eventId: string): KernelInboxEvent | undefined;
 }
 
+export interface KernelInboxObservationPort {
+  listConsumedAt(input: {
+    source_provider: string;
+    kinds: readonly string[];
+    consumed_at: string;
+    limit: number;
+  }): { events: readonly KernelInboxEvent[]; truncated: boolean; corrupt: boolean };
+}
+
 interface InboxRow {
   id: string;
   source_provider: string;
@@ -217,7 +226,8 @@ function immutableProjection(row: InboxRow): Record<string, unknown> {
 export class SqliteKernelInboxStore implements
   KernelMaintenancePort,
   KernelInboxIngressPort,
-  KernelInboxDeliveryPort {
+  KernelInboxDeliveryPort,
+  KernelInboxObservationPort {
   readonly #db: Database.Database;
   readonly #blobs: VolumeBlobStore;
   readonly #now: () => string;
@@ -466,13 +476,28 @@ export class SqliteKernelInboxStore implements
     bounded(input.owner_id, "inbox completion owner", 200, ID);
     bounded(input.lease_id, "inbox completion lease ID", 200, ID);
     const timestamp = iso(this.#now(), "inbox completion timestamp");
-    const changed = this.#db.prepare(`
-      UPDATE inbox_events
-      SET status = ?, lease_id = NULL, lease_owner_id = NULL, lease_expires_at = NULL,
-          version = version + 1, consumed_at = ?
-      WHERE id = ? AND status = 'processing' AND lease_id = ? AND lease_owner_id = ?
-    `).run(input.outcome, timestamp, input.event_id, input.lease_id, input.owner_id);
-    if (changed.changes !== 1) throw new Error("inbox completion lease fence does not match");
+    this.#db.transaction(() => {
+      const changed = this.#db.prepare(`
+        UPDATE inbox_events
+        SET status = ?, lease_id = NULL, lease_owner_id = NULL, lease_expires_at = NULL,
+            version = version + 1, consumed_at = ?
+        WHERE id = ? AND status = 'processing' AND lease_id = ? AND lease_owner_id = ?
+      `).run(input.outcome, timestamp, input.event_id, input.lease_id, input.owner_id);
+      if (changed.changes === 1) return;
+      const settled = this.#db.prepare(`
+        SELECT status, lease_id, lease_owner_id, lease_expires_at, consumed_at
+        FROM inbox_events WHERE id = ?
+      `).get(input.event_id) as Pick<
+        InboxRow,
+        "status" | "lease_id" | "lease_owner_id" | "lease_expires_at" | "consumed_at"
+      > | undefined;
+      if (
+        settled?.status === input.outcome && settled.consumed_at !== null &&
+        settled.lease_id === null && settled.lease_owner_id === null &&
+        settled.lease_expires_at === null
+      ) return;
+      throw new Error("inbox completion lease fence does not match");
+    }).immediate();
   }
 
   retry(input: {
@@ -503,6 +528,47 @@ export class SqliteKernelInboxStore implements
     bounded(eventId, "inbox event ID", 200, ID);
     const row = this.#row(eventId);
     return row ? this.#event(row) : undefined;
+  }
+
+  listConsumedAt(input: {
+    source_provider: string;
+    kinds: readonly string[];
+    consumed_at: string;
+    limit: number;
+  }): { events: readonly KernelInboxEvent[]; truncated: boolean; corrupt: boolean } {
+    bounded(input.source_provider, "inbox observation source_provider", 100, PROVIDER);
+    iso(input.consumed_at, "inbox observation consumed_at");
+    if (
+      !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100 ||
+      input.kinds.length < 1 || input.kinds.length > 20
+    ) throw new Error("inbox observation bounds are invalid");
+    for (const kind of input.kinds) {
+      bounded(kind, "inbox observation kind", 200, KIND);
+    }
+    const placeholders = input.kinds.map(() => "?").join(", ");
+    const rows = this.#db.prepare(`
+      SELECT * FROM inbox_events
+      WHERE source_provider = ? AND kind IN (${placeholders})
+        AND status = 'consumed' AND consumed_at = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(
+      input.source_provider,
+      ...input.kinds,
+      input.consumed_at,
+      input.limit + 1,
+    ) as InboxRow[];
+    const events: KernelInboxEvent[] = [];
+    let corrupt = false;
+    for (const row of rows.slice(0, input.limit)) {
+      try {
+        events.push(this.#event(row));
+      } catch (error) {
+        if (!(error instanceof InboxPayloadCorruptionError)) throw error;
+        corrupt = true;
+      }
+    }
+    return { events, truncated: rows.length > input.limit, corrupt };
   }
 
   #normalizeInput(input: KernelInboxEventInput): Required<

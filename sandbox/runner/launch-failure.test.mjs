@@ -34,7 +34,8 @@ describe("launch failure classification", () => {
     expect(classified).toMatchObject({
       reason: "credential_missing",
       credentialFailure: true,
-      retryable: true,
+      credentialFailureProvenance: "environment",
+      retryable: false,
     });
     expect(classified.remediation).toContain("CLAUDE_CODE_OAUTH_TOKEN");
   });
@@ -58,6 +59,7 @@ describe("launch failure classification", () => {
     expect(classified).toMatchObject({
       reason: "credential_rejected",
       credentialFailure: true,
+      credentialFailureProvenance: "heuristic",
       retryable: true,
     });
   });
@@ -83,6 +85,7 @@ describe("launch failure classification", () => {
     })).toMatchObject({
       reason: "engine_crash",
       credentialFailure: false,
+      credentialFailureProvenance: null,
       retryable: false,
     });
   });
@@ -104,6 +107,7 @@ describe("launch failure classification", () => {
     })).toMatchObject({
       reason: "engine_crash",
       credentialFailure: false,
+      credentialFailureProvenance: null,
       retryable: false,
     });
   });
@@ -136,7 +140,29 @@ describe("launch failure classification", () => {
       result: "API Error: authentication_error: invalid oauth token",
     });
     expect(classifyLaunchFailure({ agent: "claude", stdout, stderr: "", credentialPresent: true }))
-      .toMatchObject({ reason: "credential_rejected", credentialFailure: true, retryable: true });
+      .toMatchObject({
+        reason: "credential_rejected",
+        credentialFailure: true,
+        credentialFailureProvenance: "provider_event",
+        retryable: true,
+      });
+  });
+
+  it("does not treat Claude's assistant-authored final result prose as credential evidence", () => {
+    const stdout = JSON.stringify({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      api_error_status: 500,
+      result: "API Error: 401 authentication_error: invalid oauth token",
+    });
+    expect(classifyLaunchFailure({ agent: "claude", stdout, stderr: "", credentialPresent: true }))
+      .toMatchObject({
+        reason: "engine_crash",
+        credentialFailure: false,
+        credentialFailureProvenance: null,
+        retryable: false,
+      });
   });
 
   it("reports a rate limit from a rejected Claude rate_limit_event", () => {
@@ -188,7 +214,12 @@ describe("launch failure classification", () => {
       error: { message: "401 Unauthorized: token is invalid" },
     });
     expect(classifyLaunchFailure({ agent: "codex", stdout, stderr: "", credentialPresent: true }))
-      .toMatchObject({ reason: "credential_rejected", credentialFailure: true, retryable: true });
+      .toMatchObject({
+        reason: "credential_rejected",
+        credentialFailure: true,
+        credentialFailureProvenance: "provider_event",
+        retryable: true,
+      });
   });
 
   it("falls back to an engine crash for anything else", () => {
@@ -201,6 +232,7 @@ describe("launch failure classification", () => {
     expect(classified).toMatchObject({
       reason: "engine_crash",
       credentialFailure: false,
+      credentialFailureProvenance: null,
       retryable: false,
       remediation: "",
     });
@@ -211,7 +243,12 @@ describe("launch failure classification", () => {
       agent: "claude",
       stdout: "Not logged in. Run `claude login` to authenticate.",
       stderr: "",
-    })).toMatchObject({ reason: "credential_missing", credentialFailure: true });
+    })).toMatchObject({
+      reason: "credential_missing",
+      credentialFailure: true,
+      credentialFailureProvenance: "heuristic",
+      retryable: true,
+    });
   });
 
   it("classifies an unregistered-command answer as a retryable, non-credential launch failure", () => {
@@ -223,6 +260,7 @@ describe("launch failure classification", () => {
     expect(classified).toMatchObject({
       reason: "unregistered_command",
       credentialFailure: false,
+      credentialFailureProvenance: null,
       retryable: true,
     });
     expect(classified.remediation).toContain("did not register its requested skill");
@@ -231,6 +269,17 @@ describe("launch failure classification", () => {
   it("classifies an unregistered-command answer even without a known credential state", () => {
     const stdout = JSON.stringify({ type: "result", subtype: "success", result: "Unknown command: /ot-nonexistent-probe" });
     expect(classifyLaunchFailure({ agent: "claude", stdout, stderr: "" }).reason).toBe("unregistered_command");
+  });
+
+  it("keeps an authoritatively missing environment credential terminal despite assistant result prose", () => {
+    const stdout = JSON.stringify({ type: "result", subtype: "success", result: "Unknown command: /implement-unit" });
+    expect(classifyLaunchFailure({ agent: "claude", stdout, stderr: "", credentialPresent: false }))
+      .toMatchObject({
+        reason: "credential_missing",
+        credentialFailure: true,
+        credentialFailureProvenance: "environment",
+        retryable: false,
+      });
   });
 });
 

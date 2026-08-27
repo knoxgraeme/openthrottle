@@ -211,6 +211,7 @@ async function main(): Promise<void> {
   const providerPrompts = new KernelProviderPromptHandler({
     runs: registrations,
     projections,
+    inbox,
     github_authorization: {
       async authorizeComment(input) {
         const permission = await getRepositoryCollaboratorPermission(

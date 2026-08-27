@@ -1,12 +1,23 @@
 import { Buffer } from "node:buffer";
 import type { JsonValue } from "@openthrottle/contracts";
-import type { KernelInboxEvent } from "../persistence/kernel-inbox-store.js";
+import type {
+  KernelInboxEvent,
+  KernelInboxObservationPort,
+} from "../persistence/kernel-inbox-store.js";
 import type { KernelProjectionPort } from "../persistence/kernel-projection-store.js";
 import type { KernelRunReferencePort } from "../persistence/kernel-registration-store.js";
 import type { KernelIngressResponse } from "./kernel-control.js";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const MAX_STEERING_BODY_BYTES = 32 * 1024;
+const PRE_ADMISSION_STOP_GRACE_MS = 10 * 60_000;
+const GITHUB_ORIGIN_OBSERVATION_LIMIT = 8;
+const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+const GITHUB_ADMISSION_KINDS = [
+  "github/issues/opened@1",
+  "github/issues/labeled@1",
+  "github/issues/edited@1",
+] as const;
 
 export interface KernelProviderPromptControlPort {
   requestRunControl(input: {
@@ -40,6 +51,8 @@ interface ProviderPrompt {
   message_id: string;
   body: string;
   stop: boolean;
+  github_issue: boolean;
+  github_stop_at: number | null;
   github_authorization: { repository: string; username: string } | null;
 }
 
@@ -51,6 +64,15 @@ function object(value: JsonValue | undefined): Record<string, JsonValue> | null 
 
 function nested(value: Record<string, JsonValue> | null, key: string): Record<string, JsonValue> | null {
   return object(value?.[key]);
+}
+
+function strings(value: JsonValue | undefined): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (typeof entry === "string") return [entry];
+    const item = object(entry);
+    return typeof item?.name === "string" ? [item.name] : [];
+  });
 }
 
 function signal(value: JsonValue | undefined): string | null {
@@ -65,6 +87,38 @@ function signal(value: JsonValue | undefined): string | null {
   return null;
 }
 
+function isoInstant(value: JsonValue | undefined): number | null {
+  if (typeof value !== "string") return null;
+  const match = ISO_INSTANT.exec(value);
+  if (!match) return null;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, zone] = match;
+  const [year, month, day, hour, minute, second] = [
+    yearText, monthText, dayText, hourText, minuteText, secondText,
+  ].map(Number);
+  const zoneHour = zone === "Z" ? 0 : Number(zone.slice(1, 3));
+  const zoneMinute = zone === "Z" ? 0 : Number(zone.slice(4, 6));
+  if (
+    year! < 1 || month! < 1 || month! > 12 || day! < 1 ||
+    day! > new Date(Date.UTC(year!, month!, 0)).getUTCDate() ||
+    hour! > 23 || minute! > 59 || second! > 59 || zoneHour > 23 || zoneMinute > 59
+  ) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function preAdmissionStopDeadline(event: KernelInboxEvent): number | null {
+  const deadline = Date.parse(event.created_at) + PRE_ADMISSION_STOP_GRACE_MS;
+  return Number.isFinite(deadline) ? deadline : null;
+}
+
+export function linearAgentActivityBody(payload: JsonValue): string {
+  const activity = nested(object(payload), "agentActivity");
+  const content = nested(activity, "content");
+  return typeof content?.body === "string"
+    ? content.body
+    : typeof activity?.body === "string" ? activity.body : "";
+}
+
 function linearPrompt(event: KernelInboxEvent): ProviderPrompt | null {
   if (event.kind !== "linear/agent-session-event/prompted@1") return null;
   const payload = object(event.payload);
@@ -76,16 +130,15 @@ function linearPrompt(event: KernelInboxEvent): ProviderPrompt | null {
   if (typeof identifier !== "string" || typeof messageId !== "string") {
     throw new Error("Linear prompted event is missing its issue or activity identity");
   }
-  const content = nested(activity, "content");
-  const rawBody = typeof content?.body === "string"
-    ? content.body
-    : typeof activity?.body === "string" ? activity.body : "";
+  const rawBody = linearAgentActivityBody(event.payload);
   const stop = signal(activity?.signal) === "stop";
   return {
     reference: identifier,
     message_id: messageId,
     body: rawBody,
     stop,
+    github_issue: false,
+    github_stop_at: null,
     github_authorization: null,
   };
 }
@@ -108,15 +161,43 @@ function githubPrompt(event: KernelInboxEvent): ProviderPrompt | null {
     typeof rawBody !== "string"
   ) throw new Error("GitHub issue comment is missing its repository, issue, or comment identity");
   const body = rawBody.trim();
+  const stop = /^(?:\/)?stop$/i.test(body);
   return {
     reference: `${repo.toLowerCase()}#${number as number}`,
     message_id: String(messageId),
     body: rawBody,
-    stop: /^(?:\/)?stop$/i.test(body),
+    stop,
+    github_issue: issue?.pull_request === undefined,
+    github_stop_at: stop ? isoInstant(comment?.created_at) : null,
     github_authorization: typeof username === "string"
       ? { repository: repo, username }
       : null,
   };
+}
+
+function githubAdmissionOrigin(event: KernelInboxEvent): {
+  reference: string;
+  occurred_at: number;
+} | null {
+  if (
+    event.source_provider !== "github" ||
+    !GITHUB_ADMISSION_KINDS.includes(event.kind as typeof GITHUB_ADMISSION_KINDS[number])
+  ) return null;
+  const payload = object(event.payload);
+  const repository = nested(payload, "repository");
+  const issue = nested(payload, "issue");
+  const repo = repository?.full_name;
+  const number = issue?.number;
+  const occurredAt = isoInstant(
+    event.kind === "github/issues/opened@1" ? issue?.created_at : issue?.updated_at,
+  );
+  if (
+    typeof repo !== "string" || !Number.isSafeInteger(number) || (number as number) < 1 ||
+    issue?.pull_request !== undefined ||
+    !strings(issue?.labels).some((label) => label.toLowerCase() === "openthrottle") ||
+    occurredAt === null
+  ) return null;
+  return { reference: `${repo.toLowerCase()}#${number as number}`, occurred_at: occurredAt };
 }
 
 function providerPrompt(event: KernelInboxEvent): ProviderPrompt | null {
@@ -131,20 +212,26 @@ export class KernelProviderPromptHandler {
   readonly #projections: KernelProjectionPort;
   readonly #control: KernelProviderPromptControlPort;
   readonly #githubAuthorization: KernelProviderPromptGithubAuthorizationPort;
+  readonly #inbox: KernelInboxObservationPort;
+  readonly #now: () => Date;
 
   constructor(input: {
     runs: KernelRunReferencePort;
     projections: KernelProjectionPort;
     control: KernelProviderPromptControlPort;
     github_authorization: KernelProviderPromptGithubAuthorizationPort;
+    inbox: KernelInboxObservationPort;
+    now?: () => Date;
   }) {
     this.#runs = input.runs;
     this.#projections = input.projections;
     this.#control = input.control;
     this.#githubAuthorization = input.github_authorization;
+    this.#inbox = input.inbox;
+    this.#now = input.now ?? (() => new Date());
   }
 
-  /** Null means this is not a provider follow-up and admission should inspect it. */
+  /** Null means admission should inspect this event as a possible first prompt. */
   async handle(event: KernelInboxEvent): Promise<KernelProviderPromptDisposition | null> {
     let prompt: ProviderPrompt | null;
     try {
@@ -156,9 +243,53 @@ export class KernelProviderPromptHandler {
     if (!ID.test(prompt.message_id)) return "dead";
 
     const run = this.#runs.resolveRun(prompt.reference);
-    if (!run) return null;
+    if (!run) {
+      if (prompt.stop) {
+        if (event.source_provider === "github") {
+          if (!prompt.github_issue || !prompt.github_authorization) return "stale";
+          if (prompt.github_stop_at === null) return "dead";
+        }
+        const deadline = preAdmissionStopDeadline(event);
+        if (deadline === null) return "dead";
+        if (this.#now().getTime() >= deadline) return "stale";
+        if (
+          prompt.github_authorization &&
+          !await this.#githubAuthorization.authorizeComment(prompt.github_authorization)
+        ) return "stale";
+        throw new Error(`cannot apply provider stop before ${prompt.reference} is admitted`);
+      }
+      return null;
+    }
+    if (event.source_provider === "linear" && prompt.stop) {
+      const deadline = preAdmissionStopDeadline(event);
+      if (deadline === null) return "dead";
+      const admittedAt = Date.parse(run.admitted_at);
+      if (!Number.isFinite(admittedAt) || admittedAt >= deadline) return "stale";
+    }
     if (event.source_provider === "github") {
       if (!prompt.github_authorization) return "stale";
+      if (prompt.stop) {
+        if (!prompt.github_issue) return "stale";
+        if (prompt.github_stop_at === null) return "dead";
+        const deadline = preAdmissionStopDeadline(event);
+        if (deadline === null) return "dead";
+        const admittedAt = Date.parse(run.admitted_at);
+        if (!Number.isFinite(admittedAt) || admittedAt >= deadline) return "stale";
+        const origins = this.#inbox.listConsumedAt({
+          source_provider: "github",
+          kinds: GITHUB_ADMISSION_KINDS,
+          consumed_at: run.admitted_at,
+          limit: GITHUB_ORIGIN_OBSERVATION_LIMIT,
+        });
+        if (origins.truncated || origins.corrupt) return "stale";
+        const matching = origins.events.flatMap((candidate) => {
+          const origin = githubAdmissionOrigin(candidate);
+          return origin?.reference === prompt.reference ? [origin] : [];
+        });
+        if (matching.length !== 1 || matching[0]!.occurred_at >= prompt.github_stop_at) {
+          return "stale";
+        }
+      }
       if (!await this.#githubAuthorization.authorizeComment(prompt.github_authorization)) {
         return "stale";
       }

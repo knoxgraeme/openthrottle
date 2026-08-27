@@ -1,16 +1,25 @@
-import { digestCanonicalJson, type JsonValue, type TrustedCompilerEnvironment, type TrustedPlatformDefinitionSource } from "@openthrottle/contracts";
+import {
+  digestCanonicalJson,
+  type JsonValue,
+  type TrustedCompilerEnvironment,
+  type TrustedPlatformDefinitionSource,
+} from "@openthrottle/contracts";
 import type { KernelInboxEvent } from "../persistence/kernel-inbox-store.js";
 import type { SqliteKernelStore } from "../persistence/kernel-store.js";
 import type { VolumeBlobStore } from "../persistence/blob-store.js";
 import type { KernelRepositoryRegistrationPort } from "../persistence/kernel-registration-store.js";
 import type { ExactDefinitionSourceReader } from "../pipeline/definition-compilation.js";
-import { parseStructuredExecutionPlan } from "../pipeline/kernel/structured-coordinator.js";
+import {
+  parseStructuredExecutionPlan,
+  restoreExecutionPlanFenceMarkers,
+} from "../pipeline/kernel/structured-plan.js";
 import type { KernelRuntimeCompatibilityPort } from "../runtime/kernel-contracts.js";
 import { admitKernelPipeline } from "./kernel-admission.js";
 import {
   kernelLinearSessionStartRequest,
   type KernelLinearSessionStartPort,
 } from "./kernel-linear-session.js";
+import { linearAgentActivityBody } from "./kernel-provider-prompt.js";
 
 const SUBJECT = /^[a-f0-9]{40,64}$/;
 const DEFAULT_GITHUB_SUBJECT_TIMEOUT_MS = 15_000;
@@ -32,6 +41,21 @@ function strings(value: unknown): string[] {
     const item = object(entry);
     return typeof item?.name === "string" ? [item.name] : [];
   });
+}
+
+export function linearAdmissionPrompt(input: {
+  event_kind: "linear/agent-session-event/created@1" | "linear/agent-session-event/prompted@1";
+  title: string;
+  description: string;
+  payload: JsonValue;
+}): string {
+  const payload = object(input.payload);
+  const directive = input.event_kind === "linear/agent-session-event/prompted@1"
+    ? linearAgentActivityBody(input.payload)
+    : typeof payload?.promptContext === "string" ? payload.promptContext : "";
+  return restoreExecutionPlanFenceMarkers(
+    [input.title, input.description, directive].filter(Boolean).join("\n\n"),
+  );
 }
 
 export function selectKernelInboxPipeline(labels: readonly string[], prompt: string): string {
@@ -112,6 +136,10 @@ export class KernelAdmissionInboxHandler {
       source_commit: sourceCommit,
       request_hash: event.payload_hash,
     });
+    if (
+      event.status !== "processing" || event.lease_id === null ||
+      event.lease_owner_id === null
+    ) throw new Error("repository admission requires the leased originating inbox event");
     await admitKernelPipeline({
       repository: admission.repository,
       source_commit: sourceCommit,
@@ -137,6 +165,16 @@ export class KernelAdmissionInboxHandler {
       },
       work_retry_limit: 3,
       result_correction_limit: 2,
+      originating_inbox: {
+        event_id: event.id,
+        source_provider: event.source_provider,
+        delivery_id: event.delivery_id,
+        kind: event.kind,
+        payload_hash: event.payload_hash,
+        lease_id: event.lease_id,
+        lease_owner_id: event.lease_owner_id,
+        version: event.version,
+      },
     });
     return "consumed";
   }
@@ -155,6 +193,9 @@ export class KernelAdmissionInboxHandler {
     if (!payload) return null;
     if (event.source_provider === "linear") {
       if (!/^linear\/agent-session-event\/(?:created|prompted)@1$/.test(event.kind)) return null;
+      const eventKind = event.kind === "linear/agent-session-event/created@1"
+        ? event.kind
+        : "linear/agent-session-event/prompted@1";
       const session = nested(payload, "agentSession");
       const issue = nested(session, "issue");
       const team = nested(issue, "team");
@@ -167,8 +208,12 @@ export class KernelAdmissionInboxHandler {
       const identifier = typeof issue.identifier === "string" ? issue.identifier : event.delivery_id;
       const title = typeof issue.title === "string" ? issue.title : identifier;
       const description = typeof issue.description === "string" ? issue.description : "";
-      const promptContext = typeof payload.promptContext === "string" ? payload.promptContext : "";
-      const prompt = [title, description, promptContext].filter(Boolean).join("\n\n");
+      const prompt = linearAdmissionPrompt({
+        event_kind: eventKind,
+        title,
+        description,
+        payload: event.payload,
+      });
       const labels = strings(issue.labels);
       return {
         registration_id: registration.id,

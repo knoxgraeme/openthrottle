@@ -151,6 +151,18 @@ export interface PipelineAdmissionInput {
   run: KernelRun;
   definition_bundle: VerifiedBlobToken;
   initial_attempts: readonly KernelAttempt[];
+  originating_inbox?: PipelineAdmissionInboxFence;
+}
+
+export interface PipelineAdmissionInboxFence {
+  event_id: string;
+  source_provider: string;
+  delivery_id: string;
+  kind: string;
+  payload_hash: string;
+  lease_id: string;
+  lease_owner_id: string;
+  version: number;
 }
 
 export interface PipelineRunAttachmentInput {
@@ -175,7 +187,8 @@ export type KernelStoreFaultPoint =
   | "admission_definitions_written"
   | "admission_work_item_written"
   | "admission_run_written"
-  | "admission_attempts_written";
+  | "admission_attempts_written"
+  | "admission_inbox_consumed";
 
 export interface KernelIntegrityEvidence {
   pipeline_run_id: string;
@@ -271,6 +284,34 @@ export class SqliteKernelStore implements
       this.#fault("admission_attempts_written");
       this.#materializeDependencyReadiness(input.run.cursor);
       this.#assertRunProjections(input.run);
+      if (input.originating_inbox) {
+        const inbox = input.originating_inbox;
+        if (!Number.isSafeInteger(inbox.version) || inbox.version < 1) {
+          throw new Error("originating inbox admission fence has an invalid version");
+        }
+        const consumed = this.#db.prepare(`
+          UPDATE inbox_events
+          SET status = 'consumed', lease_id = NULL, lease_owner_id = NULL,
+              lease_expires_at = NULL, version = version + 1, consumed_at = ?
+          WHERE id = ? AND source_provider = ? AND delivery_id = ? AND kind = ? AND payload_hash = ?
+            AND status = 'processing' AND lease_id = ? AND lease_owner_id = ? AND version = ?
+            AND work_item_id IS NULL AND pipeline_run_id IS NULL AND attempt_id IS NULL
+        `).run(
+          now,
+          inbox.event_id,
+          inbox.source_provider,
+          inbox.delivery_id,
+          inbox.kind,
+          inbox.payload_hash,
+          inbox.lease_id,
+          inbox.lease_owner_id,
+          inbox.version,
+        );
+        if (consumed.changes !== 1) {
+          throw new Error("originating inbox admission fence does not match its processing lease");
+        }
+        this.#fault("admission_inbox_consumed");
+      }
     }).immediate();
   }
 

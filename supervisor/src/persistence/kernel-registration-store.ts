@@ -38,6 +38,7 @@ export interface KernelRunReference {
   work_item_id: string;
   source_provider: string;
   source_reference: string;
+  admitted_at: string;
 }
 
 export interface KernelRunReferencePort {
@@ -267,14 +268,15 @@ export class SqliteKernelRegistrationStore implements KernelRepositoryRegistrati
   resolveRun(reference: string): KernelRunReference | undefined {
     bounded(reference, "run reference", 300);
     const exact = this.#db.prepare(`
-      SELECT r.id AS pipeline_run_id, r.work_item_id, w.source_provider, w.source_reference
+      SELECT r.id AS pipeline_run_id, r.work_item_id, w.source_provider, w.source_reference,
+        w.created_at AS admitted_at
       FROM pipeline_runs r JOIN work_items w ON w.id = r.work_item_id
       WHERE r.id = ?
     `).get(reference) as KernelRunReference | undefined;
     if (exact) return exact;
     const matches = this.#db.prepare(`
-      SELECT r.id AS pipeline_run_id, r.work_item_id, w.source_provider, w.source_reference
-        , r.pipeline_id
+      SELECT r.id AS pipeline_run_id, r.work_item_id, w.source_provider, w.source_reference,
+        w.created_at AS admitted_at, r.pipeline_id
       FROM pipeline_runs r JOIN work_items w ON w.id = r.work_item_id
       WHERE w.source_reference = ?
       ORDER BY r.created_at, r.id

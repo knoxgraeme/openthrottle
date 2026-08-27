@@ -287,6 +287,156 @@ describe("kernel attempt executor", () => {
     expect(persisted).not.toContain("[REDACTED]");
   });
 
+  it("retries an initial structured Codex credential rejection once without leaking provider output", async () => {
+    const accessToken = "fixture-codex-rejected-access-token";
+    const idToken = "fixture-codex-rejected-id-token";
+    const authJson = JSON.stringify({ tokens: { access_token: accessToken, id_token: idToken } });
+    const { result, persisted } = await executeAgentResult({
+      engine: "codex",
+      env: { CODEX_AUTH_JSON: authJson, OT_ACTION_WORK_RETRY_ORDINAL: "0" },
+      execution: {
+        status: 1,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        stdout: JSON.stringify({
+          type: "turn.failed",
+          error: {
+            type: "authentication_error",
+            code: "invalid_token",
+            status: 401,
+            message: `401 Unauthorized: token ${accessToken} is invalid`,
+          },
+        }),
+        stderr: `provider rejected ${idToken}`,
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: true });
+    expect(result.outcome.reason).toContain("reason=credential_rejected");
+    expect(result.outcome.reason).toContain("status=1, signal=none, timed_out=false");
+    expect(result.outcome.reason).toContain("provider_event=turn.failed");
+    expect(result.outcome.reason).toContain("error_type=authentication_error");
+    expect(result.outcome.reason).toContain("error_code=invalid_token");
+    expect(result.outcome.reason).toContain("provider_status=401");
+    expect(result.outcome.reason).toContain("provider_error=credential_rejected");
+    expect(persisted).not.toContain(accessToken);
+    expect(persisted).not.toContain(idToken);
+    expect(persisted).not.toContain("Unauthorized");
+    expect(persisted).not.toContain("[REDACTED]");
+  });
+
+  it("terminalizes a repeated structured credential rejection despite cleanup signals", async () => {
+    const { result } = await executeAgentResult({
+      engine: "codex",
+      env: {
+        CODEX_AUTH_JSON: JSON.stringify({ tokens: { access_token: "fixture-rejected-token" } }),
+        OT_ACTION_WORK_RETRY_ORDINAL: "1",
+      },
+      execution: {
+        status: null,
+        signal: "SIGTERM",
+        timedOut: true,
+        nativeSessionId: null,
+        stdout: JSON.stringify({
+          type: "turn.failed",
+          error: { type: "authentication_error", status: 401, message: "401 Unauthorized" },
+        }),
+        stderr: "",
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: false });
+    expect(result.outcome.reason).toContain("reason=credential_rejected");
+  });
+
+  it.each([
+    ["timeout", { status: 1, signal: null, timedOut: true }],
+    ["signal", { status: null, signal: "SIGTERM", timedOut: false }],
+    ["execution error", { status: 1, signal: null, timedOut: false, error: new Error("transport closed") }],
+    ["status 137", { status: 137, signal: null, timedOut: false }],
+  ])("keeps %s retryable when only heuristic text resembles an auth rejection", async (_label, shape) => {
+    const { result } = await executeAgentResult({
+      env: {
+        CLAUDE_CODE_OAUTH_TOKEN: "fixture-present-token",
+        OT_ACTION_WORK_RETRY_ORDINAL: "1",
+      },
+      execution: {
+        nativeSessionId: null,
+        stdout: "",
+        stderr: "API Error: 401 Unauthorized: invalid oauth token",
+        ...shape,
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: true });
+    expect(result.outcome.reason).toContain("reason=credential_rejected");
+  });
+
+  it("retries an initial clean heuristic credential rejection once", async () => {
+    const { result } = await executeAgentResult({
+      env: {
+        CLAUDE_CODE_OAUTH_TOKEN: "fixture-present-token",
+        OT_ACTION_WORK_RETRY_ORDINAL: "0",
+      },
+      execution: {
+        status: 1,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        stdout: "",
+        stderr: "API Error: 401 Unauthorized: invalid oauth token",
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: true });
+    expect(result.outcome.reason).toContain("reason=credential_rejected");
+  });
+
+  it("terminalizes a repeated clean heuristic credential rejection", async () => {
+    const { result } = await executeAgentResult({
+      env: {
+        CLAUDE_CODE_OAUTH_TOKEN: "fixture-present-token",
+        OT_ACTION_WORK_RETRY_ORDINAL: "1",
+      },
+      execution: {
+        status: 1,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        stdout: "",
+        stderr: "API Error: 401 Unauthorized: invalid oauth token",
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: false });
+    expect(result.outcome.reason).toContain("reason=credential_rejected");
+  });
+
+  it("fails closed on an invalid credential retry ordinal", async () => {
+    const { result } = await executeAgentResult({
+      engine: "codex",
+      env: {
+        CODEX_AUTH_JSON: JSON.stringify({ tokens: { access_token: "fixture-rejected-token" } }),
+        OT_ACTION_WORK_RETRY_ORDINAL: "not-an-ordinal",
+      },
+      execution: {
+        status: 137,
+        signal: null,
+        timedOut: false,
+        nativeSessionId: null,
+        stdout: JSON.stringify({
+          type: "turn.failed",
+          error: { type: "authentication_error", status: 401, message: "401 Unauthorized" },
+        }),
+        stderr: "",
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: false });
+    expect(result.outcome.reason).toContain("reason=credential_rejected");
+  });
+
   it("keeps deterministic Codex preparation errors non-retryable", async () => {
     const { result } = await executeAgentResult({
       engine: "codex",
@@ -298,9 +448,9 @@ describe("kernel attempt executor", () => {
     expect(result.outcome.reason.length).toBeLessThanOrEqual(1_500);
   });
 
-  it("classifies a missing engine credential by variable name only", async () => {
+  it("terminalizes a missing engine credential even on the initial retry ordinal", async () => {
     const { result } = await executeAgentResult({
-      env: {},
+      env: { OT_ACTION_WORK_RETRY_ORDINAL: "0" },
       execution: {
         status: 1,
         signal: null,
@@ -311,7 +461,7 @@ describe("kernel attempt executor", () => {
       },
     });
 
-    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: true });
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: false });
     expect(result.outcome.reason).toContain("reason=credential_missing");
     expect(result.outcome.reason).toContain("CLAUDE_CODE_OAUTH_TOKEN");
     expect(result.outcome.reason).toContain("status=1, signal=none, timed_out=false");

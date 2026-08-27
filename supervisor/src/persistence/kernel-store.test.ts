@@ -67,6 +67,7 @@ import {
   type KernelStoreFaultPoint,
   type PipelineAdmissionInput,
 } from "./kernel-store.js";
+import { SqliteKernelInboxStore } from "./kernel-inbox-store.js";
 
 const temporaryDirectories: string[] = [];
 const NOW = "2026-08-20T12:00:00.000Z";
@@ -890,6 +891,242 @@ describe("SqliteKernelStore", () => {
       });
       expect(admitted.run.status).toBe("pending");
       expect(Object.keys(admitted.run.active_attempt_versions)).toHaveLength(1);
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("atomically consumes the originating inbox event and stays settled across reopen", () => {
+    const context = setup();
+    let reopened: Database.Database | undefined;
+    try {
+      const inbox = new SqliteKernelInboxStore({
+        db: context.db,
+        blob_store: context.blobs,
+        now: () => NOW,
+      });
+      inbox.setMaintenanceFence({ closed: false });
+      const providerEvent = {
+        source_provider: "linear",
+        delivery_id: "delivery-admission",
+        kind: "linear/agent-session-event/prompted@1",
+        generation: 0,
+        event_group_key: "linear:admission:issue-1",
+        delivery_attempt: 1,
+        subject: subject("1"),
+        payload_schema: "openthrottle.provider-event/linear/v1",
+        payload: { issue: "OPE-1", prompt: "Execute the plan." },
+      } as const;
+      expect(inbox.ingest(providerEvent)).toMatchObject({ disposition: "inserted" });
+      const leased = inbox.leaseNext({
+        owner_id: "worker-admission",
+        lease_id: "lease-admission",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })!;
+
+      context.store.admitPipelineRun({
+        ...context.admission,
+        originating_inbox: {
+          event_id: leased.id,
+          source_provider: leased.source_provider,
+          delivery_id: leased.delivery_id,
+          kind: leased.kind,
+          payload_hash: leased.payload_hash,
+          lease_id: leased.lease_id!,
+          lease_owner_id: leased.lease_owner_id!,
+          version: leased.version,
+        },
+      });
+      expect(inbox.get(leased.id)).toMatchObject({
+        status: "consumed",
+        work_item_id: null,
+        pipeline_run_id: null,
+        attempt_id: null,
+        lease_id: null,
+        consumed_at: NOW,
+        version: leased.version + 1,
+      });
+      expect(context.db.prepare(`
+        SELECT w.created_at AS admitted_at, r.created_at AS run_created_at,
+          i.consumed_at AS origin_consumed_at
+        FROM work_items w
+        JOIN pipeline_runs r ON r.work_item_id = w.id
+        JOIN inbox_events i ON i.id = ?
+        WHERE w.id = ? AND r.id = ?
+      `).get(leased.id, context.admission.work_item.id, context.admission.run.id)).toEqual({
+        admitted_at: NOW,
+        run_created_at: NOW,
+        origin_consumed_at: NOW,
+      });
+      expect(() => inbox.complete({
+        event_id: leased.id,
+        owner_id: "worker-admission",
+        lease_id: "lease-admission",
+        outcome: "consumed",
+      })).not.toThrow();
+      expect(() => inbox.complete({
+        event_id: leased.id,
+        owner_id: "worker-admission",
+        lease_id: "lease-admission",
+        outcome: "stale",
+      })).toThrow(/completion lease fence/);
+      expect(inbox.ingest(providerEvent)).toMatchObject({
+        disposition: "duplicate",
+        event: { status: "consumed" },
+      });
+      expect(inbox.ingest({
+        ...providerEvent,
+        delivery_id: "delivery-admission-redelivery",
+        delivery_attempt: 2,
+      })).toMatchObject({ disposition: "reordered", event: { status: "stale" } });
+
+      context.db.close();
+      const reopenedBlobs = VolumeBlobStore.open(context.blobs.root, context.blobs.store_id);
+      reopened = openFreshEpochDatabase({
+        database_path: context.database_path,
+        blob_store: reopenedBlobs,
+        expected_identity: context.expected_identity,
+      });
+      const replayInbox = new SqliteKernelInboxStore({
+        db: reopened,
+        blob_store: reopenedBlobs,
+        now: () => "2026-08-20T12:01:00.000Z",
+      });
+      expect(replayInbox.get(leased.id)).toMatchObject({
+        status: "consumed",
+        work_item_id: null,
+        pipeline_run_id: null,
+        attempt_id: null,
+      });
+      expect(replayInbox.leaseNext({
+        owner_id: "worker-replay",
+        lease_id: "lease-replay",
+        expires_at: "2026-08-20T12:06:00.000Z",
+      })).toBeNull();
+    } finally {
+      if (reopened) reopened.close();
+      else context.db.close();
+    }
+  });
+
+  it("rolls back inbox consumption and admission after a post-consume fault", () => {
+    const context = setup((point) => {
+      if (point === "admission_inbox_consumed") throw new Error("fault after inbox consumption");
+    });
+    try {
+      const inbox = new SqliteKernelInboxStore({
+        db: context.db,
+        blob_store: context.blobs,
+        now: () => NOW,
+      });
+      inbox.setMaintenanceFence({ closed: false });
+      const inserted = inbox.ingest({
+        source_provider: "linear",
+        delivery_id: "delivery-atomic-rollback",
+        kind: "linear/agent-session-event/created@1",
+        generation: 0,
+        event_group_key: "linear:atomic-rollback",
+        delivery_attempt: 1,
+        payload_schema: "openthrottle.provider-event/linear/v1",
+        payload: { issue: "OPE-1" },
+      });
+      if (!("event" in inserted)) throw new Error("expected inserted inbox event");
+      const leased = inbox.leaseNext({
+        owner_id: "worker-admission",
+        lease_id: "lease-admission",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })!;
+
+      expect(() => context.store.admitPipelineRun({
+        ...context.admission,
+        originating_inbox: {
+          event_id: leased.id,
+          source_provider: leased.source_provider,
+          delivery_id: leased.delivery_id,
+          kind: leased.kind,
+          payload_hash: leased.payload_hash,
+          lease_id: leased.lease_id!,
+          lease_owner_id: leased.lease_owner_id!,
+          version: leased.version,
+        },
+      })).toThrow(/fault after inbox consumption/);
+      for (const table of ["definitions", "work_items", "pipeline_runs", "attempts"]) {
+        expect(context.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get())
+          .toEqual({ count: 0 });
+      }
+      expect(inbox.get(inserted.event.id)).toMatchObject({
+        status: "processing",
+        work_item_id: null,
+        pipeline_run_id: null,
+        attempt_id: null,
+      });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("rejects admission after the originating inbox event is re-leased", () => {
+    const context = setup();
+    try {
+      const inbox = new SqliteKernelInboxStore({
+        db: context.db,
+        blob_store: context.blobs,
+        now: () => NOW,
+      });
+      inbox.setMaintenanceFence({ closed: false });
+      inbox.ingest({
+        source_provider: "linear",
+        delivery_id: "delivery-released-admission",
+        kind: "linear/agent-session-event/prompted@1",
+        generation: 0,
+        event_group_key: "linear:re-leased-admission",
+        delivery_attempt: 1,
+        payload_schema: "openthrottle.provider-event/linear/v1",
+        payload: { issue: "OPE-1", prompt: "Execute the plan." },
+      });
+      const oldLease = inbox.leaseNext({
+        owner_id: "worker-old",
+        lease_id: "lease-old",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })!;
+      inbox.retry({
+        event_id: oldLease.id,
+        owner_id: "worker-old",
+        lease_id: "lease-old",
+        available_at: "2026-08-20T12:00:01.000Z",
+      });
+      const laterInbox = new SqliteKernelInboxStore({
+        db: context.db,
+        blob_store: context.blobs,
+        now: () => "2026-08-20T12:01:00.000Z",
+      });
+      const currentLease = laterInbox.leaseNext({
+        owner_id: "worker-current",
+        lease_id: "lease-current",
+        expires_at: "2026-08-20T12:06:00.000Z",
+      })!;
+
+      expect(() => context.store.admitPipelineRun({
+        ...context.admission,
+        originating_inbox: {
+          event_id: oldLease.id,
+          source_provider: oldLease.source_provider,
+          delivery_id: oldLease.delivery_id,
+          kind: oldLease.kind,
+          payload_hash: oldLease.payload_hash,
+          lease_id: oldLease.lease_id!,
+          lease_owner_id: oldLease.lease_owner_id!,
+          version: oldLease.version,
+        },
+      })).toThrow(/originating inbox admission fence/);
+      expect(laterInbox.get(currentLease.id)).toMatchObject({
+        status: "processing",
+        lease_id: "lease-current",
+        lease_owner_id: "worker-current",
+        version: currentLease.version,
+      });
+      expect(context.db.prepare("SELECT COUNT(*) AS count FROM pipeline_runs").get())
+        .toEqual({ count: 0 });
     } finally {
       context.db.close();
     }

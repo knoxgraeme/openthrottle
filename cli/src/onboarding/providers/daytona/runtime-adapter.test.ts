@@ -57,11 +57,21 @@ interface FakeSdkCalls {
   apiKeys: string[];
   getNames: string[];
   creates: DaytonaSnapshotCreateParams[];
+  imageBaseRefs: string[];
+  imageBaseResults: Array<{ dockerfile: string }>;
   listPages: Array<Array<number | undefined>>;
 }
 
 function fakeSdk(behavior: FakeSdkBehavior = {}): { sdk: () => Promise<DaytonaSdkLike>; calls: FakeSdkCalls } {
-  const calls: FakeSdkCalls = { loads: 0, apiKeys: [], getNames: [], creates: [], listPages: [] };
+  const calls: FakeSdkCalls = {
+    loads: 0,
+    apiKeys: [],
+    getNames: [],
+    creates: [],
+    imageBaseRefs: [],
+    imageBaseResults: [],
+    listPages: [],
+  };
   const client: DaytonaClientLike = {
     snapshot: {
       async get(name) {
@@ -95,10 +105,18 @@ function fakeSdk(behavior: FakeSdkBehavior = {}): { sdk: () => Promise<DaytonaSd
     calls.apiKeys.push(config.apiKey);
     return client;
   } as unknown as DaytonaSdkLike["Daytona"];
+  const Image = {
+    base(ref: string) {
+      const image = { dockerfile: `FROM ${ref}\n` };
+      calls.imageBaseRefs.push(ref);
+      calls.imageBaseResults.push(image);
+      return image;
+    },
+  };
   return {
     sdk: async () => {
       calls.loads += 1;
-      return { Daytona };
+      return { Daytona, Image };
     },
     calls,
   };
@@ -223,6 +241,8 @@ describe("daytona runtime adapter", () => {
     if ("fragment" in result) throw new Error("expected pending evidence");
     expect(result.status).toBe("needs_action");
     expect(result.summary).toContain(`snapshot ${SNAPSHOT_NAME} not found`);
+    expect(result.summary).toContain("exact digest-backed wrapper build");
+    expect(result.summary).toContain("no repository build context");
     expect(result.summary).toContain(release.sandboxImage);
     expect(() => validateEvidence(result)).not.toThrow();
   });
@@ -237,7 +257,8 @@ describe("daytona runtime adapter", () => {
 
     expect(await adapter.plan(contextFor())).toEqual({
       mutations: [
-        `create Daytona snapshot ${SNAPSHOT_NAME} from ${release.sandboxImage} (cpu 2 / mem 4 GiB / disk 20 GiB)`,
+        `create Daytona snapshot ${SNAPSHOT_NAME} with an exact digest-backed wrapper build from ` +
+          `${release.sandboxImage} and no repository build context (cpu 2 / mem 4 GiB / disk 20 GiB)`,
       ],
       billable: false,
       externallyVisible: false,
@@ -251,7 +272,7 @@ describe("daytona runtime adapter", () => {
     expect(await adapter.plan(contextFor())).toEqual({ mutations: [], billable: false, externallyVisible: false });
   });
 
-  it("ensure creates the snapshot from the pinned registry image and returns the re-inspected result", async () => {
+  it("ensure creates the snapshot through an exact digest-backed Image wrapper", async () => {
     let missing = true;
     const logs: string[] = [];
     const { sdk, calls } = fakeSdk({
@@ -269,9 +290,18 @@ describe("daytona runtime adapter", () => {
 
     const result = await adapter.ensure(contextFor());
 
+    expect(calls.imageBaseRefs).toEqual([release.sandboxImage]);
+    expect(calls.imageBaseResults).toHaveLength(1);
     expect(calls.creates).toEqual([
-      { name: SNAPSHOT_NAME, image: release.sandboxImage, resources: { cpu: 2, memory: 4, disk: 20 } },
+      {
+        name: SNAPSHOT_NAME,
+        image: calls.imageBaseResults[0],
+        resources: { cpu: 2, memory: 4, disk: 20 },
+      },
     ]);
+    expect(calls.creates[0]?.image).toBe(calls.imageBaseResults[0]);
+    expect(typeof calls.creates[0]?.image).not.toBe("string");
+    expect(calls.loads).toBe(1);
     expect(logs).toEqual(["build progress line"]);
     // Probed once before the create and re-inspected once afterwards.
     expect(calls.getNames).toEqual([SNAPSHOT_NAME, SNAPSHOT_NAME]);
