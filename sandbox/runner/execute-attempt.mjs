@@ -359,9 +359,13 @@ function agentLaunchFailure(request, execution, env) {
     `agent work failed (${termination}, reason=${classified.reason}).`,
     classified.remediation,
   ].filter(Boolean).join(" ");
+  const credentialRejected = classified.reason === "credential_rejected";
   return {
     state: "work_failed",
-    retryable: Boolean(
+    // Generic termination signals must not turn a positively classified
+    // credential rejection back into retryable work: a retry would seed the
+    // same supervisor-owned credential again.
+    retryable: credentialRejected ? false : Boolean(
       classified.retryable || execution.timedOut || execution.signal || execution.error || execution.status === 137
     ),
     reason: boundedAgentFailureReason(prefix, {

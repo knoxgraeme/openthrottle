@@ -287,6 +287,45 @@ describe("kernel attempt executor", () => {
     expect(persisted).not.toContain("[REDACTED]");
   });
 
+  it("terminalizes a sealed Codex credential rejection without leaking provider output", async () => {
+    const accessToken = "fixture-codex-rejected-access-token";
+    const idToken = "fixture-codex-rejected-id-token";
+    const authJson = JSON.stringify({ tokens: { access_token: accessToken, id_token: idToken } });
+    const { result, persisted } = await executeAgentResult({
+      engine: "codex",
+      env: { CODEX_AUTH_JSON: authJson },
+      execution: {
+        status: null,
+        signal: "SIGTERM",
+        timedOut: true,
+        nativeSessionId: null,
+        stdout: JSON.stringify({
+          type: "turn.failed",
+          error: {
+            type: "authentication_error",
+            code: "invalid_token",
+            status: 401,
+            message: `401 Unauthorized: token ${accessToken} is invalid`,
+          },
+        }),
+        stderr: `provider rejected ${idToken}`,
+      },
+    });
+
+    expect(result.outcome).toMatchObject({ state: "work_failed", retryable: false });
+    expect(result.outcome.reason).toContain("reason=credential_rejected");
+    expect(result.outcome.reason).toContain("status=none, signal=SIGTERM, timed_out=true");
+    expect(result.outcome.reason).toContain("provider_event=turn.failed");
+    expect(result.outcome.reason).toContain("error_type=authentication_error");
+    expect(result.outcome.reason).toContain("error_code=invalid_token");
+    expect(result.outcome.reason).toContain("provider_status=401");
+    expect(result.outcome.reason).toContain("provider_error=credential_rejected");
+    expect(persisted).not.toContain(accessToken);
+    expect(persisted).not.toContain(idToken);
+    expect(persisted).not.toContain("Unauthorized");
+    expect(persisted).not.toContain("[REDACTED]");
+  });
+
   it("keeps deterministic Codex preparation errors non-retryable", async () => {
     const { result } = await executeAgentResult({
       engine: "codex",

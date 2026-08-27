@@ -58,7 +58,7 @@ describe("launch failure classification", () => {
     expect(classified).toMatchObject({
       reason: "credential_rejected",
       credentialFailure: true,
-      retryable: true,
+      retryable: false,
     });
   });
 
@@ -136,7 +136,7 @@ describe("launch failure classification", () => {
       result: "API Error: authentication_error: invalid oauth token",
     });
     expect(classifyLaunchFailure({ agent: "claude", stdout, stderr: "", credentialPresent: true }))
-      .toMatchObject({ reason: "credential_rejected", credentialFailure: true, retryable: true });
+      .toMatchObject({ reason: "credential_rejected", credentialFailure: true, retryable: false });
   });
 
   it("reports a rate limit from a rejected Claude rate_limit_event", () => {
@@ -188,7 +188,7 @@ describe("launch failure classification", () => {
       error: { message: "401 Unauthorized: token is invalid" },
     });
     expect(classifyLaunchFailure({ agent: "codex", stdout, stderr: "", credentialPresent: true }))
-      .toMatchObject({ reason: "credential_rejected", credentialFailure: true, retryable: true });
+      .toMatchObject({ reason: "credential_rejected", credentialFailure: true, retryable: false });
   });
 
   it("falls back to an engine crash for anything else", () => {

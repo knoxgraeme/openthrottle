@@ -229,10 +229,12 @@ export function classifyLaunchFailure({
   return {
     reason,
     credentialFailure: reason === "credential_missing" || reason === "credential_rejected",
-    // Neither a missing/rejected credential nor a provider usage limit is the
-    // agent's fault, so they stay infrastructure-shaped and must not consume a
-    // semantic repair round. An engine crash keeps the caller's own shape.
-    retryable: reason !== "engine_crash",
+    // A rejected credential cannot change during a kernel work retry. Retrying
+    // it would only seed the same supervisor-owned credential again and burn
+    // the Attempt's full retry ladder. Other infrastructure-shaped failures
+    // retain their existing retry policy; an engine crash keeps the caller's
+    // own shape.
+    retryable: reason !== "engine_crash" && reason !== "credential_rejected",
     remediation: remediationFor(reason, agent),
   };
 }
