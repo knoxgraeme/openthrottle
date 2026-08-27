@@ -150,10 +150,11 @@ describe("SqliteKernelInboxStore", () => {
     })).toThrow(/lease fence/);
   });
 
-  it("bounds verified observation to unsettled provider events", () => {
+  it("bounds exact consumed-origin observation by provider, kind, status, and timestamp", () => {
     const { store } = setup();
     const first = store.ingest({
       ...event("admission-1"),
+      id: "inbox-admission-1",
       kind: "github/issues/labeled@1",
       event_group_key: "issue:188:labeled",
       payload: {
@@ -163,6 +164,7 @@ describe("SqliteKernelInboxStore", () => {
     });
     const second = store.ingest({
       ...event("admission-2"),
+      id: "inbox-admission-2",
       kind: "github/issues/edited@1",
       event_group_key: "issue:189:edited",
       payload: {
@@ -174,41 +176,57 @@ describe("SqliteKernelInboxStore", () => {
       throw new Error("fixture events were not inserted");
     }
 
-    expect(store.matchUnsettled({
-      source_provider: "github",
-      kinds: ["github/issues/labeled@1", "github/issues/edited@1"],
-      exclude_event_id: "inbox-current-stop",
-      limit: 1,
-    }, () => true)).toBe("matched");
-    const observed = store.matchUnsettled({
-      source_provider: "github",
-      kinds: ["github/issues/labeled@1", "github/issues/edited@1"],
-      exclude_event_id: "inbox-current-stop",
-      limit: 1,
-    }, () => false);
-    expect(observed).toBe("truncated");
-
-    const leased = store.leaseNext({
-      owner_id: "worker-1",
-      lease_id: "lease-observed",
-      expires_at: "2026-08-20T12:05:00.000Z",
-    })!;
-    store.complete({
-      event_id: leased.id,
-      owner_id: "worker-1",
-      lease_id: "lease-observed",
-      outcome: "stale",
+    for (const [index, expectedId] of [first.event.id, second.event.id].entries()) {
+      const leaseId = `lease-observed-${index}`;
+      const leased = store.leaseNext({
+        owner_id: "worker-1",
+        lease_id: leaseId,
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })!;
+      expect(leased.id).toBe(expectedId);
+      store.complete({
+        event_id: leased.id,
+        owner_id: "worker-1",
+        lease_id: leaseId,
+        outcome: "consumed",
+      });
+    }
+    store.ingest({
+      ...event("still-pending"),
+      id: "inbox-admission-pending",
+      kind: "github/issues/labeled@1",
+      event_group_key: "issue:190:labeled",
     });
-    const otherEventId = leased.id === first.event.id ? second.event.id : first.event.id;
-    expect(store.matchUnsettled({
+
+    expect(store.listConsumedAt({
       source_provider: "github",
       kinds: ["github/issues/labeled@1", "github/issues/edited@1"],
-      exclude_event_id: otherEventId,
-      limit: 2,
-    }, () => true)).toBe("none");
+      consumed_at: KERNEL_FIXTURE_NOW,
+      limit: 1,
+    })).toMatchObject({
+      events: [{ id: "inbox-admission-2", status: "consumed", consumed_at: KERNEL_FIXTURE_NOW }],
+      truncated: true,
+      corrupt: false,
+    });
+    expect(store.listConsumedAt({
+      source_provider: "github",
+      kinds: ["github/issues/labeled@1", "github/issues/edited@1"],
+      consumed_at: KERNEL_FIXTURE_NOW,
+      limit: 10,
+    })).toMatchObject({
+      events: [{ id: "inbox-admission-2" }, { id: "inbox-admission-1" }],
+      truncated: false,
+      corrupt: false,
+    });
+    expect(store.listConsumedAt({
+      source_provider: "github",
+      kinds: ["github/issues/labeled@1", "github/issues/edited@1"],
+      consumed_at: "2026-08-20T12:00:00.001Z",
+      limit: 10,
+    })).toEqual({ events: [], truncated: false, corrupt: false });
   });
 
-  it("does not retain deterministically unreadable observation candidates", () => {
+  it("reports deterministically corrupt exact-origin candidates", () => {
     const { fixture, store } = setup();
     const corrupt = store.ingest({
       ...event("corrupt-admission"),
@@ -224,15 +242,67 @@ describe("SqliteKernelInboxStore", () => {
       },
     });
     if (corrupt.disposition !== "inserted") throw new Error("fixture event was not inserted");
+    const leased = store.leaseNext({
+      owner_id: "worker-1",
+      lease_id: "lease-corrupt-origin",
+      expires_at: "2026-08-20T12:05:00.000Z",
+    })!;
+    store.complete({
+      event_id: leased.id,
+      owner_id: "worker-1",
+      lease_id: "lease-corrupt-origin",
+      outcome: "consumed",
+    });
     fixture.db.prepare("UPDATE inbox_events SET blob_algorithm = NULL WHERE id = ?")
       .run(corrupt.event.id);
 
-    expect(store.matchUnsettled({
+    expect(store.listConsumedAt({
       source_provider: "github",
       kinds: ["github/issues/labeled@1"],
-      exclude_event_id: "inbox-current-stop",
+      consumed_at: KERNEL_FIXTURE_NOW,
       limit: 10,
-    }, () => true)).toBe("none");
+    })).toEqual({ events: [], truncated: false, corrupt: true });
+  });
+
+  it("propagates transient blob failures while verifying an exact origin", () => {
+    const { fixture, store } = setup();
+    const origin = store.ingest({
+      ...event("transient-origin"),
+      kind: "github/issues/labeled@1",
+      event_group_key: "issue:transient-origin:labeled",
+      payload: {
+        repository: { full_name: "owner/repo" },
+        issue: {
+          number: 188,
+          body: "x".repeat(70_000),
+          labels: [{ name: "openthrottle" }],
+        },
+      },
+    });
+    if (origin.disposition !== "inserted") throw new Error("fixture event was not inserted");
+    const leased = store.leaseNext({
+      owner_id: "worker-1",
+      lease_id: "lease-transient-origin",
+      expires_at: "2026-08-20T12:05:00.000Z",
+    })!;
+    store.complete({
+      event_id: leased.id,
+      owner_id: "worker-1",
+      lease_id: "lease-transient-origin",
+      outcome: "consumed",
+    });
+    const pointer = fixture.db.prepare("SELECT blob_digest FROM inbox_events WHERE id = ?")
+      .get(origin.event.id) as { blob_digest: string };
+    vi.spyOn(fixture.blobs, "read").mockImplementationOnce(() => {
+      throw new BlobAvailabilityError(pointer.blob_digest, "EIO");
+    });
+
+    expect(() => store.listConsumedAt({
+      source_provider: "github",
+      kinds: ["github/issues/labeled@1"],
+      consumed_at: KERNEL_FIXTURE_NOW,
+      limit: 10,
+    })).toThrow(BlobAvailabilityError);
   });
 
   it("prewrites large payloads before committing a verified pointer", () => {

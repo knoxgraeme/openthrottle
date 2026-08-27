@@ -946,6 +946,18 @@ describe("SqliteKernelStore", () => {
         consumed_at: NOW,
         version: leased.version + 1,
       });
+      expect(context.db.prepare(`
+        SELECT w.created_at AS admitted_at, r.created_at AS run_created_at,
+          i.consumed_at AS origin_consumed_at
+        FROM work_items w
+        JOIN pipeline_runs r ON r.work_item_id = w.id
+        JOIN inbox_events i ON i.id = ?
+        WHERE w.id = ? AND r.id = ?
+      `).get(leased.id, context.admission.work_item.id, context.admission.run.id)).toEqual({
+        admitted_at: NOW,
+        run_created_at: NOW,
+        origin_consumed_at: NOW,
+      });
       expect(() => inbox.complete({
         event_id: leased.id,
         owner_id: "worker-admission",

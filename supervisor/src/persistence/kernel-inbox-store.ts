@@ -122,12 +122,12 @@ export interface KernelInboxDeliveryPort {
 }
 
 export interface KernelInboxObservationPort {
-  matchUnsettled(input: {
+  listConsumedAt(input: {
     source_provider: string;
     kinds: readonly string[];
-    exclude_event_id: string;
+    consumed_at: string;
     limit: number;
-  }, matches: (event: KernelInboxEvent) => boolean): "matched" | "none" | "truncated";
+  }): { events: readonly KernelInboxEvent[]; truncated: boolean; corrupt: boolean };
 }
 
 interface InboxRow {
@@ -530,14 +530,14 @@ export class SqliteKernelInboxStore implements
     return row ? this.#event(row) : undefined;
   }
 
-  matchUnsettled(input: {
+  listConsumedAt(input: {
     source_provider: string;
     kinds: readonly string[];
-    exclude_event_id: string;
+    consumed_at: string;
     limit: number;
-  }, matches: (event: KernelInboxEvent) => boolean): "matched" | "none" | "truncated" {
+  }): { events: readonly KernelInboxEvent[]; truncated: boolean; corrupt: boolean } {
     bounded(input.source_provider, "inbox observation source_provider", 100, PROVIDER);
-    bounded(input.exclude_event_id, "inbox observation excluded event ID", 200, ID);
+    iso(input.consumed_at, "inbox observation consumed_at");
     if (
       !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100 ||
       input.kinds.length < 1 || input.kinds.length > 20
@@ -549,26 +549,26 @@ export class SqliteKernelInboxStore implements
     const rows = this.#db.prepare(`
       SELECT * FROM inbox_events
       WHERE source_provider = ? AND kind IN (${placeholders})
-        AND status IN ('pending', 'processing') AND consumed_at IS NULL AND id != ?
-      ORDER BY created_at, id
+        AND status = 'consumed' AND consumed_at = ?
+      ORDER BY created_at DESC, id DESC
       LIMIT ?
-    `).iterate(
+    `).all(
       input.source_provider,
       ...input.kinds,
-      input.exclude_event_id,
+      input.consumed_at,
       input.limit + 1,
-    ) as IterableIterator<InboxRow>;
-    let inspected = 0;
-    for (const row of rows) {
-      if (inspected === input.limit) return "truncated";
-      inspected += 1;
+    ) as InboxRow[];
+    const events: KernelInboxEvent[] = [];
+    let corrupt = false;
+    for (const row of rows.slice(0, input.limit)) {
       try {
-        if (matches(this.#event(row))) return "matched";
+        events.push(this.#event(row));
       } catch (error) {
         if (!(error instanceof InboxPayloadCorruptionError)) throw error;
+        corrupt = true;
       }
     }
-    return "none";
+    return { events, truncated: rows.length > input.limit, corrupt };
   }
 
   #normalizeInput(input: KernelInboxEventInput): Required<
