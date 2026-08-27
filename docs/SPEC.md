@@ -292,7 +292,12 @@ subject.
 Action checkpoints are private execution evidence. Their intermediate commit
 ancestry may preserve rejected or superseded work needed for deterministic
 review, correction, and integration, so those commits and bundles are never
-published directly. Publication first projects only the final accepted tree
+published directly. The candidate input subject remains the checkpoint's exact
+immediate parent; it is not interchangeable with the stable checkpoint-base
+subject that roots candidate ancestry, independent current ancestry, and a
+three-tree merge between sibling branches. The advancing integration subject
+is a third identity and becomes the sole parent of the compact publication
+commit. Publication first projects only the final accepted tree
 onto one executor-owned commit whose sole parent is the exact safe publication
 anchor: the sealed source commit for a first publication, or the last confirmed
 task-ref head for an update. The resulting bounded bundle is independently
@@ -515,12 +520,19 @@ The worker follows this order:
 1. lease the Effect;
 2. reconcile the target using its idempotency key and expected identity;
 3. if already committed, verify exact evidence and write a DeliveryRecord;
-4. if absent, perform at most one dispatch for the leased attempt;
-5. reconcile again and record confirmed/rejected evidence;
-6. if outcome is unknown, release with backoff in reconcile-only mode.
+4. if absent, finish any idempotent provider preparation before durably fencing
+   dispatch as started;
+5. perform at most one dispatch for the leased attempt;
+6. reconcile again and record confirmed/rejected evidence;
+7. if outcome is unknown, release with backoff in reconcile-only mode.
 
 An unknown external outcome is never blindly replayed. Conflicting external
 identity, target, subject, or payload fails closed.
+Provider preparation must not cross the external mutation entrypoint. A
+preparation failure therefore remains retryable without a dispatch-start fence.
+After that fence commits, an exact provider-owned proof that launch never began
+may resume only the same fenced dispatch; launch proof keeps the Effect
+reconcile-only even when its result is not yet observable.
 
 A deploy-authorized operator may turn one exact dispatch-fenced unknown Effect
 into rejected evidence only while mutating ingress is closed at an exact

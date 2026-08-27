@@ -737,11 +737,20 @@ export function createStructuredIntegrationAttempt(input: {
       checkpoint.id === input.source.candidate_checkpoint.id
     ) throw new Error("integration current ancestry contains a foreign checkpoint");
   }
+  const candidateInputIsOnCurrentAncestry =
+    input.source.candidate_checkpoint.input_subject === input.input_subject ||
+    suppliedAncestry.some(
+      ({ input_subject: subject }) =>
+        subject === input.source.candidate_checkpoint.input_subject,
+    );
+  const currentAncestryStartSubject = candidateInputIsOnCurrentAncestry
+    ? input.source.candidate_checkpoint.input_subject
+    : input.bundle.source_commit;
   const currentAncestry = suppliedAncestry.length === 0
     ? []
     : orderedStructuredCheckpointAncestry({
       checkpoints: suppliedAncestry,
-      start_subject: input.source.candidate_checkpoint.input_subject,
+      start_subject: currentAncestryStartSubject,
       end_subject: input.input_subject,
       label: "integration current ancestry",
     });

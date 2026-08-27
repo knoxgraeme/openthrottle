@@ -609,6 +609,162 @@ describe("kernel effect execution", () => {
     });
   });
 
+  it("retries failed provider preparation without persisting a dispatch-start fence", async () => {
+    const intent = effect({ kind: "daytona/integrate-checkpoint@1" });
+    const preparedFences: Array<{ lease_id: string; worker_id: string } | null> = [];
+    const dispatchedFences: Array<{ lease_id: string; worker_id: string } | null> = [];
+    let preparations = 0;
+    const observations: KernelEffectProviderObservation[] = [
+      { kind: "not_found" },
+      { kind: "not_found" },
+      { kind: "found", status: "confirmed", payload: { subject: SUBJECT } },
+    ];
+    const adapter: KernelEffectRuntimeAdapter = {
+      async reconcile() {
+        const observation = observations.shift();
+        if (!observation) throw new Error("unexpected reconciliation");
+        return observation;
+      },
+      async prepareDispatch(request) {
+        expect(request).toMatchObject({
+          intent,
+          external_identity: intent.target,
+          deduplication: {
+            strategy: "deterministic_target",
+            key: intent.idempotency_key,
+            target: intent.target,
+          },
+        });
+        preparedFences.push(request.dispatch_fence);
+        preparations += 1;
+        if (preparations === 1) throw new Error("checkpoint upload failed before entrypoint");
+      },
+      async dispatch(request) {
+        dispatchedFences.push(request.dispatch_fence);
+      },
+    };
+    const secondLease = {
+      ...lease(intent, "dispatch_or_reconcile", 2),
+      lease_id: "lease-2",
+      expires_at: "2026-08-20T12:02:00.000Z",
+    };
+    const port = new FakeEffectPort([lease(intent), secondLease]);
+    const executor = service({
+      port,
+      binding: binding(adapter, { effect_kind: intent.kind, provider: "daytona" }),
+    });
+
+    await expect(executor.drainOne({
+      worker_id: "worker-1",
+      lease_id: "lease-1",
+      expires_at: "2026-08-20T12:01:00.000Z",
+    })).resolves.toMatchObject({
+      kind: "held_unknown",
+      detail: expect.stringMatching(/checkpoint upload failed before entrypoint/i),
+    });
+    expect(port.dispatchStarts).toHaveLength(0);
+    expect(dispatchedFences).toHaveLength(0);
+
+    await expect(executor.drainOne({
+      worker_id: "worker-2",
+      lease_id: "lease-2",
+      expires_at: "2026-08-20T12:02:00.000Z",
+    })).resolves.toMatchObject({
+      kind: "delivered",
+      path: "dispatched_then_reconciled",
+    });
+    expect(preparedFences).toEqual([
+      { lease_id: "lease-1", worker_id: "worker-1" },
+      { lease_id: "lease-2", worker_id: "worker-2" },
+    ]);
+    expect(port.dispatchStarts).toEqual([{
+      effect_id: intent.id,
+      lease_id: "lease-2",
+      worker_id: "worker-2",
+    }]);
+    expect(dispatchedFences).toEqual([{
+      lease_id: "lease-2",
+      worker_id: "worker-2",
+    }]);
+  });
+
+  it("resumes a reconcile-only dispatch with its exact persisted fence when the provider proves entrypoint was not crossed", async () => {
+    const intent = effect({ kind: "daytona/integrate-checkpoint@1" });
+    const dispatchFence = { lease_id: "dispatch-lease-1", worker_id: "worker-1" };
+    let preparations = 0;
+    const dispatchedFences: Array<{ lease_id: string; worker_id: string } | null> = [];
+    const observations: KernelEffectProviderObservation[] = [
+      { kind: "dispatch_not_started" },
+      { kind: "found", status: "confirmed", payload: { subject: SUBJECT } },
+    ];
+    const adapter: KernelEffectRuntimeAdapter = {
+      async reconcile() {
+        const observation = observations.shift();
+        if (!observation) throw new Error("unexpected reconciliation");
+        return observation;
+      },
+      async prepareDispatch() {
+        preparations += 1;
+      },
+      async dispatch(request) {
+        dispatchedFences.push(request.dispatch_fence);
+      },
+    };
+    const recoveryLease = {
+      ...lease(intent, "reconcile_only", 2),
+      lease_id: "recovery-lease-2",
+      expires_at: "2026-08-20T12:02:00.000Z",
+      dispatch_fence: dispatchFence,
+    };
+    const port = new FakeEffectPort([recoveryLease]);
+
+    await expect(service({
+      port,
+      binding: binding(adapter, { effect_kind: intent.kind, provider: "daytona" }),
+    }).drainOne({
+      worker_id: "worker-2",
+      lease_id: "recovery-lease-2",
+      expires_at: "2026-08-20T12:02:00.000Z",
+    })).resolves.toMatchObject({
+      kind: "delivered",
+      path: "dispatched_then_reconciled",
+    });
+
+    expect(preparations).toBe(0);
+    expect(port.dispatchStarts).toHaveLength(0);
+    expect(dispatchedFences).toEqual([dispatchFence]);
+  });
+
+  it.each([
+    ["dispatch-or-reconcile lease", lease(effect())],
+    ["reconcile-only lease without a fence", {
+      ...lease(effect(), "reconcile_only"),
+      dispatch_fence: null,
+    }],
+  ] as const)("fails closed when %s receives dispatch-not-started proof", async (_label, invalidLease) => {
+    let dispatches = 0;
+    const adapter: KernelEffectRuntimeAdapter = {
+      async reconcile() {
+        return { kind: "dispatch_not_started" };
+      },
+      async dispatch() {
+        dispatches += 1;
+      },
+    };
+    const port = new FakeEffectPort([invalidLease]);
+
+    await expect(service({ port, binding: binding(adapter) }).drainOne({
+      worker_id: "worker-1",
+      lease_id: "lease-1",
+      expires_at: "2026-08-20T12:01:00.000Z",
+    })).resolves.toMatchObject({
+      kind: "held_unknown",
+      detail: expect.stringMatching(/dispatch-not-started.*invalid/i),
+    });
+    expect(dispatches).toBe(0);
+    expect(port.dispatchStarts).toHaveLength(0);
+  });
+
   it("never dispatches an observation-only wait when its target is not present yet", async () => {
     const events: string[] = [];
     const adapter = scriptedAdapter({ events, observations: [{ kind: "not_found" }] });
@@ -692,6 +848,42 @@ describe("kernel effect execution", () => {
       kind: "hold_unknown",
       detail: expect.stringMatching(/absent after dispatch.*indeterminate/i),
     });
+  });
+
+  it("schedules a retry without looping when post-dispatch reconciliation proves entrypoint was not crossed", async () => {
+    const intent = effect({ kind: "daytona/integrate-checkpoint@1" });
+    let dispatches = 0;
+    const observations: KernelEffectProviderObservation[] = [
+      { kind: "not_found" },
+      { kind: "dispatch_not_started" },
+    ];
+    const adapter: KernelEffectRuntimeAdapter = {
+      async reconcile() {
+        const observation = observations.shift();
+        if (!observation) throw new Error("same-cycle dispatch loop");
+        return observation;
+      },
+      async prepareDispatch() {},
+      async dispatch() {
+        dispatches += 1;
+      },
+    };
+    const port = new FakeEffectPort([lease(intent)]);
+
+    await expect(service({
+      port,
+      binding: binding(adapter, { effect_kind: intent.kind, provider: "daytona" }),
+    }).drainOne({
+      worker_id: "worker-1",
+      lease_id: "lease-1",
+      expires_at: "2026-08-20T12:01:00.000Z",
+    })).resolves.toMatchObject({
+      kind: "held_unknown",
+      detail: expect.stringMatching(/dispatch-not-started.*retry/i),
+      retry_at: "2026-08-20T12:00:05.000Z",
+    });
+    expect(dispatches).toBe(1);
+    expect(port.dispatchStarts).toHaveLength(1);
   });
 
   it("reconciles a provider timeout after acceptance instead of retrying dispatch", async () => {

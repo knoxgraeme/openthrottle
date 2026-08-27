@@ -39,9 +39,15 @@ schedules `repair_unit` with edit authority.
 
 `integrate_unit` is an executor Effect. It accepts only a unit candidate whose
 lead DecisionRecord and Checkpoint are exact and settled. Integration is serial
-against the run's current subject. It records delivery evidence and either
-selects the next accepted integration, exposes newly ready units, or advances
-to whole-change gates.
+against the run's current subject. A candidate's exact private input parent may
+differ from both the stable checkpoint base and the advancing integration head;
+when accepted siblings diverge, the executor proves both branches from that
+stable base and imports the complete current ancestry into the selected runtime
+slot before merging. It records delivery evidence and either selects the next
+accepted integration, exposes newly ready units, or advances to whole-change
+gates. Candidate plus current-ancestry artifacts must fit the sealed aggregate
+evidence bound; an oversized integration terminalizes to `needs_human` before
+provider preparation instead of stalling the worker.
 
 ## Whole-change assurance
 
@@ -88,5 +94,8 @@ all whole-change commands and reviews repeat within finite budgets.
 - The complete fixed Daytona pool is provisioned before normal execution.
   Stop, cleanup, and provider-backed recovery own every slot; partial provision
   cleans every confirmed create, and unsafe whole-pool replay fails closed.
+- Integration preparation is idempotent and happens before the durable
+  dispatch-start fence. Exact proof that launch did not begin permits only the
+  same fenced dispatch to resume; launch proof remains reconcile-only.
 - Stop, failure, human intervention, or retry exhaustion must stop and clean a
   confirmed Daytona pool before terminal settlement.

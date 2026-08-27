@@ -33,6 +33,16 @@ export const KERNEL_RUNTIME_RESULT_SCHEMA = "openthrottle.kernel-runtime-result/
 export const KERNEL_SESSION_EVENT_SCHEMA = "openthrottle.kernel-session-event/v1" as const;
 export const ATTEMPT_CHECKPOINT_WIRE_SCHEMA = "openthrottle.attempt-checkpoint-wire/v1" as const;
 export const KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024;
+export const KERNEL_INTEGRATION_EVIDENCE_MAX_BYTES = KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES;
+
+export function addKernelIntegrationEvidenceBytes(
+  aggregateBytes: number,
+  artifactBytes: number,
+): number | null {
+  return artifactBytes > KERNEL_INTEGRATION_EVIDENCE_MAX_BYTES - aggregateBytes
+    ? null
+    : aggregateBytes + artifactBytes;
+}
 
 type KernelRequest = KernelWorkActionRequest | KernelResultCorrectionRequest;
 

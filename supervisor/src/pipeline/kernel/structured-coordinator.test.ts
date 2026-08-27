@@ -1120,6 +1120,56 @@ describe("structured kernel coordinator", () => {
       .toThrow(/ancestry.*gap|gap.*ancestry|fork/i);
   });
 
+  it("carries the completed base ancestry when a sibling candidate input is private", () => {
+    const { bundle, manifest } = definitions();
+    const accepted = acceptedUnitEvidence();
+    const candidate = { ...accepted.candidate_checkpoint, input_subject: "8".repeat(40) };
+    const source: StructuredAcceptedUnitEvidence = {
+      ...accepted,
+      candidate_checkpoint: candidate,
+      acceptance: {
+        ...accepted.acceptance,
+        action_inputs: {
+          ...accepted.acceptance.action_inputs,
+          context: {
+            ...accepted.acceptance.action_inputs.context,
+            checkpoints: [candidate],
+          },
+        },
+      },
+    };
+    const first = acceptedIntegrationEvidence("unit-b", 1).checkpoint;
+    const finalSubject = "4".repeat(40);
+    const second: AttemptCheckpoint = {
+      ...first,
+      id: "checkpoint-integration-unit-c",
+      attempt_id: "attempt-integration-unit-c",
+      request_hash: "e".repeat(64),
+      input_subject: CURRENT_SUBJECT,
+      output_subject: finalSubject,
+    };
+
+    const integration = createStructuredIntegrationAttempt({
+      pipeline_run_id: "run-1",
+      parent_attempt_id: "parent",
+      member_id: "unit-a",
+      round: 2,
+      stage_id: "integration",
+      input_subject: finalSubject,
+      task_prompt: "Integrate sibling unit A without exposing its private parent.",
+      source,
+      current_ancestry_checkpoints: [first, second],
+      bundle,
+      manifest,
+    });
+
+    expect(integration.context_checkpoint_ids).toEqual([
+      candidate.id,
+      first.id,
+      second.id,
+    ].sort());
+  });
+
   it("preserves or replaces exactly one causal task-ref push when creating integration", () => {
     const { bundle, manifest } = definitions();
     const inherited = githubPushDelivery("delivery-push-d1", "1".repeat(40), "create");

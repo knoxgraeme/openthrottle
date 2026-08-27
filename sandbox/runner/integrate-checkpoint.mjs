@@ -245,12 +245,23 @@ export function integrateCheckpoint({
 
     const sourceGitDir = resolve(sourceRepoDir, runGitAsExecutor(sourceRepoDir, ["rev-parse", "--git-common-dir"]));
     const environment = { GIT_ALTERNATE_OBJECT_DIRECTORIES: join(sourceGitDir, "objects"), ...AUTHOR_ENV };
+    const checkpointBaseCommit = runGitAsExecutor(
+      sourceRepoDir,
+      ["rev-parse", `${request.checkpoint_base_subject}^{commit}`],
+    );
+    if (checkpointBaseCommit !== request.checkpoint_base_subject) {
+      throw new Error("checkpoint base must name its exact commit");
+    }
+    const checkpointBaseTree = runGitAsExecutor(
+      sourceRepoDir,
+      ["rev-parse", `${checkpointBaseCommit}^{tree}`],
+    );
     const currentCommit = runGitAsExecutor(sourceRepoDir, ["rev-parse", `${request.current_subject}^{commit}`]);
     if (currentCommit !== request.current_subject) throw new Error("current subject must name its exact commit");
     for (const subject of [inputCommit, currentCommit]) {
       try {
         runGitAsExecutor(sourceRepoDir, [
-          "merge-base", "--is-ancestor", request.checkpoint_base_subject, subject,
+          "merge-base", "--is-ancestor", checkpointBaseCommit, subject,
         ]);
       } catch {
         throw new Error("integration subject does not descend from the sealed checkpoint base");
@@ -293,16 +304,8 @@ export function integrateCheckpoint({
           ]);
           currentBuildsOnCandidate = true;
         } catch {}
-        if (!currentBuildsOnCandidate) {
-          result = integrationFailure(
-            request,
-            "needs_human",
-            "checkpoint integration conflict: candidate input and current have incompatible ancestry",
-          );
-          writeImmutable(resultPath, result);
-          return result;
-        }
-        const merged = mergeTree(temporary, inputTree, currentTree, candidateTree, environment);
+        const mergeBaseTree = currentBuildsOnCandidate ? inputTree : checkpointBaseTree;
+        const merged = mergeTree(temporary, mergeBaseTree, currentTree, candidateTree, environment);
         if (merged.conflict) {
           result = integrationFailure(
             request,

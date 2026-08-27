@@ -34,6 +34,7 @@ import {
   mergeCausalGithubPushContext,
 } from "../pipeline/kernel/successor-attempt.js";
 import type { KernelAttempt } from "../pipeline/kernel/types.js";
+import { addKernelIntegrationEvidenceBytes } from "../runtime/kernel-wire.js";
 import {
   assertStructuredRequestContextExact,
   assertStructuredSettledEvidence,
@@ -104,6 +105,19 @@ function structuredWaveRecords(
     ...source.decision_input_records.filter(({ id }) => id !== source.result.id),
   ]).map((record) => [record.id, record])).values()]
     .sort((left, right) => compareCodeUnits(left.id, right.id));
+}
+
+function exceedsIntegrationEvidenceByteBudget(
+  checkpoints: readonly AttemptCheckpoint[],
+): boolean {
+  let aggregateBytes = 0;
+  for (const checkpoint of checkpoints) {
+    const bytes = "blob" in checkpoint.payload ? checkpoint.payload.blob.bytes : 0;
+    const next = addKernelIntegrationEvidenceBytes(aggregateBytes, bytes);
+    if (next === null) return true;
+    aggregateBytes = next;
+  }
+  return false;
 }
 
 function structuredWaveTerminalSettlement(input: {
@@ -499,20 +513,18 @@ export class KernelStructuredSettlementPlanner implements
       : completedMembers.size < plan.units.length
         ? "next_unit"
         : "all_integrated";
+    const outcomeReason = outcome === "next_integration"
+      ? "another accepted unit is ready for serial integration"
+      : outcome === "next_unit"
+        ? "integrated dependencies unlocked the next unit frontier"
+        : "all structured units are integrated";
+    const decisionCreatedAt = this.#now();
     const decision = createPipelineDecisionRecord({
       attempt: input.attempt,
       result: input.result,
       additional_input_records: deliveries,
-      evaluated: {
-        ...input.evaluated,
-        outcome,
-        reason: outcome === "next_integration"
-          ? "another accepted unit is ready for serial integration"
-          : outcome === "next_unit"
-            ? "integrated dependencies unlocked the next unit frontier"
-            : "all structured units are integrated",
-      },
-      created_at: this.#now(),
+      evaluated: { ...input.evaluated, outcome, reason: outcomeReason },
+      created_at: decisionCreatedAt,
     });
     const current = projectCurrentStructuredEvidence({
       attempt: input.attempt,
@@ -540,13 +552,29 @@ export class KernelStructuredSettlementPlanner implements
     let nextDependencies: Readonly<Record<string, readonly string[]>> | undefined;
     if (outcome === "next_integration") {
       const source = waitingAccepted[0]!;
+      const candidateAncestryStart = completedIntegrationChain.findIndex(
+        ({ input_subject: subject }) => subject === source.candidate_checkpoint.input_subject,
+      );
       const ancestryStart = source.candidate_checkpoint.input_subject === integratedSubject
         ? completedIntegrationChain.length
-        : completedIntegrationChain.findIndex(
-          ({ input_subject: subject }) => subject === source.candidate_checkpoint.input_subject,
-        );
-      if (ancestryStart < 0) {
-        throw new Error("structured integration ancestry has no gap-free path from the candidate input");
+        : candidateAncestryStart < 0 ? 0 : candidateAncestryStart;
+      const currentAncestry = completedIntegrationChain.slice(ancestryStart);
+      if (exceedsIntegrationEvidenceByteBudget([
+        source.candidate_checkpoint,
+        ...currentAncestry,
+      ])) {
+        const boundedDecision = createPipelineDecisionRecord({
+          attempt: input.attempt,
+          result: input.result,
+          additional_input_records: deliveries,
+          evaluated: {
+            ...input.evaluated,
+            outcome: "failure",
+            reason: "next structured integration exceeds the sealed ancestry evidence byte budget",
+          },
+          created_at: decisionCreatedAt,
+        });
+        return { decision: boundedDecision, outcome: "failure", next_attempts: [] };
       }
       nextAttempts = [createStructuredIntegrationAttempt({
         pipeline_run_id: input.view.run.id,
@@ -557,7 +585,7 @@ export class KernelStructuredSettlementPlanner implements
         input_subject: integratedSubject,
         task_prompt: request.task_prompt,
         source,
-        current_ancestry_checkpoints: completedIntegrationChain.slice(ancestryStart),
+        current_ancestry_checkpoints: currentAncestry,
         planning_context_records: (() => {
           const promotion = structuredPromotionFromActionEvidence(
             source,

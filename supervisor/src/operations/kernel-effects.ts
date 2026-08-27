@@ -26,6 +26,8 @@ import {
 import type {
   KernelEffectAdapterBinding,
   KernelEffectAdapterRegistry,
+  KernelEffectDispatchFence,
+  KernelEffectDispatchRequest,
   KernelEffectProviderObservation,
 } from "../app/kernel-effect-ports.js";
 export type {
@@ -96,6 +98,10 @@ function assertBinding(binding: KernelEffectAdapterBinding): void {
   if (
     !binding.adapter ||
     typeof binding.adapter.reconcile !== "function" ||
+    (
+      binding.adapter.prepareDispatch !== undefined &&
+      typeof binding.adapter.prepareDispatch !== "function"
+    ) ||
     typeof binding.adapter.dispatch !== "function"
   ) {
     throw new Error(`effect adapter ${binding.effect_kind} is incomplete`);
@@ -229,6 +235,7 @@ function normalizeObservation(value: KernelEffectProviderObservation): KernelEff
     throw new Error("provider reconciliation must return an object");
   }
   if (value.kind === "not_found") return { kind: "not_found" };
+  if (value.kind === "dispatch_not_started") return { kind: "dispatch_not_started" };
   if (value.kind === "unknown") {
     if (typeof value.detail !== "string" || value.detail.trim().length === 0) {
       throw new Error("unknown provider reconciliation requires detail");
@@ -256,6 +263,23 @@ function normalizeObservation(value: KernelEffectProviderObservation): KernelEff
     };
   }
   throw new Error("provider reconciliation returned an unknown observation kind");
+}
+
+function dispatchRequest(input: {
+  binding: KernelEffectAdapterBinding;
+  intent: Readonly<EffectIntent>;
+  dispatch_fence: KernelEffectDispatchFence;
+}): KernelEffectDispatchRequest {
+  return {
+    intent: input.intent,
+    external_identity: input.intent.target,
+    deduplication: {
+      strategy: input.binding.idempotency_strategy,
+      key: input.intent.idempotency_key,
+      target: input.intent.target,
+    },
+    dispatch_fence: input.dispatch_fence,
+  };
 }
 
 function retryContinuation(detail: string | null): JsonValue | null {
@@ -497,60 +521,100 @@ export function createKernelEffectExecutionService(input: {
       if (initial.kind === "retry") {
         return holdUnknown(leased, request.worker_id, initial.detail, initial.continuation);
       }
-      if (binding.operation === "observation") {
-        return holdUnknown(
-          leased,
-          request.worker_id,
-          "observed target is not present yet; the observation will be reconciled again",
-        );
-      }
-      if (leased.execution_mode === "reconcile_only") {
-        return holdUnknown(
-          leased,
-          request.worker_id,
-          "reconcile-only effect target remains absent; operator reconciliation is required",
-        );
+      let dispatchFence: KernelEffectDispatchFence;
+      if (initial.kind === "dispatch_not_started") {
+        if (
+          binding.operation !== "mutation" ||
+          leased.execution_mode !== "reconcile_only" ||
+          leased.dispatch_fence === null
+        ) {
+          return holdUnknown(
+            leased,
+            request.worker_id,
+            "dispatch-not-started observation is invalid without a reconcile-only persisted dispatch fence",
+          );
+        }
+        dispatchFence = leased.dispatch_fence;
+      } else {
+        if (binding.operation === "observation") {
+          return holdUnknown(
+            leased,
+            request.worker_id,
+            "observed target is not present yet; the observation will be reconciled again",
+          );
+        }
+        if (leased.execution_mode === "reconcile_only") {
+          return holdUnknown(
+            leased,
+            request.worker_id,
+            "reconcile-only effect target remains absent; operator reconciliation is required",
+          );
+        }
+
+        const reconciliation = reconcileEffectIntent({
+          intent,
+          observation: { kind: "not_found", external_identity: intent.target },
+        });
+        if (reconciliation.kind !== "execute") {
+          throw new Error("absent effect observation produced an invalid reconciliation");
+        }
+
+        const proposedFence = {
+          lease_id: leased.lease_id,
+          worker_id: request.worker_id,
+        };
+        if (binding.adapter.prepareDispatch) {
+          abortIfRequested(request.signal);
+          try {
+            await binding.adapter.prepareDispatch(dispatchRequest({
+              binding,
+              intent,
+              dispatch_fence: proposedFence,
+            }));
+            abortIfRequested(request.signal);
+          } catch (error) {
+            abortIfRequested(request.signal);
+            return holdUnknown(
+              leased,
+              request.worker_id,
+              `dispatch preparation returned an error: ${diagnostic(error)}`,
+            );
+          }
+        }
+
+        abortIfRequested(request.signal);
+        const dispatchLease = await input.effects.markLeasedEffectDispatchStarted({
+          effect_id: intent.id,
+          lease_id: leased.lease_id,
+          worker_id: request.worker_id,
+        });
+        const persistedFence = dispatchLease.dispatch_fence;
+        if (
+          dispatchLease.lease_id !== leased.lease_id ||
+          dispatchLease.expires_at !== leased.expires_at ||
+          dispatchLease.execution_mode !== "reconcile_only" ||
+          persistedFence === null ||
+          persistedFence.lease_id !== proposedFence.lease_id ||
+          persistedFence.worker_id !== proposedFence.worker_id
+        ) {
+          throw new Error("effect store returned an invalid dispatch-start fence");
+        }
+        try {
+          assertImmutableEffectReplay(reconciliation.intent, dispatchLease.intent);
+        } catch {
+          throw new Error("effect store returned an invalid dispatch-start fence");
+        }
+        dispatchFence = persistedFence;
       }
 
-      const reconciliation = reconcileEffectIntent({
-        intent,
-        observation: { kind: "not_found", external_identity: intent.target },
-      });
-      if (reconciliation.kind !== "execute") {
-        throw new Error("absent effect observation produced an invalid reconciliation");
-      }
-
-      abortIfRequested(request.signal);
-      const dispatchLease = await input.effects.markLeasedEffectDispatchStarted({
-        effect_id: intent.id,
-        lease_id: leased.lease_id,
-        worker_id: request.worker_id,
-      });
-      if (
-        dispatchLease.lease_id !== leased.lease_id ||
-        dispatchLease.expires_at !== leased.expires_at ||
-        dispatchLease.execution_mode !== "reconcile_only"
-      ) {
-        throw new Error("effect store returned an invalid dispatch-start fence");
-      }
-      try {
-        assertImmutableEffectReplay(reconciliation.intent, dispatchLease.intent);
-      } catch {
-        throw new Error("effect store returned an invalid dispatch-start fence");
-      }
       abortIfRequested(request.signal);
       let dispatchFailure: string | null = null;
       try {
-        await binding.adapter.dispatch({
+        await binding.adapter.dispatch(dispatchRequest({
+          binding,
           intent,
-          external_identity: intent.target,
-          deduplication: {
-            strategy: binding.idempotency_strategy,
-            key: intent.idempotency_key,
-            target: intent.target,
-          },
-          dispatch_fence: dispatchLease.dispatch_fence,
-        });
+          dispatch_fence: dispatchFence,
+        }));
         abortIfRequested(request.signal);
       } catch (error) {
         abortIfRequested(request.signal);
@@ -560,7 +624,7 @@ export function createKernelEffectExecutionService(input: {
       const afterDispatch = await observe({
         binding,
         intent,
-        dispatch_fence: dispatchLease.dispatch_fence,
+        dispatch_fence: dispatchFence,
         observed_at: now(),
         continuation,
         signal: request.signal,
@@ -588,6 +652,12 @@ export function createKernelEffectExecutionService(input: {
           afterDispatch.detail,
           afterDispatch.continuation,
         );
+      }
+      if (afterDispatch.kind === "dispatch_not_started") {
+        return holdUnknown(leased, request.worker_id, [
+          dispatchFailure ? `dispatch returned an error: ${dispatchFailure}` : null,
+          "provider proved dispatch-not-started; retry the exact fenced dispatch on a later reconciliation lease",
+        ].filter((entry): entry is string => entry !== null).join("; "));
       }
       return holdUnknown(leased, request.worker_id, [
         dispatchFailure ? `dispatch returned an error: ${dispatchFailure}` : null,
