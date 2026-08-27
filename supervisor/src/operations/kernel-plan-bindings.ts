@@ -18,6 +18,7 @@ import { CORE_EXTERNAL_PLAN_SHAPES } from "./kernel-external-plans.js";
 import {
   inspectKernelCheckpointBundle,
   inspectKernelCheckpointBundleAdvertisement,
+  isCompatibleOrdinaryCheckpointRef,
 } from "../runtime/kernel-checkpoint-bundle.js";
 import { KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES } from "../runtime/kernel-wire.js";
 import {
@@ -154,11 +155,13 @@ function descriptor(
   });
   if (
     inspected.ref.startsWith("refs/openthrottle/checkpoints/") &&
-    (
-      inspected.ref !== `refs/openthrottle/checkpoints/${checkpoint.request_hash}`
-    )
+    !isCompatibleOrdinaryCheckpointRef({
+      ref: inspected.ref,
+      commit: inspected.commit,
+      request_hash: checkpoint.request_hash,
+    })
   ) {
-    throw new Error("ordinary Git checkpoint does not bind its exact request ref and sole input parent");
+    throw new Error("ordinary Git checkpoint does not bind its commit or exact request ref and sole input parent");
   }
   return {
     file: `${pointer.digest}.bundle`,

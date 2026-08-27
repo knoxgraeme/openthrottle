@@ -10,6 +10,9 @@ import {
   type SemanticResultSchemaContract,
 } from "@openthrottle/contracts";
 import {
+  isCompatibleOrdinaryCheckpointRef,
+} from "./kernel-checkpoint-bundle.js";
+import {
   KERNEL_ACTION_REQUEST_SCHEMA,
   KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA,
   STAGED_SEMANTIC_CANDIDATE_SCHEMA,
@@ -244,8 +247,12 @@ async function checkpoint(
   }
   const payloadSchema = string(input.payload_schema, "checkpoint payload schema", 200);
   const descriptor = artifactDescriptor(input.payload_artifact, payloadSchema);
-  if (descriptor.ref !== `refs/openthrottle/checkpoints/${request.request_hash}`) {
-    throw new Error("checkpoint artifact ref does not match the sealed request");
+  if (!isCompatibleOrdinaryCheckpointRef({
+    ref: descriptor.ref,
+    commit: descriptor.commit,
+    request_hash: request.request_hash,
+  })) {
+    throw new Error("checkpoint artifact ref does not match its commit or sealed request");
   }
   const mutatingWork = request.schema === KERNEL_ACTION_REQUEST_SCHEMA &&
     request.repository_authority === "edit" && request.action.kind === "agent";

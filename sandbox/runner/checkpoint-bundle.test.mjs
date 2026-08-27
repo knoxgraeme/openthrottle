@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -98,6 +98,12 @@ function fetchCheckpoint(repo, actionDirectory, checkpoint, boundary = checkpoin
   return bundlePath;
 }
 
+function stableCheckpointRef(commit) {
+  return `refs/openthrottle/checkpoints/${createHash("sha256")
+    .update(commit, "utf8")
+    .digest("hex")}`;
+}
+
 describe("attempt checkpoint bundle", () => {
   it("authors a bounded shallow exact-parent bundle and identity-bound wire checkpoint", () => {
     const source = sourceRepository();
@@ -130,7 +136,7 @@ describe("attempt checkpoint bundle", () => {
         bytes: expect.any(Number),
         media_type: "application/x-git-bundle",
         payload_schema: "openthrottle.git-checkpoint-bundle/v1",
-        ref: `refs/openthrottle/checkpoints/${"a".repeat(64)}`,
+        ref: stableCheckpointRef(checkpoint.payload_artifact.commit),
         commit: expect.stringMatching(/^[a-f0-9]{40,64}$/),
         tree: verification.output_subject,
       },
@@ -379,5 +385,54 @@ describe("attempt checkpoint bundle", () => {
     expect(git(verifier, "rev-parse", `${checkpoint.payload_artifact.commit}^{tree}`))
       .toBe(source.tree);
     expect(gitSucceeds(verifier, "cat-file", "-e", `${source.subject}^{commit}`)).toBe(false);
+  });
+
+  it("reuses byte-identical inspect bundle evidence across distinct attempts", () => {
+    const source = sourceRepository();
+    const actionDirectory = mkdtempSync(join(tmpdir(), "ot-checkpoint-inspect-dedupe-"));
+    const repository = materializeActionRepository({
+      sourceRepoDir: source.repo,
+      inputSubject: source.subject,
+      repositoryAuthority: "inspect",
+      destination: join(actionDirectory, "repository"),
+    });
+    const verification = verifyActionRepository(repository);
+    const create = ({ attempt, requestHash, nativeSessionId, capturedAt }) =>
+      createAttemptCheckpoint({
+        request: request({ attempt, requestHash, inputSubject: source.subject }),
+        repository,
+        verification,
+        outputSubject: null,
+        nativeSessionId,
+        artifactDirectory: actionDirectory,
+        capturedAt,
+      });
+    const first = create({
+      attempt: "inspect-dedupe-1",
+      requestHash: "1".repeat(64),
+      nativeSessionId: "session-inspect-dedupe-1",
+      capturedAt: "2026-08-20T00:00:00.000Z",
+    });
+    const second = create({
+      attempt: "inspect-dedupe-2",
+      requestHash: "2".repeat(64),
+      nativeSessionId: "session-inspect-dedupe-2",
+      capturedAt: "2026-08-21T00:00:00.000Z",
+    });
+
+    expect(first.id).not.toBe(second.id);
+    expect(first.request_hash).not.toBe(second.request_hash);
+    expect(first.attempt_id).not.toBe(second.attempt_id);
+    expect(first.native_session_id).not.toBe(second.native_session_id);
+    expect(first.captured_at).not.toBe(second.captured_at);
+    expect(second.payload_artifact).toMatchObject({
+      commit: first.payload_artifact.commit,
+      tree: first.payload_artifact.tree,
+      ref: first.payload_artifact.ref,
+      sha256: first.payload_artifact.sha256,
+      bytes: first.payload_artifact.bytes,
+    });
+    expect(readFileSync(join(actionDirectory, second.payload_artifact.file)))
+      .toEqual(readFileSync(join(actionDirectory, first.payload_artifact.file)));
   });
 });
