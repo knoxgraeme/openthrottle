@@ -393,13 +393,16 @@ describe("KernelProviderPromptHandler", () => {
 
   it("keeps a Linear stop retryable, then controls the run once it is admitted", async () => {
     let admitted = false;
-    const test = handler({ resolveRun: () => admitted ? {
-      pipeline_run_id: "run-1",
-      work_item_id: "work-1",
-      source_provider: "linear",
-      source_reference: "OPE-188",
-      admitted_at: ADMITTED_AT,
-    } : undefined });
+    const test = handler({
+      resolveRun: () => admitted ? {
+        pipeline_run_id: "run-1",
+        work_item_id: "work-1",
+        source_provider: "linear",
+        source_reference: "OPE-188",
+        admitted_at: ADMITTED_AT,
+      } : undefined,
+      now: () => new Date("2026-08-20T12:09:59.999Z"),
+    });
     const stop = event({
       payload: {
         agentSession: { issue: { identifier: "OPE-188" } },
@@ -417,6 +420,50 @@ describe("KernelProviderPromptHandler", () => {
       reason: "Stopped from the linear control thread.",
     });
   });
+
+  it("settles a no-run Linear stop at the first lease on its grace deadline", async () => {
+    const test = handler({
+      resolveRun: () => undefined,
+      now: () => new Date("2026-08-20T12:10:00.000Z"),
+    });
+    const stop = event({
+      payload: {
+        agentSession: { issue: { identifier: "OPE-188" } },
+        agentActivity: { id: "activity-1", signal: { type: "stop" } },
+      },
+    });
+
+    await expect(test.value.handle(stop)).resolves.toBe("stale");
+    expect(test.requestRunControl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { relation: "before", admittedAt: "2026-08-20T12:09:59.999Z", expected: "consumed" },
+    { relation: "exactly at", admittedAt: "2026-08-20T12:10:00.000Z", expected: "stale" },
+    { relation: "after", admittedAt: "2026-08-20T12:10:00.001Z", expected: "stale" },
+  ] as const)(
+    "$relation the grace deadline, a Linear admission makes its delayed stop $expected",
+    async ({ admittedAt, expected }) => {
+      const test = handler({
+        resolveRun: () => ({
+          pipeline_run_id: "run-1",
+          work_item_id: "work-1",
+          source_provider: "linear",
+          source_reference: "OPE-188",
+          admitted_at: admittedAt,
+        }),
+      });
+      const stop = event({
+        payload: {
+          agentSession: { issue: { identifier: "OPE-188" } },
+          agentActivity: { id: "activity-1", signal: { type: "stop" } },
+        },
+      });
+
+      await expect(test.value.handle(stop)).resolves.toBe(expected);
+      expect(test.requestRunControl).toHaveBeenCalledTimes(expected === "consumed" ? 1 : 0);
+    },
+  );
 
   it("keeps an authorized GitHub stop retryable until its run is admitted", async () => {
     const authorizeGithubComment = vi.fn(async () => true);

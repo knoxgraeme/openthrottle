@@ -10,7 +10,7 @@ import type { KernelIngressResponse } from "./kernel-control.js";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const MAX_STEERING_BODY_BYTES = 32 * 1024;
-const GITHUB_PRE_ADMISSION_STOP_GRACE_MS = 10 * 60_000;
+const PRE_ADMISSION_STOP_GRACE_MS = 10 * 60_000;
 const GITHUB_ORIGIN_OBSERVATION_LIMIT = 8;
 const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 const GITHUB_ADMISSION_KINDS = [
@@ -104,6 +104,11 @@ function isoInstant(value: JsonValue | undefined): number | null {
   ) return null;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function preAdmissionStopDeadline(event: KernelInboxEvent): number | null {
+  const deadline = Date.parse(event.created_at) + PRE_ADMISSION_STOP_GRACE_MS;
+  return Number.isFinite(deadline) ? deadline : null;
 }
 
 export function linearAgentActivityBody(payload: JsonValue): string {
@@ -243,24 +248,31 @@ export class KernelProviderPromptHandler {
         if (event.source_provider === "github") {
           if (!prompt.github_issue || !prompt.github_authorization) return "stale";
           if (prompt.github_stop_at === null) return "dead";
-          const deadline = Date.parse(event.created_at) + GITHUB_PRE_ADMISSION_STOP_GRACE_MS;
-          if (!Number.isFinite(deadline)) return "dead";
-          if (this.#now().getTime() >= deadline) return "stale";
-          if (!await this.#githubAuthorization.authorizeComment(prompt.github_authorization)) {
-            return "stale";
-          }
         }
+        const deadline = preAdmissionStopDeadline(event);
+        if (deadline === null) return "dead";
+        if (this.#now().getTime() >= deadline) return "stale";
+        if (
+          prompt.github_authorization &&
+          !await this.#githubAuthorization.authorizeComment(prompt.github_authorization)
+        ) return "stale";
         throw new Error(`cannot apply provider stop before ${prompt.reference} is admitted`);
       }
       return null;
+    }
+    if (event.source_provider === "linear" && prompt.stop) {
+      const deadline = preAdmissionStopDeadline(event);
+      if (deadline === null) return "dead";
+      const admittedAt = Date.parse(run.admitted_at);
+      if (!Number.isFinite(admittedAt) || admittedAt >= deadline) return "stale";
     }
     if (event.source_provider === "github") {
       if (!prompt.github_authorization) return "stale";
       if (prompt.stop) {
         if (!prompt.github_issue) return "stale";
         if (prompt.github_stop_at === null) return "dead";
-        const deadline = Date.parse(event.created_at) + GITHUB_PRE_ADMISSION_STOP_GRACE_MS;
-        if (!Number.isFinite(deadline)) return "dead";
+        const deadline = preAdmissionStopDeadline(event);
+        if (deadline === null) return "dead";
         const admittedAt = Date.parse(run.admitted_at);
         if (!Number.isFinite(admittedAt) || admittedAt >= deadline) return "stale";
         const origins = this.#inbox.listConsumedAt({
