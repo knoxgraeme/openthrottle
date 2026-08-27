@@ -150,6 +150,91 @@ describe("SqliteKernelInboxStore", () => {
     })).toThrow(/lease fence/);
   });
 
+  it("bounds verified observation to unsettled provider events", () => {
+    const { store } = setup();
+    const first = store.ingest({
+      ...event("admission-1"),
+      kind: "github/issues/labeled@1",
+      event_group_key: "issue:188:labeled",
+      payload: {
+        repository: { full_name: "owner/repo" },
+        issue: { number: 188, labels: [{ name: "openthrottle" }] },
+      },
+    });
+    const second = store.ingest({
+      ...event("admission-2"),
+      kind: "github/issues/edited@1",
+      event_group_key: "issue:189:edited",
+      payload: {
+        repository: { full_name: "owner/repo" },
+        issue: { number: 189, labels: [{ name: "openthrottle" }] },
+      },
+    });
+    if (first.disposition !== "inserted" || second.disposition !== "inserted") {
+      throw new Error("fixture events were not inserted");
+    }
+
+    expect(store.matchUnsettled({
+      source_provider: "github",
+      kinds: ["github/issues/labeled@1", "github/issues/edited@1"],
+      exclude_event_id: "inbox-current-stop",
+      limit: 1,
+    }, () => true)).toBe("matched");
+    const observed = store.matchUnsettled({
+      source_provider: "github",
+      kinds: ["github/issues/labeled@1", "github/issues/edited@1"],
+      exclude_event_id: "inbox-current-stop",
+      limit: 1,
+    }, () => false);
+    expect(observed).toBe("truncated");
+
+    const leased = store.leaseNext({
+      owner_id: "worker-1",
+      lease_id: "lease-observed",
+      expires_at: "2026-08-20T12:05:00.000Z",
+    })!;
+    store.complete({
+      event_id: leased.id,
+      owner_id: "worker-1",
+      lease_id: "lease-observed",
+      outcome: "stale",
+    });
+    const otherEventId = leased.id === first.event.id ? second.event.id : first.event.id;
+    expect(store.matchUnsettled({
+      source_provider: "github",
+      kinds: ["github/issues/labeled@1", "github/issues/edited@1"],
+      exclude_event_id: otherEventId,
+      limit: 2,
+    }, () => true)).toBe("none");
+  });
+
+  it("does not retain deterministically unreadable observation candidates", () => {
+    const { fixture, store } = setup();
+    const corrupt = store.ingest({
+      ...event("corrupt-admission"),
+      kind: "github/issues/labeled@1",
+      event_group_key: "issue:corrupt:labeled",
+      payload: {
+        repository: { full_name: "owner/repo" },
+        issue: {
+          number: 188,
+          body: "x".repeat(70_000),
+          labels: [{ name: "openthrottle" }],
+        },
+      },
+    });
+    if (corrupt.disposition !== "inserted") throw new Error("fixture event was not inserted");
+    fixture.db.prepare("UPDATE inbox_events SET blob_algorithm = NULL WHERE id = ?")
+      .run(corrupt.event.id);
+
+    expect(store.matchUnsettled({
+      source_provider: "github",
+      kinds: ["github/issues/labeled@1"],
+      exclude_event_id: "inbox-current-stop",
+      limit: 10,
+    }, () => true)).toBe("none");
+  });
+
   it("prewrites large payloads before committing a verified pointer", () => {
     const { fixture, store } = setup();
     const payload = { evidence: "x".repeat(70_000) };

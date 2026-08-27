@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import type { KernelInboxEvent } from "../persistence/kernel-inbox-store.js";
+import {
+  SqliteKernelInboxStore,
+  type KernelInboxEvent,
+} from "../persistence/kernel-inbox-store.js";
 import type { KernelStatusProjection } from "../persistence/kernel-projection-store.js";
+import { freshKernelFixture } from "../persistence/__fixtures__/kernel-epoch.js";
+import { KernelWorker } from "../operations/kernel-worker.js";
 import { KernelProviderPromptHandler } from "./kernel-provider-prompt.js";
 
 function event(overrides: Partial<KernelInboxEvent> = {}): KernelInboxEvent {
@@ -87,6 +92,8 @@ function status(overrides: Partial<KernelStatusProjection> = {}): KernelStatusPr
 function handler(input: {
   projected?: KernelStatusProjection;
   authorizeGithubComment?: (input: { repository: string; username: string }) => Promise<boolean>;
+  pendingGithubAdmissions?: KernelInboxEvent[];
+  pendingGithubAdmissionsTruncated?: boolean;
   resolveRun?: () => {
     pipeline_run_id: string;
     work_item_id: string;
@@ -116,6 +123,12 @@ function handler(input: {
       },
       github_authorization: {
         authorizeComment: input.authorizeGithubComment ?? (async () => true),
+      },
+      inbox: {
+        matchUnsettled: (_observation, matches) =>
+          (input.pendingGithubAdmissions ?? []).some(matches)
+            ? "matched"
+            : input.pendingGithubAdmissionsTruncated ? "truncated" : "none",
       },
       control: { requestRunControl, enqueueSteering },
     }),
@@ -191,7 +204,18 @@ describe("KernelProviderPromptHandler", () => {
 
   it("keeps an authorized GitHub stop retryable until its run is admitted", async () => {
     const authorizeGithubComment = vi.fn(async () => true);
-    const test = handler({ resolveRun: () => undefined, authorizeGithubComment });
+    const test = handler({
+      resolveRun: () => undefined,
+      authorizeGithubComment,
+      pendingGithubAdmissions: [event({
+        source_provider: "github",
+        kind: "github/issues/labeled@1",
+        payload: {
+          repository: { full_name: "Owner/Repo" },
+          issue: { number: 188, labels: [{ name: "openthrottle" }] },
+        },
+      })],
+    });
     await expect(test.value.handle(event({
       source_provider: "github",
       kind: "github/issue-comment/created@1",
@@ -208,8 +232,223 @@ describe("KernelProviderPromptHandler", () => {
     expect(test.requestRunControl).not.toHaveBeenCalled();
   });
 
+  it("preserves an authorized stop when an earlier admission is delayed past label removal", async () => {
+    const authorizeGithubComment = vi.fn(async () => true);
+    const test = handler({
+      resolveRun: () => undefined,
+      authorizeGithubComment,
+      pendingGithubAdmissions: [event({
+        source_provider: "github",
+        kind: "github/issues/labeled@1",
+        payload: {
+          repository: { full_name: "Owner/Repo" },
+          issue: {
+            number: 188,
+            labels: [{ name: "openthrottle" }],
+          },
+        },
+      })],
+    });
+
+    await expect(test.value.handle(event({
+      source_provider: "github",
+      kind: "github/issue-comment/created@1",
+      payload: {
+        repository: { full_name: "Owner/Repo" },
+        issue: { number: 188 },
+        comment: { id: 991, body: "/stop", user: { login: "maintainer" } },
+      },
+    }))).rejects.toThrow(/before owner\/repo#188 is admitted/i);
+    expect(authorizeGithubComment).toHaveBeenCalledWith({
+      repository: "Owner/Repo",
+      username: "maintainer",
+    });
+    expect(test.requestRunControl).not.toHaveBeenCalled();
+  });
+
+  it("converges when inbox retry ordering puts a post-removal stop before delayed admission", async () => {
+    const fixture = freshKernelFixture();
+    try {
+      let now = new Date("2026-08-20T12:00:00.000Z");
+      const inbox = new SqliteKernelInboxStore({
+        db: fixture.db,
+        blob_store: fixture.blobs,
+        now: () => now.toISOString(),
+      });
+      inbox.ingest({
+        id: "inbox-delayed-admission",
+        source_provider: "github",
+        delivery_id: "delivery-delayed-admission",
+        kind: "github/issues/labeled@1",
+        generation: 0,
+        event_group_key: "issue:188:labeled",
+        delivery_attempt: 1,
+        payload_schema: "openthrottle.provider-event/github/v1",
+        payload: {
+          repository: { full_name: "Owner/Repo" },
+          issue: { number: 188, labels: [{ name: "openthrottle" }] },
+        },
+      });
+      let admitted = false;
+      let admissionCalls = 0;
+      const requestRunControl = vi.fn(async () => ({ disposition: "consumed" as const }));
+      const prompts = new KernelProviderPromptHandler({
+        runs: { resolveRun: () => admitted ? {
+          pipeline_run_id: "run-1",
+          work_item_id: "work-1",
+          source_provider: "github" as const,
+          source_reference: "owner/repo#188",
+        } : undefined },
+        projections: {
+          getStatus: () => status(),
+          listLog: () => ({ entries: [], next_cursor: null, truncated: false }),
+        },
+        inbox,
+        github_authorization: { authorizeComment: async () => true },
+        control: {
+          requestRunControl,
+          enqueueSteering: async () => { throw new Error("not used"); },
+        },
+      });
+      const worker = new KernelWorker({
+        attempts: {
+          recoverExpiredAttemptLeases: async () => [],
+          leaseNextEligibleAttempt: async () => null,
+        } as never,
+        ordinary: {
+          resumeReadyAttempt: async () => ({ disposition: "idle" as const }),
+          terminalizeExhaustedRecovery: async () => null,
+          executeLeasedAttempt: async () => ({ disposition: "idle" as const }),
+        } as never,
+        external: { resumeReadyAttempt: async () => ({ disposition: "idle" as const }) } as never,
+        effects: { drainOne: async () => ({ kind: "idle" as const }) } as never,
+        inbox,
+        inbox_handler: {
+          async handle(leased) {
+            if (leased.kind !== "github/issue-comment/created@1") {
+              admissionCalls += 1;
+              if (admissionCalls === 1) throw new Error("transient subject lookup failure");
+              admitted = true;
+              return "consumed";
+            }
+            return await prompts.handle(leased) ?? "stale";
+          },
+        },
+        worker_id: "worker-1",
+        lease_seconds: 120,
+        cycle_limit: 1,
+        execution_width: 1,
+        now: () => now,
+      });
+
+      await worker.runCycle();
+      expect(inbox.get("inbox-delayed-admission")).toMatchObject({ status: "pending" });
+
+      now = new Date("2026-08-20T12:00:00.500Z");
+      inbox.ingest({
+        id: "inbox-stop-after-removal",
+        source_provider: "github",
+        delivery_id: "delivery-stop-after-removal",
+        kind: "github/issue-comment/created@1",
+        generation: 0,
+        event_group_key: "issue:188:stop",
+        delivery_attempt: 1,
+        payload_schema: "openthrottle.provider-event/github/v1",
+        payload: {
+          repository: { full_name: "Owner/Repo" },
+          issue: { number: 188 },
+          comment: { id: 991, body: "/stop", user: { login: "maintainer" } },
+        },
+      });
+      await worker.runCycle();
+      expect(inbox.get("inbox-stop-after-removal")).toMatchObject({ status: "pending" });
+
+      now = new Date("2026-08-20T12:00:01.000Z");
+      await worker.runCycle();
+      expect(admitted).toBe(true);
+      now = new Date("2026-08-20T12:00:01.500Z");
+      await worker.runCycle();
+
+      expect(requestRunControl).toHaveBeenCalledOnce();
+      expect(inbox.get("inbox-stop-after-removal")).toMatchObject({ status: "consumed" });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it("retains an authorized stop when the bounded admission observation is truncated", async () => {
+    const authorizeGithubComment = vi.fn(async () => true);
+    const test = handler({
+      resolveRun: () => undefined,
+      authorizeGithubComment,
+      pendingGithubAdmissionsTruncated: true,
+    });
+    await expect(test.value.handle(event({
+      source_provider: "github",
+      kind: "github/issue-comment/created@1",
+      payload: {
+        repository: { full_name: "Owner/Repo" },
+        issue: { number: 188 },
+        comment: { id: 991, body: "/stop", user: { login: "maintainer" } },
+      },
+    }))).rejects.toThrow(/before owner\/repo#188 is admitted/i);
+    expect(authorizeGithubComment).toHaveBeenCalledOnce();
+  });
+
+  it("settles a stop when unsettled GitHub events cannot admit its issue", async () => {
+    const authorizeGithubComment = vi.fn(async () => true);
+    const test = handler({
+      resolveRun: () => undefined,
+      authorizeGithubComment,
+      pendingGithubAdmissions: [
+        event({
+          source_provider: "github",
+          kind: "github/issues/opened@1",
+          payload: {
+            repository: { full_name: "Owner/Repo" },
+            issue: { number: 189, labels: [{ name: "openthrottle" }] },
+          },
+        }),
+        event({
+          source_provider: "github",
+          kind: "github/issues/labeled@1",
+          payload: {
+            repository: { full_name: "Owner/Repo" },
+            issue: { number: 188 },
+          },
+        }),
+        event({
+          source_provider: "github",
+          kind: "github/issues/edited@1",
+          payload: {
+            repository: { full_name: "Owner/Repo" },
+            issue: {
+              number: 188,
+              labels: [{ name: "openthrottle" }],
+              pull_request: { url: "https://api.github.com/repos/Owner/Repo/pulls/188" },
+            },
+          },
+        }),
+      ],
+    });
+    await expect(test.value.handle(event({
+      source_provider: "github",
+      kind: "github/issue-comment/created@1",
+      payload: {
+        repository: { full_name: "Owner/Repo" },
+        issue: { number: 188 },
+        comment: { id: 991, body: "/stop", user: { login: "maintainer" } },
+      },
+    }))).resolves.toBe("stale");
+    expect(authorizeGithubComment).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["an issue without the control label", { number: 188 }],
+    ["a labeled issue without a pending admission", {
+      number: 188,
+      labels: [{ name: "openthrottle" }],
+    }],
     [
       "a pull request",
       {
@@ -239,7 +478,18 @@ describe("KernelProviderPromptHandler", () => {
     ["a missing actor", { id: 991, body: "/stop" }],
   ])("settles a no-run GitHub stop from %s without retrying it", async (_label, comment) => {
     const authorizeGithubComment = vi.fn(async () => false);
-    const test = handler({ resolveRun: () => undefined, authorizeGithubComment });
+    const test = handler({
+      resolveRun: () => undefined,
+      authorizeGithubComment,
+      pendingGithubAdmissions: [event({
+        source_provider: "github",
+        kind: "github/issues/labeled@1",
+        payload: {
+          repository: { full_name: "Owner/Repo" },
+          issue: { number: 188, labels: [{ name: "openthrottle" }] },
+        },
+      })],
+    });
     await expect(test.value.handle(event({
       source_provider: "github",
       kind: "github/issue-comment/created@1",

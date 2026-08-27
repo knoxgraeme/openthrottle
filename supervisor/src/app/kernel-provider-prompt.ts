@@ -1,12 +1,21 @@
 import { Buffer } from "node:buffer";
 import type { JsonValue } from "@openthrottle/contracts";
-import type { KernelInboxEvent } from "../persistence/kernel-inbox-store.js";
+import type {
+  KernelInboxEvent,
+  KernelInboxObservationPort,
+} from "../persistence/kernel-inbox-store.js";
 import type { KernelProjectionPort } from "../persistence/kernel-projection-store.js";
 import type { KernelRunReferencePort } from "../persistence/kernel-registration-store.js";
 import type { KernelIngressResponse } from "./kernel-control.js";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const MAX_STEERING_BODY_BYTES = 32 * 1024;
+const GITHUB_ADMISSION_OBSERVATION_LIMIT = 64;
+const GITHUB_ADMISSION_KINDS = [
+  "github/issues/opened@1",
+  "github/issues/labeled@1",
+  "github/issues/edited@1",
+] as const;
 
 export interface KernelProviderPromptControlPort {
   requestRunControl(input: {
@@ -40,7 +49,7 @@ interface ProviderPrompt {
   message_id: string;
   body: string;
   stop: boolean;
-  retry_stop_before_admission: boolean;
+  github_issue: boolean;
   github_authorization: { repository: string; username: string } | null;
 }
 
@@ -101,7 +110,7 @@ function linearPrompt(event: KernelInboxEvent): ProviderPrompt | null {
     message_id: messageId,
     body: rawBody,
     stop,
-    retry_stop_before_admission: true,
+    github_issue: false,
     github_authorization: null,
   };
 }
@@ -124,18 +133,34 @@ function githubPrompt(event: KernelInboxEvent): ProviderPrompt | null {
     typeof rawBody !== "string"
   ) throw new Error("GitHub issue comment is missing its repository, issue, or comment identity");
   const body = rawBody.trim();
-  const admissionEligible = issue?.pull_request === undefined &&
-    strings(issue?.labels).some((label) => label.toLowerCase() === "openthrottle");
   return {
     reference: `${repo.toLowerCase()}#${number as number}`,
     message_id: String(messageId),
     body: rawBody,
     stop: /^(?:\/)?stop$/i.test(body),
-    retry_stop_before_admission: admissionEligible,
+    github_issue: issue?.pull_request === undefined,
     github_authorization: typeof username === "string"
       ? { repository: repo, username }
       : null,
   };
+}
+
+function githubAdmissionReference(event: KernelInboxEvent): string | null {
+  if (
+    event.source_provider !== "github" ||
+    !GITHUB_ADMISSION_KINDS.includes(event.kind as typeof GITHUB_ADMISSION_KINDS[number])
+  ) return null;
+  const payload = object(event.payload);
+  const repository = nested(payload, "repository");
+  const issue = nested(payload, "issue");
+  const repo = repository?.full_name;
+  const number = issue?.number;
+  if (
+    typeof repo !== "string" || !Number.isSafeInteger(number) || (number as number) < 1 ||
+    issue?.pull_request !== undefined ||
+    !strings(issue?.labels).some((label) => label.toLowerCase() === "openthrottle")
+  ) return null;
+  return `${repo.toLowerCase()}#${number as number}`;
 }
 
 function providerPrompt(event: KernelInboxEvent): ProviderPrompt | null {
@@ -150,17 +175,20 @@ export class KernelProviderPromptHandler {
   readonly #projections: KernelProjectionPort;
   readonly #control: KernelProviderPromptControlPort;
   readonly #githubAuthorization: KernelProviderPromptGithubAuthorizationPort;
+  readonly #inbox: KernelInboxObservationPort;
 
   constructor(input: {
     runs: KernelRunReferencePort;
     projections: KernelProjectionPort;
     control: KernelProviderPromptControlPort;
     github_authorization: KernelProviderPromptGithubAuthorizationPort;
+    inbox: KernelInboxObservationPort;
   }) {
     this.#runs = input.runs;
     this.#projections = input.projections;
     this.#control = input.control;
     this.#githubAuthorization = input.github_authorization;
+    this.#inbox = input.inbox;
   }
 
   /** Null means admission should inspect this event as a possible first prompt. */
@@ -177,9 +205,15 @@ export class KernelProviderPromptHandler {
     const run = this.#runs.resolveRun(prompt.reference);
     if (!run) {
       if (prompt.stop) {
-        if (!prompt.retry_stop_before_admission) return "stale";
         if (event.source_provider === "github") {
-          if (!prompt.github_authorization) return "stale";
+          if (!prompt.github_issue || !prompt.github_authorization) return "stale";
+          const admission = this.#inbox.matchUnsettled({
+            source_provider: "github",
+            kinds: GITHUB_ADMISSION_KINDS,
+            exclude_event_id: event.id,
+            limit: GITHUB_ADMISSION_OBSERVATION_LIMIT,
+          }, (candidate) => githubAdmissionReference(candidate) === prompt.reference);
+          if (admission === "none") return "stale";
           if (!await this.#githubAuthorization.authorizeComment(prompt.github_authorization)) {
             return "stale";
           }

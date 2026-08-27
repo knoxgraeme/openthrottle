@@ -121,6 +121,15 @@ export interface KernelInboxDeliveryPort {
   get(eventId: string): KernelInboxEvent | undefined;
 }
 
+export interface KernelInboxObservationPort {
+  matchUnsettled(input: {
+    source_provider: string;
+    kinds: readonly string[];
+    exclude_event_id: string;
+    limit: number;
+  }, matches: (event: KernelInboxEvent) => boolean): "matched" | "none" | "truncated";
+}
+
 interface InboxRow {
   id: string;
   source_provider: string;
@@ -217,7 +226,8 @@ function immutableProjection(row: InboxRow): Record<string, unknown> {
 export class SqliteKernelInboxStore implements
   KernelMaintenancePort,
   KernelInboxIngressPort,
-  KernelInboxDeliveryPort {
+  KernelInboxDeliveryPort,
+  KernelInboxObservationPort {
   readonly #db: Database.Database;
   readonly #blobs: VolumeBlobStore;
   readonly #now: () => string;
@@ -518,6 +528,47 @@ export class SqliteKernelInboxStore implements
     bounded(eventId, "inbox event ID", 200, ID);
     const row = this.#row(eventId);
     return row ? this.#event(row) : undefined;
+  }
+
+  matchUnsettled(input: {
+    source_provider: string;
+    kinds: readonly string[];
+    exclude_event_id: string;
+    limit: number;
+  }, matches: (event: KernelInboxEvent) => boolean): "matched" | "none" | "truncated" {
+    bounded(input.source_provider, "inbox observation source_provider", 100, PROVIDER);
+    bounded(input.exclude_event_id, "inbox observation excluded event ID", 200, ID);
+    if (
+      !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100 ||
+      input.kinds.length < 1 || input.kinds.length > 20
+    ) throw new Error("inbox observation bounds are invalid");
+    for (const kind of input.kinds) {
+      bounded(kind, "inbox observation kind", 200, KIND);
+    }
+    const placeholders = input.kinds.map(() => "?").join(", ");
+    const rows = this.#db.prepare(`
+      SELECT * FROM inbox_events
+      WHERE source_provider = ? AND kind IN (${placeholders})
+        AND status IN ('pending', 'processing') AND consumed_at IS NULL AND id != ?
+      ORDER BY created_at, id
+      LIMIT ?
+    `).iterate(
+      input.source_provider,
+      ...input.kinds,
+      input.exclude_event_id,
+      input.limit + 1,
+    ) as IterableIterator<InboxRow>;
+    let inspected = 0;
+    for (const row of rows) {
+      if (inspected === input.limit) return "truncated";
+      inspected += 1;
+      try {
+        if (matches(this.#event(row))) return "matched";
+      } catch (error) {
+        if (!(error instanceof InboxPayloadCorruptionError)) throw error;
+      }
+    }
+    return "none";
   }
 
   #normalizeInput(input: KernelInboxEventInput): Required<
