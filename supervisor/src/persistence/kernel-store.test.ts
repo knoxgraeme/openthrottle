@@ -2579,6 +2579,421 @@ describe("SqliteKernelStore", () => {
     }
   });
 
+  it.each([
+    ["stop", "canceled"],
+    ["supersede", "superseded"],
+  ] as const)(
+    "%s durably records selected and sibling result_pending evidence across replay and restart",
+    async (type, terminalStatus) => {
+      const context = setup(undefined, () => NOW, true);
+      let originalClosed = false;
+      let reopenedDb: Database.Database | undefined;
+      try {
+        const selectedPointer = putInvalidResultEvidence(context.blobs);
+        const siblingPointer = putInvalidResultEvidence(context.blobs, {
+          attempt_id: "attempt-2",
+          candidate_hash: sha("f"),
+          diagnostics: [{ path: "/payload/summary", detail: "sibling result is invalid" }],
+        });
+        const selected = attempt({
+          ...context.admission.initial_attempts[0],
+          id: "attempt-1",
+          scope: {
+            kind: "loop_item",
+            stage_id: "work",
+            parent_attempt_id: "attempt-1",
+            loop_id: "execution_plan.units",
+            item_id: "unit-a",
+            item_index: 0,
+          },
+          status: "result_pending",
+          output_subject: subject("2"),
+          native_session_id: "session-selected",
+          result_correction_count: 1,
+          result_correction_deadline: "2026-08-20T12:15:00.000Z",
+          pending_result: {
+            candidate_hash: sha("e"),
+            diagnostics: [{ path: "/payload", detail: "invalid" }],
+            invalid_result_evidence: selectedPointer,
+          },
+        });
+        const sibling = attempt({
+          ...context.admission.initial_attempts[0],
+          id: "attempt-2",
+          scope: {
+            kind: "loop_item",
+            stage_id: "work",
+            parent_attempt_id: "attempt-1",
+            loop_id: "execution_plan.units",
+            item_id: "unit-b",
+            item_index: 1,
+          },
+          status: "result_pending",
+          output_subject: subject("3"),
+          native_session_id: "session-sibling",
+          result_correction_count: 1,
+          result_correction_deadline: "2026-08-20T12:15:00.000Z",
+          pending_result: {
+            candidate_hash: sha("f"),
+            diagnostics: [{ path: "/payload/summary", detail: "sibling result is invalid" }],
+            invalid_result_evidence: siblingPointer,
+          },
+        });
+        context.admission.initial_attempts = [selected, sibling];
+        context.admission.run = run(
+          [selected, sibling],
+          context.admission.run.definition_bundle_hash,
+        );
+        context.store.admitPipelineRun(context.admission);
+        seedConfirmedRuntimeEffect(context, {
+          run_id: "run-1",
+          kind: "daytona/create-sandbox@1",
+          sequence: 1,
+        });
+
+        const deliveryId = "delivery-run-1-create";
+        const selectedView = await context.store.loadExactReductionView({
+          pipeline_run_id: "run-1",
+          attempt_id: selected.id,
+          record_ids: [deliveryId],
+          checkpoint_ids: [],
+        });
+        const siblingView = await context.store.loadExactReductionView({
+          pipeline_run_id: "run-1",
+          attempt_id: sibling.id,
+          record_ids: [],
+          checkpoint_ids: [],
+        });
+        const persistedSelected = selectedView.current_attempt!;
+        const persistedSibling = siblingView.current_attempt!;
+        const delivery = selectedView.records.get(deliveryId);
+        if (!delivery || delivery.kind !== "delivery") {
+          throw new Error("terminal evidence fixture requires its create DeliveryRecord");
+        }
+        const selectedEvidence = createInvalidResultEvidenceRecord({
+          attempt: persistedSelected,
+          pointer: selectedPointer,
+          created_at: NOW,
+        });
+        const siblingEvidence = createInvalidResultEvidenceRecord({
+          attempt: persistedSibling,
+          pointer: siblingPointer,
+          created_at: NOW,
+        });
+        const decision: DecisionRecord = {
+          schema: EXECUTION_RECORD_SCHEMA,
+          id: `decision-${type}-pending-evidence`,
+          kind: "decision",
+          pipeline_run_id: "run-1",
+          reducer: `core/${type}@1`,
+          input_record_ids: [delivery.id, selectedEvidence.id, siblingEvidence.id].sort(),
+          payload_schema: "decision/v1",
+          payload: { inline: { reason: type === "stop" ? "operator stop" : "new generation" } },
+          created_at: NOW,
+        };
+        const cleanupAttempt = attempt({
+          id: `attempt-cleanup-${type}`,
+          scope: { kind: "stage", stage_id: runtimeStopStageId(terminalStatus) },
+          repository_authority: "inspect",
+          definition_bundle_hash: selectedView.run.definition_bundle_hash,
+          input_subject: selectedView.run.current_subject,
+          context_record_ids: [decision.id, ...decision.input_record_ids].sort(),
+        });
+        const diagnosticIds = [selectedEvidence.id, siblingEvidence.id].sort();
+        const resourceDisposition = {
+          kind: "cleanup" as const,
+          runtime_delivery_record_ids: [delivery.id],
+          diagnostic_record_ids: diagnosticIds,
+          new_diagnostic_record_ids: diagnosticIds,
+          cleanup_attempt: cleanupAttempt,
+        };
+        const command = type === "stop"
+          ? {
+            type,
+            command_id: `terminal-${type}-pending-evidence`,
+            decision_record_id: decision.id,
+            reason: "operator stop",
+            resource_disposition: resourceDisposition,
+          } as const
+          : {
+            type,
+            command_id: `terminal-${type}-pending-evidence`,
+            decision_record_id: decision.id,
+            reason: "new generation",
+            resource_disposition: resourceDisposition,
+          } as const;
+        const records = new Map<string, DecisionRecord | DeliveryRecord>([
+          [decision.id, decision],
+          [delivery.id, delivery],
+          [selectedEvidence.id, selectedEvidence],
+          [siblingEvidence.id, siblingEvidence],
+        ]);
+        const transition = reduceKernelCommand({
+          ...selectedView,
+          records,
+          command,
+        });
+
+        await expect(context.store.applyAtomicTransition(transition)).resolves.toEqual({
+          disposition: "applied",
+          run_version: selectedView.run.version + 1,
+        });
+        expect(context.db.prepare(`
+          SELECT id, status, pending_candidate_hash, pending_diagnostics_json
+          FROM attempts WHERE id IN ('attempt-1', 'attempt-2') ORDER BY id
+        `).all()).toEqual([
+          {
+            id: "attempt-1",
+            status: terminalStatus,
+            pending_candidate_hash: null,
+            pending_diagnostics_json: null,
+          },
+          {
+            id: "attempt-2",
+            status: terminalStatus,
+            pending_candidate_hash: null,
+            pending_diagnostics_json: null,
+          },
+        ]);
+        expect(context.db.prepare(`
+          SELECT id, reducer, blob_digest FROM records
+          WHERE id IN (?, ?) ORDER BY id
+        `).all(selectedEvidence.id, siblingEvidence.id)).toEqual([
+          { id: selectedEvidence.id, pointer: selectedPointer },
+          { id: siblingEvidence.id, pointer: siblingPointer },
+        ].sort((left, right) => left.id.localeCompare(right.id)).map(({ id, pointer }) => ({
+          id,
+          reducer: "core/invalid-result-evidence@1",
+          blob_digest: pointer.digest,
+        })));
+        await expect(context.store.applyAtomicTransition(transition)).resolves.toEqual({
+          disposition: "replayed",
+          run_version: selectedView.run.version + 1,
+        });
+
+        context.db.close();
+        originalClosed = true;
+        const reopened = reopenStore(context);
+        reopenedDb = reopened.db;
+        await expect(reopened.store.applyAtomicTransition(transition)).resolves.toEqual({
+          disposition: "replayed",
+          run_version: selectedView.run.version + 1,
+        });
+        const restartedSelected = await reopened.store.loadExactReductionView({
+          pipeline_run_id: "run-1",
+          attempt_id: selected.id,
+          record_ids: [decision.id, delivery.id, selectedEvidence.id, siblingEvidence.id],
+          checkpoint_ids: [],
+        });
+        const restartedSibling = await reopened.store.loadExactReductionView({
+          pipeline_run_id: "run-1",
+          attempt_id: sibling.id,
+          record_ids: [],
+          checkpoint_ids: [],
+        });
+        expect(restartedSelected.current_attempt).toMatchObject({
+          id: selected.id,
+          status: terminalStatus,
+          pending_result: null,
+        });
+        expect(restartedSibling.current_attempt).toMatchObject({
+          id: sibling.id,
+          status: terminalStatus,
+          pending_result: null,
+        });
+        expect(restartedSelected.records.get(selectedEvidence.id)).toEqual(selectedEvidence);
+        expect(restartedSelected.records.get(siblingEvidence.id)).toEqual(siblingEvidence);
+      } finally {
+        reopenedDb?.close();
+        if (!originalClosed) context.db.close();
+      }
+    },
+  );
+
+  it("restores structured planning correction evidence and fails closed on a missing decision input", async () => {
+    const context = setup();
+    let originalClosed = false;
+    let reopenedDb: Database.Database | undefined;
+    try {
+      const structuredInitial = attempt({
+        ...context.admission.initial_attempts[0],
+        scope: {
+          kind: "loop_item",
+          stage_id: "work",
+          parent_attempt_id: "attempt-1",
+          loop_id: "execution_plan.units",
+          item_id: "unit-a",
+          item_index: 0,
+        },
+      });
+      context.admission.initial_attempts = [structuredInitial];
+      context.admission.run = run(
+        [structuredInitial],
+        context.admission.run.definition_bundle_hash,
+      );
+      context.store.admitPipelineRun(context.admission);
+
+      const firstPointer = putInvalidResultEvidence(context.blobs);
+      const firstPending = await prepareResultPendingTransition(context, firstPointer);
+      await context.store.applyAtomicTransition(firstPending);
+
+      const startCorrection = async (leaseId: string, commandId: string) => {
+        await expect(context.store.leaseNextEligibleAttempt({
+          worker_id: "worker-correction",
+          lease_id: leaseId,
+          expires_at: "2026-08-20T12:10:00.000Z",
+        })).resolves.toMatchObject({
+          attempt: { id: "attempt-1", status: "result_pending" },
+          lease: { id: leaseId, purpose: "result_correction" },
+        });
+        const leased = await context.store.loadExactReductionView({
+          pipeline_run_id: "run-1",
+          attempt_id: "attempt-1",
+          record_ids: [],
+          checkpoint_ids: [],
+        });
+        await context.store.applyAtomicTransition(reduceKernelCommand({
+          ...leased,
+          command: {
+            type: "start",
+            command_id: commandId,
+            attempt_id: "attempt-1",
+            lease_id: leaseId,
+          },
+        }));
+        return context.store.loadExactReductionView({
+          pipeline_run_id: "run-1",
+          attempt_id: "attempt-1",
+          record_ids: [],
+          checkpoint_ids: ["checkpoint-result-pending"],
+        });
+      };
+
+      const firstCorrection = await startCorrection(
+        "lease-correction-1",
+        "start-correction-1",
+      );
+      const correctionPointer = putInvalidResultEvidence(context.blobs, {
+        phase: "result_correction",
+        candidate_hash: sha("f"),
+        diagnostics: [{ path: "/payload/summary", detail: "corrected summary is still invalid" }],
+      });
+      const correctionEvidence = createInvalidResultEvidenceRecord({
+        attempt: firstCorrection.current_attempt!,
+        pointer: correctionPointer,
+        created_at: NOW,
+      });
+      await context.store.applyAtomicTransition(reduceKernelCommand({
+        ...firstCorrection,
+        records: exactMap(correctionEvidence),
+        command: {
+          type: "result_pending",
+          command_id: "result-pending-correction-evidence",
+          attempt_id: "attempt-1",
+          candidate_hash: sha("f"),
+          diagnostics: [{ path: "/payload/summary", detail: "corrected summary is still invalid" }],
+          correction_deadline: "2026-08-20T12:15:00.000Z",
+          invalid_result_evidence: correctionPointer,
+          invalid_result_evidence_record_id: correctionEvidence.id,
+        },
+      }));
+
+      const secondCorrection = await startCorrection(
+        "lease-correction-2",
+        "start-correction-2",
+      );
+      const correctedAttempt = secondCorrection.current_attempt!;
+      const result: ResultRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "result-corrected-structured",
+        kind: "result",
+        pipeline_run_id: "run-1",
+        attempt_id: correctedAttempt.id,
+        request_hash: correctedAttempt.request_hash,
+        definition_bundle_hash: correctedAttempt.definition_bundle_hash,
+        input_subject: correctedAttempt.input_subject,
+        output_subject: correctedAttempt.output_subject,
+        original_candidate_hash: sha("7"),
+        normalized_candidate_hash: sha("7"),
+        payload_schema: "result/v1",
+        payload: { inline: { outcome: "success" } },
+        created_at: NOW,
+      };
+      const decision: DecisionRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "decision-corrected-structured",
+        kind: "decision",
+        pipeline_run_id: "run-1",
+        reducer: "core/advance@1",
+        input_record_ids: [result.id, correctionEvidence.id].sort(),
+        payload_schema: "decision/v1",
+        payload: { inline: { accepted: true } },
+        created_at: NOW,
+      };
+      const next = attempt({
+        id: "attempt-verify-corrected-structured",
+        scope: {
+          kind: "loop_item",
+          stage_id: "verify",
+          parent_attempt_id: "attempt-1",
+          loop_id: "execution_plan.units",
+          item_id: "unit-a",
+          item_index: 0,
+        },
+        repository_authority: "inspect",
+        definition_bundle_hash: secondCorrection.run.definition_bundle_hash,
+        input_subject: subject("2"),
+      });
+      await context.store.applyAtomicTransition(reduceKernelCommand({
+        ...secondCorrection,
+        records: new Map<string, ResultRecord | DecisionRecord>([
+          [result.id, result],
+          [correctionEvidence.id, correctionEvidence],
+          [decision.id, decision],
+        ]),
+        command: {
+          type: "correct_and_settle",
+          command_id: "correct-and-settle-structured",
+          attempt_id: correctedAttempt.id,
+          result_record_id: result.id,
+          invalid_result_evidence_record_id: correctionEvidence.id,
+          decision_record_id: decision.id,
+          outcome: "success",
+          next_attempts: [next],
+        },
+      }));
+
+      const planningRequest = {
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: secondCorrection.run.definition_bundle_hash,
+        scope_kind: "loop_item" as const,
+        parent_attempt_id: "attempt-1",
+        scope_group_id: "execution_plan.units",
+        stage_ids: ["work"],
+        member_ids: ["unit-a"],
+      };
+      const settled = await context.store.listSettledStructuredPlanningAttempts(planningRequest);
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.decision_input_records).toEqual([
+        correctionEvidence,
+        result,
+      ].sort((left, right) => left.id.localeCompare(right.id)));
+
+      context.db.close();
+      originalClosed = true;
+      const reopened = reopenStore(context);
+      reopenedDb = reopened.db;
+      expect(await reopened.store.listSettledStructuredPlanningAttempts(planningRequest))
+        .toEqual(settled);
+      reopened.db.prepare("DELETE FROM records WHERE id = ?").run(correctionEvidence.id);
+      await expect(reopened.store.listSettledStructuredPlanningAttempts(planningRequest))
+        .rejects.toThrow(/exact record context is missing an authorized record/);
+    } finally {
+      reopenedDb?.close();
+      if (!originalClosed) context.db.close();
+    }
+  });
+
   it("persists result/decision/effect primitives and fences effect lease reconciliation", async () => {
     let currentTime = NOW;
     const context = setup(undefined, () => currentTime);

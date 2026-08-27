@@ -478,6 +478,7 @@ function acceptedUnitEvidence(
   };
   return {
     member_id: memberId,
+    decision_input_records: [result],
     acceptance: {
       attempt: {
         ...pending,

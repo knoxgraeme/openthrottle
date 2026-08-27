@@ -326,6 +326,7 @@ export class KernelStructuredSettlementPlanner implements
       const accepted: StructuredAcceptedUnitEvidence = {
         member_id: source.member_id,
         acceptance: settledStructuredActionEvidence(source),
+        decision_input_records: source.decision_input_records,
         candidate_checkpoint: exactStructuredBoundaryCheckpoint(
           source.request_inputs,
           source.attempt.input_subject,
@@ -465,6 +466,7 @@ export class KernelStructuredSettlementPlanner implements
         acceptedByMember.set(memberId, {
           member_id: memberId,
           acceptance: settledStructuredActionEvidence(candidate),
+          decision_input_records: candidate.decision_input_records,
           candidate_checkpoint: exactStructuredBoundaryCheckpoint(
             candidate.request_inputs,
             candidate.attempt.input_subject,

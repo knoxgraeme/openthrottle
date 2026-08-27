@@ -656,7 +656,7 @@ describe("KernelStructuredSettlementPlanner", () => {
     });
   });
 
-  it("serializes an accepted unit into one integration Attempt", async () => {
+  it("serializes a corrected current acceptance into one integration Attempt", async () => {
     const store = new PlanningStore();
     const promotion = promotionDecision();
     const candidate: AttemptCheckpoint = {
@@ -690,12 +690,14 @@ describe("KernelStructuredSettlementPlanner", () => {
     const completed = completedAttempt({ pending, output_subject: null, request });
     store.requests.set(pending.id, request);
     const planner = new KernelStructuredSettlementPlanner({ store, now: () => NOW });
+    const correction = correctionEvidence("current-acceptance");
 
     const settlement = await planner.plan(ordinaryInput({
       attempt: completed.attempt,
       checkpoint: completed.checkpoint,
       result: completed.result,
       view: view({ attempts: [completed.attempt], current: completed.attempt }),
+      additional_input_records: [correction],
     }));
 
     expect(settlement.next_attempts).toHaveLength(1);
@@ -706,9 +708,10 @@ describe("KernelStructuredSettlementPlanner", () => {
     });
     expect(settlement.next_attempts[0]!.context_checkpoint_ids).toEqual([candidate.id]);
     expect(settlement.next_attempts[0]!.context_record_ids).toContain(promotion.id);
+    expect(settlement.next_attempts[0]!.context_record_ids).toContain(correction.id);
   });
 
-  it("carries the complete two-link settled integration chain into a third serial integration", async () => {
+  it("carries corrected earlier-sibling evidence into a third serial integration", async () => {
     const unit = (id: string) => ({
       id,
       title: `Unit ${id}`,
@@ -733,7 +736,12 @@ describe("KernelStructuredSettlementPlanner", () => {
       payload: { inline: { ...promotionInline, execution_plan: executionPlan } as never },
     };
     const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
-    const accepted = (memberId: string, index: number, outputSubject: string) => {
+    const accepted = (
+      memberId: string,
+      index: number,
+      outputSubject: string,
+      additionalInputRecords: readonly ExecutionRecord[] = [],
+    ) => {
       const candidate: AttemptCheckpoint = {
         schema: ATTEMPT_CHECKPOINT_SCHEMA,
         id: `checkpoint-candidate-${memberId}`,
@@ -767,11 +775,26 @@ describe("KernelStructuredSettlementPlanner", () => {
         input_subject: outputSubject,
         request,
       });
-      return { candidate, ...completedAttempt({ pending, output_subject: null, request, settled: true }) };
+      return {
+        candidate,
+        ...completedAttempt({
+          pending,
+          output_subject: null,
+          request,
+          settled: true,
+          additional_input_records: additionalInputRecords,
+        }),
+      };
     };
     const acceptedA = accepted("unit-a", 0, UNIT_A);
     const acceptedB = accepted("unit-b", 1, UNIT_B);
-    const acceptedC = accepted("unit-c", 2, "6".repeat(40));
+    const earlierSiblingCorrection = correctionEvidence("earlier-sibling-acceptance");
+    const acceptedC = accepted(
+      "unit-c",
+      2,
+      "6".repeat(40),
+      [earlierSiblingCorrection],
+    );
     const integratedA = "4".repeat(40);
     const integratedB = "5".repeat(40);
     const integration = (input: {
@@ -880,6 +903,8 @@ describe("KernelStructuredSettlementPlanner", () => {
       first.checkpoint.id,
       second.checkpoint.id,
     ].sort());
+    expect(settlement.next_attempts[0]!.context_record_ids)
+      .toContain(earlierSiblingCorrection.id);
   });
 
   it("turns a lead rejection into a distinct unbound edit Attempt with exact prior evidence", async () => {
