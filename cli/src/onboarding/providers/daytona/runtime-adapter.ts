@@ -42,9 +42,10 @@ const DISK_CLEANUP_RECOVERY =
 // Minimal structural view of @daytona/sdk covering exactly the calls this
 // adapter makes. Shapes verified against supervisor/scripts/build-snapshot.mjs
 // and the pinned SDK's declarations (Snapshot.d.ts: snapshot.get/list/create
-// with `image: string | Image` and `{ onLogs }`; Daytona.d.ts: `Resources`
-// cpu in cores with memory/disk in GiB, and `list()` async-iterating Sandbox
-// objects that carry `disk` in GiB).
+// with `image: string | Image` and `{ onLogs }`; Image.base(ref) producing a
+// zero-context `FROM <ref>\n` wrapper; Daytona.d.ts: `Resources` cpu in cores
+// with memory/disk in GiB, and `list()` async-iterating Sandbox objects that
+// carry `disk` in GiB).
 export interface DaytonaSnapshotLike {
   name?: string;
   state?: string;
@@ -56,9 +57,13 @@ export interface DaytonaSandboxLike {
   disk?: number;
 }
 
+export interface DaytonaImageLike {
+  readonly dockerfile: string;
+}
+
 export interface DaytonaSnapshotCreateParams {
   name: string;
-  image: string;
+  image: DaytonaImageLike;
   resources: { cpu: number; memory: number; disk: number };
 }
 
@@ -76,6 +81,9 @@ export interface DaytonaClientLike {
 
 export interface DaytonaSdkLike {
   Daytona: new (config: { apiKey: string }) => DaytonaClientLike;
+  Image: {
+    base(image: string): DaytonaImageLike;
+  };
 }
 
 export interface DaytonaRuntimeAdapterOptions {
@@ -269,6 +277,7 @@ async function assessOrgDisk(daytona: DaytonaClientLike, diskGb: number): Promis
 export function createDaytonaRuntimeAdapter(options: DaytonaRuntimeAdapterOptions = {}): RuntimeSetupAdapter {
   const loadSdk = options.sdk ?? loadRealSdk;
   const log = options.log;
+  let sdkPromise: Promise<DaytonaSdkLike> | undefined;
 
   function apiKey(): string | undefined {
     const env = options.env ?? process.env;
@@ -276,9 +285,17 @@ export function createDaytonaRuntimeAdapter(options: DaytonaRuntimeAdapterOption
     return value && value.trim() !== "" ? value.trim() : undefined;
   }
 
-  async function connect(key: string): Promise<DaytonaClientLike> {
-    const sdk = await loadSdk();
-    return new sdk.Daytona({ apiKey: key });
+  async function connect(key: string): Promise<{ daytona: DaytonaClientLike; Image: DaytonaSdkLike["Image"] }> {
+    const pendingSdk = (sdkPromise ??= loadSdk());
+    let sdk: DaytonaSdkLike;
+    try {
+      sdk = await pendingSdk;
+    } catch (error) {
+      // A transient loader failure must not poison later setup retries.
+      if (sdkPromise === pendingSdk) sdkPromise = undefined;
+      throw error;
+    }
+    return { daytona: new sdk.Daytona({ apiKey: key }), Image: sdk.Image };
   }
 
   async function preflight(context: AdapterContext): Promise<ProviderEvidence> {
@@ -287,7 +304,7 @@ export function createDaytonaRuntimeAdapter(options: DaytonaRuntimeAdapterOption
     if (!key) return missingKeyEvidence(observedAt);
     let daytona: DaytonaClientLike;
     try {
-      daytona = await connect(key);
+      ({ daytona } = await connect(key));
     } catch (error) {
       return sdkLoadErrorEvidence(error, observedAt);
     }
@@ -330,7 +347,7 @@ export function createDaytonaRuntimeAdapter(options: DaytonaRuntimeAdapterOption
     if (!key) return missingKeyEvidence(observedAt);
     let daytona: DaytonaClientLike;
     try {
-      daytona = await connect(key);
+      ({ daytona } = await connect(key));
     } catch (error) {
       return sdkLoadErrorEvidence(error, observedAt);
     }
@@ -343,7 +360,8 @@ export function createDaytonaRuntimeAdapter(options: DaytonaRuntimeAdapterOption
         status: "needs_action",
         owner: "runtime_provider",
         summary: boundSummary(
-          `Daytona snapshot ${name} not found; ensure will create it from ${release.sandboxImage} (${disk.note})`
+          `Daytona snapshot ${name} not found; ensure will create it with an exact digest-backed wrapper build ` +
+            `from ${release.sandboxImage} and no repository build context (${disk.note})`
         ),
         ...(disk.overCap ? { recoveryAction: DISK_CLEANUP_RECOVERY } : {}),
         releaseId: release.releaseId,
@@ -386,7 +404,7 @@ export function createDaytonaRuntimeAdapter(options: DaytonaRuntimeAdapterOption
     if (!key) return none;
     let probe: SnapshotProbe;
     try {
-      probe = await probeSnapshot(await connect(key), name, key);
+      probe = await probeSnapshot((await connect(key)).daytona, name, key);
     } catch (error) {
       probe = { kind: "unreachable", detail: describeError(error, key) };
     }
@@ -395,7 +413,10 @@ export function createDaytonaRuntimeAdapter(options: DaytonaRuntimeAdapterOption
     // snapshot without an approved plan entry.
     if (probe.kind === "missing" || probe.kind === "unreachable") {
       return {
-        mutations: [`create Daytona snapshot ${name} from ${release.sandboxImage} (${describeResources(release)})`],
+        mutations: [
+          `create Daytona snapshot ${name} with an exact digest-backed wrapper build from ` +
+            `${release.sandboxImage} and no repository build context (${describeResources(release)})`,
+        ],
         billable: false,
         externallyVisible: false,
       };
@@ -413,12 +434,13 @@ export function createDaytonaRuntimeAdapter(options: DaytonaRuntimeAdapterOption
     }
     const key = apiKey();
     if (!key) return { evidence: missingKeyEvidence(observedAt), fragment };
-    let daytona: DaytonaClientLike;
+    let connection: Awaited<ReturnType<typeof connect>>;
     try {
-      daytona = await connect(key);
+      connection = await connect(key);
     } catch (error) {
       return { evidence: sdkLoadErrorEvidence(error, observedAt), fragment };
     }
+    const { daytona, Image } = connection;
     const probe = await probeSnapshot(daytona, name, key);
     if (probe.kind === "unreachable") {
       return { evidence: lookupErrorEvidence(probe.detail, release, observedAt), fragment };
@@ -428,13 +450,14 @@ export function createDaytonaRuntimeAdapter(options: DaytonaRuntimeAdapterOption
     }
     if (probe.kind === "missing") {
       try {
-        // Never build from a Dockerfile here: the sealed release ships a
-        // digest-pinned registry image and the snapshot must be created from
-        // exactly that ref.
+        // A string image uses Daytona's imageName path, which rewrites digest
+        // syntax as a tag. Image.base instead emits exactly `FROM <digest>\n`
+        // with zero context, so the SDK submits a digest-backed wrapper build.
+        // No repository Dockerfile or build context is read.
         await daytona.snapshot.create(
           {
             name,
-            image: release.sandboxImage,
+            image: Image.base(release.sandboxImage),
             resources: {
               cpu: release.recommendedResources.cpu,
               memory: memoryMbToGib(release.recommendedResources.memoryMb),
