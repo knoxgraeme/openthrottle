@@ -9,6 +9,7 @@ import {
   COMPILED_PIPELINE_MANIFEST_SCHEMA,
   EFFECT_INTENT_SCHEMA,
   EXECUTION_RECORD_SCHEMA,
+  RUNTIME_PROVISION_STAGE_ID,
   canonicalJson,
   digestNormalized,
   expandCompiledRuntimeLifecycle,
@@ -72,6 +73,7 @@ import { SqliteKernelInboxStore } from "./kernel-inbox-store.js";
 const temporaryDirectories: string[] = [];
 const NOW = "2026-08-20T12:00:00.000Z";
 const EXECUTION_POLICY = Object.freeze({ max_concurrent_attempts: 1 });
+const EXECUTION_POLICY_TWO = Object.freeze({ max_concurrent_attempts: 2 });
 const sha = (character: string): string => character.repeat(64);
 const subject = (character: string): string => character.repeat(40);
 
@@ -159,7 +161,11 @@ function attempt(input: Partial<KernelAttempt> = {}): KernelAttempt {
   };
 }
 
-function run(initial: readonly KernelAttempt[], bundleHash: string): KernelRun {
+function run(
+  initial: readonly KernelAttempt[],
+  bundleHash: string,
+  stageId = "work",
+): KernelRun {
   return {
     schema: KERNEL_RUN_SCHEMA,
     id: "run-1",
@@ -168,7 +174,7 @@ function run(initial: readonly KernelAttempt[], bundleHash: string): KernelRun {
     current_subject: subject("1"),
     status: "pending",
     terminal_outcome: null,
-    cursor: compileKernelCursor({ stage_id: "work", version: 0, attempts: initial }),
+    cursor: compileKernelCursor({ stage_id: stageId, version: 0, attempts: initial }),
     version: 0,
     work_retry_limit: 2,
     result_correction_limit: 2,
@@ -183,6 +189,9 @@ function setup(
   now: () => string = () => NOW,
   withRuntimeLifecycle = false,
   executionWidth = 1,
+  transformManifest: (manifest: CompiledPipelineManifest) => CompiledPipelineManifest =
+    (candidate) => candidate,
+  executionPolicy: { readonly max_concurrent_attempts: number } = EXECUTION_POLICY,
 ): {
   db: Database.Database;
   database_path: string;
@@ -233,7 +242,7 @@ function setup(
     payload_schema: "openthrottle.definition-bundle/v1",
   });
   const authoredManifest = manifest(definitionBundle.pointer.digest);
-  const pipelineManifest = withRuntimeLifecycle
+  const expandedManifest = withRuntimeLifecycle
     ? {
       ...authoredManifest,
       stages: expandCompiledRuntimeLifecycle({
@@ -242,6 +251,7 @@ function setup(
       }).stages,
     }
     : authoredManifest;
+  const pipelineManifest = transformManifest(expandedManifest);
   const initialAttempt = attempt({ definition_bundle_hash: definitionBundle.pointer.digest });
   const initialRun = run([initialAttempt], definitionBundle.pointer.digest);
   const store = new SqliteKernelStore({
@@ -249,7 +259,7 @@ function setup(
     blob_store: blobs,
     manifest_resolver: { resolve: () => pipelineManifest },
     payload_schemas: payloadSchemas,
-    execution_policy: EXECUTION_POLICY,
+    execution_policy: executionPolicy,
     execution_width: executionWidth,
     now,
     fault_injector: faultInjector,
@@ -356,17 +366,26 @@ function seedConfirmedRuntimeEffect(
     run_id: string;
     kind: "daytona/create-sandbox@1" | "daytona/cleanup-sandbox@1";
     sequence: number;
+    marker?: string;
+    target?: string;
   },
 ): void {
-  const suffix = `${input.run_id}-${input.kind.includes("cleanup") ? "cleanup" : "create"}`;
+  const marker = input.marker ?? (input.kind.includes("cleanup") ? "cleanup" : "create");
+  const suffix = `${input.run_id}-${marker}`;
   const decisionId = `decision-${suffix}`;
   const effectId = `effect-${suffix}`;
   const deliveryId = `delivery-${suffix}`;
-  const idempotencyKey = `${input.run_id}:${input.kind}`;
+  const idempotencyKey = input.marker === undefined
+    ? `${input.run_id}:${input.kind}`
+    : `${input.run_id}:${input.kind}:${marker}`;
+  const target = input.target ?? `daytona:sandbox-${input.run_id}`;
   const deliveryPayload = {
     effect_kind: input.kind,
     provider: "daytona",
-    result: { sandbox_id: `sandbox-${input.run_id}` },
+    result: {
+      identity: digestCanonicalJson({ run_id: input.run_id, marker }),
+      sandbox_id: `sandbox-${input.run_id}`,
+    },
   };
   context.db.transaction(() => {
     context.db.prepare(`
@@ -388,7 +407,7 @@ function seedConfirmedRuntimeEffect(
       decisionId,
       input.kind,
       idempotencyKey,
-      `daytona:sandbox-${input.run_id}`,
+      target,
       input.kind,
       sha("7"),
       NOW,
@@ -411,7 +430,7 @@ function seedConfirmedRuntimeEffect(
       JSON.stringify(deliveryPayload),
       effectId,
       idempotencyKey,
-      `daytona:sandbox-${input.run_id}`,
+      target,
       NOW,
     );
   }).immediate();
@@ -666,6 +685,113 @@ function seedDispatchFencedUnknownIntegration(
       UNKNOWN_INTEGRATION_DETAIL,
       NOW,
       NOW,
+    );
+  }).immediate();
+  return effect;
+}
+
+function seedAdditionalConfirmedRuntimeCreate(
+  context: ReturnType<typeof setup>,
+  runtimeIdentity: string,
+): EffectIntent {
+  const decision: DecisionRecord = {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: "decision-runtime-create-pool-member",
+    kind: "decision",
+    pipeline_run_id: "run-1",
+    reducer: "core/external-schedule@1",
+    input_record_ids: [],
+    payload_schema: "decision/v1",
+    payload: { inline: { phase: "create", attempt_id: "attempt-runtime" } },
+    created_at: NOW,
+  };
+  const effect: EffectIntent = {
+    schema: EFFECT_INTENT_SCHEMA,
+    id: "effect-runtime-create-pool-member",
+    pipeline_run_id: "run-1",
+    decision_record_id: decision.id,
+    kind: "daytona/create-sandbox@1",
+    idempotency_key: `run-1:daytona/create-sandbox@1:${runtimeIdentity}`,
+    target: `daytona:${runtimeIdentity}`,
+    subject: null,
+    payload: {
+      schema: "openthrottle.daytona-create/v1",
+      identity: runtimeIdentity,
+      pipeline_run_id: "run-1",
+      repository: "owner/repo",
+      base_branch: "main",
+      base_commit: subject("1"),
+      snapshot: OPERATOR_EFFECT_REJECTION_RUNTIME_SNAPSHOT,
+    },
+  };
+  const delivery: DeliveryRecord = {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: "delivery-runtime-create-pool-member",
+    kind: "delivery",
+    pipeline_run_id: "run-1",
+    effect_id: effect.id,
+    idempotency_key: effect.idempotency_key,
+    external_identity: effect.target,
+    status: "confirmed",
+    payload_schema: "delivery/v1",
+    payload: { inline: {
+      sandbox_id: "sandbox-operator-rejection-pool-member",
+      identity: runtimeIdentity,
+    } },
+    created_at: NOW,
+  };
+  context.db.transaction(() => {
+    context.db.prepare(`
+      INSERT INTO records (
+        id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+        inline_payload, reducer, input_record_ids_json, input_record_count, created_at
+      ) VALUES (?, ?, 4, ?, 'decision', ?, ?, ?, '[]', 0, ?)
+    `).run(
+      decision.id,
+      decision.pipeline_run_id,
+      digestCanonicalJson(decision),
+      decision.payload_schema,
+      canonicalJson((decision.payload as { inline: JsonValue }).inline),
+      decision.reducer,
+      decision.created_at,
+    );
+    context.db.prepare(`
+      INSERT INTO effects (
+        id, pipeline_run_id, decision_record_id, kind, idempotency_key, target,
+        subject, payload_schema, inline_payload, intent_hash, status, version,
+        attempt_count, available_at, delivery_record_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'acknowledged', 1, 1, ?, ?, ?, ?)
+    `).run(
+      effect.id,
+      effect.pipeline_run_id,
+      effect.decision_record_id,
+      effect.kind,
+      effect.idempotency_key,
+      effect.target,
+      effect.kind,
+      canonicalJson(effect.payload),
+      effectIntentContentHash(effect),
+      NOW,
+      delivery.id,
+      NOW,
+      NOW,
+    );
+    context.db.prepare(`
+      INSERT INTO records (
+        id, pipeline_run_id, sequence, record_hash, kind, payload_schema,
+        inline_payload, effect_id, idempotency_key, external_identity,
+        delivery_status, created_at
+      ) VALUES (?, ?, 5, ?, 'delivery', ?, ?, ?, ?, ?, 'confirmed', ?)
+    `).run(
+      delivery.id,
+      delivery.pipeline_run_id,
+      digestCanonicalJson(delivery),
+      delivery.payload_schema,
+      canonicalJson((delivery.payload as { inline: JsonValue }).inline),
+      delivery.effect_id,
+      delivery.idempotency_key,
+      delivery.external_identity,
+      delivery.created_at,
     );
   }).immediate();
   return effect;
@@ -1541,7 +1667,7 @@ describe("SqliteKernelStore", () => {
     }
   });
 
-  it("snapshots one frozen single-Attempt policy value at the persistence boundary", async () => {
+  it("snapshots one frozen bounded execution-policy value at the persistence boundary", async () => {
     const context = setup();
     const base = {
       db: context.db,
@@ -1551,21 +1677,27 @@ describe("SqliteKernelStore", () => {
       now: () => NOW,
     };
     try {
-      const forcedWidthTwo = Object.freeze({ max_concurrent_attempts: 2 }) as unknown as {
-        readonly max_concurrent_attempts: 1;
-      };
+      const forcedWidthTwo = Object.freeze({ max_concurrent_attempts: 2 });
       expect(() => new SqliteKernelStore({
         ...base,
         execution_policy: forcedWidthTwo,
-      })).toThrow(/supported release limit 1/);
+      })).not.toThrow();
+      expect(() => new SqliteKernelStore({
+        ...base,
+        execution_policy: Object.freeze({ max_concurrent_attempts: 17 }),
+      })).toThrow(/frozen between 1 and 16/);
+      expect(() => new SqliteKernelStore({
+        ...base,
+        execution_policy: { max_concurrent_attempts: 1 },
+      })).toThrow(/frozen between 1 and 16/);
 
       let reads = 0;
       const statefulGetter = Object.freeze({
         get max_concurrent_attempts() {
           reads += 1;
-          return reads === 1 ? 1 : 2;
+          return reads === 1 ? 2 : 3;
         },
-      }) as unknown as { readonly max_concurrent_attempts: 1 };
+      });
       const store = new SqliteKernelStore({
         ...base,
         execution_policy: statefulGetter,
@@ -1578,6 +1710,168 @@ describe("SqliteKernelStore", () => {
         expires_at: "2026-08-20T12:05:00.000Z",
       })).resolves.not.toBeNull();
       expect(reads).toBe(1);
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("skips a deterministically invalid manifest while leasing an unrelated run", async () => {
+    const context = setup();
+    try {
+      const goodHash = context.admission.run.definition_bundle_hash;
+      const goodAttempt = attempt({
+        id: "attempt-z-good",
+        pipeline_run_id: "run-good",
+        definition_bundle_hash: goodHash,
+      });
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: {
+          ...run([goodAttempt], goodHash),
+          id: "run-good",
+          active_attempt_versions: { [goodAttempt.id]: goodAttempt.version },
+        },
+        initial_attempts: [goodAttempt],
+      });
+
+      const invalidBundle = context.blobs.put({
+        bytes: '{"bundle":"invalid"}',
+        encoding: "utf-8",
+        media_type: "application/json",
+        payload_schema: "openthrottle.definition-bundle/v1",
+      });
+      const invalidHash = invalidBundle.pointer.digest;
+      const invalidAttempt = attempt({
+        id: "attempt-a-invalid",
+        pipeline_run_id: "run-invalid",
+        definition_bundle_hash: invalidHash,
+      });
+      context.store.admitPipelineRun({
+        ...context.admission,
+        work_item: {
+          ...context.admission.work_item,
+          id: "work-invalid",
+          source_id: "issue-invalid",
+          source_reference: "OPE-INVALID",
+        },
+        run: {
+          ...run([invalidAttempt], invalidHash),
+          id: "run-invalid",
+          active_attempt_versions: { [invalidAttempt.id]: invalidAttempt.version },
+        },
+        definition_bundle: invalidBundle,
+        initial_attempts: [invalidAttempt],
+      });
+
+      const scheduler = new SqliteKernelStore({
+        db: context.db,
+        blob_store: context.blobs,
+        manifest_resolver: {
+          resolve: (input) => {
+            if (input.definition_bundle_hash === invalidHash) {
+              throw new Error("invalid exact compiled manifest");
+            }
+            return context.pipelineManifest;
+          },
+        },
+        payload_schemas: payloadSchemas,
+        execution_policy: EXECUTION_POLICY,
+        now: () => NOW,
+      });
+      await expect(scheduler.leaseNextEligibleAttempt({
+        worker_id: "worker-good",
+        lease_id: "lease-good",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({
+        run_id: "run-good",
+        attempt: { id: "attempt-z-good" },
+      });
+      expect(context.db.prepare(
+        "SELECT lease_id FROM attempts WHERE id = 'attempt-a-invalid'",
+      ).get()).toEqual({ lease_id: null });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("refreshes a stale manifest snapshot when a new bundle is admitted before the lease transaction", async () => {
+    const context = setup();
+    try {
+      const firstHash = context.admission.run.definition_bundle_hash;
+      const firstAttempt = attempt({
+        id: "attempt-first",
+        pipeline_run_id: "run-first",
+        definition_bundle_hash: firstHash,
+      });
+      const firstAdmission: PipelineAdmissionInput = {
+        ...context.admission,
+        run: {
+          ...run([firstAttempt], firstHash),
+          id: "run-first",
+          active_attempt_versions: { [firstAttempt.id]: firstAttempt.version },
+        },
+        initial_attempts: [firstAttempt],
+      };
+      const secondBundle = context.blobs.put({
+        bytes: '{"bundle":"second"}',
+        encoding: "utf-8",
+        media_type: "application/json",
+        payload_schema: "openthrottle.definition-bundle/v1",
+      });
+      const secondHash = secondBundle.pointer.digest;
+      const secondAttempt = attempt({
+        id: "attempt-second",
+        pipeline_run_id: "run-second",
+        definition_bundle_hash: secondHash,
+      });
+      const secondAdmission: PipelineAdmissionInput = {
+        ...context.admission,
+        work_item: {
+          ...context.admission.work_item,
+          id: "work-second",
+          source_id: "issue-second",
+          source_reference: "OPE-SECOND",
+        },
+        run: {
+          ...run([secondAttempt], secondHash),
+          id: "run-second",
+          active_attempt_versions: { [secondAttempt.id]: secondAttempt.version },
+        },
+        definition_bundle: secondBundle,
+        initial_attempts: [secondAttempt],
+      };
+      let admittedSecond = false;
+      const resolvedHashes: string[] = [];
+      let scheduler: SqliteKernelStore;
+      scheduler = new SqliteKernelStore({
+        db: context.db,
+        blob_store: context.blobs,
+        manifest_resolver: {
+          resolve: (input) => {
+            resolvedHashes.push(input.definition_bundle_hash);
+            if (!admittedSecond && input.definition_bundle_hash === firstHash) {
+              admittedSecond = true;
+              scheduler.admitPipelineRun(secondAdmission);
+            }
+            return {
+              ...context.pipelineManifest,
+              definition_bundle_hash: input.definition_bundle_hash,
+            };
+          },
+        },
+        payload_schemas: payloadSchemas,
+        execution_policy: EXECUTION_POLICY,
+        now: () => NOW,
+      });
+      scheduler.admitPipelineRun(firstAdmission);
+
+      await expect(scheduler.leaseNextEligibleAttempt({
+        worker_id: "worker-first",
+        lease_id: "lease-first",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ attempt: { id: "attempt-first" } });
+      expect(admittedSecond).toBe(true);
+      expect(resolvedHashes.sort()).toEqual([firstHash, secondHash].sort());
     } finally {
       context.db.close();
     }
@@ -1658,27 +1952,54 @@ describe("SqliteKernelStore", () => {
     }
   });
 
-  it("leases up to width from distinct runs without admitting two Attempts from one run", async () => {
-    const context = setup(undefined, () => NOW, false, 2);
+  it("co-leases compatible same-run inspect members on distinct runtime slots", async () => {
+    const context = setup(undefined, () => NOW, false, 2, (candidate) => ({
+      ...candidate,
+      stages: candidate.stages.map((stage) => stage.id === "verify"
+        ? {
+          ...stage,
+          loop: {
+            over: "selection.personas",
+            max_parallel: 2,
+            max_rounds: 1,
+            body: ["verify"],
+          },
+        }
+        : stage),
+    }), EXECUTION_POLICY_TWO);
     try {
       const bundleHash = context.admission.run.definition_bundle_hash;
-      const first = context.admission.initial_attempts[0]!;
+      const first = attempt({
+        id: "attempt-1a",
+        pipeline_run_id: "run-1",
+        repository_authority: "inspect",
+        scope: {
+          kind: "fanout_member",
+          stage_id: "verify",
+          parent_attempt_id: "attempt-1a",
+          fanout_id: "selection.personas",
+          member_id: "persona-a",
+          member_index: 0,
+        },
+        definition_bundle_hash: bundleHash,
+      });
       const sameRun = attempt({
         id: "attempt-1b",
         pipeline_run_id: "run-1",
+        repository_authority: "inspect",
         scope: {
-          kind: "loop_item",
-          stage_id: "work",
-          parent_attempt_id: "attempt-1",
-          loop_id: "units",
-          item_id: "unit-b",
-          item_index: 1,
+          kind: "fanout_member",
+          stage_id: "verify",
+          parent_attempt_id: "attempt-1a",
+          fanout_id: "selection.personas",
+          member_id: "persona-b",
+          member_index: 1,
         },
         definition_bundle_hash: bundleHash,
       });
       context.store.admitPipelineRun({
         ...context.admission,
-        run: run([first, sameRun], bundleHash),
+        run: run([first, sameRun], bundleHash, "verify"),
         initial_attempts: [first, sameRun],
       });
       const otherRun = attempt({
@@ -1699,17 +2020,515 @@ describe("SqliteKernelStore", () => {
         expires_at: "2026-08-20T12:05:00.000Z",
       });
 
-      expect([firstLease?.run_id, secondLease?.run_id]).toEqual(["run-1", "run-2"]);
-      expect(firstLease?.attempt.id).toBe("attempt-1");
-      expect(secondLease?.attempt.id).toBe("attempt-2");
+      expect([firstLease?.run_id, secondLease?.run_id]).toEqual(["run-1", "run-1"]);
+      expect(firstLease?.attempt.id).toBe("attempt-1a");
+      expect(secondLease?.attempt.id).toBe("attempt-1b");
       await expect(context.store.leaseNextEligibleAttempt({
         worker_id: "worker-1",
         lease_id: "lease-3",
         expires_at: "2026-08-20T12:05:00.000Z",
       })).resolves.toBeNull();
       expect(context.db.prepare(
-        "SELECT lease_id FROM attempts WHERE id = 'attempt-1b'",
+        "SELECT lease_id FROM attempts WHERE id = 'attempt-2'",
       ).get()).toEqual({ lease_id: null });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("serializes sparse modulo collisions while a distinct runtime slot still progresses", async () => {
+    const context = setup(undefined, () => NOW, false, 2, (candidate) => ({
+      ...candidate,
+      stages: candidate.stages.map((stage) => stage.id === "verify"
+        ? {
+          ...stage,
+          loop: {
+            over: "selection.personas",
+            max_parallel: 2,
+            max_rounds: 1,
+            body: ["verify"],
+          },
+        }
+        : stage),
+    }), EXECUTION_POLICY_TWO);
+    try {
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const candidates = [0, 2, 1].map((memberIndex) => attempt({
+        id: `attempt-slot-${memberIndex}`,
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: bundleHash,
+        repository_authority: "inspect",
+        scope: {
+          kind: "fanout_member",
+          stage_id: "verify",
+          parent_attempt_id: "attempt-slot-0",
+          fanout_id: "selection.personas",
+          member_id: `persona-${memberIndex}`,
+          member_index: memberIndex,
+        },
+      }));
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: run(candidates, bundleHash, "verify"),
+        initial_attempts: candidates,
+      });
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-slot-0",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ attempt: { id: "attempt-slot-0" } });
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-slot-1",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ attempt: { id: "attempt-slot-1" } });
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-slot-2",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
+      expect(context.db.prepare(
+        "SELECT lease_id FROM attempts WHERE id = 'attempt-slot-2'",
+      ).get()).toEqual({ lease_id: null });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("keeps stage and edit Attempts serial even when another runtime slot is free", async () => {
+    const context = setup(undefined, () => NOW, false, 2, (candidate) => ({
+      ...candidate,
+      stages: candidate.stages.map((stage) => stage.id === "verify"
+        ? {
+          ...stage,
+          loop: {
+            over: "selection.personas",
+            max_parallel: 2,
+            max_rounds: 1,
+            body: ["verify"],
+          },
+        }
+        : stage),
+    }), EXECUTION_POLICY_TWO);
+    try {
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const stageAttempt = attempt({
+        id: "attempt-stage",
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: bundleHash,
+        repository_authority: "inspect",
+        scope: { kind: "stage", stage_id: "verify" },
+      });
+      const editAttempt = attempt({
+        id: "attempt-edit",
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: bundleHash,
+        repository_authority: "edit",
+        scope: {
+          kind: "fanout_member",
+          stage_id: "verify",
+          parent_attempt_id: "attempt-stage",
+          fanout_id: "selection.personas",
+          member_id: "persona-1",
+          member_index: 1,
+        },
+      });
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: run([stageAttempt, editAttempt], bundleHash, "verify"),
+        initial_attempts: [stageAttempt, editAttempt],
+      });
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-stage",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ attempt: { id: "attempt-edit" } });
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-edit",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("does not parallelize an inspect stage merely because another stage enlarged the pool", async () => {
+    const context = setup(undefined, () => NOW, false, 2, (candidate) => ({
+      ...candidate,
+      stages: candidate.stages.map((stage) => stage.id === "work"
+        ? {
+          ...stage,
+          loop: {
+            over: "execution_plan.units",
+            max_parallel: 2,
+            max_rounds: 1,
+            body: ["work"],
+          },
+        }
+        : stage),
+    }), EXECUTION_POLICY_TWO);
+    try {
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const candidates = [0, 1].map((memberIndex) => attempt({
+        id: `attempt-serial-inspect-${memberIndex}`,
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: bundleHash,
+        repository_authority: "inspect",
+        scope: {
+          kind: "fanout_member",
+          stage_id: "verify",
+          parent_attempt_id: "attempt-serial-inspect-0",
+          fanout_id: "selection.personas",
+          member_id: `persona-${memberIndex}`,
+          member_index: memberIndex,
+        },
+      }));
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: run(candidates, bundleHash, "verify"),
+        initial_attempts: candidates,
+      });
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-serial-inspect-0",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ attempt: { id: "attempt-serial-inspect-0" } });
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-serial-inspect-1",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("enforces the inspect stage's own width when another stage creates a larger pool", async () => {
+    const context = setup(undefined, () => NOW, false, 4, (candidate) => ({
+      ...candidate,
+      stages: candidate.stages.map((stage) => stage.id === "work"
+        ? {
+          ...stage,
+          loop: {
+            over: "execution_plan.units",
+            max_parallel: 4,
+            max_rounds: 1,
+            body: ["work"],
+          },
+        }
+        : stage.id === "verify"
+          ? {
+            ...stage,
+            loop: {
+              over: "selection.personas",
+              max_parallel: 2,
+              max_rounds: 1,
+              body: ["verify"],
+            },
+          }
+          : stage),
+    }), Object.freeze({ max_concurrent_attempts: 4 }));
+    try {
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const candidates = [0, 1, 2].map((memberIndex) => attempt({
+        id: `attempt-width-${memberIndex}`,
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: bundleHash,
+        repository_authority: "inspect",
+        scope: {
+          kind: "fanout_member",
+          stage_id: "verify",
+          parent_attempt_id: "attempt-width-0",
+          fanout_id: "selection.personas",
+          member_id: `persona-${memberIndex}`,
+          member_index: memberIndex,
+        },
+      }));
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: run(candidates, bundleHash, "verify"),
+        initial_attempts: candidates,
+      });
+
+      for (const memberIndex of [0, 1]) {
+        await expect(context.store.leaseNextEligibleAttempt({
+          worker_id: "worker-1",
+          lease_id: `lease-width-${memberIndex}`,
+          expires_at: "2026-08-20T12:05:00.000Z",
+        })).resolves.toMatchObject({ attempt: { id: `attempt-width-${memberIndex}` } });
+      }
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-width-2",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("lets result correction reclaim only its own held slot while another slot remains usable", async () => {
+    const context = setup(undefined, () => NOW, false, 2, (candidate) => ({
+      ...candidate,
+      stages: candidate.stages.map((stage) => stage.id === "verify"
+        ? {
+          ...stage,
+          loop: {
+            over: "selection.personas",
+            max_parallel: 2,
+            max_rounds: 1,
+            body: ["verify"],
+          },
+        }
+        : stage),
+    }), EXECUTION_POLICY_TWO);
+    try {
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const structured = (id: string, memberIndex: number, extra: Partial<KernelAttempt> = {}) =>
+        attempt({
+          id,
+          pipeline_run_id: "run-1",
+          definition_bundle_hash: bundleHash,
+          repository_authority: "inspect",
+          scope: {
+            kind: "fanout_member",
+            stage_id: "verify",
+            parent_attempt_id: "attempt-correction",
+            fanout_id: "selection.personas",
+            member_id: `persona-${memberIndex}`,
+            member_index: memberIndex,
+          },
+          ...extra,
+        });
+      const correction = structured("attempt-correction", 0, {
+        status: "result_pending",
+        native_session_id: "session-correction",
+        result_correction_deadline: "2026-08-20T12:10:00.000Z",
+        pending_result: {
+          candidate_hash: null,
+          diagnostics: [{ path: "payload.summary", detail: "must be a string" }],
+          invalid_result_evidence: null,
+        },
+      });
+      const distinct = structured("attempt-distinct-slot", 1);
+      const colliding = structured("attempt-same-slot", 2);
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: run([correction, distinct, colliding], bundleHash, "verify"),
+        initial_attempts: [correction, distinct, colliding],
+      });
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-correction",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({
+        attempt: { id: "attempt-correction" },
+        lease: { purpose: "result_correction" },
+      });
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-distinct-slot",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ attempt: { id: "attempt-distinct-slot" } });
+      expect(context.db.prepare(
+        "SELECT lease_id FROM attempts WHERE id = 'attempt-same-slot'",
+      ).get()).toEqual({ lease_id: null });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("keeps a work-complete slot claimed until its follow-up transition is durable", async () => {
+    const context = setup(undefined, () => NOW, false, 2, (candidate) => ({
+      ...candidate,
+      stages: candidate.stages.map((stage) => stage.id === "verify"
+        ? {
+          ...stage,
+          loop: {
+            over: "selection.personas",
+            max_parallel: 2,
+            max_rounds: 1,
+            body: ["verify"],
+          },
+        }
+        : stage),
+    }), EXECUTION_POLICY_TWO);
+    try {
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const structured = (id: string, memberIndex: number, status: KernelAttempt["status"] = "pending") =>
+        attempt({
+          id,
+          pipeline_run_id: "run-1",
+          definition_bundle_hash: bundleHash,
+          repository_authority: "inspect",
+          status,
+          scope: {
+            kind: "loop_item",
+            stage_id: "verify",
+            parent_attempt_id: "attempt-complete",
+            loop_id: "selection.personas",
+            item_id: `persona-${memberIndex}`,
+            item_index: memberIndex,
+          },
+        });
+      const complete = structured("attempt-complete", 0, "work_complete");
+      const colliding = structured("attempt-colliding", 2);
+      const distinct = structured("attempt-distinct", 1);
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: run([complete, colliding, distinct], bundleHash, "verify"),
+        initial_attempts: [complete, colliding, distinct],
+      });
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-distinct",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ attempt: { id: "attempt-distinct" } });
+      expect(context.db.prepare(
+        "SELECT lease_id FROM attempts WHERE id = 'attempt-colliding'",
+      ).get()).toEqual({ lease_id: null });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("reserves every runtime-pool slot before a provision Attempt schedules create effects", async () => {
+    const context = setup(undefined, () => NOW, true, 2, (candidate) => ({
+      ...candidate,
+      stages: candidate.stages.map((stage) => stage.id === "verify"
+        ? {
+          ...stage,
+          loop: {
+            over: "selection.personas",
+            max_parallel: 2,
+            max_rounds: 1,
+            body: ["verify"],
+          },
+        }
+        : stage),
+    }), EXECUTION_POLICY_TWO);
+    try {
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const provision = (id: string, runId: string) => attempt({
+        id,
+        pipeline_run_id: runId,
+        definition_bundle_hash: bundleHash,
+        repository_authority: "inspect",
+        scope: { kind: "stage", stage_id: RUNTIME_PROVISION_STAGE_ID },
+      });
+      const first = provision("attempt-provision-1", "run-1");
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: run([first], bundleHash, RUNTIME_PROVISION_STAGE_ID),
+        initial_attempts: [first],
+      });
+      const second = provision("attempt-provision-2", "run-2");
+      context.store.admitPipelineRun({
+        ...context.admission,
+        work_item: {
+          ...context.admission.work_item,
+          id: "work-2",
+          source_id: "issue-2",
+          source_reference: "OPE-2",
+        },
+        run: {
+          ...run([second], bundleHash, RUNTIME_PROVISION_STAGE_ID),
+          id: "run-2",
+          active_attempt_versions: { [second.id]: second.version },
+        },
+        initial_attempts: [second],
+      });
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-provision-1",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ run_id: "run-1" });
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-provision-2",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("leases an authenticated pool wider than the mutable execution width", async () => {
+    const context = setup(undefined, () => NOW, true, 1, (candidate) => ({
+      ...candidate,
+      stages: candidate.stages.map((stage) => stage.id === "verify"
+        ? {
+          ...stage,
+          loop: {
+            over: "selection.personas",
+            max_parallel: 2,
+            max_rounds: 1,
+            body: ["verify"],
+          },
+        }
+        : stage),
+    }), EXECUTION_POLICY_TWO);
+    try {
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const provision = attempt({
+        id: "attempt-provision",
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: bundleHash,
+        repository_authority: "inspect",
+        scope: { kind: "stage", stage_id: RUNTIME_PROVISION_STAGE_ID },
+      });
+      context.store.admitPipelineRun({
+        ...context.admission,
+        run: run([provision], bundleHash, RUNTIME_PROVISION_STAGE_ID),
+        initial_attempts: [provision],
+      });
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-provision",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toMatchObject({ attempt: { id: "attempt-provision" } });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("counts each active uncleaned create target instead of one reservation per run", async () => {
+    const context = setup(undefined, () => NOW, false, 2);
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const bundleHash = context.admission.run.definition_bundle_hash;
+      const second = attempt({
+        id: "attempt-2",
+        pipeline_run_id: "run-2",
+        definition_bundle_hash: bundleHash,
+      });
+      admitAdditionalRun(context, "run-2", 2, [second]);
+      context.db.prepare(
+        "UPDATE attempts SET unmet_dependency_count = 1 WHERE id = 'attempt-1'",
+      ).run();
+      for (const [marker, target] of [["create-a", "daytona:resource-a"], ["create-b", "daytona:resource-b"]]) {
+        seedConfirmedRuntimeEffect(context, {
+          run_id: "run-1",
+          kind: "daytona/create-sandbox@1",
+          sequence: marker === "create-a" ? 1 : 3,
+          marker,
+          target,
+        });
+      }
+
+      await expect(context.store.leaseNextEligibleAttempt({
+        worker_id: "worker-1",
+        lease_id: "lease-over-target-budget",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      })).resolves.toBeNull();
     } finally {
       context.db.close();
     }
@@ -2647,7 +3466,7 @@ describe("SqliteKernelStore", () => {
         effect_kind: "daytona/create-sandbox@1",
         provider: "daytona",
         observed_via: "reconciliation",
-        result: { sandbox_id: "sandbox-1" },
+        result: { identity: sha("9"), sandbox_id: "sandbox-1" },
       };
       const delivery: DeliveryRecord = {
         schema: EXECUTION_RECORD_SCHEMA,
@@ -3809,6 +4628,36 @@ describe("SqliteKernelStore", () => {
         ...request,
         resolution_id: "different-resolution",
       })).rejects.toBeInstanceOf(KernelOperatorEffectRejectionConflictError);
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("selects the exact runtime creation behind an unknown integration from a confirmed pool", async () => {
+    const context = setup();
+    try {
+      seedDispatchFencedUnknownIntegration(context);
+      seedAdditionalConfirmedRuntimeCreate(context, "e".repeat(64));
+
+      const rejected = await context.store.rejectDispatchFencedUnknownEffect(
+        operatorEffectRejectionRequest(),
+      );
+      expect(rejected).toMatchObject({
+        disposition: "rejected",
+        pipeline_run_id: "run-1",
+        effect_id: "effect-operator-rejection",
+      });
+      const schedule = await context.store.findExternalSchedule({
+        pipeline_run_id: "run-1",
+        attempt_id: "attempt-1",
+        phase: "integrate-checkpoint",
+      });
+      expect(schedule?.effects[0]?.delivery).toMatchObject({
+        payload: { inline: { result: {
+          runtime_identity: RUNTIME_IDENTITY,
+          runtime_create_effect_id: "effect-runtime-create",
+        } } },
+      });
     } finally {
       context.db.close();
     }

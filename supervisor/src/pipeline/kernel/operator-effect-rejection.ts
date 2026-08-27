@@ -170,6 +170,33 @@ function deliveryId(input: { resolution_digest: string; intent_hash: string }): 
   })}`;
 }
 
+/** Extracts the exact created-runtime identity sealed by a supported integration intent. */
+export function operatorEffectRejectionRuntimeIdentity(
+  intentInput: EffectIntent,
+): string {
+  const intent = validateEffectIntent(intentInput, {
+    source: "operator_rejection.effect_intent",
+  }).value;
+  if (intent.kind !== OPERATOR_EFFECT_REJECTION_EFFECT_KIND) {
+    conflict(`operator rejection is not supported for Effect kind ${intent.kind}`);
+  }
+  const payload = exactObject(
+    intent.payload,
+    "operator_rejection.integration_payload",
+    [
+      "schema", "identity", "pipeline_run_id", "attempt_id", "definition_bundle_hash",
+      "checkpoint_base_subject", "current_subject", "candidate_checkpoint_id",
+      "candidate_input_subject", "candidate_output_subject", "candidate_blob",
+      "candidate_artifact", "current_ancestry",
+    ],
+  );
+  if (
+    payload.schema !== "openthrottle.daytona-integration/v1" ||
+    payload.pipeline_run_id !== intent.pipeline_run_id
+  ) conflict("operator rejection integration has invalid runtime identity authority");
+  return identifier(payload.identity, "operator_rejection.runtime_identity");
+}
+
 function legacyIntegrationRejectionProof(
   intent: EffectIntent,
   runtimeCreateIntentInput: EffectIntent,
@@ -195,16 +222,7 @@ function legacyIntegrationRejectionProof(
       "base_commit", "snapshot",
     ],
   );
-  const integrationPayload = exactObject(
-    intent.payload,
-    "operator_rejection.integration_payload",
-    [
-      "schema", "identity", "pipeline_run_id", "attempt_id", "definition_bundle_hash",
-      "checkpoint_base_subject", "current_subject", "candidate_checkpoint_id",
-      "candidate_input_subject", "candidate_output_subject", "candidate_blob",
-      "candidate_artifact", "current_ancestry",
-    ],
-  );
+  const integrationRuntimeIdentity = operatorEffectRejectionRuntimeIdentity(intent);
   if (
     runtimePayload.schema !== "openthrottle.daytona-create/v1" ||
     runtimePayload.pipeline_run_id !== intent.pipeline_run_id ||
@@ -213,10 +231,8 @@ function legacyIntegrationRejectionProof(
     conflict("operator rejection is not supported for this runtime snapshot");
   }
   if (
-    integrationPayload.schema !== "openthrottle.daytona-integration/v1" ||
-    integrationPayload.pipeline_run_id !== intent.pipeline_run_id ||
     typeof runtimePayload.identity !== "string" ||
-    integrationPayload.identity !== runtimePayload.identity
+    integrationRuntimeIdentity !== runtimePayload.identity
   ) {
     conflict("operator rejection integration does not use the exact created runtime");
   }

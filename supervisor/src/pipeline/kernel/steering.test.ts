@@ -16,6 +16,7 @@ function binding(
     definition_bundle_hash: "b".repeat(64),
     input_subject: "1".repeat(40),
     native_session_id: "session-1",
+    scope: { kind: "stage", stage_id: "work" },
     generation: 0,
     attempt_status: "running",
     repository_authority: "edit",
@@ -42,6 +43,7 @@ describe("kernel steering", () => {
       pipeline_run_id: "run-1",
       attempt_id: "attempt-1",
       native_session_id: "session-1",
+      scope: { kind: "stage", stage_id: "work" },
       generation: 0,
       lease_generation: 0,
       policy: {
@@ -64,6 +66,32 @@ describe("kernel steering", () => {
       expect(() => authorizeKernelSteeringDelivery({ envelope, current_binding: stale }))
         .toThrow(/stale or mismatched/);
     }
+  });
+
+  it("keeps scoped slot affinity private while authorizing the durable Attempt scope", () => {
+    const current = binding({
+      attempt_id: "attempt-unit-2",
+      scope: {
+        kind: "loop_item",
+        stage_id: "implement",
+        parent_attempt_id: "attempt-plan",
+        loop_id: "units",
+        item_id: "unit-2",
+        item_index: 1,
+      },
+    });
+    const envelope = createKernelSteeringEnvelope({
+      message_id: "message-unit-2",
+      source: "operator",
+      body: "Continue in the original isolated runtime.",
+      binding: current,
+    });
+
+    expect(envelope.binding).not.toHaveProperty("scope");
+    expect(authorizeKernelSteeringDelivery({
+      envelope,
+      current_binding: current,
+    }).scope).toEqual(current.scope);
   });
 
   it("keeps generation stable across renewal but changes it across phase ordinals", () => {

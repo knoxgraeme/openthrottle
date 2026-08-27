@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
-import type { ExecutionRecordPayloadRegistry } from "@openthrottle/contracts";
+import {
+  COMPILED_PIPELINE_MANIFEST_SCHEMA,
+  type CompiledPipelineManifest,
+  type ExecutionRecordPayloadRegistry,
+} from "@openthrottle/contracts";
 import {
   freshKernelFixture,
+  KERNEL_FIXTURE_BUNDLE_HASH,
   seedKernelAttempt,
   seedKernelRun,
   type FreshKernelFixture,
@@ -12,7 +17,57 @@ const OBSERVED = "2026-08-20T12:10:00.000Z";
 const RENEWED = "2026-08-20T12:20:00.000Z";
 const EXPIRED = "2026-08-20T12:05:00.000Z";
 const EXECUTION_POLICY = Object.freeze({ max_concurrent_attempts: 1 });
+const EXECUTION_POLICY_TWO = Object.freeze({ max_concurrent_attempts: 2 });
 let fixture: FreshKernelFixture | undefined;
+
+function recoveryManifest(maxParallel = 1): CompiledPipelineManifest {
+  return {
+    schema: COMPILED_PIPELINE_MANIFEST_SCHEMA,
+    pipeline_id: "core/implement",
+    pipeline_version: 1,
+    entry_stage: "implement",
+    definition_bundle_hash: KERNEL_FIXTURE_BUNDLE_HASH,
+    compiler_version: "definition-compiler/v1",
+    runtime_capability_digest: "c".repeat(64),
+    stages: [{
+      id: "implement",
+      kind: "agent",
+      engine: "codex",
+      agent_id: "worker",
+      repository_authority: "inspect",
+      skills: ["work"],
+      entry_skill: "work",
+      eval: "result",
+      ...(maxParallel === 1 ? {} : {
+        loop: {
+          over: "items",
+          max_parallel: maxParallel,
+          max_rounds: 1,
+          body: ["implement"],
+        },
+      }),
+      on: { success: { terminal: "completed" }, failure: { terminal: "failed" } },
+    }],
+  };
+}
+
+function setFanoutScope(input: {
+  db: FreshKernelFixture["db"];
+  attempt_id: string;
+  parent_attempt_id: string;
+  member_index: number;
+}): void {
+  input.db.prepare(`
+    UPDATE attempts SET scope_kind = 'fanout_member', stage_id = 'implement',
+      parent_attempt_id = ?, scope_group_id = 'items', scope_item_id = ?,
+      scope_item_index = ? WHERE id = ?
+  `).run(
+    input.parent_attempt_id,
+    `item-${input.member_index}`,
+    input.member_index,
+    input.attempt_id,
+  );
+}
 
 afterEach(() => {
   fixture?.cleanup();
@@ -51,7 +106,7 @@ describe("expired kernel Attempt lease recovery", () => {
     const store = new SqliteKernelStore({
       db: fixture.db,
       blob_store: fixture.blobs,
-      manifest_resolver: { resolve: () => { throw new Error("not used"); } },
+      manifest_resolver: { resolve: () => recoveryManifest() },
       payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
       execution_policy: EXECUTION_POLICY,
       now: () => OBSERVED,
@@ -148,7 +203,7 @@ describe("expired kernel Attempt lease recovery", () => {
     const store = new SqliteKernelStore({
       db: fixture.db,
       blob_store: fixture.blobs,
-      manifest_resolver: { resolve: () => { throw new Error("not used"); } },
+      manifest_resolver: { resolve: () => recoveryManifest() },
       payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
       execution_policy: EXECUTION_POLICY,
       now: () => OBSERVED,
@@ -197,7 +252,7 @@ describe("expired kernel Attempt lease recovery", () => {
     const store = new SqliteKernelStore({
       db: fixture.db,
       blob_store: fixture.blobs,
-      manifest_resolver: { resolve: () => { throw new Error("not used"); } },
+      manifest_resolver: { resolve: () => recoveryManifest() },
       payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
       execution_policy: EXECUTION_POLICY,
       execution_width: 1,
@@ -214,12 +269,170 @@ describe("expired kernel Attempt lease recovery", () => {
     ]);
   });
 
+  it("recovers distinct same-run runtime slots under their original lease fences", async () => {
+    fixture = freshKernelFixture();
+    seedKernelRun({ db: fixture.db, run_id: "run-pool" });
+    for (const memberIndex of [0, 1]) {
+      seedKernelAttempt({
+        db: fixture.db,
+        run_id: "run-pool",
+        id: `attempt-${memberIndex}`,
+        status: "pending",
+        lease: {
+          id: `lease-${memberIndex}`,
+          worker_id: "worker-pool",
+          purpose: "work",
+          expires_at: EXPIRED,
+          started: false,
+        },
+      });
+      setFanoutScope({
+        db: fixture.db,
+        attempt_id: `attempt-${memberIndex}`,
+        parent_attempt_id: "attempt-0",
+        member_index: memberIndex,
+      });
+    }
+    const store = new SqliteKernelStore({
+      db: fixture.db,
+      blob_store: fixture.blobs,
+      manifest_resolver: { resolve: () => recoveryManifest(2) },
+      payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
+      execution_policy: EXECUTION_POLICY_TWO,
+      execution_width: 1,
+      now: () => OBSERVED,
+    });
+
+    await expect(store.recoverExpiredAttemptLeases({
+      observed_at: OBSERVED,
+      expires_at: RENEWED,
+      limit: 2,
+    })).resolves.toMatchObject([
+      { run_id: "run-pool", lease: { id: "lease-0", generation: 1 } },
+      { run_id: "run-pool", lease: { id: "lease-1", generation: 1 } },
+    ]);
+  });
+
+  it("skips a duplicate-slot run while recovering an unrelated run", async () => {
+    fixture = freshKernelFixture();
+    seedKernelRun({ db: fixture.db, run_id: "run-corrupt" });
+    for (const memberIndex of [0, 2]) {
+      seedKernelAttempt({
+        db: fixture.db,
+        run_id: "run-corrupt",
+        id: `attempt-corrupt-${memberIndex}`,
+        status: "pending",
+        lease: {
+          id: `lease-corrupt-${memberIndex}`,
+          worker_id: "worker-corrupt",
+          purpose: "work",
+          expires_at: EXPIRED,
+          started: false,
+        },
+      });
+      setFanoutScope({
+        db: fixture.db,
+        attempt_id: `attempt-corrupt-${memberIndex}`,
+        parent_attempt_id: "attempt-corrupt-0",
+        member_index: memberIndex,
+      });
+    }
+    seedKernelRun({ db: fixture.db, run_id: "run-good" });
+    seedKernelAttempt({
+      db: fixture.db,
+      run_id: "run-good",
+      id: "attempt-good",
+      status: "pending",
+      lease: {
+        id: "lease-good",
+        worker_id: "worker-good",
+        purpose: "work",
+        expires_at: EXPIRED,
+        started: false,
+      },
+    });
+    const store = new SqliteKernelStore({
+      db: fixture.db,
+      blob_store: fixture.blobs,
+      manifest_resolver: { resolve: () => recoveryManifest(2) },
+      payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
+      execution_policy: EXECUTION_POLICY_TWO,
+      now: () => OBSERVED,
+    });
+
+    await expect(store.recoverExpiredAttemptLeases({
+      observed_at: OBSERVED,
+      expires_at: RENEWED,
+      limit: 3,
+    })).resolves.toMatchObject([
+      { run_id: "run-good", lease: { id: "lease-good", generation: 1 } },
+    ]);
+    expect(fixture.db.prepare(`
+      SELECT id, lease_generation FROM attempts
+      WHERE pipeline_run_id = 'run-corrupt' ORDER BY id
+    `).all()).toEqual([
+      { id: "attempt-corrupt-0", lease_generation: 0 },
+      { id: "attempt-corrupt-2", lease_generation: 0 },
+    ]);
+  });
+
+  it("leases unrelated work despite incompatible live claims in another run", async () => {
+    fixture = freshKernelFixture();
+    seedKernelRun({ db: fixture.db, run_id: "run-corrupt" });
+    for (const memberIndex of [0, 2]) {
+      seedKernelAttempt({
+        db: fixture.db,
+        run_id: "run-corrupt",
+        id: `attempt-corrupt-${memberIndex}`,
+        status: "pending",
+        lease: {
+          id: `lease-corrupt-${memberIndex}`,
+          worker_id: "worker-corrupt",
+          purpose: "work",
+          expires_at: RENEWED,
+          started: false,
+        },
+      });
+      setFanoutScope({
+        db: fixture.db,
+        attempt_id: `attempt-corrupt-${memberIndex}`,
+        parent_attempt_id: "attempt-corrupt-0",
+        member_index: memberIndex,
+      });
+    }
+    seedKernelRun({ db: fixture.db, run_id: "run-good" });
+    seedKernelAttempt({
+      db: fixture.db,
+      run_id: "run-good",
+      id: "attempt-good",
+      status: "pending",
+    });
+    const store = new SqliteKernelStore({
+      db: fixture.db,
+      blob_store: fixture.blobs,
+      manifest_resolver: { resolve: () => recoveryManifest(2) },
+      payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
+      execution_policy: EXECUTION_POLICY_TWO,
+      execution_width: 4,
+      now: () => OBSERVED,
+    });
+
+    await expect(store.leaseNextEligibleAttempt({
+      worker_id: "worker-good",
+      lease_id: "lease-good",
+      expires_at: RENEWED,
+    })).resolves.toMatchObject({
+      run_id: "run-good",
+      attempt: { id: "attempt-good" },
+    });
+  });
+
   it("bounds recovery and refuses non-forward lease timestamps", async () => {
     fixture = freshKernelFixture();
     const store = new SqliteKernelStore({
       db: fixture.db,
       blob_store: fixture.blobs,
-      manifest_resolver: { resolve: () => { throw new Error("not used"); } },
+      manifest_resolver: { resolve: () => recoveryManifest() },
       payload_schemas: new Map() as ExecutionRecordPayloadRegistry,
       execution_policy: EXECUTION_POLICY,
     });

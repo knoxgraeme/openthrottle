@@ -12,6 +12,7 @@ import {
   RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
   SEMANTIC_RESULT_SCHEMA,
   compileDefinitionBundle,
+  compareCodeUnits,
   definitionEntryContentHash,
   digestCanonicalJson,
   runtimeStopStageId,
@@ -662,42 +663,57 @@ function reviewEvidence(blocking = true): {
   };
 }
 
-function runtimeCreateDelivery(): DeliveryRecord {
+function runtimeCreateDelivery(slotIndex = 0): DeliveryRecord {
+  const suffix = slotIndex === 0 ? "" : `-${slotIndex}`;
+  const sandboxId = `sandbox-${slotIndex + 1}`;
+  const identity = String(slotIndex + 1).repeat(64);
   return {
     schema: EXECUTION_RECORD_SCHEMA,
-    id: "delivery-runtime-create",
+    id: `delivery-runtime-create${suffix}`,
     kind: "delivery",
     pipeline_run_id: "run-1",
-    effect_id: "effect-runtime-create",
-    idempotency_key: "run-1:runtime:create",
-    external_identity: "daytona:sandbox-1",
+    effect_id: `effect-runtime-create${suffix}`,
+    idempotency_key: `run-1:runtime:create${suffix}`,
+    external_identity: `daytona:${identity}`,
     status: "confirmed",
     payload_schema: "openthrottle.effect-delivery/v1",
     payload: {
       inline: {
         effect_kind: "daytona/create-sandbox@1",
         provider: "daytona",
-        result: { sandbox_id: "sandbox-1", resource_state: "created" },
+        result: { identity, sandbox_id: sandboxId, resource_state: "created" },
       },
     },
     created_at: NOW,
   };
 }
 
-function runtimeStartDelivery(): DeliveryRecord {
+function runtimeStartDelivery(slotIndex = 0): DeliveryRecord {
+  const suffix = slotIndex === 0 ? "" : `-${slotIndex}`;
+  const sandboxId = `sandbox-${slotIndex + 1}`;
+  const identity = String(slotIndex + 1).repeat(64);
   return {
-    ...runtimeCreateDelivery(),
-    id: "delivery-runtime-start",
-    effect_id: "effect-runtime-start",
-    idempotency_key: "run-1:runtime:start",
+    ...runtimeCreateDelivery(slotIndex),
+    id: `delivery-runtime-start${suffix}`,
+    effect_id: `effect-runtime-start${suffix}`,
+    idempotency_key: `run-1:runtime:start${suffix}`,
     payload: {
       inline: {
         effect_kind: "daytona/start-sandbox@1",
         provider: "daytona",
-        result: { sandbox_id: "sandbox-1", resource_state: "started" },
+        result: { identity, sandbox_id: sandboxId, resource_state: "started" },
       },
     },
   };
+}
+
+function runtimePoolDeliveries(): DeliveryRecord[] {
+  return [
+    runtimeCreateDelivery(0),
+    runtimeStartDelivery(0),
+    runtimeCreateDelivery(1),
+    runtimeStartDelivery(1),
+  ];
 }
 
 function githubPushDelivery(id: string, sha: string, refMode: "create" | "update"): DeliveryRecord {
@@ -1006,6 +1022,51 @@ describe("structured kernel coordinator", () => {
     })).toThrow(/exact edited candidate checkpoint/i);
   });
 
+  it("preserves the complete runtime pool from unit acceptance into integration", () => {
+    const { bundle, manifest } = definitions();
+    const accepted = acceptedUnitEvidence();
+    const runtime = runtimePoolDeliveries();
+    const records = [
+      ...accepted.acceptance.action_inputs.context.records,
+      ...runtime,
+    ].sort((left, right) => compareCodeUnits(left.id, right.id));
+    const source: StructuredAcceptedUnitEvidence = {
+      ...accepted,
+      acceptance: {
+        ...accepted.acceptance,
+        attempt: {
+          ...accepted.acceptance.attempt,
+          context_record_ids: records.map(({ id }) => id),
+        },
+        action_inputs: {
+          ...accepted.acceptance.action_inputs,
+          context: {
+            ...accepted.acceptance.action_inputs.context,
+            records,
+          },
+        },
+      },
+    };
+
+    const integration = createStructuredIntegrationAttempt({
+      pipeline_run_id: "run-1",
+      parent_attempt_id: "parent",
+      member_id: "unit-a",
+      round: 0,
+      stage_id: "integration",
+      input_subject: CURRENT_SUBJECT,
+      task_prompt: "Integrate unit A without narrowing its runtime pool.",
+      source,
+      current_ancestry_checkpoints: [],
+      bundle,
+      manifest,
+    });
+
+    expect(integration.context_record_ids).toEqual(expect.arrayContaining(
+      runtime.map(({ id }) => id),
+    ));
+  });
+
   it("carries one exact gap-free current ancestry chain beside the candidate checkpoint", () => {
     const { bundle, manifest } = definitions();
     const accepted = acceptedUnitEvidence();
@@ -1144,7 +1205,7 @@ describe("structured kernel coordinator", () => {
   it("turns a blocking inspect decision into a distinct edit remediation attempt", () => {
     const { bundle, manifest } = definitions();
     const review = reviewEvidence();
-    const runtimeDeliveryRecords = [runtimeCreateDelivery(), runtimeStartDelivery()];
+    const runtimeDeliveryRecords = runtimePoolDeliveries();
     const correctionEvidence: DecisionRecord = {
       ...review.decision,
       id: "decision-invalid-result-evidence",
@@ -1162,6 +1223,10 @@ describe("structured kernel coordinator", () => {
       input_subject: CURRENT_SUBJECT,
       task_prompt: "Resolve the blocking security finding.",
       ...review,
+      attempt: {
+        ...review.attempt,
+        context_record_ids: runtimeDeliveryRecords.map(({ id }) => id).sort(),
+      },
       decision,
       runtime_delivery_records: runtimeDeliveryRecords,
       additional_context_records: [correctionEvidence],
@@ -1175,7 +1240,9 @@ describe("structured kernel coordinator", () => {
         correctionEvidence.id,
         "decision-review",
         "delivery-runtime-create",
+        "delivery-runtime-create-1",
         "delivery-runtime-start",
+        "delivery-runtime-start-1",
         "result-review",
       ],
       context_checkpoint_ids: ["checkpoint-reviewed-change"],
@@ -1318,8 +1385,7 @@ describe("structured kernel coordinator", () => {
       units,
       commands: [],
     })}\n\`\`\``;
-    const create = runtimeCreateDelivery();
-    const start = runtimeStartDelivery();
+    const runtime = runtimePoolDeliveries();
     const view: ReductionView = {
       manifest,
       run: {
@@ -1348,7 +1414,7 @@ describe("structured kernel coordinator", () => {
       attempt,
       result,
       bundle: base.bundle,
-      schedules: [create, start].map((delivery, index) => ({
+      schedules: runtime.map((delivery, index) => ({
         semantic_key: `provision-${index}`,
         decision: { id: `schedule-${index}` } as never,
         effects: [{ intent: {} as never, delivery }],
@@ -1361,14 +1427,21 @@ describe("structured kernel coordinator", () => {
       candidate.scope.kind === "loop_item" ? candidate.scope.item_id : "unexpected"))
       .toEqual(["unit-a", "unit-c"]);
     expect(settlement.decision.input_record_ids).toEqual([
-      create.id, start.id, result.id,
+      ...runtime.map(({ id }) => id), result.id,
     ].sort());
+    expect(settlement.next_attempts.every((candidate) =>
+      runtime.every(({ id }) => candidate.context_record_ids.includes(id))))
+      .toBe(true);
     expect(() => buildStructuredProvisionSettlement({
       view, stage: provision, attempt, result, bundle: base.bundle,
-      schedules: [{ semantic_key: "create", decision: {} as never, effects: [{ intent: {} as never, delivery: create }] }],
+      schedules: [{
+        semantic_key: "create",
+        decision: {} as never,
+        effects: [{ intent: {} as never, delivery: runtime[0]! }],
+      }],
       evaluated: { evaluator: "external/core/daytona-provision@1", outcome: "success", reason: "partial" },
       task_prompt: taskPrompt, created_at: NOW,
-    })).toThrow(/Daytona create/);
+    })).toThrow(/Daytona/);
   });
 
   it("accepts only known, unique, bounded personas and returns sealed roster order", () => {

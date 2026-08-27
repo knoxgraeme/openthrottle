@@ -93,14 +93,14 @@ function isExternalInput(input: StructuredInput): input is ExternalInput {
   return "schedules" in input;
 }
 
-function settledStructuredSiblingRecords(
+function structuredWaveRecords(
   evidence: readonly StructuredWaveEvidence[],
-  currentAttemptId: string,
 ): ExecutionRecord[] {
-  // A divergent wave replaces the current member's transient decision with
-  // one aggregate decision. Only sibling decisions already exist durably.
+  // The canonical aggregate decision supersedes completion-order-dependent
+  // per-member decisions at fan-in. Results and their executor forensics are
+  // the stable evidence shared by every settlement order.
   return [...new Map(evidence.flatMap((source) => [
-    ...(source.attempt.id === currentAttemptId ? [] : [source.result, source.decision]),
+    source.result,
     ...source.decision_input_records.filter(({ id }) => id !== source.result.id),
   ]).map((record) => [record.id, record])).values()]
     .sort((left, right) => compareCodeUnits(left.id, right.id));
@@ -108,12 +108,11 @@ function settledStructuredSiblingRecords(
 
 function structuredWaveTerminalSettlement(input: {
   ordinary: OrdinaryInput;
-  current_attempt: KernelAttempt;
   settlement: ReturnType<typeof settleStructuredWaveDecision>;
   target_stage_id: string;
-  request_inputs: KernelAttemptRequestInputs;
   evidence: readonly StructuredWaveEvidence[];
 }): OrdinaryKernelSettlementPlan {
+  const anchor = input.settlement.anchor;
   return {
     decision: input.settlement.decision,
     outcome: input.settlement.outcome,
@@ -121,15 +120,19 @@ function structuredWaveTerminalSettlement(input: {
     checkpoints: [],
     next_attempts: [deriveKernelSuccessorAttempt({
       view: input.ordinary.view,
-      current: input.current_attempt,
-      result: input.ordinary.result,
+      current: {
+        ...anchor.attempt,
+        input_subject: input.ordinary.view.run.current_subject,
+        output_subject: null,
+      },
+      result: anchor.result,
       decision: input.settlement.decision,
       bundle: input.ordinary.bundle,
       target_scope: { kind: "stage", stage_id: input.target_stage_id },
-      request_inputs: input.request_inputs,
+      request_inputs: anchor.request_inputs,
       checkpoint_override: [],
       additional_context_records: ordinaryLineageRecords(input.ordinary,
-        settledStructuredSiblingRecords(input.evidence, input.ordinary.attempt.id)),
+        structuredWaveRecords(input.evidence)),
     })],
   };
 }
@@ -304,12 +307,8 @@ export class KernelStructuredSettlementPlanner implements
     const settlement = settleStructuredWaveDecision({
       view: input.view,
       stage: input.stage,
-      current_attempt: input.attempt,
-      current_result: input.result,
-      current_decision: currentDecision,
       evidence,
       additional_input_records: input.additional_input_records,
-      created_at: this.#now(),
     });
     if (settlement.target_stage_id === null) {
       throw new Error(`structured loop stage ${input.stage.id} resolved directly to a terminal state`);
@@ -319,7 +318,7 @@ export class KernelStructuredSettlementPlanner implements
       if (input.stage.id !== UNIT_ACCEPTANCE_STAGE_ID || settlement.aggregate) {
         throw new Error("structured integration requires one uniformly accepted unit wave");
       }
-      const source = evidence[0]!;
+      const source = settlement.anchor;
       if (source.attempt.scope.kind !== "loop_item") {
         throw new Error("structured acceptance source lost its unit scope");
       }
@@ -365,7 +364,7 @@ export class KernelStructuredSettlementPlanner implements
         view: input.view,
         current: source.attempt,
         result: source.result,
-        decision: settlement.aggregate ? settlement.decision : source.decision,
+        decision: settlement.decision,
         bundle: input.bundle,
         target_scope: { ...source.attempt.scope, stage_id: target.id },
         request_inputs: source.request_inputs,
@@ -397,14 +396,8 @@ export class KernelStructuredSettlementPlanner implements
     }
     return structuredWaveTerminalSettlement({
       ordinary: input,
-      current_attempt: {
-        ...input.attempt,
-        input_subject: input.view.run.current_subject,
-        output_subject: null,
-      },
       settlement,
       target_stage_id: target.id,
-      request_inputs: currentRequest,
       evidence,
     });
   }
@@ -740,12 +733,8 @@ export class KernelStructuredSettlementPlanner implements
     const settlement = settleStructuredWaveDecision({
       view: input.view,
       stage: input.stage,
-      current_attempt: input.attempt,
-      current_result: input.result,
-      current_decision: currentDecision,
       evidence,
       additional_input_records: input.additional_input_records,
-      created_at: this.#now(),
     });
     if (settlement.target_stage_id === null) {
       throw new Error("structured review fanout resolved directly to a terminal state");
@@ -754,10 +743,8 @@ export class KernelStructuredSettlementPlanner implements
     if (target.id.startsWith("ot_runtime_stop_")) {
       return structuredWaveTerminalSettlement({
         ordinary: input,
-        current_attempt: input.attempt,
         settlement,
         target_stage_id: target.id,
-        request_inputs: currentRequest,
         evidence,
       });
     }
@@ -781,10 +768,8 @@ export class KernelStructuredSettlementPlanner implements
     if (boundaries.size !== 1) {
       throw new Error("structured review fanout does not share one exact accepted boundary");
     }
-    const additional = ordinaryLineageRecords(
-      input,
-      settledStructuredSiblingRecords(evidence, input.attempt.id),
-    );
+    const additional = ordinaryLineageRecords(input, structuredWaveRecords(evidence));
+    const anchor = settlement.anchor;
     return {
       decision: settlement.decision,
       outcome: settlement.outcome,
@@ -792,12 +777,12 @@ export class KernelStructuredSettlementPlanner implements
       checkpoints: [],
       next_attempts: [deriveKernelSuccessorAttempt({
         view: input.view,
-        current: input.attempt,
-        result: input.result,
+        current: anchor.attempt,
+        result: anchor.result,
         decision: settlement.decision,
         bundle: input.bundle,
         target_scope: { kind: "stage", stage_id: target.id },
-        request_inputs: currentRequest,
+        request_inputs: anchor.request_inputs,
         checkpoint_override: [...boundaries.values()],
         additional_context_records: additional,
       })],

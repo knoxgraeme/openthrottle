@@ -417,6 +417,7 @@ export class KernelExternalBoundaryCoordinator {
       stage,
       context: context.context,
       bundle,
+      manifest: view.manifest,
     });
     if (claim) {
       view = await this.#load(view.run.id, attempt.id);

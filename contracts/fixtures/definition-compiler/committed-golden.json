@@ -1,6 +1,6 @@
 {
   "schema": "openthrottle.definition-compiler-parity-fixture/v1",
   "source_commit": "809d4320f64e06fb4c510319fbf0c2b22dd74c5f",
-  "bundle_digest": "b9a6309e6ec8b06221774d0a272936b7afdda2658eacf8474f1560e31ec5b988",
-  "manifest_digest": "8d33e649f97e64a949bb931c40318cc0c5b4708f1fc86213cada4256c3c6f6ae"
+  "bundle_digest": "2bdc5110c0870a323850270357c59e1d45242718db78009a3a35b71c6903349d",
+  "manifest_digest": "df934e842652a7af6f318fe8f92dbbc8334442fe967eeeb110493dcdab3b24b3"
 }

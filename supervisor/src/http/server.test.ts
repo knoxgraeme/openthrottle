@@ -134,7 +134,7 @@ function setup(input: {
         capability_digest: "c".repeat(64),
         capabilities: ["kernel/v1"],
         execution_policy: Object.freeze({
-          max_concurrent_attempts: 1,
+          max_concurrent_attempts: 2,
           runtime_capability_digest: "c".repeat(64),
         }),
         task_timeout_seconds: 3_600,
@@ -185,7 +185,7 @@ describe("kernel-native HTTP surface", () => {
       worker: { status: "healthy", consecutiveFailures: 0 },
     });
     expect(await (await app.request("/capabilities", { headers: STATUS_HEADERS })).json())
-      .toMatchObject({ limits: { maxConcurrentAttempts: 1 } });
+      .toMatchObject({ limits: { maxConcurrentAttempts: 2 } });
     expect((await app.request("/runs/run-active/status")).status).toBe(401);
 
     const status = await app.request("/runs/OPE-run-active/status", { headers: STATUS_HEADERS });

@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import type { JsonValue } from "@openthrottle/contracts";
 import type {
+  AttemptScope,
   AttemptLeasePurpose,
   KernelAttempt,
 } from "./types.js";
@@ -20,6 +21,8 @@ export interface KernelRuntimeSessionBinding {
   definition_bundle_hash: string;
   input_subject: string;
   native_session_id: string;
+  /** Supervisor-private slot affinity; never serialized into the public envelope. */
+  scope: AttemptScope;
   /**
    * Stable session-phase ordinal: work_retry_ordinal for work, or
    * result_correction_count for result correction. Attempt.version is not a
@@ -130,6 +133,8 @@ export interface AuthorizedKernelSteering {
   definition_bundle_hash: string;
   input_subject: string;
   native_session_id: string;
+  /** Durable Attempt scope used only for supervisor-to-provider slot selection. */
+  scope: AttemptScope;
   generation: number;
   lease_id: string;
   lease_generation: number;
@@ -149,12 +154,39 @@ function nonEmptyId(value: string, name: string): string {
   return value;
 }
 
+function assertScope(scope: AttemptScope): void {
+  if (!scope || typeof scope !== "object" || Array.isArray(scope)) {
+    throw new Error("steering Attempt scope is invalid");
+  }
+  nonEmptyId(scope.stage_id, "steering scope stage_id");
+  if (scope.kind === "stage") return;
+  nonEmptyId(scope.parent_attempt_id, "steering scope parent_attempt_id");
+  if (scope.kind === "loop_item") {
+    nonEmptyId(scope.loop_id, "steering scope loop_id");
+    nonEmptyId(scope.item_id, "steering scope item_id");
+    if (!Number.isSafeInteger(scope.item_index) || scope.item_index < 0) {
+      throw new Error("steering scope item_index is invalid");
+    }
+    return;
+  }
+  if (scope.kind === "fanout_member") {
+    nonEmptyId(scope.fanout_id, "steering scope fanout_id");
+    nonEmptyId(scope.member_id, "steering scope member_id");
+    if (!Number.isSafeInteger(scope.member_index) || scope.member_index < 0) {
+      throw new Error("steering scope member_index is invalid");
+    }
+    return;
+  }
+  throw new Error("steering Attempt scope kind is invalid");
+}
+
 function assertBinding(binding: KernelRuntimeSessionBinding): void {
   nonEmptyId(binding.pipeline_run_id, "steering pipeline_run_id");
   nonEmptyId(binding.attempt_id, "steering attempt_id");
   nonEmptyId(binding.native_session_id, "steering native_session_id");
   nonEmptyId(binding.lease_id, "steering lease_id");
   nonEmptyId(binding.lease_worker_id, "steering lease_worker_id");
+  assertScope(binding.scope);
   if (!DIGEST.test(binding.request_hash) || !DIGEST.test(binding.definition_bundle_hash)) {
     throw new Error("steering request or bundle hash is invalid");
   }
@@ -261,6 +293,7 @@ export function authorizeKernelSteeringDelivery(input: {
     definition_bundle_hash: current.definition_bundle_hash,
     input_subject: current.input_subject,
     native_session_id: current.native_session_id,
+    scope: current.scope,
     generation: current.generation,
     lease_id: current.lease_id,
     lease_generation: current.lease_generation,

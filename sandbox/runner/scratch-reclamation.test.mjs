@@ -160,17 +160,20 @@ describe("settled attempt scratch reclamation", () => {
     expect(readFileSync(sealedSource, "utf8")).toBe("sealed source");
   });
 
-  it("reclaims stale scratch containing non-UTF-8 filenames", () => {
-    const root = mkdtempSync(join(tmpdir(), "ot-scratch-byte-names-"));
-    const current = attemptPaths(root, "attempt-current");
-    const previous = join(root, "actions", "attempt-previous");
-    mkdirSync(previous, { recursive: true });
-    writeFileSync(Buffer.concat([Buffer.from(`${previous}/`), Buffer.from([0xff])]), "stale");
+  it.skipIf(process.platform === "darwin")(
+    "reclaims stale scratch containing non-UTF-8 filenames",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "ot-scratch-byte-names-"));
+      const current = attemptPaths(root, "attempt-current");
+      const previous = join(root, "actions", "attempt-previous");
+      mkdirSync(previous, { recursive: true });
+      writeFileSync(Buffer.concat([Buffer.from(`${previous}/`), Buffer.from([0xff])]), "stale");
 
-    const result = reclaim(current, "attempt-current");
+      const result = reclaim(current, "attempt-current");
 
-    expect(existsSync(previous)).toBe(false);
-    expect(result.reclaimed_directories).toBe(1);
-    expect(result.reclaimed_bytes).toBeGreaterThan(0n);
-  });
+      expect(existsSync(previous)).toBe(false);
+      expect(result.reclaimed_directories).toBe(1);
+      expect(result.reclaimed_bytes).toBeGreaterThan(0n);
+    },
+  );
 });

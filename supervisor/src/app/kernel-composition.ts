@@ -18,7 +18,7 @@ const RUNTIME_CAPABILITY_SOURCE_SCHEMA = "openthrottle.runtime-capability-source
 const authenticatedExecutionPolicies = new WeakSet<object>();
 
 export interface KernelExecutionPolicy {
-  readonly max_concurrent_attempts: 1;
+  readonly max_concurrent_attempts: 2;
   readonly runtime_capability_digest: string;
 }
 
@@ -76,7 +76,7 @@ function assertAuthenticatedExecutionPolicy(policy: KernelExecutionPolicy): void
 
 /**
  * Authenticates the canonical runtime manifest before extracting any policy.
- * The returned policy is the sole provider-neutral serial-execution value.
+ * The returned policy is the sole provider-neutral execution-width value.
  */
 export function authenticateKernelRuntimeCapabilities(input: {
   source: unknown;
@@ -105,9 +105,9 @@ export function authenticateKernelRuntimeCapabilities(input: {
   ) {
     throw new Error("runtime_capabilities.max_concurrent_attempts must be a positive integer");
   }
-  if (source.max_concurrent_attempts !== 1) {
+  if (source.max_concurrent_attempts !== 2) {
     throw new Error(
-      "runtime_capabilities.max_concurrent_attempts must be the supported release value 1",
+      "runtime_capabilities.max_concurrent_attempts must be the supported release value 2",
     );
   }
   const normalized: KernelRuntimeCapabilitySource = Object.freeze({
@@ -121,7 +121,7 @@ export function authenticateKernelRuntimeCapabilities(input: {
     max_concurrent_attempts: source.max_concurrent_attempts as number,
   });
   const executionPolicy: KernelExecutionPolicy = Object.freeze({
-    max_concurrent_attempts: 1,
+    max_concurrent_attempts: 2,
     runtime_capability_digest: compilerEnvironment.runtime_capability_digest,
   });
   authenticatedExecutionPolicies.add(executionPolicy);

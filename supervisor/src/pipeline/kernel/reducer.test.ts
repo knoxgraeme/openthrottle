@@ -358,24 +358,44 @@ function deliveryRecord(effect: EffectIntent): DeliveryRecord {
   };
 }
 
-function runtimeDelivery(kind: "create" | "start" | "cleanup"): DeliveryRecord {
+function runtimeDelivery(
+  kind: "create" | "start" | "cleanup",
+  slotIndex = 0,
+): DeliveryRecord {
+  const suffix = slotIndex === 0 ? "" : `-${slotIndex}`;
+  const identity = String(slotIndex + 1).repeat(64);
+  const sandboxId = `sandbox-${slotIndex + 1}`;
   return {
     schema: EXECUTION_RECORD_SCHEMA,
-    id: `delivery-runtime-${kind}`,
+    id: `delivery-runtime-${kind}${suffix}`,
     kind: "delivery",
     pipeline_run_id: "run-1",
-    effect_id: `effect-runtime-${kind}`,
-    idempotency_key: `run-1:runtime:${kind}`,
-    external_identity: "daytona:sandbox-1",
+    effect_id: `effect-runtime-${kind}${suffix}`,
+    idempotency_key: `run-1:runtime:${kind}:${identity}`,
+    external_identity: `daytona:${identity}`,
     status: "confirmed",
     payload_schema: "openthrottle.effect-delivery/v1",
     payload: { inline: {
       effect_kind: `daytona/${kind === "cleanup" ? "cleanup" : kind}-sandbox@1`,
       provider: "daytona",
       observed_via: "reconciliation",
-      result: { sandbox_id: "sandbox-1" },
+      result: { identity, sandbox_id: sandboxId },
     } },
     created_at: "2026-08-20T00:00:03.000Z",
+  };
+}
+
+function runtimeAbsenceDelivery(slotIndex: number): DeliveryRecord {
+  const identity = String(slotIndex + 1).repeat(64);
+  return {
+    ...runtimeDelivery("create", slotIndex),
+    status: "rejected",
+    payload: { inline: {
+      effect_kind: "daytona/create-sandbox@1",
+      provider: "daytona",
+      observed_via: "reconciliation",
+      result: { identity, sandbox_id: null, resource_state: "absent" },
+    } },
   };
 }
 
@@ -1245,8 +1265,11 @@ describe("shared execution kernel lifecycle", () => {
     expect(pendingAgain.append_records).toHaveLength(1);
   });
 
-  it("clears correction-only state when result_pending becomes needs_human cleanup", () => {
-    const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
+  it("clears correction-only state while preserving every runtime-pool cleanup target", () => {
+    const runtime = [0, 1].flatMap((slotIndex) => [
+      runtimeDelivery("create", slotIndex),
+      runtimeDelivery("start", slotIndex),
+    ]);
     const current = attempt({
       status: "result_pending",
       version: 4,
@@ -1268,7 +1291,7 @@ describe("shared execution kernel lifecycle", () => {
         diagnostics: [{ path: "/payload", detail: "still invalid" }],
         invalid_result_evidence: invalidResultEvidence,
       },
-      context_record_ids: runtime.map(({ id }) => id),
+      context_record_ids: runtime.map(({ id }) => id).sort(),
     });
     const currentRun = run(current, {
       current_subject: subject("1"),
@@ -1864,6 +1887,37 @@ describe("pipeline topology on the shared kernel", () => {
       records: [decision],
     });
     expect(transition.run).toMatchObject({ status: "canceled", terminal_outcome: "canceled" });
+  });
+
+  it("terminalizes no-resource only from exact absence evidence for the whole pool", () => {
+    const current = attempt({
+      scope: stageScope(RUNTIME_PROVISION_STAGE_ID),
+      repository_authority: "inspect",
+      status: "recorded",
+      version: 4,
+      result_record_id: "result-provision-absent",
+    });
+    const currentRun = run(current, { status: "running", version: 6 });
+    const result = resultRecord(current, current.result_record_id!);
+    const absences = [runtimeAbsenceDelivery(0), runtimeAbsenceDelivery(1)];
+    const decision = decisionRecord([result.id, ...absences.map(({ id }) => id)]);
+
+    const transition = reduce({
+      current,
+      currentRun,
+      currentManifest: manifestWithRuntimeStages(),
+      command: {
+        type: "settle",
+        command_id: "settle-provision-absent-pool",
+        attempt_id: current.id,
+        decision_record_id: decision.id,
+        outcome: "no_resource",
+        next_attempts: [],
+      },
+      records: [result, ...absences, decision],
+    });
+
+    expect(transition.run).toMatchObject({ status: "failed", terminal_outcome: "failed" });
   });
 });
 

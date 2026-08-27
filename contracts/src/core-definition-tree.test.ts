@@ -352,6 +352,7 @@ describe("root .openthrottle definition tree", () => {
     expect(structured.manifest.value.stages.find((stage) => stage.id === "implement_unit")?.loop)
       .toMatchObject({
         over: "execution_plan.units",
+        max_parallel: 1,
         body: [
           "implement_unit",
           "simplify_unit",
@@ -377,7 +378,7 @@ describe("root .openthrottle definition tree", () => {
         "core/performance",
         "core/project-standards",
       ],
-      loop: { over: "selection.personas", body: ["persona_review"] },
+      loop: { over: "selection.personas", max_parallel: 2, body: ["persona_review"] },
     });
   });
 

@@ -42,8 +42,7 @@ import type {
   KernelCursor,
 } from "./types.js";
 import {
-  exactKernelRuntimeResourceDeliveries,
-  resolveKernelRuntimeResourceIdentity,
+  exactKernelRuntimeResourcePoolDeliveries,
 } from "./runtime-resource.js";
 import { sortedUnique } from "./reducer-support.js";
 import {
@@ -345,11 +344,7 @@ function assertIntegrationEvidence(
 }
 
 function exactRuntimeDeliveries(records: readonly ExecutionRecord[]): DeliveryRecord[] {
-  const identity = resolveKernelRuntimeResourceIdentity(records);
-  if (identity === null) return [];
-  const byId = new Map(records.flatMap((record) =>
-    record.kind === "delivery" ? [[record.id, record] as const] : []));
-  return identity.delivery_record_ids.map((id) => byId.get(id)!);
+  return [...(exactKernelRuntimeResourcePoolDeliveries(records) ?? [])];
 }
 
 function assertAcceptedUnitEvidence(
@@ -573,11 +568,12 @@ export function buildStructuredProvisionSettlement(input: {
     if (delivery === null) throw new Error("structured provision schedule is incomplete");
     return delivery;
   })).sort((left, right) => compareCodeUnits(left.id, right.id));
-  const runtime = resolveKernelRuntimeResourceIdentity(deliveries);
+  const runtime = exactKernelRuntimeResourcePoolDeliveries(deliveries);
   if (
-    runtime === null || deliveries.length !== runtime.delivery_record_ids.length ||
-    canonicalJson(deliveries.map(({ id }) => id)) !== canonicalJson(runtime.delivery_record_ids)
-  ) throw new Error("structured provision requires exactly one confirmed Daytona create/start pair");
+    runtime === null || deliveries.length !== runtime.length ||
+    canonicalJson(deliveries.map(({ id }) => id).sort(compareCodeUnits)) !==
+      canonicalJson(runtime.map(({ id }) => id).sort(compareCodeUnits))
+  ) throw new Error("structured provision requires one complete confirmed Daytona runtime pool");
   const plan = input.execution_plan ??
     parseStructuredExecutionPlan(input.task_prompt, input.view.manifest.pipeline_id);
   if (plan.pipeline_id !== input.view.manifest.pipeline_id) {
@@ -865,12 +861,14 @@ export function createBlockingReviewRemediationAttempt(input: {
   if (acceptedBoundaries.length !== 1) {
     throw new Error("review checkpoint context must contain exactly one boundary for the reviewed input subject");
   }
-  const runtimeDeliveries = exactKernelRuntimeResourceDeliveries(input.runtime_delivery_records);
+  const runtimeDeliveries = exactKernelRuntimeResourcePoolDeliveries(
+    input.runtime_delivery_records,
+  );
   if (
     runtimeDeliveries === null ||
     runtimeDeliveries.some(({ id }) => !input.attempt.context_record_ids.includes(id))
   ) {
-    throw new Error("review remediation requires the exact runtime DeliveryRecords from its sealed context");
+    throw new Error("review remediation requires the complete runtime-pool DeliveryRecords from its sealed context");
   }
   return createPendingKernelAttempt({
     id: deterministicAttemptId("blocking-review-remediation", {

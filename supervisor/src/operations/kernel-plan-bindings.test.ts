@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   digestCanonicalJson,
   type AttemptCheckpoint,
+  type CompiledPipelineManifest,
   type DeliveryRecord,
   type ExecutionRecord,
 } from "@openthrottle/contracts";
@@ -51,21 +52,78 @@ function taskRef(): string {
   return `refs/heads/ot/ope-201-${digestCanonicalJson({ run_id: "run-1" }).slice(0, 12)}`;
 }
 
-function runtimeDelivery(): ExecutionRecord {
+function runtimeDelivery(kind: "create" | "start" = "create"): ExecutionRecord {
   return {
     schema: "openthrottle.record/v1",
     kind: "delivery",
-    id: "delivery-runtime",
+    id: kind === "create" ? "delivery-runtime" : "delivery-runtime-start",
     pipeline_run_id: "run-1",
-    effect_id: "effect-runtime",
-    idempotency_key: "run-1:runtime",
+    effect_id: `effect-runtime-${kind}`,
+    idempotency_key: `run-1:runtime:${kind}`,
     external_identity: `daytona:${"d".repeat(64)}`,
     status: "confirmed",
     payload_schema: "openthrottle.effect-delivery/v1",
     payload: { inline: {
-      effect_kind: "daytona/create-sandbox@1",
+      effect_kind: `daytona/${kind}-sandbox@1`,
       provider: "daytona",
-      result: { identity: "d".repeat(64) },
+      result: { identity: "d".repeat(64), sandbox_id: "sandbox-runtime" },
+    } },
+    created_at: NOW,
+  };
+}
+
+function runtimeDeliveryEntries(): [string, ExecutionRecord][] {
+  return [runtimeDelivery("create"), runtimeDelivery("start")]
+    .map((record) => [record.id, record]);
+}
+
+function lifecycleManifest(poolSize: number): CompiledPipelineManifest {
+  return {
+    schema: "openthrottle.compiled-pipeline-manifest/v1",
+    pipeline_id: "core/test",
+    pipeline_version: 1,
+    entry_stage: "ot_runtime_provision",
+    definition_bundle_hash: "b".repeat(64),
+    compiler_version: "definition-compiler/v1",
+    runtime_capability_digest: "c".repeat(64),
+    stages: [{
+      id: "unit",
+      kind: "agent",
+      loop: {
+        over: "execution_plan.units",
+        max_parallel: poolSize,
+        max_rounds: 1,
+        body: ["unit"],
+      },
+    } as never],
+  };
+}
+
+function lifecycleDelivery(input: {
+  kind: "create" | "start";
+  identity: string;
+  sandbox_id: string | null;
+  status?: "confirmed" | "rejected";
+  resource_state?: string;
+}): DeliveryRecord {
+  return {
+    schema: "openthrottle.record/v1",
+    id: `delivery-${input.kind}-${input.identity[0]}`,
+    kind: "delivery",
+    pipeline_run_id: "run-1",
+    effect_id: `effect-${input.kind}-${input.identity[0]}`,
+    idempotency_key: `run-1:${input.kind}:${input.identity}`,
+    external_identity: `daytona:${input.sandbox_id ?? input.identity}`,
+    status: input.status ?? "confirmed",
+    payload_schema: "openthrottle.effect-delivery/v1",
+    payload: { inline: {
+      effect_kind: `daytona/${input.kind}-sandbox@1`,
+      provider: "daytona",
+      result: {
+        identity: input.identity,
+        sandbox_id: input.sandbox_id,
+        ...(input.resource_state === undefined ? {} : { resource_state: input.resource_state }),
+      },
     } },
     created_at: NOW,
   };
@@ -299,7 +357,7 @@ function integrationBudgetPrepare(input: {
     stage: {} as never,
     context: {
       records: new Map<string, ExecutionRecord>([
-        ["delivery-runtime", runtimeDelivery()],
+        ...runtimeDeliveryEntries(),
         [priorPush.id, priorPush],
       ]),
       checkpoints: new Map([
@@ -308,11 +366,164 @@ function integrationBudgetPrepare(input: {
       ]),
     },
     bundle: { source_commit: input.source } as never,
+    manifest: lifecycleManifest(1),
   });
 }
 
 afterEach(() => {
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
+
+describe("kernel runtime lifecycle plan binding", () => {
+  function bindings() {
+    return createKernelExternalPlanBindings({
+      environments: {
+        loadExactRunEnvironment: () => ({
+          repository: "owner/repo",
+          base_branch: "main",
+          runtime_snapshot: "snapshot-1",
+          source_reference: "OPE-262",
+        }),
+      } as never,
+      blob_store: {} as never,
+    });
+  }
+
+  function request(input: {
+    pool_size: number;
+    records?: readonly ExecutionRecord[];
+  }) {
+    return {
+      run: {
+        id: "run-1",
+        current_subject: "a".repeat(40),
+        definition_bundle_hash: "b".repeat(64),
+      } as never,
+      attempt: {
+        id: "attempt-runtime",
+        input_subject: "a".repeat(40),
+        scope: { kind: "stage", stage_id: "ot_runtime_provision" },
+      } as never,
+      stage: {} as never,
+      context: {
+        records: new Map((input.records ?? []).map((record) => [record.id, record])),
+        checkpoints: new Map(),
+      },
+      bundle: {
+        runtime_capability_digest: "c".repeat(64),
+        pipeline_id: "core/test",
+      } as never,
+      manifest: lifecycleManifest(input.pool_size),
+    };
+  }
+
+  it("seals a canonical fixed pool as N create effects followed by N start effects", async () => {
+    const provision = bindings().find(({ external_kind }) =>
+      external_kind === "core/daytona-provision@1")!;
+    const prepared = await provision.prepare(request({ pool_size: 3 }));
+    const identities = (prepared.checkpoint_payload as {
+      runtime_identities: string[];
+    }).runtime_identities;
+
+    expect(prepared.checkpoint_payload).toMatchObject({
+      schema: "openthrottle.daytona-runtime-pool/v1",
+      pool_size: 3,
+      runtime_snapshot: "snapshot-1",
+      runtime_identities: [...identities].sort(),
+    });
+    expect(new Set(identities)).toHaveLength(3);
+    expect(prepared.phases.map(({ id, effects }) => ({
+      id,
+      kinds: effects.map(({ kind }) => kind),
+      identities: effects.map(({ payload }) => (payload as { identity: string }).identity),
+    }))).toEqual([
+      {
+        id: "create",
+        kinds: Array(3).fill("daytona/create-sandbox@1"),
+        identities,
+      },
+      {
+        id: "start",
+        kinds: Array(3).fill("daytona/start-sandbox@1"),
+        identities,
+      },
+    ]);
+    expect(prepared.phases.flatMap(({ effects }) => effects).every(({ target, idempotency_key }) =>
+      target.length > 0 && idempotency_key.length > 0)).toBe(true);
+
+    const narrower = await provision.prepare(request({ pool_size: 2 }));
+    const narrowerIdentities = (narrower.checkpoint_payload as {
+      runtime_identities: string[];
+    }).runtime_identities;
+    expect(narrowerIdentities.some((identity) => identities.includes(identity))).toBe(false);
+  });
+
+  it("targets every confirmed create during stop and cleanup after a partial start", async () => {
+    const identityA = "a".repeat(64);
+    const identityB = "b".repeat(64);
+    const identityC = "c".repeat(64);
+    const records = [
+      lifecycleDelivery({ kind: "create", identity: identityB, sandbox_id: "sandbox-b" }),
+      lifecycleDelivery({
+        kind: "start",
+        identity: identityB,
+        sandbox_id: "sandbox-b",
+        status: "rejected",
+      }),
+      lifecycleDelivery({ kind: "create", identity: identityA, sandbox_id: "sandbox-a" }),
+      lifecycleDelivery({ kind: "start", identity: identityA, sandbox_id: "sandbox-a" }),
+      lifecycleDelivery({
+        kind: "create",
+        identity: identityC,
+        sandbox_id: null,
+        status: "rejected",
+        resource_state: "absent",
+      }),
+    ];
+    const stop = bindings().find(({ external_kind }) => external_kind === "core/daytona-stop@1")!;
+    const cleanup = bindings().find(({ external_kind }) =>
+      external_kind === "core/daytona-cleanup@1")!;
+
+    for (const binding of [stop, cleanup]) {
+      const prepared = await binding.prepare(request({ pool_size: 3, records }));
+      expect(prepared.checkpoint_payload).toMatchObject({
+        pool_size: 3,
+        target_count: 2,
+        runtime_identities: [identityA, identityB],
+      });
+      expect(prepared.phases[0]!.effects.map(({ payload }) =>
+        (payload as { identity: string }).identity)).toEqual([identityA, identityB]);
+      expect(prepared.phases[0]!.effects.map(({ target }) => target)).toEqual([
+        `daytona:${identityA}`,
+        `daytona:${identityB}`,
+      ]);
+    }
+  });
+
+  it("distinguishes exact all-absent creation from a partially created pool", async () => {
+    const provision = bindings().find(({ external_kind }) =>
+      external_kind === "core/daytona-provision@1")!;
+    const absent = ["a", "b"].map((prefix) => lifecycleDelivery({
+      kind: "create",
+      identity: prefix.repeat(64),
+      sandbox_id: null,
+      status: "rejected",
+      resource_state: "absent",
+    }));
+    expect(await provision.evaluate({
+      schedules: [{ effects: absent.map((delivery) => ({ delivery })) }],
+    } as never)).toMatchObject({ outcome: "no_resource" });
+    expect(await provision.evaluate({
+      schedules: [{ effects: [
+        { delivery: lifecycleDelivery({
+          kind: "create",
+          identity: "a".repeat(64),
+          sandbox_id: "sandbox-a",
+        }) },
+        { delivery: absent[1] },
+      ] }],
+    } as never)).toMatchObject({ outcome: "failure" });
+  });
 });
 
 describe("kernel publication plan binding", () => {
@@ -488,10 +699,11 @@ describe("kernel publication plan binding", () => {
       } as never,
       stage: {} as never,
       context: {
-        records: new Map([["delivery-runtime", runtimeDelivery()]]),
+        records: new Map(runtimeDeliveryEntries()),
         checkpoints: new Map([[candidate.id, candidate]]),
       },
       bundle: { source_commit: source } as never,
+      manifest: lifecycleManifest(1),
     });
 
     expect(prepared.checkpoint_payload).toMatchObject({
@@ -603,7 +815,7 @@ describe("kernel publication plan binding", () => {
       definition_bundle_hash: "b".repeat(64),
     } as never;
     const baseContext = {
-      records: new Map([["delivery-runtime", runtimeDelivery()]]),
+      records: new Map(runtimeDeliveryEntries()),
       checkpoints: new Map([[candidate.id, candidate]]),
     };
 
@@ -613,6 +825,7 @@ describe("kernel publication plan binding", () => {
       stage: {} as never,
       context: baseContext,
       bundle: { source_commit: source } as never,
+      manifest: lifecycleManifest(1),
     });
     expect(firstPrepared.checkpoint_payload).toMatchObject({
       candidate_checkpoint_id: candidate.id,
@@ -641,12 +854,13 @@ describe("kernel publication plan binding", () => {
       stage: {} as never,
       context: {
         records: new Map([
-          ["delivery-runtime", runtimeDelivery()],
+          ...runtimeDeliveryEntries(),
           [wrongTargetPush.id, wrongTargetPush],
         ]),
         checkpoints: baseContext.checkpoints,
       },
       bundle: { source_commit: source } as never,
+      manifest: lifecycleManifest(1),
     })).rejects.toThrow(/task-ref push evidence.*target/i);
 
     const firstDelivery = integrationDelivery({
@@ -696,6 +910,7 @@ describe("kernel publication plan binding", () => {
       stage: {} as never,
       context: baseContext,
       bundle: { source_commit: source } as never,
+      manifest: lifecycleManifest(1),
     })).resolves.toMatchObject({
       checkpoint_payload: { candidate_checkpoint_id: candidate.id },
     });
@@ -703,7 +918,7 @@ describe("kernel publication plan binding", () => {
     const priorPush = pushDelivery("delivery-push-p1", firstPublication, "create");
     const updateContext = {
       records: new Map([
-        ["delivery-runtime", runtimeDelivery()],
+        ...runtimeDeliveryEntries(),
         [priorPush.id, priorPush],
       ]),
       checkpoints: baseContext.checkpoints,
@@ -714,6 +929,7 @@ describe("kernel publication plan binding", () => {
       stage: {} as never,
       context: updateContext,
       bundle: { source_commit: source } as never,
+      manifest: lifecycleManifest(1),
     });
     expect(updatePrepared.checkpoint_payload).toMatchObject({
       publication_parent_subject: firstPublication,
@@ -746,6 +962,7 @@ describe("kernel publication plan binding", () => {
         checkpoints: new Map([[candidate.id, candidate]]),
       },
       bundle: { source_commit: source } as never,
+      manifest: lifecycleManifest(1),
     })).rejects.toThrow(/ancestry/i);
     const stalePrepared = await integrate.prepare({
       run: {
@@ -768,6 +985,7 @@ describe("kernel publication plan binding", () => {
         ]),
       },
       bundle: { source_commit: source } as never,
+      manifest: lifecycleManifest(1),
     });
     expect(stalePrepared.phases[0]!.effects[0]!.payload).toMatchObject({
       candidate_checkpoint_id: candidate.id,
@@ -796,6 +1014,7 @@ describe("kernel publication plan binding", () => {
         ]),
       },
       bundle: { source_commit: source } as never,
+      manifest: lifecycleManifest(1),
     })).rejects.toThrow(/ancestry|gap/i);
     const secondProofCheckpoint: AttemptCheckpoint = {
       ...proofCheckpoint,
@@ -819,6 +1038,7 @@ describe("kernel publication plan binding", () => {
         ]),
       },
       bundle: { source_commit: source } as never,
+      manifest: lifecycleManifest(1),
     })).rejects.toThrow(/extra checkpoints/i);
     const forkSubject = git(work, [
       "commit-tree", candidateTree, "-p", source, "-m", "forked integration proof",
@@ -853,6 +1073,7 @@ describe("kernel publication plan binding", () => {
         ]),
       },
       bundle: { source_commit: source } as never,
+      manifest: lifecycleManifest(1),
     })).rejects.toThrow(/fork/i);
     const forgedParentDelivery = integrationDelivery({
       id: "delivery-forged-identity-publication",
@@ -903,13 +1124,14 @@ describe("kernel publication plan binding", () => {
       stage: {} as never,
       context: {
         records: new Map([
-          ["delivery-runtime", runtimeDelivery()],
+          ...runtimeDeliveryEntries(),
           [priorPush.id, priorPush],
           [secondPriorPush.id, secondPriorPush],
         ]),
         checkpoints: baseContext.checkpoints,
       },
       bundle: { source_commit: source } as never,
+      manifest: lifecycleManifest(1),
     })).rejects.toThrow(/multiple task-ref push deliveries/);
   }, 15_000);
 
@@ -973,18 +1195,22 @@ describe("kernel publication plan binding", () => {
       attempt: { id: "attempt-integrate", input_subject: subject } as never,
       stage: {} as never,
       context: {
-        records: new Map([["runtime-create", {
-          kind: "delivery",
-          status: "confirmed",
-          payload_schema: "openthrottle.effect-delivery/v1",
-          payload: { inline: {
-            effect_kind: "daytona/create-sandbox@1",
-            result: { identity: runtimeIdentity },
-          } },
-        } as never]]),
+        records: new Map([
+          lifecycleDelivery({
+            kind: "create",
+            identity: runtimeIdentity,
+            sandbox_id: "sandbox-runtime",
+          }),
+          lifecycleDelivery({
+            kind: "start",
+            identity: runtimeIdentity,
+            sandbox_id: "sandbox-runtime",
+          }),
+        ].map((record) => [record.id, record])),
         checkpoints: new Map([[checkpoint.id, checkpoint]]),
       },
       bundle: { source_commit: subject } as never,
+      manifest: lifecycleManifest(1),
     });
     expect(prepared).toMatchObject({
       checkpoint_payload: {
@@ -1083,6 +1309,7 @@ describe("kernel publication plan binding", () => {
       stage: {} as never,
       context: { records: new Map(), checkpoints: new Map([[checkpoint.id, checkpoint]]) },
       bundle: { source_commit: inputSubject } as never,
+      manifest: lifecycleManifest(1),
     })).rejects.toThrow(/exact sole parent/i);
   });
 });

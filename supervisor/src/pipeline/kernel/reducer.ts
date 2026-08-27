@@ -16,7 +16,7 @@ import {
 import { authorizeEffectIntent } from "./effect-intent.js";
 import { PIPELINE_DECISION_RECORD_PAYLOAD_SCHEMA } from "./evaluator-registry.js";
 import {
-  exactKernelRuntimeAbsenceDelivery,
+  exactKernelRuntimeAbsenceDeliveries,
   exactKernelRuntimeCleanupDeliveries,
 } from "./runtime-resource.js";
 import {
@@ -668,7 +668,7 @@ function terminalCommand(
   if (
     cleanupDeliveries === null ||
     canonicalJsonValue(cleanupDeliveries.map(({ id }) => id).sort()) !== canonicalJsonValue(evidenceIds)
-  ) throw new Error("runtime cleanup requires exact confirmed Daytona create evidence");
+  ) throw new Error("runtime cleanup requires exact confirmed Daytona create evidence for every target");
   const cleanupStageId = runtimeStopStageId(outcome);
   const cleanupStage = stageFor(input.manifest, cleanupStageId);
   if (cleanupStage.kind !== "effect" || cleanupStage.effect !== "core/daytona-stop@1") {
@@ -1344,8 +1344,8 @@ function settleAuthorized(
       const cited = authorization.exact_records.filter(
         (record) => record.id !== authorization.decision.id && record.id !== resultRecordId,
       );
-      if (exactKernelRuntimeAbsenceDelivery(cited) === null) {
-        throw new Error("no-resource terminal transition requires exact rejected-create absence proof");
+      if (exactKernelRuntimeAbsenceDeliveries(cited) === null) {
+        throw new Error("no-resource terminal transition requires exact rejected-create pool absence proof");
       }
     }
   } else {

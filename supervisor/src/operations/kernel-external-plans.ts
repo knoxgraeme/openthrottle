@@ -2,6 +2,7 @@ import {
   digestCanonicalJson,
   jsonValueAt,
   type AttemptCheckpoint,
+  type CompiledPipelineManifest,
   type CompiledPipelineStage,
   type DefinitionBundle,
   type EffectIntent,
@@ -30,6 +31,7 @@ export interface KernelExternalPrimitiveShape {
 export interface KernelExternalPhaseShape {
   id: string;
   effects: readonly KernelExternalPrimitiveShape[];
+  cardinality?: "repeatable";
 }
 
 export interface KernelExternalEffectCandidate {
@@ -73,6 +75,7 @@ export interface KernelExternalStagePlanBinding {
     stage: Extract<CompiledPipelineStage, { kind: "effect" | "wait" }>;
     context: ResolvedKernelContext;
     bundle: Readonly<DefinitionBundle>;
+    manifest: Readonly<CompiledPipelineManifest>;
   }): Promise<KernelPreparedExternalPlan>;
   /**
    * Only subject-advancing executor effects implement this hook. It derives
@@ -145,10 +148,10 @@ export const CORE_EXTERNAL_PLAN_SHAPES = Object.freeze({
     phases: [
       { id: "create", effects: [
         { effect_kind: "daytona/create-sandbox@1", operation: "mutation" },
-      ] },
+      ], cardinality: "repeatable" },
       { id: "start", effects: [
         { effect_kind: "daytona/start-sandbox@1", operation: "mutation" },
-      ] },
+      ], cardinality: "repeatable" },
     ],
   },
   "core/daytona-stop@1": {
@@ -157,7 +160,7 @@ export const CORE_EXTERNAL_PLAN_SHAPES = Object.freeze({
     phases: [
       { id: "stop", effects: [
         { effect_kind: "daytona/stop-sandbox@1", operation: "mutation" },
-      ] },
+      ], cardinality: "repeatable" },
     ],
   },
   "core/daytona-cleanup@1": {
@@ -166,7 +169,7 @@ export const CORE_EXTERNAL_PLAN_SHAPES = Object.freeze({
     phases: [
       { id: "cleanup", effects: [
         { effect_kind: "daytona/cleanup-sandbox@1", operation: "mutation" },
-      ] },
+      ], cardinality: "repeatable" },
     ],
   },
   "kernel/promote-admission@1": {
@@ -217,6 +220,9 @@ function assertShape(
       throw new Error(`external stage plan ${binding.external_kind} has an invalid phase identity`);
     }
     phaseIds.add(phase.id);
+    if (phase.cardinality !== undefined && phase.cardinality !== "repeatable") {
+      throw new Error(`external phase ${phase.id} has an invalid cardinality`);
+    }
     if (phase.effects.length === 0 || phase.effects.length > 16) {
       throw new Error(`external phase ${phase.id} must contain between 1 and 16 primitive effects`);
     }
@@ -233,6 +239,9 @@ function assertShape(
       if (binding.stage_kind === "wait" && primitive.operation !== "observation") {
         throw new Error(`wait plan ${binding.external_kind} cannot dispatch ${shape.effect_kind}`);
       }
+    }
+    if (phase.cardinality === "repeatable" && phase.effects.length !== 1) {
+      throw new Error(`repeatable external phase ${phase.id} must declare one primitive template`);
     }
   }
   if (binding.stage_kind === "wait" && binding.phases.length !== 1) {
@@ -260,11 +269,17 @@ function validatePrepared(
   const acceptedSubject = prepared.verified_output_subject ?? inputSubject;
   const phases = prepared.phases.map((phase, phaseIndex) => {
     const expected = binding.phases[phaseIndex]!;
-    if (phase.id !== expected.id || phase.effects.length !== expected.effects.length) {
+    const repeatable = expected.cardinality === "repeatable";
+    if (
+      phase.id !== expected.id ||
+      (repeatable
+        ? phase.effects.length < 1 || phase.effects.length > 16
+        : phase.effects.length !== expected.effects.length)
+    ) {
       throw new Error(`prepared external plan ${binding.external_kind} changed phase ${expected.id}`);
     }
     const candidates = phase.effects.map((candidate, effectIndex) => {
-      const expectedEffect = expected.effects[effectIndex]!;
+      const expectedEffect = expected.effects[repeatable ? 0 : effectIndex]!;
       if (candidate.kind !== expectedEffect.effect_kind) {
         throw new Error(`prepared phase ${phase.id} changed primitive ${expectedEffect.effect_kind}`);
       }
@@ -280,6 +295,17 @@ function validatePrepared(
         payload: jsonValueAt(candidate.payload, `prepared.${phase.id}.${candidate.kind}.payload`),
       });
     });
+    if (repeatable) {
+      if (new Set(candidates.map(({ target }) => target)).size !== candidates.length) {
+        throw new Error(`prepared repeatable phase ${phase.id} repeats a deterministic target`);
+      }
+      if (
+        new Set(candidates.map(({ idempotency_key }) => idempotency_key)).size !==
+          candidates.length
+      ) {
+        throw new Error(`prepared repeatable phase ${phase.id} repeats an idempotency key`);
+      }
+    }
     return Object.freeze({ id: phase.id, effects: Object.freeze(candidates) });
   });
   return Object.freeze({
@@ -304,6 +330,7 @@ export function createKernelExternalStagePlanRegistry(input: {
       ...plan,
       phases: Object.freeze(plan.phases.map((phase) => Object.freeze({
         id: phase.id,
+        ...(phase.cardinality === undefined ? {} : { cardinality: phase.cardinality }),
         effects: Object.freeze(phase.effects.map((effect) => Object.freeze({ ...effect }))),
       }))),
       async prepare(request: Parameters<KernelExternalStagePlanBinding["prepare"]>[0]) {

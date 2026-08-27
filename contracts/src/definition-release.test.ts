@@ -11,6 +11,10 @@ import {
 } from "./index.js";
 
 const generatedRoot = fileURLToPath(new URL("../generated/", import.meta.url));
+const runtimeCapabilities = JSON.parse(readFileSync(
+  fileURLToPath(new URL("../runtime-capabilities.json", import.meta.url)),
+  "utf8",
+)) as { max_concurrent_attempts: number };
 const catalog = JSON.parse(readFileSync(
   `${generatedRoot}platform-definition-catalog.json`,
   "utf8",
@@ -23,9 +27,19 @@ const catalog = JSON.parse(readFileSync(
 const environment = JSON.parse(readFileSync(
   `${generatedRoot}compiler-environment.json`,
   "utf8",
-)) as { environment_digest: string; [key: string]: unknown };
+)) as {
+  environment_digest: string;
+  runtime_capability_inputs: { runtime_manifest_digest: string };
+  [key: string]: unknown;
+};
 
 describe("definition release trust anchors", () => {
+  it("seals the authenticated two-attempt execution width", () => {
+    expect(runtimeCapabilities.max_concurrent_attempts).toBe(2);
+    expect(environment.runtime_capability_inputs.runtime_manifest_digest)
+      .toBe(digestCanonicalJson(runtimeCapabilities));
+  });
+
   it("pins generated catalog and compiler-environment identities in compiled source", () => {
     expect(catalog.catalog_digest).toBe(RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST);
     expect(environment.environment_digest).toBe(RELEASE_COMPILER_ENVIRONMENT_DIGEST);

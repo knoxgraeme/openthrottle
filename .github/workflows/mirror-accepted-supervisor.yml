@@ -2,6 +2,15 @@ name: Mirror accepted supervisor image
 
 on:
   workflow_dispatch:
+    inputs:
+      source_digest:
+        description: "Accepted GHCR digest (sha256 plus 64 lowercase hex characters)"
+        required: true
+        type: string
+      target_tag:
+        description: "Fly tag suffix (accepted- plus 12 to 64 lowercase hex characters)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -11,10 +20,28 @@ jobs:
   mirror:
     runs-on: ubuntu-latest
     env:
-      SOURCE_IMAGE: ghcr.io/knoxgraeme/openthrottle-supervisor@sha256:2f6d8beebb597d33872d5f020b99e712836a5a4175f8afa79af904bdaa6cd3a1
-      TARGET_TAG: registry.fly.io/openthrottle-staging-knoxgraeme:accepted-44e010c97e53
-      EXPECTED_DIGEST: sha256:2f6d8beebb597d33872d5f020b99e712836a5a4175f8afa79af904bdaa6cd3a1
+      SOURCE_DIGEST: "${{ inputs.source_digest }}"
+      TARGET_TAG_SUFFIX: "${{ inputs.target_tag }}"
+      SOURCE_IMAGE: "ghcr.io/knoxgraeme/openthrottle-supervisor@${{ inputs.source_digest }}"
+      EXPECTED_DIGEST: "${{ inputs.source_digest }}"
+      TARGET_TAG: "registry.fly.io/openthrottle-staging-knoxgraeme:${{ inputs.target_tag }}"
     steps:
+      - name: Validate exact image mirror inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "source_digest must be sha256 followed by exactly 64 lowercase hex characters" >&2
+            exit 1
+          fi
+          if [[ ! "$TARGET_TAG_SUFFIX" =~ ^accepted-[a-f0-9]{12,64}$ ]]; then
+            echo "target_tag must be accepted- followed by 12 to 64 lowercase hex characters" >&2
+            exit 1
+          fi
+          test "$SOURCE_IMAGE" = "ghcr.io/knoxgraeme/openthrottle-supervisor@$SOURCE_DIGEST"
+          test "$EXPECTED_DIGEST" = "$SOURCE_DIGEST"
+          test "$TARGET_TAG" = "registry.fly.io/openthrottle-staging-knoxgraeme:$TARGET_TAG_SUFFIX"
+
       - name: Authenticate to the accepted-image registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:

@@ -64,7 +64,10 @@ import {
   ordinaryKernelPayloadSchemas,
 } from "./evaluator-registry.js";
 import { createInvalidResultEvidenceRecord } from "./attempt-evidence.js";
-import { OrdinaryKernelCoordinator } from "./ordinary-coordinator.js";
+import {
+  OrdinaryKernelCoordinator,
+  type OrdinaryKernelSettlementPlanner,
+} from "./ordinary-coordinator.js";
 import { compileKernelCursor, frontierMemberKey } from "./reducer.js";
 import { sandboxRecoveryAttemptId, sandboxRecoveryEvaluator } from "./sandbox-recovery.js";
 import {
@@ -81,6 +84,7 @@ const IMPLEMENTED = "2".repeat(40);
 const SIMPLIFIED = "3".repeat(40);
 const CAPABILITY = "c".repeat(64);
 const EXECUTION_POLICY = Object.freeze({ max_concurrent_attempts: 1 });
+const EXECUTION_POLICY_TWO = Object.freeze({ max_concurrent_attempts: 2 });
 const temporaryDirectories: string[] = [];
 
 afterEach(() => {
@@ -662,6 +666,8 @@ describe("ordinary kernel activation", () => {
       recovered_sandbox_fatal?: boolean;
       recovered_scope_mismatch?: boolean;
       correction_session_missing?: boolean;
+      runtime_pool_size?: number;
+      sibling_status?: KernelAttempt["status"];
     } = {},
   ) {
     const correctionMode = correctionFailure || correctionBudget;
@@ -680,27 +686,32 @@ describe("ordinary kernel activation", () => {
     const runtimeDelivery = (
       id: string,
       effectKind: "daytona/create-sandbox@1" | "daytona/start-sandbox@1",
+      slotIndex: number,
     ) => ({
       schema: EXECUTION_RECORD_SCHEMA,
-      id,
+      id: slotIndex === 0 ? id : `${id}-${slotIndex}`,
       kind: "delivery" as const,
       pipeline_run_id: "run-sandbox-failure",
-      effect_id: `effect-${id}`,
-      idempotency_key: `key-${id}`,
-      external_identity: "daytona:runtime",
+      effect_id: `effect-${id}-${slotIndex}`,
+      idempotency_key: `key-${id}-${slotIndex}`,
+      external_identity: `daytona:${String(slotIndex + 1).repeat(64)}`,
       status: "confirmed" as const,
       payload_schema: "openthrottle.effect-delivery/v1",
       payload: { inline: {
         effect_kind: effectKind,
         provider: "daytona",
-        result: { sandbox_id: "sandbox-poisoned", resource_state: "started" },
+        result: {
+          identity: String(slotIndex + 1).repeat(64),
+          sandbox_id: `sandbox-${slotIndex}`,
+          resource_state: "started",
+        },
       } },
       created_at: NOW,
     });
-    const deliveries = [
-      runtimeDelivery("delivery-create", "daytona/create-sandbox@1"),
-      runtimeDelivery("delivery-start", "daytona/start-sandbox@1"),
-    ];
+    const deliveries = Array.from({ length: options.runtime_pool_size ?? 1 }, (_, slotIndex) => [
+      runtimeDelivery("delivery-create", "daytona/create-sandbox@1", slotIndex),
+      runtimeDelivery("delivery-start", "daytona/start-sandbox@1", slotIndex),
+    ]).flat();
     const inputs = {
       task_prompt: "Run the exact command.",
       context: { records: deliveries, checkpoints: [] },
@@ -775,7 +786,8 @@ describe("ordinary kernel activation", () => {
       },
     };
     const siblingAttempt = structuredSibling
-      ? createPendingKernelAttempt({
+      ? {
+        ...createPendingKernelAttempt({
         id: "attempt-command-sibling",
         pipeline_run_id: "run-sandbox-failure",
         scope: {
@@ -790,7 +802,17 @@ describe("ordinary kernel activation", () => {
         bundle: fixed.compilation.bundle.value,
         manifest,
         action_inputs: inputs,
-      })
+        }),
+        ...(options.sibling_status === undefined
+          ? {}
+          : {
+            status: options.sibling_status,
+            version: 1,
+            output_subject: SIMPLIFIED,
+            native_session_id: "session-sibling",
+            checkpoint_id: "checkpoint-sibling",
+          }),
+      } as KernelAttempt
       : null;
     const frontierAttempts = [currentAttempt, ...(siblingAttempt === null ? [] : [siblingAttempt])];
     const dependencies = siblingAttempt === null ? undefined : {
@@ -1122,7 +1144,7 @@ describe("ordinary kernel activation", () => {
         lease: currentAttempt.lease!,
       });
     }
-    return { transition: applied!, records, forensicsLookups };
+    return { transition: applied!, records, attempts, forensicsLookups };
   }
 
   it("routes command ENOSPC through runtime stop instead of same-sandbox retry", async () => {
@@ -1144,6 +1166,25 @@ describe("ordinary kernel activation", () => {
     ]));
   });
 
+  it("routes sandbox-fatal recovery through cleanup with every runtime-pool target", async () => {
+    const { transition } = await sandboxFailureTransition(
+      Object.assign(new Error("write failed: no space left on device"), { code: "ENOSPC" }),
+      false,
+      null,
+      false,
+      false,
+      { runtime_pool_size: 2 },
+    );
+
+    expect(transition.run.cursor.stage_id).toBe(runtimeStopStageId("failed"));
+    expect(transition.create_attempts[0]?.context_record_ids).toEqual(expect.arrayContaining([
+      "delivery-create",
+      "delivery-start",
+      "delivery-create-1",
+      "delivery-start-1",
+    ]));
+  });
+
   it("captures every active structured frontier member before sandbox recovery", async () => {
     const { transition } = await sandboxFailureTransition(
       Object.assign(new Error("write failed: no space left on device"), { code: "ENOSPC" }),
@@ -1159,6 +1200,28 @@ describe("ordinary kernel activation", () => {
     expect(transition.create_attempts[0]?.context_record_ids).toEqual(expect.arrayContaining(
       frontierRecords.map(({ id }) => id),
     ));
+  });
+
+  it("needs human instead of rerunning a completed sibling after a whole-pool sandbox fatal", async () => {
+    const { transition, attempts } = await sandboxFailureTransition(
+      Object.assign(new Error("write failed: no space left on device"), { code: "ENOSPC" }),
+      true,
+      null,
+      false,
+      false,
+      { sibling_status: "work_complete" },
+    );
+
+    expect(transition.run.cursor.stage_id).toBe(runtimeStopStageId("needs_human"));
+    expect(transition.append_records).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ reducer: expect.stringMatching(/^core\/sandbox-fatal-frontier@1:/) }),
+    ]));
+    expect(attempts.get("attempt-command-sibling")).toMatchObject({
+      status: "needs_human",
+      checkpoint_id: "checkpoint-sibling",
+      output_subject: SIMPLIFIED,
+      native_session_id: "session-sibling",
+    });
   });
 
   it("keeps ordinary infrastructure failures on the same-sandbox retry ladder", async () => {
@@ -1590,6 +1653,243 @@ describe("ordinary kernel activation", () => {
       }
     },
   );
+
+  it("replans after the opposite same-run member settles in the real SQLite store", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "openthrottle-ordinary-race-"));
+    temporaryDirectories.push(directory);
+    const blobs = VolumeBlobStore.initialize(join(directory, "blobs"), "ordinary-race");
+    const db = initializeFreshEpochDatabase({
+      database_path: join(directory, "epoch.sqlite"),
+      blob_store: blobs,
+      release_id: "ordinary-race-release",
+      runtime_capability_digest: CAPABILITY,
+      bootstrap: createFreshEpochBootstrap({
+        schema: "openthrottle.fresh-epoch-bootstrap/v1",
+        settings: [],
+        repository_registrations: [{
+          id: "repo",
+          control_provider: "linear",
+          route_key: "team",
+          linear_team_id: "team",
+          linear_team_key: "OPE",
+          github_repo: "owner/repo",
+          github_installation_id: 1,
+          base_branch: "main",
+          webhook_id: 1,
+          runtime_snapshot: "snapshot",
+        }],
+      }),
+      now: () => NOW,
+    });
+    const fixed = fixture();
+    const raceStage = fixed.manifest.stages.find((stage) => stage.id === "implement")!;
+    if (raceStage.kind !== "agent") throw new Error("race fixture stage is not an agent");
+    const expandedRace = expandCompiledRuntimeLifecycle({
+      entry_stage: "implement",
+      stages: [{
+        ...raceStage,
+        repository_authority: "inspect",
+        loop: {
+          over: "selection.personas",
+          max_parallel: 2,
+          max_rounds: 1,
+          body: ["implement"],
+        },
+        on: {
+          success: { terminal: "completed" },
+          no_change: { terminal: "no_change" },
+          failure: { terminal: "failed" },
+        },
+      }],
+    });
+    const manifest: CompiledPipelineManifest = {
+      ...fixed.manifest,
+      entry_stage: expandedRace.entry_stage,
+      stages: expandedRace.stages,
+    };
+    const bundleToken = blobs.put({
+      bytes: fixed.compilation.bundle.normalized,
+      encoding: "utf-8",
+      media_type: "application/json",
+      payload_schema: DEFINITION_BUNDLE_SCHEMA,
+    });
+    const actionInputs = {
+      task_prompt: "Review the exact same-run member.",
+      context: { records: [], checkpoints: [] },
+    };
+    const parallelAttempt = (id: string, memberIndex: number) => createPendingKernelAttempt({
+      id,
+      pipeline_run_id: "run-race",
+      scope: {
+        kind: "loop_item",
+        stage_id: "implement",
+        parent_attempt_id: "attempt-a",
+        loop_id: "selection.personas",
+        item_id: `persona-${memberIndex}`,
+        item_index: memberIndex,
+      },
+      input_subject: SOURCE,
+      bundle: fixed.compilation.bundle.value,
+      manifest,
+      action_inputs: actionInputs,
+    });
+    const attempts = [parallelAttempt("attempt-a", 0), parallelAttempt("attempt-b", 1)];
+    const cursor = compileKernelCursor({ stage_id: "implement", version: 0, attempts });
+    const run: KernelRun = {
+      schema: KERNEL_RUN_SCHEMA,
+      id: "run-race",
+      pipeline_id: manifest.pipeline_id,
+      definition_bundle_hash: manifest.definition_bundle_hash,
+      current_subject: SOURCE,
+      status: "pending",
+      terminal_outcome: null,
+      cursor,
+      version: 0,
+      work_retry_limit: 2,
+      result_correction_limit: 2,
+      active_attempt_versions: Object.fromEntries(attempts.map((attempt) => [attempt.id, 0])),
+      active_effect_versions: {},
+      checkpoint_ids: {},
+    };
+    const store = new SqliteKernelStore({
+      db,
+      blob_store: blobs,
+      manifest_resolver: { resolve: () => manifest },
+      payload_schemas: ordinaryKernelPayloadSchemas(),
+      execution_policy: EXECUTION_POLICY_TWO,
+      execution_width: 2,
+      now: () => NOW,
+    });
+    store.admitPipelineRun({
+      work_item: {
+        id: "work-race",
+        repository_registration_id: "repo",
+        source_provider: "linear",
+        source_id: "issue-race",
+        source_reference: "OPE-RACE",
+        state: "active",
+        title: "Opposite settlement race",
+        payload_schema: "openthrottle.kernel-work-request/v1",
+        payload: { inline: {
+          schema: "openthrottle.kernel-work-request/v1",
+          task_prompt: actionInputs.task_prompt,
+        } },
+      },
+      definitions: [],
+      run,
+      definition_bundle: bundleToken,
+      initial_attempts: attempts,
+    });
+    const bundles = new VerifiedKernelDefinitionBundleResolver({
+      bytes: store,
+      trusted_platform_definitions: fixed.trusted,
+    });
+    const runtime = new RuntimeFixture();
+    const executionCoordinator = new OrdinaryKernelCoordinator({
+      store,
+      definition_bundles: bundles,
+      runtime,
+      runtime_sessions: new KernelRuntimeSessionService({ transitions: store, now: () => NOW }),
+      attempt_lease_duration_ms: 5 * 60 * 1_000,
+      now: () => NOW,
+    });
+    const leased = [
+      await store.leaseNextEligibleAttempt({
+        worker_id: "worker-race",
+        lease_id: "lease-a",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      }),
+      await store.leaseNextEligibleAttempt({
+        worker_id: "worker-race",
+        lease_id: "lease-b",
+        expires_at: "2026-08-20T12:05:00.000Z",
+      }),
+    ];
+    expect(leased.map((candidate) => candidate?.attempt.id)).toEqual(["attempt-a", "attempt-b"]);
+
+    const apply = store.applyAtomicTransition.bind(store);
+    let recordCrashes = 0;
+    store.applyAtomicTransition = async (transition: AtomicTransitionBundle) => {
+      const result = await apply(transition);
+      if (recordCrashes < 2 && transition.transition_id.startsWith("record-")) {
+        recordCrashes += 1;
+        throw new Error(`injected crash after record ${recordCrashes}`);
+      }
+      return result;
+    };
+    await expect(executionCoordinator.executeLeasedAttempt(leased[0]!))
+      .rejects.toThrow("injected crash after record 1");
+    await expect(executionCoordinator.executeLeasedAttempt(leased[1]!))
+      .rejects.toThrow("injected crash after record 2");
+    store.applyAtomicTransition = apply;
+
+    let releasePlans!: () => void;
+    const bothPlanned = new Promise<void>((resolve) => { releasePlans = resolve; });
+    const initialPlanAttempts: string[] = [];
+    let planCount = 0;
+    const planner = {
+      async plan(input: Parameters<OrdinaryKernelSettlementPlanner["plan"]>[0]) {
+        const defaultPlan = await input.default_plan();
+        const plan = Object.keys(input.view.run.active_attempt_versions).length > 1
+          ? { ...defaultPlan, next_attempts: [] }
+          : defaultPlan;
+        planCount += 1;
+        if (initialPlanAttempts.length < 2) {
+          initialPlanAttempts.push(input.attempt.id);
+          if (initialPlanAttempts.length === 2) releasePlans();
+          await bothPlanned;
+        }
+        return plan;
+      },
+    };
+    const candidateStore = (attemptId: string) => ({
+      loadExactReductionView: store.loadExactReductionView.bind(store),
+      applyAtomicTransition: store.applyAtomicTransition.bind(store),
+      loadAttemptRequestInputs: store.loadAttemptRequestInputs.bind(store),
+      loadAttemptForensics: store.loadAttemptForensics.bind(store),
+      async listReadyOrdinaryAttempts(input: { after?: unknown }) {
+        if (input.after !== undefined) return [];
+        const row = db.prepare(`
+          SELECT updated_at FROM attempts WHERE id = ? AND pipeline_run_id = 'run-race'
+        `).get(attemptId) as { updated_at: string };
+        return [{ updated_at: row.updated_at, pipeline_run_id: "run-race", attempt_id: attemptId }];
+      },
+    });
+    const continuationCoordinator = (attemptId: string) => new OrdinaryKernelCoordinator({
+      store: candidateStore(attemptId) as never,
+      definition_bundles: bundles,
+      runtime: {} as never,
+      runtime_sessions: {} as never,
+      settlement_planner: planner,
+      attempt_lease_duration_ms: 5 * 60 * 1_000,
+      now: () => NOW,
+    });
+
+    await expect(Promise.all([
+      continuationCoordinator("attempt-a").resumeReadyAttempt(),
+      continuationCoordinator("attempt-b").resumeReadyAttempt(),
+    ])).resolves.toEqual([
+      expect.objectContaining({ disposition: "settled", attempt_id: "attempt-a" }),
+      expect.objectContaining({ disposition: "settled", attempt_id: "attempt-b" }),
+    ]);
+    expect(initialPlanAttempts.sort()).toEqual(["attempt-a", "attempt-b"]);
+    expect(planCount).toBeGreaterThanOrEqual(3);
+    expect(db.prepare(`
+      SELECT id, status FROM attempts
+      WHERE pipeline_run_id = 'run-race' AND id IN ('attempt-a', 'attempt-b') ORDER BY id
+    `).all()).toEqual([
+      { id: "attempt-a", status: "settled" },
+      { id: "attempt-b", status: "settled" },
+    ]);
+    expect(db.prepare(`
+      SELECT status, terminal_outcome, cursor_stage_id FROM pipeline_runs WHERE id = 'run-race'
+    `).get()).toEqual({
+      status: "running",
+      terminal_outcome: null,
+      cursor_stage_id: runtimeStopStageId("completed"),
+    });
+    db.close();
+  });
 
   it("paginates past 100 malformed continuations without rerunning completed ordinary work", async () => {
     const runtime = new RuntimeFixture();

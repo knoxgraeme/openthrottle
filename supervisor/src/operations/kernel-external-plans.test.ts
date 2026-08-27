@@ -143,6 +143,16 @@ function preparationRequest(stage: CompiledPipelineStage) {
       pipeline_selection: "explicit" as const,
       entries: [],
     },
+    manifest: {
+      schema: "openthrottle.compiled-pipeline-manifest/v1" as const,
+      pipeline_id: "core/test",
+      pipeline_version: 1,
+      entry_stage: stage.id,
+      definition_bundle_hash: "c".repeat(64),
+      compiler_version: "definition-compiler/v1",
+      runtime_capability_digest: "e".repeat(64),
+      stages: [stage],
+    },
   };
 }
 
@@ -202,6 +212,54 @@ describe("kernel external stage plan registry", () => {
     await expect(registry.bindingFor(externalStages[0]!).prepare(
       preparationRequest(externalStages[0]!),
     )).rejects.toThrow(/subject policy/i);
+  });
+
+  it("validates bounded repeated lifecycle phases without widening their primitive", async () => {
+    const stage: CompiledPipelineStage = {
+      id: "provision",
+      kind: "effect",
+      effect: "core/daytona-provision@1",
+      on: { success: { terminal: "completed" } },
+    };
+    const candidate = (identity: string, overrides: Record<string, unknown> = {}) => ({
+      kind: "daytona/create-sandbox@1",
+      idempotency_key: `run-1:create:${identity}`,
+      target: `daytona:${identity}`,
+      subject: SUBJECT,
+      payload: { identity },
+      ...overrides,
+    });
+    const prepared = (secondOverrides: Record<string, unknown> = {}): KernelPreparedExternalPlan => ({
+      verified_output_subject: null,
+      checkpoint_payload: { pool_size: 2 },
+      phases: [
+        {
+          id: "create",
+          effects: [candidate("a".repeat(64)), candidate("b".repeat(64), secondOverrides)],
+        },
+        {
+          id: "start",
+          effects: [
+            { ...candidate("a".repeat(64)), kind: "daytona/start-sandbox@1" },
+            { ...candidate("b".repeat(64)), kind: "daytona/start-sandbox@1" },
+          ],
+        },
+      ],
+    });
+    const registryFor = (secondOverrides: Record<string, unknown> = {}) =>
+      createKernelExternalStagePlanRegistry({
+        effects: primitiveRegistry(),
+        plans: [plan("core/daytona-provision@1", async () => prepared(secondOverrides))],
+      });
+
+    await expect(registryFor().bindingFor(stage).prepare(preparationRequest(stage)))
+      .resolves.toMatchObject({ phases: [{ effects: [{}, {}] }, { effects: [{}, {}] }] });
+    await expect(registryFor({ kind: "daytona/start-sandbox@1" }).bindingFor(stage)
+      .prepare(preparationRequest(stage))).rejects.toThrow(/changed primitive/i);
+    await expect(registryFor({ target: `daytona:${"a".repeat(64)}` }).bindingFor(stage)
+      .prepare(preparationRequest(stage))).rejects.toThrow(/repeats a deterministic target/i);
+    await expect(registryFor({ idempotency_key: `run-1:create:${"a".repeat(64)}` }).bindingFor(stage)
+      .prepare(preparationRequest(stage))).rejects.toThrow(/repeats an idempotency key/i);
   });
 
   it("materializes deterministic Decision-owned EffectIntents", () => {

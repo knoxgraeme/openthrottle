@@ -1,10 +1,10 @@
 import {
   compareCodeUnits,
+  normalizeIso8601Timestamp,
   type AttemptCheckpoint,
   type CompiledPipelineStage,
   type DecisionRecord,
   type ExecutionRecord,
-  type ResultRecord,
 } from "@openthrottle/contracts";
 import type { OrdinaryKernelSettlementPlanner } from "../pipeline/kernel/ordinary-coordinator.js";
 import {
@@ -164,23 +164,41 @@ function preferredDivergentOutcome(outcomes: readonly string[]): string {
   return selected;
 }
 
+function latestStructuredEvidenceCreatedAt(records: readonly ExecutionRecord[]): string {
+  let latest: { record: ExecutionRecord; instant: string } | undefined;
+  for (const record of records) {
+    const instant = normalizeIso8601Timestamp(record.created_at);
+    if (instant === null) {
+      throw new Error(`structured wave input ${record.id} has an invalid created_at`);
+    }
+    const instantOrder = latest === undefined ? 1 : compareCodeUnits(instant, latest.instant);
+    if (
+      latest === undefined || instantOrder > 0 ||
+      (instantOrder === 0 && compareCodeUnits(record.id, latest.record.id) < 0)
+    ) latest = { record, instant };
+  }
+  if (!latest) throw new Error("structured wave has no timestamped input evidence");
+  return latest.record.created_at;
+}
+
 export function settleStructuredWaveDecision(input: {
   view: OrdinaryInput["view"];
   stage: OrdinaryInput["stage"];
-  current_attempt: KernelAttempt;
-  current_result: ResultRecord;
-  current_decision: DecisionRecord;
   evidence: readonly StructuredWaveEvidence[];
   additional_input_records?: readonly ExecutionRecord[];
-  created_at: string;
 }): {
   decision: DecisionRecord;
   outcome: string;
   target_stage_id: string | null;
   input_records: readonly ExecutionRecord[];
+  anchor: StructuredWaveEvidence;
   aggregate: boolean;
 } {
-  const transitions = input.evidence.map((evidence) => {
+  const canonicalEvidence = [...input.evidence].sort((left, right) =>
+    left.member_index - right.member_index || compareCodeUnits(left.member_id, right.member_id));
+  const anchor = canonicalEvidence[0];
+  if (!anchor) throw new Error("structured wave has no canonical member");
+  const transitions = canonicalEvidence.map((evidence) => {
     const outcome = structuredDecisionOutcome(evidence.decision);
     return {
       evidence,
@@ -189,61 +207,37 @@ export function settleStructuredWaveDecision(input: {
     };
   });
   const targets = new Set(transitions.map(({ target_stage_id: target }) => target));
+  const outcomes = new Set(transitions.map(({ outcome }) => outcome));
   const additionalInputs = input.additional_input_records ?? [];
   const lineageInputs = [...new Map([
-    ...input.evidence.flatMap((source) => source.decision_input_records
+    ...canonicalEvidence.flatMap((source) => source.decision_input_records
       .filter(({ id }) => id !== source.result.id)),
     ...additionalInputs,
   ].map((record) => [record.id, record])).values()]
     .sort((left, right) => compareCodeUnits(left.id, right.id));
-  if (targets.size === 1) {
-    const outcome = structuredDecisionOutcome(input.current_decision);
-    const inputRecords = [...new Map([
-      input.current_result,
-      ...lineageInputs,
-    ].map((record) => [record.id, record])).values()]
-      .sort((left, right) => compareCodeUnits(left.id, right.id));
-    const currentInputIds = [...input.current_decision.input_record_ids].sort(compareCodeUnits);
-    const inputRecordIds = inputRecords.map(({ id }) => id);
-    const decision = currentInputIds.length === inputRecordIds.length &&
-        currentInputIds.every((id, index) => id === inputRecordIds[index])
-      ? input.current_decision
-      : createPipelineDecisionRecord({
-        attempt: input.current_attempt,
-        result: input.current_result,
-        additional_input_records: inputRecords
-          .filter(({ id }) => id !== input.current_result.id),
-        evaluated: decisionEvaluation(input.current_decision),
-        created_at: input.created_at,
-      });
-    return {
-      decision,
-      outcome,
-      target_stage_id: transitions[0]!.target_stage_id,
-      input_records: inputRecords,
-      aggregate: false,
-    };
-  }
-  const outcome = preferredDivergentOutcome(transitions.map((transition) => transition.outcome));
+  const outcome = outcomes.size === 1
+    ? transitions[0]!.outcome
+    : preferredDivergentOutcome(transitions.map((transition) => transition.outcome));
   const selected = transitions.find((transition) => transition.outcome === outcome)!;
   const inputRecords = [...new Map([
-    ...input.evidence.map(({ result }) => result),
+    ...canonicalEvidence.map(({ result }) => result),
     ...lineageInputs,
   ].map((record) => [record.id, record])).values()]
     .sort((left, right) => compareCodeUnits(left.id, right.id));
   const decision = createPipelineDecisionRecord({
-    attempt: input.current_attempt,
-    result: input.current_result,
-    additional_input_records: inputRecords.filter(({ id }) => id !== input.current_result.id),
+    attempt: anchor.attempt,
+    result: anchor.result,
+    additional_input_records: inputRecords.filter(({ id }) => id !== anchor.result.id),
     evaluated: decisionEvaluation(selected.evidence.decision),
-    created_at: input.created_at,
+    created_at: latestStructuredEvidenceCreatedAt(inputRecords),
   });
   return {
     decision,
     outcome,
     target_stage_id: selected.target_stage_id,
     input_records: inputRecords,
-    aggregate: true,
+    anchor,
+    aggregate: targets.size > 1 || outcomes.size > 1,
   };
 }
 

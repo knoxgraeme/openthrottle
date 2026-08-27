@@ -131,22 +131,27 @@ function correctionRequest(overrides: Record<string, unknown> = {}): KernelResul
   } as KernelResultCorrectionRequest;
 }
 
-function runtimeDelivery(kind: "create" | "start"): DeliveryRecord {
+function runtimeDelivery(kind: "create" | "start", slotIndex = 0): DeliveryRecord {
+  const suffix = slotIndex === 0 ? "" : `-${slotIndex + 1}`;
+  const sandboxId = `sandbox-${slotIndex + 1}`;
   return {
     schema: "openthrottle.record/v1",
-    id: `delivery-${kind}`,
+    id: `delivery-${kind}${suffix}`,
     kind: "delivery",
     pipeline_run_id: "run-1",
-    effect_id: `effect-${kind}`,
-    idempotency_key: `run-1:${kind}`,
-    external_identity: "daytona:sandbox-1",
+    effect_id: `effect-${kind}${suffix}`,
+    idempotency_key: `run-1:${kind}${suffix}`,
+    external_identity: `daytona:${sandboxId}`,
     status: "confirmed",
     payload_schema: "openthrottle.effect-delivery/v1",
     payload: { inline: {
       effect_kind: `daytona/${kind}-sandbox@1`,
       provider: "daytona",
       observed_via: "reconciliation",
-      result: { sandbox_id: "sandbox-1" },
+      result: {
+        sandbox_id: sandboxId,
+        identity: `${slotIndex + 1}`.repeat(64),
+      },
     } },
     created_at: "2026-08-20T12:00:00.000Z",
   };
@@ -285,6 +290,20 @@ function adapterFor(
     poll_interval_ms: 1,
     ...optionOverrides,
   } as never);
+}
+
+function publishSteeringFiles(sandbox: ReturnType<typeof sandboxWith>): void {
+  sandbox.process.executeCommand.mockImplementation(async (command: string) => {
+    const match = /^mv -n -- '([^']+)' '([^']+)'$/.exec(command);
+    if (match) {
+      const staged = sandbox.files.get(match[1]!);
+      if (staged && !sandbox.files.has(match[2]!)) {
+        sandbox.files.set(match[2]!, Buffer.from(staged));
+      }
+      return { exitCode: 0, result: "" };
+    }
+    return sandbox.defaultExecuteCommand(command);
+  });
 }
 
 class DurableIntegrationEffectPort implements KernelEffectPort {
@@ -865,6 +884,108 @@ function correctionCheckpointExecution(
 }
 
 describe("DaytonaKernelAdapter", () => {
+  it("dispatches sibling work requests to their distinct sealed runtime slots", async () => {
+    const sandboxes = [
+      sandboxWith(async () => { throw new Error("404 not found"); }),
+      sandboxWith(async () => { throw new Error("404 not found"); }),
+    ];
+    for (const sandbox of sandboxes) {
+      sandbox.process.getSessionCommand.mockResolvedValue({ cmdId: "command-1", exitCode: 1 });
+    }
+    const get = vi.fn(async (sandboxId: string) => {
+      const sandbox = sandboxes[Number(sandboxId.at(-1)) - 1];
+      if (!sandbox) throw new Error(`unknown sandbox ${sandboxId}`);
+      return sandbox;
+    });
+    const adapter = adapterFor(sandboxes[0]!, {}, {}, { task_timeout_seconds: 60 }, { get });
+    const callbacks = {
+      lease_generation: 0,
+      work_retry_ordinal: 0,
+      heartbeat_interval_ms: 10_000,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn().mockResolvedValue(undefined),
+    };
+
+    for (const itemIndex of [0, 1]) {
+      await adapter.executeWork(workRequest({
+        attempt_id: `attempt-${itemIndex + 1}`,
+        lease_id: `lease-${itemIndex + 1}`,
+        scope: {
+          kind: "loop_item",
+          stage_id: "implement",
+          parent_attempt_id: "attempt-plan",
+          loop_id: "units",
+          item_id: `unit-${itemIndex + 1}`,
+          item_index: itemIndex,
+        },
+        runtime_resource: {
+          provider: "daytona",
+          provider_resource_id: `sandbox-${itemIndex + 1}`,
+          delivery_record_ids: [
+            runtimeDelivery("create", itemIndex).id,
+            runtimeDelivery("start", itemIndex).id,
+          ],
+        },
+      }), callbacks);
+    }
+
+    expect(get.mock.calls.map(([sandboxId]) => sandboxId)).toEqual(["sandbox-1", "sandbox-2"]);
+  });
+
+  it("returns sibling result correction to each Attempt's original runtime slot", async () => {
+    const sandboxes = [
+      sandboxWith(async () => { throw new Error("404 not found"); }),
+      sandboxWith(async () => { throw new Error("404 not found"); }),
+    ];
+    for (const sandbox of sandboxes) {
+      sandbox.process.getSessionCommand.mockResolvedValue({ cmdId: "command-1", exitCode: 1 });
+    }
+    const get = vi.fn(async (sandboxId: string) => {
+      const sandbox = sandboxes[Number(sandboxId.at(-1)) - 1];
+      if (!sandbox) throw new Error(`unknown sandbox ${sandboxId}`);
+      return sandbox;
+    });
+    const records = [
+      runtimeDelivery("create", 0),
+      runtimeDelivery("start", 0),
+      runtimeDelivery("create", 1),
+      runtimeDelivery("start", 1),
+    ];
+    const adapter = adapterFor(sandboxes[0]!, {}, {
+      loadAttemptRequestInputs: vi.fn().mockResolvedValue({
+        task_prompt: "execute the sealed task",
+        context: {
+          records: new Map(records.map((record) => [record.id, record])),
+          checkpoints: new Map(),
+        },
+      }),
+    }, { task_timeout_seconds: 60 }, { get });
+    const callbacks = {
+      lease_generation: 0,
+      work_retry_ordinal: 0,
+      heartbeat_interval_ms: 10_000,
+      on_heartbeat: vi.fn().mockResolvedValue(undefined),
+      on_session: vi.fn(),
+    };
+
+    for (const itemIndex of [0, 1]) {
+      await adapter.correctResult(correctionRequest({
+        attempt_id: `attempt-${itemIndex + 1}`,
+        lease_id: `correction-lease-${itemIndex + 1}`,
+        scope: {
+          kind: "loop_item",
+          stage_id: "implement",
+          parent_attempt_id: "attempt-plan",
+          loop_id: "units",
+          item_id: `unit-${itemIndex + 1}`,
+          item_index: itemIndex,
+        },
+      }), callbacks);
+    }
+
+    expect(get.mock.calls.map(([sandboxId]) => sandboxId)).toEqual(["sandbox-1", "sandbox-2"]);
+  });
+
   it("replays a bounded edit checkpoint during result correction from a non-root merge input", async () => {
     const artifact = boundedEditCheckpointBundle("a".repeat(64));
     const request = correctionRequest({
@@ -2088,7 +2209,11 @@ describe("DaytonaKernelAdapter", () => {
         inline: {
           effect_kind: effectKind,
           provider: "daytona",
-          result: { sandbox_id: "sandbox-1", resource_state: "started" },
+          result: {
+            sandbox_id: "sandbox-1",
+            resource_state: "started",
+            identity: "1".repeat(64),
+          },
         },
       },
       created_at: "2026-08-20T12:00:00.000Z",
@@ -2112,6 +2237,7 @@ describe("DaytonaKernelAdapter", () => {
       definition_bundle_hash: "b".repeat(64),
       input_subject: "c".repeat(40),
       native_session_id: "session-1",
+      scope: { kind: "stage", stage_id: "stage-1" },
       generation: 0,
       attempt_status: "running",
       repository_authority: "edit",
@@ -2168,6 +2294,79 @@ describe("DaytonaKernelAdapter", () => {
       stagedPath,
       { owner: "agent", group: "agent", mode: "600" },
     );
+  });
+
+  it("returns correction-phase steering for sibling Attempts to their original runtime slots", async () => {
+    const sandboxes = [
+      sandboxWith(async () => { throw new Error("404 not found"); }),
+      sandboxWith(async () => { throw new Error("404 not found"); }),
+    ];
+    sandboxes.forEach(publishSteeringFiles);
+    const get = vi.fn(async (sandboxId: string) => {
+      const sandbox = sandboxes[Number(sandboxId.at(-1)) - 1];
+      if (!sandbox) throw new Error(`unknown sandbox ${sandboxId}`);
+      return sandbox;
+    });
+    const records = [
+      runtimeDelivery("create", 0),
+      runtimeDelivery("start", 0),
+      runtimeDelivery("create", 1),
+      runtimeDelivery("start", 1),
+    ];
+    const adapter = adapterFor(sandboxes[0]!, {}, {
+      loadAttemptRequestInputs: vi.fn().mockResolvedValue({
+        task_prompt: "execute the sealed task",
+        context: {
+          records: new Map(records.map((record) => [record.id, record])),
+          checkpoints: new Map(),
+        },
+      }),
+    }, {}, { get });
+
+    for (const itemIndex of [0, 1]) {
+      const binding: KernelRuntimeSessionBinding = {
+        pipeline_run_id: "run-1",
+        attempt_id: `attempt-${itemIndex + 1}`,
+        request_hash: "a".repeat(64),
+        definition_bundle_hash: "b".repeat(64),
+        input_subject: "c".repeat(40),
+        native_session_id: `session-${itemIndex + 1}`,
+        scope: {
+          kind: "loop_item",
+          stage_id: "implement",
+          parent_attempt_id: "attempt-plan",
+          loop_id: "units",
+          item_id: `unit-${itemIndex + 1}`,
+          item_index: itemIndex,
+        },
+        generation: 1,
+        attempt_status: "result_pending",
+        repository_authority: "edit",
+        lease_id: `correction-lease-${itemIndex + 1}`,
+        lease_generation: 0,
+        lease_worker_id: `worker-${itemIndex + 1}`,
+        lease_purpose: "result_correction",
+        lease_expires_at: "2099-08-20T12:05:00.000Z",
+        lease_started: true,
+      };
+      const envelope = createKernelSteeringEnvelope({
+        message_id: `message-${itemIndex + 1}`,
+        source: "operator",
+        body: "Return only the corrected semantic result.",
+        binding,
+      });
+      await adapter.deliverSteering({
+        event_id: `event-${itemIndex + 1}`,
+        delivery_id: `steering-delivery-${itemIndex + 1}`,
+        envelope,
+        authorized: authorizeKernelSteeringDelivery({
+          envelope,
+          current_binding: binding,
+        }),
+      });
+    }
+
+    expect(get.mock.calls.map(([sandboxId]) => sandboxId)).toEqual(["sandbox-1", "sandbox-2"]);
   });
 
   it("atomically advances the private lease-generation fence on recovery and rejects stale refreshes", async () => {

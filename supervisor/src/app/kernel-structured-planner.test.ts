@@ -8,6 +8,7 @@ import {
   EXECUTION_RECORD_SCHEMA,
   RELEASE_COMPILER_ENVIRONMENT_DIGEST,
   RELEASE_PLATFORM_DEFINITION_CATALOG_DIGEST,
+  canonicalJson,
   compileDefinitionBundle,
   digestCanonicalJson,
   verifyCompilerEnvironment,
@@ -195,6 +196,7 @@ function correctionEvidence(marker = "current"): DecisionRecord {
 }
 
 function runtimeDelivery(kind: "create" | "start"): DeliveryRecord {
+  const identity = "1".repeat(64);
   return {
     schema: EXECUTION_RECORD_SCHEMA,
     id: `delivery-runtime-${kind}`,
@@ -202,7 +204,7 @@ function runtimeDelivery(kind: "create" | "start"): DeliveryRecord {
     pipeline_run_id: "run-1",
     effect_id: `effect-runtime-${kind}`,
     idempotency_key: `run-1:runtime:${kind}`,
-    external_identity: "daytona:sandbox-1",
+    external_identity: `daytona:${identity}`,
     status: "confirmed",
     payload_schema: "openthrottle.effect-delivery/v1",
     payload: {
@@ -211,7 +213,7 @@ function runtimeDelivery(kind: "create" | "start"): DeliveryRecord {
           ? "daytona/create-sandbox@1"
           : "daytona/start-sandbox@1",
         provider: "daytona",
-        result: { sandbox_id: "sandbox-1", resource_state: `${kind}d` },
+        result: { identity, sandbox_id: "sandbox-1", resource_state: `${kind}d` },
       },
     },
     created_at: NOW,
@@ -304,6 +306,7 @@ function completedAttempt(input: {
   request: KernelAttemptRequestInputs;
   settled?: boolean;
   additional_input_records?: readonly ExecutionRecord[];
+  result_created_at?: string;
 }): {
   attempt: KernelAttempt;
   checkpoint: AttemptCheckpoint;
@@ -339,7 +342,7 @@ function completedAttempt(input: {
     normalized_candidate_hash: digestCanonicalJson({ attempt: input.pending.id, normalized: true }),
     payload_schema: "openthrottle.semantic-result-record/v1",
     payload: { inline: { outcome: input.evaluated?.outcome ?? "success" } },
-    created_at: NOW,
+    created_at: input.result_created_at ?? NOW,
   };
   const recorded: KernelAttempt = {
     ...input.pending,
@@ -1091,7 +1094,7 @@ describe("KernelStructuredSettlementPlanner", () => {
     expect(settlement.next_attempts[0]!.context_record_ids).not.toContain(inheritedPush.id);
   });
 
-  it("compiles five selected reviewers into a stable serial inspect frontier", async () => {
+  it("compiles five selected reviewers into a stable width-two inspect frontier", async () => {
     const store = new PlanningStore();
     const push = githubPushDelivery("delivery-push-d1", "1".repeat(40), "create");
     const boundary: AttemptCheckpoint = {
@@ -1156,10 +1159,11 @@ describe("KernelStructuredSettlementPlanner", () => {
     })));
     const scopeKeys = settlement.next_attempts.map(frontierMemberKey);
     const dependencies = settlement.next_dependencies;
-    if (!dependencies) throw new Error("persona settlement omitted serial dependencies");
+    if (!dependencies) throw new Error("persona settlement omitted width-two dependencies");
     expect(dependencies[scopeKeys[0]!]).toEqual([]);
-    for (let index = 1; index < scopeKeys.length; index += 1) {
-      expect(dependencies[scopeKeys[index]!]).toEqual([scopeKeys[index - 1]!]);
+    expect(dependencies[scopeKeys[1]!]).toEqual([]);
+    for (let index = 2; index < scopeKeys.length; index += 1) {
+      expect(dependencies[scopeKeys[index]!]).toEqual([scopeKeys[index - 2]!]);
     }
     expect(settlement.next_attempts.every((attempt) =>
       attempt.context_checkpoint_ids.includes(boundary.id))).toBe(true);
@@ -1258,7 +1262,6 @@ describe("KernelStructuredSettlementPlanner", () => {
     });
     expect(fanoutSettlement.next_attempts[0]!.context_record_ids).toEqual(expect.arrayContaining([
       first.result.id,
-      first.decision.id,
       second.result.id,
       fanoutSettlement.decision.id,
       correction.id,
@@ -1271,7 +1274,6 @@ describe("KernelStructuredSettlementPlanner", () => {
         ...runtime,
         correction,
         first.result,
-        first.decision,
         second.result,
         fanoutSettlement.decision,
       ],
@@ -1323,6 +1325,144 @@ describe("KernelStructuredSettlementPlanner", () => {
       validation.result.id,
       remediation.decision.id,
     ].sort());
+  });
+
+  it.each([
+    ["uniform", ["success", "success", "success"]],
+    ["divergent", ["success", "failure", "success"]],
+  ] as const)("produces byte-identical %s fan-in decisions and successors in opposite settlement orders", async (
+    _label,
+    outcomes,
+  ) => {
+    const runtime = [runtimeDelivery("create"), runtimeDelivery("start")];
+    const boundary: AttemptCheckpoint = {
+      schema: ATTEMPT_CHECKPOINT_SCHEMA,
+      id: "checkpoint-opposite-order-boundary",
+      pipeline_run_id: "run-1",
+      attempt_id: "attempt-integrate-opposite-order",
+      request_hash: "f".repeat(64),
+      definition_bundle_hash: DEFINITIONS.manifest.definition_bundle_hash,
+      input_subject: SOURCE,
+      output_subject: INTEGRATED,
+      native_session_id: null,
+      payload_schema: "openthrottle.git-checkpoint-bundle/v1",
+      payload: { inline: { exact: true } },
+      captured_at: NOW,
+    };
+    const personaStage = stage("persona_review");
+    if (personaStage.kind !== "agent") throw new Error("persona stage is not an agent");
+    const members = outcomes.map((outcome, memberIndex) => {
+      const resultCreatedAt = `2026-08-20T12:0${memberIndex}:00.000Z`;
+      const correction = {
+        ...correctionEvidence(`opposite-${memberIndex}`),
+        created_at: memberIndex === 1 ? "2026-08-20T12:05:00.000Z" : NOW,
+      };
+      const request = requestInputs({ records: runtime, checkpoints: [boundary] });
+      const pending = pendingAttempt({
+        id: `attempt-opposite-${memberIndex}`,
+        stage_id: "persona_review",
+        scope: {
+          kind: "fanout_member",
+          stage_id: "persona_review",
+          parent_attempt_id: "attempt-selector-opposite",
+          fanout_id: "selection.personas",
+          member_id: personaStage.skills[memberIndex]!,
+          member_index: memberIndex,
+        },
+        input_subject: INTEGRATED,
+        request,
+      });
+      const evaluated = {
+        evaluator: "core/review-outcome@1",
+        outcome,
+        reason: outcome === "failure" ? "blocking_review_failure" : "validated_semantic_result",
+      };
+      return {
+        correction,
+        request,
+        current: completedAttempt({
+          pending,
+          output_subject: null,
+          request,
+          evaluated,
+          additional_input_records: [correction],
+          result_created_at: resultCreatedAt,
+        }),
+        settled: completedAttempt({
+          pending,
+          output_subject: null,
+          request,
+          evaluated,
+          additional_input_records: [correction],
+          result_created_at: resultCreatedAt,
+          settled: true,
+        }),
+      };
+    });
+
+    const settleLast = async (currentIndex: number, plannerNow: string) => {
+      const store = new PlanningStore();
+      for (const member of members) {
+        store.requests.set(member.current.attempt.id, member.request);
+      }
+      store.settled = members
+        .filter((_, index) => index !== currentIndex)
+        .reverse()
+        .map(({ settled }) => settled.evidence);
+      const current = members[currentIndex]!.current;
+      const prior = members.filter((_, index) => index !== currentIndex);
+      const planner = new KernelStructuredSettlementPlanner({ store, now: () => plannerNow });
+      return planner.plan(ordinaryInput({
+        attempt: current.attempt,
+        checkpoint: current.checkpoint,
+        result: current.result,
+        view: view({
+          attempts: members.map((member, index) =>
+            index === currentIndex ? member.current.attempt : member.settled.attempt),
+          current: current.attempt,
+          completed: prior.map(({ settled }) => frontierMemberKey(settled.attempt)),
+          current_subject: INTEGRATED,
+        }),
+        outcome: outcomes[currentIndex],
+        evaluator: "core/review-outcome@1",
+        reason: outcomes[currentIndex] === "failure"
+          ? "blocking_review_failure"
+          : "validated_semantic_result",
+        additional_input_records: [members[currentIndex]!.correction],
+      }));
+    };
+
+    const firstMemberLast = await settleLast(0, "2026-08-20T13:00:00.000Z");
+    const lastMemberLast = await settleLast(2, "2026-08-20T14:00:00.000Z");
+    expect(canonicalJson(firstMemberLast.decision)).toBe(canonicalJson(lastMemberLast.decision));
+    expect(firstMemberLast.decision.created_at).toBe("2026-08-20T12:05:00.000Z");
+    expect(firstMemberLast.input_records).toEqual(lastMemberLast.input_records);
+    expect(firstMemberLast.next_attempts).toEqual(lastMemberLast.next_attempts);
+    expect(firstMemberLast.next_attempts[0]!.request_hash).toBe(
+      lastMemberLast.next_attempts[0]!.request_hash,
+    );
+    expect(firstMemberLast.checkpoints).toEqual(lastMemberLast.checkpoints);
+    expect(firstMemberLast.next_dependencies).toEqual(lastMemberLast.next_dependencies);
+    const correctionIds = members.map(({ correction }) => correction.id);
+    expect(firstMemberLast.decision.input_record_ids).toEqual(expect.arrayContaining(correctionIds));
+    expect(firstMemberLast.next_attempts).toHaveLength(1);
+    expect(firstMemberLast.next_attempts[0]!.context_record_ids).toEqual(
+      expect.arrayContaining(correctionIds),
+    );
+    if (outcomes.some((outcome) => outcome === "failure")) {
+      expect(firstMemberLast.outcome).toBe("failure");
+      expect(firstMemberLast.next_attempts[0]!.scope).toEqual({
+        kind: "stage",
+        stage_id: "ot_runtime_stop_failed",
+      });
+    } else {
+      expect(firstMemberLast.outcome).toBe("success");
+      expect(firstMemberLast.next_attempts[0]!.scope).toEqual({
+        kind: "stage",
+        stage_id: "validate_review_findings",
+      });
+      expect(firstMemberLast.next_attempts[0]!.context_checkpoint_ids).toEqual([boundary.id]);
+    }
   });
 
   it("anchors a divergent persona-review failure stop to records persisted by its settlement", async () => {
@@ -1421,7 +1561,6 @@ describe("KernelStructuredSettlementPlanner", () => {
       ...runtime.slice(0, 2).map(({ id }) => id),
       correction.id,
       first.result.id,
-      first.decision.id,
       second.result.id,
       settlement.decision.id,
     ].sort());
@@ -1488,7 +1627,6 @@ describe("KernelStructuredSettlementPlanner", () => {
     expect(settlement.next_attempts[0]!.context_record_ids).toEqual([
       ...runtime.slice(0, 2).map(({ id }) => id),
       first.result.id,
-      first.decision.id,
       second.result.id,
       settlement.decision.id,
     ].sort());
