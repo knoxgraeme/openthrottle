@@ -341,12 +341,20 @@ for name in edit inspect inspect-codex command; do
 done
 
 run_action() {
-  local name="$1" stub_path="${2:-/tmp/stub}"
+  local name="$1" stub_path="${2:-/tmp/stub}" capture_runner_logs="${3:-false}"
+  local command=(/opt/openthrottle/entrypoint.sh)
+  if [ "$capture_runner_logs" = "true" ]; then
+    command=(sh -c '/opt/openthrottle/entrypoint.sh >"$OT_ACTION_RUNNER_STDOUT_FILE" 2>"$OT_ACTION_RUNNER_STDERR_FILE"')
+  fi
   docker exec \
     -e "PATH=${stub_path}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     -e "OT_ACTION_REQUEST_FILE=/requests/${name}.json" \
     -e "OT_ACTION_RESULT_FILE=/transport/${name}/result.json" \
     -e "OT_ACTION_SESSION_FILE=/transport/${name}/session.json" \
+    -e "OT_ACTION_FORENSICS_FILE=/transport/${name}/forensics.json" \
+    -e "OT_ACTION_RUNNER_STDOUT_FILE=/transport/${name}/runner.stdout.log" \
+    -e "OT_ACTION_RUNNER_STDERR_FILE=/transport/${name}/runner.stderr.log" \
+    -e "OT_ACTION_WORK_RETRY_ORDINAL=0" \
     -e "OT_LEASE_GENERATION_FENCE_FILE=/runtime/fences/${name}.json" \
     -e "OT_LEASE_GENERATION_LOCK_FILE=/runtime/fences/${name}.lock" \
     -e "GITHUB_TOKEN=ambient-github-token" \
@@ -357,7 +365,7 @@ run_action() {
     -e "GIT_ASKPASS=/tmp/ambient-git-askpass" \
     -e "GIT_SSH_COMMAND=ssh -i /tmp/ambient-git-key" \
     -e "SSH_ASKPASS=/tmp/ambient-ssh-askpass" \
-    "$CONTAINER" /opt/openthrottle/entrypoint.sh
+    "$CONTAINER" "${command[@]}"
 }
 
 # A traversable executor-source parent must fail before the runner can create
@@ -371,13 +379,51 @@ docker exec "$CONTAINER" sh -c '
   chmod 0755 /var/lib/openthrottle/repository-source
 '
 INVALID_SOURCE_LOG="$SMOKE_DIR/invalid-source.log"
-if run_action invalid-source >"$INVALID_SOURCE_LOG" 2>&1; then
+if run_action invalid-source /tmp/stub true; then
   echo "entrypoint accepted a traversable repository-source parent" >&2
   exit 42
 fi
+docker exec "$CONTAINER" cat /transport/invalid-source/runner.stderr.log >"$INVALID_SOURCE_LOG"
 grep -F 'repository source parent must be root:root mode 0700' "$INVALID_SOURCE_LOG" >/dev/null
 docker exec "$CONTAINER" test ! -e /transport/invalid-source/session.json
 docker exec "$CONTAINER" test ! -e /transport/invalid-source/result.json
+FATAL_FORENSICS_DESCRIPTOR="$(docker exec "$CONTAINER" cat /transport/invalid-source/forensics.json)"
+printf '%s' "$FATAL_FORENSICS_DESCRIPTOR" | jq -e '
+  .schema == "openthrottle.evidence-artifact-descriptor/v1" and
+  .media_type == "application/json" and
+  .payload_schema == "openthrottle.attempt-forensics/v1" and
+  (.sha256 | test("^[a-f0-9]{64}$")) and .bytes > 0
+' >/dev/null
+FATAL_FORENSICS_FILE="$(printf '%s' "$FATAL_FORENSICS_DESCRIPTOR" | jq -r '.file')"
+FATAL_FORENSICS="$(docker exec "$CONTAINER" cat "/transport/invalid-source/$FATAL_FORENSICS_FILE")"
+FATAL_FORENSICS_EXPECTED_SHA="$(printf '%s' "$FATAL_FORENSICS_DESCRIPTOR" | jq -r '.sha256')"
+FATAL_FORENSICS_EXPECTED_BYTES="$(printf '%s' "$FATAL_FORENSICS_DESCRIPTOR" | jq -r '.bytes')"
+FATAL_FORENSICS_ACTUAL_SHA="$(
+  docker exec "$CONTAINER" sha256sum "/transport/invalid-source/$FATAL_FORENSICS_FILE" |
+    awk '{print $1}'
+)"
+FATAL_FORENSICS_ACTUAL_BYTES="$(
+  docker exec "$CONTAINER" wc -c "/transport/invalid-source/$FATAL_FORENSICS_FILE" |
+    awk '{print $1}'
+)"
+[ "$FATAL_FORENSICS_ACTUAL_SHA" = "$FATAL_FORENSICS_EXPECTED_SHA" ]
+[ "$FATAL_FORENSICS_ACTUAL_BYTES" = "$FATAL_FORENSICS_EXPECTED_BYTES" ]
+printf '%s' "$FATAL_FORENSICS" | jq -e '
+  .schema == "openthrottle.attempt-forensics/v1" and
+  .pipeline_run_id == "smoke-run" and
+  .attempt_id == "attempt-edit" and
+  .request_hash == ("a" * 64) and
+  .definition_bundle_hash == ("b" * 64) and
+  .lease_id == "lease-attempt-edit" and
+  .work_retry_ordinal == 0 and
+  .exit_code != 0 and
+  .result_path_state.state == "missing" and
+  .session_event_state.state == "missing" and
+  .workspace_git_status.state == "missing" and
+  (.runner_stderr_tail | contains("repository source parent must be root:root mode 0700")) and
+  (.operational_signature | test("^[a-f0-9]{64}$")) and
+  (.observed_at | test("Z$"))
+' >/dev/null
 docker exec "$CONTAINER" chmod 0700 /var/lib/openthrottle/repository-source
 
 # Daytona sessions inherit persistent sandbox environment; reject mixed
@@ -462,6 +508,12 @@ printf '%s' "$COMMAND_RESULT" | jq -e '
   .outcome.result.command_id == "git-metadata" and
   .outcome.checkpoint.output_subject == null
 ' >/dev/null
+
+# The same EXIT trap runs after a normal action, but a fully sealed runtime
+# result is authoritative and must suppress any redundant forensic artifact.
+for name in edit inspect inspect-codex command; do
+  docker exec "$CONTAINER" test ! -e "/transport/${name}/forensics.json"
+done
 
 for removed in execute-stage.mjs execute-loop.mjs execute-child-action.mjs; do
   docker exec "$CONTAINER" test ! -e "/opt/openthrottle/runner/$removed"

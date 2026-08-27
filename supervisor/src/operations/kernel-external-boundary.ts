@@ -717,7 +717,9 @@ export class KernelExternalBoundaryCoordinator {
           });
           const retryRecords = [...new Map([
             ...[...failedInputs.context.records.values()]
-              .filter((candidate) => !isDaytonaRuntimeDelivery(candidate)),
+              .filter((candidate) =>
+                !isDaytonaRuntimeDelivery(candidate) &&
+                sandboxRecoveryAttemptId(candidate) === null),
             recoveryRecord!,
             result,
             decision,
@@ -986,6 +988,8 @@ export class KernelExternalBoundaryCoordinator {
       resource_disposition: {
         kind: "cleanup",
         runtime_delivery_record_ids: runtimeDeliveries.map(({ id }) => id).sort(),
+        diagnostic_record_ids: [],
+        new_diagnostic_record_ids: [],
         cleanup_attempt: cleanupAttempt,
       },
     }, input.claim);

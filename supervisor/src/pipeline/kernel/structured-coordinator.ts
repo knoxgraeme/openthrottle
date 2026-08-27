@@ -86,6 +86,8 @@ export interface StructuredSettledAttemptEvidence {
 export interface StructuredAcceptedUnitEvidence {
   member_id: string;
   acceptance: StructuredSettledAttemptEvidence;
+  /** Exact materialized records cited by the acceptance DecisionRecord. */
+  decision_input_records: readonly ExecutionRecord[];
   candidate_checkpoint: AttemptCheckpoint;
 }
 
@@ -365,7 +367,25 @@ function assertAcceptedUnitEvidence(
     attempt.status !== "settled" ||
     attempt.output_subject !== null
   ) throw new Error(`accepted unit ${source.member_id} has no settled inspect acceptance`);
-  assertExactResultIdentity({ attempt, result, decision });
+  assertExactResultIdentity({
+    attempt,
+    result,
+    decision,
+    allow_additional_decision_inputs: true,
+  });
+  const decisionInputIds = source.decision_input_records
+    .map(({ id }) => id)
+    .sort(compareCodeUnits);
+  const citedResult = source.decision_input_records.find(({ id }) => id === result.id);
+  if (
+    new Set(decisionInputIds).size !== decisionInputIds.length ||
+    canonicalJson(decisionInputIds) !==
+      canonicalJson([...decision.input_record_ids].sort(compareCodeUnits)) ||
+    source.decision_input_records.some(
+      (record) => record.pipeline_run_id !== expectedRunId,
+    ) ||
+    citedResult === undefined || canonicalJson(citedResult) !== canonicalJson(result)
+  ) throw new Error(`accepted unit ${source.member_id} DecisionRecord inputs are not exact`);
   const outcome = structuredDecisionOutcome(decision);
   if (outcome !== "success" && outcome !== "no_change") {
     throw new Error(`accepted unit ${source.member_id} has no accepting DecisionRecord`);
@@ -760,6 +780,9 @@ export function createStructuredIntegrationAttempt(input: {
           base_records: [
             input.source.acceptance.decision,
             input.source.acceptance.result,
+            ...input.source.decision_input_records.filter(
+              ({ id }) => id !== input.source.acceptance.result.id,
+            ),
             ...exactRuntimeDeliveries(input.source.acceptance.action_inputs.context.records),
           ],
           inherited_records: input.source.acceptance.action_inputs.context.records,
@@ -782,6 +805,7 @@ export function createBlockingReviewRemediationAttempt(input: {
   decision: DecisionRecord;
   checkpoints: readonly AttemptCheckpoint[];
   runtime_delivery_records: readonly ExecutionRecord[];
+  additional_context_records?: readonly ExecutionRecord[];
   bundle: DefinitionBundle;
   manifest: CompiledPipelineManifest;
 }): KernelAttempt {
@@ -797,7 +821,15 @@ export function createBlockingReviewRemediationAttempt(input: {
   if (input.input_subject !== input.attempt.input_subject) {
     throw new Error("remediation input subject must equal the reviewed input subject");
   }
-  assertExactResultIdentity(input);
+  assertExactResultIdentity({
+    ...input,
+    allow_additional_decision_inputs: true,
+  });
+  if ((input.additional_context_records ?? []).some(
+    ({ id }) => !input.decision.input_record_ids.includes(id),
+  )) {
+    throw new Error("review remediation context is not authorized by its DecisionRecord");
+  }
   const payload = decisionPayload(input.decision);
   if (
     payload.evaluator !== "core/review-outcome@1" ||
@@ -861,6 +893,7 @@ export function createBlockingReviewRemediationAttempt(input: {
           pipeline_run_id: input.pipeline_run_id,
           base_records: [input.decision, input.result, ...runtimeDeliveries],
           inherited_records: input.runtime_delivery_records,
+          additional_records: input.additional_context_records,
         }),
         checkpoints,
       },

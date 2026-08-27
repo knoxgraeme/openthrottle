@@ -478,6 +478,7 @@ function acceptedUnitEvidence(
   };
   return {
     member_id: memberId,
+    decision_input_records: [result],
     acceptance: {
       attempt: {
         ...pending,
@@ -1144,6 +1145,16 @@ describe("structured kernel coordinator", () => {
     const { bundle, manifest } = definitions();
     const review = reviewEvidence();
     const runtimeDeliveryRecords = [runtimeCreateDelivery(), runtimeStartDelivery()];
+    const correctionEvidence: DecisionRecord = {
+      ...review.decision,
+      id: "decision-invalid-result-evidence",
+      reducer: "core/invalid-result-evidence@1",
+      input_record_ids: [],
+    };
+    const decision: DecisionRecord = {
+      ...review.decision,
+      input_record_ids: [...review.decision.input_record_ids, correctionEvidence.id].sort(),
+    };
     const remediation = createBlockingReviewRemediationAttempt({
       pipeline_run_id: "run-1",
       stage_id: "remediation",
@@ -1151,7 +1162,9 @@ describe("structured kernel coordinator", () => {
       input_subject: CURRENT_SUBJECT,
       task_prompt: "Resolve the blocking security finding.",
       ...review,
+      decision,
       runtime_delivery_records: runtimeDeliveryRecords,
+      additional_context_records: [correctionEvidence],
       bundle,
       manifest,
     });
@@ -1159,6 +1172,7 @@ describe("structured kernel coordinator", () => {
     expect(remediation).toMatchObject({
       repository_authority: "edit",
       context_record_ids: [
+        correctionEvidence.id,
         "decision-review",
         "delivery-runtime-create",
         "delivery-runtime-start",

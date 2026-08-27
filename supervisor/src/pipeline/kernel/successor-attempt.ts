@@ -147,6 +147,7 @@ export function deriveKernelTerminalCleanupAttempt(input: {
   outcome: PipelineTerminalOutcome;
   task_prompt: string;
   runtime_delivery_records: readonly ExecutionRecord[];
+  diagnostic_records?: readonly ExecutionRecord[];
   recovery_frontier_records?: readonly ExecutionRecord[];
   recovery_trigger_records?: readonly ExecutionRecord[];
 }): KernelAttempt {
@@ -163,6 +164,7 @@ export function deriveKernelTerminalCleanupAttempt(input: {
     input.decision,
     ...(input.recovery_frontier_records ?? []),
     ...(input.recovery_trigger_records ?? []),
+    ...(input.diagnostic_records ?? []),
     ...deliveries,
   ]
     .sort((left, right) => compareCodeUnits(left.id, right.id));

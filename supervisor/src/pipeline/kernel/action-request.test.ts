@@ -125,6 +125,7 @@ describe("buildKernelResultCorrectionRequest", () => {
       pending_result: {
         candidate_hash: "e".repeat(64),
         diagnostics: [{ path: "/payload/summary", detail: "must be a string" }],
+        invalid_result_evidence: null,
       },
     };
     const checkpoint: AttemptCheckpoint = {

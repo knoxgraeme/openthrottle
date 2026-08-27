@@ -1,12 +1,19 @@
 import { Buffer } from "node:buffer";
 import {
   ATTEMPT_CHECKPOINT_SCHEMA,
+  INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
   NATIVE_SESSION_ID,
   canonicalJson,
+  compareCodeUnits,
   validateAndNormalizeResultCandidate,
   validateAttemptCheckpoint,
+  validateEvidenceArtifactDescriptor,
+  validateInvalidResultEvidencePayload,
   type AttemptCheckpoint,
+  type AttemptEvidencePayloadSchema,
   type BlobPointer,
+  type EvidenceArtifactDescriptor,
+  type InvalidResultEvidencePayload,
   type SemanticResultSchemaContract,
 } from "@openthrottle/contracts";
 import {
@@ -17,6 +24,7 @@ import {
   KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA,
   STAGED_SEMANTIC_CANDIDATE_SCHEMA,
   type KernelResultCorrectionRequest,
+  type KernelMaterializedArtifact,
   type KernelRuntimeOutcome,
   type KernelWorkActionRequest,
 } from "./kernel-contracts.js";
@@ -52,7 +60,9 @@ export interface KernelCheckpointArtifactDescriptor {
 }
 
 export interface KernelCheckpointArtifactPort {
-  materialize(input: KernelCheckpointArtifactDescriptor): Promise<BlobPointer>;
+  materialize(
+    input: KernelCheckpointArtifactDescriptor | EvidenceArtifactDescriptor,
+  ): Promise<KernelMaterializedArtifact>;
 }
 
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -215,6 +225,33 @@ function artifactDescriptor(value: unknown, payloadSchema: string): KernelCheckp
   };
 }
 
+async function evidencePointer(
+  value: unknown,
+  payloadSchema: AttemptEvidencePayloadSchema,
+  artifacts: KernelCheckpointArtifactPort,
+): Promise<{ blob: BlobPointer; payload: InvalidResultEvidencePayload }> {
+  const descriptor = validateEvidenceArtifactDescriptor(value, {
+    source: "runtime_result.outcome.invalid_result_evidence",
+    payloadSchema,
+  }).value;
+  const materialized = await artifacts.materialize(descriptor);
+  if (!("blob" in materialized) || !("evidence_payload" in materialized)) {
+    throw new Error("materialized evidence artifact omitted its verified payload");
+  }
+  const pointer = materialized.blob;
+  if (
+    pointer.digest !== descriptor.sha256 || pointer.bytes !== descriptor.bytes ||
+    pointer.encoding !== "utf-8" || pointer.media_type !== descriptor.media_type ||
+    pointer.payload_schema !== descriptor.payload_schema
+  ) throw new Error("materialized evidence artifact changed its sealed descriptor");
+  return {
+    blob: pointer,
+    payload: validateInvalidResultEvidencePayload(materialized.evidence_payload, {
+      source: "runtime_result.outcome.invalid_result_evidence.payload",
+    }).value,
+  };
+}
+
 async function checkpoint(
   value: unknown,
   request: KernelRequest,
@@ -270,6 +307,9 @@ async function checkpoint(
     throw new Error("checkpoint output subject does not match its repository authority");
   }
   const pointer = await artifacts.materialize(descriptor);
+  if ("blob" in pointer) {
+    throw new Error("materialized checkpoint artifact returned evidence payload metadata");
+  }
   if (
     pointer.digest !== descriptor.sha256 || pointer.bytes !== descriptor.bytes ||
     pointer.encoding !== "binary" || pointer.media_type !== descriptor.media_type ||
@@ -300,7 +340,8 @@ function diagnostics(value: unknown): { path: string; detail: string }[] {
       path: string(item.path, `runtime diagnostics[${index}].path`, 500),
       detail: string(item.detail, `runtime diagnostics[${index}].detail`, 1_500),
     };
-  });
+  }).sort((left, right) =>
+    compareCodeUnits(left.path, right.path) || compareCodeUnits(left.detail, right.detail));
 }
 
 function semanticSchema(request: KernelRequest): SemanticResultSchemaContract {
@@ -345,16 +386,35 @@ export async function parseKernelRuntimeResult(input: {
   if (outcome.state === "result_pending") {
     exactKeys(outcome, [
       "state", "checkpoint", "candidate_hash", "diagnostics", "correction_deadline",
+      "invalid_result_evidence",
     ], "kernel runtime outcome");
     if (outcome.candidate_hash !== null && (
       typeof outcome.candidate_hash !== "string" || !DIGEST.test(outcome.candidate_hash)
     )) throw new Error("pending candidate hash is invalid");
+    const candidateHash = outcome.candidate_hash as string | null;
+    const pendingDiagnostics = diagnostics(outcome.diagnostics);
+    const evidence = await evidencePointer(
+      outcome.invalid_result_evidence,
+      INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
+      input.artifacts,
+    );
+    if (
+      evidence.payload.phase !== input.request.phase ||
+      evidence.payload.candidate_hash !== candidateHash ||
+      canonicalJson(evidence.payload.diagnostics) !== canonicalJson(pendingDiagnostics)
+    ) {
+      throw new Error("invalid result evidence changed its runtime result semantics");
+    }
     return {
       state: "result_pending",
       checkpoint: await checkpoint(outcome.checkpoint, input.request, input.artifacts),
-      candidate_hash: outcome.candidate_hash as string | null,
-      diagnostics: diagnostics(outcome.diagnostics),
+      candidate_hash: candidateHash,
+      diagnostics: pendingDiagnostics,
       correction_deadline: timestamp(outcome.correction_deadline, "correction deadline"),
+      invalid_result_evidence: {
+        blob: evidence.blob,
+        observed_at: evidence.payload.observed_at,
+      },
     };
   }
   if (outcome.state === "work_failed") {

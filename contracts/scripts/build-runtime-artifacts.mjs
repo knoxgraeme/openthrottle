@@ -63,12 +63,16 @@ for (const file of [
   "validation.js",
   "execution-plan-v2.js",
   "result-candidate.js",
+  "attempt-evidence.js",
 ]) {
   artifacts.set(`runtime/${file}`, readFileSync(join(contractsRoot, "dist", file)));
 }
 artifacts.set(
   "runtime/index.js",
-  Buffer.from('export * from "./result-candidate.js";\n', "utf8"),
+  Buffer.from(
+    'export * from "./result-candidate.js";\nexport * from "./attempt-evidence.js";\n',
+    "utf8",
+  ),
 );
 
 function authoredEvalDefinitions() {

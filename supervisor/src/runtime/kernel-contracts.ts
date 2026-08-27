@@ -1,5 +1,7 @@
 import type {
+  AttemptEvidencePayload,
   AttemptCheckpoint,
+  BlobPointer,
   CompiledPipelineStage,
   DefinitionBundleEntry,
   ExecutionRecord,
@@ -148,6 +150,21 @@ export type KernelVerifiedActionResult =
   | { kind: "semantic"; candidate: StagedSemanticCandidate }
   | KernelCommandResult;
 
+export interface KernelAttemptForensicsEvidence {
+  blob: BlobPointer;
+  operational_signature: string;
+  observed_at: string;
+}
+
+export interface KernelInvalidResultEvidence {
+  blob: BlobPointer;
+  observed_at: string;
+}
+
+export type KernelMaterializedArtifact =
+  | BlobPointer
+  | { blob: BlobPointer; evidence_payload: AttemptEvidencePayload };
+
 export type KernelRuntimeOutcome =
   | {
     state: "work_complete";
@@ -160,6 +177,7 @@ export type KernelRuntimeOutcome =
     candidate_hash: string | null;
     diagnostics: readonly { path: string; detail: string }[];
     correction_deadline: string;
+    invalid_result_evidence: KernelInvalidResultEvidence;
   }
   | {
     state: "work_failed";
@@ -167,6 +185,7 @@ export type KernelRuntimeOutcome =
     /** The owning sandbox is poisoned and must not execute this Attempt again. */
     sandbox_fatal?: boolean;
     reason: string;
+    forensics?: KernelAttemptForensicsEvidence;
   }
   | {
     state: "needs_human";
@@ -179,6 +198,8 @@ export type KernelRuntimeOutcome =
 export interface KernelRuntimeLeaseCallbacks {
   /** Private live lease fence; this is deliberately absent from the public action request wire. */
   lease_generation: number;
+  /** Exact Attempt retry ordinal for launch-scoped forensic evidence. */
+  work_retry_ordinal: number;
   /**
    * The adapter throttles renewal to this interval while provider work is
    * outstanding. A rejected renewal is an exact-fence loss and must abort

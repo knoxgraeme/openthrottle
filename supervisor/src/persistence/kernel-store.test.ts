@@ -5,20 +5,25 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ATTEMPT_CHECKPOINT_SCHEMA,
+  ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
   COMPILED_PIPELINE_MANIFEST_SCHEMA,
   EFFECT_INTENT_SCHEMA,
   EXECUTION_RECORD_SCHEMA,
   canonicalJson,
+  digestNormalized,
   expandCompiledRuntimeLifecycle,
   runtimeStopStageId,
   digestCanonicalJson,
   type AttemptCheckpoint,
+  type AttemptForensicsPayload,
+  type BlobPointer,
   type CompiledPipelineManifest,
   type DecisionRecord,
   type DeliveryRecord,
   type EffectIntent,
   type ExecutionRecordPayloadContract,
   type ExecutionRecordPayloadRegistry,
+  type InvalidResultEvidencePayload,
   type JsonValue,
   type ResultRecord,
 } from "@openthrottle/contracts";
@@ -39,6 +44,10 @@ import {
   ordinaryKernelPayloadSchemas,
 } from "../pipeline/kernel/evaluator-registry.js";
 import {
+  createAttemptForensicsRecord,
+  createInvalidResultEvidenceRecord,
+} from "../pipeline/kernel/attempt-evidence.js";
+import {
   KERNEL_ATTEMPT_SCHEMA,
   KERNEL_RUN_SCHEMA,
   type AtomicTransitionBundle,
@@ -50,6 +59,8 @@ import { VolumeBlobStore } from "./blob-store.js";
 import {
   createFreshEpochBootstrap,
   initializeFreshEpochDatabase,
+  openFreshEpochDatabase,
+  type FreshEpochIdentity,
 } from "./epoch-database.js";
 import {
   SqliteKernelStore,
@@ -69,6 +80,9 @@ const payloadSchemas: ExecutionRecordPayloadRegistry = new Map<string, Execution
   ["decision/v1", { kind: "decision", parseInline: (value: unknown): unknown => value }],
   ["delivery/v1", { kind: "delivery", parseInline: (value: unknown): unknown => value }],
   ["openthrottle.effect-delivery/v1", { kind: "delivery", parseInline: (value: unknown): unknown => value }],
+  ["openthrottle.invalid-result-evidence/v1", {
+    kind: "decision", parseInline: (value: unknown): unknown => value,
+  }],
 ]);
 
 function temporaryDirectory(): string {
@@ -170,7 +184,9 @@ function setup(
   executionWidth = 1,
 ): {
   db: Database.Database;
+  database_path: string;
   blobs: VolumeBlobStore;
+  expected_identity: FreshEpochIdentity;
   store: SqliteKernelStore;
   admission: PipelineAdmissionInput;
   pipelineManifest: CompiledPipelineManifest;
@@ -193,11 +209,19 @@ function setup(
       runtime_snapshot: OPERATOR_EFFECT_REJECTION_RUNTIME_SNAPSHOT,
     }],
   });
-  const db = initializeFreshEpochDatabase({
-    database_path: join(directory, "epoch.sqlite"),
-    blob_store: blobs,
+  const databasePath = join(directory, "epoch.sqlite");
+  const expectedIdentity: FreshEpochIdentity = {
     release_id: "release-a",
     runtime_capability_digest: "c".repeat(64),
+    blob_store_id: blobs.store_id,
+    blob_marker_checksum: blobs.marker_checksum,
+    bootstrap_checksum: bootstrap.checksum,
+  };
+  const db = initializeFreshEpochDatabase({
+    database_path: databasePath,
+    blob_store: blobs,
+    release_id: expectedIdentity.release_id,
+    runtime_capability_digest: expectedIdentity.runtime_capability_digest,
     bootstrap,
     now,
   });
@@ -231,7 +255,9 @@ function setup(
   });
   return {
     db,
+    database_path: databasePath,
     blobs,
+    expected_identity: expectedIdentity,
     store,
     pipelineManifest,
     admission: {
@@ -271,6 +297,29 @@ function setup(
       definition_bundle: definitionBundle,
       initial_attempts: [initialAttempt],
     },
+  };
+}
+
+function reopenStore(context: ReturnType<typeof setup>): {
+  db: Database.Database;
+  store: SqliteKernelStore;
+} {
+  const blobs = VolumeBlobStore.open(context.blobs.root, context.blobs.store_id);
+  const db = openFreshEpochDatabase({
+    database_path: context.database_path,
+    blob_store: blobs,
+    expected_identity: context.expected_identity,
+  });
+  return {
+    db,
+    store: new SqliteKernelStore({
+      db,
+      blob_store: blobs,
+      manifest_resolver: { resolve: () => context.pipelineManifest },
+      payload_schemas: payloadSchemas,
+      execution_policy: EXECUTION_POLICY,
+      now: () => NOW,
+    }),
   };
 }
 
@@ -691,6 +740,134 @@ async function claimAndStart(setupResult: ReturnType<typeof setup>): Promise<{
   return { attempt: sessionBound.current_attempt!, run: sessionBound.run };
 }
 
+function putInvalidResultEvidence(
+  blobs: VolumeBlobStore,
+  overrides: Partial<InvalidResultEvidencePayload> = {},
+): BlobPointer {
+  const payload: InvalidResultEvidencePayload = {
+    schema: "openthrottle.invalid-result-evidence/v1",
+    pipeline_run_id: "run-1",
+    attempt_id: "attempt-1",
+    request_hash: sha("a"),
+    definition_bundle_hash: digestNormalized('{"bundle":"test"}'),
+    phase: "work",
+    candidate_hash: sha("e"),
+    rejected_candidate: { raw: "{\"outcome\":\"invalid\"}" },
+    diagnostics: [{ path: "/payload", detail: "invalid" }],
+    runner_stdout_tail: "",
+    runner_stderr_tail: "",
+    observed_at: NOW,
+    ...overrides,
+  };
+  return blobs.put({
+    bytes: canonicalJson(payload),
+    encoding: "utf-8",
+    media_type: "application/json",
+    payload_schema: "openthrottle.invalid-result-evidence/v1",
+  }).pointer;
+}
+
+function putAttemptForensics(
+  blobs: VolumeBlobStore,
+  attempt: KernelAttempt,
+  overrides: Partial<AttemptForensicsPayload> = {},
+): {
+  blob: BlobPointer;
+  operational_signature: string;
+  observed_at: string;
+} {
+  if (!attempt.lease?.started) throw new Error("forensics fixture requires a started lease");
+  const payload: AttemptForensicsPayload = {
+    schema: ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
+    pipeline_run_id: attempt.pipeline_run_id,
+    attempt_id: attempt.id,
+    request_hash: attempt.request_hash,
+    definition_bundle_hash: attempt.definition_bundle_hash,
+    lease_id: attempt.lease.id,
+    work_retry_ordinal: attempt.work_retry_ordinal,
+    operational_signature: sha("f"),
+    exit_code: 1,
+    runner_stdout_tail: "",
+    runner_stderr_tail: "silent exit",
+    result_path_state: { state: "missing" },
+    session_event_state: { state: "missing" },
+    workspace_git_status: { state: "present", summary: "", detail: "" },
+    observed_at: NOW,
+    ...overrides,
+  };
+  return {
+    blob: blobs.put({
+      bytes: canonicalJson(payload),
+      encoding: "utf-8",
+      media_type: "application/json",
+      payload_schema: ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
+    }).pointer,
+    operational_signature: payload.operational_signature,
+    observed_at: payload.observed_at,
+  };
+}
+
+async function prepareResultPendingTransition(
+  context: ReturnType<typeof setup>,
+  invalidResultEvidence: BlobPointer,
+): Promise<AtomicTransitionBundle> {
+  const started = await claimAndStart(context);
+  const checkpoint: AttemptCheckpoint = {
+    schema: ATTEMPT_CHECKPOINT_SCHEMA,
+    id: "checkpoint-result-pending",
+    pipeline_run_id: started.attempt.pipeline_run_id,
+    attempt_id: started.attempt.id,
+    request_hash: started.attempt.request_hash,
+    definition_bundle_hash: started.attempt.definition_bundle_hash,
+    input_subject: started.attempt.input_subject,
+    output_subject: subject("2"),
+    native_session_id: started.attempt.native_session_id,
+    payload_schema: "checkpoint/v1",
+    payload: { inline: { complete: true } },
+    captured_at: NOW,
+  };
+  await context.store.applyAtomicTransition(reduceKernelCommand({
+    manifest: context.pipelineManifest,
+    run: started.run,
+    current_attempt: started.attempt,
+    records: new Map(),
+    checkpoints: exactMap(checkpoint),
+    command: {
+      type: "work_complete",
+      command_id: "work-complete-result-pending",
+      attempt_id: started.attempt.id,
+      checkpoint_id: checkpoint.id,
+      verified_output_subject: subject("2"),
+      result_record_id: null,
+    },
+  }));
+  const completed = await context.store.loadExactReductionView({
+    pipeline_run_id: started.attempt.pipeline_run_id,
+    attempt_id: started.attempt.id,
+    record_ids: [],
+    checkpoint_ids: [checkpoint.id],
+  });
+  const evidence = createInvalidResultEvidenceRecord({
+    attempt: completed.current_attempt!,
+    pointer: invalidResultEvidence,
+    created_at: NOW,
+  });
+  return reduceKernelCommand({
+    ...completed,
+    records: exactMap(evidence),
+    command: {
+      type: "result_pending",
+      command_id: "result-pending-with-evidence",
+      attempt_id: started.attempt.id,
+      candidate_hash: sha("e"),
+      diagnostics: [{ path: "/payload", detail: "invalid" }],
+      correction_deadline: "2026-08-20T12:15:00.000Z",
+      invalid_result_evidence: invalidResultEvidence,
+      invalid_result_evidence_record_id: evidence.id,
+    },
+  });
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
@@ -713,6 +890,149 @@ describe("SqliteKernelStore", () => {
       });
       expect(admitted.run.status).toBe("pending");
       expect(Object.keys(admitted.run.active_attempt_versions)).toHaveLength(1);
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("rejects missing invalid-result evidence before initial Attempt admission", () => {
+    const context = setup();
+    try {
+      const invalidResultEvidence = putInvalidResultEvidence(context.blobs);
+      const initialAttempt = attempt({
+        ...context.admission.initial_attempts[0],
+        status: "result_pending",
+        native_session_id: "session-initial-pending",
+        result_correction_deadline: "2026-08-20T12:15:00.000Z",
+        pending_result: {
+          candidate_hash: sha("e"),
+          diagnostics: [{ path: "/payload", detail: "invalid" }],
+          invalid_result_evidence: invalidResultEvidence,
+        },
+      });
+      const admission = {
+        ...context.admission,
+        initial_attempts: [initialAttempt],
+        run: run([initialAttempt], context.admission.run.definition_bundle_hash),
+      };
+      rmSync(context.blobs.objectPath(invalidResultEvidence.digest));
+
+      expect(() => context.store.admitPipelineRun(admission)).toThrow(/object is missing/);
+      for (const table of ["definitions", "work_items", "pipeline_runs", "attempts"]) {
+        expect(context.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: 0 });
+      }
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it.each([
+    ["pipeline run", { pipeline_run_id: "run-other" }],
+    ["Attempt", { attempt_id: "attempt-other" }],
+    ["request", { request_hash: sha("f") }],
+    ["DefinitionBundle", { definition_bundle_hash: sha("f") }],
+    ["candidate", { candidate_hash: sha("f") }],
+  ] as const)("rejects invalid-result evidence with another %s identity", (_label, overrides) => {
+    const context = setup();
+    try {
+      const invalidResultEvidence = putInvalidResultEvidence(context.blobs, overrides);
+      const initialAttempt = attempt({
+        ...context.admission.initial_attempts[0],
+        status: "result_pending",
+        native_session_id: "session-initial-pending",
+        result_correction_deadline: "2026-08-20T12:15:00.000Z",
+        pending_result: {
+          candidate_hash: sha("e"),
+          diagnostics: [{ path: "/payload", detail: "invalid" }],
+          invalid_result_evidence: invalidResultEvidence,
+        },
+      });
+      const admission = {
+        ...context.admission,
+        initial_attempts: [initialAttempt],
+        run: run([initialAttempt], context.admission.run.definition_bundle_hash),
+      };
+
+      expect(() => context.store.admitPipelineRun(admission))
+        .toThrow(/invalid-result evidence changed its sealed identity/);
+      expect(context.db.prepare("SELECT COUNT(*) AS count FROM pipeline_runs").get())
+        .toEqual({ count: 0 });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("persists retry forensics under the stable pre-retry Attempt identity", async () => {
+    const context = setup();
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const started = await claimAndStart(context);
+      const evidence = putAttemptForensics(context.blobs, started.attempt);
+      const record = createAttemptForensicsRecord({ attempt: started.attempt, evidence });
+      const transition = reduceKernelCommand({
+        manifest: context.pipelineManifest,
+        run: started.run,
+        current_attempt: started.attempt,
+        records: exactMap(record),
+        checkpoints: new Map(),
+        command: {
+          type: "retry",
+          command_id: "retry-with-forensics",
+          attempt_id: started.attempt.id,
+          forensics_record_id: record.id,
+        },
+      });
+
+      await expect(context.store.applyAtomicTransition(transition)).resolves.toEqual({
+        disposition: "applied",
+        run_version: started.run.version + 1,
+      });
+      await expect(context.store.loadAttemptForensics({
+        pipeline_run_id: started.run.id,
+        attempt_id: started.attempt.id,
+        work_retry_ordinal: 0,
+      })).resolves.toEqual(expect.objectContaining({
+        record,
+        payload: expect.objectContaining({
+          lease_id: started.attempt.lease!.id,
+          work_retry_ordinal: 0,
+          observed_at: NOW,
+        }),
+      }));
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it.each([
+    ["lease", { lease_id: "lease-other" }],
+    ["retry ordinal", { work_retry_ordinal: 1 }],
+    ["request", { request_hash: sha("f") }],
+  ] as const)("rejects retry forensics with another stable %s identity", async (_label, overrides) => {
+    const context = setup();
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const started = await claimAndStart(context);
+      const evidence = putAttemptForensics(context.blobs, started.attempt, overrides);
+      const record = createAttemptForensicsRecord({ attempt: started.attempt, evidence });
+      const transition = reduceKernelCommand({
+        manifest: context.pipelineManifest,
+        run: started.run,
+        current_attempt: started.attempt,
+        records: exactMap(record),
+        checkpoints: new Map(),
+        command: {
+          type: "retry",
+          command_id: `retry-with-invalid-forensics-${_label}`,
+          attempt_id: started.attempt.id,
+          forensics_record_id: record.id,
+        },
+      });
+
+      await expect(context.store.applyAtomicTransition(transition))
+        .rejects.toThrow(/changed its live Attempt forensics identity/);
+      expect(context.db.prepare("SELECT work_retry_ordinal FROM attempts WHERE id = 'attempt-1'").get())
+        .toEqual({ work_retry_ordinal: 0 });
     } finally {
       context.db.close();
     }
@@ -1914,6 +2234,174 @@ describe("SqliteKernelStore", () => {
     }
   });
 
+  it.each(["missing", "corrupt"] as const)(
+    "rejects %s invalid-result evidence before the result_pending transition commits",
+    async (damage) => {
+      const context = setup();
+      try {
+        context.store.admitPipelineRun(context.admission);
+        const invalidResultEvidence = putInvalidResultEvidence(context.blobs);
+        const transition = await prepareResultPendingTransition(context, invalidResultEvidence);
+        if (damage === "missing") {
+          rmSync(context.blobs.objectPath(invalidResultEvidence.digest));
+        } else {
+          writeFileSync(
+            context.blobs.objectPath(invalidResultEvidence.digest),
+            Buffer.alloc(invalidResultEvidence.bytes, 0x78),
+          );
+        }
+
+        await expect(context.store.applyAtomicTransition(transition))
+          .rejects.toThrow(/failed integrity verification/);
+        expect(context.db.prepare(`
+          SELECT status, version, pending_candidate_hash, pending_diagnostics_json
+          FROM attempts WHERE id = 'attempt-1'
+        `).get()).toEqual({
+          status: "work_complete",
+          version: transition.expected.attempt_versions["attempt-1"],
+          pending_candidate_hash: null,
+          pending_diagnostics_json: null,
+        });
+        expect(context.db.prepare("SELECT version FROM pipeline_runs WHERE id = 'run-1'").get())
+          .toEqual({ version: transition.expected.run_version });
+      } finally {
+        context.db.close();
+      }
+    },
+  );
+
+  it.each([
+    ["encoding", { encoding: "binary" }],
+    ["media type", { media_type: "application/octet-stream" }],
+    ["payload schema", { payload_schema: "openthrottle.attempt-forensics/v1" }],
+  ] as const)("rejects invalid-result evidence with noncanonical pointer %s", async (_label, override) => {
+    const context = setup();
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const validPointer = putInvalidResultEvidence(context.blobs);
+      const invalidPointer: BlobPointer = { ...validPointer, ...override };
+      const transition = await prepareResultPendingTransition(context, validPointer);
+      const { content_hash: _contentHash, ...content } = transition;
+      const invalidContent: AtomicTransitionBundleContent = {
+        ...content,
+        attempt_writes: content.attempt_writes.map((write) => write.kind === "terminal"
+          ? write
+          : {
+            ...write,
+            attempt: {
+              ...write.attempt,
+              pending_result: {
+                ...write.attempt.pending_result!,
+                invalid_result_evidence: invalidPointer,
+              },
+            },
+          }),
+      };
+      const invalidTransition: AtomicTransitionBundle = {
+        ...invalidContent,
+        content_hash: digestCanonicalJson(invalidContent),
+      };
+
+      await expect(context.store.applyAtomicTransition(invalidTransition))
+        .rejects.toThrow(/invalid-result evidence pointer is not canonical JSON/);
+      expect(context.db.prepare(`
+        SELECT status, pending_candidate_hash, pending_diagnostics_json
+        FROM attempts WHERE id = 'attempt-1'
+      `).get()).toEqual({
+        status: "work_complete",
+        pending_candidate_hash: null,
+        pending_diagnostics_json: null,
+      });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("blocks active Attempt loads after restart when invalid-result evidence becomes corrupt", async () => {
+    const context = setup();
+    let originalClosed = false;
+    let reopenedDb: Database.Database | undefined;
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const invalidResultEvidence = putInvalidResultEvidence(context.blobs);
+      const transition = await prepareResultPendingTransition(context, invalidResultEvidence);
+      await context.store.applyAtomicTransition(transition);
+      writeFileSync(
+        context.blobs.objectPath(invalidResultEvidence.digest),
+        Buffer.alloc(invalidResultEvidence.bytes, 0x78),
+      );
+      context.db.close();
+      originalClosed = true;
+      const reopened = reopenStore(context);
+      reopenedDb = reopened.db;
+
+      await expect(reopened.store.loadExactReductionView({
+        pipeline_run_id: "run-1",
+        attempt_id: "attempt-1",
+        record_ids: [],
+        checkpoint_ids: [],
+      })).rejects.toMatchObject({
+        name: "KernelIntegrityError",
+        code: "KERNEL_BLOB_INTEGRITY",
+        evidence: {
+          pipeline_run_id: "run-1",
+          owner_kind: "attempt",
+          owner_id: "attempt-1",
+          digest: invalidResultEvidence.digest,
+          classification: "active_blocking",
+          operator_action: "restore_verified_blob_or_abandon_active_run",
+          detail: "sha256 digest mismatch",
+        },
+      });
+    } finally {
+      reopenedDb?.close();
+      if (!originalClosed) context.db.close();
+    }
+  });
+
+  it("does not let an immutable Attempt lease replay after restart bypass evidence verification", async () => {
+    const context = setup();
+    let originalClosed = false;
+    let reopenedDb: Database.Database | undefined;
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const invalidResultEvidence = putInvalidResultEvidence(context.blobs);
+      const transition = await prepareResultPendingTransition(context, invalidResultEvidence);
+      await context.store.applyAtomicTransition(transition);
+      const request = {
+        worker_id: "worker-result-correction",
+        lease_id: "lease-result-correction",
+        expires_at: "2026-08-20T12:20:00.000Z",
+      };
+      await expect(context.store.leaseNextEligibleAttempt(request)).resolves.toMatchObject({
+        attempt: { status: "result_pending" },
+        lease: { id: request.lease_id, purpose: "result_correction" },
+      });
+      writeFileSync(
+        context.blobs.objectPath(invalidResultEvidence.digest),
+        Buffer.alloc(invalidResultEvidence.bytes, 0x78),
+      );
+      context.db.close();
+      originalClosed = true;
+      const reopened = reopenStore(context);
+      reopenedDb = reopened.db;
+
+      await expect(reopened.store.leaseNextEligibleAttempt(request)).rejects.toMatchObject({
+        name: "KernelIntegrityError",
+        code: "KERNEL_BLOB_INTEGRITY",
+        evidence: {
+          owner_kind: "attempt",
+          owner_id: "attempt-1",
+          digest: invalidResultEvidence.digest,
+          classification: "active_blocking",
+        },
+      });
+    } finally {
+      reopenedDb?.close();
+      if (!originalClosed) context.db.close();
+    }
+  });
+
   it("atomically persists result_pending terminal cleanup without discarding completed-work evidence", async () => {
     const context = setup(undefined, () => NOW, true);
     try {
@@ -1937,6 +2425,10 @@ describe("SqliteKernelStore", () => {
         payload: { inline: deliveryPayload },
         created_at: NOW,
       };
+      const invalidEvidence = putInvalidResultEvidence(context.blobs, {
+        phase: "result_correction",
+        candidate_hash: sha("5"),
+      });
       context.db.transaction(() => {
         context.db.prepare(`
           INSERT INTO checkpoints (
@@ -1952,7 +2444,11 @@ describe("SqliteKernelStore", () => {
             result_correction_count = 2, result_correction_deadline = ?,
             pending_candidate_hash = ?, pending_diagnostics_json = ?
           WHERE id = 'attempt-1'
-        `).run(subject("2"), "2026-08-20T12:15:00.000Z", sha("5"), JSON.stringify([{ path: "/payload", detail: "invalid" }]));
+        `).run(subject("2"), "2026-08-20T12:15:00.000Z", sha("5"), canonicalJson({
+          schema: "openthrottle.pending-result-diagnostics/v1",
+          diagnostics: [{ path: "/payload", detail: "invalid" }],
+          invalid_result_evidence: invalidEvidence,
+        }));
         context.db.prepare("UPDATE pipeline_runs SET status = 'running' WHERE id = 'run-1'").run();
         context.db.prepare(`
           INSERT INTO records (
@@ -1994,13 +2490,20 @@ describe("SqliteKernelStore", () => {
         record_ids: [delivery.id],
         checkpoint_ids: [],
       });
+      expect(pending.current_attempt?.pending_result?.invalid_result_evidence)
+        .toEqual(invalidEvidence);
+      const evidenceRecord = createInvalidResultEvidenceRecord({
+        attempt: pending.current_attempt!,
+        pointer: invalidEvidence,
+        created_at: NOW,
+      });
       const decision: DecisionRecord = {
         schema: EXECUTION_RECORD_SCHEMA,
         id: "decision-result-correction-exhausted",
         kind: "decision",
         pipeline_run_id: "run-1",
         reducer: "core/result-correction-terminal@1",
-        input_record_ids: [delivery.id],
+        input_record_ids: [delivery.id, evidenceRecord.id].sort(),
         payload_schema: "decision/v1",
         payload: { inline: { outcome: "needs_human" } },
         created_at: NOW,
@@ -2012,13 +2515,14 @@ describe("SqliteKernelStore", () => {
         request_hash: sha("8"),
         definition_bundle_hash: pending.run.definition_bundle_hash,
         input_subject: pending.run.current_subject,
-        context_record_ids: [decision.id, delivery.id].sort(),
+        context_record_ids: [decision.id, delivery.id, evidenceRecord.id].sort(),
       });
       const transition = reduceKernelCommand({
         ...pending,
         records: new Map<string, DecisionRecord | DeliveryRecord>([
           [decision.id, decision],
           [delivery.id, delivery],
+          [evidenceRecord.id, evidenceRecord],
         ]),
         command: {
           type: "needs_human",
@@ -2029,6 +2533,8 @@ describe("SqliteKernelStore", () => {
           resource_disposition: {
             kind: "cleanup",
             runtime_delivery_record_ids: [delivery.id],
+            diagnostic_record_ids: [evidenceRecord.id],
+            new_diagnostic_record_ids: [evidenceRecord.id],
             cleanup_attempt: cleanupAttempt,
           },
         },
@@ -2059,10 +2565,432 @@ describe("SqliteKernelStore", () => {
       });
       expect(context.db.prepare("SELECT status FROM attempts WHERE id = ?").get(cleanupAttempt.id))
         .toEqual({ status: "pending" });
+      expect(context.db.prepare(`
+        SELECT reducer, payload_schema, blob_digest FROM records WHERE id = ?
+      `).get(evidenceRecord.id)).toEqual({
+        reducer: "core/invalid-result-evidence@1",
+        payload_schema: "openthrottle.invalid-result-evidence/v1",
+        blob_digest: invalidEvidence.digest,
+      });
       expect(context.db.prepare("SELECT status, cursor_stage_id FROM pipeline_runs WHERE id = 'run-1'").get())
         .toEqual({ status: "running", cursor_stage_id: runtimeStopStageId("needs_human") });
     } finally {
       context.db.close();
+    }
+  });
+
+  it.each([
+    ["stop", "canceled"],
+    ["supersede", "superseded"],
+  ] as const)(
+    "%s durably records selected and sibling result_pending evidence across replay and restart",
+    async (type, terminalStatus) => {
+      const context = setup(undefined, () => NOW, true);
+      let originalClosed = false;
+      let reopenedDb: Database.Database | undefined;
+      try {
+        const selectedPointer = putInvalidResultEvidence(context.blobs);
+        const siblingPointer = putInvalidResultEvidence(context.blobs, {
+          attempt_id: "attempt-2",
+          candidate_hash: sha("f"),
+          diagnostics: [{ path: "/payload/summary", detail: "sibling result is invalid" }],
+        });
+        const selected = attempt({
+          ...context.admission.initial_attempts[0],
+          id: "attempt-1",
+          scope: {
+            kind: "loop_item",
+            stage_id: "work",
+            parent_attempt_id: "attempt-1",
+            loop_id: "execution_plan.units",
+            item_id: "unit-a",
+            item_index: 0,
+          },
+          status: "result_pending",
+          output_subject: subject("2"),
+          native_session_id: "session-selected",
+          result_correction_count: 1,
+          result_correction_deadline: "2026-08-20T12:15:00.000Z",
+          pending_result: {
+            candidate_hash: sha("e"),
+            diagnostics: [{ path: "/payload", detail: "invalid" }],
+            invalid_result_evidence: selectedPointer,
+          },
+        });
+        const sibling = attempt({
+          ...context.admission.initial_attempts[0],
+          id: "attempt-2",
+          scope: {
+            kind: "loop_item",
+            stage_id: "work",
+            parent_attempt_id: "attempt-1",
+            loop_id: "execution_plan.units",
+            item_id: "unit-b",
+            item_index: 1,
+          },
+          status: "result_pending",
+          output_subject: subject("3"),
+          native_session_id: "session-sibling",
+          result_correction_count: 1,
+          result_correction_deadline: "2026-08-20T12:15:00.000Z",
+          pending_result: {
+            candidate_hash: sha("f"),
+            diagnostics: [{ path: "/payload/summary", detail: "sibling result is invalid" }],
+            invalid_result_evidence: siblingPointer,
+          },
+        });
+        context.admission.initial_attempts = [selected, sibling];
+        context.admission.run = run(
+          [selected, sibling],
+          context.admission.run.definition_bundle_hash,
+        );
+        context.store.admitPipelineRun(context.admission);
+        seedConfirmedRuntimeEffect(context, {
+          run_id: "run-1",
+          kind: "daytona/create-sandbox@1",
+          sequence: 1,
+        });
+
+        const deliveryId = "delivery-run-1-create";
+        const selectedView = await context.store.loadExactReductionView({
+          pipeline_run_id: "run-1",
+          attempt_id: selected.id,
+          record_ids: [deliveryId],
+          checkpoint_ids: [],
+        });
+        const siblingView = await context.store.loadExactReductionView({
+          pipeline_run_id: "run-1",
+          attempt_id: sibling.id,
+          record_ids: [],
+          checkpoint_ids: [],
+        });
+        const persistedSelected = selectedView.current_attempt!;
+        const persistedSibling = siblingView.current_attempt!;
+        const delivery = selectedView.records.get(deliveryId);
+        if (!delivery || delivery.kind !== "delivery") {
+          throw new Error("terminal evidence fixture requires its create DeliveryRecord");
+        }
+        const selectedEvidence = createInvalidResultEvidenceRecord({
+          attempt: persistedSelected,
+          pointer: selectedPointer,
+          created_at: NOW,
+        });
+        const siblingEvidence = createInvalidResultEvidenceRecord({
+          attempt: persistedSibling,
+          pointer: siblingPointer,
+          created_at: NOW,
+        });
+        const decision: DecisionRecord = {
+          schema: EXECUTION_RECORD_SCHEMA,
+          id: `decision-${type}-pending-evidence`,
+          kind: "decision",
+          pipeline_run_id: "run-1",
+          reducer: `core/${type}@1`,
+          input_record_ids: [delivery.id, selectedEvidence.id, siblingEvidence.id].sort(),
+          payload_schema: "decision/v1",
+          payload: { inline: { reason: type === "stop" ? "operator stop" : "new generation" } },
+          created_at: NOW,
+        };
+        const cleanupAttempt = attempt({
+          id: `attempt-cleanup-${type}`,
+          scope: { kind: "stage", stage_id: runtimeStopStageId(terminalStatus) },
+          repository_authority: "inspect",
+          definition_bundle_hash: selectedView.run.definition_bundle_hash,
+          input_subject: selectedView.run.current_subject,
+          context_record_ids: [decision.id, ...decision.input_record_ids].sort(),
+        });
+        const diagnosticIds = [selectedEvidence.id, siblingEvidence.id].sort();
+        const resourceDisposition = {
+          kind: "cleanup" as const,
+          runtime_delivery_record_ids: [delivery.id],
+          diagnostic_record_ids: diagnosticIds,
+          new_diagnostic_record_ids: diagnosticIds,
+          cleanup_attempt: cleanupAttempt,
+        };
+        const command = type === "stop"
+          ? {
+            type,
+            command_id: `terminal-${type}-pending-evidence`,
+            decision_record_id: decision.id,
+            reason: "operator stop",
+            resource_disposition: resourceDisposition,
+          } as const
+          : {
+            type,
+            command_id: `terminal-${type}-pending-evidence`,
+            decision_record_id: decision.id,
+            reason: "new generation",
+            resource_disposition: resourceDisposition,
+          } as const;
+        const records = new Map<string, DecisionRecord | DeliveryRecord>([
+          [decision.id, decision],
+          [delivery.id, delivery],
+          [selectedEvidence.id, selectedEvidence],
+          [siblingEvidence.id, siblingEvidence],
+        ]);
+        const transition = reduceKernelCommand({
+          ...selectedView,
+          records,
+          command,
+        });
+
+        await expect(context.store.applyAtomicTransition(transition)).resolves.toEqual({
+          disposition: "applied",
+          run_version: selectedView.run.version + 1,
+        });
+        expect(context.db.prepare(`
+          SELECT id, status, pending_candidate_hash, pending_diagnostics_json
+          FROM attempts WHERE id IN ('attempt-1', 'attempt-2') ORDER BY id
+        `).all()).toEqual([
+          {
+            id: "attempt-1",
+            status: terminalStatus,
+            pending_candidate_hash: null,
+            pending_diagnostics_json: null,
+          },
+          {
+            id: "attempt-2",
+            status: terminalStatus,
+            pending_candidate_hash: null,
+            pending_diagnostics_json: null,
+          },
+        ]);
+        expect(context.db.prepare(`
+          SELECT id, reducer, blob_digest FROM records
+          WHERE id IN (?, ?) ORDER BY id
+        `).all(selectedEvidence.id, siblingEvidence.id)).toEqual([
+          { id: selectedEvidence.id, pointer: selectedPointer },
+          { id: siblingEvidence.id, pointer: siblingPointer },
+        ].sort((left, right) => left.id.localeCompare(right.id)).map(({ id, pointer }) => ({
+          id,
+          reducer: "core/invalid-result-evidence@1",
+          blob_digest: pointer.digest,
+        })));
+        await expect(context.store.applyAtomicTransition(transition)).resolves.toEqual({
+          disposition: "replayed",
+          run_version: selectedView.run.version + 1,
+        });
+
+        context.db.close();
+        originalClosed = true;
+        const reopened = reopenStore(context);
+        reopenedDb = reopened.db;
+        await expect(reopened.store.applyAtomicTransition(transition)).resolves.toEqual({
+          disposition: "replayed",
+          run_version: selectedView.run.version + 1,
+        });
+        const restartedSelected = await reopened.store.loadExactReductionView({
+          pipeline_run_id: "run-1",
+          attempt_id: selected.id,
+          record_ids: [decision.id, delivery.id, selectedEvidence.id, siblingEvidence.id],
+          checkpoint_ids: [],
+        });
+        const restartedSibling = await reopened.store.loadExactReductionView({
+          pipeline_run_id: "run-1",
+          attempt_id: sibling.id,
+          record_ids: [],
+          checkpoint_ids: [],
+        });
+        expect(restartedSelected.current_attempt).toMatchObject({
+          id: selected.id,
+          status: terminalStatus,
+          pending_result: null,
+        });
+        expect(restartedSibling.current_attempt).toMatchObject({
+          id: sibling.id,
+          status: terminalStatus,
+          pending_result: null,
+        });
+        expect(restartedSelected.records.get(selectedEvidence.id)).toEqual(selectedEvidence);
+        expect(restartedSelected.records.get(siblingEvidence.id)).toEqual(siblingEvidence);
+      } finally {
+        reopenedDb?.close();
+        if (!originalClosed) context.db.close();
+      }
+    },
+  );
+
+  it("restores structured planning correction evidence and fails closed on a missing decision input", async () => {
+    const context = setup();
+    let originalClosed = false;
+    let reopenedDb: Database.Database | undefined;
+    try {
+      const structuredInitial = attempt({
+        ...context.admission.initial_attempts[0],
+        scope: {
+          kind: "loop_item",
+          stage_id: "work",
+          parent_attempt_id: "attempt-1",
+          loop_id: "execution_plan.units",
+          item_id: "unit-a",
+          item_index: 0,
+        },
+      });
+      context.admission.initial_attempts = [structuredInitial];
+      context.admission.run = run(
+        [structuredInitial],
+        context.admission.run.definition_bundle_hash,
+      );
+      context.store.admitPipelineRun(context.admission);
+
+      const firstPointer = putInvalidResultEvidence(context.blobs);
+      const firstPending = await prepareResultPendingTransition(context, firstPointer);
+      await context.store.applyAtomicTransition(firstPending);
+
+      const startCorrection = async (leaseId: string, commandId: string) => {
+        await expect(context.store.leaseNextEligibleAttempt({
+          worker_id: "worker-correction",
+          lease_id: leaseId,
+          expires_at: "2026-08-20T12:10:00.000Z",
+        })).resolves.toMatchObject({
+          attempt: { id: "attempt-1", status: "result_pending" },
+          lease: { id: leaseId, purpose: "result_correction" },
+        });
+        const leased = await context.store.loadExactReductionView({
+          pipeline_run_id: "run-1",
+          attempt_id: "attempt-1",
+          record_ids: [],
+          checkpoint_ids: [],
+        });
+        await context.store.applyAtomicTransition(reduceKernelCommand({
+          ...leased,
+          command: {
+            type: "start",
+            command_id: commandId,
+            attempt_id: "attempt-1",
+            lease_id: leaseId,
+          },
+        }));
+        return context.store.loadExactReductionView({
+          pipeline_run_id: "run-1",
+          attempt_id: "attempt-1",
+          record_ids: [],
+          checkpoint_ids: ["checkpoint-result-pending"],
+        });
+      };
+
+      const firstCorrection = await startCorrection(
+        "lease-correction-1",
+        "start-correction-1",
+      );
+      const correctionPointer = putInvalidResultEvidence(context.blobs, {
+        phase: "result_correction",
+        candidate_hash: sha("f"),
+        diagnostics: [{ path: "/payload/summary", detail: "corrected summary is still invalid" }],
+      });
+      const correctionEvidence = createInvalidResultEvidenceRecord({
+        attempt: firstCorrection.current_attempt!,
+        pointer: correctionPointer,
+        created_at: NOW,
+      });
+      await context.store.applyAtomicTransition(reduceKernelCommand({
+        ...firstCorrection,
+        records: exactMap(correctionEvidence),
+        command: {
+          type: "result_pending",
+          command_id: "result-pending-correction-evidence",
+          attempt_id: "attempt-1",
+          candidate_hash: sha("f"),
+          diagnostics: [{ path: "/payload/summary", detail: "corrected summary is still invalid" }],
+          correction_deadline: "2026-08-20T12:15:00.000Z",
+          invalid_result_evidence: correctionPointer,
+          invalid_result_evidence_record_id: correctionEvidence.id,
+        },
+      }));
+
+      const secondCorrection = await startCorrection(
+        "lease-correction-2",
+        "start-correction-2",
+      );
+      const correctedAttempt = secondCorrection.current_attempt!;
+      const result: ResultRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "result-corrected-structured",
+        kind: "result",
+        pipeline_run_id: "run-1",
+        attempt_id: correctedAttempt.id,
+        request_hash: correctedAttempt.request_hash,
+        definition_bundle_hash: correctedAttempt.definition_bundle_hash,
+        input_subject: correctedAttempt.input_subject,
+        output_subject: correctedAttempt.output_subject,
+        original_candidate_hash: sha("7"),
+        normalized_candidate_hash: sha("7"),
+        payload_schema: "result/v1",
+        payload: { inline: { outcome: "success" } },
+        created_at: NOW,
+      };
+      const decision: DecisionRecord = {
+        schema: EXECUTION_RECORD_SCHEMA,
+        id: "decision-corrected-structured",
+        kind: "decision",
+        pipeline_run_id: "run-1",
+        reducer: "core/advance@1",
+        input_record_ids: [result.id, correctionEvidence.id].sort(),
+        payload_schema: "decision/v1",
+        payload: { inline: { accepted: true } },
+        created_at: NOW,
+      };
+      const next = attempt({
+        id: "attempt-verify-corrected-structured",
+        scope: {
+          kind: "loop_item",
+          stage_id: "verify",
+          parent_attempt_id: "attempt-1",
+          loop_id: "execution_plan.units",
+          item_id: "unit-a",
+          item_index: 0,
+        },
+        repository_authority: "inspect",
+        definition_bundle_hash: secondCorrection.run.definition_bundle_hash,
+        input_subject: subject("2"),
+      });
+      await context.store.applyAtomicTransition(reduceKernelCommand({
+        ...secondCorrection,
+        records: new Map<string, ResultRecord | DecisionRecord>([
+          [result.id, result],
+          [correctionEvidence.id, correctionEvidence],
+          [decision.id, decision],
+        ]),
+        command: {
+          type: "correct_and_settle",
+          command_id: "correct-and-settle-structured",
+          attempt_id: correctedAttempt.id,
+          result_record_id: result.id,
+          invalid_result_evidence_record_id: correctionEvidence.id,
+          decision_record_id: decision.id,
+          outcome: "success",
+          next_attempts: [next],
+        },
+      }));
+
+      const planningRequest = {
+        pipeline_run_id: "run-1",
+        definition_bundle_hash: secondCorrection.run.definition_bundle_hash,
+        scope_kind: "loop_item" as const,
+        parent_attempt_id: "attempt-1",
+        scope_group_id: "execution_plan.units",
+        stage_ids: ["work"],
+        member_ids: ["unit-a"],
+      };
+      const settled = await context.store.listSettledStructuredPlanningAttempts(planningRequest);
+      expect(settled).toHaveLength(1);
+      expect(settled[0]?.decision_input_records).toEqual([
+        correctionEvidence,
+        result,
+      ].sort((left, right) => left.id.localeCompare(right.id)));
+
+      context.db.close();
+      originalClosed = true;
+      const reopened = reopenStore(context);
+      reopenedDb = reopened.db;
+      expect(await reopened.store.listSettledStructuredPlanningAttempts(planningRequest))
+        .toEqual(settled);
+      reopened.db.prepare("DELETE FROM records WHERE id = ?").run(correctionEvidence.id);
+      await expect(reopened.store.listSettledStructuredPlanningAttempts(planningRequest))
+        .rejects.toThrow(/exact record context is missing an authorized record/);
+    } finally {
+      reopenedDb?.close();
+      if (!originalClosed) context.db.close();
     }
   });
 

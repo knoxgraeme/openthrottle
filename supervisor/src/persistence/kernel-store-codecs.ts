@@ -1,6 +1,8 @@
 import {
+  canonicalJson,
   compareCodeUnits,
   validateAttemptCheckpoint,
+  validateBlobPointer,
   validateExecutionRecord,
   type AttemptCheckpoint,
   type BlobPointer,
@@ -111,6 +113,55 @@ export interface RecordRow extends PayloadRow {
   external_identity: string | null;
   delivery_status: "confirmed" | "rejected" | null;
   created_at: string;
+}
+
+export const PENDING_RESULT_DIAGNOSTICS_SCHEMA =
+  "openthrottle.pending-result-diagnostics/v1" as const;
+
+export function parsePendingResultDiagnostics(value: unknown): {
+  diagnostics: Array<{ path: string; detail: string }>;
+  invalid_result_evidence: BlobPointer | null;
+} {
+  let envelope: Record<string, unknown> | null = null;
+  if (!Array.isArray(value)) {
+    if (!value || typeof value !== "object") throw new Error("pending result diagnostics are invalid");
+    envelope = value as Record<string, unknown>;
+    if (
+      Object.keys(envelope).sort().join("\0") !==
+        "diagnostics\0invalid_result_evidence\0schema" ||
+      envelope.schema !== PENDING_RESULT_DIAGNOSTICS_SCHEMA
+    ) throw new Error("pending result diagnostics envelope is invalid");
+  }
+  const diagnosticsValue = envelope === null ? value : envelope.diagnostics;
+  if (!Array.isArray(diagnosticsValue)) throw new Error("pending result diagnostics are not an array");
+  const diagnostics = diagnosticsValue.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`pending result diagnostic ${index} is invalid`);
+    }
+    const item = entry as Record<string, unknown>;
+    if (
+      Object.keys(item).sort().join("\0") !== "detail\0path" ||
+      typeof item.path !== "string" || typeof item.detail !== "string"
+    ) throw new Error(`pending result diagnostic ${index} is invalid`);
+    return { path: item.path, detail: item.detail };
+  });
+  const invalidResultEvidence = envelope === null
+    ? null
+    : validateBlobPointer(envelope.invalid_result_evidence, {
+      source: "pending_result.invalid_result_evidence",
+    }).value;
+  return { diagnostics, invalid_result_evidence: invalidResultEvidence };
+}
+
+export function serializePendingResultDiagnostics(
+  pending: NonNullable<KernelAttempt["pending_result"]>,
+): string {
+  if (pending.invalid_result_evidence === null) return canonicalJson(pending.diagnostics);
+  return canonicalJson({
+    schema: PENDING_RESULT_DIAGNOSTICS_SCHEMA,
+    diagnostics: pending.diagnostics,
+    invalid_result_evidence: pending.invalid_result_evidence,
+  });
 }
 
 export interface CheckpointRow extends PayloadRow {
@@ -271,7 +322,10 @@ export function attemptFromRow(row: AttemptRow): KernelAttempt {
     pending_result: row.status === "result_pending"
       ? {
         candidate_hash: row.pending_candidate_hash,
-        diagnostics: parseJson(row.pending_diagnostics_json!, "result diagnostics"),
+        ...parsePendingResultDiagnostics(parseJson(
+          row.pending_diagnostics_json!,
+          "result diagnostics",
+        )),
       }
       : null,
   };

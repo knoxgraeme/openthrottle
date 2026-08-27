@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -1020,6 +1021,28 @@ describe("kernel attempt executor", () => {
     });
     expect(pending.outcome.state).toBe("result_pending");
     expect(workLaunches).toBe(1);
+    const invalidDescriptor = pending.outcome.invalid_result_evidence;
+    expect(invalidDescriptor).toMatchObject({
+      schema: "openthrottle.evidence-artifact-descriptor/v1",
+      media_type: "application/json",
+      payload_schema: "openthrottle.invalid-result-evidence/v1",
+      sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    const invalidEvidence = JSON.parse(readFileSync(
+      join(root, "transport", invalidDescriptor.file),
+      "utf8",
+    ));
+    expect(invalidEvidence).toMatchObject({
+      schema: "openthrottle.invalid-result-evidence/v1",
+      phase: "work",
+      rejected_candidate: {
+        raw: expect.stringContaining('"summary":["valid",7]'),
+      },
+      diagnostics: [{
+        path: "result_candidate.payload.summary[1]",
+        detail: "must be a non-empty string",
+      }],
+    });
     const checkpoint = pending.outcome.checkpoint;
     const correction = {
       schema: "openthrottle.kernel-result-correction-request/v2",
@@ -1080,6 +1103,169 @@ describe("kernel attempt executor", () => {
       },
     });
     expect(canonicalJson(corrected.outcome.checkpoint)).toBe(canonicalJson(checkpoint));
+  });
+
+  it("retains malformed result-correction evidence through the sealed terminal deadline", async () => {
+    const source = sourceRepository();
+    const root = mkdtempSync(join(tmpdir(), "ot-attempt-malformed-correction-"));
+    const request = workRequest(source.subject);
+    let workLaunches = 0;
+    const pending = await executeAttempt({
+      request,
+      sourceRepoDir: source.repo,
+      actionRoot: join(root, "actions"),
+      resultPath: join(root, "transport-work", "result.json"),
+      sessionPath: join(root, "transport-work", "session.json"),
+      runAgent: async ({ repositoryPath, onSession }) => {
+        workLaunches += 1;
+        writeFileSync(join(repositoryPath, "work.txt"), "implemented\n");
+        await onSession("session-malformed-correction");
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          nativeSessionId: "session-malformed-correction",
+          stderr: "",
+          stdout: claudeOutput("session-malformed-correction", {
+            schema: "openthrottle.result-candidate/v1",
+            outcome: "success",
+            payload: { summary: ["invalid work result", 7], verification: ["tests pass"] },
+          }),
+        };
+      },
+      now: () => new Date("2026-08-20T00:00:00.000Z"),
+    });
+    expect(pending.outcome.state).toBe("result_pending");
+    const checkpoint = pending.outcome.checkpoint;
+    const correctionDeadline = "2026-08-20T00:15:00.000Z";
+    const correction = {
+      schema: "openthrottle.kernel-result-correction-request/v2",
+      phase: "result_correction",
+      engine: "claude",
+      model: null,
+      reasoning_effort: null,
+      pipeline_run_id: request.pipeline_run_id,
+      attempt_id: request.attempt_id,
+      stage_id: request.stage_id,
+      scope: request.scope,
+      request_hash: request.request_hash,
+      definition_bundle_hash: request.definition_bundle_hash,
+      checkpoint_base_subject: request.checkpoint_base_subject,
+      input_subject: request.input_subject,
+      locked_subject: checkpoint.output_subject,
+      completed_work_authority: "edit",
+      checkpoint_id: checkpoint.id,
+      native_session_id: "session-malformed-correction",
+      lease_id: "lease-malformed-correction",
+      worker_id: "worker-1",
+      correction_deadline: correctionDeadline,
+      diagnostics: pending.outcome.diagnostics,
+      semantic_result_schema: semanticSchema,
+      execution_limits: { max_turns: 12, task_timeout_seconds: 600 },
+      repository_authority: "inspect",
+      tools: ["ot-result"],
+      mcp: false,
+      provider_access: false,
+    };
+    const correctionResultPath = join(root, "transport-correction", "result.json");
+    const malformedCorrection = await executeAttempt({
+      request: correction,
+      sourceRepoDir: source.repo,
+      actionRoot: join(root, "actions"),
+      resultPath: correctionResultPath,
+      sessionPath: join(root, "transport-correction", "session.json"),
+      runAgent: async ({ repositoryPath, phase }) => {
+        expect(phase).toBe("result_correction");
+        expect(() => writeFileSync(join(repositoryPath, "work.txt"), "rerun\n")).toThrow();
+        return {
+          status: 0,
+          signal: null,
+          timedOut: false,
+          nativeSessionId: "session-malformed-correction",
+          stderr: "correction returned malformed semantic bytes",
+          stdout: claudeOutput("session-malformed-correction", {
+            schema: "openthrottle.result-candidate/v1",
+            outcome: "success",
+            payload: { summary: ["still invalid", 9], verification: ["tests pass"] },
+          }),
+        };
+      },
+      now: () => new Date("2026-08-20T00:01:00.000Z"),
+    });
+
+    expect(workLaunches).toBe(1);
+    expect(malformedCorrection.outcome).toMatchObject({
+      state: "result_pending",
+      checkpoint: { id: checkpoint.id, output_subject: checkpoint.output_subject },
+      correction_deadline: correctionDeadline,
+      diagnostics: [{
+        path: "result_candidate.payload.summary[1]",
+        detail: "must be a non-empty string",
+      }],
+      invalid_result_evidence: {
+        schema: "openthrottle.evidence-artifact-descriptor/v1",
+        media_type: "application/json",
+        payload_schema: "openthrottle.invalid-result-evidence/v1",
+        sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+    });
+    expect(canonicalJson(malformedCorrection.outcome.checkpoint)).toBe(canonicalJson(checkpoint));
+    expect(readFileSync(correctionResultPath, "utf8"))
+      .toBe(`${JSON.stringify(malformedCorrection)}\n`);
+    const correctionEvidenceDescriptor = malformedCorrection.outcome.invalid_result_evidence;
+    const correctionEvidenceBytes = readFileSync(
+      join(root, "transport-correction", correctionEvidenceDescriptor.file),
+    );
+    expect(correctionEvidenceBytes.byteLength).toBe(correctionEvidenceDescriptor.bytes);
+    expect(createHash("sha256").update(correctionEvidenceBytes).digest("hex"))
+      .toBe(correctionEvidenceDescriptor.sha256);
+    const correctionEvidence = JSON.parse(correctionEvidenceBytes.toString("utf8"));
+    expect(correctionEvidence).toMatchObject({
+      schema: "openthrottle.invalid-result-evidence/v1",
+      phase: "result_correction",
+      rejected_candidate: {
+        raw: expect.stringContaining('"summary":["still invalid",9]'),
+      },
+      diagnostics: [{
+        path: "result_candidate.payload.summary[1]",
+        detail: "must be a non-empty string",
+      }],
+      runner_stdout_tail: expect.stringContaining('"summary":["still invalid",9]'),
+      runner_stderr_tail: "correction returned malformed semantic bytes",
+    });
+    expect(Buffer.byteLength(readFileSync(
+      join(root, "transport-correction", checkpoint.payload_artifact.file),
+    ))).toBe(checkpoint.payload_artifact.bytes);
+
+    let terminalLaunches = 0;
+    const terminalResultPath = join(root, "transport-terminal", "result.json");
+    const terminal = await executeAttempt({
+      request: {
+        ...correction,
+        lease_id: "lease-malformed-correction-terminal",
+        diagnostics: malformedCorrection.outcome.diagnostics,
+      },
+      sourceRepoDir: source.repo,
+      actionRoot: join(root, "actions"),
+      resultPath: terminalResultPath,
+      sessionPath: join(root, "transport-terminal", "session.json"),
+      runAgent: async () => {
+        terminalLaunches += 1;
+        throw new Error("expired correction must not launch");
+      },
+      now: () => new Date(correctionDeadline),
+    });
+    expect(terminalLaunches).toBe(0);
+    expect(terminal.outcome).toMatchObject({
+      state: "needs_human",
+      reason: "result correction deadline exhausted",
+      checkpoint: { id: checkpoint.id, output_subject: checkpoint.output_subject },
+      diagnostics: malformedCorrection.outcome.diagnostics,
+    });
+    expect(readFileSync(terminalResultPath, "utf8")).toBe(`${JSON.stringify(terminal)}\n`);
+    expect(Buffer.byteLength(readFileSync(
+      join(root, "transport-terminal", checkpoint.payload_artifact.file),
+    ))).toBe(checkpoint.payload_artifact.bytes);
   });
 
   it("runs sealed post_bootstrap commands serially before the command within its task timeout", async () => {

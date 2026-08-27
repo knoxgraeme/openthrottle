@@ -36,6 +36,7 @@ import {
   sandboxRecoveryFrontierEvaluator,
   sandboxRecoveryFrontierReason,
 } from "./sandbox-recovery.js";
+import { createInvalidResultEvidenceRecord } from "./attempt-evidence.js";
 import {
   KERNEL_ATTEMPT_SCHEMA,
   KERNEL_RUN_SCHEMA,
@@ -48,6 +49,14 @@ import {
 
 const sha = (character: string): string => character.repeat(64);
 const subject = (character: string): string => character.repeat(40);
+const invalidResultEvidence = {
+  algorithm: "sha256" as const,
+  digest: sha("e"),
+  bytes: 1,
+  encoding: "utf-8" as const,
+  media_type: "application/json",
+  payload_schema: "openthrottle.invalid-result-evidence/v1",
+};
 
 function manifest(options: {
   authority?: "inspect" | "edit";
@@ -569,6 +578,11 @@ describe("shared execution kernel lifecycle", () => {
     currentRun = transition.run;
     expect(current.status).toBe("running");
 
+    const initialInvalidEvidence = createInvalidResultEvidenceRecord({
+      attempt: current,
+      pointer: invalidResultEvidence,
+      created_at: "2026-08-20T00:02:00.000Z",
+    });
     transition = reduce({
       current,
       currentRun,
@@ -611,9 +625,13 @@ describe("shared execution kernel lifecycle", () => {
         candidate_hash: sha("f"),
         diagnostics: [{ path: "/payload/summary", detail: "must be a string" }],
         correction_deadline: "2026-08-20T00:15:00.000Z",
+        invalid_result_evidence: invalidResultEvidence,
+        invalid_result_evidence_record_id: initialInvalidEvidence.id,
       },
+      records: [initialInvalidEvidence],
       checkpoints: [completedCheckpoint],
     });
+    expect(transition.append_records).toEqual([initialInvalidEvidence]);
     current = replacedAttempt(transition, current.id);
     currentRun = transition.run;
     expect(current).toMatchObject({
@@ -646,19 +664,7 @@ describe("shared execution kernel lifecycle", () => {
     expect(current.status).toBe("result_pending");
 
     const result = resultRecord(current);
-    transition = reduce({
-      current,
-      currentRun,
-      currentManifest: manifest({ firstTerminal: true }),
-      command: { type: "record", command_id: "record", attempt_id: current.id, record_id: result.id },
-      records: [result],
-      checkpoints: [completedCheckpoint],
-    });
-    current = replacedAttempt(transition, current.id);
-    currentRun = transition.run;
-    expect(current).toMatchObject({ status: "recorded", pending_result: null, result_record_id: result.id });
-
-    const decision = decisionRecord([result.id]);
+    const decision = decisionRecord([result.id, initialInvalidEvidence.id]);
     const cleanupAttempt = attempt({
       id: "attempt-cleanup-completed",
       scope: stageScope(runtimeStopStageId("completed")),
@@ -670,15 +676,20 @@ describe("shared execution kernel lifecycle", () => {
       currentRun,
       currentManifest: manifestWithRuntimeStages({ firstTerminal: true }),
       command: {
-        type: "settle",
-        command_id: "settle",
+        type: "correct_and_settle",
+        command_id: "correct-and-settle",
         attempt_id: current.id,
+        result_record_id: result.id,
+        invalid_result_evidence_record_id: initialInvalidEvidence.id,
         decision_record_id: decision.id,
         outcome: "success",
         next_attempts: [cleanupAttempt],
       },
-      records: [decision, result],
+      records: [decision, initialInvalidEvidence, result],
     });
+    expect(transition.append_records).toEqual(expect.arrayContaining([result, decision]));
+    expect(transition.append_records).not.toContainEqual(initialInvalidEvidence);
+    expect(transition.append_records).toHaveLength(2);
     expect(transition.run).toMatchObject({
       status: "running",
       terminal_outcome: null,
@@ -686,7 +697,103 @@ describe("shared execution kernel lifecycle", () => {
       active_attempt_versions: { [cleanupAttempt.id]: 0 },
       cursor: { stage_id: runtimeStopStageId("completed") },
     });
-    expect(replacedAttempt(transition, current.id).status).toBe("settled");
+    expect(replacedAttempt(transition, current.id)).toMatchObject({
+      status: "settled",
+      result_record_id: result.id,
+      decision_record_id: decision.id,
+      result_correction_deadline: null,
+      pending_result: null,
+    });
+  });
+
+  it.each([
+    ["a missing pending pointer", "missing_pointer", /no pending invalid-result evidence/],
+    ["a decision missing the result", "missing_result_input", /must cite its result and invalid evidence/],
+    ["a decision missing the evidence", "missing_evidence_input", /must cite its result and invalid evidence/],
+    ["non-decision evidence", "non_decision", /invalid evidence does not match the pending pointer/],
+    ["another evidence record identity", "record_identity", /does not match its Attempt and blob pointer/],
+    ["another evidence run identity", "run_identity", /belongs to another pipeline run/],
+    ["another evidence reducer", "reducer", /does not match its Attempt and blob pointer/],
+    ["another evidence payload schema", "payload_schema", /does not match its Attempt and blob pointer/],
+    ["another evidence blob pointer", "blob_pointer", /does not match its Attempt and blob pointer/],
+  ] as const)("rejects corrected-result settlement with %s", (_label, variant, message) => {
+    let current = attempt({
+      status: "result_pending",
+      version: 5,
+      output_subject: subject("2"),
+      native_session_id: "session-1",
+      checkpoint_id: "checkpoint-1",
+      result_correction_count: 1,
+      result_correction_deadline: "2026-08-20T00:15:00.000Z",
+      lease: {
+        id: "lease-correction",
+        generation: 0,
+        worker_id: "worker-1",
+        purpose: "result_correction",
+        expires_at: "2026-08-20T00:10:00.000Z",
+        started: true,
+      },
+      pending_result: {
+        candidate_hash: sha("f"),
+        diagnostics: [{ path: "/payload/summary", detail: "must be a string" }],
+        invalid_result_evidence: invalidResultEvidence,
+      },
+    });
+    const validEvidence = createInvalidResultEvidenceRecord({
+      attempt: current,
+      pointer: invalidResultEvidence,
+      created_at: "2026-08-20T00:02:00.000Z",
+    });
+    let evidence: ExecutionRecord = validEvidence;
+    if (variant === "missing_pointer") {
+      current = {
+        ...current,
+        pending_result: { ...current.pending_result!, invalid_result_evidence: null },
+      };
+    } else if (variant === "non_decision") {
+      evidence = resultRecord(current, validEvidence.id);
+    } else if (variant === "record_identity") {
+      evidence = { ...validEvidence, id: "decision-mismatched-evidence" };
+    } else if (variant === "run_identity") {
+      evidence = { ...validEvidence, pipeline_run_id: "run-other" };
+    } else if (variant === "reducer") {
+      evidence = { ...validEvidence, reducer: "core/other-evidence@1" };
+    } else if (variant === "payload_schema") {
+      evidence = { ...validEvidence, payload_schema: "openthrottle.attempt-forensics/v1" };
+    } else if (variant === "blob_pointer") {
+      evidence = {
+        ...validEvidence,
+        payload: { blob: { ...invalidResultEvidence, bytes: invalidResultEvidence.bytes + 1 } },
+      };
+    }
+    const result = resultRecord(current);
+    const decisionInputs = variant === "missing_result_input"
+      ? [evidence.id]
+      : variant === "missing_evidence_input"
+      ? [result.id]
+      : [result.id, evidence.id];
+    const decision = decisionRecord(decisionInputs);
+
+    expect(() => reduce({
+      current,
+      currentRun: run(current, {
+        current_subject: subject("1"),
+        status: "running",
+        version: 5,
+        checkpoint_ids: { [current.id]: current.checkpoint_id! },
+      }),
+      command: {
+        type: "correct_and_settle",
+        command_id: `reject-correction-${variant}`,
+        attempt_id: current.id,
+        result_record_id: result.id,
+        invalid_result_evidence_record_id: evidence.id,
+        decision_record_id: decision.id,
+        outcome: "success",
+        next_attempts: [],
+      },
+      records: [result, evidence, decision],
+    })).toThrow(message);
   });
 
   it("uses the identical attempt lifecycle for an ordinary stage and one loop item", () => {
@@ -783,14 +890,24 @@ describe("shared execution kernel lifecycle", () => {
       },
       {
         name: "result pending before work complete",
-        invoke: () => reduce({
-          current: running,
-          command: {
-            type: "result_pending", command_id: "bad-pending", attempt_id: running.id,
-            candidate_hash: null, diagnostics: [{ path: "/", detail: "missing" }],
-            correction_deadline: "2026-08-20T00:15:00.000Z",
-          },
-        }),
+        invoke: () => {
+          const evidence = createInvalidResultEvidenceRecord({
+            attempt: running,
+            pointer: invalidResultEvidence,
+            created_at: "2026-08-20T00:02:00.000Z",
+          });
+          return reduce({
+            current: running,
+            command: {
+              type: "result_pending", command_id: "bad-pending", attempt_id: running.id,
+              candidate_hash: null, diagnostics: [{ path: "/", detail: "missing" }],
+              correction_deadline: "2026-08-20T00:15:00.000Z",
+              invalid_result_evidence: invalidResultEvidence,
+              invalid_result_evidence_record_id: evidence.id,
+            },
+            records: [evidence],
+          });
+        },
         message: /before work completion/,
       },
       {
@@ -1084,6 +1201,7 @@ describe("shared execution kernel lifecycle", () => {
       pending_result: {
         candidate_hash: sha("f"),
         diagnostics: [{ path: "/outcome", detail: "unknown" }],
+        invalid_result_evidence: invalidResultEvidence,
       },
     });
     const completedCheckpoint = checkpoint(current, subject("2"));
@@ -1101,7 +1219,18 @@ describe("shared execution kernel lifecycle", () => {
         candidate_hash: sha("9"),
         diagnostics: [{ path: "/payload", detail: "still invalid" }],
         correction_deadline: "2026-08-20T00:15:00.000Z",
+        invalid_result_evidence: invalidResultEvidence,
+        invalid_result_evidence_record_id: createInvalidResultEvidenceRecord({
+          attempt: current,
+          pointer: invalidResultEvidence,
+          created_at: "2026-08-20T00:03:00.000Z",
+        }).id,
       },
+      records: [createInvalidResultEvidenceRecord({
+        attempt: current,
+        pointer: invalidResultEvidence,
+        created_at: "2026-08-20T00:03:00.000Z",
+      })],
       checkpoints: [completedCheckpoint],
     });
     const next = replacedAttempt(pendingAgain, current.id);
@@ -1113,6 +1242,7 @@ describe("shared execution kernel lifecycle", () => {
       checkpoint_id: completedCheckpoint.id,
     });
     expect(pendingAgain.run.cursor).toEqual(currentRun.cursor);
+    expect(pendingAgain.append_records).toHaveLength(1);
   });
 
   it("clears correction-only state when result_pending becomes needs_human cleanup", () => {
@@ -1136,6 +1266,7 @@ describe("shared execution kernel lifecycle", () => {
       pending_result: {
         candidate_hash: sha("f"),
         diagnostics: [{ path: "/payload", detail: "still invalid" }],
+        invalid_result_evidence: invalidResultEvidence,
       },
       context_record_ids: runtime.map(({ id }) => id),
     });

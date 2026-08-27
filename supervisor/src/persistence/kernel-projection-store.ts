@@ -6,6 +6,7 @@ import {
   ACTIVE_EFFECT_STATUSES,
   ACTIVE_RUN_STATUSES,
 } from "./kernel-active-statuses.js";
+import { parsePendingResultDiagnostics } from "./kernel-store-codecs.js";
 
 const ATTEMPT_STATUSES: readonly AttemptState[] = [
   "pending", "running", "work_complete", "result_pending", "recorded", "settled",
@@ -292,11 +293,8 @@ export class SqliteKernelProjectionStore implements
         pending_diagnostic_count: row.pending_diagnostics_json === null
           ? 0
           : (() => {
-            const diagnostics: unknown = JSON.parse(row.pending_diagnostics_json);
-            if (!Array.isArray(diagnostics)) {
-              throw new Error(`attempt ${row.id} pending diagnostics are not an array`);
-            }
-            return diagnostics.length;
+            return parsePendingResultDiagnostics(JSON.parse(row.pending_diagnostics_json))
+              .diagnostics.length;
           })(),
         lease_purpose: row.lease_purpose,
         lease_expires_at: row.lease_expires_at,

@@ -1,5 +1,9 @@
 import {
+  ATTEMPT_FORENSICS_PAYLOAD_CONTRACT,
+  ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
   EXECUTION_RECORD_SCHEMA,
+  INVALID_RESULT_EVIDENCE_PAYLOAD_CONTRACT,
+  INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
   REVIEW_FINDING_SEVERITIES,
   canonicalJson,
   compareCodeUnits,
@@ -142,6 +146,8 @@ const payloadContracts: readonly [string, ExecutionRecordPayloadContract][] = [
     kind: "decision",
     parseInline: decisionPayload,
   }],
+  [ATTEMPT_FORENSICS_PAYLOAD_SCHEMA, ATTEMPT_FORENSICS_PAYLOAD_CONTRACT],
+  [INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA, INVALID_RESULT_EVIDENCE_PAYLOAD_CONTRACT],
 ];
 
 export function ordinaryKernelPayloadSchemas(): ExecutionRecordPayloadRegistry {

@@ -1,5 +1,6 @@
 import {
   compareCodeUnits,
+  type BlobPointer,
   type AttemptCheckpoint,
   type AttemptState,
   type CompiledPipelineManifest,
@@ -104,6 +105,8 @@ export interface AttemptLease {
 export interface ResultPendingState {
   candidate_hash: string | null;
   diagnostics: readonly ResultDiagnostic[];
+  /** Null only when reading the legacy bare-array persisted form. */
+  invalid_result_evidence: BlobPointer | null;
 }
 
 export interface ResultDiagnostic {
@@ -205,6 +208,8 @@ export interface ResultPendingCommand extends KernelCommandBase {
   candidate_hash: string | null;
   diagnostics: readonly ResultDiagnostic[];
   correction_deadline: string;
+  invalid_result_evidence: BlobPointer;
+  invalid_result_evidence_record_id: string;
 }
 
 export interface RecordResultCommand extends KernelCommandBase {
@@ -237,8 +242,7 @@ export interface AdvanceExternalSubjectCommand extends KernelCommandBase {
   verified_output_subject: string;
 }
 
-export interface SettleAttemptCommand extends KernelCommandBase {
-  type: "settle";
+interface SettlementCommandFields {
   attempt_id: string;
   decision_record_id: string;
   outcome: string;
@@ -252,9 +256,24 @@ export interface SettleAttemptCommand extends KernelCommandBase {
   };
 }
 
+export interface SettleAttemptCommand extends KernelCommandBase, SettlementCommandFields {
+  type: "settle";
+}
+
+/**
+ * Successful result correction records the corrected result, rejected-candidate
+ * evidence, and evidence-citing settlement in one durable transition.
+ */
+export interface CorrectAndSettleAttemptCommand extends KernelCommandBase, SettlementCommandFields {
+  type: "correct_and_settle";
+  result_record_id: string;
+  invalid_result_evidence_record_id: string;
+}
+
 export interface RetryAttemptCommand extends KernelCommandBase {
   type: "retry";
   attempt_id: string;
+  forensics_record_id?: string | null;
 }
 
 /**
@@ -289,6 +308,8 @@ export type KernelTerminalResourceDisposition =
     /** Exact confirmed Daytona create evidence authorizes stop + cleanup. */
     kind: "cleanup";
     runtime_delivery_record_ids: readonly string[];
+    diagnostic_record_ids?: readonly string[];
+    new_diagnostic_record_ids?: readonly string[];
     cleanup_attempt: KernelAttempt;
   };
 
@@ -319,6 +340,7 @@ export type KernelCommand =
   | AdvanceExternalSubjectCommand
   | RecordResultCommand
   | SettleAttemptCommand
+  | CorrectAndSettleAttemptCommand
   | RetryAttemptCommand
   | QuarantineAttemptRecoveryCommand
   | NeedsHumanCommand

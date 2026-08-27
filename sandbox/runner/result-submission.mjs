@@ -448,6 +448,7 @@ export function inspectResultSubmissionChannel(channel) {
       status: "invalid",
       original_hash: rejected.original_hash,
       diagnostics: rejected.diagnostics,
+      rejected,
     };
   }
   return {
@@ -635,6 +636,7 @@ export function submitProviderResultCandidate({ raw, engine, channel }) {
     return {
       status: "invalid",
       original_hash: digestCanonicalJson(extracted.value),
+      raw: extracted.raw,
       diagnostics: [{ path: "result_candidate", detail: body.error }],
     };
   }

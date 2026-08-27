@@ -16,7 +16,10 @@ import {
   type JsonValue,
 } from "@openthrottle/contracts";
 import { createPipelineDecisionRecord } from "../pipeline/kernel/evaluator-registry.js";
+import { createPendingKernelAttempt } from "../pipeline/kernel/action-request.js";
 import {
+  exactSandboxRecoveryRecord,
+  sandboxRecoveryAttemptId,
   sandboxRecoveryEvaluator,
   sandboxRecoveryFrontierEvaluator,
   sandboxRecoveryFrontierReason,
@@ -1552,6 +1555,76 @@ describe("kernel external boundary bridge", () => {
           result: expect.objectContaining({ sandbox_id: "sandbox-fresh" }),
         }) } }),
       ]));
+
+    const failedRetry: KernelAttempt = {
+      ...retry,
+      status: "failed",
+      version: retry.version + 1,
+      lease: null,
+    };
+    const secondRecovery = createPipelineDecisionRecord({
+      attempt: failedRetry,
+      result: null,
+      evaluated: {
+        evaluator: sandboxRecoveryEvaluator(failedRetry.id),
+        outcome: "retryable_infrastructure_failure",
+        reason: "sandbox_fatal_enospc: fresh sandbox also exhausted its storage",
+      },
+      created_at: NOW,
+    });
+    store.attempts.set(failedRetry.id, failedRetry);
+    store.records.set(secondRecovery.id, secondRecovery);
+    let secondProvision = createPendingKernelAttempt({
+      id: "attempt-second-reprovision",
+      pipeline_run_id: store.run.id,
+      scope: { kind: "stage", stage_id: RUNTIME_PROVISION_STAGE_ID },
+      input_subject: store.run.current_subject,
+      bundle: definitionBundle,
+      manifest: currentManifest,
+      action_inputs: {
+        task_prompt: "Provision another exact fresh sandbox.",
+        context: { records: [secondRecovery], checkpoints: [] },
+      },
+    });
+    secondProvision = {
+      ...secondProvision,
+      lease: {
+        id: "lease-second-reprovision",
+        generation: 0,
+        worker_id: "external-worker",
+        purpose: "work",
+        expires_at: "2026-08-20T12:15:00.000Z",
+        started: false,
+      },
+    };
+    store.attempts.set(secondProvision.id, secondProvision);
+    store.run = {
+      ...store.run,
+      cursor: compileKernelCursor({
+        stage_id: RUNTIME_PROVISION_STAGE_ID,
+        version: store.run.cursor.version + 1,
+        attempts: [secondProvision],
+      }),
+      version: store.run.version + 1,
+      active_attempt_versions: { [secondProvision.id]: secondProvision.version },
+      active_effect_versions: {},
+    };
+
+    await bridge.executeLeasedAttempt(store.leased(secondProvision.id));
+    confirmLifecyclePhase(secondProvision.id, "create", "sandbox-fresh-2");
+    await bridge.resumeAttempt({ pipeline_run_id: store.run.id, attempt_id: secondProvision.id });
+    confirmLifecyclePhase(secondProvision.id, "start", "sandbox-fresh-2");
+    await bridge.resumeAttempt({ pipeline_run_id: store.run.id, attempt_id: secondProvision.id });
+
+    const secondRetry = [...store.attempts.values()].find(({ id, scope, status }) =>
+      id !== retry.id && scope.kind === "loop_item" && scope.item_id === "unit-a" &&
+      status === "pending" && scope.stage_id === "external" &&
+      store.run.active_attempt_versions[id] !== undefined)!;
+    expect(secondRetry.work_retry_ordinal).toBe(2);
+    const secondRetryRecords = secondRetry.context_record_ids.map((id) => store.records.get(id)!);
+    const immediateRecovery = exactSandboxRecoveryRecord(secondRetryRecords);
+    expect(immediateRecovery).not.toBeNull();
+    expect(sandboxRecoveryAttemptId(immediateRecovery!)).toBe(retry.id);
   });
 
   it("enters fresh-sandbox recovery when integration settles a sandbox-fatal absence", async () => {

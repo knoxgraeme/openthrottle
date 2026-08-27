@@ -2,13 +2,19 @@ import { describe, expect, it } from "vitest";
 import {
   EXECUTION_PLAN_SCHEMA_V2,
   EXECUTION_RECORD_SCHEMA,
+  digestCanonicalJson,
+  type CompiledPipelineManifest,
+  type DefinitionBundle,
   type ExecutionPlanContractV2,
   type ResultRecord,
 } from "@openthrottle/contracts";
 import { SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA } from "../pipeline/kernel/evaluator-registry.js";
+import type { KernelAttempt, KernelRun } from "../pipeline/kernel/types.js";
 import {
+  KernelAdmissionSettlementPlanner,
   admissionPlannerEvidence,
   approvedAdmissionReviewEvidence,
+  createAdmissionPromotionRecord,
 } from "./kernel-admission-promotion.js";
 
 const NOW = "2026-08-20T12:00:00.000Z";
@@ -137,5 +143,79 @@ describe("admission promotion evidence semantics", () => {
       outcome: "rejected",
       findings: ["The route is unsafe."],
     }))).toBeNull();
+  });
+
+  it("retains correction lineage in admission settlement and promotion context", async () => {
+    const planned = plannerResult({ outcome: "simple", plan: null });
+    const reviewed = reviewerResult({ outcome: "approved" });
+    const lineage = createAdmissionPromotionRecord({
+      target_run_id: "run-admission",
+      source_run_id: "run-source",
+      source_attempt_id: "attempt-source",
+      source_commit: "c".repeat(40),
+      planner: admissionPlannerEvidence(planned)!,
+      reviewer: reviewed,
+      created_at: NOW,
+    });
+    const bundle = {
+      schema: "openthrottle.definition-bundle/v1",
+      compiler_version: "test-compiler/v1",
+      runtime_capability_digest: "a".repeat(64),
+      source_commit: "c".repeat(40),
+      pipeline_id: "core/admission",
+      pipeline_selection: "explicit",
+      entries: [],
+    } as DefinitionBundle;
+    const definitionBundleHash = digestCanonicalJson(bundle);
+    const manifest = {
+      pipeline_id: "core/admission",
+      compiler_version: bundle.compiler_version,
+      runtime_capability_digest: bundle.runtime_capability_digest,
+      definition_bundle_hash: definitionBundleHash,
+      stages: [
+        { id: "review", kind: "agent", on: { approved: { to: "promote" } } },
+        { id: "promote", kind: "effect", effect: "kernel/promote-admission@1", on: {} },
+      ],
+    } as CompiledPipelineManifest;
+    const attempt = {
+      id: "attempt-admission",
+      pipeline_run_id: "run-admission",
+      scope: { kind: "stage", stage_id: "review" },
+      definition_bundle_hash: definitionBundleHash,
+      input_subject: "c".repeat(40),
+      output_subject: null,
+    } as KernelAttempt;
+    const run = {
+      id: "run-admission",
+      pipeline_id: "core/admission",
+      cursor: { version: 1, reentries: {} },
+    } as KernelRun;
+    const planner = new KernelAdmissionSettlementPlanner({
+      store: {
+        loadAttemptRequestInputs: async () => ({
+          task_prompt: "Admit the exact task.",
+          context: { records: new Map([[planned.id, planned]]), checkpoints: new Map() },
+        }),
+      },
+      now: () => NOW,
+    });
+
+    const settlement = await planner.plan({
+      view: { manifest, run, current_attempt: attempt, records: new Map(), checkpoints: new Map() },
+      stage: manifest.stages[0] as never,
+      attempt,
+      checkpoint: {} as never,
+      result: reviewed,
+      bundle,
+      evaluated: { evaluator: "core/admission-review-result@1", outcome: "approved", reason: "approved" },
+      additional_input_records: [lineage],
+      default_plan: async () => { throw new Error("unexpected default admission settlement"); },
+    });
+
+    expect(settlement.decision.input_record_ids).toEqual([lineage.id, planned.id, reviewed.id].sort());
+    expect(settlement.input_records.map(({ id }) => id)).toEqual(
+      [lineage.id, planned.id, reviewed.id].sort(),
+    );
+    expect(settlement.next_attempts[0]!.context_record_ids).toContain(lineage.id);
   });
 });

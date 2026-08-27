@@ -11,6 +11,7 @@ import {
   digestCanonicalJson,
   providerJsonSchemaForResultCandidate,
   validateAndNormalizeResultCandidate,
+  validateAttemptForensicsPayload,
   validateEvalDefinition,
   validateSemanticResultSchema,
 } from "./index.js";
@@ -93,10 +94,33 @@ describe("generated runtime artifacts", () => {
       .toBe(canonicalJson(validateAndNormalizeResultCandidate(candidate, semanticSchema)));
   });
 
+  it("runs the same attempt-evidence validator from the sealed JavaScript artifact", async () => {
+    const runtime = await import(pathToFileURL(join(generatedRoot, "runtime/index.js")).href);
+    const payload = {
+      schema: "openthrottle.attempt-forensics/v1",
+      pipeline_run_id: "run-1",
+      attempt_id: "attempt-1",
+      request_hash: "a".repeat(64),
+      definition_bundle_hash: "b".repeat(64),
+      lease_id: "lease-1",
+      work_retry_ordinal: 0,
+      operational_signature: "c".repeat(64),
+      exit_code: 1,
+      runner_stdout_tail: "",
+      runner_stderr_tail: "failed",
+      result_path_state: { state: "missing" },
+      session_event_state: { state: "missing" },
+      workspace_git_status: { state: "present", summary: "" },
+      observed_at: "2026-08-27T00:00:00.000Z",
+    };
+    expect(canonicalJson(runtime.validateAttemptForensicsPayload(payload)))
+      .toBe(canonicalJson(validateAttemptForensicsPayload(payload)));
+  });
+
   it("fails closed when checked-in artifacts drift", () => {
     expect(execFileSync(process.execPath, [
       join(contractsRoot, "scripts/build-runtime-artifacts.mjs"),
       "--check",
-    ], { encoding: "utf8" })).toContain("verified 11 sealed runtime artifacts");
+    ], { encoding: "utf8" })).toContain("verified 12 sealed runtime artifacts");
   });
 });

@@ -63,6 +63,25 @@ export {
   type ResultRecord,
 } from "./records.js";
 export {
+  ATTEMPT_EVIDENCE_PAYLOAD_SCHEMAS,
+  ATTEMPT_FORENSICS_PAYLOAD_CONTRACT,
+  ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
+  EVIDENCE_ARTIFACT_DESCRIPTOR_SCHEMA,
+  EVIDENCE_ARTIFACT_MAX_BYTES,
+  INVALID_RESULT_EVIDENCE_PAYLOAD_CONTRACT,
+  INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
+  validateAttemptEvidencePayload,
+  validateAttemptForensicsPayload,
+  validateEvidenceArtifactDescriptor,
+  validateInvalidResultEvidencePayload,
+  type AttemptEvidenceDiagnostic,
+  type AttemptEvidencePayload,
+  type AttemptEvidencePayloadSchema,
+  type AttemptForensicsPayload,
+  type EvidenceArtifactDescriptor,
+  type InvalidResultEvidencePayload,
+} from "./attempt-evidence.js";
+export {
   EFFECT_INTENT_PAYLOAD_MAX_BYTES,
   EFFECT_INTENT_SCHEMA,
   assertSameIdempotentEffect,
