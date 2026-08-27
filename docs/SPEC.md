@@ -292,7 +292,9 @@ onto one executor-owned commit whose sole parent is the exact safe publication
 anchor: the sealed source commit for a first publication, or the last confirmed
 task-ref head for an update. The resulting bounded bundle is independently
 verified and promoted as the run's exact subject before any GitHub push or pull
-request Effect is authorized.
+request Effect is authorized. The bundle's private advertised ref is derived
+from the exact checkpoint commit so byte-identical evidence can reuse one blob;
+the Checkpoint envelope, not that Git ref, binds Attempt and request identity.
 
 ### 5.5 Records
 

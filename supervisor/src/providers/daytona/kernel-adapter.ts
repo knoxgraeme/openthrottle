@@ -55,6 +55,7 @@ import {
 import {
   inspectKernelCheckpointBundle,
   inspectKernelIntegrationBundle,
+  isCompatibleOrdinaryCheckpointRef,
 } from "../../runtime/kernel-checkpoint-bundle.js";
 import {
   KERNEL_CHECKPOINT_ANCESTRY_MAX_ENTRIES,
@@ -1331,8 +1332,16 @@ export class DaytonaKernelAdapter implements
     );
     if (
       descriptor.ref.startsWith("refs/openthrottle/checkpoints/") &&
-      descriptor.ref !== `refs/openthrottle/checkpoints/${request.request_hash}`
-    ) throw new Error(`checkpoint artifact for ${request.attempt_id} changed its exact request ref`);
+      !isCompatibleOrdinaryCheckpointRef({
+        ref: descriptor.ref,
+        commit: descriptor.commit,
+        request_hash: request.request_hash,
+      })
+    ) {
+      throw new Error(
+        `checkpoint artifact for ${request.attempt_id} changed its commit or exact request ref`,
+      );
+    }
     return this.#options.blob_store.put({
       bytes,
       encoding: "binary",

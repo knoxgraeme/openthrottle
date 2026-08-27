@@ -370,7 +370,7 @@ function runtimeResult(request: KernelWorkActionRequest): Buffer {
   }));
 }
 
-function selfContainedCheckpointBundle(requestHash: string) {
+function selfContainedCheckpointBundle(requestHash: string, stableRef = false) {
   const root = mkdtempSync(join(tmpdir(), "ot-daytona-inspect-checkpoint-"));
   const repository = join(root, "repository");
   const bundle = join(root, "checkpoint.bundle");
@@ -389,7 +389,9 @@ function selfContainedCheckpointBundle(requestHash: string) {
       cwd: repository,
       encoding: "utf8",
     }).trim();
-    const ref = `refs/openthrottle/checkpoints/${requestHash}`;
+    const ref = `refs/openthrottle/checkpoints/${stableRef
+      ? createHash("sha256").update(commit, "utf8").digest("hex")
+      : requestHash}`;
     execFileSync("git", ["update-ref", ref, commit], { cwd: repository });
     execFileSync("git", ["bundle", "create", bundle, ref], { cwd: repository });
     const bytes = readFileSync(bundle);
@@ -885,7 +887,7 @@ describe("DaytonaKernelAdapter", () => {
 
   it("keeps an inspect checkpoint self-contained during result correction", async () => {
     const request = correctionRequest();
-    const artifact = selfContainedCheckpointBundle(request.request_hash);
+    const artifact = selfContainedCheckpointBundle(request.request_hash, true);
     const { execution, put } = correctionCheckpointExecution(request, artifact, null);
 
     await expect(execution).resolves.toMatchObject({

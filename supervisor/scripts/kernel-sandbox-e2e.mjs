@@ -43,7 +43,10 @@ import { OrdinaryKernelCoordinator } from "../dist/pipeline/kernel/ordinary-coor
 import { compileKernelCursor } from "../dist/pipeline/kernel/reducer.js";
 import { compileStructuredLoopFrontier } from "../dist/pipeline/kernel/structured-coordinator.js";
 import { DaytonaKernelAdapter } from "../dist/providers/daytona/kernel-adapter.js";
-import { inspectKernelCheckpointBundle } from "../dist/runtime/kernel-checkpoint-bundle.js";
+import {
+  inspectKernelCheckpointBundle,
+  ordinaryCheckpointRefForCommit,
+} from "../dist/runtime/kernel-checkpoint-bundle.js";
 import {
   parseKernelRuntimeResult,
   parseKernelSessionEvent,
@@ -582,10 +585,9 @@ class DockerKernelRuntime {
     assert.equal(inspected.ref, descriptor.ref);
     assert.equal(inspected.commit, descriptor.commit);
     assert.equal(inspected.tree, descriptor.tree);
-    if (
-      descriptor.ref.startsWith("refs/openthrottle/checkpoints/") &&
-      descriptor.ref !== `refs/openthrottle/checkpoints/${request.request_hash}`
-    ) throw new Error("checkpoint artifact changed its exact request ref");
+    if (descriptor.ref !== ordinaryCheckpointRefForCommit(descriptor.commit)) {
+      throw new Error("checkpoint artifact did not use its stable commit-derived ref");
+    }
     const token = this.blobs.put({
       bytes,
       encoding: "binary",

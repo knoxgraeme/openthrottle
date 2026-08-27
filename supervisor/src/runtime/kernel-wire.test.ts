@@ -16,6 +16,7 @@ import {
   parseKernelRuntimeResult,
   type KernelCheckpointArtifactDescriptor,
 } from "./kernel-wire.js";
+import { ordinaryCheckpointRefForCommit } from "./kernel-checkpoint-bundle.js";
 
 const INPUT_SUBJECT = "1".repeat(40);
 const EDITED_SUBJECT = "2".repeat(40);
@@ -67,6 +68,7 @@ function rawCorrectionResult(input: {
   request: KernelResultCorrectionRequest;
   outputSubject: string | null;
   artifactCommit?: string;
+  artifactRef?: string;
 }): string {
   return JSON.stringify({
     schema: KERNEL_RUNTIME_RESULT_SCHEMA,
@@ -83,6 +85,7 @@ function rawCorrectionResult(input: {
         input.request,
         input.outputSubject,
         input.artifactCommit,
+        input.artifactRef,
       ),
       candidate_hash: null,
       diagnostics: input.request.diagnostics,
@@ -94,6 +97,7 @@ function correctionCheckpoint(
   request: KernelResultCorrectionRequest,
   outputSubject: string | null,
   artifactCommit = request.locked_subject,
+  artifactRef = `refs/openthrottle/checkpoints/${REQUEST_HASH}`,
 ) {
   return {
     schema: ATTEMPT_CHECKPOINT_WIRE_SCHEMA,
@@ -112,7 +116,7 @@ function correctionCheckpoint(
       bytes: 1,
       media_type: "application/x-git-bundle",
       payload_schema: "openthrottle.git-checkpoint-bundle/v1",
-      ref: `refs/openthrottle/checkpoints/${REQUEST_HASH}`,
+      ref: artifactRef,
       commit: artifactCommit,
       tree: "d".repeat(40),
     },
@@ -244,6 +248,32 @@ describe("kernel correction checkpoint wire fencing", () => {
       request,
       artifacts: artifacts(),
     })).rejects.toThrow(/repository authority/);
+  });
+
+  it("accepts a stable commit-derived checkpoint ref while retaining legacy request refs", async () => {
+    const request = correctionRequest("inspect");
+
+    await expect(parseKernelRuntimeResult({
+      raw: rawCorrectionResult({
+        request,
+        outputSubject: null,
+        artifactCommit: INSPECT_CHECKPOINT_COMMIT,
+        artifactRef: ordinaryCheckpointRefForCommit(INSPECT_CHECKPOINT_COMMIT),
+      }),
+      request,
+      artifacts: artifacts(),
+    })).resolves.toMatchObject({ checkpoint: { output_subject: null } });
+
+    await expect(parseKernelRuntimeResult({
+      raw: rawCorrectionResult({
+        request,
+        outputSubject: null,
+        artifactCommit: INSPECT_CHECKPOINT_COMMIT,
+        artifactRef: `refs/openthrottle/checkpoints/${"f".repeat(64)}`,
+      }),
+      request,
+      artifacts: artifacts(),
+    })).rejects.toThrow(/commit or sealed request/);
   });
 
   it("requires edit corrections to retain the exact locked output subject", async () => {

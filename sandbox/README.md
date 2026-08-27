@@ -83,11 +83,13 @@ tool policy.
 
 Every completed attempt creates an executor-authored Git commit and a bounded,
 content-addressed bundle at
-`refs/openthrottle/checkpoints/<request_hash>`. The checkpoint separately binds
-the commit and accepted content tree. The supervisor can then request an
-idempotent fast-forward or deterministic three-way integration. Integrated
-output is another exact commit/bundle under a hash-derived integration ref;
-conflicts become `needs_human` evidence rather than agent-authored Git state.
+`refs/openthrottle/checkpoints/<sha256(commit)>`, allowing byte-identical bundle
+evidence to reuse one content-addressed blob. The checkpoint envelope separately
+binds the Attempt, request, commit, and accepted content tree. The supervisor
+can then request an idempotent fast-forward or deterministic three-way
+integration. Integrated output is another exact commit/bundle under a
+hash-derived integration ref; conflicts become `needs_human` evidence rather
+than agent-authored Git state.
 
 Runtime results and native-session observations are immutable, identity-bound
 files. A repeated launch with the same request and output path returns that
