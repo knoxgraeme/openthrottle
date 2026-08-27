@@ -13,6 +13,7 @@ import {
   runtimeStopStageId,
   digestCanonicalJson,
   type AttemptCheckpoint,
+  type BlobPointer,
   type CompiledPipelineManifest,
   type DecisionRecord,
   type DeliveryRecord,
@@ -694,6 +695,73 @@ async function claimAndStart(setupResult: ReturnType<typeof setup>): Promise<{
   return { attempt: sessionBound.current_attempt!, run: sessionBound.run };
 }
 
+function putInvalidResultEvidence(blobs: VolumeBlobStore): BlobPointer {
+  return blobs.put({
+    bytes: canonicalJson({
+      schema: "openthrottle.invalid-result-evidence/v1",
+      rejected_candidate: { raw: "{\"outcome\":\"invalid\"}" },
+      diagnostics: [{ path: "/payload", detail: "invalid" }],
+    }),
+    encoding: "utf-8",
+    media_type: "application/json",
+    payload_schema: "openthrottle.invalid-result-evidence/v1",
+  }).pointer;
+}
+
+async function prepareResultPendingTransition(
+  context: ReturnType<typeof setup>,
+  invalidResultEvidence: BlobPointer,
+): Promise<AtomicTransitionBundle> {
+  const started = await claimAndStart(context);
+  const checkpoint: AttemptCheckpoint = {
+    schema: ATTEMPT_CHECKPOINT_SCHEMA,
+    id: "checkpoint-result-pending",
+    pipeline_run_id: started.attempt.pipeline_run_id,
+    attempt_id: started.attempt.id,
+    request_hash: started.attempt.request_hash,
+    definition_bundle_hash: started.attempt.definition_bundle_hash,
+    input_subject: started.attempt.input_subject,
+    output_subject: subject("2"),
+    native_session_id: started.attempt.native_session_id,
+    payload_schema: "checkpoint/v1",
+    payload: { inline: { complete: true } },
+    captured_at: NOW,
+  };
+  await context.store.applyAtomicTransition(reduceKernelCommand({
+    manifest: context.pipelineManifest,
+    run: started.run,
+    current_attempt: started.attempt,
+    records: new Map(),
+    checkpoints: exactMap(checkpoint),
+    command: {
+      type: "work_complete",
+      command_id: "work-complete-result-pending",
+      attempt_id: started.attempt.id,
+      checkpoint_id: checkpoint.id,
+      verified_output_subject: subject("2"),
+      result_record_id: null,
+    },
+  }));
+  const completed = await context.store.loadExactReductionView({
+    pipeline_run_id: started.attempt.pipeline_run_id,
+    attempt_id: started.attempt.id,
+    record_ids: [],
+    checkpoint_ids: [checkpoint.id],
+  });
+  return reduceKernelCommand({
+    ...completed,
+    command: {
+      type: "result_pending",
+      command_id: "result-pending-with-evidence",
+      attempt_id: started.attempt.id,
+      candidate_hash: sha("e"),
+      diagnostics: [{ path: "/payload", detail: "invalid" }],
+      correction_deadline: "2026-08-20T12:15:00.000Z",
+      invalid_result_evidence: invalidResultEvidence,
+    },
+  });
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
@@ -716,6 +784,37 @@ describe("SqliteKernelStore", () => {
       });
       expect(admitted.run.status).toBe("pending");
       expect(Object.keys(admitted.run.active_attempt_versions)).toHaveLength(1);
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("rejects missing invalid-result evidence before initial Attempt admission", () => {
+    const context = setup();
+    try {
+      const invalidResultEvidence = putInvalidResultEvidence(context.blobs);
+      const initialAttempt = attempt({
+        ...context.admission.initial_attempts[0],
+        status: "result_pending",
+        native_session_id: "session-initial-pending",
+        result_correction_deadline: "2026-08-20T12:15:00.000Z",
+        pending_result: {
+          candidate_hash: sha("e"),
+          diagnostics: [{ path: "/payload", detail: "invalid" }],
+          invalid_result_evidence: invalidResultEvidence,
+        },
+      });
+      const admission = {
+        ...context.admission,
+        initial_attempts: [initialAttempt],
+        run: run([initialAttempt], context.admission.run.definition_bundle_hash),
+      };
+      rmSync(context.blobs.objectPath(invalidResultEvidence.digest));
+
+      expect(() => context.store.admitPipelineRun(admission)).toThrow(/object is missing/);
+      for (const table of ["definitions", "work_items", "pipeline_runs", "attempts"]) {
+        expect(context.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: 0 });
+      }
     } finally {
       context.db.close();
     }
@@ -1911,6 +2010,113 @@ describe("SqliteKernelStore", () => {
         ordinal: 1,
         input_subject: privateCandidate,
         output_subject: publishedSubject,
+      });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it.each(["missing", "corrupt"] as const)(
+    "rejects %s invalid-result evidence before the result_pending transition commits",
+    async (damage) => {
+      const context = setup();
+      try {
+        context.store.admitPipelineRun(context.admission);
+        const invalidResultEvidence = putInvalidResultEvidence(context.blobs);
+        const transition = await prepareResultPendingTransition(context, invalidResultEvidence);
+        if (damage === "missing") {
+          rmSync(context.blobs.objectPath(invalidResultEvidence.digest));
+        } else {
+          writeFileSync(
+            context.blobs.objectPath(invalidResultEvidence.digest),
+            Buffer.alloc(invalidResultEvidence.bytes, 0x78),
+          );
+        }
+
+        await expect(context.store.applyAtomicTransition(transition))
+          .rejects.toThrow(/failed integrity verification/);
+        expect(context.db.prepare(`
+          SELECT status, version, pending_candidate_hash, pending_diagnostics_json
+          FROM attempts WHERE id = 'attempt-1'
+        `).get()).toEqual({
+          status: "work_complete",
+          version: transition.expected.attempt_versions["attempt-1"],
+          pending_candidate_hash: null,
+          pending_diagnostics_json: null,
+        });
+        expect(context.db.prepare("SELECT version FROM pipeline_runs WHERE id = 'run-1'").get())
+          .toEqual({ version: transition.expected.run_version });
+      } finally {
+        context.db.close();
+      }
+    },
+  );
+
+  it("blocks active Attempt loads when invalid-result evidence becomes corrupt", async () => {
+    const context = setup();
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const invalidResultEvidence = putInvalidResultEvidence(context.blobs);
+      const transition = await prepareResultPendingTransition(context, invalidResultEvidence);
+      await context.store.applyAtomicTransition(transition);
+      writeFileSync(
+        context.blobs.objectPath(invalidResultEvidence.digest),
+        Buffer.alloc(invalidResultEvidence.bytes, 0x78),
+      );
+
+      await expect(context.store.loadExactReductionView({
+        pipeline_run_id: "run-1",
+        attempt_id: "attempt-1",
+        record_ids: [],
+        checkpoint_ids: [],
+      })).rejects.toMatchObject({
+        name: "KernelIntegrityError",
+        code: "KERNEL_BLOB_INTEGRITY",
+        evidence: {
+          pipeline_run_id: "run-1",
+          owner_kind: "attempt",
+          owner_id: "attempt-1",
+          digest: invalidResultEvidence.digest,
+          classification: "active_blocking",
+          operator_action: "restore_verified_blob_or_abandon_active_run",
+          detail: "sha256 digest mismatch",
+        },
+      });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("does not let an immutable Attempt lease replay bypass evidence verification", async () => {
+    const context = setup();
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const invalidResultEvidence = putInvalidResultEvidence(context.blobs);
+      const transition = await prepareResultPendingTransition(context, invalidResultEvidence);
+      await context.store.applyAtomicTransition(transition);
+      const request = {
+        worker_id: "worker-result-correction",
+        lease_id: "lease-result-correction",
+        expires_at: "2026-08-20T12:20:00.000Z",
+      };
+      await expect(context.store.leaseNextEligibleAttempt(request)).resolves.toMatchObject({
+        attempt: { status: "result_pending" },
+        lease: { id: request.lease_id, purpose: "result_correction" },
+      });
+      writeFileSync(
+        context.blobs.objectPath(invalidResultEvidence.digest),
+        Buffer.alloc(invalidResultEvidence.bytes, 0x78),
+      );
+
+      await expect(context.store.leaseNextEligibleAttempt(request)).rejects.toMatchObject({
+        name: "KernelIntegrityError",
+        code: "KERNEL_BLOB_INTEGRITY",
+        evidence: {
+          owner_kind: "attempt",
+          owner_id: "attempt-1",
+          digest: invalidResultEvidence.digest,
+          classification: "active_blocking",
+        },
       });
     } finally {
       context.db.close();

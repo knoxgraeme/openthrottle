@@ -174,7 +174,7 @@ export type KernelStoreFaultPoint =
 
 export interface KernelIntegrityEvidence {
   pipeline_run_id: string;
-  owner_kind: "record" | "checkpoint" | "effect" | "definition_bundle" | "work_item";
+  owner_kind: "attempt" | "record" | "checkpoint" | "effect" | "definition_bundle" | "work_item";
   owner_id: string;
   digest: string;
   classification: "active_blocking" | "settled_history_incident";
@@ -252,6 +252,7 @@ export class SqliteKernelStore implements
       Object.keys(input.run.active_effect_versions).length > 0 ||
       Object.keys(input.run.checkpoint_ids).length > 0
     ) throw new Error("a fresh pipeline run cannot contain effects or checkpoints");
+    this.#preverifyAttemptBlobs(input.initial_attempts);
     const workPayload = this.#payloadInput(input.work_item);
     const now = this.#now();
     this.#db.transaction(() => {
@@ -288,6 +289,7 @@ export class SqliteKernelStore implements
         record.pipeline_run_id !== input.run.id ||
         record.kind !== "decision" || record.input_record_ids.length !== 0)
     ) throw new Error("attached run seed records must be input-free executor decisions in the target run");
+    this.#preverifyAttemptBlobs(input.initial_attempts);
     const now = this.#now();
     this.#db.transaction(() => {
       const source = this.#db.prepare("SELECT work_item_id FROM pipeline_runs WHERE id = ?")
@@ -1361,10 +1363,14 @@ export class SqliteKernelStore implements
     const row = this.#db.prepare("SELECT * FROM attempts WHERE id = ? AND pipeline_run_id = ?")
       .get(id, runId) as AttemptRow | undefined;
     if (!row) throw new Error(`unknown attempt ${id} for pipeline run ${runId}`);
-    return attemptFromRow(row);
+    const attempt = attemptFromRow(row);
+    const evidence = attempt.pending_result?.invalid_result_evidence;
+    if (evidence) this.#readBlob(runId, "attempt", attempt.id, evidence);
+    return attempt;
   }
 
   #insertAttempt(attempt: KernelAttempt, now: string, workerId: string | null): void {
+    this.#preverifyAttemptBlobs([attempt]);
     const [parent, group, item, index] = scopeColumns(attempt.scope);
     const contextRecordIds = canonicalAttemptContextIds(
       attempt.context_record_ids,
@@ -1451,6 +1457,7 @@ export class SqliteKernelStore implements
         existing.lease_purpose !== attempt.lease.purpose
       )
     ) throw new Error(`attempt ${attempt.id} lease claim cannot change inside its fence`);
+    this.#preverifyAttemptBlobs([attempt]);
     const worker = attempt.lease?.worker_id ?? null;
     const changed = this.#db.prepare(`
       UPDATE attempts SET
@@ -1715,6 +1722,17 @@ export class SqliteKernelStore implements
       if ("blob" in checkpoint.payload) {
         this.#blobs.assertToken(this.#blobs.verify(checkpoint.payload.blob), checkpoint.payload.blob);
       }
+    }
+    this.#preverifyAttemptBlobs([
+      ...bundle.attempt_writes.flatMap((write) => write.kind === "replace" ? [write.attempt] : []),
+      ...bundle.create_attempts,
+    ]);
+  }
+
+  #preverifyAttemptBlobs(attempts: readonly KernelAttempt[]): void {
+    for (const attempt of attempts) {
+      const evidence = attempt.pending_result?.invalid_result_evidence;
+      if (evidence) this.#blobs.assertToken(this.#blobs.verify(evidence), evidence);
     }
   }
 

@@ -13,7 +13,6 @@ import type {
 } from "../pipeline/kernel/ports.js";
 import type { KernelAttempt, KernelRun } from "../pipeline/kernel/types.js";
 import {
-  attemptFromRow,
   parseJson,
   payloadPointer,
   type AttemptRow,
@@ -73,7 +72,7 @@ export class KernelLeaseOperations {
           replay.lease_worker_id !== request.worker_id ||
           replay.lease_expires_at !== request.expires_at
         ) throw new Error(`attempt lease ${request.lease_id} conflicts with its immutable replay`);
-        const attempt = attemptFromRow(replay);
+        const attempt = this.#attemptById(replay.id, replay.pipeline_run_id);
         return {
           run_id: replay.pipeline_run_id,
           run_version: replay.run_version,
