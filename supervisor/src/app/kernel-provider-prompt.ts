@@ -65,6 +65,14 @@ function signal(value: JsonValue | undefined): string | null {
   return null;
 }
 
+export function linearAgentActivityBody(payload: JsonValue): string {
+  const activity = nested(object(payload), "agentActivity");
+  const content = nested(activity, "content");
+  return typeof content?.body === "string"
+    ? content.body
+    : typeof activity?.body === "string" ? activity.body : "";
+}
+
 function linearPrompt(event: KernelInboxEvent): ProviderPrompt | null {
   if (event.kind !== "linear/agent-session-event/prompted@1") return null;
   const payload = object(event.payload);
@@ -76,10 +84,7 @@ function linearPrompt(event: KernelInboxEvent): ProviderPrompt | null {
   if (typeof identifier !== "string" || typeof messageId !== "string") {
     throw new Error("Linear prompted event is missing its issue or activity identity");
   }
-  const content = nested(activity, "content");
-  const rawBody = typeof content?.body === "string"
-    ? content.body
-    : typeof activity?.body === "string" ? activity.body : "";
+  const rawBody = linearAgentActivityBody(event.payload);
   const stop = signal(activity?.signal) === "stop";
   return {
     reference: identifier,
@@ -144,7 +149,7 @@ export class KernelProviderPromptHandler {
     this.#githubAuthorization = input.github_authorization;
   }
 
-  /** Null means this is not a provider follow-up and admission should inspect it. */
+  /** Null means admission should inspect this event as a possible first prompt. */
   async handle(event: KernelInboxEvent): Promise<KernelProviderPromptDisposition | null> {
     let prompt: ProviderPrompt | null;
     try {
@@ -156,7 +161,7 @@ export class KernelProviderPromptHandler {
     if (!ID.test(prompt.message_id)) return "dead";
 
     const run = this.#runs.resolveRun(prompt.reference);
-    if (!run) return null;
+    if (!run) return prompt.stop ? "stale" : null;
     if (event.source_provider === "github") {
       if (!prompt.github_authorization) return "stale";
       if (!await this.#githubAuthorization.authorizeComment(prompt.github_authorization)) {

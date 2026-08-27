@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { KernelInboxEvent } from "../persistence/kernel-inbox-store.js";
 import type { KernelRepositoryRegistrationPort } from "../persistence/kernel-registration-store.js";
-import { KernelAdmissionInboxHandler, selectKernelInboxPipeline } from "./kernel-inbox-handler.js";
+import {
+  KernelAdmissionInboxHandler,
+  linearAdmissionPrompt,
+  selectKernelInboxPipeline,
+} from "./kernel-inbox-handler.js";
 
 const structuredPlan = {
   schema: "openthrottle.execution-plan/v2",
@@ -22,6 +26,10 @@ const structuredPlan = {
   commands: [],
 };
 
+function structuredPlanBlock(marker = "json"): string {
+  return `\`\`\`${marker}\n${JSON.stringify(structuredPlan)}\n\`\`\``;
+}
+
 describe("kernel inbox pipeline selection", () => {
   it("routes ordinary unplanned work through filesystem-defined admission", () => {
     expect(selectKernelInboxPipeline([], "Fix the failing behavior.")).toBe("core/admission");
@@ -35,6 +43,105 @@ describe("kernel inbox pipeline selection", () => {
     const prompt = `Execute this plan.\n\n\`\`\`json openthrottle.execution-plan/v2\n${JSON.stringify(structuredPlan)}\n\`\`\``;
     expect(selectKernelInboxPipeline([], prompt)).toBe("core/structured");
     expect(selectKernelInboxPipeline([], `${prompt}\n${prompt}`)).toBe("core/admission");
+  });
+
+  it("restores a valid plan fence normalized by Linear before routing and sealing", () => {
+    const prompt = linearAdmissionPrompt({
+      event_kind: "linear/agent-session-event/created@1",
+      title: "Execute the accepted plan",
+      description: "Use the exact bounded units.",
+      payload: { promptContext: structuredPlanBlock() },
+    });
+
+    expect(prompt).toContain("```json openthrottle.execution-plan/v2\n");
+    expect(selectKernelInboxPipeline([], prompt)).toBe("core/structured");
+  });
+
+  it.each([
+    ["two normalized plans", `${structuredPlanBlock()}\n${structuredPlanBlock()}`],
+    [
+      "one tagged and one normalized plan",
+      `${structuredPlanBlock("json openthrottle.execution-plan/v2")}\n${structuredPlanBlock()}`,
+    ],
+  ])("keeps Linear plan ambiguity fail closed for %s", (_label, promptContext) => {
+    const prompt = linearAdmissionPrompt({
+      event_kind: "linear/agent-session-event/created@1",
+      title: "Ambiguous plan",
+      description: "Do not choose between plan blocks.",
+      payload: { promptContext },
+    });
+
+    expect(selectKernelInboxPipeline([], prompt)).toBe("core/admission");
+  });
+
+  it.each([
+    ["unrelated JSON", "```json\n{\"answer\":42}\n```"],
+    ["malformed JSON", "```json\n{not-json}\n```"],
+    [
+      "a JSON block with another schema",
+      "```json\n{\"schema\":\"example.execution-plan/v1\"}\n```",
+    ],
+    [
+      "a multi-token fence Linear did not normalize",
+      structuredPlanBlock("json unrelated-marker"),
+    ],
+    [
+      "an invalid plan shape",
+      "```json\n{\"schema\":\"openthrottle.execution-plan/v2\",\"pipeline_id\":\"core/structured\"}\n```",
+    ],
+    [
+      "a plan for another pipeline",
+      `\`\`\`json\n${JSON.stringify({ ...structuredPlan, pipeline_id: "core/implement" })}\n\`\`\``,
+    ],
+    [
+      "a schema mention outside a fence",
+      'The prose says {"schema":"openthrottle.execution-plan/v2"}.',
+    ],
+  ])("does not promote %s after Linear prompt normalization", (_label, promptContext) => {
+    const prompt = linearAdmissionPrompt({
+      event_kind: "linear/agent-session-event/created@1",
+      title: "Ordinary task",
+      description: "Keep admission authoritative.",
+      payload: { promptContext },
+    });
+
+    expect(selectKernelInboxPipeline([], prompt)).toBe("core/admission");
+  });
+
+  it("uses the activity body for a no-run Linear prompt", () => {
+    const prompt = linearAdmissionPrompt({
+      event_kind: "linear/agent-session-event/prompted@1",
+      title: "Execute the accepted plan",
+      description: "Use the exact bounded units.",
+      payload: {
+        promptContext: "Stale context must not replace the prompted directive.",
+        agentActivity: {
+          id: "activity-1",
+          body: "Fallback body must not replace content.body.",
+          content: { body: structuredPlanBlock() },
+        },
+      },
+    });
+
+    expect(prompt).toContain("```json openthrottle.execution-plan/v2\n");
+    expect(prompt).not.toContain("Stale context");
+    expect(prompt).not.toContain("Fallback body");
+    expect(selectKernelInboxPipeline([], prompt)).toBe("core/structured");
+  });
+
+  it("keeps created-session prompt context authoritative over activity content", () => {
+    const prompt = linearAdmissionPrompt({
+      event_kind: "linear/agent-session-event/created@1",
+      title: "Created session",
+      description: "Use the created-session context.",
+      payload: {
+        promptContext: "Created-session directive.",
+        agentActivity: { id: "activity-1", body: "Unrelated activity body." },
+      },
+    });
+
+    expect(prompt).toContain("Created-session directive.");
+    expect(prompt).not.toContain("Unrelated activity body.");
   });
 
   it("preserves the explicit investigate route", () => {

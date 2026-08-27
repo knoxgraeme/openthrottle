@@ -87,6 +87,12 @@ function status(overrides: Partial<KernelStatusProjection> = {}): KernelStatusPr
 function handler(input: {
   projected?: KernelStatusProjection;
   authorizeGithubComment?: (input: { repository: string; username: string }) => Promise<boolean>;
+  resolveRun?: () => {
+    pipeline_run_id: string;
+    work_item_id: string;
+    source_provider: "linear";
+    source_reference: string;
+  } | undefined;
 } = {}) {
   const requestRunControl = vi.fn(async () => ({ disposition: "consumed" as const }));
   const enqueueSteering = vi.fn(async () => ({
@@ -98,12 +104,12 @@ function handler(input: {
   }));
   return {
     value: new KernelProviderPromptHandler({
-      runs: { resolveRun: () => ({
+      runs: { resolveRun: input.resolveRun ?? (() => ({
         pipeline_run_id: "run-1",
         work_item_id: "work-1",
-        source_provider: "linear",
+        source_provider: "linear" as const,
         source_reference: "OPE-188",
-      }) },
+      })) },
       projections: {
         getStatus: () => input.projected ?? status(),
         listLog: () => ({ entries: [], next_cursor: null, truncated: false }),
@@ -132,6 +138,41 @@ describe("KernelProviderPromptHandler", () => {
       pipeline_run_id: "run-1",
       attempt_id: "attempt-1",
     });
+  });
+
+  it("accepts Linear's top-level activity body shape", async () => {
+    const test = handler();
+    await expect(test.value.handle(event({
+      payload: {
+        agentSession: { issue: { identifier: "OPE-188" } },
+        agentActivity: {
+          id: "activity-1",
+          body: "Please use the exact follow-up body.",
+        },
+      },
+    }))).resolves.toBe("consumed");
+    expect(test.enqueueSteering).toHaveBeenCalledWith(expect.objectContaining({
+      body: "Please use the exact follow-up body.",
+    }));
+  });
+
+  it("hands a Linear prompt without an existing run back to admission", async () => {
+    const test = handler({ resolveRun: () => undefined });
+    await expect(test.value.handle(event())).resolves.toBeNull();
+    expect(test.requestRunControl).not.toHaveBeenCalled();
+    expect(test.enqueueSteering).not.toHaveBeenCalled();
+  });
+
+  it("settles a Linear stop without an existing run instead of admitting it", async () => {
+    const test = handler({ resolveRun: () => undefined });
+    await expect(test.value.handle(event({
+      payload: {
+        agentSession: { issue: { identifier: "OPE-188" } },
+        agentActivity: { id: "activity-1", signal: { type: "stop" } },
+      },
+    }))).resolves.toBe("stale");
+    expect(test.requestRunControl).not.toHaveBeenCalled();
+    expect(test.enqueueSteering).not.toHaveBeenCalled();
   });
 
   it("routes a Linear stop signal through the shared run controller", async () => {

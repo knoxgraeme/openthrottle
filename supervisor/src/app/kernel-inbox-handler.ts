@@ -1,4 +1,10 @@
-import { digestCanonicalJson, type JsonValue, type TrustedCompilerEnvironment, type TrustedPlatformDefinitionSource } from "@openthrottle/contracts";
+import {
+  digestCanonicalJson,
+  EXECUTION_PLAN_SCHEMA_V2,
+  type JsonValue,
+  type TrustedCompilerEnvironment,
+  type TrustedPlatformDefinitionSource,
+} from "@openthrottle/contracts";
 import type { KernelInboxEvent } from "../persistence/kernel-inbox-store.js";
 import type { SqliteKernelStore } from "../persistence/kernel-store.js";
 import type { VolumeBlobStore } from "../persistence/blob-store.js";
@@ -11,9 +17,11 @@ import {
   kernelLinearSessionStartRequest,
   type KernelLinearSessionStartPort,
 } from "./kernel-linear-session.js";
+import { linearAgentActivityBody } from "./kernel-provider-prompt.js";
 
 const SUBJECT = /^[a-f0-9]{40,64}$/;
 const DEFAULT_GITHUB_SUBJECT_TIMEOUT_MS = 15_000;
+const MARKDOWN_FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
 
 function object(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -32,6 +40,38 @@ function strings(value: unknown): string[] {
     const item = object(entry);
     return typeof item?.name === "string" ? [item.name] : [];
   });
+}
+
+function restoreLinearExecutionPlanFences(prompt: string): string {
+  return prompt.replace(MARKDOWN_FENCE_PATTERN, (block, rawMarker: string, body: string) => {
+    if (rawMarker.trim() !== "json") return block;
+    let value: unknown;
+    try {
+      value = JSON.parse(body.trim()) as unknown;
+    } catch {
+      return block;
+    }
+    const schema = value && typeof value === "object" && !Array.isArray(value)
+      ? (value as { schema?: unknown }).schema
+      : undefined;
+    if (schema !== EXECUTION_PLAN_SCHEMA_V2) return block;
+    return `\`\`\`json ${EXECUTION_PLAN_SCHEMA_V2}\n${body}\`\`\``;
+  });
+}
+
+export function linearAdmissionPrompt(input: {
+  event_kind: "linear/agent-session-event/created@1" | "linear/agent-session-event/prompted@1";
+  title: string;
+  description: string;
+  payload: JsonValue;
+}): string {
+  const payload = object(input.payload);
+  const directive = input.event_kind === "linear/agent-session-event/prompted@1"
+    ? linearAgentActivityBody(input.payload)
+    : typeof payload?.promptContext === "string" ? payload.promptContext : "";
+  return restoreLinearExecutionPlanFences(
+    [input.title, input.description, directive].filter(Boolean).join("\n\n"),
+  );
 }
 
 export function selectKernelInboxPipeline(labels: readonly string[], prompt: string): string {
@@ -155,6 +195,9 @@ export class KernelAdmissionInboxHandler {
     if (!payload) return null;
     if (event.source_provider === "linear") {
       if (!/^linear\/agent-session-event\/(?:created|prompted)@1$/.test(event.kind)) return null;
+      const eventKind = event.kind === "linear/agent-session-event/created@1"
+        ? event.kind
+        : "linear/agent-session-event/prompted@1";
       const session = nested(payload, "agentSession");
       const issue = nested(session, "issue");
       const team = nested(issue, "team");
@@ -167,8 +210,12 @@ export class KernelAdmissionInboxHandler {
       const identifier = typeof issue.identifier === "string" ? issue.identifier : event.delivery_id;
       const title = typeof issue.title === "string" ? issue.title : identifier;
       const description = typeof issue.description === "string" ? issue.description : "";
-      const promptContext = typeof payload.promptContext === "string" ? payload.promptContext : "";
-      const prompt = [title, description, promptContext].filter(Boolean).join("\n\n");
+      const prompt = linearAdmissionPrompt({
+        event_kind: eventKind,
+        title,
+        description,
+        payload: event.payload,
+      });
       const labels = strings(issue.labels);
       return {
         registration_id: registration.id,
