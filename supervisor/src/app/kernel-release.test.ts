@@ -15,7 +15,7 @@ describe("loadKernelReleaseDefinitions", () => {
     expect(release.compiler_environment.descriptor.compiler_version)
       .toBe("definition-compiler/v1");
     expect(release.runtime_capabilities.protocol).toBe("attempt-executor@2");
-    expect(release.execution_policy.max_concurrent_attempts).toBe(1);
+    expect(release.execution_policy.max_concurrent_attempts).toBe(2);
     expect(release.execution_policy.runtime_capability_digest)
       .toBe(release.compiler_environment.descriptor.runtime_capability_digest);
     expect(release.trusted_platform_definitions.get(

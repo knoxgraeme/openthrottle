@@ -272,7 +272,10 @@ function requestSeal(input: {
     input_subject: input.input_subject,
     context: input.action_inputs.context,
   });
-  const runtimeResource = resolveKernelRuntimeResourceIdentity(input.action_inputs.context.records);
+  const runtimeResource = resolveKernelRuntimeResourceIdentity(
+    input.action_inputs.context.records,
+    input.scope,
+  );
   return {
     schema: REQUEST_SEAL_SCHEMA,
     pipeline_run_id: input.pipeline_run_id,
@@ -511,7 +514,10 @@ export function buildKernelWorkActionRequest(input: {
     worker_id: attempt.lease.worker_id,
     task_prompt: assertTaskPrompt(input.action_inputs.task_prompt),
     context: input.action_inputs.context,
-    runtime_resource: resolveKernelRuntimeResourceIdentity(input.action_inputs.context.records),
+    runtime_resource: resolveKernelRuntimeResourceIdentity(
+      input.action_inputs.context.records,
+      attempt.scope,
+    ),
     change_boundary: changeBoundary({
       stage: selection.stage,
       input_subject: attempt.input_subject,

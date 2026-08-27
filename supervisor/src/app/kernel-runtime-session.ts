@@ -17,7 +17,6 @@ import type {
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
 const GIT_SUBJECT = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
-const MAX_BIND_CAS_ATTEMPTS = 3;
 
 function validId(value: string, name: string): void {
   if (typeof value !== "string" || !ID.test(value)) {
@@ -136,6 +135,7 @@ function liveBinding(input: {
     definition_bundle_hash: attempt.definition_bundle_hash,
     input_subject: attempt.input_subject,
     native_session_id: attempt.native_session_id,
+    scope: attempt.scope,
     generation: deriveKernelSteeringGeneration({
       attempt_version: attempt.version,
       work_retry_ordinal: attempt.work_retry_ordinal,
@@ -222,8 +222,8 @@ export class KernelRuntimeSessionService implements KernelRuntimeSessionBindingP
     request: KernelRuntimeSessionBindRequest,
   ): Promise<KernelRuntimeSessionBinding> {
     assertRequestShape(request);
-    for (let casAttempt = 0; casAttempt < MAX_BIND_CAS_ATTEMPTS; casAttempt += 1) {
-      const view = await this.#load(request.pipeline_run_id, request.attempt_id);
+    let view = await this.#load(request.pipeline_run_id, request.attempt_id);
+    while (true) {
       const attempt = assertBindFences({ view, request, now: this.#now() });
       if (attempt.native_session_id !== null) {
         if (attempt.native_session_id !== request.native_session_id) {
@@ -245,8 +245,11 @@ export class KernelRuntimeSessionService implements KernelRuntimeSessionBindingP
       try {
         await this.#transitions.applyAtomicTransition(bundle);
       } catch (error) {
-        if (casAttempt + 1 < MAX_BIND_CAS_ATTEMPTS && staleTransition(error)) continue;
-        throw error;
+        if (!staleTransition(error)) throw error;
+        const refreshed = await this.#load(request.pipeline_run_id, request.attempt_id);
+        if (refreshed.run.version <= view.run.version) throw error;
+        view = refreshed;
+        continue;
       }
       const binding = liveBinding({
         run: bundle.run,
@@ -256,7 +259,6 @@ export class KernelRuntimeSessionService implements KernelRuntimeSessionBindingP
       if (!binding) throw new Error("runtime session transition did not produce a live binding");
       return binding;
     }
-    throw new Error("runtime session binding exhausted compare-and-set retries");
   }
 
   async loadCurrentRuntimeSession(input: {

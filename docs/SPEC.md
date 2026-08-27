@@ -47,10 +47,15 @@ signed provider event / operator command
 ```
 
 At most one reducer transition owns a run cursor version. The protocol retains
-bounded frontiers of independent Attempts. The kernel admits up to a configured
-number of live Attempts across distinct runs (default one), with at most one
-live Attempt per run in this release. Cross-run overlap must not become
-concurrent mutation of any one run cursor.
+bounded frontiers of independent Attempts. Across all runs, live leases are
+bounded by `OT_EXECUTION_WIDTH` (default one). This release may co-lease at most
+two compatible inspect loop/fanout members from one run when their authored
+stage permits it, and only on distinct slots in that run's fixed Daytona pool.
+Same-slot members and every stage-scoped, edit, command, effect, wait, and
+integration Attempt remain serial within a run. Actual same-run overlap thus
+requires `OT_EXECUTION_WIDTH` of at least two. Reducer transitions remain
+serialized and cross-run overlap must not become concurrent mutation of any one
+run cursor.
 
 ## 3. Filesystem definitions
 
@@ -459,12 +464,24 @@ publication.
 
 Structured execution parses the exact validated execution plan from the sealed
 task prompt. It compiles a bounded dependency frontier with stable Attempt IDs.
-Dependencies determine eligibility. The kernel may execute eligible Attempts
-concurrently only across distinct runs, up to the configured execution width
-(default one); this release admits at most one live Attempt per run. The
-complete frontier remains durable and visible, so execution width changes
-overlap, not plan cardinality. Deterministic dependency evidence is merged into
-each action context.
+Dependencies determine eligibility. Edit/unit implementation and every
+stage-scoped, command, effect, wait, and integration Attempt remain serial
+within a run. The only same-run co-leasing admitted in this release is at most
+two compatible inspect members from one loop/fanout cohort with the same exact
+bundle and input subject, an authored parallel bound above one, and distinct
+fixed Daytona pool slots. Incompatible or same-slot members remain queued.
+Across all runs, live leases remain bounded by `OT_EXECUTION_WIDTH` (default
+one), so actual overlap requires a value of at least two. The complete frontier
+remains durable and visible, so execution width changes overlap, not plan
+cardinality. Deterministic dependency evidence is merged into each action
+context.
+
+Structured fan-in orders members by authored index and then member ID and uses
+the first member as its canonical anchor. Uniform and divergent wave decisions,
+successor Attempts, context, dependencies, and checkpoint lineage therefore do
+not depend on settlement order. The aggregate decision cites every member
+Result and preserves all invalid-result, correction, and retry-forensics inputs
+from the member decisions.
 
 Each unit cycles through edit implementation/simplification, commands,
 inspect-only lead acceptance, optional edit repair, and an integration Effect.
@@ -474,11 +491,13 @@ exact subject; a unit whose base is stale must be reconciled explicitly.
 After all units integrate, whole-change commands run. An inspect selector
 chooses up to `core/persona-selection.payload.personas.max_items` entries from
 the sealed reviewer-skill allowlist (currently five). Each selected persona is
-an independent scoped inspect Attempt; the per-run dependency chain executes
-the complete roster serially against the same subject. An inspect validation
-action confirms blocking findings. Confirmed blockers schedule a separate edit
-final-repair Attempt and repeat the bounded assurance cycle; advisory findings
-do not gain transition authority.
+an independent scoped inspect Attempt. The persona loop permits two compatible
+members to overlap against the same exact integrated subject on distinct fixed
+pool slots, subject to the global execution width; remaining members stay
+queued and the complete roster is never truncated. Fan-in remains independent
+of settlement order. An inspect validation action confirms blocking findings.
+Confirmed blockers schedule a separate edit final-repair Attempt and repeat the
+bounded assurance cycle; advisory findings do not gain transition authority.
 
 Structured planning and recovery query Attempts by exact run, bundle, parent,
 scope group, stage, member, and settled status. They do not infer state by
@@ -549,10 +568,18 @@ the production composition in this acceptance boundary.
 Multi-phase operations checkpoint each confirmed phase.
 
 Provisioning expands privately into provision, stop, and cleanup lifecycle
-ownership. Every terminal path—success, failure, human intervention, stop,
-supersede, retry exhaustion—must either independently prove provisioning never
-committed or schedule cleanup from exact confirmed create evidence. A runtime
-resource cannot be considered clean from an agent statement.
+ownership for one fixed run-scoped pool. The supervisor derives the pool size
+from the exact manifest, confirms every slot's create/start pair before normal
+execution, and deterministically maps each scope to one slot. Same-slot work is
+never co-leased. Stop, cleanup, and provider-backed infrastructure recovery own
+the complete pool rather than replacing one slot independently. Partial
+provisioning cleans every confirmed create; whole-pool replacement is not
+allowed to replay a sibling in `work_complete`, `result_pending`, or `recorded`
+and fails to `needs_human` when safe recovery cannot be proven. Every terminal
+path—success, failure, human intervention, stop, supersede, retry
+exhaustion—must either independently prove provisioning never committed or
+schedule cleanup from exact confirmed create evidence. A runtime resource
+cannot be considered clean from an agent statement.
 
 ## 9. Persistence and blobs
 

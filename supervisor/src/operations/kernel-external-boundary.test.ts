@@ -168,11 +168,39 @@ function realWaitBinding(): KernelExternalStagePlanBinding {
   return bindings.find(({ external_kind }) => external_kind === "core/provider-wait@1")!;
 }
 
+function realLifecycleBindings(): readonly KernelExternalStagePlanBinding[] {
+  const bindings = createKernelExternalPlanBindings({
+    environments: {
+      loadExactRunEnvironment: () => ({
+        pipeline_run_id: "run-1",
+        work_item_id: "work-1",
+        repository_registration_id: "repo-1",
+        repository: "owner/repo",
+        base_branch: "main",
+        runtime_snapshot: "snapshot-1",
+        control_provider: "github",
+        source_provider: "github",
+        source_id: "issue-1",
+        source_reference: "owner/repo#1",
+        title: "Runtime pool proof",
+        current_subject: SUBJECT,
+      }),
+    },
+    blob_store: {} as never,
+  });
+  return bindings.filter(({ external_kind }) => [
+    "core/daytona-provision@1",
+    "core/daytona-stop@1",
+    "core/daytona-cleanup@1",
+  ].includes(external_kind));
+}
+
 function manifest(input: {
   bundle_hash: string;
   external_kind?: string;
   stage_kind?: "effect" | "wait";
   terminal?: boolean;
+  pool_size?: number;
 }): CompiledPipelineManifest {
   const stageKind = input.stage_kind ?? "effect";
   const authoredStages: CompiledPipelineManifest["stages"] = [
@@ -181,6 +209,14 @@ function manifest(input: {
         id: "external",
         kind: "effect",
         effect: input.external_kind ?? "core/publish@1",
+        ...(input.pool_size === undefined ? {} : {
+          loop: {
+            over: "execution_plan.units",
+            max_parallel: input.pool_size,
+            max_rounds: 1,
+            body: ["external"],
+          },
+        }),
         on: input.terminal === false
           ? { success: { to: "next" } }
           : {
@@ -224,12 +260,13 @@ function manifest(input: {
 function initialAttempt(
   currentManifest: CompiledPipelineManifest,
   inputSubject = SUBJECT,
+  stageId = "external",
 ): KernelAttempt {
   return {
     schema: "openthrottle.kernel-attempt/v1",
     id: "attempt-1",
     pipeline_run_id: "run-1",
-    scope: { kind: "stage", stage_id: "external" },
+    scope: { kind: "stage", stage_id: stageId },
     repository_authority: "inspect",
     request_hash: "d".repeat(64),
     definition_bundle_hash: currentManifest.definition_bundle_hash,
@@ -271,8 +308,9 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
     readonly currentManifest: CompiledPipelineManifest,
     inputSubject = SUBJECT,
     readonly taskPrompt = "Execute the plan.",
+    initialStageId = "external",
   ) {
-    const attempt = initialAttempt(currentManifest, inputSubject);
+    const attempt = initialAttempt(currentManifest, inputSubject, initialStageId);
     this.attempts.set(attempt.id, attempt);
     this.run = {
       schema: "openthrottle.kernel-run/v1",
@@ -282,7 +320,7 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
       current_subject: inputSubject,
       status: "running",
       terminal_outcome: null,
-      cursor: compileKernelCursor({ stage_id: "external", version: 0, attempts: [attempt] }),
+      cursor: compileKernelCursor({ stage_id: initialStageId, version: 0, attempts: [attempt] }),
       version: 1,
       work_retry_limit: 2,
       result_correction_limit: 2,
@@ -398,15 +436,33 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
 
   acknowledgePhase(
     phase: string,
-    status: "confirmed" | "rejected" = "confirmed",
+    status: "confirmed" | "rejected" | readonly ("confirmed" | "rejected" | null)[] = "confirmed",
     observedVia: "provider" | "operator_resolution" = "provider",
     attemptId = "attempt-1",
   ): void {
     const key = `external-schedule:${attemptId}:${phase}`;
     const schedule = this.schedules.get(key);
     if (!schedule) throw new Error(`missing phase ${phase}`);
+    if (Array.isArray(status) && status.length !== schedule.effects.length) {
+      throw new Error(`phase ${phase} status roster has another cardinality`);
+    }
     const effects = schedule.effects.map(({ intent }, index) => {
+      const effectStatus = typeof status === "string" ? status : status[index]!;
+      if (effectStatus === null) return { intent, delivery: null };
       const integration = intent.kind === "daytona/integrate-checkpoint@1";
+      const lifecycle = [
+        "daytona/create-sandbox@1",
+        "daytona/start-sandbox@1",
+        "daytona/stop-sandbox@1",
+        "daytona/cleanup-sandbox@1",
+      ].includes(intent.kind);
+      const lifecycleIdentity = lifecycle
+        ? (intent.payload as { identity: string }).identity
+        : null;
+      const lifecycleSandboxId = lifecycleIdentity === null
+        ? null
+        : `sandbox-${schedule.effects.map(({ intent: candidate }) =>
+          (candidate.payload as { identity: string }).identity).sort().indexOf(lifecycleIdentity) + 1}`;
       if (integration && observedVia === "operator_resolution") {
         const delivery = createOperatorEffectRejectionDelivery({
           request: {
@@ -438,8 +494,8 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
         effect_id: intent.id,
         idempotency_key: intent.idempotency_key,
         external_identity: intent.target,
-        status,
-        payload_schema: integration ? "openthrottle.effect-delivery/v1" : "delivery/v1",
+        status: effectStatus,
+        payload_schema: integration || lifecycle ? "openthrottle.effect-delivery/v1" : "delivery/v1",
         payload: { inline: integration ? {
           effect_kind: intent.kind,
           provider: "daytona",
@@ -458,6 +514,25 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
             checkpoint_blob: INTEGRATION_BLOB,
             reason: null,
           },
+        } : lifecycle ? {
+          effect_kind: intent.kind,
+          provider: "daytona",
+          observed_via: "post_dispatch_reconciliation",
+          result: {
+            identity: lifecycleIdentity!,
+            sandbox_id: effectStatus === "rejected" && intent.kind === "daytona/create-sandbox@1"
+              ? null
+              : lifecycleSandboxId,
+            resource_state: effectStatus === "rejected" && intent.kind === "daytona/create-sandbox@1"
+              ? "absent"
+              : phase === "start"
+                ? "started"
+                : phase === "create"
+                  ? "created"
+                  : phase === "stop"
+                    ? "stopped"
+                    : "absent",
+          },
         } : { result: { sandbox_id: "sandbox-1" } } },
         created_at: NOW,
       };
@@ -466,7 +541,9 @@ class MemoryExternalStore implements KernelExternalBoundaryStore {
     });
     this.schedules.set(key, { ...schedule, effects });
     const active = { ...this.run.active_effect_versions };
-    for (const { intent } of effects) delete active[intent.id];
+    for (const { intent, delivery } of effects) {
+      if (delivery !== null) delete active[intent.id];
+    }
     this.run = { ...this.run, version: this.run.version + 1, active_effect_versions: active };
   }
 }
@@ -670,6 +747,187 @@ describe("kernel external boundary bridge", () => {
       .resolves.toMatchObject({ disposition: "waiting", phase: "observe" });
     expect(store.schedules.get("external-schedule:attempt-1:observe")!.effects[0]!.intent)
       .toEqual(scheduled.effects[0]!.intent);
+  });
+
+  it("atomically schedules a fixed pool, waits for every create, then replays the exact N starts", async () => {
+    const definitionBundle = bundle();
+    const currentManifest = manifest({
+      bundle_hash: digestCanonicalJson(definitionBundle),
+      pool_size: 3,
+    });
+    const store = new MemoryExternalStore(
+      currentManifest,
+      SUBJECT,
+      "Execute the plan.",
+      RUNTIME_PROVISION_STAGE_ID,
+    );
+    const bridge = coordinator({
+      store,
+      definition_bundle: definitionBundle,
+      plans: realLifecycleBindings(),
+    });
+
+    const createStep = await bridge.executeLeasedAttempt(store.leased());
+    expect(createStep).toMatchObject({ disposition: "scheduled", phase: "create" });
+    if (createStep.disposition !== "scheduled") throw new Error("create phase was not scheduled");
+    expect(createStep.effect_ids).toHaveLength(3);
+    const createSchedule = store.schedules.get("external-schedule:attempt-1:create")!;
+    expect(createSchedule.effects.map(({ intent }) => intent.id).sort())
+      .toEqual([...createStep.effect_ids].sort());
+    expect(store.applied.filter(({ put_effects }) => put_effects.length > 0)).toHaveLength(1);
+    expect(store.applied.find(({ put_effects }) => put_effects.length > 0)?.put_effects)
+      .toEqual(createSchedule.effects.map(({ intent }) => intent));
+    expect([...store.checkpoints.values()][0]).toMatchObject({
+      payload: { inline: { evidence: {
+        schema: "openthrottle.daytona-runtime-pool/v1",
+        pool_size: 3,
+        target_count: 3,
+      } } },
+    });
+
+    const replayStore = new MemoryExternalStore(
+      currentManifest,
+      SUBJECT,
+      "Execute the plan.",
+      RUNTIME_PROVISION_STAGE_ID,
+    );
+    const replayBridge = coordinator({
+      store: replayStore,
+      definition_bundle: definitionBundle,
+      plans: realLifecycleBindings(),
+    });
+    const replayStep = await replayBridge.executeLeasedAttempt(replayStore.leased());
+    expect(replayStep).toEqual(createStep);
+    expect(replayStore.schedules.get("external-schedule:attempt-1:create"))
+      .toEqual(createSchedule);
+    expect([...replayStore.checkpoints.values()]).toEqual([...store.checkpoints.values()]);
+
+    store.acknowledgePhase("create", ["confirmed", null, null]);
+    await expect(bridge.resumeAttempt({ pipeline_run_id: "run-1", attempt_id: "attempt-1" }))
+      .resolves.toMatchObject({ disposition: "waiting", phase: "create" });
+    expect(store.schedules.has("external-schedule:attempt-1:start")).toBe(false);
+    expect(store.schedules.get("external-schedule:attempt-1:create")?.effects
+      .map(({ intent }) => intent.id).sort()).toEqual([...createStep.effect_ids].sort());
+
+    store.acknowledgePhase("create");
+    const startStep = await bridge.resumeReadyAttempt();
+    expect(startStep).toMatchObject({ disposition: "scheduled", phase: "start" });
+    if (startStep.disposition !== "scheduled") throw new Error("start phase was not scheduled");
+    expect(startStep.effect_ids).toHaveLength(3);
+    const startSchedule = store.schedules.get("external-schedule:attempt-1:start")!;
+    expect(startSchedule.effects.map(({ intent }) => intent.id).sort())
+      .toEqual([...startStep.effect_ids].sort());
+    expect(store.applied.filter(({ put_effects }) => put_effects.length > 0)
+      .map(({ put_effects }) => put_effects.length)).toEqual([3, 3]);
+    await expect(bridge.resumeAttempt({ pipeline_run_id: "run-1", attempt_id: "attempt-1" }))
+      .resolves.toMatchObject({ disposition: "waiting", phase: "start" });
+    expect(store.schedules.get("external-schedule:attempt-1:start")).toEqual(startSchedule);
+  });
+
+  it("routes every confirmed-created target through stop after partial create or start rejection", async () => {
+    for (const rejectedPhase of ["create", "start"] as const) {
+      const definitionBundle = bundle();
+      const currentManifest = manifest({
+        bundle_hash: digestCanonicalJson(definitionBundle),
+        pool_size: 3,
+      });
+      const store = new MemoryExternalStore(
+        currentManifest,
+        SUBJECT,
+        "Execute the plan.",
+        RUNTIME_PROVISION_STAGE_ID,
+      );
+      const bridge = coordinator({
+        store,
+        definition_bundle: definitionBundle,
+        plans: realLifecycleBindings(),
+      });
+
+      await bridge.executeLeasedAttempt(store.leased());
+      if (rejectedPhase === "start") {
+        store.acknowledgePhase("create");
+        await expect(bridge.resumeReadyAttempt()).resolves.toMatchObject({
+          disposition: "scheduled",
+          phase: "start",
+        });
+        store.acknowledgePhase("start", ["confirmed", "rejected", "rejected"]);
+      } else {
+        store.acknowledgePhase("create", ["confirmed", "rejected", "rejected"]);
+      }
+
+      await expect(bridge.resumeReadyAttempt()).resolves.toMatchObject({
+        disposition: "settled",
+        outcome: "failure",
+        next_stage_id: runtimeStopStageId("failed"),
+      });
+      const deliveredCreateSchedule = store.schedules.get("external-schedule:attempt-1:create")!;
+      const confirmedCreatedIdentities = deliveredCreateSchedule.effects.flatMap(({ intent, delivery }) =>
+        delivery?.status === "confirmed"
+          ? [(intent.payload as { identity: string }).identity]
+          : []);
+      const stopAttempt = [...store.attempts.values()].find(({ scope }) =>
+        scope.stage_id === runtimeStopStageId("failed"))!;
+      expect(stopAttempt.context_record_ids).toEqual(expect.arrayContaining(
+        deliveredCreateSchedule.effects.map(({ delivery }) => delivery!.id),
+      ));
+      const leasedStop: KernelAttempt = {
+        ...stopAttempt,
+        lease: {
+          id: `stop-lease-${rejectedPhase}`,
+          generation: 0,
+          worker_id: "external-worker",
+          purpose: "work",
+          expires_at: "2026-08-20T12:05:00.000Z",
+          started: false,
+        },
+      };
+      store.attempts.set(leasedStop.id, leasedStop);
+
+      const stopStep = await bridge.executeLeasedAttempt(store.leased(leasedStop.id));
+      expect(stopStep).toMatchObject({ disposition: "scheduled", phase: "stop" });
+      const stopSchedule = store.schedules.get(
+        `external-schedule:${leasedStop.id}:stop`,
+      )!;
+      expect(stopSchedule.effects.map(({ intent }) =>
+        (intent.payload as { identity: string }).identity).sort())
+        .toEqual([...confirmedCreatedIdentities].sort());
+      expect(stopSchedule.effects).toHaveLength(rejectedPhase === "create" ? 1 : 3);
+
+      store.acknowledgePhase("stop", "confirmed", "provider", leasedStop.id);
+      await expect(bridge.resumeAttempt({
+        pipeline_run_id: store.run.id,
+        attempt_id: leasedStop.id,
+      })).resolves.toMatchObject({
+        disposition: "settled",
+        outcome: "success",
+        next_stage_id: runtimeCleanupStageId("failed"),
+      });
+      const cleanupAttempt = [...store.attempts.values()].find(({ scope }) =>
+        scope.stage_id === runtimeCleanupStageId("failed"))!;
+      expect(cleanupAttempt).toBeDefined();
+      const leasedCleanup: KernelAttempt = {
+        ...cleanupAttempt,
+        lease: {
+          id: `cleanup-lease-${rejectedPhase}`,
+          generation: 0,
+          worker_id: "external-worker",
+          purpose: "work",
+          expires_at: "2026-08-20T12:05:00.000Z",
+          started: false,
+        },
+      };
+      store.attempts.set(leasedCleanup.id, leasedCleanup);
+
+      const cleanupStep = await bridge.executeLeasedAttempt(store.leased(leasedCleanup.id));
+      expect(cleanupStep).toMatchObject({ disposition: "scheduled", phase: "cleanup" });
+      const cleanupSchedule = store.schedules.get(
+        `external-schedule:${leasedCleanup.id}:cleanup`,
+      )!;
+      expect(cleanupSchedule.effects.map(({ intent }) =>
+        (intent.payload as { identity: string }).identity).sort())
+        .toEqual([...confirmedCreatedIdentities].sort());
+      expect(cleanupSchedule.effects).toHaveLength(rejectedPhase === "create" ? 1 : 3);
+    }
   });
 
   it("fails closed before scheduling when a provider-wait bundle lacks sealed policy", async () => {
@@ -894,6 +1152,7 @@ describe("kernel external boundary bridge", () => {
       stage: currentManifest.stages.find(({ id }) => id === "next")! as never,
       context: { records: new Map(), checkpoints: new Map() },
       bundle: definitionBundle,
+      manifest: currentManifest,
     });
     expect(waitPrepared.phases[0]!.effects[0]).toMatchObject({
       subject: OUTPUT,

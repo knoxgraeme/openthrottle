@@ -158,11 +158,20 @@ or lead rejection schedules a distinct edit successor with
 `native_session_id: null`, exact prior Record/Checkpoint context, and a fresh
 native session bound only when that remediation Attempt starts.
 
-The kernel admits up to a configured number of live Attempts across distinct
-runs (default one), with at most one live Attempt per run in this release. Unit
-work and selected reviewer personas retain their complete dependency/frontier
-rosters. The selector may still choose up to its eval-bound five personas;
-execution width must not truncate that roster.
+The kernel admits live Attempts up to `OT_EXECUTION_WIDTH` across all runs
+(default one). This release may co-lease at most two compatible inspect
+loop/fanout members from one run when the authored stage permits it. They must
+belong to the same exact cohort and input and occupy distinct slots in the
+run's fixed Daytona pool; same-slot work serializes. Stage-scoped Attempts,
+edit/unit implementation, commands, effects, waits, and integration remain
+serial within a run. Actual overlap therefore requires `OT_EXECUTION_WIDTH` to
+be at least two. Unit work and selected reviewer personas retain their complete
+dependency/frontier rosters, and execution width must not truncate the
+eval-bound five-persona roster. Same-wave fan-in uses the canonical authored
+member index and member ID, not completion order, and retains every Result plus
+correction/forensics decision input. Cleanup and provider-backed recovery own
+the complete fixed pool; they do not replace one slot while completed sibling
+work could be replayed.
 
 Ordinary and structured pipelines share four primitives:
 

@@ -58,6 +58,7 @@ import {
   KernelOperatorEffectRejectionNotFoundError,
   assertExactOperatorEffectRejectionReplay,
   createOperatorEffectRejectionDelivery,
+  operatorEffectRejectionRuntimeIdentity,
   operatorEffectRejectionResolutionDigest,
 } from "../pipeline/kernel/operator-effect-rejection.js";
 import {
@@ -70,6 +71,7 @@ import {
   type QuarantineAttemptRecoveryCommand,
 } from "../pipeline/kernel/types.js";
 import { reduceKernelRecoveryQuarantine } from "../pipeline/kernel/reducer.js";
+import { kernelRuntimePoolSize } from "../pipeline/kernel/runtime-resource.js";
 import {
   ATTEMPT_FORENSICS_REDUCER,
   INVALID_RESULT_EVIDENCE_REDUCER,
@@ -109,7 +111,11 @@ import {
   ACTIVE_EFFECT_STATUSES,
   ACTIVE_RUN_STATUS_SET,
 } from "./kernel-active-statuses.js";
-import { KernelLeaseOperations } from "./kernel-store-leases.js";
+import {
+  KernelLeaseOperations,
+  type KernelLeaseManifestScheduling,
+  type KernelLeaseSchedulingSnapshot,
+} from "./kernel-store-leases.js";
 import { KERNEL_INGRESS_MAINTENANCE_SETTING } from "./epoch-schema.js";
 
 const STRUCTURED_PLANNING_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
@@ -226,13 +232,17 @@ export class SqliteKernelStore implements
   readonly #now: () => string;
   readonly #faultInjector: ((point: KernelStoreFaultPoint) => void) | undefined;
   readonly #leases: KernelLeaseOperations;
+  readonly #leaseManifestCache = new Map<
+    string,
+    Promise<KernelLeaseManifestScheduling>
+  >();
 
   constructor(input: {
     db: Database.Database;
     blob_store: VolumeBlobStore;
     manifest_resolver: KernelManifestResolver;
     payload_schemas: ExecutionRecordPayloadRegistry;
-    execution_policy: { readonly max_concurrent_attempts: 1 };
+    execution_policy: { readonly max_concurrent_attempts: number };
     execution_width?: number;
     now?: () => string;
     fault_injector?: (point: KernelStoreFaultPoint) => void;
@@ -252,6 +262,7 @@ export class SqliteKernelStore implements
       read_effect_blob: (runId, ownerId, pointer) => this.#readBlob(runId, "effect", ownerId, pointer),
       execution_policy: input.execution_policy,
       execution_width: input.execution_width ?? 1,
+      scheduling_snapshot: () => this.#leaseSchedulingSnapshot(),
     });
   }
 
@@ -562,6 +573,7 @@ export class SqliteKernelStore implements
         );
       }
       const intent = this.#leases.effectIntentFromRow(row);
+      const runtimeIdentity = operatorEffectRejectionRuntimeIdentity(intent);
       const deliveryRow = this.#db.prepare(`
         SELECT * FROM records
         WHERE pipeline_run_id = ? AND effect_id = ? AND kind = 'delivery'
@@ -578,12 +590,13 @@ export class SqliteKernelStore implements
           AND runtime_effect.status = 'acknowledged'
           AND delivery.kind = 'delivery'
           AND delivery.delivery_status = 'confirmed'
+          AND json_extract(runtime_effect.inline_payload, '$.identity') = ?
         ORDER BY runtime_effect.id
         LIMIT 2
-      `).all(row.pipeline_run_id) as EffectRow[];
+      `).all(row.pipeline_run_id, runtimeIdentity) as EffectRow[];
       if (runtimeCreateRows.length !== 1) {
         throw new KernelOperatorEffectRejectionConflictError(
-          "operator Effect rejection requires one exact confirmed runtime creation",
+          "operator Effect rejection requires one exact matching confirmed runtime creation",
         );
       }
       const runtimeCreateIntent = this.#leases.effectIntentFromRow(runtimeCreateRows[0]!);
@@ -1247,6 +1260,115 @@ export class SqliteKernelStore implements
       pointer,
       row.status,
     ));
+  }
+
+  async #leaseSchedulingSnapshot(): Promise<KernelLeaseSchedulingSnapshot> {
+    const activeRuns: Array<{
+      id: string;
+      pipeline_id: string;
+      definition_bundle_hash: string;
+    }> = [];
+    let afterRunId = "";
+    for (;;) {
+      const page = this.#db.prepare(`
+        SELECT id, pipeline_id, definition_bundle_hash FROM pipeline_runs
+        WHERE status IN ('pending', 'running') AND id > ?
+        ORDER BY id LIMIT 100
+      `).all(afterRunId) as typeof activeRuns;
+      activeRuns.push(...page);
+      if (page.length < 100) break;
+      afterRunId = page.at(-1)!.id;
+    }
+
+    const representatives = new Map<string, (typeof activeRuns)[number]>();
+    const conflictingBundleHashes = new Set<string>();
+    for (const run of activeRuns) {
+      const existing = representatives.get(run.definition_bundle_hash);
+      if (existing !== undefined && existing.pipeline_id !== run.pipeline_id) {
+        conflictingBundleHashes.add(run.definition_bundle_hash);
+      }
+      representatives.set(run.definition_bundle_hash, existing ?? run);
+    }
+
+    const resolved = await Promise.all([...representatives].map(async ([bundleHash, run]) => {
+      if (conflictingBundleHashes.has(bundleHash)) {
+        return [bundleHash, {
+          valid: false,
+          pipeline_id: null,
+          reason: "one immutable definition bundle is pinned to multiple pipelines",
+          retryable: false,
+        }] as const;
+      }
+      let pending = this.#leaseManifestCache.get(bundleHash);
+      if (pending === undefined) {
+        pending = (async (): Promise<KernelLeaseManifestScheduling> => {
+          try {
+            const definitionBundleBytes = await this.loadExactDefinitionBundleBytes({
+              pipeline_run_id: run.id,
+              definition_bundle_hash: bundleHash,
+            });
+            const manifest = await this.#manifests.resolve({
+              pipeline_id: run.pipeline_id,
+              definition_bundle_hash: bundleHash,
+              definition_bundle_bytes: definitionBundleBytes,
+            });
+            if (
+              manifest.pipeline_id !== run.pipeline_id ||
+              manifest.definition_bundle_hash !== bundleHash
+            ) {
+              return {
+                valid: false,
+                pipeline_id: run.pipeline_id,
+                reason: "manifest resolver returned another pinned pipeline",
+                retryable: false,
+              };
+            }
+            return {
+              valid: true,
+              pipeline_id: manifest.pipeline_id,
+              pool_size: kernelRuntimePoolSize(manifest),
+              parallel_inspect_stage_widths: new Map(manifest.stages.flatMap((stage) =>
+                stage.kind === "agent" && stage.repository_authority === "inspect" &&
+                  stage.loop !== undefined && stage.loop.max_parallel > 1
+                  ? [[stage.id, stage.loop.max_parallel] as const]
+                  : [])),
+            };
+          } catch (error) {
+            return {
+              valid: false,
+              pipeline_id: run.pipeline_id,
+              reason: error instanceof Error ? error.message : "manifest resolution failed",
+              retryable: true,
+            };
+          }
+        })();
+        this.#leaseManifestCache.set(bundleHash, pending);
+      }
+      try {
+        const scheduling = await pending;
+        if (
+          !scheduling.valid && scheduling.retryable &&
+          this.#leaseManifestCache.get(bundleHash) === pending
+        ) {
+          this.#leaseManifestCache.delete(bundleHash);
+        }
+        if (scheduling.pipeline_id !== null && scheduling.pipeline_id !== run.pipeline_id) {
+          return [bundleHash, {
+            valid: false,
+            pipeline_id: null,
+            reason: "one immutable definition bundle resolved for another pipeline",
+            retryable: false,
+          }] as const;
+        }
+        return [bundleHash, scheduling] as const;
+      } catch (error) {
+        if (this.#leaseManifestCache.get(bundleHash) === pending) {
+          this.#leaseManifestCache.delete(bundleHash);
+        }
+        throw error;
+      }
+    }));
+    return new Map(resolved);
   }
 
   #insertDefinitions(definitions: readonly DefinitionSnapshotInput[]): void {

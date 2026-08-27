@@ -292,24 +292,30 @@ function seedRun({ store, blobs, registrationId, compilation, run, attempts, tas
   });
 }
 
-function runtimeProvisionDelivery(runId, identity) {
-  return {
+function runtimeProvisionDeliveries(runId, identity) {
+  const sandboxId = `sandbox-${identity.slice(0, 12)}`;
+  const delivery = (kind) => ({
     schema: "openthrottle.record/v1",
     kind: "delivery",
-    id: `delivery-${runId}-runtime`,
+    id: `delivery-${runId}-runtime-${kind}`,
     pipeline_run_id: runId,
-    effect_id: `effect-${runId}-runtime`,
-    idempotency_key: `${runId}:runtime`,
+    effect_id: `effect-${runId}-runtime-${kind}`,
+    idempotency_key: `${runId}:runtime:${kind}`,
     external_identity: `daytona:${identity}`,
     status: "confirmed",
     payload_schema: "openthrottle.effect-delivery/v1",
     payload: { inline: {
-      effect_kind: "daytona/create-sandbox@1",
+      effect_kind: `daytona/${kind}-sandbox@1`,
       provider: "daytona",
-      result: { identity },
+      result: {
+        identity,
+        sandbox_id: sandboxId,
+        resource_state: kind === "create" ? "created" : "started",
+      },
     } },
     created_at: "2026-08-22T00:00:00.000Z",
-  };
+  });
+  return [delivery("create"), delivery("start")];
 }
 
 async function assertPublicationPreflight({
@@ -336,9 +342,9 @@ async function assertPublicationPreflight({
   assert.equal(candidate.output_subject, implementation.output_subject);
 
   const runtimeIdentity = "d".repeat(64);
-  const runtimeDelivery = runtimeProvisionDelivery(view.run.id, runtimeIdentity);
+  const runtimeDeliveries = runtimeProvisionDeliveries(view.run.id, runtimeIdentity);
   const context = {
-    records: new Map([[runtimeDelivery.id, runtimeDelivery]]),
+    records: new Map(runtimeDeliveries.map((record) => [record.id, record])),
     checkpoints: view.checkpoints,
   };
   const publishAttempt = createPendingStageAttempt({
@@ -350,7 +356,7 @@ async function assertPublicationPreflight({
     manifest: compilation.manifest.value,
     action_inputs: {
       task_prompt: taskPrompt,
-      context: { records: [runtimeDelivery], checkpoints: [candidate] },
+      context: { records: runtimeDeliveries, checkpoints: [candidate] },
     },
   });
   const publishStage = view.manifest.stages.find(({ id }) => id === "publish");

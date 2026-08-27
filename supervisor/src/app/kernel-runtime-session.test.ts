@@ -25,6 +25,7 @@ import {
   type AtomicTransitionApplyResult,
   type StoredTransitionIdentity,
 } from "../pipeline/kernel/store.js";
+import { frontierMemberKey } from "../pipeline/kernel/reducer-support.js";
 import { KernelRuntimeSessionService } from "./kernel-runtime-session.js";
 
 const REQUEST_HASH = "a".repeat(64);
@@ -92,6 +93,7 @@ function attempt(overrides: Partial<KernelAttempt> = {}): KernelAttempt {
 }
 
 function run(current: KernelAttempt, overrides: Partial<KernelRun> = {}): KernelRun {
+  const scopeKey = frontierMemberKey(current);
   return {
     schema: KERNEL_RUN_SCHEMA,
     id: current.pipeline_run_id,
@@ -101,17 +103,17 @@ function run(current: KernelAttempt, overrides: Partial<KernelRun> = {}): Kernel
     status: "running",
     terminal_outcome: null,
     cursor: {
-      stage_id: "work",
+      stage_id: current.scope.stage_id,
       version: 2,
       reentries: {},
       frontier: [{
-        scope_key: "0:work@attempt-1",
+        scope_key: scopeKey,
         attempt_id: current.id,
         scope: current.scope,
         depends_on: [],
       }],
       completed_scope_keys: [],
-      barrier: { kind: "all", member_scope_keys: ["0:work@attempt-1"] },
+      barrier: { kind: "all", member_scope_keys: [scopeKey] },
     },
     version: 8,
     work_retry_limit: 2,
@@ -127,6 +129,7 @@ class MemoryReductionPort implements KernelReductionPort {
   view: ReductionView;
   apply_count = 0;
   before_apply: (() => void) | null = null;
+  stale_without_progress = false;
   #lastTransition: StoredTransitionIdentity | undefined;
 
   constructor(current = attempt()) {
@@ -153,6 +156,9 @@ class MemoryReductionPort implements KernelReductionPort {
     const race = this.before_apply;
     this.before_apply = null;
     race?.();
+    if (this.stale_without_progress) {
+      throw new Error(`atomic transition ${bundle.transition_id} has a stale run or cursor version`);
+    }
     const current = this.view.current_attempt;
     const disposition = transitionApplicationDisposition({
       bundle,
@@ -224,6 +230,17 @@ class MemoryReductionPort implements KernelReductionPort {
     };
     this.#lastTransition = undefined;
   }
+
+  siblingProgress(): void {
+    this.view = {
+      ...this.view,
+      run: {
+        ...this.view.run,
+        version: this.view.run.version + 1,
+      },
+    };
+    this.#lastTransition = undefined;
+  }
 }
 
 function bindRequest(
@@ -266,6 +283,7 @@ describe("KernelRuntimeSessionService", () => {
       pipeline_run_id: "run-1",
       attempt_id: "attempt-1",
       native_session_id: "session-1",
+      scope: { kind: "stage", stage_id: "work" },
       generation: 0,
       lease_generation: 0,
       attempt_status: "running",
@@ -286,6 +304,51 @@ describe("KernelRuntimeSessionService", () => {
       ...request,
       native_session_id: "session-conflict",
     })).rejects.toThrow(/conflicting native session/);
+  });
+
+  it("loads the exact durable sibling scope into the private runtime session binding", async () => {
+    const scope = {
+      kind: "loop_item" as const,
+      stage_id: "work",
+      parent_attempt_id: "attempt-plan",
+      loop_id: "units",
+      item_id: "unit-2",
+      item_index: 1,
+    };
+    const port = new MemoryReductionPort(attempt({ scope }));
+    const sessions = service(port);
+
+    const bound = await sessions.bindRuntimeSession(bindRequest(port));
+    expect(bound.scope).toEqual(scope);
+    await expect(sessions.loadCurrentRuntimeSession({
+      pipeline_run_id: "run-1",
+      attempt_id: "attempt-1",
+    })).resolves.toMatchObject({ scope });
+  });
+
+  it("keeps retrying a stale bind while sibling progress strictly advances the run", async () => {
+    const port = new MemoryReductionPort();
+    let siblingTransitions = 5;
+    const advanceSibling = () => {
+      port.siblingProgress();
+      siblingTransitions -= 1;
+      if (siblingTransitions > 0) port.before_apply = advanceSibling;
+    };
+    port.before_apply = advanceSibling;
+
+    await expect(service(port).bindRuntimeSession(bindRequest(port))).resolves.toMatchObject({
+      native_session_id: "session-1",
+    });
+    expect(port.apply_count).toBe(6);
+  });
+
+  it("does not retry a stale bind without strictly newer run progress", async () => {
+    const port = new MemoryReductionPort();
+    port.stale_without_progress = true;
+
+    await expect(service(port).bindRuntimeSession(bindRequest(port)))
+      .rejects.toThrow(/stale run or cursor version/);
+    expect(port.apply_count).toBe(1);
   });
 
   it("rejects every stale launch fence before binding", async () => {

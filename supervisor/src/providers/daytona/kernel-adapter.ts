@@ -636,7 +636,10 @@ export class DaytonaKernelAdapter implements
       pipeline_run_id: request.pipeline_run_id,
       attempt_id: request.attempt_id,
     });
-    const resource = resolveKernelRuntimeResourceIdentity([...inputs.context.records.values()]);
+    const resource = resolveKernelRuntimeResourceIdentity(
+      [...inputs.context.records.values()],
+      request.scope,
+    );
     if (!resource) throw new Error("result correction has no exact Daytona runtime resource");
     return this.#executeWithSandboxFailure(async () =>
       this.#execute(
@@ -717,7 +720,10 @@ export class DaytonaKernelAdapter implements
       pipeline_run_id: authorized.pipeline_run_id,
       attempt_id: authorized.attempt_id,
     });
-    const resource = resolveKernelRuntimeResourceIdentity([...inputs.context.records.values()]);
+    const resource = resolveKernelRuntimeResourceIdentity(
+      [...inputs.context.records.values()],
+      authorized.scope,
+    );
     if (!resource || resource.provider !== "daytona") {
       throw new Error("steering delivery has no exact Daytona runtime resource");
     }

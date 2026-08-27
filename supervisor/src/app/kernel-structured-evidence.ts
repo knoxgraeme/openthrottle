@@ -13,7 +13,7 @@ import type {
   KernelExternalSettlementPlanner,
   SettledStructuredPlanningAttempt,
 } from "../pipeline/kernel/ports.js";
-import { exactKernelRuntimeResourceDeliveries } from "../pipeline/kernel/runtime-resource.js";
+import { exactKernelRuntimeResourcePoolDeliveries } from "../pipeline/kernel/runtime-resource.js";
 import {
   parseStructuredExecutionPlan,
   type StructuredAcceptedUnitEvidence,
@@ -40,9 +40,11 @@ export function exactStructuredDeliveries(input: ExternalInput): DeliveryRecord[
 export function exactStructuredRuntimeRecords(
   inputs: KernelAttemptRequestInputs,
 ): ExecutionRecord[] {
-  const runtime = exactKernelRuntimeResourceDeliveries([...inputs.context.records.values()]);
+  const runtime = exactKernelRuntimeResourcePoolDeliveries(
+    [...inputs.context.records.values()],
+  );
   if (runtime === null) {
-    throw new Error("structured continuation lost its exact Daytona runtime identity");
+    throw new Error("structured continuation lost its complete Daytona runtime pool");
   }
   return [...runtime];
 }

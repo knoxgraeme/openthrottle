@@ -43,11 +43,17 @@ subject, OpenThrottle can:
 - Ordinary and structured coordinators use the same kernel reducer and durable
   store. Structured work adds bounded frontier, dependency, acceptance, serial
   integration, and reviewer-persona planning over those primitives.
-- The kernel admits up to a configured number of live Attempts across distinct
-  runs (default one), with at most one live Attempt per run in this release.
-  Unit and reviewer frontiers remain complete and dependency-aware. The
-  reviewer eval may still select all five allowed personas; execution width
-  does not truncate the roster.
+- The kernel admits live Attempts up to `OT_EXECUTION_WIDTH` across all runs
+  (default one). This release may co-lease at most two compatible inspect
+  loop/fanout members from one run on distinct slots in its fixed Daytona pool;
+  same-slot members serialize, and actual overlap requires execution width of
+  at least two. Stage-scoped Attempts, edit/unit implementation, commands,
+  effects, waits, and integration remain serial within a run. Unit and reviewer
+  frontiers remain complete and dependency-aware; width does not truncate the
+  five-persona roster. Fan-in and successor lineage use a canonical authored
+  member anchor and preserve correction and forensics decision inputs across
+  settlement orders. Cleanup and provider-backed recovery own the complete
+  pool and fail closed rather than replaying completed sibling work.
 - External writes are write-ahead Effects with one idempotency key. The worker
   reconciles before writing and records confirmed or rejected delivery
   evidence.
@@ -79,6 +85,9 @@ The release is accepted only when all of the following hold:
   scheduling commit atomically and remain deterministic after restart.
 - Lost leases recover safely. Stale or conflicting events cannot settle another
   Attempt or native session.
+- Compatible same-run inspect members can overlap only on distinct sealed
+  Daytona pool slots and within `OT_EXECUTION_WIDTH`; same-slot work serializes,
+  and cleanup/recovery cannot strand or replay a completed sibling.
 - Effect retries reconcile known external state before writing and never replay
   an unknown mutation blindly.
 - Local image and harness proof covers sandbox authority profiles, result
@@ -126,7 +135,8 @@ credentials and is exercised during dogfood after local and CI proof.
 - automatic mutation of definitions from historical analysis;
 - offline evaluation and longitudinal skill-quality scoring;
 - a remote blob backend if one Fly volume stops being sufficient;
-- concurrent Attempt execution, including overlapping units and review personas;
+- same-run parallel edit/unit implementation, stage-scoped, command, effect, or
+  wait work beyond the shipped two-wide inspect loop/fanout boundary;
 - parallel Git integration of structured units;
 - outbound Linear status delivery beyond the mandatory AgentSession start
   acknowledgement, and provider review/comment feedback mapped to bounded

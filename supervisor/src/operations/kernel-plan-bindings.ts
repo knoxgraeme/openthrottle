@@ -1,5 +1,6 @@
 import {
   ATTEMPT_CHECKPOINT_SCHEMA,
+  compareCodeUnits,
   digestCanonicalJson,
   validateFilesystemConfigContract,
   type AttemptCheckpoint,
@@ -34,6 +35,12 @@ import {
   KERNEL_CHECKPOINT_ANCESTRY_MAX_ENTRIES,
   validateKernelCheckpointAncestryChain,
 } from "../pipeline/kernel/checkpoint-ancestry.js";
+import {
+  exactKernelRuntimeAbsenceDeliveries,
+  exactKernelRuntimeCleanupTargets,
+  kernelRuntimePoolSize,
+  resolveKernelRuntimeResourceSlot,
+} from "../pipeline/kernel/runtime-resource.js";
 
 const GIT_BUNDLE_SCHEMA = "openthrottle.git-checkpoint-bundle/v1" as const;
 
@@ -54,14 +61,42 @@ function githubProviderEvidencePolicy(
   return policy;
 }
 
-function runtimeIdentity(input: {
+function assertExactRuntimeManifest(input: {
+  run: Parameters<KernelExternalStagePlanBinding["prepare"]>[0]["run"];
+  bundle: Parameters<KernelExternalStagePlanBinding["prepare"]>[0]["bundle"];
+  manifest: Parameters<KernelExternalStagePlanBinding["prepare"]>[0]["manifest"];
+}): number {
+  if (
+    input.manifest.definition_bundle_hash !== input.run.definition_bundle_hash ||
+    input.manifest.pipeline_id !== input.bundle.pipeline_id ||
+    input.manifest.runtime_capability_digest !== input.bundle.runtime_capability_digest
+  ) throw new Error("runtime pool requires its exact release-authenticated compiled manifest");
+  return kernelRuntimePoolSize(input.manifest);
+}
+
+function runtimePoolMembers(input: {
   pipeline_run_id: string;
   repository: string;
   base_commit: string;
   snapshot: string;
+  pool_size: number;
   recovery_record_id?: string;
-}): string {
-  return digestCanonicalJson({ schema: "openthrottle.daytona-runtime-identity/v1", ...input });
+}): { pool_identity: string; identities: readonly string[] } {
+  const poolIdentity = digestCanonicalJson({
+    schema: "openthrottle.daytona-runtime-pool-identity/v1",
+    ...input,
+  });
+  const identities = Array.from({ length: input.pool_size }, (_, memberOrdinal) =>
+    digestCanonicalJson({
+      schema: "openthrottle.daytona-runtime-member-identity/v1",
+      pool_identity: poolIdentity,
+      pool_size: input.pool_size,
+      member_ordinal: memberOrdinal,
+    })).sort(compareCodeUnits);
+  if (new Set(identities).size !== input.pool_size) {
+    throw new Error("runtime pool member identities are not unique");
+  }
+  return { pool_identity: poolIdentity, identities };
 }
 
 function branch(runId: string, sourceReference: string): string {
@@ -317,23 +352,13 @@ function hasRetryableIntegrationFailure(
   }));
 }
 
-function persistedRuntimeIdentity(records: ReadonlyMap<string, import("@openthrottle/contracts").ExecutionRecord>): string {
-  const identities = [...records.values()].flatMap((record) => {
-    if (
-      record.kind !== "delivery" || record.status !== "confirmed" ||
-      record.payload_schema !== "openthrottle.effect-delivery/v1" ||
-      !("inline" in record.payload) || !record.payload.inline ||
-      typeof record.payload.inline !== "object" || Array.isArray(record.payload.inline) ||
-      record.payload.inline.effect_kind !== "daytona/create-sandbox@1"
-    ) return [];
-    const result = record.payload.inline.result;
-    return result && typeof result === "object" && !Array.isArray(result) &&
-      typeof result.identity === "string" && /^[a-f0-9]{64}$/.test(result.identity)
-      ? [result.identity]
-      : [];
-  });
-  if (identities.length !== 1) throw new Error("external plan has no exact persisted Daytona runtime identity");
-  return identities[0]!;
+function persistedRuntimeIdentity(
+  records: ReadonlyMap<string, ExecutionRecord>,
+  scope: Parameters<typeof resolveKernelRuntimeResourceSlot>[1],
+): string {
+  const slot = resolveKernelRuntimeResourceSlot([...records.values()], scope);
+  if (slot === null) throw new Error("external plan has no exact persisted Daytona runtime identity");
+  return slot.runtime_identity;
 }
 
 function lifecycleBinding(input: {
@@ -346,50 +371,87 @@ function lifecycleBinding(input: {
     stage_kind: "effect",
     subject_policy: "preserve",
     phases: shape.phases,
-    async prepare({ run, context }) {
+    async prepare({ run, context, bundle, manifest }) {
       const environment = input.environments.loadExactRunEnvironment(run.id);
       const recoveryRecord = exactSandboxRecoveryRecord([...context.records.values()]);
-      const identity = input.external_kind === "core/daytona-provision@1"
-        ? runtimeIdentity({
+      const poolSize = assertExactRuntimeManifest({ run, bundle, manifest });
+      const provision = input.external_kind === "core/daytona-provision@1";
+      const pool = provision
+        ? runtimePoolMembers({
           pipeline_run_id: run.id,
           repository: environment.repository,
           base_commit: run.current_subject,
           snapshot: environment.runtime_snapshot,
+          pool_size: poolSize,
           ...(recoveryRecord === null ? {} : { recovery_record_id: recoveryRecord.id }),
         })
-        : persistedRuntimeIdentity(context.records);
+        : null;
+      const cleanupTargets = provision
+        ? null
+        : exactKernelRuntimeCleanupTargets([...context.records.values()]);
+      if (!provision && cleanupTargets === null) {
+        throw new Error("runtime reclamation has no exact confirmed-create target evidence");
+      }
+      if (cleanupTargets !== null && cleanupTargets.length > poolSize) {
+        throw new Error("runtime reclamation target roster exceeds its compiled pool size");
+      }
+      const identities = pool?.identities ?? cleanupTargets!.map(({ runtime_identity }) =>
+        runtime_identity);
       return {
         verified_output_subject: null,
-        checkpoint_payload: { identity, runtime_snapshot: environment.runtime_snapshot },
+        checkpoint_payload: {
+          schema: "openthrottle.daytona-runtime-pool/v1",
+          pool_size: poolSize,
+          target_count: identities.length,
+          runtime_identities: [...identities],
+          runtime_snapshot: environment.runtime_snapshot,
+          ...(pool === null ? {} : { pool_identity: pool.pool_identity }),
+        },
         phases: shape.phases.map((phase) => ({
           id: phase.id,
-          effects: phase.effects.map(({ effect_kind }) => ({
-            kind: effect_kind,
-            idempotency_key: `${run.id}:${effect_kind}:${identity}`,
-            target: `daytona:${identity}`,
-            subject: null,
-            payload: {
-              schema: effect_kind === "daytona/create-sandbox@1"
-                ? "openthrottle.daytona-create/v1"
-                : effect_kind === "daytona/start-sandbox@1"
-                  ? "openthrottle.daytona-start/v1"
-                  : effect_kind === "daytona/stop-sandbox@1"
-                    ? "openthrottle.daytona-stop/v1"
-                    : "openthrottle.daytona-cleanup/v1",
-              identity,
-              pipeline_run_id: run.id,
-              repository: environment.repository,
-              base_branch: environment.base_branch,
-              base_commit: run.current_subject,
-              snapshot: environment.runtime_snapshot,
-            },
-          })),
+          effects: identities.map((identity) => {
+            const effectKind = phase.effects[0]!.effect_kind;
+            return {
+              kind: effectKind,
+              idempotency_key: `${run.id}:${effectKind}:${identity}`,
+              target: `daytona:${identity}`,
+              subject: null,
+              payload: {
+                schema: effectKind === "daytona/create-sandbox@1"
+                  ? "openthrottle.daytona-create/v1"
+                  : effectKind === "daytona/start-sandbox@1"
+                    ? "openthrottle.daytona-start/v1"
+                    : effectKind === "daytona/stop-sandbox@1"
+                      ? "openthrottle.daytona-stop/v1"
+                      : "openthrottle.daytona-cleanup/v1",
+                identity,
+                pipeline_run_id: run.id,
+                repository: environment.repository,
+                base_branch: environment.base_branch,
+                base_commit: run.current_subject,
+                snapshot: environment.runtime_snapshot,
+              },
+            };
+          }),
         })),
       };
     },
-    evaluate: ({ schedules }) => allConfirmed(schedules)
-      ? { outcome: "success", summary: `${input.external_kind} completed` }
-      : { outcome: "failure", summary: `${input.external_kind} was rejected` },
+    evaluate: ({ schedules }) => {
+      if (allConfirmed(schedules)) {
+        return { outcome: "success", summary: `${input.external_kind} completed` };
+      }
+      if (input.external_kind === "core/daytona-provision@1") {
+        const createDeliveries = schedules[0]?.effects.flatMap(({ delivery }) =>
+          delivery === null ? [] : [delivery]) ?? [];
+        if (
+          createDeliveries.length === schedules[0]?.effects.length &&
+          exactKernelRuntimeAbsenceDeliveries(createDeliveries) !== null
+        ) {
+          return { outcome: "no_resource", summary: "Daytona runtime pool was proven absent" };
+        }
+      }
+      return { outcome: "failure", summary: `${input.external_kind} was rejected` };
+    },
   };
 }
 
@@ -436,7 +498,7 @@ export function createKernelExternalPlanBindings(input: {
         ref: taskRef,
         source_commit: bundle.source_commit,
       });
-      const identity = persistedRuntimeIdentity(context.records);
+      const identity = persistedRuntimeIdentity(context.records, attempt.scope);
       return {
         verified_output_subject: null,
         checkpoint_payload: {
@@ -603,7 +665,7 @@ export function createKernelExternalPlanBindings(input: {
       });
       const candidate = selected.candidate;
       const artifact = selected.candidate_artifact;
-      const identity = persistedRuntimeIdentity(context.records);
+      const identity = persistedRuntimeIdentity(context.records, attempt.scope);
       const taskBranch = branch(run.id, environment.source_reference);
       const taskRef = `refs/heads/${taskBranch}`;
       const anchor = latestConfirmedTaskRefPush({

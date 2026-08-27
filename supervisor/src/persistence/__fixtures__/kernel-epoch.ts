@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +14,10 @@ import { KERNEL_INGRESS_MAINTENANCE_SETTING } from "../epoch-schema.js";
 export const KERNEL_FIXTURE_NOW = "2026-08-20T12:00:00.000Z";
 export const KERNEL_FIXTURE_SUBJECT = "1".repeat(40);
 export const KERNEL_FIXTURE_REQUEST_HASH = "a".repeat(64);
-export const KERNEL_FIXTURE_BUNDLE_HASH = "b".repeat(64);
+const KERNEL_FIXTURE_BUNDLE_BYTES = "{}";
+export const KERNEL_FIXTURE_BUNDLE_HASH = createHash("sha256")
+  .update(KERNEL_FIXTURE_BUNDLE_BYTES)
+  .digest("hex");
 
 export interface FreshKernelFixture {
   directory: string;
@@ -25,6 +29,15 @@ export interface FreshKernelFixture {
 export function freshKernelFixture(): FreshKernelFixture {
   const directory = mkdtempSync(join(tmpdir(), "openthrottle-kernel-u11-"));
   const blobs = VolumeBlobStore.initialize(join(directory, "blobs"), "kernel-u11-test");
+  const bundle = blobs.put({
+    bytes: KERNEL_FIXTURE_BUNDLE_BYTES,
+    encoding: "utf-8",
+    media_type: "application/json",
+    payload_schema: "openthrottle.definition-bundle/v1",
+  });
+  if (bundle.pointer.digest !== KERNEL_FIXTURE_BUNDLE_HASH) {
+    throw new Error("fresh kernel fixture definition bundle digest drifted");
+  }
   const db = initializeFreshEpochDatabase({
     database_path: join(directory, "epoch.sqlite"),
     blob_store: blobs,

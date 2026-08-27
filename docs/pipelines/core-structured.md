@@ -28,7 +28,9 @@ eligible unit Attempts serially. The complete bounded dependency frontier
 remains durable and visible; width one changes overlap, not plan cardinality.
 Each Attempt has a stable scope/member identity and receives only the ordered
 Result, Decision, and Checkpoint evidence of its dependencies. Unit workers
-cannot see or modify sibling worktrees.
+cannot see or modify sibling worktrees. Unit implementation, its edit and
+inspect successors, commands, and integration therefore never overlap within a
+run.
 
 The unit lead uses inspect authority and decides only whether the exact unit
 candidate matches that unit's scope, acceptance criteria, and verification
@@ -47,18 +49,22 @@ to whole-change gates.
 all units integrated
   -> final_test -> final_lint -> final_build
   -> select_review_personas(inspect)
-  -> persona_review(inspect serial fanout)
+  -> persona_review(inspect fanout, at most two-wide)
   -> validate_review_findings(inspect)
        |-- confirmed blockers --> final_repair(edit) --> final_test
        `-- clear -------------> publish(effect) -> provider(wait)
 ```
 
 The eval may select up to five allowlisted personas. Every selected persona
-receives a stable scoped inspect Attempt and remains visible in status/evidence;
-the width-one dependency chain executes them serially against the same exact
-integrated subject. The selector cannot name a new agent or skill. Current
-lenses include correctness/dataflow, tests/contracts, reliability, agent-native
-contracts, security, data changes, performance, and project standards.
+receives a stable scoped inspect Attempt and remains visible in status/evidence.
+The authored loop permits at most two compatible members from the same exact
+cohort to overlap against the integrated subject, only on distinct slots in the
+run's fixed Daytona pool. `OT_EXECUTION_WIDTH` remains the global live-lease
+bound and defaults to one, so actual overlap requires a value of at least two;
+same-slot or incompatible members serialize, and width never truncates the
+roster. The selector cannot name a new agent or skill. Current lenses include
+correctness/dataflow, tests/contracts, reliability, agent-native contracts,
+security, data changes, performance, and project standards.
 
 Finding validation independently re-inspects proposed blockers. Only confirmed
 blocking evidence can schedule `final_repair`; advisory findings remain
@@ -79,5 +85,8 @@ all whole-change commands and reviews repeat within finite budgets.
 - `repair_unit` and `final_repair` are distinct edit successors with
   `native_session_id: null`, exact rejection evidence, and the accepted
   Checkpoint boundary. Each binds a fresh session when it starts.
+- The complete fixed Daytona pool is provisioned before normal execution.
+  Stop, cleanup, and provider-backed recovery own every slot; partial provision
+  cleans every confirmed create, and unsafe whole-pool replay fails closed.
 - Stop, failure, human intervention, or retry exhaustion must stop and clean a
-  confirmed Daytona resource before terminal settlement.
+  confirmed Daytona pool before terminal settlement.

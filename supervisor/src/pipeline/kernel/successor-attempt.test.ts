@@ -68,22 +68,27 @@ function nonPushDelivery(id: string): DeliveryRecord {
   };
 }
 
-function runtimeDelivery(kind: "create" | "start"): DeliveryRecord {
+function runtimeDelivery(
+  kind: "create" | "start",
+  sandboxId = "sandbox-1",
+): DeliveryRecord {
+  const suffix = sandboxId === "sandbox-1" ? "" : `-${sandboxId}`;
+  const identity = sandboxId === "sandbox-1" ? "1".repeat(64) : "2".repeat(64);
   return {
     schema: EXECUTION_RECORD_SCHEMA,
-    id: `delivery-runtime-${kind}`,
+    id: `delivery-runtime-${kind}${suffix}`,
     kind: "delivery",
     pipeline_run_id: "run-1",
-    effect_id: `effect-runtime-${kind}`,
-    idempotency_key: `run-1:runtime:${kind}`,
-    external_identity: "daytona:sandbox-1",
+    effect_id: `effect-runtime-${kind}${suffix}`,
+    idempotency_key: `run-1:runtime:${kind}${suffix}`,
+    external_identity: `daytona:${identity}`,
     status: "confirmed",
     payload_schema: "openthrottle.effect-delivery/v1",
     payload: { inline: {
       effect_kind: `daytona/${kind}-sandbox@1`,
       provider: "daytona",
       observed_via: "reconciliation",
-      result: { sandbox_id: "sandbox-1" },
+      result: { identity, sandbox_id: sandboxId },
     } },
     created_at: NOW,
   };
@@ -325,6 +330,42 @@ describe("mergeCausalGithubPushContext", () => {
       fixture.result.id,
     ].sort());
     expect(successor.context_record_ids).not.toContain(rejected.id);
+  });
+
+  it("preserves every sealed runtime-pool delivery in a serial successor context", () => {
+    const fixture = failureSuccessorFixture();
+    const runtimeRecords = [
+      runtimeDelivery("create"),
+      runtimeDelivery("start"),
+      runtimeDelivery("create", "sandbox-2"),
+      runtimeDelivery("start", "sandbox-2"),
+    ];
+    const current: KernelAttempt = {
+      ...fixture.current,
+      context_record_ids: runtimeRecords.map(({ id }) => id).sort(),
+    };
+
+    const successor = deriveKernelSuccessorAttempt({
+      view: { ...fixture.view, current_attempt: current },
+      current,
+      result: fixture.result,
+      decision: fixture.decision,
+      bundle: fixture.bundle,
+      target_scope: { kind: "stage", stage_id: runtimeStopStageId("failed") },
+      request_inputs: {
+        task_prompt: "Keep the complete run-scoped runtime pool sealed through the successor.",
+        context: {
+          records: new Map(runtimeRecords.map((record) => [record.id, record])),
+          checkpoints: new Map(),
+        },
+      },
+    });
+
+    expect(successor.context_record_ids).toEqual([
+      fixture.decision.id,
+      fixture.result.id,
+      ...runtimeRecords.map(({ id }) => id),
+    ].sort());
   });
 
   it.each([

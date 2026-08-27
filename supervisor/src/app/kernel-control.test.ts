@@ -79,6 +79,7 @@ function binding(input: {
     definition_bundle_hash: KERNEL_FIXTURE_BUNDLE_HASH,
     input_subject: KERNEL_FIXTURE_SUBJECT,
     native_session_id: "session-live",
+    scope: { kind: "stage", stage_id: "implement" },
     generation: input.generation ?? (input.purpose === "result_correction" ? 1 : 0),
     attempt_status: input.status ?? "running",
     repository_authority: "edit",

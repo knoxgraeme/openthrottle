@@ -13,6 +13,10 @@ import type {
 } from "../pipeline/kernel/ports.js";
 import type { KernelAttempt, KernelRun } from "../pipeline/kernel/types.js";
 import {
+  MAX_KERNEL_RUNTIME_POOL_SIZE,
+  kernelRuntimeResourceSlotIndex,
+} from "../pipeline/kernel/runtime-resource.js";
+import {
   parseJson,
   payloadPointer,
   type AttemptRow,
@@ -20,6 +24,43 @@ import {
 } from "./kernel-store-codecs.js";
 
 const EXPIRED_EFFECT_RECOVERY_BATCH_SIZE = 100;
+const ATTEMPT_SCHEDULING_BATCH_SIZE = 100;
+
+export interface ValidKernelLeaseManifestScheduling {
+  readonly valid: true;
+  readonly pipeline_id: string;
+  readonly pool_size: number;
+  readonly parallel_inspect_stage_widths: ReadonlyMap<string, number>;
+}
+
+export interface InvalidKernelLeaseManifestScheduling {
+  readonly valid: false;
+  readonly pipeline_id: string | null;
+  readonly reason: string;
+  readonly retryable: boolean;
+}
+
+export type KernelLeaseManifestScheduling =
+  | ValidKernelLeaseManifestScheduling
+  | InvalidKernelLeaseManifestScheduling;
+
+export type KernelLeaseSchedulingSnapshot = ReadonlyMap<
+  string,
+  KernelLeaseManifestScheduling
+>;
+
+export class KernelLeaseSchedulingSnapshotStaleError extends Error {
+  constructor(detail: string) {
+    super(`Attempt scheduling manifest snapshot is stale: ${detail}`);
+    this.name = "KernelLeaseSchedulingSnapshotStaleError";
+  }
+}
+
+interface SchedulingAttemptRow extends AttemptRow {
+  created_at: string;
+  run_pipeline_id: string;
+  run_definition_bundle_hash: string;
+}
 
 export class KernelLeaseOperations {
   readonly #db: Database.Database;
@@ -28,7 +69,10 @@ export class KernelLeaseOperations {
   readonly #advanceRunFence: (runId: string, transitionId: string, content: unknown) => KernelRun;
   readonly #insertRecord: (record: ExecutionRecord) => void;
   readonly #readEffectBlob: (runId: string, ownerId: string, pointer: BlobPointer) => Buffer;
+  readonly #schedulingSnapshot: () => Promise<KernelLeaseSchedulingSnapshot>;
   readonly #executionWidth: number;
+  readonly #maxConcurrentAttempts: number;
+  readonly #resourceCapacity: number;
 
   constructor(input: {
     db: Database.Database;
@@ -37,8 +81,9 @@ export class KernelLeaseOperations {
     advance_run_fence: (runId: string, transitionId: string, content: unknown) => KernelRun;
     insert_record: (record: ExecutionRecord) => void;
     read_effect_blob: (runId: string, ownerId: string, pointer: BlobPointer) => Buffer;
-    execution_policy: { readonly max_concurrent_attempts: 1 };
+    execution_policy: { readonly max_concurrent_attempts: number };
     execution_width: number;
+    scheduling_snapshot: () => Promise<KernelLeaseSchedulingSnapshot>;
   }) {
     this.#db = input.db;
     this.#now = input.now;
@@ -46,83 +91,98 @@ export class KernelLeaseOperations {
     this.#advanceRunFence = input.advance_run_fence;
     this.#insertRecord = input.insert_record;
     this.#readEffectBlob = input.read_effect_blob;
+    this.#schedulingSnapshot = input.scheduling_snapshot;
     const maxConcurrentAttempts = input.execution_policy.max_concurrent_attempts;
-    if (!Object.isFrozen(input.execution_policy) || maxConcurrentAttempts !== 1) {
-      throw new Error("Attempt lease policy must be frozen at the supported release limit 1");
+    if (
+      !Object.isFrozen(input.execution_policy) ||
+      !Number.isSafeInteger(maxConcurrentAttempts) ||
+      maxConcurrentAttempts < 1 || maxConcurrentAttempts > MAX_KERNEL_RUNTIME_POOL_SIZE
+    ) {
+      throw new Error(
+        `Attempt lease policy must be frozen between 1 and ${MAX_KERNEL_RUNTIME_POOL_SIZE}`,
+      );
     }
     if (!Number.isSafeInteger(input.execution_width) || input.execution_width < 1) {
       throw new Error("Attempt execution width must be a positive integer");
     }
     this.#executionWidth = input.execution_width;
+    this.#maxConcurrentAttempts = maxConcurrentAttempts;
+    this.#resourceCapacity = Math.max(input.execution_width, maxConcurrentAttempts);
+  }
+
+  get maxConcurrentAttempts(): number {
+    return this.#maxConcurrentAttempts;
   }
 
   async leaseNextEligibleAttempt(request: AttemptLeaseRequest): Promise<LeasedAttemptView | null> {
+    for (let snapshotAttempt = 0; snapshotAttempt < 3; snapshotAttempt += 1) {
+      const snapshot = await this.#schedulingSnapshot();
+      try {
+        return this.#leaseNextEligibleAttemptWithSnapshot(request, snapshot);
+      } catch (error) {
+        if (!(error instanceof KernelLeaseSchedulingSnapshotStaleError) || snapshotAttempt === 2) {
+          throw error;
+        }
+      }
+    }
+    throw new Error("Attempt scheduling manifest snapshot retry bound was exhausted");
+  }
+
+  #leaseNextEligibleAttemptWithSnapshot(
+    request: AttemptLeaseRequest,
+    snapshot: KernelLeaseSchedulingSnapshot,
+  ): LeasedAttemptView | null {
     return this.#db.transaction(() => {
       const now = this.#now();
-      const replay = this.#db.prepare(`
-        SELECT a.*, r.version AS run_version, r.cursor_version
-        FROM attempts a JOIN pipeline_runs r ON r.id = a.pipeline_run_id
-        WHERE a.lease_id = ?
-      `).get(request.lease_id) as (AttemptRow & {
-        run_version: number;
-        cursor_version: number;
-      }) | undefined;
-      if (replay) {
-        if (
-          replay.lease_worker_id !== request.worker_id ||
-          replay.lease_expires_at !== request.expires_at
-        ) throw new Error(`attempt lease ${request.lease_id} conflicts with its immutable replay`);
-        const attempt = this.#attemptById(replay.id, replay.pipeline_run_id);
-        return {
-          run_id: replay.pipeline_run_id,
-          run_version: replay.run_version,
-          cursor_version: replay.cursor_version,
-          attempt,
-          lease: attempt.lease!,
-        };
-      }
-      const row = this.#db.prepare(`
-        WITH live_attempts AS (
-          SELECT pipeline_run_id FROM attempts WHERE lease_id IS NOT NULL
-        ), sandbox_reservations AS (
-          SELECT DISTINCT runtime_create.pipeline_run_id
-          FROM effects runtime_create
-          JOIN pipeline_runs r ON r.id = runtime_create.pipeline_run_id
+      const replay = this.#replayAttemptLease(request);
+      if (replay !== null) return replay;
+      this.#assertSchedulingSnapshotCoverage(snapshot);
+      const liveAttemptCount = (this.#db.prepare(`
+        SELECT COUNT(*) AS count FROM attempts WHERE lease_id IS NOT NULL
+      `).get() as { count: number }).count;
+      if (liveAttemptCount >= this.#executionWidth) return null;
+      const reservations = this.#resourceReservations(snapshot);
+      const reservedSlots = [...reservations.values()].reduce((sum, count) => sum + count, 0);
+      let afterCreatedAt: string | null = null;
+      let afterId: string | null = null;
+      let row: SchedulingAttemptRow | undefined;
+      for (;;) {
+        const candidates = this.#db.prepare(`
+          SELECT a.*, r.pipeline_id AS run_pipeline_id,
+            r.definition_bundle_hash AS run_definition_bundle_hash
+          FROM attempts a
+          JOIN pipeline_runs r ON r.id = a.pipeline_run_id
           WHERE r.status IN ('pending', 'running')
-            AND runtime_create.kind = 'daytona/create-sandbox@1'
-            AND runtime_create.status IN ('pending', 'processing', 'unknown', 'acknowledged')
-            AND NOT EXISTS (
-              SELECT 1 FROM effects runtime_cleanup
-              WHERE runtime_cleanup.pipeline_run_id = runtime_create.pipeline_run_id
-                AND runtime_cleanup.kind = 'daytona/cleanup-sandbox@1'
-                AND runtime_cleanup.status = 'acknowledged'
+            AND a.status IN ('pending', 'result_pending')
+            AND a.unmet_dependency_count = 0
+            AND a.lease_id IS NULL
+            AND (
+              ? IS NULL OR a.created_at > ? OR
+              (a.created_at = ? AND a.id > ?)
             )
-        ), sandbox_slots AS (
-          SELECT pipeline_run_id FROM live_attempts
-          UNION
-          SELECT pipeline_run_id FROM sandbox_reservations
-        )
-        SELECT a.* FROM attempts a
-        JOIN pipeline_runs r ON r.id = a.pipeline_run_id
-        WHERE r.status IN ('pending', 'running')
-          AND a.status IN ('pending', 'result_pending')
-          AND a.unmet_dependency_count = 0
-          AND a.lease_id IS NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM live_attempts live
-            WHERE live.pipeline_run_id = a.pipeline_run_id
-          )
-          AND (SELECT COUNT(*) FROM live_attempts) < ?
-          AND (
-            EXISTS (
-              SELECT 1 FROM sandbox_reservations reserved
-              WHERE reserved.pipeline_run_id = a.pipeline_run_id
-            )
-            OR (SELECT COUNT(*) FROM sandbox_slots) < ?
-          )
-        ORDER BY a.created_at, a.id
-        LIMIT 1
-      `).get(this.#executionWidth, this.#executionWidth) as AttemptRow | undefined;
+          ORDER BY a.created_at, a.id
+          LIMIT ?
+        `).all(
+          afterCreatedAt,
+          afterCreatedAt,
+          afterCreatedAt,
+          afterId,
+          ATTEMPT_SCHEDULING_BATCH_SIZE,
+        ) as SchedulingAttemptRow[];
+        for (const candidate of candidates) {
+          const scheduling = this.#attemptScheduling(candidate, snapshot);
+          if (scheduling === null || !this.#candidateCanShareItsRun(candidate, snapshot)) continue;
+          const existingReservation = reservations.get(candidate.pipeline_run_id) ?? 0;
+          const additionalSlots = Math.max(0, scheduling.pool_size - existingReservation);
+          if (reservedSlots + additionalSlots > this.#resourceCapacity) continue;
+          row = candidate;
+          break;
+        }
+        if (row !== undefined || candidates.length < ATTEMPT_SCHEDULING_BATCH_SIZE) break;
+        const last = candidates.at(-1)!;
+        afterCreatedAt = last.created_at;
+        afterId = last.id;
+      }
       if (!row) return null;
       const purpose = row.status === "result_pending" ? "result_correction" : "work";
       const changed = this.#db.prepare(`
@@ -160,6 +220,214 @@ export class KernelLeaseOperations {
         lease: attempt.lease!,
       };
     }).immediate();
+  }
+
+  #replayAttemptLease(request: AttemptLeaseRequest): LeasedAttemptView | null {
+    const replay = this.#db.prepare(`
+      SELECT a.*, r.version AS run_version, r.cursor_version
+      FROM attempts a JOIN pipeline_runs r ON r.id = a.pipeline_run_id
+      WHERE a.lease_id = ?
+    `).get(request.lease_id) as (AttemptRow & {
+      run_version: number;
+      cursor_version: number;
+    }) | undefined;
+    if (!replay) return null;
+    if (
+      replay.lease_worker_id !== request.worker_id ||
+      replay.lease_expires_at !== request.expires_at
+    ) throw new Error(`attempt lease ${request.lease_id} conflicts with its immutable replay`);
+    const attempt = this.#attemptById(replay.id, replay.pipeline_run_id);
+    return {
+      run_id: replay.pipeline_run_id,
+      run_version: replay.run_version,
+      cursor_version: replay.cursor_version,
+      attempt,
+      lease: attempt.lease!,
+    };
+  }
+
+  #assertSchedulingSnapshotCoverage(snapshot: KernelLeaseSchedulingSnapshot): void {
+    const runs = this.#db.prepare(`
+      SELECT id, pipeline_id, definition_bundle_hash FROM pipeline_runs
+      WHERE status IN ('pending', 'running') ORDER BY id
+    `).all() as Array<{ id: string; pipeline_id: string; definition_bundle_hash: string }>;
+    for (const run of runs) {
+      const scheduling = snapshot.get(run.definition_bundle_hash);
+      if (scheduling === undefined) {
+        throw new KernelLeaseSchedulingSnapshotStaleError(`missing exact manifest for run ${run.id}`);
+      }
+    }
+  }
+
+  #attemptScheduling(
+    row: SchedulingAttemptRow | AttemptRow,
+    snapshot: KernelLeaseSchedulingSnapshot,
+  ): ValidKernelLeaseManifestScheduling | null {
+    const scheduling = snapshot.get(row.definition_bundle_hash);
+    if (
+      scheduling === undefined || !scheduling.valid ||
+      !Number.isSafeInteger(scheduling.pool_size) || scheduling.pool_size < 1 ||
+      scheduling.pool_size > this.#maxConcurrentAttempts ||
+      scheduling.pool_size > MAX_KERNEL_RUNTIME_POOL_SIZE
+    ) return null;
+    if ("run_definition_bundle_hash" in row && (
+      row.definition_bundle_hash !== row.run_definition_bundle_hash ||
+      scheduling.pipeline_id !== row.run_pipeline_id
+    )) return null;
+    return scheduling;
+  }
+
+  #isParallelInspect(
+    row: AttemptRow,
+    scheduling: ValidKernelLeaseManifestScheduling,
+  ): boolean {
+    return row.repository_authority === "inspect" &&
+      (row.scope_kind === "loop_item" || row.scope_kind === "fanout_member") &&
+      (scheduling.parallel_inspect_stage_widths.get(row.stage_id) ?? 1) > 1 &&
+      row.scope_item_index !== null;
+  }
+
+  #slotIndex(row: AttemptRow, scheduling: ValidKernelLeaseManifestScheduling): number {
+    return kernelRuntimeResourceSlotIndex(
+      row.scope_kind === "stage"
+        ? { kind: "stage", stage_id: row.stage_id }
+        : row.scope_kind === "loop_item"
+          ? {
+            kind: "loop_item",
+            stage_id: row.stage_id,
+            parent_attempt_id: row.parent_attempt_id!,
+            loop_id: row.scope_group_id!,
+            item_id: row.scope_item_id!,
+            item_index: row.scope_item_index!,
+          }
+          : {
+            kind: "fanout_member",
+            stage_id: row.stage_id,
+            parent_attempt_id: row.parent_attempt_id!,
+            fanout_id: row.scope_group_id!,
+            member_id: row.scope_item_id!,
+            member_index: row.scope_item_index!,
+          },
+      scheduling.pool_size,
+    );
+  }
+
+  #sameParallelCohort(left: AttemptRow, right: AttemptRow): boolean {
+    return left.scope_kind === right.scope_kind &&
+      left.stage_id === right.stage_id &&
+      left.parent_attempt_id === right.parent_attempt_id &&
+      left.scope_group_id === right.scope_group_id &&
+      left.definition_bundle_hash === right.definition_bundle_hash &&
+      left.input_subject === right.input_subject;
+  }
+
+  #claimRows(runId: string): AttemptRow[] {
+    return this.#db.prepare(`
+      SELECT * FROM attempts
+      WHERE pipeline_run_id = ? AND (
+        lease_id IS NOT NULL OR status IN ('result_pending', 'work_complete')
+      )
+      ORDER BY id
+    `).all(runId) as AttemptRow[];
+  }
+
+  #claimSetIsValid(
+    claims: readonly AttemptRow[],
+    snapshot: KernelLeaseSchedulingSnapshot,
+  ): boolean {
+    if (claims.length === 0) return true;
+    const first = claims[0]!;
+    const scheduling = this.#attemptScheduling(first, snapshot);
+    if (claims.length === 1) return true;
+    if (scheduling === null) return false;
+    if (!this.#isParallelInspect(first, scheduling)) return false;
+    if (claims.length > (scheduling.parallel_inspect_stage_widths.get(first.stage_id) ?? 1)) {
+      return false;
+    }
+    const slots = new Set<number>();
+    for (const claim of claims) {
+      const claimScheduling = this.#attemptScheduling(claim, snapshot);
+      if (
+        claimScheduling === null || claimScheduling !== scheduling ||
+        !this.#isParallelInspect(claim, claimScheduling) ||
+        !this.#sameParallelCohort(first, claim)
+      ) return false;
+      const slot = this.#slotIndex(claim, claimScheduling);
+      if (slots.has(slot)) return false;
+      slots.add(slot);
+    }
+    return true;
+  }
+
+  #candidateCanShareItsRun(
+    candidate: SchedulingAttemptRow,
+    snapshot: KernelLeaseSchedulingSnapshot,
+  ): boolean {
+    const claims = this.#claimRows(candidate.pipeline_run_id);
+    if (!this.#claimSetIsValid(claims, snapshot)) return false;
+    const otherClaims = claims.filter((claim) => claim.id !== candidate.id);
+    if (otherClaims.length === 0) return true;
+    const scheduling = this.#attemptScheduling(candidate, snapshot);
+    if (scheduling === null || !this.#isParallelInspect(candidate, scheduling)) return false;
+    if (
+      otherClaims.length + 1 >
+      (scheduling.parallel_inspect_stage_widths.get(candidate.stage_id) ?? 1)
+    ) return false;
+    const candidateSlot = this.#slotIndex(candidate, scheduling);
+    return otherClaims.every((claim) => {
+      const claimScheduling = this.#attemptScheduling(claim, snapshot);
+      return claimScheduling === scheduling &&
+        this.#isParallelInspect(claim, claimScheduling) &&
+        this.#sameParallelCohort(candidate, claim) &&
+        this.#slotIndex(claim, claimScheduling) !== candidateSlot;
+    });
+  }
+
+  #resourceReservations(
+    snapshot: KernelLeaseSchedulingSnapshot,
+  ): Map<string, number> {
+    const reservations = new Map<string, number>();
+    const creates = this.#db.prepare(`
+      SELECT runtime_create.pipeline_run_id, COUNT(*) AS count
+      FROM effects runtime_create
+      JOIN pipeline_runs r ON r.id = runtime_create.pipeline_run_id
+      WHERE r.status IN ('pending', 'running')
+        AND runtime_create.kind = 'daytona/create-sandbox@1'
+        AND runtime_create.status IN ('pending', 'processing', 'unknown', 'acknowledged')
+        AND NOT EXISTS (
+          SELECT 1 FROM effects runtime_cleanup
+          WHERE runtime_cleanup.pipeline_run_id = runtime_create.pipeline_run_id
+            AND runtime_cleanup.kind = 'daytona/cleanup-sandbox@1'
+            AND runtime_cleanup.target = runtime_create.target
+            AND runtime_cleanup.status = 'acknowledged'
+        )
+      GROUP BY runtime_create.pipeline_run_id
+    `).all() as Array<{ pipeline_run_id: string; count: number }>;
+    for (const row of creates) reservations.set(row.pipeline_run_id, row.count);
+
+    const claimedRuns = this.#db.prepare(`
+      SELECT DISTINCT a.pipeline_run_id, r.definition_bundle_hash
+      FROM attempts a JOIN pipeline_runs r ON r.id = a.pipeline_run_id
+      WHERE r.status IN ('pending', 'running') AND (
+        a.lease_id IS NOT NULL OR a.status IN ('result_pending', 'work_complete')
+      )
+      ORDER BY a.pipeline_run_id
+    `).all() as Array<{
+      pipeline_run_id: string;
+      definition_bundle_hash: string;
+    }>;
+    for (const row of claimedRuns) {
+      const scheduling = snapshot.get(row.definition_bundle_hash);
+      if (
+        scheduling === undefined || !scheduling.valid ||
+        scheduling.pool_size > this.#maxConcurrentAttempts
+      ) continue;
+      reservations.set(
+        row.pipeline_run_id,
+        Math.max(reservations.get(row.pipeline_run_id) ?? 0, scheduling.pool_size),
+      );
+    }
+    return reservations;
   }
 
   async renewAttemptLease(input: {
@@ -211,26 +479,63 @@ export class KernelLeaseOperations {
     if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100) {
       throw new Error("attempt lease recovery limit must be between 1 and 100");
     }
-    return this.#db.transaction(() => {
-      const duplicateRun = this.#db.prepare(`
-        SELECT pipeline_run_id, COUNT(*) AS count FROM attempts
-        WHERE lease_id IS NOT NULL
-        GROUP BY pipeline_run_id HAVING COUNT(*) > 1
-        ORDER BY pipeline_run_id LIMIT 1
-      `).get() as { pipeline_run_id: string; count: number } | undefined;
-      if (duplicateRun) {
-        throw new Error(
-          `Attempt lease recovery found ${duplicateRun.count} live leases for run ` +
-          duplicateRun.pipeline_run_id,
-        );
+    for (let snapshotAttempt = 0; snapshotAttempt < 3; snapshotAttempt += 1) {
+      const snapshot = await this.#schedulingSnapshot();
+      try {
+        return this.#recoverExpiredAttemptLeasesWithSnapshot(input, snapshot);
+      } catch (error) {
+        if (!(error instanceof KernelLeaseSchedulingSnapshotStaleError) || snapshotAttempt === 2) {
+          throw error;
+        }
       }
-      const rows = this.#db.prepare(`
-        SELECT * FROM attempts
-        WHERE lease_id IS NOT NULL AND lease_expires_at <= ?
-          AND status IN ('pending', 'running', 'result_pending')
-        ORDER BY lease_expires_at, pipeline_run_id, id
-        LIMIT ?
-      `).all(input.observed_at, input.limit) as AttemptRow[];
+    }
+    throw new Error("Attempt recovery manifest snapshot retry bound was exhausted");
+  }
+
+  #recoverExpiredAttemptLeasesWithSnapshot(
+    input: { observed_at: string; expires_at: string; limit: number },
+    snapshot: KernelLeaseSchedulingSnapshot,
+  ): readonly LeasedAttemptView[] {
+    return this.#db.transaction(() => {
+      this.#assertSchedulingSnapshotCoverage(snapshot);
+      const corruptRuns = this.#corruptClaimRuns(snapshot);
+      const rows: AttemptRow[] = [];
+      let afterExpiresAt: string | null = null;
+      let afterRunId: string | null = null;
+      let afterId: string | null = null;
+      while (rows.length < input.limit) {
+        const page = this.#db.prepare(`
+          SELECT * FROM attempts
+          WHERE lease_id IS NOT NULL AND lease_expires_at <= ?
+            AND status IN ('pending', 'running', 'result_pending')
+            AND (
+              ? IS NULL OR lease_expires_at > ? OR
+              (lease_expires_at = ? AND pipeline_run_id > ?) OR
+              (lease_expires_at = ? AND pipeline_run_id = ? AND id > ?)
+            )
+          ORDER BY lease_expires_at, pipeline_run_id, id
+          LIMIT ?
+        `).all(
+          input.observed_at,
+          afterExpiresAt,
+          afterExpiresAt,
+          afterExpiresAt,
+          afterRunId,
+          afterExpiresAt,
+          afterRunId,
+          afterId,
+          ATTEMPT_SCHEDULING_BATCH_SIZE,
+        ) as AttemptRow[];
+        for (const row of page) {
+          if (!corruptRuns.has(row.pipeline_run_id)) rows.push(row);
+          if (rows.length === input.limit) break;
+        }
+        if (page.length < ATTEMPT_SCHEDULING_BATCH_SIZE || rows.length === input.limit) break;
+        const last = page.at(-1)!;
+        afterExpiresAt = last.lease_expires_at;
+        afterRunId = last.pipeline_run_id;
+        afterId = last.id;
+      }
       const recovered: LeasedAttemptView[] = [];
       for (const row of rows) {
         const changed = this.#db.prepare(`
@@ -277,6 +582,25 @@ export class KernelLeaseOperations {
       }
       return recovered;
     }).immediate();
+  }
+
+  #corruptClaimRuns(snapshot: KernelLeaseSchedulingSnapshot): ReadonlySet<string> {
+    const rows = this.#db.prepare(`
+      SELECT a.* FROM attempts a
+      JOIN pipeline_runs r ON r.id = a.pipeline_run_id
+      WHERE r.status IN ('pending', 'running') AND (
+        a.lease_id IS NOT NULL OR a.status IN ('result_pending', 'work_complete')
+      )
+      ORDER BY a.pipeline_run_id, a.id
+    `).all() as AttemptRow[];
+    const byRun = new Map<string, AttemptRow[]>();
+    for (const row of rows) {
+      const claims = byRun.get(row.pipeline_run_id) ?? [];
+      claims.push(row);
+      byRun.set(row.pipeline_run_id, claims);
+    }
+    return new Set([...byRun].flatMap(([runId, claims]) =>
+      this.#claimSetIsValid(claims, snapshot) ? [] : [runId]));
   }
 
   async leaseNextEffect(input: {

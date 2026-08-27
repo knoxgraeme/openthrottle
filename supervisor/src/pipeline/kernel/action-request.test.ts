@@ -1,13 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
+  EXECUTION_RECORD_SCHEMA,
   definitionEntryContentHash,
   digestCanonicalJson,
   type AttemptCheckpoint,
   type CompiledPipelineManifest,
   type DefinitionBundle,
   type DefinitionBundleEntry,
+  type DeliveryRecord,
 } from "@openthrottle/contracts";
-import { buildKernelResultCorrectionRequest, selectKernelAction } from "./action-request.js";
+import {
+  buildKernelResultCorrectionRequest,
+  buildKernelWorkActionRequest,
+  createPendingKernelAttempt,
+  selectKernelAction,
+} from "./action-request.js";
 import type { KernelAttempt } from "./types.js";
 
 const SOURCE = "a".repeat(40);
@@ -88,6 +95,32 @@ function definitions(): { bundle: DefinitionBundle; manifest: CompiledPipelineMa
     }],
   };
   return { bundle, manifest };
+}
+
+function runtimeDelivery(slotIndex: number, kind: "create" | "start"): DeliveryRecord {
+  const runtimeIdentity = String(slotIndex + 1).repeat(64);
+  const sandboxId = `sandbox-${slotIndex + 1}`;
+  return {
+    schema: EXECUTION_RECORD_SCHEMA,
+    id: `delivery-runtime-${kind}-${slotIndex}`,
+    kind: "delivery",
+    pipeline_run_id: "run-1",
+    effect_id: `effect-runtime-${kind}-${slotIndex}`,
+    idempotency_key: `run-1:runtime:${kind}:${runtimeIdentity}`,
+    external_identity: `daytona:${runtimeIdentity}`,
+    status: "confirmed",
+    payload_schema: "openthrottle.effect-delivery/v1",
+    payload: { inline: {
+      effect_kind: `daytona/${kind}-sandbox@1`,
+      provider: "daytona",
+      result: {
+        identity: runtimeIdentity,
+        sandbox_id: sandboxId,
+        resource_state: kind === "create" ? "created" : "started",
+      },
+    } },
+    created_at: "2026-08-27T12:00:00.000Z",
+  };
 }
 
 describe("buildKernelResultCorrectionRequest", () => {
@@ -192,5 +225,86 @@ describe("selectKernelAction", () => {
       post_bootstrap: ["npm ci", "npm run prepare"],
       execution_limits: { max_turns: null, task_timeout_seconds: 900 },
     });
+  });
+});
+
+describe("buildKernelWorkActionRequest", () => {
+  it("seals each loop member to the Daytona pool slot selected by its durable scope", () => {
+    const { bundle, manifest: baseManifest } = definitions();
+    const manifest: CompiledPipelineManifest = {
+      ...baseManifest,
+      stages: [{
+        ...baseManifest.stages[0]!,
+        loop: {
+          over: "execution_plan.units",
+          max_parallel: 2,
+          max_rounds: 8,
+          body: ["implement"],
+        },
+      }],
+    };
+    const records = [
+      runtimeDelivery(0, "create"),
+      runtimeDelivery(0, "start"),
+      runtimeDelivery(1, "create"),
+      runtimeDelivery(1, "start"),
+    ];
+    const actionInputs = {
+      task_prompt: "Execute one isolated structured unit.",
+      context: { records, checkpoints: [] },
+    };
+
+    const requests = [0, 1].map((itemIndex) => {
+      const pending = createPendingKernelAttempt({
+        id: `attempt-${itemIndex}`,
+        pipeline_run_id: "run-1",
+        scope: {
+          kind: "loop_item",
+          stage_id: "implement",
+          parent_attempt_id: "attempt-provision",
+          loop_id: "execution_plan.units",
+          item_id: `unit-${itemIndex}`,
+          item_index: itemIndex,
+        },
+        input_subject: SOURCE,
+        bundle,
+        manifest,
+        action_inputs: actionInputs,
+      });
+      return buildKernelWorkActionRequest({
+        attempt: {
+          ...pending,
+          status: "running",
+          lease: {
+            id: `lease-${itemIndex}`,
+            generation: 0,
+            worker_id: "worker-1",
+            purpose: "work",
+            expires_at: "2026-08-27T12:05:00.000Z",
+            started: true,
+          },
+        },
+        bundle,
+        manifest,
+        action_inputs: actionInputs,
+      });
+    });
+
+    expect(requests.map(({ runtime_resource }) => runtime_resource)).toEqual([
+      {
+        provider: "daytona",
+        provider_resource_id: "sandbox-1",
+        delivery_record_ids: ["delivery-runtime-create-0", "delivery-runtime-start-0"],
+      },
+      {
+        provider: "daytona",
+        provider_resource_id: "sandbox-2",
+        delivery_record_ids: ["delivery-runtime-create-1", "delivery-runtime-start-1"],
+      },
+    ]);
+    expect(Object.keys(requests[0]!.runtime_resource!).sort()).toEqual([
+      "delivery_record_ids", "provider", "provider_resource_id",
+    ]);
+    expect(requests[0]!.request_hash).not.toBe(requests[1]!.request_hash);
   });
 });

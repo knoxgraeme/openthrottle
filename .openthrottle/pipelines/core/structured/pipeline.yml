@@ -145,7 +145,7 @@ stages:
     eval: core/review-result
     loop:
       over: selection.personas
-      max_parallel: 1
+      max_parallel: 2
       max_rounds: 1
       body: [persona_review]
     on:

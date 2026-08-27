@@ -14,7 +14,7 @@ import {
 } from "./kernel-composition.js";
 
 function runtimeSource(
-  maxConcurrentAttempts: unknown = 1,
+  maxConcurrentAttempts: unknown = 2,
   protocol = "attempt-executor@2",
 ): Record<string, unknown> {
   return {
@@ -57,7 +57,7 @@ function compilerEnvironment(source: unknown): TrustedCompilerEnvironment {
 }
 
 describe("kernel release execution policy", () => {
-  it("authenticates one frozen serial policy against the trusted compiler environment", () => {
+  it("authenticates one frozen width-two policy against the trusted compiler environment", () => {
     const source = runtimeSource();
     const authenticated = authenticateKernelRuntimeCapabilities({
       source,
@@ -65,17 +65,17 @@ describe("kernel release execution policy", () => {
     });
 
     expect(authenticated.execution_policy).toEqual({
-      max_concurrent_attempts: 1,
+      max_concurrent_attempts: 2,
       runtime_capability_digest: authenticated.execution_policy.runtime_capability_digest,
     });
     expect(Object.isFrozen(authenticated.execution_policy)).toBe(true);
     expect(() => authenticateKernelRuntimeCapabilities({
-      source: runtimeSource(2),
+      source: runtimeSource(1),
       compiler_environment: compilerEnvironment(source),
     })).toThrow(/runtime manifest digest/);
   });
 
-  it.each([0, -1, 1.5, "1"])("rejects invalid max_concurrent_attempts %j", (value) => {
+  it.each([0, -1, 1.5, "2"])("rejects invalid max_concurrent_attempts %j", (value) => {
     const source = runtimeSource(value);
     expect(() => authenticateKernelRuntimeCapabilities({
       source,
@@ -83,13 +83,16 @@ describe("kernel release execution policy", () => {
     })).toThrow(/max_concurrent_attempts.*positive integer/);
   });
 
-  it("rejects a release width other than one even when its digest is authentic", () => {
-    const source = runtimeSource(2);
-    expect(() => authenticateKernelRuntimeCapabilities({
-      source,
-      compiler_environment: compilerEnvironment(source),
-    })).toThrow(/max_concurrent_attempts.*supported release value 1/);
-  });
+  it.each([1, 3])(
+    "rejects release width %i even when its digest is authentic",
+    (width) => {
+      const source = runtimeSource(width);
+      expect(() => authenticateKernelRuntimeCapabilities({
+        source,
+        compiler_environment: compilerEnvironment(source),
+      })).toThrow(/max_concurrent_attempts.*supported release value 2/);
+    },
+  );
 
   it("rejects a wide loop before delegating runtime compatibility", async () => {
     const source = runtimeSource();
@@ -108,19 +111,20 @@ describe("kernel release execution policy", () => {
       stages: [{
         id: "persona_review",
         kind: "agent",
-        loop: { over: "selection.personas", max_parallel: 2 },
+        repository_authority: "inspect",
+        loop: { over: "selection.personas", max_parallel: 3 },
       }] as never,
       definition_entries: [{
         definition_kind: "pipeline",
         definition_id: "core/structured",
       }] as never,
     })).rejects.toThrow(
-      /pipeline core\/structured.*loop persona_review.*offered width 2.*supported limit 1/,
+      /pipeline core\/structured.*loop persona_review.*offered width 3.*supported limit 2/,
     );
     expect(downstream.assertCompatible).not.toHaveBeenCalled();
   });
 
-  it("admits serial loops only under the same release capability digest", async () => {
+  it("admits width-one and width-two loops under the same release capability digest", async () => {
     const source = runtimeSource();
     const authenticated = authenticateKernelRuntimeCapabilities({
       source,
@@ -135,7 +139,7 @@ describe("kernel release execution policy", () => {
       manifest_runtime_capability_digest: authenticated.execution_policy.runtime_capability_digest,
       stages: [
         { id: "implement_unit", loop: { over: "execution_plan.units", max_parallel: 1 } },
-        { id: "persona_review", loop: { over: "selection.personas", max_parallel: 1 } },
+        { id: "persona_review", loop: { over: "selection.personas", max_parallel: 2 } },
       ] as never,
       definition_entries: [{
         definition_kind: "pipeline",
@@ -162,7 +166,7 @@ describe("kernel release execution policy", () => {
       execution_policy: authenticated.execution_policy,
       downstream: { assertCompatible: vi.fn() },
     });
-    const legacySource = runtimeSource(1, "attempt-executor@1");
+    const legacySource = runtimeSource(2, "attempt-executor@1");
     const legacyEnvironment = compilerEnvironment(legacySource);
 
     await expect(compatibility.assertCompatible({

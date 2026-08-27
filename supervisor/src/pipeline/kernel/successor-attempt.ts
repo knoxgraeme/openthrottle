@@ -17,7 +17,7 @@ import type { AttemptScope, KernelAttempt } from "./types.js";
 import type { KernelRun } from "./types.js";
 import {
   exactKernelRuntimeCleanupDeliveries,
-  exactKernelRuntimeResourceDeliveries,
+  exactKernelRuntimeResourcePoolDeliveries,
 } from "./runtime-resource.js";
 import { exactSandboxRecoveryRecord } from "./sandbox-recovery.js";
 import {
@@ -104,11 +104,19 @@ export function deriveKernelSuccessorAttempt(input: {
     target_scope: input.target_scope,
     next_cursor_version: input.view.run.cursor.version + 1,
   }).slice(0, 48)}`;
-  const runtimeResourceRecords = exactKernelRuntimeResourceDeliveries(
-    [...input.request_inputs.context.records.values()],
-  ) ?? [];
+  const inheritedRecords = [...input.request_inputs.context.records.values()];
+  const targetStage = input.view.manifest.stages.find(
+    ({ id }) => id === input.target_scope.stage_id,
+  );
+  const cleanupOutcome = targetStage === undefined ? null : runtimeCleanupOutcome(targetStage);
+  const runtimeResourceRecords = cleanupOutcome === null
+    ? exactKernelRuntimeResourcePoolDeliveries(inheritedRecords) ?? []
+    : exactKernelRuntimeCleanupDeliveries(inheritedRecords);
+  if (runtimeResourceRecords === null) {
+    throw new Error("runtime cleanup successor requires exact confirmed Daytona create evidence");
+  }
   const recoveryRecord = exactSandboxRecoveryRecord(
-    [...input.request_inputs.context.records.values()],
+    inheritedRecords,
   );
   const uniqueRecords = mergeCausalGithubPushContext({
     pipeline_run_id: input.view.run.id,
@@ -118,7 +126,7 @@ export function deriveKernelSuccessorAttempt(input: {
       ...runtimeResourceRecords,
       ...(recoveryRecord === null ? [] : [recoveryRecord]),
     ],
-    inherited_records: [...input.request_inputs.context.records.values()],
+    inherited_records: inheritedRecords,
     additional_records: input.additional_context_records,
   });
   const checkpoints = [
@@ -153,7 +161,7 @@ export function deriveKernelTerminalCleanupAttempt(input: {
 }): KernelAttempt {
   const deliveries = exactKernelRuntimeCleanupDeliveries(input.runtime_delivery_records);
   if (deliveries === null) {
-    throw new Error("terminal cleanup requires exact confirmed Daytona create evidence");
+    throw new Error("terminal cleanup requires exact confirmed Daytona create evidence for every target");
   }
   const targetStageId = runtimeStopStageId(input.outcome);
   const target = input.view.manifest.stages.find(({ id }) => id === targetStageId);
