@@ -10,6 +10,24 @@ import {
 import { SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA } from "./evaluator-registry.js";
 
 const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
+const EXECUTION_PLAN_SCHEMA_PROPERTY_PATTERN = new RegExp(
+  `"schema"\\s*:\\s*${JSON.stringify(EXECUTION_PLAN_SCHEMA_V2).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+);
+
+/**
+ * Linear preserves fenced JSON bodies but may normalize an info string down to
+ * `json`. Restore only blocks that still carry the exact execution-plan schema
+ * property. Deliberately do not parse here: a malformed same-schema rival must
+ * remain visible to the canonical parser so admission fails closed.
+ */
+export function restoreExecutionPlanFenceMarkers(markdown: string): string {
+  return markdown.replace(FENCE_PATTERN, (block, rawMarker: string, body: string) => {
+    if (rawMarker.trim() !== "json" || !EXECUTION_PLAN_SCHEMA_PROPERTY_PATTERN.test(body)) {
+      return block;
+    }
+    return `\`\`\`json ${EXECUTION_PLAN_SCHEMA_V2}\n${body}\`\`\``;
+  });
+}
 
 function executionPlanBlocks(markdown: string): string[] {
   const blocks: string[] = [];

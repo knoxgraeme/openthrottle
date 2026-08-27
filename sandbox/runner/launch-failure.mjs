@@ -122,7 +122,15 @@ function claudeFinalResultFailureEvidence(stdout) {
   const errorBearing = fields.is_error === true ||
     (Number.isFinite(status) && status >= 400) ||
     /(?:error|fail|refus|reject)/i.test(String(fields.subtype ?? ""));
-  return errorBearing ? formatDecisiveEngineFields(fields) : "";
+  if (!errorBearing) return "";
+  // Claude's top-level `result` string is assistant-authored prose. Retain it
+  // only for the exact unregistered-command check below; credential and usage
+  // classification may inspect only provider-owned terminal envelope fields.
+  const providerFields = {};
+  for (const key of ["subtype", "is_error", "api_error_status"]) {
+    if (fields[key] !== undefined) providerFields[key] = fields[key];
+  }
+  return formatDecisiveEngineFields(providerFields);
 }
 
 function codexFailureEvidence(event) {
@@ -142,25 +150,29 @@ function codexFailureEvidence(event) {
 // Plain non-JSON stdout remains eligible because both CLIs can reject a launch
 // before their structured event stream starts.
 function stdoutFailureEvidence(agent, stdout) {
-  const evidence = [];
+  const provider = [];
+  const heuristic = [];
   for (const line of String(stdout ?? "").split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     const event = jsonObjectFromLine(trimmed);
     if (!event) {
-      evidence.push(trimmed);
+      heuristic.push(trimmed);
       continue;
     }
     if (agent === "codex") {
       const codexEvidence = codexFailureEvidence(event);
-      if (codexEvidence) evidence.push(codexEvidence);
+      if (codexEvidence) provider.push(codexEvidence);
     }
   }
   if (agent === "claude") {
     const finalResult = claudeFinalResultFailureEvidence(stdout);
-    if (finalResult) evidence.push(finalResult);
+    if (finalResult) provider.push(finalResult);
   }
-  return evidence.join("\n");
+  return {
+    provider: provider.join("\n"),
+    heuristic: heuristic.join("\n"),
+  };
 }
 
 export function engineCredentialVariable(agent) {
@@ -213,28 +225,40 @@ export function classifyLaunchFailure({
   stderr = "",
   credentialPresent,
 }) {
-  const evidence = `${String(stderr ?? "")}\n${stdoutFailureEvidence(agent, stdout)}`;
+  const stdoutEvidence = stdoutFailureEvidence(agent, stdout);
+  const providerEvidence = stdoutEvidence.provider;
+  const heuristicEvidence = `${String(stderr ?? "")}\n${stdoutEvidence.heuristic}`;
+  const evidence = `${providerEvidence}\n${heuristicEvidence}`;
   let reason = "engine_crash";
-  if (isUnregisteredCommandResult(stdout)) {
-    reason = "unregistered_command";
-  } else if (credentialPresent === false) {
+  let credentialFailureProvenance = null;
+  if (credentialPresent === false) {
     reason = "credential_missing";
+    credentialFailureProvenance = "environment";
+  } else if (isUnregisteredCommandResult(stdout)) {
+    reason = "unregistered_command";
   } else if (hasRejectedRateLimitEvent(stdout) || matchesAny(RATE_LIMIT_PATTERNS, evidence)) {
     reason = "rate_limited";
-  } else if (matchesAny(CREDENTIAL_REJECTED_PATTERNS, evidence)) {
+  } else if (matchesAny(CREDENTIAL_REJECTED_PATTERNS, providerEvidence)) {
     reason = "credential_rejected";
-  } else if (matchesAny(CREDENTIAL_MISSING_PATTERNS, evidence)) {
+    credentialFailureProvenance = "provider_event";
+  } else if (matchesAny(CREDENTIAL_REJECTED_PATTERNS, heuristicEvidence)) {
+    reason = "credential_rejected";
+    credentialFailureProvenance = "heuristic";
+  } else if (matchesAny(CREDENTIAL_MISSING_PATTERNS, providerEvidence)) {
     reason = "credential_missing";
+    credentialFailureProvenance = "provider_event";
+  } else if (matchesAny(CREDENTIAL_MISSING_PATTERNS, heuristicEvidence)) {
+    reason = "credential_missing";
+    credentialFailureProvenance = "heuristic";
   }
   return {
     reason,
     credentialFailure: reason === "credential_missing" || reason === "credential_rejected",
-    // A rejected credential cannot change during a kernel work retry. Retrying
-    // it would only seed the same supervisor-owned credential again and burn
-    // the Attempt's full retry ladder. Other infrastructure-shaped failures
-    // retain their existing retry policy; an engine crash keeps the caller's
-    // own shape.
-    retryable: reason !== "engine_crash" && reason !== "credential_rejected",
+    credentialFailureProvenance,
+    // An authoritatively missing launch credential cannot become present
+    // inside this Attempt. Provider and heuristic refusals remain eligible for
+    // the executor's separately bounded, ordinal-aware retry policy.
+    retryable: reason !== "engine_crash" && credentialFailureProvenance !== "environment",
     remediation: remediationFor(reason, agent),
   };
 }

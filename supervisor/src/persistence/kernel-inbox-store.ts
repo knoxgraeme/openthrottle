@@ -466,13 +466,28 @@ export class SqliteKernelInboxStore implements
     bounded(input.owner_id, "inbox completion owner", 200, ID);
     bounded(input.lease_id, "inbox completion lease ID", 200, ID);
     const timestamp = iso(this.#now(), "inbox completion timestamp");
-    const changed = this.#db.prepare(`
-      UPDATE inbox_events
-      SET status = ?, lease_id = NULL, lease_owner_id = NULL, lease_expires_at = NULL,
-          version = version + 1, consumed_at = ?
-      WHERE id = ? AND status = 'processing' AND lease_id = ? AND lease_owner_id = ?
-    `).run(input.outcome, timestamp, input.event_id, input.lease_id, input.owner_id);
-    if (changed.changes !== 1) throw new Error("inbox completion lease fence does not match");
+    this.#db.transaction(() => {
+      const changed = this.#db.prepare(`
+        UPDATE inbox_events
+        SET status = ?, lease_id = NULL, lease_owner_id = NULL, lease_expires_at = NULL,
+            version = version + 1, consumed_at = ?
+        WHERE id = ? AND status = 'processing' AND lease_id = ? AND lease_owner_id = ?
+      `).run(input.outcome, timestamp, input.event_id, input.lease_id, input.owner_id);
+      if (changed.changes === 1) return;
+      const settled = this.#db.prepare(`
+        SELECT status, lease_id, lease_owner_id, lease_expires_at, consumed_at
+        FROM inbox_events WHERE id = ?
+      `).get(input.event_id) as Pick<
+        InboxRow,
+        "status" | "lease_id" | "lease_owner_id" | "lease_expires_at" | "consumed_at"
+      > | undefined;
+      if (
+        settled?.status === input.outcome && settled.consumed_at !== null &&
+        settled.lease_id === null && settled.lease_owner_id === null &&
+        settled.lease_expires_at === null
+      ) return;
+      throw new Error("inbox completion lease fence does not match");
+    }).immediate();
   }
 
   retry(input: {

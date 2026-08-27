@@ -160,9 +160,21 @@ export class KernelProviderPromptHandler {
     if (!prompt) return null;
     if (!ID.test(prompt.message_id)) return "dead";
 
+    if (event.source_provider === "github" && prompt.stop) {
+      if (!prompt.github_authorization) return "stale";
+      if (!await this.#githubAuthorization.authorizeComment(prompt.github_authorization)) {
+        return "stale";
+      }
+    }
+
     const run = this.#runs.resolveRun(prompt.reference);
-    if (!run) return prompt.stop ? "stale" : null;
-    if (event.source_provider === "github") {
+    if (!run) {
+      if (prompt.stop) {
+        throw new Error(`cannot apply provider stop before ${prompt.reference} is admitted`);
+      }
+      return null;
+    }
+    if (event.source_provider === "github" && !prompt.stop) {
       if (!prompt.github_authorization) return "stale";
       if (!await this.#githubAuthorization.authorizeComment(prompt.github_authorization)) {
         return "stale";

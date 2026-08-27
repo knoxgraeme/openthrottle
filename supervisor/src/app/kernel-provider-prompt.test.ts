@@ -163,16 +163,89 @@ describe("KernelProviderPromptHandler", () => {
     expect(test.enqueueSteering).not.toHaveBeenCalled();
   });
 
-  it("settles a Linear stop without an existing run instead of admitting it", async () => {
-    const test = handler({ resolveRun: () => undefined });
-    await expect(test.value.handle(event({
+  it("keeps a Linear stop retryable, then controls the run once it is admitted", async () => {
+    let admitted = false;
+    const test = handler({ resolveRun: () => admitted ? {
+      pipeline_run_id: "run-1",
+      work_item_id: "work-1",
+      source_provider: "linear",
+      source_reference: "OPE-188",
+    } : undefined });
+    const stop = event({
       payload: {
         agentSession: { issue: { identifier: "OPE-188" } },
         agentActivity: { id: "activity-1", signal: { type: "stop" } },
       },
-    }))).resolves.toBe("stale");
+    });
+    await expect(test.value.handle(stop)).rejects.toThrow(/before OPE-188 is admitted/);
     expect(test.requestRunControl).not.toHaveBeenCalled();
     expect(test.enqueueSteering).not.toHaveBeenCalled();
+    admitted = true;
+    await expect(test.value.handle(stop)).resolves.toBe("consumed");
+    expect(test.requestRunControl).toHaveBeenCalledWith({
+      pipeline_run_id: "run-1",
+      action: "stop",
+      reason: "Stopped from the linear control thread.",
+    });
+  });
+
+  it("keeps an authorized GitHub stop retryable until its run is admitted", async () => {
+    const authorizeGithubComment = vi.fn(async () => true);
+    const test = handler({ resolveRun: () => undefined, authorizeGithubComment });
+    await expect(test.value.handle(event({
+      source_provider: "github",
+      kind: "github/issue-comment/created@1",
+      payload: {
+        repository: { full_name: "Owner/Repo" },
+        issue: { number: 188 },
+        comment: { id: 991, body: "/stop", user: { login: "maintainer" } },
+      },
+    }))).rejects.toThrow(/before owner\/repo#188 is admitted/i);
+    expect(authorizeGithubComment).toHaveBeenCalledWith({
+      repository: "Owner/Repo",
+      username: "maintainer",
+    });
+    expect(test.requestRunControl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an outsider", { id: 991, body: "/stop", user: { login: "outsider" } }],
+    ["a missing actor", { id: 991, body: "/stop" }],
+  ])("settles a no-run GitHub stop from %s without retrying it", async (_label, comment) => {
+    const authorizeGithubComment = vi.fn(async () => false);
+    const test = handler({ resolveRun: () => undefined, authorizeGithubComment });
+    await expect(test.value.handle(event({
+      source_provider: "github",
+      kind: "github/issue-comment/created@1",
+      payload: {
+        repository: { full_name: "Owner/Repo" },
+        issue: { number: 188 },
+        comment,
+      },
+    }))).resolves.toBe("stale");
+    expect(test.requestRunControl).not.toHaveBeenCalled();
+    if (_label === "a missing actor") expect(authorizeGithubComment).not.toHaveBeenCalled();
+  });
+
+  it("settles an irrelevant no-run GitHub comment without depending on authorization", async () => {
+    const authorizeGithubComment = vi.fn(async () => {
+      throw new Error("GitHub permission lookup unavailable");
+    });
+    const test = handler({ resolveRun: () => undefined, authorizeGithubComment });
+    await expect(test.value.handle(event({
+      source_provider: "github",
+      kind: "github/issue-comment/created@1",
+      payload: {
+        repository: { full_name: "Owner/Repo" },
+        issue: { number: 188 },
+        comment: {
+          id: 991,
+          body: "There is no admitted run for this comment.",
+          user: { login: "maintainer" },
+        },
+      },
+    }))).resolves.toBeNull();
+    expect(authorizeGithubComment).not.toHaveBeenCalled();
   });
 
   it("routes a Linear stop signal through the shared run controller", async () => {

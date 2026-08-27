@@ -30,6 +30,7 @@ import type { KernelRuntimeCompatibilityPort } from "../runtime/kernel-contracts
 import type { VolumeBlobStore, VerifiedBlobToken } from "../persistence/blob-store.js";
 import type {
   DefinitionSnapshotInput,
+  PipelineAdmissionInboxFence,
   PipelineAdmissionInput,
   PipelineRunAttachmentInput,
   SqliteKernelStore,
@@ -192,6 +193,7 @@ export async function admitKernelPipeline(input: {
   identity: KernelAdmissionIdentity;
   work_retry_limit: number;
   result_correction_limit: number;
+  originating_inbox?: PipelineAdmissionInboxFence;
   compile?: KernelDefinitionCompiler;
 }): Promise<KernelAdmissionResult> {
   const compile = input.compile ?? compileRepositoryDefinitionAtCommit;
@@ -238,6 +240,7 @@ export async function admitKernelPipeline(input: {
     run,
     definition_bundle: definitionBundleToken,
     initial_attempts: [initialAttempt],
+    ...(input.originating_inbox ? { originating_inbox: input.originating_inbox } : {}),
   };
   input.store.admitPipelineRun(admission);
   return { compilation, run, initial_attempt: initialAttempt, definition_bundle_token: definitionBundleToken };

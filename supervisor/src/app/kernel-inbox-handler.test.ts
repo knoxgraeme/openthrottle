@@ -57,11 +57,51 @@ describe("kernel inbox pipeline selection", () => {
     expect(selectKernelInboxPipeline([], prompt)).toBe("core/structured");
   });
 
+  it("routes equivalent normalized and tagged description-only plans identically", () => {
+    const normalized = linearAdmissionPrompt({
+      event_kind: "linear/agent-session-event/prompted@1",
+      title: "Execute the accepted plan",
+      description: structuredPlanBlock(),
+      payload: { agentActivity: { id: "activity-1", content: { body: "Proceed." } } },
+    });
+    const tagged = linearAdmissionPrompt({
+      event_kind: "linear/agent-session-event/prompted@1",
+      title: "Execute the accepted plan",
+      description: structuredPlanBlock("json openthrottle.execution-plan/v2"),
+      payload: { agentActivity: { id: "activity-1", content: { body: "Proceed." } } },
+    });
+
+    expect(selectKernelInboxPipeline([], normalized)).toBe("core/structured");
+    expect(selectKernelInboxPipeline([], tagged)).toBe("core/structured");
+  });
+
+  it("fails closed when the description and prompted directive each contain a plan", () => {
+    const prompt = linearAdmissionPrompt({
+      event_kind: "linear/agent-session-event/prompted@1",
+      title: "Ambiguous plan",
+      description: structuredPlanBlock(),
+      payload: {
+        agentActivity: { id: "activity-1", content: { body: structuredPlanBlock() } },
+      },
+    });
+
+    expect(prompt.match(/```json openthrottle\.execution-plan\/v2/g)).toHaveLength(2);
+    expect(selectKernelInboxPipeline([], prompt)).toBe("core/admission");
+  });
+
   it.each([
     ["two normalized plans", `${structuredPlanBlock()}\n${structuredPlanBlock()}`],
     [
       "one tagged and one normalized plan",
       `${structuredPlanBlock("json openthrottle.execution-plan/v2")}\n${structuredPlanBlock()}`,
+    ],
+    [
+      "one valid plan and one malformed same-schema rival",
+      `${structuredPlanBlock()}\n\`\`\`json\n{\"schema\":\"openthrottle.execution-plan/v2\",\"pipeline_id\":\n\`\`\``,
+    ],
+    [
+      "one valid plan and one invalid-shape same-schema rival",
+      `${structuredPlanBlock()}\n\`\`\`json\n{\"schema\":\"openthrottle.execution-plan/v2\",\"pipeline_id\":\"core/structured\"}\n\`\`\``,
     ],
   ])("keeps Linear plan ambiguity fail closed for %s", (_label, promptContext) => {
     const prompt = linearAdmissionPrompt({
@@ -71,6 +111,7 @@ describe("kernel inbox pipeline selection", () => {
       payload: { promptContext },
     });
 
+    expect(prompt.match(/```json openthrottle\.execution-plan\/v2/g)).toHaveLength(2);
     expect(selectKernelInboxPipeline([], prompt)).toBe("core/admission");
   });
 

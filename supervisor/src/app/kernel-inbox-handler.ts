@@ -1,6 +1,5 @@
 import {
   digestCanonicalJson,
-  EXECUTION_PLAN_SCHEMA_V2,
   type JsonValue,
   type TrustedCompilerEnvironment,
   type TrustedPlatformDefinitionSource,
@@ -10,7 +9,10 @@ import type { SqliteKernelStore } from "../persistence/kernel-store.js";
 import type { VolumeBlobStore } from "../persistence/blob-store.js";
 import type { KernelRepositoryRegistrationPort } from "../persistence/kernel-registration-store.js";
 import type { ExactDefinitionSourceReader } from "../pipeline/definition-compilation.js";
-import { parseStructuredExecutionPlan } from "../pipeline/kernel/structured-coordinator.js";
+import {
+  parseStructuredExecutionPlan,
+  restoreExecutionPlanFenceMarkers,
+} from "../pipeline/kernel/structured-plan.js";
 import type { KernelRuntimeCompatibilityPort } from "../runtime/kernel-contracts.js";
 import { admitKernelPipeline } from "./kernel-admission.js";
 import {
@@ -21,7 +23,6 @@ import { linearAgentActivityBody } from "./kernel-provider-prompt.js";
 
 const SUBJECT = /^[a-f0-9]{40,64}$/;
 const DEFAULT_GITHUB_SUBJECT_TIMEOUT_MS = 15_000;
-const MARKDOWN_FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
 
 function object(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -42,23 +43,6 @@ function strings(value: unknown): string[] {
   });
 }
 
-function restoreLinearExecutionPlanFences(prompt: string): string {
-  return prompt.replace(MARKDOWN_FENCE_PATTERN, (block, rawMarker: string, body: string) => {
-    if (rawMarker.trim() !== "json") return block;
-    let value: unknown;
-    try {
-      value = JSON.parse(body.trim()) as unknown;
-    } catch {
-      return block;
-    }
-    const schema = value && typeof value === "object" && !Array.isArray(value)
-      ? (value as { schema?: unknown }).schema
-      : undefined;
-    if (schema !== EXECUTION_PLAN_SCHEMA_V2) return block;
-    return `\`\`\`json ${EXECUTION_PLAN_SCHEMA_V2}\n${body}\`\`\``;
-  });
-}
-
 export function linearAdmissionPrompt(input: {
   event_kind: "linear/agent-session-event/created@1" | "linear/agent-session-event/prompted@1";
   title: string;
@@ -69,7 +53,7 @@ export function linearAdmissionPrompt(input: {
   const directive = input.event_kind === "linear/agent-session-event/prompted@1"
     ? linearAgentActivityBody(input.payload)
     : typeof payload?.promptContext === "string" ? payload.promptContext : "";
-  return restoreLinearExecutionPlanFences(
+  return restoreExecutionPlanFenceMarkers(
     [input.title, input.description, directive].filter(Boolean).join("\n\n"),
   );
 }
@@ -152,6 +136,10 @@ export class KernelAdmissionInboxHandler {
       source_commit: sourceCommit,
       request_hash: event.payload_hash,
     });
+    if (
+      event.status !== "processing" || event.lease_id === null ||
+      event.lease_owner_id === null
+    ) throw new Error("repository admission requires the leased originating inbox event");
     await admitKernelPipeline({
       repository: admission.repository,
       source_commit: sourceCommit,
@@ -177,6 +165,16 @@ export class KernelAdmissionInboxHandler {
       },
       work_retry_limit: 3,
       result_correction_limit: 2,
+      originating_inbox: {
+        event_id: event.id,
+        source_provider: event.source_provider,
+        delivery_id: event.delivery_id,
+        kind: event.kind,
+        payload_hash: event.payload_hash,
+        lease_id: event.lease_id,
+        lease_owner_id: event.lease_owner_id,
+        version: event.version,
+      },
     });
     return "consumed";
   }

@@ -456,6 +456,36 @@ describe("Codex durable auth", () => {
       expect(store.getSetting(SETTINGS_CODEX_AUTH_JSON)).toBe(codexAuth);
     });
 
+    it("re-materializes Codex auth so a bounded work retry can receive a refreshed token", async () => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const refreshedAccessToken = aboveRefreshBand();
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({ ok: false, status: 503 })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            access_token: refreshedAccessToken,
+            refresh_token: "rt-1",
+          }),
+        });
+      vi.stubGlobal("fetch", fetchMock);
+      store.setSetting(
+        SETTINGS_CODEX_AUTH_JSON,
+        authBlob("rt-0", "2026-07-01T00:00:00Z", insideRefreshBand()),
+      );
+      const materialize = createKernelCredentialMaterializer(fullCfg(), store);
+
+      const first = await materialize("codex");
+      const second = await materialize("codex");
+
+      expect(JSON.parse(first.CODEX_AUTH_JSON).tokens.access_token)
+        .not.toBe(refreshedAccessToken);
+      expect(JSON.parse(second.CODEX_AUTH_JSON).tokens.access_token)
+        .toBe(refreshedAccessToken);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(codexRefreshToken(store.getSetting(SETTINGS_CODEX_AUTH_JSON))).toBe("rt-1");
+    });
+
     it("surfaces a token that cannot cover the task timeout as a launch failure", async () => {
       vi.spyOn(console, "warn").mockImplementation(() => {});
       vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 401 })));
