@@ -525,10 +525,13 @@ describe("kernel publication plan binding", () => {
     const candidateSubject = git(work, ["rev-parse", "HEAD"]);
     const candidateTree = git(work, ["rev-parse", "HEAD^{tree}"]);
     const requestHash = "1".repeat(64);
+    const candidateRef = `refs/openthrottle/checkpoints/${createHash("sha256")
+      .update(candidateSubject, "utf8")
+      .digest("hex")}`;
     const candidateBundle = writeBundle({
       repository: work,
       root,
-      ref: `refs/openthrottle/checkpoints/${requestHash}`,
+      ref: candidateRef,
       commit: candidateSubject,
       boundary: source,
       name: "candidate.bundle",
@@ -622,6 +625,7 @@ describe("kernel publication plan binding", () => {
       checkpoint_base_subject: source,
       current_subject: source,
       candidate_output_subject: candidateSubject,
+      candidate_artifact: { ref: candidateRef, commit: candidateSubject },
       current_ancestry: [],
     });
 

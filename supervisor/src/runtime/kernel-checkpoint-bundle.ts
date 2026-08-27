@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -49,8 +50,10 @@ export function inspectKernelCheckpointBundleAdvertisement(input: {
 }
 
 const SUBJECT = /^[a-f0-9]{40,64}$/;
+const DIGEST = /^[a-f0-9]{64}$/;
 const CHECKPOINT_REF = /^refs\/openthrottle\/(?:checkpoints|integrations)\/[a-f0-9]{64}$/;
 const INTEGRATION_REF = /^refs\/openthrottle\/integrations\/[a-f0-9]{64}$/;
+const ORDINARY_CHECKPOINT_REF_PREFIX = "refs/openthrottle/checkpoints/";
 const AUTHOR_ENV = {
   GIT_AUTHOR_NAME: "OpenThrottle Executor",
   GIT_AUTHOR_EMAIL: "executor@openthrottle.local",
@@ -65,6 +68,27 @@ const SCRATCH_GIT_CONFIG = [
   ["gc.autodetach", "false"],
   ["core.fsmonitor", "false"],
 ] as const;
+
+export function ordinaryCheckpointRefForCommit(commit: string): string {
+  subject(commit, "ordinary checkpoint commit");
+  return `${ORDINARY_CHECKPOINT_REF_PREFIX}${createHash("sha256")
+    .update(commit, "utf8")
+    .digest("hex")}`;
+}
+
+export function isCompatibleOrdinaryCheckpointRef(input: {
+  ref: string;
+  commit: string;
+  request_hash: string;
+}): boolean {
+  if (
+    !SUBJECT.test(input.commit) || !DIGEST.test(input.request_hash) ||
+    !input.ref.startsWith(ORDINARY_CHECKPOINT_REF_PREFIX)
+  ) return false;
+  return input.ref === ordinaryCheckpointRefForCommit(input.commit) ||
+    input.ref === `${ORDINARY_CHECKPOINT_REF_PREFIX}${input.request_hash}`;
+}
+
 function gitEnvironment(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const environment = { ...process.env };
   for (const key of Object.keys(environment)) {

@@ -91,7 +91,7 @@ export function createAttemptCheckpoint({
   const gitDir = join(temporary, "repository.git");
   const file = artifactName(request);
   const bundlePath = join(artifactDirectory, file);
-  const checkpointRef = `refs/openthrottle/checkpoints/${request.request_hash}`;
+  let checkpointRef;
   let checkpointCommit;
   try {
     mkdirSync(gitDir, { recursive: true, mode: 0o700 });
@@ -178,6 +178,9 @@ export function createAttemptCheckpoint({
         environment,
       );
     }
+    checkpointRef = `refs/openthrottle/checkpoints/${createHash("sha256")
+      .update(checkpointCommit, "utf8")
+      .digest("hex")}`;
     if (durableEdit) {
       writeFileSync(join(gitDir, "shallow"), `${checkpointBaseSubject}\n`, { mode: 0o400 });
     }
