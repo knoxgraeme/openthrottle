@@ -11,18 +11,60 @@ import { SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA } from "./evaluator-registry.js";
 
 const FENCE_PATTERN = /```([^\n`]*)\n([\s\S]*?)```/g;
 const EXECUTION_PLAN_SCHEMA_PROPERTY_PATTERN = new RegExp(
-  `"schema"\\s*:\\s*${JSON.stringify(EXECUTION_PLAN_SCHEMA_V2).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+  `^"schema"\\s*:\\s*${JSON.stringify(EXECUTION_PLAN_SCHEMA_V2).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
 );
+
+function declaresRootExecutionPlanSchema(body: string): boolean {
+  const root = body.search(/\S/);
+  if (root < 0 || body[root] !== "{") return false;
+  const containers: Array<"{" | "["> = ["{"];
+  let inString = false;
+  let escaped = false;
+
+  for (let index = root + 1; index < body.length; index += 1) {
+    const character = body[index]!;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (character === "\"") {
+      if (
+        containers.length === 1 &&
+        EXECUTION_PLAN_SCHEMA_PROPERTY_PATTERN.test(body.slice(index))
+      ) return true;
+      inString = true;
+      continue;
+    }
+    if (character === "{" || character === "[") {
+      containers.push(character);
+      continue;
+    }
+    if (character === "}" || character === "]") {
+      const expected = character === "}" ? "{" : "[";
+      if (containers.at(-1) !== expected) return false;
+      containers.pop();
+      if (containers.length === 0) return false;
+    }
+  }
+  return false;
+}
 
 /**
  * Linear preserves fenced JSON bodies but may normalize an info string down to
  * `json`. Restore only blocks that still carry the exact execution-plan schema
- * property. Deliberately do not parse here: a malformed same-schema rival must
- * remain visible to the canonical parser so admission fails closed.
+ * property directly on the root object. Deliberately do not parse the whole
+ * block here: a malformed same-schema rival must remain visible to the
+ * canonical parser so admission fails closed.
  */
 export function restoreExecutionPlanFenceMarkers(markdown: string): string {
   return markdown.replace(FENCE_PATTERN, (block, rawMarker: string, body: string) => {
-    if (rawMarker.trim() !== "json" || !EXECUTION_PLAN_SCHEMA_PROPERTY_PATTERN.test(body)) {
+    if (rawMarker.trim() !== "json" || !declaresRootExecutionPlanSchema(body)) {
       return block;
     }
     return `\`\`\`json ${EXECUTION_PLAN_SCHEMA_V2}\n${body}\`\`\``;

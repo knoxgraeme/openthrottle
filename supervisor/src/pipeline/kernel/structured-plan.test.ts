@@ -65,6 +65,18 @@ describe("restoreExecutionPlanFenceMarkers", () => {
       .toThrow(/exactly one/);
   });
 
+  it("restores a top-level schema property after nested and quoted content", () => {
+    const markdown = fence(JSON.stringify({
+      metadata: [{ nested: { value: "a } brace and a { brace" } }],
+      note: `quoted property-like text: \"schema\":\"${EXECUTION_PLAN_SCHEMA_V2}\"`,
+      schema: EXECUTION_PLAN_SCHEMA_V2,
+      pipeline_id: "core/structured",
+    }));
+
+    expect(restoreExecutionPlanFenceMarkers(markdown))
+      .toContain(`\`\`\`json ${EXECUTION_PLAN_SCHEMA_V2}\n`);
+  });
+
   it("keeps two valid bare plans ambiguous", () => {
     const restored = restoreExecutionPlanFenceMarkers(`${planFence()}\n${planFence()}`);
 
@@ -86,6 +98,18 @@ describe("restoreExecutionPlanFenceMarkers", () => {
     ["a scalar schema value", fence(JSON.stringify(EXECUTION_PLAN_SCHEMA_V2))],
     ["another schema", fence(JSON.stringify({ schema: "example.execution-plan/v1" }))],
     ["an unrelated scalar", fence("42")],
+    ["a schema property nested in an object", fence(JSON.stringify({
+      metadata: { schema: EXECUTION_PLAN_SCHEMA_V2 },
+    }))],
+    ["a schema property nested in an array", fence(JSON.stringify({
+      metadata: [{ schema: EXECUTION_PLAN_SCHEMA_V2 }],
+    }))],
+    ["a schema property inside a root array", fence(JSON.stringify([{
+      schema: EXECUTION_PLAN_SCHEMA_V2,
+    }]))],
+    ["schema-like text and braces inside a string", fence(JSON.stringify({
+      note: `ignore { \"schema\":\"${EXECUTION_PLAN_SCHEMA_V2}\" } here`,
+    }))],
     ["an existing tagged marker", planFence(`json ${EXECUTION_PLAN_SCHEMA_V2}`)],
     ["a multi-token marker", planFence("json unrelated-marker")],
   ])("does not rewrite %s", (_label, markdown) => {
